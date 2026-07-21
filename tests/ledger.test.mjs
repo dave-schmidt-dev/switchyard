@@ -1,12 +1,12 @@
-import { strictEqual, ok } from "node:assert";
-import { mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { ok, strictEqual } from "node:assert";
+import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { cwd } from "node:process";
 import { after, before, describe, it } from "node:test";
-import { recordDispatch, readLedger } from "../src/switchyard/ledger/index.mjs";
+import { readLedger, recordDispatch } from "../src/switchyard/ledger/index.mjs";
 
 const TEST_LEDGER_DIR = join(cwd(), ".switchyard-test-ledger");
-const ORIGINAL_LOG_DIR = join(
+const _ORIGINAL_LOG_DIR = join(
 	cwd(),
 	"node_modules",
 	".switchyard-ledger-backup",

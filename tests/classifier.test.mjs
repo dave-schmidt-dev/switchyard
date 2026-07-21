@@ -1,6 +1,10 @@
 import { strictEqual } from "node:assert";
 import { describe, it } from "node:test";
-import { classifyTask, classifyTasks, isValidTier, CAPABILITY_CLASS } from "../src/switchyard/roster/classifier.mjs";
+import {
+	classifyTask,
+	classifyTasks,
+	isValidTier,
+} from "../src/switchyard/roster/classifier.mjs";
 
 describe("classifier", () => {
 	describe("classifyTask", () => {

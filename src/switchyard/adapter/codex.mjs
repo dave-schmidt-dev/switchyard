@@ -26,17 +26,20 @@ export function isCodexAuthenticated() {
 
 /**
  * Authenticate Codex in the container.
- * PW-4: Independent in-container login
- * TODO: INV-1 - This currently copies host auth file, which violates no-host-cred mount.
- * Need BWS-based injection pattern instead.
+ * PW-4: Independent in-container login via BWS-provided auth payload.
+ * @param {string} bwsPath Bitwarden path for Codex auth payload JSON.
  * @returns {boolean}
  */
-export function authenticateCodex() {
+export function authenticateCodex(bwsPath) {
+	if (!bwsPath || typeof bwsPath !== "string") {
+		console.error("Failed to authenticate Codex: missing bwsPath");
+		return false;
+	}
+
 	try {
-		// TODO: Replace with BWS-based credential injection
-		// Current implementation copies host auth file (INV-1 violation)
+		const escapedBwsPath = bwsPath.replace(/'/g, "'\\''");
 		execSync(
-			`docker cp ~/.codex/auth.json ${AGENT_CONTAINER_NAME}:/root/.codex/auth.json`,
+			`docker exec -e CODEX_AUTH_JSON=$(bws-get '${escapedBwsPath}') ${AGENT_CONTAINER_NAME} sh -c '\n\t\t\tmkdir -p /root/.codex\n\t\t\tprintf "%s" "$CODEX_AUTH_JSON" > /root/.codex/auth.json\n\t\t\tchmod 600 /root/.codex/auth.json\n\t\t'`,
 			{ stdio: "inherit" },
 		);
 		return true;

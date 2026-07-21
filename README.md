@@ -2,7 +2,7 @@
 
 A containment-first Python dispatcher that routes coding tasks across subscription-backed agent CLIs (claude, agy, cursor, codex) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-4 implemented (M1-M3). Gate tests passing. Runner orchestrator stub remaining.
+**Status:** Phases 0-4 implemented (M1-M3). Runner now includes queue/checkpoint and concrete headless poll/`wait` supervision; remaining work is phased spread/integration completion.
 
 ## Priorities (in order)
 
@@ -35,8 +35,8 @@ A containment-first Python dispatcher that routes coding tasks across subscripti
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): diff validation, `git apply`, path traversal blocking. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
 | `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch, exec, diff capture. |
-| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch, exec, diff capture. |
-| `src/switchyard/runner/index.mjs` | Orchestrator runner stub (Phase 4+). |
+| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch, exec, diff capture, BWS-based auth injection. |
+| `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). |
 | **Tests** | |
 | `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5. |
 | `tests/capability-match.test.mjs` | INV-5 gate: capability filter, tier ordering, model right-sizing. |

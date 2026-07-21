@@ -1,6 +1,10 @@
-import { strictEqual, ok } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
-import { jitter, resolveSeed, computeScore } from "../src/switchyard/router/scorer.mjs";
+import {
+	computeScore,
+	jitter,
+	resolveSeed,
+} from "../src/switchyard/router/scorer.mjs";
 
 describe("scorer", () => {
 	describe("jitter", () => {
@@ -38,7 +42,7 @@ describe("scorer", () => {
 
 		it("should coerce seed to uint32", () => {
 			const result = resolveSeed({ seed: -1 });
-			strictEqual(result.seed, (-1) >>> 0);
+			strictEqual(result.seed, -1 >>> 0);
 		});
 
 		it("should hash runId when no seed", () => {
