@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { route, routeBlind } from "../src/switchyard/router/index.mjs";
 
-const SNAPSHOT_DIR = join(homedir(), "Documents/Projects/ai_monitor/.state");
+const SNAPSHOT_DIR = join(homedir(), "Documents/Projects/gradus/.state");
 const SNAPSHOT_PATH = join(SNAPSHOT_DIR, "snapshot-v2.json");
 
 // Backup original snapshot if it exists

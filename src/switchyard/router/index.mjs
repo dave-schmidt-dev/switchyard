@@ -20,7 +20,7 @@ import { computeScore, resolveSeed } from "./scorer.mjs";
 // Snapshot path - host-side, code constant (WR-1: routing is host-side)
 const SNAPSHOT_PATH = join(
 	homedir(),
-	"Documents/Projects/ai_monitor/.state/snapshot-v2.json",
+	"Documents/Projects/gradus/.state/snapshot-v2.json",
 );
 
 const EXPECTED_SCHEMA_VERSION = 2;
