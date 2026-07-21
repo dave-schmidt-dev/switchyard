@@ -8,7 +8,8 @@
 		"test": "node --test",
 		"lint": "biome check .",
 		"deadcode": "knip",
-		"validate": "npm run lint && npm run deadcode && npm run test"
+		"validate": "npm run lint && npm run deadcode && npm run test",
+		"auth": "node src/switchyard/auth/index.mjs"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.2",

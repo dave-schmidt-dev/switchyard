@@ -47,7 +47,7 @@ describe("codex adapter container execution", () => {
 	after(() => {
 		if (dockerAvailable) {
 			try {
-				execSync(`docker rm -f ${containerName}`, { stdio: "pipe" });
+				execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 			} catch {
 				// ignore cleanup errors
 			}

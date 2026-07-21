@@ -2,10 +2,18 @@
 // Centralized so a validation fix applied to one adapter can't silently miss
 // its sibling (this file exists because that happened once already).
 
-// Safe identifier pattern: Docker container names and model names.
-// Allows alphanumeric, hyphen, underscore, dot, colon, forward-slash.
-// Rejects spaces and shell metacharacters before any shell interpolation.
+// Safe identifier pattern: Docker container names and BWS secret names that
+// get interpolated into a shell string (the auth flow's `zsh -c "... $name
+// ..."` command). Rejects spaces and shell metacharacters before any shell
+// interpolation.
 const SAFE_IDENTIFIER_RE = /^[\w./:@-]+$/;
+
+// Safe model-argument pattern: broader than SAFE_IDENTIFIER_RE because model
+// values are only ever delivered as a single execFileSync argv element (never
+// interpolated into a shell string), so display-name conventions like
+// "Gemini 3.6 Flash (High)" are legitimate. Still rejects shell metacharacters
+// as defense-in-depth against a future refactor accidentally adding a shell.
+const SAFE_MODEL_ARG_RE = /^[\w./:@() -]{1,200}$/;
 
 // Safe env-var-name pattern: BWS secret names doubling as the container env
 // var they're forwarded under (project convention: UPPERCASE_SNAKE_CASE
@@ -42,6 +50,24 @@ export function validateEnvName(value, label) {
 	if (!SAFE_ENV_NAME_RE.test(value)) {
 		throw new Error(
 			`${label} must be UPPERCASE_SNAKE_CASE: ${JSON.stringify(value)}`,
+		);
+	}
+}
+
+/**
+ * Validate that a string is safe to pass as a single execFileSync argv
+ * element for a model name/flag value. Never shell-interpolated — see
+ * SAFE_MODEL_ARG_RE for why this is broader than validateIdentifier.
+ * @param {string} value
+ * @param {string} label
+ */
+export function validateModelArg(value, label) {
+	if (!value || typeof value !== "string") {
+		throw new Error(`${label} must be a non-empty string`);
+	}
+	if (!SAFE_MODEL_ARG_RE.test(value)) {
+		throw new Error(
+			`${label} contains unsafe characters: ${JSON.stringify(value)}`,
 		);
 	}
 }

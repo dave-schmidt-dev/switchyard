@@ -1,12 +1,28 @@
 import { ok, strictEqual } from "node:assert";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { captureDiff, executeCodex } from "../src/switchyard/adapter/codex.mjs";
+import {
+	buildAuthContainerScript,
+	captureDiff,
+	executeCodex,
+} from "../src/switchyard/adapter/codex.mjs";
 
 // Resolve path from project root regardless of cwd — guards Finding H.
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+
+function hasDocker() {
+	try {
+		execSync("docker --version", { stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const dockerAvailable = hasDocker();
 
 describe("codex auth isolation", () => {
 	it("does not copy host auth file into container", () => {
@@ -110,6 +126,88 @@ describe("codex adapter shell injection guard", () => {
 			);
 		} finally {
 			rmSync(markerDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("codex auth container script (real container)", () => {
+	it("persists the forwarded secret's actual content into the auth file, not an empty file", {
+		skip: !dockerAvailable,
+	}, () => {
+		// Regression: an earlier version's container script did `cat >
+		// /root/.codex/auth.json` — reading from stdin — while the secret
+		// arrives as a forwarded env var (`docker exec -e NAME`, no stdin
+		// involved). That version exited 0 while writing an EMPTY file,
+		// silently discarding the credential. This runs the exact script
+		// buildAuthContainerScript produces against a real container and
+		// checks the file's actual bytes, not just the exit code.
+		const containerName = `switchyard-codex-authscript-${Date.now()}`;
+		const secretName = "CODEX_AUTH_JSON_TEST";
+		const secretValue = '{"fake":"codex-cred-value"}';
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			const containerScript = buildAuthContainerScript(secretName);
+			execFileSync(
+				"zsh",
+				[
+					"-i",
+					"-c",
+					`docker exec -e ${secretName} ${containerName} sh -c '${containerScript}'`,
+				],
+				{
+					stdio: "pipe",
+					env: { ...process.env, [secretName]: secretValue },
+				},
+			);
+
+			const content = execSync(
+				`docker exec ${containerName} cat /root/.codex/auth.json`,
+				{ encoding: "utf8" },
+			);
+			strictEqual(content.trim(), secretValue);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+});
+
+describe("codex adapter invocation shape (real container)", () => {
+	it("invokes the `codex exec` subcommand, not the bare interactive binary", {
+		skip: !dockerAvailable,
+	}, () => {
+		// Regression: an earlier version called bare `codex` (no `exec`
+		// subcommand). Per the CLI's own --help: "If no subcommand is
+		// specified, options will be forwarded to the interactive CLI" —
+		// so a real dispatch would launch the interactive TUI instead of
+		// running non-interactively. The fake stub below fails loudly if
+		// `exec` isn't argv[1], which a stub that merely ignores its argv
+		// (as the adapter test's stub does) would never have caught.
+		const containerName = `switchyard-codex-shape-${Date.now()}`;
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			execSync(`docker exec ${containerName} mkdir -p /project`, {
+				stdio: "pipe",
+			});
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\nif [ \\"\\$1\\" != exec ]; then echo MISSING_EXEC_SUBCOMMAND >&2; exit 1; fi\ncat >/dev/null\necho ok\n" > /usr/local/bin/codex && chmod +x /usr/local/bin/codex'`,
+				{ stdio: "pipe" },
+			);
+
+			const result = executeCodex("do something", containerName, {});
+			strictEqual(result.success, true, result.error);
+			ok(
+				!result.output.includes("MISSING_EXEC_SUBCOMMAND"),
+				`codex was invoked without its exec subcommand: ${result.output}`,
+			);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 		}
 	});
 });

@@ -7,8 +7,8 @@ import { describe, it } from "node:test";
 import {
 	buildAuthContainerScript,
 	captureDiff,
-	executeClaude,
-} from "../src/switchyard/adapter/claude.mjs";
+	executeAgy,
+} from "../src/switchyard/adapter/agy.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
@@ -23,9 +23,9 @@ function hasDocker() {
 
 const dockerAvailable = hasDocker();
 
-describe("claude auth isolation", () => {
+describe("agy auth isolation", () => {
 	it("does not copy host auth file into container", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/claude.mjs");
+		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/agy.mjs");
 		const source = readFileSync(adapterPath, "utf8");
 
 		strictEqual(
@@ -40,7 +40,7 @@ describe("claude auth isolation", () => {
 	});
 
 	it("never fetches the secret host-side or embeds it in argv", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/claude.mjs");
+		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/agy.mjs");
 		const source = readFileSync(adapterPath, "utf8");
 
 		strictEqual(
@@ -49,16 +49,16 @@ describe("claude auth isolation", () => {
 			"bws-get prints secrets to stdout host-side — must not be used by adapter code",
 		);
 		strictEqual(
-			/-e CLAUDE_CREDENTIALS=/.test(source),
+			/-e GEMINI_CREDENTIALS=/.test(source),
 			false,
 			"secret must not be assigned inline on the docker exec command line (visible via ps)",
 		);
 	});
 });
 
-describe("claude adapter shell injection guard", () => {
+describe("agy adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
-		const result = executeClaude("do something", "bad container; rm -rf /", {});
+		const result = executeAgy("do something", "bad container; rm -rf /", {});
 		strictEqual(result.success, false);
 		ok(
 			result.error?.includes("unsafe characters"),
@@ -67,8 +67,8 @@ describe("claude adapter shell injection guard", () => {
 	});
 
 	it("rejects model name with shell metacharacters", () => {
-		const result = executeClaude("do something", "valid-container", {
-			model: "opus; echo INJECTED",
+		const result = executeAgy("do something", "valid-container", {
+			model: "Gemini 3.6 Flash; echo INJECTED",
 		});
 		strictEqual(result.success, false);
 		ok(
@@ -77,13 +77,13 @@ describe("claude adapter shell injection guard", () => {
 		);
 	});
 
-	it("accepts a valid container name", () => {
-		const result = executeClaude("do something", "switchyard-work-1", {
-			model: "claude-sonnet-5",
+	it("accepts a valid container name and a display-name model with spaces/parens", () => {
+		const result = executeAgy("do something", "switchyard-work-1", {
+			model: "Gemini 3.6 Flash (High)",
 		});
 		ok(
 			!result.error?.includes("unsafe characters"),
-			"valid identifier should not be rejected by validation",
+			"valid identifier/model should not be rejected by validation",
 		);
 	});
 
@@ -93,9 +93,10 @@ describe("claude adapter shell injection guard", () => {
 	});
 
 	it("does not execute shell metacharacters embedded in the prompt on the host", () => {
-		// Same class of bug fixed in the Codex adapter: the prompt must never be
-		// shell-interpolated. Delivered over stdin, so a single quote in a task
-		// description can't break out into host shell syntax.
+		// agy's prompt is delivered as a single execFileSync argv element (a
+		// --print flag value), never through a shell — this guards against a
+		// future refactor accidentally reintroducing shell interpolation, the
+		// exact bug class already found and fixed in the claude/codex adapters.
 		const markerDir = mkdtempSync(
 			join(tmpdir(), "switchyard-prompt-injection-"),
 		);
@@ -103,7 +104,7 @@ describe("claude adapter shell injection guard", () => {
 		const evilPrompt = `wrap up'; touch ${markerPath}; echo '`;
 
 		try {
-			const result = executeClaude(
+			const result = executeAgy(
 				evilPrompt,
 				"switchyard-nonexistent-container",
 				{},
@@ -120,32 +121,19 @@ describe("claude adapter shell injection guard", () => {
 	});
 });
 
-describe("claude auth container script (real container)", () => {
-	it("persists the forwarded secret's actual content to the login step, not an empty file", {
+describe("agy auth container script (real container)", () => {
+	it("persists the forwarded secret's actual content into the credentials file, not an empty file", {
 		skip: !dockerAvailable,
 	}, () => {
-		// Regression: an earlier version's container script did `cat >
-		// /tmp/claude_creds.json` — reading from stdin — while the secret
-		// arrives as a forwarded env var (`docker exec -e NAME`, no stdin
-		// involved). That version exited 0 while `claude login` received an
-		// EMPTY file, silently discarding the credential. The real script
-		// always `rm -f`s the temp file afterward (even on login failure),
-		// so this verifies the persisted content via a fake `claude` stub
-		// that copies what it was actually handed before that cleanup runs.
-		const containerName = `switchyard-claude-authscript-${Date.now()}`;
-		const secretName = "CLAUDE_CREDENTIALS_TEST";
-		const secretValue = '{"fake":"claude-cred-value"}';
+		const containerName = `switchyard-agy-authscript-${Date.now()}`;
+		const secretName = "GEMINI_CREDENTIALS_TEST";
+		const secretValue = '{"fake":"agy-cred-value"}';
 
 		execSync(
 			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
 			{ stdio: "pipe" },
 		);
 		try {
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\ncp \\"\\$3\\" /tmp/captured-for-test.json\necho ok\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
-				{ stdio: "pipe" },
-			);
-
 			const containerScript = buildAuthContainerScript(secretName);
 			execFileSync(
 				"zsh",
@@ -160,11 +148,11 @@ describe("claude auth container script (real container)", () => {
 				},
 			);
 
-			const captured = execSync(
-				`docker exec ${containerName} cat /tmp/captured-for-test.json`,
+			const content = execSync(
+				`docker exec ${containerName} cat /root/.gemini/gemini-credentials.json`,
 				{ encoding: "utf8" },
 			);
-			strictEqual(captured.trim(), secretValue);
+			strictEqual(content.trim(), secretValue);
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 		}

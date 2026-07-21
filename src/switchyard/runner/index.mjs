@@ -4,6 +4,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { captureDiff as captureAgyDiff, executeAgy } from "../adapter/agy.mjs";
 import {
 	captureDiff as captureClaudeDiff,
 	executeClaude,
@@ -12,6 +13,10 @@ import {
 	captureDiff as captureCodexDiff,
 	executeCodex,
 } from "../adapter/codex.mjs";
+import {
+	captureDiff as captureCursorDiff,
+	executeCursor,
+} from "../adapter/cursor.mjs";
 import { integrationGate } from "../integrate/index.mjs";
 import { recordDispatch } from "../ledger/index.mjs";
 import { classifyTask } from "../roster/classifier.mjs";
@@ -695,6 +700,14 @@ export function runQueue(options) {
 			codex: {
 				execute: executeCodex,
 				captureDiff: captureCodexDiff,
+			},
+			agy: {
+				execute: executeAgy,
+				captureDiff: captureAgyDiff,
+			},
+			cursor: {
+				execute: executeCursor,
+				captureDiff: captureCursorDiff,
 			},
 		},
 		projectPath,

@@ -4,10 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import {
-	captureDiff,
-	executeClaude,
-} from "../src/switchyard/adapter/claude.mjs";
+import { captureDiff, executeAgy } from "../src/switchyard/adapter/agy.mjs";
 
 function hasDocker() {
 	try {
@@ -19,10 +16,10 @@ function hasDocker() {
 }
 
 const dockerAvailable = hasDocker();
-const testRoot = mkdtempSync(join(tmpdir(), "switchyard-claude-adapter-"));
-const containerName = `switchyard-claude-adapter-${Date.now()}`;
+const testRoot = mkdtempSync(join(tmpdir(), "switchyard-agy-adapter-"));
+const containerName = `switchyard-agy-adapter-${Date.now()}`;
 
-describe("claude adapter container execution", () => {
+describe("agy adapter container execution", () => {
 	before(() => {
 		if (!dockerAvailable) return;
 
@@ -41,8 +38,10 @@ describe("claude adapter container execution", () => {
 			{ stdio: "pipe" },
 		);
 
+		// agy's prompt arrives as a --print flag value, not stdin (unlike
+		// claude/codex) — the stub doesn't drain stdin since none is sent.
 		execSync(
-			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\ncat >/dev/null\necho updated >> test.txt\necho claude\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
+			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho updated >> test.txt\necho agy\n" > /usr/local/bin/agy && chmod +x /usr/local/bin/agy'`,
 			{ stdio: "pipe" },
 		);
 	});
@@ -58,13 +57,13 @@ describe("claude adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("executes claude inside working container and captures diff", {
+	it("executes agy inside working container and captures diff", {
 		skip: !dockerAvailable,
 	}, () => {
-		const result = executeClaude("apply a small change", containerName, {
-			model: "fake-model",
+		const result = executeAgy("apply a small change", containerName, {
+			model: "Gemini 3.6 Flash (Medium)",
 		});
-		strictEqual(result.success, true);
+		strictEqual(result.success, true, result.error);
 
 		const diff = captureDiff(containerName);
 		ok(typeof diff === "string" && diff.includes("updated"));

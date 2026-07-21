@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
 	captureDiff,
-	executeClaude,
-} from "../src/switchyard/adapter/claude.mjs";
+	executeCursor,
+} from "../src/switchyard/adapter/cursor.mjs";
 
 function hasDocker() {
 	try {
@@ -19,10 +19,10 @@ function hasDocker() {
 }
 
 const dockerAvailable = hasDocker();
-const testRoot = mkdtempSync(join(tmpdir(), "switchyard-claude-adapter-"));
-const containerName = `switchyard-claude-adapter-${Date.now()}`;
+const testRoot = mkdtempSync(join(tmpdir(), "switchyard-cursor-adapter-"));
+const containerName = `switchyard-cursor-adapter-${Date.now()}`;
 
-describe("claude adapter container execution", () => {
+describe("cursor adapter container execution", () => {
 	before(() => {
 		if (!dockerAvailable) return;
 
@@ -41,8 +41,12 @@ describe("claude adapter container execution", () => {
 			{ stdio: "pipe" },
 		);
 
+		// executeCursor calls the post-auth wrapper binary (cursor-agent-authed),
+		// not cursor-agent directly — install the fake stub under that name,
+		// same as authenticateCursor would in a real deployment. cursor-agent
+		// can't read stdin, so this stub doesn't try to drain any.
 		execSync(
-			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\ncat >/dev/null\necho updated >> test.txt\necho claude\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
+			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho updated >> test.txt\necho cursor-agent\n" > /usr/local/bin/cursor-agent-authed && chmod +x /usr/local/bin/cursor-agent-authed'`,
 			{ stdio: "pipe" },
 		);
 	});
@@ -58,13 +62,13 @@ describe("claude adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("executes claude inside working container and captures diff", {
+	it("executes cursor-agent-authed inside working container and captures diff", {
 		skip: !dockerAvailable,
 	}, () => {
-		const result = executeClaude("apply a small change", containerName, {
-			model: "fake-model",
+		const result = executeCursor("apply a small change", containerName, {
+			model: "composer-2.5",
 		});
-		strictEqual(result.success, true);
+		strictEqual(result.success, true, result.error);
 
 		const diff = captureDiff(containerName);
 		ok(typeof diff === "string" && diff.includes("updated"));

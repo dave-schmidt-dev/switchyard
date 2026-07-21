@@ -5,9 +5,28 @@
 
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
-import { validateEnvName, validateIdentifier } from "./shell-safety.mjs";
+import {
+	validateEnvName,
+	validateIdentifier,
+	validateModelArg,
+} from "./shell-safety.mjs";
 
 const CODEX_CMD = "codex";
+
+/**
+ * Build the in-container script that persists the Codex auth payload
+ * forwarded via `docker exec -e ${secretName}` into `~/.codex/auth.json`.
+ * Pure/testable: exported separately from the `bws-run` wrapper so a test
+ * can verify the *actual file content* ends up correct without needing real
+ * BWS access — this exact bug (script reading from stdin instead of
+ * referencing the forwarded env var, silently writing an empty file with
+ * exit code 0) shipped once already.
+ * @param {string} secretName
+ * @returns {string}
+ */
+export function buildAuthContainerScript(secretName) {
+	return `mkdir -p /root/.codex && printf '%s' "$${secretName}" > /root/.codex/auth.json && chmod 600 /root/.codex/auth.json`;
+}
 
 /**
  * Check if Codex is authenticated in the container.
@@ -47,8 +66,7 @@ export function authenticateCodex(secretName = "CODEX_AUTH_JSON") {
 		return false;
 	}
 
-	const containerScript =
-		"mkdir -p /root/.codex && cat > /root/.codex/auth.json && chmod 600 /root/.codex/auth.json";
+	const containerScript = buildAuthContainerScript(secretName);
 
 	try {
 		execFileSync(
@@ -94,10 +112,15 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 		"/project",
 		workingContainerName,
 		CODEX_CMD,
+		// Codex's own `exec` subcommand, required for non-interactive dispatch —
+		// `codex` bare forwards straight to the interactive TUI regardless of
+		// whether stdout is a TTY (unlike `claude`, which auto-detects piped
+		// output). Verified against the installed CLI's own --help.
+		"exec",
 	];
 	if (model) {
 		try {
-			validateIdentifier(model, "model");
+			validateModelArg(model, "model");
 		} catch (error) {
 			return { output: "", success: false, error: error.message };
 		}

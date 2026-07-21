@@ -27,7 +27,7 @@ function existsInContainer(path) {
 describe("no host rights", () => {
 	before(() => {
 		try {
-			execSync(`docker rm -f ${TEST_CONTAINER}`, { stdio: "inherit" });
+			execSync(`docker rm -f -v ${TEST_CONTAINER}`, { stdio: "inherit" });
 		} catch {
 			// Ignore
 		}
@@ -39,7 +39,7 @@ describe("no host rights", () => {
 
 	after(() => {
 		try {
-			execSync(`docker rm -f ${TEST_CONTAINER}`, { stdio: "inherit" });
+			execSync(`docker rm -f -v ${TEST_CONTAINER}`, { stdio: "inherit" });
 		} catch {
 			// Ignore
 		}

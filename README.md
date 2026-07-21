@@ -1,8 +1,8 @@
 # switchyard
 
-A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, with Agy/Cursor/Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
+A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, Agy, Cursor, with Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-5 implemented and test-covered (108/108 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the container/auth lifecycle functions it imports the adapters from (`TASKS.md` Task 9). `npm run validate`'s `deadcode` step reports both honestly.
+**Status:** Phases 0-5 implemented and test-covered (134/134 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the agent-container lifecycle functions it imports the adapters from (`TASKS.md` Task 9); no Docker image exists yet to build either container from (`TASKS.md` Task 14). `npm run validate`'s `deadcode` step reports all three honestly.
 
 ## Priorities (in order)
 
@@ -34,22 +34,30 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker-managed volumes — **unused**, not yet wired into the runner. See `TASKS.md` Task 8. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, `allowSensitiveManifests`-gated review for build/CI manifests, `git apply` via stdin. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
-| `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateEnvName`) used by both provider adapters. |
-| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection. |
-| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection. |
-| `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). |
+| `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateEnvName`, `validateModelArg`) used by all four provider adapters. |
+| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection (persisted credentials JSON). |
+| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch via `codex exec` (prompt over stdin), diff capture, BWS-based auth injection (persisted `auth.json`). |
+| `src/switchyard/adapter/agy.mjs` | Antigravity (Agy) CLI adapter: dispatch (prompt via `--print` flag, not stdin — the CLI can't read it for this purpose), diff capture, BWS-based auth injection (persisted `gemini-credentials.json`). |
+| `src/switchyard/adapter/cursor.mjs` | Cursor Agent adapter: dispatch via a generated `cursor-agent-authed` wrapper (prompt as a positional argument — the CLI can't read stdin), diff capture. Auth is `CURSOR_API_KEY` (Cursor's own documented headless/CI mechanism), not the interactive OAuth session — see module comment for why. |
+| `src/switchyard/auth/index.mjs` | Checks every provider's auth status and runs its headless login for any not yet authenticated. Run directly via `npm run auth`. |
+| `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). Wires all four adapters; `route()` is restricted to whichever adapters are actually present. |
 | **Tests** | |
 | `tests/capability-match.test.mjs` | INV-5 gate: capability filter, tier ordering, model right-sizing. |
 | `tests/classifier.test.mjs` | Keyword-based task tier classifier unit tests. |
 | `tests/claude-adapter.test.mjs` | Container-backed Claude CLI dispatch and diff capture tests. |
-| `tests/claude-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression. |
+| `tests/claude-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression, real-container auth-persistence check. |
 | `tests/codex-adapter.test.mjs` | Container-backed Codex CLI dispatch and diff capture tests. |
-| `tests/codex-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression. |
+| `tests/codex-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression, real-container auth-persistence check, `codex exec` subcommand-shape check. |
+| `tests/agy-adapter.test.mjs` | Container-backed Agy CLI dispatch and diff capture tests. |
+| `tests/agy-auth.test.mjs` | Same regression shape as codex-auth, adapted for agy's `--print`-flag prompt delivery and display-name model strings. |
+| `tests/cursor-adapter.test.mjs` | Container-backed Cursor Agent dispatch (via the `cursor-agent-authed` wrapper) and diff capture tests. |
+| `tests/cursor-auth.test.mjs` | Same regression shape, plus a real-container check of the generated auth wrapper script's content/permissions. |
+| `tests/auth-check.test.mjs` | `ensureProvidersAuthenticated` unit tests via injected fake providers (no real Docker/BWS needed). |
 | `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
 | `tests/ledger.test.mjs` | INV-4 dispatch ledger recording and querying unit tests. |
 | `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation (generic Docker behavior — see `TASKS.md` Task 8). |
-| `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5. |
-| `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume, stopOnFailure/gate-failure handling, headroom-routing mechanism, and orchestrator CLI integration tests. |
+| `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5, adapter-availability filtering, blind fallback. |
+| `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume (atomic writes), stopOnFailure/gate-failure handling, headroom-routing mechanism, orchestrator CLI integration, and orchestrator status/result error guards. |
 | `tests/scorer.test.mjs` | FNV-1a hash, mulberry32 PRNG, and scoring logic unit tests. |
 | `tests/workspace-wipe.test.mjs` | INV-3 gate: working container wipe, agent container persistence (generic Docker behavior — see `TASKS.md` Task 8). |
 
@@ -74,6 +82,16 @@ Run code quality check with Biome:
 ```bash
 npm run lint
 ```
+
+### Provider Authentication
+
+Check every provider's auth status and run its headless login for any not yet authenticated:
+
+```bash
+npm run auth
+```
+
+Each provider's `authenticate*()` fetches its credential from BWS and persists it inside the standing agent container — see each adapter's module comment for the exact secret name/shape (`CLAUDE_CREDENTIALS`, `CODEX_AUTH_JSON`, `GEMINI_CREDENTIALS`, `CURSOR_API_KEY`). Exits non-zero if any provider fails.
 
 ### Queue Dispatching and Orchestration
 

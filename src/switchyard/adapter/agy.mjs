@@ -1,5 +1,5 @@
-// Claude adapter - write-enabled implementer
-// Executes claude CLI inside the container (never host-spawn)
+// Agy (Antigravity CLI) adapter - write-enabled implementer
+// Executes agy CLI inside the container (never host-spawn)
 // CR-4: Adapters exec inside container, never host-spawn
 // PW-4: Independent in-container login
 
@@ -11,43 +11,44 @@ import {
 	validateModelArg,
 } from "./shell-safety.mjs";
 
-const CLAUDE_CMD = "claude";
+const AGY_CMD = "agy";
 
 /**
- * Build the in-container script that persists the Claude credentials JSON
- * forwarded via `docker exec -e ${secretName}` into a file `claude login`
- * can read. Pure/testable: exported separately from the `bws-run` wrapper so
- * a test can verify the *actual file content* ends up correct without
- * needing real BWS access — this exact bug (script reading from stdin
- * instead of referencing the forwarded env var, silently writing an empty
- * file with exit code 0) shipped once already.
+ * Build the in-container script that persists the Gemini/Antigravity
+ * credentials JSON forwarded via `docker exec -e ${secretName}` into the
+ * path `agy` reads (`~/.gemini/gemini-credentials.json` — confirmed against
+ * a real local installation; the CLI still uses the `.gemini` directory
+ * namespace internally despite the `agy` rename).
  * @param {string} secretName
  * @returns {string}
  */
 export function buildAuthContainerScript(secretName) {
-	return `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; rm -f /tmp/claude_creds.json`;
+	return `mkdir -p /root/.gemini && printf '%s' "$${secretName}" > /root/.gemini/gemini-credentials.json && chmod 600 /root/.gemini/gemini-credentials.json`;
 }
 
 /**
- * Check if Claude is authenticated in the container.
+ * Check if Agy is installed/responding in the container. Like the
+ * claude/codex equivalents, this is a liveness check (the binary runs), not
+ * a real authentication check — agy's `--version` output has no vendor
+ * keyword to match against.
  * @returns {boolean}
  */
-export function isClaudeAuthenticated() {
+export function isAgyAuthenticated() {
 	try {
 		const result = execFileSync(
 			"docker",
-			["exec", AGENT_CONTAINER_NAME, CLAUDE_CMD, "--version"],
+			["exec", AGENT_CONTAINER_NAME, AGY_CMD, "--version"],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return result.includes("Claude");
+		return typeof result === "string" && result.trim().length > 0;
 	} catch {
 		return false;
 	}
 }
 
 /**
- * Authenticate Claude in the container.
- * PW-4: Independent in-container login (subscription, never API keys).
+ * Authenticate Agy in the container.
+ * PW-4: Independent in-container login via BWS-provided credentials payload.
  *
  * The secret is never fetched host-side and never appears in any process's
  * argv (visible via `ps`/`/proc`): `bws-run` injects `secretName` as an env
@@ -55,14 +56,14 @@ export function isClaudeAuthenticated() {
  * (bare, no `=value`) forwards that host env var into the container by
  * reference. Requires `secretName` to be the exact BWS secret key
  * (project convention: UPPERCASE_SNAKE_CASE matching the env var).
- * @param {string} [secretName] BWS secret name for the Claude credentials JSON.
+ * @param {string} [secretName] BWS secret name for the Gemini credentials JSON.
  * @returns {boolean}
  */
-export function authenticateClaude(secretName = "CLAUDE_CREDENTIALS") {
+export function authenticateAgy(secretName = "GEMINI_CREDENTIALS") {
 	try {
 		validateEnvName(secretName, "secretName");
 	} catch (error) {
-		console.error("Failed to authenticate Claude:", error.message);
+		console.error("Failed to authenticate Agy:", error.message);
 		return false;
 	}
 
@@ -80,23 +81,25 @@ export function authenticateClaude(secretName = "CLAUDE_CREDENTIALS") {
 		);
 		return true;
 	} catch (error) {
-		console.error("Failed to authenticate Claude:", error.message);
+		console.error("Failed to authenticate Agy:", error.message);
 		return false;
 	}
 }
 
 /**
- * Execute a task with Claude in the container.
- * The prompt is delivered over stdin, never shell-interpolated — this
- * avoids both shell-injection and the multi-line-prompt-flattening problem
- * that string interpolation forced on us.
+ * Execute a task with Agy in the container.
+ * Unlike claude/codex, agy's prompt is a `--print <value>` flag argument, not
+ * stdin (confirmed against the installed CLI's own --help) — still delivered
+ * as a single execFileSync argv element, never shell-interpolated.
+ * `--new-project` is required so each task gets an isolated conversation
+ * rather than resuming a stale prior one.
  * @param {string} prompt The task prompt
  * @param {string} workingContainerName Working container to exec in
  * @param {object} options Execution options
  * @param {string} [options.model] Model to use
  * @returns {{output: string, success: boolean, error?: string}}
  */
-export function executeClaude(prompt, workingContainerName, options = {}) {
+export function executeAgy(prompt, workingContainerName, options = {}) {
 	const { model } = options;
 
 	try {
@@ -107,11 +110,13 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 
 	const args = [
 		"exec",
-		"-i",
 		"-w",
 		"/project",
 		workingContainerName,
-		CLAUDE_CMD,
+		AGY_CMD,
+		"--new-project",
+		"--mode",
+		"accept-edits",
 	];
 	if (model) {
 		try {
@@ -121,12 +126,19 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 		}
 		args.push("--model", model);
 	}
+	args.push(
+		"--add-dir",
+		"/project",
+		"--print-timeout",
+		"9m",
+		"--print",
+		prompt,
+	);
 
 	try {
 		const result = execFileSync("docker", args, {
-			input: prompt,
 			encoding: "utf8",
-			stdio: ["pipe", "pipe", "pipe"],
+			stdio: ["ignore", "pipe", "pipe"],
 			timeout: 300000,
 		});
 
@@ -141,7 +153,7 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 }
 
 /**
- * Capture the diff produced by Claude in the working container.
+ * Capture the diff produced by Agy in the working container.
  * @param {string} workingContainerName Working container name
  * @returns {string|null} Git diff or null
  */
@@ -163,4 +175,4 @@ export function captureDiff(workingContainerName) {
 	}
 }
 
-export { CLAUDE_CMD };
+export { AGY_CMD };

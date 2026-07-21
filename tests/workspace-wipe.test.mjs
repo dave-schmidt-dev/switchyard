@@ -25,7 +25,7 @@ function containerExists(name) {
 describe("workspace wipe", () => {
 	before(() => {
 		try {
-			execSync(`docker rm -f ${WORKING_CONTAINER} ${AGENT_CONTAINER}`, {
+			execSync(`docker rm -f -v ${WORKING_CONTAINER} ${AGENT_CONTAINER}`, {
 				stdio: "inherit",
 			});
 		} catch {
@@ -44,7 +44,7 @@ describe("workspace wipe", () => {
 
 	after(() => {
 		try {
-			execSync(`docker rm -f ${WORKING_CONTAINER} ${AGENT_CONTAINER}`, {
+			execSync(`docker rm -f -v ${WORKING_CONTAINER} ${AGENT_CONTAINER}`, {
 				stdio: "inherit",
 			});
 		} catch {
