@@ -139,7 +139,12 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 		const result = execFileSync("docker", args, {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
-			timeout: 300000,
+			// Must exceed the `--print-timeout 9m` passed above — the host
+			// kill is a backstop for a hung/unresponsive process, not the
+			// primary timeout mechanism. A shorter host timeout would force-
+			// kill a run that Agy's own flag would otherwise let finish or
+			// time out gracefully.
+			timeout: 600000,
 		});
 
 		return { output: result, success: true };

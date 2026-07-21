@@ -302,9 +302,13 @@ export function getRunnableTasks(tasks, checkpoint) {
 
 function selectAdapter(providerName, adapters) {
 	const provider = providerName?.toLowerCase();
-	if (provider === "claude") return adapters.claude;
-	if (provider === "codex") return adapters.codex;
-	return null;
+	if (!provider) return null;
+	// Look up by key rather than a hardcoded provider allowlist: the prior
+	// version only recognized "claude"/"codex" and silently orphaned agy/
+	// cursor when they were added to the default adapters map below — route()
+	// (via availableProviders) correctly reported them as dispatchable, but
+	// this function still rejected them as unsupported on every attempt.
+	return adapters?.[provider] ?? null;
 }
 
 /**

@@ -18,6 +18,7 @@ import { afterEach, describe, it } from "node:test";
 import { SNAPSHOT_PATH } from "../src/switchyard/router/index.mjs";
 import {
 	createCliOrchestrator,
+	executeTask,
 	getRunnableTasks,
 	loadCheckpoint,
 	parseTaskQueue,
@@ -736,6 +737,63 @@ describe("runner provider spread recording", () => {
 			}
 		}
 	});
+
+	for (const provider of ["agy", "cursor"]) {
+		it(`dispatches to the ${provider} adapter when route selects it (regression: selectAdapter only recognized claude/codex)`, () => {
+			// Regression: runQueue's default adapters map was extended to include
+			// agy/cursor (so route()'s availableProviders correctly reports them
+			// as dispatchable), but selectAdapter() itself was never updated
+			// beyond its original claude/codex checks. That combination is worse
+			// than not wiring them at all: route() is now told agy/cursor are
+			// available and may legitimately pick one, but selectAdapter() then
+			// returns null for it and the task fails with "unsupported_provider"
+			// on every attempt (and every resume), exactly the failure mode the
+			// availableProviders fix was meant to eliminate.
+			const dispatches = [];
+			const result = executeTask(
+				{ id: "1.1", title: "task", description: "simple cleanup" },
+				{
+					route: () => ({
+						provider,
+						model: `${provider}-model`,
+						percentLeft: 50,
+						reason: "spread",
+					}),
+					recordDispatch: (entry) => dispatches.push(entry),
+					integrationGate: () => ({ success: true, message: "ok" }),
+					adapters: {
+						claude: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/a b/a",
+						},
+						codex: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/b b/b",
+						},
+						agy: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/c b/c",
+						},
+						cursor: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/d b/d",
+						},
+					},
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+				},
+			);
+
+			notStrictEqual(
+				result.result,
+				"unsupported_provider",
+				`${provider} has an adapter wired but was rejected as unsupported`,
+			);
+			strictEqual(result.success, true);
+			strictEqual(dispatches[0].provider, provider);
+			strictEqual(dispatches[0].result, "success");
+		});
+	}
 });
 
 describe("runner cli orchestrator wiring", () => {

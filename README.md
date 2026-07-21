@@ -2,7 +2,7 @@
 
 A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, Agy, Cursor, with Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-5 implemented and test-covered (134/134 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the agent-container lifecycle functions it imports the adapters from (`TASKS.md` Task 9); no Docker image exists yet to build either container from (`TASKS.md` Task 14). `npm run validate`'s `deadcode` step reports all three honestly.
+**Status:** Phases 0-5 implemented and test-covered (158/158 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the agent-container lifecycle functions it imports the adapters from (`TASKS.md` Task 9); no Docker image exists yet to build either container from (`TASKS.md` Task 14). `npm run validate`'s `deadcode` step reports all three honestly. Provider auth-checks are liveness-only, not real credential checks (`TASKS.md` Task 15).
 
 ## Priorities (in order)
 

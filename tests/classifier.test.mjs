@@ -85,6 +85,26 @@ describe("classifier", () => {
 			strictEqual(classifyTask("simple change to session credentials"), "high");
 		});
 
+		it("classifies inflected security keywords (plurals, prefixes, verbs) as high", () => {
+			// Regression: word-boundary \b(keyword)\b false-negated inflected
+			// forms of the security-critical subset, dropping tasks explicitly
+			// about credentials/sessions/auth to the WEAKEST tier. The trailing
+			// "s" broke \bsession\b/\bcredential\b, and "un"+"orized" broke
+			// \bauth\b on both sides — so these now use substring matching.
+			strictEqual(
+				classifyTask("Clean up expired sessions and remove old credentials"),
+				"high",
+			);
+			strictEqual(classifyTask("delete unused credentials file"), "high");
+			strictEqual(
+				classifyTask("unauthorized access bug in the endpoint"),
+				"high",
+			);
+			// Verb form: "authenticating" contains "auth" as a substring; the
+			// otherwise-standard "review" signal must not win over it.
+			strictEqual(classifyTask("review the authenticating flow"), "high");
+		});
+
 		it("should default to high for null/undefined input", () => {
 			strictEqual(classifyTask(null), "high");
 			strictEqual(classifyTask(undefined), "high");
@@ -97,6 +117,19 @@ describe("classifier", () => {
 
 		it("should default to high for empty string", () => {
 			strictEqual(classifyTask(""), "high");
+		});
+
+		it("should default to high for a whitespace-only description", () => {
+			// The `.trim()` check is what makes this distinct from the plain
+			// empty-string case above: without it, a whitespace-only description
+			// falls through to the keyword regexes (which simply never match),
+			// landing on the same conservative-high result today but only by
+			// accident of no keyword matching whitespace — not by an explicit
+			// guard. Covering it directly so a future keyword addition that
+			// happens to match whitespace (e.g. a regex with a `*` quantifier)
+			// can't silently change this case's outcome.
+			strictEqual(classifyTask("   "), "high");
+			strictEqual(classifyTask("\t\n  \n"), "high");
 		});
 
 		it("should be case-insensitive", () => {

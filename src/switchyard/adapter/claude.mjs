@@ -21,11 +21,17 @@ const CLAUDE_CMD = "claude";
  * needing real BWS access — this exact bug (script reading from stdin
  * instead of referencing the forwarded env var, silently writing an empty
  * file with exit code 0) shipped once already.
+ *
+ * The trailing cleanup (`rm -f`) must not run as an unconditional `;`
+ * continuation after the login chain — that would make `rm -f`'s own exit
+ * code (almost always 0) the script's final status, masking a real `claude
+ * login` failure as success. Capture the chain's exit status first, always
+ * clean up, then exit with the captured status.
  * @param {string} secretName
  * @returns {string}
  */
 export function buildAuthContainerScript(secretName) {
-	return `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; rm -f /tmp/claude_creds.json`;
+	return `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; login_status=$?; rm -f /tmp/claude_creds.json; exit $login_status`;
 }
 
 /**

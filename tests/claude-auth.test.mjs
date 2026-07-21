@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+	authenticateClaude,
 	buildAuthContainerScript,
 	captureDiff,
 	executeClaude,
@@ -120,6 +121,41 @@ describe("claude adapter shell injection guard", () => {
 	});
 });
 
+describe("authenticateClaude() secretName injection guard", () => {
+	it("rejects a malformed secretName before it ever reaches a shell", () => {
+		// authenticateClaude interpolates secretName directly into a
+		// `zsh -c "... docker exec -e ${secretName} ..."` string, so a
+		// malformed value must be rejected by validateEnvName before
+		// execFileSync is ever called — not just after. Proven here the
+		// same way the prompt-injection regressions above are proven: if
+		// the guard didn't fire first, this secretName would run `touch`
+		// on the host.
+		const markerDir = mkdtempSync(
+			join(tmpdir(), "switchyard-authname-injection-"),
+		);
+		const markerPath = join(markerDir, "marker");
+		const evilSecretName = `BAD; touch ${markerPath}; echo x`;
+
+		try {
+			const result = authenticateClaude(evilSecretName);
+			strictEqual(result, false, "malformed secretName must be rejected");
+			strictEqual(
+				existsSync(markerPath),
+				false,
+				"a malformed secretName must never reach a shell invocation",
+			);
+		} finally {
+			rmSync(markerDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects secretName values that aren't UPPERCASE_SNAKE_CASE", () => {
+		strictEqual(authenticateClaude("lowercase_name"), false);
+		strictEqual(authenticateClaude(""), false);
+		strictEqual(authenticateClaude(null), false);
+	});
+});
+
 describe("claude auth container script (real container)", () => {
 	it("persists the forwarded secret's actual content to the login step, not an empty file", {
 		skip: !dockerAvailable,
@@ -165,6 +201,74 @@ describe("claude auth container script (real container)", () => {
 				{ encoding: "utf8" },
 			);
 			strictEqual(captured.trim(), secretValue);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+
+	it("propagates a failed `claude login` as a non-zero script exit, not a masked success", {
+		skip: !dockerAvailable,
+	}, () => {
+		// Regression: the script's trailing `rm -f /tmp/claude_creds.json` used
+		// to run as an unconditional `;`-continuation after the login chain —
+		// so the temp-file cleanup's own exit code (almost always 0) became the
+		// whole script's exit status, masking a real `claude login` failure as
+		// success. authenticateClaude() would then report `true` for a failed
+		// login. The fixed script captures the login chain's exit status before
+		// cleanup and re-exits with it. This uses a fake `claude` stub that
+		// always fails, and asserts the container script itself now fails.
+		const containerName = `switchyard-claude-authfail-${Date.now()}`;
+		const secretName = "CLAUDE_CREDENTIALS_TEST_FAIL";
+		const secretValue = '{"fake":"claude-cred-value"}';
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho login failed >&2\nexit 1\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
+				{ stdio: "pipe" },
+			);
+
+			const containerScript = buildAuthContainerScript(secretName);
+			let threw = false;
+			try {
+				execFileSync(
+					"zsh",
+					[
+						"-i",
+						"-c",
+						`docker exec -e ${secretName} ${containerName} sh -c '${containerScript}'`,
+					],
+					{
+						stdio: "pipe",
+						env: { ...process.env, [secretName]: secretValue },
+					},
+				);
+			} catch {
+				threw = true;
+			}
+			ok(
+				threw,
+				"container script must exit non-zero when `claude login` fails, not be masked by the trailing cleanup's own success",
+			);
+
+			// The cleanup must still have run despite the failure.
+			let credsFileExists = true;
+			try {
+				execSync(
+					`docker exec ${containerName} test -f /tmp/claude_creds.json`,
+					{ stdio: "pipe" },
+				);
+			} catch {
+				credsFileExists = false;
+			}
+			strictEqual(
+				credsFileExists,
+				false,
+				"temp credentials file must be cleaned up even when login fails",
+			);
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 		}

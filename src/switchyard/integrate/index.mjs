@@ -59,25 +59,108 @@ function escapesProjectRoot(projectRoot, relativePath) {
 }
 
 /**
+ * Decode a git C-quoted path back to its real characters.
+ *
+ * Git wraps a path in double-quotes and C-escapes its contents whenever it
+ * contains a byte that would otherwise corrupt the tab-delimited
+ * `--numstat`/`--summary` output. Double-quote, backslash and control
+ * characters (tab, newline, ...) are ALWAYS escaped regardless of
+ * `core.quotePath`; bytes >= 0x80 (non-ASCII UTF-8) are escaped only while
+ * `core.quotePath` is on. A quoted path is therefore pure ASCII on the wire:
+ * `\\` = backslash, `\"` = double-quote, `\a \b \f \n \r \t \v` = the matching
+ * control byte, and `\NNN` (exactly three octal digits) = one raw byte.
+ * Multi-byte UTF-8 characters arrive as consecutive `\NNN` escapes (one per
+ * byte, e.g. `é` -> `\303\251`), so escapes are collected into a raw byte
+ * buffer and UTF-8-decoded as a whole at the end — never byte-by-byte.
+ *
+ * Without this, a path like `café/.env` reaches the sensitive-path and
+ * manifest-review checks as the literal string `"caf\303\251/.env"` (quotes
+ * and octal escapes included), whose trailing `"` defeats every pattern
+ * anchored with `(\.|$)` / `$` after the filename — a real INV-2 bypass.
+ *
+ * @param {string} path A path field from git output, possibly C-quoted.
+ * @returns {string} The real path (returned unchanged if it was never quoted).
+ */
+export function dequoteGitPath(path) {
+	if (path.length < 2 || path[0] !== '"' || path[path.length - 1] !== '"') {
+		return path;
+	}
+
+	const simpleEscapes = {
+		a: 0x07,
+		b: 0x08,
+		f: 0x0c,
+		n: 0x0a,
+		r: 0x0d,
+		t: 0x09,
+		v: 0x0b,
+		'"': 0x22,
+		"\\": 0x5c,
+	};
+
+	const inner = path.slice(1, -1);
+	const bytes = [];
+	for (let i = 0; i < inner.length; i++) {
+		if (inner[i] !== "\\") {
+			bytes.push(inner.charCodeAt(i));
+			continue;
+		}
+
+		const next = inner[i + 1];
+		if (next === undefined) {
+			// Dangling backslash (not valid git output) — keep it literally.
+			bytes.push(0x5c);
+			continue;
+		}
+		if (next >= "0" && next <= "7") {
+			// `\NNN`: exactly three octal digits => one raw byte.
+			bytes.push(Number.parseInt(inner.slice(i + 1, i + 4), 8) & 0xff);
+			i += 3;
+			continue;
+		}
+		const mapped = simpleEscapes[next];
+		if (mapped !== undefined) {
+			bytes.push(mapped);
+			i += 1;
+			continue;
+		}
+		// Unknown escape (not valid git output) — keep the escaped char.
+		bytes.push(inner.charCodeAt(i + 1));
+		i += 1;
+	}
+
+	return Buffer.from(bytes).toString("utf8");
+}
+
+/**
  * Extract the file paths a diff touches via `git apply --numstat` (git's own
  * diff parser, not a hand-rolled regex over diff text).
+ *
+ * `-c core.quotePath=false` keeps the common non-ASCII path (e.g. `café/.env`)
+ * un-quoted so it round-trips as-is; paths git still quotes unconditionally
+ * (double-quote/backslash/control chars) are decoded by `dequoteGitPath`.
  * @param {string} diff
  * @param {string} projectPath
  * @returns {string[]|null} paths, or null if git could not parse the diff
  */
 function extractTouchedPaths(diff, projectPath) {
-	const result = spawnSync("git", ["apply", "--numstat"], {
-		cwd: projectPath,
-		input: diff,
-		encoding: "utf8",
-	});
+	const result = spawnSync(
+		"git",
+		["-c", "core.quotePath=false", "apply", "--numstat"],
+		{
+			cwd: projectPath,
+			input: diff,
+			encoding: "utf8",
+		},
+	);
 	if (result.status !== 0 || typeof result.stdout !== "string") return null;
 
 	return result.stdout
 		.split("\n")
 		.filter(Boolean)
 		.map((line) => line.split("\t")[2])
-		.filter(Boolean);
+		.filter(Boolean)
+		.map(dequoteGitPath);
 }
 
 /**
@@ -89,11 +172,15 @@ function extractTouchedPaths(diff, projectPath) {
  *   special structural changes — a plain content-only diff produces none)
  */
 function extractSummaryLines(diff, projectPath) {
-	const result = spawnSync("git", ["apply", "--summary"], {
-		cwd: projectPath,
-		input: diff,
-		encoding: "utf8",
-	});
+	const result = spawnSync(
+		"git",
+		["-c", "core.quotePath=false", "apply", "--summary"],
+		{
+			cwd: projectPath,
+			input: diff,
+			encoding: "utf8",
+		},
+	);
 	if (typeof result.stdout !== "string") return [];
 	return result.stdout.split("\n").filter(Boolean);
 }

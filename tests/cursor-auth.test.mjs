@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+	authenticateCursor,
 	buildAuthContainerScript,
 	captureDiff,
 	executeCursor,
@@ -123,6 +124,38 @@ describe("cursor adapter shell injection guard", () => {
 		} finally {
 			rmSync(markerDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("authenticateCursor() secretName injection guard", () => {
+	it("rejects a malformed secretName before it ever reaches a shell", () => {
+		// authenticateCursor interpolates secretName directly into a
+		// `zsh -c "... docker exec -e ${secretName} ..."` string, so a
+		// malformed value must be rejected by validateEnvName before
+		// execFileSync is ever called — not just after.
+		const markerDir = mkdtempSync(
+			join(tmpdir(), "switchyard-authname-injection-"),
+		);
+		const markerPath = join(markerDir, "marker");
+		const evilSecretName = `BAD; touch ${markerPath}; echo x`;
+
+		try {
+			const result = authenticateCursor(evilSecretName);
+			strictEqual(result, false, "malformed secretName must be rejected");
+			strictEqual(
+				existsSync(markerPath),
+				false,
+				"a malformed secretName must never reach a shell invocation",
+			);
+		} finally {
+			rmSync(markerDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects secretName values that aren't UPPERCASE_SNAKE_CASE", () => {
+		strictEqual(authenticateCursor("lowercase_name"), false);
+		strictEqual(authenticateCursor(""), false);
+		strictEqual(authenticateCursor(null), false);
 	});
 });
 
