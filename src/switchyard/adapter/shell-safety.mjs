@@ -13,7 +13,9 @@ const SAFE_IDENTIFIER_RE = /^[\w./:@-]+$/;
 // interpolated into a shell string), so display-name conventions like
 // "Gemini 3.6 Flash (High)" are legitimate. Still rejects shell metacharacters
 // as defense-in-depth against a future refactor accidentally adding a shell.
-const SAFE_MODEL_ARG_RE = /^[\w./:@() -]{1,200}$/;
+// Rejects any value starting with `-` to prevent flag-like values (defense-in-depth
+// against model values becoming attacker-controlled in the future).
+const SAFE_MODEL_ARG_RE = /^(?!-)[\w./:@() -]{1,200}$/;
 
 // Safe env-var-name pattern: BWS secret names doubling as the container env
 // var they're forwarded under (project convention: UPPERCASE_SNAKE_CASE

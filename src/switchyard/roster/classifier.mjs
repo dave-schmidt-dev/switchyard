@@ -193,5 +193,3 @@ export function classifyTasks(descriptions) {
 export function isValidTier(tier) {
 	return Object.values(CAPABILITY_CLASS).includes(tier);
 }
-
-export { CAPABILITY_CLASS };

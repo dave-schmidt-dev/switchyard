@@ -1,81 +1,90 @@
 // INV-3 gate test: working container is wiped at project end
-// Tests: working container absent after project end, agent container persists
+// Exercises lifecycle.mjs's own functions directly (createWorkingContainer /
+// wipeWorkingContainer / workingContainerExists), not raw docker calls, so a
+// regression in the real code path — not just "docker works" — is caught.
 
 import { strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
 import { after, before, describe, it } from "node:test";
+import {
+	createWorkingContainer,
+	wipeWorkingContainer,
+	workingContainerExists,
+} from "../src/switchyard/lifecycle/index.mjs";
 
-const WORKING_CONTAINER = "switchyard-test-working";
-const AGENT_CONTAINER = "switchyard-test-agent";
-
-// `docker ps -a --filter name=X` exits 0 with empty output when nothing
-// matches — it never throws on "not found". Check the returned name list
-// directly instead of relying on a try/catch to distinguish "gone" from
-// "still there" (a prior version relied on a throw that never happened, and
-// on top of that put the failing assertion inside the same try block that
-// was supposed to catch it — so the failure was swallowed by its own catch).
-function containerExists(name) {
-	const output = execSync(
-		`docker ps -a --filter name=${name} --format '{{.Names}}'`,
-		{ encoding: "utf8", stdio: "pipe" },
-	).trim();
-	return output === name;
-}
+// A distinct test fixture name — never the real AGENT_CONTAINER_NAME — so
+// this test can never touch a developer's actual standing agent container.
+// createWorkingContainer's new optional agentContainerName parameter exists
+// specifically to make this substitution possible.
+const TEST_AGENT_CONTAINER = "switchyard-test-agent";
+const TEST_PROJECT_PATH = "/tmp/switchyard-test-project";
 
 describe("workspace wipe", () => {
+	let workingContainerName;
+
 	before(() => {
 		try {
-			execSync(`docker rm -f -v ${WORKING_CONTAINER} ${AGENT_CONTAINER}`, {
-				stdio: "inherit",
-			});
+			execSync(`docker rm -f -v ${TEST_AGENT_CONTAINER}`, { stdio: "pipe" });
 		} catch {
-			// Ignore
+			// Ignore - fixture may not exist yet
 		}
-
 		execSync(
-			`docker run -d --name ${AGENT_CONTAINER} alpine:latest sleep infinity`,
-			{ stdio: "inherit" },
-		);
-		execSync(
-			`docker run -d --name ${WORKING_CONTAINER} alpine:latest sleep infinity`,
+			`docker run -d --name ${TEST_AGENT_CONTAINER} alpine:latest sleep infinity`,
 			{ stdio: "inherit" },
 		);
 	});
 
 	after(() => {
+		if (workingContainerName) {
+			try {
+				execSync(
+					`docker rm -f -v ${workingContainerName} && docker volume rm -f ${workingContainerName}-vol`,
+					{ stdio: "pipe" },
+				);
+			} catch {
+				// Ignore - already wiped by the test itself
+			}
+		}
 		try {
-			execSync(`docker rm -f -v ${WORKING_CONTAINER} ${AGENT_CONTAINER}`, {
-				stdio: "inherit",
-			});
+			execSync(`docker rm -f -v ${TEST_AGENT_CONTAINER}`, { stdio: "pipe" });
 		} catch {
 			// Ignore
 		}
 	});
 
-	it("should have working container before wipe", () => {
-		strictEqual(containerExists(WORKING_CONTAINER), true);
+	it("createWorkingContainer creates a real container tied to the agent container", () => {
+		workingContainerName = createWorkingContainer(
+			TEST_PROJECT_PATH,
+			TEST_AGENT_CONTAINER,
+		);
+
+		strictEqual(
+			typeof workingContainerName,
+			"string",
+			"createWorkingContainer should return the generated container name",
+		);
+		strictEqual(workingContainerExists(workingContainerName), true);
 	});
 
-	it("should have agent container before wipe", () => {
-		strictEqual(containerExists(AGENT_CONTAINER), true);
+	it("agent container is still present before wipe", () => {
+		strictEqual(workingContainerExists(TEST_AGENT_CONTAINER), true);
 	});
 
-	it("should wipe working container at project end", () => {
-		// Simulate project end: stop and remove working container.
+	it("wipeWorkingContainer removes the working container at project end", () => {
 		// `docker stop` on a plain `sleep infinity` PID 1 ignores SIGTERM (no
 		// signal handler), so this waits out the ~10s default grace period
 		// before SIGKILL — expected, not a hang.
-		execSync(`docker stop ${WORKING_CONTAINER}`, { stdio: "inherit" });
-		execSync(`docker rm ${WORKING_CONTAINER}`, { stdio: "inherit" });
+		const wiped = wipeWorkingContainer(workingContainerName);
 
+		strictEqual(wiped, true);
 		strictEqual(
-			containerExists(WORKING_CONTAINER),
+			workingContainerExists(workingContainerName),
 			false,
 			"working container should be wiped",
 		);
 	});
 
-	it("should preserve agent container after working wipe", () => {
-		strictEqual(containerExists(AGENT_CONTAINER), true);
+	it("preserves agent container after working container wipe (INV-3: agent container is never the disposable unit)", () => {
+		strictEqual(workingContainerExists(TEST_AGENT_CONTAINER), true);
 	});
 });

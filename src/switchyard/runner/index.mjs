@@ -17,10 +17,44 @@ import {
 	captureDiff as captureCursorDiff,
 	executeCursor,
 } from "../adapter/cursor.mjs";
+import {
+	AGENT_IMAGE,
+	buildAgentImage,
+	imageExists,
+	isContainerRuntimeAvailable,
+	startAgentContainer,
+} from "../container/index.mjs";
 import { integrationGate } from "../integrate/index.mjs";
 import { recordDispatch } from "../ledger/index.mjs";
+import {
+	createWorkingContainer,
+	wipeWorkingContainer,
+} from "../lifecycle/index.mjs";
 import { classifyTask } from "../roster/classifier.mjs";
 import { route } from "../router/index.mjs";
+
+/**
+ * Ensure the standing agent container is built and running.
+ * Idempotent: only builds the image if it isn't already present (a build
+ * costs multiple minutes and should only pay once per host), and
+ * startAgentContainer() is itself idempotent (starts an existing stopped
+ * container, or is a no-op if already running).
+ * @throws {Error} if Docker/OrbStack is unavailable, or the image build or
+ *   container start fails.
+ */
+export function ensureAgentContainer() {
+	if (!isContainerRuntimeAvailable()) {
+		throw new Error("ensureAgentContainer: Docker/OrbStack is not available");
+	}
+	if (!imageExists(AGENT_IMAGE)) {
+		if (!buildAgentImage()) {
+			throw new Error(`ensureAgentContainer: failed to build ${AGENT_IMAGE}`);
+		}
+	}
+	if (!startAgentContainer()) {
+		throw new Error("ensureAgentContainer: failed to start agent container");
+	}
+}
 
 const CHECKPOINT_VERSION = 1;
 const TERMINAL_JOB_STATES = new Set([
@@ -744,12 +778,35 @@ export function runQueue(options) {
 	const {
 		tasksFilePath,
 		projectPath,
-		workingContainerName,
+		workingContainerName: suppliedWorkingContainerName,
 		checkpointPath = getCheckpointPath(tasksFilePath),
 		maxTasks = Number.POSITIVE_INFINITY,
 		stopOnFailure = true,
 		dependencies = {},
 	} = options;
+
+	// Only stand up containers when the caller hasn't already supplied a
+	// working container — an existing workingContainerName implies the
+	// caller (or an earlier runQueue call) already ensured the agent
+	// container exists when that working container was created (INV-1:
+	// createWorkingContainer's --volumes-from requires it).
+	const ensureAgentContainerFn =
+		dependencies.ensureAgentContainer ?? ensureAgentContainer;
+	const createWorkingContainerFn =
+		dependencies.createWorkingContainer ?? createWorkingContainer;
+	const wipeWorkingContainerFn =
+		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+
+	let workingContainerName = suppliedWorkingContainerName;
+	let ownsWorkingContainer = false;
+	if (!workingContainerName) {
+		ensureAgentContainerFn();
+		workingContainerName = createWorkingContainerFn(projectPath);
+		if (!workingContainerName) {
+			throw new Error("runQueue: failed to create working container");
+		}
+		ownsWorkingContainer = true;
+	}
 
 	const context = {
 		route: dependencies.route ?? route,
@@ -777,49 +834,59 @@ export function runQueue(options) {
 		workingContainerName,
 	};
 
-	const tasks = loadTaskQueue(tasksFilePath);
-	const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
-	const runnable = getRunnableTasks(tasks, checkpoint);
-	const results = [];
-	let processed = 0;
+	try {
+		const tasks = loadTaskQueue(tasksFilePath);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
+		const runnable = getRunnableTasks(tasks, checkpoint);
+		const results = [];
+		let processed = 0;
 
-	for (const task of runnable) {
-		if (processed >= maxTasks) break;
+		for (const task of runnable) {
+			if (processed >= maxTasks) break;
 
-		const result = executeTask(task, context);
-		results.push(result);
-		checkpoint.results.push({
-			taskId: result.taskId,
-			provider: result.provider,
-			model: result.model,
-			result: result.result,
-			success: result.success,
-			timestamp: new Date().toISOString(),
-		});
-		checkpoint.lastTaskId = result.taskId;
-		checkpoint.lastUpdatedAt = new Date().toISOString();
+			const result = executeTask(task, context);
+			results.push(result);
+			checkpoint.results.push({
+				taskId: result.taskId,
+				provider: result.provider,
+				model: result.model,
+				result: result.result,
+				success: result.success,
+				timestamp: new Date().toISOString(),
+			});
+			checkpoint.lastTaskId = result.taskId;
+			checkpoint.lastUpdatedAt = new Date().toISOString();
 
-		if (result.success) {
-			checkpoint.completedTaskIds.push(result.taskId);
+			if (result.success) {
+				checkpoint.completedTaskIds.push(result.taskId);
+			}
+
+			saveCheckpoint(checkpointPath, checkpoint);
+			processed += 1;
+
+			if (!result.success && stopOnFailure) {
+				break;
+			}
 		}
 
-		saveCheckpoint(checkpointPath, checkpoint);
-		processed += 1;
-
-		if (!result.success && stopOnFailure) {
-			break;
+		return {
+			totalTasks: tasks.length,
+			runnableTasks: runnable.length,
+			processedTasks: processed,
+			completedTaskIds: checkpoint.completedTaskIds,
+			lastTaskId: checkpoint.lastTaskId,
+			checkpointPath,
+			results,
+		};
+	} finally {
+		// INV-3: the working container is wiped at project end — including
+		// when the loop above throws or exits early on a failure, not just
+		// on the normal return path. Only wipe what we created; a
+		// caller-supplied container is the caller's to manage.
+		if (ownsWorkingContainer) {
+			wipeWorkingContainerFn(workingContainerName);
 		}
 	}
-
-	return {
-		totalTasks: tasks.length,
-		runnableTasks: runnable.length,
-		processedTasks: processed,
-		completedTaskIds: checkpoint.completedTaskIds,
-		lastTaskId: checkpoint.lastTaskId,
-		checkpointPath,
-		results,
-	};
 }
 
 /**
@@ -839,7 +906,7 @@ export async function runQueueWithOrchestrator(options) {
 	const {
 		tasksFilePath,
 		projectPath,
-		workingContainerName,
+		workingContainerName: suppliedWorkingContainerName,
 		checkpointPath = getCheckpointPath(tasksFilePath),
 		maxTasks = Number.POSITIVE_INFINITY,
 		stopOnFailure = true,
@@ -847,6 +914,28 @@ export async function runQueueWithOrchestrator(options) {
 		maxPolls = 1_000,
 		dependencies = {},
 	} = options;
+
+	// Same rationale as runQueue: only stand up containers when the caller
+	// hasn't already supplied a working container.
+	const ensureAgentContainerFn =
+		dependencies.ensureAgentContainer ?? ensureAgentContainer;
+	const createWorkingContainerFn =
+		dependencies.createWorkingContainer ?? createWorkingContainer;
+	const wipeWorkingContainerFn =
+		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+
+	let workingContainerName = suppliedWorkingContainerName;
+	let ownsWorkingContainer = false;
+	if (!workingContainerName) {
+		ensureAgentContainerFn();
+		workingContainerName = createWorkingContainerFn(projectPath);
+		if (!workingContainerName) {
+			throw new Error(
+				"runQueueWithOrchestrator: failed to create working container",
+			);
+		}
+		ownsWorkingContainer = true;
+	}
 
 	const context = {
 		route: dependencies.route ?? route,
@@ -862,50 +951,56 @@ export async function runQueueWithOrchestrator(options) {
 		onPoll: dependencies.onPoll ?? null,
 	};
 
-	const tasks = loadTaskQueue(tasksFilePath);
-	const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
-	const runnable = getRunnableTasks(tasks, checkpoint);
-	const results = [];
-	let processed = 0;
+	try {
+		const tasks = loadTaskQueue(tasksFilePath);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
+		const runnable = getRunnableTasks(tasks, checkpoint);
+		const results = [];
+		let processed = 0;
 
-	for (const task of runnable) {
-		if (processed >= maxTasks) break;
+		for (const task of runnable) {
+			if (processed >= maxTasks) break;
 
-		// eslint-disable-next-line no-await-in-loop
-		const result = await executeTaskWithOrchestrator(task, context);
-		results.push(result);
-		checkpoint.results.push({
-			taskId: result.taskId,
-			provider: result.provider,
-			model: result.model,
-			result: result.result,
-			success: result.success,
-			timestamp: new Date().toISOString(),
-		});
-		checkpoint.lastTaskId = result.taskId;
-		checkpoint.lastUpdatedAt = new Date().toISOString();
+			// eslint-disable-next-line no-await-in-loop
+			const result = await executeTaskWithOrchestrator(task, context);
+			results.push(result);
+			checkpoint.results.push({
+				taskId: result.taskId,
+				provider: result.provider,
+				model: result.model,
+				result: result.result,
+				success: result.success,
+				timestamp: new Date().toISOString(),
+			});
+			checkpoint.lastTaskId = result.taskId;
+			checkpoint.lastUpdatedAt = new Date().toISOString();
 
-		if (result.success) {
-			checkpoint.completedTaskIds.push(result.taskId);
+			if (result.success) {
+				checkpoint.completedTaskIds.push(result.taskId);
+			}
+
+			saveCheckpoint(checkpointPath, checkpoint);
+			processed += 1;
+
+			if (!result.success && stopOnFailure) {
+				break;
+			}
 		}
 
-		saveCheckpoint(checkpointPath, checkpoint);
-		processed += 1;
-
-		if (!result.success && stopOnFailure) {
-			break;
+		return {
+			totalTasks: tasks.length,
+			runnableTasks: runnable.length,
+			processedTasks: processed,
+			completedTaskIds: checkpoint.completedTaskIds,
+			lastTaskId: checkpoint.lastTaskId,
+			checkpointPath,
+			results,
+		};
+	} finally {
+		if (ownsWorkingContainer) {
+			wipeWorkingContainerFn(workingContainerName);
 		}
 	}
-
-	return {
-		totalTasks: tasks.length,
-		runnableTasks: runnable.length,
-		processedTasks: processed,
-		completedTaskIds: checkpoint.completedTaskIds,
-		lastTaskId: checkpoint.lastTaskId,
-		checkpointPath,
-		results,
-	};
 }
 
 /**

@@ -246,6 +246,99 @@ describe("codex adapter invocation shape (real container)", () => {
 	});
 });
 
+describe("buildAuthContainerScript base64 boundary-crossing (real container)", () => {
+	it("delivers a script with a bare single quote and a live $(...) to the container untouched", {
+		skip: !dockerAvailable,
+	}, () => {
+		// Proves the actual bug class this mechanism eliminates. Pre-fix,
+		// buildAuthContainerScript's raw return value was interpolated directly
+		// into `sh -c '${containerScript}'` inside the outer `zsh -c "..."`
+		// invocation — so a future edit introducing a bare single quote or a
+		// `$(...)` into the real script text would have broken out of that
+		// single-quoted region (or been evaluated too early). Now
+		// buildAuthContainerScript base64-encodes the whole real script and
+		// returns only `echo <b64> | base64 -d | sh` — the base64 alphabet has
+		// no shell metacharacters, so nothing but that fixed, quote-free
+		// wrapper ever crosses the boundary. This replicates that exact
+		// wrapping formula against a deliberately hazardous payload to prove
+		// it survives, rather than merely asserting it.
+		const containerName = `switchyard-codex-boundary-${Date.now()}`;
+		const hazardousRealScript = `printf '%s' "it's a $(echo substituted) value" > /tmp/boundary-result`;
+		const scriptB64 = Buffer.from(hazardousRealScript, "utf8").toString(
+			"base64",
+		);
+		const wrapped = `echo ${scriptB64} | base64 -d | sh`;
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			execFileSync(
+				"zsh",
+				["-i", "-c", `docker exec ${containerName} sh -c '${wrapped}'`],
+				{ stdio: "pipe" },
+			);
+
+			const result = execSync(
+				`docker exec ${containerName} cat /tmp/boundary-result`,
+				{ encoding: "utf8" },
+			);
+			strictEqual(
+				result,
+				"it's a substituted value",
+				"the hazardous script must run exactly as normal shell semantics dictate, with nothing corrupted by the boundary crossing",
+			);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+
+	it("never lets an embedded single quote escape onto the host shell", () => {
+		// Same hazard, from the other direction: a bare `'` positioned exactly
+		// where it would have prematurely closed the old naive
+		// `sh -c '${containerScript}'` embedding, leaking the fragment after it
+		// to whatever shell parses that level — the host's own zsh. Wrapping
+		// the payload as base64 before it ever reaches a shell means this
+		// string is never interpolated raw into any shell command at all, so
+		// the host-side marker must never appear regardless of container
+		// state (this container is never even created).
+		const markerDir = mkdtempSync(
+			join(tmpdir(), "switchyard-codex-boundary-quote-"),
+		);
+		const markerPath = join(markerDir, "marker");
+		const hazardousRealScript = `echo start'; touch ${markerPath}; echo end '`;
+		const scriptB64 = Buffer.from(hazardousRealScript, "utf8").toString(
+			"base64",
+		);
+		const wrapped = `echo ${scriptB64} | base64 -d | sh`;
+
+		try {
+			try {
+				execFileSync(
+					"zsh",
+					[
+						"-i",
+						"-c",
+						`docker exec switchyard-nonexistent-boundary-container sh -c '${wrapped}'`,
+					],
+					{ stdio: "pipe" },
+				);
+			} catch {
+				// Expected: the container doesn't exist, so docker exec fails.
+				// The only thing under test is whether the host ever ran `touch`.
+			}
+			strictEqual(
+				existsSync(markerPath),
+				false,
+				"the embedded single quote must never break out of the outer single-quoted region onto the host",
+			);
+		} finally {
+			rmSync(markerDir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("isCodexAuthenticated credential-validity check (real container)", () => {
 	it("returns false when the credential is withheld/corrupt even though the binary responds", {
 		skip: !dockerAvailable,

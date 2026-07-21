@@ -1094,3 +1094,198 @@ describe("orchestrator status/result error guards", () => {
 		);
 	});
 });
+
+describe("container lifecycle wiring (Tasks 8+9)", () => {
+	function baseDependencies() {
+		return {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				percentLeft: 72,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			integrationGate: () => ({ success: true, message: "ok" }),
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/a b/a",
+				},
+			},
+		};
+	}
+
+	it("runQueue skips ensureAgentContainer/createWorkingContainer entirely when workingContainerName is supplied", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let ensureCalled = false;
+		let createCalled = false;
+		let wipeCalled = false;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				...baseDependencies(),
+				ensureAgentContainer: () => {
+					ensureCalled = true;
+				},
+				createWorkingContainer: () => {
+					createCalled = true;
+					return "should-not-be-used";
+				},
+				wipeWorkingContainer: () => {
+					wipeCalled = true;
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(
+			ensureCalled,
+			false,
+			"a caller-supplied workingContainerName must skip ensureAgentContainer",
+		);
+		strictEqual(createCalled, false);
+		strictEqual(
+			wipeCalled,
+			false,
+			"a caller-supplied workingContainerName is the caller's to wipe, not runQueue's",
+		);
+	});
+
+	it("runQueue creates and wipes its own working container when none is supplied, ensuring the agent container first", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const callOrder = [];
+		let capturedProjectPath;
+		let capturedContextContainerName;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				...baseDependencies(),
+				ensureAgentContainer: () => {
+					callOrder.push("ensure");
+				},
+				createWorkingContainer: (projectPath) => {
+					callOrder.push("create");
+					capturedProjectPath = projectPath;
+					return "generated-working-container";
+				},
+				wipeWorkingContainer: (name) => {
+					callOrder.push("wipe");
+					capturedContextContainerName = name;
+				},
+				adapters: {
+					claude: {
+						execute: (_prompt, workingContainerName) => {
+							callOrder.push(`execute:${workingContainerName}`);
+							return { success: true, output: "ok" };
+						},
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(capturedProjectPath, TEST_DIR);
+		strictEqual(capturedContextContainerName, "generated-working-container");
+		deepStrictEqual(callOrder, [
+			"ensure",
+			"create",
+			"execute:generated-working-container",
+			"wipe",
+		]);
+	});
+
+	it("runQueue still wipes the working container it created when a task throws mid-queue (INV-3)", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let wipeCalled = false;
+
+		throws(() => {
+			runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: {
+					...baseDependencies(),
+					ensureAgentContainer: () => {},
+					createWorkingContainer: () => "generated-working-container",
+					wipeWorkingContainer: () => {
+						wipeCalled = true;
+					},
+					route: () => {
+						throw new Error("route exploded mid-queue");
+					},
+				},
+			});
+		}, /route exploded mid-queue/);
+
+		strictEqual(
+			wipeCalled,
+			true,
+			"the working container must still be wiped even when the task loop throws",
+		);
+	});
+
+	it("runQueueWithOrchestrator also skips container wiring when workingContainerName is supplied", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let ensureCalled = false;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				ensureAgentContainer: () => {
+					ensureCalled = true;
+				},
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: "diff --git a/a b/a" }),
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(ensureCalled, false);
+	});
+});

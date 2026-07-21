@@ -299,4 +299,4 @@ export function routeBlind(providerOrder, exclude = []) {
 	return { provider: null, model: null, reason: "no_eligible_blind" };
 }
 
-export { DEFAULT_FLOOR, EXPECTED_SCHEMA_VERSION, SNAPSHOT_PATH };
+export { SNAPSHOT_PATH };

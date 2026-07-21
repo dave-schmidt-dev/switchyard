@@ -26,6 +26,27 @@ export function isContainerRuntimeAvailable() {
 }
 
 /**
+ * Check whether a Docker image is already present locally.
+ * Used to make image builds idempotent — rebuilding the ~1.4GB agent image
+ * on every dispatch would cost multiple minutes per run for no benefit once
+ * it already exists.
+ * @param {string} image Image name (e.g. "switchyard-agent:latest")
+ * @returns {boolean}
+ */
+export function imageExists(image) {
+	try {
+		const output = execSync(`docker images -q ${image}`, {
+			stdio: "pipe",
+		})
+			.toString()
+			.trim();
+		return output.length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Build the agent container image with provider CLIs installed.
  * INV-1: No host mounts that grant host access
  * @returns {boolean} true if successful
@@ -50,29 +71,32 @@ export function buildAgentImage() {
  */
 export function startAgentContainer() {
 	try {
-		const running = execSync(
-			"docker ps --filter name=" +
-				AGENT_CONTAINER_NAME +
-				" --format '{{.Status}}'",
+		// `--filter name=X` is a SUBSTRING match in Docker, not exact — an
+		// unanchored filter would false-positive against any other container
+		// whose name happens to contain AGENT_CONTAINER_NAME (e.g. a working
+		// container, or in tests, a differently-named fixture). `^/X$`
+		// anchors to the exact name (Docker stores names with a leading
+		// slash internally), and comparing the returned Names list by exact
+		// string keeps this from mismatching on a multi-line substring hit.
+		const runningNames = execSync(
+			`docker ps --filter "name=^/${AGENT_CONTAINER_NAME}$" --format '{{.Names}}'`,
 			{ stdio: "pipe" },
 		)
 			.toString()
-			.includes("Up");
+			.trim();
 
-		if (running) {
+		if (runningNames === AGENT_CONTAINER_NAME) {
 			return true;
 		}
 
-		const exists = execSync(
-			"docker ps -a --filter name=" +
-				AGENT_CONTAINER_NAME +
-				" --format '{{.Names}}'",
+		const allNames = execSync(
+			`docker ps -a --filter "name=^/${AGENT_CONTAINER_NAME}$" --format '{{.Names}}'`,
 			{ stdio: "pipe" },
 		)
 			.toString()
-			.includes(AGENT_CONTAINER_NAME);
+			.trim();
 
-		if (exists) {
+		if (allNames === AGENT_CONTAINER_NAME) {
 			execSync(`docker start ${AGENT_CONTAINER_NAME}`, { stdio: "inherit" });
 			return true;
 		}
@@ -90,53 +114,6 @@ export function startAgentContainer() {
 		console.error("Failed to start agent container:", error.message);
 		return false;
 	}
-}
-
-/**
- * Stop the agent container.
- * @returns {boolean}
- */
-export function stopAgentContainer() {
-	try {
-		execSync(`docker stop ${AGENT_CONTAINER_NAME}`, { stdio: "inherit" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Check if agent container is running.
- * @returns {boolean}
- */
-export function isAgentContainerRunning() {
-	try {
-		const output = execSync(
-			"docker ps --filter name=" +
-				AGENT_CONTAINER_NAME +
-				" --format '{{.Names}}'",
-			{ stdio: "pipe" },
-		)
-			.toString()
-			.trim();
-		return output === AGENT_CONTAINER_NAME;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Execute a command inside the agent container.
- * @param {string} command Command to execute
- * @returns {string} Command output
- */
-export function execInAgentContainer(command) {
-	const escapedCommand = command.replace(/'/g, "'\\''");
-	const result = execSync(
-		`docker exec ${AGENT_CONTAINER_NAME} sh -c '${escapedCommand}'`,
-		{ encoding: "utf8", stdio: "pipe" },
-	);
-	return result.trim();
 }
 
 export { AGENT_CONTAINER_NAME, AGENT_IMAGE };

@@ -7,7 +7,6 @@ import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 
-const WORK_DIR = "/tmp/switchyard-work";
 const WORKING_PREFIX = "switchyard-work-";
 
 /**
@@ -23,10 +22,19 @@ function generateWorkingContainerName(projectPath) {
 /**
  * Create a working container for a project.
  * INV-1: No host FS mounts - uses isolated volume
+ * `--volumes-from` requires the named agent container to already exist
+ * (running or stopped) — the caller is responsible for ensuring that before
+ * calling this (see container/index.mjs's startAgentContainer).
  * @param {string} projectPath Host project path
+ * @param {string} [agentContainerName] Agent container to mount volumes from.
+ *   Defaults to the real standing container; overridable for tests so a test
+ *   fixture container can stand in without touching the real one.
  * @returns {string|null} Working container name or null on failure
  */
-export function createWorkingContainer(projectPath) {
+export function createWorkingContainer(
+	projectPath,
+	agentContainerName = AGENT_CONTAINER_NAME,
+) {
 	const containerName = generateWorkingContainerName(projectPath);
 
 	try {
@@ -36,7 +44,7 @@ export function createWorkingContainer(projectPath) {
 		// Create working container with isolated volume
 		execSync(
 			`docker run -d --name ${containerName} ` +
-				`--volumes-from ${AGENT_CONTAINER_NAME} ` +
+				`--volumes-from ${agentContainerName} ` +
 				`-v ${containerName}-vol:/project -w /project ` +
 				`alpine:latest sleep infinity`,
 			{ stdio: "inherit" },
@@ -80,8 +88,16 @@ export function wipeWorkingContainer(workingContainerName) {
  */
 export function workingContainerExists(workingContainerName) {
 	try {
+		// `--filter name=X` is a SUBSTRING match in Docker, not exact — an
+		// unanchored filter false-positives/false-negatives against any other
+		// container whose name contains workingContainerName as a substring
+		// (reproduced concretely: two test fixtures where one name contained
+		// the other as a prefix caused this check to see multiple matched
+		// names and fail the exact-equality comparison below). `^/X$` anchors
+		// to the exact name — Docker stores container names with a leading
+		// slash internally.
 		const output = execSync(
-			`docker ps -a --filter name=${workingContainerName} --format '{{.Names}}'`,
+			`docker ps -a --filter "name=^/${workingContainerName}$" --format '{{.Names}}'`,
 			{ stdio: "pipe" },
 		)
 			.toString()
@@ -106,5 +122,3 @@ export function execInWorkingContainer(workingContainerName, command) {
 	);
 	return result.trim();
 }
-
-export { WORK_DIR, WORKING_PREFIX };

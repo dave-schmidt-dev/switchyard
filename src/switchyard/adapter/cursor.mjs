@@ -259,5 +259,3 @@ export function captureDiff(workingContainerName) {
 		return null;
 	}
 }
-
-export { CURSOR_AUTHED_CMD, CURSOR_CMD };

@@ -27,11 +27,26 @@ const CLAUDE_CMD = "claude";
  * code (almost always 0) the script's final status, masking a real `claude
  * login` failure as success. Capture the chain's exit status first, always
  * clean up, then exit with the captured status.
+ *
+ * The string returned here is NOT that script verbatim — it's that script
+ * base64-encoded and wrapped as `echo <b64> | base64 -d | sh` (same
+ * technique cursor.mjs's CURSOR_WRAPPER_SCRIPT uses, applied to the whole
+ * script rather than one sub-payload). authenticateClaude() embeds the
+ * return value via single quotes into a `zsh -c "... docker exec ... sh -c
+ * '...'"` nesting; the base64 alphabet ([A-Za-z0-9+/=]) contains no shell
+ * metacharacters, so the only characters that ever cross that boundary
+ * cannot break out of the single-quoted region regardless of what the real
+ * script above contains. A future edit introducing a bare single quote,
+ * `$(...)`, or other special character into the real script text can no
+ * longer reintroduce the quote-escaping bug that already shipped once (see
+ * tests/claude-auth.test.mjs's boundary-crossing regression test).
  * @param {string} secretName
  * @returns {string}
  */
 export function buildAuthContainerScript(secretName) {
-	return `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; login_status=$?; rm -f /tmp/claude_creds.json; exit $login_status`;
+	const realScript = `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; login_status=$?; rm -f /tmp/claude_creds.json; exit $login_status`;
+	const scriptB64 = Buffer.from(realScript, "utf8").toString("base64");
+	return `echo ${scriptB64} | base64 -d | sh`;
 }
 
 // Claude diverges from the other three adapters: authenticateClaude writes
@@ -226,5 +241,3 @@ export function captureDiff(workingContainerName) {
 		return null;
 	}
 }
-
-export { CLAUDE_CMD };
