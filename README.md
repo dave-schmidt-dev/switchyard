@@ -2,7 +2,7 @@
 
 A containment-first Python dispatcher that routes coding tasks across subscription-backed agent CLIs (claude, agy, cursor, codex) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-4 implemented (M1-M3). Runner now includes queue/checkpoint and concrete headless poll/`wait` supervision; remaining work is phased spread/integration completion.
+**Status:** Phases 0-5 implemented. All core routing, capability classification, container execution, sandbox lifecycle, integration gate, ledger, provider adapters, runner orchestration, and test suites complete.
 
 ## Priorities (in order)
 
@@ -38,10 +38,16 @@ A containment-first Python dispatcher that routes coding tasks across subscripti
 | `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch, exec, diff capture, BWS-based auth injection. |
 | `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). |
 | **Tests** | |
-| `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5. |
 | `tests/capability-match.test.mjs` | INV-5 gate: capability filter, tier ordering, model right-sizing. |
+| `tests/classifier.test.mjs` | Keyword-based task tier classifier unit tests. |
+| `tests/codex-adapter.test.mjs` | Container-backed Codex CLI dispatch and diff capture tests. |
+| `tests/codex-auth.test.mjs` | INV-1 regression test verifying host auth file is not copied. |
 | `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
+| `tests/ledger.test.mjs` | INV-4 dispatch ledger recording and querying unit tests. |
 | `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation. |
+| `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5. |
+| `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume, and orchestrator CLI integration tests. |
+| `tests/scorer.test.mjs` | FNV-1a hash, mulberry32 PRNG, and scoring logic unit tests. |
 | `tests/workspace-wipe.test.mjs` | INV-3 gate: working container wipe, agent container persistence. |
 
 ## Planning artifacts
@@ -52,7 +58,46 @@ A containment-first Python dispatcher that routes coding tasks across subscripti
 
 ## Workflows
 
-<Placeholder — fill in as implementation lands. Cover: dispatch a task, provision the topology, run the adversarial corpus, inspect a task's provenance, teardown, rollback.>
+### Running Tests and Linting
+
+Execute the full suite of node unit and integration gate tests:
+
+```bash
+npm test
+```
+
+Run code quality check with Biome:
+
+```bash
+npm run lint
+```
+
+### Queue Dispatching and Orchestration
+
+The host-side runner parses markdown task queues and dispatches tasks serially through the router, adapters, and integration gate:
+
+```javascript
+import { runQueue, runQueueWithOrchestrator } from './src/switchyard/runner/index.mjs';
+
+// Standard queue runner with local checkpoint/resume (synchronous)
+const summary = runQueue({
+  tasksFilePath: '/path/to/tasks.md',
+  projectPath: '/path/to/project',
+  workingContainerName: 'switchyard-work-1',
+  checkpointPath: '.switchyard-checkpoint.json', // optional
+});
+
+// Headless orchestrator mode — requires SWITCHYARD_ORCHESTRATOR_CMD (async)
+const orchSummary = await runQueueWithOrchestrator({
+  tasksFilePath: '/path/to/tasks.md',
+  projectPath: '/path/to/project',
+  workingContainerName: 'switchyard-work-1',
+});
+```
+
+### Environment Variables
+
+- `SWITCHYARD_ORCHESTRATOR_CMD`: Path to executable command (e.g. `switchyard-orchestrator`) for external job supervision when using `createCliOrchestrator`.
 
 ## Conventions
 
