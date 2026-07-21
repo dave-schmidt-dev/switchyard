@@ -2,7 +2,7 @@
 
 A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, Agy, Cursor, with Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-5 implemented and test-covered (158/158 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the agent-container lifecycle functions it imports the adapters from (`TASKS.md` Task 9); no Docker image exists yet to build either container from (`TASKS.md` Task 14). `npm run validate`'s `deadcode` step reports all three honestly. Provider auth-checks are liveness-only, not real credential checks (`TASKS.md` Task 15).
+**Status:** Phases 0-5 implemented and test-covered (198/198 `npm test`), but not fully wired end-to-end. Agent/working container lifecycle is wired into the real runner dispatch path (`src/switchyard/lifecycle/index.mjs`, the sole surviving implementation after `sandbox/index.mjs` was deleted) and `npm run validate`'s `deadcode` step is clean. The real remaining gap: working containers are built `FROM alpine:latest` with `--volumes-from` the agent container, but the agent container shares no volumes and the four provider CLIs live only in `AGENT_IMAGE`'s filesystem layers — so a real dispatch's `docker exec` can't find them yet (`TASKS.md` Task 14). All four adapters perform real credential checks via `hasNonTrivialCredential()` in addition to liveness checks (`TASKS.md` Task 15, completed).
 
 ## Priorities (in order)
 
@@ -122,7 +122,7 @@ const orchSummary = await runQueueWithOrchestrator({
 
 ### Environment Variables
 
-- `SWITCHYARD_ORCHESTRATOR_CMD`: Path to executable command (e.g. `switchyard-orchestrator`) for external job supervision when using `createCliOrchestrator`.
+- `SWITCHYARD_ORCHESTRATOR_CMD`: Path to executable command (e.g. `switchyard-orchestrator`) for external job supervision when using `createCliOrchestrator`. If the orchestrator cannot run a task on the selected provider, the task remains incomplete and will retry against the same provider on every resume (no capability-discovery protocol exists to break the retry loop).
 
 ## Conventions
 

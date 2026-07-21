@@ -608,6 +608,20 @@ export function executeTask(task, context) {
  */
 export async function executeTaskWithOrchestrator(task, context) {
 	const tier = classifyTask(task.description || task.title);
+	// Deliberately unfiltered, unlike executeTask (which constrains routing to
+	// Object.keys(context.adapters)). This path has no local adapters map to
+	// derive candidates from — dispatch is delegated to an external orchestrator
+	// treated as an opaque black box that may support the full roster. No
+	// protocol exists to query that orchestrator's actual supported-provider
+	// set, and inventing one speculatively (with no real orchestrator to
+	// validate it against) is exactly the fabricated-interface guesswork this
+	// project forbids, so route() runs unconstrained. Accepted consequence: if
+	// route() picks a provider the orchestrator can't actually run, launch()
+	// below fails, the task is recorded as failed but never added to
+	// completedTaskIds — so every resume re-selects the same provider and fails
+	// identically. That retry loop is accepted behavior for the orchestrator
+	// path today (there is no capability-discovery mechanism to break it), not
+	// an oversight; tests/runner.test.mjs characterizes this exact failure mode.
 	const routeResult = context.route({ tier });
 
 	if (!routeResult.provider) {

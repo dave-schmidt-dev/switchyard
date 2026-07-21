@@ -1,6 +1,13 @@
 import { ok, strictEqual } from "node:assert";
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -154,6 +161,77 @@ describe("authenticateClaude() secretName injection guard", () => {
 		strictEqual(authenticateClaude("lowercase_name"), false);
 		strictEqual(authenticateClaude(""), false);
 		strictEqual(authenticateClaude(null), false);
+	});
+});
+
+describe("authenticateClaude() ground truth (fake shell/docker — touches no real container)", () => {
+	// Installs fake `zsh` and `docker` executables at the front of PATH so
+	// authenticateClaude() never reaches a real shell, real BWS, or a real
+	// container — both calls it makes (`execFileSync("zsh", ...)` and
+	// hasNonTrivialCredential's `execFileSync("docker", ...)`) resolve
+	// through PATH with no `env` override on either call, so this genuinely
+	// intercepts the exact binaries the production code spawns rather than
+	// mocking at the JS layer (named ESM imports from node:child_process
+	// don't observe mock.method() reassignment on the shared module object —
+	// verified empirically before choosing this approach). Fake zsh always
+	// exits 0, standing in for the exact failure mode a61aafc fixed: `bws
+	// run` has been observed to report success for a wrapped `docker exec
+	// ...` command even when the script demonstrably failed inside the
+	// container. Fake docker's exit code is the caller's to control,
+	// standing in for hasNonTrivialCredential's own credential-presence
+	// check succeeding or failing. AGENT_CONTAINER_NAME is never touched —
+	// there is no real container at all in this scenario.
+	function withFakeAuthShell(dockerExitCode, fn) {
+		const fakeBinDir = mkdtempSync(join(tmpdir(), "switchyard-fake-auth-bin-"));
+		writeFileSync(join(fakeBinDir, "zsh"), "#!/bin/sh\nexit 0\n");
+		writeFileSync(
+			join(fakeBinDir, "docker"),
+			`#!/bin/sh\nexit ${dockerExitCode}\n`,
+		);
+		chmodSync(join(fakeBinDir, "zsh"), 0o755);
+		chmodSync(join(fakeBinDir, "docker"), 0o755);
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = `${fakeBinDir}:${originalPath}`;
+		try {
+			return fn();
+		} finally {
+			process.env.PATH = originalPath;
+			rmSync(fakeBinDir, { recursive: true, force: true });
+		}
+	}
+
+	it("returns false when the wrapped command reports success but no credential is actually persisted (regression: a61aafc, previously trusted the wrapper's exit code)", () => {
+		// Pre-fix authenticateClaude() did `execFileSync(...); return true;`
+		// inside the try block — trusting the wrapped command's exit code
+		// directly. Faking zsh to always exit 0 reproduces that "reported
+		// success" shape; faking docker to exit non-zero makes
+		// hasNonTrivialCredential's own credential-presence check fail,
+		// standing in for "no credential was actually persisted". Against
+		// the pre-fix code this returns true; against the fix it must return
+		// false because the real return value now comes from
+		// hasNonTrivialCredential() unconditionally, never from the wrapped
+		// command's own exit code.
+		const result = withFakeAuthShell(1, () =>
+			authenticateClaude("CLAUDE_CREDENTIALS_FAKE_TEST"),
+		);
+		strictEqual(
+			result,
+			false,
+			"authenticateClaude() must not trust the wrapped command's exit code alone",
+		);
+	});
+
+	it("returns true when the wrapped command succeeds and the credential check also passes (positive control)", () => {
+		// Proves the negative case above isn't vacuous: with the identical
+		// fake-zsh-always-succeeds setup, a passing credential check still
+		// yields true, so the false result above is specifically caused by
+		// the credential check failing, not by some general breakage of the
+		// fake-shell harness.
+		const result = withFakeAuthShell(0, () =>
+			authenticateClaude("CLAUDE_CREDENTIALS_FAKE_TEST"),
+		);
+		strictEqual(result, true);
 	});
 });
 

@@ -2,6 +2,7 @@ import {
 	deepStrictEqual,
 	notStrictEqual,
 	ok,
+	rejects,
 	strictEqual,
 	throws,
 } from "node:assert";
@@ -581,6 +582,95 @@ describe("runner headless orchestrator mode", () => {
 		deepStrictEqual(
 			launches.map((payload) => payload.taskId),
 			["1.1", "1.2"],
+		);
+	});
+
+	it("re-selects and re-fails the same unsupported provider on every resume (characterizes the intentionally-unfiltered orchestrator route — Task 16)", async () => {
+		// Unlike executeTask, executeTaskWithOrchestrator does NOT pass
+		// availableProviders, so route() can pick a provider the external
+		// orchestrator can't actually run. This is deliberate: the orchestrator
+		// is an opaque black box with no capability-discovery protocol. Here the
+		// fake orchestrator rejects "cursor" at launch(), standing in for one
+		// that doesn't support that provider. Because a failed launch never adds
+		// the task to completedTaskIds, a resume re-selects the same task and
+		// the same provider and fails identically — accepted behavior today, not
+		// a bug. This test pins that loop and doubles as a real guard: the mock
+		// route below honors availableProviders, so today (this path passes
+		// none) cursor is returned and launch throws, but if this path is ever
+		// constrained to a set excluding the picked provider, route() returns no
+		// provider and the launch_failed assertions below fail — forcing a
+		// deliberate update rather than silently passing.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** First operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const launchAttempts = [];
+		const dispatches = [];
+
+		const dependencies = {
+			route: ({ availableProviders }) =>
+				availableProviders && !availableProviders.includes("cursor")
+					? { provider: null, reason: "no candidates" }
+					: {
+							provider: "cursor",
+							model: "cursor-fast",
+							percentLeft: 95,
+							reason: "spread",
+						},
+			recordDispatch: (entry) => dispatches.push(entry),
+			integrationGate: () => ({ success: true, message: "ok" }),
+			sleepFn: async () => {},
+			orchestrator: {
+				launch: async (payload) => {
+					launchAttempts.push(payload);
+					throw new Error(
+						`orchestrator cannot run provider ${payload.provider}`,
+					);
+				},
+				status: async () => ({ state: "done" }),
+				result: async () => ({ success: true, diff: "" }),
+			},
+		};
+
+		const first = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies,
+		});
+
+		// Failed task is recorded but NOT marked complete...
+		strictEqual(first.results[0].result, "launch_failed");
+		deepStrictEqual(first.completedTaskIds, []);
+		deepStrictEqual(
+			loadCheckpoint(checkpointPath, tasksPath).completedTaskIds,
+			[],
+		);
+
+		// ...so a resume re-runs the SAME task against the SAME provider.
+		const second = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies,
+		});
+
+		strictEqual(second.results[0].result, "launch_failed");
+		deepStrictEqual(second.completedTaskIds, []);
+
+		strictEqual(launchAttempts.length, 2);
+		deepStrictEqual(
+			launchAttempts.map((payload) => payload.taskId),
+			["1.1", "1.1"],
+		);
+		deepStrictEqual(
+			launchAttempts.map((payload) => payload.provider),
+			["cursor", "cursor"],
 		);
 	});
 });
@@ -1287,5 +1377,109 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 		strictEqual(result.processedTasks, 1);
 		strictEqual(ensureCalled, false);
+	});
+
+	it("runQueueWithOrchestrator creates and wipes its own working container when none is supplied, ensuring the agent container first", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const callOrder = [];
+		let capturedProjectPath;
+		let capturedContextContainerName;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				ensureAgentContainer: () => {
+					callOrder.push("ensure");
+				},
+				createWorkingContainer: (projectPath) => {
+					callOrder.push("create");
+					capturedProjectPath = projectPath;
+					return "generated-orchestrator-container";
+				},
+				wipeWorkingContainer: (name) => {
+					callOrder.push("wipe");
+					capturedContextContainerName = name;
+				},
+				orchestrator: {
+					launch: async (payload) => {
+						callOrder.push(`launch:${payload.workingContainerName}`);
+						return "job-1";
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: "diff --git a/a b/a" }),
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(capturedProjectPath, TEST_DIR);
+		strictEqual(
+			capturedContextContainerName,
+			"generated-orchestrator-container",
+		);
+		deepStrictEqual(callOrder, [
+			"ensure",
+			"create",
+			"launch:generated-orchestrator-container",
+			"wipe",
+		]);
+	});
+
+	it("runQueueWithOrchestrator still wipes the working container it created when a task throws mid-queue (INV-3)", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let wipeCalled = false;
+
+		await rejects(async () => {
+			await runQueueWithOrchestrator({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: {
+					recordDispatch: () => {},
+					integrationGate: () => ({ success: true, message: "ok" }),
+					ensureAgentContainer: () => {},
+					createWorkingContainer: () => "generated-orchestrator-container",
+					wipeWorkingContainer: () => {
+						wipeCalled = true;
+					},
+					route: () => {
+						throw new Error("route exploded mid-orchestrator-queue");
+					},
+					orchestrator: {
+						launch: async () => "job-1",
+						status: async () => ({ state: "done" }),
+						result: async () => ({ success: true, diff: "" }),
+					},
+				},
+			});
+		}, /route exploded mid-orchestrator-queue/);
+
+		strictEqual(
+			wipeCalled,
+			true,
+			"the working container must still be wiped even when the orchestrator task loop throws",
+		);
 	});
 });
