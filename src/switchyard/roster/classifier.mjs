@@ -7,7 +7,9 @@
 import { CAPABILITY_CLASS } from "./index.mjs";
 
 /**
- * Keywords that indicate a high-tier (complex) task.
+ * Keywords that indicate a high-tier (complex) task. Includes auth/crypto
+ * terms explicitly: a task touching these is never safe to downgrade just
+ * because it also happens to contain a low-tier word like "minor" or "quick".
  */
 const HIGH_TIER_KEYWORDS = Object.freeze([
 	"integration",
@@ -24,6 +26,14 @@ const HIGH_TIER_KEYWORDS = Object.freeze([
 	"infrastructure",
 	"authentication",
 	"authorization",
+	"auth",
+	"jwt",
+	"session",
+	"crypto",
+	"encryption",
+	"credential",
+	"permission",
+	"secret",
 	"security",
 	"performance",
 	"scaling",
@@ -70,45 +80,58 @@ const LOW_TIER_KEYWORDS = Object.freeze([
 	"minor",
 ]);
 
+function escapeRegExp(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Build a single word-boundary regex from a keyword list. Plain substring
+ * matching (the prior implementation) false-matched "api" inside "rapid",
+ * "design" inside "redesignate", and "move" inside "movement" — as well as
+ * false-negating the reverse: "move" failed to signal on "movement" at all
+ * once boundaries are added, which is intentional (a whole different word).
+ * @param {readonly string[]} keywords
+ * @returns {RegExp}
+ */
+function buildKeywordPattern(keywords) {
+	return new RegExp(`\\b(${keywords.map(escapeRegExp).join("|")})\\b`, "i");
+}
+
+const HIGH_TIER_PATTERN = buildKeywordPattern(HIGH_TIER_KEYWORDS);
+const STANDARD_TIER_PATTERN = buildKeywordPattern(STANDARD_TIER_KEYWORDS);
+const LOW_TIER_PATTERN = buildKeywordPattern(LOW_TIER_KEYWORDS);
+
 /**
  * Classify a task's difficulty tier from its description.
- * Uses keyword matching against task description (case-insensitive).
+ * Uses whole-word keyword matching (case-insensitive). Checked in order
+ * high -> standard -> low: a task that mentions any standard-tier signal
+ * (e.g. "fix", "bug", "endpoint") is never downgraded to low just because
+ * it also contains a low-tier word (e.g. "fix the bug and add a comment"
+ * is standard, not low) — under-classifying real work to a weak provider
+ * is the dangerous direction; over-classifying trivial work is just cost.
  *
  * @param {string} description Task description
  * @returns {string} Tier: 'high', 'standard', or 'low'
  */
 export function classifyTask(description) {
-	if (!description || typeof description !== "string") {
-		return CAPABILITY_CLASS.high; // Conservative default
+	if (!description || typeof description !== "string" || !description.trim()) {
+		return CAPABILITY_CLASS.high; // Conservative default (unknown => high-capability only)
 	}
 
-	const lowerDesc = description.toLowerCase();
-
-	// Check for high-tier keywords first (most specific)
-	for (const keyword of HIGH_TIER_KEYWORDS) {
-		if (lowerDesc.includes(keyword)) {
-			return CAPABILITY_CLASS.high;
-		}
+	if (HIGH_TIER_PATTERN.test(description)) {
+		return CAPABILITY_CLASS.high;
 	}
 
-	// Check for low-tier keywords
-	for (const keyword of LOW_TIER_KEYWORDS) {
-		if (lowerDesc.includes(keyword)) {
-			return CAPABILITY_CLASS.low;
-		}
+	if (STANDARD_TIER_PATTERN.test(description)) {
+		return CAPABILITY_CLASS.standard;
 	}
 
-	// Check for standard-tier keywords
-	for (const keyword of STANDARD_TIER_KEYWORDS) {
-		if (lowerDesc.includes(keyword)) {
-			return CAPABILITY_CLASS.standard;
-		}
+	if (LOW_TIER_PATTERN.test(description)) {
+		return CAPABILITY_CLASS.low;
 	}
 
-	// Default: standard tier for unknown
-	// Conservative: if we can't determine, assume standard
-	// (but high-tier tasks should be explicitly marked)
-	return CAPABILITY_CLASS.standard;
+	// Conservative default: no recognized signal at all => high-capability only.
+	return CAPABILITY_CLASS.high;
 }
 
 /**

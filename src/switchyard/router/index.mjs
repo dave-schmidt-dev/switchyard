@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
 	CAPABILITY_CLASS,
 	getRightSizedModel,
+	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
 } from "../roster/index.mjs";
 import { resolveSeed } from "./scorer.mjs";
@@ -76,28 +77,51 @@ function indexProviders(snapshot) {
  * @param {string[]} [options.exclude] Provider names to explicitly exclude
  * @param {number} [options.floor] Percent left floor (default: DEFAULT_FLOOR)
  * @param {string} [options.tier] Task difficulty tier (high/standard/low) for INV-5
+ * @param {string[]} [options.availableProviders] Restrict candidates to providers
+ *   the caller can actually dispatch to (e.g. the runner's registered adapters).
+ *   Omit to consider every roster/snapshot provider (existing behavior).
  * @returns {{provider: string|null, model: string|null, percentLeft: number|null,
  *   reason: string, log: string[]}} Routing result
  */
 export function route(options = {}) {
-	const { seed, runId, exclude = [], floor = DEFAULT_FLOOR, tier } = options;
+	const {
+		seed,
+		runId,
+		exclude = [],
+		floor = DEFAULT_FLOOR,
+		tier,
+		availableProviders,
+	} = options;
 	resolveSeed({ seed, runId }); // seed is used even if not stored
 	const log = [];
 
 	// Default tier is high for conservative routing (unknown tier => high-capability only)
 	const effectiveTier = tier ?? CAPABILITY_CLASS.high;
+	const isAvailable = (name) =>
+		!availableProviders || availableProviders.includes(name);
 
 	// Read snapshot host-side (WR-1)
 	const snapshot = readSnapshot();
 
 	if (!isValidSnapshot(snapshot)) {
 		log.push("snapshot invalid or missing — routing blind");
+		// Wire the blind fallback into the real path: a missing/broken snapshot
+		// must not silently halt every task behind it. Candidates are ordered
+		// by roster declaration order (highest capability first) and still
+		// respect the capability filter and caller-supplied availability/exclude.
+		const blindOrder = Object.keys(PROVIDER_CAPABILITIES).filter(
+			(name) =>
+				isAvailable(name) && passesCapabilityFilter(name, effectiveTier),
+		);
+		const blind = routeBlind(blindOrder, exclude);
+		const model = blind.provider
+			? getRightSizedModel(blind.provider, effectiveTier)
+			: null;
 		return {
-			provider: null,
-			model: null,
+			...blind,
+			model,
 			percentLeft: null,
-			reason: "blind",
-			log,
+			log: [...log, `blind candidates: ${blindOrder.join(", ") || "none"}`],
 		};
 	}
 
@@ -108,6 +132,11 @@ export function route(options = {}) {
 	for (const [name, provider] of providers) {
 		// CR-3: tolerate absent providers - but we're iterating present ones,
 		// absent providers simply won't be in the map. This is the tolerance.
+
+		if (!isAvailable(name)) {
+			log.push(`provider ${name}: no adapter available for this dispatcher`);
+			continue;
+		}
 
 		if (exclude.includes(name)) {
 			log.push(`provider ${name}: explicitly excluded`);

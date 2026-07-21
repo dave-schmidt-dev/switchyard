@@ -118,8 +118,52 @@ describe("router", () => {
 			// Ignore
 		}
 
+		// A missing/broken snapshot must not silently halt every task behind
+		// it — route() now wires the blind fallback into the real path instead
+		// of just giving up (a prior version returned provider:null here and
+		// the exported routeBlind was never called by anything).
 		const result = route();
-		strictEqual(result.reason, "blind", "Should fall back to blind routing");
+		strictEqual(result.reason, "blind_fallback");
+		strictEqual(
+			result.provider,
+			"claude",
+			"highest-capability roster entry first",
+		);
+	});
+
+	it("should skip providers unavailable to this dispatcher even in blind mode", () => {
+		try {
+			rmSync(SNAPSHOT_PATH);
+		} catch {
+			// Ignore
+		}
+
+		const result = route({ availableProviders: ["codex"] });
+		strictEqual(result.reason, "blind_fallback");
+		strictEqual(result.provider, "codex");
+	});
+
+	it("never routes to a provider outside availableProviders", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 30, pace_delta: 100 }],
+			},
+			{
+				name: "vibe",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 50 }], // most headroom, low tier
+			},
+		]);
+
+		const result = route({ tier: "low", availableProviders: ["claude"] });
+		strictEqual(
+			result.provider,
+			"claude",
+			"vibe has more headroom and passes the low-tier capability filter, " +
+				"but has no adapter registered so must never be selected",
+		);
 	});
 
 	it("should select model based on tier (INV-5)", () => {

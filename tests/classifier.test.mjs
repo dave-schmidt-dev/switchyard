@@ -25,15 +25,64 @@ describe("classifier", () => {
 
 		it("should classify low-tier tasks from keywords", () => {
 			strictEqual(classifyTask("format the code"), "low");
-			strictEqual(classifyTask("fix typo in readme"), "low");
+			strictEqual(classifyTask("typo in the readme file"), "low");
 			strictEqual(classifyTask("cleanup comments"), "low");
 			strictEqual(classifyTask("rename variable"), "low");
 			strictEqual(classifyTask("simple trivial minor change"), "low");
 		});
 
-		it("should default to standard for unknown descriptions", () => {
-			strictEqual(classifyTask("do the thing"), "standard");
-			strictEqual(classifyTask("random words here"), "standard");
+		it("should default to high for unrecognized descriptions", () => {
+			// Conservative default: no recognized signal at all => high-capability
+			// only (a prior version fell through to "standard" here, contradicting
+			// its own documented contract).
+			strictEqual(classifyTask("do the thing"), "high");
+			strictEqual(classifyTask("random words here"), "high");
+		});
+
+		it("never downgrades a task to low when it also contains standard-tier signal", () => {
+			// Regression: LOW was checked before STANDARD, so "fix the bug and
+			// add a clarifying comment" classified low ("comment" beat "fix"/
+			// "bug"). Under-classifying real work to a weak provider is the
+			// dangerous direction; STANDARD now takes priority over LOW.
+			strictEqual(
+				classifyTask("fix the bug and add a clarifying comment"),
+				"standard",
+			);
+			strictEqual(
+				classifyTask(
+					"remove the deprecated login endpoint and add input validation",
+				),
+				"standard",
+			);
+			strictEqual(
+				classifyTask("debug the flaky test and document the fix"),
+				"standard",
+			);
+		});
+
+		it("does not false-match a keyword as a substring of an unrelated word", () => {
+			// "api" must not match inside "rapid"/"capital"; "design" must not
+			// match inside "redesignate"; "move" must not match inside "movement".
+			// None of these actually contain a recognized keyword once the false
+			// substring matches are removed, so they land on the conservative
+			// high default rather than the (wrong) keyword tier a prior version
+			// assigned via the accidental substring hit.
+			strictEqual(classifyTask("make the UI feel more rapid"), "high");
+			strictEqual(classifyTask("update the capital gains calculator"), "high");
+			strictEqual(classifyTask("redesignate the owner column"), "high");
+			strictEqual(classifyTask("track user movement heatmaps"), "high");
+		});
+
+		it("treats auth/session/crypto terms as high-tier regardless of other words", () => {
+			// Regression: "minor tweak to the JWT session handling" classified
+			// low ("minor" matched, no HIGH_TIER_KEYWORDS entry recognized
+			// "jwt"/"session"/"auth" at all).
+			strictEqual(
+				classifyTask("minor tweak to the JWT session handling"),
+				"high",
+			);
+			strictEqual(classifyTask("quick fix to the auth flow"), "high");
+			strictEqual(classifyTask("simple change to session credentials"), "high");
 		});
 
 		it("should default to high for null/undefined input", () => {

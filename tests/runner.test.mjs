@@ -1,5 +1,17 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	strictEqual,
+	throws,
+} from "node:assert";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
@@ -12,6 +24,7 @@ import {
 	resolveOrchestrator,
 	runQueue,
 	runQueueWithOrchestrator,
+	saveCheckpoint,
 	waitForJobCompletion,
 } from "../src/switchyard/runner/index.mjs";
 
@@ -639,6 +652,90 @@ describe("runner provider spread recording", () => {
 			}
 		}
 	});
+
+	it("never dispatches to a roster provider with no adapter, even with the most headroom", async () => {
+		// Regression: vibe/agy/cursor/copilot are in the roster but only
+		// claude/codex have adapters wired here. Before the availableProviders
+		// fix, route() (unconstrained) could legitimately pick vibe for a
+		// low-tier task, selectAdapter() would return null, and the task
+		// would fail with "unsupported_provider" forever — every resume
+		// re-picks the same unsupported provider and fails identically.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** simple trivial cleanup
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const snapshotDir = dirname(SNAPSHOT_PATH);
+		let originalSnapshot = null;
+
+		try {
+			try {
+				originalSnapshot = readFileSync(SNAPSHOT_PATH, "utf8");
+			} catch {
+				originalSnapshot = null;
+			}
+
+			mkdirSync(snapshotDir, { recursive: true });
+			writeFileSync(
+				SNAPSHOT_PATH,
+				JSON.stringify({
+					schema_version: 2,
+					providers: [
+						{
+							name: "claude",
+							ok: true,
+							windows: [{ percent_left: 30, pace_delta: 100 }],
+						},
+						{
+							name: "vibe",
+							ok: true,
+							windows: [{ percent_left: 95, pace_delta: 10 }],
+						},
+					],
+				}),
+				"utf8",
+			);
+
+			const dispatches = [];
+			const result = runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				checkpointPath,
+				dependencies: {
+					// Real router (not mocked) — only override recordDispatch/adapters.
+					recordDispatch: (entry) => dispatches.push(entry),
+					integrationGate: () => ({ success: true, message: "ok" }),
+					adapters: {
+						claude: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/a b/a",
+						},
+						codex: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/b b/b",
+						},
+					},
+				},
+			});
+
+			strictEqual(dispatches[0].provider, "claude");
+			notStrictEqual(dispatches[0].result, "unsupported_provider");
+			strictEqual(result.results[0].success, true);
+		} finally {
+			if (originalSnapshot === null) {
+				try {
+					rmSync(SNAPSHOT_PATH, { force: true });
+				} catch {
+					// ignore cleanup errors
+				}
+			} else {
+				writeFileSync(SNAPSHOT_PATH, originalSnapshot, "utf8");
+			}
+		}
+	});
 });
 
 describe("runner cli orchestrator wiring", () => {
@@ -712,5 +809,128 @@ describe("runner cli orchestrator wiring", () => {
 
 		ok(error instanceof Error);
 		ok(error.message.includes("SWITCHYARD_ORCHESTRATOR_CMD"));
+	});
+});
+
+describe("checkpoint durability", () => {
+	it("round-trips through an atomic write with no leftover temp file", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: ["1.1"],
+			lastTaskId: "1.1",
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+			results: [],
+		});
+
+		strictEqual(existsSync(`${checkpointPath}.tmp`), false);
+		deepStrictEqual(
+			loadCheckpoint(checkpointPath, tasksPath).completedTaskIds,
+			["1.1"],
+		);
+	});
+
+	it("throws instead of silently discarding a checkpoint that exists but fails to parse", () => {
+		// Regression: a prior version caught any parse error and returned a
+		// fresh empty checkpoint, indistinguishable from "no checkpoint yet" —
+		// a crash mid-write (before checkpoints were written atomically) would
+		// silently erase all completed-task history and trigger a full re-run.
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		writeFileSync(checkpointPath, "{not valid json", "utf8");
+
+		throws(() => loadCheckpoint(checkpointPath, tasksPath), /not valid JSON/);
+	});
+
+	it("throws on a checkpoint file with an unexpected shape", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		writeFileSync(checkpointPath, JSON.stringify({ foo: "bar" }), "utf8");
+
+		throws(() => loadCheckpoint(checkpointPath, tasksPath), /unexpected shape/);
+	});
+
+	it("still returns an empty checkpoint when the file is simply missing", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpoint = loadCheckpoint(
+			`${tasksPath}.checkpoint.json`,
+			tasksPath,
+		);
+		deepStrictEqual(checkpoint.completedTaskIds, []);
+	});
+});
+
+describe("orchestrator status/result error guards", () => {
+	it("waitForJobCompletion returns status_error instead of throwing when status() fails", async () => {
+		const result = await waitForJobCompletion({
+			jobId: "job-1",
+			orchestrator: {
+				status: async () => {
+					throw new Error("orchestrator CLI crashed");
+				},
+			},
+			sleepFn: async () => {},
+		});
+
+		strictEqual(result.state, "status_error");
+		strictEqual(result.timedOut, false);
+	});
+
+	it("runQueueWithOrchestrator fails only the affected task when result() throws, not the whole queue", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** First operation
+
+### Task 1.2: Second task
+- **Status:** pending
+- **Description:** Second operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const dispatches = [];
+		let launchIndex = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				integrationGate: () => ({ success: true, message: "ok" }),
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => {
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => {
+						throw new Error("orchestrator result endpoint unreachable");
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+		deepStrictEqual(
+			result.results.map((r) => r.result),
+			["result_fetch_failed", "result_fetch_failed"],
+		);
+		strictEqual(
+			dispatches[0].reason,
+			"orchestrator result endpoint unreachable",
+		);
 	});
 });

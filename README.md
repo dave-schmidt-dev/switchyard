@@ -2,7 +2,7 @@
 
 A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, with Agy/Cursor/Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-5 implemented and test-covered (89/89 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the container/auth lifecycle functions it imports the adapters from (`TASKS.md` Task 9). `npm run validate`'s `deadcode` step reports both honestly.
+**Status:** Phases 0-5 implemented and test-covered (108/108 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the container/auth lifecycle functions it imports the adapters from (`TASKS.md` Task 9). `npm run validate`'s `deadcode` step reports both honestly.
 
 ## Priorities (in order)
 
@@ -32,7 +32,7 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `src/switchyard/container/index.mjs` | Agent container lifecycle (Docker start/stop/exec). Not yet called by the runner (`TASKS.md` Task 9). |
 | `src/switchyard/sandbox/index.mjs` | Working container creation/wipe — **unused, unfinished** (bind-mounts a host temp dir; file-copy step is a stub). Superseded by `lifecycle/index.mjs`; see `TASKS.md` Task 8. |
 | `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker-managed volumes — **unused**, not yet wired into the runner. See `TASKS.md` Task 8. |
-| `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): diff validation, `git apply`, path traversal blocking. |
+| `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, `allowSensitiveManifests`-gated review for build/CI manifests, `git apply` via stdin. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
 | `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateEnvName`) used by both provider adapters. |
 | `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection. |

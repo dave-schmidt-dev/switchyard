@@ -2,7 +2,7 @@
 // Reads persisted task queue, drives serial execution, checkpoints for resume.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
 	captureDiff as captureClaudeDiff,
@@ -222,35 +222,63 @@ export function createEmptyCheckpoint(tasksFilePath) {
 }
 
 /**
- * Persist checkpoint file.
+ * Persist checkpoint file. Writes to a sibling temp file and renames over
+ * the target — `rename` is atomic on the same filesystem, so a crash
+ * mid-write can never leave `checkpointPath` itself holding truncated/
+ * invalid JSON; the reader always sees either the prior state or the new
+ * one, never a partial write.
  * @param {string} checkpointPath
  * @param {object} checkpoint
  */
 export function saveCheckpoint(checkpointPath, checkpoint) {
 	mkdirSync(dirname(checkpointPath), { recursive: true });
-	writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2), "utf8");
+	const tmpPath = `${checkpointPath}.tmp`;
+	writeFileSync(tmpPath, JSON.stringify(checkpoint, null, 2), "utf8");
+	renameSync(tmpPath, checkpointPath);
 }
 
 /**
- * Load checkpoint file; return an empty state when missing/unreadable.
+ * Load checkpoint file. A *missing* file is the normal first-run case and
+ * returns an empty checkpoint. A file that *exists but fails to parse or
+ * has an unexpected shape* is treated as corruption, not "no checkpoint" —
+ * silently discarding it would erase completed-task history and cause a
+ * full re-run, which then fails to reapply already-applied diffs and wedges
+ * the queue anyway, several steps removed from the actual cause. Fail loudly
+ * here instead.
  * @param {string} checkpointPath
  * @param {string} tasksFilePath
+ * @throws {Error} if the checkpoint file exists but is unreadable/invalid
  */
 export function loadCheckpoint(checkpointPath, tasksFilePath) {
+	let raw;
 	try {
-		const raw = readFileSync(checkpointPath, "utf8");
-		const parsed = JSON.parse(raw);
-		if (
-			parsed?.version === CHECKPOINT_VERSION &&
-			Array.isArray(parsed.completedTaskIds) &&
-			Array.isArray(parsed.results)
-		) {
-			return parsed;
-		}
+		raw = readFileSync(checkpointPath, "utf8");
 	} catch {
-		// fall through to empty checkpoint
+		return createEmptyCheckpoint(tasksFilePath); // no checkpoint yet
 	}
-	return createEmptyCheckpoint(tasksFilePath);
+
+	let parsed;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(
+			`checkpoint file exists but is not valid JSON, refusing to silently ` +
+				`discard completed-task history: ${checkpointPath} (${error.message})`,
+		);
+	}
+
+	if (
+		parsed?.version === CHECKPOINT_VERSION &&
+		Array.isArray(parsed.completedTaskIds) &&
+		Array.isArray(parsed.results)
+	) {
+		return parsed;
+	}
+
+	throw new Error(
+		`checkpoint file exists but has an unexpected shape, refusing to ` +
+			`silently discard completed-task history: ${checkpointPath}`,
+	);
 }
 
 /**
@@ -313,8 +341,22 @@ export async function waitForJobCompletion(options) {
 	let lastStatus = { state: "missing" };
 
 	while (polls < maxPolls) {
-		// eslint-disable-next-line no-await-in-loop
-		const status = await orchestrator.status(jobId);
+		let status;
+		try {
+			// eslint-disable-next-line no-await-in-loop
+			status = await orchestrator.status(jobId);
+		} catch (error) {
+			// A transient status-fetch failure must fail only this task, not
+			// abort every remaining task in the queue with no ledger record
+			// and no checkpoint save (unlike launch(), this call previously
+			// had no error handling at all).
+			return {
+				state: "status_error",
+				status: { error: error?.message ?? "orchestrator status failed" },
+				timedOut: false,
+				polls: polls + 1,
+			};
+		}
 		const state = String(status?.state ?? "missing");
 		lastStatus = status ?? { state: "missing" };
 		polls += 1;
@@ -346,7 +388,16 @@ export async function waitForJobCompletion(options) {
  */
 export function executeTask(task, context) {
 	const tier = classifyTask(task.description || task.title);
-	const routeResult = context.route({ tier });
+	// Constrain routing to providers this dispatcher can actually execute.
+	// Without this, route() can legitimately pick a roster provider (e.g.
+	// vibe/agy/cursor) that has no adapter wired here, which previously
+	// produced an unrecoverable "unsupported_provider" failure that
+	// re-occurred identically on every resume (the same task, same route,
+	// same missing adapter, forever).
+	const routeResult = context.route({
+		tier,
+		availableProviders: Object.keys(context.adapters ?? {}),
+	});
 
 	if (!routeResult.provider) {
 		context.recordDispatch({
@@ -531,7 +582,28 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 
-	const jobResult = await context.orchestrator.result(jobId);
+	let jobResult;
+	try {
+		jobResult = await context.orchestrator.result(jobId);
+	} catch (error) {
+		// Same reasoning as the status() guard above: a transient result-fetch
+		// failure must fail only this task, not the whole remaining queue.
+		context.recordDispatch({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "result_fetch_failed",
+			reason: error?.message ?? "orchestrator result failed",
+			percentLeft: routeResult.percentLeft ?? undefined,
+		});
+		return {
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			result: "result_fetch_failed",
+		};
+	}
 	if (!jobResult?.success) {
 		context.recordDispatch({
 			provider: routeResult.provider,
