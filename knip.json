@@ -1,0 +1,9 @@
+{
+	"ignoreDependencies": ["@biomejs/biome", "knip"],
+	"workspaces": {
+		"": {
+			"entry": ["src/**/*.mjs", "src/**/*.js"],
+			"project": ["*.json", "*.md"]
+		}
+	}
+}
