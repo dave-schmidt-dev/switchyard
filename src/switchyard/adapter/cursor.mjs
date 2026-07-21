@@ -159,6 +159,12 @@ export function authenticateCursor(secretName = "CURSOR_API_KEY") {
 
 	const containerScript = buildAuthContainerScript(secretName);
 
+	// Don't trust this call's exit code alone: `bws run` has been observed to
+	// report success (exit 0) for a wrapped `docker exec ... sh -c '<script>'`
+	// even when the script demonstrably failed inside the container (it
+	// re-serializes trailing argv through a shell, which can mangle a
+	// multi-word `sh -c` argument). The credential-presence check below is
+	// the ground truth this function's return value is actually built on.
 	try {
 		execFileSync(
 			"zsh",
@@ -169,11 +175,11 @@ export function authenticateCursor(secretName = "CURSOR_API_KEY") {
 			],
 			{ stdio: "inherit" },
 		);
-		return true;
 	} catch (error) {
 		console.error("Failed to authenticate Cursor:", error.message);
-		return false;
 	}
+
+	return hasNonTrivialCredential(AGENT_CONTAINER_NAME);
 }
 
 /**
