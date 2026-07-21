@@ -1,9 +1,5 @@
 {
-	"ignoreDependencies": ["@biomejs/biome", "knip"],
-	"workspaces": {
-		"": {
-			"entry": ["src/**/*.mjs", "src/**/*.js"],
-			"project": ["*.json", "*.md"]
-		}
-	}
+	"entry": ["tests/**/*.test.mjs", "src/switchyard/runner/index.mjs"],
+	"project": ["src/**/*.mjs"],
+	"ignoreBinaries": ["zsh", "orb"]
 }

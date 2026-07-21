@@ -1,8 +1,8 @@
 # switchyard
 
-A containment-first Python dispatcher that routes coding tasks across subscription-backed agent CLIs (claude, agy, cursor, codex) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
+A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, with Agy/Cursor/Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** Phases 0-5 implemented. All core routing, capability classification, container execution, sandbox lifecycle, integration gate, ledger, provider adapters, runner orchestration, and test suites complete.
+**Status:** Phases 0-5 implemented and test-covered (89/89 `npm test`), but not fully wired end-to-end. `src/switchyard/sandbox/index.mjs` and `src/switchyard/lifecycle/index.mjs` are two competing, unfinished, unused implementations of the working-container lifecycle (`TASKS.md` Task 8); the runner never calls the container/auth lifecycle functions it imports the adapters from (`TASKS.md` Task 9). `npm run validate`'s `deadcode` step reports both honestly.
 
 ## Priorities (in order)
 
@@ -29,26 +29,29 @@ A containment-first Python dispatcher that routes coding tasks across subscripti
 | `src/switchyard/router/scorer.mjs` | Capacity scoring: FNV-1a hash, mulberry32 PRNG, deterministic jitter. |
 | `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter. |
 | `src/switchyard/roster/classifier.mjs` | Keyword-based task-tier classifier (high/standard/low). |
-| `src/switchyard/container/index.mjs` | Agent container lifecycle (Docker start/stop/exec). |
-| `src/switchyard/sandbox/index.mjs` | Working container creation, project staging, wipe (INV-1/INV-3). |
-| `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker volumes (INV-1/INV-3). |
+| `src/switchyard/container/index.mjs` | Agent container lifecycle (Docker start/stop/exec). Not yet called by the runner (`TASKS.md` Task 9). |
+| `src/switchyard/sandbox/index.mjs` | Working container creation/wipe — **unused, unfinished** (bind-mounts a host temp dir; file-copy step is a stub). Superseded by `lifecycle/index.mjs`; see `TASKS.md` Task 8. |
+| `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker-managed volumes — **unused**, not yet wired into the runner. See `TASKS.md` Task 8. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): diff validation, `git apply`, path traversal blocking. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
-| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch, exec, diff capture. |
-| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch, exec, diff capture, BWS-based auth injection. |
+| `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateEnvName`) used by both provider adapters. |
+| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection. |
+| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection. |
 | `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). |
 | **Tests** | |
 | `tests/capability-match.test.mjs` | INV-5 gate: capability filter, tier ordering, model right-sizing. |
 | `tests/classifier.test.mjs` | Keyword-based task tier classifier unit tests. |
+| `tests/claude-adapter.test.mjs` | Container-backed Claude CLI dispatch and diff capture tests. |
+| `tests/claude-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression. |
 | `tests/codex-adapter.test.mjs` | Container-backed Codex CLI dispatch and diff capture tests. |
-| `tests/codex-auth.test.mjs` | INV-1 regression test verifying host auth file is not copied. |
+| `tests/codex-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression. |
 | `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
 | `tests/ledger.test.mjs` | INV-4 dispatch ledger recording and querying unit tests. |
-| `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation. |
+| `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation (generic Docker behavior — see `TASKS.md` Task 8). |
 | `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5. |
-| `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume, and orchestrator CLI integration tests. |
+| `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume, stopOnFailure/gate-failure handling, headroom-routing mechanism, and orchestrator CLI integration tests. |
 | `tests/scorer.test.mjs` | FNV-1a hash, mulberry32 PRNG, and scoring logic unit tests. |
-| `tests/workspace-wipe.test.mjs` | INV-3 gate: working container wipe, agent container persistence. |
+| `tests/workspace-wipe.test.mjs` | INV-3 gate: working container wipe, agent container persistence (generic Docker behavior — see `TASKS.md` Task 8). |
 
 ## Planning artifacts
 

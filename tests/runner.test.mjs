@@ -186,6 +186,95 @@ describe("runner orchestration", () => {
 	});
 });
 
+describe("runner stopOnFailure + integration gate failure", () => {
+	function dependenciesWithGateResult(gateResult) {
+		return {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				percentLeft: 72,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			integrationGate: () => gateResult,
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/a b/a",
+				},
+				codex: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/b b/b",
+				},
+			},
+		};
+	}
+
+	it("halts the queue when integrationGate fails and stopOnFailure is true", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** First operation
+
+### Task 1.2: Second task
+- **Status:** pending
+- **Description:** Second operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			stopOnFailure: true,
+			dependencies: dependenciesWithGateResult({
+				success: false,
+				message: "rejected",
+			}),
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[0].result, "integration_failed");
+		strictEqual(result.results[0].success, false);
+		deepStrictEqual(result.completedTaskIds, []);
+	});
+
+	it("continues past an integrationGate failure when stopOnFailure is false", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** First operation
+
+### Task 1.2: Second task
+- **Status:** pending
+- **Description:** Second operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: dependenciesWithGateResult({
+				success: false,
+				message: "rejected",
+			}),
+		});
+
+		strictEqual(result.processedTasks, 2);
+		deepStrictEqual(
+			result.results.map((r) => r.result),
+			["integration_failed", "integration_failed"],
+		);
+		deepStrictEqual(result.completedTaskIds, []);
+	});
+});
+
 describe("runner poll/wait loop", () => {
 	it("waits through running states until done", async () => {
 		const statuses = [
@@ -528,6 +617,16 @@ describe("runner provider spread recording", () => {
 				dispatches.map((entry) => entry.provider),
 				["claude", "codex"],
 			);
+			// Assert the mechanism, not just the outcome sequence: the first
+			// dispatch picks claude specifically because it has more headroom
+			// (72 > 60) via spread selection, and the second picks codex
+			// specifically because claude's headroom then dropped to 4% —
+			// below DEFAULT_FLOOR (5.0) — excluding it, not because provider
+			// selection happened to differ for some unrelated reason.
+			strictEqual(dispatches[0].reason, "spread");
+			strictEqual(dispatches[0].percentLeft, 72);
+			strictEqual(dispatches[1].reason, "spread");
+			strictEqual(dispatches[1].percentLeft, 68);
 		} finally {
 			if (originalSnapshot === null) {
 				try {

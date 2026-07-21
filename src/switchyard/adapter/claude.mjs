@@ -3,8 +3,9 @@
 // CR-4: Adapters exec inside container, never host-spawn
 // PW-4: Independent in-container login
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
+import { validateEnvName, validateIdentifier } from "./shell-safety.mjs";
 
 const CLAUDE_CMD = "claude";
 
@@ -14,8 +15,9 @@ const CLAUDE_CMD = "claude";
  */
 export function isClaudeAuthenticated() {
 	try {
-		const result = execSync(
-			`docker exec ${AGENT_CONTAINER_NAME} sh -c '${CLAUDE_CMD} --version'`,
+		const result = execFileSync(
+			"docker",
+			["exec", AGENT_CONTAINER_NAME, CLAUDE_CMD, "--version"],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
 		return result.includes("Claude");
@@ -26,18 +28,35 @@ export function isClaudeAuthenticated() {
 
 /**
  * Authenticate Claude in the container.
- * PW-4: Independent in-container login (subscription, never API keys)
- * Uses bws-run pattern for credential injection
- * @param {string} bwsPath Bitwarden path for credentials
+ * PW-4: Independent in-container login (subscription, never API keys).
+ *
+ * The secret is never fetched host-side and never appears in any process's
+ * argv (visible via `ps`/`/proc`): `bws-run` injects `secretName` as an env
+ * var into the `docker exec` process it launches, and `docker exec -e NAME`
+ * (bare, no `=value`) forwards that host env var into the container by
+ * reference. Requires `secretName` to be the exact BWS secret key
+ * (project convention: UPPERCASE_SNAKE_CASE matching the env var).
+ * @param {string} [secretName] BWS secret name for the Claude credentials JSON.
  * @returns {boolean}
  */
-export function authenticateClaude(bwsPath) {
+export function authenticateClaude(secretName = "CLAUDE_CREDENTIALS") {
 	try {
-		// Use bws-run to inject credentials into the container
-		// This runs claude login inside the container with credentials from BWS
-		const escapedBwsPath = bwsPath.replace(/'/g, "'\\''");
-		execSync(
-			`docker exec -e CLAUDE_CREDENTIALS=$(bws-get '${escapedBwsPath}') ${AGENT_CONTAINER_NAME} sh -c '\n\t\t\techo "$CLAUDE_CREDENTIALS" > /tmp/claude_creds.json\n\t\t\t${CLAUDE_CMD} login --file /tmp/claude_creds.json\n\t\t\trm /tmp/claude_creds.json\n\t\t'`,
+		validateEnvName(secretName, "secretName");
+	} catch (error) {
+		console.error("Failed to authenticate Claude:", error.message);
+		return false;
+	}
+
+	const containerScript = `cat > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; rm -f /tmp/claude_creds.json`;
+
+	try {
+		execFileSync(
+			"zsh",
+			[
+				"-i",
+				"-c",
+				`bws-run -- docker exec -e ${secretName} ${AGENT_CONTAINER_NAME} sh -c '${containerScript}'`,
+			],
 			{ stdio: "inherit" },
 		);
 		return true;
@@ -49,6 +68,9 @@ export function authenticateClaude(bwsPath) {
 
 /**
  * Execute a task with Claude in the container.
+ * The prompt is delivered over stdin, never shell-interpolated — this
+ * avoids both shell-injection and the multi-line-prompt-flattening problem
+ * that string interpolation forced on us.
  * @param {string} prompt The task prompt
  * @param {string} workingContainerName Working container to exec in
  * @param {object} options Execution options
@@ -59,26 +81,35 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 	const { model } = options;
 
 	try {
-		// Build the claude command
-		let cmd = CLAUDE_CMD;
-		if (model) {
-			cmd += ` --model ${model}`;
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+
+	const args = [
+		"exec",
+		"-i",
+		"-w",
+		"/project",
+		workingContainerName,
+		CLAUDE_CMD,
+	];
+	if (model) {
+		try {
+			validateIdentifier(model, "model");
+		} catch (error) {
+			return { output: "", success: false, error: error.message };
 		}
+		args.push("--model", model);
+	}
 
-		// Escape the prompt for shell execution
-		const escapedPrompt = prompt
-			.replace(/\\/g, "\\\\")
-			.replace(/'/g, "'\\''")
-			.replace(/"/g, '\\"')
-			.replace(/\n/g, "\\n")
-			.replace(/\$/g, "\\$");
-
-		// Execute claude in the working container
-		// The working container has the project code mounted at /project
-		const result = execSync(
-			`docker exec -w /project ${workingContainerName} sh -c '\n\t\t\techo "${escapedPrompt}" | ${cmd}\n\t\t'`,
-			{ encoding: "utf8", stdio: "pipe", timeout: 300000 },
-		);
+	try {
+		const result = execFileSync("docker", args, {
+			input: prompt,
+			encoding: "utf8",
+			stdio: ["pipe", "pipe", "pipe"],
+			timeout: 300000,
+		});
 
 		return { output: result, success: true };
 	} catch (error) {
@@ -97,8 +128,14 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
  */
 export function captureDiff(workingContainerName) {
 	try {
-		const diff = execSync(
-			`docker exec -w /project ${workingContainerName} git diff`,
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return null;
+	}
+	try {
+		const diff = execFileSync(
+			"docker",
+			["exec", "-w", "/project", workingContainerName, "git", "diff"],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
 		return diff.trim() || null;

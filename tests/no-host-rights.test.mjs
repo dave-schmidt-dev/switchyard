@@ -1,7 +1,7 @@
 // INV-1 gate test: agents have no rights to the Mac host
 // Tests: from inside container, host FS / Docker socket / host creds are unreachable
 
-import { ok, strictEqual } from "node:assert";
+import { strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { after, before, describe, it } from "node:test";
@@ -9,18 +9,35 @@ import { after, before, describe, it } from "node:test";
 // Use a test container to verify isolation
 const TEST_CONTAINER = "switchyard-test-isolation";
 
+// Returns true if the path is listable inside the container, false if the
+// `ls` invocation fails (path absent/inaccessible — the property we want).
+// IMPORTANT: this must not be called from inside a try/catch that also
+// contains the assertion — an assertion failure thrown alongside the
+// command's own exception would otherwise be swallowed by that same catch
+// block and silently reported as a pass (this bit us once already).
+function existsInContainer(path) {
+	try {
+		execSync(`docker exec ${TEST_CONTAINER} ls ${path}`, { stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 describe("no host rights", () => {
 	before(() => {
-		// Clean up any existing test container
 		try {
 			execSync(`docker rm -f ${TEST_CONTAINER}`, { stdio: "inherit" });
 		} catch {
 			// Ignore
 		}
+		execSync(
+			`docker run -d --name ${TEST_CONTAINER} alpine:latest sleep infinity`,
+			{ stdio: "inherit" },
+		);
 	});
 
 	after(() => {
-		// Clean up test container
 		try {
 			execSync(`docker rm -f ${TEST_CONTAINER}`, { stdio: "inherit" });
 		} catch {
@@ -29,62 +46,35 @@ describe("no host rights", () => {
 	});
 
 	it("should not access host filesystem", () => {
-		// Create a test container with no host mounts
-		execSync(
-			`docker run -d --name ${TEST_CONTAINER} alpine:latest sleep infinity`,
-			{ stdio: "inherit" },
+		strictEqual(
+			existsInContainer("/Users"),
+			false,
+			"host filesystem must not be reachable from the container",
 		);
-
-		// Try to access a known host path
-		try {
-			const _result = execSync(`docker exec ${TEST_CONTAINER} ls /Users`, {
-				encoding: "utf8",
-				stdio: "pipe",
-			});
-			// If we get here, host FS is accessible (BAD)
-			// Note: In a real isolated container, /Users wouldn't exist
-			// This test assumes proper container isolation
-		} catch (_error) {
-			// Expected: /Users doesn't exist in container
-			ok(true, "Host filesystem not accessible from container");
-		}
 	});
 
 	it("should not access Docker socket", () => {
-		// Docker socket should not be mounted in the container
-		try {
-			const result = execSync(
-				`docker exec ${TEST_CONTAINER} ls /var/run/docker.sock`,
-				{ encoding: "utf8", stdio: "pipe" },
-			);
-			// If socket exists, that's a problem
-			strictEqual(result.includes("docker.sock"), false);
-		} catch {
-			// Expected: socket doesn't exist
-			ok(true, "Docker socket not accessible from container");
-		}
+		strictEqual(
+			existsInContainer("/var/run/docker.sock"),
+			false,
+			"Docker socket must not be reachable from the container",
+		);
 	});
 
 	it("should not access host credentials", () => {
-		// Common credential paths should not be accessible
 		const credPaths = [
-			`/root/.ssh`,
-			`/root/.gitconfig`,
-			`/root/.config`,
-			`${homedir()}`,
+			"/root/.ssh",
+			"/root/.gitconfig",
+			"/root/.config",
+			homedir(),
 		];
 
 		for (const path of credPaths) {
-			try {
-				execSync(`docker exec ${TEST_CONTAINER} ls ${path}`, {
-					stdio: "pipe",
-				});
-				// If we can list the path, that's a potential issue
-				// Note: Some paths may exist but be empty in the container
-			} catch {
-				// Expected: path doesn't exist or isn't accessible
-				ok(true, `Host credential path ${path} not accessible`);
-			}
+			strictEqual(
+				existsInContainer(path),
+				false,
+				`host credential path ${path} must not be reachable from the container`,
+			);
 		}
 	});
 });

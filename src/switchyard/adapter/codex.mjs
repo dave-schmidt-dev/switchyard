@@ -3,32 +3,11 @@
 // CR-4: Adapters exec inside container, never host-spawn
 // PW-4: Independent in-container login
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
+import { validateEnvName, validateIdentifier } from "./shell-safety.mjs";
 
 const CODEX_CMD = "codex";
-
-// Safe identifier pattern: Docker container names and model names.
-// Allows alphanumeric, hyphen, underscore, dot, colon, forward-slash.
-// Rejects spaces and shell metacharacters before any shell interpolation.
-const SAFE_IDENTIFIER_RE = /^[\w./:@-]+$/;
-
-/**
- * Validate that a string is a safe identifier for shell interpolation.
- * Throws on invalid input — fail closed so no malformed value reaches a shell.
- * @param {string} value
- * @param {string} label Human-readable name for error messages.
- */
-function validateIdentifier(value, label) {
-	if (!value || typeof value !== "string") {
-		throw new Error(`${label} must be a non-empty string`);
-	}
-	if (!SAFE_IDENTIFIER_RE.test(value)) {
-		throw new Error(
-			`${label} contains unsafe characters: ${JSON.stringify(value)}`,
-		);
-	}
-}
 
 /**
  * Check if Codex is authenticated in the container.
@@ -36,8 +15,9 @@ function validateIdentifier(value, label) {
  */
 export function isCodexAuthenticated() {
 	try {
-		const result = execSync(
-			`docker exec ${AGENT_CONTAINER_NAME} sh -c '${CODEX_CMD} --version'`,
+		const result = execFileSync(
+			"docker",
+			["exec", AGENT_CONTAINER_NAME, CODEX_CMD, "--version"],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
 		return result.includes("codex");
@@ -49,27 +29,35 @@ export function isCodexAuthenticated() {
 /**
  * Authenticate Codex in the container.
  * PW-4: Independent in-container login via BWS-provided auth payload.
- * NOTE: bws-get is called host-side and the secret is passed via -e flag.
- * The secret appears in the docker exec command-line args (visible in ps)
- * while the command runs — acceptable for an attended auth operation but
- * not suitable for unattended automation. TODO: refactor to pass via stdin.
- * @param {string} bwsPath Bitwarden path for Codex auth payload JSON.
+ *
+ * The secret is never fetched host-side and never appears in any process's
+ * argv (visible via `ps`/`/proc`): `bws-run` injects `secretName` as an env
+ * var into the `docker exec` process it launches, and `docker exec -e NAME`
+ * (bare, no `=value`) forwards that host env var into the container by
+ * reference. Requires `secretName` to be the exact BWS secret key
+ * (project convention: UPPERCASE_SNAKE_CASE matching the env var).
+ * @param {string} [secretName] BWS secret name for the Codex auth payload JSON.
  * @returns {boolean}
  */
-export function authenticateCodex(bwsPath) {
-	if (!bwsPath || typeof bwsPath !== "string") {
-		console.error("Failed to authenticate Codex: missing bwsPath");
+export function authenticateCodex(secretName = "CODEX_AUTH_JSON") {
+	try {
+		validateEnvName(secretName, "secretName");
+	} catch (error) {
+		console.error("Failed to authenticate Codex:", error.message);
 		return false;
 	}
 
+	const containerScript =
+		"mkdir -p /root/.codex && cat > /root/.codex/auth.json && chmod 600 /root/.codex/auth.json";
+
 	try {
-		const escapedBwsPath = bwsPath.replace(/'/g, "'\\''");
-		execSync(
-			`docker exec -e CODEX_AUTH_JSON=$(bws-get '${escapedBwsPath}') ${AGENT_CONTAINER_NAME} sh -c '
-			mkdir -p /root/.codex
-			printf "%s" "$CODEX_AUTH_JSON" > /root/.codex/auth.json
-			chmod 600 /root/.codex/auth.json
-		'`,
+		execFileSync(
+			"zsh",
+			[
+				"-i",
+				"-c",
+				`bws-run -- docker exec -e ${secretName} ${AGENT_CONTAINER_NAME} sh -c '${containerScript}'`,
+			],
 			{ stdio: "inherit" },
 		);
 		return true;
@@ -81,6 +69,9 @@ export function authenticateCodex(bwsPath) {
 
 /**
  * Execute a task with Codex in the container.
+ * The prompt is delivered over stdin, never shell-interpolated — this
+ * avoids both shell-injection and the multi-line-prompt-flattening problem
+ * that string interpolation forced on us.
  * @param {string} prompt The task prompt
  * @param {string} workingContainerName Working container to exec in
  * @param {object} options Execution options
@@ -90,46 +81,36 @@ export function authenticateCodex(bwsPath) {
 export function executeCodex(prompt, workingContainerName, options = {}) {
 	const { model } = options;
 
-	// Validate identifiers at the adapter boundary before any shell interpolation.
-	// Fail closed: a malformed container name or model name is rejected here
-	// rather than passed to the shell where it could be exploited.
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	let cmd = CODEX_CMD;
+	const args = [
+		"exec",
+		"-i",
+		"-w",
+		"/project",
+		workingContainerName,
+		CODEX_CMD,
+	];
 	if (model) {
 		try {
 			validateIdentifier(model, "model");
 		} catch (error) {
 			return { output: "", success: false, error: error.message };
 		}
-		cmd += ` --model ${model}`;
+		args.push("--model", model);
 	}
 
 	try {
-		// Escape the prompt for insertion into a double-quoted echo argument
-		// inside a single-quoted sh -c block. The outer single-quotes are the
-		// actual shell boundary; the inner double-quotes are literal to sh -c.
-		// NOTE: \n in the prompt is replaced with a space — echo does not
-		// interpret \n portably and the single-quoted outer block prevents
-		// using $'...' syntax. Multi-line prompts are flattened. TODO: pass
-		// prompts via a temp file to preserve newlines correctly.
-		const escapedPrompt = prompt
-			.replace(/\\/g, "\\\\")
-			.replace(/"/g, '\\"')
-			.replace(/\n/g, " ")
-			.replace(/\$/g, "\\$");
-
-		// Execute codex in the working container
-		const result = execSync(
-			`docker exec -w /project ${workingContainerName} sh -c '
-			echo "${escapedPrompt}" | ${cmd}
-		'`,
-			{ encoding: "utf8", stdio: "pipe", timeout: 300000 },
-		);
+		const result = execFileSync("docker", args, {
+			input: prompt,
+			encoding: "utf8",
+			stdio: ["pipe", "pipe", "pipe"],
+			timeout: 300000,
+		});
 
 		return { output: result, success: true };
 	} catch (error) {
@@ -153,8 +134,9 @@ export function captureDiff(workingContainerName) {
 		return null;
 	}
 	try {
-		const diff = execSync(
-			`docker exec -w /project ${workingContainerName} git diff`,
+		const diff = execFileSync(
+			"docker",
+			["exec", "-w", "/project", workingContainerName, "git", "diff"],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
 		return diff.trim() || null;

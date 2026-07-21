@@ -3,20 +3,22 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { captureDiff, executeCodex } from "../src/switchyard/adapter/codex.mjs";
+import {
+	captureDiff,
+	executeClaude,
+} from "../src/switchyard/adapter/claude.mjs";
 
-// Resolve path from project root regardless of cwd — guards Finding H.
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
-describe("codex auth isolation", () => {
+describe("claude auth isolation", () => {
 	it("does not copy host auth file into container", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/codex.mjs");
+		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/claude.mjs");
 		const source = readFileSync(adapterPath, "utf8");
 
 		strictEqual(
-			source.includes("docker cp ~/.codex/auth.json"),
+			source.includes("docker cp"),
 			false,
-			"host auth copy is forbidden",
+			"host cred copy is forbidden",
 		);
 		ok(
 			source.includes("bws-run"),
@@ -25,7 +27,7 @@ describe("codex auth isolation", () => {
 	});
 
 	it("never fetches the secret host-side or embeds it in argv", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/codex.mjs");
+		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/claude.mjs");
 		const source = readFileSync(adapterPath, "utf8");
 
 		strictEqual(
@@ -34,16 +36,16 @@ describe("codex auth isolation", () => {
 			"bws-get prints secrets to stdout host-side — must not be used by adapter code",
 		);
 		strictEqual(
-			/-e CODEX_AUTH_JSON=/.test(source),
+			/-e CLAUDE_CREDENTIALS=/.test(source),
 			false,
 			"secret must not be assigned inline on the docker exec command line (visible via ps)",
 		);
 	});
 });
 
-describe("codex adapter shell injection guard", () => {
+describe("claude adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
-		const result = executeCodex("do something", "bad container; rm -rf /", {});
+		const result = executeClaude("do something", "bad container; rm -rf /", {});
 		strictEqual(result.success, false);
 		ok(
 			result.error?.includes("unsafe characters"),
@@ -52,8 +54,8 @@ describe("codex adapter shell injection guard", () => {
 	});
 
 	it("rejects model name with shell metacharacters", () => {
-		const result = executeCodex("do something", "valid-container", {
-			model: "gpt-4; echo INJECTED",
+		const result = executeClaude("do something", "valid-container", {
+			model: "opus; echo INJECTED",
 		});
 		strictEqual(result.success, false);
 		ok(
@@ -63,13 +65,9 @@ describe("codex adapter shell injection guard", () => {
 	});
 
 	it("accepts a valid container name", () => {
-		// Should not throw on validation — will fail at Docker exec (not available),
-		// but the failure comes from Docker, not from input validation.
-		const result = executeCodex("do something", "switchyard-work-1", {
-			model: "gpt-4o",
+		const result = executeClaude("do something", "switchyard-work-1", {
+			model: "claude-sonnet-5",
 		});
-		// Either Docker is unavailable (success:false with docker error) or succeeds.
-		// Key: no "unsafe characters" error.
 		ok(
 			!result.error?.includes("unsafe characters"),
 			"valid identifier should not be rejected by validation",
@@ -82,14 +80,9 @@ describe("codex adapter shell injection guard", () => {
 	});
 
 	it("does not execute shell metacharacters embedded in the prompt on the host", () => {
-		// Regression test: an earlier version shell-interpolated the prompt into
-		// a single-quoted `sh -c '...'` block without escaping single quotes.
-		// A prompt containing an unescaped `'` would close that quoted region
-		// early and let the remainder of the prompt run as literal shell syntax
-		// in the *host* shell that invoked the whole docker command — a host
-		// RCE via task text, not merely a captured-diff bug. The current
-		// implementation delivers the prompt over stdin (never shell-parsed),
-		// so this must be a no-op regardless of the container's existence.
+		// Same class of bug fixed in the Codex adapter: the prompt must never be
+		// shell-interpolated. Delivered over stdin, so a single quote in a task
+		// description can't break out into host shell syntax.
 		const markerDir = mkdtempSync(
 			join(tmpdir(), "switchyard-prompt-injection-"),
 		);
@@ -97,7 +90,7 @@ describe("codex adapter shell injection guard", () => {
 		const evilPrompt = `wrap up'; touch ${markerPath}; echo '`;
 
 		try {
-			const result = executeCodex(
+			const result = executeClaude(
 				evilPrompt,
 				"switchyard-nonexistent-container",
 				{},
