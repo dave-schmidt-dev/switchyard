@@ -35,8 +35,9 @@ export function authenticateClaude(bwsPath) {
 	try {
 		// Use bws-run to inject credentials into the container
 		// This runs claude login inside the container with credentials from BWS
+		const escapedBwsPath = bwsPath.replace(/'/g, "'\\''");
 		execSync(
-			`docker exec -e CLAUDE_CREDENTIALS=$$(bws-get ${bwsPath}) ${AGENT_CONTAINER_NAME} sh -c '\n\t\t\techo "$CLAUDE_CREDENTIALS" > /tmp/claude_creds.json\n\t\t\t${CLAUDE_CMD} login --file /tmp/claude_creds.json\n\t\t\trm /tmp/claude_creds.json\n\t\t'`,
+			`docker exec -e CLAUDE_CREDENTIALS=$(bws-get '${escapedBwsPath}') ${AGENT_CONTAINER_NAME} sh -c '\n\t\t\techo "$CLAUDE_CREDENTIALS" > /tmp/claude_creds.json\n\t\t\t${CLAUDE_CMD} login --file /tmp/claude_creds.json\n\t\t\trm /tmp/claude_creds.json\n\t\t'`,
 			{ stdio: "inherit" },
 		);
 		return true;
@@ -68,6 +69,7 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 		const escapedPrompt = prompt
 			.replace(/\\/g, "\\\\")
 			.replace(/'/g, "'\\''")
+			.replace(/"/g, '\\"')
 			.replace(/\n/g, "\\n")
 			.replace(/\$/g, "\\$");
 

@@ -3,11 +3,11 @@
 // Implements git apply of approved diffs
 
 import { spawnSync } from "node:child_process";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { cwd } from "node:process";
 
-const SCratch_DIR = join(cwd(), ".switchyard-scratch");
+const SCRATCH_DIR = join(cwd(), ".switchyard-scratch");
 
 /**
  * Apply a diff to the host after review.
@@ -19,7 +19,7 @@ const SCratch_DIR = join(cwd(), ".switchyard-scratch");
 export function applyReviewedDiff(diff, projectPath) {
 	try {
 		// Write diff to temp file
-		const diffPath = join(SCratch_DIR, "reviewed.diff");
+		const diffPath = join(SCRATCH_DIR, "reviewed.diff");
 		mkdirSync(dirname(diffPath), { recursive: true });
 		writeFileSync(diffPath, diff, "utf8");
 

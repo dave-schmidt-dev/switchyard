@@ -2,7 +2,7 @@
 
 A containment-first Python dispatcher that routes coding tasks across subscription-backed agent CLIs (claude, agy, cursor, codex) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
 
-**Status:** scaffolded, pre-implementation.
+**Status:** Phases 0-4 implemented (M1-M3). Gate tests passing. Runner orchestrator stub remaining.
 
 ## Priorities (in order)
 
@@ -20,11 +20,35 @@ A containment-first Python dispatcher that routes coding tasks across subscripti
 | `HISTORY.md` | Meaningful changes, bugs, remediation, regression notes. (local, gitignored) |
 | `TASKS.md` | Per-project task tracking. (local, gitignored) |
 | `LICENSE` | MIT. |
+| `package.json` | Node.js/ESM project config, biome + knip devDependencies. |
+| `biome.json` | Biome linter/formatter config. |
+| `knip.json` | Dead code / unused dependency detection. |
+| `docker/.gitkeep` | Placeholder for Docker image build context. |
+| **Source modules** | |
+| `src/switchyard/router/index.mjs` | Provider selection: snapshot-backed spread routing, blind fallback, INV-4 compliance. |
+| `src/switchyard/router/scorer.mjs` | Capacity scoring: FNV-1a hash, mulberry32 PRNG, deterministic jitter. |
+| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter. |
+| `src/switchyard/roster/classifier.mjs` | Keyword-based task-tier classifier (high/standard/low). |
+| `src/switchyard/container/index.mjs` | Agent container lifecycle (Docker start/stop/exec). |
+| `src/switchyard/sandbox/index.mjs` | Working container creation, project staging, wipe (INV-1/INV-3). |
+| `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker volumes (INV-1/INV-3). |
+| `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): diff validation, `git apply`, path traversal blocking. |
+| `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
+| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch, exec, diff capture. |
+| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch, exec, diff capture. |
+| `src/switchyard/runner/index.mjs` | Orchestrator runner stub (Phase 4+). |
+| **Tests** | |
+| `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5. |
+| `tests/capability-match.test.mjs` | INV-5 gate: capability filter, tier ordering, model right-sizing. |
+| `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
+| `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation. |
+| `tests/workspace-wipe.test.mjs` | INV-3 gate: working container wipe, agent container persistence. |
 
 ## Planning artifacts
 
-- `~/Documents/Projects/.plans/switchyard/switchyard-containment-architecture-2026-07-20.md` — warp-tier implementation plan (in progress: steps 1–7 of the seed architecture as 5 milestones).
-- Seed architecture doc: sacrificial execution architecture for coordinating subscription-backed coding agents.
+- `~/Documents/Projects/.plans/switchyard/switchyard-plan-implementation-engine-2026-07-20.md` — impulse-tier implementation plan (active: 18 tasks, 8 phases).
+- `~/Documents/Projects/.plans/switchyard/switchyard-plan-implementation-engine-2026-07-20-tasks.md` — task board for the implementation engine.
+- Supersedes the abandoned `switchyard-containment-architecture-2026-07-20` (adversary-defense) draft.
 
 ## Workflows
 

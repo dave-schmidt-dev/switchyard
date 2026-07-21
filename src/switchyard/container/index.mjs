@@ -81,7 +81,6 @@ export function startAgentContainer() {
 			"docker run -d --name " +
 				AGENT_CONTAINER_NAME +
 				" --restart unless-stopped " +
-				"-v /tmp/switchyard-work:/work " +
 				AGENT_IMAGE +
 				" sleep infinity",
 			{ stdio: "inherit" },

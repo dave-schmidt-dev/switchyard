@@ -27,12 +27,14 @@ export function isCodexAuthenticated() {
 /**
  * Authenticate Codex in the container.
  * PW-4: Independent in-container login
+ * TODO: INV-1 - This currently copies host auth file, which violates no-host-cred mount.
+ * Need BWS-based injection pattern instead.
  * @returns {boolean}
  */
 export function authenticateCodex() {
 	try {
-		// Codex uses ~/.codex/auth.json for authentication
-		// Copy auth from host to container (read-only copy for auth only)
+		// TODO: Replace with BWS-based credential injection
+		// Current implementation copies host auth file (INV-1 violation)
 		execSync(
 			`docker cp ~/.codex/auth.json ${AGENT_CONTAINER_NAME}:/root/.codex/auth.json`,
 			{ stdio: "inherit" },
@@ -66,6 +68,7 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 		const escapedPrompt = prompt
 			.replace(/\\/g, "\\\\")
 			.replace(/'/g, "'\\''")
+			.replace(/"/g, '\\"')
 			.replace(/\n/g, "\\n")
 			.replace(/\$/g, "\\$");
 
