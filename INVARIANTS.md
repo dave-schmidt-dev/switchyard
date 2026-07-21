@@ -1,52 +1,39 @@
 # Invariants — switchyard
 
 > System contract. The harvest tool reads `area:` globs to map HISTORY bug entries
-> to invariants. Per-project convention (commit prefix, invariant refs) is declared
-> in this project's README, not globally.
+> to invariants. Per-project convention is declared in this project's README.
 >
-> Confirmed by David Schmidt 2026-07-20 (first closed-loop plan:
-> `switchyard-containment-architecture-2026-07-20`). Each invariant maps to a
-> seed §4 Go/No-Go gate. `area:` globs point at the planned layout; they become
-> live as the code lands.
+> Confirmed by David Schmidt 2026-07-20. switchyard is a **usage-aware dispatcher**
+> that spreads coding tasks across subscription-backed agent CLIs (routing on live
+> usage from the `ai_monitor` project) and runs each in a disposable sandbox with no
+> rights to the Mac host. Threat model: **accident-containment, not adversary defense.**
 
-### INV-1 — No exec/validation container can reach the host, VM gateway, RFC1918 LAN, cloud metadata, Docker socket, or local DNS
-area: ["src/switchyard/net/**", "src/switchyard/container/**", "docker/**", "tests/adversarial/**"]
-gate_test: tests/adversarial/test_containment.py
+### INV-1 — Agents have no rights to the Mac host
+area: ["src/switchyard/container/**", "src/switchyard/sandbox/**", "docker/**"]
+gate_test: tests/no-host-rights.test.mjs
 threshold: 3
-rationale: The sandbox boundary is the product. A reachable host/LAN/metadata endpoint turns a hostile workload into host or network compromise. This is the whole point of the architecture.
+rationale: The whole safety story. Neither the agent container nor the working container mounts the host filesystem, Docker socket, or host credentials. Agents operate only on the working container's copy of the code. A host mount = the agent can nuke the Mac. Provider CLIs authenticate via **independent in-container logins**, not copied host credentials, so no host secret enters the container. Routing is decided **host-side** (the runner reads ai_monitor's snapshot on the host), so the snapshot never enters the container either — the only inbound signal is the per-task assignment (chosen provider/model + task text), a control input that carries no host credentials or paths and confers no power over the host.
 
-### INV-2 — Reusable base images contain no live credentials; provider creds are injected per-task and only for one provider
-area: ["docker/**", "src/switchyard/container/**", "src/switchyard/creds/**"]
-gate_test: tests/test_base_image_no_creds.py
+### INV-2 — Code returns to the Mac only through the explicit, reviewed integration step
+area: ["src/switchyard/integrate/**"]
+gate_test: tests/integration-gate.test.mjs
 threshold: 3
-rationale: A credential baked into a reusable image is a credential leaked to every task and every image copy. Per-task single-provider injection bounds the blast to one sacrificial environment and one provider.
+rationale: The single door between the sandbox and the host. Agent output reaches real files only via a reviewed apply/merge — never a direct agent write to the host. Bypassing this is how unattended agents would silently corrupt the Mac's copy.
 
-### INV-3 — The host reads only Importer-emitted canonical patches + control-stripped plaintext logs; never un-normalized container output
-area: ["src/switchyard/importer/**"]
-gate_test: tests/test_quarantine_importer.py
+### INV-3 — The working container is wiped at project end
+area: ["src/switchyard/container/**", "src/switchyard/lifecycle/**"]
+gate_test: tests/workspace-wipe.test.mjs
 threshold: 3
-rationale: Container output is hostile data (terminal-escape injection, patch path-traversal, symlink attacks). Opening it raw on the trusted host is a direct compromise path; normalization in quarantine is the only safe intake.
+rationale: The working container (project code + build artifacts) is the disposable unit; wiping it per project prevents cross-project state bleed and bounds any accident to one project. The standing agent container is never the disposable unit.
 
-### INV-4 — The validation container has no network, no credentials, no Docker socket, no writable dep cache, and immutable hash-pinned deps
-area: ["src/switchyard/validator/**", "docker/validator/**"]
-gate_test: tests/test_validator_offline.py
+### INV-4 — A task is dispatched only to a provider with remaining usage, spreading load across funded providers; every dispatch records provider + model + result
+area: ["src/switchyard/router/**", "src/switchyard/roster/**", "src/switchyard/ledger/**"]
+gate_test: tests/router.test.mjs
 threshold: 3
-rationale: The validator runs a hostile workload (the patched code + its tests). Network or credential access there re-opens every exfiltration/tamper vector the pipeline exists to close.
+rationale: The product's reason to exist. Routing to an exhausted provider (percent_left at/near 0, or before reset_iso) defeats load-spreading and hits the "out of usage" wall switchyard removes. Among funded providers the router SPREADS — it favors the most remaining headroom rather than draining one provider before touching the next — so a plan consumes the aggregate capacity of every subscription. (The provider *priority list* Claude>Codex>Agy>Cursor>Vibe>Copilot governs the order adapters are BUILT, not runtime preference.) Recording provider+model+result per task keeps dispatch auditable and feeds the (tier → provider/model) fitness record INV-5 relies on.
 
-### INV-5 — Every task enforces a path/operation allowlist (e.g. max_files_changed) on both export and import, atop global blocks
-area: ["src/switchyard/exporter/**", "src/switchyard/importer/**", "src/switchyard/policy/**"]
-gate_test: tests/test_allowlists.py
+### INV-5 — A task runs only on a (provider, model) whose capability class meets its difficulty tier
+area: ["src/switchyard/router/**", "src/switchyard/roster/**"]
+gate_test: tests/capability-match.test.mjs
 threshold: 3
-rationale: Without a per-task allowlist, a compromised agent can exfiltrate more source than intended (export) or write outside its remit (import). Dual-layer allowlists (global blocks + task-specific) bound both directions.
-
-### INV-6 — Every task records repo snapshot, base-image digest, provider-credential identity, patch hash, and validation result — never secret values
-area: ["src/switchyard/ledger/**"]
-gate_test: tests/test_provenance.py
-threshold: 3
-rationale: A change that can't be traced to a snapshot/image/credential/patch/result is unauditable and unattributable — fatal for a system that runs untrusted code. Storing credential *identity* (not value) keeps the ledger itself non-sensitive.
-
-### INV-7 — The adversarial corpus uses instrumented canary/test credentials, never production tokens
-area: ["tests/adversarial/**", "src/switchyard/creds/**"]
-gate_test: tests/adversarial/test_canary_only.py
-threshold: 3
-rationale: Red-teaming assumes credential exfiltration succeeds. Using a real token to prove that burns a real token; canaries make exfiltration observable without real loss.
+rationale: Providers and models are not interchangeable. A high-tier task (complex integration, schema/migration) routed to a low-capability harness or small model (Vibe, Copilot, or a Haiku-class model) produces wrong work that costs more to fix than it saved; conversely, running trivial tasks on a top model (Opus, top-tier GPT) needlessly burns the premium caps switchyard exists to conserve. So capability is a hard eligibility FILTER applied *before* INV-4's spread selection — a (provider, model) below the task's tier is not a candidate — and within the chosen harness the model is right-sized to the tier. Combined with INV-4's spread this is self-optimizing: easy tasks fall to weak/cheap providers first, reserving strong providers' headroom for the tasks that need them. The per-task difficulty tier is assigned upstream (the plan/board, per `delegation-principle.md`); switchyard's contract is to RESPECT it, not to invent it.

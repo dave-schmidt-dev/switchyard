@@ -5,6 +5,4 @@ invariants:
   INV-3: {gate_test_status: missing}
   INV-4: {gate_test_status: missing}
   INV-5: {gate_test_status: missing}
-  INV-6: {gate_test_status: missing}
-  INV-7: {gate_test_status: missing}
 resolutions: {}                          # INV-x: {resolved_at_date: "YYYY-MM-DD", note: "..."}
