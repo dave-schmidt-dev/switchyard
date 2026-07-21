@@ -26,24 +26,73 @@ export function buildAuthContainerScript(secretName) {
 	return `mkdir -p /root/.gemini && printf '%s' "$${secretName}" > /root/.gemini/gemini-credentials.json && chmod 600 /root/.gemini/gemini-credentials.json`;
 }
 
+// authenticateAgy persists the credential here (see buildAuthContainerScript
+// above — it writes /root/.gemini/gemini-credentials.json directly; the CLI
+// still uses the pre-rename `.gemini` namespace), so like codex/cursor this is
+// the durable, adapter-controlled path.
+const AGY_CREDENTIALS_PATH = "/root/.gemini/gemini-credentials.json";
+
+// A real credentials JSON is hundreds of bytes; this floor rejects an empty
+// file (the exact bug that shipped once — a printf writing nothing) and
+// trivial JSON stubs (`{}`, `null`, `""`). It deliberately does NOT attempt
+// server-side validity — a well-formed but revoked/garbage token still
+// passes — because that needs a network round-trip the container can't make
+// reliably. Scope: presence + substance, not liveness against the API.
+const MIN_CREDENTIAL_BYTES = 16;
+
 /**
- * Check if Agy is installed/responding in the container. Like the
- * claude/codex equivalents, this is a liveness check (the binary runs), not
- * a real authentication check — agy's `--version` output has no vendor
- * keyword to match against.
+ * Check that the persisted credential file exists inside the container and is
+ * non-trivial (not empty, not a placeholder stub). INV-1: the credential
+ * VALUE never crosses to the host and never appears in argv — only the
+ * constant file path and byte threshold do, and `wc -c` reports a byte
+ * count, not content. The host reads only the check's exit code.
+ * @param {string} containerName
  * @returns {boolean}
  */
-export function isAgyAuthenticated() {
+function hasNonTrivialCredential(containerName) {
 	try {
-		const result = execFileSync(
+		execFileSync(
 			"docker",
-			["exec", AGENT_CONTAINER_NAME, AGY_CMD, "--version"],
+			[
+				"exec",
+				containerName,
+				"sh",
+				"-c",
+				`[ -f ${AGY_CREDENTIALS_PATH} ] && [ "$(wc -c < ${AGY_CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return typeof result === "string" && result.trim().length > 0;
+		return true;
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Check if Agy is authenticated in the container. `agy --version` has no
+ * vendor keyword to match, so liveness here is just "binary runs, non-empty
+ * output"; the real signal is the credential check that supplements it — the
+ * persisted gemini-credentials.json must exist and be non-trivial. Liveness
+ * alone treated an installed-but-unauthenticated CLI as authenticated, so
+ * ensureProvidersAuthenticated() skipped its headless login and the first
+ * real dispatch failed instead of `npm run auth` catching it (TASKS.md Task 15).
+ * @param {string} [containerName] Container to check (defaults to the standing agent container).
+ * @returns {boolean}
+ */
+export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+	try {
+		const result = execFileSync(
+			"docker",
+			["exec", containerName, AGY_CMD, "--version"],
+			{ encoding: "utf8", stdio: "pipe" },
+		);
+		if (!(typeof result === "string" && result.trim().length > 0)) {
+			return false;
+		}
+	} catch {
+		return false;
+	}
+	return hasNonTrivialCredential(containerName);
 }
 
 /**

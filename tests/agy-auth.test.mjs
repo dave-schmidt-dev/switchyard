@@ -9,6 +9,7 @@ import {
 	buildAuthContainerScript,
 	captureDiff,
 	executeAgy,
+	isAgyAuthenticated,
 } from "../src/switchyard/adapter/agy.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -186,6 +187,77 @@ describe("agy auth container script (real container)", () => {
 				{ encoding: "utf8" },
 			);
 			strictEqual(content.trim(), secretValue);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+});
+
+describe("isAgyAuthenticated credential-validity check (real container)", () => {
+	it("returns false when the credential is withheld/corrupt even though the binary responds", {
+		skip: !dockerAvailable,
+	}, () => {
+		// TASKS.md Task 15 "done when": with the CLI installed and answering
+		// `--version` (liveness passes — agy has no vendor keyword, so any
+		// non-empty output counts), a withheld or trivial credentials file must
+		// make isAgyAuthenticated() return false. Agy persists
+		// /root/.gemini/gemini-credentials.json directly (the CLI still uses the
+		// pre-rename `.gemini` namespace), so that is the checked path.
+		const containerName = `switchyard-agy-authcheck-${Date.now()}`;
+		const credPath = "/root/.gemini/gemini-credentials.json";
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			// Stub that satisfies the `--version` liveness check (non-empty
+			// output) but is not actually authenticated.
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho agy 1.0.0\n" > /usr/local/bin/agy && chmod +x /usr/local/bin/agy'`,
+				{ stdio: "pipe" },
+			);
+
+			// Credential withheld entirely.
+			strictEqual(
+				isAgyAuthenticated(containerName),
+				false,
+				"withheld credential must not read as authenticated",
+			);
+
+			// Credential present but empty (the empty-file bug shape).
+			execSync(
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.gemini && : > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isAgyAuthenticated(containerName),
+				false,
+				"empty credential file must not read as authenticated",
+			);
+
+			// Credential present but a trivial JSON stub.
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isAgyAuthenticated(containerName),
+				false,
+				"trivial {} stub must not read as authenticated",
+			);
+
+			// Positive control: a non-trivial credential reads as authenticated
+			// (pre-fix liveness-only logic returned true for all four states).
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "{\\"refresh_token\\":\\"fake-gemini-token-1234567890\\"}" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isAgyAuthenticated(containerName),
+				true,
+				"a non-trivial persisted credential must read as authenticated",
+			);
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 		}

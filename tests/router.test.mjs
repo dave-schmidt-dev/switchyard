@@ -243,4 +243,80 @@ describe("router", () => {
 			"Should fall back to first non-excluded",
 		);
 	});
+
+	it("does not blow the call stack on an oversized windows array (Task 10)", () => {
+		// A malformed/runaway usage-snapshot writer could emit tens of thousands
+		// of windows for one provider. The old `Math.min(...windows.map(...))` and
+		// `Math.min(...paces)` spreads threw `RangeError: Maximum call stack size
+		// exceeded`; the reduce-based min degrades gracefully instead. Each window
+		// carries a finite pace_delta so the paces reduce (line ~184) is exercised
+		// too, not just the percent_left reduce (line ~169).
+		const bigWindows = Array.from({ length: 200000 }, () => ({
+			percent_left: 50,
+			pace_delta: 100,
+		}));
+		createTestSnapshot([{ name: "claude", ok: true, windows: bigWindows }]);
+
+		const result = route();
+		strictEqual(
+			result.provider,
+			"claude",
+			"oversized windows must route, not crash the router",
+		);
+		strictEqual(result.percentLeft, 50, "min headroom computed via reduce");
+	});
+
+	it("breaks percent_left ties with the scorer, not roster order (Task 11)", () => {
+		// claude is FIRST in snapshot/roster iteration order, so the old
+		// array-order tie-break (winner seeded with scored[0]) always picked
+		// claude on a headroom tie. codex has the higher pace_delta, so the
+		// documented scorer (0.9*normPace + 0.1*jitter) must pick codex instead —
+		// proving computeScore, not iteration order, decides the tie.
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 1 }],
+			},
+			{
+				name: "codex",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 999 }],
+			},
+		]);
+
+		const result = route({ seed: 42 });
+		strictEqual(result.percentLeft, 50, "tie is at the top headroom");
+		strictEqual(
+			result.provider,
+			"codex",
+			"scorer (higher pace) must break the tie, not roster order (claude first)",
+		);
+	});
+
+	it("excludes a non-finite percent_left window rather than treating it as eligible (Task 13)", () => {
+		// A snapshot CAN carry a non-finite percent_left: JSON.parse("1e999") is
+		// Infinity (NaN can't survive a JSON round-trip, so it's unreachable here;
+		// Number.isFinite guards both). typeof Infinity === "number" passed the
+		// old filter, and `Infinity < floor` is false, so the provider evaded the
+		// exhausted-skip and won with unbounded headroom — an INV-4 bypass. It must
+		// now be excluded, leaving codex the only valid provider. Written as raw
+		// JSON because JSON.stringify(Infinity) === "null".
+		mkdirSync(SNAPSHOT_DIR, { recursive: true });
+		writeFileSync(
+			SNAPSHOT_PATH,
+			'{"schema_version":2,"providers":[' +
+				'{"name":"claude","ok":true,"windows":[{"percent_left":1e999,"pace_delta":100}]},' +
+				'{"name":"codex","ok":true,"windows":[{"percent_left":50,"pace_delta":200}]}' +
+				"]}",
+			"utf8",
+		);
+
+		const result = route();
+		strictEqual(
+			result.provider,
+			"codex",
+			"claude's non-finite window must be excluded, leaving codex the winner",
+		);
+	});
 });

@@ -30,7 +30,6 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter. |
 | `src/switchyard/roster/classifier.mjs` | Keyword-based task-tier classifier (high/standard/low). |
 | `src/switchyard/container/index.mjs` | Agent container lifecycle (Docker start/stop/exec). Not yet called by the runner (`TASKS.md` Task 9). |
-| `src/switchyard/sandbox/index.mjs` | Working container creation/wipe — **unused, unfinished** (bind-mounts a host temp dir; file-copy step is a stub). Superseded by `lifecycle/index.mjs`; see `TASKS.md` Task 8. |
 | `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker-managed volumes — **unused**, not yet wired into the runner. See `TASKS.md` Task 8. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, `allowSensitiveManifests`-gated review for build/CI manifests, `git apply` via stdin. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |

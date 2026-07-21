@@ -15,7 +15,7 @@ import {
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
 } from "../roster/index.mjs";
-import { resolveSeed } from "./scorer.mjs";
+import { computeScore, resolveSeed } from "./scorer.mjs";
 
 // Snapshot path - host-side, code constant (WR-1: routing is host-side)
 const SNAPSHOT_PATH = join(
@@ -92,7 +92,10 @@ export function route(options = {}) {
 		tier,
 		availableProviders,
 	} = options;
-	resolveSeed({ seed, runId }); // seed is used even if not stored
+	// Resolve the routing seed up front; it feeds the scorer's deterministic
+	// tie-break below (Task 11: equal-headroom candidates are decided by
+	// computeScore, not by roster iteration order).
+	const { seed: routeSeed } = resolveSeed({ seed, runId });
 	const log = [];
 
 	// Default tier is high for conservative routing (unknown tier => high-capability only)
@@ -156,8 +159,13 @@ export function route(options = {}) {
 			continue;
 		}
 
+		// Task 13: require finite percent_left, matching the pace filter below.
+		// typeof NaN === "number", so a NaN'd window would otherwise pass here,
+		// propagate through minPercentLeft, and (NaN < floor === false) evade the
+		// exhausted-skip — an INV-4 bypass.
 		const windows = (provider.windows ?? []).filter(
-			(w) => typeof w?.percent_left === "number",
+			(w) =>
+				typeof w?.percent_left === "number" && Number.isFinite(w.percent_left),
 		);
 
 		if (windows.length === 0) {
@@ -165,8 +173,13 @@ export function route(options = {}) {
 			continue;
 		}
 
-		// Health = MIN across valid windows (worst window vetoes)
-		const minPercentLeft = Math.min(...windows.map((w) => w.percent_left));
+		// Health = MIN across valid windows (worst window vetoes).
+		// Task 10: reduce instead of Math.min(...spread) — an oversized windows
+		// array (tens of thousands of entries) would blow the call stack.
+		const minPercentLeft = windows.reduce(
+			(min, w) => Math.min(min, w.percent_left),
+			Infinity,
+		);
 
 		if (minPercentLeft < floor) {
 			log.push(
@@ -181,7 +194,12 @@ export function route(options = {}) {
 			.map((w) => w.pace_delta)
 			.filter((p) => typeof p === "number" && Number.isFinite(p));
 
-		const pace = paces.length > 0 ? Math.min(...paces) : 0;
+		// Task 10: reduce instead of Math.min(...spread); keep the empty guard so
+		// a provider with no finite paces still scores 0 (not Infinity).
+		const pace =
+			paces.length > 0
+				? paces.reduce((min, p) => Math.min(min, p), Infinity)
+				: 0;
 
 		scored.push({
 			name,
@@ -216,6 +234,30 @@ export function route(options = {}) {
 		if (s.percentLeft > winner.percentLeft) {
 			winner = s;
 		}
+	}
+
+	// Task 11: tie-break with the documented scorer, not roster iteration order.
+	// Multiple providers can share the top percent_left; before this the winner
+	// was simply scored[0] (array order). Decide equal-headroom candidates with
+	// computeScore (0.9·normPace + 0.1·jitter) seeded by the resolved routeSeed,
+	// so the tie-break is deterministic and actually spreads (INV-4).
+	const topPercentLeft = winner.percentLeft;
+	const tied = scored.filter((s) => s.percentLeft === topPercentLeft);
+	if (tied.length > 1) {
+		const allPaces = tied.map((s) => s.pace);
+		let bestScore = Number.NEGATIVE_INFINITY;
+		for (const s of tied) {
+			const model = getRightSizedModel(s.name, effectiveTier);
+			const key = `${s.name}:${model ?? effectiveTier}`;
+			const { score } = computeScore(s.pace, routeSeed, key, allPaces);
+			if (score > bestScore) {
+				bestScore = score;
+				winner = s;
+			}
+		}
+		log.push(
+			`tie at ${topPercentLeft}% among ${tied.map((s) => s.name).join(", ")} — scorer picked ${winner.name}`,
+		);
 	}
 
 	// CR-2 regression

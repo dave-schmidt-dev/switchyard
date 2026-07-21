@@ -82,6 +82,108 @@ describe("runner queue parsing", () => {
 			["1.2"],
 		);
 	});
+
+	it("warns and excludes a task with an unrecognized status instead of silently dropping it", () => {
+		// Regression (Task 12): the old filter matched exactly
+		// `pending`/`in progress`, so a typo'd status was excluded with no
+		// signal, indistinguishable from a deliberate skip. The task must now
+		// still be excluded, but the exclusion must be *visible*. The
+		// discriminating assertion is that console.error fires — the old code
+		// also excluded it, so "excluded" alone would pass on the unfixed code.
+		const tasks = [
+			{ id: "1.1", status: "pending" },
+			{ id: "1.2", status: "pnding" }, // typo
+		];
+		const warnings = [];
+		const originalError = console.error;
+		console.error = (...args) => {
+			warnings.push(args.join(" "));
+		};
+		let runnable;
+		try {
+			runnable = getRunnableTasks(tasks, { completedTaskIds: [] });
+		} finally {
+			console.error = originalError;
+		}
+
+		deepStrictEqual(
+			runnable.map((task) => task.id),
+			["1.1"],
+		);
+		strictEqual(warnings.length, 1);
+		ok(warnings[0].includes("1.2"));
+		ok(warnings[0].includes("pnding"));
+	});
+
+	it("excludes recognized non-runnable statuses (done, blocked) without any warning", () => {
+		// `done` and `blocked` are documented project vocabulary — an
+		// intentional skip, not a mistake — so they must be excluded silently.
+		// Warning on them (e.g. on every completed task) would be pure noise.
+		const tasks = [
+			{ id: "1.1", status: "pending" },
+			{ id: "1.2", status: "done" },
+			{ id: "1.3", status: "blocked" },
+		];
+		const warnings = [];
+		const originalError = console.error;
+		console.error = (...args) => {
+			warnings.push(args.join(" "));
+		};
+		let runnable;
+		try {
+			runnable = getRunnableTasks(tasks, { completedTaskIds: [] });
+		} finally {
+			console.error = originalError;
+		}
+
+		deepStrictEqual(
+			runnable.map((task) => task.id),
+			["1.1"],
+		);
+		strictEqual(warnings.length, 0);
+	});
+
+	it("normalizes case and surrounding whitespace before matching status", () => {
+		// A differently-cased or padded status is a recognized status, not an
+		// unrecognized one — it must run, not warn.
+		const tasks = [
+			{ id: "1.1", status: "  Pending  " },
+			{ id: "1.2", status: "IN PROGRESS" },
+		];
+		const warnings = [];
+		const originalError = console.error;
+		console.error = (...args) => {
+			warnings.push(args.join(" "));
+		};
+		let runnable;
+		try {
+			runnable = getRunnableTasks(tasks, { completedTaskIds: [] });
+		} finally {
+			console.error = originalError;
+		}
+
+		deepStrictEqual(
+			runnable.map((task) => task.id),
+			["1.1", "1.2"],
+		);
+		strictEqual(warnings.length, 0);
+	});
+
+	it("throws on duplicate task IDs within one parse instead of yielding both", () => {
+		// Regression (Task 12): a malformed queue with two blocks sharing an id
+		// previously returned both — `done.has(id)` only checks the checkpoint's
+		// completed set, not IDs already yielded in this same pass — so both
+		// would execute in one run. Fail loudly, matching loadCheckpoint's
+		// posture on malformed input.
+		const tasks = [
+			{ id: "1.1", status: "pending" },
+			{ id: "1.1", status: "pending" },
+		];
+		throws(
+			() => getRunnableTasks(tasks, { completedTaskIds: [] }),
+			/duplicate task id "1\.1"/,
+		);
+	});
 });
 
 describe("runner orchestration", () => {

@@ -9,6 +9,7 @@ import {
 	buildAuthContainerScript,
 	captureDiff,
 	executeCursor,
+	isCursorAuthenticated,
 } from "../src/switchyard/adapter/cursor.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -215,6 +216,78 @@ describe("cursor auth container script (real container)", () => {
 				{ encoding: "utf8" },
 			);
 			strictEqual(perms.trim(), "755");
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+});
+
+describe("isCursorAuthenticated credential-validity check (real container)", () => {
+	it("returns false when the credential is withheld/corrupt even though the binary responds", {
+		skip: !dockerAvailable,
+	}, () => {
+		// TASKS.md Task 15 "done when": with the CLI installed and answering
+		// `--version` (liveness passes — cursor-agent has no vendor keyword, so
+		// any non-empty output counts, and `cursor-agent status` is not a usable
+		// signal), a withheld or trivial API-key file must make
+		// isCursorAuthenticated() return false. The persisted credential is the
+		// CURSOR_API_KEY file at /root/.cursor-agent-env/api_key (the secret
+		// itself, not the generated wrapper launcher).
+		const containerName = `switchyard-cursor-authcheck-${Date.now()}`;
+		const credPath = "/root/.cursor-agent-env/api_key";
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			// Stub that satisfies the `--version` liveness check (non-empty
+			// output) but is not actually authenticated.
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho cursor-agent 1.0.0\n" > /usr/local/bin/cursor-agent && chmod +x /usr/local/bin/cursor-agent'`,
+				{ stdio: "pipe" },
+			);
+
+			// Credential withheld entirely.
+			strictEqual(
+				isCursorAuthenticated(containerName),
+				false,
+				"withheld credential must not read as authenticated",
+			);
+
+			// Credential present but empty (the empty-file bug shape).
+			execSync(
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.cursor-agent-env && : > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isCursorAuthenticated(containerName),
+				false,
+				"empty API-key file must not read as authenticated",
+			);
+
+			// Credential present but a trivial stub value.
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "x" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isCursorAuthenticated(containerName),
+				false,
+				"trivial stub key must not read as authenticated",
+			);
+
+			// Positive control: a non-trivial API key reads as authenticated
+			// (pre-fix liveness-only logic returned true for all four states).
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "key_fake_cursor_api_value_1234567890" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isCursorAuthenticated(containerName),
+				true,
+				"a non-trivial persisted API key must read as authenticated",
+			);
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 		}

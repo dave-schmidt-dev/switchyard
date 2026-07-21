@@ -9,6 +9,7 @@ import {
 	buildAuthContainerScript,
 	captureDiff,
 	executeClaude,
+	isClaudeAuthenticated,
 } from "../src/switchyard/adapter/claude.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -268,6 +269,79 @@ describe("claude auth container script (real container)", () => {
 				credsFileExists,
 				false,
 				"temp credentials file must be cleaned up even when login fails",
+			);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+});
+
+describe("isClaudeAuthenticated credential-validity check (real container)", () => {
+	it("returns false when the credential is withheld/corrupt even though the binary responds", {
+		skip: !dockerAvailable,
+	}, () => {
+		// TASKS.md Task 15 "done when": with the CLI installed and answering
+		// `--version` (liveness passes), a withheld or trivial credential must
+		// make isClaudeAuthenticated() return false — the exact false-positive
+		// the old liveness-only check produced. Claude's operative credential
+		// is Claude Code's own store (/root/.claude/.credentials.json), NOT the
+		// /tmp/claude_creds.json that authenticateClaude writes then deletes.
+		const containerName = `switchyard-claude-authcheck-${Date.now()}`;
+		const credPath = "/root/.claude/.credentials.json";
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			// Stub that satisfies the `--version` liveness check (output
+			// contains "Claude") but is not actually authenticated.
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho Claude Code stub\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
+				{ stdio: "pipe" },
+			);
+
+			// Credential withheld entirely.
+			strictEqual(
+				isClaudeAuthenticated(containerName),
+				false,
+				"withheld credential must not read as authenticated",
+			);
+
+			// Credential present but empty (the empty-file bug shape).
+			execSync(
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.claude && : > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isClaudeAuthenticated(containerName),
+				false,
+				"empty credential file must not read as authenticated",
+			);
+
+			// Credential present but a trivial JSON stub.
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isClaudeAuthenticated(containerName),
+				false,
+				"trivial {} stub must not read as authenticated",
+			);
+
+			// Positive control: a non-trivial credential reads as authenticated,
+			// proving the check isn't vacuously false and the negative cases
+			// above are meaningfully distinguished (pre-fix liveness-only logic
+			// returned true for all four states).
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+			strictEqual(
+				isClaudeAuthenticated(containerName),
+				true,
+				"a non-trivial persisted credential must read as authenticated",
 			);
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });

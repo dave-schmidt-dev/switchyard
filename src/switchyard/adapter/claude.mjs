@@ -34,21 +34,79 @@ export function buildAuthContainerScript(secretName) {
 	return `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; login_status=$?; rm -f /tmp/claude_creds.json; exit $login_status`;
 }
 
+// Claude diverges from the other three adapters: authenticateClaude writes
+// /tmp/claude_creds.json only as an *input* to `claude login`, then deletes
+// it in the same script — so it is NOT the durable credential. `claude login`
+// persists the operative credential to Claude Code's own store, which on
+// Linux (the container runs as root) is /root/.claude/.credentials.json —
+// mode 0600, holding the OAuth access/refresh tokens + expiry. Verified
+// against Claude Code's own authentication docs, not assumed. (Unverifiable
+// end-to-end until the agent image exists — TASKS.md Task 14 — but a wrong
+// path only causes a needless, idempotent re-auth, never a false "authed".)
+const CLAUDE_CREDENTIALS_PATH = "/root/.claude/.credentials.json";
+
+// A real OAuth/token credential is hundreds of bytes; this floor rejects an
+// empty file (the exact bug that shipped once — a printf writing nothing)
+// and trivial JSON stubs (`{}`, `null`, `""`). It deliberately does NOT
+// attempt server-side validity — a well-formed but revoked/garbage token
+// still passes — because that needs a network round-trip the container
+// can't make reliably (the same reason `cursor-agent status` was rejected
+// as an auth signal; see cursor.mjs). Scope: presence + substance, not
+// liveness of the token against the provider's API.
+const MIN_CREDENTIAL_BYTES = 16;
+
 /**
- * Check if Claude is authenticated in the container.
+ * Check that the persisted credential file exists inside the container and is
+ * non-trivial (not empty, not a placeholder stub). INV-1: the credential
+ * VALUE never crosses to the host and never appears in argv — only the
+ * constant file path and byte threshold do, and `wc -c` reports a byte
+ * count, not content. The host reads only the check's exit code.
+ * @param {string} containerName
  * @returns {boolean}
  */
-export function isClaudeAuthenticated() {
+function hasNonTrivialCredential(containerName) {
 	try {
-		const result = execFileSync(
+		execFileSync(
 			"docker",
-			["exec", AGENT_CONTAINER_NAME, CLAUDE_CMD, "--version"],
+			[
+				"exec",
+				containerName,
+				"sh",
+				"-c",
+				`[ -f ${CLAUDE_CREDENTIALS_PATH} ] && [ "$(wc -c < ${CLAUDE_CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return result.includes("Claude");
+		return true;
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Check if Claude is authenticated in the container. Supplements the binary
+ * liveness check (`--version` responds) with a real credential check: the
+ * persisted credential must exist and be non-trivial. Liveness alone treated
+ * an installed-but-unauthenticated CLI as authenticated, so
+ * ensureProvidersAuthenticated() skipped its headless login and the first
+ * real dispatch failed instead of `npm run auth` catching it (TASKS.md Task 15).
+ * @param {string} [containerName] Container to check (defaults to the standing agent container).
+ * @returns {boolean}
+ */
+export function isClaudeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+	try {
+		const result = execFileSync(
+			"docker",
+			["exec", containerName, CLAUDE_CMD, "--version"],
+			{ encoding: "utf8", stdio: "pipe" },
+		);
+		if (!result.includes("Claude")) {
+			return false;
+		}
+	} catch {
+		return false;
+	}
+	return hasNonTrivialCredential(containerName);
 }
 
 /**

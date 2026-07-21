@@ -31,6 +31,21 @@ const TERMINAL_JOB_STATES = new Set([
 	"missing",
 ]);
 
+// Statuses whose tasks are eligible to run, and the full vocabulary of
+// statuses the project documents (see TASKS.md status key:
+// `pending | in progress | done | blocked`). A recognized-but-not-runnable
+// status (`done`, `blocked`) is an *intentional* skip and excluded silently;
+// any status outside this vocabulary is treated as a typo/mistake and excluded
+// with a visible warning rather than vanishing indistinguishably from a
+// deliberate skip.
+const RUNNABLE_TASK_STATUSES = new Set(["pending", "in progress"]);
+const KNOWN_TASK_STATUSES = new Set([
+	"pending",
+	"in progress",
+	"done",
+	"blocked",
+]);
+
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -288,16 +303,60 @@ export function loadCheckpoint(checkpointPath, tasksFilePath) {
 
 /**
  * Filter queue to tasks that still need execution.
+ *
+ * Robustness beyond a plain status match (see Task 12):
+ * - Status is normalized (trimmed + lowercased) before comparison, so a
+ *   differently-cased or whitespace-padded value isn't silently dropped.
+ * - A status outside the documented vocabulary produces a visible warning and
+ *   is excluded, instead of vanishing indistinguishably from a deliberate skip.
+ * - Duplicate task IDs within a single parse are malformed input and throw
+ *   loudly (matching `loadCheckpoint`'s fail-loud posture) rather than being
+ *   yielded twice and executed twice in the same pass — `done` only tracks the
+ *   checkpoint's completed set, not IDs already yielded earlier in this pass.
+ *
  * @param {Array<{id: string, status: string}>} tasks
  * @param {object} checkpoint
+ * @throws {Error} if two tasks share the same id (malformed queue)
  */
 export function getRunnableTasks(tasks, checkpoint) {
 	const done = new Set(checkpoint.completedTaskIds);
-	return tasks.filter((task) => {
-		const queueStatusEligible =
-			task.status === "pending" || task.status === "in progress";
-		return queueStatusEligible && !done.has(task.id);
-	});
+	const seenIds = new Set();
+	const runnable = [];
+
+	for (const task of tasks) {
+		if (seenIds.has(task.id)) {
+			throw new Error(
+				`tasks queue contains a duplicate task id "${task.id}"; refusing to ` +
+					`run the same id twice in one pass — fix the malformed tasks file`,
+			);
+		}
+		seenIds.add(task.id);
+
+		const status = String(task.status ?? "")
+			.trim()
+			.toLowerCase();
+
+		if (!KNOWN_TASK_STATUSES.has(status)) {
+			console.error(
+				`getRunnableTasks: task "${task.id}" has unrecognized status ` +
+					`"${task.status}" (known: ${[...KNOWN_TASK_STATUSES].join(", ")}); ` +
+					`excluding it from the run`,
+			);
+			continue;
+		}
+
+		if (!RUNNABLE_TASK_STATUSES.has(status)) {
+			continue; // recognized but intentionally not runnable (done, blocked)
+		}
+
+		if (done.has(task.id)) {
+			continue; // already completed per checkpoint
+		}
+
+		runnable.push(task);
+	}
+
+	return runnable;
 }
 
 function selectAdapter(providerName, adapters) {
