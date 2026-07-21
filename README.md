@@ -79,7 +79,10 @@ The host-side runner parses markdown task queues and dispatches tasks serially t
 ```javascript
 import { runQueue, runQueueWithOrchestrator } from './src/switchyard/runner/index.mjs';
 
-// Standard queue runner with local checkpoint/resume (synchronous)
+// Standard queue runner with local checkpoint/resume (synchronous).
+// Without `dependencies`, this uses the real router + live Docker adapters —
+// the working container must already exist and have an agent CLI inside it.
+// In tests, inject `dependencies` to stub route, adapters, and integrationGate.
 const summary = runQueue({
   tasksFilePath: '/path/to/tasks.md',
   projectPath: '/path/to/project',
@@ -87,7 +90,9 @@ const summary = runQueue({
   checkpointPath: '.switchyard-checkpoint.json', // optional
 });
 
-// Headless orchestrator mode — requires SWITCHYARD_ORCHESTRATOR_CMD (async)
+// Headless orchestrator mode — async; requires SWITCHYARD_ORCHESTRATOR_CMD to
+// be set, or throws immediately. Pass `dependencies.orchestrator` in tests.
+// export SWITCHYARD_ORCHESTRATOR_CMD=/path/to/orchestrator
 const orchSummary = await runQueueWithOrchestrator({
   tasksFilePath: '/path/to/tasks.md',
   projectPath: '/path/to/project',
