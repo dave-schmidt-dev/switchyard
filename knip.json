@@ -1,5 +1,5 @@
 {
 	"entry": ["tests/**/*.test.mjs", "src/switchyard/runner/index.mjs"],
 	"project": ["src/**/*.mjs"],
-	"ignoreBinaries": ["zsh", "orb"]
+	"ignoreBinaries": ["orb"]
 }

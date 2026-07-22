@@ -1,25 +1,14 @@
 import { ok, strictEqual } from "node:assert";
-import { execFileSync, execSync } from "node:child_process";
-import {
-	chmodSync,
-	existsSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { execSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-	authenticateCursor,
-	buildAuthContainerScript,
 	captureDiff,
 	executeCursor,
 	isCursorAuthenticated,
 } from "../src/switchyard/adapter/cursor.mjs";
-
-const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 function hasDocker() {
 	try {
@@ -31,44 +20,6 @@ function hasDocker() {
 }
 
 const dockerAvailable = hasDocker();
-
-describe("cursor auth isolation", () => {
-	it("does not copy a host OAuth session/config into the container", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/cursor.mjs");
-		const source = readFileSync(adapterPath, "utf8");
-
-		strictEqual(
-			source.includes("docker cp"),
-			false,
-			"host cred/session copy is forbidden",
-		);
-		strictEqual(
-			source.includes("cli-config.json"),
-			false,
-			"must not replicate the interactive OAuth session file — CURSOR_API_KEY is the sanctioned headless mechanism",
-		);
-		ok(
-			source.includes("bws-run"),
-			"BWS-based auth injection should be present",
-		);
-	});
-
-	it("never fetches the secret host-side or embeds it in argv", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/cursor.mjs");
-		const source = readFileSync(adapterPath, "utf8");
-
-		strictEqual(
-			/bws-get/.test(source),
-			false,
-			"bws-get prints secrets to stdout host-side — must not be used by adapter code",
-		);
-		strictEqual(
-			/-e CURSOR_API_KEY=/.test(source),
-			false,
-			"secret must not be assigned inline on the docker exec command line (visible via ps)",
-		);
-	});
-});
 
 describe("cursor adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -135,236 +86,124 @@ describe("cursor adapter shell injection guard", () => {
 	});
 });
 
-describe("authenticateCursor() secretName injection guard", () => {
-	it("rejects a malformed secretName before it ever reaches a shell", () => {
-		// authenticateCursor interpolates secretName directly into a
-		// `zsh -c "... docker exec -e ${secretName} ..."` string, so a
-		// malformed value must be rejected by validateEnvName before
-		// execFileSync is ever called — not just after.
-		const markerDir = mkdtempSync(
-			join(tmpdir(), "switchyard-authname-injection-"),
+describe("isCursorAuthenticated credential-validity check (real container)", () => {
+	// TASKS.md Task 24: unlike claude/codex/agy, `cursor-agent status`'s exit
+	// code does NOT distinguish logged-in from logged-out (confirmed live:
+	// exit 0 either way), so the check reads `cursor-agent status --format
+	// json`'s structured `isAuthenticated` boolean instead (live-verified
+	// against a real completed OAuth session: `{"status":"authenticated",
+	// "isAuthenticated":true,...}`). The stub is base64-encoded (this
+	// project's established pattern for payloads that must cross a
+	// `docker exec ... sh -c '...'` boundary, per the cursor wrapper
+	// quote-nesting bug found earlier — see HISTORY.md) so the JSON's own
+	// quotes never have to be hand-balanced across shell layers.
+	function installStatusStub(containerName, statusJson) {
+		const script = [
+			"#!/bin/sh",
+			'if [ "$1" = --version ]; then echo cursor-agent 1.0.0; exit 0; fi',
+			`if [ "$1" = status ]; then echo '${statusJson}'; exit 0; fi`,
+		].join("\n");
+		const encoded = Buffer.from(script, "utf8").toString("base64");
+		execSync(
+			`docker exec ${containerName} sh -c 'echo ${encoded} | base64 -d > /usr/local/bin/cursor-agent && chmod +x /usr/local/bin/cursor-agent'`,
+			{ stdio: "pipe" },
 		);
-		const markerPath = join(markerDir, "marker");
-		const evilSecretName = `BAD; touch ${markerPath}; echo x`;
-
-		try {
-			const result = authenticateCursor(evilSecretName);
-			strictEqual(result, false, "malformed secretName must be rejected");
-			strictEqual(
-				existsSync(markerPath),
-				false,
-				"a malformed secretName must never reach a shell invocation",
-			);
-		} finally {
-			rmSync(markerDir, { recursive: true, force: true });
-		}
-	});
-
-	it("rejects secretName values that aren't UPPERCASE_SNAKE_CASE", () => {
-		strictEqual(authenticateCursor("lowercase_name"), false);
-		strictEqual(authenticateCursor(""), false);
-		strictEqual(authenticateCursor(null), false);
-	});
-});
-
-describe("authenticateCursor() ground truth (fake shell/docker — touches no real container)", () => {
-	// Installs fake `zsh` and `docker` executables at the front of PATH so
-	// authenticateCursor() never reaches a real shell, real BWS, or a real
-	// container — both calls it makes (`execFileSync("zsh", ...)` and
-	// hasNonTrivialCredential's `execFileSync("docker", ...)`) resolve
-	// through PATH with no `env` override on either call, so this genuinely
-	// intercepts the exact binaries the production code spawns rather than
-	// mocking at the JS layer (named ESM imports from node:child_process
-	// don't observe mock.method() reassignment on the shared module object —
-	// verified empirically before choosing this approach). Fake zsh always
-	// exits 0, standing in for the exact failure mode a61aafc fixed: `bws
-	// run` has been observed to report success for a wrapped `docker exec
-	// ...` command even when the script demonstrably failed inside the
-	// container. Fake docker's exit code is the caller's to control,
-	// standing in for hasNonTrivialCredential's own credential-presence
-	// check succeeding or failing. AGENT_CONTAINER_NAME is never touched —
-	// there is no real container at all in this scenario.
-	function withFakeAuthShell(dockerExitCode, fn) {
-		const fakeBinDir = mkdtempSync(join(tmpdir(), "switchyard-fake-auth-bin-"));
-		writeFileSync(join(fakeBinDir, "zsh"), "#!/bin/sh\nexit 0\n");
-		writeFileSync(
-			join(fakeBinDir, "docker"),
-			`#!/bin/sh\nexit ${dockerExitCode}\n`,
-		);
-		chmodSync(join(fakeBinDir, "zsh"), 0o755);
-		chmodSync(join(fakeBinDir, "docker"), 0o755);
-
-		const originalPath = process.env.PATH;
-		process.env.PATH = `${fakeBinDir}:${originalPath}`;
-		try {
-			return fn();
-		} finally {
-			process.env.PATH = originalPath;
-			rmSync(fakeBinDir, { recursive: true, force: true });
-		}
 	}
 
-	it("returns false when the wrapped command reports success but no credential is actually persisted (regression: a61aafc, previously trusted the wrapper's exit code)", () => {
-		// Pre-fix authenticateCursor() did `execFileSync(...); return true;`
-		// inside the try block — trusting the wrapped command's exit code
-		// directly. Faking zsh to always exit 0 reproduces that "reported
-		// success" shape; faking docker to exit non-zero makes
-		// hasNonTrivialCredential's own credential-presence check fail,
-		// standing in for "no credential was actually persisted". Against
-		// the pre-fix code this returns true; against the fix it must return
-		// false because the real return value now comes from
-		// hasNonTrivialCredential() unconditionally, never from the wrapped
-		// command's own exit code.
-		const result = withFakeAuthShell(1, () =>
-			authenticateCursor("CURSOR_API_KEY_FAKE_TEST"),
-		);
-		strictEqual(
-			result,
-			false,
-			"authenticateCursor() must not trust the wrapped command's exit code alone",
-		);
-	});
-
-	it("returns true when the wrapped command succeeds and the credential check also passes (positive control)", () => {
-		// Proves the negative case above isn't vacuous: with the identical
-		// fake-zsh-always-succeeds setup, a passing credential check still
-		// yields true, so the false result above is specifically caused by
-		// the credential check failing, not by some general breakage of the
-		// fake-shell harness.
-		const result = withFakeAuthShell(0, () =>
-			authenticateCursor("CURSOR_API_KEY_FAKE_TEST"),
-		);
-		strictEqual(result, true);
-	});
-});
-
-describe("cursor auth container script (real container)", () => {
-	it("persists the forwarded API key and writes a working wrapper binary", {
+	it("returns false when `status --format json` reports isAuthenticated:false, even though the binary responds", {
 		skip: !dockerAvailable,
 	}, () => {
-		// This is the test that caught a real bug during development: the
-		// wrapper script's own body contains shell-special characters
-		// ($, ", (), @) that broke the *outer* shell's quoting when
-		// naively embedded, causing the outer zsh to command-substitute
-		// $(cat ...) against the HOST filesystem instead of writing it
-		// literally into the container. Fixed by base64-encoding the
-		// wrapper payload so no shell-special byte ever crosses a shell
-		// boundary. This test exercises the real script end-to-end.
-		const containerName = `switchyard-cursor-authscript-${Date.now()}`;
-		const secretName = "CURSOR_API_KEY_TEST";
-		const secretValue = "sk-fake-cursor-key-abc123";
+		const containerName = `switchyard-cursor-authcheck-${Date.now()}`;
 
 		execSync(
 			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
 			{ stdio: "pipe" },
 		);
 		try {
-			const containerScript = buildAuthContainerScript(secretName);
-			execFileSync(
-				"zsh",
-				[
-					"-i",
-					"-c",
-					`docker exec -e ${secretName} ${containerName} sh -c '${containerScript}'`,
-				],
-				{
-					stdio: "pipe",
-					env: { ...process.env, [secretName]: secretValue },
-				},
+			installStatusStub(containerName, '{"isAuthenticated":false}');
+			strictEqual(
+				isCursorAuthenticated(containerName),
+				false,
+				"isAuthenticated:false must not read as authenticated",
 			);
-
-			const apiKey = execSync(
-				`docker exec ${containerName} cat /root/.cursor-agent-env/api_key`,
-				{ encoding: "utf8" },
-			);
-			strictEqual(apiKey.trim(), secretValue);
-
-			const wrapper = execSync(
-				`docker exec ${containerName} cat /usr/local/bin/cursor-agent-authed`,
-				{ encoding: "utf8" },
-			);
-			ok(wrapper.startsWith("#!/bin/sh"), "wrapper must be a valid script");
-			ok(
-				wrapper.includes('export CURSOR_API_KEY="$(cat'),
-				"wrapper must export CURSOR_API_KEY from the persisted file",
-			);
-
-			const perms = execSync(
-				`docker exec ${containerName} stat -c "%a" /usr/local/bin/cursor-agent-authed`,
-				{ encoding: "utf8" },
-			);
-			strictEqual(perms.trim(), "755");
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
 		}
 	});
-});
 
-describe("isCursorAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the credential is withheld/corrupt even though the binary responds", {
+	it("returns false when the binary doesn't respond to --version at all", {
 		skip: !dockerAvailable,
 	}, () => {
-		// TASKS.md Task 15 "done when": with the CLI installed and answering
-		// `--version` (liveness passes — cursor-agent has no vendor keyword, so
-		// any non-empty output counts, and `cursor-agent status` is not a usable
-		// signal), a withheld or trivial API-key file must make
-		// isCursorAuthenticated() return false. The persisted credential is the
-		// CURSOR_API_KEY file at /root/.cursor-agent-env/api_key (the secret
-		// itself, not the generated wrapper launcher).
-		const containerName = `switchyard-cursor-authcheck-${Date.now()}`;
-		const credPath = "/root/.cursor-agent-env/api_key";
+		const containerName = `switchyard-cursor-authcheck-noliveness-${Date.now()}`;
 
 		execSync(
 			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
 			{ stdio: "pipe" },
 		);
 		try {
-			// Stub that satisfies the `--version` liveness check (non-empty
-			// output) but is not actually authenticated.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho cursor-agent 1.0.0\n" > /usr/local/bin/cursor-agent && chmod +x /usr/local/bin/cursor-agent'`,
-				{ stdio: "pipe" },
-			);
-
-			// Credential withheld entirely.
 			strictEqual(
 				isCursorAuthenticated(containerName),
 				false,
-				"withheld credential must not read as authenticated",
+				"a missing binary must not read as authenticated",
 			);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
 
-			// Credential present but empty (the empty-file bug shape).
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.cursor-agent-env && : > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCursorAuthenticated(containerName),
-				false,
-				"empty API-key file must not read as authenticated",
-			);
+	it("returns false when status output is empty, malformed, or missing the field (fails CLOSED, not open)", {
+		skip: !dockerAvailable,
+	}, () => {
+		// The class of bug caught in review: an earlier text-matching version
+		// of this check (`!/not logged in/i.test(statusResult)`) defaulted to
+		// "authenticated" for any of these shapes. The JSON-boolean check must
+		// default to false instead.
+		const containerName = `switchyard-cursor-authcheck-malformed-${Date.now()}`;
 
-			// Credential present but a trivial stub value.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "x" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCursorAuthenticated(containerName),
-				false,
-				"trivial stub key must not read as authenticated",
-			);
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			for (const badJson of [
+				"",
+				"{}",
+				"not json at all",
+				'{"status":"error"}',
+			]) {
+				installStatusStub(containerName, badJson);
+				strictEqual(
+					isCursorAuthenticated(containerName),
+					false,
+					`status output ${JSON.stringify(badJson)} must not read as authenticated`,
+				);
+			}
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
 
-			// Positive control: a non-trivial API key reads as authenticated
-			// (pre-fix liveness-only logic returned true for all four states).
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "key_fake_cursor_api_value_1234567890" > ${credPath}'`,
-				{ stdio: "pipe" },
+	it("returns true when `status --format json` reports isAuthenticated:true (positive control)", {
+		skip: !dockerAvailable,
+	}, () => {
+		// Proves the negative cases above aren't vacuous, and matches the real
+		// shape live-verified against a completed OAuth session:
+		// {"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,...}
+		const containerName = `switchyard-cursor-authcheck-positive-${Date.now()}`;
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			installStatusStub(
+				containerName,
+				'{"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,"hasRefreshToken":true}',
 			);
 			strictEqual(
 				isCursorAuthenticated(containerName),
 				true,
-				"a non-trivial persisted API key must read as authenticated",
+				"isAuthenticated:true should read as authenticated",
 			);
 		} finally {
 			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });

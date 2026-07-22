@@ -2,50 +2,30 @@
 // Executes agy CLI inside the container (never host-spawn)
 // CR-4: Adapters exec inside container, never host-spawn
 // PW-4: Independent in-container login
+//
+// Agy has no explicit login subcommand: running it unauthenticated
+// auto-triggers a real Google OAuth flow (prints a URL to visit, then waits
+// for a pasted authorization code) — run once by a human directly against
+// the standing agent container, see `src/switchyard/auth/index.mjs`.
+// TASKS.md Task 24: this replaces an earlier BWS-credential-injection design.
 
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
-import {
-	validateEnvName,
-	validateIdentifier,
-	validateModelArg,
-} from "./shell-safety.mjs";
+import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const AGY_CMD = "agy";
 
-/**
- * Build the in-container script that persists the Gemini/Antigravity
- * credentials JSON forwarded via `docker exec -e ${secretName}` into the
- * path `agy` reads (`~/.gemini/gemini-credentials.json` — confirmed against
- * a real local installation; the CLI still uses the `.gemini` directory
- * namespace internally despite the `agy` rename).
- *
- * The string returned here is NOT that script verbatim — it's that script
- * base64-encoded and wrapped as `echo <b64> | base64 -d | sh` (same
- * technique cursor.mjs's CURSOR_WRAPPER_SCRIPT uses, applied to the whole
- * script rather than one sub-payload). authenticateAgy() embeds the return
- * value via single quotes into a `zsh -c "... docker exec ... sh -c '...'"`
- * nesting; the base64 alphabet ([A-Za-z0-9+/=]) contains no shell
- * metacharacters, so the only characters that ever cross that boundary
- * cannot break out of the single-quoted region regardless of what the real
- * script above contains. A future edit introducing a bare single quote,
- * `$(...)`, or other special character into the real script text can no
- * longer reintroduce the quote-escaping bug that already shipped once (see
- * tests/agy-auth.test.mjs's boundary-crossing regression test).
- * @param {string} secretName
- * @returns {string}
- */
-export function buildAuthContainerScript(secretName) {
-	const realScript = `mkdir -p /root/.gemini && printf '%s' "$${secretName}" > /root/.gemini/gemini-credentials.json && chmod 600 /root/.gemini/gemini-credentials.json`;
-	const scriptB64 = Buffer.from(realScript, "utf8").toString("base64");
-	return `echo ${scriptB64} | base64 -d | sh`;
-}
-
-// authenticateAgy persists the credential here (see buildAuthContainerScript
-// above — it writes /root/.gemini/gemini-credentials.json directly; the CLI
-// still uses the pre-rename `.gemini` namespace), so like codex/cursor this is
-// the durable, adapter-controlled path.
-const AGY_CREDENTIALS_PATH = "/root/.gemini/gemini-credentials.json";
+// A completed OAuth login persists the token to
+// `~/.gemini/antigravity-cli/antigravity-oauth-token` — live-verified 2026-07-21
+// against the real standing agent container immediately after a real
+// `agy --print "hi"` login completed (a fresh 498-byte, mode-0600 file
+// appeared at exactly that path/timestamp). The earlier assumed path,
+// `~/.gemini/gemini-credentials.json`, does not exist under a real login —
+// it was carried over from an older local-install check and was never
+// re-verified against this container image; `isAgyAuthenticated()` reported
+// a real, working login as unauthenticated until this was caught.
+const AGY_CREDENTIALS_PATH =
+	"/root/.gemini/antigravity-cli/antigravity-oauth-token";
 
 // A real credentials JSON is hundreds of bytes; this floor rejects an empty
 // file (the exact bug that shipped once — a printf writing nothing) and
@@ -87,10 +67,10 @@ function hasNonTrivialCredential(containerName) {
  * Check if Agy is authenticated in the container. `agy --version` has no
  * vendor keyword to match, so liveness here is just "binary runs, non-empty
  * output"; the real signal is the credential check that supplements it — the
- * persisted gemini-credentials.json must exist and be non-trivial. Liveness
- * alone treated an installed-but-unauthenticated CLI as authenticated, so
- * ensureProvidersAuthenticated() skipped its headless login and the first
- * real dispatch failed instead of `npm run auth` catching it (TASKS.md Task 15).
+ * persisted OAuth token (`AGY_CREDENTIALS_PATH`) must exist and be non-trivial.
+ * Liveness alone treated an installed-but-unauthenticated CLI as authenticated,
+ * so `npm run auth` would have skipped a provider that still needed a real
+ * interactive login (TASKS.md Task 15).
  * @param {string} [containerName] Container to check (defaults to the standing agent container).
  * @returns {boolean}
  */
@@ -108,52 +88,6 @@ export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 		return false;
 	}
 	return hasNonTrivialCredential(containerName);
-}
-
-/**
- * Authenticate Agy in the container.
- * PW-4: Independent in-container login via BWS-provided credentials payload.
- *
- * The secret is never fetched host-side and never appears in any process's
- * argv (visible via `ps`/`/proc`): `bws-run` injects `secretName` as an env
- * var into the `docker exec` process it launches, and `docker exec -e NAME`
- * (bare, no `=value`) forwards that host env var into the container by
- * reference. Requires `secretName` to be the exact BWS secret key
- * (project convention: UPPERCASE_SNAKE_CASE matching the env var).
- * @param {string} [secretName] BWS secret name for the Gemini credentials JSON.
- * @returns {boolean}
- */
-export function authenticateAgy(secretName = "GEMINI_CREDENTIALS") {
-	try {
-		validateEnvName(secretName, "secretName");
-	} catch (error) {
-		console.error("Failed to authenticate Agy:", error.message);
-		return false;
-	}
-
-	const containerScript = buildAuthContainerScript(secretName);
-
-	// Don't trust this call's exit code alone: `bws run` has been observed to
-	// report success (exit 0) for a wrapped `docker exec ... sh -c '<script>'`
-	// even when the script demonstrably failed inside the container (it
-	// re-serializes trailing argv through a shell, which can mangle a
-	// multi-word `sh -c` argument). The credential-presence check below is
-	// the ground truth this function's return value is actually built on.
-	try {
-		execFileSync(
-			"zsh",
-			[
-				"-i",
-				"-c",
-				`bws-run -- docker exec -e ${secretName} ${AGENT_CONTAINER_NAME} sh -c '${containerScript}'`,
-			],
-			{ stdio: "inherit" },
-		);
-	} catch (error) {
-		console.error("Failed to authenticate Agy:", error.message);
-	}
-
-	return hasNonTrivialCredential(AGENT_CONTAINER_NAME);
 }
 
 /**

@@ -1,9 +1,11 @@
 # Standing agent container image (AGENT_IMAGE, built by buildAgentImage() in
 # src/switchyard/container/index.mjs). Holds the four provider CLIs only —
 # NO project code and NO credentials baked in at build time. Auth happens at
-# runtime via each adapter's authenticateX(), which injects BWS-sourced
-# secrets through `docker exec -e` into the *running* container — never a
-# build-time ARG/ENV.
+# runtime via a real interactive OAuth login run once by a human directly
+# against the *running* container (`npm run auth`, see
+# src/switchyard/auth/index.mjs) — never a build-time ARG/ENV, and never a
+# BWS-injected secret (TASKS.md Task 24 replaced the earlier
+# BWS-credential-injection design with this).
 #
 # INV-1 (INVARIANTS.md): this image is the standing agent container's base —
 # no host filesystem mounts, no host credentials, no project code.
@@ -106,8 +108,8 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
 
 # --- Cursor Agent CLI -----------------------------------------------------
 # Official installer creates both `agent` and `cursor-agent` symlinks under
-# ~/.local/bin. Invoked by cursor.mjs as `cursor-agent` (wrapped at runtime
-# by the adapter's own `cursor-agent-authed` script).
+# ~/.local/bin. Invoked by cursor.mjs directly as `cursor-agent` (no wrapper
+# binary — see TASKS.md Task 24).
 # Verified against cursor.com/docs/cli/installation (2026-07-21).
 #
 # Accepted risk (neither a nor b): fetched the installer itself

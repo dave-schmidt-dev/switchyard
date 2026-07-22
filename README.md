@@ -33,25 +33,25 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker-managed volumes — **unused**, not yet wired into the runner. See `TASKS.md` Task 8. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, `allowSensitiveManifests`-gated review for build/CI manifests, `git apply` via stdin. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
-| `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateEnvName`, `validateModelArg`) used by all four provider adapters. |
-| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, BWS-based auth injection (persisted credentials JSON). |
-| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch via `codex exec` (prompt over stdin), diff capture, BWS-based auth injection (persisted `auth.json`). |
-| `src/switchyard/adapter/agy.mjs` | Antigravity (Agy) CLI adapter: dispatch (prompt via `--print` flag, not stdin — the CLI can't read it for this purpose), diff capture, BWS-based auth injection (persisted `gemini-credentials.json`). |
-| `src/switchyard/adapter/cursor.mjs` | Cursor Agent adapter: dispatch via a generated `cursor-agent-authed` wrapper (prompt as a positional argument — the CLI can't read stdin), diff capture. Auth is `CURSOR_API_KEY` (Cursor's own documented headless/CI mechanism), not the interactive OAuth session — see module comment for why. |
-| `src/switchyard/auth/index.mjs` | Checks every provider's auth status and runs its headless login for any not yet authenticated. Run directly via `npm run auth`. |
+| `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateModelArg`) used by all four provider adapters. |
+| `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, real credential check (`/root/.claude/.credentials.json`, persisted by `claude auth login`). |
+| `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch via `codex exec` (prompt over stdin), diff capture, real credential check (`/root/.codex/auth.json`, persisted by `codex login --device-auth`). |
+| `src/switchyard/adapter/agy.mjs` | Antigravity (Agy) CLI adapter: dispatch (prompt via `--print` flag, not stdin — the CLI can't read it for this purpose), diff capture, real credential check (`/root/.gemini/antigravity-cli/antigravity-oauth-token`, persisted by agy's auto-triggered Google OAuth flow). |
+| `src/switchyard/adapter/cursor.mjs` | Cursor Agent adapter: dispatch invokes `cursor-agent` directly, diff capture, real credential check via `cursor-agent status` text (persisted by `cursor-agent login`). |
+| `src/switchyard/auth/index.mjs` | Walks a human through authenticating every provider that isn't already authenticated, by running each one's real interactive OAuth login inside the standing agent container. Run directly via `npm run auth`. |
 | `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). Wires all four adapters; `route()` is restricted to whichever adapters are actually present. |
 | **Tests** | |
 | `tests/capability-match.test.mjs` | INV-5 gate: capability filter, tier ordering, model right-sizing. |
 | `tests/classifier.test.mjs` | Keyword-based task tier classifier unit tests. |
 | `tests/claude-adapter.test.mjs` | Container-backed Claude CLI dispatch and diff capture tests. |
-| `tests/claude-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression, real-container auth-persistence check. |
+| `tests/claude-auth.test.mjs` | Shell-injection guard, prompt-injection regression, real-container credential-validity check. |
 | `tests/codex-adapter.test.mjs` | Container-backed Codex CLI dispatch and diff capture tests. |
-| `tests/codex-auth.test.mjs` | INV-1 regression: no host cred copy, no secret-in-argv, shell-injection guard, prompt-injection regression, real-container auth-persistence check, `codex exec` subcommand-shape check. |
+| `tests/codex-auth.test.mjs` | Shell-injection guard, prompt-injection regression, real-container credential-validity check, `codex exec` subcommand-shape check. |
 | `tests/agy-adapter.test.mjs` | Container-backed Agy CLI dispatch and diff capture tests. |
 | `tests/agy-auth.test.mjs` | Same regression shape as codex-auth, adapted for agy's `--print`-flag prompt delivery and display-name model strings. |
-| `tests/cursor-adapter.test.mjs` | Container-backed Cursor Agent dispatch (via the `cursor-agent-authed` wrapper) and diff capture tests. |
-| `tests/cursor-auth.test.mjs` | Same regression shape, plus a real-container check of the generated auth wrapper script's content/permissions. |
-| `tests/auth-check.test.mjs` | `ensureProvidersAuthenticated` unit tests via injected fake providers (no real Docker/BWS needed). |
+| `tests/cursor-adapter.test.mjs` | Container-backed Cursor Agent dispatch and diff capture tests. |
+| `tests/cursor-auth.test.mjs` | Same regression shape, plus real-container checks of `isCursorAuthenticated()`'s `cursor-agent status --format json` `isAuthenticated`-boolean signal (positive, negative, missing-binary, and malformed/empty-output fail-closed cases). |
+| `tests/auth-check.test.mjs` | `ensureProvidersAuthenticated` unit tests via injected fake providers (no real Docker needed), including regressions for a provider's `runLogin()`/`isAuthenticated()` throwing without aborting the rest of the walkthrough. |
 | `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
 | `tests/ledger.test.mjs` | INV-4 dispatch ledger recording and querying unit tests. |
 | `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation (generic Docker behavior — see `TASKS.md` Task 8). |
@@ -84,13 +84,24 @@ npm run lint
 
 ### Provider Authentication
 
-Check every provider's auth status and run its headless login for any not yet authenticated:
+There is no headless auto-login: every provider's real login step requires a human to complete a browser or device-code OAuth consent. `npm run auth` checks each provider's real credential state and, for any that aren't authenticated, opens its real interactive login inside the standing agent container so you can complete it live:
 
 ```bash
 npm run auth
 ```
 
-Each provider's `authenticate*()` fetches its credential from BWS and persists it inside the standing agent container — see each adapter's module comment for the exact secret name/shape (`CLAUDE_CREDENTIALS`, `CODEX_AUTH_JSON`, `GEMINI_CREDENTIALS`, `CURSOR_API_KEY`). Exits non-zero if any provider fails.
+For each unauthenticated provider it runs (attached to your terminal, so follow the prompts — visit a URL, paste a code, approve in a browser):
+
+| Provider | Real login command |
+|---|---|
+| claude | `claude auth login` (subscription auth, not `--console`/API billing) |
+| codex | `codex login --device-auth` (device-code flow, no local browser needed) |
+| agy | no explicit subcommand — running it unauthenticated auto-triggers a Google OAuth flow |
+| cursor | `NO_OPEN_BROWSER=1 cursor-agent login` |
+
+A completed login persists to the provider CLI's own credential store inside the standing agent container (which is never wiped, unlike working containers — INV-3), so this is a one-time step per provider, not per task. Exits non-zero if any provider is still unauthenticated when it finishes.
+
+This one-time-per-provider guarantee currently only covers the standing agent container itself — working containers (where real dispatches actually run) don't yet share the agent container's provider binaries or credentials (see Task 14 in `TASKS.md`), so a real end-to-end dispatch isn't possible until that's resolved.
 
 ### Queue Dispatching and Orchestration
 

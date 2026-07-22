@@ -3,183 +3,61 @@
 // CR-4: Adapters exec inside container, never host-spawn
 // PW-4: Independent in-container login
 //
-// Cursor's primary auth is a browser-based OAuth login (`cursor-agent
-// login`), but that session isn't reproducible headlessly inside a
-// container. Cursor's own docs (cursor.com/docs/cli/headless) document a
-// separate, vendor-sanctioned mechanism for exactly this case: a
-// CURSOR_API_KEY (Dashboard -> API Keys), read via env var or --api-key.
-// That's what this adapter injects — never the interactive OAuth session.
+// Auth is a real interactive OAuth login (`cursor-agent login`, or
+// `NO_OPEN_BROWSER=1 cursor-agent login` inside a headless container) run
+// once by a human directly against the standing agent container — see
+// `src/switchyard/auth/index.mjs`. TASKS.md Task 24: this replaces an
+// earlier CURSOR_API_KEY/BWS-credential-injection design; a real OAuth
+// session persists to cursor-agent's own local credential store, not a
+// project-invented file, so there is no headless auto-login here.
 
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
-import {
-	validateEnvName,
-	validateIdentifier,
-	validateModelArg,
-} from "./shell-safety.mjs";
+import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CURSOR_CMD = "cursor-agent";
-const CURSOR_AUTHED_CMD = "cursor-agent-authed";
-
-// The wrapper script's own body contains shell-special characters ($, ",
-// (), @) that would otherwise have to survive three nested shell layers
-// (the host zsh, the `docker exec ... sh -c '...'` it launches, and the
-// resulting file being written by a printf inside that). Getting that
-// nesting right by hand-balancing quotes failed in testing — the "$(...)"
-// inside the wrapper body fell outside the intended single-quoted region
-// and got command-substituted by the *host* shell instead of written
-// literally. Base64-encoding the payload sidesteps the whole hazard: the
-// only characters that ever cross a shell boundary are [A-Za-z0-9+/=],
-// none of which are shell-special at any nesting level.
-const CURSOR_WRAPPER_SCRIPT = [
-	"#!/bin/sh",
-	'export CURSOR_API_KEY="$(cat /root/.cursor-agent-env/api_key)"',
-	'exec cursor-agent "$@"',
-	"",
-].join("\n");
 
 /**
- * Build the in-container script that persists the CURSOR_API_KEY forwarded
- * via `docker exec -e ${secretName}` and generates a small wrapper binary
- * that exports it before invoking the real CLI. A wrapper is needed (rather
- * than exporting the var directly in executeCursor's own docker exec) because
- * a running container's environment can't be amended after `docker run` —
- * unlike claude/codex, cursor-agent has no on-disk credentials file to
- * write directly, so the wrapper is what gives later dispatches access to
- * the persisted secret without re-touching BWS on every task.
- * @param {string} secretName
- * @returns {string}
- */
-export function buildAuthContainerScript(secretName) {
-	const wrapperB64 = Buffer.from(CURSOR_WRAPPER_SCRIPT, "utf8").toString(
-		"base64",
-	);
-	return (
-		"mkdir -p /root/.cursor-agent-env && " +
-		`printf '%s' "$${secretName}" > /root/.cursor-agent-env/api_key && ` +
-		"chmod 600 /root/.cursor-agent-env/api_key && " +
-		`printf '%s' '${wrapperB64}' | base64 -d > /usr/local/bin/${CURSOR_AUTHED_CMD} && ` +
-		`chmod 755 /usr/local/bin/${CURSOR_AUTHED_CMD}`
-	);
-}
-
-// The persisted credential IS the CURSOR_API_KEY file authenticateCursor
-// writes (see buildAuthContainerScript above). The generated
-// `cursor-agent-authed` wrapper is only a launcher that exports this key — the
-// key file is the secret, so that is what the credential check targets.
-// Unlike claude/codex/agy this is a raw key string, not JSON — the presence/
-// non-triviality check applies identically.
-const CURSOR_CREDENTIALS_PATH = "/root/.cursor-agent-env/api_key";
-
-// A real CURSOR_API_KEY is a long token; this floor rejects an empty file
-// (the exact bug class that shipped once elsewhere — a printf writing
-// nothing) and trivial stubs. It deliberately does NOT attempt server-side
-// validity — a well-formed but revoked/garbage key still passes — because
-// that needs a network round-trip the container can't make reliably (and
-// `cursor-agent status` is explicitly not a usable signal here; see above).
-// Scope: presence + substance, not liveness against the API.
-const MIN_CREDENTIAL_BYTES = 16;
-
-/**
- * Check that the persisted credential file exists inside the container and is
- * non-trivial (not empty, not a placeholder stub). INV-1: the credential
- * VALUE never crosses to the host and never appears in argv — only the
- * constant file path and byte threshold do, and `wc -c` reports a byte
- * count, not content. The host reads only the check's exit code.
- * @param {string} containerName
- * @returns {boolean}
- */
-function hasNonTrivialCredential(containerName) {
-	try {
-		execFileSync(
-			"docker",
-			[
-				"exec",
-				containerName,
-				"sh",
-				"-c",
-				`[ -f ${CURSOR_CREDENTIALS_PATH} ] && [ "$(wc -c < ${CURSOR_CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
-			],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Check if Cursor Agent is authenticated in the container. `cursor-agent
- * --version` is only a binary liveness signal (and `cursor-agent status`
- * reflects OAuth session state, not CURSOR_API_KEY validity — confirmed, so
- * it is unusable here); the real signal is the credential check that
- * supplements it — the persisted API-key file must exist and be non-trivial.
- * Liveness alone treated an installed-but-unauthenticated CLI as
- * authenticated, so ensureProvidersAuthenticated() skipped its headless login
- * and the first real dispatch failed instead of `npm run auth` catching it
- * (TASKS.md Task 15).
+ * Check if Cursor Agent is authenticated in the container: `--version`
+ * liveness, supplemented by `cursor-agent status --format json`'s structured
+ * `isAuthenticated` boolean (confirmed live against a real completed OAuth
+ * session — status's exit code does NOT distinguish logged-in from
+ * logged-out, so a structured field is required rather than the exit code).
+ * Deliberately fails CLOSED: any exec failure, timeout, or unparseable/
+ * unexpected JSON returns false, matching the other three adapters'
+ * fail-closed posture (an earlier text-matching version of this check
+ * inverted that — defaulting to "authenticated" unless the literal string
+ * "not logged in" appeared — which read an empty, reworded, or error status
+ * output as authenticated; caught in review before shipping).
  * @param {string} [containerName] Container to check (defaults to the standing agent container).
  * @returns {boolean}
  */
 export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 	try {
-		const result = execFileSync(
+		const versionResult = execFileSync(
 			"docker",
 			["exec", containerName, CURSOR_CMD, "--version"],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		if (!(typeof result === "string" && result.trim().length > 0)) {
+		if (
+			!(typeof versionResult === "string" && versionResult.trim().length > 0)
+		) {
 			return false;
 		}
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(containerName);
-}
 
-/**
- * Authenticate Cursor Agent in the container via CURSOR_API_KEY.
- *
- * The secret is never fetched host-side and never appears in any process's
- * argv (visible via `ps`/`/proc`): `bws-run` injects `secretName` as an env
- * var into the `docker exec` process it launches, and `docker exec -e NAME`
- * (bare, no `=value`) forwards that host env var into the container by
- * reference. Requires `secretName` to be the exact BWS secret key
- * (project convention: UPPERCASE_SNAKE_CASE matching the env var).
- * @param {string} [secretName] BWS secret name for the Cursor API key.
- * @returns {boolean}
- */
-export function authenticateCursor(secretName = "CURSOR_API_KEY") {
 	try {
-		validateEnvName(secretName, "secretName");
-	} catch (error) {
-		console.error("Failed to authenticate Cursor:", error.message);
+		const statusResult = execFileSync(
+			"docker",
+			["exec", containerName, CURSOR_CMD, "status", "--format", "json"],
+			{ encoding: "utf8", stdio: "pipe", timeout: 10000 },
+		);
+		return JSON.parse(statusResult).isAuthenticated === true;
+	} catch {
 		return false;
 	}
-
-	const containerScript = buildAuthContainerScript(secretName);
-
-	// Don't trust this call's exit code alone: `bws run` has been observed to
-	// report success (exit 0) for a wrapped `docker exec ... sh -c '<script>'`
-	// even when the script demonstrably failed inside the container (it
-	// re-serializes trailing argv through a shell, which can mangle a
-	// multi-word `sh -c` argument). The credential-presence check below is
-	// the ground truth this function's return value is actually built on.
-	try {
-		execFileSync(
-			"zsh",
-			[
-				"-i",
-				"-c",
-				`bws-run -- docker exec -e ${secretName} ${AGENT_CONTAINER_NAME} sh -c '${containerScript}'`,
-			],
-			{ stdio: "inherit" },
-		);
-	} catch (error) {
-		console.error("Failed to authenticate Cursor:", error.message);
-	}
-
-	return hasNonTrivialCredential(AGENT_CONTAINER_NAME);
 }
 
 /**
@@ -209,7 +87,7 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 		"-w",
 		"/project",
 		workingContainerName,
-		CURSOR_AUTHED_CMD,
+		CURSOR_CMD,
 		"--print",
 		"--force",
 		"--trust",

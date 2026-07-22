@@ -1,26 +1,14 @@
 import { ok, strictEqual } from "node:assert";
-import { execFileSync, execSync } from "node:child_process";
-import {
-	chmodSync,
-	existsSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { execSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-	authenticateCodex,
-	buildAuthContainerScript,
 	captureDiff,
 	executeCodex,
 	isCodexAuthenticated,
 } from "../src/switchyard/adapter/codex.mjs";
-
-// Resolve path from project root regardless of cwd — guards Finding H.
-const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 function hasDocker() {
 	try {
@@ -32,39 +20,6 @@ function hasDocker() {
 }
 
 const dockerAvailable = hasDocker();
-
-describe("codex auth isolation", () => {
-	it("does not copy host auth file into container", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/codex.mjs");
-		const source = readFileSync(adapterPath, "utf8");
-
-		strictEqual(
-			source.includes("docker cp ~/.codex/auth.json"),
-			false,
-			"host auth copy is forbidden",
-		);
-		ok(
-			source.includes("bws-run"),
-			"BWS-based auth injection should be present",
-		);
-	});
-
-	it("never fetches the secret host-side or embeds it in argv", () => {
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/codex.mjs");
-		const source = readFileSync(adapterPath, "utf8");
-
-		strictEqual(
-			/bws-get/.test(source),
-			false,
-			"bws-get prints secrets to stdout host-side — must not be used by adapter code",
-		);
-		strictEqual(
-			/-e CODEX_AUTH_JSON=/.test(source),
-			false,
-			"secret must not be assigned inline on the docker exec command line (visible via ps)",
-		);
-	});
-});
 
 describe("codex adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -139,154 +94,6 @@ describe("codex adapter shell injection guard", () => {
 	});
 });
 
-describe("authenticateCodex() secretName injection guard", () => {
-	it("rejects a malformed secretName before it ever reaches a shell", () => {
-		// authenticateCodex interpolates secretName directly into a
-		// `zsh -c "... docker exec -e ${secretName} ..."` string, so a
-		// malformed value must be rejected by validateEnvName before
-		// execFileSync is ever called — not just after.
-		const markerDir = mkdtempSync(
-			join(tmpdir(), "switchyard-authname-injection-"),
-		);
-		const markerPath = join(markerDir, "marker");
-		const evilSecretName = `BAD; touch ${markerPath}; echo x`;
-
-		try {
-			const result = authenticateCodex(evilSecretName);
-			strictEqual(result, false, "malformed secretName must be rejected");
-			strictEqual(
-				existsSync(markerPath),
-				false,
-				"a malformed secretName must never reach a shell invocation",
-			);
-		} finally {
-			rmSync(markerDir, { recursive: true, force: true });
-		}
-	});
-
-	it("rejects secretName values that aren't UPPERCASE_SNAKE_CASE", () => {
-		strictEqual(authenticateCodex("lowercase_name"), false);
-		strictEqual(authenticateCodex(""), false);
-		strictEqual(authenticateCodex(null), false);
-	});
-});
-
-describe("authenticateCodex() ground truth (fake shell/docker — touches no real container)", () => {
-	// Installs fake `zsh` and `docker` executables at the front of PATH so
-	// authenticateCodex() never reaches a real shell, real BWS, or a real
-	// container — both calls it makes (`execFileSync("zsh", ...)` and
-	// hasNonTrivialCredential's `execFileSync("docker", ...)`) resolve
-	// through PATH with no `env` override on either call, so this genuinely
-	// intercepts the exact binaries the production code spawns rather than
-	// mocking at the JS layer (named ESM imports from node:child_process
-	// don't observe mock.method() reassignment on the shared module object —
-	// verified empirically before choosing this approach). Fake zsh always
-	// exits 0, standing in for the exact failure mode a61aafc fixed: `bws
-	// run` has been observed to report success for a wrapped `docker exec
-	// ...` command even when the script demonstrably failed inside the
-	// container. Fake docker's exit code is the caller's to control,
-	// standing in for hasNonTrivialCredential's own credential-presence
-	// check succeeding or failing. AGENT_CONTAINER_NAME is never touched —
-	// there is no real container at all in this scenario.
-	function withFakeAuthShell(dockerExitCode, fn) {
-		const fakeBinDir = mkdtempSync(join(tmpdir(), "switchyard-fake-auth-bin-"));
-		writeFileSync(join(fakeBinDir, "zsh"), "#!/bin/sh\nexit 0\n");
-		writeFileSync(
-			join(fakeBinDir, "docker"),
-			`#!/bin/sh\nexit ${dockerExitCode}\n`,
-		);
-		chmodSync(join(fakeBinDir, "zsh"), 0o755);
-		chmodSync(join(fakeBinDir, "docker"), 0o755);
-
-		const originalPath = process.env.PATH;
-		process.env.PATH = `${fakeBinDir}:${originalPath}`;
-		try {
-			return fn();
-		} finally {
-			process.env.PATH = originalPath;
-			rmSync(fakeBinDir, { recursive: true, force: true });
-		}
-	}
-
-	it("returns false when the wrapped command reports success but no credential is actually persisted (regression: a61aafc, previously trusted the wrapper's exit code)", () => {
-		// Pre-fix authenticateCodex() did `execFileSync(...); return true;`
-		// inside the try block — trusting the wrapped command's exit code
-		// directly. Faking zsh to always exit 0 reproduces that "reported
-		// success" shape; faking docker to exit non-zero makes
-		// hasNonTrivialCredential's own credential-presence check fail,
-		// standing in for "no credential was actually persisted". Against
-		// the pre-fix code this returns true; against the fix it must return
-		// false because the real return value now comes from
-		// hasNonTrivialCredential() unconditionally, never from the wrapped
-		// command's own exit code.
-		const result = withFakeAuthShell(1, () =>
-			authenticateCodex("CODEX_AUTH_JSON_FAKE_TEST"),
-		);
-		strictEqual(
-			result,
-			false,
-			"authenticateCodex() must not trust the wrapped command's exit code alone",
-		);
-	});
-
-	it("returns true when the wrapped command succeeds and the credential check also passes (positive control)", () => {
-		// Proves the negative case above isn't vacuous: with the identical
-		// fake-zsh-always-succeeds setup, a passing credential check still
-		// yields true, so the false result above is specifically caused by
-		// the credential check failing, not by some general breakage of the
-		// fake-shell harness.
-		const result = withFakeAuthShell(0, () =>
-			authenticateCodex("CODEX_AUTH_JSON_FAKE_TEST"),
-		);
-		strictEqual(result, true);
-	});
-});
-
-describe("codex auth container script (real container)", () => {
-	it("persists the forwarded secret's actual content into the auth file, not an empty file", {
-		skip: !dockerAvailable,
-	}, () => {
-		// Regression: an earlier version's container script did `cat >
-		// /root/.codex/auth.json` — reading from stdin — while the secret
-		// arrives as a forwarded env var (`docker exec -e NAME`, no stdin
-		// involved). That version exited 0 while writing an EMPTY file,
-		// silently discarding the credential. This runs the exact script
-		// buildAuthContainerScript produces against a real container and
-		// checks the file's actual bytes, not just the exit code.
-		const containerName = `switchyard-codex-authscript-${Date.now()}`;
-		const secretName = "CODEX_AUTH_JSON_TEST";
-		const secretValue = '{"fake":"codex-cred-value"}';
-
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
-		);
-		try {
-			const containerScript = buildAuthContainerScript(secretName);
-			execFileSync(
-				"zsh",
-				[
-					"-i",
-					"-c",
-					`docker exec -e ${secretName} ${containerName} sh -c '${containerScript}'`,
-				],
-				{
-					stdio: "pipe",
-					env: { ...process.env, [secretName]: secretValue },
-				},
-			);
-
-			const content = execSync(
-				`docker exec ${containerName} cat /root/.codex/auth.json`,
-				{ encoding: "utf8" },
-			);
-			strictEqual(content.trim(), secretValue);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
-	});
-});
-
 describe("codex adapter invocation shape (real container)", () => {
 	it("invokes the `codex exec` subcommand, not the bare interactive binary", {
 		skip: !dockerAvailable,
@@ -324,99 +131,6 @@ describe("codex adapter invocation shape (real container)", () => {
 	});
 });
 
-describe("buildAuthContainerScript base64 boundary-crossing (real container)", () => {
-	it("delivers a script with a bare single quote and a live $(...) to the container untouched", {
-		skip: !dockerAvailable,
-	}, () => {
-		// Proves the actual bug class this mechanism eliminates. Pre-fix,
-		// buildAuthContainerScript's raw return value was interpolated directly
-		// into `sh -c '${containerScript}'` inside the outer `zsh -c "..."`
-		// invocation — so a future edit introducing a bare single quote or a
-		// `$(...)` into the real script text would have broken out of that
-		// single-quoted region (or been evaluated too early). Now
-		// buildAuthContainerScript base64-encodes the whole real script and
-		// returns only `echo <b64> | base64 -d | sh` — the base64 alphabet has
-		// no shell metacharacters, so nothing but that fixed, quote-free
-		// wrapper ever crosses the boundary. This replicates that exact
-		// wrapping formula against a deliberately hazardous payload to prove
-		// it survives, rather than merely asserting it.
-		const containerName = `switchyard-codex-boundary-${Date.now()}`;
-		const hazardousRealScript = `printf '%s' "it's a $(echo substituted) value" > /tmp/boundary-result`;
-		const scriptB64 = Buffer.from(hazardousRealScript, "utf8").toString(
-			"base64",
-		);
-		const wrapped = `echo ${scriptB64} | base64 -d | sh`;
-
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
-		);
-		try {
-			execFileSync(
-				"zsh",
-				["-i", "-c", `docker exec ${containerName} sh -c '${wrapped}'`],
-				{ stdio: "pipe" },
-			);
-
-			const result = execSync(
-				`docker exec ${containerName} cat /tmp/boundary-result`,
-				{ encoding: "utf8" },
-			);
-			strictEqual(
-				result,
-				"it's a substituted value",
-				"the hazardous script must run exactly as normal shell semantics dictate, with nothing corrupted by the boundary crossing",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
-	});
-
-	it("never lets an embedded single quote escape onto the host shell", () => {
-		// Same hazard, from the other direction: a bare `'` positioned exactly
-		// where it would have prematurely closed the old naive
-		// `sh -c '${containerScript}'` embedding, leaking the fragment after it
-		// to whatever shell parses that level — the host's own zsh. Wrapping
-		// the payload as base64 before it ever reaches a shell means this
-		// string is never interpolated raw into any shell command at all, so
-		// the host-side marker must never appear regardless of container
-		// state (this container is never even created).
-		const markerDir = mkdtempSync(
-			join(tmpdir(), "switchyard-codex-boundary-quote-"),
-		);
-		const markerPath = join(markerDir, "marker");
-		const hazardousRealScript = `echo start'; touch ${markerPath}; echo end '`;
-		const scriptB64 = Buffer.from(hazardousRealScript, "utf8").toString(
-			"base64",
-		);
-		const wrapped = `echo ${scriptB64} | base64 -d | sh`;
-
-		try {
-			try {
-				execFileSync(
-					"zsh",
-					[
-						"-i",
-						"-c",
-						`docker exec switchyard-nonexistent-boundary-container sh -c '${wrapped}'`,
-					],
-					{ stdio: "pipe" },
-				);
-			} catch {
-				// Expected: the container doesn't exist, so docker exec fails.
-				// The only thing under test is whether the host ever ran `touch`.
-			}
-			strictEqual(
-				existsSync(markerPath),
-				false,
-				"the embedded single quote must never break out of the outer single-quoted region onto the host",
-			);
-		} finally {
-			rmSync(markerDir, { recursive: true, force: true });
-		}
-	});
-});
-
 describe("isCodexAuthenticated credential-validity check (real container)", () => {
 	it("returns false when the credential is withheld/corrupt even though the binary responds", {
 		skip: !dockerAvailable,
@@ -424,8 +138,9 @@ describe("isCodexAuthenticated credential-validity check (real container)", () =
 		// TASKS.md Task 15 "done when": with the CLI installed and answering
 		// `--version` (liveness passes), a withheld or trivial auth.json must
 		// make isCodexAuthenticated() return false — the false-positive the old
-		// liveness-only check produced. Codex persists /root/.codex/auth.json
-		// directly (see buildAuthContainerScript), so that is the checked path.
+		// liveness-only check produced. `codex login` persists
+		// /root/.codex/auth.json directly (TASKS.md Task 24), so that is the
+		// checked path.
 		const containerName = `switchyard-codex-authcheck-${Date.now()}`;
 		const credPath = "/root/.codex/auth.json";
 

@@ -41,12 +41,12 @@ describe("cursor adapter container execution", () => {
 			{ stdio: "pipe" },
 		);
 
-		// executeCursor calls the post-auth wrapper binary (cursor-agent-authed),
-		// not cursor-agent directly — install the fake stub under that name,
-		// same as authenticateCursor would in a real deployment. cursor-agent
-		// can't read stdin, so this stub doesn't try to drain any.
+		// executeCursor invokes cursor-agent directly (TASKS.md Task 24: auth is
+		// now a real in-container OAuth login, not a generated wrapper binary
+		// that exports an injected API key). cursor-agent can't read stdin, so
+		// this stub doesn't try to drain any.
 		execSync(
-			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho updated >> test.txt\necho cursor-agent\n" > /usr/local/bin/cursor-agent-authed && chmod +x /usr/local/bin/cursor-agent-authed'`,
+			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho updated >> test.txt\necho cursor-agent\n" > /usr/local/bin/cursor-agent && chmod +x /usr/local/bin/cursor-agent'`,
 			{ stdio: "pipe" },
 		);
 	});
@@ -62,7 +62,7 @@ describe("cursor adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("executes cursor-agent-authed inside working container and captures diff", {
+	it("executes cursor-agent inside working container and captures diff", {
 		skip: !dockerAvailable,
 	}, () => {
 		const result = executeCursor("apply a small change", containerName, {

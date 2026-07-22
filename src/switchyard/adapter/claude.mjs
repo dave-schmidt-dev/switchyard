@@ -2,58 +2,21 @@
 // Executes claude CLI inside the container (never host-spawn)
 // CR-4: Adapters exec inside container, never host-spawn
 // PW-4: Independent in-container login
+//
+// Auth is a real interactive OAuth login (`claude auth login`) run once by
+// a human directly against the standing agent container — see
+// `src/switchyard/auth/index.mjs`. TASKS.md Task 24: this replaces an
+// earlier BWS-credential-injection design.
 
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
-import {
-	validateEnvName,
-	validateIdentifier,
-	validateModelArg,
-} from "./shell-safety.mjs";
+import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CLAUDE_CMD = "claude";
 
-/**
- * Build the in-container script that persists the Claude credentials JSON
- * forwarded via `docker exec -e ${secretName}` into a file `claude login`
- * can read. Pure/testable: exported separately from the `bws-run` wrapper so
- * a test can verify the *actual file content* ends up correct without
- * needing real BWS access — this exact bug (script reading from stdin
- * instead of referencing the forwarded env var, silently writing an empty
- * file with exit code 0) shipped once already.
- *
- * The trailing cleanup (`rm -f`) must not run as an unconditional `;`
- * continuation after the login chain — that would make `rm -f`'s own exit
- * code (almost always 0) the script's final status, masking a real `claude
- * login` failure as success. Capture the chain's exit status first, always
- * clean up, then exit with the captured status.
- *
- * The string returned here is NOT that script verbatim — it's that script
- * base64-encoded and wrapped as `echo <b64> | base64 -d | sh` (same
- * technique cursor.mjs's CURSOR_WRAPPER_SCRIPT uses, applied to the whole
- * script rather than one sub-payload). authenticateClaude() embeds the
- * return value via single quotes into a `zsh -c "... docker exec ... sh -c
- * '...'"` nesting; the base64 alphabet ([A-Za-z0-9+/=]) contains no shell
- * metacharacters, so the only characters that ever cross that boundary
- * cannot break out of the single-quoted region regardless of what the real
- * script above contains. A future edit introducing a bare single quote,
- * `$(...)`, or other special character into the real script text can no
- * longer reintroduce the quote-escaping bug that already shipped once (see
- * tests/claude-auth.test.mjs's boundary-crossing regression test).
- * @param {string} secretName
- * @returns {string}
- */
-export function buildAuthContainerScript(secretName) {
-	const realScript = `printf '%s' "$${secretName}" > /tmp/claude_creds.json && chmod 600 /tmp/claude_creds.json && ${CLAUDE_CMD} login --file /tmp/claude_creds.json; login_status=$?; rm -f /tmp/claude_creds.json; exit $login_status`;
-	const scriptB64 = Buffer.from(realScript, "utf8").toString("base64");
-	return `echo ${scriptB64} | base64 -d | sh`;
-}
-
-// Claude diverges from the other three adapters: authenticateClaude writes
-// /tmp/claude_creds.json only as an *input* to `claude login`, then deletes
-// it in the same script — so it is NOT the durable credential. `claude login`
-// persists the operative credential to Claude Code's own store, which on
-// Linux (the container runs as root) is /root/.claude/.credentials.json —
+// `claude auth login` persists the operative credential to Claude Code's own
+// store, which on Linux (the container runs as root) is
+// /root/.claude/.credentials.json —
 // mode 0600, holding the OAuth access/refresh tokens + expiry. Verified
 // against Claude Code's own authentication docs, not assumed. (Unverifiable
 // end-to-end until the agent image exists — TASKS.md Task 14 — but a wrong
@@ -122,52 +85,6 @@ export function isClaudeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 		return false;
 	}
 	return hasNonTrivialCredential(containerName);
-}
-
-/**
- * Authenticate Claude in the container.
- * PW-4: Independent in-container login (subscription, never API keys).
- *
- * The secret is never fetched host-side and never appears in any process's
- * argv (visible via `ps`/`/proc`): `bws-run` injects `secretName` as an env
- * var into the `docker exec` process it launches, and `docker exec -e NAME`
- * (bare, no `=value`) forwards that host env var into the container by
- * reference. Requires `secretName` to be the exact BWS secret key
- * (project convention: UPPERCASE_SNAKE_CASE matching the env var).
- * @param {string} [secretName] BWS secret name for the Claude credentials JSON.
- * @returns {boolean}
- */
-export function authenticateClaude(secretName = "CLAUDE_CREDENTIALS") {
-	try {
-		validateEnvName(secretName, "secretName");
-	} catch (error) {
-		console.error("Failed to authenticate Claude:", error.message);
-		return false;
-	}
-
-	const containerScript = buildAuthContainerScript(secretName);
-
-	// Don't trust this call's exit code alone: `bws run` has been observed to
-	// report success (exit 0) for a wrapped `docker exec ... sh -c '<script>'`
-	// even when the script demonstrably failed inside the container (it
-	// re-serializes trailing argv through a shell, which can mangle a
-	// multi-word `sh -c` argument). The credential-presence check below is
-	// the ground truth this function's return value is actually built on.
-	try {
-		execFileSync(
-			"zsh",
-			[
-				"-i",
-				"-c",
-				`bws-run -- docker exec -e ${secretName} ${AGENT_CONTAINER_NAME} sh -c '${containerScript}'`,
-			],
-			{ stdio: "inherit" },
-		);
-	} catch (error) {
-		console.error("Failed to authenticate Claude:", error.message);
-	}
-
-	return hasNonTrivialCredential(AGENT_CONTAINER_NAME);
 }
 
 /**
