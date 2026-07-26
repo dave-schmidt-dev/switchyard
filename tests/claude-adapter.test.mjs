@@ -22,6 +22,26 @@ const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-claude-adapter-"));
 const containerName = `switchyard-claude-adapter-${Date.now()}`;
 
+// Fake `claude` that ENFORCES the adapter's headless invocation shape (Task 25):
+// it exits non-zero unless executeClaude passed BOTH --print (non-interactive
+// dispatch) and --permission-mode acceptEdits (auto-apply edits). A regression
+// that drops either flag turns this test red instead of passing silently — the
+// argv-blind-stub gap Task 19 tracks for the other adapters. Only when both
+// flags are present does it apply the edit the diff assertion looks for.
+const CLAUDE_STUB = `#!/bin/sh
+cat >/dev/null
+case " $* " in
+  *" --print "*) ;;
+  *) echo "stub: executeClaude did not pass --print (Task 25); args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --permission-mode acceptEdits "*) ;;
+  *) echo "stub: executeClaude did not pass --permission-mode acceptEdits (Task 25); args: $*" >&2; exit 3 ;;
+esac
+echo updated >> test.txt
+echo claude
+`;
+
 describe("claude adapter container execution", () => {
 	before(() => {
 		if (!dockerAvailable) return;
@@ -41,10 +61,18 @@ describe("claude adapter container execution", () => {
 			{ stdio: "pipe" },
 		);
 
-		execSync(
-			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\ncat >/dev/null\necho updated >> test.txt\necho claude\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
-			{ stdio: "pipe" },
-		);
+		// Write the arg-checking stub on the host and copy it in (docker cp, not
+		// the /project mount) so the multi-line `case` script survives intact
+		// rather than fighting nested printf/quote escaping. It lands untracked,
+		// so `git diff` (captureDiff) only ever sees the edit to test.txt.
+		const stubPath = join(testRoot, "claude-stub.sh");
+		writeFileSync(stubPath, CLAUDE_STUB, { mode: 0o755 });
+		execSync(`docker cp ${stubPath} ${containerName}:/usr/local/bin/claude`, {
+			stdio: "pipe",
+		});
+		execSync(`docker exec ${containerName} chmod +x /usr/local/bin/claude`, {
+			stdio: "pipe",
+		});
 	});
 
 	after(() => {
@@ -58,9 +86,12 @@ describe("claude adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("executes claude inside working container and captures diff", {
+	it("passes --print --permission-mode acceptEdits and captures the applied diff", {
 		skip: !dockerAvailable,
 	}, () => {
+		// The stub exits non-zero unless BOTH headless flags were passed, so a
+		// green result here is itself the assertion that executeClaude sends
+		// them (Task 25) — not just that some diff came back.
 		const result = executeClaude("apply a small change", containerName, {
 			model: "fake-model",
 		});

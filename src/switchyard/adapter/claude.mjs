@@ -114,6 +114,24 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 		"/project",
 		workingContainerName,
 		CLAUDE_CMD,
+		// Non-interactive dispatch (Task 25). claude's default is an interactive
+		// TUI session; -p/--print makes it process the piped prompt and exit,
+		// bringing it to parity with the other headless adapters (cursor already
+		// passes --print, agy --mode accept-edits). Without this, the earlier
+		// stdin-only invocation "worked" only by interactive mode happening to
+		// read piped stdin then hit EOF — fragile, and it left edits blocked.
+		"--print",
+		// Auto-apply file edits without an interactive approval prompt no human
+		// is present to answer (the live proof caught claude blocking its own
+		// write here). acceptEdits accepts *edits* only and still gates other
+		// tools (bash, etc.) — the deliberately conservative first step per the
+		// user's Task 25 call ("try this before bypassing entirely"); escalate
+		// to bypassPermissions only if edit-only gating stalls real tasks. Safe
+		// posture because the disposable working container is itself the
+		// containment boundary (INV-1) and INV-2's integration gate is the real
+		// review point for anything that leaves it.
+		"--permission-mode",
+		"acceptEdits",
 	];
 	if (model) {
 		try {

@@ -19,6 +19,26 @@ const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-codex-adapter-"));
 const containerName = `switchyard-codex-adapter-${Date.now()}`;
 
+// Fake `codex` that ENFORCES the adapter's headless invocation shape (Task 25):
+// it exits non-zero unless executeCodex passed BOTH the `exec` subcommand
+// (non-interactive dispatch) and --dangerously-bypass-approvals-and-sandbox
+// (the only mode that applies edits inside a container, where codex's own
+// bubblewrap sandbox can't initialize). Dropping either flag turns this test
+// red instead of passing silently — the argv-blind-stub gap Task 19 tracks.
+const CODEX_STUB = `#!/bin/sh
+cat >/dev/null
+case " $* " in
+  *" exec "*) ;;
+  *) echo "stub: executeCodex did not pass the exec subcommand; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --dangerously-bypass-approvals-and-sandbox "*) ;;
+  *) echo "stub: executeCodex did not pass --dangerously-bypass-approvals-and-sandbox (Task 25); args: $*" >&2; exit 3 ;;
+esac
+echo updated >> test.txt
+echo codex
+`;
+
 describe("codex adapter container execution", () => {
 	before(() => {
 		if (!dockerAvailable) return;
@@ -38,10 +58,18 @@ describe("codex adapter container execution", () => {
 			{ stdio: "pipe" },
 		);
 
-		execSync(
-			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\ncat >/dev/null\necho updated >> test.txt\necho codex\n" > /usr/local/bin/codex && chmod +x /usr/local/bin/codex'`,
-			{ stdio: "pipe" },
-		);
+		// Write the arg-checking stub on the host and copy it in (docker cp, not
+		// the /project mount) so the multi-line `case` script survives intact
+		// rather than fighting nested printf/quote escaping. It lands untracked,
+		// so `git diff` (captureDiff) only ever sees the edit to test.txt.
+		const stubPath = join(testRoot, "codex-stub.sh");
+		writeFileSync(stubPath, CODEX_STUB, { mode: 0o755 });
+		execSync(`docker cp ${stubPath} ${containerName}:/usr/local/bin/codex`, {
+			stdio: "pipe",
+		});
+		execSync(`docker exec ${containerName} chmod +x /usr/local/bin/codex`, {
+			stdio: "pipe",
+		});
 	});
 
 	after(() => {
@@ -55,9 +83,12 @@ describe("codex adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("executes codex inside working container and captures diff", {
+	it("passes exec --dangerously-bypass-approvals-and-sandbox and captures the applied diff", {
 		skip: !dockerAvailable,
 	}, () => {
+		// The stub exits non-zero unless BOTH the exec subcommand and the
+		// sandbox-bypass flag were passed, so a green result here is itself the
+		// assertion that executeCodex sends them (Task 25).
 		const result = executeCodex("apply a small change", containerName, {
 			model: "fake-model",
 		});

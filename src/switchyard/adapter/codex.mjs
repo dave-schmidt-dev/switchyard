@@ -112,6 +112,20 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 		// whether stdout is a TTY (unlike `claude`, which auto-detects piped
 		// output). Verified against the installed CLI's own --help.
 		"exec",
+		// Delegate containment to the working container instead of codex's own
+		// sandbox (Task 25). Codex enforces `read-only`/`workspace-write` via
+		// bubblewrap, which needs an unprivileged user namespace — but nested
+		// unprivileged userns is disallowed inside the Docker/OrbStack container,
+		// so bwrap can't initialize (`bwrap: No permissions to create a new
+		// namespace`). Verified live 2026-07-26: the default (read-only) and
+		// `-s workspace-write` BOTH fail to apply any edit in-container; only
+		// this flag works. It is codex's own documented mode for "environments
+		// that are externally sandboxed" — which the working container is
+		// (INV-1: no host FS mount, no docker.sock, no host creds; disposable,
+		// INV-3). INV-2's integration gate remains the real review point for
+		// anything that leaves the container, so auto-approving in-container is
+		// consistent with the accident-containment threat model, not a hole.
+		"--dangerously-bypass-approvals-and-sandbox",
 	];
 	if (model) {
 		try {
