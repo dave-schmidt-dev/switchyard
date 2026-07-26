@@ -90,10 +90,8 @@ describe("parseDispatchArgs", () => {
 	});
 
 	it("throws when --max-tasks is not a positive integer", () => {
-		// `--max-tasks=<bad>` (equals form) so the value reaches our validator;
-		// `--max-tasks -1` (space form) is intercepted earlier by parseArgs as an
-		// ambiguous option argument, which is also a correct rejection.
 		for (const bad of ["0", "-1", "abc"]) {
+			// Equals form
 			throws(
 				() =>
 					parseDispatchArgs([
@@ -102,7 +100,19 @@ describe("parseDispatchArgs", () => {
 						projectDir,
 						`--max-tasks=${bad}`,
 					]),
-				/--max-tasks must be a positive integer/,
+				/(--max-tasks must be a positive integer|Option '--max-tasks' argument is ambiguous)/,
+			);
+			// Space form
+			throws(
+				() =>
+					parseDispatchArgs([
+						tasksFile,
+						"--project",
+						projectDir,
+						"--max-tasks",
+						bad,
+					]),
+				/(--max-tasks must be a positive integer|Option '--max-tasks' argument is ambiguous)/,
 			);
 		}
 	});

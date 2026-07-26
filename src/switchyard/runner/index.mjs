@@ -140,6 +140,7 @@ function parseArgsJson(rawArgsJson) {
  * - launch: `<command> ... launch --json <payload>` => JSON or plain job id
  * - status: `<command> ... status <jobId>` => JSON payload with state/expected_by
  * - result: `<command> ... result <jobId>` => JSON payload with success/diff/error
+ *   (Note: per-task diff isolation is the orchestrator's contract, not the runner's.)
  *
  * @param {object} options
  * @param {string} options.command

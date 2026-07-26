@@ -277,7 +277,7 @@ export function seedProject(workingContainerName, projectPath) {
 			"cd /project && git init -q && " +
 				"git config user.email seed@switchyard.local && " +
 				"git config user.name switchyard-seed && " +
-				"git add -A -f && git commit -q -m baseline",
+				"git add -A -f && git commit --allow-empty -q -m baseline",
 		],
 		{ stdio: "pipe" },
 	);

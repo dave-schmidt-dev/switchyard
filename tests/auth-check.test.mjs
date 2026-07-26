@@ -196,8 +196,6 @@ describe("reportProviderStatus (read-only auth check)", () => {
 		// ensureProvidersAuthenticated calls isAuthenticated twice for an
 		// unauthed provider (before + after login). The read-only report has no
 		// login step, so it must check exactly once and take the first answer.
-		const provider = fakeProvider("once", { authenticatedSequence: [true] });
-		reportProviderStatus([provider]);
 		// A second call to isAuthenticated would advance the sequence; assert the
 		// report used only the first element by re-running against a divergent
 		// sequence and checking the reported value is the first, not the second.

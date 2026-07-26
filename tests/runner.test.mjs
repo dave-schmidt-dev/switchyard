@@ -1671,4 +1671,43 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 			"result:1.2:true",
 		]);
 	});
+
+	it("fires onResult with success:false when a task fails", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing task
+- **Status:** pending
+- **Description:** This will fail
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				onTaskStart: (task) => events.push(`start:${task.id}`),
+				onResult: (result) =>
+					events.push(`result:${result.taskId}:${result.success}`),
+				adapters: {
+					claude: {
+						execute: () => ({ success: false, error: "simulated failure" }),
+						captureDiff: () => "",
+					},
+				},
+			},
+		});
+
+		deepStrictEqual(events, ["start:1.1", "result:1.1:false"]);
+	});
 });
