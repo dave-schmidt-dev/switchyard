@@ -25,8 +25,9 @@ const AGY_MODEL = "Gemini 3.6 Flash (Medium)";
 const AGY_PROMPT = "apply a small change";
 
 // Fake `agy` that ENFORCES the adapter's invocation shape: it exits non-zero
-// unless --new-project, --mode accept-edits, --add-dir /project,
-// --print-timeout 9m, --model <value>, and --print <prompt> are all present
+// unless --new-project, --mode accept-edits, --dangerously-skip-permissions,
+// --add-dir /project, --print-timeout 9m, --model <value>, and --print
+// <prompt> are all present
 // and correctly paired (each flag immediately followed by its own value, and
 // --print <prompt> anchored as the final args) — so a dropped or misordered
 // flag turns this test red instead of passing silently, the argv-blind-stub
@@ -41,6 +42,10 @@ esac
 case " $* " in
   *" --mode accept-edits "*) ;;
   *) echo "stub: executeAgy did not pass --mode accept-edits; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --dangerously-skip-permissions "*) ;;
+  *) echo "stub: executeAgy did not pass --dangerously-skip-permissions; args: $*" >&2; exit 3 ;;
 esac
 case " $* " in
   *" --add-dir /project "*) ;;
@@ -106,7 +111,7 @@ describe("agy adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("passes --new-project --mode accept-edits --model and --print <prompt>, and captures the applied diff", {
+	it("passes --new-project --mode accept-edits --dangerously-skip-permissions --model and --print <prompt>, and captures the applied diff", {
 		skip: !dockerAvailable,
 	}, () => {
 		// The stub exits non-zero unless the required flags, model arg, and

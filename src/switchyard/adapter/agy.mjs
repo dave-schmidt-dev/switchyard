@@ -97,6 +97,18 @@ export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  * as a single execFileSync argv element, never shell-interpolated.
  * `--new-project` is required so each task gets an isolated conversation
  * rather than resuming a stale prior one.
+ *
+ * `--dangerously-skip-permissions` is required to actually APPLY edits
+ * headlessly: `--mode accept-edits` alone is NOT sufficient in `--print` mode
+ * — agy's permission layer auto-denies the `write_file` tool ("headless mode
+ * cannot prompt for it") and exits 0 having produced no diff (live-verified
+ * 2026-07-26). This is NOT the nested-userns/bwrap limitation codex hit; it is
+ * agy's own tool-permission gate. David approved full auto-approve here (the
+ * same posture as codex's bypass): the working container is itself the
+ * containment boundary (INV-1, disposable, no host rights), and INV-2's
+ * integration gate remains the real review point. agy offers a narrower
+ * settings.json `write_file` allow-rule as an alternative; the full-bypass
+ * flag was chosen for consistency with codex and because it is verified.
  * @param {string} prompt The task prompt
  * @param {string} workingContainerName Working container to exec in
  * @param {object} options Execution options
@@ -121,6 +133,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 		"--new-project",
 		"--mode",
 		"accept-edits",
+		"--dangerously-skip-permissions",
 	];
 	if (model) {
 		try {

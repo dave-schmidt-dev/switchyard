@@ -121,6 +121,14 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
 # reasonable verification path exists today. Accepted given INV-1 (no host
 # rights at build time) -- a compromised installer here compromises only
 # the disposable build environment.
+#
+# Conscious risk acceptance (David, 2026-07-26, Task 20): the other three
+# installers verify integrity (claude: GPG-signed manifest; codex/agy:
+# vendor-internal checksum, source-confirmed above). Cursor is the sole
+# unverified one and no vendor-published hash exists to pin to, so the
+# residual supply-chain risk is ACCEPTED rather than mitigated, bounded by
+# INV-1 -- not silently deferred. Revisit if Cursor ever publishes a
+# checksum/signature for this artifact.
 RUN curl https://cursor.com/install -fsS | bash \
     && cursor-agent --version
 
