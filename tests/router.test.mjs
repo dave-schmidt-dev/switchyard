@@ -3,48 +3,40 @@
 // INV-5: capability filter + model right-sizing
 
 import { notStrictEqual, strictEqual } from "node:assert";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { route, routeBlind } from "../src/switchyard/router/index.mjs";
 
-const SNAPSHOT_DIR = join(homedir(), "Documents/Projects/gradus/.state");
-const SNAPSHOT_PATH = join(SNAPSHOT_DIR, "snapshot-v2.json");
-
-// Backup original snapshot if it exists
-let originalSnapshot = null;
+// Isolated per-process temp snapshot (see resolveSnapshotPath() in
+// src/switchyard/router/index.mjs). This file and tests/runner.test.mjs both
+// exercise the real snapshot loader, and `node --test` runs test files
+// concurrently as separate processes — both used to read/write/rm the SAME
+// real on-disk SNAPSHOT_PATH (the host-side gradus snapshot), which raced.
+// The suffix is unique per test run (not a fixed test-only name), so this
+// file never collides with another isolated run either.
+const SNAPSHOT_PATH = join(
+	tmpdir(),
+	`switchyard-router-test-${process.pid}-${randomUUID()}.json`,
+);
 
 before(() => {
-	try {
-		originalSnapshot = readFileSync(SNAPSHOT_PATH, "utf8");
-	} catch {
-		// No original snapshot
-	}
+	process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = SNAPSHOT_PATH;
 });
 
 after(() => {
-	// Restore original snapshot
-	if (originalSnapshot !== null) {
-		try {
-			mkdirSync(SNAPSHOT_DIR, { recursive: true });
-			writeFileSync(SNAPSHOT_PATH, originalSnapshot, "utf8");
-		} catch {
-			// Ignore
-		}
-	} else {
-		// Clean up test snapshot
-		try {
-			rmSync(SNAPSHOT_PATH);
-		} catch {
-			// Ignore
-		}
+	delete process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
+	try {
+		rmSync(SNAPSHOT_PATH, { force: true });
+	} catch {
+		// Ignore
 	}
 });
 
 // Helper to create a test snapshot
 function createTestSnapshot(providers) {
-	mkdirSync(SNAPSHOT_DIR, { recursive: true });
 	writeFileSync(
 		SNAPSHOT_PATH,
 		JSON.stringify({
@@ -302,7 +294,6 @@ describe("router", () => {
 		// exhausted-skip and won with unbounded headroom — an INV-4 bypass. It must
 		// now be excluded, leaving codex the only valid provider. Written as raw
 		// JSON because JSON.stringify(Infinity) === "null".
-		mkdirSync(SNAPSHOT_DIR, { recursive: true });
 		writeFileSync(
 			SNAPSHOT_PATH,
 			'{"schema_version":2,"providers":[' +

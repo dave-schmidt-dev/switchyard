@@ -23,6 +23,19 @@ const SNAPSHOT_PATH = join(
 	"Documents/Projects/gradus/.state/snapshot-v2.json",
 );
 
+// Test-only escape hatch: tests/router.test.mjs and tests/runner.test.mjs both
+// exercise the real readSnapshot() (the latter indirectly, via runQueue's
+// default route()), and node --test runs test files concurrently as separate
+// processes. Pointing every test at the same real SNAPSHOT_PATH made them race
+// on one shared on-disk file. Read dynamically (inside the function, not
+// hoisted to module load) so each test process can set its own unique temp
+// path — a value read once at import time would be fixed before a test ever
+// gets to set it. Production callers never set this env var, so
+// resolveSnapshotPath() always returns the real SNAPSHOT_PATH for them.
+function resolveSnapshotPath() {
+	return process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE || SNAPSHOT_PATH;
+}
+
 const EXPECTED_SCHEMA_VERSION = 2;
 const DEFAULT_FLOOR = 5.0; // percent_left floor for skipping exhausted providers
 
@@ -35,7 +48,7 @@ const DEFAULT_FLOOR = 5.0; // percent_left floor for skipping exhausted provider
  */
 function readSnapshot() {
 	try {
-		return JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8"));
+		return JSON.parse(readFileSync(resolveSnapshotPath(), "utf8"));
 	} catch {
 		return null; // CR-3: tolerate absent/malformed snapshot
 	}
@@ -298,5 +311,3 @@ export function routeBlind(providerOrder, exclude = []) {
 	}
 	return { provider: null, model: null, reason: "no_eligible_blind" };
 }
-
-export { SNAPSHOT_PATH };

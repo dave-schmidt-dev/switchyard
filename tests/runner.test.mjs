@@ -6,17 +6,12 @@ import {
 	strictEqual,
 	throws,
 } from "node:assert";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
-import { SNAPSHOT_PATH } from "../src/switchyard/router/index.mjs";
 import {
 	createCliOrchestrator,
 	executeTask,
@@ -758,14 +753,24 @@ describe("runner provider spread recording", () => {
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const dispatches = [];
-		const snapshotDir = dirname(SNAPSHOT_PATH);
-		let originalSnapshot = null;
+		// Isolated per-test temp snapshot, not the real shared SNAPSHOT_PATH: this
+		// test intentionally exercises the real, unmocked route() (no
+		// dependencies.route override below), and tests/router.test.mjs also
+		// exercises the real loader concurrently in its own process. Both used to
+		// read/write/rm the SAME on-disk SNAPSHOT_PATH (the host-side gradus
+		// snapshot), which raced under `node --test`'s concurrent-file execution.
+		// The env var is read dynamically by resolveSnapshotPath() in
+		// src/switchyard/router/index.mjs, so pointing it at a unique file here
+		// redirects the real readSnapshot() without touching production callers.
+		const snapshotPath = join(
+			tmpdir(),
+			`switchyard-runner-test-headroom-${process.pid}-${randomUUID()}.json`,
+		);
 		let launchIndex = 0;
 
 		const writeSnapshot = (claudePercentLeft, codexPercentLeft) => {
-			mkdirSync(snapshotDir, { recursive: true });
 			writeFileSync(
-				SNAPSHOT_PATH,
+				snapshotPath,
 				JSON.stringify({
 					schema_version: 2,
 					providers: [
@@ -785,13 +790,10 @@ describe("runner provider spread recording", () => {
 			);
 		};
 
-		try {
-			try {
-				originalSnapshot = readFileSync(SNAPSHOT_PATH, "utf8");
-			} catch {
-				originalSnapshot = null;
-			}
+		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
+		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
 
+		try {
 			writeSnapshot(72, 60);
 
 			await runQueueWithOrchestrator({
@@ -834,14 +836,15 @@ describe("runner provider spread recording", () => {
 			strictEqual(dispatches[1].reason, "spread");
 			strictEqual(dispatches[1].percentLeft, 68);
 		} finally {
-			if (originalSnapshot === null) {
-				try {
-					rmSync(SNAPSHOT_PATH, { force: true });
-				} catch {
-					// ignore cleanup errors
-				}
+			if (previousOverride === undefined) {
+				delete process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 			} else {
-				writeFileSync(SNAPSHOT_PATH, originalSnapshot, "utf8");
+				process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = previousOverride;
+			}
+			try {
+				rmSync(snapshotPath, { force: true });
+			} catch {
+				// ignore cleanup errors
 			}
 		}
 	});
@@ -860,19 +863,19 @@ describe("runner provider spread recording", () => {
 - **Description:** simple trivial cleanup
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const snapshotDir = dirname(SNAPSHOT_PATH);
-		let originalSnapshot = null;
+		// Isolated per-test temp snapshot — see the "uses headroom routing" test
+		// above for why: this test also exercises the real, unmocked route().
+		const snapshotPath = join(
+			tmpdir(),
+			`switchyard-runner-test-noadapter-${process.pid}-${randomUUID()}.json`,
+		);
+
+		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
+		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
 
 		try {
-			try {
-				originalSnapshot = readFileSync(SNAPSHOT_PATH, "utf8");
-			} catch {
-				originalSnapshot = null;
-			}
-
-			mkdirSync(snapshotDir, { recursive: true });
 			writeFileSync(
-				SNAPSHOT_PATH,
+				snapshotPath,
 				JSON.stringify({
 					schema_version: 2,
 					providers: [
@@ -918,14 +921,15 @@ describe("runner provider spread recording", () => {
 			notStrictEqual(dispatches[0].result, "unsupported_provider");
 			strictEqual(result.results[0].success, true);
 		} finally {
-			if (originalSnapshot === null) {
-				try {
-					rmSync(SNAPSHOT_PATH, { force: true });
-				} catch {
-					// ignore cleanup errors
-				}
+			if (previousOverride === undefined) {
+				delete process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 			} else {
-				writeFileSync(SNAPSHOT_PATH, originalSnapshot, "utf8");
+				process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = previousOverride;
+			}
+			try {
+				rmSync(snapshotPath, { force: true });
+			} catch {
+				// ignore cleanup errors
 			}
 		}
 	});
