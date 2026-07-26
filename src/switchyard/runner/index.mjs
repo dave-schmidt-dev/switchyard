@@ -28,7 +28,7 @@ import { integrationGate } from "../integrate/index.mjs";
 import { recordDispatch } from "../ledger/index.mjs";
 import {
 	createWorkingContainer,
-	provisionClaudeCredentials,
+	provisionCredentials,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
 import { classifyTask } from "../roster/classifier.mjs";
@@ -806,14 +806,14 @@ export function runQueue(options) {
 	// container exists when that working container was created. The agent
 	// container is still required before creating one: createWorkingContainer
 	// builds the working container FROM the agent image, and
-	// provisionClaudeCredentials copies the agent container's credentials into
+	// provisionCredentials copies the agent container's credentials into
 	// it (the old --volumes-from coupling is gone — see lifecycle/index.mjs).
 	const ensureAgentContainerFn =
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;
 	const createWorkingContainerFn =
 		dependencies.createWorkingContainer ?? createWorkingContainer;
 	const provisionCredentialsFn =
-		dependencies.provisionCredentials ?? provisionClaudeCredentials;
+		dependencies.provisionCredentials ?? provisionCredentials;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 
@@ -955,7 +955,7 @@ export async function runQueueWithOrchestrator(options) {
 	const createWorkingContainerFn =
 		dependencies.createWorkingContainer ?? createWorkingContainer;
 	const provisionCredentialsFn =
-		dependencies.provisionCredentials ?? provisionClaudeCredentials;
+		dependencies.provisionCredentials ?? provisionCredentials;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 

@@ -10,17 +10,39 @@ import { AGENT_CONTAINER_NAME, AGENT_IMAGE } from "../container/index.mjs";
 
 const WORKING_PREFIX = "switchyard-work-";
 
-// Credential paths copied from the standing agent container into a fresh
-// working container so an authenticated CLI can actually run there. CLAUDE
-// ONLY for now: `/root/.claude` (dir, holds `.credentials.json`) plus the
-// root-level `/root/.claude.json` config. Claude is the one provider whose
-// credential locations do NOT collide with the INV-1 gate test's assertion
-// that `/root/.config` must be absent from the working container. Extending
-// this to codex (`/root/.codex`), agy (`/root/.gemini/...`), and especially
-// cursor (`/root/.config/cursor/auth.json`) is deferred to a dedicated task
-// that pairs the four-provider credential model with re-expressing INV-1 as
-// "no host rights" rather than "no container-local creds" (see TASKS.md).
-const CLAUDE_CREDENTIAL_PATHS = ["/root/.claude", "/root/.claude.json"];
+// Credential FILES copied from the standing agent container into each fresh
+// working container so any of the four authenticated CLIs can actually run
+// there (Task 26). Two deliberate properties:
+//
+//   - CREDENTIAL FILES ONLY, never the whole provider directory. Each
+//     provider's dir also holds conversation history / project state (claude
+//     `projects/`, `sessions/`, `backups/`; codex `log/`, `goals_*.sqlite`;
+//     agy `conversations/`, `brain/`, `knowledge/`), which must NOT bleed into
+//     a disposable working container. Copying just the single auth file avoids
+//     that cross-project/conversation bleed. (`/root/.claude.json` is a
+//     single root-level config file, not a directory, so it carries no
+//     subtree.)
+//   - `dest` is the file's PARENT DIR, created with `mkdir -p` before the copy:
+//     `docker cp SRC -` roots the tar at basename(SRC) and we extract into
+//     `dest`, so `/root/.codex/auth.json` must extract into `/root/.codex`
+//     (not `/root`) to land at the right path.
+//
+// Paths were confirmed empirically against a real authenticated agent
+// container (2026-07-26), not assumed. cursor's file lives under
+// `/root/.config`; the INV-1 gate test no longer forbids that path — it now
+// asserts "no host bind mount" directly (see tests/no-host-rights.test.mjs),
+// which is INV-1's real intent ("no host rights"), so a legitimately
+// provisioned in-container credential no longer trips it.
+const PROVIDER_CREDENTIAL_PATHS = [
+	{ src: "/root/.claude/.credentials.json", dest: "/root/.claude" },
+	{ src: "/root/.claude.json", dest: "/root" },
+	{ src: "/root/.codex/auth.json", dest: "/root/.codex" },
+	{
+		src: "/root/.gemini/antigravity-cli/antigravity-oauth-token",
+		dest: "/root/.gemini/antigravity-cli",
+	},
+	{ src: "/root/.config/cursor/auth.json", dest: "/root/.config/cursor" },
+];
 
 /**
  * Generate a unique working container name for a project.
@@ -44,7 +66,7 @@ function generateWorkingContainerName(projectPath) {
  * INV-1: still no host filesystem mount — `/project` is an isolated named
  * Docker volume and nothing binds a host path in. Credentials are NOT baked
  * in here; a fresh working container is unauthenticated until
- * provisionClaudeCredentials() copies them in. That is deliberately a
+ * provisionCredentials() copies them in. That is deliberately a
  * separate step so the INV-1/INV-3 gate tests, which pass a credential-less
  * `alpine:latest` image, exercise pure container creation without needing the
  * multi-GB agent image present.
@@ -99,13 +121,17 @@ export function createWorkingContainer(projectPath, image = AGENT_IMAGE) {
  * than a piped shell string.
  * @param {string} agentContainerName Source (standing agent container)
  * @param {string} workingContainerName Destination (disposable working container)
- * @param {string} srcPath Absolute path inside the agent container
+ * @param {string} srcPath Absolute file path inside the agent container
+ * @param {string} destDir Absolute parent dir inside the working container to
+ *   extract the file into (created with `mkdir -p` first). See
+ *   PROVIDER_CREDENTIAL_PATHS for why dest is the file's parent dir, not `/root`.
  * @returns {boolean} true if copied, false if the source was absent (skipped)
  */
 function copyPathAgentToWorking(
 	agentContainerName,
 	workingContainerName,
 	srcPath,
+	destDir,
 ) {
 	// Best-effort existence probe — a missing source is a skip, not an error.
 	try {
@@ -120,9 +146,19 @@ function copyPathAgentToWorking(
 		return false;
 	}
 
+	// `docker cp - container:destDir` extracts INTO destDir, which must already
+	// exist — create it first (idempotent). destDir is an internal constant
+	// from PROVIDER_CREDENTIAL_PATHS, never user input; the container name was
+	// already validated by the caller.
+	execFileSync(
+		"docker",
+		["exec", workingContainerName, "mkdir", "-p", destDir],
+		{ stdio: "pipe" },
+	);
+
 	// `docker cp SRC -` streams a tar of srcPath (rooted at its basename) to
-	// stdout; extracting that tar into `/root` of the working container
-	// recreates the path there. Two hops through a Node Buffer — no shell, no
+	// stdout; extracting that tar into destDir of the working container
+	// recreates the file there. Two hops through a Node Buffer — no shell, no
 	// temp file — so the credential bytes never persist to host disk (INV-1)
 	// and no value is ever interpolated into a command string.
 	const tar = execFileSync(
@@ -130,7 +166,7 @@ function copyPathAgentToWorking(
 		["cp", `${agentContainerName}:${srcPath}`, "-"],
 		{ maxBuffer: 256 * 1024 * 1024 },
 	);
-	execFileSync("docker", ["cp", "-", `${workingContainerName}:/root`], {
+	execFileSync("docker", ["cp", "-", `${workingContainerName}:${destDir}`], {
 		input: tar,
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -138,22 +174,21 @@ function copyPathAgentToWorking(
 }
 
 /**
- * Provision CLAUDE credentials from the standing agent container into a newly
- * created working container, so `docker exec <working> claude ...` runs
- * authenticated. Best-effort: returns the count of paths actually copied and
- * silently skips any that are absent (an `alpine` test fixture, or claude
- * never logged in) — a fresh working container simply stays unauthenticated,
- * which the adapter's own isClaudeAuthenticated() check surfaces downstream.
- *
- * Scoped to claude deliberately — see CLAUDE_CREDENTIAL_PATHS. Do NOT extend
- * to `/root/.config`-based providers (cursor) here without the paired INV-1
- * re-expression, or this will start writing `/root/.config` into the working
- * container and break the INV-1 gate test.
+ * Provision all four providers' credentials from the standing agent container
+ * into a newly created working container, so `docker exec <working> <cli> ...`
+ * runs authenticated for whichever provider a task routes to. Best-effort:
+ * returns the count of credential files actually copied and silently skips any
+ * that are absent (an `alpine` test fixture, or a provider never logged in) —
+ * a fresh working container simply stays unauthenticated for that provider,
+ * which the adapter's own is<Provider>Authenticated() check surfaces
+ * downstream. Copies credential FILES only, never whole provider dirs, so no
+ * conversation/project state bleeds into the disposable container (see
+ * PROVIDER_CREDENTIAL_PATHS).
  * @param {string} workingContainerName Destination working container
  * @param {string} [agentContainerName] Source agent container (defaults to the standing one)
- * @returns {number} number of credential paths copied (0 if none present)
+ * @returns {number} number of credential files copied (0 if none present)
  */
-export function provisionClaudeCredentials(
+export function provisionCredentials(
 	workingContainerName,
 	agentContainerName = AGENT_CONTAINER_NAME,
 ) {
@@ -161,9 +196,14 @@ export function provisionClaudeCredentials(
 	validateIdentifier(agentContainerName, "agentContainerName");
 
 	let copied = 0;
-	for (const srcPath of CLAUDE_CREDENTIAL_PATHS) {
+	for (const { src, dest } of PROVIDER_CREDENTIAL_PATHS) {
 		if (
-			copyPathAgentToWorking(agentContainerName, workingContainerName, srcPath)
+			copyPathAgentToWorking(
+				agentContainerName,
+				workingContainerName,
+				src,
+				dest,
+			)
 		) {
 			copied += 1;
 		}
