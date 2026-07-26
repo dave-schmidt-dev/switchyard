@@ -27,8 +27,10 @@ import {
 import { integrationGate } from "../integrate/index.mjs";
 import { recordDispatch } from "../ledger/index.mjs";
 import {
+	commitWorkingTree,
 	createWorkingContainer,
 	provisionCredentials,
+	seedProject,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
 import { classifyTask } from "../roster/classifier.mjs";
@@ -814,8 +816,16 @@ export function runQueue(options) {
 		dependencies.createWorkingContainer ?? createWorkingContainer;
 	const provisionCredentialsFn =
 		dependencies.provisionCredentials ?? provisionCredentials;
+	const seedProjectFn = dependencies.seedProject ?? seedProject;
+	const commitWorkingTreeFn =
+		dependencies.commitWorkingTree ?? commitWorkingTree;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+	// Optional host-side progress hooks (INV-1: no silent waits). A serial
+	// dispatch otherwise blocks with no feedback during each multi-minute
+	// provider exec; the CLI passes these to print a line per task start/finish.
+	const onTaskStart = dependencies.onTaskStart ?? null;
+	const onResult = dependencies.onResult ?? null;
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
@@ -868,6 +878,16 @@ export function runQueue(options) {
 	};
 
 	try {
+		// Seed the container we created with the project's committed tree so the
+		// agent edits real code and captureDiff has a git baseline — without it
+		// /project is empty and every task dead-ends at "success_no_diff",
+		// never reaching the integration gate (INV-2). Inside the try so a seed
+		// failure still hits the INV-3 wipe in `finally`. Only seed a container
+		// we own; a caller-supplied one is theirs to seed.
+		if (ownsWorkingContainer) {
+			seedProjectFn(workingContainerName, projectPath);
+		}
+
 		const tasks = loadTaskQueue(tasksFilePath);
 		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
 		const runnable = getRunnableTasks(tasks, checkpoint);
@@ -877,7 +897,24 @@ export function runQueue(options) {
 		for (const task of runnable) {
 			if (processed >= maxTasks) break;
 
+			if (onTaskStart) onTaskStart(task);
 			const result = executeTask(task, context);
+			if (onResult) onResult(result);
+			// Advance the container's baseline so the NEXT task diffs only against
+			// this task's result instead of re-emitting it (multi-task isolation;
+			// otherwise task 2's diff carries task 1's hunks and the host apply
+			// rejects it). Only for a container we own+seeded; a caller-supplied
+			// one is theirs to manage. Best-effort: a checkpoint hiccup must not
+			// abort the queue, but it is surfaced rather than swallowed (INV-1).
+			if (ownsWorkingContainer) {
+				try {
+					commitWorkingTreeFn(workingContainerName);
+				} catch (error) {
+					console.error(
+						`runQueue: could not checkpoint working container after task ${result.taskId}: ${error.message}`,
+					);
+				}
+			}
 			results.push(result);
 			checkpoint.results.push({
 				taskId: result.taskId,
@@ -956,6 +993,7 @@ export async function runQueueWithOrchestrator(options) {
 		dependencies.createWorkingContainer ?? createWorkingContainer;
 	const provisionCredentialsFn =
 		dependencies.provisionCredentials ?? provisionCredentials;
+	const seedProjectFn = dependencies.seedProject ?? seedProject;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 
@@ -995,6 +1033,13 @@ export async function runQueueWithOrchestrator(options) {
 	};
 
 	try {
+		// Same seeding rationale as runQueue: an unseeded /project makes every
+		// task dead-end at "success_no_diff". Inside the try so a seed failure
+		// still hits the INV-3 wipe; only seed a container we own.
+		if (ownsWorkingContainer) {
+			seedProjectFn(workingContainerName, projectPath);
+		}
+
 		const tasks = loadTaskQueue(tasksFilePath);
 		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
 		const runnable = getRunnableTasks(tasks, checkpoint);

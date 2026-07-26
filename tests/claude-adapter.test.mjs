@@ -63,8 +63,10 @@ describe("claude adapter container execution", () => {
 
 		// Write the arg-checking stub on the host and copy it in (docker cp, not
 		// the /project mount) so the multi-line `case` script survives intact
-		// rather than fighting nested printf/quote escaping. It lands untracked,
-		// so `git diff` (captureDiff) only ever sees the edit to test.txt.
+		// rather than fighting nested printf/quote escaping. captureDiff now
+		// stages untracked files, so the stub copy the bind mount leaves in
+		// /project also shows in the diff — harmless here: the assertion only
+		// requires the tracked test.txt edit to be present.
 		const stubPath = join(testRoot, "claude-stub.sh");
 		writeFileSync(stubPath, CLAUDE_STUB, { mode: 0o755 });
 		execSync(`docker cp ${stubPath} ${containerName}:/usr/local/bin/claude`, {

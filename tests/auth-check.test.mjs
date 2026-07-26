@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	ensureProvidersAuthenticated,
 	PROVIDERS,
+	reportProviderStatus,
 } from "../src/switchyard/auth/index.mjs";
 
 function fakeProvider(name, { authenticatedSequence }) {
@@ -163,5 +164,68 @@ describe("ensureProvidersAuthenticated", () => {
 			strictEqual(typeof provider.isAuthenticated, "function");
 			strictEqual(typeof provider.runLogin, "function");
 		}
+	});
+});
+
+describe("reportProviderStatus (read-only auth check)", () => {
+	it("reports each provider's authenticated state without ever attempting a login", () => {
+		// The whole point of the read-only check: it must NEVER call runLogin,
+		// even for an unauthenticated provider. This is the property the fragile
+		// ad-hoc `docker exec` probe was reaching for — reuse the real check,
+		// mutate nothing.
+		const authed = fakeProvider("authed", { authenticatedSequence: [true] });
+		const unauthed = fakeProvider("unauthed", {
+			authenticatedSequence: [false],
+		});
+
+		const results = reportProviderStatus([authed, unauthed]);
+
+		deepStrictEqual(results, [
+			{ name: "authed", authenticated: true },
+			{ name: "unauthed", authenticated: false },
+		]);
+		strictEqual(authed.getRunLoginCalls(), 0);
+		strictEqual(
+			unauthed.getRunLoginCalls(),
+			0,
+			"an unauthenticated provider must NOT trigger a login in read-only mode",
+		);
+	});
+
+	it("checks each provider exactly once (no re-check, since it never logs in)", () => {
+		// ensureProvidersAuthenticated calls isAuthenticated twice for an
+		// unauthed provider (before + after login). The read-only report has no
+		// login step, so it must check exactly once and take the first answer.
+		const provider = fakeProvider("once", { authenticatedSequence: [true] });
+		reportProviderStatus([provider]);
+		// A second call to isAuthenticated would advance the sequence; assert the
+		// report used only the first element by re-running against a divergent
+		// sequence and checking the reported value is the first, not the second.
+		const flip = fakeProvider("flip", { authenticatedSequence: [false, true] });
+		const [result] = reportProviderStatus([flip]);
+		strictEqual(
+			result.authenticated,
+			false,
+			"read-only report must take the first isAuthenticated() answer, never re-check",
+		);
+	});
+
+	it("reports authenticated:false when a provider's check throws, without aborting later providers", () => {
+		// Same fail-soft contract as ensureProvidersAuthenticated: one throwing
+		// check can't take down the whole report.
+		const throwing = {
+			name: "throwing",
+			isAuthenticated: () => {
+				throw new Error("boom: docker exec failed");
+			},
+		};
+		const healthy = fakeProvider("healthy", { authenticatedSequence: [true] });
+
+		const results = reportProviderStatus([throwing, healthy]);
+
+		deepStrictEqual(results, [
+			{ name: "throwing", authenticated: false },
+			{ name: "healthy", authenticated: true },
+		]);
 	});
 });

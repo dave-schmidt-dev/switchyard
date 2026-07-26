@@ -9,7 +9,9 @@
 		"lint": "biome check .",
 		"deadcode": "knip",
 		"validate": "npm run lint && npm run deadcode && npm run test",
-		"auth": "node src/switchyard/auth/index.mjs"
+		"auth": "node src/switchyard/auth/index.mjs",
+		"auth:check": "node src/switchyard/auth/index.mjs --check",
+		"dispatch": "node src/switchyard/dispatch/index.mjs"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.2",

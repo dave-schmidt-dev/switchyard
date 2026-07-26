@@ -212,6 +212,114 @@ export function provisionCredentials(
 }
 
 /**
+ * Seed a freshly created working container's /project with the host project's
+ * committed tree, so an agent CLI edits real project code and captureDiff()'s
+ * `git diff` has a baseline to diff against. Without this, /project is an
+ * empty, un-initialized volume and every dispatch dead-ends at
+ * "success_no_diff" — the integration gate (INV-2) is never reached.
+ *
+ * INV-1: the tree crosses host->container as an in-memory tar Buffer piped
+ * through `docker cp` — no host path is bind-mounted into the container (same
+ * pattern provisionCredentials uses for credentials). Only the committed HEAD
+ * tree is sent (`git archive HEAD` excludes .git), so no history, no untracked
+ * scratch, and no uncommitted host changes bleed in. INV-3: the seed lives in
+ * the disposable working container and is destroyed when it is wiped.
+ *
+ * The in-container baseline commit gives `git diff` a tree to diff against; its
+ * commit hash need not match the host's — the integration gate applies the
+ * returned diff with `git apply`, which matches context by CONTENT, not blob
+ * hash, so a diff generated against this baseline lands cleanly on the
+ * identical-content host tree.
+ *
+ * @param {string} workingContainerName Destination working container
+ * @param {string} projectPath Host project path; must be a git repo with a
+ *   committed HEAD (the baseline the agent works from)
+ * @throws {Error} if the container name is unsafe, `git archive` fails (e.g. no
+ *   commits yet), or the container-side baseline commit fails — a seed failure
+ *   must abort the run loudly, never silently yield empty "success_no_diff".
+ */
+export function seedProject(workingContainerName, projectPath) {
+	validateIdentifier(workingContainerName, "workingContainerName");
+
+	// git archive HEAD => tar of the committed tree only (no .git), rooted at
+	// the repo top. execFileSync (no shell) returns the tar as a Buffer; the
+	// host path is an argv element, never interpolated into a command string.
+	const tar = execFileSync("git", ["-C", projectPath, "archive", "HEAD"], {
+		maxBuffer: 256 * 1024 * 1024,
+	});
+
+	// Extract that tar INTO /project (the container's isolated named volume);
+	// /project already exists (createWorkingContainer set it as the workdir).
+	execFileSync("docker", ["cp", "-", `${workingContainerName}:/project`], {
+		input: tar,
+		maxBuffer: 256 * 1024 * 1024,
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+
+	// Make /project a git repo whose baseline == the seeded tree so the agent's
+	// edits surface under `git diff`. `git add -A -f` FORCE-adds every extracted
+	// file: `git archive HEAD` faithfully includes files that were force-added
+	// on the host despite matching a `.gitignore` pattern (e.g. a committed
+	// `build/keep.txt` with `build/` ignored), but a plain `git add -A` would
+	// re-honor that `.gitignore` and silently drop them from the baseline —
+	// their later edits would then produce no diff and be lost (INV-2). Only the
+	// archived tracked files are on disk, so `-f` re-adds exactly them, nothing
+	// stray. The script is a constant (no host input interpolated) and runs
+	// inside the container's own `sh` — there is no host shell, and the
+	// container name was already validated above.
+	execFileSync(
+		"docker",
+		[
+			"exec",
+			workingContainerName,
+			"sh",
+			"-c",
+			"cd /project && git init -q && " +
+				"git config user.email seed@switchyard.local && " +
+				"git config user.name switchyard-seed && " +
+				"git add -A -f && git commit -q -m baseline",
+		],
+		{ stdio: "pipe" },
+	);
+}
+
+/**
+ * Commit the working container's current tree so the NEXT task in the queue
+ * diffs against it rather than against the original seed.
+ *
+ * The runner runs a whole task queue through ONE working container. Without
+ * advancing the baseline between tasks, task 2's captureDiff (`git add -A` +
+ * `git diff --cached`) re-emits task 1's still-uncommitted changes on top of
+ * its own, so the host `git apply` rejects task 2 outright (task 1's hunks
+ * already landed on the host). Committing task 1 inside the container isolates
+ * each task's diff to just that task's work.
+ *
+ * Idempotent: a task that changed nothing leaves a clean index, so the commit
+ * is skipped (`git diff --cached --quiet`) rather than failing on "nothing to
+ * commit". INV-1/INV-3: this only ever mutates the disposable container's own
+ * git state — no host path, no bind mount — and is destroyed at wipe. The
+ * container name is validated before any docker call; the script is a constant.
+ *
+ * @param {string} workingContainerName
+ */
+export function commitWorkingTree(workingContainerName) {
+	validateIdentifier(workingContainerName, "workingContainerName");
+	execFileSync(
+		"docker",
+		[
+			"exec",
+			"-w",
+			"/project",
+			workingContainerName,
+			"sh",
+			"-c",
+			"git add -A && (git diff --cached --quiet || git commit -q -m switchyard-task)",
+		],
+		{ stdio: "pipe" },
+	);
+}
+
+/**
  * Wipe working container at project end.
  * INV-3: Working container is wiped at project end
  * @param {string} workingContainerName Working container name

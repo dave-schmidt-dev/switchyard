@@ -1200,6 +1200,13 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			}),
 			recordDispatch: () => {},
 			integrationGate: () => ({ success: true, message: "ok" }),
+			// No-op by default so an auto-create test doesn't invoke the real
+			// docker+git seedProject against TEST_DIR (not a git repo). The
+			// callOrder test below overrides this with a recording spy.
+			seedProject: () => {},
+			// No-op by default for the same reason — the real commitWorkingTree
+			// runs docker+git. The callOrder test overrides it with a spy.
+			commitWorkingTree: () => {},
 			adapters: {
 				claude: {
 					execute: () => ({ success: true, output: "ok" }),
@@ -1266,6 +1273,8 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		const callOrder = [];
 		let capturedProjectPath;
 		let capturedContextContainerName;
+		let seededContainerName;
+		let seededProjectPath;
 
 		const result = runQueue({
 			tasksFilePath: tasksPath,
@@ -1286,6 +1295,15 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					capturedContextContainerName = name;
 					return 1;
 				},
+				seedProject: (name, projectPath) => {
+					callOrder.push("seed");
+					seededContainerName = name;
+					seededProjectPath = projectPath;
+				},
+				commitWorkingTree: (name) => {
+					callOrder.push("commit");
+					capturedContextContainerName = name;
+				},
 				wipeWorkingContainer: (name) => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
@@ -1305,13 +1323,66 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		strictEqual(result.processedTasks, 1);
 		strictEqual(capturedProjectPath, TEST_DIR);
 		strictEqual(capturedContextContainerName, "generated-working-container");
+		// The container it created is the one it seeds, with the project path
+		// (INV-2: the seed is what gives captureDiff a baseline to diff against).
+		strictEqual(seededContainerName, "generated-working-container");
+		strictEqual(seededProjectPath, TEST_DIR);
+		// commit lands after the task's execute (advancing the container baseline
+		// so a following task diffs only against its own work) and before wipe.
 		deepStrictEqual(callOrder, [
 			"ensure",
 			"create",
 			"provision",
+			"seed",
 			"execute:generated-working-container",
+			"commit",
 			"wipe",
 		]);
+	});
+
+	it("commits the working container after EACH task so multi-task diffs stay isolated (INV-2)", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const order = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				...baseDependencies(),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => order.push("commit"),
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => {
+							order.push("execute");
+							return { success: true, output: "ok" };
+						},
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+		// Exactly one commit per task, each immediately after that task's execute
+		// — never batched at the end, which would leave every task diffing the
+		// original seed and re-emitting earlier tasks' hunks.
+		deepStrictEqual(order, ["execute", "commit", "execute", "commit"]);
 	});
 
 	it("runQueue still wipes the working container it created when a task throws mid-queue (INV-3)", () => {
@@ -1348,6 +1419,47 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			wipeCalled,
 			true,
 			"the working container must still be wiped even when the task loop throws",
+		);
+	});
+
+	it("runQueue wipes the working container it created when seedProject throws (INV-3)", () => {
+		// seedProject runs inside the try/finally specifically so a seed failure
+		// (e.g. the project has no committed HEAD to archive) still triggers the
+		// INV-3 wipe rather than leaking the container. If seeding were placed in
+		// the pre-try setup block next to provisionCredentials, this would leak.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let wipeCalled = false;
+
+		throws(() => {
+			runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: {
+					...baseDependencies(),
+					ensureAgentContainer: () => {},
+					createWorkingContainer: () => "generated-working-container",
+					provisionCredentials: () => {},
+					seedProject: () => {
+						throw new Error("seed exploded: project has no commits");
+					},
+					wipeWorkingContainer: () => {
+						wipeCalled = true;
+					},
+				},
+			});
+		}, /seed exploded/);
+
+		strictEqual(
+			wipeCalled,
+			true,
+			"a container created by runQueue must still be wiped when seeding throws",
 		);
 	});
 
@@ -1428,6 +1540,9 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					capturedContextContainerName = name;
 					return 1;
 				},
+				seedProject: () => {
+					callOrder.push("seed");
+				},
 				wipeWorkingContainer: (name) => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
@@ -1453,6 +1568,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"ensure",
 			"create",
 			"provision",
+			"seed",
 			"launch:generated-orchestrator-container",
 			"wipe",
 		]);
@@ -1479,6 +1595,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					ensureAgentContainer: () => {},
 					createWorkingContainer: () => "generated-orchestrator-container",
 					provisionCredentials: () => {},
+					seedProject: () => {},
 					wipeWorkingContainer: () => {
 						wipeCalled = true;
 					},
@@ -1499,5 +1616,59 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			true,
 			"the working container must still be wiped even when the orchestrator task loop throws",
 		);
+	});
+});
+
+describe("runner progress hooks (INV-1: no silent waits)", () => {
+	it("fires onTaskStart before and onResult after each task, in order", () => {
+		// A serial dispatch blocks with no feedback during each multi-minute
+		// provider exec. These hooks are the CLI's feedback path — assert they
+		// fire interleaved (start then result, per task) so the surface can
+		// print a line as each task begins and finishes.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** First operation
+
+### Task 1.2: Second task
+- **Status:** pending
+- **Description:** Second operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				onTaskStart: (task) => events.push(`start:${task.id}`),
+				onResult: (result) =>
+					events.push(`result:${result.taskId}:${result.success}`),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		deepStrictEqual(events, [
+			"start:1.1",
+			"result:1.1:true",
+			"start:1.2",
+			"result:1.2:true",
+		]);
 	});
 });

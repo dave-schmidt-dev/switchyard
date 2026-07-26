@@ -166,9 +166,31 @@ export function captureDiff(workingContainerName) {
 		return null;
 	}
 	try {
+		// Stage first so NEWLY CREATED files are captured too — plain `git diff`
+		// reports only unstaged edits to already-tracked files, so a "write a new
+		// module/test" task (the most common agent output) would otherwise diff
+		// empty, be recorded success_no_diff, and silently lose the work before
+		// the integration gate (INV-2) ever ran. `git add -A` honors the seeded
+		// .gitignore, so agent-created build artifacts / stray .env files are
+		// deliberately left unshipped. `git diff --cached HEAD` then shows the
+		// full change set (new files included) against the seeded baseline.
+		execFileSync(
+			"docker",
+			["exec", "-w", "/project", workingContainerName, "git", "add", "-A"],
+			{ stdio: "pipe" },
+		);
 		const diff = execFileSync(
 			"docker",
-			["exec", "-w", "/project", workingContainerName, "git", "diff"],
+			[
+				"exec",
+				"-w",
+				"/project",
+				workingContainerName,
+				"git",
+				"diff",
+				"--cached",
+				"HEAD",
+			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
 		return diff.trim() || null;

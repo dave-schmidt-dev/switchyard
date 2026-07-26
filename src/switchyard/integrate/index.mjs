@@ -279,7 +279,20 @@ function applyReviewedDiff(diff, projectPath) {
  * @returns {{success: boolean, message: string, requiresReview?: boolean, sensitivePaths?: string[]}} Result
  */
 export function integrationGate(diff, projectPath, options = {}) {
-	const validation = validateDiff(diff, projectPath);
+	// `git apply` requires a newline-terminated patch. Every adapter's
+	// captureDiff() returns `diff.trim()`, and executeTaskWithOrchestrator
+	// trims the orchestrator's diff too — both strip that terminator, so a real
+	// captured diff is otherwise rejected here as "corrupt patch" before a
+	// single edit can reach the host (INV-2). Re-terminate once, at this single
+	// door, so every diff source is covered rather than repeating the fix in
+	// four separate adapters. An empty/whitespace diff is left untouched so
+	// validateDiff still reports it as "empty diff".
+	const patch =
+		typeof diff === "string" && diff.length > 0 && !diff.endsWith("\n")
+			? `${diff}\n`
+			: diff;
+
+	const validation = validateDiff(patch, projectPath);
 	if (!validation.safe) {
 		return {
 			success: false,
@@ -297,7 +310,7 @@ export function integrationGate(diff, projectPath, options = {}) {
 		};
 	}
 
-	if (applyReviewedDiff(diff, projectPath)) {
+	if (applyReviewedDiff(patch, projectPath)) {
 		return { success: true, message: "Diff applied successfully" };
 	}
 

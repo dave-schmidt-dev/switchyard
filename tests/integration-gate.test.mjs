@@ -84,6 +84,59 @@ describe("integration gate", () => {
 		);
 	});
 
+	it("applies a diff whose trailing newline was stripped (captureDiff .trim() regression)", () => {
+		// Regression: every adapter's captureDiff() returns `diff.trim()`, which
+		// strips the trailing newline `git apply` requires — so the real
+		// captureDiff -> integrationGate seam (never exercised together before)
+		// failed with "corrupt patch" and NO edit ever reached the host. The
+		// gate must re-terminate such a patch and still apply it. The unit
+		// fixtures elsewhere use git-produced diffs that keep their newline,
+		// which is exactly why this hole hid.
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
+		});
+		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+
+		const trimmed = diff.trim();
+		ok(
+			!trimmed.endsWith("\n"),
+			"fixture must reproduce captureDiff's stripped-newline shape",
+		);
+
+		const result = integrationGate(trimmed, projectPath);
+		strictEqual(result.success, true, result.message);
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"modified content\n",
+		);
+	});
+
+	it("applies a diff that CREATES a new file, landing it on the host (captureDiff new-file regression)", () => {
+		// captureDiff now stages (`git add -A`) before diffing so newly created
+		// files are captured — the most common agent output. A new-file diff must
+		// pass the gate and actually create the file on the host, trimmed newline
+		// and all (this is the buildStagedDiff shape a real dispatch produces).
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			mkdirSync(join(dir, "src"), { recursive: true });
+			writeFileSync(
+				join(dir, "src", "new-module.txt"),
+				"created by agent\n",
+				"utf8",
+			);
+		});
+		ok(diff.includes("new file"), "fixture must be a new-file diff");
+		// Undo the fixture's local creation so the gate is what lands it on host.
+		rmSync(join(projectPath, "src"), { recursive: true, force: true });
+		execSync("git reset -q", { cwd: projectPath, stdio: "pipe" });
+
+		const result = integrationGate(diff.trim(), projectPath);
+		strictEqual(result.success, true, result.message);
+		strictEqual(
+			readFileSync(join(projectPath, "src", "new-module.txt"), "utf8"),
+			"created by agent\n",
+		);
+	});
+
 	it("rejects a diff that escapes the project root, even if git's own check ever changed", () => {
 		const traversalDiff = `diff --git a/../../../etc/switchyard-poc b/../../../etc/switchyard-poc
 new file mode 100644

@@ -1,6 +1,14 @@
 // Auth walkthrough - checks every provider's real credential state and, for
 // any that aren't authenticated, runs its real interactive OAuth login
 // inside the standing agent container so a human can complete it live.
+//
+//   npm run auth           full walkthrough: check, then log in anything unauthed
+//   npm run auth:check     read-only status report — never attempts a login
+//
+// Use --check (npm run auth:check) to just look. It reuses the same
+// isXAuthenticated() checks as the walkthrough, so it can't disagree with what
+// a real dispatch sees, and it never mutates auth state — the safe replacement
+// for hand-rolling a `docker exec ... test -e` credential probe.
 // PW-4: Independent in-container login (subscription, never API keys).
 // TASKS.md Task 24: there is no headless auto-login — every provider's real
 // login step requires a human to complete a browser or device-code OAuth
@@ -138,7 +146,52 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
 	});
 }
 
-function main() {
+/**
+ * Read-only auth status: report each provider's real credential state WITHOUT
+ * attempting any login. This is the "just look" primitive —
+ * ensureProvidersAuthenticated() instead starts an interactive login for
+ * anything unauthenticated, so it can't be used to merely inspect state. A
+ * pure check that never mutates anything is the correct thing to script
+ * against, and the safe replacement for a hand-rolled `docker exec` credential
+ * probe (whose fragility is exactly what a first-class command exists to
+ * avoid). Reuses the same isXAuthenticated() functions the real walkthrough
+ * trusts, so status and login can never disagree.
+ * @param {Array<{name: string, isAuthenticated: () => boolean}>} [providers]
+ * @returns {Array<{name: string, authenticated: boolean}>}
+ */
+export function reportProviderStatus(providers = PROVIDERS) {
+	return providers.map((provider) => {
+		try {
+			return { name: provider.name, authenticated: provider.isAuthenticated() };
+		} catch (error) {
+			// Same fail-soft contract as ensureProvidersAuthenticated: one
+			// provider's check throwing must not abort the report for the rest,
+			// and a check that can't complete is reported as not-authenticated,
+			// never as a crash.
+			console.error(
+				`\n--- ${provider.name}: auth check threw, treating as not authenticated: ${error.message} ---\n`,
+			);
+			return { name: provider.name, authenticated: false };
+		}
+	});
+}
+
+/**
+ * Print the read-only status report and set the exit code (1 if any provider
+ * is unauthenticated, else 0) — no login is ever attempted.
+ */
+function runCheck() {
+	const statuses = reportProviderStatus();
+	console.log("=== Auth status (read-only — no login attempted) ===");
+	for (const status of statuses) {
+		console.log(
+			`${status.name}: ${status.authenticated ? "authenticated" : "NOT AUTHENTICATED"}`,
+		);
+	}
+	process.exitCode = statuses.some((status) => !status.authenticated) ? 1 : 0;
+}
+
+function main(argv = process.argv.slice(2)) {
 	try {
 		ensureAgentContainer();
 	} catch (error) {
@@ -147,6 +200,13 @@ function main() {
 			"The agent container must be built and running before auth can proceed.",
 		);
 		process.exitCode = 1;
+		return;
+	}
+
+	// `--check`: read-only status, never a login. The default (no flag) is the
+	// full walkthrough, which logs in anything unauthenticated.
+	if (argv.includes("--check")) {
+		runCheck();
 		return;
 	}
 
