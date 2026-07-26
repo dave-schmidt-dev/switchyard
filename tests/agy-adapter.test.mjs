@@ -21,6 +21,47 @@ const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-agy-adapter-"));
 const containerName = `switchyard-agy-adapter-${Date.now()}`;
 
+const AGY_MODEL = "Gemini 3.6 Flash (Medium)";
+const AGY_PROMPT = "apply a small change";
+
+// Fake `agy` that ENFORCES the adapter's invocation shape: it exits non-zero
+// unless --new-project, --mode accept-edits, --add-dir /project,
+// --print-timeout 9m, --model <value>, and --print <prompt> are all present
+// and correctly paired (each flag immediately followed by its own value, and
+// --print <prompt> anchored as the final args) — so a dropped or misordered
+// flag turns this test red instead of passing silently, the argv-blind-stub
+// gap Task 19 tracks. agy's prompt arrives as a --print flag value, not
+// stdin (unlike claude/codex), so — unlike the codex stub — this one never
+// drains stdin.
+const AGY_STUB = `#!/bin/sh
+case " $* " in
+  *" --new-project "*) ;;
+  *) echo "stub: executeAgy did not pass --new-project; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --mode accept-edits "*) ;;
+  *) echo "stub: executeAgy did not pass --mode accept-edits; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --add-dir /project "*) ;;
+  *) echo "stub: executeAgy did not pass --add-dir /project; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --print-timeout 9m "*) ;;
+  *) echo "stub: executeAgy did not pass --print-timeout 9m; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --model ${AGY_MODEL} "*) ;;
+  *) echo "stub: executeAgy did not pass --model ${AGY_MODEL}; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --print ${AGY_PROMPT} ") ;;
+  *) echo "stub: executeAgy did not pass --print ${AGY_PROMPT} as the final args; args: $*" >&2; exit 3 ;;
+esac
+echo updated >> test.txt
+echo agy
+`;
+
 describe("agy adapter container execution", () => {
 	before(() => {
 		if (!dockerAvailable) return;
@@ -40,12 +81,18 @@ describe("agy adapter container execution", () => {
 			{ stdio: "pipe" },
 		);
 
-		// agy's prompt arrives as a --print flag value, not stdin (unlike
-		// claude/codex) — the stub doesn't drain stdin since none is sent.
-		execSync(
-			`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho updated >> test.txt\necho agy\n" > /usr/local/bin/agy && chmod +x /usr/local/bin/agy'`,
-			{ stdio: "pipe" },
-		);
+		// Write the arg-checking stub on the host and copy it in (docker cp, not
+		// the /project mount) so the multi-line `case` script survives intact
+		// rather than fighting nested printf/quote escaping. It lands untracked,
+		// so `git diff` (captureDiff) only ever sees the edit to test.txt.
+		const stubPath = join(testRoot, "agy-stub.sh");
+		writeFileSync(stubPath, AGY_STUB, { mode: 0o755 });
+		execSync(`docker cp ${stubPath} ${containerName}:/usr/local/bin/agy`, {
+			stdio: "pipe",
+		});
+		execSync(`docker exec ${containerName} chmod +x /usr/local/bin/agy`, {
+			stdio: "pipe",
+		});
 	});
 
 	after(() => {
@@ -59,11 +106,14 @@ describe("agy adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("executes agy inside working container and captures diff", {
+	it("passes --new-project --mode accept-edits --model and --print <prompt>, and captures the applied diff", {
 		skip: !dockerAvailable,
 	}, () => {
-		const result = executeAgy("apply a small change", containerName, {
-			model: "Gemini 3.6 Flash (Medium)",
+		// The stub exits non-zero unless the required flags, model arg, and
+		// prompt are all present and correctly paired, so a green result here is
+		// itself the assertion that executeAgy sends them.
+		const result = executeAgy(AGY_PROMPT, containerName, {
+			model: AGY_MODEL,
 		});
 		strictEqual(result.success, true, result.error);
 
