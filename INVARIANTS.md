@@ -9,7 +9,7 @@
 > rights to the Mac host. Threat model: **accident-containment, not adversary defense.**
 
 ### INV-1 — Agents have no rights to the Mac host
-area: ["src/switchyard/container/**", "src/switchyard/sandbox/**", "docker/**"]
+area: ["src/switchyard/container/**", "src/switchyard/lifecycle/**", "docker/**"]
 gate_test: tests/no-host-rights.test.mjs
 threshold: 3
 rationale: The whole safety story. Neither the agent container nor the working container mounts the host filesystem, Docker socket, or host credentials. Agents operate only on the working container's copy of the code. A host mount = the agent can nuke the Mac. Provider CLIs authenticate via **independent in-container logins**, not copied host credentials, so no host secret enters the container. Routing is decided **host-side** (the runner reads gradus's snapshot on the host), so the snapshot never enters the container either — the only inbound signal is the per-task assignment (chosen provider/model + task text), a control input that carries no host credentials or paths and confers no power over the host.

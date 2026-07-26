@@ -1,14 +1,14 @@
 # switchyard
 
-A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, Agy, Cursor, with Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes — built on the explicit assumption that any credential or source entering an execution environment may be stolen or disclosed, and confined accordingly.
+A containment-first Node.js dispatcher that routes coding tasks across subscription-backed agent CLIs (Claude, Codex, Agy, Cursor, with Vibe/Copilot on the roadmap) inside disposable, per-provider sandboxes. Threat model: **accident-containment, not adversary defense** — a coding agent that misbehaves (a runaway loop, a destructive command, a confused tool call) is confined to a throwaway container with no rights to the Mac host, rather than treated as a motivated attacker actively engineering an escape. The risk it exists to bound is mishap, not a targeted breakout.
 
-**Status:** Phases 0-5 implemented and test-covered (198/198 `npm test`), but not fully wired end-to-end. Agent/working container lifecycle is wired into the real runner dispatch path (`src/switchyard/lifecycle/index.mjs`, the sole surviving implementation after `sandbox/index.mjs` was deleted) and `npm run validate`'s `deadcode` step is clean. The real remaining gap: working containers are built `FROM alpine:latest` with `--volumes-from` the agent container, but the agent container shares no volumes and the four provider CLIs live only in `AGENT_IMAGE`'s filesystem layers — so a real dispatch's `docker exec` can't find them yet (`TASKS.md` Task 14). All four adapters perform real credential checks via `hasNonTrivialCredential()` in addition to liveness checks (`TASKS.md` Task 15, completed).
+**Status:** Phases 0-5 implemented and test-covered; the full gate (`npm run validate` — lint + dead-code + tests) is green. **Claude dispatch is wired end-to-end and proven live against the real agent image**: working containers are built `FROM ${AGENT_IMAGE}` (this dropped the earlier broken `FROM alpine:latest` + `--volumes-from` design, which shared no filesystem so the provider CLIs were unreachable — `TASKS.md` Task 14), so all four provider CLIs + git resolve on PATH inside them; claude's credentials are provisioned container→container without touching host disk; and `executeClaude` applied a real change that was captured as a `git diff`. All four adapters perform real credential checks via `hasNonTrivialCredential()` alongside liveness checks. The remaining gap is breadth, not depth: credential provisioning into working containers currently covers **claude only** — extending it to codex/agy/cursor, and re-expressing INV-1 around legitimately-provisioned in-container credentials, is `TASKS.md` Task 26.
 
 ## Priorities (in order)
 
-1. **Containment & isolation (security).** The sandbox boundary *is* the product. A hostile in-container workload must never reach the macOS host, the LAN, cloud metadata, the Docker socket, or another provider's environment.
+1. **Containment & isolation (security).** The sandbox boundary *is* the product. A misbehaving in-container workload must never reach the macOS host, the LAN, cloud metadata, the Docker socket, or another provider's environment.
 2. **Correctness of the trust-boundary data plane.** Sanitized allowlist export, quarantined normalized import, and a complete provenance record for every task — the host must never open un-normalized hostile output.
-3. **Adversarial testability.** The boundary is *proven* with canary-credential exfiltration tests (creds escape; host/LAN/metadata do not), not assumed.
+3. **Provable containment.** The boundary is *proven*, not assumed: the INV-1 gate (`tests/no-host-rights.test.mjs`) asserts that neither the standing agent container nor the working container can reach the host filesystem, the Docker socket, or host credentials — containment against a misbehaving agent, verified, not a claim to withstand a targeted attacker.
 4. **Observability & auditability.** Every task records which repository snapshot, base image, provider-credential identity, patch, and validation result belonged to it.
 
 ## Layout
@@ -23,14 +23,14 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `package.json` | Node.js/ESM project config, biome + knip devDependencies. |
 | `biome.json` | Biome linter/formatter config. |
 | `knip.json` | Dead code / unused dependency detection. |
-| `docker/.gitkeep` | Placeholder for Docker image build context. |
+| `docker/Dockerfile` | Agent image build context: installs all four provider CLIs + git onto a pinned base, built to `switchyard-agent:latest` (the image every working container is derived from). |
 | **Source modules** | |
 | `src/switchyard/router/index.mjs` | Provider selection: snapshot-backed spread routing, blind fallback, INV-4 compliance. |
 | `src/switchyard/router/scorer.mjs` | Capacity scoring: FNV-1a hash, mulberry32 PRNG, deterministic jitter. |
 | `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter. |
 | `src/switchyard/roster/classifier.mjs` | Keyword-based task-tier classifier (high/standard/low). |
-| `src/switchyard/container/index.mjs` | Agent container lifecycle (Docker start/stop/exec). Not yet called by the runner (`TASKS.md` Task 9). |
-| `src/switchyard/lifecycle/index.mjs` | Working container lifecycle via Docker-managed volumes — **unused**, not yet wired into the runner. See `TASKS.md` Task 8. |
+| `src/switchyard/container/index.mjs` | Standing **agent** container lifecycle (Docker start/stop/exec). Wired into the runner's dispatch path; its image is the base every working container is built from. |
+| `src/switchyard/lifecycle/index.mjs` | **Working** container lifecycle, wired into the runner's real dispatch path: builds each per-project container `FROM ${AGENT_IMAGE}` on a Docker-managed `/project` volume (no host bind — INV-1), provisions claude credentials container→container, and wipes at project end (INV-3). The sole surviving implementation after `sandbox/index.mjs` was deleted. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, `allowSensitiveManifests`-gated review for build/CI manifests, `git apply` via stdin. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
 | `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateModelArg`) used by all four provider adapters. |
@@ -52,13 +52,15 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `tests/cursor-adapter.test.mjs` | Container-backed Cursor Agent dispatch and diff capture tests. |
 | `tests/cursor-auth.test.mjs` | Same regression shape, plus real-container checks of `isCursorAuthenticated()`'s `cursor-agent status --format json` `isAuthenticated`-boolean signal (positive, negative, missing-binary, and malformed/empty-output fail-closed cases). |
 | `tests/auth-check.test.mjs` | `ensureProvidersAuthenticated` unit tests via injected fake providers (no real Docker needed), including regressions for a provider's `runLogin()`/`isAuthenticated()` throwing without aborting the rest of the walkthrough. |
+| `tests/shell-safety.test.mjs` | Unit tests for the shared `validateIdentifier`/`validateModelArg` shell-interpolation guards used by all four adapters. |
 | `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
 | `tests/ledger.test.mjs` | INV-4 dispatch ledger recording and querying unit tests. |
-| `tests/no-host-rights.test.mjs` | INV-1 gate: host FS, Docker socket, credential isolation (generic Docker behavior — see `TASKS.md` Task 8). |
+| `tests/no-host-rights.test.mjs` | INV-1 gate: exercises the real `createWorkingContainer` and asserts the working container has no host FS mount, no Docker socket, and no host credential paths. |
+| `tests/credential-provision.test.mjs` | Exercises the real `provisionClaudeCredentials` container→container copy with dummy non-secret sentinels: both paths round-trip, an absent source is a clean no-fabrication skip, an unsafe container name is rejected before any docker call. |
 | `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5, adapter-availability filtering, blind fallback. |
 | `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume (atomic writes), stopOnFailure/gate-failure handling, headroom-routing mechanism, orchestrator CLI integration, and orchestrator status/result error guards. |
 | `tests/scorer.test.mjs` | FNV-1a hash, mulberry32 PRNG, and scoring logic unit tests. |
-| `tests/workspace-wipe.test.mjs` | INV-3 gate: working container wipe, agent container persistence (generic Docker behavior — see `TASKS.md` Task 8). |
+| `tests/workspace-wipe.test.mjs` | INV-3 gate: exercises the real `wipeWorkingContainer` — the working container is wiped, the standing agent container survives. |
 
 ## Planning artifacts
 
@@ -108,9 +110,11 @@ For each unauthenticated provider it runs (attached to your terminal, so follow 
 | agy | no explicit subcommand — running it unauthenticated auto-triggers a Google OAuth flow |
 | cursor | `NO_OPEN_BROWSER=1 cursor-agent login` |
 
-A completed login persists to the provider CLI's own credential store inside the standing agent container (which is never wiped, unlike working containers — INV-3), so this is a one-time step per provider, not per task. Exits non-zero if any provider is still unauthenticated when it finishes.
+A completed login persists to the provider CLI's own credential store inside the standing agent container (which is never wiped, unlike working containers — INV-3), so it holds across many tasks — you do not re-authenticate per dispatch. Exits non-zero if any provider is still unauthenticated when it finishes.
 
-This one-time-per-provider guarantee currently only covers the standing agent container itself — working containers (where real dispatches actually run) don't yet share the agent container's provider binaries or credentials (see Task 14 in `TASKS.md`), so a real end-to-end dispatch isn't possible until that's resolved.
+**Caveat: provider OAuth sessions expire (on the order of days), so re-auth is periodic, not truly one-time.** `npm run auth` checks each credential's *presence and substance* (the file exists and isn't a trivial stub), **not** its *liveness* against the provider's API — a real validity check would need an unreliable in-container network round-trip. So an expired-but-still-present token reads as authenticated and `npm run auth` will **skip** re-login for it. When a session has actually expired, force a fresh login directly against the standing agent container — e.g. `docker exec -it switchyard-agent claude auth login` — from a **real terminal** (an interactive `-it` exec needs a TTY, which a non-interactive/piped shell can't allocate).
+
+Working containers (where real dispatches actually run) are built `FROM ${AGENT_IMAGE}`, so they carry the agent container's provider binaries directly (`TASKS.md` Task 14, done). Credentials are provisioned as a separate container→container step: claude's are copied into each working container, so a real end-to-end **claude** dispatch works today (proven live). codex/agy/cursor credentials are not yet provisioned into working containers — extending provisioning to them is `TASKS.md` Task 26.
 
 ### Queue Dispatching and Orchestration
 
@@ -149,4 +153,4 @@ const orchSummary = await runQueueWithOrchestrator({
 - All files self-contained under this directory.
 - Secrets in BWS. Never committed. Provider credentials injected into an execution environment are treated as **already compromised**.
 - Update `HISTORY.md` alongside every meaningful change. Bug entries cite the files touched (`- files: path/a.py, path/b.ts`).
-- Tests verify real behavior — no smoke-only "did it run" checks. Containment claims require adversarial proof.
+- Tests verify real behavior — no smoke-only "did it run" checks. Containment invariants are backed by gate tests that exercise the real boundary against live containers (INV-1's `no-host-rights`, INV-3's `workspace-wipe`), not by assertion alone.
