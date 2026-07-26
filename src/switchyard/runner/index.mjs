@@ -28,6 +28,7 @@ import { integrationGate } from "../integrate/index.mjs";
 import { recordDispatch } from "../ledger/index.mjs";
 import {
 	createWorkingContainer,
+	provisionClaudeCredentials,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
 import { classifyTask } from "../roster/classifier.mjs";
@@ -800,14 +801,19 @@ export function runQueue(options) {
 	} = options;
 
 	// Only stand up containers when the caller hasn't already supplied a
-	// working container — an existing workingContainerName implies the
-	// caller (or an earlier runQueue call) already ensured the agent
-	// container exists when that working container was created (INV-1:
-	// createWorkingContainer's --volumes-from requires it).
+	// working container — an existing workingContainerName implies the caller
+	// (or an earlier runQueue call) already ensured the standing agent
+	// container exists when that working container was created. The agent
+	// container is still required before creating one: createWorkingContainer
+	// builds the working container FROM the agent image, and
+	// provisionClaudeCredentials copies the agent container's credentials into
+	// it (the old --volumes-from coupling is gone — see lifecycle/index.mjs).
 	const ensureAgentContainerFn =
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;
 	const createWorkingContainerFn =
 		dependencies.createWorkingContainer ?? createWorkingContainer;
+	const provisionCredentialsFn =
+		dependencies.provisionCredentials ?? provisionClaudeCredentials;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 
@@ -820,6 +826,19 @@ export function runQueue(options) {
 			throw new Error("runQueue: failed to create working container");
 		}
 		ownsWorkingContainer = true;
+		// Copy the standing agent container's provider credentials into the
+		// fresh working container so an authenticated CLI can actually run
+		// there (INV-1: container→container, no host path; INV-3: discarded
+		// when the working container is wiped). Best-effort — a provider that
+		// isn't logged in simply stays unauthenticated, which the adapter's
+		// own auth check surfaces; it must not abort the whole run.
+		try {
+			provisionCredentialsFn(workingContainerName);
+		} catch (error) {
+			console.error(
+				`runQueue: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+			);
+		}
 	}
 
 	const context = {
@@ -935,6 +954,8 @@ export async function runQueueWithOrchestrator(options) {
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;
 	const createWorkingContainerFn =
 		dependencies.createWorkingContainer ?? createWorkingContainer;
+	const provisionCredentialsFn =
+		dependencies.provisionCredentials ?? provisionClaudeCredentials;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 
@@ -949,6 +970,14 @@ export async function runQueueWithOrchestrator(options) {
 			);
 		}
 		ownsWorkingContainer = true;
+		// Best-effort credential provisioning, same as runQueue — see there.
+		try {
+			provisionCredentialsFn(workingContainerName);
+		} catch (error) {
+			console.error(
+				`runQueueWithOrchestrator: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+			);
+		}
 	}
 
 	const context = {

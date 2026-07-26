@@ -12,11 +12,17 @@ import {
 	workingContainerExists,
 } from "../src/switchyard/lifecycle/index.mjs";
 
-// A distinct test fixture name — never the real AGENT_CONTAINER_NAME — so
-// this test can never touch a developer's actual standing agent container.
-// createWorkingContainer's new optional agentContainerName parameter exists
-// specifically to make this substitution possible.
+// A distinct agent-container fixture — never the real AGENT_CONTAINER_NAME —
+// so this test can never touch a developer's actual standing agent container.
+// createWorkingContainer no longer mounts from it (the --volumes-from coupling
+// is gone), but it stands in here as "the container that must survive a
+// working-container wipe": INV-3 requires wiping a working container to never
+// remove the standing agent container, and the persistence assertions below
+// guard exactly that.
 const TEST_AGENT_CONTAINER = "switchyard-test-agent";
+// The working container is built from this minimal image — see the INV-1 test
+// for why alpine keeps these container tests hermetic.
+const TEST_WORKING_IMAGE = "alpine:latest";
 const TEST_PROJECT_PATH = "/tmp/switchyard-test-project";
 
 describe("workspace wipe", () => {
@@ -52,10 +58,10 @@ describe("workspace wipe", () => {
 		}
 	});
 
-	it("createWorkingContainer creates a real container tied to the agent container", () => {
+	it("createWorkingContainer creates a real container from the given image", () => {
 		workingContainerName = createWorkingContainer(
 			TEST_PROJECT_PATH,
-			TEST_AGENT_CONTAINER,
+			TEST_WORKING_IMAGE,
 		);
 
 		strictEqual(

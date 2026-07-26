@@ -70,6 +70,15 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 
 ### Running Tests and Linting
 
+**Prerequisite — Docker daemon (OrbStack).** The container-backed tests (adapter dispatch, and the INV-1 `no-host-rights` / INV-3 `workspace-wipe` gates) shell out to real `docker run`/`docker exec`, so the daemon must be up or those tests fail with `Command failed: docker run ...`. This project uses **OrbStack** as the Docker runtime (plan decision D-2). If it isn't running, start it before running the suite:
+
+```bash
+open -a OrbStack   # start OrbStack if the daemon isn't already up
+until docker info >/dev/null 2>&1; do sleep 1; done   # wait for readiness
+```
+
+The pure-logic tests (router, roster, classifier, ledger, integration-gate, shell-safety) run without Docker; only the container-backed ones require it.
+
 Execute the full suite of node unit and integration gate tests:
 
 ```bash

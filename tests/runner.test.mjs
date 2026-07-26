@@ -1277,6 +1277,11 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					capturedProjectPath = projectPath;
 					return "generated-working-container";
 				},
+				provisionCredentials: (name) => {
+					callOrder.push("provision");
+					capturedContextContainerName = name;
+					return 1;
+				},
 				wipeWorkingContainer: (name) => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
@@ -1299,6 +1304,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		deepStrictEqual(callOrder, [
 			"ensure",
 			"create",
+			"provision",
 			"execute:generated-working-container",
 			"wipe",
 		]);
@@ -1323,6 +1329,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					...baseDependencies(),
 					ensureAgentContainer: () => {},
 					createWorkingContainer: () => "generated-working-container",
+					provisionCredentials: () => {},
 					wipeWorkingContainer: () => {
 						wipeCalled = true;
 					},
@@ -1412,6 +1419,11 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					capturedProjectPath = projectPath;
 					return "generated-orchestrator-container";
 				},
+				provisionCredentials: (name) => {
+					callOrder.push("provision");
+					capturedContextContainerName = name;
+					return 1;
+				},
 				wipeWorkingContainer: (name) => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
@@ -1436,6 +1448,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		deepStrictEqual(callOrder, [
 			"ensure",
 			"create",
+			"provision",
 			"launch:generated-orchestrator-container",
 			"wipe",
 		]);
@@ -1461,6 +1474,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					integrationGate: () => ({ success: true, message: "ok" }),
 					ensureAgentContainer: () => {},
 					createWorkingContainer: () => "generated-orchestrator-container",
+					provisionCredentials: () => {},
 					wipeWorkingContainer: () => {
 						wipeCalled = true;
 					},

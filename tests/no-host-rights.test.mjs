@@ -5,7 +5,6 @@
 // general" — is caught.
 
 import { strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { after, before, describe, it } from "node:test";
 import {
@@ -14,9 +13,12 @@ import {
 	wipeWorkingContainer,
 } from "../src/switchyard/lifecycle/index.mjs";
 
-// A distinct test fixture name — never the real AGENT_CONTAINER_NAME — so
-// this test can never touch a developer's actual standing agent container.
-const TEST_AGENT_CONTAINER = "switchyard-test-agent-isolation";
+// Build the working container from a minimal, credential-less image so this
+// test stays hermetic (no multi-GB agent image pull) and the host-isolation
+// assertions below hold regardless of what the real agent image contains.
+// createWorkingContainer's second parameter is now the base image, not an
+// agent container to mount from — the old --volumes-from coupling is gone.
+const TEST_WORKING_IMAGE = "alpine:latest";
 const TEST_PROJECT_PATH = "/tmp/switchyard-test-isolation-project";
 
 // Returns true if the path is listable inside the container, false if the
@@ -38,30 +40,15 @@ describe("no host rights", () => {
 	let workingContainerName;
 
 	before(() => {
-		try {
-			execSync(`docker rm -f -v ${TEST_AGENT_CONTAINER}`, { stdio: "pipe" });
-		} catch {
-			// Ignore - fixture may not exist yet
-		}
-		execSync(
-			`docker run -d --name ${TEST_AGENT_CONTAINER} alpine:latest sleep infinity`,
-			{ stdio: "inherit" },
-		);
-
 		workingContainerName = createWorkingContainer(
 			TEST_PROJECT_PATH,
-			TEST_AGENT_CONTAINER,
+			TEST_WORKING_IMAGE,
 		);
 	});
 
 	after(() => {
 		if (workingContainerName) {
 			wipeWorkingContainer(workingContainerName);
-		}
-		try {
-			execSync(`docker rm -f -v ${TEST_AGENT_CONTAINER}`, { stdio: "pipe" });
-		} catch {
-			// Ignore
 		}
 	});
 
