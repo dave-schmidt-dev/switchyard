@@ -80,9 +80,9 @@ export const PROVIDER_CAPABILITIES = Object.freeze({
 	opencode: {
 		capability_class: CAPABILITY_CLASS.high,
 		models: {
-			high: "opencode/deepseek-v4-pro",
-			standard: "opencode/minimax-m3",
-			low: "opencode/deepseek-v4-flash",
+			high: "opencode-go/deepseek-v4-pro",
+			standard: "opencode-go/minimax-m3",
+			low: "opencode-go/deepseek-v4-flash",
 		},
 	},
 });
