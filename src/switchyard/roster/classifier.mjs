@@ -27,35 +27,39 @@ const SECURITY_CRITICAL_KEYWORDS = Object.freeze([
 	"permission",
 	"secret",
 	"security",
+	"vulnerability",
+	"penetration",
 ]);
 
 /**
- * Structural/complexity high-tier keywords. These are general-purpose words
- * ("api", "design", "service") that DO false-match as substrings of unrelated
- * words ("api" in "rapid", "design" in "redesignate"), so they stay on
- * word-boundary matching (see buildKeywordPattern).
+ * Structural/complexity high-tier keywords for major architectural work.
  */
 const STRUCTURAL_TIER_KEYWORDS = Object.freeze([
+	"architecture",
+	"system-design",
+	"cross-cutting",
+	"infrastructure",
+	"scaling",
+	"threat-model",
+	"disaster-recovery",
+]);
+
+/**
+ * Keywords that indicate a standard-tier task (bounded implementation logic).
+ */
+const STANDARD_TIER_KEYWORDS = Object.freeze([
+	"implement",
 	"integration",
 	"migration",
 	"schema",
-	"architecture",
-	"design",
 	"refactor",
-	"complex",
-	"cross-cutting",
 	"database",
+	"sqlite",
+	"store",
+	"persistence",
 	"api",
 	"service",
-	"infrastructure",
-	"performance",
-	"scaling",
-]);
-
-/**
- * Keywords that indicate a standard-tier task.
- */
-const STANDARD_TIER_KEYWORDS = Object.freeze([
+	"session",
 	"review",
 	"test",
 	"fix",

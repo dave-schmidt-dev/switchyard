@@ -9,14 +9,14 @@ import {
 describe("classifier", () => {
 	describe("classifyTask", () => {
 		it("should classify high-tier tasks from keywords", () => {
-			strictEqual(classifyTask("implement integration tests"), "high");
-			strictEqual(classifyTask("database migration schema"), "high");
-			strictEqual(classifyTask("architecture design refactor"), "high");
-			strictEqual(classifyTask("security authentication fix"), "high");
-			strictEqual(classifyTask("performance scaling api"), "high");
+			strictEqual(classifyTask("architecture system-design refactor"), "high");
+			strictEqual(classifyTask("security authentication jwt"), "high");
+			strictEqual(classifyTask("infrastructure scaling threat-model"), "high");
 		});
 
 		it("should classify standard-tier tasks from keywords", () => {
+			strictEqual(classifyTask("database migration schema"), "standard");
+			strictEqual(classifyTask("implement sqlite progress store"), "standard");
 			strictEqual(classifyTask("review the feature"), "standard");
 			strictEqual(classifyTask("fix the bug in endpoint"), "standard");
 			strictEqual(classifyTask("add validation to function"), "standard");
@@ -133,7 +133,7 @@ describe("classifier", () => {
 		});
 
 		it("should be case-insensitive", () => {
-			strictEqual(classifyTask("INTEGRATION work"), "high");
+			strictEqual(classifyTask("ARCHITECTURE work"), "high");
 			strictEqual(classifyTask("FORMAT code"), "low");
 			strictEqual(classifyTask("REVIEW feature"), "standard");
 		});
@@ -147,7 +147,7 @@ describe("classifier", () => {
 	describe("classifyTasks", () => {
 		it("should classify multiple descriptions", () => {
 			const results = classifyTasks([
-				"integration work",
+				"architecture work",
 				"format code",
 				"review feature",
 			]);
