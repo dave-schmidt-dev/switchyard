@@ -162,6 +162,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 			// kill a run that Agy's own flag would otherwise let finish or
 			// time out gracefully.
 			timeout: 900000, // 15 minutes
+			maxBuffer: 64 * 1024 * 1024, // 64 MB
 		});
 
 		return { output: result, success: true };

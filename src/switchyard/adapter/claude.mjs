@@ -148,6 +148,7 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: 900000, // 15 minutes
+			maxBuffer: 64 * 1024 * 1024, // 64 MB
 		});
 
 		return { output: result, success: true };
