@@ -63,6 +63,23 @@ describe("runner queue parsing", () => {
 		strictEqual(tasks[1].status, "in progress");
 	});
 
+	it("parses tasks with Work or unlabelled body sections", () => {
+		const markdown = `
+### Task 2.1: Work section task
+- **Status:** pending
+- **Work:** Do the work steps
+
+### Task 2.2: Raw body task
+- **Status:** pending
+1. Step one
+2. Step two
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 2);
+		strictEqual(tasks[0].description, "Do the work steps");
+		strictEqual(tasks[1].description.includes("Step one"), true);
+	});
+
 	it("returns runnable tasks excluding completed checkpoint IDs", () => {
 		const tasks = [
 			{ id: "1.1", status: "pending" },

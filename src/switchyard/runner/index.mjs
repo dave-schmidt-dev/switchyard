@@ -239,16 +239,18 @@ export function parseTaskQueue(markdown) {
 
 	for (const match of markdown.matchAll(taskBlockRegex)) {
 		const [, id, title, block] = match;
-		const statusMatch = block.match(/- \*\*Status:\*\*\s*(.+)/);
+		const statusMatch = block.match(/- \*\*Status:\*\*\s*(.+)/i);
 		const descriptionMatch = block.match(
-			/- \*\*Description:\*\*\s*([\s\S]*?)(?=\n- \*\*|$)/,
+			/- \*\*(?:Description|Work|Details|Overview):\*\*\s*([\s\S]*?)(?=\n- \*\*|$)/i,
 		);
+
+		const rawDesc = descriptionMatch?.[1] ?? block.replace(/- \*\*Status:\*\*\s*.*/gi, "");
 
 		tasks.push({
 			id: id.trim(),
 			title: title.trim(),
 			status: (statusMatch?.[1] ?? "pending").trim().toLowerCase(),
-			description: (descriptionMatch?.[1] ?? "").trim(),
+			description: rawDesc.trim(),
 		});
 	}
 
