@@ -14,9 +14,17 @@ import {
 	executeCodex,
 } from "../adapter/codex.mjs";
 import {
+	captureDiff as captureCopilotDiff,
+	execute as executeCopilot,
+} from "../adapter/copilot.mjs";
+import {
 	captureDiff as captureCursorDiff,
 	executeCursor,
 } from "../adapter/cursor.mjs";
+import {
+	captureDiff as captureOpencodeDiff,
+	execute as executeOpencode,
+} from "../adapter/opencode.mjs";
 import {
 	AGENT_IMAGE,
 	buildAgentImage,
@@ -872,6 +880,14 @@ export function runQueue(options) {
 			cursor: {
 				execute: executeCursor,
 				captureDiff: captureCursorDiff,
+			},
+			copilot: {
+				execute: executeCopilot,
+				captureDiff: captureCopilotDiff,
+			},
+			opencode: {
+				execute: executeOpencode,
+				captureDiff: captureOpencodeDiff,
 			},
 		},
 		projectPath,

@@ -72,9 +72,17 @@ export const PROVIDER_CAPABILITIES = Object.freeze({
 	copilot: {
 		capability_class: CAPABILITY_CLASS.low,
 		models: {
-			high: "copilot-gpt-4",
-			standard: "copilot-gpt-4",
-			low: "copilot-gpt-3.5",
+			high: "gpt-4o",
+			standard: "gpt-4o",
+			low: "gpt-4o",
+		},
+	},
+	opencode: {
+		capability_class: CAPABILITY_CLASS.standard,
+		models: {
+			high: "mistral-medium-latest",
+			standard: "mistral-medium-latest",
+			low: "mistral-medium-latest",
 		},
 	},
 });

@@ -42,6 +42,20 @@ const PROVIDER_CREDENTIAL_PATHS = [
 		dest: "/root/.gemini/antigravity-cli",
 	},
 	{ src: "/root/.config/cursor/auth.json", dest: "/root/.config/cursor" },
+	{
+		src: "/root/.config/github-copilot/hosts.json",
+		dest: "/root/.config/github-copilot",
+	},
+	{
+		src: "/root/.config/github-copilot/apps.json",
+		dest: "/root/.config/github-copilot",
+	},
+	{ src: "/root/.config/gh/hosts.yml", dest: "/root/.config/gh" },
+	{ src: "/root/.config/opencode/auth.json", dest: "/root/.config/opencode" },
+	{
+		src: "/root/.config/opencode/config.json",
+		dest: "/root/.config/opencode",
+	},
 ];
 
 /**

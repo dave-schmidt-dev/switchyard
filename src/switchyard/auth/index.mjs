@@ -21,7 +21,9 @@ import { execFileSync } from "node:child_process";
 import { isAgyAuthenticated } from "../adapter/agy.mjs";
 import { isClaudeAuthenticated } from "../adapter/claude.mjs";
 import { isCodexAuthenticated } from "../adapter/codex.mjs";
+import { isCopilotAuthenticated } from "../adapter/copilot.mjs";
 import { isCursorAuthenticated } from "../adapter/cursor.mjs";
+import { isOpencodeAuthenticated } from "../adapter/opencode.mjs";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { ensureAgentContainer } from "../runner/index.mjs";
 
@@ -83,6 +85,16 @@ const PROVIDERS = [
 			runInteractiveLogin(["cursor-agent", "login"], {
 				NO_OPEN_BROWSER: "1",
 			}),
+	},
+	{
+		name: "copilot",
+		isAuthenticated: isCopilotAuthenticated,
+		runLogin: () => runInteractiveLogin(["copilot", "auth", "login"]),
+	},
+	{
+		name: "opencode",
+		isAuthenticated: isOpencodeAuthenticated,
+		runLogin: () => runInteractiveLogin(["opencode", "auth", "login"]),
 	},
 ];
 

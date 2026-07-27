@@ -1,5 +1,5 @@
 # Standing agent container image (AGENT_IMAGE, built by buildAgentImage() in
-# src/switchyard/container/index.mjs). Holds the four provider CLIs only —
+# src/switchyard/container/index.mjs). Holds the provider CLIs only —
 # NO project code and NO credentials baked in at build time. Auth happens at
 # runtime via a real interactive OAuth login run once by a human directly
 # against the *running* container (`npm run auth`, see
@@ -131,5 +131,15 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
 # checksum/signature for this artifact.
 RUN curl https://cursor.com/install -fsS | bash \
     && cursor-agent --version
+
+# --- GitHub Copilot CLI ---------------------------------------------------
+# Installed globally via NPM. Invoked by copilot.mjs as `copilot`.
+RUN npm install -g @github/copilot \
+    && copilot --help > /dev/null
+
+# --- OpenCode CLI ---------------------------------------------------------
+# Installed globally via NPM. Invoked by opencode.mjs as `opencode`.
+RUN npm install -g opencode-ai \
+    && opencode --help > /dev/null
 
 WORKDIR /

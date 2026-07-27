@@ -33,7 +33,7 @@ const TEST_WORKING_IMAGE = "alpine:latest";
 const DUMMY_CRED = "dummy-not-a-real-credential";
 const DUMMY_BLEED = "BLEED-must-not-be-copied";
 
-// The five credential FILES provisionCredentials copies, and the dest path
+// The credential FILES provisionCredentials copies, and the dest path
 // each must land at in the working container (mirrors PROVIDER_CREDENTIAL_PATHS
 // in lifecycle/index.mjs — kept here as the independent assertion of record).
 const CREDENTIAL_FILES = [
@@ -42,6 +42,11 @@ const CREDENTIAL_FILES = [
 	"/root/.codex/auth.json",
 	"/root/.gemini/antigravity-cli/antigravity-oauth-token",
 	"/root/.config/cursor/auth.json",
+	"/root/.config/github-copilot/hosts.json",
+	"/root/.config/github-copilot/apps.json",
+	"/root/.config/gh/hosts.yml",
+	"/root/.config/opencode/auth.json",
+	"/root/.config/opencode/config.json",
 ];
 
 // Sibling state that shares each provider's dir but is NOT a credential — it
@@ -51,6 +56,8 @@ const BLEED_FILES = [
 	"/root/.claude/sessions/session.json",
 	"/root/.codex/log/codex.log",
 	"/root/.gemini/antigravity-cli/conversations/conv.db",
+	"/root/.config/github-copilot/logs/copilot.log",
+	"/root/.config/opencode/logs/opencode.log",
 ];
 
 // Seed a fake agent container with dummy credential files AND dummy bleed
@@ -110,11 +117,11 @@ describe("provisionCredentials copies every provider's credential file into the 
 		}
 	});
 
-	it("copies all five credential files and reports the count", () => {
+	it("copies all provider credential files and reports the count", () => {
 		strictEqual(
 			provisionCredentials(working, AGENT),
 			CREDENTIAL_FILES.length,
-			"all five provider credential files should copy",
+			"all provider credential files should copy",
 		);
 	});
 

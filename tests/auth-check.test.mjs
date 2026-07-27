@@ -152,13 +152,15 @@ describe("ensureProvidersAuthenticated", () => {
 		strictEqual(results[1].authenticated, true);
 	});
 
-	it("defaults to the real four adapters when no providers are injected", () => {
-		strictEqual(PROVIDERS.length, 4);
+	it("defaults to the real six adapters when no providers are injected", () => {
+		strictEqual(PROVIDERS.length, 6);
 		deepStrictEqual(PROVIDERS.map((p) => p.name).sort(), [
 			"agy",
 			"claude",
 			"codex",
+			"copilot",
 			"cursor",
+			"opencode",
 		]);
 		for (const provider of PROVIDERS) {
 			strictEqual(typeof provider.isAuthenticated, "function");
