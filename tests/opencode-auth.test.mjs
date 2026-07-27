@@ -91,7 +91,7 @@ describe("isOpencodeAuthenticated credential-validity check (real container)", (
 		skip: !dockerAvailable,
 	}, () => {
 		const containerName = `switchyard-opencode-authcheck-${Date.now()}`;
-		const credPath = "/root/.config/opencode/auth.json";
+		const credPath = "/root/.local/share/opencode/auth.json";
 
 		execSync(
 			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
@@ -110,7 +110,7 @@ describe("isOpencodeAuthenticated credential-validity check (real container)", (
 			);
 
 			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.config/opencode && : > ${credPath}'`,
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.local/share/opencode && : > ${credPath}'`,
 				{ stdio: "pipe" },
 			);
 			strictEqual(

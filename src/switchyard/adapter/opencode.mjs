@@ -3,7 +3,7 @@ import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const OPENCODE_CMD = "opencode";
-const CREDENTIALS_PATH = "/root/.config/opencode/auth.json";
+const CREDENTIALS_PATH = "/root/.local/share/opencode/auth.json";
 const MIN_CREDENTIAL_BYTES = 16;
 
 function hasNonTrivialCredential(containerName) {
