@@ -245,12 +245,14 @@ export function parseTaskQueue(markdown) {
 		);
 
 		const rawDesc = descriptionMatch?.[1] ?? block.replace(/- \*\*Status:\*\*\s*.*/gi, "");
+		const fullPrompt = `### Task ${id.trim()}: ${title.trim()}\n${block.trim()}`;
 
 		tasks.push({
 			id: id.trim(),
 			title: title.trim(),
 			status: (statusMatch?.[1] ?? "pending").trim().toLowerCase(),
 			description: rawDesc.trim(),
+			prompt: fullPrompt,
 		});
 	}
 
@@ -551,7 +553,7 @@ export function executeTask(task, context) {
 		};
 	}
 
-	const prompt = task.description || task.title;
+	const prompt = task.prompt || task.description || task.title;
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routeResult.model ?? undefined,
 	});
@@ -661,7 +663,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			taskId: task.id,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
-			prompt: task.description || task.title,
+			prompt: task.prompt || task.description || task.title,
 			workingContainerName: context.workingContainerName,
 		});
 	} catch (error) {

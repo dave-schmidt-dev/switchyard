@@ -250,7 +250,10 @@ describe("runner orchestration", () => {
 		strictEqual(result.processedTasks, 2);
 		strictEqual(result.completedTaskIds.length, 2);
 		strictEqual(dispatches.length, 2);
-		deepStrictEqual(prompts, ["First operation", "Second operation"]);
+		deepStrictEqual(prompts, [
+			"### Task 1.1: First task\n- **Status:** pending\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Description:** Second operation",
+		]);
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		deepStrictEqual(checkpoint.completedTaskIds, ["1.1", "1.2"]);
@@ -311,7 +314,10 @@ describe("runner orchestration", () => {
 			dependencies,
 		});
 
-		deepStrictEqual(prompts, ["First operation", "Second operation"]);
+		deepStrictEqual(prompts, [
+			"### Task 1.1: First task\n- **Status:** pending\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Description:** Second operation",
+		]);
 	});
 });
 
@@ -530,7 +536,10 @@ describe("runner headless orchestrator mode", () => {
 		);
 		deepStrictEqual(
 			launches.map((payload) => payload.prompt),
-			["First operation", "Second operation"],
+			[
+				"### Task 1.1: First task\n- **Status:** pending\n- **Description:** First operation",
+				"### Task 1.2: Second task\n- **Status:** pending\n- **Description:** Second operation",
+			],
 		);
 		deepStrictEqual(polls, ["running", "done", "done"]);
 
