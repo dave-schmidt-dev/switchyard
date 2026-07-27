@@ -12,9 +12,9 @@ import { join } from "node:path";
 import {
 	CAPABILITY_CLASS,
 	getRightSizedModel,
+	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
-	normalizeProviderName,
 } from "../roster/index.mjs";
 import { computeScore, resolveSeed } from "./scorer.mjs";
 
@@ -196,10 +196,7 @@ export function route(options = {}) {
 		const isCursor = normalizeProviderName(name) === "cursor";
 		const minPercentLeft = isCursor
 			? windows.reduce((sum, w) => sum + w.percent_left, 0) / windows.length
-			: windows.reduce(
-					(min, w) => Math.min(min, w.percent_left),
-					Infinity,
-			  );
+			: windows.reduce((min, w) => Math.min(min, w.percent_left), Infinity);
 
 		if (minPercentLeft < floor) {
 			log.push(

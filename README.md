@@ -59,11 +59,11 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `tests/opencode-adapter.test.mjs` | Container-backed Opencode CLI dispatch and diff capture tests. |
 | `tests/opencode-auth.test.mjs` | Shell-injection guard and credential-validity check for Opencode CLI. |
 | `tests/auth-check.test.mjs` | `ensureProvidersAuthenticated` + `reportProviderStatus` (the read-only `auth:check`) unit tests via injected fake providers (no real Docker needed), including regressions for a provider's `runLogin()`/`isAuthenticated()` throwing without aborting the rest, and that the read-only report never triggers a login. |
-| `tests/shell-safety.test.mjs` | Unit tests for the shared `validateIdentifier`/`validateModelArg` shell-interpolation guards used by all four adapters. |
+| `tests/shell-safety.test.mjs` | Unit tests for the shared `validateIdentifier`/`validateModelArg` shell-interpolation guards used by all six adapters. |
 | `tests/integration-gate.test.mjs` | INV-2 gate: reviewed diff apply, suspicious path rejection. |
 | `tests/ledger.test.mjs` | INV-4 dispatch ledger recording and querying unit tests. |
 | `tests/no-host-rights.test.mjs` | INV-1 gate: exercises the real `createWorkingContainer` and asserts the working container has no host FS mount, no Docker socket, and no host credential paths. |
-| `tests/credential-provision.test.mjs` | Exercises the real `provisionCredentials` container→container copy for all four providers with dummy non-secret sentinels: every credential file round-trips to its correct path, sibling conversation/project state does **not** bleed into the working container (cred-bleed regression), an absent source is a clean no-fabrication skip, and an unsafe container name is rejected before any docker call. |
+| `tests/credential-provision.test.mjs` | Exercises the real `provisionCredentials` container→container copy for all six providers with dummy non-secret sentinels: every credential file round-trips to its correct path, sibling conversation/project state does **not** bleed into the working container (cred-bleed regression), an absent source is a clean no-fabrication skip, and an unsafe container name is rejected before any docker call. |
 | `tests/project-seed.test.mjs` | Exercises the real `seedProject`/`commitWorkingTree` against a live working container: the host committed tree (incl. nested and force-added-ignored files) reproduces inside `/project` with a clean single-commit baseline, a newly created file surfaces in the staged capture (finding #1), and committing between tasks isolates the next task's diff (finding #3). Identifier-validation cases always run without Docker. |
 | `tests/router.test.mjs` | INV-4 + CR-2/CR-3 regression: spread, exhaust skip, absent tolerance, INV-5, adapter-availability filtering, blind fallback. |
 | `tests/runner.test.mjs` | Queue parsing, serial dispatch, checkpoint/resume (atomic writes), stopOnFailure/gate-failure handling, headroom-routing mechanism, seed/commit/wipe lifecycle wiring + call order, per-task commit for multi-task isolation, progress hooks, orchestrator CLI integration, and orchestrator status/result error guards. |
@@ -129,7 +129,7 @@ Working containers (where real dispatches actually run) are built `FROM ${AGENT_
 
 ### Queue Dispatching and Orchestration
 
-The host-side runner parses markdown task queues and dispatches tasks serially through the router, adapters, and integration gate. It seeds a working container from the project's committed tree, routes each task by usage headroom, runs the provider CLI headless inside the container, returns the diff to the host only through the reviewed integration gate (INV-2), commits the container baseline between tasks, and wipes the container at the end (INV-3).
+The host-side runner parses markdown task queues and dispatches tasks serially through the router, adapters, and integration gate. It seeds a working container from the project's committed tree, routes each task by usage headroom, runs the provider CLI headless inside the container, returns the diff to the host only through the reviewed integration gate (INV-2), commits the container baseline between tasks, and wipes the container at the end (INV-3). All six container adapters execute commands with a 30-minute execution timeout (`1,800,000` ms) and 128 MB `maxBuffer` to prevent ENOBUFS errors and premature process termination on complex tasks.
 
 The thin CLI wraps `runQueue` for standalone use (the `--project` must be a git repo — its committed HEAD seeds each working container):
 

@@ -244,7 +244,8 @@ export function parseTaskQueue(markdown) {
 			/- \*\*(?:Description|Work|Details|Overview):\*\*\s*([\s\S]*?)(?=\n- \*\*|$)/i,
 		);
 
-		const rawDesc = descriptionMatch?.[1] ?? block.replace(/- \*\*Status:\*\*\s*.*/gi, "");
+		const rawDesc =
+			descriptionMatch?.[1] ?? block.replace(/- \*\*Status:\*\*\s*.*/gi, "");
 		const fullPrompt = `### Task ${id.trim()}: ${title.trim()}\n${block.trim()}`;
 
 		tasks.push({
