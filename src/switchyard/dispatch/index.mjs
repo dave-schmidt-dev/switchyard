@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Thin dispatch CLI over runQueue: farm a task queue across the funded
 // providers instead of running every task on one. Host-side routing picks a
 // provider by usage headroom (INV-4/5); each task then runs headless inside a
@@ -22,8 +23,9 @@
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --help                 Show this help.
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { runQueue } from "../runner/index.mjs";
 
@@ -168,7 +170,7 @@ function main(argv) {
 	dispatch(opts);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
 	try {
 		main(process.argv.slice(2));
 	} catch (error) {
