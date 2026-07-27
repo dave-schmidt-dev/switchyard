@@ -14,6 +14,7 @@ import {
 	getRightSizedModel,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
+	normalizeProviderName,
 } from "../roster/index.mjs";
 import { computeScore, resolveSeed } from "./scorer.mjs";
 
@@ -113,8 +114,11 @@ export function route(options = {}) {
 
 	// Default tier is high for conservative routing (unknown tier => high-capability only)
 	const effectiveTier = tier ?? CAPABILITY_CLASS.high;
-	const isAvailable = (name) =>
-		!availableProviders || availableProviders.includes(name);
+	const isAvailable = (name) => {
+		if (!availableProviders) return true;
+		const norm = normalizeProviderName(name);
+		return availableProviders.some((p) => normalizeProviderName(p) === norm);
+	};
 
 	// Read snapshot host-side (WR-1)
 	const snapshot = readSnapshot();

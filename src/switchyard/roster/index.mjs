@@ -88,12 +88,29 @@ export const PROVIDER_CAPABILITIES = Object.freeze({
 });
 
 /**
+ * Normalize provider display names (e.g. "OpenCode Go", "Antigravity", "Codex") to canonical harness keys.
+ * @param {string} name
+ * @returns {string}
+ */
+export function normalizeProviderName(name) {
+	if (!name) return "";
+	const lower = name.toLowerCase().trim();
+	if (lower.includes("opencode")) return "opencode";
+	if (lower.includes("antigravity") || lower === "agy") return "agy";
+	if (lower.includes("cursor")) return "cursor";
+	if (lower.includes("claude")) return "claude";
+	if (lower.includes("codex")) return "codex";
+	if (lower.includes("copilot")) return "copilot";
+	return lower;
+}
+
+/**
  * Get the capability class for a provider.
  * @param {string} providerName
  * @returns {string|null} capability class or null if unknown
  */
 export function getCapabilityClass(providerName) {
-	const provider = PROVIDER_CAPABILITIES[providerName?.toLowerCase()];
+	const provider = PROVIDER_CAPABILITIES[normalizeProviderName(providerName)];
 	return provider?.capability_class ?? null;
 }
 
@@ -104,7 +121,7 @@ export function getCapabilityClass(providerName) {
  * @returns {string|null} model name or null if not found
  */
 export function getModelForTier(providerName, tier) {
-	const provider = PROVIDER_CAPABILITIES[providerName?.toLowerCase()];
+	const provider = PROVIDER_CAPABILITIES[normalizeProviderName(providerName)];
 	return provider?.models?.[tier] ?? null;
 }
 
