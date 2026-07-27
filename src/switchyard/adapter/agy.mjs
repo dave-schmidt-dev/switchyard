@@ -161,8 +161,8 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 			// primary timeout mechanism. A shorter host timeout would force-
 			// kill a run that Agy's own flag would otherwise let finish or
 			// time out gracefully.
-			timeout: 900000, // 15 minutes
-			maxBuffer: 64 * 1024 * 1024, // 64 MB
+			timeout: 1800000, // 30 minutes
+			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
 		return { output: result, success: true };

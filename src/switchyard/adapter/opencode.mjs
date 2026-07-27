@@ -68,8 +68,8 @@ export function execute(prompt, workingContainerName, options = {}) {
 			input: prompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
-			timeout: 900000, // 15 minutes
-			maxBuffer: 64 * 1024 * 1024, // 64 MB
+			timeout: 1800000, // 30 minutes
+			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
 		return { output: result, success: true };
