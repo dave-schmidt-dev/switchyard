@@ -191,12 +191,15 @@ export function route(options = {}) {
 		}
 
 		// Health = MIN across valid windows (worst window vetoes).
-		// Task 10: reduce instead of Math.min(...spread) — an oversized windows
-		// array (tens of thousands of entries) would blow the call stack.
-		const minPercentLeft = windows.reduce(
-			(min, w) => Math.min(min, w.percent_left),
-			Infinity,
-		);
+		// Exception for Cursor: auto/composer usage shifts to API once exhausted, so Cursor's
+		// buckets (ac/ap) are pooled into a single combined average headroom.
+		const isCursor = normalizeProviderName(name) === "cursor";
+		const minPercentLeft = isCursor
+			? windows.reduce((sum, w) => sum + w.percent_left, 0) / windows.length
+			: windows.reduce(
+					(min, w) => Math.min(min, w.percent_left),
+					Infinity,
+			  );
 
 		if (minPercentLeft < floor) {
 			log.push(

@@ -205,6 +205,23 @@ describe("router", () => {
 		);
 	});
 
+	it("pools Cursor auto and API buckets into one combined average headroom pool", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ percent_left: 4.66, pace_delta: -0.4 },
+					{ percent_left: 81.82, pace_delta: 0.2 },
+				],
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(result.provider, "cursor");
+		strictEqual(Math.round(result.percentLeft), 43);
+	});
+
 	it("should spread to provider with most headroom", () => {
 		createTestSnapshot([
 			{
