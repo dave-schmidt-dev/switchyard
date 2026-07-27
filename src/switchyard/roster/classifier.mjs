@@ -32,9 +32,17 @@ const SECURITY_CRITICAL_KEYWORDS = Object.freeze([
 ]);
 
 /**
- * Structural/complexity high-tier keywords for major architectural work.
+ * High-tier tasks requiring flagship reasoning models: debugging, root-cause investigation, planning, architecture.
  */
 const STRUCTURAL_TIER_KEYWORDS = Object.freeze([
+	"debug",
+	"debugging",
+	"root-cause",
+	"investigate",
+	"investigation",
+	"troubleshoot",
+	"plan",
+	"planning",
 	"architecture",
 	"system-design",
 	"cross-cutting",
@@ -45,10 +53,13 @@ const STRUCTURAL_TIER_KEYWORDS = Object.freeze([
 ]);
 
 /**
- * Keywords that indicate a standard-tier task (bounded implementation logic).
+ * Keywords that indicate a standard-tier task (bounded implementation & feature work).
  */
 const STANDARD_TIER_KEYWORDS = Object.freeze([
 	"implement",
+	"implementation",
+	"build",
+	"code",
 	"integration",
 	"migration",
 	"schema",
@@ -59,7 +70,6 @@ const STANDARD_TIER_KEYWORDS = Object.freeze([
 	"persistence",
 	"api",
 	"service",
-	"session",
 	"review",
 	"test",
 	"fix",
@@ -72,7 +82,6 @@ const STANDARD_TIER_KEYWORDS = Object.freeze([
 	"component",
 	"validation",
 	"optimization",
-	"debug",
 ]);
 
 /**

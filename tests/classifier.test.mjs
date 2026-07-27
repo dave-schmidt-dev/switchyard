@@ -9,15 +9,17 @@ import {
 describe("classifier", () => {
 	describe("classifyTask", () => {
 		it("should classify high-tier tasks from keywords", () => {
-			strictEqual(classifyTask("architecture system-design refactor"), "high");
+			strictEqual(classifyTask("debug the complex failure"), "high");
+			strictEqual(classifyTask("root-cause investigation"), "high");
+			strictEqual(classifyTask("planning phase spec"), "high");
+			strictEqual(classifyTask("architecture system-design"), "high");
 			strictEqual(classifyTask("security authentication jwt"), "high");
-			strictEqual(classifyTask("infrastructure scaling threat-model"), "high");
 		});
 
 		it("should classify standard-tier tasks from keywords", () => {
 			strictEqual(classifyTask("database migration schema"), "standard");
 			strictEqual(classifyTask("implement sqlite progress store"), "standard");
-			strictEqual(classifyTask("review the feature"), "standard");
+			strictEqual(classifyTask("build the new feature"), "standard");
 			strictEqual(classifyTask("fix the bug in endpoint"), "standard");
 			strictEqual(classifyTask("add validation to function"), "standard");
 			strictEqual(classifyTask("optimize the module"), "standard");
