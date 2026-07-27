@@ -57,7 +57,7 @@ describe("classifier", () => {
 				"standard",
 			);
 			strictEqual(
-				classifyTask("debug the flaky test and document the fix"),
+				classifyTask("resolve the flaky test and document the fix"),
 				"standard",
 			);
 		});

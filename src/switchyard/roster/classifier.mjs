@@ -59,7 +59,6 @@ const STANDARD_TIER_KEYWORDS = Object.freeze([
 	"implement",
 	"implementation",
 	"build",
-	"code",
 	"integration",
 	"migration",
 	"schema",
