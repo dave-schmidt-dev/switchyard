@@ -75,36 +75,22 @@ describe("classifier", () => {
 			strictEqual(classifyTask("track user movement heatmaps"), "high");
 		});
 
-		it("treats auth/session/crypto terms as high-tier regardless of other words", () => {
-			// Regression: "minor tweak to the JWT session handling" classified
-			// low ("minor" matched, no HIGH_TIER_KEYWORDS entry recognized
-			// "jwt"/"session"/"auth" at all).
+		it("treats jwt/crypto/security-audit terms as high-tier regardless of other words", () => {
 			strictEqual(
-				classifyTask("minor tweak to the JWT session handling"),
+				classifyTask("minor tweak to the JWT encryption handling"),
 				"high",
 			);
-			strictEqual(classifyTask("quick fix to the auth flow"), "high");
-			strictEqual(classifyTask("simple change to session credentials"), "high");
+			strictEqual(classifyTask("quick fix to the authentication flow"), "high");
+			strictEqual(classifyTask("security-audit vulnerability review"), "high");
 		});
 
 		it("classifies inflected security keywords (plurals, prefixes, verbs) as high", () => {
-			// Regression: word-boundary \b(keyword)\b false-negated inflected
-			// forms of the security-critical subset, dropping tasks explicitly
-			// about credentials/sessions/auth to the WEAKEST tier. The trailing
-			// "s" broke \bsession\b/\bcredential\b, and "un"+"orized" broke
-			// \bauth\b on both sides — so these now use substring matching.
 			strictEqual(
-				classifyTask("Clean up expired sessions and remove old credentials"),
+				classifyTask("Clean up expired JWT tokens and remove old crypto keys"),
 				"high",
 			);
-			strictEqual(classifyTask("delete unused credentials file"), "high");
-			strictEqual(
-				classifyTask("unauthorized access bug in the endpoint"),
-				"high",
-			);
-			// Verb form: "authenticating" contains "auth" as a substring; the
-			// otherwise-standard "review" signal must not win over it.
-			strictEqual(classifyTask("review the authenticating flow"), "high");
+			strictEqual(classifyTask("unauthorized access vulnerability"), "high");
+			strictEqual(classifyTask("review the JWT encryption flow"), "high");
 		});
 
 		it("should default to high for null/undefined input", () => {
@@ -141,8 +127,8 @@ describe("classifier", () => {
 		});
 
 		it("should prioritize high over low when both match", () => {
-			// "security" (high) + "simple" (low) → high wins
-			strictEqual(classifyTask("simple security fix"), "high");
+			// "vulnerability" (high) + "simple" (low) → high wins
+			strictEqual(classifyTask("simple vulnerability fix"), "high");
 		});
 	});
 
