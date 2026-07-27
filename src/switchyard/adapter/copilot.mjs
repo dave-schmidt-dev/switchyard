@@ -70,7 +70,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 			input: prompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
-			timeout: 300000,
+			timeout: 900000, // 15 minutes
 		});
 
 		return { output: result, success: true };
