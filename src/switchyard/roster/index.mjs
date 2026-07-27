@@ -80,9 +80,9 @@ export const PROVIDER_CAPABILITIES = Object.freeze({
 	opencode: {
 		capability_class: CAPABILITY_CLASS.standard,
 		models: {
-			high: "mistral-medium-latest",
-			standard: "mistral-medium-latest",
-			low: "mistral-medium-latest",
+			high: "mistral/mistral-medium-latest",
+			standard: "mistral/mistral-medium-latest",
+			low: "mistral/mistral-small-latest",
 		},
 	},
 });

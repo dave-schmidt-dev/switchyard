@@ -51,10 +51,13 @@ const PROVIDER_CREDENTIAL_PATHS = [
 		dest: "/root/.config/github-copilot",
 	},
 	{ src: "/root/.config/gh/hosts.yml", dest: "/root/.config/gh" },
-	{ src: "/root/.config/opencode/auth.json", dest: "/root/.config/opencode" },
 	{
-		src: "/root/.config/opencode/config.json",
-		dest: "/root/.config/opencode",
+		src: "/root/.local/share/opencode/auth.json",
+		dest: "/root/.local/share/opencode",
+	},
+	{
+		src: "/root/.local/share/opencode/config.json",
+		dest: "/root/.local/share/opencode",
 	},
 ];
 

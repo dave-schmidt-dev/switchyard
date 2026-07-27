@@ -45,8 +45,8 @@ const CREDENTIAL_FILES = [
 	"/root/.config/github-copilot/hosts.json",
 	"/root/.config/github-copilot/apps.json",
 	"/root/.config/gh/hosts.yml",
-	"/root/.config/opencode/auth.json",
-	"/root/.config/opencode/config.json",
+	"/root/.local/share/opencode/auth.json",
+	"/root/.local/share/opencode/config.json",
 ];
 
 // Sibling state that shares each provider's dir but is NOT a credential — it
@@ -57,7 +57,7 @@ const BLEED_FILES = [
 	"/root/.codex/log/codex.log",
 	"/root/.gemini/antigravity-cli/conversations/conv.db",
 	"/root/.config/github-copilot/logs/copilot.log",
-	"/root/.config/opencode/logs/opencode.log",
+	"/root/.local/share/opencode/logs/opencode.log",
 ];
 
 // Seed a fake agent container with dummy credential files AND dummy bleed
