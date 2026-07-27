@@ -87,6 +87,32 @@ describe("opencode adapter shell injection guard", () => {
 });
 
 describe("isOpencodeAuthenticated credential-validity check (real container)", () => {
+	it("returns false when the binary is absent even with nontrivial auth.json present", {
+		skip: !dockerAvailable,
+	}, () => {
+		const containerName = `switchyard-opencode-binfail-${Date.now()}`;
+		const credPath = "/root/.local/share/opencode/auth.json";
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			execSync(
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.local/share/opencode && printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credPath}'`,
+				{ stdio: "pipe" },
+			);
+
+			strictEqual(
+				isOpencodeAuthenticated(containerName),
+				false,
+				"missing binary must not read as authenticated even with a nontrivial credential present",
+			);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+
 	it("returns false when the credential is withheld/corrupt even though the binary responds", {
 		skip: !dockerAvailable,
 	}, () => {

@@ -87,6 +87,37 @@ describe("copilot adapter shell injection guard", () => {
 });
 
 describe("isCopilotAuthenticated credential-validity check (real container)", () => {
+	it("returns false when the binary is absent even with nontrivial hosts.json and apps.json present", {
+		skip: !dockerAvailable,
+	}, () => {
+		const containerName = `switchyard-copilot-binfail-${Date.now()}`;
+		const appsPath = "/root/.config/github-copilot/apps.json";
+		const hostsPath = "/root/.config/github-copilot/hosts.json";
+
+		execSync(
+			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
+			{ stdio: "pipe" },
+		);
+		try {
+			execSync(
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.config/github-copilot && printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${appsPath}'`,
+				{ stdio: "pipe" },
+			);
+			execSync(
+				`docker exec ${containerName} sh -c 'printf "%s" "{\\"host\\":\\"github.com\\",\\"accessToken\\":\\"gho_fake-token-value-1234567890\\"}" > ${hostsPath}'`,
+				{ stdio: "pipe" },
+			);
+
+			strictEqual(
+				isCopilotAuthenticated(containerName),
+				false,
+				"missing binary must not read as authenticated even with nontrivial credentials present",
+			);
+		} finally {
+			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
+		}
+	});
+
 	it("returns false when the credential is withheld/corrupt even though the binary responds", {
 		skip: !dockerAvailable,
 	}, () => {

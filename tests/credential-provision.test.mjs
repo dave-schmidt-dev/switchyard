@@ -218,3 +218,151 @@ describe("provisionCredentials rejects unsafe identifiers before any docker call
 		);
 	});
 });
+
+describe("provisionCredentials handles partial credential sets", () => {
+	const PROJECT = "/tmp/switchyard-test-cred-partial-project";
+
+	it("copies only hosts.json when apps.json is missing (Copilot)", () => {
+		const agentName = `switchyard-test-cred-partial-copilot-h-${Date.now()}`;
+		let working;
+		try {
+			execSync(
+				`docker run -d --name ${agentName} ${TEST_WORKING_IMAGE} sleep infinity`,
+				{ stdio: "inherit" },
+			);
+			execSync(
+				`docker exec ${agentName} sh -c 'mkdir -p /root/.config/github-copilot && printf %s "${DUMMY_CRED}" > /root/.config/github-copilot/hosts.json'`,
+				{ stdio: "inherit" },
+			);
+			working = createWorkingContainer(PROJECT, TEST_WORKING_IMAGE);
+			strictEqual(
+				provisionCredentials(working, agentName),
+				1,
+				"only hosts.json should be copied",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.config/github-copilot/hosts.json"),
+				true,
+				"hosts.json must land in the working container",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.config/github-copilot/apps.json"),
+				false,
+				"apps.json must NOT be fabricated when absent from source",
+			);
+		} finally {
+			if (working) wipeWorkingContainer(working);
+			try {
+				execSync(`docker rm -f -v ${agentName}`, { stdio: "pipe" });
+			} catch {}
+		}
+	});
+
+	it("copies only apps.json when hosts.json is missing (Copilot inverted)", () => {
+		const agentName = `switchyard-test-cred-partial-copilot-a-${Date.now()}`;
+		let working;
+		try {
+			execSync(
+				`docker run -d --name ${agentName} ${TEST_WORKING_IMAGE} sleep infinity`,
+				{ stdio: "inherit" },
+			);
+			execSync(
+				`docker exec ${agentName} sh -c 'mkdir -p /root/.config/github-copilot && printf %s "${DUMMY_CRED}" > /root/.config/github-copilot/apps.json'`,
+				{ stdio: "inherit" },
+			);
+			working = createWorkingContainer(PROJECT, TEST_WORKING_IMAGE);
+			strictEqual(
+				provisionCredentials(working, agentName),
+				1,
+				"only apps.json should be copied",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.config/github-copilot/apps.json"),
+				true,
+				"apps.json must land in the working container",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.config/github-copilot/hosts.json"),
+				false,
+				"hosts.json must NOT be fabricated when absent from source",
+			);
+		} finally {
+			if (working) wipeWorkingContainer(working);
+			try {
+				execSync(`docker rm -f -v ${agentName}`, { stdio: "pipe" });
+			} catch {}
+		}
+	});
+
+	it("copies only auth.json when config.json is missing (Opencode)", () => {
+		const agentName = `switchyard-test-cred-partial-oc-auth-${Date.now()}`;
+		let working;
+		try {
+			execSync(
+				`docker run -d --name ${agentName} ${TEST_WORKING_IMAGE} sleep infinity`,
+				{ stdio: "inherit" },
+			);
+			execSync(
+				`docker exec ${agentName} sh -c 'mkdir -p /root/.local/share/opencode && printf %s "${DUMMY_CRED}" > /root/.local/share/opencode/auth.json'`,
+				{ stdio: "inherit" },
+			);
+			working = createWorkingContainer(PROJECT, TEST_WORKING_IMAGE);
+			strictEqual(
+				provisionCredentials(working, agentName),
+				1,
+				"only auth.json should be copied",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.local/share/opencode/auth.json"),
+				true,
+				"auth.json must land in the working container",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.local/share/opencode/config.json"),
+				false,
+				"config.json must NOT be fabricated when absent from source",
+			);
+		} finally {
+			if (working) wipeWorkingContainer(working);
+			try {
+				execSync(`docker rm -f -v ${agentName}`, { stdio: "pipe" });
+			} catch {}
+		}
+	});
+
+	it("copies only config.json when auth.json is missing (Opencode inverted)", () => {
+		const agentName = `switchyard-test-cred-partial-oc-cfg-${Date.now()}`;
+		let working;
+		try {
+			execSync(
+				`docker run -d --name ${agentName} ${TEST_WORKING_IMAGE} sleep infinity`,
+				{ stdio: "inherit" },
+			);
+			execSync(
+				`docker exec ${agentName} sh -c 'mkdir -p /root/.local/share/opencode && printf %s "${DUMMY_CRED}" > /root/.local/share/opencode/config.json'`,
+				{ stdio: "inherit" },
+			);
+			working = createWorkingContainer(PROJECT, TEST_WORKING_IMAGE);
+			strictEqual(
+				provisionCredentials(working, agentName),
+				1,
+				"only config.json should be copied",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.local/share/opencode/config.json"),
+				true,
+				"config.json must land in the working container",
+			);
+			strictEqual(
+				existsInContainer(working, "/root/.local/share/opencode/auth.json"),
+				false,
+				"auth.json must NOT be fabricated when absent from source",
+			);
+		} finally {
+			if (working) wipeWorkingContainer(working);
+			try {
+				execSync(`docker rm -f -v ${agentName}`, { stdio: "pipe" });
+			} catch {}
+		}
+	});
+});

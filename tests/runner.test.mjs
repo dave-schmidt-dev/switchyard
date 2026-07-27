@@ -197,6 +197,121 @@ describe("runner queue parsing", () => {
 			/duplicate task id "1\.1"/,
 		);
 	});
+
+	it("extracts requiredPaths from a Files: field", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: File task
+- **Status:** pending
+- **Files:** src/a.mjs, tests/a.test.mjs
+- **Description:** Do things with files
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs", "tests/a.test.mjs"]);
+	});
+
+	it("sets requiredPaths to null when no Files: field is present", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Simple task
+- **Status:** pending
+- **Description:** Do things
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].requiredPaths, null);
+	});
+
+	it("rejects a Files: field with an absolute path", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** /etc/passwd
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /absolute path/);
+	});
+
+	it("rejects a Files: field with '..' traversal", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** ../outside/evil.mjs
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /path traversal/);
+	});
+
+	it("rejects a Files: field with a wildcard", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** src/*.mjs
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /wildcards/);
+	});
+
+	it("rejects an empty Files: field (no paths)", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:**   	
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /empty/);
+	});
+
+	it("rejects a Files: field with backslash separators", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** src\\evil.mjs
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /backslash/);
+	});
+
+	it("rejects a Files: field with directory-only entries", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** src/
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /directory-only/);
+	});
+
+	it("rejects a Files: field with duplicate paths", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** src/a.mjs, src/a.mjs
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /duplicate/);
+	});
+
+	it("ignores prose-embedded Files: mentions and only matches - **Files:** lines", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: File task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** This mentions Files: but without the bullet anchor
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs"]);
+	});
 });
 
 describe("runner orchestration", () => {
@@ -1569,6 +1684,9 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 				seedProject: () => {
 					callOrder.push("seed");
 				},
+				commitWorkingTree: () => {
+					callOrder.push("commit");
+				},
 				wipeWorkingContainer: (name) => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
@@ -1596,6 +1714,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"provision",
 			"seed",
 			"launch:generated-orchestrator-container",
+			"commit",
 			"wipe",
 		]);
 	});
@@ -1641,6 +1760,471 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			wipeCalled,
 			true,
 			"the working container must still be wiped even when the orchestrator task loop throws",
+		);
+	});
+});
+
+describe("runner commit/reset behavior (Task 3.2)", () => {
+	it("commits only after successful tasks, not after failed ones", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+
+### Task 1.3: Third
+- **Status:** pending
+- **Description:** third task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const commits = [];
+		const resets = [];
+		let gateCalls = 0;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => {
+					gateCalls += 1;
+					if (gateCalls === 2) {
+						return { success: false, message: "rejected" };
+					}
+					return { success: true, message: "ok" };
+				},
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => commits.push(true),
+				resetWorkingTree: () => resets.push(true),
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 3);
+		deepStrictEqual(
+			result.results.map((r) => r.result),
+			["success", "integration_failed", "success"],
+		);
+		strictEqual(commits.length, 2, "commit called after tasks 1 and 3 only");
+		strictEqual(resets.length, 1, "reset called after failed task 2");
+	});
+
+	it("resets rejected state before continuing when stopOnFailure is false", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const commits = [];
+		const resets = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => commits.push(true),
+				resetWorkingTree: () => resets.push(true),
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+		strictEqual(commits.length, 0, "commit never called for failed tasks");
+		strictEqual(resets.length, 2, "reset called after each failed task");
+	});
+
+	it("does not reset when stopOnFailure is true", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const commits = [];
+		const resets = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: true,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => commits.push(true),
+				resetWorkingTree: () => resets.push(true),
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1, "stopped after first failure");
+		strictEqual(commits.length, 0);
+		strictEqual(
+			resets.length,
+			0,
+			"reset not called when stopOnFailure is true",
+		);
+	});
+
+	it("does not reset when working container is caller-supplied", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const commits = [];
+		const resets = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "caller-supplied",
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+				commitWorkingTree: () => commits.push(true),
+				resetWorkingTree: () => resets.push(true),
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(commits.length, 0);
+		strictEqual(
+			resets.length,
+			0,
+			"reset not called when container is caller-supplied",
+		);
+	});
+
+	it("orchestrator path: commits only after success, resets on failure with continuation", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Failing
+- **Status:** pending
+- **Description:** second task
+
+### Task 1.3: Third
+- **Status:** pending
+- **Description:** third task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const commits = [];
+		const resets = [];
+		let launchIndex = 0;
+		let gateCalls = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => {
+					gateCalls += 1;
+					if (gateCalls === 2) {
+						return { success: false, message: "rejected" };
+					}
+					return { success: true, message: "ok" };
+				},
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => commits.push(true),
+				resetWorkingTree: () => resets.push(true),
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => {
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 3);
+		deepStrictEqual(
+			result.results.map((r) => r.result),
+			["success", "integration_failed", "success"],
+		);
+		strictEqual(
+			commits.length,
+			2,
+			"orchestrator: commit called after tasks 1 and 3 only",
+		);
+		strictEqual(
+			resets.length,
+			1,
+			"orchestrator: reset called after failed task 2",
+		);
+	});
+
+	it("orchestrator path: does not reset when stopOnFailure is true", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const resets = [];
+		let launchIndex = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: true,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => resets.push(true),
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => {
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1, "stopped after first failure");
+		strictEqual(
+			resets.length,
+			0,
+			"orchestrator: reset not called when stopOnFailure is true",
+		);
+	});
+
+	it("orchestrator path: does not reset when working container is caller-supplied", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const resets = [];
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "caller-supplied",
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => resets.push(true),
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(
+			resets.length,
+			0,
+			"orchestrator: reset not called when container is caller-supplied",
+		);
+	});
+	it("orchestrator path: resets when result returns success=false (execution_failed) with continuation", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const resets = [];
+		let launchIndex = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => resets.push(true),
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => {
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: false,
+						error: "execution_failed",
+					}),
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+		deepStrictEqual(
+			result.results.map((r) => r.result),
+			["execution_failed", "execution_failed"],
+		);
+		strictEqual(
+			resets.length,
+			2,
+			"orchestrator: reset called after each execution_failed",
 		);
 	});
 });
@@ -1698,6 +2282,508 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 		]);
 	});
 
+	it("runner emits task_started, diff_captured, gate_validated, gate_applied, task_completed, checkpoint_saved, and cleanup events via onStatus", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) =>
+					events.push({
+						phase: e.phase,
+						event: e.event,
+						outcome: e.outcome,
+						byteCount: e.byteCount,
+						taskId: e.taskId,
+					}),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-diag-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		const byEvent = {};
+		for (const e of events) {
+			byEvent[e.event] = e;
+		}
+
+		ok(byEvent.container_created, "container_created fired");
+		strictEqual(byEvent.container_created.phase, "bootstrap");
+		ok(byEvent.task_started, "task_started fired");
+		strictEqual(byEvent.task_started.taskId, "1.1");
+		ok(byEvent.diff_captured, "diff_captured fired");
+		strictEqual(byEvent.diff_captured.byteCount, 18);
+		ok(byEvent.gate_validated, "gate_validated fired");
+		strictEqual(byEvent.gate_validated.outcome, "passed");
+		ok(byEvent.gate_applied, "gate_applied fired");
+		ok(byEvent.task_completed, "task_completed fired");
+		strictEqual(byEvent.task_completed.taskId, "1.1");
+		ok(byEvent.checkpoint_saved, "checkpoint_saved fired");
+		ok(byEvent.terminal, "terminal fired");
+		strictEqual(byEvent.terminal.phase, "lifecycle");
+		ok(byEvent.cleanup_started, "cleanup_started fired");
+		ok(byEvent.cleanup_complete, "cleanup_complete fired");
+	});
+
+	it("runner emits task_failed event with error serialization", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing task
+- **Status:** pending
+- **Description:** This will fail
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-diag-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: false,
+							error: "simulated adapter failure",
+						}),
+						captureDiff: () => "",
+					},
+				},
+			},
+		});
+
+		const failed = events.find((e) => e.event === "task_failed");
+		ok(failed, "task_failed event emitted");
+		strictEqual(failed.taskId, "1.1");
+		ok(failed.error, "error field present");
+	});
+
+	it("runner emits gate_validated event with rejected outcome on gate failure", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Gate-failing task
+- **Status:** pending
+- **Description:** This will be rejected
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({
+					success: false,
+					message: "gate rejected diff",
+				}),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-diag-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		const validated = events.find((e) => e.event === "gate_validated");
+		ok(validated, "gate_validated event emitted");
+		strictEqual(validated.outcome, "rejected");
+		ok(
+			!events.find((e) => e.event === "gate_applied"),
+			"gate_applied not emitted on rejection",
+		);
+	});
+
+	it("runner emits checkpoint events (checkpoint_saved) for each task", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-diag-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		const checkpoints = events.filter((e) => e.event === "checkpoint_saved");
+		strictEqual(checkpoints.length, 2);
+		strictEqual(checkpoints[0].taskId, "1.1");
+		strictEqual(checkpoints[1].taskId, "1.2");
+	});
+
+	it("runner emits container_created when it creates a working container", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-diag-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		const created = events.find((e) => e.event === "container_created");
+		ok(created, "container_created event emitted");
+		strictEqual(created.phase, "bootstrap");
+	});
+
+	it("does NOT emit container_created when working container is supplied by caller", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "caller-supplied-container",
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "should-not-be-used",
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(
+			events.find((e) => e.event === "container_created"),
+			undefined,
+			"container_created not emitted for caller-supplied container",
+		);
+	});
+
+	it("onStatus absence: existing behavior unchanged (no new output when hook not provided)", () => {
+		// Regression guard: ensure that when neither onStatus nor diagnostics
+		// is provided, runQueue behaves exactly as before — no errors, no
+		// new side effects.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[0].success, true);
+	});
+
+	it("supports Diagnostics instance via dependencies.diagnostics", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		// Build a minimal diagnostics-like interface inline.
+		const diag = {
+			emit: (e) => events.push(e),
+		};
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				diagnostics: diag,
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		ok(events.length > 0, "diagnostics.emit was called");
+		ok(
+			events.find((e) => e.event === "task_completed"),
+			"task_completed event via diagnostics",
+		);
+	});
+
+	it("cleanup_failed event is emitted when wipe fails", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		throws(() => {
+			runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: {
+					onStatus: (e) => events.push(e),
+					route: () => ({
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 72,
+						reason: "spread",
+					}),
+					recordDispatch: () => {},
+					integrationGate: () => ({ success: true, message: "ok" }),
+					ensureAgentContainer: () => {},
+					createWorkingContainer: () => "generated-diag-container",
+					provisionCredentials: () => 1,
+					seedProject: () => {},
+					commitWorkingTree: () => {},
+					wipeWorkingContainer: () => {
+						throw new Error("wipe exploded");
+					},
+					adapters: {
+						claude: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/a b/a",
+						},
+					},
+				},
+			});
+		}, /wipe exploded/);
+
+		const failed = events.find((e) => e.event === "cleanup_failed");
+		ok(failed, "cleanup_failed event emitted");
+		strictEqual(failed.phase, "cleanup");
+		ok(
+			events.find((e) => e.event === "cleanup_started"),
+			"cleanup_started was emitted first",
+		);
+	});
+
+	it("Diagnostics instance supports multiple sinks via dependencies.diagnostics", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const sinkA = [];
+		const sinkB = [];
+		const d = {
+			_sinks: [],
+			emit(event) {
+				for (const s of this._sinks) s(event);
+			},
+			sink(fn) {
+				this._sinks.push(fn);
+			},
+			removeSink(fn) {
+				this._sinks = this._sinks.filter((s) => s !== fn);
+			},
+		};
+		d.sink((e) => sinkA.push(e));
+		d.sink((e) => sinkB.push(e));
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				diagnostics: d,
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		ok(
+			sinkA.length === sinkB.length,
+			"both sinks received same number of events",
+		);
+		ok(sinkA.length > 0, "sink A received events");
+		deepStrictEqual(
+			sinkA.map((e) => e.event),
+			sinkB.map((e) => e.event),
+		);
+	});
+
 	it("fires onResult with success:false when a task fails", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -1735,5 +2821,377 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 		});
 
 		deepStrictEqual(events, ["start:1.1", "result:1.1:false"]);
+	});
+});
+
+describe("Files requiredPaths propagation", () => {
+	it("executeTask passes requiredPaths to integrationGate", () => {
+		const gateCalls = [];
+		const result = executeTask(
+			{
+				id: "1.1",
+				title: "task",
+				description: "simple cleanup",
+				requiredPaths: ["src/a.mjs", "tests/a.test.mjs"],
+			},
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 50,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: (diff, projectPath, options) => {
+					gateCalls.push({ diff, projectPath, options });
+					return { success: true, message: "ok" };
+				},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.success, true);
+		strictEqual(gateCalls.length, 1);
+		deepStrictEqual(gateCalls[0].options.requiredPaths, [
+			"src/a.mjs",
+			"tests/a.test.mjs",
+		]);
+	});
+
+	it("executeTask passes null requiredPaths to integrationGate when task has none", () => {
+		const gateCalls = [];
+		const result = executeTask(
+			{
+				id: "1.1",
+				title: "task",
+				description: "simple cleanup",
+				requiredPaths: null,
+			},
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 50,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: (diff, projectPath, options) => {
+					gateCalls.push({ diff, projectPath, options });
+					return { success: true, message: "ok" };
+				},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.success, true);
+		strictEqual(gateCalls.length, 1);
+		strictEqual(gateCalls[0].options.requiredPaths, null);
+	});
+
+	it("executeTask calls integrationGate with empty diff when requiredPaths is set (not success_no_diff)", () => {
+		const gateCalls = [];
+		const dispatches = [];
+		const result = executeTask(
+			{
+				id: "1.1",
+				title: "task",
+				description: "simple cleanup",
+				requiredPaths: ["src/f.mjs"],
+			},
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 50,
+					reason: "spread",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				integrationGate: (diff, projectPath, options) => {
+					gateCalls.push({ diff, projectPath, options });
+					return { success: false, message: "empty_required_diff" };
+				},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "",
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.success, false);
+		strictEqual(result.result, "integration_failed");
+		strictEqual(gateCalls.length, 1);
+		strictEqual(gateCalls[0].diff, "");
+		deepStrictEqual(gateCalls[0].options.requiredPaths, ["src/f.mjs"]);
+		strictEqual(dispatches[0].result, "integration_failed");
+	});
+
+	it("executeTaskWithOrchestrator passes requiredPaths to integrationGate", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: File task
+- **Status:** pending
+- **Description:** Simple operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const gateCalls = [];
+
+		await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: (_diff, _projectPath, options) => {
+					gateCalls.push({ options });
+					return { success: true, message: "ok" };
+				},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async (_payload) => {
+						// Inject requiredPaths into the task so the orchestrator
+						// path receives them.
+						return "job-1";
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+				onTaskStart: (task) => {
+					// Simulate parseTaskQueue injecting requiredPaths
+					task.requiredPaths = ["src/a.mjs"];
+				},
+			},
+		});
+
+		strictEqual(gateCalls.length, 1);
+		deepStrictEqual(gateCalls[0].options.requiredPaths, ["src/a.mjs"]);
+	});
+
+	it("executeTaskWithOrchestrator calls gate with empty diff when requiredPaths is set", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: File task
+- **Status:** pending
+- **Description:** Simple operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const gateCalls = [];
+		const dispatches = [];
+
+		await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				integrationGate: (diff, _projectPath, options) => {
+					gateCalls.push({ diff, options });
+					return { success: false, message: "empty_required_diff" };
+				},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: "" }),
+				},
+				onTaskStart: (task) => {
+					task.requiredPaths = ["src/a.mjs"];
+				},
+			},
+		});
+
+		strictEqual(gateCalls.length, 1);
+		strictEqual(gateCalls[0].diff, "");
+		strictEqual(dispatches[0].result, "integration_failed");
+	});
+});
+
+describe("runner runStore dependency", () => {
+	it("calls runStore.updateRun during task execution with activeTaskId", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** First operation
+
+### Task 1.2: Second task
+- **Status:** pending
+- **Description:** Second operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const runStoreCalls = [];
+
+		const runStore = {
+			updateRun: (partial) => {
+				runStoreCalls.push({ ...partial });
+				return Promise.resolve({ revision: 0 });
+			},
+		};
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+				runStore,
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+
+		const taskStartCalls = runStoreCalls.filter(
+			(c) => typeof c.activeTaskId === "string",
+		);
+		strictEqual(taskStartCalls.length, 2);
+		strictEqual(taskStartCalls[0].activeTaskId, "1.1");
+		strictEqual(taskStartCalls[1].activeTaskId, "1.2");
+
+		const emptyCalls = runStoreCalls.filter(
+			(c) => c.activeTaskId === undefined && c.state === undefined,
+		);
+		strictEqual(emptyCalls.length, 2);
+
+		const terminalCall = runStoreCalls.find((c) => c.state !== undefined);
+		ok(terminalCall, "terminal updateRun call present");
+		strictEqual(terminalCall.state, "succeeded");
+		strictEqual(terminalCall.activeTaskId, null);
+		strictEqual(terminalCall.cleanupState, "complete");
+	});
+
+	it("runStore terminal call sets state to failed when tasks fail", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing task
+- **Status:** pending
+- **Description:** This will fail
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const runStoreCalls = [];
+
+		const runStore = {
+			updateRun: (partial) => {
+				runStoreCalls.push({ ...partial });
+				return Promise.resolve({ revision: 0 });
+			},
+		};
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: false, error: "simulated failure" }),
+						captureDiff: () => "",
+					},
+				},
+				runStore,
+			},
+		});
+
+		const terminalCall = runStoreCalls.find((c) => c.state !== undefined);
+		ok(terminalCall, "terminal updateRun call present");
+		strictEqual(terminalCall.state, "failed");
+	});
+
+	it("calls onCheckpointSaved after each checkpoint save", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First task
+- **Status:** pending
+- **Description:** First operation
+
+### Task 1.2: Second task
+- **Status:** pending
+- **Description:** Second operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const checkpoints = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+				onCheckpointSaved: () => checkpoints.push(true),
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+		strictEqual(checkpoints.length, 2);
 	});
 });

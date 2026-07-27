@@ -2,13 +2,21 @@
 // INV-3: Working container is wiped at project end
 // Manages create, credential-provision, wipe operations
 
-import { execFileSync, execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { validateIdentifier } from "../adapter/shell-safety.mjs";
 import { AGENT_CONTAINER_NAME, AGENT_IMAGE } from "../container/index.mjs";
 
 const WORKING_PREFIX = "switchyard-work-";
+
+const LABEL_MANAGED = "com.zerodelta.switchyard.managed=true";
+const LABEL_RUN_ID = "com.zerodelta.switchyard.run_id";
+const LABEL_PROJECT = "com.zerodelta.switchyard.project";
+
+function projectHash(projectPath) {
+	return createHash("sha256").update(projectPath).digest("hex").slice(0, 12);
+}
 
 // Credential FILES copied from the standing agent container into each fresh
 // working container so any of the four authenticated CLIs can actually run
@@ -93,27 +101,114 @@ function generateWorkingContainerName(projectPath) {
  *   hermetic and don't require the agent image to be built.
  * @returns {string|null} Working container name or null on failure
  */
-export function createWorkingContainer(projectPath, image = AGENT_IMAGE) {
+export function createWorkingContainer(
+	projectPath,
+	image = AGENT_IMAGE,
+	options = {},
+) {
 	const containerName = generateWorkingContainerName(projectPath);
+	const { runId, labels: extraLabels = {} } = options;
 
 	try {
 		// Defense-in-depth: `image` is an internal constant today, but it is
-		// interpolated into the execSync command string below, so validate it
+		// passed as an execFileSync argv element below, so validate it
 		// against the same safe-identifier pattern the adapters use.
 		validateIdentifier(image, "image");
 
-		// Isolated named volume for project code (INV-1: no host FS mount).
-		execSync(`docker volume create ${containerName}-vol`, { stdio: "inherit" });
+		if (runId) {
+			const ph = projectHash(projectPath);
+			execFileSync(
+				"docker",
+				[
+					"volume",
+					"create",
+					"--label",
+					LABEL_MANAGED,
+					"--label",
+					`${LABEL_RUN_ID}=${runId}`,
+					"--label",
+					`${LABEL_PROJECT}=${ph}`,
+					`${containerName}-vol`,
+				],
+				{ stdio: "inherit" },
+			);
 
-		// Build the working container FROM the agent image so every provider
-		// CLI + git is on PATH inside it. No --volumes-from: the CLIs come from
-		// the image's own layers, not a shared volume.
-		execSync(
-			`docker run -d --name ${containerName} ` +
-				`-v ${containerName}-vol:/project -w /project ` +
-				`${image} sleep infinity`,
-			{ stdio: "inherit" },
-		);
+			try {
+				const runArgs = [
+					"run",
+					"-d",
+					"--name",
+					containerName,
+					"--label",
+					LABEL_MANAGED,
+					"--label",
+					`${LABEL_RUN_ID}=${runId}`,
+					"--label",
+					`${LABEL_PROJECT}=${ph}`,
+				];
+				for (const [key, value] of Object.entries(extraLabels)) {
+					runArgs.push("--label", `${key}=${value}`);
+				}
+				runArgs.push(
+					"-v",
+					`${containerName}-vol:/project`,
+					"-w",
+					"/project",
+					image,
+					"sleep",
+					"infinity",
+				);
+				execFileSync("docker", runArgs, { stdio: "inherit" });
+			} catch (runError) {
+				try {
+					execFileSync("docker", ["volume", "rm", `${containerName}-vol`], {
+						stdio: "pipe",
+					});
+				} catch {
+					/* best effort */
+				}
+				throw runError;
+			}
+		} else {
+			// Isolated named volume for project code (INV-1: no host FS mount).
+			// containerName is safe-char validated below before any docker call.
+			validateIdentifier(containerName, "containerName");
+			execFileSync("docker", ["volume", "create", `${containerName}-vol`], {
+				stdio: "inherit",
+			});
+
+			// Build the working container FROM the agent image so every provider
+			// CLI + git is on PATH inside it. No --volumes-from: the CLIs come from
+			// the image's own layers, not a shared volume.
+			try {
+				execFileSync(
+					"docker",
+					[
+						"run",
+						"-d",
+						"--name",
+						containerName,
+						"-v",
+						`${containerName}-vol:/project`,
+						"-w",
+						"/project",
+						image,
+						"sleep",
+						"infinity",
+					],
+					{ stdio: "inherit" },
+				);
+			} catch (runError) {
+				try {
+					execFileSync("docker", ["volume", "rm", `${containerName}-vol`], {
+						stdio: "pipe",
+					});
+				} catch {
+					/* best effort */
+				}
+				throw runError;
+			}
+		}
 
 		return containerName;
 	} catch (error) {
@@ -167,26 +262,39 @@ function copyPathAgentToWorking(
 	// exist — create it first (idempotent). destDir is an internal constant
 	// from PROVIDER_CREDENTIAL_PATHS, never user input; the container name was
 	// already validated by the caller.
-	execFileSync(
-		"docker",
-		["exec", workingContainerName, "mkdir", "-p", destDir],
-		{ stdio: "pipe" },
-	);
+	try {
+		execFileSync(
+			"docker",
+			["exec", workingContainerName, "mkdir", "-p", destDir],
+			{ stdio: "pipe" },
+		);
+	} catch {
+		return false;
+	}
 
 	// `docker cp SRC -` streams a tar of srcPath (rooted at its basename) to
 	// stdout; extracting that tar into destDir of the working container
 	// recreates the file there. Two hops through a Node Buffer — no shell, no
 	// temp file — so the credential bytes never persist to host disk (INV-1)
 	// and no value is ever interpolated into a command string.
-	const tar = execFileSync(
-		"docker",
-		["cp", `${agentContainerName}:${srcPath}`, "-"],
-		{ maxBuffer: 256 * 1024 * 1024 },
-	);
-	execFileSync("docker", ["cp", "-", `${workingContainerName}:${destDir}`], {
-		input: tar,
-		stdio: ["pipe", "pipe", "pipe"],
-	});
+	let tar;
+	try {
+		tar = execFileSync(
+			"docker",
+			["cp", `${agentContainerName}:${srcPath}`, "-"],
+			{ maxBuffer: 256 * 1024 * 1024 },
+		);
+	} catch {
+		return false;
+	}
+	try {
+		execFileSync("docker", ["cp", "-", `${workingContainerName}:${destDir}`], {
+			input: tar,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+	} catch {
+		return false;
+	}
 	return true;
 }
 
@@ -337,27 +445,341 @@ export function commitWorkingTree(workingContainerName) {
 }
 
 /**
+ * Reset the working container's /project to the last committed state,
+ * discarding all uncommitted changes from a failed task. Uses `git reset --hard`
+ * followed by `git clean -fd` to ensure no stray untracked files survive.
+ *
+ * INV-2: This prevents a rejected task's changes from contaminating the next
+ * task's baseline. Without this, a failed task's edits persist in the working
+ * tree and reappear in the next task's diff.
+ *
+ * @param {string} workingContainerName
+ */
+export function resetWorkingTree(workingContainerName) {
+	validateIdentifier(workingContainerName, "workingContainerName");
+	execFileSync(
+		"docker",
+		["exec", "-w", "/project", workingContainerName, "git", "reset", "--hard"],
+		{ stdio: "pipe" },
+	);
+	execFileSync(
+		"docker",
+		["exec", "-w", "/project", workingContainerName, "git", "clean", "-fd"],
+		{ stdio: "pipe" },
+	);
+}
+
+/**
  * Wipe working container at project end.
  * INV-3: Working container is wiped at project end
+ * Idempotent: succeeds when containers/volumes are already absent.
  * @param {string} workingContainerName Working container name
- * @returns {boolean}
+ * @returns {{containerRemoved: boolean, volumeRemoved: boolean, verified: boolean}}
  */
 export function wipeWorkingContainer(workingContainerName) {
+	const results = {
+		containerRemoved: false,
+		volumeRemoved: false,
+		verified: false,
+	};
+
+	// Step 1: Stop container (idempotent — succeeds if stopped or doesn't exist)
 	try {
-		// Stop and remove the working container
-		execSync(`docker stop ${workingContainerName}`, { stdio: "inherit" });
-		execSync(`docker rm ${workingContainerName}`, { stdio: "inherit" });
-
-		// Remove the associated volume
-		execSync(`docker volume rm ${workingContainerName}-vol`, {
-			stdio: "inherit",
+		execFileSync("docker", ["stop", workingContainerName], {
+			stdio: "pipe",
+			timeout: 15_000,
 		});
-
-		return true;
-	} catch (error) {
-		console.error("Failed to wipe working container:", error.message);
-		return false;
+	} catch {
+		/* already stopped or doesn't exist */
 	}
+
+	// Step 2: Remove container (idempotent)
+	try {
+		execFileSync("docker", ["rm", workingContainerName], { stdio: "pipe" });
+		results.containerRemoved = true;
+	} catch {
+		/* doesn't exist */
+	}
+
+	// Step 3: Remove volume (idempotent — doesn't fail if already gone)
+	try {
+		execFileSync("docker", ["volume", "rm", `${workingContainerName}-vol`], {
+			stdio: "pipe",
+		});
+		results.volumeRemoved = true;
+	} catch {
+		/* doesn't exist */
+	}
+
+	// Step 4: Verify absence
+	const containerExists = workingContainerExists(workingContainerName);
+	let volumeExists = false;
+	try {
+		const out = execFileSync(
+			"docker",
+			["volume", "ls", "-q", "--filter", `name=^${workingContainerName}-vol$`],
+			{ encoding: "utf8", stdio: "pipe" },
+		);
+		volumeExists = out.trim().length > 0;
+	} catch {
+		/* ignore */
+	}
+
+	results.verified = !containerExists && !volumeExists;
+
+	return results;
+}
+
+/**
+ * List all containers with the Switchyard managed label.
+ * @returns {Array<{name: string, runId: string, project: string, status: string}>}
+ */
+export function listManagedContainers() {
+	try {
+		const out = execFileSync(
+			"docker",
+			[
+				"ps",
+				"-a",
+				"--filter",
+				`label=${LABEL_MANAGED}`,
+				"--format",
+				`{{.Names}}\t{{.Label "${LABEL_RUN_ID}"}}\t{{.Label "${LABEL_PROJECT}"}}\t{{.State}}`,
+			],
+			{ encoding: "utf8", stdio: "pipe" },
+		);
+		return out
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const [name, runId, project, status] = line.split("\t");
+				return { name, runId, project, status };
+			});
+	} catch (error) {
+		console.error("Failed to list managed containers:", error.message);
+		return [];
+	}
+}
+
+/**
+ * List all volumes with the Switchyard managed label.
+ * @returns {Array<{name: string, runId: string}>}
+ */
+export function listManagedVolumes() {
+	let names;
+	try {
+		names = execFileSync(
+			"docker",
+			["volume", "ls", "-q", "--filter", `label=${LABEL_MANAGED}`],
+			{ encoding: "utf8", stdio: "pipe" },
+		)
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+	} catch (error) {
+		console.error("Failed to list managed volumes:", error.message);
+		return [];
+	}
+
+	if (names.length === 0) return [];
+
+	let json;
+	try {
+		json = JSON.parse(
+			execFileSync("docker", ["volume", "inspect", ...names], {
+				encoding: "utf8",
+				stdio: "pipe",
+			}),
+		);
+	} catch (parseError) {
+		console.error(
+			"Failed to parse docker volume inspect output:",
+			parseError.message,
+		);
+		return [];
+	}
+
+	return json.map((v) => ({
+		name: v.Name,
+		runId: v.Labels?.[LABEL_RUN_ID] || "",
+	}));
+}
+
+/**
+ * Recover orphaned Switchyard-managed containers and volumes.
+ * Only reclaims objects whose owning run is demonstrably dead.
+ * Active runs, standing agent containers, and ambiguous owners are never touched.
+ *
+ * If `isRunActive` is not provided or is not a function, every managed object
+ * is treated as still active and nothing is reclaimed (silent no-op).
+ *
+ * @param {object} options
+ * @param {Function} [options.isRunActive] — (runId: string) => boolean
+ *   Called for each managed object's runId. Should return true if the run
+ *   is still active (has a live process or unexpired lease).
+ *   When absent, defaults to treating every run as active (reclaims nothing).
+ * @param {boolean} [options.dryRun] — if true, report but don't delete
+ * @param {Function} [options.onStatus] — callback(recoveryEvent) for diagnostics
+ * @returns {{containersReclaimed: number, volumesReclaimed: number,
+ *   errors: string[]}}
+ */
+export function recoverManagedObjects(options = {}) {
+	const { isRunActive, dryRun = false, onStatus } = options;
+
+	const result = {
+		containersReclaimed: 0,
+		volumesReclaimed: 0,
+		errors: [],
+	};
+
+	const emit = (event) => {
+		if (onStatus) onStatus(event);
+	};
+
+	const checkActive = (runId) => {
+		if (typeof isRunActive !== "function") return true;
+		return isRunActive(runId);
+	};
+
+	const containers = listManagedContainers();
+	for (const container of containers) {
+		if (container.name === AGENT_CONTAINER_NAME) {
+			emit({
+				type: "skip",
+				object: "container",
+				name: container.name,
+				reason: "standing-agent",
+			});
+			continue;
+		}
+
+		if (!container.runId || container.runId === "") {
+			result.errors.push(
+				`Container ${container.name} has empty/missing runId label`,
+			);
+			emit({
+				type: "error",
+				object: "container",
+				name: container.name,
+				reason: "missing-run-id",
+			});
+			continue;
+		}
+
+		if (checkActive(container.runId)) {
+			emit({
+				type: "skip",
+				object: "container",
+				name: container.name,
+				runId: container.runId,
+				reason: "active-run",
+			});
+			continue;
+		}
+
+		if (dryRun) {
+			emit({
+				type: "would-reclaim",
+				object: "container",
+				name: container.name,
+				runId: container.runId,
+			});
+			result.containersReclaimed += 1;
+			continue;
+		}
+
+		try {
+			execFileSync("docker", ["stop", container.name], {
+				stdio: "pipe",
+				timeout: 15_000,
+			});
+		} catch {
+			/* already stopped */
+		}
+
+		try {
+			execFileSync("docker", ["rm", container.name], { stdio: "pipe" });
+			result.containersReclaimed += 1;
+			emit({
+				type: "reclaimed",
+				object: "container",
+				name: container.name,
+				runId: container.runId,
+			});
+		} catch (e) {
+			result.errors.push(
+				`Failed to remove container ${container.name}: ${e.message}`,
+			);
+			emit({
+				type: "error",
+				object: "container",
+				name: container.name,
+				reason: "rm-failed",
+				error: e.message,
+			});
+		}
+	}
+
+	const volumes = listManagedVolumes();
+	for (const volume of volumes) {
+		if (!volume.runId || volume.runId === "") {
+			result.errors.push(`Volume ${volume.name} has empty/missing runId label`);
+			emit({
+				type: "error",
+				object: "volume",
+				name: volume.name,
+				reason: "missing-run-id",
+			});
+			continue;
+		}
+
+		if (checkActive(volume.runId)) {
+			emit({
+				type: "skip",
+				object: "volume",
+				name: volume.name,
+				runId: volume.runId,
+				reason: "active-run",
+			});
+			continue;
+		}
+
+		if (dryRun) {
+			emit({
+				type: "would-reclaim",
+				object: "volume",
+				name: volume.name,
+				runId: volume.runId,
+			});
+			result.volumesReclaimed += 1;
+			continue;
+		}
+
+		try {
+			execFileSync("docker", ["volume", "rm", volume.name], { stdio: "pipe" });
+			result.volumesReclaimed += 1;
+			emit({
+				type: "reclaimed",
+				object: "volume",
+				name: volume.name,
+				runId: volume.runId,
+			});
+		} catch (e) {
+			result.errors.push(
+				`Failed to remove volume ${volume.name}: ${e.message}`,
+			);
+			emit({
+				type: "error",
+				object: "volume",
+				name: volume.name,
+				reason: "rm-failed",
+				error: e.message,
+			});
+		}
+	}
+
+	return result;
 }
 
 /**
@@ -367,16 +789,17 @@ export function wipeWorkingContainer(workingContainerName) {
  */
 export function workingContainerExists(workingContainerName) {
 	try {
-		// `--filter name=X` is a SUBSTRING match in Docker, not exact — an
-		// unanchored filter false-positives/false-negatives against any other
-		// container whose name contains workingContainerName as a substring
-		// (reproduced concretely: two test fixtures where one name contained
-		// the other as a prefix caused this check to see multiple matched
-		// names and fail the exact-equality comparison below). `^/X$` anchors
-		// to the exact name — Docker stores container names with a leading
-		// slash internally.
-		const output = execSync(
-			`docker ps -a --filter "name=^/${workingContainerName}$" --format '{{.Names}}'`,
+		validateIdentifier(workingContainerName, "workingContainerName");
+		const output = execFileSync(
+			"docker",
+			[
+				"ps",
+				"-a",
+				"--filter",
+				`name=^/${workingContainerName}$`,
+				"--format",
+				"{{.Names}}",
+			],
 			{ stdio: "pipe" },
 		)
 			.toString()
@@ -394,9 +817,10 @@ export function workingContainerExists(workingContainerName) {
  * @returns {string} Command output
  */
 export function execInWorkingContainer(workingContainerName, command) {
-	const escapedCommand = command.replace(/'/g, "'\\''");
-	const result = execSync(
-		`docker exec ${workingContainerName} sh -c '${escapedCommand}'`,
+	validateIdentifier(workingContainerName, "workingContainerName");
+	const result = execFileSync(
+		"docker",
+		["exec", workingContainerName, "sh", "-c", command],
 		{ encoding: "utf8", stdio: "pipe" },
 	);
 	return result.trim();

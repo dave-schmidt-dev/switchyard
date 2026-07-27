@@ -1,5 +1,9 @@
 {
-	"entry": ["tests/**/*.test.mjs", "src/switchyard/runner/index.mjs"],
+	"entry": [
+		"tests/**/*.test.mjs",
+		"src/switchyard/runner/index.mjs",
+		"src/switchyard/dispatch/worker-bootstrap.mjs"
+	],
 	"project": ["src/**/*.mjs"],
 	"ignoreBinaries": ["orb"]
 }

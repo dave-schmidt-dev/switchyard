@@ -2,7 +2,7 @@
 // Tests: agent output reaches host files ONLY via the reviewed apply, and
 // the gate's own validation — not just git's — rejects unsafe diffs.
 
-import { ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
 import {
 	existsSync,
@@ -399,6 +399,193 @@ index 0000000..abcdef1
 		strictEqual(result.success, false);
 		strictEqual(result.requiresReview, true);
 		ok(result.sensitivePaths.includes("naïve/package.json"));
+	});
+});
+
+describe("Files allowlist enforcement", () => {
+	it("exact declared set passes gate", () => {
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
+		});
+		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["test.txt"],
+		});
+		strictEqual(result.success, true);
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"modified content\n",
+		);
+	});
+
+	it("returns required_paths_missing when a declared path is not touched", () => {
+		commitFile(projectPath, "src/a.mjs", "original\n");
+		commitFile(projectPath, "src/b.mjs", "original\n");
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "src", "a.mjs"), "modified\n", "utf8");
+		});
+		execSync("git checkout -- src/a.mjs", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["src/a.mjs", "src/b.mjs"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "required_paths_missing");
+		deepStrictEqual(result.missingPaths, ["src/b.mjs"]);
+	});
+
+	it("returns undeclared_paths_touched when a touched path is not declared", () => {
+		commitFile(projectPath, "src/a.mjs", "original\n");
+		commitFile(projectPath, "src/b.mjs", "original\n");
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "src", "a.mjs"), "modified\n", "utf8");
+			writeFileSync(join(dir, "src", "b.mjs"), "also modified\n", "utf8");
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["src/a.mjs"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		ok(result.extraPaths.includes("src/b.mjs"));
+	});
+
+	it("returns empty_required_diff when diff is empty and requiredPaths is set", () => {
+		const result = integrationGate("", projectPath, {
+			requiredPaths: ["test.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "empty_required_diff");
+	});
+
+	it("rename: Files declaring the destination passes (both rename paths counted for declaration)", () => {
+		commitFile(projectPath, "src/old.mjs", "original\n");
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			execSync("git mv src/old.mjs src/new.mjs", { cwd: dir });
+		});
+		execSync("git reset -q HEAD -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		execSync("git checkout -q -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		// checkout restores tracked files but leaves the rename destination as
+		// an untracked file — remove it so git apply can recreate it cleanly.
+		rmSync(join(projectPath, "src", "new.mjs"), { force: true });
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["src/new.mjs"],
+		});
+		strictEqual(result.success, true);
+	});
+
+	it("rename: Files declaring the destination fails when only the source is declared", () => {
+		commitFile(projectPath, "src/old.mjs", "original\n");
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			execSync("git mv src/old.mjs src/new.mjs", { cwd: dir });
+		});
+		execSync("git reset -q HEAD -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		execSync("git checkout -q -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		rmSync(join(projectPath, "src", "new.mjs"), { force: true });
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["src/old.mjs"],
+		});
+		// The source path is counted via the summary line, but the destination
+		// path (src/new.mjs) is also touched and undeclared — blocked.
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		ok(result.extraPaths.includes("src/new.mjs"));
+	});
+
+	it("delete: Files declaring the deleted path passes (deleted path in --numstat)", () => {
+		commitFile(projectPath, "src/gone.mjs", "original\n");
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			execSync("git rm -q src/gone.mjs", { cwd: dir });
+		});
+		execSync("git reset -q HEAD -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		execSync("git checkout -q -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["src/gone.mjs"],
+		});
+		strictEqual(result.success, true);
+	});
+
+	it("sensitive paths still blocked even when in Files allowlist", () => {
+		commitFile(projectPath, "config.json", "{}");
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, ".env"), "SECRET=xyz\n", "utf8");
+		});
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: [".env"],
+		});
+		strictEqual(result.success, false);
+		ok(result.message.includes("credential"));
+	});
+
+	it("manifest paths still require allowSensitiveManifests even when in Files allowlist", () => {
+		commitFile(projectPath, "package.json", '{"name":"x"}\n');
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "package.json"), '{"name":"y"}\n', "utf8");
+		});
+		execSync("git checkout -- package.json", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["package.json"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.requiresReview, true);
+	});
+
+	it("manifest path passes Files: + allowSensitiveManifests together", () => {
+		commitFile(projectPath, "package.json", '{"name":"x"}\n');
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "package.json"), '{"name":"y"}\n', "utf8");
+		});
+		execSync("git checkout -- package.json", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["package.json"],
+			allowSensitiveManifests: true,
+		});
+		strictEqual(result.success, true);
+	});
+
+	it("null requiredPaths: legacy behavior preserved", () => {
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
+		});
+		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: null,
+		});
+		strictEqual(result.success, true);
 	});
 });
 

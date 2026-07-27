@@ -38,6 +38,7 @@ import {
 	commitWorkingTree,
 	createWorkingContainer,
 	provisionCredentials,
+	resetWorkingTree,
 	seedProject,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
@@ -230,7 +231,7 @@ export function resolveOrchestrator(dependencies = {}) {
  *   - **Description:** ...
  *
  * @param {string} markdown
- * @returns {Array<{id: string, title: string, status: string, description: string}>}
+ * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null}>}
  */
 export function parseTaskQueue(markdown) {
 	const tasks = [];
@@ -247,17 +248,87 @@ export function parseTaskQueue(markdown) {
 		const rawDesc =
 			descriptionMatch?.[1] ?? block.replace(/- \*\*Status:\*\*\s*.*/gi, "");
 		const fullPrompt = `### Task ${id.trim()}: ${title.trim()}\n${block.trim()}`;
+		const taskId = id.trim();
+
+		let requiredPaths = null;
+		const filesLine = block
+			.split("\n")
+			.find((line) => /^- \*\*Files:\*\*\s/.test(line));
+		if (filesLine) {
+			const filesValue = filesLine.replace(/^- \*\*Files:\*\*\s*/, "").trim();
+			requiredPaths = parseFilePaths(filesValue, taskId);
+		}
 
 		tasks.push({
-			id: id.trim(),
+			id: taskId,
 			title: title.trim(),
 			status: (statusMatch?.[1] ?? "pending").trim().toLowerCase(),
 			description: rawDesc.trim(),
 			prompt: fullPrompt,
+			requiredPaths,
 		});
 	}
 
 	return tasks;
+}
+
+/**
+ * Parse and validate a comma-separated Files: field into an array of paths.
+ * @param {string} raw The raw value of the Files: field
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string[]} Validated project-relative POSIX paths
+ * @throws {Error} If any path is invalid
+ */
+function parseFilePaths(raw, taskId) {
+	const trimmed = raw.trim();
+	if (!trimmed) {
+		throw new Error(
+			`Task ${taskId}: Files field is empty (must include at least one path)`,
+		);
+	}
+
+	const paths = trimmed.split(",").map((p) => p.trim());
+
+	for (const path of paths) {
+		if (!path) {
+			throw new Error(`Task ${taskId}: empty path entry in Files field`);
+		}
+		if (path.startsWith("/")) {
+			throw new Error(
+				`Task ${taskId}: absolute path not allowed in Files: "${path}"`,
+			);
+		}
+		if (path.split("/").includes("..")) {
+			throw new Error(
+				`Task ${taskId}: path traversal not allowed in Files: "${path}"`,
+			);
+		}
+		if (path.includes("\\")) {
+			throw new Error(
+				`Task ${taskId}: backslash separator not allowed in Files: "${path}"`,
+			);
+		}
+		if (/[*?[\]]/.test(path)) {
+			throw new Error(
+				`Task ${taskId}: wildcards not allowed in Files: "${path}"`,
+			);
+		}
+		if (path.endsWith("/")) {
+			throw new Error(
+				`Task ${taskId}: directory-only entry not allowed in Files: "${path}"`,
+			);
+		}
+	}
+
+	const seen = new Set();
+	for (const path of paths) {
+		if (seen.has(path)) {
+			throw new Error(`Task ${taskId}: duplicate path in Files: "${path}"`);
+		}
+		seen.add(path);
+	}
+
+	return paths;
 }
 
 /**
@@ -413,11 +484,6 @@ export function getRunnableTasks(tasks, checkpoint) {
 function selectAdapter(providerName, adapters) {
 	const provider = providerName?.toLowerCase();
 	if (!provider) return null;
-	// Look up by key rather than a hardcoded provider allowlist: the prior
-	// version only recognized "claude"/"codex" and silently orphaned agy/
-	// cursor when they were added to the default adapters map below — route()
-	// (via availableProviders) correctly reported them as dispatchable, but
-	// this function still rejected them as unsupported on every attempt.
 	return adapters?.[provider] ?? null;
 }
 
@@ -465,10 +531,6 @@ export async function waitForJobCompletion(options) {
 			// eslint-disable-next-line no-await-in-loop
 			status = await orchestrator.status(jobId);
 		} catch (error) {
-			// A transient status-fetch failure must fail only this task, not
-			// abort every remaining task in the queue with no ledger record
-			// and no checkpoint save (unlike launch(), this call previously
-			// had no error handling at all).
 			return {
 				state: "status_error",
 				status: { error: error?.message ?? "orchestrator status failed" },
@@ -507,12 +569,6 @@ export async function waitForJobCompletion(options) {
  */
 export function executeTask(task, context) {
 	const tier = classifyTask(task.description || task.title);
-	// Constrain routing to providers this dispatcher can actually execute.
-	// Without this, route() can legitimately pick a roster provider (e.g.
-	// vibe/agy/cursor) that has no adapter wired here, which previously
-	// produced an unrecoverable "unsupported_provider" failure that
-	// re-occurred identically on every resume (the same task, same route,
-	// same missing adapter, forever).
 	const routeResult = context.route({
 		tier,
 		availableProviders: Object.keys(context.adapters ?? {}),
@@ -579,7 +635,19 @@ export function executeTask(task, context) {
 	}
 
 	const diff = adapter.captureDiff(context.workingContainerName);
-	if (!diff) {
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "execution",
+			event: "diff_captured",
+			status: "Diff captured",
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			byteCount: diff ? diff.length : 0,
+		});
+	}
+
+	if (!diff && task.requiredPaths === null) {
 		context.recordDispatch({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -597,8 +665,33 @@ export function executeTask(task, context) {
 		};
 	}
 
-	const gateResult = context.integrationGate(diff, context.projectPath);
+	const gateResult = context.integrationGate(diff, context.projectPath, {
+		requiredPaths: task.requiredPaths,
+	});
 	const success = Boolean(gateResult?.success);
+
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "integration",
+			event: "gate_validated",
+			status: gateResult?.message ?? (success ? "ok" : "rejected"),
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			outcome: success ? "passed" : "rejected",
+		});
+		if (success) {
+			context.onStatus({
+				phase: "integration",
+				event: "gate_applied",
+				status: "Diff applied via integration gate",
+				taskId: task.id,
+				provider: routeResult.provider,
+				model: routeResult.model ?? null,
+			});
+		}
+	}
+
 	context.recordDispatch({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
@@ -625,20 +718,6 @@ export function executeTask(task, context) {
  */
 export async function executeTaskWithOrchestrator(task, context) {
 	const tier = classifyTask(task.description || task.title);
-	// Deliberately unfiltered, unlike executeTask (which constrains routing to
-	// Object.keys(context.adapters)). This path has no local adapters map to
-	// derive candidates from — dispatch is delegated to an external orchestrator
-	// treated as an opaque black box that may support the full roster. No
-	// protocol exists to query that orchestrator's actual supported-provider
-	// set, and inventing one speculatively (with no real orchestrator to
-	// validate it against) is exactly the fabricated-interface guesswork this
-	// project forbids, so route() runs unconstrained. Accepted consequence: if
-	// route() picks a provider the orchestrator can't actually run, launch()
-	// below fails, the task is recorded as failed but never added to
-	// completedTaskIds — so every resume re-selects the same provider and fails
-	// identically. That retry loop is accepted behavior for the orchestrator
-	// path today (there is no capability-discovery mechanism to break it), not
-	// an oversight; tests/runner.test.mjs characterizes this exact failure mode.
 	const routeResult = context.route({ tier });
 
 	if (!routeResult.provider) {
@@ -719,8 +798,6 @@ export async function executeTaskWithOrchestrator(task, context) {
 	try {
 		jobResult = await context.orchestrator.result(jobId);
 	} catch (error) {
-		// Same reasoning as the status() guard above: a transient result-fetch
-		// failure must fail only this task, not the whole remaining queue.
 		context.recordDispatch({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -756,7 +833,19 @@ export async function executeTaskWithOrchestrator(task, context) {
 	}
 
 	const diff = typeof jobResult.diff === "string" ? jobResult.diff.trim() : "";
-	if (!diff) {
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "execution",
+			event: "diff_captured",
+			status: "Diff captured",
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			byteCount: diff.length,
+		});
+	}
+
+	if (!diff && task.requiredPaths === null) {
 		context.recordDispatch({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -774,8 +863,33 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 
-	const gateResult = context.integrationGate(diff, context.projectPath);
+	const gateResult = context.integrationGate(diff, context.projectPath, {
+		requiredPaths: task.requiredPaths,
+	});
 	const success = Boolean(gateResult?.success);
+
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "integration",
+			event: "gate_validated",
+			status: gateResult?.message ?? (success ? "ok" : "rejected"),
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			outcome: success ? "passed" : "rejected",
+		});
+		if (success) {
+			context.onStatus({
+				phase: "integration",
+				event: "gate_applied",
+				status: "Diff applied via integration gate",
+				taskId: task.id,
+				provider: routeResult.provider,
+				model: routeResult.model ?? null,
+			});
+		}
+	}
+
 	context.recordDispatch({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
@@ -792,6 +906,37 @@ export async function executeTaskWithOrchestrator(task, context) {
 		model: routeResult.model ?? null,
 		result: success ? "success" : "integration_failed",
 	};
+}
+
+function _resolveOnStatus(deps) {
+	const diagnostics = deps.diagnostics ?? null;
+	const onStatus = deps.onStatus ?? null;
+
+	if (!onStatus && !diagnostics) return null;
+
+	return (event) => {
+		if (diagnostics && typeof diagnostics.emit === "function") {
+			diagnostics.emit(event);
+		}
+		if (onStatus && typeof onStatus === "function") {
+			onStatus(event);
+		}
+	};
+}
+
+function _safeError(error) {
+	if (error == null) return { message: "unknown error" };
+	if (typeof error === "string") return { message: error };
+	if (error instanceof Error) {
+		const out = { name: error.name, message: error.message };
+		if (error.code !== undefined) out.code = error.code;
+		return out;
+	}
+	const out = {};
+	if (error.name !== undefined) out.name = error.name;
+	if (error.message !== undefined) out.message = error.message;
+	if (error.code !== undefined) out.code = error.code;
+	return out;
 }
 
 /**
@@ -816,14 +961,6 @@ export function runQueue(options) {
 		dependencies = {},
 	} = options;
 
-	// Only stand up containers when the caller hasn't already supplied a
-	// working container — an existing workingContainerName implies the caller
-	// (or an earlier runQueue call) already ensured the standing agent
-	// container exists when that working container was created. The agent
-	// container is still required before creating one: createWorkingContainer
-	// builds the working container FROM the agent image, and
-	// provisionCredentials copies the agent container's credentials into
-	// it (the old --volumes-from coupling is gone — see lifecycle/index.mjs).
 	const ensureAgentContainerFn =
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;
 	const createWorkingContainerFn =
@@ -833,13 +970,14 @@ export function runQueue(options) {
 	const seedProjectFn = dependencies.seedProject ?? seedProject;
 	const commitWorkingTreeFn =
 		dependencies.commitWorkingTree ?? commitWorkingTree;
+	const resetWorkingTreeFn = dependencies.resetWorkingTree ?? resetWorkingTree;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
-	// Optional host-side progress hooks (INV-1: no silent waits). A serial
-	// dispatch otherwise blocks with no feedback during each multi-minute
-	// provider exec; the CLI passes these to print a line per task start/finish.
 	const onTaskStart = dependencies.onTaskStart ?? null;
 	const onResult = dependencies.onResult ?? null;
+	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
+	const runStore = dependencies.runStore ?? null;
+	const emitStatus = _resolveOnStatus(dependencies);
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
@@ -850,12 +988,15 @@ export function runQueue(options) {
 			throw new Error("runQueue: failed to create working container");
 		}
 		ownsWorkingContainer = true;
-		// Copy the standing agent container's provider credentials into the
-		// fresh working container so an authenticated CLI can actually run
-		// there (INV-1: container→container, no host path; INV-3: discarded
-		// when the working container is wiped). Best-effort — a provider that
-		// isn't logged in simply stays unauthenticated, which the adapter's
-		// own auth check surfaces; it must not abort the whole run.
+		if (emitStatus) {
+			emitStatus({
+				phase: "bootstrap",
+				event: "container_created",
+				status: "Working container created",
+				provider: null,
+				model: null,
+			});
+		}
 		try {
 			provisionCredentialsFn(workingContainerName);
 		} catch (error) {
@@ -897,17 +1038,24 @@ export function runQueue(options) {
 		},
 		projectPath,
 		workingContainerName,
+		onStatus: emitStatus,
 	};
 
 	try {
-		// Seed the container we created with the project's committed tree so the
-		// agent edits real code and captureDiff has a git baseline — without it
-		// /project is empty and every task dead-ends at "success_no_diff",
-		// never reaching the integration gate (INV-2). Inside the try so a seed
-		// failure still hits the INV-3 wipe in `finally`. Only seed a container
-		// we own; a caller-supplied one is theirs to seed.
 		if (ownsWorkingContainer) {
-			seedProjectFn(workingContainerName, projectPath);
+			try {
+				seedProjectFn(workingContainerName, projectPath);
+			} catch (error) {
+				if (emitStatus) {
+					emitStatus({
+						phase: "bootstrap",
+						event: "seed_failed",
+						status: `Seed failed: ${error.message}`,
+						error: _safeError(error),
+					});
+				}
+				throw error;
+			}
 		}
 
 		const tasks = loadTaskQueue(tasksFilePath);
@@ -920,21 +1068,89 @@ export function runQueue(options) {
 			if (processed >= maxTasks) break;
 
 			if (onTaskStart) onTaskStart(task);
+			if (runStore) {
+				runStore
+					.updateRun({ activeTaskId: task.id })
+					.then((upd) => {
+						runStore._rev = upd.revision;
+					})
+					.catch(() => {});
+			}
+			if (emitStatus) {
+				emitStatus({
+					phase: "execution",
+					event: "task_started",
+					status: `Starting task ${task.id}`,
+					taskId: task.id,
+				});
+			}
 			const result = executeTask(task, context);
 			if (onResult) onResult(result);
-			// Advance the container's baseline so the NEXT task diffs only against
-			// this task's result instead of re-emitting it (multi-task isolation;
-			// otherwise task 2's diff carries task 1's hunks and the host apply
-			// rejects it). Only for a container we own+seeded; a caller-supplied
-			// one is theirs to manage. Best-effort: a checkpoint hiccup must not
-			// abort the queue, but it is surfaced rather than swallowed (INV-1).
+			if (emitStatus) {
+				if (result.success) {
+					emitStatus({
+						phase: "execution",
+						event: "task_completed",
+						status: `Task ${result.taskId} completed`,
+						taskId: result.taskId,
+						provider: result.provider ?? null,
+						model: result.model ?? null,
+					});
+				} else {
+					emitStatus({
+						phase: "execution",
+						event: "task_failed",
+						status: `Task ${result.taskId} failed: ${result.result}`,
+						taskId: result.taskId,
+						provider: result.provider ?? null,
+						model: result.model ?? null,
+						error: _safeError(result.error),
+					});
+				}
+			}
 			if (ownsWorkingContainer) {
-				try {
-					commitWorkingTreeFn(workingContainerName);
-				} catch (error) {
-					console.error(
-						`runQueue: could not checkpoint working container after task ${result.taskId}: ${error.message}`,
-					);
+				if (result.success) {
+					try {
+						commitWorkingTreeFn(workingContainerName);
+					} catch (error) {
+						console.error(
+							`runQueue: could not checkpoint working container after task ${result.taskId}: ${error.message}`,
+						);
+						if (emitStatus) {
+							emitStatus({
+								phase: "checkpoint",
+								event: "checkpoint_failed",
+								status: `Checkpoint commit failed: ${error.message}`,
+								taskId: result.taskId,
+								error: _safeError(error),
+							});
+						}
+					}
+				} else if (!stopOnFailure) {
+					try {
+						resetWorkingTreeFn(workingContainerName);
+						if (emitStatus) {
+							emitStatus({
+								phase: "checkpoint",
+								event: "state_reset",
+								status: `Reset working tree after failed task ${result.taskId}`,
+								taskId: result.taskId,
+							});
+						}
+					} catch (error) {
+						console.error(
+							`runQueue: could not reset working container after task ${result.taskId}: ${error.message}`,
+						);
+						if (emitStatus) {
+							emitStatus({
+								phase: "checkpoint",
+								event: "checkpoint_failed",
+								status: `Checkpoint reset failed: ${error.message}`,
+								taskId: result.taskId,
+								error: _safeError(error),
+							});
+						}
+					}
 				}
 			}
 			results.push(result);
@@ -953,12 +1169,55 @@ export function runQueue(options) {
 				checkpoint.completedTaskIds.push(result.taskId);
 			}
 
-			saveCheckpoint(checkpointPath, checkpoint);
+			try {
+				saveCheckpoint(checkpointPath, checkpoint);
+			} catch (error) {
+				if (emitStatus) {
+					emitStatus({
+						phase: "checkpoint",
+						event: "checkpoint_failed",
+						status: `Checkpoint save failed: ${error.message}`,
+						taskId: result.taskId,
+						error: _safeError(error),
+					});
+				}
+				throw error;
+			}
+			if (emitStatus) {
+				emitStatus({
+					phase: "checkpoint",
+					event: "checkpoint_saved",
+					status: `Checkpoint saved after task ${result.taskId}`,
+					taskId: result.taskId,
+				});
+			}
+			if (onCheckpointSaved) onCheckpointSaved();
+			if (runStore) {
+				runStore.updateRun({}).catch(() => {});
+			}
 			processed += 1;
 
 			if (!result.success && stopOnFailure) {
 				break;
 			}
+		}
+
+		if (emitStatus) {
+			emitStatus({
+				phase: "lifecycle",
+				event: "terminal",
+				status: `Queue complete: ${processed} tasks processed`,
+			});
+		}
+		if (runStore) {
+			const anyFailed = results.some((r) => !r.success);
+			runStore
+				.updateRun({
+					state: anyFailed ? "failed" : "succeeded",
+					activeTaskId: null,
+					cleanupState: "complete",
+				})
+				.catch(() => {});
 		}
 
 		return {
@@ -971,12 +1230,35 @@ export function runQueue(options) {
 			results,
 		};
 	} finally {
-		// INV-3: the working container is wiped at project end — including
-		// when the loop above throws or exits early on a failure, not just
-		// on the normal return path. Only wipe what we created; a
-		// caller-supplied container is the caller's to manage.
 		if (ownsWorkingContainer) {
-			wipeWorkingContainerFn(workingContainerName);
+			if (emitStatus) {
+				emitStatus({
+					phase: "cleanup",
+					event: "cleanup_started",
+					status: "Wiping working container",
+				});
+			}
+			try {
+				wipeWorkingContainerFn(workingContainerName);
+				if (emitStatus) {
+					emitStatus({
+						phase: "cleanup",
+						event: "cleanup_complete",
+						status: "Cleanup complete",
+					});
+				}
+			} catch (error) {
+				if (emitStatus) {
+					emitStatus({
+						phase: "cleanup",
+						event: "cleanup_failed",
+						status: `Cleanup failed: ${error.message}`,
+						error: _safeError(error),
+					});
+				}
+				// biome-ignore lint/correctness/noUnsafeFinally: re-throwing the same error the bare wipe call would throw
+				throw error;
+			}
 		}
 	}
 }
@@ -1007,8 +1289,6 @@ export async function runQueueWithOrchestrator(options) {
 		dependencies = {},
 	} = options;
 
-	// Same rationale as runQueue: only stand up containers when the caller
-	// hasn't already supplied a working container.
 	const ensureAgentContainerFn =
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;
 	const createWorkingContainerFn =
@@ -1016,8 +1296,16 @@ export async function runQueueWithOrchestrator(options) {
 	const provisionCredentialsFn =
 		dependencies.provisionCredentials ?? provisionCredentials;
 	const seedProjectFn = dependencies.seedProject ?? seedProject;
+	const commitWorkingTreeFn =
+		dependencies.commitWorkingTree ?? commitWorkingTree;
+	const resetWorkingTreeFn = dependencies.resetWorkingTree ?? resetWorkingTree;
+	const onTaskStart = dependencies.onTaskStart ?? null;
+	const onResult = dependencies.onResult ?? null;
+	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
+	const runStore = dependencies.runStore ?? null;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+	const emitStatus = _resolveOnStatus(dependencies);
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
@@ -1030,7 +1318,15 @@ export async function runQueueWithOrchestrator(options) {
 			);
 		}
 		ownsWorkingContainer = true;
-		// Best-effort credential provisioning, same as runQueue — see there.
+		if (emitStatus) {
+			emitStatus({
+				phase: "bootstrap",
+				event: "container_created",
+				status: "Working container created",
+				provider: null,
+				model: null,
+			});
+		}
 		try {
 			provisionCredentialsFn(workingContainerName);
 		} catch (error) {
@@ -1052,14 +1348,24 @@ export async function runQueueWithOrchestrator(options) {
 		now: dependencies.now ?? Date.now,
 		sleepFn: dependencies.sleepFn ?? sleep,
 		onPoll: dependencies.onPoll ?? null,
+		onStatus: emitStatus,
 	};
 
 	try {
-		// Same seeding rationale as runQueue: an unseeded /project makes every
-		// task dead-end at "success_no_diff". Inside the try so a seed failure
-		// still hits the INV-3 wipe; only seed a container we own.
 		if (ownsWorkingContainer) {
-			seedProjectFn(workingContainerName, projectPath);
+			try {
+				seedProjectFn(workingContainerName, projectPath);
+			} catch (error) {
+				if (emitStatus) {
+					emitStatus({
+						phase: "bootstrap",
+						event: "seed_failed",
+						status: `Seed failed: ${error.message}`,
+						error: _safeError(error),
+					});
+				}
+				throw error;
+			}
 		}
 
 		const tasks = loadTaskQueue(tasksFilePath);
@@ -1071,8 +1377,97 @@ export async function runQueueWithOrchestrator(options) {
 		for (const task of runnable) {
 			if (processed >= maxTasks) break;
 
+			if (onTaskStart) onTaskStart(task);
+			if (runStore) {
+				runStore
+					.updateRun({ activeTaskId: task.id })
+					.then((upd) => {
+						runStore._rev = upd.revision;
+					})
+					.catch(() => {});
+			}
+			if (emitStatus) {
+				emitStatus({
+					phase: "execution",
+					event: "task_started",
+					status: `Starting task ${task.id}`,
+					taskId: task.id,
+				});
+			}
+
 			// eslint-disable-next-line no-await-in-loop
 			const result = await executeTaskWithOrchestrator(task, context);
+
+			if (onResult) onResult(result);
+			if (emitStatus) {
+				if (result.success) {
+					emitStatus({
+						phase: "execution",
+						event: "task_completed",
+						status: `Task ${result.taskId} completed`,
+						taskId: result.taskId,
+						provider: result.provider ?? null,
+						model: result.model ?? null,
+					});
+				} else {
+					emitStatus({
+						phase: "execution",
+						event: "task_failed",
+						status: `Task ${result.taskId} failed: ${result.result}`,
+						taskId: result.taskId,
+						provider: result.provider ?? null,
+						model: result.model ?? null,
+						error: _safeError(result.error),
+					});
+				}
+			}
+
+			if (ownsWorkingContainer) {
+				if (result.success) {
+					try {
+						commitWorkingTreeFn(workingContainerName);
+					} catch (error) {
+						console.error(
+							`runQueueWithOrchestrator: could not checkpoint working container after task ${result.taskId}: ${error.message}`,
+						);
+						if (emitStatus) {
+							emitStatus({
+								phase: "checkpoint",
+								event: "checkpoint_failed",
+								status: `Checkpoint commit failed: ${error.message}`,
+								taskId: result.taskId,
+								error: _safeError(error),
+							});
+						}
+					}
+				} else if (!stopOnFailure) {
+					try {
+						resetWorkingTreeFn(workingContainerName);
+						if (emitStatus) {
+							emitStatus({
+								phase: "checkpoint",
+								event: "state_reset",
+								status: `Reset working tree after failed task ${result.taskId}`,
+								taskId: result.taskId,
+							});
+						}
+					} catch (error) {
+						console.error(
+							`runQueueWithOrchestrator: could not reset working container after task ${result.taskId}: ${error.message}`,
+						);
+						if (emitStatus) {
+							emitStatus({
+								phase: "checkpoint",
+								event: "checkpoint_failed",
+								status: `Checkpoint reset failed: ${error.message}`,
+								taskId: result.taskId,
+								error: _safeError(error),
+							});
+						}
+					}
+				}
+			}
+
 			results.push(result);
 			checkpoint.results.push({
 				taskId: result.taskId,
@@ -1089,12 +1484,55 @@ export async function runQueueWithOrchestrator(options) {
 				checkpoint.completedTaskIds.push(result.taskId);
 			}
 
-			saveCheckpoint(checkpointPath, checkpoint);
+			try {
+				saveCheckpoint(checkpointPath, checkpoint);
+			} catch (error) {
+				if (emitStatus) {
+					emitStatus({
+						phase: "checkpoint",
+						event: "checkpoint_failed",
+						status: `Checkpoint save failed: ${error.message}`,
+						taskId: result.taskId,
+						error: _safeError(error),
+					});
+				}
+				throw error;
+			}
+			if (emitStatus) {
+				emitStatus({
+					phase: "checkpoint",
+					event: "checkpoint_saved",
+					status: `Checkpoint saved after task ${result.taskId}`,
+					taskId: result.taskId,
+				});
+			}
+			if (onCheckpointSaved) onCheckpointSaved();
+			if (runStore) {
+				runStore.updateRun({}).catch(() => {});
+			}
 			processed += 1;
 
 			if (!result.success && stopOnFailure) {
 				break;
 			}
+		}
+
+		if (emitStatus) {
+			emitStatus({
+				phase: "lifecycle",
+				event: "terminal",
+				status: `Queue complete: ${processed} tasks processed`,
+			});
+		}
+		if (runStore) {
+			const anyFailed = results.some((r) => !r.success);
+			runStore
+				.updateRun({
+					state: anyFailed ? "failed" : "succeeded",
+					activeTaskId: null,
+					cleanupState: "complete",
+				})
+				.catch(() => {});
 		}
 
 		return {
@@ -1108,7 +1546,34 @@ export async function runQueueWithOrchestrator(options) {
 		};
 	} finally {
 		if (ownsWorkingContainer) {
-			wipeWorkingContainerFn(workingContainerName);
+			if (emitStatus) {
+				emitStatus({
+					phase: "cleanup",
+					event: "cleanup_started",
+					status: "Wiping working container",
+				});
+			}
+			try {
+				wipeWorkingContainerFn(workingContainerName);
+				if (emitStatus) {
+					emitStatus({
+						phase: "cleanup",
+						event: "cleanup_complete",
+						status: "Cleanup complete",
+					});
+				}
+			} catch (error) {
+				if (emitStatus) {
+					emitStatus({
+						phase: "cleanup",
+						event: "cleanup_failed",
+						status: `Cleanup failed: ${error.message}`,
+						error: _safeError(error),
+					});
+				}
+				// biome-ignore lint/correctness/noUnsafeFinally: re-throwing the same error the bare wipe call would throw
+				throw error;
+			}
 		}
 	}
 }

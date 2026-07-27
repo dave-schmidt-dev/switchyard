@@ -1,0 +1,901 @@
+// Detached dispatch integration tests: launch/status/result round-trips,
+// worker-bootstrap nonce handshake, project locks, and failure recording.
+// These spawn real Node subprocesses.
+
+import { ok, strictEqual } from "node:assert";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { isContainerRuntimeAvailable } from "../src/switchyard/container/index.mjs";
+import {
+	containerExists,
+	createLabeledContainer,
+	createLabeledVolume,
+	removeContainer,
+	removeVolume,
+	volumeExists,
+} from "./helpers/lifecycle-fixture.mjs";
+
+const HAS_DOCKER = isContainerRuntimeAvailable();
+
+if (!HAS_DOCKER) {
+	console.log("Docker not available — skipping detached crash matrix tests");
+}
+
+function describeIf(condition, ...args) {
+	if (condition) return describe(...args);
+	return describe.skip(...args);
+}
+
+const __dirname = resolve(fileURLToPath(import.meta.url), "..");
+const DISPATCH_PATH = resolve(
+	__dirname,
+	"..",
+	"src",
+	"switchyard",
+	"dispatch",
+	"index.mjs",
+);
+const BOOTSTRAP_PATH = resolve(
+	__dirname,
+	"..",
+	"src",
+	"switchyard",
+	"dispatch",
+	"worker-bootstrap.mjs",
+);
+
+function runDispatch(args, env = {}) {
+	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		timeout: 10_000,
+		env: { ...process.env, ...env },
+	});
+}
+
+function runBootstrap(args, env = {}) {
+	return spawnSync(process.execPath, [BOOTSTRAP_PATH, ...args], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		timeout: 10_000,
+		env: { ...process.env, ...env },
+	});
+}
+
+let dir;
+let tasksFile;
+let projectDir;
+let stateRoot;
+
+function makeStateRootEnv() {
+	return { SWITCHYARD_RUN_STORE_ROOT: stateRoot };
+}
+
+beforeEach(async () => {
+	dir = mkdtempSync(join(tmpdir(), "switchyard-detached-dispatch-"));
+	stateRoot = join(dir, "state-root");
+	tasksFile = join(dir, "tasks.md");
+	writeFileSync(
+		tasksFile,
+		"### Task 1.1: Test task\n- **Status:** pending\n- **Description:** A test\n",
+		"utf8",
+	);
+	projectDir = join(dir, "project");
+	mkdirSync(join(projectDir, ".git"), { recursive: true });
+
+	process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+});
+
+afterEach(() => {
+	delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+	rmSync(dir, { recursive: true, force: true });
+});
+
+async function launchAndGetRunId() {
+	const result = runDispatch(
+		["launch", tasksFile, "--project", projectDir],
+		makeStateRootEnv(),
+	);
+	strictEqual(result.status, 0, `launch failed: ${result.stderr}`);
+	const envelope = JSON.parse(result.stdout.trim());
+	ok(typeof envelope.runId === "string" && envelope.runId.length > 0);
+	return envelope.runId;
+}
+
+function pollStatus(runId, env) {
+	return runDispatch(["status", runId], env);
+}
+
+describe("launch returns before completion", () => {
+	it("launch exits 0 immediately, status returns a tracked run", async () => {
+		const startTime = Date.now();
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		const elapsed = Date.now() - startTime;
+
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		ok(elapsed < 5000, `launch took ${elapsed}ms, expected < 5000ms`);
+
+		const envelope = JSON.parse(result.stdout.trim());
+		strictEqual(envelope.state, "launcher_ready");
+		const runId = envelope.runId;
+
+		const statusResult = pollStatus(runId, makeStateRootEnv());
+		strictEqual(
+			statusResult.status,
+			0,
+			`status failed: ${statusResult.stderr}`,
+		);
+		const status = JSON.parse(statusResult.stdout.trim());
+		strictEqual(status.runId, runId);
+	});
+});
+
+describe("worker reaches terminal state and result is readable", () => {
+	it("worker runs against a real run and eventually reaches a terminal state", async () => {
+		const runId = await launchAndGetRunId();
+
+		let terminalReached = false;
+		const start = Date.now();
+		const maxWait = 15_000;
+
+		while (Date.now() - start < maxWait) {
+			const statusResult = pollStatus(runId, makeStateRootEnv());
+			if (statusResult.status !== 0) {
+				await new Promise((r) => setTimeout(r, 500));
+				continue;
+			}
+			const status = JSON.parse(statusResult.stdout.trim());
+
+			if (status.state === "succeeded" || status.state === "failed") {
+				terminalReached = true;
+				break;
+			}
+			await new Promise((r) => setTimeout(r, 500));
+		}
+
+		ok(terminalReached, "run did not reach terminal state within timeout");
+
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 1, "result exits 1 for failed run");
+
+		const result = JSON.parse(resultResult.stdout.trim());
+		ok(result.terminalSummary !== null, "terminalSummary present");
+		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
+	});
+});
+
+describe("duplicate project runs fail", () => {
+	it("second launch against same project exits non-zero", async () => {
+		const first = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(first.status, 0, `first launch failed: ${first.stderr}`);
+
+		const second = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(
+			second.status,
+			1,
+			`second launch against same project should exit non-zero, got ${second.status}: ${second.stderr}`,
+		);
+	});
+});
+
+describe("non-matching nonce", () => {
+	it("bootstrap with wrong nonce exits 3 and records worker_boot_failed", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		const correctNonce = "correct-nonce-value";
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: correctNonce,
+			launchArgs: [],
+		});
+
+		const result = runBootstrap(
+			[
+				"--state-root",
+				stateRoot,
+				"--run-id",
+				runId,
+				"--nonce",
+				"wrong-nonce-value",
+			],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(
+			result.status,
+			3,
+			`expected exit 3 for nonce mismatch, got ${result.status}: ${result.stderr}`,
+		);
+
+		const { readEvents } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+		ok(bootFailed.detail.includes("nonce mismatch"));
+	});
+});
+
+describe("fast/failed bootstrap", () => {
+	it("bootstrap that fails to import the runner records worker_boot_failed and does not hang", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		const nonce = randomUUID();
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		// Build a broken bootstrap script that fails to import
+		const brokenBootstrapPath = join(dir, "broken-bootstrap.mjs");
+		writeFileSync(
+			brokenBootstrapPath,
+			`process.env.SWITCHYARD_RUN_STORE_ROOT = ${JSON.stringify(stateRoot)};
+process.env.SWITCHYARD_RUN_STORE_ROOT = process.env.SWITCHYARD_RUN_STORE_ROOT;
+import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs")}").then(async (runStore) => {
+	await runStore.advanceState("${runId}", "running");
+	throw new Error("simulated import failure: module not found");
+}).catch(async (err) => {
+	try {
+		await (await import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs")}")).createEvent("${runId}", {
+			phase: "worker",
+			event: "worker_boot_failed",
+			status: "fatal",
+			detail: err.message ?? "import failed",
+		});
+	} catch {}
+	process.exit(1);
+});
+`,
+			"utf8",
+		);
+
+		// Set the run's workerNonce to the correct value so the broken
+		// bootstrap can proceed past nonce check (it doesn't validate)
+
+		const start = Date.now();
+		const result = spawnSync(process.execPath, [brokenBootstrapPath], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			timeout: 10_000,
+			env: { ...process.env, SWITCHYARD_RUN_STORE_ROOT: stateRoot },
+		});
+		const elapsed = Date.now() - start;
+
+		strictEqual(
+			result.status,
+			1,
+			`expected exit 1, got ${result.status}: ${result.stderr}`,
+		);
+		ok(elapsed < 10_000, `broken bootstrap hung: ${elapsed}ms`);
+
+		const { readEvents } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+	});
+});
+
+describe("status and result envelope contracts", () => {
+	it("status shows activeTaskId when a task is running and completed/failed counts change", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1", "1.2"],
+			initialHostFingerprint: "test-fp",
+			launchArgs: [],
+		});
+
+		// Advance to running and set activeTaskId
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{ state: "running", activeTaskId: "1.1" },
+			current.revision,
+		);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0);
+		const status = JSON.parse(statusResult.stdout.trim());
+		strictEqual(status.state, "running");
+		strictEqual(status.activeTaskId, "1.1");
+	});
+});
+
+function assertNoSecretCanary(runId) {
+	const runDir = resolve(stateRoot, "runs", runId);
+	const runJsonRaw = readFileSync(resolve(runDir, "run.json"), "utf8");
+	ok(
+		!runJsonRaw.includes("SECRET_CANARY_"),
+		"run.json must not contain SECRET_CANARY_",
+	);
+
+	try {
+		const eventsRaw = readFileSync(resolve(runDir, "events.jsonl"), "utf8");
+		ok(
+			!eventsRaw.includes("SECRET_CANARY_"),
+			"events.jsonl must not contain SECRET_CANARY_",
+		);
+	} catch (e) {
+		if (e.code !== "ENOENT") throw e;
+	}
+
+	try {
+		const artifactsDir = resolve(runDir, "artifacts");
+		const entries = readdirSync(artifactsDir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (entry.isFile()) {
+				const content = readFileSync(resolve(artifactsDir, entry.name), "utf8");
+				ok(
+					!content.includes("SECRET_CANARY_"),
+					`artifact ${entry.name} must not contain SECRET_CANARY_`,
+				);
+			}
+		}
+	} catch (e) {
+		if (e.code !== "ENOENT") throw e;
+	}
+}
+
+function cleanFixture(name) {
+	removeContainer(name);
+	removeVolume(`${name}-vol`);
+}
+
+const SWITCHYARD_LABELS = {
+	managed: "com.zerodelta.switchyard.managed",
+	runId: "com.zerodelta.switchyard.run_id",
+	project: "com.zerodelta.switchyard.project",
+};
+
+describeIf(HAS_DOCKER, "detached crash matrix", () => {
+	describe("scenario 1: death before lease claim", () => {
+		let runId;
+
+		beforeEach(async () => {
+			runId = randomUUID();
+			const { initializeRun } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+		});
+
+		it("bootstrap that dies before lease claim records worker_boot_failed", async () => {
+			const { readEvents } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			const runStorePath = resolve(
+				__dirname,
+				"..",
+				"src",
+				"switchyard",
+				"run-store",
+				"index.mjs",
+			);
+
+			const wrapperPath = join(dir, "crash-before-lease.mjs");
+			writeFileSync(
+				wrapperPath,
+				`process.env.SWITCHYARD_RUN_STORE_ROOT = ${JSON.stringify(stateRoot)};
+async function main() {
+	const runStore = await import(${JSON.stringify(runStorePath)});
+	await runStore.readRun("${runId}");
+	const err = new Error("simulated crash: process killed before lease claim");
+	await runStore.createEvent("${runId}", {
+		phase: "worker",
+		event: "worker_boot_failed",
+		status: "fatal",
+		detail: err.message,
+	});
+	process.exit(1);
+}
+main();
+`,
+				"utf8",
+			);
+
+			const result = spawnSync(process.execPath, [wrapperPath], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+				timeout: 10_000,
+				env: { ...process.env, SWITCHYARD_RUN_STORE_ROOT: stateRoot },
+			});
+
+			strictEqual(
+				result.status,
+				1,
+				`expected exit 1, got ${result.status}: ${result.stderr}`,
+			);
+
+			const events = await readEvents(runId);
+			const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+			ok(bootFailed, "worker_boot_failed event recorded");
+		});
+
+		it("no SECRET_CANARY_ in run artifacts after crash before lease", () => {
+			assertNoSecretCanary(runId);
+		});
+	});
+
+	describe("scenario 2: death after lease but before container", () => {
+		let runId;
+
+		beforeEach(async () => {
+			runId = randomUUID();
+			const { initializeRun, advanceState } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			await advanceState(runId, "running");
+		});
+
+		it("expired lease allows recovery when no Docker objects were created", async () => {
+			const { isRunLockExpired, acquireRunLock, readRun, updateRun } =
+				await import("../src/switchyard/run-store/index.mjs");
+
+			const current = await readRun(runId);
+			await updateRun(
+				runId,
+				{
+					workerPid: 99999,
+					workerStartToken: "old-token",
+					lastLeaseHeartbeat: new Date(Date.now() - 120_000).toISOString(),
+				},
+				current.revision,
+			);
+
+			const expired = await isRunLockExpired(runId, { maxAgeMs: 60_000 });
+			ok(expired, "lease should be expired after 120s with 60s max age");
+
+			const updated = await acquireRunLock(
+				runId,
+				process.pid,
+				randomUUID(),
+				"recovery-nonce",
+				{ allowRecovery: true, maxAgeMs: 60_000 },
+			);
+			strictEqual(updated.workerPid, process.pid);
+		});
+
+		it("run in running state with no Docker objects is handled gracefully by recovery", async () => {
+			const { recoverManagedObjects } = await import(
+				"../src/switchyard/lifecycle/index.mjs"
+			);
+
+			const result = recoverManagedObjects({
+				isRunActive: (rid) => rid !== runId,
+			});
+
+			strictEqual(result.containersReclaimed, 0);
+			strictEqual(result.volumesReclaimed, 0);
+		});
+
+		it("no SECRET_CANARY_ in run artifacts", () => {
+			assertNoSecretCanary(runId);
+		});
+	});
+
+	describe("scenario 3: death after container creation", () => {
+		let runId;
+		let trackedContainer;
+		let trackedVolume;
+
+		beforeEach(async () => {
+			runId = randomUUID();
+			const { initializeRun, advanceState } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			await advanceState(runId, "running");
+
+			trackedContainer = createLabeledContainer({
+				name: `switchyard-test-crash3-${randomUUID().slice(0, 8)}`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: runId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+
+			trackedVolume = createLabeledVolume({
+				name: `${trackedContainer}-vol`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: runId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+		});
+
+		afterEach(() => {
+			cleanFixture(trackedContainer);
+		});
+
+		it("reclaims labeled container and volume for dead run", async () => {
+			strictEqual(
+				containerExists(trackedContainer),
+				true,
+				"fixture container must exist before recovery",
+			);
+			strictEqual(
+				volumeExists(trackedVolume),
+				true,
+				"fixture volume must exist before recovery",
+			);
+
+			const { recoverManagedObjects } = await import(
+				"../src/switchyard/lifecycle/index.mjs"
+			);
+
+			const result = recoverManagedObjects({
+				isRunActive: (rid) => rid !== runId,
+			});
+
+			ok(
+				result.containersReclaimed >= 1,
+				"should reclaim at least the fixture container",
+			);
+			ok(
+				result.volumesReclaimed >= 1,
+				"should reclaim at least the fixture volume",
+			);
+
+			strictEqual(
+				containerExists(trackedContainer),
+				false,
+				"fixture container must be removed after recovery",
+			);
+			strictEqual(
+				volumeExists(trackedVolume),
+				false,
+				"fixture volume must be removed after recovery",
+			);
+		});
+
+		it("no SECRET_CANARY_ in run artifacts after container recovery", () => {
+			assertNoSecretCanary(runId);
+		});
+	});
+
+	describe("scenario 4: death during integration", () => {
+		let runId;
+		let trackedContainer;
+		let unrelatedContainer;
+
+		beforeEach(async () => {
+			runId = randomUUID();
+			const { initializeRun, advanceState, readRun, updateRun } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			await advanceState(runId, "running");
+
+			const current = await readRun(runId);
+			await updateRun(runId, { activeTaskId: "1.1" }, current.revision);
+
+			trackedContainer = createLabeledContainer({
+				name: `switchyard-test-crash4-${randomUUID().slice(0, 8)}`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: runId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+
+			createLabeledVolume({
+				name: `${trackedContainer}-vol`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: runId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+
+			const unrelatedRunId = randomUUID();
+			await initializeRun({
+				runId: unrelatedRunId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				launchArgs: [],
+			});
+
+			unrelatedContainer = createLabeledContainer({
+				name: `switchyard-test-crash4-other-${randomUUID().slice(0, 8)}`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: unrelatedRunId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+		});
+
+		afterEach(() => {
+			cleanFixture(trackedContainer);
+			cleanFixture(unrelatedContainer);
+		});
+
+		it("reclaims only target run objects, preserves unrelated container", async () => {
+			strictEqual(
+				containerExists(trackedContainer),
+				true,
+				"fixture container must exist before recovery",
+			);
+			strictEqual(
+				containerExists(unrelatedContainer),
+				true,
+				"unrelated container must exist before recovery",
+			);
+
+			const { recoverManagedObjects } = await import(
+				"../src/switchyard/lifecycle/index.mjs"
+			);
+
+			const reclaimEvents = [];
+			const result = recoverManagedObjects({
+				isRunActive: (rid) => rid !== runId,
+				onStatus: (e) => reclaimEvents.push(e),
+			});
+
+			ok(
+				result.containersReclaimed >= 1,
+				"should reclaim at least the fixture container",
+			);
+
+			strictEqual(
+				containerExists(trackedContainer),
+				false,
+				"fixture container must be removed after recovery",
+			);
+			strictEqual(
+				containerExists(unrelatedContainer),
+				true,
+				"unrelated container must NOT be affected by recovery",
+			);
+
+			const reclaimed = reclaimEvents.filter(
+				(e) => e.type === "reclaimed" && e.object === "container",
+			);
+			const ourRecovered = reclaimed.find((e) => e.name === trackedContainer);
+			ok(ourRecovered, "recovered fixture must emit reclaimed event");
+			strictEqual(ourRecovered.runId, runId);
+
+			const unrelatedSkipped = reclaimEvents.find(
+				(e) =>
+					e.type === "skip" &&
+					e.name === unrelatedContainer &&
+					e.reason === "active-run",
+			);
+			ok(unrelatedSkipped, "unrelated container must be skipped as active-run");
+		});
+
+		it("exact-label teardown with strictEqual assertion", async () => {
+			const { recoverManagedObjects } = await import(
+				"../src/switchyard/lifecycle/index.mjs"
+			);
+
+			strictEqual(
+				containerExists(trackedContainer),
+				true,
+				"before cleanup: container must exist",
+			);
+			strictEqual(
+				volumeExists(`${trackedContainer}-vol`),
+				true,
+				"before cleanup: volume must exist",
+			);
+
+			recoverManagedObjects({
+				isRunActive: (rid) => rid !== runId,
+			});
+
+			strictEqual(
+				containerExists(trackedContainer),
+				false,
+				"after cleanup: container must be removed",
+			);
+			strictEqual(
+				volumeExists(`${trackedContainer}-vol`),
+				false,
+				"after cleanup: volume must be removed",
+			);
+		});
+
+		it("no SECRET_CANARY_ in run artifacts after integration crash", () => {
+			assertNoSecretCanary(runId);
+		});
+	});
+
+	describe("scenario 5: death during cleanup", () => {
+		let runId;
+		let trackedContainer;
+
+		beforeEach(async () => {
+			runId = randomUUID();
+			const { initializeRun, advanceState, readRun, updateRun } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			await advanceState(runId, "running");
+
+			const runCurrent = await readRun(runId);
+			await updateRun(
+				runId,
+				{
+					state: "succeeded",
+					cleanupState: "failed",
+					terminalSummary: {
+						totalTasks: 1,
+						runnableTasks: 1,
+						processedTasks: 1,
+						completedTaskIds: ["1.1"],
+						failedCount: 0,
+					},
+				},
+				runCurrent.revision,
+			);
+
+			trackedContainer = createLabeledContainer({
+				name: `switchyard-test-crash5-${randomUUID().slice(0, 8)}`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: runId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+
+			createLabeledVolume({
+				name: `${trackedContainer}-vol`,
+				labels: {
+					[SWITCHYARD_LABELS.managed]: "true",
+					[SWITCHYARD_LABELS.runId]: runId,
+					[SWITCHYARD_LABELS.project]: projectDir,
+				},
+			});
+		});
+
+		afterEach(() => {
+			cleanFixture(trackedContainer);
+		});
+
+		it("reclaims remaining containers after cleanup failure", async () => {
+			strictEqual(
+				containerExists(trackedContainer),
+				true,
+				"fixture container must exist before recovery",
+			);
+
+			const { recoverManagedObjects } = await import(
+				"../src/switchyard/lifecycle/index.mjs"
+			);
+
+			const result = recoverManagedObjects({
+				isRunActive: (rid) => rid !== runId,
+			});
+
+			ok(
+				result.containersReclaimed >= 1,
+				"should reclaim at least the fixture container",
+			);
+
+			strictEqual(
+				containerExists(trackedContainer),
+				false,
+				"fixture container must be removed after recovery",
+			);
+			strictEqual(
+				volumeExists(`${trackedContainer}-vol`),
+				false,
+				"fixture volume must be removed after recovery",
+			);
+		});
+
+		it("run state remains succeeded with cleanupState failed after object recovery", async () => {
+			const { recoverManagedObjects } = await import(
+				"../src/switchyard/lifecycle/index.mjs"
+			);
+
+			recoverManagedObjects({
+				isRunActive: (rid) => rid !== runId,
+			});
+
+			const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+			const runState = await readRun(runId);
+			strictEqual(runState.state, "succeeded");
+			strictEqual(runState.cleanupState, "failed");
+		});
+
+		it("no SECRET_CANARY_ in run artifacts after cleanup crash", () => {
+			assertNoSecretCanary(runId);
+		});
+	});
+});

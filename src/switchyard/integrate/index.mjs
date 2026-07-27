@@ -133,6 +133,40 @@ export function dequoteGitPath(path) {
 }
 
 /**
+ * Extract rename source and destination paths from a `git apply --summary`
+ * rename line. Handles both the plain format (`rename old => new`) and the
+ * shared-prefix format (`rename prefix/{old => new} (100%)`).
+ * @param {string} line A summary line
+ * @returns {{old: string, new: string}|null} Dequoted paths, or null if the
+ *   line is not a recognised rename.
+ */
+function parseRenamePaths(line) {
+	// Shared-prefix format: rename prefix/{old => new} (100%)
+	// Try this FIRST — it's more specific than the plain format.
+	let match = line.match(/^\s*rename\s+(.+?)\{([^}]+?)\s+=>\s+([^}]+)\}(.*)$/);
+	if (match) {
+		const prefix = match[1];
+		const oldTail = match[2].trim();
+		const newTail = match[3].trim();
+		return {
+			old: dequoteGitPath(`${prefix}${oldTail}`),
+			new: dequoteGitPath(`${prefix}${newTail}`),
+		};
+	}
+
+	// Plain format: rename old/path => new/path
+	match = line.match(/^\s*rename\s+(.+?)\s+=>\s+(.+?)(?:\s*\([^)]*\))?\s*$/);
+	if (match) {
+		return {
+			old: dequoteGitPath(match[1].trim()),
+			new: dequoteGitPath(match[2].trim()),
+		};
+	}
+
+	return null;
+}
+
+/**
  * Extract the file paths a diff touches via `git apply --numstat` (git's own
  * diff parser, not a hand-rolled regex over diff text).
  *
@@ -276,9 +310,26 @@ function applyReviewedDiff(diff, projectPath) {
  *   that touches a build/execution-manifest file (package.json, Makefile,
  *   Dockerfile, shell scripts, CI configs) to auto-apply. Without this, such
  *   a diff is rejected with requiresReview:true instead of silently running.
- * @returns {{success: boolean, message: string, requiresReview?: boolean, sensitivePaths?: string[]}} Result
+ * @param {string[]|null} [options.requiredPaths] When non-null, enforce exact
+ *   Files allowlist: every declared path must be touched and every touched
+ *   path must be declared. Composes with (does not replace) structural checks.
+ * @returns {{success: boolean, message: string, requiresReview?: boolean,
+ *   sensitivePaths?: string[], missingPaths?: string[], extraPaths?: string[],
+ *   structural_error?: string}} Result
  */
 export function integrationGate(diff, projectPath, options = {}) {
+	const { requiredPaths = null } = options;
+
+	// Required-paths: empty diff check runs BEFORE patch normalization so we
+	// don't accidentally re-terminate an empty string into "\n" and treat it
+	// as a (weird) non-empty patch.
+	if (
+		requiredPaths !== null &&
+		(!diff || typeof diff !== "string" || !diff.trim())
+	) {
+		return { success: false, message: "empty_required_diff" };
+	}
+
 	// `git apply` requires a newline-terminated patch. Every adapter's
 	// captureDiff() returns `diff.trim()`, and executeTaskWithOrchestrator
 	// trims the orchestrator's diff too — both strip that terminator, so a real
@@ -291,6 +342,64 @@ export function integrationGate(diff, projectPath, options = {}) {
 		typeof diff === "string" && diff.length > 0 && !diff.endsWith("\n")
 			? `${diff}\n`
 			: diff;
+
+	// Files enforcement: check declared vs touched paths.
+	// Runs BEFORE the structural checks in validateDiff; still calls
+	// validateDiff afterward so structural errors compose (both sets of
+	// errors are reported).
+	if (requiredPaths !== null) {
+		const touchedPaths = extractTouchedPaths(patch, projectPath);
+		if (touchedPaths === null) {
+			return {
+				success: false,
+				message: "diff could not be parsed by git apply",
+			};
+		}
+
+		const summaryLines = extractSummaryLines(patch, projectPath);
+		const touchedForDeclaration = new Set(touchedPaths);
+		for (const line of summaryLines) {
+			const paths = parseRenamePaths(line);
+			if (paths) {
+				touchedForDeclaration.add(paths.old);
+				touchedForDeclaration.add(paths.new);
+			}
+		}
+
+		const requiredSet = new Set(requiredPaths);
+		const missingPaths = requiredPaths.filter(
+			(p) => !touchedForDeclaration.has(p),
+		);
+		const extraPaths = touchedPaths.filter((p) => !requiredSet.has(p));
+
+		if (missingPaths.length > 0) {
+			const validation = validateDiff(patch, projectPath);
+			const result = {
+				success: false,
+				message: "required_paths_missing",
+				missingPaths,
+			};
+			if (!validation.safe) {
+				result.structural_error = validation.reason;
+			}
+			return result;
+		}
+
+		if (extraPaths.length > 0) {
+			const validation = validateDiff(patch, projectPath);
+			const result = {
+				success: false,
+				message: "undeclared_paths_touched",
+				extraPaths,
+			};
+			if (!validation.safe) {
+				result.structural_error = validation.reason;
+			}
+			return result;
+		}
+
+		// Exact match — fall through to structural validation.
+	}
 
 	const validation = validateDiff(patch, projectPath);
 	if (!validation.safe) {

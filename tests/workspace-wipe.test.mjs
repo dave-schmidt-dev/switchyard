@@ -4,10 +4,12 @@
 // regression in the real code path — not just "docker works" — is caught.
 
 import { strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { after, before, describe, it } from "node:test";
 import {
 	createWorkingContainer,
+	listManagedContainers,
+	listManagedVolumes,
 	wipeWorkingContainer,
 	workingContainerExists,
 } from "../src/switchyard/lifecycle/index.mjs";
@@ -78,11 +80,11 @@ describe("workspace wipe", () => {
 
 	it("wipeWorkingContainer removes the working container at project end", () => {
 		// `docker stop` on a plain `sleep infinity` PID 1 ignores SIGTERM (no
-		// signal handler), so this waits out the ~10s default grace period
-		// before SIGKILL — expected, not a hang.
-		const wiped = wipeWorkingContainer(workingContainerName);
+		// signal handler), so this waits out the default grace period before
+		// SIGKILL — expected, not a hang.
+		const result = wipeWorkingContainer(workingContainerName);
 
-		strictEqual(wiped, true);
+		strictEqual(result.verified, true);
 		strictEqual(
 			workingContainerExists(workingContainerName),
 			false,
@@ -153,6 +155,260 @@ describe("workingContainerExists exact-name matching (substring-overlap regressi
 			workingContainerExists("switchyard-test-overlap"),
 			false,
 			"a name that only partially matches must not read as present",
+		);
+	});
+});
+
+describe("labeled container creation", () => {
+	const TEST_RUN_ID = "test-run-1";
+	const TEST_PROJECT = "/tmp/switchyard-label-test-project";
+	const TEST_WORKING_IMAGE = "alpine:latest";
+	let labeledContainerName;
+
+	before(() => {
+		labeledContainerName = createWorkingContainer(
+			TEST_PROJECT,
+			TEST_WORKING_IMAGE,
+			{ runId: TEST_RUN_ID },
+		);
+	});
+
+	after(() => {
+		if (labeledContainerName) {
+			try {
+				execFileSync("docker", ["rm", "-f", "-v", labeledContainerName], {
+					stdio: "pipe",
+				});
+			} catch {
+				/* ignore */
+			}
+			try {
+				execFileSync(
+					"docker",
+					["volume", "rm", "-f", `${labeledContainerName}-vol`],
+					{ stdio: "pipe" },
+				);
+			} catch {
+				/* ignore */
+			}
+		}
+	});
+
+	it("container has managed label", () => {
+		const info = JSON.parse(
+			execFileSync(
+				"docker",
+				[
+					"inspect",
+					"--format",
+					"{{json .Config.Labels}}",
+					labeledContainerName,
+				],
+				{ encoding: "utf8", stdio: "pipe" },
+			),
+		);
+		strictEqual(
+			info["com.zerodelta.switchyard.managed"],
+			"true",
+			"container must carry the managed=true label",
+		);
+	});
+
+	it("container has run_id label", () => {
+		const info = JSON.parse(
+			execFileSync(
+				"docker",
+				[
+					"inspect",
+					"--format",
+					"{{json .Config.Labels}}",
+					labeledContainerName,
+				],
+				{ encoding: "utf8", stdio: "pipe" },
+			),
+		);
+		strictEqual(
+			info["com.zerodelta.switchyard.run_id"],
+			TEST_RUN_ID,
+			"container must carry the correct run_id label",
+		);
+	});
+
+	it("container has project label (12-char hex hash)", () => {
+		const info = JSON.parse(
+			execFileSync(
+				"docker",
+				[
+					"inspect",
+					"--format",
+					"{{json .Config.Labels}}",
+					labeledContainerName,
+				],
+				{ encoding: "utf8", stdio: "pipe" },
+			),
+		);
+		const ph = info["com.zerodelta.switchyard.project"];
+		strictEqual(typeof ph, "string", "project label must be a string");
+		strictEqual(ph.length, 12, "project hash must be 12 hex chars");
+		strictEqual(
+			/^[0-9a-f]{12}$/.test(ph),
+			true,
+			"project hash must be lowercase hex",
+		);
+	});
+
+	it("volume has managed label", () => {
+		const info = JSON.parse(
+			execFileSync(
+				"docker",
+				[
+					"volume",
+					"inspect",
+					"--format",
+					"{{json .Labels}}",
+					`${labeledContainerName}-vol`,
+				],
+				{ encoding: "utf8", stdio: "pipe" },
+			),
+		);
+		strictEqual(
+			info?.["com.zerodelta.switchyard.managed"],
+			"true",
+			"volume must carry the managed=true label",
+		);
+	});
+
+	it("volume has run_id label", () => {
+		const info = JSON.parse(
+			execFileSync(
+				"docker",
+				[
+					"volume",
+					"inspect",
+					"--format",
+					"{{json .Labels}}",
+					`${labeledContainerName}-vol`,
+				],
+				{ encoding: "utf8", stdio: "pipe" },
+			),
+		);
+		strictEqual(
+			info?.["com.zerodelta.switchyard.run_id"],
+			TEST_RUN_ID,
+			"volume must carry the correct run_id label",
+		);
+	});
+
+	it("listManagedContainers returns labeled container", () => {
+		const containers = listManagedContainers();
+		const found = containers.find((c) => c.name === labeledContainerName);
+		strictEqual(
+			typeof found,
+			"object",
+			"labeled container must appear in list",
+		);
+		strictEqual(found.runId, TEST_RUN_ID);
+		strictEqual(typeof found.project, "string");
+		strictEqual(typeof found.status, "string");
+	});
+
+	it("listManagedVolumes returns labeled volume", () => {
+		const volumes = listManagedVolumes();
+		const found = volumes.find((v) => v.name === `${labeledContainerName}-vol`);
+		strictEqual(typeof found, "object", "labeled volume must appear in list");
+		strictEqual(found.runId, TEST_RUN_ID);
+	});
+
+	it("backward compat: createWorkingContainer without options still works and has no labels", () => {
+		const name = createWorkingContainer(TEST_PROJECT, TEST_WORKING_IMAGE);
+		strictEqual(typeof name, "string");
+		strictEqual(workingContainerExists(name), true);
+
+		// Verify no switchyard labels are present
+		const info = JSON.parse(
+			execFileSync(
+				"docker",
+				["inspect", "--format", "{{json .Config.Labels}}", name],
+				{ encoding: "utf8", stdio: "pipe" },
+			),
+		);
+		strictEqual(
+			info === null || info["com.zerodelta.switchyard.managed"] === undefined,
+			true,
+			"unlabeled container must not carry managed label",
+		);
+
+		// Clean up
+		try {
+			execFileSync("docker", ["rm", "-f", "-v", name], { stdio: "pipe" });
+		} catch {
+			/* ignore */
+		}
+		try {
+			execFileSync("docker", ["volume", "rm", "-f", `${name}-vol`], {
+				stdio: "pipe",
+			});
+		} catch {
+			/* ignore */
+		}
+	});
+});
+
+describe("idempotent wipe", () => {
+	const TEST_PROJECT_PATH = "/tmp/switchyard-test-project";
+	const TEST_WORKING_IMAGE = "alpine:latest";
+	let wipeContainerName;
+
+	before(() => {
+		wipeContainerName = createWorkingContainer(
+			TEST_PROJECT_PATH,
+			TEST_WORKING_IMAGE,
+		);
+	});
+
+	after(() => {
+		if (wipeContainerName) {
+			try {
+				execFileSync("docker", ["rm", "-f", "-v", wipeContainerName], {
+					stdio: "pipe",
+				});
+			} catch {
+				/* ignore */
+			}
+			try {
+				execFileSync(
+					"docker",
+					["volume", "rm", "-f", `${wipeContainerName}-vol`],
+					{ stdio: "pipe" },
+				);
+			} catch {
+				/* ignore */
+			}
+		}
+	});
+
+	it("wipe returns structured outcome fields", () => {
+		const result = wipeWorkingContainer(wipeContainerName);
+		strictEqual(typeof result.containerRemoved, "boolean");
+		strictEqual(typeof result.volumeRemoved, "boolean");
+		strictEqual(typeof result.verified, "boolean");
+		strictEqual(result.verified, true);
+	});
+
+	it("repeated wipe does not throw", () => {
+		// First wipe consumed the container; second wipe must succeed (idempotent)
+		let threw = false;
+		try {
+			const result = wipeWorkingContainer(wipeContainerName);
+			// After first wipe, container/volume already gone — verified should be true
+			strictEqual(result.verified, true);
+		} catch {
+			threw = true;
+		}
+		strictEqual(
+			threw,
+			false,
+			"second wipe must not throw when container is already gone",
 		);
 	});
 });
