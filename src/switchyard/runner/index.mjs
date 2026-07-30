@@ -13,6 +13,7 @@ import {
 	captureDiff as captureCodexDiff,
 	executeCodex,
 } from "../adapter/codex.mjs";
+import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../adapter/constants.mjs";
 import {
 	captureDiff as captureCopilotDiff,
 	execute as executeCopilot,
@@ -610,6 +611,33 @@ export function executeTask(task, context) {
 		};
 	}
 
+	// Emitted here, before the blocking adapter.execute call below, so the
+	// routed provider/model/deadline are visible immediately rather than only
+	// discoverable after the (up to PROVIDER_EXECUTION_TIMEOUT_MS-long) call
+	// returns.
+	const routedDeadline = new Date(
+		Date.now() + PROVIDER_EXECUTION_TIMEOUT_MS,
+	).toISOString();
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "execution",
+			event: "task_routed",
+			status: `Task ${task.id} routed to ${routeResult.provider}${routeResult.model ? `/${routeResult.model}` : ""}`,
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			deadline: routedDeadline,
+		});
+	}
+	if (context.onTaskRouted) {
+		context.onTaskRouted({
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			deadline: routedDeadline,
+		});
+	}
+
 	const prompt = task.prompt || task.description || task.title;
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routeResult.model ?? undefined,
@@ -940,6 +968,42 @@ function _safeError(error) {
 }
 
 /**
+ * Fail closed when a tasks file parses to zero tasks — this always indicates
+ * a schema mismatch (wrong heading level, empty file, corrupted markdown),
+ * never a legitimate "nothing to do" state. Writes an auditable checkpoint
+ * carrying the failure detail before throwing, so a run that never reaches
+ * the per-task loop still leaves the checkpoint file its caller reports.
+ * @param {string} tasksFilePath
+ * @param {string} checkpointPath
+ * @param {Function|null} emitStatus
+ * @throws {Error} always
+ */
+function throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus) {
+	const message =
+		`runQueue: no tasks parsed from ${tasksFilePath} — 0 headings matching ` +
+		`"### Task <id>: <title>" were found. Expected format:\n` +
+		`### Task <id>: <title>\n- **Status:** pending\n- **Description:** ...`;
+	const failureCheckpoint = createEmptyCheckpoint(tasksFilePath);
+	failureCheckpoint.parseError = {
+		message: "no tasks parsed",
+		tasksFilePath,
+		detectedHeadings: 0,
+		expectedFormat: "### Task <id>: <title>",
+	};
+	failureCheckpoint.lastUpdatedAt = new Date().toISOString();
+	saveCheckpoint(checkpointPath, failureCheckpoint);
+	if (emitStatus) {
+		emitStatus({
+			phase: "bootstrap",
+			event: "parse_failed",
+			status: message,
+			error: { tasksFilePath, detectedHeadings: 0 },
+		});
+	}
+	throw new Error(message);
+}
+
+/**
  * Run queue serially with host-side checkpointing.
  * @param {object} options
  * @param {string} options.tasksFilePath
@@ -974,6 +1038,7 @@ export function runQueue(options) {
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 	const onTaskStart = dependencies.onTaskStart ?? null;
+	const onTaskRouted = dependencies.onTaskRouted ?? null;
 	const onResult = dependencies.onResult ?? null;
 	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
 	const runStore = dependencies.runStore ?? null;
@@ -1039,6 +1104,7 @@ export function runQueue(options) {
 		projectPath,
 		workingContainerName,
 		onStatus: emitStatus,
+		onTaskRouted,
 	};
 
 	try {
@@ -1059,6 +1125,9 @@ export function runQueue(options) {
 		}
 
 		const tasks = loadTaskQueue(tasksFilePath);
+		if (tasks.length === 0) {
+			throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus);
+		}
 		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
 		const runnable = getRunnableTasks(tasks, checkpoint);
 		const results = [];
@@ -1220,6 +1289,12 @@ export function runQueue(options) {
 				.catch(() => {});
 		}
 
+		// Guarantee a checkpoint file exists at the path this return value
+		// reports, even when the per-task loop above never ran (e.g. every
+		// task was already completed by a prior checkpoint) — the caller must
+		// never be handed a checkpointPath with nothing on disk behind it.
+		saveCheckpoint(checkpointPath, checkpoint);
+
 		return {
 			totalTasks: tasks.length,
 			runnableTasks: runnable.length,
@@ -1369,6 +1444,9 @@ export async function runQueueWithOrchestrator(options) {
 		}
 
 		const tasks = loadTaskQueue(tasksFilePath);
+		if (tasks.length === 0) {
+			throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus);
+		}
 		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
 		const runnable = getRunnableTasks(tasks, checkpoint);
 		const results = [];
@@ -1534,6 +1612,12 @@ export async function runQueueWithOrchestrator(options) {
 				})
 				.catch(() => {});
 		}
+
+		// Guarantee a checkpoint file exists at the path this return value
+		// reports, even when the per-task loop above never ran (e.g. every
+		// task was already completed by a prior checkpoint) — the caller must
+		// never be handed a checkpointPath with nothing on disk behind it.
+		saveCheckpoint(checkpointPath, checkpoint);
 
 		return {
 			totalTasks: tasks.length,

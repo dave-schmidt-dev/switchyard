@@ -579,6 +579,102 @@ describe("status and result envelope contracts", () => {
 		strictEqual(status.state, "running");
 		strictEqual(status.activeTaskId, "1.1");
 	});
+
+	it("status exposes workerLive:true and the routed provider/model/deadline for a live worker, without needing docker top", async () => {
+		// Regression: an operator had to shell out to `docker top`/`ps` to
+		// distinguish a genuinely active run from a ghost (a "running" state
+		// whose worker process actually died), and had to inspect the host
+		// process to learn which provider/model a task was routed to.
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fp",
+			launchArgs: [],
+		});
+
+		const deadline = new Date(Date.now() + 1_800_000).toISOString();
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "running",
+				workerPid: process.pid,
+				activeTaskId: "1.1",
+				activeTaskProvider: "claude",
+				activeTaskModel: "claude-sonnet-5",
+				activeTaskDeadline: deadline,
+			},
+			current.revision,
+		);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0);
+		const status = JSON.parse(statusResult.stdout.trim());
+		strictEqual(status.workerLive, true);
+		strictEqual(status.activeTaskProvider, "claude");
+		strictEqual(status.activeTaskModel, "claude-sonnet-5");
+		strictEqual(status.activeTaskDeadline, deadline);
+	});
+
+	it("status exposes workerLive:false for a running state whose worker pid is dead (ghost run)", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fp",
+			launchArgs: [],
+		});
+
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{ state: "running", workerPid: 99999, activeTaskId: "1.1" },
+			current.revision,
+		);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0);
+		const status = JSON.parse(statusResult.stdout.trim());
+		strictEqual(status.workerLive, false);
+	});
+
+	it("status reports workerLive:null for a non-running state (no live-worker question applies)", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fp",
+			launchArgs: [],
+		});
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0);
+		const status = JSON.parse(statusResult.stdout.trim());
+		strictEqual(status.state, "created");
+		strictEqual(status.workerLive, null);
+		strictEqual(status.activeTaskProvider, null);
+		strictEqual(status.activeTaskModel, null);
+		strictEqual(status.activeTaskDeadline, null);
+	});
 });
 
 function assertNoSecretCanary(runId) {

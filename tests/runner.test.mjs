@@ -7,7 +7,13 @@ import {
 	throws,
 } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cwd } from "node:process";
@@ -1256,6 +1262,90 @@ describe("checkpoint durability", () => {
 		);
 		deepStrictEqual(checkpoint.completedTaskIds, []);
 	});
+
+	it("runQueue fails closed instead of silently succeeding when the tasks file parses to zero tasks", () => {
+		// Regression: a tasks file with 0 "### Task <id>: <title>" headings
+		// (wrong heading level, empty file, corrupted markdown) parsed to an
+		// empty array and runQueue returned totalTasks:0/runnableTasks:0 as a
+		// normal success — a silent no-op instead of a loud, diagnosable
+		// failure.
+		const tasksPath = writeTasksFile("## Phase 1\nNo task headings here.\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+					checkpointPath,
+					dependencies: {},
+				}),
+			/no tasks parsed from .*0 headings/,
+		);
+
+		// The auditable checkpoint must exist even though the run never
+		// reached the per-task loop.
+		strictEqual(existsSync(checkpointPath), true);
+		const raw = JSON.parse(readFileSync(checkpointPath, "utf8"));
+		strictEqual(raw.parseError.detectedHeadings, 0);
+		strictEqual(raw.parseError.tasksFilePath, tasksPath);
+	});
+
+	it("runQueueWithOrchestrator also fails closed on a zero-task parse", async () => {
+		const tasksPath = writeTasksFile("## Phase 1\nNo task headings here.\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		await rejects(
+			() =>
+				runQueueWithOrchestrator({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+					checkpointPath,
+					dependencies: {},
+				}),
+			/no tasks parsed from .*0 headings/,
+		);
+		strictEqual(existsSync(checkpointPath), true);
+	});
+
+	it("runQueue always leaves a checkpoint file behind on a normal completion, even with zero runnable tasks", () => {
+		// Regression: saveCheckpoint was only called inside the per-task loop,
+		// so a run whose queue was already fully completed by a prior
+		// checkpoint (runnable.length === 0, totalTasks > 0) returned a
+		// checkpointPath with nothing on disk backing it up on this
+		// invocation.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: ["1.1"],
+			lastTaskId: "1.1",
+			lastUpdatedAt: "2026-01-01T00:00:00Z",
+			results: [{ taskId: "1.1", success: true }],
+		});
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {},
+		});
+
+		strictEqual(result.totalTasks, 1);
+		strictEqual(result.runnableTasks, 0);
+		strictEqual(existsSync(checkpointPath), true);
+		const onDisk = JSON.parse(readFileSync(checkpointPath, "utf8"));
+		deepStrictEqual(onDisk.completedTaskIds, ["1.1"]);
+	});
 });
 
 describe("orchestrator status/result error guards", () => {
@@ -2280,6 +2370,110 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 			"start:1.2",
 			"result:1.2:true",
 		]);
+	});
+
+	it("fires onTaskRouted with provider/model/deadline before the blocking adapter.execute call", () => {
+		// Regression: task_started fires before routing decides a provider, so
+		// an operator watching progress couldn't learn which provider/model was
+		// picked until the (up to 30-minute) adapter call finished. onTaskRouted
+		// must fire between routing and the execute call.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				onTaskRouted: (info) => events.push({ type: "routed", ...info }),
+				adapters: {
+					claude: {
+						execute: () => {
+							events.push({ type: "execute" });
+							return { success: true, output: "ok" };
+						},
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(events.length, 2);
+		strictEqual(events[0].type, "routed");
+		strictEqual(events[0].taskId, "1.1");
+		strictEqual(events[0].provider, "claude");
+		strictEqual(events[0].model, "claude-sonnet-5");
+		ok(
+			new Date(events[0].deadline).getTime() > Date.now(),
+			"deadline must be in the future",
+		);
+		strictEqual(events[1].type, "execute", "routed must fire before execute");
+	});
+
+	it("emits a task_routed onStatus event with provider/model/deadline", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		const routed = events.find((e) => e.event === "task_routed");
+		ok(routed, "task_routed event fired");
+		strictEqual(routed.phase, "execution");
+		strictEqual(routed.provider, "claude");
+		strictEqual(routed.model, "claude-sonnet-5");
+		ok(routed.deadline, "deadline present");
+
+		const routedIndex = events.findIndex((e) => e.event === "task_routed");
+		const completedIndex = events.findIndex(
+			(e) => e.event === "task_completed",
+		);
+		ok(
+			routedIndex < completedIndex,
+			"task_routed must fire before task_completed",
+		);
 	});
 
 	it("runner emits task_started, diff_captured, gate_validated, gate_applied, task_completed, checkpoint_saved, and cleanup events via onStatus", () => {

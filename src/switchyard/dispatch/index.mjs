@@ -282,6 +282,10 @@ function runDispatch(opts) {
 				console.error(
 					`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd(),
 				),
+			onTaskRouted: (info) =>
+				console.error(
+					`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline}`,
+				),
 			onResult: (r) => {
 				const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
 				console.error(
@@ -441,7 +445,14 @@ async function buildStatusEnvelope(runId, run) {
 		runId: run.runId,
 		state: run.state,
 		cleanupState: run.cleanupState,
+		// Liveness derived from a signal-0 probe of the recorded worker pid
+		// (see isWorkerLive), so an operator doesn't have to shell out to
+		// `docker top`/`ps` to tell active work from a stalled/ghost run.
+		workerLive: run.state === "running" ? isWorkerLive(run) : null,
 		activeTaskId: run.activeTaskId ?? null,
+		activeTaskProvider: run.activeTaskProvider ?? null,
+		activeTaskModel: run.activeTaskModel ?? null,
+		activeTaskDeadline: run.activeTaskDeadline ?? null,
 		completedCount,
 		failedCount,
 		updatedAt: run.updatedAt,
@@ -468,7 +479,11 @@ async function buildResultEnvelope(runId, run) {
 		runId: run.runId,
 		state: run.state,
 		cleanupState: run.cleanupState,
+		workerLive: run.state === "running" ? isWorkerLive(run) : null,
 		activeTaskId: run.activeTaskId ?? null,
+		activeTaskProvider: run.activeTaskProvider ?? null,
+		activeTaskModel: run.activeTaskModel ?? null,
+		activeTaskDeadline: run.activeTaskDeadline ?? null,
 		completedCount,
 		failedCount,
 		updatedAt: run.updatedAt,

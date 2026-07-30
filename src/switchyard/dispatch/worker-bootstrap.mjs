@@ -113,16 +113,29 @@ try {
 		maxTasks: Number.POSITIVE_INFINITY,
 		stopOnFailure: true,
 		dependencies: {
+			// These fire-and-forget callbacks all use updateRunWithRetry rather
+			// than a read-then-updateRun(fixed revision) pair: onTaskStart and
+			// onTaskRouted fire microseconds apart (routing is synchronous, ahead
+			// of the blocking adapter.execute call), so both can read the same
+			// base revision and race for the same per-runId update queue slot.
+			// With a fixed expectedRevision, the loser's update throws
+			// RevisionError and is silently dropped by the .catch(() => {})
+			// below, so activeTaskId or activeTaskProvider/Model/Deadline goes
+			// missing nondeterministically. updateRunWithRetry re-reads the
+			// current revision and retries on conflict, so the loser's write
+			// still lands instead of vanishing.
 			onTaskStart: (task) => {
 				runStore
-					.readRun(runId)
-					.then((current) =>
-						runStore.updateRun(
-							runId,
-							{ activeTaskId: task.id },
-							current.revision,
-						),
-					)
+					.updateRunWithRetry(runId, { activeTaskId: task.id })
+					.catch(() => {});
+			},
+			onTaskRouted: (info) => {
+				runStore
+					.updateRunWithRetry(runId, {
+						activeTaskProvider: info.provider,
+						activeTaskModel: info.model,
+						activeTaskDeadline: info.deadline,
+					})
 					.catch(() => {});
 			},
 			onResult: (r) => {
@@ -146,23 +159,17 @@ try {
 				runStore
 					.createEvent(runId, event)
 					.then(() =>
-						runStore
-							.readRun(runId)
-							.then((current) =>
-								runStore.updateRun(
-									runId,
-									{ activeTaskId: null },
-									current.revision,
-								),
-							),
+						runStore.updateRunWithRetry(runId, {
+							activeTaskId: null,
+							activeTaskProvider: null,
+							activeTaskModel: null,
+							activeTaskDeadline: null,
+						}),
 					)
 					.catch(() => {});
 			},
 			onCheckpointSaved: () => {
-				runStore
-					.readRun(runId)
-					.then((current) => runStore.updateRun(runId, {}, current.revision))
-					.catch(() => {});
+				runStore.updateRunWithRetry(runId, {}).catch(() => {});
 			},
 		},
 	});
@@ -171,6 +178,9 @@ try {
 	const terminalPatch = {
 		state: failed.length > 0 ? "failed" : "succeeded",
 		activeTaskId: null,
+		activeTaskProvider: null,
+		activeTaskModel: null,
+		activeTaskDeadline: null,
 		cleanupState: "complete",
 		terminalSummary: {
 			totalTasks: result.totalTasks,
@@ -215,6 +225,9 @@ try {
 			{
 				state: "failed",
 				activeTaskId: null,
+				activeTaskProvider: null,
+				activeTaskModel: null,
+				activeTaskDeadline: null,
 				cleanupState: "complete",
 				terminalSummary: {
 					totalTasks: 0,

@@ -941,4 +941,31 @@ describe("concurrent atomic writes", () => {
 			"the real terminal summary must win, not be lost to the floating writer",
 		);
 	});
+
+	it("two concurrent updateRunWithRetry callers touching different fields both survive", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const { runId } = opts;
+
+		// Mirrors worker-bootstrap's onTaskStart and onTaskRouted: routing is
+		// synchronous and fires microseconds after task-start, so both
+		// callbacks can read the same base revision and race for the same
+		// per-runId update queue slot. Before onTaskStart/onTaskRouted/onResult
+		// were switched to updateRunWithRetry, this shape (two fixed-revision
+		// updateRun calls) would silently drop one caller's write via
+		// RevisionError — the specific regression this fix addresses.
+		const [a, b] = await Promise.all([
+			updateRunWithRetry(runId, { activeTaskId: "task-1" }),
+			updateRunWithRetry(runId, {
+				activeTaskProvider: "claude",
+				activeTaskModel: "claude-sonnet-5",
+			}),
+		]);
+		ok(a && b, "both concurrent updateRunWithRetry calls should resolve");
+
+		const final = await readRun(runId);
+		strictEqual(final.activeTaskId, "task-1");
+		strictEqual(final.activeTaskProvider, "claude");
+		strictEqual(final.activeTaskModel, "claude-sonnet-5");
+	});
 });

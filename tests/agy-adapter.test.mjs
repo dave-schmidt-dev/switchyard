@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { captureDiff, executeAgy } from "../src/switchyard/adapter/agy.mjs";
+import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
@@ -149,9 +150,14 @@ describe("agy adapter host-side timeout", () => {
 		);
 		const printTimeoutMs = Number(printTimeoutMatch[1]) * 60 * 1000;
 
-		const hostTimeoutMatch = source.match(/timeout:\s*(\d+)/);
-		ok(hostTimeoutMatch, "expected to find the host-side execFileSync timeout");
-		const hostTimeoutMs = Number(hostTimeoutMatch[1]);
+		// The host-side timeout is the shared PROVIDER_EXECUTION_TIMEOUT_MS
+		// constant (see adapter/constants.mjs), not a literal in this file, so
+		// resolve it through the constant rather than regex-scanning source.
+		ok(
+			/timeout:\s*PROVIDER_EXECUTION_TIMEOUT_MS/.test(source),
+			"expected agy.mjs to pass PROVIDER_EXECUTION_TIMEOUT_MS as the host-side execFileSync timeout",
+		);
+		const hostTimeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS;
 
 		ok(
 			hostTimeoutMs > printTimeoutMs,

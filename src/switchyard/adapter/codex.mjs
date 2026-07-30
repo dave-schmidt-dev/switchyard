@@ -10,6 +10,7 @@
 
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
+import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CODEX_CMD = "codex";
@@ -141,7 +142,7 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 			input: prompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
-			timeout: 1800000, // 30 minutes
+			timeout: PROVIDER_EXECUTION_TIMEOUT_MS,
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 

@@ -11,6 +11,7 @@
 
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
+import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const AGY_CMD = "agy";
@@ -161,7 +162,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 			// primary timeout mechanism. A shorter host timeout would force-
 			// kill a run that Agy's own flag would otherwise let finish or
 			// time out gracefully.
-			timeout: 1800000, // 30 minutes
+			timeout: PROVIDER_EXECUTION_TIMEOUT_MS,
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
