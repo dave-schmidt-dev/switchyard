@@ -15,9 +15,19 @@ import { validateIdentifier } from "./shell-safety.mjs";
  * itself" (POSIX kill(2)), so this reaches an orphaned provider CLI without
  * needing `pkill`/`ps` to be installed in the agent image. TERM first, then
  * KILL after a short grace period, so a process gets a chance to flush
- * before being forced. Best-effort: swallows all errors, since this runs
- * from an adapter's timeout catch block and must never itself throw or
- * block returning the (already-failed) execution result.
+ * before being forced.
+ *
+ * Also clears a stale `/project/.git/index.lock` left behind if the killed
+ * process was itself mid `git add`/`git commit` (a real, empirically
+ * confirmed case: a stale lock makes captureDiff's own `git add -A` fail,
+ * which its catch-all swallows into a silent `null` — losing the very work
+ * this whole timeout path exists to preserve). Safe specifically at this
+ * point: every process in the container has just been force-killed above, so
+ * nothing can still legitimately hold the lock.
+ *
+ * Best-effort throughout: swallows all errors, since this runs from an
+ * adapter's timeout catch block and must never itself throw or block
+ * returning the (already-failed) execution result.
  * @param {string} containerName
  */
 export function killOrphanedProcesses(containerName) {
@@ -34,7 +44,8 @@ export function killOrphanedProcesses(containerName) {
 				containerName,
 				"sh",
 				"-c",
-				"kill -TERM -1 2>/dev/null; sleep 1; kill -KILL -1 2>/dev/null",
+				"kill -TERM -1 2>/dev/null; sleep 1; kill -KILL -1 2>/dev/null; " +
+					"rm -f /project/.git/index.lock 2>/dev/null",
 			],
 			{ timeout: 5000, stdio: "pipe" },
 		);

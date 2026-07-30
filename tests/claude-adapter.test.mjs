@@ -114,6 +114,14 @@ describe("claude adapter container execution", () => {
 // every second; a frozen counter after the timeout proves the adapter's own
 // in-container kill (adapter/orphan-kill.mjs) actually stopped it, not just
 // that the host-side execFileSync call returned an error.
+//
+// Each iteration also edits a real git-tracked file and re-touches
+// .git/index.lock, simulating a provider killed mid `git` operation (a real
+// failure mode: verified empirically that a stale index.lock makes
+// captureDiff's `git add -A` fail, silently losing the whole partial diff via
+// its catch-all `null` return). This proves both that a coherent partial
+// diff actually lands on disk on timeout, and that killOrphanedProcesses'
+// lock-clearing keeps that path working.
 const TIMEOUT_COUNTER_PATH = "/tmp/switchyard-timeout-counter";
 const TIMEOUT_STUB = `#!/bin/sh
 cat >/dev/null
@@ -121,6 +129,8 @@ i=0
 while [ $i -lt 20 ]; do
   i=$((i+1))
   echo $i > ${TIMEOUT_COUNTER_PATH}
+  echo "edit $i" >> /project/test.txt
+  touch /project/.git/index.lock
   sleep 1
 done
 `;
@@ -134,16 +144,25 @@ describe("claude adapter timeout handling", () => {
 	before(() => {
 		if (!dockerAvailable) return;
 
-		execSync(
-			`docker run -d --name ${timeoutContainerName} --entrypoint sh alpine/git -c "sleep infinity"`,
-			{ stdio: "pipe" },
-		);
-		// executeClaude always execs with `-w /project` (see claude.mjs); the
-		// other describe block's container gets this from its bind mount, but
-		// this one has none, so it must be created explicitly.
-		execSync(`docker exec ${timeoutContainerName} mkdir -p /project`, {
+		writeFileSync(join(timeoutTestRoot, "test.txt"), "base\n", "utf8");
+		execSync("git init", { cwd: timeoutTestRoot, stdio: "pipe" });
+		execSync('git config user.email "test@test.com"', {
+			cwd: timeoutTestRoot,
 			stdio: "pipe",
 		});
+		execSync('git config user.name "Test"', {
+			cwd: timeoutTestRoot,
+			stdio: "pipe",
+		});
+		execSync("git add test.txt", { cwd: timeoutTestRoot, stdio: "pipe" });
+		execSync('git commit -m "base"', { cwd: timeoutTestRoot, stdio: "pipe" });
+
+		// Bind-mounted (unlike the empty-mkdir approach this replaces) so the
+		// stub's edits land in a real git working tree captureDiff can inspect.
+		execSync(
+			`docker run -d --name ${timeoutContainerName} --entrypoint sh -v ${timeoutTestRoot}:/project -w /project alpine/git -c "sleep infinity"`,
+			{ stdio: "pipe" },
+		);
 
 		const stubPath = join(timeoutTestRoot, "claude-stub.sh");
 		writeFileSync(stubPath, TIMEOUT_STUB, { mode: 0o755 });
@@ -204,5 +223,16 @@ describe("claude adapter timeout handling", () => {
 			counterAfterTimeout,
 			"counter kept climbing after the host-side timeout — the in-container process was not actually killed",
 		);
+
+		// The stub leaves a stale .git/index.lock on every iteration, so a diff
+		// here only comes back non-null if killOrphanedProcesses actually
+		// cleared it before this call — without that, captureDiff's `git add -A`
+		// fails and its catch-all silently returns null, losing the edit.
+		const diff = captureDiff(timeoutContainerName);
+		ok(
+			typeof diff === "string",
+			"captureDiff returned null — a stale .git/index.lock from the killed process likely defeated `git add -A`",
+		);
+		ok(diff.includes("edit"), "captured diff should contain the partial edit");
 	});
 });

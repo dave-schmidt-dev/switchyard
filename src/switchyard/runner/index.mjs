@@ -1276,6 +1276,21 @@ export function runQueue(options) {
 				// Raw diff text stays out of checkpoint.json / onResult payloads —
 				// the artifact on disk (partialDiffPath) is the single copy.
 				result.partialDiff = undefined;
+			} else if (result.timedOut) {
+				// The rescue attempt itself came up empty (no edits were made
+				// before the kill, or diff capture failed — e.g. a container in a
+				// state git couldn't diff). Distinct from the diff-captured case so
+				// this doesn't collapse into a generic task_failed: an operator
+				// needs to know whether their in-progress work was actually saved,
+				// not just that the task didn't finish.
+				if (emitStatus) {
+					emitStatus({
+						phase: "execution",
+						event: "partial_diff_capture_failed",
+						status: `Task ${result.taskId} timed out; no diff was recovered (no edits made, or diff capture failed)`,
+						taskId: result.taskId,
+					});
+				}
 			}
 			if (onResult) onResult(result);
 			if (emitStatus) {
