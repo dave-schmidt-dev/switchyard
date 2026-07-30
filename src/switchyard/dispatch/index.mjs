@@ -348,6 +348,17 @@ async function handleLaunch(argv) {
 	const stateRoot = getStateRoot();
 	const runId = randomUUID();
 	const tasks = loadTaskQueue(opts.tasksFilePath);
+	if (tasks.length === 0) {
+		// Fail closed before any run state, lock, or worker exists — mirrors
+		// runQueue's throwOnEmptyParse, but as a UsageError (exit 2) since an
+		// empty/malformed queue is a bad-invocation condition the caller can
+		// fix, not a run-time failure.
+		throw new UsageError(
+			`no tasks parsed from ${opts.tasksFilePath} — 0 headings matching ` +
+				`"### Task <id>: <title>" were found. Expected format:\n` +
+				`### Task <id>: <title>\n- **Status:** pending\n- **Description:** ...`,
+		);
+	}
 	const orderedTaskIds = tasks.map((t) => t.id);
 
 	const launchArgs = process.argv.slice(2).filter((a) => a !== "launch");

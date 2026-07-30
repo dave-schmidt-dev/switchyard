@@ -4,7 +4,14 @@
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -311,6 +318,36 @@ describe("run subcommand equivalence", () => {
 });
 
 describe("launch integration", () => {
+	it("launch with a 0-task queue fails closed: exits 2, no run state or lock created", () => {
+		const emptyTasksFile = join(dir, "empty-tasks.md");
+		writeFileSync(
+			emptyTasksFile,
+			"# Nothing here, no task headings.\n",
+			"utf8",
+		);
+
+		const result = runDispatch(
+			["launch", emptyTasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 2, `stderr: ${result.stderr}`);
+		ok(result.stderr.includes("no tasks parsed"));
+
+		// The failure must land before initializeRun/acquireProjectLock, so
+		// no run directory or project lock is left behind for `launch` to
+		// have silently created ahead of an inevitable worker-side failure.
+		ok(
+			!existsSync(join(stateRoot, "runs")) ||
+				readdirSync(join(stateRoot, "runs")).length === 0,
+			"no run directory should be created for a 0-task queue",
+		);
+		ok(
+			!existsSync(join(stateRoot, "locks")) ||
+				readdirSync(join(stateRoot, "locks")).length === 0,
+			"no project lock should be created for a 0-task queue",
+		);
+	});
+
 	it("launch with valid args exits 0 and produces JSON envelope", () => {
 		const result = runDispatch(
 			["launch", tasksFile, "--project", projectDir],
