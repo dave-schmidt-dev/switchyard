@@ -150,12 +150,20 @@ describe("agy adapter host-side timeout", () => {
 		);
 		const printTimeoutMs = Number(printTimeoutMatch[1]) * 60 * 1000;
 
-		// The host-side timeout is the shared PROVIDER_EXECUTION_TIMEOUT_MS
-		// constant (see adapter/constants.mjs), not a literal in this file, so
-		// resolve it through the constant rather than regex-scanning source.
+		// The host-side timeout defaults to the shared
+		// PROVIDER_EXECUTION_TIMEOUT_MS constant (see adapter/constants.mjs),
+		// but is overridable per task (options.timeoutMs, e.g. a task's
+		// `Timeout:` field) — so the literal passed to execFileSync is the
+		// `timeoutMs` local, not the constant directly. What must still hold
+		// is the DEFAULT: `timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS` in the
+		// options destructuring, and `timeout: timeoutMs` at the call site.
 		ok(
-			/timeout:\s*PROVIDER_EXECUTION_TIMEOUT_MS/.test(source),
-			"expected agy.mjs to pass PROVIDER_EXECUTION_TIMEOUT_MS as the host-side execFileSync timeout",
+			/timeoutMs\s*=\s*PROVIDER_EXECUTION_TIMEOUT_MS/.test(source),
+			"expected agy.mjs to default options.timeoutMs to PROVIDER_EXECUTION_TIMEOUT_MS",
+		);
+		ok(
+			/timeout:\s*timeoutMs/.test(source),
+			"expected agy.mjs to pass timeoutMs as the host-side execFileSync timeout",
 		);
 		const hostTimeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS;
 

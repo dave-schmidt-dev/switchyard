@@ -4,6 +4,8 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { copyFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 
 function parseArg(argv, flag) {
 	const idx = argv.indexOf(flag);
@@ -167,6 +169,23 @@ try {
 						}),
 					)
 					.catch(() => {});
+
+				// Surface a timeout's partial diff through the run's existing
+				// (already-provisioned, previously-unused) artifacts channel so
+				// it shows up in `switchyard result <runId>`'s artifactRefs —
+				// same best-effort, fire-and-forget style as the rest of this
+				// callback.
+				if (r.partialDiffPath) {
+					const artifactsDir = join(runStore.getRunRoot(runId), "artifacts");
+					mkdir(artifactsDir, { recursive: true })
+						.then(() =>
+							copyFile(
+								r.partialDiffPath,
+								join(artifactsDir, `${r.taskId}.diff`),
+							),
+						)
+						.catch(() => {});
+				}
 			},
 			onCheckpointSaved: () => {
 				runStore.updateRunWithRetry(runId, {}).catch(() => {});

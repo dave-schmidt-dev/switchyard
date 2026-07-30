@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
+import { killOrphanedProcesses } from "./orphan-kill.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const COPILOT_CMD = "copilot";
@@ -39,7 +40,7 @@ export function isCopilotAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 }
 
 export function execute(prompt, workingContainerName, options = {}) {
-	const { model } = options;
+	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
@@ -71,16 +72,21 @@ export function execute(prompt, workingContainerName, options = {}) {
 			input: prompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
-			timeout: PROVIDER_EXECUTION_TIMEOUT_MS,
+			timeout: timeoutMs,
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
 		return { output: result, success: true };
 	} catch (error) {
+		const timedOut = error.code === "ETIMEDOUT";
+		if (timedOut) {
+			killOrphanedProcesses(workingContainerName);
+		}
 		return {
 			output: error.stdout || "",
 			success: false,
 			error: error.message,
+			timedOut,
 		};
 	}
 }

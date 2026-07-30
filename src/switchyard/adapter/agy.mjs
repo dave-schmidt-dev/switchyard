@@ -12,6 +12,7 @@
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
+import { killOrphanedProcesses } from "./orphan-kill.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const AGY_CMD = "agy";
@@ -114,10 +115,11 @@ export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  * @param {string} workingContainerName Working container to exec in
  * @param {object} options Execution options
  * @param {string} [options.model] Model to use
- * @returns {{output: string, success: boolean, error?: string}}
+ * @param {number} [options.timeoutMs] Execution timeout in ms (defaults to PROVIDER_EXECUTION_TIMEOUT_MS)
+ * @returns {{output: string, success: boolean, error?: string, timedOut?: boolean}}
  */
 export function executeAgy(prompt, workingContainerName, options = {}) {
-	const { model } = options;
+	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
@@ -157,21 +159,28 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 		const result = execFileSync("docker", args, {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
-			// Must exceed the `--print-timeout 9m` passed above — the host
-			// kill is a backstop for a hung/unresponsive process, not the
-			// primary timeout mechanism. A shorter host timeout would force-
-			// kill a run that Agy's own flag would otherwise let finish or
-			// time out gracefully.
-			timeout: PROVIDER_EXECUTION_TIMEOUT_MS,
+			// Should exceed the `--print-timeout 9m` passed above so the host
+			// kill stays a backstop for a hung/unresponsive process rather than
+			// the primary timeout mechanism — true for the default (30m). A
+			// task's `Timeout:` override can still set this below 9m; that's a
+			// deliberate per-task choice, and it degrades safely: the host kill
+			// just fires before agy's own graceful timeout would have, and the
+			// orphan-kill + diff-capture path below still applies.
+			timeout: timeoutMs,
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
 		return { output: result, success: true };
 	} catch (error) {
+		const timedOut = error.code === "ETIMEDOUT";
+		if (timedOut) {
+			killOrphanedProcesses(workingContainerName);
+		}
 		return {
 			output: error.stdout || "",
 			success: false,
 			error: error.message,
+			timedOut,
 		};
 	}
 }

@@ -232,7 +232,7 @@ export function resolveOrchestrator(dependencies = {}) {
  *   - **Description:** ...
  *
  * @param {string} markdown
- * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null}>}
+ * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, timeoutMs: number|null}>}
  */
 export function parseTaskQueue(markdown) {
 	const tasks = [];
@@ -260,6 +260,17 @@ export function parseTaskQueue(markdown) {
 			requiredPaths = parseFilePaths(filesValue, taskId);
 		}
 
+		let timeoutMs = null;
+		const timeoutLine = block
+			.split("\n")
+			.find((line) => /^- \*\*Timeout:\*\*\s/.test(line));
+		if (timeoutLine) {
+			const timeoutValue = timeoutLine
+				.replace(/^- \*\*Timeout:\*\*\s*/, "")
+				.trim();
+			timeoutMs = parseTimeoutField(timeoutValue, taskId);
+		}
+
 		tasks.push({
 			id: taskId,
 			title: title.trim(),
@@ -267,10 +278,48 @@ export function parseTaskQueue(markdown) {
 			description: rawDesc.trim(),
 			prompt: fullPrompt,
 			requiredPaths,
+			timeoutMs,
 		});
 	}
 
 	return tasks;
+}
+
+// Typo guards, not policy limits: MIN rejects an accidental zero/near-zero
+// value, MAX rejects an accidental order-of-magnitude slip (e.g. "24h" typed
+// for "2.4h") without capping how long a task is legitimately allowed to run.
+const MIN_TASK_TIMEOUT_MS = 1000; // 1 second
+const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/**
+ * Parse and validate a per-task `Timeout:` override into milliseconds.
+ * Requires an explicit unit (s/m/h) rather than a bare number — same
+ * unambiguous-input rule `parseFilePaths` applies to `Files:`.
+ * @param {string} raw The raw value of the Timeout field, e.g. "90m"
+ * @param {string} taskId Task identifier for error messages
+ * @returns {number} Timeout in milliseconds
+ * @throws {Error} If the value is malformed or out of bounds
+ */
+function parseTimeoutField(raw, taskId) {
+	const trimmed = raw.trim();
+	const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(s|m|h)$/i);
+	if (!match) {
+		throw new Error(
+			`Task ${taskId}: invalid Timeout field "${trimmed}" (expected a number followed by s/m/h, e.g. "90m")`,
+		);
+	}
+
+	const [, amount, unit] = match;
+	const unitMs = { s: 1000, m: 60_000, h: 3_600_000 }[unit.toLowerCase()];
+	const ms = Number.parseFloat(amount) * unitMs;
+
+	if (ms < MIN_TASK_TIMEOUT_MS || ms > MAX_TASK_TIMEOUT_MS) {
+		throw new Error(
+			`Task ${taskId}: Timeout must be between 1s and 24h (got "${trimmed}")`,
+		);
+	}
+
+	return ms;
 }
 
 /**
@@ -378,6 +427,28 @@ export function saveCheckpoint(checkpointPath, checkpoint) {
 	const tmpPath = `${checkpointPath}.tmp`;
 	writeFileSync(tmpPath, JSON.stringify(checkpoint, null, 2), "utf8");
 	renameSync(tmpPath, checkpointPath);
+}
+
+/**
+ * Persist a timeout-interrupted diff as a review artifact next to the
+ * checkpoint file, rather than embedding raw diff content in
+ * checkpoint.json. This is the same class of content checkpoint.json's
+ * `success` path already sends through captureDiff -> the integration gate
+ * (a project source diff, `git add -A`-scoped so .gitignore'd files are
+ * already excluded) — the only difference is it arrives via a timed-out task
+ * instead of a completed one, so it is kept out of the gate and returned
+ * here as a plain file for a human to review.
+ * @param {string} checkpointPath
+ * @param {string} taskId
+ * @param {string} diffText
+ * @returns {string} Path to the written artifact
+ */
+function savePartialDiff(checkpointPath, taskId, diffText) {
+	const dir = `${checkpointPath}.partial-diffs`;
+	mkdirSync(dir, { recursive: true });
+	const artifactPath = join(dir, `${taskId}.diff`);
+	writeFileSync(artifactPath, diffText, "utf8");
+	return artifactPath;
 }
 
 /**
@@ -611,13 +682,15 @@ export function executeTask(task, context) {
 		};
 	}
 
+	// A task's own `Timeout:` field (runner/index.mjs parseTimeoutField)
+	// overrides the global default for tasks known to legitimately need more
+	// (or less) than PROVIDER_EXECUTION_TIMEOUT_MS.
+	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+
 	// Emitted here, before the blocking adapter.execute call below, so the
 	// routed provider/model/deadline are visible immediately rather than only
-	// discoverable after the (up to PROVIDER_EXECUTION_TIMEOUT_MS-long) call
-	// returns.
-	const routedDeadline = new Date(
-		Date.now() + PROVIDER_EXECUTION_TIMEOUT_MS,
-	).toISOString();
+	// discoverable after the (up to timeoutMs-long) call returns.
+	const routedDeadline = new Date(Date.now() + timeoutMs).toISOString();
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "execution",
@@ -641,6 +714,7 @@ export function executeTask(task, context) {
 	const prompt = task.prompt || task.description || task.title;
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routeResult.model ?? undefined,
+		timeoutMs,
 	});
 
 	if (!execution.success) {
@@ -648,10 +722,33 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
-			result: "execution_failed",
+			result: execution.timedOut ? "execution_timed_out" : "execution_failed",
 			reason: execution.error ?? routeResult.reason,
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
+
+		if (execution.timedOut) {
+			// The adapter already killed the orphaned in-container process
+			// before returning (see adapter/orphan-kill.mjs), so this reads a
+			// stable snapshot rather than one still being mutated. Surfaced as
+			// a review artifact only — deliberately NOT run through
+			// context.integrationGate, so an interrupted (possibly broken,
+			// possibly mid-edit) diff can never auto-apply as if the task had
+			// succeeded. INV-2: the gate is the only reviewed door back to the
+			// host, and this diff has not been reviewed.
+			const partialDiff = adapter.captureDiff(context.workingContainerName);
+			return {
+				taskId: task.id,
+				success: false,
+				provider: routeResult.provider,
+				model: routeResult.model ?? null,
+				result: "execution_timed_out",
+				error: execution.error ?? null,
+				timedOut: true,
+				partialDiff,
+			};
+		}
+
 		return {
 			taskId: task.id,
 			success: false,
@@ -1154,6 +1251,32 @@ export function runQueue(options) {
 				});
 			}
 			const result = executeTask(task, context);
+			if (result.timedOut && result.partialDiff) {
+				try {
+					result.partialDiffPath = savePartialDiff(
+						checkpointPath,
+						result.taskId,
+						result.partialDiff,
+					);
+					if (emitStatus) {
+						emitStatus({
+							phase: "execution",
+							event: "partial_diff_captured",
+							status: `Task ${result.taskId} timed out; partial diff saved for review (not applied)`,
+							taskId: result.taskId,
+							partialDiffPath: result.partialDiffPath,
+							byteCount: result.partialDiff.length,
+						});
+					}
+				} catch (error) {
+					console.error(
+						`runQueue: could not save partial diff for timed-out task ${result.taskId}: ${error.message}`,
+					);
+				}
+				// Raw diff text stays out of checkpoint.json / onResult payloads —
+				// the artifact on disk (partialDiffPath) is the single copy.
+				result.partialDiff = undefined;
+			}
 			if (onResult) onResult(result);
 			if (emitStatus) {
 				if (result.success) {
@@ -1229,6 +1352,8 @@ export function runQueue(options) {
 				model: result.model,
 				result: result.result,
 				success: result.success,
+				timedOut: Boolean(result.timedOut),
+				partialDiffPath: result.partialDiffPath ?? null,
 				timestamp: new Date().toISOString(),
 			});
 			checkpoint.lastTaskId = result.taskId;

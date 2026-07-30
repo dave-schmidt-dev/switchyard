@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
+import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import {
 	createCliOrchestrator,
 	executeTask,
@@ -317,6 +318,102 @@ describe("runner queue parsing", () => {
 		const tasks = parseTaskQueue(markdown);
 		strictEqual(tasks.length, 1);
 		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs"]);
+	});
+
+	it("extracts timeoutMs from a Timeout: field in minutes", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Long task
+- **Status:** pending
+- **Timeout:** 90m
+- **Description:** Needs more than the default 30 minutes
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].timeoutMs, 90 * 60 * 1000);
+	});
+
+	it("extracts timeoutMs from a Timeout: field in seconds, hours, and fractional hours", () => {
+		strictEqual(
+			parseTaskQueue(
+				"### Task 1.1: T\n- **Status:** pending\n- **Timeout:** 45s\n",
+			)[0].timeoutMs,
+			45 * 1000,
+		);
+		strictEqual(
+			parseTaskQueue(
+				"### Task 1.1: T\n- **Status:** pending\n- **Timeout:** 2h\n",
+			)[0].timeoutMs,
+			2 * 3_600_000,
+		);
+		strictEqual(
+			parseTaskQueue(
+				"### Task 1.1: T\n- **Status:** pending\n- **Timeout:** 1.5h\n",
+			)[0].timeoutMs,
+			1.5 * 3_600_000,
+		);
+	});
+
+	it("sets timeoutMs to null when no Timeout: field is present", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Simple task
+- **Status:** pending
+- **Description:** Do things
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].timeoutMs, null);
+	});
+
+	it("rejects a Timeout: field without a unit suffix (bare number is ambiguous)", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Timeout:** 90
+- **Description:** Bad
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/expected a number followed by s\/m\/h/,
+		);
+	});
+
+	it("rejects a Timeout: field with an unsupported unit", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Timeout:** 90ms
+- **Description:** Bad
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/expected a number followed by s\/m\/h/,
+		);
+	});
+
+	it("rejects a Timeout: field below the 1-second floor", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Timeout:** 0s
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /must be between 1s and 24h/);
+	});
+
+	it("rejects a Timeout: field above the 24-hour typo-guard ceiling", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Timeout:** 48h
+- **Description:** Bad
+`;
+		throws(() => parseTaskQueue(markdown), /must be between 1s and 24h/);
 	});
 });
 
@@ -3387,5 +3484,212 @@ describe("runner runStore dependency", () => {
 
 		strictEqual(result.processedTasks, 2);
 		strictEqual(checkpoints.length, 2);
+	});
+});
+
+describe("executeTask timeout handling", () => {
+	it("captures a partial diff and returns execution_timed_out without calling integrationGate when the adapter reports timedOut", () => {
+		const gateCalls = [];
+		const captureDiffCalls = [];
+		const dispatches = [];
+
+		const result = executeTask(
+			{
+				id: "1.1",
+				title: "task",
+				description: "a task that overran its timeout",
+				requiredPaths: null,
+			},
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 50,
+					reason: "spread",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				integrationGate: (diff, projectPath, options) => {
+					gateCalls.push({ diff, projectPath, options });
+					return { success: true, message: "ok" };
+				},
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: false,
+							output: "partial output before kill",
+							error: "spawnSync docker ETIMEDOUT",
+							timedOut: true,
+						}),
+						captureDiff: (containerName) => {
+							captureDiffCalls.push(containerName);
+							return "diff --git a/wip.mjs b/wip.mjs\n+work in progress";
+						},
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.success, false);
+		strictEqual(result.result, "execution_timed_out");
+		strictEqual(result.timedOut, true);
+		strictEqual(
+			result.partialDiff,
+			"diff --git a/wip.mjs b/wip.mjs\n+work in progress",
+		);
+		strictEqual(captureDiffCalls.length, 1, "captureDiff called once");
+		strictEqual(captureDiffCalls[0], "fake-container");
+		strictEqual(
+			gateCalls.length,
+			0,
+			"a timed-out diff must never reach integrationGate — it is not a reviewed success (INV-2)",
+		);
+		strictEqual(dispatches[0].result, "execution_timed_out");
+	});
+
+	it("passes task.timeoutMs through to adapter.execute, falling back to the provider default when absent", () => {
+		const executeCalls = [];
+		const context = () => ({
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				percentLeft: 50,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			integrationGate: () => ({ success: true, message: "ok" }),
+			adapters: {
+				claude: {
+					execute: (_prompt, _containerName, options) => {
+						executeCalls.push(options.timeoutMs);
+						return { success: true, output: "ok" };
+					},
+					captureDiff: () => null,
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+
+		executeTask(
+			{ id: "1.1", title: "custom", description: "x", timeoutMs: 90_000 },
+			context(),
+		);
+		executeTask({ id: "1.2", title: "default", description: "x" }, context());
+
+		strictEqual(executeCalls[0], 90_000);
+		strictEqual(executeCalls[1], PROVIDER_EXECUTION_TIMEOUT_MS);
+	});
+
+	it("does not capture a diff for a non-timeout execution failure (existing behavior unchanged)", () => {
+		const captureDiffCalls = [];
+
+		const result = executeTask(
+			{ id: "1.1", title: "task", description: "a normal failure" },
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 50,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: false,
+							output: "",
+							error: "provider crashed",
+						}),
+						captureDiff: (containerName) => {
+							captureDiffCalls.push(containerName);
+							return "should not be captured";
+						},
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.result, "execution_failed");
+		strictEqual(result.timedOut, undefined);
+		strictEqual(result.partialDiff, undefined);
+		strictEqual(captureDiffCalls.length, 0);
+	});
+});
+
+describe("runQueue timeout diff persistence", () => {
+	it("persists a timed-out task's partial diff to disk and records partialDiffPath + timedOut in checkpoint.json without embedding the raw diff text", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Long-running task
+- **Status:** pending
+- **Description:** overruns its timeout
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const diffText =
+			"diff --git a/wip.mjs b/wip.mjs\n+SECRET_CANARY_wip_marker";
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: false,
+							output: "",
+							error: "spawnSync docker ETIMEDOUT",
+							timedOut: true,
+						}),
+						captureDiff: () => diffText,
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		const [taskResult] = result.results;
+		strictEqual(taskResult.timedOut, true);
+		strictEqual(
+			taskResult.partialDiff,
+			undefined,
+			"raw diff text must not ride along in the in-memory result once persisted",
+		);
+		ok(taskResult.partialDiffPath, "result carries the artifact path");
+		ok(existsSync(taskResult.partialDiffPath));
+		strictEqual(readFileSync(taskResult.partialDiffPath, "utf8"), diffText);
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[0].timedOut, true);
+		strictEqual(
+			checkpoint.results[0].partialDiffPath,
+			taskResult.partialDiffPath,
+		);
+
+		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
+		ok(
+			!rawCheckpointJson.includes("SECRET_CANARY_wip_marker"),
+			"checkpoint.json must reference the artifact by path only, never embed the diff text",
+		);
 	});
 });

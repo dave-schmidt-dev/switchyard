@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
+import { killOrphanedProcesses } from "./orphan-kill.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CLAUDE_CMD = "claude";
@@ -97,10 +98,11 @@ export function isClaudeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  * @param {string} workingContainerName Working container to exec in
  * @param {object} options Execution options
  * @param {string} [options.model] Model to use
- * @returns {{output: string, success: boolean, error?: string}}
+ * @param {number} [options.timeoutMs] Execution timeout in ms (defaults to PROVIDER_EXECUTION_TIMEOUT_MS)
+ * @returns {{output: string, success: boolean, error?: string, timedOut?: boolean}}
  */
 export function executeClaude(prompt, workingContainerName, options = {}) {
-	const { model } = options;
+	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
@@ -148,16 +150,24 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 			input: prompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
-			timeout: PROVIDER_EXECUTION_TIMEOUT_MS,
+			timeout: timeoutMs,
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
 		return { output: result, success: true };
 	} catch (error) {
+		const timedOut = error.code === "ETIMEDOUT";
+		if (timedOut) {
+			// The host-side kill above only stops the `docker exec` client; the
+			// process it started keeps running inside the container's PID
+			// namespace until explicitly killed there (see orphan-kill.mjs).
+			killOrphanedProcesses(workingContainerName);
+		}
 		return {
 			output: error.stdout || "",
 			success: false,
 			error: error.message,
+			timedOut,
 		};
 	}
 }

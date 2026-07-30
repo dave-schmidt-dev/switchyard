@@ -104,3 +104,105 @@ describe("claude adapter container execution", () => {
 		ok(diff.includes("diff --git"));
 	});
 });
+
+// Real (not mocked) proof of the timeout + orphan-kill mechanism: `docker
+// exec` does not forward host signals into the container's PID namespace, so
+// killing the host-side client on a host timeout leaves whatever it started
+// running unsupervised until something explicitly kills it in-container
+// (verified empirically against a bare container before this was wired up).
+// This stub loops past the host-side timeout, incrementing a counter file
+// every second; a frozen counter after the timeout proves the adapter's own
+// in-container kill (adapter/orphan-kill.mjs) actually stopped it, not just
+// that the host-side execFileSync call returned an error.
+const TIMEOUT_COUNTER_PATH = "/tmp/switchyard-timeout-counter";
+const TIMEOUT_STUB = `#!/bin/sh
+cat >/dev/null
+i=0
+while [ $i -lt 20 ]; do
+  i=$((i+1))
+  echo $i > ${TIMEOUT_COUNTER_PATH}
+  sleep 1
+done
+`;
+
+describe("claude adapter timeout handling", () => {
+	const timeoutTestRoot = mkdtempSync(
+		join(tmpdir(), "switchyard-claude-timeout-"),
+	);
+	const timeoutContainerName = `switchyard-claude-timeout-${Date.now()}`;
+
+	before(() => {
+		if (!dockerAvailable) return;
+
+		execSync(
+			`docker run -d --name ${timeoutContainerName} --entrypoint sh alpine/git -c "sleep infinity"`,
+			{ stdio: "pipe" },
+		);
+		// executeClaude always execs with `-w /project` (see claude.mjs); the
+		// other describe block's container gets this from its bind mount, but
+		// this one has none, so it must be created explicitly.
+		execSync(`docker exec ${timeoutContainerName} mkdir -p /project`, {
+			stdio: "pipe",
+		});
+
+		const stubPath = join(timeoutTestRoot, "claude-stub.sh");
+		writeFileSync(stubPath, TIMEOUT_STUB, { mode: 0o755 });
+		execSync(
+			`docker cp ${stubPath} ${timeoutContainerName}:/usr/local/bin/claude`,
+			{ stdio: "pipe" },
+		);
+		execSync(
+			`docker exec ${timeoutContainerName} chmod +x /usr/local/bin/claude`,
+			{
+				stdio: "pipe",
+			},
+		);
+	});
+
+	after(() => {
+		if (dockerAvailable) {
+			try {
+				execSync(`docker rm -f -v ${timeoutContainerName}`, { stdio: "pipe" });
+			} catch {
+				// ignore cleanup errors
+			}
+		}
+		rmSync(timeoutTestRoot, { recursive: true, force: true });
+	});
+
+	it("kills the orphaned in-container process on timeout instead of leaving it running", {
+		skip: !dockerAvailable,
+	}, () => {
+		const result = executeClaude(
+			"this will overrun its timeout",
+			timeoutContainerName,
+			{
+				timeoutMs: 1500,
+			},
+		);
+
+		strictEqual(result.success, false);
+		strictEqual(result.timedOut, true);
+		ok(/ETIMEDOUT/.test(result.error));
+
+		const counterAfterTimeout = execSync(
+			`docker exec ${timeoutContainerName} cat ${TIMEOUT_COUNTER_PATH}`,
+			{ encoding: "utf8" },
+		).trim();
+
+		// Give a still-running orphan a further window to keep incrementing —
+		// executeClaude's own catch block should already have killed it before
+		// returning, so this should read back unchanged.
+		execSync("sleep 3");
+		const counterAfterWait = execSync(
+			`docker exec ${timeoutContainerName} cat ${TIMEOUT_COUNTER_PATH}`,
+			{ encoding: "utf8" },
+		).trim();
+
+		strictEqual(
+			counterAfterWait,
+			counterAfterTimeout,
+			"counter kept climbing after the host-side timeout — the in-container process was not actually killed",
+		);
+	});
+});
