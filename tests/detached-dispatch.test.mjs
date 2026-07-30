@@ -181,12 +181,65 @@ describe("worker reaches terminal state and result is readable", () => {
 });
 
 describe("duplicate project runs fail", () => {
-	it("second launch against same project exits non-zero", async () => {
-		const first = runDispatch(
+	it("launch is blocked while the project lock is already held", async () => {
+		const { acquireProjectLock } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		// Hold the project lock directly to simulate an in-flight run. This is
+		// deterministic: it does not race a detached worker's terminal cleanup
+		// (which now releases the lock — see the "terminal run" test below).
+		await acquireProjectLock(projectDir, randomUUID());
+
+		const result = runDispatch(
 			["launch", tasksFile, "--project", projectDir],
 			makeStateRootEnv(),
 		);
-		strictEqual(first.status, 0, `first launch failed: ${first.stderr}`);
+		strictEqual(
+			result.status,
+			1,
+			`launch against a locked project should exit 1, got ${result.status}: ${result.stderr}`,
+		);
+	});
+});
+
+describe("terminal run releases the project lock", () => {
+	it("after a run reaches terminal state the lock is released and a second launch succeeds", async () => {
+		const { isProjectLockHeld } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = await launchAndGetRunId();
+
+		const start = Date.now();
+		const maxWait = 20_000;
+
+		let terminalReached = false;
+		while (Date.now() - start < maxWait) {
+			const statusResult = pollStatus(runId, makeStateRootEnv());
+			if (statusResult.status === 0) {
+				const status = JSON.parse(statusResult.stdout.trim());
+				if (status.state === "succeeded" || status.state === "failed") {
+					terminalReached = true;
+					break;
+				}
+			}
+			await new Promise((r) => setTimeout(r, 300));
+		}
+		ok(terminalReached, "run did not reach terminal state within timeout");
+
+		// The worker releases the project lock right after writing terminal
+		// state; poll until the lock file is gone.
+		let released = false;
+		while (Date.now() - start < maxWait) {
+			if (!isProjectLockHeld(projectDir)) {
+				released = true;
+				break;
+			}
+			await new Promise((r) => setTimeout(r, 200));
+		}
+		ok(
+			released,
+			"project lock was not released after the run reached terminal state",
+		);
 
 		const second = runDispatch(
 			["launch", tasksFile, "--project", projectDir],
@@ -194,8 +247,186 @@ describe("duplicate project runs fail", () => {
 		);
 		strictEqual(
 			second.status,
-			1,
-			`second launch against same project should exit non-zero, got ${second.status}: ${second.stderr}`,
+			0,
+			`second launch after lock release should exit 0, got ${second.status}: ${second.stderr}`,
+		);
+	});
+});
+
+describe("recover releases stale project locks", () => {
+	it("recover --run clears a project lock left by a dead/terminal run", async () => {
+		const {
+			initializeRun,
+			advanceState,
+			acquireProjectLock,
+			isProjectLockHeld,
+		} = await import("../src/switchyard/run-store/index.mjs");
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		// Terminal, dead run that still holds its project lock (the Bug 1
+		// residue a hard-crashed worker would leave behind).
+		await advanceState(runId, "failed");
+		await acquireProjectLock(projectDir, runId);
+		strictEqual(isProjectLockHeld(projectDir), true);
+
+		const result = runDispatch(["recover", "--run", runId], makeStateRootEnv());
+		ok(
+			result.status === 0 || result.status === 1,
+			`recover exit code should be 0 or 1, got ${result.status}: ${result.stderr}`,
+		);
+		strictEqual(
+			isProjectLockHeld(projectDir),
+			false,
+			"recover should have released the stale project lock",
+		);
+	});
+
+	it("recover --run does not release a lock held by a live worker", async () => {
+		const {
+			initializeRun,
+			advanceState,
+			acquireProjectLock,
+			isProjectLockHeld,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(runId, "running");
+		// Point the lease at this test process, which is provably alive.
+		const current = await readRun(runId);
+		await updateRun(runId, { workerPid: process.pid }, current.revision);
+		await acquireProjectLock(projectDir, runId);
+		strictEqual(isProjectLockHeld(projectDir), true);
+
+		const result = runDispatch(["recover", "--run", runId], makeStateRootEnv());
+		ok(
+			result.status === 0 || result.status === 1,
+			`recover exit code should be 0 or 1, got ${result.status}: ${result.stderr}`,
+		);
+		strictEqual(
+			isProjectLockHeld(projectDir),
+			true,
+			"recover must not yank a project lock from a live worker",
+		);
+	});
+
+	it("recover --run clears a lock left by a crashed worker still marked running", async () => {
+		const {
+			initializeRun,
+			advanceState,
+			acquireProjectLock,
+			isProjectLockHeld,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
+
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		// Non-terminal state with a dead worker pid: exactly the residue a
+		// hard-crashed worker (unhandledRejection -> process.exit before any
+		// terminal write) leaves behind. The safety net must reclaim this via
+		// the liveness probe, not the terminal-state check.
+		await advanceState(runId, "running");
+		const current = await readRun(runId);
+		await updateRun(runId, { workerPid: 99999 }, current.revision);
+		await acquireProjectLock(projectDir, runId);
+		strictEqual(isProjectLockHeld(projectDir), true);
+
+		const result = runDispatch(["recover", "--run", runId], makeStateRootEnv());
+		ok(
+			result.status === 0 || result.status === 1,
+			`recover exit code should be 0 or 1, got ${result.status}: ${result.stderr}`,
+		);
+		strictEqual(
+			isProjectLockHeld(projectDir),
+			false,
+			"recover should have released the lock held by a dead running worker",
+		);
+	});
+
+	it("recover --run does not release a lock reassigned to a newer active run on the same project", async () => {
+		const {
+			initializeRun,
+			advanceState,
+			acquireProjectLock,
+			isProjectLockHeld,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
+
+		const staleRunId = randomUUID();
+		await initializeRun({
+			runId: staleRunId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(staleRunId, "failed");
+		// staleRunId's own project lock was already released by its own worker
+		// (the Bug 1 terminal-path fix) — never acquired here, matching that.
+
+		// A newer run has since legitimately acquired the SAME project's lock
+		// and is still actively running.
+		const activeRunId = randomUUID();
+		await initializeRun({
+			runId: activeRunId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(activeRunId, "running");
+		const current = await readRun(activeRunId);
+		await updateRun(activeRunId, { workerPid: process.pid }, current.revision);
+		await acquireProjectLock(projectDir, activeRunId);
+		strictEqual(isProjectLockHeld(projectDir), true);
+
+		// Someone runs recover against the OLD, already-terminal run id —
+		// a blind release-by-path would incorrectly clear activeRunId's lock.
+		const result = runDispatch(
+			["recover", "--run", staleRunId],
+			makeStateRootEnv(),
+		);
+		ok(
+			result.status === 0 || result.status === 1,
+			`recover exit code should be 0 or 1, got ${result.status}: ${result.stderr}`,
+		);
+		strictEqual(
+			isProjectLockHeld(projectDir),
+			true,
+			"recover must not release a lock owned by a different, currently-active run",
 		);
 	});
 });

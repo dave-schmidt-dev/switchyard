@@ -168,27 +168,42 @@ try {
 	});
 
 	const failed = result.results.filter((r) => !r.success);
+	const terminalPatch = {
+		state: failed.length > 0 ? "failed" : "succeeded",
+		activeTaskId: null,
+		cleanupState: "complete",
+		terminalSummary: {
+			totalTasks: result.totalTasks,
+			runnableTasks: result.runnableTasks,
+			processedTasks: result.processedTasks,
+			completedTaskIds: result.completedTaskIds,
+			failedCount: failed.length,
+		},
+	};
 
 	try {
-		const current = await runStore.readRun(runId);
-		await runStore.updateRun(
-			runId,
-			{
-				state: failed.length > 0 ? "failed" : "succeeded",
-				activeTaskId: null,
-				cleanupState: "complete",
-				terminalSummary: {
-					totalTasks: result.totalTasks,
-					runnableTasks: result.runnableTasks,
-					processedTasks: result.processedTasks,
-					completedTaskIds: result.completedTaskIds,
-					failedCount: failed.length,
-				},
-			},
-			current.revision,
-		);
+		// The terminal write carries the authoritative outcome, but it can lose
+		// the revision race to a still-in-flight fire-and-forget event callback
+		// (onTaskStart/onResult). updateRunWithRetry retries against the
+		// current revision on conflict rather than letting this real
+		// terminalSummary be lost and falling through to the catch block
+		// below, which would replace it with a zeroed placeholder.
+		await runStore.updateRunWithRetry(runId, terminalPatch);
 	} finally {
 		await runStore.releaseRunLock(runId);
+	}
+	// Release the project lock on the success/failure terminal path so a
+	// subsequent launch against the same project is not blocked forever.
+	// Mirror the acquire-side canonicalization: acquireProjectLock was called
+	// with the resolved project path, which is exactly what run.projectPath
+	// persists. The run's terminal state was already committed above, so a
+	// failure here must stay contained — it must not fall into the catch
+	// block below and overwrite that already-successful state with
+	// "failed". `recover` reclaims any lock left behind by this failure.
+	try {
+		await runStore.releaseProjectLock(run.projectPath);
+	} catch (lockError) {
+		await writeFatalEvent(lockError);
 	}
 } catch (error) {
 	await writeFatalEvent(error);
@@ -212,13 +227,18 @@ try {
 			current.revision,
 		);
 		await runStore.releaseRunLock(runId);
+		// Same project-lock release on the crash/catch terminal path.
+		await runStore.releaseProjectLock(current.projectPath);
 	} catch {
-		// best effort — at least the fatal event was recorded
+		// best effort — the fatal event is already recorded, and `recover`
+		// can clear any lock that survives this fallback.
 		try {
 			const runStore = await import("../run-store/index.mjs");
+			const current = await runStore.readRun(runId);
 			await runStore.releaseRunLock(runId);
+			await runStore.releaseProjectLock(current.projectPath);
 		} catch {
-			// lock may not exist
+			// run.json unreadable — leave locks for `recover` to reclaim
 		}
 	}
 	process.exit(1);

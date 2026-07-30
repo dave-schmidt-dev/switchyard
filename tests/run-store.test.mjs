@@ -32,6 +32,7 @@ import {
 	renewRunLock,
 	SchemaError,
 	updateRun,
+	updateRunWithRetry,
 } from "../src/switchyard/run-store/index.mjs";
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-run-store-"));
@@ -809,5 +810,135 @@ describe("lock file path resolution", () => {
 
 		const relPath = relative(process.cwd(), path1);
 		await rejects(acquireLaunchLock(relPath, uniqueRunId()), LockError);
+	});
+});
+
+describe("concurrent atomic writes", () => {
+	it("concurrent updateRun/createEvent never throw ENOENT and leave a valid run.json", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const { runId } = opts;
+		const base = await readRun(runId);
+
+		// Fire many writers concurrently at the same run.json. With a fixed,
+		// shared tmp path (the bug), roughly half of these collide on rename:
+		// one writer renames the shared tmp away before another's rename runs,
+		// so the loser throws ENOENT. A unique tmp path per write eliminates
+		// the collision — each writer's rename only touches its own tmp file.
+		const N = 40;
+		const ops = [];
+		for (let i = 0; i < N; i++) {
+			if (i % 2 === 0) {
+				ops.push(
+					updateRun(runId, { activeTaskId: `task-${i}` }, base.revision),
+				);
+			} else {
+				ops.push(
+					createEvent(runId, {
+						phase: "execution",
+						event: `evt-${i}`,
+						status: "ok",
+					}),
+				);
+			}
+		}
+		const settled = await Promise.allSettled(ops);
+
+		const enoent = settled.filter(
+			(r) => r.status === "rejected" && r.reason?.code === "ENOENT",
+		);
+		strictEqual(
+			enoent.length,
+			0,
+			`no writer should fail with ENOENT, got ${enoent.length}`,
+		);
+
+		// run.json must remain valid and parseable; readRun validates the schema.
+		const final = await readRun(runId);
+		strictEqual(final.runId, runId);
+		ok(
+			final.revision > base.revision,
+			`revision should advance past ${base.revision}, got ${final.revision}`,
+		);
+	});
+
+	it("serializes racing updateRun calls on the same expectedRevision instead of clobbering", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const { runId } = opts;
+		const base = await readRun(runId);
+
+		// Simulate worker-bootstrap's fire-and-forget callbacks (onTaskStart,
+		// onResult) racing the main thread's terminal write: every caller reads
+		// the same starting revision before any of them has written. Without
+		// serialization, all of these can pass the optimistic-concurrency check
+		// and last-rename-wins silently discards every write but the last —
+		// with no error thrown, and no guarantee the terminal write survives.
+		const N = 10;
+		const settled = await Promise.allSettled(
+			Array.from({ length: N }, (_, i) =>
+				updateRun(runId, { activeTaskId: `task-${i}` }, base.revision),
+			),
+		);
+
+		const succeeded = settled.filter((r) => r.status === "fulfilled");
+		const revisionErrors = settled.filter(
+			(r) => r.status === "rejected" && r.reason instanceof RevisionError,
+		);
+		strictEqual(
+			succeeded.length,
+			1,
+			`exactly one racing updateRun should win, got ${succeeded.length}`,
+		);
+		strictEqual(
+			revisionErrors.length,
+			N - 1,
+			`the other ${N - 1} should lose with RevisionError, got ${revisionErrors.length}`,
+		);
+
+		const final = await readRun(runId);
+		strictEqual(final.revision, base.revision + 1);
+		strictEqual(final.activeTaskId, succeeded[0].value.activeTaskId);
+	});
+
+	it("updateRunWithRetry's authoritative write survives a losing race against a stale-revision writer", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const { runId } = opts;
+		const base = await readRun(runId);
+
+		// Mirror worker-bootstrap: a fire-and-forget callback (e.g. onResult)
+		// captured the starting revision before the terminal write began, so
+		// it races updateRunWithRetry using that now-stale expectedRevision.
+		// Whichever of these actually reaches the update queue first, the
+		// authoritative write must still land with its real payload — it must
+		// never be discarded by losing the race.
+		const floatingWrite = updateRun(
+			runId,
+			{ activeTaskId: "floating-task" },
+			base.revision,
+		);
+		const authoritativeWrite = updateRunWithRetry(runId, {
+			state: "failed",
+			activeTaskId: null,
+			cleanupState: "complete",
+			terminalSummary: { totalTasks: 2, processedTasks: 1, failedCount: 1 },
+		});
+
+		const authoritative = await authoritativeWrite;
+		await floatingWrite.catch(() => {});
+
+		strictEqual(authoritative.state, "failed");
+		strictEqual(authoritative.cleanupState, "complete");
+		strictEqual(authoritative.terminalSummary.failedCount, 1);
+
+		const final = await readRun(runId);
+		strictEqual(final.state, "failed");
+		strictEqual(final.cleanupState, "complete");
+		strictEqual(
+			final.terminalSummary.failedCount,
+			1,
+			"the real terminal summary must win, not be lost to the floating writer",
+		);
 	});
 });

@@ -47,6 +47,7 @@ import {
 	initializeRun,
 	readEvents,
 	readRun,
+	releaseProjectLockIfOwnedBy,
 	SchemaError,
 } from "../run-store/index.mjs";
 import { loadTaskQueue, runQueue } from "../runner/index.mjs";
@@ -589,6 +590,69 @@ async function resolveIsRunDead(runId, dependencies) {
 }
 
 /**
+ * Best-effort liveness probe for a run's worker process.
+ * @param {object} run parsed run snapshot
+ * @returns {boolean} true only if a signalable worker pid still exists
+ */
+function isWorkerLive(run) {
+	if (run.workerPid == null) return false;
+	try {
+		// Signal 0 performs error checking without delivering a signal.
+		process.kill(run.workerPid, 0);
+		return true;
+	} catch (e) {
+		// ESRCH => no such process; EPERM => process exists but is not ours.
+		return e.code === "EPERM";
+	}
+}
+
+/**
+ * Release stale project locks for runs that are dead or terminal.
+ *
+ * The worker releases its own project lock on every terminal path, but a worker
+ * that crashes hard (e.g. process.exit from a fatal handler) can bypass that
+ * cleanup. `recover` is the safety net: for each candidate run whose worker is
+ * gone (terminal state, or a running state with no live worker), release the
+ * project lock so the project is not blocked forever. Runs whose run.json is
+ * unreadable are skipped — without a projectPath there is no lock to key on.
+ *
+ * Release is ownership-checked (`releaseProjectLockIfOwnedBy`), not a blind
+ * unlink by path: a lock is keyed by project path only, so a stale candidate
+ * whose lock was already superseded by a newer, currently-active run against
+ * the same project must never have that active run's lock pulled out from
+ * under it.
+ *
+ * @param {string[]} candidateIds run ids to consider
+ * @param {object} dependencies optional injected readRun/releaseProjectLockIfOwnedBy
+ * @returns {Promise<string[]>} run ids whose project lock was released
+ */
+async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
+	const readRunFn = dependencies.readRun ?? readRun;
+	const releaseFn =
+		dependencies.releaseProjectLockIfOwnedBy ?? releaseProjectLockIfOwnedBy;
+	const released = [];
+	for (const rid of candidateIds) {
+		let run;
+		try {
+			run = await readRunFn(rid);
+		} catch {
+			// run.json missing/unreadable — no projectPath to key the lock on
+			continue;
+		}
+		const terminal = run.state === "succeeded" || run.state === "failed";
+		if (terminal || !isWorkerLive(run)) {
+			try {
+				const didRelease = await releaseFn(run.projectPath, rid);
+				if (didRelease) released.push(rid);
+			} catch {
+				// unlink failure is non-fatal; the run's Docker recovery still ran
+			}
+		}
+	}
+	return released;
+}
+
+/**
  * Handle the recover subcommand.
  * @param {string[]} argv arguments after the subcommand
  */
@@ -626,10 +690,18 @@ async function handleRecover(argv, dependencies = {}) {
 		dryRun: false,
 	});
 
+	// Filesystem project locks are not Docker-managed objects, so
+	// recoverManagedObjects never touches them. Clear stale ones here.
+	const projectLocksReleased = await releaseStaleProjectLocks(
+		candidateIds,
+		dependencies,
+	);
+
 	const output = {
 		containersReclaimed: result.containersReclaimed,
 		volumesReclaimed: result.volumesReclaimed,
 		errors: result.errors,
+		projectLocksReleased,
 		runId: runId ?? null,
 		candidates: !runId
 			? managedContainers().map((c) => ({

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
 	appendFile,
@@ -160,9 +160,20 @@ function validateRun(data) {
 }
 
 async function writeRunAtomically(runJsonPath, data) {
-	const tmpPath = `${runJsonPath}.tmp`;
+	// Unique tmp path per write call: process.pid + a random UUID. A fixed
+	// shared tmp path lets concurrent writers to the same run.json collide —
+	// writer A renames (and removes) the tmp before writer B's rename runs,
+	// so B fails with ENOENT. Per-call uniqueness means each writer's rename
+	// only ever touches its own tmp file.
+	const tmpPath = `${runJsonPath}.${process.pid}.${randomUUID()}.tmp`;
 	await writeFile(tmpPath, JSON.stringify(data), { mode: 0o600 });
-	await rename(tmpPath, runJsonPath);
+	try {
+		await rename(tmpPath, runJsonPath);
+	} catch (e) {
+		// Best-effort cleanup so a failed rename never orphans a unique tmp.
+		await unlink(tmpPath).catch(() => {});
+		throw e;
+	}
 }
 
 async function ensureDir(dirPath, mode) {
@@ -271,6 +282,13 @@ export async function readRun(runId) {
 	return data;
 }
 
+// Per-runId queue serializing updateRun's read-check-write section. Without
+// this, concurrent callers (e.g. worker-bootstrap's fire-and-forget event
+// callbacks racing its own terminal write) can all read the same on-disk
+// revision, all pass the optimistic-concurrency check, and last-rename-wins
+// silently clobbers an earlier write with no error thrown.
+const updateQueues = new Map();
+
 /**
  * Atomically update a run snapshot with a revision check.
  * Merges `partial` into the current snapshot, increments revision,
@@ -285,6 +303,16 @@ export async function readRun(runId) {
  */
 export async function updateRun(runId, partial, expectedRevision) {
 	validateRunId(runId);
+	const previous = updateQueues.get(runId) ?? Promise.resolve();
+	const settledPrevious = previous.catch(() => {});
+	const result = settledPrevious.then(() =>
+		performUpdate(runId, partial, expectedRevision),
+	);
+	updateQueues.set(runId, result);
+	return result;
+}
+
+async function performUpdate(runId, partial, expectedRevision) {
 	const current = await readRun(runId);
 
 	if (current.revision !== expectedRevision) {
@@ -308,6 +336,31 @@ export async function updateRun(runId, partial, expectedRevision) {
 	const runJsonPath = resolve(getRunRoot(runId), "run.json");
 	await writeRunAtomically(runJsonPath, merged);
 	return merged;
+}
+
+/**
+ * Update a run, retrying against the freshest on-disk revision when a
+ * concurrent writer wins the race. Use this for an authoritative write (e.g.
+ * a worker's terminal state) that must not be discarded just because a
+ * lower-priority in-flight update (a fire-and-forget event callback) reached
+ * the per-runId update queue first.
+ *
+ * @param {string} runId
+ * @param {object} partial - key-value updates to merge
+ * @param {number} [maxAttempts=10]
+ * @returns {Promise<object>} updated run snapshot
+ */
+export async function updateRunWithRetry(runId, partial, maxAttempts = 10) {
+	for (let attempt = 0; ; attempt++) {
+		const current = await readRun(runId);
+		try {
+			return await updateRun(runId, partial, current.revision);
+		} catch (error) {
+			if (!(error instanceof RevisionError) || attempt >= maxAttempts - 1) {
+				throw error;
+			}
+		}
+	}
 }
 
 /**
@@ -621,6 +674,38 @@ export async function releaseProjectLock(canonicalProjectPath) {
 	} catch (e) {
 		if (e.code !== "ENOENT") throw e;
 	}
+}
+
+/**
+ * Release the project lock only if it is still held by the expected run.
+ *
+ * A blind `releaseProjectLock` by path is unsafe for stale-run cleanup: the
+ * lock is keyed by project path only, so a lock legitimately re-acquired by
+ * a newer run (after the stale run's own lock was already cleared) would be
+ * silently deleted too, defeating the mutual exclusion the lock exists for.
+ * This performs a read-then-compare-then-delete so a recovery sweep against
+ * an old runId can never release a different, currently-active run's lock.
+ *
+ * @param {string} canonicalProjectPath
+ * @param {string} expectedRunId
+ * @returns {Promise<boolean>} true if the lock was held by expectedRunId and released
+ */
+export async function releaseProjectLockIfOwnedBy(
+	canonicalProjectPath,
+	expectedRunId,
+) {
+	const lockPath = lockFilePath(`project:${canonicalProjectPath}`);
+	let holder;
+	try {
+		const raw = await readFile(lockPath, "utf8");
+		holder = JSON.parse(raw).runId;
+	} catch (e) {
+		if (e.code === "ENOENT") return false;
+		throw e;
+	}
+	if (holder !== expectedRunId) return false;
+	await releaseProjectLock(canonicalProjectPath);
+	return true;
 }
 
 /**
