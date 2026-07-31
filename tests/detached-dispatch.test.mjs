@@ -261,7 +261,12 @@ describe("--exclude-provider on the detached worker path", () => {
 		// observe routing, not wait for the task to finish executing.
 		let observedProvider = null;
 		const start = Date.now();
-		const maxWait = 20_000;
+		// 60s, not the file's usual 15-20s budget: this test's container has to
+		// build/start from cold before routing is observable, which measured
+		// ~24.9s under sustained Docker load during this plan's own development
+		// (see TASKS.md's Docker-contention item) — comfortably inside 60s but
+		// past a tighter budget shared with lighter-weight tests in this file.
+		const maxWait = 60_000;
 		while (Date.now() - start < maxWait) {
 			const statusResult = pollStatus(runId, env);
 			if (statusResult.status === 0) {
