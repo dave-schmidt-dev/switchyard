@@ -767,6 +767,13 @@ describe("envelope format", () => {
 			"completedCount",
 			"failedCount",
 			"updatedAt",
+			"queueStartedAt",
+			"elapsedMs",
+			"totalTaskCount",
+			"runningCount",
+			"lastCompletionAt",
+			"activeTaskAgeMs",
+			"activeTaskRemainingMs",
 		];
 		for (const key of required) {
 			ok(key in envelope, `status envelope missing field: ${key}`);
@@ -811,9 +818,130 @@ describe("envelope format", () => {
 			"updatedAt",
 			"terminalSummary",
 			"artifactRefs",
+			"queueStartedAt",
+			"elapsedMs",
+			"totalTaskCount",
+			"runningCount",
+			"lastCompletionAt",
+			"activeTaskAgeMs",
+			"activeTaskRemainingMs",
 		];
 		for (const key of required) {
 			ok(key in envelope, `result envelope missing field: ${key}`);
 		}
+	});
+});
+
+describe("deriveTelemetryFields parity between status and result envelopes", () => {
+	it("status and result envelopes agree on the shared telemetry fields for the same run", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "telemetry-parity-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1", "1.2", "1.3"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const activeTaskStartedAt = Date.now() - 5_000;
+		const lastCompletionAt = Date.now() - 1_000;
+		const activeTaskDeadline = new Date(Date.now() + 1_800_000).toISOString();
+
+		const current = await readRun(runId);
+		// Fields set directly (rather than via a real run) purely to exercise
+		// the telemetry math with every input populated at once — the two
+		// envelope builders must derive identical shared-field values from
+		// the same underlying run record regardless of run state.
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				activeTaskId: "1.2",
+				activeTaskProvider: "claude",
+				activeTaskModel: "claude-sonnet-5",
+				activeTaskStartedAt,
+				activeTaskDeadline,
+				lastCompletionAt,
+				terminalSummary: { completedTaskIds: ["1.1"] },
+			},
+			current.revision,
+		);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
+
+		// Deterministic fields (no dependency on wall-clock "now" at build
+		// time) must match exactly between the two envelopes.
+		strictEqual(statusEnvelope.queueStartedAt, resultEnvelope.queueStartedAt);
+		strictEqual(statusEnvelope.totalTaskCount, resultEnvelope.totalTaskCount);
+		strictEqual(statusEnvelope.totalTaskCount, 3);
+		strictEqual(statusEnvelope.runningCount, resultEnvelope.runningCount);
+		strictEqual(statusEnvelope.runningCount, 1);
+		strictEqual(
+			statusEnvelope.lastCompletionAt,
+			resultEnvelope.lastCompletionAt,
+		);
+		strictEqual(statusEnvelope.lastCompletionAt, lastCompletionAt);
+
+		// now()-derived fields: assert both envelopes computed them (not
+		// null/NaN) and agree within a generous tolerance for the wall-clock
+		// drift between the two spawned CLI calls.
+		for (const key of [
+			"elapsedMs",
+			"activeTaskAgeMs",
+			"activeTaskRemainingMs",
+		]) {
+			ok(
+				typeof statusEnvelope[key] === "number" &&
+					!Number.isNaN(statusEnvelope[key]),
+				`status envelope ${key} should be a number, got ${statusEnvelope[key]}`,
+			);
+			ok(
+				typeof resultEnvelope[key] === "number" &&
+					!Number.isNaN(resultEnvelope[key]),
+				`result envelope ${key} should be a number, got ${resultEnvelope[key]}`,
+			);
+			ok(
+				Math.abs(statusEnvelope[key] - resultEnvelope[key]) < 5_000,
+				`status/result ${key} drifted too far: ${statusEnvelope[key]} vs ${resultEnvelope[key]}`,
+			);
+		}
+	});
+
+	it("activeTaskAgeMs and activeTaskRemainingMs are null when the underlying fields are unset", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "telemetry-null-fields-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const result = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const envelope = JSON.parse(result.stdout.trim());
+
+		strictEqual(envelope.activeTaskAgeMs, null);
+		strictEqual(envelope.activeTaskRemainingMs, null);
+		strictEqual(envelope.lastCompletionAt, null);
+		strictEqual(envelope.runningCount, 0);
+		strictEqual(envelope.totalTaskCount, 1);
+		ok(typeof envelope.elapsedMs === "number" && envelope.elapsedMs >= 0);
 	});
 });

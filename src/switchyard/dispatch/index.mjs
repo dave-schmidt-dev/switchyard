@@ -430,27 +430,77 @@ async function handleLaunch(argv) {
 	console.log(JSON.stringify(envelope));
 }
 
-async function countCompletedAndFailed(runId) {
-	let completedCount = 0;
-	let failedCount = 0;
+// Best-effort event read: a missing/unreadable events.jsonl (e.g. a run
+// that hasn't started executing yet) degrades to an empty list rather than
+// failing the envelope build.
+async function readEventsSafe(runId) {
 	try {
-		const events = await readEvents(runId);
-		for (const evt of events) {
-			if (evt.phase === "execution" && evt.event === "task_completed") {
-				completedCount += 1;
-			}
-			if (evt.phase === "execution" && evt.event === "task_failed") {
-				failedCount += 1;
-			}
-		}
+		return await readEvents(runId);
 	} catch {
 		// events may be absent or unreadable
+		return [];
+	}
+}
+
+function countCompletedAndFailed(events) {
+	let completedCount = 0;
+	let failedCount = 0;
+	for (const evt of events) {
+		if (evt.phase === "execution" && evt.event === "task_completed") {
+			completedCount += 1;
+		}
+		if (evt.phase === "execution" && evt.event === "task_failed") {
+			failedCount += 1;
+		}
 	}
 	return { completedCount, failedCount };
 }
 
+/**
+ * Derive the throughput/telemetry fields shared by buildStatusEnvelope and
+ * buildResultEnvelope, so the two envelope builders can't drift on the same
+ * underlying aggregate-progress signal.
+ *
+ * `checkpointState` is accepted but not yet consumed by any field here — it
+ * is threaded through so a later `pendingCount` derivation (read off the
+ * same checkpoint state `runQueue` itself consults) can be added without
+ * another signature change.
+ *
+ * @param {object} run parsed run snapshot
+ * @param {Array<object>} events this run's event log (readEventsSafe result)
+ * @param {object|null} checkpointState reserved for a future pendingCount derivation
+ * @returns {object} shared telemetry fields
+ */
+function deriveTelemetryFields(run, events, checkpointState) {
+	void events;
+	void checkpointState;
+
+	const now = Date.now();
+	const queueStartedAt = new Date(run.createdAt).getTime();
+
+	return {
+		queueStartedAt,
+		elapsedMs: now - queueStartedAt,
+		totalTaskCount: run.orderedTaskIds.length,
+		// Single worker processes one task at a time, so "running" is a
+		// 0/1 signal keyed off whether a task is currently active.
+		runningCount: run.activeTaskId != null ? 1 : 0,
+		lastCompletionAt: run.lastCompletionAt ?? null,
+		activeTaskAgeMs:
+			run.activeTaskStartedAt != null ? now - run.activeTaskStartedAt : null,
+		// Display-only: derived from the routed deadline, not a scheduling
+		// guarantee. Can go negative if a task runs past its deadline.
+		activeTaskRemainingMs:
+			run.activeTaskDeadline != null
+				? new Date(run.activeTaskDeadline).getTime() - now
+				: null,
+	};
+}
+
 async function buildStatusEnvelope(runId, run) {
-	const { completedCount, failedCount } = await countCompletedAndFailed(runId);
+	const events = await readEventsSafe(runId);
+	const { completedCount, failedCount } = countCompletedAndFailed(events);
+	const telemetry = deriveTelemetryFields(run, events, null);
 	return {
 		schemaVersion: 1,
 		runId: run.runId,
@@ -467,6 +517,7 @@ async function buildStatusEnvelope(runId, run) {
 		completedCount,
 		failedCount,
 		updatedAt: run.updatedAt,
+		...telemetry,
 	};
 }
 
@@ -483,7 +534,9 @@ async function listArtifactRefs(runId) {
 }
 
 async function buildResultEnvelope(runId, run) {
-	const { completedCount, failedCount } = await countCompletedAndFailed(runId);
+	const events = await readEventsSafe(runId);
+	const { completedCount, failedCount } = countCompletedAndFailed(events);
+	const telemetry = deriveTelemetryFields(run, events, null);
 	const artifactRefs = await listArtifactRefs(runId);
 	return {
 		schemaVersion: 1,
@@ -500,6 +553,7 @@ async function buildResultEnvelope(runId, run) {
 		updatedAt: run.updatedAt,
 		terminalSummary: run.terminalSummary ?? null,
 		artifactRefs,
+		...telemetry,
 	};
 }
 

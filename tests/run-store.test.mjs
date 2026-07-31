@@ -27,6 +27,7 @@ import {
 	RevisionError,
 	readRun,
 	releaseLaunchLock,
+	releaseOrphanedProjectLocks,
 	releaseProjectLock,
 	releaseRunLock,
 	renewRunLock,
@@ -527,6 +528,158 @@ describe("project lock", () => {
 		strictEqual(body.projectPath, path);
 		strictEqual(body.runId, runId);
 		ok(typeof body.createdAt === "string");
+	});
+});
+
+describe("releaseOrphanedProjectLocks", () => {
+	it("returns an empty array when the locks directory does not exist", async () => {
+		const reclaimed = await releaseOrphanedProjectLocks();
+		strictEqual(reclaimed.length, 0);
+	});
+
+	it("leaves a live run's lock untouched alongside an orphaned lock it reclaims", async () => {
+		// Live run: non-terminal state, worker pid points at this very test
+		// process, which is provably alive.
+		const liveOpts = makeOptions({ projectPath: uniquePath("live-project") });
+		await initializeRun(liveOpts);
+		await advanceState(liveOpts.runId, "running");
+		const liveCurrent = await readRun(liveOpts.runId);
+		await updateRun(
+			liveOpts.runId,
+			{ workerPid: process.pid },
+			liveCurrent.revision,
+		);
+		await acquireProjectLock(liveOpts.projectPath, liveOpts.runId);
+
+		// Orphaned run sitting alongside it: terminal state, lock never
+		// released (the residue a crashed worker leaves behind).
+		const deadOpts = makeOptions({ projectPath: uniquePath("dead-project") });
+		await initializeRun(deadOpts);
+		await advanceState(deadOpts.runId, "failed");
+		await acquireProjectLock(deadOpts.projectPath, deadOpts.runId);
+
+		const reclaimed = await releaseOrphanedProjectLocks();
+
+		ok(
+			reclaimed.includes(deadOpts.runId),
+			"the orphaned run's lock should be reclaimed",
+		);
+		ok(
+			!reclaimed.includes(liveOpts.runId),
+			"the live run's id must not appear in the reclaimed list",
+		);
+		strictEqual(
+			isProjectLockHeld(liveOpts.projectPath),
+			true,
+			"a live run's lock must never be touched by the scan",
+		);
+		strictEqual(
+			isProjectLockHeld(deadOpts.projectPath),
+			false,
+			"the orphaned lock should have been reclaimed",
+		);
+	});
+
+	it("reclaims a lock whose worker is still 'running' but the pid is dead", async () => {
+		// Non-terminal state with a dead worker pid: exactly what a
+		// hard-crashed worker (process.exit before any terminal write)
+		// leaves behind. Covered by the isWorkerLive branch, not the
+		// terminal-state branch, of the shared staleness check.
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { workerPid: 999999 }, current.revision);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+
+		const reclaimed = await releaseOrphanedProjectLocks();
+
+		ok(reclaimed.includes(opts.runId));
+		strictEqual(isProjectLockHeld(opts.projectPath), false);
+	});
+
+	it("never reclaims a lock with an unparseable body, regardless of age", async () => {
+		const locksDir = join(getStateRoot(), "locks");
+		mkdirSync(locksDir, { recursive: true });
+		const corruptLockPath = join(locksDir, "corrupt-test.lock");
+		writeFileSync(corruptLockPath, "not json {{{");
+
+		const reclaimed = await releaseOrphanedProjectLocks();
+
+		strictEqual(reclaimed.length, 0);
+		ok(
+			existsSync(corruptLockPath),
+			"a lock with an unparseable body must be left on disk untouched",
+		);
+	});
+
+	it("never reclaims a launch lock (parseable body, no projectPath)", async () => {
+		// A launch lock predates F.1's projectPath addition: {runId,
+		// createdAt} only. This is the permanent, correct shape for launch
+		// locks — not a migration gap — so the scan must leave it alone.
+		const tasksPath = uniquePath("tasks");
+		const launchRunId = uniqueRunId();
+		await acquireLaunchLock(tasksPath, launchRunId);
+
+		const reclaimed = await releaseOrphanedProjectLocks();
+
+		strictEqual(reclaimed.length, 0);
+		// Black-box check that the launch lock file is still present: a
+		// second acquire on the same tasks path must still collide.
+		await rejects(acquireLaunchLock(tasksPath, uniqueRunId()), LockError);
+	});
+
+	it("never reclaims a lock whose runId has no run.json at all", async () => {
+		// A parseable, projectPath-bearing lock whose run was never
+		// initialized (or whose run directory is gone entirely) is a
+		// strictly weaker signal than a resolvable-but-dead run: the scan
+		// can observe the run record is gone but cannot prove the lock's
+		// original holder is actually dead. Per CR-4/CR-5 this resolves to
+		// "cannot identify, leave alone" — same posture as an unparseable
+		// body or a launch lock. Deferred to F.3's human-confirmed manual
+		// remediation, not something this scan should reclaim on its own.
+		const path = uniquePath("project");
+		const ghostRunId = uniqueRunId();
+		await acquireProjectLock(path, ghostRunId);
+
+		const reclaimed = await releaseOrphanedProjectLocks();
+
+		ok(!reclaimed.includes(ghostRunId));
+		strictEqual(isProjectLockHeld(path), true);
+	});
+
+	it("does not release a lock already reassigned to a newer active run on the same project", async () => {
+		// Mirrors dispatch's releaseProjectLockIfOwnedBy ownership guard: a
+		// stale run's own lock file was already superseded by a different,
+		// currently-active run against the same project path. The scan must
+		// never pull that active run's lock out from under it.
+		const projectPath = uniquePath("project");
+
+		const staleOpts = makeOptions({ projectPath });
+		await initializeRun(staleOpts);
+		await advanceState(staleOpts.runId, "failed");
+		// staleRunId's own lock was already released elsewhere; only the
+		// active run below currently holds project lock for this path.
+
+		const activeOpts = makeOptions({ projectPath });
+		await initializeRun(activeOpts);
+		await advanceState(activeOpts.runId, "running");
+		const activeCurrent = await readRun(activeOpts.runId);
+		await updateRun(
+			activeOpts.runId,
+			{ workerPid: process.pid },
+			activeCurrent.revision,
+		);
+		await acquireProjectLock(projectPath, activeOpts.runId);
+
+		const reclaimed = await releaseOrphanedProjectLocks();
+
+		ok(!reclaimed.includes(activeOpts.runId));
+		strictEqual(
+			isProjectLockHeld(projectPath),
+			true,
+			"the active run's lock must survive even though a stale run once used the same project path",
+		);
 	});
 });
 

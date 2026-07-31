@@ -745,6 +745,154 @@ export function isProjectLockHeld(canonicalProjectPath) {
 }
 
 /**
+ * Best-effort liveness probe for a run's worker process.
+ *
+ * Not exported: this mirrors dispatch/index.mjs's private isWorkerLive
+ * exactly (signal-0 kill(2) probe: ESRCH => dead, EPERM => alive-but-
+ * foreign). That copy predates this one and dispatch has not been rewired
+ * to import from here, so the two definitions currently coexist as
+ * module-private code in their respective files. If dispatch/index.mjs is
+ * ever updated to import this instead of keeping its own copy, export this
+ * function at that point. Until then, any change to the liveness rule must
+ * be mirrored in dispatch/index.mjs by hand.
+ *
+ * @param {object} run parsed run snapshot
+ * @returns {boolean} true only if a signalable worker pid still exists
+ */
+function isWorkerLive(run) {
+	if (run.workerPid == null) return false;
+	try {
+		// Signal 0 performs error checking without delivering a signal.
+		process.kill(run.workerPid, 0);
+		return true;
+	} catch (e) {
+		// ESRCH => no such process; EPERM => process exists but is not ours.
+		return e.code === "EPERM";
+	}
+}
+
+/**
+ * Determine whether a run is stale/reclaimable for lock-recovery purposes:
+ * its worker is provably gone (terminal state, or a non-terminal state with
+ * no live worker process left).
+ *
+ * Factored out so this module has exactly one definition of "stale" —
+ * releaseOrphanedProjectLocks below is the only current caller, but the
+ * point is to avoid a second inline copy of dispatch/index.mjs's
+ * `terminal || !isWorkerLive(run)` check appearing anywhere in this file.
+ *
+ * @param {object} run parsed run snapshot
+ * @returns {boolean}
+ */
+function isRunStale(run) {
+	const terminal = run.state === "succeeded" || run.state === "failed";
+	return terminal || !isWorkerLive(run);
+}
+
+/**
+ * Scan locksRoot() on disk and reclaim orphaned project locks.
+ *
+ * releaseStaleProjectLocks (dispatch/index.mjs) walks *known* candidate run
+ * ids inward to their locks. This scan walks the other direction: it starts
+ * from every lock file actually on disk, so a project lock left behind by a
+ * run that never made it into that candidate list (e.g. its container was
+ * already reaped before recovery ran) still gets reconciled. It relies on
+ * the projectPath F.1 added to every newly-acquired project lock body, so a
+ * lock's owning project never has to be looked up via the run itself.
+ *
+ * Scope is intentionally conservative (David's CR-4/CR-5 decision):
+ *  - A lock file whose body is not valid JSON is left untouched, regardless
+ *    of age. A corrupt lock body is not this scan's business to repair,
+ *    delete, or recover.
+ *  - A lock file with a valid JSON body but no `projectPath` is a launch
+ *    lock (predates F.1's schema addition). It is left untouched —
+ *    permanently, by design, not a migration gap to close later. There is
+ *    no safe way to derive a projectPath for a lock that never recorded
+ *    one, so do not "fix" this case.
+ *  - A lock file with a valid JSON body and a `projectPath`, but whose
+ *    runId no longer resolves to any run.json at all (pruned, or never
+ *    written), is ALSO left untouched. A missing run record is a strictly
+ *    weaker signal than "the run exists and is provably dead" — the scan
+ *    can observe the record is gone, but cannot prove the lock's original
+ *    holder is actually dead versus e.g. mid-retention-sweep. Per CR-4/CR-5
+ *    this ambiguity resolves to "cannot identify, leave alone," the same
+ *    posture as the missing-projectPath case above. This is intentionally
+ *    deferred to F.3's human-confirmed manual remediation, not a gap for
+ *    this scan to close.
+ *  - Only a lock that is parseable AND has a projectPath AND whose run.json
+ *    exists AND is stale per the shared liveness check is reclaimed.
+ *
+ * Reclaiming is ownership-checked (releaseProjectLockIfOwnedBy), never a
+ * blind unlink by path, so a lock already superseded by a newer,
+ * currently-active run against the same project is never pulled out from
+ * under it.
+ *
+ * @returns {Promise<string[]>} runIds whose project lock was reclaimed
+ */
+export async function releaseOrphanedProjectLocks() {
+	let entries;
+	try {
+		entries = await readdir(locksRoot(), { withFileTypes: true });
+	} catch (e) {
+		if (e.code === "ENOENT") return [];
+		throw e;
+	}
+
+	const reclaimed = [];
+
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".lock")) continue;
+
+		const lockPath = resolve(locksRoot(), entry.name);
+		let body;
+		try {
+			const raw = await readFile(lockPath, "utf8");
+			body = JSON.parse(raw);
+		} catch {
+			// Unparseable body: never touched, regardless of age. See the
+			// scope note in this function's doc comment.
+			continue;
+		}
+
+		if (
+			body === null ||
+			typeof body !== "object" ||
+			typeof body.projectPath !== "string"
+		) {
+			// Parseable but no projectPath: a launch lock. Left untouched
+			// permanently — see the scope note in this function's doc comment.
+			continue;
+		}
+
+		let run;
+		try {
+			run = await readRun(body.runId);
+		} catch {
+			// The run no longer exists at all: a strictly weaker signal than
+			// a resolvable-but-dead run, so this cannot be proven stale.
+			// "Cannot identify, leave alone" per CR-4/CR-5 — see the doc
+			// comment above. Deferred to F.3's manual remediation.
+			continue;
+		}
+
+		if (!isRunStale(run)) continue;
+
+		try {
+			const didRelease = await releaseProjectLockIfOwnedBy(
+				body.projectPath,
+				body.runId,
+			);
+			if (didRelease) reclaimed.push(body.runId);
+		} catch {
+			// Best-effort; leave the lock for a future scan rather than throw
+			// and abandon the rest of the sweep.
+		}
+	}
+
+	return reclaimed;
+}
+
+/**
  * Apply retention policy to completed runs.
  * Deletes runs where state is "succeeded" AND cleanupState is "complete".
  * Never touches non-terminal or cleanup-failed runs.
