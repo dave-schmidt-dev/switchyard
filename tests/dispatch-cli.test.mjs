@@ -798,6 +798,7 @@ describe("envelope format", () => {
 			"pendingCount",
 			"runningCount",
 			"lastCompletionAt",
+			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
 		];
@@ -850,6 +851,7 @@ describe("envelope format", () => {
 			"pendingCount",
 			"runningCount",
 			"lastCompletionAt",
+			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
 		];
@@ -932,6 +934,7 @@ describe("deriveTelemetryFields parity between status and result envelopes", () 
 		// drift between the two spawned CLI calls.
 		for (const key of [
 			"elapsedMs",
+			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
 		]) {
@@ -977,6 +980,77 @@ describe("deriveTelemetryFields parity between status and result envelopes", () 
 		strictEqual(envelope.runningCount, 0);
 		strictEqual(envelope.totalTaskCount, 1);
 		ok(typeof envelope.elapsedMs === "number" && envelope.elapsedMs >= 0);
+		// lastCompletionAt is unset, so elapsedSinceLastCompletionMs must fall
+		// back to the same queueStartedAt-derived value as elapsedMs — both
+		// fields are computed from the same `now` inside deriveTelemetryFields.
+		strictEqual(envelope.elapsedSinceLastCompletionMs, envelope.elapsedMs);
+	});
+});
+
+describe("elapsedSinceLastCompletionMs telemetry field (B.4)", () => {
+	it("falls back to queueStartedAt-derived elapsed time when lastCompletionAt is unset (zero-completions incident state)", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "elapsed-since-completion-fallback-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const result = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const envelope = JSON.parse(result.stdout.trim());
+
+		strictEqual(envelope.lastCompletionAt, null);
+		ok(
+			typeof envelope.elapsedSinceLastCompletionMs === "number" &&
+				!Number.isNaN(envelope.elapsedSinceLastCompletionMs),
+			`expected a number, got ${envelope.elapsedSinceLastCompletionMs}`,
+		);
+		strictEqual(envelope.elapsedSinceLastCompletionMs, envelope.elapsedMs);
+	});
+
+	it("uses lastCompletionAt once at least one task has completed", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "elapsed-since-completion-lastcompletion-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const lastCompletionAt = Date.now() - 60_000;
+		const current = await readRun(runId);
+		await updateRun(runId, { lastCompletionAt }, current.revision);
+
+		const result = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const envelope = JSON.parse(result.stdout.trim());
+
+		strictEqual(envelope.lastCompletionAt, lastCompletionAt);
+		// Should track ~60s since lastCompletionAt, not the (much smaller)
+		// queueStartedAt-derived elapsedMs for a run created moments ago in
+		// this same test.
+		ok(
+			Math.abs(envelope.elapsedSinceLastCompletionMs - 60_000) < 5_000,
+			`expected ~60000ms since lastCompletionAt, got ${envelope.elapsedSinceLastCompletionMs}`,
+		);
+		ok(
+			envelope.elapsedSinceLastCompletionMs > envelope.elapsedMs,
+			`expected elapsedSinceLastCompletionMs (${envelope.elapsedSinceLastCompletionMs}) to exceed elapsedMs (${envelope.elapsedMs}) once lastCompletionAt predates queueStartedAt-derived elapsed`,
+		);
 	});
 });
 

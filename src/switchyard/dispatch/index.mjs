@@ -524,6 +524,12 @@ function deriveTelemetryFields(run, events, checkpointState) {
 		// 0/1 signal keyed off whether a task is currently active.
 		runningCount: run.activeTaskId != null ? 1 : 0,
 		lastCompletionAt: run.lastCompletionAt ?? null,
+		// Before the first completion this falls back to queueStartedAt,
+		// overstating elapsed time by launch/lock/verification overhead
+		// (typically sub-second to low-single-digit seconds) — negligible
+		// against this field's hours-scale purpose.
+		elapsedSinceLastCompletionMs:
+			now - (run.lastCompletionAt ?? queueStartedAt),
 		activeTaskAgeMs:
 			run.activeTaskStartedAt != null ? now - run.activeTaskStartedAt : null,
 		// Display-only: derived from the routed deadline, not a scheduling
