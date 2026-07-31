@@ -245,14 +245,14 @@ Added after a live multi-hour dispatch run produced only one completed task with
 
 `acquireProjectLock` writes `projectPath` into a project lock's body (in addition to the pre-existing `{runId, createdAt}`), and `releaseOrphanedProjectLocks()` (used internally by `recover`) reconciles any *parseable* lock's `projectPath` against known run liveness, even when the run's own directory has been pruned — closing the gap where `recover`'s existing `candidateIds`-driven scan can't reach a lock whose run record no longer exists. This scan never touches an unparseable lock body or a lock missing `projectPath` (a launch lock, or a project lock predating this change) — those can't be proven dead, so they're never auto-reclaimed.
 
-For the 6 project locks orphaned on 2026-07-27 (predating `projectPath`), a separate standalone script handles the one-time cleanup with a human in the loop:
+For the class of project lock orphaned on 2026-07-27 (predating `projectPath`), a separate standalone script handles one-time cleanup with a human in the loop:
 
 ```bash
 node src/switchyard/dispatch/remediate-orphaned-locks.mjs --dry-run   # inspect the candidate set first
 node src/switchyard/dispatch/remediate-orphaned-locks.mjs             # interactive, confirms before each removal
 ```
 
-It recovers `projectPath` for the pre-`projectPath` lock shape from the run's own record, confirms it by recomputing the lock's expected filename hash against the file on disk, and still enforces the existing ownership-checked `releaseProjectLockIfOwnedBy` at the moment of deletion. **Not yet run against this installation's live orphaned locks** — see `TASKS.md`.
+It recovers `projectPath` for the pre-`projectPath` lock shape from the run's own record, confirms it by recomputing the lock's expected filename hash against the file on disk, and still enforces the existing ownership-checked `releaseProjectLockIfOwnedBy` at the moment of deletion. This installation's own 6 locks from 2026-07-27 were, as it turned out, already cleared by the time this tool was built — see `HISTORY.md`'s 2026-07-31 entry — so `--dry-run` here now correctly reports zero candidates; the tool remains the safe path for the next time this class of lock turns up.
 
 ### Environment Variables
 
