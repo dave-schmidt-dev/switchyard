@@ -266,6 +266,19 @@ node src/switchyard/dispatch/remediate-orphaned-locks.mjs             # interact
 
 It recovers `projectPath` for the pre-`projectPath` lock shape from the run's own record, confirms it by recomputing the lock's expected filename hash against the file on disk, and still enforces the existing ownership-checked `releaseProjectLockIfOwnedBy` at the moment of deletion. This installation's own 6 locks from 2026-07-27 were, as it turned out, already cleared by the time this tool was built — see `HISTORY.md`'s 2026-07-31 entry — so `--dry-run` here now correctly reports zero candidates; the tool remains the safe path for the next time this class of lock turns up.
 
+#### Scheduled reaping (idle autoclean)
+
+A working container/volume orphaned by a hard kill is reclaimed on the next dispatch (the pre-run sweep), by an interactive `recover`, and by the SIGTERM/SIGINT owned-container handler. For truly hands-off cleanup during long idle stretches, an optional launchd LaunchAgent runs a **standalone reaper** hourly (and at login):
+
+```bash
+sh ops/install-reaper.sh     # install/reload the com.zerodelta.switchyard.reaper LaunchAgent (idempotent)
+sh ops/uninstall-reaper.sh   # remove it
+launchctl kickstart gui/$(id -u)/com.zerodelta.switchyard.reaper   # run once now
+# log: ~/Library/Logs/switchyard-reaper.log
+```
+
+`ops/switchyard-reaper.sh` reclaims liveness **purely from Docker labels** — it reads each managed object's `worker_pid` label and probes it with `kill -0`, force-removing (`docker rm -f -v`) only a proven-dead owner's objects. It reads no run store and no project code, which is deliberate: a background launchd agent cannot read the project tree under `~/Documents` without a Full Disk Access grant (macOS TCC), so the installer copies the reaper to `~/Library/Application Support/switchyard/` and it needs **no privilege grant** to run. Because it shares INV-3's PID-liveness rule, it is safe to run concurrently with live dispatches (a live owner's PID is always signalable, so its objects are skipped) and it never touches the standing `switchyard-agent` container (unmanaged, so outside the `managed=true` filter). The label strings it hardcodes are kept in sync with `src/switchyard/lifecycle/index.mjs` by a parity assertion in `tests/reaper-script.test.mjs`. It is intentionally narrower than `recover`: a legacy object with no `worker_pid` label is skipped (the safe direction), left for interactive/pre-dispatch `recover`.
+
 ### Environment Variables
 
 - `SWITCHYARD_ROSTER_PATH`: Path to `roster.json` — the canonical provider/harness capability roster file. Required; fail-loud on unset. Typically points to `~/.agent/roster.json` in production. No configured install-path fallback (switchyard must not hardcode an external roster location into its own source).

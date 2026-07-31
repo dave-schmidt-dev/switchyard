@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Switchyard standalone reaper (LaunchAgent).
+
+  TEMPLATE: ops/install-reaper.sh copies switchyard-reaper.sh into a non-TCC
+  location under ~/Library and substitutes __REAPER_SH__ with its absolute path.
+  The reaper reads only Docker labels (never project code), so it runs here with
+  NO Full Disk Access grant. Do not load this template directly.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.zerodelta.switchyard.reaper</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>__REAPER_SH__</string>
+	</array>
+
+	<!-- Reap once at load/login, then hourly. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+
+	<!-- Never contend with foreground work. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+
+	<key>StandardOutPath</key>
+	<string>__REAPER_OUT__</string>
+	<key>StandardErrorPath</key>
+	<string>__REAPER_ERR__</string>
+</dict>
+</plist>
