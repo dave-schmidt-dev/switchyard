@@ -43,7 +43,7 @@ import {
 	seedProject,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
-import { classifyTask } from "../roster/classifier.mjs";
+import { classifyTask, isValidTier } from "../roster/classifier.mjs";
 import {
 	normalizeProviderName,
 	resolveRouteProvenance,
@@ -275,6 +275,21 @@ export function parseTaskQueue(markdown) {
 			timeoutMs = parseTimeoutField(timeoutValue, taskId);
 		}
 
+		// Task 2.1: an upstream task-queue author can declare a tier explicitly
+		// rather than leaving it to classifyTask's keyword inference (INV-5
+		// right-sizing). Absent is fine (executeTask falls back to
+		// classifyTask); present-but-invalid is not — same fail-closed
+		// convention as Files:/Timeout: above, not the silent lowest-tier
+		// coercion this replaces (see resolveTaskTier / passesCapabilityFilter).
+		let tier = null;
+		const tierLine = block
+			.split("\n")
+			.find((line) => /^- \*\*Tier:\*\*\s/.test(line));
+		if (tierLine) {
+			const tierValue = tierLine.replace(/^- \*\*Tier:\*\*\s*/, "").trim();
+			tier = parseTierField(tierValue, taskId);
+		}
+
 		tasks.push({
 			id: taskId,
 			title: title.trim(),
@@ -283,6 +298,7 @@ export function parseTaskQueue(markdown) {
 			prompt: fullPrompt,
 			requiredPaths,
 			timeoutMs,
+			tier,
 		});
 	}
 
@@ -324,6 +340,26 @@ function parseTimeoutField(raw, taskId) {
 	}
 
 	return ms;
+}
+
+/**
+ * Parse and validate a per-task `Tier:` declaration (Task 2.1). Same
+ * fail-closed convention as parseTimeoutField/parseFilePaths: an
+ * unrecognized value throws immediately rather than being silently accepted
+ * — never coerced to a default tier here.
+ * @param {string} raw The raw value of the Tier field, e.g. "standard"
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string} normalized tier ('high'|'standard'|'low')
+ * @throws {Error} If the value isn't a recognized tier
+ */
+function parseTierField(raw, taskId) {
+	const trimmed = raw.trim().toLowerCase();
+	if (!isValidTier(trimmed)) {
+		throw new Error(
+			`Task ${taskId}: invalid Tier field "${raw.trim()}" (expected one of: high, standard, low)`,
+		);
+	}
+	return trimmed;
 }
 
 /**
@@ -657,12 +693,37 @@ export async function waitForJobCompletion(options) {
 }
 
 /**
+ * Resolve the tier to route a task at (Task 2.1 — respect the
+ * upstream-declared tier). A declared `task.tier` (parseTaskQueue's `Tier:`
+ * field) takes precedence over classifyTask's keyword inference, but only
+ * when it is both present AND valid — an invalid/unrecognized declared tier
+ * is rejected outright (fail closed, INV-5) rather than silently falling
+ * back to classifyTask or reaching the roster's tier-order lookup, which
+ * would otherwise coerce an unrecognized string to the least-restrictive
+ * tier. classifyTask only runs when the tier is fully ABSENT from the task.
+ * @param {{id: string, tier?: string|null, description?: string, title?: string}} task
+ * @returns {string} tier ('high'|'standard'|'low')
+ * @throws {Error} if task.tier is present but not a recognized tier
+ */
+function resolveTaskTier(task) {
+	if (task.tier != null) {
+		if (!isValidTier(task.tier)) {
+			throw new Error(
+				`Task ${task.id}: invalid declared tier "${task.tier}" (expected one of: high, standard, low) — refusing to silently route at a fallback tier`,
+			);
+		}
+		return task.tier;
+	}
+	return classifyTask(task.description || task.title);
+}
+
+/**
  * Execute one task via routed provider/model and return a structured result.
  * @param {{id: string, title: string, description: string}} task
  * @param {object} context
  */
 export function executeTask(task, context) {
-	const tier = classifyTask(task.description || task.title);
+	const tier = resolveTaskTier(task);
 	const routeResult = context.route({
 		tier,
 		availableProviders: Object.keys(context.adapters ?? {}),
@@ -878,7 +939,7 @@ export function executeTask(task, context) {
  * @returns {Promise<object>}
  */
 export async function executeTaskWithOrchestrator(task, context) {
-	const tier = classifyTask(task.description || task.title);
+	const tier = resolveTaskTier(task);
 	// Deliberately no availableProviders here — see runQueueWithOrchestrator's
 	// "intentionally-unfiltered orchestrator route" note (Task 16), a
 	// pre-existing gap this task does not touch.

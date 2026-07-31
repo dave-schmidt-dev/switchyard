@@ -484,13 +484,27 @@ export function getModelForTier(providerName, tier) {
 /**
  * Capability filter - INV-5.
  * A (provider, model) below the task's tier is not a candidate.
+ *
+ * Task 2.1: `taskTier` must be a recognized tier name — an unknown/typo'd
+ * value is REJECTED (thrown), not coerced to `0` (the lowest/least-
+ * restrictive tier). Coercing to 0 was a real INV-5 bypass: an invalid tier
+ * would previously pass the filter against every provider regardless of
+ * capability. `providerClass` still falls back to `0` on purpose — an
+ * unqualified/unknown *provider* class is a normal "doesn't meet any tier"
+ * state, not a caller error.
  * @param {string} providerName
  * @param {string} taskTier
  * @returns {boolean} true if provider meets or exceeds the tier
+ * @throws {Error} if taskTier is not one of TIER_ORDER's known keys
  */
 export function passesCapabilityFilter(providerName, taskTier) {
 	const providerClass = getCapabilityClass(providerName);
-	const taskTierValue = TIER_ORDER[taskTier] ?? 0;
+	if (!Object.hasOwn(TIER_ORDER, taskTier)) {
+		throw new Error(
+			`passesCapabilityFilter: unrecognized task tier ${JSON.stringify(taskTier)} (expected one of: ${Object.keys(TIER_ORDER).join(", ")}) — refusing to silently treat it as the lowest tier`,
+		);
+	}
+	const taskTierValue = TIER_ORDER[taskTier];
 	const providerTierValue = TIER_ORDER[providerClass] ?? 0;
 	return providerTierValue >= taskTierValue;
 }

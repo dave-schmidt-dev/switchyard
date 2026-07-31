@@ -429,6 +429,49 @@ describe("runner queue parsing", () => {
 `;
 		throws(() => parseTaskQueue(markdown), /must be between 1s and 24h/);
 	});
+
+	// Task 2.1 (roster-unification plan): parseTaskQueue reads a declared
+	// `Tier:` field so an upstream task-queue author's tier assignment can be
+	// respected by the runner instead of always being re-inferred by
+	// classifyTask (see "runner tier resolution" below for the routing half).
+	it("extracts tier from a Tier: field, normalizing case", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Declared tier task
+- **Status:** pending
+- **Tier:** Standard
+- **Description:** Whatever classifyTask would guess is irrelevant here
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].tier, "standard");
+	});
+
+	it("sets tier to null when no Tier: field is present", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Simple task
+- **Status:** pending
+- **Description:** Do things
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].tier, null);
+	});
+
+	it("rejects a Tier: field with an unrecognized value instead of silently accepting it", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Tier:** urgent
+- **Description:** Bad
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/invalid Tier field "urgent" \(expected one of: high, standard, low\)/,
+		);
+	});
 });
 
 describe("runner orchestration", () => {
@@ -3700,6 +3743,181 @@ describe("executeTask timeout handling", () => {
 		strictEqual(result.timedOut, undefined);
 		strictEqual(result.partialDiff, undefined);
 		strictEqual(captureDiffCalls.length, 0);
+	});
+});
+
+// Task 2.1 (roster-unification plan): executeTask/executeTaskWithOrchestrator
+// used to invent the tier via classifyTask(task.description || task.title) on
+// every call, never reading a tier the task-queue author may have already
+// declared upstream (INV-5 right-sizing). These tests exercise the fix at
+// the routing boundary: route() must receive a task's declared tier verbatim
+// when present and valid, must still fall back to classifyTask when the tier
+// is absent, and must reject (not silently route at a fallback) when a
+// declared tier is present but unrecognized.
+describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)", () => {
+	function tierCapturingContext(routeCalls) {
+		return {
+			route: (opts) => {
+				routeCalls.push(opts);
+				return {
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 50,
+					reason: "spread",
+				};
+			},
+			recordDispatch: () => {},
+			integrationGate: () => ({ success: true, message: "ok" }),
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => null,
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		};
+	}
+
+	it("executeTask routes at the task's declared tier, not classifyTask's guess from the description", () => {
+		const routeCalls = [];
+		// "format the readme" is an unambiguous LOW_TIER_KEYWORDS match in
+		// classifier.mjs (format/readme) -- classifyTask would call this
+		// "low". The declared tier must win instead.
+		executeTask(
+			{
+				id: "1.1",
+				title: "task",
+				description: "format the readme",
+				tier: "high",
+			},
+			tierCapturingContext(routeCalls),
+		);
+		strictEqual(routeCalls.length, 1);
+		strictEqual(routeCalls[0].tier, "high");
+	});
+
+	it("executeTask falls back to classifyTask when no tier is declared (existing behavior preserved)", () => {
+		const routeCalls = [];
+		executeTask(
+			{
+				id: "1.1",
+				title: "task",
+				description: "format the readme",
+				tier: null,
+			},
+			tierCapturingContext(routeCalls),
+		);
+		strictEqual(routeCalls.length, 1);
+		strictEqual(routeCalls[0].tier, "low");
+	});
+
+	it("executeTask rejects an invalid declared tier instead of silently routing at tier 0", () => {
+		const routeCalls = [];
+		throws(
+			() =>
+				executeTask(
+					{
+						id: "1.1",
+						title: "task",
+						description: "format the readme",
+						tier: "urgent",
+					},
+					tierCapturingContext(routeCalls),
+				),
+			/invalid declared tier "urgent"/,
+		);
+		// The reject must happen before route() is ever reached -- an invalid
+		// tier must not silently reach the router as a fallback/zero tier.
+		strictEqual(routeCalls.length, 0);
+	});
+
+	it("executeTaskWithOrchestrator routes at the task's declared tier, not classifyTask's guess", async () => {
+		const routeCalls = [];
+		const result = await executeTaskWithOrchestrator(
+			{
+				id: "1.1",
+				title: "task",
+				description: "format the readme",
+				tier: "high",
+			},
+			{
+				...tierCapturingContext(routeCalls),
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: "" }),
+				},
+			},
+		);
+		strictEqual(routeCalls.length, 1);
+		strictEqual(routeCalls[0].tier, "high");
+		strictEqual(result.taskId, "1.1");
+	});
+
+	it("executeTaskWithOrchestrator falls back to classifyTask when no tier is declared", async () => {
+		const routeCalls = [];
+		await executeTaskWithOrchestrator(
+			{ id: "1.1", title: "task", description: "format the readme" },
+			{
+				...tierCapturingContext(routeCalls),
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: "" }),
+				},
+			},
+		);
+		strictEqual(routeCalls.length, 1);
+		strictEqual(routeCalls[0].tier, "low");
+	});
+
+	it("executeTaskWithOrchestrator rejects an invalid declared tier instead of silently routing at tier 0", async () => {
+		const routeCalls = [];
+		await rejects(
+			() =>
+				executeTaskWithOrchestrator(
+					{
+						id: "1.1",
+						title: "task",
+						description: "format the readme",
+						tier: "urgent",
+					},
+					{
+						...tierCapturingContext(routeCalls),
+						orchestrator: {
+							launch: async () => "job-1",
+							status: async () => ({ state: "done" }),
+							result: async () => ({ success: true, diff: "" }),
+						},
+					},
+				),
+			/invalid declared tier "urgent"/,
+		);
+		strictEqual(routeCalls.length, 0);
+	});
+
+	it("end to end: a Tier: field declared in the task queue reaches route() verbatim", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Declared-tier task
+- **Status:** pending
+- **Tier:** high
+- **Description:** format the readme
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const routeCalls = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: tierCapturingContext(routeCalls),
+		});
+
+		strictEqual(routeCalls.length, 1);
+		strictEqual(routeCalls[0].tier, "high");
 	});
 });
 

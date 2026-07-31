@@ -31,7 +31,7 @@
 //   opencode -> low      (opencode-go target; standard slot is temporarily_unavailable)
 //   vibe     -> null     (vibe target is enabled:false -> excluded at EVERY tier)
 
-import { deepStrictEqual, strictEqual } from "node:assert";
+import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -252,5 +252,23 @@ describe("capability match — INV-5 safety property", () => {
 			strictEqual(passesCapabilityFilter("vibe", tier), false);
 			strictEqual(getRightSizedModel("vibe", tier), null);
 		}
+	});
+
+	// Task 2.1: an unrecognized/typo'd task tier must be REJECTED, not
+	// silently coerced to `0` (the lowest/least-restrictive tier) the way
+	// `TIER_ORDER[taskTier] ?? 0` used to. That coercion was a real INV-5
+	// bypass -- every provider, including a disabled one, would pass the
+	// filter against a garbage tier string.
+	it("passesCapabilityFilter throws on an unrecognized task tier instead of treating it as tier 0", () => {
+		throws(
+			() => passesCapabilityFilter("claude", "urgent"),
+			/unrecognized task tier/,
+		);
+		// Specifically: it must NOT silently pass every provider (the old `?? 0`
+		// bypass would have made even a disabled target pass).
+		throws(
+			() => passesCapabilityFilter("vibe", "urgent"),
+			/unrecognized task tier/,
+		);
 	});
 });
