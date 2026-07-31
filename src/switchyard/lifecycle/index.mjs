@@ -13,6 +13,38 @@ const WORKING_PREFIX = "switchyard-work-";
 const LABEL_MANAGED = "com.zerodelta.switchyard.managed=true";
 const LABEL_RUN_ID = "com.zerodelta.switchyard.run_id";
 const LABEL_PROJECT = "com.zerodelta.switchyard.project";
+// PID of the process that created (and therefore owns) this working object.
+// Stamped on every managed container AND volume so reclamation can decide
+// liveness from the object itself — no run-store read, so it works across
+// state-roots, in the run-store-unavailable fallback, and for legacy-free
+// self-healing. This is the primary, self-contained liveness signal; the
+// run-store `isRunActive` check is only a fallback for objects with no pid
+// label. Key uses `_` to match the existing label style.
+const LABEL_WORKER_PID = "com.zerodelta.switchyard.worker_pid";
+
+/**
+ * Liveness of a working object's owning process from its worker_pid label.
+ * The safe-direction guarantee: a false "alive" (PID reused by an unrelated
+ * process) only DELAYS reclamation to a later sweep once that PID dies — it
+ * never reaps a live owner. A false "dead" (the dangerous, data-losing
+ * direction) cannot arise from PID reuse. Mirrors run-store's isWorkerLive.
+ * @param {string|undefined} pidLabel raw worker_pid label value
+ * @returns {boolean|null} true=alive, false=dead, null=no/invalid label (caller
+ *   must fall back to the run-store liveness signal)
+ */
+function ownerPidLiveness(pidLabel) {
+	if (pidLabel == null || pidLabel === "") return null;
+	const pid = Number(pidLabel);
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	try {
+		// Signal 0 checks existence without delivering a signal.
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		// ESRCH => gone; EPERM => exists but not ours (still alive).
+		return e.code === "EPERM";
+	}
+}
 
 // Resource containment for disposable working containers (CPU-meltdown
 // hardening). A working container can run heavy native builds under amd64
@@ -186,102 +218,64 @@ export function createWorkingContainer(
 		// passed as an execFileSync argv element below, so validate it
 		// against the same safe-identifier pattern the adapters use.
 		validateIdentifier(image, "image");
+		// containerName is embedded in every docker call below (and in the
+		// volume name); validate it once here regardless of the runId branch.
+		validateIdentifier(containerName, "containerName");
 
+		// Every working object is ALWAYS labeled managed + owner-pid (+ project)
+		// so nothing ever leaks unreclaimable: a sweep can find it and decide
+		// liveness from the worker_pid label alone. The run_id label is added
+		// when a runId is threaded through (the run-store-backed path), giving
+		// reclamation a second, run-store-based liveness signal. Before this,
+		// the no-runId path created UNLABELED objects that accumulated forever.
+		const ph = projectHash(projectPath);
+		const commonLabels = [
+			"--label",
+			LABEL_MANAGED,
+			"--label",
+			`${LABEL_WORKER_PID}=${process.pid}`,
+			"--label",
+			`${LABEL_PROJECT}=${ph}`,
+		];
 		if (runId) {
-			const ph = projectHash(projectPath);
-			execFileSync(
-				"docker",
-				[
-					"volume",
-					"create",
-					"--label",
-					LABEL_MANAGED,
-					"--label",
-					`${LABEL_RUN_ID}=${runId}`,
-					"--label",
-					`${LABEL_PROJECT}=${ph}`,
-					`${containerName}-vol`,
-				],
-				{ stdio: "inherit" },
+			commonLabels.push("--label", `${LABEL_RUN_ID}=${runId}`);
+		}
+
+		// Isolated named volume for project code (INV-1: no host FS mount).
+		execFileSync(
+			"docker",
+			["volume", "create", ...commonLabels, `${containerName}-vol`],
+			{ stdio: "inherit" },
+		);
+
+		// Build the working container FROM the agent image so every provider
+		// CLI + git is on PATH inside it. No --volumes-from: the CLIs come from
+		// the image's own layers, not a shared volume.
+		try {
+			const runArgs = ["run", "-d", "--name", containerName, ...commonLabels];
+			for (const [key, value] of Object.entries(extraLabels)) {
+				runArgs.push("--label", `${key}=${value}`);
+			}
+			runArgs.push(...buildWorkContainerResourceArgs());
+			runArgs.push(
+				"-v",
+				`${containerName}-vol:/project`,
+				"-w",
+				"/project",
+				image,
+				"sleep",
+				"infinity",
 			);
-
+			execFileSync("docker", runArgs, { stdio: "inherit" });
+		} catch (runError) {
 			try {
-				const runArgs = [
-					"run",
-					"-d",
-					"--name",
-					containerName,
-					"--label",
-					LABEL_MANAGED,
-					"--label",
-					`${LABEL_RUN_ID}=${runId}`,
-					"--label",
-					`${LABEL_PROJECT}=${ph}`,
-				];
-				for (const [key, value] of Object.entries(extraLabels)) {
-					runArgs.push("--label", `${key}=${value}`);
-				}
-				runArgs.push(...buildWorkContainerResourceArgs());
-				runArgs.push(
-					"-v",
-					`${containerName}-vol:/project`,
-					"-w",
-					"/project",
-					image,
-					"sleep",
-					"infinity",
-				);
-				execFileSync("docker", runArgs, { stdio: "inherit" });
-			} catch (runError) {
-				try {
-					execFileSync("docker", ["volume", "rm", `${containerName}-vol`], {
-						stdio: "pipe",
-					});
-				} catch {
-					/* best effort */
-				}
-				throw runError;
+				execFileSync("docker", ["volume", "rm", `${containerName}-vol`], {
+					stdio: "pipe",
+				});
+			} catch {
+				/* best effort */
 			}
-		} else {
-			// Isolated named volume for project code (INV-1: no host FS mount).
-			// containerName is safe-char validated below before any docker call.
-			validateIdentifier(containerName, "containerName");
-			execFileSync("docker", ["volume", "create", `${containerName}-vol`], {
-				stdio: "inherit",
-			});
-
-			// Build the working container FROM the agent image so every provider
-			// CLI + git is on PATH inside it. No --volumes-from: the CLIs come from
-			// the image's own layers, not a shared volume.
-			try {
-				execFileSync(
-					"docker",
-					[
-						"run",
-						"-d",
-						"--name",
-						containerName,
-						...buildWorkContainerResourceArgs(),
-						"-v",
-						`${containerName}-vol:/project`,
-						"-w",
-						"/project",
-						image,
-						"sleep",
-						"infinity",
-					],
-					{ stdio: "inherit" },
-				);
-			} catch (runError) {
-				try {
-					execFileSync("docker", ["volume", "rm", `${containerName}-vol`], {
-						stdio: "pipe",
-					});
-				} catch {
-					/* best effort */
-				}
-				throw runError;
-			}
+			throw runError;
 		}
 
 		return containerName;
@@ -606,7 +600,7 @@ export function wipeWorkingContainer(workingContainerName) {
 
 /**
  * List all containers with the Switchyard managed label.
- * @returns {Array<{name: string, runId: string, project: string, status: string}>}
+ * @returns {Array<{name: string, runId: string, project: string, status: string, workerPid: string}>}
  */
 export function listManagedContainers() {
 	try {
@@ -618,7 +612,7 @@ export function listManagedContainers() {
 				"--filter",
 				`label=${LABEL_MANAGED}`,
 				"--format",
-				`{{.Names}}\t{{.Label "${LABEL_RUN_ID}"}}\t{{.Label "${LABEL_PROJECT}"}}\t{{.State}}`,
+				`{{.Names}}\t{{.Label "${LABEL_RUN_ID}"}}\t{{.Label "${LABEL_PROJECT}"}}\t{{.State}}\t{{.Label "${LABEL_WORKER_PID}"}}`,
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
@@ -627,8 +621,8 @@ export function listManagedContainers() {
 			.split("\n")
 			.filter(Boolean)
 			.map((line) => {
-				const [name, runId, project, status] = line.split("\t");
-				return { name, runId, project, status };
+				const [name, runId, project, status, workerPid] = line.split("\t");
+				return { name, runId, project, status, workerPid };
 			});
 	} catch (error) {
 		console.error("Failed to list managed containers:", error.message);
@@ -638,7 +632,7 @@ export function listManagedContainers() {
 
 /**
  * List all volumes with the Switchyard managed label.
- * @returns {Array<{name: string, runId: string}>}
+ * @returns {Array<{name: string, runId: string, workerPid: string}>}
  */
 export function listManagedVolumes() {
 	let names;
@@ -677,6 +671,7 @@ export function listManagedVolumes() {
 	return json.map((v) => ({
 		name: v.Name,
 		runId: v.Labels?.[LABEL_RUN_ID] || "",
+		workerPid: v.Labels?.[LABEL_WORKER_PID] || "",
 	}));
 }
 
@@ -685,14 +680,19 @@ export function listManagedVolumes() {
  * Only reclaims objects whose owning run is demonstrably dead.
  * Active runs, standing agent containers, and ambiguous owners are never touched.
  *
- * If `isRunActive` is not provided or is not a function, every managed object
- * is treated as still active and nothing is reclaimed (silent no-op).
+ * Liveness is decided PID-first: every object carries a worker_pid label (the
+ * process that created it), so reclamation reads liveness from the object
+ * itself with no run-store dependency — correct across state-roots and when the
+ * run store is unavailable. `isRunActive` is only the fallback signal for
+ * legacy objects created before pid-labeling. An object with neither a
+ * pid-liveness-decidable label nor a run_id is never reaped.
  *
  * @param {object} options
  * @param {Function} [options.isRunActive] — (runId: string) => boolean
- *   Called for each managed object's runId. Should return true if the run
- *   is still active (has a live process or unexpired lease).
- *   When absent, defaults to treating every run as active (reclaims nothing).
+ *   Fallback liveness for objects with no usable worker_pid label. Should
+ *   return true if the run is still active. When absent, legacy no-pid objects
+ *   with a run_id are treated as active (reclaims nothing) — pid-labeled
+ *   objects are still judged directly from their pid.
  * @param {boolean} [options.dryRun] — if true, report but don't delete
  * @param {Function} [options.onStatus] — callback(recoveryEvent) for diagnostics
  * @returns {{containersReclaimed: number, volumesReclaimed: number,
@@ -716,6 +716,21 @@ export function recoverManagedObjects(options = {}) {
 		return isRunActive(runId);
 	};
 
+	// Per-object liveness. The worker_pid label is the PRIMARY signal: it lives
+	// on the object itself, so it works with no run-store read at all — across
+	// state-roots, in the run-store-unavailable fallback, and for the sweep on
+	// every dispatch. Only when an object carries no usable pid label (a legacy
+	// pre-labeling object) do we fall back to the run-store `isRunActive` check
+	// keyed on run_id. Returns true=active, false=dead, null=no signal at all
+	// (neither a live-decidable pid nor a run_id — genuinely ambiguous, so it is
+	// never reaped).
+	const objectLiveness = (obj) => {
+		const pidLive = ownerPidLiveness(obj.workerPid);
+		if (pidLive !== null) return pidLive;
+		if (obj.runId) return checkActive(obj.runId);
+		return null;
+	};
+
 	const containers = listManagedContainers();
 	for (const container of containers) {
 		if (container.name === AGENT_CONTAINER_NAME) {
@@ -728,20 +743,23 @@ export function recoverManagedObjects(options = {}) {
 			continue;
 		}
 
-		if (!container.runId || container.runId === "") {
+		const containerLive = objectLiveness(container);
+		if (containerLive === null) {
+			// No worker_pid label AND no run_id — no way to prove the owner is
+			// dead, so never reap (a false "dead" here would kill a live run).
 			result.errors.push(
-				`Container ${container.name} has empty/missing runId label`,
+				`Container ${container.name} has no liveness signal (no worker_pid or run_id label)`,
 			);
 			emit({
 				type: "error",
 				object: "container",
 				name: container.name,
-				reason: "missing-run-id",
+				reason: "no-liveness-signal",
 			});
 			continue;
 		}
 
-		if (checkActive(container.runId)) {
+		if (containerLive) {
 			emit({
 				type: "skip",
 				object: "container",
@@ -763,17 +781,18 @@ export function recoverManagedObjects(options = {}) {
 			continue;
 		}
 
+		// Force-remove: reclamation only runs against a PROVEN-dead owner, so the
+		// container is abandoned work with nothing to flush. `docker rm -f`
+		// (SIGKILL + remove in one call) avoids the ~10s `docker stop` grace that
+		// a PID-1 `sleep infinity` incurs by ignoring SIGTERM — reclaim fast so
+		// orphans never pile up. `-v` drops the anonymous volumes docker created
+		// for the container; the named project volume is reclaimed separately
+		// below (it may outlive the container on a partial create).
 		try {
-			execFileSync("docker", ["stop", container.name], {
+			execFileSync("docker", ["rm", "-f", "-v", container.name], {
 				stdio: "pipe",
 				timeout: 15_000,
 			});
-		} catch {
-			/* already stopped */
-		}
-
-		try {
-			execFileSync("docker", ["rm", container.name], { stdio: "pipe" });
 			result.containersReclaimed += 1;
 			emit({
 				type: "reclaimed",
@@ -797,18 +816,21 @@ export function recoverManagedObjects(options = {}) {
 
 	const volumes = listManagedVolumes();
 	for (const volume of volumes) {
-		if (!volume.runId || volume.runId === "") {
-			result.errors.push(`Volume ${volume.name} has empty/missing runId label`);
+		const volumeLive = objectLiveness(volume);
+		if (volumeLive === null) {
+			result.errors.push(
+				`Volume ${volume.name} has no liveness signal (no worker_pid or run_id label)`,
+			);
 			emit({
 				type: "error",
 				object: "volume",
 				name: volume.name,
-				reason: "missing-run-id",
+				reason: "no-liveness-signal",
 			});
 			continue;
 		}
 
-		if (checkActive(volume.runId)) {
+		if (volumeLive) {
 			emit({
 				type: "skip",
 				object: "volume",

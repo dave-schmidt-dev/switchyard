@@ -132,6 +132,16 @@ try {
 	await runStore.acquireRunLock(runId, pid, startToken, nonce);
 	await runStore.advanceState(runId, "running");
 
+	// NOTE (leak-recovery Piece C): the detached worker deliberately does NOT
+	// run a pre-dispatch orphan sweep. An ephemeral worker whose only job is to
+	// execute one task must not perform system-wide Docker GC — a concurrent
+	// sweep here reclaims containers/volumes belonging to *other* live runs
+	// (proven: enabling it deterministically reaps a sibling run's fixture
+	// volume). The leak-recovery guarantee is delivered by the primary
+	// `runDispatch` path's pre-run sweep, the explicit `recover` command, and
+	// the SIGTERM/SIGINT owned-container cleanup handler in the runner — none of
+	// which run concurrently with a foreign live run.
+
 	const { runQueue: runQueueFn } = await import("../runner/index.mjs");
 
 	const result = runQueueFn({
@@ -139,6 +149,9 @@ try {
 		projectPath: run.projectPath,
 		maxTasks: Number.POSITIVE_INFINITY,
 		stopOnFailure: true,
+		// Stamp the working container with this run's id so a leaked container
+		// is discoverable + liveness-checkable by `recover` (labeled branch).
+		runId,
 		// Defensive fallback: a run.json written before this field existed (or
 		// a hand-built fixture in a test) won't have excludeProviders at all.
 		exclude: run.excludeProviders ?? [],

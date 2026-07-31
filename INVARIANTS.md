@@ -20,11 +20,11 @@ gate_test: tests/integration-gate.test.mjs
 threshold: 3
 rationale: The single door between the sandbox and the host. Agent output reaches real files only via a reviewed apply/merge — never a direct agent write to the host. Bypassing this is how unattended agents would silently corrupt the Mac's copy.
 
-### INV-3 — The working container is wiped at project end
+### INV-3 — The working container is wiped at project end, and no working object ever accumulates
 area: ["src/switchyard/container/**", "src/switchyard/lifecycle/**", "src/switchyard/runner/**"]
 gate_test: tests/workspace-wipe.test.mjs
 threshold: 3
-rationale: The working container (project code + build artifacts) is the disposable unit; wiping it per project prevents cross-project state bleed and bounds any accident to one project. The standing agent container is never the disposable unit.
+rationale: The working container (project code + build artifacts) is the disposable unit; wiping it per project prevents cross-project state bleed and bounds any accident to one project. The standing agent container is never the disposable unit. Disposal must hold on the ABNORMAL paths too, so no leaked container or volume ever accumulates on the host: (1) every working container AND its named volume is labeled `managed` + `worker_pid` (the creating process) at creation — never unlabeled — so an orphan left by a crash/SIGKILL is always discoverable and reclaimable; (2) reclamation (`recover`, the per-dispatch pre-run sweep, the SIGTERM/SIGINT owned-container handler) decides liveness PID-first from the object's own `worker_pid` label, so it is correct across state-roots and with no run-store read, and force-removes only a PROVEN-dead owner's objects (a live owner is never reaped — the safe direction under PID reuse). A normal exit wipes; a crash is swept; a graceful signal cleans up its own container — junk never piles up. The no-accumulation / reclamation-liveness half is additionally gated by tests/lifecycle-recovery.test.mjs (worker_pid liveness: dead-pid reclaimed, live-pid preserved even when the run store is unreadable, no-signal object never reaped). Scope note: this invariant covers Docker working containers + named volumes (the resource-cost objects); run-store text dirs under the state root are governed separately — see the applyRetention follow-up in TASKS.md.
 
 ### INV-4 — A task is dispatched only to a provider with remaining usage, spreading load across funded providers; every dispatch records provider + model + result
 area: ["src/switchyard/router/**", "src/switchyard/roster/**", "src/switchyard/ledger/**"]

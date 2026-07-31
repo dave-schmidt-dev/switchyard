@@ -43,6 +43,7 @@ import {
 } from "../lifecycle/index.mjs";
 import {
 	acquireProjectLock,
+	acquireRunLock,
 	advanceState,
 	getRunRoot,
 	getStateRoot,
@@ -50,6 +51,7 @@ import {
 	readEvents,
 	readRun,
 	releaseProjectLockIfOwnedBy,
+	releaseRunLock,
 	SchemaError,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
@@ -121,6 +123,14 @@ const KNOWN_SUBCOMMANDS = new Set([
 // Distinguishes a bad-invocation error (print usage, exit 2) from a real
 // run-time failure (exit 1), mirroring conventional CLI exit-code semantics.
 class UsageError extends Error {}
+
+// Grace window for a run that has been initialized but whose worker has not yet
+// acquired the run lock (workerPid still null). Within this window `recover`
+// treats the run — and its working container — as a launching dispatch and
+// leaves it alone; past it, a still-worker-less run is a stuck/abandoned launch
+// and is reclaimable. Generous relative to real startup (spawn + fingerprint +
+// acquireRunLock is seconds; container creation happens AFTER the lock).
+const RUN_STARTUP_GRACE_MS = 5 * 60_000;
 
 /**
  * Validate CLI arguments into a runQueue options object.
@@ -272,9 +282,18 @@ function parseRecoverArgs(argv) {
 /**
  * Run the dispatch, printing live per-task progress (INV-1: no silent waits).
  * Sets process.exitCode: 1 if any processed task failed, else 0.
+ *
+ * Wraps runQueue in a minimal run-store lifecycle (a runId + a run lock that
+ * stamps this process's PID) so the working container it creates is (a)
+ * labeled with the runId and (b) liveness-checkable by `recover`: while this
+ * process lives the run reads active and is never reaped; on clean exit we
+ * advance to a terminal state; on a crash the dead PID makes the run — and its
+ * leaked container — reclaimable. The run-store steps are best-effort: a
+ * run-store failure must not block a foreground dispatch, so we fall back to
+ * an unlabeled (legacy) container rather than aborting.
  * @param {object} opts Result of parseDispatchArgs (help:false variant)
  */
-function runDispatch(opts) {
+async function runDispatch(opts) {
 	console.error(`dispatch: queue    ${opts.tasksFilePath}`);
 	console.error(`dispatch: project  ${opts.projectPath}`);
 	console.error(
@@ -284,30 +303,91 @@ function runDispatch(opts) {
 		"dispatch: expect several minutes per task while the provider CLI runs.",
 	);
 
-	const result = runQueue({
-		tasksFilePath: opts.tasksFilePath,
-		projectPath: opts.projectPath,
-		maxTasks: opts.maxTasks,
-		...(opts.checkpointPath ? { checkpointPath: opts.checkpointPath } : {}),
-		stopOnFailure: opts.stopOnFailure,
-		exclude: opts.excludeProviders,
-		dependencies: {
-			onTaskStart: (task) =>
+	// Pre-dispatch sweep (Piece C): reap any container a prior crashed run
+	// leaked so the host self-heals every dispatch. Fire-and-forget — hygiene
+	// must NOT sit on the dispatch critical path; the resource limits are the
+	// meltdown safety gate, so the sweep only needs to run eventually. It starts
+	// before this run's id exists, so it cannot see (or reap) our own run/
+	// container. This process lives for the whole dispatch (minutes), giving the
+	// sweep ample time to finish. The .catch prevents an unhandledRejection.
+	sweepManagedOrphans()
+		.then((swept) => {
+			if (swept.containersReclaimed > 0 || swept.volumesReclaimed > 0) {
 				console.error(
-					`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd(),
-				),
-			onTaskRouted: (info) =>
-				console.error(
-					`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline}`,
-				),
-			onResult: (r) => {
-				const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
-				console.error(
-					`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}`,
+					`dispatch: pre-run sweep reclaimed ${swept.containersReclaimed} orphaned container(s), ${swept.volumesReclaimed} volume(s)`,
 				);
+			}
+		})
+		.catch((error) => {
+			console.error(`dispatch: pre-run sweep failed (${error.message})`);
+		});
+
+	const runId = randomUUID();
+	const pid = process.pid;
+	const startToken = randomUUID();
+	const nonce = randomUUID();
+	let runStoreReady = false;
+	try {
+		const tasks = loadTaskQueue(opts.tasksFilePath);
+		await initializeRun({
+			runId,
+			tasksFilePath: opts.tasksFilePath,
+			projectPath: opts.projectPath,
+			orderedTaskIds: tasks.map((t) => t.id),
+			initialHostFingerprint: captureHostFingerprint(opts.projectPath),
+			workerNonce: nonce,
+		});
+		await acquireRunLock(runId, pid, startToken, nonce);
+		await advanceState(runId, "running");
+		runStoreReady = true;
+	} catch (error) {
+		console.error(
+			`dispatch: run-store init failed (${error.message}); continuing without leak-recovery labels`,
+		);
+	}
+
+	let result;
+	try {
+		result = runQueue({
+			tasksFilePath: opts.tasksFilePath,
+			projectPath: opts.projectPath,
+			maxTasks: opts.maxTasks,
+			...(opts.checkpointPath ? { checkpointPath: opts.checkpointPath } : {}),
+			stopOnFailure: opts.stopOnFailure,
+			exclude: opts.excludeProviders,
+			...(runStoreReady ? { runId } : {}),
+			dependencies: {
+				onTaskStart: (task) =>
+					console.error(
+						`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd(),
+					),
+				onTaskRouted: (info) =>
+					console.error(
+						`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline}`,
+					),
+				onResult: (r) => {
+					const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
+					console.error(
+						`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}`,
+					);
+				},
 			},
-		},
-	});
+		});
+	} finally {
+		if (runStoreReady) {
+			// Advance to a terminal state (so `recover` treats this run as
+			// reclaimable) and release the lock. Best-effort — never mask the
+			// original outcome/throw. If runQueue threw, result is undefined:
+			// treat that as a failed run.
+			const anyFailed = result ? result.results.some((r) => !r.success) : true;
+			try {
+				await advanceState(runId, anyFailed ? "failed" : "succeeded");
+				await releaseRunLock(runId);
+			} catch (error) {
+				console.error(`dispatch: run-store teardown failed (${error.message})`);
+			}
+		}
+	}
 
 	const failed = result.results.filter((r) => !r.success);
 	console.error(
@@ -388,6 +468,13 @@ async function handleLaunch(argv) {
 		workerNonce: nonce,
 		launchArgs,
 	});
+
+	// NOTE: the pre-dispatch sweep runs in the detached WORKER
+	// (worker-bootstrap), NOT here — keeping the host launch handshake fast and
+	// off the Docker daemon (a Docker sweep on this path made `launch` slow and
+	// its exit-code tests flaky under daemon contention). The worker sweeps
+	// just before it creates this run's container; the synchronous `run` path
+	// sweeps in-process (see runDispatch).
 
 	// initializeRun writes a fixed snapshot literal (run-store/index.mjs) with
 	// no options passthrough, so a launch-time option that needs to become its
@@ -833,15 +920,37 @@ async function handleResult(argv) {
 
 async function resolveIsRunDead(runId, dependencies) {
 	const readRunFn = dependencies.readRun ?? readRun;
+	let run;
 	try {
-		await readRunFn(runId);
-		// run exists — check if locked/expired would require lock check,
-		// but for recovery purposes, treat an existing run as active
-		return false;
+		run = await readRunFn(runId);
 	} catch {
-		// run not found => demonstrably dead
+		// run record not found => demonstrably dead (its container is an orphan).
 		return true;
 	}
+
+	// A run record existing is NOT proof of life: a crashed worker or a
+	// terminal run leaves run.json behind. Disambiguate carefully so a
+	// launching dispatch is never reaped mid-startup:
+	//   1. terminal state => done, reclaimable.
+	//   2. live worker PID => alive (protects a long-running task and a
+	//      just-started sync dispatch, whose PID is stamped immediately).
+	//   3. workerPid set but not signalable => the worker HELD the lock and
+	//      died => crashed => reclaimable.
+	//   4. workerPid null => never acquired the lock => still inside the
+	//      pre-lock startup window. `workerPid: null` alone is ambiguous
+	//      ("not started yet" vs "never will"), so fall back to run age: young
+	//      => a legitimately launching run, protect it; older than the startup
+	//      grace => an abandoned/stuck launch, reclaim it.
+	if (run.state === "succeeded" || run.state === "failed") return true;
+
+	const isWorkerLiveFn = dependencies.isWorkerLive ?? isWorkerLive;
+	if (isWorkerLiveFn(run)) return false;
+
+	if (run.workerPid != null) return true;
+
+	const createdMs = new Date(run.createdAt).getTime();
+	if (!Number.isFinite(createdMs)) return true;
+	return Date.now() - createdMs > RUN_STARTUP_GRACE_MS;
 }
 
 /**
@@ -905,6 +1014,42 @@ async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 		}
 	}
 	return released;
+}
+
+/**
+ * Best-effort reap of leaked managed containers/volumes whose owning run is
+ * dead — the reusable core of the no-runId `recover` path. Called as a
+ * pre-dispatch sweep (Piece C of the leak-recovery loop) so every dispatch
+ * self-heals the previous run's leaks before creating its own container.
+ * @param {object} [dependencies]
+ * @returns {Promise<{containersReclaimed:number, volumesReclaimed:number,
+ *   errors:string[], projectLocksReleased:number}>}
+ */
+async function sweepManagedOrphans(dependencies = {}) {
+	const managedContainers =
+		dependencies.listManagedContainers ?? listManagedContainers;
+	const candidateIds = managedContainers()
+		.map((c) => c.runId)
+		.filter(Boolean);
+
+	const deadMap = new Map();
+	await Promise.all(
+		candidateIds.map(async (rid) => {
+			deadMap.set(rid, await resolveIsRunDead(rid, dependencies));
+		}),
+	);
+
+	const result = await recoverManagedObjects({
+		isRunActive: (rid) => !(deadMap.get(rid) ?? false),
+		dryRun: false,
+	});
+
+	const projectLocksReleased = await releaseStaleProjectLocks(
+		candidateIds,
+		dependencies,
+	);
+
+	return { ...result, projectLocksReleased };
 }
 
 /**
@@ -995,7 +1140,7 @@ async function main(argv) {
 					console.log(subcommand === "run" ? USAGE_RUN : USAGE);
 					return;
 				}
-				runDispatch(opts);
+				await runDispatch(opts);
 				break;
 			}
 			case "launch": {
@@ -1024,7 +1169,7 @@ async function main(argv) {
 			console.log(USAGE);
 			return;
 		}
-		runDispatch(opts);
+		await runDispatch(opts);
 	}
 }
 
@@ -1055,6 +1200,8 @@ export {
 	parseResultArgs,
 	parseStatusArgs,
 	probeProviderProcess,
+	resolveIsRunDead,
+	sweepManagedOrphans,
 	USAGE,
 	USAGE_LAUNCH,
 	USAGE_RECOVER,

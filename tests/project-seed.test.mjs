@@ -33,10 +33,13 @@ import {
 	seedProject,
 	wipeWorkingContainer,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { reapOwnManagedObjects } from "./helpers/lifecycle-fixture.mjs";
 
 const SEED_SKIP = imageExists(AGENT_IMAGE)
 	? false
 	: `${AGENT_IMAGE} not built — skipping live seedProject test`;
+
+after(() => reapOwnManagedObjects());
 
 describe("seedProject copies the host committed tree into the working container", {
 	skip: SEED_SKIP,

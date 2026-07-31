@@ -172,3 +172,52 @@ export function volumeExists(name) {
 		return false;
 	}
 }
+
+const LABEL_WORKER_PID = "com.zerodelta.switchyard.worker_pid";
+
+/**
+ * Reap every managed container + volume created by THIS test process, keyed on
+ * the worker_pid label createWorkingContainer stamps (= process.pid). Register
+ * in a Docker-touching suite's afterEach/after hook so working objects never
+ * accumulate on the shared daemon between runs (David's "nothing accumulates"
+ * invariant). PID-scoped, so it is safe under Node's parallel test-file
+ * execution: a sibling test file runs in a different process and its objects
+ * carry a different worker_pid, so this never touches them. Best-effort: any
+ * docker failure is swallowed so teardown never fails a suite.
+ * @returns {{containers: number, volumes: number}} counts reaped
+ */
+export function reapOwnManagedObjects() {
+	const pidFilter = `label=${LABEL_WORKER_PID}=${process.pid}`;
+	let containers = 0;
+	let volumes = 0;
+	try {
+		const names = execFileSync("docker", ["ps", "-aq", "--filter", pidFilter], {
+			encoding: "utf8",
+			stdio: "pipe",
+		})
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		for (const id of names) {
+			if (removeContainer(id)) containers += 1;
+		}
+	} catch {
+		/* best effort */
+	}
+	try {
+		const vols = execFileSync(
+			"docker",
+			["volume", "ls", "-q", "--filter", pidFilter],
+			{ encoding: "utf8", stdio: "pipe" },
+		)
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		for (const name of vols) {
+			if (removeVolume(name)) volumes += 1;
+		}
+	} catch {
+		/* best effort */
+	}
+	return { containers, volumes };
+}

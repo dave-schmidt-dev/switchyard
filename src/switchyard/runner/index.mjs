@@ -1173,6 +1173,41 @@ function _safeError(error) {
 }
 
 /**
+ * Install SIGINT/SIGTERM handlers that wipe an owned working container on
+ * graceful termination, so a Ctrl-C or `kill` between tasks does not leak it
+ * (part of the container leak-recovery loop). Returns an uninstall function to
+ * call in the owner's finally so the handlers never outlive the run.
+ *
+ * Limitation: while a provider CLI runs via a blocking execFileSync, Node
+ * defers signal handlers until that call returns — a signal delivered
+ * mid-execution is serviced only once the task finishes (when normal cleanup
+ * runs anyway) — and a SIGKILL cannot be caught at all. The host-side
+ * pre-dispatch sweep + `recover` is the backstop for both cases.
+ * @param {string} containerName owned working container to wipe on signal
+ * @param {(name: string) => void} wipeFn
+ * @returns {() => void} uninstall
+ */
+function _installOwnedContainerSignalCleanup(containerName, wipeFn) {
+	const handler = (signal) => {
+		try {
+			wipeFn(containerName);
+		} catch {
+			/* best effort — recover is the backstop */
+		}
+		process.removeListener("SIGINT", handler);
+		process.removeListener("SIGTERM", handler);
+		// Re-raise with default disposition so the exit status reflects the signal.
+		process.kill(process.pid, signal);
+	};
+	process.on("SIGINT", handler);
+	process.on("SIGTERM", handler);
+	return () => {
+		process.removeListener("SIGINT", handler);
+		process.removeListener("SIGTERM", handler);
+	};
+}
+
+/**
  * Fail closed when a tasks file parses to zero tasks — this always indicates
  * a schema mismatch (wrong heading level, empty file, corrupted markdown),
  * never a legitimate "nothing to do" state. Writes an auditable checkpoint
@@ -1229,6 +1264,7 @@ export function runQueue(options) {
 		maxTasks = Number.POSITIVE_INFINITY,
 		stopOnFailure = true,
 		exclude = [],
+		runId = null,
 		dependencies = {},
 	} = options;
 
@@ -1254,13 +1290,23 @@ export function runQueue(options) {
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
+	let uninstallSignalCleanup = null;
 	if (!workingContainerName) {
 		ensureAgentContainerFn();
-		workingContainerName = createWorkingContainerFn(projectPath);
+		// Pass runId so the working container carries the managed + run_id
+		// labels (createWorkingContainer's labeled branch). Without this the
+		// container is unlabeled and invisible to `recover` — the core leak.
+		workingContainerName = createWorkingContainerFn(projectPath, undefined, {
+			runId,
+		});
 		if (!workingContainerName) {
 			throw new Error("runQueue: failed to create working container");
 		}
 		ownsWorkingContainer = true;
+		uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+			workingContainerName,
+			wipeWorkingContainerFn,
+		);
 		if (emitStatus) {
 			emitStatus({
 				phase: "bootstrap",
@@ -1565,6 +1611,7 @@ export function runQueue(options) {
 			results,
 		};
 	} finally {
+		if (uninstallSignalCleanup) uninstallSignalCleanup();
 		if (ownsWorkingContainer) {
 			if (emitStatus) {
 				emitStatus({
@@ -1621,6 +1668,7 @@ export async function runQueueWithOrchestrator(options) {
 		stopOnFailure = true,
 		pollIntervalMs = 10_000,
 		maxPolls = 1_000,
+		runId = null,
 		dependencies = {},
 	} = options;
 
@@ -1644,15 +1692,23 @@ export async function runQueueWithOrchestrator(options) {
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
+	let uninstallSignalCleanup = null;
 	if (!workingContainerName) {
 		ensureAgentContainerFn();
-		workingContainerName = createWorkingContainerFn(projectPath);
+		// Pass runId so the container is labeled managed + run_id (see runQueue).
+		workingContainerName = createWorkingContainerFn(projectPath, undefined, {
+			runId,
+		});
 		if (!workingContainerName) {
 			throw new Error(
 				"runQueueWithOrchestrator: failed to create working container",
 			);
 		}
 		ownsWorkingContainer = true;
+		uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+			workingContainerName,
+			wipeWorkingContainerFn,
+		);
 		if (emitStatus) {
 			emitStatus({
 				phase: "bootstrap",
@@ -1889,6 +1945,7 @@ export async function runQueueWithOrchestrator(options) {
 			results,
 		};
 	} finally {
+		if (uninstallSignalCleanup) uninstallSignalCleanup();
 		if (ownsWorkingContainer) {
 			if (emitStatus) {
 				emitStatus({

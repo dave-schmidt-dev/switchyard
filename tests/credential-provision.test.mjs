@@ -26,6 +26,7 @@ import {
 	provisionCredentials,
 	wipeWorkingContainer,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { reapOwnManagedObjects } from "./helpers/lifecycle-fixture.mjs";
 
 const TEST_WORKING_IMAGE = "alpine:latest";
 
@@ -86,6 +87,8 @@ function existsInContainer(containerName, path) {
 		return false;
 	}
 }
+
+after(() => reapOwnManagedObjects());
 
 describe("provisionCredentials copies every provider's credential file into the working container", () => {
 	const AGENT = "switchyard-test-cred-agent";

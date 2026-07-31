@@ -13,6 +13,7 @@ import {
 	wipeWorkingContainer,
 	workingContainerExists,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { reapOwnManagedObjects } from "./helpers/lifecycle-fixture.mjs";
 
 // A distinct agent-container fixture — never the real AGENT_CONTAINER_NAME —
 // so this test can never touch a developer's actual standing agent container.
@@ -26,6 +27,8 @@ const TEST_AGENT_CONTAINER = "switchyard-test-agent";
 // for why alpine keeps these container tests hermetic.
 const TEST_WORKING_IMAGE = "alpine:latest";
 const TEST_PROJECT_PATH = "/tmp/switchyard-test-project";
+
+after(() => reapOwnManagedObjects());
 
 describe("workspace wipe", () => {
 	let workingContainerName;
@@ -319,12 +322,16 @@ describe("labeled container creation", () => {
 		strictEqual(found.runId, TEST_RUN_ID);
 	});
 
-	it("backward compat: createWorkingContainer without options still works and has no labels", () => {
+	it("createWorkingContainer without a runId is still labeled managed + worker_pid (always reclaimable, no leak)", () => {
+		// INV-3: no working object ever accumulates. Even the no-runId path must
+		// label the container `managed` + `worker_pid` so a sweep can find it and
+		// judge its liveness — before, this path created UNLABELED containers
+		// that were invisible to reclamation and piled up forever. Only the
+		// run_id label is absent when no runId is threaded.
 		const name = createWorkingContainer(TEST_PROJECT, TEST_WORKING_IMAGE);
 		strictEqual(typeof name, "string");
 		strictEqual(workingContainerExists(name), true);
 
-		// Verify no switchyard labels are present
 		const info = JSON.parse(
 			execFileSync(
 				"docker",
@@ -333,9 +340,19 @@ describe("labeled container creation", () => {
 			),
 		);
 		strictEqual(
-			info === null || info["com.zerodelta.switchyard.managed"] === undefined,
-			true,
-			"unlabeled container must not carry managed label",
+			info?.["com.zerodelta.switchyard.managed"],
+			"true",
+			"no-runId container must still carry the managed label",
+		);
+		strictEqual(
+			info["com.zerodelta.switchyard.worker_pid"],
+			String(process.pid),
+			"no-runId container must carry the owning worker_pid label",
+		);
+		strictEqual(
+			info["com.zerodelta.switchyard.run_id"],
+			undefined,
+			"no run_id label without a threaded runId",
 		);
 
 		// Clean up

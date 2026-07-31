@@ -6,6 +6,7 @@ import {
 	createWorkingContainer,
 	wipeWorkingContainer,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { reapOwnManagedObjects } from "./helpers/lifecycle-fixture.mjs";
 
 // CPU-meltdown hardening: every disposable working container must be launched
 // with per-container CPU/memory/PID caps so a leaked or emulated worker can
@@ -16,6 +17,8 @@ function argFor(args, flag) {
 	const i = args.indexOf(flag);
 	return i >= 0 ? args[i + 1] : undefined;
 }
+
+after(() => reapOwnManagedObjects());
 
 describe("work-container resource limits — argv fragment", () => {
 	it("emits the four caps with safe defaults for empty env", () => {

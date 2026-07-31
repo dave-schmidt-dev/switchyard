@@ -781,6 +781,12 @@ function isWorkerLive(run) {
  * point is to avoid a second inline copy of dispatch/index.mjs's
  * `terminal || !isWorkerLive(run)` check appearing anywhere in this file.
  *
+ * NOTE: container recovery (dispatch/index.mjs's resolveIsRunDead) deliberately
+ * does NOT use this predicate — it gates the `!isWorkerLive` half behind
+ * `isRunLockExpired` as well, so a run still inside its pre-lock startup window
+ * (workerPid null but lease fresh) is not mistaken for dead and its container
+ * reaped out from under a launching dispatch.
+ *
  * @param {object} run parsed run snapshot
  * @returns {boolean}
  */

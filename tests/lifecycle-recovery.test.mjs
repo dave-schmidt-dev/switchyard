@@ -1,5 +1,5 @@
 import { ok, rejects, strictEqual } from "node:assert";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +23,7 @@ import {
 	createLabeledContainer,
 	createTestWorkingContainer,
 	getContainerLabels,
+	reapOwnManagedObjects,
 	removeContainer,
 	removeVolume,
 	volumeExists,
@@ -49,6 +50,8 @@ function describeIf(condition, ...args) {
 }
 
 const TEST_PROJECT = "/tmp/switchyard-test-recovery";
+
+after(() => reapOwnManagedObjects());
 
 describeIf(HAS_DOCKER, "lifecycle recovery — label round-trip", () => {
 	let containerName;
@@ -703,3 +706,103 @@ describeIf(
 		});
 	},
 );
+
+// worker_pid-label liveness: the primary, self-contained reclamation signal.
+// These prove recovery decides liveness from the object's own worker_pid label
+// with NO run-store dependency (no isRunActive) — the property that fixes
+// cross-state-root blindness (the recover-hang and worker-sweep interference).
+function deadPid() {
+	// A just-exited child's PID is reliably dead (tiny reuse window, fine for a
+	// test). Using an arbitrary large integer would not be guaranteed dead.
+	const child = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+	return child.pid;
+}
+
+describeIf(HAS_DOCKER, "lifecycle recovery — worker_pid liveness", () => {
+	const PID_LABEL = "com.zerodelta.switchyard.worker_pid";
+	let names;
+
+	beforeEach(() => {
+		names = [];
+	});
+
+	afterEach(() => {
+		for (const n of names) cleanFixture(n);
+	});
+
+	function makeContainer(labels) {
+		const name = `switchyard-pidtest-${randomUUID().slice(0, 8)}`;
+		names.push(name);
+		createLabeledContainer({
+			name,
+			labels: { "com.zerodelta.switchyard.managed": "true", ...labels },
+		});
+		return name;
+	}
+
+	it("reclaims a container whose worker_pid is dead, with NO isRunActive and NO run_id", () => {
+		const c = makeContainer({ [PID_LABEL]: String(deadPid()) });
+		strictEqual(containerExists(c), true);
+
+		// No isRunActive at all: the dead pid label is the only signal.
+		const result = recoverManagedObjects({});
+
+		ok(result.containersReclaimed >= 1, "dead-pid container must be reclaimed");
+		strictEqual(containerExists(c), false);
+	});
+
+	it("preserves a container whose worker_pid is live even when isRunActive says dead", () => {
+		// process.pid is this live test process; pid liveness must win over the
+		// run-store signal so an explicit isRunActive:false cannot reap a live run.
+		const c = makeContainer({
+			[PID_LABEL]: String(process.pid),
+			"com.zerodelta.switchyard.run_id": "some-run",
+		});
+
+		const result = recoverManagedObjects({ isRunActive: () => false });
+
+		strictEqual(
+			containerExists(c),
+			true,
+			"live-pid container must survive even when isRunActive returns false",
+		);
+		strictEqual(result.containersReclaimed, 0);
+	});
+
+	it("never reaps a managed object with neither a usable worker_pid nor a run_id", () => {
+		// No liveness signal at all => ambiguous => must be left untouched, and
+		// reported as an error rather than silently reclaimed.
+		const c = makeContainer({});
+		const events = [];
+
+		const result = recoverManagedObjects({
+			isRunActive: () => false,
+			onStatus: (e) => events.push(e),
+		});
+
+		strictEqual(containerExists(c), true, "no-signal object must survive");
+		ok(
+			result.errors.some((m) => m.includes(c)),
+			"no-signal object must be reported as an error",
+		);
+		ok(
+			events.some((e) => e.name === c && e.reason === "no-liveness-signal"),
+			"a no-liveness-signal event must be emitted",
+		);
+	});
+
+	it("run_id fallback still works for a legacy object with no worker_pid label", () => {
+		// Backwards compatibility: pre-labeling objects have no worker_pid, so
+		// reclamation must fall back to the run-store isRunActive check.
+		const c = makeContainer({
+			"com.zerodelta.switchyard.run_id": "legacy-run",
+		});
+
+		const result = recoverManagedObjects({
+			isRunActive: (rid) => rid !== "legacy-run",
+		});
+
+		ok(result.containersReclaimed >= 1, "legacy dead run must be reclaimed");
+		strictEqual(containerExists(c), false);
+	});
+});

@@ -29,6 +29,7 @@ import {
 	execInWorkingContainer,
 	wipeWorkingContainer,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { reapOwnManagedObjects } from "./helpers/lifecycle-fixture.mjs";
 
 // Build the working container from a minimal, credential-less image so this
 // test stays hermetic (no multi-GB agent image pull) and the host-isolation
@@ -76,6 +77,8 @@ function getMounts(workingContainerName) {
 	);
 	return JSON.parse(out);
 }
+
+after(() => reapOwnManagedObjects());
 
 describe("no host rights", () => {
 	let workingContainerName;
