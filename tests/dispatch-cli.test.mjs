@@ -4,6 +4,7 @@
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -16,6 +17,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+
+import {
+	AGENT_IMAGE,
+	imageExists,
+	isContainerRuntimeAvailable,
+} from "../src/switchyard/container/index.mjs";
+import {
+	createLabeledContainer,
+	removeContainer,
+} from "./helpers/lifecycle-fixture.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -33,6 +44,7 @@ import {
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,
+	probeProviderProcess,
 	USAGE,
 	USAGE_LAUNCH,
 	USAGE_RECOVER,
@@ -40,6 +52,19 @@ import {
 	USAGE_RUN,
 	USAGE_STATUS,
 } from "../src/switchyard/dispatch/index.mjs";
+
+const HAS_DOCKER = isContainerRuntimeAvailable();
+
+if (!HAS_DOCKER) {
+	console.log(
+		"Docker not available — skipping providerProcessDetected live-Docker tests",
+	);
+}
+
+function describeIf(condition, ...args) {
+	if (condition) return describe(...args);
+	return describe.skip(...args);
+}
 
 function runDispatch(args, env = {}, timeout = 10_000) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
@@ -1094,5 +1119,280 @@ describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", (
 		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
 		strictEqual(statusEnvelope.totalTaskCount, 3);
 		strictEqual(statusEnvelope.pendingCount, 3);
+	});
+});
+
+describe("probeProviderProcess (providerProcessDetected)", () => {
+	it("never shells out when run.state is not 'running'", () => {
+		for (const state of [
+			"created",
+			"launching",
+			"launcher_ready",
+			"succeeded",
+			"failed",
+			"recovery_required",
+		]) {
+			let execCalled = false;
+			const spyExecFn = () => {
+				execCalled = true;
+				return "";
+			};
+			const result = probeProviderProcess(
+				{
+					state,
+					workingContainerName: "some-container",
+					activeTaskProvider: "claude",
+				},
+				{ execFn: spyExecFn },
+			);
+			strictEqual(result, null, `expected null for state ${state}`);
+			strictEqual(
+				execCalled,
+				false,
+				`execFn must never be invoked for state ${state}`,
+			);
+		}
+	});
+
+	it("returns null without shelling out when workingContainerName or activeTaskProvider is unset, even while running", () => {
+		let execCalled = false;
+		const spyExecFn = () => {
+			execCalled = true;
+			return "";
+		};
+		strictEqual(
+			probeProviderProcess(
+				{
+					state: "running",
+					workingContainerName: null,
+					activeTaskProvider: "claude",
+				},
+				{ execFn: spyExecFn },
+			),
+			null,
+		);
+		strictEqual(
+			probeProviderProcess(
+				{
+					state: "running",
+					workingContainerName: "some-container",
+					activeTaskProvider: null,
+				},
+				{ execFn: spyExecFn },
+			),
+			null,
+		);
+		strictEqual(execCalled, false);
+	});
+
+	it("returns null without shelling out for a provider with no known binary mapping", () => {
+		let execCalled = false;
+		const spyExecFn = () => {
+			execCalled = true;
+			return "";
+		};
+		const result = probeProviderProcess(
+			{
+				state: "running",
+				workingContainerName: "some-container",
+				activeTaskProvider: "totally-unknown-provider",
+			},
+			{ execFn: spyExecFn },
+		);
+		strictEqual(result, null);
+		strictEqual(execCalled, false);
+	});
+
+	it("returns null (never throws) when execFn itself throws, e.g. Docker unavailable", () => {
+		const throwingExecFn = () => {
+			throw new Error("simulated docker failure");
+		};
+		const result = probeProviderProcess(
+			{
+				state: "running",
+				workingContainerName: "some-container",
+				activeTaskProvider: "claude",
+			},
+			{ execFn: throwingExecFn },
+		);
+		strictEqual(result, null);
+	});
+
+	it("returns true when a docker top line's args column matches the mapped binary basename, even via a fully-qualified path", () => {
+		const fakeExecFn = () =>
+			"  PID ARGS\n  123 /usr/local/bin/claude --headless\n  456 sleep infinity\n";
+		const result = probeProviderProcess(
+			{
+				state: "running",
+				workingContainerName: "some-container",
+				activeTaskProvider: "claude",
+			},
+			{ execFn: fakeExecFn },
+		);
+		strictEqual(result, true);
+	});
+
+	it("returns false (a real boolean, not null) when docker top succeeds but no line matches", () => {
+		const fakeExecFn = () => "  PID ARGS\n  456 sleep infinity\n";
+		const result = probeProviderProcess(
+			{
+				state: "running",
+				workingContainerName: "some-container",
+				activeTaskProvider: "claude",
+			},
+			{ execFn: fakeExecFn },
+		);
+		strictEqual(result, false);
+	});
+
+	it("uses the cursor-agent binary name (not cursor) for the cursor provider", () => {
+		const noMatchExecFn = () => "  PID ARGS\n  123 cursor --headless\n";
+		strictEqual(
+			probeProviderProcess(
+				{
+					state: "running",
+					workingContainerName: "some-container",
+					activeTaskProvider: "cursor",
+				},
+				{ execFn: noMatchExecFn },
+			),
+			false,
+			"binary name 'cursor' alone must not match — the actual binary is cursor-agent",
+		);
+
+		const matchExecFn = () => "  PID ARGS\n  123 cursor-agent --headless\n";
+		strictEqual(
+			probeProviderProcess(
+				{
+					state: "running",
+					workingContainerName: "some-container",
+					activeTaskProvider: "cursor",
+				},
+				{ execFn: matchExecFn },
+			),
+			true,
+		);
+	});
+
+	it("calls execFn with docker top, an explicit args array, and a 5000ms timeout", () => {
+		let capturedCommand;
+		let capturedArgs;
+		let capturedOptions;
+		const spyExecFn = (command, args, options) => {
+			capturedCommand = command;
+			capturedArgs = args;
+			capturedOptions = options;
+			return "";
+		};
+		probeProviderProcess(
+			{
+				state: "running",
+				workingContainerName: "my-container",
+				activeTaskProvider: "claude",
+			},
+			{ execFn: spyExecFn },
+		);
+		strictEqual(capturedCommand, "docker");
+		deepStrictEqual(capturedArgs, ["top", "my-container", "-eo", "pid,args"]);
+		strictEqual(capturedOptions.timeout, 5000);
+	});
+});
+
+describeIf(
+	HAS_DOCKER,
+	"probeProviderProcess against real Docker containers",
+	() => {
+		it("returns null (never throws) against a container name that was never created", () => {
+			const containerName = `switchyard-test-gone-${randomUUID().slice(0, 8)}`;
+			const result = probeProviderProcess({
+				state: "running",
+				workingContainerName: containerName,
+				activeTaskProvider: "claude",
+			});
+			strictEqual(result, null);
+		});
+
+		it("returns null (never throws) against a container removed mid-restart", () => {
+			const containerName = createLabeledContainer({
+				name: `switchyard-test-removed-${randomUUID().slice(0, 8)}`,
+				cmd: ["sleep", "infinity"],
+			});
+			removeContainer(containerName);
+			const result = probeProviderProcess({
+				state: "running",
+				workingContainerName: containerName,
+				activeTaskProvider: "claude",
+			});
+			strictEqual(result, null);
+		});
+
+		it("returns false for a live container running a non-matching process", () => {
+			const containerName = createLabeledContainer({
+				name: `switchyard-test-noproc-${randomUUID().slice(0, 8)}`,
+				cmd: ["sleep", "infinity"],
+			});
+			try {
+				const result = probeProviderProcess({
+					state: "running",
+					workingContainerName: containerName,
+					activeTaskProvider: "claude",
+				});
+				strictEqual(result, false);
+			} finally {
+				removeContainer(containerName);
+			}
+		});
+	},
+);
+
+// Alpine's /bin/sleep (used by the generic describeIf(HAS_DOCKER, ...) block
+// above) is a BusyBox multi-call binary that dispatches on argv[0]'s
+// basename — a symlink named "claude" exits immediately with "applet not
+// found" rather than running, so a live end-to-end match assertion needs a
+// real standalone (non-multi-call) executable to symlink instead. This
+// project's own agent image (built by docker/Dockerfile) has one: its
+// /bin/sleep is genuine GNU coreutils and ignores argv[0]. Mirrors
+// project-seed.test.mjs's imageExists(AGENT_IMAGE) skip pattern so this
+// still passes on a host that has Docker but hasn't built the agent image.
+const AGENT_IMAGE_SKIP = imageExists(AGENT_IMAGE)
+	? false
+	: `${AGENT_IMAGE} not built — skipping live providerProcessDetected match test`;
+
+describe("probeProviderProcess matches a real provider-named process (live agent image)", {
+	skip: AGENT_IMAGE_SKIP,
+}, () => {
+	it("returns true for a live container running a matching provider process", async () => {
+		// Symlinking the image's real sleep binary to a path named
+		// "claude" and exec-ing through that path makes the resulting
+		// process's argv[0] (and therefore docker top's args column)
+		// read "claude", exercising the real match path end-to-end
+		// without needing to invoke the actual provider CLI.
+		const containerName = createLabeledContainer({
+			name: `switchyard-test-matchproc-${randomUUID().slice(0, 8)}`,
+			image: AGENT_IMAGE,
+			cmd: [
+				"sh",
+				"-c",
+				"ln -s /bin/sleep /tmp/claude && exec /tmp/claude infinity",
+			],
+		});
+		try {
+			let result = null;
+			// The container execs through the symlink immediately after
+			// start; poll briefly in case docker top is queried before
+			// that exec has landed.
+			for (let attempt = 0; attempt < 20; attempt++) {
+				result = probeProviderProcess({
+					state: "running",
+					workingContainerName: containerName,
+					activeTaskProvider: "claude",
+				});
+				if (result === true) break;
+				await new Promise((r) => setTimeout(r, 100));
+			}
+			strictEqual(result, true);
+		} finally {
+			removeContainer(containerName);
+		}
 	});
 });

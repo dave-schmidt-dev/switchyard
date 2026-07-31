@@ -28,7 +28,7 @@
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --help                 Show this help.
 
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -535,6 +535,93 @@ function deriveTelemetryFields(run, events, checkpointState) {
 	};
 }
 
+// Maps a run's routed provider (run.activeTaskProvider) to the binary name
+// its CLI actually execs as inside the working container. Most providers'
+// CLI binary matches the provider key, but cursor's does not — its package
+// is "cursor-agent", not "cursor" — so this must stay an explicit map
+// rather than an assumed identity transform.
+const PROVIDER_BINARY_NAMES = {
+	claude: "claude",
+	codex: "codex",
+	agy: "agy",
+	cursor: "cursor-agent",
+	copilot: "copilot",
+	opencode: "opencode",
+};
+
+/**
+ * Match one `docker top -eo pid,args` output line against a target binary
+ * name. The pid,args format is "<pid><whitespace><args...>" where the args
+ * column is itself whitespace-separated (argv[0] is its first token); this
+ * compares the basename of that first token so a fully-qualified path (e.g.
+ * "/usr/local/bin/claude") still matches "claude".
+ * @param {string} line one line of `docker top` output
+ * @param {string} binaryName target executable basename
+ * @returns {boolean}
+ */
+function lineMatchesBinary(line, binaryName) {
+	const match = line.trim().match(/^\d+\s+(\S+)/);
+	if (!match) return false;
+	const executable = match[1];
+	const base = executable.split("/").pop();
+	return base === binaryName;
+}
+
+/**
+ * Best-effort presence probe for whether the provider CLI routed to this
+ * run (run.activeTaskProvider) is actually executing inside the run's
+ * working container. Mirrors container/index.mjs's getPlatformInfo pattern:
+ * shell out to Docker, catch any failure, and degrade to null rather than
+ * throwing — a diagnostic nicety surfaced via the providerProcessDetected
+ * envelope field must never crash or indefinitely block a status/result
+ * read. The 5000ms timeout on the underlying `docker top` call enforces the
+ * "never block indefinitely" half of that contract.
+ *
+ * Only the derived boolean crosses into the envelope — raw `docker top`
+ * output (which can include other processes' full command lines) is never
+ * exposed, since that would be a potential information leak, not just a
+ * style choice.
+ *
+ * Self-gates on run.state === "running" as its first check (in addition to
+ * the identical ternary at each call site, mirroring workerLive) so the
+ * function is safe to call unconditionally and never shells out at all —
+ * not even attempting a probe whose result gets discarded — for a
+ * non-running run.
+ *
+ * @param {object} run parsed run snapshot
+ * @param {object} [deps] Injectable dependencies (tests only)
+ * @param {(command: string, args: string[], options: object) => Buffer | string} [deps.execFn]
+ *   Defaults to the real `execFileSync`
+ * @returns {boolean|null} true/false once the probe runs successfully;
+ *   null if the run isn't currently running, isn't routed to a
+ *   container/provider yet, the provider has no known binary mapping, or
+ *   the probe itself failed
+ */
+function probeProviderProcess(run, { execFn = execFileSync } = {}) {
+	if (run.state !== "running") return null;
+
+	const { workingContainerName, activeTaskProvider } = run;
+	if (!workingContainerName || !activeTaskProvider) return null;
+
+	const binaryName = PROVIDER_BINARY_NAMES[activeTaskProvider];
+	if (!binaryName) return null;
+
+	try {
+		const output = execFn(
+			"docker",
+			["top", workingContainerName, "-eo", "pid,args"],
+			{ timeout: 5000 },
+		).toString();
+		return output
+			.split("\n")
+			.some((line) => lineMatchesBinary(line, binaryName));
+	} catch {
+		// Docker not running, container gone/mid-restart, `docker top` erroring,
+		// or the 5000ms timeout tripped — degrade to null rather than throw.
+		return null;
+	}
+}
+
 async function buildStatusEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
@@ -549,6 +636,12 @@ async function buildStatusEnvelope(runId, run) {
 		// (see isWorkerLive), so an operator doesn't have to shell out to
 		// `docker top`/`ps` to tell active work from a stalled/ghost run.
 		workerLive: run.state === "running" ? isWorkerLive(run) : null,
+		// Presence of the routed provider's CLI process inside the working
+		// container (see probeProviderProcess) — same conditional-null-when-
+		// not-running shape as workerLive, and same "skip the shell-out
+		// entirely when not running" rule.
+		providerProcessDetected:
+			run.state === "running" ? probeProviderProcess(run) : null,
 		activeTaskId: run.activeTaskId ?? null,
 		activeTaskProvider: run.activeTaskProvider ?? null,
 		activeTaskModel: run.activeTaskModel ?? null,
@@ -584,6 +677,8 @@ async function buildResultEnvelope(runId, run) {
 		state: run.state,
 		cleanupState: run.cleanupState,
 		workerLive: run.state === "running" ? isWorkerLive(run) : null,
+		providerProcessDetected:
+			run.state === "running" ? probeProviderProcess(run) : null,
 		activeTaskId: run.activeTaskId ?? null,
 		activeTaskProvider: run.activeTaskProvider ?? null,
 		activeTaskModel: run.activeTaskModel ?? null,
@@ -919,6 +1014,7 @@ export {
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,
+	probeProviderProcess,
 	USAGE,
 	USAGE_LAUNCH,
 	USAGE_RECOVER,
