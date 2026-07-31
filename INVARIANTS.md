@@ -21,7 +21,7 @@ threshold: 3
 rationale: The single door between the sandbox and the host. Agent output reaches real files only via a reviewed apply/merge — never a direct agent write to the host. Bypassing this is how unattended agents would silently corrupt the Mac's copy.
 
 ### INV-3 — The working container is wiped at project end
-area: ["src/switchyard/container/**", "src/switchyard/lifecycle/**"]
+area: ["src/switchyard/container/**", "src/switchyard/lifecycle/**", "src/switchyard/runner/**"]
 gate_test: tests/workspace-wipe.test.mjs
 threshold: 3
 rationale: The working container (project code + build artifacts) is the disposable unit; wiping it per project prevents cross-project state bleed and bounds any accident to one project. The standing agent container is never the disposable unit.

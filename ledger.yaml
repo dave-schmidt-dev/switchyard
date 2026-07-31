@@ -5,6 +5,9 @@ invariants:
   INV-3: {gate_test_status: covered}
   INV-4: {gate_test_status: covered}
   INV-5: {gate_test_status: covered}
+  INV-6: {gate_test_status: covered}    # was omitted entirely until 2026-07-30 (dispatch-telemetry-consolidation
+                                         # CR-11) despite Phases A/B/E/F all depending on it; reconciled, not a
+                                         # resolutions: entry — no historical-recurrence dismissal made here.
 resolutions:
   INV-1:
     resolved_at_date: "2026-07-30"
