@@ -709,6 +709,84 @@ describe("initialHostFingerprint validation", () => {
 	});
 });
 
+describe("validateRun type checks for telemetry fields", () => {
+	it("rejects a non-number activeTaskStartedAt", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+
+		await rejects(
+			updateRun(
+				opts.runId,
+				{ activeTaskStartedAt: "not-a-number" },
+				snapshot.revision,
+			),
+			SchemaError,
+		);
+	});
+
+	it("rejects a non-number lastCompletionAt", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+
+		await rejects(
+			updateRun(
+				opts.runId,
+				{ lastCompletionAt: "not-a-number" },
+				snapshot.revision,
+			),
+			SchemaError,
+		);
+	});
+
+	it("rejects a non-string workingContainerName", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+
+		await rejects(
+			updateRun(opts.runId, { workingContainerName: 12345 }, snapshot.revision),
+			SchemaError,
+		);
+	});
+
+	it("accepts activeTaskStartedAt, lastCompletionAt, and workingContainerName when absent, null, or correctly typed", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+
+		// Absent: initializeRun doesn't set these fields at all.
+		strictEqual(snapshot.activeTaskStartedAt, undefined);
+		strictEqual(snapshot.lastCompletionAt, undefined);
+		strictEqual(snapshot.workingContainerName, undefined);
+
+		// Explicit null.
+		const nulled = await updateRun(
+			opts.runId,
+			{
+				activeTaskStartedAt: null,
+				lastCompletionAt: null,
+				workingContainerName: null,
+			},
+			snapshot.revision,
+		);
+		strictEqual(nulled.activeTaskStartedAt, null);
+		strictEqual(nulled.lastCompletionAt, null);
+		strictEqual(nulled.workingContainerName, null);
+
+		// Correctly typed values.
+		const typed = await updateRun(
+			opts.runId,
+			{
+				activeTaskStartedAt: 1000,
+				lastCompletionAt: 2000,
+				workingContainerName: "container-abc",
+			},
+			nulled.revision,
+		);
+		strictEqual(typed.activeTaskStartedAt, 1000);
+		strictEqual(typed.lastCompletionAt, 2000);
+		strictEqual(typed.workingContainerName, "container-abc");
+	});
+});
+
 describe("protected fields in updateRun", () => {
 	it("does not allow overwriting runId", async () => {
 		const opts = makeOptions();

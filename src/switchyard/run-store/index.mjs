@@ -157,6 +157,27 @@ function validateRun(data) {
 	) {
 		throw new SchemaError("lastEventSequence must be an integer");
 	}
+	if (
+		data.activeTaskStartedAt !== undefined &&
+		data.activeTaskStartedAt !== null &&
+		typeof data.activeTaskStartedAt !== "number"
+	) {
+		throw new SchemaError("activeTaskStartedAt must be a number or null");
+	}
+	if (
+		data.lastCompletionAt !== undefined &&
+		data.lastCompletionAt !== null &&
+		typeof data.lastCompletionAt !== "number"
+	) {
+		throw new SchemaError("lastCompletionAt must be a number or null");
+	}
+	if (
+		data.workingContainerName !== undefined &&
+		data.workingContainerName !== null &&
+		typeof data.workingContainerName !== "string"
+	) {
+		throw new SchemaError("workingContainerName must be a string or null");
+	}
 }
 
 async function writeRunAtomically(runJsonPath, data) {
