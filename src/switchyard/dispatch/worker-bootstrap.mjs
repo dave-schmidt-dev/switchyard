@@ -128,7 +128,10 @@ try {
 			// still lands instead of vanishing.
 			onTaskStart: (task) => {
 				runStore
-					.updateRunWithRetry(runId, { activeTaskId: task.id })
+					.updateRunWithRetry(runId, {
+						activeTaskId: task.id,
+						activeTaskStartedAt: Date.now(),
+					})
 					.catch(() => {});
 			},
 			onTaskRouted: (info) => {
@@ -166,6 +169,11 @@ try {
 							activeTaskProvider: null,
 							activeTaskModel: null,
 							activeTaskDeadline: null,
+							// Only a successful task advances lastCompletionAt — a
+							// failure must leave the run record's existing value
+							// untouched (not null it out), so this stays a
+							// conditional spread rather than a bare field.
+							...(r.success ? { lastCompletionAt: Date.now() } : {}),
 						}),
 					)
 					.catch(() => {});
@@ -189,6 +197,13 @@ try {
 			},
 			onCheckpointSaved: () => {
 				runStore.updateRunWithRetry(runId, {}).catch(() => {});
+			},
+			onContainerReady: (info) => {
+				runStore
+					.updateRunWithRetry(runId, {
+						workingContainerName: info.workingContainerName,
+					})
+					.catch(() => {});
 			},
 		},
 	});

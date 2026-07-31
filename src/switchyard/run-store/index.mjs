@@ -644,6 +644,7 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
 	const content = JSON.stringify({
 		runId,
 		createdAt: new Date().toISOString(),
+		projectPath: canonicalProjectPath,
 	});
 	try {
 		await writeFile(lockPath, content, { flag: "wx", mode: 0o600 });

@@ -1138,6 +1138,7 @@ export function runQueue(options) {
 	const onTaskRouted = dependencies.onTaskRouted ?? null;
 	const onResult = dependencies.onResult ?? null;
 	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
+	const onContainerReady = dependencies.onContainerReady ?? null;
 	const runStore = dependencies.runStore ?? null;
 	const emitStatus = _resolveOnStatus(dependencies);
 
@@ -1166,6 +1167,14 @@ export function runQueue(options) {
 				`runQueue: credential provisioning failed, continuing unauthenticated: ${error.message}`,
 			);
 		}
+	}
+
+	// Fires unconditionally once workingContainerName holds its final value —
+	// whether just created above or supplied by the caller — so a caller
+	// wiring the run record (e.g. worker-bootstrap) always learns the
+	// container name, not just on the auto-created path.
+	if (onContainerReady) {
+		onContainerReady({ workingContainerName });
 	}
 
 	const context = {

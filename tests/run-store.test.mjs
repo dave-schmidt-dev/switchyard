@@ -1,5 +1,5 @@
 import { ok, rejects, strictEqual } from "node:assert";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -7,7 +7,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
@@ -61,6 +61,14 @@ function uniqueRunId() {
 
 function uniquePath(label) {
 	return join(TEST_ROOT, `path-${label || uniqueRunId()}`);
+}
+
+// Mirrors the private lockFilePath() hashing scheme in run-store/index.mjs
+// so tests can read a lock file's raw JSON body directly.
+function projectLockFilePath(canonicalProjectPath) {
+	const resolvedPath = resolve(`project:${canonicalProjectPath}`);
+	const hash = createHash("sha256").update(resolvedPath).digest("hex");
+	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
 
 function makeOptions(overrides = {}) {
@@ -506,6 +514,19 @@ describe("project lock", () => {
 	it("release on non-existent lock does not throw", async () => {
 		await releaseProjectLock(uniquePath("nonexistent"));
 		ok(true);
+	});
+
+	it("lock body includes projectPath alongside runId and createdAt", async () => {
+		const path = uniquePath("project");
+		const runId = uniqueRunId();
+
+		await acquireProjectLock(path, runId);
+
+		const raw = await readFile(projectLockFilePath(path), "utf8");
+		const body = JSON.parse(raw);
+		strictEqual(body.projectPath, path);
+		strictEqual(body.runId, runId);
+		ok(typeof body.createdAt === "string");
 	});
 });
 
@@ -967,5 +988,58 @@ describe("concurrent atomic writes", () => {
 		strictEqual(final.activeTaskId, "task-1");
 		strictEqual(final.activeTaskProvider, "claude");
 		strictEqual(final.activeTaskModel, "claude-sonnet-5");
+	});
+});
+
+describe("lastCompletionAt (worker-bootstrap onResult conditional field)", () => {
+	// Mirrors worker-bootstrap's onResult callback, which adds lastCompletionAt
+	// via a conditional spread — `...(r.success ? { lastCompletionAt: Date.now() } : {})`
+	// — rather than a bare field. A failed task's patch must never carry the
+	// key at all, so it can neither introduce nor null out lastCompletionAt.
+	function completionPatch(success, now) {
+		return {
+			activeTaskId: null,
+			activeTaskProvider: null,
+			activeTaskModel: null,
+			activeTaskDeadline: null,
+			...(success ? { lastCompletionAt: now } : {}),
+		};
+	}
+
+	it("stays absent (not null, not set) after a task_failed outcome on a fresh run", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const { runId } = opts;
+
+		const final = await updateRunWithRetry(runId, completionPatch(false, 1234));
+
+		ok(
+			!Object.hasOwn(final, "lastCompletionAt"),
+			"a failed task's patch must never introduce lastCompletionAt",
+		);
+		strictEqual(final.lastCompletionAt, undefined);
+	});
+
+	it("leaves an existing lastCompletionAt untouched (not nulled) when a later task fails", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const { runId } = opts;
+
+		const afterSuccess = await updateRunWithRetry(
+			runId,
+			completionPatch(true, 111222),
+		);
+		strictEqual(afterSuccess.lastCompletionAt, 111222);
+
+		const afterFailure = await updateRunWithRetry(
+			runId,
+			completionPatch(false, 333444),
+		);
+
+		strictEqual(
+			afterFailure.lastCompletionAt,
+			111222,
+			"a failed task must not overwrite or null out the prior completion timestamp",
+		);
 	});
 });

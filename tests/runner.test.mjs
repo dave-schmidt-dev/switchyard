@@ -1590,6 +1590,60 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		);
 	});
 
+	it("fires onContainerReady with the resolved workingContainerName on both the pre-supplied and freshly-created branches", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+
+		// Branch 1: caller supplies workingContainerName — onContainerReady must
+		// still fire, surfacing that same name.
+		const suppliedCheckpointPath = `${tasksPath}.supplied.checkpoint.json`;
+		const suppliedReady = [];
+		const suppliedResult = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath: suppliedCheckpointPath,
+			dependencies: {
+				...baseDependencies(),
+				onContainerReady: (info) => suppliedReady.push(info),
+			},
+		});
+
+		strictEqual(suppliedResult.processedTasks, 1);
+		deepStrictEqual(suppliedReady, [
+			{ workingContainerName: "fake-container" },
+		]);
+
+		// Branch 2: no workingContainerName supplied — runQueue creates its own,
+		// and onContainerReady must fire with the name it generated.
+		const createdCheckpointPath = `${tasksPath}.created.checkpoint.json`;
+		const createdReady = [];
+		const createdResult = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: createdCheckpointPath,
+			dependencies: {
+				...baseDependencies(),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => 1,
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				onContainerReady: (info) => createdReady.push(info),
+			},
+		});
+
+		strictEqual(createdResult.processedTasks, 1);
+		deepStrictEqual(createdReady, [
+			{ workingContainerName: "generated-working-container" },
+		]);
+	});
+
 	it("runQueue creates and wipes its own working container when none is supplied, ensuring the agent container first", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
