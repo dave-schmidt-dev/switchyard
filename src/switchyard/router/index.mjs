@@ -158,7 +158,12 @@ export function route(options = {}) {
 			continue;
 		}
 
-		if (exclude.some((excluded) => normalizeProviderName(excluded) === normalizeProviderName(name))) {
+		if (
+			exclude.some(
+				(excluded) =>
+					normalizeProviderName(excluded) === normalizeProviderName(name),
+			)
+		) {
 			log.push(`provider ${name}: explicitly excluded`);
 			continue;
 		}

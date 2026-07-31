@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
+import { describeExecError } from "./exec-error.mjs";
 import { killOrphanedProcesses } from "./orphan-kill.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
@@ -74,7 +75,7 @@ export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  * @param {object} options Execution options
  * @param {string} [options.model] Model to use
  * @param {number} [options.timeoutMs] Execution timeout in ms (defaults to PROVIDER_EXECUTION_TIMEOUT_MS)
- * @returns {{output: string, success: boolean, error?: string, timedOut?: boolean}}
+ * @returns {{output: string, success: boolean, error?: string, timedOut?: boolean, errorKind?: string|null}}
  */
 export function executeCursor(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
@@ -120,11 +121,24 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 		const timedOut = error.code === "ETIMEDOUT";
 		if (timedOut) {
 			killOrphanedProcesses(workingContainerName);
+			// Keep error.message (carries ETIMEDOUT) so the runner classifies
+			// this as execution_timed_out, not a generic failure.
+			return {
+				output: error.stdout || "",
+				success: false,
+				error: error.message,
+				timedOut,
+			};
 		}
+		// Non-timeout failure: surface the provider's own diagnostic (and, on an
+		// expired session, an actionable re-auth hint) instead of Node's opaque
+		// "Command failed: docker exec …" wrapper — see exec-error.mjs.
+		const described = describeExecError(error, { provider: "cursor" });
 		return {
-			output: error.stdout || "",
+			output: described.output,
 			success: false,
-			error: error.message,
+			error: described.error,
+			errorKind: described.errorKind,
 			timedOut,
 		};
 	}
