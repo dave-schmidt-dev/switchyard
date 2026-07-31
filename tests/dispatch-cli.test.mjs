@@ -859,6 +859,7 @@ describe("envelope format", () => {
 			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
+			"platformInfo",
 		];
 		for (const key of required) {
 			ok(key in envelope, `status envelope missing field: ${key}`);
@@ -912,9 +913,75 @@ describe("envelope format", () => {
 			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
+			"platformInfo",
 		];
 		for (const key of required) {
 			ok(key in envelope, `result envelope missing field: ${key}`);
+		}
+	});
+
+	it("status and result envelopes' platformInfo has the getPlatformInfo shape", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "env-platform-info";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: ["1.1"] },
+			},
+			current.revision,
+		);
+
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
+		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
+
+		// platformInfo is a static host/image diagnostic (see
+		// container/index.mjs's getPlatformInfo), unconditional on run.state —
+		// unlike providerProcessDetected, it must be populated on both a
+		// non-terminal status read and a terminal result read.
+		for (const envelope of [statusEnvelope, resultEnvelope]) {
+			ok(
+				envelope.platformInfo && typeof envelope.platformInfo === "object",
+				"platformInfo must be an object",
+			);
+			ok("mismatch" in envelope.platformInfo, "platformInfo missing mismatch");
+			ok("hostArch" in envelope.platformInfo, "platformInfo missing hostArch");
+			ok(
+				"imageArch" in envelope.platformInfo,
+				"platformInfo missing imageArch",
+			);
+			ok("note" in envelope.platformInfo, "platformInfo missing note");
+			strictEqual(typeof envelope.platformInfo.mismatch, "boolean");
+			strictEqual(typeof envelope.platformInfo.hostArch, "string");
+			ok(
+				envelope.platformInfo.imageArch === null ||
+					typeof envelope.platformInfo.imageArch === "string",
+				"platformInfo.imageArch must be a string or null",
+			);
+			ok(
+				envelope.platformInfo.note === null ||
+					typeof envelope.platformInfo.note === "string",
+				"platformInfo.note must be a string or null",
+			);
 		}
 	});
 });
@@ -1042,6 +1109,55 @@ describe("deriveTelemetryFields parity between status and result envelopes", () 
 		// back to the same queueStartedAt-derived value as elapsedMs — both
 		// fields are computed from the same `now` inside deriveTelemetryFields.
 		strictEqual(envelope.elapsedSinceLastCompletionMs, envelope.elapsedMs);
+	});
+
+	it("activeTaskAgeMs is null once activeTaskId clears, even though activeTaskStartedAt remains set on the underlying run record (regression: activeTaskAgeMs never cleared)", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "telemetry-completed-task-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const current = await readRun(runId);
+		// Mirrors onResult's real patch shape (worker-bootstrap.mjs): on task
+		// completion activeTaskId/Provider/Model/Deadline are nulled, but
+		// activeTaskStartedAt is left as-is — it is never cleared anywhere.
+		// Before the fix, activeTaskAgeMs gated on activeTaskStartedAt alone
+		// and so kept reporting a stale, ever-growing age here.
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				activeTaskId: null,
+				activeTaskProvider: null,
+				activeTaskModel: null,
+				activeTaskDeadline: null,
+				activeTaskStartedAt: Date.now() - 60_000,
+				terminalSummary: { completedTaskIds: ["1.1"] },
+			},
+			current.revision,
+		);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+		strictEqual(statusEnvelope.activeTaskAgeMs, null);
+		strictEqual(statusEnvelope.runningCount, 0);
+
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
+		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
+		strictEqual(resultEnvelope.activeTaskAgeMs, null);
+		strictEqual(resultEnvelope.runningCount, 0);
 	});
 });
 

@@ -56,4 +56,38 @@ describe("getPlatformInfo", () => {
 		strictEqual(info.imageArch, null);
 		strictEqual(info.note, null);
 	});
+
+	it("calls execFn with docker image inspect, an explicit args array, and a 5000ms timeout", () => {
+		let capturedArgs = null;
+		let capturedOptions = null;
+		getPlatformInfo("switchyard-agent:latest", {
+			execFn: (command, args, options) => {
+				strictEqual(command, "docker");
+				capturedArgs = args;
+				capturedOptions = options;
+				return "amd64";
+			},
+			hostArch: "arm64",
+		});
+
+		strictEqual(
+			capturedArgs.includes("image") && capturedArgs.includes("inspect"),
+			true,
+		);
+		strictEqual(capturedOptions.timeout, 5000);
+	});
+
+	it("degrades gracefully (never throws) when execFn itself times out", () => {
+		const info = getPlatformInfo("switchyard-agent:latest", {
+			execFn: () => {
+				const error = new Error("Command timed out");
+				error.code = "ETIMEDOUT";
+				throw error;
+			},
+			hostArch: "arm64",
+		});
+
+		strictEqual(info.mismatch, false);
+		strictEqual(info.imageArch, null);
+	});
 });

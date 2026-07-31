@@ -36,6 +36,7 @@ import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { getPlatformInfo } from "../container/index.mjs";
 import {
 	listManagedContainers,
 	recoverManagedObjects,
@@ -546,8 +547,15 @@ function deriveTelemetryFields(run, events, checkpointState) {
 		// against this field's hours-scale purpose.
 		elapsedSinceLastCompletionMs:
 			now - (run.lastCompletionAt ?? queueStartedAt),
+		// Gated on activeTaskId, not activeTaskStartedAt: activeTaskStartedAt
+		// is set once at task start and never cleared (onResult's patch nulls
+		// activeTaskId/Provider/Model/Deadline but omits it), so gating on it
+		// directly would report a stale, ever-growing age after the task
+		// completes or the run reaches a terminal state. activeTaskId IS
+		// reliably nulled on completion/terminal/crash — same reasoning as
+		// runningCount two lines above.
 		activeTaskAgeMs:
-			run.activeTaskStartedAt != null ? now - run.activeTaskStartedAt : null,
+			run.activeTaskId != null ? now - run.activeTaskStartedAt : null,
 		// Display-only: derived from the routed deadline, not a scheduling
 		// guarantee. Can go negative if a task runs past its deadline.
 		activeTaskRemainingMs:
@@ -664,6 +672,11 @@ async function buildStatusEnvelope(runId, run) {
 		// entirely when not running" rule.
 		providerProcessDetected:
 			run.state === "running" ? probeProviderProcess(run) : null,
+		// Host-vs-image Docker architecture comparison (see
+		// container/index.mjs's getPlatformInfo) — a static diagnostic, not
+		// run-specific, so unlike providerProcessDetected it's safe to call
+		// unconditionally regardless of run.state.
+		platformInfo: getPlatformInfo(),
 		activeTaskId: run.activeTaskId ?? null,
 		activeTaskProvider: run.activeTaskProvider ?? null,
 		activeTaskModel: run.activeTaskModel ?? null,
@@ -701,6 +714,11 @@ async function buildResultEnvelope(runId, run) {
 		workerLive: run.state === "running" ? isWorkerLive(run) : null,
 		providerProcessDetected:
 			run.state === "running" ? probeProviderProcess(run) : null,
+		// Host-vs-image Docker architecture comparison (see
+		// container/index.mjs's getPlatformInfo) — a static diagnostic, not
+		// run-specific, so unlike providerProcessDetected it's safe to call
+		// unconditionally regardless of run.state.
+		platformInfo: getPlatformInfo(),
 		activeTaskId: run.activeTaskId ?? null,
 		activeTaskProvider: run.activeTaskProvider ?? null,
 		activeTaskModel: run.activeTaskModel ?? null,

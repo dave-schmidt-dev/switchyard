@@ -155,7 +155,7 @@ export function startAgentContainer() {
  *
  * @param {string} [image] Image to inspect (defaults to AGENT_IMAGE)
  * @param {object} [deps] Injectable dependencies (tests only)
- * @param {(command: string, args: string[]) => Buffer | string} [deps.execFn]
+ * @param {(command: string, args: string[], options: object) => Buffer | string} [deps.execFn]
  *   Defaults to the real `execFileSync`
  * @param {string} [deps.hostArch] Defaults to the real `os.arch()`
  * @returns {{mismatch: boolean, hostArch: string, imageArch: (string|null), note: (string|null)}}
@@ -172,13 +172,17 @@ export function getPlatformInfo(
 
 	let imageArch;
 	try {
-		imageArch = execFn("docker", [
-			"image",
-			"inspect",
-			image,
-			"--format",
-			"{{.Architecture}}",
-		])
+		// Explicit timeout (matches probeProviderProcess's precedent in
+		// dispatch/index.mjs): this is now called unconditionally on every
+		// `switchyard status`/`switchyard result` read (dispatch/index.mjs's
+		// envelope builders), not just from its own isolated unit tests, so an
+		// unresponsive Docker daemon must not be able to hang a status read
+		// indefinitely.
+		imageArch = execFn(
+			"docker",
+			["image", "inspect", image, "--format", "{{.Architecture}}"],
+			{ timeout: 5000 },
+		)
 			.toString()
 			.trim();
 	} catch {
