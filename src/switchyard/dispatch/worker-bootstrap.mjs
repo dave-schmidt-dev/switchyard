@@ -24,6 +24,22 @@ if (!stateRoot || !runId || !nonce) {
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
 
+// Module-scope write chain serializing every run-store mutation this worker
+// fires outside a direct `await` (the onTaskStart/onTaskRouted/onResult/
+// onCheckpointSaved/onContainerReady callbacks below). Each callback must
+// synchronously extend this chain the moment it fires — `writeChain =
+// writeChain.then(fn, fn).catch(() => {})` — so the *call* to
+// updateRunWithRetry for a later-firing callback can never start before an
+// earlier-firing callback's call has settled. Without this, two callbacks
+// firing close together race independently for I/O (their internal readRun()
+// calls), and whichever happens to resolve first reaches the per-runId
+// update queue first — which can let an earlier-firing callback's write land
+// *after* a later-firing one's, silently corrupting the run record with a
+// stale value even though updateRunWithRetry guarantees no write is ever
+// lost. Chaining on fire order (not completion order) fixes that. It always
+// resolves (never rejects), so awaiting it anywhere is safe and bounded.
+let writeChain = Promise.resolve();
+
 async function writeFatalEvent(error) {
 	try {
 		const runStore = await import("../run-store/index.mjs");
@@ -115,33 +131,39 @@ try {
 		maxTasks: Number.POSITIVE_INFINITY,
 		stopOnFailure: true,
 		dependencies: {
-			// These fire-and-forget callbacks all use updateRunWithRetry rather
-			// than a read-then-updateRun(fixed revision) pair: onTaskStart and
+			// These callbacks all use updateRunWithRetry rather than a
+			// read-then-updateRun(fixed revision) pair, and each one synchronously
+			// extends the module-scope `writeChain` (declared above) instead of
+			// firing its updateRunWithRetry call directly: onTaskStart and
 			// onTaskRouted fire microseconds apart (routing is synchronous, ahead
-			// of the blocking adapter.execute call), so both can read the same
-			// base revision and race for the same per-runId update queue slot.
-			// With a fixed expectedRevision, the loser's update throws
-			// RevisionError and is silently dropped by the .catch(() => {})
-			// below, so activeTaskId or activeTaskProvider/Model/Deadline goes
-			// missing nondeterministically. updateRunWithRetry re-reads the
-			// current revision and retries on conflict, so the loser's write
-			// still lands instead of vanishing.
+			// of the blocking adapter.execute call), and onResult for one task can
+			// fire close to onTaskStart for the next, so consecutive callbacks'
+			// underlying readRun() calls can resolve in either order.
+			// updateRunWithRetry alone guarantees no write is ever *lost* (it
+			// re-reads and retries on conflict rather than throwing RevisionError),
+			// but it does not guarantee *order* — a callback that fired first could
+			// still have its write applied after a callback that fired later, if
+			// the later one's readRun() happens to resolve first and reaches the
+			// per-runId update queue first. Chaining onto writeChain fixes that: a
+			// later-firing callback's actual updateRunWithRetry call cannot start
+			// until the earlier-firing callback's call has fully settled, so writes
+			// are strictly ordered by fire-time regardless of I/O timing.
 			onTaskStart: (task) => {
-				runStore
-					.updateRunWithRetry(runId, {
+				const fn = () =>
+					runStore.updateRunWithRetry(runId, {
 						activeTaskId: task.id,
 						activeTaskStartedAt: Date.now(),
-					})
-					.catch(() => {});
+					});
+				writeChain = writeChain.then(fn, fn).catch(() => {});
 			},
 			onTaskRouted: (info) => {
-				runStore
-					.updateRunWithRetry(runId, {
+				const fn = () =>
+					runStore.updateRunWithRetry(runId, {
 						activeTaskProvider: info.provider,
 						activeTaskModel: info.model,
 						activeTaskDeadline: info.deadline,
-					})
-					.catch(() => {});
+					});
+				writeChain = writeChain.then(fn, fn).catch(() => {});
 			},
 			onResult: (r) => {
 				const event = r.success
@@ -161,9 +183,8 @@ try {
 							provider: r.provider ?? null,
 							model: r.model ?? null,
 						};
-				runStore
-					.createEvent(runId, event)
-					.then(() =>
+				const fn = () =>
+					runStore.createEvent(runId, event).then(() =>
 						runStore.updateRunWithRetry(runId, {
 							activeTaskId: null,
 							activeTaskProvider: null,
@@ -175,14 +196,16 @@ try {
 							// conditional spread rather than a bare field.
 							...(r.success ? { lastCompletionAt: Date.now() } : {}),
 						}),
-					)
-					.catch(() => {});
+					);
+				writeChain = writeChain.then(fn, fn).catch(() => {});
 
 				// Surface a timeout's partial diff through the run's existing
 				// (already-provisioned, previously-unused) artifacts channel so
 				// it shows up in `switchyard result <runId>`'s artifactRefs —
 				// same best-effort, fire-and-forget style as the rest of this
-				// callback.
+				// callback. This copies a file rather than mutating run.json, so
+				// it doesn't race the other callbacks' writes and stays outside
+				// writeChain.
 				if (r.partialDiffPath) {
 					const artifactsDir = join(runStore.getRunRoot(runId), "artifacts");
 					mkdir(artifactsDir, { recursive: true })
@@ -196,14 +219,15 @@ try {
 				}
 			},
 			onCheckpointSaved: () => {
-				runStore.updateRunWithRetry(runId, {}).catch(() => {});
+				const fn = () => runStore.updateRunWithRetry(runId, {});
+				writeChain = writeChain.then(fn, fn).catch(() => {});
 			},
 			onContainerReady: (info) => {
-				runStore
-					.updateRunWithRetry(runId, {
+				const fn = () =>
+					runStore.updateRunWithRetry(runId, {
 						workingContainerName: info.workingContainerName,
-					})
-					.catch(() => {});
+					});
+				writeChain = writeChain.then(fn, fn).catch(() => {});
 			},
 		},
 	});
@@ -224,6 +248,18 @@ try {
 			failedCount: failed.length,
 		},
 	};
+
+	// Drain writeChain before the terminal write. runQueueFn has already
+	// returned, so no further callback will extend the chain past this point —
+	// but the last task's callbacks may still have an updateRunWithRetry call
+	// in flight. Without waiting for it here, releaseRunLock's fixed-revision
+	// updateRun (in the finally below) can lose a race against that straggler:
+	// its readRun() can be followed by the straggler bumping the revision
+	// before releaseRunLock's own update reaches the queue, throwing
+	// RevisionError, which would fall into the catch block below and
+	// overwrite this run's real terminal outcome with a zeroed failure
+	// placeholder. writeChain always resolves, so this await is bounded.
+	await writeChain;
 
 	try {
 		// The terminal write carries the authoritative outcome, but it can lose
@@ -250,6 +286,12 @@ try {
 		await writeFatalEvent(lockError);
 	}
 } catch (error) {
+	// Same reasoning as the terminal-write drain above: a crash can land here
+	// while a straggler writeChain write is still in flight (e.g. runQueueFn
+	// itself threw mid-loop). Draining first keeps this fixed-revision
+	// updateRun below from losing a revision race to that straggler.
+	// writeChain always resolves, so this is safe even before it's ever used.
+	await writeChain;
 	await writeFatalEvent(error);
 	try {
 		const runStore = await import("../run-store/index.mjs");
