@@ -498,3 +498,121 @@ describe("router (INV-4: every dispatch outcome records provider + model + resul
 		strictEqual(result.reason, "no_eligible");
 	});
 });
+
+describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 spread)", () => {
+	it("low-tier tasks are eligible for qualified low-cost lanes (opencode) and INV-4 spread selects opencode when it has most headroom", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 40, pace_delta: 100 }],
+			},
+			{
+				name: "opencode",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 50 }],
+			},
+		]);
+
+		const result = route({ tier: "low" });
+		strictEqual(
+			result.provider,
+			"opencode",
+			"opencode is eligible for low-tier tasks and has most headroom",
+		);
+		strictEqual(
+			result.model,
+			"fixture/opencode-low",
+			"model is right-sized to opencode's low selector",
+		);
+		strictEqual(result.percentLeft, 90);
+		strictEqual(result.reason, "spread");
+	});
+
+	it("INV-4 spread governs selection among eligible lanes — higher-headroom provider wins over low-cost lane (cost never overrides spread)", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 100 }],
+			},
+			{
+				name: "opencode",
+				ok: true,
+				windows: [{ percent_left: 40, pace_delta: 50 }],
+			},
+		]);
+
+		const result = route({ tier: "low" });
+		strictEqual(
+			result.provider,
+			"claude",
+			"claude has more headroom (90% > 40%) so INV-4 spread selects it; cost does not override spread",
+		);
+		strictEqual(result.model, "fixture-claude-low");
+		strictEqual(result.percentLeft, 90);
+	});
+
+	it("high-tier eligibility stays Claude + Codex only regardless of low-tier provider headroom", () => {
+		createTestSnapshot([
+			{
+				name: "opencode",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 10 }],
+			},
+			{
+				name: "agy",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 10 }],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 30, pace_delta: 100 }],
+			},
+			{
+				name: "codex",
+				ok: true,
+				windows: [{ percent_left: 60, pace_delta: 100 }],
+			},
+		]);
+
+		const result = route({ tier: "high" });
+		strictEqual(
+			result.provider,
+			"codex",
+			"high-tier task excludes opencode and agy; selects codex with highest headroom among Claude+Codex",
+		);
+		strictEqual(result.model, "fixture-codex-high");
+		strictEqual(result.percentLeft, 60);
+	});
+
+	it("INV-4 spread algorithm itself is unchanged (regression check: most headroom selection given same availability)", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 75, pace_delta: 50 }],
+			},
+			{
+				name: "codex",
+				ok: true,
+				windows: [{ percent_left: 85, pace_delta: 50 }],
+			},
+			{
+				name: "opencode",
+				ok: true,
+				windows: [{ percent_left: 65, pace_delta: 50 }],
+			},
+		]);
+
+		const result = route({ tier: "low" });
+		strictEqual(
+			result.provider,
+			"codex",
+			"spread picks highest percent_left among all low-eligible providers",
+		);
+		strictEqual(result.percentLeft, 85);
+		strictEqual(result.reason, "spread");
+	});
+});

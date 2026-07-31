@@ -1,6 +1,9 @@
 // Router module - selects provider for task dispatch
 // INV-4: Dispatch only to funded providers, spreading load across funded providers
 // INV-5: Capability filter applied before spread selection
+// Low-tier economics: easy tasks become eligible for cheap/low-cost lanes (e.g. opencode-go),
+// while high-tier tasks remain reserved for high-capability providers (Claude/Codex).
+// INV-4 most-headroom spread selects among eligible lanes without cost-override or fixed ratios.
 //
 // Reuses review-plugin's capacity scoring (0.9·pace + 0.1·jitter, floor/skip, blind fallback)
 // CR-2: EXCLUDED_FAMILIES removed - Claude is routable
