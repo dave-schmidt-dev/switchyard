@@ -233,6 +233,38 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		);
 	});
 
+	it("--exclude-provider still excludes when the live snapshot uses title-cased provider names (regression)", () => {
+		// The real production snapshot (gradus/.state/snapshot-v2.json) stores
+		// provider.name title-cased ("Claude", "Antigravity", ...), not the
+		// lowercase harness key ("claude", "agy") documented for
+		// --exclude-provider and used everywhere else in this file's fixtures.
+		// route()'s exclude check used to do a raw `exclude.includes(name)`
+		// with no normalization, so excluding "claude" silently failed to
+		// match snapshot entry "Claude" and the exclusion was a no-op --
+		// caught live 2026-07-31 when --exclude-provider claude/codex/cursor/
+		// opencode/copilot left every task routing straight back to Claude.
+		createTestSnapshot([
+			{
+				name: "Claude",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 50 }], // most headroom
+			},
+			{
+				name: "Codex",
+				ok: true,
+				windows: [{ percent_left: 30, pace_delta: 100 }],
+			},
+		]);
+
+		const result = route({ tier: "low", exclude: ["claude"] });
+		strictEqual(
+			result.provider,
+			"Codex",
+			"excluding the lowercase harness key 'claude' must exclude the " +
+				"title-cased snapshot entry 'Claude' -- case must not matter",
+		);
+	});
+
 	it("spreads to the provider with most headroom among funded candidates", () => {
 		createTestSnapshot([
 			{
@@ -401,6 +433,15 @@ describe("router (INV-4: blind fallback still respects funding/eligibility)", ()
 			result.provider,
 			"codex",
 			"Should fall back to first non-excluded",
+		);
+	});
+
+	it("routeBlind excludes case-insensitively too (regression, mirrors the route() fix above)", () => {
+		const result = routeBlind(["Claude", "Codex"], ["claude"]);
+		strictEqual(
+			result.provider,
+			"Codex",
+			"excluding lowercase 'claude' must exclude candidate 'Claude'",
 		);
 	});
 });

@@ -158,7 +158,7 @@ export function route(options = {}) {
 			continue;
 		}
 
-		if (exclude.includes(name)) {
+		if (exclude.some((excluded) => normalizeProviderName(excluded) === normalizeProviderName(name))) {
 			log.push(`provider ${name}: explicitly excluded`);
 			continue;
 		}
@@ -309,7 +309,11 @@ export function route(options = {}) {
  */
 export function routeBlind(providerOrder, exclude = []) {
 	for (const name of providerOrder) {
-		if (!exclude.includes(name)) {
+		const excluded = exclude.some(
+			(excludedName) =>
+				normalizeProviderName(excludedName) === normalizeProviderName(name),
+		);
+		if (!excluded) {
 			return { provider: name, model: null, reason: "blind_fallback" };
 		}
 	}
