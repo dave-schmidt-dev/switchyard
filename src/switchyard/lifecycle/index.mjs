@@ -14,6 +14,78 @@ const LABEL_MANAGED = "com.zerodelta.switchyard.managed=true";
 const LABEL_RUN_ID = "com.zerodelta.switchyard.run_id";
 const LABEL_PROJECT = "com.zerodelta.switchyard.project";
 
+// Resource containment for disposable working containers (CPU-meltdown
+// hardening). A working container can run heavy native builds under amd64
+// emulation (Rosetta/QEMU), and a leaked/orphaned one keeps burning host CPU
+// after its dispatch exits. These caps bound a SINGLE container so no one
+// worker can saturate the host; the OrbStack VM-wide `cpu`/`memory_mib`
+// ceiling is the complementary second layer that bounds the SUM of all of
+// them (see README hardening notes). Limits are a backstop — they cap blast
+// radius, they do NOT stop the leak itself (that is the recover/teardown fix).
+//
+// Defaults chosen for an 18-core / 16GB-VM host: 6 CPUs and 8GB per worker,
+// so even a couple of concurrent/leaked workers stay under the VM ceiling.
+// Overridable via env for hosts with different budgets; a malformed override
+// falls back to the default rather than emitting a broken docker arg.
+const DEFAULT_WORK_CPUS = "6";
+const DEFAULT_WORK_MEMORY = "8g";
+const DEFAULT_WORK_PIDS = "1024";
+
+function validatedCpus(env) {
+	const raw = env.SWITCHYARD_WORK_CPUS;
+	if (
+		typeof raw === "string" &&
+		/^\d+(\.\d+)?$/.test(raw.trim()) &&
+		Number(raw) > 0
+	) {
+		return raw.trim();
+	}
+	return DEFAULT_WORK_CPUS;
+}
+
+function validatedMemory(env) {
+	const raw = env.SWITCHYARD_WORK_MEMORY;
+	// Docker memory syntax: <positive number><optional b|k|m|g unit>.
+	if (typeof raw === "string" && /^\d+(\.\d+)?[bkmg]?$/i.test(raw.trim())) {
+		return raw.trim();
+	}
+	return DEFAULT_WORK_MEMORY;
+}
+
+function validatedPids(env) {
+	const raw = env.SWITCHYARD_WORK_PIDS;
+	if (typeof raw === "string" && /^\d+$/.test(raw.trim()) && Number(raw) > 0) {
+		return raw.trim();
+	}
+	return DEFAULT_WORK_PIDS;
+}
+
+/**
+ * Build the `docker run` resource-limit argv fragment applied to EVERY working
+ * container. Spliced into both `docker run` sites in createWorkingContainer so
+ * the two can never drift. `--memory-swap` is pinned equal to `--memory` to
+ * disable swap (an OOMing container is killed rather than allowed to thrash
+ * disk-backed swap). Reads process.env on each call so env overrides apply at
+ * dispatch time.
+ * @param {NodeJS.ProcessEnv} [env] Environment (defaults to process.env)
+ * @returns {string[]} docker run flags
+ */
+export function buildWorkContainerResourceArgs(env = process.env) {
+	const cpus = validatedCpus(env);
+	const memory = validatedMemory(env);
+	const pids = validatedPids(env);
+	return [
+		"--cpus",
+		cpus,
+		"--memory",
+		memory,
+		"--memory-swap",
+		memory,
+		"--pids-limit",
+		pids,
+	];
+}
+
 function projectHash(projectPath) {
 	return createHash("sha256").update(projectPath).digest("hex").slice(0, 12);
 }
@@ -149,6 +221,7 @@ export function createWorkingContainer(
 				for (const [key, value] of Object.entries(extraLabels)) {
 					runArgs.push("--label", `${key}=${value}`);
 				}
+				runArgs.push(...buildWorkContainerResourceArgs());
 				runArgs.push(
 					"-v",
 					`${containerName}-vol:/project`,
@@ -188,6 +261,7 @@ export function createWorkingContainer(
 						"-d",
 						"--name",
 						containerName,
+						...buildWorkContainerResourceArgs(),
 						"-v",
 						`${containerName}-vol:/project`,
 						"-w",
