@@ -68,7 +68,7 @@ export class Diagnostics {
 		this._sinks = [];
 	}
 
-	emit(event) {
+	async emit(event) {
 		// Serialize error first (while still an Error instance with
 		// non-enumerable name/message). _sanitizeObject iterates
 		// Object.entries which would strip them.
@@ -84,13 +84,23 @@ export class Diagnostics {
 		if (!sanitized.timestamp) {
 			sanitized.timestamp = new Date().toISOString();
 		}
-		for (const sink of this._sinks) {
-			try {
-				sink(sanitized);
-			} catch {
-				// Sink errors must not propagate.
-			}
-		}
+		// Sinks are invoked synchronously here (inside .map(), before the
+		// `await` below) so callers that emit without awaiting still see
+		// synchronous sinks run immediately — only the settling of async
+		// sinks requires awaiting emit()'s returned promise. A sink that
+		// throws synchronously must not escape .map()'s synchronous
+		// iteration and skip the rest of the sinks / propagate out of
+		// emit(): wrap each call so a sync throw becomes a rejected
+		// Promise before Promise.allSettled ever sees it.
+		await Promise.allSettled(
+			this._sinks.map((sink) => {
+				try {
+					return Promise.resolve(sink(sanitized));
+				} catch (err) {
+					return Promise.reject(err);
+				}
+			}),
+		);
 	}
 
 	sink(fn) {

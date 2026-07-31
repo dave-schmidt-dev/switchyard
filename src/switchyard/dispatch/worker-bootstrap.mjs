@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { Diagnostics } from "../diagnostics/index.mjs";
 
 function parseArg(argv, flag) {
 	const idx = argv.indexOf(flag);
@@ -43,11 +44,19 @@ let writeChain = Promise.resolve();
 async function writeFatalEvent(error) {
 	try {
 		const runStore = await import("../run-store/index.mjs");
-		await runStore.createEvent(runId, {
+		// Route through Diagnostics with the real Error object (not
+		// error?.message) so _serializeError's allowlist and _redactPaths
+		// actually apply — a raw message string would bypass that
+		// redaction path entirely. emit() is awaited so the payload is
+		// guaranteed to have reached the sink before this returns (and
+		// before the caller's process.exit(1) runs).
+		const diagnostics = new Diagnostics();
+		diagnostics.sink((sanitized) => runStore.createEvent(runId, sanitized));
+		await diagnostics.emit({
 			phase: "worker",
 			event: "worker_boot_failed",
 			status: "fatal",
-			detail: error?.message ?? "unknown error",
+			error,
 		});
 	} catch {
 		// best effort

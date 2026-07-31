@@ -81,6 +81,71 @@ describe("diagnostics emit/sink", () => {
 
 		strictEqual(received.length, 1);
 	});
+
+	it("emit() returns a Promise that resolves once sinks settle", async () => {
+		const d = new Diagnostics();
+		const received = [];
+		d.sink(async (e) => {
+			await new Promise((r) => setTimeout(r, 5));
+			received.push(e);
+		});
+
+		const p = d.emit({
+			phase: "execution",
+			event: "task_completed",
+			status: "ok",
+		});
+		ok(p instanceof Promise);
+		// The async sink hasn't settled yet — proves emit() is actually
+		// waiting on it rather than being fire-and-forget.
+		strictEqual(received.length, 0);
+
+		await p;
+		strictEqual(received.length, 1);
+	});
+
+	it("a synchronously-throwing sink does not reject emit() or crash the caller", async () => {
+		const d = new Diagnostics();
+		const received = [];
+		d.sink(() => {
+			throw new Error("sync sink exploded");
+		});
+		d.sink((e) => received.push(e));
+
+		await d.emit({ phase: "execution", event: "task_completed", status: "ok" });
+
+		strictEqual(received.length, 1);
+	});
+
+	it("an asynchronously-rejecting sink does not reject emit() or crash the caller", async () => {
+		const d = new Diagnostics();
+		const received = [];
+		d.sink(async () => {
+			await new Promise((r) => setTimeout(r, 1));
+			throw new Error("async sink rejected");
+		});
+		d.sink((e) => received.push(e));
+
+		await d.emit({ phase: "execution", event: "task_completed", status: "ok" });
+
+		strictEqual(received.length, 1);
+	});
+
+	it("both a sync-throwing and an async-rejecting sink are swallowed together", async () => {
+		const d = new Diagnostics();
+		const received = [];
+		d.sink(() => {
+			throw new Error("sync sink exploded");
+		});
+		d.sink(async () => {
+			throw new Error("async sink rejected");
+		});
+		d.sink((e) => received.push(e));
+
+		await d.emit({ phase: "execution", event: "task_completed", status: "ok" });
+
+		strictEqual(received.length, 1);
+	});
 });
 
 describe("diagnostics error serialization", () => {
@@ -240,6 +305,31 @@ describe("diagnostics secret canary", () => {
 
 		strictEqual(received[0].status, "normal status");
 		strictEqual(received[0].taskId, "CANARY_OK");
+	});
+
+	it("redacts a secret canary from a real Error instance's message (writeFatalEvent path)", async () => {
+		// Mirrors worker-bootstrap's writeFatalEvent: pass the actual Error
+		// object (not error?.message) as `error` so _serializeError's
+		// allowlist and _redactPaths/canary redaction apply, instead of a
+		// raw message string bypassing that path entirely.
+		const d = new Diagnostics();
+		const received = [];
+		d.sink((e) => received.push(e));
+
+		const err = new Error(
+			'nonce mismatch: bootstrap received "SECRET_CANARY_leaked_nonce"',
+		);
+
+		await d.emit({
+			phase: "worker",
+			event: "worker_boot_failed",
+			status: "fatal",
+			error: err,
+		});
+
+		strictEqual(received.length, 1);
+		strictEqual(received[0].error.message, "[REDACTED]");
+		ok(!JSON.stringify(received[0]).includes("SECRET_CANARY_"));
 	});
 
 	it("redacts canary in nested error object fields", () => {

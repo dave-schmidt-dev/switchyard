@@ -474,7 +474,65 @@ describe("non-matching nonce", () => {
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
-		ok(bootFailed.detail.includes("nonce mismatch"));
+		// writeFatalEvent now routes the real Error through Diagnostics
+		// (error: error, not detail: error?.message), so the persisted
+		// payload carries a serialized `error` object rather than a raw
+		// `detail` string.
+		ok(bootFailed.error, "worker_boot_failed event carries a serialized error");
+		ok(bootFailed.error.message.includes("nonce mismatch"));
+	});
+
+	it("bootstrap with a secret-canary-bearing nonce redacts it from the persisted worker_boot_failed event", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		const correctNonce = "correct-nonce-value";
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: correctNonce,
+			launchArgs: [],
+		});
+
+		// The nonce-mismatch Error message interpolates both the received
+		// and expected nonce values, so a canary-shaped wrong nonce lands
+		// straight in error.message — proving writeFatalEvent's Diagnostics
+		// path (not just the Diagnostics unit tests) actually redacts it
+		// before it reaches events.jsonl.
+		const result = runBootstrap(
+			[
+				"--state-root",
+				stateRoot,
+				"--run-id",
+				runId,
+				"--nonce",
+				"SECRET_CANARY_leaked_nonce_value",
+			],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(
+			result.status,
+			3,
+			`expected exit 3 for nonce mismatch, got ${result.status}: ${result.stderr}`,
+		);
+
+		const { readEvents } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+		ok(bootFailed.error, "worker_boot_failed event carries a serialized error");
+		strictEqual(bootFailed.error.message, "[REDACTED]");
+
+		assertNoSecretCanary(runId);
 	});
 });
 
