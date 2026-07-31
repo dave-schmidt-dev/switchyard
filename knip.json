@@ -2,7 +2,8 @@
 	"entry": [
 		"tests/**/*.test.mjs",
 		"src/switchyard/runner/index.mjs",
-		"src/switchyard/dispatch/worker-bootstrap.mjs"
+		"src/switchyard/dispatch/worker-bootstrap.mjs",
+		"src/switchyard/dispatch/remediate-orphaned-locks.mjs"
 	],
 	"project": ["src/**/*.mjs"],
 	"ignoreBinaries": ["orb"]
