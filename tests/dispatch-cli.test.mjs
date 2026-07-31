@@ -770,6 +770,7 @@ describe("envelope format", () => {
 			"queueStartedAt",
 			"elapsedMs",
 			"totalTaskCount",
+			"pendingCount",
 			"runningCount",
 			"lastCompletionAt",
 			"activeTaskAgeMs",
@@ -821,6 +822,7 @@ describe("envelope format", () => {
 			"queueStartedAt",
 			"elapsedMs",
 			"totalTaskCount",
+			"pendingCount",
 			"runningCount",
 			"lastCompletionAt",
 			"activeTaskAgeMs",
@@ -885,6 +887,13 @@ describe("deriveTelemetryFields parity between status and result envelopes", () 
 		strictEqual(statusEnvelope.queueStartedAt, resultEnvelope.queueStartedAt);
 		strictEqual(statusEnvelope.totalTaskCount, resultEnvelope.totalTaskCount);
 		strictEqual(statusEnvelope.totalTaskCount, 3);
+		strictEqual(statusEnvelope.pendingCount, resultEnvelope.pendingCount);
+		// No checkpoint file exists for this run's tasksFile, so pendingCount
+		// falls back to the full orderedTaskIds count — it must NOT be
+		// derived from terminalSummary.completedTaskIds (a different,
+		// run-record-level notion of "done" that deriveTelemetryFields does
+		// not consult).
+		strictEqual(statusEnvelope.pendingCount, 3);
 		strictEqual(statusEnvelope.runningCount, resultEnvelope.runningCount);
 		strictEqual(statusEnvelope.runningCount, 1);
 		strictEqual(
@@ -943,5 +952,147 @@ describe("deriveTelemetryFields parity between status and result envelopes", () 
 		strictEqual(envelope.runningCount, 0);
 		strictEqual(envelope.totalTaskCount, 1);
 		ok(typeof envelope.elapsedMs === "number" && envelope.elapsedMs >= 0);
+	});
+});
+
+describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", () => {
+	it("pendingCount equals totalTaskCount on a fresh run with no checkpoint file", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = "pending-fresh-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1", "1.2", "1.3"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+		strictEqual(statusEnvelope.totalTaskCount, 3);
+		strictEqual(statusEnvelope.pendingCount, 3);
+
+		// result requires a terminal run state — advance it before checking
+		// the same field agrees on the result envelope.
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: [] },
+			},
+			current.revision,
+		);
+
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
+		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
+		strictEqual(resultEnvelope.pendingCount, 3);
+	});
+
+	it("pendingCount excludes tasks a pre-existing checkpoint already marks done, even with zero matching events in this run's own log (resumed-run regression case)", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { CHECKPOINT_VERSION, getCheckpointPath, saveCheckpoint } =
+			await import("../src/switchyard/runner/index.mjs");
+
+		const runId = "pending-resumed-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1", "1.2", "1.3"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		// Simulate a checkpoint left behind by a prior process on a resumed
+		// run: task "1.1" is already marked done there, but this run's own
+		// events.jsonl has recorded zero events for it (no run-store events
+		// were ever written for this runId). This is the exact CR-3
+		// regression shape: a flat `orderedTaskIds.length - events.length`
+		// subtraction would see 0 events and report pendingCount as 3,
+		// silently counting an already-completed task as still pending. The
+		// checkpoint-derived computation must instead see completedTaskIds
+		// and report 2.
+		saveCheckpoint(getCheckpointPath(tasksFile), {
+			version: CHECKPOINT_VERSION,
+			tasksFilePath: tasksFile,
+			completedTaskIds: ["1.1"],
+			lastTaskId: "1.1",
+			lastUpdatedAt: new Date().toISOString(),
+			results: [],
+		});
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+		strictEqual(statusEnvelope.totalTaskCount, 3);
+		strictEqual(
+			statusEnvelope.pendingCount,
+			2,
+			"pendingCount must exclude the checkpoint-completed task even though this run's own events.jsonl has no matching event",
+		);
+
+		// result requires a terminal run state — advance it before checking
+		// the same field agrees on the result envelope.
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: ["1.1"] },
+			},
+			current.revision,
+		);
+
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
+		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
+		strictEqual(resultEnvelope.pendingCount, 2);
+	});
+
+	it("status degrades pendingCount rather than crashing when the checkpoint file exists but is corrupt", async () => {
+		const { initializeRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { getCheckpointPath } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+
+		const runId = "pending-corrupt-checkpoint-run";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1", "1.2", "1.3"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+
+		// status/result are read-only diagnostic commands (like
+		// readEventsSafe's best-effort event read above) — a checkpoint that
+		// exists but fails to parse must not crash an otherwise-healthy
+		// status read, even though runQueue's own write path deliberately
+		// fails loudly on the same condition.
+		writeFileSync(
+			getCheckpointPath(tasksFile),
+			"{not valid json at all",
+			"utf8",
+		);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+		strictEqual(statusEnvelope.totalTaskCount, 3);
+		strictEqual(statusEnvelope.pendingCount, 3);
 	});
 });

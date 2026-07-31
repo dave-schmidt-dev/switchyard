@@ -50,7 +50,12 @@ import {
 	releaseProjectLockIfOwnedBy,
 	SchemaError,
 } from "../run-store/index.mjs";
-import { loadTaskQueue, runQueue } from "../runner/index.mjs";
+import {
+	getCheckpointPath,
+	loadCheckpoint,
+	loadTaskQueue,
+	runQueue,
+} from "../runner/index.mjs";
 
 const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
 
@@ -456,32 +461,65 @@ function countCompletedAndFailed(events) {
 	return { completedCount, failedCount };
 }
 
+// Best-effort checkpoint read, mirroring readEventsSafe above: status/result
+// are read-only diagnostic commands, so a checkpoint that's absent (fresh
+// run, nothing written yet) or corrupt (loadCheckpoint's fail-loud path —
+// appropriate for runQueue's own write path, where silently discarding
+// completed-task history would cause a full destructive re-run) must not
+// crash the *observation* of a run. It degrades to null, which
+// deriveTelemetryFields treats as an empty completed set — the same
+// pendingCount an operator would see before any checkpoint existed.
+//
+// Reads the same checkpoint state `runQueue` itself consults
+// (getCheckpointPath(tasksFilePath)) so `pendingCount` reflects tasks
+// completed by a prior process on a resumed run, not just this run's own
+// event log. Mirrors runQueue's own default-path resolution — dispatch never
+// threads a custom `--checkpoint` path through run-store, so the default is
+// always the one in effect for a launched run.
+function readCheckpointStateForRun(run) {
+	try {
+		return loadCheckpoint(
+			getCheckpointPath(run.tasksFilePath),
+			run.tasksFilePath,
+		);
+	} catch {
+		// checkpoint exists but is corrupt/unreadable — degrade rather than
+		// failing an otherwise-healthy status/result read
+		return null;
+	}
+}
+
 /**
  * Derive the throughput/telemetry fields shared by buildStatusEnvelope and
  * buildResultEnvelope, so the two envelope builders can't drift on the same
  * underlying aggregate-progress signal.
  *
- * `checkpointState` is accepted but not yet consumed by any field here — it
- * is threaded through so a later `pendingCount` derivation (read off the
- * same checkpoint state `runQueue` itself consults) can be added without
- * another signature change.
- *
  * @param {object} run parsed run snapshot
  * @param {Array<object>} events this run's event log (readEventsSafe result)
- * @param {object|null} checkpointState reserved for a future pendingCount derivation
+ * @param {object|null} checkpointState checkpoint state read via
+ *   readCheckpointStateForRun; `pendingCount` is derived from its
+ *   `completedTaskIds` rather than from `events`, so a resumed run against a
+ *   pre-existing checkpoint (tasks completed by a prior process, with no
+ *   matching event in this run's own events.jsonl) is still counted
+ *   correctly instead of over/under-counting via a flat
+ *   `orderedTaskIds.length - events.length` subtraction.
  * @returns {object} shared telemetry fields
  */
 function deriveTelemetryFields(run, events, checkpointState) {
 	void events;
-	void checkpointState;
 
 	const now = Date.now();
 	const queueStartedAt = new Date(run.createdAt).getTime();
+	const completedIds = new Set(checkpointState?.completedTaskIds ?? []);
+	const pendingCount = run.orderedTaskIds.filter(
+		(id) => !completedIds.has(id),
+	).length;
 
 	return {
 		queueStartedAt,
 		elapsedMs: now - queueStartedAt,
 		totalTaskCount: run.orderedTaskIds.length,
+		pendingCount,
 		// Single worker processes one task at a time, so "running" is a
 		// 0/1 signal keyed off whether a task is currently active.
 		runningCount: run.activeTaskId != null ? 1 : 0,
@@ -500,7 +538,8 @@ function deriveTelemetryFields(run, events, checkpointState) {
 async function buildStatusEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
-	const telemetry = deriveTelemetryFields(run, events, null);
+	const checkpointState = readCheckpointStateForRun(run);
+	const telemetry = deriveTelemetryFields(run, events, checkpointState);
 	return {
 		schemaVersion: 1,
 		runId: run.runId,
@@ -536,7 +575,8 @@ async function listArtifactRefs(runId) {
 async function buildResultEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
-	const telemetry = deriveTelemetryFields(run, events, null);
+	const checkpointState = readCheckpointStateForRun(run);
+	const telemetry = deriveTelemetryFields(run, events, checkpointState);
 	const artifactRefs = await listArtifactRefs(runId);
 	return {
 		schemaVersion: 1,
