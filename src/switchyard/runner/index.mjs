@@ -644,6 +644,7 @@ export function executeTask(task, context) {
 	const routeResult = context.route({
 		tier,
 		availableProviders: Object.keys(context.adapters ?? {}),
+		exclude: context.exclude,
 	});
 
 	if (!routeResult.provider) {
@@ -843,7 +844,10 @@ export function executeTask(task, context) {
  */
 export async function executeTaskWithOrchestrator(task, context) {
 	const tier = classifyTask(task.description || task.title);
-	const routeResult = context.route({ tier });
+	// Deliberately no availableProviders here — see runQueueWithOrchestrator's
+	// "intentionally-unfiltered orchestrator route" note (Task 16), a
+	// pre-existing gap this task does not touch.
+	const routeResult = context.route({ tier, exclude: context.exclude });
 
 	if (!routeResult.provider) {
 		context.recordDispatch({
@@ -1109,6 +1113,7 @@ function throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus) {
  * @param {string} [options.checkpointPath]
  * @param {number} [options.maxTasks]
  * @param {boolean} [options.stopOnFailure]
+ * @param {string[]} [options.exclude] Provider names to never route to.
  * @param {object} [options.dependencies]
  */
 export function runQueue(options) {
@@ -1119,6 +1124,7 @@ export function runQueue(options) {
 		checkpointPath = getCheckpointPath(tasksFilePath),
 		maxTasks = Number.POSITIVE_INFINITY,
 		stopOnFailure = true,
+		exclude = [],
 		dependencies = {},
 	} = options;
 
@@ -1211,6 +1217,7 @@ export function runQueue(options) {
 		workingContainerName,
 		onStatus: emitStatus,
 		onTaskRouted,
+		exclude,
 	};
 
 	try {

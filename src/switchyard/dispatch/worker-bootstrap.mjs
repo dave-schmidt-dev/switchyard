@@ -139,6 +139,9 @@ try {
 		projectPath: run.projectPath,
 		maxTasks: Number.POSITIVE_INFINITY,
 		stopOnFailure: true,
+		// Defensive fallback: a run.json written before this field existed (or
+		// a hand-built fixture in a test) won't have excludeProviders at all.
+		exclude: run.excludeProviders ?? [],
 		dependencies: {
 			// These callbacks all use updateRunWithRetry rather than a
 			// read-then-updateRun(fixed revision) pair, and each one synchronously

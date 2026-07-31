@@ -26,6 +26,7 @@
 //   --max-tasks <n>        Cap how many tasks are processed this run.
 //   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json).
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
+//   --exclude-provider <name>  Never route to this provider (repeatable).
 //   --help                 Show this help.
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
@@ -49,6 +50,7 @@ import {
 	readRun,
 	releaseProjectLockIfOwnedBy,
 	SchemaError,
+	updateRunWithRetry,
 } from "../run-store/index.mjs";
 import {
 	getCheckpointPath,
@@ -71,6 +73,7 @@ Run/Launch options:
   --max-tasks <n>        Cap how many tasks are processed this run
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
   --no-stop-on-failure   Keep going after a task fails (default: stop)
+  --exclude-provider <name>  Never route to this provider (repeatable)
   --help                 Show this help`;
 
 const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [options]
@@ -79,6 +82,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --max-tasks <n>        Cap how many tasks are processed this run
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
   --no-stop-on-failure   Keep going after a task fails (default: stop)
+  --exclude-provider <name>  Never route to this provider (repeatable)
   --help                 Show this help`;
 
 const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <path> [options]
@@ -87,6 +91,7 @@ const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <pa
   --max-tasks <n>        Cap how many tasks are processed this run
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
   --no-stop-on-failure   Keep going after a task fails (default: stop)
+  --exclude-provider <name>  Never route to this provider (repeatable)
   --help                 Show this help`;
 
 const USAGE_STATUS = `Usage: switchyard-dispatch status <run-id> [--json]
@@ -132,6 +137,7 @@ function parseDispatchArgs(argv) {
 				"max-tasks": { type: "string" },
 				checkpoint: { type: "string" },
 				"no-stop-on-failure": { type: "boolean", default: false },
+				"exclude-provider": { type: "string", multiple: true },
 				help: { type: "boolean", default: false },
 			},
 		});
@@ -189,6 +195,7 @@ function parseDispatchArgs(argv) {
 		maxTasks,
 		checkpointPath: values.checkpoint ? resolve(values.checkpoint) : undefined,
 		stopOnFailure: !values["no-stop-on-failure"],
+		excludeProviders: values["exclude-provider"] ?? [],
 	};
 }
 
@@ -282,6 +289,7 @@ function runDispatch(opts) {
 		maxTasks: opts.maxTasks,
 		...(opts.checkpointPath ? { checkpointPath: opts.checkpointPath } : {}),
 		stopOnFailure: opts.stopOnFailure,
+		exclude: opts.excludeProviders,
 		dependencies: {
 			onTaskStart: (task) =>
 				console.error(
@@ -379,6 +387,14 @@ async function handleLaunch(argv) {
 		workerNonce: nonce,
 		launchArgs,
 	});
+
+	// initializeRun writes a fixed snapshot literal (run-store/index.mjs) with
+	// no options passthrough, so a launch-time option that needs to become its
+	// own named field on the run record — as opposed to just riding along
+	// inside the raw launchArgs array above — is persisted via a follow-up
+	// updateRunWithRetry rather than threaded into the initializeRun call
+	// itself. worker-bootstrap reads it back off run.excludeProviders.
+	await updateRunWithRetry(runId, { excludeProviders: opts.excludeProviders });
 
 	await acquireProjectLock(opts.projectPath, runId);
 

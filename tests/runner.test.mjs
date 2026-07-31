@@ -22,6 +22,7 @@ import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constan
 import {
 	createCliOrchestrator,
 	executeTask,
+	executeTaskWithOrchestrator,
 	getRunnableTasks,
 	loadCheckpoint,
 	parseTaskQueue,
@@ -3672,6 +3673,166 @@ describe("executeTask timeout handling", () => {
 		strictEqual(result.timedOut, undefined);
 		strictEqual(result.partialDiff, undefined);
 		strictEqual(captureDiffCalls.length, 0);
+	});
+});
+
+describe("--exclude-provider threading (context.exclude -> route)", () => {
+	it("runQueue forwards options.exclude onto context.exclude, reaching route() via executeTask", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** First operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const routeCalls = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			exclude: ["claude"],
+			dependencies: {
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 60,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(routeCalls.length, 1);
+		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
+	});
+
+	it("runQueue defaults context.exclude to [] when options.exclude is omitted", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** First operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const routeCalls = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 60,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+			},
+		});
+
+		deepStrictEqual(routeCalls[0].exclude, []);
+	});
+
+	it("executeTask passes context.exclude through to route(), alongside availableProviders", () => {
+		const routeCalls = [];
+
+		executeTask(
+			{ id: "1.1", title: "task", description: "op" },
+			{
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 50,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				exclude: ["claude"],
+			},
+		);
+
+		strictEqual(routeCalls.length, 1);
+		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
+		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
+	});
+
+	it("executeTaskWithOrchestrator passes context.exclude through to route(), without gaining availableProviders", async () => {
+		// Mirrors the existing "intentionally-unfiltered orchestrator route"
+		// characterization (Task 16, above): executeTaskWithOrchestrator still
+		// deliberately does not pass availableProviders. That pre-existing gap
+		// is out of scope for --exclude-provider threading — only assert
+		// exclude is forwarded, and pin that availableProviders stays absent.
+		const routeCalls = [];
+
+		const result = await executeTaskWithOrchestrator(
+			{ id: "1.1", title: "task", description: "op" },
+			{
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 50,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: "" }),
+				},
+				sleepFn: async () => {},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				exclude: ["claude"],
+			},
+		);
+
+		strictEqual(result.success, true);
+		strictEqual(routeCalls.length, 1);
+		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
+		ok(
+			!("availableProviders" in routeCalls[0]),
+			"executeTaskWithOrchestrator must not gain availableProviders — pre-existing gap, out of scope here",
+		);
 	});
 });
 

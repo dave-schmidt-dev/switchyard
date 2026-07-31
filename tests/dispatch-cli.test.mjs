@@ -137,6 +137,24 @@ describe("parseDispatchArgs (backwards compat)", () => {
 		strictEqual(opts.stopOnFailure, false);
 	});
 
+	it("defaults excludeProviders to an empty array when --exclude-provider is absent", () => {
+		const opts = parseDispatchArgs([tasksFile, "--project", projectDir]);
+		deepStrictEqual(opts.excludeProviders, []);
+	});
+
+	it("collects repeated --exclude-provider flags into excludeProviders", () => {
+		const opts = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--exclude-provider",
+			"claude",
+			"--exclude-provider",
+			"cursor",
+		]);
+		deepStrictEqual(opts.excludeProviders, ["claude", "cursor"]);
+	});
+
 	it("throws when the tasks positional is missing", () => {
 		strictEqual(
 			(() => {
@@ -267,6 +285,11 @@ describe("usage output", () => {
 		ok(USAGE_LAUNCH.includes("--project"));
 	});
 
+	it("USAGE_RUN and USAGE_LAUNCH describe --exclude-provider", () => {
+		ok(USAGE_RUN.includes("--exclude-provider"));
+		ok(USAGE_LAUNCH.includes("--exclude-provider"));
+	});
+
 	it("USAGE_STATUS describes status usage", () => {
 		ok(USAGE_STATUS.includes("<run-id>"));
 	});
@@ -391,6 +414,41 @@ describe("launch integration", () => {
 		strictEqual(envelope.state, "launcher_ready");
 		ok(envelope.statusCommand.includes("switchyard-dispatch status"));
 		ok(envelope.resultCommand.includes("switchyard-dispatch result"));
+	});
+
+	it("launch with no --exclude-provider persists excludeProviders: [] on the run record", async () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		deepStrictEqual(run.excludeProviders, []);
+	});
+
+	it("launch persists repeated --exclude-provider flags onto the run record as excludeProviders", async () => {
+		const result = runDispatch(
+			[
+				"launch",
+				tasksFile,
+				"--project",
+				projectDir,
+				"--exclude-provider",
+				"claude",
+				"--exclude-provider",
+				"cursor",
+			],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		deepStrictEqual(run.excludeProviders, ["claude", "cursor"]);
 	});
 });
 

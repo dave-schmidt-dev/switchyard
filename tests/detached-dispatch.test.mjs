@@ -3,7 +3,7 @@
 // These spawn real Node subprocesses.
 
 import { ok, strictEqual } from "node:assert";
-import { spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	mkdirSync,
@@ -177,6 +177,133 @@ describe("worker reaches terminal state and result is readable", () => {
 		const result = JSON.parse(resultResult.stdout.trim());
 		ok(result.terminalSummary !== null, "terminalSummary present");
 		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
+	});
+});
+
+describe("--exclude-provider on the detached worker path", () => {
+	it("excludes the given provider from routing end-to-end via `launch` (not just the foreground path)", async () => {
+		// The shared `projectDir` fixture (beforeEach) is just an empty `.git`
+		// directory — enough for the other tests in this file, which only care
+		// that the run reaches *some* terminal state, but seedProject's `git
+		// archive HEAD` needs a real commit or the worker crashes before ever
+		// reaching routing. Use a dedicated, properly-initialized repo here
+		// (same recipe as dispatch-cli.test.mjs's "run subcommand via spawn").
+		const excludeProjectDir = join(dir, "exclude-provider-project");
+		mkdirSync(excludeProjectDir, { recursive: true });
+		execSync("git init", { cwd: excludeProjectDir, stdio: "ignore" });
+		execSync("git config user.email test@test.com", {
+			cwd: excludeProjectDir,
+			stdio: "ignore",
+		});
+		execSync("git config user.name test", {
+			cwd: excludeProjectDir,
+			stdio: "ignore",
+		});
+		execSync("git commit --allow-empty -m initial", {
+			cwd: excludeProjectDir,
+			stdio: "ignore",
+		});
+
+		// Deterministic routing: point SWITCHYARD_SNAPSHOT_PATH_OVERRIDE at a
+		// fixture snapshot with two known-healthy providers instead of relying
+		// on whatever the real production snapshot happens to contain (see
+		// resolveSnapshotPath() in router/index.mjs — the same override
+		// router.test.mjs and runner.test.mjs use for isolation). Without
+		// --exclude-provider, claude (90% left) outranks codex (50% left) and
+		// wins routing under router/index.mjs's spread-by-headroom rule; with
+		// `--exclude-provider claude`, codex must be routed instead.
+		const snapshotPath = join(dir, "snapshot.json");
+		writeFileSync(
+			snapshotPath,
+			JSON.stringify({
+				schema_version: 2,
+				providers: [
+					{
+						name: "claude",
+						ok: true,
+						windows: [{ percent_left: 90, pace_delta: 0 }],
+					},
+					{
+						name: "codex",
+						ok: true,
+						windows: [{ percent_left: 50, pace_delta: 0 }],
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		const env = {
+			...makeStateRootEnv(),
+			SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: snapshotPath,
+		};
+
+		const launchResult = runDispatch(
+			[
+				"launch",
+				tasksFile,
+				"--project",
+				excludeProjectDir,
+				"--exclude-provider",
+				"claude",
+			],
+			env,
+		);
+		strictEqual(
+			launchResult.status,
+			0,
+			`launch failed: ${launchResult.stderr}`,
+		);
+		const { runId } = JSON.parse(launchResult.stdout.trim());
+
+		// onTaskRouted fires (and is persisted to activeTaskProvider) before the
+		// blocking adapter.execute call, so poll frequently: this only needs to
+		// observe routing, not wait for the task to finish executing.
+		let observedProvider = null;
+		const start = Date.now();
+		const maxWait = 20_000;
+		while (Date.now() - start < maxWait) {
+			const statusResult = pollStatus(runId, env);
+			if (statusResult.status === 0) {
+				const status = JSON.parse(statusResult.stdout.trim());
+				if (status.activeTaskProvider) {
+					observedProvider = status.activeTaskProvider;
+					break;
+				}
+				if (status.state === "succeeded" || status.state === "failed") {
+					break;
+				}
+			}
+			await new Promise((r) => setTimeout(r, 200));
+		}
+
+		// Fallback for the race where the task already reached a terminal state
+		// (task_completed/task_failed) before any poll caught
+		// activeTaskProvider populated — the routed provider is still on the
+		// terminal event worker-bootstrap.mjs's onResult callback records.
+		if (!observedProvider) {
+			const { readEvents } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			const events = await readEvents(runId);
+			const routedEvent = events.find(
+				(e) =>
+					e.phase === "execution" &&
+					(e.event === "task_completed" || e.event === "task_failed"),
+			);
+			observedProvider = routedEvent?.provider ?? null;
+		}
+
+		ok(observedProvider, "expected the task to be routed to some provider");
+		strictEqual(
+			observedProvider,
+			"codex",
+			"claude is excluded and has more headroom, so codex must be routed instead",
+		);
+		ok(
+			observedProvider !== "claude",
+			"the excluded provider must never be routed",
+		);
 	});
 });
 
