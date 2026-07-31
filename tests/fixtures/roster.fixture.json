@@ -1,0 +1,212 @@
+{
+	"schema_version": 1,
+	"models": {
+		"fixture/claude-low": {
+			"selector": "fixture-claude-low",
+			"base_model": "fixture-claude-low",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/claude-standard": {
+			"selector": "fixture-claude-standard",
+			"base_model": "fixture-claude-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/claude-high": {
+			"selector": "fixture-claude-high",
+			"base_model": "fixture-claude-high",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/codex-low": {
+			"selector": "fixture-codex-low",
+			"base_model": "fixture-codex-low",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/codex-standard": {
+			"selector": "fixture-codex-standard",
+			"base_model": "fixture-codex-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/codex-high": {
+			"selector": "fixture-codex-high",
+			"base_model": "fixture-codex-high",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/agy-low": {
+			"selector": "fixture-agy-low",
+			"base_model": "fixture-agy-low",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/agy-standard": {
+			"selector": "fixture-agy-standard",
+			"base_model": "fixture-agy-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/cursor-composer": {
+			"selector": "fixture-cursor-composer",
+			"base_model": "fixture-cursor-composer",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/cursor-manual-high": {
+			"selector": "fixture-cursor-manual-high",
+			"base_model": "fixture-cursor-manual-high",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/vibe-standard": {
+			"selector": "fixture-vibe-standard",
+			"base_model": "fixture-vibe-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/copilot-auto": {
+			"selector": "fixture-copilot-auto",
+			"base_model": "opaque",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/opencode-low": {
+			"selector": "fixture/opencode-low",
+			"base_model": "fixture-opencode-low",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/opencode-standard": {
+			"selector": "fixture/opencode-standard",
+			"base_model": "fixture-opencode-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/retired-model": {
+			"selector": "fixture-retired",
+			"base_model": "fixture-retired",
+			"model_provider": "fixture",
+			"status": "retired"
+		}
+	},
+	"targets": {
+		"claude-code": {
+			"harness": "claude",
+			"credential_profile": "default",
+			"enabled": true,
+			"technical_ceiling": "high",
+			"qualifications": {
+				"fixture-claude-low": { "status": "qualified" },
+				"fixture-claude-standard": { "status": "qualified" },
+				"fixture-claude-high": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [{ "model_ref": "fixture/claude-low", "priority": 1 }],
+				"standard": [{ "model_ref": "fixture/claude-standard", "priority": 1 }],
+				"high": [{ "model_ref": "fixture/claude-high", "priority": 1 }]
+			}
+		},
+		"codex": {
+			"harness": "codex",
+			"credential_profile": "default",
+			"enabled": true,
+			"technical_ceiling": "high",
+			"qualifications": {
+				"fixture-codex-low": { "status": "qualified" },
+				"fixture-codex-standard": { "status": "qualified" },
+				"fixture-codex-high": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [{ "model_ref": "fixture/codex-low", "priority": 1 }],
+				"standard": [{ "model_ref": "fixture/codex-standard", "priority": 1 }],
+				"high": [{ "model_ref": "fixture/codex-high", "priority": 1 }]
+			}
+		},
+		"antigravity": {
+			"harness": "agy",
+			"credential_profile": "default",
+			"enabled": true,
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture-agy-low": { "status": "qualified" },
+				"fixture-agy-standard": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [{ "model_ref": "fixture/agy-low", "priority": 1 }],
+				"standard": [{ "model_ref": "fixture/agy-standard", "priority": 1 }],
+				"high": []
+			}
+		},
+		"cursor-pro": {
+			"harness": "cursor",
+			"credential_profile": "default",
+			"enabled": true,
+			"technical_ceiling": "high",
+			"qualifications": {
+				"fixture-cursor-composer": { "status": "qualified" },
+				"fixture-cursor-manual-high@xhigh": { "status": "untested" }
+			},
+			"slots": {
+				"low": [{ "model_ref": "fixture/cursor-composer", "priority": 1 }],
+				"standard": [{ "model_ref": "fixture/cursor-composer", "priority": 1 }],
+				"high": [
+					{
+						"model_ref": "fixture/cursor-manual-high",
+						"priority": 1,
+						"effort": "xhigh",
+						"manual_only": true
+					}
+				]
+			}
+		},
+		"vibe": {
+			"harness": "vibe",
+			"credential_profile": "default",
+			"enabled": false,
+			"disabled_reason": "fixture: no ZDR (synthetic, mirrors production shape only)",
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture-vibe-standard": { "status": "untested" }
+			},
+			"slots": {
+				"low": [],
+				"standard": [{ "model_ref": "fixture/vibe-standard", "priority": 1 }],
+				"high": []
+			}
+		},
+		"copilot-student": {
+			"harness": "copilot",
+			"credential_profile": "default",
+			"enabled": true,
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture-copilot-auto": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [{ "model_ref": "fixture/copilot-auto", "priority": 1 }],
+				"standard": [{ "model_ref": "fixture/copilot-auto", "priority": 1 }],
+				"high": []
+			}
+		},
+		"opencode-go": {
+			"harness": "opencode",
+			"credential_profile": "go",
+			"enabled": true,
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture/opencode-low": { "status": "qualified" },
+				"fixture/opencode-standard": { "status": "temporarily_unavailable" }
+			},
+			"slots": {
+				"low": [{ "model_ref": "fixture/opencode-low", "priority": 1 }],
+				"standard": [
+					{ "model_ref": "fixture/opencode-standard", "priority": 1 }
+				],
+				"high": []
+			}
+		}
+	}
+}

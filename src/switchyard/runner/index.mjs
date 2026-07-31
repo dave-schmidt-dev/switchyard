@@ -44,6 +44,10 @@ import {
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
 import { classifyTask } from "../roster/classifier.mjs";
+import {
+	normalizeProviderName,
+	resolveRouteProvenance,
+} from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
 
 /**
@@ -553,10 +557,28 @@ export function getRunnableTasks(tasks, checkpoint) {
 	return runnable;
 }
 
-function selectAdapter(providerName, adapters) {
-	const provider = providerName?.toLowerCase();
-	if (!provider) return null;
-	return adapters?.[provider] ?? null;
+/**
+ * Select the execution adapter for a route by its HARNESS, not its snapshot
+ * provider/display name (Task 1.6, M1b). Adapters are keyed by harness
+ * (`claude`, `codex`, `agy`, `cursor`, `copilot`, `opencode`), but a route's
+ * `provider` is a snapshot display name (e.g. "OpenCode Go"). The old
+ * `providerName.toLowerCase()` produced "opencode go", which never matched the
+ * "opencode" adapter key, collapsing every opencode-target dispatch to
+ * `unsupported_provider`. Normalizing to the harness ("OpenCode Go" →
+ * "opencode") lets the route survive to dispatch.
+ *
+ * Callers pass `routeResult.resolved_harness` (the roster target's authoritative
+ * `harness`) when available, falling back to the raw provider name;
+ * normalizeProviderName is idempotent on an already-resolved harness, so both
+ * inputs resolve to the same adapter key.
+ * @param {string} harnessOrProvider
+ * @param {object} adapters
+ * @returns {object|null}
+ */
+function selectAdapter(harnessOrProvider, adapters) {
+	const harness = normalizeProviderName(harnessOrProvider);
+	if (!harness) return null;
+	return adapters?.[harness] ?? null;
 }
 
 /**
@@ -647,8 +669,18 @@ export function executeTask(task, context) {
 		exclude: context.exclude,
 	});
 
+	// Provenance (Task 1.6, M7/M8): resolve the six roster-provenance fields
+	// once, attach them to routeResult, and route every dispatch record through
+	// a local `record()` that spreads them in. Doing it here — not at each of
+	// the recordDispatch call sites below — means no dispatch record can omit
+	// provenance, and adds it in exactly one place per execute path.
+	const provenance = resolveRouteProvenance(routeResult.provider, tier);
+	Object.assign(routeResult, provenance);
+	const record = (dispatch) =>
+		context.recordDispatch({ ...provenance, ...dispatch });
+
 	if (!routeResult.provider) {
-		context.recordDispatch({
+		record({
 			provider: "none",
 			model: "none",
 			taskId: task.id,
@@ -664,9 +696,12 @@ export function executeTask(task, context) {
 		};
 	}
 
-	const adapter = selectAdapter(routeResult.provider, context.adapters);
+	const adapter = selectAdapter(
+		routeResult.resolved_harness ?? routeResult.provider,
+		context.adapters,
+	);
 	if (!adapter) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -719,7 +754,7 @@ export function executeTask(task, context) {
 	});
 
 	if (!execution.success) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -774,7 +809,7 @@ export function executeTask(task, context) {
 	}
 
 	if (!diff && task.requiredPaths === null) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -818,7 +853,7 @@ export function executeTask(task, context) {
 		}
 	}
 
-	context.recordDispatch({
+	record({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
@@ -849,8 +884,16 @@ export async function executeTaskWithOrchestrator(task, context) {
 	// pre-existing gap this task does not touch.
 	const routeResult = context.route({ tier, exclude: context.exclude });
 
+	// Provenance (Task 1.6, M7/M8) — same treatment as executeTask: resolve the
+	// six fields once, attach to routeResult, and route every dispatch record
+	// through the provenance-injecting `record()`.
+	const provenance = resolveRouteProvenance(routeResult.provider, tier);
+	Object.assign(routeResult, provenance);
+	const record = (dispatch) =>
+		context.recordDispatch({ ...provenance, ...dispatch });
+
 	if (!routeResult.provider) {
-		context.recordDispatch({
+		record({
 			provider: "none",
 			model: "none",
 			taskId: task.id,
@@ -876,7 +919,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			workingContainerName: context.workingContainerName,
 		});
 	} catch (error) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -904,7 +947,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 	});
 
 	if (waited.state !== "done") {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -927,7 +970,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 	try {
 		jobResult = await context.orchestrator.result(jobId);
 	} catch (error) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -944,7 +987,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 	if (!jobResult?.success) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -975,7 +1018,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 	}
 
 	if (!diff && task.requiredPaths === null) {
-		context.recordDispatch({
+		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -1019,7 +1062,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		}
 	}
 
-	context.recordDispatch({
+	record({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,

@@ -27,7 +27,7 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | **Source modules** | |
 | `src/switchyard/router/index.mjs` | Provider selection: snapshot-backed spread routing, blind fallback, INV-4 compliance. |
 | `src/switchyard/router/scorer.mjs` | Capacity scoring: FNV-1a hash, mulberry32 PRNG, deterministic jitter. |
-| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter. |
+| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter, now loaded from SWITCHYARD_ROSTER_PATH (roster.json, lazy-loaded + memoized). Preserves all pre-roster exports for backward-compatible caller interface. Dispatch records include provenance: roster identity (schema version + routing-stable sha) + resolved target/harness/selector. |
 | `src/switchyard/roster/classifier.mjs` | Keyword-based task-tier classifier (high/standard/low). |
 | `src/switchyard/container/index.mjs` | Standing **agent** container lifecycle (Docker start/stop/exec). Wired into the runner's dispatch path; its image is the base every working container is built from. Also owns `getPlatformInfo()`: host-vs-image Docker architecture comparison (Node `os.arch()` naming normalized against Docker's before comparing, so an amd64 host running an amd64 image doesn't false-positive a mismatch), surfaced as `platformInfo` in the dispatch status/result envelope; documents its own Rosetta limitation. |
 | `src/switchyard/lifecycle/index.mjs` | **Working** container lifecycle, wired into the runner's real dispatch path: builds each per-project container `FROM ${AGENT_IMAGE}` on a Docker-managed `/project` volume (no host bind — INV-1), provisions all six providers' credential files container→container, **seeds** the container from the host repo's committed tree so `captureDiff` has a baseline (`seedProject`), **commits** the container baseline between queued tasks so multi-task diffs stay isolated (`commitWorkingTree`), and wipes at project end (INV-3). The sole surviving implementation after `sandbox/index.mjs` was deleted. |
@@ -83,6 +83,13 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | `tests/detached-dispatch.test.mjs` | End-to-end `launch`/`status`/`result`/`recover` CLI regression: nonce and host-fingerprint verification, terminal-state project-lock release, `recover` reclaiming stale locks from dead/terminal runs via `isWorkerLive` without touching a lock owned by a different currently-active run, the `status`/`result` envelope's `workerLive`/`activeTaskProvider`/`activeTaskModel`/`activeTaskDeadline` fields for live, ghost (dead pid), and non-running runs, and `--exclude-provider` working identically on the foreground and detached worker paths. |
 | `tests/lifecycle-recovery.test.mjs` | `recoverManagedObjects` crash-matrix regression: 5 crash points (pre-claim, pre-container, post-create, mid-integration, mid-cleanup), orphaned container/volume reclamation, bounded recovery. |
 | `tests/diagnostics.test.mjs` | `Diagnostics` event/error serialization: allowlisted field extraction, `SECRET_CANARY_` redaction, async `emit()` resolving once every sink has settled (a synchronously-throwing sink can't skip the rest). |
+| `tests/roster-loader.test.mjs` | Roster loader fail-loud path resolution (missing env var, missing file, malformed JSON, structural contract violations) and preserved interface against a committed synthetic fixture. |
+| `tests/fixtures/roster.fixture.json` | Synthetic test roster with 7 providers, varying capability/qualification/enabled states, used by roster-loader.test.mjs and other roster-aware tests. |
+| `tests/provenance.test.mjs` | Dispatch provenance: `computeRosterSha` pure-function properties (excludes qualifications, reflects catalog/target changes), six-field provenance attachment on all dispatch paths, roster sha stability across simulated smoke runs, `recordDispatchToStore` parity. |
+| `tests/router-rightsizing.test.mjs` | Router INV-5 property tests through `route()`: right-sized models per tier, capability filter preventing sub-tier routing even with headroom advantage. |
+| `tests/harness-registry-drift.test.mjs` | Drift regression: every enabled ~/.agent/roster.json target names a registered harness adapter (one per file under `src/switchyard/adapter/*.mjs`). Scope: only enabled targets; reads real roster file. |
+| `tests/router-usage-provider.test.mjs` | Mapping regression: every enabled ~/.agent/roster.json target's `usage_provider` (or `harness` default) normalizes to a gradus provider name. Reads real roster file against committed GRADUS_PROVIDER_DISPLAY_NAMES. |
+| `tests/runner-adapter-harness.test.mjs` | SelectAdapter must normalize provider display name to harness key before adapter lookup (regression: display name "OpenCode Go" → harness "opencode" → adapter invocation, not unsupported_provider). |
 
 ## Planning artifacts
 
@@ -256,6 +263,7 @@ It recovers `projectPath` for the pre-`projectPath` lock shape from the run's ow
 
 ### Environment Variables
 
+- `SWITCHYARD_ROSTER_PATH`: Path to `roster.json` — the canonical provider/harness capability roster file. Required; fail-loud on unset. Typically points to `~/.agent/roster.json` in production. No configured install-path fallback (switchyard must not hardcode an external roster location into its own source).
 - `SWITCHYARD_ORCHESTRATOR_CMD`: Path to executable command (e.g. `switchyard-orchestrator`) for external job supervision when using `createCliOrchestrator`. If the orchestrator cannot run a task on the selected provider, the task remains incomplete and will retry against the same provider on every resume (no capability-discovery protocol exists to break the retry loop).
 
 ## Conventions

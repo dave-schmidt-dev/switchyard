@@ -15,9 +15,10 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import {
 	createCliOrchestrator,
@@ -34,6 +35,18 @@ import {
 } from "../src/switchyard/runner/index.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-runner-test");
+// Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
+// lazily loads SWITCHYARD_ROSTER_PATH and fails loud if it's unset. Most of
+// this file's tests inject `dependencies.route` and never touch the roster
+// at all, but the two tests explicitly noted as exercising the real,
+// unmocked route() do reach it — point them at this committed synthetic
+// fixture (not the real ~/.agent/roster.json) so they keep passing.
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const ROSTER_FIXTURE_PATH = resolve(
+	__dirname,
+	"fixtures",
+	"roster.fixture.json",
+);
 
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
@@ -1037,6 +1050,8 @@ describe("runner provider spread recording", () => {
 
 		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
+		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
 
 		try {
 			writeSnapshot(72, 60);
@@ -1086,6 +1101,11 @@ describe("runner provider spread recording", () => {
 			} else {
 				process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = previousOverride;
 			}
+			if (previousRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+			}
 			try {
 				rmSync(snapshotPath, { force: true });
 			} catch {
@@ -1117,6 +1137,8 @@ describe("runner provider spread recording", () => {
 
 		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
+		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
 
 		try {
 			writeFileSync(
@@ -1170,6 +1192,11 @@ describe("runner provider spread recording", () => {
 				delete process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 			} else {
 				process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = previousOverride;
+			}
+			if (previousRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
 			}
 			try {
 				rmSync(snapshotPath, { force: true });

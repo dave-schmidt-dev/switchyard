@@ -1,0 +1,528 @@
+// Task 1.6 (roster-unification plan), M7/M8: dispatch provenance.
+//
+// Every dispatch record carries six provenance fields — roster_schema_version,
+// roster_sha256, resolved_target, resolved_harness, resolved_selector,
+// resolved_credential_profile — so a ledger entry is self-describing: which
+// roster (identity + version) routed it, and to which concrete
+// target/harness/selector/credential profile. This suite proves:
+//   1. computeRosterSha is a PURE function that EXCLUDES the mutable
+//      qualifications block (PM-12/SR-4) but still reflects real catalog/target
+//      changes — tested by comparing two in-memory objects, not by fighting the
+//      loader cache (advisor guidance);
+//   2. executeTask attaches all six fields to EVERY dispatch record, on both
+//      the success and the unsupported_provider paths (no record can omit them);
+//   3. the roster sha is stable across a simulated `roster smoke` write-back at
+//      the loader level (flip a qualification -> same sha), and moves for a real
+//      change (control);
+//   4. recordDispatchToStore preserves the provenance fields for parity with the
+//      default file ledger.
+
+import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { after, afterEach, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import {
+	readLedgerFromStore,
+	recordDispatchToStore,
+} from "../src/switchyard/ledger/index.mjs";
+import {
+	__resetRosterCacheForTests,
+	computeRosterSha,
+	getRosterProvenance,
+	resolveRouteProvenance,
+	resolveTargetProvenance,
+} from "../src/switchyard/roster/index.mjs";
+import {
+	executeTask,
+	executeTaskWithOrchestrator,
+} from "../src/switchyard/runner/index.mjs";
+
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
+
+const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+let tmpDir;
+
+function setRosterPath(value) {
+	if (value === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+	else process.env.SWITCHYARD_ROSTER_PATH = value;
+	__resetRosterCacheForTests();
+}
+
+before(() => {
+	setRosterPath(FIXTURE_PATH);
+});
+
+afterEach(() => {
+	if (tmpDir) {
+		rmSync(tmpDir, { recursive: true, force: true });
+		tmpDir = undefined;
+	}
+	setRosterPath(FIXTURE_PATH);
+});
+
+after(() => {
+	if (previousRosterPath === undefined)
+		delete process.env.SWITCHYARD_ROSTER_PATH;
+	else process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+	__resetRosterCacheForTests();
+});
+
+const PROVENANCE_KEYS = [
+	"roster_schema_version",
+	"roster_sha256",
+	"resolved_target",
+	"resolved_harness",
+	"resolved_selector",
+	"resolved_credential_profile",
+];
+
+function makeContext({ provider, model, adapters }) {
+	const dispatches = [];
+	return {
+		context: {
+			route: () => ({
+				provider,
+				model,
+				percentLeft: 50,
+				reason: "spread",
+				log: [],
+			}),
+			adapters: adapters ?? {},
+			recordDispatch: (d) => dispatches.push(d),
+			integrationGate: () => ({ success: true }),
+			projectPath: "/tmp/does-not-matter",
+			workingContainerName: "test-container",
+			exclude: [],
+		},
+		dispatches,
+	};
+}
+
+const TASK = {
+	id: "T-1",
+	title: "trivial task",
+	description: "trivial task",
+	prompt: "do the thing",
+	requiredPaths: null,
+};
+
+describe("computeRosterSha — pure, excludes qualifications (PM-12/SR-4)", () => {
+	// Two rosters identical except for the mutable qualifications block.
+	const base = {
+		schema_version: 1,
+		models: { "p/m": { selector: "p-m", status: "active" } },
+		targets: {
+			t: {
+				harness: "p",
+				enabled: true,
+				slots: { low: [{ model_ref: "p/m", priority: 1 }] },
+				qualifications: { "p-m": { status: "untested" } },
+			},
+		},
+	};
+
+	it("returns the SAME hash when only qualifications differ (smoke write-back is invisible)", () => {
+		const flipped = structuredClone(base);
+		flipped.targets.t.qualifications["p-m"].status = "qualified";
+		flipped.targets.t.qualifications["p-m"].last_smoke = "2026-07-31T00:00:00Z";
+		strictEqual(computeRosterSha(base), computeRosterSha(flipped));
+	});
+
+	it("returns a DIFFERENT hash when a real (non-qualification) field changes", () => {
+		const changed = structuredClone(base);
+		changed.targets.t.slots.low[0].priority = 2; // a genuine routing change
+		notStrictEqual(computeRosterSha(base), computeRosterSha(changed));
+	});
+
+	it("is order-independent over object keys (canonicalized) but not over arrays", () => {
+		const reordered = {
+			targets: base.targets,
+			schema_version: 1,
+			models: base.models,
+		};
+		strictEqual(computeRosterSha(base), computeRosterSha(reordered));
+	});
+
+	it("produces a 64-char hex sha256 string", () => {
+		const sha = computeRosterSha(base);
+		strictEqual(typeof sha, "string");
+		ok(/^[0-9a-f]{64}$/.test(sha), `expected 64-char hex, got ${sha}`);
+	});
+});
+
+describe("resolveTargetProvenance / resolveRouteProvenance — target resolution", () => {
+	it("resolves the enabled target, harness, and tier-right-sized selector", () => {
+		deepStrictEqual(resolveTargetProvenance("OpenCode Go", "low"), {
+			resolved_target: "opencode-go",
+			resolved_harness: "opencode",
+			resolved_selector: "fixture/opencode-low",
+			// credential_profile is carried as metadata (M1b) but never passed to
+			// the adapter — the fixture's opencode-go target uses profile "go".
+			resolved_credential_profile: "go",
+		});
+	});
+
+	it("returns a null target/selector but the normalized harness for an unbacked provider", () => {
+		deepStrictEqual(resolveTargetProvenance("Totally Unknown", "low"), {
+			resolved_target: null,
+			resolved_harness: "totally unknown",
+			resolved_selector: null,
+			resolved_credential_profile: null,
+		});
+	});
+
+	it("resolveRouteProvenance returns all six fields with the roster identity", () => {
+		const prov = resolveRouteProvenance("OpenCode Go", "low");
+		strictEqual(prov.roster_schema_version, 1);
+		ok(/^[0-9a-f]{64}$/.test(prov.roster_sha256));
+		strictEqual(prov.resolved_target, "opencode-go");
+		strictEqual(prov.resolved_harness, "opencode");
+		strictEqual(prov.resolved_selector, "fixture/opencode-low");
+	});
+
+	it("resolves the ENABLED target when two targets share one harness (production shape: opencode-go/opencode-zen)", () => {
+		// findTargetEntryForHarness's whole reason for existing: the real roster
+		// has exactly this shape (opencode-go enabled, opencode-zen disabled, both
+		// harness "opencode"), and its docstring cites that case directly. The
+		// committed fixture never models two same-harness targets, so nothing
+		// proves resolveTargetProvenance actually picks the enabled one rather
+		// than, say, the first one found by object-key order (which would be
+		// wrong if the disabled target happened to be declared first).
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		const path = join(tmpDir, "shared-harness.json");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"fixture/opencode-zen-low": {
+						selector: "fixture-opencode-zen-low",
+						status: "active",
+					},
+					"fixture/opencode-go-low": {
+						selector: "fixture-opencode-go-low",
+						status: "active",
+					},
+				},
+				targets: {
+					// Declared BEFORE the enabled target, so a naive "first match wins"
+					// implementation would pick this one and fail the assertion below.
+					"opencode-zen": {
+						harness: "opencode",
+						enabled: false,
+						credential_profile: "zen",
+						qualifications: {
+							"fixture-opencode-zen-low": { status: "qualified" },
+						},
+						slots: {
+							low: [{ model_ref: "fixture/opencode-zen-low", priority: 1 }],
+						},
+					},
+					"opencode-go": {
+						harness: "opencode",
+						enabled: true,
+						credential_profile: "go",
+						qualifications: {
+							"fixture-opencode-go-low": { status: "qualified" },
+						},
+						slots: {
+							low: [{ model_ref: "fixture/opencode-go-low", priority: 1 }],
+						},
+					},
+				},
+			}),
+			"utf8",
+		);
+		setRosterPath(path);
+
+		deepStrictEqual(resolveTargetProvenance("OpenCode", "low"), {
+			resolved_target: "opencode-go",
+			resolved_harness: "opencode",
+			resolved_selector: "fixture-opencode-go-low",
+			resolved_credential_profile: "go",
+		});
+	});
+
+	it("degrades every field to null (never throws) when the roster is unavailable", () => {
+		setRosterPath(undefined); // env unset -> loader throws internally
+		const prov = resolveRouteProvenance("OpenCode Go", "low");
+		deepStrictEqual(prov, {
+			roster_schema_version: null,
+			roster_sha256: null,
+			resolved_target: null,
+			resolved_harness: null,
+			resolved_selector: null,
+			resolved_credential_profile: null,
+		});
+	});
+});
+
+describe("executeTask — every dispatch record carries all six provenance fields", () => {
+	it("carries provenance on the SUCCESS path (opencode-go via its adapter)", () => {
+		let executed = 0;
+		const { context, dispatches } = makeContext({
+			provider: "OpenCode Go",
+			model: "fixture/opencode-low",
+			adapters: {
+				opencode: {
+					execute: () => {
+						executed += 1;
+						return { success: true };
+					},
+					captureDiff: () => "",
+				},
+			},
+		});
+
+		const result = executeTask(TASK, context);
+		strictEqual(executed, 1);
+		strictEqual(result.result, "success_no_diff");
+
+		strictEqual(dispatches.length, 1);
+		const rec = dispatches[0];
+		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.roster_schema_version, 1);
+		ok(/^[0-9a-f]{64}$/.test(rec.roster_sha256));
+		strictEqual(rec.resolved_target, "opencode-go");
+		strictEqual(rec.resolved_harness, "opencode");
+		// credential_profile metadata (M1b) is recorded on the dispatch, not
+		// passed to the adapter.
+		strictEqual(rec.resolved_credential_profile, "go");
+	});
+
+	it("carries provenance on the UNSUPPORTED_PROVIDER path too (no record can omit it)", () => {
+		// Claude normalizes to harness "claude" but no adapter is registered ->
+		// unsupported_provider. The record must still carry provenance.
+		const { context, dispatches } = makeContext({
+			provider: "Claude",
+			model: "fixture-claude-high",
+			adapters: {},
+		});
+
+		const result = executeTask(TASK, context);
+		strictEqual(result.result, "unsupported_provider");
+
+		const rec = dispatches[0];
+		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.resolved_target, "claude-code");
+		strictEqual(rec.resolved_harness, "claude");
+		// claude-code is qualified at every tier, so the selector is a real claude
+		// selector regardless of the classified tier.
+		ok(
+			typeof rec.resolved_selector === "string" &&
+				rec.resolved_selector.startsWith("fixture-claude-"),
+			`expected a claude selector, got ${rec.resolved_selector}`,
+		);
+	});
+
+	it("attaches the six fields onto routeResult itself", () => {
+		// Hold a reference to the exact object route() returns; executeTask does
+		// Object.assign(routeResult, provenance) on it, so after the call the
+		// provenance must be visible on this same object.
+		const routeResultObj = {
+			provider: "OpenCode Go",
+			model: "fixture/opencode-low",
+			percentLeft: 50,
+			reason: "spread",
+			log: [],
+		};
+		const context = {
+			route: () => routeResultObj,
+			adapters: {
+				opencode: {
+					execute: () => ({ success: true }),
+					captureDiff: () => "",
+				},
+			},
+			recordDispatch: () => {},
+			integrationGate: () => ({ success: true }),
+			projectPath: "/tmp/x",
+			workingContainerName: "c",
+			exclude: [],
+		};
+		executeTask(TASK, context);
+		for (const key of PROVENANCE_KEYS) {
+			ok(key in routeResultObj, `routeResult missing ${key}`);
+		}
+		strictEqual(routeResultObj.resolved_target, "opencode-go");
+		strictEqual(routeResultObj.resolved_harness, "opencode");
+		strictEqual(routeResultObj.resolved_credential_profile, "go");
+	});
+});
+
+function makeOrchestratorContext({
+	provider,
+	model,
+	orchestratorOverrides = {},
+}) {
+	const dispatches = [];
+	return {
+		context: {
+			route: () => ({
+				provider,
+				model,
+				percentLeft: 50,
+				reason: "spread",
+				log: [],
+			}),
+			recordDispatch: (d) => dispatches.push(d),
+			integrationGate: () => ({ success: true }),
+			projectPath: "/tmp/does-not-matter",
+			workingContainerName: "test-container",
+			exclude: [],
+			orchestrator: {
+				launch: async () => "job-1",
+				status: async () => ({ state: "done" }),
+				result: async () => ({ success: true, diff: "" }),
+				...orchestratorOverrides,
+			},
+		},
+		dispatches,
+	};
+}
+
+// executeTaskWithOrchestrator (Task 1.6, M7/M8) duplicates executeTask's
+// provenance-wiring shape verbatim (resolve once via resolveRouteProvenance,
+// Object.assign onto routeResult, route every record() call through it) but
+// is a fully separate code path — nothing above exercises it. A regression
+// that broke provenance ONLY on the orchestrator path (e.g. someone editing
+// one record() wrapper but not the other) would pass every test above and
+// go undetected without this.
+describe("executeTaskWithOrchestrator — every dispatch record carries all six provenance fields", () => {
+	it("carries provenance on the SUCCESS path (opencode-go via the orchestrator)", async () => {
+		const { context, dispatches } = makeOrchestratorContext({
+			provider: "OpenCode Go",
+			model: "fixture/opencode-low",
+		});
+
+		const result = await executeTaskWithOrchestrator(TASK, context);
+		strictEqual(result.result, "success_no_diff");
+
+		strictEqual(dispatches.length, 1);
+		const rec = dispatches[0];
+		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.roster_schema_version, 1);
+		ok(/^[0-9a-f]{64}$/.test(rec.roster_sha256));
+		strictEqual(rec.resolved_target, "opencode-go");
+		strictEqual(rec.resolved_harness, "opencode");
+		strictEqual(rec.resolved_credential_profile, "go");
+	});
+
+	it("carries provenance on the launch_failed path (an early record() call site)", async () => {
+		// The orchestrator path has record() call sites the adapter path doesn't
+		// (launch/poll/result failures). This is the earliest one — proves
+		// provenance is resolved and attached BEFORE the launch is even attempted,
+		// not bolted on only at the success tail.
+		const { context, dispatches } = makeOrchestratorContext({
+			provider: "Claude",
+			model: "fixture-claude-high",
+			orchestratorOverrides: {
+				launch: async () => {
+					throw new Error("orchestrator unreachable");
+				},
+			},
+		});
+
+		const result = await executeTaskWithOrchestrator(TASK, context);
+		strictEqual(result.result, "launch_failed");
+
+		strictEqual(dispatches.length, 1);
+		const rec = dispatches[0];
+		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.resolved_target, "claude-code");
+		strictEqual(rec.resolved_harness, "claude");
+		ok(
+			typeof rec.resolved_selector === "string" &&
+				rec.resolved_selector.startsWith("fixture-claude-"),
+			`expected a claude selector, got ${rec.resolved_selector}`,
+		);
+		ok(
+			typeof rec.resolved_credential_profile === "string" &&
+				rec.resolved_credential_profile.length > 0,
+			`expected a credential profile, got ${rec.resolved_credential_profile}`,
+		);
+	});
+});
+
+describe("roster_sha256 is stable across a simulated `roster smoke` write-back", () => {
+	it("flipping a qualification in the on-disk roster does not move the loader-computed sha", () => {
+		// Baseline sha from the committed fixture.
+		setRosterPath(FIXTURE_PATH);
+		const shaBefore = getRosterProvenance().roster_sha256;
+
+		// Simulate a smoke write-back: read the fixture, flip a qualification
+		// status (and stamp a timestamp, as smoke does), write to a temp path.
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+		roster.targets["opencode-go"].qualifications["fixture/opencode-standard"] =
+			{
+				status: "qualified",
+				last_smoke: "2026-07-31T12:00:00Z",
+			};
+		roster.targets["claude-code"].qualifications["fixture-claude-high"].status =
+			"qualified";
+		const writtenBack = join(tmpDir, "roster.smoke.json");
+		writeFileSync(writtenBack, JSON.stringify(roster, null, 2), "utf8");
+
+		setRosterPath(writtenBack);
+		const shaAfter = getRosterProvenance().roster_sha256;
+
+		strictEqual(
+			shaAfter,
+			shaBefore,
+			"qualification write-back must not move the sha",
+		);
+	});
+
+	it("changing a real routing field DOES move the loader-computed sha (control)", () => {
+		setRosterPath(FIXTURE_PATH);
+		const shaBefore = getRosterProvenance().roster_sha256;
+
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+		roster.targets["opencode-go"].slots.low[0].priority = 99; // real change
+		const changed = join(tmpDir, "roster.changed.json");
+		writeFileSync(changed, JSON.stringify(roster, null, 2), "utf8");
+
+		setRosterPath(changed);
+		const shaAfter = getRosterProvenance().roster_sha256;
+
+		notStrictEqual(shaAfter, shaBefore);
+	});
+});
+
+describe("recordDispatchToStore — provenance parity with the file ledger", () => {
+	it("preserves the six provenance fields written into a store-backed ledger", async () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-store-"));
+		const provenance = {
+			roster_schema_version: 1,
+			roster_sha256: "a".repeat(64),
+			resolved_target: "opencode-go",
+			resolved_harness: "opencode",
+			resolved_selector: "fixture/opencode-low",
+			resolved_credential_profile: "go",
+		};
+		await recordDispatchToStore(
+			{
+				provider: "OpenCode Go",
+				model: "fixture/opencode-low",
+				taskId: "T-store",
+				result: "success",
+				...provenance,
+			},
+			tmpDir,
+		);
+
+		const entries = await readLedgerFromStore(tmpDir);
+		strictEqual(entries.length, 1);
+		for (const key of PROVENANCE_KEYS)
+			ok(key in entries[0], `store entry missing ${key}`);
+		strictEqual(entries[0].resolved_target, "opencode-go");
+		strictEqual(entries[0].resolved_harness, "opencode");
+		strictEqual(entries[0].roster_schema_version, 1);
+		strictEqual(entries[0].resolved_credential_profile, "go");
+	});
+});

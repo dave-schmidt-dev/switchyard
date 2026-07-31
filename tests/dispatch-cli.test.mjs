@@ -37,6 +37,18 @@ const DISPATCH_PATH = resolve(
 	"dispatch",
 	"index.mjs",
 );
+// Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
+// lazily loads SWITCHYARD_ROSTER_PATH and fails loud if it's unset. This
+// file's `launch` subcommand spawns a detached worker that eventually
+// reaches the real, unmocked router/roster on the way to routing a task —
+// point at this committed synthetic fixture (not the real
+// ~/.agent/roster.json) so a background routing failure can't leak into
+// this suite as stray errors or a stuck run.
+const ROSTER_FIXTURE_PATH = resolve(
+	__dirname,
+	"fixtures",
+	"roster.fixture.json",
+);
 
 import {
 	parseDispatchArgs,
@@ -98,10 +110,16 @@ beforeEach(async () => {
 
 	// Set env var so direct run-store calls in tests target the temp dir
 	process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+	process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
+	// Real dispatch subprocesses go through the real, unmocked ledger writer —
+	// redirect it so this suite never writes to the real dispatch-ledger.jsonl.
+	process.env.SWITCHYARD_LEDGER_PATH = join(dir, "dispatch-ledger.jsonl");
 });
 
 afterEach(() => {
 	delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+	delete process.env.SWITCHYARD_ROSTER_PATH;
+	delete process.env.SWITCHYARD_LEDGER_PATH;
 	rmSync(dir, { recursive: true, force: true });
 });
 

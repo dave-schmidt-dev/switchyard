@@ -56,6 +56,17 @@ const BOOTSTRAP_PATH = resolve(
 	"dispatch",
 	"worker-bootstrap.mjs",
 );
+// Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
+// lazily loads SWITCHYARD_ROSTER_PATH and fails loud if it's unset. This
+// file's real dispatch subprocesses (and the detached workers they spawn)
+// go through the real, unmocked router/roster on the way to routing a task,
+// so every spawned process needs a valid roster — point at this committed
+// synthetic fixture (not the real ~/.agent/roster.json).
+const ROSTER_FIXTURE_PATH = resolve(
+	__dirname,
+	"fixtures",
+	"roster.fixture.json",
+);
 
 function runDispatch(args, env = {}) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
@@ -97,10 +108,16 @@ beforeEach(async () => {
 	mkdirSync(join(projectDir, ".git"), { recursive: true });
 
 	process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+	process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
+	// Real dispatch subprocesses go through the real, unmocked ledger writer —
+	// redirect it so this suite never writes to the real dispatch-ledger.jsonl.
+	process.env.SWITCHYARD_LEDGER_PATH = join(dir, "dispatch-ledger.jsonl");
 });
 
 afterEach(() => {
 	delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+	delete process.env.SWITCHYARD_ROSTER_PATH;
+	delete process.env.SWITCHYARD_LEDGER_PATH;
 	rmSync(dir, { recursive: true, force: true });
 });
 

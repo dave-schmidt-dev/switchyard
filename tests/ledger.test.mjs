@@ -17,6 +17,22 @@ const _ORIGINAL_LOG_DIR = join(
 	".switchyard-ledger-backup",
 );
 
+// recordDispatch()/readLedger() (exercised below, including the "backward
+// compat" case) default to the real ~/.logs/switchyard/dispatch-ledger.jsonl.
+// Redirect for the whole file so this suite never writes to the real ledger.
+before(() => {
+	mkdirSync(TEST_LEDGER_DIR, { recursive: true });
+	process.env.SWITCHYARD_LEDGER_PATH = join(
+		TEST_LEDGER_DIR,
+		"dispatch-ledger.jsonl",
+	);
+});
+
+after(() => {
+	delete process.env.SWITCHYARD_LEDGER_PATH;
+	rmSync(TEST_LEDGER_DIR, { recursive: true, force: true });
+});
+
 describe("ledger", () => {
 	before(() => {
 		// Ensure clean state
@@ -69,6 +85,8 @@ describe("ledger", () => {
 	});
 
 	it("should record multiple dispatches", () => {
+		const before = readLedger().length;
+
 		recordDispatch({
 			provider: "codex",
 			model: "gpt-5.6-sol",
@@ -85,7 +103,9 @@ describe("ledger", () => {
 		});
 
 		const entries = readLedger();
-		ok(entries.length >= 3, "ledger has at least 3 entries");
+		strictEqual(entries.length, before + 2, "two new dispatches were appended");
+		strictEqual(entries[entries.length - 2].taskId, "task-002");
+		strictEqual(entries[entries.length - 1].taskId, "task-003");
 	});
 });
 
@@ -136,6 +156,8 @@ describe("ledger run-store backed", () => {
 	});
 
 	it("readLedgerFromStore reads entries back", async () => {
+		const before = (await readLedgerFromStore(STORE_DIR)).length;
+
 		await recordDispatchToStore(
 			{
 				provider: "codex",
@@ -147,7 +169,7 @@ describe("ledger run-store backed", () => {
 		);
 
 		const entries = await readLedgerFromStore(STORE_DIR);
-		ok(entries.length >= 2, "has at least 2 entries");
+		strictEqual(entries.length, before + 1, "one new entry was appended");
 	});
 
 	it("project-local ledger path is under ledger/dispatch-ledger.jsonl", async () => {

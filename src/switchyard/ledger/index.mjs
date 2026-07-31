@@ -4,18 +4,32 @@
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { getStateRoot } from "../run-store/index.mjs";
 
-const LOG_DIR = join(homedir(), ".logs", "switchyard");
-const LEDGER_PATH = join(LOG_DIR, "dispatch-ledger.jsonl");
+const DEFAULT_LEDGER_PATH = join(
+	homedir(),
+	".logs",
+	"switchyard",
+	"dispatch-ledger.jsonl",
+);
+
+/**
+ * Resolve the legacy ledger file path, honoring SWITCHYARD_LEDGER_PATH for
+ * test isolation (mirrors SWITCHYARD_ROSTER_PATH / SWITCHYARD_RUN_STORE_ROOT).
+ * Read lazily (not cached at module load) so tests can redirect it per-run.
+ */
+function resolveLegacyLedgerPath() {
+	const envOverride = process.env.SWITCHYARD_LEDGER_PATH;
+	return envOverride ? resolve(envOverride) : DEFAULT_LEDGER_PATH;
+}
 
 /**
  * Ensure log directory exists.
  */
 function ensureLogDir() {
 	try {
-		mkdirSync(LOG_DIR, { recursive: true });
+		mkdirSync(dirname(resolveLegacyLedgerPath()), { recursive: true });
 	} catch (error) {
 		if (error?.code !== "EEXIST") {
 			throw error;
@@ -44,7 +58,11 @@ export function recordDispatch(dispatch) {
 		...dispatch,
 	};
 
-	appendFileSync(LEDGER_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+	appendFileSync(
+		resolveLegacyLedgerPath(),
+		`${JSON.stringify(entry)}\n`,
+		"utf8",
+	);
 }
 
 /**
@@ -53,7 +71,7 @@ export function recordDispatch(dispatch) {
  */
 export function readLedger() {
 	try {
-		const content = readFileSync(LEDGER_PATH, "utf8");
+		const content = readFileSync(resolveLegacyLedgerPath(), "utf8");
 		const entries = [];
 		for (const line of content.split("\n")) {
 			if (line.trim() === "") continue;
