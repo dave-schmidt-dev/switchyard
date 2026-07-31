@@ -27,13 +27,14 @@ A containment-first Node.js dispatcher that routes coding tasks across subscript
 | **Source modules** | |
 | `src/switchyard/router/index.mjs` | Provider selection: snapshot-backed spread routing, blind fallback, INV-4 compliance. |
 | `src/switchyard/router/scorer.mjs` | Capacity scoring: FNV-1a hash, mulberry32 PRNG, deterministic jitter. |
-| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter, now loaded from SWITCHYARD_ROSTER_PATH (roster.json, lazy-loaded + memoized). Preserves all pre-roster exports for backward-compatible caller interface. Dispatch records include provenance: roster identity (schema version + routing-stable sha) + resolved target/harness/selector. |
+| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter, now loaded from SWITCHYARD_ROSTER_PATH (roster.json, lazy-loaded + memoized). Preserves all pre-roster exports for backward-compatible caller interface. Dispatch records include provenance: roster identity (schema version + routing-stable sha) + resolved target/harness/selector. Low-tier lane eligibility (e.g. `opencode-go`) is entirely roster-driven through `passesCapabilityFilter` — there is no separate hardcoded spread ratio; INV-4's most-headroom spread still governs *which* eligible lane wins, cost never overrides it. `passesCapabilityFilter` throws on an unrecognized task tier rather than silently treating it as the lowest tier. |
 | `src/switchyard/roster/classifier.mjs` | Keyword-based task-tier classifier (high/standard/low). |
 | `src/switchyard/container/index.mjs` | Standing **agent** container lifecycle (Docker start/stop/exec). Wired into the runner's dispatch path; its image is the base every working container is built from. Also owns `getPlatformInfo()`: host-vs-image Docker architecture comparison (Node `os.arch()` naming normalized against Docker's before comparing, so an amd64 host running an amd64 image doesn't false-positive a mismatch), surfaced as `platformInfo` in the dispatch status/result envelope; documents its own Rosetta limitation. |
 | `src/switchyard/lifecycle/index.mjs` | **Working** container lifecycle, wired into the runner's real dispatch path: builds each per-project container `FROM ${AGENT_IMAGE}` on a Docker-managed `/project` volume (no host bind — INV-1), provisions all six providers' credential files container→container, **seeds** the container from the host repo's committed tree so `captureDiff` has a baseline (`seedProject`), **commits** the container baseline between queued tasks so multi-task diffs stay isolated (`commitWorkingTree`), and wipes at project end (INV-3). The sole surviving implementation after `sandbox/index.mjs` was deleted. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, `allowSensitiveManifests`-gated review for build/CI manifests, `git apply` via stdin. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): JSONL append of provider/model/result per task. |
 | `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateModelArg`) used by all six provider adapters. |
+| `src/switchyard/adapter/exec-error.mjs` | `describeExecError()`: turns a thrown `execFileSync` error from a NON-timeout provider failure into a diagnosable result — surfaces the provider CLI's own captured stdout/stderr instead of Node's generic "Command failed: docker exec…" wrapper, and recognizes an expired/failed auth session as a distinct `errorKind: "auth_expired"` with an actionable `docker exec -it` re-auth hint (`reauthHintFor`). Used by all six adapters' catch blocks; the timeout path is untouched (keeps `error.message` so `ETIMEDOUT` still classifies correctly). |
 | `src/switchyard/adapter/constants.mjs` | `PROVIDER_EXECUTION_TIMEOUT_MS` (30 minutes) — the shared host-side `execFileSync` kill timeout used by all six adapters as a default, overridable per task via `- **Timeout:**`; centralized so `runner/index.mjs` can compute an accurate `task_routed` deadline instead of drifting from a value duplicated per adapter. |
 | `src/switchyard/adapter/orphan-kill.mjs` | Best-effort in-container process cleanup after a host-side `ETIMEDOUT`: `docker exec` does not forward host signals into the container's PID namespace, so each adapter calls this to kill whatever it started (`kill -TERM -1` then `kill -KILL -1`, sparing PID 1 — the container's keep-alive process) before the runner captures a diff. |
 | `src/switchyard/adapter/claude.mjs` | Claude CLI adapter: dispatch (prompt over stdin), diff capture, real credential check (`/root/.claude/.credentials.json`, persisted by `claude auth login`). |
@@ -156,7 +157,9 @@ The thin CLI wraps `runQueue` for standalone use (the `--project` must be a git 
 ```bash
 npm run dispatch -- tasks.md --project /path/to/repo
 # options: --max-tasks <n>  --checkpoint <path>  --no-stop-on-failure
-#          --exclude-provider <name>  (repeatable — never route to this provider)
+#          --exclude-provider <name>  (repeatable — never route to this provider;
+#          matches case-insensitively against both lowercase harness keys, e.g. "claude",
+#          and the usage snapshot's title-cased provider names, e.g. "Claude")
 ```
 
 Or call it programmatically:
@@ -188,6 +191,8 @@ const orchSummary = await runQueueWithOrchestrator({
 Each task's `- **Files:**` field (comma-separated paths) is enforced at the integration gate: a diff that touches any path outside the declared allowlist — or fails to touch a declared path — is rejected, not silently accepted. A working tree is committed only on a task's success and reset on failure/rejection, so a bad diff never bleeds into the next task's baseline.
 
 Each task's optional `- **Timeout:**` field (e.g. `90m`, `45s`, `2h` — a unit suffix is required, same as `Files:` rejecting ambiguous input) overrides `PROVIDER_EXECUTION_TIMEOUT_MS` for that task only, bounded to [1s, 24h] as a typo guard rather than a policy cap.
+
+Each task's optional `- **Tier:**` field (`high` | `standard` | `low`) declares its INV-5 capability tier up front instead of leaving it to the keyword-based `classifier.mjs` heuristic. A declared tier always wins over classification; an unrecognized value fails loud (`parseTierField`/`resolveTaskTier`, `src/switchyard/runner/index.mjs`) rather than silently falling back to a guess. Omit the field to keep the previous classify-from-description behavior.
 
 ### Timeout Handling
 
