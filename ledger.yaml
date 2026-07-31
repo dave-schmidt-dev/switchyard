@@ -5,4 +5,30 @@ invariants:
   INV-3: {gate_test_status: covered}
   INV-4: {gate_test_status: covered}
   INV-5: {gate_test_status: covered}
-resolutions: {}                          # INV-x: {resolved_at_date: "YYYY-MM-DD", note: "..."}
+resolutions:
+  INV-1:
+    resolved_at_date: "2026-07-30"
+    note: >
+      Historical recurrence (4 tagged HISTORY entries, 2026-07-21 to 2026-07-26) mixed one
+      genuine violation with three adjacent/non-breach entries. The genuine one — a literal
+      host bind mount (-v /tmp/switchyard-work:/work) on the agent container — was removed;
+      tests/no-host-rights.test.mjs proves no working container carries a host bind mount. The
+      other three: an approved, documented sandbox posture (codex's
+      --dangerously-bypass-approvals-and-sandbox, required because nested unprivileged userns
+      is disallowed under Docker/OrbStack — the working container remains the containment
+      boundary), a working-container filesystem bug whose own fix note says "INV-1 intact", and
+      a stale-docs correction. Resolved by David 2026-07-30.
+  INV-2:
+    resolved_at_date: "2026-07-30"
+    note: >
+      Historical recurrence (5 tagged HISTORY entries, 2026-07-21 to 2026-07-26) included two
+      genuine, serious gate-bypass bugs: a CRITICAL non-ASCII/quoted-path bypass of the
+      sensitive-path filter (secrets reproducibly written to disk pre-fix) and a naive
+      content-substring blocklist trivially evaded by e.g. a malicious package.json script. Both
+      were fixed by rewriting validateDiff/applyReviewedDiff to parse diffs structurally via
+      `git apply --numstat`/`--summary` instead of scanning text, with regression tests
+      reproducing both exploits and confirming they fail closed post-fix
+      (tests/integration-gate.test.mjs). The other three tagged entries were tangential (a
+      write-blocked-before-reaching-the-gate bug, a dual-tagged sandbox-posture entry, a
+      missing-import crash) rather than gate bypasses. Resolved by David 2026-07-30.
+                          # INV-x: {resolved_at_date: "YYYY-MM-DD", note: "..."}
