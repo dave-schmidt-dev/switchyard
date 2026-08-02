@@ -421,6 +421,36 @@ describe("retention", () => {
 		strictEqual(deleted, 1);
 	});
 
+	it("dryRun reports maxAgeDays-eligible runs without deleting them", async () => {
+		const run = await createTerminalRun("dry-age");
+
+		const deleted = await applyRetention({
+			maxAgeDays: 0,
+			now: new Date(Date.now() + 86_400_000).toISOString(),
+			dryRun: true,
+		});
+		// Same count as the non-dryRun call above, but nothing was removed.
+		strictEqual(deleted, 1);
+
+		const r = await readRun(run.runId);
+		strictEqual(r.state, "succeeded");
+	});
+
+	it("dryRun reports maxRuns-eligible runs without deleting them", async () => {
+		const runs = [];
+		for (let i = 0; i < 3; i++) {
+			runs.push(await createTerminalRun(`dry-runs-${i}`));
+		}
+
+		const deleted = await applyRetention({ maxRuns: 1, dryRun: true });
+		strictEqual(deleted, 2);
+
+		for (const run of runs) {
+			const r = await readRun(run.runId);
+			strictEqual(r.state, "succeeded");
+		}
+	});
+
 	it("deletes nothing when no retention limits set", async () => {
 		await createTerminalRun("keep");
 		const deleted = await applyRetention({});

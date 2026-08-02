@@ -907,10 +907,13 @@ export async function releaseOrphanedProjectLocks() {
  * @param {number} [options.maxRuns] - maximum number of completed runs to keep
  * @param {number} [options.maxAgeDays] - maximum age in days for completed runs
  * @param {string} [options.now] - reference ISO timestamp (default: now)
- * @returns {Promise<number>} number of runs deleted
+ * @param {boolean} [options.dryRun] - log-only mode: report which runs WOULD be
+ *   reclaimed (on stderr, with the reason) without deleting anything. Never
+ *   calls `rm`; the returned count is the number of runs eligible for deletion.
+ * @returns {Promise<number>} number of runs deleted (or eligible, in dryRun)
  */
 export async function applyRetention(options = {}) {
-	const { maxRuns, maxAgeDays, now } = options;
+	const { maxRuns, maxAgeDays, now, dryRun } = options;
 	const referenceTime = now ? new Date(now).getTime() : Date.now();
 
 	let entries;
@@ -945,6 +948,13 @@ export async function applyRetention(options = {}) {
 		const cutoff = referenceTime - maxAgeDays * 86_400_000;
 		for (const r of eligible) {
 			if (r.createdAt < cutoff) {
+				if (dryRun) {
+					console.error(
+						`applyRetention: would delete run ${r.runId} (older than maxAgeDays cutoff)`,
+					);
+					deleted.add(r.runId);
+					continue;
+				}
 				try {
 					await rm(getRunRoot(r.runId), { recursive: true, force: true });
 					deleted.add(r.runId);
@@ -964,6 +974,13 @@ export async function applyRetention(options = {}) {
 	) {
 		const toDelete = remaining.slice(0, remaining.length - maxRuns);
 		for (const r of toDelete) {
+			if (dryRun) {
+				console.error(
+					`applyRetention: would delete run ${r.runId} (maxRuns trim)`,
+				);
+				deleted.add(r.runId);
+				continue;
+			}
 			try {
 				await rm(getRunRoot(r.runId), { recursive: true, force: true });
 				deleted.add(r.runId);

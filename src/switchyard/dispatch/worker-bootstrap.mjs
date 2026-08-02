@@ -148,13 +148,19 @@ try {
 		tasksFilePath: run.tasksFilePath,
 		projectPath: run.projectPath,
 		maxTasks: Number.POSITIVE_INFINITY,
-		stopOnFailure: true,
+		// Defensive fallback: a run record written before this field existed
+		// (or a hand-built fixture in a test) won't have stopOnFailure at all —
+		// default to true (stop on first failure), today's existing behavior.
+		stopOnFailure: run.stopOnFailure ?? true,
 		// Stamp the working container with this run's id so a leaked container
 		// is discoverable + liveness-checkable by `recover` (labeled branch).
 		runId,
 		// Defensive fallback: a run.json written before this field existed (or
 		// a hand-built fixture in a test) won't have excludeProviders at all.
 		exclude: run.excludeProviders ?? [],
+		// Defensive fallback: a run.json written before this field existed (or
+		// a hand-built fixture in a test) won't have onlyProviders at all.
+		only: run.onlyProviders ?? [],
 		dependencies: {
 			// These callbacks all use updateRunWithRetry rather than a
 			// read-then-updateRun(fixed revision) pair, and each one synchronously

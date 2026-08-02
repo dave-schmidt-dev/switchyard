@@ -45,6 +45,7 @@ import {
 	acquireProjectLock,
 	acquireRunLock,
 	advanceState,
+	applyRetention,
 	getRunRoot,
 	getStateRoot,
 	initializeRun,
@@ -77,6 +78,7 @@ Run/Launch options:
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
+  --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --help                 Show this help`;
 
 const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [options]
@@ -86,6 +88,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
+  --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --help                 Show this help`;
 
 const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <path> [options]
@@ -95,6 +98,7 @@ const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <pa
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
+  --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --help                 Show this help`;
 
 const USAGE_STATUS = `Usage: switchyard-dispatch status <run-id> [--json]
@@ -149,6 +153,8 @@ function parseDispatchArgs(argv) {
 				checkpoint: { type: "string" },
 				"no-stop-on-failure": { type: "boolean", default: false },
 				"exclude-provider": { type: "string", multiple: true },
+				"only-provider": { type: "string", multiple: true },
+				provider: { type: "string", multiple: true },
 				help: { type: "boolean", default: false },
 			},
 		});
@@ -199,6 +205,19 @@ function parseDispatchArgs(argv) {
 		}
 	}
 
+	const onlyProviders = [
+		...(values["only-provider"] ?? []),
+		...(values.provider ?? []),
+	];
+	if (
+		onlyProviders.length > 0 &&
+		(values["exclude-provider"] ?? []).length > 0
+	) {
+		throw new UsageError(
+			"--only-provider/--provider and --exclude-provider are mutually exclusive",
+		);
+	}
+
 	return {
 		help: false,
 		tasksFilePath: resolvedTasks,
@@ -207,6 +226,7 @@ function parseDispatchArgs(argv) {
 		checkpointPath: values.checkpoint ? resolve(values.checkpoint) : undefined,
 		stopOnFailure: !values["no-stop-on-failure"],
 		excludeProviders: values["exclude-provider"] ?? [],
+		onlyProviders,
 	};
 }
 
@@ -322,6 +342,24 @@ async function runDispatch(opts) {
 			console.error(`dispatch: pre-run sweep failed (${error.message})`);
 		});
 
+	// Retention sweep (Task D.5): dry-run only for this pass — logs what WOULD
+	// be reclaimed without deleting anything. David's explicit call: flip
+	// dryRun to false in a follow-up once a few dry-run logs have been
+	// reviewed. Failed-run directories and their .partial-diffs artifacts are
+	// explicitly OUT OF SCOPE here (CR-7/CR-11/PM-7 disposition) — this only
+	// ever reaps succeeded && cleanupState:"complete" runs, same as always.
+	applyRetention({ maxAgeDays: 30, dryRun: true })
+		.then((count) => {
+			if (count > 0) {
+				console.error(
+					`dispatch: retention sweep (dry-run) found ${count} run-store director${count === 1 ? "y" : "ies"} older than 30 days eligible for reclaim — no deletion performed`,
+				);
+			}
+		})
+		.catch((error) => {
+			console.error(`dispatch: retention sweep failed (${error.message})`);
+		});
+
 	const runId = randomUUID();
 	const pid = process.pid;
 	const startToken = randomUUID();
@@ -355,6 +393,7 @@ async function runDispatch(opts) {
 			...(opts.checkpointPath ? { checkpointPath: opts.checkpointPath } : {}),
 			stopOnFailure: opts.stopOnFailure,
 			exclude: opts.excludeProviders,
+			only: opts.onlyProviders,
 			...(runStoreReady ? { runId } : {}),
 			dependencies: {
 				onTaskStart: (task) =>
@@ -368,7 +407,7 @@ async function runDispatch(opts) {
 				onResult: (r) => {
 					const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
 					console.error(
-						`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}`,
+						`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}${r.reason ? ` (${r.reason})` : ""}`,
 					);
 				},
 			},
@@ -381,7 +420,16 @@ async function runDispatch(opts) {
 			// treat that as a failed run.
 			const anyFailed = result ? result.results.some((r) => !r.success) : true;
 			try {
-				await advanceState(runId, anyFailed ? "failed" : "succeeded");
+				// Single combined terminal write (mirrors worker-bootstrap's
+				// terminalPatch): setting cleanupState:"complete" here is what
+				// makes a sync-path run retention-eligible (applyRetention only
+				// reaps succeeded && cleanupState:"complete"). Must be one call —
+				// advanceState can only carry {state}, and a second separate
+				// write would race the releaseRunLock revision bump.
+				await updateRunWithRetry(runId, {
+					state: anyFailed ? "failed" : "succeeded",
+					cleanupState: "complete",
+				});
 				await releaseRunLock(runId);
 			} catch (error) {
 				console.error(`dispatch: run-store teardown failed (${error.message})`);
@@ -481,8 +529,13 @@ async function handleLaunch(argv) {
 	// own named field on the run record — as opposed to just riding along
 	// inside the raw launchArgs array above — is persisted via a follow-up
 	// updateRunWithRetry rather than threaded into the initializeRun call
-	// itself. worker-bootstrap reads it back off run.excludeProviders.
-	await updateRunWithRetry(runId, { excludeProviders: opts.excludeProviders });
+	// itself. worker-bootstrap reads them back off run.excludeProviders,
+	// run.onlyProviders, and run.stopOnFailure.
+	await updateRunWithRetry(runId, {
+		excludeProviders: opts.excludeProviders,
+		onlyProviders: opts.onlyProviders,
+		stopOnFailure: opts.stopOnFailure,
+	});
 
 	await acquireProjectLock(opts.projectPath, runId);
 

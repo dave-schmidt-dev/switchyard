@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -881,21 +882,18 @@ describe("runner headless orchestrator mode", () => {
 		);
 	});
 
-	it("re-selects and re-fails the same unsupported provider on every resume (characterizes the intentionally-unfiltered orchestrator route — Task 16)", async () => {
-		// Unlike executeTask, executeTaskWithOrchestrator does NOT pass
-		// availableProviders, so route() can pick a provider the external
-		// orchestrator can't actually run. This is deliberate: the orchestrator
-		// is an opaque black box with no capability-discovery protocol. Here the
-		// fake orchestrator rejects "cursor" at launch(), standing in for one
-		// that doesn't support that provider. Because a failed launch never adds
-		// the task to completedTaskIds, a resume re-selects the same task and
-		// the same provider and fails identically — accepted behavior today, not
-		// a bug. This test pins that loop and doubles as a real guard: the mock
-		// route below honors availableProviders, so today (this path passes
-		// none) cursor is returned and launch throws, but if this path is ever
-		// constrained to a set excluding the picked provider, route() returns no
-		// provider and the launch_failed assertions below fail — forcing a
-		// deliberate update rather than silently passing.
+	it("re-selects and re-fails the same unsupported provider on every resume (orchestrator launch failure, not a route gap — Task E.1)", async () => {
+		// Since Task E.1, executeTaskWithOrchestrator passes availableProviders
+		// (derived from context.adapters), same as executeTask — so this
+		// dependencies object declares an adapters.cursor entry to keep cursor
+		// selectable, isolating the scenario under test: the external
+		// orchestrator is an opaque black box with no capability-discovery
+		// protocol, so route() can still pick a provider the orchestrator
+		// itself can't run. Here the fake orchestrator rejects "cursor" at
+		// launch(), standing in for one that doesn't support that provider.
+		// Because a failed launch never adds the task to completedTaskIds, a
+		// resume re-selects the same task and the same provider and fails
+		// identically — accepted behavior today, not a bug.
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -919,6 +917,12 @@ describe("runner headless orchestrator mode", () => {
 			recordDispatch: (entry) => dispatches.push(entry),
 			integrationGate: () => ({ success: true, message: "ok" }),
 			sleepFn: async () => {},
+			adapters: {
+				cursor: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => null,
+				},
+			},
 			orchestrator: {
 				launch: async (payload) => {
 					launchAttempts.push(payload);
@@ -1305,6 +1309,44 @@ describe("runner provider spread recording", () => {
 			strictEqual(dispatches[0].result, "success");
 		});
 	}
+});
+
+describe("runner no-provider outcome carries the route reason (Task D.3)", () => {
+	it("returns the route's reason in the result object when no provider is found, not just the ledger record", () => {
+		// The ledger record always carried `reason`; the RETURNED result must
+		// too, so callers (dispatch's onResult) can tell the operator a
+		// deterministic INV-5 capability-ceiling exhaustion from an actionable
+		// upstream-unavailable provider. Route's reason passes through
+		// verbatim, including the redacted upstream error detail.
+		const dispatches = [];
+		const result = executeTask(
+			{ id: "1.1", title: "task", description: "simple cleanup" },
+			{
+				route: () => ({
+					provider: null,
+					reason: "no_eligible_upstream_unavailable: claude — token expired",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				integrationGate: () => ({ success: true }),
+				adapters: {},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.result, "no_provider");
+		strictEqual(result.success, false);
+		strictEqual(
+			result.reason,
+			"no_eligible_upstream_unavailable: claude — token expired",
+		);
+		// Ledger record unchanged behavior: still records the same reason.
+		strictEqual(dispatches[0].result, "no_provider");
+		strictEqual(
+			dispatches[0].reason,
+			"no_eligible_upstream_unavailable: claude — token expired",
+		);
+	});
 });
 
 describe("runner cli orchestrator wiring", () => {
@@ -4037,12 +4079,126 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
 	});
 
-	it("executeTaskWithOrchestrator passes context.exclude through to route(), without gaining availableProviders", async () => {
-		// Mirrors the existing "intentionally-unfiltered orchestrator route"
-		// characterization (Task 16, above): executeTaskWithOrchestrator still
-		// deliberately does not pass availableProviders. That pre-existing gap
-		// is out of scope for --exclude-provider threading — only assert
-		// exclude is forwarded, and pin that availableProviders stays absent.
+	it("runQueue forwards options.only onto context.only, reaching route() via executeTask (Task C.9)", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** First operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const routeCalls = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			only: ["codex"],
+			dependencies: {
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 60,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(routeCalls.length, 1);
+		deepStrictEqual(routeCalls[0].only, ["codex"]);
+	});
+
+	it("runQueue defaults context.only to [] when options.only is omitted (Task C.9)", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** First operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const routeCalls = [];
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 60,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+			},
+		});
+
+		deepStrictEqual(routeCalls[0].only, []);
+	});
+
+	it("executeTask passes context.only through to route(), alongside exclude and availableProviders (Task C.9)", () => {
+		const routeCalls = [];
+
+		executeTask(
+			{ id: "1.1", title: "task", description: "op" },
+			{
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 50,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				only: ["codex"],
+			},
+		);
+
+		strictEqual(routeCalls.length, 1);
+		deepStrictEqual(routeCalls[0].only, ["codex"]);
+		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
+	});
+
+	it("executeTaskWithOrchestrator passes both context.exclude and availableProviders through to route() (Task E.1)", async () => {
+		// Task E.1 closed the "intentionally-unfiltered orchestrator route" gap
+		// (Task 16): executeTaskWithOrchestrator now mirrors executeTask and
+		// passes availableProviders derived from context.adapters, alongside
+		// the pre-existing exclude forwarding.
 		const routeCalls = [];
 
 		const result = await executeTaskWithOrchestrator(
@@ -4067,6 +4223,12 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 				sleepFn: async () => {},
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
 				exclude: ["claude"],
 			},
 		);
@@ -4074,10 +4236,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		strictEqual(result.success, true);
 		strictEqual(routeCalls.length, 1);
 		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
-		ok(
-			!("availableProviders" in routeCalls[0]),
-			"executeTaskWithOrchestrator must not gain availableProviders — pre-existing gap, out of scope here",
-		);
+		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
 	});
 });
 
@@ -4220,5 +4379,150 @@ describe("runQueue timeout diff persistence", () => {
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(checkpoint.results[0].timedOut, true);
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
+	});
+});
+
+describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
+	it("persists a non-timeout, non-credential integrationGate rejection's diff to disk, same as the timeout path", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Rejected task
+- **Status:** pending
+- **Description:** produces a diff the gate rejects for a non-credential reason
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const diffText =
+			"diff --git a/wip.mjs b/wip.mjs\n+SECRET_CANARY_rejected_marker";
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({
+					success: false,
+					message: "Diff apply failed",
+				}),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "", error: null }),
+						captureDiff: () => diffText,
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		const [taskResult] = result.results;
+		strictEqual(taskResult.success, false);
+		strictEqual(taskResult.result, "integration_failed");
+		strictEqual(
+			taskResult.partialDiff,
+			undefined,
+			"raw diff text must not ride along in the in-memory result once persisted",
+		);
+		ok(taskResult.partialDiffPath, "result carries the artifact path");
+		ok(existsSync(taskResult.partialDiffPath));
+		strictEqual(readFileSync(taskResult.partialDiffPath, "utf8"), diffText);
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(
+			checkpoint.results[0].partialDiffPath,
+			taskResult.partialDiffPath,
+		);
+
+		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
+		ok(
+			!rawCheckpointJson.includes("SECRET_CANARY_rejected_marker"),
+			"checkpoint.json must reference the artifact by path only, never embed the diff text",
+		);
+	});
+
+	it("NEVER persists a credential-flagged rejection's diff to disk (security property)", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Credential-flagged task
+- **Status:** pending
+- **Description:** produces a diff the gate rejects for touching a credential-convention path
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const diffText =
+			"diff --git a/.env b/.env\n+SECRET_CANARY_must_never_touch_disk";
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({
+					success: false,
+					message: "diff touches a credential-convention path: .env",
+					credentialFlagged: true,
+				}),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "", error: null }),
+						captureDiff: () => diffText,
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		const [taskResult] = result.results;
+		strictEqual(taskResult.success, false);
+		strictEqual(
+			taskResult.partialDiff,
+			undefined,
+			"credential-flagged diff must never even ride along in the in-memory result",
+		);
+		strictEqual(
+			taskResult.partialDiffPath,
+			undefined,
+			"credential-flagged rejection must never produce an artifact path",
+		);
+
+		const artifactsDir = `${checkpointPath}.partial-diffs`;
+		ok(
+			!existsSync(artifactsDir) || readdirSync(artifactsDir).length === 0,
+			"no artifact file may exist under .partial-diffs for a credential-flagged rejection",
+		);
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[0].partialDiffPath, null);
+
+		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
+		ok(
+			!rawCheckpointJson.includes("SECRET_CANARY_must_never_touch_disk"),
+			"checkpoint.json must never embed a credential-flagged diff's text",
+		);
 	});
 });

@@ -1,0 +1,73 @@
+{
+	"schema_version": 1,
+	"models": {
+		"fixture/claude-standard": {
+			"selector": "fixture-claude-standard",
+			"base_model": "fixture-claude-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/agy-claude-standard": {
+			"selector": "fixture-agy-claude-standard",
+			"base_model": "fixture-agy-claude-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		},
+		"fixture/agy-gemini-standard": {
+			"selector": "fixture-agy-gemini-standard",
+			"base_model": "fixture-agy-gemini-standard",
+			"model_provider": "fixture",
+			"status": "active"
+		}
+	},
+	"targets": {
+		"claude-code": {
+			"harness": "claude",
+			"credential_profile": "default",
+			"enabled": true,
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture-claude-standard": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [],
+				"standard": [{ "model_ref": "fixture/claude-standard", "priority": 1 }],
+				"high": []
+			}
+		},
+		"antigravity-claude": {
+			"harness": "agy",
+			"snapshot_name": "Antigravity (Claude)",
+			"credential_profile": "claude-profile",
+			"enabled": true,
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture-agy-claude-standard": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [],
+				"standard": [
+					{ "model_ref": "fixture/agy-claude-standard", "priority": 1 }
+				],
+				"high": []
+			}
+		},
+		"antigravity": {
+			"harness": "agy",
+			"snapshot_name": "Antigravity",
+			"credential_profile": "gemini-profile",
+			"enabled": true,
+			"technical_ceiling": "standard",
+			"qualifications": {
+				"fixture-agy-gemini-standard": { "status": "qualified" }
+			},
+			"slots": {
+				"low": [],
+				"standard": [
+					{ "model_ref": "fixture/agy-gemini-standard", "priority": 1 }
+				],
+				"high": []
+			}
+		}
+	}
+}

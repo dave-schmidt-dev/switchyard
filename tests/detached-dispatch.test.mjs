@@ -329,6 +329,118 @@ describe("--exclude-provider on the detached worker path", () => {
 	});
 });
 
+describe("--only-provider on the detached worker path", () => {
+	it("restricts routing to the given provider end-to-end via `launch` (not just the foreground path) (Task C.9)", async () => {
+		// Mirrors the --exclude-provider test above, but proves the allowlist
+		// (not just the denylist) works end-to-end through the real detached
+		// worker path: without --only-provider, claude (90% left) outranks
+		// codex (50% left) and wins routing under router/index.mjs's
+		// spread-by-headroom rule; with `--only-provider codex`, codex must be
+		// routed instead even though claude has more headroom.
+		const onlyProjectDir = join(dir, "only-provider-project");
+		mkdirSync(onlyProjectDir, { recursive: true });
+		execSync("git init", { cwd: onlyProjectDir, stdio: "ignore" });
+		execSync("git config user.email test@test.com", {
+			cwd: onlyProjectDir,
+			stdio: "ignore",
+		});
+		execSync("git config user.name test", {
+			cwd: onlyProjectDir,
+			stdio: "ignore",
+		});
+		execSync("git commit --allow-empty -m initial", {
+			cwd: onlyProjectDir,
+			stdio: "ignore",
+		});
+
+		const snapshotPath = join(dir, "snapshot-only.json");
+		writeFileSync(
+			snapshotPath,
+			JSON.stringify({
+				schema_version: 2,
+				providers: [
+					{
+						name: "claude",
+						ok: true,
+						windows: [{ percent_left: 90, pace_delta: 0 }],
+					},
+					{
+						name: "codex",
+						ok: true,
+						windows: [{ percent_left: 50, pace_delta: 0 }],
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		const env = {
+			...makeStateRootEnv(),
+			SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: snapshotPath,
+		};
+
+		const launchResult = runDispatch(
+			[
+				"launch",
+				tasksFile,
+				"--project",
+				onlyProjectDir,
+				"--only-provider",
+				"codex",
+			],
+			env,
+		);
+		strictEqual(
+			launchResult.status,
+			0,
+			`launch failed: ${launchResult.stderr}`,
+		);
+		const { runId } = JSON.parse(launchResult.stdout.trim());
+
+		let observedProvider = null;
+		const start = Date.now();
+		const maxWait = 60_000;
+		while (Date.now() - start < maxWait) {
+			const statusResult = pollStatus(runId, env);
+			if (statusResult.status === 0) {
+				const status = JSON.parse(statusResult.stdout.trim());
+				if (status.activeTaskProvider) {
+					observedProvider = status.activeTaskProvider;
+					break;
+				}
+				if (status.state === "succeeded" || status.state === "failed") {
+					break;
+				}
+			}
+			await new Promise((r) => setTimeout(r, 200));
+		}
+
+		if (!observedProvider) {
+			const { readEvents } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			const events = await readEvents(runId);
+			const routedEvent = events.find(
+				(e) =>
+					e.phase === "execution" &&
+					(e.event === "task_completed" || e.event === "task_failed"),
+			);
+			observedProvider = routedEvent?.provider ?? null;
+		}
+
+		ok(observedProvider, "expected the task to be routed to some provider");
+		strictEqual(
+			observedProvider,
+			"codex",
+			"claude has more headroom but is not in the --only-provider allowlist, so codex must be routed instead",
+		);
+		ok(
+			observedProvider !== "claude",
+			"a provider outside the --only-provider allowlist must never be routed",
+		);
+	});
+});
+
 describe("duplicate project runs fail", () => {
 	it("launch is blocked while the project lock is already held", async () => {
 		const { acquireProjectLock } = await import(

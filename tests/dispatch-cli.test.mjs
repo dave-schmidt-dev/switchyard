@@ -173,6 +173,62 @@ describe("parseDispatchArgs (backwards compat)", () => {
 		deepStrictEqual(opts.excludeProviders, ["claude", "cursor"]);
 	});
 
+	it("defaults onlyProviders to an empty array when --only-provider is absent", () => {
+		const opts = parseDispatchArgs([tasksFile, "--project", projectDir]);
+		deepStrictEqual(opts.onlyProviders, []);
+	});
+
+	it("collects repeated --only-provider flags into onlyProviders", () => {
+		const opts = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--only-provider",
+			"claude",
+			"--only-provider",
+			"agy",
+		]);
+		deepStrictEqual(opts.onlyProviders, ["claude", "agy"]);
+	});
+
+	it("collects --provider as an alias for --only-provider into the same onlyProviders list", () => {
+		// onlyProviders concatenates --only-provider values then --provider
+		// values, regardless of the order the flags appear on the command
+		// line (parseArgs groups by option name, not positional order).
+		const opts = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--provider",
+			"claude",
+			"--only-provider",
+			"agy",
+		]);
+		deepStrictEqual(opts.onlyProviders, ["agy", "claude"]);
+	});
+
+	it("throws a UsageError when --only-provider and --exclude-provider are combined", () => {
+		strictEqual(
+			(() => {
+				try {
+					parseDispatchArgs([
+						tasksFile,
+						"--project",
+						projectDir,
+						"--only-provider",
+						"claude",
+						"--exclude-provider",
+						"cursor",
+					]);
+					return null;
+				} catch (e) {
+					return e.message;
+				}
+			})().includes("mutually exclusive"),
+			true,
+		);
+	});
+
 	it("throws when the tasks positional is missing", () => {
 		strictEqual(
 			(() => {
@@ -306,6 +362,11 @@ describe("usage output", () => {
 	it("USAGE_RUN and USAGE_LAUNCH describe --exclude-provider", () => {
 		ok(USAGE_RUN.includes("--exclude-provider"));
 		ok(USAGE_LAUNCH.includes("--exclude-provider"));
+	});
+
+	it("USAGE_RUN and USAGE_LAUNCH describe --only-provider", () => {
+		ok(USAGE_RUN.includes("--only-provider"));
+		ok(USAGE_LAUNCH.includes("--only-provider"));
 	});
 
 	it("USAGE_STATUS describes status usage", () => {
@@ -467,6 +528,67 @@ describe("launch integration", () => {
 		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
 		const run = await readRun(runId);
 		deepStrictEqual(run.excludeProviders, ["claude", "cursor"]);
+	});
+
+	it("launch with no --only-provider persists onlyProviders: [] on the run record", async () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		deepStrictEqual(run.onlyProviders, []);
+	});
+
+	it("launch persists repeated --only-provider flags onto the run record as onlyProviders", async () => {
+		const result = runDispatch(
+			[
+				"launch",
+				tasksFile,
+				"--project",
+				projectDir,
+				"--only-provider",
+				"claude",
+				"--only-provider",
+				"agy",
+			],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		deepStrictEqual(run.onlyProviders, ["claude", "agy"]);
+	});
+
+	it("launch with no --no-stop-on-failure persists stopOnFailure: true on the run record", async () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		strictEqual(run.stopOnFailure, true);
+	});
+
+	it("launch --no-stop-on-failure persists stopOnFailure: false on the run record", async () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir, "--no-stop-on-failure"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		strictEqual(run.stopOnFailure, false);
 	});
 });
 
@@ -785,7 +907,7 @@ describe("CLI exit code contract - launch failures", () => {
 });
 
 describe("run subcommand via spawn", () => {
-	it("run with valid args exits 0 and produces checkpoint", () => {
+	it("run with valid args exits 0 and produces checkpoint", async () => {
 		const tasksPath = join(dir, "run-tasks.md");
 		writeFileSync(
 			tasksPath,
@@ -819,6 +941,20 @@ describe("run subcommand via spawn", () => {
 			result.status === 0 || result.status === 1,
 			`expected exit 0 or 1, got ${result.status}: stderr=${result.stderr}`,
 		);
+
+		// The sync path's terminal write must persist cleanupState:"complete"
+		// (Task D.5) so applyRetention can later reclaim the run. Unlike
+		// `launch`, the `run` subcommand prints no envelope, so locate the
+		// single persisted run record in the fresh state root instead.
+		const runDirs = readdirSync(join(stateRoot, "runs"));
+		strictEqual(
+			runDirs.length,
+			1,
+			`expected exactly one run record, got ${runDirs.length}`,
+		);
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runDirs[0]);
+		strictEqual(run.cleanupState, "complete");
 	});
 });
 

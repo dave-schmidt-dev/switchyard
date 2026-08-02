@@ -223,7 +223,7 @@ function extractSummaryLines(diff, projectPath) {
  * Validate that a diff is structurally safe to apply.
  * @param {string} diff The git diff to validate
  * @param {string} projectPath Target project path (paths are resolved against this)
- * @returns {{safe: boolean, reason?: string, requiresReview?: boolean, sensitivePaths?: string[]}}
+ * @returns {{safe: boolean, reason?: string, requiresReview?: boolean, sensitivePaths?: string[], touchedPaths?: string[]}}
  */
 export function validateDiff(diff, projectPath) {
 	if (!diff || typeof diff !== "string" || !diff.trim()) {
@@ -246,6 +246,7 @@ export function validateDiff(diff, projectPath) {
 			return {
 				safe: false,
 				reason: `diff touches a credential-convention path: ${path}`,
+				credentialFlagged: true,
 			};
 		}
 	}
@@ -271,10 +272,11 @@ export function validateDiff(diff, projectPath) {
 			safe: true,
 			requiresReview: true,
 			sensitivePaths: sensitiveManifestPaths,
+			touchedPaths,
 		};
 	}
 
-	return { safe: true };
+	return { safe: true, touchedPaths };
 }
 
 /**
@@ -298,6 +300,43 @@ function applyReviewedDiff(diff, projectPath) {
 		console.error("Failed to apply reviewed diff:", error.message);
 		return false;
 	}
+}
+
+/**
+ * Run `git status --porcelain` and return only the lines whose path matches
+ * one of the given touched paths. Used for no-op detection: by scoping to
+ * only the files the diff claims to touch, pre-existing unrelated dirty
+ * state in other files never triggers a false positive.
+ * @param {string} projectPath
+ * @param {string[]} touchedPaths
+ * @returns {string}
+ */
+function getScopedStatus(projectPath, touchedPaths) {
+	const result = spawnSync(
+		"git",
+		["status", "--porcelain", "--untracked-files=all"],
+		{
+			cwd: projectPath,
+			encoding: "utf8",
+		},
+	);
+	const lines = (result.stdout || "").split("\n").filter(Boolean);
+	const touchedSet = new Set(touchedPaths);
+	return lines
+		.filter((line) => {
+			const path = line.slice(3).trim();
+			if (touchedSet.has(path)) return true;
+			// Handle rename format: `R  old -> new`
+			const arrow = path.indexOf(" -> ");
+			if (arrow !== -1) {
+				return (
+					touchedSet.has(path.slice(0, arrow)) ||
+					touchedSet.has(path.slice(arrow + 4))
+				);
+			}
+			return false;
+		})
+		.join("\n");
 }
 
 /**
@@ -406,6 +445,7 @@ export function integrationGate(diff, projectPath, options = {}) {
 		return {
 			success: false,
 			message: validation.reason ?? "Diff validation failed",
+			credentialFlagged: validation.credentialFlagged === true,
 		};
 	}
 
@@ -419,7 +459,22 @@ export function integrationGate(diff, projectPath, options = {}) {
 		};
 	}
 
+	// No-op detection: only for the common path (requiredPaths === null),
+	// where touchedPaths isn't computed independently elsewhere in this
+	// function. Scoped to touched paths only so pre-existing unrelated
+	// dirty state in other files never triggers a false no-op report.
+	let preStatus = "";
+	if (requiredPaths === null) {
+		preStatus = getScopedStatus(projectPath, validation.touchedPaths);
+	}
+
 	if (applyReviewedDiff(patch, projectPath)) {
+		if (requiredPaths === null) {
+			const postStatus = getScopedStatus(projectPath, validation.touchedPaths);
+			if (preStatus === postStatus) {
+				return { success: false, message: "no_op_diff" };
+			}
+		}
 		return { success: true, message: "Diff applied successfully" };
 	}
 

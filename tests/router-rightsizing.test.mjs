@@ -140,7 +140,10 @@ describe("router INV-5 — capability filter gates the spread", () => {
 		const result = route({ tier: "high" });
 		strictEqual(result.provider, null);
 		strictEqual(result.model, null);
-		strictEqual(result.reason, "no_eligible");
+		// Every candidate fails only the INV-5 capability filter, so the reason
+		// names the deterministic ceiling classification (Task D.3), not the
+		// generic no_eligible.
+		strictEqual(result.reason, "no_eligible_capability_ceiling");
 	});
 
 	it("at standard tier the same under-capable provider IS eligible and right-sized", () => {

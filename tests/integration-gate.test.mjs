@@ -165,6 +165,34 @@ index 0000000..abcdef1
 		ok(result.message.includes("credential"));
 	});
 
+	it("tags a credential-convention rejection with credentialFlagged: true, both from validateDiff and integrationGate (Task D.4: the signal runner uses to withhold the diff body from disk)", () => {
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, ".env"), "SECRET=xyz\n", "utf8");
+		});
+
+		const validation = validateDiff(diff, projectPath);
+		strictEqual(validation.safe, false);
+		strictEqual(validation.credentialFlagged, true);
+
+		const result = integrationGate(diff, projectPath);
+		strictEqual(result.success, false);
+		strictEqual(result.credentialFlagged, true);
+	});
+
+	it("does not set credentialFlagged on unrelated rejections", () => {
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			execSync("ln -s /etc/passwd evil-link", { cwd: dir });
+		});
+		execSync("git rm --cached -q evil-link", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath);
+		strictEqual(result.success, false);
+		ok(!result.credentialFlagged);
+	});
+
 	it("does NOT reject a legitimate diff merely because it contains the word 'password' in content", () => {
 		// Regression: the prior content-substring blocklist rejected any diff
 		// whose text contained "password"/"token"/"secret" anywhere — including
@@ -325,6 +353,43 @@ index 0000000..abcdef1
 		const result = integrationGate(diff, projectPath);
 		strictEqual(result.success, false);
 		ok(result.message.includes("credential"));
+	});
+
+	it("detects a no-op diff (hunks net to zero content change) even with unrelated dirty state", () => {
+		// Regression: integrationGate reported {success: true} whenever
+		// `git apply` exited 0, even when the diff netted to zero real
+		// content change — a production incident. The new no-op check
+		// compares pre- and post-apply git status scoped to touched paths
+		// only, so unrelated dirty state in other files is ignored.
+		commitFile(projectPath, "target.txt", "a\nb\nc\n");
+		commitFile(projectPath, "other.txt", "original\n");
+
+		// A structurally-valid diff whose hunk changes 'b' to 'b' — a
+		// semantic no-op. `git apply --numstat` parses it (passes
+		// structural validation), `git apply` exits 0 (context matches),
+		// but the file content doesn't change.
+		const noopDiff = `${[
+			"diff --git a/target.txt b/target.txt",
+			"--- a/target.txt",
+			"+++ b/target.txt",
+			"@@ -1,3 +1,3 @@",
+			" a",
+			"-b",
+			"+b",
+			" c",
+		].join("\n")}\n`;
+
+		// Unrelated dirty state in a file the diff doesn't touch
+		writeFileSync(join(projectPath, "other.txt"), "modified\n", "utf8");
+
+		const result = integrationGate(noopDiff, projectPath);
+		strictEqual(result.success, false);
+		strictEqual(result.message, "no_op_diff");
+
+		// Verify the genuine empty-diff path is unchanged
+		const emptyResult = integrationGate("", projectPath);
+		strictEqual(emptyResult.success, false);
+		ok(emptyResult.message.toLowerCase().includes("empty"));
 	});
 
 	it("rejects a credential-convention path even when its directory name is non-ASCII (git C-quoting bypass)", () => {

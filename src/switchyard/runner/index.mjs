@@ -728,6 +728,7 @@ export function executeTask(task, context) {
 		tier,
 		availableProviders: Object.keys(context.adapters ?? {}),
 		exclude: context.exclude,
+		only: context.only,
 	});
 
 	// Provenance (Task 1.6, M7/M8): resolve the six roster-provenance fields
@@ -754,6 +755,7 @@ export function executeTask(task, context) {
 			provider: null,
 			model: null,
 			result: "no_provider",
+			reason: routeResult.reason,
 		};
 	}
 
@@ -923,13 +925,17 @@ export function executeTask(task, context) {
 		percentLeft: routeResult.percentLeft ?? undefined,
 	});
 
-	return {
+	const result = {
 		taskId: task.id,
 		success,
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		result: success ? "success" : "integration_failed",
 	};
+	if (!success && !gateResult?.credentialFlagged) {
+		result.partialDiff = diff;
+	}
+	return result;
 }
 
 /**
@@ -940,10 +946,11 @@ export function executeTask(task, context) {
  */
 export async function executeTaskWithOrchestrator(task, context) {
 	const tier = resolveTaskTier(task);
-	// Deliberately no availableProviders here — see runQueueWithOrchestrator's
-	// "intentionally-unfiltered orchestrator route" note (Task 16), a
-	// pre-existing gap this task does not touch.
-	const routeResult = context.route({ tier, exclude: context.exclude });
+	const routeResult = context.route({
+		tier,
+		availableProviders: Object.keys(context.adapters ?? {}),
+		exclude: context.exclude,
+	});
 
 	// Provenance (Task 1.6, M7/M8) — same treatment as executeTask: resolve the
 	// six fields once, attach to routeResult, and route every dispatch record
@@ -967,6 +974,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: null,
 			model: null,
 			result: "no_provider",
+			reason: routeResult.reason,
 		};
 	}
 
@@ -1132,13 +1140,17 @@ export async function executeTaskWithOrchestrator(task, context) {
 		percentLeft: routeResult.percentLeft ?? undefined,
 	});
 
-	return {
+	const result = {
 		taskId: task.id,
 		success,
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		result: success ? "success" : "integration_failed",
 	};
+	if (!success && !gateResult?.credentialFlagged) {
+		result.partialDiff = diff;
+	}
+	return result;
 }
 
 function _resolveOnStatus(deps) {
@@ -1243,6 +1255,38 @@ function throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus) {
 	throw new Error(message);
 }
 
+// Shared by runQueue and runQueueWithOrchestrator so both execution paths
+// report the same known-provider set as availableProviders to route() —
+// the orchestrator path never calls execute()/captureDiff() on these (its
+// dispatch goes through context.orchestrator.launch()), but still needs the
+// same key set so its availableProviders filter isn't always empty (Task E.1).
+const DEFAULT_ADAPTERS = {
+	claude: {
+		execute: executeClaude,
+		captureDiff: captureClaudeDiff,
+	},
+	codex: {
+		execute: executeCodex,
+		captureDiff: captureCodexDiff,
+	},
+	agy: {
+		execute: executeAgy,
+		captureDiff: captureAgyDiff,
+	},
+	cursor: {
+		execute: executeCursor,
+		captureDiff: captureCursorDiff,
+	},
+	copilot: {
+		execute: executeCopilot,
+		captureDiff: captureCopilotDiff,
+	},
+	opencode: {
+		execute: executeOpencode,
+		captureDiff: captureOpencodeDiff,
+	},
+};
+
 /**
  * Run queue serially with host-side checkpointing.
  * @param {object} options
@@ -1253,6 +1297,7 @@ function throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus) {
  * @param {number} [options.maxTasks]
  * @param {boolean} [options.stopOnFailure]
  * @param {string[]} [options.exclude] Provider names to never route to.
+ * @param {string[]} [options.only] Provider names/target ids to restrict routing to.
  * @param {object} [options.dependencies]
  */
 export function runQueue(options) {
@@ -1264,6 +1309,7 @@ export function runQueue(options) {
 		maxTasks = Number.POSITIVE_INFINITY,
 		stopOnFailure = true,
 		exclude = [],
+		only = [],
 		runId = null,
 		dependencies = {},
 	} = options;
@@ -1337,37 +1383,13 @@ export function runQueue(options) {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? recordDispatch,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
-		adapters: dependencies.adapters ?? {
-			claude: {
-				execute: executeClaude,
-				captureDiff: captureClaudeDiff,
-			},
-			codex: {
-				execute: executeCodex,
-				captureDiff: captureCodexDiff,
-			},
-			agy: {
-				execute: executeAgy,
-				captureDiff: captureAgyDiff,
-			},
-			cursor: {
-				execute: executeCursor,
-				captureDiff: captureCursorDiff,
-			},
-			copilot: {
-				execute: executeCopilot,
-				captureDiff: captureCopilotDiff,
-			},
-			opencode: {
-				execute: executeOpencode,
-				captureDiff: captureOpencodeDiff,
-			},
-		},
+		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
 		onStatus: emitStatus,
 		onTaskRouted,
 		exclude,
+		only,
 	};
 
 	try {
@@ -1417,7 +1439,7 @@ export function runQueue(options) {
 				});
 			}
 			const result = executeTask(task, context);
-			if (result.timedOut && result.partialDiff) {
+			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
 						checkpointPath,
@@ -1428,7 +1450,9 @@ export function runQueue(options) {
 						emitStatus({
 							phase: "execution",
 							event: "partial_diff_captured",
-							status: `Task ${result.taskId} timed out; partial diff saved for review (not applied)`,
+							status: result.timedOut
+								? `Task ${result.taskId} timed out; partial diff saved for review (not applied)`
+								: `Task ${result.taskId} was rejected (${result.result}); diff saved for review (not applied)`,
 							taskId: result.taskId,
 							partialDiffPath: result.partialDiffPath,
 							byteCount: result.partialDiff.length,
@@ -1436,7 +1460,7 @@ export function runQueue(options) {
 					}
 				} catch (error) {
 					console.error(
-						`runQueue: could not save partial diff for timed-out task ${result.taskId}: ${error.message}`,
+						`runQueue: could not save diff artifact for task ${result.taskId}: ${error.message}`,
 					);
 				}
 				// Raw diff text stays out of checkpoint.json / onResult payloads —
@@ -1732,6 +1756,7 @@ export async function runQueueWithOrchestrator(options) {
 		recordDispatch: dependencies.recordDispatch ?? recordDispatch,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
 		orchestrator: resolveOrchestrator(dependencies),
+		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
 		pollIntervalMs,

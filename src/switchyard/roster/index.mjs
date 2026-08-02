@@ -73,6 +73,7 @@ const KNOWN_PROVIDER_HARNESSES = [
 
 let cachedRoster = null;
 let cachedProviderCapabilities = null;
+let cachedSnapshotNameCapabilities = null;
 let cachedRosterSha = null;
 
 /**
@@ -317,16 +318,52 @@ function resolveSlotModel(target, models, tier) {
 
 /**
  * Pick the roster target ENTRY (id + object) that backs a given
- * provider/harness key, preferring an `enabled` target when more than one
- * target shares a harness (e.g. opencode-go vs opencode-zen both carry
- * `harness: "opencode"`). Returns the id alongside the target so provenance
- * (Task 1.6, M7/M8) can record which concrete target was resolved, not just
- * the shared harness.
+ * provider/harness key. Multiple targets sharing one harness is the STEADY
+ * STATE this function exists for (Task C.3), not a rare edge case — it
+ * covers two distinct shapes:
+ *
+ *  1. Exclusive alternatives, only one enabled at a time (opencode-go vs
+ *     opencode-zen, a billing-account swap): the enabled-tie-break below is
+ *     both necessary and sufficient — whichever target is `enabled` IS the
+ *     one the caller means, and `snapshotName` is unneeded.
+ *  2. Simultaneously-enabled targets that both stay live at once (the
+ *     Antigravity / Antigravity (Claude) buckets, Task C.2): the harness
+ *     alone is ambiguous between them, so the enabled-tie-break cannot be
+ *     the answer — routing identity (which target) has to be resolved from
+ *     something more specific than the harness. That "something" is the
+ *     snapshot's own raw provider display name (e.g. "Antigravity
+ *     (Claude)"): pass it as `snapshotName` and a target whose own
+ *     `snapshot_name` field matches exactly is returned in preference to
+ *     the tie-break (Task C.4/C.6). Execution identity (which adapter
+ *     process actually runs the task) stays harness-keyed regardless —
+ *     both targets here still dispatch through the one `agy` adapter
+ *     (Task C.7) — only ROUTING identity needs the extra disambiguation.
+ *
+ * `snapshotName` is optional and purely additive: every existing caller
+ * that omits it, and every target that never sets `snapshot_name` (every
+ * harness except the two agy targets, today), gets byte-identical behavior
+ * to before this parameter existed. Returns the id alongside the target so
+ * provenance (Task 1.6, M7/M8; Task C.8) can record which concrete target
+ * was resolved, not just the shared harness.
  * @param {object} targets
  * @param {string} harnessKey
+ * @param {string} [snapshotName]
  * @returns {{id: string, target: object}|null}
  */
-function findTargetEntryForHarness(targets, harnessKey) {
+function findTargetEntryForHarness(targets, harnessKey, snapshotName) {
+	if (snapshotName) {
+		for (const [id, target] of Object.entries(targets)) {
+			if (
+				target &&
+				typeof target === "object" &&
+				target.harness === harnessKey &&
+				target.enabled &&
+				target.snapshot_name === snapshotName
+			) {
+				return { id, target };
+			}
+		}
+	}
 	let fallback = null;
 	for (const [id, target] of Object.entries(targets)) {
 		if (!target || typeof target !== "object" || target.harness !== harnessKey)
@@ -343,16 +380,48 @@ function findTargetEntryForHarness(targets, harnessKey) {
  * over findTargetEntryForHarness for callers that only need the target object.
  * @param {object} targets
  * @param {string} harnessKey
+ * @param {string} [snapshotName]
  * @returns {object|null}
  */
-function findTargetForHarness(targets, harnessKey) {
-	return findTargetEntryForHarness(targets, harnessKey)?.target ?? null;
+function findTargetForHarness(targets, harnessKey, snapshotName) {
+	return (
+		findTargetEntryForHarness(targets, harnessKey, snapshotName)?.target ?? null
+	);
+}
+
+/**
+ * Compute one PROVIDER_CAPABILITIES-shaped entry (`capability_class` +
+ * `models` per tier) for a single target. Shared by the harness-keyed table
+ * (buildProviderCapabilities) and the snapshot-name-keyed table
+ * (buildSnapshotNameCapabilities) so both stay byte-identical in shape.
+ * @param {object} target
+ * @param {object} models
+ * @returns {{capability_class: string|null, models: object}}
+ */
+function buildCapabilityEntry(target, models) {
+	const modelsByTier = {};
+	for (const tier of TIERS) {
+		modelsByTier[tier] = resolveSlotModel(target, models, tier);
+	}
+	return {
+		capability_class: autoRoutingCeiling(target, models),
+		models: modelsByTier,
+	};
 }
 
 /**
  * Build the PROVIDER_CAPABILITIES-shaped map from the loaded roster: one
  * entry per known provider/harness key with a `capability_class` (the
  * computed auto_routing_ceiling) and a `models` map of tier -> selector.
+ *
+ * Deliberately stays harness-keyed with exactly one entry per harness, even
+ * when two targets share a harness (Task C.5) — router/index.mjs's blind
+ * fallback reads `Object.keys(PROVIDER_CAPABILITIES)` directly to build its
+ * candidate list, and that list must never enumerate one harness twice.
+ * Disambiguating a specific snapshot-named target (e.g. "Antigravity
+ * (Claude)" vs "Antigravity") is buildSnapshotNameCapabilities's job, a
+ * separate table consulted BEFORE this one falls back — see
+ * getCapabilityClass/getModelForTier below.
  * @returns {object}
  */
 function buildProviderCapabilities() {
@@ -366,16 +435,38 @@ function buildProviderCapabilities() {
 	for (const harnessKey of KNOWN_PROVIDER_HARNESSES) {
 		const target = findTargetForHarness(targets, harnessKey);
 		if (!target) continue; // no roster target uses this harness
+		result[harnessKey] = buildCapabilityEntry(target, models);
+	}
+	return result;
+}
 
-		const modelsByTier = {};
-		for (const tier of TIERS) {
-			modelsByTier[tier] = resolveSlotModel(target, models, tier);
+/**
+ * Build a SEPARATE capabilities map keyed by each target's own
+ * `snapshot_name` (Task C.5/C.6) — only targets that declare that field are
+ * included, which today means the two agy targets. Kept out of
+ * PROVIDER_CAPABILITIES's own key set on purpose (see that function's
+ * docstring); getCapabilityClass/getModelForTier consult this table first,
+ * by the RAW provider name they were called with, before normalizing to a
+ * harness and falling back to the harness-keyed table.
+ * @returns {object}
+ */
+function buildSnapshotNameCapabilities() {
+	const roster = getRoster();
+	const models =
+		roster.models && typeof roster.models === "object" ? roster.models : {};
+	const targets =
+		roster.targets && typeof roster.targets === "object" ? roster.targets : {};
+
+	const result = {};
+	for (const target of Object.values(targets)) {
+		if (
+			target &&
+			typeof target === "object" &&
+			typeof target.snapshot_name === "string" &&
+			target.snapshot_name
+		) {
+			result[target.snapshot_name] = buildCapabilityEntry(target, models);
 		}
-
-		result[harnessKey] = {
-			capability_class: autoRoutingCeiling(target, models),
-			models: modelsByTier,
-		};
 	}
 	return result;
 }
@@ -385,6 +476,13 @@ function getProviderCapabilities() {
 		cachedProviderCapabilities = buildProviderCapabilities();
 	}
 	return cachedProviderCapabilities;
+}
+
+function getSnapshotNameCapabilities() {
+	if (!cachedSnapshotNameCapabilities) {
+		cachedSnapshotNameCapabilities = buildSnapshotNameCapabilities();
+	}
+	return cachedSnapshotNameCapabilities;
 }
 
 /**
@@ -465,18 +563,26 @@ export function normalizeProviderName(name) {
  */
 export function getCapabilityClass(providerName) {
 	const provider =
+		getSnapshotNameCapabilities()[providerName] ??
 		getProviderCapabilities()[normalizeProviderName(providerName)];
 	return provider?.capability_class ?? null;
 }
 
 /**
  * Get the model for a provider at a given tier — roster-backed.
+ *
+ * Task C.5/C.6: tries an EXACT match against a target's own `snapshot_name`
+ * first (disambiguates two targets sharing one harness, e.g. the two agy
+ * targets), falling back to the harness-keyed table when no target declares
+ * that snapshot name — i.e. every provider except the two agy targets today,
+ * completely unaffected.
  * @param {string} providerName
  * @param {string} tier
  * @returns {string|null} model selector or null if not found
  */
 export function getModelForTier(providerName, tier) {
 	const provider =
+		getSnapshotNameCapabilities()[providerName] ??
 		getProviderCapabilities()[normalizeProviderName(providerName)];
 	return provider?.models?.[tier] ?? null;
 }
@@ -629,6 +735,45 @@ export function getRosterProvenance() {
 }
 
 /**
+ * Resolve an arbitrary provider identifier — a roster target id (e.g.
+ * "antigravity-claude", the B.1-pinned `--only-provider`/`--exclude-provider`
+ * value), a raw snapshot display name (e.g. "Antigravity (Claude)"), or a
+ * harness key (e.g. "codex") — to the target id it refers to (Task C.6).
+ *
+ * This is the target-id-aware resolution path allowlist/denylist matching
+ * needs: a harness alone (`normalizeProviderName`'s output) cannot
+ * distinguish two simultaneously-enabled targets sharing one harness, but a
+ * target id can. Tries, in order: (1) the identifier IS already a target id
+ * — return it directly; (2) it's a snapshot display name that some target
+ * declares as its own `snapshot_name` — return that target's id; (3)
+ * otherwise fall back to the harness-keyed enabled-tie-break (preserves
+ * existing behavior for every single-target harness). Returns null if the
+ * roster can't be loaded or nothing matches — callers must treat that as "no
+ * target-id-level opinion, fall back to harness-level matching," never as a
+ * hard failure (this is a matching aid, not a routing gate).
+ * @param {string} identifier
+ * @returns {string|null}
+ */
+export function resolveTargetId(identifier) {
+	if (!identifier) return null;
+	try {
+		const roster = getRoster();
+		const targets =
+			roster.targets && typeof roster.targets === "object"
+				? roster.targets
+				: {};
+		if (Object.hasOwn(targets, identifier)) return identifier;
+		const harnessKey = normalizeProviderName(identifier);
+		const entry = harnessKey
+			? findTargetEntryForHarness(targets, harnessKey, identifier)
+			: null;
+		return entry?.id ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Resolve the concrete target a provider/harness routes to at a given tier,
  * for provenance. All four fields are sourced from the ONE resolved target so
  * they stay mutually truthful (advisor guidance): `resolved_target` is the
@@ -649,8 +794,12 @@ export function resolveTargetProvenance(providerName, tier) {
 		roster.targets && typeof roster.targets === "object" ? roster.targets : {};
 
 	const harnessKey = normalizeProviderName(providerName);
+	// Task C.8: pass the RAW providerName through as the snapshot-name
+	// disambiguator, so a harness shared by two simultaneously-enabled targets
+	// (the agy buckets) resolves to the target the caller actually meant,
+	// not whichever wins the enabled-tie-break.
 	const entry = harnessKey
-		? findTargetEntryForHarness(targets, harnessKey)
+		? findTargetEntryForHarness(targets, harnessKey, providerName)
 		: null;
 
 	if (!entry) {
@@ -718,5 +867,6 @@ export function resolveRouteProvenance(providerName, tier) {
 export function __resetRosterCacheForTests() {
 	cachedRoster = null;
 	cachedProviderCapabilities = null;
+	cachedSnapshotNameCapabilities = null;
 	cachedRosterSha = null;
 }

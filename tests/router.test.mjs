@@ -178,6 +178,48 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		strictEqual(result.reason, "no_eligible");
 	});
 
+	it("returns no_eligible_capability_ceiling when the only candidate is below the tier's capability ceiling", () => {
+		// Task D.3: distinguish the deterministic INV-5 ceiling case (every
+		// candidate's technical_ceiling is below the task's required tier —
+		// expected, not actionable) from the upstream-unavailable case below.
+		// antigravity's fixture ceiling is standard, so at tier high the
+		// capability filter rejects it and nothing else is present: the reason
+		// must name the ceiling, not the generic no_eligible.
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }], // standard ceiling only
+			},
+		]);
+
+		const result = route({ tier: "high" });
+		strictEqual(result.provider, null);
+		strictEqual(result.reason, "no_eligible_capability_ceiling");
+	});
+
+	it("returns no_eligible_upstream_unavailable with the first unavailable provider's error", () => {
+		// Task D.3: a provider that WOULD be eligible (claude clears the high
+		// capability filter) but is currently unreachable must surface as an
+		// actionable upstream failure carrying the snapshot's (already
+		// redacted) error string — not the generic no_eligible.
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: false,
+				error: "token expired",
+				windows: [{ percent_left: 50, pace_delta: 100 }],
+			},
+		]);
+
+		const result = route({ tier: "high" });
+		strictEqual(result.provider, null);
+		strictEqual(
+			result.reason,
+			"no_eligible_upstream_unavailable: claude — token expired",
+		);
+	});
+
 	it("never routes to vibe (a disabled, no-adapter roster target) even with the most headroom", () => {
 		// vibe is `enabled: false` in the roster (no ZDR, no adapter) -- its
 		// computed capability_class is null, so it fails the capability filter
@@ -262,6 +304,29 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			"Codex",
 			"excluding the lowercase harness key 'claude' must exclude the " +
 				"title-cased snapshot entry 'Claude' -- case must not matter",
+		);
+	});
+
+	it("--only-provider restricts routing to the allowlisted provider, even when a non-allowlisted one has more headroom (Task C.9)", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 30, pace_delta: 100 }],
+			},
+			{
+				name: "codex",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 50 }], // most headroom
+			},
+		]);
+
+		const result = route({ tier: "low", only: ["claude"] });
+		strictEqual(
+			result.provider,
+			"claude",
+			"codex has more headroom, but --only-provider claude must restrict " +
+				"routing to claude regardless",
 		);
 	});
 
@@ -495,7 +560,10 @@ describe("router (INV-4: every dispatch outcome records provider + model + resul
 		const result = route({ tier: "high" });
 		strictEqual(result.provider, null);
 		strictEqual(result.model, null);
-		strictEqual(result.reason, "no_eligible");
+		// The single candidate fails only the INV-5 capability filter, so the
+		// triple's reason is the distinguishable ceiling classification (Task
+		// D.3), not the generic no_eligible.
+		strictEqual(result.reason, "no_eligible_capability_ceiling");
 	});
 });
 

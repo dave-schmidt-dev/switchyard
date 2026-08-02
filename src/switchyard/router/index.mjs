@@ -18,8 +18,35 @@ import {
 	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
+	resolveTargetId,
 } from "../roster/index.mjs";
 import { computeScore, resolveSeed } from "./scorer.mjs";
+
+/**
+ * Task C.6/C.9: does `identifier` (an `--only-provider`/`--exclude-provider`
+ * value, which per Task B.1 is a roster TARGET id, e.g. "antigravity-claude")
+ * refer to the same provider as a live snapshot candidate `name` (a raw
+ * display name, e.g. "Antigravity (Claude)")?
+ *
+ * Prefers target-id identity — the only thing that can tell apart two
+ * simultaneously-enabled targets sharing one harness (the two agy buckets) —
+ * and falls back to harness-normalized matching only when either side can't
+ * be resolved to a target id (roster unavailable, a harness-only identifier
+ * like "codex" with no ambiguity to resolve, or a test with no roster
+ * loaded). The fallback is what keeps every existing single-target-harness
+ * caller's behavior byte-identical.
+ * @param {string} identifier
+ * @param {string} name
+ * @returns {boolean}
+ */
+function providerMatches(identifier, name) {
+	const identifierTargetId = resolveTargetId(identifier);
+	const nameTargetId = resolveTargetId(name);
+	if (identifierTargetId && nameTargetId) {
+		return identifierTargetId === nameTargetId;
+	}
+	return normalizeProviderName(identifier) === normalizeProviderName(name);
+}
 
 // Snapshot path - host-side, code constant (WR-1: routing is host-side)
 const SNAPSHOT_PATH = join(
@@ -92,6 +119,7 @@ function indexProviders(snapshot) {
  * @param {number} [options.seed] Explicit seed
  * @param {string} [options.runId] Run ID for seed derivation
  * @param {string[]} [options.exclude] Provider names to explicitly exclude
+ * @param {string[]} [options.only] Provider names/target ids to restrict routing to. Mutually exclusive with exclude at the CLI layer, which rejects that combination before it reaches here; if both were passed directly to route() anyway, exclude is checked first and wins for any name present in both lists.
  * @param {number} [options.floor] Percent left floor (default: DEFAULT_FLOOR)
  * @param {string} [options.tier] Task difficulty tier (high/standard/low) for INV-5
  * @param {string[]} [options.availableProviders] Restrict candidates to providers
@@ -105,6 +133,7 @@ export function route(options = {}) {
 		seed,
 		runId,
 		exclude = [],
+		only = [],
 		floor = DEFAULT_FLOOR,
 		tier,
 		availableProviders,
@@ -134,7 +163,9 @@ export function route(options = {}) {
 		// respect the capability filter and caller-supplied availability/exclude.
 		const blindOrder = Object.keys(PROVIDER_CAPABILITIES).filter(
 			(name) =>
-				isAvailable(name) && passesCapabilityFilter(name, effectiveTier),
+				isAvailable(name) &&
+				passesCapabilityFilter(name, effectiveTier) &&
+				(only.length === 0 || only.some((o) => providerMatches(o, name))),
 		);
 		const blind = routeBlind(blindOrder, exclude);
 		const model = blind.provider
@@ -151,28 +182,46 @@ export function route(options = {}) {
 	const providers = indexProviders(snapshot);
 	const scored = [];
 
+	// Task D.3 (diagnosable no-eligible outcomes): classify every skip so that
+	// when nothing scores we can tell a deterministic INV-5 capability-ceiling
+	// exhaustion (expected, not actionable) from an upstream-unavailable case
+	// (a provider that WOULD be eligible but is unreachable — actionable, go
+	// check credentials/upstream status). `ceilingSkips` counts the INV-5
+	// capability-filter rejections, `otherSkips` every other non-unavailable
+	// rejection (no-adapter, excluded, exhausted, no-windows), and
+	// `firstUnavailable` captures the first `ok:false` provider (in iteration
+	// order) with its snapshot `error` string, which is already redacted/capped
+	// upstream and safe to surface.
+	let ceilingSkips = 0;
+	let otherSkips = 0;
+	let firstUnavailable = null;
+
 	// Score each provider by headroom (percent_left)
 	for (const [name, provider] of providers) {
 		// CR-3: tolerate absent providers - but we're iterating present ones,
 		// absent providers simply won't be in the map. This is the tolerance.
 
 		if (!isAvailable(name)) {
+			otherSkips += 1;
 			log.push(`provider ${name}: no adapter available for this dispatcher`);
 			continue;
 		}
 
-		if (
-			exclude.some(
-				(excluded) =>
-					normalizeProviderName(excluded) === normalizeProviderName(name),
-			)
-		) {
+		if (exclude.some((excluded) => providerMatches(excluded, name))) {
+			otherSkips += 1;
 			log.push(`provider ${name}: explicitly excluded`);
+			continue;
+		}
+
+		if (only.length > 0 && !only.some((o) => providerMatches(o, name))) {
+			otherSkips += 1;
+			log.push(`provider ${name}: not in --only-provider allowlist`);
 			continue;
 		}
 
 		// INV-5: Capability filter - skip providers below task tier
 		if (!passesCapabilityFilter(name, effectiveTier)) {
+			ceilingSkips += 1;
 			log.push(
 				`provider ${name}: below capability threshold for tier ${effectiveTier}`,
 			);
@@ -180,6 +229,9 @@ export function route(options = {}) {
 		}
 
 		if (!provider.ok) {
+			if (firstUnavailable === null) {
+				firstUnavailable = { name, error: provider.error ?? null };
+			}
 			log.push(`provider ${name}: unavailable (ok=false)`);
 			continue;
 		}
@@ -194,6 +246,7 @@ export function route(options = {}) {
 		);
 
 		if (windows.length === 0) {
+			otherSkips += 1;
 			log.push(`provider ${name}: no valid windows`);
 			continue;
 		}
@@ -207,6 +260,7 @@ export function route(options = {}) {
 			: windows.reduce((min, w) => Math.min(min, w.percent_left), Infinity);
 
 		if (minPercentLeft < floor) {
+			otherSkips += 1;
 			log.push(
 				`provider ${name}: exhausted (${minPercentLeft}% < ${floor}% floor)`,
 			);
@@ -239,11 +293,29 @@ export function route(options = {}) {
 
 	if (scored.length === 0) {
 		log.push("no eligible providers");
+		// Task D.3: replace the bare generic reason with the most actionable
+		// classification, in this exact precedence:
+		//   1. an upstream-unavailable provider (ok=false) — actionable, go
+		//      check credentials/upstream status. Surface the FIRST such
+		//      provider in iteration order with its (already redacted) error.
+		//   2. otherwise, if every skip was the deterministic INV-5 capability
+		//      ceiling (zero unavailable, zero other skips) — expected, not
+		//      actionable.
+		//   3. otherwise keep the generic no_eligible unchanged (mixed or
+		//      non-ceiling skips: exhausted-floor, excluded, no-adapter,
+		//      no-windows) — relied on by the existing exhaustion-floor test.
+		let reason = "no_eligible";
+		if (firstUnavailable !== null) {
+			const error = firstUnavailable.error ?? "unknown error";
+			reason = `no_eligible_upstream_unavailable: ${firstUnavailable.name} — ${error}`;
+		} else if (ceilingSkips > 0 && otherSkips === 0) {
+			reason = "no_eligible_capability_ceiling";
+		}
 		return {
 			provider: null,
 			model: null,
 			percentLeft: null,
-			reason: "no_eligible",
+			reason,
 			log,
 		};
 	}
