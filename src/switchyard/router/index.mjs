@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	CAPABILITY_CLASS,
+	getImplementorPriority,
 	getRightSizedModel,
 	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
@@ -180,7 +181,6 @@ export function route(options = {}) {
 	}
 
 	const providers = indexProviders(snapshot);
-	const scored = [];
 
 	// Task D.3 (diagnosable no-eligible outcomes): classify every skip so that
 	// when nothing scores we can tell a deterministic INV-5 capability-ceiling
@@ -188,13 +188,45 @@ export function route(options = {}) {
 	// (a provider that WOULD be eligible but is unreachable — actionable, go
 	// check credentials/upstream status). `ceilingSkips` counts the INV-5
 	// capability-filter rejections, `otherSkips` every other non-unavailable
-	// rejection (no-adapter, excluded, exhausted, no-windows), and
-	// `firstUnavailable` captures the first `ok:false` provider (in iteration
-	// order) with its snapshot `error` string, which is already redacted/capped
-	// upstream and safe to surface.
+	// rejection (no-adapter, excluded, exhausted, no-windows, ranked-provider
+	// drained, ac/ap exhausted), and `firstUnavailable` captures the first
+	// `ok:false` provider (in iteration order) with its snapshot `error`
+	// string, which is already redacted/capped upstream and safe to surface.
 	let ceilingSkips = 0;
 	let otherSkips = 0;
 	let firstUnavailable = null;
+
+	// implementor-priority-waterfall-routing plan: survivors of the checks
+	// above partition into three pools instead of one flat scored array.
+	//   - rankedPool: providers whose roster target sets implementor_priority
+	//     (the "cheap implementor" waterfall — Antigravity's two buckets,
+	//     Copilot, Cursor's `ac` window). Drained to a hardcoded 0% floor,
+	//     strictly in priority order — INV-4's headroom spread does not apply
+	//     WITHIN this pool.
+	//   - unrankedPool: every other funded provider (Claude, Codex,
+	//     opencode-go, ...), using the EXACT pre-existing floor+spread
+	//     semantics, byte-identical to today.
+	//   - lastResortPool: Cursor's `ap` (API) window alone, gated by the
+	//     ordinary DEFAULT_FLOOR — only reachable once both pools above are
+	//     empty (see the winner-resolution precedence below).
+	const rankedPool = [];
+	const unrankedPool = [];
+	const lastResortPool = [];
+
+	// Minimum finite pace_delta across a set of windows — Task 10's
+	// reduce-based min (never Math.min(...spread), which blows the call stack
+	// on an oversized windows array), 0 fallback when none is finite. Shared
+	// by every pool: the unranked pool uses it over all of a provider's
+	// windows (unchanged), the ranked pool the same way, and Cursor's ac/ap
+	// candidates each pass their own single-window array.
+	function computePace(windowSet) {
+		const paces = windowSet
+			.map((w) => w.pace_delta)
+			.filter((p) => typeof p === "number" && Number.isFinite(p));
+		return paces.length > 0
+			? paces.reduce((min, p) => Math.min(min, p), Infinity)
+			: 0;
+	}
 
 	// Score each provider by headroom (percent_left)
 	for (const [name, provider] of providers) {
@@ -251,14 +283,98 @@ export function route(options = {}) {
 			continue;
 		}
 
-		// Health = MIN across valid windows (worst window vetoes).
-		// Exception for Cursor: auto/composer usage shifts to API once exhausted, so Cursor's
-		// buckets (ac/ap) are pooled into a single combined average headroom.
+		const priority = getImplementorPriority(name);
 		const isCursor = normalizeProviderName(name) === "cursor";
-		const minPercentLeft = isCursor
-			? windows.reduce((sum, w) => sum + w.percent_left, 0) / windows.length
-			: windows.reduce((min, w) => Math.min(min, w.percent_left), Infinity);
 
+		if (isCursor) {
+			// Cursor's `ac` (auto/1st-party) and `ap` (API) windows are no
+			// longer pooled: `ac` alone is the rank-3 priority-fill candidate
+			// (0% floor, matched by w.id, never array position), `ap` alone is
+			// a separate last-resort candidate gated by the ordinary
+			// DEFAULT_FLOOR regardless of the caller-supplied floor — reserved,
+			// almost never used.
+			const acWindow = windows.find((w) => w.id === "ac");
+			const apWindow = windows.find((w) => w.id === "ap");
+
+			if (acWindow && priority !== null) {
+				if (acWindow.percent_left > 0) {
+					rankedPool.push({
+						name,
+						percentLeft: acWindow.percent_left,
+						pace: computePace([acWindow]),
+						priority,
+					});
+					log.push(
+						`provider ${name}: eligible for priority fill via ac (${acWindow.percent_left}% left, priority ${priority})`,
+					);
+				} else {
+					otherSkips += 1;
+					log.push(
+						`provider ${name}: ac window drained (${acWindow.percent_left}% <= 0% floor)`,
+					);
+				}
+			} else {
+				otherSkips += 1;
+				log.push(
+					`provider ${name}: no ac window (or no roster implementor_priority) for priority fill`,
+				);
+			}
+
+			if (apWindow) {
+				if (apWindow.percent_left >= DEFAULT_FLOOR) {
+					lastResortPool.push({
+						name,
+						percentLeft: apWindow.percent_left,
+						pace: computePace([apWindow]),
+					});
+					log.push(
+						`provider ${name}: eligible as last-resort via ap (${apWindow.percent_left}% left)`,
+					);
+				} else {
+					otherSkips += 1;
+					log.push(
+						`provider ${name}: ap exhausted (${apWindow.percent_left}% < ${DEFAULT_FLOOR}% floor)`,
+					);
+				}
+			} else {
+				otherSkips += 1;
+				log.push(`provider ${name}: no ap window for last-resort fallback`);
+			}
+
+			continue;
+		}
+
+		// Health = MIN across valid windows (worst window vetoes) — unchanged
+		// for every non-Cursor provider.
+		const minPercentLeft = windows.reduce(
+			(min, w) => Math.min(min, w.percent_left),
+			Infinity,
+		);
+
+		if (priority !== null) {
+			// Ranked ("cheap implementor") provider: hardcoded 0% floor,
+			// regardless of the caller-supplied floor option — a deliberate
+			// policy override, not just a new default.
+			if (minPercentLeft > 0) {
+				rankedPool.push({
+					name,
+					percentLeft: minPercentLeft,
+					pace: computePace(windows),
+					priority,
+				});
+				log.push(
+					`provider ${name}: eligible for priority fill (${minPercentLeft}% left, priority ${priority})`,
+				);
+			} else {
+				otherSkips += 1;
+				log.push(
+					`provider ${name}: ranked provider drained (${minPercentLeft}% <= 0% floor)`,
+				);
+			}
+			continue;
+		}
+
+		// Unranked: exact pre-existing floor + spread semantics.
 		if (minPercentLeft < floor) {
 			otherSkips += 1;
 			log.push(
@@ -267,31 +383,75 @@ export function route(options = {}) {
 			continue; // INV-4: skip exhausted providers
 		}
 
-		// Use pace_delta for spread scoring (review-plugin's approach)
-		// All finite pace_deltas from valid windows
-		const paces = windows
-			.map((w) => w.pace_delta)
-			.filter((p) => typeof p === "number" && Number.isFinite(p));
-
-		// Task 10: reduce instead of Math.min(...spread); keep the empty guard so
-		// a provider with no finite paces still scores 0 (not Infinity).
-		const pace =
-			paces.length > 0
-				? paces.reduce((min, p) => Math.min(min, p), Infinity)
-				: 0;
-
-		scored.push({
-			name,
-			percentLeft: minPercentLeft,
-			pace,
-		});
-
+		const pace = computePace(windows);
+		unrankedPool.push({ name, percentLeft: minPercentLeft, pace });
 		log.push(
 			`provider ${name}: eligible (${minPercentLeft}% left, pace=${pace})`,
 		);
 	}
 
-	if (scored.length === 0) {
+	// Resolve the winner of a pool by best metric (lowest for priority rank,
+	// highest for percentLeft headroom), tie-breaking equal-metric candidates
+	// with the documented scorer (0.9·normPace + 0.1·jitter, Task 11) — the
+	// SAME mechanism the pre-existing equal-percentLeft tie-break used, now
+	// shared by both the unranked spread pool and the ranked priority pool.
+	function resolveWinner(pool, metricOf, isBetter, describeMetric) {
+		let best = pool[0];
+		for (const item of pool) {
+			if (isBetter(metricOf(item), metricOf(best))) best = item;
+		}
+		const bestMetric = metricOf(best);
+		const tied = pool.filter((item) => metricOf(item) === bestMetric);
+		if (tied.length > 1) {
+			const allPaces = tied.map((s) => s.pace);
+			let bestScore = Number.NEGATIVE_INFINITY;
+			for (const s of tied) {
+				const model = getRightSizedModel(s.name, effectiveTier);
+				const key = `${s.name}:${model ?? effectiveTier}`;
+				const { score } = computeScore(s.pace, routeSeed, key, allPaces);
+				if (score > bestScore) {
+					bestScore = score;
+					best = s;
+				}
+			}
+			log.push(
+				`tie ${describeMetric(bestMetric)} among ${tied.map((s) => s.name).join(", ")} — scorer picked ${best.name}`,
+			);
+		}
+		return best;
+	}
+
+	let winner;
+	let reason;
+
+	if (rankedPool.length > 0) {
+		// True waterfall: strictly lowest implementor_priority wins, never
+		// compared against headroom across ranks (rank 1 wins over rank 2 even
+		// with less headroom left). Equal-priority candidates (the two
+		// Antigravity buckets, both priority 1) fall to the scorer.
+		winner = resolveWinner(
+			rankedPool,
+			(s) => s.priority,
+			(a, b) => a < b,
+			(metric) => `at priority ${metric}`,
+		);
+		reason = "priority_fill";
+	} else if (unrankedPool.length > 0) {
+		// Spread: favor most remaining headroom (highest percent_left).
+		// This differs from review-plugin's pace-based spread because
+		// switchyard wants to drain aggregate capacity, not optimize for pace.
+		winner = resolveWinner(
+			unrankedPool,
+			(s) => s.percentLeft,
+			(a, b) => a > b,
+			(metric) => `at ${metric}%`,
+		);
+		reason = "spread";
+	} else if (lastResortPool.length > 0) {
+		// At most one candidate (Cursor's ap window) — trivial, no tie-break.
+		winner = lastResortPool[0];
+		reason = "last_resort_fallback";
+	} else {
 		log.push("no eligible providers");
 		// Task D.3: replace the bare generic reason with the most actionable
 		// classification, in this exact precedence:
@@ -303,58 +463,22 @@ export function route(options = {}) {
 		//      actionable.
 		//   3. otherwise keep the generic no_eligible unchanged (mixed or
 		//      non-ceiling skips: exhausted-floor, excluded, no-adapter,
-		//      no-windows) — relied on by the existing exhaustion-floor test.
-		let reason = "no_eligible";
+		//      no-windows, ranked-drained, ac/ap-exhausted) — relied on by the
+		//      existing exhaustion-floor test.
+		let noEligibleReason = "no_eligible";
 		if (firstUnavailable !== null) {
 			const error = firstUnavailable.error ?? "unknown error";
-			reason = `no_eligible_upstream_unavailable: ${firstUnavailable.name} — ${error}`;
+			noEligibleReason = `no_eligible_upstream_unavailable: ${firstUnavailable.name} — ${error}`;
 		} else if (ceilingSkips > 0 && otherSkips === 0) {
-			reason = "no_eligible_capability_ceiling";
+			noEligibleReason = "no_eligible_capability_ceiling";
 		}
 		return {
 			provider: null,
 			model: null,
 			percentLeft: null,
-			reason,
+			reason: noEligibleReason,
 			log,
 		};
-	}
-
-	// Spread: favor most remaining headroom (highest percent_left)
-	// This differs from review-plugin's pace-based spread because switchyard
-	// wants to drain aggregate capacity, not optimize for pace.
-	// The plan says: "favors the most remaining headroom rather than draining
-	// one provider before touching the next"
-	let winner = scored[0];
-	for (const s of scored) {
-		// Primary: highest percent_left (most headroom)
-		if (s.percentLeft > winner.percentLeft) {
-			winner = s;
-		}
-	}
-
-	// Task 11: tie-break with the documented scorer, not roster iteration order.
-	// Multiple providers can share the top percent_left; before this the winner
-	// was simply scored[0] (array order). Decide equal-headroom candidates with
-	// computeScore (0.9·normPace + 0.1·jitter) seeded by the resolved routeSeed,
-	// so the tie-break is deterministic and actually spreads (INV-4).
-	const topPercentLeft = winner.percentLeft;
-	const tied = scored.filter((s) => s.percentLeft === topPercentLeft);
-	if (tied.length > 1) {
-		const allPaces = tied.map((s) => s.pace);
-		let bestScore = Number.NEGATIVE_INFINITY;
-		for (const s of tied) {
-			const model = getRightSizedModel(s.name, effectiveTier);
-			const key = `${s.name}:${model ?? effectiveTier}`;
-			const { score } = computeScore(s.pace, routeSeed, key, allPaces);
-			if (score > bestScore) {
-				bestScore = score;
-				winner = s;
-			}
-		}
-		log.push(
-			`tie at ${topPercentLeft}% among ${tied.map((s) => s.name).join(", ")} — scorer picked ${winner.name}`,
-		);
 	}
 
 	// CR-2 regression
@@ -370,7 +494,7 @@ export function route(options = {}) {
 		provider: winner.name,
 		model,
 		percentLeft: winner.percentLeft,
-		reason: "spread",
+		reason,
 		log,
 	};
 }

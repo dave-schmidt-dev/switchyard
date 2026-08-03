@@ -390,13 +390,29 @@ function findTargetForHarness(targets, harnessKey, snapshotName) {
 }
 
 /**
+ * Normalize a target's raw `implementor_priority` field (implementor-
+ * priority-waterfall-routing plan) to either a positive integer or `null`.
+ * The field is optional roster data (unknown-field-permissive per
+ * ~/.agent/rosterlib/validate.py R4/R5 — no schema change needed there): a
+ * missing field, `0`, a negative number, or a non-integer all normalize to
+ * `null` ("unranked"), matching how an absent field behaves for every target
+ * that never sets it.
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function normalizeImplementorPriority(value) {
+	return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
  * Compute one PROVIDER_CAPABILITIES-shaped entry (`capability_class` +
- * `models` per tier) for a single target. Shared by the harness-keyed table
- * (buildProviderCapabilities) and the snapshot-name-keyed table
- * (buildSnapshotNameCapabilities) so both stay byte-identical in shape.
+ * `models` + `implementor_priority` per tier) for a single target. Shared by
+ * the harness-keyed table (buildProviderCapabilities) and the
+ * snapshot-name-keyed table (buildSnapshotNameCapabilities) so both stay
+ * byte-identical in shape.
  * @param {object} target
  * @param {object} models
- * @returns {{capability_class: string|null, models: object}}
+ * @returns {{capability_class: string|null, models: object, implementor_priority: number|null}}
  */
 function buildCapabilityEntry(target, models) {
 	const modelsByTier = {};
@@ -406,6 +422,9 @@ function buildCapabilityEntry(target, models) {
 	return {
 		capability_class: autoRoutingCeiling(target, models),
 		models: modelsByTier,
+		implementor_priority: normalizeImplementorPriority(
+			target?.implementor_priority,
+		),
 	};
 }
 
@@ -585,6 +604,24 @@ export function getModelForTier(providerName, tier) {
 		getSnapshotNameCapabilities()[providerName] ??
 		getProviderCapabilities()[normalizeProviderName(providerName)];
 	return provider?.models?.[tier] ?? null;
+}
+
+/**
+ * Get the implementor-priority rank for a provider (implementor-priority-
+ * waterfall-routing plan) — a positive integer where lower drains first, or
+ * `null` when the backing roster target doesn't set `implementor_priority`
+ * (the unranked/spread-pool default for every target that doesn't opt in).
+ * Same snapshot-name-then-harness lookup order as getCapabilityClass/
+ * getModelForTier, so the two simultaneously-enabled agy targets each carry
+ * their own rank rather than colliding on the shared "agy" harness key.
+ * @param {string} providerName
+ * @returns {number|null}
+ */
+export function getImplementorPriority(providerName) {
+	const provider =
+		getSnapshotNameCapabilities()[providerName] ??
+		getProviderCapabilities()[normalizeProviderName(providerName)];
+	return provider?.implementor_priority ?? null;
 }
 
 /**

@@ -17,6 +17,7 @@ import {
 	CAPABILITY_CLASS,
 	filterByCapability,
 	getCapabilityClass,
+	getImplementorPriority,
 	getModelForTier,
 	getRightSizedModel,
 	normalizeProviderName,
@@ -226,6 +227,25 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 	it("getCapabilityClass returns null for a provider name absent from the roster", () => {
 		setRosterPath(FIXTURE_PATH);
 		strictEqual(getCapabilityClass("totally-unknown-provider"), null);
+	});
+
+	it("getImplementorPriority returns the roster-declared rank for a ranked target, null for an unranked one", () => {
+		setRosterPath(FIXTURE_PATH);
+		// antigravity/copilot-student/cursor-pro are the fixture's ranked
+		// ("cheap implementor") targets (implementor-priority-waterfall-routing
+		// plan); claude-code/codex/opencode-go set no implementor_priority and
+		// must resolve to null (unranked/spread pool).
+		strictEqual(getImplementorPriority("agy"), 1);
+		strictEqual(getImplementorPriority("copilot"), 2);
+		strictEqual(getImplementorPriority("cursor"), 3);
+		strictEqual(getImplementorPriority("claude"), null);
+		strictEqual(getImplementorPriority("codex"), null);
+		strictEqual(getImplementorPriority("opencode"), null);
+	});
+
+	it("getImplementorPriority returns null for a provider name absent from the roster", () => {
+		setRosterPath(FIXTURE_PATH);
+		strictEqual(getImplementorPriority("totally-unknown-provider"), null);
 	});
 
 	it("__resetRosterCacheForTests lets a later test point at a different roster and see fresh values", () => {

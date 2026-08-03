@@ -130,6 +130,7 @@
 			"credential_profile": "default",
 			"enabled": true,
 			"technical_ceiling": "standard",
+			"implementor_priority": 1,
 			"qualifications": {
 				"fixture-agy-low": { "status": "qualified" },
 				"fixture-agy-standard": { "status": "qualified" }
@@ -145,6 +146,7 @@
 			"credential_profile": "default",
 			"enabled": true,
 			"technical_ceiling": "high",
+			"implementor_priority": 3,
 			"qualifications": {
 				"fixture-cursor-composer": { "status": "qualified" },
 				"fixture-cursor-manual-high@xhigh": { "status": "untested" }
@@ -182,6 +184,7 @@
 			"credential_profile": "default",
 			"enabled": true,
 			"technical_ceiling": "standard",
+			"implementor_priority": 2,
 			"qualifications": {
 				"fixture-copilot-auto": { "status": "qualified" }
 			},

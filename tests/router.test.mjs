@@ -352,21 +352,27 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		);
 	});
 
-	it("pools Cursor auto and API buckets into one combined average headroom pool", () => {
+	it("no longer pools Cursor's ac/ap windows — ac alone drives the (ranked) result even though ap has more headroom", () => {
+		// implementor-priority-waterfall-routing plan: Cursor's ac (1st-party,
+		// rank 3, 0% floor) and ap (API, last-resort) windows are matched by
+		// `w.id`, never pooled/averaged. ac is well above its 0% floor here, so
+		// cursor-pro's ranked candidate wins on ac's own headroom (4.66%) —
+		// nothing close to the old pooled ~43% average.
 		createTestSnapshot([
 			{
 				name: "cursor",
 				ok: true,
 				windows: [
-					{ percent_left: 4.66, pace_delta: -0.4 },
-					{ percent_left: 81.82, pace_delta: 0.2 },
+					{ id: "ac", percent_left: 4.66, pace_delta: -0.4 },
+					{ id: "ap", percent_left: 81.82, pace_delta: 0.2 },
 				],
 			},
 		]);
 
 		const result = route({ tier: "standard" });
 		strictEqual(result.provider, "cursor");
-		strictEqual(Math.round(result.percentLeft), 43);
+		strictEqual(result.percentLeft, 4.66);
+		strictEqual(result.reason, "priority_fill");
 	});
 
 	it("breaks percent_left ties with the scorer, not roster order (Task 11)", () => {
@@ -682,5 +688,234 @@ describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 sp
 		);
 		strictEqual(result.percentLeft, 85);
 		strictEqual(result.reason, "spread");
+	});
+});
+
+describe("router (implementor-priority waterfall routing)", () => {
+	// Fixture ranks: antigravity (agy) = 1, copilot-student (copilot) = 2,
+	// cursor-pro (cursor, ac window only) = 3. claude/codex/opencode carry no
+	// implementor_priority and stay in the unranked spread pool.
+
+	it("a ranked provider is chosen over a higher-headroom unranked one", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 0 }],
+			},
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 20, pace_delta: 0 }],
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(
+			result.provider,
+			"antigravity",
+			"ranked pool wins over unranked pool regardless of relative headroom",
+		);
+		strictEqual(result.reason, "priority_fill");
+	});
+
+	it("waterfall order is strictly honored across multiple ranked providers regardless of relative headroom", () => {
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 1, pace_delta: 0 }],
+			},
+			{
+				name: "copilot",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }],
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(
+			result.provider,
+			"antigravity",
+			"priority 1 wins over priority 2 even with far less headroom left — a true waterfall, not a headroom comparison",
+		);
+		strictEqual(result.reason, "priority_fill");
+	});
+
+	it("a ranked provider drains to exactly 0% (not the 5% DEFAULT_FLOOR) before falling through", () => {
+		// Below the unranked DEFAULT_FLOOR (5%) but still above the ranked 0%
+		// floor: must still be picked — proves the hardcoded 0% floor
+		// override, not just a lower default.
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 1, pace_delta: 0 }],
+			},
+		]);
+		let result = route({ tier: "standard" });
+		strictEqual(result.provider, "antigravity");
+		strictEqual(result.reason, "priority_fill");
+
+		// At exactly 0%, the ranked provider must fall through instead.
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 0, pace_delta: 0 }],
+			},
+		]);
+		result = route({ tier: "standard" });
+		strictEqual(
+			result.provider,
+			null,
+			"a ranked provider at exactly 0% must be excluded, not treated as still-eligible",
+		);
+	});
+
+	it("Cursor's ac window alone drives ranked eligibility (matched by window id, not array position)", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ap", percent_left: 99, pace_delta: 0 },
+					{ id: "ac", percent_left: 10, pace_delta: 0 },
+				],
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(result.provider, "cursor");
+		strictEqual(
+			result.percentLeft,
+			10,
+			"eligibility and headroom must come from the ac window (matched by id), not array position or the ap window",
+		);
+		strictEqual(result.reason, "priority_fill");
+	});
+
+	it("Cursor's ap window is NOT picked as long as any unranked provider still has headroom, even with ac exhausted", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 0, pace_delta: 0 },
+					{ id: "ap", percent_left: 50, pace_delta: 0 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 10, pace_delta: 0 }],
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(
+			result.provider,
+			"claude",
+			"an unranked provider with headroom must win over Cursor's ap last-resort bucket",
+		);
+		strictEqual(result.reason, "spread");
+	});
+
+	it("Cursor's ap window IS picked once ac is exhausted AND every unranked provider is also exhausted", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 0, pace_delta: 0 },
+					{ id: "ap", percent_left: 50, pace_delta: 0 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 2, pace_delta: 0 }], // below the 5% DEFAULT_FLOOR
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(result.provider, "cursor");
+		strictEqual(result.percentLeft, 50);
+		strictEqual(result.reason, "last_resort_fallback");
+	});
+
+	it("Cursor's ap window still respects its own DEFAULT_FLOOR (5%) exhaustion check", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 0, pace_delta: 0 },
+					{ id: "ap", percent_left: 3, pace_delta: 0 }, // below 5%
+				],
+			},
+		]);
+
+		const result = route({ tier: "standard" });
+		strictEqual(
+			result.provider,
+			null,
+			"ap below its own 5% floor must not be picked even as a last resort",
+		);
+	});
+
+	it("two same-priority ranked providers (the two Antigravity buckets) tie-break via the scorer", () => {
+		// Dedicated fixture (not the shared dual-agy one, which asserts
+		// headroom-based winner flips that a priority tie-break would break):
+		// both agy-harness targets carry implementor_priority: 1, so the tie
+		// is decided by priority equality, then the SAME scorer mechanism
+		// (0.9*normPace + 0.1*jitter) equal-percentLeft ties use elsewhere.
+		// The two buckets are given DELIBERATELY UNEQUAL headroom (90% vs
+		// 40%) to prove headroom plays no role in a same-rank tie: the
+		// ranked-pool tie set is built from priority equality alone, so both
+		// still enter the tie-break despite the headroom gap, and the
+		// LOWER-headroom/higher-pace bucket wins — showing this is not
+		// secretly the ordinary headroom-spread path in disguise. With two
+		// candidates and distinct finite paces, the one at normPace===1 (max
+		// pace) always outscores the one at normPace===0 regardless of
+		// jitter, so the higher-pace bucket deterministically wins even
+		// though it holds less headroom.
+		const tiebreakFixturePath = resolve(
+			__dirname,
+			"fixtures",
+			"roster.priority-tiebreak.fixture.json",
+		);
+		const savedRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = tiebreakFixturePath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "Antigravity",
+					ok: true,
+					windows: [{ percent_left: 90, pace_delta: 1 }],
+				},
+				{
+					name: "Antigravity (Claude)",
+					ok: true,
+					windows: [{ percent_left: 40, pace_delta: 999 }],
+				},
+			]);
+
+			const result = route({ tier: "standard" });
+			strictEqual(
+				result.provider,
+				"Antigravity (Claude)",
+				"both buckets tie at priority 1 — the scorer's higher-pace candidate must win even though it holds LESS headroom (90% vs 40%), proving headroom is not compared within a same-rank tie",
+			);
+			strictEqual(result.reason, "priority_fill");
+		} finally {
+			if (savedRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = savedRosterPath;
+			}
+			__resetRosterCacheForTests();
+		}
 	});
 });

@@ -44,3 +44,6 @@ overnight-log.md
 overnight-report.html
 .verifier_prompt.md
 spikes/
+
+# personal opencode agent-permission config (not shared team config)
+opencode.jsonc
