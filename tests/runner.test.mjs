@@ -1803,6 +1803,10 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
 				},
+				// Marks the checkpoint save position in the sequence (fired right
+				// after saveCheckpoint), proving the durable write lands between
+				// execute and commit — not after it (INV-6).
+				onCheckpointSaved: () => callOrder.push("checkpoint"),
 				adapters: {
 					claude: {
 						execute: (_prompt, workingContainerName) => {
@@ -1824,12 +1828,15 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		strictEqual(seededProjectPath, TEST_DIR);
 		// commit lands after the task's execute (advancing the container baseline
 		// so a following task diffs only against its own work) and before wipe.
+		// The checkpoint save lands between execute and commit so a commit
+		// failure can never strand a completed task outside the durable record.
 		deepStrictEqual(callOrder, [
 			"ensure",
 			"create",
 			"provision",
 			"seed",
 			"execute:generated-working-container",
+			"checkpoint",
 			"commit",
 			"wipe",
 		]);
@@ -1861,6 +1868,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 				seedProject: () => {},
 				commitWorkingTree: () => order.push("commit"),
 				wipeWorkingContainer: () => {},
+				onCheckpointSaved: () => order.push("checkpoint"),
 				adapters: {
 					claude: {
 						execute: () => {
@@ -1876,8 +1884,18 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		strictEqual(result.processedTasks, 2);
 		// Exactly one commit per task, each immediately after that task's execute
 		// — never batched at the end, which would leave every task diffing the
-		// original seed and re-emitting earlier tasks' hunks.
-		deepStrictEqual(order, ["execute", "commit", "execute", "commit"]);
+		// original seed and re-emitting earlier tasks' hunks. Each task's
+		// checkpoint save (fired right after saveCheckpoint) also lands between
+		// that task's execute and commit: the durable record is on disk before
+		// the container baseline is advanced (INV-6).
+		deepStrictEqual(order, [
+			"execute",
+			"checkpoint",
+			"commit",
+			"execute",
+			"checkpoint",
+			"commit",
+		]);
 	});
 
 	it("runQueue still wipes the working container it created when a task throws mid-queue (INV-3)", () => {
@@ -2045,6 +2063,9 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 					callOrder.push("wipe");
 					capturedContextContainerName = name;
 				},
+				// Marks the checkpoint save position in the sequence (fired right
+				// after saveCheckpoint) — it must land between launch and commit.
+				onCheckpointSaved: () => callOrder.push("checkpoint"),
 				orchestrator: {
 					launch: async (payload) => {
 						callOrder.push(`launch:${payload.workingContainerName}`);
@@ -2068,6 +2089,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"provision",
 			"seed",
 			"launch:generated-orchestrator-container",
+			"checkpoint",
 			"commit",
 			"wipe",
 		]);
@@ -2581,6 +2603,861 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			"orchestrator: reset called after each execution_failed",
 		);
 	});
+
+	it("sync path: a completed task is already in the durable checkpoint when commitWorkingTree throws (INV-6)", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let checkpointAtCommit = null;
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {
+					// Snapshot the checkpoint the instant commit is attempted.
+					checkpointAtCommit = JSON.parse(readFileSync(checkpointPath, "utf8"));
+					throw new Error("commit exploded");
+				},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		ok(checkpointAtCommit, "commitWorkingTree was attempted");
+		// The checkpoint save runs ahead of the commit block, so a commit failure
+		// can never strand a completed task outside the durable record.
+		deepStrictEqual(checkpointAtCommit.completedTaskIds, ["1.1"]);
+		strictEqual(checkpointAtCommit.results[0].taskId, "1.1");
+		strictEqual(checkpointAtCommit.results[0].result, "success");
+		strictEqual(checkpointAtCommit.results[0].success, true);
+	});
+
+	it("orchestrator path: a completed task is already in the durable checkpoint when commitWorkingTree throws (INV-6)", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Only task
+- **Status:** pending
+- **Description:** Do the thing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let checkpointAtCommit = null;
+
+		await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {
+					checkpointAtCommit = JSON.parse(readFileSync(checkpointPath, "utf8"));
+					throw new Error("commit exploded");
+				},
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+			},
+		});
+
+		ok(checkpointAtCommit, "commitWorkingTree was attempted");
+		deepStrictEqual(checkpointAtCommit.completedTaskIds, ["1.1"]);
+		strictEqual(checkpointAtCommit.results[0].taskId, "1.1");
+		strictEqual(checkpointAtCommit.results[0].result, "success");
+		strictEqual(checkpointAtCommit.results[0].success, true);
+	});
+
+	it("sync path: a commitWorkingTree failure halts the queue before the next task, keeping the completed task's durable checkpoint (Task 1.2)", () => {
+		// INV-3: a success whose container baseline was not advanced is not
+		// reusable — the next task would diff against (and re-emit) task 1's
+		// uncommitted work. The run must stop before task 2's execute, even
+		// with stopOnFailure:false (only the commit failure can stop it here).
+		// Task 1's checkpoint stays on disk (INV-6); the halt is recorded as a
+		// distinct outcome, not by failing task 1.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+		const executes = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {
+					throw new Error("commit exploded");
+				},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => {
+							executes.push(true);
+							return { success: true, output: "ok" };
+						},
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(
+			executes.length,
+			1,
+			"task 2's execute must never run against an unadvanced container",
+		);
+		strictEqual(result.processedTasks, 1);
+		// The completed task's durable checkpoint stays on disk (INV-6)...
+		deepStrictEqual(result.completedTaskIds, ["1.1"]);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.completedTaskIds, ["1.1"]);
+		strictEqual(checkpoint.results[0].taskId, "1.1");
+		strictEqual(checkpoint.results[0].result, "success");
+		strictEqual(checkpoint.results[0].success, true);
+		// ...and the halt is a distinct, recorded outcome — not a failure
+		// assigned to the successfully completed task.
+		strictEqual(result.results.length, 2);
+		strictEqual(result.results[0].result, "success");
+		strictEqual(result.results[1].result, "halted_after_commit_failure");
+		strictEqual(result.results[1].success, false);
+		strictEqual(result.results[1].action, "commit");
+		ok(
+			result.results[1].reason.includes("commit exploded"),
+			"halt outcome carries the underlying commit failure detail",
+		);
+		strictEqual(checkpoint.results[1].result, "halted_after_commit_failure");
+		// The durable halt entry carries the action-specific static fields
+		// and never embeds the raw commit error message.
+		strictEqual(checkpoint.results[1].action, "commit");
+		strictEqual(checkpoint.results[1].success, false);
+		strictEqual(checkpoint.results[1].timedOut, false);
+		strictEqual(checkpoint.results[1].partialDiffPath, null);
+		ok(
+			!readFileSync(checkpointPath, "utf8").includes("commit exploded"),
+			"checkpoint.json must not embed the commit failure's raw message",
+		);
+		// The failure stays observable on the status channel.
+		const commitFailure = events.find(
+			(e) =>
+				e.event === "checkpoint_failed" &&
+				e.status.startsWith("Checkpoint commit failed"),
+		);
+		ok(commitFailure, "checkpoint_failed event emitted for the commit failure");
+		strictEqual(commitFailure.taskId, "1.1");
+		ok(
+			events.find((e) => e.event === "queue_halted"),
+			"queue_halted event emitted when the run stops",
+		);
+		// The terminal status must not claim "Queue complete" for a halted run.
+		const terminal = events.find((e) => e.event === "terminal");
+		ok(terminal, "terminal event emitted");
+		strictEqual(
+			terminal.status,
+			"Queue halted: 1 tasks processed",
+			"a halted run reports a halted terminal status, not Queue complete",
+		);
+	});
+
+	it("orchestrator path: a commitWorkingTree failure halts the queue before the next launch (Task 1.2)", async () => {
+		// Same INV-3 halt through the headless orchestrator path: task 2 must
+		// never be launched once task 1's container baseline commit failed.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const launches = [];
+		let launchIndex = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {
+					throw new Error("orchestrator commit exploded");
+				},
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async (payload) => {
+						launches.push(payload);
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+			},
+		});
+
+		strictEqual(
+			launches.length,
+			1,
+			"task 2 must never be launched against an unadvanced container",
+		);
+		deepStrictEqual(launches[0].taskId, "1.1");
+		strictEqual(result.processedTasks, 1);
+		deepStrictEqual(result.completedTaskIds, ["1.1"]);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.completedTaskIds, ["1.1"]);
+		strictEqual(checkpoint.results[0].result, "success");
+		strictEqual(checkpoint.results[0].success, true);
+		strictEqual(result.results.length, 2);
+		strictEqual(result.results[1].result, "halted_after_commit_failure");
+		strictEqual(result.results[1].success, false);
+		strictEqual(result.results[1].action, "commit");
+		strictEqual(checkpoint.results[1].result, "halted_after_commit_failure");
+		// The durable orchestrator halt entry carries the action-specific
+		// static fields and never embeds the raw commit error message.
+		strictEqual(checkpoint.results[1].action, "commit");
+		strictEqual(checkpoint.results[1].success, false);
+		strictEqual(checkpoint.results[1].timedOut, false);
+		strictEqual(checkpoint.results[1].partialDiffPath, null);
+		ok(
+			!readFileSync(checkpointPath, "utf8").includes(
+				"orchestrator commit exploded",
+			),
+			"checkpoint.json must not embed the commit failure's raw message",
+		);
+	});
+
+	it("sync path: a resetWorkingTree failure after a failed task halts the queue before the next task, keeping the failed task's durable checkpoint (Task 1.2)", () => {
+		// INV-3 continuation reset: with stopOnFailure:false a failed task's
+		// un-reset changes would bleed into the next task, so a reset failure
+		// must stop the run before task 2's execute. The failed task's
+		// checkpoint entry stays durable (INV-6, success:false and NOT in
+		// completedTaskIds); the halt is a distinct halted_after_reset_failure
+		// outcome — not a failure retroactively assigned to the failed task.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const executes = [];
+		const events = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {
+					throw new Error("reset exploded");
+				},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => {
+							executes.push(true);
+							return { success: true, output: "ok" };
+						},
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(
+			executes.length,
+			1,
+			"task 2's execute must never run after a reset failure",
+		);
+		strictEqual(result.processedTasks, 1);
+		// The failed task's bookkeeping stays durable and un-completed.
+		deepStrictEqual(result.completedTaskIds, []);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.completedTaskIds, []);
+		strictEqual(checkpoint.results[0].taskId, "1.1");
+		strictEqual(checkpoint.results[0].result, "integration_failed");
+		strictEqual(checkpoint.results[0].success, false);
+		// The outcome identifies a reset halt, action-specifically and durably.
+		strictEqual(result.results.length, 2);
+		strictEqual(result.results[1].result, "halted_after_reset_failure");
+		strictEqual(result.results[1].action, "reset");
+		strictEqual(result.results[1].success, false);
+		ok(
+			result.results[1].reason.includes("reset exploded"),
+			"halt outcome carries the underlying reset failure detail",
+		);
+		strictEqual(checkpoint.results[1].result, "halted_after_reset_failure");
+		strictEqual(checkpoint.results[1].action, "reset");
+		// Raw command stderr must never reach the durable checkpoint.
+		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
+		ok(
+			!rawCheckpointJson.includes("reset exploded"),
+			"checkpoint.json must not embed the reset failure's raw message",
+		);
+		// The failure stays observable on the status channel and the terminal
+		// status is truthful about the halt.
+		const resetFailure = events.find(
+			(e) =>
+				e.event === "checkpoint_failed" &&
+				e.status.startsWith("Checkpoint reset failed"),
+		);
+		ok(resetFailure, "checkpoint_failed event emitted for the reset failure");
+		strictEqual(resetFailure.taskId, "1.1");
+		ok(
+			events.find((e) => e.event === "queue_halted"),
+			"queue_halted event emitted when the run stops",
+		);
+		const terminal = events.find((e) => e.event === "terminal");
+		ok(terminal, "terminal event emitted");
+		strictEqual(terminal.status, "Queue halted: 1 tasks processed");
+	});
+
+	it("orchestrator path: a resetWorkingTree failure after a failed task halts the queue before the next launch (Task 1.2)", async () => {
+		// Same INV-3 halt through the headless orchestrator path: task 2 must
+		// never be launched once task 1's continuation reset failed.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Second
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const launches = [];
+		const events = [];
+		let launchIndex = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {
+					throw new Error("orchestrator reset exploded");
+				},
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async (payload) => {
+						launches.push(payload);
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+			},
+		});
+
+		strictEqual(
+			launches.length,
+			1,
+			"task 2 must never be launched after a reset failure",
+		);
+		deepStrictEqual(launches[0].taskId, "1.1");
+		strictEqual(result.processedTasks, 1);
+		deepStrictEqual(result.completedTaskIds, []);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.completedTaskIds, []);
+		strictEqual(checkpoint.results[0].result, "integration_failed");
+		strictEqual(checkpoint.results[0].success, false);
+		strictEqual(result.results.length, 2);
+		strictEqual(result.results[1].result, "halted_after_reset_failure");
+		strictEqual(result.results[1].action, "reset");
+		strictEqual(result.results[1].success, false);
+		strictEqual(checkpoint.results[1].result, "halted_after_reset_failure");
+		strictEqual(checkpoint.results[1].action, "reset");
+		const terminal = events.find((e) => e.event === "terminal");
+		ok(terminal, "terminal event emitted");
+		strictEqual(terminal.status, "Queue halted: 1 tasks processed");
+	});
+
+	it("failed and timed-out tasks still land in the checkpoint with success:false under the reordered flow", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Fails
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Times out
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const diffText = "diff --git a/wip.mjs b/wip.mjs\n+work in progress";
+		let callCount = 0;
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => {
+							callCount += 1;
+							if (callCount === 1) {
+								return { success: false, error: "provider crashed" };
+							}
+							return {
+								success: false,
+								error: "spawnSync docker ETIMEDOUT",
+								timedOut: true,
+							};
+						},
+						captureDiff: () => diffText,
+					},
+				},
+			},
+		});
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results.length, 2);
+		deepStrictEqual(
+			checkpoint.results.map((r) => r.success),
+			[false, false],
+		);
+		deepStrictEqual(
+			checkpoint.results.map((r) => r.result),
+			["execution_failed", "execution_timed_out"],
+		);
+		strictEqual(checkpoint.results[1].timedOut, true);
+		deepStrictEqual(checkpoint.completedTaskIds, []);
+	});
+
+	it("orchestrator path: failed and timed-out tasks land in the checkpoint with success:false under the reordered flow", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Fails
+- **Status:** pending
+- **Description:** first task
+
+### Task 1.2: Times out
+- **Status:** pending
+- **Description:** second task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let launchIndex = 0;
+
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 65,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-orch-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				sleepFn: async () => {},
+				// Deterministic orchestrator timeout: the first status poll
+				// reports a running job whose expected_by is already in the
+				// past relative to the injected clock, so waitForJobCompletion
+				// returns timed_out without sleeping.
+				now: () => 2_000_000_000_000,
+				orchestrator: {
+					launch: async () => {
+						launchIndex += 1;
+						return `job-${launchIndex}`;
+					},
+					status: async (jobId) =>
+						jobId === "job-1"
+							? { state: "done" }
+							: {
+									state: "running",
+									expected_by: "2020-01-01T00:00:00Z",
+								},
+					result: async () => ({
+						success: false,
+						error: "provider crashed",
+					}),
+				},
+			},
+		});
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results.length, 2);
+		deepStrictEqual(
+			checkpoint.results.map((r) => r.success),
+			[false, false],
+		);
+		deepStrictEqual(
+			checkpoint.results.map((r) => r.result),
+			["execution_failed", "orchestrator_timed_out"],
+		);
+		deepStrictEqual(checkpoint.completedTaskIds, []);
+		// The orchestrator timeout verdict must reach the durable record, not
+		// just the result string: the checkpoint's timedOut flag is truthful
+		// for the orchestrator_timed_out outcome (and the in-memory result it
+		// was derived from).
+		strictEqual(result.results[1].timedOut, true);
+		strictEqual(result.results[1].result, "orchestrator_timed_out");
+		strictEqual(checkpoint.results[1].timedOut, true);
+	});
+
+	it("persists the halt outcome to the checkpoint before queue_halted and terminal events (INV-6)", () => {
+		// The halt entry must be on disk the moment the queue_halted observer
+		// event fires — not merely after the run's final save — so any
+		// observer reading the checkpoint at that point (e.g. an operator
+		// reacting to the status channel) already sees the durable halt
+		// outcome. Asserted behaviorally: read the checkpoint inside the
+		// queue_halted handler.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+		let haltOnDiskWhenEventFired = null;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => {
+					events.push(e.event);
+					if (e.event === "queue_halted") {
+						haltOnDiskWhenEventFired = loadCheckpoint(
+							checkpointPath,
+							tasksPath,
+						);
+					}
+				},
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {
+					throw new Error("commit exploded");
+				},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		ok(haltOnDiskWhenEventFired, "queue_halted event fired");
+		strictEqual(
+			haltOnDiskWhenEventFired.results.length,
+			2,
+			"the halt entry must already be on disk when queue_halted fires",
+		);
+		strictEqual(
+			haltOnDiskWhenEventFired.results[1].result,
+			"halted_after_commit_failure",
+		);
+		strictEqual(haltOnDiskWhenEventFired.results[1].action, "commit");
+		// The task's own durable entry precedes the halt, and the halt
+		// precedes the terminal event.
+		const saved = events.indexOf("checkpoint_saved");
+		const halted = events.indexOf("queue_halted");
+		const terminal = events.indexOf("terminal");
+		ok(saved !== -1 && saved < halted, "task entry saved before queue_halted");
+		ok(
+			halted !== -1 && halted < terminal,
+			"queue_halted fires before the terminal event",
+		);
+		strictEqual(result.results[1].result, "halted_after_commit_failure");
+	});
+
+	it("formats a non-Error commit seam failure safely and halts without crashing (regression)", () => {
+		// Injected dependency seams may throw any value, not just an Error. A
+		// thrown plain object must not crash the halt formatting (no unguarded
+		// `error.message` dereference) and must not leak its arbitrary
+		// contents into the halt text or the durable checkpoint.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: First
+- **Status:** pending
+- **Description:** first task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {
+					throw { marker: "RAW_CANARY_commit_object" };
+				},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[1].result, "halted_after_commit_failure");
+		strictEqual(result.results[1].action, "commit");
+		// A non-Error throw maps to the bounded static label, never to the
+		// thrown object's own contents.
+		ok(
+			result.results[1].reason.includes("unknown error"),
+			"halt reason uses the bounded static label for a non-Error throw",
+		);
+		ok(
+			!result.results[1].reason.includes("RAW_CANARY_commit_object"),
+			"a non-Error throw's arbitrary value must never reach the halt reason",
+		);
+		strictEqual(
+			result.results[1].error,
+			null,
+			"a non-Error throw's arbitrary value must never reach the halt error field",
+		);
+		ok(
+			!readFileSync(checkpointPath, "utf8").includes(
+				"RAW_CANARY_commit_object",
+			),
+			"checkpoint.json must never embed a non-Error throw's value",
+		);
+		ok(
+			events.find((e) => e.event === "queue_halted"),
+			"queue_halted still emitted after a non-Error commit failure",
+		);
+		ok(
+			events.find((e) => e.event === "terminal"),
+			"terminal event still emitted after a non-Error commit failure",
+		);
+	});
+
+	it("formats a null reset seam failure safely (no unguarded message dereference)", () => {
+		// A seam that throws literally `null` is the sharpest non-Error case:
+		// any unguarded `error.message` in the reset halt path would throw a
+		// TypeError instead of producing the halt outcome.
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Failing
+- **Status:** pending
+- **Description:** first task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			stopOnFailure: false,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: false, message: "rejected" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {
+					throw null;
+				},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[1].result, "halted_after_reset_failure");
+		strictEqual(result.results[1].action, "reset");
+		ok(
+			result.results[1].reason.includes("unknown error"),
+			"a null throw maps to the bounded static label",
+		);
+		strictEqual(result.results[1].error, null);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[1].result, "halted_after_reset_failure");
+		strictEqual(checkpoint.results[1].action, "reset");
+	});
 });
 
 describe("runner progress hooks (INV-1: no silent waits)", () => {
@@ -2646,9 +3523,11 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 ### Task 1.1: Only task
 - **Status:** pending
 - **Description:** Do the thing
+- **Timeout:** 60s
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const events = [];
+		const routedBefore = Date.now();
 
 		runQueue({
 			tasksFilePath: tasksPath,
@@ -2677,14 +3556,21 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 			},
 		});
 
+		const routedAfter = Date.now();
 		strictEqual(events.length, 2);
 		strictEqual(events[0].type, "routed");
 		strictEqual(events[0].taskId, "1.1");
 		strictEqual(events[0].provider, "claude");
 		strictEqual(events[0].model, "claude-sonnet-5");
+		// The deadline must encode the task's declared Timeout (60s), not
+		// merely "some future time" — a deadline hardcoded to now, or to the
+		// wrong unit, fails this range check. runQueue is synchronous, so the
+		// routing happens between the two timestamps captured around it and
+		// deadline = routing time + 60s must land in [before, after] + 60s.
+		const deadlineMs = new Date(events[0].deadline).getTime();
 		ok(
-			new Date(events[0].deadline).getTime() > Date.now(),
-			"deadline must be in the future",
+			deadlineMs >= routedBefore + 60_000 && deadlineMs <= routedAfter + 60_000,
+			`deadline must encode the 60s task Timeout, got ${events[0].deadline}`,
 		);
 		strictEqual(events[1].type, "execute", "routed must fire before execute");
 	});
@@ -4299,6 +5185,7 @@ describe("runQueue timeout diff persistence", () => {
 		strictEqual(readFileSync(taskResult.partialDiffPath, "utf8"), diffText);
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[0].success, false);
 		strictEqual(checkpoint.results[0].timedOut, true);
 		strictEqual(
 			checkpoint.results[0].partialDiffPath,

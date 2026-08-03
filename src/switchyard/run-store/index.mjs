@@ -37,6 +37,9 @@ function runsRoot() {
 function locksRoot() {
 	return resolve(resolveStateRoot(), "locks");
 }
+function quarantineRoot() {
+	return resolve(resolveStateRoot(), ".quarantine");
+}
 
 const VALID_STATES = new Set([
 	"created",
@@ -63,7 +66,7 @@ const DEFAULT_LEASE_AGE_MS = 60_000;
 
 function validateRunId(runId) {
 	if (typeof runId !== "string" || !RUN_ID_RE.test(runId)) {
-		throw new SchemaError(`Invalid runId: ${runId}`);
+		throw new SchemaError("Invalid runId");
 	}
 }
 
@@ -115,20 +118,20 @@ function lockFilePath(canonicalPath) {
 function validateRun(data) {
 	if (data.schemaVersion !== CURRENT_SCHEMA_VERSION) {
 		throw new SchemaError(
-			`Unsupported schemaVersion: ${data.schemaVersion} (expected ${CURRENT_SCHEMA_VERSION})`,
+			`Unsupported schemaVersion (expected ${CURRENT_SCHEMA_VERSION})`,
 		);
 	}
 	if (typeof data.runId !== "string") {
 		throw new SchemaError("runId must be a string");
 	}
 	if (typeof data.state !== "string" || !VALID_STATES.has(data.state)) {
-		throw new SchemaError(`Invalid state: ${data.state}`);
+		throw new SchemaError("Invalid state");
 	}
 	if (
 		typeof data.cleanupState !== "string" ||
 		!VALID_CLEANUP_STATES.has(data.cleanupState)
 	) {
-		throw new SchemaError(`Invalid cleanupState: ${data.cleanupState}`);
+		throw new SchemaError("Invalid cleanupState");
 	}
 	if (typeof data.revision !== "number" || !Number.isInteger(data.revision)) {
 		throw new SchemaError("revision must be an integer");
@@ -292,14 +295,14 @@ export async function readRun(runId) {
 	let data;
 	try {
 		data = JSON.parse(raw);
-	} catch (e) {
-		throw new SchemaError(
-			`Invalid JSON in run.json for ${runId}: ${e.message}`,
-		);
+	} catch {
+		// Never interpolate JSON.parse's own message or the raw file content —
+		// both can echo fragments of whatever malformed bytes were on disk.
+		throw new SchemaError("run.json contains invalid JSON");
 	}
 
 	if (data === null || typeof data !== "object") {
-		throw new SchemaError(`run.json for ${runId} is not a valid object`);
+		throw new SchemaError("run.json is not a valid object");
 	}
 
 	validateRun(data);
@@ -920,10 +923,20 @@ export async function applyRetention(options = {}) {
 	try {
 		entries = await readdir(runsRoot(), { withFileTypes: true });
 	} catch (e) {
-		if (e.code === "ENOENT") return 0;
+		if (e.code === "ENOENT") return { deletedCount: 0, quarantined: [] };
 		throw e;
 	}
 
+	// A malformed run directory (invalid JSON, unsupported schema, corrupt
+	// runId, etc.) fails readRun on every single scan forever — it never ages
+	// out via the normal succeeded+complete retention path below, since it
+	// can't even be classified. Quarantine moves it out of the active scan
+	// atomically (a rename, not a delete) so it stops being re-read on every
+	// dispatch while staying inspectable on disk. Reason text is always one
+	// of a small set of static strings (SchemaError's own message, which by
+	// construction never interpolates file content — see readRun/validateRun)
+	// or the generic fallback below; raw error/file content never appears.
+	const quarantined = [];
 	const eligible = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
@@ -936,7 +949,29 @@ export async function applyRetention(options = {}) {
 				});
 			}
 		} catch (e) {
-			console.warn(`Failed to read run ${entry.name}: ${e.message}`);
+			const reason =
+				e instanceof SchemaError
+					? e.message
+					: "invalid or unreadable run record";
+			if (dryRun) {
+				console.error(
+					`applyRetention: would quarantine run ${entry.name} (${reason})`,
+				);
+				quarantined.push({ runId: entry.name, reason });
+				continue;
+			}
+			try {
+				await ensureDir(quarantineRoot(), 0o700);
+				await rename(
+					getRunRoot(entry.name),
+					resolve(quarantineRoot(), entry.name),
+				);
+				quarantined.push({ runId: entry.name, reason });
+			} catch (moveError) {
+				console.warn(
+					`applyRetention: failed to quarantine run ${entry.name}: ${moveError.message}`,
+				);
+			}
 		}
 	}
 
@@ -990,7 +1025,7 @@ export async function applyRetention(options = {}) {
 		}
 	}
 
-	return deleted.size;
+	return { deletedCount: deleted.size, quarantined };
 }
 
 /**

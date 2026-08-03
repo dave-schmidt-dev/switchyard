@@ -310,10 +310,18 @@ function parseRecoverArgs(argv) {
  * advance to a terminal state; on a crash the dead PID makes the run — and its
  * leaked container — reclaimable. The run-store steps are best-effort: a
  * run-store failure must not block a foreground dispatch, so we fall back to
- * an unlabeled (legacy) container rather than aborting.
+ * an unlabeled (legacy) container rather than aborting. An exclusive project
+ * lock (INV-6) is held across queue execution and released on every terminal
+ * path; it is only acquired after the run record exists, so a killed dispatch
+ * can never strand a lock whose missing run record `recover` refuses to
+ * reclaim.
  * @param {object} opts Result of parseDispatchArgs (help:false variant)
+ * @param {object} [dependencies] Injectable dependencies (tests only)
+ * @param {(options: object) => object} [dependencies.runQueue] Defaults to the
+ *   real runQueue; tests stub it so the dispatch lock lifecycle can be proven
+ *   in isolation from queue execution (no Docker/containers on that path).
  */
-async function runDispatch(opts) {
+async function runDispatch(opts, dependencies = {}) {
 	console.error(`dispatch: queue    ${opts.tasksFilePath}`);
 	console.error(`dispatch: project  ${opts.projectPath}`);
 	console.error(
@@ -348,11 +356,21 @@ async function runDispatch(opts) {
 	// reviewed. Failed-run directories and their .partial-diffs artifacts are
 	// explicitly OUT OF SCOPE here (CR-7/CR-11/PM-7 disposition) — this only
 	// ever reaps succeeded && cleanupState:"complete" runs, same as always.
+	// Malformed run directories are quarantined (moved, not deleted) on every
+	// sweep regardless of dryRun — same as always for that path — since a
+	// record that can't be read never becomes "eligible" and would otherwise
+	// fail this same scan forever. This sweep remains synchronous-dispatch-only:
+	// detached launch and worker-bootstrap intentionally do not invoke it.
 	applyRetention({ maxAgeDays: 30, dryRun: true })
-		.then((count) => {
-			if (count > 0) {
+		.then(({ deletedCount, quarantined }) => {
+			if (deletedCount > 0) {
 				console.error(
-					`dispatch: retention sweep (dry-run) found ${count} run-store director${count === 1 ? "y" : "ies"} older than 30 days eligible for reclaim — no deletion performed`,
+					`dispatch: retention sweep (dry-run) found ${deletedCount} run-store director${deletedCount === 1 ? "y" : "ies"} older than 30 days eligible for reclaim — no deletion performed`,
+				);
+			}
+			for (const entry of quarantined) {
+				console.error(
+					`dispatch: retention sweep quarantined run ${entry.runId} (${entry.reason})`,
 				);
 			}
 		})
@@ -364,6 +382,18 @@ async function runDispatch(opts) {
 	const pid = process.pid;
 	const startToken = randomUUID();
 	const nonce = randomUUID();
+	const runQueueFn = dependencies.runQueue ?? runQueue;
+
+	// Initialize the run record BEFORE the project lock is ever acquired —
+	// the same ordering handleLaunch uses. The project lock is keyed by the
+	// project path alone and `recover` deliberately refuses to reclaim a lock
+	// whose run.json is missing (CR-4/CR-5), so a lock acquired before its run
+	// record exists is a permanent block if this process is killed in between.
+	// Initializing first means a hard kill at any point after lock acquisition
+	// always leaves a run record the recovery model can reason about (INV-6).
+	// The lock itself is acquired immediately before queue execution below; on
+	// a contention failure it throws the existing LockError and the finally
+	// block advances this run's already-written record to a terminal state.
 	let runStoreReady = false;
 	try {
 		const tasks = loadTaskQueue(opts.tasksFilePath);
@@ -386,7 +416,22 @@ async function runDispatch(opts) {
 
 	let result;
 	try {
-		result = runQueue({
+		// Acquire the exclusive project lock immediately before queue
+		// execution, mirroring handleLaunch. This is deliberately NOT
+		// best-effort like the run-store init above — the lock is the
+		// mutual-exclusion gate, and a run that cannot acquire it must not run
+		// (it fails fast with the existing LockError). It is only attempted
+		// when the run record exists (runStoreReady): when the run store is
+		// degraded there is no record for `recover` to key on, so holding the
+		// lock would recreate the unreclaimable-orphan window this ordering
+		// exists to prevent — the run instead degrades to the unlabeled legacy
+		// path (no lock, no runId label), exactly as a run-store failure always
+		// has. Release on every terminal path is guaranteed by the finally
+		// block below.
+		if (runStoreReady) {
+			await acquireProjectLock(opts.projectPath, runId);
+		}
+		result = runQueueFn({
 			tasksFilePath: opts.tasksFilePath,
 			projectPath: opts.projectPath,
 			maxTasks: opts.maxTasks,
@@ -415,8 +460,8 @@ async function runDispatch(opts) {
 	} finally {
 		if (runStoreReady) {
 			// Advance to a terminal state (so `recover` treats this run as
-			// reclaimable) and release the lock. Best-effort — never mask the
-			// original outcome/throw. If runQueue threw, result is undefined:
+			// reclaimable) and release the run lock. Best-effort — never mask
+			// the original outcome/throw. If runQueue threw, result is undefined:
 			// treat that as a failed run.
 			const anyFailed = result ? result.results.some((r) => !r.success) : true;
 			try {
@@ -434,6 +479,23 @@ async function runDispatch(opts) {
 			} catch (error) {
 				console.error(`dispatch: run-store teardown failed (${error.message})`);
 			}
+		}
+		// Release the project lock on every terminal path — success, a
+		// failed-task result, a thrown runQueue error, or a lock-contention
+		// failure — so a follow-up run against the same project is never
+		// blocked (INV-6). On a contention failure the lock was never ours to
+		// hold, and the ownership check below is exactly what stops this
+		// teardown from unlinking the winner's lock. Runs AFTER the run-store
+		// teardown above (mirroring worker-bootstrap's release ordering), and
+		// independently of it: the lock is released even when runStoreReady is
+		// false. Ownership-checked so this teardown can never unlink a lock a
+		// newer run legitimately re-acquired; best-effort so a release failure
+		// can't mask the run's own outcome (`recover` reclaims any lock this
+		// leaves behind).
+		try {
+			await releaseProjectLockIfOwnedBy(opts.projectPath, runId);
+		} catch (error) {
+			console.error(`dispatch: project lock release failed (${error.message})`);
 		}
 	}
 
@@ -1254,6 +1316,7 @@ export {
 	parseStatusArgs,
 	probeProviderProcess,
 	resolveIsRunDead,
+	runDispatch,
 	sweepManagedOrphans,
 	USAGE,
 	USAGE_LAUNCH,

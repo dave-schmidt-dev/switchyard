@@ -373,8 +373,8 @@ describe("retention", () => {
 			runs.push(await createTerminalRun(i));
 		}
 
-		const deleted = await applyRetention({ maxRuns: 2 });
-		strictEqual(deleted, 3);
+		const result = await applyRetention({ maxRuns: 2 });
+		strictEqual(result.deletedCount, 3);
 
 		for (let i = 0; i < 3; i++) {
 			await rejects(readRun(runs[i].runId), /Run not found/);
@@ -396,8 +396,8 @@ describe("retention", () => {
 
 		await createTerminalRun("ok");
 
-		const deleted = await applyRetention({ maxRuns: 0 });
-		strictEqual(deleted, 1);
+		const result = await applyRetention({ maxRuns: 0 });
+		strictEqual(result.deletedCount, 1);
 
 		const r = await readRun(nonTerminal.runId);
 		strictEqual(r.state, "failed");
@@ -407,30 +407,30 @@ describe("retention", () => {
 		const run = await createTerminalRun("cf");
 		await updateRun(run.runId, { cleanupState: "failed" }, run.revision);
 
-		const deleted = await applyRetention({ maxRuns: 0 });
-		strictEqual(deleted, 0);
+		const result = await applyRetention({ maxRuns: 0 });
+		strictEqual(result.deletedCount, 0);
 	});
 
 	it("deletes runs older than maxAgeDays", async () => {
 		await createTerminalRun("old");
 
-		const deleted = await applyRetention({
+		const result = await applyRetention({
 			maxAgeDays: 0,
 			now: new Date(Date.now() + 86_400_000).toISOString(),
 		});
-		strictEqual(deleted, 1);
+		strictEqual(result.deletedCount, 1);
 	});
 
 	it("dryRun reports maxAgeDays-eligible runs without deleting them", async () => {
 		const run = await createTerminalRun("dry-age");
 
-		const deleted = await applyRetention({
+		const result = await applyRetention({
 			maxAgeDays: 0,
 			now: new Date(Date.now() + 86_400_000).toISOString(),
 			dryRun: true,
 		});
 		// Same count as the non-dryRun call above, but nothing was removed.
-		strictEqual(deleted, 1);
+		strictEqual(result.deletedCount, 1);
 
 		const r = await readRun(run.runId);
 		strictEqual(r.state, "succeeded");
@@ -442,8 +442,8 @@ describe("retention", () => {
 			runs.push(await createTerminalRun(`dry-runs-${i}`));
 		}
 
-		const deleted = await applyRetention({ maxRuns: 1, dryRun: true });
-		strictEqual(deleted, 2);
+		const result = await applyRetention({ maxRuns: 1, dryRun: true });
+		strictEqual(result.deletedCount, 2);
 
 		for (const run of runs) {
 			const r = await readRun(run.runId);
@@ -453,13 +453,82 @@ describe("retention", () => {
 
 	it("deletes nothing when no retention limits set", async () => {
 		await createTerminalRun("keep");
-		const deleted = await applyRetention({});
-		strictEqual(deleted, 0);
+		const result = await applyRetention({});
+		strictEqual(result.deletedCount, 0);
 	});
 
 	it("returns 0 when runs directory does not exist", async () => {
-		const deleted = await applyRetention({ maxRuns: 1 });
-		strictEqual(deleted, 0);
+		const result = await applyRetention({ maxRuns: 1 });
+		strictEqual(result.deletedCount, 0);
+	});
+
+	function writeMalformedRun(runId, rawContent) {
+		const runDir = join(getStateRoot(), "runs", runId);
+		mkdirSync(runDir, { recursive: true });
+		writeFileSync(join(runDir, "run.json"), rawContent, "utf8");
+		return runDir;
+	}
+
+	it("quarantines a run with invalid JSON using a safe, static reason", async () => {
+		const runId = `quarantine-badjson-${uniqueRunId().slice(0, 8)}`;
+		writeMalformedRun(runId, "not valid json at all {{{");
+
+		const result = await applyRetention({});
+		strictEqual(result.deletedCount, 0);
+		strictEqual(result.quarantined.length, 1);
+		strictEqual(result.quarantined[0].runId, runId);
+		strictEqual(result.quarantined[0].reason, "run.json contains invalid JSON");
+		ok(!result.quarantined[0].reason.includes("{{{"));
+
+		strictEqual(existsSync(join(getStateRoot(), "runs", runId)), false);
+		strictEqual(
+			existsSync(join(getStateRoot(), ".quarantine", runId, "run.json")),
+			true,
+		);
+		await rejects(readRun(runId), /Run not found/);
+	});
+
+	it("quarantines a run with an unsupported schemaVersion, surfacing SchemaError's static message", async () => {
+		const runId = `quarantine-schema-${uniqueRunId().slice(0, 8)}`;
+		writeMalformedRun(runId, JSON.stringify({ schemaVersion: 99, runId }));
+
+		const result = await applyRetention({});
+		strictEqual(result.quarantined.length, 1);
+		strictEqual(result.quarantined[0].runId, runId);
+		strictEqual(
+			result.quarantined[0].reason,
+			"Unsupported schemaVersion (expected 1)",
+		);
+	});
+
+	it("dryRun reports quarantine candidates without moving them", async () => {
+		const runId = `quarantine-dry-${uniqueRunId().slice(0, 8)}`;
+		writeMalformedRun(runId, "{ this is not json");
+
+		const result = await applyRetention({ dryRun: true });
+		strictEqual(result.quarantined.length, 1);
+		strictEqual(result.quarantined[0].runId, runId);
+
+		strictEqual(existsSync(join(getStateRoot(), "runs", runId)), true);
+		strictEqual(existsSync(join(getStateRoot(), ".quarantine", runId)), false);
+	});
+
+	it("quarantining a malformed run does not affect valid records in the same sweep", async () => {
+		const badRunId = `quarantine-mixed-bad-${uniqueRunId().slice(0, 8)}`;
+		writeMalformedRun(badRunId, "garbage");
+		const goodRun = await createTerminalRun("mixed-good");
+
+		const result = await applyRetention({ maxRuns: 0 });
+		strictEqual(result.deletedCount, 1);
+		strictEqual(result.quarantined.length, 1);
+		strictEqual(result.quarantined[0].runId, badRunId);
+
+		await rejects(readRun(goodRun.runId), /Run not found/);
+		await rejects(readRun(badRunId), /Run not found/);
+		strictEqual(
+			existsSync(join(getStateRoot(), ".quarantine", badRunId, "run.json")),
+			true,
+		);
 	});
 });
 

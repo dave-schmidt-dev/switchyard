@@ -1032,6 +1032,10 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			result: `orchestrator_${waited.state}`,
+			// Propagate the wait result's timeout verdict so the durable
+			// checkpoint record (timedOut: Boolean(result.timedOut)) is
+			// truthful for an orchestrator_timed_out outcome.
+			timedOut: waited.timedOut,
 		};
 	}
 
@@ -1182,6 +1186,192 @@ function _safeError(error) {
 	if (error.message !== undefined) out.message = error.message;
 	if (error.code !== undefined) out.code = error.code;
 	return out;
+}
+
+// Injected commit/reset seams (tests) can throw any JavaScript value — null,
+// undefined, a string, a plain object — not just an Error. Format the failure
+// for display without ever dereferencing `error.message` on such a value: an
+// Error keeps its message (existing behavior); every other throw maps to one
+// static, bounded label so arbitrary values can never leak into halt text or
+// checkpoint-adjacent status events.
+function _formatCheckpointActionError(error) {
+	if (
+		error instanceof Error &&
+		typeof error.message === "string" &&
+		error.message.length > 0
+	) {
+		return error.message;
+	}
+	return "unknown error";
+}
+
+/**
+ * Build the halt outcome recorded when an owned working container's baseline
+ * cannot be advanced (commit) or restored (reset) after a task. The task
+ * itself is untouched — its durable checkpoint entry stays intact — this is a
+ * run-level outcome explaining why the queue stopped.
+ * The outcome's `result`/`action` are static, action-specific values
+ * (`halted_after_commit_failure`/`commit` vs `halted_after_reset_failure`/
+ * `reset`) so the durable checkpoint entry stays diagnosable without
+ * persisting the underlying error, whose message may embed arbitrary command
+ * stderr. The raw error text is kept only on the in-memory `error`/`reason`
+ * fields for the immediate caller, never written to the checkpoint.
+ * @param {{taskId: string, provider: string|null, model: string|null}} result
+ * @param {string} actionLabel "commit" or "reset"
+ * @param {Error} error The underlying commit/reset error
+ * @returns {object}
+ */
+function _haltResult(result, actionLabel, error) {
+	return {
+		taskId: result.taskId,
+		success: false,
+		provider: result.provider ?? null,
+		model: result.model ?? null,
+		result: `halted_after_${actionLabel}_failure`,
+		action: actionLabel,
+		// Bounded: only a real Error's message is kept; a non-Error throw
+		// value (including a plain object's `message`) never rides along.
+		error: error instanceof Error ? error.message : null,
+		reason: `${actionLabel} failed after task ${result.taskId}: ${_formatCheckpointActionError(error)}`,
+	};
+}
+
+/**
+ * Commit (after success) or reset (after a failed task when continuing) the
+ * owned working container's baseline, per task so multi-task diffs stay
+ * isolated (INV-2). A commit/reset failure leaves the container in a state
+ * INV-3 forbids reusing — a success whose baseline was not advanced would
+ * make the next task diff against (and re-emit) prior uncommitted work, and
+ * a failed task whose changes were not reset would bleed into the next task —
+ * so the run must halt instead of dispatching another task against it. The
+ * existing console/status failure reporting is preserved verbatim.
+ * @param {{success: boolean, taskId: string}} result
+ * @param {object} deps
+ * @param {boolean} deps.ownsWorkingContainer
+ * @param {string} deps.workingContainerName
+ * @param {boolean} deps.stopOnFailure
+ * @param {(name: string) => void} deps.commitWorkingTreeFn
+ * @param {(name: string) => void} deps.resetWorkingTreeFn
+ * @param {Function|null} deps.emitStatus
+ * @param {string} deps.logPrefix Console.error prefix ("runQueue: " or similar)
+ * @returns {object|null} A halt outcome (result: "halted_after_<action>_failure",
+ *   e.g. "halted_after_commit_failure" or "halted_after_reset_failure")
+ *   when the baseline could not be advanced/reset, else null.
+ */
+function commitOrResetWorkingContainer(result, deps) {
+	const {
+		ownsWorkingContainer,
+		workingContainerName,
+		stopOnFailure,
+		commitWorkingTreeFn,
+		resetWorkingTreeFn,
+		emitStatus,
+		logPrefix,
+	} = deps;
+
+	if (!ownsWorkingContainer) return null;
+
+	if (result.success) {
+		try {
+			commitWorkingTreeFn(workingContainerName);
+		} catch (error) {
+			const message = _formatCheckpointActionError(error);
+			console.error(
+				`${logPrefix} could not checkpoint working container after task ${result.taskId}: ${message}`,
+			);
+			if (emitStatus) {
+				emitStatus({
+					phase: "checkpoint",
+					event: "checkpoint_failed",
+					status: `Checkpoint commit failed: ${message}`,
+					taskId: result.taskId,
+					error: _safeError(error),
+				});
+			}
+			return _haltResult(result, "commit", error);
+		}
+	} else if (!stopOnFailure) {
+		try {
+			resetWorkingTreeFn(workingContainerName);
+			if (emitStatus) {
+				emitStatus({
+					phase: "checkpoint",
+					event: "state_reset",
+					status: `Reset working tree after failed task ${result.taskId}`,
+					taskId: result.taskId,
+				});
+			}
+		} catch (error) {
+			const message = _formatCheckpointActionError(error);
+			console.error(
+				`${logPrefix} could not reset working container after task ${result.taskId}: ${message}`,
+			);
+			if (emitStatus) {
+				emitStatus({
+					phase: "checkpoint",
+					event: "checkpoint_failed",
+					status: `Checkpoint reset failed: ${message}`,
+					taskId: result.taskId,
+					error: _safeError(error),
+				});
+			}
+			return _haltResult(result, "reset", error);
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Record a commit/reset-halt outcome in the returned results and the durable
+ * checkpoint, and surface it on the status channel. The halted task's own
+ * checkpoint entry is not modified — completedTaskIds and its result stay on
+ * disk exactly as the pre-commit save wrote them (INV-6). The durable entry
+ * carries only static, secret-safe fields (result/action), never the raw
+ * error message that may contain command output.
+ *
+ * The halt entry is saved through the normal atomic saveCheckpoint at the
+ * point it is recorded — before the queue_halted observer event (and the
+ * later terminal event) can fire — so an observer reading the checkpoint at
+ * that moment already sees the halt outcome (INV-6: durable before
+ * observable). The final save callers make after the run remains and covers
+ * the non-halt fields/zero-runnable path.
+ * @param {object} checkpoint
+ * @param {string} checkpointPath
+ * @param {object[]} results
+ * @param {object} haltResult
+ * @param {Function|null} emitStatus
+ */
+function recordHalt(
+	checkpoint,
+	checkpointPath,
+	results,
+	haltResult,
+	emitStatus,
+) {
+	results.push(haltResult);
+	checkpoint.results.push({
+		taskId: haltResult.taskId,
+		provider: haltResult.provider,
+		model: haltResult.model,
+		result: haltResult.result,
+		action: haltResult.action,
+		success: haltResult.success,
+		timedOut: false,
+		partialDiffPath: null,
+		timestamp: new Date().toISOString(),
+	});
+	checkpoint.lastUpdatedAt = new Date().toISOString();
+	saveCheckpoint(checkpointPath, checkpoint);
+	if (emitStatus) {
+		emitStatus({
+			phase: "lifecycle",
+			event: "queue_halted",
+			status: `Queue halted after task ${haltResult.taskId}: ${haltResult.reason}`,
+			taskId: haltResult.taskId,
+			error: _safeError(haltResult.error),
+		});
+	}
 }
 
 /**
@@ -1417,6 +1607,7 @@ export function runQueue(options) {
 		const runnable = getRunnableTasks(tasks, checkpoint);
 		const results = [];
 		let processed = 0;
+		let halted = false;
 
 		for (const task of runnable) {
 			if (processed >= maxTasks) break;
@@ -1505,51 +1696,6 @@ export function runQueue(options) {
 					});
 				}
 			}
-			if (ownsWorkingContainer) {
-				if (result.success) {
-					try {
-						commitWorkingTreeFn(workingContainerName);
-					} catch (error) {
-						console.error(
-							`runQueue: could not checkpoint working container after task ${result.taskId}: ${error.message}`,
-						);
-						if (emitStatus) {
-							emitStatus({
-								phase: "checkpoint",
-								event: "checkpoint_failed",
-								status: `Checkpoint commit failed: ${error.message}`,
-								taskId: result.taskId,
-								error: _safeError(error),
-							});
-						}
-					}
-				} else if (!stopOnFailure) {
-					try {
-						resetWorkingTreeFn(workingContainerName);
-						if (emitStatus) {
-							emitStatus({
-								phase: "checkpoint",
-								event: "state_reset",
-								status: `Reset working tree after failed task ${result.taskId}`,
-								taskId: result.taskId,
-							});
-						}
-					} catch (error) {
-						console.error(
-							`runQueue: could not reset working container after task ${result.taskId}: ${error.message}`,
-						);
-						if (emitStatus) {
-							emitStatus({
-								phase: "checkpoint",
-								event: "checkpoint_failed",
-								status: `Checkpoint reset failed: ${error.message}`,
-								taskId: result.taskId,
-								error: _safeError(error),
-							});
-						}
-					}
-				}
-			}
 			results.push(result);
 			checkpoint.results.push({
 				taskId: result.taskId,
@@ -1591,10 +1737,38 @@ export function runQueue(options) {
 				});
 			}
 			if (onCheckpointSaved) onCheckpointSaved();
+
+			// The checkpoint/result bookkeeping block above runs ahead of the
+			// working-container commit/reset below: a commit or reset failure (or
+			// a crash mid-commit) must never leave a task whose execute succeeded
+			// missing from the durable checkpoint (INV-6). The result and
+			// completedTaskIds are on disk before commit is even attempted.
+			const haltResult = commitOrResetWorkingContainer(result, {
+				ownsWorkingContainer,
+				workingContainerName,
+				stopOnFailure,
+				commitWorkingTreeFn,
+				resetWorkingTreeFn,
+				emitStatus,
+				logPrefix: "runQueue: ",
+			});
 			if (runStore) {
 				runStore.updateRun({}).catch(() => {});
 			}
 			processed += 1;
+
+			// A commit/reset failure leaves the owned working container in a
+			// state INV-3 forbids reusing (an unadvanced baseline or a failed
+			// task's un-reset changes), so the run must halt here — after this
+			// task's checkpoint/bookkeeping and failure handling — before the
+			// next task's execute/gate/capture can begin. The completed task's
+			// checkpoint stays durable for a later invocation on a fresh
+			// container; the halt itself is recorded as a distinct outcome.
+			if (haltResult) {
+				recordHalt(checkpoint, checkpointPath, results, haltResult, emitStatus);
+				halted = true;
+				break;
+			}
 
 			if (!result.success && stopOnFailure) {
 				break;
@@ -1605,7 +1779,7 @@ export function runQueue(options) {
 			emitStatus({
 				phase: "lifecycle",
 				event: "terminal",
-				status: `Queue complete: ${processed} tasks processed`,
+				status: `Queue ${halted ? "halted" : "complete"}: ${processed} tasks processed`,
 			});
 		}
 		if (runStore) {
@@ -1623,6 +1797,9 @@ export function runQueue(options) {
 		// reports, even when the per-task loop above never ran (e.g. every
 		// task was already completed by a prior checkpoint) — the caller must
 		// never be handed a checkpointPath with nothing on disk behind it.
+		// A halt entry was already persisted by recordHalt before the
+		// queue_halted event fired; this final save is a no-op for that entry
+		// and remains for the other fields/zero-runnable path.
 		saveCheckpoint(checkpointPath, checkpoint);
 
 		return {
@@ -1792,6 +1969,7 @@ export async function runQueueWithOrchestrator(options) {
 		const runnable = getRunnableTasks(tasks, checkpoint);
 		const results = [];
 		let processed = 0;
+		let halted = false;
 
 		for (const task of runnable) {
 			if (processed >= maxTasks) break;
@@ -1841,52 +2019,6 @@ export async function runQueueWithOrchestrator(options) {
 				}
 			}
 
-			if (ownsWorkingContainer) {
-				if (result.success) {
-					try {
-						commitWorkingTreeFn(workingContainerName);
-					} catch (error) {
-						console.error(
-							`runQueueWithOrchestrator: could not checkpoint working container after task ${result.taskId}: ${error.message}`,
-						);
-						if (emitStatus) {
-							emitStatus({
-								phase: "checkpoint",
-								event: "checkpoint_failed",
-								status: `Checkpoint commit failed: ${error.message}`,
-								taskId: result.taskId,
-								error: _safeError(error),
-							});
-						}
-					}
-				} else if (!stopOnFailure) {
-					try {
-						resetWorkingTreeFn(workingContainerName);
-						if (emitStatus) {
-							emitStatus({
-								phase: "checkpoint",
-								event: "state_reset",
-								status: `Reset working tree after failed task ${result.taskId}`,
-								taskId: result.taskId,
-							});
-						}
-					} catch (error) {
-						console.error(
-							`runQueueWithOrchestrator: could not reset working container after task ${result.taskId}: ${error.message}`,
-						);
-						if (emitStatus) {
-							emitStatus({
-								phase: "checkpoint",
-								event: "checkpoint_failed",
-								status: `Checkpoint reset failed: ${error.message}`,
-								taskId: result.taskId,
-								error: _safeError(error),
-							});
-						}
-					}
-				}
-			}
-
 			results.push(result);
 			checkpoint.results.push({
 				taskId: result.taskId,
@@ -1894,6 +2026,7 @@ export async function runQueueWithOrchestrator(options) {
 				model: result.model,
 				result: result.result,
 				success: result.success,
+				timedOut: Boolean(result.timedOut),
 				timestamp: new Date().toISOString(),
 			});
 			checkpoint.lastTaskId = result.taskId;
@@ -1926,10 +2059,32 @@ export async function runQueueWithOrchestrator(options) {
 				});
 			}
 			if (onCheckpointSaved) onCheckpointSaved();
+
+			// Same INV-6 ordering as runQueue: the checkpoint is on disk before
+			// the working-container commit/reset is attempted.
+			const haltResult = commitOrResetWorkingContainer(result, {
+				ownsWorkingContainer,
+				workingContainerName,
+				stopOnFailure,
+				commitWorkingTreeFn,
+				resetWorkingTreeFn,
+				emitStatus,
+				logPrefix: "runQueueWithOrchestrator: ",
+			});
 			if (runStore) {
 				runStore.updateRun({}).catch(() => {});
 			}
 			processed += 1;
+
+			// Same INV-3 halt as runQueue: a commit/reset failure makes the
+			// container non-reusable, so the run stops before the next task's
+			// launch/status/result cycle instead of reusing an unadvanced or
+			// un-reset baseline. The completed task's checkpoint stays durable.
+			if (haltResult) {
+				recordHalt(checkpoint, checkpointPath, results, haltResult, emitStatus);
+				halted = true;
+				break;
+			}
 
 			if (!result.success && stopOnFailure) {
 				break;
@@ -1940,7 +2095,7 @@ export async function runQueueWithOrchestrator(options) {
 			emitStatus({
 				phase: "lifecycle",
 				event: "terminal",
-				status: `Queue complete: ${processed} tasks processed`,
+				status: `Queue ${halted ? "halted" : "complete"}: ${processed} tasks processed`,
 			});
 		}
 		if (runStore) {
@@ -1958,6 +2113,9 @@ export async function runQueueWithOrchestrator(options) {
 		// reports, even when the per-task loop above never ran (e.g. every
 		// task was already completed by a prior checkpoint) — the caller must
 		// never be handed a checkpointPath with nothing on disk behind it.
+		// A halt entry was already persisted by recordHalt before the
+		// queue_halted event fired; this final save is a no-op for that entry
+		// and remains for the other fields/zero-runnable path.
 		saveCheckpoint(checkpointPath, checkpoint);
 
 		return {

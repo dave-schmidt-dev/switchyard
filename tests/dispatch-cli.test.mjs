@@ -2,7 +2,7 @@
 // and backwards compatibility. Tests parse functions directly for deterministic
 // validation and spawns the CLI for exit-code / envelope contract verification.
 
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -11,6 +11,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,6 +52,7 @@ const ROSTER_FIXTURE_PATH = resolve(
 );
 
 import {
+	runDispatch as dispatchRun,
 	parseDispatchArgs,
 	parseLaunchArgs,
 	parseRecoverArgs,
@@ -1796,5 +1798,243 @@ describe("probeProviderProcess matches a real provider-named process (live agent
 		} finally {
 			removeContainer(containerName);
 		}
+	});
+});
+
+// Task 1.3 (INV-6): the synchronous `run` path must hold the exclusive
+// project lock for the duration of queue execution and release it on every
+// terminal path. runQueue is stubbed via runDispatch's injectable
+// dependencies so the lock lifecycle is proven without Docker/containers;
+// the contention failure is additionally proven end-to-end through a real
+// CLI spawn (mirroring detached-dispatch.test.mjs's launch counterpart).
+// The run record is initialized BEFORE the lock is acquired (matching
+// handleLaunch), so the lock is never held without a recoverable run record
+// behind it.
+describe("runDispatch project lock lifecycle (INV-6)", () => {
+	function stubResult(success) {
+		return {
+			totalTasks: 1,
+			runnableTasks: 1,
+			processedTasks: 1,
+			completedTaskIds: success ? ["1.1"] : [],
+			lastTaskId: "1.1",
+			checkpointPath: join(dir, "stub.checkpoint.json"),
+			results: [
+				{
+					taskId: "1.1",
+					success,
+					provider: "stub",
+					model: null,
+					result: success ? "ok" : "boom",
+					reason: success ? undefined : "stubbed failure",
+				},
+			],
+		};
+	}
+
+	async function dispatchWithStub(runQueueFn) {
+		const opts = parseDispatchArgs([tasksFile, "--project", projectDir]);
+		const savedExitCode = process.exitCode;
+		try {
+			await dispatchRun(opts, { runQueue: runQueueFn });
+			return process.exitCode;
+		} finally {
+			process.exitCode = savedExitCode;
+		}
+	}
+
+	async function onlyRunRecord() {
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const runDirs = readdirSync(join(stateRoot, "runs"));
+		strictEqual(
+			runDirs.length,
+			1,
+			`expected exactly one run record, got ${runDirs.length}`,
+		);
+		return readRun(runDirs[0]);
+	}
+
+	it("releases the project lock after a successful synchronous run", async () => {
+		const { isProjectLockHeld } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const exitCode = await dispatchWithStub(() => stubResult(true));
+		strictEqual(exitCode, 0);
+
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released after a successful run",
+		);
+		const run = await onlyRunRecord();
+		strictEqual(run.state, "succeeded");
+		strictEqual(run.cleanupState, "complete");
+	});
+
+	it("holds the synchronous project lock inside the injected runQueue callback (direct behavioral assertion)", async () => {
+		const { isProjectLockHeld } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		// Behavioral seam, not source inspection: the lock must actually be
+		// held for the duration of queue execution — i.e. visible to the
+		// injected runQueue callback itself — and released on the terminal
+		// path afterward (INV-6).
+		let lockHeldInsideCallback = null;
+		const exitCode = await dispatchWithStub(() => {
+			lockHeldInsideCallback = isProjectLockHeld(projectDir);
+			return stubResult(true);
+		});
+		strictEqual(exitCode, 0);
+		strictEqual(
+			lockHeldInsideCallback,
+			true,
+			"the exclusive project lock must be held inside the runQueue callback",
+		);
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released after the run",
+		);
+	});
+
+	it("releases the project lock after a normal failed-task result", async () => {
+		const { isProjectLockHeld } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const exitCode = await dispatchWithStub(() => stubResult(false));
+		strictEqual(exitCode, 1);
+
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released after a failed-task result",
+		);
+		const run = await onlyRunRecord();
+		strictEqual(run.state, "failed");
+		strictEqual(run.cleanupState, "complete");
+	});
+
+	it("releases the project lock after a thrown runQueue error", async () => {
+		const { isProjectLockHeld } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const savedExitCode = process.exitCode;
+		try {
+			await rejects(
+				dispatchRun(parseDispatchArgs([tasksFile, "--project", projectDir]), {
+					runQueue: () => {
+						throw new Error("stubbed queue crash");
+					},
+				}),
+				/stubbed queue crash/,
+			);
+		} finally {
+			process.exitCode = savedExitCode;
+		}
+
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released after a thrown runQueue error",
+		);
+		const run = await onlyRunRecord();
+		strictEqual(run.state, "failed");
+		strictEqual(run.cleanupState, "complete");
+	});
+
+	it("releases the project lock even when the run-store init failed (runStoreReady false)", async () => {
+		const { isProjectLockHeld } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		// Block the run-store from initializing: with a plain file sitting at
+		// stateRoot/runs, initializeRun's ensureDir for the run directory
+		// fails, so runStoreReady stays false and no run record is created.
+		// The queue stub still runs, and its throw must propagate with no
+		// project lock left behind regardless of the failed init (INV-6).
+		// The lock is only ever attempted once the run record exists, so a
+		// degraded run store means no lock at all (the unlabeled legacy
+		// path) — never a lock without a record to back it.
+		mkdirSync(stateRoot, { recursive: true });
+		writeFileSync(join(stateRoot, "runs"), "blocker", "utf8");
+
+		const savedExitCode = process.exitCode;
+		try {
+			await rejects(
+				dispatchRun(parseDispatchArgs([tasksFile, "--project", projectDir]), {
+					runQueue: () => {
+						throw new Error("queue ran despite init failure");
+					},
+				}),
+				/queue ran despite init failure/,
+			);
+		} finally {
+			process.exitCode = savedExitCode;
+		}
+
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released even when the run-store init failed",
+		);
+		const runsPath = join(stateRoot, "runs");
+		ok(
+			!existsSync(runsPath) ||
+				!statSync(runsPath).isDirectory() ||
+				readdirSync(runsPath).length === 0,
+			"no run record should exist when the run-store init failed",
+		);
+	});
+
+	it("a concurrent second run fails fast with the lock-contention error before any queue work (end-to-end)", async () => {
+		const { acquireProjectLock, releaseProjectLockIfOwnedBy } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		// Hold the project lock directly to simulate an in-flight run. This
+		// is deterministic: it does not race a run's terminal cleanup.
+		const holderRunId = randomUUID();
+		await acquireProjectLock(projectDir, holderRunId);
+
+		const result = runDispatch(
+			["run", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(
+			result.status,
+			1,
+			`run against a locked project should exit 1, got ${result.status}: stderr=${result.stderr}`,
+		);
+		ok(
+			result.stderr.includes("Project lock already held"),
+			`expected the lock-contention error, got stderr: ${result.stderr}`,
+		);
+
+		// The run record is initialized before the lock is attempted, so the
+		// contended run leaves a terminal record (with no queue work ever
+		// executed) rather than the old acquire-before-initialize path's
+		// nothing at all. The terminal state is what keeps the record out of
+		// `recover`'s way and confirms the run never executed.
+		const run = await onlyRunRecord();
+		strictEqual(run.state, "failed");
+		strictEqual(run.cleanupState, "complete");
+
+		// No queue execution: the run aborted at the lock gate, so no
+		// checkpoint was ever written for the tasks file.
+		const { getCheckpointPath } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+		ok(
+			!existsSync(getCheckpointPath(tasksFile)),
+			"a lock-contended run must not execute any queue work",
+		);
+
+		// The failed run's teardown must not have released the first run's
+		// lock (ownership-checked release) — prove it still holds the lock,
+		// then clean it up.
+		strictEqual(
+			await releaseProjectLockIfOwnedBy(projectDir, holderRunId),
+			true,
+			"the first run's lock must still be held after the second run failed",
+		);
 	});
 });

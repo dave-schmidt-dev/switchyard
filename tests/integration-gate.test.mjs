@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
+	APPLY_CHECK_MAX_BUFFER,
 	dequoteGitPath,
 	integrationGate,
 	validateDiff,
@@ -148,11 +149,25 @@ index 0000000..abcdef1
 `;
 		const result = integrationGate(traversalDiff, projectPath);
 		strictEqual(result.success, false);
-		ok(
-			!/etc\/switchyard-poc/.test(
-				readFileSync("/etc/hosts", "utf8").slice(0, 0),
-			),
-			"sanity: no host write happened",
+
+		// Real guard (replaces a vacuous readFileSync("/etc/hosts").slice(0,0)
+		// assertion that could never fail): the rejected diff must not have
+		// mutated the temporary repo the gate ran against. A regression that
+		// applied before rejecting, or partially applied, leaves a dirty tree
+		// or a changed file behind. (git apply itself also rejects this path
+		// with status 128, so the external target is never written either.)
+		const status = execSync("git status --porcelain", {
+			cwd: projectPath,
+			encoding: "utf8",
+		});
+		strictEqual(
+			status,
+			"",
+			"a rejected traversal diff must not touch the temp repo working tree",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"original content\n",
 		);
 	});
 
@@ -163,6 +178,70 @@ index 0000000..abcdef1
 		const result = integrationGate(diff, projectPath);
 		strictEqual(result.success, false);
 		ok(result.message.includes("credential"));
+	});
+
+	it("pins the bounded apply-check buffer (regression: the --check probes must stay memory-bounded)", () => {
+		// The forward/reverse `git apply --check` probes (applyCheckPasses)
+		// pipe the diff to git and capture its output; maxBuffer bounds that
+		// capture so a pathological patch cannot buffer unbounded stderr.
+		// The module has no injectable spawn seam, and `git apply --check`
+		// output does not scale with patch size (verified empirically: errors
+		// are emitted once per failing file, so the bound cannot be driven
+		// past from a real diff), so this is a narrow source contract: the
+		// exported bound must be an explicit, generous-but-finite value AND
+		// the probe's spawnSync must actually pass it. Either half dropped
+		// (falling back to the default 1 MiB bound, removing maxBuffer, or
+		// shrinking the constant) fails this test.
+		strictEqual(APPLY_CHECK_MAX_BUFFER, 8 * 1024 * 1024);
+		ok(
+			APPLY_CHECK_MAX_BUFFER > 1024 * 1024,
+			"bound must be larger than the default 1 MiB the probe would otherwise fall back to",
+		);
+		const source = readFileSync(
+			new URL("../src/switchyard/integrate/index.mjs", import.meta.url),
+			"utf8",
+		);
+		// Anchor the wiring to the probe implementation itself rather than
+		// to an unanchored module-wide count: a refactor could move the
+		// single maxBuffer site to a different spawnSync (e.g. the mutating
+		// apply) and leave the --check probes unbounded while the old count
+		// still matched. Extract applyCheckPasses' own body via a
+		// balanced-brace scan (pure string ops — deterministic, no runtime
+		// import needed)...
+		const fnMatch = /function\s+applyCheckPasses\s*\([\s\S]*?\)\s*\{/.exec(
+			source,
+		);
+		ok(fnMatch, "applyCheckPasses must be a function declaration");
+		const bodyStart = fnMatch.index + fnMatch[0].length;
+		let depth = 1;
+		let cursor = bodyStart;
+		while (cursor < source.length && depth > 0) {
+			if (source[cursor] === "{") depth += 1;
+			else if (source[cursor] === "}") depth -= 1;
+			cursor += 1;
+		}
+		ok(
+			depth === 0 && cursor <= source.length,
+			"applyCheckPasses body must terminate at its closing brace",
+		);
+		const probeBody = source.slice(bodyStart, cursor - 1);
+		// ...and require the wiring inside that body:
+		const probeWiring =
+			probeBody.match(/maxBuffer:\s*APPLY_CHECK_MAX_BUFFER/g) ?? [];
+		strictEqual(
+			probeWiring.length,
+			1,
+			"applyCheckPasses must set maxBuffer: APPLY_CHECK_MAX_BUFFER exactly once in its own body",
+		);
+		// No spawnSync outside applyCheckPasses may use the bound either:
+		// every occurrence in the module must be inside the probe body.
+		const moduleWiring =
+			source.match(/maxBuffer:\s*APPLY_CHECK_MAX_BUFFER/g) ?? [];
+		strictEqual(
+			moduleWiring.length,
+			probeWiring.length,
+			"no spawnSync outside applyCheckPasses may use the bound",
+		);
 	});
 
 	it("tags a credential-convention rejection with credentialFlagged: true, both from validateDiff and integrationGate (Task D.4: the signal runner uses to withhold the diff body from disk)", () => {
@@ -390,6 +469,296 @@ index 0000000..abcdef1
 		const emptyResult = integrationGate("", projectPath);
 		strictEqual(emptyResult.success, false);
 		ok(emptyResult.message.toLowerCase().includes("empty"));
+	});
+
+	it("applies an identical diff twice: the second call is a success no-op with alreadyApplied", () => {
+		// Idempotent dispatch: a task whose diff was already applied must not
+		// be reported as a failure (or re-mutate the host). The forward
+		// `git apply --check` fails because the before-state no longer
+		// matches; the reverse check succeeds because the change is already
+		// present, so the gate returns a successful alreadyApplied no-op.
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
+		});
+		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+
+		const first = integrationGate(diff, projectPath);
+		strictEqual(first.success, true, first.message);
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"modified content\n",
+		);
+
+		const second = integrationGate(diff, projectPath);
+		strictEqual(second.success, true, second.message);
+		strictEqual(second.alreadyApplied, true);
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"modified content\n",
+			"re-applying must not mutate the host",
+		);
+	});
+
+	it("second application of a NEW-FILE diff is an alreadyApplied no-op (reverse-check semantics)", () => {
+		// New-file shape: a reverse apply of a new-file diff deletes the
+		// already-created file, so `--reverse --check` succeeds and the gate
+		// reports alreadyApplied without touching the host.
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			mkdirSync(join(dir, "src"), { recursive: true });
+			writeFileSync(
+				join(dir, "src", "new-module.txt"),
+				"created by agent\n",
+				"utf8",
+			);
+		});
+		ok(diff.includes("new file"), "fixture must be a new-file diff");
+		rmSync(join(projectPath, "src"), { recursive: true, force: true });
+		execSync("git reset -q", { cwd: projectPath, stdio: "pipe" });
+
+		const first = integrationGate(diff.trim(), projectPath);
+		strictEqual(first.success, true, first.message);
+		ok(existsSync(join(projectPath, "src", "new-module.txt")));
+
+		const second = integrationGate(diff.trim(), projectPath);
+		strictEqual(second.success, true, second.message);
+		strictEqual(second.alreadyApplied, true);
+		strictEqual(
+			readFileSync(join(projectPath, "src", "new-module.txt"), "utf8"),
+			"created by agent\n",
+		);
+	});
+
+	it("second application of a RENAME diff is an alreadyApplied no-op (reverse-check semantics)", () => {
+		commitFile(projectPath, "src/old.mjs", "original\n");
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			execSync("git mv src/old.mjs src/new.mjs", { cwd: dir });
+		});
+		execSync("git reset -q HEAD -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		execSync("git checkout -q -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		rmSync(join(projectPath, "src", "new.mjs"), { force: true });
+
+		const first = integrationGate(diff, projectPath);
+		strictEqual(first.success, true, first.message);
+		ok(existsSync(join(projectPath, "src", "new.mjs")));
+		ok(!existsSync(join(projectPath, "src", "old.mjs")));
+
+		const second = integrationGate(diff, projectPath);
+		strictEqual(second.success, true, second.message);
+		strictEqual(second.alreadyApplied, true);
+		ok(existsSync(join(projectPath, "src", "new.mjs")));
+		ok(!existsSync(join(projectPath, "src", "old.mjs")));
+	});
+
+	it("second application of a DELETE diff is an alreadyApplied no-op (reverse-check semantics)", () => {
+		commitFile(projectPath, "src/gone.mjs", "original\n");
+		const diff = buildStagedDiff(projectPath, (dir) => {
+			execSync("git rm -q src/gone.mjs", { cwd: dir });
+		});
+		execSync("git reset -q HEAD -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		execSync("git checkout -q -- src/", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const first = integrationGate(diff, projectPath);
+		strictEqual(first.success, true, first.message);
+		ok(!existsSync(join(projectPath, "src", "gone.mjs")));
+
+		const second = integrationGate(diff, projectPath);
+		strictEqual(second.success, true, second.message);
+		strictEqual(second.alreadyApplied, true);
+		ok(!existsSync(join(projectPath, "src", "gone.mjs")));
+	});
+
+	it("still fails on a genuinely conflicting diff (forward and reverse checks both fail)", () => {
+		// A third-party edit moves the tree to a state matching neither the
+		// diff's before-state (forward `--check` fails) nor its after-state
+		// (reverse `--check` fails) — a real conflict, not an already-applied
+		// no-op. It must remain a failure and leave the host untouched.
+		commitFile(projectPath, "conflict.txt", "line a\nline b\nline c\n");
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(
+				join(dir, "conflict.txt"),
+				"line a\nline x\nline c\n",
+				"utf8",
+			);
+		});
+		execSync("git checkout -- conflict.txt", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		writeFileSync(
+			join(projectPath, "conflict.txt"),
+			"line a\nline y\nline c\n",
+			"utf8",
+		);
+
+		const result = integrationGate(diff, projectPath);
+		strictEqual(result.success, false);
+		strictEqual(result.message, "Diff apply failed");
+		// Task 2.1: a genuine conflict must carry git's actionable stderr
+		// under `reason` (e.g. "error: conflict.txt: patch does not apply")
+		// so the caller can distinguish a real conflict from a mis-delivered
+		// patch, while keeping the generic message above.
+		ok(
+			typeof result.reason === "string" && result.reason.length > 0,
+			"a genuine conflict must include git's actionable stderr as reason",
+		);
+		ok(
+			/patch does not apply|patch failed|error:/i.test(result.reason),
+			`reason should quote git's own failure text, got: ${JSON.stringify(result.reason)}`,
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "conflict.txt"), "utf8"),
+			"line a\nline y\nline c\n",
+			"the conflicting diff must not modify the host file",
+		);
+		strictEqual(
+			result.reasonKind,
+			"conflict",
+			"a real conflict must be tagged 'conflict', not 'corrupt_patch'",
+		);
+	});
+
+	it("tags a truncated/malformed diff as reasonKind 'corrupt_patch', distinct from a genuine conflict", () => {
+		// Regression for a live incident (2026-08-03): a container-generated
+		// diff arrived with its final hunk cut short — the hunk header claimed
+		// more lines than were actually present, and the file had no trailing
+		// newline. git's `--check` (forward and reverse) both report
+		// "corrupt patch" for this, distinct from "patch does not apply" for a
+		// real conflict — the two must not be reported identically, since a
+		// truncated diff calls for a retry/re-generation while a real conflict
+		// calls for a different diff entirely.
+		const fullDiff = buildDiff(projectPath, (dir) => {
+			writeFileSync(
+				join(dir, "test.txt"),
+				"original content\nline two\nline three\nline four\nline five\nline six\nline seven\nline eight\nline nine\nCHANGED\n",
+				"utf8",
+			);
+		});
+		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+
+		// Drop the final 2 lines of the diff, matching the real incident's
+		// artifact exactly: the last hunk's trailing context/added lines are
+		// missing and the file has no trailing newline.
+		const lines = fullDiff.split("\n");
+		const truncatedDiff = lines.slice(0, lines.length - 3).join("\n");
+
+		const result = integrationGate(truncatedDiff, projectPath);
+		strictEqual(result.success, false);
+		// A truncated diff fails to parse at all (git apply --numstat, called
+		// from validateDiff) — earlier than a genuine conflict, which parses
+		// fine and only fails later at the actual --check/apply stage. Both
+		// paths must still carry reasonKind so a caller can tell them apart
+		// without inspecting message text.
+		strictEqual(result.message, "diff could not be parsed by git apply");
+		strictEqual(result.reasonKind, "corrupt_patch");
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"original content\n",
+			"a truncated diff must not modify the host file",
+		);
+	});
+
+	it("reports alreadyApplied even when requiredPaths (Files: enforcement) is set — the actual runner call shape", () => {
+		// runner/index.mjs always calls integrationGate with
+		// `{requiredPaths: task.requiredPaths}` (the task's declared `Files:`
+		// field), never bare — so the realistic idempotent-retry path (a killed
+		// dispatch's checkpoint retry regenerating the same diff, INV-6/Task
+		// 1.4's whole motivation) always goes through the requiredPaths branch,
+		// not the bare-call shape the other alreadyApplied tests use. The
+		// requiredPaths checks parse the diff text itself (extractTouchedPaths/
+		// extractSummaryLines), independent of tree state, so they must not be
+		// disturbed by a second, already-applied call.
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
+		});
+		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+
+		const first = integrationGate(diff, projectPath, {
+			requiredPaths: ["test.txt"],
+		});
+		strictEqual(first.success, true, first.message);
+
+		const second = integrationGate(diff, projectPath, {
+			requiredPaths: ["test.txt"],
+		});
+		strictEqual(second.success, true, second.message);
+		strictEqual(second.alreadyApplied, true);
+		strictEqual(
+			readFileSync(join(projectPath, "test.txt"), "utf8"),
+			"modified content\n",
+			"re-applying under requiredPaths enforcement must not mutate the host",
+		);
+	});
+
+	it("a multi-file diff with one already-applied file and one genuinely conflicting file fails closed, not a false alreadyApplied (mixed-state regression)", () => {
+		// Task 1.4 explicitly does not attempt to distinguish a "mixed"
+		// (partially-already-applied, partially-conflicting) patch from a
+		// plain conflict, because a whole-patch forward/reverse check cannot
+		// observe that distinction. This proves the conservative direction
+		// actually holds in code: when one file in a multi-file diff already
+		// matches the diff's after-state but another file has been
+		// independently changed to a THIRD state (matching neither the diff's
+		// before- nor after-state), the whole patch must fail — it must never
+		// be silently swallowed as alreadyApplied, which would abandon the
+		// conflicting file's real conflict undetected.
+		commitFile(projectPath, "a.txt", "original A\n");
+		commitFile(projectPath, "b.txt", "line a\nline b\nline c\n");
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "a.txt"), "modified A\n", "utf8");
+			writeFileSync(join(dir, "b.txt"), "line a\nline x\nline c\n", "utf8");
+		});
+		execSync("git checkout -- a.txt b.txt", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const first = integrationGate(diff, projectPath);
+		strictEqual(first.success, true, first.message);
+		strictEqual(
+			readFileSync(join(projectPath, "a.txt"), "utf8"),
+			"modified A\n",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "b.txt"), "utf8"),
+			"line a\nline x\nline c\n",
+		);
+
+		// a.txt is left at the diff's after-state (as if already applied), but
+		// b.txt is independently changed to a third state that matches
+		// neither the diff's before-state nor its after-state.
+		writeFileSync(
+			join(projectPath, "b.txt"),
+			"line a\nline z\nline c\n",
+			"utf8",
+		);
+
+		const second = integrationGate(diff, projectPath);
+		strictEqual(second.success, false, second.message);
+		ok(
+			!second.alreadyApplied,
+			"a mixed already-applied/conflicting patch must not report alreadyApplied",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "a.txt"), "utf8"),
+			"modified A\n",
+			"the failed apply must not touch a.txt either (git apply is all-or-nothing)",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "b.txt"), "utf8"),
+			"line a\nline z\nline c\n",
+			"the failed apply must leave b.txt's conflicting content untouched",
+		);
 	});
 
 	it("rejects a credential-convention path even when its directory name is non-ASCII (git C-quoting bypass)", () => {

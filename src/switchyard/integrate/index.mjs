@@ -12,6 +12,13 @@
 import { spawnSync } from "node:child_process";
 import { resolve, sep } from "node:path";
 
+// Bound the captured output of the non-mutating `git apply --check` probes.
+// A malformed or oversized patch must not be able to buffer unbounded
+// stderr/stdout; 8 MiB is generous for any legitimate patch while keeping
+// the probe memory-bounded (the default 1 MiB is too close to pathological
+// cases for comfort, but the exact size only needs to be a safe ceiling).
+export const APPLY_CHECK_MAX_BUFFER = 8 * 1024 * 1024;
+
 // Known secret/credential storage conventions, matched against the actual
 // file paths a diff touches (not diff body content).
 const SENSITIVE_PATH_PATTERNS = [
@@ -166,6 +173,20 @@ function parseRenamePaths(line) {
 	return null;
 }
 
+// Git reports a genuinely malformed/truncated diff (a transport or
+// generation problem — e.g. a provider's output got cut off mid-hunk, or
+// arrived with no trailing newline after its last hunk) differently from a
+// diff that is well-formed but fails to apply because the tree has diverged
+// from both its before- and after-state (a real conflict). A caller needs to
+// tell these apart: a truncated diff calls for a retry/re-generation, while
+// a real conflict calls for a different diff entirely — treating both as
+// one generic "apply failed" loses that distinction.
+const CORRUPT_PATCH_PATTERN = /corrupt patch|unrecognized input/i;
+
+function classifyApplyFailure(stderrText) {
+	return CORRUPT_PATCH_PATTERN.test(stderrText) ? "corrupt_patch" : "conflict";
+}
+
 /**
  * Extract the file paths a diff touches via `git apply --numstat` (git's own
  * diff parser, not a hand-rolled regex over diff text).
@@ -175,7 +196,9 @@ function parseRenamePaths(line) {
  * (double-quote/backslash/control chars) are decoded by `dequoteGitPath`.
  * @param {string} diff
  * @param {string} projectPath
- * @returns {string[]|null} paths, or null if git could not parse the diff
+ * @returns {{paths: string[]|null, stderr: string}} `paths` is null if git
+ *   could not parse the diff at all (e.g. truncated/corrupt); `stderr` is
+ *   git's captured diagnostic, meaningful only when `paths` is null.
  */
 function extractTouchedPaths(diff, projectPath) {
 	const result = spawnSync(
@@ -187,14 +210,20 @@ function extractTouchedPaths(diff, projectPath) {
 			encoding: "utf8",
 		},
 	);
-	if (result.status !== 0 || typeof result.stdout !== "string") return null;
+	const stderr = typeof result.stderr === "string" ? result.stderr : "";
+	if (result.status !== 0 || typeof result.stdout !== "string") {
+		return { paths: null, stderr };
+	}
 
-	return result.stdout
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => line.split("\t")[2])
-		.filter(Boolean)
-		.map(dequoteGitPath);
+	return {
+		paths: result.stdout
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => line.split("\t")[2])
+			.filter(Boolean)
+			.map(dequoteGitPath),
+		stderr,
+	};
 }
 
 /**
@@ -223,16 +252,23 @@ function extractSummaryLines(diff, projectPath) {
  * Validate that a diff is structurally safe to apply.
  * @param {string} diff The git diff to validate
  * @param {string} projectPath Target project path (paths are resolved against this)
- * @returns {{safe: boolean, reason?: string, requiresReview?: boolean, sensitivePaths?: string[], touchedPaths?: string[]}}
+ * @returns {{safe: boolean, reason?: string, reasonKind?: "corrupt_patch"|"conflict", requiresReview?: boolean, sensitivePaths?: string[], touchedPaths?: string[]}}
  */
 export function validateDiff(diff, projectPath) {
 	if (!diff || typeof diff !== "string" || !diff.trim()) {
 		return { safe: false, reason: "empty diff" };
 	}
 
-	const touchedPaths = extractTouchedPaths(diff, projectPath);
+	const { paths: touchedPaths, stderr: numstatStderr } = extractTouchedPaths(
+		diff,
+		projectPath,
+	);
 	if (touchedPaths === null) {
-		return { safe: false, reason: "diff could not be parsed by git apply" };
+		return {
+			safe: false,
+			reason: "diff could not be parsed by git apply",
+			reasonKind: classifyApplyFailure(numstatStderr),
+		};
 	}
 
 	for (const path of touchedPaths) {
@@ -280,25 +316,117 @@ export function validateDiff(diff, projectPath) {
 }
 
 /**
+ * Run a non-mutating `git apply` probe against the current tree. Captured
+ * UTF-8 output, per this file's convention for non-mutating git checks.
+ * `git apply` is the authority on whether a diff applies cleanly, so any
+ * non-zero exit (including a failed spawn) means the probe did not pass —
+ * nothing on the host is ever modified by this call.
+ * @param {string[]} args `git apply` arguments (e.g. `["--check"]`,
+ *   `["--reverse", "--check"]`)
+ * @param {string} diff
+ * @param {string} projectPath
+ * @returns {{ok: boolean, stderr: string}} `ok` true when git reports the
+ *   diff applies cleanly; `stderr` is git's captured UTF-8 diagnostic,
+ *   meaningful only when `ok` is false.
+ */
+function applyCheckPasses(args, diff, projectPath) {
+	const result = spawnSync("git", ["apply", ...args], {
+		cwd: projectPath,
+		input: diff,
+		encoding: "utf8",
+		maxBuffer: APPLY_CHECK_MAX_BUFFER,
+	});
+	return {
+		ok: result.status === 0,
+		stderr: typeof result.stderr === "string" ? result.stderr : "",
+	};
+}
+
+/**
  * Apply a diff to the host after review.
  * INV-2: This is the only path for agent output to reach host files.
  * The diff is piped via stdin — no shared scratch file, no cross-process
  * collision if this is ever called concurrently.
+ *
+ * The mutating apply runs exactly once, and only after a non-mutating
+ * `git apply --check` confirms the diff still applies to the current tree.
+ * When the forward check fails, a `git apply --reverse --check` probe
+ * decides whether the diff is already present: if the reverse probe
+ * succeeds, the diff was applied previously and the result is a successful
+ * no-op (`{alreadyApplied: true}`) — the mutating apply is NOT run. When
+ * both probes fail, the diff genuinely conflicts (the tree matches neither
+ * the diff's before state nor its after state) and the caller reports
+ * failure with the existing result shape.
  * @param {string} diff The git diff to apply
  * @param {string} projectPath Target project path
- * @returns {boolean} true if apply succeeded
+ * @returns {boolean|{alreadyApplied: boolean}|{applied: false, reason: string}}
+ *   true if apply succeeded; `{alreadyApplied: true}` if the diff was already
+ *   in the tree; `{applied: false, reason}` carrying git's diagnostic (or the
+ *   spawn error) when the diff could not be applied.
  */
 function applyReviewedDiff(diff, projectPath) {
 	try {
-		const result = spawnSync("git", ["apply"], {
-			cwd: projectPath,
-			input: diff,
-			stdio: ["pipe", "inherit", "inherit"],
-		});
-		return result.status === 0;
+		// Non-mutating forward check: nothing touches the host until git
+		// confirms the diff applies cleanly to the current tree.
+		const forward = applyCheckPasses(["--check"], diff, projectPath);
+		if (forward.ok) {
+			// Mutating apply runs exactly once, and only after the forward
+			// check passed. stdio is captured (not inherited) so git's own
+			// diagnostic on an unexpected failure is returned as `reason`
+			// instead of leaking onto the caller's terminal.
+			const result = spawnSync("git", ["apply"], {
+				cwd: projectPath,
+				input: diff,
+				encoding: "utf8",
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			if (result.status === 0) return true;
+			const stderr =
+				typeof result.stderr === "string" ? result.stderr.trim() : "";
+			return {
+				applied: false,
+				reason:
+					stderr ||
+					(result.error
+						? `git apply failed to spawn: ${result.error.message}`
+						: `git apply exited with status ${result.status}`),
+			};
+		}
+
+		// Forward check failed. Only now probe for "already applied": a
+		// reverse apply succeeds exactly when the diff's changes are already
+		// present in the tree. This is a successful no-op for the host.
+		const reverse = applyCheckPasses(
+			["--reverse", "--check"],
+			diff,
+			projectPath,
+		);
+		if (reverse.ok) {
+			return { alreadyApplied: true };
+		}
+
+		// Both checks failed. Usually this means a genuine conflict — the tree
+		// matches neither the diff's before state nor its after state — but
+		// git reports a truncated/malformed diff (never a valid patch to begin
+		// with) through this same pair of failed --check probes, so surface
+		// which one it was: classifyApplyFailure() only ever reports
+		// "corrupt_patch" on git's own "corrupt patch"/"unrecognized input"
+		// diagnostic text, not on any other failure. Surface git's own
+		// `--check` diagnostic (e.g. "error: ... patch does not apply") as
+		// `reason` so the caller gets actionable text, not just a bare
+		// "Diff apply failed".
+		const combinedStderr = `${forward.stderr}\n${reverse.stderr}`;
+		return {
+			applied: false,
+			reason:
+				forward.stderr.trim() ||
+				reverse.stderr.trim() ||
+				"git apply --check rejected the diff",
+			reasonKind: classifyApplyFailure(combinedStderr),
+		};
 	} catch (error) {
 		console.error("Failed to apply reviewed diff:", error.message);
-		return false;
+		return { applied: false, reason: error.message };
 	}
 }
 
@@ -354,7 +482,8 @@ function getScopedStatus(projectPath, touchedPaths) {
  *   path must be declared. Composes with (does not replace) structural checks.
  * @returns {{success: boolean, message: string, requiresReview?: boolean,
  *   sensitivePaths?: string[], missingPaths?: string[], extraPaths?: string[],
- *   structural_error?: string}} Result
+ *   structural_error?: string, alreadyApplied?: boolean, reason?: string,
+ *   reasonKind?: "corrupt_patch"|"conflict"}} Result
  */
 export function integrationGate(diff, projectPath, options = {}) {
 	const { requiredPaths = null } = options;
@@ -387,11 +516,15 @@ export function integrationGate(diff, projectPath, options = {}) {
 	// validateDiff afterward so structural errors compose (both sets of
 	// errors are reported).
 	if (requiredPaths !== null) {
-		const touchedPaths = extractTouchedPaths(patch, projectPath);
+		const { paths: touchedPaths, stderr: numstatStderr } = extractTouchedPaths(
+			patch,
+			projectPath,
+		);
 		if (touchedPaths === null) {
 			return {
 				success: false,
 				message: "diff could not be parsed by git apply",
+				reasonKind: classifyApplyFailure(numstatStderr),
 			};
 		}
 
@@ -442,11 +575,15 @@ export function integrationGate(diff, projectPath, options = {}) {
 
 	const validation = validateDiff(patch, projectPath);
 	if (!validation.safe) {
-		return {
+		const result = {
 			success: false,
 			message: validation.reason ?? "Diff validation failed",
 			credentialFlagged: validation.credentialFlagged === true,
 		};
+		if (typeof validation.reasonKind === "string") {
+			result.reasonKind = validation.reasonKind;
+		}
+		return result;
 	}
 
 	if (validation.requiresReview && !options.allowSensitiveManifests) {
@@ -468,7 +605,8 @@ export function integrationGate(diff, projectPath, options = {}) {
 		preStatus = getScopedStatus(projectPath, validation.touchedPaths);
 	}
 
-	if (applyReviewedDiff(patch, projectPath)) {
+	const applyResult = applyReviewedDiff(patch, projectPath);
+	if (applyResult === true) {
 		if (requiredPaths === null) {
 			const postStatus = getScopedStatus(projectPath, validation.touchedPaths);
 			if (preStatus === postStatus) {
@@ -478,5 +616,20 @@ export function integrationGate(diff, projectPath, options = {}) {
 		return { success: true, message: "Diff applied successfully" };
 	}
 
-	return { success: false, message: "Diff apply failed" };
+	if (applyResult?.alreadyApplied) {
+		return {
+			success: true,
+			message: "Diff already applied",
+			alreadyApplied: true,
+		};
+	}
+
+	const result = { success: false, message: "Diff apply failed" };
+	if (applyResult && typeof applyResult.reason === "string") {
+		result.reason = applyResult.reason;
+	}
+	if (applyResult && typeof applyResult.reasonKind === "string") {
+		result.reasonKind = applyResult.reasonKind;
+	}
+	return result;
 }
