@@ -346,7 +346,7 @@ index 0000000..abcdef1
 		ok(!onDisk.includes("curl evil.example"));
 	});
 
-	it("auto-applies a package.json diff when allowSensitiveManifests is explicitly set", () => {
+	it("rejects a package.json diff when AllowManifests is set without a Files declaration", () => {
 		commitFile(projectPath, "package.json", '{"name":"x"}\n');
 		const diff = buildDiff(projectPath, (dir) => {
 			writeFileSync(join(dir, "package.json"), '{"name":"y"}\n', "utf8");
@@ -359,11 +359,8 @@ index 0000000..abcdef1
 		const result = integrationGate(diff, projectPath, {
 			allowSensitiveManifests: true,
 		});
-		strictEqual(result.success, true);
-		strictEqual(
-			readFileSync(join(projectPath, "package.json"), "utf8"),
-			'{"name":"y"}\n',
-		);
+		strictEqual(result.success, false);
+		strictEqual(result.requiresReview, true);
 	});
 
 	it("rejects a malformed/truncated diff without partially applying it", () => {
@@ -993,7 +990,7 @@ describe("Files allowlist enforcement", () => {
 		strictEqual(result.requiresReview, true);
 	});
 
-	it("manifest path passes Files: + allowSensitiveManifests together", () => {
+	it("manifest path passes AllowManifests: true plus Files: together", () => {
 		commitFile(projectPath, "package.json", '{"name":"x"}\n');
 		const diff = buildDiff(projectPath, (dir) => {
 			writeFileSync(join(dir, "package.json"), '{"name":"y"}\n', "utf8");

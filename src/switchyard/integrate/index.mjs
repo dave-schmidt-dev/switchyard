@@ -40,8 +40,9 @@ const SENSITIVE_PATH_PATTERNS = [
 // lifecycle scripts, Makefiles, CI configs, Dockerfiles, shell scripts).
 // Diffs touching these are not blocked outright — legitimate task work often
 // needs to touch package.json — but are not auto-applied either: the gate
-// requires an explicit opt-in (`allowSensitiveManifests`) rather than
-// silently running whatever a diff puts in a `preinstall` script.
+// requires an explicit task opt-in (`AllowManifests: true`) *and* an exact
+// `Files:` declaration for every touched manifest, rather than silently
+// running whatever a diff puts in a `preinstall` script.
 const MANIFEST_REVIEW_PATTERNS = [
 	/(^|\/)package\.json$/i,
 	/(^|\/)Makefile$/i,
@@ -473,10 +474,9 @@ function getScopedStatus(projectPath, touchedPaths) {
  * @param {string} diff The git diff from agent
  * @param {string} projectPath Target project path
  * @param {object} [options]
- * @param {boolean} [options.allowSensitiveManifests] Explicitly permit a diff
- *   that touches a build/execution-manifest file (package.json, Makefile,
- *   Dockerfile, shell scripts, CI configs) to auto-apply. Without this, such
- *   a diff is rejected with requiresReview:true instead of silently running.
+ * @param {boolean} [options.allowSensitiveManifests] The parsed
+ *   `AllowManifests: true` task opt-in. It permits a manifest diff only when
+ *   `requiredPaths` also explicitly declares every touched manifest path.
  * @param {string[]|null} [options.requiredPaths] When non-null, enforce exact
  *   Files allowlist: every declared path must be touched and every touched
  *   path must be declared. Composes with (does not replace) structural checks.
@@ -586,11 +586,19 @@ export function integrationGate(diff, projectPath, options = {}) {
 		return result;
 	}
 
-	if (validation.requiresReview && !options.allowSensitiveManifests) {
+	const manifestsAreDeclared =
+		requiredPaths !== null &&
+		(validation.sensitivePaths ?? []).every((path) =>
+			requiredPaths.includes(path),
+		);
+	if (
+		validation.requiresReview &&
+		!(options.allowSensitiveManifests === true && manifestsAreDeclared)
+	) {
 		return {
 			success: false,
 			message:
-				"diff touches a build/execution manifest file and requires explicit review",
+				"diff touches a build/execution manifest file and requires AllowManifests: true plus an explicit Files: declaration",
 			requiresReview: true,
 			sensitivePaths: validation.sensitivePaths,
 		};

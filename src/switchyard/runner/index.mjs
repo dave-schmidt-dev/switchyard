@@ -242,7 +242,7 @@ export function resolveOrchestrator(dependencies = {}) {
  *   - **Description:** ...
  *
  * @param {string} markdown
- * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, timeoutMs: number|null, tier: string|null, type: string}>}
+ * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, allowManifests: boolean, timeoutMs: number|null, tier: string|null, type: string}>}
  */
 export function parseTaskQueue(markdown) {
 	const tasks = [];
@@ -311,6 +311,27 @@ export function parseTaskQueue(markdown) {
 			);
 		}
 
+		const allowManifestsLine = block
+			.split("\n")
+			.find((line) => /^- \*\*AllowManifests:\*\*(?:\s|$)/.test(line));
+		let allowManifests = false;
+		if (allowManifestsLine) {
+			if (type !== "implementation") {
+				throw new Error(
+					`Task ${taskId}: AllowManifests is only supported for implementation-type tasks`,
+				);
+			}
+			const value = allowManifestsLine
+				.replace(/^- \*\*AllowManifests:\*\*\s*/, "")
+				.trim();
+			if (value !== "true") {
+				throw new Error(
+					`Task ${taskId}: AllowManifests must be exactly true when present`,
+				);
+			}
+			allowManifests = true;
+		}
+
 		tasks.push({
 			id: taskId,
 			title: title.trim(),
@@ -318,6 +339,7 @@ export function parseTaskQueue(markdown) {
 			description: rawDesc.trim(),
 			prompt: fullPrompt,
 			requiredPaths,
+			allowManifests,
 			timeoutMs,
 			tier,
 			type,
@@ -932,6 +954,8 @@ export function executeTask(task, context) {
 
 	const gateResult = context.integrationGate(diff, context.projectPath, {
 		requiredPaths: task.requiredPaths,
+		allowSensitiveManifests:
+			task.type === "implementation" && task.allowManifests === true,
 	});
 	const success = Boolean(gateResult?.success);
 
@@ -1151,6 +1175,8 @@ export async function executeTaskWithOrchestrator(task, context) {
 
 	const gateResult = context.integrationGate(diff, context.projectPath, {
 		requiredPaths: task.requiredPaths,
+		allowSensitiveManifests:
+			task.type === "implementation" && task.allowManifests === true,
 	});
 	const success = Boolean(gateResult?.success);
 
