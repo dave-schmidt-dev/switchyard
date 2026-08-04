@@ -57,11 +57,13 @@ const BOOTSTRAP_PATH = resolve(
 	"worker-bootstrap.mjs",
 );
 // Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
-// lazily loads SWITCHYARD_ROSTER_PATH and fails loud if it's unset. This
-// file's real dispatch subprocesses (and the detached workers they spawn)
-// go through the real, unmocked router/roster on the way to routing a task,
-// so every spawned process needs a valid roster — point at this committed
-// synthetic fixture (not the real ~/.agent/roster.json).
+// lazily loads the roster, resolving SWITCHYARD_ROSTER_PATH or the canonical
+// ~/.agent/roster.json default (Task 4.1) and failing loud only if that
+// resolved file can't load. This file's real dispatch subprocesses (and the
+// detached workers they spawn) go through the real, unmocked router/roster
+// on the way to routing a task, so every spawned process needs a valid
+// roster — point at this committed synthetic fixture (not the real
+// ~/.agent/roster.json).
 const ROSTER_FIXTURE_PATH = resolve(
 	__dirname,
 	"fixtures",

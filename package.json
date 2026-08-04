@@ -5,7 +5,9 @@
 	"license": "MIT",
 	"private": true,
 	"scripts": {
-		"test": "node --test",
+		"test": "npm run test:docker && npm run test:other",
+		"test:docker": "node --test --test-concurrency=1 tests/dispatch-cli.test.mjs tests/lifecycle-recovery.test.mjs tests/detached-dispatch.test.mjs",
+		"test:other": "files=\"\"; for f in tests/*.test.mjs; do case \"$f\" in tests/dispatch-cli.test.mjs|tests/lifecycle-recovery.test.mjs|tests/detached-dispatch.test.mjs) ;; *) files=\"$files $f\";; esac; done; node --test $files",
 		"lint": "biome check .",
 		"deadcode": "knip",
 		"validate": "npm run lint && npm run deadcode && npm run test",

@@ -39,12 +39,13 @@ const DISPATCH_PATH = resolve(
 	"index.mjs",
 );
 // Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
-// lazily loads SWITCHYARD_ROSTER_PATH and fails loud if it's unset. This
-// file's `launch` subcommand spawns a detached worker that eventually
-// reaches the real, unmocked router/roster on the way to routing a task —
-// point at this committed synthetic fixture (not the real
-// ~/.agent/roster.json) so a background routing failure can't leak into
-// this suite as stray errors or a stuck run.
+// lazily loads the roster, resolving SWITCHYARD_ROSTER_PATH or the canonical
+// ~/.agent/roster.json default (Task 4.1) and failing loud only if that
+// resolved file can't load. This file's `launch` subcommand spawns a
+// detached worker that eventually reaches the real, unmocked router/roster
+// on the way to routing a task — point at this committed synthetic fixture
+// (not the real ~/.agent/roster.json) so a background routing failure can't
+// leak into this suite as stray errors or a stuck run.
 const ROSTER_FIXTURE_PATH = resolve(
 	__dirname,
 	"fixtures",
@@ -53,6 +54,7 @@ const ROSTER_FIXTURE_PATH = resolve(
 
 import {
 	runDispatch as dispatchRun,
+	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseLaunchArgs,
 	parseRecoverArgs,
@@ -447,6 +449,27 @@ describe("run subcommand equivalence", () => {
 });
 
 describe("launch integration", () => {
+	it("does not regress a worker-owned running state to launcher_ready", async () => {
+		const runId = `launch-state-${randomUUID()}`;
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+		});
+
+		const created = await readRun(runId);
+		await updateRun(runId, { state: "running" }, created.revision);
+
+		const result = await markLauncherReadyIfLaunching(runId);
+		strictEqual(result.state, "running");
+		strictEqual((await readRun(runId)).state, "running");
+	});
+
 	it("launch with a 0-task queue fails closed: exits 2, no run state or lock created", () => {
 		const emptyTasksFile = join(dir, "empty-tasks.md");
 		writeFileSync(

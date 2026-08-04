@@ -49,11 +49,13 @@ import {
 	getRunRoot,
 	getStateRoot,
 	initializeRun,
+	RevisionError,
 	readEvents,
 	readRun,
 	releaseProjectLockIfOwnedBy,
 	releaseRunLock,
 	SchemaError,
+	updateRun,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
 import {
@@ -135,6 +137,38 @@ class UsageError extends Error {}
 // and is reclaimable. Generous relative to real startup (spawn + fingerprint +
 // acquireRunLock is seconds; container creation happens AFTER the lock).
 const RUN_STARTUP_GRACE_MS = 5 * 60_000;
+
+/**
+ * Publish the detached-launch handshake only if the worker has not already
+ * claimed the run. The worker can reach `running` during the parent's 500 ms
+ * launch grace period; an unconditional `advanceState(..., "launcher_ready")`
+ * would then regress the durable state and make status lie about a live run.
+ *
+ * @param {string} runId
+ * @returns {Promise<object>} the current or updated run snapshot
+ */
+async function markLauncherReadyIfLaunching(runId) {
+	for (let attempt = 0; attempt < 10; attempt += 1) {
+		const current = await readRun(runId);
+		if (current.state !== "launching") return current;
+
+		try {
+			return await updateRun(
+				runId,
+				{ state: "launcher_ready" },
+				current.revision,
+			);
+		} catch (error) {
+			if (!(error instanceof RevisionError)) throw error;
+			// A worker or another lifecycle writer won the optimistic-concurrency
+			// race. Re-read before deciding whether the handshake is still valid.
+		}
+	}
+
+	throw new Error(
+		`Could not publish launcher_ready for ${runId}: run changed concurrently`,
+	);
+}
 
 /**
  * Validate CLI arguments into a runQueue options object.
@@ -359,7 +393,10 @@ async function runDispatch(opts, dependencies = {}) {
 	// Malformed run directories are quarantined (moved, not deleted) on every
 	// sweep regardless of dryRun — same as always for that path — since a
 	// record that can't be read never becomes "eligible" and would otherwise
-	// fail this same scan forever. This sweep remains synchronous-dispatch-only:
+	// fail this same scan forever. The one conservative exception: a run
+	// directory whose run.json is absent (ENOENT — e.g. a concurrent
+	// initializeRun mid-flight) is left for a later sweep, not quarantined.
+	// This sweep remains synchronous-dispatch-only:
 	// detached launch and worker-bootstrap intentionally do not invoke it.
 	applyRetention({ maxAgeDays: 30, dryRun: true })
 		.then(({ deletedCount, quarantined }) => {
@@ -642,7 +679,7 @@ async function handleLaunch(argv) {
 		return;
 	}
 
-	await advanceState(runId, "launcher_ready");
+	await markLauncherReadyIfLaunching(runId);
 
 	const envelope = {
 		schemaVersion: 1,
@@ -1309,6 +1346,7 @@ export {
 	handleRecover,
 	handleResult,
 	handleStatus,
+	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseLaunchArgs,
 	parseRecoverArgs,

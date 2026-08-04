@@ -7,6 +7,7 @@ import {
 	readFile,
 	rename,
 	rm,
+	rmdir,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
@@ -204,6 +205,18 @@ async function ensureDir(dirPath, mode) {
 	await mkdir(dirPath, { recursive: true, mode, force: true });
 }
 
+// Strip control characters (C0, DEL, C1 — \p{Cc}), Unicode format controls
+// (\p{Cf}: zero-width joiners/spaces, bidi override marks, etc.), and the
+// Unicode line/paragraph separators (\p{Zl}/\p{Zp}) from any untrusted string
+// before it reaches a warning or the returned quarantine metadata, so an
+// arbitrary directory name or filesystem error can never inject log lines,
+// hide or reorder text, or control the terminal.
+const CONTROL_CHAR_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+function sanitizeForDisplay(text) {
+	if (typeof text !== "string") return "";
+	return text.replace(CONTROL_CHAR_RE, "?");
+}
+
 /**
  * Initialize a new run with state "created".
  *
@@ -287,7 +300,12 @@ export async function readRun(runId) {
 		raw = await readFile(runJsonPath, "utf8");
 	} catch (e) {
 		if (e.code === "ENOENT") {
-			throw new Error(`Run not found: ${runId}`);
+			// Tag the not-found signal with ENOENT so callers can tell a
+			// transient missing run.json apart from corruption (see
+			// applyRetention's conservative skip in its quarantine loop).
+			const notFound = new Error(`Run not found: ${runId}`);
+			notFound.code = "ENOENT";
+			throw notFound;
 		}
 		throw e;
 	}
@@ -901,19 +919,77 @@ export async function releaseOrphanedProjectLocks() {
 	return reclaimed;
 }
 
+// Move a malformed run directory out of the active scan and under
+// quarantineRoot(), preserving its artifacts on disk. The first-choice
+// destination is exactly `.quarantine/<name>`; when that path already exists
+// it is NEVER overwritten or replaced — a unique suffixed destination is
+// allocated instead, so both the pre-existing quarantine artifact and the
+// newly moved run survive. `mkdir` reserves the destination name first, so
+// the empty placeholder replaced by a successful rename is always one this
+// function created itself, never a pre-existing artifact.
+async function quarantineDirectory(name) {
+	await ensureDir(quarantineRoot(), 0o700);
+	const baseDestination = resolve(quarantineRoot(), name);
+	let destination = baseDestination;
+	try {
+		await mkdir(baseDestination);
+	} catch (e) {
+		if (e.code !== "EEXIST") throw e;
+		destination = resolve(
+			quarantineRoot(),
+			`${name}-collision-${randomUUID()}`,
+		);
+		await mkdir(destination);
+	}
+	try {
+		await rename(getRunRoot(name), destination);
+		return destination;
+	} catch (e) {
+		// Only remove the empty placeholder reserved above. rmdir removes a
+		// directory only when it is empty, so a pre-existing or non-empty
+		// quarantine artifact can never be deleted — unlike
+		// rm({recursive:false}), which throws EISDIR on a directory and would
+		// leave the placeholder behind.
+		await rmdir(destination).catch(() => {});
+		throw e;
+	}
+}
+
 /**
  * Apply retention policy to completed runs.
  * Deletes runs where state is "succeeded" AND cleanupState is "complete".
  * Never touches non-terminal or cleanup-failed runs.
  *
+ * Malformed run directories (invalid JSON, unsupported schema, corrupt
+ * runId, etc.) fail readRun on every single scan forever — they never age
+ * out via the normal succeeded+complete retention path below, since they
+ * can't even be classified. Quarantine moves them out of the active scan
+ * atomically (a rename, never a delete) on every sweep, dryRun or not, so
+ * they stop being re-read while staying inspectable on disk. The
+ * conservative exception: a run directory whose read fails for any
+ * non-validation reason — run.json absent (readRun's ENOENT signal, e.g. a
+ * concurrent initializeRun mid-flight), EACCES, EIO, EMFILE, or any other
+ * filesystem/IO error — is left in place and skipped, not quarantined.
+ * None of those signals proves corruption, and a later sweep may or may not
+ * resolve them: a transiently-missing run.json likely will, while a
+ * persistent I/O error is simply re-skipped on every sweep (see the
+ * quarantine loop below).
+ *
  * @param {object} options
  * @param {number} [options.maxRuns] - maximum number of completed runs to keep
  * @param {number} [options.maxAgeDays] - maximum age in days for completed runs
  * @param {string} [options.now] - reference ISO timestamp (default: now)
- * @param {boolean} [options.dryRun] - log-only mode: report which runs WOULD be
- *   reclaimed (on stderr, with the reason) without deleting anything. Never
- *   calls `rm`; the returned count is the number of runs eligible for deletion.
- * @returns {Promise<number>} number of runs deleted (or eligible, in dryRun)
+ * @param {boolean} [options.dryRun] - log-only mode for DELETION: report which
+ *   eligible valid runs WOULD be reclaimed (on stderr, with the reason)
+ *   without calling `rm`. Malformed-run quarantine is NOT suppressed —
+ *   malformed directories are still moved, since they would otherwise fail
+ *   this same scan forever.
+ * @returns {Promise<{deletedCount: number, quarantined: Array<{runId: string, destination: string, destinationDisplay: string, reason: string}>}>}
+ *   deletedCount: number of eligible runs deleted (or eligible, in dryRun);
+ *   quarantined: one entry per malformed run directory moved out of the
+ *   active scan, with its sanitized runId, the actual on-disk destination it
+ *   was moved to (raw, for machine use), a separately sanitized
+ *   destinationDisplay safe for logs/terminal, and a static reason string.
  */
 export async function applyRetention(options = {}) {
 	const { maxRuns, maxAgeDays, now, dryRun } = options;
@@ -927,51 +1003,61 @@ export async function applyRetention(options = {}) {
 		throw e;
 	}
 
-	// A malformed run directory (invalid JSON, unsupported schema, corrupt
-	// runId, etc.) fails readRun on every single scan forever — it never ages
-	// out via the normal succeeded+complete retention path below, since it
-	// can't even be classified. Quarantine moves it out of the active scan
-	// atomically (a rename, not a delete) so it stops being re-read on every
-	// dispatch while staying inspectable on disk. Reason text is always one
-	// of a small set of static strings (SchemaError's own message, which by
-	// construction never interpolates file content — see readRun/validateRun)
-	// or the generic fallback below; raw error/file content never appears.
 	const quarantined = [];
 	const eligible = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
+		let run;
 		try {
-			const run = await readRun(entry.name);
-			if (run.state === "succeeded" && run.cleanupState === "complete") {
-				eligible.push({
-					runId: entry.name,
-					createdAt: new Date(run.createdAt).getTime(),
-				});
-			}
+			run = await readRun(entry.name);
 		} catch (e) {
-			const reason =
-				e instanceof SchemaError
-					? e.message
-					: "invalid or unreadable run record";
-			if (dryRun) {
-				console.error(
-					`applyRetention: would quarantine run ${entry.name} (${reason})`,
-				);
-				quarantined.push({ runId: entry.name, reason });
+			if (!(e instanceof SchemaError)) {
+				// Conservative choice: a run directory that fails to read is
+				// NOT quarantined unless the failure is a positive content-
+				// validation error. ENOENT (run.json absent — e.g. a
+				// concurrent initializeRun mid-flight), EACCES, EIO, EMFILE,
+				// and any other filesystem/IO error are indistinguishable
+				// from transient or externally-caused failures on this
+				// signal, so moving the directory out from under a live
+				// writer would be worse than re-scanning it. Leave it in
+				// place and skip it. A later sweep may find it readable
+				// again, but that is not guaranteed — a persistent I/O error
+				// is simply re-skipped each sweep. Only present-but-invalid
+				// content (invalid JSON, non-object JSON, SchemaError
+				// validation failures) is worth quarantining.
 				continue;
 			}
+			// Reason text is always one of a small set of static strings
+			// (SchemaError's own message, which by construction never
+			// interpolates file content — see readRun/validateRun); raw
+			// error or file content never appears.
+			const reason = e.message;
 			try {
-				await ensureDir(quarantineRoot(), 0o700);
-				await rename(
-					getRunRoot(entry.name),
-					resolve(quarantineRoot(), entry.name),
-				);
-				quarantined.push({ runId: entry.name, reason });
+				const destination = await quarantineDirectory(entry.name);
+				quarantined.push({
+					runId: sanitizeForDisplay(entry.name),
+					// Raw on-disk path for machine use; destinationDisplay is
+					// the separately sanitized value safe for logs/terminal.
+					destination,
+					destinationDisplay: sanitizeForDisplay(destination),
+					reason,
+				});
 			} catch (moveError) {
+				// ENOENT here means the source run directory is already gone —
+				// a concurrent or repeated sweep moved it first — which is the
+				// expected outcome, not a failure worth warning about.
+				if (moveError.code === "ENOENT") continue;
 				console.warn(
-					`applyRetention: failed to quarantine run ${entry.name}: ${moveError.message}`,
+					`applyRetention: failed to quarantine run ${sanitizeForDisplay(entry.name)}: ${sanitizeForDisplay(moveError.message)}`,
 				);
 			}
+			continue;
+		}
+		if (run.state === "succeeded" && run.cleanupState === "complete") {
+			eligible.push({
+				runId: entry.name,
+				createdAt: new Date(run.createdAt).getTime(),
+			});
 		}
 	}
 

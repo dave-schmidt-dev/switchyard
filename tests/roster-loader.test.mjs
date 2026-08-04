@@ -1,13 +1,16 @@
-// Task 1.5 (roster-unification plan): loader test for the roster-backed
-// src/switchyard/roster/index.mjs. Verifies SWITCHYARD_ROSTER_PATH resolution
-// fails loud (missing env var, missing file, malformed JSON, broken
-// structural contract) and that the exports router/index.mjs depends on
-// (PROVIDER_CAPABILITIES, passesCapabilityFilter, getRightSizedModel, and
-// the rest of the pre-roster interface) return roster-backed values against
-// a committed, synthetic fixture — never the real ~/.agent/roster.json.
+// Task 1.5 & Task 4.1: loader test for the roster-backed src/switchyard/roster/index.mjs.
+// Verifies roster path resolution (default canonical ~/.agent/roster.json and SWITCHYARD_ROSTER_PATH override)
+// fails loud on missing file, malformed JSON, or broken structural contract, and that exports return
+// roster-backed values against synthetic fixtures.
 
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -44,6 +47,18 @@ function setRosterPath(value) {
 	__resetRosterCacheForTests();
 }
 
+function setHomeDir(value) {
+	if (!("HOME" in previousEnv)) {
+		previousEnv.HOME = process.env.HOME;
+	}
+	if (value === undefined) {
+		delete process.env.HOME;
+	} else {
+		process.env.HOME = value;
+	}
+	__resetRosterCacheForTests();
+}
+
 afterEach(() => {
 	if ("SWITCHYARD_ROSTER_PATH" in previousEnv) {
 		if (previousEnv.SWITCHYARD_ROSTER_PATH === undefined) {
@@ -53,6 +68,14 @@ afterEach(() => {
 		}
 		delete previousEnv.SWITCHYARD_ROSTER_PATH;
 	}
+	if ("HOME" in previousEnv) {
+		if (previousEnv.HOME === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = previousEnv.HOME;
+		}
+		delete previousEnv.HOME;
+	}
 	__resetRosterCacheForTests();
 	if (tmpDir) {
 		rmSync(tmpDir, { recursive: true, force: true });
@@ -60,24 +83,104 @@ afterEach(() => {
 	}
 });
 
-describe("roster loader — fail-loud path resolution", () => {
-	it("throws when SWITCHYARD_ROSTER_PATH is unset", () => {
+describe("roster loader — path resolution (default ~/.agent/roster.json & SWITCHYARD_ROSTER_PATH override)", () => {
+	it("resolves to canonical ~/.agent/roster.json when SWITCHYARD_ROSTER_PATH is unset", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		const agentDir = join(tmpDir, ".agent");
+		mkdirSync(agentDir, { recursive: true });
+		copyFileSync(FIXTURE_PATH, join(agentDir, "roster.json"));
+
 		setRosterPath(undefined);
+		setHomeDir(tmpDir);
+
+		strictEqual(getRightSizedModel("claude", "low"), "fixture-claude-low");
+		strictEqual(passesCapabilityFilter("claude", "low"), true);
+	});
+
+	it("resolves to canonical ~/.agent/roster.json when SWITCHYARD_ROSTER_PATH is empty string", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		const agentDir = join(tmpDir, ".agent");
+		mkdirSync(agentDir, { recursive: true });
+		copyFileSync(FIXTURE_PATH, join(agentDir, "roster.json"));
+
+		setRosterPath("");
+		setHomeDir(tmpDir);
+
+		strictEqual(getRightSizedModel("claude", "low"), "fixture-claude-low");
+	});
+
+	it("uses SWITCHYARD_ROSTER_PATH as an explicit override over default home roster", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		const agentDir = join(tmpDir, ".agent");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(
+			join(agentDir, "roster.json"),
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"home/model": { selector: "home-selector", status: "active" },
+				},
+				targets: {
+					"claude-code": {
+						harness: "claude",
+						enabled: true,
+						qualifications: { "home-selector": { status: "qualified" } },
+						slots: { low: [{ model_ref: "home/model", priority: 1 }] },
+					},
+				},
+			}),
+			"utf8",
+		);
+
+		setHomeDir(tmpDir);
+		setRosterPath(FIXTURE_PATH);
+
+		strictEqual(getRightSizedModel("claude", "low"), "fixture-claude-low");
+	});
+
+	it("throws fail-loud error when default ~/.agent/roster.json is missing", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		setRosterPath(undefined);
+		setHomeDir(tmpDir);
+
 		throws(
 			() => passesCapabilityFilter("claude", "low"),
-			/SWITCHYARD_ROSTER_PATH is not set/,
+			/failed to read roster/,
 		);
 	});
 
-	it("throws when SWITCHYARD_ROSTER_PATH is empty string (treated as unset)", () => {
-		setRosterPath("");
+	it("throws fail-loud error when default ~/.agent/roster.json is malformed JSON", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		const agentDir = join(tmpDir, ".agent");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(join(agentDir, "roster.json"), "{ not valid json", "utf8");
+
+		setRosterPath(undefined);
+		setHomeDir(tmpDir);
+
+		throws(() => getRightSizedModel("codex", "high"), /is not valid JSON/);
+	});
+
+	it("throws fail-loud error when default ~/.agent/roster.json is structurally invalid", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		const agentDir = join(tmpDir, ".agent");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(
+			join(agentDir, "roster.json"),
+			JSON.stringify({ schema_version: 1, models: {} }),
+			"utf8",
+		);
+
+		setRosterPath(undefined);
+		setHomeDir(tmpDir);
+
 		throws(
-			() => getRightSizedModel("claude", "low"),
-			/SWITCHYARD_ROSTER_PATH is not set/,
+			() => passesCapabilityFilter("claude", "low"),
+			/failed structural validation/,
 		);
 	});
 
-	it("throws when SWITCHYARD_ROSTER_PATH points at a nonexistent file", () => {
+	it("throws when SWITCHYARD_ROSTER_PATH override points at a nonexistent file", () => {
 		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
 		setRosterPath(join(tmpDir, "does-not-exist.json"));
 		throws(
@@ -86,27 +189,12 @@ describe("roster loader — fail-loud path resolution", () => {
 		);
 	});
 
-	it("throws when the roster file is not valid JSON", () => {
+	it("throws when SWITCHYARD_ROSTER_PATH override file is not valid JSON", () => {
 		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
 		const badPath = join(tmpDir, "malformed.json");
 		writeFileSync(badPath, "{ not valid json at all", "utf8");
 		setRosterPath(badPath);
 		throws(() => getRightSizedModel("codex", "high"), /is not valid JSON/);
-	});
-
-	it("throws when the roster is missing top-level 'targets'", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
-		const badPath = join(tmpDir, "no-targets.json");
-		writeFileSync(
-			badPath,
-			JSON.stringify({ schema_version: 1, models: {} }),
-			"utf8",
-		);
-		setRosterPath(badPath);
-		throws(
-			() => passesCapabilityFilter("claude", "low"),
-			/failed structural validation/,
-		);
 	});
 
 	it("throws when a slot's model_ref does not resolve in the catalog", () => {

@@ -37,11 +37,13 @@ import {
 
 const TEST_DIR = join(cwd(), ".switchyard-runner-test");
 // Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
-// lazily loads SWITCHYARD_ROSTER_PATH and fails loud if it's unset. Most of
-// this file's tests inject `dependencies.route` and never touch the roster
-// at all, but the two tests explicitly noted as exercising the real,
-// unmocked route() do reach it — point them at this committed synthetic
-// fixture (not the real ~/.agent/roster.json) so they keep passing.
+// lazily loads the roster, resolving SWITCHYARD_ROSTER_PATH or the canonical
+// ~/.agent/roster.json default (Task 4.1) and failing loud only if that
+// resolved file can't load. Most of this file's tests inject
+// `dependencies.route` and never touch the roster at all, but the two tests
+// explicitly noted as exercising the real, unmocked route() do reach it —
+// point them at this committed synthetic fixture (not the real
+// ~/.agent/roster.json) so they keep passing.
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const ROSTER_FIXTURE_PATH = resolve(
 	__dirname,

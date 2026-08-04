@@ -43,11 +43,18 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+const previousHomeDir = process.env.HOME;
 let tmpDir;
 
 function setRosterPath(value) {
 	if (value === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
 	else process.env.SWITCHYARD_ROSTER_PATH = value;
+	__resetRosterCacheForTests();
+}
+
+function setHomeDir(value) {
+	if (value === undefined) delete process.env.HOME;
+	else process.env.HOME = value;
 	__resetRosterCacheForTests();
 }
 
@@ -61,12 +68,14 @@ afterEach(() => {
 		tmpDir = undefined;
 	}
 	setRosterPath(FIXTURE_PATH);
+	setHomeDir(previousHomeDir);
 });
 
 after(() => {
 	if (previousRosterPath === undefined)
 		delete process.env.SWITCHYARD_ROSTER_PATH;
 	else process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+	setHomeDir(previousHomeDir);
 	__resetRosterCacheForTests();
 });
 
@@ -247,7 +256,14 @@ describe("resolveTargetProvenance / resolveRouteProvenance — target resolution
 	});
 
 	it("degrades every field to null (never throws) when the roster is unavailable", () => {
-		setRosterPath(undefined); // env unset -> loader throws internally
+		// Task 4.1: with SWITCHYARD_ROSTER_PATH unset the loader now resolves
+		// the canonical ~/.agent/roster.json default — which EXISTS on dev
+		// machines, so unsetting alone no longer makes the roster unavailable.
+		// Point HOME at an empty temp dir so the canonical default is guaranteed
+		// missing, keeping this case hermetic and independent of the real roster.
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		setHomeDir(tmpDir);
+		setRosterPath(undefined); // env unset -> canonical default is a missing file
 		const prov = resolveRouteProvenance("OpenCode Go", "low");
 		deepStrictEqual(prov, {
 			roster_schema_version: null,

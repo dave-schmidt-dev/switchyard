@@ -4,18 +4,14 @@
 // Task 1.5 (roster-unification plan): the frozen PROVIDER_CAPABILITIES table
 // this module used to export has been replaced by a load of the canonical
 // roster.json (design brief `roster-design-brief-2026-07-30.md` §4/§6),
-// located via SWITCHYARD_ROSTER_PATH. The exports below (PROVIDER_CAPABILITIES,
-// passesCapabilityFilter, getRightSizedModel, and friends) keep their exact
-// call-compatible shape so router/index.mjs (Task 1.6 migrates it) and every
-// existing caller need no changes yet.
+// located via SWITCHYARD_ROSTER_PATH or the canonical ~/.agent/roster.json
+// default. The exports below (PROVIDER_CAPABILITIES, passesCapabilityFilter,
+// getRightSizedModel, and friends) keep their exact call-compatible shape so
+// router/index.mjs (Task 1.6 migrates it) and every existing caller need no
+// changes yet.
 //
-// Path resolution is env-only for now: SWITCHYARD_ROSTER_PATH -> fail loud.
-// The brief's "configured install path" fallback tier is deliberately NOT
-// implemented here — that would mean hardcoding an external, non-switchyard
-// directory (e.g. ~/.agent) into this repo's source, which switchyard must
-// never do. Until Task 1.9's cutover sets SWITCHYARD_ROSTER_PATH globally,
-// an unset env var is expected and this module fails loud rather than
-// silently guessing a path.
+// Path resolution: default canonical path is ~/.agent/roster.json (via os.homedir()),
+// overridable by SWITCHYARD_ROSTER_PATH env var. Fails loud if missing or malformed.
 //
 // Loading is LAZY and memoized for the life of the process: importing this
 // module never touches the filesystem (many existing test files import it
@@ -25,6 +21,8 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /**
  * Tier vocabulary. Unchanged from the pre-roster module: this is Layer-1
@@ -77,19 +75,14 @@ let cachedSnapshotNameCapabilities = null;
 let cachedRosterSha = null;
 
 /**
- * Resolve the roster path: SWITCHYARD_ROSTER_PATH env var only. No silent
- * fallback (brief §6/§3.14) — an unset env var is a fail-loud condition.
+ * Resolve the roster path: canonical ~/.agent/roster.json using os.homedir(),
+ * with SWITCHYARD_ROSTER_PATH env var taking precedence as an explicit override.
  * @returns {string}
  */
 function resolveRosterPath() {
 	const envPath = process.env.SWITCHYARD_ROSTER_PATH;
 	if (envPath) return envPath;
-	throw new Error(
-		"SWITCHYARD_ROSTER_PATH is not set. The roster loader has no configured " +
-			"install-path fallback (switchyard must not hardcode an external " +
-			"roster location into its own source) and refuses to silently proceed " +
-			"without one. Set SWITCHYARD_ROSTER_PATH to a valid roster.json path.",
-	);
+	return join(homedir(), ".agent", "roster.json");
 }
 
 /**
@@ -201,9 +194,9 @@ function validateRosterStructure(data) {
 }
 
 /**
- * Read, parse, and structurally validate the roster at SWITCHYARD_ROSTER_PATH.
+ * Read, parse, and structurally validate the roster at the resolved roster path.
  * Fails loud (throws) on a missing path, unreadable file, malformed JSON, or
- * a broken structural contract — never a silent fallback.
+ * a broken structural contract — never a silent fallback to an empty roster.
  * @returns {object}
  */
 function loadRosterData() {
@@ -213,9 +206,7 @@ function loadRosterData() {
 	try {
 		text = readFileSync(path, "utf8");
 	} catch (err) {
-		throw new Error(
-			`failed to read roster at SWITCHYARD_ROSTER_PATH='${path}': ${err.message}`,
-		);
+		throw new Error(`failed to read roster at '${path}': ${err.message}`);
 	}
 
 	let data;
@@ -867,9 +858,11 @@ export function resolveTargetProvenance(providerName, tier) {
  * target/harness/selector/credential_profile this route resolved to.
  *
  * Best-effort: provenance is a record-keeping enhancement, never a dispatch
- * gate. If the roster can't be loaded (e.g. SWITCHYARD_ROSTER_PATH unset in a
- * unit test whose `route` is mocked), every field degrades to null rather than
- * throwing — a dispatch that would otherwise succeed must not be aborted just
+ * gate. If the roster can't be loaded — an unset SWITCHYARD_ROSTER_PATH
+ * resolves to the canonical ~/.agent/roster.json default (Task 4.1), so an
+ * unavailable roster means the resolved path (override or default) failed to
+ * read, parse, or validate — every field degrades to null rather than
+ * throwing, so a dispatch that would otherwise succeed is never aborted just
  * because provenance couldn't be computed. Whenever the real `route` ran, it
  * already loaded the same roster, so the populated path and the route path are
  * always consistent.
