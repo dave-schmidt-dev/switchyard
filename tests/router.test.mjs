@@ -87,15 +87,20 @@ after(() => {
 });
 
 // Helper to create a test snapshot
-function createTestSnapshot(providers) {
+function createTestSnapshot(providers, updatedAt = new Date().toISOString()) {
 	writeFileSync(
 		SNAPSHOT_PATH,
 		JSON.stringify({
 			schema_version: 2,
+			updated_at: updatedAt,
 			providers,
 		}),
 		"utf8",
 	);
+}
+
+function removeSnapshot() {
+	rmSync(SNAPSHOT_PATH, { force: true });
 }
 
 describe("router (INV-4: dispatch only to a snapshot-available funded provider)", () => {
@@ -517,6 +522,53 @@ describe("router (INV-4: blind fallback still respects funding/eligibility)", ()
 			"Codex",
 			"excluding lowercase 'claude' must exclude candidate 'Claude'",
 		);
+	});
+});
+
+describe("router route-time snapshot diagnostics", () => {
+	it("reports a missing snapshot from the same route read", () => {
+		removeSnapshot();
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.snapshotStatus, "missing");
+		strictEqual(result.snapshotMtime, null);
+		strictEqual(result.snapshotAgeMsAtRoute, null);
+	});
+
+	it("reports malformed JSON and malformed timestamps without throwing", () => {
+		writeFileSync(SNAPSHOT_PATH, "{not-json", "utf8");
+		strictEqual(route().snapshotStatus, "malformed");
+
+		writeFileSync(
+			SNAPSHOT_PATH,
+			JSON.stringify({ schema_version: 2, providers: [] }),
+			"utf8",
+		);
+		strictEqual(route().snapshotStatus, "malformed");
+	});
+
+	it("reports stale and future producer timestamps with age at route", () => {
+		const nowMs = Date.parse("2026-08-04T16:00:00.000Z");
+		const providers = [
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 80, pace_delta: 0 }],
+			},
+		];
+
+		createTestSnapshot(
+			providers,
+			new Date(nowMs - 5 * 60 * 1000).toISOString(),
+		);
+		const stale = route({ nowMs });
+		strictEqual(stale.snapshotStatus, "stale");
+		strictEqual(stale.snapshotAgeMsAtRoute, 5 * 60 * 1000);
+		ok(Number.isFinite(stale.snapshotMtime));
+
+		createTestSnapshot(providers, new Date(nowMs + 1_000).toISOString());
+		const future = route({ nowMs });
+		strictEqual(future.snapshotStatus, "future");
+		strictEqual(future.snapshotAgeMsAtRoute, -1_000);
 	});
 });
 

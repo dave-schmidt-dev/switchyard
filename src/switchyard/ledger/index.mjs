@@ -5,6 +5,7 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
 
@@ -38,6 +39,21 @@ function ensureLogDir() {
 	}
 }
 
+function sanitizeDispatchEntry(dispatch) {
+	const safe = { ...dispatch };
+	const failure = sanitizeFailureMetadata(dispatch);
+	// Provider output, thrown error messages, and host artifact paths are
+	// transient adapter data. None may cross the ledger boundary.
+	delete safe.error;
+	delete safe.output;
+	delete safe.partialDiffPath;
+	if (failure) {
+		delete safe.reason;
+		Object.assign(safe, failure);
+	}
+	return safe;
+}
+
 /**
  * Record a dispatch to the ledger.
  * INV-4: records provider + model + result for each dispatch
@@ -58,7 +74,7 @@ export function recordDispatch(dispatch) {
 	const entry = {
 		timestamp: new Date().toISOString(),
 		host: hostname(),
-		...dispatch,
+		...sanitizeDispatchEntry(dispatch),
 	};
 
 	appendFileSync(
@@ -124,7 +140,7 @@ export async function recordDispatchToStore(data, runStorePath) {
 		timestamp: new Date().toISOString(),
 		host: hostname(),
 		storeBacked: true,
-		...data,
+		...sanitizeDispatchEntry(data),
 	};
 
 	const path = resolveLedgerPath(runStorePath);

@@ -10,7 +10,7 @@
 // CR-2: EXCLUDED_FAMILIES removed - Claude is routable
 // CR-3: Tolerate absent providers - skip, never crash
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,6 +21,7 @@ import {
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
 	resolveTargetId,
+	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { computeScore, resolveSeed } from "./scorer.mjs";
 
@@ -42,8 +43,11 @@ import { computeScore, resolveSeed } from "./scorer.mjs";
  * @returns {boolean}
  */
 function providerMatches(identifier, name) {
-	const identifierTargetId = resolveTargetId(identifier);
-	const nameTargetId = resolveTargetId(name);
+	const identifierResolution = resolveTargetIdentity(identifier);
+	const nameResolution = resolveTargetIdentity(name);
+	if (identifierResolution.ambiguous || nameResolution.ambiguous) return false;
+	const identifierTargetId = identifierResolution.targetId;
+	const nameTargetId = nameResolution.targetId;
 	if (identifierTargetId && nameTargetId) {
 		return identifierTargetId === nameTargetId;
 	}
@@ -71,20 +75,82 @@ function resolveSnapshotPath() {
 
 const EXPECTED_SCHEMA_VERSION = 2;
 const DEFAULT_FLOOR = 5.0; // percent_left floor for skipping exhausted providers
+const SNAPSHOT_STALE_THRESHOLD_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Snapshot reading
 
 /**
- * Read snapshot from host-side path. Tolerates missing file (CR-3).
- * @returns {object|null} Snapshot or null if unreadable
+ * Read the path and content used for one route exactly once, while deriving
+ * diagnostics from that same read. `snapshotAgeMsAtRoute` is based on the
+ * producer timestamp (`updated_at`); `snapshotMtime` remains the filesystem
+ * mtime so operators can distinguish a fresh file write from fresh producer
+ * data.
+ *
+ * @param {number} nowMs
+ * @returns {{snapshot: object|null, snapshotStatus: string, snapshotMtime: number|null, snapshotAgeMsAtRoute: number|null}}
  */
-function readSnapshot() {
+function readSnapshotAtRoute(nowMs) {
+	const path = resolveSnapshotPath();
+	let snapshotMtime = null;
+	let raw;
 	try {
-		return JSON.parse(readFileSync(resolveSnapshotPath(), "utf8"));
-	} catch {
-		return null; // CR-3: tolerate absent/malformed snapshot
+		const stat = statSync(path);
+		snapshotMtime = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null;
+		raw = readFileSync(path, "utf8");
+	} catch (error) {
+		return {
+			snapshot: null,
+			snapshotStatus: error?.code === "ENOENT" ? "missing" : "malformed",
+			snapshotMtime,
+			snapshotAgeMsAtRoute: null,
+		};
 	}
+
+	let snapshot;
+	try {
+		snapshot = JSON.parse(raw);
+	} catch {
+		return {
+			snapshot: null,
+			snapshotStatus: "malformed",
+			snapshotMtime,
+			snapshotAgeMsAtRoute: null,
+		};
+	}
+
+	if (!isValidSnapshot(snapshot)) {
+		return {
+			snapshot: null,
+			snapshotStatus: "malformed",
+			snapshotMtime,
+			snapshotAgeMsAtRoute: null,
+		};
+	}
+
+	const updatedAtMs = Date.parse(snapshot.updated_at);
+	if (!Number.isFinite(updatedAtMs)) {
+		return {
+			snapshot,
+			snapshotStatus: "malformed",
+			snapshotMtime,
+			snapshotAgeMsAtRoute: null,
+		};
+	}
+
+	const snapshotAgeMsAtRoute = nowMs - updatedAtMs;
+	const snapshotStatus =
+		snapshotAgeMsAtRoute < 0
+			? "future"
+			: snapshotAgeMsAtRoute >= SNAPSHOT_STALE_THRESHOLD_MS
+				? "stale"
+				: "fresh";
+	return {
+		snapshot,
+		snapshotStatus,
+		snapshotMtime,
+		snapshotAgeMsAtRoute,
+	};
 }
 
 /**
@@ -93,7 +159,7 @@ function readSnapshot() {
 function isValidSnapshot(snapshot) {
 	if (!snapshot || typeof snapshot !== "object") return false;
 	if (snapshot.schema_version !== EXPECTED_SCHEMA_VERSION) return false;
-	return true;
+	return Array.isArray(snapshot.providers);
 }
 
 /**
@@ -140,6 +206,7 @@ export function route(options = {}) {
 		floor = DEFAULT_FLOOR,
 		requiredCapability,
 		availableProviders,
+		nowMs = Date.now(),
 	} = options;
 	// Resolve the routing seed up front; it feeds the scorer's deterministic
 	// tie-break below (Task 11: equal-headroom candidates are decided by
@@ -156,21 +223,57 @@ export function route(options = {}) {
 		return availableProviders.some((p) => normalizeProviderName(p) === norm);
 	};
 
-	// Read snapshot host-side (WR-1)
-	const snapshot = readSnapshot();
+	// Read snapshot host-side (WR-1). All route-time diagnostics below come
+	// from this one resolved path/content read, so status, mtime, and age cannot
+	// describe different snapshot generations.
+	const snapshotRead = readSnapshotAtRoute(
+		Number.isFinite(nowMs) ? nowMs : Date.now(),
+	);
+	const { snapshot, snapshotStatus, snapshotMtime, snapshotAgeMsAtRoute } =
+		snapshotRead;
+	const snapshotDiagnostics = {
+		snapshotStatus,
+		snapshotMtime,
+		snapshotAgeMsAtRoute,
+	};
 
-	if (!isValidSnapshot(snapshot)) {
-		log.push("snapshot invalid or missing — routing blind");
+	const ambiguousFilter = [...exclude, ...only].find(
+		(identifier) => resolveTargetIdentity(identifier).ambiguous,
+	);
+	if (ambiguousFilter) {
+		return {
+			provider: null,
+			model: null,
+			percentLeft: null,
+			resolvedTargetId: null,
+			requiredCapability: effectiveCapabilityClass,
+			reason: "ambiguous_target",
+			log: [
+				`provider selector ${ambiguousFilter} is ambiguous; use an exact target id`,
+			],
+			...snapshotDiagnostics,
+		};
+	}
+
+	if (!snapshot) {
+		log.push(`snapshot ${snapshotStatus} — routing blind`);
 		// Wire the blind fallback into the real path: a missing/broken snapshot
 		// must not silently halt every task behind it. Candidates are ordered
 		// by roster declaration order (highest capability first) and still
 		// respect the capability filter and caller-supplied availability/exclude.
-		const blindOrder = Object.keys(PROVIDER_CAPABILITIES).filter(
-			(name) =>
+		const unresolvedBlind = [];
+		const blindOrder = Object.keys(PROVIDER_CAPABILITIES).filter((name) => {
+			const identity = resolveTargetIdentity(name);
+			if (!identity.targetId) {
+				if (identity.ambiguous) unresolvedBlind.push(name);
+				return false;
+			}
+			return (
 				isAvailable(name) &&
 				passesCapabilityFilter(name, effectiveCapabilityClass) &&
-				(only.length === 0 || only.some((o) => providerMatches(o, name))),
-		);
+				(only.length === 0 || only.some((o) => providerMatches(o, name)))
+			);
+		});
 		const blind = routeBlind(blindOrder, exclude);
 		const model = blind.provider
 			? getRightSizedModel(blind.provider, effectiveCapabilityClass)
@@ -179,8 +282,20 @@ export function route(options = {}) {
 			...blind,
 			model,
 			percentLeft: null,
+			resolvedTargetId: blind.provider ? resolveTargetId(blind.provider) : null,
 			requiredCapability: effectiveCapabilityClass,
-			log: [...log, `blind candidates: ${blindOrder.join(", ") || "none"}`],
+			reason:
+				blind.provider || unresolvedBlind.length === 0
+					? blind.reason
+					: "quarantine_unresolvable",
+			log: [
+				...log,
+				...(unresolvedBlind.length > 0
+					? [`ambiguous blind targets skipped: ${unresolvedBlind.join(", ")}`]
+					: []),
+				`blind candidates: ${blindOrder.join(", ") || "none"}`,
+			],
+			...snapshotDiagnostics,
 		};
 	}
 
@@ -199,6 +314,8 @@ export function route(options = {}) {
 	let ceilingSkips = 0;
 	let otherSkips = 0;
 	let firstUnavailable = null;
+	let unresolvedTargetSkips = 0;
+	let ambiguousTargetSkips = 0;
 
 	// implementor-priority-waterfall-routing plan: survivors of the checks
 	// above partition into three pools instead of one flat scored array.
@@ -236,6 +353,16 @@ export function route(options = {}) {
 	for (const [name, provider] of providers) {
 		// CR-3: tolerate absent providers - but we're iterating present ones,
 		// absent providers simply won't be in the map. This is the tolerance.
+		const targetIdentity = resolveTargetIdentity(name);
+		if (!targetIdentity.targetId) {
+			otherSkips += 1;
+			unresolvedTargetSkips += 1;
+			if (targetIdentity.ambiguous) ambiguousTargetSkips += 1;
+			log.push(
+				`provider ${name}: target identity unavailable${targetIdentity.ambiguous ? " (ambiguous harness)" : ""}`,
+			);
+			continue;
+		}
 
 		if (!isAvailable(name)) {
 			otherSkips += 1;
@@ -476,14 +603,21 @@ export function route(options = {}) {
 			noEligibleReason = `no_eligible_upstream_unavailable: ${firstUnavailable.name} — ${error}`;
 		} else if (ceilingSkips > 0 && otherSkips === 0) {
 			noEligibleReason = "no_eligible_capability_ceiling";
+		} else if (
+			ambiguousTargetSkips > 0 &&
+			unresolvedTargetSkips === otherSkips
+		) {
+			noEligibleReason = "quarantine_unresolvable";
 		}
 		return {
 			provider: null,
 			model: null,
 			percentLeft: null,
+			resolvedTargetId: null,
 			requiredCapability: effectiveCapabilityClass,
 			reason: noEligibleReason,
 			log,
+			...snapshotDiagnostics,
 		};
 	}
 
@@ -502,9 +636,11 @@ export function route(options = {}) {
 		provider: winner.name,
 		model,
 		percentLeft: winner.percentLeft,
+		resolvedTargetId: resolveTargetId(winner.name),
 		requiredCapability: effectiveCapabilityClass,
 		reason,
 		log,
+		...snapshotDiagnostics,
 	};
 }
 
@@ -521,14 +657,47 @@ export function route(options = {}) {
  * @returns {{provider: string|null, model: null, reason: string}} Result
  */
 export function routeBlind(providerOrder, exclude = []) {
+	const ambiguousFilter = exclude.find(
+		(identifier) => resolveTargetIdentity(identifier).ambiguous,
+	);
+	if (ambiguousFilter) {
+		return {
+			provider: null,
+			model: null,
+			resolvedTargetId: null,
+			reason: "ambiguous_target",
+		};
+	}
+
 	for (const name of providerOrder) {
-		const excluded = exclude.some(
-			(excludedName) =>
-				normalizeProviderName(excludedName) === normalizeProviderName(name),
+		const identity = resolveTargetIdentity(name);
+		if (!identity.targetId) {
+			if (identity.ambiguous) {
+				return {
+					provider: null,
+					model: null,
+					resolvedTargetId: null,
+					reason: "quarantine_unresolvable",
+				};
+			}
+			continue;
+		}
+		const excluded = exclude.some((excludedName) =>
+			providerMatches(excludedName, name),
 		);
 		if (!excluded) {
-			return { provider: name, model: null, reason: "blind_fallback" };
+			return {
+				provider: name,
+				model: null,
+				resolvedTargetId: identity.targetId,
+				reason: "blind_fallback",
+			};
 		}
 	}
-	return { provider: null, model: null, reason: "no_eligible_blind" };
+	return {
+		provider: null,
+		model: null,
+		resolvedTargetId: null,
+		reason: "no_eligible_blind",
+	};
 }

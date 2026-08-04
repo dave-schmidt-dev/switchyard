@@ -30,12 +30,13 @@
 //   --help                 Show this help.
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { getPlatformInfo } from "../container/index.mjs";
 import {
 	listManagedContainers,
@@ -47,6 +48,7 @@ import {
 	acquireRunLock,
 	advanceState,
 	applyRetention,
+	createEvent,
 	getRunRoot,
 	getStateRoot,
 	initializeRun,
@@ -468,6 +470,7 @@ async function runDispatch(opts, dependencies = {}) {
 	}
 
 	let result;
+	let eventWriteChain = Promise.resolve();
 	try {
 		// Acquire the exclusive project lock immediately before queue
 		// execution, mirroring handleLaunch. This is deliberately NOT
@@ -503,15 +506,56 @@ async function runDispatch(opts, dependencies = {}) {
 					console.error(
 						`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd(),
 					),
-				onTaskRouted: (info) =>
+				onTaskRouted: (info) => {
 					console.error(
-						`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline}`,
-					),
-				onResult: (r) => {
-					const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
-					console.error(
-						`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}${r.reason ? ` (${r.reason})` : ""}`,
+						`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline ?? "orchestrator"}`,
 					);
+					if (runStoreReady) {
+						eventWriteChain = eventWriteChain
+							.then(() =>
+								updateRunWithRetry(runId, {
+									activeTaskProvider: info.provider,
+									activeTaskModel: info.model,
+									activeTaskDeadline: info.deadline ?? null,
+									resolvedTargetId: info.resolvedTargetId ?? null,
+									snapshotStatus: info.snapshotStatus ?? null,
+									snapshotMtime: info.snapshotMtime ?? null,
+									snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
+								}),
+							)
+							.catch(() => {});
+					}
+				},
+				onResult: (r) => {
+					const safeFailure = sanitizeFailureMetadata(r);
+					const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
+					const displayReason =
+						safeFailure?.reason ?? (r.success ? "" : "task failed");
+					console.error(
+						`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}${displayReason ? ` (${displayReason})` : ""}`,
+					);
+					if (runStoreReady) {
+						const event = {
+							phase: "execution",
+							event: r.success ? "task_completed" : "task_failed",
+							status: `Task ${r.taskId} ${r.success ? "completed" : "failed"}`,
+							taskId: r.taskId,
+							provider: r.provider ?? null,
+							model: r.model ?? null,
+							result: r.result,
+							...(safeFailure ?? {}),
+						};
+						eventWriteChain = eventWriteChain
+							.then(async () => {
+								await createEvent(runId, event);
+								if (safeFailure) {
+									await updateRunWithRetry(runId, {
+										lastFailure: safeFailure,
+									});
+								}
+							})
+							.catch(() => {});
+					}
 				},
 			},
 		});
@@ -523,6 +567,7 @@ async function runDispatch(opts, dependencies = {}) {
 			// treat that as a failed run.
 			const anyFailed = result ? result.results.some((r) => !r.success) : true;
 			try {
+				await eventWriteChain;
 				// Single combined terminal write (mirrors worker-bootstrap's
 				// terminalPatch): setting cleanupState:"complete" here is what
 				// makes a sync-path run retention-eligible (applyRetention only
@@ -1001,8 +1046,13 @@ async function buildStatusEnvelope(runId, run) {
 		activeTaskProvider: run.activeTaskProvider ?? null,
 		activeTaskModel: run.activeTaskModel ?? null,
 		activeTaskDeadline: run.activeTaskDeadline ?? null,
+		resolvedTargetId: run.resolvedTargetId ?? null,
+		snapshotStatus: run.snapshotStatus ?? null,
+		snapshotMtime: run.snapshotMtime ?? null,
+		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount,
 		failedCount,
+		lastFailure: run.lastFailure ?? null,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		...telemetry,
@@ -1015,7 +1065,13 @@ async function listArtifactRefs(runId) {
 		const entries = await readdir(artifactsDir, { withFileTypes: true });
 		return entries
 			.filter((e) => e.isFile())
-			.map((e) => resolve(artifactsDir, e.name));
+			.map(
+				(e) =>
+					`artifact:${createHash("sha256")
+						.update(e.name)
+						.digest("hex")
+						.slice(0, 24)}`,
+			);
 	} catch {
 		return [];
 	}
@@ -1046,8 +1102,13 @@ async function buildResultEnvelope(runId, run) {
 		activeTaskProvider: run.activeTaskProvider ?? null,
 		activeTaskModel: run.activeTaskModel ?? null,
 		activeTaskDeadline: run.activeTaskDeadline ?? null,
+		resolvedTargetId: run.resolvedTargetId ?? null,
+		snapshotStatus: run.snapshotStatus ?? null,
+		snapshotMtime: run.snapshotMtime ?? null,
+		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount,
 		failedCount,
+		lastFailure: run.lastFailure ?? null,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		terminalSummary: run.terminalSummary ?? null,

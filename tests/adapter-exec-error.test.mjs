@@ -1,8 +1,11 @@
-import { match, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	describeExecError,
+	isPersistentFailureMetadata,
+	PERSISTED_ERROR_KINDS,
 	reauthHintFor,
+	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { AGENT_CONTAINER_NAME } from "../src/switchyard/container/index.mjs";
 
@@ -125,5 +128,58 @@ describe("reauthHintFor", () => {
 
 	it("returns null for an unknown provider rather than inventing a command", () => {
 		strictEqual(reauthHintFor("nope"), null);
+	});
+});
+
+describe("sanitizeFailureMetadata — persistence boundary", () => {
+	it("maps an untrusted provider classification to static metadata and an opaque artifact ref", () => {
+		const metadata = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "execution_failed",
+			errorKind: "provider_private_reason",
+			partialDiffPath: "/Users/dave/project/.partial-diffs/1.1.diff",
+		});
+
+		strictEqual(metadata.errorKind, "execution_failed");
+		strictEqual(metadata.reasonCode, "execution_failed");
+		strictEqual(
+			metadata.reason,
+			"Provider execution failed before a reviewed integration.",
+		);
+		match(metadata.artifactRef, /^artifact:[a-f0-9]{24}$/);
+		ok(!metadata.reason.includes("/Users/dave"));
+		ok(isPersistentFailureMetadata(metadata));
+	});
+
+	it("retains the closed auth-expired enum without persisting the adapter's raw hint", () => {
+		const metadata = sanitizeFailureMetadata({
+			taskId: "1.2",
+			result: "execution_failed",
+			errorKind: "auth_expired",
+		});
+
+		deepStrictEqual(metadata, {
+			errorKind: "auth_expired",
+			reasonCode: "auth_expired",
+			reason:
+				"Provider authentication expired; interactive re-authentication is required.",
+		});
+		ok(PERSISTED_ERROR_KINDS.includes(metadata.errorKind));
+	});
+
+	it("does not create failure metadata for successful results", () => {
+		strictEqual(sanitizeFailureMetadata({ result: "success" }), null);
+		strictEqual(sanitizeFailureMetadata({ result: "success_no_diff" }), null);
+	});
+
+	it("rejects durable metadata carrying raw provider fields", () => {
+		ok(
+			!isPersistentFailureMetadata({
+				errorKind: "execution_failed",
+				reasonCode: "execution_failed",
+				reason: "Provider execution failed before a reviewed integration.",
+				output: "SECRET_CANARY_provider_output",
+			}),
+		);
 	});
 });

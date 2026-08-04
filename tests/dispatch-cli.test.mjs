@@ -1151,8 +1151,13 @@ describe("envelope format", () => {
 			"state",
 			"cleanupState",
 			"activeTaskId",
+			"resolvedTargetId",
+			"snapshotStatus",
+			"snapshotMtime",
+			"snapshotAgeMsAtRoute",
 			"completedCount",
 			"failedCount",
+			"lastFailure",
 			"updatedAt",
 			"queueStartedAt",
 			"elapsedMs",
@@ -1203,8 +1208,13 @@ describe("envelope format", () => {
 			"state",
 			"cleanupState",
 			"activeTaskId",
+			"resolvedTargetId",
+			"snapshotStatus",
+			"snapshotMtime",
+			"snapshotAgeMsAtRoute",
 			"completedCount",
 			"failedCount",
+			"lastFailure",
 			"updatedAt",
 			"terminalSummary",
 			"artifactRefs",
@@ -1222,6 +1232,64 @@ describe("envelope format", () => {
 		for (const key of required) {
 			ok(key in envelope, `result envelope missing field: ${key}`);
 		}
+	});
+
+	it("capstone: status and result preserve the same bounded route/failure projection", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = "unconditional-contract-projection";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		const routeAndFailure = {
+			resolvedTargetId: "agy-gemini",
+			snapshotStatus: "stale",
+			snapshotMtime: 1_754_000_000_000,
+			snapshotAgeMsAtRoute: 301_000,
+			lastFailure: {
+				errorKind: "integration_failed",
+				reasonCode: "integration_failed",
+				reason: "The reviewed integration gate rejected the task result.",
+				artifactRef: "artifact:0123456789abcdef01234567",
+			},
+		};
+		let current = await readRun(runId);
+		await updateRun(runId, routeAndFailure, current.revision);
+
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
+		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
+
+		current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: ["1.1"] },
+			},
+			current.revision,
+		);
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
+		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
+
+		for (const envelope of [statusEnvelope, resultEnvelope]) {
+			for (const [key, expected] of Object.entries(routeAndFailure)) {
+				deepStrictEqual(envelope[key], expected, `${key} projection drifted`);
+			}
+		}
+		ok(
+			!JSON.stringify({ statusEnvelope, resultEnvelope }).includes(
+				"SECRET_CANARY",
+			),
+		);
 	});
 
 	it("status and result envelopes' platformInfo has the getPlatformInfo shape", async () => {

@@ -13,6 +13,10 @@ import {
 } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	isPersistentFailureMetadata,
+	sanitizeFailureMetadata,
+} from "../adapter/exec-error.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const defaultStateRoot = resolve(
@@ -186,6 +190,36 @@ function validateRun(data) {
 	) {
 		throw new SchemaError("workingContainerName must be a string or null");
 	}
+	if (
+		data.snapshotStatus !== undefined &&
+		data.snapshotStatus !== null &&
+		typeof data.snapshotStatus !== "string"
+	) {
+		throw new SchemaError("snapshotStatus must be a string or null");
+	}
+	if (
+		data.resolvedTargetId !== undefined &&
+		data.resolvedTargetId !== null &&
+		typeof data.resolvedTargetId !== "string"
+	) {
+		throw new SchemaError("resolvedTargetId must be a string or null");
+	}
+	for (const field of ["snapshotMtime", "snapshotAgeMsAtRoute"]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			(typeof data[field] !== "number" || !Number.isFinite(data[field]))
+		) {
+			throw new SchemaError(`${field} must be a finite number or null`);
+		}
+	}
+	if (
+		data.lastFailure !== undefined &&
+		data.lastFailure !== null &&
+		!isPersistentFailureMetadata(data.lastFailure)
+	) {
+		throw new SchemaError("lastFailure contains invalid persistent metadata");
+	}
 	if (data.schemaVersion === CURRENT_SCHEMA_VERSION) {
 		if (
 			typeof data.queueIdentity !== "string" ||
@@ -329,10 +363,15 @@ export async function initializeRun(options) {
 		activeTaskProvider: null,
 		activeTaskModel: null,
 		activeTaskDeadline: null,
+		snapshotStatus: null,
+		snapshotMtime: null,
+		snapshotAgeMsAtRoute: null,
+		resolvedTargetId: null,
 		terminalSummary: null,
 		cleanupError: null,
 		lastLeaseHeartbeat: now,
 		lastEventSequence: 0,
+		lastFailure: null,
 		launchArgs,
 	};
 	if (versioned) {
@@ -497,6 +536,28 @@ export async function createEvent(runId, event) {
 
 	let current = await readRun(runId);
 	const nextSeq = current.lastEventSequence + 1;
+	const isFailureEvent =
+		event?.event === "task_failed" || event?.event === "queue_halted";
+	const suppliedFailure = isFailureEvent
+		? {
+				errorKind: event.errorKind,
+				reasonCode: event.reasonCode,
+				reason: event.reason,
+				...(event.artifactRef !== undefined
+					? { artifactRef: event.artifactRef }
+					: {}),
+			}
+		: null;
+	const safeFailure = isFailureEvent
+		? isPersistentFailureMetadata(suppliedFailure)
+			? suppliedFailure
+			: sanitizeFailureMetadata({
+					taskId: event.taskId,
+					result: event.result ?? "unknown_failure",
+					errorKind: event.errorKind,
+					partialDiffPath: event.partialDiffPath,
+				})
+		: null;
 
 	const entry = {
 		schemaVersion: current.schemaVersion,
@@ -513,6 +574,15 @@ export async function createEvent(runId, event) {
 	delete extra.status;
 	delete extra.sequence;
 	delete extra.timestamp;
+	if (safeFailure) {
+		delete extra.error;
+		delete extra.output;
+		delete extra.partialDiff;
+		delete extra.partialDiffPath;
+		delete extra.artifactRef;
+		delete extra.reason;
+		Object.assign(extra, safeFailure);
+	}
 	Object.assign(entry, extra);
 
 	await appendFile(eventsPath, `${JSON.stringify(entry)}\n`, {

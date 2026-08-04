@@ -901,6 +901,121 @@ ${body}
 		ok(!serialized.includes("provider-secret-name.mjs"));
 		ok(!serialized.includes("decision:approval"));
 	});
+
+	it("capstone: immutable handoff and Sentinel-style queues honor every unconditional contract", () => {
+		// Keep this fixture immutable and local: the capstone must not depend on
+		// an active plan file, a provider credential, or a live quota response.
+		const markdown = `## Phase 1
+
+### Task 1.1: Sentinel root
+- **Status:** pending
+- **RequiredCapability:** high
+- **Executor:** switchyard
+- **Files:** src/root.mjs
+- **Blocked by:** none
+- **Description:** provider work stays in the selected execution lane
+
+### Task 1.2: Native handoff
+- **Status:** pending
+- **RequiredCapability:** standard
+- **Executor:** native
+- **Description:** native work never enters provider routing
+
+### Task 1.3: Human approval
+- **Status:** pending
+- **RequiredCapability:** low
+- **Executor:** human
+- **Description:** human work is gated outside the provider queue
+
+### Task 1.4: External gate
+- **Status:** pending
+- **RequiredCapability:** standard
+- **Executor:** switchyard
+- **Files:** src/gated.mjs
+- **External blockers:** decision:release-approval
+- **Description:** the unresolved external gate remains parked
+
+### Task 1.5: Dependent follow-up
+- **Status:** pending
+- **RequiredCapability:** low
+- **Executor:** switchyard
+- **Files:** src/follow-up.mjs
+- **Blocked by:** Task 1.1
+- **Description:** follow-up waits for durable success of the root
+`;
+		const tasks = parseFixture(markdown);
+		strictEqual(tasks.length, 5);
+		deepStrictEqual(
+			getRunnableTasks(tasks, { completedTaskIds: [] }).map((task) => task.id),
+			["1.1"],
+		);
+		deepStrictEqual(
+			getRunnableTasks(tasks, { completedTaskIds: ["1.1"] }).map(
+				(task) => task.id,
+			),
+			["1.5"],
+		);
+		throws(
+			() =>
+				getRunnableTasks(
+					tasks,
+					{ completedTaskIds: [] },
+					{ selectedTaskIds: ["1.4"] },
+				),
+			(error) =>
+				error instanceof TaskSelectionError &&
+				error.reason === "external-blocked:decision:release-approval",
+		);
+
+		const diagnostics = deriveQueueDiagnostics(tasks, {
+			completedTaskIds: [],
+		});
+		strictEqual(diagnostics.runnable.count, 1);
+		strictEqual(diagnostics.nativeGated.reason, "executor_native");
+		strictEqual(diagnostics.humanGated.reason, "executor_human");
+		strictEqual(diagnostics.externalBlocked.reason, "external_blocker");
+		strictEqual(diagnostics.dependencyBlocked.reason, "task_dependency");
+		const serializedDiagnostics = JSON.stringify(diagnostics);
+		ok(!serializedDiagnostics.includes("provider work stays"));
+		ok(!serializedDiagnostics.includes("src/root.mjs"));
+		ok(!serializedDiagnostics.includes("decision:release-approval"));
+
+		const runOptions = normalizeRunOptions({
+			maxTasks: 2,
+			only: ["agy"],
+			exclude: ["codex"],
+			taskIds: ["1.1"],
+		});
+		const identity = createQueueIdentity({
+			tasksFilePath: "/immutable/sentinel/tasks.md",
+			markdown,
+			tasks,
+			projectRevision: "sentinel-revision",
+			runOptions,
+		});
+		notStrictEqual(
+			identity,
+			createQueueIdentity({
+				tasksFilePath: "/immutable/sentinel/tasks.md",
+				markdown,
+				tasks,
+				projectRevision: "sentinel-revision",
+				runOptions: normalizeRunOptions({ ...runOptions, maxTasks: 1 }),
+			}),
+			"run-shaping options must be identity-bound",
+		);
+		notStrictEqual(
+			identity,
+			createQueueIdentity({
+				tasksFilePath: "/immutable/sentinel/tasks.md",
+				markdown: `${markdown}\n<!-- immutable fixture revision -->\n`,
+				tasks,
+				projectRevision: "sentinel-revision",
+				runOptions,
+			}),
+			"queue content must be identity-bound",
+		);
+	});
 });
 
 describe("runner task selection and queue identity", () => {
@@ -2752,6 +2867,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		const commits = [];
 		const resets = [];
 		let gateCalls = 0;
+		let routeCalls = 0;
+		let executeCalls = 0;
 
 		const result = runQueue({
 			tasksFilePath: tasksPath,
@@ -2759,12 +2876,15 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			checkpointPath,
 			stopOnFailure: false,
 			dependencies: {
-				route: () => ({
-					provider: "claude",
-					model: "claude-sonnet-5",
-					percentLeft: 72,
-					reason: "spread",
-				}),
+				route: () => {
+					routeCalls += 1;
+					return {
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 72,
+						reason: "spread",
+					};
+				},
 				recordDispatch: () => {},
 				integrationGate: () => {
 					gateCalls += 1;
@@ -2782,7 +2902,10 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
+						execute: () => {
+							executeCalls += 1;
+							return { success: true, output: "ok" };
+						},
 						captureDiff: () => "diff --git a/a b/a",
 					},
 				},
@@ -2796,6 +2919,16 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		);
 		strictEqual(commits.length, 2, "commit called after tasks 1 and 3 only");
 		strictEqual(resets.length, 1, "reset called after failed task 2");
+		strictEqual(
+			routeCalls,
+			3,
+			"integration rejection must not re-route the task",
+		);
+		strictEqual(
+			executeCalls,
+			3,
+			"integration rejection must not re-execute the task",
+		);
 	});
 
 	it("resets rejected state before continuing when stopOnFailure is false", () => {
@@ -3033,6 +3166,11 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			resets.length,
 			1,
 			"orchestrator: reset called after failed task 2",
+		);
+		strictEqual(
+			launchIndex,
+			3,
+			"integration rejection must not relaunch a task",
 		);
 	});
 
@@ -4357,7 +4495,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 					claude: {
 						execute: () => ({
 							success: false,
-							error: "simulated adapter failure",
+							error: "SECRET_CANARY_provider_failure",
 						}),
 						captureDiff: () => "",
 					},
@@ -4369,6 +4507,13 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 		ok(failed, "task_failed event emitted");
 		strictEqual(failed.taskId, "1.1");
 		ok(failed.error, "error field present");
+		strictEqual(failed.errorKind, "execution_failed");
+		strictEqual(failed.reasonCode, "execution_failed");
+		strictEqual(
+			failed.error.message,
+			"Provider execution failed before a reviewed integration.",
+		);
+		ok(!JSON.stringify(events).includes("SECRET_CANARY_provider_failure"));
 	});
 
 	it("runner emits gate_validated event with rejected outcome on gate failure", () => {
@@ -4417,10 +4562,18 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 		const validated = events.find((e) => e.event === "gate_validated");
 		ok(validated, "gate_validated event emitted");
 		strictEqual(validated.outcome, "rejected");
+		strictEqual(validated.errorKind, "integration_failed");
+		strictEqual(validated.reasonCode, "integration_failed");
+		strictEqual(
+			validated.status,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(validated.artifactRef));
 		ok(
 			!events.find((e) => e.event === "gate_applied"),
 			"gate_applied not emitted on rejection",
 		);
+		ok(!JSON.stringify(events).includes("gate rejected diff"));
 	});
 
 	it("runner emits checkpoint events (checkpoint_saved) for each task", () => {
@@ -4919,10 +5072,24 @@ describe("Files requiredPaths propagation", () => {
 
 		strictEqual(result.success, false);
 		strictEqual(result.result, "integration_failed");
+		strictEqual(result.errorKind, "integration_failed");
+		strictEqual(result.reasonCode, "integration_failed");
+		strictEqual(
+			result.reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(!JSON.stringify(result).includes("empty_required_diff"));
 		strictEqual(gateCalls.length, 1);
 		strictEqual(gateCalls[0].diff, "");
 		deepStrictEqual(gateCalls[0].options.requiredPaths, ["src/f.mjs"]);
 		strictEqual(dispatches[0].result, "integration_failed");
+		strictEqual(dispatches[0].errorKind, "integration_failed");
+		strictEqual(dispatches[0].reasonCode, "integration_failed");
+		strictEqual(
+			dispatches[0].reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(!JSON.stringify(dispatches).includes("empty_required_diff"));
 	});
 
 	it("executeTaskWithOrchestrator passes requiredPaths to integrationGate", async () => {
@@ -4989,7 +5156,7 @@ describe("Files requiredPaths propagation", () => {
 		const gateCalls = [];
 		const dispatches = [];
 
-		await runQueueWithOrchestrator({
+		const result = await runQueueWithOrchestrator({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -5020,7 +5187,24 @@ describe("Files requiredPaths propagation", () => {
 
 		strictEqual(gateCalls.length, 1);
 		strictEqual(gateCalls[0].diff, "");
+		const [taskResult] = result.results;
+		strictEqual(taskResult.success, false);
+		strictEqual(taskResult.result, "integration_failed");
+		strictEqual(taskResult.errorKind, "integration_failed");
+		strictEqual(taskResult.reasonCode, "integration_failed");
+		strictEqual(
+			taskResult.reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(!JSON.stringify(taskResult).includes("empty_required_diff"));
 		strictEqual(dispatches[0].result, "integration_failed");
+		strictEqual(dispatches[0].errorKind, "integration_failed");
+		strictEqual(dispatches[0].reasonCode, "integration_failed");
+		strictEqual(
+			dispatches[0].reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(!JSON.stringify(dispatches).includes("empty_required_diff"));
 	});
 });
 
@@ -5778,7 +5962,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
 	});
 
-	it("executeTaskWithOrchestrator passes both context.exclude and availableProviders through to route() (Task E.1)", async () => {
+	it("executeTaskWithOrchestrator passes both provider filters and availableProviders through to route() (Task E.1)", async () => {
 		// Task E.1 closed the "intentionally-unfiltered orchestrator route" gap
 		// (Task 16): executeTaskWithOrchestrator now mirrors executeTask and
 		// passes availableProviders derived from context.adapters, alongside
@@ -5814,12 +5998,14 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					},
 				},
 				exclude: ["claude"],
+				only: ["codex"],
 			},
 		);
 
 		strictEqual(result.success, true);
 		strictEqual(routeCalls.length, 1);
 		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
+		deepStrictEqual(routeCalls[0].only, ["codex"]);
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
 	});
 });
@@ -5886,15 +6072,17 @@ describe("runQueue timeout diff persistence", () => {
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(checkpoint.results[0].success, false);
 		strictEqual(checkpoint.results[0].timedOut, true);
-		strictEqual(
-			checkpoint.results[0].partialDiffPath,
-			taskResult.partialDiffPath,
-		);
+		strictEqual(checkpoint.results[0].partialDiffPath, null);
+		ok(/^artifact:[a-f0-9]{24}$/.test(checkpoint.results[0].artifactRef));
 
 		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
 		ok(
 			!rawCheckpointJson.includes("SECRET_CANARY_wip_marker"),
 			"checkpoint.json must reference the artifact by path only, never embed the diff text",
+		);
+		ok(
+			!rawCheckpointJson.includes(taskResult.partialDiffPath),
+			"checkpoint.json must not persist the host artifact path",
 		);
 	});
 
@@ -5981,6 +6169,8 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const diffText =
 			"diff --git a/wip.mjs b/wip.mjs\n+SECRET_CANARY_rejected_marker";
+		const dispatches = [];
+		const events = [];
 
 		const result = runQueue({
 			tasksFilePath: tasksPath,
@@ -5993,10 +6183,11 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 					percentLeft: 72,
 					reason: "spread",
 				}),
-				recordDispatch: () => {},
+				recordDispatch: (entry) => dispatches.push(entry),
+				onStatus: (event) => events.push(event),
 				integrationGate: () => ({
 					success: false,
-					message: "Diff apply failed",
+					message: "SECRET_CANARY_gate_message",
 				}),
 				ensureAgentContainer: () => {},
 				createWorkingContainer: () => "generated-working-container",
@@ -6018,6 +6209,13 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 		const [taskResult] = result.results;
 		strictEqual(taskResult.success, false);
 		strictEqual(taskResult.result, "integration_failed");
+		strictEqual(taskResult.errorKind, "integration_failed");
+		strictEqual(taskResult.reasonCode, "integration_failed");
+		strictEqual(
+			taskResult.reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(taskResult.artifactRef));
 		strictEqual(
 			taskResult.partialDiff,
 			undefined,
@@ -6028,15 +6226,41 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 		strictEqual(readFileSync(taskResult.partialDiffPath, "utf8"), diffText);
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[0].partialDiffPath, null);
+		strictEqual(checkpoint.results[0].errorKind, "integration_failed");
+		strictEqual(checkpoint.results[0].reasonCode, "integration_failed");
 		strictEqual(
-			checkpoint.results[0].partialDiffPath,
-			taskResult.partialDiffPath,
+			checkpoint.results[0].reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(checkpoint.results[0].artifactRef));
+		const failedEvent = events.find((event) => event.event === "task_failed");
+		ok(failedEvent, "task_failed status event is present");
+		strictEqual(failedEvent.errorKind, "integration_failed");
+		strictEqual(failedEvent.reasonCode, "integration_failed");
+		strictEqual(
+			failedEvent.reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(failedEvent.artifactRef));
+		strictEqual(dispatches.length, 1);
+		strictEqual(dispatches[0].errorKind, "integration_failed");
+		strictEqual(dispatches[0].reasonCode, "integration_failed");
+		ok(/^artifact:[a-f0-9]{24}$/.test(dispatches[0].artifactRef));
+		ok(
+			!JSON.stringify({ dispatches, events, checkpoint }).includes(
+				"SECRET_CANARY_gate_message",
+			),
 		);
 
 		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
 		ok(
 			!rawCheckpointJson.includes("SECRET_CANARY_rejected_marker"),
 			"checkpoint.json must reference the artifact by path only, never embed the diff text",
+		);
+		ok(
+			!rawCheckpointJson.includes(taskResult.partialDiffPath),
+			"checkpoint.json must not persist the host artifact path",
 		);
 	});
 

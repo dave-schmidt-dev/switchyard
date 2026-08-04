@@ -39,9 +39,10 @@ import {
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
 	resolveRouteProvenance,
+	resolveTargetIdentity,
 	resolveTargetProvenance,
 } from "../src/switchyard/roster/index.mjs";
-import { route } from "../src/switchyard/router/index.mjs";
+import { route, routeBlind } from "../src/switchyard/router/index.mjs";
 import {
 	executeTask,
 	executeTaskWithOrchestrator,
@@ -174,6 +175,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, ANTIGRAVITY_CLAUDE);
 		strictEqual(result.model, "fixture-agy-claude-standard");
+		strictEqual(result.resolvedTargetId, "antigravity-claude");
 	});
 
 	it("routes to the Gemini bucket's model when IT has the most headroom (winner flips, model follows)", () => {
@@ -192,6 +194,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, ANTIGRAVITY);
 		strictEqual(result.model, "fixture-agy-gemini-standard");
+		strictEqual(result.resolvedTargetId, "antigravity");
 	});
 
 	it("both agy-harness snapshot entries are scored as independent candidates, not collapsed to one", () => {
@@ -226,23 +229,69 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 		ok(mentionsGemini, `expected log to mention ${ANTIGRAVITY}: ${result.log}`);
 	});
 
-	it("blind fallback (no snapshot) does not crash and does not double-count the agy harness", () => {
+	it("blind fallback quarantines an ambiguous shared harness instead of choosing a target", () => {
 		removeSnapshot();
 		const result = route({ requiredCapability: "standard" });
 		ok(
-			result.log.some((line) => line.startsWith("snapshot invalid or missing")),
+			result.log.some((line) => line.startsWith("snapshot missing")),
 			"expected the blind-routing path to have been taken",
 		);
 		const blindLine = result.log.find((line) =>
 			line.startsWith("blind candidates:"),
 		);
 		ok(blindLine, `expected a blind candidates log line, got: ${result.log}`);
+		strictEqual(result.provider, "claude");
+		strictEqual(result.resolvedTargetId, "claude-code");
+		ok(
+			result.log.some((line) =>
+				line.includes("ambiguous blind targets skipped: agy"),
+			),
+			`expected agy to be quarantined, got: ${result.log}`,
+		);
 		const agyOccurrences = (blindLine.match(/\bagy\b/g) ?? []).length;
 		strictEqual(
 			agyOccurrences,
-			1,
-			`agy harness must appear exactly once in blind candidates, got: ${blindLine}`,
+			0,
+			`ambiguous agy must not appear in blind candidates, got: ${blindLine}`,
 		);
+	});
+
+	it("rejects a harness alias that maps to two enabled targets", () => {
+		strictEqual(resolveTargetIdentity("agy").ambiguous, true);
+		const result = route({
+			requiredCapability: "standard",
+			only: ["agy"],
+		});
+		strictEqual(result.provider, null);
+		strictEqual(result.resolvedTargetId, null);
+		strictEqual(result.reason, "ambiguous_target");
+	});
+
+	it("routeBlind also fails closed for an ambiguous shared harness", () => {
+		const result = routeBlind(["agy"]);
+		strictEqual(result.provider, null);
+		strictEqual(result.reason, "quarantine_unresolvable");
+	});
+
+	it("allows an exact target id to select only its shared-harness target", () => {
+		writeSnapshot([
+			{
+				name: ANTIGRAVITY_CLAUDE,
+				ok: true,
+				windows: [{ percent_left: 40, pace_delta: 0 }],
+			},
+			{
+				name: ANTIGRAVITY,
+				ok: true,
+				windows: [{ percent_left: 95, pace_delta: 0 }],
+			},
+		]);
+		const result = route({
+			requiredCapability: "standard",
+			only: ["antigravity-claude"],
+		});
+		strictEqual(result.provider, ANTIGRAVITY_CLAUDE);
+		strictEqual(result.resolvedTargetId, "antigravity-claude");
 	});
 });
 

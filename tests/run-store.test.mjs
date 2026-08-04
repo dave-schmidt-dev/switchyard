@@ -134,6 +134,11 @@ describe("initializeRun", () => {
 		strictEqual(snapshot.activeTaskId, null);
 		strictEqual(snapshot.terminalSummary, null);
 		strictEqual(snapshot.cleanupError, null);
+		strictEqual(snapshot.lastFailure, null);
+		strictEqual(snapshot.resolvedTargetId, null);
+		strictEqual(snapshot.snapshotStatus, null);
+		strictEqual(snapshot.snapshotMtime, null);
+		strictEqual(snapshot.snapshotAgeMsAtRoute, null);
 		strictEqual(typeof snapshot.lastLeaseHeartbeat, "string");
 		ok(Array.isArray(snapshot.launchArgs));
 		strictEqual(snapshot.launchArgs[0], "--provider");
@@ -297,6 +302,77 @@ describe("event ordering", () => {
 		strictEqual(parsed.taskId, "task-1");
 		strictEqual(parsed.provider, "claude");
 		strictEqual(parsed.model, "sonnet");
+	});
+
+	it("sanitizes failure events before they are persisted", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+
+		await createEvent(opts.runId, {
+			phase: "execution",
+			event: "task_failed",
+			status: "Task task-1 failed",
+			taskId: "task-1",
+			result: "execution_failed",
+			errorKind: "provider_private_reason",
+			error: "SECRET_CANARY_provider_error",
+			output: "SECRET_CANARY_provider_output",
+			reason: "SECRET_CANARY_provider_reason",
+			partialDiffPath: "/Users/dave/project/.partial-diffs/task-1.diff",
+		});
+
+		const eventsPath = join(getRunRoot(opts.runId), "events.jsonl");
+		const [event] = (await readFile(eventsPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		strictEqual(event.errorKind, "execution_failed");
+		strictEqual(event.reasonCode, "execution_failed");
+		strictEqual(
+			event.reason,
+			"Provider execution failed before a reviewed integration.",
+		);
+		for (const key of ["error", "output", "partialDiffPath"]) {
+			ok(!(key in event), `raw event field ${key} must not persist`);
+		}
+		ok(!JSON.stringify(event).includes("SECRET_CANARY"));
+	});
+
+	it("persists integration failures with static diagnostics only", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+
+		await createEvent(opts.runId, {
+			phase: "integration",
+			event: "task_failed",
+			status: "Task task-1 failed",
+			taskId: "task-1",
+			result: "integration_failed",
+			errorKind: "integration_failed",
+			reason: "SECRET_CANARY_gate_message",
+			error: "SECRET_CANARY_gate_error",
+			output: "SECRET_CANARY_gate_output",
+			partialDiff: "SECRET_CANARY_gate_diff",
+			partialDiffPath: "/Users/dave/project/.partial-diffs/task-1.diff",
+			artifactRef: "artifact:aaaaaaaaaaaaaaaaaaaaaaaa",
+		});
+
+		const eventsPath = join(getRunRoot(opts.runId), "events.jsonl");
+		const [event] = (await readFile(eventsPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		strictEqual(event.errorKind, "integration_failed");
+		strictEqual(event.reasonCode, "integration_failed");
+		strictEqual(
+			event.reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(event.artifactRef));
+		for (const key of ["error", "output", "partialDiff", "partialDiffPath"]) {
+			ok(!(key in event), `raw event field ${key} must not persist`);
+		}
+		ok(!JSON.stringify(event).includes("SECRET_CANARY"));
 	});
 });
 
@@ -1275,6 +1351,38 @@ describe("initialHostFingerprint validation", () => {
 });
 
 describe("validateRun type checks for telemetry fields", () => {
+	it("accepts static lastFailure metadata and rejects raw fields", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const safeFailure = {
+			errorKind: "execution_failed",
+			reasonCode: "execution_failed",
+			reason: "Provider execution failed before a reviewed integration.",
+			artifactRef: "artifact:0123456789abcdef01234567",
+		};
+
+		const updated = await updateRun(
+			opts.runId,
+			{ lastFailure: safeFailure },
+			snapshot.revision,
+		);
+		strictEqual(updated.lastFailure.reasonCode, "execution_failed");
+
+		await rejects(
+			updateRun(
+				opts.runId,
+				{
+					lastFailure: {
+						...safeFailure,
+						output: "SECRET_CANARY_provider_output",
+					},
+				},
+				updated.revision,
+			),
+			SchemaError,
+		);
+	});
+
 	it("rejects a non-number activeTaskStartedAt", async () => {
 		const opts = makeOptions();
 		const snapshot = await initializeRun(opts);

@@ -23,6 +23,7 @@ import {
 	captureDiff as captureCursorDiff,
 	executeCursor,
 } from "../adapter/cursor.mjs";
+import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import {
 	captureDiff as captureOpencodeDiff,
 	execute as executeOpencode,
@@ -1530,8 +1531,36 @@ function nonSwitchyardExecutorResult(task, executor, requiredCapability) {
 		model: null,
 		requiredCapability,
 		result: "executor_not_switchyard",
+		...sanitizeFailureMetadata({
+			taskId: task.id,
+			result: "executor_not_switchyard",
+		}),
 		reason: `Task ${task.id} declares Executor: ${executor}; Switchyard does not route ${executor} tasks to a provider`,
 	};
+}
+
+function failureMetadataFor(result, partialDiffPath) {
+	return sanitizeFailureMetadata({
+		taskId: result.taskId,
+		result: result.result,
+		errorKind: result.errorKind,
+		timedOut: result.timedOut,
+		partialDiffPath,
+	});
+}
+
+function integrationFailureMetadata(taskId, diff, credentialFlagged) {
+	return sanitizeFailureMetadata({
+		taskId,
+		result: "integration_failed",
+		// The queue saves this diff as `<taskId>.diff`; derive the opaque pointer
+		// before recording the dispatch so the ledger can carry the same safe
+		// artifact identity without receiving the host path or diff body.
+		partialDiffPath:
+			typeof diff === "string" && diff.length > 0 && !credentialFlagged
+				? `${taskId}.diff`
+				: undefined,
+	});
 }
 
 /**
@@ -1572,6 +1601,7 @@ export function executeTask(task, context) {
 			taskId: task.id,
 			result: "no_provider",
 			reason: routeResult.reason,
+			errorKind: null,
 		});
 		return {
 			taskId: task.id,
@@ -1581,6 +1611,7 @@ export function executeTask(task, context) {
 			requiredCapability,
 			result: "no_provider",
 			reason: routeResult.reason,
+			errorKind: null,
 		};
 	}
 
@@ -1594,6 +1625,7 @@ export function executeTask(task, context) {
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: "unsupported_provider",
+			errorKind: null,
 			reason: routeResult.reason,
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
@@ -1625,6 +1657,10 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			deadline: routedDeadline,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			snapshotStatus: routeResult.snapshotStatus ?? null,
+			snapshotMtime: routeResult.snapshotMtime ?? null,
+			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
 		});
 	}
 	if (context.onTaskRouted) {
@@ -1633,6 +1669,10 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			deadline: routedDeadline,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			snapshotStatus: routeResult.snapshotStatus ?? null,
+			snapshotMtime: routeResult.snapshotMtime ?? null,
+			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
 		});
 	}
 
@@ -1670,6 +1710,7 @@ export function executeTask(task, context) {
 				requiredCapability,
 				result: "execution_timed_out",
 				error: execution.error ?? null,
+				errorKind: execution.errorKind ?? null,
 				timedOut: true,
 				partialDiff,
 			};
@@ -1683,6 +1724,7 @@ export function executeTask(task, context) {
 			requiredCapability,
 			result: "execution_failed",
 			error: execution.error ?? null,
+			errorKind: execution.errorKind ?? null,
 		};
 	}
 
@@ -1724,16 +1766,22 @@ export function executeTask(task, context) {
 			task.type === "implementation" && task.allowManifests === true,
 	});
 	const success = Boolean(gateResult?.success);
+	const safeGateFailure = success
+		? null
+		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
 
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "integration",
 			event: "gate_validated",
-			status: gateResult?.message ?? (success ? "ok" : "rejected"),
+			status: success ? "ok" : safeGateFailure.reason,
 			taskId: task.id,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			outcome: success ? "passed" : "rejected",
+			errorKind: safeGateFailure?.errorKind,
+			reasonCode: safeGateFailure?.reasonCode,
+			artifactRef: safeGateFailure?.artifactRef,
 		});
 		if (success) {
 			context.onStatus({
@@ -1752,7 +1800,8 @@ export function executeTask(task, context) {
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
 		result: success ? "success" : "integration_failed",
-		reason: gateResult?.message ?? routeResult.reason,
+		...(safeGateFailure ?? {}),
+		...(success ? { reason: routeResult.reason } : {}),
 		percentLeft: routeResult.percentLeft ?? undefined,
 	});
 
@@ -1763,6 +1812,7 @@ export function executeTask(task, context) {
 		model: routeResult.model ?? null,
 		requiredCapability,
 		result: success ? "success" : "integration_failed",
+		...(safeGateFailure ?? {}),
 	};
 	if (!success && !gateResult?.credentialFlagged) {
 		result.partialDiff = diff;
@@ -1786,6 +1836,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		requiredCapability,
 		availableProviders: Object.keys(context.adapters ?? {}),
 		exclude: context.exclude,
+		only: context.only,
 	});
 
 	// Provenance (Task 1.6, M7/M8) — same treatment as executeTask: resolve the
@@ -1819,7 +1870,37 @@ export async function executeTaskWithOrchestrator(task, context) {
 			requiredCapability,
 			result: "no_provider",
 			reason: routeResult.reason,
+			errorKind: null,
 		};
+	}
+
+	const routedDeadline = null;
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "execution",
+			event: "task_routed",
+			status: `Task ${task.id} routed to ${routeResult.provider}${routeResult.model ? `/${routeResult.model}` : ""}`,
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			deadline: routedDeadline,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			snapshotStatus: routeResult.snapshotStatus ?? null,
+			snapshotMtime: routeResult.snapshotMtime ?? null,
+			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
+		});
+	}
+	if (context.onTaskRouted) {
+		context.onTaskRouted({
+			taskId: task.id,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			deadline: routedDeadline,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			snapshotStatus: routeResult.snapshotStatus ?? null,
+			snapshotMtime: routeResult.snapshotMtime ?? null,
+			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
+		});
 	}
 
 	let jobId;
@@ -1847,6 +1928,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			model: routeResult.model ?? null,
 			requiredCapability,
 			result: "launch_failed",
+			errorKind: null,
 		};
 	}
 
@@ -1878,6 +1960,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			model: routeResult.model ?? null,
 			requiredCapability,
 			result: `orchestrator_${waited.state}`,
+			errorKind: null,
 			// Propagate the wait result's timeout verdict so the durable
 			// checkpoint record (timedOut: Boolean(result.timedOut)) is
 			// truthful for an orchestrator_timed_out outcome.
@@ -1904,6 +1987,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			model: routeResult.model ?? null,
 			requiredCapability,
 			result: "result_fetch_failed",
+			errorKind: null,
 		};
 	}
 	if (!jobResult?.success) {
@@ -1922,6 +2006,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			model: routeResult.model ?? null,
 			requiredCapability,
 			result: "execution_failed",
+			errorKind: jobResult?.errorKind ?? null,
 		};
 	}
 
@@ -1963,16 +2048,22 @@ export async function executeTaskWithOrchestrator(task, context) {
 			task.type === "implementation" && task.allowManifests === true,
 	});
 	const success = Boolean(gateResult?.success);
+	const safeGateFailure = success
+		? null
+		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
 
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "integration",
 			event: "gate_validated",
-			status: gateResult?.message ?? (success ? "ok" : "rejected"),
+			status: success ? "ok" : safeGateFailure.reason,
 			taskId: task.id,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			outcome: success ? "passed" : "rejected",
+			errorKind: safeGateFailure?.errorKind,
+			reasonCode: safeGateFailure?.reasonCode,
+			artifactRef: safeGateFailure?.artifactRef,
 		});
 		if (success) {
 			context.onStatus({
@@ -1991,7 +2082,8 @@ export async function executeTaskWithOrchestrator(task, context) {
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
 		result: success ? "success" : "integration_failed",
-		reason: gateResult?.message ?? routeResult.reason,
+		...(safeGateFailure ?? {}),
+		...(success ? { reason: routeResult.reason } : {}),
 		percentLeft: routeResult.percentLeft ?? undefined,
 	});
 
@@ -2002,6 +2094,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		model: routeResult.model ?? null,
 		requiredCapability,
 		result: success ? "success" : "integration_failed",
+		...(safeGateFailure ?? {}),
 	};
 	if (!success && !gateResult?.credentialFlagged) {
 		result.partialDiff = diff;
@@ -2201,6 +2294,7 @@ function recordHalt(
 	haltResult,
 	emitStatus,
 ) {
+	const safeFailure = failureMetadataFor(haltResult);
 	results.push(haltResult);
 	checkpoint.results.push({
 		taskId: haltResult.taskId,
@@ -2211,6 +2305,7 @@ function recordHalt(
 		success: haltResult.success,
 		timedOut: false,
 		partialDiffPath: null,
+		...(safeFailure ?? {}),
 		timestamp: new Date().toISOString(),
 	});
 	checkpoint.lastUpdatedAt = new Date().toISOString();
@@ -2219,9 +2314,11 @@ function recordHalt(
 		emitStatus({
 			phase: "lifecycle",
 			event: "queue_halted",
-			status: `Queue halted after task ${haltResult.taskId}: ${haltResult.reason}`,
+			status: `Queue halted after task ${haltResult.taskId}: ${safeFailure?.reason ?? "The queue halted after a checkpoint action failure."}`,
 			taskId: haltResult.taskId,
-			error: _safeError(haltResult.error),
+			error: safeFailure ? { message: safeFailure.reason } : undefined,
+			errorKind: safeFailure?.errorKind,
+			reasonCode: safeFailure?.reasonCode,
 		});
 	}
 }
@@ -2612,6 +2709,7 @@ export function runQueue(options) {
 				}
 			}
 			if (onResult) onResult(result);
+			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
 			if (emitStatus) {
 				if (result.success) {
 					emitStatus({
@@ -2630,7 +2728,11 @@ export function runQueue(options) {
 						taskId: result.taskId,
 						provider: result.provider ?? null,
 						model: result.model ?? null,
-						error: _safeError(result.error),
+						error: safeFailure ? { message: safeFailure.reason } : undefined,
+						errorKind: safeFailure?.errorKind,
+						reasonCode: safeFailure?.reasonCode,
+						reason: safeFailure?.reason,
+						artifactRef: safeFailure?.artifactRef,
 					});
 				}
 			}
@@ -2642,7 +2744,8 @@ export function runQueue(options) {
 				result: result.result,
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
-				partialDiffPath: result.partialDiffPath ?? null,
+				partialDiffPath: null,
+				...(safeFailure ?? {}),
 				timestamp: new Date().toISOString(),
 			});
 			checkpoint.lastTaskId = result.taskId;
@@ -2839,6 +2942,7 @@ export async function runQueueWithOrchestrator(options) {
 		dependencies.commitWorkingTree ?? commitWorkingTree;
 	const resetWorkingTreeFn = dependencies.resetWorkingTree ?? resetWorkingTree;
 	const onTaskStart = dependencies.onTaskStart ?? null;
+	const onTaskRouted = dependencies.onTaskRouted ?? null;
 	const onResult = dependencies.onResult ?? null;
 	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
 	const runStore = dependencies.runStore ?? null;
@@ -2902,6 +3006,7 @@ export async function runQueueWithOrchestrator(options) {
 		sleepFn: dependencies.sleepFn ?? sleep,
 		onPoll: dependencies.onPoll ?? null,
 		onStatus: emitStatus,
+		onTaskRouted,
 	};
 
 	try {
@@ -3012,6 +3117,7 @@ export async function runQueueWithOrchestrator(options) {
 			const result = await executeTaskWithOrchestrator(task, context);
 
 			if (onResult) onResult(result);
+			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
 			if (emitStatus) {
 				if (result.success) {
 					emitStatus({
@@ -3030,7 +3136,11 @@ export async function runQueueWithOrchestrator(options) {
 						taskId: result.taskId,
 						provider: result.provider ?? null,
 						model: result.model ?? null,
-						error: _safeError(result.error),
+						error: safeFailure ? { message: safeFailure.reason } : undefined,
+						errorKind: safeFailure?.errorKind,
+						reasonCode: safeFailure?.reasonCode,
+						reason: safeFailure?.reason,
+						artifactRef: safeFailure?.artifactRef,
 					});
 				}
 			}
@@ -3043,6 +3153,8 @@ export async function runQueueWithOrchestrator(options) {
 				result: result.result,
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
+				partialDiffPath: null,
+				...(safeFailure ?? {}),
 				timestamp: new Date().toISOString(),
 			});
 			checkpoint.lastTaskId = result.taskId;

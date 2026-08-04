@@ -31,6 +31,10 @@ import { join, resolve } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	describeExecError,
+	sanitizeFailureMetadata,
+} from "../src/switchyard/adapter/exec-error.mjs";
+import {
 	readLedger,
 	readLedgerFromStore,
 	recordDispatchToStore,
@@ -867,5 +871,98 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 		strictEqual(entries[0].resolved_harness, "opencode");
 		strictEqual(entries[0].roster_schema_version, 1);
 		strictEqual(entries[0].resolved_credential_profile, "go");
+	});
+
+	it("persists static failure metadata without raw output or host paths", async () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-failure-"));
+		await recordDispatchToStore(
+			{
+				provider: "claude",
+				model: "fixture-claude-high",
+				taskId: "1.1",
+				result: "execution_failed",
+				errorKind: "provider_private_reason",
+				reason: "SECRET_CANARY_provider_reason",
+				error: "SECRET_CANARY_provider_error",
+				output: "SECRET_CANARY_provider_output",
+				partialDiffPath: "/Users/dave/project/.partial-diffs/1.1.diff",
+			},
+			tmpDir,
+		);
+
+		const [entry] = await readLedgerFromStore(tmpDir);
+		strictEqual(entry.errorKind, "execution_failed");
+		strictEqual(entry.reasonCode, "execution_failed");
+		strictEqual(
+			entry.reason,
+			"Provider execution failed before a reviewed integration.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(entry.artifactRef));
+		for (const key of ["error", "output", "partialDiffPath"]) {
+			ok(
+				!(key in entry),
+				`raw field ${key} must not cross the ledger boundary`,
+			);
+		}
+		ok(!JSON.stringify(entry).includes("SECRET_CANARY"));
+	});
+
+	it("preserves integration failure diagnostics without gate content", async () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-integration-"));
+		await recordDispatchToStore(
+			{
+				provider: "claude",
+				model: "fixture-claude-standard",
+				taskId: "1.1",
+				result: "integration_failed",
+				errorKind: "integration_failed",
+				reason: "SECRET_CANARY_gate_message",
+				error: "SECRET_CANARY_gate_error",
+				output: "SECRET_CANARY_gate_output",
+				partialDiffPath: "/Users/dave/project/.partial-diffs/1.1.diff",
+			},
+			tmpDir,
+		);
+
+		const [entry] = await readLedgerFromStore(tmpDir);
+		strictEqual(entry.errorKind, "integration_failed");
+		strictEqual(entry.reasonCode, "integration_failed");
+		strictEqual(
+			entry.reason,
+			"The reviewed integration gate rejected the task result.",
+		);
+		ok(/^artifact:[a-f0-9]{24}$/.test(entry.artifactRef));
+		for (const key of ["error", "output", "partialDiffPath"]) {
+			ok(
+				!(key in entry),
+				`raw field ${key} must not cross the ledger boundary`,
+			);
+		}
+		ok(!JSON.stringify(entry).includes("SECRET_CANARY"));
+	});
+
+	it("capstone: quota classification remains parked without a verified Agy fixture", () => {
+		// This is a negative contract, not a guessed matcher. The exact
+		// standing-container quota envelope is an external blocker, so a
+		// quota-shaped provider string remains an ordinary execution failure.
+		const transient = describeExecError(
+			{
+				message: "provider rejected the request",
+				stdout: "Individual quota reached SECRET_CANARY_unverified_quota",
+				stderr: "",
+			},
+			{ provider: "agy" },
+		);
+		strictEqual(transient.errorKind, null);
+
+		const persistent = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "execution_failed",
+			errorKind: transient.errorKind,
+			partialDiffPath: "1.1.diff",
+		});
+		strictEqual(persistent.errorKind, "execution_failed");
+		strictEqual(persistent.reasonCode, "execution_failed");
+		ok(!JSON.stringify(persistent).includes("SECRET_CANARY"));
 	});
 });

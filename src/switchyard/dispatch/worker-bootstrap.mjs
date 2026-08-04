@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { Diagnostics } from "../diagnostics/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 
@@ -238,10 +239,15 @@ try {
 						activeTaskProvider: info.provider,
 						activeTaskModel: info.model,
 						activeTaskDeadline: info.deadline,
+						snapshotStatus: info.snapshotStatus ?? null,
+						snapshotMtime: info.snapshotMtime ?? null,
+						snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
+						resolvedTargetId: info.resolvedTargetId ?? null,
 					});
 				writeChain = writeChain.then(fn, fn).catch(() => {});
 			},
 			onResult: (r) => {
+				const safeFailure = sanitizeFailureMetadata(r);
 				const event = r.success
 					? {
 							phase: "execution",
@@ -258,6 +264,8 @@ try {
 							taskId: r.taskId,
 							provider: r.provider ?? null,
 							model: r.model ?? null,
+							result: r.result,
+							...(safeFailure ?? {}),
 						};
 				const fn = () =>
 					runStore.createEvent(runId, event).then(() =>
@@ -266,6 +274,11 @@ try {
 							activeTaskProvider: null,
 							activeTaskModel: null,
 							activeTaskDeadline: null,
+							snapshotStatus: null,
+							snapshotMtime: null,
+							snapshotAgeMsAtRoute: null,
+							resolvedTargetId: null,
+							...(safeFailure ? { lastFailure: safeFailure } : {}),
 							// Only a successful task advances lastCompletionAt — a
 							// failure must leave the run record's existing value
 							// untouched (not null it out), so this stays a
@@ -315,6 +328,10 @@ try {
 		activeTaskProvider: null,
 		activeTaskModel: null,
 		activeTaskDeadline: null,
+		snapshotStatus: null,
+		snapshotMtime: null,
+		snapshotAgeMsAtRoute: null,
+		resolvedTargetId: null,
 		cleanupState: "complete",
 		terminalSummary: {
 			totalTasks: result.totalTasks,
@@ -380,6 +397,10 @@ try {
 				activeTaskProvider: null,
 				activeTaskModel: null,
 				activeTaskDeadline: null,
+				snapshotStatus: null,
+				snapshotMtime: null,
+				snapshotAgeMsAtRoute: null,
+				resolvedTargetId: null,
 				cleanupState: "complete",
 				terminalSummary: {
 					totalTasks: 0,

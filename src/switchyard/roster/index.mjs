@@ -389,6 +389,72 @@ function findTargetForHarness(targets, harnessKey, snapshotName) {
 }
 
 /**
+ * Resolve an identifier with routing-grade identity semantics. A harness alias
+ * is only sufficient when it names one enabled target; silently selecting the
+ * first target would widen an allowlist and make blind routing nondeterministic
+ * when two live targets share one harness.
+ *
+ * @param {object} targets
+ * @param {unknown} identifier
+ * @returns {{targetId: string|null, harnessKey: string|null, ambiguous: boolean}}
+ */
+function resolveTargetIdentityFromTargets(targets, identifier) {
+	if (typeof identifier !== "string" || identifier.length === 0) {
+		return { targetId: null, harnessKey: null, ambiguous: false };
+	}
+
+	const exactTarget = targets[identifier];
+	if (exactTarget && typeof exactTarget === "object") {
+		return {
+			targetId: identifier,
+			harnessKey:
+				typeof exactTarget.harness === "string" ? exactTarget.harness : null,
+			ambiguous: false,
+		};
+	}
+
+	for (const [id, target] of Object.entries(targets)) {
+		if (
+			target &&
+			typeof target === "object" &&
+			target.enabled &&
+			target.snapshot_name === identifier
+		) {
+			return {
+				targetId: id,
+				harnessKey: typeof target.harness === "string" ? target.harness : null,
+				ambiguous: false,
+			};
+		}
+	}
+
+	const harnessKey = normalizeProviderName(identifier);
+	if (!harnessKey) {
+		return { targetId: null, harnessKey: null, ambiguous: false };
+	}
+
+	const enabledEntries = Object.entries(targets).filter(
+		([, target]) =>
+			target &&
+			typeof target === "object" &&
+			target.enabled &&
+			target.harness === harnessKey,
+	);
+	if (enabledEntries.length === 1) {
+		return {
+			targetId: enabledEntries[0][0],
+			harnessKey,
+			ambiguous: false,
+		};
+	}
+	if (enabledEntries.length > 1) {
+		return { targetId: null, harnessKey, ambiguous: true };
+	}
+
+	return { targetId: null, harnessKey, ambiguous: false };
+}
+
+/**
  * Normalize a target's raw `implementor_priority` field (implementor-
  * priority-waterfall-routing plan) to either a positive integer or `null`.
  * The field is optional roster data (unknown-field-permissive per
@@ -806,14 +872,33 @@ export function resolveTargetId(identifier) {
 			roster.targets && typeof roster.targets === "object"
 				? roster.targets
 				: {};
-		if (Object.hasOwn(targets, identifier)) return identifier;
-		const harnessKey = normalizeProviderName(identifier);
-		const entry = harnessKey
-			? findTargetEntryForHarness(targets, harnessKey, identifier)
-			: null;
-		return entry?.id ?? null;
+		return resolveTargetIdentityFromTargets(targets, identifier).targetId;
 	} catch {
 		return null;
+	}
+}
+
+/**
+ * Return routing-grade identity details for a provider selector. Unlike the
+ * legacy `resolveTargetId` matching aid, callers can distinguish an unknown
+ * selector from an ambiguous harness alias and fail closed accordingly.
+ *
+ * @param {unknown} identifier
+ * @returns {{targetId: string|null, harnessKey: string|null, ambiguous: boolean}}
+ */
+export function resolveTargetIdentity(identifier) {
+	if (!identifier) {
+		return { targetId: null, harnessKey: null, ambiguous: false };
+	}
+	try {
+		const roster = getRoster();
+		const targets =
+			roster.targets && typeof roster.targets === "object"
+				? roster.targets
+				: {};
+		return resolveTargetIdentityFromTargets(targets, identifier);
+	} catch {
+		return { targetId: null, harnessKey: null, ambiguous: false };
 	}
 }
 
@@ -842,8 +927,14 @@ export function resolveTargetProvenance(providerName, capabilityClass) {
 	// disambiguator, so a harness shared by two simultaneously-enabled targets
 	// (the agy buckets) resolves to the target the caller actually meant,
 	// not whichever wins the enabled-tie-break.
-	const entry = harnessKey
-		? findTargetEntryForHarness(targets, harnessKey, providerName)
+	const entry = resolveTargetIdentityFromTargets(targets, providerName).targetId
+		? (() => {
+				const targetId = resolveTargetIdentityFromTargets(
+					targets,
+					providerName,
+				).targetId;
+				return targetId ? { id: targetId, target: targets[targetId] } : null;
+			})()
 		: null;
 
 	if (!entry) {

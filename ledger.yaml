@@ -35,3 +35,19 @@ resolutions:
       write-blocked-before-reaching-the-gate bug, a dual-tagged sandbox-posture entry, a
       missing-import crash) rather than gate bypasses. Resolved by David 2026-07-30.
                           # INV-x: {resolved_at_date: "YYYY-MM-DD", note: "..."}
+  INV-4:
+    resolved_at_date: "2026-08-04"
+    note: >
+      Consolidation checkpoint: the pre-2026-08-04 recurrence window was reviewed and the
+      unconditional capability/selection/provenance contract is covered by the router,
+      runner, ledger, checkpoint, status, result, and capstone tests. The Agy quota-specific
+      classifier and retry/quarantine tranche is explicitly parked because the approved
+      standing-container fixture is unavailable; this entry does not claim quota resolution
+      or authorize live quota probing.
+  INV-5:
+    resolved_at_date: "2026-08-04"
+    note: >
+      Consolidation checkpoint: the pre-2026-08-04 terminology and capability-contract
+      recurrence window was reviewed. RequiredCapability remains the hard eligibility filter
+      and the unconditional parser/selection capstone covers the contract. The separate Agy
+      quota fixture and retry work remains parked and is not treated as resolved here.
