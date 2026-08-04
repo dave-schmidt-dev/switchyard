@@ -53,11 +53,24 @@ const AUTH_FAILURE_SIGNATURES = [
 	"re-authenticate",
 ];
 
+// Provider-specific quota signatures are intentionally narrow. These are
+// derived from sanitized provider-boundary evidence, not from generic words
+// such as "quota", "exhausted", "429", or "rate limit" that also occur in
+// transient and transport failures. Keep the provider gate here so a phrase
+// from one CLI cannot quarantine an unrelated provider.
+const QUOTA_FAILURE_SIGNATURES = Object.freeze({
+	agy: /individual[\s.,:;_/-]+quota[\s.,:;_/-]+reached\b/i,
+	cursor: {
+		usage: /out[\s.,:;_/-]+of[\s.,:;_/-]+usage\b/i,
+		limit: /your[\s.,:;_/-]+limit\b/i,
+	},
+});
+
 // This is the only error vocabulary allowed to cross a persistence boundary.
 // Keep provider text at the adapter edge; callers persist only one of these
-// enum values plus the static metadata below. quota_exhausted is reserved for
-// the verified Agy classifier and is intentionally allowlisted here without
-// enabling retry or classification by itself.
+// enum values plus the static metadata below. quota_exhausted is intentionally
+// allowlisted here, but only the provider-scoped classifier below may request
+// it from a transient adapter result.
 export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"auth_expired",
 	"quota_exhausted",
@@ -266,13 +279,34 @@ function truncate(text) {
 }
 
 /**
+ * Classify only verified provider-specific quota signatures.
+ * @param {string} text Combined provider output.
+ * @param {unknown} provider Adapter provider key.
+ * @returns {boolean}
+ */
+function isQuotaExhausted(text, provider) {
+	const providerKey =
+		typeof provider === "string" ? provider.toLowerCase() : "";
+	if (providerKey === "agy") {
+		return QUOTA_FAILURE_SIGNATURES.agy.test(text);
+	}
+	if (providerKey === "cursor") {
+		return (
+			QUOTA_FAILURE_SIGNATURES.cursor.usage.test(text) &&
+			QUOTA_FAILURE_SIGNATURES.cursor.limit.test(text)
+		);
+	}
+	return false;
+}
+
+/**
  * Turn a thrown execFileSync error from a provider invocation into a
  * diagnosable adapter-result fragment. Intended for NON-timeout failures only —
  * the timeout path keeps `error.message` so the ETIMEDOUT signal survives.
  * @param {(Error & {stdout?: string, stderr?: string, code?: string|number})} error
  * @param {object} [opts]
  * @param {string} [opts.provider] Provider name; attaches a re-auth hint on an auth failure.
- * @returns {{output: string, error: string, errorKind: ("auth_expired"|null)}}
+ * @returns {{output: string, error: string, errorKind: ("auth_expired"|"quota_exhausted"|null)}}
  */
 export function describeExecError(error, { provider } = {}) {
 	const stdout = typeof error?.stdout === "string" ? error.stdout : "";
@@ -282,6 +316,10 @@ export function describeExecError(error, { provider } = {}) {
 	const authExpired =
 		combined.length > 0 &&
 		AUTH_FAILURE_SIGNATURES.some((sig) => haystack.includes(sig));
+	// Auth takes precedence if a provider emits both an auth and quota phrase;
+	// an expired session is not evidence that the account quota is exhausted.
+	const quotaExhausted =
+		!authExpired && combined.length > 0 && isQuotaExhausted(combined, provider);
 
 	// Prefer the provider's own words; fall back to Node's wrapper only when the
 	// provider printed nothing (e.g. it was killed before it could output).
@@ -297,6 +335,10 @@ export function describeExecError(error, { provider } = {}) {
 	return {
 		output: stdout,
 		error: reason,
-		errorKind: authExpired ? "auth_expired" : null,
+		errorKind: authExpired
+			? "auth_expired"
+			: quotaExhausted
+				? "quota_exhausted"
+				: null,
 	};
 }

@@ -70,6 +70,16 @@ const CURRENT_SCHEMA_VERSION = 2;
 
 const DEFAULT_LEASE_AGE_MS = 60_000;
 
+function isSafeTargetId(value) {
+	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+		return false;
+	}
+	return ![...value].some((character) => {
+		const codePoint = character.codePointAt(0);
+		return codePoint <= 0x1f || codePoint === 0x7f;
+	});
+}
+
 function validateRunId(runId) {
 	if (typeof runId !== "string" || !RUN_ID_RE.test(runId)) {
 		throw new SchemaError("Invalid runId");
@@ -203,6 +213,38 @@ function validateRun(data) {
 		typeof data.resolvedTargetId !== "string"
 	) {
 		throw new SchemaError("resolvedTargetId must be a string or null");
+	}
+	if (data.quarantinedTargetIds !== undefined) {
+		if (
+			!Array.isArray(data.quarantinedTargetIds) ||
+			data.quarantinedTargetIds.some((value) => !isSafeTargetId(value))
+		) {
+			throw new SchemaError(
+				"quarantinedTargetIds must be an array of non-empty strings",
+			);
+		}
+	}
+	if (
+		data.retryTransitionId !== undefined &&
+		(!Number.isInteger(data.retryTransitionId) || data.retryTransitionId < 0)
+	) {
+		throw new SchemaError("retryTransitionId must be a non-negative integer");
+	}
+	if (data.retryState !== undefined && data.retryState !== null) {
+		const retryState = data.retryState;
+		if (
+			typeof retryState !== "object" ||
+			Array.isArray(retryState) ||
+			typeof retryState.taskId !== "string" ||
+			!Number.isInteger(retryState.attempt) ||
+			(retryState.attempt !== 1 && retryState.attempt !== 2) ||
+			typeof retryState.phase !== "string" ||
+			(retryState.resolvedTargetId !== undefined &&
+				retryState.resolvedTargetId !== null &&
+				!isSafeTargetId(retryState.resolvedTargetId))
+		) {
+			throw new SchemaError("retryState contains invalid retry metadata");
+		}
 	}
 	for (const field of ["snapshotMtime", "snapshotAgeMsAtRoute"]) {
 		if (
@@ -367,6 +409,9 @@ export async function initializeRun(options) {
 		snapshotMtime: null,
 		snapshotAgeMsAtRoute: null,
 		resolvedTargetId: null,
+		quarantinedTargetIds: [],
+		retryState: null,
+		retryTransitionId: 0,
 		terminalSummary: null,
 		cleanupError: null,
 		lastLeaseHeartbeat: now,

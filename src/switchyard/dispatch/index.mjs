@@ -928,6 +928,18 @@ function deriveTelemetryFields(run, events, checkpointState) {
 	};
 }
 
+function deriveRetryProjection(checkpointState) {
+	return {
+		quarantinedTargetIds: Array.isArray(checkpointState?.quarantinedTargetIds)
+			? [...checkpointState.quarantinedTargetIds]
+			: [],
+		retryState: checkpointState?.retryState ?? null,
+		retryTransitionId: Number.isInteger(checkpointState?.retryTransitionId)
+			? checkpointState.retryTransitionId
+			: 0,
+	};
+}
+
 // Maps a run's routed provider (run.activeTaskProvider) to the binary name
 // its CLI actually execs as inside the working container. Most providers'
 // CLI binary matches the provider key, but cursor's does not — its package
@@ -1020,6 +1032,7 @@ async function buildStatusEnvelope(runId, run) {
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
+	const retryProjection = deriveRetryProjection(checkpointState);
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
@@ -1053,6 +1066,7 @@ async function buildStatusEnvelope(runId, run) {
 		completedCount,
 		failedCount,
 		lastFailure: run.lastFailure ?? null,
+		...retryProjection,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		...telemetry,
@@ -1082,6 +1096,7 @@ async function buildResultEnvelope(runId, run) {
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
+	const retryProjection = deriveRetryProjection(checkpointState);
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
 	const artifactRefs = await listArtifactRefs(runId);
 	return {
@@ -1109,6 +1124,7 @@ async function buildResultEnvelope(runId, run) {
 		completedCount,
 		failedCount,
 		lastFailure: run.lastFailure ?? null,
+		...retryProjection,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		terminalSummary: run.terminalSummary ?? null,

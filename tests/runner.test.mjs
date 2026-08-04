@@ -6,6 +6,7 @@ import {
 	strictEqual,
 	throws,
 } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	existsSync,
@@ -19,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import {
 	createCliOrchestrator,
@@ -2000,6 +2001,535 @@ describe("runner provider spread recording", () => {
 			strictEqual(dispatches[0].result, "success");
 		});
 	}
+});
+
+describe("runner quota retry coordination", () => {
+	function makeQuotaRetryDependencies({
+		routePlan,
+		executionOutcomes,
+		onResult,
+		onStatus,
+		only = [],
+		recordDispatch,
+		resetWorkingTree = () => {},
+	} = {}) {
+		const routeCalls = [];
+		const executeCalls = [];
+		const retryProjections = [];
+		const outcomes = new Map(
+			Object.entries(executionOutcomes ?? {}).map(([provider, values]) => [
+				provider,
+				[...values],
+			]),
+		);
+		const route = ({ exclude = [], only = [] } = {}) => {
+			routeCalls.push({ exclude: [...exclude], only: [...only] });
+			const candidate = routePlan.find(
+				(entry) =>
+					!exclude.includes(entry.target) &&
+					!exclude.includes(entry.provider) &&
+					(only.length === 0 ||
+						only.includes(entry.target) ||
+						only.includes(entry.provider)),
+			);
+			if (!candidate) {
+				return {
+					provider: null,
+					model: null,
+					resolvedTargetId: null,
+					reason: "no_eligible_retry_target",
+					log: [],
+				};
+			}
+			return {
+				...candidate,
+				resolvedTargetId: candidate.target,
+				percentLeft: 50,
+				reason: "fixture",
+				log: [],
+			};
+		};
+		const makeAdapter = (provider) => ({
+			execute: () => {
+				executeCalls.push(provider);
+				const queue = outcomes.get(provider) ?? [];
+				return (
+					queue.shift() ?? {
+						success: true,
+						output: "ok",
+					}
+				);
+			},
+			captureDiff: () => "diff --git a/a b/a\n+change",
+		});
+		return {
+			routeCalls,
+			executeCalls,
+			retryProjections,
+			dependencies: {
+				route,
+				recordDispatch: recordDispatch ?? (() => {}),
+				onResult,
+				onStatus,
+				onRetryStateChanged: (projection) => retryProjections.push(projection),
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "owned-retry-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree,
+				wipeWorkingContainer: () => {},
+				adapters: {
+					agy: makeAdapter("agy"),
+					codex: makeAdapter("codex"),
+				},
+			},
+			only,
+		};
+	}
+
+	it("quarantines one target, retries on an isolated target, and counts one logical task", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Quota fallback
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** retry after a verified quota failure
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const dispatches = [];
+		const results = [];
+		const statuses = [];
+		let resetCalls = 0;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+				{ provider: "agy", model: "fixture-claude", target: "agy-claude" },
+			],
+			executionOutcomes: {
+				agy: [
+					{
+						success: false,
+						output: "",
+						error: "provider quota unavailable",
+						errorKind: "quota_exhausted",
+					},
+					{ success: true, output: "ok" },
+				],
+			},
+			onResult: (result) => results.push(result),
+			onStatus: (event) => statuses.push(event),
+			recordDispatch: (entry) => dispatches.push(entry),
+			resetWorkingTree: () => {
+				resetCalls += 1;
+			},
+		});
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			maxTasks: 1,
+			dependencies: fixture.dependencies,
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results.length, 1);
+		strictEqual(result.results[0].success, true);
+		strictEqual(results.length, 1, "onResult receives only the final outcome");
+		strictEqual(fixture.executeCalls.length, 2);
+		strictEqual(resetCalls, 1, "reset completes before the retry");
+		deepStrictEqual(
+			fixture.routeCalls.map((call) => call.exclude),
+			[[], ["agy-gemini"]],
+		);
+		strictEqual(
+			dispatches.length,
+			2,
+			"both attempts remain in the dispatch ledger",
+		);
+		strictEqual(dispatches[0].errorKind, "quota_exhausted");
+		strictEqual(dispatches[0].resolvedTargetId, "agy-gemini");
+		strictEqual(dispatches[1].resolvedTargetId, "agy-claude");
+		ok(statuses.some((event) => event.event === "target_quarantined"));
+		deepStrictEqual(
+			fixture.retryProjections.map(
+				(projection) => projection.retryTransitionId,
+			),
+			[1, 2, 3, 4, 5],
+		);
+		deepStrictEqual(fixture.retryProjections.at(-1), {
+			quarantinedTargetIds: ["agy-gemini"],
+			retryState: null,
+			retryTransitionId: 5,
+		});
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.completedTaskIds, ["1.1"]);
+		strictEqual(
+			checkpoint.results.length,
+			1,
+			"checkpoint results are final-only",
+		);
+		strictEqual(checkpoint.results[0].success, true);
+		deepStrictEqual(checkpoint.quarantinedTargetIds, ["agy-gemini"]);
+		strictEqual(checkpoint.retryAttempts.length, 2);
+		deepStrictEqual(
+			checkpoint.retryTransitions.map((transition) => transition.type),
+			[
+				"attempt_recorded",
+				"target_quarantined",
+				"reset_completed",
+				"retry_started",
+				"finalized",
+			],
+		);
+		strictEqual(checkpoint.retryState, null);
+		ok(
+			!readFileSync(checkpointPath, "utf8").includes(
+				"provider quota unavailable",
+			),
+		);
+	});
+
+	it("does not retry a caller-supplied container or escape an explicit target allowlist", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Quota fallback
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** no unsafe retry
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const executeCalls = [];
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+				{ provider: "codex", model: "fixture-codex", target: "codex-main" },
+			],
+			executionOutcomes: {},
+		});
+		fixture.dependencies.adapters.agy.execute = () => {
+			executeCalls.push("agy");
+			return {
+				success: false,
+				output: "",
+				error: "quota",
+				errorKind: "quota_exhausted",
+			};
+		};
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "caller-owned",
+			checkpointPath,
+			only: ["agy-gemini"],
+			dependencies: fixture.dependencies,
+		});
+
+		strictEqual(result.processedTasks, 1);
+		deepStrictEqual(executeCalls, ["agy"]);
+		strictEqual(result.results[0].errorKind, "quota_exhausted");
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.quarantinedTargetIds, []);
+		strictEqual(checkpoint.retryAttempts.length, 0);
+	});
+
+	it("resumes a quarantined task on the remaining target without repeating attempt one", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Resume quota retry
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** resume after a durable quarantine transition
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			quarantinedTargetIds: ["agy-gemini"],
+			retryAttempts: [
+				{
+					taskId: "1.1",
+					attempt: 1,
+					provider: "agy",
+					model: "fixture-gemini",
+					resolvedTargetId: "agy-gemini",
+					result: "execution_failed",
+					success: false,
+					timedOut: false,
+					errorKind: "quota_exhausted",
+					reasonCode: "quota_exhausted",
+					reason:
+						"Provider quota is exhausted; the target is unavailable for this attempt.",
+				},
+			],
+			retryTransitions: [
+				{ transitionId: 1, type: "attempt_recorded", taskId: "1.1" },
+				{ transitionId: 2, type: "target_quarantined", taskId: "1.1" },
+			],
+			retryTransitionId: 2,
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "target_quarantined",
+				resolvedTargetId: "agy-gemini",
+			},
+		});
+
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+				{ provider: "agy", model: "fixture-claude", target: "agy-claude" },
+			],
+			executionOutcomes: { agy: [{ success: true, output: "ok" }] },
+		});
+		let resetCalls = 0;
+		fixture.dependencies.resetWorkingTree = () => {
+			resetCalls += 1;
+		};
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: fixture.dependencies,
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[0].success, true);
+		strictEqual(fixture.executeCalls.length, 1);
+		strictEqual(resetCalls, 1);
+		deepStrictEqual(fixture.routeCalls[0].exclude, ["agy-gemini"]);
+		strictEqual(fixture.routeCalls[0].only.length, 0);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.quarantinedTargetIds, ["agy-gemini"]);
+		strictEqual(checkpoint.retryAttempts.length, 2);
+		strictEqual(checkpoint.retryState, null);
+	});
+
+	it("reconstructs quarantine when resuming after attempt recording", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Resume before quarantine
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** recover the transition boundary
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			quarantinedTargetIds: [],
+			retryAttempts: [
+				{
+					taskId: "1.1",
+					attempt: 1,
+					provider: "agy",
+					model: "fixture-gemini",
+					resolvedTargetId: "agy-gemini",
+					result: "execution_failed",
+					success: false,
+					timedOut: false,
+					errorKind: "quota_exhausted",
+					reasonCode: "quota_exhausted",
+					reason:
+						"Provider quota is exhausted; the target is unavailable for this attempt.",
+				},
+			],
+			retryTransitions: [
+				{ transitionId: 1, type: "attempt_recorded", taskId: "1.1" },
+			],
+			retryTransitionId: 1,
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "attempt_recorded",
+				resolvedTargetId: "agy-gemini",
+			},
+		});
+
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+				{ provider: "agy", model: "fixture-claude", target: "agy-claude" },
+			],
+			executionOutcomes: { agy: [{ success: true, output: "ok" }] },
+		});
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: fixture.dependencies,
+		});
+
+		strictEqual(result.results[0].success, true);
+		strictEqual(fixture.executeCalls.length, 1);
+		deepStrictEqual(fixture.routeCalls[0].exclude, ["agy-gemini"]);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.quarantinedTargetIds, ["agy-gemini"]);
+		strictEqual(checkpoint.retryTransitions[1].type, "target_quarantined");
+	});
+
+	it("halts safely when the mandatory retry reset fails", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reset failure
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** reset failure
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+			],
+			executionOutcomes: {
+				agy: [
+					{
+						success: false,
+						output: "",
+						error: "quota",
+						errorKind: "quota_exhausted",
+					},
+				],
+			},
+			resetWorkingTree: () => {
+				throw new Error("reset implementation failed");
+			},
+		});
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: fixture.dependencies,
+		});
+
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[0].result, "halted_after_reset_failure");
+		strictEqual(fixture.executeCalls.length, 1);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.retryState, null);
+		strictEqual(checkpoint.retryTransitions.at(-1).type, "retry_halted");
+		ok(
+			!readFileSync(checkpointPath, "utf8").includes(
+				"reset implementation failed",
+			),
+		);
+	});
+
+	it("recovers a real child-process crash from a durable quarantine transition", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Child crash recovery
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** recover after the provider target is quarantined
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const runnerUrl = pathToFileURL(
+			resolve(cwd(), "src/switchyard/runner/index.mjs"),
+		).href;
+		const childScript = `
+import { runQueue } from ${JSON.stringify(runnerUrl)};
+const [tasksFilePath, checkpointPath, projectPath] = process.argv.slice(1);
+const routePlan = [
+  { provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+  { provider: "agy", model: "fixture-claude", target: "agy-claude" },
+];
+const route = ({ exclude = [], only = [] } = {}) => {
+  const candidate = routePlan.find((entry) =>
+    !exclude.includes(entry.target) &&
+    !exclude.includes(entry.provider) &&
+    (only.length === 0 || only.includes(entry.target) || only.includes(entry.provider))
+  );
+  return candidate
+    ? { ...candidate, resolvedTargetId: candidate.target, percentLeft: 50, log: [] }
+    : { provider: null, model: null, resolvedTargetId: null, reason: "no_eligible_retry_target", log: [] };
+};
+runQueue({
+  tasksFilePath,
+  projectPath,
+  checkpointPath,
+  dependencies: {
+    route,
+    recordDispatch: () => {},
+    integrationGate: () => ({ success: true }),
+    ensureAgentContainer: () => {},
+    createWorkingContainer: () => "child-owned-retry-container",
+    provisionCredentials: () => {},
+    seedProject: () => {},
+    commitWorkingTree: () => {},
+    resetWorkingTree: () => {},
+    wipeWorkingContainer: () => {},
+    onRetryStateChanged: ({ retryTransitionId }) => {
+      if (retryTransitionId === Number(process.env.CRASH_AT)) process.exit(73);
+    },
+    adapters: {
+      agy: {
+        execute: () => ({ success: false, output: "", error: "quota", errorKind: "quota_exhausted" }),
+        captureDiff: () => "diff --git a/a b/a\\n+change",
+      },
+    },
+  },
+});
+`;
+		const child = spawnSync(
+			process.execPath,
+			[
+				"--input-type=module",
+				"-e",
+				childScript,
+				tasksPath,
+				checkpointPath,
+				TEST_DIR,
+			],
+			{
+				encoding: "utf8",
+				env: { ...process.env, CRASH_AT: "2" },
+			},
+		);
+		strictEqual(child.status, 73, child.stderr);
+
+		const interrupted = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(interrupted.quarantinedTargetIds, ["agy-gemini"]);
+		strictEqual(interrupted.retryTransitionId, 2);
+		strictEqual(interrupted.retryState.phase, "target_quarantined");
+
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+				{ provider: "agy", model: "fixture-claude", target: "agy-claude" },
+			],
+			executionOutcomes: { agy: [{ success: true, output: "ok" }] },
+		});
+		const resumed = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: fixture.dependencies,
+		});
+
+		strictEqual(resumed.processedTasks, 1);
+		strictEqual(resumed.results[0].success, true);
+		strictEqual(fixture.executeCalls.length, 1);
+		deepStrictEqual(fixture.routeCalls[0].exclude, ["agy-gemini"]);
+		const completed = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(completed.retryState, null);
+		strictEqual(completed.retryTransitionId, 5);
+	});
 });
 
 describe("runner no-provider outcome carries the route reason (Task D.3)", () => {

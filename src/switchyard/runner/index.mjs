@@ -1549,6 +1549,135 @@ function failureMetadataFor(result, partialDiffPath) {
 	});
 }
 
+const RETRY_TRANSITION_TYPES = new Set([
+	"attempt_recorded",
+	"target_quarantined",
+	"reset_completed",
+	"retry_started",
+	"finalized",
+	"retry_halted",
+]);
+
+function normalizeRetryTargetId(value) {
+	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+		return null;
+	}
+	if (
+		[...value].some((character) => {
+			const codePoint = character.codePointAt(0);
+			return codePoint <= 0x1f || codePoint === 0x7f;
+		})
+	) {
+		return null;
+	}
+	return value;
+}
+
+function ensureRetryCheckpoint(checkpoint) {
+	if (!Array.isArray(checkpoint.quarantinedTargetIds)) {
+		checkpoint.quarantinedTargetIds = [];
+	}
+	checkpoint.quarantinedTargetIds = [
+		...new Set(
+			checkpoint.quarantinedTargetIds
+				.map(normalizeRetryTargetId)
+				.filter((targetId) => targetId !== null),
+		),
+	];
+	if (!Array.isArray(checkpoint.retryAttempts)) checkpoint.retryAttempts = [];
+	if (!Array.isArray(checkpoint.retryTransitions)) {
+		checkpoint.retryTransitions = [];
+	}
+	if (!Number.isInteger(checkpoint.retryTransitionId)) {
+		checkpoint.retryTransitionId = checkpoint.retryTransitions.length;
+	}
+	if (checkpoint.retryState === undefined) checkpoint.retryState = null;
+	return checkpoint;
+}
+
+function mergeRetryExclusions(base, quarantinedTargetIds) {
+	return [
+		...new Set([
+			...(Array.isArray(base) ? base : []),
+			...(Array.isArray(quarantinedTargetIds)
+				? quarantinedTargetIds.filter(
+						(targetId) => normalizeRetryTargetId(targetId) !== null,
+					)
+				: []),
+		]),
+	];
+}
+
+function persistRetryTransition(
+	checkpoint,
+	checkpointPath,
+	{
+		type,
+		taskId,
+		attempt,
+		provider = null,
+		model = null,
+		resolvedTargetId = null,
+		phase = type,
+		clearState = false,
+		save = true,
+	},
+) {
+	if (!RETRY_TRANSITION_TYPES.has(type)) {
+		throw new Error(`unknown retry transition: ${type}`);
+	}
+	const targetId = normalizeRetryTargetId(resolvedTargetId);
+	const transitionId = checkpoint.retryTransitionId + 1;
+	const transition = {
+		transitionId,
+		type,
+		taskId,
+		attempt,
+		provider: typeof provider === "string" ? provider : null,
+		model: typeof model === "string" ? model : null,
+		resolvedTargetId: targetId,
+		timestamp: new Date().toISOString(),
+	};
+	checkpoint.retryTransitionId = transitionId;
+	checkpoint.retryTransitions.push(transition);
+	checkpoint.retryState = clearState
+		? null
+		: {
+				taskId,
+				attempt,
+				phase,
+				resolvedTargetId: targetId,
+			};
+	checkpoint.lastUpdatedAt = transition.timestamp;
+	if (save) saveCheckpoint(checkpointPath, checkpoint);
+	return transition;
+}
+
+function appendRetryAttempt(checkpoint, result, attempt) {
+	const safeFailure = failureMetadataFor(result);
+	checkpoint.retryAttempts.push({
+		taskId: result.taskId,
+		attempt,
+		provider: result.provider ?? null,
+		model: result.model ?? null,
+		resolvedTargetId: normalizeRetryTargetId(result.resolvedTargetId),
+		result: result.result,
+		success: Boolean(result.success),
+		timedOut: Boolean(result.timedOut),
+		...(safeFailure ?? {}),
+	});
+}
+
+function isQuotaRetryCandidate(result, ownsWorkingContainer) {
+	return Boolean(
+		ownsWorkingContainer &&
+			result &&
+			result.result === "execution_failed" &&
+			result.errorKind === "quota_exhausted" &&
+			normalizeRetryTargetId(result.resolvedTargetId),
+	);
+}
+
 function integrationFailureMetadata(taskId, diff, credentialFlagged) {
 	return sanitizeFailureMetadata({
 		taskId,
@@ -1592,7 +1721,13 @@ export function executeTask(task, context) {
 	);
 	Object.assign(routeResult, { requiredCapability }, provenance);
 	const record = (dispatch) =>
-		context.recordDispatch({ ...provenance, ...dispatch, requiredCapability });
+		context.recordDispatch({
+			...provenance,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			...dispatch,
+			requiredCapability,
+		});
+	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
 
 	if (!routeResult.provider) {
 		record({
@@ -1609,6 +1744,7 @@ export function executeTask(task, context) {
 			provider: null,
 			model: null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "no_provider",
 			reason: routeResult.reason,
 			errorKind: null,
@@ -1635,6 +1771,7 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "unsupported_provider",
 		};
 	}
@@ -1688,6 +1825,7 @@ export function executeTask(task, context) {
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: execution.timedOut ? "execution_timed_out" : "execution_failed",
+			errorKind: execution.errorKind ?? null,
 			reason: execution.error ?? routeResult.reason,
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
@@ -1708,6 +1846,7 @@ export function executeTask(task, context) {
 				provider: routeResult.provider,
 				model: routeResult.model ?? null,
 				requiredCapability,
+				resolvedTargetId,
 				result: "execution_timed_out",
 				error: execution.error ?? null,
 				errorKind: execution.errorKind ?? null,
@@ -1722,6 +1861,7 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "execution_failed",
 			error: execution.error ?? null,
 			errorKind: execution.errorKind ?? null,
@@ -1756,6 +1896,7 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "success_no_diff",
 		};
 	}
@@ -1811,6 +1952,7 @@ export function executeTask(task, context) {
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		requiredCapability,
+		resolvedTargetId,
 		result: success ? "success" : "integration_failed",
 		...(safeGateFailure ?? {}),
 	};
@@ -1847,9 +1989,11 @@ export async function executeTaskWithOrchestrator(task, context) {
 		requiredCapability,
 	);
 	Object.assign(routeResult, { requiredCapability }, provenance);
+	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
 	const record = async (dispatch) =>
 		await context.recordDispatch({
 			...provenance,
+			resolvedTargetId,
 			...dispatch,
 			requiredCapability,
 		});
@@ -1868,6 +2012,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: null,
 			model: null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "no_provider",
 			reason: routeResult.reason,
 			errorKind: null,
@@ -1927,6 +2072,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "launch_failed",
 			errorKind: null,
 		};
@@ -1959,6 +2105,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: `orchestrator_${waited.state}`,
 			errorKind: null,
 			// Propagate the wait result's timeout verdict so the durable
@@ -1986,6 +2133,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "result_fetch_failed",
 			errorKind: null,
 		};
@@ -2005,6 +2153,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "execution_failed",
 			errorKind: jobResult?.errorKind ?? null,
 		};
@@ -2038,6 +2187,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
 			requiredCapability,
+			resolvedTargetId,
 			result: "success_no_diff",
 		};
 	}
@@ -2093,6 +2243,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		requiredCapability,
+		resolvedTargetId,
 		result: success ? "success" : "integration_failed",
 		...(safeGateFailure ?? {}),
 	};
@@ -2264,6 +2415,77 @@ function commitOrResetWorkingContainer(result, deps) {
 		}
 	}
 
+	return null;
+}
+
+/**
+ * Restore the owned working-container baseline before a quota retry. Unlike
+ * the normal failed-task continuation, this reset is mandatory even when the
+ * caller requested stop-on-failure: the second attempt must never see edits
+ * from the failed first attempt.
+ * @param {object} deps
+ * @returns {object|null} a safe halt result when reset fails
+ */
+function resetBeforeQuotaRetry({
+	result,
+	checkpoint,
+	checkpointPath,
+	workingContainerName,
+	resetWorkingTreeFn,
+	emitStatus,
+}) {
+	if (emitStatus) {
+		emitStatus({
+			phase: "checkpoint",
+			event: "retry_reset_started",
+			status: `Resetting the working tree before retrying task ${result.taskId}`,
+			taskId: result.taskId,
+			provider: result.provider ?? null,
+			model: result.model ?? null,
+			resolvedTargetId: result.resolvedTargetId ?? null,
+		});
+	}
+	try {
+		resetWorkingTreeFn(workingContainerName);
+	} catch (error) {
+		const haltResult = _haltResult(result, "reset", error);
+		persistRetryTransition(checkpoint, checkpointPath, {
+			type: "retry_halted",
+			taskId: result.taskId,
+			attempt: 1,
+			provider: result.provider,
+			model: result.model,
+			resolvedTargetId: result.resolvedTargetId,
+			clearState: true,
+		});
+		if (emitStatus) {
+			emitStatus({
+				phase: "checkpoint",
+				event: "checkpoint_failed",
+				status: `Checkpoint reset failed: ${_formatCheckpointActionError(error)}`,
+				taskId: result.taskId,
+				error: _safeError(error),
+			});
+		}
+		return haltResult;
+	}
+
+	persistRetryTransition(checkpoint, checkpointPath, {
+		type: "reset_completed",
+		taskId: result.taskId,
+		attempt: 1,
+		provider: result.provider,
+		model: result.model,
+		resolvedTargetId: result.resolvedTargetId,
+	});
+	if (emitStatus) {
+		emitStatus({
+			phase: "checkpoint",
+			event: "state_reset",
+			status: `Reset working tree before retrying task ${result.taskId}`,
+			taskId: result.taskId,
+		});
+	}
 	return null;
 }
 
@@ -2485,6 +2707,7 @@ export function runQueue(options) {
 	const onTaskRouted = dependencies.onTaskRouted ?? null;
 	const onResult = dependencies.onResult ?? null;
 	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
+	const onRetryStateChanged = dependencies.onRetryStateChanged ?? null;
 	const onContainerReady = dependencies.onContainerReady ?? null;
 	const runStore = dependencies.runStore ?? null;
 	const emitStatus = _resolveOnStatus(dependencies);
@@ -2625,9 +2848,31 @@ export function runQueue(options) {
 					}
 				: null,
 		);
+		ensureRetryCheckpoint(checkpoint);
+		const projectRetryState = () => {
+			if (
+				(!runStore && !onRetryStateChanged) ||
+				(checkpoint.retryTransitionId === 0 &&
+					checkpoint.retryState === null &&
+					checkpoint.quarantinedTargetIds.length === 0)
+			) {
+				return;
+			}
+			const projection = {
+				quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+				retryState: checkpoint.retryState,
+				retryTransitionId: checkpoint.retryTransitionId,
+			};
+			if (runStore) runStore.updateRun(projection).catch(() => {});
+			if (onRetryStateChanged) onRetryStateChanged(projection);
+		};
 		const selectionOptions = identity.enabled
 			? { selectedTaskIds: effectiveTaskIds }
 			: {};
+		context.exclude = mergeRetryExclusions(
+			effectiveExclude,
+			checkpoint.quarantinedTargetIds,
+		);
 		const initialRunnable = getRunnableTasks(
 			tasks,
 			checkpoint,
@@ -2637,15 +2882,28 @@ export function runQueue(options) {
 		const results = [];
 		let processed = 0;
 		let halted = false;
+		let resumedRetryTaskId = checkpoint.retryState?.taskId ?? null;
 
 		while (processed < effectiveMaxTasks) {
-			const runnable = getRunnableTasks(tasks, checkpoint, {
-				excludedTaskIds: attemptedTaskIds,
-				...selectionOptions,
-			});
-			const task = runnable[0];
+			const runnable = resumedRetryTaskId
+				? []
+				: getRunnableTasks(tasks, checkpoint, {
+						excludedTaskIds: attemptedTaskIds,
+						...selectionOptions,
+					});
+			const task = resumedRetryTaskId
+				? tasks.find((candidate) => candidate.id === resumedRetryTaskId)
+				: runnable[0];
 			if (!task) break;
-			attemptedTaskIds.add(task.id);
+			const retryState =
+				checkpoint.retryState?.taskId === task.id
+					? checkpoint.retryState
+					: null;
+			if (resumedRetryTaskId) {
+				resumedRetryTaskId = null;
+			} else {
+				attemptedTaskIds.add(task.id);
+			}
 
 			if (onTaskStart) onTaskStart(task);
 			if (runStore) {
@@ -2664,7 +2922,172 @@ export function runQueue(options) {
 					taskId: task.id,
 				});
 			}
-			const result = executeTask(task, context);
+			context.exclude = mergeRetryExclusions(
+				effectiveExclude,
+				checkpoint.quarantinedTargetIds,
+			);
+			let result;
+			let retryHaltResult = null;
+			let retryUsed = Boolean(retryState);
+			let retryTargetId = retryState?.resolvedTargetId ?? null;
+			if (retryState) {
+				const resumedTargetId = normalizeRetryTargetId(
+					retryState.resolvedTargetId,
+				);
+				if (
+					resumedTargetId &&
+					!checkpoint.quarantinedTargetIds.includes(resumedTargetId)
+				) {
+					// A crash can land after attempt_recorded but before the
+					// separate quarantine transition. Reconstruct the safety
+					// invariant before any reset/reroute so resume cannot select
+					// the exhausted target again.
+					checkpoint.quarantinedTargetIds = [
+						...checkpoint.quarantinedTargetIds,
+						resumedTargetId,
+					];
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "target_quarantined",
+						taskId: task.id,
+						attempt: 1,
+						resolvedTargetId: resumedTargetId,
+					});
+					projectRetryState();
+				}
+				if (retryState.phase === "retry_halted") {
+					result = {
+						taskId: task.id,
+						success: false,
+						provider: null,
+						model: null,
+						result: "unknown_failure",
+						errorKind: "unknown_failure",
+					};
+				} else if (retryState.phase === "retry_started") {
+					// A provider may already have run when the process died after
+					// this transition. Never spend a third attempt; fail closed.
+					result = {
+						taskId: task.id,
+						success: false,
+						provider: null,
+						model: null,
+						result: "unknown_failure",
+						errorKind: "unknown_failure",
+					};
+				} else {
+					if (retryState.phase !== "reset_completed") {
+						retryHaltResult = resetBeforeQuotaRetry({
+							result: {
+								taskId: task.id,
+								provider: null,
+								model: null,
+								resolvedTargetId: retryState.resolvedTargetId,
+							},
+							checkpoint,
+							checkpointPath,
+							workingContainerName,
+							resetWorkingTreeFn,
+							emitStatus,
+						});
+						projectRetryState();
+					}
+					if (!retryHaltResult) {
+						persistRetryTransition(checkpoint, checkpointPath, {
+							type: "retry_started",
+							taskId: task.id,
+							attempt: 2,
+							resolvedTargetId: retryState.resolvedTargetId,
+						});
+						projectRetryState();
+						context.exclude = mergeRetryExclusions(
+							effectiveExclude,
+							checkpoint.quarantinedTargetIds,
+						);
+						result = executeTask(task, context);
+					}
+				}
+			} else {
+				result = executeTask(task, context);
+				if (isQuotaRetryCandidate(result, ownsWorkingContainer)) {
+					const targetId = normalizeRetryTargetId(result.resolvedTargetId);
+					retryUsed = true;
+					retryTargetId = targetId;
+					appendRetryAttempt(checkpoint, result, 1);
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "attempt_recorded",
+						taskId: task.id,
+						attempt: 1,
+						provider: result.provider,
+						model: result.model,
+						resolvedTargetId: targetId,
+					});
+					projectRetryState();
+					checkpoint.quarantinedTargetIds = [
+						...new Set([...checkpoint.quarantinedTargetIds, targetId]),
+					];
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "target_quarantined",
+						taskId: task.id,
+						attempt: 1,
+						provider: result.provider,
+						model: result.model,
+						resolvedTargetId: targetId,
+					});
+					projectRetryState();
+					if (emitStatus) {
+						emitStatus({
+							phase: "execution",
+							event: "target_quarantined",
+							status: `Quarantined ${targetId} after quota exhaustion`,
+							taskId: task.id,
+							provider: result.provider,
+							model: result.model,
+							resolvedTargetId: targetId,
+						});
+					}
+					retryHaltResult = resetBeforeQuotaRetry({
+						result,
+						checkpoint,
+						checkpointPath,
+						workingContainerName,
+						resetWorkingTreeFn,
+						emitStatus,
+					});
+					projectRetryState();
+					if (!retryHaltResult) {
+						persistRetryTransition(checkpoint, checkpointPath, {
+							type: "retry_started",
+							taskId: task.id,
+							attempt: 2,
+							provider: result.provider,
+							model: result.model,
+							resolvedTargetId: targetId,
+						});
+						projectRetryState();
+						context.exclude = mergeRetryExclusions(
+							effectiveExclude,
+							checkpoint.quarantinedTargetIds,
+						);
+						result = executeTask(task, context);
+					}
+				}
+			}
+
+			if (retryHaltResult) {
+				recordHalt(
+					checkpoint,
+					checkpointPath,
+					results,
+					retryHaltResult,
+					emitStatus,
+				);
+				processed += 1;
+				halted = true;
+				break;
+			}
+			if (retryUsed) {
+				appendRetryAttempt(checkpoint, result, 2);
+			}
 			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
@@ -2754,6 +3177,18 @@ export function runQueue(options) {
 			if (result.success) {
 				checkpoint.completedTaskIds.push(result.taskId);
 			}
+			if (retryUsed) {
+				persistRetryTransition(checkpoint, checkpointPath, {
+					type: "finalized",
+					taskId: result.taskId,
+					attempt: 2,
+					provider: result.provider,
+					model: result.model,
+					resolvedTargetId: retryTargetId,
+					clearState: true,
+					save: false,
+				});
+			}
 
 			try {
 				saveCheckpoint(checkpointPath, checkpoint);
@@ -2769,6 +3204,7 @@ export function runQueue(options) {
 				}
 				throw error;
 			}
+			projectRetryState();
 			if (emitStatus) {
 				emitStatus({
 					phase: "checkpoint",
@@ -2829,6 +3265,9 @@ export function runQueue(options) {
 				.updateRun({
 					state: anyFailed ? "failed" : "succeeded",
 					activeTaskId: null,
+					quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+					retryState: checkpoint.retryState,
+					retryTransitionId: checkpoint.retryTransitionId,
 					cleanupState: "complete",
 				})
 				.catch(() => {});

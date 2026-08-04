@@ -39,15 +39,23 @@ resolutions:
     resolved_at_date: "2026-08-04"
     note: >
       Consolidation checkpoint: the pre-2026-08-04 recurrence window was reviewed and the
-      unconditional capability/selection/provenance contract is covered by the router,
-      runner, ledger, checkpoint, status, result, and capstone tests. The Agy quota-specific
-      classifier and retry/quarantine tranche is explicitly parked because the approved
-      standing-container fixture is unavailable; this entry does not claim quota resolution
-      or authorize live quota probing.
+      capability/selection/provenance contract is covered by the router, runner, ledger,
+      checkpoint, status, result, and quota capstone tests. The adapter accepts only verified
+      provider-scoped quota signatures; the runner quarantines an exact owned-container target
+      for one same-task retry after reset, while generic/auth/unknown failures remain terminal.
+      No live quota was spent to manufacture exhaustion, and standing-container credentials
+      were not treated as equivalent to host-side provider evidence.
   INV-5:
     resolved_at_date: "2026-08-04"
     note: >
       Consolidation checkpoint: the pre-2026-08-04 terminology and capability-contract
       recurrence window was reviewed. RequiredCapability remains the hard eligibility filter
-      and the unconditional parser/selection capstone covers the contract. The separate Agy
-      quota fixture and retry work remains parked and is not treated as resolved here.
+      and the parser/selection and quota capstones cover the contract without weakening
+      capability filtering during retry.
+  INV-6:
+    resolved_at_date: "2026-08-04"
+    note: >
+      The quota capstone extends the existing durable-run contract: checkpoint retry state is
+      authoritative, transitions are monotonic and atomically persisted, exact target quarantine
+      survives resume, reset precedes reroute, and detached status/result reconcile the derived
+      projection. Caller-owned containers and the untrusted orchestrator path fail closed.

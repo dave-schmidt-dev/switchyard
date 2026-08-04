@@ -1,4 +1,4 @@
-import { ok, rejects, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	chmodSync,
@@ -136,6 +136,9 @@ describe("initializeRun", () => {
 		strictEqual(snapshot.cleanupError, null);
 		strictEqual(snapshot.lastFailure, null);
 		strictEqual(snapshot.resolvedTargetId, null);
+		deepStrictEqual(snapshot.quarantinedTargetIds, []);
+		strictEqual(snapshot.retryState, null);
+		strictEqual(snapshot.retryTransitionId, 0);
 		strictEqual(snapshot.snapshotStatus, null);
 		strictEqual(snapshot.snapshotMtime, null);
 		strictEqual(snapshot.snapshotAgeMsAtRoute, null);
@@ -1351,6 +1354,42 @@ describe("initialHostFingerprint validation", () => {
 });
 
 describe("validateRun type checks for telemetry fields", () => {
+	it("accepts retry projection metadata and rejects unsafe shapes", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const projection = {
+			quarantinedTargetIds: ["agy-gemini"],
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "target_quarantined",
+				resolvedTargetId: "agy-gemini",
+			},
+			retryTransitionId: 2,
+		};
+
+		const updated = await updateRun(opts.runId, projection, snapshot.revision);
+		strictEqual(updated.retryTransitionId, 2);
+		deepStrictEqual(updated.quarantinedTargetIds, ["agy-gemini"]);
+
+		await rejects(
+			updateRun(
+				opts.runId,
+				{ retryState: { taskId: "1.1", attempt: 3, phase: "bad" } },
+				updated.revision,
+			),
+			SchemaError,
+		);
+		await rejects(
+			updateRun(
+				opts.runId,
+				{ quarantinedTargetIds: ["bad\u0000target"] },
+				updated.revision,
+			),
+			SchemaError,
+		);
+	});
+
 	it("accepts static lastFailure metadata and rejects raw fields", async () => {
 		const opts = makeOptions();
 		const snapshot = await initializeRun(opts);

@@ -1238,6 +1238,9 @@ describe("envelope format", () => {
 		const { initializeRun, updateRun, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
+		const { saveCheckpoint } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
 		const runId = "unconditional-contract-projection";
 		await initializeRun({
 			runId,
@@ -1261,6 +1264,25 @@ describe("envelope format", () => {
 		};
 		let current = await readRun(runId);
 		await updateRun(runId, routeAndFailure, current.revision);
+		const retryProjection = {
+			quarantinedTargetIds: ["agy-gemini"],
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "target_quarantined",
+				resolvedTargetId: "agy-gemini",
+			},
+			retryTransitionId: 2,
+		};
+		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+			version: 1,
+			tasksFilePath: tasksFile,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			...retryProjection,
+		});
 
 		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
 		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
@@ -1283,6 +1305,13 @@ describe("envelope format", () => {
 		for (const envelope of [statusEnvelope, resultEnvelope]) {
 			for (const [key, expected] of Object.entries(routeAndFailure)) {
 				deepStrictEqual(envelope[key], expected, `${key} projection drifted`);
+			}
+			for (const [key, expected] of Object.entries(retryProjection)) {
+				deepStrictEqual(
+					envelope[key],
+					expected,
+					`${key} retry projection drifted`,
+				);
 			}
 		}
 		ok(

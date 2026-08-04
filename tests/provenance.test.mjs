@@ -941,19 +941,19 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 		ok(!JSON.stringify(entry).includes("SECRET_CANARY"));
 	});
 
-	it("capstone: quota classification remains parked without a verified Agy fixture", () => {
-		// This is a negative contract, not a guessed matcher. The exact
-		// standing-container quota envelope is an external blocker, so a
-		// quota-shaped provider string remains an ordinary execution failure.
+	it("capstone: verified provider quota classification persists safely", () => {
+		// The matcher is provider-scoped and based on the approved sanitized
+		// provider-boundary evidence. The transient result may retain the
+		// diagnostic phrase, but the persisted projection must remain static.
 		const transient = describeExecError(
 			{
 				message: "provider rejected the request",
-				stdout: "Individual quota reached SECRET_CANARY_unverified_quota",
+				stdout: "Individual quota reached; retry after the reset window",
 				stderr: "",
 			},
 			{ provider: "agy" },
 		);
-		strictEqual(transient.errorKind, null);
+		strictEqual(transient.errorKind, "quota_exhausted");
 
 		const persistent = sanitizeFailureMetadata({
 			taskId: "1.1",
@@ -961,8 +961,8 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 			errorKind: transient.errorKind,
 			partialDiffPath: "1.1.diff",
 		});
-		strictEqual(persistent.errorKind, "execution_failed");
-		strictEqual(persistent.reasonCode, "execution_failed");
-		ok(!JSON.stringify(persistent).includes("SECRET_CANARY"));
+		strictEqual(persistent.errorKind, "quota_exhausted");
+		strictEqual(persistent.reasonCode, "quota_exhausted");
+		ok(!JSON.stringify(persistent).includes("Individual quota reached"));
 	});
 });

@@ -311,6 +311,14 @@ try {
 				const fn = () => runStore.updateRunWithRetry(runId, {});
 				writeChain = writeChain.then(fn, fn).catch(() => {});
 			},
+			onRetryStateChanged: (projection) => {
+				// The checkpoint is authoritative. This is only a sanitized
+				// run-store projection; status/result re-read the checkpoint so a
+				// crash cannot hide a transition if this asynchronous write loses
+				// the race with worker termination.
+				const fn = () => runStore.updateRunWithRetry(runId, projection);
+				writeChain = writeChain.then(fn, fn).catch(() => {});
+			},
 			onContainerReady: (info) => {
 				const fn = () =>
 					runStore.updateRunWithRetry(runId, {

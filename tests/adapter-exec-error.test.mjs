@@ -68,6 +68,103 @@ describe("describeExecError — auth-expiry classification", () => {
 	});
 });
 
+describe("describeExecError — provider-scoped quota classification", () => {
+	it("classifies the verified Agy phrase with a dynamic suffix", () => {
+		const described = describeExecError(
+			fakeExecError({
+				stdout: "Individual quota reached; retry after the reset window",
+				code: 1,
+			}),
+			{ provider: "agy" },
+		);
+
+		strictEqual(described.errorKind, "quota_exhausted");
+		ok(described.error.includes("Individual quota reached"));
+	});
+
+	it("classifies Cursor only when both verified usage markers are present", () => {
+		const described = describeExecError(
+			fakeExecError({
+				stderr: "Request denied: out-of-usage; your limit is unavailable",
+				code: 1,
+			}),
+			{ provider: "cursor" },
+		);
+
+		strictEqual(described.errorKind, "quota_exhausted");
+	});
+
+	it("rejects near misses, generic rate limits, and provider cross-talk", () => {
+		const cases = [
+			{ provider: "agy", output: "Quota reached", label: "Agy near miss" },
+			{
+				provider: "cursor",
+				output: "out of usage",
+				label: "Cursor missing limit marker",
+			},
+			{
+				provider: "cursor",
+				output: "your limit is unavailable",
+				label: "Cursor missing usage marker",
+			},
+			{
+				provider: "unknown",
+				output: "Individual quota reached",
+				label: "unknown provider",
+			},
+			{
+				provider: "agy",
+				output: "HTTP 429 rate limit exceeded",
+				label: "generic rate limit",
+			},
+		];
+
+		for (const { provider, output, label } of cases) {
+			const described = describeExecError(
+				fakeExecError({ stdout: output, code: 1 }),
+				{ provider },
+			);
+			strictEqual(described.errorKind, null, label);
+		}
+	});
+
+	it("keeps auth precedence and leaves transport failures unclassified", () => {
+		const auth = describeExecError(
+			fakeExecError({
+				stdout: "Authentication failed: individual quota reached",
+				code: 1,
+			}),
+			{ provider: "agy" },
+		);
+		strictEqual(auth.errorKind, "auth_expired");
+
+		const transport = describeExecError(
+			fakeExecError({
+				message: "spawnSync docker ETIMEDOUT",
+				code: "ETIMEDOUT",
+			}),
+			{ provider: "agy" },
+		);
+		strictEqual(transport.errorKind, null);
+	});
+
+	it("persists quota as static metadata without provider text", () => {
+		const metadata = sanitizeFailureMetadata({
+			taskId: "5.4",
+			result: "execution_failed",
+			errorKind: "quota_exhausted",
+		});
+
+		deepStrictEqual(metadata, {
+			errorKind: "quota_exhausted",
+			reasonCode: "quota_exhausted",
+			reason:
+				"Provider quota is exhausted; the target is unavailable for this attempt.",
+		});
+		ok(isPersistentFailureMetadata(metadata));
+	});
+});
+
 describe("describeExecError — general diagnosability", () => {
 	it("surfaces the provider's real output for a NON-auth failure instead of Node's wrapper", () => {
 		const described = describeExecError(
