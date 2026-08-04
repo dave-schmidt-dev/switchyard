@@ -3,12 +3,12 @@ import { describe, it } from "node:test";
 import {
 	classifyTask,
 	classifyTasks,
-	isValidTier,
+	isValidCapabilityClass,
 } from "../src/switchyard/roster/classifier.mjs";
 
 describe("classifier", () => {
 	describe("classifyTask", () => {
-		it("should classify high-tier tasks from keywords", () => {
+		it("should classify high-capability tasks from keywords", () => {
 			strictEqual(classifyTask("debug the complex failure"), "high");
 			strictEqual(classifyTask("root-cause investigation"), "high");
 			strictEqual(classifyTask("planning phase spec"), "high");
@@ -16,7 +16,7 @@ describe("classifier", () => {
 			strictEqual(classifyTask("security authentication jwt"), "high");
 		});
 
-		it("should classify standard-tier tasks from keywords", () => {
+		it("should classify standard-capability tasks from keywords", () => {
 			strictEqual(classifyTask("database migration schema"), "standard");
 			strictEqual(classifyTask("implement sqlite progress store"), "standard");
 			strictEqual(classifyTask("build the new feature"), "standard");
@@ -25,7 +25,7 @@ describe("classifier", () => {
 			strictEqual(classifyTask("optimize the module"), "standard");
 		});
 
-		it("should classify low-tier tasks from keywords", () => {
+		it("should classify low-capability tasks from keywords", () => {
 			strictEqual(classifyTask("format the code"), "low");
 			strictEqual(classifyTask("typo in the readme file"), "low");
 			strictEqual(classifyTask("cleanup comments"), "low");
@@ -41,7 +41,7 @@ describe("classifier", () => {
 			strictEqual(classifyTask("random words here"), "high");
 		});
 
-		it("never downgrades a task to low when it also contains standard-tier signal", () => {
+		it("never downgrades a task to low when it also contains standard-capability signal", () => {
 			// Regression: LOW was checked before STANDARD, so "fix the bug and
 			// add a clarifying comment" classified low ("comment" beat "fix"/
 			// "bug"). Under-classifying real work to a weak provider is the
@@ -67,7 +67,7 @@ describe("classifier", () => {
 			// match inside "redesignate"; "move" must not match inside "movement".
 			// None of these actually contain a recognized keyword once the false
 			// substring matches are removed, so they land on the conservative
-			// high default rather than the (wrong) keyword tier a prior version
+			// high default rather than the (wrong) keyword capability a prior version
 			// assigned via the accidental substring hit.
 			strictEqual(classifyTask("make the UI feel more rapid"), "high");
 			strictEqual(classifyTask("update the capital gains calculator"), "high");
@@ -75,7 +75,7 @@ describe("classifier", () => {
 			strictEqual(classifyTask("track user movement heatmaps"), "high");
 		});
 
-		it("treats jwt/crypto/security-audit terms as high-tier regardless of other words", () => {
+		it("treats jwt/crypto/security-audit terms as high-capability regardless of other words", () => {
 			strictEqual(
 				classifyTask("minor tweak to the JWT encryption handling"),
 				"high",
@@ -150,17 +150,17 @@ describe("classifier", () => {
 		});
 	});
 
-	describe("isValidTier", () => {
-		it("should accept valid tiers", () => {
-			strictEqual(isValidTier("high"), true);
-			strictEqual(isValidTier("standard"), true);
-			strictEqual(isValidTier("low"), true);
+	describe("isValidCapabilityClass", () => {
+		it("should accept valid capability classes", () => {
+			strictEqual(isValidCapabilityClass("high"), true);
+			strictEqual(isValidCapabilityClass("standard"), true);
+			strictEqual(isValidCapabilityClass("low"), true);
 		});
 
-		it("should reject invalid tiers", () => {
-			strictEqual(isValidTier("medium"), false);
-			strictEqual(isValidTier(""), false);
-			strictEqual(isValidTier(null), false);
+		it("should reject invalid capability classes", () => {
+			strictEqual(isValidCapabilityClass("medium"), false);
+			strictEqual(isValidCapabilityClass(""), false);
+			strictEqual(isValidCapabilityClass(null), false);
 		});
 	});
 });

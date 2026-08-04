@@ -6,8 +6,8 @@
 // Task 1.6c (roster-unification plan): migrated off hardcoded outcome
 // literals this same gate used to assert directly against the frozen
 // PROVIDER_CAPABILITIES table -- blind-fallback `provider === 'claude'`,
-// `route({tier:'high'}).model === 'claude-opus-4-8'`,
-// `route({tier:'standard'}).model === 'claude-sonnet-5'`, and a
+// `route({requiredCapability:'high'}).model === 'claude-opus-4-8'`,
+// `route({requiredCapability:'standard'}).model === 'claude-sonnet-5'`, and a
 // vibe-has-no-adapter exclusion -- onto the roster-backed router (Task
 // 1.5/1.6). Uses the same committed fixture roster
 // (tests/fixtures/roster.fixture.json) + SWITCHYARD_ROSTER_PATH +
@@ -178,11 +178,11 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		strictEqual(result.reason, "no_eligible");
 	});
 
-	it("returns no_eligible_capability_ceiling when the only candidate is below the tier's capability ceiling", () => {
+	it("returns no_eligible_capability_ceiling when the only candidate is below the required capability ceiling", () => {
 		// Task D.3: distinguish the deterministic INV-5 ceiling case (every
-		// candidate's technical_ceiling is below the task's required tier —
+		// candidate's technical_ceiling is below the task's required capability —
 		// expected, not actionable) from the upstream-unavailable case below.
-		// antigravity's fixture ceiling is standard, so at tier high the
+		// antigravity fixture's ceiling is standard, so at required capability high the
 		// capability filter rejects it and nothing else is present: the reason
 		// must name the ceiling, not the generic no_eligible.
 		createTestSnapshot([
@@ -193,7 +193,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.provider, null);
 		strictEqual(result.reason, "no_eligible_capability_ceiling");
 	});
@@ -212,7 +212,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.provider, null);
 		strictEqual(
 			result.reason,
@@ -223,7 +223,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 	it("never routes to vibe (a disabled, no-adapter roster target) even with the most headroom", () => {
 		// vibe is `enabled: false` in the roster (no ZDR, no adapter) -- its
 		// computed capability_class is null, so it fails the capability filter
-		// at every tier, including the lowest. This is the INV-4-relevant half
+		// at every required capability, including the lowest. This is the INV-4-relevant half
 		// of the old "vibe exclusion" test: a snapshot can report any headroom
 		// it likes for a provider switchyard has no business dispatching to,
 		// and that must never win the spread.
@@ -240,12 +240,12 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "low" });
+		const result = route({ requiredCapability: "low" });
 		strictEqual(
 			result.provider,
 			"claude",
 			"vibe is disabled in the roster and must never be selected, even at " +
-				"the lowest tier and with the most headroom",
+				"the lowest required capability and with the most headroom",
 		);
 	});
 
@@ -266,7 +266,10 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "low", availableProviders: ["claude"] });
+		const result = route({
+			requiredCapability: "low",
+			availableProviders: ["claude"],
+		});
 		strictEqual(
 			result.provider,
 			"claude",
@@ -298,7 +301,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "low", exclude: ["claude"] });
+		const result = route({ requiredCapability: "low", exclude: ["claude"] });
 		strictEqual(
 			result.provider,
 			"Codex",
@@ -321,7 +324,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "low", only: ["claude"] });
+		const result = route({ requiredCapability: "low", only: ["claude"] });
 		strictEqual(
 			result.provider,
 			"claude",
@@ -369,7 +372,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, "cursor");
 		strictEqual(result.percentLeft, 4.66);
 		strictEqual(result.reason, "priority_fill");
@@ -527,9 +530,10 @@ describe("router (INV-4: every dispatch outcome records provider + model + resul
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.provider, "claude");
 		strictEqual(result.reason, "spread");
+		strictEqual(result.requiredCapability, "high");
 		notStrictEqual(
 			result.model,
 			null,
@@ -544,8 +548,9 @@ describe("router (INV-4: every dispatch outcome records provider + model + resul
 			// Ignore
 		}
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.reason, "blind_fallback");
+		strictEqual(result.requiredCapability, "high");
 		notStrictEqual(result.provider, null);
 		notStrictEqual(
 			result.model,
@@ -563,9 +568,10 @@ describe("router (INV-4: every dispatch outcome records provider + model + resul
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.provider, null);
 		strictEqual(result.model, null);
+		strictEqual(result.requiredCapability, "high");
 		// The single candidate fails only the INV-5 capability filter, so the
 		// triple's reason is the distinguishable ceiling classification (Task
 		// D.3), not the generic no_eligible.
@@ -573,8 +579,8 @@ describe("router (INV-4: every dispatch outcome records provider + model + resul
 	});
 });
 
-describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 spread)", () => {
-	it("low-tier tasks are eligible for qualified low-cost lanes (opencode) and INV-4 spread selects opencode when it has most headroom", () => {
+describe("router (Task 2.2: low-capability lane economics & eligibility under INV-4 spread)", () => {
+	it("low-capability tasks are eligible for qualified low-cost lanes (opencode) and INV-4 spread selects opencode when it has most headroom", () => {
 		createTestSnapshot([
 			{
 				name: "claude",
@@ -588,11 +594,11 @@ describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 sp
 			},
 		]);
 
-		const result = route({ tier: "low" });
+		const result = route({ requiredCapability: "low" });
 		strictEqual(
 			result.provider,
 			"opencode",
-			"opencode is eligible for low-tier tasks and has most headroom",
+			"opencode is eligible for low-capability tasks and has most headroom",
 		);
 		strictEqual(
 			result.model,
@@ -617,7 +623,7 @@ describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 sp
 			},
 		]);
 
-		const result = route({ tier: "low" });
+		const result = route({ requiredCapability: "low" });
 		strictEqual(
 			result.provider,
 			"claude",
@@ -627,7 +633,7 @@ describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 sp
 		strictEqual(result.percentLeft, 90);
 	});
 
-	it("high-tier eligibility stays Claude + Codex only regardless of low-tier provider headroom", () => {
+	it("high-capability eligibility stays Claude + Codex only regardless of low-capability provider headroom", () => {
 		createTestSnapshot([
 			{
 				name: "opencode",
@@ -651,11 +657,11 @@ describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 sp
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(
 			result.provider,
 			"codex",
-			"high-tier task excludes opencode and agy; selects codex with highest headroom among Claude+Codex",
+			"high-capability task excludes opencode and agy; selects codex with highest headroom among Claude+Codex",
 		);
 		strictEqual(result.model, "fixture-codex-high");
 		strictEqual(result.percentLeft, 60);
@@ -680,7 +686,7 @@ describe("router (Task 2.2: low-tier lane economics & eligibility under INV-4 sp
 			},
 		]);
 
-		const result = route({ tier: "low" });
+		const result = route({ requiredCapability: "low" });
 		strictEqual(
 			result.provider,
 			"codex",
@@ -710,7 +716,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(
 			result.provider,
 			"antigravity",
@@ -733,7 +739,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(
 			result.provider,
 			"antigravity",
@@ -753,7 +759,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 				windows: [{ percent_left: 1, pace_delta: 0 }],
 			},
 		]);
-		let result = route({ tier: "standard" });
+		let result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, "antigravity");
 		strictEqual(result.reason, "priority_fill");
 
@@ -765,7 +771,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 				windows: [{ percent_left: 0, pace_delta: 0 }],
 			},
 		]);
-		result = route({ tier: "standard" });
+		result = route({ requiredCapability: "standard" });
 		strictEqual(
 			result.provider,
 			null,
@@ -785,7 +791,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, "cursor");
 		strictEqual(
 			result.percentLeft,
@@ -812,7 +818,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(
 			result.provider,
 			"claude",
@@ -838,7 +844,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, "cursor");
 		strictEqual(result.percentLeft, 50);
 		strictEqual(result.reason, "last_resort_fallback");
@@ -856,7 +862,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 			},
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(
 			result.provider,
 			null,
@@ -902,7 +908,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 				},
 			]);
 
-			const result = route({ tier: "standard" });
+			const result = route({ requiredCapability: "standard" });
 			strictEqual(
 				result.provider,
 				"Antigravity (Claude)",

@@ -51,10 +51,35 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"roster.fixture.json",
 );
 
+// These older runner fixtures predate the mandatory task-contract Executor:
+// field. Normalize only the fixture text so the real parser receives an
+// explicit field; the missing-Executor rejection is tested directly below.
+function withExplicitSwitchyardExecutor(markdown) {
+	const lines = markdown.split("\n");
+	return lines
+		.flatMap((line, index) => {
+			if (!/^- \*\*Status:\*\*/.test(line)) return [line];
+			const nextHeading = lines.findIndex(
+				(candidate, candidateIndex) =>
+					candidateIndex > index && /^### Task /.test(candidate),
+			);
+			const blockEnd = nextHeading === -1 ? lines.length : nextHeading;
+			const hasExecutor = lines
+				.slice(index + 1, blockEnd)
+				.some((candidate) => /^- \*\*Executor:\*\*/.test(candidate));
+			return hasExecutor ? [line] : [line, "- **Executor:** switchyard"];
+		})
+		.join("\n");
+}
+
+function parseFixture(markdown) {
+	return parseTaskQueue(withExplicitSwitchyardExecutor(markdown));
+}
+
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");
-	writeFileSync(tasksPath, content, "utf8");
+	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
 	return tasksPath;
 }
 
@@ -81,7 +106,7 @@ describe("runner queue parsing", () => {
 - **Description:** Do second thing
 `;
 
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 2);
 		strictEqual(tasks[0].id, "1.1");
 		strictEqual(tasks[0].status, "pending");
@@ -102,7 +127,7 @@ describe("runner queue parsing", () => {
 1. Step one
 2. Step two
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 2);
 		strictEqual(tasks[0].description, "Do the work steps");
 		strictEqual(tasks[1].description.includes("Step one"), true);
@@ -234,7 +259,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/a.mjs, tests/a.test.mjs
 - **Description:** Do things with files
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs", "tests/a.test.mjs"]);
 	});
@@ -247,7 +272,7 @@ describe("runner queue parsing", () => {
 - **Type:** review
 - **Description:** Do things
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].requiredPaths, null);
 	});
@@ -260,7 +285,7 @@ describe("runner queue parsing", () => {
 - **Files:** /etc/passwd
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /absolute path/);
+		throws(() => parseFixture(markdown), /absolute path/);
 	});
 
 	it("rejects a Files: field with '..' traversal", () => {
@@ -271,7 +296,7 @@ describe("runner queue parsing", () => {
 - **Files:** ../outside/evil.mjs
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /path traversal/);
+		throws(() => parseFixture(markdown), /path traversal/);
 	});
 
 	it("rejects a Files: field with a wildcard", () => {
@@ -282,7 +307,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/*.mjs
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /wildcards/);
+		throws(() => parseFixture(markdown), /wildcards/);
 	});
 
 	it("rejects an empty Files: field (no paths)", () => {
@@ -293,7 +318,7 @@ describe("runner queue parsing", () => {
 - **Files:**   	
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /empty/);
+		throws(() => parseFixture(markdown), /empty/);
 	});
 
 	it("rejects a Files: field with backslash separators", () => {
@@ -304,7 +329,7 @@ describe("runner queue parsing", () => {
 - **Files:** src\\evil.mjs
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /backslash/);
+		throws(() => parseFixture(markdown), /backslash/);
 	});
 
 	it("rejects a Files: field with directory-only entries", () => {
@@ -315,7 +340,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /directory-only/);
+		throws(() => parseFixture(markdown), /directory-only/);
 	});
 
 	it("rejects a Files: field with duplicate paths", () => {
@@ -326,7 +351,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/a.mjs, src/a.mjs
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /duplicate/);
+		throws(() => parseFixture(markdown), /duplicate/);
 	});
 
 	it("ignores prose-embedded Files: mentions and only matches - **Files:** lines", () => {
@@ -337,7 +362,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/a.mjs
 - **Description:** This mentions Files: but without the bullet anchor
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs"]);
 	});
@@ -351,26 +376,26 @@ describe("runner queue parsing", () => {
 - **Timeout:** 90m
 - **Description:** Needs more than the default 30 minutes
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].timeoutMs, 90 * 60 * 1000);
 	});
 
 	it("extracts timeoutMs from a Timeout: field in seconds, hours, and fractional hours", () => {
 		strictEqual(
-			parseTaskQueue(
+			parseFixture(
 				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Timeout:** 45s\n",
 			)[0].timeoutMs,
 			45 * 1000,
 		);
 		strictEqual(
-			parseTaskQueue(
+			parseFixture(
 				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Timeout:** 2h\n",
 			)[0].timeoutMs,
 			2 * 3_600_000,
 		);
 		strictEqual(
-			parseTaskQueue(
+			parseFixture(
 				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Timeout:** 1.5h\n",
 			)[0].timeoutMs,
 			1.5 * 3_600_000,
@@ -385,7 +410,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/a.mjs
 - **Description:** Do things
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].timeoutMs, null);
 	});
@@ -400,7 +425,7 @@ describe("runner queue parsing", () => {
 - **Description:** Bad
 `;
 		throws(
-			() => parseTaskQueue(markdown),
+			() => parseFixture(markdown),
 			/expected a number followed by s\/m\/h/,
 		);
 	});
@@ -415,7 +440,7 @@ describe("runner queue parsing", () => {
 - **Description:** Bad
 `;
 		throws(
-			() => parseTaskQueue(markdown),
+			() => parseFixture(markdown),
 			/expected a number followed by s\/m\/h/,
 		);
 	});
@@ -429,7 +454,7 @@ describe("runner queue parsing", () => {
 - **Timeout:** 0s
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /must be between 1s and 24h/);
+		throws(() => parseFixture(markdown), /must be between 1s and 24h/);
 	});
 
 	it("rejects a Timeout: field above the 24-hour typo-guard ceiling", () => {
@@ -441,41 +466,53 @@ describe("runner queue parsing", () => {
 - **Timeout:** 48h
 - **Description:** Bad
 `;
-		throws(() => parseTaskQueue(markdown), /must be between 1s and 24h/);
+		throws(() => parseFixture(markdown), /must be between 1s and 24h/);
 	});
 
-	// Task 2.1 (roster-unification plan): parseTaskQueue reads a declared
-	// `Tier:` field so an upstream task-queue author's tier assignment can be
-	// respected by the runner instead of always being re-inferred by
-	// classifyTask (see "runner tier resolution" below for the routing half).
-	it("extracts tier from a Tier: field, normalizing case", () => {
+	it("extracts requiredCapability from RequiredCapability:, normalizing case", () => {
 		const markdown = `## Phase 1
 
-### Task 1.1: Declared tier task
+### Task 1.1: Declared capability task
 - **Status:** pending
 - **Files:** src/a.mjs
-- **Tier:** Standard
+- **Executor:** switchyard
+- **RequiredCapability:** Standard
 - **Description:** Whatever classifyTask would guess is irrelevant here
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
-		strictEqual(tasks[0].tier, "standard");
+		strictEqual(tasks[0].requiredCapability, "standard");
+		strictEqual(tasks[0].executor, "switchyard");
 	});
 
-	it("sets tier to null when no Tier: field is present", () => {
+	it("sets requiredCapability to null when Executor is explicit", () => {
 		const markdown = `## Phase 1
 
 ### Task 1.1: Simple task
 - **Status:** pending
 - **Files:** src/a.mjs
+- **Executor:** switchyard
 - **Description:** Do things
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
-		strictEqual(tasks[0].tier, null);
+		strictEqual(tasks[0].requiredCapability, null);
+		strictEqual(tasks[0].executor, "switchyard");
 	});
 
-	it("rejects a Tier: field with an unrecognized value instead of silently accepting it", () => {
+	it("rejects a task contract with no Executor field", () => {
+		const markdown = `### Task 1.1: Missing executor
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** Do things
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/Task 1.1: missing Executor field \(expected one of: native, switchyard, human\)/,
+		);
+	});
+
+	it("rejects the retired Tier: field instead of accepting it as an alias", () => {
 		const markdown = `## Phase 1
 
 ### Task 1.1: Bad task
@@ -485,9 +522,50 @@ describe("runner queue parsing", () => {
 - **Description:** Bad
 `;
 		throws(
-			() => parseTaskQueue(markdown),
-			/invalid Tier field "urgent" \(expected one of: high, standard, low\)/,
+			() => parseFixture(markdown),
+			/Tier is a retired task-contract field/,
 		);
+	});
+
+	it("rejects duplicate, mixed, empty, and invalid RequiredCapability declarations", () => {
+		const cases = [
+			[
+				"- **RequiredCapability:** high\n- **RequiredCapability:** low",
+				/duplicate RequiredCapability/,
+			],
+			["- **RequiredCapability:** high, standard", /mixed RequiredCapability/],
+			["- **RequiredCapability:**", /RequiredCapability field is empty/],
+			["- **RequiredCapability:** urgent", /invalid RequiredCapability field/],
+		];
+
+		for (const [declaration, error] of cases) {
+			const markdown = `### Task 1.1: Bad capability\n- **Status:** pending\n- **Files:** src/a.mjs\n${declaration}\n`;
+			throws(() => parseFixture(markdown), error);
+		}
+	});
+
+	it("parses Executor strictly and normalizes accepted values", () => {
+		for (const executor of ["Native", "SWITCHYARD", "human"]) {
+			const files =
+				executor.toLowerCase() === "switchyard"
+					? "- **Files:** src/a.mjs\n"
+					: "";
+			const markdown = `### Task 1.1: Executor task\n- **Status:** pending\n${files}- **Executor:** ${executor}\n- **Description:** Work\n`;
+			strictEqual(parseFixture(markdown)[0].executor, executor.toLowerCase());
+		}
+	});
+
+	it("rejects duplicate, empty, and invalid Executor declarations", () => {
+		const cases = [
+			["- **Executor:** native\n- **Executor:** human", /duplicate Executor/],
+			["- **Executor:**", /invalid Executor field/],
+			["- **Executor:** provider", /invalid Executor field/],
+		];
+
+		for (const [declaration, error] of cases) {
+			const markdown = `### Task 1.1: Bad executor\n- **Status:** pending\n- **Type:** review\n${declaration}\n`;
+			throws(() => parseFixture(markdown), error);
+		}
 	});
 
 	it("defaults type to implementation when no Type: field is present", () => {
@@ -498,7 +576,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/a.mjs
 - **Description:** Do things
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].type, "implementation");
 	});
@@ -512,7 +590,7 @@ describe("runner queue parsing", () => {
 - **Type:** Review
 - **Description:** Perform code review
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].type, "review");
 	});
@@ -527,37 +605,35 @@ describe("runner queue parsing", () => {
 - **Description:** Bad type
 `;
 		throws(
-			() => parseTaskQueue(markdown),
+			() => parseFixture(markdown),
 			/invalid Type field "audit" \(expected one of: implementation, review\)/,
 		);
 	});
 
-	// Task 2.2: mandatory Files: for implementation-type tasks
-	it("rejects an implementation-type task without Files: field, failing closed at parse time", () => {
+	it("rejects a switchyard implementation task without Files: field, failing closed at parse time", () => {
 		const markdown = `## Phase 1
 
 ### Task 1.1: Implementation task without files
 - **Status:** pending
 - **Type:** implementation
+- **Executor:** switchyard
 - **Description:** Do work
 `;
 		throws(
-			() => parseTaskQueue(markdown),
-			/Task 1.1: implementation-type task requires a Files: field/,
+			() => parseFixture(markdown),
+			/Task 1.1: switchyard implementation task requires a Files: field/,
 		);
 	});
 
-	it("rejects a task defaulting to implementation-type without Files: field", () => {
+	it("allows native and human implementation tasks without Files: field", () => {
 		const markdown = `## Phase 1
 
-### Task 1.1: Default implementation task without files
+### Task 1.1: Non-switchyard implementation task without files
 - **Status:** pending
+- **Executor:** native
 - **Description:** Do work
 `;
-		throws(
-			() => parseTaskQueue(markdown),
-			/Task 1.1: implementation-type task requires a Files: field/,
-		);
+		strictEqual(parseFixture(markdown)[0].requiredPaths, null);
 	});
 
 	it("allows review-type task without Files: field, leaving requiredPaths as null", () => {
@@ -568,7 +644,7 @@ describe("runner queue parsing", () => {
 - **Type:** review
 - **Description:** Review PR
 `;
-		const tasks = parseTaskQueue(markdown);
+		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].type, "review");
 		strictEqual(tasks[0].requiredPaths, null);
@@ -629,8 +705,8 @@ describe("runner orchestration", () => {
 		strictEqual(result.completedTaskIds.length, 2);
 		strictEqual(dispatches.length, 2);
 		deepStrictEqual(prompts, [
-			"### Task 1.1: First task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** First operation",
-			"### Task 1.2: Second task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+			"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
@@ -695,8 +771,8 @@ describe("runner orchestration", () => {
 		});
 
 		deepStrictEqual(prompts, [
-			"### Task 1.1: First task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** First operation",
-			"### Task 1.2: Second task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+			"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 	});
 });
@@ -923,8 +999,8 @@ describe("runner headless orchestrator mode", () => {
 		deepStrictEqual(
 			launches.map((payload) => payload.prompt),
 			[
-				"### Task 1.1: First task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** First operation",
-				"### Task 1.2: Second task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+				"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
+				"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 			],
 		);
 		deepStrictEqual(polls, ["running", "done", "done"]);
@@ -1282,7 +1358,7 @@ describe("runner provider spread recording", () => {
 		// Regression: vibe/agy/cursor/copilot are in the roster but only
 		// claude/codex have adapters wired here. Before the availableProviders
 		// fix, route() (unconstrained) could legitimately pick vibe for a
-		// low-tier task, selectAdapter() would return null, and the task
+		// low-capability task, selectAdapter() would return null, and the task
 		// would fail with "unsupported_provider" forever — every resume
 		// re-picks the same unsupported provider and fails identically.
 		const tasksPath = writeTasksFile(`## Phase 1
@@ -4861,16 +4937,10 @@ describe("executeTask timeout handling", () => {
 	});
 });
 
-// Task 2.1 (roster-unification plan): executeTask/executeTaskWithOrchestrator
-// used to invent the tier via classifyTask(task.description || task.title) on
-// every call, never reading a tier the task-queue author may have already
-// declared upstream (INV-5 right-sizing). These tests exercise the fix at
-// the routing boundary: route() must receive a task's declared tier verbatim
-// when present and valid, must still fall back to classifyTask when the tier
-// is absent, and must reject (not silently route at a fallback) when a
-// declared tier is present but unrecognized.
-describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)", () => {
-	function tierCapturingContext(routeCalls) {
+// Task 1.1: RequiredCapability is the task-contract name at the parser and
+// runner boundary. Task 1.2 carries that name through route selection.
+describe("runner task contract resolution", () => {
+	function capabilityCapturingContext(routeCalls) {
 		return {
 			route: (opts) => {
 				routeCalls.push(opts);
@@ -4894,40 +4964,59 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 		};
 	}
 
-	it("executeTask routes at the task's declared tier, not classifyTask's guess from the description", () => {
+	it("executeTask routes at RequiredCapability, not classifyTask's guess from the description", () => {
 		const routeCalls = [];
-		// "format the readme" is an unambiguous LOW_TIER_KEYWORDS match in
+		// "format the readme" is an unambiguous low-capability keyword match in
 		// classifier.mjs (format/readme) -- classifyTask would call this
-		// "low". The declared tier must win instead.
+		// "low". The declared capability must win instead.
 		executeTask(
 			{
 				id: "1.1",
 				title: "task",
 				description: "format the readme",
-				tier: "high",
+				requiredCapability: "high",
 			},
-			tierCapturingContext(routeCalls),
+			capabilityCapturingContext(routeCalls),
 		);
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].tier, "high");
+		strictEqual(routeCalls[0].requiredCapability, "high");
 	});
 
-	it("executeTask falls back to classifyTask when no tier is declared (existing behavior preserved)", () => {
+	it("programmatic task objects may omit Executor and still fall back to classifyTask", () => {
 		const routeCalls = [];
 		executeTask(
 			{
 				id: "1.1",
 				title: "task",
 				description: "format the readme",
-				tier: null,
+				requiredCapability: null,
 			},
-			tierCapturingContext(routeCalls),
+			capabilityCapturingContext(routeCalls),
 		);
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].tier, "low");
+		strictEqual(routeCalls[0].requiredCapability, "low");
 	});
 
-	it("executeTask rejects an invalid declared tier instead of silently routing at tier 0", () => {
+	it("executeTask never provider-routes native or human tasks", () => {
+		for (const executor of ["native", "human"]) {
+			const routeCalls = [];
+			const result = executeTask(
+				{
+					id: "1.1",
+					title: "task",
+					description: "format the readme",
+					executor,
+					requiredCapability: "high",
+				},
+				capabilityCapturingContext(routeCalls),
+			);
+			strictEqual(routeCalls.length, 0);
+			strictEqual(result.provider, null);
+			strictEqual(result.result, "executor_not_switchyard");
+		}
+	});
+
+	it("executeTask rejects an invalid RequiredCapability instead of silently routing at capability 0", () => {
 		const routeCalls = [];
 		throws(
 			() =>
@@ -4936,28 +5025,29 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 						id: "1.1",
 						title: "task",
 						description: "format the readme",
-						tier: "urgent",
+						requiredCapability: "urgent",
 					},
-					tierCapturingContext(routeCalls),
+					capabilityCapturingContext(routeCalls),
 				),
-			/invalid declared tier "urgent"/,
+			/invalid declared RequiredCapability "urgent"/,
 		);
 		// The reject must happen before route() is ever reached -- an invalid
-		// tier must not silently reach the router as a fallback/zero tier.
+		// RequiredCapability must not silently reach the router as a fallback or
+		// zero capability.
 		strictEqual(routeCalls.length, 0);
 	});
 
-	it("executeTaskWithOrchestrator routes at the task's declared tier, not classifyTask's guess", async () => {
+	it("executeTaskWithOrchestrator routes at RequiredCapability, not classifyTask's guess", async () => {
 		const routeCalls = [];
 		const result = await executeTaskWithOrchestrator(
 			{
 				id: "1.1",
 				title: "task",
 				description: "format the readme",
-				tier: "high",
+				requiredCapability: "high",
 			},
 			{
-				...tierCapturingContext(routeCalls),
+				...capabilityCapturingContext(routeCalls),
 				orchestrator: {
 					launch: async () => "job-1",
 					status: async () => ({ state: "done" }),
@@ -4966,16 +5056,21 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 			},
 		);
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].tier, "high");
+		strictEqual(routeCalls[0].requiredCapability, "high");
 		strictEqual(result.taskId, "1.1");
 	});
 
-	it("executeTaskWithOrchestrator falls back to classifyTask when no tier is declared", async () => {
+	it("executeTaskWithOrchestrator falls back to classifyTask when RequiredCapability is absent", async () => {
 		const routeCalls = [];
 		await executeTaskWithOrchestrator(
-			{ id: "1.1", title: "task", description: "format the readme" },
 			{
-				...tierCapturingContext(routeCalls),
+				id: "1.1",
+				title: "task",
+				description: "format the readme",
+				requiredCapability: null,
+			},
+			{
+				...capabilityCapturingContext(routeCalls),
 				orchestrator: {
 					launch: async () => "job-1",
 					status: async () => ({ state: "done" }),
@@ -4984,10 +5079,39 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 			},
 		);
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].tier, "low");
+		strictEqual(routeCalls[0].requiredCapability, "low");
 	});
 
-	it("executeTaskWithOrchestrator rejects an invalid declared tier instead of silently routing at tier 0", async () => {
+	it("executeTaskWithOrchestrator never provider-routes native or human tasks", async () => {
+		for (const executor of ["native", "human"]) {
+			const routeCalls = [];
+			let launches = 0;
+			const result = await executeTaskWithOrchestrator(
+				{
+					id: "1.1",
+					title: "task",
+					description: "format the readme",
+					executor,
+					requiredCapability: "high",
+				},
+				{
+					...capabilityCapturingContext(routeCalls),
+					orchestrator: {
+						launch: async () => {
+							launches += 1;
+							return "job-1";
+						},
+					},
+				},
+			);
+			strictEqual(routeCalls.length, 0);
+			strictEqual(launches, 0);
+			strictEqual(result.provider, null);
+			strictEqual(result.result, "executor_not_switchyard");
+		}
+	});
+
+	it("executeTaskWithOrchestrator rejects an invalid RequiredCapability instead of silently routing at capability 0", async () => {
 		const routeCalls = [];
 		await rejects(
 			() =>
@@ -4996,10 +5120,10 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 						id: "1.1",
 						title: "task",
 						description: "format the readme",
-						tier: "urgent",
+						requiredCapability: "urgent",
 					},
 					{
-						...tierCapturingContext(routeCalls),
+						...capabilityCapturingContext(routeCalls),
 						orchestrator: {
 							launch: async () => "job-1",
 							status: async () => ({ state: "done" }),
@@ -5007,18 +5131,18 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 						},
 					},
 				),
-			/invalid declared tier "urgent"/,
+			/invalid declared RequiredCapability "urgent"/,
 		);
 		strictEqual(routeCalls.length, 0);
 	});
 
-	it("end to end: a Tier: field declared in the task queue reaches route() verbatim", () => {
+	it("end to end: RequiredCapability reaches route() as requiredCapability", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
-### Task 1.1: Declared-tier task
+### Task 1.1: Declared-capability task
 - **Status:** pending
 - **Files:** src/a.mjs
-- **Tier:** high
+- **RequiredCapability:** high
 - **Description:** format the readme
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5029,11 +5153,11 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
 			checkpointPath,
-			dependencies: tierCapturingContext(routeCalls),
+			dependencies: capabilityCapturingContext(routeCalls),
 		});
 
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].tier, "high");
+		strictEqual(routeCalls[0].requiredCapability, "high");
 	});
 });
 

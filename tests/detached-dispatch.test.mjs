@@ -103,7 +103,7 @@ beforeEach(async () => {
 	tasksFile = join(dir, "tasks.md");
 	writeFileSync(
 		tasksFile,
-		"### Task 1.1: Test task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
 		"utf8",
 	);
 	projectDir = join(dir, "project");

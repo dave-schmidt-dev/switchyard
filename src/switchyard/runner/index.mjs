@@ -44,7 +44,7 @@ import {
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
-import { classifyTask, isValidTier } from "../roster/classifier.mjs";
+import { classifyTask, isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
 	normalizeProviderName,
 	resolveRouteProvenance,
@@ -243,7 +243,7 @@ export function resolveOrchestrator(dependencies = {}) {
  *   - **Description:** ...
  *
  * @param {string} markdown
- * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, allowManifests: boolean, timeoutMs: number|null, tier: string|null, type: string}>}
+ * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, allowManifests: boolean, timeoutMs: number|null, requiredCapability: string|null, executor: string, type: string}>}
  */
 export function parseTaskQueue(markdown) {
 	const tasks = [];
@@ -261,6 +261,12 @@ export function parseTaskQueue(markdown) {
 			descriptionMatch?.[1] ?? block.replace(/- \*\*Status:\*\*\s*.*/gi, "");
 		const fullPrompt = `### Task ${id.trim()}: ${title.trim()}\n${block.trim()}`;
 		const taskId = id.trim();
+
+		if (hasTaskField(block, "Tier")) {
+			throw new Error(
+				`Task ${taskId}: Tier is a retired task-contract field; use RequiredCapability instead (Tier is not an alias)`,
+			);
+		}
 
 		let requiredPaths = null;
 		const filesLine = block
@@ -282,20 +288,8 @@ export function parseTaskQueue(markdown) {
 			timeoutMs = parseTimeoutField(timeoutValue, taskId);
 		}
 
-		// Task 2.1: an upstream task-queue author can declare a tier explicitly
-		// rather than leaving it to classifyTask's keyword inference (INV-5
-		// right-sizing). Absent is fine (executeTask falls back to
-		// classifyTask); present-but-invalid is not — same fail-closed
-		// convention as Files:/Timeout: above, not the silent lowest-tier
-		// coercion this replaces (see resolveTaskTier / passesCapabilityFilter).
-		let tier = null;
-		const tierLine = block
-			.split("\n")
-			.find((line) => /^- \*\*Tier:\*\*\s/.test(line));
-		if (tierLine) {
-			const tierValue = tierLine.replace(/^- \*\*Tier:\*\*\s*/, "").trim();
-			tier = parseTierField(tierValue, taskId);
-		}
+		const requiredCapability = parseRequiredCapabilityField(block, taskId);
+		const executor = parseExecutorField(block, taskId);
 
 		let type = "implementation";
 		const typeLine = block
@@ -306,9 +300,13 @@ export function parseTaskQueue(markdown) {
 			type = parseTypeField(typeValue, taskId);
 		}
 
-		if (type === "implementation" && requiredPaths === null) {
+		if (
+			executor === "switchyard" &&
+			type === "implementation" &&
+			requiredPaths === null
+		) {
 			throw new Error(
-				`Task ${taskId}: implementation-type task requires a Files: field (declare Type: review to exempt review tasks)`,
+				`Task ${taskId}: switchyard implementation task requires a Files: field (declare project-relative paths)`,
 			);
 		}
 
@@ -342,7 +340,8 @@ export function parseTaskQueue(markdown) {
 			requiredPaths,
 			allowManifests,
 			timeoutMs,
-			tier,
+			requiredCapability,
+			executor,
 			type,
 		});
 	}
@@ -387,29 +386,89 @@ function parseTimeoutField(raw, taskId) {
 	return ms;
 }
 
+function getTaskFieldValues(block, fieldName) {
+	const fieldPattern = new RegExp(`^- \\*\\*${fieldName}:\\*\\*(?:\\s(.*))?$`);
+	return block.split("\n").flatMap((line) => {
+		const match = line.match(fieldPattern);
+		return match ? [match[1] ?? ""] : [];
+	});
+}
+
+function hasTaskField(block, fieldName) {
+	const fieldPattern = new RegExp(`^- \\*\\*${fieldName}:\\*\\*(?:\\s|$)`, "i");
+	return block.split("\n").some((line) => fieldPattern.test(line));
+}
+
 /**
- * Parse and validate a per-task `Tier:` declaration (Task 2.1). Same
- * fail-closed convention as parseTimeoutField/parseFilePaths: an
- * unrecognized value throws immediately rather than being silently accepted
- * — never coerced to a default tier here.
- * @param {string} raw The raw value of the Tier field, e.g. "standard"
+ * Parse the exact task-contract `RequiredCapability:` field. This boundary
+ * deliberately keeps the router's internal capability-class vocabulary private
+ * runner: the retired `Tier:` task field is rejected above, never aliased.
+ * @param {string} block Task markdown block
  * @param {string} taskId Task identifier for error messages
- * @returns {string} normalized tier ('high'|'standard'|'low')
- * @throws {Error} If the value isn't a recognized tier
+ * @returns {string|null} normalized capability or null when absent
  */
-function parseTierField(raw, taskId) {
-	const trimmed = raw.trim().toLowerCase();
-	if (!isValidTier(trimmed)) {
+function parseRequiredCapabilityField(block, taskId) {
+	const values = getTaskFieldValues(block, "RequiredCapability");
+	if (values.length === 0) return null;
+	if (values.length > 1) {
 		throw new Error(
-			`Task ${taskId}: invalid Tier field "${raw.trim()}" (expected one of: high, standard, low)`,
+			`Task ${taskId}: duplicate RequiredCapability declarations are not allowed`,
 		);
 	}
-	return trimmed;
+
+	const raw = values[0].trim();
+	if (!raw) {
+		throw new Error(`Task ${taskId}: RequiredCapability field is empty`);
+	}
+	if (/[,|/]+|\s/.test(raw)) {
+		throw new Error(
+			`Task ${taskId}: mixed RequiredCapability declaration "${raw}" is not allowed; declare exactly one of high, standard, or low`,
+		);
+	}
+
+	const normalized = raw.toLowerCase();
+	if (!isValidCapabilityClass(normalized)) {
+		throw new Error(
+			`Task ${taskId}: invalid RequiredCapability field "${raw}" (expected one of: high, standard, low)`,
+		);
+	}
+	return normalized;
+}
+
+/**
+ * Parse the required task-contract `Executor:` field. Programmatic task
+ * objects may still omit it at the runner boundary; markdown task contracts
+ * may not.
+ * @param {string} block Task markdown block
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string} normalized executor
+ */
+function parseExecutorField(block, taskId) {
+	const values = getTaskFieldValues(block, "Executor");
+	if (values.length === 0) {
+		throw new Error(
+			`Task ${taskId}: missing Executor field (expected one of: native, switchyard, human)`,
+		);
+	}
+	if (values.length > 1) {
+		throw new Error(
+			`Task ${taskId}: duplicate Executor declarations are not allowed`,
+		);
+	}
+
+	const raw = values[0].trim();
+	const normalized = raw.toLowerCase();
+	if (!raw || !["native", "switchyard", "human"].includes(normalized)) {
+		throw new Error(
+			`Task ${taskId}: invalid Executor field "${raw}" (expected one of: native, switchyard, human)`,
+		);
+	}
+	return normalized;
 }
 
 /**
  * Parse and validate a per-task `Type:` field (`implementation` | `review`).
- * Same fail-closed convention as parseTierField: an unrecognized value throws
+ * Same fail-closed convention as parseRequiredCapabilityField: an unrecognized value throws
  * immediately with the offending value in the message.
  * @param {string} raw The raw value of the Type field, e.g. "review"
  * @param {string} taskId Task identifier for error messages
@@ -757,28 +816,59 @@ export async function waitForJobCompletion(options) {
 }
 
 /**
- * Resolve the tier to route a task at (Task 2.1 — respect the
- * upstream-declared tier). A declared `task.tier` (parseTaskQueue's `Tier:`
- * field) takes precedence over classifyTask's keyword inference, but only
- * when it is both present AND valid — an invalid/unrecognized declared tier
- * is rejected outright (fail closed, INV-5) rather than silently falling
- * back to classifyTask or reaching the roster's tier-order lookup, which
- * would otherwise coerce an unrecognized string to the least-restrictive
- * tier. classifyTask only runs when the tier is fully ABSENT from the task.
- * @param {{id: string, tier?: string|null, description?: string, title?: string}} task
- * @returns {string} tier ('high'|'standard'|'low')
- * @throws {Error} if task.tier is present but not a recognized tier
+ * Resolve the task executor. Missing Executor retains the existing
+ * Switchyard-routed behavior; present values are fail-closed.
+ * @param {{id: string, executor?: string, description?: string, title?: string}} task
+ * @returns {string} executor ('native'|'switchyard'|'human')
+ * @throws {Error} if task.executor is present but invalid
  */
-function resolveTaskTier(task) {
-	if (task.tier != null) {
-		if (!isValidTier(task.tier)) {
+function resolveTaskExecutor(task) {
+	if (!Object.hasOwn(task, "executor")) return "switchyard";
+	if (["native", "switchyard", "human"].includes(task.executor)) {
+		return task.executor;
+	}
+	throw new Error(
+		`Task ${task.id}: invalid Executor field "${task.executor}" (expected one of: native, switchyard, human)`,
+	);
+}
+
+/**
+ * Resolve the required capability from the task contract. A declared
+ * `task.requiredCapability` takes precedence over classifyTask's keyword
+ * inference. The retired `task.tier` input is rejected rather than accepted
+ * as a compatibility alias. classifyTask only runs when the capability is
+ * fully absent from the task.
+ * @param {{id: string, requiredCapability?: string|null, tier?: unknown, description?: string, title?: string}} task
+ * @returns {string} required capability ('high'|'standard'|'low')
+ * @throws {Error} if a retired task.tier or invalid capability is present
+ */
+function resolveTaskRequiredCapability(task) {
+	if (Object.hasOwn(task, "tier")) {
+		throw new Error(
+			`Task ${task.id}: Tier is a retired task-contract field; use requiredCapability instead (Tier is not an alias)`,
+		);
+	}
+	if (task.requiredCapability != null) {
+		if (!isValidCapabilityClass(task.requiredCapability)) {
 			throw new Error(
-				`Task ${task.id}: invalid declared tier "${task.tier}" (expected one of: high, standard, low) — refusing to silently route at a fallback tier`,
+				`Task ${task.id}: invalid declared RequiredCapability "${task.requiredCapability}" (expected one of: high, standard, low) — refusing to silently route at a fallback capability`,
 			);
 		}
-		return task.tier;
+		return task.requiredCapability;
 	}
 	return classifyTask(task.description || task.title);
+}
+
+function nonSwitchyardExecutorResult(task, executor, requiredCapability) {
+	return {
+		taskId: task.id,
+		success: false,
+		provider: null,
+		model: null,
+		requiredCapability,
+		result: "executor_not_switchyard",
+		reason: `Task ${task.id} declares Executor: ${executor}; Switchyard does not route ${executor} tasks to a provider`,
+	};
 }
 
 /**
@@ -787,9 +877,13 @@ function resolveTaskTier(task) {
  * @param {object} context
  */
 export function executeTask(task, context) {
-	const tier = resolveTaskTier(task);
+	const executor = resolveTaskExecutor(task);
+	const requiredCapability = resolveTaskRequiredCapability(task);
+	if (executor !== "switchyard") {
+		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
+	}
 	const routeResult = context.route({
-		tier,
+		requiredCapability,
 		availableProviders: Object.keys(context.adapters ?? {}),
 		exclude: context.exclude,
 		only: context.only,
@@ -800,10 +894,13 @@ export function executeTask(task, context) {
 	// a local `record()` that spreads them in. Doing it here — not at each of
 	// the recordDispatch call sites below — means no dispatch record can omit
 	// provenance, and adds it in exactly one place per execute path.
-	const provenance = resolveRouteProvenance(routeResult.provider, tier);
-	Object.assign(routeResult, provenance);
+	const provenance = resolveRouteProvenance(
+		routeResult.provider,
+		requiredCapability,
+	);
+	Object.assign(routeResult, { requiredCapability }, provenance);
 	const record = (dispatch) =>
-		context.recordDispatch({ ...provenance, ...dispatch });
+		context.recordDispatch({ ...provenance, ...dispatch, requiredCapability });
 
 	if (!routeResult.provider) {
 		record({
@@ -818,6 +915,7 @@ export function executeTask(task, context) {
 			success: false,
 			provider: null,
 			model: null,
+			requiredCapability,
 			result: "no_provider",
 			reason: routeResult.reason,
 		};
@@ -841,6 +939,7 @@ export function executeTask(task, context) {
 			success: false,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "unsupported_provider",
 		};
 	}
@@ -905,6 +1004,7 @@ export function executeTask(task, context) {
 				success: false,
 				provider: routeResult.provider,
 				model: routeResult.model ?? null,
+				requiredCapability,
 				result: "execution_timed_out",
 				error: execution.error ?? null,
 				timedOut: true,
@@ -917,6 +1017,7 @@ export function executeTask(task, context) {
 			success: false,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "execution_failed",
 			error: execution.error ?? null,
 		};
@@ -949,6 +1050,7 @@ export function executeTask(task, context) {
 			success: true,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "success_no_diff",
 		};
 	}
@@ -996,6 +1098,7 @@ export function executeTask(task, context) {
 		success,
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
+		requiredCapability,
 		result: success ? "success" : "integration_failed",
 	};
 	if (!success && !gateResult?.credentialFlagged) {
@@ -1011,9 +1114,13 @@ export function executeTask(task, context) {
  * @returns {Promise<object>}
  */
 export async function executeTaskWithOrchestrator(task, context) {
-	const tier = resolveTaskTier(task);
+	const executor = resolveTaskExecutor(task);
+	const requiredCapability = resolveTaskRequiredCapability(task);
+	if (executor !== "switchyard") {
+		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
+	}
 	const routeResult = context.route({
-		tier,
+		requiredCapability,
 		availableProviders: Object.keys(context.adapters ?? {}),
 		exclude: context.exclude,
 	});
@@ -1021,10 +1128,17 @@ export async function executeTaskWithOrchestrator(task, context) {
 	// Provenance (Task 1.6, M7/M8) — same treatment as executeTask: resolve the
 	// six fields once, attach to routeResult, and route every dispatch record
 	// through the provenance-injecting `record()`.
-	const provenance = resolveRouteProvenance(routeResult.provider, tier);
-	Object.assign(routeResult, provenance);
+	const provenance = resolveRouteProvenance(
+		routeResult.provider,
+		requiredCapability,
+	);
+	Object.assign(routeResult, { requiredCapability }, provenance);
 	const record = async (dispatch) =>
-		await context.recordDispatch({ ...provenance, ...dispatch });
+		await context.recordDispatch({
+			...provenance,
+			...dispatch,
+			requiredCapability,
+		});
 
 	if (!routeResult.provider) {
 		await record({
@@ -1039,6 +1153,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			success: false,
 			provider: null,
 			model: null,
+			requiredCapability,
 			result: "no_provider",
 			reason: routeResult.reason,
 		};
@@ -1067,6 +1182,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			success: false,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "launch_failed",
 		};
 	}
@@ -1097,6 +1213,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			success: false,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: `orchestrator_${waited.state}`,
 			// Propagate the wait result's timeout verdict so the durable
 			// checkpoint record (timedOut: Boolean(result.timedOut)) is
@@ -1122,6 +1239,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			success: false,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "result_fetch_failed",
 		};
 	}
@@ -1139,6 +1257,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			success: false,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "execution_failed",
 		};
 	}
@@ -1170,6 +1289,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			success: true,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
+			requiredCapability,
 			result: "success_no_diff",
 		};
 	}
@@ -1217,6 +1337,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		success,
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
+		requiredCapability,
 		result: success ? "success" : "integration_failed",
 	};
 	if (!success && !gateResult?.credentialFlagged) {

@@ -1,5 +1,5 @@
 // Roster module - provider capability metadata, now roster-backed
-// INV-5: Capability filter ensures (provider, model) meets task tier
+// INV-5: Capability filter ensures (provider, model) meets task required capability
 //
 // Task 1.5 (roster-unification plan): the frozen PROVIDER_CAPABILITIES table
 // this module used to export has been replaced by a load of the canonical
@@ -25,8 +25,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /**
- * Tier vocabulary. Unchanged from the pre-roster module: this is Layer-1
- * tier vocabulary (brief §1), not roster data, so it needs no roster load.
+ * Capability-class vocabulary. Unchanged from the pre-roster module: this is
+ * Layer-1 capability vocabulary (brief §1), not roster data, so it needs no
+ * roster load.
  */
 export const CAPABILITY_CLASS = Object.freeze({
 	high: "high",
@@ -35,20 +36,22 @@ export const CAPABILITY_CLASS = Object.freeze({
 });
 
 /**
- * Tier ordering for comparison. Higher tier = more capability required.
+ * Capability-class ordering for comparison. Higher class = more capability
+ * required.
  */
-export const TIER_ORDER = Object.freeze({
+export const CAPABILITY_CLASS_ORDER = Object.freeze({
 	high: 3,
 	standard: 2,
 	low: 1,
 });
 
-// Internal tier rank used against the roster's own tier names, separate from
-// the public TIER_ORDER (which callers compare CAPABILITY_CLASS values
-// against). Kept internal so a future roster schema change to TIER_ORDER's
-// numbering can't accidentally desync auto-ceiling derivation.
-const TIERS = ["low", "standard", "high"];
-const TIER_RANK = { low: 0, standard: 1, high: 2 };
+// Internal capability-class rank used against the roster's slot keys,
+// separate from the public CAPABILITY_CLASS_ORDER (which callers compare
+// CAPABILITY_CLASS values against). Kept internal so a future roster schema
+// change to CAPABILITY_CLASS_ORDER's numbering can't accidentally desync
+// auto-ceiling derivation.
+const ROSTER_CAPABILITY_CLASSES = ["low", "standard", "high"];
+const CAPABILITY_CLASS_RANK = { low: 0, standard: 1, high: 2 };
 
 const MODEL_STATUSES = new Set(["active", "retired"]);
 
@@ -164,17 +167,17 @@ function validateRosterStructure(data) {
 			continue;
 		}
 
-		for (const tier of TIERS) {
-			const slotList = slots[tier];
+		for (const capabilityClass of ROSTER_CAPABILITY_CLASSES) {
+			const slotList = slots[capabilityClass];
 			if (slotList === undefined) continue;
 			if (!Array.isArray(slotList)) {
 				violations.push(
-					`targets['${targetId}'].slots.${tier} must be an array`,
+					`targets['${targetId}'].slots.${capabilityClass} must be an array`,
 				);
 				continue;
 			}
 			slotList.forEach((slot, idx) => {
-				const where = `targets['${targetId}'].slots.${tier}[${idx}]`;
+				const where = `targets['${targetId}'].slots.${capabilityClass}[${idx}]`;
 				if (!slot || typeof slot !== "object") {
 					violations.push(`${where} must be an object`);
 					return;
@@ -236,7 +239,7 @@ function getRoster() {
 
 /**
  * Derive `auto_routing_ceiling` for a target (brief §3.3/§9.2 — DERIVED,
- * never stored): the highest tier among the target's slots that are active
+ * never stored): the highest capability class among the target's slots that are active
  * (catalog status == "active") + qualified (qualification.status ==
  * "qualified") + non-`manual_only`, on an `enabled` target. Mirrors
  * `_auto_routing_ceiling` in ~/.agent/bin/roster. Returns null if nothing
@@ -254,8 +257,8 @@ function autoRoutingCeiling(target, models) {
 			: {};
 
 	let best = null;
-	for (const tier of TIERS) {
-		const slotList = target.slots?.[tier];
+	for (const capabilityClass of ROSTER_CAPABILITY_CLASSES) {
+		const slotList = target.slots?.[capabilityClass];
 		if (!Array.isArray(slotList)) continue;
 		for (const slot of slotList) {
 			if (!slot || typeof slot !== "object" || slot.manual_only) continue;
@@ -264,7 +267,11 @@ function autoRoutingCeiling(target, models) {
 			const variantKey = qualificationVariantKey(modelEntry, slot);
 			const qual = variantKey ? qualifications[variantKey] : null;
 			if (qual?.status !== "qualified") continue;
-			if (best === null || TIER_RANK[tier] > TIER_RANK[best]) best = tier;
+			if (
+				best === null ||
+				CAPABILITY_CLASS_RANK[capabilityClass] > CAPABILITY_CLASS_RANK[best]
+			)
+				best = capabilityClass;
 		}
 	}
 	return best;
@@ -272,17 +279,18 @@ function autoRoutingCeiling(target, models) {
 
 /**
  * The highest-priority active+qualified non-`manual_only` slot at EXACTLY
- * the given tier, on an `enabled` target (brief §4: "getRightSizedModel
- * returns the highest-priority active+qualified non-manual_only slot for
- * the tier"). Returns the model's selector, or null if nothing qualifies.
+ * the given capability class, on an `enabled` target (brief §4:
+ * "getRightSizedModel returns the highest-priority active+qualified
+ * non-manual_only slot for the capability class"). Returns the model's
+ * selector, or null if nothing qualifies.
  * @param {object} target
  * @param {object} models
- * @param {string} tier
+ * @param {string} capabilityClass
  * @returns {string|null}
  */
-function resolveSlotModel(target, models, tier) {
+function resolveSlotModel(target, models, capabilityClass) {
 	if (!target?.enabled) return null;
-	const slotList = target.slots?.[tier];
+	const slotList = target.slots?.[capabilityClass];
 	if (!Array.isArray(slotList)) return null;
 	const qualifications =
 		target.qualifications && typeof target.qualifications === "object"
@@ -397,7 +405,7 @@ function normalizeImplementorPriority(value) {
 
 /**
  * Compute one PROVIDER_CAPABILITIES-shaped entry (`capability_class` +
- * `models` + `implementor_priority` per tier) for a single target. Shared by
+ * `models` + `implementor_priority` per capability class) for a single target. Shared by
  * the harness-keyed table (buildProviderCapabilities) and the
  * snapshot-name-keyed table (buildSnapshotNameCapabilities) so both stay
  * byte-identical in shape.
@@ -406,13 +414,17 @@ function normalizeImplementorPriority(value) {
  * @returns {{capability_class: string|null, models: object, implementor_priority: number|null}}
  */
 function buildCapabilityEntry(target, models) {
-	const modelsByTier = {};
-	for (const tier of TIERS) {
-		modelsByTier[tier] = resolveSlotModel(target, models, tier);
+	const modelsByCapabilityClass = {};
+	for (const capabilityClass of ROSTER_CAPABILITY_CLASSES) {
+		modelsByCapabilityClass[capabilityClass] = resolveSlotModel(
+			target,
+			models,
+			capabilityClass,
+		);
 	}
 	return {
 		capability_class: autoRoutingCeiling(target, models),
-		models: modelsByTier,
+		models: modelsByCapabilityClass,
 		implementor_priority: normalizeImplementorPriority(
 			target?.implementor_priority,
 		),
@@ -422,7 +434,7 @@ function buildCapabilityEntry(target, models) {
 /**
  * Build the PROVIDER_CAPABILITIES-shaped map from the loaded roster: one
  * entry per known provider/harness key with a `capability_class` (the
- * computed auto_routing_ceiling) and a `models` map of tier -> selector.
+ * computed auto_routing_ceiling) and a `models` map of capability class -> selector.
  *
  * Deliberately stays harness-keyed with exactly one entry per harness, even
  * when two targets share a harness (Task C.5) — router/index.mjs's blind
@@ -431,7 +443,7 @@ function buildCapabilityEntry(target, models) {
  * Disambiguating a specific snapshot-named target (e.g. "Antigravity
  * (Claude)" vs "Antigravity") is buildSnapshotNameCapabilities's job, a
  * separate table consulted BEFORE this one falls back — see
- * getCapabilityClass/getModelForTier below.
+ * getCapabilityClass/getModelForCapability below.
  * @returns {object}
  */
 function buildProviderCapabilities() {
@@ -455,7 +467,7 @@ function buildProviderCapabilities() {
  * `snapshot_name` (Task C.5/C.6) — only targets that declare that field are
  * included, which today means the two agy targets. Kept out of
  * PROVIDER_CAPABILITIES's own key set on purpose (see that function's
- * docstring); getCapabilityClass/getModelForTier consult this table first,
+ * docstring); getCapabilityClass/getModelForCapability consult this table first,
  * by the RAW provider name they were called with, before normalizing to a
  * harness and falling back to the harness-keyed table.
  * @returns {object}
@@ -579,7 +591,7 @@ export function getCapabilityClass(providerName) {
 }
 
 /**
- * Get the model for a provider at a given tier — roster-backed.
+ * Get the model for a provider at a given capability class — roster-backed.
  *
  * Task C.5/C.6: tries an EXACT match against a target's own `snapshot_name`
  * first (disambiguates two targets sharing one harness, e.g. the two agy
@@ -587,14 +599,14 @@ export function getCapabilityClass(providerName) {
  * that snapshot name — i.e. every provider except the two agy targets today,
  * completely unaffected.
  * @param {string} providerName
- * @param {string} tier
+ * @param {string} capabilityClass
  * @returns {string|null} model selector or null if not found
  */
-export function getModelForTier(providerName, tier) {
+export function getModelForCapability(providerName, capabilityClass) {
 	const provider =
 		getSnapshotNameCapabilities()[providerName] ??
 		getProviderCapabilities()[normalizeProviderName(providerName)];
-	return provider?.models?.[tier] ?? null;
+	return provider?.models?.[capabilityClass] ?? null;
 }
 
 /**
@@ -603,7 +615,7 @@ export function getModelForTier(providerName, tier) {
  * `null` when the backing roster target doesn't set `implementor_priority`
  * (the unranked/spread-pool default for every target that doesn't opt in).
  * Same snapshot-name-then-harness lookup order as getCapabilityClass/
- * getModelForTier, so the two simultaneously-enabled agy targets each carry
+ * getModelForCapability, so the two simultaneously-enabled agy targets each carry
  * their own rank rather than colliding on the shared "agy" harness key.
  * @param {string} providerName
  * @returns {number|null}
@@ -617,51 +629,55 @@ export function getImplementorPriority(providerName) {
 
 /**
  * Capability filter - INV-5.
- * A (provider, model) below the task's tier is not a candidate.
+ * A (provider, model) below the task's required capability is not a candidate.
  *
- * Task 2.1: `taskTier` must be a recognized tier name — an unknown/typo'd
- * value is REJECTED (thrown), not coerced to `0` (the lowest/least-
- * restrictive tier). Coercing to 0 was a real INV-5 bypass: an invalid tier
+ * Task 2.1: `requiredCapability` must be a recognized capability class — an
+ * unknown/typo'd value is REJECTED (thrown), not coerced to `0` (the
+ * lowest/least-restrictive capability). Coercing to 0 was a real INV-5 bypass:
+ * an invalid capability
  * would previously pass the filter against every provider regardless of
  * capability. `providerClass` still falls back to `0` on purpose — an
- * unqualified/unknown *provider* class is a normal "doesn't meet any tier"
+ * unqualified/unknown *provider* class is a normal "doesn't meet any
+ * capability"
  * state, not a caller error.
  * @param {string} providerName
- * @param {string} taskTier
- * @returns {boolean} true if provider meets or exceeds the tier
- * @throws {Error} if taskTier is not one of TIER_ORDER's known keys
+ * @param {string} requiredCapability
+ * @returns {boolean} true if provider meets or exceeds the required capability
+ * @throws {Error} if requiredCapability is not one of CAPABILITY_CLASS_ORDER's known keys
  */
-export function passesCapabilityFilter(providerName, taskTier) {
+export function passesCapabilityFilter(providerName, requiredCapability) {
 	const providerClass = getCapabilityClass(providerName);
-	if (!Object.hasOwn(TIER_ORDER, taskTier)) {
+	if (!Object.hasOwn(CAPABILITY_CLASS_ORDER, requiredCapability)) {
 		throw new Error(
-			`passesCapabilityFilter: unrecognized task tier ${JSON.stringify(taskTier)} (expected one of: ${Object.keys(TIER_ORDER).join(", ")}) — refusing to silently treat it as the lowest tier`,
+			`passesCapabilityFilter: unrecognized required capability ${JSON.stringify(requiredCapability)} (expected one of: ${Object.keys(CAPABILITY_CLASS_ORDER).join(", ")}) — refusing to silently treat it as the lowest capability`,
 		);
 	}
-	const taskTierValue = TIER_ORDER[taskTier];
-	const providerTierValue = TIER_ORDER[providerClass] ?? 0;
-	return providerTierValue >= taskTierValue;
+	const requiredCapabilityValue = CAPABILITY_CLASS_ORDER[requiredCapability];
+	const providerCapabilityValue = CAPABILITY_CLASS_ORDER[providerClass] ?? 0;
+	return providerCapabilityValue >= requiredCapabilityValue;
 }
 
 /**
  * Get right-sized model - INV-5.
- * Within the chosen harness, pick the model mapped to the task's tier.
+ * Within the chosen harness, pick the model mapped to the task's required capability.
  * @param {string} providerName
- * @param {string} tier
+ * @param {string} capabilityClass
  * @returns {string|null} model name or null if not found
  */
-export function getRightSizedModel(providerName, tier) {
-	return getModelForTier(providerName, tier);
+export function getRightSizedModel(providerName, capabilityClass) {
+	return getModelForCapability(providerName, capabilityClass);
 }
 
 /**
  * Filter providers by capability.
  * @param {string[]} providerNames
- * @param {string} taskTier
+ * @param {string} requiredCapability
  * @returns {string[]} filtered list of provider names
  */
-export function filterByCapability(providerNames, taskTier) {
-	return providerNames.filter((name) => passesCapabilityFilter(name, taskTier));
+export function filterByCapability(providerNames, requiredCapability) {
+	return providerNames.filter((name) =>
+		passesCapabilityFilter(name, requiredCapability),
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -802,19 +818,19 @@ export function resolveTargetId(identifier) {
 }
 
 /**
- * Resolve the concrete target a provider/harness routes to at a given tier,
+ * Resolve the concrete target a provider/harness routes to at a given capability class,
  * for provenance. All four fields are sourced from the ONE resolved target so
  * they stay mutually truthful (advisor guidance): `resolved_target` is the
  * target id, `resolved_harness` its `harness`, `resolved_selector` the right-
- * sized slot selector for the tier, `resolved_credential_profile` its
+ * sized slot selector for the capability class, `resolved_credential_profile` its
  * `credential_profile`. When no target backs the provider, target and
  * selector are null but the normalized harness is still returned (so adapter
  * selection can fall back to it).
  * @param {string} providerName
- * @param {string} [tier]
+ * @param {string} [capabilityClass]
  * @returns {{resolved_target: string|null, resolved_harness: string|null, resolved_selector: string|null, resolved_credential_profile: string|null}}
  */
-export function resolveTargetProvenance(providerName, tier) {
+export function resolveTargetProvenance(providerName, capabilityClass) {
 	const roster = getRoster();
 	const models =
 		roster.models && typeof roster.models === "object" ? roster.models : {};
@@ -839,7 +855,9 @@ export function resolveTargetProvenance(providerName, tier) {
 		};
 	}
 
-	const selector = tier ? resolveSlotModel(entry.target, models, tier) : null;
+	const selector = capabilityClass
+		? resolveSlotModel(entry.target, models, capabilityClass)
+		: null;
 	return {
 		resolved_target: entry.id,
 		resolved_harness: entry.target.harness ?? harnessKey ?? null,
@@ -867,14 +885,14 @@ export function resolveTargetProvenance(providerName, tier) {
  * already loaded the same roster, so the populated path and the route path are
  * always consistent.
  * @param {string} providerName
- * @param {string} [tier]
+ * @param {string} [capabilityClass]
  * @returns {{roster_schema_version: number|null, roster_sha256: string|null, resolved_target: string|null, resolved_harness: string|null, resolved_selector: string|null, resolved_credential_profile: string|null}}
  */
-export function resolveRouteProvenance(providerName, tier) {
+export function resolveRouteProvenance(providerName, capabilityClass) {
 	try {
 		return {
 			...getRosterProvenance(),
-			...resolveTargetProvenance(providerName, tier),
+			...resolveTargetProvenance(providerName, capabilityClass),
 		};
 	} catch {
 		return {

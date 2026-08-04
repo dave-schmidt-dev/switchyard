@@ -38,13 +38,13 @@ import { fileURLToPath } from "node:url";
 import {
 	__resetRosterCacheForTests,
 	CAPABILITY_CLASS,
+	CAPABILITY_CLASS_ORDER,
 	filterByCapability,
 	getCapabilityClass,
-	getModelForTier,
+	getModelForCapability,
 	getRightSizedModel,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
-	TIER_ORDER,
 } from "../src/switchyard/roster/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -80,16 +80,16 @@ after(() => {
 });
 
 describe("capability match", () => {
-	it("should define capability classes (static tier vocabulary, unaffected by the roster)", () => {
+	it("should define capability classes (static vocabulary, unaffected by the roster)", () => {
 		strictEqual(CAPABILITY_CLASS.high, "high");
 		strictEqual(CAPABILITY_CLASS.standard, "standard");
 		strictEqual(CAPABILITY_CLASS.low, "low");
 	});
 
-	it("should define tier ordering (static tier vocabulary, unaffected by the roster)", () => {
-		strictEqual(TIER_ORDER.high, 3);
-		strictEqual(TIER_ORDER.standard, 2);
-		strictEqual(TIER_ORDER.low, 1);
+	it("should define capability-class ordering (static vocabulary, unaffected by the roster)", () => {
+		strictEqual(CAPABILITY_CLASS_ORDER.high, 3);
+		strictEqual(CAPABILITY_CLASS_ORDER.standard, 2);
+		strictEqual(CAPABILITY_CLASS_ORDER.low, 1);
 	});
 
 	it("should derive provider capability classes from the roster's computed auto_routing_ceiling", () => {
@@ -127,12 +127,12 @@ describe("capability match", () => {
 	});
 
 	it("should get model for provider and tier (fixture selectors, not a hardcoded production model id)", () => {
-		strictEqual(getModelForTier("claude", "high"), "fixture-claude-high");
+		strictEqual(getModelForCapability("claude", "high"), "fixture-claude-high");
 		strictEqual(
-			getModelForTier("claude", "standard"),
+			getModelForCapability("claude", "standard"),
 			"fixture-claude-standard",
 		);
-		strictEqual(getModelForTier("claude", "low"), "fixture-claude-low");
+		strictEqual(getModelForCapability("claude", "low"), "fixture-claude-low");
 	});
 
 	it("should get right-sized model", () => {
@@ -238,7 +238,7 @@ describe("capability match — INV-5 safety property", () => {
 	it("low-capability targets are excluded from high-tier routing even though they are enabled and qualified at their own tier", () => {
 		// opencode-go is enabled and genuinely qualified at low -- it is a
 		// legitimate low-tier target, not a broken one -- yet it must still
-		// be excluded the moment the task tier exceeds its ceiling.
+		// be excluded the moment the required capability exceeds its ceiling.
 		strictEqual(passesCapabilityFilter("opencode", "low"), true);
 		strictEqual(getRightSizedModel("opencode", "low"), "fixture/opencode-low");
 		strictEqual(passesCapabilityFilter("opencode", "standard"), false);
@@ -254,21 +254,21 @@ describe("capability match — INV-5 safety property", () => {
 		}
 	});
 
-	// Task 2.1: an unrecognized/typo'd task tier must be REJECTED, not
-	// silently coerced to `0` (the lowest/least-restrictive tier) the way
-	// `TIER_ORDER[taskTier] ?? 0` used to. That coercion was a real INV-5
+	// Task 2.1: an unrecognized/typo'd required capability must be REJECTED,
+	// not silently coerced to `0` (the lowest/least-restrictive capability) the
+	// way `CAPABILITY_CLASS_ORDER[requiredCapability] ?? 0` used to. That coercion was a real INV-5
 	// bypass -- every provider, including a disabled one, would pass the
-	// filter against a garbage tier string.
-	it("passesCapabilityFilter throws on an unrecognized task tier instead of treating it as tier 0", () => {
+	// filter against a garbage capability string.
+	it("passesCapabilityFilter throws on an unrecognized required capability instead of treating it as capability 0", () => {
 		throws(
 			() => passesCapabilityFilter("claude", "urgent"),
-			/unrecognized task tier/,
+			/unrecognized required capability/,
 		);
 		// Specifically: it must NOT silently pass every provider (the old `?? 0`
 		// bypass would have made even a disabled target pass).
 		throws(
 			() => passesCapabilityFilter("vibe", "urgent"),
-			/unrecognized task tier/,
+			/unrecognized required capability/,
 		);
 	});
 });

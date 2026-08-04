@@ -1,8 +1,9 @@
 // Router module - selects provider for task dispatch
 // INV-4: Dispatch only to funded providers, spreading load across funded providers
 // INV-5: Capability filter applied before spread selection
-// Low-tier economics: easy tasks become eligible for cheap/low-cost lanes (e.g. opencode-go),
-// while high-tier tasks remain reserved for high-capability providers (Claude/Codex).
+// Low-capability economics: easy tasks become eligible for cheap/low-cost
+// lanes (e.g. opencode-go), while high-capability tasks remain reserved for
+// high-capability providers (Claude/Codex).
 // INV-4 most-headroom spread selects among eligible lanes without cost-override or fixed ratios.
 //
 // Reuses review-plugin's capacity scoring (0.9·pace + 0.1·jitter, floor/skip, blind fallback)
@@ -114,7 +115,7 @@ function indexProviders(snapshot) {
  * Filters: not absent from snapshot (CR-3), not exhausted (below floor),
  * capability filter (INV-5) applied before spread selection.
  * Spread: pick highest headroom among eligible.
- * Model: right-sized to task tier (INV-5).
+ * Model: right-sized to the task's required capability (INV-5).
  *
  * @param {object} options
  * @param {number} [options.seed] Explicit seed
@@ -122,12 +123,13 @@ function indexProviders(snapshot) {
  * @param {string[]} [options.exclude] Provider names to explicitly exclude
  * @param {string[]} [options.only] Provider names/target ids to restrict routing to. Mutually exclusive with exclude at the CLI layer, which rejects that combination before it reaches here; if both were passed directly to route() anyway, exclude is checked first and wins for any name present in both lists.
  * @param {number} [options.floor] Percent left floor (default: DEFAULT_FLOOR)
- * @param {string} [options.tier] Task difficulty tier (high/standard/low) for INV-5
+ * @param {string} [options.requiredCapability] Required capability class
+ *   (high/standard/low) for INV-5
  * @param {string[]} [options.availableProviders] Restrict candidates to providers
  *   the caller can actually dispatch to (e.g. the runner's registered adapters).
  *   Omit to consider every roster/snapshot provider (existing behavior).
  * @returns {{provider: string|null, model: string|null, percentLeft: number|null,
- *   reason: string, log: string[]}} Routing result
+ *   requiredCapability: string, reason: string, log: string[]}} Routing result
  */
 export function route(options = {}) {
 	const {
@@ -136,7 +138,7 @@ export function route(options = {}) {
 		exclude = [],
 		only = [],
 		floor = DEFAULT_FLOOR,
-		tier,
+		requiredCapability,
 		availableProviders,
 	} = options;
 	// Resolve the routing seed up front; it feeds the scorer's deterministic
@@ -145,8 +147,9 @@ export function route(options = {}) {
 	const { seed: routeSeed } = resolveSeed({ seed, runId });
 	const log = [];
 
-	// Default tier is high for conservative routing (unknown tier => high-capability only)
-	const effectiveTier = tier ?? CAPABILITY_CLASS.high;
+	// Default capability is high for conservative routing (unknown capability
+	// => high-capability only).
+	const effectiveCapabilityClass = requiredCapability ?? CAPABILITY_CLASS.high;
 	const isAvailable = (name) => {
 		if (!availableProviders) return true;
 		const norm = normalizeProviderName(name);
@@ -165,17 +168,18 @@ export function route(options = {}) {
 		const blindOrder = Object.keys(PROVIDER_CAPABILITIES).filter(
 			(name) =>
 				isAvailable(name) &&
-				passesCapabilityFilter(name, effectiveTier) &&
+				passesCapabilityFilter(name, effectiveCapabilityClass) &&
 				(only.length === 0 || only.some((o) => providerMatches(o, name))),
 		);
 		const blind = routeBlind(blindOrder, exclude);
 		const model = blind.provider
-			? getRightSizedModel(blind.provider, effectiveTier)
+			? getRightSizedModel(blind.provider, effectiveCapabilityClass)
 			: null;
 		return {
 			...blind,
 			model,
 			percentLeft: null,
+			requiredCapability: effectiveCapabilityClass,
 			log: [...log, `blind candidates: ${blindOrder.join(", ") || "none"}`],
 		};
 	}
@@ -251,11 +255,12 @@ export function route(options = {}) {
 			continue;
 		}
 
-		// INV-5: Capability filter - skip providers below task tier
-		if (!passesCapabilityFilter(name, effectiveTier)) {
+		// INV-5: Capability filter - skip providers below the task's required
+		// capability.
+		if (!passesCapabilityFilter(name, effectiveCapabilityClass)) {
 			ceilingSkips += 1;
 			log.push(
-				`provider ${name}: below capability threshold for tier ${effectiveTier}`,
+				`provider ${name}: below required capability ${effectiveCapabilityClass}`,
 			);
 			continue;
 		}
@@ -406,8 +411,8 @@ export function route(options = {}) {
 			const allPaces = tied.map((s) => s.pace);
 			let bestScore = Number.NEGATIVE_INFINITY;
 			for (const s of tied) {
-				const model = getRightSizedModel(s.name, effectiveTier);
-				const key = `${s.name}:${model ?? effectiveTier}`;
+				const model = getRightSizedModel(s.name, effectiveCapabilityClass);
+				const key = `${s.name}:${model ?? effectiveCapabilityClass}`;
 				const { score } = computeScore(s.pace, routeSeed, key, allPaces);
 				if (score > bestScore) {
 					bestScore = score;
@@ -476,6 +481,7 @@ export function route(options = {}) {
 			provider: null,
 			model: null,
 			percentLeft: null,
+			requiredCapability: effectiveCapabilityClass,
 			reason: noEligibleReason,
 			log,
 		};
@@ -485,15 +491,18 @@ export function route(options = {}) {
 	log.push(`winner: ${winner.name} with ${winner.percentLeft}% left`);
 
 	// INV-5: Model right-sizing
-	const model = getRightSizedModel(winner.name, effectiveTier);
+	const model = getRightSizedModel(winner.name, effectiveCapabilityClass);
 	if (!model) {
-		log.push(`no model for ${winner.name} at tier ${effectiveTier}`);
+		log.push(
+			`no model for ${winner.name} at required capability ${effectiveCapabilityClass}`,
+		);
 	}
 
 	return {
 		provider: winner.name,
 		model,
 		percentLeft: winner.percentLeft,
+		requiredCapability: effectiveCapabilityClass,
 		reason,
 		log,
 	};

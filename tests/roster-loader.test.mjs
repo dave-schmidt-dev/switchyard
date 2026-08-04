@@ -18,15 +18,15 @@ import { fileURLToPath } from "node:url";
 import {
 	__resetRosterCacheForTests,
 	CAPABILITY_CLASS,
+	CAPABILITY_CLASS_ORDER,
 	filterByCapability,
 	getCapabilityClass,
 	getImplementorPriority,
-	getModelForTier,
+	getModelForCapability,
 	getRightSizedModel,
 	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
-	TIER_ORDER,
 } from "../src/switchyard/roster/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -228,14 +228,14 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 });
 
 describe("roster loader — preserved exports, roster-backed (committed fixture)", () => {
-	it("CAPABILITY_CLASS and TIER_ORDER are static tier vocabulary, unaffected by the roster", () => {
+	it("CAPABILITY_CLASS and CAPABILITY_CLASS_ORDER are static capability vocabulary, unaffected by the roster", () => {
 		// No SWITCHYARD_ROSTER_PATH needed at all — these never touch the roster.
 		strictEqual(CAPABILITY_CLASS.high, "high");
 		strictEqual(CAPABILITY_CLASS.standard, "standard");
 		strictEqual(CAPABILITY_CLASS.low, "low");
-		strictEqual(TIER_ORDER.high, 3);
-		strictEqual(TIER_ORDER.standard, 2);
-		strictEqual(TIER_ORDER.low, 1);
+		strictEqual(CAPABILITY_CLASS_ORDER.high, 3);
+		strictEqual(CAPABILITY_CLASS_ORDER.standard, 2);
+		strictEqual(CAPABILITY_CLASS_ORDER.low, 1);
 	});
 
 	it("normalizeProviderName is unchanged pure vocabulary, unaffected by the roster", () => {
@@ -258,7 +258,7 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 		]);
 	});
 
-	it("getRightSizedModel/getModelForTier return the fixture's per-tier selectors", () => {
+	it("getRightSizedModel/getModelForCapability return the fixture's per-class selectors", () => {
 		setRosterPath(FIXTURE_PATH);
 		strictEqual(getRightSizedModel("claude", "low"), "fixture-claude-low");
 		strictEqual(
@@ -266,7 +266,7 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 			"fixture-claude-standard",
 		);
 		strictEqual(getRightSizedModel("claude", "high"), "fixture-claude-high");
-		strictEqual(getModelForTier("codex", "high"), "fixture-codex-high");
+		strictEqual(getModelForCapability("codex", "high"), "fixture-codex-high");
 	});
 
 	it("passesCapabilityFilter derives from the computed auto_routing_ceiling, not a static table", () => {

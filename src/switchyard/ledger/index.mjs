@@ -47,6 +47,7 @@ function ensureLogDir() {
  * @param {string} dispatch.model Model name
  * @param {string} dispatch.taskId Task identifier
  * @param {string} dispatch.result Dispatch result status
+ * @param {string} [dispatch.requiredCapability] Resolved capability class
  * @param {string} [dispatch.reason] Routing reason
  * @param {number} [dispatch.percentLeft] Provider percent left at dispatch time
  */
@@ -108,6 +109,7 @@ function resolveLedgerPath(runStorePath) {
  * @param {string} data.model
  * @param {string} data.taskId
  * @param {string} data.result
+ * @param {string} [data.requiredCapability]
  * @param {string} [data.reason]
  * @param {number} [data.percentLeft]
  * @param {string} [runStorePath] - defaults to getStateRoot()

@@ -106,7 +106,7 @@ beforeEach(async () => {
 	tasksFile = join(dir, "tasks.md");
 	writeFileSync(
 		tasksFile,
-		"### Task 1.1: Test task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
 		"utf8",
 	);
 	projectDir = join(dir, "project");
@@ -936,7 +936,7 @@ describe("run subcommand via spawn", () => {
 		const tasksPath = join(dir, "run-tasks.md");
 		writeFileSync(
 			tasksPath,
-			"### Task 1.1: Test run task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Run test\n",
+			"### Task 1.1: Test run task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Run test\n",
 			"utf8",
 		);
 

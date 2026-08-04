@@ -34,7 +34,7 @@ import { fileURLToPath } from "node:url";
 import {
 	__resetRosterCacheForTests,
 	getCapabilityClass,
-	getModelForTier,
+	getModelForCapability,
 	getRightSizedModel,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
@@ -102,23 +102,23 @@ function removeSnapshot() {
 }
 
 describe("capability gate functions resolve each agy target INDEPENDENTLY (C.5/C.6)", () => {
-	it("getModelForTier returns the CORRECT target's selector for each snapshot name", () => {
+	it("getModelForCapability returns the CORRECT target's selector for each snapshot name", () => {
 		strictEqual(
-			getModelForTier(ANTIGRAVITY_CLAUDE, "standard"),
+			getModelForCapability(ANTIGRAVITY_CLAUDE, "standard"),
 			"fixture-agy-claude-standard",
 		);
 		strictEqual(
-			getModelForTier(ANTIGRAVITY, "standard"),
+			getModelForCapability(ANTIGRAVITY, "standard"),
 			"fixture-agy-gemini-standard",
 		);
 		notStrictEqual(
-			getModelForTier(ANTIGRAVITY_CLAUDE, "standard"),
-			getModelForTier(ANTIGRAVITY, "standard"),
+			getModelForCapability(ANTIGRAVITY_CLAUDE, "standard"),
+			getModelForCapability(ANTIGRAVITY, "standard"),
 			"the two agy-harness targets must never collapse to the same model",
 		);
 	});
 
-	it("getRightSizedModel is consistent with getModelForTier for both targets", () => {
+	it("getRightSizedModel is consistent with getModelForCapability for both targets", () => {
 		strictEqual(
 			getRightSizedModel(ANTIGRAVITY_CLAUDE, "standard"),
 			"fixture-agy-claude-standard",
@@ -145,7 +145,7 @@ describe("capability gate functions resolve each agy target INDEPENDENTLY (C.5/C
 		// fallback reads Object.keys(PROVIDER_CAPABILITIES) directly (line ~135)
 		// to build its candidate order, and that list must contain "agy" exactly
 		// once, not once per agy-harness target. Disambiguation must live in a
-		// path getCapabilityClass/getModelForTier consult BEFORE falling back to
+		// path getCapabilityClass/getModelForCapability consult BEFORE falling back to
 		// the harness-keyed table, not in the table's own key set.
 		const keys = Object.keys(PROVIDER_CAPABILITIES);
 		const agyCount = keys.filter((k) => k === "agy").length;
@@ -171,7 +171,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 				windows: [{ percent_left: 40, pace_delta: 0 }],
 			},
 		]);
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, ANTIGRAVITY_CLAUDE);
 		strictEqual(result.model, "fixture-agy-claude-standard");
 	});
@@ -189,7 +189,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 				windows: [{ percent_left: 95, pace_delta: 0 }],
 			},
 		]);
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, ANTIGRAVITY);
 		strictEqual(result.model, "fixture-agy-gemini-standard");
 	});
@@ -211,7 +211,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 				windows: [{ percent_left: 50, pace_delta: 0 }],
 			},
 		]);
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		const mentionsClaude = result.log.some((line) =>
 			line.includes(ANTIGRAVITY_CLAUDE),
 		);
@@ -228,7 +228,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 
 	it("blind fallback (no snapshot) does not crash and does not double-count the agy harness", () => {
 		removeSnapshot();
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		ok(
 			result.log.some((line) => line.startsWith("snapshot invalid or missing")),
 			"expected the blind-routing path to have been taken",

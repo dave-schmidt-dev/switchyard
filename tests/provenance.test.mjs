@@ -4,7 +4,8 @@
 // roster_sha256, resolved_target, resolved_harness, resolved_selector,
 // resolved_credential_profile — so a ledger entry is self-describing: which
 // roster (identity + version) routed it, and to which concrete
-// target/harness/selector/credential profile. This suite proves:
+// target/harness/selector/credential profile. It also carries the resolved
+// required capability. This suite proves:
 //   1. computeRosterSha is a PURE function that EXCLUDES the mutable
 //      qualifications block (PM-12/SR-4) but still reflects real catalog/target
 //      changes — tested by comparing two in-memory objects, not by fighting the
@@ -126,6 +127,7 @@ const TASK = {
 	title: "trivial task",
 	description: "trivial task",
 	prompt: "do the thing",
+	requiredCapability: "low",
 	requiredPaths: null,
 };
 
@@ -311,6 +313,8 @@ describe("executeTask — every dispatch record carries all six provenance field
 		strictEqual(dispatches.length, 1);
 		const rec = dispatches[0];
 		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.requiredCapability, "low");
+		strictEqual(result.requiredCapability, "low");
 		strictEqual(rec.roster_schema_version, 1);
 		ok(/^[0-9a-f]{64}$/.test(rec.roster_sha256));
 		strictEqual(rec.resolved_target, "opencode-go");
@@ -377,6 +381,7 @@ describe("executeTask — every dispatch record carries all six provenance field
 		strictEqual(routeResultObj.resolved_target, "opencode-go");
 		strictEqual(routeResultObj.resolved_harness, "opencode");
 		strictEqual(routeResultObj.resolved_credential_profile, "go");
+		strictEqual(routeResultObj.requiredCapability, "low");
 	});
 });
 
@@ -425,7 +430,7 @@ function makeDefaultWiringFixture(taskId) {
 	const tasksFilePath = join(tmpDir, `${taskId}.md`);
 	writeFileSync(
 		tasksFilePath,
-		"### Task 1.1: Default ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Description:** write matching ledger records\n",
+		"### Task 1.1: Default ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **Description:** write matching ledger records\n",
 		"utf8",
 	);
 
@@ -499,6 +504,7 @@ function assertMatchingLedgerRecords(legacyRecord, storeRecord) {
 		"result",
 		"reason",
 		"percentLeft",
+		"requiredCapability",
 		...PROVENANCE_KEYS,
 	]) {
 		strictEqual(storeRecord[key], legacyRecord[key], `matching ${key}`);
@@ -522,10 +528,12 @@ describe("executeTaskWithOrchestrator — every dispatch record carries all six 
 
 		const result = await executeTaskWithOrchestrator(TASK, context);
 		strictEqual(result.result, "success_no_diff");
+		strictEqual(result.requiredCapability, "low");
 
 		strictEqual(dispatches.length, 1);
 		const rec = dispatches[0];
 		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.requiredCapability, "low");
 		strictEqual(rec.roster_schema_version, 1);
 		ok(/^[0-9a-f]{64}$/.test(rec.roster_sha256));
 		strictEqual(rec.resolved_target, "opencode-go");
@@ -550,10 +558,12 @@ describe("executeTaskWithOrchestrator — every dispatch record carries all six 
 
 		const result = await executeTaskWithOrchestrator(TASK, context);
 		strictEqual(result.result, "launch_failed");
+		strictEqual(result.requiredCapability, "low");
 
 		strictEqual(dispatches.length, 1);
 		const rec = dispatches[0];
 		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
+		strictEqual(rec.requiredCapability, "low");
 		strictEqual(rec.resolved_target, "claude-code");
 		strictEqual(rec.resolved_harness, "claude");
 		ok(
@@ -622,11 +632,15 @@ describe("default runner ledger wiring", () => {
 				"### Task 1.1: First ordered ledger task",
 				"- **Status:** pending",
 				"- **Type:** review",
+				"- **Executor:** switchyard",
+				"- **RequiredCapability:** low",
 				"- **Description:** first ordered task",
 				"",
 				"### Task 1.2: Second ordered ledger task",
 				"- **Status:** pending",
 				"- **Type:** review",
+				"- **Executor:** switchyard",
+				"- **RequiredCapability:** low",
 				"- **Description:** second ordered task",
 				"",
 			].join("\n"),
@@ -695,7 +709,7 @@ describe("default runner ledger wiring", () => {
 			);
 			writeFileSync(
 				orchestratorTasksFilePath,
-				"### Task 1.1: Override ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Description:** use the injected recorder\n",
+				"### Task 1.1: Override ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **Description:** use the injected recorder\n",
 				"utf8",
 			);
 			await runQueueWithOrchestrator({
@@ -832,6 +846,7 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 			resolved_harness: "opencode",
 			resolved_selector: "fixture/opencode-low",
 			resolved_credential_profile: "go",
+			requiredCapability: "low",
 		};
 		await recordDispatchToStore(
 			{

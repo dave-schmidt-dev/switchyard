@@ -1,14 +1,15 @@
-// Classifier module - lightweight task-tier classifier
-// CR-5: The per-task difficulty tier is assigned by a lightweight classifier
-// since implement-protocol assigns tiers at Phase-3 runtime, not board-build.
+// Classifier module - lightweight task-capability classifier
+// CR-5: The per-task required capability is assigned by a lightweight
+// classifier since implement-protocol assigns capabilities at Phase-3 runtime,
+// not board-build.
 //
-// Conservative default: unknown tier => high-capability only
+// Conservative default: unknown capability => high-capability only
 
 import { CAPABILITY_CLASS } from "./index.mjs";
 
 /**
- * Security-critical high-tier keywords. A task touching these is never safe to
- * downgrade just because it also happens to contain a low-tier word like
+ * Security-critical high-capability keywords. A task touching these is never
+ * safe to downgrade just because it also happens to contain a low-capability word like
  * "minor" or "quick". These are matched by plain case-insensitive SUBSTRING
  * (see buildSubstringPattern) rather than word boundaries, so inflected and
  * compound forms ("credentials", "sessions", "unauthorized", "authoring") also
@@ -27,9 +28,10 @@ const SECURITY_CRITICAL_KEYWORDS = Object.freeze([
 ]);
 
 /**
- * High-tier tasks requiring flagship reasoning models: debugging, root-cause investigation, planning, architecture.
+ * High-capability tasks requiring flagship reasoning models: debugging,
+ * root-cause investigation, planning, architecture.
  */
-const STRUCTURAL_TIER_KEYWORDS = Object.freeze([
+const STRUCTURAL_CAPABILITY_KEYWORDS = Object.freeze([
 	"debug",
 	"debugging",
 	"root-cause",
@@ -48,9 +50,9 @@ const STRUCTURAL_TIER_KEYWORDS = Object.freeze([
 ]);
 
 /**
- * Keywords that indicate a standard-tier task (bounded implementation & feature work).
+ * Keywords that indicate a standard-capability task (bounded implementation & feature work).
  */
-const STANDARD_TIER_KEYWORDS = Object.freeze([
+const STANDARD_CAPABILITY_KEYWORDS = Object.freeze([
 	"implement",
 	"implementation",
 	"build",
@@ -85,9 +87,9 @@ const STANDARD_TIER_KEYWORDS = Object.freeze([
 ]);
 
 /**
- * Keywords that indicate a low-tier (mechanical) task.
+ * Keywords that indicate a low-capability (mechanical) task.
  */
-const LOW_TIER_KEYWORDS = Object.freeze([
+const LOW_CAPABILITY_KEYWORDS = Object.freeze([
 	"format",
 	"lint",
 	"cleanup",
@@ -139,49 +141,53 @@ function buildSubstringPattern(keywords) {
 const SECURITY_CRITICAL_PATTERN = buildSubstringPattern(
 	SECURITY_CRITICAL_KEYWORDS,
 );
-const STRUCTURAL_TIER_PATTERN = buildKeywordPattern(STRUCTURAL_TIER_KEYWORDS);
-const STANDARD_TIER_PATTERN = buildKeywordPattern(STANDARD_TIER_KEYWORDS);
-const LOW_TIER_PATTERN = buildKeywordPattern(LOW_TIER_KEYWORDS);
+const STRUCTURAL_CAPABILITY_PATTERN = buildKeywordPattern(
+	STRUCTURAL_CAPABILITY_KEYWORDS,
+);
+const STANDARD_CAPABILITY_PATTERN = buildKeywordPattern(
+	STANDARD_CAPABILITY_KEYWORDS,
+);
+const LOW_CAPABILITY_PATTERN = buildKeywordPattern(LOW_CAPABILITY_KEYWORDS);
 
 /**
- * A task is high-tier if it matches EITHER the security-critical substring
+ * A task requires high capability if it matches EITHER the security-critical substring
  * pattern OR the structural word-boundary pattern.
  * @param {string} description
  * @returns {boolean}
  */
-function isHighTier(description) {
+function requiresHighCapability(description) {
 	return (
 		SECURITY_CRITICAL_PATTERN.test(description) ||
-		STRUCTURAL_TIER_PATTERN.test(description)
+		STRUCTURAL_CAPABILITY_PATTERN.test(description)
 	);
 }
 
 /**
- * Classify a task's difficulty tier from its description.
+ * Classify a task's required capability from its description.
  * Uses whole-word keyword matching (case-insensitive). Checked in order
- * high -> standard -> low: a task that mentions any standard-tier signal
+ * high -> standard -> low: a task that mentions any standard-capability signal
  * (e.g. "fix", "bug", "endpoint") is never downgraded to low just because
- * it also contains a low-tier word (e.g. "fix the bug and add a comment"
+ * it also contains a low-capability word (e.g. "fix the bug and add a comment"
  * is standard, not low) — under-classifying real work to a weak provider
  * is the dangerous direction; over-classifying trivial work is just cost.
  *
  * @param {string} description Task description
- * @returns {string} Tier: 'high', 'standard', or 'low'
+ * @returns {string} Required capability: 'high', 'standard', or 'low'
  */
 export function classifyTask(description) {
 	if (!description || typeof description !== "string" || !description.trim()) {
 		return CAPABILITY_CLASS.high; // Conservative default (unknown => high-capability only)
 	}
 
-	if (isHighTier(description)) {
+	if (requiresHighCapability(description)) {
 		return CAPABILITY_CLASS.high;
 	}
 
-	if (STANDARD_TIER_PATTERN.test(description)) {
+	if (STANDARD_CAPABILITY_PATTERN.test(description)) {
 		return CAPABILITY_CLASS.standard;
 	}
 
-	if (LOW_TIER_PATTERN.test(description)) {
+	if (LOW_CAPABILITY_PATTERN.test(description)) {
 		return CAPABILITY_CLASS.low;
 	}
 
@@ -192,17 +198,17 @@ export function classifyTask(description) {
 /**
  * Batch classify multiple task descriptions.
  * @param {string[]} descriptions Array of task descriptions
- * @returns {string[]} Array of tier classifications
+ * @returns {string[]} Array of required capability classifications
  */
 export function classifyTasks(descriptions) {
 	return descriptions.map(classifyTask);
 }
 
 /**
- * Validate that a tier is one of the known capability classes.
- * @param {string} tier
+ * Validate that a required capability is one of the known capability classes.
+ * @param {string} capabilityClass
  * @returns {boolean}
  */
-export function isValidTier(tier) {
-	return Object.values(CAPABILITY_CLASS).includes(tier);
+export function isValidCapabilityClass(capabilityClass) {
+	return Object.values(CAPABILITY_CLASS).includes(capabilityClass);
 }

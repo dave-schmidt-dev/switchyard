@@ -8,8 +8,8 @@
 // the roster. This test PROVES that (rather than asserting it): against the
 // committed synthetic fixture it verifies the two INV-5 properties end-to-end
 // through route() —
-//   1. the routed model is right-sized to the requested tier, and
-//   2. a provider below the tier is never routed, even when it holds the most
+//   1. the routed model is right-sized to the required capability, and
+//   2. a provider below the required capability is never routed, even when it holds the most
 //      headroom (so the capability filter, not the spread, decides eligibility).
 //
 // It reads the committed fixture (never the real ~/.agent/roster.json) and an
@@ -67,8 +67,8 @@ function writeSnapshot(providers) {
 	);
 }
 
-describe("router INV-5 — model right-sizing per tier", () => {
-	it("routes the tier-appropriate selector for low/standard/high (single eligible provider)", () => {
+describe("router INV-5 — model right-sizing per capability class", () => {
+	it("routes the capability-appropriate selector for low/standard/high (single eligible provider)", () => {
 		// claude is qualified at every tier in the fixture; make it the only
 		// present provider so the winner is deterministic and we isolate the
 		// right-sizing behavior from the spread.
@@ -80,12 +80,21 @@ describe("router INV-5 — model right-sizing per tier", () => {
 			},
 		]);
 
-		strictEqual(route({ tier: "low" }).model, "fixture-claude-low");
-		strictEqual(route({ tier: "standard" }).model, "fixture-claude-standard");
-		strictEqual(route({ tier: "high" }).model, "fixture-claude-high");
+		strictEqual(
+			route({ requiredCapability: "low" }).model,
+			"fixture-claude-low",
+		);
+		strictEqual(
+			route({ requiredCapability: "standard" }).model,
+			"fixture-claude-standard",
+		);
+		strictEqual(
+			route({ requiredCapability: "high" }).model,
+			"fixture-claude-high",
+		);
 	});
 
-	it("the winner's model always matches the requested tier, whichever high-capable provider wins", () => {
+	it("the winner's model always matches the required capability, whichever high-capable provider wins", () => {
 		// claude and codex are both full-high in the fixture; codex has more
 		// headroom so the spread picks it. The routed model must be codex's
 		// HIGH selector — right-sizing follows the winner.
@@ -102,14 +111,14 @@ describe("router INV-5 — model right-sizing per tier", () => {
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.provider, "codex");
 		strictEqual(result.model, "fixture-codex-high");
 	});
 });
 
 describe("router INV-5 — capability filter gates the spread", () => {
-	it("never routes an under-capable provider at high tier, even with the most headroom", () => {
+	it("never routes an under-capable provider at high required capability, even with the most headroom", () => {
 		// antigravity (agy) has NO high slot in the fixture -> standard ceiling.
 		// Give it the most headroom so a pure spread would pick it; the INV-5
 		// capability filter must exclude it and hand the route to codex.
@@ -122,22 +131,22 @@ describe("router INV-5 — capability filter gates the spread", () => {
 			},
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(
 			result.provider,
 			"codex",
-			"agy is below high tier and must be filtered out",
+			"agy is below high required capability and must be filtered out",
 		);
 		strictEqual(result.model, "fixture-codex-high");
 	});
 
-	it("returns no eligible provider when every present provider is below the tier", () => {
-		// Only agy (standard ceiling) is present; at high tier nothing qualifies.
+	it("returns no eligible provider when every present provider is below the required capability", () => {
+		// Only agy (standard ceiling) is present; at high required capability nothing qualifies.
 		writeSnapshot([
 			{ name: "agy", ok: true, windows: [{ percent_left: 99, pace_delta: 0 }] },
 		]);
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.provider, null);
 		strictEqual(result.model, null);
 		// Every candidate fails only the INV-5 capability filter, so the reason
@@ -146,14 +155,14 @@ describe("router INV-5 — capability filter gates the spread", () => {
 		strictEqual(result.reason, "no_eligible_capability_ceiling");
 	});
 
-	it("at standard tier the same under-capable provider IS eligible and right-sized", () => {
+	it("at standard required capability the same under-capable provider IS eligible and right-sized", () => {
 		// agy qualifies at standard; with no higher-capable provider present it
 		// wins and is right-sized to its standard selector.
 		writeSnapshot([
 			{ name: "agy", ok: true, windows: [{ percent_left: 99, pace_delta: 0 }] },
 		]);
 
-		const result = route({ tier: "standard" });
+		const result = route({ requiredCapability: "standard" });
 		strictEqual(result.provider, "agy");
 		strictEqual(result.model, "fixture-agy-standard");
 	});
@@ -167,7 +176,7 @@ describe("router INV-5 — blind fallback still filters + right-sizes", () => {
 		// three roster-backed call sites Task 1.6 migrated.
 		rmSync(SNAPSHOT_PATH, { force: true });
 
-		const result = route({ tier: "high" });
+		const result = route({ requiredCapability: "high" });
 		strictEqual(result.reason, "blind_fallback");
 		// Whatever blind winner emerges must be high-capable and high-right-sized.
 		strictEqual(result.model, `fixture-${result.provider}-high`);
