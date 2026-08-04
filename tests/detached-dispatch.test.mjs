@@ -163,6 +163,67 @@ describe("launch returns before completion", () => {
 		const status = JSON.parse(statusResult.stdout.trim());
 		strictEqual(status.runId, runId);
 	});
+
+	it("quarantines malformed records during the awaited worker startup sweep without touching a sibling launch", async () => {
+		const { initializeRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const malformedRunId = `malformed-${randomUUID()}`;
+		const siblingRunId = randomUUID();
+
+		await initializeRun({
+			runId: siblingRunId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		mkdirSync(join(stateRoot, "runs", malformedRunId), { recursive: true });
+		writeFileSync(
+			join(stateRoot, "runs", malformedRunId, "run.json"),
+			"{ malformed run record",
+			"utf8",
+		);
+
+		const launchResult = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(
+			launchResult.status,
+			0,
+			`launch failed: ${launchResult.stderr}`,
+		);
+
+		// The quarantine move happens inside applyRetention, which bootstrap
+		// awaits before claiming its lease. Seeing the moved directory confirms
+		// that startup sweep completed before we inspect the sibling record.
+		const quarantineRoot = join(stateRoot, ".quarantine");
+		let sweepCompleted = false;
+		const start = Date.now();
+		while (Date.now() - start < 10_000) {
+			try {
+				const quarantined = readdirSync(quarantineRoot);
+				if (quarantined.some((entry) => entry.startsWith(malformedRunId))) {
+					sweepCompleted = true;
+					break;
+				}
+			} catch (error) {
+				if (error.code !== "ENOENT") throw error;
+			}
+			await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+		}
+		ok(
+			sweepCompleted,
+			"worker startup retention sweep did not quarantine malformed record",
+		);
+
+		const sibling = await readRun(siblingRunId);
+		strictEqual(sibling.state, "created");
+		strictEqual(sibling.workerPid, null);
+	});
 });
 
 describe("worker reaches terminal state and result is readable", () => {

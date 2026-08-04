@@ -100,6 +100,16 @@ function captureCurrentFingerprint(projectPath) {
 
 try {
 	const runStore = await import("../run-store/index.mjs");
+	// Match the synchronous dispatch path's retention policy, but wait for its
+	// schema-only quarantine pass before this worker starts its own run.
+	// Deletion remains dry-run-only.
+	try {
+		await runStore.applyRetention({ maxAgeDays: 30, dryRun: true });
+	} catch (error) {
+		console.error(
+			`worker-bootstrap: retention sweep failed (${error.message})`,
+		);
+	}
 
 	const run = await runStore.readRun(runId);
 
@@ -137,10 +147,13 @@ try {
 	// execute one task must not perform system-wide Docker GC — a concurrent
 	// sweep here reclaims containers/volumes belonging to *other* live runs
 	// (proven: enabling it deterministically reaps a sibling run's fixture
-	// volume). The leak-recovery guarantee is delivered by the primary
-	// `runDispatch` path's pre-run sweep, the explicit `recover` command, and
-	// the SIGTERM/SIGINT owned-container cleanup handler in the runner — none of
-	// which run concurrently with a foreign live run.
+	// volume). The startup applyRetention call above is safe to include: its
+	// schema-only quarantine can only move that malformed run's own record; it
+	// never touches another run's live resources and therefore has none of the
+	// orphan sweep's cross-run interference risk. The leak-recovery guarantee is
+	// delivered by the primary `runDispatch` path's pre-run sweep, the explicit
+	// `recover` command, and the SIGTERM/SIGINT owned-container cleanup handler
+	// in the runner — none of which run concurrently with a foreign live run.
 
 	const { runQueue: runQueueFn } = await import("../runner/index.mjs");
 
