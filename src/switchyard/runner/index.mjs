@@ -242,7 +242,7 @@ export function resolveOrchestrator(dependencies = {}) {
  *   - **Description:** ...
  *
  * @param {string} markdown
- * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, timeoutMs: number|null}>}
+ * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, timeoutMs: number|null, tier: string|null, type: string}>}
  */
 export function parseTaskQueue(markdown) {
 	const tasks = [];
@@ -296,6 +296,15 @@ export function parseTaskQueue(markdown) {
 			tier = parseTierField(tierValue, taskId);
 		}
 
+		let type = "implementation";
+		const typeLine = block
+			.split("\n")
+			.find((line) => /^- \*\*Type:\*\*\s/.test(line));
+		if (typeLine) {
+			const typeValue = typeLine.replace(/^- \*\*Type:\*\*\s*/, "").trim();
+			type = parseTypeField(typeValue, taskId);
+		}
+
 		tasks.push({
 			id: taskId,
 			title: title.trim(),
@@ -305,6 +314,7 @@ export function parseTaskQueue(markdown) {
 			requiredPaths,
 			timeoutMs,
 			tier,
+			type,
 		});
 	}
 
@@ -363,6 +373,25 @@ function parseTierField(raw, taskId) {
 	if (!isValidTier(trimmed)) {
 		throw new Error(
 			`Task ${taskId}: invalid Tier field "${raw.trim()}" (expected one of: high, standard, low)`,
+		);
+	}
+	return trimmed;
+}
+
+/**
+ * Parse and validate a per-task `Type:` field (`implementation` | `review`).
+ * Same fail-closed convention as parseTierField: an unrecognized value throws
+ * immediately with the offending value in the message.
+ * @param {string} raw The raw value of the Type field, e.g. "review"
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string} normalized type ('implementation'|'review')
+ * @throws {Error} If the value isn't a recognized task type
+ */
+function parseTypeField(raw, taskId) {
+	const trimmed = raw.trim().toLowerCase();
+	if (trimmed !== "implementation" && trimmed !== "review") {
+		throw new Error(
+			`Task ${taskId}: invalid Type field "${raw.trim()}" (expected one of: implementation, review)`,
 		);
 	}
 	return trimmed;

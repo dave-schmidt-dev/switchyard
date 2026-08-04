@@ -475,6 +475,45 @@ describe("runner queue parsing", () => {
 			/invalid Tier field "urgent" \(expected one of: high, standard, low\)/,
 		);
 	});
+
+	it("defaults type to implementation when no Type: field is present", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Simple task
+- **Status:** pending
+- **Description:** Do things
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].type, "implementation");
+	});
+
+	it("extracts type from a Type: field, accepting explicit review and normalizing case", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Review task
+- **Status:** pending
+- **Type:** Review
+- **Description:** Perform code review
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].type, "review");
+	});
+
+	it("rejects a Type: field with an unrecognized value, failing closed at parse time", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Bad type task
+- **Status:** pending
+- **Type:** audit
+- **Description:** Bad type
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/invalid Type field "audit" \(expected one of: implementation, review\)/,
+		);
+	});
 });
 
 describe("runner orchestration", () => {
