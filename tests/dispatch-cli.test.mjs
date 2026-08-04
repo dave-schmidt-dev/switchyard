@@ -211,6 +211,19 @@ describe("parseDispatchArgs (backwards compat)", () => {
 		deepStrictEqual(opts.onlyProviders, ["agy", "claude"]);
 	});
 
+	it("collects repeated --task-id selectors", () => {
+		const opts = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--task-id",
+			"1.2",
+			"--task-id",
+			"2.1",
+		]);
+		deepStrictEqual(opts.taskIds, ["1.2", "2.1"]);
+	});
+
 	it("throws a UsageError when --only-provider and --exclude-provider are combined", () => {
 		strictEqual(
 			(() => {
@@ -513,7 +526,7 @@ describe("launch integration", () => {
 			ok(false, `stdout is not valid JSON: ${result.stdout}`);
 			return;
 		}
-		strictEqual(envelope.schemaVersion, 1);
+		strictEqual(envelope.schemaVersion, 2);
 		ok(typeof envelope.runId === "string" && envelope.runId.length > 0);
 		strictEqual(envelope.state, "launcher_ready");
 		ok(envelope.statusCommand.includes("switchyard-dispatch status"));
@@ -530,7 +543,22 @@ describe("launch integration", () => {
 
 		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
 		const run = await readRun(runId);
+		strictEqual(run.schemaVersion, 2);
+		ok(/^[a-f0-9]{64}$/.test(run.queueIdentity));
+		strictEqual(run.runOptions.version, 1);
 		deepStrictEqual(run.excludeProviders, []);
+	});
+
+	it("launch persists repeatable task selection in runOptions", async () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir, "--task-id", "1.1"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		deepStrictEqual(run.runOptions.taskIds, ["1.1"]);
 	});
 
 	it("launch persists repeated --exclude-provider flags onto the run record as excludeProviders", async () => {
@@ -668,6 +696,103 @@ describe("status integration", () => {
 		strictEqual(result.status, 0);
 		const envelope = JSON.parse(result.stdout.trim());
 		strictEqual(envelope.runId, "test-status-json");
+	});
+
+	it("status and terminal result expose the same bounded queue diagnostics", async () => {
+		const diagnosticTasksFile = join(dir, "diagnostic-tasks.md");
+		writeFileSync(
+			diagnosticTasksFile,
+			`### Task 1.1: Provider task with sensitive description
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/provider-secret-name.mjs
+- **Description:** provider task description
+
+### Task 1.2: Human gate
+- **Status:** pending
+- **Executor:** human
+- **Description:** human approval details
+
+### Task 1.3: Native gate
+- **Status:** pending
+- **Executor:** native
+- **Description:** local worker details
+
+### Task 1.4: Dependency gate
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/dependent.mjs
+- **Blocked by:** Task 1.1
+
+### Task 1.5: External gate
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/external.mjs
+- **External blockers:** decision:approval
+
+### Task 1.6: Completed task
+- **Status:** done
+- **Executor:** switchyard
+- **Files:** src/completed.mjs
+`,
+			"utf8",
+		);
+		const runId = "diagnostic-parity";
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		await initializeRun({
+			runId,
+			tasksFilePath: diagnosticTasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1", "1.2", "1.3", "1.4", "1.5", "1.6"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: ["1.6"] },
+			},
+			current.revision,
+		);
+
+		const status = JSON.parse(
+			runDispatch(["status", runId], makeStateRootEnv()).stdout.trim(),
+		);
+		const result = JSON.parse(
+			runDispatch(["result", runId], makeStateRootEnv()).stdout.trim(),
+		);
+		deepStrictEqual(status.queueDiagnostics, result.queueDiagnostics);
+		deepStrictEqual(status.queueDiagnostics.selected, {
+			count: 5,
+			reason: "queue_default",
+		});
+		strictEqual(status.queueDiagnostics.runnable.count, 1);
+		strictEqual(status.queueDiagnostics.humanGated.count, 1);
+		strictEqual(status.queueDiagnostics.nativeGated.count, 1);
+		strictEqual(status.queueDiagnostics.dependencyBlocked.count, 1);
+		strictEqual(status.queueDiagnostics.externalBlocked.count, 1);
+		strictEqual(status.queueDiagnostics.completed.count, 1);
+		const allowedReasons = new Set([
+			"queue_default",
+			"provider_eligible_and_unblocked",
+			"executor_human",
+			"executor_native",
+			"task_dependency",
+			"external_blocker",
+			"queue_status_or_checkpoint",
+			"queue_unavailable",
+		]);
+		for (const value of Object.values(status.queueDiagnostics)) {
+			ok(allowedReasons.has(value.reason));
+		}
+		const serialized = JSON.stringify(status.queueDiagnostics);
+		ok(!serialized.includes("provider-secret-name.mjs"));
+		ok(!serialized.includes("provider task description"));
 	});
 });
 
@@ -1000,7 +1125,7 @@ describe("envelope format", () => {
 		for (const key of required) {
 			ok(key in envelope, `launch envelope missing field: ${key}`);
 		}
-		strictEqual(envelope.schemaVersion, 1);
+		strictEqual(envelope.schemaVersion, 2);
 		strictEqual(envelope.state, "launcher_ready");
 	});
 
@@ -1452,8 +1577,9 @@ describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", (
 		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { CHECKPOINT_VERSION, getCheckpointPath, saveCheckpoint } =
-			await import("../src/switchyard/runner/index.mjs");
+		const { getCheckpointPath, saveCheckpoint } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
 
 		const runId = "pending-resumed-run";
 		await initializeRun({
@@ -1475,7 +1601,7 @@ describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", (
 		// checkpoint-derived computation must instead see completedTaskIds
 		// and report 2.
 		saveCheckpoint(getCheckpointPath(tasksFile), {
-			version: CHECKPOINT_VERSION,
+			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: ["1.1"],
 			lastTaskId: "1.1",

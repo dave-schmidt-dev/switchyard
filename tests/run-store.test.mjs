@@ -149,6 +149,32 @@ describe("initializeRun", () => {
 		strictEqual(loaded.revision, 1);
 	});
 
+	it("persists an identity-bound v2 run while retaining the v1 reader", async () => {
+		const opts = makeOptions({
+			projectRevision: "rev-1",
+			queueIdentity: "a".repeat(64),
+			runOptions: {
+				version: 1,
+				maxTasks: 2,
+				checkpointPath: "/tmp/checkpoint.json",
+				stopOnFailure: true,
+				onlyProviders: ["claude"],
+				excludeProviders: [],
+				taskIds: ["task-1"],
+			},
+		});
+		const snapshot = await initializeRun(opts);
+		strictEqual(snapshot.schemaVersion, 2);
+		strictEqual(snapshot.projectRevision, "rev-1");
+		strictEqual(snapshot.queueIdentity, "a".repeat(64));
+		strictEqual((await readRun(opts.runId)).schemaVersion, 2);
+
+		const legacy = makeOptions({ runId: uniqueRunId() });
+		const legacySnapshot = await initializeRun(legacy);
+		strictEqual(legacySnapshot.schemaVersion, 1);
+		strictEqual((await readRun(legacy.runId)).schemaVersion, 1);
+	});
+
 	it("creates run directory and artifacts subdirectory", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);
@@ -266,6 +292,7 @@ describe("event ordering", () => {
 		const content = await readFile(eventsPath, "utf8");
 		const parsed = JSON.parse(content.trim().split("\n")[0]);
 
+		strictEqual(parsed.schemaVersion, 1);
 		strictEqual(parsed.sequence, 1);
 		strictEqual(parsed.taskId, "task-1");
 		strictEqual(parsed.provider, "claude");
@@ -498,7 +525,7 @@ describe("retention", () => {
 		strictEqual(result.quarantined[0].runId, runId);
 		strictEqual(
 			result.quarantined[0].reason,
-			"Unsupported schemaVersion (expected 1)",
+			"Unsupported schemaVersion (expected 1 or 2)",
 		);
 	});
 
@@ -789,7 +816,7 @@ describe("retention", () => {
 			{
 				name: `q-bad-schema-${uniqueRunId().slice(0, 8)}`,
 				content: JSON.stringify({ schemaVersion: 99 }),
-				reason: "Unsupported schemaVersion (expected 1)",
+				reason: "Unsupported schemaVersion (expected 1 or 2)",
 			},
 			{
 				name: `q-missing-field-${uniqueRunId().slice(0, 8)}`,

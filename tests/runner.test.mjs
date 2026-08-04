@@ -23,15 +23,22 @@ import { fileURLToPath } from "node:url";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import {
 	createCliOrchestrator,
+	createEmptyCheckpoint,
+	createQueueIdentity,
+	deriveQueueDiagnostics,
 	executeTask,
 	executeTaskWithOrchestrator,
 	getRunnableTasks,
 	loadCheckpoint,
+	loadTaskQueue,
+	normalizeRunOptions,
 	parseTaskQueue,
 	resolveOrchestrator,
 	runQueue,
 	runQueueWithOrchestrator,
 	saveCheckpoint,
+	TaskSelectionError,
+	validateTaskGraph,
 	waitForJobCompletion,
 } from "../src/switchyard/runner/index.mjs";
 
@@ -651,7 +658,382 @@ describe("runner queue parsing", () => {
 	});
 });
 
+describe("runner dependency metadata", () => {
+	it("parses task-only dependencies and external blockers", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Root
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Blocked by:** none
+- **Description:** Root
+
+### Task 1.2: Middle
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Blocked by:** Task 1.1
+- **Description:** Middle
+
+### Task 1.3: Leaf
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Blocked by:** Tasks 1.1, Task 1.2
+- **External blockers:** decision:release-approval, gate:phase-1
+- **Description:** Leaf
+`;
+		const tasks = parseFixture(markdown);
+		deepStrictEqual(
+			tasks.map((task) => task.blockedBy),
+			[[], ["1.1"], ["1.1", "1.2"]],
+		);
+		deepStrictEqual(tasks[2].externalBlockers, [
+			"decision:release-approval",
+			"gate:phase-1",
+		]);
+	});
+
+	it("rejects free prose and malformed external blocker ids", () => {
+		const prose = `### Task 1.1: Bad dependency
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Blocked by:** after the review is approved
+`;
+		throws(() => parseFixture(prose), /invalid Blocked by field/);
+
+		const malformedExternal = `### Task 1.1: Bad external blocker
+- **Status:** pending
+- **Files:** src/a.mjs
+- **External blockers:** David must approve
+`;
+		throws(
+			() => parseFixture(malformedExternal),
+			/invalid External blockers id/,
+		);
+	});
+
+	it("rejects unknown, self, cyclic, and duplicate dependencies", () => {
+		const queue = (body) => `### Task 1.1: Task one
+- **Status:** pending
+- **Files:** src/a.mjs
+${body}
+`;
+		throws(
+			() => parseFixture(queue("- **Blocked by:** Task 9.9")),
+			/unknown Blocked by task "9\.9"/,
+		);
+		throws(
+			() => parseFixture(queue("- **Blocked by:** Task 1.1")),
+			/self-dependency is not allowed/,
+		);
+
+		const cycle = `### Task 1.1: First
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Blocked by:** Task 1.2
+
+### Task 1.2: Second
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Blocked by:** Task 1.1
+`;
+		throws(() => parseFixture(cycle), /task dependency cycle detected/);
+		throws(
+			() => parseFixture(queue("- **Blocked by:** Task 1.1, Task 1.1")),
+			/duplicate Blocked by dependency/,
+		);
+	});
+
+	it("gates chains and diamonds on done or checkpoint-success prerequisites", () => {
+		const tasks = [
+			{ id: "1.1", status: "pending", executor: "switchyard" },
+			{
+				id: "1.2",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.1"],
+			},
+			{
+				id: "1.3",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.1"],
+			},
+			{
+				id: "1.4",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.2", "1.3"],
+			},
+		];
+
+		deepStrictEqual(
+			getRunnableTasks(tasks, { completedTaskIds: [] }).map((task) => task.id),
+			["1.1"],
+		);
+		deepStrictEqual(
+			getRunnableTasks(tasks, { completedTaskIds: ["1.1"] }).map(
+				(task) => task.id,
+			),
+			["1.2", "1.3"],
+		);
+		deepStrictEqual(
+			getRunnableTasks(tasks, { completedTaskIds: ["1.1", "1.2", "1.3"] }).map(
+				(task) => task.id,
+			),
+			["1.4"],
+		);
+
+		const failedPrerequisite = [
+			...tasks.slice(0, 2),
+			{
+				id: "1.5",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.2"],
+			},
+		];
+		deepStrictEqual(
+			getRunnableTasks(failedPrerequisite, {
+				completedTaskIds: [],
+				results: [{ taskId: "1.2", success: false }],
+			}).map((task) => task.id),
+			["1.1"],
+		);
+	});
+
+	it("keeps external, native, human, and unselected work out of provider routing", () => {
+		const tasks = [
+			{
+				id: "1.1",
+				status: "pending",
+				executor: "switchyard",
+				externalBlockers: ["decision:approval"],
+			},
+			{ id: "1.2", status: "pending", executor: "native" },
+			{ id: "1.3", status: "pending", executor: "human" },
+			{
+				id: "1.4",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.2"],
+			},
+		];
+		deepStrictEqual(
+			getRunnableTasks(tasks, { completedTaskIds: [] }).map((task) => task.id),
+			[],
+		);
+		deepStrictEqual(
+			getRunnableTasks(
+				tasks,
+				{ completedTaskIds: [] },
+				{ resolvedExternalBlockers: ["decision:approval"] },
+			).map((task) => task.id),
+			["1.1"],
+		);
+		deepStrictEqual(
+			getRunnableTasks(
+				[
+					{ id: "1.1", status: "done", executor: "human" },
+					{
+						id: "1.2",
+						status: "pending",
+						executor: "switchyard",
+						blockedBy: ["1.1"],
+					},
+				],
+				{ completedTaskIds: [] },
+			).map((task) => task.id),
+			["1.2"],
+		);
+	});
+
+	it("validates programmatic dependency graphs before routing", () => {
+		throws(
+			() => validateTaskGraph([{ id: "1.1", blockedBy: ["9.9"] }]),
+			/unknown Blocked by task "9\.9"/,
+		);
+	});
+
+	it("derives content-free queue diagnostics with stable reason codes", () => {
+		const tasks = [
+			{
+				id: "1.1",
+				status: "pending",
+				executor: "switchyard",
+				description: "provider task description",
+				requiredPaths: ["src/provider-secret-name.mjs"],
+			},
+			{ id: "1.2", status: "pending", executor: "human" },
+			{ id: "1.3", status: "pending", executor: "native" },
+			{
+				id: "1.4",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.1"],
+			},
+			{
+				id: "1.5",
+				status: "pending",
+				executor: "switchyard",
+				externalBlockers: ["decision:approval"],
+			},
+			{ id: "1.6", status: "done", executor: "switchyard" },
+		];
+
+		const diagnostics = deriveQueueDiagnostics(tasks, {
+			completedTaskIds: ["1.6"],
+		});
+		deepStrictEqual(diagnostics, {
+			selected: { count: 5, reason: "queue_default" },
+			runnable: { count: 1, reason: "provider_eligible_and_unblocked" },
+			humanGated: { count: 1, reason: "executor_human" },
+			nativeGated: { count: 1, reason: "executor_native" },
+			dependencyBlocked: { count: 1, reason: "task_dependency" },
+			externalBlocked: { count: 1, reason: "external_blocker" },
+			completed: { count: 1, reason: "queue_status_or_checkpoint" },
+		});
+
+		const serialized = JSON.stringify(diagnostics);
+		ok(!serialized.includes("provider task description"));
+		ok(!serialized.includes("provider-secret-name.mjs"));
+		ok(!serialized.includes("decision:approval"));
+	});
+});
+
+describe("runner task selection and queue identity", () => {
+	it("rejects explicit selection with a stable reason for each unsafe target", () => {
+		const checkpoint = { completedTaskIds: [] };
+		const tasks = [
+			{ id: "1.1", status: "pending", executor: "switchyard" },
+			{ id: "1.2", status: "pending", executor: "native" },
+			{ id: "1.3", status: "pending", executor: "human" },
+			{
+				id: "1.4",
+				status: "pending",
+				executor: "switchyard",
+				externalBlockers: ["decision:approval"],
+			},
+			{
+				id: "1.5",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.1"],
+			},
+		];
+
+		for (const [taskId, reason] of [
+			["missing", "unknown-task"],
+			["1.2", "native-task"],
+			["1.3", "human-task"],
+			["1.4", "external-blocked:decision:approval"],
+			["1.5", "dependency-blocked:1.1"],
+		]) {
+			throws(
+				() =>
+					getRunnableTasks(tasks, checkpoint, { selectedTaskIds: [taskId] }),
+				(error) =>
+					error instanceof TaskSelectionError && error.reason === reason,
+			);
+		}
+	});
+
+	it("creates and validates an identity-bound v2 checkpoint", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Identity task
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** Identity
+`);
+		const tasks = loadTaskQueue(tasksPath);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const runOptions = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 1,
+			stopOnFailure: true,
+			taskIds: ["1.1"],
+		});
+		const queueIdentity = createQueueIdentity({
+			tasksFilePath: tasksPath,
+			markdown: readFileSync(tasksPath, "utf8"),
+			tasks,
+			projectRevision: "rev-1",
+			runOptions,
+		});
+		const empty = createEmptyCheckpoint(tasksPath, {
+			queueIdentity,
+			runOptions,
+		});
+		saveCheckpoint(checkpointPath, empty);
+		const loaded = loadCheckpoint(checkpointPath, tasksPath, {
+			queueIdentity,
+			runOptions,
+		});
+		strictEqual(loaded.version, 2);
+		strictEqual(loaded.queueIdentity, queueIdentity);
+		throws(
+			() =>
+				loadCheckpoint(checkpointPath, tasksPath, {
+					queueIdentity: `${"0".repeat(64)}`,
+					runOptions,
+				}),
+			/checkpoint identity mismatch/,
+		);
+	});
+});
+
 describe("runner orchestration", () => {
+	it("re-evaluates dependencies after each successful task", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Root task
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Blocked by:** none
+- **Description:** Root operation
+
+### Task 1.2: Dependent task
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Blocked by:** Task 1.1
+- **Description:** Dependent operation
+`);
+		const dispatches = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.runnableTasks, 1);
+		strictEqual(result.processedTasks, 2);
+		deepStrictEqual(
+			dispatches.map((dispatch) => dispatch.taskId),
+			["1.1", "1.2"],
+		);
+	});
+
 	it("executes tasks serially and checkpoints completion", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 

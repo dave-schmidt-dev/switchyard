@@ -164,6 +164,20 @@ describe("launch returns before completion", () => {
 		strictEqual(status.runId, runId);
 	});
 
+	it("detached launch persists the v2 identity and selected task options", async () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir, "--task-id", "1.1"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `launch failed: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		strictEqual(run.schemaVersion, 2);
+		ok(/^[a-f0-9]{64}$/.test(run.queueIdentity));
+		strictEqual(run.runOptions.taskIds[0], "1.1");
+	});
+
 	it("quarantines malformed records during the awaited worker startup sweep without touching a sibling launch", async () => {
 		const { initializeRun, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"

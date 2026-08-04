@@ -2,8 +2,9 @@
 // Reads persisted task queue, drives serial execution, checkpoints for resume.
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { captureDiff as captureAgyDiff, executeAgy } from "../adapter/agy.mjs";
 import {
 	captureDiff as captureClaudeDiff,
@@ -80,7 +81,9 @@ export function ensureAgentContainer(deps = {}) {
 	}
 }
 
-const CHECKPOINT_VERSION = 1;
+const CHECKPOINT_VERSION = 2;
+const HISTORICAL_CHECKPOINT_VERSION = 1;
+const RUN_OPTIONS_VERSION = 1;
 const TERMINAL_JOB_STATES = new Set([
 	"done",
 	"expired",
@@ -103,6 +106,270 @@ const KNOWN_TASK_STATUSES = new Set([
 	"done",
 	"blocked",
 ]);
+const TASK_ID_PATTERN = "\\d+(?:\\.\\d+)*";
+const EXTERNAL_BLOCKER_ID_RE = /^[a-z][a-z0-9]*(?:(?:-|:)[a-z0-9]+)*$/;
+
+function stableStringify(value) {
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+	if (value && typeof value === "object") {
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+			.join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+function normalizeIds(values, label) {
+	if (values == null) return [];
+	if (
+		!Array.isArray(values) ||
+		values.some((value) => typeof value !== "string")
+	) {
+		throw new Error(`${label} must be an array of strings`);
+	}
+	const ids = values.map((value) => value.trim());
+	if (ids.some((value) => !value))
+		throw new Error(`${label} contains an empty value`);
+	return [...new Set(ids)].sort();
+}
+
+function normalizeProviders(values, label) {
+	return normalizeIds(values, label).map((value) => value.toLowerCase());
+}
+
+/** Normalize the persisted run options used for identity and resume checks. */
+export function normalizeRunOptions(options = {}) {
+	const maxTasks = options.maxTasks ?? Number.POSITIVE_INFINITY;
+	if (
+		maxTasks !== Number.POSITIVE_INFINITY &&
+		(!Number.isInteger(maxTasks) || maxTasks < 1)
+	) {
+		throw new Error(
+			"runOptions.maxTasks must be a positive integer or infinity",
+		);
+	}
+	return {
+		version: RUN_OPTIONS_VERSION,
+		maxTasks: Number.isFinite(maxTasks) ? maxTasks : null,
+		checkpointPath: options.checkpointPath
+			? resolve(options.checkpointPath)
+			: null,
+		stopOnFailure: options.stopOnFailure !== false,
+		onlyProviders: normalizeProviders(
+			options.onlyProviders ?? options.only ?? [],
+			"runOptions.onlyProviders",
+		),
+		excludeProviders: normalizeProviders(
+			options.excludeProviders ?? options.exclude ?? [],
+			"runOptions.excludeProviders",
+		),
+		taskIds: normalizeIds(
+			options.taskIds ?? options.selectedTaskIds ?? [],
+			"runOptions.taskIds",
+		),
+	};
+}
+
+/** Build an opaque identity over the queue, graph, project revision, and options. */
+export function createQueueIdentity({
+	tasksFilePath,
+	markdown,
+	tasks,
+	projectRevision,
+	runOptions,
+}) {
+	const graph = tasks.map((task) => ({
+		id: task.id,
+		blockedBy: [...(task.blockedBy ?? [])].sort(),
+		externalBlockers: [...(task.externalBlockers ?? [])].sort(),
+	}));
+	const payload = {
+		tasksFilePath: resolve(tasksFilePath),
+		tasksContentHash: createHash("sha256").update(markdown).digest("hex"),
+		graph,
+		projectRevision: String(projectRevision ?? "unknown"),
+		runOptions: normalizeRunOptions(runOptions),
+	};
+	return createHash("sha256").update(stableStringify(payload)).digest("hex");
+}
+
+export function computeQueueIdentityFromFile(
+	tasksFilePath,
+	projectRevision,
+	runOptions,
+) {
+	const markdown = readFileSync(tasksFilePath, "utf8");
+	const tasks = parseTaskQueue(markdown);
+	return {
+		markdown,
+		tasks,
+		queueIdentity: createQueueIdentity({
+			tasksFilePath,
+			markdown,
+			tasks,
+			projectRevision,
+			runOptions,
+		}),
+	};
+}
+
+/**
+ * Read the committed project revision used by queue identity.
+ * A repository without a readable HEAD uses a stable sentinel; callers still
+ * retain the task-file content and graph hashes in the resulting identity.
+ * @param {string} projectPath
+ * @returns {string}
+ */
+export function getProjectRevision(projectPath) {
+	try {
+		const result = spawnSync("git", ["rev-parse", "HEAD"], {
+			cwd: projectPath,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		return result.status === 0 && result.stdout?.trim()
+			? result.stdout.trim()
+			: "unknown";
+	} catch {
+		return "unknown";
+	}
+}
+
+function isIdentityRequested(options) {
+	return (
+		options.queueIdentity !== undefined ||
+		options.runOptions !== undefined ||
+		(options.taskIds ?? []).length > 0
+	);
+}
+
+function resolveQueueIdentity(options, tasks) {
+	if (!isIdentityRequested(options)) {
+		return {
+			enabled: false,
+			queueIdentity: null,
+			runOptions: null,
+			projectRevision: null,
+		};
+	}
+
+	const runOptions = normalizeRunOptions(
+		options.runOptions ?? {
+			...options,
+			checkpointPath: options.checkpointPath,
+		},
+	);
+	const projectRevision =
+		options.projectRevision ?? getProjectRevision(options.projectPath);
+	const markdown = readFileSync(options.tasksFilePath, "utf8");
+	const expectedIdentity = createQueueIdentity({
+		tasksFilePath: options.tasksFilePath,
+		markdown,
+		tasks,
+		projectRevision,
+		runOptions,
+	});
+
+	if (
+		options.queueIdentity !== undefined &&
+		options.queueIdentity !== expectedIdentity
+	) {
+		throw new Error(
+			`queue identity mismatch: supplied ${options.queueIdentity}, expected ${expectedIdentity}; ` +
+				"the task path, content/graph, project revision, or run options changed — create a new checkpoint or use an audited migration",
+		);
+	}
+
+	return {
+		enabled: true,
+		queueIdentity: expectedIdentity,
+		runOptions,
+		projectRevision,
+	};
+}
+
+export class TaskSelectionError extends Error {
+	constructor(taskId, reason) {
+		super(`task selection failed: ${reason}`);
+		this.name = "TaskSelectionError";
+		this.taskId = taskId;
+		this.reason = reason;
+		this.code = reason;
+	}
+}
+
+/**
+ * Validate explicit task selection before provider routing. Dependencies that
+ * are also selected may run first; a dependency outside the selection must
+ * already be complete, otherwise the request is rejected rather than silently
+ * producing a partial run.
+ * @param {Array} tasks
+ * @param {object} checkpoint
+ * @param {string[]} selectedTaskIds
+ */
+export function validateTaskSelection(
+	tasks,
+	checkpoint,
+	selectedTaskIds,
+	options = {},
+) {
+	const selected = normalizeIds(selectedTaskIds, "task selection");
+	if (selected.length === 0) return selected;
+	const byId = new Map(tasks.map((task) => [task.id, task]));
+	const done = new Set(checkpoint?.completedTaskIds ?? []);
+	const resolvedExternalBlockers = new Set(
+		options.resolvedExternalBlockers ??
+			checkpoint?.resolvedExternalBlockers ??
+			[],
+	);
+	for (const task of tasks) {
+		if (
+			String(task.status ?? "")
+				.trim()
+				.toLowerCase() === "done"
+		) {
+			done.add(task.id);
+		}
+	}
+
+	for (const taskId of selected) {
+		const task = byId.get(taskId);
+		if (!task) throw new TaskSelectionError(taskId, "unknown-task");
+		const status = String(task.status ?? "")
+			.trim()
+			.toLowerCase();
+		if (done.has(taskId) || status === "done") {
+			throw new TaskSelectionError(taskId, "completed-task");
+		}
+		if (task.executor === "native") {
+			throw new TaskSelectionError(taskId, "native-task");
+		}
+		if (task.executor === "human") {
+			throw new TaskSelectionError(taskId, "human-task");
+		}
+		const unresolvedExternal = (task.externalBlockers ?? []).find(
+			(blocker) => !resolvedExternalBlockers.has(blocker),
+		);
+		if (unresolvedExternal) {
+			throw new TaskSelectionError(
+				taskId,
+				`external-blocked:${unresolvedExternal}`,
+			);
+		}
+		const unresolvedDependency = (task.blockedBy ?? []).find(
+			(dependency) => !done.has(dependency) && !selected.includes(dependency),
+		);
+		if (unresolvedDependency) {
+			throw new TaskSelectionError(
+				taskId,
+				`dependency-blocked:${unresolvedDependency}`,
+			);
+		}
+	}
+
+	return selected;
+}
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -290,6 +557,8 @@ export function parseTaskQueue(markdown) {
 
 		const requiredCapability = parseRequiredCapabilityField(block, taskId);
 		const executor = parseExecutorField(block, taskId);
+		const blockedBy = parseBlockedByField(block, taskId);
+		const externalBlockers = parseExternalBlockersField(block, taskId);
 
 		let type = "implementation";
 		const typeLine = block
@@ -343,9 +612,12 @@ export function parseTaskQueue(markdown) {
 			requiredCapability,
 			executor,
 			type,
+			blockedBy,
+			externalBlockers,
 		});
 	}
 
+	validateTaskGraph(tasks);
 	return tasks;
 }
 
@@ -486,6 +758,96 @@ function parseTypeField(raw, taskId) {
 }
 
 /**
+ * Parse the machine-readable `Blocked by:` task dependency field.
+ *
+ * The field accepts `none`, a single `Task 1.1`, or a comma-separated list
+ * such as `Tasks 1.1, 1.2`. Repeating `Task` before each id is accepted for
+ * compatibility with existing active queues. Free prose is rejected rather
+ * than being silently treated as a dependency or as no dependency.
+ * @param {string} block Task markdown block
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string[]} task ids
+ */
+function parseBlockedByField(block, taskId) {
+	const values = getTaskFieldValues(block, "Blocked by");
+	if (values.length === 0) return [];
+	if (values.length > 1) {
+		throw new Error(
+			`Task ${taskId}: duplicate Blocked by declarations are not allowed`,
+		);
+	}
+
+	const raw = values[0].trim();
+	if (!raw) {
+		throw new Error(`Task ${taskId}: Blocked by field is empty`);
+	}
+	if (raw.toLowerCase() === "none") return [];
+
+	const taskIdToken = `(?:${TASK_ID_PATTERN})`;
+	const validList = new RegExp(
+		`^(?:(?:Tasks?|tasks?)\\s+)?${taskIdToken}(?:\\s*,\\s*(?:(?:Task|task)\\s+)?${taskIdToken})*$`,
+	);
+	if (!validList.test(raw)) {
+		throw new Error(
+			`Task ${taskId}: invalid Blocked by field "${raw}" (expected none or exact task IDs)`,
+		);
+	}
+
+	const dependencies = raw.match(new RegExp(TASK_ID_PATTERN, "g")) ?? [];
+	const seen = new Set();
+	for (const dependency of dependencies) {
+		if (seen.has(dependency)) {
+			throw new Error(
+				`Task ${taskId}: duplicate Blocked by dependency "${dependency}"`,
+			);
+		}
+		seen.add(dependency);
+	}
+	return dependencies;
+}
+
+/**
+ * Parse stable decision/approval/gate identifiers from `External blockers:`.
+ * A blocker remains unresolved unless a caller explicitly supplies it as
+ * resolved to getRunnableTasks; the default runner therefore fails closed.
+ * @param {string} block Task markdown block
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string[]} external blocker ids
+ */
+function parseExternalBlockersField(block, taskId) {
+	const values = getTaskFieldValues(block, "External blockers");
+	if (values.length === 0) return [];
+	if (values.length > 1) {
+		throw new Error(
+			`Task ${taskId}: duplicate External blockers declarations are not allowed`,
+		);
+	}
+
+	const raw = values[0].trim();
+	if (!raw) {
+		throw new Error(`Task ${taskId}: External blockers field is empty`);
+	}
+	if (raw.toLowerCase() === "none") return [];
+
+	const blockers = raw.split(",").map((value) => value.trim());
+	const seen = new Set();
+	for (const blocker of blockers) {
+		if (!EXTERNAL_BLOCKER_ID_RE.test(blocker)) {
+			throw new Error(
+				`Task ${taskId}: invalid External blockers id "${blocker}" (expected stable slug)`,
+			);
+		}
+		if (seen.has(blocker)) {
+			throw new Error(
+				`Task ${taskId}: duplicate External blockers id "${blocker}"`,
+			);
+		}
+		seen.add(blocker);
+	}
+	return blockers;
+}
+
+/**
  * Parse and validate a comma-separated Files: field into an array of paths.
  * @param {string} raw The raw value of the Files: field
  * @param {string} taskId Task identifier for error messages
@@ -554,6 +916,76 @@ export function loadTaskQueue(tasksFilePath) {
 }
 
 /**
+ * Validate the task dependency graph before any provider can be selected.
+ *
+ * @param {Array<{id: string, blockedBy?: string[]}>} tasks
+ * @returns {Array} the original task array
+ * @throws {Error} if ids are duplicated, dependencies are unknown/self-referential, or cyclic
+ */
+export function validateTaskGraph(tasks) {
+	if (!Array.isArray(tasks)) {
+		throw new Error("tasks queue must be an array");
+	}
+
+	const byId = new Map();
+	for (const task of tasks) {
+		if (!task || typeof task.id !== "string" || !task.id.trim()) {
+			throw new Error("tasks queue contains a task without a valid id");
+		}
+		if (byId.has(task.id)) {
+			throw new Error(
+				`tasks queue contains a duplicate task id "${task.id}"; refusing to ` +
+					`run the same id twice in one pass — fix the malformed tasks file`,
+			);
+		}
+		byId.set(task.id, task);
+	}
+
+	for (const task of tasks) {
+		const dependencies = task.blockedBy ?? [];
+		if (!Array.isArray(dependencies)) {
+			throw new Error(
+				`Task ${task.id}: blockedBy must be an array of exact task IDs`,
+			);
+		}
+		for (const dependency of dependencies) {
+			if (typeof dependency !== "string" || !byId.has(dependency)) {
+				throw new Error(
+					`Task ${task.id}: unknown Blocked by task "${dependency}"`,
+				);
+			}
+			if (dependency === task.id) {
+				throw new Error(
+					`Task ${task.id}: self-dependency is not allowed in Blocked by`,
+				);
+			}
+		}
+	}
+
+	const visiting = new Set();
+	const visited = new Set();
+	const visit = (taskId, path) => {
+		if (visiting.has(taskId)) {
+			const cycleStart = path.indexOf(taskId);
+			const cycle = [...path.slice(cycleStart), taskId].join(" -> ");
+			throw new Error(`task dependency cycle detected: ${cycle}`);
+		}
+		if (visited.has(taskId)) return;
+
+		visiting.add(taskId);
+		const task = byId.get(taskId);
+		for (const dependency of task.blockedBy ?? []) {
+			visit(dependency, [...path, taskId]);
+		}
+		visiting.delete(taskId);
+		visited.add(taskId);
+	};
+
+	for (const task of tasks) visit(task.id, []);
+	return tasks;
+}
+
+/**
  * Default checkpoint path for a tasks file.
  * @param {string} tasksFilePath
  */
@@ -565,15 +997,24 @@ export function getCheckpointPath(tasksFilePath) {
  * Create an empty checkpoint state.
  * @param {string} tasksFilePath
  */
-export function createEmptyCheckpoint(tasksFilePath) {
-	return {
-		version: CHECKPOINT_VERSION,
+export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
+	const checkpoint = {
+		// Keep the historical shape for direct callers that predate queue
+		// identity. Dispatch/resume paths pass an identity and receive v2.
+		version: identity.queueIdentity
+			? CHECKPOINT_VERSION
+			: HISTORICAL_CHECKPOINT_VERSION,
 		tasksFilePath,
 		completedTaskIds: [],
 		lastTaskId: null,
 		lastUpdatedAt: null,
 		results: [],
 	};
+	if (identity.queueIdentity) {
+		checkpoint.queueIdentity = identity.queueIdentity;
+		checkpoint.runOptions = identity.runOptions ?? null;
+	}
+	return checkpoint;
 }
 
 /**
@@ -626,12 +1067,12 @@ function savePartialDiff(checkpointPath, taskId, diffText) {
  * @param {string} tasksFilePath
  * @throws {Error} if the checkpoint file exists but is unreadable/invalid
  */
-export function loadCheckpoint(checkpointPath, tasksFilePath) {
+export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 	let raw;
 	try {
 		raw = readFileSync(checkpointPath, "utf8");
 	} catch {
-		return createEmptyCheckpoint(tasksFilePath); // no checkpoint yet
+		return createEmptyCheckpoint(tasksFilePath, expected ?? {}); // no checkpoint yet
 	}
 
 	let parsed;
@@ -649,6 +1090,46 @@ export function loadCheckpoint(checkpointPath, tasksFilePath) {
 		Array.isArray(parsed.completedTaskIds) &&
 		Array.isArray(parsed.results)
 	) {
+		if (parsed.tasksFilePath !== tasksFilePath) {
+			throw new Error(
+				`checkpoint identity mismatch: tasksFilePath is ${parsed.tasksFilePath}, expected ${tasksFilePath}`,
+			);
+		}
+		if (!parsed.queueIdentity || typeof parsed.queueIdentity !== "string") {
+			throw new Error(
+				"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
+			);
+		}
+		if (
+			expected?.queueIdentity &&
+			parsed.queueIdentity !== expected.queueIdentity
+		) {
+			throw new Error(
+				`checkpoint identity mismatch: supplied ${parsed.queueIdentity}, expected ${expected.queueIdentity}; create a new checkpoint or use an audited migration`,
+			);
+		}
+		if (
+			expected?.runOptions &&
+			stableStringify(parsed.runOptions) !==
+				stableStringify(expected.runOptions)
+		) {
+			throw new Error(
+				"checkpoint identity mismatch: normalized run options changed; create a new checkpoint or use an audited migration",
+			);
+		}
+		return parsed;
+	}
+
+	if (
+		parsed?.version === HISTORICAL_CHECKPOINT_VERSION &&
+		Array.isArray(parsed.completedTaskIds) &&
+		Array.isArray(parsed.results)
+	) {
+		if (expected?.queueIdentity) {
+			throw new Error(
+				"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
+			);
+		}
 		return parsed;
 	}
 
@@ -671,12 +1152,38 @@ export function loadCheckpoint(checkpointPath, tasksFilePath) {
  *   yielded twice and executed twice in the same pass — `done` only tracks the
  *   checkpoint's completed set, not IDs already yielded earlier in this pass.
  *
- * @param {Array<{id: string, status: string}>} tasks
+ * @param {Array<{id: string, status: string, blockedBy?: string[], externalBlockers?: string[], executor?: string}>} tasks
  * @param {object} checkpoint
+ * @param {object} [options]
+ * @param {Iterable<string>} [options.excludedTaskIds] Task ids already attempted in this run
+ * @param {Iterable<string>} [options.resolvedExternalBlockers] External blocker ids cleared by an operator
  * @throws {Error} if two tasks share the same id (malformed queue)
  */
-export function getRunnableTasks(tasks, checkpoint) {
-	const done = new Set(checkpoint.completedTaskIds);
+export function getRunnableTasks(tasks, checkpoint, options = {}) {
+	validateTaskGraph(tasks);
+	const selectedTaskIds = normalizeIds(
+		options.selectedTaskIds ?? options.taskIds ?? [],
+		"task selection",
+	);
+	if (selectedTaskIds.length > 0) {
+		validateTaskSelection(tasks, checkpoint, selectedTaskIds, options);
+	}
+	const done = new Set(checkpoint?.completedTaskIds ?? []);
+	for (const task of tasks) {
+		if (
+			String(task.status ?? "")
+				.trim()
+				.toLowerCase() === "done"
+		) {
+			done.add(task.id);
+		}
+	}
+	const excluded = new Set(options.excludedTaskIds ?? []);
+	const resolvedExternalBlockers = new Set(
+		options.resolvedExternalBlockers ??
+			checkpoint?.resolvedExternalBlockers ??
+			[],
+	);
 	const seenIds = new Set();
 	const runnable = [];
 
@@ -706,14 +1213,170 @@ export function getRunnableTasks(tasks, checkpoint) {
 			continue; // recognized but intentionally not runnable (done, blocked)
 		}
 
-		if (done.has(task.id)) {
+		if (done.has(task.id) || excluded.has(task.id)) {
 			continue; // already completed per checkpoint
+		}
+
+		if (selectedTaskIds.length > 0 && !selectedTaskIds.includes(task.id)) {
+			continue;
+		}
+
+		if (task.executor === "native" || task.executor === "human") {
+			continue;
+		}
+
+		if (
+			(task.externalBlockers ?? []).some(
+				(blocker) => !resolvedExternalBlockers.has(blocker),
+			)
+		) {
+			continue;
+		}
+
+		if ((task.blockedBy ?? []).some((dependency) => !done.has(dependency))) {
+			continue;
 		}
 
 		runnable.push(task);
 	}
 
 	return runnable;
+}
+
+const QUEUE_DIAGNOSTIC_REASONS = Object.freeze({
+	selectionExplicit: "explicit_task_ids",
+	selectionDefault: "queue_default",
+	runnable: "provider_eligible_and_unblocked",
+	humanGated: "executor_human",
+	nativeGated: "executor_native",
+	dependencyBlocked: "task_dependency",
+	externalBlocked: "external_blocker",
+	completed: "queue_status_or_checkpoint",
+});
+
+/**
+ * Derive bounded, content-free queue diagnostics for status/result surfaces.
+ * Only counts and a closed vocabulary of reason codes leave this function.
+ * @param {Array} tasks parsed queue tasks
+ * @param {object|null} checkpoint checkpoint state
+ * @param {object} [options]
+ * @param {Iterable<string>} [options.selectedTaskIds] explicit selection
+ * @param {Iterable<string>} [options.resolvedExternalBlockers] cleared blockers
+ * @returns {object}
+ */
+export function deriveQueueDiagnostics(tasks, checkpoint, options = {}) {
+	validateTaskGraph(tasks);
+	const selectedTaskIds = normalizeIds(
+		options.selectedTaskIds ?? options.taskIds ?? [],
+		"task selection",
+	);
+	const selected = new Set(selectedTaskIds);
+	const explicitSelection = selected.size > 0;
+	const done = new Set(checkpoint?.completedTaskIds ?? []);
+	for (const task of tasks) {
+		if (
+			String(task.status ?? "")
+				.trim()
+				.toLowerCase() === "done"
+		) {
+			done.add(task.id);
+		}
+	}
+	const resolvedExternalBlockers = new Set(
+		options.resolvedExternalBlockers ??
+			checkpoint?.resolvedExternalBlockers ??
+			[],
+	);
+	const considered = (task) => {
+		const status = String(task.status ?? "")
+			.trim()
+			.toLowerCase();
+		return (
+			(status === "pending" || status === "in progress") &&
+			(!explicitSelection || selected.has(task.id))
+		);
+	};
+	const counts = {
+		selected: explicitSelection
+			? selectedTaskIds.length
+			: tasks.filter((task) => {
+					const status = String(task.status ?? "")
+						.trim()
+						.toLowerCase();
+					return status === "pending" || status === "in progress";
+				}).length,
+		runnable: 0,
+		humanGated: 0,
+		nativeGated: 0,
+		dependencyBlocked: 0,
+		externalBlocked: 0,
+		completed: done.size,
+	};
+
+	for (const task of tasks) {
+		if (!considered(task)) continue;
+		if (task.executor === "human") {
+			counts.humanGated += 1;
+			continue;
+		}
+		if (task.executor === "native") {
+			counts.nativeGated += 1;
+			continue;
+		}
+		if (
+			(task.externalBlockers ?? []).some(
+				(blocker) => !resolvedExternalBlockers.has(blocker),
+			)
+		) {
+			counts.externalBlocked += 1;
+		}
+		if ((task.blockedBy ?? []).some((dependency) => !done.has(dependency))) {
+			counts.dependencyBlocked += 1;
+		}
+		if (
+			task.executor !== "native" &&
+			task.executor !== "human" &&
+			!(task.externalBlockers ?? []).some(
+				(blocker) => !resolvedExternalBlockers.has(blocker),
+			) &&
+			!(task.blockedBy ?? []).some((dependency) => !done.has(dependency))
+		) {
+			counts.runnable += 1;
+		}
+	}
+
+	return {
+		selected: {
+			count: counts.selected,
+			reason: explicitSelection
+				? QUEUE_DIAGNOSTIC_REASONS.selectionExplicit
+				: QUEUE_DIAGNOSTIC_REASONS.selectionDefault,
+		},
+		runnable: {
+			count: counts.runnable,
+			reason: QUEUE_DIAGNOSTIC_REASONS.runnable,
+		},
+		humanGated: {
+			count: counts.humanGated,
+			reason: QUEUE_DIAGNOSTIC_REASONS.humanGated,
+		},
+		nativeGated: {
+			count: counts.nativeGated,
+			reason: QUEUE_DIAGNOSTIC_REASONS.nativeGated,
+		},
+		dependencyBlocked: {
+			count: counts.dependencyBlocked,
+			reason: QUEUE_DIAGNOSTIC_REASONS.dependencyBlocked,
+		},
+		externalBlocked: {
+			count: counts.externalBlocked,
+			reason: QUEUE_DIAGNOSTIC_REASONS.externalBlocked,
+		},
+		completed: {
+			count: counts.completed,
+			reason: QUEUE_DIAGNOSTIC_REASONS.completed,
+		},
+	};
 }
 
 /**
@@ -1697,6 +2360,10 @@ export function runQueue(options) {
 		stopOnFailure = true,
 		exclude = [],
 		only = [],
+		taskIds = [],
+		runOptions,
+		queueIdentity,
+		projectRevision,
 		runId = null,
 		dependencies = {},
 	} = options;
@@ -1818,14 +2485,70 @@ export function runQueue(options) {
 		if (tasks.length === 0) {
 			throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus);
 		}
-		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
-		const runnable = getRunnableTasks(tasks, checkpoint);
+		const identity = resolveQueueIdentity(
+			{
+				tasksFilePath,
+				projectPath,
+				checkpointPath,
+				maxTasks,
+				stopOnFailure,
+				exclude,
+				only,
+				taskIds,
+				runOptions,
+				queueIdentity,
+				projectRevision,
+			},
+			tasks,
+		);
+		const effectiveMaxTasks = identity.runOptions
+			? (identity.runOptions.maxTasks ?? Number.POSITIVE_INFINITY)
+			: maxTasks;
+		const effectiveStopOnFailure = identity.runOptions
+			? identity.runOptions.stopOnFailure
+			: stopOnFailure;
+		const effectiveExclude = identity.runOptions
+			? identity.runOptions.excludeProviders
+			: exclude;
+		const effectiveOnly = identity.runOptions
+			? identity.runOptions.onlyProviders
+			: only;
+		const effectiveTaskIds = identity.runOptions
+			? identity.runOptions.taskIds
+			: taskIds;
+		context.exclude = effectiveExclude;
+		context.only = effectiveOnly;
+		const checkpoint = loadCheckpoint(
+			checkpointPath,
+			tasksFilePath,
+			identity.enabled
+				? {
+						queueIdentity: identity.queueIdentity,
+						runOptions: identity.runOptions,
+					}
+				: null,
+		);
+		const selectionOptions = identity.enabled
+			? { selectedTaskIds: effectiveTaskIds }
+			: {};
+		const initialRunnable = getRunnableTasks(
+			tasks,
+			checkpoint,
+			selectionOptions,
+		);
+		const attemptedTaskIds = new Set();
 		const results = [];
 		let processed = 0;
 		let halted = false;
 
-		for (const task of runnable) {
-			if (processed >= maxTasks) break;
+		while (processed < effectiveMaxTasks) {
+			const runnable = getRunnableTasks(tasks, checkpoint, {
+				excludedTaskIds: attemptedTaskIds,
+				...selectionOptions,
+			});
+			const task = runnable[0];
+			if (!task) break;
+			attemptedTaskIds.add(task.id);
 
 			if (onTaskStart) onTaskStart(task);
 			if (runStore) {
@@ -1961,7 +2684,7 @@ export function runQueue(options) {
 			const haltResult = commitOrResetWorkingContainer(result, {
 				ownsWorkingContainer,
 				workingContainerName,
-				stopOnFailure,
+				stopOnFailure: effectiveStopOnFailure,
 				commitWorkingTreeFn,
 				resetWorkingTreeFn,
 				emitStatus,
@@ -1985,7 +2708,7 @@ export function runQueue(options) {
 				break;
 			}
 
-			if (!result.success && stopOnFailure) {
+			if (!result.success && effectiveStopOnFailure) {
 				break;
 			}
 		}
@@ -2019,11 +2742,18 @@ export function runQueue(options) {
 
 		return {
 			totalTasks: tasks.length,
-			runnableTasks: runnable.length,
+			runnableTasks: initialRunnable.length,
 			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
 			lastTaskId: checkpoint.lastTaskId,
 			checkpointPath,
+			...(identity.enabled
+				? {
+						queueIdentity: identity.queueIdentity,
+						runOptions: identity.runOptions,
+						projectRevision: identity.projectRevision,
+					}
+				: {}),
 			results,
 		};
 	} finally {
@@ -2082,6 +2812,12 @@ export async function runQueueWithOrchestrator(options) {
 		checkpointPath = getCheckpointPath(tasksFilePath),
 		maxTasks = Number.POSITIVE_INFINITY,
 		stopOnFailure = true,
+		exclude = [],
+		only = [],
+		taskIds = [],
+		runOptions,
+		queueIdentity,
+		projectRevision,
 		pollIntervalMs = 10_000,
 		maxPolls = 1_000,
 		runId = null,
@@ -2189,14 +2925,70 @@ export async function runQueueWithOrchestrator(options) {
 		if (tasks.length === 0) {
 			throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus);
 		}
-		const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
-		const runnable = getRunnableTasks(tasks, checkpoint);
+		const identity = resolveQueueIdentity(
+			{
+				tasksFilePath,
+				projectPath,
+				checkpointPath,
+				maxTasks,
+				stopOnFailure,
+				exclude,
+				only,
+				taskIds,
+				runOptions,
+				queueIdentity,
+				projectRevision,
+			},
+			tasks,
+		);
+		const effectiveMaxTasks = identity.runOptions
+			? (identity.runOptions.maxTasks ?? Number.POSITIVE_INFINITY)
+			: maxTasks;
+		const effectiveStopOnFailure = identity.runOptions
+			? identity.runOptions.stopOnFailure
+			: stopOnFailure;
+		const effectiveExclude = identity.runOptions
+			? identity.runOptions.excludeProviders
+			: exclude;
+		const effectiveOnly = identity.runOptions
+			? identity.runOptions.onlyProviders
+			: only;
+		const effectiveTaskIds = identity.runOptions
+			? identity.runOptions.taskIds
+			: taskIds;
+		context.exclude = effectiveExclude;
+		context.only = effectiveOnly;
+		const checkpoint = loadCheckpoint(
+			checkpointPath,
+			tasksFilePath,
+			identity.enabled
+				? {
+						queueIdentity: identity.queueIdentity,
+						runOptions: identity.runOptions,
+					}
+				: null,
+		);
+		const selectionOptions = identity.enabled
+			? { selectedTaskIds: effectiveTaskIds }
+			: {};
+		const initialRunnable = getRunnableTasks(
+			tasks,
+			checkpoint,
+			selectionOptions,
+		);
+		const attemptedTaskIds = new Set();
 		const results = [];
 		let processed = 0;
 		let halted = false;
 
-		for (const task of runnable) {
-			if (processed >= maxTasks) break;
+		while (processed < effectiveMaxTasks) {
+			const runnable = getRunnableTasks(tasks, checkpoint, {
+				excludedTaskIds: attemptedTaskIds,
+				...selectionOptions,
+			});
+			const task = runnable[0];
+			if (!task) break;
+			attemptedTaskIds.add(task.id);
 
 			if (onTaskStart) onTaskStart(task);
 			if (runStore) {
@@ -2289,7 +3081,7 @@ export async function runQueueWithOrchestrator(options) {
 			const haltResult = commitOrResetWorkingContainer(result, {
 				ownsWorkingContainer,
 				workingContainerName,
-				stopOnFailure,
+				stopOnFailure: effectiveStopOnFailure,
 				commitWorkingTreeFn,
 				resetWorkingTreeFn,
 				emitStatus,
@@ -2310,7 +3102,7 @@ export async function runQueueWithOrchestrator(options) {
 				break;
 			}
 
-			if (!result.success && stopOnFailure) {
+			if (!result.success && effectiveStopOnFailure) {
 				break;
 			}
 		}
@@ -2344,11 +3136,18 @@ export async function runQueueWithOrchestrator(options) {
 
 		return {
 			totalTasks: tasks.length,
-			runnableTasks: runnable.length,
+			runnableTasks: initialRunnable.length,
 			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
 			lastTaskId: checkpoint.lastTaskId,
 			checkpointPath,
+			...(identity.enabled
+				? {
+						queueIdentity: identity.queueIdentity,
+						runOptions: identity.runOptions,
+						projectRevision: identity.projectRevision,
+					}
+				: {}),
 			results,
 		};
 	} finally {

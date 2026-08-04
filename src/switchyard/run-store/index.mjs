@@ -61,7 +61,8 @@ const VALID_CLEANUP_STATES = new Set([
 
 const RUN_ID_RE = /^[\w-]+$/;
 
-const CURRENT_SCHEMA_VERSION = 1;
+const HISTORICAL_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 const DEFAULT_LEASE_AGE_MS = 60_000;
 
@@ -117,9 +118,12 @@ function lockFilePath(canonicalPath) {
 }
 
 function validateRun(data) {
-	if (data.schemaVersion !== CURRENT_SCHEMA_VERSION) {
+	if (
+		data.schemaVersion !== HISTORICAL_SCHEMA_VERSION &&
+		data.schemaVersion !== CURRENT_SCHEMA_VERSION
+	) {
 		throw new SchemaError(
-			`Unsupported schemaVersion (expected ${CURRENT_SCHEMA_VERSION})`,
+			`Unsupported schemaVersion (expected ${HISTORICAL_SCHEMA_VERSION} or ${CURRENT_SCHEMA_VERSION})`,
 		);
 	}
 	if (typeof data.runId !== "string") {
@@ -182,6 +186,47 @@ function validateRun(data) {
 	) {
 		throw new SchemaError("workingContainerName must be a string or null");
 	}
+	if (data.schemaVersion === CURRENT_SCHEMA_VERSION) {
+		if (
+			typeof data.queueIdentity !== "string" ||
+			!/^[a-f0-9]{64}$/.test(data.queueIdentity)
+		) {
+			throw new SchemaError("queueIdentity must be a sha256 hex string");
+		}
+		if (typeof data.projectRevision !== "string" || !data.projectRevision) {
+			throw new SchemaError("projectRevision must be a non-empty string");
+		}
+		const options = data.runOptions;
+		if (
+			options === null ||
+			typeof options !== "object" ||
+			Array.isArray(options)
+		) {
+			throw new SchemaError("runOptions must be an object");
+		}
+		if (options.version !== 1) {
+			throw new SchemaError("runOptions.version must be 1");
+		}
+		if (
+			(options.maxTasks !== null &&
+				(!Number.isInteger(options.maxTasks) || options.maxTasks < 1)) ||
+			typeof options.stopOnFailure !== "boolean" ||
+			(options.checkpointPath !== null &&
+				typeof options.checkpointPath !== "string")
+		) {
+			throw new SchemaError("runOptions contains invalid scalar fields");
+		}
+		for (const field of ["onlyProviders", "excludeProviders", "taskIds"]) {
+			if (
+				!Array.isArray(options[field]) ||
+				options[field].some((value) => typeof value !== "string")
+			) {
+				throw new SchemaError(
+					`runOptions.${field} must be an array of strings`,
+				);
+			}
+		}
+	}
 }
 
 async function writeRunAtomically(runJsonPath, data) {
@@ -238,6 +283,9 @@ export async function initializeRun(options) {
 		initialHostFingerprint,
 		workerNonce = "",
 		launchArgs = [],
+		projectRevision = null,
+		runOptions = undefined,
+		queueIdentity = undefined,
 	} = options;
 
 	validateRunId(runId);
@@ -256,8 +304,14 @@ export async function initializeRun(options) {
 	await ensureDir(resolve(runDir, "artifacts"), 0o700);
 
 	const now = new Date().toISOString();
+	const versioned =
+		queueIdentity !== undefined ||
+		runOptions !== undefined ||
+		projectRevision !== null;
 	const snapshot = {
-		schemaVersion: CURRENT_SCHEMA_VERSION,
+		schemaVersion: versioned
+			? CURRENT_SCHEMA_VERSION
+			: HISTORICAL_SCHEMA_VERSION,
 		runId,
 		state: "created",
 		cleanupState: "not_started",
@@ -281,6 +335,11 @@ export async function initializeRun(options) {
 		lastEventSequence: 0,
 		launchArgs,
 	};
+	if (versioned) {
+		snapshot.projectRevision = projectRevision ?? "unknown";
+		snapshot.runOptions = runOptions ?? null;
+		snapshot.queueIdentity = queueIdentity;
+	}
 
 	await writeRunAtomically(runJsonPath, snapshot);
 	return snapshot;
@@ -440,6 +499,7 @@ export async function createEvent(runId, event) {
 	const nextSeq = current.lastEventSequence + 1;
 
 	const entry = {
+		schemaVersion: current.schemaVersion,
 		sequence: nextSeq,
 		timestamp: new Date().toISOString(),
 		phase: event.phase,

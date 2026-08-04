@@ -60,9 +60,13 @@ import {
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
 import {
+	computeQueueIdentityFromFile,
+	deriveQueueDiagnostics,
 	getCheckpointPath,
+	getProjectRevision,
 	loadCheckpoint,
 	loadTaskQueue,
+	normalizeRunOptions,
 	runQueue,
 } from "../runner/index.mjs";
 
@@ -82,6 +86,7 @@ Run/Launch options:
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
+  --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
 const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [options]
@@ -92,6 +97,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
+  --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
 const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <path> [options]
@@ -102,6 +108,7 @@ const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <pa
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
+  --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
 const USAGE_STATUS = `Usage: switchyard-dispatch status <run-id> [--json]
@@ -190,6 +197,7 @@ function parseDispatchArgs(argv) {
 				"exclude-provider": { type: "string", multiple: true },
 				"only-provider": { type: "string", multiple: true },
 				provider: { type: "string", multiple: true },
+				"task-id": { type: "string", multiple: true },
 				help: { type: "boolean", default: false },
 			},
 		});
@@ -262,6 +270,7 @@ function parseDispatchArgs(argv) {
 		stopOnFailure: !values["no-stop-on-failure"],
 		excludeProviders: values["exclude-provider"] ?? [],
 		onlyProviders,
+		taskIds: values["task-id"] ?? [],
 	};
 }
 
@@ -434,8 +443,10 @@ async function runDispatch(opts, dependencies = {}) {
 	// a contention failure it throws the existing LockError and the finally
 	// block advances this run's already-written record to a terminal state.
 	let runStoreReady = false;
+	let identity = null;
 	try {
 		const tasks = loadTaskQueue(opts.tasksFilePath);
+		identity = prepareRunIdentity(opts);
 		await initializeRun({
 			runId,
 			tasksFilePath: opts.tasksFilePath,
@@ -443,6 +454,9 @@ async function runDispatch(opts, dependencies = {}) {
 			orderedTaskIds: tasks.map((t) => t.id),
 			initialHostFingerprint: captureHostFingerprint(opts.projectPath),
 			workerNonce: nonce,
+			projectRevision: identity.projectRevision,
+			runOptions: identity.runOptions,
+			queueIdentity: identity.queueIdentity,
 		});
 		await acquireRunLock(runId, pid, startToken, nonce);
 		await advanceState(runId, "running");
@@ -474,10 +488,15 @@ async function runDispatch(opts, dependencies = {}) {
 			tasksFilePath: opts.tasksFilePath,
 			projectPath: opts.projectPath,
 			maxTasks: opts.maxTasks,
-			...(opts.checkpointPath ? { checkpointPath: opts.checkpointPath } : {}),
+			checkpointPath:
+				opts.checkpointPath ?? getCheckpointPath(opts.tasksFilePath),
 			stopOnFailure: opts.stopOnFailure,
 			exclude: opts.excludeProviders,
 			only: opts.onlyProviders,
+			taskIds: opts.taskIds,
+			runOptions: identity?.runOptions,
+			queueIdentity: identity?.queueIdentity,
+			projectRevision: identity?.projectRevision,
 			...(runStoreReady ? { runId } : {}),
 			dependencies: {
 				onTaskStart: (task) =>
@@ -573,6 +592,26 @@ function captureHostFingerprint(projectPath) {
 	return `git:${head || "no-head"}:${dirty}`;
 }
 
+function prepareRunIdentity(opts) {
+	const checkpointPath =
+		opts.checkpointPath ?? getCheckpointPath(opts.tasksFilePath);
+	const runOptions = normalizeRunOptions({
+		maxTasks: opts.maxTasks,
+		checkpointPath,
+		stopOnFailure: opts.stopOnFailure,
+		onlyProviders: opts.onlyProviders,
+		excludeProviders: opts.excludeProviders,
+		taskIds: opts.taskIds,
+	});
+	const projectRevision = getProjectRevision(opts.projectPath);
+	const { queueIdentity } = computeQueueIdentityFromFile(
+		opts.tasksFilePath,
+		projectRevision,
+		runOptions,
+	);
+	return { checkpointPath, projectRevision, runOptions, queueIdentity };
+}
+
 function resolveBootstrapPath() {
 	return fileURLToPath(new URL("./worker-bootstrap.mjs", import.meta.url));
 }
@@ -604,6 +643,7 @@ async function handleLaunch(argv) {
 		);
 	}
 	const orderedTaskIds = tasks.map((t) => t.id);
+	const identity = prepareRunIdentity(opts);
 
 	const launchArgs = process.argv.slice(2).filter((a) => a !== "launch");
 	const nonce = randomUUID();
@@ -617,6 +657,9 @@ async function handleLaunch(argv) {
 		initialHostFingerprint: fingerprint,
 		workerNonce: nonce,
 		launchArgs,
+		projectRevision: identity.projectRevision,
+		runOptions: identity.runOptions,
+		queueIdentity: identity.queueIdentity,
 	});
 
 	// NOTE: the pre-dispatch sweep runs in the detached WORKER
@@ -637,6 +680,7 @@ async function handleLaunch(argv) {
 		excludeProviders: opts.excludeProviders,
 		onlyProviders: opts.onlyProviders,
 		stopOnFailure: opts.stopOnFailure,
+		taskIds: opts.taskIds,
 	});
 
 	await acquireProjectLock(opts.projectPath, runId);
@@ -682,12 +726,13 @@ async function handleLaunch(argv) {
 		return;
 	}
 
-	await markLauncherReadyIfLaunching(runId);
+	const readyRun = await markLauncherReadyIfLaunching(runId);
 
 	const envelope = {
-		schemaVersion: 1,
+		schemaVersion: readyRun.schemaVersion ?? 1,
 		runId,
 		state: "launcher_ready",
+		queueIdentity: readyRun.queueIdentity ?? null,
 		statusCommand: `switchyard-dispatch status ${runId}`,
 		resultCommand: `switchyard-dispatch result ${runId}`,
 	};
@@ -737,14 +782,45 @@ function countCompletedAndFailed(events) {
 // always the one in effect for a launched run.
 function readCheckpointStateForRun(run) {
 	try {
+		const checkpointPath =
+			run.runOptions?.checkpointPath ?? getCheckpointPath(run.tasksFilePath);
 		return loadCheckpoint(
-			getCheckpointPath(run.tasksFilePath),
+			checkpointPath,
 			run.tasksFilePath,
+			run.queueIdentity
+				? {
+						queueIdentity: run.queueIdentity,
+						runOptions: run.runOptions,
+					}
+				: null,
 		);
 	} catch {
 		// checkpoint exists but is corrupt/unreadable — degrade rather than
 		// failing an otherwise-healthy status/result read
 		return null;
+	}
+}
+
+const QUEUE_DIAGNOSTICS_UNAVAILABLE = Object.freeze({
+	selected: { count: 0, reason: "queue_unavailable" },
+	runnable: { count: 0, reason: "queue_unavailable" },
+	humanGated: { count: 0, reason: "queue_unavailable" },
+	nativeGated: { count: 0, reason: "queue_unavailable" },
+	dependencyBlocked: { count: 0, reason: "queue_unavailable" },
+	externalBlocked: { count: 0, reason: "queue_unavailable" },
+	completed: { count: 0, reason: "queue_unavailable" },
+});
+
+function readQueueDiagnosticsForRun(run, checkpointState) {
+	try {
+		const tasks = loadTaskQueue(run.tasksFilePath);
+		return deriveQueueDiagnostics(tasks, checkpointState, {
+			selectedTaskIds: run.runOptions?.taskIds ?? run.taskIds ?? [],
+		});
+	} catch {
+		// Status/result are observation surfaces. A malformed or unavailable
+		// queue must never echo its parser error or arbitrary task content.
+		return QUEUE_DIAGNOSTICS_UNAVAILABLE;
 	}
 }
 
@@ -899,9 +975,11 @@ async function buildStatusEnvelope(runId, run) {
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
+	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
 	return {
-		schemaVersion: 1,
+		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
+		queueIdentity: run.queueIdentity ?? null,
 		state: run.state,
 		cleanupState: run.cleanupState,
 		// Liveness derived from a signal-0 probe of the recorded worker pid
@@ -925,6 +1003,7 @@ async function buildStatusEnvelope(runId, run) {
 		activeTaskDeadline: run.activeTaskDeadline ?? null,
 		completedCount,
 		failedCount,
+		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		...telemetry,
 	};
@@ -947,10 +1026,12 @@ async function buildResultEnvelope(runId, run) {
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
+	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
 	const artifactRefs = await listArtifactRefs(runId);
 	return {
-		schemaVersion: 1,
+		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
+		queueIdentity: run.queueIdentity ?? null,
 		state: run.state,
 		cleanupState: run.cleanupState,
 		workerLive: run.state === "running" ? isWorkerLive(run) : null,
@@ -967,6 +1048,7 @@ async function buildResultEnvelope(runId, run) {
 		activeTaskDeadline: run.activeTaskDeadline ?? null,
 		completedCount,
 		failedCount,
+		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		terminalSummary: run.terminalSummary ?? null,
 		artifactRefs,

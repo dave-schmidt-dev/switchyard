@@ -174,24 +174,38 @@ try {
 	// in the runner — none of which run concurrently with a foreign live run.
 
 	const { runQueue: runQueueFn } = await import("../runner/index.mjs");
+	const persistedRunOptions = run.runOptions ?? null;
 
 	const result = runQueueFn({
 		tasksFilePath: run.tasksFilePath,
 		projectPath: run.projectPath,
-		maxTasks: Number.POSITIVE_INFINITY,
+		maxTasks: persistedRunOptions?.maxTasks ?? Number.POSITIVE_INFINITY,
+		checkpointPath:
+			persistedRunOptions?.checkpointPath ??
+			`${run.tasksFilePath}.checkpoint.json`,
 		// Defensive fallback: a run record written before this field existed
 		// (or a hand-built fixture in a test) won't have stopOnFailure at all —
 		// default to true (stop on first failure), today's existing behavior.
-		stopOnFailure: run.stopOnFailure ?? true,
+		stopOnFailure:
+			persistedRunOptions?.stopOnFailure ?? run.stopOnFailure ?? true,
 		// Stamp the working container with this run's id so a leaked container
 		// is discoverable + liveness-checkable by `recover` (labeled branch).
 		runId,
 		// Defensive fallback: a run.json written before this field existed (or
 		// a hand-built fixture in a test) won't have excludeProviders at all.
-		exclude: run.excludeProviders ?? [],
+		exclude:
+			persistedRunOptions?.excludeProviders ?? run.excludeProviders ?? [],
 		// Defensive fallback: a run.json written before this field existed (or
 		// a hand-built fixture in a test) won't have onlyProviders at all.
-		only: run.onlyProviders ?? [],
+		only: persistedRunOptions?.onlyProviders ?? run.onlyProviders ?? [],
+		taskIds: persistedRunOptions?.taskIds ?? run.taskIds ?? [],
+		...(run.queueIdentity
+			? {
+					runOptions: persistedRunOptions,
+					queueIdentity: run.queueIdentity,
+					projectRevision: run.projectRevision,
+				}
+			: {}),
 		dependencies: {
 			// These callbacks all use updateRunWithRetry rather than a
 			// read-then-updateRun(fixed revision) pair, and each one synchronously
