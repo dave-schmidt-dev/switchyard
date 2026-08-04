@@ -34,7 +34,7 @@ import {
 	startAgentContainer,
 } from "../container/index.mjs";
 import { integrationGate } from "../integrate/index.mjs";
-import { recordDispatch } from "../ledger/index.mjs";
+import { recordDispatch, recordDispatchToStore } from "../ledger/index.mjs";
 import {
 	commitWorkingTree,
 	createWorkingContainer,
@@ -1022,11 +1022,11 @@ export async function executeTaskWithOrchestrator(task, context) {
 	// through the provenance-injecting `record()`.
 	const provenance = resolveRouteProvenance(routeResult.provider, tier);
 	Object.assign(routeResult, provenance);
-	const record = (dispatch) =>
-		context.recordDispatch({ ...provenance, ...dispatch });
+	const record = async (dispatch) =>
+		await context.recordDispatch({ ...provenance, ...dispatch });
 
 	if (!routeResult.provider) {
-		record({
+		await record({
 			provider: "none",
 			model: "none",
 			taskId: task.id,
@@ -1053,7 +1053,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			workingContainerName: context.workingContainerName,
 		});
 	} catch (error) {
-		record({
+		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -1081,7 +1081,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 	});
 
 	if (waited.state !== "done") {
-		record({
+		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -1108,7 +1108,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 	try {
 		jobResult = await context.orchestrator.result(jobId);
 	} catch (error) {
-		record({
+		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -1125,7 +1125,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 	if (!jobResult?.success) {
-		record({
+		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -1156,7 +1156,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 	}
 
 	if (!diff && task.requiredPaths === null) {
-		record({
+		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
@@ -1202,7 +1202,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		}
 	}
 
-	record({
+	await record({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
@@ -1544,6 +1544,14 @@ const DEFAULT_ADAPTERS = {
 	},
 };
 
+function recordDispatchToBothLedgers(
+	dispatch,
+	recordDispatchToStoreFn = recordDispatchToStore,
+) {
+	recordDispatch(dispatch);
+	return recordDispatchToStoreFn(dispatch);
+}
+
 /**
  * Run queue serially with host-side checkpointing.
  * @param {object} options
@@ -1636,9 +1644,23 @@ export function runQueue(options) {
 		onContainerReady({ workingContainerName });
 	}
 
+	const recordDispatchToStoreFn =
+		dependencies.recordDispatchToStore ?? recordDispatchToStore;
+	let storeWriteChain = Promise.resolve();
+	const defaultRecordDispatch = (dispatch) => {
+		recordDispatch(dispatch);
+		storeWriteChain = storeWriteChain.then(() =>
+			recordDispatchToStoreFn(dispatch),
+		);
+		storeWriteChain = storeWriteChain.catch((error) => {
+			console.warn(
+				`runQueue: project-local dispatch ledger write failed: ${error.message}`,
+			);
+		});
+	};
 	const context = {
 		route: dependencies.route ?? route,
-		recordDispatch: dependencies.recordDispatch ?? recordDispatch,
+		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
@@ -1995,9 +2017,14 @@ export async function runQueueWithOrchestrator(options) {
 		}
 	}
 
+	const recordDispatchToStoreFn =
+		dependencies.recordDispatchToStore ?? recordDispatchToStore;
+	const defaultRecordDispatch = async (dispatch) => {
+		await recordDispatchToBothLedgers(dispatch, recordDispatchToStoreFn);
+	};
 	const context = {
 		route: dependencies.route ?? route,
-		recordDispatch: dependencies.recordDispatch ?? recordDispatch,
+		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
 		orchestrator: resolveOrchestrator(dependencies),
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,

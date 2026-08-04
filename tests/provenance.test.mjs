@@ -17,13 +17,20 @@
 //   4. recordDispatchToStore preserves the provenance fields for parity with the
 //      default file ledger.
 
-import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	rejects,
+	strictEqual,
+} from "node:assert";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	readLedger,
 	readLedgerFromStore,
 	recordDispatchToStore,
 } from "../src/switchyard/ledger/index.mjs";
@@ -37,6 +44,8 @@ import {
 import {
 	executeTask,
 	executeTaskWithOrchestrator,
+	runQueue,
+	runQueueWithOrchestrator,
 } from "../src/switchyard/runner/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -44,6 +53,8 @@ const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 const previousHomeDir = process.env.HOME;
+const previousLegacyLedgerPath = process.env.SWITCHYARD_LEDGER_PATH;
+const previousRunStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 let tmpDir;
 
 function setRosterPath(value) {
@@ -400,6 +411,101 @@ function makeOrchestratorContext({
 	};
 }
 
+function restoreLedgerPaths() {
+	if (previousLegacyLedgerPath === undefined)
+		delete process.env.SWITCHYARD_LEDGER_PATH;
+	else process.env.SWITCHYARD_LEDGER_PATH = previousLegacyLedgerPath;
+	if (previousRunStoreRoot === undefined)
+		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+	else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRunStoreRoot;
+}
+
+function makeDefaultWiringFixture(taskId) {
+	tmpDir = mkdtempSync(join(tmpdir(), "switchyard-ledger-wiring-"));
+	const tasksFilePath = join(tmpDir, `${taskId}.md`);
+	writeFileSync(
+		tasksFilePath,
+		"### Task 1.1: Default ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Description:** write matching ledger records\n",
+		"utf8",
+	);
+
+	const legacyLedgerPath = join(tmpDir, "legacy-dispatch-ledger.jsonl");
+	const storeRoot = join(tmpDir, "run-store");
+	process.env.SWITCHYARD_LEDGER_PATH = legacyLedgerPath;
+	process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
+
+	return {
+		taskId: "1.1",
+		tasksFilePath,
+		checkpointPath: join(tmpDir, `${taskId}.checkpoint.json`),
+		legacyLedgerPath,
+		storeRoot,
+	};
+}
+
+function defaultRoute() {
+	return {
+		provider: "OpenCode Go",
+		model: "fixture/opencode-low",
+		percentLeft: 50,
+		reason: "spread",
+		log: [],
+	};
+}
+
+function defaultSyncDependencies(overrides = {}) {
+	return {
+		route: defaultRoute,
+		adapters: {
+			opencode: {
+				execute: () => ({ success: true }),
+				captureDiff: () => "",
+			},
+		},
+		...overrides,
+	};
+}
+
+function defaultOrchestratorDependencies(overrides = {}) {
+	return {
+		route: defaultRoute,
+		adapters: { opencode: {} },
+		orchestrator: {
+			launch: async () => "job-default-ledger",
+			status: async () => ({ state: "done" }),
+			result: async () => ({ success: true, diff: "" }),
+		},
+		...overrides,
+	};
+}
+
+async function waitForStoreRecord(storeRoot, taskId) {
+	for (let attempts = 0; attempts < 50; attempts += 1) {
+		const entries = await readLedgerFromStore(storeRoot);
+		const record = entries.find((entry) => entry.taskId === taskId);
+		if (record) return record;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	throw new Error(
+		`timed out waiting for project-local ledger record ${taskId}`,
+	);
+}
+
+function assertMatchingLedgerRecords(legacyRecord, storeRecord) {
+	for (const key of [
+		"provider",
+		"model",
+		"taskId",
+		"result",
+		"reason",
+		"percentLeft",
+		...PROVENANCE_KEYS,
+	]) {
+		strictEqual(storeRecord[key], legacyRecord[key], `matching ${key}`);
+	}
+	strictEqual(storeRecord.storeBacked, true);
+}
+
 // executeTaskWithOrchestrator (Task 1.6, M7/M8) duplicates executeTask's
 // provenance-wiring shape verbatim (resolve once via resolveRouteProvenance,
 // Object.assign onto routeResult, route every record() call through it) but
@@ -460,6 +566,212 @@ describe("executeTaskWithOrchestrator — every dispatch record carries all six 
 				rec.resolved_credential_profile.length > 0,
 			`expected a credential profile, got ${rec.resolved_credential_profile}`,
 		);
+	});
+});
+
+describe("default runner ledger wiring", () => {
+	it("dual-writes matching records from the synchronous runner", async () => {
+		const fixture = makeDefaultWiringFixture("sync-default-ledger");
+		try {
+			const result = runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies(),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+
+			const legacyRecord = readLedger().at(-1);
+			const storeRecord = await waitForStoreRecord(
+				fixture.storeRoot,
+				fixture.taskId,
+			);
+			assertMatchingLedgerRecords(legacyRecord, storeRecord);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
+	it("dual-writes matching records from the orchestrator runner", async () => {
+		const fixture = makeDefaultWiringFixture("orchestrator-default-ledger");
+		try {
+			const result = await runQueueWithOrchestrator({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultOrchestratorDependencies(),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+
+			const legacyRecord = readLedger().at(-1);
+			const storeRecord = (await readLedgerFromStore(fixture.storeRoot)).at(-1);
+			assertMatchingLedgerRecords(legacyRecord, storeRecord);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
+	it("serializes synchronous store writes in dispatch order", async () => {
+		const fixture = makeDefaultWiringFixture("sync-store-order");
+		const tasksFilePath = join(tmpDir, "sync-store-order-tasks.md");
+		writeFileSync(
+			tasksFilePath,
+			[
+				"### Task 1.1: First ordered ledger task",
+				"- **Status:** pending",
+				"- **Type:** review",
+				"- **Description:** first ordered task",
+				"",
+				"### Task 1.2: Second ordered ledger task",
+				"- **Status:** pending",
+				"- **Type:** review",
+				"- **Description:** second ordered task",
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		let releaseFirst;
+		const firstStoreWrite = new Promise((resolve) => {
+			releaseFirst = resolve;
+		});
+		const delayedStoreWriter = async (dispatch, storeRoot) => {
+			if (dispatch.taskId === "1.1") await firstStoreWrite;
+			await recordDispatchToStore(dispatch, storeRoot);
+		};
+
+		try {
+			const result = runQueue({
+				tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies({
+					recordDispatchToStore: delayedStoreWriter,
+				}),
+			});
+			strictEqual(result.results.length, 2);
+			deepStrictEqual(
+				readLedger().map((record) => record.taskId),
+				["1.1", "1.2"],
+			);
+
+			releaseFirst();
+			let storeRecords = [];
+			for (let attempts = 0; attempts < 50; attempts += 1) {
+				storeRecords = await readLedgerFromStore(fixture.storeRoot);
+				if (storeRecords.length === 2) break;
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			deepStrictEqual(
+				storeRecords.map((record) => record.taskId),
+				["1.1", "1.2"],
+			);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
+	it("lets an injected recorder replace both default writers", async () => {
+		const fixture = makeDefaultWiringFixture("override-sync-ledger");
+		const overrides = [];
+		try {
+			runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: {
+					...defaultSyncDependencies(),
+					recordDispatch: (record) => overrides.push(record),
+				},
+			});
+
+			const orchestratorTaskId = "override-orchestrator-ledger";
+			const orchestratorTasksFilePath = join(
+				tmpDir,
+				`${orchestratorTaskId}.md`,
+			);
+			writeFileSync(
+				orchestratorTasksFilePath,
+				"### Task 1.1: Override ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Description:** use the injected recorder\n",
+				"utf8",
+			);
+			await runQueueWithOrchestrator({
+				tasksFilePath: orchestratorTasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: join(tmpDir, `${orchestratorTaskId}.checkpoint.json`),
+				dependencies: {
+					...defaultOrchestratorDependencies(),
+					recordDispatch: (record) => overrides.push(record),
+				},
+			});
+
+			strictEqual(overrides.length, 2);
+			strictEqual(readLedger().length, 0);
+			deepStrictEqual(await readLedgerFromStore(fixture.storeRoot), []);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
+	it("warns and completes when the synchronous store write fails", async () => {
+		const fixture = makeDefaultWiringFixture("sync-store-write-failure");
+		writeFileSync(fixture.storeRoot, "not a directory", "utf8");
+		const warnings = [];
+		const originalWarn = console.warn;
+		console.warn = (message) => warnings.push(message);
+		try {
+			const result = runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies(),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+
+			for (
+				let attempts = 0;
+				attempts < 50 && warnings.length === 0;
+				attempts += 1
+			) {
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			strictEqual(warnings.length, 1);
+			ok(
+				warnings[0].startsWith(
+					"runQueue: project-local dispatch ledger write failed:",
+				),
+			);
+		} finally {
+			console.warn = originalWarn;
+			restoreLedgerPaths();
+		}
+	});
+
+	it("propagates an orchestrator store-write failure after the legacy record", async () => {
+		const fixture = makeDefaultWiringFixture(
+			"orchestrator-store-write-failure",
+		);
+		writeFileSync(fixture.storeRoot, "not a directory", "utf8");
+		try {
+			await rejects(
+				runQueueWithOrchestrator({
+					tasksFilePath: fixture.tasksFilePath,
+					projectPath: tmpDir,
+					workingContainerName: "test-container",
+					checkpointPath: fixture.checkpointPath,
+					dependencies: defaultOrchestratorDependencies(),
+				}),
+				/(EEXIST|ENOTDIR|not a directory)/,
+			);
+			strictEqual(readLedger().length, 1);
+		} finally {
+			restoreLedgerPaths();
+		}
 	});
 });
 
