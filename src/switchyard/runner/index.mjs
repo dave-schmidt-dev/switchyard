@@ -305,6 +305,12 @@ export function parseTaskQueue(markdown) {
 			type = parseTypeField(typeValue, taskId);
 		}
 
+		if (type === "implementation" && requiredPaths === null) {
+			throw new Error(
+				`Task ${taskId}: implementation-type task requires a Files: field (declare Type: review to exempt review tasks)`,
+			);
+		}
+
 		tasks.push({
 			id: taskId,
 			title: title.trim(),

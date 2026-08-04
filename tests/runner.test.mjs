@@ -72,10 +72,12 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do first thing
 
 ### Task 1.2: Second task
 - **Status:** in progress
+- **Files:** src/a.mjs
 - **Description:** Do second thing
 `;
 
@@ -91,10 +93,12 @@ describe("runner queue parsing", () => {
 		const markdown = `
 ### Task 2.1: Work section task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Work:** Do the work steps
 
 ### Task 2.2: Raw body task
 - **Status:** pending
+- **Files:** src/a.mjs
 1. Step one
 2. Step two
 `;
@@ -235,11 +239,12 @@ describe("runner queue parsing", () => {
 		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs", "tests/a.test.mjs"]);
 	});
 
-	it("sets requiredPaths to null when no Files: field is present", () => {
+	it("sets requiredPaths to null when no Files: field is present on a review task", () => {
 		const markdown = `## Phase 1
 
 ### Task 1.1: Simple task
 - **Status:** pending
+- **Type:** review
 - **Description:** Do things
 `;
 		const tasks = parseTaskQueue(markdown);
@@ -342,6 +347,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Long task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Timeout:** 90m
 - **Description:** Needs more than the default 30 minutes
 `;
@@ -353,19 +359,19 @@ describe("runner queue parsing", () => {
 	it("extracts timeoutMs from a Timeout: field in seconds, hours, and fractional hours", () => {
 		strictEqual(
 			parseTaskQueue(
-				"### Task 1.1: T\n- **Status:** pending\n- **Timeout:** 45s\n",
+				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Timeout:** 45s\n",
 			)[0].timeoutMs,
 			45 * 1000,
 		);
 		strictEqual(
 			parseTaskQueue(
-				"### Task 1.1: T\n- **Status:** pending\n- **Timeout:** 2h\n",
+				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Timeout:** 2h\n",
 			)[0].timeoutMs,
 			2 * 3_600_000,
 		);
 		strictEqual(
 			parseTaskQueue(
-				"### Task 1.1: T\n- **Status:** pending\n- **Timeout:** 1.5h\n",
+				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Timeout:** 1.5h\n",
 			)[0].timeoutMs,
 			1.5 * 3_600_000,
 		);
@@ -376,6 +382,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Simple task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do things
 `;
 		const tasks = parseTaskQueue(markdown);
@@ -388,6 +395,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Bad task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Timeout:** 90
 - **Description:** Bad
 `;
@@ -402,6 +410,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Bad task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Timeout:** 90ms
 - **Description:** Bad
 `;
@@ -416,6 +425,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Bad task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Timeout:** 0s
 - **Description:** Bad
 `;
@@ -427,6 +437,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Bad task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Timeout:** 48h
 - **Description:** Bad
 `;
@@ -442,6 +453,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Declared tier task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Tier:** Standard
 - **Description:** Whatever classifyTask would guess is irrelevant here
 `;
@@ -455,6 +467,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Simple task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do things
 `;
 		const tasks = parseTaskQueue(markdown);
@@ -467,6 +480,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Bad task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Tier:** urgent
 - **Description:** Bad
 `;
@@ -481,6 +495,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Simple task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do things
 `;
 		const tasks = parseTaskQueue(markdown);
@@ -493,6 +508,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Review task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Type:** Review
 - **Description:** Perform code review
 `;
@@ -506,6 +522,7 @@ describe("runner queue parsing", () => {
 
 ### Task 1.1: Bad type task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Type:** audit
 - **Description:** Bad type
 `;
@@ -513,6 +530,48 @@ describe("runner queue parsing", () => {
 			() => parseTaskQueue(markdown),
 			/invalid Type field "audit" \(expected one of: implementation, review\)/,
 		);
+	});
+
+	// Task 2.2: mandatory Files: for implementation-type tasks
+	it("rejects an implementation-type task without Files: field, failing closed at parse time", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Implementation task without files
+- **Status:** pending
+- **Type:** implementation
+- **Description:** Do work
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/Task 1.1: implementation-type task requires a Files: field/,
+		);
+	});
+
+	it("rejects a task defaulting to implementation-type without Files: field", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Default implementation task without files
+- **Status:** pending
+- **Description:** Do work
+`;
+		throws(
+			() => parseTaskQueue(markdown),
+			/Task 1.1: implementation-type task requires a Files: field/,
+		);
+	});
+
+	it("allows review-type task without Files: field, leaving requiredPaths as null", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Review task without files
+- **Status:** pending
+- **Type:** review
+- **Description:** Review PR
+`;
+		const tasks = parseTaskQueue(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].type, "review");
+		strictEqual(tasks[0].requiredPaths, null);
 	});
 });
 
@@ -522,10 +581,12 @@ describe("runner orchestration", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -568,8 +629,8 @@ describe("runner orchestration", () => {
 		strictEqual(result.completedTaskIds.length, 2);
 		strictEqual(dispatches.length, 2);
 		deepStrictEqual(prompts, [
-			"### Task 1.1: First task\n- **Status:** pending\n- **Description:** First operation",
-			"### Task 1.2: Second task\n- **Status:** pending\n- **Description:** Second operation",
+			"### Task 1.1: First task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
@@ -581,10 +642,12 @@ describe("runner orchestration", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -632,8 +695,8 @@ describe("runner orchestration", () => {
 		});
 
 		deepStrictEqual(prompts, [
-			"### Task 1.1: First task\n- **Status:** pending\n- **Description:** First operation",
-			"### Task 1.2: Second task\n- **Status:** pending\n- **Description:** Second operation",
+			"### Task 1.1: First task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 	});
 });
@@ -667,10 +730,12 @@ describe("runner stopOnFailure + integration gate failure", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -698,10 +763,12 @@ describe("runner stopOnFailure + integration gate failure", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -787,10 +854,12 @@ describe("runner headless orchestrator mode", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -849,13 +918,13 @@ describe("runner headless orchestrator mode", () => {
 		strictEqual(dispatches.length, 2);
 		deepStrictEqual(
 			dispatches.map((entry) => entry.result),
-			["success", "success_no_diff"],
+			["success", "success"],
 		);
 		deepStrictEqual(
 			launches.map((payload) => payload.prompt),
 			[
-				"### Task 1.1: First task\n- **Status:** pending\n- **Description:** First operation",
-				"### Task 1.2: Second task\n- **Status:** pending\n- **Description:** Second operation",
+				"### Task 1.1: First task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** First operation",
+				"### Task 1.2: Second task\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 			],
 		);
 		deepStrictEqual(polls, ["running", "done", "done"]);
@@ -869,10 +938,12 @@ describe("runner headless orchestrator mode", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -939,6 +1010,7 @@ describe("runner headless orchestrator mode", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1022,10 +1094,12 @@ describe("runner provider spread recording", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Type:** review
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Type:** review
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1091,10 +1165,12 @@ describe("runner provider spread recording", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Type:** review
 - **Description:** integration task one
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Type:** review
 - **Description:** integration task two
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1213,6 +1289,7 @@ describe("runner provider spread recording", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** simple trivial cleanup
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1571,6 +1648,7 @@ describe("checkpoint durability", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1620,10 +1698,12 @@ describe("orchestrator status/result error guards", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1703,6 +1783,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1749,6 +1830,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 
@@ -1803,6 +1885,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1888,10 +1971,12 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1944,6 +2029,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -1985,6 +2071,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2022,6 +2109,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2061,6 +2149,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2141,6 +2230,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2187,14 +2277,17 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 
 ### Task 1.3: Third
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** third task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2252,10 +2345,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2302,10 +2397,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2356,6 +2453,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2402,14 +2500,17 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 
 ### Task 1.3: Third
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** third task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2482,10 +2583,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2541,6 +2644,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2587,10 +2691,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2650,6 +2756,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2701,6 +2808,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2758,10 +2866,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2867,10 +2977,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -2957,10 +3069,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3058,10 +3172,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3137,10 +3253,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Fails
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Times out
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3206,10 +3324,12 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Fails
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Times out
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3293,6 +3413,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3372,6 +3493,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3451,6 +3573,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 
 ### Task 1.1: Failing
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3511,10 +3634,12 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3563,6 +3688,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 - **Timeout:** 60s
 `);
@@ -3621,6 +3747,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3672,6 +3799,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3741,6 +3869,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Failing task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** This will fail
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3789,6 +3918,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Gate-failing task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** This will be rejected
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3840,10 +3970,12 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: First
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** first task
 
 ### Task 1.2: Second
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** second task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3889,6 +4021,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3933,6 +4066,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -3980,6 +4114,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4016,6 +4151,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4062,6 +4198,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4114,6 +4251,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4174,6 +4312,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 
 ### Task 1.1: Failing task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** This will fail
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4333,6 +4472,7 @@ describe("Files requiredPaths propagation", () => {
 
 ### Task 1.1: File task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Simple operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4384,6 +4524,7 @@ describe("Files requiredPaths propagation", () => {
 
 ### Task 1.1: File task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Simple operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4431,10 +4572,12 @@ describe("runner runStore dependency", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4497,6 +4640,7 @@ describe("runner runStore dependency", () => {
 
 ### Task 1.1: Failing task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** This will fail
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4543,10 +4687,12 @@ describe("runner runStore dependency", () => {
 
 ### Task 1.1: First task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4871,6 +5017,7 @@ describe("runner tier resolution (Task 2.1: respect the upstream-declared tier)"
 
 ### Task 1.1: Declared-tier task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Tier:** high
 - **Description:** format the readme
 `);
@@ -4896,6 +5043,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -4938,6 +5086,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5011,6 +5160,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5053,6 +5203,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 
 ### Task 1.1: Only task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** First operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5173,6 +5324,7 @@ describe("runQueue timeout diff persistence", () => {
 
 ### Task 1.1: Long-running task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** overruns its timeout
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5245,6 +5397,7 @@ describe("runQueue timeout diff persistence", () => {
 
 ### Task 1.1: Long-running task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** overruns its timeout
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5316,6 +5469,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 
 ### Task 1.1: Rejected task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** produces a diff the gate rejects for a non-credential reason
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5385,6 +5539,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 
 ### Task 1.1: Credential-flagged task
 - **Status:** pending
+- **Files:** src/a.mjs
 - **Description:** produces a diff the gate rejects for touching a credential-convention path
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
