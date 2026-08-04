@@ -19,21 +19,124 @@ const NODE_ARCH_TO_DOCKER_ARCH = {
 };
 
 /**
- * Check if Docker/OrbStack is available.
- * @returns {boolean}
+ * Result of container runtime preflight check.
+ * @typedef {Object} ContainerRuntimeStatus
+ * @property {boolean} available - Whether a container runtime daemon is reachable
+ * @property {"binary-missing" | "daemon-unreachable" | "other-exec-error" | null} classification -
+ *   Failure mode classification if not available
+ * @property {Error | null} error - Raw execution error if probe failed
  */
-export function isContainerRuntimeAvailable() {
+
+/**
+ * Perform an authoritative container runtime availability check.
+ * Probes `docker info` (or `orb info`) with an explicit 5000ms timeout.
+ * Distinguishes binary-missing, daemon-unreachable, and other-exec-error.
+ *
+ * @param {object | function} [options]
+ * @param {(command: string, args: string[], options: object) => Buffer | string} [options.execFn]
+ *   Defaults to `execFileSync`
+ * @returns {ContainerRuntimeStatus}
+ */
+export function checkContainerRuntime(options = {}) {
+	const opts = typeof options === "function" ? { execFn: options } : options;
+	const { execFn = execFileSync } = opts;
+
+	const isEnoent = (err) =>
+		Boolean(
+			err &&
+				(err.code === "ENOENT" ||
+					(typeof err.message === "string" && err.message.includes("ENOENT")) ||
+					(typeof err.message === "string" &&
+						err.message.toLowerCase().includes("not found"))),
+		);
+
+	// Primary probe: `docker info` with explicit 5000ms timeout
 	try {
-		execSync("docker --version", { stdio: "pipe" });
-		return true;
-	} catch {
+		execFn("docker", ["info"], { timeout: 5000, stdio: "pipe" });
+		return { available: true, classification: null, error: null };
+	} catch (dockerInfoError) {
+		// Probe whether docker CLI binary exists
+		let dockerBinaryExists = false;
+		let dockerVersionError = null;
 		try {
-			execSync("orb --version", { stdio: "pipe" });
-			return true;
-		} catch {
-			return false;
+			execFn("docker", ["--version"], { timeout: 5000, stdio: "pipe" });
+			dockerBinaryExists = true;
+		} catch (vErr) {
+			dockerVersionError = vErr;
+		}
+
+		if (dockerBinaryExists) {
+			// Binary is present, but docker info failed -> daemon unreachable
+			return {
+				available: false,
+				classification: "daemon-unreachable",
+				error: dockerInfoError,
+			};
+		}
+
+		// Fallback probe for OrbStack runtime
+		try {
+			execFn("orb", ["info"], { timeout: 5000, stdio: "pipe" });
+			return { available: true, classification: null, error: null };
+		} catch (orbInfoError) {
+			let orbBinaryExists = false;
+			let orbVersionError = null;
+			try {
+				execFn("orb", ["--version"], { timeout: 5000, stdio: "pipe" });
+				orbBinaryExists = true;
+			} catch (vErr) {
+				orbVersionError = vErr;
+			}
+
+			if (orbBinaryExists) {
+				return {
+					available: false,
+					classification: "daemon-unreachable",
+					error: orbInfoError,
+				};
+			}
+
+			// Neither binary is present or executable.
+			const dockerEnoent = isEnoent(dockerVersionError ?? dockerInfoError);
+			const orbEnoent = isEnoent(orbVersionError ?? orbInfoError);
+
+			if (dockerEnoent && orbEnoent) {
+				return {
+					available: false,
+					classification: "binary-missing",
+					error: dockerInfoError,
+				};
+			}
+
+			// If timeout or signal or daemon error occurred on docker info
+			if (
+				dockerInfoError?.code === "ETIMEDOUT" ||
+				dockerInfoError?.signal === "SIGTERM"
+			) {
+				return {
+					available: false,
+					classification: "daemon-unreachable",
+					error: dockerInfoError,
+				};
+			}
+
+			return {
+				available: false,
+				classification: "other-exec-error",
+				error: dockerInfoError,
+			};
 		}
 	}
+}
+
+/**
+ * Check if Docker/OrbStack is available.
+ * @param {object | function} [options]
+ * @param {(command: string, args: string[], options: object) => Buffer | string} [options.execFn]
+ * @returns {boolean}
+ */
+export function isContainerRuntimeAvailable(options = {}) {
+	return checkContainerRuntime(options).available;
 }
 
 /**

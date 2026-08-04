@@ -29,8 +29,8 @@ import {
 import {
 	AGENT_IMAGE,
 	buildAgentImage,
+	checkContainerRuntime,
 	imageExists,
-	isContainerRuntimeAvailable,
 	startAgentContainer,
 } from "../container/index.mjs";
 import { integrationGate } from "../integrate/index.mjs";
@@ -56,12 +56,18 @@ import { route } from "../router/index.mjs";
  * costs multiple minutes and should only pay once per host), and
  * startAgentContainer() is itself idempotent (starts an existing stopped
  * container, or is a no-op if already running).
+ * @param {object} [deps] Injectable dependencies (tests only)
+ * @param {(command: string, args: string[], options: object) => Buffer | string} [deps.execFn]
+ *   Defaults to the real `execFileSync`
  * @throws {Error} if Docker/OrbStack is unavailable, or the image build or
  *   container start fails.
  */
-export function ensureAgentContainer() {
-	if (!isContainerRuntimeAvailable()) {
-		throw new Error("ensureAgentContainer: Docker/OrbStack is not available");
+export function ensureAgentContainer(deps = {}) {
+	const status = checkContainerRuntime(deps);
+	if (!status.available) {
+		throw new Error(
+			`ensureAgentContainer: Docker/OrbStack is not available (${status.classification})`,
+		);
 	}
 	if (!imageExists(AGENT_IMAGE)) {
 		if (!buildAgentImage()) {
