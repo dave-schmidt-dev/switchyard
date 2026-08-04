@@ -43,6 +43,7 @@ import {
 	seedProject,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
+import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { classifyTask, isValidTier } from "../roster/classifier.mjs";
 import {
 	normalizeProviderName,
@@ -1579,6 +1580,10 @@ export function runQueue(options) {
 		dependencies = {},
 	} = options;
 
+	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
+		markerPath: dependencies.generationMarkerPath,
+	});
+
 	const ensureAgentContainerFn =
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;
 	const createWorkingContainerFn =
@@ -1961,6 +1966,10 @@ export async function runQueueWithOrchestrator(options) {
 		runId = null,
 		dependencies = {},
 	} = options;
+
+	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
+		markerPath: dependencies.generationMarkerPath,
+	});
 
 	const ensureAgentContainerFn =
 		dependencies.ensureAgentContainer ?? ensureAgentContainer;

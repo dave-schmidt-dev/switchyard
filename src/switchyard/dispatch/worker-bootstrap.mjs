@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Diagnostics } from "../diagnostics/index.mjs";
+import { assertGenerationAllowed } from "../maintenance/index.mjs";
 
 function parseArg(argv, flag) {
 	const idx = argv.indexOf(flag);
@@ -24,6 +25,18 @@ if (!stateRoot || !runId || !nonce) {
 }
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+
+// Refuse before importing run-store or running retention. A maintenance
+// generation freezes every producer, including detached workers; the later
+// handshake check closes the launch-to-start race as well.
+try {
+	assertGenerationAllowed();
+} catch (error) {
+	console.error(
+		`worker-bootstrap: generation guard refused (${error.message})`,
+	);
+	process.exit(1);
+}
 
 // Module-scope write chain serializing every run-store mutation this worker
 // fires outside a direct `await` (the onTaskStart/onTaskRouted/onResult/
@@ -135,6 +148,11 @@ try {
 		);
 		process.exit(4);
 	}
+
+	// Re-check after the detached handshake. A generation may begin between
+	// launch() and worker startup; fail closed before claiming the run lease or
+	// creating a working container. The launch record remains recoverable.
+	assertGenerationAllowed();
 
 	const pid = process.pid;
 	const startToken = randomUUID();

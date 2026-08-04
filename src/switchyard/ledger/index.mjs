@@ -5,6 +5,7 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
 
 const DEFAULT_LEDGER_PATH = join(
@@ -50,6 +51,7 @@ function ensureLogDir() {
  * @param {number} [dispatch.percentLeft] Provider percent left at dispatch time
  */
 export function recordDispatch(dispatch) {
+	assertGenerationAllowed();
 	ensureLogDir();
 
 	const entry = {
@@ -112,6 +114,7 @@ function resolveLedgerPath(runStorePath) {
  * @returns {Promise<void>}
  */
 export async function recordDispatchToStore(data, runStorePath) {
+	assertGenerationAllowed();
 	const dir = resolveLedgerDir(runStorePath);
 	await mkdir(dir, { recursive: true });
 

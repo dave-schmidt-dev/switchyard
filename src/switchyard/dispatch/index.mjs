@@ -41,6 +41,7 @@ import {
 	listManagedContainers,
 	recoverManagedObjects,
 } from "../lifecycle/index.mjs";
+import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
 	acquireProjectLock,
 	acquireRunLock,
@@ -356,6 +357,7 @@ function parseRecoverArgs(argv) {
  *   in isolation from queue execution (no Docker/containers on that path).
  */
 async function runDispatch(opts, dependencies = {}) {
+	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
 	console.error(`dispatch: queue    ${opts.tasksFilePath}`);
 	console.error(`dispatch: project  ${opts.projectPath}`);
 	console.error(
@@ -585,6 +587,7 @@ async function handleLaunch(argv) {
 		console.log(USAGE_LAUNCH);
 		return;
 	}
+	assertGenerationAllowed();
 
 	const stateRoot = getStateRoot();
 	const runId = randomUUID();
