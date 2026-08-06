@@ -7,6 +7,7 @@ import {
 	readLedger,
 	readLedgerFromStore,
 	recordDispatch,
+	recordDispatchIntentToStore,
 	recordDispatchToStore,
 } from "../src/switchyard/ledger/index.mjs";
 
@@ -200,5 +201,81 @@ describe("ledger run-store backed", () => {
 
 		const entries = readLedger();
 		ok(entries.length > 0, "legacy ledger still works");
+	});
+
+	it("writes a sanitized project-local intent receipt", () => {
+		const intentStore = join(STORE_DIR, "intent-sanitization");
+		recordDispatchIntentToStore(
+			{
+				taskId: "task-intent",
+				provider: "claude",
+				model: "claude-sonnet-5",
+				requiredCapability: "standard",
+				resolvedTargetId: "claude",
+				descriptorIdentity: "descriptor-sha",
+				descriptorHarness: "claude",
+				roster_schema_version: 1,
+				hostname: "secret-host",
+				credential: "secret-credential",
+				env: { TOKEN: "secret-token" },
+				prompt: "private prompt",
+				diff: "private diff",
+				invocationDescriptor: { invocation_args: ["private arg"] },
+			},
+			intentStore,
+		);
+
+		return readLedgerFromStore(intentStore).then((entries) => {
+			strictEqual(entries.length, 1);
+			const entry = entries[0];
+			strictEqual(entry.intent, true);
+			strictEqual(entry.recordType, "intent");
+			ok(/^sha256:[a-f0-9]{64}$/.test(entry.taskId));
+			ok(/^sha256:[a-f0-9]{64}$/.test(entry.model));
+			strictEqual(entry.host, undefined);
+			strictEqual(entry.hostname, undefined);
+			strictEqual(entry.credential, undefined);
+			strictEqual(entry.env, undefined);
+			strictEqual(entry.prompt, undefined);
+			strictEqual(entry.diff, undefined);
+			strictEqual(entry.invocationDescriptor, undefined);
+		});
+	});
+
+	it("redacts unsafe values even when they use allowlisted intent keys", async () => {
+		const intentStore = join(TEST_LEDGER_DIR, "intent-adversarial");
+		recordDispatchIntentToStore(
+			{
+				taskId: "service.prod.company.com",
+				provider: "sk-proj-opaquevalue",
+				model: "service.prod.company.com",
+				requiredCapability: "sk-proj-opaquevalue",
+				resolvedTargetId: "service.prod.company.com",
+				descriptorIdentity: "sk-proj-opaquevalue",
+				descriptorHarness: "sk-proj-opaquevalue",
+				roster_sha256: "service.prod.company.com",
+				resolved_target: "service.prod.company.com",
+				resolved_harness: "sk-proj-opaquevalue",
+				resolved_selector: "service.prod.company.com",
+				resolved_credential_profile: "sk-proj-opaquevalue",
+			},
+			intentStore,
+		);
+
+		const [entry] = await readLedgerFromStore(intentStore);
+		ok(!JSON.stringify(entry).includes("service.prod.company.com"));
+		ok(!JSON.stringify(entry).includes("sk-proj-opaquevalue"));
+		ok(/^sha256:[a-f0-9]{64}$/.test(entry.taskId));
+		strictEqual(entry.provider, undefined);
+		ok(/^sha256:[a-f0-9]{64}$/.test(entry.model));
+		strictEqual(entry.requiredCapability, undefined);
+		ok(/^sha256:[a-f0-9]{64}$/.test(entry.resolvedTargetId));
+		strictEqual(entry.descriptorIdentity, undefined);
+		strictEqual(entry.descriptorHarness, undefined);
+		strictEqual(entry.roster_sha256, undefined);
+		ok(/^sha256:[a-f0-9]{64}$/.test(entry.resolved_target));
+		strictEqual(entry.resolved_harness, undefined);
+		ok(/^sha256:[a-f0-9]{64}$/.test(entry.resolved_selector));
+		ok(/^sha256:[a-f0-9]{64}$/.test(entry.resolved_credential_profile));
 	});
 });

@@ -5,7 +5,7 @@
 // Empirically verified: a process started via `docker exec` kept executing
 // for several seconds after its host-side client was killed on timeout.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { validateIdentifier } from "./shell-safety.mjs";
 
 /**
@@ -53,4 +53,49 @@ export function killOrphanedProcesses(containerName) {
 		// Best-effort — the container may already be gone, or the shell may
 		// not exist; either way there's nothing left to clean up.
 	}
+}
+
+/**
+ * Non-blocking counterpart for async provider lifecycles. The command is
+ * deliberately identical to killOrphanedProcesses so TERM/KILL ordering and
+ * stale-index cleanup remain one containment policy.
+ * @param {string} containerName
+ * @returns {Promise<void>}
+ */
+export function killOrphanedProcessesAsync(containerName) {
+	try {
+		validateIdentifier(containerName, "containerName");
+	} catch {
+		return Promise.resolve();
+	}
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			resolve();
+		};
+		let child;
+		try {
+			child = execFile(
+				"docker",
+				[
+					"exec",
+					containerName,
+					"sh",
+					"-c",
+					"kill -TERM -1 2>/dev/null; sleep 1; kill -KILL -1 2>/dev/null; " +
+						"rm -f /project/.git/index.lock 2>/dev/null",
+				],
+				{ timeout: 5000, stdio: "ignore" },
+				finish,
+			);
+		} catch {
+			finish();
+			return;
+		}
+		child?.once?.("error", finish);
+		child?.once?.("close", finish);
+		setTimeout(finish, 5000).unref?.();
+	});
 }

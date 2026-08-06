@@ -2,7 +2,7 @@
 // worker-bootstrap nonce handshake, project locks, and failure recording.
 // These spawn real Node subprocesses.
 
-import { ok, strictEqual } from "node:assert";
+import { ok, rejects, strictEqual } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { isContainerRuntimeAvailable } from "../src/switchyard/container/index.mjs";
+import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 import {
 	containerExists,
 	createLabeledContainer,
@@ -86,6 +87,39 @@ function runBootstrap(args, env = {}) {
 		timeout: 10_000,
 		env: { ...process.env, ...env },
 	});
+}
+
+function writeDispatchQualifiedRoster(path, targetId) {
+	const roster = JSON.parse(readFileSync(ROSTER_FIXTURE_PATH, "utf8"));
+	const target = roster.targets[targetId];
+	const slot = target.slots.standard[0];
+	const model = roster.models[slot.model_ref];
+	const core = {
+		target_id: targetId,
+		model_ref: slot.model_ref,
+		selector: model.selector,
+		effort: slot.effort ?? null,
+		variant: slot.variant ?? null,
+		invocation_args: slot.invocation_args ?? [],
+	};
+	const identity = getInvocationDescriptorIdentity(core, target.harness);
+	const now = new Date().toISOString();
+	target.qualifications[identity] = {
+		...core,
+		descriptor_identity: identity,
+		status: "dispatch_qualified",
+		tested_at: now,
+		credential_profile: target.credential_profile,
+		promotion_receipt: {
+			...core,
+			descriptor_identity: identity,
+			status: "promoted",
+			atomic: true,
+			receipt_id: `detached-test-${targetId}`,
+			committed_at: now,
+		},
+	};
+	writeFileSync(path, JSON.stringify(roster), "utf8");
 }
 
 let dir;
@@ -174,6 +208,8 @@ describe("launch returns before completion", () => {
 		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
 		const run = await readRun(runId);
 		strictEqual(run.schemaVersion, 2);
+		strictEqual(run.dispatchContractVersion, 1);
+		strictEqual(run.activeTaskInvocationDescriptor, null);
 		ok(/^[a-f0-9]{64}$/.test(run.queueIdentity));
 		strictEqual(run.runOptions.taskIds[0], "1.1");
 	});
@@ -271,6 +307,169 @@ describe("worker reaches terminal state and result is readable", () => {
 		const result = JSON.parse(resultResult.stdout.trim());
 		ok(result.terminalSummary !== null, "terminalSummary present");
 		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
+		strictEqual(result.dispatchContractVersion, 1);
+		if (result.lastTaskDescriptorIdentity !== null) {
+			ok(
+				/^sha256:[a-f0-9]{64}$/.test(result.lastTaskDescriptorIdentity),
+				"terminal result preserves the routed descriptor identity",
+			);
+			strictEqual(
+				result.lastTaskInvocationDescriptor.descriptor_identity,
+				result.lastTaskDescriptorIdentity,
+			);
+		}
+	});
+});
+
+describe("detached descriptor receipt parity", () => {
+	it("preserves a descriptor identity from run-store event/overlay into status and result", async () => {
+		const { initializeRun, updateRun, createEvent } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const descriptorCore = {
+			target_id: "claude-code",
+			model_ref: "fixture/claude-standard",
+			selector: "fixture-claude-standard",
+			effort: null,
+			variant: null,
+			invocation_args: [],
+		};
+		const descriptor = {
+			...descriptorCore,
+			descriptor_identity: getInvocationDescriptorIdentity(
+				descriptorCore,
+				"claude",
+			),
+		};
+		const runId = `receipt-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "fixture",
+		});
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				lastTaskInvocationDescriptor: descriptor,
+				lastTaskDescriptorIdentity: descriptor.descriptor_identity,
+				lastTaskDescriptorHarness: "claude",
+				lastResolvedTargetId: descriptor.target_id,
+			},
+			1,
+		);
+		await createEvent(runId, {
+			phase: "execution",
+			event: "task_completed",
+			status: "Task 1.1 completed",
+			taskId: "1.1",
+			invocationDescriptor: descriptor,
+			descriptorIdentity: descriptor.descriptor_identity,
+			descriptorHarness: "claude",
+			resolvedTargetId: descriptor.target_id,
+		});
+
+		const status = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(status.status, 0);
+		const statusEnvelope = JSON.parse(status.stdout.trim());
+		strictEqual(
+			statusEnvelope.lastTaskDescriptorIdentity,
+			descriptor.descriptor_identity,
+		);
+		const result = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(result.status, 0);
+		const resultEnvelope = JSON.parse(result.stdout.trim());
+		strictEqual(
+			resultEnvelope.lastTaskDescriptorIdentity,
+			descriptor.descriptor_identity,
+		);
+		strictEqual(
+			resultEnvelope.lastTaskInvocationDescriptor.descriptor_identity,
+			descriptor.descriptor_identity,
+		);
+	});
+
+	it("rejects unsafe argv, mismatched identities, and invalid event versions", async () => {
+		const { initializeRun, updateRun, createEvent } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const descriptorCore = {
+			target_id: "claude-code",
+			model_ref: "fixture/claude-standard",
+			selector: "fixture-claude-standard",
+			effort: null,
+			variant: null,
+			invocation_args: [],
+		};
+		const descriptor = {
+			...descriptorCore,
+			descriptor_identity: getInvocationDescriptorIdentity(
+				descriptorCore,
+				"claude",
+			),
+		};
+		const runId = `receipt-invalid-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "fixture",
+		});
+
+		await rejects(
+			updateRun(
+				runId,
+				{
+					lastTaskInvocationDescriptor: descriptor,
+					lastTaskDescriptorIdentity: `sha256:${"0".repeat(64)}`,
+					lastTaskDescriptorHarness: "claude",
+					lastResolvedTargetId: descriptor.target_id,
+				},
+				1,
+			),
+			/does not match/,
+		);
+		await rejects(
+			updateRun(
+				runId,
+				{
+					lastTaskInvocationDescriptor: {
+						...descriptor,
+						invocation_args: ["--prompt", "secret-token"],
+					},
+					lastTaskDescriptorHarness: "claude",
+					lastResolvedTargetId: descriptor.target_id,
+				},
+				1,
+			),
+			/invalid descriptor receipt/,
+		);
+		await rejects(
+			createEvent(runId, {
+				phase: "execution",
+				event: "task_completed",
+				status: "complete",
+				invocationDescriptor: descriptor,
+				descriptorIdentity: `sha256:${"0".repeat(64)}`,
+				descriptorHarness: "claude",
+				resolvedTargetId: descriptor.target_id,
+				dispatchContractVersion: 1,
+			}),
+			/event descriptorIdentity does not match invocationDescriptor/,
+		);
+		await rejects(
+			createEvent(runId, {
+				phase: "execution",
+				event: "task_completed",
+				status: "complete",
+				dispatchContractVersion: 0,
+			}),
+			/event dispatchContractVersion must be a positive integer/,
+		);
 	});
 });
 
@@ -331,6 +530,9 @@ describe("--exclude-provider on the detached worker path", () => {
 			...makeStateRootEnv(),
 			SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: snapshotPath,
 		};
+		const runtimeRosterPath = join(dir, "codex-dispatch-roster.json");
+		writeDispatchQualifiedRoster(runtimeRosterPath, "codex");
+		env.SWITCHYARD_ROSTER_PATH = runtimeRosterPath;
 
 		const launchResult = runDispatch(
 			[
@@ -354,6 +556,8 @@ describe("--exclude-provider on the detached worker path", () => {
 		// blocking adapter.execute call, so poll frequently: this only needs to
 		// observe routing, not wait for the task to finish executing.
 		let observedProvider = null;
+		let observedDescriptor = null;
+		let observedDescriptorIdentity = null;
 		const start = Date.now();
 		// 60s, not the file's usual 15-20s budget: this test's container has to
 		// build/start from cold before routing is observable, which measured
@@ -367,6 +571,8 @@ describe("--exclude-provider on the detached worker path", () => {
 				const status = JSON.parse(statusResult.stdout.trim());
 				if (status.activeTaskProvider) {
 					observedProvider = status.activeTaskProvider;
+					observedDescriptor = status.activeTaskInvocationDescriptor;
+					observedDescriptorIdentity = status.activeTaskDescriptorIdentity;
 					break;
 				}
 				if (status.state === "succeeded" || status.state === "failed") {
@@ -391,6 +597,8 @@ describe("--exclude-provider on the detached worker path", () => {
 					(e.event === "task_completed" || e.event === "task_failed"),
 			);
 			observedProvider = routedEvent?.provider ?? null;
+			observedDescriptor = routedEvent?.invocationDescriptor ?? null;
+			observedDescriptorIdentity = routedEvent?.descriptorIdentity ?? null;
 		}
 
 		ok(observedProvider, "expected the task to be routed to some provider");
@@ -402,6 +610,15 @@ describe("--exclude-provider on the detached worker path", () => {
 		ok(
 			observedProvider !== "claude",
 			"the excluded provider must never be routed",
+		);
+		ok(
+			observedDescriptor,
+			"detached worker must persist its descriptor receipt",
+		);
+		strictEqual(
+			observedDescriptor.descriptor_identity,
+			observedDescriptorIdentity,
+			"detached descriptor identity must match its receipt",
 		);
 	});
 });
@@ -455,6 +672,12 @@ describe("--only-provider on the detached worker path", () => {
 			...makeStateRootEnv(),
 			SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: snapshotPath,
 		};
+		// Automatic routing now requires an exact dispatch-qualified descriptor;
+		// qualify the allowlisted Codex slot in this subprocess fixture so the
+		// test exercises --only-provider rather than legacy selector evidence.
+		const runtimeRosterPath = join(dir, "codex-only-dispatch-roster.json");
+		writeDispatchQualifiedRoster(runtimeRosterPath, "codex");
+		env.SWITCHYARD_ROSTER_PATH = runtimeRosterPath;
 
 		const launchResult = runDispatch(
 			[
@@ -1006,6 +1229,11 @@ describe("status and result envelope contracts", () => {
 				activeTaskProvider: "claude",
 				activeTaskModel: "claude-sonnet-5",
 				activeTaskDeadline: deadline,
+				activeTaskElapsedMs: 321,
+				activeTaskHeartbeatAt: 123456,
+				activeTaskProcessPhase: "provider_running",
+				telemetryWriteFailures: 2,
+				lastTelemetryWriteFailure: "revision_conflict",
 			},
 			current.revision,
 		);
@@ -1017,6 +1245,40 @@ describe("status and result envelope contracts", () => {
 		strictEqual(status.activeTaskProvider, "claude");
 		strictEqual(status.activeTaskModel, "claude-sonnet-5");
 		strictEqual(status.activeTaskDeadline, deadline);
+		strictEqual(status.activeTaskElapsedMs, 321);
+		strictEqual(status.activeTaskHeartbeatAt, 123456);
+		strictEqual(status.activeTaskProcessPhase, "provider_running");
+		strictEqual(status.telemetryWriteFailures, 2);
+		strictEqual(status.lastTelemetryWriteFailure, "revision_conflict");
+
+		const terminalCurrent = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: {
+					totalTasks: 1,
+					runnableTasks: 1,
+					processedTasks: 1,
+					completedTaskIds: ["1.1"],
+					failedCount: 0,
+				},
+			},
+			terminalCurrent.revision,
+		);
+		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResult.status, 0);
+		const result = JSON.parse(resultResult.stdout.trim());
+		strictEqual(result.activeTaskId, null);
+		strictEqual(result.activeTaskProvider, null);
+		strictEqual(result.activeTaskModel, null);
+		strictEqual(result.activeTaskDeadline, null);
+		strictEqual(result.activeTaskElapsedMs, null);
+		strictEqual(result.activeTaskHeartbeatAt, null);
+		strictEqual(result.activeTaskProcessPhase, null);
+		strictEqual(result.telemetryWriteFailures, 2);
+		strictEqual(result.lastTelemetryWriteFailure, "revision_conflict");
 	});
 
 	it("status exposes workerLive:false for a running state whose worker pid is dead (ghost run)", async () => {
@@ -1070,6 +1332,11 @@ describe("status and result envelope contracts", () => {
 		strictEqual(status.activeTaskProvider, null);
 		strictEqual(status.activeTaskModel, null);
 		strictEqual(status.activeTaskDeadline, null);
+		strictEqual(status.activeTaskElapsedMs, null);
+		strictEqual(status.activeTaskHeartbeatAt, null);
+		strictEqual(status.activeTaskProcessPhase, null);
+		strictEqual(status.telemetryWriteFailures, 0);
+		strictEqual(status.lastTelemetryWriteFailure, null);
 	});
 });
 

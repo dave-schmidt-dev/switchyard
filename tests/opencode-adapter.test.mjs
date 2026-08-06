@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	execute as executeOpencode,
 } from "../src/switchyard/adapter/opencode.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 function hasDocker() {
 	try {
@@ -21,9 +22,33 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-opencode-adapter-"));
 const containerName = `switchyard-opencode-adapter-${Date.now()}`;
+const PROMPT_MARKER = "switchyard-prompt-marker";
+const OPENCODE_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "opencode-target",
+		model_ref: "fake-model",
+		selector: "fake-model",
+		effort: null,
+		variant: "high",
+		invocation_args: ["--variant", "high"],
+	},
+	"opencode",
+);
 
 const OPENCODE_STUB = `#!/bin/sh
 cat >/dev/null
+case " $* " in
+  *" run "*) ;;
+  *) echo "stub: executeOpencode did not invoke the run subcommand; args: $*" >&2; exit 4 ;;
+esac
+case " $* " in
+  *" --variant high "*) ;;
+  *) echo "stub: executeOpencode did not forward descriptor variant; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *"${PROMPT_MARKER}"*) ;;
+  *) echo "stub: executeOpencode did not forward positional prompt; args: $*" >&2; exit 5 ;;
+esac
 echo updated >> test.txt
 echo opencode
 `;
@@ -71,8 +96,12 @@ describe("opencode adapter container execution", () => {
 	it("captures the applied diff", {
 		skip: !dockerAvailable,
 	}, () => {
-		const result = executeOpencode("apply a small change", containerName, {
+		const result = executeOpencode(PROMPT_MARKER, containerName, {
 			model: "fake-model",
+			resolvedTargetId: OPENCODE_DESCRIPTOR.target_id,
+			descriptorHarness: "opencode",
+			invocationDescriptor: OPENCODE_DESCRIPTOR,
+			descriptorIdentity: OPENCODE_DESCRIPTOR.descriptor_identity,
 		});
 		strictEqual(result.success, true);
 

@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	executeClaude,
 } from "../src/switchyard/adapter/claude.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 function hasDocker() {
 	try {
@@ -21,6 +22,17 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-claude-adapter-"));
 const containerName = `switchyard-claude-adapter-${Date.now()}`;
+const CLAUDE_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "claude-target",
+		model_ref: "fake-model",
+		selector: "fake-model",
+		effort: "high",
+		variant: null,
+		invocation_args: ["--effort", "high"],
+	},
+	"claude",
+);
 
 // Fake `claude` that ENFORCES the adapter's headless invocation shape (Task 25):
 // it exits non-zero unless executeClaude passed BOTH --print (non-interactive
@@ -37,6 +49,10 @@ esac
 case " $* " in
   *" --permission-mode acceptEdits "*) ;;
   *) echo "stub: executeClaude did not pass --permission-mode acceptEdits (Task 25); args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --effort high "*) ;;
+  *) echo "stub: executeClaude did not forward descriptor effort; args: $*" >&2; exit 3 ;;
 esac
 echo updated >> test.txt
 echo claude
@@ -96,6 +112,10 @@ describe("claude adapter container execution", () => {
 		// them (Task 25) — not just that some diff came back.
 		const result = executeClaude("apply a small change", containerName, {
 			model: "fake-model",
+			resolvedTargetId: CLAUDE_DESCRIPTOR.target_id,
+			descriptorHarness: "claude",
+			invocationDescriptor: CLAUDE_DESCRIPTOR,
+			descriptorIdentity: CLAUDE_DESCRIPTOR.descriptor_identity,
 		});
 		strictEqual(result.success, true);
 
@@ -197,6 +217,11 @@ describe("claude adapter timeout handling", () => {
 			timeoutContainerName,
 			{
 				timeoutMs: 1500,
+				model: "fake-model",
+				resolvedTargetId: CLAUDE_DESCRIPTOR.target_id,
+				descriptorHarness: "claude",
+				invocationDescriptor: CLAUDE_DESCRIPTOR,
+				descriptorIdentity: CLAUDE_DESCRIPTOR.descriptor_identity,
 			},
 		);
 

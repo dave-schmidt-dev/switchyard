@@ -518,6 +518,11 @@ async function runDispatch(opts, dependencies = {}) {
 									activeTaskModel: info.model,
 									activeTaskDeadline: info.deadline ?? null,
 									resolvedTargetId: info.resolvedTargetId ?? null,
+									activeTaskInvocationDescriptor:
+										info.invocationDescriptor ?? null,
+									activeTaskDescriptorIdentity: info.descriptorIdentity ?? null,
+									activeTaskDescriptorHarness: info.descriptorHarness ?? null,
+									dispatchContractVersion: info.dispatchContractVersion ?? 1,
 									snapshotStatus: info.snapshotStatus ?? null,
 									snapshotMtime: info.snapshotMtime ?? null,
 									snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
@@ -528,6 +533,11 @@ async function runDispatch(opts, dependencies = {}) {
 				},
 				onResult: (r) => {
 					const safeFailure = sanitizeFailureMetadata(r);
+					const artifactRef =
+						typeof r.artifactRef === "string" &&
+						/^artifact:[a-f0-9]{24}$/.test(r.artifactRef)
+							? r.artifactRef
+							: undefined;
 					const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
 					const displayReason =
 						safeFailure?.reason ?? (r.success ? "" : "task failed");
@@ -542,17 +552,34 @@ async function runDispatch(opts, dependencies = {}) {
 							taskId: r.taskId,
 							provider: r.provider ?? null,
 							model: r.model ?? null,
+							invocationDescriptor: r.invocationDescriptor ?? null,
+							descriptorIdentity: r.descriptorIdentity ?? null,
+							descriptorHarness: r.descriptorHarness ?? null,
+							resolvedTargetId: r.resolvedTargetId ?? null,
+							dispatchContractVersion: r.dispatchContractVersion ?? 1,
 							result: r.result,
+							...(r.alreadyApplied ? { alreadyApplied: true } : {}),
 							...(safeFailure ?? {}),
+							...(artifactRef ? { artifactRef } : {}),
 						};
 						eventWriteChain = eventWriteChain
 							.then(async () => {
 								await createEvent(runId, event);
-								if (safeFailure) {
-									await updateRunWithRetry(runId, {
-										lastFailure: safeFailure,
-									});
-								}
+								await updateRunWithRetry(runId, {
+									activeTaskId: null,
+									activeTaskProvider: null,
+									activeTaskModel: null,
+									activeTaskDeadline: null,
+									activeTaskInvocationDescriptor: null,
+									activeTaskDescriptorIdentity: null,
+									activeTaskDescriptorHarness: null,
+									resolvedTargetId: null,
+									lastResolvedTargetId: r.resolvedTargetId ?? null,
+									lastTaskInvocationDescriptor: r.invocationDescriptor ?? null,
+									lastTaskDescriptorIdentity: r.descriptorIdentity ?? null,
+									lastTaskDescriptorHarness: r.descriptorHarness ?? null,
+									...(safeFailure ? { lastFailure: safeFailure } : {}),
+								});
 							})
 							.catch(() => {});
 					}
@@ -577,6 +604,9 @@ async function runDispatch(opts, dependencies = {}) {
 				await updateRunWithRetry(runId, {
 					state: anyFailed ? "failed" : "succeeded",
 					cleanupState: "complete",
+					activeTaskInvocationDescriptor: null,
+					activeTaskDescriptorIdentity: null,
+					activeTaskDescriptorHarness: null,
 				});
 				await releaseRunLock(runId);
 			} catch (error) {
@@ -1055,11 +1085,45 @@ async function buildStatusEnvelope(runId, run) {
 		// run-specific, so unlike providerProcessDetected it's safe to call
 		// unconditionally regardless of run.state.
 		platformInfo: getPlatformInfo(),
-		activeTaskId: run.activeTaskId ?? null,
-		activeTaskProvider: run.activeTaskProvider ?? null,
-		activeTaskModel: run.activeTaskModel ?? null,
-		activeTaskDeadline: run.activeTaskDeadline ?? null,
+		activeTaskId: run.state === "running" ? (run.activeTaskId ?? null) : null,
+		activeTaskProvider:
+			run.state === "running" ? (run.activeTaskProvider ?? null) : null,
+		activeTaskModel:
+			run.state === "running" ? (run.activeTaskModel ?? null) : null,
+		activeTaskDeadline:
+			run.state === "running" ? (run.activeTaskDeadline ?? null) : null,
+		activeTaskElapsedMs:
+			run.state === "running" && run.activeTaskId != null
+				? (run.activeTaskElapsedMs ?? 0)
+				: null,
+		activeTaskHeartbeatAt:
+			run.state === "running" && run.activeTaskId != null
+				? (run.activeTaskHeartbeatAt ?? null)
+				: null,
+		activeTaskProcessPhase:
+			run.state === "running" && run.activeTaskId != null
+				? (run.activeTaskProcessPhase ?? null)
+				: null,
+		telemetryWriteFailures: run.telemetryWriteFailures ?? 0,
+		lastTelemetryWriteFailure: run.lastTelemetryWriteFailure ?? null,
 		resolvedTargetId: run.resolvedTargetId ?? null,
+		activeTaskInvocationDescriptor:
+			run.state === "running"
+				? (run.activeTaskInvocationDescriptor ?? null)
+				: null,
+		activeTaskDescriptorIdentity:
+			run.state === "running"
+				? (run.activeTaskDescriptorIdentity ?? null)
+				: null,
+		activeTaskDescriptorHarness:
+			run.state === "running"
+				? (run.activeTaskDescriptorHarness ?? null)
+				: null,
+		lastTaskInvocationDescriptor: run.lastTaskInvocationDescriptor ?? null,
+		lastTaskDescriptorIdentity: run.lastTaskDescriptorIdentity ?? null,
+		lastTaskDescriptorHarness: run.lastTaskDescriptorHarness ?? null,
+		lastResolvedTargetId: run.lastResolvedTargetId ?? null,
+		dispatchContractVersion: run.dispatchContractVersion ?? null,
 		snapshotStatus: run.snapshotStatus ?? null,
 		snapshotMtime: run.snapshotMtime ?? null,
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
@@ -1113,11 +1177,45 @@ async function buildResultEnvelope(runId, run) {
 		// run-specific, so unlike providerProcessDetected it's safe to call
 		// unconditionally regardless of run.state.
 		platformInfo: getPlatformInfo(),
-		activeTaskId: run.activeTaskId ?? null,
-		activeTaskProvider: run.activeTaskProvider ?? null,
-		activeTaskModel: run.activeTaskModel ?? null,
-		activeTaskDeadline: run.activeTaskDeadline ?? null,
+		activeTaskId: run.state === "running" ? (run.activeTaskId ?? null) : null,
+		activeTaskProvider:
+			run.state === "running" ? (run.activeTaskProvider ?? null) : null,
+		activeTaskModel:
+			run.state === "running" ? (run.activeTaskModel ?? null) : null,
+		activeTaskDeadline:
+			run.state === "running" ? (run.activeTaskDeadline ?? null) : null,
+		activeTaskElapsedMs:
+			run.state === "running" && run.activeTaskId != null
+				? (run.activeTaskElapsedMs ?? 0)
+				: null,
+		activeTaskHeartbeatAt:
+			run.state === "running" && run.activeTaskId != null
+				? (run.activeTaskHeartbeatAt ?? null)
+				: null,
+		activeTaskProcessPhase:
+			run.state === "running" && run.activeTaskId != null
+				? (run.activeTaskProcessPhase ?? null)
+				: null,
+		telemetryWriteFailures: run.telemetryWriteFailures ?? 0,
+		lastTelemetryWriteFailure: run.lastTelemetryWriteFailure ?? null,
 		resolvedTargetId: run.resolvedTargetId ?? null,
+		activeTaskInvocationDescriptor:
+			run.state === "running"
+				? (run.activeTaskInvocationDescriptor ?? null)
+				: null,
+		activeTaskDescriptorIdentity:
+			run.state === "running"
+				? (run.activeTaskDescriptorIdentity ?? null)
+				: null,
+		activeTaskDescriptorHarness:
+			run.state === "running"
+				? (run.activeTaskDescriptorHarness ?? null)
+				: null,
+		lastTaskInvocationDescriptor: run.lastTaskInvocationDescriptor ?? null,
+		lastTaskDescriptorIdentity: run.lastTaskDescriptorIdentity ?? null,
+		lastTaskDescriptorHarness: run.lastTaskDescriptorHarness ?? null,
+		lastResolvedTargetId: run.lastResolvedTargetId ?? null,
+		dispatchContractVersion: run.dispatchContractVersion ?? null,
 		snapshotStatus: run.snapshotStatus ?? null,
 		snapshotMtime: run.snapshotMtime ?? null,
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,

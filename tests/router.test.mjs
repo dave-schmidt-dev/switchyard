@@ -8,7 +8,7 @@
 // PROVIDER_CAPABILITIES table -- blind-fallback `provider === 'claude'`,
 // `route({requiredCapability:'high'}).model === 'claude-opus-4-8'`,
 // `route({requiredCapability:'standard'}).model === 'claude-sonnet-5'`, and a
-// vibe-has-no-adapter exclusion -- onto the roster-backed router (Task
+// fixture-only disabled-Vibe exclusion -- onto the roster-backed router (Task
 // 1.5/1.6). Uses the same committed fixture roster
 // (tests/fixtures/roster.fixture.json) + SWITCHYARD_ROSTER_PATH +
 // __resetRosterCacheForTests() pattern tests/router-rightsizing.test.mjs
@@ -36,13 +36,14 @@
 
 import { notStrictEqual, ok, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
 	__resetRosterCacheForTests,
+	getInvocationDescriptorIdentity,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
 } from "../src/switchyard/roster/index.mjs";
@@ -62,12 +63,60 @@ const SNAPSHOT_PATH = join(
 	tmpdir(),
 	`switchyard-router-test-${process.pid}-${randomUUID()}.json`,
 );
+const ROUTER_ROSTER_PATH = join(
+	tmpdir(),
+	`switchyard-router-roster-${process.pid}-${randomUUID()}.json`,
+);
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 
+function withDispatchQualifiedDescriptors(roster) {
+	const testedAt = new Date().toISOString();
+	for (const [targetId, target] of Object.entries(roster.targets)) {
+		if (!target.enabled) continue;
+		for (const slots of Object.values(target.slots ?? {})) {
+			for (const slot of slots ?? []) {
+				if (slot.manual_only) continue;
+				const model = roster.models[slot.model_ref];
+				if (model?.status !== "active") continue;
+				const descriptor = {
+					target_id: targetId,
+					model_ref: slot.model_ref,
+					selector: model.selector,
+					effort: slot.effort ?? null,
+					variant: slot.variant ?? null,
+					invocation_args: slot.invocation_args ?? [],
+				};
+				const descriptorIdentity = getInvocationDescriptorIdentity(
+					descriptor,
+					target.harness,
+				);
+				target.qualifications ??= {};
+				target.qualifications[descriptorIdentity] = {
+					...descriptor,
+					descriptor_identity: descriptorIdentity,
+					status: "dispatch_qualified",
+					tested_at: testedAt,
+					credential_profile: target.credential_profile,
+				};
+			}
+		}
+	}
+	return roster;
+}
+
 before(() => {
 	process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = SNAPSHOT_PATH;
-	process.env.SWITCHYARD_ROSTER_PATH = FIXTURE_PATH;
+	writeFileSync(
+		ROUTER_ROSTER_PATH,
+		JSON.stringify(
+			withDispatchQualifiedDescriptors(
+				JSON.parse(readFileSync(FIXTURE_PATH, "utf8")),
+			),
+		),
+		"utf8",
+	);
+	process.env.SWITCHYARD_ROSTER_PATH = ROUTER_ROSTER_PATH;
 	__resetRosterCacheForTests();
 });
 
@@ -81,6 +130,7 @@ after(() => {
 	__resetRosterCacheForTests();
 	try {
 		rmSync(SNAPSHOT_PATH, { force: true });
+		rmSync(ROUTER_ROSTER_PATH, { force: true });
 	} catch {
 		// Ignore
 	}
@@ -104,6 +154,72 @@ function removeSnapshot() {
 }
 
 describe("router (INV-4: dispatch only to a snapshot-available funded provider)", () => {
+	it("excludes an enabled Vibe implementation target until its exact descriptor is dispatch-qualified", () => {
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-router-vibe-opencode-${process.pid}-${randomUUID()}.json`,
+		);
+		const roster = withDispatchQualifiedDescriptors(
+			JSON.parse(readFileSync(FIXTURE_PATH, "utf8")),
+		);
+		roster.targets.vibe = {
+			harness: "opencode",
+			snapshot_name: "Vibe",
+			credential_profile: "default",
+			enabled: true,
+			technical_ceiling: "low",
+			qualifications: {
+				"fixture/opencode-low": { status: "qualified" },
+			},
+			slots: {
+				low: [{ model_ref: "fixture/opencode-low", priority: 1 }],
+				standard: [],
+				high: [],
+			},
+		};
+		writeFileSync(rosterPath, JSON.stringify(roster), "utf8");
+		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "Vibe",
+					ok: true,
+					windows: [{ percent_left: 90, pace_delta: 50 }],
+				},
+			]);
+			const result = route({
+				requiredCapability: "low",
+				availableProviders: ["opencode"],
+			});
+			strictEqual(result.provider, null);
+			strictEqual(result.reason, "no_eligible");
+			ok(
+				result.log.some((entry) =>
+					entry.includes("Vibe: no current exact invocation descriptor"),
+				),
+				"selector-only Vibe must not become an automatic OpenCode route",
+			);
+
+			const explicit = route({
+				requiredCapability: "low",
+				availableProviders: ["opencode"],
+				only: ["vibe"],
+			});
+			strictEqual(explicit.provider, null);
+			strictEqual(explicit.reason, "no_eligible");
+		} finally {
+			if (previousRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+			}
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
+		}
+	});
+
 	it("routes to a funded provider when multiple are present (CR-2 regression)", () => {
 		createTestSnapshot([
 			{
@@ -121,6 +237,20 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		const result = route();
 		notStrictEqual(result.provider, null, "Should find a provider");
 		strictEqual(result.reason, "spread", "Should use spread selection");
+	});
+
+	it("uses standard capability when RequiredCapability is omitted", () => {
+		createTestSnapshot([
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }],
+			},
+		]);
+
+		const result = route();
+		strictEqual(result.requiredCapability, "standard");
+		strictEqual(result.provider, "claude");
 	});
 
 	it("skips a provider below the exhaustion floor, still landing on the funded one", () => {
@@ -225,13 +355,10 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		);
 	});
 
-	it("never routes to vibe (a disabled, no-adapter roster target) even with the most headroom", () => {
-		// vibe is `enabled: false` in the roster (no ZDR, no adapter) -- its
-		// computed capability_class is null, so it fails the capability filter
-		// at every required capability, including the lowest. This is the INV-4-relevant half
-		// of the old "vibe exclusion" test: a snapshot can report any headroom
-		// it likes for a provider switchyard has no business dispatching to,
-		// and that must never win the spread.
+	it("skips a fixture-disabled Vibe target even with the most headroom", () => {
+		// This fixture isolates disabled-target handling. Production Vibe is an
+		// enabled OpenCode-backed implementation target; its separate exact-
+		// descriptor gate is covered above.
 		createTestSnapshot([
 			{
 				name: "claude",
@@ -249,9 +376,74 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		strictEqual(
 			result.provider,
 			"claude",
-			"vibe is disabled in the roster and must never be selected, even at " +
+			"fixture-disabled Vibe must never be selected, even at " +
 				"the lowest required capability and with the most headroom",
 		);
+	});
+
+	it("--only-provider cannot force a fixture-disabled Vibe target into the candidate set", () => {
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }],
+			},
+			{
+				name: "vibe",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }],
+			},
+		]);
+
+		for (const only of ["vibe"]) {
+			const result = route({ requiredCapability: "standard", only: [only] });
+			strictEqual(result.provider, null);
+			strictEqual(result.reason, "no_eligible");
+		}
+	});
+
+	it("rejects disabled Gemini target id while accepting enabled Agy Claude", () => {
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-router-agy-target-${process.pid}-${randomUUID()}.json`,
+		);
+		const roster = withDispatchQualifiedDescriptors(
+			JSON.parse(readFileSync(FIXTURE_PATH, "utf8")),
+		);
+		roster.targets.antigravity.enabled = false;
+		roster.targets["antigravity-claude"] = {
+			harness: "agy",
+			enabled: true,
+			slots: {
+				low: [],
+				standard: [{ model_ref: "fixture/agy-standard", priority: 1 }],
+				high: [],
+			},
+			qualifications: {
+				"fixture-agy-standard": { status: "qualified" },
+			},
+		};
+		withDispatchQualifiedDescriptors(roster);
+		writeFileSync(rosterPath, JSON.stringify(roster), "utf8");
+		const previousPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "agy",
+					ok: true,
+					windows: [{ percent_left: 80, pace_delta: 10 }],
+				},
+			]);
+			strictEqual(route({ only: ["antigravity"] }).provider, null);
+			strictEqual(route({ only: ["agy"] }).provider, "agy");
+		} finally {
+			if (previousPath === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previousPath;
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
+		}
 	});
 
 	it("never routes outside availableProviders, even when the excluded one has more headroom", () => {
@@ -522,6 +714,12 @@ describe("router (INV-4: blind fallback still respects funding/eligibility)", ()
 			"Codex",
 			"excluding lowercase 'claude' must exclude candidate 'Claude'",
 		);
+	});
+
+	it("routeBlind skips fixture-disabled Vibe even when explicitly ordered", () => {
+		const result = routeBlind(["vibe", "claude"]);
+		strictEqual(result.provider, "claude");
+		strictEqual(result.reason, "blind_fallback");
 	});
 });
 
@@ -943,8 +1141,21 @@ describe("router (implementor-priority waterfall routing)", () => {
 			"fixtures",
 			"roster.priority-tiebreak.fixture.json",
 		);
+		const qualifiedTiebreakFixturePath = join(
+			tmpdir(),
+			`switchyard-router-priority-tiebreak-${process.pid}-${randomUUID()}.json`,
+		);
 		const savedRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
-		process.env.SWITCHYARD_ROSTER_PATH = tiebreakFixturePath;
+		writeFileSync(
+			qualifiedTiebreakFixturePath,
+			JSON.stringify(
+				withDispatchQualifiedDescriptors(
+					JSON.parse(readFileSync(tiebreakFixturePath, "utf8")),
+				),
+			),
+			"utf8",
+		);
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedTiebreakFixturePath;
 		__resetRosterCacheForTests();
 		try {
 			createTestSnapshot([
@@ -974,6 +1185,7 @@ describe("router (implementor-priority waterfall routing)", () => {
 				process.env.SWITCHYARD_ROSTER_PATH = savedRosterPath;
 			}
 			__resetRosterCacheForTests();
+			rmSync(qualifiedTiebreakFixturePath, { force: true });
 		}
 	});
 });

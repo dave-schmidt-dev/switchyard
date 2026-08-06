@@ -21,9 +21,9 @@
 // switchyard-dispatch targets from ~/.agent/roster.json.
 //   - Catalog-only entries (`claude-fable-5`, `kimi-k2.7-code`) are never
 //     targets at all -- nothing to iterate.
-//   - `vibe` is a target but `enabled: false` by design (no ZDR, no
-//     vibe.mjs -- see roster-unification-2026-07-30-tasks.md Task 1.1) and
-//     is deliberately excluded from the enabled-target filter below.
+//   - `vibe` is an enabled implementation target backed by the existing
+//     OpenCode adapter; its exact snapshot target is checked like every other
+//     enabled target, so no standalone vibe.mjs adapter is required.
 //   - `pi` is not a switchyard-dispatch target (review-wrapper only,
 //     decision #6) and has no roster.json target entry to iterate.
 //
@@ -135,8 +135,8 @@ describe("harness registry drift (Task 1.6b)", () => {
 	}
 
 	// Explicit exclusion checks (PM-3/PM-11, locked scope) -- these document
-	// *why* fable/kimi/vibe/pi don't need a live-adapter entry, rather than
-	// silently relying on the `enabled === true` filter above to skip them.
+	// why catalog-only and review-wrapper entries do not need a live-adapter
+	// target, rather than silently relying on the `enabled === true` filter.
 	it("catalog-only entries (fable, kimi) are not targets at all", () => {
 		ok(
 			!("claude-fable-5" in targets),
@@ -148,9 +148,11 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	it("vibe is present but disabled, so it's excluded from the drift check", () => {
-		ok("vibe" in targets, "expected a vibe target entry (enabled: false)");
-		strictEqual(targets.vibe?.enabled, false);
+	it("vibe is an enabled OpenCode-backed implementation target", () => {
+		ok("vibe" in targets, "expected a vibe target entry");
+		strictEqual(targets.vibe?.enabled, true);
+		strictEqual(targets.vibe?.harness, "opencode");
+		strictEqual(targets.vibe?.snapshot_name, "Vibe");
 	});
 
 	it("pi is not a switchyard-dispatch target", () => {

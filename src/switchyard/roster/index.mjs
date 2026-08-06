@@ -23,6 +23,11 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+	validateIdentifier,
+	validateInvocationArgs,
+	validateModelArg,
+} from "../adapter/shell-safety.mjs";
 
 /**
  * Capability-class vocabulary. Unchanged from the pre-roster module: this is
@@ -54,6 +59,72 @@ const ROSTER_CAPABILITY_CLASSES = ["low", "standard", "high"];
 const CAPABILITY_CLASS_RANK = { low: 0, standard: 1, high: 2 };
 
 const MODEL_STATUSES = new Set(["active", "retired"]);
+const EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max"]);
+const VARIANT_VALUES = new Set(["default", "high", "max"]);
+
+/**
+ * Provider-specific invocation vocabulary.  These are adapter contracts, not
+ * interchangeable labels: a Claude `--effort max` value is not a Codex
+ * reasoning setting, and OpenCode's `--variant max` is not a Claude effort.
+ * An empty vocabulary means that the adapter has no supported automatic
+ * effort/variant override; a slot carrying one stays disabled by the strict
+ * descriptor/coherence path.
+ */
+export const PROVIDER_INVOCATION_VOCABULARY = Object.freeze({
+	claude: Object.freeze({
+		effort: Object.freeze(["low", "medium", "high", "xhigh", "max"]),
+		variant: Object.freeze([]),
+		argv: Object.freeze({ effort: Object.freeze(["--effort", "<effort>"]) }),
+	}),
+	codex: Object.freeze({
+		effort: Object.freeze(["low", "medium", "high", "xhigh"]),
+		variant: Object.freeze([]),
+		argv: Object.freeze({
+			effort: Object.freeze(["-c", "model_reasoning_effort=<effort>"]),
+		}),
+	}),
+	agy: Object.freeze({
+		effort: Object.freeze([]),
+		variant: Object.freeze([]),
+		argv: Object.freeze({}),
+	}),
+	opencode: Object.freeze({
+		effort: Object.freeze([]),
+		variant: Object.freeze(["default", "high", "max"]),
+		argv: Object.freeze({ variant: Object.freeze(["--variant", "<variant>"]) }),
+	}),
+	copilot: Object.freeze({
+		effort: Object.freeze([]),
+		variant: Object.freeze([]),
+		argv: Object.freeze({}),
+	}),
+	cursor: Object.freeze({
+		effort: Object.freeze([]),
+		variant: Object.freeze([]),
+		argv: Object.freeze({}),
+	}),
+});
+
+export const ADAPTER_ARGV_MAPPING = PROVIDER_INVOCATION_VOCABULARY;
+
+/**
+ * Qualification evidence is deliberately more specific than the legacy
+ * `qualified` status.  A read-only probe proves that a harness can answer;
+ * only a dispatch qualification proves the exact write-path descriptor.
+ */
+export const QUALIFICATION_STATUS = Object.freeze({
+	PROBE_QUALIFIED: "probe_qualified",
+	DISPATCH_QUALIFIED: "dispatch_qualified",
+	NOT_TRANSMITTABLE: "not_transmittable",
+	TEMPORARILY_UNAVAILABLE: "temporarily_unavailable",
+	STALE: "stale",
+	FAILED: "failed_qualification",
+	UNTESTED: "untested",
+});
+
+// Keep this in one place so the loader and synthetic tests use the same
+// freshness contract as rosterlib.smoke.compute_qualification_status.
+export const STALE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 // Canonical provider/harness keys this module has always exposed via
 // PROVIDER_CAPABILITIES (the snapshot-provider namespace router/index.mjs
@@ -67,7 +138,6 @@ const KNOWN_PROVIDER_HARNESSES = [
 	"codex",
 	"agy",
 	"cursor",
-	"vibe",
 	"copilot",
 	"opencode",
 ];
@@ -90,9 +160,10 @@ function resolveRosterPath() {
 
 /**
  * The invocation-variant key a slot's qualification record is filed under:
- * `selector`, or `selector@effort` when the slot carries an effort (brief
- * §4: "Qualification is keyed by invocation variant"). Mirrors
- * `_qualification_variant_key` in ~/.agent/rosterlib/validate.py.
+ * `selector`, or `selector@effort`/`selector@variant` when the slot carries
+ * an invocation override (brief §4: "Qualification is keyed by invocation
+ * variant"). Mirrors `_qualification_variant_key` in
+ * ~/.agent/rosterlib/validate.py.
  * @param {object} modelEntry
  * @param {object} slot
  * @returns {string|null}
@@ -102,6 +173,8 @@ function qualificationVariantKey(modelEntry, slot) {
 	if (typeof selector !== "string" || !selector) return null;
 	const effort = slot?.effort;
 	if (typeof effort === "string" && effort) return `${selector}@${effort}`;
+	const variant = slot?.variant;
+	if (typeof variant === "string" && variant) return `${selector}@${variant}`;
 	return selector;
 }
 
@@ -136,6 +209,11 @@ function validateRosterStructure(data) {
 					`models['${key}'].status must be 'active' or 'retired', got ${JSON.stringify(entry.status)}`,
 				);
 			}
+			try {
+				validateModelArg(entry.selector, `models['${key}'].selector`);
+			} catch (error) {
+				violations.push(error.message);
+			}
 		}
 	}
 	const modelsDict =
@@ -158,6 +236,11 @@ function validateRosterStructure(data) {
 			violations.push(
 				`targets['${targetId}'].harness must be a non-empty string`,
 			);
+		}
+		try {
+			validateIdentifier(targetId, `targets['${targetId}'] target id`);
+		} catch (error) {
+			violations.push(error.message);
 		}
 
 		const slots = target.slots;
@@ -188,6 +271,44 @@ function validateRosterStructure(data) {
 					violations.push(
 						`${where}.model_ref '${slot.model_ref}' does not resolve to any catalog model in 'models'`,
 					);
+				} else {
+					try {
+						validateModelArg(slot.model_ref, `${where}.model_ref`);
+					} catch (error) {
+						violations.push(error.message);
+					}
+				}
+				if (slot.effort !== undefined && slot.effort !== null) {
+					if (
+						typeof slot.effort !== "string" ||
+						!EFFORT_VALUES.has(slot.effort)
+					) {
+						violations.push(
+							`${where}.effort must be one of: ${[...EFFORT_VALUES].join(", ")}`,
+						);
+					}
+				}
+				if (slot.variant !== undefined && slot.variant !== null) {
+					if (
+						typeof slot.variant !== "string" ||
+						!VARIANT_VALUES.has(slot.variant)
+					) {
+						violations.push(
+							`${where}.variant must be one of: ${[...VARIANT_VALUES].join(", ")}`,
+						);
+					}
+				}
+				if (slot.effort != null && slot.variant != null) {
+					violations.push(`${where} must not declare both effort and variant`);
+				}
+				if (slot.invocation_args !== undefined) {
+					try {
+						validateInvocationArgs(slot.invocation_args, target.harness);
+					} catch (error) {
+						violations.push(
+							`${where}.invocation_args invalid: ${error.message}`,
+						);
+					}
 				}
 			});
 		}
@@ -255,7 +376,6 @@ function autoRoutingCeiling(target, models) {
 		target.qualifications && typeof target.qualifications === "object"
 			? target.qualifications
 			: {};
-
 	let best = null;
 	for (const capabilityClass of ROSTER_CAPABILITY_CLASSES) {
 		const slotList = target.slots?.[capabilityClass];
@@ -296,7 +416,6 @@ function resolveSlotModel(target, models, capabilityClass) {
 		target.qualifications && typeof target.qualifications === "object"
 			? target.qualifications
 			: {};
-
 	const candidates = [];
 	for (const slot of slotList) {
 		if (!slot || typeof slot !== "object" || slot.manual_only) continue;
@@ -316,76 +435,17 @@ function resolveSlotModel(target, models, capabilityClass) {
 }
 
 /**
- * Pick the roster target ENTRY (id + object) that backs a given
- * provider/harness key. Multiple targets sharing one harness is the STEADY
- * STATE this function exists for (Task C.3), not a rare edge case — it
- * covers two distinct shapes:
- *
- *  1. Exclusive alternatives, only one enabled at a time (opencode-go vs
- *     opencode-zen, a billing-account swap): the enabled-tie-break below is
- *     both necessary and sufficient — whichever target is `enabled` IS the
- *     one the caller means, and `snapshotName` is unneeded.
- *  2. Simultaneously-enabled targets that both stay live at once (the
- *     Antigravity / Antigravity (Claude) buckets, Task C.2): the harness
- *     alone is ambiguous between them, so the enabled-tie-break cannot be
- *     the answer — routing identity (which target) has to be resolved from
- *     something more specific than the harness. That "something" is the
- *     snapshot's own raw provider display name (e.g. "Antigravity
- *     (Claude)"): pass it as `snapshotName` and a target whose own
- *     `snapshot_name` field matches exactly is returned in preference to
- *     the tie-break (Task C.4/C.6). Execution identity (which adapter
- *     process actually runs the task) stays harness-keyed regardless —
- *     both targets here still dispatch through the one `agy` adapter
- *     (Task C.7) — only ROUTING identity needs the extra disambiguation.
- *
- * `snapshotName` is optional and purely additive: every existing caller
- * that omits it, and every target that never sets `snapshot_name` (every
- * harness except the two agy targets, today), gets byte-identical behavior
- * to before this parameter existed. Returns the id alongside the target so
- * provenance (Task 1.6, M7/M8; Task C.8) can record which concrete target
- * was resolved, not just the shared harness.
- * @param {object} targets
- * @param {string} harnessKey
- * @param {string} [snapshotName]
- * @returns {{id: string, target: object}|null}
+ * Automatic Switchyard routing is driven only by target identity/configuration:
+ * disabled targets are never candidates, while an enabled target remains
+ * eligible through its declared harness.
+ * @param {object} target
+ * @param {string} targetId
+ * @returns {boolean}
  */
-function findTargetEntryForHarness(targets, harnessKey, snapshotName) {
-	if (snapshotName) {
-		for (const [id, target] of Object.entries(targets)) {
-			if (
-				target &&
-				typeof target === "object" &&
-				target.harness === harnessKey &&
-				target.enabled &&
-				target.snapshot_name === snapshotName
-			) {
-				return { id, target };
-			}
-		}
-	}
-	let fallback = null;
-	for (const [id, target] of Object.entries(targets)) {
-		if (!target || typeof target !== "object" || target.harness !== harnessKey)
-			continue;
-		if (target.enabled) return { id, target };
-		if (!fallback) fallback = { id, target };
-	}
-	return fallback;
-}
-
-/**
- * Pick the roster target that backs a given provider/harness key, preferring
- * an `enabled` target when more than one target shares a harness. Thin wrapper
- * over findTargetEntryForHarness for callers that only need the target object.
- * @param {object} targets
- * @param {string} harnessKey
- * @param {string} [snapshotName]
- * @returns {object|null}
- */
-function findTargetForHarness(targets, harnessKey, snapshotName) {
-	return (
-		findTargetEntryForHarness(targets, harnessKey, snapshotName)?.target ?? null
-	);
+function isAutomaticRoutingTarget(target, targetId) {
+	if (!target || typeof target !== "object" || !target.enabled) return false;
+	void targetId;
+	return true;
 }
 
 /**
@@ -417,7 +477,6 @@ function resolveTargetIdentityFromTargets(targets, identifier) {
 		if (
 			target &&
 			typeof target === "object" &&
-			target.enabled &&
 			target.snapshot_name === identifier
 		) {
 			return {
@@ -434,11 +493,12 @@ function resolveTargetIdentityFromTargets(targets, identifier) {
 	}
 
 	const enabledEntries = Object.entries(targets).filter(
-		([, target]) =>
+		([id, target]) =>
 			target &&
 			typeof target === "object" &&
 			target.enabled &&
-			target.harness === harnessKey,
+			target.harness === harnessKey &&
+			isAutomaticRoutingTarget(target, id),
 	);
 	if (enabledEntries.length === 1) {
 		return {
@@ -452,6 +512,14 @@ function resolveTargetIdentityFromTargets(targets, identifier) {
 	}
 
 	return { targetId: null, harnessKey, ambiguous: false };
+}
+
+function findTargetEntryForDescriptor(targets, identifier) {
+	const identity = resolveTargetIdentityFromTargets(targets, identifier);
+	if (!identity.targetId || identity.ambiguous) return null;
+	const target = targets[identity.targetId];
+	if (!isAutomaticRoutingTarget(target, identity.targetId)) return null;
+	return { id: identity.targetId, target };
 }
 
 /**
@@ -521,7 +589,11 @@ function buildProviderCapabilities() {
 
 	const result = {};
 	for (const harnessKey of KNOWN_PROVIDER_HARNESSES) {
-		const target = findTargetForHarness(targets, harnessKey);
+		const entry = Object.entries(targets).find(
+			([id, target]) =>
+				target?.harness === harnessKey && isAutomaticRoutingTarget(target, id),
+		);
+		const target = entry?.[1];
 		if (!target) continue; // no roster target uses this harness
 		result[harnessKey] = buildCapabilityEntry(target, models);
 	}
@@ -553,6 +625,10 @@ function buildSnapshotNameCapabilities() {
 			typeof target.snapshot_name === "string" &&
 			target.snapshot_name
 		) {
+			const targetId = Object.entries(targets).find(
+				([, candidate]) => candidate === target,
+			)?.[0];
+			if (targetId && !isAutomaticRoutingTarget(target, targetId)) continue;
 			result[target.snapshot_name] = buildCapabilityEntry(target, models);
 		}
 	}
@@ -571,6 +647,36 @@ function getSnapshotNameCapabilities() {
 		cachedSnapshotNameCapabilities = buildSnapshotNameCapabilities();
 	}
 	return cachedSnapshotNameCapabilities;
+}
+
+/**
+ * Resolve a capability entry without letting an explicitly selected disabled
+ * target fall through to another target sharing its harness. Plain harness
+ * aliases still use the automatic target projection (e.g. `agy` resolves to
+ * the enabled Antigravity Claude target).
+ * @param {string} providerName
+ * @returns {object|null}
+ */
+function getCapabilityEntry(providerName) {
+	const snapshotEntry = getSnapshotNameCapabilities()[providerName];
+	if (snapshotEntry) return snapshotEntry;
+
+	try {
+		const roster = getRoster();
+		const targets =
+			roster.targets && typeof roster.targets === "object"
+				? roster.targets
+				: {};
+		const identity = resolveTargetIdentityFromTargets(targets, providerName);
+		if (identity.targetId) {
+			const target = targets[identity.targetId];
+			if (!isAutomaticRoutingTarget(target, identity.targetId)) return null;
+		}
+	} catch {
+		// Preserve the existing roster-unavailable fallback behavior below.
+	}
+
+	return getProviderCapabilities()[normalizeProviderName(providerName)] ?? null;
 }
 
 /**
@@ -644,15 +750,77 @@ export function normalizeProviderName(name) {
 }
 
 /**
+ * Return the invocation contract for a provider harness or target selector.
+ * Unknown harnesses deliberately return null rather than inheriting another
+ * CLI's vocabulary.
+ * @param {string} providerOrHarness
+ * @returns {Readonly<object>|null}
+ */
+export function getProviderInvocationVocabulary(providerOrHarness) {
+	const harness = normalizeProviderName(providerOrHarness);
+	return PROVIDER_INVOCATION_VOCABULARY[harness] ?? null;
+}
+
+/**
+ * Map a provider-specific intent to the exact argv fragment accepted by its
+ * adapter. Unsupported or mixed effort/variant intent returns null so callers
+ * can keep that slot disabled instead of coercing it across CLIs.
+ * @param {string} providerOrHarness
+ * @param {{effort?: string|null, variant?: string|null}} intent
+ * @returns {readonly string[]|null}
+ */
+export function mapInvocationArgs(providerOrHarness, intent = {}) {
+	const vocabulary = getProviderInvocationVocabulary(providerOrHarness);
+	if (!vocabulary || !intent || typeof intent !== "object") return null;
+	const effort = intent.effort ?? null;
+	const variant = intent.variant ?? null;
+	if (effort !== null && variant !== null) return null;
+	if (effort !== null) {
+		if (!vocabulary.effort.includes(effort)) return null;
+		if (
+			providerOrHarness &&
+			normalizeProviderName(providerOrHarness) === "codex"
+		) {
+			return Object.freeze(["-c", `model_reasoning_effort=${effort}`]);
+		}
+		return Object.freeze(["--effort", effort]);
+	}
+	if (variant !== null) {
+		if (!vocabulary.variant.includes(variant)) return null;
+		return Object.freeze(["--variant", variant]);
+	}
+	return Object.freeze([]);
+}
+
+/**
+ * Check that a roster slot's intent and argv are representable by its own
+ * adapter. This is intentionally stricter than generic argv safety: a safe
+ * `--variant` must not reach Claude, and a Codex `max` must not be accepted as
+ * if it were a valid Codex effort.
+ * @param {string} harness
+ * @param {object} slot
+ * @returns {boolean}
+ */
+function slotInvocationIsSupported(harness, slot) {
+	if (!slot || typeof slot !== "object") return false;
+	const expected = mapInvocationArgs(harness, slot);
+	if (expected === null) return false;
+	const actual = slot.invocation_args ?? [];
+	return (
+		Array.isArray(actual) &&
+		actual.length === expected.length &&
+		actual.every((value, index) => value === expected[index])
+	);
+}
+
+/**
  * Get the capability class for a provider — now the roster-computed
  * `auto_routing_ceiling` of the target backing that provider/harness.
  * @param {string} providerName
  * @returns {string|null} capability class or null if unknown/unqualified
  */
 export function getCapabilityClass(providerName) {
-	const provider =
-		getSnapshotNameCapabilities()[providerName] ??
-		getProviderCapabilities()[normalizeProviderName(providerName)];
+	const provider = getCapabilityEntry(providerName);
 	return provider?.capability_class ?? null;
 }
 
@@ -669,9 +837,7 @@ export function getCapabilityClass(providerName) {
  * @returns {string|null} model selector or null if not found
  */
 export function getModelForCapability(providerName, capabilityClass) {
-	const provider =
-		getSnapshotNameCapabilities()[providerName] ??
-		getProviderCapabilities()[normalizeProviderName(providerName)];
+	const provider = getCapabilityEntry(providerName);
 	return provider?.models?.[capabilityClass] ?? null;
 }
 
@@ -687,11 +853,527 @@ export function getModelForCapability(providerName, capabilityClass) {
  * @returns {number|null}
  */
 export function getImplementorPriority(providerName) {
-	const provider =
-		getSnapshotNameCapabilities()[providerName] ??
-		getProviderCapabilities()[normalizeProviderName(providerName)];
+	const provider = getCapabilityEntry(providerName);
 	return provider?.implementor_priority ?? null;
 }
+
+function parseQualificationTimestamp(value) {
+	if (typeof value !== "string" || value.length === 0) return null;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Port of rosterlib.smoke.compute_qualification_status.  This is pure and
+ * intentionally accepts a caller-supplied clock so loader tests never need a
+ * provider probe or a wall-clock race.
+ *
+ * `currentSignature` may contain selector, cli_version, wrapper_version, and
+ * credential_profile.  Missing signature fields remain backward compatible;
+ * when a field is present, drift invalidates a previously qualified receipt.
+ */
+export function computeQualificationStatus(
+	existingRecord,
+	currentSignature = {},
+	nowIso = new Date().toISOString(),
+	maxAgeSeconds = STALE_MAX_AGE_SECONDS,
+) {
+	if (!existingRecord || typeof existingRecord !== "object") {
+		return QUALIFICATION_STATUS.UNTESTED;
+	}
+	const status = existingRecord.status ?? QUALIFICATION_STATUS.UNTESTED;
+	const qualifiedStatuses = new Set([
+		QUALIFICATION_STATUS.PROBE_QUALIFIED,
+		QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+		// `qualified` is retained here solely for the compatibility helper. It
+		// can never authorize getInvocationDescriptor below.
+		"qualified",
+	]);
+	if (!qualifiedStatuses.has(status)) return status;
+
+	for (const field of [
+		"selector",
+		"cli_version",
+		"wrapper_version",
+		"credential_profile",
+	]) {
+		if (
+			Object.hasOwn(currentSignature, field) &&
+			existingRecord[field] !== currentSignature[field]
+		) {
+			return QUALIFICATION_STATUS.STALE;
+		}
+	}
+
+	// Dispatch receipts require an observation time. Probe records preserve the
+	// Python helper's permissive legacy behavior, but an unparsable timestamp is
+	// always stale when one is supplied.
+	const testedAt =
+		existingRecord.tested_at ??
+		existingRecord.qualified_at ??
+		existingRecord.observed_at;
+	if (testedAt !== undefined && testedAt !== null) {
+		const testedMs = parseQualificationTimestamp(testedAt);
+		const nowMs = parseQualificationTimestamp(nowIso);
+		if (testedMs === null || nowMs === null) return QUALIFICATION_STATUS.STALE;
+		const ageSeconds = (nowMs - testedMs) / 1000;
+		if (ageSeconds < 0 || ageSeconds > maxAgeSeconds) {
+			return QUALIFICATION_STATUS.STALE;
+		}
+	}
+	return status;
+}
+
+export const evaluateQualificationFreshness = computeQualificationStatus;
+
+function currentQualificationSignature(target, slot, model, descriptor) {
+	const contexts = [
+		slot?.qualification_signature,
+		slot?.current_signature,
+		target?.qualification_signature,
+		target?.current_signature,
+		target?.runtime_signature,
+		target?.runtime,
+		target,
+	];
+	const signature = { selector: descriptor.selector };
+	for (const field of [
+		"cli_version",
+		"wrapper_version",
+		"credential_profile",
+	]) {
+		for (const context of contexts) {
+			if (!context || typeof context !== "object") continue;
+			const aliases = {
+				cli_version: ["cli_version", "current_cli_version"],
+				wrapper_version: [
+					"wrapper_version",
+					"current_wrapper_version",
+					"adapter_version",
+				],
+				credential_profile: [
+					"credential_profile",
+					"current_credential_profile",
+				],
+			}[field];
+			const value = aliases
+				.map((key) => context[key])
+				.find((item) => typeof item === "string");
+			if (value !== undefined) {
+				signature[field] = value;
+				break;
+			}
+		}
+	}
+	void model;
+	return signature;
+}
+
+function descriptorReceiptMatches(
+	record,
+	descriptor,
+	{ complete = false } = {},
+) {
+	if (!record || typeof record !== "object") return false;
+	const identity = descriptor.descriptor_identity;
+	if (complete && record.descriptor_identity !== identity) return false;
+	if (
+		!complete &&
+		record.descriptor_identity !== undefined &&
+		record.descriptor_identity !== identity
+	) {
+		return false;
+	}
+	if (complete) {
+		for (const field of [
+			"target_id",
+			"model_ref",
+			"selector",
+			"effort",
+			"variant",
+		]) {
+			if (!Object.hasOwn(record, field)) return false;
+		}
+		if (
+			record.target_id !== descriptor.target_id ||
+			record.model_ref !== descriptor.model_ref ||
+			record.selector !== descriptor.selector ||
+			(record.effort ?? null) !== (descriptor.effort ?? null) ||
+			(record.variant ?? null) !== (descriptor.variant ?? null)
+		) {
+			return false;
+		}
+	}
+	if (
+		record.target_id !== undefined &&
+		record.target_id !== descriptor.target_id
+	)
+		return false;
+	if (
+		record.model_ref !== undefined &&
+		record.model_ref !== descriptor.model_ref
+	)
+		return false;
+	if (record.selector !== undefined && record.selector !== descriptor.selector)
+		return false;
+	const argvFields = [
+		"invocation_args",
+		"argv",
+		"validated_invocation_args",
+	].filter((field) => Object.hasOwn(record, field));
+	if (complete && argvFields.length === 0) return false;
+	for (const field of argvFields) {
+		const recordArgs = record[field];
+		if (
+			!Array.isArray(recordArgs) ||
+			recordArgs.length !== descriptor.invocation_args.length ||
+			recordArgs.some((arg, index) => arg !== descriptor.invocation_args[index])
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function atomicPromotionReceiptIsValid(record, descriptor) {
+	// A direct descriptor-keyed record is itself the atomic promotion receipt
+	// in roster v1.  Newer writers may additionally include a nested receipt;
+	// validate it whenever present rather than trusting a partially-written
+	// promotion marker.
+	const receipt =
+		record.promotion_receipt ??
+		record.promotionReceipt ??
+		record.atomic_promotion_receipt;
+	if (receipt === undefined) return true;
+	if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+		return false;
+	}
+	if (!descriptorReceiptMatches(receipt, descriptor, { complete: true })) {
+		return false;
+	}
+	if (receipt.atomic !== true) return false;
+	if (!new Set(["promoted", "committed", "atomic"]).has(receipt.status)) {
+		return false;
+	}
+	const receiptTime =
+		receipt.committed_at ?? receipt.promoted_at ?? receipt.created_at;
+	if (parseQualificationTimestamp(receiptTime) === null) return false;
+	if (
+		typeof receipt.receipt_id !== "string" ||
+		receipt.receipt_id.length === 0
+	) {
+		return false;
+	}
+	return true;
+}
+
+function qualificationAuthorizesDescriptor(
+	target,
+	descriptor,
+	slot,
+	model,
+	{
+		nowIso = new Date().toISOString(),
+		maxAgeSeconds = STALE_MAX_AGE_SECONDS,
+	} = {},
+) {
+	const qualifications =
+		target?.qualifications && typeof target.qualifications === "object"
+			? target.qualifications
+			: {};
+	const identity = descriptor.descriptor_identity;
+	const candidates = [];
+	if (qualifications[identity]) candidates.push(qualifications[identity]);
+	for (const record of Object.values(qualifications)) {
+		if (
+			record &&
+			typeof record === "object" &&
+			record.descriptor_identity === identity &&
+			!candidates.includes(record)
+		) {
+			candidates.push(record);
+		}
+	}
+	const currentSignature = currentQualificationSignature(
+		target,
+		slot,
+		model,
+		descriptor,
+	);
+	return candidates.some((record) => {
+		if (!record || typeof record !== "object") return false;
+		// Selector-only legacy keys and probe-only evidence are readable but can
+		// never grant an automatic write-path descriptor.
+		if (record.status !== QUALIFICATION_STATUS.DISPATCH_QUALIFIED) return false;
+		if (
+			record.tested_at === undefined &&
+			record.qualified_at === undefined &&
+			record.observed_at === undefined
+		) {
+			return false;
+		}
+		if (!descriptorReceiptMatches(record, descriptor)) return false;
+		if (!atomicPromotionReceiptIsValid(record, descriptor)) return false;
+		if (
+			computeQualificationStatus(
+				record,
+				currentSignature,
+				nowIso,
+				maxAgeSeconds,
+			) !== QUALIFICATION_STATUS.DISPATCH_QUALIFIED
+		) {
+			return false;
+		}
+		if (record.freshness === "stale" || record.freshness?.status === "stale")
+			return false;
+		if (
+			record.availability === "temporarily_unavailable" ||
+			record.temporary_availability === true ||
+			record.transmittable === false ||
+			record.evidence_type === QUALIFICATION_STATUS.NOT_TRANSMITTABLE
+		) {
+			return false;
+		}
+		return true;
+	});
+}
+
+function resolveCurrentDispatchDescriptor(
+	targetId,
+	target,
+	models,
+	slot,
+	options = {},
+) {
+	if (
+		!targetId ||
+		!target?.harness ||
+		!slotInvocationIsSupported(target.harness, slot)
+	) {
+		return null;
+	}
+	const model = models?.[slot?.model_ref];
+	if (model?.status !== "active") return null;
+	let descriptor;
+	try {
+		descriptor = validateInvocationDescriptor(
+			{
+				target_id: targetId,
+				model_ref: slot.model_ref,
+				selector: model.selector,
+				effort: slot.effort ?? null,
+				variant: slot.variant ?? null,
+				invocation_args: slot.invocation_args ?? [],
+			},
+			target.harness,
+		);
+	} catch {
+		return null;
+	}
+	return qualificationAuthorizesDescriptor(
+		target,
+		descriptor,
+		slot,
+		model,
+		options,
+	)
+		? descriptor
+		: null;
+}
+
+/**
+ * Evaluate the real roster's automatic capability coverage without changing
+ * any qualification evidence. The gate is deliberately stricter than the
+ * legacy compatibility projection: every counted slot must have a current,
+ * exact `dispatch_qualified` receipt for its descriptor and a provider-local
+ * argv mapping. Disabled targets (including Gemini) are reported as
+ * exclusions, not as missing capacity classes; an enabled Vibe target is
+ * evaluated through its OpenCode-backed descriptor like any other implementer.
+ *
+ * @param {object} [rosterData] Optional synthetic roster for tests.
+ * @param {{nowIso?: string, maxAgeSeconds?: number}} [options]
+ * @returns {{ok:boolean, enabledClasses:string[], missingClasses:string[], eligibleByClass:object, excludedTargets:string[], unsupportedSlots:object[]}}
+ */
+export function evaluateRealRosterCoherence(
+	rosterData = getRoster(),
+	{
+		nowIso = new Date().toISOString(),
+		maxAgeSeconds = STALE_MAX_AGE_SECONDS,
+	} = {},
+) {
+	const models =
+		rosterData?.models && typeof rosterData.models === "object"
+			? rosterData.models
+			: {};
+	const targets =
+		rosterData?.targets && typeof rosterData.targets === "object"
+			? rosterData.targets
+			: {};
+	const enabledClasses = new Set();
+	const eligibleByClass = Object.fromEntries(
+		ROSTER_CAPABILITY_CLASSES.map((capabilityClass) => [capabilityClass, []]),
+	);
+	const excludedTargets = [];
+	const unsupportedSlots = [];
+
+	for (const [targetId, target] of Object.entries(targets)) {
+		if (!target || typeof target !== "object") continue;
+		if (!isAutomaticRoutingTarget(target, targetId)) {
+			if (
+				targetId === "antigravity" ||
+				targetId === "vibe" ||
+				target.harness === "vibe"
+			) {
+				excludedTargets.push(targetId);
+			}
+			continue;
+		}
+		for (const capabilityClass of ROSTER_CAPABILITY_CLASSES) {
+			const slots = target.slots?.[capabilityClass];
+			if (!Array.isArray(slots)) continue;
+			for (const slot of slots) {
+				if (!slot || typeof slot !== "object" || slot.manual_only) continue;
+				const model = models[slot.model_ref];
+				if (model?.status !== "active") continue;
+				enabledClasses.add(capabilityClass);
+				if (!slotInvocationIsSupported(target.harness, slot)) {
+					unsupportedSlots.push({
+						targetId,
+						capabilityClass,
+						intent: {
+							effort: slot.effort ?? null,
+							variant: slot.variant ?? null,
+						},
+					});
+					continue;
+				}
+				const descriptor = resolveCurrentDispatchDescriptor(
+					targetId,
+					target,
+					models,
+					slot,
+					{ nowIso, maxAgeSeconds },
+				);
+				if (descriptor) {
+					eligibleByClass[capabilityClass].push({
+						targetId,
+						descriptorIdentity: descriptor.descriptor_identity,
+					});
+				}
+			}
+		}
+	}
+
+	const noEnabledClasses = enabledClasses.size === 0;
+	// The automatic ladder has a fixed low/standard/high baseline. A roster
+	// that accidentally drops an entire class must fail closed rather than
+	// treating the remaining class set as a vacuous success.
+	const missingClasses = ROSTER_CAPABILITY_CLASSES.filter(
+		(capabilityClass) => eligibleByClass[capabilityClass].length === 0,
+	);
+	return {
+		ok: !noEnabledClasses && missingClasses.length === 0,
+		enabledClasses: [...ROSTER_CAPABILITY_CLASSES],
+		missingClasses,
+		noEnabledClasses,
+		eligibleByClass,
+		excludedTargets: [...new Set(excludedTargets)].sort(),
+		unsupportedSlots,
+	};
+}
+
+export function formatRealRosterCoherenceFailure(report) {
+	if (report?.ok) return "real-roster coherence passed";
+	const missing = report?.missingClasses?.join(", ") || "none";
+	const enabled = report?.enabledClasses?.join(", ") || "none";
+	const unsupported = report?.unsupportedSlots?.length ?? 0;
+	return (
+		`real-roster coherence failed; missing current exact dispatch_qualified ` +
+		`automatic coverage for: ${missing}; enabled classes: ${enabled}. ` +
+		`Unsupported automatic slots disabled: ${unsupported}. ` +
+		"Run an explicitly authorized dispatch qualification canary for each " +
+		"missing descriptor; legacy qualified/probe evidence is insufficient."
+	);
+}
+
+export function assertRealRosterCoherence(
+	rosterData = getRoster(),
+	options = {},
+) {
+	const report = evaluateRealRosterCoherence(rosterData, options);
+	if (!report.ok) throw new Error(formatRealRosterCoherenceFailure(report));
+	return report;
+}
+
+/**
+ * Resolve an exact, currently-qualified automatic invocation descriptor.
+ * Legacy selector/selector@effort qualification keys remain readable by the
+ * compatibility capability helpers, but they deliberately cannot authorize
+ * this descriptor path.
+ *
+ * @param {string} providerName target id, snapshot name, or unambiguous harness
+ * @param {string} capabilityClass
+ * @returns {Readonly<object>|null}
+ */
+export function getInvocationDescriptor(providerName, capabilityClass) {
+	if (!Object.hasOwn(CAPABILITY_CLASS_ORDER, capabilityClass)) {
+		throw new Error(
+			`getInvocationDescriptor: unrecognized capability ${JSON.stringify(capabilityClass)}`,
+		);
+	}
+	const roster = getRoster();
+	const models =
+		roster.models && typeof roster.models === "object" ? roster.models : {};
+	const targets =
+		roster.targets && typeof roster.targets === "object" ? roster.targets : {};
+	const entry = findTargetEntryForDescriptor(targets, providerName);
+	if (!entry) return null;
+	const slots = entry.target.slots?.[capabilityClass];
+	if (!Array.isArray(slots)) return null;
+	const candidates = [];
+	for (const slot of slots) {
+		if (!slot || typeof slot !== "object" || slot.manual_only) continue;
+		const model = models[slot.model_ref];
+		if (model?.status !== "active") continue;
+		const descriptor = resolveCurrentDispatchDescriptor(
+			entry.id,
+			entry.target,
+			models,
+			slot,
+		);
+		if (!descriptor) continue;
+		candidates.push({
+			priority: Number.isInteger(slot.priority)
+				? slot.priority
+				: Number.POSITIVE_INFINITY,
+			descriptor,
+		});
+	}
+	if (candidates.length === 0) return null;
+	candidates.sort((a, b) => a.priority - b.priority);
+	return candidates[0].descriptor;
+}
+
+/**
+ * Whether a target has current exact qualification evidence for automatic
+ * dispatch at a capability class. This is intentionally stricter than the
+ * legacy capability helpers, which remain readable for compatibility but must
+ * not make a selector-only target routable.
+ *
+ * @param {string} providerName target id, snapshot name, or unambiguous harness
+ * @param {string} capabilityClass
+ * @returns {boolean}
+ */
+export function hasAutomaticInvocationDescriptor(
+	providerName,
+	capabilityClass,
+) {
+	return getInvocationDescriptor(providerName, capabilityClass) !== null;
+}
+
+export const getAutomaticInvocationDescriptor = getInvocationDescriptor;
+export const getRightSizedDescriptor = getInvocationDescriptor;
+export const getInvocationDescriptorForCapability = getInvocationDescriptor;
 
 /**
  * Capability filter - INV-5.
@@ -773,6 +1455,240 @@ function canonicalizeForHash(value) {
 	}
 	return value;
 }
+
+const DESCRIPTOR_FIELDS = new Set([
+	"target_id",
+	"model_ref",
+	"selector",
+	"effort",
+	"variant",
+	"invocation_args",
+]);
+
+function descriptorCore(descriptor) {
+	return {
+		target_id: descriptor.target_id,
+		model_ref: descriptor.model_ref,
+		selector: descriptor.selector,
+		effort: descriptor.effort ?? null,
+		variant: descriptor.variant ?? null,
+		invocation_args: [...descriptor.invocation_args],
+	};
+}
+
+function requireDescriptorHarness(harness) {
+	if (typeof harness !== "string" || harness.trim().length === 0) {
+		throw new Error(
+			"invocation descriptor harness is required and must be a non-empty string",
+		);
+	}
+	return normalizeProviderName(harness);
+}
+
+function assertDescriptorIdentityInput(descriptor, harness) {
+	if (!descriptor || typeof descriptor !== "object") {
+		throw new Error("invocation descriptor must be an object");
+	}
+	for (const key of Object.keys(descriptor)) {
+		if (key !== "descriptor_identity" && !DESCRIPTOR_FIELDS.has(key)) {
+			throw new Error(`invocation descriptor has unapproved field '${key}'`);
+		}
+	}
+	for (const field of ["target_id", "model_ref", "selector"]) {
+		if (
+			typeof descriptor[field] !== "string" ||
+			descriptor[field].length === 0
+		) {
+			throw new Error(
+				`invocation descriptor.${field} must be a non-empty string`,
+			);
+		}
+	}
+	validateIdentifier(descriptor.target_id, "invocation descriptor.target_id");
+	validateModelArg(descriptor.model_ref, "invocation descriptor.model_ref");
+	validateModelArg(descriptor.selector, "invocation descriptor.selector");
+	if (!Array.isArray(descriptor.invocation_args)) {
+		throw new Error("invocation descriptor.invocation_args must be an array");
+	}
+	if (descriptor.effort !== undefined && descriptor.effort !== null) {
+		if (
+			typeof descriptor.effort !== "string" ||
+			!EFFORT_VALUES.has(descriptor.effort)
+		) {
+			throw new Error("invocation descriptor.effort is not an approved value");
+		}
+	}
+	if (descriptor.variant !== undefined && descriptor.variant !== null) {
+		if (
+			typeof descriptor.variant !== "string" ||
+			!VARIANT_VALUES.has(descriptor.variant)
+		) {
+			throw new Error("invocation descriptor.variant is not an approved value");
+		}
+	}
+	if (descriptor.effort != null && descriptor.variant != null) {
+		throw new Error(
+			"invocation descriptor must not declare both effort and variant",
+		);
+	}
+	const boundHarness = requireDescriptorHarness(harness);
+	const args = validateInvocationArgs(descriptor.invocation_args, boundHarness);
+	const expectedArgs = mapInvocationArgs(boundHarness, descriptor);
+	if (
+		expectedArgs === null ||
+		args.length !== expectedArgs.length ||
+		args.some((value, index) => value !== expectedArgs[index])
+	) {
+		throw new Error(
+			`invocation descriptor argv does not match the ${boundHarness} provider mapping`,
+		);
+	}
+	if (args[0] === "--effort" && descriptor.effort !== args[1]) {
+		throw new Error(
+			"invocation descriptor effort does not match invocation_args",
+		);
+	}
+	if (args[0] === "-c" && descriptor.effort !== args[1].split("=", 2)[1]) {
+		throw new Error(
+			"invocation descriptor effort does not match invocation_args",
+		);
+	}
+	if (args[0] === "--variant" && descriptor.variant !== args[1]) {
+		throw new Error(
+			"invocation descriptor variant does not match invocation_args",
+		);
+	}
+}
+
+/**
+ * Validate and freeze an invocation descriptor.  This is intentionally
+ * independent of roster qualifications: callers can validate a receipt or a
+ * retry record without granting it automatic-routing authority.
+ *
+ * @param {unknown} value
+ * @param {string} harness Provider harness used for argv allowlisting.
+ * @returns {Readonly<{target_id:string,model_ref:string,selector:string,effort:string|null,variant:string|null,invocation_args:readonly string[],descriptor_identity:string}>}
+ */
+export function validateInvocationDescriptor(value, harness) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error("invocation descriptor must be an object");
+	}
+	for (const key of Object.keys(value)) {
+		if (key === "descriptor_identity") continue;
+		if (!DESCRIPTOR_FIELDS.has(key)) {
+			throw new Error(`invocation descriptor has unapproved field '${key}'`);
+		}
+	}
+	for (const field of ["target_id", "model_ref", "selector"]) {
+		if (typeof value[field] !== "string" || value[field].length === 0) {
+			throw new Error(
+				`invocation descriptor.${field} must be a non-empty string`,
+			);
+		}
+	}
+	validateIdentifier(value.target_id, "invocation descriptor.target_id");
+	validateModelArg(value.model_ref, "invocation descriptor.model_ref");
+	validateModelArg(value.selector, "invocation descriptor.selector");
+	if (value.effort !== undefined && value.effort !== null) {
+		if (typeof value.effort !== "string" || !EFFORT_VALUES.has(value.effort)) {
+			throw new Error("invocation descriptor.effort is not an approved value");
+		}
+	}
+	if (value.variant !== undefined && value.variant !== null) {
+		if (
+			typeof value.variant !== "string" ||
+			!VARIANT_VALUES.has(value.variant)
+		) {
+			throw new Error("invocation descriptor.variant is not an approved value");
+		}
+	}
+	if (value.effort != null && value.variant != null) {
+		throw new Error(
+			"invocation descriptor must not declare both effort and variant",
+		);
+	}
+	const rawArgs =
+		value.invocation_args === undefined ? [] : value.invocation_args;
+	const boundHarness = requireDescriptorHarness(harness);
+	const args = validateInvocationArgs(rawArgs, boundHarness);
+	const expectedArgs = mapInvocationArgs(boundHarness, value);
+	if (
+		expectedArgs === null ||
+		args.length !== expectedArgs.length ||
+		args.some((arg, index) => arg !== expectedArgs[index])
+	) {
+		throw new Error(
+			`invocation descriptor argv does not match the ${boundHarness} provider mapping`,
+		);
+	}
+	if (args[0] === "--effort" && value.effort !== args[1]) {
+		throw new Error(
+			"invocation descriptor effort does not match invocation_args",
+		);
+	}
+	if (args[0] === "-c" && value.effort !== args[1].split("=", 2)[1]) {
+		throw new Error(
+			"invocation descriptor effort does not match invocation_args",
+		);
+	}
+	if (args[0] === "--variant" && value.variant !== args[1]) {
+		throw new Error(
+			"invocation descriptor variant does not match invocation_args",
+		);
+	}
+	const core = descriptorCore({ ...value, invocation_args: args });
+	const identity = getInvocationDescriptorIdentity(core, boundHarness);
+	if (
+		value.descriptor_identity !== undefined &&
+		value.descriptor_identity !== identity
+	) {
+		throw new Error(
+			"invocation descriptor_identity does not match the canonical descriptor",
+		);
+	}
+	return Object.freeze({
+		...core,
+		invocation_args: args,
+		descriptor_identity: identity,
+	});
+}
+
+/**
+ * Return the canonical, routing-stable identity for a descriptor. The target,
+ * model reference, selector, effort/variant, every argv position, and the
+ * normalized canonical harness are part of the digest; qualification aliases
+ * containing only a selector cannot produce this identity.
+ * @param {object} descriptor
+ * @returns {string} `sha256:<hex>`
+ */
+export function getInvocationDescriptorIdentity(descriptor, harness) {
+	const boundHarness = requireDescriptorHarness(harness);
+	assertDescriptorIdentityInput(descriptor, boundHarness);
+	const core = descriptorCore({
+		...descriptor,
+		invocation_args: descriptor.invocation_args,
+	});
+	const canonical = canonicalizeInvocationDescriptor(core, boundHarness);
+	return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
+}
+
+/** Return the canonical JSON bytes used to derive descriptor identity. */
+export function canonicalizeInvocationDescriptor(descriptor, harness) {
+	const boundHarness = requireDescriptorHarness(harness);
+	assertDescriptorIdentityInput(descriptor, boundHarness);
+	return JSON.stringify(
+		canonicalizeForHash({
+			...descriptorCore(descriptor),
+			harness: normalizeProviderName(boundHarness),
+		}),
+	);
+}
+
+// Explicit aliases make the identity contract discoverable to callers that
+// use the shorter terminology in receipts and retry/quarantine records.
+export const descriptorIdentity = getInvocationDescriptorIdentity;
+export const canonicalDescriptorIdentity = getInvocationDescriptorIdentity;
+export const getDescriptorIdentity = getInvocationDescriptorIdentity;
 
 /**
  * Compute the provenance roster hash over the catalog (`models`) and
@@ -1008,4 +1924,20 @@ export function __resetRosterCacheForTests() {
 	cachedProviderCapabilities = null;
 	cachedSnapshotNameCapabilities = null;
 	cachedRosterSha = null;
+}
+
+// Maintainer-facing validation entry point. It reads the configured real
+// roster only; it never probes a provider or writes qualification evidence.
+if (process.argv.includes("--coherence")) {
+	try {
+		const report = evaluateRealRosterCoherence();
+		console.log(JSON.stringify(report, null, 2));
+		if (!report.ok) {
+			console.error(formatRealRosterCoherenceFailure(report));
+			process.exitCode = 1;
+		}
+	} catch (error) {
+		console.error(`real-roster coherence could not run: ${error.message}`);
+		process.exitCode = 1;
+	}
 }

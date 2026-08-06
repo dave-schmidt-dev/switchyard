@@ -56,7 +56,7 @@
 			"harness": "agy",
 			"snapshot_name": "Antigravity",
 			"credential_profile": "gemini-profile",
-			"enabled": true,
+			"enabled": false,
 			"technical_ceiling": "standard",
 			"qualifications": {
 				"fixture-agy-gemini-standard": { "status": "qualified" }

@@ -45,12 +45,28 @@ const SENSITIVE_PATH_PATTERNS = [
 // running whatever a diff puts in a `preinstall` script.
 const MANIFEST_REVIEW_PATTERNS = [
 	/(^|\/)package\.json$/i,
+	/(^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.ya?ml|bun\.lock(?:b)?)$/i,
 	/(^|\/)Makefile$/i,
 	/(^|\/)Dockerfile/i,
 	/\.(sh|bash)$/i,
 	/(^|\/)\.github\/workflows\//i,
 	/(^|\/)\.gitlab-ci\.ya?ml$/i,
 ];
+
+/**
+ * Normalize a patch only when it lacks git's required final line terminator.
+ * Already-terminated patches, including those with two trailing newlines,
+ * are returned byte-for-byte unchanged. This makes repeated gate calls
+ * idempotent and avoids reconstructing bytes lost by an earlier trim().
+ * @param {unknown} diff
+ * @returns {unknown}
+ */
+function normalizePatch(diff) {
+	if (typeof diff !== "string" || diff.length === 0 || diff.endsWith("\n")) {
+		return diff;
+	}
+	return `${diff}\n`;
+}
 
 /**
  * Resolve a diff-relative path against the project root and report whether
@@ -498,18 +514,11 @@ export function integrationGate(diff, projectPath, options = {}) {
 		return { success: false, message: "empty_required_diff" };
 	}
 
-	// `git apply` requires a newline-terminated patch. Every adapter's
-	// captureDiff() returns `diff.trim()`, and executeTaskWithOrchestrator
-	// trims the orchestrator's diff too — both strip that terminator, so a real
-	// captured diff is otherwise rejected here as "corrupt patch" before a
-	// single edit can reach the host (INV-2). Re-terminate once, at this single
-	// door, so every diff source is covered rather than repeating the fix in
-	// four separate adapters. An empty/whitespace diff is left untouched so
-	// validateDiff still reports it as "empty diff".
-	const patch =
-		typeof diff === "string" && diff.length > 0 && !diff.endsWith("\n")
-			? `${diff}\n`
-			: diff;
+	// `git apply` requires a newline-terminated patch. Adapter capture keeps
+	// the provider's bytes intact; this compatibility normalizer only repairs
+	// sources that arrive without a terminator. It is idempotent and preserves
+	// valid one- and two-newline endings.
+	const patch = normalizePatch(diff);
 
 	// Files enforcement: check declared vs touched paths.
 	// Runs BEFORE the structural checks in validateDiff; still calls

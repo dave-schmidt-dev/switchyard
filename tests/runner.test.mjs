@@ -22,25 +22,35 @@ import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
+import { sanitizeFailureMetadata } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	__resetRosterCacheForTests,
+	getInvocationDescriptorIdentity,
+	validateInvocationDescriptor,
+} from "../src/switchyard/roster/index.mjs";
+import { route as realRoute } from "../src/switchyard/router/index.mjs";
 import {
 	createCliOrchestrator,
 	createEmptyCheckpoint,
 	createQueueIdentity,
 	deriveQueueDiagnostics,
-	executeTask,
-	executeTaskWithOrchestrator,
+	executeTask as executeTaskImpl,
+	executeTaskWithOrchestrator as executeTaskWithOrchestratorImpl,
 	getRunnableTasks,
 	loadCheckpoint,
 	loadTaskQueue,
 	normalizeRunOptions,
 	parseTaskQueue,
 	resolveOrchestrator,
-	runQueue,
-	runQueueWithOrchestrator,
+	runQueueAsync as runQueueAsyncImpl,
+	runQueue as runQueueImpl,
+	runQueueWithOrchestrator as runQueueWithOrchestratorImpl,
 	saveCheckpoint,
 	TaskSelectionError,
 	validateTaskGraph,
 	waitForJobCompletion,
+	writeDispatchIntent,
+	writeDispatchIntentAsync,
 } from "../src/switchyard/runner/index.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-runner-test");
@@ -58,6 +68,47 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
+
+function writeDispatchQualifiedRosterFixture() {
+	const roster = JSON.parse(readFileSync(ROSTER_FIXTURE_PATH, "utf8"));
+	const testedAt = new Date().toISOString();
+	for (const [targetId, target] of Object.entries(roster.targets)) {
+		if (!target.enabled) continue;
+		for (const slots of Object.values(target.slots ?? {})) {
+			for (const slot of slots ?? []) {
+				if (slot.manual_only) continue;
+				const model = roster.models[slot.model_ref];
+				if (model?.status !== "active") continue;
+				const core = {
+					target_id: targetId,
+					model_ref: slot.model_ref,
+					selector: model.selector,
+					effort: slot.effort ?? null,
+					variant: slot.variant ?? null,
+					invocation_args: slot.invocation_args ?? [],
+				};
+				const descriptorIdentity = getInvocationDescriptorIdentity(
+					core,
+					target.harness,
+				);
+				target.qualifications ??= {};
+				target.qualifications[descriptorIdentity] = {
+					...core,
+					descriptor_identity: descriptorIdentity,
+					status: "dispatch_qualified",
+					tested_at: testedAt,
+					credential_profile: target.credential_profile,
+				};
+			}
+		}
+	}
+	const fixturePath = join(
+		tmpdir(),
+		`switchyard-runner-qualified-roster-${process.pid}-${randomUUID()}.json`,
+	);
+	writeFileSync(fixturePath, JSON.stringify(roster), "utf8");
+	return fixturePath;
+}
 
 // These older runner fixtures predate the mandatory task-contract Executor:
 // field. Normalize only the fixture text so the real parser receives an
@@ -98,6 +149,414 @@ afterEach(() => {
 		// no-op
 	}
 });
+
+describe("dispatch descriptor receipt contract", () => {
+	it("fails closed when direct intent helpers have no writer", async () => {
+		const payload = { taskId: "direct-missing", provider: "claude" };
+		const syncFailure = writeDispatchIntent({}, payload);
+		strictEqual(syncFailure.ledgerFailureCode, "missing_writer");
+		strictEqual(
+			(await writeDispatchIntentAsync({}, payload)).ledgerFailureCode,
+			"missing_writer",
+		);
+	});
+
+	it("fails closed on a thenable returned by a synchronous intent writer", () => {
+		let executions = 0;
+		const descriptor = testDescriptor();
+		const base = {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				resolvedTargetId: "claude",
+				resolved_harness: "claude",
+			}),
+			resolveDescriptor: () => descriptor,
+			recordDispatch: () => {},
+			adapters: {
+				claude: {
+					execute: () => {
+						executions += 1;
+						return { success: true };
+					},
+					captureDiff: () => null,
+				},
+			},
+			workingContainerName: "fake-container",
+			projectPath: TEST_DIR,
+		};
+		for (const writer of [
+			() => Promise.resolve(),
+			() => Promise.reject(new Error("synthetic writer failure")),
+		]) {
+			const result = executeTask(
+				{ id: "direct-thenable", title: "task", description: "work" },
+				{ ...base, recordDispatchIntent: writer },
+			);
+			strictEqual(result.result, "intent_receipt_failed");
+			strictEqual(result.ledgerFailureCode, "async_writer");
+		}
+		strictEqual(executions, 0);
+	});
+
+	it("fails closed before adapter execution when the context writer is absent", () => {
+		let executions = 0;
+		const result = executeTask(
+			{ id: "direct-no-writer", title: "task", description: "work" },
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					resolvedTargetId: "claude",
+					resolved_harness: "claude",
+				}),
+				resolveDescriptor: () => testDescriptor(),
+				recordDispatch: () => {},
+				adapters: {
+					claude: {
+						execute: () => {
+							executions += 1;
+							return { success: true };
+						},
+						captureDiff: () => null,
+					},
+				},
+				workingContainerName: "fake-container",
+				projectPath: TEST_DIR,
+			},
+		);
+		strictEqual(result.result, "intent_receipt_failed");
+		strictEqual(result.ledgerFailureCode, "missing_writer");
+		strictEqual(executions, 0);
+	});
+
+	it("rejects a missing or changed receipt before adapter execution", () => {
+		let executions = 0;
+		const descriptor = testDescriptor();
+		const base = {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				resolvedTargetId: "claude",
+				resolved_harness: "claude",
+			}),
+			resolveDescriptor: () => descriptor,
+			recordDispatch: () => {},
+			integrationGate: () => ({ success: true }),
+			adapters: {
+				claude: {
+					execute: () => {
+						executions += 1;
+						return { success: true };
+					},
+					captureDiff: () => null,
+				},
+			},
+			workingContainerName: "fake-container",
+			projectPath: TEST_DIR,
+		};
+		const missing = executeTask(
+			{ id: "1.1", title: "task", description: "work" },
+			{
+				...base,
+				route: () => ({ ...base.route(), invocationDescriptor: null }),
+			},
+		);
+		strictEqual(missing.result, "descriptor_receipt_invalid");
+		const changed = executeTask(
+			{ id: "1.1", title: "task", description: "work" },
+			{
+				...base,
+				route: () => ({
+					...base.route(),
+					invocationDescriptor: testDescriptor({ selector: "claude-opus-4" }),
+				}),
+			},
+		);
+		strictEqual(changed.result, "descriptor_receipt_invalid");
+		strictEqual(executions, 0);
+	});
+
+	it("fails closed when the authoritative intent receipt cannot be written", () => {
+		let executions = 0;
+		const descriptor = testDescriptor();
+		const result = executeTask(
+			{ id: "1.2", title: "task", description: "work", requiredPaths: null },
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					resolvedTargetId: "claude",
+					resolved_harness: "claude",
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true }),
+				recordDispatchIntent: () => {
+					const error = new Error("EPERM: /private/host/path");
+					error.code = "EPERM";
+					throw error;
+				},
+				adapters: {
+					claude: {
+						execute: () => {
+							executions += 1;
+							return { success: true };
+						},
+						captureDiff: () => null,
+					},
+				},
+				workingContainerName: "fake-container",
+				projectPath: TEST_DIR,
+			},
+		);
+		strictEqual(result.result, "intent_receipt_failed");
+		strictEqual(result.ledgerFailureCode, "EPERM");
+		strictEqual(result.errorKind, "intent_receipt");
+		strictEqual(executions, 0);
+	});
+
+	it("continues after a legacy projection failure once local intent succeeds", () => {
+		let executions = 0;
+		let intentWrites = 0;
+		const descriptor = testDescriptor();
+		const result = executeTask(
+			{ id: "1.3", title: "task", description: "work", requiredPaths: null },
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					resolvedTargetId: "claude",
+					resolved_harness: "claude",
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: () => {
+					const error = new Error("EPERM: /private/host/path");
+					error.code = "EPERM";
+					throw error;
+				},
+				recordDispatchIntent: () => {
+					intentWrites += 1;
+				},
+				adapters: {
+					claude: {
+						execute: () => {
+							executions += 1;
+							return { success: true };
+						},
+						captureDiff: () => null,
+					},
+				},
+				integrationGate: () => ({ success: true }),
+				workingContainerName: "fake-container",
+				projectPath: TEST_DIR,
+			},
+		);
+		strictEqual(result.success, true);
+		strictEqual(intentWrites, 1);
+		strictEqual(executions, 1);
+	});
+
+	it("runQueue blocks adapter execution when its local intent writer rejects", () => {
+		const tasksFilePath = writeTasksFile(`
+### Task 1.6: intent gate
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** work
+`);
+		let executions = 0;
+		const result = runQueue({
+			tasksFilePath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath: join(TEST_DIR, "intent-gate-checkpoint.json"),
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					resolvedTargetId: "claude",
+					resolved_harness: "claude",
+				}),
+				resolveDescriptor: () => testDescriptor(),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {
+					const error = new Error("EPERM: /private/host/path");
+					error.code = "EPERM";
+					throw error;
+				},
+				adapters: {
+					claude: {
+						execute: () => {
+							executions += 1;
+							return { success: true };
+						},
+						captureDiff: () => null,
+					},
+				},
+				integrationGate: () => ({ success: true }),
+			},
+		});
+		strictEqual(result.results[0].result, "intent_receipt_failed");
+		strictEqual(executions, 0);
+	});
+
+	it("writes the orchestrator intent before launch and blocks launch on failure", async () => {
+		const descriptor = testDescriptor();
+		const events = [];
+		const base = {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				resolvedTargetId: "claude",
+				resolved_harness: "claude",
+			}),
+			resolveDescriptor: () => descriptor,
+			recordDispatch: () => {},
+			workingContainerName: "fake-container",
+			projectPath: TEST_DIR,
+			pollIntervalMs: 1,
+			maxPolls: 1,
+			sleepFn: async () => {},
+			integrationGate: () => ({ success: true }),
+			adapters: { claude: {} },
+		};
+		const success = await executeTaskWithOrchestrator(
+			{ id: "1.4", title: "task", description: "work" },
+			{
+				...base,
+				recordDispatchIntent: () => events.push("intent"),
+				orchestrator: {
+					launch: async () => {
+						events.push("launch");
+						return "job-1";
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: null }),
+				},
+			},
+		);
+		strictEqual(success.success, true);
+		deepStrictEqual(events, ["intent", "launch"]);
+
+		let launched = false;
+		const blocked = await executeTaskWithOrchestrator(
+			{ id: "1.5", title: "task", description: "work" },
+			{
+				...base,
+				recordDispatchIntent: () => {
+					const error = new Error("EPERM: /private/host/path");
+					error.code = "EPERM";
+					throw error;
+				},
+				orchestrator: {
+					launch: async () => {
+						launched = true;
+						return "job-2";
+					},
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: null }),
+				},
+			},
+		);
+		strictEqual(blocked.result, "intent_receipt_failed");
+		strictEqual(launched, false);
+	});
+});
+
+function testDescriptor(overrides = {}) {
+	const core = {
+		target_id: "claude",
+		model_ref: "claude-sonnet-5",
+		selector: "claude-sonnet-5",
+		effort: null,
+		variant: null,
+		invocation_args: [],
+		...overrides,
+	};
+	return validateInvocationDescriptor(
+		{
+			...core,
+			descriptor_identity: getInvocationDescriptorIdentity(core, "claude"),
+		},
+		"claude",
+	);
+}
+
+function descriptorForRoute(routeResult) {
+	if (!routeResult?.provider) return null;
+	const harness = routeResult.provider
+		.replace(/^antigravity-claude$/, "agy")
+		.replace(/^opencode-go$/, "opencode");
+	const model = routeResult.model ?? "test-model";
+	const core = {
+		target_id: routeResult.resolvedTargetId ?? routeResult.provider,
+		model_ref: model,
+		selector: model,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	};
+	return {
+		...core,
+		descriptor_identity: getInvocationDescriptorIdentity(core, harness),
+	};
+}
+
+function withTestDescriptorContext(context) {
+	let latest = null;
+	const originalRoute = context.route;
+	const route = (options) => {
+		const routed = originalRoute(options);
+		latest = descriptorForRoute(routed);
+		return latest && routed && !Object.hasOwn(routed, "invocationDescriptor")
+			? { ...routed, invocationDescriptor: latest }
+			: routed;
+	};
+	return {
+		...context,
+		route,
+		resolveDescriptor: () => latest,
+	};
+}
+
+function executeTask(task, context) {
+	return executeTaskImpl(task, withTestDescriptorContext(context));
+}
+
+async function executeTaskWithOrchestrator(task, context) {
+	return executeTaskWithOrchestratorImpl(
+		task,
+		withTestDescriptorContext(context),
+	);
+}
+
+function withTestDescriptorOptions(options) {
+	const dependencies = options.dependencies ?? {};
+	const context = withTestDescriptorContext({
+		...dependencies,
+		route: dependencies.route ?? realRoute,
+	});
+	return {
+		...options,
+		dependencies: {
+			...dependencies,
+			route: context.route,
+			resolveDescriptor: context.resolveDescriptor,
+		},
+	};
+}
+
+function runQueue(options) {
+	return runQueueImpl(withTestDescriptorOptions(options));
+}
+
+async function runQueueAsync(options) {
+	return runQueueAsyncImpl(withTestDescriptorOptions(options));
+}
+
+async function runQueueWithOrchestrator(options) {
+	return runQueueWithOrchestratorImpl(withTestDescriptorOptions(options));
+}
 
 describe("runner queue parsing", () => {
 	it("parses task blocks with status and description", () => {
@@ -552,6 +1011,53 @@ describe("runner queue parsing", () => {
 		}
 	});
 
+	it("requires a non-empty justification for explicit low/high capabilities", () => {
+		for (const capability of ["high", "low"]) {
+			const markdown = `### Task 1.1: Missing justification
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Executor:** switchyard
+- **RequiredCapability:** ${capability}
+- **Description:** Work
+`;
+			throws(
+				() => parseFixture(markdown),
+				/RequiredCapabilityJustification is required for explicit/,
+			);
+		}
+	});
+
+	it("rejects an empty RequiredCapabilityJustification field", () => {
+		const markdown = `### Task 1.1: Empty justification
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Executor:** switchyard
+- **RequiredCapability:** low
+- **RequiredCapabilityJustification:**
+- **Description:** Work
+`;
+		throws(
+			() => parseFixture(markdown),
+			/RequiredCapabilityJustification field is empty/,
+		);
+	});
+
+	it("rejects duplicate RequiredCapabilityJustification declarations", () => {
+		const markdown = `### Task 1.1: Duplicate justification
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Executor:** switchyard
+- **RequiredCapability:** high
+- **RequiredCapabilityJustification:** First reason
+- **RequiredCapabilityJustification:** Second reason
+- **Description:** Work
+`;
+		throws(
+			() => parseFixture(markdown),
+			/duplicate RequiredCapabilityJustification declarations/,
+		);
+	});
+
 	it("parses Executor strictly and normalizes accepted values", () => {
 		for (const executor of ["Native", "SWITCHYARD", "human"]) {
 			const files =
@@ -656,6 +1162,253 @@ describe("runner queue parsing", () => {
 		strictEqual(tasks.length, 1);
 		strictEqual(tasks[0].type, "review");
 		strictEqual(tasks[0].requiredPaths, null);
+	});
+});
+
+describe("async runner provider lifecycle", () => {
+	async function runAsyncRedactionCase({ execution, integrationGate }) {
+		const root = join(
+			TEST_DIR,
+			`async-redaction-${Date.now()}-${Math.random()}`,
+		);
+		mkdirSync(root, { recursive: true });
+		const tasksPath = join(root, "TASKS.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		writeFileSync(
+			tasksPath,
+			"### Task 4.2: Async redaction\n- **Status:** pending\n- **Type:** review\n- **Description:** exercise redaction\n- **Executor:** switchyard\n",
+		);
+		const descriptor = descriptorForRoute({
+			provider: "opencode",
+			resolved_harness: "opencode",
+			resolvedTargetId: "async-target",
+			model: "fake-model",
+		});
+		let observed;
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
+			projectPath: root,
+			workingContainerName: "async-worker",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "opencode",
+					resolved_harness: "opencode",
+					resolvedTargetId: "async-target",
+					model: "fake-model",
+					invocationDescriptor: descriptor,
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				integrationGate,
+				onResult: (value) => {
+					observed = value;
+				},
+				adapters: {
+					opencode: {
+						executeAsync: async () => execution,
+						captureDiffAsync: async () => "SECRET_RAW_DIFF",
+					},
+				},
+			},
+		});
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		return { result, observed, checkpoint };
+	}
+
+	it("awaits executeAsync before returning a terminal task result", async () => {
+		const root = join(TEST_DIR, "async-lifecycle");
+		mkdirSync(root, { recursive: true });
+		const tasksPath = join(root, "TASKS.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		writeFileSync(
+			tasksPath,
+			"### Task 4.1: Async provider\n- **Status:** pending\n- **Type:** review\n- **Description:** exercise async lifecycle\n- **Executor:** switchyard\n",
+		);
+		const descriptor = descriptorForRoute({
+			provider: "opencode",
+			resolved_harness: "opencode",
+			resolvedTargetId: "async-target",
+			model: "fake-model",
+		});
+		let settled = false;
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
+			projectPath: root,
+			workingContainerName: "async-worker",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "opencode",
+					resolved_harness: "opencode",
+					resolvedTargetId: "async-target",
+					model: "fake-model",
+					invocationDescriptor: descriptor,
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: () => {},
+				adapters: {
+					opencode: {
+						executeAsync: async () => {
+							await new Promise((resolve) => setTimeout(resolve, 5));
+							settled = true;
+							return { success: true, output: "" };
+						},
+						captureDiff: () => null,
+						captureDiffAsync: async () => null,
+					},
+				},
+			},
+		});
+		strictEqual(settled, true);
+		strictEqual(result.results[0].success, true);
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.completedTaskIds[0], "4.1");
+	});
+
+	it("emits bounded scalar heartbeats while an async provider is in flight", async () => {
+		const root = join(TEST_DIR, "async-heartbeat");
+		mkdirSync(root, { recursive: true });
+		const tasksPath = join(root, "TASKS.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		writeFileSync(
+			tasksPath,
+			"### Task 4.2: Heartbeat\n- **Status:** pending\n- **Type:** review\n- **Description:** heartbeat\n- **Executor:** switchyard\n",
+		);
+		const descriptor = descriptorForRoute({
+			provider: "opencode",
+			resolved_harness: "opencode",
+			resolvedTargetId: "async-target",
+			model: "fake-model",
+		});
+		const heartbeats = [];
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
+			projectPath: root,
+			workingContainerName: "async-worker",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "opencode",
+					resolved_harness: "opencode",
+					resolvedTargetId: "async-target",
+					model: "fake-model",
+					invocationDescriptor: descriptor,
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				onTaskHeartbeat: (value) => heartbeats.push(value),
+				adapters: {
+					opencode: {
+						executeAsync: async (_prompt, _container, options) => {
+							options.onPoll({
+								elapsedMs: 42,
+								stdoutBytes: 999,
+								stderrBytes: 999,
+							});
+							return { success: true, output: "SECRET_STREAM" };
+						},
+						captureDiffAsync: async () => null,
+					},
+				},
+			},
+		});
+		strictEqual(result.results[0].success, true);
+		strictEqual(heartbeats.length, 1);
+		strictEqual(heartbeats[0].taskId, "4.2");
+		strictEqual(heartbeats[0].elapsedMs, 42);
+		strictEqual(heartbeats[0].processPhase, "provider_running");
+		ok(!Object.hasOwn(heartbeats[0], "stdoutBytes"));
+		ok(!JSON.stringify(heartbeats).includes("SECRET_STREAM"));
+	});
+
+	it("async managed-container lifecycle reports processed tasks and cleans up on selection failure", async () => {
+		const root = join(TEST_DIR, "async-managed-container");
+		mkdirSync(root, { recursive: true });
+		const tasksPath = join(root, "TASKS.md");
+		writeFileSync(
+			tasksPath,
+			"### Task 4.2: Managed\n- **Status:** pending\n- **Type:** review\n- **Description:** managed\n- **Executor:** switchyard\n",
+		);
+		let wiped = 0;
+		const ready = [];
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: root,
+				taskIds: ["9.9"],
+				dependencies: {
+					ensureAgentContainer: () => {},
+					createWorkingContainer: () => "managed-worker",
+					provisionCredentials: () => {},
+					seedProject: () => {},
+					wipeWorkingContainer: () => {
+						wiped += 1;
+					},
+					onContainerReady: (info) => ready.push(info.workingContainerName),
+				},
+			}),
+			TaskSelectionError,
+		);
+		deepStrictEqual(ready, ["managed-worker"]);
+		strictEqual(
+			wiped,
+			1,
+			"selection/graph errors after container creation must still clean up the owned container",
+		);
+		wiped = 0;
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: root,
+				dependencies: {
+					ensureAgentContainer: () => {},
+					createWorkingContainer: () => "managed-worker-2",
+					provisionCredentials: () => {},
+					seedProject: () => {},
+					wipeWorkingContainer: () => {
+						wiped += 1;
+					},
+					onContainerReady: () => {
+						throw new Error("ready callback failed");
+					},
+				},
+			}),
+			/ready callback failed/,
+		);
+		strictEqual(
+			wiped,
+			1,
+			"ready callback failures must clean up owned containers",
+		);
+	});
+
+	it("redacts timeout partial diffs before onResult and checkpoint persistence", async () => {
+		const { result, observed, checkpoint } = await runAsyncRedactionCase({
+			execution: { success: false, timedOut: true, error: "timed out" },
+			integrationGate: () => ({ success: true }),
+		});
+		strictEqual(result.results[0].partialDiff, undefined);
+		strictEqual(observed.partialDiff, undefined);
+		ok(result.results[0].partialDiffPath?.endsWith("4.2.diff"));
+		strictEqual(checkpoint.results[0].partialDiffPath, null);
+		ok(checkpoint.results[0].artifactRef?.startsWith("artifact:"));
+		ok(!JSON.stringify(checkpoint).includes("SECRET_RAW_DIFF"));
+	});
+
+	it("redacts integration-rejection partial diffs before onResult", async () => {
+		const { result, observed, checkpoint } = await runAsyncRedactionCase({
+			execution: { success: true, output: "" },
+			integrationGate: () => ({ success: false }),
+		});
+		strictEqual(result.results[0].partialDiff, undefined);
+		strictEqual(observed.partialDiff, undefined);
+		ok(result.results[0].partialDiffPath?.endsWith("4.2.diff"));
+		strictEqual(checkpoint.results[0].partialDiffPath, null);
+		ok(checkpoint.results[0].artifactRef?.startsWith("artifact:"));
+		ok(!JSON.stringify(checkpoint).includes("SECRET_RAW_DIFF"));
 	});
 });
 
@@ -911,6 +1664,7 @@ ${body}
 ### Task 1.1: Sentinel root
 - **Status:** pending
 - **RequiredCapability:** high
+- **RequiredCapabilityJustification:** The root task spans multiple provider boundaries.
 - **Executor:** switchyard
 - **Files:** src/root.mjs
 - **Blocked by:** none
@@ -925,6 +1679,7 @@ ${body}
 ### Task 1.3: Human approval
 - **Status:** pending
 - **RequiredCapability:** low
+- **RequiredCapabilityJustification:** The human approval is a mechanical confirmation.
 - **Executor:** human
 - **Description:** human work is gated outside the provider queue
 
@@ -939,6 +1694,7 @@ ${body}
 ### Task 1.5: Dependent follow-up
 - **Status:** pending
 - **RequiredCapability:** low
+- **RequiredCapabilityJustification:** The follow-up is a bounded mechanical change.
 - **Executor:** switchyard
 - **Files:** src/follow-up.mjs
 - **Blocked by:** Task 1.1
@@ -1273,6 +2029,71 @@ describe("runner orchestration", () => {
 			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 	});
+
+	it("treats an exactly selected completed task as already_complete without routing", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Already complete
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** Already completed operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		let routeCalls = 0;
+		const dependencies = {
+			route: () => {
+				routeCalls += 1;
+				throw new Error("completed exact selection must not route");
+			},
+			recordDispatch: () => {
+				throw new Error("completed exact selection must not dispatch");
+			},
+			adapters: {},
+		};
+
+		// Seed an identity-bound checkpoint through the normal queue path so the
+		// exact selection has durable successful-completion evidence to reconcile.
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			taskIds: ["1.1"],
+			dependencies: {
+				route: () => ({ provider: "claude", model: "sonnet", reason: "test" }),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			taskIds: ["1.1"],
+			dependencies,
+		});
+
+		strictEqual(routeCalls, 0);
+		strictEqual(result.results.length, 1);
+		strictEqual(result.results[0].result, "already_complete");
+		strictEqual(result.results[0].success, true);
+		strictEqual(
+			loadCheckpoint(checkpointPath, tasksPath, {
+				queueIdentity: result.queueIdentity,
+				runOptions: result.runOptions,
+			}).results.at(-1).result,
+			"already_complete",
+		);
+	});
 });
 
 describe("runner stopOnFailure + integration gate failure", () => {
@@ -1365,6 +2186,120 @@ describe("runner stopOnFailure + integration gate failure", () => {
 			["integration_failed", "integration_failed"],
 		);
 		deepStrictEqual(result.completedTaskIds, []);
+	});
+
+	it("reconciles alreadyApplied as a successful terminal outcome", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Already applied
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** Idempotent operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const artifactRef = "artifact:0123456789abcdef01234567";
+		const dispatches = [];
+		const events = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "sonnet",
+					reason:
+						"../../private/sk-proj-opaquevalue at service.prod.company.com",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				onStatus: (event) => events.push(event),
+				integrationGate: () => ({ alreadyApplied: true, artifactRef }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true }),
+						captureDiff: () => "diff --git a/a b/a",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.results[0].success, true);
+		strictEqual(result.results[0].result, "success");
+		strictEqual(result.results[0].alreadyApplied, true);
+		strictEqual(result.results[0].artifactRef, artifactRef);
+		strictEqual(dispatches[0].result, "success");
+		strictEqual(dispatches[0].alreadyApplied, true);
+		strictEqual(dispatches[0].artifactRef, artifactRef);
+		strictEqual(dispatches[0].reason, "spread");
+		strictEqual(sanitizeFailureMetadata(dispatches[0]), null);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[0].result, "success");
+		strictEqual(checkpoint.results[0].alreadyApplied, true);
+		strictEqual(checkpoint.results[0].artifactRef, artifactRef);
+		ok(!JSON.stringify(dispatches).includes("unknown_failure"));
+		ok(
+			!JSON.stringify({ result, checkpoint, dispatches, events }).includes(
+				"sk-proj-opaquevalue",
+			),
+		);
+		ok(events.some((event) => event.outcome === "already_applied"));
+	});
+
+	it("keeps orchestrator alreadyApplied outcomes safe and ledger-compatible", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Orchestrator already applied
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** Idempotent headless operation
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const artifactRef = "artifact:fedcba987654321001234567";
+		const dispatches = [];
+		const events = [];
+		const result = await runQueueWithOrchestrator({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "sonnet",
+					resolvedTargetId: "claude-target",
+					resolved_harness: "claude",
+					reason:
+						"../../private/sk-proj-orchestrator at service.prod.company.com",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				onStatus: (event) => events.push(event),
+				integrationGate: () => ({ alreadyApplied: true, artifactRef }),
+				sleepFn: async () => {},
+				orchestrator: {
+					launch: async () => "job-1",
+					status: async () => ({ state: "done" }),
+					result: async () => ({
+						success: true,
+						diff: "diff --git a/a b/a",
+					}),
+				},
+			},
+		});
+
+		strictEqual(result.results[0].result, "success");
+		strictEqual(result.results[0].alreadyApplied, true);
+		strictEqual(dispatches[0].reason, "spread");
+		strictEqual(dispatches[0].artifactRef, artifactRef);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		ok(
+			!JSON.stringify({ result, checkpoint, dispatches, events }).includes(
+				"sk-proj-orchestrator",
+			),
+		);
+		ok(events.some((event) => event.outcome === "already_applied"));
 	});
 });
 
@@ -1460,6 +2395,8 @@ describe("runner headless orchestrator mode", () => {
 				route: () => ({
 					provider: "claude",
 					model: "claude-sonnet-5",
+					resolvedTargetId: "claude-target",
+					resolved_harness: "claude",
 					percentLeft: 65,
 					reason: "spread",
 				}),
@@ -1505,6 +2442,8 @@ describe("runner headless orchestrator mode", () => {
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		deepStrictEqual(checkpoint.completedTaskIds, ["1.1", "1.2"]);
+		strictEqual(checkpoint.results[0].descriptorHarness, "claude");
+		strictEqual(checkpoint.results[0].resolvedTargetId, "claude-target");
 	});
 
 	it("resumes in orchestrator mode from checkpoint", async () => {
@@ -1566,6 +2505,130 @@ describe("runner headless orchestrator mode", () => {
 			launches.map((payload) => payload.taskId),
 			["1.1", "1.2"],
 		);
+	});
+
+	it("blocks historical model-only retry state before routing or orchestrator launch", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Historical retry
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** A legacy retry record must not be reinterpreted as a fresh task
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			quarantinedTargetIds: ["agy-gemini"],
+			retryAttempts: [],
+			retryTransitions: [],
+			retryTransitionId: 0,
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "target_quarantined",
+				resolvedTargetId: "agy-gemini",
+			},
+		});
+		let routeCalls = 0;
+		let launchCalls = 0;
+
+		await rejects(
+			() =>
+				runQueueWithOrchestrator({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+					checkpointPath,
+					dependencies: {
+						route: () => {
+							routeCalls += 1;
+							return { provider: "agy", model: "fixture-gemini" };
+						},
+						orchestrator: {
+							launch: async () => {
+								launchCalls += 1;
+								return "job-never-launched";
+							},
+							status: async () => ({ state: "done" }),
+							result: async () => ({ success: true, diff: "" }),
+						},
+					},
+				}),
+			/historical retry state lacks exact invocation descriptor evidence/,
+		);
+		strictEqual(routeCalls, 0);
+		strictEqual(launchCalls, 0);
+	});
+
+	it("blocks complete retry state until orchestrator retry-resume semantics are audited", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Complete retry
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** A complete retry record needs an explicit resume state machine
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const descriptor = testDescriptor({
+			target_id: "claude-target",
+			model_ref: "claude-sonnet-5",
+			selector: "claude-sonnet-5",
+		});
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			quarantinedTargetIds: ["claude-target"],
+			retryAttempts: [],
+			retryTransitions: [],
+			retryTransitionId: 0,
+			retryState: {
+				taskId: "1.1",
+				attempt: 2,
+				phase: "retry_started",
+				resolvedTargetId: "claude-target",
+				invocationDescriptor: descriptor,
+				descriptorIdentity: descriptor.descriptor_identity,
+				descriptorHarness: "claude",
+			},
+		});
+		let routeCalls = 0;
+		let launchCalls = 0;
+
+		await rejects(
+			() =>
+				runQueueWithOrchestrator({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+					checkpointPath,
+					dependencies: {
+						route: () => {
+							routeCalls += 1;
+							return { provider: "claude", model: "claude-sonnet-5" };
+						},
+						orchestrator: {
+							launch: async () => {
+								launchCalls += 1;
+								return "job-never-launched";
+							},
+							status: async () => ({ state: "done" }),
+							result: async () => ({ success: true, diff: "" }),
+						},
+					},
+				}),
+			/orchestrator mode cannot resume persisted retry state/,
+		);
+		strictEqual(routeCalls, 0);
+		strictEqual(launchCalls, 0);
 	});
 
 	it("re-selects and re-fails the same unsupported provider on every resume (orchestrator launch failure, not a route gap — Task E.1)", async () => {
@@ -1662,7 +2725,7 @@ describe("runner headless orchestrator mode", () => {
 	});
 });
 
-describe("runner provider spread recording", () => {
+describe("runner provider spread recording", { concurrency: false }, () => {
 	it("records split dispatches across claude and codex", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -1789,7 +2852,9 @@ describe("runner provider spread recording", () => {
 		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
 		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
-		process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
+		const qualifiedRosterPath = writeDispatchQualifiedRosterFixture();
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedRosterPath;
+		__resetRosterCacheForTests();
 
 		try {
 			writeSnapshot(72, 60);
@@ -1844,8 +2909,10 @@ describe("runner provider spread recording", () => {
 			} else {
 				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
 			}
+			__resetRosterCacheForTests();
 			try {
 				rmSync(snapshotPath, { force: true });
+				rmSync(qualifiedRosterPath, { force: true });
 			} catch {
 				// ignore cleanup errors
 			}
@@ -1877,7 +2944,9 @@ describe("runner provider spread recording", () => {
 		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
 		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
-		process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
+		const qualifiedRosterPath = writeDispatchQualifiedRosterFixture();
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedRosterPath;
+		__resetRosterCacheForTests();
 
 		try {
 			writeFileSync(
@@ -1937,8 +3006,10 @@ describe("runner provider spread recording", () => {
 			} else {
 				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
 			}
+			__resetRosterCacheForTests();
 			try {
 				rmSync(snapshotPath, { force: true });
+				rmSync(qualifiedRosterPath, { force: true });
 			} catch {
 				// ignore cleanup errors
 			}
@@ -1967,6 +3038,7 @@ describe("runner provider spread recording", () => {
 						reason: "spread",
 					}),
 					recordDispatch: (entry) => dispatches.push(entry),
+					recordDispatchIntent: () => {},
 					integrationGate: () => ({ success: true, message: "ok" }),
 					adapters: {
 						claude: {
@@ -2185,6 +3257,14 @@ describe("runner quota retry coordination", () => {
 				"finalized",
 			],
 		);
+		for (const transition of checkpoint.retryTransitions) {
+			if (transition.invocationDescriptor) {
+				strictEqual(
+					transition.invocationDescriptor.target_id,
+					transition.resolvedTargetId,
+				);
+			}
+		}
 		strictEqual(checkpoint.retryState, null);
 		ok(
 			!readFileSync(checkpointPath, "utf8").includes(
@@ -2246,6 +3326,11 @@ describe("runner quota retry coordination", () => {
 - **Description:** resume after a durable quarantine transition
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const resumeDescriptor = descriptorForRoute({
+			provider: "agy",
+			model: "fixture-gemini",
+			resolvedTargetId: "agy-gemini",
+		});
 		saveCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
@@ -2280,6 +3365,9 @@ describe("runner quota retry coordination", () => {
 				attempt: 1,
 				phase: "target_quarantined",
 				resolvedTargetId: "agy-gemini",
+				invocationDescriptor: resumeDescriptor,
+				descriptorIdentity: resumeDescriptor.descriptor_identity,
+				descriptorHarness: "agy",
 			},
 		});
 
@@ -2323,6 +3411,11 @@ describe("runner quota retry coordination", () => {
 - **Description:** recover the transition boundary
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const resumeDescriptor = descriptorForRoute({
+			provider: "agy",
+			model: "fixture-gemini",
+			resolvedTargetId: "agy-gemini",
+		});
 		saveCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
@@ -2356,6 +3449,9 @@ describe("runner quota retry coordination", () => {
 				attempt: 1,
 				phase: "attempt_recorded",
 				resolvedTargetId: "agy-gemini",
+				invocationDescriptor: resumeDescriptor,
+				descriptorIdentity: resumeDescriptor.descriptor_identity,
+				descriptorHarness: "agy",
 			},
 		});
 
@@ -2380,6 +3476,276 @@ describe("runner quota retry coordination", () => {
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		deepStrictEqual(checkpoint.quarantinedTargetIds, ["agy-gemini"]);
 		strictEqual(checkpoint.retryTransitions[1].type, "target_quarantined");
+	});
+
+	it("fails closed on historical model-only retry state without launching", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reject insufficient retry evidence
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** an old retry record has no exact descriptor
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			quarantinedTargetIds: ["agy-gemini"],
+			retryAttempts: [],
+			retryTransitions: [],
+			retryTransitionId: 0,
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "target_quarantined",
+				resolvedTargetId: "agy-gemini",
+			},
+		});
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-claude", target: "agy-claude" },
+			],
+			executionOutcomes: { agy: [{ success: true, output: "must not run" }] },
+		});
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: fixture.dependencies,
+		});
+		strictEqual(result.processedTasks, 1);
+		strictEqual(result.results[0].success, false);
+		strictEqual(result.results[0].errorKind, "descriptor_receipt");
+		strictEqual(fixture.executeCalls.length, 0);
+	});
+
+	it("rejects a forged Claude descriptor for antigravity before reset, reroute, or execution", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reject forged retry evidence
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** a descriptor signed for the wrong harness must not resume
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const descriptorCore = {
+			target_id: "antigravity",
+			model_ref: "fixture-gemini",
+			selector: "fixture-gemini",
+			effort: null,
+			variant: null,
+			invocation_args: [],
+		};
+		const forgedDescriptor = {
+			...descriptorCore,
+			descriptor_identity: getInvocationDescriptorIdentity(
+				descriptorCore,
+				"claude",
+			),
+		};
+		saveCheckpoint(checkpointPath, {
+			version: 1,
+			tasksFilePath: tasksPath,
+			completedTaskIds: [],
+			lastTaskId: null,
+			lastUpdatedAt: null,
+			results: [],
+			quarantinedTargetIds: ["antigravity"],
+			retryAttempts: [],
+			retryTransitions: [],
+			retryTransitionId: 0,
+			retryState: {
+				taskId: "1.1",
+				attempt: 1,
+				phase: "target_quarantined",
+				resolvedTargetId: "antigravity",
+				invocationDescriptor: forgedDescriptor,
+				descriptorIdentity: forgedDescriptor.descriptor_identity,
+				descriptorHarness: "claude",
+			},
+		});
+
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "antigravity" },
+			],
+			executionOutcomes: {
+				agy: [{ success: true, output: "must not execute" }],
+			},
+		});
+		let resetCalls = 0;
+		fixture.dependencies.resetWorkingTree = () => {
+			resetCalls += 1;
+		};
+
+		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
+		__resetRosterCacheForTests();
+		try {
+			throws(
+				() =>
+					runQueue({
+						tasksFilePath: tasksPath,
+						projectPath: TEST_DIR,
+						checkpointPath,
+						dependencies: fixture.dependencies,
+					}),
+				/descriptor harness does not match target/,
+			);
+		} finally {
+			if (previousRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+			}
+			__resetRosterCacheForTests();
+		}
+
+		strictEqual(resetCalls, 0);
+		deepStrictEqual(fixture.routeCalls, []);
+		strictEqual(fixture.executeCalls.length, 0);
+	});
+
+	for (const corruptField of ["retryAttempts", "retryTransitions"]) {
+		it(`rejects forged descriptor evidence in ${corruptField} before routing`, () => {
+			const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reject corrupt retry evidence
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** malformed retry evidence must not be resumed
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const descriptorCore = {
+				target_id: "antigravity",
+				model_ref: "fixture-gemini",
+				selector: "fixture-gemini",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			};
+			const forgedDescriptor = {
+				...descriptorCore,
+				descriptor_identity: getInvocationDescriptorIdentity(
+					descriptorCore,
+					"claude",
+				),
+			};
+			saveCheckpoint(checkpointPath, {
+				version: 1,
+				tasksFilePath: tasksPath,
+				completedTaskIds: [],
+				lastTaskId: null,
+				lastUpdatedAt: null,
+				results: [],
+				quarantinedTargetIds: [],
+				retryAttempts:
+					corruptField === "retryAttempts"
+						? [
+								{
+									taskId: "1.1",
+									attempt: 1,
+									resolvedTargetId: "antigravity",
+									invocationDescriptor: forgedDescriptor,
+									descriptorIdentity: forgedDescriptor.descriptor_identity,
+									descriptorHarness: "claude",
+								},
+							]
+						: [],
+				retryTransitions:
+					corruptField === "retryTransitions"
+						? [
+								{
+									transitionId: 1,
+									type: "attempt_recorded",
+									taskId: "1.1",
+									resolvedTargetId: "antigravity",
+									invocationDescriptor: forgedDescriptor,
+									descriptorIdentity: forgedDescriptor.descriptor_identity,
+									descriptorHarness: "claude",
+								},
+							]
+						: [],
+				retryTransitionId: corruptField === "retryTransitions" ? 1 : 0,
+				retryState: null,
+			});
+
+			const fixture = makeQuotaRetryDependencies({
+				routePlan: [
+					{ provider: "agy", model: "fixture-gemini", target: "antigravity" },
+				],
+				executionOutcomes: {
+					agy: [{ success: true, output: "must not execute" }],
+				},
+			});
+			const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+			process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
+			__resetRosterCacheForTests();
+			try {
+				throws(
+					() =>
+						runQueue({
+							tasksFilePath: tasksPath,
+							projectPath: TEST_DIR,
+							checkpointPath,
+							dependencies: fixture.dependencies,
+						}),
+					/descriptor harness does not match target/,
+				);
+			} finally {
+				if (previousRosterPath === undefined) {
+					delete process.env.SWITCHYARD_ROSTER_PATH;
+				} else {
+					process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+				}
+				__resetRosterCacheForTests();
+			}
+			deepStrictEqual(fixture.routeCalls, []);
+			strictEqual(fixture.executeCalls.length, 0);
+		});
+	}
+
+	it("does not erase present non-array retry collections before validation", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reject non-array retry evidence
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** corrupt retry collection
+`);
+		for (const corruptField of ["retryAttempts", "retryTransitions"]) {
+			const checkpointPath = `${tasksPath}.${corruptField}.checkpoint.json`;
+			saveCheckpoint(checkpointPath, {
+				version: 1,
+				tasksFilePath: tasksPath,
+				completedTaskIds: [],
+				lastTaskId: null,
+				lastUpdatedAt: null,
+				results: [],
+				[corruptField]: { forged: true },
+			});
+			const fixture = makeQuotaRetryDependencies({
+				routePlan: [
+					{ provider: "agy", model: "fixture-gemini", target: "antigravity" },
+				],
+			});
+			throws(
+				() =>
+					runQueue({
+						tasksFilePath: tasksPath,
+						projectPath: TEST_DIR,
+						checkpointPath,
+						dependencies: fixture.dependencies,
+					}),
+				new RegExp(`${corruptField} is invalid`),
+			);
+			deepStrictEqual(fixture.routeCalls, []);
+			strictEqual(fixture.executeCalls.length, 0);
+		}
 	});
 
 	it("halts safely when the mandatory retry reset fails", () => {
@@ -2442,13 +3808,29 @@ describe("runner quota retry coordination", () => {
 		const runnerUrl = pathToFileURL(
 			resolve(cwd(), "src/switchyard/runner/index.mjs"),
 		).href;
+		const rosterUrl = pathToFileURL(
+			resolve(cwd(), "src/switchyard/roster/index.mjs"),
+		).href;
 		const childScript = `
 import { runQueue } from ${JSON.stringify(runnerUrl)};
+import { getInvocationDescriptorIdentity } from ${JSON.stringify(rosterUrl)};
 const [tasksFilePath, checkpointPath, projectPath] = process.argv.slice(1);
 const routePlan = [
   { provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
   { provider: "agy", model: "fixture-claude", target: "agy-claude" },
 ];
+let latestDescriptor = null;
+const descriptorFor = (candidate) => {
+  const core = {
+    target_id: candidate.target,
+    model_ref: candidate.model,
+    selector: candidate.model,
+    effort: null,
+    variant: null,
+    invocation_args: [],
+  };
+  return { ...core, descriptor_identity: getInvocationDescriptorIdentity(core, "agy") };
+};
 const route = ({ exclude = [], only = [] } = {}) => {
   const candidate = routePlan.find((entry) =>
     !exclude.includes(entry.target) &&
@@ -2456,7 +3838,7 @@ const route = ({ exclude = [], only = [] } = {}) => {
     (only.length === 0 || only.includes(entry.target) || only.includes(entry.provider))
   );
   return candidate
-    ? { ...candidate, resolvedTargetId: candidate.target, percentLeft: 50, log: [] }
+    ? (latestDescriptor = descriptorFor(candidate), { ...candidate, resolvedTargetId: candidate.target, invocationDescriptor: latestDescriptor, percentLeft: 50, log: [] })
     : { provider: null, model: null, resolvedTargetId: null, reason: "no_eligible_retry_target", log: [] };
 };
 runQueue({
@@ -2465,6 +3847,7 @@ runQueue({
   checkpointPath,
   dependencies: {
     route,
+    resolveDescriptor: () => latestDescriptor,
     recordDispatch: () => {},
     integrationGate: () => ({ success: true }),
     ensureAgentContainer: () => {},
@@ -2498,15 +3881,20 @@ runQueue({
 			],
 			{
 				encoding: "utf8",
-				env: { ...process.env, CRASH_AT: "2" },
+				env: { ...process.env, CRASH_AT: "4" },
 			},
 		);
 		strictEqual(child.status, 73, child.stderr);
 
 		const interrupted = loadCheckpoint(checkpointPath, tasksPath);
 		deepStrictEqual(interrupted.quarantinedTargetIds, ["agy-gemini"]);
-		strictEqual(interrupted.retryTransitionId, 2);
-		strictEqual(interrupted.retryState.phase, "target_quarantined");
+		strictEqual(interrupted.retryTransitionId, 4);
+		strictEqual(interrupted.retryState.phase, "retry_started");
+		strictEqual(interrupted.retryState.descriptorHarness, "agy");
+		strictEqual(
+			interrupted.retryState.invocationDescriptor.target_id,
+			interrupted.retryState.resolvedTargetId,
+		);
 
 		const fixture = makeQuotaRetryDependencies({
 			routePlan: [
@@ -2523,29 +3911,28 @@ runQueue({
 		});
 
 		strictEqual(resumed.processedTasks, 1);
-		strictEqual(resumed.results[0].success, true);
-		strictEqual(fixture.executeCalls.length, 1);
-		deepStrictEqual(fixture.routeCalls[0].exclude, ["agy-gemini"]);
+		strictEqual(resumed.results[0].success, false);
+		strictEqual(resumed.results[0].result, "unknown_failure");
+		strictEqual(fixture.executeCalls.length, 0);
+		deepStrictEqual(fixture.routeCalls, []);
 		const completed = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(completed.retryState, null);
 		strictEqual(completed.retryTransitionId, 5);
 	});
 });
 
-describe("runner no-provider outcome carries the route reason (Task D.3)", () => {
-	it("returns the route's reason in the result object when no provider is found, not just the ledger record", () => {
-		// The ledger record always carried `reason`; the RETURNED result must
-		// too, so callers (dispatch's onResult) can tell the operator a
-		// deterministic INV-5 capability-ceiling exhaustion from an actionable
-		// upstream-unavailable provider. Route's reason passes through
-		// verbatim, including the redacted upstream error detail.
+describe("runner no-provider outcome uses a safe route reason code (Task D.3)", () => {
+	it("maps an untrusted route reason to a closed code in result and ledger", () => {
+		// The result and ledger retain only the closed route reason code; raw
+		// upstream diagnostics never cross either boundary.
 		const dispatches = [];
 		const result = executeTask(
 			{ id: "1.1", title: "task", description: "simple cleanup" },
 			{
 				route: () => ({
 					provider: null,
-					reason: "no_eligible_upstream_unavailable: claude — token expired",
+					reason:
+						"no_eligible_upstream_unavailable: claude — sk-proj-opaquevalue at service.prod.company.com",
 				}),
 				recordDispatch: (entry) => dispatches.push(entry),
 				integrationGate: () => ({ success: true }),
@@ -2557,16 +3944,41 @@ describe("runner no-provider outcome carries the route reason (Task D.3)", () =>
 
 		strictEqual(result.result, "no_provider");
 		strictEqual(result.success, false);
-		strictEqual(
-			result.reason,
-			"no_eligible_upstream_unavailable: claude — token expired",
-		);
-		// Ledger record unchanged behavior: still records the same reason.
+		strictEqual(result.reason, "no_eligible_upstream_unavailable");
+		// Ledger record uses the same safe code.
 		strictEqual(dispatches[0].result, "no_provider");
-		strictEqual(
-			dispatches[0].reason,
-			"no_eligible_upstream_unavailable: claude — token expired",
+		strictEqual(dispatches[0].reason, "no_eligible_upstream_unavailable");
+	});
+
+	it("maps an untrusted route reason before orchestrator outcome projection", async () => {
+		const dispatches = [];
+		let launches = 0;
+		const result = await executeTaskWithOrchestrator(
+			{ id: "1.1", title: "task", description: "simple cleanup" },
+			{
+				route: () => ({
+					provider: null,
+					reason:
+						"../../private/sk-proj-opaquevalue at service.prod.company.com",
+				}),
+				recordDispatch: (entry) => dispatches.push(entry),
+				recordDispatchIntent: () => {},
+				integrationGate: () => ({ success: true }),
+				adapters: {},
+				orchestrator: {
+					launch: async () => {
+						launches += 1;
+						return "should-not-launch";
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
 		);
+
+		strictEqual(result.reason, "no_eligible");
+		strictEqual(dispatches[0].reason, "no_eligible");
+		strictEqual(launches, 0);
 	});
 });
 
@@ -5507,6 +6919,7 @@ describe("Files requiredPaths propagation", () => {
 					reason: "spread",
 				}),
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: (diff, projectPath, options) => {
 					gateCalls.push({ diff, projectPath, options });
 					return { success: true, message: "ok" };
@@ -5547,6 +6960,7 @@ describe("Files requiredPaths propagation", () => {
 					reason: "spread",
 				}),
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: (diff, projectPath, options) => {
 					gateCalls.push({ diff, projectPath, options });
 					return { success: true, message: "ok" };
@@ -5585,6 +6999,7 @@ describe("Files requiredPaths propagation", () => {
 					reason: "spread",
 				}),
 				recordDispatch: (entry) => dispatches.push(entry),
+				recordDispatchIntent: () => {},
 				integrationGate: (diff, projectPath, options) => {
 					gateCalls.push({ diff, projectPath, options });
 					return { success: false, message: "empty_required_diff" };
@@ -5920,6 +7335,7 @@ describe("executeTask timeout handling", () => {
 					reason: "spread",
 				}),
 				recordDispatch: (entry) => dispatches.push(entry),
+				recordDispatchIntent: () => {},
 				integrationGate: (diff, projectPath, options) => {
 					gateCalls.push({ diff, projectPath, options });
 					return { success: true, message: "ok" };
@@ -5970,6 +7386,7 @@ describe("executeTask timeout handling", () => {
 				reason: "spread",
 			}),
 			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
 			integrationGate: () => ({ success: true, message: "ok" }),
 			adapters: {
 				claude: {
@@ -6007,6 +7424,7 @@ describe("executeTask timeout handling", () => {
 					reason: "spread",
 				}),
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
@@ -6071,6 +7489,8 @@ describe("runner task contract resolution", () => {
 				title: "task",
 				description: "format the readme",
 				requiredCapability: "high",
+				requiredCapabilityJustification:
+					"The task requires architectural review.",
 			},
 			capabilityCapturingContext(routeCalls),
 		);
@@ -6078,7 +7498,7 @@ describe("runner task contract resolution", () => {
 		strictEqual(routeCalls[0].requiredCapability, "high");
 	});
 
-	it("programmatic task objects may omit Executor and still fall back to classifyTask", () => {
+	it("programmatic task objects with an omitted capability use standard", () => {
 		const routeCalls = [];
 		executeTask(
 			{
@@ -6090,7 +7510,7 @@ describe("runner task contract resolution", () => {
 			capabilityCapturingContext(routeCalls),
 		);
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].requiredCapability, "low");
+		strictEqual(routeCalls[0].requiredCapability, "standard");
 	});
 
 	it("executeTask never provider-routes native or human tasks", () => {
@@ -6103,6 +7523,8 @@ describe("runner task contract resolution", () => {
 					description: "format the readme",
 					executor,
 					requiredCapability: "high",
+					requiredCapabilityJustification:
+						"The task requires architectural review.",
 				},
 				capabilityCapturingContext(routeCalls),
 			);
@@ -6133,6 +7555,26 @@ describe("runner task contract resolution", () => {
 		strictEqual(routeCalls.length, 0);
 	});
 
+	it("executeTask rejects explicit low/high capability without justification before routing", () => {
+		for (const capability of ["high", "low"]) {
+			const routeCalls = [];
+			throws(
+				() =>
+					executeTask(
+						{
+							id: "1.1",
+							title: "task",
+							description: "format the readme",
+							requiredCapability: capability,
+						},
+						capabilityCapturingContext(routeCalls),
+					),
+				/RequiredCapabilityJustification is required for explicit/,
+			);
+			strictEqual(routeCalls.length, 0);
+		}
+	});
+
 	it("executeTaskWithOrchestrator routes at RequiredCapability, not classifyTask's guess", async () => {
 		const routeCalls = [];
 		const result = await executeTaskWithOrchestrator(
@@ -6141,6 +7583,8 @@ describe("runner task contract resolution", () => {
 				title: "task",
 				description: "format the readme",
 				requiredCapability: "high",
+				requiredCapabilityJustification:
+					"The task requires architectural review.",
 			},
 			{
 				...capabilityCapturingContext(routeCalls),
@@ -6156,7 +7600,7 @@ describe("runner task contract resolution", () => {
 		strictEqual(result.taskId, "1.1");
 	});
 
-	it("executeTaskWithOrchestrator falls back to classifyTask when RequiredCapability is absent", async () => {
+	it("executeTaskWithOrchestrator uses standard when RequiredCapability is absent", async () => {
 		const routeCalls = [];
 		await executeTaskWithOrchestrator(
 			{
@@ -6175,7 +7619,7 @@ describe("runner task contract resolution", () => {
 			},
 		);
 		strictEqual(routeCalls.length, 1);
-		strictEqual(routeCalls[0].requiredCapability, "low");
+		strictEqual(routeCalls[0].requiredCapability, "standard");
 	});
 
 	it("executeTaskWithOrchestrator never provider-routes native or human tasks", async () => {
@@ -6189,6 +7633,8 @@ describe("runner task contract resolution", () => {
 					description: "format the readme",
 					executor,
 					requiredCapability: "high",
+					requiredCapabilityJustification:
+						"The task requires architectural review.",
 				},
 				{
 					...capabilityCapturingContext(routeCalls),
@@ -6232,6 +7678,36 @@ describe("runner task contract resolution", () => {
 		strictEqual(routeCalls.length, 0);
 	});
 
+	it("executeTaskWithOrchestrator rejects explicit low/high without justification before routing or launch", async () => {
+		for (const capability of ["high", "low"]) {
+			const routeCalls = [];
+			let launches = 0;
+			await rejects(
+				() =>
+					executeTaskWithOrchestrator(
+						{
+							id: "1.1",
+							title: "task",
+							description: "format the readme",
+							requiredCapability: capability,
+						},
+						{
+							...capabilityCapturingContext(routeCalls),
+							orchestrator: {
+								launch: async () => {
+									launches += 1;
+									return "job-1";
+								},
+							},
+						},
+					),
+				/RequiredCapabilityJustification is required for explicit/,
+			);
+			strictEqual(routeCalls.length, 0);
+			strictEqual(launches, 0);
+		}
+	});
+
 	it("end to end: RequiredCapability reaches route() as requiredCapability", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -6239,6 +7715,7 @@ describe("runner task contract resolution", () => {
 - **Status:** pending
 - **Files:** src/a.mjs
 - **RequiredCapability:** high
+- **RequiredCapabilityJustification:** The task requires architectural review.
 - **Description:** format the readme
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -6286,6 +7763,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					};
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					codex: {
@@ -6328,6 +7806,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					};
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
@@ -6512,6 +7991,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					};
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				orchestrator: {
 					launch: async () => "job-1",

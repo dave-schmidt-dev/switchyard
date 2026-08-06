@@ -3,7 +3,7 @@
 // fails loud on missing file, malformed JSON, or broken structural contract, and that exports return
 // roster-backed values against synthetic fixtures.
 
-import { deepStrictEqual, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import {
 	copyFileSync,
 	mkdirSync,
@@ -19,14 +19,24 @@ import {
 	__resetRosterCacheForTests,
 	CAPABILITY_CLASS,
 	CAPABILITY_CLASS_ORDER,
+	computeQualificationStatus,
+	evaluateRealRosterCoherence,
 	filterByCapability,
+	formatRealRosterCoherenceFailure,
 	getCapabilityClass,
 	getImplementorPriority,
+	getInvocationDescriptor,
+	getInvocationDescriptorIdentity,
 	getModelForCapability,
 	getRightSizedModel,
+	mapInvocationArgs,
 	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
+	PROVIDER_INVOCATION_VOCABULARY,
 	passesCapabilityFilter,
+	QUALIFICATION_STATUS,
+	STALE_MAX_AGE_SECONDS,
+	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -254,7 +264,6 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 			"copilot",
 			"cursor",
 			"opencode",
-			"vibe",
 		]);
 	});
 
@@ -274,7 +283,8 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 		// claude/codex are qualified at every tier -> full high capability.
 		strictEqual(passesCapabilityFilter("claude", "high"), true);
 		strictEqual(passesCapabilityFilter("codex", "high"), true);
-		// antigravity has no high slot at all -> excluded above standard.
+		// The fixture's enabled Antigravity target has a standard ceiling.
+		strictEqual(getCapabilityClass("agy"), "standard");
 		strictEqual(passesCapabilityFilter("agy", "standard"), true);
 		strictEqual(passesCapabilityFilter("agy", "high"), false);
 	});
@@ -411,6 +421,7 @@ describe("roster loader — effort-keyed qualification variants (brief §4: 'qua
 									model_ref: "fixture/claude-high-effort",
 									priority: 1,
 									effort: "xhigh",
+									invocation_args: ["--effort", "xhigh"],
 								},
 							],
 						},
@@ -472,6 +483,83 @@ describe("roster loader — effort-keyed qualification variants (brief §4: 'qua
 		strictEqual(passesCapabilityFilter("claude", "high"), false);
 		strictEqual(getRightSizedModel("claude", "high"), null);
 	});
+
+	it("keeps same-selector OpenCode variants independently qualified", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		const path = join(tmpDir, "opencode-variant-qualification.json");
+		const modelRef = "fixture/opencode-variant";
+		const selector = "fixture-opencode-variant";
+		const makeDescriptor = (variant) => ({
+			target_id: "opencode-go",
+			model_ref: modelRef,
+			selector,
+			effort: null,
+			variant,
+			invocation_args: ["--variant", variant],
+		});
+		const high = makeDescriptor("high");
+		const max = makeDescriptor("max");
+		const highIdentity = getInvocationDescriptorIdentity(high, "opencode");
+		const maxIdentity = getInvocationDescriptorIdentity(max, "opencode");
+		const qualification = (descriptor, identity) => ({
+			status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+			descriptor_identity: identity,
+			target_id: descriptor.target_id,
+			model_ref: descriptor.model_ref,
+			selector: descriptor.selector,
+			effort: null,
+			variant: descriptor.variant,
+			invocation_args: descriptor.invocation_args,
+			tested_at: new Date().toISOString(),
+			credential_profile: "default",
+		});
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					[modelRef]: { selector, status: "active" },
+				},
+				targets: {
+					"opencode-go": {
+						harness: "opencode",
+						credential_profile: "default",
+						enabled: true,
+						slots: {
+							low: [
+								{
+									model_ref: modelRef,
+									priority: 1,
+									variant: "high",
+									invocation_args: ["--variant", "high"],
+								},
+							],
+							standard: [
+								{
+									model_ref: modelRef,
+									priority: 1,
+									variant: "max",
+									invocation_args: ["--variant", "max"],
+								},
+							],
+							high: [],
+						},
+						qualifications: {
+							[highIdentity]: qualification(high, highIdentity),
+							[maxIdentity]: qualification(max, maxIdentity),
+						},
+					},
+				},
+			}),
+			"utf8",
+		);
+		setRosterPath(path);
+		strictEqual(getInvocationDescriptor("opencode-go", "low")?.variant, "high");
+		strictEqual(
+			getInvocationDescriptor("opencode-go", "standard")?.variant,
+			"max",
+		);
+	});
 });
 
 describe("roster loader — a retired catalog model never counts toward the ceiling", () => {
@@ -516,5 +604,809 @@ describe("roster loader — a retired catalog model never counts toward the ceil
 		strictEqual(getCapabilityClass("claude"), null);
 		strictEqual(passesCapabilityFilter("claude", "high"), false);
 		strictEqual(getRightSizedModel("claude", "high"), null);
+	});
+});
+
+describe("roster loader — invocation descriptor identity", () => {
+	function writeInvocationArgsRoster(path, invocation_args) {
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"openai/fixture": { selector: "fixture-codex", status: "active" },
+				},
+				targets: {
+					codex: {
+						harness: "codex",
+						enabled: true,
+						slots: {
+							high: [{ model_ref: "openai/fixture", invocation_args }],
+						},
+					},
+				},
+			}),
+			"utf8",
+		);
+	}
+
+	it("freezes every descriptor field and changes identity when argv changes", () => {
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "codex",
+				model_ref: "openai/gpt-5.6-sol",
+				selector: "gpt-5.6-sol",
+				effort: "xhigh",
+				invocation_args: ["-c", "model_reasoning_effort=xhigh"],
+			},
+			"codex",
+		);
+		strictEqual(Object.isFrozen(descriptor), true);
+		strictEqual(Object.isFrozen(descriptor.invocation_args), true);
+		strictEqual(
+			descriptor.descriptor_identity,
+			getInvocationDescriptorIdentity(descriptor, "codex"),
+		);
+		strictEqual(
+			getInvocationDescriptorIdentity(
+				{
+					...descriptor,
+					effort: "high",
+					invocation_args: ["-c", "model_reasoning_effort=high"],
+				},
+				"codex",
+			) === descriptor.descriptor_identity,
+			false,
+		);
+	});
+
+	it("requires an explicit target-bound harness and never lets argv choose it", () => {
+		const descriptor = {
+			target_id: "claude",
+			model_ref: "anthropic/fixture",
+			selector: "fixture-claude",
+			effort: "xhigh",
+			invocation_args: ["-c", "model_reasoning_effort=xhigh"],
+		};
+		throws(
+			() => validateInvocationDescriptor(descriptor, "claude"),
+			/must be|claude invocation_args/,
+		);
+		throws(
+			() => getInvocationDescriptorIdentity(descriptor, "claude"),
+			/must be|claude invocation_args/,
+		);
+		throws(
+			() => getInvocationDescriptorIdentity(descriptor),
+			/harness is required/,
+		);
+	});
+
+	it("binds descriptor identity to the canonical harness", () => {
+		const core = {
+			target_id: "antigravity",
+			model_ref: "google/fixture",
+			selector: "fixture-gemini",
+			effort: null,
+			variant: null,
+			invocation_args: [],
+		};
+		const agyIdentity = getInvocationDescriptorIdentity(core, "Antigravity");
+		const claudeIdentity = getInvocationDescriptorIdentity(core, "Claude");
+		strictEqual(agyIdentity === claudeIdentity, false);
+
+		const agyReceipt = validateInvocationDescriptor(
+			{ ...core, descriptor_identity: agyIdentity },
+			"agy",
+		);
+		throws(
+			() => validateInvocationDescriptor(agyReceipt, "claude"),
+			/descriptor_identity|invocation descriptor argv/,
+		);
+	});
+
+	it("selector-only qualification remains readable but cannot authorize a descriptor", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		const path = join(tmpDir, "legacy-qualification.json");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"openai/fixture": { selector: "fixture-codex", status: "active" },
+				},
+				targets: {
+					codex: {
+						harness: "codex",
+						enabled: true,
+						qualifications: { "fixture-codex": { status: "qualified" } },
+						slots: { high: [{ model_ref: "openai/fixture", priority: 1 }] },
+					},
+				},
+			}),
+			"utf8",
+		);
+		setRosterPath(path);
+		strictEqual(getRightSizedModel("codex", "high"), "fixture-codex");
+		strictEqual(getInvocationDescriptor("codex", "high"), null);
+	});
+
+	it("authorizes only the exact descriptor identity", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		const path = join(tmpDir, "exact-qualification.json");
+		const descriptor = {
+			target_id: "codex",
+			model_ref: "openai/fixture",
+			selector: "fixture-codex",
+			effort: "xhigh",
+			invocation_args: ["-c", "model_reasoning_effort=xhigh"],
+		};
+		const identity = getInvocationDescriptorIdentity(descriptor, "codex");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"openai/fixture": { selector: "fixture-codex", status: "active" },
+				},
+				targets: {
+					codex: {
+						harness: "codex",
+						enabled: true,
+						qualifications: {
+							[identity]: {
+								status: "dispatch_qualified",
+								selector: descriptor.selector,
+								descriptor_identity: identity,
+								tested_at: new Date().toISOString(),
+							},
+						},
+						slots: {
+							high: [
+								{
+									model_ref: descriptor.model_ref,
+									priority: 1,
+									effort: descriptor.effort,
+									invocation_args: descriptor.invocation_args,
+								},
+							],
+						},
+					},
+				},
+			}),
+			"utf8",
+		);
+		setRosterPath(path);
+		const resolved = getInvocationDescriptor("codex", "high");
+		strictEqual(resolved?.descriptor_identity, identity);
+		strictEqual(Object.isFrozen(resolved), true);
+	});
+
+	it("does not authorize qualifications whose descriptor identity changes", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		const path = join(tmpDir, "mismatch.json");
+		const base = {
+			target_id: "codex",
+			model_ref: "openai/fixture",
+			selector: "fixture-codex",
+			effort: "xhigh",
+			invocation_args: ["-c", "model_reasoning_effort=xhigh"],
+		};
+		const variants = [
+			["target_id", { ...base, target_id: "codex-alt" }],
+			["model_ref", { ...base, model_ref: "openai/other" }],
+			["selector", { ...base, selector: "fixture-other" }],
+			[
+				"effort",
+				{
+					...base,
+					effort: "high",
+					invocation_args: ["-c", "model_reasoning_effort=high"],
+				},
+			],
+			[
+				"variant",
+				{
+					...base,
+					effort: null,
+					variant: "high",
+					invocation_args: ["--variant", "high"],
+				},
+			],
+			[
+				"argv",
+				{
+					...base,
+					effort: "high",
+					invocation_args: ["-c", "model_reasoning_effort=high"],
+				},
+			],
+		];
+		for (const [field, variant] of variants) {
+			const identity = getInvocationDescriptorIdentity(
+				variant,
+				variant.variant !== undefined ? "opencode" : "codex",
+			);
+			writeFileSync(
+				path,
+				JSON.stringify({
+					schema_version: 1,
+					models: {
+						"openai/fixture": { selector: "fixture-codex", status: "active" },
+					},
+					targets: {
+						codex: {
+							harness: "codex",
+							enabled: true,
+							qualifications: { [identity]: { status: "qualified" } },
+							slots: {
+								high: [
+									{
+										model_ref: base.model_ref,
+										effort: base.effort,
+										invocation_args: base.invocation_args,
+									},
+								],
+							},
+						},
+					},
+				}),
+				"utf8",
+			);
+			setRosterPath(path);
+			strictEqual(getInvocationDescriptor("codex", "high"), null, field);
+		}
+	});
+
+	it("rejects unapproved invocation flags, values, and positions at roster load", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		const path = join(tmpDir, "unsafe-invocation.json");
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"openai/fixture": { selector: "fixture-codex", status: "active" },
+				},
+				targets: {
+					codex: {
+						harness: "codex",
+						enabled: true,
+						slots: {
+							high: [
+								{
+									model_ref: "openai/fixture",
+									invocation_args: ["--dangerously-bypass", "yes"],
+								},
+							],
+						},
+					},
+				},
+			}),
+			"utf8",
+		);
+		setRosterPath(path);
+		throws(
+			() => getRightSizedModel("codex", "high"),
+			/invocation_args invalid/,
+		);
+		const descriptor = {
+			target_id: "codex",
+			model_ref: "openai/fixture",
+			selector: "fixture-codex",
+			effort: "xhigh",
+		};
+		for (const invocation_args of [
+			["--dangerously-bypass", "yes"],
+			["-c", "model_reasoning_effort=turbo"],
+			["model_reasoning_effort=xhigh", "-c"],
+		]) {
+			throws(
+				() =>
+					getInvocationDescriptorIdentity(
+						{
+							...descriptor,
+							invocation_args,
+						},
+						"codex",
+					),
+				/invalid|unapproved|must be/,
+			);
+		}
+	});
+
+	it("rejects an approved invocation flag with a bad value at roster load", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		const path = join(tmpDir, "bad-value.json");
+		writeInvocationArgsRoster(path, ["-c", "model_reasoning_effort=turbo"]);
+		setRosterPath(path);
+		throws(
+			() => getRightSizedModel("codex", "high"),
+			/invocation_args invalid/,
+		);
+	});
+
+	it("rejects a correctly-shaped invocation pair in reversed positions at roster load", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		const path = join(tmpDir, "reversed-pair.json");
+		writeInvocationArgsRoster(path, ["model_reasoning_effort=xhigh", "-c"]);
+		setRosterPath(path);
+		throws(
+			() => getRightSizedModel("codex", "high"),
+			/invocation_args invalid/,
+		);
+	});
+});
+
+describe("roster loader — dispatch qualification evidence and freshness", () => {
+	const recentTimestamp = () => new Date().toISOString();
+	const descriptor = {
+		target_id: "codex",
+		model_ref: "openai/fixture",
+		selector: "fixture-codex",
+		effort: "xhigh",
+		invocation_args: ["-c", "model_reasoning_effort=xhigh"],
+	};
+	const identity = getInvocationDescriptorIdentity(descriptor, "codex");
+
+	function writeRoster(path, qualification, targetOverrides = {}) {
+		writeFileSync(
+			path,
+			JSON.stringify({
+				schema_version: 1,
+				models: {
+					"openai/fixture": { selector: "fixture-codex", status: "active" },
+				},
+				targets: {
+					codex: {
+						harness: "codex",
+						enabled: true,
+						cli_version: "codex-cli 0.146.0",
+						wrapper_version: "sha256:wrapper-a",
+						credential_profile: "default",
+						qualifications: { [identity]: qualification },
+						slots: {
+							high: [
+								{
+									model_ref: descriptor.model_ref,
+									effort: descriptor.effort,
+									invocation_args: descriptor.invocation_args,
+									priority: 1,
+								},
+							],
+						},
+						...targetOverrides,
+					},
+				},
+			}),
+			"utf8",
+		);
+	}
+
+	it("authorizes a current exact dispatch_qualified receipt", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-qualification-"));
+		const path = join(tmpDir, "current.json");
+		writeRoster(path, {
+			status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+			descriptor_identity: identity,
+			target_id: descriptor.target_id,
+			model_ref: descriptor.model_ref,
+			selector: descriptor.selector,
+			invocation_args: descriptor.invocation_args,
+			tested_at: recentTimestamp(),
+			cli_version: "codex-cli 0.146.0",
+			wrapper_version: "sha256:wrapper-a",
+			credential_profile: "default",
+			promotion_receipt: {
+				status: "promoted",
+				atomic: true,
+				descriptor_identity: identity,
+				target_id: descriptor.target_id,
+				model_ref: descriptor.model_ref,
+				selector: descriptor.selector,
+				effort: descriptor.effort,
+				variant: null,
+				invocation_args: descriptor.invocation_args,
+				receipt_id: "receipt-1",
+				committed_at: recentTimestamp(),
+			},
+		});
+		setRosterPath(path);
+		strictEqual(
+			getInvocationDescriptor("codex", "high")?.descriptor_identity,
+			identity,
+		);
+	});
+
+	it("fails closed for probe-only, temporary, non-transmittable, stale, drifted, and wrong-argv evidence", () => {
+		const records = [
+			{
+				status: QUALIFICATION_STATUS.PROBE_QUALIFIED,
+				tested_at: recentTimestamp(),
+			},
+			{ status: QUALIFICATION_STATUS.TEMPORARILY_UNAVAILABLE },
+			{ status: QUALIFICATION_STATUS.NOT_TRANSMITTABLE },
+			{
+				status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+				tested_at: "2026-01-01T00:00:00Z",
+			},
+			{
+				status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+				tested_at: recentTimestamp(),
+				cli_version: "codex-cli old",
+			},
+			{
+				status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+				tested_at: recentTimestamp(),
+				invocation_args: ["-c", "model_reasoning_effort=high"],
+			},
+		];
+		for (const [index, record] of records.entries()) {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), `switchyard-roster-qualification-${index}-`),
+			);
+			const path = join(tmpDir, "negative.json");
+			writeRoster(path, record);
+			setRosterPath(path);
+			strictEqual(
+				getInvocationDescriptor("codex", "high"),
+				null,
+				`case ${index}`,
+			);
+			rmSync(tmpDir, { recursive: true, force: true });
+			tmpDir = undefined;
+		}
+	});
+
+	it("rejects malformed atomic promotion receipts", () => {
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-qualification-"));
+		const path = join(tmpDir, "malformed-promotion.json");
+		writeRoster(path, {
+			status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+			descriptor_identity: identity,
+			tested_at: recentTimestamp(),
+			promotion_receipt: { status: "rolled_back", atomic: false },
+		});
+		setRosterPath(path);
+		strictEqual(getInvocationDescriptor("codex", "high"), null);
+	});
+
+	it("requires nested promotion receipts to match the complete descriptor atomically", () => {
+		const baseReceipt = {
+			status: "promoted",
+			atomic: true,
+			descriptor_identity: identity,
+			target_id: descriptor.target_id,
+			model_ref: descriptor.model_ref,
+			selector: descriptor.selector,
+			effort: descriptor.effort,
+			variant: null,
+			invocation_args: descriptor.invocation_args,
+			receipt_id: "receipt-2",
+			committed_at: new Date().toISOString(),
+		};
+		const invalidReceipts = [
+			{},
+			{ ...baseReceipt, atomic: undefined },
+			{ ...baseReceipt, atomic: false },
+			{ ...baseReceipt, target_id: "other-target" },
+			{ ...baseReceipt, model_ref: "openai/other" },
+			{ ...baseReceipt, effort: "high" },
+			{ ...baseReceipt, variant: "high" },
+			{
+				...baseReceipt,
+				invocation_args: ["-c", "model_reasoning_effort=high"],
+			},
+			{
+				...baseReceipt,
+				argv: ["-c", "model_reasoning_effort=high"],
+			},
+			{
+				...baseReceipt,
+				validated_invocation_args: ["-c", "model_reasoning_effort=high"],
+			},
+		];
+		for (const [index, promotion_receipt] of invalidReceipts.entries()) {
+			tmpDir = mkdtempSync(
+				join(tmpdir(), `switchyard-roster-promotion-${index}-`),
+			);
+			const path = join(tmpDir, "invalid-promotion.json");
+			writeRoster(path, {
+				status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+				selector: descriptor.selector,
+				tested_at: recentTimestamp(),
+				promotion_receipt,
+			});
+			setRosterPath(path);
+			strictEqual(
+				getInvocationDescriptor("codex", "high"),
+				null,
+				`promotion case ${index}`,
+			);
+			rmSync(tmpDir, { recursive: true, force: true });
+			tmpDir = undefined;
+		}
+	});
+
+	it("ports staleness evaluation and treats malformed or future timestamps as stale", () => {
+		const signature = {
+			selector: "fixture-codex",
+			cli_version: "codex-cli 0.146.0",
+			wrapper_version: "sha256:wrapper-a",
+			credential_profile: "default",
+		};
+		strictEqual(
+			computeQualificationStatus(
+				{
+					status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+					...signature,
+					tested_at: "2026-08-05T18:00:00Z",
+				},
+				signature,
+				"2026-08-05T18:00:00Z",
+			),
+			QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+		);
+		strictEqual(
+			computeQualificationStatus(
+				{
+					status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+					...signature,
+					tested_at: "2026-08-05T18:00:00Z",
+				},
+				{ ...signature, wrapper_version: "sha256:wrapper-b" },
+				"2026-08-05T18:00:01Z",
+			),
+			QUALIFICATION_STATUS.STALE,
+		);
+		strictEqual(
+			computeQualificationStatus(
+				{
+					status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+					...signature,
+					tested_at: "not-a-date",
+				},
+				signature,
+				"2026-08-05T18:00:01Z",
+			),
+			QUALIFICATION_STATUS.STALE,
+		);
+		strictEqual(
+			computeQualificationStatus(
+				{
+					status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+					...signature,
+					tested_at: "2026-08-05T18:00:00Z",
+				},
+				signature,
+				"2026-08-05T18:00:01Z",
+				0,
+			),
+			QUALIFICATION_STATUS.STALE,
+		);
+		strictEqual(STALE_MAX_AGE_SECONDS, 30 * 24 * 60 * 60);
+	});
+});
+
+describe("roster loader — provider vocabularies and real-roster coherence", () => {
+	const nowIso = "2026-08-05T18:00:00Z";
+
+	function makeRoster({
+		status = QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+	} = {}) {
+		const models = {
+			"anthropic/fixture-low": { selector: "fixture-low", status: "active" },
+			"anthropic/fixture-standard": {
+				selector: "fixture-standard",
+				status: "active",
+			},
+			"anthropic/fixture-high": { selector: "fixture-high", status: "active" },
+		};
+		const slots = {};
+		const qualifications = {};
+		for (const [capabilityClass, modelRef] of Object.entries({
+			low: "anthropic/fixture-low",
+			standard: "anthropic/fixture-standard",
+			high: "anthropic/fixture-high",
+		})) {
+			const model = models[modelRef];
+			const descriptor = {
+				target_id: "claude-code",
+				model_ref: modelRef,
+				selector: model.selector,
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			};
+			const descriptorIdentity = getInvocationDescriptorIdentity(
+				descriptor,
+				"claude",
+			);
+			slots[capabilityClass] = [{ model_ref: modelRef, priority: 1 }];
+			qualifications[descriptorIdentity] = {
+				status,
+				descriptor_identity: descriptorIdentity,
+				target_id: "claude-code",
+				model_ref: modelRef,
+				selector: model.selector,
+				invocation_args: [],
+				tested_at: nowIso,
+			};
+		}
+		return {
+			schema_version: 1,
+			models,
+			targets: {
+				"claude-code": {
+					harness: "claude",
+					enabled: true,
+					slots,
+					qualifications,
+				},
+			},
+		};
+	}
+
+	it("keeps effort/variant labels and argv mapping isolated per CLI", () => {
+		strictEqual(mapInvocationArgs("claude", { effort: "max" })[0], "--effort");
+		strictEqual(
+			mapInvocationArgs("codex", { effort: "xhigh" })[1],
+			"model_reasoning_effort=xhigh",
+		);
+		strictEqual(mapInvocationArgs("codex", { effort: "max" }), null);
+		strictEqual(
+			mapInvocationArgs("opencode", { variant: "max" })[0],
+			"--variant",
+		);
+		strictEqual(mapInvocationArgs("agy", { effort: "high" }), null);
+		strictEqual(mapInvocationArgs("cursor", { variant: "high" }), null);
+		strictEqual(PROVIDER_INVOCATION_VOCABULARY.copilot.effort.length, 0);
+	});
+
+	it("passes when every enabled automatic class has a current exact dispatch receipt", () => {
+		const report = evaluateRealRosterCoherence(makeRoster(), { nowIso });
+		strictEqual(report.ok, true);
+		deepStrictEqual(report.missingClasses, []);
+		strictEqual(report.unsupportedSlots.length, 0);
+	});
+
+	it("fails closed for legacy qualified evidence and reports an actionable gap", () => {
+		const report = evaluateRealRosterCoherence(
+			makeRoster({ status: "qualified" }),
+			{ nowIso },
+		);
+		strictEqual(report.ok, false);
+		deepStrictEqual(report.missingClasses, ["low", "standard", "high"]);
+		ok(formatRealRosterCoherenceFailure(report).includes("dispatch_qualified"));
+	});
+
+	it("disables unsupported cross-harness intent instead of coercing it", () => {
+		const roster = makeRoster();
+		roster.targets["claude-code"].slots.high[0].effort = "max";
+		roster.targets["claude-code"].slots.high[0].invocation_args = [
+			"-c",
+			"model_reasoning_effort=max",
+		];
+		const report = evaluateRealRosterCoherence(roster, { nowIso });
+		strictEqual(report.ok, false);
+		strictEqual(report.unsupportedSlots.length, 1);
+		strictEqual(report.unsupportedSlots[0].capabilityClass, "high");
+	});
+
+	it("fails closed when the automatic capability baseline is empty", () => {
+		const report = evaluateRealRosterCoherence({ models: {}, targets: {} });
+		strictEqual(report.ok, false);
+		deepStrictEqual(report.missingClasses, ["low", "standard", "high"]);
+		strictEqual(report.noEnabledClasses, true);
+	});
+
+	it("rejects effort/variant descriptors with empty or cross-provider argv", () => {
+		throws(
+			() =>
+				validateInvocationDescriptor(
+					{
+						target_id: "claude-code",
+						model_ref: "anthropic/fixture",
+						selector: "fixture-claude",
+						effort: "max",
+						invocation_args: [],
+					},
+					"claude",
+				),
+			/(invocation descriptor argv does not match|codex invocation_args must)/,
+		);
+		throws(
+			() =>
+				validateInvocationDescriptor(
+					{
+						target_id: "codex",
+						model_ref: "openai/fixture",
+						selector: "fixture-codex",
+						effort: "xhigh",
+						invocation_args: ["--effort", "xhigh"],
+					},
+					"codex",
+				),
+			/(invocation descriptor argv does not match|codex invocation_args must)/,
+		);
+	});
+
+	it("returns no descriptor for an effort-bearing slot with empty argv", () => {
+		const roster = makeRoster();
+		roster.targets["claude-code"].slots.high[0].effort = "max";
+		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-argv-"));
+		const path = join(tmpDir, "unsupported.json");
+		writeFileSync(path, JSON.stringify(roster), "utf8");
+		setRosterPath(path);
+		strictEqual(getInvocationDescriptor("claude-code", "high"), null);
+	});
+
+	it("excludes configured-disabled Gemini and Vibe targets", () => {
+		const roster = makeRoster();
+		roster.targets.antigravity = {
+			harness: "agy",
+			enabled: false,
+			slots: {
+				low: [{ model_ref: "google/gemini-3.6-flash-low" }],
+				standard: [],
+				high: [],
+			},
+		};
+		roster.targets.vibe = {
+			harness: "vibe",
+			enabled: false,
+			slots: { low: [], standard: [], high: [] },
+		};
+		const report = evaluateRealRosterCoherence(roster, { nowIso });
+		deepStrictEqual(report.excludedTargets, ["antigravity", "vibe"]);
+		strictEqual(report.ok, true);
+	});
+
+	it("retains enabled Antigravity Claude while Gemini Antigravity is disabled", () => {
+		const roster = makeRoster();
+		const modelRef = "anthropic/agy-sonnet";
+		const selector = "claude-sonnet-4-6";
+		roster.models[modelRef] = { selector, status: "active" };
+		const descriptor = {
+			target_id: "antigravity-claude",
+			model_ref: modelRef,
+			selector,
+			effort: null,
+			variant: null,
+			invocation_args: [],
+		};
+		const descriptorIdentity = getInvocationDescriptorIdentity(
+			descriptor,
+			"agy",
+		);
+		roster.targets.antigravity = {
+			harness: "agy",
+			enabled: false,
+			slots: { low: [], standard: [], high: [] },
+		};
+		roster.targets["antigravity-claude"] = {
+			harness: "agy",
+			enabled: true,
+			slots: { low: [], standard: [{ model_ref: modelRef }], high: [] },
+			qualifications: {
+				[descriptorIdentity]: {
+					status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+					descriptor_identity: descriptorIdentity,
+					target_id: descriptor.target_id,
+					model_ref: modelRef,
+					selector,
+					invocation_args: [],
+					tested_at: nowIso,
+				},
+			},
+		};
+		const report = evaluateRealRosterCoherence(roster, { nowIso });
+		strictEqual(report.ok, true);
+		ok(
+			report.eligibleByClass.standard.some(
+				(entry) => entry.targetId === "antigravity-claude",
+			),
+		);
+		ok(report.excludedTargets.includes("antigravity"));
 	});
 });

@@ -13,7 +13,11 @@ import { strictEqual } from "node:assert";
 import { resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
+import {
+	__resetRosterCacheForTests,
+	getInvocationDescriptorIdentity,
+	validateInvocationDescriptor,
+} from "../src/switchyard/roster/index.mjs";
 import { executeTask } from "../src/switchyard/runner/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -39,16 +43,25 @@ after(() => {
 // keyed by harness (exactly as runQueue wires them). Records every dispatch.
 function makeContext({ provider, model }) {
 	const dispatches = [];
+	const dispatchIntents = [];
 	const calls = { execute: 0, lastModel: null };
+	const targetId = provider === "OpenCode Go" ? "opencode-go" : "claude-code";
+	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
+	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
 			route: () => ({
 				provider,
 				model,
+				resolvedTargetId: targetId,
+				resolved_harness: harness,
+				invocationDescriptor: descriptor,
 				percentLeft: 50,
 				reason: "spread",
 				log: [],
 			}),
+			resolveDescriptor: () => descriptor,
+			recordDispatchIntent: (intent) => dispatchIntents.push(intent),
 			adapters: {
 				opencode: {
 					execute: (_prompt, _container, opts) => {
@@ -66,8 +79,27 @@ function makeContext({ provider, model }) {
 			exclude: [],
 		},
 		dispatches,
+		dispatchIntents,
 		calls,
 	};
+}
+
+function syntheticDescriptor({ targetId, model, harness }) {
+	const core = {
+		target_id: targetId,
+		model_ref: model,
+		selector: model,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	};
+	return validateInvocationDescriptor(
+		{
+			...core,
+			descriptor_identity: getInvocationDescriptorIdentity(core, harness),
+		},
+		harness,
+	);
 }
 
 const TASK = {
@@ -80,7 +112,7 @@ const TASK = {
 
 describe("runner M1b — adapter selected by resolved harness", () => {
 	it("dispatches an 'OpenCode Go' route through the opencode adapter (not unsupported_provider)", () => {
-		const { context, dispatches, calls } = makeContext({
+		const { context, dispatches, dispatchIntents, calls } = makeContext({
 			provider: "OpenCode Go",
 			model: "fixture/opencode-low",
 		});
@@ -99,6 +131,8 @@ describe("runner M1b — adapter selected by resolved harness", () => {
 
 		strictEqual(dispatches.length, 1);
 		strictEqual(dispatches[0].result, "success_no_diff");
+		strictEqual(dispatchIntents.length, 1);
+		strictEqual(dispatchIntents[0].taskId, TASK.id);
 	});
 
 	it("still records unsupported_provider when no adapter exists for the resolved harness", () => {

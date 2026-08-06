@@ -38,6 +38,17 @@ describe("opencode adapter shell injection guard", () => {
 	it("rejects model name with shell metacharacters", () => {
 		const result = executeOpencode("do something", "valid-container", {
 			model: "opus; echo INJECTED",
+			resolvedTargetId: "opencode-target",
+			descriptorHarness: "opencode",
+			invocationDescriptor: {
+				target_id: "opencode-target",
+				model_ref: "opus; echo INJECTED",
+				selector: "opus; echo INJECTED",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			descriptorIdentity: `sha256:${"0".repeat(64)}`,
 		});
 		strictEqual(result.success, false);
 		ok(

@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	execute as executeCopilot,
 } from "../src/switchyard/adapter/copilot.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 function hasDocker() {
 	try {
@@ -21,6 +22,17 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-copilot-adapter-"));
 const containerName = `switchyard-copilot-adapter-${Date.now()}`;
+const COPILOT_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "copilot-target",
+		model_ref: "fake-model",
+		selector: "fake-model",
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	},
+	"copilot",
+);
 
 const COPILOT_STUB = `#!/bin/sh
 cat >/dev/null
@@ -77,6 +89,10 @@ describe("copilot adapter container execution", () => {
 	}, () => {
 		const result = executeCopilot("apply a small change", containerName, {
 			model: "fake-model",
+			resolvedTargetId: COPILOT_DESCRIPTOR.target_id,
+			descriptorHarness: "copilot",
+			invocationDescriptor: COPILOT_DESCRIPTOR,
+			descriptorIdentity: COPILOT_DESCRIPTOR.descriptor_identity,
 		});
 		strictEqual(result.success, true);
 
@@ -84,4 +100,19 @@ describe("copilot adapter container execution", () => {
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});
+});
+
+it("rejects unsupported invocation argv before Docker", () => {
+	const malformed = {
+		...COPILOT_DESCRIPTOR,
+		invocation_args: ["--effort", "high"],
+	};
+	const result = executeCopilot("apply a small change", "unused-container", {
+		model: "fake-model",
+		resolvedTargetId: COPILOT_DESCRIPTOR.target_id,
+		descriptorHarness: "copilot",
+		invocationDescriptor: malformed,
+		descriptorIdentity: COPILOT_DESCRIPTOR.descriptor_identity,
+	});
+	strictEqual(result.success, false);
 });

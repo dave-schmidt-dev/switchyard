@@ -34,6 +34,17 @@ describe("claude adapter shell injection guard", () => {
 	it("rejects model name with shell metacharacters", () => {
 		const result = executeClaude("do something", "valid-container", {
 			model: "opus; echo INJECTED",
+			resolvedTargetId: "claude-target",
+			descriptorHarness: "claude",
+			invocationDescriptor: {
+				target_id: "claude-target",
+				model_ref: "opus; echo INJECTED",
+				selector: "opus; echo INJECTED",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			descriptorIdentity: `sha256:${"0".repeat(64)}`,
 		});
 		strictEqual(result.success, false);
 		ok(

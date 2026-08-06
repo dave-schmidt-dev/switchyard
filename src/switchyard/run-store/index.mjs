@@ -17,6 +17,17 @@ import {
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
+import {
+	validateIdentifier,
+	validateInvocationArgs,
+	validateModelArg,
+} from "../adapter/shell-safety.mjs";
+import {
+	getInvocationDescriptorIdentity,
+	normalizeProviderName,
+	resolveTargetIdentity,
+	validateInvocationDescriptor,
+} from "../roster/index.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const defaultStateRoot = resolve(
@@ -69,6 +80,13 @@ const HISTORICAL_SCHEMA_VERSION = 1;
 const CURRENT_SCHEMA_VERSION = 2;
 
 const DEFAULT_LEASE_AGE_MS = 60_000;
+const TELEMETRY_WRITE_FAILURE_LABELS = new Set([
+	"revision_conflict",
+	"schema_invalid",
+	"lock_error",
+	"type_error",
+	"write_failed",
+]);
 
 function isSafeTargetId(value) {
 	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
@@ -78,6 +96,141 @@ function isSafeTargetId(value) {
 		const codePoint = character.codePointAt(0);
 		return codePoint <= 0x1f || codePoint === 0x7f;
 	});
+}
+
+const DESCRIPTOR_IDENTITY_RE = /^sha256:[a-f0-9]{64}$/;
+const DESCRIPTOR_CONTROL_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+// Schema-v1 receipts predate harness binding. They remain readable only when
+// no harness provenance is available; execution paths require the new
+// canonical identity below whenever a harness is known.
+function legacyDescriptorIdentityForReceipt(value) {
+	const canonical = {
+		effort: value.effort ?? null,
+		invocation_args: [...value.invocation_args],
+		model_ref: value.model_ref,
+		selector: value.selector,
+		target_id: value.target_id,
+		variant: value.variant ?? null,
+	};
+	return `sha256:${createHash("sha256")
+		.update(JSON.stringify(canonical), "utf8")
+		.digest("hex")}`;
+}
+
+// Best-effort provenance lookup: current roster targets are authoritative when
+// available, while synthetic or historical target ids remain readable when no
+// roster can resolve them. Strict execution still requires an explicit
+// descriptor harness in either case.
+function knownTargetHarness(targetId) {
+	try {
+		const identity = resolveTargetIdentity(targetId);
+		return identity?.targetId === targetId ? identity.harnessKey : null;
+	} catch {
+		return null;
+	}
+}
+
+function isSafeDescriptorReceipt(value, descriptorHarness = null) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const fields = [
+		"target_id",
+		"model_ref",
+		"selector",
+		"effort",
+		"variant",
+		"invocation_args",
+		"descriptor_identity",
+	];
+	if (Object.keys(value).some((key) => !fields.includes(key))) return false;
+	try {
+		validateIdentifier(value.target_id, "descriptor target_id");
+		validateModelArg(value.model_ref, "descriptor model_ref");
+		validateModelArg(value.selector, "descriptor selector");
+	} catch {
+		return false;
+	}
+	if (!DESCRIPTOR_IDENTITY_RE.test(value.descriptor_identity)) return false;
+	if (
+		(value.effort !== null &&
+			value.effort !== undefined &&
+			(typeof value.effort !== "string" ||
+				!["low", "medium", "high", "xhigh", "max"].includes(value.effort))) ||
+		(value.variant !== null &&
+			value.variant !== undefined &&
+			(typeof value.variant !== "string" ||
+				!["default", "high", "max"].includes(value.variant))) ||
+		(value.effort != null && value.variant != null)
+	)
+		return false;
+	if (!Array.isArray(value.invocation_args)) return false;
+	if (
+		value.invocation_args.some(
+			(arg) => typeof arg !== "string" || DESCRIPTOR_CONTROL_RE.test(arg),
+		)
+	)
+		return false;
+	const validArgGrammar = ["claude", "codex", "opencode"].some((harness) => {
+		try {
+			validateInvocationArgs(value.invocation_args, harness);
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	if (!validArgGrammar) return false;
+	if (
+		value.invocation_args[0] === "--effort" &&
+		value.effort !== value.invocation_args[1]
+	) {
+		return false;
+	}
+	if (
+		value.invocation_args[0] === "-c" &&
+		value.effort !== value.invocation_args[1].split("=", 2)[1]
+	) {
+		return false;
+	}
+	if (
+		value.invocation_args[0] === "--variant" &&
+		value.variant !== value.invocation_args[1]
+	) {
+		return false;
+	}
+	if (descriptorHarness !== null && descriptorHarness !== undefined) {
+		if (
+			typeof descriptorHarness !== "string" ||
+			descriptorHarness.trim() === ""
+		) {
+			return false;
+		}
+		try {
+			validateInvocationDescriptor(value, descriptorHarness);
+			if (
+				getInvocationDescriptorIdentity(value, descriptorHarness) !==
+				value.descriptor_identity
+			)
+				return false;
+		} catch {
+			return false;
+		}
+		if (!normalizeProviderName(descriptorHarness)) return false;
+		const rosterHarness = knownTargetHarness(value.target_id);
+		if (
+			rosterHarness &&
+			normalizeProviderName(descriptorHarness) !==
+				normalizeProviderName(rosterHarness)
+		) {
+			return false;
+		}
+	} else if (
+		value.descriptor_identity !== legacyDescriptorIdentityForReceipt(value)
+	) {
+		// A model-only historical receipt cannot be rebound to a harness safely;
+		// accept only the exact legacy digest and keep it out of strict execution.
+		return false;
+	}
+	return true;
 }
 
 function validateRunId(runId) {
@@ -186,6 +339,50 @@ function validateRun(data) {
 	) {
 		throw new SchemaError("activeTaskStartedAt must be a number or null");
 	}
+	for (const field of ["activeTaskElapsedMs", "activeTaskHeartbeatAt"]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			(typeof data[field] !== "number" ||
+				!Number.isFinite(data[field]) ||
+				data[field] < 0)
+		) {
+			throw new SchemaError(
+				`${field} must be a finite non-negative number or null`,
+			);
+		}
+	}
+	if (
+		data.activeTaskProcessPhase !== undefined &&
+		data.activeTaskProcessPhase !== null &&
+		(typeof data.activeTaskProcessPhase !== "string" ||
+			data.activeTaskProcessPhase.length > 64 ||
+			/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(data.activeTaskProcessPhase))
+	) {
+		throw new SchemaError(
+			"activeTaskProcessPhase must be a safe scalar string or null",
+		);
+	}
+	if (
+		data.telemetryWriteFailures !== undefined &&
+		(typeof data.telemetryWriteFailures !== "number" ||
+			!Number.isInteger(data.telemetryWriteFailures) ||
+			data.telemetryWriteFailures < 0)
+	) {
+		throw new SchemaError(
+			"telemetryWriteFailures must be a non-negative integer",
+		);
+	}
+	if (
+		data.lastTelemetryWriteFailure !== undefined &&
+		data.lastTelemetryWriteFailure !== null &&
+		(typeof data.lastTelemetryWriteFailure !== "string" ||
+			!TELEMETRY_WRITE_FAILURE_LABELS.has(data.lastTelemetryWriteFailure))
+	) {
+		throw new SchemaError(
+			"lastTelemetryWriteFailure must be a known safe label or null",
+		);
+	}
 	if (
 		data.lastCompletionAt !== undefined &&
 		data.lastCompletionAt !== null &&
@@ -213,6 +410,114 @@ function validateRun(data) {
 		typeof data.resolvedTargetId !== "string"
 	) {
 		throw new SchemaError("resolvedTargetId must be a string or null");
+	}
+	for (const field of ["lastResolvedTargetId"]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			!isSafeTargetId(data[field])
+		) {
+			throw new SchemaError(`${field} must be a safe target id or null`);
+		}
+	}
+	for (const field of [
+		"activeTaskDescriptorHarness",
+		"lastTaskDescriptorHarness",
+	]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			(typeof data[field] !== "string" || !normalizeProviderName(data[field]))
+		) {
+			throw new SchemaError(`${field} must be a provider harness or null`);
+		}
+	}
+	for (const field of [
+		"activeTaskInvocationDescriptor",
+		"lastTaskInvocationDescriptor",
+	]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			!isSafeDescriptorReceipt(
+				data[field],
+				field === "activeTaskInvocationDescriptor"
+					? data.activeTaskDescriptorHarness
+					: data.lastTaskDescriptorHarness,
+			)
+		) {
+			throw new SchemaError(`${field} contains an invalid descriptor receipt`);
+		}
+	}
+	for (const field of [
+		"activeTaskDescriptorIdentity",
+		"lastTaskDescriptorIdentity",
+	]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			(typeof data[field] !== "string" ||
+				!DESCRIPTOR_IDENTITY_RE.test(data[field]))
+		) {
+			throw new SchemaError(`${field} must be a descriptor identity or null`);
+		}
+	}
+	for (const [descriptorField, identityField] of [
+		["activeTaskInvocationDescriptor", "activeTaskDescriptorIdentity"],
+		["lastTaskInvocationDescriptor", "lastTaskDescriptorIdentity"],
+	]) {
+		const descriptor = data[descriptorField];
+		const identity = data[identityField];
+		if (
+			descriptor !== undefined &&
+			descriptor !== null &&
+			identity !== undefined &&
+			identity !== null &&
+			descriptor.descriptor_identity !== identity
+		) {
+			throw new SchemaError(
+				`${identityField} does not match ${descriptorField}`,
+			);
+		}
+	}
+	if (data.activeTaskInvocationDescriptor) {
+		if (!data.activeTaskDescriptorHarness || !data.resolvedTargetId) {
+			throw new SchemaError(
+				"active descriptor requires descriptor harness and resolvedTargetId",
+			);
+		}
+	}
+	if (data.lastTaskInvocationDescriptor) {
+		if (!data.lastTaskDescriptorHarness || !data.lastResolvedTargetId) {
+			throw new SchemaError(
+				"last descriptor requires descriptor harness and lastResolvedTargetId",
+			);
+		}
+	}
+	if (
+		data.activeTaskInvocationDescriptor &&
+		data.resolvedTargetId &&
+		data.activeTaskInvocationDescriptor.target_id !== data.resolvedTargetId
+	) {
+		throw new SchemaError(
+			"active descriptor target does not match resolvedTargetId",
+		);
+	}
+	if (
+		data.lastTaskInvocationDescriptor &&
+		data.lastResolvedTargetId &&
+		data.lastTaskInvocationDescriptor.target_id !== data.lastResolvedTargetId
+	) {
+		throw new SchemaError(
+			"last descriptor target does not match lastResolvedTargetId",
+		);
+	}
+	if (
+		data.dispatchContractVersion !== undefined &&
+		(!Number.isInteger(data.dispatchContractVersion) ||
+			data.dispatchContractVersion < 1)
+	) {
+		throw new SchemaError("dispatchContractVersion must be a positive integer");
 	}
 	if (data.quarantinedTargetIds !== undefined) {
 		if (
@@ -244,6 +549,93 @@ function validateRun(data) {
 				!isSafeTargetId(retryState.resolvedTargetId))
 		) {
 			throw new SchemaError("retryState contains invalid retry metadata");
+		}
+		if (
+			retryState.invocationDescriptor !== undefined &&
+			retryState.invocationDescriptor !== null &&
+			!isSafeDescriptorReceipt(
+				retryState.invocationDescriptor,
+				retryState.descriptorHarness,
+			)
+		) {
+			throw new SchemaError(
+				"retryState contains an invalid descriptor receipt",
+			);
+		}
+		if (
+			retryState.invocationDescriptor &&
+			(!retryState.descriptorHarness || !retryState.resolvedTargetId)
+		) {
+			throw new SchemaError(
+				"retryState descriptor requires descriptor harness and resolvedTargetId",
+			);
+		}
+		if (
+			retryState.descriptorIdentity !== undefined &&
+			retryState.descriptorIdentity !== null &&
+			(!DESCRIPTOR_IDENTITY_RE.test(retryState.descriptorIdentity) ||
+				retryState.invocationDescriptor?.descriptor_identity !==
+					retryState.descriptorIdentity)
+		) {
+			throw new SchemaError("retryState descriptor identity is invalid");
+		}
+		if (
+			retryState.invocationDescriptor &&
+			retryState.resolvedTargetId &&
+			retryState.invocationDescriptor.target_id !== retryState.resolvedTargetId
+		) {
+			throw new SchemaError(
+				"retryState descriptor target does not match target",
+			);
+		}
+	}
+	for (const field of ["retryAttempts", "retryTransitions"]) {
+		if (data[field] === undefined) continue;
+		if (!Array.isArray(data[field])) {
+			throw new SchemaError(`${field} must be an array`);
+		}
+		for (const entry of data[field]) {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+				throw new SchemaError(`${field} contains invalid retry metadata`);
+			}
+			if (
+				entry.invocationDescriptor !== undefined &&
+				entry.invocationDescriptor !== null &&
+				!isSafeDescriptorReceipt(
+					entry.invocationDescriptor,
+					entry.descriptorHarness,
+				)
+			) {
+				throw new SchemaError(
+					`${field} contains an invalid descriptor receipt`,
+				);
+			}
+			if (
+				entry.invocationDescriptor &&
+				(!entry.descriptorHarness || !entry.resolvedTargetId)
+			) {
+				throw new SchemaError(
+					`${field} descriptor requires descriptor harness and resolvedTargetId`,
+				);
+			}
+			if (
+				entry.descriptorIdentity !== undefined &&
+				entry.descriptorIdentity !== null &&
+				(!DESCRIPTOR_IDENTITY_RE.test(entry.descriptorIdentity) ||
+					entry.invocationDescriptor?.descriptor_identity !==
+						entry.descriptorIdentity)
+			) {
+				throw new SchemaError(`${field} descriptor identity is invalid`);
+			}
+			if (
+				entry.invocationDescriptor &&
+				entry.resolvedTargetId &&
+				entry.invocationDescriptor.target_id !== entry.resolvedTargetId
+			) {
+				throw new SchemaError(
+					`${field} descriptor target does not match target`,
+				);
+			}
 		}
 	}
 	for (const field of ["snapshotMtime", "snapshotAgeMsAtRoute"]) {
@@ -405,10 +797,21 @@ export async function initializeRun(options) {
 		activeTaskProvider: null,
 		activeTaskModel: null,
 		activeTaskDeadline: null,
+		activeTaskElapsedMs: null,
+		activeTaskHeartbeatAt: null,
+		activeTaskProcessPhase: null,
 		snapshotStatus: null,
 		snapshotMtime: null,
 		snapshotAgeMsAtRoute: null,
 		resolvedTargetId: null,
+		lastResolvedTargetId: null,
+		activeTaskInvocationDescriptor: null,
+		activeTaskDescriptorIdentity: null,
+		activeTaskDescriptorHarness: null,
+		lastTaskInvocationDescriptor: null,
+		lastTaskDescriptorIdentity: null,
+		lastTaskDescriptorHarness: null,
+		dispatchContractVersion: 1,
 		quarantinedTargetIds: [],
 		retryState: null,
 		retryTransitionId: 0,
@@ -576,6 +979,59 @@ export async function advanceState(runId, newState) {
  */
 export async function createEvent(runId, event) {
 	validateRunId(runId);
+	if (
+		event?.invocationDescriptor !== undefined &&
+		event.invocationDescriptor !== null &&
+		!isSafeDescriptorReceipt(
+			event.invocationDescriptor,
+			event.descriptorHarness,
+		)
+	) {
+		throw new SchemaError("event contains an invalid descriptor receipt");
+	}
+	if (
+		event?.descriptorIdentity !== undefined &&
+		event.descriptorIdentity !== null &&
+		(typeof event.descriptorIdentity !== "string" ||
+			!DESCRIPTOR_IDENTITY_RE.test(event.descriptorIdentity))
+	) {
+		throw new SchemaError("event descriptorIdentity is invalid");
+	}
+	if (
+		event?.invocationDescriptor != null &&
+		event?.descriptorIdentity != null &&
+		event.invocationDescriptor.descriptor_identity !== event.descriptorIdentity
+	) {
+		throw new SchemaError(
+			"event descriptorIdentity does not match invocationDescriptor",
+		);
+	}
+	if (
+		event?.invocationDescriptor &&
+		event?.resolvedTargetId &&
+		event.invocationDescriptor.target_id !== event.resolvedTargetId
+	) {
+		throw new SchemaError(
+			"event descriptor target does not match resolvedTargetId",
+		);
+	}
+	if (
+		event?.invocationDescriptor &&
+		(!event.descriptorHarness || !event.resolvedTargetId)
+	) {
+		throw new SchemaError(
+			"event descriptor requires descriptor harness and resolvedTargetId",
+		);
+	}
+	if (
+		event?.dispatchContractVersion !== undefined &&
+		(!Number.isInteger(event.dispatchContractVersion) ||
+			event.dispatchContractVersion < 1)
+	) {
+		throw new SchemaError(
+			"event dispatchContractVersion must be a positive integer",
+		);
+	}
 	const runDir = getRunRoot(runId);
 	const eventsPath = resolve(runDir, "events.jsonl");
 

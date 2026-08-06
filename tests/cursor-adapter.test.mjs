@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	executeCursor,
 } from "../src/switchyard/adapter/cursor.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 function hasDocker() {
 	try {
@@ -24,6 +25,17 @@ const containerName = `switchyard-cursor-adapter-${Date.now()}`;
 
 const CURSOR_MODEL = "composer-2.5";
 const CURSOR_PROMPT = "apply a small change";
+const CURSOR_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "cursor-target",
+		model_ref: CURSOR_MODEL,
+		selector: CURSOR_MODEL,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	},
+	"cursor",
+);
 
 // Fake `cursor-agent` that ENFORCES the adapter's invocation shape: it exits
 // non-zero unless --print, --force, --trust, --output-format text, and
@@ -57,8 +69,8 @@ case " $* " in
   *) echo "stub: executeCursor did not pass --model ${CURSOR_MODEL}; args: $*" >&2; exit 3 ;;
 esac
 case " $* " in
-  *" ${CURSOR_PROMPT} ") ;;
-  *) echo "stub: executeCursor did not pass ${CURSOR_PROMPT} as the final positional arg; args: $*" >&2; exit 3 ;;
+  *" ${CURSOR_PROMPT}"*) ;;
+  *) echo "stub: executeCursor did not pass ${CURSOR_PROMPT} in the guarded prompt; args: $*" >&2; exit 3 ;;
 esac
 echo updated >> test.txt
 echo cursor-agent
@@ -120,6 +132,10 @@ describe("cursor adapter container execution", () => {
 		// itself the assertion that executeCursor sends them.
 		const result = executeCursor(CURSOR_PROMPT, containerName, {
 			model: CURSOR_MODEL,
+			resolvedTargetId: CURSOR_DESCRIPTOR.target_id,
+			descriptorHarness: "cursor",
+			invocationDescriptor: CURSOR_DESCRIPTOR,
+			descriptorIdentity: CURSOR_DESCRIPTOR.descriptor_identity,
 		});
 		strictEqual(result.success, true, result.error);
 
@@ -127,4 +143,19 @@ describe("cursor adapter container execution", () => {
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});
+});
+
+it("rejects unsupported invocation argv before Docker", () => {
+	const malformed = {
+		...CURSOR_DESCRIPTOR,
+		invocation_args: ["--variant", "high"],
+	};
+	const result = executeCursor(CURSOR_PROMPT, "unused-container", {
+		model: CURSOR_MODEL,
+		resolvedTargetId: CURSOR_DESCRIPTOR.target_id,
+		descriptorHarness: "cursor",
+		invocationDescriptor: malformed,
+		descriptorIdentity: CURSOR_DESCRIPTOR.descriptor_identity,
+	});
+	strictEqual(result.success, false);
 });

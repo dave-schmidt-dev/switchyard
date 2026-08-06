@@ -15,7 +15,16 @@ import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { killOrphanedProcesses } from "./orphan-kill.mjs";
+import { validateAdapterInvocation } from "./invocation.mjs";
+import {
+	killOrphanedProcesses,
+	killOrphanedProcessesAsync,
+} from "./orphan-kill.mjs";
+import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
+import {
+	captureProviderDiffAsync,
+	executeProviderInvocation,
+} from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CURSOR_CMD = "cursor-agent";
@@ -79,9 +88,19 @@ export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  */
 export function executeCursor(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+	try {
+		validateAdapterInvocation(options, {
+			expectedHarness: "cursor",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
@@ -106,7 +125,7 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 		}
 		args.push("--model", model);
 	}
-	args.push(prompt);
+	args.push(guardedPrompt);
 
 	try {
 		const result = execFileSync("docker", args, {
@@ -141,6 +160,56 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 			errorKind: described.errorKind,
 			timedOut,
 		};
+	}
+}
+
+/** Async counterpart used by non-blocking queue workers. */
+export async function executeCursorAsync(
+	prompt,
+	workingContainerName,
+	options = {},
+) {
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		signal,
+		onPoll,
+	} = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+		validateAdapterInvocation(options, {
+			expectedHarness: "cursor",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
+		const args = [
+			"exec",
+			"-w",
+			"/project",
+			workingContainerName,
+			CURSOR_CMD,
+			"--print",
+			"--force",
+			"--trust",
+			"--output-format",
+			"text",
+		];
+		if (model) {
+			validateModelArg(model, "model");
+			args.push("--model", model);
+		}
+		args.push(guardedPrompt);
+		return await executeProviderInvocation("docker", args, {
+			...options,
+			provider: "cursor",
+			timeoutMs,
+			signal,
+			onPoll,
+			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+		});
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
 	}
 }
 
@@ -183,8 +252,17 @@ export function captureDiff(workingContainerName) {
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return diff.trim() || null;
+		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
 	}
+}
+
+export function captureDiffAsync(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return Promise.resolve(null);
+	}
+	return captureProviderDiffAsync(workingContainerName, options);
 }

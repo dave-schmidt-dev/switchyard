@@ -2,7 +2,16 @@ import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { killOrphanedProcesses } from "./orphan-kill.mjs";
+import { validateAdapterInvocation } from "./invocation.mjs";
+import {
+	killOrphanedProcesses,
+	killOrphanedProcessesAsync,
+} from "./orphan-kill.mjs";
+import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
+import {
+	captureProviderDiffAsync,
+	executeProviderInvocation,
+} from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const OPENCODE_CMD = "opencode";
@@ -42,9 +51,20 @@ export function isOpencodeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 
 export function execute(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+	let invocationArgs;
+	try {
+		invocationArgs = validateAdapterInvocation(options, {
+			expectedHarness: "opencode",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
@@ -56,6 +76,10 @@ export function execute(prompt, workingContainerName, options = {}) {
 		"/project",
 		workingContainerName,
 		OPENCODE_CMD,
+		"run",
+		// OpenCode variant argv is forwarded verbatim immediately after the
+		// `run` subcommand and before the model selector.
+		...invocationArgs,
 	];
 	if (model) {
 		try {
@@ -65,10 +89,14 @@ export function execute(prompt, workingContainerName, options = {}) {
 		}
 		args.push("--model", model);
 	}
+	// `opencode run` consumes the task message as a positional argument. Keep
+	// stdin populated for compatibility with wrappers that still read it, but
+	// do not rely on stdin as the only prompt transport.
+	args.push(guardedPrompt);
 
 	try {
 		const result = execFileSync("docker", args, {
-			input: prompt,
+			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeoutMs,
@@ -103,6 +131,51 @@ export function execute(prompt, workingContainerName, options = {}) {
 	}
 }
 
+/** Async counterpart used by non-blocking queue workers. */
+export async function executeAsync(prompt, workingContainerName, options = {}) {
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		signal,
+		onPoll,
+	} = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+		const invocationArgs = validateAdapterInvocation(options, {
+			expectedHarness: "opencode",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
+		const args = [
+			"exec",
+			"-i",
+			"-w",
+			"/project",
+			workingContainerName,
+			OPENCODE_CMD,
+			"run",
+			...invocationArgs,
+		];
+		if (model) {
+			validateModelArg(model, "model");
+			args.push("--model", model);
+		}
+		args.push(guardedPrompt);
+		return await executeProviderInvocation("docker", args, {
+			...options,
+			provider: "opencode",
+			input: guardedPrompt,
+			timeoutMs,
+			signal,
+			onPoll,
+			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+		});
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+}
+
 export function captureDiff(workingContainerName) {
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
@@ -129,8 +202,17 @@ export function captureDiff(workingContainerName) {
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return diff.trim() || null;
+		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
 	}
+}
+
+export function captureDiffAsync(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return Promise.resolve(null);
+	}
+	return captureProviderDiffAsync(workingContainerName, options);
 }

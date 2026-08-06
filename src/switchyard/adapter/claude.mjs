@@ -12,7 +12,16 @@ import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { killOrphanedProcesses } from "./orphan-kill.mjs";
+import { validateAdapterInvocation } from "./invocation.mjs";
+import {
+	killOrphanedProcesses,
+	killOrphanedProcessesAsync,
+} from "./orphan-kill.mjs";
+import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
+import {
+	captureProviderDiffAsync,
+	executeProviderInvocation,
+} from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CLAUDE_CMD = "claude";
@@ -104,9 +113,20 @@ export function isClaudeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  */
 export function executeClaude(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+	let invocationArgs;
+	try {
+		invocationArgs = validateAdapterInvocation(options, {
+			expectedHarness: "claude",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
@@ -136,6 +156,9 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 		// review point for anything that leaves it.
 		"--permission-mode",
 		"acceptEdits",
+		// Provider-specific descriptor argv is forwarded verbatim at this fixed
+		// position, immediately after Claude's headless safety flags.
+		...invocationArgs,
 	];
 	if (model) {
 		try {
@@ -148,7 +171,7 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 
 	try {
 		const result = execFileSync("docker", args, {
-			input: prompt,
+			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeoutMs,
@@ -183,6 +206,56 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 			errorKind: described.errorKind,
 			timedOut,
 		};
+	}
+}
+
+/** Async counterpart used by non-blocking queue workers. */
+export async function executeClaudeAsync(
+	prompt,
+	workingContainerName,
+	options = {},
+) {
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		signal,
+		onPoll,
+	} = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+		const invocationArgs = validateAdapterInvocation(options, {
+			expectedHarness: "claude",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
+		const args = [
+			"exec",
+			"-i",
+			"-w",
+			"/project",
+			workingContainerName,
+			CLAUDE_CMD,
+			"--print",
+			"--permission-mode",
+			"acceptEdits",
+			...invocationArgs,
+		];
+		if (model) {
+			validateModelArg(model, "model");
+			args.push("--model", model);
+		}
+		return await executeProviderInvocation("docker", args, {
+			...options,
+			provider: "claude",
+			input: guardedPrompt,
+			timeoutMs,
+			signal,
+			onPoll,
+			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+		});
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
 	}
 }
 
@@ -225,8 +298,17 @@ export function captureDiff(workingContainerName) {
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return diff.trim() || null;
+		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
 	}
+}
+
+export function captureDiffAsync(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return Promise.resolve(null);
+	}
+	return captureProviderDiffAsync(workingContainerName, options);
 }

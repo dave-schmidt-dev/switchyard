@@ -18,13 +18,7 @@
 //   4. recordDispatchToStore preserves the provenance fields for parity with the
 //      default file ledger.
 
-import {
-	deepStrictEqual,
-	notStrictEqual,
-	ok,
-	rejects,
-	strictEqual,
-} from "node:assert";
+import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -42,9 +36,11 @@ import {
 import {
 	__resetRosterCacheForTests,
 	computeRosterSha,
+	getInvocationDescriptorIdentity,
 	getRosterProvenance,
 	resolveRouteProvenance,
 	resolveTargetProvenance,
+	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
 import {
 	executeTask,
@@ -106,17 +102,30 @@ const PROVENANCE_KEYS = [
 
 function makeContext({ provider, model, adapters }) {
 	const dispatches = [];
+	const targetId =
+		provider === "OpenCode Go"
+			? "opencode-go"
+			: provider === "Claude"
+				? "claude-code"
+				: provider;
+	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
+	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
 			route: () => ({
 				provider,
 				model,
+				resolvedTargetId: targetId,
+				resolved_harness: harness,
+				invocationDescriptor: descriptor,
 				percentLeft: 50,
 				reason: "spread",
 				log: [],
 			}),
+			resolveDescriptor: () => descriptor,
 			adapters: adapters ?? {},
 			recordDispatch: (d) => dispatches.push(d),
+			recordDispatchIntent: () => {},
 			integrationGate: () => ({ success: true }),
 			projectPath: "/tmp/does-not-matter",
 			workingContainerName: "test-container",
@@ -126,12 +135,31 @@ function makeContext({ provider, model, adapters }) {
 	};
 }
 
+function syntheticDescriptor({ targetId, model, harness }) {
+	const core = {
+		target_id: targetId,
+		model_ref: model,
+		selector: model,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	};
+	return validateInvocationDescriptor(
+		{
+			...core,
+			descriptor_identity: getInvocationDescriptorIdentity(core, harness),
+		},
+		harness,
+	);
+}
+
 const TASK = {
 	id: "T-1",
 	title: "trivial task",
 	description: "trivial task",
 	prompt: "do the thing",
 	requiredCapability: "low",
+	requiredCapabilityJustification: "The task is a bounded mechanical change.",
 	requiredPaths: null,
 };
 
@@ -360,6 +388,13 @@ describe("executeTask — every dispatch record carries all six provenance field
 		const routeResultObj = {
 			provider: "OpenCode Go",
 			model: "fixture/opencode-low",
+			resolvedTargetId: "opencode-go",
+			resolved_harness: "opencode",
+			invocationDescriptor: syntheticDescriptor({
+				targetId: "opencode-go",
+				model: "fixture/opencode-low",
+				harness: "opencode",
+			}),
 			percentLeft: 50,
 			reason: "spread",
 			log: [],
@@ -378,6 +413,7 @@ describe("executeTask — every dispatch record carries all six provenance field
 			workingContainerName: "c",
 			exclude: [],
 		};
+		context.resolveDescriptor = () => routeResultObj.invocationDescriptor;
 		executeTask(TASK, context);
 		for (const key of PROVENANCE_KEYS) {
 			ok(key in routeResultObj, `routeResult missing ${key}`);
@@ -395,16 +431,29 @@ function makeOrchestratorContext({
 	orchestratorOverrides = {},
 }) {
 	const dispatches = [];
+	const targetId =
+		provider === "OpenCode Go"
+			? "opencode-go"
+			: provider === "Claude"
+				? "claude-code"
+				: provider;
+	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
+	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
 			route: () => ({
 				provider,
 				model,
+				resolvedTargetId: targetId,
+				resolved_harness: harness,
+				invocationDescriptor: descriptor,
 				percentLeft: 50,
 				reason: "spread",
 				log: [],
 			}),
+			resolveDescriptor: () => descriptor,
 			recordDispatch: (d) => dispatches.push(d),
+			recordDispatchIntent: () => {},
 			integrationGate: () => ({ success: true }),
 			projectPath: "/tmp/does-not-matter",
 			workingContainerName: "test-container",
@@ -434,7 +483,7 @@ function makeDefaultWiringFixture(taskId) {
 	const tasksFilePath = join(tmpDir, `${taskId}.md`);
 	writeFileSync(
 		tasksFilePath,
-		"### Task 1.1: Default ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **Description:** write matching ledger records\n",
+		"### Task 1.1: Default ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **RequiredCapabilityJustification:** The review is a bounded mechanical check.\n- **Description:** write matching ledger records\n",
 		"utf8",
 	);
 
@@ -453,9 +502,17 @@ function makeDefaultWiringFixture(taskId) {
 }
 
 function defaultRoute() {
+	const descriptor = syntheticDescriptor({
+		targetId: "opencode-go",
+		model: "fixture/opencode-low",
+		harness: "opencode",
+	});
 	return {
 		provider: "OpenCode Go",
 		model: "fixture/opencode-low",
+		resolvedTargetId: "opencode-go",
+		resolved_harness: "opencode",
+		invocationDescriptor: descriptor,
 		percentLeft: 50,
 		reason: "spread",
 		log: [],
@@ -465,12 +522,19 @@ function defaultRoute() {
 function defaultSyncDependencies(overrides = {}) {
 	return {
 		route: defaultRoute,
+		resolveDescriptor: () =>
+			syntheticDescriptor({
+				targetId: "opencode-go",
+				model: "fixture/opencode-low",
+				harness: "opencode",
+			}),
 		adapters: {
 			opencode: {
 				execute: () => ({ success: true }),
 				captureDiff: () => "",
 			},
 		},
+		recordDispatchIntent: () => {},
 		...overrides,
 	};
 }
@@ -478,12 +542,19 @@ function defaultSyncDependencies(overrides = {}) {
 function defaultOrchestratorDependencies(overrides = {}) {
 	return {
 		route: defaultRoute,
+		resolveDescriptor: () =>
+			syntheticDescriptor({
+				targetId: "opencode-go",
+				model: "fixture/opencode-low",
+				harness: "opencode",
+			}),
 		adapters: { opencode: {} },
 		orchestrator: {
 			launch: async () => "job-default-ledger",
 			status: async () => ({ state: "done" }),
 			result: async () => ({ success: true, diff: "" }),
 		},
+		recordDispatchIntent: () => {},
 		...overrides,
 	};
 }
@@ -596,11 +667,16 @@ describe("default runner ledger wiring", () => {
 			});
 			strictEqual(result.results[0].result, "success_no_diff");
 
-			const legacyRecord = readLedger().at(-1);
 			const storeRecord = await waitForStoreRecord(
 				fixture.storeRoot,
 				fixture.taskId,
 			);
+			let legacyRecord;
+			for (let attempts = 0; attempts < 50; attempts += 1) {
+				legacyRecord = readLedger().at(-1);
+				if (legacyRecord?.taskId === fixture.taskId) break;
+				await new Promise((resolve) => setImmediate(resolve));
+			}
 			assertMatchingLedgerRecords(legacyRecord, storeRecord);
 		} finally {
 			restoreLedgerPaths();
@@ -638,6 +714,7 @@ describe("default runner ledger wiring", () => {
 				"- **Type:** review",
 				"- **Executor:** switchyard",
 				"- **RequiredCapability:** low",
+				"- **RequiredCapabilityJustification:** The first review is a bounded mechanical check.",
 				"- **Description:** first ordered task",
 				"",
 				"### Task 1.2: Second ordered ledger task",
@@ -645,6 +722,7 @@ describe("default runner ledger wiring", () => {
 				"- **Type:** review",
 				"- **Executor:** switchyard",
 				"- **RequiredCapability:** low",
+				"- **RequiredCapabilityJustification:** The second review is a bounded mechanical check.",
 				"- **Description:** second ordered task",
 				"",
 			].join("\n"),
@@ -670,10 +748,6 @@ describe("default runner ledger wiring", () => {
 				}),
 			});
 			strictEqual(result.results.length, 2);
-			deepStrictEqual(
-				readLedger().map((record) => record.taskId),
-				["1.1", "1.2"],
-			);
 
 			releaseFirst();
 			let storeRecords = [];
@@ -684,6 +758,16 @@ describe("default runner ledger wiring", () => {
 			}
 			deepStrictEqual(
 				storeRecords.map((record) => record.taskId),
+				["1.1", "1.2"],
+			);
+			let legacyRecords = [];
+			for (let attempts = 0; attempts < 50; attempts += 1) {
+				legacyRecords = readLedger();
+				if (legacyRecords.length === 2) break;
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			deepStrictEqual(
+				legacyRecords.map((record) => record.taskId),
 				["1.1", "1.2"],
 			);
 		} finally {
@@ -713,7 +797,7 @@ describe("default runner ledger wiring", () => {
 			);
 			writeFileSync(
 				orchestratorTasksFilePath,
-				"### Task 1.1: Override ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **Description:** use the injected recorder\n",
+				"### Task 1.1: Override ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **RequiredCapabilityJustification:** The review is a bounded mechanical check.\n- **Description:** use the injected recorder\n",
 				"utf8",
 			);
 			await runQueueWithOrchestrator({
@@ -761,7 +845,7 @@ describe("default runner ledger wiring", () => {
 			strictEqual(warnings.length, 1);
 			ok(
 				warnings[0].startsWith(
-					"runQueue: project-local dispatch ledger write failed:",
+					"runQueue: project-local dispatch outcome projection failed",
 				),
 			);
 		} finally {
@@ -770,23 +854,25 @@ describe("default runner ledger wiring", () => {
 		}
 	});
 
-	it("propagates an orchestrator store-write failure after the legacy record", async () => {
+	it("contains an orchestrator store-write failure after the legacy record", async () => {
 		const fixture = makeDefaultWiringFixture(
 			"orchestrator-store-write-failure",
 		);
 		writeFileSync(fixture.storeRoot, "not a directory", "utf8");
 		try {
-			await rejects(
-				runQueueWithOrchestrator({
-					tasksFilePath: fixture.tasksFilePath,
-					projectPath: tmpDir,
-					workingContainerName: "test-container",
-					checkpointPath: fixture.checkpointPath,
-					dependencies: defaultOrchestratorDependencies(),
-				}),
-				/(EEXIST|ENOTDIR|not a directory)/,
+			const result = await runQueueWithOrchestrator({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultOrchestratorDependencies(),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(
+				readLedger().filter((record) => record.taskId === fixture.taskId)
+					.length,
+				1,
 			);
-			strictEqual(readLedger().length, 1);
 		} finally {
 			restoreLedgerPaths();
 		}

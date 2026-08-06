@@ -15,8 +15,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	CAPABILITY_CLASS,
+	getCapabilityClass,
 	getImplementorPriority,
 	getRightSizedModel,
+	hasAutomaticInvocationDescriptor,
 	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
@@ -190,7 +192,7 @@ function indexProviders(snapshot) {
  * @param {string[]} [options.only] Provider names/target ids to restrict routing to. Mutually exclusive with exclude at the CLI layer, which rejects that combination before it reaches here; if both were passed directly to route() anyway, exclude is checked first and wins for any name present in both lists.
  * @param {number} [options.floor] Percent left floor (default: DEFAULT_FLOOR)
  * @param {string} [options.requiredCapability] Required capability class
- *   (high/standard/low) for INV-5
+ *   (high/standard/low) for INV-5. Omitted values use standard.
  * @param {string[]} [options.availableProviders] Restrict candidates to providers
  *   the caller can actually dispatch to (e.g. the runner's registered adapters).
  *   Omit to consider every roster/snapshot provider (existing behavior).
@@ -214,13 +216,31 @@ export function route(options = {}) {
 	const { seed: routeSeed } = resolveSeed({ seed, runId });
 	const log = [];
 
-	// Default capability is high for conservative routing (unknown capability
-	// => high-capability only).
-	const effectiveCapabilityClass = requiredCapability ?? CAPABILITY_CLASS.high;
+	// Missing task-contract capability is the standard lane. Explicit values
+	// are validated by the runner boundary (and by the roster filter below).
+	const effectiveCapabilityClass =
+		requiredCapability ?? CAPABILITY_CLASS.standard;
 	const isAvailable = (name) => {
 		if (!availableProviders) return true;
-		const norm = normalizeProviderName(name);
-		return availableProviders.some((p) => normalizeProviderName(p) === norm);
+		/*
+		 * A snapshot display name can identify a target whose harness is shared
+		 * with another target (for example `Vibe` and `OpenCode Go` both use the
+		 * OpenCode adapter). Resolve the display name to its declared harness
+		 * before comparing it with the adapter registry; normalizing `Vibe` to a
+		 * fictional `vibe` adapter would incorrectly reject the OpenCode-backed
+		 * implementation route.
+		 */
+		const requestedIdentity = resolveTargetIdentity(name);
+		const requestedHarness = requestedIdentity.targetId
+			? requestedIdentity.harnessKey
+			: normalizeProviderName(name);
+		return availableProviders.some((provider) => {
+			const providerIdentity = resolveTargetIdentity(provider);
+			const availableHarness = providerIdentity.targetId
+				? providerIdentity.harnessKey
+				: normalizeProviderName(provider);
+			return availableHarness === requestedHarness;
+		});
 	};
 
 	// Read snapshot host-side (WR-1). All route-time diagnostics below come
@@ -271,10 +291,11 @@ export function route(options = {}) {
 			return (
 				isAvailable(name) &&
 				passesCapabilityFilter(name, effectiveCapabilityClass) &&
+				hasAutomaticInvocationDescriptor(name, effectiveCapabilityClass) &&
 				(only.length === 0 || only.some((o) => providerMatches(o, name)))
 			);
 		});
-		const blind = routeBlind(blindOrder, exclude);
+		const blind = routeBlind(blindOrder, exclude, effectiveCapabilityClass);
 		const model = blind.provider
 			? getRightSizedModel(blind.provider, effectiveCapabilityClass)
 			: null;
@@ -388,6 +409,19 @@ export function route(options = {}) {
 			ceilingSkips += 1;
 			log.push(
 				`provider ${name}: below required capability ${effectiveCapabilityClass}`,
+			);
+			continue;
+		}
+
+		// Selector-only compatibility qualifications can describe an eligible
+		// capability lane, but automatic dispatch needs current, exact evidence
+		// for the target/model/argv it would transmit. Keep an explicitly named
+		// target distinct: it is rejected here rather than falling through to a
+		// sibling that shares its harness.
+		if (!hasAutomaticInvocationDescriptor(name, effectiveCapabilityClass)) {
+			otherSkips += 1;
+			log.push(
+				`provider ${name}: no current exact invocation descriptor for ${effectiveCapabilityClass}`,
 			);
 			continue;
 		}
@@ -654,9 +688,14 @@ export function route(options = {}) {
  *
  * @param {string[]} providerOrder Ordered list of provider names to try
  * @param {string[]} [exclude] Providers to exclude
+ * @param {string} [requiredCapability] Capability class already resolved by route()
  * @returns {{provider: string|null, model: null, reason: string}} Result
  */
-export function routeBlind(providerOrder, exclude = []) {
+export function routeBlind(
+	providerOrder,
+	exclude = [],
+	requiredCapability = CAPABILITY_CLASS.standard,
+) {
 	const ambiguousFilter = exclude.find(
 		(identifier) => resolveTargetIdentity(identifier).ambiguous,
 	);
@@ -682,6 +721,11 @@ export function routeBlind(providerOrder, exclude = []) {
 			}
 			continue;
 		}
+		// Blind callers may provide an explicit order, so repeat the roster's
+		// automatic-eligibility gates here. An explicitly disabled or
+		// selector-only target cannot bypass route()'s generated blindOrder.
+		if (getCapabilityClass(name) === null) continue;
+		if (!hasAutomaticInvocationDescriptor(name, requiredCapability)) continue;
 		const excluded = exclude.some((excludedName) =>
 			providerMatches(excludedName, name),
 		);

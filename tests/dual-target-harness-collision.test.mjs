@@ -26,7 +26,7 @@
 
 import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -34,6 +34,7 @@ import { fileURLToPath } from "node:url";
 import {
 	__resetRosterCacheForTests,
 	getCapabilityClass,
+	getInvocationDescriptorIdentity,
 	getModelForCapability,
 	getRightSizedModel,
 	PROVIDER_CAPABILITIES,
@@ -41,6 +42,7 @@ import {
 	resolveRouteProvenance,
 	resolveTargetIdentity,
 	resolveTargetProvenance,
+	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
 import { route, routeBlind } from "../src/switchyard/router/index.mjs";
 import {
@@ -62,12 +64,60 @@ const SNAPSHOT_PATH = join(
 	tmpdir(),
 	`switchyard-dual-agy-${process.pid}-${randomUUID()}.json`,
 );
+const QUALIFIED_FIXTURE_PATH = join(
+	tmpdir(),
+	`switchyard-dual-agy-qualified-${process.pid}-${randomUUID()}.json`,
+);
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 
+function withDispatchQualifiedDescriptors(roster) {
+	const testedAt = new Date().toISOString();
+	for (const [targetId, target] of Object.entries(roster.targets)) {
+		if (!target.enabled) continue;
+		for (const slots of Object.values(target.slots ?? {})) {
+			for (const slot of slots ?? []) {
+				if (slot.manual_only) continue;
+				const model = roster.models[slot.model_ref];
+				if (model?.status !== "active") continue;
+				const core = {
+					target_id: targetId,
+					model_ref: slot.model_ref,
+					selector: model.selector,
+					effort: slot.effort ?? null,
+					variant: slot.variant ?? null,
+					invocation_args: slot.invocation_args ?? [],
+				};
+				const descriptorIdentity = getInvocationDescriptorIdentity(
+					core,
+					target.harness,
+				);
+				target.qualifications ??= {};
+				target.qualifications[descriptorIdentity] = {
+					...core,
+					descriptor_identity: descriptorIdentity,
+					status: "dispatch_qualified",
+					tested_at: testedAt,
+					credential_profile: target.credential_profile,
+				};
+			}
+		}
+	}
+	return roster;
+}
+
 before(() => {
 	process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = SNAPSHOT_PATH;
-	process.env.SWITCHYARD_ROSTER_PATH = FIXTURE_PATH;
+	writeFileSync(
+		QUALIFIED_FIXTURE_PATH,
+		JSON.stringify(
+			withDispatchQualifiedDescriptors(
+				JSON.parse(readFileSync(FIXTURE_PATH, "utf8")),
+			),
+		),
+		"utf8",
+	);
+	process.env.SWITCHYARD_ROSTER_PATH = QUALIFIED_FIXTURE_PATH;
 	__resetRosterCacheForTests();
 });
 
@@ -81,6 +131,7 @@ after(() => {
 	__resetRosterCacheForTests();
 	try {
 		rmSync(SNAPSHOT_PATH, { force: true });
+		rmSync(QUALIFIED_FIXTURE_PATH, { force: true });
 	} catch {
 		// ignore
 	}
@@ -102,16 +153,31 @@ function removeSnapshot() {
 	}
 }
 
+function syntheticDescriptor({ targetId, model, harness }) {
+	const core = {
+		target_id: targetId,
+		model_ref: model,
+		selector: model,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	};
+	return validateInvocationDescriptor(
+		{
+			...core,
+			descriptor_identity: getInvocationDescriptorIdentity(core, harness),
+		},
+		harness,
+	);
+}
+
 describe("capability gate functions resolve each agy target INDEPENDENTLY (C.5/C.6)", () => {
 	it("getModelForCapability returns the CORRECT target's selector for each snapshot name", () => {
 		strictEqual(
 			getModelForCapability(ANTIGRAVITY_CLAUDE, "standard"),
 			"fixture-agy-claude-standard",
 		);
-		strictEqual(
-			getModelForCapability(ANTIGRAVITY, "standard"),
-			"fixture-agy-gemini-standard",
-		);
+		strictEqual(getModelForCapability(ANTIGRAVITY, "standard"), null);
 		notStrictEqual(
 			getModelForCapability(ANTIGRAVITY_CLAUDE, "standard"),
 			getModelForCapability(ANTIGRAVITY, "standard"),
@@ -124,17 +190,14 @@ describe("capability gate functions resolve each agy target INDEPENDENTLY (C.5/C
 			getRightSizedModel(ANTIGRAVITY_CLAUDE, "standard"),
 			"fixture-agy-claude-standard",
 		);
-		strictEqual(
-			getRightSizedModel(ANTIGRAVITY, "standard"),
-			"fixture-agy-gemini-standard",
-		);
+		strictEqual(getRightSizedModel(ANTIGRAVITY, "standard"), null);
 	});
 
 	it("getCapabilityClass / passesCapabilityFilter reflect each target's OWN technical_ceiling", () => {
 		strictEqual(getCapabilityClass(ANTIGRAVITY_CLAUDE), "standard");
-		strictEqual(getCapabilityClass(ANTIGRAVITY), "standard");
+		strictEqual(getCapabilityClass(ANTIGRAVITY), null);
 		strictEqual(passesCapabilityFilter(ANTIGRAVITY_CLAUDE, "standard"), true);
-		strictEqual(passesCapabilityFilter(ANTIGRAVITY, "standard"), true);
+		strictEqual(passesCapabilityFilter(ANTIGRAVITY, "standard"), false);
 		// Neither target's fixture qualifies a high slot -> both fail high.
 		strictEqual(passesCapabilityFilter(ANTIGRAVITY_CLAUDE, "high"), false);
 		strictEqual(passesCapabilityFilter(ANTIGRAVITY, "high"), false);
@@ -178,7 +241,7 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 		strictEqual(result.resolvedTargetId, "antigravity-claude");
 	});
 
-	it("routes to the Gemini bucket's model when IT has the most headroom (winner flips, model follows)", () => {
+	it("does not route to the Gemini bucket even when it has the most headroom", () => {
 		writeSnapshot([
 			{
 				name: ANTIGRAVITY_CLAUDE,
@@ -192,16 +255,14 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 			},
 		]);
 		const result = route({ requiredCapability: "standard" });
-		strictEqual(result.provider, ANTIGRAVITY);
-		strictEqual(result.model, "fixture-agy-gemini-standard");
-		strictEqual(result.resolvedTargetId, "antigravity");
+		strictEqual(result.provider, ANTIGRAVITY_CLAUDE);
+		strictEqual(result.model, "fixture-agy-claude-standard");
+		strictEqual(result.resolvedTargetId, "antigravity-claude");
 	});
 
-	it("both agy-harness snapshot entries are scored as independent candidates, not collapsed to one", () => {
-		// Both present and eligible -> both must appear in the routing log as
-		// distinct, independently-evaluated candidates (proves the scoring loop
-		// itself sees two entries, not that one shadows the other before scoring
-		// even starts).
+	it("an explicitly named Gemini snapshot is skipped without same-harness fallback", () => {
+		// The disabled exact target is diagnosed, but the enabled Claude target
+		// remains the sole automatic candidate.
 		writeSnapshot([
 			{
 				name: ANTIGRAVITY_CLAUDE,
@@ -227,9 +288,10 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 			`expected log to mention ${ANTIGRAVITY_CLAUDE}: ${result.log}`,
 		);
 		ok(mentionsGemini, `expected log to mention ${ANTIGRAVITY}: ${result.log}`);
+		strictEqual(result.provider, ANTIGRAVITY_CLAUDE);
 	});
 
-	it("blind fallback quarantines an ambiguous shared harness instead of choosing a target", () => {
+	it("blind fallback keeps the enabled agy target in the candidate order", () => {
 		removeSnapshot();
 		const result = route({ requiredCapability: "standard" });
 		ok(
@@ -243,34 +305,32 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 		strictEqual(result.provider, "claude");
 		strictEqual(result.resolvedTargetId, "claude-code");
 		ok(
-			result.log.some((line) =>
-				line.includes("ambiguous blind targets skipped: agy"),
-			),
-			`expected agy to be quarantined, got: ${result.log}`,
-		);
-		const agyOccurrences = (blindLine.match(/\bagy\b/g) ?? []).length;
-		strictEqual(
-			agyOccurrences,
-			0,
-			`ambiguous agy must not appear in blind candidates, got: ${blindLine}`,
+			blindLine.includes("agy"),
+			`expected agy in blind candidates, got: ${blindLine}`,
 		);
 	});
 
-	it("rejects a harness alias that maps to two enabled targets", () => {
-		strictEqual(resolveTargetIdentity("agy").ambiguous, true);
+	it("plain agy resolves to the separately enabled Claude target", () => {
+		strictEqual(resolveTargetIdentity("agy").ambiguous, false);
+		strictEqual(resolveTargetIdentity("agy").targetId, "antigravity-claude");
 		const result = route({
 			requiredCapability: "standard",
 			only: ["agy"],
 		});
-		strictEqual(result.provider, null);
-		strictEqual(result.resolvedTargetId, null);
-		strictEqual(result.reason, "ambiguous_target");
+		strictEqual(result.provider, "agy");
+		strictEqual(result.resolvedTargetId, "antigravity-claude");
 	});
 
-	it("routeBlind also fails closed for an ambiguous shared harness", () => {
+	it("routeBlind uses the enabled Claude target for a plain agy alias", () => {
 		const result = routeBlind(["agy"]);
+		strictEqual(result.provider, "agy");
+		strictEqual(result.resolvedTargetId, "antigravity-claude");
+	});
+
+	it("routeBlind rejects an exact disabled Gemini target without same-harness fallback", () => {
+		const result = routeBlind([ANTIGRAVITY]);
 		strictEqual(result.provider, null);
-		strictEqual(result.reason, "quarantine_unresolvable");
+		strictEqual(result.reason, "no_eligible_blind");
 	});
 
 	it("allows an exact target id to select only its shared-harness target", () => {
@@ -293,6 +353,22 @@ describe("route() gives each agy target independent candidacy (C.5/C.6)", () => 
 		strictEqual(result.provider, ANTIGRAVITY_CLAUDE);
 		strictEqual(result.resolvedTargetId, "antigravity-claude");
 	});
+
+	it("--only-provider cannot force the disabled Gemini target", () => {
+		writeSnapshot([
+			{
+				name: ANTIGRAVITY,
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }],
+			},
+		]);
+		const result = route({
+			requiredCapability: "standard",
+			only: ["antigravity"],
+		});
+		strictEqual(result.provider, null);
+		strictEqual(result.resolvedTargetId, null);
+	});
 });
 
 describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's OWN identity (C.8)", () => {
@@ -309,7 +385,7 @@ describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's
 		deepStrictEqual(resolveTargetProvenance(ANTIGRAVITY, "standard"), {
 			resolved_target: "antigravity",
 			resolved_harness: "agy",
-			resolved_selector: "fixture-agy-gemini-standard",
+			resolved_selector: null,
 			resolved_credential_profile: "gemini-profile",
 		});
 	});
@@ -329,17 +405,26 @@ describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's
 });
 
 describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selector per target (C.7 proof)", () => {
-	function makeAdapterContext({ provider, model }) {
+	function makeAdapterContext({ provider, model, targetId }) {
 		const executeCalls = [];
+		const descriptor = syntheticDescriptor({
+			targetId,
+			model,
+			harness: "agy",
+		});
 		return {
 			context: {
 				route: () => ({
 					provider,
 					model,
+					resolvedTargetId: targetId,
+					resolved_harness: "agy",
+					invocationDescriptor: descriptor,
 					percentLeft: 50,
 					reason: "spread",
 					log: [],
 				}),
+				resolveDescriptor: () => descriptor,
 				adapters: {
 					agy: {
 						execute: (_prompt, _containerName, opts) => {
@@ -350,6 +435,7 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 					},
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true }),
 				projectPath: "/tmp/does-not-matter",
 				workingContainerName: "test-container",
@@ -371,6 +457,7 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		const { context, executeCalls } = makeAdapterContext({
 			provider: ANTIGRAVITY_CLAUDE,
 			model: "fixture-agy-claude-standard",
+			targetId: "antigravity-claude",
 		});
 		const result = executeTask(TASK, context);
 		strictEqual(result.result, "success_no_diff");
@@ -382,6 +469,7 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		const { context, executeCalls } = makeAdapterContext({
 			provider: ANTIGRAVITY,
 			model: "fixture-agy-gemini-standard",
+			targetId: "antigravity",
 		});
 		const result = executeTask(TASK, context);
 		strictEqual(result.result, "success_no_diff");
@@ -389,18 +477,28 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		strictEqual(executeCalls[0].model, "fixture-agy-gemini-standard");
 	});
 
-	function makeOrchestratorContext({ provider, model }) {
+	function makeOrchestratorContext({ provider, model, targetId }) {
 		const launchCalls = [];
+		const descriptor = syntheticDescriptor({
+			targetId,
+			model,
+			harness: "agy",
+		});
 		return {
 			context: {
 				route: () => ({
 					provider,
 					model,
+					resolvedTargetId: targetId,
+					resolved_harness: "agy",
+					invocationDescriptor: descriptor,
 					percentLeft: 50,
 					reason: "spread",
 					log: [],
 				}),
+				resolveDescriptor: () => descriptor,
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true }),
 				projectPath: "/tmp/does-not-matter",
 				workingContainerName: "test-container",
@@ -422,6 +520,7 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		const { context, launchCalls } = makeOrchestratorContext({
 			provider: ANTIGRAVITY_CLAUDE,
 			model: "fixture-agy-claude-standard",
+			targetId: "antigravity-claude",
 		});
 		await executeTaskWithOrchestrator(TASK, context);
 		strictEqual(launchCalls.length, 1);
@@ -433,10 +532,41 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		const { context, launchCalls } = makeOrchestratorContext({
 			provider: ANTIGRAVITY,
 			model: "fixture-agy-gemini-standard",
+			targetId: "antigravity",
 		});
 		await executeTaskWithOrchestrator(TASK, context);
 		strictEqual(launchCalls.length, 1);
 		strictEqual(launchCalls[0].provider, ANTIGRAVITY);
 		strictEqual(launchCalls[0].model, "fixture-agy-gemini-standard");
+	});
+
+	it("review tasks use the normal high-capability route without a reviewer role flag", () => {
+		const routeCalls = [];
+		const { context } = makeAdapterContext({
+			provider: ANTIGRAVITY_CLAUDE,
+			model: "fixture-agy-claude-standard",
+			targetId: "antigravity-claude",
+		});
+		context.route = (options) => {
+			routeCalls.push(options);
+			return {
+				provider: ANTIGRAVITY_CLAUDE,
+				model: "fixture-agy-claude-standard",
+				percentLeft: 50,
+				reason: "spread",
+			};
+		};
+		executeTask(
+			{
+				...TASK,
+				type: "review",
+				requiredCapability: "high",
+				requiredCapabilityJustification:
+					"The review spans provider boundaries.",
+			},
+			context,
+		);
+		strictEqual(routeCalls[0].requiredCapability, "high");
+		strictEqual(Object.hasOwn(routeCalls[0], "reviewerRole"), false);
 	});
 });

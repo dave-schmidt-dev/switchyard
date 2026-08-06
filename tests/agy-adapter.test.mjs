@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { captureDiff, executeAgy } from "../src/switchyard/adapter/agy.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
@@ -24,6 +25,17 @@ const containerName = `switchyard-agy-adapter-${Date.now()}`;
 
 const AGY_MODEL = "Gemini 3.6 Flash (Medium)";
 const AGY_PROMPT = "apply a small change";
+const AGY_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "agy-target",
+		model_ref: AGY_MODEL,
+		selector: AGY_MODEL,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	},
+	"agy",
+);
 
 // Fake `agy` that ENFORCES the adapter's invocation shape: it exits non-zero
 // unless --new-project, --mode accept-edits, --dangerously-skip-permissions,
@@ -61,8 +73,8 @@ case " $* " in
   *) echo "stub: executeAgy did not pass --model ${AGY_MODEL}; args: $*" >&2; exit 3 ;;
 esac
 case " $* " in
-  *" --print ${AGY_PROMPT} ") ;;
-  *) echo "stub: executeAgy did not pass --print ${AGY_PROMPT} as the final args; args: $*" >&2; exit 3 ;;
+  *" ${AGY_PROMPT}"*) ;;
+  *) echo "stub: executeAgy did not pass ${AGY_PROMPT} in the guarded prompt; args: $*" >&2; exit 3 ;;
 esac
 echo updated >> test.txt
 echo agy
@@ -122,6 +134,10 @@ describe("agy adapter container execution", () => {
 		// itself the assertion that executeAgy sends them.
 		const result = executeAgy(AGY_PROMPT, containerName, {
 			model: AGY_MODEL,
+			resolvedTargetId: AGY_DESCRIPTOR.target_id,
+			descriptorHarness: "agy",
+			invocationDescriptor: AGY_DESCRIPTOR,
+			descriptorIdentity: AGY_DESCRIPTOR.descriptor_identity,
 		});
 		strictEqual(result.success, true, result.error);
 
@@ -129,6 +145,21 @@ describe("agy adapter container execution", () => {
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});
+});
+
+it("rejects unsupported invocation argv before Docker", () => {
+	const malformed = {
+		...AGY_DESCRIPTOR,
+		invocation_args: ["--effort", "high"],
+	};
+	const result = executeAgy(AGY_PROMPT, "unused-container", {
+		model: AGY_MODEL,
+		resolvedTargetId: AGY_DESCRIPTOR.target_id,
+		descriptorHarness: "agy",
+		invocationDescriptor: malformed,
+		descriptorIdentity: AGY_DESCRIPTOR.descriptor_identity,
+	});
+	strictEqual(result.success, false);
 });
 
 describe("agy adapter host-side timeout", () => {

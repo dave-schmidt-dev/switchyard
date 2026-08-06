@@ -17,12 +17,15 @@
 
 import { strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
+import {
+	__resetRosterCacheForTests,
+	getInvocationDescriptorIdentity,
+} from "../src/switchyard/roster/index.mjs";
 import { route } from "../src/switchyard/router/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -35,12 +38,60 @@ const SNAPSHOT_PATH = join(
 	tmpdir(),
 	`switchyard-router-rightsizing-${process.pid}-${randomUUID()}.json`,
 );
+const QUALIFIED_FIXTURE_PATH = join(
+	tmpdir(),
+	`switchyard-router-rightsizing-roster-${process.pid}-${randomUUID()}.json`,
+);
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 
+function withDispatchQualifiedDescriptors(roster) {
+	const testedAt = new Date().toISOString();
+	for (const [targetId, target] of Object.entries(roster.targets)) {
+		if (!target.enabled) continue;
+		for (const slots of Object.values(target.slots ?? {})) {
+			for (const slot of slots ?? []) {
+				if (slot.manual_only) continue;
+				const model = roster.models[slot.model_ref];
+				if (model?.status !== "active") continue;
+				const core = {
+					target_id: targetId,
+					model_ref: slot.model_ref,
+					selector: model.selector,
+					effort: slot.effort ?? null,
+					variant: slot.variant ?? null,
+					invocation_args: slot.invocation_args ?? [],
+				};
+				const descriptorIdentity = getInvocationDescriptorIdentity(
+					core,
+					target.harness,
+				);
+				target.qualifications ??= {};
+				target.qualifications[descriptorIdentity] = {
+					...core,
+					descriptor_identity: descriptorIdentity,
+					status: "dispatch_qualified",
+					tested_at: testedAt,
+					credential_profile: target.credential_profile,
+				};
+			}
+		}
+	}
+	return roster;
+}
+
 before(() => {
 	process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = SNAPSHOT_PATH;
-	process.env.SWITCHYARD_ROSTER_PATH = FIXTURE_PATH;
+	writeFileSync(
+		QUALIFIED_FIXTURE_PATH,
+		JSON.stringify(
+			withDispatchQualifiedDescriptors(
+				JSON.parse(readFileSync(FIXTURE_PATH, "utf8")),
+			),
+		),
+		"utf8",
+	);
+	process.env.SWITCHYARD_ROSTER_PATH = QUALIFIED_FIXTURE_PATH;
 	__resetRosterCacheForTests();
 });
 
@@ -54,6 +105,7 @@ after(() => {
 	__resetRosterCacheForTests();
 	try {
 		rmSync(SNAPSHOT_PATH, { force: true });
+		rmSync(QUALIFIED_FIXTURE_PATH, { force: true });
 	} catch {
 		// Ignore
 	}

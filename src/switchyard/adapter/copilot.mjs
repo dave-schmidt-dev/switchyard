@@ -2,7 +2,16 @@ import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { killOrphanedProcesses } from "./orphan-kill.mjs";
+import { validateAdapterInvocation } from "./invocation.mjs";
+import {
+	killOrphanedProcesses,
+	killOrphanedProcessesAsync,
+} from "./orphan-kill.mjs";
+import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
+import {
+	captureProviderDiffAsync,
+	executeProviderInvocation,
+} from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const COPILOT_CMD = "copilot";
@@ -42,9 +51,19 @@ export function isCopilotAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 
 export function execute(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+	try {
+		validateAdapterInvocation(options, {
+			expectedHarness: "copilot",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
@@ -70,7 +89,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 
 	try {
 		const result = execFileSync("docker", args, {
-			input: prompt,
+			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeoutMs,
@@ -105,6 +124,50 @@ export function execute(prompt, workingContainerName, options = {}) {
 	}
 }
 
+/** Async counterpart used by non-blocking queue workers. */
+export async function executeAsync(prompt, workingContainerName, options = {}) {
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		signal,
+		onPoll,
+	} = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+		validateAdapterInvocation(options, {
+			expectedHarness: "copilot",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
+		const args = [
+			"exec",
+			"-i",
+			"-w",
+			"/project",
+			workingContainerName,
+			COPILOT_CMD,
+			"-s",
+			"--no-ask-user",
+		];
+		if (model) {
+			validateModelArg(model, "model");
+			args.push("--model", model);
+		}
+		return await executeProviderInvocation("docker", args, {
+			...options,
+			provider: "copilot",
+			input: guardedPrompt,
+			timeoutMs,
+			signal,
+			onPoll,
+			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+		});
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+}
+
 export function captureDiff(workingContainerName) {
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
@@ -131,8 +194,17 @@ export function captureDiff(workingContainerName) {
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return diff.trim() || null;
+		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
 	}
+}
+
+export function captureDiffAsync(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return Promise.resolve(null);
+	}
+	return captureProviderDiffAsync(workingContainerName, options);
 }

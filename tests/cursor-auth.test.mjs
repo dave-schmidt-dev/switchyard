@@ -34,6 +34,17 @@ describe("cursor adapter shell injection guard", () => {
 	it("rejects model name with shell metacharacters", () => {
 		const result = executeCursor("do something", "valid-container", {
 			model: "composer-2.5; echo INJECTED",
+			resolvedTargetId: "cursor-target",
+			descriptorHarness: "cursor",
+			invocationDescriptor: {
+				target_id: "cursor-target",
+				model_ref: "composer-2.5; echo INJECTED",
+				selector: "composer-2.5; echo INJECTED",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			descriptorIdentity: `sha256:${"0".repeat(64)}`,
 		});
 		strictEqual(result.success, false);
 		ok(

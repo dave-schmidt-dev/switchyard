@@ -1,9 +1,7 @@
-// Classifier module - lightweight task-capability classifier
-// CR-5: The per-task required capability is assigned by a lightweight
-// classifier since implement-protocol assigns capabilities at Phase-3 runtime,
-// not board-build.
-//
-// Conservative default: unknown capability => high-capability only
+// Classifier module - legacy keyword-based task-capability classifier.
+// New task-contract records default an omitted RequiredCapability to standard
+// in the runner/router. This helper remains available for older callers that
+// still classify descriptions directly, preserving their high/low behavior.
 
 import { CAPABILITY_CLASS } from "./index.mjs";
 
@@ -191,7 +189,7 @@ export function classifyTask(description) {
 		return CAPABILITY_CLASS.low;
 	}
 
-	// Conservative default: no recognized signal at all => high-capability only.
+	// Legacy default: no recognized signal at all => high-capability only.
 	return CAPABILITY_CLASS.high;
 }
 

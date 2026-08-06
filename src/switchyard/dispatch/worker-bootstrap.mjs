@@ -54,6 +54,33 @@ try {
 // lost. Chaining on fire order (not completion order) fixes that. It always
 // resolves (never rejects), so awaiting it anywhere is safe and bounded.
 let writeChain = Promise.resolve();
+let writeFailureCount = 0;
+let lastWriteFailure = null;
+
+function safeWriteFailure(error) {
+	writeFailureCount += 1;
+	// Keep diagnostics categorical and scalar; Error.message can contain host
+	// paths or provider-generated text and must not cross the telemetry boundary.
+	const categories = {
+		RevisionError: "revision_conflict",
+		SchemaError: "schema_invalid",
+		LockError: "lock_error",
+		TypeError: "type_error",
+		Error: "write_failed",
+	};
+	const name = typeof error?.name === "string" ? error.name : "";
+	lastWriteFailure = Object.hasOwn(categories, name)
+		? categories[name]
+		: "write_failed";
+	console.error("worker-bootstrap: run-store write failed");
+}
+
+function queueWrite(fn) {
+	writeChain = writeChain.then(fn, fn).catch((error) => {
+		safeWriteFailure(error);
+	});
+	return writeChain;
+}
 
 async function writeFatalEvent(error) {
 	try {
@@ -135,6 +162,17 @@ try {
 		);
 		process.exit(3);
 	}
+	if (
+		run.dispatchContractVersion !== undefined &&
+		run.dispatchContractVersion !== 1
+	) {
+		await writeFatalEvent(
+			new Error(
+				`unsupported dispatch descriptor contract version: ${run.dispatchContractVersion}`,
+			),
+		);
+		process.exit(5);
+	}
 
 	const currentFingerprint = captureCurrentFingerprint(run.projectPath);
 	if (
@@ -174,10 +212,10 @@ try {
 	// `recover` command, and the SIGTERM/SIGINT owned-container cleanup handler
 	// in the runner — none of which run concurrently with a foreign live run.
 
-	const { runQueue: runQueueFn } = await import("../runner/index.mjs");
+	const { runQueueAsync: runQueueFn } = await import("../runner/index.mjs");
 	const persistedRunOptions = run.runOptions ?? null;
 
-	const result = runQueueFn({
+	const result = await runQueueFn({
 		tasksFilePath: run.tasksFilePath,
 		projectPath: run.projectPath,
 		maxTasks: persistedRunOptions?.maxTasks ?? Number.POSITIVE_INFINITY,
@@ -230,8 +268,11 @@ try {
 					runStore.updateRunWithRetry(runId, {
 						activeTaskId: task.id,
 						activeTaskStartedAt: Date.now(),
+						activeTaskElapsedMs: 0,
+						activeTaskHeartbeatAt: Date.now(),
+						activeTaskProcessPhase: "starting",
 					});
-				writeChain = writeChain.then(fn, fn).catch(() => {});
+				queueWrite(fn);
 			},
 			onTaskRouted: (info) => {
 				const fn = () =>
@@ -243,8 +284,26 @@ try {
 						snapshotMtime: info.snapshotMtime ?? null,
 						snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
 						resolvedTargetId: info.resolvedTargetId ?? null,
+						activeTaskInvocationDescriptor: info.invocationDescriptor ?? null,
+						activeTaskDescriptorIdentity: info.descriptorIdentity ?? null,
+						activeTaskDescriptorHarness: info.descriptorHarness ?? null,
+						dispatchContractVersion: info.dispatchContractVersion ?? 1,
+						activeTaskElapsedMs: 0,
+						activeTaskHeartbeatAt: Date.now(),
+						activeTaskProcessPhase: "routed",
 					});
-				writeChain = writeChain.then(fn, fn).catch(() => {});
+				queueWrite(fn);
+			},
+			onTaskHeartbeat: (info) => {
+				const fn = () =>
+					runStore.updateRunWithRetry(runId, {
+						activeTaskElapsedMs: Number.isFinite(info.elapsedMs)
+							? Math.max(0, info.elapsedMs)
+							: 0,
+						activeTaskHeartbeatAt: Date.now(),
+						activeTaskProcessPhase: "provider_running",
+					});
+				queueWrite(fn);
 			},
 			onResult: (r) => {
 				const safeFailure = sanitizeFailureMetadata(r);
@@ -256,6 +315,11 @@ try {
 							taskId: r.taskId,
 							provider: r.provider ?? null,
 							model: r.model ?? null,
+							invocationDescriptor: r.invocationDescriptor ?? null,
+							descriptorIdentity: r.descriptorIdentity ?? null,
+							descriptorHarness: r.descriptorHarness ?? null,
+							resolvedTargetId: r.resolvedTargetId ?? null,
+							dispatchContractVersion: r.dispatchContractVersion ?? 1,
 						}
 					: {
 							phase: "execution",
@@ -265,6 +329,11 @@ try {
 							provider: r.provider ?? null,
 							model: r.model ?? null,
 							result: r.result,
+							invocationDescriptor: r.invocationDescriptor ?? null,
+							descriptorIdentity: r.descriptorIdentity ?? null,
+							descriptorHarness: r.descriptorHarness ?? null,
+							resolvedTargetId: r.resolvedTargetId ?? null,
+							dispatchContractVersion: r.dispatchContractVersion ?? 1,
 							...(safeFailure ?? {}),
 						};
 				const fn = () =>
@@ -274,10 +343,20 @@ try {
 							activeTaskProvider: null,
 							activeTaskModel: null,
 							activeTaskDeadline: null,
+							activeTaskElapsedMs: null,
+							activeTaskHeartbeatAt: null,
+							activeTaskProcessPhase: null,
 							snapshotStatus: null,
 							snapshotMtime: null,
 							snapshotAgeMsAtRoute: null,
 							resolvedTargetId: null,
+							lastResolvedTargetId: r.resolvedTargetId ?? null,
+							lastTaskInvocationDescriptor: r.invocationDescriptor ?? null,
+							lastTaskDescriptorIdentity: r.descriptorIdentity ?? null,
+							lastTaskDescriptorHarness: r.descriptorHarness ?? null,
+							activeTaskInvocationDescriptor: null,
+							activeTaskDescriptorIdentity: null,
+							activeTaskDescriptorHarness: null,
 							...(safeFailure ? { lastFailure: safeFailure } : {}),
 							// Only a successful task advances lastCompletionAt — a
 							// failure must leave the run record's existing value
@@ -286,7 +365,7 @@ try {
 							...(r.success ? { lastCompletionAt: Date.now() } : {}),
 						}),
 					);
-				writeChain = writeChain.then(fn, fn).catch(() => {});
+				queueWrite(fn);
 
 				// Surface a timeout's partial diff through the run's existing
 				// (already-provisioned, previously-unused) artifacts channel so
@@ -309,7 +388,7 @@ try {
 			},
 			onCheckpointSaved: () => {
 				const fn = () => runStore.updateRunWithRetry(runId, {});
-				writeChain = writeChain.then(fn, fn).catch(() => {});
+				queueWrite(fn);
 			},
 			onRetryStateChanged: (projection) => {
 				// The checkpoint is authoritative. This is only a sanitized
@@ -317,29 +396,36 @@ try {
 				// crash cannot hide a transition if this asynchronous write loses
 				// the race with worker termination.
 				const fn = () => runStore.updateRunWithRetry(runId, projection);
-				writeChain = writeChain.then(fn, fn).catch(() => {});
+				queueWrite(fn);
 			},
 			onContainerReady: (info) => {
 				const fn = () =>
 					runStore.updateRunWithRetry(runId, {
 						workingContainerName: info.workingContainerName,
 					});
-				writeChain = writeChain.then(fn, fn).catch(() => {});
+				queueWrite(fn);
 			},
 		},
 	});
 
 	const failed = result.results.filter((r) => !r.success);
-	const terminalPatch = {
+	const terminalPatchBase = {
 		state: failed.length > 0 ? "failed" : "succeeded",
 		activeTaskId: null,
 		activeTaskProvider: null,
 		activeTaskModel: null,
 		activeTaskDeadline: null,
+		activeTaskStartedAt: null,
+		activeTaskElapsedMs: null,
+		activeTaskHeartbeatAt: null,
+		activeTaskProcessPhase: null,
 		snapshotStatus: null,
 		snapshotMtime: null,
 		snapshotAgeMsAtRoute: null,
 		resolvedTargetId: null,
+		activeTaskInvocationDescriptor: null,
+		activeTaskDescriptorIdentity: null,
+		activeTaskDescriptorHarness: null,
 		cleanupState: "complete",
 		terminalSummary: {
 			totalTasks: result.totalTasks,
@@ -361,6 +447,15 @@ try {
 	// overwrite this run's real terminal outcome with a zeroed failure
 	// placeholder. writeChain always resolves, so this await is bounded.
 	await writeChain;
+	const terminalPatch = {
+		...terminalPatchBase,
+		...(writeFailureCount > 0
+			? {
+					telemetryWriteFailures: writeFailureCount,
+					lastTelemetryWriteFailure: lastWriteFailure,
+				}
+			: {}),
+	};
 
 	try {
 		// The terminal write carries the authoritative outcome, but it can lose
@@ -405,10 +500,23 @@ try {
 				activeTaskProvider: null,
 				activeTaskModel: null,
 				activeTaskDeadline: null,
+				activeTaskStartedAt: null,
+				activeTaskElapsedMs: null,
+				activeTaskHeartbeatAt: null,
+				activeTaskProcessPhase: null,
 				snapshotStatus: null,
 				snapshotMtime: null,
 				snapshotAgeMsAtRoute: null,
 				resolvedTargetId: null,
+				activeTaskInvocationDescriptor: null,
+				activeTaskDescriptorIdentity: null,
+				activeTaskDescriptorHarness: null,
+				...(writeFailureCount > 0
+					? {
+							telemetryWriteFailures: writeFailureCount,
+							lastTelemetryWriteFailure: lastWriteFailure,
+						}
+					: {}),
 				cleanupState: "complete",
 				terminalSummary: {
 					totalTasks: 0,

@@ -9,6 +9,7 @@ import {
 	executeCodex,
 	isCodexAuthenticated,
 } from "../src/switchyard/adapter/codex.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 function hasDocker() {
 	try {
@@ -20,6 +21,17 @@ function hasDocker() {
 }
 
 const dockerAvailable = hasDocker();
+const CODEX_SHAPE_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "codex-shape-target",
+		model_ref: "gpt-4o",
+		selector: "gpt-4o",
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	},
+	"codex",
+);
 
 describe("codex adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -34,6 +46,17 @@ describe("codex adapter shell injection guard", () => {
 	it("rejects model name with shell metacharacters", () => {
 		const result = executeCodex("do something", "valid-container", {
 			model: "gpt-4; echo INJECTED",
+			resolvedTargetId: "codex-target",
+			descriptorHarness: "codex",
+			invocationDescriptor: {
+				target_id: "codex-target",
+				model_ref: "gpt-4; echo INJECTED",
+				selector: "gpt-4; echo INJECTED",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			descriptorIdentity: `sha256:${"0".repeat(64)}`,
 		});
 		strictEqual(result.success, false);
 		ok(
@@ -119,7 +142,13 @@ describe("codex adapter invocation shape (real container)", () => {
 				{ stdio: "pipe" },
 			);
 
-			const result = executeCodex("do something", containerName, {});
+			const result = executeCodex("do something", containerName, {
+				model: "gpt-4o",
+				resolvedTargetId: CODEX_SHAPE_DESCRIPTOR.target_id,
+				descriptorHarness: "codex",
+				invocationDescriptor: CODEX_SHAPE_DESCRIPTOR,
+				descriptorIdentity: CODEX_SHAPE_DESCRIPTOR.descriptor_identity,
+			});
 			strictEqual(result.success, true, result.error);
 			ok(
 				!result.output.includes("MISSING_EXEC_SUBCOMMAND"),

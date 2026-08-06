@@ -13,7 +13,16 @@ import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { killOrphanedProcesses } from "./orphan-kill.mjs";
+import { validateAdapterInvocation } from "./invocation.mjs";
+import {
+	killOrphanedProcesses,
+	killOrphanedProcessesAsync,
+} from "./orphan-kill.mjs";
+import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
+import {
+	captureProviderDiffAsync,
+	executeProviderInvocation,
+} from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const AGY_CMD = "agy";
@@ -121,9 +130,19 @@ export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  */
 export function executeAgy(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+	try {
+		validateAdapterInvocation(options, {
+			expectedHarness: "agy",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
@@ -153,7 +172,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 		"--print-timeout",
 		"9m",
 		"--print",
-		prompt,
+		guardedPrompt,
 	);
 
 	try {
@@ -199,6 +218,62 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 	}
 }
 
+/** Async counterpart used by non-blocking queue workers. */
+export async function executeAgyAsync(
+	prompt,
+	workingContainerName,
+	options = {},
+) {
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		signal,
+		onPoll,
+	} = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+		validateAdapterInvocation(options, {
+			expectedHarness: "agy",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
+		const args = [
+			"exec",
+			"-w",
+			"/project",
+			workingContainerName,
+			AGY_CMD,
+			"--new-project",
+			"--mode",
+			"accept-edits",
+			"--dangerously-skip-permissions",
+		];
+		if (model) {
+			validateModelArg(model, "model");
+			args.push("--model", model);
+		}
+		args.push(
+			"--add-dir",
+			"/project",
+			"--print-timeout",
+			"9m",
+			"--print",
+			guardedPrompt,
+		);
+		return await executeProviderInvocation("docker", args, {
+			...options,
+			provider: "agy",
+			timeoutMs,
+			signal,
+			onPoll,
+			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+		});
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+}
+
 /**
  * Capture the diff produced by Agy in the working container.
  * @param {string} workingContainerName Working container name
@@ -238,8 +313,17 @@ export function captureDiff(workingContainerName) {
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return diff.trim() || null;
+		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
 	}
+}
+
+export function captureDiffAsync(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return Promise.resolve(null);
+	}
+	return captureProviderDiffAsync(workingContainerName, options);
 }

@@ -12,6 +12,7 @@ import { readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import {
 	acquireLaunchLock,
 	acquireProjectLock,
@@ -1496,6 +1497,84 @@ describe("validateRun type checks for telemetry fields", () => {
 		strictEqual(typed.activeTaskStartedAt, 1000);
 		strictEqual(typed.lastCompletionAt, 2000);
 		strictEqual(typed.workingContainerName, "container-abc");
+	});
+
+	it("rejects unrecognized telemetry write-failure labels", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		await rejects(
+			updateRun(
+				opts.runId,
+				{ lastTelemetryWriteFailure: "/private/path/SECRET" },
+				snapshot.revision,
+			),
+			SchemaError,
+		);
+		const valid = await updateRun(
+			opts.runId,
+			{ lastTelemetryWriteFailure: "revision_conflict" },
+			snapshot.revision,
+		);
+		strictEqual(valid.lastTelemetryWriteFailure, "revision_conflict");
+	});
+});
+
+describe("descriptor receipt harness binding", () => {
+	it("rejects forged Claude provenance and accepts the enabled Agy Sonnet target", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		// Empty argv is valid for both harnesses, so this identity is deliberately
+		// recomputed for Claude. The rejection below must therefore come from the
+		// current roster's antigravity -> agy target provenance, not a hash mismatch.
+		const forgedClaudeDescriptor = validateInvocationDescriptor(
+			{
+				target_id: "antigravity",
+				model_ref: "google/fixture",
+				selector: "fixture-gemini",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"claude",
+		);
+
+		await rejects(
+			updateRun(
+				opts.runId,
+				{
+					resolvedTargetId: "antigravity",
+					activeTaskInvocationDescriptor: forgedClaudeDescriptor,
+					activeTaskDescriptorIdentity:
+						forgedClaudeDescriptor.descriptor_identity,
+					activeTaskDescriptorHarness: "claude",
+				},
+				snapshot.revision,
+			),
+			SchemaError,
+		);
+
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "antigravity-claude",
+				model_ref: "google/fixture",
+				selector: "fixture-gemini",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"agy",
+		);
+		const accepted = await updateRun(
+			opts.runId,
+			{
+				resolvedTargetId: "antigravity-claude",
+				activeTaskInvocationDescriptor: descriptor,
+				activeTaskDescriptorIdentity: descriptor.descriptor_identity,
+				activeTaskDescriptorHarness: "agy",
+			},
+			snapshot.revision,
+		);
+		strictEqual(accepted.activeTaskDescriptorHarness, "agy");
 	});
 });
 

@@ -41,6 +41,7 @@ import {
 	CAPABILITY_CLASS_ORDER,
 	filterByCapability,
 	getCapabilityClass,
+	getInvocationDescriptor,
 	getModelForCapability,
 	getRightSizedModel,
 	PROVIDER_CAPABILITIES,
@@ -113,9 +114,9 @@ describe("capability match", () => {
 			PROVIDER_CAPABILITIES.opencode.capability_class,
 			CAPABILITY_CLASS.low,
 		);
-		// vibe is enabled:false in the fixture -> excluded from auto-routing
-		// at every tier, not merely capped low.
-		strictEqual(PROVIDER_CAPABILITIES.vibe.capability_class, null);
+		// Disabled targets are omitted from the automatic capability map rather
+		// than represented as a null-capability entry.
+		strictEqual(PROVIDER_CAPABILITIES.vibe, undefined);
 	});
 
 	it("should get capability class for provider", () => {
@@ -141,6 +142,11 @@ describe("capability match", () => {
 			getRightSizedModel("codex", "standard"),
 			"fixture-codex-standard",
 		);
+	});
+
+	it("does not authorize a new automatic descriptor from selector-only legacy qualifications", () => {
+		strictEqual(getInvocationDescriptor("claude", "high"), null);
+		strictEqual(getInvocationDescriptor("codex", "high"), null);
 	});
 
 	it("should pass capability filter for sufficient providers", () => {

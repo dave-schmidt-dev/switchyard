@@ -112,6 +112,24 @@ describe("integration gate", () => {
 		);
 	});
 
+	for (const trailingNewlines of [1, 2]) {
+		it(`preserves ${trailingNewlines} valid trailing newline(s) when normalizing`, () => {
+			const diff = buildDiff(projectPath, (dir) => {
+				writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
+			});
+			execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
+			const body = diff.replace(/\n+$/u, "");
+			const patch = `${body}${"\n".repeat(trailingNewlines)}`;
+
+			const result = integrationGate(patch, projectPath);
+			strictEqual(result.success, true, result.message);
+			strictEqual(
+				readFileSync(join(projectPath, "test.txt"), "utf8"),
+				"modified content\n",
+			);
+		});
+	}
+
 	it("applies a diff that CREATES a new file, landing it on the host (captureDiff new-file regression)", () => {
 		// captureDiff now stages (`git add -A`) before diffing so newly created
 		// files are captured — the most common agent output. A new-file diff must
@@ -988,6 +1006,53 @@ describe("Files allowlist enforcement", () => {
 		});
 		strictEqual(result.success, false);
 		strictEqual(result.requiresReview, true);
+	});
+
+	it("rejects undeclared package-lock artifacts while preserving the exact Files allowlist", () => {
+		commitFile(projectPath, "package-lock.json", '{"lockfileVersion":3}\n');
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(
+				join(dir, "package-lock.json"),
+				'{"lockfileVersion":3,"packages":{}}\n',
+				"utf8",
+			);
+			writeFileSync(join(dir, "test.txt"), "declared source change\n", "utf8");
+		});
+		execSync("git checkout -- package-lock.json", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		execSync("git checkout -- test.txt", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			requiredPaths: ["test.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		ok(result.extraPaths.includes("package-lock.json"));
+	});
+
+	it("requires review for a lockfile even without an explicit Files allowlist", () => {
+		commitFile(projectPath, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(
+				join(dir, "pnpm-lock.yaml"),
+				"lockfileVersion: '9.0'\nimporters: {}\n",
+				"utf8",
+			);
+		});
+		execSync("git checkout -- pnpm-lock.yaml", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath);
+		strictEqual(result.success, false);
+		strictEqual(result.requiresReview, true);
+		ok(result.sensitivePaths.includes("pnpm-lock.yaml"));
 	});
 
 	it("manifest path passes AllowManifests: true plus Files: together", () => {

@@ -12,7 +12,16 @@ import { execFileSync } from "node:child_process";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { killOrphanedProcesses } from "./orphan-kill.mjs";
+import { validateAdapterInvocation } from "./invocation.mjs";
+import {
+	killOrphanedProcesses,
+	killOrphanedProcessesAsync,
+} from "./orphan-kill.mjs";
+import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
+import {
+	captureProviderDiffAsync,
+	executeProviderInvocation,
+} from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CODEX_CMD = "codex";
@@ -97,9 +106,20 @@ export function isCodexAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  */
 export function executeCodex(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
+	}
+	let invocationArgs;
+	try {
+		invocationArgs = validateAdapterInvocation(options, {
+			expectedHarness: "codex",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
@@ -111,6 +131,9 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 		"/project",
 		workingContainerName,
 		CODEX_CMD,
+		// Codex global `-c key=value` options must precede the `exec`
+		// subcommand. Forward the descriptor's exact argv at this fixed position.
+		...invocationArgs,
 		// Codex's own `exec` subcommand, required for non-interactive dispatch —
 		// `codex` bare forwards straight to the interactive TUI regardless of
 		// whether stdout is a TTY (unlike `claude`, which auto-detects piped
@@ -142,7 +165,7 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 
 	try {
 		const result = execFileSync("docker", args, {
-			input: prompt,
+			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeoutMs,
@@ -174,6 +197,55 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 			errorKind: described.errorKind,
 			timedOut,
 		};
+	}
+}
+
+/** Async counterpart used by non-blocking queue workers. */
+export async function executeCodexAsync(
+	prompt,
+	workingContainerName,
+	options = {},
+) {
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		signal,
+		onPoll,
+	} = options;
+	const guardedPrompt = addProviderPromptGuardrail(prompt);
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+		const invocationArgs = validateAdapterInvocation(options, {
+			expectedHarness: "codex",
+			expectedTargetId: options.resolvedTargetId,
+			expectedModel: model,
+		});
+		const args = [
+			"exec",
+			"-i",
+			"-w",
+			"/project",
+			workingContainerName,
+			CODEX_CMD,
+			...invocationArgs,
+			"exec",
+			"--dangerously-bypass-approvals-and-sandbox",
+		];
+		if (model) {
+			validateModelArg(model, "model");
+			args.push("--model", model);
+		}
+		return await executeProviderInvocation("docker", args, {
+			...options,
+			provider: "codex",
+			input: guardedPrompt,
+			timeoutMs,
+			signal,
+			onPoll,
+			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+		});
+	} catch (error) {
+		return { output: "", success: false, error: error.message };
 	}
 }
 
@@ -216,8 +288,17 @@ export function captureDiff(workingContainerName) {
 			],
 			{ encoding: "utf8", stdio: "pipe" },
 		);
-		return diff.trim() || null;
+		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
 	}
+}
+
+export function captureDiffAsync(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return Promise.resolve(null);
+	}
+	return captureProviderDiffAsync(workingContainerName, options);
 }

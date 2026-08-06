@@ -34,6 +34,17 @@ describe("agy adapter shell injection guard", () => {
 	it("rejects model name with shell metacharacters", () => {
 		const result = executeAgy("do something", "valid-container", {
 			model: "Gemini 3.6 Flash; echo INJECTED",
+			resolvedTargetId: "agy-target",
+			descriptorHarness: "agy",
+			invocationDescriptor: {
+				target_id: "agy-target",
+				model_ref: "Gemini 3.6 Flash; echo INJECTED",
+				selector: "Gemini 3.6 Flash; echo INJECTED",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			descriptorIdentity: `sha256:${"0".repeat(64)}`,
 		});
 		strictEqual(result.success, false);
 		ok(

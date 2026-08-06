@@ -10,7 +10,8 @@
 		"test:other": "files=\"\"; for f in tests/*.test.mjs; do case \"$f\" in tests/dispatch-cli.test.mjs|tests/lifecycle-recovery.test.mjs|tests/detached-dispatch.test.mjs) ;; *) files=\"$files $f\";; esac; done; node --test $files",
 		"lint": "biome check .",
 		"deadcode": "knip",
-		"validate": "npm run lint && npm run deadcode && npm run test",
+		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",
+		"validate": "npm run lint && npm run deadcode && npm run test && npm run roster:coherence",
 		"auth": "node src/switchyard/auth/index.mjs",
 		"auth:check": "node src/switchyard/auth/index.mjs --check",
 		"dispatch": "node src/switchyard/dispatch/index.mjs"

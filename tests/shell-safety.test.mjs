@@ -1,6 +1,9 @@
 import assert from "node:assert";
 import test from "node:test";
-import { validateModelArg } from "../src/switchyard/adapter/shell-safety.mjs";
+import {
+	validateInvocationArgs,
+	validateModelArg,
+} from "../src/switchyard/adapter/shell-safety.mjs";
 
 test("validateModelArg - rejects leading dash", () => {
 	// Single leading dash
@@ -77,5 +80,28 @@ test("validateModelArg - rejects non-string types", () => {
 		() => validateModelArg({}, "model"),
 		/must be a non-empty string/,
 		"should reject object",
+	);
+});
+
+test("validateInvocationArgs - rejects unapproved flags", () => {
+	assert.throws(
+		() => validateInvocationArgs(["--dangerous", "yes"], "codex"),
+		/unapproved|must be/,
+	);
+});
+
+test("validateInvocationArgs - rejects an approved flag with a bad value", () => {
+	assert.throws(
+		() =>
+			validateInvocationArgs(["-c", "model_reasoning_effort=turbo"], "codex"),
+		/must be/,
+	);
+});
+
+test("validateInvocationArgs - rejects a correctly-shaped pair in reversed positions", () => {
+	assert.throws(
+		() =>
+			validateInvocationArgs(["model_reasoning_effort=xhigh", "-c"], "codex"),
+		/must be/,
 	);
 });

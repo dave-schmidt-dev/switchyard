@@ -5,28 +5,43 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { captureDiff as captureAgyDiff, executeAgy } from "../adapter/agy.mjs";
+import {
+	captureDiff as captureAgyDiff,
+	captureDiffAsync as captureAgyDiffAsync,
+	executeAgy,
+	executeAgyAsync,
+} from "../adapter/agy.mjs";
 import {
 	captureDiff as captureClaudeDiff,
+	captureDiffAsync as captureClaudeDiffAsync,
 	executeClaude,
+	executeClaudeAsync,
 } from "../adapter/claude.mjs";
 import {
 	captureDiff as captureCodexDiff,
+	captureDiffAsync as captureCodexDiffAsync,
 	executeCodex,
+	executeCodexAsync,
 } from "../adapter/codex.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../adapter/constants.mjs";
 import {
 	captureDiff as captureCopilotDiff,
+	captureDiffAsync as captureCopilotDiffAsync,
 	execute as executeCopilot,
+	executeAsync as executeCopilotAsync,
 } from "../adapter/copilot.mjs";
 import {
 	captureDiff as captureCursorDiff,
+	captureDiffAsync as captureCursorDiffAsync,
 	executeCursor,
+	executeCursorAsync,
 } from "../adapter/cursor.mjs";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import {
 	captureDiff as captureOpencodeDiff,
+	captureDiffAsync as captureOpencodeDiffAsync,
 	execute as executeOpencode,
+	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
 import {
 	AGENT_IMAGE,
@@ -36,7 +51,11 @@ import {
 	startAgentContainer,
 } from "../container/index.mjs";
 import { integrationGate } from "../integrate/index.mjs";
-import { recordDispatch, recordDispatchToStore } from "../ledger/index.mjs";
+import {
+	recordDispatch,
+	recordDispatchIntentToStore,
+	recordDispatchToStore,
+} from "../ledger/index.mjs";
 import {
 	commitWorkingTree,
 	createWorkingContainer,
@@ -46,10 +65,13 @@ import {
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
-import { classifyTask, isValidCapabilityClass } from "../roster/classifier.mjs";
+import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
+	getInvocationDescriptor,
 	normalizeProviderName,
 	resolveRouteProvenance,
+	resolveTargetIdentity,
+	validateInvocationDescriptor,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
 
@@ -85,6 +107,12 @@ export function ensureAgentContainer(deps = {}) {
 const CHECKPOINT_VERSION = 2;
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
+// Versioned contract shared by the host runner, detached worker, and any
+// external headless orchestrator.  Keep this independent from the run-store
+// schema so a durable record can remain readable while the wire contract
+// evolves.
+export const ORCHESTRATOR_PAYLOAD_VERSION = 1;
+export const DISPATCH_DESCRIPTOR_CONTRACT_VERSION = 1;
 const TERMINAL_JOB_STATES = new Set([
 	"done",
 	"expired",
@@ -341,7 +369,10 @@ export function validateTaskSelection(
 			.trim()
 			.toLowerCase();
 		if (done.has(taskId) || status === "done") {
-			throw new TaskSelectionError(taskId, "completed-task");
+			// An exact selection of a task that is already complete is a
+			// terminal no-op. The queue reconciles an `already_complete`
+			// result without routing it to a provider.
+			continue;
 		}
 		if (task.executor === "native") {
 			throw new TaskSelectionError(taskId, "native-task");
@@ -370,6 +401,95 @@ export function validateTaskSelection(
 	}
 
 	return selected;
+}
+
+function alreadyCompleteSelectionResults(tasks, checkpoint, selectedTaskIds) {
+	const selected = normalizeIds(selectedTaskIds, "task selection");
+	if (selected.length === 0) return [];
+	const done = new Set(checkpoint?.completedTaskIds ?? []);
+	for (const task of tasks) {
+		if (
+			String(task.status ?? "")
+				.trim()
+				.toLowerCase() === "done"
+		) {
+			done.add(task.id);
+		}
+	}
+	return selected
+		.filter((taskId) => done.has(taskId))
+		.map((taskId) => ({
+			taskId,
+			success: true,
+			provider: null,
+			model: null,
+			result: "already_complete",
+			reason:
+				"Task is already successfully complete; no provider dispatch was needed.",
+		}));
+}
+
+function reconcileAlreadyCompleteSelection(
+	checkpoint,
+	checkpointPath,
+	results,
+	selectedTaskIds,
+	tasks,
+	onResult,
+	emitStatus,
+	onCheckpointSaved,
+) {
+	const terminal = alreadyCompleteSelectionResults(
+		tasks,
+		checkpoint,
+		selectedTaskIds,
+	);
+	if (terminal.length === 0) return;
+	let changed = false;
+	for (const result of terminal) {
+		results.push(result);
+		if (!checkpoint.completedTaskIds.includes(result.taskId)) {
+			checkpoint.completedTaskIds.push(result.taskId);
+			changed = true;
+		}
+		if (
+			!checkpoint.results.some(
+				(entry) =>
+					entry.taskId === result.taskId && entry.result === "already_complete",
+			)
+		) {
+			checkpoint.results.push({
+				taskId: result.taskId,
+				provider: null,
+				model: null,
+				result: result.result,
+				success: true,
+				timedOut: false,
+				partialDiffPath: null,
+				reason: result.reason,
+				timestamp: new Date().toISOString(),
+			});
+			changed = true;
+		}
+		checkpoint.lastTaskId = result.taskId;
+		checkpoint.lastUpdatedAt = new Date().toISOString();
+		if (onResult) onResult(result);
+		if (emitStatus) {
+			emitStatus({
+				phase: "execution",
+				event: "task_completed",
+				status: `Task ${result.taskId} already complete; no provider dispatch needed`,
+				taskId: result.taskId,
+				provider: null,
+				model: null,
+				result: result.result,
+			});
+		}
+	}
+	if (changed) {
+		saveCheckpoint(checkpointPath, checkpoint);
+		if (onCheckpointSaved) onCheckpointSaved();
+	}
 }
 
 function sleep(ms) {
@@ -421,6 +541,226 @@ function parseArgsJson(rawArgsJson) {
 		);
 	}
 	return parsed;
+}
+
+function descriptorFromRoute(
+	routeResult,
+	requiredCapability,
+	resolveDescriptor,
+) {
+	if (!routeResult?.provider) return null;
+	const routeTarget = routeResult.resolvedTargetId ?? null;
+	const descriptorLookupTarget = routeTarget ?? routeResult.provider;
+	const harness = routeResult.resolved_harness ?? routeResult.provider;
+	const suppliedKey = [
+		"invocationDescriptor",
+		"invocation_descriptor",
+		"dispatchDescriptor",
+		"dispatch_descriptor",
+	].find((key) => Object.hasOwn(routeResult, key));
+	const supplied = suppliedKey ? routeResult[suppliedKey] : undefined;
+	const current = resolveDescriptor(descriptorLookupTarget, requiredCapability);
+	if (!current) {
+		throw new Error(
+			`missing dispatch descriptor receipt for ${descriptorLookupTarget ?? "unknown target"}`,
+		);
+	}
+	const validatedCurrent = validateInvocationDescriptor(current, harness);
+	if (routeTarget && validatedCurrent.target_id !== routeTarget) {
+		throw new Error("dispatch descriptor target does not match routed target");
+	}
+	if (routeResult.model && routeResult.model !== validatedCurrent.selector) {
+		throw new Error("dispatch descriptor selector does not match routed model");
+	}
+	if (supplied !== undefined && supplied !== null) {
+		const validatedSupplied = validateInvocationDescriptor(supplied, harness);
+		if (
+			validatedSupplied.descriptor_identity !==
+			validatedCurrent.descriptor_identity
+		) {
+			throw new Error("dispatch descriptor receipt changed or is stale");
+		}
+		if (routeTarget && validatedSupplied.target_id !== routeTarget) {
+			throw new Error(
+				"dispatch descriptor target does not match routed target",
+			);
+		}
+		descriptorHarnesses.set(validatedSupplied, normalizeProviderName(harness));
+		return validatedSupplied;
+	}
+	if (supplied === null) {
+		throw new Error("missing dispatch descriptor receipt");
+	}
+	descriptorHarnesses.set(validatedCurrent, normalizeProviderName(harness));
+	return validatedCurrent;
+}
+
+const descriptorHarnesses = new WeakMap();
+
+function descriptorReceiptFields(descriptor, harness = null) {
+	return descriptor
+		? {
+				dispatchContractVersion: DISPATCH_DESCRIPTOR_CONTRACT_VERSION,
+				invocationDescriptor: descriptor,
+				descriptorIdentity: descriptor.descriptor_identity,
+				descriptorHarness:
+					harness ?? descriptorHarnesses.get(descriptor) ?? null,
+			}
+		: {
+				dispatchContractVersion: DISPATCH_DESCRIPTOR_CONTRACT_VERSION,
+				invocationDescriptor: null,
+				descriptorIdentity: null,
+				descriptorHarness: null,
+			};
+}
+
+const SAFE_LEDGER_ERROR_CODES = new Set([
+	"EACCES",
+	"EPERM",
+	"EROFS",
+	"ENOSPC",
+	"EIO",
+	"EMFILE",
+	"ENFILE",
+]);
+const SAFE_ROUTE_REASON_CODES = new Set([
+	"ambiguous_target",
+	"blind_fallback",
+	"no_eligible",
+	"no_eligible_blind",
+	"no_eligible_capability_ceiling",
+	"no_eligible_upstream_unavailable",
+	"quarantine_unresolvable",
+	"spread",
+	"priority_fill",
+	"last_resort_fallback",
+]);
+
+function safeNoProviderReason(reason) {
+	// Route diagnostics may contain upstream error text. Only the closed route
+	// code crosses the result/status/ledger boundary; unknown text is generic.
+	if (typeof reason !== "string") return "no_eligible";
+	const code = reason.split(":", 1)[0];
+	return SAFE_ROUTE_REASON_CODES.has(code) ? code : "no_eligible";
+}
+
+function safeSuccessfulRouteReason(reason) {
+	if (typeof reason !== "string") return "spread";
+	const code = reason.split(":", 1)[0];
+	return SAFE_ROUTE_REASON_CODES.has(code) ? code : "spread";
+}
+
+function safeLedgerFailure(error, phase) {
+	const code = SAFE_LEDGER_ERROR_CODES.has(error?.code)
+		? error.code
+		: "unknown";
+	return {
+		ledgerFailure: true,
+		ledgerFailurePhase: phase,
+		ledgerFailureCode: code,
+	};
+}
+
+function classifiedIntentFailure(context, payload, metadata) {
+	context.onStatus?.({
+		phase: "ledger",
+		event: "intent_receipt_failed",
+		status: "Authoritative dispatch intent could not be recorded",
+		...metadata,
+		taskId: payload?.taskId,
+		provider: payload?.provider,
+	});
+	context.onIntentReceiptFailure?.(metadata);
+	return metadata;
+}
+
+function reportLegacyProjectionFailure(context, error) {
+	const metadata = safeLedgerFailure(error, "legacy_projection");
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "ledger",
+			event: "legacy_projection_failed",
+			status: "Legacy dispatch projection failed",
+			...metadata,
+		});
+	} else {
+		console.warn(
+			`runner: legacy dispatch projection failed (${metadata.ledgerFailureCode})`,
+		);
+	}
+	context.onLedgerProjectionFailure?.(metadata);
+	return metadata;
+}
+
+function dispatchIntentPayload(
+	taskId,
+	routeResult,
+	requiredCapability,
+	provenance,
+	invocationDescriptor,
+) {
+	return {
+		taskId,
+		provider: routeResult.provider ?? null,
+		model: invocationDescriptor?.selector ?? routeResult.model ?? null,
+		requiredCapability,
+		resolvedTargetId: routeResult.resolvedTargetId ?? null,
+		descriptorIdentity: invocationDescriptor?.descriptor_identity ?? null,
+		descriptorHarness: routeResult.resolved_harness ?? null,
+		...provenance,
+	};
+}
+
+const DESCRIPTOR_RECEIPT_INVALID_REASON =
+	"The dispatch descriptor receipt was invalid.";
+
+export function writeDispatchIntent(context, payload) {
+	if (typeof context?.recordDispatchIntent !== "function") {
+		return classifiedIntentFailure(context ?? {}, payload, {
+			ledgerFailure: true,
+			ledgerFailurePhase: "authoritative_intent",
+			ledgerFailureCode: "missing_writer",
+		});
+	}
+	try {
+		const receipt = context.recordDispatchIntent(payload);
+		if (
+			receipt !== null &&
+			receipt !== undefined &&
+			(typeof receipt === "object" || typeof receipt === "function") &&
+			typeof receipt.then === "function"
+		) {
+			// Prevent a rejecting thenable from becoming an unhandled rejection;
+			// the synchronous contract has already failed closed.
+			Promise.resolve(receipt).catch(() => {});
+			return classifiedIntentFailure(context, payload, {
+				ledgerFailure: true,
+				ledgerFailurePhase: "authoritative_intent",
+				ledgerFailureCode: "async_writer",
+			});
+		}
+		return null;
+	} catch (error) {
+		const metadata = safeLedgerFailure(error, "authoritative_intent");
+		return classifiedIntentFailure(context, payload, metadata);
+	}
+}
+
+export async function writeDispatchIntentAsync(context, payload) {
+	if (typeof context?.recordDispatchIntent !== "function") {
+		return classifiedIntentFailure(context ?? {}, payload, {
+			ledgerFailure: true,
+			ledgerFailurePhase: "authoritative_intent",
+			ledgerFailureCode: "missing_writer",
+		});
+	}
+	try {
+		await context.recordDispatchIntent(payload);
+		return null;
+	} catch (error) {
+		const metadata = safeLedgerFailure(error, "authoritative_intent");
+		return classifiedIntentFailure(context, payload, metadata);
+	}
 }
 
 /**
@@ -511,7 +851,7 @@ export function resolveOrchestrator(dependencies = {}) {
  *   - **Description:** ...
  *
  * @param {string} markdown
- * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, allowManifests: boolean, timeoutMs: number|null, requiredCapability: string|null, executor: string, type: string}>}
+ * @returns {Array<{id: string, title: string, status: string, description: string, requiredPaths: string[]|null, allowManifests: boolean, timeoutMs: number|null, requiredCapability: string|null, requiredCapabilityJustification: string|null, executor: string, type: string}>}
  */
 export function parseTaskQueue(markdown) {
 	const tasks = [];
@@ -557,6 +897,17 @@ export function parseTaskQueue(markdown) {
 		}
 
 		const requiredCapability = parseRequiredCapabilityField(block, taskId);
+		const requiredCapabilityJustification =
+			parseRequiredCapabilityJustificationField(block, taskId);
+		if (
+			requiredCapability &&
+			requiredCapability !== "standard" &&
+			requiredCapabilityJustification === null
+		) {
+			throw new Error(
+				`Task ${taskId}: RequiredCapabilityJustification is required for explicit ${requiredCapability} capability tasks`,
+			);
+		}
 		const executor = parseExecutorField(block, taskId);
 		const blockedBy = parseBlockedByField(block, taskId);
 		const externalBlockers = parseExternalBlockersField(block, taskId);
@@ -611,6 +962,7 @@ export function parseTaskQueue(markdown) {
 			allowManifests,
 			timeoutMs,
 			requiredCapability,
+			requiredCapabilityJustification,
 			executor,
 			type,
 			blockedBy,
@@ -706,6 +1058,33 @@ function parseRequiredCapabilityField(block, taskId) {
 		);
 	}
 	return normalized;
+}
+
+/**
+ * Parse the optional justification for an explicitly declared capability.
+ * Low/high declarations must carry a non-empty explanation; standard and
+ * omitted declarations do not need one. The field remains attached to the
+ * parsed task so programmatic and markdown task records share one contract.
+ * @param {string} block Task markdown block
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string|null} trimmed justification or null when absent
+ */
+function parseRequiredCapabilityJustificationField(block, taskId) {
+	const values = getTaskFieldValues(block, "RequiredCapabilityJustification");
+	if (values.length === 0) return null;
+	if (values.length > 1) {
+		throw new Error(
+			`Task ${taskId}: duplicate RequiredCapabilityJustification declarations are not allowed`,
+		);
+	}
+
+	const justification = values[0].trim();
+	if (!justification) {
+		throw new Error(
+			`Task ${taskId}: RequiredCapabilityJustification field is empty`,
+		);
+	}
+	return justification;
 }
 
 /**
@@ -1118,6 +1497,7 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				"checkpoint identity mismatch: normalized run options changed; create a new checkpoint or use an audited migration",
 			);
 		}
+		validateRetryDescriptorEvidence(parsed);
 		return parsed;
 	}
 
@@ -1131,6 +1511,7 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
 			);
 		}
+		validateRetryDescriptorEvidence(parsed);
 		return parsed;
 	}
 
@@ -1498,11 +1879,11 @@ function resolveTaskExecutor(task) {
 
 /**
  * Resolve the required capability from the task contract. A declared
- * `task.requiredCapability` takes precedence over classifyTask's keyword
- * inference. The retired `task.tier` input is rejected rather than accepted
- * as a compatibility alias. classifyTask only runs when the capability is
- * fully absent from the task.
- * @param {{id: string, requiredCapability?: string|null, tier?: unknown, description?: string, title?: string}} task
+ * `task.requiredCapability` takes precedence, and explicit low/high values
+ * require a non-empty justification. Missing capability fields use the
+ * standard lane; this keeps legacy records readable without re-running the
+ * keyword classifier or silently escalating them to high.
+ * @param {{id: string, requiredCapability?: string|null, requiredCapabilityJustification?: string|null, tier?: unknown, description?: string, title?: string}} task
  * @returns {string} required capability ('high'|'standard'|'low')
  * @throws {Error} if a retired task.tier or invalid capability is present
  */
@@ -1518,9 +1899,18 @@ function resolveTaskRequiredCapability(task) {
 				`Task ${task.id}: invalid declared RequiredCapability "${task.requiredCapability}" (expected one of: high, standard, low) — refusing to silently route at a fallback capability`,
 			);
 		}
+		if (
+			task.requiredCapability !== "standard" &&
+			(typeof task.requiredCapabilityJustification !== "string" ||
+				task.requiredCapabilityJustification.trim() === "")
+		) {
+			throw new Error(
+				`Task ${task.id}: RequiredCapabilityJustification is required for explicit ${task.requiredCapability} capability tasks`,
+			);
+		}
 		return task.requiredCapability;
 	}
-	return classifyTask(task.description || task.title);
+	return "standard";
 }
 
 function nonSwitchyardExecutorResult(task, executor, requiredCapability) {
@@ -1584,15 +1974,106 @@ function ensureRetryCheckpoint(checkpoint) {
 				.filter((targetId) => targetId !== null),
 		),
 	];
-	if (!Array.isArray(checkpoint.retryAttempts)) checkpoint.retryAttempts = [];
-	if (!Array.isArray(checkpoint.retryTransitions)) {
-		checkpoint.retryTransitions = [];
+	for (const field of ["retryAttempts", "retryTransitions"]) {
+		if (
+			Object.hasOwn(checkpoint, field) &&
+			checkpoint[field] !== undefined &&
+			checkpoint[field] !== null &&
+			!Array.isArray(checkpoint[field])
+		) {
+			throw new Error(`${field} is invalid`);
+		}
+		if (!Array.isArray(checkpoint[field])) checkpoint[field] = [];
 	}
 	if (!Number.isInteger(checkpoint.retryTransitionId)) {
 		checkpoint.retryTransitionId = checkpoint.retryTransitions.length;
 	}
 	if (checkpoint.retryState === undefined) checkpoint.retryState = null;
 	return checkpoint;
+}
+
+function hasExactRetryDescriptorEvidence(retryState) {
+	return Boolean(
+		retryState?.invocationDescriptor &&
+			retryState.descriptorIdentity &&
+			retryState.descriptorHarness,
+	);
+}
+
+/**
+ * Validate persisted retry descriptor evidence before it can authorize a
+ * reset, reroute, or adapter execution. Retry records written before the
+ * descriptor contract have no descriptor fields and remain readable; they
+ * are handled by the fail-closed historical path in runQueue. Any partial or
+ * malformed descriptor evidence is corruption, not legacy state.
+ * @param {object} checkpoint
+ * @throws {Error} when retry descriptor evidence is incoherent
+ */
+function validateRetryDescriptorEvidence(checkpoint) {
+	const validateEntry = (entry, label) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+			throw new Error(`${label} is invalid`);
+		}
+		const hasEvidence = [
+			"invocationDescriptor",
+			"descriptorIdentity",
+			"descriptorHarness",
+		].some((field) => entry[field] !== undefined && entry[field] !== null);
+		if (!hasEvidence) return;
+
+		if (
+			!entry.invocationDescriptor ||
+			typeof entry.descriptorIdentity !== "string" ||
+			entry.descriptorIdentity.length === 0 ||
+			typeof entry.descriptorHarness !== "string" ||
+			entry.descriptorHarness.trim() === ""
+		) {
+			throw new Error(`${label} has incomplete descriptor evidence`);
+		}
+		const targetId = normalizeRetryTargetId(entry.resolvedTargetId);
+		if (!targetId || targetId !== entry.resolvedTargetId) {
+			throw new Error(`${label} descriptor target is invalid`);
+		}
+
+		let descriptor;
+		try {
+			descriptor = validateInvocationDescriptor(
+				entry.invocationDescriptor,
+				entry.descriptorHarness,
+			);
+		} catch {
+			throw new Error(`${label} contains an invalid descriptor receipt`);
+		}
+		if (descriptor.descriptor_identity !== entry.descriptorIdentity) {
+			throw new Error(`${label} descriptor identity does not match receipt`);
+		}
+		if (descriptor.target_id !== targetId) {
+			throw new Error(`${label} descriptor target does not match target`);
+		}
+
+		const targetIdentity = resolveTargetIdentity(targetId);
+		if (
+			targetIdentity.targetId === targetId &&
+			targetIdentity.harnessKey &&
+			normalizeProviderName(entry.descriptorHarness) !==
+				normalizeProviderName(targetIdentity.harnessKey)
+		) {
+			throw new Error(`${label} descriptor harness does not match target`);
+		}
+	};
+
+	if (checkpoint.retryState !== undefined && checkpoint.retryState !== null) {
+		validateEntry(checkpoint.retryState, "retryState");
+	}
+	for (const field of ["retryAttempts", "retryTransitions"]) {
+		if (checkpoint[field] === undefined || checkpoint[field] === null) continue;
+		if (!Array.isArray(checkpoint[field])) {
+			throw new Error(`${field} is invalid`);
+		}
+		checkpoint[field].forEach((entry, index) => {
+			validateEntry(entry, `${field}[${index}]`);
+		});
+	}
 }
 
 function mergeRetryExclusions(base, quarantinedTargetIds) {
@@ -1618,6 +2099,9 @@ function persistRetryTransition(
 		provider = null,
 		model = null,
 		resolvedTargetId = null,
+		invocationDescriptor = null,
+		descriptorIdentity = null,
+		descriptorHarness = null,
 		phase = type,
 		clearState = false,
 		save = true,
@@ -1636,6 +2120,9 @@ function persistRetryTransition(
 		provider: typeof provider === "string" ? provider : null,
 		model: typeof model === "string" ? model : null,
 		resolvedTargetId: targetId,
+		invocationDescriptor,
+		descriptorIdentity,
+		descriptorHarness,
 		timestamp: new Date().toISOString(),
 	};
 	checkpoint.retryTransitionId = transitionId;
@@ -1647,6 +2134,9 @@ function persistRetryTransition(
 				attempt,
 				phase,
 				resolvedTargetId: targetId,
+				invocationDescriptor,
+				descriptorIdentity,
+				descriptorHarness,
 			};
 	checkpoint.lastUpdatedAt = transition.timestamp;
 	if (save) saveCheckpoint(checkpointPath, checkpoint);
@@ -1661,6 +2151,9 @@ function appendRetryAttempt(checkpoint, result, attempt) {
 		provider: result.provider ?? null,
 		model: result.model ?? null,
 		resolvedTargetId: normalizeRetryTargetId(result.resolvedTargetId),
+		invocationDescriptor: result.invocationDescriptor ?? null,
+		descriptorIdentity: result.descriptorIdentity ?? null,
+		descriptorHarness: result.descriptorHarness ?? null,
 		result: result.result,
 		success: Boolean(result.success),
 		timedOut: Boolean(result.timedOut),
@@ -1692,6 +2185,12 @@ function integrationFailureMetadata(taskId, diff, credentialFlagged) {
 	});
 }
 
+function opaqueArtifactRef(value) {
+	return typeof value === "string" && /^artifact:[a-f0-9]{24}$/.test(value)
+		? value
+		: undefined;
+}
+
 /**
  * Execute one task via routed provider/model and return a structured result.
  * @param {{id: string, title: string, description: string}} task
@@ -1720,25 +2219,72 @@ export function executeTask(task, context) {
 		requiredCapability,
 	);
 	Object.assign(routeResult, { requiredCapability }, provenance);
-	const record = (dispatch) =>
-		context.recordDispatch({
-			...provenance,
-			resolvedTargetId: routeResult.resolvedTargetId ?? null,
-			...dispatch,
+	let invocationDescriptor;
+	try {
+		invocationDescriptor = descriptorFromRoute(
+			routeResult,
 			requiredCapability,
-		});
+			context.resolveDescriptor ?? getInvocationDescriptor,
+		);
+	} catch {
+		try {
+			context.recordDispatch({
+				...provenance,
+				...descriptorReceiptFields(null),
+				resolvedTargetId: routeResult.resolvedTargetId ?? null,
+				provider: routeResult.provider ?? "none",
+				model: routeResult.model ?? null,
+				taskId: task.id,
+				result: "descriptor_receipt_invalid",
+				reason: DESCRIPTOR_RECEIPT_INVALID_REASON,
+				requiredCapability,
+			});
+		} catch (projectionError) {
+			reportLegacyProjectionFailure(context, projectionError);
+		}
+		return {
+			...descriptorReceiptFields(null),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider ?? null,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			result: "descriptor_receipt_invalid",
+			errorKind: "descriptor_receipt",
+			reason: DESCRIPTOR_RECEIPT_INVALID_REASON,
+		};
+	}
+	Object.assign(routeResult, descriptorReceiptFields(invocationDescriptor));
+	context._activeInvocationDescriptor = invocationDescriptor;
+	let projectionFailure = null;
+	const record = (dispatch) => {
+		try {
+			context.recordDispatch({
+				...provenance,
+				...descriptorReceiptFields(invocationDescriptor),
+				resolvedTargetId: routeResult.resolvedTargetId ?? null,
+				...dispatch,
+				requiredCapability,
+			});
+		} catch (error) {
+			projectionFailure = reportLegacyProjectionFailure(context, error);
+		}
+	};
 	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
 
 	if (!routeResult.provider) {
+		const noProviderReason = safeNoProviderReason(routeResult.reason);
 		record({
 			provider: "none",
 			model: "none",
 			taskId: task.id,
 			result: "no_provider",
-			reason: routeResult.reason,
+			reason: noProviderReason,
 			errorKind: null,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: null,
@@ -1746,7 +2292,7 @@ export function executeTask(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "no_provider",
-			reason: routeResult.reason,
+			reason: noProviderReason,
 			errorKind: null,
 		};
 	}
@@ -1762,14 +2308,15 @@ export function executeTask(task, context) {
 			taskId: task.id,
 			result: "unsupported_provider",
 			errorKind: null,
-			reason: routeResult.reason,
+			reason: safeSuccessfulRouteReason(routeResult.reason),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
 			requiredCapability,
 			resolvedTargetId,
 			result: "unsupported_provider",
@@ -1792,9 +2339,10 @@ export function executeTask(task, context) {
 			status: `Task ${task.id} routed to ${routeResult.provider}${routeResult.model ? `/${routeResult.model}` : ""}`,
 			taskId: task.id,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
 			deadline: routedDeadline,
 			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			...descriptorReceiptFields(invocationDescriptor),
 			snapshotStatus: routeResult.snapshotStatus ?? null,
 			snapshotMtime: routeResult.snapshotMtime ?? null,
 			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
@@ -1804,19 +2352,50 @@ export function executeTask(task, context) {
 		context.onTaskRouted({
 			taskId: task.id,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
 			deadline: routedDeadline,
 			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			...descriptorReceiptFields(invocationDescriptor),
 			snapshotStatus: routeResult.snapshotStatus ?? null,
 			snapshotMtime: routeResult.snapshotMtime ?? null,
 			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
 		});
 	}
 
+	const intentFailure = writeDispatchIntent(
+		context,
+		dispatchIntentPayload(
+			task.id,
+			routeResult,
+			requiredCapability,
+			provenance,
+			invocationDescriptor,
+		),
+	);
+	if (intentFailure) {
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: invocationDescriptor.selector,
+			requiredCapability,
+			resolvedTargetId,
+			result: "intent_receipt_failed",
+			errorKind: "intent_receipt",
+			...intentFailure,
+		};
+	}
+
 	const prompt = task.prompt || task.description || task.title;
+	const routedModel = invocationDescriptor?.selector ?? routeResult.model;
 	const execution = adapter.execute(prompt, context.workingContainerName, {
-		model: routeResult.model ?? undefined,
+		model: routedModel ?? undefined,
 		timeoutMs,
+		invocationDescriptor,
+		descriptorIdentity: invocationDescriptor?.descriptor_identity ?? null,
+		descriptorHarness: routeResult.resolved_harness ?? null,
+		resolvedTargetId,
 	});
 
 	if (!execution.success) {
@@ -1841,6 +2420,7 @@ export function executeTask(task, context) {
 			// host, and this diff has not been reviewed.
 			const partialDiff = adapter.captureDiff(context.workingContainerName);
 			return {
+				...descriptorReceiptFields(invocationDescriptor),
 				taskId: task.id,
 				success: false,
 				provider: routeResult.provider,
@@ -1856,10 +2436,11 @@ export function executeTask(task, context) {
 		}
 
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor?.selector ?? routeResult.model ?? null,
 			requiredCapability,
 			resolvedTargetId,
 			result: "execution_failed",
@@ -1876,7 +2457,7 @@ export function executeTask(task, context) {
 			status: "Diff captured",
 			taskId: task.id,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
 			byteCount: diff ? diff.length : 0,
 		});
 	}
@@ -1887,10 +2468,11 @@ export function executeTask(task, context) {
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: "success_no_diff",
-			reason: routeResult.reason,
+			reason: safeSuccessfulRouteReason(routeResult.reason),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: true,
 			provider: routeResult.provider,
@@ -1906,32 +2488,45 @@ export function executeTask(task, context) {
 		allowSensitiveManifests:
 			task.type === "implementation" && task.allowManifests === true,
 	});
-	const success = Boolean(gateResult?.success);
+	const alreadyApplied = gateResult?.alreadyApplied === true;
+	const success = Boolean(gateResult?.success) || alreadyApplied;
+	const terminalResult = success ? "success" : "integration_failed";
 	const safeGateFailure = success
 		? null
 		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
+	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "integration",
 			event: "gate_validated",
-			status: success ? "ok" : safeGateFailure.reason,
+			status: success
+				? alreadyApplied
+					? "already applied"
+					: "ok"
+				: safeGateFailure.reason,
 			taskId: task.id,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
-			outcome: success ? "passed" : "rejected",
+			outcome: success
+				? alreadyApplied
+					? "already_applied"
+					: "passed"
+				: "rejected",
 			errorKind: safeGateFailure?.errorKind,
 			reasonCode: safeGateFailure?.reasonCode,
-			artifactRef: safeGateFailure?.artifactRef,
+			artifactRef: safeGateFailure?.artifactRef ?? gateArtifactRef,
 		});
 		if (success) {
 			context.onStatus({
 				phase: "integration",
 				event: "gate_applied",
-				status: "Diff applied via integration gate",
+				status: alreadyApplied
+					? "Diff already applied; integration gate confirmed terminal state"
+					: "Diff applied via integration gate",
 				taskId: task.id,
 				provider: routeResult.provider,
-				model: routeResult.model ?? null,
+				model: invocationDescriptor.selector,
 			});
 		}
 	}
@@ -1940,9 +2535,13 @@ export function executeTask(task, context) {
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
-		result: success ? "success" : "integration_failed",
+		result: terminalResult,
+		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
-		...(success ? { reason: routeResult.reason } : {}),
+		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
+		...(success
+			? { reason: safeSuccessfulRouteReason(routeResult.reason) }
+			: {}),
 		percentLeft: routeResult.percentLeft ?? undefined,
 	});
 
@@ -1953,13 +2552,494 @@ export function executeTask(task, context) {
 		model: routeResult.model ?? null,
 		requiredCapability,
 		resolvedTargetId,
-		result: success ? "success" : "integration_failed",
+		result: terminalResult,
+		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
+		...(projectionFailure
+			? { legacyProjectionFailure: projectionFailure }
+			: {}),
 	};
 	if (!success && !gateResult?.credentialFlagged) {
 		result.partialDiff = diff;
 	}
 	return result;
+}
+
+/**
+ * Async provider-backed execution seam. The synchronous executeTask API remains
+ * for legacy callers, while queue workers that can await use each adapter's
+ * shared spawn/poll lifecycle through this path.
+ */
+export async function executeTaskAsync(task, context) {
+	const executor = resolveTaskExecutor(task);
+	const requiredCapability = resolveTaskRequiredCapability(task);
+	if (executor !== "switchyard") {
+		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
+	}
+	const routeResult = context.route({
+		requiredCapability,
+		availableProviders: Object.keys(context.adapters ?? {}),
+		exclude: context.exclude,
+		only: context.only,
+	});
+	const provenance = resolveRouteProvenance(
+		routeResult.provider,
+		requiredCapability,
+	);
+	Object.assign(routeResult, { requiredCapability }, provenance);
+	let invocationDescriptor;
+	try {
+		invocationDescriptor = descriptorFromRoute(
+			routeResult,
+			requiredCapability,
+			context.resolveDescriptor ?? getInvocationDescriptor,
+		);
+	} catch {
+		return {
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider ?? null,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			result: "descriptor_receipt_invalid",
+			errorKind: "descriptor_receipt",
+			reason: DESCRIPTOR_RECEIPT_INVALID_REASON,
+		};
+	}
+	Object.assign(routeResult, descriptorReceiptFields(invocationDescriptor));
+	context._activeInvocationDescriptor = invocationDescriptor;
+	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
+	const record = async (dispatch) => {
+		await Promise.resolve(
+			context.recordDispatch({
+				...provenance,
+				...descriptorReceiptFields(invocationDescriptor),
+				resolvedTargetId,
+				...dispatch,
+				requiredCapability,
+			}),
+		);
+	};
+	if (!routeResult.provider) {
+		const reason = safeNoProviderReason(routeResult.reason);
+		await record({
+			provider: "none",
+			model: "none",
+			taskId: task.id,
+			result: "no_provider",
+			reason,
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: null,
+			model: null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "no_provider",
+			reason,
+			errorKind: null,
+		};
+	}
+	const adapter = selectAdapter(
+		routeResult.resolved_harness ?? routeResult.provider,
+		context.adapters,
+	);
+	if (!adapter) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "unsupported_provider",
+			reason: safeSuccessfulRouteReason(routeResult.reason),
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: invocationDescriptor.selector,
+			requiredCapability,
+			resolvedTargetId,
+			result: "unsupported_provider",
+		};
+	}
+	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	const routedDeadline = new Date(Date.now() + timeoutMs).toISOString();
+	context.onStatus?.({
+		phase: "execution",
+		event: "task_routed",
+		status: `Task ${task.id} routed to ${routeResult.provider}`,
+		taskId: task.id,
+		provider: routeResult.provider,
+		model: invocationDescriptor.selector,
+		deadline: routedDeadline,
+		resolvedTargetId,
+		...descriptorReceiptFields(invocationDescriptor),
+	});
+	context.onTaskRouted?.({
+		taskId: task.id,
+		provider: routeResult.provider,
+		model: invocationDescriptor.selector,
+		deadline: routedDeadline,
+		resolvedTargetId,
+		...descriptorReceiptFields(invocationDescriptor),
+	});
+	const intentFailure = await writeDispatchIntentAsync(
+		context,
+		dispatchIntentPayload(
+			task.id,
+			routeResult,
+			requiredCapability,
+			provenance,
+			invocationDescriptor,
+		),
+	);
+	if (intentFailure)
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: invocationDescriptor.selector,
+			requiredCapability,
+			resolvedTargetId,
+			result: "intent_receipt_failed",
+			errorKind: "intent_receipt",
+			...intentFailure,
+		};
+	if (
+		typeof adapter.executeAsync !== "function" ||
+		typeof adapter.captureDiffAsync !== "function"
+	) {
+		const reason = "adapter async lifecycle unavailable";
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "execution_failed",
+			errorKind: "execution_failed",
+			reason,
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "execution_failed",
+			errorKind: "execution_failed",
+			error: reason,
+		};
+	}
+	const executeAsync = adapter.executeAsync;
+	const execution = await executeAsync(
+		task.prompt || task.description || task.title,
+		context.workingContainerName,
+		{
+			model: invocationDescriptor.selector ?? routeResult.model,
+			timeoutMs,
+			signal: context.signal,
+			onPoll: (poll) => {
+				// Provider lifecycle polling exposes only bounded scalar timing
+				// metadata. Never forward stdout/stderr bytes or provider output to
+				// durable state.
+				context.onPoll?.(poll);
+				context.onTaskHeartbeat?.({
+					taskId: task.id,
+					provider: routeResult.provider,
+					model: invocationDescriptor.selector ?? routeResult.model,
+					deadline: routedDeadline,
+					elapsedMs: Number.isFinite(poll?.elapsedMs)
+						? Math.max(0, poll.elapsedMs)
+						: 0,
+					processPhase: "provider_running",
+					resolvedTargetId,
+					descriptorIdentity: invocationDescriptor.descriptor_identity,
+					descriptorHarness: routeResult.resolved_harness ?? null,
+				});
+			},
+			invocationDescriptor,
+			descriptorIdentity: invocationDescriptor.descriptor_identity,
+			descriptorHarness: routeResult.resolved_harness ?? null,
+			resolvedTargetId,
+		},
+	);
+	if (!execution.success) {
+		const resultName = execution.timedOut
+			? "execution_timed_out"
+			: "execution_failed";
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: resultName,
+			errorKind: execution.errorKind ?? null,
+			reason: execution.error ?? routeResult.reason,
+		});
+		const partialDiff = execution.timedOut
+			? await adapter.captureDiffAsync(context.workingContainerName, {
+					signal: context.signal,
+				})
+			: undefined;
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: resultName,
+			error: execution.error ?? null,
+			errorKind: execution.errorKind ?? null,
+			...(execution.timedOut ? { timedOut: true, partialDiff } : {}),
+		};
+	}
+	const diff = await adapter.captureDiffAsync(context.workingContainerName, {
+		signal: context.signal,
+	});
+	context.onStatus?.({
+		phase: "execution",
+		event: "diff_captured",
+		status: "Diff captured",
+		taskId: task.id,
+		provider: routeResult.provider,
+		model: invocationDescriptor.selector,
+		byteCount: diff ? diff.length : 0,
+	});
+	if (!diff && task.requiredPaths === null) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "success_no_diff",
+			reason: safeSuccessfulRouteReason(routeResult.reason),
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: true,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "success_no_diff",
+		};
+	}
+	const gateResult = context.integrationGate(diff, context.projectPath, {
+		requiredPaths: task.requiredPaths,
+		allowSensitiveManifests:
+			task.type === "implementation" && task.allowManifests === true,
+	});
+	const alreadyApplied = gateResult?.alreadyApplied === true;
+	const success = Boolean(gateResult?.success) || alreadyApplied;
+	const terminalResult = success ? "success" : "integration_failed";
+	const safeGateFailure = success
+		? null
+		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
+	await record({
+		provider: routeResult.provider,
+		model: routeResult.model ?? "unknown",
+		taskId: task.id,
+		result: terminalResult,
+		...(alreadyApplied ? { alreadyApplied: true } : {}),
+		...(safeGateFailure ?? {}),
+		...(success
+			? { reason: safeSuccessfulRouteReason(routeResult.reason) }
+			: {}),
+	});
+	return {
+		...descriptorReceiptFields(invocationDescriptor),
+		taskId: task.id,
+		success,
+		provider: routeResult.provider,
+		model: routeResult.model ?? null,
+		requiredCapability,
+		resolvedTargetId,
+		result: terminalResult,
+		...(alreadyApplied ? { alreadyApplied: true } : {}),
+		...(safeGateFailure ?? {}),
+		...(!success && !gateResult?.credentialFlagged
+			? { partialDiff: diff }
+			: {}),
+	};
+}
+
+/**
+ * Awaiting queue entrypoint for callers that own an async worker. This is a
+ * deliberately small sibling of runQueue: it keeps the established sync API
+ * untouched while making the per-task provider lifecycle genuinely awaitable.
+ * Container creation/seeding is delegated to the same injectable lifecycle
+ * dependencies; callers with a supplied working container avoid Docker setup.
+ */
+export async function runQueueAsync(options) {
+	const {
+		tasksFilePath,
+		projectPath,
+		workingContainerName: suppliedWorkingContainerName,
+		checkpointPath = getCheckpointPath(tasksFilePath),
+		maxTasks = Number.POSITIVE_INFINITY,
+		stopOnFailure = true,
+		exclude = [],
+		only = [],
+		taskIds = [],
+		runStorePath = null,
+		runId = null,
+		dependencies = {},
+	} = options;
+	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
+		markerPath: dependencies.generationMarkerPath,
+	});
+	const tasks = loadTaskQueue(tasksFilePath);
+	if (tasks.length === 0)
+		throwOnEmptyParse(tasksFilePath, checkpointPath, dependencies.onStatus);
+	const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
+	const ensureAgentContainerFn =
+		dependencies.ensureAgentContainer ?? ensureAgentContainer;
+	const createWorkingContainerFn =
+		dependencies.createWorkingContainer ?? createWorkingContainer;
+	const provisionCredentialsFn =
+		dependencies.provisionCredentials ?? provisionCredentials;
+	const seedProjectFn = dependencies.seedProject ?? seedProject;
+	const wipeWorkingContainerFn =
+		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+	let workingContainerName = suppliedWorkingContainerName;
+	let ownsWorkingContainer = false;
+	if (!workingContainerName) {
+		ensureAgentContainerFn();
+		workingContainerName = createWorkingContainerFn(projectPath, undefined, {
+			runId,
+		});
+		if (!workingContainerName) {
+			throw new Error("runQueueAsync: failed to create working container");
+		}
+		ownsWorkingContainer = true;
+		try {
+			provisionCredentialsFn(workingContainerName);
+		} catch (error) {
+			console.error(
+				`runQueueAsync: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+			);
+		}
+		try {
+			seedProjectFn(workingContainerName, projectPath);
+		} catch (error) {
+			try {
+				wipeWorkingContainerFn(workingContainerName);
+			} catch {
+				// Best effort cleanup; preserve the seed error.
+			}
+			throw error;
+		}
+	}
+	const context = {
+		route: dependencies.route ?? route,
+		recordDispatch:
+			dependencies.recordDispatch ??
+			((dispatch) =>
+				recordDispatchToBothLedgers(dispatch, (data) =>
+					recordDispatchToStore(data, runStorePath),
+				)),
+		recordDispatchIntent:
+			dependencies.recordDispatchIntent ??
+			((intent) => recordDispatchIntentToStore(intent, runStorePath)),
+		integrationGate: dependencies.integrationGate ?? integrationGate,
+		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
+		projectPath,
+		workingContainerName,
+		onStatus: dependencies.onStatus ?? null,
+		onTaskRouted: dependencies.onTaskRouted ?? null,
+		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
+		exclude,
+		only,
+		signal: dependencies.signal,
+		onPoll: dependencies.onPoll,
+		resolveDescriptor: dependencies.resolveDescriptor,
+	};
+	const results = [];
+	try {
+		dependencies.onContainerReady?.({ workingContainerName });
+		const runnable = getRunnableTasks(tasks, checkpoint, {
+			selectedTaskIds: taskIds,
+			resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
+		});
+		for (const task of runnable.slice(0, maxTasks)) {
+			dependencies.onTaskStart?.(task);
+			const result = await executeTaskAsync(task, context);
+			if (result.partialDiff) {
+				try {
+					result.partialDiffPath = savePartialDiff(
+						checkpointPath,
+						result.taskId,
+						result.partialDiff,
+					);
+				} catch {
+					result.partialDiffPath = null;
+				}
+				// Raw diff text is an in-memory transient only; never expose it to
+				// onResult or persist it in checkpoint.json.
+				result.partialDiff = undefined;
+			}
+			results.push(result);
+			dependencies.onResult?.(result);
+			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
+			checkpoint.results.push({
+				taskId: result.taskId,
+				provider: result.provider,
+				model: result.model,
+				...(result.invocationDescriptor
+					? {
+							dispatchContractVersion: DISPATCH_DESCRIPTOR_CONTRACT_VERSION,
+							invocationDescriptor: result.invocationDescriptor,
+							descriptorIdentity:
+								result.invocationDescriptor.descriptor_identity,
+							descriptorHarness: result.descriptorHarness ?? null,
+							resolvedTargetId: result.resolvedTargetId ?? null,
+						}
+					: {}),
+				result: result.result,
+				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
+				success: result.success,
+				timedOut: Boolean(result.timedOut),
+				// The host path is transient; safeFailure carries only its opaque
+				// artifactRef into the durable checkpoint.
+				partialDiffPath: null,
+				...(safeFailure ?? {}),
+				...(opaqueArtifactRef(result.artifactRef)
+					? { artifactRef: opaqueArtifactRef(result.artifactRef) }
+					: {}),
+				timestamp: new Date().toISOString(),
+			});
+			checkpoint.lastTaskId = result.taskId;
+			if (result.success) checkpoint.completedTaskIds.push(result.taskId);
+			checkpoint.lastUpdatedAt = new Date().toISOString();
+			saveCheckpoint(checkpointPath, checkpoint);
+			dependencies.onCheckpointSaved?.(checkpoint);
+			if (!result.success && stopOnFailure) break;
+		}
+		saveCheckpoint(checkpointPath, checkpoint);
+		return {
+			results,
+			totalTasks: tasks.length,
+			runnableTasks: runnable.length,
+			processedTasks: results.length,
+			completedTaskIds: checkpoint.completedTaskIds,
+		};
+	} finally {
+		if (ownsWorkingContainer) {
+			try {
+				wipeWorkingContainerFn(workingContainerName);
+			} catch {
+				// Container cleanup is best effort; the run result remains authoritative.
+			}
+		}
+	}
 }
 
 /**
@@ -1989,24 +3069,71 @@ export async function executeTaskWithOrchestrator(task, context) {
 		requiredCapability,
 	);
 	Object.assign(routeResult, { requiredCapability }, provenance);
-	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
-	const record = async (dispatch) =>
-		await context.recordDispatch({
-			...provenance,
-			resolvedTargetId,
-			...dispatch,
+	let invocationDescriptor;
+	try {
+		invocationDescriptor = descriptorFromRoute(
+			routeResult,
 			requiredCapability,
-		});
+			context.resolveDescriptor ?? getInvocationDescriptor,
+		);
+	} catch {
+		try {
+			await context.recordDispatch({
+				...provenance,
+				...descriptorReceiptFields(null),
+				resolvedTargetId: routeResult.resolvedTargetId ?? null,
+				provider: routeResult.provider ?? "none",
+				model: routeResult.model ?? null,
+				taskId: task.id,
+				result: "descriptor_receipt_invalid",
+				reason: DESCRIPTOR_RECEIPT_INVALID_REASON,
+				requiredCapability,
+			});
+		} catch (projectionError) {
+			reportLegacyProjectionFailure(context, projectionError);
+		}
+		return {
+			...descriptorReceiptFields(null),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider ?? null,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			result: "descriptor_receipt_invalid",
+			errorKind: "descriptor_receipt",
+			reason: DESCRIPTOR_RECEIPT_INVALID_REASON,
+		};
+	}
+	Object.assign(routeResult, descriptorReceiptFields(invocationDescriptor));
+	context._activeInvocationDescriptor = invocationDescriptor;
+	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
+	let projectionFailure = null;
+	const record = async (dispatch) => {
+		try {
+			await context.recordDispatch({
+				...provenance,
+				...descriptorReceiptFields(invocationDescriptor),
+				resolvedTargetId,
+				...dispatch,
+				requiredCapability,
+			});
+		} catch (error) {
+			projectionFailure = reportLegacyProjectionFailure(context, error);
+		}
+	};
 
 	if (!routeResult.provider) {
+		const noProviderReason = safeNoProviderReason(routeResult.reason);
 		await record({
 			provider: "none",
 			model: "none",
 			taskId: task.id,
 			result: "no_provider",
-			reason: routeResult.reason,
+			reason: noProviderReason,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: null,
@@ -2014,7 +3141,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "no_provider",
-			reason: routeResult.reason,
+			reason: noProviderReason,
 			errorKind: null,
 		};
 	}
@@ -2027,9 +3154,10 @@ export async function executeTaskWithOrchestrator(task, context) {
 			status: `Task ${task.id} routed to ${routeResult.provider}${routeResult.model ? `/${routeResult.model}` : ""}`,
 			taskId: task.id,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
 			deadline: routedDeadline,
 			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			...descriptorReceiptFields(invocationDescriptor),
 			snapshotStatus: routeResult.snapshotStatus ?? null,
 			snapshotMtime: routeResult.snapshotMtime ?? null,
 			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
@@ -2039,21 +3167,54 @@ export async function executeTaskWithOrchestrator(task, context) {
 		context.onTaskRouted({
 			taskId: task.id,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
 			deadline: routedDeadline,
 			resolvedTargetId: routeResult.resolvedTargetId ?? null,
+			...descriptorReceiptFields(invocationDescriptor),
 			snapshotStatus: routeResult.snapshotStatus ?? null,
 			snapshotMtime: routeResult.snapshotMtime ?? null,
 			snapshotAgeMsAtRoute: routeResult.snapshotAgeMsAtRoute ?? null,
 		});
 	}
 
+	const intentFailure = await writeDispatchIntentAsync(
+		context,
+		dispatchIntentPayload(
+			task.id,
+			routeResult,
+			requiredCapability,
+			provenance,
+			invocationDescriptor,
+		),
+	);
+	if (intentFailure) {
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: invocationDescriptor.selector,
+			requiredCapability,
+			resolvedTargetId,
+			result: "intent_receipt_failed",
+			errorKind: "intent_receipt",
+			...intentFailure,
+		};
+	}
+
 	let jobId;
 	try {
 		jobId = await context.orchestrator.launch({
+			payloadVersion: ORCHESTRATOR_PAYLOAD_VERSION,
+			contractVersion: ORCHESTRATOR_PAYLOAD_VERSION,
+			dispatchContractVersion: DISPATCH_DESCRIPTOR_CONTRACT_VERSION,
 			taskId: task.id,
 			provider: routeResult.provider,
-			model: routeResult.model ?? null,
+			model: invocationDescriptor.selector,
+			invocationDescriptor,
+			descriptorIdentity: invocationDescriptor.descriptor_identity,
+			descriptorHarness: routeResult.resolved_harness ?? null,
+			resolvedTargetId,
 			prompt: task.prompt || task.description || task.title,
 			workingContainerName: context.workingContainerName,
 		});
@@ -2067,6 +3228,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: routeResult.provider,
@@ -2100,6 +3262,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: routeResult.provider,
@@ -2128,6 +3291,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: routeResult.provider,
@@ -2148,6 +3312,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: false,
 			provider: routeResult.provider,
@@ -2178,10 +3343,11 @@ export async function executeTaskWithOrchestrator(task, context) {
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: "success_no_diff",
-			reason: routeResult.reason,
+			reason: safeSuccessfulRouteReason(routeResult.reason),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
+			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
 			success: true,
 			provider: routeResult.provider,
@@ -2197,29 +3363,42 @@ export async function executeTaskWithOrchestrator(task, context) {
 		allowSensitiveManifests:
 			task.type === "implementation" && task.allowManifests === true,
 	});
-	const success = Boolean(gateResult?.success);
+	const alreadyApplied = gateResult?.alreadyApplied === true;
+	const success = Boolean(gateResult?.success) || alreadyApplied;
+	const terminalResult = success ? "success" : "integration_failed";
 	const safeGateFailure = success
 		? null
 		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
+	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "integration",
 			event: "gate_validated",
-			status: success ? "ok" : safeGateFailure.reason,
+			status: success
+				? alreadyApplied
+					? "already applied"
+					: "ok"
+				: safeGateFailure.reason,
 			taskId: task.id,
 			provider: routeResult.provider,
 			model: routeResult.model ?? null,
-			outcome: success ? "passed" : "rejected",
+			outcome: success
+				? alreadyApplied
+					? "already_applied"
+					: "passed"
+				: "rejected",
 			errorKind: safeGateFailure?.errorKind,
 			reasonCode: safeGateFailure?.reasonCode,
-			artifactRef: safeGateFailure?.artifactRef,
+			artifactRef: safeGateFailure?.artifactRef ?? gateArtifactRef,
 		});
 		if (success) {
 			context.onStatus({
 				phase: "integration",
 				event: "gate_applied",
-				status: "Diff applied via integration gate",
+				status: alreadyApplied
+					? "Diff already applied; integration gate confirmed terminal state"
+					: "Diff applied via integration gate",
 				taskId: task.id,
 				provider: routeResult.provider,
 				model: routeResult.model ?? null,
@@ -2231,9 +3410,13 @@ export async function executeTaskWithOrchestrator(task, context) {
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
-		result: success ? "success" : "integration_failed",
+		result: terminalResult,
+		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
-		...(success ? { reason: routeResult.reason } : {}),
+		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
+		...(success
+			? { reason: safeSuccessfulRouteReason(routeResult.reason) }
+			: {}),
 		percentLeft: routeResult.percentLeft ?? undefined,
 	});
 
@@ -2244,8 +3427,13 @@ export async function executeTaskWithOrchestrator(task, context) {
 		model: routeResult.model ?? null,
 		requiredCapability,
 		resolvedTargetId,
-		result: success ? "success" : "integration_failed",
+		result: terminalResult,
+		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
+		...(projectionFailure
+			? { legacyProjectionFailure: projectionFailure }
+			: {}),
 	};
 	if (!success && !gateResult?.credentialFlagged) {
 		result.partialDiff = diff;
@@ -2456,6 +3644,9 @@ function resetBeforeQuotaRetry({
 			provider: result.provider,
 			model: result.model,
 			resolvedTargetId: result.resolvedTargetId,
+			invocationDescriptor: result.invocationDescriptor,
+			descriptorIdentity: result.descriptorIdentity,
+			descriptorHarness: result.descriptorHarness,
 			clearState: true,
 		});
 		if (emitStatus) {
@@ -2477,6 +3668,9 @@ function resetBeforeQuotaRetry({
 		provider: result.provider,
 		model: result.model,
 		resolvedTargetId: result.resolvedTargetId,
+		invocationDescriptor: result.invocationDescriptor,
+		descriptorIdentity: result.descriptorIdentity,
+		descriptorHarness: result.descriptorHarness,
 	});
 	if (emitStatus) {
 		emitStatus({
@@ -2624,27 +3818,39 @@ function throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus) {
 const DEFAULT_ADAPTERS = {
 	claude: {
 		execute: executeClaude,
+		executeAsync: executeClaudeAsync,
 		captureDiff: captureClaudeDiff,
+		captureDiffAsync: captureClaudeDiffAsync,
 	},
 	codex: {
 		execute: executeCodex,
+		executeAsync: executeCodexAsync,
 		captureDiff: captureCodexDiff,
+		captureDiffAsync: captureCodexDiffAsync,
 	},
 	agy: {
 		execute: executeAgy,
+		executeAsync: executeAgyAsync,
 		captureDiff: captureAgyDiff,
+		captureDiffAsync: captureAgyDiffAsync,
 	},
 	cursor: {
 		execute: executeCursor,
+		executeAsync: executeCursorAsync,
 		captureDiff: captureCursorDiff,
+		captureDiffAsync: captureCursorDiffAsync,
 	},
 	copilot: {
 		execute: executeCopilot,
+		executeAsync: executeCopilotAsync,
 		captureDiff: captureCopilotDiff,
+		captureDiffAsync: captureCopilotDiffAsync,
 	},
 	opencode: {
 		execute: executeOpencode,
+		executeAsync: executeOpencodeAsync,
 		captureDiff: captureOpencodeDiff,
+		captureDiffAsync: captureOpencodeDiffAsync,
 	},
 };
 
@@ -2652,8 +3858,22 @@ function recordDispatchToBothLedgers(
 	dispatch,
 	recordDispatchToStoreFn = recordDispatchToStore,
 ) {
-	recordDispatch(dispatch);
-	return recordDispatchToStoreFn(dispatch);
+	return Promise.resolve()
+		.then(() => recordDispatchToStoreFn(dispatch))
+		.catch((error) => {
+			console.warn(
+				`runner: project-local dispatch outcome projection failed (${safeLedgerFailure(error, "outcome_projection").ledgerFailureCode})`,
+			);
+		})
+		.then(() => {
+			try {
+				recordDispatch(dispatch);
+			} catch (error) {
+				console.warn(
+					`runner: legacy dispatch projection failed (${safeLedgerFailure(error, "legacy_projection").ledgerFailureCode})`,
+				);
+			}
+		});
 }
 
 /**
@@ -2710,6 +3930,7 @@ export function runQueue(options) {
 	const onRetryStateChanged = dependencies.onRetryStateChanged ?? null;
 	const onContainerReady = dependencies.onContainerReady ?? null;
 	const runStore = dependencies.runStore ?? null;
+	const runStorePath = dependencies.runStorePath ?? null;
 	const emitStatus = _resolveOnStatus(dependencies);
 
 	let workingContainerName = suppliedWorkingContainerName;
@@ -2759,27 +3980,45 @@ export function runQueue(options) {
 
 	const recordDispatchToStoreFn =
 		dependencies.recordDispatchToStore ?? recordDispatchToStore;
+	const recordDispatchIntentFn =
+		dependencies.recordDispatchIntent ?? recordDispatchIntentToStore;
 	let storeWriteChain = Promise.resolve();
 	const defaultRecordDispatch = (dispatch) => {
-		recordDispatch(dispatch);
 		storeWriteChain = storeWriteChain.then(() =>
-			recordDispatchToStoreFn(dispatch),
+			recordDispatchToStoreFn(dispatch, runStorePath),
 		);
 		storeWriteChain = storeWriteChain.catch((error) => {
 			console.warn(
-				`runQueue: project-local dispatch ledger write failed: ${error.message}`,
+				`runQueue: project-local dispatch outcome projection failed (${safeLedgerFailure(error, "outcome_projection").ledgerFailureCode})`,
 			);
 		});
+		storeWriteChain = storeWriteChain.then(() => {
+			try {
+				recordDispatch(dispatch);
+			} catch (error) {
+				console.warn(
+					`runQueue: legacy dispatch projection failed (${safeLedgerFailure(error, "legacy_projection").ledgerFailureCode})`,
+				);
+			}
+		});
+	};
+	const defaultRecordDispatchIntent = (intent) => {
+		recordDispatchIntentFn(intent, runStorePath);
 	};
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
+		recordDispatchIntent:
+			dependencies.recordDispatchIntent ?? defaultRecordDispatchIntent,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
 		onStatus: emitStatus,
 		onTaskRouted,
+		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
+		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
+		resolveDescriptor: dependencies.resolveDescriptor,
 		exclude,
 		only,
 	};
@@ -2849,6 +4088,7 @@ export function runQueue(options) {
 				: null,
 		);
 		ensureRetryCheckpoint(checkpoint);
+		validateRetryDescriptorEvidence(checkpoint);
 		const projectRetryState = () => {
 			if (
 				(!runStore && !onRetryStateChanged) ||
@@ -2880,6 +4120,16 @@ export function runQueue(options) {
 		);
 		const attemptedTaskIds = new Set();
 		const results = [];
+		reconcileAlreadyCompleteSelection(
+			checkpoint,
+			checkpointPath,
+			results,
+			effectiveTaskIds,
+			tasks,
+			onResult,
+			emitStatus,
+			onCheckpointSaved,
+		);
 		let processed = 0;
 		let halted = false;
 		let resumedRetryTaskId = checkpoint.retryState?.taskId ?? null;
@@ -2904,6 +4154,7 @@ export function runQueue(options) {
 			} else {
 				attemptedTaskIds.add(task.id);
 			}
+			context._activeInvocationDescriptor = null;
 
 			if (onTaskStart) onTaskStart(task);
 			if (runStore) {
@@ -2930,7 +4181,25 @@ export function runQueue(options) {
 			let retryHaltResult = null;
 			let retryUsed = Boolean(retryState);
 			let retryTargetId = retryState?.resolvedTargetId ?? null;
-			if (retryState) {
+			const retryEvidenceMissing =
+				Boolean(retryState) && !hasExactRetryDescriptorEvidence(retryState);
+			if (retryEvidenceMissing) {
+				// Historical model-only retry state is readable, but it cannot
+				// authorize a retry against an exact descriptor/target. Halt before
+				// reset, reroute, or adapter invocation; the normal finally path
+				// still releases the run/project locks.
+				result = {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					resolvedTargetId: retryState.resolvedTargetId ?? null,
+					result: "unknown_failure",
+					errorKind: "descriptor_receipt",
+					reason:
+						"historical retry state lacks exact invocation descriptor evidence",
+				};
+			} else if (retryState) {
 				const resumedTargetId = normalizeRetryTargetId(
 					retryState.resolvedTargetId,
 				);
@@ -2951,6 +4220,9 @@ export function runQueue(options) {
 						taskId: task.id,
 						attempt: 1,
 						resolvedTargetId: resumedTargetId,
+						invocationDescriptor: retryState.invocationDescriptor,
+						descriptorIdentity: retryState.descriptorIdentity,
+						descriptorHarness: retryState.descriptorHarness,
 					});
 					projectRetryState();
 				}
@@ -2982,6 +4254,9 @@ export function runQueue(options) {
 								provider: null,
 								model: null,
 								resolvedTargetId: retryState.resolvedTargetId,
+								invocationDescriptor: retryState.invocationDescriptor,
+								descriptorIdentity: retryState.descriptorIdentity,
+								descriptorHarness: retryState.descriptorHarness,
 							},
 							checkpoint,
 							checkpointPath,
@@ -2997,6 +4272,9 @@ export function runQueue(options) {
 							taskId: task.id,
 							attempt: 2,
 							resolvedTargetId: retryState.resolvedTargetId,
+							invocationDescriptor: retryState.invocationDescriptor,
+							descriptorIdentity: retryState.descriptorIdentity,
+							descriptorHarness: retryState.descriptorHarness,
 						});
 						projectRetryState();
 						context.exclude = mergeRetryExclusions(
@@ -3008,6 +4286,12 @@ export function runQueue(options) {
 				}
 			} else {
 				result = executeTask(task, context);
+				if (context._activeInvocationDescriptor) {
+					Object.assign(
+						result,
+						descriptorReceiptFields(context._activeInvocationDescriptor),
+					);
+				}
 				if (isQuotaRetryCandidate(result, ownsWorkingContainer)) {
 					const targetId = normalizeRetryTargetId(result.resolvedTargetId);
 					retryUsed = true;
@@ -3020,6 +4304,9 @@ export function runQueue(options) {
 						provider: result.provider,
 						model: result.model,
 						resolvedTargetId: targetId,
+						invocationDescriptor: result.invocationDescriptor,
+						descriptorIdentity: result.descriptorIdentity,
+						descriptorHarness: result.descriptorHarness,
 					});
 					projectRetryState();
 					checkpoint.quarantinedTargetIds = [
@@ -3032,6 +4319,9 @@ export function runQueue(options) {
 						provider: result.provider,
 						model: result.model,
 						resolvedTargetId: targetId,
+						invocationDescriptor: result.invocationDescriptor,
+						descriptorIdentity: result.descriptorIdentity,
+						descriptorHarness: result.descriptorHarness,
 					});
 					projectRetryState();
 					if (emitStatus) {
@@ -3043,6 +4333,9 @@ export function runQueue(options) {
 							provider: result.provider,
 							model: result.model,
 							resolvedTargetId: targetId,
+							invocationDescriptor: result.invocationDescriptor,
+							descriptorIdentity: result.descriptorIdentity,
+							descriptorHarness: result.descriptorHarness,
 						});
 					}
 					retryHaltResult = resetBeforeQuotaRetry({
@@ -3062,6 +4355,9 @@ export function runQueue(options) {
 							provider: result.provider,
 							model: result.model,
 							resolvedTargetId: targetId,
+							invocationDescriptor: result.invocationDescriptor,
+							descriptorIdentity: result.descriptorIdentity,
+							descriptorHarness: result.descriptorHarness,
 						});
 						projectRetryState();
 						context.exclude = mergeRetryExclusions(
@@ -3087,6 +4383,12 @@ export function runQueue(options) {
 			}
 			if (retryUsed) {
 				appendRetryAttempt(checkpoint, result, 2);
+			}
+			if (context._activeInvocationDescriptor) {
+				Object.assign(
+					result,
+					descriptorReceiptFields(context._activeInvocationDescriptor),
+				);
 			}
 			if (result.partialDiff) {
 				try {
@@ -3164,11 +4466,25 @@ export function runQueue(options) {
 				taskId: result.taskId,
 				provider: result.provider,
 				model: result.model,
+				...(result.invocationDescriptor
+					? {
+							dispatchContractVersion: DISPATCH_DESCRIPTOR_CONTRACT_VERSION,
+							invocationDescriptor: result.invocationDescriptor,
+							descriptorIdentity:
+								result.invocationDescriptor.descriptor_identity,
+							descriptorHarness: result.descriptorHarness ?? null,
+							resolvedTargetId: result.resolvedTargetId ?? null,
+						}
+					: {}),
 				result: result.result,
+				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
 				partialDiffPath: null,
 				...(safeFailure ?? {}),
+				...(opaqueArtifactRef(result.artifactRef)
+					? { artifactRef: opaqueArtifactRef(result.artifactRef) }
+					: {}),
 				timestamp: new Date().toISOString(),
 			});
 			checkpoint.lastTaskId = result.taskId;
@@ -3184,7 +4500,13 @@ export function runQueue(options) {
 					attempt: 2,
 					provider: result.provider,
 					model: result.model,
-					resolvedTargetId: retryTargetId,
+					resolvedTargetId:
+						result.invocationDescriptor?.target_id ??
+						normalizeRetryTargetId(result.resolvedTargetId) ??
+						retryTargetId,
+					invocationDescriptor: result.invocationDescriptor,
+					descriptorIdentity: result.descriptorIdentity,
+					descriptorHarness: result.descriptorHarness,
 					clearState: true,
 					save: false,
 				});
@@ -3385,6 +4707,7 @@ export async function runQueueWithOrchestrator(options) {
 	const onResult = dependencies.onResult ?? null;
 	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
 	const runStore = dependencies.runStore ?? null;
+	const runStorePath = dependencies.runStorePath ?? null;
 	const wipeWorkingContainerFn =
 		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 	const emitStatus = _resolveOnStatus(dependencies);
@@ -3428,12 +4751,20 @@ export async function runQueueWithOrchestrator(options) {
 
 	const recordDispatchToStoreFn =
 		dependencies.recordDispatchToStore ?? recordDispatchToStore;
+	const recordDispatchIntentFn =
+		dependencies.recordDispatchIntent ?? recordDispatchIntentToStore;
 	const defaultRecordDispatch = async (dispatch) => {
-		await recordDispatchToBothLedgers(dispatch, recordDispatchToStoreFn);
+		await recordDispatchToBothLedgers(dispatch, (data) =>
+			recordDispatchToStoreFn(data, runStorePath),
+		);
 	};
+	const defaultRecordDispatchIntent = (intent) =>
+		recordDispatchIntentFn(intent, runStorePath);
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
+		recordDispatchIntent:
+			dependencies.recordDispatchIntent ?? defaultRecordDispatchIntent,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
 		orchestrator: resolveOrchestrator(dependencies),
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
@@ -3446,6 +4777,9 @@ export async function runQueueWithOrchestrator(options) {
 		onPoll: dependencies.onPoll ?? null,
 		onStatus: emitStatus,
 		onTaskRouted,
+		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
+		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
+		resolveDescriptor: dependencies.resolveDescriptor,
 	};
 
 	try {
@@ -3512,6 +4846,14 @@ export async function runQueueWithOrchestrator(options) {
 					}
 				: null,
 		);
+		ensureRetryCheckpoint(checkpoint);
+		validateRetryDescriptorEvidence(checkpoint);
+		if (checkpoint.retryState !== null) {
+			const reason = hasExactRetryDescriptorEvidence(checkpoint.retryState)
+				? "orchestrator mode cannot resume persisted retry state until an audited retry-resume state machine is implemented"
+				: "historical retry state lacks exact invocation descriptor evidence";
+			throw new Error(`runQueueWithOrchestrator: ${reason}`);
+		}
 		const selectionOptions = identity.enabled
 			? { selectedTaskIds: effectiveTaskIds }
 			: {};
@@ -3522,6 +4864,16 @@ export async function runQueueWithOrchestrator(options) {
 		);
 		const attemptedTaskIds = new Set();
 		const results = [];
+		reconcileAlreadyCompleteSelection(
+			checkpoint,
+			checkpointPath,
+			results,
+			effectiveTaskIds,
+			tasks,
+			onResult,
+			emitStatus,
+			onCheckpointSaved,
+		);
 		let processed = 0;
 		let halted = false;
 
@@ -3533,6 +4885,7 @@ export async function runQueueWithOrchestrator(options) {
 			const task = runnable[0];
 			if (!task) break;
 			attemptedTaskIds.add(task.id);
+			context._activeInvocationDescriptor = null;
 
 			if (onTaskStart) onTaskStart(task);
 			if (runStore) {
@@ -3554,6 +4907,12 @@ export async function runQueueWithOrchestrator(options) {
 
 			// eslint-disable-next-line no-await-in-loop
 			const result = await executeTaskWithOrchestrator(task, context);
+			if (context._activeInvocationDescriptor) {
+				Object.assign(
+					result,
+					descriptorReceiptFields(context._activeInvocationDescriptor),
+				);
+			}
 
 			if (onResult) onResult(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
@@ -3589,11 +4948,25 @@ export async function runQueueWithOrchestrator(options) {
 				taskId: result.taskId,
 				provider: result.provider,
 				model: result.model,
+				...(result.invocationDescriptor
+					? {
+							dispatchContractVersion: DISPATCH_DESCRIPTOR_CONTRACT_VERSION,
+							invocationDescriptor: result.invocationDescriptor,
+							descriptorIdentity:
+								result.invocationDescriptor.descriptor_identity,
+							descriptorHarness: result.descriptorHarness ?? null,
+							resolvedTargetId: result.resolvedTargetId ?? null,
+						}
+					: {}),
 				result: result.result,
+				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
 				partialDiffPath: null,
 				...(safeFailure ?? {}),
+				...(opaqueArtifactRef(result.artifactRef)
+					? { artifactRef: opaqueArtifactRef(result.artifactRef) }
+					: {}),
 				timestamp: new Date().toISOString(),
 			});
 			checkpoint.lastTaskId = result.taskId;

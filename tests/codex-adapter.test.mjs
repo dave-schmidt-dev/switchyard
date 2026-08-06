@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { captureDiff, executeCodex } from "../src/switchyard/adapter/codex.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 function hasDocker() {
 	try {
@@ -18,6 +19,17 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-codex-adapter-"));
 const containerName = `switchyard-codex-adapter-${Date.now()}`;
+const CODEX_DESCRIPTOR = validateInvocationDescriptor(
+	{
+		target_id: "codex-target",
+		model_ref: "fake-model",
+		selector: "fake-model",
+		effort: "high",
+		variant: null,
+		invocation_args: ["-c", "model_reasoning_effort=high"],
+	},
+	"codex",
+);
 
 // Fake `codex` that ENFORCES the adapter's headless invocation shape (Task 25):
 // it exits non-zero unless executeCodex passed BOTH the `exec` subcommand
@@ -34,6 +46,10 @@ esac
 case " $* " in
   *" --dangerously-bypass-approvals-and-sandbox "*) ;;
   *) echo "stub: executeCodex did not pass --dangerously-bypass-approvals-and-sandbox (Task 25); args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" -c model_reasoning_effort=high exec "*) ;;
+  *) echo "stub: executeCodex did not forward descriptor effort before exec; args: $*" >&2; exit 3 ;;
 esac
 echo updated >> test.txt
 echo codex
@@ -93,6 +109,10 @@ describe("codex adapter container execution", () => {
 		// assertion that executeCodex sends them (Task 25).
 		const result = executeCodex("apply a small change", containerName, {
 			model: "fake-model",
+			resolvedTargetId: CODEX_DESCRIPTOR.target_id,
+			descriptorHarness: "codex",
+			invocationDescriptor: CODEX_DESCRIPTOR,
+			descriptorIdentity: CODEX_DESCRIPTOR.descriptor_identity,
 		});
 		strictEqual(result.success, true);
 
