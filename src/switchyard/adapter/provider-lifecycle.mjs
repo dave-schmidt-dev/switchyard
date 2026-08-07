@@ -232,12 +232,30 @@ function truncateDiagnostic(value, maxChars = DEFAULT_DIAGNOSTIC_CHARS) {
  * this boundary and remain bounded before callers can persist/report them.
  */
 export async function executeProviderInvocation(command, args, options = {}) {
-	const { provider, cleanup, ...lifecycleOptions } = options;
+	const { provider, cleanup, idleExitCode, ...lifecycleOptions } = options;
 	const result = await runProviderProcess(command, args, {
 		...lifecycleOptions,
 		cleanup,
 	});
 	if (result.success) return { output: result.output, success: true };
+	// A provider whose container-side supervisor reports this reserved exit code
+	// finished its work but could not exit on its own (see opencode.mjs). The
+	// work is in the working tree, so it is mapped to success and the captured
+	// diff still passes through the integration gate.
+	if (
+		typeof idleExitCode === "number" &&
+		result.code === idleExitCode &&
+		!result.timedOut &&
+		!result.cancelled &&
+		!result.error
+	) {
+		return {
+			output: result.output,
+			stderr: result.stderr,
+			success: true,
+			idleTerminated: true,
+		};
+	}
 	if (result.timedOut) {
 		return {
 			output: result.output,
