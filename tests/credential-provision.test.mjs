@@ -45,6 +45,7 @@ const CREDENTIAL_FILES = [
 	"/root/.config/cursor/auth.json",
 	"/root/.config/github-copilot/hosts.json",
 	"/root/.config/github-copilot/apps.json",
+	"/root/.copilot/config.json",
 	"/root/.config/gh/hosts.yml",
 	"/root/.local/share/opencode/auth.json",
 	"/root/.local/share/opencode/config.json",

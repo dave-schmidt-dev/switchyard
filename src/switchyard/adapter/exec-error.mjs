@@ -258,7 +258,7 @@ const REAUTH_LOGIN = {
 	codex: "codex login --device-auth",
 	agy: "agy --print hi",
 	cursor: "NO_OPEN_BROWSER=1 cursor-agent login",
-	copilot: "copilot auth login",
+	copilot: "copilot login",
 	opencode: "opencode auth login",
 };
 

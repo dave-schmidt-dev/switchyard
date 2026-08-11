@@ -15,7 +15,10 @@ import {
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const COPILOT_CMD = "copilot";
-const CREDENTIALS_PATH = "/root/.config/github-copilot/apps.json";
+// Copilot CLI's current OAuth device-flow credential store. The file is
+// copied as an opaque credential file; its contents are never parsed or
+// logged by Switchyard.
+const CREDENTIALS_PATH = "/root/.copilot/config.json";
 const MIN_CREDENTIAL_BYTES = 16;
 
 function hasNonTrivialCredential(containerName) {
@@ -70,12 +73,13 @@ export function execute(prompt, workingContainerName, options = {}) {
 
 	const args = [
 		"exec",
-		"-i",
 		"-w",
 		"/project",
 		workingContainerName,
 		COPILOT_CMD,
-		"-s",
+		"-p",
+		guardedPrompt,
+		"--allow-all-tools",
 		"--no-ask-user",
 	];
 	if (model) {
@@ -142,12 +146,13 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 		});
 		const args = [
 			"exec",
-			"-i",
 			"-w",
 			"/project",
 			workingContainerName,
 			COPILOT_CMD,
-			"-s",
+			"-p",
+			guardedPrompt,
+			"--allow-all-tools",
 			"--no-ask-user",
 		];
 		if (model) {
@@ -157,7 +162,6 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 		return await executeProviderInvocation("docker", args, {
 			...options,
 			provider: "copilot",
-			input: guardedPrompt,
 			timeoutMs,
 			signal,
 			onPoll,

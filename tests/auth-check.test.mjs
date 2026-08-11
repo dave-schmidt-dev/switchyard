@@ -1,6 +1,7 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
+	COPILOT_LOGIN_COMMAND,
 	ensureProvidersAuthenticated,
 	PROVIDERS,
 	reportProviderStatus,
@@ -25,6 +26,10 @@ function fakeProvider(name, { authenticatedSequence }) {
 }
 
 describe("ensureProvidersAuthenticated", () => {
+	it("uses the supported Copilot CLI login subcommand", () => {
+		deepStrictEqual(COPILOT_LOGIN_COMMAND, ["copilot", "login"]);
+	});
+
 	it("skips runLogin() for providers already authenticated", () => {
 		const provider = fakeProvider("already-ok", {
 			authenticatedSequence: [true],

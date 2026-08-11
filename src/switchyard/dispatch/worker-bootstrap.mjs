@@ -5,7 +5,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { Diagnostics } from "../diagnostics/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
@@ -56,6 +56,20 @@ try {
 let writeChain = Promise.resolve();
 let writeFailureCount = 0;
 let lastWriteFailure = null;
+const shutdown = new AbortController();
+let shutdownSignal = null;
+
+function requestGracefulShutdown(signal) {
+	if (shutdownSignal) return;
+	shutdownSignal = signal;
+	shutdown.abort();
+	console.error(
+		`worker-bootstrap: received ${signal}; finishing durable cleanup`,
+	);
+}
+
+process.on("SIGINT", () => requestGracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => requestGracefulShutdown("SIGTERM"));
 
 function safeWriteFailure(error) {
 	writeFailureCount += 1;
@@ -125,7 +139,19 @@ function captureCurrentFingerprint(projectPath) {
 		if (headResult.status === 0) {
 			head = headResult.stdout.trim();
 		}
-		const statusResult = spawnSync("git", ["status", "--porcelain"], {
+		const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
+		const relativeStateRoot = relative(
+			resolve(projectPath),
+			resolve(stateRoot),
+		);
+		if (
+			relativeStateRoot &&
+			!isAbsolute(relativeStateRoot) &&
+			!relativeStateRoot.startsWith(`..${sep}`)
+		) {
+			statusArgs.push("--", ".", `:(exclude)${relativeStateRoot}/**`);
+		}
+		const statusResult = spawnSync("git", statusArgs, {
 			cwd: projectPath,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
@@ -246,6 +272,7 @@ try {
 				}
 			: {}),
 		dependencies: {
+			signal: shutdown.signal,
 			// These callbacks all use updateRunWithRetry rather than a
 			// read-then-updateRun(fixed revision) pair, and each one synchronously
 			// extends the module-scope `writeChain` (declared above) instead of

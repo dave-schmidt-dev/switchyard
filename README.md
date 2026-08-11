@@ -44,7 +44,7 @@ The 2026-08-04 capability-reliability checkpoint adds explicit `RequiredCapabili
 | `src/switchyard/adapter/codex.mjs` | Codex CLI adapter: dispatch via `codex exec` (prompt over stdin), diff capture, real credential check (`/root/.codex/auth.json`, persisted by `codex login --device-auth`). |
 | `src/switchyard/adapter/agy.mjs` | Antigravity (Agy) CLI adapter: dispatch (prompt via `--print` flag, not stdin — the CLI can't read it for this purpose), diff capture, real credential check (`/root/.gemini/antigravity-cli/antigravity-oauth-token`, persisted by agy's auto-triggered Google OAuth flow). |
 | `src/switchyard/adapter/cursor.mjs` | Cursor Agent adapter: dispatch invokes `cursor-agent` directly, diff capture, real credential check via `cursor-agent status` text (persisted by `cursor-agent login`). |
-| `src/switchyard/adapter/copilot.mjs` | Copilot CLI adapter: dispatch invokes `copilot`, diff capture, real credential check (`/root/.config/github-copilot`). |
+| `src/switchyard/adapter/copilot.mjs` | Copilot CLI adapter: dispatch invokes `copilot`, diff capture, and an opaque credential-file check at `/root/.copilot/config.json` (the current device-flow store). |
 | `src/switchyard/adapter/opencode.mjs` | Opencode CLI adapter: dispatch invokes `opencode`, diff capture, real credential check (`/root/.config/opencode`). |
 | `src/switchyard/auth/index.mjs` | Walks a human through authenticating every provider that isn't already authenticated, by running each one's real interactive OAuth login inside the standing agent container. Run the walkthrough via `npm run auth`; `npm run auth:check` (`reportProviderStatus`) reports read-only per-provider status without ever attempting a login. |
 | `src/switchyard/runner/index.mjs` | Host-side queue runner with checkpoint/resume and headless poll/`wait` orchestration mode (`SWITCHYARD_ORCHESTRATOR_CMD`). Wires all six adapters; `route()` is restricted to whichever adapters are actually present. Seeds, commits between tasks, and wipes the working container it creates — owns the container-wipe logic INV-3 governs (INV-3's area map includes this module). Parses `Type:` (`implementation` by default or `review`), requires `Files:` for implementation tasks, and parses `AllowManifests: true` as the explicit sensitive-manifest opt-in; the integration gate rejects any diff that doesn't exactly match the declared target paths (rename/delete included). Also parses an optional `Timeout:` field overriding `PROVIDER_EXECUTION_TIMEOUT_MS` per task; on a timeout the runner captures the diff as a review artifact instead of discarding it (never through the integration gate — see "Timeout Handling"). A tasks file that parses to 0 tasks fails closed (throws with the file path, detected heading count, and expected format) rather than silently reporting a 0/0 success, and always writes an auditable checkpoint first; a run also always leaves a final checkpoint on disk even when it reaches 0 runnable tasks without entering the per-task loop. The per-task checkpoint/result block — including failed/timed-out bookkeeping, on both the sync and orchestrator paths — is saved to disk **before** the working-container commit/reset, so a commit crash or external kill mid-commit can never leave a completed task outside the durable checkpoint; a commit/reset failure then halts the run (`halted_after_commit_failure`/`halted_after_reset_failure`) instead of dispatching the next task against a container with an unadvanced or un-reset baseline. Verified `quota_exhausted` failures on an owned container enter a checkpoint-authoritative, target-specific quarantine state, reset before one reroute, and never consume a second logical `maxTasks` slot; resume reconstructs an interrupted quarantine transition before selecting a target. Emits a `task_routed` event/callback (`{taskId, provider, model, deadline}`) synchronously right after routing, before the blocking (up to `PROVIDER_EXECUTION_TIMEOUT_MS`-long) adapter call. Fires a new `onContainerReady` callback unconditionally right after `workingContainerName` is resolved (both the freshly-created and pre-supplied-name branches), surfacing it into the run record. The authoritative project-local intent receipt is written synchronously before adapter execution or awaited before orchestrator launch; only outcome projections to the local/legacy ledgers are non-blocking/best-effort. `runQueue` and `runQueueWithOrchestrator` carry the same `only` and `exclude` provider filters into their route calls; the orchestrator context also carries the available adapter set. |
@@ -143,14 +143,14 @@ npm run auth
 
 For each unauthenticated provider it runs (attached to your terminal, so follow the prompts — visit a URL, paste a code, approve in a browser):
 
-| Provider | Real login command |
+| Provider | Run from a host terminal |
 |---|---|
-| claude | `claude auth login` (subscription auth, not `--console`/API billing) |
-| codex | `codex login --device-auth` (device-code flow, no local browser needed) |
-| agy | no explicit subcommand — running it unauthenticated auto-triggers a Google OAuth flow |
-| cursor | `NO_OPEN_BROWSER=1 cursor-agent login` |
-| copilot | `copilot auth login` |
-| opencode | `opencode auth login` |
+| claude | `docker exec -it switchyard-agent claude auth login` (subscription auth, not `--console`/API billing) |
+| codex | `docker exec -it switchyard-agent codex login --device-auth` (device-code flow) |
+| agy | `docker exec -it switchyard-agent agy --print hi` (triggers OAuth when needed) |
+| cursor | `docker exec -it -e NO_OPEN_BROWSER=1 switchyard-agent cursor-agent login` |
+| copilot | `docker exec -it switchyard-agent copilot login` |
+| opencode | `docker exec -it switchyard-agent opencode auth login` |
 
 A completed login persists to the provider CLI's own credential store inside the standing agent container (which is never wiped, unlike working containers — INV-3), so it holds across many tasks — you do not re-authenticate per dispatch. Exits non-zero if any provider is still unauthenticated when it finishes.
 

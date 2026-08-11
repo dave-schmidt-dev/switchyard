@@ -213,7 +213,7 @@ describe("reauthHintFor", () => {
 			["claude", "claude auth login"],
 			["codex", "codex login --device-auth"],
 			["cursor", "cursor-agent login"],
-			["copilot", "copilot auth login"],
+			["copilot", "copilot login"],
 			["opencode", "opencode auth login"],
 			["agy", "agy --print hi"],
 		]) {

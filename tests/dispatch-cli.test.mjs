@@ -53,6 +53,7 @@ const ROSTER_FIXTURE_PATH = resolve(
 );
 
 import {
+	captureHostFingerprint,
 	runDispatch as dispatchRun,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
@@ -302,6 +303,25 @@ describe("parseDispatchArgs (backwards compat)", () => {
 			})().includes("not a git repository"),
 			true,
 		);
+	});
+});
+
+describe("captureHostFingerprint", () => {
+	it("ignores the project-local durable run store while detecting source edits", () => {
+		mkdirSync(projectDir, { recursive: true });
+		writeFileSync(join(projectDir, "README.md"), "canary\n", "utf8");
+		execSync(
+			"git init -q && git add README.md && git -c user.name=Test -c user.email=test@example.invalid commit -qm seed",
+			{
+				cwd: projectDir,
+			},
+		);
+		mkdirSync(join(stateRoot, "runs", "live"), { recursive: true });
+		writeFileSync(join(stateRoot, "runs", "live", "run.json"), "{}\n", "utf8");
+
+		ok(captureHostFingerprint(projectDir).endsWith(":clean"));
+		writeFileSync(join(projectDir, "README.md"), "changed\n", "utf8");
+		ok(captureHostFingerprint(projectDir).endsWith(":dirty"));
 	});
 });
 
@@ -2160,6 +2180,25 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		strictEqual(run.cleanupState, "complete");
 	});
 
+	it("defaults durable state to the target project when no override is set", async () => {
+		const savedRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		try {
+			const exitCode = await dispatchRun(
+				parseDispatchArgs([tasksFile, "--project", projectDir]),
+				{ runQueue: () => stubResult(true) },
+			);
+			strictEqual(exitCode, undefined);
+			ok(
+				existsSync(join(projectDir, ".logs", "switchyard", "runs")),
+				"default run store must be colocated with the dispatched project",
+			);
+		} finally {
+			if (savedRoot === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = savedRoot;
+		}
+	});
+
 	it("releases the project lock after a thrown runQueue error", async () => {
 		const { isProjectLockHeld } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -2188,40 +2227,35 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		strictEqual(run.cleanupState, "complete");
 	});
 
-	it("releases the project lock even when the run-store init failed (runStoreReady false)", async () => {
+	it("fails before queue execution when run-store initialization fails", async () => {
 		const { isProjectLockHeld } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 
-		// Block the run-store from initializing: with a plain file sitting at
-		// stateRoot/runs, initializeRun's ensureDir for the run directory
-		// fails, so runStoreReady stays false and no run record is created.
-		// The queue stub still runs, and its throw must propagate with no
-		// project lock left behind regardless of the failed init (INV-6).
-		// The lock is only ever attempted once the run record exists, so a
-		// degraded run store means no lock at all (the unlabeled legacy
-		// path) — never a lock without a record to back it.
+		// Block run-store initialization with a plain file at stateRoot/runs.
+		// INV-6 requires a durable record before any queue work, so this must
+		// fail before the runner can route or create a working container.
 		mkdirSync(stateRoot, { recursive: true });
 		writeFileSync(join(stateRoot, "runs"), "blocker", "utf8");
 
+		let queueCalls = 0;
 		const savedExitCode = process.exitCode;
 		try {
 			await rejects(
 				dispatchRun(parseDispatchArgs([tasksFile, "--project", projectDir]), {
 					runQueue: () => {
-						throw new Error("queue ran despite init failure");
+						queueCalls += 1;
+						return stubResult(true);
 					},
 				}),
-				/queue ran despite init failure/,
+				/run-store initialization failed before routing/,
 			);
 		} finally {
 			process.exitCode = savedExitCode;
 		}
 
-		ok(
-			!isProjectLockHeld(projectDir),
-			"project lock must be released even when the run-store init failed",
-		);
+		strictEqual(queueCalls, 0, "queue must not run without a durable store");
+		ok(!isProjectLockHeld(projectDir), "no project lock may be acquired");
 		const runsPath = join(stateRoot, "runs");
 		ok(
 			!existsSync(runsPath) ||

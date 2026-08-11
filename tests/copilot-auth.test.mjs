@@ -98,12 +98,11 @@ describe("copilot adapter shell injection guard", () => {
 });
 
 describe("isCopilotAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the binary is absent even with nontrivial hosts.json and apps.json present", {
+	it("returns false when the binary is absent even with a nontrivial current credential present", {
 		skip: !dockerAvailable,
 	}, () => {
 		const containerName = `switchyard-copilot-binfail-${Date.now()}`;
-		const appsPath = "/root/.config/github-copilot/apps.json";
-		const hostsPath = "/root/.config/github-copilot/hosts.json";
+		const credentialPath = "/root/.copilot/config.json";
 
 		execSync(
 			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
@@ -111,11 +110,7 @@ describe("isCopilotAuthenticated credential-validity check (real container)", ()
 		);
 		try {
 			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.config/github-copilot && printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${appsPath}'`,
-				{ stdio: "pipe" },
-			);
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{\\"host\\":\\"github.com\\",\\"accessToken\\":\\"gho_fake-token-value-1234567890\\"}" > ${hostsPath}'`,
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.copilot && printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credentialPath}'`,
 				{ stdio: "pipe" },
 			);
 
@@ -133,7 +128,7 @@ describe("isCopilotAuthenticated credential-validity check (real container)", ()
 		skip: !dockerAvailable,
 	}, () => {
 		const containerName = `switchyard-copilot-authcheck-${Date.now()}`;
-		const credPath = "/root/.config/github-copilot/apps.json";
+		const credPath = "/root/.copilot/config.json";
 
 		execSync(
 			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
@@ -152,7 +147,7 @@ describe("isCopilotAuthenticated credential-validity check (real container)", ()
 			);
 
 			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.config/github-copilot && : > ${credPath}'`,
+				`docker exec ${containerName} sh -c 'mkdir -p /root/.copilot && : > ${credPath}'`,
 				{ stdio: "pipe" },
 			);
 			strictEqual(

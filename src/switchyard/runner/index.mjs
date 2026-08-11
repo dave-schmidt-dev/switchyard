@@ -2920,6 +2920,19 @@ export async function runQueueAsync(options) {
 			throw new Error("runQueueAsync: failed to create working container");
 		}
 		ownsWorkingContainer = true;
+		// Credential provisioning and project seeding can be slow. Publish the
+		// resolved container before either operation so status is useful during
+		// bootstrap rather than looking like a dead launch.
+		try {
+			dependencies.onContainerReady?.({ workingContainerName });
+		} catch (error) {
+			try {
+				wipeWorkingContainerFn(workingContainerName);
+			} catch {
+				// Best effort cleanup; preserve the callback failure.
+			}
+			throw error;
+		}
 		try {
 			provisionCredentialsFn(workingContainerName);
 		} catch (error) {
@@ -2964,7 +2977,6 @@ export async function runQueueAsync(options) {
 	};
 	const results = [];
 	try {
-		dependencies.onContainerReady?.({ workingContainerName });
 		const runnable = getRunnableTasks(tasks, checkpoint, {
 			selectedTaskIds: taskIds,
 			resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,

@@ -54,6 +54,8 @@ function runInteractiveLogin(loginCommand, env = {}) {
 	}
 }
 
+export const COPILOT_LOGIN_COMMAND = Object.freeze(["copilot", "login"]);
+
 const PROVIDERS = [
 	{
 		name: "claude",
@@ -89,7 +91,7 @@ const PROVIDERS = [
 	{
 		name: "copilot",
 		isAuthenticated: isCopilotAuthenticated,
-		runLogin: () => runInteractiveLogin(["copilot", "auth", "login"]),
+		runLogin: () => runInteractiveLogin(COPILOT_LOGIN_COMMAND),
 	},
 	{
 		name: "opencode",

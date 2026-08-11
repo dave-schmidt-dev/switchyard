@@ -35,10 +35,17 @@ const COPILOT_DESCRIPTOR = validateInvocationDescriptor(
 );
 
 const COPILOT_STUB = `#!/bin/sh
-cat >/dev/null
 case " $* " in
-  *" -s --no-ask-user "*) ;;
-  *) echo "stub: executeCopilot did not pass -s --no-ask-user; args: $*" >&2; exit 3 ;;
+  *" -p "*) ;;
+  *) echo "stub: executeCopilot did not pass -p; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --allow-all-tools "*) ;;
+  *) echo "stub: executeCopilot did not pass --allow-all-tools; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --no-ask-user "*) ;;
+  *) echo "stub: executeCopilot did not pass --no-ask-user; args: $*" >&2; exit 3 ;;
 esac
 echo updated >> test.txt
 echo copilot
@@ -84,7 +91,7 @@ describe("copilot adapter container execution", () => {
 		rmSync(testRoot, { recursive: true, force: true });
 	});
 
-	it("passes -s --no-ask-user and captures the applied diff", {
+	it("passes noninteractive prompt and tool permissions, then captures the diff", {
 		skip: !dockerAvailable,
 	}, () => {
 		const result = executeCopilot("apply a small change", containerName, {

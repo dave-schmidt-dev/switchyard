@@ -33,7 +33,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
@@ -368,6 +368,17 @@ function parseRecoverArgs(argv) {
  *   in isolation from queue execution (no Docker/containers on that path).
  */
 async function runDispatch(opts, dependencies = {}) {
+	// A dispatch belongs to its target project, not to this checkout. Keeping
+	// durable state beside that project avoids File Provider permissions on a
+	// separately checked-out Switchyard source tree. Explicit overrides remain
+	// authoritative for isolated tests and shared operational stores.
+	if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
+		process.env.SWITCHYARD_RUN_STORE_ROOT = resolve(
+			opts.projectPath,
+			".logs",
+			"switchyard",
+		);
+	}
 	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
 	console.error(`dispatch: queue    ${opts.tasksFilePath}`);
 	console.error(`dispatch: project  ${opts.projectPath}`);
@@ -464,8 +475,8 @@ async function runDispatch(opts, dependencies = {}) {
 		await advanceState(runId, "running");
 		runStoreReady = true;
 	} catch (error) {
-		console.error(
-			`dispatch: run-store init failed (${error.message}); continuing without leak-recovery labels`,
+		throw new Error(
+			`dispatch: run-store initialization failed before routing (${error.message})`,
 		);
 	}
 
@@ -653,7 +664,19 @@ function captureHostFingerprint(projectPath) {
 		if (headResult.status === 0) {
 			head = headResult.stdout.trim();
 		}
-		const statusResult = spawnSync("git", ["status", "--porcelain"], {
+		const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
+		const relativeStateRoot = relative(
+			resolve(projectPath),
+			resolve(getStateRoot()),
+		);
+		if (
+			relativeStateRoot &&
+			!isAbsolute(relativeStateRoot) &&
+			!relativeStateRoot.startsWith(`..${sep}`)
+		) {
+			statusArgs.push("--", ".", `:(exclude)${relativeStateRoot}/**`);
+		}
+		const statusResult = spawnSync("git", statusArgs, {
 			cwd: projectPath,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
@@ -702,6 +725,13 @@ async function handleLaunch(argv) {
 		return;
 	}
 	assertGenerationAllowed();
+	if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
+		process.env.SWITCHYARD_RUN_STORE_ROOT = resolve(
+			opts.projectPath,
+			".logs",
+			"switchyard",
+		);
+	}
 
 	const stateRoot = getStateRoot();
 	const runId = randomUUID();
