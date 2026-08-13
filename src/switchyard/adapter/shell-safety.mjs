@@ -7,6 +7,8 @@
 // and shell metacharacters as defense-in-depth against a future refactor
 // accidentally reintroducing shell interpolation.
 const SAFE_IDENTIFIER_RE = /^[\w./:@-]+$/;
+const SAFE_PARALLELS_UUID_RE =
+	/^\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?$/i;
 
 // Safe model-argument pattern: broader than SAFE_IDENTIFIER_RE because model
 // values are only ever delivered as a single execFileSync argv element (never
@@ -102,7 +104,9 @@ export function validateInvocationArgs(args, harness) {
 }
 
 /**
- * Validate that a string is a safe Docker container-name identifier.
+ * Validate that a string is a safe workspace identifier. Docker names use
+ * SAFE_IDENTIFIER_RE; Parallels workspaces use an exact UUID, optionally
+ * wrapped in the braces returned by prlctl.
  * Throws on invalid input — fail closed so no malformed value reaches Docker,
  * and as defense-in-depth against a future refactor reintroducing a shell.
  * @param {string} value
@@ -112,7 +116,7 @@ export function validateIdentifier(value, label) {
 	if (!value || typeof value !== "string") {
 		throw new Error(`${label} must be a non-empty string`);
 	}
-	if (!SAFE_IDENTIFIER_RE.test(value)) {
+	if (!SAFE_IDENTIFIER_RE.test(value) && !SAFE_PARALLELS_UUID_RE.test(value)) {
 		throw new Error(
 			`${label} contains unsafe characters: ${JSON.stringify(value)}`,
 		);

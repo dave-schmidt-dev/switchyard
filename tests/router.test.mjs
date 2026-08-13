@@ -34,20 +34,39 @@
 // Roster and test already agree on "claude" as the harness key; nothing to
 // change.
 
-import { notStrictEqual, ok, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	strictEqual,
+	throws,
+} from "node:assert";
 import { randomUUID } from "node:crypto";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__resetRosterCacheForTests,
 	getInvocationDescriptorIdentity,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
 } from "../src/switchyard/roster/index.mjs";
-import { route, routeBlind } from "../src/switchyard/router/index.mjs";
+import {
+	preflightMacosQueue,
+	route,
+	routeBlind,
+} from "../src/switchyard/router/index.mjs";
+import {
+	createQueueBackend,
+	executeTaskAsync,
+	normalizeRunOptions,
+	runQueue,
+	runQueueAsync,
+	runQueueWithOrchestrator,
+} from "../src/switchyard/runner/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
@@ -650,6 +669,438 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			"oversized windows must route, not crash the router",
 		);
 		strictEqual(result.percentLeft, 50, "min headroom computed via reduce");
+	});
+});
+
+describe("Task 4.3 timeout boundaries", () => {
+	it("records Docker timeout capture failure only after capture resolves", async () => {
+		const order = [];
+		const dispatches = [];
+		const descriptor = {
+			target_id: "claude-code",
+			model_ref: "fixture/claude-standard",
+			selector: "fixture/claude-standard",
+			invocation_args: [],
+		};
+		const result = await executeTaskAsync(
+			{
+				id: "4.3-docker",
+				title: "timeout",
+				description: "timeout",
+				requiredPaths: null,
+			},
+			{
+				route: () => ({
+					provider: "claude",
+					resolved_harness: "claude",
+					resolvedTargetId: "claude-code",
+					model: descriptor.selector,
+					invocationDescriptor: descriptor,
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: (entry) => {
+					order.push(`record:${entry.result}`);
+					dispatches.push(entry);
+				},
+				recordDispatchIntent: () => {},
+				integrationGate: () => {
+					throw new Error("timeout capture failure must not reach the gate");
+				},
+				adapters: {
+					claude: {
+						executeAsync: async () => ({
+							success: false,
+							timedOut: true,
+							error: "provider execution timed out (ETIMEDOUT)",
+						}),
+						captureDiffAsync: async () => {
+							order.push("capture");
+							return null;
+						},
+					},
+				},
+				workingContainerName: "docker-worker",
+				projectPath: process.cwd(),
+			},
+		);
+
+		strictEqual(result.result, "execution_timed_out_capture_failed");
+		strictEqual(result.success, false);
+		strictEqual(result.timedOut, true);
+		strictEqual(result.errorKind, "diff_capture_failed");
+		strictEqual(result.partialDiff, undefined);
+		strictEqual(dispatches[0].result, "execution_timed_out_capture_failed");
+		strictEqual(
+			order.join("|"),
+			"capture|record:execution_timed_out_capture_failed",
+		);
+	});
+
+	it("kills the recorded guest tree before clearing index.lock and retains the VM", () => {
+		const calls = [];
+		const statuses = [];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args.includes("/bin/cat")) return "4321\n";
+				return "ok";
+			},
+		});
+
+		const cleanup = backend.cleanupProviderProcess(
+			"prlctl",
+			["exec", "vm-timeout"],
+			{ onStatus: (event) => statuses.push(event.event) },
+		);
+		strictEqual(cleanup.pid, 4321);
+		strictEqual(
+			calls.findIndex((args) => args.includes("/project/.git/index.lock")) >
+				calls.findIndex((args) => args.includes("switchyard-kill-tree")),
+			true,
+		);
+		ok(
+			calls
+				.find((args) => args.includes("switchyard-kill-tree"))
+				.join(" ")
+				.includes("signal_tree TERM") &&
+				!calls
+					.find((args) => args.includes("switchyard-kill-tree"))
+					.join(" ")
+					.includes("kill -1"),
+		);
+		ok(!calls.some((args) => args.includes("destroy")));
+		strictEqual(statuses.at(-1), "provider_cleanup_complete");
+	});
+
+	it("does not clear index.lock when guest tree cleanup is unconfirmed", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args.includes("/bin/cat")) return "4321\n";
+				if (args.includes("switchyard-kill-tree")) {
+					throw new Error("guest provider survived cleanup");
+				}
+				return "ok";
+			},
+		});
+
+		throws(
+			() => backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"]),
+			/guest provider survived cleanup/,
+		);
+		ok(!calls.some((args) => args.includes("/project/.git/index.lock")));
+	});
+});
+
+describe("Task 6.1 queue-level platform selection", () => {
+	it("normalizes docker by default and rejects an invalid platform", () => {
+		strictEqual(normalizeRunOptions({}).platform, "docker");
+		throws(() => normalizeRunOptions({ platform: "windows" }), /platform/);
+	});
+
+	it("selects one macOS backend before workspace creation for every queue entrypoint", async () => {
+		const root = join(
+			tmpdir(),
+			`switchyard-platform-${process.pid}-${randomUUID()}`,
+		);
+		const tasksFilePath = join(root, "tasks.md");
+		const calls = [];
+		const backendFactory = ({ platform }) => {
+			strictEqual(platform, "macos");
+			return {
+				platform,
+				create: () => {
+					calls.push("create-vm");
+					return "vm-handle";
+				},
+				provision: () => calls.push("provision-vm"),
+				seed: () => calls.push("seed-vm"),
+				commit: () => calls.push("commit-vm"),
+				reset: () => calls.push("reset-vm"),
+				destroy: () => calls.push("destroy-vm"),
+			};
+		};
+		mkdirSync(root, { recursive: true });
+		writeFileSync(
+			tasksFilePath,
+			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
+			"utf8",
+		);
+		const base = {
+			tasksFilePath,
+			projectPath: process.cwd(),
+			checkpointPath: join(root, "checkpoint.json"),
+			platform: "macos",
+			dependencies: {
+				backendFactory,
+				orchestrator: { launch: async () => ({ jobId: "unused" }) },
+			},
+		};
+		try {
+			await runQueueAsync(base);
+			runQueue(base);
+			await runQueueWithOrchestrator(base);
+			strictEqual(calls.filter((call) => call === "create-vm").length, 3);
+			strictEqual(calls.filter((call) => call === "destroy-vm").length, 3);
+			ok(!calls.some((call) => call.includes("docker")));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the injected queue helper synchronous and exposes later queue gates", () => {
+		const events = [];
+		const helper = createQueueBackend({
+			platform: "macos",
+			dependencies: {
+				backendFactory: () => ({
+					create: () => "vm",
+					seed: () => {},
+					commit: () => {},
+					reset: () => {},
+					destroy: () => {},
+					preflight: () => events.push("preflight"),
+					acquireSlot: () => events.push("acquire"),
+					releaseSlot: () => events.push("release"),
+				}),
+			},
+		});
+		strictEqual(helper.platform, "macos");
+		strictEqual(typeof helper.preflight, "function");
+		strictEqual(typeof helper.acquireSlot, "function");
+		strictEqual(typeof helper.releaseSlot, "function");
+		deepStrictEqual(events, []);
+	});
+
+	it("wires the default macOS preflight into the queue backend", () => {
+		const helper = createQueueBackend({
+			platform: "macos",
+			dependencies: {
+				tarProvisionRegistry: { verified: true, providers: ["opencode"] },
+				preflightReadSnapshot: () => ({
+					snapshot: {
+						schema_version: 2,
+						updated_at: new Date().toISOString(),
+						providers: [
+							{
+								name: "codex",
+								ok: true,
+								windows: [{ percent_left: 80, pace_delta: 1 }],
+							},
+						],
+					},
+					snapshotStatus: "fresh",
+					snapshotMtime: 1,
+					snapshotAgeMsAtRoute: 0,
+				}),
+			},
+		});
+
+		throws(
+			() =>
+				helper.preflight({
+					tasks: [{ status: "pending", requiredCapability: "high" }],
+				}),
+			/high: no_tar_provisionable_provider_with_quota_headroom.*codex/,
+		);
+	});
+});
+
+describe("Task 6.3 macOS provider-eligibility preflight", () => {
+	function snapshotFor(...providers) {
+		return {
+			schema_version: 2,
+			updated_at: new Date().toISOString(),
+			providers,
+		};
+	}
+
+	function freshSnapshotReader(snapshot, calls) {
+		return () => {
+			calls.push("snapshot");
+			return {
+				snapshot,
+				snapshotStatus: "fresh",
+				snapshotMtime: 1,
+				snapshotAgeMsAtRoute: 0,
+			};
+		};
+	}
+
+	it("reads one snapshot for all tiers and counts blocked tasks as non-terminal", () => {
+		const reads = [];
+		const result = preflightMacosQueue({
+			tasks: [
+				{
+					id: "pending-standard",
+					status: "pending",
+					requiredCapability: "standard",
+				},
+				{ id: "blocked-high", status: "blocked", requiredCapability: "high" },
+				{ id: "done-high", status: "done", requiredCapability: "high" },
+			],
+			tarProvisionManifest: { verified: true, providers: ["codex"] },
+			readSnapshot: freshSnapshotReader(
+				snapshotFor({
+					name: "codex",
+					ok: true,
+					windows: [{ percent_left: 80, pace_delta: 1 }],
+				}),
+				reads,
+			),
+		});
+
+		strictEqual(reads.length, 1);
+		deepStrictEqual(result.checkedCapabilities, ["standard", "high"]);
+		strictEqual(result.eligible, true);
+		deepStrictEqual(result.rejections, []);
+	});
+
+	it("rejects an unsatisfiable blocked tier with its capability and excluded provider", () => {
+		const result = preflightMacosQueue({
+			tasks: [
+				{ id: "blocked-high", status: "blocked", requiredCapability: "high" },
+			],
+			tarProvisionRegistry: { verified: true, providers: ["opencode"] },
+			readSnapshot: freshSnapshotReader(
+				snapshotFor({
+					name: "OpenCode Go",
+					ok: true,
+					windows: [{ percent_left: 80, pace_delta: 1 }],
+				}),
+				[],
+			),
+		});
+
+		strictEqual(result.eligible, false);
+		deepStrictEqual(result.rejection, {
+			capability: "high",
+			excludedProviders: ["OpenCode Go"],
+			reason: "no_tar_provisionable_provider_with_quota_headroom",
+		});
+		strictEqual(
+			result.capabilityResults[0].excludedReasons["OpenCode Go"],
+			"below_required_capability",
+		);
+	});
+
+	it("rejects one unsatisfiable tier even when another tier is eligible", () => {
+		const reads = [];
+		const result = preflightMacosQueue({
+			tasks: [
+				{
+					id: "pending-standard",
+					status: "pending",
+					requiredCapability: "standard",
+				},
+				{ id: "pending-high", status: "pending", requiredCapability: "high" },
+			],
+			tarProvisionRegistry: { verified: true, providers: ["agy"] },
+			readSnapshot: freshSnapshotReader(
+				snapshotFor({
+					name: "agy",
+					ok: true,
+					windows: [{ percent_left: 80, pace_delta: 1 }],
+				}),
+				reads,
+			),
+		});
+
+		strictEqual(reads.length, 1);
+		deepStrictEqual(result.checkedCapabilities, ["standard", "high"]);
+		strictEqual(result.eligible, false);
+		strictEqual(result.capabilityResults[0].eligible, true);
+		strictEqual(result.capabilityResults[1].eligible, false);
+		deepStrictEqual(result.rejections, [
+			{
+				capability: "high",
+				excludedProviders: ["agy"],
+				reason: "no_tar_provisionable_provider_with_quota_headroom",
+			},
+		]);
+	});
+
+	it("fails closed for an absent or unverified tar manifest and respects only/exclude and adapters", () => {
+		const calls = [];
+		const result = preflightMacosQueue({
+			tasks: [
+				{ id: "standard", status: "pending", requiredCapability: "standard" },
+			],
+			only: ["codex"],
+			exclude: ["claude"],
+			availableProviders: ["claude"],
+			readSnapshot: freshSnapshotReader(
+				snapshotFor(
+					{
+						name: "codex",
+						ok: true,
+						windows: [{ percent_left: 80, pace_delta: 1 }],
+					},
+					{
+						name: "claude",
+						ok: true,
+						windows: [{ percent_left: 80, pace_delta: 1 }],
+					},
+				),
+				calls,
+			),
+		});
+
+		strictEqual(calls.length, 1);
+		strictEqual(result.eligible, false);
+		strictEqual(result.rejection.capability, "standard");
+		deepStrictEqual(result.rejection.excludedProviders, ["codex", "claude"]);
+		strictEqual(result.rejection.reason, "tar_provisionability_unverified");
+	});
+
+	it("leaves Docker as an explicit no-op without reading the snapshot", () => {
+		let reads = 0;
+		const result = preflightMacosQueue({
+			platform: "docker",
+			tasks: [{ status: "pending", requiredCapability: "high" }],
+			readSnapshot: () => {
+				reads += 1;
+				throw new Error("Docker preflight must not read the macOS snapshot");
+			},
+		});
+
+		strictEqual(reads, 0);
+		strictEqual(result.eligible, true);
+		strictEqual(result.reason, "docker_unchanged");
+	});
+
+	it("allows a terminal-only macOS queue without snapshot or manifest evidence", () => {
+		const result = preflightMacosQueue({
+			tasks: [{ status: "done", requiredCapability: "high" }],
+			readSnapshot: () => {
+				throw new Error("terminal-only queues must not read routing state");
+			},
+		});
+
+		strictEqual(result.eligible, true);
+		strictEqual(result.reason, "no_non_terminal_tasks");
+	});
+
+	it("does not gate native or human tasks on provider eligibility", () => {
+		const result = preflightMacosQueue({
+			tasks: [
+				{ status: "pending", executor: "native", requiredCapability: "high" },
+				{
+					status: "blocked",
+					executor: "human",
+					requiredCapability: "standard",
+				},
+			],
+			readSnapshot: () => {
+				throw new Error("non-switchyard tasks must not read routing state");
+			},
+		});
+
+		strictEqual(result.eligible, true);
+		strictEqual(result.reason, "no_non_terminal_tasks");
 	});
 });
 

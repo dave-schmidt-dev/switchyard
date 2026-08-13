@@ -6,5 +6,5 @@
 		"src/switchyard/dispatch/remediate-orphaned-locks.mjs"
 	],
 	"project": ["src/**/*.mjs"],
-	"ignoreBinaries": ["orb", "plutil"]
+	"ignoreBinaries": ["pbcopy", "pbpaste", "plutil", "prlctl"]
 }

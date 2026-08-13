@@ -1,5 +1,5 @@
 import { ok, strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { after, before, describe, it } from "node:test";
 import {
 	execute as executeOpencode,
 	executeAsync as executeOpencodeAsync,
+	OPENCODE_SUPERVISOR,
 } from "../src/switchyard/adapter/opencode.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
@@ -27,6 +28,7 @@ function hasDocker() {
 
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-opencode-idle-"));
+const realPsPath = execSync("command -v ps", { encoding: "utf8" }).trim();
 const containerName = `switchyard-opencode-idle-${Date.now()}`;
 const IDLE_SECONDS = 5;
 const STUB_OUTPUT = "stub-did-the-work";
@@ -100,6 +102,25 @@ function survivingStubs() {
 		{ encoding: "utf8", stdio: "pipe" },
 	);
 	return out.split("\n").filter((line) => line.includes(STUB_HANG_MARKER));
+}
+
+function writeExecutable(path, body) {
+	writeFileSync(path, body, { mode: 0o755 });
+}
+
+function runSupervisor(commandDir, idleSeconds = 1) {
+	return spawnSync(
+		"sh",
+		["-c", OPENCODE_SUPERVISOR, "sh", String(idleSeconds), "opencode"],
+		{
+			env: {
+				...process.env,
+				PATH: `${commandDir}:${process.env.PATH ?? ""}`,
+			},
+			encoding: "utf8",
+			timeout: 15_000,
+		},
+	);
 }
 
 const invocationOptions = {
@@ -241,5 +262,84 @@ describe("opencode container-side idle bound", () => {
 		strictEqual(result.success, false);
 		strictEqual(result.timedOut, true);
 		ok(result.idleTerminated === undefined);
+	});
+
+	for (const state of ["Ss", "S+", "Z+"]) {
+		it(`matches macOS ps state prefix ${state}`, () => {
+			const commandDir = mkdtempSync(join(testRoot, `state-${state}-`));
+			const psCountPath = join(commandDir, "ps-count");
+			writeFileSync(psCountPath, "0\n");
+			writeExecutable(
+				join(commandDir, "ps"),
+				`#!/bin/sh
+count=$(cat '${psCountPath}')
+count=$((count + 1))
+printf '%s\\n' "$count" >'${psCountPath}'
+if [ "$count" -le 2 ]; then
+  printf '${state}\\n'
+else
+  exec '${realPsPath}' "$@"
+fi
+`,
+			);
+			writeExecutable(
+				join(commandDir, "opencode"),
+				"#!/bin/sh\necho mac-state-output\nsleep 2\n",
+			);
+
+			const result = runSupervisor(commandDir);
+			if (state.startsWith("Z")) {
+				strictEqual(result.status, 0);
+			} else {
+				strictEqual(result.status, 75);
+			}
+			ok(result.stdout.includes("mac-state-output"));
+			rmSync(commandDir, { recursive: true, force: true });
+		});
+	}
+
+	it("treats an unprobeable PID as alive", () => {
+		const commandDir = mkdtempSync(join(testRoot, "unprobeable-"));
+		writeExecutable(join(commandDir, "ps"), "#!/bin/sh\nexit 1\n");
+		writeExecutable(
+			join(commandDir, "opencode"),
+			"#!/bin/sh\necho unprobeable-output\nsleep 2\n",
+		);
+
+		const result = runSupervisor(commandDir);
+		strictEqual(result.status, 75);
+		ok(result.stdout.includes("unprobeable-output"));
+		rmSync(commandDir, { recursive: true, force: true });
+	});
+
+	it("sweeps a surviving named process and reports a nonzero count", () => {
+		const commandDir = mkdtempSync(join(testRoot, "sweep-"));
+		const pidPath = join(commandDir, "survivor-pid");
+		writeExecutable(
+			join(commandDir, "pgrep"),
+			`#!/bin/sh
+case "$*" in
+  *"-x opencode"*) cat '${pidPath}' ;;
+  *) exit 1 ;;
+esac
+`,
+		);
+		writeExecutable(
+			join(commandDir, "opencode"),
+			`#!/bin/sh
+sleep 60 &
+echo $! >'${pidPath}'
+echo sweep-output
+exec sleep 60
+`,
+		);
+
+		const result = runSupervisor(commandDir);
+		strictEqual(result.status, 75);
+		ok(
+			/swept [1-9][0-9]* surviving opencode process\(es\)/u.test(result.stderr),
+			result.stderr,
+		);
+		rmSync(commandDir, { recursive: true, force: true });
 	});
 });

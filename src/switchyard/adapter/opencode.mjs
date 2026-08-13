@@ -9,8 +9,10 @@ import {
 } from "./orphan-kill.mjs";
 import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
+	captureProviderDiff,
 	captureProviderDiffAsync,
 	executeProviderInvocation,
+	getWorkspaceExecution,
 } from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
@@ -46,7 +48,7 @@ const IDLE_TERMINATION_NOTE =
 // The prompt and every provider argument arrive as positional parameters and
 // are never interpolated into this text, so no caller-controlled string is ever
 // parsed as shell source.
-const OPENCODE_SUPERVISOR = `set -u
+export const OPENCODE_SUPERVISOR = `set -u
 idle=$1
 shift
 cmd=$1
@@ -61,9 +63,22 @@ last=0
 quiet=0
 elapsed=0
 killed=0
+
+is_alive() {
+	st=$(ps -o state= -p "$1" 2>/dev/null)
+	if [ "$?" -eq 0 ] && [ -n "$st" ]; then
+		case "$st" in
+			Z*) return 1 ;;
+			*) return 0 ;;
+		esac
+	fi
+	# A failed or empty ps probe is not proof of exit. kill -0 distinguishes
+	# that unprobeable case from a child that has actually gone away.
+	kill -0 "$1" 2>/dev/null
+}
+
 while :; do
-	st=$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null)
-	if [ -z "$st" ] || [ "$st" = Z ]; then
+	if ! is_alive "$pid"; then
 		break
 	fi
 	osize=$(wc -c <"$out")
@@ -93,8 +108,7 @@ if [ "$killed" -eq 1 ]; then
 	kill -TERM "$pid" 2>/dev/null
 	i=0
 	while [ "$i" -lt 5 ]; do
-		st=$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null)
-		if [ -z "$st" ] || [ "$st" = Z ]; then
+		if ! is_alive "$pid"; then
 			break
 		fi
 		sleep 1
@@ -103,19 +117,13 @@ if [ "$killed" -eq 1 ]; then
 	kill -KILL "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
 	swept=0
-	for p in /proc/[0-9]*; do
-		q=$(basename "$p")
+	cmd_name=\${cmd##*/}
+	for q in $(pgrep -x "$cmd_name" 2>/dev/null); do
 		if [ "$q" = "$$" ] || [ "$q" = 1 ]; then
 			continue
 		fi
-		a0=$(tr '\\0' '\\n' <"$p/cmdline" 2>/dev/null | head -n 1)
-		if [ -z "$a0" ]; then
-			continue
-		fi
-		if [ "$(basename "$a0")" = "$cmd" ]; then
-			kill -KILL "$q" 2>/dev/null
-			swept=$(( swept + 1 ))
-		fi
+		kill -KILL "$q" 2>/dev/null
+		swept=$(( swept + 1 ))
 	done
 	if [ "$swept" -gt 0 ]; then
 		printf 'switchyard: swept %s surviving %s process(es)\\n' "$swept" "$cmd" >&2
@@ -159,14 +167,14 @@ function buildSupervisedArgs(
 	invocationArgs,
 	model,
 	guardedPrompt,
+	options = {},
 ) {
 	validateIdentifier(workingContainerName, "workingContainerName");
+	const { args: workspaceArgs } = getWorkspaceExecution(workingContainerName, {
+		...options,
+	});
 	const args = [
-		"exec",
-		"-i",
-		"-w",
-		"/project",
-		workingContainerName,
+		...workspaceArgs,
 		"sh",
 		"-c",
 		OPENCODE_SUPERVISOR,
@@ -219,6 +227,7 @@ function annotateIdleTermination(output, stderr) {
 
 function hasNonTrivialCredential(containerName) {
 	try {
+		// D-10: authentication probes remain on the standing Docker credential vault.
 		execFileSync(
 			"docker",
 			[
@@ -238,6 +247,7 @@ function hasNonTrivialCredential(containerName) {
 
 export function isOpencodeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 	try {
+		// D-10: authentication probes remain on the standing Docker credential vault.
 		execFileSync("docker", ["exec", containerName, OPENCODE_CMD, "--version"], {
 			encoding: "utf8",
 			stdio: "pipe",
@@ -267,13 +277,17 @@ export function execute(prompt, workingContainerName, options = {}) {
 			invocationArgs,
 			model,
 			guardedPrompt,
+			options,
 		);
 	} catch (error) {
 		return { output: "", success: false, error: error.message };
 	}
 
 	try {
-		const result = execFileSync("docker", args, {
+		const { command } = getWorkspaceExecution(workingContainerName, {
+			...options,
+		});
+		const result = execFileSync(command, args, {
 			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
@@ -340,8 +354,12 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			invocationArgs,
 			model,
 			guardedPrompt,
+			options,
 		);
-		const result = await executeProviderInvocation("docker", args, {
+		const { command } = getWorkspaceExecution(workingContainerName, {
+			...options,
+		});
+		const result = await executeProviderInvocation(command, args, {
 			...options,
 			provider: "opencode",
 			input: guardedPrompt,
@@ -362,36 +380,8 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 	}
 }
 
-export function captureDiff(workingContainerName) {
-	try {
-		validateIdentifier(workingContainerName, "workingContainerName");
-	} catch {
-		return null;
-	}
-	try {
-		execFileSync(
-			"docker",
-			["exec", "-w", "/project", workingContainerName, "git", "add", "-A"],
-			{ stdio: "pipe" },
-		);
-		const diff = execFileSync(
-			"docker",
-			[
-				"exec",
-				"-w",
-				"/project",
-				workingContainerName,
-				"git",
-				"diff",
-				"--cached",
-				"HEAD",
-			],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
-		return /\S/u.test(diff) ? diff : null;
-	} catch {
-		return null;
-	}
+export function captureDiff(workingContainerName, options = {}) {
+	return captureProviderDiff(workingContainerName, options);
 }
 
 export function captureDiffAsync(workingContainerName, options = {}) {

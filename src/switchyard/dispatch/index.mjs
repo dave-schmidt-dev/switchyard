@@ -27,9 +27,10 @@
 //   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json).
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --exclude-provider <name>  Never route to this provider (repeatable).
+//   --platform <docker|macos> Queue workspace platform (default: docker).
 //   --help                 Show this help.
 
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -38,6 +39,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { getPlatformInfo } from "../container/index.mjs";
+import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
 import {
 	listManagedContainers,
 	recoverManagedObjects,
@@ -88,6 +90,7 @@ Run/Launch options:
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
+  --platform <docker|macos>  Queue workspace platform (default: docker)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
@@ -99,6 +102,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
+  --platform <docker|macos>  Queue workspace platform (default: docker)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
@@ -200,6 +204,7 @@ function parseDispatchArgs(argv) {
 				"only-provider": { type: "string", multiple: true },
 				provider: { type: "string", multiple: true },
 				"task-id": { type: "string", multiple: true },
+				platform: { type: "string" },
 				help: { type: "boolean", default: false },
 			},
 		});
@@ -254,6 +259,14 @@ function parseDispatchArgs(argv) {
 		...(values["only-provider"] ?? []),
 		...(values.provider ?? []),
 	];
+	const platform = String(values.platform ?? "docker")
+		.trim()
+		.toLowerCase();
+	if (!["docker", "macos"].includes(platform)) {
+		throw new UsageError(
+			`--platform must be one of docker, macos, got "${values.platform}"`,
+		);
+	}
 	if (
 		onlyProviders.length > 0 &&
 		(values["exclude-provider"] ?? []).length > 0
@@ -273,6 +286,7 @@ function parseDispatchArgs(argv) {
 		excludeProviders: values["exclude-provider"] ?? [],
 		onlyProviders,
 		taskIds: values["task-id"] ?? [],
+		platform,
 	};
 }
 
@@ -508,6 +522,7 @@ async function runDispatch(opts, dependencies = {}) {
 			exclude: opts.excludeProviders,
 			only: opts.onlyProviders,
 			taskIds: opts.taskIds,
+			platform: opts.platform,
 			runOptions: identity?.runOptions,
 			queueIdentity: identity?.queueIdentity,
 			projectRevision: identity?.projectRevision,
@@ -700,6 +715,7 @@ function prepareRunIdentity(opts) {
 		onlyProviders: opts.onlyProviders,
 		excludeProviders: opts.excludeProviders,
 		taskIds: opts.taskIds,
+		platform: opts.platform,
 	});
 	const projectRevision = getProjectRevision(opts.projectPath);
 	const { queueIdentity } = computeQueueIdentityFromFile(
@@ -1014,6 +1030,11 @@ const PROVIDER_BINARY_NAMES = {
 	opencode: "opencode",
 };
 
+// Docker remains the default workspace backend until a caller supplies another
+// execution backend. Its inspectProcess implementation preserves the existing
+// `docker top -eo pid,args` probe and timeout.
+const DEFAULT_EXECUTION_BACKEND = new DockerExecutionBackend();
+
 /**
  * Match one `docker top -eo pid,args` output line against a target binary
  * name. The pid,args format is "<pid><whitespace><args...>" where the args
@@ -1036,7 +1057,8 @@ function lineMatchesBinary(line, binaryName) {
  * Best-effort presence probe for whether the provider CLI routed to this
  * run (run.activeTaskProvider) is actually executing inside the run's
  * working container. Mirrors container/index.mjs's getPlatformInfo pattern:
- * shell out to Docker, catch any failure, and degrade to null rather than
+ * inspect the workspace through the execution backend, catch any failure, and
+ * degrade to null rather than
  * throwing — a diagnostic nicety surfaced via the providerProcessDetected
  * envelope field must never crash or indefinitely block a status/result
  * read. The 5000ms timeout on the underlying `docker top` call enforces the
@@ -1055,14 +1077,19 @@ function lineMatchesBinary(line, binaryName) {
  *
  * @param {object} run parsed run snapshot
  * @param {object} [deps] Injectable dependencies (tests only)
+ * @param {import("../lifecycle/execution-backend.mjs").ExecutionBackend} [deps.executionBackend]
+ *   Defaults to the Docker backend
  * @param {(command: string, args: string[], options: object) => Buffer | string} [deps.execFn]
- *   Defaults to the real `execFileSync`
+ *   Compatibility injection; wraps the Docker backend for existing callers
  * @returns {boolean|null} true/false once the probe runs successfully;
  *   null if the run isn't currently running, isn't routed to a
  *   container/provider yet, the provider has no known binary mapping, or
  *   the probe itself failed
  */
-function probeProviderProcess(run, { execFn = execFileSync } = {}) {
+function probeProviderProcess(
+	run,
+	{ executionBackend = DEFAULT_EXECUTION_BACKEND, execFn } = {},
+) {
 	if (run.state !== "running") return null;
 
 	const { workingContainerName, activeTaskProvider } = run;
@@ -1072,11 +1099,12 @@ function probeProviderProcess(run, { execFn = execFileSync } = {}) {
 	if (!binaryName) return null;
 
 	try {
-		const output = execFn(
-			"docker",
-			["top", workingContainerName, "-eo", "pid,args"],
-			{ timeout: 5000 },
-		).toString();
+		// The compatibility injection remains Docker-shaped for existing callers;
+		// production and new callers use the backend seam directly.
+		const backend = execFn
+			? new DockerExecutionBackend({ execFn })
+			: executionBackend;
+		const output = backend.inspectProcess(workingContainerName).toString();
 		return output
 			.split("\n")
 			.some((line) => lineMatchesBinary(line, binaryName));

@@ -4786,6 +4786,171 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 	});
 });
 
+describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
+	function writeTerminalQueue() {
+		return writeTasksFile(`## Phase 1
+
+### Task 1.1: Already complete
+- **Status:** done
+- **Type:** review
+- **Description:** no provider work
+- **Executor:** switchyard
+`);
+	}
+
+	function macosBackend(events, { failCreate = false } = {}) {
+		return {
+			platform: "macos",
+			preflight: () => events.push("preflight"),
+			acquireSlot: () => {
+				events.push("acquire");
+				return { token: "test-slot" };
+			},
+			releaseSlot: () => events.push("release"),
+			ensureAgentContainer: () => events.push("ensure"),
+			create: () => {
+				events.push("create");
+				if (failCreate) throw new Error("create failed");
+				return "test-vm";
+			},
+			provision: () => events.push("provision"),
+			seed: () => events.push("seed"),
+			commit: () => {},
+			reset: () => {},
+			destroy: () => events.push("destroy"),
+		};
+	}
+
+	it("runs preflight and admission before create, then releases after teardown on all three entrypoints", async () => {
+		for (const entrypoint of ["sync", "async", "orchestrator"]) {
+			const events = [];
+			const tasksPath = writeTerminalQueue();
+			const options = {
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				checkpointPath: `${tasksPath}.${entrypoint}.checkpoint.json`,
+				dependencies: {
+					backendFactory: () => macosBackend(events),
+					orchestrator: {
+						launch: async () => "job",
+						status: async () => ({ state: "done" }),
+						result: async () => ({ success: true, diff: "" }),
+					},
+				},
+			};
+			if (entrypoint === "sync") runQueueImpl(options);
+			if (entrypoint === "async") await runQueueAsyncImpl(options);
+			if (entrypoint === "orchestrator")
+				await runQueueWithOrchestratorImpl(options);
+			strictEqual(events[0], "preflight");
+			strictEqual(events[1], "acquire");
+			ok(events.indexOf("acquire") < events.indexOf("create"));
+			ok(events.indexOf("destroy") < events.indexOf("release"));
+		}
+	});
+
+	it("releases a slot when workspace creation fails", () => {
+		const events = [];
+		const tasksPath = writeTerminalQueue();
+		throws(
+			() =>
+				runQueueImpl({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "macos",
+					dependencies: {
+						backendFactory: () => macosBackend(events, { failCreate: true }),
+					},
+				}),
+			/create failed/,
+		);
+		deepStrictEqual(events, [
+			"preflight",
+			"acquire",
+			"ensure",
+			"create",
+			"release",
+		]);
+	});
+
+	it("rejects an invalid platform before backend selection or admission", () => {
+		const events = [];
+		const tasksPath = writeTerminalQueue();
+		throws(
+			() =>
+				runQueueImpl({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "windows",
+					dependencies: {
+						backendFactory: () => {
+							events.push("factory");
+							return macosBackend(events);
+						},
+					},
+				}),
+			/runOptions\.platform must be one of docker, macos/,
+		);
+		deepStrictEqual(events, []);
+	});
+
+	it("rejects the default macOS preflight before slot acquisition or VM creation", () => {
+		const events = [];
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Native queue gate
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **RequiredCapability:** high
+- **RequiredCapabilityJustification:** test gate
+- **Description:** fixture
+`);
+		throws(
+			() =>
+				runQueueImpl({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "macos",
+					dependencies: {
+						backendFactory: () => ({
+							create: () => {
+								events.push("create");
+								return "vm";
+							},
+							seed: () => {},
+							commit: () => {},
+							reset: () => {},
+							destroy: () => {},
+							acquireSlot: () => events.push("acquire"),
+						}),
+						adapters: { codex: {} },
+						tarProvisionRegistry: { verified: true, providers: ["opencode"] },
+						preflightReadSnapshot: () => ({
+							snapshot: {
+								schema_version: 2,
+								updated_at: new Date().toISOString(),
+								providers: [
+									{
+										name: "codex",
+										ok: true,
+										windows: [{ percent_left: 80, pace_delta: 1 }],
+									},
+								],
+							},
+							snapshotStatus: "fresh",
+							snapshotMtime: 1,
+							snapshotAgeMsAtRoute: 0,
+						}),
+					},
+				}),
+			/high: no_tar_provisionable_provider_with_quota_headroom.*codex/,
+		);
+		deepStrictEqual(events, []);
+	});
+});
+
 describe("runner commit/reset behavior (Task 3.2)", () => {
 	it("commits only after successful tasks, not after failed ones", () => {
 		const tasksPath = writeTasksFile(`## Phase 1

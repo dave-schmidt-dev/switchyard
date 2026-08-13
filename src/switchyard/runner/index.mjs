@@ -56,14 +56,17 @@ import {
 	recordDispatchIntentToStore,
 	recordDispatchToStore,
 } from "../ledger/index.mjs";
+import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
 import {
 	commitWorkingTree,
 	createWorkingContainer,
 	provisionCredentials,
 	resetWorkingTree,
 	seedProject,
+	seedProjectWithBackend,
 	wipeWorkingContainer,
 } from "../lifecycle/index.mjs";
+import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
@@ -73,7 +76,8 @@ import {
 	resolveTargetIdentity,
 	validateInvocationDescriptor,
 } from "../roster/index.mjs";
-import { route } from "../router/index.mjs";
+import { preflightMacosQueue, route } from "../router/index.mjs";
+import { acquireVmSlot, releaseVmSlot } from "../run-store/index.mjs";
 
 /**
  * Ensure the standing agent container is built and running.
@@ -107,6 +111,7 @@ export function ensureAgentContainer(deps = {}) {
 const CHECKPOINT_VERSION = 2;
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
+export const QUEUE_PLATFORMS = Object.freeze(["docker", "macos"]);
 // Versioned contract shared by the host runner, detached worker, and any
 // external headless orchestrator.  Keep this independent from the run-store
 // schema so a durable record can remain readable while the wire contract
@@ -180,6 +185,7 @@ export function normalizeRunOptions(options = {}) {
 	}
 	return {
 		version: RUN_OPTIONS_VERSION,
+		platform: normalizeQueuePlatform(options.platform),
 		maxTasks: Number.isFinite(maxTasks) ? maxTasks : null,
 		checkpointPath: options.checkpointPath
 			? resolve(options.checkpointPath)
@@ -198,6 +204,19 @@ export function normalizeRunOptions(options = {}) {
 			"runOptions.taskIds",
 		),
 	};
+}
+
+/** Normalize the queue-level execution platform before any workspace exists. */
+export function normalizeQueuePlatform(value = "docker") {
+	const platform = String(value ?? "docker")
+		.trim()
+		.toLowerCase();
+	if (!QUEUE_PLATFORMS.includes(platform)) {
+		throw new Error(
+			`runOptions.platform must be one of ${QUEUE_PLATFORMS.join(", ")}, got "${value}"`,
+		);
+	}
+	return platform;
 }
 
 /** Build an opaque identity over the queue, graph, project revision, and options. */
@@ -267,8 +286,8 @@ export function getProjectRevision(projectPath) {
 
 function isIdentityRequested(options) {
 	return (
-		options.queueIdentity !== undefined ||
-		options.runOptions !== undefined ||
+		options.queueIdentity != null ||
+		options.runOptions != null ||
 		(options.taskIds ?? []).length > 0
 	);
 }
@@ -2392,6 +2411,7 @@ export function executeTask(task, context) {
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
 		timeoutMs,
+		executionBackend: context.executionBackend,
 		invocationDescriptor,
 		descriptorIdentity: invocationDescriptor?.descriptor_identity ?? null,
 		descriptorHarness: routeResult.resolved_harness ?? null,
@@ -2399,16 +2419,6 @@ export function executeTask(task, context) {
 	});
 
 	if (!execution.success) {
-		record({
-			provider: routeResult.provider,
-			model: routeResult.model ?? "unknown",
-			taskId: task.id,
-			result: execution.timedOut ? "execution_timed_out" : "execution_failed",
-			errorKind: execution.errorKind ?? null,
-			reason: execution.error ?? routeResult.reason,
-			percentLeft: routeResult.percentLeft ?? undefined,
-		});
-
 		if (execution.timedOut) {
 			// The adapter already killed the orphaned in-container process
 			// before returning (see adapter/orphan-kill.mjs), so this reads a
@@ -2418,7 +2428,39 @@ export function executeTask(task, context) {
 			// possibly mid-edit) diff can never auto-apply as if the task had
 			// succeeded. INV-2: the gate is the only reviewed door back to the
 			// host, and this diff has not been reviewed.
-			const partialDiff = adapter.captureDiff(context.workingContainerName);
+			let partialDiff = null;
+			try {
+				partialDiff = adapter.captureDiff(context.workingContainerName, {
+					executionBackend: context.executionBackend,
+				});
+			} catch {
+				partialDiff = null;
+			}
+			const captureFailed = !partialDiff;
+			const cleanupFailed = execution.cleanupFailed === true;
+			const resultName = cleanupFailed
+				? "execution_timed_out_cleanup_failed"
+				: captureFailed
+					? "execution_timed_out_capture_failed"
+					: "execution_timed_out";
+			const error = cleanupFailed
+				? (execution.error ?? "provider cleanup failed after timeout")
+				: captureFailed
+					? "diff capture failed after timeout"
+					: (execution.error ?? null);
+			record({
+				provider: routeResult.provider,
+				model: routeResult.model ?? "unknown",
+				taskId: task.id,
+				result: resultName,
+				errorKind:
+					(cleanupFailed && "provider_cleanup_failed") ||
+					(captureFailed && "diff_capture_failed") ||
+					execution.errorKind ||
+					null,
+				reason: error ?? routeResult.reason,
+				percentLeft: routeResult.percentLeft ?? undefined,
+			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
 				taskId: task.id,
@@ -2427,13 +2469,27 @@ export function executeTask(task, context) {
 				model: routeResult.model ?? null,
 				requiredCapability,
 				resolvedTargetId,
-				result: "execution_timed_out",
-				error: execution.error ?? null,
-				errorKind: execution.errorKind ?? null,
+				result: resultName,
+				error,
+				errorKind:
+					(cleanupFailed && "provider_cleanup_failed") ||
+					(captureFailed && "diff_capture_failed") ||
+					execution.errorKind ||
+					null,
 				timedOut: true,
-				partialDiff,
+				...(partialDiff ? { partialDiff } : {}),
 			};
 		}
+
+		record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "execution_failed",
+			errorKind: execution.errorKind ?? null,
+			reason: execution.error ?? routeResult.reason,
+			percentLeft: routeResult.percentLeft ?? undefined,
+		});
 
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
@@ -2449,7 +2505,9 @@ export function executeTask(task, context) {
 		};
 	}
 
-	const diff = adapter.captureDiff(context.workingContainerName);
+	const diff = adapter.captureDiff(context.workingContainerName, {
+		executionBackend: context.executionBackend,
+	});
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "execution",
@@ -2744,7 +2802,9 @@ export async function executeTaskAsync(task, context) {
 		{
 			model: invocationDescriptor.selector ?? routeResult.model,
 			timeoutMs,
+			executionBackend: context.executionBackend,
 			signal: context.signal,
+			onStatus: context.onStatus,
 			onPoll: (poll) => {
 				// Provider lifecycle polling exposes only bounded scalar timing
 				// metadata. Never forward stdout/stderr bytes or provider output to
@@ -2771,22 +2831,65 @@ export async function executeTaskAsync(task, context) {
 		},
 	);
 	if (!execution.success) {
-		const resultName = execution.timedOut
-			? "execution_timed_out"
-			: "execution_failed";
+		if (!execution.timedOut) {
+			await record({
+				provider: routeResult.provider,
+				model: routeResult.model ?? "unknown",
+				taskId: task.id,
+				result: "execution_failed",
+				errorKind: execution.errorKind ?? null,
+				reason: execution.error ?? routeResult.reason,
+			});
+			return {
+				...descriptorReceiptFields(invocationDescriptor),
+				taskId: task.id,
+				success: false,
+				provider: routeResult.provider,
+				model: routeResult.model ?? null,
+				requiredCapability,
+				resolvedTargetId,
+				result: "execution_failed",
+				error: execution.error ?? null,
+				errorKind: execution.errorKind ?? null,
+			};
+		}
+
+		let partialDiff = null;
+		try {
+			partialDiff = await adapter.captureDiffAsync(
+				context.workingContainerName,
+				{
+					executionBackend: context.executionBackend,
+					signal: context.signal,
+				},
+			);
+		} catch {
+			partialDiff = null;
+		}
+		const captureFailed = !partialDiff;
+		const cleanupFailed = execution.cleanupFailed === true;
+		const resultName = cleanupFailed
+			? "execution_timed_out_cleanup_failed"
+			: captureFailed
+				? "execution_timed_out_capture_failed"
+				: "execution_timed_out";
+		const error = cleanupFailed
+			? (execution.error ?? "provider cleanup failed after timeout")
+			: captureFailed
+				? "diff capture failed after timeout"
+				: (execution.error ?? null);
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: resultName,
-			errorKind: execution.errorKind ?? null,
-			reason: execution.error ?? routeResult.reason,
+			errorKind:
+				(cleanupFailed && "provider_cleanup_failed") ||
+				(captureFailed && "diff_capture_failed") ||
+				execution.errorKind ||
+				null,
+			reason: error ?? routeResult.reason,
 		});
-		const partialDiff = execution.timedOut
-			? await adapter.captureDiffAsync(context.workingContainerName, {
-					signal: context.signal,
-				})
-			: undefined;
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
@@ -2796,12 +2899,18 @@ export async function executeTaskAsync(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: resultName,
-			error: execution.error ?? null,
-			errorKind: execution.errorKind ?? null,
-			...(execution.timedOut ? { timedOut: true, partialDiff } : {}),
+			error,
+			errorKind:
+				(cleanupFailed && "provider_cleanup_failed") ||
+				(captureFailed && "diff_capture_failed") ||
+				execution.errorKind ||
+				null,
+			timedOut: true,
+			...(partialDiff ? { partialDiff } : {}),
 		};
 	}
 	const diff = await adapter.captureDiffAsync(context.workingContainerName, {
+		executionBackend: context.executionBackend,
 		signal: context.signal,
 	});
 	context.onStatus?.({
@@ -2889,6 +2998,10 @@ export async function runQueueAsync(options) {
 		exclude = [],
 		only = [],
 		taskIds = [],
+		platform,
+		runOptions = null,
+		queueIdentity = null,
+		projectRevision = null,
 		runStorePath = null,
 		runId = null,
 		dependencies = {},
@@ -2896,60 +3009,68 @@ export async function runQueueAsync(options) {
 	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
 		markerPath: dependencies.generationMarkerPath,
 	});
-	const tasks = loadTaskQueue(tasksFilePath);
-	if (tasks.length === 0)
-		throwOnEmptyParse(tasksFilePath, checkpointPath, dependencies.onStatus);
-	const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
-	const ensureAgentContainerFn =
-		dependencies.ensureAgentContainer ?? ensureAgentContainer;
-	const createWorkingContainerFn =
-		dependencies.createWorkingContainer ?? createWorkingContainer;
-	const provisionCredentialsFn =
-		dependencies.provisionCredentials ?? provisionCredentials;
-	const seedProjectFn = dependencies.seedProject ?? seedProject;
-	const wipeWorkingContainerFn =
-		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+	const launch = prepareQueueLaunch({
+		tasksFilePath,
+		projectPath,
+		checkpointPath,
+		maxTasks,
+		stopOnFailure,
+		exclude,
+		only,
+		taskIds,
+		identityTaskIds: [],
+		platform,
+		runOptions,
+		queueIdentity,
+		projectRevision,
+		runId,
+		dependencies,
+		onStatus: dependencies.onStatus,
+	});
+	const {
+		queueBackend,
+		slotLease,
+		tasks,
+		checkpoint,
+		effectiveMaxTasks,
+		effectiveStopOnFailure,
+		effectiveExclude,
+		effectiveOnly,
+		effectiveTaskIds,
+	} = launch;
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
-	if (!workingContainerName) {
-		ensureAgentContainerFn();
-		workingContainerName = createWorkingContainerFn(projectPath, undefined, {
-			runId,
-		});
+	try {
 		if (!workingContainerName) {
-			throw new Error("runQueueAsync: failed to create working container");
-		}
-		ownsWorkingContainer = true;
-		// Credential provisioning and project seeding can be slow. Publish the
-		// resolved container before either operation so status is useful during
-		// bootstrap rather than looking like a dead launch.
-		try {
+			queueBackend.ensureAgentContainer();
+			workingContainerName = queueBackend.create(projectPath, { runId });
+			if (!workingContainerName) {
+				throw new Error("runQueueAsync: failed to create working container");
+			}
+			ownsWorkingContainer = true;
+			// Credential provisioning and project seeding can be slow. Publish the
+			// resolved container before either operation so status is useful during
+			// bootstrap rather than looking like a dead launch.
 			dependencies.onContainerReady?.({ workingContainerName });
-		} catch (error) {
 			try {
-				wipeWorkingContainerFn(workingContainerName);
-			} catch {
-				// Best effort cleanup; preserve the callback failure.
+				queueBackend.provision(workingContainerName);
+			} catch (error) {
+				console.error(
+					`runQueueAsync: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+				);
 			}
-			throw error;
+			queueBackend.seed(workingContainerName, projectPath);
 		}
-		try {
-			provisionCredentialsFn(workingContainerName);
-		} catch (error) {
-			console.error(
-				`runQueueAsync: credential provisioning failed, continuing unauthenticated: ${error.message}`,
-			);
-		}
-		try {
-			seedProjectFn(workingContainerName, projectPath);
-		} catch (error) {
+	} catch (error) {
+		if (ownsWorkingContainer && workingContainerName) {
 			try {
-				wipeWorkingContainerFn(workingContainerName);
+				queueBackend.destroy(workingContainerName);
 			} catch {
-				// Best effort cleanup; preserve the seed error.
+				// Preserve the bootstrap error.
 			}
-			throw error;
 		}
+		releaseQueueSlot(queueBackend, slotLease);
+		throw error;
 	}
 	const context = {
 		route: dependencies.route ?? route,
@@ -2966,11 +3087,13 @@ export async function runQueueAsync(options) {
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
+		executionBackend: queueBackend.executionBackend,
+		queueBackend,
 		onStatus: dependencies.onStatus ?? null,
 		onTaskRouted: dependencies.onTaskRouted ?? null,
 		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
-		exclude,
-		only,
+		exclude: effectiveExclude,
+		only: effectiveOnly,
 		signal: dependencies.signal,
 		onPoll: dependencies.onPoll,
 		resolveDescriptor: dependencies.resolveDescriptor,
@@ -2978,10 +3101,10 @@ export async function runQueueAsync(options) {
 	const results = [];
 	try {
 		const runnable = getRunnableTasks(tasks, checkpoint, {
-			selectedTaskIds: taskIds,
+			selectedTaskIds: effectiveTaskIds,
 			resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
 		});
-		for (const task of runnable.slice(0, maxTasks)) {
+		for (const task of runnable.slice(0, effectiveMaxTasks)) {
 			dependencies.onTaskStart?.(task);
 			const result = await executeTaskAsync(task, context);
 			if (result.partialDiff) {
@@ -3033,7 +3156,7 @@ export async function runQueueAsync(options) {
 			checkpoint.lastUpdatedAt = new Date().toISOString();
 			saveCheckpoint(checkpointPath, checkpoint);
 			dependencies.onCheckpointSaved?.(checkpoint);
-			if (!result.success && stopOnFailure) break;
+			if (!result.success && effectiveStopOnFailure) break;
 		}
 		saveCheckpoint(checkpointPath, checkpoint);
 		return {
@@ -3044,12 +3167,16 @@ export async function runQueueAsync(options) {
 			completedTaskIds: checkpoint.completedTaskIds,
 		};
 	} finally {
-		if (ownsWorkingContainer) {
-			try {
-				wipeWorkingContainerFn(workingContainerName);
-			} catch {
-				// Container cleanup is best effort; the run result remains authoritative.
+		try {
+			if (ownsWorkingContainer) {
+				try {
+					queueBackend.destroy(workingContainerName);
+				} catch {
+					// Container cleanup is best effort; the run result remains authoritative.
+				}
 			}
+		} finally {
+			releaseQueueSlot(queueBackend, slotLease);
 		}
 	}
 }
@@ -3866,6 +3993,346 @@ const DEFAULT_ADAPTERS = {
 	},
 };
 
+function runBackendGitCommand(executionBackend, workspaceId, script) {
+	if (typeof executionBackend.execGuest === "function") {
+		executionBackend.execGuest(workspaceId, "/bin/bash", ["-lc", script], {
+			cwd: "/project",
+		});
+		return { status: 0 };
+	}
+	const prefix = executionBackend.execArgv(workspaceId, { cwd: "/project" });
+	const result = spawnSync(
+		prefix.command,
+		[...prefix.args, "/bin/bash", "-lc", `cd /project && ${script}`],
+		{ stdio: "pipe" },
+	);
+	if (result.status !== 0) {
+		throw new Error(
+			`backend workspace command failed (${result.status ?? result.signal ?? "unknown"})`,
+		);
+	}
+	return result;
+}
+
+function loadTarProvisionRegistry(dependencies) {
+	if (Object.hasOwn(dependencies, "tarProvisionRegistry")) {
+		return dependencies.tarProvisionRegistry;
+	}
+	if (Object.hasOwn(dependencies, "tarProvisionManifest")) {
+		return dependencies.tarProvisionManifest;
+	}
+	const manifestPath =
+		dependencies.tarProvisionManifestPath ??
+		process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST;
+	if (!manifestPath) return null;
+	try {
+		return JSON.parse(readFileSync(resolve(manifestPath), "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+function formatQueuePreflightFailure(result) {
+	const details = (result.rejections ?? []).map((rejection) => {
+		const capability = rejection.capability ?? "unknown";
+		const excluded = rejection.excludedProviders?.length
+			? rejection.excludedProviders.join(", ")
+			: "none";
+		return `${capability}: ${rejection.reason} (excluded: ${excluded})`;
+	});
+	return `macOS queue provider preflight failed: ${details.join("; ") || result.reason}`;
+}
+
+function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
+	if (selectedPlatform !== "macos") return () => ({ ok: true, eligible: true });
+
+	const adapters = dependencies.adapters ?? DEFAULT_ADAPTERS;
+	const tarProvisionRegistry = loadTarProvisionRegistry(dependencies);
+	return (input = {}) => {
+		const result = preflightMacosQueue({
+			...input,
+			platform: selectedPlatform,
+			availableProviders: Object.keys(adapters),
+			tarProvisionRegistry,
+			...(dependencies.preflightReadSnapshot
+				? { readSnapshot: dependencies.preflightReadSnapshot }
+				: {}),
+		});
+		if (!result.ok) throw new Error(formatQueuePreflightFailure(result));
+		return result;
+	};
+}
+
+/**
+ * Bind queue lifetime operations to one selected execution substrate.
+ *
+ * `backendFactory` is intentionally synchronous and returns either a backend
+ * or a partial queue helper. It is the seam for VM admission and provider
+ * preflight.
+ */
+export function createQueueBackend({
+	platform = "docker",
+	dependencies = {},
+	projectPath,
+	runId = null,
+	runOptions = null,
+} = {}) {
+	const selectedPlatform = normalizeQueuePlatform(platform);
+	const defaultQueuePreflight = createDefaultQueuePreflight({
+		selectedPlatform,
+		dependencies,
+	});
+	const configuredQueuePreflight =
+		dependencies.queuePreflight ?? defaultQueuePreflight;
+	const factory = dependencies.backendFactory;
+	const supplied = factory?.({
+		platform: selectedPlatform,
+		projectPath,
+		runId,
+		runOptions,
+	});
+	if (supplied && typeof supplied === "object") {
+		if (
+			supplied.platform &&
+			normalizeQueuePlatform(supplied.platform) !== selectedPlatform
+		) {
+			throw new Error("backendFactory returned a different queue platform");
+		}
+		if (
+			supplied.create &&
+			supplied.destroy &&
+			supplied.seed &&
+			supplied.commit &&
+			supplied.reset
+		) {
+			return {
+				platform: selectedPlatform,
+				...supplied,
+				ensureAgentContainer: supplied.ensureAgentContainer ?? (() => {}),
+				provision: supplied.provision ?? (() => null),
+				preflight: supplied.preflight ?? configuredQueuePreflight,
+				acquireSlot: supplied.acquireSlot ?? (() => null),
+				releaseSlot: supplied.releaseSlot ?? (() => {}),
+			};
+		}
+	}
+
+	const executionBackend =
+		supplied?.executionBackend ??
+		supplied?.backend ??
+		dependencies.executionBackend ??
+		(selectedPlatform === "macos"
+			? new ParallelsExecutionBackend({
+					goldenImage:
+						dependencies.goldenImage ??
+						process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
+					aquaUid:
+						dependencies.aquaUid ?? process.env.SWITCHYARD_PARALLELS_AQUA_UID,
+					providerUser:
+						dependencies.providerUser ??
+						process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
+						"switchyard",
+				})
+			: new DockerExecutionBackend());
+
+	if (selectedPlatform === "docker") {
+		const createFn =
+			dependencies.createWorkingContainer ?? createWorkingContainer;
+		const destroyFn = dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
+		return {
+			platform: selectedPlatform,
+			executionBackend,
+			ensureAgentContainer:
+				dependencies.ensureAgentContainer ?? ensureAgentContainer,
+			create: (path, options = {}) =>
+				createFn(path, undefined, { runId: options.runId }),
+			provision: dependencies.provisionCredentials ?? provisionCredentials,
+			seed: dependencies.seedProject ?? seedProject,
+			commit: dependencies.commitWorkingTree ?? commitWorkingTree,
+			reset: dependencies.resetWorkingTree ?? resetWorkingTree,
+			destroy: destroyFn,
+			preflight: configuredQueuePreflight,
+			acquireSlot: () => null,
+			releaseSlot: () => {},
+		};
+	}
+
+	const goldenImage =
+		dependencies.goldenImage ?? process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE;
+	const aquaUid =
+		dependencies.aquaUid ?? process.env.SWITCHYARD_PARALLELS_AQUA_UID;
+	const providerUser =
+		dependencies.providerUser ??
+		process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
+		"switchyard";
+	return {
+		platform: selectedPlatform,
+		executionBackend,
+		// The VM lane does not start the Docker agent container. Credential
+		// preflight/provisioning is a later queue gate because routing has not
+		// selected a provider at workspace creation time.
+		ensureAgentContainer: () => {},
+		create: (_path, options = {}) => {
+			if (!goldenImage) {
+				throw new Error(
+					"macos queue requires SWITCHYARD_PARALLELS_GOLDEN_IMAGE",
+				);
+			}
+			return executionBackend.create(goldenImage, {
+				runId: options.runId ?? runId,
+				aquaUid,
+				providerUser,
+				// Linked-clone measurement/admission is owned by its later task.
+				linked: !!dependencies.linkedCloneMeasurement,
+				...(dependencies.linkedCloneMeasurement
+					? { linkedCloneMeasurement: dependencies.linkedCloneMeasurement }
+					: {}),
+			});
+		},
+		provision: dependencies.provisionCredentials ?? (() => null),
+		seed: (workspaceId, path) =>
+			seedProjectWithBackend(executionBackend, workspaceId, path),
+		commit: (workspaceId) =>
+			runBackendGitCommand(
+				executionBackend,
+				workspaceId,
+				"git add -A && (git diff --cached --quiet || git commit -q -m switchyard-task)",
+			),
+		reset: (workspaceId) =>
+			runBackendGitCommand(
+				executionBackend,
+				workspaceId,
+				"git reset --hard && git clean -fd",
+			),
+		destroy: (workspaceId) => executionBackend.destroy(workspaceId),
+		preflight: configuredQueuePreflight,
+		acquireSlot: dependencies.acquireVmSlot ?? acquireVmSlot,
+		releaseSlot: dependencies.releaseVmSlot ?? releaseVmSlot,
+	};
+}
+
+function queuePlatform(options) {
+	return normalizeQueuePlatform(
+		options.runOptions?.platform ?? options.platform,
+	);
+}
+
+function prepareQueueLaunch({
+	tasksFilePath,
+	projectPath,
+	checkpointPath,
+	maxTasks,
+	stopOnFailure,
+	exclude,
+	only,
+	taskIds,
+	identityTaskIds = taskIds,
+	platform,
+	runOptions,
+	queueIdentity,
+	projectRevision,
+	runId,
+	dependencies,
+	onStatus,
+}) {
+	const selectedPlatform = queuePlatform({ platform, runOptions });
+	const tasks = loadTaskQueue(tasksFilePath);
+	if (tasks.length === 0) {
+		throwOnEmptyParse(tasksFilePath, checkpointPath, onStatus);
+	}
+	// Read the checkpoint before backend selection so malformed or stale queue
+	// state fails without creating a workspace or reserving a VM slot.
+	loadCheckpoint(checkpointPath, tasksFilePath);
+	const identity = resolveQueueIdentity(
+		{
+			tasksFilePath,
+			projectPath,
+			checkpointPath,
+			maxTasks,
+			stopOnFailure,
+			exclude,
+			only,
+			taskIds: identityTaskIds,
+			platform: selectedPlatform,
+			runOptions,
+			queueIdentity,
+			projectRevision,
+		},
+		tasks,
+	);
+	const effectiveMaxTasks = identity.runOptions
+		? (identity.runOptions.maxTasks ?? Number.POSITIVE_INFINITY)
+		: maxTasks;
+	const effectiveStopOnFailure = identity.runOptions
+		? identity.runOptions.stopOnFailure
+		: stopOnFailure;
+	const effectiveExclude = identity.runOptions
+		? identity.runOptions.excludeProviders
+		: exclude;
+	const effectiveOnly = identity.runOptions
+		? identity.runOptions.onlyProviders
+		: only;
+	const effectiveTaskIds = identity.runOptions
+		? identity.runOptions.taskIds
+		: taskIds;
+	const checkpoint = loadCheckpoint(
+		checkpointPath,
+		tasksFilePath,
+		identity.enabled
+			? {
+					queueIdentity: identity.queueIdentity,
+					runOptions: identity.runOptions,
+				}
+			: null,
+	);
+	ensureRetryCheckpoint(checkpoint);
+	validateRetryDescriptorEvidence(checkpoint);
+	const queueBackend = createQueueBackend({
+		platform: selectedPlatform,
+		dependencies,
+		projectPath,
+		runId,
+		runOptions: identity.runOptions ?? runOptions,
+	});
+	queueBackend.preflight({
+		platform: selectedPlatform,
+		tasks,
+		checkpoint,
+		maxTasks: effectiveMaxTasks,
+		selectedTaskIds: effectiveTaskIds,
+		exclude: effectiveExclude,
+		only: effectiveOnly,
+		runId,
+		projectPath,
+		runOptions: identity.runOptions,
+	});
+	const slotLease =
+		selectedPlatform === "macos" ? queueBackend.acquireSlot({ runId }) : null;
+	return {
+		selectedPlatform,
+		tasks,
+		checkpoint,
+		identity,
+		queueBackend,
+		slotLease,
+		effectiveMaxTasks,
+		effectiveStopOnFailure,
+		effectiveExclude,
+		effectiveOnly,
+		effectiveTaskIds,
+	};
+}
+
+function releaseQueueSlot(queueBackend, slotLease) {
+	if (!slotLease) return;
+	try {
+		queueBackend.releaseSlot(slotLease);
+	} catch {
+		// The queue outcome is authoritative; release is best effort but always
+		// attempted from the enclosing finally block.
+	}
+}
+
 function recordDispatchToBothLedgers(
 	dispatch,
 	recordDispatchToStoreFn = recordDispatchToStore,
@@ -3912,6 +4379,7 @@ export function runQueue(options) {
 		exclude = [],
 		only = [],
 		taskIds = [],
+		platform,
 		runOptions,
 		queueIdentity,
 		projectRevision,
@@ -3922,19 +4390,6 @@ export function runQueue(options) {
 	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
 		markerPath: dependencies.generationMarkerPath,
 	});
-
-	const ensureAgentContainerFn =
-		dependencies.ensureAgentContainer ?? ensureAgentContainer;
-	const createWorkingContainerFn =
-		dependencies.createWorkingContainer ?? createWorkingContainer;
-	const provisionCredentialsFn =
-		dependencies.provisionCredentials ?? provisionCredentials;
-	const seedProjectFn = dependencies.seedProject ?? seedProject;
-	const commitWorkingTreeFn =
-		dependencies.commitWorkingTree ?? commitWorkingTree;
-	const resetWorkingTreeFn = dependencies.resetWorkingTree ?? resetWorkingTree;
-	const wipeWorkingContainerFn =
-		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 	const onTaskStart = dependencies.onTaskStart ?? null;
 	const onTaskRouted = dependencies.onTaskRouted ?? null;
 	const onResult = dependencies.onResult ?? null;
@@ -3944,50 +4399,85 @@ export function runQueue(options) {
 	const runStore = dependencies.runStore ?? null;
 	const runStorePath = dependencies.runStorePath ?? null;
 	const emitStatus = _resolveOnStatus(dependencies);
+	const launch = prepareQueueLaunch({
+		tasksFilePath,
+		projectPath,
+		checkpointPath,
+		maxTasks,
+		stopOnFailure,
+		exclude,
+		only,
+		taskIds,
+		platform,
+		runOptions,
+		queueIdentity,
+		projectRevision,
+		runId,
+		dependencies,
+		onStatus: emitStatus,
+	});
+	const {
+		queueBackend,
+		slotLease,
+		tasks,
+		checkpoint,
+		identity,
+		effectiveMaxTasks,
+		effectiveStopOnFailure,
+		effectiveExclude,
+		effectiveOnly,
+		effectiveTaskIds,
+	} = launch;
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
 	let uninstallSignalCleanup = null;
-	if (!workingContainerName) {
-		ensureAgentContainerFn();
-		// Pass runId so the working container carries the managed + run_id
-		// labels (createWorkingContainer's labeled branch). Without this the
-		// container is unlabeled and invisible to `recover` — the core leak.
-		workingContainerName = createWorkingContainerFn(projectPath, undefined, {
-			runId,
-		});
+	try {
 		if (!workingContainerName) {
-			throw new Error("runQueue: failed to create working container");
-		}
-		ownsWorkingContainer = true;
-		uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
-			workingContainerName,
-			wipeWorkingContainerFn,
-		);
-		if (emitStatus) {
-			emitStatus({
-				phase: "bootstrap",
-				event: "container_created",
-				status: "Working container created",
-				provider: null,
-				model: null,
-			});
-		}
-		try {
-			provisionCredentialsFn(workingContainerName);
-		} catch (error) {
-			console.error(
-				`runQueue: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+			queueBackend.ensureAgentContainer();
+			// Pass runId so the working container carries the managed + run_id
+			// labels (createWorkingContainer's labeled branch). Without this the
+			// container is unlabeled and invisible to `recover` — the core leak.
+			workingContainerName = queueBackend.create(projectPath, { runId });
+			if (!workingContainerName) {
+				throw new Error("runQueue: failed to create working container");
+			}
+			ownsWorkingContainer = true;
+			uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+				workingContainerName,
+				queueBackend.destroy,
 			);
+			if (emitStatus) {
+				emitStatus({
+					phase: "bootstrap",
+					event: "container_created",
+					status: "Working container created",
+					provider: null,
+					model: null,
+				});
+			}
+			try {
+				queueBackend.provision(workingContainerName);
+			} catch (error) {
+				console.error(
+					`runQueue: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+				);
+			}
 		}
-	}
 
-	// Fires unconditionally once workingContainerName holds its final value —
-	// whether just created above or supplied by the caller — so a caller
-	// wiring the run record (e.g. worker-bootstrap) always learns the
-	// container name, not just on the auto-created path.
-	if (onContainerReady) {
-		onContainerReady({ workingContainerName });
+		// Fires once the workspace handle holds its final value, whether it was
+		// supplied by the caller or created by this queue.
+		if (onContainerReady) onContainerReady({ workingContainerName });
+	} catch (error) {
+		if (ownsWorkingContainer && workingContainerName) {
+			try {
+				queueBackend.destroy(workingContainerName);
+			} catch {
+				// Preserve the bootstrap error.
+			}
+		}
+		releaseQueueSlot(queueBackend, slotLease);
+		throw error;
 	}
 
 	const recordDispatchToStoreFn =
@@ -4026,6 +4516,8 @@ export function runQueue(options) {
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
+		executionBackend: queueBackend.executionBackend,
+		queueBackend,
 		onStatus: emitStatus,
 		onTaskRouted,
 		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
@@ -4038,7 +4530,7 @@ export function runQueue(options) {
 	try {
 		if (ownsWorkingContainer) {
 			try {
-				seedProjectFn(workingContainerName, projectPath);
+				queueBackend.seed(workingContainerName, projectPath);
 			} catch (error) {
 				if (emitStatus) {
 					emitStatus({
@@ -4052,55 +4544,8 @@ export function runQueue(options) {
 			}
 		}
 
-		const tasks = loadTaskQueue(tasksFilePath);
-		if (tasks.length === 0) {
-			throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus);
-		}
-		const identity = resolveQueueIdentity(
-			{
-				tasksFilePath,
-				projectPath,
-				checkpointPath,
-				maxTasks,
-				stopOnFailure,
-				exclude,
-				only,
-				taskIds,
-				runOptions,
-				queueIdentity,
-				projectRevision,
-			},
-			tasks,
-		);
-		const effectiveMaxTasks = identity.runOptions
-			? (identity.runOptions.maxTasks ?? Number.POSITIVE_INFINITY)
-			: maxTasks;
-		const effectiveStopOnFailure = identity.runOptions
-			? identity.runOptions.stopOnFailure
-			: stopOnFailure;
-		const effectiveExclude = identity.runOptions
-			? identity.runOptions.excludeProviders
-			: exclude;
-		const effectiveOnly = identity.runOptions
-			? identity.runOptions.onlyProviders
-			: only;
-		const effectiveTaskIds = identity.runOptions
-			? identity.runOptions.taskIds
-			: taskIds;
 		context.exclude = effectiveExclude;
 		context.only = effectiveOnly;
-		const checkpoint = loadCheckpoint(
-			checkpointPath,
-			tasksFilePath,
-			identity.enabled
-				? {
-						queueIdentity: identity.queueIdentity,
-						runOptions: identity.runOptions,
-					}
-				: null,
-		);
-		ensureRetryCheckpoint(checkpoint);
-		validateRetryDescriptorEvidence(checkpoint);
 		const projectRetryState = () => {
 			if (
 				(!runStore && !onRetryStateChanged) ||
@@ -4273,7 +4718,7 @@ export function runQueue(options) {
 							checkpoint,
 							checkpointPath,
 							workingContainerName,
-							resetWorkingTreeFn,
+							resetWorkingTreeFn: queueBackend.reset,
 							emitStatus,
 						});
 						projectRetryState();
@@ -4355,7 +4800,7 @@ export function runQueue(options) {
 						checkpoint,
 						checkpointPath,
 						workingContainerName,
-						resetWorkingTreeFn,
+						resetWorkingTreeFn: queueBackend.reset,
 						emitStatus,
 					});
 					projectRetryState();
@@ -4558,8 +5003,8 @@ export function runQueue(options) {
 				ownsWorkingContainer,
 				workingContainerName,
 				stopOnFailure: effectiveStopOnFailure,
-				commitWorkingTreeFn,
-				resetWorkingTreeFn,
+				commitWorkingTreeFn: queueBackend.commit,
+				resetWorkingTreeFn: queueBackend.reset,
 				emitStatus,
 				logPrefix: "runQueue: ",
 			});
@@ -4634,35 +5079,39 @@ export function runQueue(options) {
 		};
 	} finally {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();
-		if (ownsWorkingContainer) {
-			if (emitStatus) {
-				emitStatus({
-					phase: "cleanup",
-					event: "cleanup_started",
-					status: "Wiping working container",
-				});
-			}
-			try {
-				wipeWorkingContainerFn(workingContainerName);
+		try {
+			if (ownsWorkingContainer) {
 				if (emitStatus) {
 					emitStatus({
 						phase: "cleanup",
-						event: "cleanup_complete",
-						status: "Cleanup complete",
+						event: "cleanup_started",
+						status: "Wiping working container",
 					});
 				}
-			} catch (error) {
-				if (emitStatus) {
-					emitStatus({
-						phase: "cleanup",
-						event: "cleanup_failed",
-						status: `Cleanup failed: ${error.message}`,
-						error: _safeError(error),
-					});
+				try {
+					queueBackend.destroy(workingContainerName);
+					if (emitStatus) {
+						emitStatus({
+							phase: "cleanup",
+							event: "cleanup_complete",
+							status: "Cleanup complete",
+						});
+					}
+				} catch (error) {
+					if (emitStatus) {
+						emitStatus({
+							phase: "cleanup",
+							event: "cleanup_failed",
+							status: `Cleanup failed: ${error.message}`,
+							error: _safeError(error),
+						});
+					}
+					// biome-ignore lint/correctness/noUnsafeFinally: re-throwing the same error the bare wipe call would throw
+					throw error;
 				}
-				// biome-ignore lint/correctness/noUnsafeFinally: re-throwing the same error the bare wipe call would throw
-				throw error;
 			}
+		} finally {
+			releaseQueueSlot(queueBackend, slotLease);
 		}
 	}
 }
@@ -4691,6 +5140,7 @@ export async function runQueueWithOrchestrator(options) {
 		exclude = [],
 		only = [],
 		taskIds = [],
+		platform,
 		runOptions,
 		queueIdentity,
 		projectRevision,
@@ -4703,62 +5153,88 @@ export async function runQueueWithOrchestrator(options) {
 	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
 		markerPath: dependencies.generationMarkerPath,
 	});
-
-	const ensureAgentContainerFn =
-		dependencies.ensureAgentContainer ?? ensureAgentContainer;
-	const createWorkingContainerFn =
-		dependencies.createWorkingContainer ?? createWorkingContainer;
-	const provisionCredentialsFn =
-		dependencies.provisionCredentials ?? provisionCredentials;
-	const seedProjectFn = dependencies.seedProject ?? seedProject;
-	const commitWorkingTreeFn =
-		dependencies.commitWorkingTree ?? commitWorkingTree;
-	const resetWorkingTreeFn = dependencies.resetWorkingTree ?? resetWorkingTree;
 	const onTaskStart = dependencies.onTaskStart ?? null;
 	const onTaskRouted = dependencies.onTaskRouted ?? null;
 	const onResult = dependencies.onResult ?? null;
 	const onCheckpointSaved = dependencies.onCheckpointSaved ?? null;
 	const runStore = dependencies.runStore ?? null;
 	const runStorePath = dependencies.runStorePath ?? null;
-	const wipeWorkingContainerFn =
-		dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
 	const emitStatus = _resolveOnStatus(dependencies);
+	const launch = prepareQueueLaunch({
+		tasksFilePath,
+		projectPath,
+		checkpointPath,
+		maxTasks,
+		stopOnFailure,
+		exclude,
+		only,
+		taskIds,
+		platform,
+		runOptions,
+		queueIdentity,
+		projectRevision,
+		runId,
+		dependencies,
+		onStatus: emitStatus,
+	});
+	const {
+		queueBackend,
+		slotLease,
+		tasks,
+		checkpoint,
+		identity,
+		effectiveMaxTasks,
+		effectiveStopOnFailure,
+		effectiveExclude,
+		effectiveOnly,
+		effectiveTaskIds,
+	} = launch;
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
 	let uninstallSignalCleanup = null;
-	if (!workingContainerName) {
-		ensureAgentContainerFn();
-		// Pass runId so the container is labeled managed + run_id (see runQueue).
-		workingContainerName = createWorkingContainerFn(projectPath, undefined, {
-			runId,
-		});
+	try {
 		if (!workingContainerName) {
-			throw new Error(
-				"runQueueWithOrchestrator: failed to create working container",
+			queueBackend.ensureAgentContainer();
+			// Pass runId so the container is labeled managed + run_id (see runQueue).
+			workingContainerName = queueBackend.create(projectPath, { runId });
+			if (!workingContainerName) {
+				throw new Error(
+					"runQueueWithOrchestrator: failed to create working container",
+				);
+			}
+			ownsWorkingContainer = true;
+			uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+				workingContainerName,
+				queueBackend.destroy,
 			);
+			if (emitStatus) {
+				emitStatus({
+					phase: "bootstrap",
+					event: "container_created",
+					status: "Working container created",
+					provider: null,
+					model: null,
+				});
+			}
+			try {
+				queueBackend.provision(workingContainerName);
+			} catch (error) {
+				console.error(
+					`runQueueWithOrchestrator: credential provisioning failed, continuing unauthenticated: ${error.message}`,
+				);
+			}
 		}
-		ownsWorkingContainer = true;
-		uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
-			workingContainerName,
-			wipeWorkingContainerFn,
-		);
-		if (emitStatus) {
-			emitStatus({
-				phase: "bootstrap",
-				event: "container_created",
-				status: "Working container created",
-				provider: null,
-				model: null,
-			});
+	} catch (error) {
+		if (ownsWorkingContainer && workingContainerName) {
+			try {
+				queueBackend.destroy(workingContainerName);
+			} catch {
+				// Preserve the bootstrap error.
+			}
 		}
-		try {
-			provisionCredentialsFn(workingContainerName);
-		} catch (error) {
-			console.error(
-				`runQueueWithOrchestrator: credential provisioning failed, continuing unauthenticated: ${error.message}`,
-			);
-		}
+		releaseQueueSlot(queueBackend, slotLease);
+		throw error;
 	}
 
 	const recordDispatchToStoreFn =
@@ -4782,6 +5258,8 @@ export async function runQueueWithOrchestrator(options) {
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
+		executionBackend: queueBackend.executionBackend,
+		queueBackend,
 		pollIntervalMs,
 		maxPolls,
 		now: dependencies.now ?? Date.now,
@@ -4797,7 +5275,7 @@ export async function runQueueWithOrchestrator(options) {
 	try {
 		if (ownsWorkingContainer) {
 			try {
-				seedProjectFn(workingContainerName, projectPath);
+				queueBackend.seed(workingContainerName, projectPath);
 			} catch (error) {
 				if (emitStatus) {
 					emitStatus({
@@ -4811,55 +5289,8 @@ export async function runQueueWithOrchestrator(options) {
 			}
 		}
 
-		const tasks = loadTaskQueue(tasksFilePath);
-		if (tasks.length === 0) {
-			throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus);
-		}
-		const identity = resolveQueueIdentity(
-			{
-				tasksFilePath,
-				projectPath,
-				checkpointPath,
-				maxTasks,
-				stopOnFailure,
-				exclude,
-				only,
-				taskIds,
-				runOptions,
-				queueIdentity,
-				projectRevision,
-			},
-			tasks,
-		);
-		const effectiveMaxTasks = identity.runOptions
-			? (identity.runOptions.maxTasks ?? Number.POSITIVE_INFINITY)
-			: maxTasks;
-		const effectiveStopOnFailure = identity.runOptions
-			? identity.runOptions.stopOnFailure
-			: stopOnFailure;
-		const effectiveExclude = identity.runOptions
-			? identity.runOptions.excludeProviders
-			: exclude;
-		const effectiveOnly = identity.runOptions
-			? identity.runOptions.onlyProviders
-			: only;
-		const effectiveTaskIds = identity.runOptions
-			? identity.runOptions.taskIds
-			: taskIds;
 		context.exclude = effectiveExclude;
 		context.only = effectiveOnly;
-		const checkpoint = loadCheckpoint(
-			checkpointPath,
-			tasksFilePath,
-			identity.enabled
-				? {
-						queueIdentity: identity.queueIdentity,
-						runOptions: identity.runOptions,
-					}
-				: null,
-		);
-		ensureRetryCheckpoint(checkpoint);
-		validateRetryDescriptorEvidence(checkpoint);
 		if (checkpoint.retryState !== null) {
 			const reason = hasExactRetryDescriptorEvidence(checkpoint.retryState)
 				? "orchestrator mode cannot resume persisted retry state until an audited retry-resume state machine is implemented"
@@ -5018,8 +5449,8 @@ export async function runQueueWithOrchestrator(options) {
 				ownsWorkingContainer,
 				workingContainerName,
 				stopOnFailure: effectiveStopOnFailure,
-				commitWorkingTreeFn,
-				resetWorkingTreeFn,
+				commitWorkingTreeFn: queueBackend.commit,
+				resetWorkingTreeFn: queueBackend.reset,
 				emitStatus,
 				logPrefix: "runQueueWithOrchestrator: ",
 			});
@@ -5088,35 +5519,39 @@ export async function runQueueWithOrchestrator(options) {
 		};
 	} finally {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();
-		if (ownsWorkingContainer) {
-			if (emitStatus) {
-				emitStatus({
-					phase: "cleanup",
-					event: "cleanup_started",
-					status: "Wiping working container",
-				});
-			}
-			try {
-				wipeWorkingContainerFn(workingContainerName);
+		try {
+			if (ownsWorkingContainer) {
 				if (emitStatus) {
 					emitStatus({
 						phase: "cleanup",
-						event: "cleanup_complete",
-						status: "Cleanup complete",
+						event: "cleanup_started",
+						status: "Wiping working container",
 					});
 				}
-			} catch (error) {
-				if (emitStatus) {
-					emitStatus({
-						phase: "cleanup",
-						event: "cleanup_failed",
-						status: `Cleanup failed: ${error.message}`,
-						error: _safeError(error),
-					});
+				try {
+					queueBackend.destroy(workingContainerName);
+					if (emitStatus) {
+						emitStatus({
+							phase: "cleanup",
+							event: "cleanup_complete",
+							status: "Cleanup complete",
+						});
+					}
+				} catch (error) {
+					if (emitStatus) {
+						emitStatus({
+							phase: "cleanup",
+							event: "cleanup_failed",
+							status: `Cleanup failed: ${error.message}`,
+							error: _safeError(error),
+						});
+					}
+					// biome-ignore lint/correctness/noUnsafeFinally: re-throwing the same error the bare wipe call would throw
+					throw error;
 				}
-				// biome-ignore lint/correctness/noUnsafeFinally: re-throwing the same error the bare wipe call would throw
-				throw error;
 			}
+		} finally {
+			releaseQueueSlot(queueBackend, slotLease);
 		}
 	}
 }

@@ -41,6 +41,8 @@ import { ensureAgentContainer } from "../runner/index.mjs";
  * @param {Record<string, string>} [env] Extra env vars to forward via `docker exec -e`.
  */
 function runInteractiveLogin(loginCommand, env = {}) {
+	// D-10: interactive OAuth remains attached to the standing Docker
+	// credential container; the VM execution backend does not replace it.
 	const dockerArgs = ["exec", "-it"];
 	for (const [key, value] of Object.entries(env)) {
 		dockerArgs.push("-e", `${key}=${value}`);

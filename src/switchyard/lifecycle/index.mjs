@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { validateIdentifier } from "../adapter/shell-safety.mjs";
 import { AGENT_CONTAINER_NAME, AGENT_IMAGE } from "../container/index.mjs";
+import { configureDockerLifecycle } from "./execution-backend.mjs";
 
 const WORKING_PREFIX = "switchyard-work-";
 
@@ -173,6 +174,17 @@ const PROVIDER_CREDENTIAL_PATHS = [
 		dest: "/root/.local/share/opencode",
 	},
 ];
+
+// The VM lane can only carry the file-backed stores confirmed by Task 1.3.
+// These sources are read from the standing Docker vault into a Node Buffer and
+// immediately handed to the selected backend; no credential tar is written to
+// a host path. Keychain-backed providers are deliberately absent so a routed
+// VM task fails before execution instead of claiming that vault auth is
+// present in a guest that never received it.
+const VM_TAR_CREDENTIAL_SOURCES = Object.freeze({
+	codex: Object.freeze({ src: "/root/.codex/auth.json" }),
+	opencode: Object.freeze({ src: "/root/.local/share/opencode/auth.json" }),
+});
 
 /**
  * Generate a unique working container name for a project.
@@ -365,6 +377,131 @@ function copyPathAgentToWorking(
 		return false;
 	}
 	return true;
+}
+
+function readPathAgentToBuffer(agentContainerName, srcPath) {
+	try {
+		execFileSync(
+			"docker",
+			["exec", agentContainerName, "test", "-e", srcPath],
+			{
+				stdio: "pipe",
+			},
+		);
+	} catch {
+		throw new Error("credential source is absent from the standing vault");
+	}
+	try {
+		return execFileSync(
+			"docker",
+			["cp", `${agentContainerName}:${srcPath}`, "-"],
+			{ maxBuffer: 256 * 1024 * 1024 },
+		);
+	} catch {
+		throw new Error(
+			"credential source could not be read from the standing vault",
+		);
+	}
+}
+
+/**
+ * Provision one macOS VM credential from the standing Docker vault.
+ *
+ * The source tar exists only as a Node Buffer. The backend owns the second
+ * hop and must write it through the provider's Aqua identity; a missing or
+ * unsupported provider is an error, never a silent unauthenticated fallback.
+ * @param {import("./execution-backend.mjs").ExecutionBackend & {provisionCredentials?: Function}} executionBackend
+ * @param {string} workspaceId VM UUID or backend workspace handle
+ * @param {object} options
+ * @param {string} options.provider Routed provider name
+ * @param {string} [options.agentContainerName] Standing Docker vault
+ * @param {number|string} [options.aquaUid] Guest Aqua UID
+ * @param {string} [options.providerUser] Guest provider account
+ * @param {(agentContainerName: string, srcPath: string) => Buffer} [options.readCredentialTar]
+ * @returns {object} backend provisioning receipt
+ */
+export function provisionCredentialsWithBackend(
+	executionBackend,
+	workspaceId,
+	{
+		provider,
+		agentContainerName = AGENT_CONTAINER_NAME,
+		aquaUid,
+		providerUser,
+		readCredentialTar = readPathAgentToBuffer,
+	} = {},
+) {
+	if (
+		!executionBackend ||
+		typeof executionBackend.provisionCredentials !== "function"
+	) {
+		throw new TypeError(
+			"execution backend does not support VM credential provisioning",
+		);
+	}
+	if (typeof workspaceId !== "string" || workspaceId.length === 0) {
+		throw new TypeError("workspaceId must be a non-empty backend handle");
+	}
+	validateIdentifier(agentContainerName, "agentContainerName");
+	const providerKey = String(provider ?? "").toLowerCase();
+	const source = VM_TAR_CREDENTIAL_SOURCES[providerKey];
+	if (!source) {
+		throw new Error(`provider is not tar-provisionable on macOS: ${provider}`);
+	}
+	const tar = readCredentialTar(agentContainerName, source.src);
+	if (!Buffer.isBuffer(tar)) {
+		throw new TypeError("credential reader must return an in-memory Buffer");
+	}
+	return executionBackend.provisionCredentials(workspaceId, {
+		provider: providerKey,
+		tar,
+		aquaUid,
+		providerUser,
+	});
+}
+
+/**
+ * Seed a backend workspace from the host repository's committed tree.
+ * `pushTar` is the only payload transfer; the baseline git setup runs through
+ * the same backend execution prefix and therefore works for Docker and VM
+ * workspaces without a host mount.
+ * @param {import("./execution-backend.mjs").ExecutionBackend} executionBackend
+ * @param {string} workspaceId
+ * @param {string} projectPath
+ * @returns {object} backend transfer receipt
+ */
+export function seedProjectWithBackend(
+	executionBackend,
+	workspaceId,
+	projectPath,
+) {
+	if (!executionBackend || typeof executionBackend.pushTar !== "function") {
+		throw new TypeError("execution backend does not support tar transfer");
+	}
+	if (typeof workspaceId !== "string" || workspaceId.length === 0) {
+		throw new TypeError("workspaceId must be a non-empty backend handle");
+	}
+	const tar = execFileSync("git", ["-C", projectPath, "archive", "HEAD"], {
+		maxBuffer: 256 * 1024 * 1024,
+	});
+	const receipt = executionBackend.pushTar(workspaceId, tar, "/project");
+	const script =
+		"git init -q && git add -A -f && git -c user.name=switchyard -c user.email=switchyard@localhost commit -qm baseline";
+	if (typeof executionBackend.execGuest === "function") {
+		executionBackend.execGuest(workspaceId, "/bin/bash", ["-lc", script], {
+			cwd: "/project",
+		});
+	} else {
+		const execution = executionBackend.execArgv(workspaceId, {
+			cwd: "/project",
+		});
+		execFileSync(
+			execution.command,
+			[...execution.args, "/bin/bash", "-lc", script],
+			{ stdio: "pipe" },
+		);
+	}
+	return receipt;
 }
 
 /**
@@ -922,3 +1059,15 @@ export function execInWorkingContainer(workingContainerName, command) {
 	);
 	return result.trim();
 }
+
+configureDockerLifecycle({
+	create: createWorkingContainer,
+	destroy: wipeWorkingContainer,
+	listManaged: () => ({
+		containers: listManagedContainers(),
+		volumes: listManagedVolumes(),
+	}),
+});
+
+export * from "./execution-backend.mjs";
+export * from "./parallels-execution-backend.mjs";

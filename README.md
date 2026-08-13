@@ -26,13 +26,16 @@ The 2026-08-04 capability-reliability checkpoint adds explicit `RequiredCapabili
 | `biome.json` | Biome linter/formatter config. |
 | `knip.json` | Dead code / unused dependency detection. |
 | `docker/Dockerfile` | Agent image build context: installs all six provider CLIs + git onto a pinned base, built to `switchyard-agent:latest` (the image every working container is derived from). |
+| `ops/macos-vm/build-golden-image.sh` | Reproducible Parallels golden-image hardening recipe for the native macOS execution lane. |
 | **Source modules** | |
 | `src/switchyard/router/index.mjs` | Provider selection: snapshot-backed spread routing, blind fallback, INV-4 compliance. Survivors of the exclude/only/capability/availability checks partition into three pools before a winner is picked: a **ranked pool** (roster `implementor_priority` set — the drain-to-0%-first "cheap implementor" waterfall) wins outright over a **spread pool** (every unranked provider, unchanged highest-headroom selection) whenever it's non-empty, which in turn wins over a **last-resort pool** (Cursor's `ap`/API window alone, gated by the ordinary `DEFAULT_FLOOR`). Ranked candidates are matched strictly by lowest `implementor_priority` number (never compared by headroom across ranks), with same-priority ties broken by the same scorer the spread pool's headroom ties use. `reason` reports which pool won: `priority_fill`, `spread`, or `last_resort_fallback`. Cursor's `ac`/`ap` snapshot windows are matched by `w.id`, never pooled or averaged. |
 | `src/switchyard/router/scorer.mjs` | Capacity scoring: FNV-1a hash, mulberry32 PRNG, deterministic jitter. |
-| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter, now loaded from the canonical `~/.agent/roster.json` default (resolved via `os.homedir()`), overridable by `SWITCHYARD_ROSTER_PATH`, lazy-loaded + memoized; a missing or malformed roster at the resolved path (override or default) fails loud on load — never a silent fallback to an empty or wrong roster. Preserves all pre-roster exports for backward-compatible caller interface. Dispatch records include provenance: roster identity (schema version + routing-stable sha) + resolved target/harness/selector. Low-capability lane eligibility (e.g. `opencode-go`) is entirely roster-driven through `passesCapabilityFilter` — there is no separate hardcoded spread ratio; INV-4's most-headroom spread still governs *which* eligible lane wins, cost never overrides it. `passesCapabilityFilter` throws on an unrecognized required capability rather than silently treating it as the lowest capability. Multiple targets may share a harness; the Gemini Antigravity target is disabled, while Vibe is an enabled OpenCode-backed implementation target keyed by its exact `Vibe` snapshot name. The Antigravity Claude target remains eligible through `agy`. Provider-specific effort/variant vocabularies and declarative adapter argv mappings are validated at the adapter boundary and forwarded verbatim only from the exact routed descriptor; unsupported intent remains disabled instead of crossing CLI labels. Automatic routing requires a current exact `dispatch_qualified` descriptor, so an enabled target without promoted evidence remains unavailable. `evaluateRealRosterCoherence()` and `npm run roster:coherence` require current exact `dispatch_qualified` descriptors for the low/standard/high automatic baseline and explicitly report missing canary evidence; disabled Gemini is excluded, while Vibe requires its own current descriptor evidence. `resolveTargetId(identifier)` and the router's `providerMatches(identifier, name)` helper (`router/index.mjs`) retain target-id-aware matching for `--exclude-provider`/`--only-provider`, so an explicit selector cannot force a disabled target into routing. `getImplementorPriority(providerName)` exposes a target's optional `implementor_priority` (positive integer, lower drains first) the same snapshot-name-then-harness lookup way as `getCapabilityClass`/`getModelForCapability`, returning `null` for the unranked default — the router's priority-fill waterfall (see `router/index.mjs` above) is the sole consumer. |
+| `src/switchyard/roster/index.mjs` | Provider capability definitions and INV-5 capability filter, now loaded from the canonical `~/.agent/roster.json` default (resolved via `os.homedir()`), overridable by `SWITCHYARD_ROSTER_PATH`, lazy-loaded + memoized; a missing or malformed roster at the resolved path (override or default) fails loud on load — never a silent fallback to an empty or wrong roster. Preserves all pre-roster exports for backward-compatible caller interface. Dispatch records include provenance: roster identity (schema version + routing-stable sha) + resolved target/harness/selector. Low-capability lane eligibility (e.g. `opencode-go`) is entirely roster-driven through `passesCapabilityFilter` — there is no separate hardcoded spread ratio; INV-4's most-headroom spread still governs *which* eligible lane wins, cost never overrides it. `passesCapabilityFilter` throws on an unrecognized required capability rather than silently treating it as the lowest capability. Multiple targets may share a harness; the Gemini Antigravity target is enabled (re-enabled 2026-08-13 on Gemini 3.7 Flash) but holds no `dispatch_qualified` receipt, so it is roster-qualified and automatically ineligible at the same time, and Vibe is an enabled OpenCode-backed implementation target keyed by its exact `Vibe` snapshot name in the same state. The Antigravity Claude target remains eligible through `agy`. Provider-specific effort/variant vocabularies and declarative adapter argv mappings are validated at the adapter boundary and forwarded verbatim only from the exact routed descriptor; unsupported intent remains disabled instead of crossing CLI labels. Automatic routing requires a current exact `dispatch_qualified` descriptor, so an enabled target without promoted evidence remains unavailable. `evaluateRealRosterCoherence()` and `npm run roster:coherence` require current exact `dispatch_qualified` descriptors for the low/standard/high automatic baseline and explicitly report missing canary evidence; Gemini Antigravity, Cursor, and Vibe are enabled but each still require their own current descriptor evidence before automatic dispatch. `resolveTargetId(identifier)` and the router's `providerMatches(identifier, name)` helper (`router/index.mjs`) retain target-id-aware matching for `--exclude-provider`/`--only-provider`, so an explicit selector cannot force a disabled target into routing. `getImplementorPriority(providerName)` exposes a target's optional `implementor_priority` (positive integer, lower drains first) the same snapshot-name-then-harness lookup way as `getCapabilityClass`/`getModelForCapability`, returning `null` for the unranked default — the router's priority-fill waterfall (see `router/index.mjs` above) is the sole consumer. |
 | `src/switchyard/roster/classifier.mjs` | Keyword-based task-capability classifier (high/standard/low). |
 | `src/switchyard/container/index.mjs` | Standing **agent** container lifecycle (Docker start/stop/exec). Wired into the runner's dispatch path; its image is the base every working container is built from. Also owns the authoritative `docker info`/`orb info` daemon preflight with a 5-second timeout and explicit binary-missing, daemon-unreachable, and other-exec-error classifications, plus `getPlatformInfo()`: host-vs-image Docker architecture comparison (Node `os.arch()` naming normalized against Docker's before comparing, so an amd64 host running an amd64 image doesn't false-positive a mismatch), surfaced as `platformInfo` in the dispatch status/result envelope; documents its own Rosetta limitation. |
 | `src/switchyard/lifecycle/index.mjs` | **Working** container lifecycle, wired into the runner's real dispatch path: builds each per-project container `FROM ${AGENT_IMAGE}` on a Docker-managed `/project` volume (no host bind — INV-1), provisions all six providers' credential files container→container, **seeds** the container from the host repo's committed tree so `captureDiff` has a baseline (`seedProject`), **commits** the container baseline between queued tasks so multi-task diffs stay isolated (`commitWorkingTree`), and wipes at project end (INV-3). The sole surviving implementation after `sandbox/index.mjs` was deleted. |
+| `src/switchyard/lifecycle/execution-backend.mjs` | `ExecutionBackend` contract and the behavior-preserving `DockerExecutionBackend`; the seam is defined before later backend/call-site conversion work. |
+| `src/switchyard/lifecycle/parallels-execution-backend.mjs` | Task 4.1 Parallels lifecycle: UUID-backed clone/boot/destroy, Aqua readiness polling, exact-prefix PID reclamation, and golden-image safety refusals. No ownership sidecar is used. |
 | `src/switchyard/integrate/index.mjs` | Integration gate (INV-2): structural diff validation (`git apply --numstat`/`--summary`, not a content blocklist), path-escape/symlink/executable-file rejection, and explicit `allowSensitiveManifests` review for build/CI manifests, package manifests, and lockfiles. The runner accepts that opt-in only when `AllowManifests: true` and every manifest path is declared in the task's `Files:` list; an undeclared package or lock artifact is rejected by the exact allowlist before apply. Reviewed apply is via stdin. Apply is idempotent: a non-mutating `git apply --check` runs first, and when it fails a `--reverse --check` probe treats an already-applied diff as a successful no-op (`{alreadyApplied: true}`) with no mutating apply; a genuinely conflicting (or corrupt) diff fails with git's captured stderr as the `reason` and a `reasonKind` of `corrupt_patch` vs `conflict`. Patch normalization only adds a missing final newline and preserves valid one- and two-newline endings. The reviewed-gate contract is unchanged. |
 | `src/switchyard/ledger/index.mjs` | Dispatch ledger (INV-4): the sanitized project-local intent receipt is authoritative and must complete before any provider execution/launch; outcome records are appended to the project-local store and projected to the legacy global ledger on a best-effort basis. Projection failures use bounded classifications and never change the authoritative launch gate. |
 | `src/switchyard/adapter/shell-safety.mjs` | Shared shell-interpolation guards (`validateIdentifier`, `validateModelArg`) used by all six provider adapters. |
@@ -105,6 +108,173 @@ The 2026-08-04 capability-reliability checkpoint adds explicit `RequiredCapabili
 - Supersedes the abandoned `switchyard-containment-architecture-2026-07-20` (adversary-defense) draft.
 
 ## Workflows
+
+### Native macOS golden image
+
+`ops/macos-vm/build-golden-image.sh` hardens the existing Task 1.1 Parallels VM
+in place. It requires a host-staged Xcode VM with Homebrew, an interactive
+administrator build session for Homebrew's Node package, and explicit network
+probe inputs. The script sets headless startup and 16 GiB memory, creates a
+generated non-admin `switchyard` provider account, enables passwordless
+automation mode, configures the provider Aqua session to remain unlocked,
+installs the six provider CLIs without authentication, pins
+the requested iOS runtime, disables the guest clipboard agent, and loads the
+guest-side C-3 pf anchor. It restarts before the final Aqua, transport,
+clipboard, pf, memory, and network assertions.
+
+Provider installers are supplied through a pinned, externally reviewed
+manifest; the script will not use an unpinned `curl | shell` or an unversioned
+npm install. Each non-comment row is
+`provider|kind|ref|detail|sha256`, with `kind` set to `script` or `npm`,
+`detail` set to `bash`/`sh` for scripts or an exact npm version, and `sha256`
+set to the downloaded installer or npm tarball digest. The manifest must have
+one row for each of `claude`, `codex`, `agy`, `cursor-agent`, `copilot`, and
+`opencode`; every artifact is downloaded, hashed, and installed on each build.
+Keep the manifest and its release-source review alongside the operator's build
+records, not in the VM or a commit containing credentials.
+
+Example using the measured Parallels addresses:
+
+```sh
+ops/macos-vm/build-golden-image.sh --vm macOS \
+  --simulator-runtime-version 26.5 \
+  --cli-manifest /path/to/reviewed-cli-manifest.txt \
+  --blocked-endpoint 10.211.55.2:22 \
+  --blocked-endpoint 192.168.1.49:22 \
+  --blocked-endpoint 192.168.1.1:443 \
+  --blocked-endpoint 10.211.55.6:22 \
+  --reachable-endpoint 1.1.1.1:443 \
+  --dns-name apple.com
+```
+
+The auto-login password is generated and consumed only inside the guest. The
+only deliberate plaintext-equivalent persistence is `/etc/kcpassword`: it is a
+disposable, non-admin, guest-only credential shared by image clones. It is
+never sourced from BWS, reused from the host, printed, or written to an
+artifact. The encoder uses macOS's repeating 11-byte XOR key and padded binary
+format; a cold boot must land in an unlocked provider Aqua session. If those
+conditions stop being true, rebuild the image.
+
+Task 1.3 reproducibility recipe: start from a stopped Task 1.2 substrate, create
+an independent disposable VM, run the same command above against the new VM, then
+create a second disposable clone from that build. On the second clone, assert a
+`prlctl exec` round-trip, the pinned `xcodebuild -version`, the pinned iOS runtime
+from `xcrun simctl list runtimes`, a trivial `xcodebuild` fixture build, and a
+booted device from `xcrun simctl boot`. Keep provider checks in the Aqua identity;
+`prlctl exec` itself is root in the System domain:
+
+```sh
+# Omit --linked for an independent full clone.
+prlctl clone <stopped-base> --name <build-2>
+ops/macos-vm/build-golden-image.sh --vm <build-2> \
+  --simulator-runtime-version 26.5 \
+  --cli-manifest /path/to/reviewed-cli-manifest.txt \
+  --blocked-endpoint 10.211.55.2:22 \
+  --blocked-endpoint 192.168.1.49:22 \
+  --blocked-endpoint 192.168.1.1:443 \
+  --blocked-endpoint 10.211.55.6:22 \
+  --reachable-endpoint 1.1.1.1:443 --dns-name apple.com
+prlctl clone <build-2> --name <check-2>
+```
+
+The live second-build gate is currently unverified: the linked validation clone
+reported `GuestTools: state=not_installed`, so the script could not establish its
+required `prlctl exec` channel. No credential values or credential contents were
+read.
+
+#### macOS provider credential locations
+
+The route in the fourth column is mandatory for every check: `prlctl exec` lands
+as root, while the provider runs in the auto-login Aqua session. “Yes” means only
+the stated file-backed mode is eligible; “No” is the safe default until an
+authenticated opaque-copy check proves otherwise. No auth login was run here.
+
+| Provider | Storage on macOS | Tar-provisionable | Auth-check identity route | Evidence / unknown status |
+|---|---|---:|---|---|
+| Claude | Keychain-backed; `~/.claude/.credentials.json` is a fallback when Keychain is unavailable | No | `launchctl asuser <UID> sudo -u <provider>` | Anthropic documents secure credential storage; macOS Keychain behavior and fallback are documented in the Claude Code issue tracker. Live guest check: unknown. |
+| Codex | File-backed by default: `~/.codex/auth.json`; `cli_auth_credentials_store=keyring` changes this | Yes* | `launchctl asuser <UID> sudo -u <provider>` | OpenAI source documents file, keyring, and auto modes. *Yes only with file mode; live opaque-copy check: unknown. |
+| Antigravity/Gemini | Keychain-backed native OS keyring; exact item/path is not a tar source | No | `launchctl asuser <UID> sudo -u <provider>` | Antigravity documentation names the native secure keyring. Live guest check: unknown. |
+| Cursor | Keychain-backed status unverified; exact item/path unknown | No | `launchctl asuser <UID> sudo -u <provider>` | Cursor documents secure local storage but not a stable macOS path. Live guest check: unknown. |
+| Copilot | Keychain-backed by default (`copilot-cli`); plaintext `~/.copilot/config.json` is fallback only when Keychain is unavailable | No* | `launchctl asuser <UID> sudo -u <provider>` | GitHub documents both stores. *No until fallback mode is deliberately selected and tested; live check: unknown. |
+| OpenCode | File-backed: `~/.local/share/opencode/auth.json` | Yes | `launchctl asuser <UID> sudo -u <provider>` | OpenCode documents this path. Live opaque-copy/auth check: unknown. |
+
+Sources: [Claude Code setup](https://docs.anthropic.com/en/docs/claude-code/getting-started),
+[Codex auth storage](https://github.com/openai/codex/blob/main/codex-rs/core/src/config/mod.rs),
+[Antigravity CLI auth](https://antigravity.google/docs/cli-install),
+[Cursor authentication](https://docs.cursor.com/en/cli/reference/authentication),
+[Copilot credential storage](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli),
+[OpenCode providers](https://opencode.ai/docs/providers).
+
+### Execution backend contract
+
+The lifecycle backend seam is defined by `ExecutionBackend`: `DockerExecutionBackend` supplies Docker's command prefix, workspace creation/destruction, tar transfer, managed-object listing, and process inspection. `execArgv(workspaceId, {cwd})` has no mode or session parameter. Honoring `cwd` is each backend's obligation; `prlctl exec` has no working-directory field and enters a different launchd domain from the Aqua domain required by the provider.
+
+
+### Parallels lifecycle backend (Task 4.1)
+
+`ParallelsExecutionBackend` uses only the reserved VM namespace
+`switchyard-work-<runId>-<creatorPid>`. The VM's Parallels UUID is the runtime
+handle; the name remains the ownership proof. Reclamation touches only names
+with that exact prefix and a valid embedded PID, and only after that PID is
+proven dead. It writes no sidecar ownership file.
+
+The backend creates a full-copy clone by default, boots by UUID, and polls
+`prlctl exec <uuid> launchctl print gui/<UID>` until the Aqua domain exists or a
+bounded timeout names the missing domain. A linked clone is considered only when
+`measureLinkedClone()` has produced a receipt for that exact golden image with
+positive disk usage and finite clone-to-boot time. The real golden-image probe
+on 2026-08-13 had no usable Guest Tools channel, so full-copy is the active
+measured path. Destroy tries a graceful `prlctl stop` and falls back to
+`prlctl stop <uuid> --kill` before deleting the VM. Partial creates roll back
+through the same stop/delete path.
+
+The backend refuses to boot the golden image while any owned clone exists. When
+a measured linked clone is used, it tracks and removes the linked-parent
+snapshot before teardown completes. VM calls, time, sleeping, disk measurement,
+and PID liveness are injectable for hermetic tests and smoke runs.
+
+### Parallels data plane (Task 4.2)
+
+VM execution uses `prlctl exec <uuid> launchctl asuser <UID> sudo -u <provider>
+/bin/bash -lc ...`, with an explicit `cd <cwd>` shim. This is intentionally the
+measured Aqua-session route; the earlier LaunchAgent/`launchctl bootstrap` D-5
+requirement was withdrawn because it could not provide the provider's stdin,
+incremental output, exit status, or killable process handle.
+
+Large tar transfers use a one-shot host-memory HTTP endpoint over the Parallels
+host-only address. The guest's baked C-3 pf anchor contains a nested
+`switchyard-transfer/*` anchor; each transfer loads one exact host/port pass
+rule, then flushes it in a `finally` path. Tar bytes never enter `prlctl exec`
+stdin and are never written to host disk. The VM credential hop reads only the
+file-backed Codex/OpenCode stores from the standing Docker vault into memory;
+Keychain-backed providers fail closed before execution rather than being
+reported authenticated from the vault alone.
+
+### macOS queue admission and provider preflight
+
+Select the native queue substrate explicitly:
+
+```sh
+npm run dispatch -- <tasks.md> --project <path> --platform macos
+```
+
+Before a macOS workspace or VM slot is created, Switchyard reads one routing
+snapshot for every non-terminal capability tier and requires at least one
+funded, adapter-available, tar-provisionable provider for each tier. The
+verified evidence is supplied as a JSON manifest through
+`SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST` (or the equivalent injected runner
+dependency), for example:
+
+```json
+{"verified":true,"providers":["codex","opencode"]}
+```
+
+No manifest, an unverified manifest, a missing snapshot, or an unsatisfied
+tier fails closed before admission. This is a launch gate only: quota can drain
+while the queue runs, so passing preflight does not guarantee every later task.
+The current Task 1.3 guest round-trip evidence is still unavailable; therefore
+the default macOS path remains intentionally blocked until that manifest is
+backed by live checks. Docker queues retain their existing preflight no-op.
 
 ### Running Tests and Linting
 

@@ -175,6 +175,430 @@ function indexProviders(snapshot) {
 	return map;
 }
 
+const TERMINAL_PREFLIGHT_STATUSES = new Set([
+	"done",
+	"succeeded",
+	"failed",
+	"cancelled",
+	"canceled",
+	"skipped",
+]);
+
+/**
+ * Normalize the explicit tar-provisionability evidence used by the macOS
+ * queue gate. A verified envelope is mandatory: a bare list, map, or stale
+ * status is not evidence that a credential round-trip was exercised.
+ *
+ * Accepted manifest shape:
+ *   { verified: true, providers: ["codex", "opencode"] }
+ * or:
+ *   { verified: true, providers: { codex: true, opencode: { tarProvisionable: true } } }
+ *
+ * @param {object|null|undefined} registry
+ * @returns {{verified: boolean, providers: string[]}}
+ */
+function normalizeTarProvisionRegistry(registry) {
+	if (!registry || typeof registry !== "object" || registry.verified !== true) {
+		return { verified: false, providers: [] };
+	}
+
+	const source =
+		registry.providers ??
+		registry.tarProvisionableProviders ??
+		registry.tarProvisionable;
+	const providers = [];
+
+	if (Array.isArray(source)) {
+		for (const entry of source) {
+			if (typeof entry === "string" && entry.trim()) {
+				providers.push(entry.trim());
+				continue;
+			}
+			if (
+				entry &&
+				typeof entry === "object" &&
+				typeof entry.provider === "string" &&
+				entry.tarProvisionable === true &&
+				entry.verified !== false
+			) {
+				providers.push(entry.provider.trim());
+			}
+		}
+	} else if (source && typeof source === "object") {
+		for (const [provider, evidence] of Object.entries(source)) {
+			if (
+				evidence === true ||
+				(evidence &&
+					typeof evidence === "object" &&
+					evidence.tarProvisionable === true &&
+					evidence.verified !== false)
+			) {
+				providers.push(provider);
+			}
+		}
+	}
+
+	const hasExplicitProviderSection =
+		Array.isArray(source) || (source !== null && typeof source === "object");
+	return { verified: hasExplicitProviderSection, providers };
+}
+
+/**
+ * Tar evidence is normally recorded at the adapter/harness grain (for
+ * example, `opencode` covers the enabled OpenCode Go target), while an
+ * explicit target id remains exact when a manifest supplies one.
+ *
+ * @param {string} registered
+ * @param {string} snapshotName
+ * @returns {boolean}
+ */
+function tarProviderMatches(registered, snapshotName) {
+	const registeredIdentity = resolveTargetIdentity(registered);
+	const snapshotIdentity = resolveTargetIdentity(snapshotName);
+	if (registeredIdentity.targetId && snapshotIdentity.targetId) {
+		return registeredIdentity.targetId === snapshotIdentity.targetId;
+	}
+	return (
+		normalizeProviderName(registered) === normalizeProviderName(snapshotName)
+	);
+}
+
+/**
+ * Return whether a snapshot provider has the same quota-headroom semantics
+ * as `route()`. Ranked providers may drain to 0%; unranked providers use the
+ * caller's floor; Cursor's `ac` and `ap` windows retain their separate route
+ * rules.
+ *
+ * @param {string} name
+ * @param {Array<object>} windows
+ * @param {number} floor
+ * @returns {boolean}
+ */
+function hasQuotaHeadroom(name, windows, floor) {
+	const priority = getImplementorPriority(name);
+	const minPercentLeft = windows.reduce(
+		(min, window) => Math.min(min, window.percent_left),
+		Infinity,
+	);
+	if (normalizeProviderName(name) === "cursor") {
+		const acWindow = windows.find((window) => window.id === "ac");
+		if (acWindow && priority !== null && acWindow.percent_left > 0) return true;
+		const apWindow = windows.find((window) => window.id === "ap");
+		return Boolean(apWindow && apWindow.percent_left >= DEFAULT_FLOOR);
+	}
+	if (priority !== null) return minPercentLeft > 0;
+	return minPercentLeft >= floor;
+}
+
+/**
+ * Determine whether a snapshot provider is an adapter- and selector-eligible
+ * candidate for one capability tier. This intentionally mirrors the gates in
+ * `route()` without invoking it, so one preflight evaluates one snapshot
+ * generation for every task tier.
+ *
+ * @param {string} name
+ * @param {object} provider
+ * @param {string} capability
+ * @param {object} options
+ * @returns {{eligible: boolean, reason: string}}
+ */
+function classifyPreflightProvider(name, provider, capability, options) {
+	const { exclude, only, floor, isAvailable, tarProviders } = options;
+	const targetIdentity = resolveTargetIdentity(name);
+	if (!targetIdentity.targetId) {
+		return { eligible: false, reason: "target_identity_unavailable" };
+	}
+	if (!isAvailable(name)) {
+		return { eligible: false, reason: "adapter_unavailable" };
+	}
+	if (exclude.some((excluded) => providerMatches(excluded, name))) {
+		return { eligible: false, reason: "explicitly_excluded" };
+	}
+	if (
+		only.length > 0 &&
+		!only.some((allowed) => providerMatches(allowed, name))
+	) {
+		return { eligible: false, reason: "not_in_only_allowlist" };
+	}
+	if (!passesCapabilityFilter(name, capability)) {
+		return { eligible: false, reason: "below_required_capability" };
+	}
+	if (!hasAutomaticInvocationDescriptor(name, capability)) {
+		return { eligible: false, reason: "no_invocation_descriptor" };
+	}
+	if (!provider?.ok) {
+		return { eligible: false, reason: "provider_unavailable" };
+	}
+	const windows = (provider.windows ?? []).filter(
+		(window) =>
+			typeof window?.percent_left === "number" &&
+			Number.isFinite(window.percent_left),
+	);
+	if (windows.length === 0 || !hasQuotaHeadroom(name, windows, floor)) {
+		return { eligible: false, reason: "no_quota_headroom" };
+	}
+	if (
+		!tarProviders.some((registered) => tarProviderMatches(registered, name))
+	) {
+		return { eligible: false, reason: "not_tar_provisionable" };
+	}
+	return { eligible: true, reason: "eligible" };
+}
+
+/**
+ * Preflight a macOS queue before a VM or workspace is created.
+ *
+ * The snapshot is read exactly once and then shared across every distinct
+ * non-terminal task capability tier. The tar registry must be an explicitly
+ * verified manifest; quota or adapter evidence alone cannot make a provider
+ * eligible for the VM lane. `platform: "docker"` is an explicit no-op so
+ * existing Docker launches retain their behavior.
+ *
+ * @param {object} options
+ * @param {string} [options.platform="macos"]
+ * @param {Array<object>} [options.tasks]
+ * @param {string[]} [options.only]
+ * @param {string[]} [options.exclude]
+ * @param {string[]} [options.availableProviders]
+ * @param {number} [options.floor]
+ * @param {object} [options.tarProvisionRegistry]
+ * @param {object} [options.tarProvisionManifest]
+ * @param {number} [options.nowMs]
+ * @param {Function} [options.readSnapshot] Test-only snapshot-reader seam.
+ * @returns {object} Structured preflight result with capability rejections.
+ */
+export function preflightMacosQueue(options = {}) {
+	const {
+		platform = "macos",
+		tasks = [],
+		only = [],
+		exclude = [],
+		availableProviders,
+		floor = DEFAULT_FLOOR,
+		nowMs = Date.now(),
+		readSnapshot = readSnapshotAtRoute,
+	} = options;
+
+	if (platform === "docker") {
+		return {
+			platform,
+			eligible: true,
+			ok: true,
+			reason: "docker_unchanged",
+			checkedCapabilities: [],
+			capabilityResults: [],
+			rejections: [],
+		};
+	}
+
+	if (platform !== "macos") {
+		const rejection = {
+			capability: null,
+			excludedProviders: [],
+			reason: "invalid_platform",
+		};
+		return {
+			platform,
+			eligible: false,
+			ok: false,
+			reason: rejection.reason,
+			checkedCapabilities: [],
+			capabilityResults: [],
+			rejections: [rejection],
+			rejection,
+		};
+	}
+
+	const taskTiers = [];
+	for (const task of Array.isArray(tasks) ? tasks : []) {
+		const executor = String(task?.executor ?? "switchyard")
+			.trim()
+			.toLowerCase();
+		if (executor !== "switchyard") continue;
+		const status = String(task?.status ?? "")
+			.trim()
+			.toLowerCase();
+		if (TERMINAL_PREFLIGHT_STATUSES.has(status)) continue;
+		const capability = task?.requiredCapability ?? CAPABILITY_CLASS.standard;
+		if (!taskTiers.includes(capability)) taskTiers.push(capability);
+	}
+	if (taskTiers.length === 0) {
+		return {
+			platform,
+			eligible: true,
+			ok: true,
+			reason: "no_non_terminal_tasks",
+			checkedCapabilities: [],
+			capabilityResults: [],
+			rejections: [],
+			rejection: null,
+			snapshotStatus: "not_checked",
+			snapshotMtime: null,
+			snapshotAgeMsAtRoute: null,
+		};
+	}
+
+	// This is the only snapshot read in the helper. Do not replace this with
+	// route() calls per tier: route() intentionally reads its own live snapshot.
+	const snapshotRead = readSnapshot(
+		Number.isFinite(nowMs) ? nowMs : Date.now(),
+	);
+	const snapshot = snapshotRead?.snapshot;
+
+	const rejectionFor = (capability, reason, excludedProviders = []) => ({
+		capability,
+		excludedProviders: [...new Set(excludedProviders)],
+		reason,
+	});
+	const baseResult = {
+		platform,
+		snapshotStatus: snapshotRead?.snapshotStatus ?? "malformed",
+		snapshotMtime: snapshotRead?.snapshotMtime ?? null,
+		snapshotAgeMsAtRoute: snapshotRead?.snapshotAgeMsAtRoute ?? null,
+		checkedCapabilities: [...taskTiers],
+	};
+
+	if (!snapshot || snapshotRead?.snapshotStatus === "malformed") {
+		const rejections = taskTiers.map((capability) =>
+			rejectionFor(capability, "routing_snapshot_unavailable"),
+		);
+		return {
+			...baseResult,
+			eligible: rejections.length === 0,
+			ok: rejections.length === 0,
+			reason:
+				rejections.length === 0
+					? "no_non_terminal_tasks"
+					: "provider_eligibility_preflight_failed",
+			capabilityResults: [],
+			rejections,
+			rejection: rejections[0] ?? null,
+		};
+	}
+
+	const registry = normalizeTarProvisionRegistry(
+		options.tarProvisionRegistry ??
+			options.tarProvisionManifest ??
+			options.registry ??
+			options.manifest,
+	);
+	if (!registry.verified) {
+		const rejections = taskTiers.map((capability) =>
+			rejectionFor(capability, "tar_provisionability_unverified", [
+				...indexProviders(snapshot).keys(),
+			]),
+		);
+		return {
+			...baseResult,
+			eligible: false,
+			ok: false,
+			reason: "provider_eligibility_preflight_failed",
+			capabilityResults: taskTiers.map((capability) => ({
+				capability,
+				eligible: false,
+				providers: [],
+				excludedProviders: [...indexProviders(snapshot).keys()],
+				reason: "tar_provisionability_unverified",
+			})),
+			rejections,
+			rejection: rejections[0],
+		};
+	}
+	const normalizedFloor = Number.isFinite(floor) ? floor : DEFAULT_FLOOR;
+	const isAvailable = (name) => {
+		if (!availableProviders) return true;
+		const requestedIdentity = resolveTargetIdentity(name);
+		const requestedHarness = requestedIdentity.targetId
+			? requestedIdentity.harnessKey
+			: normalizeProviderName(name);
+		return availableProviders.some((provider) => {
+			const providerIdentity = resolveTargetIdentity(provider);
+			const availableHarness = providerIdentity.targetId
+				? providerIdentity.harnessKey
+				: normalizeProviderName(provider);
+			return availableHarness === requestedHarness;
+		});
+	};
+	const providers = indexProviders(snapshot);
+	const capabilityResults = [];
+	const rejections = [];
+
+	for (const capability of taskTiers) {
+		if (!Object.hasOwn(CAPABILITY_CLASS, capability)) {
+			const rejection = rejectionFor(capability, "invalid_capability", [
+				...providers.keys(),
+			]);
+			capabilityResults.push({
+				capability,
+				eligible: false,
+				providers: [],
+				excludedProviders: rejection.excludedProviders,
+				reason: rejection.reason,
+			});
+			rejections.push(rejection);
+			continue;
+		}
+
+		const excludedProviders = [];
+		const excludedReasons = {};
+		const eligibleProviders = [];
+		for (const [name, provider] of providers) {
+			const classification = classifyPreflightProvider(
+				name,
+				provider,
+				capability,
+				{
+					exclude,
+					only,
+					availableProviders,
+					floor: normalizedFloor,
+					isAvailable,
+					tarProviders: registry.providers,
+				},
+			);
+			if (classification.eligible) {
+				eligibleProviders.push(name);
+			} else {
+				excludedProviders.push(name);
+				excludedReasons[name] = classification.reason;
+			}
+		}
+
+		const result = {
+			capability,
+			eligible: eligibleProviders.length > 0,
+			providers: eligibleProviders,
+			excludedProviders,
+			excludedReasons,
+			reason:
+				eligibleProviders.length > 0
+					? "eligible"
+					: registry.verified
+						? "no_tar_provisionable_provider_with_quota_headroom"
+						: "tar_provisionability_unverified",
+		};
+		capabilityResults.push(result);
+		if (!result.eligible) {
+			rejections.push(
+				rejectionFor(capability, result.reason, result.excludedProviders),
+			);
+		}
+	}
+
+	return {
+		...baseResult,
+		eligible: rejections.length === 0,
+		ok: rejections.length === 0,
+		reason:
+			rejections.length === 0
+				? "provider_eligibility_preflight_passed"
+				: "provider_eligibility_preflight_failed",
+		capabilityResults,
+		rejections,
+		rejection: rejections[0] ?? null,
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Routing with spread selection (INV-4)
 

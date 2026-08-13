@@ -453,7 +453,7 @@ index 0000000..abcdef1
 		// Regression: integrationGate reported {success: true} whenever
 		// `git apply` exited 0, even when the diff netted to zero real
 		// content change — a production incident. The new no-op check
-		// compares pre- and post-apply git status scoped to touched paths
+		// compares pre- and post-apply fingerprints scoped to touched paths
 		// only, so unrelated dirty state in other files is ignored.
 		commitFile(projectPath, "target.txt", "a\nb\nc\n");
 		commitFile(projectPath, "other.txt", "original\n");
@@ -484,6 +484,34 @@ index 0000000..abcdef1
 		const emptyResult = integrationGate("", projectPath);
 		strictEqual(emptyResult.success, false);
 		ok(emptyResult.message.toLowerCase().includes("empty"));
+	});
+
+	it("accepts a real change to a touched file that was already dirty", () => {
+		commitFile(
+			projectPath,
+			"target.txt",
+			"line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n",
+		);
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(
+				join(dir, "target.txt"),
+				"line 1\nchanged by diff\nline 3\nline 4\nline 5\nline 6\nline 7\n",
+				"utf8",
+			);
+		});
+		execSync("git checkout -- target.txt", { cwd: projectPath, stdio: "pipe" });
+		writeFileSync(
+			join(projectPath, "target.txt"),
+			"line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nlocal dirty line\n",
+			"utf8",
+		);
+
+		const result = integrationGate(diff, projectPath);
+		strictEqual(result.success, true, result.message);
+		strictEqual(
+			readFileSync(join(projectPath, "target.txt"), "utf8"),
+			"line 1\nchanged by diff\nline 3\nline 4\nline 5\nline 6\nline 7\nlocal dirty line\n",
+		);
 	});
 
 	it("applies an identical diff twice: the second call is a success no-op with alreadyApplied", () => {

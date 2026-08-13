@@ -9,8 +9,10 @@ import {
 } from "./orphan-kill.mjs";
 import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
+	captureProviderDiff,
 	captureProviderDiffAsync,
 	executeProviderInvocation,
+	getWorkspaceExecution,
 } from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
@@ -23,6 +25,7 @@ const MIN_CREDENTIAL_BYTES = 16;
 
 function hasNonTrivialCredential(containerName) {
 	try {
+		// D-10: authentication probes remain on the standing Docker credential vault.
 		execFileSync(
 			"docker",
 			[
@@ -42,6 +45,7 @@ function hasNonTrivialCredential(containerName) {
 
 export function isCopilotAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 	try {
+		// D-10: authentication probes remain on the standing Docker credential vault.
 		execFileSync("docker", ["exec", containerName, COPILOT_CMD, "--version"], {
 			encoding: "utf8",
 			stdio: "pipe",
@@ -71,11 +75,12 @@ export function execute(prompt, workingContainerName, options = {}) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	const args = [
-		"exec",
-		"-w",
-		"/project",
+	const { command, args: workspaceArgs } = getWorkspaceExecution(
 		workingContainerName,
+		options,
+	);
+	const args = [
+		...workspaceArgs,
 		COPILOT_CMD,
 		"-p",
 		guardedPrompt,
@@ -92,7 +97,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 	}
 
 	try {
-		const result = execFileSync("docker", args, {
+		const result = execFileSync(command, args, {
 			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
@@ -144,11 +149,12 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const args = [
-			"exec",
-			"-w",
-			"/project",
+		const { command, args: workspaceArgs } = getWorkspaceExecution(
 			workingContainerName,
+			options,
+		);
+		const args = [
+			...workspaceArgs,
 			COPILOT_CMD,
 			"-p",
 			guardedPrompt,
@@ -159,7 +165,7 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			validateModelArg(model, "model");
 			args.push("--model", model);
 		}
-		return await executeProviderInvocation("docker", args, {
+		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "copilot",
 			timeoutMs,
@@ -172,36 +178,8 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 	}
 }
 
-export function captureDiff(workingContainerName) {
-	try {
-		validateIdentifier(workingContainerName, "workingContainerName");
-	} catch {
-		return null;
-	}
-	try {
-		execFileSync(
-			"docker",
-			["exec", "-w", "/project", workingContainerName, "git", "add", "-A"],
-			{ stdio: "pipe" },
-		);
-		const diff = execFileSync(
-			"docker",
-			[
-				"exec",
-				"-w",
-				"/project",
-				workingContainerName,
-				"git",
-				"diff",
-				"--cached",
-				"HEAD",
-			],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
-		return /\S/u.test(diff) ? diff : null;
-	} catch {
-		return null;
-	}
+export function captureDiff(workingContainerName, options = {}) {
+	return captureProviderDiff(workingContainerName, options);
 }
 
 export function captureDiffAsync(workingContainerName, options = {}) {

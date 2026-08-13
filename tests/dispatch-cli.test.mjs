@@ -69,6 +69,7 @@ import {
 	USAGE_RUN,
 	USAGE_STATUS,
 } from "../src/switchyard/dispatch/index.mjs";
+import { runQueue } from "../src/switchyard/runner/index.mjs";
 
 const HAS_DOCKER = isContainerRuntimeAvailable();
 
@@ -137,6 +138,40 @@ describe("parseDispatchArgs (backwards compat)", () => {
 		strictEqual(opts.maxTasks, Number.POSITIVE_INFINITY);
 		strictEqual(opts.stopOnFailure, true);
 		strictEqual(opts.checkpointPath, undefined);
+		strictEqual(opts.platform, "docker");
+	});
+
+	it("parses the queue-level macOS platform", () => {
+		strictEqual(
+			parseDispatchArgs([
+				tasksFile,
+				"--project",
+				projectDir,
+				"--platform",
+				"macos",
+			]).platform,
+			"macos",
+		);
+	});
+
+	it("rejects an unsupported platform before dispatch", () => {
+		strictEqual(
+			(() => {
+				try {
+					parseDispatchArgs([
+						tasksFile,
+						"--project",
+						projectDir,
+						"--platform",
+						"windows",
+					]);
+					return null;
+				} catch (error) {
+					return error.message;
+				}
+			})(),
+			'--platform must be one of docker, macos, got "windows"',
+		);
 	});
 
 	it("returns help:true for --help without requiring other args", () => {
@@ -303,6 +338,53 @@ describe("parseDispatchArgs (backwards compat)", () => {
 			})().includes("not a git repository"),
 			true,
 		);
+	});
+});
+
+describe("CLI queue-level platform selection", () => {
+	it("runs the macOS queue path through a VM helper without Docker workspace calls", async () => {
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
+			"utf8",
+		);
+		const calls = [];
+		const opts = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--platform",
+			"macos",
+		]);
+		await dispatchRun(opts, {
+			runQueue: (queueOptions) =>
+				runQueue({
+					...queueOptions,
+					dependencies: {
+						...queueOptions.dependencies,
+						backendFactory: ({ platform }) => {
+							strictEqual(platform, "macos");
+							return {
+								create: () => {
+									calls.push("create-vm");
+									return "vm-handle";
+								},
+								seed: () => calls.push("seed-vm"),
+								commit: () => calls.push("commit-vm"),
+								reset: () => calls.push("reset-vm"),
+								destroy: () => calls.push("destroy-vm"),
+							};
+						},
+					},
+				}),
+		});
+		strictEqual(calls.includes("create-vm"), true);
+		strictEqual(calls.includes("destroy-vm"), true);
+		strictEqual(
+			calls.some((call) => call.includes("docker")),
+			false,
+		);
+		process.exitCode = 0;
 	});
 });
 

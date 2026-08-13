@@ -1,10 +1,18 @@
-import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	rejects,
+	strictEqual,
+} from "node:assert";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -12,16 +20,19 @@ import { readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import {
 	acquireLaunchLock,
 	acquireProjectLock,
 	acquireRunLock,
+	acquireVmSlot,
 	advanceState,
 	applyRetention,
 	createEvent,
 	getRunRoot,
 	getStateRoot,
+	getVmAdmissionRoot,
 	initializeRun,
 	isProjectLockHeld,
 	isRunLockExpired,
@@ -32,6 +43,7 @@ import {
 	releaseOrphanedProjectLocks,
 	releaseProjectLock,
 	releaseRunLock,
+	releaseVmSlot,
 	renewRunLock,
 	SchemaError,
 	updateRun,
@@ -41,6 +53,8 @@ import {
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-run-store-"));
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
+const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
+process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
 
 after(() => {
 	try {
@@ -53,6 +67,7 @@ after(() => {
 afterEach(() => {
 	try {
 		rmSync(join(TEST_ROOT, "store"), { recursive: true, force: true });
+		rmSync(VM_ADMISSION_ROOT, { recursive: true, force: true });
 	} catch {
 		// no-op
 	}
@@ -60,6 +75,48 @@ afterEach(() => {
 
 function uniqueRunId() {
 	return randomUUID();
+}
+
+const RUN_STORE_MODULE_URL = pathToFileURL(
+	resolve("src/switchyard/run-store/index.mjs"),
+).href;
+
+function spawnSlotChild(source) {
+	return spawn(process.execPath, ["--input-type=module", "-e", source], {
+		env: { ...process.env, SWITCHYARD_VM_ADMISSION_ROOT: VM_ADMISSION_ROOT },
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+}
+
+function readChildLine(child) {
+	return new Promise((resolveLine, reject) => {
+		let output = "";
+		const timeout = setTimeout(() => {
+			child.kill("SIGKILL");
+			reject(new Error(`timed out waiting for child output: ${output}`));
+		}, 5_000);
+		child.stdout.setEncoding("utf8");
+		const onData = (chunk) => {
+			output += chunk;
+			const newline = output.indexOf("\n");
+			if (newline < 0) return;
+			clearTimeout(timeout);
+			child.stdout.off("data", onData);
+			resolveLine(output.slice(0, newline));
+		};
+		child.stdout.on("data", onData);
+		child.once("error", (error) => {
+			clearTimeout(timeout);
+			reject(error);
+		});
+	});
+}
+
+function waitForChild(child) {
+	return new Promise((resolveExit, reject) => {
+		child.once("error", reject);
+		child.once("exit", (code, signal) => resolveExit({ code, signal }));
+	});
 }
 
 function uniquePath(label) {
@@ -1020,6 +1077,140 @@ describe("project lock", () => {
 		strictEqual(body.projectPath, path);
 		strictEqual(body.runId, runId);
 		ok(typeof body.createdAt === "string");
+	});
+});
+
+describe("global VM admission slots", () => {
+	it("uses a dedicated override root outside the project run store", () => {
+		strictEqual(getVmAdmissionRoot(), VM_ADMISSION_ROOT);
+		notStrictEqual(getVmAdmissionRoot(), getStateRoot());
+	});
+
+	it("publishes a complete parseable owner and releases by matching token only", () => {
+		const lease = acquireVmSlot({ runId: "token-owner" });
+		const slotPath = join(VM_ADMISSION_ROOT, `vm-slot-${lease.slot}.lock`);
+		const body = JSON.parse(readFileSync(slotPath, "utf8"));
+
+		strictEqual(body.ownerPid, process.pid);
+		strictEqual(body.runId, "token-owner");
+		strictEqual(body.token, lease.token);
+		strictEqual(releaseVmSlot({ ...lease, token: "wrong-token" }), false);
+		ok(existsSync(slotPath));
+		strictEqual(releaseVmSlot(lease), true);
+		strictEqual(releaseVmSlot(lease), false);
+	});
+
+	it("reclaims a slot whose owner PID is provably dead", () => {
+		mkdirSync(VM_ADMISSION_ROOT, { recursive: true });
+		for (const slotIndex of [0, 1]) {
+			writeFileSync(
+				join(VM_ADMISSION_ROOT, `vm-slot-${slotIndex}.lock`),
+				JSON.stringify({
+					ownerPid: 999999999,
+					runId: `dead-owner-${slotIndex}`,
+					token: `dead-token-${slotIndex}`,
+				}),
+			);
+		}
+
+		const lease = acquireVmSlot({ runId: "new-owner-0" });
+		const secondLease = acquireVmSlot({ runId: "new-owner-1" });
+		strictEqual(lease.slot, 0);
+		strictEqual(secondLease.slot, 1);
+		strictEqual(
+			JSON.parse(readFileSync(lease.path, "utf8")).runId,
+			"new-owner-0",
+		);
+		lease.release();
+		secondLease.release();
+	});
+
+	it("ignores interrupted temporary files", () => {
+		mkdirSync(VM_ADMISSION_ROOT, { recursive: true });
+		const tmpPath = join(
+			VM_ADMISSION_ROOT,
+			`vm-slot-0.lock.${process.pid}.interrupted.tmp`,
+		);
+		writeFileSync(tmpPath, "complete but unpublished");
+
+		const lease = acquireVmSlot({ runId: "after-interruption" });
+		strictEqual(lease.slot, 0);
+		lease.release();
+		ok(
+			existsSync(tmpPath),
+			"the primitive need not guess which temp files are safe to remove",
+		);
+	});
+
+	it("does not invoke project-lock orphan reclamation", async () => {
+		const source = await readFile(
+			new URL("../src/switchyard/run-store/index.mjs", import.meta.url),
+			"utf8",
+		);
+		const primitive = source.slice(
+			source.indexOf("export function acquireVmSlot"),
+			source.indexOf("export const acquireMacosVmSlot"),
+		);
+		ok(primitive.includes("linkSync"));
+		ok(!primitive.includes("releaseOrphanedProjectLocks"));
+		ok(!primitive.includes('flag: "wx"'));
+	});
+
+	it("contends across processes and reports the holding runs safely", async () => {
+		const holderSource = `
+			import * as store from ${JSON.stringify(RUN_STORE_MODULE_URL)};
+			const lease = store.acquireVmSlot({ runId: "child-holder" });
+			console.log(JSON.stringify({ slot: lease.slot }));
+			process.stdin.once("data", () => { lease.release(); process.exit(0); });
+		`;
+		const holder = spawnSlotChild(holderSource);
+		let parentLease;
+		try {
+			deepStrictEqual(JSON.parse(await readChildLine(holder)), { slot: 0 });
+			parentLease = acquireVmSlot({ runId: "parent-holder" });
+			strictEqual(parentLease.slot, 1);
+
+			const challengerSource = `
+				import * as store from ${JSON.stringify(RUN_STORE_MODULE_URL)};
+			try {
+					store.acquireVmSlot({ runId: "challenger" });
+				} catch (error) {
+					console.log(JSON.stringify({ code: error.code, message: error.message }));
+					process.exit(0);
+				}
+				process.exit(1);
+			`;
+			const challenger = spawnSlotChild(challengerSource);
+			const result = JSON.parse(await readChildLine(challenger));
+			await waitForChild(challenger);
+			strictEqual(result.code, "VM_SLOT_UNAVAILABLE");
+			ok(result.message.includes("child-holder"));
+			ok(result.message.includes("parent-holder"));
+		} finally {
+			if (parentLease) parentLease.release();
+			holder.stdin.write("release\n");
+			await waitForChild(holder);
+		}
+	});
+
+	it("allows a later process to acquire after an unreleased owner is killed", async () => {
+		const holderSource = `
+			import * as store from ${JSON.stringify(RUN_STORE_MODULE_URL)};
+			store.acquireVmSlot({ runId: "killed-holder" });
+			console.log("ready");
+			setInterval(() => {}, 1000);
+		`;
+		const holder = spawnSlotChild(holderSource);
+		try {
+			strictEqual((await readChildLine(holder)).trim(), "ready");
+			holder.kill("SIGKILL");
+			await waitForChild(holder);
+			const lease = acquireVmSlot({ runId: "reclaimed-after-kill" });
+			strictEqual(lease.slot, 0);
+			lease.release();
+		} finally {
+			if (!holder.killed) holder.kill("SIGKILL");
+		}
 	});
 });
 

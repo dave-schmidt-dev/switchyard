@@ -1,4 +1,4 @@
-// Best-effort in-container process cleanup after a host-side execFileSync
+// D-9: best-effort in-container process cleanup after a host-side execFileSync
 // timeout. `docker exec` does not forward host signals into the container's
 // PID namespace — killing the host-side exec client (SIGTERM on ETIMEDOUT)
 // leaves whatever it spawned inside the container running unsupervised.

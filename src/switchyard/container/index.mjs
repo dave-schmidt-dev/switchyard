@@ -50,11 +50,14 @@ export function checkContainerRuntime(options = {}) {
 						err.message.toLowerCase().includes("not found"))),
 		);
 
+	// D-10: deliberate Docker-specific probe: this is the Docker backend's daemon
+	// preflight, not a workspace-execution command that can move to a VM.
 	// Primary probe: `docker info` with explicit 5000ms timeout
 	try {
 		execFn("docker", ["info"], { timeout: 5000, stdio: "pipe" });
 		return { available: true, classification: null, error: null };
 	} catch (dockerInfoError) {
+		// D-10: deliberate Docker-specific binary check paired with the daemon probe.
 		// Probe whether docker CLI binary exists
 		let dockerBinaryExists = false;
 		let dockerVersionError = null;
@@ -74,6 +77,8 @@ export function checkContainerRuntime(options = {}) {
 			};
 		}
 
+		// D-10: deliberate Docker/OrbStack-specific fallback for the existing container
+		// runtime contract; it is not a workspace backend transport.
 		// Fallback probe for OrbStack runtime
 		try {
 			execFn("orb", ["info"], { timeout: 5000, stdio: "pipe" });
@@ -149,6 +154,7 @@ export function isContainerRuntimeAvailable(options = {}) {
  */
 export function imageExists(image) {
 	try {
+		// Deliberate Docker-only standing-agent lifecycle check.
 		const output = execSync(`docker images -q ${image}`, {
 			stdio: "pipe",
 		})
@@ -167,6 +173,8 @@ export function imageExists(image) {
  */
 export function buildAgentImage() {
 	try {
+		// Deliberate Docker-only standing-agent image build; VM images use a
+		// separate lifecycle and are not interchangeable with this image.
 		execSync(`docker build -t ${AGENT_IMAGE} -f docker/Dockerfile docker`, {
 			stdio: "inherit",
 			cwd: process.cwd(),
@@ -185,6 +193,7 @@ export function buildAgentImage() {
  */
 export function startAgentContainer() {
 	try {
+		// Deliberate Docker-only standing-agent lifecycle operation.
 		// `--filter name=X` is a SUBSTRING match in Docker, not exact — an
 		// unanchored filter would false-positive against any other container
 		// whose name happens to contain AGENT_CONTAINER_NAME (e.g. a working
@@ -275,6 +284,9 @@ export function getPlatformInfo(
 
 	let imageArch;
 	try {
+		// D-10: deliberate Docker-specific image diagnostic. The ExecutionBackend
+		// contract has no image-architecture inspection primitive, and changing
+		// this probe would alter the existing status/result behavior.
 		// Explicit timeout (matches probeProviderProcess's precedent in
 		// dispatch/index.mjs): this is now called unconditionally on every
 		// `switchyard status`/`switchyard result` read (dispatch/index.mjs's

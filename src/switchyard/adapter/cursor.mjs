@@ -22,8 +22,10 @@ import {
 } from "./orphan-kill.mjs";
 import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
+	captureProviderDiff,
 	captureProviderDiffAsync,
 	executeProviderInvocation,
+	getWorkspaceExecution,
 } from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
@@ -46,6 +48,7 @@ const CURSOR_CMD = "cursor-agent";
  */
 export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 	try {
+		// D-10: authentication probes remain on the standing Docker credential vault.
 		const versionResult = execFileSync(
 			"docker",
 			["exec", containerName, CURSOR_CMD, "--version"],
@@ -61,6 +64,7 @@ export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 	}
 
 	try {
+		// D-10: authentication probes remain on the standing Docker credential vault.
 		const statusResult = execFileSync(
 			"docker",
 			["exec", containerName, CURSOR_CMD, "status", "--format", "json"],
@@ -105,11 +109,12 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	const args = [
-		"exec",
-		"-w",
-		"/project",
+	const { command, args: workspaceArgs } = getWorkspaceExecution(
 		workingContainerName,
+		options,
+	);
+	const args = [
+		...workspaceArgs,
 		CURSOR_CMD,
 		"--print",
 		"--force",
@@ -128,7 +133,7 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 	args.push(guardedPrompt);
 
 	try {
-		const result = execFileSync("docker", args, {
+		const result = execFileSync(command, args, {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
 			timeout: timeoutMs,
@@ -183,11 +188,12 @@ export async function executeCursorAsync(
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const args = [
-			"exec",
-			"-w",
-			"/project",
+		const { command, args: workspaceArgs } = getWorkspaceExecution(
 			workingContainerName,
+			options,
+		);
+		const args = [
+			...workspaceArgs,
 			CURSOR_CMD,
 			"--print",
 			"--force",
@@ -200,7 +206,7 @@ export async function executeCursorAsync(
 			args.push("--model", model);
 		}
 		args.push(guardedPrompt);
-		return await executeProviderInvocation("docker", args, {
+		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "cursor",
 			timeoutMs,
@@ -218,44 +224,8 @@ export async function executeCursorAsync(
  * @param {string} workingContainerName Working container name
  * @returns {string|null} Git diff or null
  */
-export function captureDiff(workingContainerName) {
-	try {
-		validateIdentifier(workingContainerName, "workingContainerName");
-	} catch {
-		return null;
-	}
-	try {
-		// Stage first so NEWLY CREATED files are captured too — plain `git diff`
-		// reports only unstaged edits to already-tracked files, so a "write a new
-		// module/test" task (the most common agent output) would otherwise diff
-		// empty, be recorded success_no_diff, and silently lose the work before
-		// the integration gate (INV-2) ever ran. `git add -A` honors the seeded
-		// .gitignore, so agent-created build artifacts / stray .env files are
-		// deliberately left unshipped. `git diff --cached HEAD` then shows the
-		// full change set (new files included) against the seeded baseline.
-		execFileSync(
-			"docker",
-			["exec", "-w", "/project", workingContainerName, "git", "add", "-A"],
-			{ stdio: "pipe" },
-		);
-		const diff = execFileSync(
-			"docker",
-			[
-				"exec",
-				"-w",
-				"/project",
-				workingContainerName,
-				"git",
-				"diff",
-				"--cached",
-				"HEAD",
-			],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
-		return /\S/u.test(diff) ? diff : null;
-	} catch {
-		return null;
-	}
+export function captureDiff(workingContainerName, options = {}) {
+	return captureProviderDiff(workingContainerName, options);
 }
 
 export function captureDiffAsync(workingContainerName, options = {}) {

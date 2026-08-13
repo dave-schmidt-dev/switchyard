@@ -1186,9 +1186,13 @@ function resolveCurrentDispatchDescriptor(
  * any qualification evidence. The gate is deliberately stricter than the
  * legacy compatibility projection: every counted slot must have a current,
  * exact `dispatch_qualified` receipt for its descriptor and a provider-local
- * argv mapping. Disabled targets (including Gemini) are reported as
- * exclusions, not as missing capacity classes; an enabled Vibe target is
- * evaluated through its OpenCode-backed descriptor like any other implementer.
+ * argv mapping. Disabled targets are reported as exclusions, not as missing
+ * capacity classes. Enablement and eligibility are separate gates: as of
+ * 2026-08-13 the Gemini Antigravity, Cursor, and Vibe targets are all enabled
+ * — so none of them appear in `excludedTargets` — yet none appear in
+ * `eligibleByClass` either, because none holds a current exact receipt for its
+ * descriptor. An enabled target without promoted evidence is invisible to
+ * automatic routing without being excluded.
  *
  * @param {object} [rosterData] Optional synthetic roster for tests.
  * @param {{nowIso?: string, maxAgeSeconds?: number}} [options]

@@ -7,6 +7,7 @@ import { after, before, describe, it } from "node:test";
 import {
 	captureDiff,
 	execute as executeOpencode,
+	OPENCODE_SUPERVISOR,
 } from "../src/switchyard/adapter/opencode.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
@@ -54,6 +55,13 @@ echo opencode
 `;
 
 describe("opencode adapter container execution", () => {
+	it("uses portable supervisor process probes", () => {
+		ok(!OPENCODE_SUPERVISOR.includes("/proc"));
+		ok(OPENCODE_SUPERVISOR.includes("ps -o state= -p"));
+		ok(OPENCODE_SUPERVISOR.includes("Z*)"));
+		ok(OPENCODE_SUPERVISOR.includes("pgrep -x"));
+	});
+
 	before(() => {
 		if (!dockerAvailable) return;
 

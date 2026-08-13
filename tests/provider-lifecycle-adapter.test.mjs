@@ -1,10 +1,11 @@
-import { deepStrictEqual, strictEqual } from "node:assert";
+import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 import {
 	captureProviderDiffAsync,
 	runProviderProcess,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
+import { validateIdentifier } from "../src/switchyard/adapter/shell-safety.mjs";
 
 function fakeChild() {
 	const child = new EventEmitter();
@@ -22,6 +23,14 @@ function fakeChild() {
 }
 
 describe("provider process lifecycle", () => {
+	it("accepts exact Parallels UUID workspace handles but rejects malformed braces", () => {
+		validateIdentifier("{11111111-1111-4111-8111-111111111111}", "workspaceId");
+		throws(
+			() => validateIdentifier("{not-a-vm}", "workspaceId"),
+			/unsafe characters/,
+		);
+	});
+
 	it("captures successful output and emits no terminal duplicate", async () => {
 		const child = fakeChild();
 		let terminalEvents = 0;

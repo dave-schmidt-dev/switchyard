@@ -1,5 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import {
+	existsSync,
+	linkSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import {
 	appendFile,
 	mkdir,
@@ -11,6 +19,7 @@ import {
 	unlink,
 	writeFile,
 } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -38,6 +47,7 @@ const defaultStateRoot = resolve(
 	".logs",
 	"switchyard",
 );
+const defaultVmAdmissionRoot = resolve(homedir(), ".switchyard", "admission");
 
 function resolveStateRoot() {
 	const envOverride = process.env.SWITCHYARD_RUN_STORE_ROOT;
@@ -55,6 +65,16 @@ function locksRoot() {
 }
 function quarantineRoot() {
 	return resolve(resolveStateRoot(), ".quarantine");
+}
+
+function resolveVmAdmissionRoot() {
+	const envOverride = process.env.SWITCHYARD_VM_ADMISSION_ROOT;
+	if (envOverride) return resolve(envOverride);
+	return defaultVmAdmissionRoot;
+}
+
+function vmSlotPath(slotIndex) {
+	return resolve(resolveVmAdmissionRoot(), `vm-slot-${slotIndex}.lock`);
 }
 
 const VALID_STATES = new Set([
@@ -253,6 +273,17 @@ class LockError extends Error {
 	}
 }
 
+class VmSlotUnavailableError extends LockError {
+	constructor(holderRuns) {
+		const holders = holderRuns.length > 0 ? holderRuns.join(", ") : "unknown";
+		super(
+			`VM_SLOT_UNAVAILABLE: VM admission capacity is unavailable (held by run ${holders})`,
+		);
+		this.name = "VmSlotUnavailableError";
+		this.code = "VM_SLOT_UNAVAILABLE";
+	}
+}
+
 class SchemaError extends Error {
 	constructor(message) {
 		super(message);
@@ -267,6 +298,15 @@ class SchemaError extends Error {
  */
 export function getStateRoot() {
 	return resolveStateRoot();
+}
+
+/**
+ * Resolve the global root containing the two VM admission slot files.
+ * Honors SWITCHYARD_VM_ADMISSION_ROOT for hermetic tests and operators.
+ * @returns {string}
+ */
+export function getVmAdmissionRoot() {
+	return resolveVmAdmissionRoot();
 }
 
 /**
@@ -680,7 +720,9 @@ function validateRun(data) {
 				(!Number.isInteger(options.maxTasks) || options.maxTasks < 1)) ||
 			typeof options.stopOnFailure !== "boolean" ||
 			(options.checkpointPath !== null &&
-				typeof options.checkpointPath !== "string")
+				typeof options.checkpointPath !== "string") ||
+			(options.platform !== undefined &&
+				!["docker", "macos"].includes(options.platform))
 		) {
 			throw new SchemaError("runOptions contains invalid scalar fields");
 		}
@@ -1396,6 +1438,197 @@ export function isProjectLockHeld(canonicalProjectPath) {
 	return existsSync(lockPath);
 }
 
+const VM_SLOT_COUNT = 2;
+
+function safeVmRunId(value) {
+	if (typeof value !== "string" || value.length === 0) return "unknown";
+	const safe = sanitizeForDisplay(value).slice(0, 128);
+	return safe || "unknown";
+}
+
+function vmSlotBody(raw) {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+		return null;
+	}
+	const ownerPid = raw.ownerPid ?? raw.pid;
+	if (
+		!Number.isInteger(ownerPid) ||
+		ownerPid <= 0 ||
+		typeof raw.runId !== "string" ||
+		raw.runId.length === 0 ||
+		typeof raw.token !== "string" ||
+		raw.token.length === 0
+	) {
+		return null;
+	}
+	return { ownerPid, runId: raw.runId, token: raw.token };
+}
+
+function readVmSlotBody(slotPath) {
+	try {
+		return vmSlotBody(JSON.parse(readFileSync(slotPath, "utf8")));
+	} catch {
+		return null;
+	}
+}
+
+function removeVmTempFile(tmpPath) {
+	try {
+		unlinkSync(tmpPath);
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+	}
+}
+
+function vmOwnerIsLive(ownerPid) {
+	try {
+		process.kill(ownerPid, 0);
+		return true;
+	} catch (error) {
+		// Only ESRCH proves that the owner is gone. EPERM, EINVAL, and all
+		// other probe failures are conservatively treated as live/unknown.
+		return error.code !== "ESRCH";
+	}
+}
+
+function publishVmSlot(slotPath, body) {
+	const tmpPath = `${slotPath}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(tmpPath, JSON.stringify(body), { mode: 0o600 });
+	try {
+		linkSync(tmpPath, slotPath);
+		return true;
+	} catch (error) {
+		if (error.code === "EEXIST") return false;
+		throw error;
+	} finally {
+		removeVmTempFile(tmpPath);
+	}
+}
+
+function vmSlotIndex(value) {
+	if (Number.isInteger(value) && value >= 0 && value < VM_SLOT_COUNT) {
+		return value;
+	}
+	if (typeof value !== "string") return null;
+	for (let index = 0; index < VM_SLOT_COUNT; index += 1) {
+		if (value === vmSlotPath(index)) return index;
+	}
+	return null;
+}
+
+/**
+ * Acquire one of the two global VM admission slots synchronously.
+ *
+ * A complete unique temporary file is hard-linked into the fixed slot path;
+ * the hard link is the cross-process exclusion operation. Dead owners are
+ * reclaimed by atomically renaming the stale slot away before retrying.
+ *
+ * @param {object} [options]
+ * @param {string} [options.runId] identifying the queue holding the slot
+ * @returns {{slot: number, slotIndex: number, path: string, ownerPid: number, runId: string, token: string, release: () => boolean}}
+ */
+export function acquireVmSlot(options = {}) {
+	const normalized = typeof options === "string" ? { runId: options } : options;
+	const runId =
+		typeof normalized?.runId === "string" && normalized.runId.length > 0
+			? normalized.runId
+			: `pid-${process.pid}-${randomUUID()}`;
+	const token =
+		typeof normalized?.token === "string" && normalized.token.length > 0
+			? normalized.token
+			: randomUUID();
+	const body = {
+		ownerPid: process.pid,
+		pid: process.pid,
+		runId,
+		token,
+		createdAt: new Date().toISOString(),
+	};
+
+	mkdirSync(resolveVmAdmissionRoot(), { recursive: true, mode: 0o700 });
+	const holders = [];
+
+	for (let slotIndex = 0; slotIndex < VM_SLOT_COUNT; slotIndex += 1) {
+		const slotPath = vmSlotPath(slotIndex);
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			if (publishVmSlot(slotPath, body)) {
+				const lease = {
+					slot: slotIndex,
+					slotIndex,
+					path: slotPath,
+					ownerPid: process.pid,
+					runId,
+					token,
+				};
+				lease.release = () => releaseVmSlot(lease);
+				return lease;
+			}
+
+			const owner = readVmSlotBody(slotPath);
+			if (owner && !vmOwnerIsLive(owner.ownerPid)) {
+				const reclaimPath = `${slotPath}.${process.pid}.${randomUUID()}.reclaim`;
+				try {
+					renameSync(slotPath, reclaimPath);
+				} catch (error) {
+					if (error.code === "ENOENT") continue;
+					throw error;
+				}
+				try {
+					unlinkSync(reclaimPath);
+				} catch (error) {
+					if (error.code !== "ENOENT") throw error;
+				}
+				continue;
+			}
+
+			holders.push(owner ? safeVmRunId(owner.runId) : "unknown");
+			break;
+		}
+	}
+
+	throw new VmSlotUnavailableError([...new Set(holders)]);
+}
+
+/**
+ * Release a VM slot only when its token (and supplied identity) still match.
+ * Missing or already-released slots are harmless, making this idempotent.
+ *
+ * @param {object|number|string} leaseOrSlot lease returned by acquireVmSlot, or slot index/path
+ * @param {string} [token]
+ * @param {string} [runId]
+ * @returns {boolean} whether this call removed its slot file
+ */
+export function releaseVmSlot(leaseOrSlot, token, runId) {
+	const lease =
+		leaseOrSlot && typeof leaseOrSlot === "object"
+			? leaseOrSlot
+			: { slot: leaseOrSlot, token, runId };
+	const slotIndex = vmSlotIndex(lease.slotIndex ?? lease.slot ?? lease.path);
+	const expectedToken = lease.token ?? token;
+	if (slotIndex === null || typeof expectedToken !== "string") return false;
+
+	const slotPath = vmSlotPath(slotIndex);
+	const owner = readVmSlotBody(slotPath);
+	if (!owner || owner.token !== expectedToken) return false;
+	if (lease.runId !== undefined && owner.runId !== lease.runId) return false;
+	if (lease.ownerPid !== undefined && owner.ownerPid !== lease.ownerPid) {
+		return false;
+	}
+
+	try {
+		unlinkSync(slotPath);
+		return true;
+	} catch (error) {
+		if (error.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+// Existing VM gate callers use this spelling while the runner integration is
+// still being assembled. Keep it as the same synchronous primitive.
+export const acquireMacosVmSlot = acquireVmSlot;
+export const releaseMacosVmSlot = releaseVmSlot;
+
 /**
  * Best-effort liveness probe for a run's worker process.
  *
@@ -1767,4 +2000,4 @@ export async function readEvents(runId) {
 	}
 }
 
-export { LockError, RevisionError, SchemaError };
+export { LockError, RevisionError, SchemaError, VmSlotUnavailableError };

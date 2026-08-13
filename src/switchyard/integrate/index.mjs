@@ -10,6 +10,8 @@
 // word "token" has nothing to do with a credential file).
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 // Bound the captured output of the non-mutating `git apply --check` probes.
@@ -448,38 +450,36 @@ function applyReviewedDiff(diff, projectPath) {
 }
 
 /**
- * Run `git status --porcelain` and return only the lines whose path matches
- * one of the given touched paths. Used for no-op detection: by scoping to
- * only the files the diff claims to touch, pre-existing unrelated dirty
- * state in other files never triggers a false positive.
+ * Fingerprint the current content and file state of each touched path. Used
+ * for no-op detection: pre-existing unrelated dirty state is excluded, while
+ * edits to an already-dirty touched path remain visible.
  * @param {string} projectPath
  * @param {string[]} touchedPaths
  * @returns {string}
  */
-function getScopedStatus(projectPath, touchedPaths) {
-	const result = spawnSync(
-		"git",
-		["status", "--porcelain", "--untracked-files=all"],
-		{
-			cwd: projectPath,
-			encoding: "utf8",
-		},
-	);
-	const lines = (result.stdout || "").split("\n").filter(Boolean);
-	const touchedSet = new Set(touchedPaths);
-	return lines
-		.filter((line) => {
-			const path = line.slice(3).trim();
-			if (touchedSet.has(path)) return true;
-			// Handle rename format: `R  old -> new`
-			const arrow = path.indexOf(" -> ");
-			if (arrow !== -1) {
-				return (
-					touchedSet.has(path.slice(0, arrow)) ||
-					touchedSet.has(path.slice(arrow + 4))
-				);
+function getScopedFingerprint(projectPath, touchedPaths) {
+	return touchedPaths
+		.map((relativePath) => {
+			const fullPath = resolve(projectPath, relativePath);
+			try {
+				const stats = lstatSync(fullPath);
+				const mode = (stats.mode & 0o7777).toString(8);
+				if (stats.isSymbolicLink()) {
+					return `${relativePath}\0symlink:${mode}:${readlinkSync(fullPath)}`;
+				}
+				if (stats.isFile()) {
+					const digest = createHash("sha256")
+						.update(readFileSync(fullPath))
+						.digest("hex");
+					return `${relativePath}\0file:${mode}:${digest}`;
+				}
+				return `${relativePath}\0other:${mode}:${stats.size}`;
+			} catch (error) {
+				if (error?.code === "ENOENT") {
+					return `${relativePath}\0missing`;
+				}
+				return `${relativePath}\0unreadable:${error?.code ?? "unknown"}`;
 			}
-			return false;
 		})
 		.join("\n");
 }
@@ -615,18 +615,21 @@ export function integrationGate(diff, projectPath, options = {}) {
 
 	// No-op detection: only for the common path (requiredPaths === null),
 	// where touchedPaths isn't computed independently elsewhere in this
-	// function. Scoped to touched paths only so pre-existing unrelated
+	// function. Scoped to touched-path content/state so pre-existing unrelated
 	// dirty state in other files never triggers a false no-op report.
-	let preStatus = "";
+	let preFingerprint = "";
 	if (requiredPaths === null) {
-		preStatus = getScopedStatus(projectPath, validation.touchedPaths);
+		preFingerprint = getScopedFingerprint(projectPath, validation.touchedPaths);
 	}
 
 	const applyResult = applyReviewedDiff(patch, projectPath);
 	if (applyResult === true) {
 		if (requiredPaths === null) {
-			const postStatus = getScopedStatus(projectPath, validation.touchedPaths);
-			if (preStatus === postStatus) {
+			const postFingerprint = getScopedFingerprint(
+				projectPath,
+				validation.touchedPaths,
+			);
+			if (preFingerprint === postFingerprint) {
 				return { success: false, message: "no_op_diff" };
 			}
 		}

@@ -5,7 +5,8 @@
 // capture, heartbeat polling, timeout escalation, cancellation, cleanup, and
 // the exactly-once terminal transition.
 
-import { spawn as nodeSpawn } from "node:child_process";
+import { execFileSync, spawn as nodeSpawn } from "node:child_process";
+import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
 import { describeExecError } from "./exec-error.mjs";
 import { validateIdentifier } from "./shell-safety.mjs";
 
@@ -13,6 +14,21 @@ const DEFAULT_MAX_BUFFER = 128 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_DIAGNOSTIC_CHARS = 800;
+const DEFAULT_EXECUTION_BACKEND = new DockerExecutionBackend();
+
+/**
+ * Resolve the transport command and workspace prefix for a provider command.
+ * The backend owns the command and workspace prefix, including any transport
+ * option needed to deliver stdin. Callers never splice Docker- or VM-specific
+ * flags into this prefix.
+ */
+export function getWorkspaceExecution(
+	workspaceId,
+	{ executionBackend = DEFAULT_EXECUTION_BACKEND, cwd = "/project" } = {},
+) {
+	const execution = executionBackend.execArgv(workspaceId, { cwd });
+	return { command: execution.command, args: [...execution.args] };
+}
 
 function appendBounded(current, chunk, maxBuffer) {
 	const text = Buffer.isBuffer(chunk)
@@ -71,6 +87,7 @@ export function runProviderProcess(command, args, options = {}) {
 		let settled = false;
 		let terminationRequested = false;
 		let cleanupPromise = null;
+		let cleanupError = null;
 		let timedOut = false;
 		let cancelled = false;
 		let timeoutTimer = null;
@@ -99,7 +116,8 @@ export function runProviderProcess(command, args, options = {}) {
 			}
 			const elapsedMs = Math.max(0, now() - startedAt);
 			resolve({
-				success: !timedOut && !cancelled && !error && code === 0,
+				success:
+					!timedOut && !cancelled && !error && !cleanupError && code === 0,
 				output: stdout,
 				stderr,
 				code,
@@ -107,7 +125,8 @@ export function runProviderProcess(command, args, options = {}) {
 				timedOut,
 				cancelled,
 				elapsedMs,
-				error,
+				error: cleanupError ?? error,
+				cleanupFailed: Boolean(cleanupError),
 			});
 		};
 
@@ -115,8 +134,8 @@ export function runProviderProcess(command, args, options = {}) {
 			if (cleanupPromise) return cleanupPromise;
 			cleanupPromise = Promise.resolve()
 				.then(() => (typeof cleanup === "function" ? cleanup() : undefined))
-				.catch(() => {
-					// Cleanup is best effort; the provider result remains authoritative.
+				.catch((error) => {
+					cleanupError = error;
 				});
 			return cleanupPromise;
 		};
@@ -232,10 +251,32 @@ function truncateDiagnostic(value, maxChars = DEFAULT_DIAGNOSTIC_CHARS) {
  * this boundary and remain bounded before callers can persist/report them.
  */
 export async function executeProviderInvocation(command, args, options = {}) {
-	const { provider, cleanup, idleExitCode, ...lifecycleOptions } = options;
+	const {
+		provider,
+		cleanup,
+		executionBackend,
+		onStatus,
+		idleExitCode,
+		...lifecycleOptions
+	} = options;
+	const cleanupWithBackend = async () => {
+		let backendError = null;
+		try {
+			if (typeof executionBackend?.cleanupProviderProcess === "function") {
+				await executionBackend.cleanupProviderProcess(command, args, {
+					onStatus,
+				});
+			}
+		} catch (error) {
+			backendError = error;
+		} finally {
+			if (typeof cleanup === "function") await cleanup();
+		}
+		if (backendError) throw backendError;
+	};
 	const result = await runProviderProcess(command, args, {
 		...lifecycleOptions,
-		cleanup,
+		cleanup: cleanupWithBackend,
 	});
 	if (result.success) return { output: result.output, success: true };
 	// A provider whose container-side supervisor reports this reserved exit code
@@ -260,8 +301,13 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		return {
 			output: result.output,
 			success: false,
-			error: "provider execution timed out (ETIMEDOUT)",
+			error: result.cleanupFailed
+				? truncateDiagnostic(
+						result.error?.message ?? "provider cleanup failed after timeout",
+					)
+				: "provider execution timed out (ETIMEDOUT)",
 			timedOut: true,
+			cleanupFailed: result.cleanupFailed,
 		};
 	}
 	if (result.cancelled) {
@@ -310,25 +356,46 @@ export async function captureProviderDiffAsync(
 		spawnFn,
 		timeoutMs,
 	};
+	const { command, args: workspaceArgs } = getWorkspaceExecution(
+		workingContainerName,
+		options,
+	);
 	const add = await runProviderProcess(
-		"docker",
-		["exec", "-w", "/project", workingContainerName, "git", "add", "-A"],
+		command,
+		[...workspaceArgs, "git", "add", "-A"],
 		lifecycle,
 	);
 	if (!add.success) return null;
 	const diff = await runProviderProcess(
-		"docker",
-		[
-			"exec",
-			"-w",
-			"/project",
-			workingContainerName,
-			"git",
-			"diff",
-			"--cached",
-			"HEAD",
-		],
+		command,
+		[...workspaceArgs, "git", "diff", "--cached", "HEAD"],
 		lifecycle,
 	);
 	return diff.success && /\S/u.test(diff.output) ? diff.output : null;
+}
+
+/** Capture a working-container diff synchronously through the backend seam. */
+export function captureProviderDiff(workingContainerName, options = {}) {
+	try {
+		validateIdentifier(workingContainerName, "workingContainerName");
+	} catch {
+		return null;
+	}
+	try {
+		const { command, args: workspaceArgs } = getWorkspaceExecution(
+			workingContainerName,
+			options,
+		);
+		execFileSync(command, [...workspaceArgs, "git", "add", "-A"], {
+			stdio: "pipe",
+		});
+		const diff = execFileSync(
+			command,
+			[...workspaceArgs, "git", "diff", "--cached", "HEAD"],
+			{ encoding: "utf8", stdio: "pipe" },
+		);
+		return /\S/u.test(diff) ? diff : null;
+	} catch {
+		return null;
+	}
 }

@@ -247,7 +247,7 @@ export function isPersistentFailureMetadata(value) {
 // line (JSONL, one object per line) or a status surface.
 const MAX_REASON_CHARS = 800;
 
-// Per-provider re-auth command, matching README's documented recovery step.
+// D-10: per-provider re-auth command, matching README's documented recovery step.
 // An expired-but-present token is NOT fixed by `npm run auth` (it skips any
 // credential that already passes the presence check), so the hint points at a
 // direct interactive login against the standing agent container — which needs a
