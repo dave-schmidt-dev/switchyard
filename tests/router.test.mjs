@@ -53,6 +53,7 @@ import {
 	getInvocationDescriptorIdentity,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
+	resolveTargetIdentity,
 } from "../src/switchyard/roster/index.mjs";
 import {
 	preflightMacosQueue,
@@ -122,6 +123,46 @@ function withDispatchQualifiedDescriptors(roster) {
 		}
 	}
 	return roster;
+}
+
+// Two ENABLED codex-harness targets, which is what makes `resolveTargetIdentity`
+// fall through to its harness tie-break and report `ambiguous: true`. Shared by
+// the Task 6.2 disambiguation lock and the case-variant identifier test at the
+// bottom of this file; both need the same two-target shape, and duplicating it
+// would let one copy drift while the other kept passing.
+function buildDualCodexRoster({ incumbentSnapshotName }) {
+	const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+	if (incumbentSnapshotName) {
+		roster.targets.codex.snapshot_name = incumbentSnapshotName;
+	}
+	roster.models["fixture/codex-spark-low"] = {
+		selector: "fixture-codex-spark-low",
+		base_model: "fixture-codex-spark-low",
+		model_provider: "fixture",
+		status: "active",
+	};
+	roster.targets["codex-spark"] = {
+		harness: "codex",
+		snapshot_name: "Codex (Spark)",
+		enabled: true,
+		technical_ceiling: "low",
+		// Selector-keyed `qualified` and descriptor-identity-keyed
+		// `dispatch_qualified` are two DIFFERENT records: the first is what
+		// autoRoutingCeiling() reads to give the target a capability_class,
+		// the second is the routing descriptor gate that
+		// withDispatchQualifiedDescriptors() adds below. Omitting this one
+		// leaves the target ineligible ("below required capability low"), and
+		// each caller's control assertion is what catches that.
+		qualifications: {
+			"fixture-codex-spark-low": { status: "qualified" },
+		},
+		slots: {
+			low: [{ model_ref: "fixture/codex-spark-low", priority: 1 }],
+			standard: [],
+			high: [],
+		},
+	};
+	return withDispatchQualifiedDescriptors(roster);
 }
 
 before(() => {
@@ -484,40 +525,6 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			tmpdir(),
 			`switchyard-router-codex-spark-${process.pid}-${randomUUID()}.json`,
 		);
-		const buildDualCodexRoster = ({ incumbentSnapshotName }) => {
-			const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
-			if (incumbentSnapshotName) {
-				roster.targets.codex.snapshot_name = incumbentSnapshotName;
-			}
-			roster.models["fixture/codex-spark-low"] = {
-				selector: "fixture-codex-spark-low",
-				base_model: "fixture-codex-spark-low",
-				model_provider: "fixture",
-				status: "active",
-			};
-			roster.targets["codex-spark"] = {
-				harness: "codex",
-				snapshot_name: "Codex (Spark)",
-				enabled: true,
-				technical_ceiling: "low",
-				// Selector-keyed `qualified` and descriptor-identity-keyed
-				// `dispatch_qualified` are two DIFFERENT records: the first is what
-				// autoRoutingCeiling() reads to give the target a capability_class,
-				// the second is the routing descriptor gate that
-				// withDispatchQualifiedDescriptors() adds below. Omitting this one
-				// leaves the target ineligible ("below required capability low"), and
-				// the control assertion further down is what catches that.
-				qualifications: {
-					"fixture-codex-spark-low": { status: "qualified" },
-				},
-				slots: {
-					low: [{ model_ref: "fixture/codex-spark-low", priority: 1 }],
-					standard: [],
-					high: [],
-				},
-			};
-			return withDispatchQualifiedDescriptors(roster);
-		};
 		const previousPath = process.env.SWITCHYARD_ROSTER_PATH;
 		const routeOnlyCodex = (roster) => {
 			writeFileSync(rosterPath, JSON.stringify(roster), "utf8");
@@ -1738,6 +1745,165 @@ describe("router (implementor-priority waterfall routing)", () => {
 			}
 			__resetRosterCacheForTests();
 			rmSync(qualifiedTiebreakFixturePath, { force: true });
+		}
+	});
+});
+
+// providerMatches()'s last line -- the `normalizeProviderName(identifier) ===
+// normalizeProviderName(name)` fallback -- had no coverage. It is reached only
+// when at least one side fails to resolve to a roster target, and since every
+// one of its seven call sites already guards `name` with a non-null-targetId
+// check first, in practice that means: the caller-supplied IDENTIFIER
+// (--only-provider / --exclude-provider) names nothing in the roster.
+//
+// Both outcomes of that fallback are reachable and observable, so both are
+// locked below. The asymmetry that makes the `true` side reachable at all is
+// that resolveTargetIdentity()'s first two steps (exact target id, exact
+// snapshot_name) do NOT check `enabled`, while its harness tie-break does --
+// so a snapshot provider named exactly like a DISABLED target still resolves,
+// while a case-variant of that same string does not.
+describe("providerMatches fallback for roster-unresolvable identifiers", () => {
+	it("matches nothing when --only-provider names no roster target, and excludes nothing when --exclude-provider does", () => {
+		// Both filtered routes below go through the fallback's `false` outcome:
+		// "windsurf" resolves to no target (targetId null), every snapshot name
+		// here resolves to one, and "windsurf" !== "claude"/"codex".
+		strictEqual(resolveTargetIdentity("windsurf").targetId, null);
+
+		createTestSnapshot([
+			{ name: "claude", ok: true, windows: [{ percent_left: 90 }] },
+			{ name: "codex", ok: true, windows: [{ percent_left: 80 }] },
+		]);
+
+		// Control: without a filter this queue routes fine. Without it, the
+		// `only` assertion would pass vacuously on any roster/snapshot state
+		// that made every provider ineligible for an unrelated reason.
+		const unfiltered = route({ requiredCapability: "standard" });
+		notStrictEqual(unfiltered.provider, null);
+
+		// An unknown allowlist entry allows nothing -- it must not silently
+		// degrade to "no filter".
+		strictEqual(
+			route({ requiredCapability: "standard", only: ["windsurf"] }).provider,
+			null,
+		);
+
+		// The opposite polarity, which the `only` case alone would not catch:
+		// an unknown exclusion must remove nothing. An inverted condition in
+		// the fallback would show up here as a null route.
+		strictEqual(
+			route({ requiredCapability: "standard", exclude: ["windsurf"] }).provider,
+			unfiltered.provider,
+		);
+	});
+
+	it("still excludes a disabled target's snapshot provider given a case-variant identifier", () => {
+		// The fallback's `true` outcome. The fixture's `vibe` target is
+		// disabled, which is precisely what splits the two spellings:
+		//   "vibe" -> exact target id (step 1, no `enabled` check) -> "vibe"
+		//   "Vibe" -> no id/snapshot_name match, then the harness tie-break
+		//             finds zero ENABLED vibe targets                -> null
+		// One resolved side and one unresolved side is what drops
+		// providerMatches past its `identifierTargetId && nameTargetId` branch
+		// onto the fallback, where both spellings normalize to "vibe".
+		//
+		// Asserting the split directly rather than assuming it: if `vibe` is
+		// ever enabled in the fixture, "Vibe" starts resolving through the
+		// tie-break, the exclusion below still fires via the earlier branch,
+		// and this test would keep passing while covering nothing.
+		strictEqual(resolveTargetIdentity("vibe").targetId, "vibe");
+		strictEqual(resolveTargetIdentity("Vibe").targetId, null);
+
+		const snapshot = {
+			schema_version: 2,
+			updated_at: new Date().toISOString(),
+			providers: [{ name: "vibe", ok: true, windows: [{ percent_left: 80 }] }],
+		};
+		const reasonFor = (exclude) =>
+			preflightMacosQueue({
+				tasks: [{ id: "t", status: "pending", requiredCapability: "standard" }],
+				tarProvisionManifest: { verified: true, providers: ["vibe"] },
+				readSnapshot: () => ({
+					snapshot,
+					snapshotStatus: "fresh",
+					snapshotMtime: 1,
+					snapshotAgeMsAtRoute: 0,
+				}),
+				exclude,
+			}).capabilityResults[0].excludedReasons.vibe;
+
+		// Control: unexcluded, `vibe` drops out later in classifyPreflightProvider
+		// for an unrelated reason. That baseline is what makes the flip to
+		// "explicitly_excluded" evidence that the exclusion matched, rather
+		// than a reason string this provider would have carried anyway.
+		strictEqual(reasonFor([]), "below_required_capability");
+		strictEqual(reasonFor(["Vibe"]), "explicitly_excluded");
+		// ...and the fallback is still discriminating, not matching everything:
+		// an unrelated unresolvable identifier leaves the baseline reason.
+		strictEqual(reasonFor(["windsurf"]), "below_required_capability");
+	});
+
+	it("refuses a case-variant of an ambiguous harness with ambiguous_target rather than routing it", () => {
+		// The rider to the above: with TWO enabled codex targets, "CODEX" no
+		// longer resolves -- it matches no exact target id (that comparison is
+		// case-sensitive) and the harness tie-break now sees two candidates.
+		// Lowercase "codex" keeps working because it hits the exact id.
+		//
+		// route() catches this in its own pre-loop guard and returns
+		// `ambiguous_target` with an actionable hint, so the identifier never
+		// reaches providerMatches at all. Assert that reason, not just
+		// `provider === null`: a bare null assertion would keep passing if the
+		// guard were deleted, because the fallback above would then quietly
+		// match "CODEX" to the "Codex" snapshot name instead.
+		//
+		// The mixed case itself is a PRECONDITION, not a bug to fix here: the
+		// CLI lowercases every provider filter in normalizeProviders()
+		// (src/switchyard/runner/index.mjs:171), so only a programmatic
+		// runQueue caller bypassing normalizeRunOptions can hand the router a
+		// mixed-case identifier. If case-insensitive target-id resolution is
+		// ever added to resolveTargetIdentityFromTargets, revisit this.
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-router-codex-case-${process.pid}-${randomUUID()}.json`,
+		);
+		const previousPath = process.env.SWITCHYARD_ROSTER_PATH;
+		try {
+			writeFileSync(
+				rosterPath,
+				JSON.stringify(
+					buildDualCodexRoster({ incumbentSnapshotName: "Codex" }),
+				),
+				"utf8",
+			);
+			process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+			__resetRosterCacheForTests();
+			createTestSnapshot([
+				{ name: "Codex", ok: true, windows: [{ percent_left: 40 }] },
+				{ name: "Codex (Spark)", ok: true, windows: [{ percent_left: 95 }] },
+			]);
+
+			// Control: both targets are live and Spark holds the headroom, so a
+			// null result below is the filter's doing and not an ineligible roster.
+			strictEqual(
+				route({ requiredCapability: "low" }).provider,
+				"Codex (Spark)",
+			);
+			strictEqual(
+				route({ requiredCapability: "low", only: ["codex"] }).provider,
+				"Codex",
+			);
+
+			const upper = route({ requiredCapability: "low", only: ["CODEX"] });
+			strictEqual(upper.provider, null);
+			strictEqual(upper.reason, "ambiguous_target");
+			ok(
+				upper.log.some((line) => line.includes("use an exact target id")),
+				`expected an actionable hint, got: ${JSON.stringify(upper.log)}`,
+			);
+		} finally {
+			if (previousPath === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previousPath;
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
 		}
 	});
 });
