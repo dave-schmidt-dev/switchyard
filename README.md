@@ -177,6 +177,22 @@ handshake, not the stateful unicast renewal the build VM does. The build VM
 cannot catch this on its own — it already holds a lease from before pf was
 loaded — which is exactly why the second independent build exists.
 
+**The provider CLIs are only useful if a login shell can find them.** They
+install into the provider account's `~/.local/bin`, which no default macOS login
+PATH contains, so the build registers that directory with `path_helper` via
+`/etc/paths.d/switchyard`. The installer's own `command -v` sweep cannot catch a
+regression here — it runs inside a heredoc that exports the directory, so it
+passes either way. The assertion that matters runs after the final restart,
+through the same `sudo -u <account> /bin/bash -lc` identity the execution
+backend uses. Without it the image ships six CLIs that are present on disk and
+unreachable by name, and every provider exec fails with `command not found`.
+
+**Anything with shell metacharacters must reach the guest over stdin.**
+`prlctl exec` reparses a script supplied as an argv element, so a pipe,
+redirect, or quoted word does not survive. `guest_exec` is for single commands
+only; `guest_exec_script` is the stdin channel. The execution backend solves the
+same problem by shell-quoting the script argument.
+
 The auto-login password is generated and consumed only inside the guest. The
 only deliberate plaintext-equivalent persistence is `/etc/kcpassword`: it is a
 disposable, non-admin, guest-only credential shared by image clones. It is

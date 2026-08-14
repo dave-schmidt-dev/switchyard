@@ -189,6 +189,81 @@ describe("macOS golden-image ops artifacts", () => {
 			"a DHCP pass below the blocks never matches: a fresh-MAC clone gets no lease",
 		);
 	});
+
+	// The CLIs install into the provider's ~/.local/bin, which no default macOS
+	// login PATH contains. Measured 2026-08-14: the image shipped with all six
+	// present on disk and none resolvable by name from the Aqua session the
+	// adapters actually use, so every provider exec would have failed with
+	// "command not found".
+	it("puts the provider's ~/.local/bin on the login PATH", () => {
+		const body = readFileSync(BUILD, "utf8");
+		ok(
+			/\/etc\/paths\.d\/switchyard/.test(body),
+			"the build no longer registers a path_helper entry for the provider CLIs",
+		);
+		ok(
+			/printf '%s\\\\n' "\/Users\/\\\$provider_user\/\.local\/bin" > \/etc\/paths\.d\/switchyard/.test(
+				body,
+			),
+			"the path_helper entry does not name the provider's ~/.local/bin",
+		);
+	});
+
+	// The installer heredoc exports ~/.local/bin itself, so its own `command -v`
+	// sweep passes whether or not a real login can resolve the CLIs. The
+	// assertion that matters has to run outside that heredoc, through the same
+	// identity the execution backend uses.
+	it("resolves every pinned CLI through a fresh provider login", () => {
+		const body = readFileSync(BUILD, "utf8");
+		const installStart = body.indexOf("INSTALL_SCRIPT");
+		const installEnd = body.indexOf("\nINSTALL_SCRIPT", installStart);
+		ok(installEnd !== -1, "installer heredoc moved");
+
+		const loginCheck =
+			/\/bin\/launchctl asuser "\\\$uid" \/usr\/bin\/sudo -u "\\\$provider_user" \/bin\/bash -lc/;
+		const match = body.search(loginCheck);
+		ok(match !== -1, "no login-PATH resolution check in the build");
+		ok(
+			match > installEnd,
+			"the login-PATH check sits inside the installer heredoc, which exports the directory and can never fail",
+		);
+		ok(
+			/pinned CLI is not on the provider login PATH/.test(body),
+			"the login-PATH check does not fail closed with a distinct message",
+		);
+	});
+
+	// A lease and a default route arrive before resolution does, and the CLI
+	// installers all fetch over the network moments after a restart. Measured
+	// 2026-08-14: a build died on `curl: (6) Could not resolve host`.
+	it("waits for guest DNS before installing the CLIs, over stdin", () => {
+		const body = readFileSync(BUILD, "utf8");
+		ok(
+			/wait_for_guest_dns\(\)/.test(body),
+			"the build no longer gates CLI installation on DNS readiness",
+		);
+		const installIndex = body.indexOf("install_guest_tools() {");
+		ok(installIndex !== -1, "install_guest_tools moved");
+		const installBody = body.slice(installIndex, installIndex + 200);
+		ok(
+			/wait_for_guest_dns/.test(installBody),
+			"install_guest_tools does not wait for DNS before fetching installers",
+		);
+
+		// The probe is piped, and prlctl reparses an argv-supplied script, so
+		// routing it through guest_exec would drop the pipe and the gate would
+		// fail for its whole timeout against a guest that resolves fine.
+		const gateStart = body.indexOf("wait_for_guest_dns() {");
+		const gateBody = body.slice(gateStart, body.indexOf("\n}", gateStart));
+		ok(
+			/\| guest_exec_script/.test(gateBody),
+			"the DNS probe does not use the stdin channel",
+		);
+		ok(
+			!/guest_exec "/.test(gateBody),
+			"the DNS probe uses guest_exec, whose argv reparse drops the pipe",
+		);
+	});
 });
 
 describe("the pinned CLI manifest", () => {

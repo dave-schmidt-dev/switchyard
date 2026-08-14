@@ -209,6 +209,11 @@ require_host_tools() {
 guest_exec() {
   # The command is supplied as an argv element, not interpolated into a host
   # shell. The generated password is created only inside guest_exec_script.
+  #
+  # Single commands only. prlctl reparses the script argument, so a pipe,
+  # redirect, or quoted word does not survive the trip and the command silently
+  # does something other than what it reads as. Anything with shell
+  # metacharacters must go over stdin via guest_exec_script instead.
   prlctl exec "$VM_NAME" /bin/bash -lc "$1"
 }
 
@@ -288,6 +293,29 @@ wait_for_provider_user() {
     sleep 2
   done
   fail "provider user did not become ready: $PROVIDER_USER"
+}
+
+wait_for_guest_dns() {
+  local attempt
+  # The CLI installers all fetch over the network, and the guest reaches this
+  # point moments after a restart. A lease and a default route arrive before
+  # resolution does, so waiting on the account alone is not enough: an
+  # unlucky build dies on `curl: (6) Could not resolve host`, which reads like
+  # a C-3 policy failure and is really a race. Resolve the caller's own
+  # reachability DNS name, so this also fails loudly if the ruleset is wrong.
+  local probe="/usr/bin/dscacheutil -q host -a name '$DNS_NAME' | /usr/bin/grep -q ip_address"
+  for attempt in {1..60}; do
+    # Over stdin, not as an argv script: the pipe would not survive prlctl's
+    # reparse, and the probe would fail for the full timeout while the guest
+    # resolved names perfectly well.
+    if printf '%s\n' "$probe" | guest_exec_script >/dev/null 2>&1; then
+      log "guest DNS resolution is ready"
+      return 0
+    fi
+    ((attempt % 5 == 0)) && log "waiting for guest DNS resolution (${attempt}/60)"
+    sleep 2
+  done
+  fail "guest could not resolve $DNS_NAME; network is not ready or C-3 blocks it"
 }
 
 configure_host() {
@@ -471,6 +499,7 @@ EOF
 }
 
 install_guest_tools() {
+  wait_for_guest_dns
   log "installing unauthenticated provider CLIs in the provider Aqua identity"
   guest_exec_script <<EOF
 set -Eeuo pipefail
@@ -540,6 +569,15 @@ for provider in claude codex agy cursor-agent copilot opencode; do
   }
 done
 INSTALL_SCRIPT
+# The CLIs land in the provider's ~/.local/bin, which is not on a default macOS
+# login PATH. The installer heredoc above exports that directory itself, so its
+# own \`command -v\` check passes whether or not a real login can resolve them —
+# the same blind spot the DHCP defect had. Register the directory the way macOS
+# actually assembles a login PATH, via path_helper, so an adapter invoking
+# \`claude\` by bare name in the Aqua session finds it.
+/bin/mkdir -p /etc/paths.d
+/usr/bin/printf '%s\\n' "/Users/\$provider_user/.local/bin" > /etc/paths.d/switchyard
+/bin/chmod 644 /etc/paths.d/switchyard
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 /usr/bin/xcode-select -s "\$DEVELOPER_DIR"
 /usr/bin/xcodebuild -runFirstLaunch >/dev/null
@@ -614,6 +652,16 @@ first_block_line="\$(printf '%s\\n' "\$loaded_rules" |
   fail_guest "C-3 anchor has no inbound DHCP pass; a fresh-MAC clone cannot get a lease"
 [[ -n "\$first_block_line" && "\$dhcp_in_line" -lt "\$first_block_line" ]] ||
   fail_guest "C-3 inbound DHCP pass is below the RFC1918 blocks and will never match"
+# Resolve every pinned CLI through a *fresh* provider login that exports no
+# PATH of its own, using the same \`sudo -u ... /bin/bash -lc\` identity the
+# execution backend's Aqua route uses. This is the assertion the installer's
+# in-heredoc check cannot make, and without it the image ships with six CLIs
+# that are present on disk and unreachable by name.
+for provider in claude codex agy cursor-agent copilot opencode; do
+  /bin/launchctl asuser "\$uid" /usr/bin/sudo -u "\$provider_user" /bin/bash -lc \\
+    "command -v \$provider" >/dev/null 2>&1 ||
+    fail_guest "pinned CLI is not on the provider login PATH: \$provider"
+done
 printf '[guest] restarted posture assertions passed\\n' >&2
 EOF
 
