@@ -465,6 +465,107 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		}
 	});
 
+	// Task 6.2 (gradus codex-spark-bucket plan): the incumbent `codex` target and
+	// the new `codex-spark` target share the `codex` harness and are BOTH enabled,
+	// so `resolveTargetIdentity` can no longer fall through to its harness
+	// tie-break -- that path returns `ambiguous: true` for two enabled targets, and
+	// providerMatches() turns any ambiguity into `false`. The incumbent's
+	// `snapshot_name: "Codex"` is what keeps `--only-provider codex` matching it.
+	//
+	// This drives the REAL providerMatches through route({only}) rather than
+	// asserting on resolveTargetIdentity directly, and it builds both targets
+	// enabled from the fixture, so it cannot pass vacuously if a target is later
+	// disabled in the live roster. The second half re-runs the identical route
+	// against a roster with `snapshot_name` deleted and asserts it stops matching
+	// -- without that leg the first assertion alone would still pass on a roster
+	// where the regression had returned.
+	it("keeps --only-provider codex on the incumbent target when a second codex-harness target is enabled (Task 6.2)", () => {
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-router-codex-spark-${process.pid}-${randomUUID()}.json`,
+		);
+		const buildDualCodexRoster = ({ incumbentSnapshotName }) => {
+			const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+			if (incumbentSnapshotName) {
+				roster.targets.codex.snapshot_name = incumbentSnapshotName;
+			}
+			roster.models["fixture/codex-spark-low"] = {
+				selector: "fixture-codex-spark-low",
+				base_model: "fixture-codex-spark-low",
+				model_provider: "fixture",
+				status: "active",
+			};
+			roster.targets["codex-spark"] = {
+				harness: "codex",
+				snapshot_name: "Codex (Spark)",
+				enabled: true,
+				technical_ceiling: "low",
+				// Selector-keyed `qualified` and descriptor-identity-keyed
+				// `dispatch_qualified` are two DIFFERENT records: the first is what
+				// autoRoutingCeiling() reads to give the target a capability_class,
+				// the second is the routing descriptor gate that
+				// withDispatchQualifiedDescriptors() adds below. Omitting this one
+				// leaves the target ineligible ("below required capability low"), and
+				// the control assertion further down is what catches that.
+				qualifications: {
+					"fixture-codex-spark-low": { status: "qualified" },
+				},
+				slots: {
+					low: [{ model_ref: "fixture/codex-spark-low", priority: 1 }],
+					standard: [],
+					high: [],
+				},
+			};
+			return withDispatchQualifiedDescriptors(roster);
+		};
+		const previousPath = process.env.SWITCHYARD_ROSTER_PATH;
+		const routeOnlyCodex = (roster) => {
+			writeFileSync(rosterPath, JSON.stringify(roster), "utf8");
+			process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+			__resetRosterCacheForTests();
+			// Spark deliberately holds the most headroom: if the identifier matched
+			// both targets, INV-4's most-headroom spread would hand the route to
+			// Spark, so "Codex" below is a positive result and not a tie default.
+			createTestSnapshot([
+				{
+					name: "Codex",
+					ok: true,
+					windows: [{ percent_left: 40, pace_delta: 0 }],
+				},
+				{
+					name: "Codex (Spark)",
+					ok: true,
+					windows: [{ percent_left: 95, pace_delta: 0 }],
+				},
+			]);
+			return {
+				onlyCodex: route({ requiredCapability: "low", only: ["codex"] }),
+				unfiltered: route({ requiredCapability: "low" }),
+			};
+		};
+		try {
+			const withSnapshotName = routeOnlyCodex(
+				buildDualCodexRoster({ incumbentSnapshotName: "Codex" }),
+			);
+			// Control: Spark IS eligible and IS the most-headroom lane here, so the
+			// filtered assertion below is doing real work. Without this the test
+			// would still pass if Spark were quietly ineligible (no descriptor,
+			// capability filtered out), proving nothing about disambiguation.
+			strictEqual(withSnapshotName.unfiltered.provider, "Codex (Spark)");
+			strictEqual(withSnapshotName.onlyCodex.provider, "Codex");
+			strictEqual(
+				routeOnlyCodex(buildDualCodexRoster({ incumbentSnapshotName: null }))
+					.onlyCodex.provider,
+				null,
+			);
+		} finally {
+			if (previousPath === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previousPath;
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
+		}
+	});
+
 	it("never routes outside availableProviders, even when the excluded one has more headroom", () => {
 		// Isolate the availableProviders restriction from capability filtering:
 		// both claude and codex are fully capable here, so the ONLY reason
