@@ -16,12 +16,15 @@
 // SNAPSHOT_PATH in src/switchyard/router/index.mjs) rather than via a
 // fixture: this test's whole point is checking the real file, not a copy.
 
-import { ok, strictEqual } from "node:assert";
+import { notStrictEqual, ok, strictEqual } from "node:assert";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { normalizeProviderName } from "../src/switchyard/roster/index.mjs";
+import {
+	normalizeProviderName,
+	resolveTargetIdentity,
+} from "../src/switchyard/roster/index.mjs";
 
 const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
 
@@ -35,6 +38,7 @@ const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
 // if gradus adds, renames, or removes a provider.
 const GRADUS_PROVIDER_DISPLAY_NAMES = [
 	"Codex",
+	"Codex (Spark)",
 	"Claude",
 	"Antigravity",
 	"Copilot",
@@ -93,5 +97,81 @@ describe("target -> usage_provider mapping (INV-4, Task 1.5b)", () => {
 	// failing silently elsewhere.
 	it("opencode-zen stays disabled (excluded from the enabled-target check above)", () => {
 		strictEqual(targets["opencode-zen"]?.enabled, false);
+	});
+});
+
+// Task 6.2 (codex-spark-bucket plan): regression lock for the Task 6.1 fix
+// that keeps a bare "codex" identifier resolving to ONLY the incumbent
+// target now that a second codex-harness target (codex-spark, snapshot_name
+// "Codex (Spark)") is enabled alongside it. router/index.mjs's
+// providerMatches(identifier, name) isn't exported (it's a local helper), so
+// this locks in the resolveTargetIdentity resolution it's built on instead:
+// resolve both sides, fail closed (false) on ambiguity, else compare
+// targetId. Reads the real ~/.agent/roster.json (same pattern as the rest of
+// this file) rather than a fixture -- this is exactly the scenario Task 6.1
+// fixed, so it must hold for the real, current roster state.
+describe("providerMatches disambiguates the two codex-harness targets (Task 6.2)", () => {
+	it("providerMatches('codex', 'Codex') stays true", () => {
+		const identifierResolution = resolveTargetIdentity("codex");
+		const nameResolution = resolveTargetIdentity("Codex");
+		ok(
+			!identifierResolution.ambiguous,
+			`identifier 'codex' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
+		);
+		ok(
+			!nameResolution.ambiguous,
+			`name 'Codex' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
+		);
+		strictEqual(identifierResolution.targetId, nameResolution.targetId);
+		strictEqual(identifierResolution.targetId, "codex");
+	});
+
+	it("providerMatches('codex', 'Codex (Spark)') is false", () => {
+		const identifierResolution = resolveTargetIdentity("codex");
+		const nameResolution = resolveTargetIdentity("Codex (Spark)");
+		ok(
+			!identifierResolution.ambiguous,
+			`identifier 'codex' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
+		);
+		ok(
+			!nameResolution.ambiguous,
+			`name 'Codex (Spark)' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
+		);
+		notStrictEqual(identifierResolution.targetId, nameResolution.targetId);
+		strictEqual(nameResolution.targetId, "codex-spark");
+	});
+
+	// The mirror of the two cases above. Without these, the lock only proves
+	// the incumbent identifier still resolves correctly -- it would stay green
+	// if `codex-spark` itself became unroutable or collapsed back onto the
+	// incumbent target, which is the other half of the same ambiguity failure.
+	it("providerMatches('codex-spark', 'Codex (Spark)') stays true", () => {
+		const identifierResolution = resolveTargetIdentity("codex-spark");
+		const nameResolution = resolveTargetIdentity("Codex (Spark)");
+		ok(
+			!identifierResolution.ambiguous,
+			`identifier 'codex-spark' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
+		);
+		ok(
+			!nameResolution.ambiguous,
+			`name 'Codex (Spark)' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
+		);
+		strictEqual(identifierResolution.targetId, nameResolution.targetId);
+		strictEqual(identifierResolution.targetId, "codex-spark");
+	});
+
+	it("providerMatches('codex-spark', 'Codex') is false", () => {
+		const identifierResolution = resolveTargetIdentity("codex-spark");
+		const nameResolution = resolveTargetIdentity("Codex");
+		ok(
+			!identifierResolution.ambiguous,
+			`identifier 'codex-spark' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
+		);
+		ok(
+			!nameResolution.ambiguous,
+			`name 'Codex' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
+		);
+		notStrictEqual(identifierResolution.targetId, nameResolution.targetId);
+		strictEqual(nameResolution.targetId, "codex");
 	});
 });
