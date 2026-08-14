@@ -16,6 +16,18 @@
 # libc6:arm64 / libgcc-s1:arm64). OrbStack and Docker Desktop both run amd64
 # images transparently on Apple Silicon (Rosetta / QEMU), so this costs
 # emulation overhead, not correctness.
+#
+# The platform is the only thing pinned here. Vendor CLI *versions* are
+# deliberately not — decided and closed (David, 2026-08-13). Supply-chain
+# integrity is a separate question and is already settled per installer below
+# (Task 20: claude/codex/agy each verify, cursor's gap is an accepted risk
+# bounded by INV-1). What version pinning would add is build reproducibility,
+# and in this image it costs more than it buys: a CLI's bundled model catalog
+# is what a container falls back to when it cannot fetch the live one (see the
+# agy provisioning bug in TASKS.md), so freezing versions converts "the catalog
+# is stale until the next rebuild" into "stale until someone edits this file" —
+# a newly released model becomes undispatchable by default rather than by
+# accident. Revisit only if a floating install actually breaks a build.
 FROM --platform=linux/amd64 node:22-bookworm-slim
 
 # git: every adapter's captureDiff() shells out to `git diff` inside the
