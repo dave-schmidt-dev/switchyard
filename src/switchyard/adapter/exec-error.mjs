@@ -66,6 +66,30 @@ const QUOTA_FAILURE_SIGNATURES = Object.freeze({
 	},
 });
 
+// A model the provider CLI cannot resolve at all. Observed 2026-08-13: a
+// working container provisioned with only agy's OAuth token rejected a model
+// the standing container dispatches fine — every such dispatch failed as a
+// generic execution_failed, and the ledger's static reason ("Provider execution
+// failed before a reviewed integration") could not distinguish it from a model
+// that ran and failed. The real cause is a provisioning gap, not a model fault.
+//
+// The pattern is the verbatim stderr of a 2026-08-14 probe against the standing
+// container, which also confirmed the mechanism from the other side: `agy
+// models` there prints "Fetching available models..." and returns the 3.7 tier,
+// while the agy binary itself carries model literals only up to Gemini 3.6
+// (plus 3.5/3.1, Claude, GPT-OSS) — precisely the list the deprived container
+// reported. So the fallback catalog is real and bundled, and the live fetch is
+// what a token-only container loses. The persisted reason below still says
+// "stale or incomplete" rather than naming that mechanism, because this
+// classifier sees only the CLI's refusal, not why the fetch did not happen.
+//
+// Provider-scoped and narrow, for the same reason the quota signatures are:
+// this is verbatim provider-boundary evidence, not the generic words "model" or
+// "not recognized" that appear in ordinary provider output.
+const MODEL_UNAVAILABLE_SIGNATURES = Object.freeze({
+	agy: /is[\s.,:;_/-]+not[\s.,:;_/-]+recognized[\s.,:;_/-]+as[\s.,:;_/-]+a[\s.,:;_/-]+known[\s.,:;_/-]+model[\s.,:;_/-]+or[\s.,:;_/-]+custom[\s.,:;_/-]+model\b/i,
+});
+
 // This is the only error vocabulary allowed to cross a persistence boundary.
 // Keep provider text at the adapter edge; callers persist only one of these
 // enum values plus the static metadata below. quota_exhausted is intentionally
@@ -74,6 +98,7 @@ const QUOTA_FAILURE_SIGNATURES = Object.freeze({
 export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"auth_expired",
 	"quota_exhausted",
+	"model_unavailable",
 	"execution_failed",
 	"execution_timed_out",
 	"integration_failed",
@@ -96,6 +121,11 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reasonCode: "quota_exhausted",
 		reason:
 			"Provider quota is exhausted; the target is unavailable for this attempt.",
+	}),
+	model_unavailable: Object.freeze({
+		reasonCode: "model_unavailable",
+		reason:
+			"The provider CLI did not recognize the dispatched model; its resolvable catalog is stale or the working container's provider state is incomplete.",
 	}),
 	execution_failed: Object.freeze({
 		reasonCode: "execution_failed",
@@ -300,13 +330,26 @@ function isQuotaExhausted(text, provider) {
 }
 
 /**
+ * Classify only verified provider-specific unresolvable-model signatures.
+ * @param {string} text Combined provider output.
+ * @param {unknown} provider Adapter provider key.
+ * @returns {boolean}
+ */
+function isModelUnavailable(text, provider) {
+	const providerKey =
+		typeof provider === "string" ? provider.toLowerCase() : "";
+	const signature = MODEL_UNAVAILABLE_SIGNATURES[providerKey];
+	return signature ? signature.test(text) : false;
+}
+
+/**
  * Turn a thrown execFileSync error from a provider invocation into a
  * diagnosable adapter-result fragment. Intended for NON-timeout failures only —
  * the timeout path keeps `error.message` so the ETIMEDOUT signal survives.
  * @param {(Error & {stdout?: string, stderr?: string, code?: string|number})} error
  * @param {object} [opts]
  * @param {string} [opts.provider] Provider name; attaches a re-auth hint on an auth failure.
- * @returns {{output: string, error: string, errorKind: ("auth_expired"|"quota_exhausted"|null)}}
+ * @returns {{output: string, error: string, errorKind: ("auth_expired"|"quota_exhausted"|"model_unavailable"|null)}}
  */
 export function describeExecError(error, { provider } = {}) {
 	const stdout = typeof error?.stdout === "string" ? error.stdout : "";
@@ -320,6 +363,14 @@ export function describeExecError(error, { provider } = {}) {
 	// an expired session is not evidence that the account quota is exhausted.
 	const quotaExhausted =
 		!authExpired && combined.length > 0 && isQuotaExhausted(combined, provider);
+	// Last in precedence: an expired session or an exhausted quota can produce
+	// odd downstream output, and neither is a catalog problem. Only classify the
+	// model as unavailable when nothing better explains the failure.
+	const modelUnavailable =
+		!authExpired &&
+		!quotaExhausted &&
+		combined.length > 0 &&
+		isModelUnavailable(combined, provider);
 
 	// Prefer the provider's own words; fall back to Node's wrapper only when the
 	// provider printed nothing (e.g. it was killed before it could output).
@@ -339,6 +390,8 @@ export function describeExecError(error, { provider } = {}) {
 			? "auth_expired"
 			: quotaExhausted
 				? "quota_exhausted"
-				: null,
+				: modelUnavailable
+					? "model_unavailable"
+					: null,
 	};
 }
