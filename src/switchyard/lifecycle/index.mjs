@@ -175,16 +175,62 @@ const PROVIDER_CREDENTIAL_PATHS = [
 	},
 ];
 
-// The VM lane can only carry the file-backed stores confirmed by Task 1.3.
-// These sources are read from the standing Docker vault into a Node Buffer and
-// immediately handed to the selected backend; no credential tar is written to
-// a host path. Keychain-backed providers are deliberately absent so a routed
-// VM task fails before execution instead of claiming that vault auth is
-// present in a guest that never received it.
+// The VM lane can only carry the stores Task 1.3 confirmed by measurement:
+// each file below was moved aside inside the guest and that provider's own
+// auth check re-run through the Aqua session, so every entry is backed by a
+// provider that actually authenticated from a copied file. These sources are
+// read from the standing Docker vault into a Node Buffer and immediately
+// handed to the selected backend; no credential tar is written to a host path.
+//
+// `cursor-agent` is deliberately absent — it is file-backed in shape and
+// machine-bound in behavior, and stayed `Not logged in` with three candidate
+// stores provisioned. A routed VM task fails before execution rather than
+// claiming that vault auth is present in a guest that never received it.
+//
+// The `file` values are home-relative and must match the backend's own
+// allowlist; the backend rejects anything outside it, so this table cannot
+// widen the destination set on its own.
 const VM_TAR_CREDENTIAL_SOURCES = Object.freeze({
-	codex: Object.freeze({ src: "/root/.codex/auth.json" }),
-	opencode: Object.freeze({ src: "/root/.local/share/opencode/auth.json" }),
+	// claude needs both. Either one alone reports `"loggedIn": false`.
+	claude: Object.freeze([
+		Object.freeze({
+			src: "/root/.claude/.credentials.json",
+			file: ".claude/.credentials.json",
+		}),
+		Object.freeze({ src: "/root/.claude.json", file: ".claude.json" }),
+	]),
+	codex: Object.freeze([
+		Object.freeze({ src: "/root/.codex/auth.json", file: ".codex/auth.json" }),
+	]),
+	agy: Object.freeze([
+		Object.freeze({
+			src: "/root/.gemini/antigravity-cli/antigravity-oauth-token",
+			file: ".gemini/antigravity-cli/antigravity-oauth-token",
+		}),
+	]),
+	copilot: Object.freeze([
+		Object.freeze({
+			src: "/root/.copilot/config.json",
+			file: ".copilot/config.json",
+		}),
+	]),
+	opencode: Object.freeze([
+		Object.freeze({
+			src: "/root/.local/share/opencode/auth.json",
+			file: ".local/share/opencode/auth.json",
+		}),
+	]),
 });
+
+/**
+ * The providers the VM lane can actually authenticate, in table order.
+ * Exported so the shipped tar-provision manifest — which is what the macOS
+ * queue preflight admits on — can be checked against the table that does the
+ * work, rather than drifting from it silently.
+ */
+export const VM_TAR_PROVISIONABLE_PROVIDERS = Object.freeze(
+	Object.keys(VM_TAR_CREDENTIAL_SOURCES),
+);
 
 /**
  * Generate a unique working container name for a project.
@@ -444,20 +490,66 @@ export function provisionCredentialsWithBackend(
 	}
 	validateIdentifier(agentContainerName, "agentContainerName");
 	const providerKey = String(provider ?? "").toLowerCase();
-	const source = VM_TAR_CREDENTIAL_SOURCES[providerKey];
-	if (!source) {
+	const sources = VM_TAR_CREDENTIAL_SOURCES[providerKey];
+	if (!sources) {
 		throw new Error(`provider is not tar-provisionable on macOS: ${provider}`);
 	}
-	const tar = readCredentialTar(agentContainerName, source.src);
-	if (!Buffer.isBuffer(tar)) {
-		throw new TypeError("credential reader must return an in-memory Buffer");
-	}
+	// Read every file first. A provider whose layout is partially present in the
+	// vault must fail before anything reaches the guest, rather than leaving a
+	// half-provisioned home that reads as authenticated and is not.
+	const credentials = sources.map(({ src, file }) => {
+		const tar = readCredentialTar(agentContainerName, src);
+		if (!Buffer.isBuffer(tar)) {
+			throw new TypeError("credential reader must return an in-memory Buffer");
+		}
+		return { file, tar };
+	});
 	return executionBackend.provisionCredentials(workspaceId, {
 		provider: providerKey,
-		tar,
+		credentials,
 		aquaUid,
 		providerUser,
 	});
+}
+
+/**
+ * Provision every tar-provisionable provider into a fresh VM workspace.
+ *
+ * The VM lane creates its workspace before routing picks a provider, so this
+ * mirrors the Docker lane: seed the credentials for anything that might be
+ * routed to, then let each adapter's own auth check decide. Best-effort per
+ * provider — a vault that was never logged in to for one provider must not stop
+ * the other four — but unlike the Docker lane, each skip is reported rather
+ * than swallowed, because a silently unauthenticated guest is indistinguishable
+ * from a working one until a task dies at exec.
+ * @param {import("./execution-backend.mjs").ExecutionBackend & {provisionCredentials?: Function}} executionBackend
+ * @param {string} workspaceId VM UUID or backend workspace handle
+ * @param {object} [options] Forwarded to provisionCredentialsWithBackend
+ * @param {(skip: {provider: string, reason: string}) => void} [options.onSkip]
+ * @returns {{provisioned: number, skipped: {provider: string, reason: string}[]}}
+ */
+export function provisionAllCredentialsWithBackend(
+	executionBackend,
+	workspaceId,
+	{ onSkip, ...options } = {},
+) {
+	const report = { provisioned: 0, skipped: [] };
+	for (const provider of Object.keys(VM_TAR_CREDENTIAL_SOURCES)) {
+		try {
+			const receipt = provisionCredentialsWithBackend(
+				executionBackend,
+				workspaceId,
+				{ ...options, provider },
+			);
+			report.provisioned +=
+				receipt?.files?.length ?? VM_TAR_CREDENTIAL_SOURCES[provider].length;
+		} catch (error) {
+			const skip = { provider, reason: error.message };
+			report.skipped.push(skip);
+			onSkip?.(skip);
+		}
+	}
+	return report;
 }
 
 /**

@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	captureDiff as captureAgyDiff,
 	captureDiffAsync as captureAgyDiffAsync,
@@ -60,6 +61,7 @@ import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
 import {
 	commitWorkingTree,
 	createWorkingContainer,
+	provisionAllCredentialsWithBackend,
 	provisionCredentials,
 	resetWorkingTree,
 	seedProject,
@@ -4070,6 +4072,10 @@ function runBackendGitCommand(executionBackend, workspaceId, script) {
 	return result;
 }
 
+const DEFAULT_TAR_PROVISION_MANIFEST_PATH = fileURLToPath(
+	new URL("../../../ops/macos-vm/tar-provision-manifest.json", import.meta.url),
+);
+
 function loadTarProvisionRegistry(dependencies) {
 	if (Object.hasOwn(dependencies, "tarProvisionRegistry")) {
 		return dependencies.tarProvisionRegistry;
@@ -4077,10 +4083,15 @@ function loadTarProvisionRegistry(dependencies) {
 	if (Object.hasOwn(dependencies, "tarProvisionManifest")) {
 		return dependencies.tarProvisionManifest;
 	}
+	// The shipped manifest is the recorded Task 1.3 measurement, one file per
+	// provider verdict with the evidence that produced it. Before 2026-08-14
+	// there was nothing to point at and the preflight rejected every provider
+	// with `tar_provisionability_unverified`; an operator who re-measures
+	// against a different image still overrides it by env or dependency.
 	const manifestPath =
 		dependencies.tarProvisionManifestPath ??
-		process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST;
-	if (!manifestPath) return null;
+		process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST ??
+		DEFAULT_TAR_PROVISION_MANIFEST_PATH;
 	try {
 		return JSON.parse(readFileSync(resolve(manifestPath), "utf8"));
 	} catch {
@@ -4230,9 +4241,9 @@ export function createQueueBackend({
 	return {
 		platform: selectedPlatform,
 		executionBackend,
-		// The VM lane does not start the Docker agent container. Credential
-		// preflight/provisioning is a later queue gate because routing has not
-		// selected a provider at workspace creation time.
+		// The VM lane does not start the Docker agent container; the standing
+		// vault is only read from, over `docker cp`, when credentials are moved
+		// into the guest.
 		ensureAgentContainer: () => {},
 		create: (_path, options = {}) => {
 			if (!goldenImage) {
@@ -4251,7 +4262,31 @@ export function createQueueBackend({
 					: {}),
 			});
 		},
-		provision: dependencies.provisionCredentials ?? (() => null),
+		// Routing has not picked a provider at workspace-creation time, so every
+		// tar-provisionable provider is seeded and each adapter's own auth check
+		// decides at exec — the same contract the Docker lane has always had.
+		// This was `() => null` until 2026-08-14, which meant the guest booted
+		// with no credentials at all and every provider failed authentication.
+		provision:
+			dependencies.provisionCredentials ??
+			((workspaceId) =>
+				provisionAllCredentialsWithBackend(executionBackend, workspaceId, {
+					aquaUid,
+					providerUser,
+					...(dependencies.agentContainerName
+						? { agentContainerName: dependencies.agentContainerName }
+						: {}),
+					// The vault read is a seam so the wiring can be tested without a
+					// standing Docker container, and so nothing pulls real credential
+					// bytes into a unit-test process.
+					...(dependencies.readCredentialTar
+						? { readCredentialTar: dependencies.readCredentialTar }
+						: {}),
+					onSkip: ({ provider, reason }) =>
+						console.error(
+							`macos queue: ${provider} credentials not provisioned, tasks routed to it will fail authentication: ${reason}`,
+						),
+				})),
 		seed: (workspaceId, path) =>
 			seedProjectWithBackend(executionBackend, workspaceId, path),
 		commit: (workspaceId) =>

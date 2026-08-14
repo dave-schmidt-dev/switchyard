@@ -165,6 +165,18 @@ ops/macos-vm/build-golden-image.sh --vm macOS \
   --dns-name apple.com
 ```
 
+**The C-3 anchor's rule order is the property that matters, not its contents.**
+pf takes the first `quick` match, so a pass that sits below a block is dead
+text. The three RFC1918 `block drop` rules carry no direction, which means they
+also drop packets addressed *to* the guest's own `10.211.55.x` — including the
+inbound DHCP OFFER. The anchor therefore passes DHCP in **both** directions
+above those blocks, and the build asserts the ordering by comparing line numbers
+in the *loaded* ruleset rather than trusting the file on disk. Without it, every
+task-time clone comes up dead: each clone gets a fresh MAC and so needs a full
+handshake, not the stateful unicast renewal the build VM does. The build VM
+cannot catch this on its own — it already holds a lease from before pf was
+loaded — which is exactly why the second independent build exists.
+
 The auto-login password is generated and consumed only inside the guest. The
 only deliberate plaintext-equivalent persistence is `/etc/kcpassword`: it is a
 disposable, non-admin, guest-only credential shared by image clones. It is
@@ -218,28 +230,38 @@ no secret can reach its output. Classification reads each CLI's output rather
 than its exit status: `cursor-agent status` and `opencode auth list` both exit 0
 while logged out.
 
-The live second-build gate is currently unverified: the linked validation clone
-reported `GuestTools: state=not_installed`, so the script could not establish its
-required `prlctl exec` channel. No credential values or credential contents were
-read.
+A **full** clone is required, not a linked one. An earlier attempt at this gate
+used a linked clone, which reported `GuestTools: state=not_installed` and so had
+no `prlctl exec` channel at all. Full clones carry working Guest Tools, and they
+are not the expensive option they sound like: APFS clonefile produced a 185 GB
+clone in **0.28–0.34 s** consuming zero additional disk.
 
 #### macOS provider credential locations
 
-The route in the fourth column is mandatory for every check: `prlctl exec` lands
-as root, while the provider runs in the auto-login Aqua session. “Yes” means only
-the stated file-backed mode is eligible; “No” is the safe default until an
-authenticated opaque-copy check proves otherwise. No auth login was run here.
+Measured 2026-08-14 in a full clone of the second independent build, not derived
+from vendor documentation. The route in the fourth column is mandatory for every
+check: `prlctl exec` lands as root in the `System` domain, while the provider
+runs in the auto-login Aqua session, and the two see different Keychains.
+Attribution is per file — each file was moved aside and the provider's own check
+re-run — so every **Yes** names the file that actually decides the verdict.
 
-| Provider | Storage on macOS | Tar-provisionable | Auth-check identity route | Evidence / unknown status |
+| Provider | Credential files, relative to the provider's home | Tar-provisionable | Auth-check identity route | Evidence |
 |---|---|---:|---|---|
-| Claude | Keychain-backed; `~/.claude/.credentials.json` is a fallback when Keychain is unavailable | No | `launchctl asuser <UID> sudo -u <provider>` | Anthropic documents secure credential storage; macOS Keychain behavior and fallback are documented in the Claude Code issue tracker. Live guest check: unknown. |
-| Codex | File-backed by default: `~/.codex/auth.json`; `cli_auth_credentials_store=keyring` changes this | Yes* | `launchctl asuser <UID> sudo -u <provider>` | OpenAI source documents file, keyring, and auto modes. *Yes only with file mode; live opaque-copy check: unknown. |
-| Antigravity/Gemini | Keychain-backed native OS keyring; exact item/path is not a tar source | No | `launchctl asuser <UID> sudo -u <provider>` | Antigravity documentation names the native secure keyring. Live guest check: unknown. |
-| Cursor | Keychain-backed status unverified; exact item/path unknown | No | `launchctl asuser <UID> sudo -u <provider>` | Cursor documents secure local storage but not a stable macOS path. Live guest check: unknown. |
-| Copilot | Keychain-backed by default (`copilot-cli`); plaintext `~/.copilot/config.json` is fallback only when Keychain is unavailable | No* | `launchctl asuser <UID> sudo -u <provider>` | GitHub documents both stores. *No until fallback mode is deliberately selected and tested; live check: unknown. |
-| OpenCode | File-backed: `~/.local/share/opencode/auth.json` | Yes | `launchctl asuser <UID> sudo -u <provider>` | OpenCode documents this path. Live opaque-copy/auth check: unknown. |
+| Claude | `.claude/.credentials.json` **and** `.claude.json` | Yes | `launchctl asuser <UID> sudo -iu <provider>` | Both are required. Either alone reports `"loggedIn": false, "authMethod": "none"`; together, `"loggedIn": true, "authMethod": "claude.ai"`. |
+| Codex | `.codex/auth.json` | Yes | same | Removing it yields `Not logged in`. |
+| Antigravity/Gemini | `.gemini/antigravity-cli/antigravity-oauth-token` | Yes | same | File-backed despite appearances: `agy` *writes* a `gemini` login-Keychain entry after authenticating, yet still fails without the token file. Keychain presence is not evidence of Keychain backing. |
+| Cursor | none found | **No** | same | The measured no. With `.config/cursor/auth.json`, `.cursor/cli-config.json`, and `.cursor/agent-cli-state.json` all in place, `cursor-agent status` still reports `Not logged in`, and no cursor service appears in the login Keychain. File-backed in shape, machine-bound in behavior. |
+| Copilot | `.copilot/config.json` | Yes | same | This falsified the standing prediction. `copilot login --help` advertises the system credential store — the login Keychain on macOS — and copilot was called the most likely Keychain-backed **No**. It is file-backed and a copy works. |
+| OpenCode | `.local/share/opencode/auth.json` | Yes | same | Removing it yields `0 credentials`, at exit status 0. |
 
-Sources: [Claude Code setup](https://docs.anthropic.com/en/docs/claude-code/getting-started),
+The verdicts are recorded in `ops/macos-vm/tar-provision-manifest.json`, which is
+what the macOS queue preflight admits on. Override it with
+`SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST` after re-measuring against a different
+image; a manifest that is absent or unparseable rejects every provider rather
+than guessing.
+
+Vendor documentation, for contrast with what was measured:
+[Claude Code setup](https://docs.anthropic.com/en/docs/claude-code/getting-started),
 [Codex auth storage](https://github.com/openai/codex/blob/main/codex-rs/core/src/config/mod.rs),
 [Antigravity CLI auth](https://antigravity.google/docs/cli-install),
 [Cursor authentication](https://docs.cursor.com/en/cli/reference/authentication),
@@ -287,9 +309,19 @@ host-only address. The guest's baked C-3 pf anchor contains a nested
 `switchyard-transfer/*` anchor; each transfer loads one exact host/port pass
 rule, then flushes it in a `finally` path. Tar bytes never enter `prlctl exec`
 stdin and are never written to host disk. The VM credential hop reads only the
-file-backed Codex/OpenCode stores from the standing Docker vault into memory;
-Keychain-backed providers fail closed before execution rather than being
-reported authenticated from the vault alone.
+five measured-provisionable stores from the standing Docker vault into memory,
+one file at a time, and the backend owns the destination allowlist so a caller
+can pick from the measured layout but never name a path. A provider whose layout
+is only partly present in the vault fails before anything reaches the guest:
+Claude needs two files, and a half-provisioned home reads as authenticated and
+is not. `cursor-agent` fails closed before execution rather than being reported
+authenticated from the vault alone.
+
+Because the VM workspace is created before routing picks a provider, all five
+are seeded at creation time and each adapter's own auth check decides at exec —
+the same contract the Docker lane has. A provider the vault was never logged in
+to is reported, not swallowed, since a silently unauthenticated guest is
+indistinguishable from a working one until a task dies at exec.
 
 ### macOS queue admission and provider preflight
 
@@ -302,20 +334,22 @@ npm run dispatch -- <tasks.md> --project <path> --platform macos
 Before a macOS workspace or VM slot is created, Switchyard reads one routing
 snapshot for every non-terminal capability tier and requires at least one
 funded, adapter-available, tar-provisionable provider for each tier. The
-verified evidence is supplied as a JSON manifest through
-`SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST` (or the equivalent injected runner
-dependency), for example:
+verified evidence is `ops/macos-vm/tar-provision-manifest.json`, which records
+the guest measurement above one provider at a time, with the check that produced
+each verdict. Point `SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST` (or the equivalent
+injected runner dependency) at your own after re-measuring against a different
+image; the minimal accepted shape is:
 
 ```json
 {"verified":true,"providers":["codex","opencode"]}
 ```
 
-No manifest, an unverified manifest, a missing snapshot, or an unsatisfied
+An unverified or unparseable manifest, a missing snapshot, or an unsatisfied
 tier fails closed before admission. This is a launch gate only: quota can drain
 while the queue runs, so passing preflight does not guarantee every later task.
-The current Task 1.3 guest round-trip evidence is still unavailable; therefore
-the default macOS path remains intentionally blocked until that manifest is
-backed by live checks. Docker queues retain their existing preflight no-op.
+Until the shipped manifest existed there was nothing to point at and the default
+macOS path rejected every provider with `tar_provisionability_unverified`.
+Docker queues retain their existing preflight no-op.
 
 ### Running Tests and Linting
 

@@ -19,6 +19,34 @@ const UUID =
 	/^\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?$/i;
 const SAFE_GUEST_PATH = /^\/[A-Za-z0-9._+@%+=:,\-/]*$/;
 const SAFE_USER = /^[A-Za-z_][A-Za-z0-9._-]*$/;
+
+/**
+ * The Task 1.3 credential layout, relative to the provider account's home.
+ *
+ * Every path here was measured inside the guest on 2026-08-14, not inferred
+ * from the CLI's shape: each file was moved aside and the provider's own auth
+ * check re-run through the Aqua session, so a `yes` means that provider
+ * actually authenticated from a copied file. Two results are worth keeping in
+ * view because they invert the obvious guess. **copilot is file-backed** —
+ * `login --help` advertises the system credential store, which on macOS is the
+ * login Keychain, but the token lands in `~/.copilot/config.json` and a copy of
+ * it works. **agy writes a `gemini` Keychain entry after authenticating** and
+ * still fails without its token file, so Keychain presence is not evidence of
+ * Keychain backing.
+ *
+ * `cursor-agent` is deliberately absent. It is the PM3-5 case: file-backed in
+ * shape, machine-bound in behavior. With `.config/cursor/auth.json`,
+ * `.cursor/cli-config.json`, and `.cursor/agent-cli-state.json` all provisioned
+ * it still reported `Not logged in`. A routed VM task must fail here rather
+ * than at exec inside a guest that holds a store the CLI refuses.
+ */
+const VM_CREDENTIAL_LAYOUTS = Object.freeze({
+	claude: Object.freeze([".claude/.credentials.json", ".claude.json"]),
+	codex: Object.freeze([".codex/auth.json"]),
+	agy: Object.freeze([".gemini/antigravity-cli/antigravity-oauth-token"]),
+	copilot: Object.freeze([".copilot/config.json"]),
+	opencode: Object.freeze([".local/share/opencode/auth.json"]),
+});
 const DEFAULT_TRANSFER_HOST = "10.211.55.2";
 // Bind on the Parallels host-only interface. Binding all interfaces leaves
 // the listener reachable from unrelated host networks and was not reachable
@@ -700,6 +728,17 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const user = validateUser(options.providerUser ?? this.providerUser);
 		const resolvedDestination = resolveWorkspacePath(destination, user);
 		validateGuestPath(resolvedDestination, "destination");
+		// A caller that knows exactly which paths it extracted can name them and
+		// skip the recursive sweep below. Credential provisioning must: one of
+		// claude's two files lives at the root of the provider's home, so a
+		// `chown -R` of that destination would descend through the seeded
+		// workspace and everything else the account owns.
+		const chownTargets =
+			Array.isArray(options.chownTargets) && options.chownTargets.length > 0
+				? options.chownTargets.map((value) =>
+						validateGuestPath(resolveWorkspacePath(value, user), "chownTarget"),
+					)
+				: null;
 		const script =
 			`set -o pipefail; /bin/mkdir -p -- ${shellQuote(resolvedDestination)} && ` +
 			`/usr/bin/curl --fail --silent --show-error --location --retry 15 --retry-delay 1 --retry-connrefused --output - TRANSFER_URL | ` +
@@ -727,14 +766,18 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		// extraction is initiated by the provider account. Normalize only the
 		// destination subtree so generated Xcode projects and Git metadata are
 		// writable without weakening the sealed system volume.
-		this._call([
-			"exec",
-			workspaceId,
-			"/usr/sbin/chown",
-			"-R",
-			user,
-			resolvedDestination,
-		]);
+		this._call(
+			chownTargets
+				? ["exec", workspaceId, "/usr/sbin/chown", user, ...chownTargets]
+				: [
+						"exec",
+						workspaceId,
+						"/usr/sbin/chown",
+						"-R",
+						user,
+						resolvedDestination,
+					],
+		);
 		return receipt;
 	}
 
@@ -765,42 +808,72 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	}
 
 	/**
-	 * Provision one Task 1.3 tar-provisionable credential into the provider's
-	 * home. Unknown or non-tar providers fail closed; there is no Keychain copy
-	 * fallback and no guest-side supervisor.
+	 * Provision one Task 1.3 tar-provisionable provider's credential files into
+	 * the provider's home. Unknown or non-tar providers fail closed; there is no
+	 * Keychain copy fallback and no guest-side supervisor.
+	 *
+	 * `credentials` is a list because a provider can need more than one file at
+	 * more than one depth, and the caller supplies each file's bytes while this
+	 * method owns the allowlist — a caller cannot name a destination, only pick
+	 * from the measured layout.
+	 * @param {string} workspaceId VM UUID
+	 * @param {object} options
+	 * @param {string} options.provider Routed provider name
+	 * @param {{file: string, tar: Buffer}[]} options.credentials Home-relative
+	 *   path plus its in-memory tar, one entry per file in the provider's layout
+	 * @param {number|string} [options.aquaUid] Guest Aqua UID
+	 * @param {string} [options.providerUser] Guest provider account
 	 */
 	provisionCredentials(
 		workspaceId,
-		{ provider, tar, aquaUid, providerUser } = {},
+		{ provider, credentials, aquaUid, providerUser } = {},
 	) {
-		const layouts = {
-			codex: { directory: ".codex", file: "auth.json" },
-			opencode: { directory: ".local/share/opencode", file: "auth.json" },
-		};
-		const layout = layouts[String(provider ?? "").toLowerCase()];
+		const providerKey = String(provider ?? "").toLowerCase();
+		const layout = VM_CREDENTIAL_LAYOUTS[providerKey];
 		if (!layout)
 			throw new Error(
 				`provider is not tar-provisionable on macOS: ${provider}`,
 			);
+		const supplied = new Map();
+		for (const entry of Array.isArray(credentials) ? credentials : []) {
+			const file = String(entry?.file ?? "");
+			if (!layout.includes(file))
+				throw new Error(
+					`unexpected credential file for ${providerKey}: ${file}`,
+				);
+			supplied.set(file, entry.tar);
+		}
+		// Every file in the layout, or none. claude is why this is a list and not
+		// a single path: measured in the guest, it reports `"loggedIn": false`
+		// with `.claude.json` alone and with `.claude/.credentials.json` alone.
+		// A partial push would leave a guest that looks provisioned and behaves
+		// unauthenticated, which is the PM3-5 failure the layout exists to stop.
+		for (const file of layout) {
+			if (!supplied.has(file))
+				throw new Error(`missing credential file for ${providerKey}: ${file}`);
+		}
 		const user = validateUser(providerUser ?? this.providerUser);
-		const destination = `/Users/${user}/${layout.directory}`;
-		const credentialPath = `${destination}/${layout.file}`;
-		const receipt = this.pushTar(workspaceId, tar, destination, {
-			aquaUid,
-			providerUser: user,
+		const files = layout.map((file) => {
+			const credentialPath = validateGuestPath(
+				`/Users/${user}/${file}`,
+				"credentialPath",
+			);
+			const receipt = this.pushTar(
+				workspaceId,
+				supplied.get(file),
+				dirname(credentialPath),
+				{ aquaUid, providerUser: user, chownTargets: [credentialPath] },
+			);
+			// The transfer runs as the provider account. This chmod is deliberately
+			// also routed through Aqua so the auth check measures the same identity.
+			this.execGuest(workspaceId, "/bin/chmod", ["600", credentialPath], {
+				cwd: "/",
+				aquaUid,
+				providerUser: user,
+			});
+			return { path: credentialPath, ...receipt };
 		});
-		// The transfer runs as the provider account. This chmod is deliberately
-		// also routed through Aqua so the auth check measures the same identity.
-		this.execGuest(workspaceId, "/bin/chmod", ["600", credentialPath], {
-			cwd: "/",
-			aquaUid,
-			providerUser: user,
-		});
-		return {
-			provider: String(provider).toLowerCase(),
-			path: credentialPath,
-			...receipt,
-		};
+		return { provider: providerKey, files };
 	}
 
 	/** Inspect provider processes from the same Aqua identity as execution. */

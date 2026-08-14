@@ -26,7 +26,7 @@
 // Nothing here talks to Parallels or boots a VM: the probe is rendered, not
 // dispatched.
 
-import { ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import {
 	accessSync,
@@ -40,6 +40,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { VM_TAR_PROVISIONABLE_PROVIDERS } from "../src/switchyard/lifecycle/index.mjs";
+import { createQueueBackend } from "../src/switchyard/runner/index.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
@@ -49,6 +51,7 @@ const BUILD = resolve(VM_OPS, "build-golden-image.sh");
 const GENERATOR = resolve(VM_OPS, "generate-cli-manifest.sh");
 const PROBE = resolve(VM_OPS, "probe-guest-credentials.sh");
 const MANIFEST = resolve(VM_OPS, "cli-manifest.txt");
+const TAR_MANIFEST = resolve(VM_OPS, "tar-provision-manifest.json");
 const DOCKERFILE = resolve(PKG_ROOT, "docker/Dockerfile");
 
 const IS_DARWIN = process.platform === "darwin";
@@ -537,4 +540,152 @@ describe("the guest credential probe", () => {
 			);
 		},
 	);
+});
+
+// The recorded measurement and the code that acts on it are two different
+// files, and they fail in opposite directions when they disagree. A manifest
+// that admits a provider the credential table cannot carry produces the
+// expensive failure the preflight exists to prevent: VM up, slot held, task
+// dead at exec. A manifest that omits one the table can carry silently narrows
+// the routable set with no error anywhere.
+describe("the tar-provision manifest", () => {
+	const manifest = JSON.parse(readFileSync(TAR_MANIFEST, "utf8"));
+
+	it("is what the macOS preflight loads with no env override", () => {
+		const previous = process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST;
+		// Deleted, not emptied: the shipped default is only reached when the
+		// variable is absent, and an empty string would resolve to cwd.
+		delete process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST;
+		try {
+			const backend = createQueueBackend({
+				platform: "macos",
+				dependencies: {
+					preflightReadSnapshot: () => ({
+						snapshot: {
+							schema_version: 2,
+							updated_at: new Date().toISOString(),
+							providers: [
+								{
+									name: "codex",
+									ok: true,
+									windows: [{ percent_left: 80, pace_delta: 1 }],
+								},
+							],
+						},
+						snapshotStatus: "fresh",
+						snapshotMtime: 1,
+						snapshotAgeMsAtRoute: 0,
+					}),
+				},
+			});
+			// A pending task is required: with an empty queue the preflight
+			// returns `no_non_terminal_tasks` before it ever consults the
+			// registry, and this assertion would hold with no manifest at all.
+			// Until 2026-08-14 nothing shipped a manifest, so this call threw
+			// `tar_provisionability_unverified` and every provider was rejected.
+			const result = backend.preflight({
+				tasks: [{ status: "pending", requiredCapability: "high" }],
+			});
+			strictEqual(result.ok, true);
+		} finally {
+			if (previous !== undefined)
+				process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST = previous;
+		}
+	});
+
+	it("admits exactly the providers the credential table can carry", () => {
+		const admitted = Object.entries(manifest.providers)
+			.filter(([, evidence]) => evidence.tarProvisionable === true)
+			.map(([provider]) => provider);
+		deepStrictEqual(admitted, [...VM_TAR_PROVISIONABLE_PROVIDERS]);
+	});
+
+	it("records every provider, including the measured no", () => {
+		deepStrictEqual(
+			Object.keys(manifest.providers).sort(),
+			[...REQUIRED_PROVIDERS].sort(),
+		);
+		// cursor-agent is the reason this column is measured rather than
+		// inferred: file-backed in shape, machine-bound in behavior.
+		strictEqual(manifest.providers["cursor-agent"].tarProvisionable, false);
+		for (const [provider, evidence] of Object.entries(manifest.providers)) {
+			ok(evidence.check, `${provider} records no auth check`);
+			ok(evidence.evidence, `${provider} records no evidence`);
+			strictEqual(
+				evidence.files.length > 0,
+				evidence.tarProvisionable,
+				`${provider} lists files inconsistently with its verdict`,
+			);
+		}
+	});
+});
+
+describe("the macOS queue backend", () => {
+	it("provisions credentials instead of returning null", () => {
+		const provisioned = [];
+		const read = [];
+		const backend = createQueueBackend({
+			platform: "macos",
+			dependencies: {
+				goldenImage: "{golden}",
+				aquaUid: 503,
+				providerUser: "switchyard",
+				executionBackend: {
+					provisionCredentials(workspaceId, options) {
+						provisioned.push({ workspaceId, provider: options.provider });
+						return { provider: options.provider, files: options.credentials };
+					},
+				},
+				// The vault is a Docker container this test must not touch, and a
+				// real read would pull live credential bytes into this process.
+				readCredentialTar: (_agent, src) => {
+					read.push(src);
+					return Buffer.from(src);
+				},
+			},
+		});
+		const report = backend.provision("{vm-uuid}");
+		// Until 2026-08-14 this was `() => null`: the guest booted with no
+		// credentials at all and every provider failed authentication at exec.
+		deepStrictEqual(
+			provisioned.map((call) => call.provider),
+			[...VM_TAR_PROVISIONABLE_PROVIDERS],
+		);
+		strictEqual(provisioned[0].workspaceId, "{vm-uuid}");
+		strictEqual(report.provisioned, read.length);
+		deepStrictEqual(report.skipped, []);
+		// Every source is read out of the standing vault's root home, never off
+		// the host filesystem.
+		for (const src of read) ok(src.startsWith("/root/"));
+	});
+
+	it("reports a provider it could not seed rather than failing the queue", () => {
+		const backend = createQueueBackend({
+			platform: "macos",
+			dependencies: {
+				goldenImage: "{golden}",
+				executionBackend: {
+					provisionCredentials: (_workspaceId, options) => ({
+						provider: options.provider,
+						files: options.credentials,
+					}),
+				},
+				readCredentialTar: (_agent, src) => {
+					if (src.startsWith("/root/.copilot/"))
+						throw new Error(
+							"credential source is absent from the standing vault",
+						);
+					return Buffer.from(src);
+				},
+			},
+		});
+		const report = backend.provision("{vm-uuid}");
+		deepStrictEqual(
+			report.skipped.map((skip) => skip.provider),
+			["copilot"],
+		);
+		// The other four still land: the VM lane seeds before routing, so one
+		// never-logged-in provider must not leave the rest unauthenticated.
+		strictEqual(report.provisioned, 5);
+	});
 });

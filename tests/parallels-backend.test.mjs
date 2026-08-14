@@ -7,6 +7,7 @@ import {
 } from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+	provisionAllCredentialsWithBackend,
 	provisionCredentialsWithBackend,
 	seedProjectWithBackend,
 } from "../src/switchyard/lifecycle/index.mjs";
@@ -115,7 +116,7 @@ describe("Parallels execution backend lifecycle", () => {
 		const backend = {
 			provisionCredentials(workspaceId, options) {
 				calls.push({ workspaceId, options });
-				return { provider: options.provider, bytes: options.tar.length };
+				return { provider: options.provider, files: options.credentials };
 			},
 		};
 		const credential = Buffer.from("opaque-credential-bytes");
@@ -124,14 +125,163 @@ describe("Parallels execution backend lifecycle", () => {
 				provider: "opencode",
 				readCredentialTar: () => credential,
 			}),
-			{ provider: "opencode", bytes: credential.length },
+			{
+				provider: "opencode",
+				files: [{ file: ".local/share/opencode/auth.json", tar: credential }],
+			},
 		);
-		strictEqual(calls[0].options.tar, credential);
+		strictEqual(calls[0].options.credentials[0].tar, credential);
+		// cursor-agent is the measured no: it kept reporting `Not logged in` in
+		// the guest with three candidate stores in place, so it must fail here
+		// rather than at exec inside a provisioned-looking VM.
 		throws(
 			() =>
 				provisionCredentialsWithBackend(backend, "vm-uuid", {
-					provider: "claude",
+					provider: "cursor-agent",
 					readCredentialTar: () => credential,
+				}),
+			/not tar-provisionable/,
+		);
+	});
+
+	it("reads both of claude's credential files from the vault", () => {
+		const read = [];
+		const backend = {
+			provisionCredentials: (_workspaceId, options) => options,
+		};
+		const result = provisionCredentialsWithBackend(backend, "vm-uuid", {
+			provider: "claude",
+			readCredentialTar: (_agent, src) => {
+				read.push(src);
+				return Buffer.from(src);
+			},
+		});
+		deepStrictEqual(read, [
+			"/root/.claude/.credentials.json",
+			"/root/.claude.json",
+		]);
+		deepStrictEqual(
+			result.credentials.map((entry) => entry.file),
+			[".claude/.credentials.json", ".claude.json"],
+		);
+	});
+
+	it("provisions every tar-provisionable provider and reports the skips", () => {
+		const provisioned = [];
+		const skips = [];
+		const backend = {
+			provisionCredentials(_workspaceId, options) {
+				provisioned.push(options.provider);
+				return { provider: options.provider, files: options.credentials };
+			},
+		};
+		// A vault that was never logged in to for one provider must not stop the
+		// others: the VM lane seeds before routing, so one absent store would
+		// otherwise leave four working providers unauthenticated too.
+		const report = provisionAllCredentialsWithBackend(backend, "vm-uuid", {
+			onSkip: (skip) => skips.push(skip),
+			readCredentialTar: (_agent, src) => {
+				if (src.startsWith("/root/.copilot/"))
+					throw new Error(
+						"credential source is absent from the standing vault",
+					);
+				return Buffer.from(src);
+			},
+		});
+		deepStrictEqual(provisioned, ["claude", "codex", "agy", "opencode"]);
+		// claude contributes two files, the other three one each.
+		strictEqual(report.provisioned, 5);
+		deepStrictEqual(
+			report.skipped.map((skip) => skip.provider),
+			["copilot"],
+		);
+		deepStrictEqual(skips, report.skipped);
+	});
+
+	it("writes each measured credential file to its own home-relative path", () => {
+		const prlctlCalls = [];
+		const pushes = [];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 503,
+			providerUser: "switchyard",
+			bulkTransferFn: (descriptor) => {
+				pushes.push(descriptor);
+				return { audited: true };
+			},
+			prlctlFn: (args) => prlctlCalls.push(args),
+		});
+		const receipt = backend.provisionCredentials("{vm-uuid}", {
+			provider: "claude",
+			credentials: [
+				{ file: ".claude/.credentials.json", tar: Buffer.from("cred-a") },
+				{ file: ".claude.json", tar: Buffer.from("cred-b") },
+			],
+			aquaUid: 503,
+		});
+		deepStrictEqual(
+			receipt.files.map((entry) => entry.path),
+			[
+				"/Users/switchyard/.claude/.credentials.json",
+				"/Users/switchyard/.claude.json",
+			],
+		);
+		strictEqual(pushes.length, 2);
+		// Every hop runs through the Aqua session, because that is the identity
+		// whose Keychain and home the provider actually reads at exec time.
+		for (const push of pushes) {
+			ok(push.guestArgs.includes("asuser"));
+			ok(push.guestArgs.includes("503"));
+		}
+		ok(
+			pushes[0].guestArgs.some((value) =>
+				value.includes("/Users/switchyard/.claude"),
+			),
+		);
+		const chowns = prlctlCalls.filter((args) =>
+			args.includes("/usr/sbin/chown"),
+		);
+		// Named targets, never `-R`: the second file lives at the root of the
+		// provider's home, so a recursive chown there would sweep the seeded
+		// workspace and everything else the account owns.
+		strictEqual(chowns.length, 2);
+		for (const chown of chowns) ok(!chown.includes("-R"));
+		deepStrictEqual(chowns[1].at(-1), "/Users/switchyard/.claude.json");
+		const chmods = prlctlCalls.filter((args) => args.includes("/bin/chmod"));
+		strictEqual(chmods.length, 2);
+		for (const chmod of chmods) ok(chmod.includes("600"));
+	});
+
+	it("refuses a partial or unexpected credential set", () => {
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 503,
+			bulkTransferFn: () => ({ audited: true }),
+			prlctlFn: () => "",
+		});
+		// Measured in the guest: claude reports `"loggedIn": false` with either
+		// file alone, so a half-provisioned home looks provisioned and is not.
+		throws(
+			() =>
+				backend.provisionCredentials("{vm-uuid}", {
+					provider: "claude",
+					credentials: [{ file: ".claude.json", tar: Buffer.from("cred") }],
+				}),
+			/missing credential file for claude: \.claude\/\.credentials\.json/,
+		);
+		throws(
+			() =>
+				backend.provisionCredentials("{vm-uuid}", {
+					provider: "codex",
+					credentials: [{ file: "../../etc/passwd", tar: Buffer.from("cred") }],
+				}),
+			/unexpected credential file for codex/,
+		);
+		throws(
+			() =>
+				backend.provisionCredentials("{vm-uuid}", {
+					provider: "cursor-agent",
+					credentials: [
+						{ file: ".cursor/cli-config.json", tar: Buffer.from("cred") },
+					],
 				}),
 			/not tar-provisionable/,
 		);
