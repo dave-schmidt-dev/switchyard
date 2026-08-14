@@ -42,8 +42,12 @@ import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 /** The smallest request that still proves a round trip to the provider. */
 export const LIVENESS_PROMPT = "reply with the single word OK";
 
-/** Generous: a cold provider CLI can take tens of seconds to answer at all. */
-export const LIVENESS_TIMEOUT_MS = 120_000;
+/**
+ * Generous: a cold provider CLI can take tens of seconds to answer at all.
+ * Module-local on purpose — the only consumer is `probeLiveness`'s `timeoutMs`
+ * default below, and exporting it tripped the `deadcode` (knip) gate.
+ */
+const LIVENESS_TIMEOUT_MS = 120_000;
 
 const MAX_REASON_CHARS = 240;
 
