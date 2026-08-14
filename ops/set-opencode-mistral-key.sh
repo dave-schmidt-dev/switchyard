@@ -91,10 +91,32 @@ process.stdin.on("end", () => {
 # `npm run auth:check` — only a real call says whether the key still works, which
 # is exactly the distinction that hid this failure until a canary dispatched.
 echo "set-opencode-mistral-key: verifying with a live call..." >&2
-if docker exec "$CONTAINER" sh -c \
-    'cd /tmp && opencode run --variant high --model mistral/mistral-medium-latest "reply with the single word OK" 2>&1' \
-    | grep -qi "unauthorized\|invalid api key"; then
+verify_status=0
+verify_output=$(docker exec "$CONTAINER" sh -c \
+  'cd /tmp && opencode run --variant high --model mistral/mistral-medium-latest "reply with the single word OK" 2>&1') \
+  || verify_status=$?
+
+# Redact before anything is printed. This is the only place the script emits text
+# it did not author, and a provider diagnostic that echoed the credential back
+# would otherwise land in a terminal or a log. Bash parameter expansion, not sed,
+# so the value never becomes another process's argv.
+verify_output=${verify_output//"$MISTRAL_API_KEY"/[redacted]}
+
+if printf '%s' "$verify_output" | grep -qi "unauthorized\|invalid api key"; then
   echo "set-opencode-mistral-key: key was installed but Mistral rejected it" >&2
+  exit 1
+fi
+
+# Positive assertion, not merely the absence of the one error string I thought of.
+# A network failure, an opencode crash, a retired model, or an empty reply all
+# leave that grep unmatched, so checking only for rejection would print "verified"
+# for a call that never reached Mistral — the same presence-for-liveness
+# substitution this whole script exists to stop making one layer up.
+if [ "$verify_status" -ne 0 ] \
+  || ! printf '%s' "$verify_output" | grep -qE '(^|[^A-Za-z])[Oo][Kk]([^A-Za-z]|$)'; then
+  echo "set-opencode-mistral-key: key installed, but the live call did not confirm it (exit ${verify_status})" >&2
+  echo "--- opencode output (key redacted) ---" >&2
+  printf '%s\n' "$verify_output" >&2
   exit 1
 fi
 echo "set-opencode-mistral-key: verified" >&2
