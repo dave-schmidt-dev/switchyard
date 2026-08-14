@@ -158,11 +158,11 @@ function resolveIdleSeconds(env = process.env) {
 }
 
 /**
- * Build the `docker exec` argv for a supervised `opencode run`. Throws on any
- * argument that fails the shared shell-safety checks so both the sync and async
- * entry points reject identically.
+ * Build the full transport invocation for a supervised `opencode run`. Throws
+ * on any argument that fails the shared shell-safety checks so both the sync
+ * and async entry points reject identically.
  */
-function buildSupervisedArgs(
+function buildSupervisedExecution(
 	workingContainerName,
 	invocationArgs,
 	model,
@@ -170,11 +170,7 @@ function buildSupervisedArgs(
 	options = {},
 ) {
 	validateIdentifier(workingContainerName, "workingContainerName");
-	const { args: workspaceArgs } = getWorkspaceExecution(workingContainerName, {
-		...options,
-	});
-	const args = [
-		...workspaceArgs,
+	const argv = [
 		"sh",
 		"-c",
 		OPENCODE_SUPERVISOR,
@@ -188,11 +184,11 @@ function buildSupervisedArgs(
 	];
 	if (model) {
 		validateModelArg(model, "model");
-		args.push("--model", model);
+		argv.push("--model", model);
 	}
 	// `opencode run` consumes the task message as a positional argument.
-	args.push(guardedPrompt);
-	return args;
+	argv.push(guardedPrompt);
+	return getWorkspaceExecution(workingContainerName, { ...options, argv });
 }
 
 /**
@@ -262,7 +258,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
 	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
-	let args;
+	let execution;
 	try {
 		// Validated ahead of the descriptor so an unsafe container name is still
 		// reported first, as it was before the supervisor wrapper.
@@ -272,7 +268,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		args = buildSupervisedArgs(
+		execution = buildSupervisedExecution(
 			workingContainerName,
 			invocationArgs,
 			model,
@@ -284,10 +280,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 	}
 
 	try {
-		const { command } = getWorkspaceExecution(workingContainerName, {
-			...options,
-		});
-		const result = execFileSync(command, args, {
+		const result = execFileSync(execution.command, execution.args, {
 			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
@@ -349,26 +342,27 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const args = buildSupervisedArgs(
+		const execution = buildSupervisedExecution(
 			workingContainerName,
 			invocationArgs,
 			model,
 			guardedPrompt,
 			options,
 		);
-		const { command } = getWorkspaceExecution(workingContainerName, {
-			...options,
-		});
-		const result = await executeProviderInvocation(command, args, {
-			...options,
-			provider: "opencode",
-			input: guardedPrompt,
-			timeoutMs,
-			signal,
-			onPoll,
-			idleExitCode: IDLE_EXIT_CODE,
-			cleanup: () => killOrphanedProcessesAsync(workingContainerName),
-		});
+		const result = await executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				...options,
+				provider: "opencode",
+				input: guardedPrompt,
+				timeoutMs,
+				signal,
+				onPoll,
+				idleExitCode: IDLE_EXIT_CODE,
+				cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+			},
+		);
 		if (!result.idleTerminated) return result;
 		const { stderr, ...rest } = result;
 		return {

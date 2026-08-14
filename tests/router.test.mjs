@@ -72,6 +72,22 @@ import {
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 
+/**
+ * The Parallels transport ships the guest command as a base64 payload, because
+ * `prlctl exec` cannot carry a byte above 0x7F. Assertions about what the guest
+ * runs have to read the decoded script, not the envelope.
+ * @param {string[]} args prlctl argument vector
+ * @returns {string}
+ */
+function guestText(args) {
+	const match = /^'eval "\$\(printf %s ([A-Za-z0-9+/=]+) \| .*\)"'$/.exec(
+		args.at(-1) ?? "",
+	);
+	if (!match) return args.join(" ");
+	const decoded = Buffer.from(match[1], "base64").toString("utf8");
+	return `${args.slice(0, -1).join(" ")} ${decoded}`;
+}
+
 // Isolated per-process temp snapshot (see resolveSnapshotPath() in
 // src/switchyard/router/index.mjs). This file and tests/runner.test.mjs both
 // exercise the real snapshot loader, and `node --test` runs test files
@@ -851,7 +867,7 @@ describe("Task 4.3 timeout boundaries", () => {
 			aquaUid: 501,
 			prlctlFn: (args) => {
 				calls.push(args);
-				if (args.includes("/bin/cat")) return "4321\n";
+				if (guestText(args).includes("/bin/cat")) return "4321\n";
 				return "ok";
 			},
 		});
@@ -863,21 +879,19 @@ describe("Task 4.3 timeout boundaries", () => {
 		);
 		strictEqual(cleanup.pid, 4321);
 		strictEqual(
-			calls.findIndex((args) => args.includes("/project/.git/index.lock")) >
-				calls.findIndex((args) => args.includes("switchyard-kill-tree")),
+			calls.findIndex((args) =>
+				guestText(args).includes("/project/.git/index.lock"),
+			) >
+				calls.findIndex((args) =>
+					guestText(args).includes("switchyard-kill-tree"),
+				),
 			true,
 		);
-		ok(
-			calls
-				.find((args) => args.includes("switchyard-kill-tree"))
-				.join(" ")
-				.includes("signal_tree TERM") &&
-				!calls
-					.find((args) => args.includes("switchyard-kill-tree"))
-					.join(" ")
-					.includes("kill -1"),
+		const killCall = guestText(
+			calls.find((args) => guestText(args).includes("switchyard-kill-tree")),
 		);
-		ok(!calls.some((args) => args.includes("destroy")));
+		ok(killCall.includes("signal_tree TERM") && !killCall.includes("kill -1"));
+		ok(!calls.some((args) => guestText(args).includes("destroy")));
 		strictEqual(statuses.at(-1), "provider_cleanup_complete");
 	});
 
@@ -887,8 +901,8 @@ describe("Task 4.3 timeout boundaries", () => {
 			aquaUid: 501,
 			prlctlFn: (args) => {
 				calls.push(args);
-				if (args.includes("/bin/cat")) return "4321\n";
-				if (args.includes("switchyard-kill-tree")) {
+				if (guestText(args).includes("/bin/cat")) return "4321\n";
+				if (guestText(args).includes("switchyard-kill-tree")) {
 					throw new Error("guest provider survived cleanup");
 				}
 				return "ok";
@@ -899,7 +913,11 @@ describe("Task 4.3 timeout boundaries", () => {
 			() => backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"]),
 			/guest provider survived cleanup/,
 		);
-		ok(!calls.some((args) => args.includes("/project/.git/index.lock")));
+		ok(
+			!calls.some((args) =>
+				guestText(args).includes("/project/.git/index.lock"),
+			),
+		);
 	});
 });
 

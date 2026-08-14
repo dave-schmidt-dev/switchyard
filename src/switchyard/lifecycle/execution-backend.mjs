@@ -34,14 +34,38 @@ function abstractMethod(name) {
 }
 
 /**
+ * Reject anything that is not a complete command vector. Every backend runs
+ * this before building a transport, so a caller that forgets to pass `argv`
+ * fails at the seam instead of producing a prefix that runs nothing.
+ * @param {unknown} argv
+ * @returns {string[]}
+ */
+export function normalizeExecArgv(argv) {
+	if (!Array.isArray(argv) || argv.length === 0) {
+		throw new TypeError("execArgv requires a non-empty argv command vector");
+	}
+	if (argv.some((entry) => typeof entry !== "string")) {
+		throw new TypeError("execArgv command vector entries must be strings");
+	}
+	return [...argv];
+}
+
+/**
  * Contract implemented by every workspace execution substrate.
  *
- * `execArgv` returns the transport command and its workspace prefix; callers
- * append the provider command and arguments. The backend owns `cwd`: honoring
- * it is not optional transport behavior. In particular, `prlctl exec` carries
- * no working-directory field and lands in a different launchd domain than the
- * Aqua domain in which a provider must run, so a VM backend must enforce both
- * the directory and execution domain itself.
+ * `execArgv` takes the *complete* command vector and returns the transport
+ * command and the full argument list to run it. It does not return a bare
+ * prefix for callers to append to: `prlctl exec` joins its argument vector
+ * into one string that the guest re-parses as shell source, so a transport
+ * that never sees the provider argv cannot quote it, and any argument
+ * carrying a space or newline — which is every prompt — is silently
+ * word-split into different commands. Passing the whole vector through the
+ * seam is what lets a backend quote it exactly once.
+ *
+ * The backend also owns `cwd`: honoring it is not optional transport
+ * behavior. `prlctl exec` carries no working-directory field and lands in a
+ * different launchd domain than the Aqua domain in which a provider must run,
+ * so a VM backend must enforce both the directory and execution domain itself.
  * @public
  */
 export class ExecutionBackend {
@@ -53,8 +77,8 @@ export class ExecutionBackend {
 		return abstractMethod("create", args);
 	}
 
-	execArgv(workspaceId, { cwd = "/project" } = {}) {
-		return abstractMethod("execArgv", [workspaceId, { cwd }]);
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return abstractMethod("execArgv", [workspaceId, { cwd, argv }]);
 	}
 
 	pushTar(...args) {
@@ -106,12 +130,15 @@ export class DockerExecutionBackend extends ExecutionBackend {
 		);
 	}
 
-	execArgv(workspaceId, { cwd = "/project" } = {}) {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		const command = normalizeExecArgv(argv);
 		return {
 			command: "docker",
 			// Keep stdin attached for provider prompts. This is part of the
 			// Docker transport prefix; VM backends must not receive this flag.
-			args: ["exec", "-i", "-w", cwd, workspaceId],
+			// `docker exec` passes its argument vector through execve without a
+			// shell, so the command vector needs no quoting here.
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...command],
 		};
 	}
 

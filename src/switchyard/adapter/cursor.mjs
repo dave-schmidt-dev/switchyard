@@ -109,12 +109,7 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	const { command, args: workspaceArgs } = getWorkspaceExecution(
-		workingContainerName,
-		options,
-	);
-	const args = [
-		...workspaceArgs,
+	const argv = [
 		CURSOR_CMD,
 		"--print",
 		"--force",
@@ -128,9 +123,13 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 		} catch (error) {
 			return { output: "", success: false, error: error.message };
 		}
-		args.push("--model", model);
+		argv.push("--model", model);
 	}
-	args.push(guardedPrompt);
+	argv.push(guardedPrompt);
+	const { command, args } = getWorkspaceExecution(workingContainerName, {
+		...options,
+		argv,
+	});
 
 	try {
 		const result = execFileSync(command, args, {
@@ -188,12 +187,7 @@ export async function executeCursorAsync(
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const { command, args: workspaceArgs } = getWorkspaceExecution(
-			workingContainerName,
-			options,
-		);
-		const args = [
-			...workspaceArgs,
+		const argv = [
 			CURSOR_CMD,
 			"--print",
 			"--force",
@@ -203,9 +197,13 @@ export async function executeCursorAsync(
 		];
 		if (model) {
 			validateModelArg(model, "model");
-			args.push("--model", model);
+			argv.push("--model", model);
 		}
-		args.push(guardedPrompt);
+		argv.push(guardedPrompt);
+		const { command, args } = getWorkspaceExecution(workingContainerName, {
+			...options,
+			argv,
+		});
 		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "cursor",

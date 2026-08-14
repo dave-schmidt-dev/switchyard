@@ -5,6 +5,7 @@ import {
 	strictEqual,
 	throws,
 } from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { describe, it } from "node:test";
 import {
 	provisionAllCredentialsWithBackend,
@@ -22,6 +23,21 @@ import {
 const GOLDEN_UUID = "{11111111-1111-4111-8111-111111111111}";
 const WORK_UUID = "{22222222-2222-4222-8222-222222222222}";
 
+/**
+ * Recover the script the guest will actually run. `prlctl exec` cannot carry a
+ * byte above 0x7F, so the transport ships a base64 payload; a test that reads
+ * the argv without decoding is asserting on the envelope, not the command.
+ * @param {string[]} args prlctl argument vector
+ * @returns {string}
+ */
+function decodeGuestScript(args) {
+	const match = /^'eval "\$\(printf %s ([A-Za-z0-9+/=]+) \| .*\)"'$/.exec(
+		args.at(-1),
+	);
+	ok(match, `no base64 payload in ${args.at(-1)}`);
+	return Buffer.from(match[1], "base64").toString("utf8");
+}
+
 function listed(entries) {
 	return [
 		"uuid\tstatus\tname",
@@ -32,9 +48,12 @@ function listed(entries) {
 describe("Parallels execution backend lifecycle", () => {
 	it("builds an Aqua execution prefix with cwd and no Docker flags", () => {
 		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
-		const execution = backend.execArgv("{vm-uuid}", { cwd: "/project/subdir" });
+		const execution = backend.execArgv("{vm-uuid}", {
+			cwd: "/project/subdir",
+			argv: ["true"],
+		});
 		strictEqual(execution.command, "prlctl");
-		deepStrictEqual(execution.args.slice(0, 9), [
+		deepStrictEqual(execution.args.slice(0, 13), [
 			"exec",
 			"{vm-uuid}",
 			"launchctl",
@@ -43,15 +62,119 @@ describe("Parallels execution backend lifecycle", () => {
 			"sudo",
 			"-u",
 			"switchyard",
+			"/usr/bin/env",
+			"HOME=/Users/switchyard",
+			"USER=switchyard",
+			"LOGNAME=switchyard",
 			"/bin/bash",
 		]);
 		ok(!execution.args.includes("-i"));
-		ok(
-			execution.args.some((value) =>
-				value.includes("/.switchyard/project/subdir"),
-			),
+		const script = decodeGuestScript(execution.args);
+		ok(script.startsWith("cd '/Users/switchyard/.switchyard/project/subdir'"));
+		ok(script.endsWith("&& exec 'true'"));
+	});
+
+	// `prlctl exec` joins its argument vector with spaces and the guest applies
+	// exactly one round of shell parsing to the result. Proven live 2026-08-14:
+	// a supervised `opencode run` was truncated to its first word, `set`, which
+	// dumped the environment and exited 0 — a provider that never ran, reported
+	// as a successful execution with an empty diff.
+	//
+	// So the property under test is not "the arguments are present" but "the
+	// arguments survive the joining and re-parse byte for byte". Emulate that
+	// trip locally: join the transport argv, hand it to a real `/bin/sh`, and
+	// assert the command vector comes back out unchanged.
+	it("round-trips a command vector through prlctl's join-and-reparse", () => {
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		const argv = [
+			"sh",
+			"-c",
+			"set -u\nprintf '%s\\n' \"$@\"\n",
+			"sh",
+			"a prompt with spaces",
+			"it's got a single quote",
+			"and\na newline",
+			"$(touch /tmp/pwned)",
+			"x".repeat(4096),
+		];
+		const { args } = backend.execArgv("{vm-uuid}", { argv });
+		// Emulate the whole trip, not just the tail: prlctl joins *every*
+		// argument into one string, so an unquoted newline anywhere terminates
+		// the guest's command line and turns the remainder into separate
+		// commands. Parsing only one slice would not observe that.
+		const envelope = execFileSync(
+			"/bin/sh",
+			["-c", `printf '%s\\0' ${args.join(" ")}`],
+			{ encoding: "utf8", maxBuffer: 1024 * 1024 },
+		)
+			.split("\0")
+			.slice(0, -1);
+		// One command, one word per transport argument.
+		strictEqual(envelope.length, args.length);
+		// The provider account's environment is established as argv, before bash
+		// starts, so `-l` reads the right profile and providers do not fall back
+		// to a read-only `/` for their caches.
+		deepStrictEqual(envelope.slice(0, 12), [
+			"exec",
+			"{vm-uuid}",
+			"launchctl",
+			"asuser",
+			"501",
+			"sudo",
+			"-u",
+			"switchyard",
+			"/usr/bin/env",
+			"HOME=/Users/switchyard",
+			"USER=switchyard",
+			"LOGNAME=switchyard",
+		]);
+		// And the decoded payload parses to the command vector byte for byte.
+		const script = decodeGuestScript(args);
+		const launch = script.slice(
+			script.indexOf(" && exec '") + " && exec ".length,
 		);
-		strictEqual(execution.args.at(-1), "--");
+		const recovered = execFileSync(
+			"/bin/sh",
+			["-c", `printf '%s\\0' ${launch}`],
+			{ encoding: "utf8", maxBuffer: 1024 * 1024 },
+		)
+			.split("\0")
+			.slice(0, -1);
+		deepStrictEqual(recovered, argv);
+	});
+
+	// `prlctl exec` cannot carry a byte above 0x7F. Proven live 2026-08-14
+	// against switchyard-debug-1: an em dash, a curly quote, an accented name,
+	// CJK and an emoji each corrupted the command line the guest rebuilt, which
+	// surfaced as `unexpected EOF while looking for matching '` rather than as
+	// mangled text. One em dash in a comment inside the opencode supervisor was
+	// enough to stop the provider from starting at all.
+	it("keeps every transport byte inside ASCII", () => {
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		const argv = [
+			"opencode",
+			"run",
+			"Rewrite café — 日本 🙂 and don't drop the ’curly’ quotes",
+		];
+		const { args } = backend.execArgv("{vm-uuid}", { argv });
+		for (const entry of args) {
+			// One UTF-8 byte per code unit is true only when every byte is ASCII.
+			ok(
+				Buffer.byteLength(entry, "utf8") === entry.length,
+				`non-ASCII byte reached prlctl argv: ${JSON.stringify(entry)}`,
+			);
+		}
+		ok(decodeGuestScript(args).endsWith(`'${argv[2].replace(/'/g, "'\\''")}'`));
+	});
+
+	it("refuses a transport with no command vector", () => {
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		throws(() => backend.execArgv("{vm-uuid}", {}), /non-empty argv/);
+		throws(() => backend.execArgv("{vm-uuid}", { argv: [] }), /non-empty argv/);
+		throws(
+			() => backend.execArgv("{vm-uuid}", { argv: ["ok", 7] }),
+			/must be strings/,
+		);
 	});
 
 	it("quotes bash scripts before passing them through prlctl", () => {
@@ -67,11 +190,12 @@ describe("Parallels execution backend lifecycle", () => {
 			"-lc",
 			"if test -e /tmp/x; then echo yes; fi",
 		]);
-		deepStrictEqual(calls[0].slice(-3), [
-			"/bin/bash",
-			"-lc",
-			"'if test -e /tmp/x; then echo yes; fi'",
-		]);
+		strictEqual(calls[0].at(-2), "-lc");
+		strictEqual(
+			decodeGuestScript(calls[0]),
+			"cd '/Users/switchyard/.switchyard/project' && exec '/bin/bash' '-lc' " +
+				"'if test -e /tmp/x; then echo yes; fi'",
+		);
 	});
 
 	it("uses the bulk transfer hook without sending tar bytes to prlctl", () => {
@@ -233,8 +357,8 @@ describe("Parallels execution backend lifecycle", () => {
 			ok(push.guestArgs.includes("503"));
 		}
 		ok(
-			pushes[0].guestArgs.some((value) =>
-				value.includes("/Users/switchyard/.claude"),
+			decodeGuestScript(pushes[0].guestArgs).includes(
+				"/Users/switchyard/.claude",
 			),
 		);
 		const chowns = prlctlCalls.filter((args) =>
@@ -246,9 +370,11 @@ describe("Parallels execution backend lifecycle", () => {
 		strictEqual(chowns.length, 2);
 		for (const chown of chowns) ok(!chown.includes("-R"));
 		deepStrictEqual(chowns[1].at(-1), "/Users/switchyard/.claude.json");
-		const chmods = prlctlCalls.filter((args) => args.includes("/bin/chmod"));
+		const chmods = prlctlCalls
+			.map((args) => (args.at(-2) === "-lc" ? decodeGuestScript(args) : ""))
+			.filter((script) => script.includes("'/bin/chmod'"));
 		strictEqual(chmods.length, 2);
-		for (const chmod of chmods) ok(chmod.includes("600"));
+		for (const chmod of chmods) ok(chmod.includes("'600'"));
 	});
 
 	it("refuses a partial or unexpected credential set", () => {
@@ -287,7 +413,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
-	it("seeds a backend through pushTar and its execution prefix", () => {
+	it("seeds a backend through pushTar and its execution seam", () => {
 		const calls = [];
 		const backend = {
 			pushTar(workspaceId, tar, destination) {
@@ -302,7 +428,11 @@ describe("Parallels execution backend lifecycle", () => {
 		const receipt = seedProjectWithBackend(backend, "vm-uuid", process.cwd());
 		ok(receipt.bytes > 0);
 		strictEqual(calls[0].destination, "/project");
-		deepStrictEqual(calls[1].options, { cwd: "/project" });
+		strictEqual(calls[1].options.cwd, "/project");
+		// The baseline commit is handed to the backend as a command vector, not
+		// appended to a prefix the backend never sees and so cannot quote.
+		deepStrictEqual(calls[1].options.argv.slice(0, 2), ["/bin/bash", "-lc"]);
+		ok(calls[1].options.argv[2].startsWith("git init -q"));
 	});
 
 	it("uses the reserved run-and-pid grammar and rejects malformed ownership", () => {

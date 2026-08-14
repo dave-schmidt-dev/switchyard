@@ -586,12 +586,9 @@ export function seedProjectWithBackend(
 	} else {
 		const execution = executionBackend.execArgv(workspaceId, {
 			cwd: "/project",
+			argv: ["/bin/bash", "-lc", script],
 		});
-		execFileSync(
-			execution.command,
-			[...execution.args, "/bin/bash", "-lc", script],
-			{ stdio: "pipe" },
-		);
+		execFileSync(execution.command, execution.args, { stdio: "pipe" });
 	}
 	return receipt;
 }

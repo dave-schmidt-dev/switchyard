@@ -4058,12 +4058,13 @@ function runBackendGitCommand(executionBackend, workspaceId, script) {
 		});
 		return { status: 0 };
 	}
-	const prefix = executionBackend.execArgv(workspaceId, { cwd: "/project" });
-	const result = spawnSync(
-		prefix.command,
-		[...prefix.args, "/bin/bash", "-lc", `cd /project && ${script}`],
-		{ stdio: "pipe" },
-	);
+	const execution = executionBackend.execArgv(workspaceId, {
+		cwd: "/project",
+		argv: ["/bin/bash", "-lc", `cd /project && ${script}`],
+	});
+	const result = spawnSync(execution.command, execution.args, {
+		stdio: "pipe",
+	});
 	if (result.status !== 0) {
 		throw new Error(
 			`backend workspace command failed (${result.status ?? result.signal ?? "unknown"})`,

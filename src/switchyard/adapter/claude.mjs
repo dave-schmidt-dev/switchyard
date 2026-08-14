@@ -135,12 +135,7 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	const { command, args: workspaceArgs } = getWorkspaceExecution(
-		workingContainerName,
-		options,
-	);
-	const args = [
-		...workspaceArgs,
+	const argv = [
 		CLAUDE_CMD,
 		// Non-interactive dispatch (Task 25). claude's default is an interactive
 		// TUI session; -p/--print makes it process the piped prompt and exit,
@@ -170,8 +165,12 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 		} catch (error) {
 			return { output: "", success: false, error: error.message };
 		}
-		args.push("--model", model);
+		argv.push("--model", model);
 	}
+	const { command, args } = getWorkspaceExecution(workingContainerName, {
+		...options,
+		argv,
+	});
 
 	try {
 		const result = execFileSync(command, args, {
@@ -233,12 +232,7 @@ export async function executeClaudeAsync(
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const { command, args: workspaceArgs } = getWorkspaceExecution(
-			workingContainerName,
-			options,
-		);
-		const args = [
-			...workspaceArgs,
+		const argv = [
 			CLAUDE_CMD,
 			"--print",
 			"--permission-mode",
@@ -247,8 +241,12 @@ export async function executeClaudeAsync(
 		];
 		if (model) {
 			validateModelArg(model, "model");
-			args.push("--model", model);
+			argv.push("--model", model);
 		}
+		const { command, args } = getWorkspaceExecution(workingContainerName, {
+			...options,
+			argv,
+		});
 		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "claude",

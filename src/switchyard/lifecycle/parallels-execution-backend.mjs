@@ -9,7 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
 
-import { ExecutionBackend } from "./execution-backend.mjs";
+import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 const DEFAULT_AQUA_TIMEOUT_MS = 30_000;
@@ -54,6 +54,11 @@ const DEFAULT_TRANSFER_HOST = "10.211.55.2";
 const DEFAULT_TRANSFER_LISTEN_HOST = DEFAULT_TRANSFER_HOST;
 const MAX_TRANSFER_BYTES = 512 * 1024 * 1024;
 const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
+// The bulk-transfer URL is only known once the helper has bound its ephemeral
+// port, so it reaches the guest as a plaintext argv assignment that the helper
+// substitutes. The variable name deliberately does not contain the placeholder
+// token, or the substitution would rewrite the name along with the value.
+const XFER_URL_ASSIGNMENT = "SWITCHYARD_XFER_URL=TRANSFER_URL";
 const INDEX_LOCK_PATH = "/project/.git/index.lock";
 const KILL_GUEST_PROCESS_TREE = String.raw`
 set -eu
@@ -254,12 +259,41 @@ function validateUser(value) {
 	return value;
 }
 
+/**
+ * The provider account's home directory. `prlctl exec` enters the guest with
+ * `HOME=/`, and macOS sudoers preserves it across `sudo -u`, so `-H` does not
+ * override it. Everything that has to agree on one home — credential
+ * provisioning, the login shell's profile, and the provider's own cache and
+ * config directories — resolves it here.
+ * @param {string} providerUser
+ * @returns {string}
+ */
+function providerHomePath(providerUser) {
+	return `/Users/${validateUser(providerUser)}`;
+}
+
 function resolveWorkspacePath(value, providerUser) {
 	const user = validateUser(providerUser);
-	const physicalRoot = `/Users/${user}/.switchyard/project`;
+	const physicalRoot = `${providerHomePath(user)}/.switchyard/project`;
 	if (value === "/project") return physicalRoot;
 	if (value.startsWith("/project/")) {
 		return `${physicalRoot}${value.slice("/project".length)}`;
+	}
+	return value;
+}
+
+/**
+ * A `KEY=value` assignment that survives prlctl's join-and-reparse untouched:
+ * printable ASCII only, and no character the guest's single parse would act on.
+ * @param {string} value
+ * @returns {string}
+ */
+function validateEnvAssignment(value) {
+	if (
+		typeof value !== "string" ||
+		!/^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._+@%=:,/-]*$/.test(value)
+	) {
+		throw new Error("env assignment must be a safe KEY=value pair");
 	}
 	return value;
 }
@@ -547,18 +581,54 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return outputText(this._call(["--version"])).trim();
 	}
 
+	/**
+	 * Build the complete prlctl argument vector for one guest command.
+	 *
+	 * Two properties of `prlctl exec` shape this, both measured against a live
+	 * guest rather than assumed:
+	 *
+	 * 1. It does not pass its argument vector through. It joins the arguments
+	 *    with spaces and the guest applies exactly one round of shell parsing
+	 *    to the result, so an unquoted prompt is word-split at its first space
+	 *    and the tail of a multi-line argument runs as separate commands.
+	 * 2. It cannot carry a byte above 0x7F. Every multi-byte UTF-8 character —
+	 *    an em dash, a curly quote, an accented name, CJK, an emoji — corrupts
+	 *    the command line the guest reconstructs, which surfaces as an
+	 *    unbalanced-quote syntax error rather than as mangled text.
+	 *
+	 * So the guest command is shell-quoted here and then base64-encoded, and
+	 * what crosses the boundary is only the base64 alphabet. Callers append
+	 * nothing: `argv` is the whole command, because a transport that never
+	 * sees the full vector cannot encode it.
+	 *
+	 * @param {string} workspaceId
+	 * @param {string[]} argv complete guest command vector
+	 * @param {{cwd?: string, aquaUid?: string|number, providerUser?: string,
+	 *          recordPid?: boolean, env?: string[]}} [options]
+	 * @returns {string[]}
+	 */
 	_buildAquaExecArgs(
 		workspaceId,
-		{ cwd = "/project", aquaUid, providerUser, recordPid = false } = {},
+		argv,
+		{
+			cwd = "/project",
+			aquaUid,
+			providerUser,
+			recordPid = false,
+			env = [],
+		} = {},
 	) {
+		const command = normalizeExecArgv(argv);
 		const uid = validateUid(aquaUid ?? this.aquaUid);
 		const user = validateUser(providerUser ?? this.providerUser);
 		const resolvedCwd = resolveWorkspacePath(cwd, user);
 		validateGuestPath(resolvedCwd, "cwd");
 		const pidPath = providerPidMarkerPath(workspaceId);
-		const shell = recordPid
-			? `cd ${shellQuote(resolvedCwd)} && trap 'rm -f -- ${shellQuote(pidPath)}' EXIT && echo $$ > ${shellQuote(pidPath)} && exec "$@"`
-			: `cd ${shellQuote(resolvedCwd)} && exec "$@"`;
+		const launch = `exec ${command.map((entry) => shellQuote(entry)).join(" ")}`;
+		const inner = recordPid
+			? `cd ${shellQuote(resolvedCwd)} && trap 'rm -f -- ${shellQuote(pidPath)}' EXIT && echo $$ > ${shellQuote(pidPath)} && ${launch}`
+			: `cd ${shellQuote(resolvedCwd)} && ${launch}`;
+		const payload = Buffer.from(inner, "utf8").toString("base64");
 		return [
 			"exec",
 			workspaceId,
@@ -568,25 +638,39 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			"sudo",
 			"-u",
 			user,
+			// The account's environment has to be established before bash starts,
+			// not inside the -c script: `-l` sources /etc/profile and then
+			// $HOME/.bash_profile *first*, and with the inherited HOME=/ it would
+			// read the wrong profile and leave providers writing their caches to a
+			// read-only /.
+			"/usr/bin/env",
+			`HOME=${providerHomePath(user)}`,
+			`USER=${user}`,
+			`LOGNAME=${user}`,
+			// Extra assignments stay outside the base64 payload so a value that is
+			// only known once the transport is running — the bulk-transfer URL and
+			// its ephemeral port — can still be substituted into the argv.
+			...env.map((entry) => validateEnvAssignment(entry)),
 			"/bin/bash",
 			"-lc",
-			shellQuote(shell),
-			// Parallels includes a named bash placeholder in "$@". `--` is the
-			// conventional `$0` sentinel and keeps only the provider command in
-			// the executed argument vector.
-			"--",
+			// The decode runs in a command substitution, so the provider still
+			// inherits this process's stdin, stdout, stderr and exit status.
+			shellQuote(`eval "$(printf %s ${payload} | /usr/bin/base64 -D)"`),
 		];
 	}
 
 	/**
-	 * Return the exact provider transport prefix. The command appended by the
-	 * caller runs in the provider's Aqua session and inherits its stdin,
-	 * stdout, stderr, exit status, and killable prlctl process handle.
+	 * Return the exact transport for one provider command. It runs in the
+	 * provider's Aqua session and inherits its stdin, stdout, stderr, exit
+	 * status, and killable prlctl process handle.
 	 */
-	execArgv(workspaceId, { cwd = "/project", aquaUid, providerUser } = {}) {
+	execArgv(
+		workspaceId,
+		{ cwd = "/project", aquaUid, providerUser, argv } = {},
+	) {
 		return {
 			command: "prlctl",
-			args: this._buildAquaExecArgs(workspaceId, {
+			args: this._buildAquaExecArgs(workspaceId, argv, {
 				cwd,
 				aquaUid,
 				providerUser,
@@ -615,18 +699,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
 			throw new TypeError("guest command arguments must be strings");
 		}
-		const guestArgs = [...args];
-		if (
-			command === "/bin/bash" &&
-			guestArgs[0] === "-lc" &&
-			typeof guestArgs[1] === "string"
-		) {
-			// prlctl reparses shell metacharacters in the bash script argument.
-			// Quote the script so conditionals and pipelines reach bash intact.
-			guestArgs[1] = shellQuote(guestArgs[1]);
-		}
 		return this._call(
-			[...this._buildAquaExecArgs(workspaceId, options), command, ...guestArgs],
+			this._buildAquaExecArgs(workspaceId, [command, ...args], options),
 			options.prlctlOptions ?? {},
 		);
 	}
@@ -741,21 +815,25 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				: null;
 		const script =
 			`set -o pipefail; /bin/mkdir -p -- ${shellQuote(resolvedDestination)} && ` +
-			`/usr/bin/curl --fail --silent --show-error --location --retry 15 --retry-delay 1 --retry-connrefused --output - TRANSFER_URL | ` +
+			`/usr/bin/curl --fail --silent --show-error --location --retry 15 --retry-delay 1 --retry-connrefused --output - "$SWITCHYARD_XFER_URL" | ` +
 			`/usr/bin/tar -xpf - -C ${shellQuote(resolvedDestination)}`;
 		const guestArgs =
 			options.providerUser || options.aquaUid
-				? [
-						...this._buildAquaExecArgs(workspaceId, {
-							cwd: "/",
-							aquaUid: options.aquaUid,
-							providerUser: options.providerUser,
-						}),
+				? this._buildAquaExecArgs(workspaceId, ["/bin/bash", "-lc", script], {
+						cwd: "/",
+						aquaUid: options.aquaUid,
+						providerUser: options.providerUser,
+						env: [XFER_URL_ASSIGNMENT],
+					})
+				: [
+						"exec",
+						workspaceId,
+						"/usr/bin/env",
+						XFER_URL_ASSIGNMENT,
 						"/bin/bash",
 						"-lc",
 						shellQuote(script),
-					]
-				: ["exec", workspaceId, "/bin/bash", "-lc", shellQuote(script)];
+					];
 		const receipt = this._runBulkTransfer({
 			direction: "push",
 			workspaceId,
@@ -790,20 +868,24 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const name = basename(resolvedSourcePath);
 		const script =
 			`/usr/bin/tar -cpf - -C ${shellQuote(parent)} ${shellQuote(name)} | ` +
-			`/usr/bin/curl --fail --silent --show-error --request PUT --data-binary @- TRANSFER_URL`;
+			`/usr/bin/curl --fail --silent --show-error --request PUT --data-binary @- "$SWITCHYARD_XFER_URL"`;
 		const guestArgs =
 			options.providerUser || options.aquaUid
-				? [
-						...this._buildAquaExecArgs(workspaceId, {
-							cwd: "/",
-							aquaUid: options.aquaUid,
-							providerUser: options.providerUser,
-						}),
+				? this._buildAquaExecArgs(workspaceId, ["/bin/bash", "-lc", script], {
+						cwd: "/",
+						aquaUid: options.aquaUid,
+						providerUser: options.providerUser,
+						env: [XFER_URL_ASSIGNMENT],
+					})
+				: [
+						"exec",
+						workspaceId,
+						"/usr/bin/env",
+						XFER_URL_ASSIGNMENT,
 						"/bin/bash",
 						"-lc",
 						shellQuote(script),
-					]
-				: ["exec", workspaceId, "/bin/bash", "-lc", shellQuote(script)];
+					];
 		return this._runBulkTransfer({ direction: "pull", workspaceId, guestArgs });
 	}
 
@@ -855,7 +937,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const user = validateUser(providerUser ?? this.providerUser);
 		const files = layout.map((file) => {
 			const credentialPath = validateGuestPath(
-				`/Users/${user}/${file}`,
+				`${providerHomePath(user)}/${file}`,
 				"credentialPath",
 			);
 			const receipt = this.pushTar(
@@ -878,12 +960,13 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	/** Inspect provider processes from the same Aqua identity as execution. */
 	inspectProcess(workspaceId) {
-		return this._call([
-			...this._buildAquaExecArgs(workspaceId, { cwd: "/" }),
-			"/bin/ps",
-			"-axo",
-			"pid=,command=",
-		]);
+		return this._call(
+			this._buildAquaExecArgs(
+				workspaceId,
+				["/bin/ps", "-axo", "pid=,command="],
+				{ cwd: "/" },
+			),
+		);
 	}
 
 	/**

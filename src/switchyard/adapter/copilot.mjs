@@ -75,12 +75,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	const { command, args: workspaceArgs } = getWorkspaceExecution(
-		workingContainerName,
-		options,
-	);
-	const args = [
-		...workspaceArgs,
+	const argv = [
 		COPILOT_CMD,
 		"-p",
 		guardedPrompt,
@@ -93,8 +88,12 @@ export function execute(prompt, workingContainerName, options = {}) {
 		} catch (error) {
 			return { output: "", success: false, error: error.message };
 		}
-		args.push("--model", model);
+		argv.push("--model", model);
 	}
+	const { command, args } = getWorkspaceExecution(workingContainerName, {
+		...options,
+		argv,
+	});
 
 	try {
 		const result = execFileSync(command, args, {
@@ -149,12 +148,7 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const { command, args: workspaceArgs } = getWorkspaceExecution(
-			workingContainerName,
-			options,
-		);
-		const args = [
-			...workspaceArgs,
+		const argv = [
 			COPILOT_CMD,
 			"-p",
 			guardedPrompt,
@@ -163,8 +157,12 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 		];
 		if (model) {
 			validateModelArg(model, "model");
-			args.push("--model", model);
+			argv.push("--model", model);
 		}
+		const { command, args } = getWorkspaceExecution(workingContainerName, {
+			...options,
+			argv,
+		});
 		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "copilot",

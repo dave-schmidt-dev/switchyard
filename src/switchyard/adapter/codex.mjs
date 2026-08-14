@@ -128,12 +128,7 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 		return { output: "", success: false, error: error.message };
 	}
 
-	const { command, args: workspaceArgs } = getWorkspaceExecution(
-		workingContainerName,
-		options,
-	);
-	const args = [
-		...workspaceArgs,
+	const argv = [
 		CODEX_CMD,
 		// Codex global `-c key=value` options must precede the `exec`
 		// subcommand. Forward the descriptor's exact argv at this fixed position.
@@ -164,8 +159,12 @@ export function executeCodex(prompt, workingContainerName, options = {}) {
 		} catch (error) {
 			return { output: "", success: false, error: error.message };
 		}
-		args.push("--model", model);
+		argv.push("--model", model);
 	}
+	const { command, args } = getWorkspaceExecution(workingContainerName, {
+		...options,
+		argv,
+	});
 
 	try {
 		const result = execFileSync(command, args, {
@@ -224,12 +223,7 @@ export async function executeCodexAsync(
 			expectedTargetId: options.resolvedTargetId,
 			expectedModel: model,
 		});
-		const { command, args: workspaceArgs } = getWorkspaceExecution(
-			workingContainerName,
-			options,
-		);
-		const args = [
-			...workspaceArgs,
+		const argv = [
 			CODEX_CMD,
 			...invocationArgs,
 			"exec",
@@ -237,8 +231,12 @@ export async function executeCodexAsync(
 		];
 		if (model) {
 			validateModelArg(model, "model");
-			args.push("--model", model);
+			argv.push("--model", model);
 		}
+		const { command, args } = getWorkspaceExecution(workingContainerName, {
+			...options,
+			argv,
+		});
 		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "codex",

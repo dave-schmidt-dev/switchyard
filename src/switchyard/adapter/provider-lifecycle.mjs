@@ -17,16 +17,21 @@ const DEFAULT_DIAGNOSTIC_CHARS = 800;
 const DEFAULT_EXECUTION_BACKEND = new DockerExecutionBackend();
 
 /**
- * Resolve the transport command and workspace prefix for a provider command.
- * The backend owns the command and workspace prefix, including any transport
- * option needed to deliver stdin. Callers never splice Docker- or VM-specific
- * flags into this prefix.
+ * Resolve the complete transport invocation for one provider command. The
+ * backend owns the command, the workspace prefix, any transport option needed
+ * to deliver stdin, and — on a transport that re-parses its argument vector in
+ * the guest — the quoting of `argv`. Callers hand over the whole command
+ * vector and never splice Docker- or VM-specific flags into the result.
+ *
+ * `argv` is mandatory. An adapter that builds the prefix and appends its own
+ * command works on Docker and is silently word-split on the VM lane, so the
+ * seam refuses the shape rather than letting it reach a guest.
  */
 export function getWorkspaceExecution(
 	workspaceId,
-	{ executionBackend = DEFAULT_EXECUTION_BACKEND, cwd = "/project" } = {},
+	{ executionBackend = DEFAULT_EXECUTION_BACKEND, cwd = "/project", argv } = {},
 ) {
-	const execution = executionBackend.execArgv(workspaceId, { cwd });
+	const execution = executionBackend.execArgv(workspaceId, { cwd, argv });
 	return { command: execution.command, args: [...execution.args] };
 }
 
@@ -356,19 +361,19 @@ export async function captureProviderDiffAsync(
 		spawnFn,
 		timeoutMs,
 	};
-	const { command, args: workspaceArgs } = getWorkspaceExecution(
-		workingContainerName,
-		options,
-	);
-	const add = await runProviderProcess(
-		command,
-		[...workspaceArgs, "git", "add", "-A"],
-		lifecycle,
-	);
+	const stage = getWorkspaceExecution(workingContainerName, {
+		...options,
+		argv: ["git", "add", "-A"],
+	});
+	const add = await runProviderProcess(stage.command, stage.args, lifecycle);
 	if (!add.success) return null;
+	const capture = getWorkspaceExecution(workingContainerName, {
+		...options,
+		argv: ["git", "diff", "--cached", "HEAD"],
+	});
 	const diff = await runProviderProcess(
-		command,
-		[...workspaceArgs, "git", "diff", "--cached", "HEAD"],
+		capture.command,
+		capture.args,
 		lifecycle,
 	);
 	return diff.success && /\S/u.test(diff.output) ? diff.output : null;
@@ -382,18 +387,19 @@ export function captureProviderDiff(workingContainerName, options = {}) {
 		return null;
 	}
 	try {
-		const { command, args: workspaceArgs } = getWorkspaceExecution(
-			workingContainerName,
-			options,
-		);
-		execFileSync(command, [...workspaceArgs, "git", "add", "-A"], {
+		const stage = getWorkspaceExecution(workingContainerName, {
+			...options,
+			argv: ["git", "add", "-A"],
+		});
+		execFileSync(stage.command, stage.args, { stdio: "pipe" });
+		const capture = getWorkspaceExecution(workingContainerName, {
+			...options,
+			argv: ["git", "diff", "--cached", "HEAD"],
+		});
+		const diff = execFileSync(capture.command, capture.args, {
+			encoding: "utf8",
 			stdio: "pipe",
 		});
-		const diff = execFileSync(
-			command,
-			[...workspaceArgs, "git", "diff", "--cached", "HEAD"],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
 		return /\S/u.test(diff) ? diff : null;
 	} catch {
 		return null;
