@@ -67,21 +67,30 @@ const QUOTA_FAILURE_SIGNATURES = Object.freeze({
 });
 
 // A model the provider CLI cannot resolve at all. Observed 2026-08-13: a
-// working container provisioned with only agy's OAuth token rejected a model
-// the standing container dispatches fine — every such dispatch failed as a
-// generic execution_failed, and the ledger's static reason ("Provider execution
-// failed before a reviewed integration") could not distinguish it from a model
-// that ran and failed. The real cause is a provisioning gap, not a model fault.
+// working container rejected a model the standing container dispatches fine —
+// every such dispatch failed as a generic execution_failed, and the ledger's
+// static reason ("Provider execution failed before a reviewed integration")
+// could not distinguish it from a model that ran and failed.
 //
-// The pattern is the verbatim stderr of a 2026-08-14 probe against the standing
-// container, which also confirmed the mechanism from the other side: `agy
-// models` there prints "Fetching available models..." and returns the 3.7 tier,
-// while the agy binary itself carries model literals only up to Gemini 3.6
-// (plus 3.5/3.1, Claude, GPT-OSS) — precisely the list the deprived container
-// reported. So the fallback catalog is real and bundled, and the live fetch is
-// what a token-only container loses. The persisted reason below still says
-// "stale or incomplete" rather than naming that mechanism, because this
-// classifier sees only the CLI's refusal, not why the fetch did not happen.
+// What the CLI is doing when it says this is now measured. agy resolves its
+// model catalog by fetching it live, and falls back to the list compiled into
+// the binary when that fetch does not succeed — the fallback is real (the
+// 1.1.12 binary in `switchyard-agent:latest` contains `gemini-3.6` literals and
+// zero `gemini-3.7`) and, critically, SILENT: there is no error, only a shorter
+// catalog, so the next dispatch fails as an unknown model rather than as a
+// failed fetch. That substitution is the whole reason this kind has to exist.
+//
+// What it is NOT is a provisioning gap, which is what this comment claimed
+// until 2026-08-14. That was disproved by running switchyard's own
+// createWorkingContainer + provisionCredentials and probing the result: a
+// token-only working container fetches the live catalog and dispatches
+// `gemini-3.7-flash-medium` successfully, on the image's own agy 1.1.12 and on
+// 1.1.13, and does so even when the copied OAuth envelope is already past its
+// expiry (agy refreshes it in place from the refresh_token that travels in the
+// same file). So the persisted reason below says "did not resolve" and stops
+// there: this classifier sees only the CLI's refusal, and the reason behind a
+// failed fetch — network, vendor-side, or an expired credential — is not
+// visible from here and must not be guessed at in a persisted string.
 //
 // Provider-scoped and narrow, for the same reason the quota signatures are:
 // this is verbatim provider-boundary evidence, not the generic words "model" or
@@ -125,7 +134,7 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 	model_unavailable: Object.freeze({
 		reasonCode: "model_unavailable",
 		reason:
-			"The provider CLI did not recognize the dispatched model; its resolvable catalog is stale or the working container's provider state is incomplete.",
+			"The provider CLI did not resolve the dispatched model; its resolvable catalog is stale or incomplete for this attempt.",
 	}),
 	execution_failed: Object.freeze({
 		reasonCode: "execution_failed",

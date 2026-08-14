@@ -165,24 +165,28 @@ describe("describeExecError — provider-scoped quota classification", () => {
 	});
 });
 
-// Measured 2026-08-13: a working container provisioned with agy's OAuth token
-// alone cannot perform the live model-catalog fetch, so the pinned CLI falls
-// back to its bundled list and rejects anything newer. Every such dispatch was
-// booked as a generic execution_failed whose static ledger reason ("Provider
-// execution failed before a reviewed integration") is indistinguishable from a
-// model that actually ran and failed — so the provisioning gap had to be
-// re-diagnosed by hand. This class now has its own bounded kind, which is the
-// only way the real cause can cross the persistence boundary: the provider's
-// own text never does.
+// Measured 2026-08-13: a working container rejected a model the standing
+// container dispatches fine. Every such dispatch was booked as a generic
+// execution_failed whose static ledger reason ("Provider execution failed
+// before a reviewed integration") is indistinguishable from a model that
+// actually ran and failed — so it had to be re-diagnosed by hand. This class
+// now has its own bounded kind, which is the only way the real cause can cross
+// the persistence boundary: the provider's own text never does.
+//
+// The kind earns its place because of HOW agy fails here. It fetches its model
+// catalog live and falls back to the list compiled into the binary when that
+// fetch does not succeed, with no error of any sort — so a fetch failure
+// arrives disguised as an unknown model. (Verified 2026-08-14: the 1.1.12
+// binary in `switchyard-agent:latest` carries `gemini-3.6` literals and zero
+// `gemini-3.7`, so a container listing 3.7 has demonstrably fetched.) The
+// original diagnosis blamed provisioning; that was disproved the same day —
+// see the comment in adapter/exec-error.mjs — which is why nothing here
+// asserts a cause beyond the CLI's own refusal.
 //
 // The constant below is the verbatim stderr of a live 2026-08-14 probe against
 // the standing container (agy 1.1.13, `--model <nonexistent>`), with the probe's
 // throwaway model id swapped for a real one — so this asserts the classifier
-// against the CLI's actual wording, not a transcription of it. The same probe
-// confirmed the mechanism from both sides: `agy models` in the standing
-// container prints "Fetching available models..." and lists the 3.7 tier, while
-// the binary's own model literals stop at Gemini 3.6 — exactly the list the
-// deprived container reported in the 2026-08-13 measurement.
+// against the CLI's actual wording, not a transcription of it.
 //
 // Note the real message is multi-line and prefixes the phrase with an "invalid
 // model selection (--model … --effort …)" clause. Matching a fragment in the
@@ -258,7 +262,7 @@ describe("describeExecError — provider-scoped unresolvable-model classificatio
 		strictEqual(quota.errorKind, "quota_exhausted");
 	});
 
-	it("persists as static metadata naming the provisioning gap, not the model", () => {
+	it("persists as static metadata naming the catalog, not the model", () => {
 		const metadata = sanitizeFailureMetadata({
 			taskId: "1.1",
 			result: "execution_failed",
@@ -269,11 +273,15 @@ describe("describeExecError — provider-scoped unresolvable-model classificatio
 			errorKind: "model_unavailable",
 			reasonCode: "model_unavailable",
 			reason:
-				"The provider CLI did not recognize the dispatched model; its resolvable catalog is stale or the working container's provider state is incomplete.",
+				"The provider CLI did not resolve the dispatched model; its resolvable catalog is stale or incomplete for this attempt.",
 		});
 		ok(isPersistentFailureMetadata(metadata));
-		// No model name, no provider text: the kind is the whole signal.
+		// No model name, no provider text: the kind is the whole signal. And no
+		// claim about WHY the catalog was short -- the classifier cannot see that,
+		// and the first attempt at this string guessed wrong ("the working
+		// container's provider state is incomplete", disproved 2026-08-14).
 		ok(!metadata.reason.includes("gemini"));
+		ok(!metadata.reason.includes("container"));
 	});
 });
 
