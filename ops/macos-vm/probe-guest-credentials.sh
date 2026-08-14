@@ -199,7 +199,12 @@ classify() {
   local provider="\$1" unauth_re="\$2" auth_rule="\$3"
   shift 3
   local output status verdict
-  output="\$(bounded 90 "\$@" 2>&1)"
+  # </dev/null is not optional. This script is itself fed to \`bash -s\` on stdin,
+  # so a provider that reads stdin -- as \`agy\` does when it decides to prompt for
+  # a login -- consumes the remainder of the script text and every later check
+  # silently vanishes. Measured 2026-08-14: the baseline run ended after agy,
+  # losing cursor-agent, copilot, and opencode with no error.
+  output="\$(bounded 90 "\$@" </dev/null 2>&1)"
   status=\$?
   verdict="indeterminate"
   if [[ "\$output" =~ \$unauth_re ]]; then
@@ -221,7 +226,10 @@ classify() {
 
 classify claude '"loggedIn": false' '"loggedIn": true' claude auth status
 classify codex 'Not logged in' 'Logged in' codex login status
-classify agy 'Please sign in' 'gemini-' agy models
+# agy's refusal wording differs between the container and the VM: the container
+# said "Please sign in to view available models", the guest says "authentication
+# required. Run 'agy' to log in". Both are measured; match either.
+classify agy 'Please sign in|authentication required' 'gemini-' agy models
 classify cursor-agent 'Not logged in' 'Logged in|Email|Account' cursor-agent status
 # copilot has no status subcommand at all -- login is its only auth verb -- so
 # the check is a trivial dispatch, whose unauthenticated refusal is exact and

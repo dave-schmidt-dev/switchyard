@@ -332,15 +332,26 @@ describe("the guest credential probe", () => {
 				],
 				[
 					"agy",
-					"Please sign in",
+					"Please sign in|authentication required",
 					"gemini-",
 					"Error: Please sign in to view available models.",
 					1,
 					"unauthenticated",
 				],
+				// agy words its refusal differently in the VM than in the container.
+				// Measured in switchyard-check-2 on 2026-08-14; the container fixture
+				// above is the same day. Both must score unauthenticated.
 				[
 					"agy",
-					"Please sign in",
+					"Please sign in|authentication required",
+					"gemini-",
+					"Error: authentication required. Run 'agy' to log in, then retry.",
+					1,
+					"unauthenticated",
+				],
+				[
+					"agy",
+					"Please sign in|authentication required",
 					"gemini-",
 					"gemini-3.7-flash-medium",
 					0,
@@ -446,4 +457,40 @@ describe("the guest credential probe", () => {
 		ok(r.status !== 0, "a hung check must not report success");
 		ok(elapsed < 10_000, `alarm did not fire: ${elapsed}ms`);
 	});
+
+	// Regression, found on the first real guest run (2026-08-14): the probe is
+	// itself delivered to `bash -s` on stdin, so a provider that reads stdin --
+	// agy does, when it decides to prompt for a login -- swallows the remainder
+	// of the script. The baseline run ended silently after agy and never ran
+	// cursor-agent, copilot, or opencode. Nothing failed; three rows just
+	// disappeared, which is the worst shape a credential probe can fail in.
+	it(
+		"does not let a provider check eat the rest of the script",
+		notDarwin,
+		() => {
+			const guest = renderGuestScript(scratch());
+			const dir = scratch();
+			const harness = join(dir, "stdin.sh");
+			writeFileSync(
+				harness,
+				[
+					"set -uo pipefail",
+					extractShellFunction(guest, "bounded"),
+					extractShellFunction(guest, "classify"),
+					// /bin/cat is the minimal stand-in for a stdin-reading provider.
+					"classify greedy no-such-string exit0 /bin/cat >/dev/null 2>&1",
+					'printf "SURVIVED\\n"',
+				].join("\n"),
+			);
+			const r = spawnSync("/bin/bash", ["-s"], {
+				encoding: "utf8",
+				input: readFileSync(harness, "utf8"),
+			});
+			strictEqual(
+				r.stdout.trim(),
+				"SURVIVED",
+				"a stdin-reading provider consumed the script tail",
+			);
+		},
+	);
 });
