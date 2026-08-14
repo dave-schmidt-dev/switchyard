@@ -1,0 +1,5 @@
+# `validate` is lint + deadcode + the full test suite + roster:coherence.
+# Hooking the named script rather than restating its steps means the hook
+# cannot drift from the gate — which is the failure this hook exists to stop:
+# knip went red at a4138a5 and three commits landed on top of it unnoticed.
+npm run validate

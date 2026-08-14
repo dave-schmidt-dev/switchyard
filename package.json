@@ -5,6 +5,7 @@
 	"license": "MIT",
 	"private": true,
 	"scripts": {
+		"prepare": "husky",
 		"test": "npm run test:docker && npm run test:other",
 		"test:docker": "node --test --test-concurrency=1 tests/dispatch-cli.test.mjs tests/lifecycle-recovery.test.mjs tests/detached-dispatch.test.mjs tests/no-host-rights-vm.test.mjs tests/workspace-wipe-vm.test.mjs",
 		"test:other": "files=\"\"; for f in tests/*.test.mjs; do case \"$f\" in tests/dispatch-cli.test.mjs|tests/lifecycle-recovery.test.mjs|tests/detached-dispatch.test.mjs|tests/no-host-rights-vm.test.mjs|tests/workspace-wipe-vm.test.mjs) ;; *) files=\"$files $f\";; esac; done; node --test $files",
@@ -19,6 +20,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.2",
+		"husky": "^9.1.7",
 		"knip": "^6.24.0"
 	}
 }

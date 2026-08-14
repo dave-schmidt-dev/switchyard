@@ -22,7 +22,8 @@ The 2026-08-04 capability-reliability checkpoint adds explicit `RequiredCapabili
 | `HISTORY.md` | Meaningful changes, bugs, remediation, regression notes. (local, gitignored) |
 | `TASKS.md` | Per-project task tracking. (local, gitignored) |
 | `LICENSE` | MIT. |
-| `package.json` | Node.js/ESM project config, biome + knip devDependencies. Test scripts serialize the three files that have shown Docker-daemon contention flakes: `test:docker` runs `dispatch-cli`, `lifecycle-recovery`, and `detached-dispatch` at `--test-concurrency=1`, and `test:other` dynamically derives every other `tests/*.test.mjs` — the three named files are an **exclusion** list, not an inclusion list, so a new test file runs by default. The split serializes only the recorded contention files; other container-backed tests (adapter dispatch, the INV-1/INV-3 gates) remain in `test:other` by design, so it is not a guarantee that nothing else touches Docker. `test` chains both (every test file exactly once); `validate` chains lint + deadcode + test. |
+| `package.json` | Node.js/ESM project config, biome + knip + husky devDependencies; `prepare` installs the git hooks on `npm install`. Test scripts serialize the three files that have shown Docker-daemon contention flakes: `test:docker` runs `dispatch-cli`, `lifecycle-recovery`, and `detached-dispatch` at `--test-concurrency=1`, and `test:other` dynamically derives every other `tests/*.test.mjs` — the three named files are an **exclusion** list, not an inclusion list, so a new test file runs by default. The split serializes only the recorded contention files; other container-backed tests (adapter dispatch, the INV-1/INV-3 gates) remain in `test:other` by design, so it is not a guarantee that nothing else touches Docker. `test` chains both (every test file exactly once); `validate` chains lint + deadcode + test. |
+| `.husky/pre-commit`, `.husky/pre-push` | Git hooks (husky, wired by the `prepare` script). `pre-commit` runs `npm run lint`; `pre-push` runs `npm run validate`. Both call the named script instead of restating its steps so a hook cannot drift from the gate. See [Git hooks](#git-hooks). |
 | `biome.json` | Biome linter/formatter config. |
 | `knip.json` | Dead code / unused dependency detection. |
 | `docker/Dockerfile` | Agent image build context: installs all six provider CLIs + git onto a pinned base, built to `switchyard-agent:latest` (the image every working container is derived from). |
@@ -303,6 +304,21 @@ Run code quality check with Biome:
 ```bash
 npm run lint
 ```
+
+#### Git hooks
+
+Husky installs two hooks from `.husky/`, wired by the `prepare` script on `npm install`:
+
+| Hook | Runs | Why here |
+| --- | --- | --- |
+| `pre-commit` | `npm run lint` | Fast enough to sit in front of every commit. |
+| `pre-push` | `npm run validate` | Lint, deadcode, the full suite, and roster coherence — the heavy gate, once per push. |
+
+The hooks invoke the named scripts rather than restating their steps, so they cannot drift from the gate. That drift is the failure they exist to stop: `knip` went red at `a4138a5` and three commits landed on top of it before anyone ran `validate` by hand.
+
+`pre-push` is safe without Docker. Every container-backed test guards on `isContainerRuntimeAvailable()` (or a `docker info` probe) and degrades to `describe.skip`, so a stopped daemon costs coverage, not a failed push — but a green push with OrbStack down has *not* exercised the container gates. Start OrbStack before pushing anything that touches them.
+
+When checking a gate from a script or a terminal, do not pipe it: `npm run validate 2>&1 | tail -60` reports **tail's** exit status, not the gate's. That is what hid the red build. Redirect to a file and check `$?`, or read `$pipestatus[1]` in zsh (`${PIPESTATUS[0]}` is the bash spelling and expands to nothing under zsh).
 
 ### Provider Authentication
 
