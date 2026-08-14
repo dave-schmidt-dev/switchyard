@@ -142,6 +142,50 @@ describe("macOS golden-image ops artifacts", () => {
 			strictEqual(r.status, 0, `bash -n failed for ${script}: ${r.stderr}`);
 		}
 	});
+
+	// Regression, measured in switchyard-check-2 on 2026-08-14. The C-3 block
+	// rules carry no direction, so they also drop packets addressed TO
+	// 10.0.0.0/8 -- which includes the guest's own shared-network address, which
+	// includes the DHCP OFFER. A clone with a fresh MAC therefore never
+	// completed a lease, fell back to 169.254, and had no network at all: every
+	// provider auth check that needs the network read as unauthenticated. The
+	// build VM cannot catch this, because it already holds a lease taken before
+	// pf was loaded and renewals are stateful unicast the port-67 rule passes.
+	// pf takes the first quick match, so presence is not enough -- order is the
+	// property.
+	it("passes DHCP in both directions above the C-3 blocks", () => {
+		const body = readFileSync(BUILD, "utf8");
+		const start = body.indexOf('anchor "switchyard-transfer/*"');
+		ok(start !== -1, "C-3 anchor rules moved");
+		const end = body.indexOf("\nPFEOF", start);
+		ok(end !== -1, "unterminated C-3 anchor heredoc");
+		const rules = body
+			.slice(start, end)
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("#"));
+
+		const dhcpOut = rules.findIndex((line) =>
+			/^pass\s+out quick on en0 proto udp from any port 68 to any port 67$/.test(
+				line.replace(/\s+/g, " ").trim(),
+			),
+		);
+		const dhcpIn = rules.findIndex((line) =>
+			/^pass\s+in quick on en0 proto udp from any port 67 to any port 68$/.test(
+				line.replace(/\s+/g, " ").trim(),
+			),
+		);
+		const firstBlock = rules.findIndex((line) =>
+			line.startsWith("block drop quick on en0"),
+		);
+
+		ok(dhcpOut !== -1, "no outbound DHCP pass in the C-3 anchor");
+		ok(dhcpIn !== -1, "no inbound DHCP pass in the C-3 anchor");
+		ok(firstBlock !== -1, "C-3 anchor lost its RFC1918 blocks");
+		ok(
+			dhcpOut < firstBlock && dhcpIn < firstBlock,
+			"a DHCP pass below the blocks never matches: a fresh-MAC clone gets no lease",
+		);
+	});
 });
 
 describe("the pinned CLI manifest", () => {

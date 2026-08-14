@@ -419,6 +419,17 @@ anchor "switchyard-transfer/*"
 pass  out quick on en0 proto udp from any to \$gateway port 53
 pass  out quick on en0 proto tcp from any to \$gateway port 53
 pass  out quick on en0 proto udp from any to \$gateway port 67
+# DHCP, both directions, and it must stay above the RFC1918 blocks -- pf takes
+# the first quick match. The blocks below carry no direction, so they also drop
+# packets addressed TO 10.0.0.0/8, which includes this guest's own shared-network
+# address, which includes the DHCP OFFER. Measured 2026-08-14 in
+# switchyard-check-2: without these two lines a clone with a fresh MAC never
+# completes a lease, falls back to 169.254, and has no network at all. The build
+# VM cannot catch it -- it already holds a lease from before pf was loaded, and a
+# renewal is stateful unicast that the port-67 rule above already passes. Every
+# task-time clone would come up dead.
+pass  out quick on en0 proto udp from any port 68 to any port 67
+pass  in  quick on en0 proto udp from any port 67 to any port 68
 block drop quick on en0 from any to 10.0.0.0/8
 block drop quick on en0 from any to 172.16.0.0/12
 block drop quick on en0 from any to 192.168.0.0/16
@@ -590,6 +601,19 @@ uid="\$(/usr/bin/id -u "\$provider_user")"
 /sbin/pfctl -s info | /usr/bin/grep -q 'Status: Enabled' || fail_guest "pf is disabled"
 /sbin/pfctl -a "\$pf_anchor" -sr | /usr/bin/grep -q 'block drop quick on en0' ||
   fail_guest "C-3 pf anchor is not loaded"
+# Ordering, not mere presence. pf takes the first quick match, so a DHCP pass
+# that sits below the RFC1918 blocks is dead text and every clone loses its
+# network. Compare line numbers in the loaded ruleset rather than trusting the
+# file on disk, since the loader is what actually decides.
+loaded_rules="\$(/sbin/pfctl -a "\$pf_anchor" -sr 2>/dev/null)"
+dhcp_in_line="\$(printf '%s\\n' "\$loaded_rules" |
+  /usr/bin/grep -n 'pass in quick on en0.*port = 67' | /usr/bin/head -1 | /usr/bin/cut -d: -f1)"
+first_block_line="\$(printf '%s\\n' "\$loaded_rules" |
+  /usr/bin/grep -n 'block drop quick on en0' | /usr/bin/head -1 | /usr/bin/cut -d: -f1)"
+[[ -n "\$dhcp_in_line" ]] ||
+  fail_guest "C-3 anchor has no inbound DHCP pass; a fresh-MAC clone cannot get a lease"
+[[ -n "\$first_block_line" && "\$dhcp_in_line" -lt "\$first_block_line" ]] ||
+  fail_guest "C-3 inbound DHCP pass is below the RFC1918 blocks and will never match"
 printf '[guest] restarted posture assertions passed\\n' >&2
 EOF
 
