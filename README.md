@@ -316,6 +316,8 @@ Husky installs two hooks from `.husky/`, wired by the `prepare` script on `npm i
 
 The hooks invoke the named scripts rather than restating their steps, so they cannot drift from the gate. That drift is the failure they exist to stop: `knip` went red at `a4138a5` and three commits landed on top of it before anyone ran `validate` by hand.
 
+**These hooks are the whole enforcement story — there is no CI, by decision (2026-08-14), not by omission.** A GitHub runner could not exercise the container-backed gates against OrbStack, and this is a solo repo. The accepted cost: hooks are bypassable with `--no-verify`, and a fresh clone has none until `npm install` runs `prepare`. Run `npm install` before your first commit.
+
 `pre-push` is safe without Docker. Every container-backed test guards on `isContainerRuntimeAvailable()` (or a `docker info` probe) and degrades to `describe.skip`, so a stopped daemon costs coverage, not a failed push — but a green push with OrbStack down has *not* exercised the container gates. Start OrbStack before pushing anything that touches them.
 
 When checking a gate from a script or a terminal, do not pipe it: `npm run validate 2>&1 | tail -60` reports **tail's** exit status, not the gate's. That is what hid the red build. Redirect to a file and check `$?`, or read `$pipestatus[1]` in zsh (`${PIPESTATUS[0]}` is the bash spelling and expands to nothing under zsh).
