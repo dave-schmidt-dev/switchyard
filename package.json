@@ -14,6 +14,7 @@
 		"validate": "npm run lint && npm run deadcode && npm run test && npm run roster:coherence",
 		"auth": "node src/switchyard/auth/index.mjs",
 		"auth:check": "node src/switchyard/auth/index.mjs --check",
+		"auth:check:live": "node src/switchyard/auth/index.mjs --check --live",
 		"dispatch": "node src/switchyard/dispatch/index.mjs"
 	},
 	"devDependencies": {

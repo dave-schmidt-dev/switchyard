@@ -2,13 +2,22 @@
 // any that aren't authenticated, runs its real interactive OAuth login
 // inside the standing agent container so a human can complete it live.
 //
-//   npm run auth           full walkthrough: check, then log in anything unauthed
-//   npm run auth:check     read-only status report — never attempts a login
+//   npm run auth              full walkthrough: check, then log in anything unauthed
+//   npm run auth:check        read-only status report — never attempts a login
+//   npm run auth:check:live   the same report, plus one real request per provider
 //
 // Use --check (npm run auth:check) to just look. It reuses the same
 // isXAuthenticated() checks as the walkthrough, so it can't disagree with what
 // a real dispatch sees, and it never mutates auth state — the safe replacement
 // for hand-rolling a `docker exec ... test -e` credential probe.
+//
+// Those checks answer "is there a credential", not "does this session work".
+// The difference is not academic: on 2026-08-13 this command reported claude
+// and opencode authenticated while every dispatch to them failed, and the
+// walkthrough gated its login on the same check, so it skipped the repair too.
+// Liveness (auth/liveness.mjs) closes that: the walkthrough always probes, and
+// --check does on request. See that file for why each probe's invocation is
+// empirical rather than read off a --help page.
 // PW-4: Independent in-container login (subscription, never API keys).
 // TASKS.md Task 24: there is no headless auto-login — every provider's real
 // login step requires a human to complete a browser or device-code OAuth
@@ -26,6 +35,7 @@ import { isCursorAuthenticated } from "../adapter/cursor.mjs";
 import { isOpencodeAuthenticated } from "../adapter/opencode.mjs";
 import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { ensureAgentContainer } from "../runner/index.mjs";
+import { probeLiveness } from "./liveness.mjs";
 
 /**
  * Run a provider's real login command interactively inside the standing
@@ -62,6 +72,7 @@ const PROVIDERS = [
 	{
 		name: "claude",
 		isAuthenticated: isClaudeAuthenticated,
+		isLive: () => probeLiveness("claude"),
 		runLogin: () => runInteractiveLogin(["claude", "auth", "login"]),
 	},
 	{
@@ -69,6 +80,7 @@ const PROVIDERS = [
 		// --device-auth: a device-code flow, needs no local browser inside
 		// the container.
 		isAuthenticated: isCodexAuthenticated,
+		isLive: () => probeLiveness("codex"),
 		runLogin: () => runInteractiveLogin(["codex", "login", "--device-auth"]),
 	},
 	{
@@ -78,6 +90,7 @@ const PROVIDERS = [
 		// a pasted authorization code). Confirmed empirically: a plain
 		// `agy --print "hi"` triggers it with no other side effect.
 		isAuthenticated: isAgyAuthenticated,
+		isLive: () => probeLiveness("agy"),
 		runLogin: () => runInteractiveLogin(["agy", "--print", "hi"]),
 	},
 	{
@@ -85,6 +98,7 @@ const PROVIDERS = [
 		// NO_OPEN_BROWSER=1: the CLI's own documented override to avoid trying
 		// to launch a GUI browser inside a headless container.
 		isAuthenticated: isCursorAuthenticated,
+		isLive: () => probeLiveness("cursor"),
 		runLogin: () =>
 			runInteractiveLogin(["cursor-agent", "login"], {
 				NO_OPEN_BROWSER: "1",
@@ -93,14 +107,44 @@ const PROVIDERS = [
 	{
 		name: "copilot",
 		isAuthenticated: isCopilotAuthenticated,
+		isLive: () => probeLiveness("copilot"),
 		runLogin: () => runInteractiveLogin(COPILOT_LOGIN_COMMAND),
 	},
 	{
 		name: "opencode",
 		isAuthenticated: isOpencodeAuthenticated,
+		isLive: () => probeLiveness("opencode"),
 		runLogin: () => runInteractiveLogin(["opencode", "auth", "login"]),
 	},
 ];
+
+/**
+ * Presence, then liveness — and only in that order, because the probe costs a
+ * real request against a real quota and a missing credential file already
+ * answers the question.
+ *
+ * A provider with no `isLive` is reported on presence alone and said to be
+ * unprobed. Injected providers (this module's tested seam) rely on that, and so
+ * does any future provider whose live invocation has not been confirmed by
+ * actually running it — a guessed probe is worse than no probe, because it
+ * fails for flag reasons and calls a working provider dead.
+ * @param {{name: string, isAuthenticated: () => boolean, isLive?: () => {live: boolean, reason: string|null, kind: string|null}}} provider
+ * @param {boolean} probe Run the live probe when presence passes.
+ * @returns {{authenticated: boolean, live: boolean|null, reason: string|null, kind: string|null}}
+ */
+function inspectProvider(provider, probe) {
+	const authenticated = provider.isAuthenticated();
+	if (!authenticated || !probe || typeof provider.isLive !== "function") {
+		return { authenticated, live: null, reason: null, kind: null };
+	}
+	const result = provider.isLive();
+	return {
+		authenticated,
+		live: result.live === true,
+		reason: result.reason ?? null,
+		kind: result.kind ?? null,
+	};
+}
 
 /**
  * Walk a human through authenticating every provider that isn't already
@@ -115,7 +159,26 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
 		let wasAuthenticated = false;
 		let ranLogin = false;
 		try {
-			wasAuthenticated = provider.isAuthenticated();
+			const state = inspectProvider(provider, true);
+			// An expired session leaves the credential file exactly where it was,
+			// so presence alone kept answering "already authenticated" and this
+			// walkthrough skipped the one provider that needed it — claude, for a
+			// whole session, while every dispatch to it failed `auth_expired`.
+			// Liveness is what decides whether to run the login.
+			if (state.kind === "quota_exhausted") {
+				// Credentials are fine and a login cannot help; saying otherwise
+				// would send a human through an OAuth flow to fix a quota.
+				console.log(
+					`\n--- ${provider.name}: authenticated, but the provider reports quota exhausted — skipping login (${state.reason}) ---\n`,
+				);
+				return {
+					name: provider.name,
+					wasAuthenticated: true,
+					ranLogin: false,
+					authenticated: true,
+				};
+			}
+			wasAuthenticated = state.authenticated && state.live !== false;
 			if (wasAuthenticated) {
 				return {
 					name: provider.name,
@@ -125,16 +188,21 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
 				};
 			}
 			console.log(
-				`\n--- ${provider.name}: not authenticated — starting interactive login, follow the prompts ---\n`,
+				state.authenticated
+					? `\n--- ${provider.name}: credential present but the provider did not answer (${state.reason}) — starting interactive login, follow the prompts ---\n`
+					: `\n--- ${provider.name}: not authenticated — starting interactive login, follow the prompts ---\n`,
 			);
 			ranLogin = true;
 			provider.runLogin();
-			const authenticated = provider.isAuthenticated();
+			// Re-check the same way, not the cheap way: a login that "succeeded"
+			// and left an unusable session is the exact state this walkthrough was
+			// reporting as fixed.
+			const after = inspectProvider(provider, true);
 			return {
 				name: provider.name,
 				wasAuthenticated: false,
 				ranLogin: true,
-				authenticated,
+				authenticated: after.authenticated && after.live !== false,
 			};
 		} catch (error) {
 			// A provider's isAuthenticated()/runLogin() throwing must not abort
@@ -172,13 +240,34 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
  * probe (whose fragility is exactly what a first-class command exists to
  * avoid). Reuses the same isXAuthenticated() functions the real walkthrough
  * trusts, so status and login can never disagree.
- * @param {Array<{name: string, isAuthenticated: () => boolean}>} [providers]
- * @returns {Array<{name: string, authenticated: boolean}>}
+ *
+ * `{live: true}` additionally asks each authenticated provider to answer a real
+ * one-word request, which is the only thing that distinguishes a credential
+ * from a working session. It is opt-in because it spends real quota, six
+ * requests at a time, on a command people run casually — and stays read-only
+ * either way. The plain form is honest about its limits rather than silently
+ * cheap: it reports a credential, and a credential is not a session.
+ * @param {Array<{name: string, isAuthenticated: () => boolean, isLive?: () => object}>} [providers]
+ * @param {{live?: boolean}} [options]
+ * @returns {Array<{name: string, authenticated: boolean, live?: boolean|null, reason?: string|null}>}
  */
-export function reportProviderStatus(providers = PROVIDERS) {
+export function reportProviderStatus(
+	providers = PROVIDERS,
+	{ live = false } = {},
+) {
 	return providers.map((provider) => {
 		try {
-			return { name: provider.name, authenticated: provider.isAuthenticated() };
+			const state = inspectProvider(provider, live);
+			// `live` stays absent unless a probe actually ran, so a caller can
+			// never mistake "we did not look" for "we looked and it answered".
+			return live
+				? {
+						name: provider.name,
+						authenticated: state.authenticated,
+						live: state.live,
+						reason: state.reason,
+					}
+				: { name: provider.name, authenticated: state.authenticated };
 		} catch (error) {
 			// Same fail-soft contract as ensureProvidersAuthenticated: one
 			// provider's check throwing must not abort the report for the rest,
@@ -194,17 +283,37 @@ export function reportProviderStatus(providers = PROVIDERS) {
 
 /**
  * Print the read-only status report and set the exit code (1 if any provider
- * is unauthenticated, else 0) — no login is ever attempted.
+ * is unauthenticated — or, with `--live`, if any authenticated provider failed
+ * to answer) — no login is ever attempted.
+ * @param {boolean} [live] Probe each authenticated provider with a real request.
  */
-function runCheck() {
-	const statuses = reportProviderStatus();
-	console.log("=== Auth status (read-only — no login attempted) ===");
+function runCheck(live = false) {
+	const statuses = reportProviderStatus(PROVIDERS, { live });
+	console.log(
+		live
+			? "=== Auth status (read-only — no login attempted; each provider was sent one real request) ==="
+			: "=== Auth status (read-only — credential presence only; add --live to probe) ===",
+	);
 	for (const status of statuses) {
+		if (!status.authenticated) {
+			console.log(`${status.name}: NOT AUTHENTICATED`);
+			continue;
+		}
+		if (!live || status.live === null) {
+			console.log(`${status.name}: authenticated`);
+			continue;
+		}
 		console.log(
-			`${status.name}: ${status.authenticated ? "authenticated" : "NOT AUTHENTICATED"}`,
+			status.live
+				? `${status.name}: authenticated (live)`
+				: `${status.name}: AUTHENTICATED BUT NOT LIVE — ${status.reason}`,
 		);
 	}
-	process.exitCode = statuses.some((status) => !status.authenticated) ? 1 : 0;
+	process.exitCode = statuses.some(
+		(status) => !status.authenticated || status.live === false,
+	)
+		? 1
+		: 0;
 }
 
 function main(argv = process.argv.slice(2)) {
@@ -220,9 +329,11 @@ function main(argv = process.argv.slice(2)) {
 	}
 
 	// `--check`: read-only status, never a login. The default (no flag) is the
-	// full walkthrough, which logs in anything unauthenticated.
+	// full walkthrough, which logs in anything unauthenticated. `--live` adds a
+	// real request per authenticated provider; the walkthrough always probes,
+	// because a wrong answer there costs an hour rather than a status line.
 	if (argv.includes("--check")) {
-		runCheck();
+		runCheck(argv.includes("--live"));
 		return;
 	}
 
