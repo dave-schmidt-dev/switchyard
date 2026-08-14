@@ -118,6 +118,17 @@ const PROVIDERS = [
 	},
 ];
 
+// Probe outcomes that prove the credentials work and that a login would not
+// change. Keyed by the classification describeExecError() produced, so this
+// grows with PERSISTED_ERROR_KINDS rather than duplicating it: auth_expired is
+// deliberately absent, since that is exactly the case a login does fix. The
+// value is the clause shown to the human, which has to name the real blocker —
+// "authenticated, but ..." is the only thing distinguishing these from success.
+const LOGIN_CANNOT_HELP = Object.freeze({
+	quota_exhausted: "the provider reports quota exhausted",
+	model_unavailable: "the provider CLI cannot resolve the probe's model",
+});
+
 /**
  * Presence, then liveness — and only in that order, because the probe costs a
  * real request against a real quota and a missing credential file already
@@ -165,11 +176,13 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
 			// walkthrough skipped the one provider that needed it — claude, for a
 			// whole session, while every dispatch to it failed `auth_expired`.
 			// Liveness is what decides whether to run the login.
-			if (state.kind === "quota_exhausted") {
+			if (LOGIN_CANNOT_HELP[state.kind]) {
 				// Credentials are fine and a login cannot help; saying otherwise
-				// would send a human through an OAuth flow to fix a quota.
+				// would send a human through an OAuth flow to fix a quota — or,
+				// since `kind` forwards describeExecError()'s classification
+				// verbatim, to fix a model the CLI cannot resolve.
 				console.log(
-					`\n--- ${provider.name}: authenticated, but the provider reports quota exhausted — skipping login (${state.reason}) ---\n`,
+					`\n--- ${provider.name}: authenticated, but ${LOGIN_CANNOT_HELP[state.kind]} — skipping login (${state.reason}) ---\n`,
 				);
 				return {
 					name: provider.name,

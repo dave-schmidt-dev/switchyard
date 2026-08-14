@@ -1,4 +1,4 @@
-import { deepStrictEqual, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	COPILOT_LOGIN_COMMAND,
@@ -306,6 +306,38 @@ describe("liveness gating", () => {
 		strictEqual(throttled.getRunLoginCalls(), 0);
 		strictEqual(results[0].authenticated, true);
 		strictEqual(results[0].wasAuthenticated, true);
+	});
+
+	// The same argument as the quota case above, for the kind added when
+	// describeExecError() learned to classify an unresolvable model. `kind` is
+	// forwarded from that classifier verbatim rather than being an enum of its
+	// own, so every new kind lands here and has to be answered: is this
+	// something a login fixes? A model the CLI cannot resolve is not.
+	it("skips the login when the probe's own model is what is unavailable", () => {
+		const logs = [];
+		const originalLog = console.log;
+		console.log = (message) => logs.push(message);
+		const blocked = liveProvider("catalog-gap", {
+			authenticated: true,
+			live: false,
+			kind: "model_unavailable",
+		});
+
+		try {
+			const results = ensureProvidersAuthenticated([blocked]);
+
+			strictEqual(blocked.getRunLoginCalls(), 0);
+			strictEqual(results[0].authenticated, true);
+			strictEqual(results[0].wasAuthenticated, true);
+			// Reporting it as plain "authenticated" would read as success and
+			// hide the actual blocker, so the human is told which one it is.
+			ok(
+				logs.some((line) => line.includes("cannot resolve the probe's model")),
+				`expected the model_unavailable clause, got ${JSON.stringify(logs)}`,
+			);
+		} finally {
+			console.log = originalLog;
+		}
 	});
 
 	it("re-checks liveness after a login, not just presence", () => {

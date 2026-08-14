@@ -4587,6 +4587,22 @@ export function runQueue(options) {
 				} catch (error) {
 					reportLegacyProjectionFailure(ledgerReporting, error);
 				}
+			})
+			// Both handlers above call caller-supplied code (`onStatus`,
+			// `diagnostics.emit`, `onLedgerProjectionFailure`), none of which is
+			// guarded against throwing. Everywhere else in this runner such a
+			// throw propagates synchronously and is the caller's own visible
+			// bug; here it would instead reject a chain that the documented
+			// normal case ignores, turning a best-effort ledger warning into an
+			// unhandled rejection -- fatal on current Node, and raised after
+			// runQueue has already returned success. So the chain is kept
+			// non-rejecting: `ledgerWritesSettled` always settles, which is also
+			// what a caller draining it before exit needs. console.warn is the
+			// only channel left once the status surface is the thing that broke.
+			.catch((error) => {
+				console.warn(
+					`runQueue: dispatch-ledger failure reporting threw (${error?.name ?? "Error"}); the ledger write itself is unaffected`,
+				);
 			});
 	};
 	const defaultRecordDispatchIntent = (intent) => {

@@ -146,7 +146,9 @@ function truncate(text) {
  * @param {string} [options.containerName]
  * @param {number} [options.timeoutMs]
  * @param {(spec: {args: string[], cwd?: string, stdin?: boolean}) => string} [options.run] Test seam.
- * @returns {{live: boolean, reason: string|null, kind: ("auth_expired"|"quota_exhausted"|null)}}
+ * `kind` is whatever describeExecError() classified, forwarded verbatim — so it
+ * tracks PERSISTED_ERROR_KINDS rather than being an enum of its own.
+ * @returns {{live: boolean, reason: string|null, kind: ("auth_expired"|"quota_exhausted"|"model_unavailable"|null)}}
  */
 export function probeLiveness(name, options = {}) {
 	const {

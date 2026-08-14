@@ -1056,6 +1056,65 @@ describe("default runner ledger wiring", () => {
 		}
 	});
 
+	// The drain boundary is documented as ignorable by every caller that is not
+	// about to exit, so it must never reject: an unhandled rejection here would
+	// be fatal on current Node, and would be raised after runQueue had already
+	// returned success. The reporters call caller-supplied code that nothing
+	// guards, so a status surface that throws is the way it would happen.
+	it("keeps the drain boundary settling when the status surface itself throws", async () => {
+		const fixture = makeDefaultWiringFixture("sync-status-surface-throws");
+		const warnings = [];
+		const originalWarn = console.warn;
+		console.warn = (message) => warnings.push(message);
+		try {
+			const result = runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies({
+					recordDispatchToStore: async () => {
+						throw Object.assign(new Error("denied"), { code: "EACCES" });
+					},
+					// Scoped to the ledger event on purpose. A surface that throws
+					// on every event dies synchronously inside runQueue on the
+					// first one -- loud, and the caller's own bug. The hazard
+					// this covers is narrower: a consumer that mishandles only
+					// this event shape, and so throws where nothing is awaiting.
+					onStatus: (event) => {
+						if (event.phase === "ledger") {
+							throw new Error("status surface exploded");
+						}
+					},
+				}),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+
+			let rejected = null;
+			await result.ledgerWritesSettled.catch((error) => {
+				rejected = error;
+			});
+			strictEqual(
+				rejected,
+				null,
+				`ledgerWritesSettled must settle, not reject: ${rejected?.message}`,
+			);
+
+			strictEqual(warnings.length, 1);
+			ok(
+				warnings[0].startsWith(
+					"runQueue: dispatch-ledger failure reporting threw",
+				),
+			);
+			// The thrown surface's own message is caller-controlled text and is
+			// not repeated into the fallback channel.
+			ok(!warnings[0].includes("status surface exploded"));
+		} finally {
+			console.warn = originalWarn;
+			restoreLedgerPaths();
+		}
+	});
+
 	it("contains an orchestrator store-write failure after the legacy record", async () => {
 		const fixture = makeDefaultWiringFixture(
 			"orchestrator-store-write-failure",
