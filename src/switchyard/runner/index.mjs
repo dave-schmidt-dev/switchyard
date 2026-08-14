@@ -704,11 +704,65 @@ function reportLegacyProjectionFailure(context, error) {
 		});
 	} else {
 		console.warn(
-			`runner: legacy dispatch projection failed (${metadata.ledgerFailureCode})`,
+			`${context.ledgerSource ?? "runner"}: legacy dispatch projection failed (${metadata.ledgerFailureCode})`,
 		);
 	}
 	context.onLedgerProjectionFailure?.(metadata);
 	return metadata;
+}
+
+/**
+ * The outcome-projection twin of reportLegacyProjectionFailure.
+ *
+ * Both dispatch ledgers can fail independently, and both failures used to be
+ * swallowed into bare console.warn calls that no caller could observe. They
+ * now share one bounded classifier (safeLedgerFailure), one status phase, and
+ * one callback, so a failed projection is a structured event on any surface
+ * that supplies onStatus and only degrades to console.warn when none does.
+ *
+ * @param {object} context
+ * @param {Error} error
+ * @returns {{ledgerFailure: boolean, ledgerFailurePhase: string, ledgerFailureCode: string}}
+ */
+function reportOutcomeProjectionFailure(context, error) {
+	const metadata = safeLedgerFailure(error, "outcome_projection");
+	if (context.onStatus) {
+		context.onStatus({
+			phase: "ledger",
+			event: "outcome_projection_failed",
+			status: "Project-local dispatch outcome projection failed",
+			...metadata,
+		});
+	} else {
+		console.warn(
+			`${context.ledgerSource ?? "runner"}: project-local dispatch outcome projection failed (${metadata.ledgerFailureCode})`,
+		);
+	}
+	context.onLedgerProjectionFailure?.(metadata);
+	return metadata;
+}
+
+/**
+ * The minimal context the two ledger-failure reporters need. Built separately
+ * from the executor `context` so the reporters can be reached from the dispatch
+ * writers, which are constructed before that object exists.
+ *
+ * @param {Function|null} onStatus
+ * @param {object} dependencies
+ */
+function ledgerReportingContext(
+	onStatus,
+	dependencies = {},
+	source = "runner",
+) {
+	return {
+		onStatus: onStatus ?? null,
+		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
+		// Only reaches the console fallback. The entry point is worth keeping in
+		// that one line because it is all an operator gets when no status
+		// surface is wired; the structured event carries the phase instead.
+		ledgerSource: source,
+	};
 }
 
 function dispatchIntentPayload(
@@ -3077,8 +3131,10 @@ export async function runQueueAsync(options) {
 		recordDispatch:
 			dependencies.recordDispatch ??
 			((dispatch) =>
-				recordDispatchToBothLedgers(dispatch, (data) =>
-					recordDispatchToStore(data, runStorePath),
+				recordDispatchToBothLedgers(
+					dispatch,
+					(data) => recordDispatchToStore(data, runStorePath),
+					ledgerReportingContext(dependencies.onStatus ?? null, dependencies),
 				)),
 		recordDispatchIntent:
 			dependencies.recordDispatchIntent ??
@@ -4339,24 +4395,34 @@ function releaseQueueSlot(queueBackend, slotLease) {
 	}
 }
 
+/**
+ * Dual-write one dispatch outcome: project-local store first, legacy file
+ * ledger second. Neither failure aborts the other, and neither aborts the
+ * dispatch — but both are now reported through the bounded classifier rather
+ * than swallowed, so a caller supplying `reporting` sees them.
+ *
+ * `reporting` is appended rather than inserted: both call sites already pass a
+ * store-writer closure as the second argument.
+ *
+ * @param {object} dispatch
+ * @param {Function} [recordDispatchToStoreFn]
+ * @param {object} [reporting] from ledgerReportingContext()
+ */
 function recordDispatchToBothLedgers(
 	dispatch,
 	recordDispatchToStoreFn = recordDispatchToStore,
+	reporting = {},
 ) {
 	return Promise.resolve()
 		.then(() => recordDispatchToStoreFn(dispatch))
 		.catch((error) => {
-			console.warn(
-				`runner: project-local dispatch outcome projection failed (${safeLedgerFailure(error, "outcome_projection").ledgerFailureCode})`,
-			);
+			reportOutcomeProjectionFailure(reporting, error);
 		})
 		.then(() => {
 			try {
 				recordDispatch(dispatch);
 			} catch (error) {
-				console.warn(
-					`runner: legacy dispatch projection failed (${safeLedgerFailure(error, "legacy_projection").ledgerFailureCode})`,
-				);
+				reportLegacyProjectionFailure(reporting, error);
 			}
 		});
 }
@@ -4490,25 +4556,38 @@ export function runQueue(options) {
 		dependencies.recordDispatchToStore ?? recordDispatchToStore;
 	const recordDispatchIntentFn =
 		dependencies.recordDispatchIntent ?? recordDispatchIntentToStore;
+	const ledgerReporting = ledgerReportingContext(
+		emitStatus,
+		dependencies,
+		"runQueue",
+	);
+	// The project-local outcome write is async; executeTask() and runQueue are
+	// both synchronous. Writes are therefore queued onto one chain that keeps
+	// them in dispatch order, and nothing in this function can await it --
+	// making runQueue async would duplicate runQueueAsync, which exists for
+	// exactly that reason.
+	//
+	// What the chain cannot do on its own is guarantee durability before the
+	// caller acts on the return value: a caller that exits the process as soon
+	// as runQueue returns drops any write still in flight. The chain is
+	// returned as `ledgerWritesSettled` so such a caller can drain it. The
+	// authoritative pre-dispatch intent receipt is unaffected -- it is written
+	// synchronously by recordDispatchIntentToStore, before the provider runs,
+	// and never goes through this chain.
 	let storeWriteChain = Promise.resolve();
 	const defaultRecordDispatch = (dispatch) => {
-		storeWriteChain = storeWriteChain.then(() =>
-			recordDispatchToStoreFn(dispatch, runStorePath),
-		);
-		storeWriteChain = storeWriteChain.catch((error) => {
-			console.warn(
-				`runQueue: project-local dispatch outcome projection failed (${safeLedgerFailure(error, "outcome_projection").ledgerFailureCode})`,
-			);
-		});
-		storeWriteChain = storeWriteChain.then(() => {
-			try {
-				recordDispatch(dispatch);
-			} catch (error) {
-				console.warn(
-					`runQueue: legacy dispatch projection failed (${safeLedgerFailure(error, "legacy_projection").ledgerFailureCode})`,
-				);
-			}
-		});
+		storeWriteChain = storeWriteChain
+			.then(() => recordDispatchToStoreFn(dispatch, runStorePath))
+			.catch((error) => {
+				reportOutcomeProjectionFailure(ledgerReporting, error);
+			})
+			.then(() => {
+				try {
+					recordDispatch(dispatch);
+				} catch (error) {
+					reportLegacyProjectionFailure(ledgerReporting, error);
+				}
+			});
 	};
 	const defaultRecordDispatchIntent = (intent) => {
 		recordDispatchIntentFn(intent, runStorePath);
@@ -5074,6 +5153,11 @@ export function runQueue(options) {
 			completedTaskIds: checkpoint.completedTaskIds,
 			lastTaskId: checkpoint.lastTaskId,
 			checkpointPath,
+			// The drain boundary for the async outcome writes queued above. A
+			// caller that terminates on return (or that reads the ledger right
+			// after it) must await this; every other caller can ignore it, which
+			// is why runQueue's own signature stays synchronous.
+			ledgerWritesSettled: storeWriteChain,
 			...(identity.enabled
 				? {
 						queueIdentity: identity.queueIdentity,
@@ -5248,8 +5332,10 @@ export async function runQueueWithOrchestrator(options) {
 	const recordDispatchIntentFn =
 		dependencies.recordDispatchIntent ?? recordDispatchIntentToStore;
 	const defaultRecordDispatch = async (dispatch) => {
-		await recordDispatchToBothLedgers(dispatch, (data) =>
-			recordDispatchToStoreFn(data, runStorePath),
+		await recordDispatchToBothLedgers(
+			dispatch,
+			(data) => recordDispatchToStoreFn(data, runStorePath),
+			ledgerReportingContext(emitStatus, dependencies),
 		);
 	};
 	const defaultRecordDispatchIntent = (intent) =>

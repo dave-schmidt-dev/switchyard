@@ -775,6 +775,208 @@ describe("default runner ledger wiring", () => {
 		}
 	});
 
+	// runQueue is synchronous and its project-local outcome write is not, so the
+	// write is queued onto a chain the function itself cannot await. Ordering was
+	// already preserved (the test above); durability before return was not. A
+	// caller that terminates on return -- the case this drain exists for -- had
+	// no way to know a record was still in flight.
+	it("exposes a drain boundary that settles the outcome write a terminal caller would drop", async () => {
+		const fixture = makeDefaultWiringFixture("sync-drain-boundary");
+		let releaseWrite;
+		const gate = new Promise((resolve) => {
+			releaseWrite = resolve;
+		});
+		// Blocked until released, then real filesystem work: mkdir + append.
+		// A caller that merely yields a microtask still misses it; only awaiting
+		// the returned chain is sufficient.
+		const gatedStoreWriter = async (dispatch, storeRoot) => {
+			await gate;
+			await recordDispatchToStore(dispatch, storeRoot);
+		};
+
+		try {
+			const result = runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies({
+					recordDispatchToStore: gatedStoreWriter,
+				}),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+
+			// Control: the write really is still in flight at return, so the
+			// assertion after the drain below is about the drain and not about a
+			// write that had already landed.
+			deepStrictEqual(await readLedgerFromStore(fixture.storeRoot), []);
+
+			releaseWrite();
+			await result.ledgerWritesSettled;
+
+			// No polling loop: after the drain the record is simply there. The
+			// other tests in this suite need waitForStoreRecord precisely because
+			// they do not await this.
+			const storeRecords = await readLedgerFromStore(fixture.storeRoot);
+			strictEqual(storeRecords.length, 1);
+			strictEqual(storeRecords[0].taskId, fixture.taskId);
+			// The legacy projection is sequenced behind the store write on the same
+			// chain, so it is settled too.
+			strictEqual(readLedger().at(-1)?.taskId, fixture.taskId);
+		} finally {
+			releaseWrite?.();
+			restoreLedgerPaths();
+		}
+	});
+
+	// Both ledger writes used to fail into bare console.warn calls, which no
+	// caller could observe and no status surface ever saw. They now go through
+	// the same bounded classifier the intent-receipt path uses.
+	it("reports a failed outcome projection as a structured status event, not a console warning", async () => {
+		const fixture = makeDefaultWiringFixture("sync-outcome-failure");
+		const statuses = [];
+		const projectionFailures = [];
+		const denied = Object.assign(new Error("denied"), { code: "EACCES" });
+
+		try {
+			const result = runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies({
+					recordDispatchToStore: async () => {
+						throw denied;
+					},
+					onStatus: (event) => statuses.push(event),
+					onLedgerProjectionFailure: (metadata) =>
+						projectionFailures.push(metadata),
+				}),
+			});
+			// The dispatch itself is unaffected: a ledger projection failure is
+			// reported, never promoted into a task failure.
+			strictEqual(result.results[0].result, "success_no_diff");
+			await result.ledgerWritesSettled;
+
+			const reported = statuses.find(
+				(event) => event.event === "outcome_projection_failed",
+			);
+			ok(
+				reported,
+				`expected an outcome_projection_failed status, got ${JSON.stringify(
+					statuses.map((event) => event.event),
+				)}`,
+			);
+			strictEqual(reported.phase, "ledger");
+			strictEqual(reported.ledgerFailure, true);
+			strictEqual(reported.ledgerFailurePhase, "outcome_projection");
+			strictEqual(reported.ledgerFailureCode, "EACCES");
+			deepStrictEqual(projectionFailures, [
+				{
+					ledgerFailure: true,
+					ledgerFailurePhase: "outcome_projection",
+					ledgerFailureCode: "EACCES",
+				},
+			]);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
+	// The classifier is bounded on purpose: an errno outside the allowlist
+	// becomes "unknown" rather than crossing the status/ledger boundary, so a
+	// path or message embedded in an unexpected error cannot leak through it.
+	it("bounds an unexpected legacy-projection errno to unknown", async () => {
+		const fixture = makeDefaultWiringFixture("sync-legacy-failure");
+		const statuses = [];
+		// A regular file where the legacy ledger's parent directory should be, so
+		// the legacy append fails with ENOTDIR -- a real errno, deliberately not
+		// in SAFE_LEDGER_ERROR_CODES.
+		const blocker = join(tmpDir, "blocker");
+		writeFileSync(blocker, "not a directory", "utf8");
+		process.env.SWITCHYARD_LEDGER_PATH = join(blocker, "ledger.jsonl");
+
+		try {
+			const result = runQueue({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultSyncDependencies({
+					onStatus: (event) => statuses.push(event),
+				}),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+			await result.ledgerWritesSettled;
+
+			const reported = statuses.find(
+				(event) => event.event === "legacy_projection_failed",
+			);
+			ok(
+				reported,
+				`expected a legacy_projection_failed status, got ${JSON.stringify(
+					statuses.map((event) => event.event),
+				)}`,
+			);
+			strictEqual(reported.ledgerFailurePhase, "legacy_projection");
+			strictEqual(reported.ledgerFailureCode, "unknown");
+			// The store-backed write is independent and still landed.
+			strictEqual(
+				(await readLedgerFromStore(fixture.storeRoot)).at(-1)?.taskId,
+				fixture.taskId,
+			);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
+	// runQueueAsync and runQueueWithOrchestrator share recordDispatchToBothLedgers,
+	// which had its own copy of the swallowed-warning pattern. Without this the
+	// orchestrator path could regress alone while the sync tests above passed.
+	it("reports a failed outcome projection on the orchestrator path too", async () => {
+		const fixture = makeDefaultWiringFixture("orchestrator-outcome-failure");
+		const statuses = [];
+		const projectionFailures = [];
+
+		try {
+			const result = await runQueueWithOrchestrator({
+				tasksFilePath: fixture.tasksFilePath,
+				projectPath: tmpDir,
+				workingContainerName: "test-container",
+				checkpointPath: fixture.checkpointPath,
+				dependencies: defaultOrchestratorDependencies({
+					recordDispatchToStore: async () => {
+						throw Object.assign(new Error("read-only"), { code: "EROFS" });
+					},
+					onStatus: (event) => statuses.push(event),
+					onLedgerProjectionFailure: (metadata) =>
+						projectionFailures.push(metadata),
+				}),
+			});
+			strictEqual(result.results[0].result, "success_no_diff");
+
+			const reported = statuses.find(
+				(event) => event.event === "outcome_projection_failed",
+			);
+			ok(
+				reported,
+				`expected an outcome_projection_failed status, got ${JSON.stringify(
+					statuses.map((event) => event.event),
+				)}`,
+			);
+			strictEqual(reported.ledgerFailureCode, "EROFS");
+			deepStrictEqual(projectionFailures, [
+				{
+					ledgerFailure: true,
+					ledgerFailurePhase: "outcome_projection",
+					ledgerFailureCode: "EROFS",
+				},
+			]);
+		} finally {
+			restoreLedgerPaths();
+		}
+	});
+
 	it("lets an injected recorder replace both default writers", async () => {
 		const fixture = makeDefaultWiringFixture("override-sync-ledger");
 		const overrides = [];
