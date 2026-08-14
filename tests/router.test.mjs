@@ -1192,6 +1192,115 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 		strictEqual(result.reason, "no_non_terminal_tasks");
 	});
 
+	it("refuses an ambiguous provider selector on the same terms route() does", () => {
+		// The queue-level go/no-go has to agree with the dispatches it admits.
+		// route() refuses an ambiguous selector with `ambiguous_target`; before
+		// the preflight guard existed, the same selector fell through to the
+		// per-capability loop here and came back as a per-provider
+		// `not_in_only_allowlist` -- preflight reporting "no eligible provider
+		// for this tier" for a queue route() would refuse to route at all.
+		//
+		// "CODEX" is ambiguous for the same reason as in the route() test at the
+		// bottom of this file: it matches no exact target id (case-sensitive) and
+		// the harness tie-break sees two enabled codex targets.
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-preflight-ambiguous-${process.pid}-${randomUUID()}.json`,
+		);
+		const previousPath = process.env.SWITCHYARD_ROSTER_PATH;
+		const tasks = [
+			{ id: "pending-low", status: "pending", requiredCapability: "low" },
+		];
+		const tarProvisionRegistry = {
+			verified: true,
+			providers: ["codex", "codex-spark"],
+		};
+		try {
+			writeFileSync(
+				rosterPath,
+				JSON.stringify(
+					buildDualCodexRoster({ incumbentSnapshotName: "Codex" }),
+				),
+				"utf8",
+			);
+			process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+			__resetRosterCacheForTests();
+			const snapshot = snapshotFor(
+				{ name: "Codex", ok: true, windows: [{ percent_left: 40 }] },
+				{ name: "Codex (Spark)", ok: true, windows: [{ percent_left: 95 }] },
+			);
+
+			// Control: the exact target id resolves, so an unambiguous selector
+			// over this same roster and snapshot passes preflight. Without this, a
+			// false `eligible` below could be an ineligible fixture rather than
+			// the guard.
+			const exact = preflightMacosQueue({
+				tasks,
+				only: ["codex"],
+				tarProvisionRegistry,
+				readSnapshot: freshSnapshotReader(snapshot, []),
+			});
+			strictEqual(exact.eligible, true);
+
+			// The guard sits above the snapshot read and above the task scan, so
+			// an ambiguous selector is refused without touching routing state.
+			const throwingReader = () => {
+				throw new Error("an ambiguous selector must not read routing state");
+			};
+			const ambiguous = preflightMacosQueue({
+				tasks,
+				only: ["CODEX"],
+				tarProvisionRegistry,
+				readSnapshot: throwingReader,
+			});
+			strictEqual(ambiguous.ok, false);
+			strictEqual(ambiguous.eligible, false);
+			strictEqual(ambiguous.reason, "ambiguous_target");
+			strictEqual(ambiguous.rejection.selector, "CODEX");
+			strictEqual(ambiguous.rejection.capability, null);
+			ok(
+				ambiguous.log.some((line) => line.includes("use an exact target id")),
+				`expected an actionable hint, got: ${JSON.stringify(ambiguous.log)}`,
+			);
+
+			// ...and route() agrees, which is the property the guard exists for.
+			strictEqual(
+				route({ requiredCapability: "low", only: ["CODEX"] }).reason,
+				"ambiguous_target",
+			);
+
+			// An exclude-side selector is refused identically: route() pools both
+			// lists into one ambiguity check and so must this.
+			strictEqual(
+				preflightMacosQueue({
+					tasks,
+					exclude: ["CODEX"],
+					tarProvisionRegistry,
+					readSnapshot: throwingReader,
+				}).reason,
+				"ambiguous_target",
+			);
+
+			// Placement assertion: a queue with nothing left to run still fails
+			// closed. Below the task scan the guard would never run here, and
+			// preflight would return `no_non_terminal_tasks` for a selector that
+			// cannot be routed -- the last case where the two could disagree.
+			const terminalOnly = preflightMacosQueue({
+				tasks: [{ id: "done-low", status: "done", requiredCapability: "low" }],
+				only: ["CODEX"],
+				tarProvisionRegistry,
+				readSnapshot: throwingReader,
+			});
+			strictEqual(terminalOnly.ok, false);
+			strictEqual(terminalOnly.reason, "ambiguous_target");
+		} finally {
+			if (previousPath === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previousPath;
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
+		}
+	});
+
 	it("does not gate native or human tasks on provider eligibility", () => {
 		const result = preflightMacosQueue({
 			tasks: [

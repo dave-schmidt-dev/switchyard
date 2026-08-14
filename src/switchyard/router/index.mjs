@@ -409,6 +409,45 @@ export function preflightMacosQueue(options = {}) {
 		};
 	}
 
+	// route() and routeBlind() both refuse an ambiguous --only/--exclude
+	// selector outright, with reason "ambiguous_target". Preflight has to refuse
+	// it on the same terms, and has to do so here — before any task or snapshot
+	// analysis — because this is a go/no-go for the dispatches that follow. Left
+	// to the per-capability loop, an ambiguous name degrades into a per-provider
+	// not_in_only_allowlist: the queue is reported as merely having no eligible
+	// provider for the tier, when the truth is that route() will reject the
+	// selector itself. Placing the guard above the task scan also means an empty
+	// queue with an ambiguous selector fails closed rather than returning
+	// no_non_terminal_tasks, which is the one case where the two could still
+	// have disagreed.
+	const ambiguousFilter = [...exclude, ...only].find(
+		(identifier) => resolveTargetIdentity(identifier).ambiguous,
+	);
+	if (ambiguousFilter) {
+		const rejection = {
+			capability: null,
+			excludedProviders: [],
+			reason: "ambiguous_target",
+			selector: ambiguousFilter,
+		};
+		return {
+			platform,
+			eligible: false,
+			ok: false,
+			reason: rejection.reason,
+			checkedCapabilities: [],
+			capabilityResults: [],
+			rejections: [rejection],
+			rejection,
+			log: [
+				`provider selector ${ambiguousFilter} is ambiguous; use an exact target id`,
+			],
+			snapshotStatus: "not_checked",
+			snapshotMtime: null,
+			snapshotAgeMsAtRoute: null,
+		};
+	}
+
 	const taskTiers = [];
 	for (const task of Array.isArray(tasks) ? tasks : []) {
 		const executor = String(task?.executor ?? "switchyard")

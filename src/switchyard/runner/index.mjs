@@ -4035,6 +4035,12 @@ function loadTarProvisionRegistry(dependencies) {
 function formatQueuePreflightFailure(result) {
 	const details = (result.rejections ?? []).map((rejection) => {
 		const capability = rejection.capability ?? "unknown";
+		// A selector-level rejection is not about any one capability tier, so the
+		// excluded-provider list would be empty and misleading. Name the selector
+		// instead: it is the only thing the operator can act on.
+		if (rejection.selector) {
+			return `${capability}: ${rejection.reason} (selector: ${rejection.selector}; use an exact target id)`;
+		}
 		const excluded = rejection.excludedProviders?.length
 			? rejection.excludedProviders.join(", ")
 			: "none";
