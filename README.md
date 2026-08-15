@@ -365,6 +365,25 @@ The host is the size limit, not the guest: `spawnSync` hits macOS `ARG_MAX`
 between a 683 KB and a 1.33 MB argument vector, and base64 inflates the payload
 by 4/3, so the usable prompt ceiling is roughly 500 KB.
 
+**Never orphan a `prlctl` process.** Do not wrap a `prlctl` call in a short
+`timeout`, and do not kill a shell, harness, or agent turn that is blocked in
+one. prlctl 26.4.1 segfaults when a signal reaches it after its parent has
+exited: it jumps to address 0 through `_sigtramp` while blocked in
+`QWaitCondition::wait` inside `ParallelsVirtualizationSDK` — measured
+2026-08-14 17:33:00, pid 10735, five minutes into an operation whose parent had
+already gone. That is a Parallels defect, and the fix on our side is not to
+provoke it. These operations are long by nature: a full clone of the golden
+image runs for minutes, and an in-guest `xcodebuild` runs longer. Bound them by
+making the operation smaller, never by killing it partway. If a call must run
+unattended, launch it detached and poll for its result rather than capping it.
+An interrupted clone is the orphan INV-3 reclamation has to sweep, and that
+sweep only fires for a creator PID it can prove dead.
+
+switchyard itself fails closed on a prlctl that dies this way — `execFileSync`
+throws, the `spawnSync` path treats the `null` status of a signal death as a
+failure, and the async transfer path reports `code ?? signal`. Nothing books a
+crashed transport as success.
+
 Large tar transfers use a one-shot host-memory HTTP endpoint over the Parallels
 host-only address. The guest's baked C-3 pf anchor contains a nested
 `switchyard-transfer/*` anchor; each transfer loads one exact host/port pass

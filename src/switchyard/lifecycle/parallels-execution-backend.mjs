@@ -573,6 +573,22 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.maxTransferBytes = maxTransferBytes;
 	}
 
+	/**
+	 * The single funnel for every synchronous prlctl invocation.
+	 *
+	 * Do not give this call a timeout, and do not kill an orchestrator that is
+	 * blocked in it. prlctl 26.4.1 segfaults when a signal reaches it after its
+	 * parent has exited: it jumps to address 0 through `_sigtramp` while blocked
+	 * in `QWaitCondition::wait` inside ParallelsVirtualizationSDK. Measured
+	 * 2026-08-14 17:33:00 — pid 10735, five minutes into an operation whose
+	 * parent was already gone. That crash leaked nothing, but an interrupted
+	 * clone is exactly the orphan INV-3's reclamation exists to sweep, and the
+	 * sweep only fires for a creator PID it can prove dead.
+	 *
+	 * The operations here are long by nature: a full clone of the golden image
+	 * runs for minutes. Bound them by making the operation smaller, never by
+	 * killing it partway.
+	 */
 	_call(args, options = {}) {
 		return this.prlctlFn(args, options);
 	}

@@ -198,6 +198,61 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
+	// The README's prlctl process-lifetime rule has two halves. The first is
+	// "do not provoke it": prlctl 26.4.1 segfaults when a signal reaches it
+	// after its parent has exited, jumping to address 0 through `_sigtramp`
+	// while blocked in QWaitCondition::wait inside ParallelsVirtualizationSDK
+	// (measured 2026-08-14 17:33:00, pid 10735). That half is a discipline, not
+	// a mechanism. This is the second half, which is testable: when it does
+	// happen, no path may book the crashed transport as success.
+	it("never books a signal-killed prlctl as success", () => {
+		const signalDeath = () => {
+			// The shape execFileSync raises for a child killed by a signal.
+			const error = new Error("Command failed: prlctl");
+			error.status = null;
+			error.signal = "SIGSEGV";
+			throw error;
+		};
+		const calls = [];
+		// `list` keeps working so the failure lands where it matters. A crash
+		// that takes out handle resolution proves nothing about the paths that
+		// catch and escalate.
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			prlctlFn: (args) => {
+				calls.push(args[0]);
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							// Destroy refuses a VM outside the reserved name, so an
+							// unmanaged name would pass this test for the wrong reason.
+							name: buildParallelsWorkingName("crashed-run", process.pid),
+						},
+					]);
+				return signalDeath();
+			},
+		});
+		throws(
+			() => backend.execGuest(WORK_UUID, "/bin/bash", ["-lc", "true"]),
+			/Command failed: prlctl/,
+			"a segfaulted prlctl exec returned instead of throwing",
+		);
+		// destroy escalates stop -> stop --kill -> delete. Every one of those
+		// dies the same way here, so the escalation must run out and surface
+		// rather than report a VM it never destroyed.
+		throws(
+			() => backend.destroy(WORK_UUID),
+			/Command failed: prlctl/,
+			"destroy reported success against a prlctl that never ran",
+		);
+		ok(
+			calls.filter((verb) => verb === "stop").length >= 2,
+			`destroy did not exhaust its escalation before failing: ${calls.join(",")}`,
+		);
+	});
+
 	it("uses the bulk transfer hook without sending tar bytes to prlctl", () => {
 		const transfers = [];
 		const prlctlCalls = [];
