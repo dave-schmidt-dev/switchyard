@@ -365,9 +365,16 @@ describe("macOS golden-image ops artifacts", () => {
 		);
 		// brew decides "installed" from the prefix, and the broken Cellar carries
 		// no receipt, so `brew reinstall` alone can no-op against this exact state.
+		// `uninstall --force` is brew bookkeeping too and can decline a formula it
+		// does not consider installed, so the removal the install depends on is the
+		// rm -- which needs no bookkeeping to be correct.
 		ok(
 			/uninstall --force xcodegen/.test(block.body),
 			"the XcodeGen repair does not remove the broken install before reinstalling",
+		);
+		ok(
+			/rm -rf "\$brew_path\/Cellar\/xcodegen"/.test(block.body),
+			"the XcodeGen repair leaves the broken Cellar directory to brew's bookkeeping, which does not model it",
 		);
 		// The guest script is root. A root-owned mktemp -d at mode 700 would make
 		// the generate fail on permissions and report a cause that is not the
@@ -448,6 +455,40 @@ describe("macOS golden-image ops artifacts", () => {
 				entry.startsWith(".switchyard-xcodegen-probe."),
 			),
 			"the probe left its working directory in the image",
+		);
+	});
+
+	// Regression, from the credential probe's own history: that script is fed to
+	// `bash -s`, `agy` read stdin when it decided to prompt, and it swallowed the
+	// script tail -- three provider checks silently never ran and nothing failed.
+	// The XcodeGen probe arrives the same way, so it gets the same `</dev/null`.
+	// Feeding the probe on stdin here is what makes the test able to see it: as a
+	// file argument the shell can seek back and the defect cannot reproduce.
+	it("does not let xcodegen eat the rest of the probe", () => {
+		const { script } = extractProbeScript(renderBuildGuestScripts(scratch()));
+		const dir = scratch();
+		const greedy = join(dir, "xcodegen-greedy");
+		writeFileSync(
+			greedy,
+			[
+				"#!/bin/bash",
+				// Exactly what a CLI that prompts does to a piped script.
+				"cat >/dev/null",
+				"mkdir -p SwitchyardPresetProbe.xcodeproj",
+				"printf 'path = SwitchyardPresetProbe.app;\\n' > SwitchyardPresetProbe.xcodeproj/project.pbxproj",
+				"",
+			].join("\n"),
+		);
+		chmodSync(greedy, 0o755);
+
+		const run = spawnSync("/bin/bash", ["-s", "--", greedy], {
+			encoding: "utf8",
+			input: script,
+			env: { ...process.env, HOME: dir },
+		});
+		ok(
+			run.stdout.includes("SWITCHYARD_XCODEGEN_PRODUCT_NAME_OK"),
+			"a stdin-reading xcodegen ate the probe's remaining lines, so the check silently never ran",
 		);
 	});
 });

@@ -388,9 +388,13 @@ if ! /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
   # catch. The broken Cellar directory carried no INSTALL_RECEIPT.json, and
   # brew decides "installed" from the prefix on disk, so a repair that leaves
   # that directory in place can no-op against exactly the state it targets.
-  # Remove it first, then install clean.
+  # \`uninstall --force\` is the right first move — it unlinks properly — but it
+  # is brew bookkeeping too, and it can decline a formula it does not consider
+  # installed. So the removal that the install actually depends on is the
+  # \`rm -rf\`, which needs no bookkeeping to be correct.
   /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
     /usr/bin/env NONINTERACTIVE=1 "\$brew_path/bin/brew" uninstall --force xcodegen || true
+  /bin/rm -rf "\$brew_path/Cellar/xcodegen"
   /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
     /usr/bin/env NONINTERACTIVE=1 "\$brew_path/bin/brew" install xcodegen
 fi
@@ -423,7 +427,10 @@ trap '/bin/rm -rf "\$probe_dir"' EXIT
 /usr/bin/printf 'name: SwitchyardPresetProbe\\ntargets:\\n  SwitchyardPresetProbe:\\n    type: application\\n    platform: iOS\\n' \\
   > "\$probe_dir/project.yml"
 cd "\$probe_dir"
-"\$xcodegen_bin" generate 2>&1
+# \`</dev/null\` for the reason the credential probe carries it: this script
+# arrives on \`bash -s\`, and a tool that reads stdin when it decides to prompt
+# eats the rest of it. That cost three silently-skipped providers once already.
+"\$xcodegen_bin" generate 2>&1 </dev/null
 /usr/bin/grep -Fq 'SwitchyardPresetProbe.app' \\
   "\$probe_dir/SwitchyardPresetProbe.xcodeproj/project.pbxproj" &&
   /usr/bin/printf 'SWITCHYARD_XCODEGEN_PRODUCT_NAME_OK\\n'
