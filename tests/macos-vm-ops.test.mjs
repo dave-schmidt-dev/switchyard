@@ -5,7 +5,7 @@
 // generate-cli-manifest.sh) and the guest credential probe
 // (ops/macos-vm/probe-guest-credentials.sh).
 //
-// Three things here cannot be checked by reading the scripts:
+// Four things here cannot be checked by reading the scripts:
 //
 //   1. The manifest has to satisfy the build script's OWN validator, not a
 //      restatement of it. So the validator is extracted from
@@ -23,6 +23,14 @@
 //      logged-out CLI as ready, which is the wrong "yes" the whole credential
 //      table exists to prevent — so those two fixtures are asserted directly.
 //
+//   4. build-golden-image.sh's `guest_exec_script <<EOF` blocks are a second
+//      program. The host expands them, `prlctl exec` feeds them to the guest's
+//      bash, and `bash -n` on the outer file never looks inside — so a break
+//      there surfaces hours into a rebuild, against a VM, as a guest error. The
+//      blocks are rendered and syntax-checked here, and the XcodeGen probe
+//      (added after the image shipped a preset-less install twice) is executed
+//      against a broken stub and a healthy one.
+//
 // Nothing here talks to Parallels or boots a VM: the probe is rendered, not
 // dispatched.
 
@@ -30,9 +38,11 @@ import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import {
 	accessSync,
+	chmodSync,
 	constants,
 	existsSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
@@ -103,6 +113,62 @@ const extractShellFunction = (body, name) => {
 };
 
 const scratch = () => mkdtempSync(join(tmpdir(), "switchyard-vm-ops-"));
+
+// Renders every `guest_exec_script <<EOF` block in the build script the way the
+// host renders it: the script's own top-level assignments, then `cat <<EOF`.
+// Returns one entry per block with the source line it started on, so a failure
+// names the block instead of the file.
+const renderBuildGuestScripts = (dir) => {
+	const lines = readFileSync(BUILD, "utf8").split("\n");
+	const preamble = [];
+	for (const line of lines) {
+		if (/^[a-z_]+\(\) \{/.test(line)) break;
+		if (/^(readonly )?[A-Z][A-Z0-9_]*=/.test(line)) preamble.push(line);
+	}
+	ok(preamble.length > 0, "build script lost its top-level assignments");
+
+	const rendered = [];
+	for (let i = 0; i < lines.length; i += 1) {
+		if (!/guest_exec_script <<EOF$/.test(lines[i])) continue;
+		const end = lines.indexOf("EOF", i + 1);
+		ok(end !== -1, `unterminated guest heredoc opened at line ${i + 1}`);
+		const harness = join(dir, `render-guest-${rendered.length}.sh`);
+		writeFileSync(
+			harness,
+			[...preamble, "cat <<EOF", ...lines.slice(i + 1, end), "EOF", ""].join(
+				"\n",
+			),
+		);
+		const run = spawnSync("/bin/bash", [harness], { encoding: "utf8" });
+		strictEqual(
+			run.status,
+			0,
+			`rendering the guest block at line ${i + 1} failed: ${run.stderr}`,
+		);
+		rendered.push({ line: i + 1, body: run.stdout });
+		i = end;
+	}
+	ok(
+		rendered.length >= 3,
+		`expected several guest blocks, got ${rendered.length}`,
+	);
+	return rendered;
+};
+
+// Pulls the XcodeGen probe out of a rendered guest block so it can be run
+// standalone. It takes the xcodegen path as $1, which is what makes it testable
+// against a stub.
+const extractProbeScript = (rendered) => {
+	const block = rendered.find((entry) =>
+		entry.body.includes("<<'PROBE_SCRIPT'"),
+	);
+	ok(block, "no guest block carries the XcodeGen probe heredoc");
+	const start = block.body.indexOf("<<'PROBE_SCRIPT'");
+	const bodyStart = block.body.indexOf("\n", start) + 1;
+	const end = block.body.indexOf("\nPROBE_SCRIPT\n", bodyStart);
+	ok(end !== -1, "unterminated XcodeGen probe heredoc");
+	return { block, script: block.body.slice(bodyStart, end + 1) };
+};
 
 // Renders the guest-side script the probe would feed to `prlctl exec`, without
 // needing Parallels: the one prlctl call is swapped for cat and the running-VM
@@ -262,6 +328,126 @@ describe("macOS golden-image ops artifacts", () => {
 		ok(
 			!/guest_exec "/.test(gateBody),
 			"the DNS probe uses guest_exec, whose argv reparse drops the pipe",
+		);
+	});
+
+	// `bash -n` on the file above only parses the host half. The guest half is
+	// text until the host expands it, and it runs under macOS's bash 3.2.57.
+	it("renders guest scripts that parse under the guest's own bash", () => {
+		const dir = scratch();
+		for (const { line, body } of renderBuildGuestScripts(dir)) {
+			const guest = join(dir, `guest-${line}.sh`);
+			writeFileSync(guest, body);
+			const r = spawnSync("/bin/bash", ["-n", guest], { encoding: "utf8" });
+			strictEqual(
+				r.status,
+				0,
+				`the guest block at line ${line} does not parse: ${r.stderr}`,
+			);
+		}
+	});
+
+	// Regression, measured 2026-08-14. `switchyard-golden-6` shipped an XcodeGen
+	// whose Cellar held `bin` and nothing else -- no share/xcodegen/SettingPresets
+	// -- so every generated project came out with an empty PRODUCT_NAME and
+	// SWIFT_VERSION and `xcodebuild` died on "Multiple commands produce .../.app".
+	// `xcodegen --version` reports the pinned version perfectly well in that
+	// state, so the version guard could never see it. The same defect is visible
+	// in the Task 1.3 evidence from a clone of golden-2, which means it shipped in
+	// every build of this script.
+	it("checks XcodeGen by generating a project, not by its version string", () => {
+		const rendered = renderBuildGuestScripts(scratch());
+		const { block, script } = extractProbeScript(rendered);
+
+		ok(
+			block.body.includes("share/xcodegen/SettingPresets"),
+			"the build no longer asserts the XcodeGen preset tree is on disk",
+		);
+		// brew decides "installed" from the prefix, and the broken Cellar carries
+		// no receipt, so `brew reinstall` alone can no-op against this exact state.
+		ok(
+			/uninstall --force xcodegen/.test(block.body),
+			"the XcodeGen repair does not remove the broken install before reinstalling",
+		);
+		// The guest script is root. A root-owned mktemp -d at mode 700 would make
+		// the generate fail on permissions and report a cause that is not the
+		// cause, so the probe's directory has to be created in the same hop that
+		// runs xcodegen.
+		ok(
+			script.includes('mktemp -d "$HOME/'),
+			"the XcodeGen probe does not create its working directory as the build user",
+		);
+		ok(
+			/XcodeGen did not generate a project carrying a product name: \$xcodegen_probe_out/.test(
+				block.body,
+			),
+			"the XcodeGen failure does not carry the probe's own output, so it cannot say why it stopped",
+		);
+	});
+
+	// Executed, not read: the probe is the thing that has to fail on a
+	// preset-less install, and asserting its text cannot show that it does.
+	it("fails a preset-less XcodeGen and passes a healthy one", () => {
+		const { script } = extractProbeScript(renderBuildGuestScripts(scratch()));
+		const dir = scratch();
+		const probe = join(dir, "probe.sh");
+		writeFileSync(probe, script);
+
+		const stub = (name, body) => {
+			const path = join(dir, name);
+			writeFileSync(path, `#!/bin/bash\n${body}\n`);
+			chmodSync(path, 0o755);
+			return path;
+		};
+		// What the broken image does: exits 0, warns, writes a project whose
+		// product name is empty.
+		const presetless = stub(
+			"xcodegen-preset-less",
+			[
+				`printf 'No "base" settings found\\n'`,
+				"mkdir -p SwitchyardPresetProbe.xcodeproj",
+				"printf 'PRODUCT_NAME = \"\";\\n' > SwitchyardPresetProbe.xcodeproj/project.pbxproj",
+			].join("\n"),
+		);
+		const healthy = stub(
+			"xcodegen-healthy",
+			[
+				"mkdir -p SwitchyardPresetProbe.xcodeproj",
+				"printf 'path = SwitchyardPresetProbe.app;\\n' > SwitchyardPresetProbe.xcodeproj/project.pbxproj",
+			].join("\n"),
+		);
+
+		const run = (bin) =>
+			spawnSync("/bin/bash", [probe, bin], {
+				encoding: "utf8",
+				env: { ...process.env, HOME: dir },
+			});
+
+		const broken = run(presetless);
+		ok(
+			broken.stdout.includes('No "base" settings found'),
+			"the probe swallowed the preset warning the build greps for",
+		);
+		ok(
+			!broken.stdout.includes("SWITCHYARD_XCODEGEN_PRODUCT_NAME_OK"),
+			"the probe passed a preset-less XcodeGen",
+		);
+
+		const good = run(healthy);
+		strictEqual(
+			good.status,
+			0,
+			`probe failed a healthy install: ${good.stderr}`,
+		);
+		ok(
+			good.stdout.includes("SWITCHYARD_XCODEGEN_PRODUCT_NAME_OK"),
+			"the probe does not signal success on a healthy install",
+		);
+		ok(
+			!readdirSync(dir).some((entry) =>
+				entry.startsWith(".switchyard-xcodegen-probe."),
+			),
+			"the probe left its working directory in the image",
 		);
 	});
 });

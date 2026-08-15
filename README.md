@@ -126,6 +126,18 @@ the requested iOS runtime, disables the guest clipboard agent, and loads the
 guest-side C-3 pf anchor. It restarts before the final Aqua, transport,
 clipboard, pf, memory, and network assertions.
 
+It also pins XcodeGen, and asserts it by **using** it rather than by its version
+string. Two shipped images carried a Homebrew Cellar holding `bin` and nothing
+else — no `share/xcodegen/SettingPresets` — which reports the pinned version
+correctly while generating projects with an empty `PRODUCT_NAME` and
+`SWIFT_VERSION` that `xcodebuild` cannot build. The build now requires the
+preset tree, repairs by removing the Cellar directory before installing (brew
+keys "installed" off the prefix, and the broken directory has no receipt, so
+`brew reinstall` can no-op against exactly that state), and generates a
+throwaway project to assert a non-empty product name. Apply the same rule to
+anything added here: a check that proves a tool is present does not prove it
+works.
+
 Provider installers are supplied through a pinned, externally reviewed
 manifest; the script will not use an unpinned `curl | shell` or an unversioned
 npm install. Each non-comment row is
@@ -315,10 +327,43 @@ and PID liveness are injectable for hermetic tests and smoke runs.
 ### Parallels data plane (Task 4.2)
 
 VM execution uses `prlctl exec <uuid> launchctl asuser <UID> sudo -u <provider>
-/bin/bash -lc ...`, with an explicit `cd <cwd>` shim. This is intentionally the
-measured Aqua-session route; the earlier LaunchAgent/`launchctl bootstrap` D-5
-requirement was withdrawn because it could not provide the provider's stdin,
-incremental output, exit status, or killable process handle.
+/usr/bin/env HOME=… USER=… LOGNAME=… /bin/bash -lc '<base64 decode>'`. This is
+intentionally the measured Aqua-session route; the earlier
+LaunchAgent/`launchctl bootstrap` D-5 requirement was withdrawn because it could
+not provide the provider's stdin, incremental output, exit status, or killable
+process handle.
+
+Three properties of `prlctl exec` shape that command line, and all three were
+measured against a live guest rather than assumed. **Do not simplify any of them
+away.**
+
+- *It does not pass an argument vector through.* It joins the arguments with
+  spaces and the guest applies exactly one round of shell parsing. So the
+  backend builds the entire vector in one place — `_buildAquaExecArgs` takes the
+  command's `argv` and returns the finished `prlctl` arguments. It is not a
+  prefix for callers to append to; a transport that never sees the whole vector
+  cannot quote it.
+- *It enters the guest with `HOME=/`,* and macOS sudoers preserves that across
+  `sudo -u`. `sudo -H` does not override it. Left alone, Bun-based providers try
+  to `mkdir /.cache` on the read-only system volume. The `env` assignments are
+  therefore *ahead of* `bash -lc`, not inside the script: `-l` sources
+  `/etc/profile` and `$HOME/.bash_profile` first, so anything set inside the
+  script would arrive after the profile had already read the wrong home.
+- *It cannot carry a byte above 0x7F.* Any multi-byte character corrupts the
+  command line the guest rebuilds, and it surfaces as
+  `unexpected EOF while looking for matching '` rather than as mangled text —
+  one em dash in a code comment was enough to stop a provider from starting. The
+  guest script therefore crosses base64-encoded, so only the base64 alphabet is
+  ever on the wire. The decode runs in a command substitution, which is what
+  keeps the provider's stdin, stdout, stderr and exit status inherited.
+
+The one value that cannot be inside the payload is the bulk-transfer URL, since
+its port is not known until the helper has bound it. It crosses as a validated
+plaintext `KEY=value` argument that the guest script substitutes.
+
+The host is the size limit, not the guest: `spawnSync` hits macOS `ARG_MAX`
+between a 683 KB and a 1.33 MB argument vector, and base64 inflates the payload
+by 4/3, so the usable prompt ceiling is roughly 500 KB.
 
 Large tar transfers use a one-shot host-memory HTTP endpoint over the Parallels
 host-only address. The guest's baked C-3 pf anchor contains a nested
@@ -344,8 +389,19 @@ indistinguishable from a working one until a task dies at exec.
 Select the native queue substrate explicitly:
 
 ```sh
+SWITCHYARD_PARALLELS_GOLDEN_IMAGE=<golden-vm-name> \
+SWITCHYARD_PARALLELS_AQUA_UID=<uid> \
 npm run dispatch -- <tasks.md> --project <path> --platform macos
 ```
+
+`SWITCHYARD_PARALLELS_GOLDEN_IMAGE` is required and has no default — a macOS
+queue without it fails closed, because guessing at which VM to clone is not a
+safe default. `SWITCHYARD_PARALLELS_AQUA_UID` is the auto-login account's uid
+(`503` on the reference image, where the provider account is `switchyard`);
+`SWITCHYARD_PARALLELS_PROVIDER_USER` overrides the account name. Both come from
+the image `ops/macos-vm/build-golden-image.sh` produced — read them off the
+guest with `id -u <account>` rather than assuming, since a rebuilt image can
+allocate a different uid.
 
 Before a macOS workspace or VM slot is created, Switchyard reads one routing
 snapshot for every non-terminal capability tier and requires at least one

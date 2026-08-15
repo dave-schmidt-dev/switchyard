@@ -375,10 +375,22 @@ if ! /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
   /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
     /usr/bin/env NONINTERACTIVE=1 "\$brew_path/bin/brew" install node
 fi
+# Reinstall on a version mismatch *or* a missing preset tree. The second half
+# matters because a binary-only XcodeGen reports the pinned version perfectly
+# well, so a version-only guard would skip the repair and leave the image
+# shipping a tool that cannot generate a buildable project.
 if ! /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
   "\$brew_path/bin/xcodegen" --version 2>/dev/null |
-  /usr/bin/grep -Fq "Version: ${XCODEGEN_VERSION}"; then
+  /usr/bin/grep -Fq "Version: ${XCODEGEN_VERSION}" ||
+  [[ ! -d "\$(/usr/bin/dirname "\$(/usr/bin/readlink -f "\$brew_path/bin/xcodegen" 2>/dev/null || echo /nonexistent)")/../share/xcodegen/SettingPresets" ]]; then
   guest_log "installing pinned XcodeGen ${XCODEGEN_VERSION} through the existing administrator build session"
+  # \`brew reinstall\` alone would not repair the damage this guard exists to
+  # catch. The broken Cellar directory carried no INSTALL_RECEIPT.json, and
+  # brew decides "installed" from the prefix on disk, so a repair that leaves
+  # that directory in place can no-op against exactly the state it targets.
+  # Remove it first, then install clean.
+  /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
+    /usr/bin/env NONINTERACTIVE=1 "\$brew_path/bin/brew" uninstall --force xcodegen || true
   /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
     /usr/bin/env NONINTERACTIVE=1 "\$brew_path/bin/brew" install xcodegen
 fi
@@ -386,6 +398,45 @@ fi
   "\$brew_path/bin/xcodegen" --version |
   /usr/bin/grep -Fq "Version: ${XCODEGEN_VERSION}" ||
   guest_fail "XcodeGen version is not pinned to ${XCODEGEN_VERSION}"
+# --version is not enough, and \`switchyard-golden-6\` is the proof: it shipped a
+# binary-only XcodeGen whose Cellar held \`bin\` and nothing else — no
+# \`share/xcodegen/SettingPresets\`, no install receipt. The version check passed,
+# every generated project came out with an empty PRODUCT_NAME and an empty
+# SWIFT_VERSION, and \`xcodebuild test\` then died on "Multiple commands produce
+# .../.app". So assert the presets are on disk and that a generated project
+# actually carries a product name. Same blind spot as the DHCP and stdin-eating
+# probe defects: a check that proves the tool is present, not that it works.
+xcodegen_root="\$(/usr/bin/dirname "\$(/usr/bin/readlink -f "\$brew_path/bin/xcodegen")")/.."
+[[ -d "\$xcodegen_root/share/xcodegen/SettingPresets" ]] ||
+  guest_fail "XcodeGen is installed without its SettingPresets resources; every generated project would build with an empty PRODUCT_NAME"
+# The probe runs entirely inside the unprivileged hop, and the working
+# directory is created there too. This guest shell is root, so a root-owned
+# \`mktemp -d\` at mode 700 would be unwritable by the build user: the generate
+# would then fail on permissions, not on presets, and the check would report a
+# cause that is not the cause. Same class of mistake as the defect it guards.
+xcodegen_probe_out="\$(/bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
+  /bin/bash -s -- "\$brew_path/bin/xcodegen" 2>&1 <<'PROBE_SCRIPT' || true
+set -Eeuo pipefail
+xcodegen_bin="\$1"
+probe_dir="\$(/usr/bin/mktemp -d "\$HOME/.switchyard-xcodegen-probe.XXXXXX")"
+trap '/bin/rm -rf "\$probe_dir"' EXIT
+/usr/bin/printf 'name: SwitchyardPresetProbe\\ntargets:\\n  SwitchyardPresetProbe:\\n    type: application\\n    platform: iOS\\n' \\
+  > "\$probe_dir/project.yml"
+cd "\$probe_dir"
+"\$xcodegen_bin" generate 2>&1
+/usr/bin/grep -Fq 'SwitchyardPresetProbe.app' \\
+  "\$probe_dir/SwitchyardPresetProbe.xcodeproj/project.pbxproj" &&
+  /usr/bin/printf 'SWITCHYARD_XCODEGEN_PRODUCT_NAME_OK\\n'
+PROBE_SCRIPT
+)"
+case "\$xcodegen_probe_out" in
+  *'No "base" settings found'*)
+    guest_fail "XcodeGen cannot load its setting presets, so generated projects are unbuildable" ;;
+esac
+# Carry the probe's own output into the failure. A build that stops here has to
+# say whether it stopped on presets, on permissions, or on something else.
+[[ "\$xcodegen_probe_out" == *SWITCHYARD_XCODEGEN_PRODUCT_NAME_OK* ]] ||
+  guest_fail "XcodeGen did not generate a project carrying a product name: \$xcodegen_probe_out"
 
 # The password is generated and consumed inside this guest shell. It is never
 # an argument to prlctl, never printed, and never copied to a host artifact.
