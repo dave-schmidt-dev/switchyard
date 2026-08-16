@@ -1,6 +1,6 @@
 const DEFAULT_MAX_AGE_MS = 5 * 60 * 1000;
 
-export class BrokerSnapshotError extends Error {
+class BrokerSnapshotError extends Error {
 	constructor(code) {
 		super(code);
 		this.name = "BrokerSnapshotError";

@@ -28,7 +28,7 @@ const RESULT_FIELDS = new Set([
 ]);
 
 export const BROKER_CONTRACT_VERSION = BROKER_SCHEMA_VERSION;
-export const BROKER_DATA_CLASS = Object.freeze({
+const BROKER_DATA_CLASS = Object.freeze({
 	repository: "repository",
 	restricted: "restricted",
 	unknown: "unknown",

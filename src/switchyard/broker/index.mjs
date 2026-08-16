@@ -12,8 +12,6 @@ import {
 } from "./schema.mjs";
 import { createSnapshotCoordinator } from "./snapshots.mjs";
 
-export { executeBrokerRoute } from "./executor.mjs";
-
 function requireDependency(value, label) {
 	if (typeof value !== "function") {
 		throw new TypeError(`broker dependency ${label} must be a function`);
