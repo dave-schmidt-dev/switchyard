@@ -3,6 +3,7 @@ import {
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { readSnapshotAtRoute, route } from "../router/index.mjs";
+import { executeBrokerRoute } from "./executor.mjs";
 import { createReservationLedger } from "./reservations.mjs";
 import {
 	BROKER_CONTRACT_VERSION,
@@ -10,6 +11,8 @@ import {
 	validateBrokerResult,
 } from "./schema.mjs";
 import { createSnapshotCoordinator } from "./snapshots.mjs";
+
+export { executeBrokerRoute } from "./executor.mjs";
 
 function requireDependency(value, label) {
 	if (typeof value !== "function") {
@@ -358,10 +361,36 @@ export function createBroker(dependencies = {}) {
 		});
 	}
 
+	async function execute(requestValue, resultValue, options = {}) {
+		const request = validateBrokerRequest(requestValue);
+		const result = validateBrokerResult(resultValue);
+		if (!dependencies.executor) {
+			throw new Error("broker executor is unavailable");
+		}
+		const descriptor = resolveDescriptor(
+			result.resolvedTarget,
+			result.capability,
+		);
+		return executeBrokerRoute({
+			request,
+			route: result,
+			invocationDescriptor: descriptor,
+			launcherIdentity: options.launcherIdentity,
+			launch: dependencies.executor,
+			signal: options.signal,
+			onStatus: options.onStatus,
+			terminal: ({ outcome, actualConsumption }) =>
+				outcome === "success"
+					? reconcile(result, actualConsumption)
+					: release(result, outcome),
+		});
+	}
+
 	return Object.freeze({
 		select,
 		selectAndReserve,
 		fallbackAndReserve,
+		execute,
 		reconcile,
 		release,
 	});

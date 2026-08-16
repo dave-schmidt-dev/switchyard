@@ -4051,6 +4051,51 @@ const DEFAULT_ADAPTERS = {
 	},
 };
 
+/**
+ * Bind an existing async provider adapter to the complete broker identity.
+ * The returned identity is checked by the broker before adapter execution.
+ */
+export function createBrokerAdapterLauncher({
+	adapter,
+	executionBackend,
+	workingContainerName,
+	prompt,
+	timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+}) {
+	if (!adapter || typeof adapter.executeAsync !== "function") {
+		throw new TypeError("broker adapter requires executeAsync");
+	}
+	return async function launch({
+		request,
+		route,
+		invocationDescriptor,
+		signal,
+		onStatus,
+	}) {
+		const execution = await adapter.executeAsync(
+			typeof prompt === "string" && prompt.length > 0 ? prompt : request.taskId,
+			workingContainerName,
+			{
+				model: route.model,
+				timeoutMs,
+				executionBackend,
+				signal,
+				onPoll: onStatus,
+				invocationDescriptor,
+				descriptorIdentity: invocationDescriptor.descriptor_identity,
+				descriptorHarness: route.harness,
+				resolvedTargetId: route.resolvedTarget,
+			},
+		);
+		return {
+			success: execution?.success === true,
+			cancelled: signal?.aborted === true,
+			reason: execution?.error ?? null,
+			actualConsumption: execution?.actualConsumption,
+		};
+	};
+}
+
 function runBackendGitCommand(executionBackend, workspaceId, script) {
 	if (typeof executionBackend.execGuest === "function") {
 		executionBackend.execGuest(workspaceId, "/bin/bash", ["-lc", script], {
