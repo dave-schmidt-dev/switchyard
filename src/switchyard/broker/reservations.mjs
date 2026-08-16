@@ -32,7 +32,12 @@ function processIsAlive(pid) {
 }
 
 function emptyLedger() {
-	return { schemaVersion: LEDGER_VERSION, revision: 0, reservations: [] };
+	return {
+		schemaVersion: LEDGER_VERSION,
+		revision: 0,
+		reservations: [],
+		fallbackAttempts: [],
+	};
 }
 
 function publicReservation(record) {
@@ -142,6 +147,10 @@ export function createReservationLedger(options = {}) {
 		) {
 			throw new Error("broker reservation ledger has an unsupported schema");
 		}
+		if (value.fallbackAttempts === undefined) value.fallbackAttempts = [];
+		if (!Array.isArray(value.fallbackAttempts)) {
+			throw new Error("broker reservation ledger has an unsupported schema");
+		}
 		return value;
 	}
 
@@ -196,13 +205,53 @@ export function createReservationLedger(options = {}) {
 		return changed;
 	}
 
-	async function reserveWithSelection(select) {
+	async function reserveWithSelection(select, fallbackContext = null) {
 		if (typeof select !== "function") {
 			throw new TypeError("reservation selector must be a function");
+		}
+		if (fallbackContext !== null) {
+			if (!fallbackContext || typeof fallbackContext !== "object") {
+				throw new TypeError("fallback reservation context must be an object");
+			}
+			requireText(fallbackContext.runId, "fallback.runId");
+			requireText(fallbackContext.taskId, "fallback.taskId");
+			requireText(
+				fallbackContext.fromReservationId,
+				"fallback.fromReservationId",
+			);
 		}
 		return withLock(async (ledger, persist) => {
 			const timestamp = now();
 			const recovered = recover(ledger, timestamp);
+			if (fallbackContext !== null) {
+				const previous = ledger.reservations.find(
+					(record) => record.id === fallbackContext.fromReservationId,
+				);
+				if (
+					!previous ||
+					previous.runId !== fallbackContext.runId ||
+					previous.taskId !== fallbackContext.taskId ||
+					previous.state !== "released" ||
+					previous.terminalReason !== "failure"
+				) {
+					throw new Error("fallback source reservation is not a failed route");
+				}
+				if (
+					ledger.fallbackAttempts.some(
+						(attempt) =>
+							attempt.runId === fallbackContext.runId &&
+							attempt.taskId === fallbackContext.taskId,
+					)
+				) {
+					throw new Error("fallback already attempted for this task");
+				}
+				ledger.fallbackAttempts.push({
+					runId: fallbackContext.runId,
+					taskId: fallbackContext.taskId,
+					fromReservationId: fallbackContext.fromReservationId,
+					attemptedAt: timestamp,
+				});
+			}
 			const active = Object.freeze(
 				ledger.reservations
 					.filter((record) => record.state === "reserved")
@@ -214,9 +263,15 @@ export function createReservationLedger(options = {}) {
 						}),
 					),
 			);
-			const input = await select(active);
+			let input;
+			try {
+				input = await select(active);
+			} catch (error) {
+				if (recovered || fallbackContext !== null) await persist(ledger);
+				throw error;
+			}
 			if (input === null) {
-				if (recovered) await persist(ledger);
+				if (recovered || fallbackContext !== null) await persist(ledger);
 				return null;
 			}
 			const provider = requireText(input.provider, "reservation.provider");

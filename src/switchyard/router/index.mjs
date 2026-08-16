@@ -92,8 +92,8 @@ const SNAPSHOT_STALE_THRESHOLD_MS = 5 * 60 * 1000;
  * @param {number} nowMs
  * @returns {{snapshot: object|null, snapshotStatus: string, snapshotMtime: number|null, snapshotAgeMsAtRoute: number|null}}
  */
-function readSnapshotAtRoute(nowMs) {
-	const path = resolveSnapshotPath();
+export function readSnapshotAtRoute(nowMs, sourcePath) {
+	const path = sourcePath ?? resolveSnapshotPath();
 	let snapshotMtime = null;
 	let raw;
 	try {
@@ -672,6 +672,7 @@ export function route(options = {}) {
 		requiredCapability,
 		availableProviders,
 		nowMs = Date.now(),
+		snapshotRead: suppliedSnapshotRead,
 	} = options;
 	// Resolve the routing seed up front; it feeds the scorer's deterministic
 	// tie-break below (Task 11: equal-headroom candidates are decided by
@@ -709,9 +710,9 @@ export function route(options = {}) {
 	// Read snapshot host-side (WR-1). All route-time diagnostics below come
 	// from this one resolved path/content read, so status, mtime, and age cannot
 	// describe different snapshot generations.
-	const snapshotRead = readSnapshotAtRoute(
-		Number.isFinite(nowMs) ? nowMs : Date.now(),
-	);
+	const snapshotRead =
+		suppliedSnapshotRead ??
+		readSnapshotAtRoute(Number.isFinite(nowMs) ? nowMs : Date.now());
 	const { snapshot, snapshotStatus, snapshotMtime, snapshotAgeMsAtRoute } =
 		snapshotRead;
 	const snapshotDiagnostics = {

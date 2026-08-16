@@ -2,13 +2,14 @@ import {
 	getInvocationDescriptor,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
-import { route } from "../router/index.mjs";
+import { readSnapshotAtRoute, route } from "../router/index.mjs";
 import { createReservationLedger } from "./reservations.mjs";
 import {
 	BROKER_CONTRACT_VERSION,
 	validateBrokerRequest,
 	validateBrokerResult,
 } from "./schema.mjs";
+import { createSnapshotCoordinator } from "./snapshots.mjs";
 
 function requireDependency(value, label) {
 	if (typeof value !== "function") {
@@ -50,6 +51,36 @@ export function createBroker(dependencies = {}) {
 		throw new TypeError("broker dependency reservations is invalid");
 	}
 	const ownerId = dependencies.ownerId ?? `pid:${process.pid}`;
+	const snapshotSources = dependencies.snapshotSources ?? { "gradus-v2": null };
+	if (
+		!snapshotSources ||
+		typeof snapshotSources !== "object" ||
+		Array.isArray(snapshotSources)
+	) {
+		throw new TypeError("broker dependency snapshotSources must be an object");
+	}
+	const snapshots =
+		dependencies.readSnapshot !== undefined || routeTask === route
+			? createSnapshotCoordinator({
+					read:
+						dependencies.readSnapshot ??
+						(({ source, nowMs }) => {
+							if (!Object.hasOwn(snapshotSources, source)) {
+								throw new Error("snapshot_source_unknown");
+							}
+							const sourcePath = snapshotSources[source];
+							if (sourcePath !== null && typeof sourcePath !== "string") {
+								throw new TypeError(
+									"configured snapshot source must be a path or null",
+								);
+							}
+							return readSnapshotAtRoute(nowMs, sourcePath ?? undefined);
+						}),
+					refresh: dependencies.refreshSnapshot,
+					now: dependencies.now,
+					maxAgeMs: dependencies.snapshotMaxAgeMs,
+				})
+			: null;
 	const reservationCapacity = dependencies.reservationCapacity ?? 100;
 	if (
 		typeof reservationCapacity !== "number" ||
@@ -67,7 +98,7 @@ export function createBroker(dependencies = {}) {
 		throw new TypeError("broker dependency executor must be a function");
 	}
 
-	function select(requestValue) {
+	function selectPrepared(requestValue, selectionOptions = {}) {
 		const request = validateBrokerRequest(requestValue);
 		for (const adapter of request.availableAdapters) {
 			if (!Object.hasOwn(adapters, adapter) || !adapters[adapter]) {
@@ -85,6 +116,8 @@ export function createBroker(dependencies = {}) {
 			requiredCapability: request.capability,
 			availableProviders,
 			snapshotSource: request.snapshotSource,
+			snapshotRead: selectionOptions.snapshotRead,
+			exclude: selectionOptions.exclude ?? [],
 		});
 		if (!routed || typeof routed !== "object" || Array.isArray(routed)) {
 			throw new Error("router returned a malformed result");
@@ -162,11 +195,18 @@ export function createBroker(dependencies = {}) {
 		});
 	}
 
+	function select(requestValue) {
+		return selectPrepared(requestValue);
+	}
+
 	async function selectAndReserve(requestValue) {
 		const request = validateBrokerRequest(requestValue);
+		const snapshotRead = snapshots
+			? await snapshots.prepare(request.snapshotSource)
+			: undefined;
 		let selected = null;
 		const reservation = await reservations.reserveWithSelection(() => {
-			selected = select(request);
+			selected = selectPrepared(request, { snapshotRead });
 			if (!selected.provider) return null;
 			const generation =
 				selected.snapshotIdentity.mtime ?? selected.snapshotIdentity.status;
@@ -199,6 +239,102 @@ export function createBroker(dependencies = {}) {
 		});
 	}
 
+	const NEXT_CAPABILITY = Object.freeze({ low: "standard", standard: "high" });
+
+	async function fallbackAndReserve(
+		requestValue,
+		previousResultValue,
+		options = {},
+	) {
+		const request = validateBrokerRequest(requestValue);
+		const previous = validateBrokerResult(previousResultValue);
+		if (
+			previous.runId !== request.runId ||
+			previous.taskId !== request.taskId ||
+			previous.capability !== request.capability ||
+			!previous.provider ||
+			!previous.reservation
+		) {
+			throw new Error("fallback request does not match the reserved route");
+		}
+		if (!options || typeof options !== "object" || Array.isArray(options)) {
+			throw new TypeError("fallback options must be an object");
+		}
+		for (const field of Object.keys(options)) {
+			if (!new Set(["failureKind", "capabilityCeiling"]).has(field)) {
+				throw new TypeError(`fallback options has unknown field '${field}'`);
+			}
+		}
+		if (!new Set(["provider", "transient"]).has(options.failureKind)) {
+			throw new Error("fallback is limited to provider or transient failures");
+		}
+		const ceiling = options.capabilityCeiling ?? request.capability;
+		if (
+			ceiling !== request.capability &&
+			ceiling !== NEXT_CAPABILITY[request.capability]
+		) {
+			throw new Error(
+				"fallback capability ceiling must be the current or next tier",
+			);
+		}
+		const snapshotRead = snapshots
+			? await snapshots.prepare(request.snapshotSource)
+			: undefined;
+		await release(previous, "failure");
+		const capabilities =
+			ceiling === request.capability
+				? [request.capability]
+				: [request.capability, ceiling];
+		let selected = null;
+		const reservation = await reservations.reserveWithSelection(
+			() => {
+				for (const capability of capabilities) {
+					const candidateRequest = { ...request, capability };
+					selected = selectPrepared(candidateRequest, {
+						snapshotRead,
+						exclude: [previous.provider],
+					});
+					if (selected.provider) {
+						const generation =
+							selected.snapshotIdentity.mtime ??
+							selected.snapshotIdentity.status;
+						return {
+							provider: selected.provider,
+							window: `${selected.snapshotIdentity.source}@${generation}`,
+							runId: request.runId,
+							taskId: request.taskId,
+							ownerId,
+							ownerPid: process.pid,
+							estimatedConsumption: request.estimatedConsumption,
+							capacity: reservationCapacity,
+						};
+					}
+				}
+				return null;
+			},
+			{
+				runId: request.runId,
+				taskId: request.taskId,
+				fromReservationId: previous.reservation.id,
+			},
+		);
+		if (selected?.provider && reservation) {
+			return validateBrokerResult({ ...selected, reservation });
+		}
+		return validateBrokerResult({
+			...selected,
+			provider: null,
+			resolvedTarget: null,
+			harness: null,
+			model: null,
+			effort: null,
+			reservation: null,
+			reason: selected?.provider
+				? "capacity_unavailable"
+				: "fallback_unavailable",
+		});
+	}
+
 	async function reconcile(resultValue, actualConsumption) {
 		const result = validateBrokerResult(resultValue);
 		if (!result.reservation)
@@ -225,6 +361,7 @@ export function createBroker(dependencies = {}) {
 	return Object.freeze({
 		select,
 		selectAndReserve,
+		fallbackAndReserve,
 		reconcile,
 		release,
 	});
