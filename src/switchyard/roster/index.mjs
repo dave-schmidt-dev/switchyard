@@ -60,7 +60,16 @@ const CAPABILITY_CLASS_RANK = { low: 0, standard: 1, high: 2 };
 
 const MODEL_STATUSES = new Set(["active", "retired"]);
 const EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max"]);
-const VARIANT_VALUES = new Set(["default", "high", "max"]);
+const VARIANT_VALUES = new Set([
+	"default",
+	"none",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"thinking",
+]);
 
 /**
  * Provider-specific invocation vocabulary.  These are adapter contracts, not
@@ -90,7 +99,16 @@ export const PROVIDER_INVOCATION_VOCABULARY = Object.freeze({
 	}),
 	opencode: Object.freeze({
 		effort: Object.freeze([]),
-		variant: Object.freeze(["default", "high", "max"]),
+		variant: Object.freeze([
+			"default",
+			"none",
+			"low",
+			"medium",
+			"high",
+			"xhigh",
+			"max",
+			"thinking",
+		]),
 		argv: Object.freeze({ variant: Object.freeze(["--variant", "<variant>"]) }),
 	}),
 	copilot: Object.freeze({

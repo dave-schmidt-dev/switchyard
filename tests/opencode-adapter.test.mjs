@@ -30,8 +30,8 @@ const OPENCODE_DESCRIPTOR = validateInvocationDescriptor(
 		model_ref: "fake-model",
 		selector: "fake-model",
 		effort: null,
-		variant: "high",
-		invocation_args: ["--variant", "high"],
+		variant: "thinking",
+		invocation_args: ["--variant", "thinking"],
 	},
 	"opencode",
 );
@@ -43,7 +43,7 @@ case " $* " in
   *) echo "stub: executeOpencode did not invoke the run subcommand; args: $*" >&2; exit 4 ;;
 esac
 case " $* " in
-  *" --variant high "*) ;;
+  *" --variant thinking "*) ;;
   *) echo "stub: executeOpencode did not forward descriptor variant; args: $*" >&2; exit 3 ;;
 esac
 case " $* " in

@@ -1254,10 +1254,11 @@ describe("roster loader — provider vocabularies and real-roster coherence", ()
 			"model_reasoning_effort=xhigh",
 		);
 		strictEqual(mapInvocationArgs("codex", { effort: "max" }), null);
-		strictEqual(
-			mapInvocationArgs("opencode", { variant: "max" })[0],
+		deepStrictEqual(mapInvocationArgs("opencode", { variant: "thinking" }), [
 			"--variant",
-		);
+			"thinking",
+		]);
+		deepStrictEqual(mapInvocationArgs("opencode", {}), []);
 		strictEqual(mapInvocationArgs("agy", { effort: "high" }), null);
 		strictEqual(mapInvocationArgs("cursor", { variant: "high" }), null);
 		strictEqual(PROVIDER_INVOCATION_VOCABULARY.copilot.effort.length, 0);

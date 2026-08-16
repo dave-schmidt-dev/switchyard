@@ -179,7 +179,16 @@ function isSafeDescriptorReceipt(value, descriptorHarness = null) {
 		(value.variant !== null &&
 			value.variant !== undefined &&
 			(typeof value.variant !== "string" ||
-				!["default", "high", "max"].includes(value.variant))) ||
+				![
+					"default",
+					"none",
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+					"max",
+					"thinking",
+				].includes(value.variant))) ||
 		(value.effort != null && value.variant != null)
 	)
 		return false;

@@ -26,7 +26,16 @@ const SAFE_MODEL_ARG_RE = /^(?!-)[\w./:@() -]{1,200}$/;
 // the complete shape below.
 const SAFE_INVOCATION_ARG_RE = /^[^\r\n]{1,200}$/;
 const EFFORT_VALUES = new Set(["low", "medium", "high", "xhigh", "max"]);
-const VARIANT_VALUES = new Set(["default", "high", "max"]);
+const VARIANT_VALUES = new Set([
+	"default",
+	"none",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"thinking",
+]);
 
 function assertInvocationArgString(value, label) {
 	if (
@@ -77,7 +86,7 @@ export function validateInvocationArgs(args, harness) {
 			!VARIANT_VALUES.has(values[1])
 		) {
 			throw new Error(
-				"opencode invocation_args must be [--variant, default|high|max]",
+				"opencode invocation_args must be [--variant, default|none|low|medium|high|xhigh|max|thinking]",
 			);
 		}
 		return Object.freeze(values);

@@ -26,7 +26,7 @@
 //   agy       agy --print <prompt>                                  -> OK
 //   cursor    cursor-agent -p <prompt> --force --trust              -> OK
 //   copilot   copilot -p <prompt> --allow-all-tools --no-ask-user   -> OK
-//   opencode  opencode run --variant high --model <model> <prompt>  -> OK
+//   opencode  opencode run --model <model> <prompt>                 -> OK
 //
 // Flags mirror each adapter's real executeX() invocation so a probe exercises
 // the same path a dispatch would. Two deviations, both deliberate: codex needs a
@@ -55,10 +55,9 @@ const MAX_REASON_CHARS = 240;
 // carries four), so one probe proves one lane, not the CLI as a whole. The model
 // is the one whose live call is verified; override when probing another lane.
 const OPENCODE_PROBE_MODEL =
-	process.env.SWITCHYARD_OPENCODE_PROBE_MODEL ??
-	"mistral/mistral-medium-latest";
+	process.env.SWITCHYARD_OPENCODE_PROBE_MODEL ?? "opencode-go/mimo-v2.5";
 const OPENCODE_PROBE_VARIANT =
-	process.env.SWITCHYARD_OPENCODE_PROBE_VARIANT ?? "high";
+	process.env.SWITCHYARD_OPENCODE_PROBE_VARIANT ?? "";
 
 /**
  * @typedef {{args: string[], cwd?: string, stdin?: boolean}} ProbeSpec
@@ -85,18 +84,14 @@ export const LIVENESS_PROBES = Object.freeze({
 		args: ["copilot", "-p", prompt, "--allow-all-tools", "--no-ask-user"],
 		cwd: "/tmp",
 	}),
-	opencode: (prompt) => ({
-		args: [
-			"opencode",
-			"run",
-			"--variant",
-			OPENCODE_PROBE_VARIANT,
-			"--model",
-			OPENCODE_PROBE_MODEL,
-			prompt,
-		],
-		cwd: "/tmp",
-	}),
+	opencode: (prompt) => {
+		const args = ["opencode", "run"];
+		if (OPENCODE_PROBE_VARIANT) {
+			args.push("--variant", OPENCODE_PROBE_VARIANT);
+		}
+		args.push("--model", OPENCODE_PROBE_MODEL, prompt);
+		return { args, cwd: "/tmp" };
+	},
 });
 
 // Built rather than written as a literal: the pattern starts with ESC, and a

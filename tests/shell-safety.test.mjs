@@ -105,3 +105,18 @@ test("validateInvocationArgs - rejects a correctly-shaped pair in reversed posit
 		/must be/,
 	);
 });
+
+test("validateInvocationArgs - accepts MiniMax thinking and no OpenCode variant", () => {
+	assert.deepStrictEqual(
+		validateInvocationArgs(["--variant", "thinking"], "opencode"),
+		["--variant", "thinking"],
+	);
+	assert.deepStrictEqual(validateInvocationArgs([], "opencode"), []);
+});
+
+test("validateInvocationArgs - rejects unsupported OpenCode variants", () => {
+	assert.throws(
+		() => validateInvocationArgs(["--variant", "turbo"], "opencode"),
+		/must be/,
+	);
+});

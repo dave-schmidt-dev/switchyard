@@ -140,9 +140,14 @@ describe("probeLiveness", () => {
 		);
 	});
 
-	it("gives opencode an explicit model, because a bare run does not terminate", () => {
+	it("probes the no-variant MiMo lane used for low-capability dispatch", () => {
 		const spec = specFor("opencode");
-		strictEqual(spec.args.includes("--model"), true);
-		strictEqual(spec.args.includes("--variant"), true);
+		deepStrictEqual(spec.args.slice(0, 4), [
+			"opencode",
+			"run",
+			"--model",
+			"opencode-go/mimo-v2.5",
+		]);
+		strictEqual(spec.args.includes("--variant"), false);
 	});
 });
