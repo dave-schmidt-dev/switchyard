@@ -365,12 +365,20 @@ export function createBroker(dependencies = {}) {
 		if (!dependencies.executor) {
 			throw new Error("broker executor is unavailable");
 		}
+		// A broker-owned fallback may deliberately advance the selected route to
+		// the exact authorized next capability. Keep the caller's request as the
+		// authority for identity and consumption, while executing the route's
+		// capability so descriptor validation remains exact.
+		const executionRequest =
+			result.capability === request.capability
+				? request
+				: { ...request, capability: result.capability };
 		const descriptor = resolveDescriptor(
 			result.resolvedTarget,
-			result.capability,
+			executionRequest.capability,
 		);
 		return executeBrokerRoute({
-			request,
+			request: executionRequest,
 			route: result,
 			invocationDescriptor: descriptor,
 			launcherIdentity: options.launcherIdentity,
