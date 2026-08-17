@@ -97,7 +97,6 @@ export function execute(prompt, workingContainerName, options = {}) {
 
 	try {
 		const result = execFileSync(command, args, {
-			input: guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeoutMs,

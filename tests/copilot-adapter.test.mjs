@@ -35,6 +35,11 @@ const COPILOT_DESCRIPTOR = validateInvocationDescriptor(
 );
 
 const COPILOT_STUB = `#!/bin/sh
+# The prompt belongs in argv only; stdin must be closed and empty.
+if [ -n "$(cat)" ]; then
+  echo "stub: received unexpected stdin payload" >&2
+  exit 4
+fi
 case " $* " in
   *" -p "*) ;;
   *) echo "stub: executeCopilot did not pass -p; args: $*" >&2; exit 3 ;;
@@ -47,6 +52,12 @@ case " $* " in
   *" --no-ask-user "*) ;;
   *) echo "stub: executeCopilot did not pass --no-ask-user; args: $*" >&2; exit 3 ;;
 esac
+# The prompt is delivered through exactly one -p option.
+count_p=$(echo " $* " | grep -o " -p " | wc -l)
+if [ "$count_p" -ne 1 ]; then
+  echo "stub: expected exactly one -p flag, found $count_p; args: $*" >&2
+  exit 5
+fi
 echo updated >> test.txt
 echo copilot
 `;
