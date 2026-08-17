@@ -71,7 +71,7 @@ import {
 	loadCheckpoint,
 	loadTaskQueue,
 	normalizeRunOptions,
-	runQueue,
+	runQueueAsync,
 } from "../runner/index.mjs";
 
 const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
@@ -457,7 +457,10 @@ async function runDispatch(opts, dependencies = {}) {
 	const pid = process.pid;
 	const startToken = randomUUID();
 	const nonce = randomUUID();
-	const runQueueFn = dependencies.runQueue ?? runQueue;
+	// Production dispatch uses the async runner, which owns broker selection,
+	// reservations, fallback, and provider execution. Keep the injectable
+	// override for lifecycle tests and compatibility callers.
+	const runQueueFn = dependencies.runQueue ?? runQueueAsync;
 
 	// Initialize the run record BEFORE the project lock is ever acquired —
 	// the same ordering handleLaunch uses. The project lock is keyed by the
@@ -512,7 +515,7 @@ async function runDispatch(opts, dependencies = {}) {
 		if (runStoreReady) {
 			await acquireProjectLock(opts.projectPath, runId);
 		}
-		result = runQueueFn({
+		result = await runQueueFn({
 			tasksFilePath: opts.tasksFilePath,
 			projectPath: opts.projectPath,
 			maxTasks: opts.maxTasks,

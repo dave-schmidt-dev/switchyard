@@ -2,6 +2,16 @@ import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
 const TERMINAL_OUTCOMES = new Set(["success", "failure", "cancel"]);
+const FAILURE_KINDS = new Set(["provider", "transient"]);
+const ERROR_KINDS = new Set([
+	"auth_expired",
+	"quota_exhausted",
+	"model_unavailable",
+	"execution_failed",
+	"execution_timed_out",
+	"launch_failed",
+	"unknown_failure",
+]);
 
 function sameSnapshot(left, right) {
 	return (
@@ -96,6 +106,7 @@ export async function executeBrokerRoute(options) {
 	let terminalOutcome = null;
 	let terminalCompleted = false;
 	let terminalEvidence;
+	let launcherResult = null;
 	const reconcileOnce = async (outcome, actualConsumption) => {
 		if (terminalOutcome !== null) {
 			throw new Error("broker route already reconciled");
@@ -145,7 +156,7 @@ export async function executeBrokerRoute(options) {
 			descriptor,
 		);
 		emit(options.onStatus, "execution_started", route);
-		const result = await options.launch({
+		launcherResult = await options.launch({
 			request,
 			route,
 			invocationDescriptor: descriptor,
@@ -157,8 +168,11 @@ export async function executeBrokerRoute(options) {
 						? Math.max(0, progress.elapsedMs)
 						: null,
 				}),
+			onAdapterStatus: options.onAdapterStatus,
+			onPoll: options.onPoll,
+			onTaskHeartbeat: options.onTaskHeartbeat,
 		});
-		if (signal?.aborted || result?.cancelled === true) {
+		if (signal?.aborted || launcherResult?.cancelled === true) {
 			await reconcileOnce("cancel", null);
 			emit(options.onStatus, "execution_cancelled", route);
 			return Object.freeze({
@@ -172,12 +186,13 @@ export async function executeBrokerRoute(options) {
 				terminalEvidence,
 			});
 		}
-		if (result?.success !== true) {
+		if (launcherResult?.success !== true) {
 			throw new Error("launcher failed");
 		}
 		const actualConsumption =
-			Number.isFinite(result.actualConsumption) && result.actualConsumption > 0
-				? result.actualConsumption
+			Number.isFinite(launcherResult.actualConsumption) &&
+			launcherResult.actualConsumption > 0
+				? launcherResult.actualConsumption
 				: request.estimatedConsumption;
 		await reconcileOnce("success", actualConsumption);
 		emit(options.onStatus, "execution_succeeded", route);
@@ -211,10 +226,20 @@ export async function executeBrokerRoute(options) {
 				? "cancelled"
 				: !terminalCompleted
 					? "terminal_reconciliation_failed"
-					: error?.message?.includes("drift") ||
-							error?.message?.includes("identity")
-						? "identity_drift"
-						: "launcher_failed",
+					: launcherResult?.timedOut === true
+						? launcherResult?.reason || "provider execution timed out"
+						: error?.message?.includes("drift") ||
+								error?.message?.includes("identity")
+							? "identity_drift"
+							: "launcher_failed",
+			timedOut: launcherResult?.timedOut === true,
+			cleanupFailed: launcherResult?.cleanupFailed === true,
+			failureKind: FAILURE_KINDS.has(launcherResult?.failureKind)
+				? launcherResult.failureKind
+				: null,
+			errorKind: ERROR_KINDS.has(launcherResult?.errorKind)
+				? launcherResult.errorKind
+				: null,
 			terminalEvidence,
 		});
 	}

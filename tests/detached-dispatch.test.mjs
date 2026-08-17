@@ -510,6 +510,7 @@ describe("--exclude-provider on the detached worker path", () => {
 			snapshotPath,
 			JSON.stringify({
 				schema_version: 2,
+				updated_at: new Date().toISOString(),
 				providers: [
 					{
 						name: "claude",
@@ -652,6 +653,7 @@ describe("--only-provider on the detached worker path", () => {
 			snapshotPath,
 			JSON.stringify({
 				schema_version: 2,
+				updated_at: new Date().toISOString(),
 				providers: [
 					{
 						name: "claude",

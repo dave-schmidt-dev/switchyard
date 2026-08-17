@@ -146,6 +146,25 @@ describe("broker async executor", () => {
 		}
 	});
 
+	it("preserves bounded timeout metadata from the launcher", async () => {
+		const value = fixture();
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				timedOut: true,
+				cleanupFailed: true,
+			}),
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.reason, "provider execution timed out");
+		strictEqual(result.timedOut, true);
+		strictEqual(result.cleanupFailed, true);
+	});
+
 	it("ignores a broken status sink and never exposes launcher output", async () => {
 		const value = fixture();
 		let terminals = 0;

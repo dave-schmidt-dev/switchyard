@@ -273,6 +273,23 @@ try {
 			: {}),
 		dependencies: {
 			signal: shutdown.signal,
+			onStatus: (event) => {
+				const phase =
+					typeof event?.phase === "string"
+						? event.phase.slice(0, 64)
+						: "execution";
+				const name =
+					typeof event?.event === "string"
+						? event.event.slice(0, 64)
+						: "status";
+				const status =
+					typeof event?.status === "string"
+						? event.status.slice(0, 256)
+						: name.replaceAll("_", " ");
+				queueWrite(() =>
+					runStore.createEvent(runId, { phase, event: name, status }),
+				);
+			},
 			// These callbacks all use updateRunWithRetry rather than a
 			// read-then-updateRun(fixed revision) pair, and each one synchronously
 			// extends the module-scope `writeChain` (declared above) instead of

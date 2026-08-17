@@ -1,6 +1,7 @@
 import {
 	getInvocationDescriptor,
 	resolveTargetIdentity,
+	validateInvocationDescriptor,
 } from "../roster/index.mjs";
 import { readSnapshotAtRoute, route } from "../router/index.mjs";
 import { executeBrokerRoute } from "./executor.mjs";
@@ -385,6 +386,9 @@ export function createBroker(dependencies = {}) {
 			launch: dependencies.executor,
 			signal: options.signal,
 			onStatus: options.onStatus,
+			onAdapterStatus: options.onAdapterStatus,
+			onPoll: options.onPoll,
+			onTaskHeartbeat: options.onTaskHeartbeat,
 			terminal: ({ outcome, actualConsumption }) =>
 				outcome === "success"
 					? reconcile(result, actualConsumption)
@@ -392,10 +396,32 @@ export function createBroker(dependencies = {}) {
 		});
 	}
 
+	function launcherIdentity(resultValue) {
+		const result = validateBrokerResult(resultValue);
+		if (!result.provider || !result.reservation) {
+			throw new Error("broker launcher identity requires a reserved route");
+		}
+		const descriptor = validateInvocationDescriptor(
+			resolveDescriptor(result.resolvedTarget, result.capability),
+			result.harness,
+		);
+		return Object.freeze({
+			provider: result.provider,
+			resolvedTarget: result.resolvedTarget,
+			harness: result.harness,
+			model: result.model,
+			effort: result.effort,
+			descriptorIdentity: descriptor.descriptor_identity,
+			reservationId: result.reservation.id,
+			snapshotIdentity: result.snapshotIdentity,
+		});
+	}
+
 	return Object.freeze({
 		select,
 		selectAndReserve,
 		fallbackAndReserve,
+		launcherIdentity,
 		execute,
 		reconcile,
 		release,

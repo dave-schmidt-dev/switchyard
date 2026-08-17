@@ -536,12 +536,33 @@ function withTestDescriptorOptions(options) {
 		...dependencies,
 		route: dependencies.route ?? realRoute,
 	});
+	const testIdentityResolver =
+		dependencies.resolveTargetIdentity ??
+		(dependencies.route
+			? (provider) => {
+					const routed = context.route({
+						requiredCapability: "standard",
+						availableProviders: Object.keys(context.adapters ?? {}),
+					});
+					if (routed?.provider !== provider) {
+						return { targetId: null, harnessKey: null, ambiguous: true };
+					}
+					return {
+						targetId: routed.resolvedTargetId ?? routed.resolvedTarget ?? null,
+						harnessKey: routed.resolved_harness ?? routed.harness ?? provider,
+						ambiguous: false,
+					};
+				}
+			: undefined);
 	return {
 		...options,
 		dependencies: {
 			...dependencies,
 			route: context.route,
 			resolveDescriptor: context.resolveDescriptor,
+			...(testIdentityResolver
+				? { resolveTargetIdentity: testIdentityResolver }
+				: {}),
 		},
 	};
 }

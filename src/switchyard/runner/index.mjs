@@ -37,13 +37,17 @@ import {
 	executeCursor,
 	executeCursorAsync,
 } from "../adapter/cursor.mjs";
-import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import {
+	PERSISTED_ERROR_KINDS,
+	sanitizeFailureMetadata,
+} from "../adapter/exec-error.mjs";
 import {
 	captureDiff as captureOpencodeDiff,
 	captureDiffAsync as captureOpencodeDiffAsync,
 	execute as executeOpencode,
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
+import { createBroker } from "../broker/index.mjs";
 import {
 	AGENT_IMAGE,
 	buildAgentImage,
@@ -78,7 +82,11 @@ import {
 	resolveTargetIdentity,
 	validateInvocationDescriptor,
 } from "../roster/index.mjs";
-import { preflightMacosQueue, route } from "../router/index.mjs";
+import {
+	preflightMacosQueue,
+	readSnapshotAtRoute,
+	route,
+} from "../router/index.mjs";
 import { acquireVmSlot, releaseVmSlot } from "../run-store/index.mjs";
 
 /**
@@ -111,6 +119,7 @@ export function ensureAgentContainer(deps = {}) {
 }
 
 const CHECKPOINT_VERSION = 2;
+const BOUNDED_ERROR_KINDS = new Set(PERSISTED_ERROR_KINDS);
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
 export const QUEUE_PLATFORMS = Object.freeze(["docker", "macos"]);
@@ -2686,30 +2695,138 @@ export function executeTask(task, context) {
  * shared spawn/poll lifecycle through this path.
  */
 export async function executeTaskAsync(task, context) {
+	clearAsyncTaskContext(context);
+	const requiredCapability = resolveTaskRequiredCapability(task);
+	try {
+		return await executeTaskAsyncUnsafe(task, context);
+	} catch (error) {
+		const route = context._activeBrokerRoute;
+		const routed = context._activeTaskRoute;
+		const failure = asyncExecutionFailureMetadata(error, task.id);
+		context._activeBrokerRoute = null;
+		if (route?.reservation && context.broker?.release) {
+			try {
+				await context.broker.release(route, "failure");
+			} catch {
+				// The task failure remains bounded; recovery handles an unavailable ledger.
+			}
+		}
+		if (!context._activeDispatchOutcomeRecorded) {
+			try {
+				await Promise.resolve(
+					context.recordDispatch({
+						provider: routed?.provider ?? "none",
+						model: routed?.model ?? "none",
+						taskId: task.id,
+						result: "execution_failed",
+						...failure,
+						requiredCapability,
+						resolvedTargetId: routed?.resolvedTargetId ?? null,
+					}),
+				);
+			} catch {
+				// Preserve the bounded task result if outcome projection is unavailable.
+			}
+		}
+		return {
+			taskId: task.id,
+			success: false,
+			provider: routed?.provider ?? null,
+			model: routed?.model ?? null,
+			requiredCapability,
+			result: "execution_failed",
+			...failure,
+		};
+	} finally {
+		clearAsyncTaskContext(context);
+	}
+}
+
+function clearAsyncTaskContext(context) {
+	context._activeBrokerRoute = null;
+	context._activeTaskRoute = null;
+	context._activeInvocationDescriptor = null;
+	context._activeDispatchOutcomeRecorded = false;
+	context._activeTaskPrompt = null;
+	context._activeTaskTimeoutMs = null;
+	context._activeTaskDeadline = null;
+}
+
+function asyncExecutionFailureMetadata(error, taskId) {
+	const errorKind = BOUNDED_ERROR_KINDS.has(error?.errorKind)
+		? error.errorKind
+		: "unknown_failure";
+	const failure = sanitizeFailureMetadata({
+		taskId,
+		result: "execution_failed",
+		errorKind,
+	});
+	const message = typeof error?.message === "string" ? error.message : "";
+	const brokerErrorCode =
+		error?.code && /^snapshot_[a-z_]+$/.test(error.code)
+			? error.code
+			: message.includes("fallback already attempted")
+				? "fallback_already_attempted"
+				: message.includes("timed out acquiring broker reservation lock")
+					? "reservation_lock_timeout"
+					: null;
+	return {
+		...failure,
+		...(brokerErrorCode
+			? {
+					ledgerFailure: true,
+					ledgerFailurePhase: "broker_precondition",
+					ledgerFailureCode: brokerErrorCode,
+				}
+			: {}),
+	};
+}
+
+async function executeTaskAsyncUnsafe(task, context) {
 	const executor = resolveTaskExecutor(task);
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
 	}
-	const routeResult = context.route({
-		requiredCapability,
-		availableProviders: Object.keys(context.adapters ?? {}),
-		exclude: context.exclude,
-		only: context.only,
-	});
-	const provenance = resolveRouteProvenance(
+	let broker = context.broker;
+	if (!broker) {
+		broker = createDispatchBroker(context, context.brokerDependencies);
+		context.broker = broker;
+	}
+	context._activeTaskPrompt = task.prompt || task.description || task.title;
+	context._activeTaskTimeoutMs =
+		task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	const brokerRequest = brokerRequestForTask(task, context, requiredCapability);
+	let selectedRoute = await broker.selectAndReserve(brokerRequest);
+	context._activeBrokerRoute = selectedRoute;
+	context._activeDispatchOutcomeRecorded = false;
+	const releaseSelected = async (route) => {
+		context._activeBrokerRoute = null;
+		if (route?.reservation) {
+			try {
+				await broker.release(route, "failure");
+			} catch {
+				// Preserve the task failure; recovery handles an unavailable ledger.
+			}
+		}
+	};
+	let routeResult = normalizeBrokerRoute(selectedRoute);
+	context._activeTaskRoute = routeResult;
+	let routeCapability = selectedRoute.capability;
+	let provenance = resolveRouteProvenance(
 		routeResult.provider,
-		requiredCapability,
+		routeCapability,
 	);
-	Object.assign(routeResult, { requiredCapability }, provenance);
+	mergeBrokerRouteProvenance(routeResult, routeCapability, provenance);
 	let invocationDescriptor;
 	try {
 		invocationDescriptor = descriptorFromRoute(
 			routeResult,
-			requiredCapability,
+			routeCapability,
 			context.resolveDescriptor ?? getInvocationDescriptor,
 		);
 	} catch {
+		await releaseSelected(selectedRoute);
 		return {
 			taskId: task.id,
 			success: false,
@@ -2724,19 +2841,28 @@ export async function executeTaskAsync(task, context) {
 	}
 	Object.assign(routeResult, descriptorReceiptFields(invocationDescriptor));
 	context._activeInvocationDescriptor = invocationDescriptor;
-	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
-	const record = async (dispatch) => {
+	let resolvedTargetId = routeResult.resolvedTargetId ?? null;
+	const record = async (
+		dispatch,
+		{
+			recordProvenance = provenance,
+			recordDescriptor = invocationDescriptor,
+			recordResolvedTargetId = resolvedTargetId,
+		} = {},
+	) => {
 		await Promise.resolve(
 			context.recordDispatch({
-				...provenance,
-				...descriptorReceiptFields(invocationDescriptor),
-				resolvedTargetId,
+				...recordProvenance,
+				...descriptorReceiptFields(recordDescriptor),
+				resolvedTargetId: recordResolvedTargetId,
 				...dispatch,
 				requiredCapability,
 			}),
 		);
+		context._activeDispatchOutcomeRecorded = true;
 	};
 	if (!routeResult.provider) {
+		await releaseSelected(selectedRoute);
 		const reason = safeNoProviderReason(routeResult.reason);
 		await record({
 			provider: "none",
@@ -2758,11 +2884,12 @@ export async function executeTaskAsync(task, context) {
 			errorKind: null,
 		};
 	}
-	const adapter = selectAdapter(
+	let adapter = selectAdapter(
 		routeResult.resolved_harness ?? routeResult.provider,
 		context.adapters,
 	);
 	if (!adapter) {
+		await releaseSelected(selectedRoute);
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -2783,6 +2910,7 @@ export async function executeTaskAsync(task, context) {
 	}
 	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
 	const routedDeadline = new Date(Date.now() + timeoutMs).toISOString();
+	context._activeTaskDeadline = routedDeadline;
 	context.onStatus?.({
 		phase: "execution",
 		event: "task_routed",
@@ -2812,7 +2940,8 @@ export async function executeTaskAsync(task, context) {
 			invocationDescriptor,
 		),
 	);
-	if (intentFailure)
+	if (intentFailure) {
+		await releaseSelected(selectedRoute);
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
@@ -2825,10 +2954,12 @@ export async function executeTaskAsync(task, context) {
 			errorKind: "intent_receipt",
 			...intentFailure,
 		};
+	}
 	if (
 		typeof adapter.executeAsync !== "function" ||
 		typeof adapter.captureDiffAsync !== "function"
 	) {
+		await releaseSelected(selectedRoute);
 		const reason = "adapter async lifecycle unavailable";
 		await record({
 			provider: routeResult.provider,
@@ -2851,41 +2982,152 @@ export async function executeTaskAsync(task, context) {
 			error: reason,
 		};
 	}
-	const executeAsync = adapter.executeAsync;
-	const execution = await executeAsync(
-		task.prompt || task.description || task.title,
-		context.workingContainerName,
-		{
-			model: invocationDescriptor.selector ?? routeResult.model,
-			timeoutMs,
-			executionBackend: context.executionBackend,
-			signal: context.signal,
-			onStatus: context.onStatus,
-			onPoll: (poll) => {
-				// Provider lifecycle polling exposes only bounded scalar timing
-				// metadata. Never forward stdout/stderr bytes or provider output to
-				// durable state.
-				context.onPoll?.(poll);
-				context.onTaskHeartbeat?.({
+	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
+		launcherIdentity: broker.launcherIdentity(selectedRoute),
+		signal: context.signal,
+		onStatus: context.onStatus,
+		onAdapterStatus: context.onStatus,
+		onPoll: context.onPoll,
+		onTaskHeartbeat: context.onTaskHeartbeat,
+	});
+	context._activeBrokerRoute = null;
+	if (!brokerExecution.success) {
+		const primaryRoute = routeResult;
+		const primaryProvenance = provenance;
+		const primaryDescriptor = invocationDescriptor;
+		const primaryResolvedTargetId = resolvedTargetId;
+		const failureKind = brokerFailureKind(brokerExecution);
+		const fallbackCapability = {
+			low: "low",
+			standard: "standard",
+			high: "high",
+		}[requiredCapability];
+		if (failureKind && fallbackCapability) {
+			context._activeBrokerRoute = selectedRoute;
+			const fallbackRoute = await broker.fallbackAndReserve(
+				brokerRequest,
+				selectedRoute,
+				{
+					failureKind,
+					capabilityCeiling: fallbackCapability,
+				},
+			);
+			if (fallbackRoute.provider) {
+				await record(
+					{
+						provider: primaryRoute.provider,
+						model: primaryRoute.model ?? "unknown",
+						taskId: task.id,
+						result: "execution_failed",
+						errorKind: brokerExecution.errorKind ?? "execution_failed",
+						reason: brokerExecution.reason ?? primaryRoute.reason,
+					},
+					{
+						recordProvenance: primaryProvenance,
+						recordDescriptor: primaryDescriptor,
+						recordResolvedTargetId: primaryResolvedTargetId,
+					},
+				);
+				context._activeDispatchOutcomeRecorded = false;
+				context._activeBrokerRoute = fallbackRoute;
+				selectedRoute = fallbackRoute;
+				routeCapability = fallbackRoute.capability;
+				routeResult = normalizeBrokerRoute(fallbackRoute);
+				context._activeTaskRoute = routeResult;
+				provenance = resolveRouteProvenance(
+					routeResult.provider,
+					routeCapability,
+				);
+				invocationDescriptor = descriptorFromRoute(
+					routeResult,
+					routeCapability,
+					context.resolveDescriptor ?? getInvocationDescriptor,
+				);
+				mergeBrokerRouteProvenance(routeResult, routeCapability, provenance);
+				Object.assign(
+					routeResult,
+					descriptorReceiptFields(invocationDescriptor),
+				);
+				context._activeInvocationDescriptor = invocationDescriptor;
+				resolvedTargetId = routeResult.resolvedTargetId ?? null;
+				adapter = selectAdapter(
+					routeResult.resolved_harness ?? routeResult.provider,
+					context.adapters,
+				);
+				context.onStatus?.({
+					phase: "broker",
+					event: "fallback_reserved",
+					status: `Task ${task.id} reserved an authorized fallback route`,
 					taskId: task.id,
 					provider: routeResult.provider,
-					model: invocationDescriptor.selector ?? routeResult.model,
-					deadline: routedDeadline,
-					elapsedMs: Number.isFinite(poll?.elapsedMs)
-						? Math.max(0, poll.elapsedMs)
-						: 0,
-					processPhase: "provider_running",
-					resolvedTargetId,
-					descriptorIdentity: invocationDescriptor.descriptor_identity,
-					descriptorHarness: routeResult.resolved_harness ?? null,
+					model: routeResult.model,
 				});
-			},
-			invocationDescriptor,
-			descriptorIdentity: invocationDescriptor.descriptor_identity,
-			descriptorHarness: routeResult.resolved_harness ?? null,
-			resolvedTargetId,
-		},
-	);
+				context._activeTaskDeadline = new Date(
+					Date.now() + timeoutMs,
+				).toISOString();
+				context.onTaskRouted?.({
+					taskId: task.id,
+					provider: routeResult.provider,
+					model: invocationDescriptor.selector,
+					deadline: context._activeTaskDeadline,
+					resolvedTargetId,
+					...descriptorReceiptFields(invocationDescriptor),
+				});
+				context.onStatus?.({
+					phase: "execution",
+					event: "task_routed",
+					status: `Task ${task.id} fallback routed to ${routeResult.provider}`,
+					taskId: task.id,
+					provider: routeResult.provider,
+					model: invocationDescriptor.selector,
+					deadline: context._activeTaskDeadline,
+					resolvedTargetId,
+					...descriptorReceiptFields(invocationDescriptor),
+				});
+				const fallbackIntentFailure = await writeDispatchIntentAsync(
+					context,
+					dispatchIntentPayload(
+						task.id,
+						routeResult,
+						requiredCapability,
+						provenance,
+						invocationDescriptor,
+					),
+				);
+				if (fallbackIntentFailure) {
+					await releaseSelected(fallbackRoute);
+					return {
+						...descriptorReceiptFields(invocationDescriptor),
+						taskId: task.id,
+						success: false,
+						provider: routeResult.provider,
+						model: invocationDescriptor.selector,
+						requiredCapability,
+						resolvedTargetId,
+						result: "intent_receipt_failed",
+						errorKind: "intent_receipt",
+						...fallbackIntentFailure,
+					};
+				}
+				brokerExecution = await broker.execute(brokerRequest, fallbackRoute, {
+					launcherIdentity: broker.launcherIdentity(fallbackRoute),
+					signal: context.signal,
+					onStatus: context.onStatus,
+					onAdapterStatus: context.onStatus,
+					onPoll: context.onPoll,
+					onTaskHeartbeat: context.onTaskHeartbeat,
+				});
+				context._activeBrokerRoute = null;
+			}
+		}
+	}
+	const execution = {
+		success: brokerExecution.success,
+		timedOut: brokerExecution.timedOut === true,
+		cleanupFailed: brokerExecution.cleanupFailed === true,
+		error: brokerExecution.reason ?? null,
+		errorKind: brokerExecution.errorKind ?? brokerExecution.outcome,
+	};
 	if (!execution.success) {
 		if (!execution.timedOut) {
 			await record({
@@ -3094,8 +3336,10 @@ export async function runQueueAsync(options) {
 		effectiveOnly,
 		effectiveTaskIds,
 	} = launch;
+	ensureRetryCheckpoint(checkpoint);
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
+	let uninstallSignalCleanup = null;
 	try {
 		if (!workingContainerName) {
 			queueBackend.ensureAgentContainer();
@@ -3104,6 +3348,15 @@ export async function runQueueAsync(options) {
 				throw new Error("runQueueAsync: failed to create working container");
 			}
 			ownsWorkingContainer = true;
+			uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+				workingContainerName,
+				queueBackend.destroy,
+			);
+			dependencies.onStatus?.({
+				phase: "bootstrap",
+				event: "container_created",
+				status: "Working container created",
+			});
 			// Credential provisioning and project seeding can be slow. Publish the
 			// resolved container before either operation so status is useful during
 			// bootstrap rather than looking like a dead launch.
@@ -3150,21 +3403,276 @@ export async function runQueueAsync(options) {
 		onStatus: dependencies.onStatus ?? null,
 		onTaskRouted: dependencies.onTaskRouted ?? null,
 		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
-		exclude: effectiveExclude,
+		exclude: mergeRetryExclusions(
+			effectiveExclude,
+			checkpoint.quarantinedTargetIds,
+		),
 		only: effectiveOnly,
 		signal: dependencies.signal,
 		onPoll: dependencies.onPoll,
 		resolveDescriptor: dependencies.resolveDescriptor,
+		runId,
+		snapshotSource: dependencies.snapshotSource ?? "gradus-v2",
 	};
 	const results = [];
 	try {
-		const runnable = getRunnableTasks(tasks, checkpoint, {
+		context.broker = createDispatchBroker(context, dependencies);
+		const initialRunnable = getRunnableTasks(tasks, checkpoint, {
 			selectedTaskIds: effectiveTaskIds,
 			resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
 		});
-		for (const task of runnable.slice(0, effectiveMaxTasks)) {
+		const attemptedTaskIds = new Set();
+		let resumedRetryTaskId = checkpoint.retryState?.taskId ?? null;
+		let processed = 0;
+		const projectRetryState = () => {
+			dependencies.onRetryStateChanged?.({
+				quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+				retryState: checkpoint.retryState,
+				retryTransitionId: checkpoint.retryTransitionId,
+			});
+		};
+		reconcileAlreadyCompleteSelection(
+			checkpoint,
+			checkpointPath,
+			results,
+			effectiveTaskIds,
+			tasks,
+			dependencies.onResult,
+			dependencies.onStatus,
+			dependencies.onCheckpointSaved,
+		);
+		while (processed < effectiveMaxTasks) {
+			context.exclude = mergeRetryExclusions(
+				effectiveExclude,
+				checkpoint.quarantinedTargetIds,
+			);
+			const runnable = resumedRetryTaskId
+				? []
+				: getRunnableTasks(tasks, checkpoint, {
+						selectedTaskIds: effectiveTaskIds,
+						resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
+						excludedTaskIds: attemptedTaskIds,
+					});
+			const task = resumedRetryTaskId
+				? tasks.find((candidate) => candidate.id === resumedRetryTaskId)
+				: runnable[0];
+			if (!task) break;
+			if (resumedRetryTaskId) resumedRetryTaskId = null;
+			else attemptedTaskIds.add(task.id);
 			dependencies.onTaskStart?.(task);
-			const result = await executeTaskAsync(task, context);
+			const retryState =
+				checkpoint.retryState?.taskId === task.id
+					? checkpoint.retryState
+					: null;
+			let result;
+			if (retryState && !hasExactRetryDescriptorEvidence(retryState)) {
+				result = {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					resolvedTargetId: retryState.resolvedTargetId ?? null,
+					result: "unknown_failure",
+					errorKind: "descriptor_receipt",
+					reason:
+						"historical retry state lacks exact invocation descriptor evidence",
+				};
+				persistRetryTransition(checkpoint, checkpointPath, {
+					type: "finalized",
+					taskId: task.id,
+					attempt: retryState.attempt,
+					resolvedTargetId: retryState.resolvedTargetId,
+					clearState: true,
+					save: false,
+				});
+				projectRetryState();
+			} else if (
+				retryState &&
+				["retry_started", "retry_halted"].includes(retryState.phase)
+			) {
+				result = {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					resolvedTargetId: retryState.resolvedTargetId ?? null,
+					result: "unknown_failure",
+					errorKind: "unknown_failure",
+					reason:
+						"persisted retry state already consumed the bounded retry attempt",
+				};
+				persistRetryTransition(checkpoint, checkpointPath, {
+					type: "finalized",
+					taskId: task.id,
+					attempt: retryState.attempt,
+					provider: retryState.provider,
+					model: retryState.model,
+					resolvedTargetId: retryState.resolvedTargetId,
+					invocationDescriptor: retryState.invocationDescriptor,
+					descriptorIdentity: retryState.descriptorIdentity,
+					descriptorHarness: retryState.descriptorHarness,
+					clearState: true,
+					save: false,
+				});
+				projectRetryState();
+			} else if (retryState) {
+				const retryTargetId = normalizeRetryTargetId(
+					retryState.resolvedTargetId,
+				);
+				if (
+					retryTargetId &&
+					!checkpoint.quarantinedTargetIds.includes(retryTargetId)
+				) {
+					checkpoint.quarantinedTargetIds.push(retryTargetId);
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "target_quarantined",
+						taskId: task.id,
+						attempt: 1,
+						resolvedTargetId: retryTargetId,
+						invocationDescriptor: retryState.invocationDescriptor,
+						descriptorIdentity: retryState.descriptorIdentity,
+						descriptorHarness: retryState.descriptorHarness,
+					});
+					projectRetryState();
+				}
+				let retryHalt = null;
+				if (retryState.phase !== "reset_completed") {
+					retryHalt = resetBeforeQuotaRetry({
+						result: {
+							taskId: task.id,
+							provider: null,
+							model: null,
+							resolvedTargetId: retryState.resolvedTargetId,
+							invocationDescriptor: retryState.invocationDescriptor,
+							descriptorIdentity: retryState.descriptorIdentity,
+							descriptorHarness: retryState.descriptorHarness,
+						},
+						checkpoint,
+						checkpointPath,
+						workingContainerName,
+						resetWorkingTreeFn: queueBackend.reset,
+						emitStatus: dependencies.onStatus,
+					});
+					projectRetryState();
+				}
+				if (retryHalt) {
+					result = retryHalt;
+				} else {
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "retry_started",
+						taskId: task.id,
+						attempt: 2,
+						resolvedTargetId: retryState.resolvedTargetId,
+						invocationDescriptor: retryState.invocationDescriptor,
+						descriptorIdentity: retryState.descriptorIdentity,
+						descriptorHarness: retryState.descriptorHarness,
+					});
+					projectRetryState();
+					context.exclude = mergeRetryExclusions(
+						effectiveExclude,
+						checkpoint.quarantinedTargetIds,
+					);
+					result = await executeTaskAsync(task, context);
+					appendRetryAttempt(checkpoint, result, 2);
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "finalized",
+						taskId: task.id,
+						attempt: 2,
+						provider: result.provider,
+						model: result.model,
+						resolvedTargetId:
+							result.invocationDescriptor?.target_id ??
+							normalizeRetryTargetId(result.resolvedTargetId) ??
+							retryTargetId,
+						invocationDescriptor: result.invocationDescriptor,
+						descriptorIdentity: result.descriptorIdentity,
+						descriptorHarness: result.descriptorHarness,
+						clearState: true,
+						save: false,
+					});
+					projectRetryState();
+				}
+			} else {
+				result = await executeTaskAsync(task, context);
+			}
+			if (!retryState && isQuotaRetryCandidate(result, ownsWorkingContainer)) {
+				const targetId = normalizeRetryTargetId(result.resolvedTargetId);
+				appendRetryAttempt(checkpoint, result, 1);
+				persistRetryTransition(checkpoint, checkpointPath, {
+					type: "attempt_recorded",
+					taskId: task.id,
+					attempt: 1,
+					provider: result.provider,
+					model: result.model,
+					resolvedTargetId: targetId,
+					invocationDescriptor: result.invocationDescriptor,
+					descriptorIdentity: result.descriptorIdentity,
+					descriptorHarness: result.descriptorHarness,
+				});
+				projectRetryState();
+				checkpoint.quarantinedTargetIds = [
+					...new Set([...checkpoint.quarantinedTargetIds, targetId]),
+				];
+				persistRetryTransition(checkpoint, checkpointPath, {
+					type: "target_quarantined",
+					taskId: task.id,
+					attempt: 1,
+					provider: result.provider,
+					model: result.model,
+					resolvedTargetId: targetId,
+					invocationDescriptor: result.invocationDescriptor,
+					descriptorIdentity: result.descriptorIdentity,
+					descriptorHarness: result.descriptorHarness,
+				});
+				projectRetryState();
+				const retryHalt = resetBeforeQuotaRetry({
+					result,
+					checkpoint,
+					checkpointPath,
+					workingContainerName,
+					resetWorkingTreeFn: queueBackend.reset,
+					emitStatus: dependencies.onStatus,
+				});
+				if (retryHalt) {
+					result = retryHalt;
+				} else {
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "retry_started",
+						taskId: task.id,
+						attempt: 2,
+						provider: result.provider,
+						model: result.model,
+						resolvedTargetId: targetId,
+						invocationDescriptor: result.invocationDescriptor,
+						descriptorIdentity: result.descriptorIdentity,
+						descriptorHarness: result.descriptorHarness,
+					});
+					projectRetryState();
+					context.exclude = mergeRetryExclusions(
+						effectiveExclude,
+						checkpoint.quarantinedTargetIds,
+					);
+					result = await executeTaskAsync(task, context);
+					appendRetryAttempt(checkpoint, result, 2);
+					persistRetryTransition(checkpoint, checkpointPath, {
+						type: "finalized",
+						taskId: task.id,
+						attempt: 2,
+						provider: result.provider,
+						model: result.model,
+						resolvedTargetId:
+							result.invocationDescriptor?.target_id ??
+							normalizeRetryTargetId(result.resolvedTargetId) ??
+							targetId,
+						invocationDescriptor: result.invocationDescriptor,
+						descriptorIdentity: result.descriptorIdentity,
+						descriptorHarness: result.descriptorHarness,
+						clearState: true,
+						save: false,
+					});
+					projectRetryState();
+				}
+			}
 			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
@@ -3214,17 +3722,43 @@ export async function runQueueAsync(options) {
 			checkpoint.lastUpdatedAt = new Date().toISOString();
 			saveCheckpoint(checkpointPath, checkpoint);
 			dependencies.onCheckpointSaved?.(checkpoint);
+			const haltResult = commitOrResetWorkingContainer(result, {
+				ownsWorkingContainer,
+				workingContainerName,
+				stopOnFailure: effectiveStopOnFailure,
+				commitWorkingTreeFn: queueBackend.commit,
+				resetWorkingTreeFn: queueBackend.reset,
+				emitStatus: dependencies.onStatus,
+				logPrefix: "runQueueAsync: ",
+			});
+			processed += 1;
+			if (haltResult) {
+				recordHalt(
+					checkpoint,
+					checkpointPath,
+					results,
+					haltResult,
+					dependencies.onStatus,
+				);
+				break;
+			}
 			if (!result.success && effectiveStopOnFailure) break;
 		}
 		saveCheckpoint(checkpointPath, checkpoint);
 		return {
 			results,
 			totalTasks: tasks.length,
-			runnableTasks: runnable.length,
-			processedTasks: results.length,
+			runnableTasks: initialRunnable.length,
+			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
+			checkpointPath,
+			ledgerWritesSettled: Promise.resolve(),
+			quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+			retryState: checkpoint.retryState,
+			retryTransitionId: checkpoint.retryTransitionId,
 		};
 	} finally {
+		if (uninstallSignalCleanup) uninstallSignalCleanup();
 		try {
 			if (ownsWorkingContainer) {
 				try {
@@ -4069,9 +4603,24 @@ export function createBrokerAdapterLauncher({
 		request,
 		route,
 		invocationDescriptor,
+		launcherIdentity,
 		signal,
-		onStatus,
+		onAdapterStatus,
+		onPoll,
 	}) {
+		if (
+			!launcherIdentity ||
+			launcherIdentity.provider !== route.provider ||
+			launcherIdentity.resolvedTarget !== route.resolvedTarget ||
+			launcherIdentity.harness !== route.harness ||
+			launcherIdentity.model !== route.model ||
+			launcherIdentity.effort !== route.effort ||
+			launcherIdentity.descriptorIdentity !==
+				invocationDescriptor.descriptor_identity ||
+			launcherIdentity.reservationId !== route.reservation?.id
+		) {
+			throw new Error("broker launcher identity drift at spawn");
+		}
 		const execution = await adapter.executeAsync(
 			typeof prompt === "string" && prompt.length > 0 ? prompt : request.taskId,
 			workingContainerName,
@@ -4080,7 +4629,8 @@ export function createBrokerAdapterLauncher({
 				timeoutMs,
 				executionBackend,
 				signal,
-				onPoll: onStatus,
+				onStatus: onAdapterStatus,
+				onPoll,
 				invocationDescriptor,
 				descriptorIdentity: invocationDescriptor.descriptor_identity,
 				descriptorHarness: route.harness,
@@ -4092,8 +4642,218 @@ export function createBrokerAdapterLauncher({
 			cancelled: signal?.aborted === true,
 			reason: execution?.error ?? null,
 			actualConsumption: execution?.actualConsumption,
+			timedOut: execution?.timedOut === true,
+			cleanupFailed: execution?.cleanupFailed === true,
+			failureKind:
+				execution?.failureKind === "transient" ||
+				execution?.failureKind === "provider"
+					? execution.failureKind
+					: null,
+			errorKind: BOUNDED_ERROR_KINDS.has(execution?.errorKind)
+				? execution.errorKind
+				: null,
 		};
 	};
+}
+
+function createDispatchBroker(context, dependencies = {}) {
+	if (dependencies.broker) return dependencies.broker;
+	const adapters = context.adapters ?? DEFAULT_ADAPTERS;
+	const contextOnly = Array.isArray(context.only) ? context.only : [];
+	const snapshotSources = dependencies.snapshotSources ?? { "gradus-v2": null };
+	if (
+		typeof context.projectPath !== "string" ||
+		context.projectPath.trim() === ""
+	) {
+		throw new Error(
+			"broker runner requires projectPath for its reservation ledger",
+		);
+	}
+	const projectLedgerRoot = join(
+		context.projectPath,
+		".logs",
+		"switchyard",
+		"broker",
+	);
+	const usesProductionRouter = context.route === route;
+	return createBroker({
+		adapters,
+		route: ({
+			runId,
+			requiredCapability,
+			availableProviders,
+			snapshotSource,
+			snapshotRead,
+			exclude = [],
+		}) =>
+			context.route({
+				runId,
+				requiredCapability,
+				availableProviders,
+				snapshotSource,
+				snapshotRead,
+				exclude: [
+					...(Array.isArray(context.exclude) ? context.exclude : []),
+					...exclude,
+				],
+				only: contextOnly,
+			}),
+		resolveTargetIdentity:
+			dependencies.resolveTargetIdentity ?? resolveTargetIdentity,
+		getInvocationDescriptor:
+			context.resolveDescriptor ?? getInvocationDescriptor,
+		reservations: dependencies.brokerReservations,
+		reservationOptions: dependencies.brokerReservationOptions ?? {
+			root: projectLedgerRoot,
+		},
+		snapshotSources,
+		readSnapshot: usesProductionRouter
+			? (dependencies.readSnapshot ??
+				(({ source, nowMs }) => {
+					if (!Object.hasOwn(snapshotSources, source)) {
+						const error = new Error("snapshot_source_unknown");
+						error.code = "snapshot_source_unknown";
+						throw error;
+					}
+					const sourcePath = snapshotSources[source];
+					if (sourcePath !== null && typeof sourcePath !== "string") {
+						throw new TypeError(
+							"configured snapshot source must be a path or null",
+						);
+					}
+					return readSnapshotAtRoute(nowMs, sourcePath ?? undefined);
+				}))
+			: dependencies.readSnapshot,
+		refreshSnapshot: dependencies.refreshSnapshot,
+		ownerId: context.runId ? `runner:${context.runId}` : undefined,
+		executor: async ({
+			request,
+			route: selectedRoute,
+			invocationDescriptor,
+			launcherIdentity,
+			signal,
+			onStatus,
+			onAdapterStatus,
+			onPoll,
+			onTaskHeartbeat,
+		}) => {
+			const adapter = selectAdapter(selectedRoute.harness, adapters);
+			if (!adapter) {
+				throw new Error(
+					`broker route harness '${selectedRoute.harness}' has no runner adapter`,
+				);
+			}
+			return createBrokerAdapterLauncher({
+				adapter,
+				executionBackend: context.executionBackend,
+				workingContainerName: context.workingContainerName,
+				prompt: context._activeTaskPrompt,
+				timeoutMs: context._activeTaskTimeoutMs,
+			})({
+				request,
+				route: selectedRoute,
+				invocationDescriptor,
+				launcherIdentity,
+				signal,
+				onAdapterStatus,
+				onPoll: (poll) => {
+					onStatus?.(poll);
+					onPoll?.(poll);
+					const heartbeat = {
+						taskId: request.taskId,
+						provider: selectedRoute.provider,
+						model: invocationDescriptor.selector ?? selectedRoute.model,
+						deadline: context._activeTaskDeadline ?? null,
+						elapsedMs: Number.isFinite(poll?.elapsedMs)
+							? Math.max(0, poll.elapsedMs)
+							: 0,
+						processPhase: "provider_running",
+						resolvedTargetId: selectedRoute.resolvedTarget,
+						descriptorIdentity: invocationDescriptor.descriptor_identity,
+						descriptorHarness: selectedRoute.harness,
+					};
+					onTaskHeartbeat?.(heartbeat);
+				},
+			});
+		},
+	});
+}
+
+function brokerRequestForTask(task, context, requiredCapability) {
+	return {
+		schemaVersion: 1,
+		capability: requiredCapability,
+		dataClass: "repository",
+		estimatedConsumption:
+			typeof task.estimatedConsumption === "number" &&
+			Number.isFinite(task.estimatedConsumption) &&
+			task.estimatedConsumption > 0
+				? task.estimatedConsumption
+				: 1,
+		runId: context.runId ?? `runner-${process.pid}`,
+		taskId: task.id,
+		snapshotSource: context.snapshotSource ?? "gradus-v2",
+		availableAdapters: Object.keys(context.adapters ?? DEFAULT_ADAPTERS),
+	};
+}
+
+function normalizeBrokerRoute(result) {
+	return {
+		provider: result.provider,
+		model: result.model,
+		resolvedTargetId: result.resolvedTarget,
+		resolved_harness: result.harness,
+		requiredCapability: result.capability,
+		reason: result.reason,
+		snapshotStatus: result.snapshotIdentity.status,
+		snapshotMtime: result.snapshotIdentity.mtime,
+		snapshotAgeMsAtRoute: result.snapshotIdentity.ageMs,
+	};
+}
+
+function mergeBrokerRouteProvenance(routeResult, capability, provenance) {
+	Object.assign(routeResult, { requiredCapability: capability });
+	for (const [key, value] of Object.entries(provenance)) {
+		if (key === "resolved_target" && routeResult.resolvedTargetId != null) {
+			routeResult[key] = routeResult.resolvedTargetId;
+			continue;
+		}
+		if (key === "resolved_harness" && routeResult.resolved_harness != null) {
+			continue;
+		}
+		if (key === "resolved_selector" && routeResult.model != null) {
+			routeResult[key] = routeResult.model;
+			continue;
+		}
+		if (value != null || routeResult[key] == null) routeResult[key] = value;
+	}
+}
+
+function brokerFailureKind(result) {
+	if (result?.outcome !== "failure" || result?.timedOut === true) {
+		return null;
+	}
+	if (
+		result.errorKind === "auth_expired" ||
+		result.errorKind === "model_unavailable" ||
+		result.errorKind === "quota_exhausted"
+	) {
+		return null;
+	}
+	if (result.failureKind === "provider" || result.failureKind === "transient") {
+		return result.failureKind;
+	}
+	if (typeof result.reason !== "string") {
+		return null;
+	}
+	const reason = result.reason.toLowerCase();
+	if (reason.includes("transient") || reason.includes("timeout")) {
+		return "transient";
+	}
+	if (reason === "launcher_failed" || reason.includes("provider")) {
+		return "provider";
+	}
+	return null;
 }
 
 function runBackendGitCommand(executionBackend, workspaceId, script) {
