@@ -133,7 +133,11 @@ export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
  * @returns {{output: string, success: boolean, error?: string, timedOut?: boolean, errorKind?: string|null}}
  */
 export function executeAgy(prompt, workingContainerName, options = {}) {
-	const { model, timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS } = options;
+	const {
+		model,
+		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		cwd = "/project",
+	} = options;
 	const guardedPrompt = addProviderPromptGuardrail(prompt);
 
 	try {
@@ -168,7 +172,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 	}
 	argv.push(
 		"--add-dir",
-		"/project",
+		cwd,
 		"--print-timeout",
 		"9m",
 		"--print",
@@ -176,6 +180,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 	);
 	const { command, args } = getWorkspaceExecution(workingContainerName, {
 		...options,
+		cwd,
 		argv,
 	});
 
@@ -231,6 +236,7 @@ export async function executeAgyAsync(
 	const {
 		model,
 		timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+		cwd = "/project",
 		signal,
 		onPoll,
 	} = options;
@@ -255,7 +261,7 @@ export async function executeAgyAsync(
 		}
 		argv.push(
 			"--add-dir",
-			"/project",
+			cwd,
 			"--print-timeout",
 			"9m",
 			"--print",
@@ -263,6 +269,7 @@ export async function executeAgyAsync(
 		);
 		const { command, args } = getWorkspaceExecution(workingContainerName, {
 			...options,
+			cwd,
 			argv,
 		});
 		return await executeProviderInvocation(command, args, {

@@ -1,10 +1,15 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { captureDiff, executeAgy } from "../src/switchyard/adapter/agy.mjs";
+import {
+	captureDiff,
+	executeAgy,
+	executeAgyAsync,
+} from "../src/switchyard/adapter/agy.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
@@ -201,6 +206,109 @@ describe("agy adapter host-side timeout", () => {
 		ok(
 			hostTimeoutMs > printTimeoutMs,
 			`host timeout (${hostTimeoutMs}ms) must exceed agy's own --print-timeout (${printTimeoutMs}ms)`,
+		);
+	});
+});
+
+function fakeChild() {
+	const child = new EventEmitter();
+	child.stdout = new EventEmitter();
+	child.stderr = new EventEmitter();
+	child.stdin = { end() {} };
+	child.signals = [];
+	child.kill = (signal) => {
+		child.signals.push(signal);
+		if (signal === "SIGKILL")
+			queueMicrotask(() => child.emit("close", null, signal));
+		return true;
+	};
+	return child;
+}
+
+describe("agy adapter workspace path resolution", () => {
+	it("honors caller-provided workspace path in synchronous execution", () => {
+		const alternateWorkspace = "/Users/switchyard/.switchyard/project";
+		const calls = [];
+		const fakeBackend = {
+			execArgv(workspaceId, options) {
+				calls.push({ workspaceId, ...options });
+				return {
+					command: process.execPath,
+					args: ["-e", "process.stdout.write('sync ok'); process.exit(0);"],
+				};
+			},
+		};
+
+		const result = executeAgy(AGY_PROMPT, "test-container", {
+			model: AGY_MODEL,
+			cwd: alternateWorkspace,
+			resolvedTargetId: AGY_DESCRIPTOR.target_id,
+			descriptorHarness: "agy",
+			invocationDescriptor: AGY_DESCRIPTOR,
+			descriptorIdentity: AGY_DESCRIPTOR.descriptor_identity,
+			executionBackend: fakeBackend,
+		});
+
+		strictEqual(result.success, true);
+		strictEqual(calls.length, 1);
+		strictEqual(calls[0].workspaceId, "test-container");
+		strictEqual(calls[0].cwd, alternateWorkspace);
+
+		const addDirIndex = calls[0].argv.indexOf("--add-dir");
+		ok(addDirIndex !== -1, "expected --add-dir in agy argv");
+		strictEqual(calls[0].argv[addDirIndex + 1], alternateWorkspace);
+		strictEqual(
+			calls[0].cwd,
+			calls[0].argv[addDirIndex + 1],
+			"caller-provided workspace path must match both --add-dir and execution backend cwd",
+		);
+	});
+
+	it("honors caller-provided workspace path in asynchronous execution", async () => {
+		const alternateWorkspace = "/custom/agy/workspace";
+		const calls = [];
+		const fakeBackend = {
+			execArgv(workspaceId, options) {
+				calls.push({ workspaceId, ...options });
+				return {
+					command: "fake-agy",
+					args: ["arg"],
+				};
+			},
+		};
+
+		const child = fakeChild();
+		const spawnFn = () => {
+			queueMicrotask(() => {
+				child.stdout.emit("data", "async ok\n");
+				child.emit("close", 0, null);
+			});
+			return child;
+		};
+
+		const result = await executeAgyAsync(AGY_PROMPT, "test-container", {
+			model: AGY_MODEL,
+			cwd: alternateWorkspace,
+			resolvedTargetId: AGY_DESCRIPTOR.target_id,
+			descriptorHarness: "agy",
+			invocationDescriptor: AGY_DESCRIPTOR,
+			descriptorIdentity: AGY_DESCRIPTOR.descriptor_identity,
+			executionBackend: fakeBackend,
+			spawnFn,
+		});
+
+		strictEqual(result.success, true);
+		strictEqual(calls.length, 1);
+		strictEqual(calls[0].workspaceId, "test-container");
+		strictEqual(calls[0].cwd, alternateWorkspace);
+
+		const addDirIndex = calls[0].argv.indexOf("--add-dir");
+		ok(addDirIndex !== -1, "expected --add-dir in agy argv");
+		strictEqual(calls[0].argv[addDirIndex + 1], alternateWorkspace);
+		strictEqual(
+			calls[0].cwd,
+			calls[0].argv[addDirIndex + 1],
+			"caller-provided workspace path must match both --add-dir and execution backend cwd in async execution",
 		);
 	});
 });
