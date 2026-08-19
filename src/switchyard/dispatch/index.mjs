@@ -44,6 +44,7 @@ import {
 	listManagedContainers,
 	recoverManagedObjects,
 } from "../lifecycle/index.mjs";
+import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
 	acquireProjectLock,
@@ -1039,6 +1040,25 @@ const PROVIDER_BINARY_NAMES = {
 const DEFAULT_EXECUTION_BACKEND = new DockerExecutionBackend();
 
 /**
+ * Select the execution backend that matches the platform a run actually
+ * used, mirroring runner/index.mjs's createQueueBackend construction so a
+ * later, separate `status`/`result` process reconstructs the same backend
+ * shape the worker did. Legacy runs recorded before runOptions.platform
+ * existed default to Docker (the only platform that existed then).
+ * @param {object} run parsed run snapshot
+ * @returns {import("../lifecycle/execution-backend.mjs").ExecutionBackend}
+ */
+function executionBackendForRun(run) {
+	if (run?.runOptions?.platform !== "macos") return DEFAULT_EXECUTION_BACKEND;
+	return new ParallelsExecutionBackend({
+		goldenImage: process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
+		aquaUid: process.env.SWITCHYARD_PARALLELS_AQUA_UID,
+		providerUser:
+			process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ?? "switchyard",
+	});
+}
+
+/**
  * Match one `docker top -eo pid,args` output line against a target binary
  * name. The pid,args format is "<pid><whitespace><args...>" where the args
  * column is itself whitespace-separated (argv[0] is its first token); this
@@ -1140,7 +1160,11 @@ async function buildStatusEnvelope(runId, run) {
 		// not-running shape as workerLive, and same "skip the shell-out
 		// entirely when not running" rule.
 		providerProcessDetected:
-			run.state === "running" ? probeProviderProcess(run) : null,
+			run.state === "running"
+				? probeProviderProcess(run, {
+						executionBackend: executionBackendForRun(run),
+					})
+				: null,
 		// Host-vs-image Docker architecture comparison (see
 		// container/index.mjs's getPlatformInfo) — a static diagnostic, not
 		// run-specific, so unlike providerProcessDetected it's safe to call
@@ -1232,7 +1256,11 @@ async function buildResultEnvelope(runId, run) {
 		cleanupState: run.cleanupState,
 		workerLive: run.state === "running" ? isWorkerLive(run) : null,
 		providerProcessDetected:
-			run.state === "running" ? probeProviderProcess(run) : null,
+			run.state === "running"
+				? probeProviderProcess(run, {
+						executionBackend: executionBackendForRun(run),
+					})
+				: null,
 		// Host-vs-image Docker architecture comparison (see
 		// container/index.mjs's getPlatformInfo) — a static diagnostic, not
 		// run-specific, so unlike providerProcessDetected it's safe to call
