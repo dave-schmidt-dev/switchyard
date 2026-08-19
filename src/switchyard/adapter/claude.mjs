@@ -181,10 +181,14 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 	} catch (error) {
 		const timedOut = error.code === "ETIMEDOUT";
 		if (timedOut) {
-			// The host-side kill above only stops the `docker exec` client; the
-			// process it started keeps running inside the container's PID
-			// namespace until explicitly killed there (see orphan-kill.mjs).
-			killOrphanedProcesses(workingContainerName);
+			// The host-side kill above only stops the exec client; the process
+			// it started keeps running in the container/guest until explicitly
+			// killed there (see orphan-kill.mjs).
+			killOrphanedProcesses(workingContainerName, {
+				executionBackend: options.executionBackend,
+				command,
+				args,
+			});
 			// Keep error.message (carries ETIMEDOUT) so the runner classifies
 			// this as execution_timed_out, not a generic failure.
 			return {

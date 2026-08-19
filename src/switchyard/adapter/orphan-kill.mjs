@@ -1,36 +1,20 @@
-// D-9: best-effort in-container process cleanup after a host-side execFileSync
-// timeout. `docker exec` does not forward host signals into the container's
-// PID namespace — killing the host-side exec client (SIGTERM on ETIMEDOUT)
-// leaves whatever it spawned inside the container running unsupervised.
-// Empirically verified: a process started via `docker exec` kept executing
-// for several seconds after its host-side client was killed on timeout.
-
+// D-9: best-effort process cleanup after a host-side execFileSync timeout.
+// Neither transport forwards host signals into the executed process's own
+// process tree — killing the host-side client (SIGTERM on ETIMEDOUT) leaves
+// whatever it spawned running unsupervised, in a container's PID namespace or
+// a VM guest alike. Empirically verified for `docker exec`: a process it
+// started kept executing for several seconds after its host-side client was
+// killed on timeout.
+//
+// A `ParallelsExecutionBackend` (or any future backend) that implements
+// `cleanupProviderProcess(command, args, {onStatus})` is preferred when
+// present — it knows how to reach into its own guest and is the only correct
+// mechanism there, since a VM has no `docker exec` to fall back to. The
+// Docker path below is the fallback for backends that don't provide one.
 import { execFile, execFileSync } from "node:child_process";
 import { validateIdentifier } from "./shell-safety.mjs";
 
-/**
- * Kill every process inside a container except PID 1 (the container's own
- * `sleep infinity` keep-alive process — see lifecycle/index.mjs). `kill -1`
- * targets "every process the caller may signal, except PID 1 and the caller
- * itself" (POSIX kill(2)), so this reaches an orphaned provider CLI without
- * needing `pkill`/`ps` to be installed in the agent image. TERM first, then
- * KILL after a short grace period, so a process gets a chance to flush
- * before being forced.
- *
- * Also clears a stale `/project/.git/index.lock` left behind if the killed
- * process was itself mid `git add`/`git commit` (a real, empirically
- * confirmed case: a stale lock makes captureDiff's own `git add -A` fail,
- * which its catch-all swallows into a silent `null` — losing the very work
- * this whole timeout path exists to preserve). Safe specifically at this
- * point: every process in the container has just been force-killed above, so
- * nothing can still legitimately hold the lock.
- *
- * Best-effort throughout: swallows all errors, since this runs from an
- * adapter's timeout catch block and must never itself throw or block
- * returning the (already-failed) execution result.
- * @param {string} containerName
- */
-export function killOrphanedProcesses(containerName) {
+function killViaDocker(containerName) {
 	try {
 		validateIdentifier(containerName, "containerName");
 	} catch {
@@ -56,9 +40,52 @@ export function killOrphanedProcesses(containerName) {
 }
 
 /**
- * Non-blocking counterpart for async provider lifecycles. The command is
- * deliberately identical to killOrphanedProcesses so TERM/KILL ordering and
- * stale-index cleanup remain one containment policy.
+ * Kill every process inside a container except PID 1 (the container's own
+ * `sleep infinity` keep-alive process — see lifecycle/index.mjs). `kill -1`
+ * targets "every process the caller may signal, except PID 1 and the caller
+ * itself" (POSIX kill(2)), so this reaches an orphaned provider CLI without
+ * needing `pkill`/`ps` to be installed in the agent image. TERM first, then
+ * KILL after a short grace period, so a process gets a chance to flush
+ * before being forced.
+ *
+ * Also clears a stale `/project/.git/index.lock` left behind if the killed
+ * process was itself mid `git add`/`git commit` (a real, empirically
+ * confirmed case: a stale lock makes captureDiff's own `git add -A` fail,
+ * which its catch-all swallows into a silent `null` — losing the very work
+ * this whole timeout path exists to preserve). Safe specifically at this
+ * point: every process has just been force-killed above, so nothing can
+ * still legitimately hold the lock.
+ *
+ * Best-effort throughout: swallows all errors, since this runs from an
+ * adapter's timeout catch block and must never itself throw or block
+ * returning the (already-failed) execution result.
+ * @param {string} containerName
+ * @param {object} [options]
+ * @param {{cleanupProviderProcess?: Function}} [options.executionBackend]
+ * @param {string} [options.command]
+ * @param {string[]} [options.args]
+ */
+export function killOrphanedProcesses(containerName, options = {}) {
+	const { executionBackend, command, args, onStatus } = options;
+	if (typeof executionBackend?.cleanupProviderProcess === "function") {
+		try {
+			executionBackend.cleanupProviderProcess(command, args, { onStatus });
+			return;
+		} catch {
+			// Fall through to the Docker path as a last-resort backstop.
+		}
+	}
+	killViaDocker(containerName);
+}
+
+/**
+ * Non-blocking counterpart for async provider lifecycles. Docker-only: the
+ * async provider-lifecycle path (`executeProviderInvocation` in
+ * provider-lifecycle.mjs) already calls a VM-native
+ * `executionBackend.cleanupProviderProcess()` itself, before falling back to
+ * this function, so this stays the Docker backstop it always was. The
+ * command is deliberately identical to killOrphanedProcesses so TERM/KILL
+ * ordering and stale-index cleanup remain one containment policy.
  * @param {string} containerName
  * @returns {Promise<void>}
  */

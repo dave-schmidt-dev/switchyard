@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 import {
 	captureProviderDiffAsync,
+	executeProviderInvocation,
 	runProviderProcess,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import { validateIdentifier } from "../src/switchyard/adapter/shell-safety.mjs";
@@ -149,5 +150,73 @@ describe("provider process lifecycle", () => {
 		});
 		strictEqual(typeof result, "string");
 		deepStrictEqual(calls, ["-A", "HEAD"]);
+	});
+
+	it("prefers a backend's cleanupProviderProcess and skips the adapter's own cleanup on timeout", async () => {
+		const child = fakeChild();
+		let backendCalls = 0;
+		let adapterCleanups = 0;
+		const executionBackend = {
+			cleanupProviderProcess: () => {
+				backendCalls += 1;
+			},
+		};
+		const result = await executeProviderInvocation("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			executionBackend,
+			cleanup: () => {
+				adapterCleanups += 1;
+			},
+		});
+		strictEqual(result.timedOut, true);
+		strictEqual(backendCalls, 1);
+		strictEqual(
+			adapterCleanups,
+			0,
+			"adapter cleanup must not run once the backend's own cleanup succeeded",
+		);
+	});
+
+	it("falls back to the adapter's cleanup when the backend's cleanupProviderProcess throws", async () => {
+		const child = fakeChild();
+		let adapterCleanups = 0;
+		const executionBackend = {
+			cleanupProviderProcess: () => {
+				throw new Error("guest unreachable");
+			},
+		};
+		const result = await executeProviderInvocation("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			executionBackend,
+			cleanup: () => {
+				adapterCleanups += 1;
+			},
+		});
+		strictEqual(result.timedOut, true);
+		strictEqual(result.cleanupFailed, true);
+		strictEqual(
+			adapterCleanups,
+			1,
+			"adapter cleanup must still run as a backstop when the backend's cleanup fails",
+		);
+	});
+
+	it("runs the adapter's cleanup when no backend cleanupProviderProcess is available", async () => {
+		const child = fakeChild();
+		let adapterCleanups = 0;
+		const result = await executeProviderInvocation("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			cleanup: () => {
+				adapterCleanups += 1;
+			},
+		});
+		strictEqual(result.timedOut, true);
+		strictEqual(adapterCleanups, 1);
 	});
 });

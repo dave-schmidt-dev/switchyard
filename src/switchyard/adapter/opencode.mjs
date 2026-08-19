@@ -297,7 +297,11 @@ export function execute(prompt, workingContainerName, options = {}) {
 		}
 		const timedOut = error.code === "ETIMEDOUT";
 		if (timedOut) {
-			killOrphanedProcesses(workingContainerName);
+			killOrphanedProcesses(workingContainerName, {
+				executionBackend: options.executionBackend,
+				command: execution.command,
+				args: execution.args,
+			});
 			// Keep error.message (carries ETIMEDOUT) so the runner classifies
 			// this as execution_timed_out, not a generic failure.
 			return {

@@ -267,18 +267,26 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		idleExitCode,
 		...lifecycleOptions
 	} = options;
+	// A backend that implements cleanupProviderProcess() (currently only
+	// ParallelsExecutionBackend) is authoritative for its own transport — the
+	// adapter's `cleanup` (killOrphanedProcessesAsync, Docker-only) would be a
+	// guaranteed-to-fail no-op against a VM workspace id, so it only runs as a
+	// fallback: when no such backend method exists, or when it throws.
 	const cleanupWithBackend = async () => {
 		let backendError = null;
-		try {
-			if (typeof executionBackend?.cleanupProviderProcess === "function") {
+		let backendHandled = false;
+		if (typeof executionBackend?.cleanupProviderProcess === "function") {
+			try {
 				await executionBackend.cleanupProviderProcess(command, args, {
 					onStatus,
 				});
+				backendHandled = true;
+			} catch (error) {
+				backendError = error;
 			}
-		} catch (error) {
-			backendError = error;
-		} finally {
-			if (typeof cleanup === "function") await cleanup();
+		}
+		if (!backendHandled && typeof cleanup === "function") {
+			await cleanup();
 		}
 		if (backendError) throw backendError;
 	};
