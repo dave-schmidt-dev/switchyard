@@ -218,8 +218,8 @@ export function normalizeRunOptions(options = {}) {
 }
 
 /** Normalize the queue-level execution platform before any workspace exists. */
-export function normalizeQueuePlatform(value = "docker") {
-	const platform = String(value ?? "docker")
+export function normalizeQueuePlatform(value = "macos") {
+	const platform = String(value ?? "macos")
 		.trim()
 		.toLowerCase();
 	if (!QUEUE_PLATFORMS.includes(platform)) {
@@ -4978,7 +4978,7 @@ function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
  * preflight.
  */
 export function createQueueBackend({
-	platform = "docker",
+	platform = "macos",
 	dependencies = {},
 	projectPath,
 	runId = null,

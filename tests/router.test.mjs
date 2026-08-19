@@ -922,8 +922,8 @@ describe("Task 4.3 timeout boundaries", () => {
 });
 
 describe("Task 6.1 queue-level platform selection", () => {
-	it("normalizes docker by default and rejects an invalid platform", () => {
-		strictEqual(normalizeRunOptions({}).platform, "docker");
+	it("normalizes macos by default and rejects an invalid platform", () => {
+		strictEqual(normalizeRunOptions({}).platform, "macos");
 		throws(() => normalizeRunOptions({ platform: "windows" }), /platform/);
 	});
 

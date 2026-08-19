@@ -27,7 +27,7 @@
 //   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json).
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --exclude-provider <name>  Never route to this provider (repeatable).
-//   --platform <docker|macos> Queue workspace platform (default: docker).
+//   --platform <docker|macos> Queue workspace platform (default: macos).
 //   --help                 Show this help.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -90,7 +90,7 @@ Run/Launch options:
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
-  --platform <docker|macos>  Queue workspace platform (default: docker)
+  --platform <docker|macos>  Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
@@ -102,7 +102,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
-  --platform <docker|macos>  Queue workspace platform (default: docker)
+  --platform <docker|macos>  Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
@@ -259,7 +259,7 @@ function parseDispatchArgs(argv) {
 		...(values["only-provider"] ?? []),
 		...(values.provider ?? []),
 	];
-	const platform = String(values.platform ?? "docker")
+	const platform = String(values.platform ?? "macos")
 		.trim()
 		.toLowerCase();
 	if (!["docker", "macos"].includes(platform)) {

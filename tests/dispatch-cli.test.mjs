@@ -138,7 +138,7 @@ describe("parseDispatchArgs (backwards compat)", () => {
 		strictEqual(opts.maxTasks, Number.POSITIVE_INFINITY);
 		strictEqual(opts.stopOnFailure, true);
 		strictEqual(opts.checkpointPath, undefined);
-		strictEqual(opts.platform, "docker");
+		strictEqual(opts.platform, "macos");
 	});
 
 	it("parses the queue-level macOS platform", () => {

@@ -543,6 +543,8 @@ describe("--exclude-provider on the detached worker path", () => {
 				excludeProjectDir,
 				"--exclude-provider",
 				"claude",
+				"--platform",
+				"docker",
 			],
 			env,
 		);
@@ -689,6 +691,8 @@ describe("--only-provider on the detached worker path", () => {
 				onlyProjectDir,
 				"--only-provider",
 				"codex",
+				"--platform",
+				"docker",
 			],
 			env,
 		);

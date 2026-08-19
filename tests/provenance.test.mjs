@@ -662,6 +662,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies(),
 			});
@@ -690,6 +691,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies(),
 			});
@@ -742,6 +744,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: delayedStoreWriter,
@@ -799,6 +802,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: gatedStoreWriter,
@@ -843,6 +847,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: async () => {
@@ -901,6 +906,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					onStatus: (event) => statuses.push(event),
@@ -943,6 +949,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies({
 					recordDispatchToStore: async () => {
@@ -985,6 +992,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: {
 					...defaultSyncDependencies(),
@@ -1006,6 +1014,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: orchestratorTasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: join(tmpDir, `${orchestratorTaskId}.checkpoint.json`),
 				dependencies: {
 					...defaultOrchestratorDependencies(),
@@ -1032,6 +1041,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies(),
 			});
@@ -1071,6 +1081,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: async () => {
@@ -1125,6 +1136,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
+				platform: "docker",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies(),
 			});

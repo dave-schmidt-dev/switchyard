@@ -556,6 +556,7 @@ function withTestDescriptorOptions(options) {
 			: undefined);
 	return {
 		...options,
+		platform: options.platform ?? "docker",
 		dependencies: {
 			...dependencies,
 			route: context.route,
@@ -3866,6 +3867,7 @@ runQueue({
   tasksFilePath,
   projectPath,
   checkpointPath,
+  platform: "docker",
   dependencies: {
     route,
     resolveDescriptor: () => latestDescriptor,
