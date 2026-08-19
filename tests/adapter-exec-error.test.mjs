@@ -1,6 +1,7 @@
 import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
+	classifyProviderDiagnostic,
 	describeExecError,
 	isPersistentFailureMetadata,
 	PERSISTED_ERROR_KINDS,
@@ -349,6 +350,37 @@ describe("reauthHintFor", () => {
 });
 
 describe("sanitizeFailureMetadata — persistence boundary", () => {
+	it("retains only allowlisted structured execution diagnostics", () => {
+		const metadata = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "execution_failed",
+			diagnosticCode: "cli_usage_error",
+			exitCode: 2,
+			signal: "SECRET_CANARY_signal",
+			failurePhase: "provider_execution",
+		});
+
+		deepStrictEqual(metadata, {
+			errorKind: "execution_failed",
+			reasonCode: "execution_failed",
+			reason: "Provider execution failed before a reviewed integration.",
+			diagnosticCode: "cli_usage_error",
+			exitCode: 2,
+			failurePhase: "provider_execution",
+		});
+		ok(isPersistentFailureMetadata(metadata));
+		strictEqual(JSON.stringify(metadata).includes("SECRET_CANARY"), false);
+	});
+
+	it("classifies provider text without returning the text", () => {
+		const code = classifyProviderDiagnostic({
+			text: "SECRET_CANARY_x: unexpected argument --bad",
+			exitCode: 2,
+		});
+		strictEqual(code, "cli_usage_error");
+		strictEqual(code.includes("SECRET_CANARY"), false);
+	});
+
 	it("maps an untrusted provider classification to static metadata and an opaque artifact ref", () => {
 		const metadata = sanitizeFailureMetadata({
 			taskId: "1.1",

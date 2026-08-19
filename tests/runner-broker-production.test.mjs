@@ -39,7 +39,16 @@ test("production async runner uses broker reservation, fallback, and adapter lau
 		claude: {
 			executeAsync: async (_prompt, _container, options) => {
 				calls.push(options.resolvedTargetId);
-				return { success: calls.length > 1 };
+				return calls.length > 1
+					? { success: true }
+					: {
+							success: false,
+							error: "SECRET_CANARY_provider output",
+							errorKind: "execution_failed",
+							diagnosticCode: "cli_usage_error",
+							exitCode: 2,
+							failurePhase: "provider_execution",
+						};
 			},
 			captureDiffAsync: async () => null,
 		},
@@ -99,6 +108,10 @@ test("production async runner uses broker reservation, fallback, and adapter lau
 	strictEqual(dispatches.length, 2);
 	strictEqual(dispatches[0].provider, "Cheap");
 	strictEqual(dispatches[0].result, "execution_failed");
+	strictEqual(dispatches[0].diagnosticCode, "cli_usage_error");
+	strictEqual(dispatches[0].exitCode, 2);
+	strictEqual(dispatches[0].failurePhase, "provider_execution");
+	strictEqual(JSON.stringify(dispatches[0]).includes("SECRET_CANARY"), false);
 	strictEqual(dispatches[1].provider, "Expensive");
 	strictEqual(dispatches[1].result, "success_no_diff");
 	strictEqual(snapshotReads >= 2, true);

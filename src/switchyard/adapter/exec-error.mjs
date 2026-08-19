@@ -120,6 +120,61 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"unknown_failure",
 ]);
 
+const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
+	"auth_expired",
+	"quota_exhausted",
+	"model_unavailable",
+	"cli_usage_error",
+	"provider_exit_nonzero",
+	"provider_signalled",
+	"provider_output_unclassified",
+	"execution_timed_out",
+	"execution_cancelled",
+]);
+
+const PERSISTED_FAILURE_PHASES = new Set([
+	"adapter_validation",
+	"provider_execution",
+	"provider_cleanup",
+	"terminal_reconciliation",
+]);
+const PERSISTED_SIGNALS = new Set([
+	"SIGABRT",
+	"SIGHUP",
+	"SIGINT",
+	"SIGKILL",
+	"SIGQUIT",
+	"SIGTERM",
+]);
+const CLI_USAGE_SIGNATURE =
+	/\b(?:unexpected argument|unrecognized (?:option|argument)|unknown (?:option|argument)|invalid value|usage:)\b/i;
+
+/** Convert transient provider output into a content-free diagnostic code. */
+export function classifyProviderDiagnostic({
+	errorKind,
+	text,
+	exitCode,
+	signal,
+	timedOut = false,
+	cancelled = false,
+} = {}) {
+	if (cancelled) return "execution_cancelled";
+	if (timedOut) return "execution_timed_out";
+	if (
+		["auth_expired", "quota_exhausted", "model_unavailable"].includes(errorKind)
+	) {
+		return errorKind;
+	}
+	if (typeof text === "string" && CLI_USAGE_SIGNATURE.test(text)) {
+		return "cli_usage_error";
+	}
+	if (typeof signal === "string" && signal) return "provider_signalled";
+	if (typeof text === "string" && text.trim()) {
+		return "provider_output_unclassified";
+	}
+	return Number.isSafeInteger(exitCode) ? "provider_exit_nonzero" : null;
+}
+
 const PERSISTED_ERROR_METADATA = Object.freeze({
 	auth_expired: Object.freeze({
 		reasonCode: "auth_expired",
@@ -222,6 +277,10 @@ export function sanitizeFailureMetadata({
 	errorKind,
 	timedOut = false,
 	partialDiffPath,
+	diagnosticCode,
+	exitCode,
+	signal,
+	failurePhase,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -236,6 +295,16 @@ export function sanitizeFailureMetadata({
 		reasonCode: metadata.reasonCode,
 		reason: metadata.reason,
 	};
+	if (PERSISTED_DIAGNOSTIC_CODES.includes(diagnosticCode)) {
+		safe.diagnosticCode = diagnosticCode;
+	}
+	if (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255) {
+		safe.exitCode = exitCode;
+	}
+	if (PERSISTED_SIGNALS.has(signal)) safe.signal = signal;
+	if (PERSISTED_FAILURE_PHASES.has(failurePhase)) {
+		safe.failurePhase = failurePhase;
+	}
 	if (partialDiffPath && typeof taskId === "string" && taskId) {
 		const digest = createHash("sha256")
 			.update(`${taskId}.diff`)
@@ -258,6 +327,10 @@ export function isPersistentFailureMetadata(value) {
 		"reasonCode",
 		"reason",
 		"artifactRef",
+		"diagnosticCode",
+		"exitCode",
+		"signal",
+		"failurePhase",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
 	const expected = sanitizeFailureMetadata({
@@ -278,6 +351,21 @@ export function isPersistentFailureMetadata(value) {
 		) {
 			return false;
 		}
+	}
+	const safeDiagnostics = sanitizeFailureMetadata({
+		result: "execution_failed",
+		diagnosticCode: value.diagnosticCode,
+		exitCode: value.exitCode,
+		signal: value.signal,
+		failurePhase: value.failurePhase,
+	});
+	for (const field of [
+		"diagnosticCode",
+		"exitCode",
+		"signal",
+		"failurePhase",
+	]) {
+		if (value[field] !== safeDiagnostics?.[field]) return false;
 	}
 	return true;
 }

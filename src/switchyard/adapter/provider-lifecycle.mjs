@@ -7,7 +7,10 @@
 
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
 import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
-import { describeExecError } from "./exec-error.mjs";
+import {
+	classifyProviderDiagnostic,
+	describeExecError,
+} from "./exec-error.mjs";
 import { validateIdentifier } from "./shell-safety.mjs";
 
 const DEFAULT_MAX_BUFFER = 128 * 1024 * 1024;
@@ -313,6 +316,12 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				: "provider execution timed out (ETIMEDOUT)",
 			timedOut: true,
 			cleanupFailed: result.cleanupFailed,
+			diagnosticCode: "execution_timed_out",
+			failurePhase: result.cleanupFailed
+				? "provider_cleanup"
+				: "provider_execution",
+			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
+			signal: result.signal ?? null,
 		};
 	}
 	if (result.cancelled) {
@@ -321,6 +330,10 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			success: false,
 			error: "provider execution cancelled",
 			cancelled: true,
+			diagnosticCode: "execution_cancelled",
+			failurePhase: "provider_execution",
+			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
+			signal: result.signal ?? null,
 		};
 	}
 	const error = Object.assign(
@@ -337,7 +350,16 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		output: described.output,
 		success: false,
 		error: truncateDiagnostic(described.error),
-		errorKind: described.errorKind,
+		errorKind: described.errorKind ?? "execution_failed",
+		diagnosticCode: classifyProviderDiagnostic({
+			errorKind: described.errorKind,
+			text: `${result.output ?? ""}\n${result.stderr ?? ""}`,
+			exitCode: result.code,
+			signal: result.signal,
+		}),
+		failurePhase: "provider_execution",
+		exitCode: Number.isSafeInteger(result.code) ? result.code : null,
+		signal: result.signal ?? null,
 	};
 }
 

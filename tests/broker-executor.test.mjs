@@ -165,7 +165,7 @@ describe("broker async executor", () => {
 		strictEqual(result.cleanupFailed, true);
 	});
 
-	it("ignores a broken status sink and never exposes launcher output", async () => {
+	it("retains safe structured diagnostics without exposing launcher output", async () => {
 		const value = fixture();
 		let terminals = 0;
 		const result = await executeBrokerRoute({
@@ -178,7 +178,11 @@ describe("broker async executor", () => {
 			},
 			launch: async () => ({
 				success: false,
-				reason: "raw provider stdout must not escape",
+				reason: "SECRET_CANARY_raw provider stdout must not escape",
+				errorKind: "execution_failed",
+				diagnosticCode: "cli_usage_error",
+				exitCode: 2,
+				failurePhase: "provider_execution",
 			}),
 			terminal: async () => {
 				terminals += 1;
@@ -187,5 +191,10 @@ describe("broker async executor", () => {
 		});
 		strictEqual(terminals, 1);
 		strictEqual(result.reason, "launcher_failed");
+		strictEqual(result.errorKind, "execution_failed");
+		strictEqual(result.diagnosticCode, "cli_usage_error");
+		strictEqual(result.exitCode, 2);
+		strictEqual(result.failurePhase, "provider_execution");
+		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
 	});
 });

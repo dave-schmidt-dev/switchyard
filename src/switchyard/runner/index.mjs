@@ -3021,6 +3021,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 						result: "execution_failed",
 						errorKind: brokerExecution.errorKind ?? "execution_failed",
 						reason: brokerExecution.reason ?? primaryRoute.reason,
+						diagnosticCode: brokerExecution.diagnosticCode,
+						exitCode: brokerExecution.exitCode,
+						signal: brokerExecution.signal,
+						failurePhase: brokerExecution.failurePhase,
 					},
 					{
 						recordProvenance: primaryProvenance,
@@ -3127,6 +3131,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 		cleanupFailed: brokerExecution.cleanupFailed === true,
 		error: brokerExecution.reason ?? null,
 		errorKind: brokerExecution.errorKind ?? brokerExecution.outcome,
+		diagnosticCode: brokerExecution.diagnosticCode ?? null,
+		exitCode: brokerExecution.exitCode ?? null,
+		signal: brokerExecution.signal ?? null,
+		failurePhase: brokerExecution.failurePhase ?? null,
 	};
 	if (!execution.success) {
 		if (!execution.timedOut) {
@@ -3137,6 +3145,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 				result: "execution_failed",
 				errorKind: execution.errorKind ?? null,
 				reason: execution.error ?? routeResult.reason,
+				diagnosticCode: execution.diagnosticCode,
+				exitCode: execution.exitCode,
+				signal: execution.signal,
+				failurePhase: execution.failurePhase,
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -3149,6 +3161,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 				result: "execution_failed",
 				error: execution.error ?? null,
 				errorKind: execution.errorKind ?? null,
+				diagnosticCode: execution.diagnosticCode,
+				exitCode: execution.exitCode,
+				signal: execution.signal,
+				failurePhase: execution.failurePhase,
 			};
 		}
 
@@ -3187,6 +3203,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 				execution.errorKind ||
 				null,
 			reason: error ?? routeResult.reason,
+			diagnosticCode: execution.diagnosticCode,
+			exitCode: execution.exitCode,
+			signal: execution.signal,
+			failurePhase: execution.failurePhase,
 		});
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
@@ -3204,6 +3224,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 				execution.errorKind ||
 				null,
 			timedOut: true,
+			diagnosticCode: execution.diagnosticCode,
+			exitCode: execution.exitCode,
+			signal: execution.signal,
+			failurePhase: execution.failurePhase,
 			...(partialDiff ? { partialDiff } : {}),
 		};
 	}
@@ -4652,6 +4676,10 @@ export function createBrokerAdapterLauncher({
 			errorKind: BOUNDED_ERROR_KINDS.has(execution?.errorKind)
 				? execution.errorKind
 				: null,
+			diagnosticCode: execution?.diagnosticCode ?? null,
+			exitCode: execution?.exitCode ?? null,
+			signal: execution?.signal ?? null,
+			failurePhase: execution?.failurePhase ?? null,
 		};
 	};
 }

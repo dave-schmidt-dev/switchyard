@@ -1,18 +1,9 @@
+import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
 const TERMINAL_OUTCOMES = new Set(["success", "failure", "cancel"]);
 const FAILURE_KINDS = new Set(["provider", "transient"]);
-const ERROR_KINDS = new Set([
-	"auth_expired",
-	"quota_exhausted",
-	"model_unavailable",
-	"execution_failed",
-	"execution_timed_out",
-	"launch_failed",
-	"unknown_failure",
-]);
-
 function sameSnapshot(left, right) {
 	return (
 		left?.source === right?.source &&
@@ -210,10 +201,22 @@ export async function executeBrokerRoute(options) {
 		const cancelled = signal?.aborted || error?.name === "AbortError";
 		const outcome = cancelled ? "cancel" : "failure";
 		if (terminalOutcome === null) await reconcileOnce(outcome, null);
+		const failure = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: launcherResult?.errorKind,
+			timedOut: launcherResult?.timedOut === true,
+			diagnosticCode: launcherResult?.diagnosticCode,
+			exitCode: launcherResult?.exitCode,
+			signal: launcherResult?.signal,
+			failurePhase:
+				launcherResult?.failurePhase ??
+				(!terminalCompleted ? "terminal_reconciliation" : "provider_execution"),
+		});
 		emit(
 			options.onStatus,
 			cancelled ? "execution_cancelled" : "execution_failed",
 			route,
+			failure ?? {},
 		);
 		return Object.freeze({
 			runId: route.runId,
@@ -237,9 +240,11 @@ export async function executeBrokerRoute(options) {
 			failureKind: FAILURE_KINDS.has(launcherResult?.failureKind)
 				? launcherResult.failureKind
 				: null,
-			errorKind: ERROR_KINDS.has(launcherResult?.errorKind)
-				? launcherResult.errorKind
-				: null,
+			errorKind: failure?.errorKind ?? null,
+			diagnosticCode: failure?.diagnosticCode ?? null,
+			exitCode: failure?.exitCode ?? null,
+			signal: failure?.signal ?? null,
+			failurePhase: failure?.failurePhase ?? null,
 			terminalEvidence,
 		});
 	}
