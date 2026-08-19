@@ -12,7 +12,6 @@
 // project-invented file, so there is no headless auto-login here.
 
 import { execFileSync } from "node:child_process";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
 import { validateAdapterInvocation } from "./invocation.mjs";
@@ -43,17 +42,21 @@ const CURSOR_CMD = "cursor-agent";
  * inverted that — defaulting to "authenticated" unless the literal string
  * "not logged in" appeared — which read an empty, reworded, or error status
  * output as authenticated; caught in review before shipping).
- * @param {string} [containerName] Container to check (defaults to the standing agent container).
+ * cursor-agent is also the one provider confirmed machine-bound rather than
+ * purely file-backed (see `VM_CREDENTIAL_LAYOUTS` in
+ * `parallels-execution-backend.mjs`): a guest provisioned with copies of its
+ * three credential files still reported `Not logged in`. The live status
+ * check below is what actually catches that case — a credential-presence
+ * check alone would report a false positive.
+ * @param {string} workspaceId
+ * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
  */
-export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+export function isCursorAuthenticated(workspaceId, executionBackend) {
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		const versionResult = execFileSync(
-			"docker",
-			["exec", containerName, CURSOR_CMD, "--version"],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
+		const versionResult = executionBackend
+			.execGuest(workspaceId, CURSOR_CMD, ["--version"], { cwd: "/" })
+			.toString();
 		if (
 			!(typeof versionResult === "string" && versionResult.trim().length > 0)
 		) {
@@ -64,12 +67,12 @@ export function isCursorAuthenticated(containerName = AGENT_CONTAINER_NAME) {
 	}
 
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		const statusResult = execFileSync(
-			"docker",
-			["exec", containerName, CURSOR_CMD, "status", "--format", "json"],
-			{ encoding: "utf8", stdio: "pipe", timeout: 10000 },
-		);
+		const statusResult = executionBackend
+			.execGuest(workspaceId, CURSOR_CMD, ["status", "--format", "json"], {
+				cwd: "/",
+				prlctlOptions: { timeout: 10000 },
+			})
+			.toString();
 		return JSON.parse(statusResult).isAuthenticated === true;
 	} catch {
 		return false;

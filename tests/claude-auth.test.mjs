@@ -1,5 +1,4 @@
 import { ok, strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,17 +8,7 @@ import {
 	executeClaude,
 	isClaudeAuthenticated,
 } from "../src/switchyard/adapter/claude.mjs";
-
-function hasDocker() {
-	try {
-		execSync("docker --version", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
+import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
 
 describe("claude adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -96,75 +85,75 @@ describe("claude adapter shell injection guard", () => {
 	});
 });
 
-describe("isClaudeAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the credential is withheld/corrupt even though the binary responds", {
-		skip: !dockerAvailable,
-	}, () => {
+describe("isClaudeAuthenticated credential-validity check (fake guest)", () => {
+	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
 		// TASKS.md Task 15 "done when": with the CLI installed and answering
 		// `--version` (liveness passes), a withheld or trivial credential must
 		// make isClaudeAuthenticated() return false — the exact false-positive
 		// the old liveness-only check produced. Claude's operative credential
-		// is Claude Code's own store (/root/.claude/.credentials.json), which
-		// `claude auth login` persists to directly (TASKS.md Task 24).
-		const containerName = `switchyard-claude-authcheck-${Date.now()}`;
-		const credPath = "/root/.claude/.credentials.json";
+		// is Claude Code's own store (~/.claude/.credentials.json, plus
+		// ~/.claude.json), which `claude auth login` persists to directly
+		// (TASKS.md Task 24).
+		const credentialsPath = ".claude/.credentials.json";
+		const configPath = ".claude.json";
+		const files = {};
+		const backend = createFakeExecutionBackend({
+			version: "Claude Code stub",
+			files,
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		// Credential withheld entirely.
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"withheld credential must not read as authenticated",
 		);
-		try {
-			// Stub that satisfies the `--version` liveness check (output
-			// contains "Claude") but is not actually authenticated.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho Claude Code stub\n" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude'`,
-				{ stdio: "pipe" },
-			);
 
-			// Credential withheld entirely.
-			strictEqual(
-				isClaudeAuthenticated(containerName),
-				false,
-				"withheld credential must not read as authenticated",
-			);
+		// Credential present but empty (the empty-file bug shape).
+		files[credentialsPath] = "";
+		files[configPath] = "";
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"empty credential file must not read as authenticated",
+		);
 
-			// Credential present but empty (the empty-file bug shape).
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.claude && : > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isClaudeAuthenticated(containerName),
-				false,
-				"empty credential file must not read as authenticated",
-			);
+		// Credential present but a trivial JSON stub.
+		files[credentialsPath] = "{}";
+		files[configPath] = "{}";
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"trivial {} stub must not read as authenticated",
+		);
 
-			// Credential present but a trivial JSON stub.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isClaudeAuthenticated(containerName),
-				false,
-				"trivial {} stub must not read as authenticated",
-			);
+		// Positive control: a non-trivial credential reads as authenticated,
+		// proving the check isn't vacuously false and the negative cases
+		// above are meaningfully distinguished (pre-fix liveness-only logic
+		// returned true for all four states).
+		files[credentialsPath] =
+			'{"accessToken":"fake-oauth-token-value-1234567890"}';
+		files[configPath] = '{"accessToken":"fake-oauth-token-value-1234567890"}';
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			true,
+			"a non-trivial persisted credential must read as authenticated",
+		);
+	});
 
-			// Positive control: a non-trivial credential reads as authenticated,
-			// proving the check isn't vacuously false and the negative cases
-			// above are meaningfully distinguished (pre-fix liveness-only logic
-			// returned true for all four states).
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isClaudeAuthenticated(containerName),
-				true,
-				"a non-trivial persisted credential must read as authenticated",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
+	it("returns false when the binary doesn't respond to --version at all", () => {
+		const backend = createFakeExecutionBackend({
+			version: null,
+			files: {
+				".claude/.credentials.json":
+					'{"accessToken":"fake-oauth-token-value-1234567890"}',
+				".claude.json": '{"accessToken":"fake-oauth-token-value-1234567890"}',
+			},
+		});
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"missing binary must not read as authenticated even with credentials present",
+		);
 	});
 });

@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
 import { validateAdapterInvocation } from "./invocation.mjs";
@@ -20,22 +19,20 @@ const COPILOT_CMD = "copilot";
 // Copilot CLI's current OAuth device-flow credential store. The file is
 // copied as an opaque credential file; its contents are never parsed or
 // logged by Switchyard.
-const CREDENTIALS_PATH = "/root/.copilot/config.json";
+const CREDENTIALS_RELATIVE_PATH = ".copilot/config.json";
 const MIN_CREDENTIAL_BYTES = 16;
 
-function hasNonTrivialCredential(containerName) {
+function hasNonTrivialCredential(workspaceId, executionBackend) {
+	const path = `/Users/${executionBackend.providerUser}/${CREDENTIALS_RELATIVE_PATH}`;
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		execFileSync(
-			"docker",
+		executionBackend.execGuest(
+			workspaceId,
+			"sh",
 			[
-				"exec",
-				containerName,
-				"sh",
 				"-c",
-				`[ -f ${CREDENTIALS_PATH} ] && [ "$(wc -c < ${CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+				`[ -f ${path} ] && [ "$(wc -c < ${path} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
 			],
-			{ encoding: "utf8", stdio: "pipe" },
+			{ cwd: "/" },
 		);
 		return true;
 	} catch {
@@ -43,17 +40,15 @@ function hasNonTrivialCredential(containerName) {
 	}
 }
 
-export function isCopilotAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+export function isCopilotAuthenticated(workspaceId, executionBackend) {
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		execFileSync("docker", ["exec", containerName, COPILOT_CMD, "--version"], {
-			encoding: "utf8",
-			stdio: "pipe",
+		executionBackend.execGuest(workspaceId, COPILOT_CMD, ["--version"], {
+			cwd: "/",
 		});
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(containerName);
+	return hasNonTrivialCredential(workspaceId, executionBackend);
 }
 
 export function execute(prompt, workingContainerName, options = {}) {

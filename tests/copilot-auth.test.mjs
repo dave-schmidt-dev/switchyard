@@ -1,5 +1,4 @@
 import { ok, strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,17 +8,7 @@ import {
 	execute as executeCopilot,
 	isCopilotAuthenticated,
 } from "../src/switchyard/adapter/copilot.mjs";
-
-function hasDocker() {
-	try {
-		execSync("docker --version", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
+import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
 
 describe("copilot adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -97,86 +86,56 @@ describe("copilot adapter shell injection guard", () => {
 	});
 });
 
-describe("isCopilotAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the binary is absent even with a nontrivial current credential present", {
-		skip: !dockerAvailable,
-	}, () => {
-		const containerName = `switchyard-copilot-binfail-${Date.now()}`;
-		const credentialPath = "/root/.copilot/config.json";
+describe("isCopilotAuthenticated credential-validity check (fake guest)", () => {
+	it("returns false when the binary is absent even with a nontrivial current credential present", () => {
+		const backend = createFakeExecutionBackend({
+			version: null,
+			files: {
+				".copilot/config.json":
+					'{"accessToken":"fake-oauth-token-value-1234567890"}',
+			},
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		strictEqual(
+			isCopilotAuthenticated("fake-workspace", backend),
+			false,
+			"missing binary must not read as authenticated even with nontrivial credentials present",
 		);
-		try {
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.copilot && printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credentialPath}'`,
-				{ stdio: "pipe" },
-			);
-
-			strictEqual(
-				isCopilotAuthenticated(containerName),
-				false,
-				"missing binary must not read as authenticated even with nontrivial credentials present",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
 	});
 
-	it("returns false when the credential is withheld/corrupt even though the binary responds", {
-		skip: !dockerAvailable,
-	}, () => {
-		const containerName = `switchyard-copilot-authcheck-${Date.now()}`;
-		const credPath = "/root/.copilot/config.json";
+	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
+		const credPath = ".copilot/config.json";
+		const files = {};
+		const backend = createFakeExecutionBackend({
+			version: "Copilot stub",
+			files,
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		strictEqual(
+			isCopilotAuthenticated("fake-workspace", backend),
+			false,
+			"withheld credential must not read as authenticated",
 		);
-		try {
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho Copilot stub\n" > /usr/local/bin/copilot && chmod +x /usr/local/bin/copilot'`,
-				{ stdio: "pipe" },
-			);
 
-			strictEqual(
-				isCopilotAuthenticated(containerName),
-				false,
-				"withheld credential must not read as authenticated",
-			);
+		files[credPath] = "";
+		strictEqual(
+			isCopilotAuthenticated("fake-workspace", backend),
+			false,
+			"empty credential file must not read as authenticated",
+		);
 
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.copilot && : > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCopilotAuthenticated(containerName),
-				false,
-				"empty credential file must not read as authenticated",
-			);
+		files[credPath] = "{}";
+		strictEqual(
+			isCopilotAuthenticated("fake-workspace", backend),
+			false,
+			"trivial {} stub must not read as authenticated",
+		);
 
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCopilotAuthenticated(containerName),
-				false,
-				"trivial {} stub must not read as authenticated",
-			);
-
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCopilotAuthenticated(containerName),
-				true,
-				"a non-trivial persisted credential must read as authenticated",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
+		files[credPath] = '{"accessToken":"fake-oauth-token-value-1234567890"}';
+		strictEqual(
+			isCopilotAuthenticated("fake-workspace", backend),
+			true,
+			"a non-trivial persisted credential must read as authenticated",
+		);
 	});
 });

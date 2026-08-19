@@ -30,7 +30,6 @@
 // surfacing provider output here does not leak secrets to the host.
 
 import { createHash } from "node:crypto";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 
 // Broad, case-insensitive substrings that mark an expired/unusable session
 // across provider CLIs. Kept deliberately loose: exact wording varies by CLI
@@ -375,11 +374,13 @@ export function isPersistentFailureMetadata(value) {
 const MAX_REASON_CHARS = 800;
 
 // D-10: per-provider re-auth command, matching README's documented recovery step.
-// An expired-but-present token is NOT fixed by `npm run auth` (it skips any
-// credential that already passes the presence check), so the hint points at a
-// direct interactive login against the standing agent container — which needs a
-// real TTY (`-it`), so it cannot be run from this non-interactive dispatch
-// path. These mirror the login commands in auth/index.mjs verbatim.
+// An expired-but-present token IS fixed by `npm run auth` now — liveness
+// gating (auth/liveness.mjs) means a dead-but-present session no longer skips
+// the login the way a presence-only check used to. That command boots the
+// golden image, runs each unauthenticated provider's real login directly
+// against it (a real TTY is required, so this cannot run from this
+// non-interactive dispatch path), and stops the golden image again — see
+// auth/index.mjs. These mirror the login commands run there verbatim.
 const REAUTH_LOGIN = {
 	claude: "claude auth login",
 	codex: "codex login --device-auth",
@@ -397,7 +398,7 @@ const REAUTH_LOGIN = {
 export function reauthHintFor(provider) {
 	const login = REAUTH_LOGIN[provider];
 	if (!login) return null;
-	return `${provider} session may have expired — re-auth from a real terminal: docker exec -it ${AGENT_CONTAINER_NAME} ${login}`;
+	return `${provider} session may have expired — re-auth with \`npm run auth\` (runs \`${login}\` against the golden image)`;
 }
 
 function truncate(text) {

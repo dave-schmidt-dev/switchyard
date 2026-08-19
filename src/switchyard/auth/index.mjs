@@ -1,15 +1,24 @@
 // Auth walkthrough - checks every provider's real credential state and, for
 // any that aren't authenticated, runs its real interactive OAuth login
-// inside the standing agent container so a human can complete it live.
+// directly inside the booted golden image so a human can complete it live.
 //
 //   npm run auth              full walkthrough: check, then log in anything unauthed
 //   npm run auth:check        read-only status report — never attempts a login
 //   npm run auth:check:live   the same report, plus one real request per provider
 //
+// Every command above boots the golden image, does its work, and stops it
+// again — there is no standing credential VM to attach to (see
+// withBootedGoldenImage()). That makes even the plain `--check` report a real
+// VM boot, not a free status line: isXAuthenticated() has to exec inside a
+// running, Aqua-ready guest to read a credential file, the same as a real
+// dispatch does. The golden image is also the one artifact every future
+// clone is made from, so a login has to run against it directly — logging in
+// inside a disposable clone would lose the credential the moment the clone is
+// destroyed.
+//
 // Use --check (npm run auth:check) to just look. It reuses the same
 // isXAuthenticated() checks as the walkthrough, so it can't disagree with what
-// a real dispatch sees, and it never mutates auth state — the safe replacement
-// for hand-rolling a `docker exec ... test -e` credential probe.
+// a real dispatch sees, and it never mutates auth state.
 //
 // Those checks answer "is there a credential", not "does this session work".
 // The difference is not academic: on 2026-08-13 this command reported claude
@@ -18,7 +27,8 @@
 // Liveness (auth/liveness.mjs) closes that: the walkthrough always probes, and
 // --check does on request. See that file for why each probe's invocation is
 // empirical rather than read off a --help page.
-// PW-4: Independent in-container login (subscription, never API keys).
+// PW-4: Independent login, run directly against the golden image (subscription,
+// never API keys).
 // TASKS.md Task 24: there is no headless auto-login — every provider's real
 // login step requires a human to complete a browser or device-code OAuth
 // consent, so this walks the human through each one rather than attempting
@@ -33,33 +43,91 @@ import { isCodexAuthenticated } from "../adapter/codex.mjs";
 import { isCopilotAuthenticated } from "../adapter/copilot.mjs";
 import { isCursorAuthenticated } from "../adapter/cursor.mjs";
 import { isOpencodeAuthenticated } from "../adapter/opencode.mjs";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
-import { ensureAgentContainer } from "../runner/index.mjs";
+import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { probeLiveness } from "./liveness.mjs";
 
 /**
- * Run a provider's real login command interactively inside the standing
- * agent container, attached to this process's own TTY so a human can
- * complete whatever the flow needs (visit a URL, paste a device code,
- * approve in a browser). Never trust this call's exit code as the outcome —
- * a cancelled or timed-out login can exit non-zero even though nothing
- * needs fixing, and a "successful" run doesn't by itself guarantee the
- * account is now authenticated. The caller re-checks via isAuthenticated()
- * afterward, which is the real ground truth (same "don't trust the wrapped
- * command's exit code" principle the old authenticateX() functions used).
- * @param {string[]} loginCommand The CLI command + args to run, e.g. ["claude", "auth", "login"].
- * @param {Record<string, string>} [env] Extra env vars to forward via `docker exec -e`.
+ * Build the same execution backend a real macOS-platform dispatch would use
+ * (mirrors dispatch/index.mjs's executionBackendForRun), so auth never checks
+ * or logs in against a different guest shape than a real run executes in.
+ * @returns {ParallelsExecutionBackend}
  */
-function runInteractiveLogin(loginCommand, env = {}) {
-	// D-10: interactive OAuth remains attached to the standing Docker
-	// credential container; the VM execution backend does not replace it.
-	const dockerArgs = ["exec", "-it"];
-	for (const [key, value] of Object.entries(env)) {
-		dockerArgs.push("-e", `${key}=${value}`);
+function createExecutionBackend() {
+	return new ParallelsExecutionBackend({
+		goldenImage: process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
+		aquaUid: process.env.SWITCHYARD_PARALLELS_AQUA_UID,
+		providerUser:
+			process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ?? "switchyard",
+	});
+}
+
+/**
+ * Boot the golden image, run `fn` against it, and always stop it again —
+ * fails fast, before ever starting the VM, if the environment isn't
+ * configured, rather than booting and then discovering `waitForAqua()` has
+ * nothing to probe with. Left running, the golden image blocks the next real
+ * dispatch: `assertGoldenImageAvailable()`/clone creation both require it.
+ * @param {ParallelsExecutionBackend} executionBackend
+ * @param {(workspaceId: string) => any} fn
+ */
+function withBootedGoldenImage(executionBackend, fn) {
+	if (!executionBackend.goldenImage) {
+		throw new Error(
+			"SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set to check or run provider auth",
+		);
 	}
-	dockerArgs.push(AGENT_CONTAINER_NAME, ...loginCommand);
+	if (!/^\d+$/.test(String(executionBackend.aquaUid ?? ""))) {
+		throw new Error(
+			"SWITCHYARD_PARALLELS_AQUA_UID must be set to check or run provider auth",
+		);
+	}
+	// Propagates as-is (e.g. assertGoldenImageAvailable()'s "owned clones
+	// exist" refusal) — nothing was started, so there is nothing to stop.
+	const booted = executionBackend.bootGoldenImage();
 	try {
-		execFileSync("docker", dockerArgs, { stdio: "inherit" });
+		return fn(booted.uuid);
+	} finally {
+		try {
+			executionBackend.stopGoldenImage(booted.uuid);
+		} catch (error) {
+			console.error(
+				`warning: failed to stop the golden image after auth: ${error.message}`,
+			);
+		}
+	}
+}
+
+/**
+ * Run a provider's real login command interactively inside the booted golden
+ * image, attached to this process's own TTY so a human can complete whatever
+ * the flow needs (visit a URL, paste a device code, approve in a browser).
+ * Shares execArgv() — the exact inherit-stdio transport a real dispatch uses
+ * — rather than a second one. Never trust this call's exit code as the
+ * outcome — a cancelled or timed-out login can exit non-zero even though
+ * nothing needs fixing, and a "successful" run doesn't by itself guarantee
+ * the account is now authenticated. The caller re-checks via
+ * isAuthenticated() afterward, which is the real ground truth (same "don't
+ * trust the wrapped command's exit code" principle the old authenticateX()
+ * functions used).
+ * @param {string[]} loginCommand The CLI command + args to run, e.g. ["claude", "auth", "login"].
+ * @param {object} options
+ * @param {string} options.workspaceId Booted golden image uuid.
+ * @param {ParallelsExecutionBackend} options.executionBackend
+ * @param {Record<string, string>} [options.env] Extra env vars for the guest process.
+ */
+function runInteractiveLogin(
+	loginCommand,
+	{ workspaceId, executionBackend, env = {} },
+) {
+	const { command, args } = executionBackend.execArgv(workspaceId, {
+		argv: loginCommand,
+		// Never /project: that resolves to a per-task workspace directory that
+		// only exists inside a provisioned clone, not the golden image itself.
+		cwd: "/",
+		env: Object.entries(env).map(([key, value]) => `${key}=${value}`),
+	});
+	try {
+		execFileSync(command, args, { stdio: "inherit" });
 	} catch {
 		// Expected on Ctrl+C, a declined prompt, or a real login failure — the
 		// isAuthenticated() re-check the caller performs is what matters.
@@ -72,16 +140,26 @@ const PROVIDERS = [
 	{
 		name: "claude",
 		isAuthenticated: isClaudeAuthenticated,
-		isLive: () => probeLiveness("claude"),
-		runLogin: () => runInteractiveLogin(["claude", "auth", "login"]),
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("claude", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
+			runInteractiveLogin(["claude", "auth", "login"], {
+				workspaceId,
+				executionBackend,
+			}),
 	},
 	{
 		name: "codex",
 		// --device-auth: a device-code flow, needs no local browser inside
-		// the container.
+		// the guest.
 		isAuthenticated: isCodexAuthenticated,
-		isLive: () => probeLiveness("codex"),
-		runLogin: () => runInteractiveLogin(["codex", "login", "--device-auth"]),
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("codex", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
+			runInteractiveLogin(["codex", "login", "--device-auth"], {
+				workspaceId,
+				executionBackend,
+			}),
 	},
 	{
 		name: "agy",
@@ -90,31 +168,49 @@ const PROVIDERS = [
 		// a pasted authorization code). Confirmed empirically: a plain
 		// `agy --print "hi"` triggers it with no other side effect.
 		isAuthenticated: isAgyAuthenticated,
-		isLive: () => probeLiveness("agy"),
-		runLogin: () => runInteractiveLogin(["agy", "--print", "hi"]),
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("agy", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
+			runInteractiveLogin(["agy", "--print", "hi"], {
+				workspaceId,
+				executionBackend,
+			}),
 	},
 	{
 		name: "cursor",
 		// NO_OPEN_BROWSER=1: the CLI's own documented override to avoid trying
-		// to launch a GUI browser inside a headless container.
+		// to launch a GUI browser inside a headless guest.
 		isAuthenticated: isCursorAuthenticated,
-		isLive: () => probeLiveness("cursor"),
-		runLogin: () =>
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("cursor", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
 			runInteractiveLogin(["cursor-agent", "login"], {
-				NO_OPEN_BROWSER: "1",
+				workspaceId,
+				executionBackend,
+				env: { NO_OPEN_BROWSER: "1" },
 			}),
 	},
 	{
 		name: "copilot",
 		isAuthenticated: isCopilotAuthenticated,
-		isLive: () => probeLiveness("copilot"),
-		runLogin: () => runInteractiveLogin(COPILOT_LOGIN_COMMAND),
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("copilot", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
+			runInteractiveLogin(COPILOT_LOGIN_COMMAND, {
+				workspaceId,
+				executionBackend,
+			}),
 	},
 	{
 		name: "opencode",
 		isAuthenticated: isOpencodeAuthenticated,
-		isLive: () => probeLiveness("opencode"),
-		runLogin: () => runInteractiveLogin(["opencode", "auth", "login"]),
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("opencode", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
+			runInteractiveLogin(["opencode", "auth", "login"], {
+				workspaceId,
+				executionBackend,
+			}),
 	},
 ];
 
@@ -139,16 +235,20 @@ const LOGIN_CANNOT_HELP = Object.freeze({
  * does any future provider whose live invocation has not been confirmed by
  * actually running it — a guessed probe is worse than no probe, because it
  * fails for flag reasons and calls a working provider dead.
- * @param {{name: string, isAuthenticated: () => boolean, isLive?: () => {live: boolean, reason: string|null, kind: string|null}}} provider
+ * @param {{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, isLive?: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => {live: boolean, reason: string|null, kind: string|null}}} provider
  * @param {boolean} probe Run the live probe when presence passes.
+ * @param {string} [workspaceId] Booted golden image uuid — forwarded to the
+ *   provider's own check functions, which ignore it if injected as a test
+ *   double.
+ * @param {ParallelsExecutionBackend} [executionBackend]
  * @returns {{authenticated: boolean, live: boolean|null, reason: string|null, kind: string|null}}
  */
-function inspectProvider(provider, probe) {
-	const authenticated = provider.isAuthenticated();
+function inspectProvider(provider, probe, workspaceId, executionBackend) {
+	const authenticated = provider.isAuthenticated(workspaceId, executionBackend);
 	if (!authenticated || !probe || typeof provider.isLive !== "function") {
 		return { authenticated, live: null, reason: null, kind: null };
 	}
-	const result = provider.isLive();
+	const result = provider.isLive(workspaceId, executionBackend);
 	return {
 		authenticated,
 		live: result.live === true,
@@ -160,17 +260,34 @@ function inspectProvider(provider, probe) {
 /**
  * Walk a human through authenticating every provider that isn't already
  * authenticated: check real credential state first (skip anything already
- * good), then hand the terminal to the real in-container login for anything
- * that isn't, and re-check afterward.
- * @param {Array<{name: string, isAuthenticated: () => boolean, runLogin: () => void}>} [providers]
+ * good), then hand the terminal to the real login (run directly against the
+ * golden image) for anything that isn't, and re-check afterward.
+ *
+ * Pure with respect to VM lifecycle — it does not boot or stop anything
+ * itself, only threads `workspaceId`/`executionBackend` through to each
+ * provider's check/login functions. The caller (main(), or a test injecting
+ * fake providers) owns booting the golden image beforehand; that keeps this
+ * function's tested contract free of a real Parallels dependency.
+ * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, runLogin: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => void}>} [providers]
+ * @param {object} [options]
+ * @param {string} [options.workspaceId] Booted golden image uuid.
+ * @param {ParallelsExecutionBackend} [options.executionBackend]
  * @returns {Array<{name: string, wasAuthenticated: boolean, ranLogin: boolean, authenticated: boolean}>}
  */
-export function ensureProvidersAuthenticated(providers = PROVIDERS) {
+export function ensureProvidersAuthenticated(
+	providers = PROVIDERS,
+	{ workspaceId, executionBackend } = {},
+) {
 	return providers.map((provider) => {
 		let wasAuthenticated = false;
 		let ranLogin = false;
 		try {
-			const state = inspectProvider(provider, true);
+			const state = inspectProvider(
+				provider,
+				true,
+				workspaceId,
+				executionBackend,
+			);
 			// An expired session leaves the credential file exactly where it was,
 			// so presence alone kept answering "already authenticated" and this
 			// walkthrough skipped the one provider that needed it — claude, for a
@@ -206,11 +323,16 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
 					: `\n--- ${provider.name}: not authenticated — starting interactive login, follow the prompts ---\n`,
 			);
 			ranLogin = true;
-			provider.runLogin();
+			provider.runLogin(workspaceId, executionBackend);
 			// Re-check the same way, not the cheap way: a login that "succeeded"
 			// and left an unusable session is the exact state this walkthrough was
 			// reporting as fixed.
-			const after = inspectProvider(provider, true);
+			const after = inspectProvider(
+				provider,
+				true,
+				workspaceId,
+				executionBackend,
+			);
 			return {
 				name: provider.name,
 				wasAuthenticated: false,
@@ -259,18 +381,27 @@ export function ensureProvidersAuthenticated(providers = PROVIDERS) {
  * from a working session. It is opt-in because it spends real quota, six
  * requests at a time, on a command people run casually — and stays read-only
  * either way. The plain form is honest about its limits rather than silently
- * cheap: it reports a credential, and a credential is not a session.
- * @param {Array<{name: string, isAuthenticated: () => boolean, isLive?: () => object}>} [providers]
- * @param {{live?: boolean}} [options]
+ * cheap: it reports a credential, and a credential is not a session. (It is
+ * not free either — see withBootedGoldenImage(): even the plain form needs a
+ * running guest to read a credential file from.)
+ *
+ * Pure with respect to VM lifecycle, same as ensureProvidersAuthenticated().
+ * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, isLive?: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => object}>} [providers]
+ * @param {{live?: boolean, workspaceId?: string, executionBackend?: ParallelsExecutionBackend}} [options]
  * @returns {Array<{name: string, authenticated: boolean, live?: boolean|null, reason?: string|null}>}
  */
 export function reportProviderStatus(
 	providers = PROVIDERS,
-	{ live = false } = {},
+	{ live = false, workspaceId, executionBackend } = {},
 ) {
 	return providers.map((provider) => {
 		try {
-			const state = inspectProvider(provider, live);
+			const state = inspectProvider(
+				provider,
+				live,
+				workspaceId,
+				executionBackend,
+			);
 			// `live` stays absent unless a probe actually ran, so a caller can
 			// never mistake "we did not look" for "we looked and it answered".
 			return live
@@ -297,11 +428,22 @@ export function reportProviderStatus(
 /**
  * Print the read-only status report and set the exit code (1 if any provider
  * is unauthenticated — or, with `--live`, if any authenticated provider failed
- * to answer) — no login is ever attempted.
+ * to answer) — no login is ever attempted. Boots the golden image for the
+ * duration of the report (see withBootedGoldenImage()).
+ * @param {ParallelsExecutionBackend} executionBackend
  * @param {boolean} [live] Probe each authenticated provider with a real request.
  */
-function runCheck(live = false) {
-	const statuses = reportProviderStatus(PROVIDERS, { live });
+function runCheck(executionBackend, live = false) {
+	let statuses;
+	try {
+		statuses = withBootedGoldenImage(executionBackend, (workspaceId) =>
+			reportProviderStatus(PROVIDERS, { live, workspaceId, executionBackend }),
+		);
+	} catch (error) {
+		console.error(error.message);
+		process.exitCode = 1;
+		return;
+	}
 	console.log(
 		live
 			? "=== Auth status (read-only — no login attempted; each provider was sent one real request) ==="
@@ -330,27 +472,30 @@ function runCheck(live = false) {
 }
 
 function main(argv = process.argv.slice(2)) {
-	try {
-		ensureAgentContainer();
-	} catch (error) {
-		console.error(error.message);
-		console.error(
-			"The agent container must be built and running before auth can proceed.",
-		);
-		process.exitCode = 1;
-		return;
-	}
+	const executionBackend = createExecutionBackend();
 
 	// `--check`: read-only status, never a login. The default (no flag) is the
 	// full walkthrough, which logs in anything unauthenticated. `--live` adds a
 	// real request per authenticated provider; the walkthrough always probes,
 	// because a wrong answer there costs an hour rather than a status line.
 	if (argv.includes("--check")) {
-		runCheck(argv.includes("--live"));
+		runCheck(executionBackend, argv.includes("--live"));
 		return;
 	}
 
-	const results = ensureProvidersAuthenticated();
+	let results;
+	try {
+		results = withBootedGoldenImage(executionBackend, (workspaceId) =>
+			ensureProvidersAuthenticated(PROVIDERS, {
+				workspaceId,
+				executionBackend,
+			}),
+		);
+	} catch (error) {
+		console.error(error.message);
+		process.exitCode = 1;
+		return;
+	}
 	console.log("\n=== Auth summary ===");
 	for (const result of results) {
 		const status = result.authenticated ? "authenticated" : "NOT AUTHENTICATED";

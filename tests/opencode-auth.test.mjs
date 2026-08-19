@@ -1,5 +1,4 @@
 import { ok, strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,17 +8,7 @@ import {
 	execute as executeOpencode,
 	isOpencodeAuthenticated,
 } from "../src/switchyard/adapter/opencode.mjs";
-
-function hasDocker() {
-	try {
-		execSync("docker --version", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
+import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
 
 describe("opencode adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -97,86 +86,56 @@ describe("opencode adapter shell injection guard", () => {
 	});
 });
 
-describe("isOpencodeAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the binary is absent even with nontrivial auth.json present", {
-		skip: !dockerAvailable,
-	}, () => {
-		const containerName = `switchyard-opencode-binfail-${Date.now()}`;
-		const credPath = "/root/.local/share/opencode/auth.json";
+describe("isOpencodeAuthenticated credential-validity check (fake guest)", () => {
+	it("returns false when the binary is absent even with nontrivial auth.json present", () => {
+		const backend = createFakeExecutionBackend({
+			version: null,
+			files: {
+				".local/share/opencode/auth.json":
+					'{"accessToken":"fake-oauth-token-value-1234567890"}',
+			},
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		strictEqual(
+			isOpencodeAuthenticated("fake-workspace", backend),
+			false,
+			"missing binary must not read as authenticated even with a nontrivial credential present",
 		);
-		try {
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.local/share/opencode && printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-
-			strictEqual(
-				isOpencodeAuthenticated(containerName),
-				false,
-				"missing binary must not read as authenticated even with a nontrivial credential present",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
 	});
 
-	it("returns false when the credential is withheld/corrupt even though the binary responds", {
-		skip: !dockerAvailable,
-	}, () => {
-		const containerName = `switchyard-opencode-authcheck-${Date.now()}`;
-		const credPath = "/root/.local/share/opencode/auth.json";
+	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
+		const credPath = ".local/share/opencode/auth.json";
+		const files = {};
+		const backend = createFakeExecutionBackend({
+			version: "Opencode stub",
+			files,
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		strictEqual(
+			isOpencodeAuthenticated("fake-workspace", backend),
+			false,
+			"withheld credential must not read as authenticated",
 		);
-		try {
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho Opencode stub\n" > /usr/local/bin/opencode && chmod +x /usr/local/bin/opencode'`,
-				{ stdio: "pipe" },
-			);
 
-			strictEqual(
-				isOpencodeAuthenticated(containerName),
-				false,
-				"withheld credential must not read as authenticated",
-			);
+		files[credPath] = "";
+		strictEqual(
+			isOpencodeAuthenticated("fake-workspace", backend),
+			false,
+			"empty credential file must not read as authenticated",
+		);
 
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.local/share/opencode && : > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isOpencodeAuthenticated(containerName),
-				false,
-				"empty credential file must not read as authenticated",
-			);
+		files[credPath] = "{}";
+		strictEqual(
+			isOpencodeAuthenticated("fake-workspace", backend),
+			false,
+			"trivial {} stub must not read as authenticated",
+		);
 
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isOpencodeAuthenticated(containerName),
-				false,
-				"trivial {} stub must not read as authenticated",
-			);
-
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{\\"accessToken\\":\\"fake-oauth-token-value-1234567890\\"}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isOpencodeAuthenticated(containerName),
-				true,
-				"a non-trivial persisted credential must read as authenticated",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
+		files[credPath] = '{"accessToken":"fake-oauth-token-value-1234567890"}';
+		strictEqual(
+			isOpencodeAuthenticated("fake-workspace", backend),
+			true,
+			"a non-trivial persisted credential must read as authenticated",
+		);
 	});
 });

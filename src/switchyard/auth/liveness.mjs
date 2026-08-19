@@ -16,10 +16,13 @@
 // detect the failure, it also gates the repair.
 //
 // Each command below was confirmed live against the standing `switchyard-agent`
-// container on 2026-08-13, by running it and reading the reply — not inferred
-// from a --help page. A probe that fails for flag reasons reports "not live" and
-// reintroduces exactly the same class of lie in the opposite direction, so these
-// are empirical or they are nothing:
+// Docker container on 2026-08-13, by running it and reading the reply — not
+// inferred from a --help page. The execution lane has since moved to a
+// Parallels VM (see auth/index.mjs), but the invocations themselves are
+// unchanged: the same flags, run inside the guest instead of the container. A
+// probe that fails for flag reasons reports "not live" and reintroduces
+// exactly the same class of lie in the opposite direction, so these are
+// empirical or they are nothing:
 //
 //   claude    claude -p <prompt>                                    -> OK
 //   codex     codex exec --dangerously-bypass-approvals-and-sandbox -> OK   (prompt on stdin, cwd /tmp)
@@ -35,9 +38,7 @@
 // off reading files in the working directory until the 120s timeout killed it
 // (reproduced 2026-08-13, and the same non-exit already recorded in TASKS.md).
 
-import { execFileSync } from "node:child_process";
 import { describeExecError } from "../adapter/exec-error.mjs";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 
 /** The smallest request that still proves a round trip to the provider. */
 export const LIVENESS_PROMPT = "reply with the single word OK";
@@ -132,13 +133,15 @@ function truncate(text) {
 }
 
 /**
- * Ask a provider for a one-word answer inside the standing agent container.
+ * Ask a provider for a one-word answer inside the booted golden image.
  *
  * Never throws: a probe that cannot run is reported as not-live with a reason,
  * matching the fail-soft contract the auth report already promises.
  * @param {string} name Provider key in LIVENESS_PROBES.
  * @param {object} [options]
- * @param {string} [options.containerName]
+ * @param {string} [options.workspaceId] Booted VM handle (the golden image's
+ *   own uuid — see auth/index.mjs) to run the probe against.
+ * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} [options.executionBackend]
  * @param {number} [options.timeoutMs]
  * @param {(spec: {args: string[], cwd?: string, stdin?: boolean}) => string} [options.run] Test seam.
  * `kind` is whatever describeExecError() classified, forwarded verbatim — so it
@@ -147,7 +150,8 @@ function truncate(text) {
  */
 export function probeLiveness(name, options = {}) {
 	const {
-		containerName = AGENT_CONTAINER_NAME,
+		workspaceId,
+		executionBackend,
 		timeoutMs = LIVENESS_TIMEOUT_MS,
 		run,
 	} = options;
@@ -168,13 +172,16 @@ export function probeLiveness(name, options = {}) {
 	try {
 		const output = run
 			? run(spec)
-			: execFileSync("docker", buildDockerArgs(containerName, spec), {
-					encoding: "utf8",
-					stdio: "pipe",
-					input: spec.stdin ? LIVENESS_PROMPT : undefined,
-					timeout: timeoutMs,
-					maxBuffer: 8 * 1024 * 1024,
-				});
+			: executionBackend
+					.execGuest(workspaceId, spec.args[0], spec.args.slice(1), {
+						cwd: spec.cwd,
+						prlctlOptions: {
+							input: spec.stdin ? LIVENESS_PROMPT : undefined,
+							timeout: timeoutMs,
+							maxBuffer: 8 * 1024 * 1024,
+						},
+					})
+					.toString();
 		if (repliesOk(output)) return { live: true, reason: null, kind: null };
 		return {
 			live: false,
@@ -199,17 +206,4 @@ export function probeLiveness(name, options = {}) {
 			kind: described.errorKind,
 		};
 	}
-}
-
-/**
- * @param {string} containerName
- * @param {{args: string[], cwd?: string, stdin?: boolean}} spec
- * @returns {string[]}
- */
-function buildDockerArgs(containerName, spec) {
-	const dockerArgs = ["exec"];
-	if (spec.stdin) dockerArgs.push("-i");
-	if (spec.cwd) dockerArgs.push("-w", spec.cwd);
-	dockerArgs.push(containerName, ...spec.args);
-	return dockerArgs;
 }

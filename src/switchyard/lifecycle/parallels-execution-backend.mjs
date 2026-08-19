@@ -690,10 +690,15 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * Return the exact transport for one provider command. It runs in the
 	 * provider's Aqua session and inherits its stdin, stdout, stderr, exit
 	 * status, and killable prlctl process handle.
+	 * @param {string[]} [options.env] Extra `KEY=value` assignments for the
+	 *   guest process — e.g. an interactive login that needs
+	 *   `NO_OPEN_BROWSER=1`. Real dispatch never needs this; it exists for
+	 *   `auth/index.mjs`'s interactive login, which shares this exact
+	 *   inherit-stdio transport rather than a second one.
 	 */
 	execArgv(
 		workspaceId,
-		{ cwd = "/project", aquaUid, providerUser, argv } = {},
+		{ cwd = "/project", aquaUid, providerUser, argv, env } = {},
 	) {
 		return {
 			command: "prlctl",
@@ -702,6 +707,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				aquaUid,
 				providerUser,
 				recordPid: true,
+				env,
 			}),
 		};
 	}
@@ -1118,6 +1124,22 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			skipGoldenCheck: true,
 			allowUnmanaged: true,
 		});
+	}
+
+	/**
+	 * Stop the golden image itself — never delete it. `destroy()`/`stopAndDelete()`
+	 * are for disposable managed clones; the golden image is the one VM every
+	 * future clone is made from, so this method's entire reason to exist is to
+	 * NOT be those. Used to leave the golden image stopped again after
+	 * `auth/index.mjs` boots it directly to check or refresh a provider's
+	 * credential, so a subsequent dispatch's `bootGoldenImage()`/clone is not
+	 * blocked by it still running.
+	 */
+	stopGoldenImage(handle = this.goldenImage) {
+		if (!handle) throw new Error("goldenImage is required");
+		const entry = this.resolveHandle(handle, { allowUnmanaged: true });
+		this._call(["stop", entry.uuid]);
+		return { uuid: entry.uuid, name: entry.name, status: "stopped" };
 	}
 
 	/**

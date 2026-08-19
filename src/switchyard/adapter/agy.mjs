@@ -10,7 +10,6 @@
 // TASKS.md Task 24: this replaces an earlier BWS-credential-injection design.
 
 import { execFileSync } from "node:child_process";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
 import { validateAdapterInvocation } from "./invocation.mjs";
@@ -30,16 +29,16 @@ import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 const AGY_CMD = "agy";
 
 // A completed OAuth login persists the token to
-// `~/.gemini/antigravity-cli/antigravity-oauth-token` — live-verified 2026-07-21
-// against the real standing agent container immediately after a real
-// `agy --print "hi"` login completed (a fresh 498-byte, mode-0600 file
-// appeared at exactly that path/timestamp). The earlier assumed path,
-// `~/.gemini/gemini-credentials.json`, does not exist under a real login —
-// it was carried over from an older local-install check and was never
-// re-verified against this container image; `isAgyAuthenticated()` reported
-// a real, working login as unauthenticated until this was caught.
-const AGY_CREDENTIALS_PATH =
-	"/root/.gemini/antigravity-cli/antigravity-oauth-token";
+// `~/.gemini/antigravity-cli/antigravity-oauth-token` under the guest
+// provider account's home directory — live-verified 2026-07-21 against the
+// real standing agent container immediately after a real `agy --print "hi"`
+// login completed (a fresh 498-byte, mode-0600 file appeared at exactly that
+// path/timestamp). The earlier assumed path, `~/.gemini/gemini-credentials.json`,
+// does not exist under a real login — it was carried over from an older
+// local-install check and was never re-verified; `isAgyAuthenticated()`
+// reported a real, working login as unauthenticated until this was caught.
+const AGY_CREDENTIALS_RELATIVE_PATH =
+	".gemini/antigravity-cli/antigravity-oauth-token";
 
 // A real credentials JSON is hundreds of bytes; this floor rejects an empty
 // file (the exact bug that shipped once — a printf writing nothing) and
@@ -50,27 +49,26 @@ const AGY_CREDENTIALS_PATH =
 const MIN_CREDENTIAL_BYTES = 16;
 
 /**
- * Check that the persisted credential file exists inside the container and is
+ * Check that the persisted credential file exists inside the guest and is
  * non-trivial (not empty, not a placeholder stub). INV-1: the credential
  * VALUE never crosses to the host and never appears in argv — only the
  * constant file path and byte threshold do, and `wc -c` reports a byte
  * count, not content. The host reads only the check's exit code.
- * @param {string} containerName
+ * @param {string} workspaceId
+ * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
  */
-function hasNonTrivialCredential(containerName) {
+function hasNonTrivialCredential(workspaceId, executionBackend) {
+	const path = `/Users/${executionBackend.providerUser}/${AGY_CREDENTIALS_RELATIVE_PATH}`;
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		execFileSync(
-			"docker",
+		executionBackend.execGuest(
+			workspaceId,
+			"sh",
 			[
-				"exec",
-				containerName,
-				"sh",
 				"-c",
-				`[ -f ${AGY_CREDENTIALS_PATH} ] && [ "$(wc -c < ${AGY_CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+				`[ -f ${path} ] && [ "$(wc -c < ${path} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
 			],
-			{ encoding: "utf8", stdio: "pipe" },
+			{ cwd: "/" },
 		);
 		return true;
 	} catch {
@@ -79,31 +77,29 @@ function hasNonTrivialCredential(containerName) {
 }
 
 /**
- * Check if Agy is authenticated in the container. `agy --version` has no
- * vendor keyword to match, so liveness here is just "binary runs, non-empty
+ * Check if Agy is authenticated in the guest. `agy --version` has no vendor
+ * keyword to match, so liveness here is just "binary runs, non-empty
  * output"; the real signal is the credential check that supplements it — the
- * persisted OAuth token (`AGY_CREDENTIALS_PATH`) must exist and be non-trivial.
- * Liveness alone treated an installed-but-unauthenticated CLI as authenticated,
- * so `npm run auth` would have skipped a provider that still needed a real
+ * persisted OAuth token must exist and be non-trivial. Liveness alone
+ * treated an installed-but-unauthenticated CLI as authenticated, so
+ * `npm run auth` would have skipped a provider that still needed a real
  * interactive login (TASKS.md Task 15).
- * @param {string} [containerName] Container to check (defaults to the standing agent container).
+ * @param {string} workspaceId
+ * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
  */
-export function isAgyAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+export function isAgyAuthenticated(workspaceId, executionBackend) {
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		const result = execFileSync(
-			"docker",
-			["exec", containerName, AGY_CMD, "--version"],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
+		const result = executionBackend
+			.execGuest(workspaceId, AGY_CMD, ["--version"], { cwd: "/" })
+			.toString();
 		if (!(typeof result === "string" && result.trim().length > 0)) {
 			return false;
 		}
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(containerName);
+	return hasNonTrivialCredential(workspaceId, executionBackend);
 }
 
 /**

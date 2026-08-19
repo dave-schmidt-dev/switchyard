@@ -1,5 +1,4 @@
 import { ok, strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,17 +8,7 @@ import {
 	executeAgy,
 	isAgyAuthenticated,
 } from "../src/switchyard/adapter/agy.mjs";
-
-function hasDocker() {
-	try {
-		execSync("docker --version", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
+import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
 
 describe("agy adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -97,74 +86,67 @@ describe("agy adapter shell injection guard", () => {
 	});
 });
 
-describe("isAgyAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the credential is withheld/corrupt even though the binary responds", {
-		skip: !dockerAvailable,
-	}, () => {
+describe("isAgyAuthenticated credential-validity check (fake guest)", () => {
+	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
 		// TASKS.md Task 15 "done when": with the CLI installed and answering
 		// `--version` (liveness passes — agy has no vendor keyword, so any
 		// non-empty output counts), a withheld or trivial credentials file must
 		// make isAgyAuthenticated() return false. A real completed OAuth login
-		// persists /root/.gemini/antigravity-cli/antigravity-oauth-token — live-
+		// persists ~/.gemini/antigravity-cli/antigravity-oauth-token — live-
 		// verified against a real login (TASKS.md Task 24), replacing an earlier
 		// assumed path that never actually existed under a real login.
-		const containerName = `switchyard-agy-authcheck-${Date.now()}`;
-		const credPath = "/root/.gemini/antigravity-cli/antigravity-oauth-token";
+		const credPath = ".gemini/antigravity-cli/antigravity-oauth-token";
+		const files = {};
+		const backend = createFakeExecutionBackend({
+			version: "agy 1.0.0",
+			files,
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		// Credential withheld entirely.
+		strictEqual(
+			isAgyAuthenticated("fake-workspace", backend),
+			false,
+			"withheld credential must not read as authenticated",
 		);
-		try {
-			// Stub that satisfies the `--version` liveness check (non-empty
-			// output) but is not actually authenticated.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho agy 1.0.0\n" > /usr/local/bin/agy && chmod +x /usr/local/bin/agy'`,
-				{ stdio: "pipe" },
-			);
 
-			// Credential withheld entirely.
-			strictEqual(
-				isAgyAuthenticated(containerName),
-				false,
-				"withheld credential must not read as authenticated",
-			);
+		// Credential present but empty (the empty-file bug shape).
+		files[credPath] = "";
+		strictEqual(
+			isAgyAuthenticated("fake-workspace", backend),
+			false,
+			"empty credential file must not read as authenticated",
+		);
 
-			// Credential present but empty (the empty-file bug shape).
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.gemini/antigravity-cli && : > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isAgyAuthenticated(containerName),
-				false,
-				"empty credential file must not read as authenticated",
-			);
+		// Credential present but a trivial JSON stub.
+		files[credPath] = "{}";
+		strictEqual(
+			isAgyAuthenticated("fake-workspace", backend),
+			false,
+			"trivial {} stub must not read as authenticated",
+		);
 
-			// Credential present but a trivial JSON stub.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isAgyAuthenticated(containerName),
-				false,
-				"trivial {} stub must not read as authenticated",
-			);
+		// Positive control: a non-trivial credential reads as authenticated
+		// (pre-fix liveness-only logic returned true for all four states).
+		files[credPath] = '{"refresh_token":"fake-gemini-token-1234567890"}';
+		strictEqual(
+			isAgyAuthenticated("fake-workspace", backend),
+			true,
+			"a non-trivial persisted credential must read as authenticated",
+		);
+	});
 
-			// Positive control: a non-trivial credential reads as authenticated
-			// (pre-fix liveness-only logic returned true for all four states).
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{\\"refresh_token\\":\\"fake-gemini-token-1234567890\\"}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isAgyAuthenticated(containerName),
-				true,
-				"a non-trivial persisted credential must read as authenticated",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
+	it("returns false when the binary doesn't respond to --version at all", () => {
+		const backend = createFakeExecutionBackend({
+			version: null,
+			files: {
+				".gemini/antigravity-cli/antigravity-oauth-token":
+					'{"refresh_token":"fake-gemini-token-1234567890"}',
+			},
+		});
+		strictEqual(
+			isAgyAuthenticated("fake-workspace", backend),
+			false,
+			"missing binary must not read as authenticated even with credentials present",
+		);
 	});
 });

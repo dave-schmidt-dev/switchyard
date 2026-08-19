@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
 import { validateAdapterInvocation } from "./invocation.mjs";
@@ -17,7 +16,7 @@ import {
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const OPENCODE_CMD = "opencode";
-const CREDENTIALS_PATH = "/root/.local/share/opencode/auth.json";
+const CREDENTIALS_RELATIVE_PATH = ".local/share/opencode/auth.json";
 const MIN_CREDENTIAL_BYTES = 16;
 
 // `opencode run` starts an in-process local server (see its own `run --help`:
@@ -221,19 +220,17 @@ function annotateIdleTermination(output, stderr) {
 	return `${parts.join("\n")}\n`;
 }
 
-function hasNonTrivialCredential(containerName) {
+function hasNonTrivialCredential(workspaceId, executionBackend) {
+	const path = `/Users/${executionBackend.providerUser}/${CREDENTIALS_RELATIVE_PATH}`;
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		execFileSync(
-			"docker",
+		executionBackend.execGuest(
+			workspaceId,
+			"sh",
 			[
-				"exec",
-				containerName,
-				"sh",
 				"-c",
-				`[ -f ${CREDENTIALS_PATH} ] && [ "$(wc -c < ${CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+				`[ -f ${path} ] && [ "$(wc -c < ${path} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
 			],
-			{ encoding: "utf8", stdio: "pipe" },
+			{ cwd: "/" },
 		);
 		return true;
 	} catch {
@@ -241,17 +238,15 @@ function hasNonTrivialCredential(containerName) {
 	}
 }
 
-export function isOpencodeAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+export function isOpencodeAuthenticated(workspaceId, executionBackend) {
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		execFileSync("docker", ["exec", containerName, OPENCODE_CMD, "--version"], {
-			encoding: "utf8",
-			stdio: "pipe",
+		executionBackend.execGuest(workspaceId, OPENCODE_CMD, ["--version"], {
+			cwd: "/",
 		});
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(containerName);
+	return hasNonTrivialCredential(workspaceId, executionBackend);
 }
 
 export function execute(prompt, workingContainerName, options = {}) {

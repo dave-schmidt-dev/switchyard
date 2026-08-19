@@ -10,6 +10,7 @@ import {
 	isCodexAuthenticated,
 } from "../src/switchyard/adapter/codex.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
 
 function hasDocker() {
 	try {
@@ -160,73 +161,65 @@ describe("codex adapter invocation shape (real container)", () => {
 	});
 });
 
-describe("isCodexAuthenticated credential-validity check (real container)", () => {
-	it("returns false when the credential is withheld/corrupt even though the binary responds", {
-		skip: !dockerAvailable,
-	}, () => {
+describe("isCodexAuthenticated credential-validity check (fake guest)", () => {
+	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
 		// TASKS.md Task 15 "done when": with the CLI installed and answering
 		// `--version` (liveness passes), a withheld or trivial auth.json must
 		// make isCodexAuthenticated() return false — the false-positive the old
 		// liveness-only check produced. `codex login` persists
-		// /root/.codex/auth.json directly (TASKS.md Task 24), so that is the
+		// ~/.codex/auth.json directly (TASKS.md Task 24), so that is the
 		// checked path.
-		const containerName = `switchyard-codex-authcheck-${Date.now()}`;
-		const credPath = "/root/.codex/auth.json";
+		const credPath = ".codex/auth.json";
+		const files = {};
+		const backend = createFakeExecutionBackend({
+			version: "codex-cli 1.0.0",
+			files,
+		});
 
-		execSync(
-			`docker run -d --name ${containerName} --entrypoint sh alpine -c "sleep 60"`,
-			{ stdio: "pipe" },
+		// Credential withheld entirely.
+		strictEqual(
+			isCodexAuthenticated("fake-workspace", backend),
+			false,
+			"withheld credential must not read as authenticated",
 		);
-		try {
-			// Stub that satisfies the `--version` liveness check (output
-			// contains "codex") but is not actually authenticated.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "#!/bin/sh\necho codex-cli 1.0.0\n" > /usr/local/bin/codex && chmod +x /usr/local/bin/codex'`,
-				{ stdio: "pipe" },
-			);
 
-			// Credential withheld entirely.
-			strictEqual(
-				isCodexAuthenticated(containerName),
-				false,
-				"withheld credential must not read as authenticated",
-			);
+		// Credential present but empty (the empty-file bug shape).
+		files[credPath] = "";
+		strictEqual(
+			isCodexAuthenticated("fake-workspace", backend),
+			false,
+			"empty credential file must not read as authenticated",
+		);
 
-			// Credential present but empty (the empty-file bug shape).
-			execSync(
-				`docker exec ${containerName} sh -c 'mkdir -p /root/.codex && : > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCodexAuthenticated(containerName),
-				false,
-				"empty credential file must not read as authenticated",
-			);
+		// Credential present but a trivial JSON stub.
+		files[credPath] = "{}";
+		strictEqual(
+			isCodexAuthenticated("fake-workspace", backend),
+			false,
+			"trivial {} stub must not read as authenticated",
+		);
 
-			// Credential present but a trivial JSON stub.
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCodexAuthenticated(containerName),
-				false,
-				"trivial {} stub must not read as authenticated",
-			);
+		// Positive control: a non-trivial credential reads as authenticated
+		// (pre-fix liveness-only logic returned true for all four states).
+		files[credPath] = '{"OPENAI_API_KEY":"fake-codex-token-1234567890"}';
+		strictEqual(
+			isCodexAuthenticated("fake-workspace", backend),
+			true,
+			"a non-trivial persisted credential must read as authenticated",
+		);
+	});
 
-			// Positive control: a non-trivial credential reads as authenticated
-			// (pre-fix liveness-only logic returned true for all four states).
-			execSync(
-				`docker exec ${containerName} sh -c 'printf "%s" "{\\"OPENAI_API_KEY\\":\\"fake-codex-token-1234567890\\"}" > ${credPath}'`,
-				{ stdio: "pipe" },
-			);
-			strictEqual(
-				isCodexAuthenticated(containerName),
-				true,
-				"a non-trivial persisted credential must read as authenticated",
-			);
-		} finally {
-			execSync(`docker rm -f -v ${containerName}`, { stdio: "pipe" });
-		}
+	it("returns false when the binary doesn't respond to --version at all", () => {
+		const backend = createFakeExecutionBackend({
+			version: null,
+			files: {
+				".codex/auth.json": '{"OPENAI_API_KEY":"fake-codex-token-1234567890"}',
+			},
+		});
+		strictEqual(
+			isCodexAuthenticated("fake-workspace", backend),
+			false,
+			"missing binary must not read as authenticated even with credentials present",
+		);
 	});
 });

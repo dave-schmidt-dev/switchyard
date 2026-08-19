@@ -9,7 +9,6 @@
 // TASKS.md Task 24: this replaces an earlier BWS-credential-injection design.
 
 import { execFileSync } from "node:child_process";
-import { AGENT_CONTAINER_NAME } from "../container/index.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
 import { validateAdapterInvocation } from "./invocation.mjs";
@@ -28,9 +27,9 @@ import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CODEX_CMD = "codex";
 
-// `codex login` persists the operative credential directly to
-// /root/.codex/auth.json.
-const CODEX_CREDENTIALS_PATH = "/root/.codex/auth.json";
+// `codex login` persists the operative credential directly to the guest
+// provider account's own auth.json.
+const CODEX_CREDENTIALS_RELATIVE_PATH = ".codex/auth.json";
 
 // A real auth.json is hundreds of bytes; this floor rejects an empty file
 // (the exact bug that shipped once — a printf writing nothing) and trivial
@@ -41,27 +40,26 @@ const CODEX_CREDENTIALS_PATH = "/root/.codex/auth.json";
 const MIN_CREDENTIAL_BYTES = 16;
 
 /**
- * Check that the persisted credential file exists inside the container and is
+ * Check that the persisted credential file exists inside the guest and is
  * non-trivial (not empty, not a placeholder stub). INV-1: the credential
  * VALUE never crosses to the host and never appears in argv — only the
  * constant file path and byte threshold do, and `wc -c` reports a byte
  * count, not content. The host reads only the check's exit code.
- * @param {string} containerName
+ * @param {string} workspaceId
+ * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
  */
-function hasNonTrivialCredential(containerName) {
+function hasNonTrivialCredential(workspaceId, executionBackend) {
+	const path = `/Users/${executionBackend.providerUser}/${CODEX_CREDENTIALS_RELATIVE_PATH}`;
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		execFileSync(
-			"docker",
+		executionBackend.execGuest(
+			workspaceId,
+			"sh",
 			[
-				"exec",
-				containerName,
-				"sh",
 				"-c",
-				`[ -f ${CODEX_CREDENTIALS_PATH} ] && [ "$(wc -c < ${CODEX_CREDENTIALS_PATH} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+				`[ -f ${path} ] && [ "$(wc -c < ${path} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
 			],
-			{ encoding: "utf8", stdio: "pipe" },
+			{ cwd: "/" },
 		);
 		return true;
 	} catch {
@@ -70,30 +68,28 @@ function hasNonTrivialCredential(containerName) {
 }
 
 /**
- * Check if Codex is authenticated in the container. Supplements the binary
+ * Check if Codex is authenticated in the guest. Supplements the binary
  * liveness check (`--version` responds) with a real credential check: the
  * persisted `auth.json` must exist and be non-trivial. Liveness alone treated
  * an installed-but-unauthenticated CLI as authenticated, so
  * ensureProvidersAuthenticated() skipped its headless login and the first
  * real dispatch failed instead of `npm run auth` catching it (TASKS.md Task 15).
- * @param {string} [containerName] Container to check (defaults to the standing agent container).
+ * @param {string} workspaceId
+ * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
  */
-export function isCodexAuthenticated(containerName = AGENT_CONTAINER_NAME) {
+export function isCodexAuthenticated(workspaceId, executionBackend) {
 	try {
-		// D-10: authentication probes remain on the standing Docker credential vault.
-		const result = execFileSync(
-			"docker",
-			["exec", containerName, CODEX_CMD, "--version"],
-			{ encoding: "utf8", stdio: "pipe" },
-		);
+		const result = executionBackend
+			.execGuest(workspaceId, CODEX_CMD, ["--version"], { cwd: "/" })
+			.toString();
 		if (!result.includes("codex")) {
 			return false;
 		}
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(containerName);
+	return hasNonTrivialCredential(workspaceId, executionBackend);
 }
 
 /**

@@ -8,7 +8,6 @@ import {
 	reauthHintFor,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
-import { AGENT_CONTAINER_NAME } from "../src/switchyard/container/index.mjs";
 
 // Build a thrown-error stand-in shaped like the object execFileSync attaches on
 // a non-zero exit: a generic `.message` wrapper plus the captured `.stdout` /
@@ -41,9 +40,8 @@ describe("describeExecError — auth-expiry classification", () => {
 		// The reason must carry the recovery command a human can actually run —
 		// matching README's documented re-auth step verbatim — not the opaque
 		// "Command failed: docker exec …" wrapper the ledger recorded before.
-		match(described.error, /docker exec -it/);
+		match(described.error, /npm run auth/);
 		match(described.error, /claude auth login/);
-		ok(described.error.includes(AGENT_CONTAINER_NAME));
 		// The provider's own words survive alongside the hint, as evidence.
 		ok(described.error.includes("OAuth session expired"));
 		ok(!described.error.includes("Command failed"));
@@ -329,7 +327,7 @@ describe("describeExecError — general diagnosability", () => {
 });
 
 describe("reauthHintFor", () => {
-	it("returns a TTY-attached docker login command for each known provider", () => {
+	it("points at `npm run auth` with each known provider's real login command", () => {
 		for (const [provider, needle] of [
 			["claude", "claude auth login"],
 			["codex", "codex login --device-auth"],
@@ -339,7 +337,7 @@ describe("reauthHintFor", () => {
 			["agy", "agy --print hi"],
 		]) {
 			const hint = reauthHintFor(provider);
-			ok(hint.includes(`docker exec -it ${AGENT_CONTAINER_NAME}`));
+			ok(hint.includes("npm run auth"));
 			ok(hint.includes(needle), `${provider} hint should include ${needle}`);
 		}
 	});
