@@ -14,6 +14,7 @@ import {
 } from "../src/switchyard/lifecycle/index.mjs";
 import {
 	buildParallelsWorkingName,
+	MAX_AQUA_EXEC_ARGV_BYTES,
 	PARALLELS_WORKING_PREFIX,
 	ParallelsExecutionBackend,
 	parseParallelsWorkingName,
@@ -661,5 +662,81 @@ describe("Parallels execution backend lifecycle", () => {
 				}),
 			/Aqua domain gui\/501 was not ready/,
 		);
+	});
+
+	it("enforces prompt-size guard before macOS-lane spawn and rejects oversized payloads", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			prlctlFn: (args) => {
+				calls.push(args);
+				return "ok";
+			},
+		});
+
+		// (a) a normal-size command passes through unchanged
+		const normalArgv = ["echo", "hello world"];
+		const normalResult = backend.execGuest("{vm-uuid}", "/bin/echo", [
+			"hello world",
+		]);
+		strictEqual(normalResult, "ok");
+		strictEqual(calls.length, 1);
+		const { args } = backend.execArgv("{vm-uuid}", { argv: normalArgv });
+		ok(Array.isArray(args));
+		const normalScript = decodeGuestScript(args);
+		ok(normalScript.includes("exec 'echo' 'hello world'"));
+
+		// (b) a synthetic oversized argv throws the named error instead of reaching prlctlFn/execFn
+		const oversizedPayload = "x".repeat(MAX_AQUA_EXEC_ARGV_BYTES);
+		const oversizedArgv = ["echo", oversizedPayload];
+		throws(
+			() => backend.execGuest("{vm-uuid}", "echo", [oversizedPayload]),
+			(error) => {
+				strictEqual(error instanceof Error, true);
+				return (
+					error.message.includes(
+						"guest command exceeds the macOS ARG_MAX-safe limit",
+					) &&
+					error.message.includes(`> ${MAX_AQUA_EXEC_ARGV_BYTES} bytes`) &&
+					error.message.includes(
+						"this VM lane cannot execute a payload this large",
+					)
+				);
+			},
+		);
+		// prlctlFn must never have been called for the oversized command
+		strictEqual(calls.length, 1);
+
+		throws(
+			() => backend.execArgv("{vm-uuid}", { argv: oversizedArgv }),
+			(error) => {
+				strictEqual(error instanceof Error, true);
+				return (
+					error.message.includes(
+						"guest command exceeds the macOS ARG_MAX-safe limit",
+					) &&
+					error.message.includes(`> ${MAX_AQUA_EXEC_ARGV_BYTES} bytes`) &&
+					error.message.includes(
+						"this VM lane cannot execute a payload this large",
+					)
+				);
+			},
+		);
+
+		// Also verify with execFn constructor parameter
+		let execFnCalled = false;
+		const backendWithExecFn = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: () => {
+				execFnCalled = true;
+				return "ok";
+			},
+		});
+		throws(
+			() =>
+				backendWithExecFn.execGuest("{vm-uuid}", "echo", [oversizedPayload]),
+			/guest command exceeds the macOS ARG_MAX-safe limit/,
+		);
+		strictEqual(execFnCalled, false);
 	});
 });

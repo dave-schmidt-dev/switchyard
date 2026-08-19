@@ -12,6 +12,7 @@ import { basename, dirname } from "node:path";
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
+export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
 const DEFAULT_AQUA_TIMEOUT_MS = 30_000;
 const DEFAULT_AQUA_POLL_MS = 250;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -645,7 +646,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			? `cd ${shellQuote(resolvedCwd)} && trap 'rm -f -- ${shellQuote(pidPath)}' EXIT && echo $$ > ${shellQuote(pidPath)} && ${launch}`
 			: `cd ${shellQuote(resolvedCwd)} && ${launch}`;
 		const payload = Buffer.from(inner, "utf8").toString("base64");
-		return [
+		const args = [
 			"exec",
 			workspaceId,
 			"launchctl",
@@ -673,6 +674,16 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			// inherits this process's stdin, stdout, stderr and exit status.
 			shellQuote(`eval "$(printf %s ${payload} | /usr/bin/base64 -D)"`),
 		];
+		const totalBytes = args.reduce(
+			(total, entry) => total + Buffer.byteLength(entry, "utf8"),
+			0,
+		);
+		if (totalBytes > MAX_AQUA_EXEC_ARGV_BYTES) {
+			throw new Error(
+				`guest command exceeds the macOS ARG_MAX-safe limit (${totalBytes} bytes > ${MAX_AQUA_EXEC_ARGV_BYTES} bytes); this VM lane cannot execute a payload this large`,
+			);
+		}
+		return args;
 	}
 
 	/**
