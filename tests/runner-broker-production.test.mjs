@@ -8,6 +8,15 @@ import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.
 import { route as productionRoute } from "../src/switchyard/router/index.mjs";
 import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
 
+// Every dependencies object below sets queuePreflight to a trivial pass.
+// This file exercises broker reservation/fallback/adapter-launch behavior
+// downstream of admission, not the macOS/Parallels provider-eligibility
+// preflight gate itself (that's covered directly in tests/router.test.mjs
+// and tests/runner.test.mjs's "Task 6.1"/"Task 6.3" describe blocks) --
+// without the override, runQueueAsync's default preflight reads real
+// on-disk routing state via the production readSnapshotAtRoute, which
+// none of these tmpdir-rooted fixtures provide, so every task would be
+// rejected before dispatch regardless of the scenario under test.
 function descriptor(target, model) {
 	const core = {
 		target_id: target,
@@ -59,6 +68,7 @@ test("production async runner uses broker reservation, fallback, and adapter lau
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters,
 			readSnapshot: () => {
 				snapshotReads += 1;
@@ -149,6 +159,7 @@ test("production async broker forwards adapter status and heartbeats", async () 
 		workingContainerName: "broker-status-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			onStatus: (event) => statusEvents.push(event),
 			onTaskHeartbeat: (event) => heartbeats.push(event),
 			route: () => ({
@@ -211,6 +222,7 @@ test("production async runner drains a dependency chain in one bounded run", asy
 		checkpointPath,
 		maxTasks: 2,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			route: () => ({
 				provider: "Cheap",
 				resolvedTargetId: "cheap",
@@ -261,6 +273,7 @@ test("production async runner commits each task on an owned container", async ()
 		checkpointPath,
 		maxTasks: 2,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			backendFactory: () => ({
 				executionBackend: {},
 				ensureAgentContainer: () => {},
@@ -323,6 +336,7 @@ test("production async runner resets failed tasks before continuing on an owned 
 		maxTasks: 2,
 		stopOnFailure: false,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			backendFactory: () => ({
 				executionBackend: {},
 				ensureAgentContainer: () => {},
@@ -411,6 +425,7 @@ test("production async runner fails closed on a persisted retry_started state", 
 	);
 	const invocation = descriptor("cheap", "cheap-standard");
 	const baseDependencies = {
+		queuePreflight: () => ({ ok: true, eligible: true }),
 		route: () => ({
 			provider: "Cheap",
 			resolvedTargetId: "cheap",
@@ -502,6 +517,7 @@ test("production async runner isolates selection failures and releases early res
 		stopOnFailure: false,
 		workingContainerName: "broker-production-worker",
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => ({ success: true }),
@@ -557,6 +573,7 @@ test("production async runner clears route state after a successful task before 
 		checkpointPath,
 		stopOnFailure: false,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => ({ success: true }),
@@ -612,6 +629,7 @@ test("production async runner records a fallback intent failure before launching
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async (_prompt, _container, options) => {
@@ -686,6 +704,7 @@ test("production async runner preserves a broker precondition failure on retry",
 		projectPath: root,
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			backendFactory: () => ({
 				executionBackend: {},
 				create: () => "owned-broker-precondition-worker",
@@ -763,6 +782,7 @@ test("production async runner does not fallback a typed nonretryable failure", a
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async (_prompt, _container, options) => {
@@ -815,6 +835,7 @@ test("production async runner records the routed provider when post-execution ca
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => ({ success: true }),
@@ -866,6 +887,7 @@ test("production async runner records fallback after post-execution capture thro
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => {
@@ -932,6 +954,7 @@ test("production async runner releases a reservation before an adapter precondit
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: { claude: { captureDiffAsync: async () => null } },
 			brokerReservations: ledger,
 			recordDispatch: () => {},
@@ -1009,6 +1032,7 @@ test("production router path coordinates the requested snapshot source", async (
 		checkpointPath,
 		only: ["claude"],
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => {
@@ -1074,6 +1098,7 @@ test("production router path rejects an unknown snapshot source", async () => {
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => {
@@ -1112,6 +1137,7 @@ test("production async runner quarantines quota targets and retries the same tas
 		projectPath: root,
 		checkpointPath,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			backendFactory: () => ({
 				executionBackend: {},
 				create: () => "unused",
@@ -1191,6 +1217,7 @@ test("production async runner refreshes quarantined exclusions for each task", a
 		maxTasks: 2,
 		stopOnFailure: false,
 		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
 			backendFactory: () => ({
 				executionBackend: {},
 				create: () => "owned-async-quota-queue-worker",

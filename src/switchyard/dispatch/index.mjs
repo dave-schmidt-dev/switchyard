@@ -27,7 +27,7 @@
 //   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json).
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --exclude-provider <name>  Never route to this provider (repeatable).
-//   --platform <docker|macos> Queue workspace platform (default: macos).
+//   --platform <macos>     Queue workspace platform (default: macos).
 //   --help                 Show this help.
 
 import { spawn, spawnSync } from "node:child_process";
@@ -38,12 +38,6 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
-import { getPlatformInfo } from "../container/index.mjs";
-import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
-import {
-	listManagedContainers,
-	recoverManagedObjects,
-} from "../lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
@@ -91,7 +85,7 @@ Run/Launch options:
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
-  --platform <docker|macos>  Queue workspace platform (default: macos)
+  --platform <macos>     Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
@@ -103,7 +97,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --no-stop-on-failure   Keep going after a task fails (default: stop)
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
-  --platform <docker|macos>  Queue workspace platform (default: macos)
+  --platform <macos>     Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --help                 Show this help`;
 
@@ -240,8 +234,8 @@ function parseDispatchArgs(argv) {
 	if (!existsSync(projectPath) || !statSync(projectPath).isDirectory()) {
 		throw new UsageError(`--project is not a directory: ${projectPath}`);
 	}
-	// seedProject archives the project's committed HEAD into each working
-	// container, so a non-repo project can't be dispatched against.
+	// seedProjectWithBackend archives the project's committed HEAD into each
+	// workspace, so a non-repo project can't be dispatched against.
 	if (!existsSync(join(projectPath, ".git"))) {
 		throw new UsageError(`--project is not a git repository: ${projectPath}`);
 	}
@@ -263,10 +257,8 @@ function parseDispatchArgs(argv) {
 	const platform = String(values.platform ?? "macos")
 		.trim()
 		.toLowerCase();
-	if (!["docker", "macos"].includes(platform)) {
-		throw new UsageError(
-			`--platform must be one of docker, macos, got "${values.platform}"`,
-		);
+	if (platform !== "macos") {
+		throw new UsageError(`--platform must be macos, got "${values.platform}"`);
 	}
 	if (
 		onlyProviders.length > 0 &&
@@ -380,7 +372,7 @@ function parseRecoverArgs(argv) {
  * @param {object} [dependencies] Injectable dependencies (tests only)
  * @param {(options: object) => object} [dependencies.runQueue] Defaults to the
  *   real runQueue; tests stub it so the dispatch lock lifecycle can be proven
- *   in isolation from queue execution (no Docker/containers on that path).
+ *   in isolation from queue execution (no VM workspaces on that path).
  */
 async function runDispatch(opts, dependencies = {}) {
 	// A dispatch belongs to its target project, not to this checkout. Keeping
@@ -789,9 +781,9 @@ async function handleLaunch(argv) {
 
 	// NOTE: the pre-dispatch sweep runs in the detached WORKER
 	// (worker-bootstrap), NOT here — keeping the host launch handshake fast and
-	// off the Docker daemon (a Docker sweep on this path made `launch` slow and
-	// its exit-code tests flaky under daemon contention). The worker sweeps
-	// just before it creates this run's container; the synchronous `run` path
+	// off the VM backend (an orphan sweep on this path made `launch` slow and
+	// its exit-code tests flaky under contention). The worker sweeps just
+	// before it creates this run's workspace; the synchronous `run` path
 	// sweeps in-process (see runDispatch).
 
 	// initializeRun writes a fixed snapshot literal (run-store/index.mjs) with
@@ -1034,22 +1026,14 @@ const PROVIDER_BINARY_NAMES = {
 	opencode: "opencode",
 };
 
-// Docker remains the default workspace backend until a caller supplies another
-// execution backend. Its inspectProcess implementation preserves the existing
-// `docker top -eo pid,args` probe and timeout.
-const DEFAULT_EXECUTION_BACKEND = new DockerExecutionBackend();
-
 /**
- * Select the execution backend that matches the platform a run actually
- * used, mirroring runner/index.mjs's createQueueBackend construction so a
- * later, separate `status`/`result` process reconstructs the same backend
- * shape the worker did. Legacy runs recorded before runOptions.platform
- * existed default to Docker (the only platform that existed then).
- * @param {object} run parsed run snapshot
+ * Build the execution backend used to inspect/reclaim a run's workspace,
+ * mirroring runner/index.mjs's createQueueBackend construction so a later,
+ * separate `status`/`result`/`recover` process reconstructs the same backend
+ * shape the worker did.
  * @returns {import("../lifecycle/execution-backend.mjs").ExecutionBackend}
  */
-function executionBackendForRun(run) {
-	if (run?.runOptions?.platform !== "macos") return DEFAULT_EXECUTION_BACKEND;
+function executionBackendForRun() {
 	return new ParallelsExecutionBackend({
 		goldenImage: process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
 		aquaUid: process.env.SWITCHYARD_PARALLELS_AQUA_UID,
@@ -1059,12 +1043,12 @@ function executionBackendForRun(run) {
 }
 
 /**
- * Match one `docker top -eo pid,args` output line against a target binary
- * name. The pid,args format is "<pid><whitespace><args...>" where the args
- * column is itself whitespace-separated (argv[0] is its first token); this
- * compares the basename of that first token so a fully-qualified path (e.g.
+ * Match one `ps -axo pid=,command=` output line against a target binary
+ * name. The format is "<pid><whitespace><args...>" where the args column is
+ * itself whitespace-separated (argv[0] is its first token); this compares
+ * the basename of that first token so a fully-qualified path (e.g.
  * "/usr/local/bin/claude") still matches "claude".
- * @param {string} line one line of `docker top` output
+ * @param {string} line one line of guest `ps` output
  * @param {string} binaryName target executable basename
  * @returns {boolean}
  */
@@ -1079,15 +1063,12 @@ function lineMatchesBinary(line, binaryName) {
 /**
  * Best-effort presence probe for whether the provider CLI routed to this
  * run (run.activeTaskProvider) is actually executing inside the run's
- * working container. Mirrors container/index.mjs's getPlatformInfo pattern:
- * inspect the workspace through the execution backend, catch any failure, and
- * degrade to null rather than
- * throwing — a diagnostic nicety surfaced via the providerProcessDetected
- * envelope field must never crash or indefinitely block a status/result
- * read. The 5000ms timeout on the underlying `docker top` call enforces the
- * "never block indefinitely" half of that contract.
+ * workspace: inspect the workspace through the execution backend, catch any
+ * failure, and degrade to null rather than throwing — a diagnostic nicety
+ * surfaced via the providerProcessDetected envelope field must never crash
+ * or indefinitely block a status/result read.
  *
- * Only the derived boolean crosses into the envelope — raw `docker top`
+ * Only the derived boolean crosses into the envelope — raw guest `ps`
  * output (which can include other processes' full command lines) is never
  * exposed, since that would be a potential information leak, not just a
  * style choice.
@@ -1101,18 +1082,16 @@ function lineMatchesBinary(line, binaryName) {
  * @param {object} run parsed run snapshot
  * @param {object} [deps] Injectable dependencies (tests only)
  * @param {import("../lifecycle/execution-backend.mjs").ExecutionBackend} [deps.executionBackend]
- *   Defaults to the Docker backend
+ *   Defaults to a fresh ParallelsExecutionBackend
  * @param {(command: string, args: string[], options: object) => Buffer | string} [deps.execFn]
- *   Compatibility injection; wraps the Docker backend for existing callers
+ *   Compatibility injection: routed into a ParallelsExecutionBackend's own
+ *   execFn seam instead of executionBackend when supplied.
  * @returns {boolean|null} true/false once the probe runs successfully;
  *   null if the run isn't currently running, isn't routed to a
- *   container/provider yet, the provider has no known binary mapping, or
+ *   workspace/provider yet, the provider has no known binary mapping, or
  *   the probe itself failed
  */
-function probeProviderProcess(
-	run,
-	{ executionBackend = DEFAULT_EXECUTION_BACKEND, execFn } = {},
-) {
+function probeProviderProcess(run, { executionBackend, execFn } = {}) {
 	if (run.state !== "running") return null;
 
 	const { workingContainerName, activeTaskProvider } = run;
@@ -1122,18 +1101,16 @@ function probeProviderProcess(
 	if (!binaryName) return null;
 
 	try {
-		// The compatibility injection remains Docker-shaped for existing callers;
-		// production and new callers use the backend seam directly.
 		const backend = execFn
-			? new DockerExecutionBackend({ execFn })
-			: executionBackend;
+			? new ParallelsExecutionBackend({ execFn })
+			: (executionBackend ?? executionBackendForRun());
 		const output = backend.inspectProcess(workingContainerName).toString();
 		return output
 			.split("\n")
 			.some((line) => lineMatchesBinary(line, binaryName));
 	} catch {
-		// Docker not running, container gone/mid-restart, `docker top` erroring,
-		// or the 5000ms timeout tripped — degrade to null rather than throw.
+		// VM unreachable, workspace gone/mid-restart, the guest ps call
+		// erroring, or a timeout tripped — degrade to null rather than throw.
 		return null;
 	}
 }
@@ -1153,23 +1130,18 @@ async function buildStatusEnvelope(runId, run) {
 		cleanupState: run.cleanupState,
 		// Liveness derived from a signal-0 probe of the recorded worker pid
 		// (see isWorkerLive), so an operator doesn't have to shell out to
-		// `docker top`/`ps` to tell active work from a stalled/ghost run.
+		// `ps` to tell active work from a stalled/ghost run.
 		workerLive: run.state === "running" ? isWorkerLive(run) : null,
 		// Presence of the routed provider's CLI process inside the working
-		// container (see probeProviderProcess) — same conditional-null-when-
+		// VM workspace (see probeProviderProcess) — same conditional-null-when-
 		// not-running shape as workerLive, and same "skip the shell-out
 		// entirely when not running" rule.
 		providerProcessDetected:
 			run.state === "running"
 				? probeProviderProcess(run, {
-						executionBackend: executionBackendForRun(run),
+						executionBackend: executionBackendForRun(),
 					})
 				: null,
-		// Host-vs-image Docker architecture comparison (see
-		// container/index.mjs's getPlatformInfo) — a static diagnostic, not
-		// run-specific, so unlike providerProcessDetected it's safe to call
-		// unconditionally regardless of run.state.
-		platformInfo: getPlatformInfo(),
 		activeTaskId: run.state === "running" ? (run.activeTaskId ?? null) : null,
 		activeTaskProvider:
 			run.state === "running" ? (run.activeTaskProvider ?? null) : null,
@@ -1258,14 +1230,9 @@ async function buildResultEnvelope(runId, run) {
 		providerProcessDetected:
 			run.state === "running"
 				? probeProviderProcess(run, {
-						executionBackend: executionBackendForRun(run),
+						executionBackend: executionBackendForRun(),
 					})
 				: null,
-		// Host-vs-image Docker architecture comparison (see
-		// container/index.mjs's getPlatformInfo) — a static diagnostic, not
-		// run-specific, so unlike providerProcessDetected it's safe to call
-		// unconditionally regardless of run.state.
-		platformInfo: getPlatformInfo(),
 		activeTaskId: run.state === "running" ? (run.activeTaskId ?? null) : null,
 		activeTaskProvider:
 			run.state === "running" ? (run.activeTaskProvider ?? null) : null,
@@ -1510,7 +1477,7 @@ async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 				const didRelease = await releaseFn(run.projectPath, rid);
 				if (didRelease) released.push(rid);
 			} catch {
-				// unlink failure is non-fatal; the run's Docker recovery still ran
+				// unlink failure is non-fatal; the run's VM recovery still ran
 			}
 		}
 	}
@@ -1518,43 +1485,56 @@ async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 }
 
 /**
- * Best-effort reap of leaked managed containers/volumes whose owning run is
- * dead — the reusable core of the no-runId `recover` path. Called as a
- * pre-dispatch sweep (Piece C of the leak-recovery loop) so every dispatch
- * self-heals the previous run's leaks before creating its own container.
+ * Build the execution backend a recovery-path caller (sweep or `recover`)
+ * inspects/reclaims managed VMs through. A VM's name embeds its own
+ * creator pid (see buildParallelsWorkingName/reclaim), so no run-store
+ * read is needed to decide liveness.
  * @param {object} [dependencies]
- * @returns {Promise<{containersReclaimed:number, volumesReclaimed:number,
- *   errors:string[], projectLocksReleased:number}>}
+ * @returns {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend}
+ */
+function recoveryExecutionBackend(dependencies = {}) {
+	return dependencies.executionBackend ?? executionBackendForRun();
+}
+
+/**
+ * Best-effort reap of leaked managed VMs whose creator process is dead —
+ * the reusable core of the no-runId `recover` path. Called as a
+ * pre-dispatch sweep (Piece C of the leak-recovery loop) so every dispatch
+ * self-heals the previous run's leaks before creating its own workspace.
+ * @param {object} [dependencies]
+ * @returns {Promise<{vmsReclaimed:number, errors:string[],
+ *   projectLocksReleased:number}>}
  */
 async function sweepManagedOrphans(dependencies = {}) {
-	const managedContainers =
-		dependencies.listManagedContainers ?? listManagedContainers;
-	const candidateIds = managedContainers()
-		.map((c) => c.runId)
+	const executionBackend = recoveryExecutionBackend(dependencies);
+	const listManaged =
+		dependencies.listManaged ?? (() => executionBackend.listManaged());
+	const reclaim =
+		dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
+
+	const candidateIds = listManaged()
+		.map((entry) => entry.runId)
 		.filter(Boolean);
 
-	const deadMap = new Map();
-	await Promise.all(
-		candidateIds.map(async (rid) => {
-			deadMap.set(rid, await resolveIsRunDead(rid, dependencies));
-		}),
-	);
-
-	const result = await recoverManagedObjects({
-		isRunActive: (rid) => !(deadMap.get(rid) ?? false),
-		dryRun: false,
-	});
+	const result = reclaim({ dryRun: false });
 
 	const projectLocksReleased = await releaseStaleProjectLocks(
 		candidateIds,
 		dependencies,
 	);
 
-	return { ...result, projectLocksReleased };
+	return {
+		vmsReclaimed: result.reclaimed.length,
+		errors: result.errors.map((e) => `${e.name}: ${e.reason}`),
+		projectLocksReleased,
+	};
 }
 
 /**
- * Handle the recover subcommand.
+ * Handle the recover subcommand. With no `--run`, sweeps every managed VM
+ * whose creator process is dead (same liveness rule as sweepManagedOrphans).
+ * With `--run <run-id>`, force-reclaims that one run's VM unconditionally —
+ * the operator asked for it by name, so liveness is not consulted.
  * @param {string[]} argv arguments after the subcommand
  */
 async function handleRecover(argv, dependencies = {}) {
@@ -1565,57 +1545,58 @@ async function handleRecover(argv, dependencies = {}) {
 		return;
 	}
 
-	const managedContainers =
-		dependencies.listManagedContainers ?? listManagedContainers;
-	let candidateIds;
-	if (!runId) {
-		candidateIds = managedContainers()
-			.map((c) => c.runId)
-			.filter(Boolean);
+	const executionBackend = recoveryExecutionBackend(dependencies);
+	const listManaged =
+		dependencies.listManaged ?? (() => executionBackend.listManaged());
+	const managed = listManaged();
+	const candidateIds = managed.map((entry) => entry.runId).filter(Boolean);
+
+	let reclaimedCount = 0;
+	let errors = [];
+	if (runId) {
+		const target = managed.find((entry) => entry.runId === runId);
+		if (target) {
+			const destroy =
+				dependencies.destroy ?? ((handle) => executionBackend.destroy(handle));
+			try {
+				destroy(target);
+				reclaimedCount = 1;
+			} catch (error) {
+				errors = [`${target.name}: ${error.message}`];
+			}
+		}
 	} else {
-		candidateIds = [runId];
+		const reclaim =
+			dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
+		const result = reclaim({ dryRun: false });
+		reclaimedCount = result.reclaimed.length;
+		errors = result.errors.map((e) => `${e.name}: ${e.reason}`);
 	}
 
-	const deadMap = new Map();
-	await Promise.all(
-		candidateIds.map(async (rid) => {
-			deadMap.set(rid, await resolveIsRunDead(rid, dependencies));
-		}),
-	);
-
-	const result = await recoverManagedObjects({
-		isRunActive: (rid) => {
-			if (runId) return rid !== runId;
-			return !(deadMap.get(rid) ?? false);
-		},
-		dryRun: false,
-	});
-
-	// Filesystem project locks are not Docker-managed objects, so
-	// recoverManagedObjects never touches them. Clear stale ones here.
+	// Filesystem project locks are not VM-managed objects, so reclaim never
+	// touches them. Clear stale ones here.
 	const projectLocksReleased = await releaseStaleProjectLocks(
-		candidateIds,
+		runId ? [runId] : candidateIds,
 		dependencies,
 	);
 
 	const output = {
-		containersReclaimed: result.containersReclaimed,
-		volumesReclaimed: result.volumesReclaimed,
-		errors: result.errors,
+		vmsReclaimed: reclaimedCount,
+		errors,
 		projectLocksReleased,
 		runId: runId ?? null,
 		candidates: !runId
-			? managedContainers().map((c) => ({
-					name: c.name,
-					runId: c.runId,
-					status: c.status,
+			? managed.map((entry) => ({
+					name: entry.name,
+					runId: entry.runId,
+					status: entry.status,
 				}))
 			: [{ runId }],
 	};
 
 	console.log(JSON.stringify(output));
 
-	process.exitCode = result.errors.length > 0 ? 1 : 0;
+	process.exitCode = errors.length > 0 ? 1 : 0;
 }
 
 /**

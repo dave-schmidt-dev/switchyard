@@ -5,8 +5,9 @@
 
   TEMPLATE: ops/install-reaper.sh copies switchyard-reaper.sh into a non-TCC
   location under ~/Library and substitutes __REAPER_SH__ with its absolute path.
-  The reaper reads only Docker labels (never project code), so it runs here with
-  NO Full Disk Access grant. Do not load this template directly.
+  The reaper reads only managed Parallels VM names via prlctl (never project
+  code), so it runs here with NO Full Disk Access grant. Do not load this
+  template directly.
 -->
 <plist version="1.0">
 <dict>

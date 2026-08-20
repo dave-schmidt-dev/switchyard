@@ -23,9 +23,9 @@ const MIN_CREDENTIAL_BYTES = 16;
 // `--port` "port for the local server", `--attach` "attach to a running
 // opencode server") and never shuts it down, so the CLI parks in futex_wait
 // after finishing the task. There is no one-shot/`--exit` flag. Because the
-// lingering process holds `docker exec`'s stdout pipe as fd 1, the host never
-// observes EOF and NO host-side deadline can shorten the wait — the pipe stays
-// open until something inside the container kills the process. Upstream:
+// lingering process holds the exec'd command's stdout pipe as fd 1, the host
+// never observes EOF and NO host-side deadline can shorten the wait — the
+// pipe stays open until something inside the container kills the process. Upstream:
 // anomalyco/opencode#17516 (open, no maintainer response) and #32335 (the
 // non-exiting process retains 90-400 MB RSS per job).
 //
@@ -169,12 +169,27 @@ function buildSupervisedExecution(
 	options = {},
 ) {
 	validateIdentifier(workingContainerName, "workingContainerName");
+	const idleSeconds = resolveIdleSeconds();
+	// API-key lanes are deliberately not persisted in the golden image. The VM
+	// backend routes only the two approved model families through its pinned BWS
+	// bridge; every other OpenCode target retains the ordinary credential-file
+	// transport and is never silently granted either key.
+	const bridge = options.executionBackend?.ephemeralOpenCodeKeyExecution?.(
+		workingContainerName,
+		{
+			model,
+			invocationArgs,
+			prompt: guardedPrompt,
+			idleSeconds,
+		},
+	);
+	if (bridge) return bridge;
 	const argv = [
 		"sh",
 		"-c",
 		OPENCODE_SUPERVISOR,
 		"sh",
-		String(resolveIdleSeconds()),
+		String(idleSeconds),
 		OPENCODE_CMD,
 		"run",
 		// OpenCode variant argv is forwarded verbatim immediately after the
@@ -276,7 +291,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 
 	try {
 		const result = execFileSync(execution.command, execution.args, {
-			input: guardedPrompt,
+			input: execution.input ?? guardedPrompt,
 			encoding: "utf8",
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeoutMs,
@@ -354,7 +369,8 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			{
 				...options,
 				provider: "opencode",
-				input: guardedPrompt,
+				input: execution.input ?? guardedPrompt,
+				cleanupContext: execution.cleanupContext,
 				timeoutMs,
 				signal,
 				onPoll,

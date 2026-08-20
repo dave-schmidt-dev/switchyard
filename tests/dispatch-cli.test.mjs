@@ -19,15 +19,7 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
-	AGENT_IMAGE,
-	imageExists,
-	isContainerRuntimeAvailable,
-} from "../src/switchyard/container/index.mjs";
-import {
-	createLabeledContainer,
-	removeContainer,
-} from "./helpers/lifecycle-fixture.mjs";
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -70,19 +62,6 @@ import {
 	USAGE_STATUS,
 } from "../src/switchyard/dispatch/index.mjs";
 import { runQueue } from "../src/switchyard/runner/index.mjs";
-
-const HAS_DOCKER = isContainerRuntimeAvailable();
-
-if (!HAS_DOCKER) {
-	console.log(
-		"Docker not available — skipping providerProcessDetected live-Docker tests",
-	);
-}
-
-function describeIf(condition, ...args) {
-	if (condition) return describe(...args);
-	return describe.skip(...args);
-}
 
 function runDispatch(args, env = {}, timeout = 10_000) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
@@ -170,7 +149,7 @@ describe("parseDispatchArgs (backwards compat)", () => {
 					return error.message;
 				}
 			})(),
-			'--platform must be one of docker, macos, got "windows"',
+			'--platform must be macos, got "windows"',
 		);
 	});
 
@@ -1036,21 +1015,16 @@ describe("recover integration", () => {
 		strictEqual(parsed.runId, "test-run");
 	});
 
-	it("recover without --help runs and exits (Docker may not be available)", () => {
+	it("recover without --help runs and exits (Parallels may not be available)", () => {
 		const result = runDispatch(["recover"]);
 		ok(
 			result.status === 0 || result.status === 1,
 			`unexpected exit code: ${result.status}`,
 		);
-		try {
-			const output = JSON.parse(result.stdout.trim());
-			ok(typeof output.containersReclaimed === "number");
-			ok(typeof output.volumesReclaimed === "number");
-			ok(Array.isArray(output.errors));
-			ok(Array.isArray(output.candidates) || output.candidates === null);
-		} catch {
-			ok(false, `recover stdout is not valid JSON: ${result.stdout}`);
-		}
+		const output = JSON.parse(result.stdout.trim());
+		ok(typeof output.vmsReclaimed === "number");
+		ok(Array.isArray(output.errors));
+		ok(Array.isArray(output.candidates) || output.candidates === null);
 	});
 });
 
@@ -1270,7 +1244,6 @@ describe("envelope format", () => {
 			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
-			"platformInfo",
 		];
 		for (const key of required) {
 			ok(key in envelope, `status envelope missing field: ${key}`);
@@ -1329,7 +1302,6 @@ describe("envelope format", () => {
 			"elapsedSinceLastCompletionMs",
 			"activeTaskAgeMs",
 			"activeTaskRemainingMs",
-			"platformInfo",
 		];
 		for (const key of required) {
 			ok(key in envelope, `result envelope missing field: ${key}`);
@@ -1421,71 +1393,6 @@ describe("envelope format", () => {
 				"SECRET_CANARY",
 			),
 		);
-	});
-
-	it("status and result envelopes' platformInfo has the getPlatformInfo shape", async () => {
-		const { initializeRun, updateRun, readRun } = await import(
-			"../src/switchyard/run-store/index.mjs"
-		);
-
-		const runId = "env-platform-info";
-		await initializeRun({
-			runId,
-			tasksFilePath: tasksFile,
-			projectPath: projectDir,
-			orderedTaskIds: ["1.1"],
-			initialHostFingerprint: "test-host",
-			launchArgs: [],
-		});
-
-		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
-		strictEqual(statusResult.status, 0, `stderr: ${statusResult.stderr}`);
-		const statusEnvelope = JSON.parse(statusResult.stdout.trim());
-
-		const current = await readRun(runId);
-		await updateRun(
-			runId,
-			{
-				state: "succeeded",
-				cleanupState: "complete",
-				terminalSummary: { completedTaskIds: ["1.1"] },
-			},
-			current.revision,
-		);
-
-		const resultResult = runDispatch(["result", runId], makeStateRootEnv());
-		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
-		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
-
-		// platformInfo is a static host/image diagnostic (see
-		// container/index.mjs's getPlatformInfo), unconditional on run.state —
-		// unlike providerProcessDetected, it must be populated on both a
-		// non-terminal status read and a terminal result read.
-		for (const envelope of [statusEnvelope, resultEnvelope]) {
-			ok(
-				envelope.platformInfo && typeof envelope.platformInfo === "object",
-				"platformInfo must be an object",
-			);
-			ok("mismatch" in envelope.platformInfo, "platformInfo missing mismatch");
-			ok("hostArch" in envelope.platformInfo, "platformInfo missing hostArch");
-			ok(
-				"imageArch" in envelope.platformInfo,
-				"platformInfo missing imageArch",
-			);
-			ok("note" in envelope.platformInfo, "platformInfo missing note");
-			strictEqual(typeof envelope.platformInfo.mismatch, "boolean");
-			strictEqual(typeof envelope.platformInfo.hostArch, "string");
-			ok(
-				envelope.platformInfo.imageArch === null ||
-					typeof envelope.platformInfo.imageArch === "string",
-				"platformInfo.imageArch must be a string or null",
-			);
-			ok(
-				envelope.platformInfo.note === null ||
-					typeof envelope.platformInfo.note === "string",
-				"platformInfo.note must be a string or null",
-			);
-		}
 	});
 });
 
@@ -1955,50 +1862,62 @@ describe("probeProviderProcess (providerProcessDetected)", () => {
 		strictEqual(execCalled, false);
 	});
 
-	it("returns null (never throws) when execFn itself throws, e.g. Docker unavailable", () => {
-		const throwingExecFn = () => {
-			throw new Error("simulated docker failure");
-		};
+	it("returns null (never throws) when the backend itself throws, e.g. the VM is unreachable", () => {
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: () => {
+				throw new Error("simulated prlctl failure");
+			},
+		});
 		const result = probeProviderProcess(
 			{
 				state: "running",
 				workingContainerName: "some-container",
 				activeTaskProvider: "claude",
 			},
-			{ execFn: throwingExecFn },
+			{ executionBackend: backend },
 		);
 		strictEqual(result, null);
 	});
 
-	it("returns true when a docker top line's args column matches the mapped binary basename, even via a fully-qualified path", () => {
-		const fakeExecFn = () =>
-			"  PID ARGS\n  123 /usr/local/bin/claude --headless\n  456 sleep infinity\n";
+	it("returns true when a guest ps line's command column matches the mapped binary basename, even via a fully-qualified path", () => {
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: () =>
+				"123 /usr/local/bin/claude --headless\n456 sleep infinity\n",
+		});
 		const result = probeProviderProcess(
 			{
 				state: "running",
 				workingContainerName: "some-container",
 				activeTaskProvider: "claude",
 			},
-			{ execFn: fakeExecFn },
+			{ executionBackend: backend },
 		);
 		strictEqual(result, true);
 	});
 
-	it("returns false (a real boolean, not null) when docker top succeeds but no line matches", () => {
-		const fakeExecFn = () => "  PID ARGS\n  456 sleep infinity\n";
+	it("returns false (a real boolean, not null) when the guest probe succeeds but no line matches", () => {
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: () => "456 sleep infinity\n",
+		});
 		const result = probeProviderProcess(
 			{
 				state: "running",
 				workingContainerName: "some-container",
 				activeTaskProvider: "claude",
 			},
-			{ execFn: fakeExecFn },
+			{ executionBackend: backend },
 		);
 		strictEqual(result, false);
 	});
 
 	it("uses the cursor-agent binary name (not cursor) for the cursor provider", () => {
-		const noMatchExecFn = () => "  PID ARGS\n  123 cursor --headless\n";
+		const noMatchBackend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: () => "123 cursor --headless\n",
+		});
 		strictEqual(
 			probeProviderProcess(
 				{
@@ -2006,13 +1925,16 @@ describe("probeProviderProcess (providerProcessDetected)", () => {
 					workingContainerName: "some-container",
 					activeTaskProvider: "cursor",
 				},
-				{ execFn: noMatchExecFn },
+				{ executionBackend: noMatchBackend },
 			),
 			false,
 			"binary name 'cursor' alone must not match — the actual binary is cursor-agent",
 		);
 
-		const matchExecFn = () => "  PID ARGS\n  123 cursor-agent --headless\n";
+		const matchBackend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: () => "123 cursor-agent --headless\n",
+		});
 		strictEqual(
 			probeProviderProcess(
 				{
@@ -2020,132 +1942,34 @@ describe("probeProviderProcess (providerProcessDetected)", () => {
 					workingContainerName: "some-container",
 					activeTaskProvider: "cursor",
 				},
-				{ execFn: matchExecFn },
+				{ executionBackend: matchBackend },
 			),
 			true,
 		);
 	});
 
-	it("calls execFn with docker top, an explicit args array, and a 5000ms timeout", () => {
+	it("inspects the workspace through prlctl exec against the routed workspace id", () => {
 		let capturedCommand;
 		let capturedArgs;
-		let capturedOptions;
-		const spyExecFn = (command, args, options) => {
-			capturedCommand = command;
-			capturedArgs = args;
-			capturedOptions = options;
-			return "";
-		};
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			execFn: (command, args) => {
+				capturedCommand = command;
+				capturedArgs = args;
+				return "";
+			},
+		});
 		probeProviderProcess(
 			{
 				state: "running",
 				workingContainerName: "my-container",
 				activeTaskProvider: "claude",
 			},
-			{ execFn: spyExecFn },
+			{ executionBackend: backend },
 		);
-		strictEqual(capturedCommand, "docker");
-		deepStrictEqual(capturedArgs, ["top", "my-container", "-eo", "pid,args"]);
-		strictEqual(capturedOptions.timeout, 5000);
-	});
-});
-
-describeIf(
-	HAS_DOCKER,
-	"probeProviderProcess against real Docker containers",
-	() => {
-		it("returns null (never throws) against a container name that was never created", () => {
-			const containerName = `switchyard-test-gone-${randomUUID().slice(0, 8)}`;
-			const result = probeProviderProcess({
-				state: "running",
-				workingContainerName: containerName,
-				activeTaskProvider: "claude",
-			});
-			strictEqual(result, null);
-		});
-
-		it("returns null (never throws) against a container removed mid-restart", () => {
-			const containerName = createLabeledContainer({
-				name: `switchyard-test-removed-${randomUUID().slice(0, 8)}`,
-				cmd: ["sleep", "infinity"],
-			});
-			removeContainer(containerName);
-			const result = probeProviderProcess({
-				state: "running",
-				workingContainerName: containerName,
-				activeTaskProvider: "claude",
-			});
-			strictEqual(result, null);
-		});
-
-		it("returns false for a live container running a non-matching process", () => {
-			const containerName = createLabeledContainer({
-				name: `switchyard-test-noproc-${randomUUID().slice(0, 8)}`,
-				cmd: ["sleep", "infinity"],
-			});
-			try {
-				const result = probeProviderProcess({
-					state: "running",
-					workingContainerName: containerName,
-					activeTaskProvider: "claude",
-				});
-				strictEqual(result, false);
-			} finally {
-				removeContainer(containerName);
-			}
-		});
-	},
-);
-
-// Alpine's /bin/sleep (used by the generic describeIf(HAS_DOCKER, ...) block
-// above) is a BusyBox multi-call binary that dispatches on argv[0]'s
-// basename — a symlink named "claude" exits immediately with "applet not
-// found" rather than running, so a live end-to-end match assertion needs a
-// real standalone (non-multi-call) executable to symlink instead. This
-// project's own agent image (built by docker/Dockerfile) has one: its
-// /bin/sleep is genuine GNU coreutils and ignores argv[0]. Mirrors
-// project-seed.test.mjs's imageExists(AGENT_IMAGE) skip pattern so this
-// still passes on a host that has Docker but hasn't built the agent image.
-const AGENT_IMAGE_SKIP = imageExists(AGENT_IMAGE)
-	? false
-	: `${AGENT_IMAGE} not built — skipping live providerProcessDetected match test`;
-
-describe("probeProviderProcess matches a real provider-named process (live agent image)", {
-	skip: AGENT_IMAGE_SKIP,
-}, () => {
-	it("returns true for a live container running a matching provider process", async () => {
-		// Symlinking the image's real sleep binary to a path named
-		// "claude" and exec-ing through that path makes the resulting
-		// process's argv[0] (and therefore docker top's args column)
-		// read "claude", exercising the real match path end-to-end
-		// without needing to invoke the actual provider CLI.
-		const containerName = createLabeledContainer({
-			name: `switchyard-test-matchproc-${randomUUID().slice(0, 8)}`,
-			image: AGENT_IMAGE,
-			cmd: [
-				"sh",
-				"-c",
-				"ln -s /bin/sleep /tmp/claude && exec /tmp/claude infinity",
-			],
-		});
-		try {
-			let result = null;
-			// The container execs through the symlink immediately after
-			// start; poll briefly in case docker top is queried before
-			// that exec has landed.
-			for (let attempt = 0; attempt < 20; attempt++) {
-				result = probeProviderProcess({
-					state: "running",
-					workingContainerName: containerName,
-					activeTaskProvider: "claude",
-				});
-				if (result === true) break;
-				await new Promise((r) => setTimeout(r, 100));
-			}
-			strictEqual(result, true);
-		} finally {
-			removeContainer(containerName);
-		}
+		strictEqual(capturedCommand, "prlctl");
+		strictEqual(capturedArgs[0], "exec");
+		strictEqual(capturedArgs[1], "my-container");
 	});
 });
 

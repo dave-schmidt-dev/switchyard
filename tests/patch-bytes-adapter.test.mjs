@@ -21,6 +21,21 @@ const captures = [
 	["opencode", captureOpencodeDiff],
 ];
 
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in. installFakeDocker() below still shims a `docker`
+// binary onto PATH, so this fixture only needs to route through that:
+// command "docker" with the same argv tail the case-statement stub matches
+// against.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
+
 let tempRoot;
 let originalPath;
 
@@ -84,7 +99,9 @@ describe("adapter patch-byte preservation", () => {
 
 			for (const [name, capture] of captures) {
 				strictEqual(
-					capture("fake-container"),
+					capture("fake-container", {
+						executionBackend: dockerExecutionBackend,
+					}),
 					expected,
 					`${name} capture must preserve terminal patch bytes`,
 				);

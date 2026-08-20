@@ -519,6 +519,15 @@ function defaultRoute() {
 	};
 }
 
+// This describe block proves ledger dual-write/legacy-projection/outcome-
+// projection behavior, not real macOS provider admission — so its fixtures
+// stub out queuePreflight via the dependency-injection seam runner/index.mjs
+// documents as "(tests only)" (see createQueueBackend's
+// dependencies.queuePreflight), rather than needing their synthetic
+// opencode-go route to satisfy the real GOLDEN_IMAGE_VERIFIED_PROVIDERS
+// allowlist.
+const NOOP_QUEUE_PREFLIGHT = () => ({ ok: true, eligible: true });
+
 function defaultSyncDependencies(overrides = {}) {
 	return {
 		route: defaultRoute,
@@ -535,6 +544,7 @@ function defaultSyncDependencies(overrides = {}) {
 			},
 		},
 		recordDispatchIntent: () => {},
+		queuePreflight: NOOP_QUEUE_PREFLIGHT,
 		...overrides,
 	};
 }
@@ -555,6 +565,7 @@ function defaultOrchestratorDependencies(overrides = {}) {
 			result: async () => ({ success: true, diff: "" }),
 		},
 		recordDispatchIntent: () => {},
+		queuePreflight: NOOP_QUEUE_PREFLIGHT,
 		...overrides,
 	};
 }
@@ -662,7 +673,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies(),
 			});
@@ -691,7 +702,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies(),
 			});
@@ -744,7 +755,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: delayedStoreWriter,
@@ -802,7 +813,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: gatedStoreWriter,
@@ -847,7 +858,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: async () => {
@@ -906,7 +917,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					onStatus: (event) => statuses.push(event),
@@ -949,7 +960,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies({
 					recordDispatchToStore: async () => {
@@ -992,7 +1003,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: {
 					...defaultSyncDependencies(),
@@ -1014,7 +1025,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: orchestratorTasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: join(tmpDir, `${orchestratorTaskId}.checkpoint.json`),
 				dependencies: {
 					...defaultOrchestratorDependencies(),
@@ -1041,7 +1052,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies(),
 			});
@@ -1081,7 +1092,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies({
 					recordDispatchToStore: async () => {
@@ -1136,7 +1147,7 @@ describe("default runner ledger wiring", () => {
 				tasksFilePath: fixture.tasksFilePath,
 				projectPath: tmpDir,
 				workingContainerName: "test-container",
-				platform: "docker",
+				platform: "macos",
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies(),
 			});

@@ -2,8 +2,10 @@ import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 import {
+	captureProviderDiff,
 	captureProviderDiffAsync,
 	executeProviderInvocation,
+	getWorkspaceExecution,
 	runProviderProcess,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import { validateIdentifier } from "../src/switchyard/adapter/shell-safety.mjs";
@@ -132,9 +134,38 @@ describe("provider process lifecycle", () => {
 		strictEqual(cleanupCount, 1);
 	});
 
+	it("opts provider execution into PID recording by default", () => {
+		let receivedOptions;
+		const executionBackend = {
+			execArgv(_workspaceId, options) {
+				receivedOptions = options;
+				return { command: "fake", args: [] };
+			},
+		};
+		getWorkspaceExecution("worker", {
+			executionBackend,
+			argv: ["provider"],
+		});
+		strictEqual(receivedOptions.recordPid, true);
+	});
+
 	it("captures add and diff asynchronously through spawn", async () => {
 		const calls = [];
+		const backendOptions = [];
+		// getWorkspaceExecution now requires an executionBackend with no
+		// default (the removed DEFAULT_EXECUTION_BACKEND used to fill this
+		// in). This test only cares that the argv tail reaches spawnFn
+		// unchanged, so a minimal passthrough is enough -- no real Docker
+		// transport needed here.
+		const passthroughExecutionBackend = {
+			execArgv(_workspaceId, options = {}) {
+				backendOptions.push(options);
+				const { argv } = options;
+				return { command: "fake", args: [...argv] };
+			},
+		};
 		const result = await captureProviderDiffAsync("worker", {
+			executionBackend: passthroughExecutionBackend,
 			spawnFn: (_command, args) => {
 				calls.push(args.at(-1));
 				const child = fakeChild();
@@ -150,15 +181,40 @@ describe("provider process lifecycle", () => {
 		});
 		strictEqual(typeof result, "string");
 		deepStrictEqual(calls, ["-A", "HEAD"]);
+		deepStrictEqual(
+			backendOptions.map((options) => options.recordPid),
+			[false, false],
+		);
+	});
+
+	it("captures add and diff synchronously without PID recording", () => {
+		const backendOptions = [];
+		const executionBackend = {
+			execArgv(_workspaceId, options = {}) {
+				backendOptions.push(options);
+				const isCapture = options.argv.at(-1) === "HEAD";
+				return {
+					command: process.execPath,
+					args: ["-e", isCapture ? 'process.stdout.write("diff")' : ""],
+				};
+			},
+		};
+		strictEqual(captureProviderDiff("worker", { executionBackend }), "diff");
+		deepStrictEqual(
+			backendOptions.map((options) => options.recordPid),
+			[false, false],
+		);
 	});
 
 	it("prefers a backend's cleanupProviderProcess and skips the adapter's own cleanup on timeout", async () => {
 		const child = fakeChild();
 		let backendCalls = 0;
+		let cleanupOptions = null;
 		let adapterCleanups = 0;
 		const executionBackend = {
-			cleanupProviderProcess: () => {
+			cleanupProviderProcess: (_command, _args, options) => {
 				backendCalls += 1;
+				cleanupOptions = options;
 			},
 		};
 		const result = await executeProviderInvocation("fake", [], {
@@ -166,6 +222,7 @@ describe("provider process lifecycle", () => {
 			timeoutMs: 1,
 			termGraceMs: 1,
 			executionBackend,
+			cleanupContext: { workspaceId: "{bridge-workspace}" },
 			cleanup: () => {
 				adapterCleanups += 1;
 			},
@@ -177,6 +234,10 @@ describe("provider process lifecycle", () => {
 			0,
 			"adapter cleanup must not run once the backend's own cleanup succeeded",
 		);
+		deepStrictEqual(cleanupOptions, {
+			onStatus: undefined,
+			workspaceId: "{bridge-workspace}",
+		});
 	});
 
 	it("falls back to the adapter's cleanup when the backend's cleanupProviderProcess throws", async () => {

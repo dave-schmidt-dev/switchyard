@@ -22,6 +22,18 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-copilot-adapter-"));
 const containerName = `switchyard-copilot-adapter-${Date.now()}`;
+
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
 const COPILOT_DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "copilot-target",
@@ -111,10 +123,13 @@ describe("copilot adapter container execution", () => {
 			descriptorHarness: "copilot",
 			invocationDescriptor: COPILOT_DESCRIPTOR,
 			descriptorIdentity: COPILOT_DESCRIPTOR.descriptor_identity,
+			executionBackend: dockerExecutionBackend,
 		});
 		strictEqual(result.success, true);
 
-		const diff = captureDiff(containerName);
+		const diff = captureDiff(containerName, {
+			executionBackend: dockerExecutionBackend,
+		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});

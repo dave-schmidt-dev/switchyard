@@ -123,12 +123,25 @@ function runSupervisor(commandDir, idleSeconds = 1) {
 	);
 }
 
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
+
 const invocationOptions = {
 	model: "fake-model",
 	resolvedTargetId: DESCRIPTOR.target_id,
 	descriptorHarness: "opencode",
 	invocationDescriptor: DESCRIPTOR,
 	descriptorIdentity: DESCRIPTOR.descriptor_identity,
+	executionBackend: dockerExecutionBackend,
 };
 
 describe("opencode container-side idle bound", () => {

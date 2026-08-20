@@ -22,6 +22,22 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-claude-adapter-"));
 const containerName = `switchyard-claude-adapter-${Date.now()}`;
+
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests. This fixture
+// reproduces that Docker-exec transport for the real containers this file
+// spins up in before(). It deliberately does not implement
+// cleanupProviderProcess, so the orphan-kill timeout test below still
+// exercises orphan-kill.mjs's existing Docker-fallback path unchanged.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
 const CLAUDE_DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "claude-target",
@@ -116,10 +132,13 @@ describe("claude adapter container execution", () => {
 			descriptorHarness: "claude",
 			invocationDescriptor: CLAUDE_DESCRIPTOR,
 			descriptorIdentity: CLAUDE_DESCRIPTOR.descriptor_identity,
+			executionBackend: dockerExecutionBackend,
 		});
 		strictEqual(result.success, true);
 
-		const diff = captureDiff(containerName);
+		const diff = captureDiff(containerName, {
+			executionBackend: dockerExecutionBackend,
+		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});
@@ -222,6 +241,7 @@ describe("claude adapter timeout handling", () => {
 				descriptorHarness: "claude",
 				invocationDescriptor: CLAUDE_DESCRIPTOR,
 				descriptorIdentity: CLAUDE_DESCRIPTOR.descriptor_identity,
+				executionBackend: dockerExecutionBackend,
 			},
 		);
 
@@ -253,7 +273,9 @@ describe("claude adapter timeout handling", () => {
 		// here only comes back non-null if killOrphanedProcesses actually
 		// cleared it before this call — without that, captureDiff's `git add -A`
 		// fails and its catch-all silently returns null, losing the edit.
-		const diff = captureDiff(timeoutContainerName);
+		const diff = captureDiff(timeoutContainerName, {
+			executionBackend: dockerExecutionBackend,
+		});
 		ok(
 			typeof diff === "string",
 			"captureDiff returned null — a stale .git/index.lock from the killed process likely defeated `git add -A`",

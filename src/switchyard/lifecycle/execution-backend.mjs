@@ -1,32 +1,5 @@
 // Execution backend seam for disposable workspaces.
 
-import { execFileSync } from "node:child_process";
-import { checkContainerRuntime } from "../container/index.mjs";
-
-// The lifecycle barrel configures these operations after its declarations have
-// initialized. Keeping the callbacks here instead of importing the barrel
-// avoids a circular module graph when a provider adapter imports this seam
-// directly.
-let configuredDockerLifecycle = null;
-
-export function configureDockerLifecycle(operations) {
-	if (!operations || typeof operations !== "object") {
-		throw new TypeError("Docker lifecycle operations are required");
-	}
-	configuredDockerLifecycle = operations;
-}
-
-function lifecycleOperation(instance, name) {
-	const operations = instance.lifecycle ?? configuredDockerLifecycle;
-	const operation = operations?.[name];
-	if (typeof operation !== "function") {
-		throw new Error(
-			`DockerExecutionBackend.${name}() is unavailable before lifecycle initialization`,
-		);
-	}
-	return operation;
-}
-
 function abstractMethod(name) {
 	throw new Error(
 		`ExecutionBackend.${name}() must be implemented by a backend`,
@@ -99,81 +72,5 @@ export class ExecutionBackend {
 
 	inspectProcess(...args) {
 		return abstractMethod("inspectProcess", args);
-	}
-}
-
-/**
- * Docker implementation of the execution backend.
- *
- * This class is intentionally not wired into adapters or runner call sites in
- * Task 3.1. Existing Docker lifecycle helpers remain the behavior contract
- * until the later conversion tasks move callers onto this seam.
- * @public
- */
-export class DockerExecutionBackend extends ExecutionBackend {
-	constructor({ execFn = execFileSync, lifecycle = null } = {}) {
-		super();
-		this.execFn = execFn;
-		this.lifecycle = lifecycle;
-	}
-
-	preflight() {
-		return checkContainerRuntime({ execFn: this.execFn });
-	}
-
-	create(projectPath, image, options) {
-		return lifecycleOperation(this, "create").call(
-			this.lifecycle ?? configuredDockerLifecycle,
-			projectPath,
-			image,
-			options,
-		);
-	}
-
-	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
-		const command = normalizeExecArgv(argv);
-		return {
-			command: "docker",
-			// Keep stdin attached for provider prompts. This is part of the
-			// Docker transport prefix; VM backends must not receive this flag.
-			// `docker exec` passes its argument vector through execve without a
-			// shell, so the command vector needs no quoting here.
-			args: ["exec", "-i", "-w", cwd, workspaceId, ...command],
-		};
-	}
-
-	pushTar(workspaceId, tar, destination = "/project") {
-		return this.execFn("docker", ["cp", "-", `${workspaceId}:${destination}`], {
-			input: tar,
-			maxBuffer: 256 * 1024 * 1024,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-	}
-
-	pullTar(workspaceId, sourcePath) {
-		return this.execFn("docker", ["cp", `${workspaceId}:${sourcePath}`, "-"], {
-			maxBuffer: 256 * 1024 * 1024,
-		});
-	}
-
-	destroy(workspaceId) {
-		return lifecycleOperation(this, "destroy").call(
-			this.lifecycle ?? configuredDockerLifecycle,
-			workspaceId,
-		);
-	}
-
-	listManaged() {
-		return lifecycleOperation(this, "listManaged").call(
-			this.lifecycle ?? configuredDockerLifecycle,
-		);
-	}
-
-	inspectProcess(workspaceId) {
-		return this.execFn("docker", ["top", workspaceId, "-eo", "pid,args"], {
-			encoding: "utf8",
-			stdio: "pipe",
-			timeout: 5000,
-		});
 	}
 }

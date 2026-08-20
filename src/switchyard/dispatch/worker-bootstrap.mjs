@@ -227,8 +227,8 @@ try {
 
 	// NOTE (leak-recovery Piece C): the detached worker deliberately does NOT
 	// run a pre-dispatch orphan sweep. An ephemeral worker whose only job is to
-	// execute one task must not perform system-wide Docker GC — a concurrent
-	// sweep here reclaims containers/volumes belonging to *other* live runs
+	// execute one task must not perform system-wide VM GC — a concurrent
+	// sweep here reclaims workspaces belonging to *other* live runs
 	// (proven: enabling it deterministically reaps a sibling run's fixture
 	// volume). The startup applyRetention call above is safe to include: its
 	// schema-only quarantine can only move that malformed run's own record; it

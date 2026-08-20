@@ -5,13 +5,11 @@ import {
 	strictEqual,
 	throws,
 } from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { describe, it } from "node:test";
-import {
-	provisionAllCredentialsWithBackend,
-	provisionCredentialsWithBackend,
-	seedProjectWithBackend,
-} from "../src/switchyard/lifecycle/index.mjs";
+import { seedProjectWithBackend } from "../src/switchyard/lifecycle/index.mjs";
 import {
 	buildParallelsWorkingName,
 	MAX_AQUA_EXEC_ARGV_BYTES,
@@ -54,9 +52,10 @@ describe("Parallels execution backend lifecycle", () => {
 			argv: ["true"],
 		});
 		strictEqual(execution.command, "prlctl");
-		deepStrictEqual(execution.args.slice(0, 13), [
+		deepStrictEqual(execution.args.slice(0, 14), [
 			"exec",
 			"{vm-uuid}",
+			"--use-advanced-terminal",
 			"launchctl",
 			"asuser",
 			"501",
@@ -69,10 +68,83 @@ describe("Parallels execution backend lifecycle", () => {
 			"LOGNAME=switchyard",
 			"/bin/bash",
 		]);
+		strictEqual(execution.args[2], "--use-advanced-terminal");
 		ok(!execution.args.includes("-i"));
 		const script = decodeGuestScript(execution.args);
 		ok(script.startsWith("cd '/Users/switchyard/.switchyard/project/subdir'"));
 		ok(script.endsWith("&& exec 'true'"));
+	});
+
+	it("routes only approved API-key models through fixed BWS consumers", () => {
+		const backend = new ParallelsExecutionBackend({ aquaUid: 503 });
+		const request = {
+			model: "opencode-go/mimo-v2.5",
+			invocationArgs: [],
+			prompt: "synthetic prompt only",
+			idleSeconds: 60,
+		};
+		const go = backend.ephemeralOpenCodeKeyExecution(WORK_UUID, request);
+		strictEqual(
+			go.command,
+			"/Users/dave/Documents/Projects/bws/bws-secret-exec",
+		);
+		deepStrictEqual(go.args, ["switchyard-opencode-go-dispatch", "--"]);
+		deepStrictEqual(JSON.parse(go.input), {
+			...request,
+			workspaceId: WORK_UUID.slice(1, -1),
+		});
+		deepStrictEqual(go.cleanupContext, { workspaceId: WORK_UUID });
+		const mistral = backend.ephemeralOpenCodeKeyExecution(WORK_UUID, {
+			...request,
+			model: "mistral/mistral-medium-latest",
+		});
+		deepStrictEqual(mistral.args, [
+			"switchyard-opencode-mistral-dispatch",
+			"--",
+		]);
+		strictEqual(
+			backend.ephemeralOpenCodeKeyExecution(WORK_UUID, {
+				...request,
+				model: "opencode-zen/gpt-5",
+			}),
+			null,
+		);
+		throws(
+			() => backend.ephemeralOpenCodeKeyExecution("not-a-vm", request),
+			/VM UUID/,
+		);
+	});
+
+	it("records only opted-in provider commands and removes the marker on exit", () => {
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		const workspaceId = `marker-test-${randomUUID()}`;
+		const markerPath = backend.providerPidPath(workspaceId);
+		const controlScript = decodeGuestScript(
+			backend.execArgv(workspaceId, { cwd: "/", argv: ["true"] }).args,
+		);
+		ok(!controlScript.includes(markerPath));
+
+		const providerScript = decodeGuestScript(
+			backend.execArgv(workspaceId, {
+				cwd: "/",
+				recordPid: true,
+				argv: [
+					"/bin/bash",
+					"-c",
+					'for _ in {1..100}; do test -s "$1" && break; sleep 0.01; done; test "$(cat "$1")" = "$$" || exit 9; IFS= read -r value; printf "out:%s\\n" "$value"; printf "err:%s\\n" "$value" >&2; exit 7',
+					"provider-test",
+					markerPath,
+				],
+			}).args,
+		);
+		const result = spawnSync("/bin/bash", ["-c", providerScript], {
+			input: "payload\n",
+			encoding: "utf8",
+		});
+		strictEqual(result.status, 7);
+		strictEqual(result.stdout, "out:payload\n");
+		strictEqual(result.stderr, "err:payload\n");
+		strictEqual(existsSync(markerPath), false);
 	});
 
 	// `prlctl exec` joins its argument vector with spaces and the guest applies
@@ -115,9 +187,10 @@ describe("Parallels execution backend lifecycle", () => {
 		// The provider account's environment is established as argv, before bash
 		// starts, so `-l` reads the right profile and providers do not fall back
 		// to a read-only `/` for their caches.
-		deepStrictEqual(envelope.slice(0, 12), [
+		deepStrictEqual(envelope.slice(0, 13), [
 			"exec",
 			"{vm-uuid}",
+			"--use-advanced-terminal",
 			"launchctl",
 			"asuser",
 			"501",
@@ -289,93 +362,6 @@ describe("Parallels execution backend lifecycle", () => {
 			"switchyard",
 			"/Users/switchyard/.switchyard/project",
 		]);
-	});
-
-	it("keeps VM credential bytes in memory and fails closed by provider", () => {
-		const calls = [];
-		const backend = {
-			provisionCredentials(workspaceId, options) {
-				calls.push({ workspaceId, options });
-				return { provider: options.provider, files: options.credentials };
-			},
-		};
-		const credential = Buffer.from("opaque-credential-bytes");
-		deepStrictEqual(
-			provisionCredentialsWithBackend(backend, "vm-uuid", {
-				provider: "opencode",
-				readCredentialTar: () => credential,
-			}),
-			{
-				provider: "opencode",
-				files: [{ file: ".local/share/opencode/auth.json", tar: credential }],
-			},
-		);
-		strictEqual(calls[0].options.credentials[0].tar, credential);
-		// cursor-agent is the measured no: it kept reporting `Not logged in` in
-		// the guest with three candidate stores in place, so it must fail here
-		// rather than at exec inside a provisioned-looking VM.
-		throws(
-			() =>
-				provisionCredentialsWithBackend(backend, "vm-uuid", {
-					provider: "cursor-agent",
-					readCredentialTar: () => credential,
-				}),
-			/not tar-provisionable/,
-		);
-	});
-
-	it("reads both of claude's credential files from the vault", () => {
-		const read = [];
-		const backend = {
-			provisionCredentials: (_workspaceId, options) => options,
-		};
-		const result = provisionCredentialsWithBackend(backend, "vm-uuid", {
-			provider: "claude",
-			readCredentialTar: (_agent, src) => {
-				read.push(src);
-				return Buffer.from(src);
-			},
-		});
-		deepStrictEqual(read, [
-			"/root/.claude/.credentials.json",
-			"/root/.claude.json",
-		]);
-		deepStrictEqual(
-			result.credentials.map((entry) => entry.file),
-			[".claude/.credentials.json", ".claude.json"],
-		);
-	});
-
-	it("provisions every tar-provisionable provider and reports the skips", () => {
-		const provisioned = [];
-		const skips = [];
-		const backend = {
-			provisionCredentials(_workspaceId, options) {
-				provisioned.push(options.provider);
-				return { provider: options.provider, files: options.credentials };
-			},
-		};
-		// A vault that was never logged in to for one provider must not stop the
-		// others: the VM lane seeds before routing, so one absent store would
-		// otherwise leave four working providers unauthenticated too.
-		const report = provisionAllCredentialsWithBackend(backend, "vm-uuid", {
-			onSkip: (skip) => skips.push(skip),
-			readCredentialTar: (_agent, src) => {
-				if (src.startsWith("/root/.copilot/"))
-					throw new Error(
-						"credential source is absent from the standing vault",
-					);
-				return Buffer.from(src);
-			},
-		});
-		deepStrictEqual(provisioned, ["claude", "codex", "agy", "opencode"]);
-		// claude contributes two files, the other three one each.
-		strictEqual(report.provisioned, 5);
-		deepStrictEqual(
-			report.skipped.map((skip) => skip.provider),
-			["copilot"],
-		);
-		deepStrictEqual(skips, report.skipped);
 	});
 
 	it("writes each measured credential file to its own home-relative path", () => {

@@ -119,6 +119,11 @@ if [ -n "$descendants" ]; then
 fi
 [ -z "$survivors" ]
 `;
+const BWS_SECRET_EXEC = "/Users/dave/Documents/Projects/bws/bws-secret-exec";
+const OPENCODE_BWS_CONSUMERS = Object.freeze({
+	"opencode-go/": "switchyard-opencode-go-dispatch",
+	"mistral/": "switchyard-opencode-mistral-dispatch",
+});
 
 // This helper runs in a separate Node process because the synchronous
 // lifecycle API blocks the caller's event loop while prlctl is running. The
@@ -641,14 +646,16 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const resolvedCwd = resolveWorkspacePath(cwd, user);
 		validateGuestPath(resolvedCwd, "cwd");
 		const pidPath = providerPidMarkerPath(workspaceId);
-		const launch = `exec ${command.map((entry) => shellQuote(entry)).join(" ")}`;
+		const quotedCommand = command.map((entry) => shellQuote(entry)).join(" ");
+		const launch = `exec ${quotedCommand}`;
 		const inner = recordPid
-			? `cd ${shellQuote(resolvedCwd)} && trap 'rm -f -- ${shellQuote(pidPath)}' EXIT && echo $$ > ${shellQuote(pidPath)} && ${launch}`
+			? `cd ${shellQuote(resolvedCwd)} || exit $?; trap 'rm -f -- ${shellQuote(pidPath)}' EXIT; ${quotedCommand} <&0 & provider_pid=$!; echo "$provider_pid" > ${shellQuote(pidPath)}; wait "$provider_pid"; provider_status=$?; exit "$provider_status"`
 			: `cd ${shellQuote(resolvedCwd)} && ${launch}`;
 		const payload = Buffer.from(inner, "utf8").toString("base64");
 		const args = [
 			"exec",
 			workspaceId,
+			"--use-advanced-terminal",
 			"launchctl",
 			"asuser",
 			uid,
@@ -698,7 +705,14 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 */
 	execArgv(
 		workspaceId,
-		{ cwd = "/project", aquaUid, providerUser, argv, env } = {},
+		{
+			cwd = "/project",
+			aquaUid,
+			providerUser,
+			argv,
+			recordPid = false,
+			env,
+		} = {},
 	) {
 		return {
 			command: "prlctl",
@@ -706,9 +720,51 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				cwd,
 				aquaUid,
 				providerUser,
-				recordPid: true,
+				recordPid,
 				env,
 			}),
+		};
+	}
+
+	/**
+	 * Return the fixed BWS consumer invocation for a one-off OpenCode API-key
+	 * dispatch. The request is non-secret stdin: the pinned consumer obtains the
+	 * key itself and keeps it out of host argv, guest disk, and auth.json.
+	 *
+	 * @param {string} workspaceId Linked-clone UUID.
+	 * @param {{model:string, invocationArgs:string[], prompt:string, idleSeconds:number}} request
+	 * @returns {{command:string, args:string[], input:string}|null}
+	 */
+	ephemeralOpenCodeKeyExecution(workspaceId, request = {}) {
+		if (!UUID.test(String(workspaceId ?? ""))) {
+			throw new Error(
+				"workspaceId must be a VM UUID for ephemeral OpenCode credentials",
+			);
+		}
+		const model = String(request.model ?? "");
+		const prefix = Object.keys(OPENCODE_BWS_CONSUMERS).find((entry) =>
+			model.startsWith(entry),
+		);
+		if (!prefix) return null;
+		if (
+			!Array.isArray(request.invocationArgs) ||
+			request.invocationArgs.some((value) => typeof value !== "string") ||
+			typeof request.prompt !== "string" ||
+			!Number.isInteger(request.idleSeconds)
+		) {
+			throw new TypeError("ephemeral OpenCode request is malformed");
+		}
+		return {
+			command: BWS_SECRET_EXEC,
+			args: [OPENCODE_BWS_CONSUMERS[prefix], "--"],
+			input: JSON.stringify({
+				workspaceId: String(workspaceId).replace(/^\{|\}$/g, ""),
+				model,
+				invocationArgs: request.invocationArgs,
+				prompt: request.prompt,
+				idleSeconds: request.idleSeconds,
+			}),
+			cleanupContext: { workspaceId },
 		};
 	}
 
@@ -1010,11 +1066,22 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * @param {string[]} args
 	 * @returns {{workspaceId: string, pid: number}}
 	 */
-	cleanupProviderProcess(command, args, { onStatus } = {}) {
-		if (command !== "prlctl" || !Array.isArray(args) || args[0] !== "exec") {
+	cleanupProviderProcess(
+		command,
+		args,
+		{ onStatus, workspaceId: requestedWorkspaceId } = {},
+	) {
+		const bridgeInvocation =
+			command === BWS_SECRET_EXEC &&
+			Array.isArray(args) &&
+			Object.values(OPENCODE_BWS_CONSUMERS).includes(args[0]);
+		if (
+			(command !== "prlctl" || !Array.isArray(args) || args[0] !== "exec") &&
+			!bridgeInvocation
+		) {
 			return null;
 		}
-		const workspaceId = args[1];
+		const workspaceId = bridgeInvocation ? requestedWorkspaceId : args[1];
 		if (typeof workspaceId !== "string" || workspaceId.length === 0) {
 			throw new Error("Parallels provider cleanup received no VM handle");
 		}

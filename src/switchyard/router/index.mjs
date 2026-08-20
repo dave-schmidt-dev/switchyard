@@ -185,81 +185,37 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
 ]);
 
 /**
- * Normalize the explicit tar-provisionability evidence used by the macOS
- * queue gate. A verified envelope is mandatory: a bare list, map, or stale
- * status is not evidence that a credential round-trip was exercised.
- *
- * Accepted manifest shape:
- *   { verified: true, providers: ["codex", "opencode"] }
- * or:
- *   { verified: true, providers: { codex: true, opencode: { tarProvisionable: true } } }
- *
- * @param {object|null|undefined} registry
- * @returns {{verified: boolean, providers: string[]}}
+ * Providers whose golden-image-baked auth has been proven, by a real
+ * clone-survival test, to persist through cloning: log in once in the
+ * golden image, clone it, and confirm the clone is still authenticated with
+ * no fresh login. `codex` is verified this way. OpenCode Go and Vibe/Mistral
+ * are separately qualified via their fixed BWS API-key bridge, which injects
+ * no persistent credential into the golden image or clone. The macOS queue
+ * admits either evidence class but keeps every other provider fail-closed.
  */
-function normalizeTarProvisionRegistry(registry) {
-	if (!registry || typeof registry !== "object" || registry.verified !== true) {
-		return { verified: false, providers: [] };
-	}
-
-	const source =
-		registry.providers ??
-		registry.tarProvisionableProviders ??
-		registry.tarProvisionable;
-	const providers = [];
-
-	if (Array.isArray(source)) {
-		for (const entry of source) {
-			if (typeof entry === "string" && entry.trim()) {
-				providers.push(entry.trim());
-				continue;
-			}
-			if (
-				entry &&
-				typeof entry === "object" &&
-				typeof entry.provider === "string" &&
-				entry.tarProvisionable === true &&
-				entry.verified !== false
-			) {
-				providers.push(entry.provider.trim());
-			}
-		}
-	} else if (source && typeof source === "object") {
-		for (const [provider, evidence] of Object.entries(source)) {
-			if (
-				evidence === true ||
-				(evidence &&
-					typeof evidence === "object" &&
-					evidence.tarProvisionable === true &&
-					evidence.verified !== false)
-			) {
-				providers.push(provider);
-			}
-		}
-	}
-
-	const hasExplicitProviderSection =
-		Array.isArray(source) || (source !== null && typeof source === "object");
-	return { verified: hasExplicitProviderSection, providers };
-}
+const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
+	"codex",
+	"opencode-go",
+	"vibe",
+]);
 
 /**
- * Tar evidence is normally recorded at the adapter/harness grain (for
- * example, `opencode` covers the enabled OpenCode Go target), while an
- * explicit target id remains exact when a manifest supplies one.
+ * Golden-image verification is normally recorded at the adapter/harness
+ * grain (for example, `opencode` covers the enabled OpenCode Go target),
+ * while an explicit target id remains exact when the caller supplies one.
  *
- * @param {string} registered
+ * @param {string} verified
  * @param {string} snapshotName
  * @returns {boolean}
  */
-function tarProviderMatches(registered, snapshotName) {
-	const registeredIdentity = resolveTargetIdentity(registered);
+function goldenImageProviderMatches(verified, snapshotName) {
+	const verifiedIdentity = resolveTargetIdentity(verified);
 	const snapshotIdentity = resolveTargetIdentity(snapshotName);
-	if (registeredIdentity.targetId && snapshotIdentity.targetId) {
-		return registeredIdentity.targetId === snapshotIdentity.targetId;
+	if (verifiedIdentity.targetId && snapshotIdentity.targetId) {
+		return verifiedIdentity.targetId === snapshotIdentity.targetId;
 	}
 	return (
-		normalizeProviderName(registered) === normalizeProviderName(snapshotName)
+		normalizeProviderName(verified) === normalizeProviderName(snapshotName)
 	);
 }
 
@@ -303,7 +259,7 @@ function hasQuotaHeadroom(name, windows, floor) {
  * @returns {{eligible: boolean, reason: string}}
  */
 function classifyPreflightProvider(name, provider, capability, options) {
-	const { exclude, only, floor, isAvailable, tarProviders } = options;
+	const { exclude, only, floor, isAvailable, verifiedProviders } = options;
 	const targetIdentity = resolveTargetIdentity(name);
 	if (!targetIdentity.targetId) {
 		return { eligible: false, reason: "target_identity_unavailable" };
@@ -338,9 +294,11 @@ function classifyPreflightProvider(name, provider, capability, options) {
 		return { eligible: false, reason: "no_quota_headroom" };
 	}
 	if (
-		!tarProviders.some((registered) => tarProviderMatches(registered, name))
+		!verifiedProviders.some((verified) =>
+			goldenImageProviderMatches(verified, name),
+		)
 	) {
-		return { eligible: false, reason: "not_tar_provisionable" };
+		return { eligible: false, reason: "not_golden_image_verified" };
 	}
 	return { eligible: true, reason: "eligible" };
 }
@@ -349,10 +307,11 @@ function classifyPreflightProvider(name, provider, capability, options) {
  * Preflight a macOS queue before a VM or workspace is created.
  *
  * The snapshot is read exactly once and then shared across every distinct
- * non-terminal task capability tier. The tar registry must be an explicitly
- * verified manifest; quota or adapter evidence alone cannot make a provider
- * eligible for the VM lane. `platform: "docker"` is an explicit no-op so
- * existing Docker launches retain their behavior.
+ * non-terminal task capability tier. A provider must be on the
+ * credential-evidence allowlist (GOLDEN_IMAGE_VERIFIED_PROVIDERS) to be
+ * eligible for the VM lane. OAuth providers require clone-survival evidence;
+ * BWS API-key lanes require fixed-bridge qualification instead. Every other
+ * provider fails closed before a VM is created.
  *
  * @param {object} options
  * @param {string} [options.platform="macos"]
@@ -361,8 +320,8 @@ function classifyPreflightProvider(name, provider, capability, options) {
  * @param {string[]} [options.exclude]
  * @param {string[]} [options.availableProviders]
  * @param {number} [options.floor]
- * @param {object} [options.tarProvisionRegistry]
- * @param {object} [options.tarProvisionManifest]
+ * @param {string[]} [options.goldenImageVerifiedProviders] Overrides
+ *   GOLDEN_IMAGE_VERIFIED_PROVIDERS (tests only).
  * @param {number} [options.nowMs]
  * @param {Function} [options.readSnapshot] Test-only snapshot-reader seam.
  * @returns {object} Structured preflight result with capability rejections.
@@ -378,18 +337,6 @@ export function preflightMacosQueue(options = {}) {
 		nowMs = Date.now(),
 		readSnapshot = readSnapshotAtRoute,
 	} = options;
-
-	if (platform === "docker") {
-		return {
-			platform,
-			eligible: true,
-			ok: true,
-			reason: "docker_unchanged",
-			checkedCapabilities: [],
-			capabilityResults: [],
-			rejections: [],
-		};
-	}
 
 	if (platform !== "macos") {
 		const rejection = {
@@ -515,34 +462,8 @@ export function preflightMacosQueue(options = {}) {
 		};
 	}
 
-	const registry = normalizeTarProvisionRegistry(
-		options.tarProvisionRegistry ??
-			options.tarProvisionManifest ??
-			options.registry ??
-			options.manifest,
-	);
-	if (!registry.verified) {
-		const rejections = taskTiers.map((capability) =>
-			rejectionFor(capability, "tar_provisionability_unverified", [
-				...indexProviders(snapshot).keys(),
-			]),
-		);
-		return {
-			...baseResult,
-			eligible: false,
-			ok: false,
-			reason: "provider_eligibility_preflight_failed",
-			capabilityResults: taskTiers.map((capability) => ({
-				capability,
-				eligible: false,
-				providers: [],
-				excludedProviders: [...indexProviders(snapshot).keys()],
-				reason: "tar_provisionability_unverified",
-			})),
-			rejections,
-			rejection: rejections[0],
-		};
-	}
+	const verifiedProviders =
+		options.goldenImageVerifiedProviders ?? GOLDEN_IMAGE_VERIFIED_PROVIDERS;
 	const normalizedFloor = Number.isFinite(floor) ? floor : DEFAULT_FLOOR;
 	const isAvailable = (name) => {
 		if (!availableProviders) return true;
@@ -592,7 +513,7 @@ export function preflightMacosQueue(options = {}) {
 					availableProviders,
 					floor: normalizedFloor,
 					isAvailable,
-					tarProviders: registry.providers,
+					verifiedProviders,
 				},
 			);
 			if (classification.eligible) {
@@ -612,9 +533,7 @@ export function preflightMacosQueue(options = {}) {
 			reason:
 				eligibleProviders.length > 0
 					? "eligible"
-					: registry.verified
-						? "no_tar_provisionable_provider_with_quota_headroom"
-						: "tar_provisionability_unverified",
+					: "no_golden_image_verified_provider_with_quota_headroom",
 		};
 		capabilityResults.push(result);
 		if (!result.eligible) {

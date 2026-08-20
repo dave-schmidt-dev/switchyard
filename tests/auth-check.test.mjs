@@ -1,10 +1,13 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
+	AGY_LOGIN_COMMAND,
+	CLAUDE_LOGIN_HINT,
 	COPILOT_LOGIN_COMMAND,
 	ensureProvidersAuthenticated,
 	PROVIDERS,
 	reportProviderStatus,
+	runCheck,
 } from "../src/switchyard/auth/index.mjs";
 
 function fakeProvider(name, { authenticatedSequence }) {
@@ -26,8 +29,67 @@ function fakeProvider(name, { authenticatedSequence }) {
 }
 
 describe("ensureProvidersAuthenticated", () => {
+	it("skips interactive OAuth for BWS-backed API-key dispatch", () => {
+		let checked = 0;
+		let loggedIn = 0;
+		const [result] = ensureProvidersAuthenticated([
+			{
+				name: "opencode",
+				authMode: "ephemeral_api_key_dispatch",
+				isAuthenticated: () => {
+					checked += 1;
+					return false;
+				},
+				runLogin: () => {
+					loggedIn += 1;
+				},
+			},
+		]);
+		deepStrictEqual(result, {
+			name: "opencode",
+			wasAuthenticated: true,
+			ranLogin: false,
+			authenticated: true,
+		});
+		strictEqual(checked, 0);
+		strictEqual(loggedIn, 0);
+	});
+
+	it("uses agy's plain interactive login invocation", () => {
+		deepStrictEqual(AGY_LOGIN_COMMAND, ["agy"]);
+	});
+
 	it("uses the supported Copilot CLI login subcommand", () => {
-		deepStrictEqual(COPILOT_LOGIN_COMMAND, ["copilot", "login"]);
+		deepStrictEqual(COPILOT_LOGIN_COMMAND, [
+			"copilot",
+			"login",
+			"--device-code",
+		]);
+	});
+
+	it("prints the Claude browser-code hint before interactive login", () => {
+		const output = [];
+		const originalLog = console.log;
+		console.log = (...args) => output.push(args.join(" "));
+		try {
+			ensureProvidersAuthenticated([
+				{
+					name: "claude",
+					loginHint: CLAUDE_LOGIN_HINT,
+					isAuthenticated: (() => {
+						let calls = 0;
+						return () => calls++ > 0;
+					})(),
+					runLogin: () => {},
+				},
+			]);
+		} finally {
+			console.log = originalLog;
+		}
+		ok(
+			output.some((line) => line.includes(CLAUDE_LOGIN_HINT)),
+			"Claude's login hint must be shown before the login command",
+		);
 	});
 
 	it("skips runLogin() for providers already authenticated", () => {
@@ -168,6 +230,7 @@ describe("ensureProvidersAuthenticated", () => {
 			"opencode",
 		]);
 		for (const provider of PROVIDERS) {
+			if (provider.authMode === "ephemeral_api_key_dispatch") continue;
 			strictEqual(typeof provider.isAuthenticated, "function");
 			strictEqual(typeof provider.runLogin, "function");
 		}
@@ -232,6 +295,29 @@ describe("reportProviderStatus (read-only auth check)", () => {
 			{ name: "throwing", authenticated: false },
 			{ name: "healthy", authenticated: true },
 		]);
+	});
+
+	it("marks ephemeral BWS dispatch as unprobed in live mode", () => {
+		deepStrictEqual(
+			reportProviderStatus(
+				[
+					{
+						name: "opencode",
+						authMode: "ephemeral_api_key_dispatch",
+					},
+				],
+				{ live: true },
+			),
+			[
+				{
+					name: "opencode",
+					authenticated: true,
+					live: null,
+					reason: null,
+					authMode: "ephemeral_api_key_dispatch",
+				},
+			],
+		);
 	});
 });
 
@@ -412,11 +498,52 @@ describe("liveness gating", () => {
 
 	it("every real provider carries a liveness probe", () => {
 		for (const provider of PROVIDERS) {
+			if (provider.authMode === "ephemeral_api_key_dispatch") continue;
 			strictEqual(
 				typeof provider.isLive,
 				"function",
 				`${provider.name} must be probeable`,
 			);
+		}
+	});
+
+	it("fails closed when live mode has an unprobed BWS lane", () => {
+		const output = [];
+		const originalLog = console.log;
+		const originalExitCode = process.exitCode;
+		console.log = (...args) => output.push(args.join(" "));
+		process.exitCode = undefined;
+		const backend = {
+			goldenImage: "golden",
+			aquaUid: "501",
+			bootGoldenImage: () => ({ uuid: "workspace" }),
+			stopGoldenImage: () => {},
+		};
+		try {
+			runCheck(backend, true, [
+				{
+					name: "opencode",
+					authMode: "ephemeral_api_key_dispatch",
+				},
+			]);
+			strictEqual(process.exitCode, 1);
+			ok(
+				output.some((line) => line.includes("BWS lanes remain unprobed")),
+				`live header must disclose unprobed BWS lanes: ${JSON.stringify(output)}`,
+			);
+			ok(
+				output.some((line) => line.includes("live status unprobed")),
+				`BWS status must be explicit: ${JSON.stringify(output)}`,
+			);
+			ok(
+				!output.some((line) =>
+					line.includes("each provider was sent one real request"),
+				),
+				"live header must not claim every provider was probed",
+			);
+		} finally {
+			console.log = originalLog;
+			process.exitCode = originalExitCode;
 		}
 	});
 });

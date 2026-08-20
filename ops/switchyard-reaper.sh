@@ -1,32 +1,33 @@
 #!/bin/sh
-# Switchyard standalone reaper (label-only, project-code-free).
+# Switchyard standalone reaper (VM-name-only, project-code-free).
 #
-# Reclaims proven-dead working containers + named volumes by reading liveness
-# straight off each object's own Docker labels — the `worker_pid` the creating
-# process stamped — and probing it with `kill -0`. It reads NO project code and
-# NO run store, so it runs from a launchd LaunchAgent under ~/Library without
-# any Full Disk Access / TCC grant (a background agent cannot read the project
-# tree under ~/Documents; this reaper never needs to).
+# Reclaims proven-dead managed Parallels VMs by reading ownership straight off
+# each VM's own reserved name — switchyard-work-<runId>-<creatorPid>, the
+# exact prefix/suffix contract ParallelsExecutionBackend.buildParallelsWorkingName
+# writes and parseParallelsWorkingName parses — and probing the embedded
+# creator PID with `kill -0`. It reads NO project code and NO run store, so it
+# runs from a launchd LaunchAgent under ~/Library without any Full Disk
+# Access / TCC grant (a background agent cannot read the project tree under
+# ~/Documents; this reaper never needs to).
 #
 # This is the standalone counterpart to `switchyard-dispatch recover`. It is
-# deliberately NARROWER than recover: it only reaps objects that carry a
-# `worker_pid` label (every object created since the PID-label change does), and
-# it SKIPS any object with no PID signal (the safe direction — a legacy no-pid
-# orphan is left for interactive/pre-dispatch `recover`, never force-removed
-# blind). It shares INV-3's guarantee: force-remove ONLY a proven-dead owner's
-# objects; a live owner (live PID) is always skipped.
+# deliberately NARROWER than recover: it only touches VMs whose complete name
+# parses as a Switchyard owner, and it SKIPS anything else — a foreign or
+# malformed-prefix VM is never touched or reported, and a live owner (live
+# PID) is always skipped. It shares INV-3's guarantee: force-remove ONLY a
+# proven-dead owner's VM.
 #
-# Label strings below MUST match src/switchyard/lifecycle/index.mjs. A parity
-# test (tests/reaper-script.test.mjs) asserts they stay in sync so a rename
-# there can't silently disable this reaper.
+# The name prefix below MUST match PARALLELS_WORKING_PREFIX in
+# src/switchyard/lifecycle/parallels-execution-backend.mjs. A parity test
+# (tests/reaper-script.test.mjs) asserts they stay in sync so a rename there
+# can't silently disable this reaper.
 set -u
 
-# --- Label source of truth (kept in sync by the parity test) ---
-MANAGED_LABEL="com.zerodelta.switchyard.managed"
-PID_LABEL="com.zerodelta.switchyard.worker_pid"
+# --- Name source of truth (kept in sync by the parity test) ---
+WORKING_PREFIX="switchyard-work-"
 
-# launchd starts jobs with a minimal PATH; docker (OrbStack) lives here.
-PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# launchd starts jobs with a minimal PATH; prlctl lives here.
+PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 export PATH
 
 LOG_DIR="$HOME/Library/Logs"
@@ -60,40 +61,65 @@ owner_reapable() {
 	return 0 # proven dead => reap
 }
 
-if ! command -v docker >/dev/null 2>&1; then
-	log "reaper: docker not found on PATH — nothing to do"
+# Parse ownership from a VM name. Sets $creator_pid on success. The PID is the
+# final hyphen-delimited component, so run IDs may contain hyphens without
+# weakening the proof (mirrors parseParallelsWorkingName).
+parse_owned_vm() {
+	name="$1"
+	case "$name" in
+	"$WORKING_PREFIX"*) ;;
+	*) return 1 ;;
+	esac
+	remainder=${name#"$WORKING_PREFIX"}
+	creator_pid=${remainder##*-}
+	run_id=${remainder%-"$creator_pid"}
+	case "$creator_pid" in
+	'' | 0 | *[!0-9]*) return 1 ;;
+	esac
+	case "$run_id" in
+	'') return 1 ;;
+	*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
+}
+
+if ! command -v prlctl >/dev/null 2>&1; then
+	log "reaper: prlctl not found on PATH — nothing to do"
 	exit 0
 fi
 
-# OrbStack may be stopped; a failed listing just means nothing to reap.
-containers=$(docker ps -aq --filter "label=$MANAGED_LABEL=true" 2>/dev/null || true)
-volumes=$(docker volume ls -q --filter "label=$MANAGED_LABEL=true" 2>/dev/null || true)
+reaped=0
 
-reaped_c=0
-reaped_v=0
+# `prlctl list -a -o uuid,status,name` may fail if Parallels isn't running;
+# a failed listing just means nothing to reap. Listed into a temp file (not
+# piped straight into `while read`) so the loop runs in THIS shell, not a
+# subshell — a piped loop would lose the $reaped count across iterations.
+LIST_TMP=$(mktemp "${TMPDIR:-/tmp}/switchyard-reaper-list.XXXXXX")
+trap 'rm -f "$LIST_TMP"' EXIT
+prlctl list -a -o uuid,status,name >"$LIST_TMP" 2>/dev/null
 
-# Containers first, so a named working volume is no longer in-use when the
-# volume pass runs (docker rm -f -v only removes ANON volumes, not our named
-# ${name}-vol).
-for id in $containers; do
-	pid=$(docker inspect --format "{{index .Config.Labels \"$PID_LABEL\"}}" "$id" 2>/dev/null || echo "")
-	if owner_reapable "$pid"; then
-		if docker rm -f -v "$id" >/dev/null 2>&1; then
-			reaped_c=$((reaped_c + 1))
-			log "reaper: removed container $id (dead owner pid ${pid:-none})"
-		fi
+while IFS= read -r line; do
+	uuid=$(printf '%s\n' "$line" | awk '{print $1}')
+	status=$(printf '%s\n' "$line" | awk '{print $2}')
+	name=$(printf '%s\n' "$line" | awk '{$1=""; $2=""; sub(/^[ \t]+/, ""); print}')
+	case "$uuid" in
+	'' | UUID) continue ;;
+	esac
+	if ! parse_owned_vm "$name"; then
+		continue
 	fi
-done
-
-for v in $volumes; do
-	pid=$(docker volume inspect --format "{{index .Labels \"$PID_LABEL\"}}" "$v" 2>/dev/null || echo "")
-	if owner_reapable "$pid"; then
-		if docker volume rm -f "$v" >/dev/null 2>&1; then
-			reaped_v=$((reaped_v + 1))
-			log "reaper: removed volume $v (dead owner pid ${pid:-none})"
-		fi
+	if ! owner_reapable "$creator_pid"; then
+		continue
 	fi
-done
+	case "$status" in
+	[Ss]topped) ;;
+	*) prlctl stop "$uuid" --kill >/dev/null 2>&1 ;;
+	esac
+	if prlctl delete "$uuid" >/dev/null 2>&1; then
+		reaped=$((reaped + 1))
+		log "reaper: removed VM $name ($uuid, dead owner pid $creator_pid)"
+	fi
+done <"$LIST_TMP"
 
-log "reaper: done (containers=$reaped_c volumes=$reaped_v)"
+log "reaper: done (vms=$reaped)"
 exit 0

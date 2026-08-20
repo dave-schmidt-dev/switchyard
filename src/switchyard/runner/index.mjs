@@ -5,7 +5,6 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
 	captureDiff as captureAgyDiff,
 	captureDiffAsync as captureAgyDiffAsync,
@@ -48,30 +47,17 @@ import {
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
 import { createBroker } from "../broker/index.mjs";
-import {
-	AGENT_IMAGE,
-	buildAgentImage,
-	checkContainerRuntime,
-	imageExists,
-	startAgentContainer,
-} from "../container/index.mjs";
 import { integrationGate } from "../integrate/index.mjs";
 import {
 	recordDispatch,
 	recordDispatchIntentToStore,
 	recordDispatchToStore,
 } from "../ledger/index.mjs";
-import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
 import {
-	commitWorkingTree,
-	createWorkingContainer,
-	provisionAllCredentialsWithBackend,
-	provisionCredentials,
-	resetWorkingTree,
-	seedProject,
-	seedProjectWithBackend,
-	wipeWorkingContainer,
-} from "../lifecycle/index.mjs";
+	loadWorkspaceLifecycleHooks,
+	runWorkspaceLifecycleHook,
+} from "../lifecycle/hooks.mjs";
+import { seedProjectWithBackend } from "../lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
@@ -89,40 +75,11 @@ import {
 } from "../router/index.mjs";
 import { acquireVmSlot, releaseVmSlot } from "../run-store/index.mjs";
 
-/**
- * Ensure the standing agent container is built and running.
- * Idempotent: only builds the image if it isn't already present (a build
- * costs multiple minutes and should only pay once per host), and
- * startAgentContainer() is itself idempotent (starts an existing stopped
- * container, or is a no-op if already running).
- * @param {object} [deps] Injectable dependencies (tests only)
- * @param {(command: string, args: string[], options: object) => Buffer | string} [deps.execFn]
- *   Defaults to the real `execFileSync`
- * @throws {Error} if Docker/OrbStack is unavailable, or the image build or
- *   container start fails.
- */
-export function ensureAgentContainer(deps = {}) {
-	const status = checkContainerRuntime(deps);
-	if (!status.available) {
-		throw new Error(
-			`ensureAgentContainer: Docker/OrbStack is not available (${status.classification})`,
-		);
-	}
-	if (!imageExists(AGENT_IMAGE)) {
-		if (!buildAgentImage()) {
-			throw new Error(`ensureAgentContainer: failed to build ${AGENT_IMAGE}`);
-		}
-	}
-	if (!startAgentContainer()) {
-		throw new Error("ensureAgentContainer: failed to start agent container");
-	}
-}
-
 const CHECKPOINT_VERSION = 2;
 const BOUNDED_ERROR_KINDS = new Set(PERSISTED_ERROR_KINDS);
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
-export const QUEUE_PLATFORMS = Object.freeze(["docker", "macos"]);
+export const QUEUE_PLATFORMS = Object.freeze(["macos"]);
 // Versioned contract shared by the host runner, detached worker, and any
 // external headless orchestrator.  Keep this independent from the run-store
 // schema so a durable record can remain readable while the wire contract
@@ -2473,6 +2430,11 @@ export function executeTask(task, context) {
 
 	const prompt = task.prompt || task.description || task.title;
 	const routedModel = invocationDescriptor?.selector ?? routeResult.model;
+	context.queueBackend?.beforeRun?.(
+		context.workingContainerName,
+		context.projectPath,
+		{ onStatus: context.onStatus },
+	);
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
 		timeoutMs,
@@ -2570,6 +2532,11 @@ export function executeTask(task, context) {
 		};
 	}
 
+	context.queueBackend?.afterRun?.(
+		context.workingContainerName,
+		context.projectPath,
+		{ onStatus: context.onStatus },
+	);
 	const diff = adapter.captureDiff(context.workingContainerName, {
 		executionBackend: context.executionBackend,
 	});
@@ -2982,6 +2949,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 			error: reason,
 		};
 	}
+	context.queueBackend?.beforeRun?.(
+		context.workingContainerName,
+		context.projectPath,
+		{ onStatus: context.onStatus },
+	);
 	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
 		launcherIdentity: broker.launcherIdentity(selectedRoute),
 		signal: context.signal,
@@ -3231,6 +3203,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 			...(partialDiff ? { partialDiff } : {}),
 		};
 	}
+	context.queueBackend?.afterRun?.(
+		context.workingContainerName,
+		context.projectPath,
+		{ onStatus: context.onStatus },
+	);
 	const diff = await adapter.captureDiffAsync(context.workingContainerName, {
 		executionBackend: context.executionBackend,
 		signal: context.signal,
@@ -3306,8 +3283,8 @@ async function executeTaskAsyncUnsafe(task, context) {
  * Awaiting queue entrypoint for callers that own an async worker. This is a
  * deliberately small sibling of runQueue: it keeps the established sync API
  * untouched while making the per-task provider lifecycle genuinely awaitable.
- * Container creation/seeding is delegated to the same injectable lifecycle
- * dependencies; callers with a supplied working container avoid Docker setup.
+ * Workspace creation/seeding is delegated to the same injectable lifecycle
+ * dependencies; callers with a supplied working container avoid VM setup.
  */
 export async function runQueueAsync(options) {
 	const {
@@ -3367,7 +3344,10 @@ export async function runQueueAsync(options) {
 	try {
 		if (!workingContainerName) {
 			queueBackend.ensureAgentContainer();
-			workingContainerName = queueBackend.create(projectPath, { runId });
+			workingContainerName = queueBackend.create(projectPath, {
+				runId,
+				onStatus: dependencies.onStatus,
+			});
 			if (!workingContainerName) {
 				throw new Error("runQueueAsync: failed to create working container");
 			}
@@ -3393,10 +3373,20 @@ export async function runQueueAsync(options) {
 				);
 			}
 			queueBackend.seed(workingContainerName, projectPath);
+			queueBackend.afterCreate?.(workingContainerName, projectPath, {
+				onStatus: dependencies.onStatus,
+			});
 		}
 	} catch (error) {
 		if (ownsWorkingContainer && workingContainerName) {
 			try {
+				try {
+					queueBackend.beforeRemove?.(workingContainerName, projectPath);
+				} catch (hookError) {
+					console.error(
+						`runQueueAsync: before_remove hook failed: ${hookError.message}`,
+					);
+				}
 				queueBackend.destroy(workingContainerName);
 			} catch {
 				// Preserve the bootstrap error.
@@ -3786,6 +3776,13 @@ export async function runQueueAsync(options) {
 		try {
 			if (ownsWorkingContainer) {
 				try {
+					try {
+						queueBackend.beforeRemove?.(workingContainerName, projectPath);
+					} catch (hookError) {
+						console.error(
+							`runQueueAsync: before_remove hook failed: ${hookError.message}`,
+						);
+					}
 					queueBackend.destroy(workingContainerName);
 				} catch {
 					// Container cleanup is best effort; the run result remains authoritative.
@@ -3959,6 +3956,11 @@ export async function executeTaskWithOrchestrator(task, context) {
 
 	let jobId;
 	try {
+		context.queueBackend?.beforeRun?.(
+			context.workingContainerName,
+			context.projectPath,
+			{ onStatus: context.onStatus },
+		);
 		jobId = await context.orchestrator.launch({
 			payloadVersion: ORCHESTRATOR_PAYLOAD_VERSION,
 			contractVersion: ORCHESTRATOR_PAYLOAD_VERSION,
@@ -4079,6 +4081,11 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 
+	context.queueBackend?.afterRun?.(
+		context.workingContainerName,
+		context.projectPath,
+		{ onStatus: context.onStatus },
+	);
 	const diff = typeof jobResult.diff === "string" ? jobResult.diff.trim() : "";
 	if (context.onStatus) {
 		context.onStatus({
@@ -4906,33 +4913,6 @@ function runBackendGitCommand(executionBackend, workspaceId, script) {
 	return result;
 }
 
-const DEFAULT_TAR_PROVISION_MANIFEST_PATH = fileURLToPath(
-	new URL("../../../ops/macos-vm/tar-provision-manifest.json", import.meta.url),
-);
-
-function loadTarProvisionRegistry(dependencies) {
-	if (Object.hasOwn(dependencies, "tarProvisionRegistry")) {
-		return dependencies.tarProvisionRegistry;
-	}
-	if (Object.hasOwn(dependencies, "tarProvisionManifest")) {
-		return dependencies.tarProvisionManifest;
-	}
-	// The shipped manifest is the recorded Task 1.3 measurement, one file per
-	// provider verdict with the evidence that produced it. Before 2026-08-14
-	// there was nothing to point at and the preflight rejected every provider
-	// with `tar_provisionability_unverified`; an operator who re-measures
-	// against a different image still overrides it by env or dependency.
-	const manifestPath =
-		dependencies.tarProvisionManifestPath ??
-		process.env.SWITCHYARD_MACOS_TAR_PROVISION_MANIFEST ??
-		DEFAULT_TAR_PROVISION_MANIFEST_PATH;
-	try {
-		return JSON.parse(readFileSync(resolve(manifestPath), "utf8"));
-	} catch {
-		return null;
-	}
-}
-
 function formatQueuePreflightFailure(result) {
 	const details = (result.rejections ?? []).map((rejection) => {
 		const capability = rejection.capability ?? "unknown";
@@ -4954,19 +4934,64 @@ function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
 	if (selectedPlatform !== "macos") return () => ({ ok: true, eligible: true });
 
 	const adapters = dependencies.adapters ?? DEFAULT_ADAPTERS;
-	const tarProvisionRegistry = loadTarProvisionRegistry(dependencies);
 	return (input = {}) => {
 		const result = preflightMacosQueue({
 			...input,
 			platform: selectedPlatform,
 			availableProviders: Object.keys(adapters),
-			tarProvisionRegistry,
+			...(Object.hasOwn(dependencies, "goldenImageVerifiedProviders")
+				? {
+						goldenImageVerifiedProviders:
+							dependencies.goldenImageVerifiedProviders,
+					}
+				: {}),
 			...(dependencies.preflightReadSnapshot
 				? { readSnapshot: dependencies.preflightReadSnapshot }
 				: {}),
 		});
 		if (!result.ok) throw new Error(formatQueuePreflightFailure(result));
 		return result;
+	};
+}
+
+/**
+ * Adapt the Parallels lifecycle's low-level Aqua callbacks to the runner's
+ * status contract. The backend deliberately reports its own `type` field so
+ * it can be used outside the runner; queue callers receive the established
+ * `{phase, event, status}` shape instead.
+ *
+ * @param {Function|null|undefined} onStatus runner status callback
+ * @returns {Function|undefined} backend lifecycle callback
+ */
+function createQueueBootstrapStatusEmitter(onStatus) {
+	if (typeof onStatus !== "function") return undefined;
+	return (event) => {
+		if (event?.type === "aqua-wait") {
+			onStatus({
+				phase: "bootstrap",
+				event: "aqua_wait",
+				status: "Waiting for Aqua session to become ready",
+				...(event.uuid !== undefined ? { uuid: event.uuid } : {}),
+				...(event.domain !== undefined ? { domain: event.domain } : {}),
+				...(event.elapsedMs !== undefined
+					? { elapsedMs: event.elapsedMs }
+					: {}),
+			});
+			return;
+		}
+		if (event?.type === "aqua-ready") {
+			onStatus({
+				phase: "bootstrap",
+				event: "aqua_ready",
+				status: "Aqua session ready",
+				...(event.uuid !== undefined ? { uuid: event.uuid } : {}),
+				...(event.domain !== undefined ? { domain: event.domain } : {}),
+			});
+			return;
+		}
+		// Preserve any future backend lifecycle events rather than dropping
+		// visibility when the backend grows its status vocabulary.
+		onStatus(event);
 	};
 }
 
@@ -5015,6 +5040,11 @@ export function createQueueBackend({
 			return {
 				platform: selectedPlatform,
 				...supplied,
+				create: (path, options = {}) =>
+					supplied.create(path, {
+						...options,
+						onStatus: createQueueBootstrapStatusEmitter(options.onStatus),
+					}),
 				ensureAgentContainer: supplied.ensureAgentContainer ?? (() => {}),
 				provision: supplied.provision ?? (() => null),
 				preflight: supplied.preflight ?? configuredQueuePreflight,
@@ -5028,41 +5058,17 @@ export function createQueueBackend({
 		supplied?.executionBackend ??
 		supplied?.backend ??
 		dependencies.executionBackend ??
-		(selectedPlatform === "macos"
-			? new ParallelsExecutionBackend({
-					goldenImage:
-						dependencies.goldenImage ??
-						process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
-					aquaUid:
-						dependencies.aquaUid ?? process.env.SWITCHYARD_PARALLELS_AQUA_UID,
-					providerUser:
-						dependencies.providerUser ??
-						process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
-						"switchyard",
-				})
-			: new DockerExecutionBackend());
-
-	if (selectedPlatform === "docker") {
-		const createFn =
-			dependencies.createWorkingContainer ?? createWorkingContainer;
-		const destroyFn = dependencies.wipeWorkingContainer ?? wipeWorkingContainer;
-		return {
-			platform: selectedPlatform,
-			executionBackend,
-			ensureAgentContainer:
-				dependencies.ensureAgentContainer ?? ensureAgentContainer,
-			create: (path, options = {}) =>
-				createFn(path, undefined, { runId: options.runId }),
-			provision: dependencies.provisionCredentials ?? provisionCredentials,
-			seed: dependencies.seedProject ?? seedProject,
-			commit: dependencies.commitWorkingTree ?? commitWorkingTree,
-			reset: dependencies.resetWorkingTree ?? resetWorkingTree,
-			destroy: destroyFn,
-			preflight: configuredQueuePreflight,
-			acquireSlot: () => null,
-			releaseSlot: () => {},
-		};
-	}
+		new ParallelsExecutionBackend({
+			goldenImage:
+				dependencies.goldenImage ??
+				process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
+			aquaUid:
+				dependencies.aquaUid ?? process.env.SWITCHYARD_PARALLELS_AQUA_UID,
+			providerUser:
+				dependencies.providerUser ??
+				process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
+				"switchyard",
+		});
 
 	const goldenImage =
 		dependencies.goldenImage ?? process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE;
@@ -5075,9 +5081,6 @@ export function createQueueBackend({
 	return {
 		platform: selectedPlatform,
 		executionBackend,
-		// The VM lane does not start the Docker agent container; the standing
-		// vault is only read from, over `docker cp`, when credentials are moved
-		// into the guest.
 		ensureAgentContainer: () => {},
 		create: (_path, options = {}) => {
 			if (!goldenImage) {
@@ -5085,10 +5088,16 @@ export function createQueueBackend({
 					"macos queue requires SWITCHYARD_PARALLELS_GOLDEN_IMAGE",
 				);
 			}
+			if (!/^\d+$/u.test(String(aquaUid ?? "")) || Number(aquaUid) <= 0) {
+				throw new Error(
+					"macos queue requires SWITCHYARD_PARALLELS_AQUA_UID to be a positive numeric uid",
+				);
+			}
 			return executionBackend.create(goldenImage, {
 				runId: options.runId ?? runId,
 				aquaUid,
 				providerUser,
+				onStatus: createQueueBootstrapStatusEmitter(options.onStatus),
 				// Linked-clone measurement/admission is owned by its later task.
 				linked: !!dependencies.linkedCloneMeasurement,
 				...(dependencies.linkedCloneMeasurement
@@ -5096,33 +5105,45 @@ export function createQueueBackend({
 					: {}),
 			});
 		},
-		// Routing has not picked a provider at workspace-creation time, so every
-		// tar-provisionable provider is seeded and each adapter's own auth check
-		// decides at exec — the same contract the Docker lane has always had.
-		// This was `() => null` until 2026-08-14, which meant the guest booted
-		// with no credentials at all and every provider failed authentication.
-		provision:
-			dependencies.provisionCredentials ??
-			((workspaceId) =>
-				provisionAllCredentialsWithBackend(executionBackend, workspaceId, {
-					aquaUid,
-					providerUser,
-					...(dependencies.agentContainerName
-						? { agentContainerName: dependencies.agentContainerName }
-						: {}),
-					// The vault read is a seam so the wiring can be tested without a
-					// standing Docker container, and so nothing pulls real credential
-					// bytes into a unit-test process.
-					...(dependencies.readCredentialTar
-						? { readCredentialTar: dependencies.readCredentialTar }
-						: {}),
-					onSkip: ({ provider, reason }) =>
-						console.error(
-							`macos queue: ${provider} credentials not provisioned, tasks routed to it will fail authentication: ${reason}`,
-						),
-				})),
+		// Provider auth is baked into the golden image and survives cloning
+		// (verified for codex — see TASKS.md's clone-survival test), so there is
+		// no runtime credential-provisioning step; each adapter's own auth
+		// check decides at exec time.
+		provision: dependencies.provisionCredentials ?? (() => null),
 		seed: (workspaceId, path) =>
 			seedProjectWithBackend(executionBackend, workspaceId, path),
+		afterCreate: (workspaceId, path, options = {}) =>
+			runWorkspaceLifecycleHook(
+				executionBackend,
+				workspaceId,
+				loadWorkspaceLifecycleHooks(path),
+				"after_create",
+				options,
+			),
+		beforeRun: (workspaceId, path, options = {}) =>
+			runWorkspaceLifecycleHook(
+				executionBackend,
+				workspaceId,
+				loadWorkspaceLifecycleHooks(path),
+				"before_run",
+				options,
+			),
+		afterRun: (workspaceId, path, options = {}) =>
+			runWorkspaceLifecycleHook(
+				executionBackend,
+				workspaceId,
+				loadWorkspaceLifecycleHooks(path),
+				"after_run",
+				options,
+			),
+		beforeRemove: (workspaceId, path, options = {}) =>
+			runWorkspaceLifecycleHook(
+				executionBackend,
+				workspaceId,
+				loadWorkspaceLifecycleHooks(path),
+				"before_remove",
+				options,
+			),
 		commit: (workspaceId) =>
 			runBackendGitCommand(
 				executionBackend,
@@ -5376,10 +5397,14 @@ export function runQueue(options) {
 	try {
 		if (!workingContainerName) {
 			queueBackend.ensureAgentContainer();
-			// Pass runId so the working container carries the managed + run_id
-			// labels (createWorkingContainer's labeled branch). Without this the
-			// container is unlabeled and invisible to `recover` — the core leak.
-			workingContainerName = queueBackend.create(projectPath, { runId });
+			// Pass runId so the cloned VM's name embeds it (see
+			// buildParallelsWorkingName) — that embedding is the only ownership
+			// record `recover`/reclaim has, so a missing runId here is invisible
+			// to leak reclamation.
+			workingContainerName = queueBackend.create(projectPath, {
+				runId,
+				onStatus: emitStatus,
+			});
 			if (!workingContainerName) {
 				throw new Error("runQueue: failed to create working container");
 			}
@@ -5412,6 +5437,13 @@ export function runQueue(options) {
 	} catch (error) {
 		if (ownsWorkingContainer && workingContainerName) {
 			try {
+				try {
+					queueBackend.beforeRemove?.(workingContainerName, projectPath);
+				} catch (hookError) {
+					console.error(
+						`runQueue: before_remove hook failed: ${hookError.message}`,
+					);
+				}
 				queueBackend.destroy(workingContainerName);
 			} catch {
 				// Preserve the bootstrap error.
@@ -5501,6 +5533,9 @@ export function runQueue(options) {
 		if (ownsWorkingContainer) {
 			try {
 				queueBackend.seed(workingContainerName, projectPath);
+				queueBackend.afterCreate?.(workingContainerName, projectPath, {
+					onStatus: emitStatus,
+				});
 			} catch (error) {
 				if (emitStatus) {
 					emitStatus({
@@ -6064,6 +6099,13 @@ export function runQueue(options) {
 					});
 				}
 				try {
+					try {
+						queueBackend.beforeRemove?.(workingContainerName, projectPath);
+					} catch (hookError) {
+						console.error(
+							`runQueue: before_remove hook failed: ${hookError.message}`,
+						);
+					}
 					queueBackend.destroy(workingContainerName);
 					if (emitStatus) {
 						emitStatus({
@@ -6172,7 +6214,10 @@ export async function runQueueWithOrchestrator(options) {
 		if (!workingContainerName) {
 			queueBackend.ensureAgentContainer();
 			// Pass runId so the container is labeled managed + run_id (see runQueue).
-			workingContainerName = queueBackend.create(projectPath, { runId });
+			workingContainerName = queueBackend.create(projectPath, {
+				runId,
+				onStatus: emitStatus,
+			});
 			if (!workingContainerName) {
 				throw new Error(
 					"runQueueWithOrchestrator: failed to create working container",
@@ -6203,6 +6248,13 @@ export async function runQueueWithOrchestrator(options) {
 	} catch (error) {
 		if (ownsWorkingContainer && workingContainerName) {
 			try {
+				try {
+					queueBackend.beforeRemove?.(workingContainerName, projectPath);
+				} catch (hookError) {
+					console.error(
+						`runQueueWithOrchestrator: before_remove hook failed: ${hookError.message}`,
+					);
+				}
 				queueBackend.destroy(workingContainerName);
 			} catch {
 				// Preserve the bootstrap error.
@@ -6253,6 +6305,9 @@ export async function runQueueWithOrchestrator(options) {
 		if (ownsWorkingContainer) {
 			try {
 				queueBackend.seed(workingContainerName, projectPath);
+				queueBackend.afterCreate?.(workingContainerName, projectPath, {
+					onStatus: emitStatus,
+				});
 			} catch (error) {
 				if (emitStatus) {
 					emitStatus({
@@ -6506,6 +6561,13 @@ export async function runQueueWithOrchestrator(options) {
 					});
 				}
 				try {
+					try {
+						queueBackend.beforeRemove?.(workingContainerName, projectPath);
+					} catch (hookError) {
+						console.error(
+							`runQueueWithOrchestrator: before_remove hook failed: ${hookError.message}`,
+						);
+					}
 					queueBackend.destroy(workingContainerName);
 					if (emitStatus) {
 						emitStatus({

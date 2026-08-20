@@ -22,6 +22,18 @@ function hasDocker() {
 }
 
 const dockerAvailable = hasDocker();
+
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
 const CODEX_SHAPE_DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "codex-shape-target",
@@ -149,6 +161,7 @@ describe("codex adapter invocation shape (real container)", () => {
 				descriptorHarness: "codex",
 				invocationDescriptor: CODEX_SHAPE_DESCRIPTOR,
 				descriptorIdentity: CODEX_SHAPE_DESCRIPTOR.descriptor_identity,
+				executionBackend: dockerExecutionBackend,
 			});
 			strictEqual(result.success, true, result.error);
 			ok(

@@ -19,6 +19,18 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-codex-adapter-"));
 const containerName = `switchyard-codex-adapter-${Date.now()}`;
+
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
 const CODEX_DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "codex-target",
@@ -113,10 +125,13 @@ describe("codex adapter container execution", () => {
 			descriptorHarness: "codex",
 			invocationDescriptor: CODEX_DESCRIPTOR,
 			descriptorIdentity: CODEX_DESCRIPTOR.descriptor_identity,
+			executionBackend: dockerExecutionBackend,
 		});
 		strictEqual(result.success, true);
 
-		const diff = captureDiff(containerName);
+		const diff = captureDiff(containerName, {
+			executionBackend: dockerExecutionBackend,
+		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});

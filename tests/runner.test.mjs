@@ -32,6 +32,7 @@ import { route as realRoute } from "../src/switchyard/router/index.mjs";
 import {
 	createCliOrchestrator,
 	createEmptyCheckpoint,
+	createQueueBackend,
 	createQueueIdentity,
 	deriveQueueDiagnostics,
 	executeTask as executeTaskImpl,
@@ -68,6 +69,105 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
+
+describe("macOS queue admission", () => {
+	it("rejects a missing Aqua UID before cloning", () => {
+		let creates = 0;
+		const backend = createQueueBackend({
+			dependencies: {
+				goldenImage: "fixture-golden",
+				aquaUid: "",
+				executionBackend: {
+					create() {
+						creates += 1;
+					},
+				},
+			},
+		});
+		throws(() => backend.create("/fixture"), /SWITCHYARD_PARALLELS_AQUA_UID/);
+		strictEqual(creates, 0);
+	});
+
+	it("surfaces Aqua wait and ready status for every queue create path", async () => {
+		const entrypoints = [
+			["sync", runQueue],
+			["async", runQueueAsync],
+			["orchestrator", runQueueWithOrchestrator],
+		];
+
+		for (const [name, entrypoint] of entrypoints) {
+			const root = join(TEST_DIR, `aqua-status-${name}`);
+			mkdirSync(root, { recursive: true });
+			const tasksPath = join(root, "TASKS.md");
+			const checkpointPath = join(root, "checkpoint.json");
+			writeFileSync(
+				tasksPath,
+				withExplicitSwitchyardExecutor(
+					"### Task 1.1: Bootstrap only\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** no task execution\n",
+				),
+			);
+			const events = [];
+			const backendFactory = () => ({
+				create(_path, { onStatus }) {
+					onStatus({
+						type: "aqua-wait",
+						uuid: "vm-uuid",
+						domain: "gui/501",
+						elapsedMs: 250,
+					});
+					onStatus({
+						type: "aqua-ready",
+						uuid: "vm-uuid",
+						domain: "gui/501",
+					});
+					return `${name}-container`;
+				},
+				destroy: () => {},
+				seed: () => {},
+				commit: () => {},
+				reset: () => {},
+			});
+
+			const result = entrypoint({
+				tasksFilePath: tasksPath,
+				projectPath: root,
+				checkpointPath,
+				maxTasks: 0,
+				dependencies: {
+					backendFactory,
+					onStatus: (event) => events.push(event),
+					orchestrator: {
+						launch: async () => "job",
+						status: async () => ({ state: "done" }),
+						result: async () => ({ success: true, diff: null }),
+					},
+				},
+			});
+			await result;
+
+			deepStrictEqual(
+				events
+					.filter(
+						({ event }) => event === "aqua_wait" || event === "aqua_ready",
+					)
+					.map(({ phase, event, status }) => ({ phase, event, status })),
+				[
+					{
+						phase: "bootstrap",
+						event: "aqua_wait",
+						status: "Waiting for Aqua session to become ready",
+					},
+					{
+						phase: "bootstrap",
+						event: "aqua_ready",
+						status: "Aqua session ready",
+					},
+				],
+				`${name} queue path must surface Aqua lifecycle status`,
+			);
+		}
+	});
+});
 
 function writeDispatchQualifiedRosterFixture() {
 	const roster = JSON.parse(readFileSync(ROSTER_FIXTURE_PATH, "utf8"));
@@ -530,6 +630,33 @@ async function executeTaskWithOrchestrator(task, context) {
 	);
 }
 
+// Legacy per-method container-lifecycle stubs (ensureAgentContainer,
+// createWorkingContainer, provisionCredentials, seedProject,
+// commitWorkingTree, resetWorkingTree, wipeWorkingContainer) predate
+// createQueueBackend's dependencies.backendFactory seam and are no longer
+// read directly by production code -- only a backendFactory returning a
+// full {create, destroy, seed, commit, reset, ...} object is honored (see
+// runner/index.mjs's createQueueBackend, which falls through to the real
+// ParallelsExecutionBackend when no backendFactory -- or an incomplete one
+// -- is supplied). Synthesize a backendFactory from these flat keys here so
+// the dozens of tests written against the old shape keep exercising the
+// same stub behavior without a per-test rewrite. Call signatures mirror the
+// real production call sites exactly: create(projectPath, {runId}),
+// provision(name), seed(name, projectPath), commit(name), reset(name),
+// destroy(name), ensureAgentContainer().
+function legacyBackendFactory(dependencies) {
+	return () => ({
+		executionBackend: dependencies.executionBackend,
+		ensureAgentContainer: dependencies.ensureAgentContainer ?? (() => {}),
+		create: dependencies.createWorkingContainer ?? (() => "test-container"),
+		provision: dependencies.provisionCredentials ?? (() => null),
+		seed: dependencies.seedProject ?? (() => {}),
+		commit: dependencies.commitWorkingTree ?? (() => {}),
+		reset: dependencies.resetWorkingTree ?? (() => {}),
+		destroy: dependencies.wipeWorkingContainer ?? (() => {}),
+	});
+}
+
 function withTestDescriptorOptions(options) {
 	const dependencies = options.dependencies ?? {};
 	const context = withTestDescriptorContext({
@@ -556,11 +683,26 @@ function withTestDescriptorOptions(options) {
 			: undefined);
 	return {
 		...options,
-		platform: options.platform ?? "docker",
+		platform: options.platform ?? "macos",
 		dependencies: {
 			...dependencies,
 			route: context.route,
 			resolveDescriptor: context.resolveDescriptor,
+			// macOS/Parallels is the sole execution backend now, so every
+			// runQueue* call through this helper runs the real provider
+			// preflight gate unless a test overrides it. The overwhelming
+			// majority of these tests exercise dispatch/retry/ledger/
+			// orchestration logic downstream of admission, not the gate
+			// itself (that's covered directly in the "Task 6.1"/"Task 6.3"
+			// describe blocks below, which call runQueueImpl or
+			// preflightMacosQueue directly and so never pass through this
+			// helper) -- so default preflight to a no-op here and let a
+			// test that actually wants real gate behavior override
+			// dependencies.queuePreflight explicitly.
+			queuePreflight:
+				dependencies.queuePreflight ?? (() => ({ ok: true, eligible: true })),
+			backendFactory:
+				dependencies.backendFactory ?? legacyBackendFactory(dependencies),
 			...(testIdentityResolver
 				? { resolveTargetIdentity: testIdentityResolver }
 				: {}),
@@ -3867,19 +4009,33 @@ runQueue({
   tasksFilePath,
   projectPath,
   checkpointPath,
-  platform: "docker",
+  platform: "macos",
+  // isQuotaRetryCandidate (runner/index.mjs) only treats a quota_exhausted
+  // failure as retryable when ownsWorkingContainer is true, which the queue
+  // only sets when IT creates the working container itself -- a caller-
+  // supplied workingContainerName skips that bootstrap block entirely and
+  // silently disables retry/quarantine. So this crash-recovery test needs a
+  // synthetic backendFactory (not a workingContainerName shortcut) to let
+  // the queue own the container while still avoiding any real VM lifecycle.
   dependencies: {
     route,
     resolveDescriptor: () => latestDescriptor,
     recordDispatch: () => {},
     integrationGate: () => ({ success: true }),
-    ensureAgentContainer: () => {},
-    createWorkingContainer: () => "child-owned-retry-container",
-    provisionCredentials: () => {},
-    seedProject: () => {},
-    commitWorkingTree: () => {},
-    resetWorkingTree: () => {},
-    wipeWorkingContainer: () => {},
+    // No real routing snapshot exists in this child process's cwd; the
+    // default macOS preflight gate is irrelevant to what this test proves,
+    // so bypass it the same way tests/runner.test.mjs's shared runQueue
+    // wrapper does for the rest of this file.
+    queuePreflight: () => ({ ok: true, eligible: true }),
+    backendFactory: () => ({
+      ensureAgentContainer: () => {},
+      create: () => "child-owned-retry-container",
+      provision: () => {},
+      seed: () => {},
+      commit: () => {},
+      reset: () => {},
+      destroy: () => {},
+    }),
     onRetryStateChanged: ({ retryTransitionId }) => {
       if (retryTransitionId === Number(process.env.CRASH_AT)) process.exit(73);
     },
@@ -4913,7 +5069,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 						},
 					},
 				}),
-			/runOptions\.platform must be one of docker, macos/,
+			/runOptions\.platform must be one of macos/,
 		);
 		deepStrictEqual(events, []);
 	});
@@ -4948,15 +5104,18 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 							destroy: () => {},
 							acquireSlot: () => events.push("acquire"),
 						}),
-						adapters: { codex: {} },
-						tarProvisionRegistry: { verified: true, providers: ["opencode"] },
+						// "claude" has quota and meets the "high" capability bar, but
+						// the default GOLDEN_IMAGE_VERIFIED_PROVIDERS allowlist is
+						// codex-only, so the default preflight must still fail closed
+						// on it (mirrors tests/router.test.mjs's equivalent case).
+						adapters: { claude: {} },
 						preflightReadSnapshot: () => ({
 							snapshot: {
 								schema_version: 2,
 								updated_at: new Date().toISOString(),
 								providers: [
 									{
-										name: "codex",
+										name: "claude",
 										ok: true,
 										windows: [{ percent_left: 80, pace_delta: 1 }],
 									},
@@ -4968,7 +5127,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 						}),
 					},
 				}),
-			/high: no_tar_provisionable_provider_with_quota_headroom.*codex/,
+			/high: no_golden_image_verified_provider_with_quota_headroom.*claude/,
 		);
 		deepStrictEqual(events, []);
 	});

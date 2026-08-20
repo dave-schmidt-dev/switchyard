@@ -2,11 +2,12 @@
 //
 // Verifies the launchd reaper artifacts (ops/switchyard-reaper.sh, the plist
 // template, install/uninstall scripts) are present, syntactically valid, render
-// a well-formed plist, and — critically — that the reaper's hardcoded Docker
-// label strings stay in sync with the source of truth in lifecycle/index.mjs.
-// The reaper duplicates those labels by necessity (it is a standalone shell
-// script that reads no project code so it can run TCC-free from ~/Library); this
-// parity test is what stops a rename there from silently disabling reaping.
+// a well-formed plist, and — critically — that the reaper's hardcoded VM-name
+// prefix stays in sync with the source of truth in
+// parallels-execution-backend.mjs. The reaper duplicates that prefix by
+// necessity (it is a standalone shell script that reads no project code so it
+// can run TCC-free from ~/Library); this parity test is what stops a rename
+// there from silently disabling reaping.
 //
 // Deliberately does NOT run the reaper against the live daemon: that path reaps
 // by PID liveness and could remove a sibling test file's fixtures under Node's
@@ -23,7 +24,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
 const OPS = resolve(PKG_ROOT, "ops");
-const LIFECYCLE = resolve(PKG_ROOT, "src/switchyard/lifecycle/index.mjs");
+const BACKEND = resolve(
+	PKG_ROOT,
+	"src/switchyard/lifecycle/parallels-execution-backend.mjs",
+);
 
 const REAPER = resolve(OPS, "switchyard-reaper.sh");
 const SCRIPTS = [REAPER].concat(
@@ -46,7 +50,7 @@ describe("standalone reaper ops artifacts", () => {
 		}
 	});
 
-	it("the reaper reads Docker labels only — never invokes node/project code", () => {
+	it("the reaper reads managed VM names only — never invokes node/project code", () => {
 		const body = readFileSync(REAPER, "utf8");
 		// The load-bearing TCC guarantee: with no node invocation the reaper
 		// physically cannot execute project .mjs, so it needs nothing from the
@@ -55,42 +59,28 @@ describe("standalone reaper ops artifacts", () => {
 		// assert on the *absence of an interpreter*, not on path mentions.)
 		ok(!/\bnode\b/.test(body), "reaper must not invoke node");
 		ok(!/\bpython3?\b/.test(body), "reaper must not invoke python");
-		// It must actually do the label-based reap.
-		ok(/docker\s+ps\s+-aq/.test(body), "reaper must list managed containers");
+		// It must actually do the name-based reap.
+		ok(/prlctl list\s+-a/.test(body), "reaper must list managed VMs");
 		ok(/kill -0/.test(body), "reaper must probe owner liveness via kill -0");
-		ok(
-			/docker rm -f -v/.test(body),
-			"reaper must force-remove dead containers",
-		);
+		ok(/prlctl delete/.test(body), "reaper must force-remove dead VMs");
 	});
 
-	it("reaper label strings stay in sync with lifecycle/index.mjs (parity guard)", () => {
+	it("reaper VM-name prefix stays in sync with parallels-execution-backend.mjs (parity guard)", () => {
 		const reaper = readFileSync(REAPER, "utf8");
-		const lifecycle = readFileSync(LIFECYCLE, "utf8");
+		const backend = readFileSync(BACKEND, "utf8");
 
-		// Source of truth in lifecycle: LABEL_MANAGED includes "=true"; strip it
-		// to the bare key. LABEL_WORKER_PID is already the bare key.
-		const srcManaged = /LABEL_MANAGED\s*=\s*"([^"]+)"/
-			.exec(lifecycle)?.[1]
-			?.replace(/=true$/, "");
-		const srcPid = /LABEL_WORKER_PID\s*=\s*"([^"]+)"/.exec(lifecycle)?.[1];
-		ok(srcManaged, "could not read LABEL_MANAGED from lifecycle");
-		ok(srcPid, "could not read LABEL_WORKER_PID from lifecycle");
+		const srcPrefix = /PARALLELS_WORKING_PREFIX\s*=\s*"([^"]+)"/.exec(
+			backend,
+		)?.[1];
+		ok(srcPrefix, "could not read PARALLELS_WORKING_PREFIX from backend");
 
-		const reaperManaged = /MANAGED_LABEL="([^"]+)"/.exec(reaper)?.[1];
-		const reaperPid = /PID_LABEL="([^"]+)"/.exec(reaper)?.[1];
-		ok(reaperManaged, "could not read MANAGED_LABEL from reaper");
-		ok(reaperPid, "could not read PID_LABEL from reaper");
+		const reaperPrefix = /WORKING_PREFIX="([^"]+)"/.exec(reaper)?.[1];
+		ok(reaperPrefix, "could not read WORKING_PREFIX from reaper");
 
 		strictEqual(
-			reaperManaged,
-			srcManaged,
-			"reaper MANAGED_LABEL drifted from lifecycle LABEL_MANAGED",
-		);
-		strictEqual(
-			reaperPid,
-			srcPid,
-			"reaper PID_LABEL drifted from lifecycle LABEL_WORKER_PID",
+			reaperPrefix,
+			srcPrefix,
+			"reaper WORKING_PREFIX drifted from backend PARALLELS_WORKING_PREFIX",
 		);
 	});
 

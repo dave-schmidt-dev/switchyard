@@ -5,8 +5,9 @@
 # The reaper is COPIED out of the project (which lives under the TCC-protected
 # ~/Documents) into ~/Library/Application Support/switchyard/, because a
 # background launchd agent cannot read files under ~/Documents without a Full
-# Disk Access grant. The reaper reads only Docker labels, so it needs nothing
-# from the project tree at runtime — the copy is fully self-sufficient.
+# Disk Access grant. The reaper reads only managed VM names via prlctl, so it
+# needs nothing from the project tree at runtime — the copy is fully
+# self-sufficient.
 set -eu
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)

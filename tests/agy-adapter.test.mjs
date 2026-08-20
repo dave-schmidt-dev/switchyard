@@ -28,6 +28,20 @@ const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-agy-adapter-"));
 const containerName = `switchyard-agy-adapter-${Date.now()}`;
 
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests. This fixture
+// reproduces that Docker-exec transport for the real container this file
+// spins up in before().
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
+
 const AGY_MODEL = "Gemini 3.6 Flash (Medium)";
 const AGY_PROMPT = "apply a small change";
 const AGY_DESCRIPTOR = validateInvocationDescriptor(
@@ -143,10 +157,13 @@ describe("agy adapter container execution", () => {
 			descriptorHarness: "agy",
 			invocationDescriptor: AGY_DESCRIPTOR,
 			descriptorIdentity: AGY_DESCRIPTOR.descriptor_identity,
+			executionBackend: dockerExecutionBackend,
 		});
 		strictEqual(result.success, true, result.error);
 
-		const diff = captureDiff(containerName);
+		const diff = captureDiff(containerName, {
+			executionBackend: dockerExecutionBackend,
+		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});

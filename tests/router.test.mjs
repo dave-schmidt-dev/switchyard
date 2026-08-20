@@ -1002,17 +1002,19 @@ describe("Task 6.1 queue-level platform selection", () => {
 	});
 
 	it("wires the default macOS preflight into the queue backend", () => {
+		// "claude" has quota and meets the "high" capability bar, but the
+		// default GOLDEN_IMAGE_VERIFIED_PROVIDERS allowlist is codex-only, so
+		// the default wiring (no override) must still fail closed on it.
 		const helper = createQueueBackend({
 			platform: "macos",
 			dependencies: {
-				tarProvisionRegistry: { verified: true, providers: ["opencode"] },
 				preflightReadSnapshot: () => ({
 					snapshot: {
 						schema_version: 2,
 						updated_at: new Date().toISOString(),
 						providers: [
 							{
-								name: "codex",
+								name: "claude",
 								ok: true,
 								windows: [{ percent_left: 80, pace_delta: 1 }],
 							},
@@ -1030,7 +1032,7 @@ describe("Task 6.1 queue-level platform selection", () => {
 				helper.preflight({
 					tasks: [{ status: "pending", requiredCapability: "high" }],
 				}),
-			/high: no_tar_provisionable_provider_with_quota_headroom.*codex/,
+			/high: no_golden_image_verified_provider_with_quota_headroom.*claude/,
 		);
 	});
 });
@@ -1068,7 +1070,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 				{ id: "blocked-high", status: "blocked", requiredCapability: "high" },
 				{ id: "done-high", status: "done", requiredCapability: "high" },
 			],
-			tarProvisionManifest: { verified: true, providers: ["codex"] },
+			goldenImageVerifiedProviders: ["codex"],
 			readSnapshot: freshSnapshotReader(
 				snapshotFor({
 					name: "codex",
@@ -1090,7 +1092,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 			tasks: [
 				{ id: "blocked-high", status: "blocked", requiredCapability: "high" },
 			],
-			tarProvisionRegistry: { verified: true, providers: ["opencode"] },
+			goldenImageVerifiedProviders: ["opencode"],
 			readSnapshot: freshSnapshotReader(
 				snapshotFor({
 					name: "OpenCode Go",
@@ -1105,7 +1107,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 		deepStrictEqual(result.rejection, {
 			capability: "high",
 			excludedProviders: ["OpenCode Go"],
-			reason: "no_tar_provisionable_provider_with_quota_headroom",
+			reason: "no_golden_image_verified_provider_with_quota_headroom",
 		});
 		strictEqual(
 			result.capabilityResults[0].excludedReasons["OpenCode Go"],
@@ -1124,7 +1126,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 				},
 				{ id: "pending-high", status: "pending", requiredCapability: "high" },
 			],
-			tarProvisionRegistry: { verified: true, providers: ["agy"] },
+			goldenImageVerifiedProviders: ["agy"],
 			readSnapshot: freshSnapshotReader(
 				snapshotFor({
 					name: "agy",
@@ -1144,12 +1146,12 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 			{
 				capability: "high",
 				excludedProviders: ["agy"],
-				reason: "no_tar_provisionable_provider_with_quota_headroom",
+				reason: "no_golden_image_verified_provider_with_quota_headroom",
 			},
 		]);
 	});
 
-	it("fails closed for an absent or unverified tar manifest and respects only/exclude and adapters", () => {
+	it("fails closed when only/exclude/availableProviders leave no eligible provider", () => {
 		const calls = [];
 		const result = preflightMacosQueue({
 			tasks: [
@@ -1179,23 +1181,33 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 		strictEqual(result.eligible, false);
 		strictEqual(result.rejection.capability, "standard");
 		deepStrictEqual(result.rejection.excludedProviders, ["codex", "claude"]);
-		strictEqual(result.rejection.reason, "tar_provisionability_unverified");
+		strictEqual(
+			result.rejection.reason,
+			"no_golden_image_verified_provider_with_quota_headroom",
+		);
 	});
 
-	it("leaves Docker as an explicit no-op without reading the snapshot", () => {
+	it("fails closed on a non-macos platform without reading the snapshot", () => {
+		// macOS/Parallels is the sole execution backend now; there is no
+		// alternate platform lane with its own preflight no-op. An
+		// unrecognized platform value must fail closed rather than read
+		// routing state that was never scoped to it.
 		let reads = 0;
 		const result = preflightMacosQueue({
 			platform: "docker",
 			tasks: [{ status: "pending", requiredCapability: "high" }],
 			readSnapshot: () => {
 				reads += 1;
-				throw new Error("Docker preflight must not read the macOS snapshot");
+				throw new Error(
+					"preflight for a non-macos platform must not read the macOS snapshot",
+				);
 			},
 		});
 
 		strictEqual(reads, 0);
-		strictEqual(result.eligible, true);
-		strictEqual(result.reason, "docker_unchanged");
+		strictEqual(result.eligible, false);
+		strictEqual(result.ok, false);
+		strictEqual(result.reason, "invalid_platform");
 	});
 
 	it("allows a terminal-only macOS queue without snapshot or manifest evidence", () => {

@@ -23,6 +23,18 @@ function hasDocker() {
 const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-opencode-adapter-"));
 const containerName = `switchyard-opencode-adapter-${Date.now()}`;
+
+// getWorkspaceExecution (provider-lifecycle.mjs) now requires an
+// executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
+// used to fill this in for real-container integration tests.
+const dockerExecutionBackend = {
+	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+		return {
+			command: "docker",
+			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
+		};
+	},
+};
 const PROMPT_MARKER = "switchyard-prompt-marker";
 const OPENCODE_DESCRIPTOR = validateInvocationDescriptor(
 	{
@@ -60,6 +72,51 @@ describe("opencode adapter container execution", () => {
 		ok(OPENCODE_SUPERVISOR.includes("ps -o state= -p"));
 		ok(OPENCODE_SUPERVISOR.includes("Z*)"));
 		ok(OPENCODE_SUPERVISOR.includes("pgrep -x"));
+	});
+
+	it("hands approved API-key models to the backend's fixed bridge over stdin", () => {
+		let request = null;
+		const bridgeBackend = {
+			ephemeralOpenCodeKeyExecution(workspaceId, candidate) {
+				request = { workspaceId, ...candidate };
+				return {
+					command: process.execPath,
+					args: [
+						"-e",
+						'const input = JSON.parse(require("node:fs").readFileSync(0, "utf8")); if (input.bridge !== "fixed") process.exit(9); process.stdout.write("bridge-ran")',
+					],
+					input: JSON.stringify({ bridge: "fixed" }),
+				};
+			},
+		};
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "opencode-go",
+				model_ref: "opencode-go/mimo-v2.5",
+				selector: "opencode-go/mimo-v2.5",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"opencode",
+		);
+		const result = executeOpencode(
+			"bridge prompt",
+			"22222222-2222-4222-8222-222222222222",
+			{
+				model: descriptor.selector,
+				resolvedTargetId: descriptor.target_id,
+				descriptorHarness: "opencode",
+				invocationDescriptor: descriptor,
+				descriptorIdentity: descriptor.descriptor_identity,
+				executionBackend: bridgeBackend,
+			},
+		);
+		strictEqual(result.success, true);
+		strictEqual(result.output, "bridge-ran");
+		strictEqual(request.workspaceId, "22222222-2222-4222-8222-222222222222");
+		strictEqual(request.model, "opencode-go/mimo-v2.5");
+		ok(request.prompt.includes("bridge prompt"));
 	});
 
 	before(() => {
@@ -110,10 +167,13 @@ describe("opencode adapter container execution", () => {
 			descriptorHarness: "opencode",
 			invocationDescriptor: OPENCODE_DESCRIPTOR,
 			descriptorIdentity: OPENCODE_DESCRIPTOR.descriptor_identity,
+			executionBackend: dockerExecutionBackend,
 		});
 		strictEqual(result.success, true);
 
-		const diff = captureDiff(containerName);
+		const diff = captureDiff(containerName, {
+			executionBackend: dockerExecutionBackend,
+		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
 	});

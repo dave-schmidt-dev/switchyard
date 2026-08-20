@@ -367,6 +367,14 @@ elif [[ -x /usr/local/bin/brew ]]; then
 else
   guest_fail "Homebrew is required in the Task 1.1 base VM"
 fi
+# Homebrew is intentionally operated by the interactive administrator, not the
+# root provisioning channel.  A failed earlier repair can leave its prefix
+# root-owned (notably after removing a broken Cellar formula); restore the
+# expected ownership before asking brew to install or repair anything.
+if [[ "\$(/usr/bin/stat -f%Su "\$brew_path")" != "\$console_user" ]]; then
+  guest_log "restoring Homebrew ownership to the existing administrator build session"
+  /usr/sbin/chown -R "\$console_user:admin" "\$brew_path"
+fi
 if ! /bin/launchctl asuser "\$console_uid" /usr/bin/sudo -iu "\$console_user" \\
   /bin/bash -lc "test -x '\$brew_path/bin/node'"; then
   /usr/sbin/dseditgroup -o checkmember -m "\$console_user" admin 2>/dev/null | /usr/bin/grep -q '^yes' ||

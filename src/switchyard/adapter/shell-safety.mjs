@@ -2,10 +2,10 @@
 // Centralized so a validation fix applied to one adapter can't silently miss
 // its sibling (this file exists because that happened once already).
 
-// Safe identifier pattern: Docker container names passed as a single
-// execFileSync argv element (never shell-interpolated today). Rejects spaces
-// and shell metacharacters as defense-in-depth against a future refactor
-// accidentally reintroducing shell interpolation.
+// Safe identifier pattern: workspace/container-shaped names passed as a
+// single execFileSync argv element (never shell-interpolated today).
+// Rejects spaces and shell metacharacters as defense-in-depth against a
+// future refactor accidentally reintroducing shell interpolation.
 const SAFE_IDENTIFIER_RE = /^[\w./:@-]+$/;
 const SAFE_PARALLELS_UUID_RE =
 	/^\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?$/i;
@@ -113,11 +113,12 @@ export function validateInvocationArgs(args, harness) {
 }
 
 /**
- * Validate that a string is a safe workspace identifier. Docker names use
- * SAFE_IDENTIFIER_RE; Parallels workspaces use an exact UUID, optionally
- * wrapped in the braces returned by prlctl.
- * Throws on invalid input — fail closed so no malformed value reaches Docker,
- * and as defense-in-depth against a future refactor reintroducing a shell.
+ * Validate that a string is a safe workspace identifier. Generic
+ * container/workspace names use SAFE_IDENTIFIER_RE; Parallels workspaces
+ * use an exact UUID, optionally wrapped in the braces returned by prlctl.
+ * Throws on invalid input — fail closed so no malformed value reaches a
+ * subprocess call, and as defense-in-depth against a future refactor
+ * reintroducing a shell.
  * @param {string} value
  * @param {string} label Human-readable name for error messages.
  */

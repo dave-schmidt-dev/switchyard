@@ -3,7 +3,7 @@
 // These spawn real Node subprocesses.
 
 import { ok, rejects, strictEqual } from "node:assert";
-import { execSync, spawnSync } from "node:child_process";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	mkdirSync,
@@ -18,27 +18,7 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { isContainerRuntimeAvailable } from "../src/switchyard/container/index.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
-import {
-	containerExists,
-	createLabeledContainer,
-	createLabeledVolume,
-	removeContainer,
-	removeVolume,
-	volumeExists,
-} from "./helpers/lifecycle-fixture.mjs";
-
-const HAS_DOCKER = isContainerRuntimeAvailable();
-
-if (!HAS_DOCKER) {
-	console.log("Docker not available — skipping detached crash matrix tests");
-}
-
-function describeIf(condition, ...args) {
-	if (condition) return describe(...args);
-	return describe.skip(...args);
-}
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -78,6 +58,73 @@ function runDispatch(args, env = {}) {
 		timeout: 10_000,
 		env: { ...process.env, ...env },
 	});
+}
+
+// Workspace creation on the sole surviving (macOS/Parallels) platform clones
+// and boots a real VM from a golden image — unlike the removed Docker lane,
+// there is no lightweight hermetic fallback. The two "routes end-to-end via
+// launch" tests below need routing to actually happen (not just a run
+// reaching *some* terminal state), so they can't pass in an environment
+// without a configured golden image; gate them the same way the -vm suite
+// files do rather than let them hard-fail when Parallels prerequisites are
+// missing. Runtime under real hardware (clone + boot + route) is unverified
+// here — this dev machine has no golden image configured — so the poll
+// budget below is a conservative guess a Parallels-equipped run should
+// double check.
+const PARALLELS_GOLDEN_IMAGE =
+	process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "macOS";
+const PARALLELS_AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
+const PARALLELS_PROVIDER_USER =
+	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
+
+function commandAvailable(command) {
+	try {
+		execFileSync("/usr/bin/which", [command], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function parallelsGoldenImagePrerequisiteReason() {
+	if (!commandAvailable("prlctl")) return "Parallels prlctl is unavailable";
+	let output;
+	try {
+		output = execFileSync("prlctl", ["list", "-a", "-o", "uuid,status,name"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+	} catch {
+		return "Parallels VM inventory is unavailable";
+	}
+	const golden = output
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.map((line) => line.split(/\s+/))
+		.find(
+			(fields) =>
+				fields.length >= 3 &&
+				fields.slice(2).join(" ") === PARALLELS_GOLDEN_IMAGE,
+		);
+	if (!golden) return `golden image ${PARALLELS_GOLDEN_IMAGE} is unavailable`;
+	if (!/^stopped$/i.test(golden[1])) {
+		return `golden image ${PARALLELS_GOLDEN_IMAGE} is not stopped`;
+	}
+	if (!/^\d+$/.test(PARALLELS_AQUA_UID) || Number(PARALLELS_AQUA_UID) <= 0) {
+		return "Aqua UID is unavailable; set SWITCHYARD_PARALLELS_AQUA_UID";
+	}
+	return null;
+}
+
+const PARALLELS_PREREQUISITE_REASON = parallelsGoldenImagePrerequisiteReason();
+
+function parallelsBackendEnv() {
+	return {
+		SWITCHYARD_PARALLELS_GOLDEN_IMAGE: PARALLELS_GOLDEN_IMAGE,
+		SWITCHYARD_PARALLELS_AQUA_UID: PARALLELS_AQUA_UID,
+		SWITCHYARD_PARALLELS_PROVIDER_USER: PARALLELS_PROVIDER_USER,
+	};
 }
 
 function runBootstrap(args, env = {}) {
@@ -474,7 +521,11 @@ describe("detached descriptor receipt parity", () => {
 });
 
 describe("--exclude-provider on the detached worker path", () => {
-	it("excludes the given provider from routing end-to-end via `launch` (not just the foreground path)", async () => {
+	it("excludes the given provider from routing end-to-end via `launch` (not just the foreground path)", {
+		skip: PARALLELS_PREREQUISITE_REASON
+			? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
+			: false,
+	}, async () => {
 		// The shared `projectDir` fixture (beforeEach) is just an empty `.git`
 		// directory — enough for the other tests in this file, which only care
 		// that the run reaches *some* terminal state, but seedProject's `git
@@ -529,6 +580,7 @@ describe("--exclude-provider on the detached worker path", () => {
 
 		const env = {
 			...makeStateRootEnv(),
+			...parallelsBackendEnv(),
 			SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: snapshotPath,
 		};
 		const runtimeRosterPath = join(dir, "codex-dispatch-roster.json");
@@ -544,7 +596,7 @@ describe("--exclude-provider on the detached worker path", () => {
 				"--exclude-provider",
 				"claude",
 				"--platform",
-				"docker",
+				"macos",
 			],
 			env,
 		);
@@ -562,12 +614,12 @@ describe("--exclude-provider on the detached worker path", () => {
 		let observedDescriptor = null;
 		let observedDescriptorIdentity = null;
 		const start = Date.now();
-		// 60s, not the file's usual 15-20s budget: this test's container has to
-		// build/start from cold before routing is observable, which measured
-		// ~24.9s under sustained Docker load during this plan's own development
-		// (see TASKS.md's Docker-contention item) — comfortably inside 60s but
-		// past a tighter budget shared with lighter-weight tests in this file.
-		const maxWait = 60_000;
+		// A full linked/full clone + boot of the golden image replaces the old
+		// Docker cold-start (~24.9s under sustained load) this budget used to be
+		// tuned for. Unverified against real hardware — no golden image is
+		// configured on this dev machine — so 5 minutes is a conservative guess;
+		// tighten it once measured against a real Parallels clone+boot.
+		const maxWait = 300_000;
 		while (Date.now() - start < maxWait) {
 			const statusResult = pollStatus(runId, env);
 			if (statusResult.status === 0) {
@@ -627,7 +679,11 @@ describe("--exclude-provider on the detached worker path", () => {
 });
 
 describe("--only-provider on the detached worker path", () => {
-	it("restricts routing to the given provider end-to-end via `launch` (not just the foreground path) (Task C.9)", async () => {
+	it("restricts routing to the given provider end-to-end via `launch` (not just the foreground path) (Task C.9)", {
+		skip: PARALLELS_PREREQUISITE_REASON
+			? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
+			: false,
+	}, async () => {
 		// Mirrors the --exclude-provider test above, but proves the allowlist
 		// (not just the denylist) works end-to-end through the real detached
 		// worker path: without --only-provider, claude (90% left) outranks
@@ -674,6 +730,7 @@ describe("--only-provider on the detached worker path", () => {
 
 		const env = {
 			...makeStateRootEnv(),
+			...parallelsBackendEnv(),
 			SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: snapshotPath,
 		};
 		// Automatic routing now requires an exact dispatch-qualified descriptor;
@@ -692,7 +749,7 @@ describe("--only-provider on the detached worker path", () => {
 				"--only-provider",
 				"codex",
 				"--platform",
-				"docker",
+				"macos",
 			],
 			env,
 		);
@@ -705,7 +762,9 @@ describe("--only-provider on the detached worker path", () => {
 
 		let observedProvider = null;
 		const start = Date.now();
-		const maxWait = 60_000;
+		// See the --exclude-provider test's matching comment: unverified against
+		// real hardware, conservative budget for a full clone + boot.
+		const maxWait = 300_000;
 		while (Date.now() - start < maxWait) {
 			const statusResult = pollStatus(runId, env);
 			if (statusResult.status === 0) {
@@ -1380,518 +1439,3 @@ function assertNoSecretCanary(runId) {
 		if (e.code !== "ENOENT") throw e;
 	}
 }
-
-function cleanFixture(name) {
-	removeContainer(name);
-	removeVolume(`${name}-vol`);
-}
-
-const SWITCHYARD_LABELS = {
-	managed: "com.zerodelta.switchyard.managed",
-	runId: "com.zerodelta.switchyard.run_id",
-	project: "com.zerodelta.switchyard.project",
-};
-
-describeIf(HAS_DOCKER, "detached crash matrix", () => {
-	describe("scenario 1: death before lease claim", () => {
-		let runId;
-
-		beforeEach(async () => {
-			runId = randomUUID();
-			const { initializeRun } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			await initializeRun({
-				runId,
-				tasksFilePath: tasksFile,
-				projectPath: projectDir,
-				orderedTaskIds: ["1.1"],
-				initialHostFingerprint: "test-fingerprint",
-				workerNonce: randomUUID(),
-				launchArgs: [],
-			});
-		});
-
-		it("bootstrap that dies before lease claim records worker_boot_failed", async () => {
-			const { readEvents } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			const runStorePath = resolve(
-				__dirname,
-				"..",
-				"src",
-				"switchyard",
-				"run-store",
-				"index.mjs",
-			);
-
-			const wrapperPath = join(dir, "crash-before-lease.mjs");
-			writeFileSync(
-				wrapperPath,
-				`process.env.SWITCHYARD_RUN_STORE_ROOT = ${JSON.stringify(stateRoot)};
-async function main() {
-	const runStore = await import(${JSON.stringify(runStorePath)});
-	await runStore.readRun("${runId}");
-	const err = new Error("simulated crash: process killed before lease claim");
-	await runStore.createEvent("${runId}", {
-		phase: "worker",
-		event: "worker_boot_failed",
-		status: "fatal",
-		detail: err.message,
-	});
-	process.exit(1);
-}
-main();
-`,
-				"utf8",
-			);
-
-			const result = spawnSync(process.execPath, [wrapperPath], {
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "pipe"],
-				timeout: 10_000,
-				env: { ...process.env, SWITCHYARD_RUN_STORE_ROOT: stateRoot },
-			});
-
-			strictEqual(
-				result.status,
-				1,
-				`expected exit 1, got ${result.status}: ${result.stderr}`,
-			);
-
-			const events = await readEvents(runId);
-			const bootFailed = events.find((e) => e.event === "worker_boot_failed");
-			ok(bootFailed, "worker_boot_failed event recorded");
-		});
-
-		it("no SECRET_CANARY_ in run artifacts after crash before lease", () => {
-			assertNoSecretCanary(runId);
-		});
-	});
-
-	describe("scenario 2: death after lease but before container", () => {
-		let runId;
-
-		beforeEach(async () => {
-			runId = randomUUID();
-			const { initializeRun, advanceState } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			await initializeRun({
-				runId,
-				tasksFilePath: tasksFile,
-				projectPath: projectDir,
-				orderedTaskIds: ["1.1"],
-				initialHostFingerprint: "test-fingerprint",
-				workerNonce: randomUUID(),
-				launchArgs: [],
-			});
-			await advanceState(runId, "running");
-		});
-
-		it("expired lease allows recovery when no Docker objects were created", async () => {
-			const { isRunLockExpired, acquireRunLock, readRun, updateRun } =
-				await import("../src/switchyard/run-store/index.mjs");
-
-			const current = await readRun(runId);
-			await updateRun(
-				runId,
-				{
-					workerPid: 99999,
-					workerStartToken: "old-token",
-					lastLeaseHeartbeat: new Date(Date.now() - 120_000).toISOString(),
-				},
-				current.revision,
-			);
-
-			const expired = await isRunLockExpired(runId, { maxAgeMs: 60_000 });
-			ok(expired, "lease should be expired after 120s with 60s max age");
-
-			const updated = await acquireRunLock(
-				runId,
-				process.pid,
-				randomUUID(),
-				"recovery-nonce",
-				{ allowRecovery: true, maxAgeMs: 60_000 },
-			);
-			strictEqual(updated.workerPid, process.pid);
-		});
-
-		it("run in running state with no Docker objects is handled gracefully by recovery", async () => {
-			const { recoverManagedObjects } = await import(
-				"../src/switchyard/lifecycle/index.mjs"
-			);
-
-			const result = recoverManagedObjects({
-				isRunActive: (rid) => rid !== runId,
-			});
-
-			strictEqual(result.containersReclaimed, 0);
-			strictEqual(result.volumesReclaimed, 0);
-		});
-
-		it("no SECRET_CANARY_ in run artifacts", () => {
-			assertNoSecretCanary(runId);
-		});
-	});
-
-	describe("scenario 3: death after container creation", () => {
-		let runId;
-		let trackedContainer;
-		let trackedVolume;
-
-		beforeEach(async () => {
-			runId = randomUUID();
-			const { initializeRun, advanceState } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			await initializeRun({
-				runId,
-				tasksFilePath: tasksFile,
-				projectPath: projectDir,
-				orderedTaskIds: ["1.1"],
-				initialHostFingerprint: "test-fingerprint",
-				workerNonce: randomUUID(),
-				launchArgs: [],
-			});
-			await advanceState(runId, "running");
-
-			trackedContainer = createLabeledContainer({
-				name: `switchyard-test-crash3-${randomUUID().slice(0, 8)}`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: runId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-
-			trackedVolume = createLabeledVolume({
-				name: `${trackedContainer}-vol`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: runId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-		});
-
-		afterEach(() => {
-			cleanFixture(trackedContainer);
-		});
-
-		it("reclaims labeled container and volume for dead run", async () => {
-			strictEqual(
-				containerExists(trackedContainer),
-				true,
-				"fixture container must exist before recovery",
-			);
-			strictEqual(
-				volumeExists(trackedVolume),
-				true,
-				"fixture volume must exist before recovery",
-			);
-
-			const { recoverManagedObjects } = await import(
-				"../src/switchyard/lifecycle/index.mjs"
-			);
-
-			const result = recoverManagedObjects({
-				isRunActive: (rid) => rid !== runId,
-			});
-
-			ok(
-				result.containersReclaimed >= 1,
-				"should reclaim at least the fixture container",
-			);
-			ok(
-				result.volumesReclaimed >= 1,
-				"should reclaim at least the fixture volume",
-			);
-
-			strictEqual(
-				containerExists(trackedContainer),
-				false,
-				"fixture container must be removed after recovery",
-			);
-			strictEqual(
-				volumeExists(trackedVolume),
-				false,
-				"fixture volume must be removed after recovery",
-			);
-		});
-
-		it("no SECRET_CANARY_ in run artifacts after container recovery", () => {
-			assertNoSecretCanary(runId);
-		});
-	});
-
-	describe("scenario 4: death during integration", () => {
-		let runId;
-		let trackedContainer;
-		let unrelatedContainer;
-
-		beforeEach(async () => {
-			runId = randomUUID();
-			const { initializeRun, advanceState, readRun, updateRun } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			await initializeRun({
-				runId,
-				tasksFilePath: tasksFile,
-				projectPath: projectDir,
-				orderedTaskIds: ["1.1"],
-				initialHostFingerprint: "test-fingerprint",
-				workerNonce: randomUUID(),
-				launchArgs: [],
-			});
-			await advanceState(runId, "running");
-
-			const current = await readRun(runId);
-			await updateRun(runId, { activeTaskId: "1.1" }, current.revision);
-
-			trackedContainer = createLabeledContainer({
-				name: `switchyard-test-crash4-${randomUUID().slice(0, 8)}`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: runId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-
-			createLabeledVolume({
-				name: `${trackedContainer}-vol`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: runId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-
-			const unrelatedRunId = randomUUID();
-			await initializeRun({
-				runId: unrelatedRunId,
-				tasksFilePath: tasksFile,
-				projectPath: projectDir,
-				orderedTaskIds: ["1.1"],
-				initialHostFingerprint: "test-fingerprint",
-				launchArgs: [],
-			});
-
-			unrelatedContainer = createLabeledContainer({
-				name: `switchyard-test-crash4-other-${randomUUID().slice(0, 8)}`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: unrelatedRunId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-		});
-
-		afterEach(() => {
-			cleanFixture(trackedContainer);
-			cleanFixture(unrelatedContainer);
-		});
-
-		it("reclaims only target run objects, preserves unrelated container", async () => {
-			strictEqual(
-				containerExists(trackedContainer),
-				true,
-				"fixture container must exist before recovery",
-			);
-			strictEqual(
-				containerExists(unrelatedContainer),
-				true,
-				"unrelated container must exist before recovery",
-			);
-
-			const { recoverManagedObjects } = await import(
-				"../src/switchyard/lifecycle/index.mjs"
-			);
-
-			const reclaimEvents = [];
-			const result = recoverManagedObjects({
-				isRunActive: (rid) => rid !== runId,
-				onStatus: (e) => reclaimEvents.push(e),
-			});
-
-			ok(
-				result.containersReclaimed >= 1,
-				"should reclaim at least the fixture container",
-			);
-
-			strictEqual(
-				containerExists(trackedContainer),
-				false,
-				"fixture container must be removed after recovery",
-			);
-			strictEqual(
-				containerExists(unrelatedContainer),
-				true,
-				"unrelated container must NOT be affected by recovery",
-			);
-
-			const reclaimed = reclaimEvents.filter(
-				(e) => e.type === "reclaimed" && e.object === "container",
-			);
-			const ourRecovered = reclaimed.find((e) => e.name === trackedContainer);
-			ok(ourRecovered, "recovered fixture must emit reclaimed event");
-			strictEqual(ourRecovered.runId, runId);
-
-			const unrelatedSkipped = reclaimEvents.find(
-				(e) =>
-					e.type === "skip" &&
-					e.name === unrelatedContainer &&
-					e.reason === "active-run",
-			);
-			ok(unrelatedSkipped, "unrelated container must be skipped as active-run");
-		});
-
-		it("exact-label teardown with strictEqual assertion", async () => {
-			const { recoverManagedObjects } = await import(
-				"../src/switchyard/lifecycle/index.mjs"
-			);
-
-			strictEqual(
-				containerExists(trackedContainer),
-				true,
-				"before cleanup: container must exist",
-			);
-			strictEqual(
-				volumeExists(`${trackedContainer}-vol`),
-				true,
-				"before cleanup: volume must exist",
-			);
-
-			recoverManagedObjects({
-				isRunActive: (rid) => rid !== runId,
-			});
-
-			strictEqual(
-				containerExists(trackedContainer),
-				false,
-				"after cleanup: container must be removed",
-			);
-			strictEqual(
-				volumeExists(`${trackedContainer}-vol`),
-				false,
-				"after cleanup: volume must be removed",
-			);
-		});
-
-		it("no SECRET_CANARY_ in run artifacts after integration crash", () => {
-			assertNoSecretCanary(runId);
-		});
-	});
-
-	describe("scenario 5: death during cleanup", () => {
-		let runId;
-		let trackedContainer;
-
-		beforeEach(async () => {
-			runId = randomUUID();
-			const { initializeRun, advanceState, readRun, updateRun } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			await initializeRun({
-				runId,
-				tasksFilePath: tasksFile,
-				projectPath: projectDir,
-				orderedTaskIds: ["1.1"],
-				initialHostFingerprint: "test-fingerprint",
-				workerNonce: randomUUID(),
-				launchArgs: [],
-			});
-			await advanceState(runId, "running");
-
-			const runCurrent = await readRun(runId);
-			await updateRun(
-				runId,
-				{
-					state: "succeeded",
-					cleanupState: "failed",
-					terminalSummary: {
-						totalTasks: 1,
-						runnableTasks: 1,
-						processedTasks: 1,
-						completedTaskIds: ["1.1"],
-						failedCount: 0,
-					},
-				},
-				runCurrent.revision,
-			);
-
-			trackedContainer = createLabeledContainer({
-				name: `switchyard-test-crash5-${randomUUID().slice(0, 8)}`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: runId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-
-			createLabeledVolume({
-				name: `${trackedContainer}-vol`,
-				labels: {
-					[SWITCHYARD_LABELS.managed]: "true",
-					[SWITCHYARD_LABELS.runId]: runId,
-					[SWITCHYARD_LABELS.project]: projectDir,
-				},
-			});
-		});
-
-		afterEach(() => {
-			cleanFixture(trackedContainer);
-		});
-
-		it("reclaims remaining containers after cleanup failure", async () => {
-			strictEqual(
-				containerExists(trackedContainer),
-				true,
-				"fixture container must exist before recovery",
-			);
-
-			const { recoverManagedObjects } = await import(
-				"../src/switchyard/lifecycle/index.mjs"
-			);
-
-			const result = recoverManagedObjects({
-				isRunActive: (rid) => rid !== runId,
-			});
-
-			ok(
-				result.containersReclaimed >= 1,
-				"should reclaim at least the fixture container",
-			);
-
-			strictEqual(
-				containerExists(trackedContainer),
-				false,
-				"fixture container must be removed after recovery",
-			);
-			strictEqual(
-				volumeExists(`${trackedContainer}-vol`),
-				false,
-				"fixture volume must be removed after recovery",
-			);
-		});
-
-		it("run state remains succeeded with cleanupState failed after object recovery", async () => {
-			const { recoverManagedObjects } = await import(
-				"../src/switchyard/lifecycle/index.mjs"
-			);
-
-			recoverManagedObjects({
-				isRunActive: (rid) => rid !== runId,
-			});
-
-			const { readRun } = await import("../src/switchyard/run-store/index.mjs");
-			const runState = await readRun(runId);
-			strictEqual(runState.state, "succeeded");
-			strictEqual(runState.cleanupState, "failed");
-		});
-
-		it("no SECRET_CANARY_ in run artifacts after cleanup crash", () => {
-			assertNoSecretCanary(runId);
-		});
-	});
-});

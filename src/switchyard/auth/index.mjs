@@ -4,7 +4,8 @@
 //
 //   npm run auth              full walkthrough: check, then log in anything unauthed
 //   npm run auth:check        read-only status report — never attempts a login
-//   npm run auth:check:live   the same report, plus one real request per provider
+//   npm run auth:check:live   the same report, plus one real request per
+//                              probeable provider (BWS lanes are unprobed)
 //
 // Every command above boots the golden image, does its work, and stops it
 // again — there is no standing credential VM to attach to (see
@@ -42,7 +43,6 @@ import { isClaudeAuthenticated } from "../adapter/claude.mjs";
 import { isCodexAuthenticated } from "../adapter/codex.mjs";
 import { isCopilotAuthenticated } from "../adapter/copilot.mjs";
 import { isCursorAuthenticated } from "../adapter/cursor.mjs";
-import { isOpencodeAuthenticated } from "../adapter/opencode.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { probeLiveness } from "./liveness.mjs";
 
@@ -134,7 +134,19 @@ function runInteractiveLogin(
 	}
 }
 
-export const COPILOT_LOGIN_COMMAND = Object.freeze(["copilot", "login"]);
+// The desktop OAuth flow starts a loopback callback listener. Inside the
+// Parallels guest, the host browser cannot reach that guest-local listener,
+// so use the documented device-code flow instead.
+export const COPILOT_LOGIN_COMMAND = Object.freeze([
+	"copilot",
+	"login",
+	"--device-code",
+]);
+
+export const AGY_LOGIN_COMMAND = Object.freeze(["agy"]);
+
+export const CLAUDE_LOGIN_HINT =
+	"Claude login: when the browser shows an Authentication code, copy/paste that code back into this terminal; browser authorization alone does not complete VM login.";
 
 const PROVIDERS = [
 	{
@@ -142,6 +154,7 @@ const PROVIDERS = [
 		isAuthenticated: isClaudeAuthenticated,
 		isLive: (workspaceId, executionBackend) =>
 			probeLiveness("claude", { workspaceId, executionBackend }),
+		loginHint: CLAUDE_LOGIN_HINT,
 		runLogin: (workspaceId, executionBackend) =>
 			runInteractiveLogin(["claude", "auth", "login"], {
 				workspaceId,
@@ -163,15 +176,14 @@ const PROVIDERS = [
 	},
 	{
 		name: "agy",
-		// agy has no explicit login subcommand — running it unauthenticated
-		// auto-triggers a real Google OAuth flow (prints a URL, then waits for
-		// a pasted authorization code). Confirmed empirically: a plain
-		// `agy --print "hi"` triggers it with no other side effect.
+		// agy has no explicit login subcommand. Current CLI releases begin the
+		// Google OAuth flow only when invoked plainly; `--print` is an execution
+		// flag and can fail before the credential UI is reached.
 		isAuthenticated: isAgyAuthenticated,
 		isLive: (workspaceId, executionBackend) =>
 			probeLiveness("agy", { workspaceId, executionBackend }),
 		runLogin: (workspaceId, executionBackend) =>
-			runInteractiveLogin(["agy", "--print", "hi"], {
+			runInteractiveLogin(AGY_LOGIN_COMMAND, {
 				workspaceId,
 				executionBackend,
 			}),
@@ -203,14 +215,11 @@ const PROVIDERS = [
 	},
 	{
 		name: "opencode",
-		isAuthenticated: isOpencodeAuthenticated,
-		isLive: (workspaceId, executionBackend) =>
-			probeLiveness("opencode", { workspaceId, executionBackend }),
-		runLogin: (workspaceId, executionBackend) =>
-			runInteractiveLogin(["opencode", "auth", "login"], {
-				workspaceId,
-				executionBackend,
-			}),
+		// The active OpenCode targets are Go and Mistral API-key lanes. Their
+		// fixed BWS consumers inject keys only into a disposable dispatch, so an
+		// OAuth login would create irrelevant persistent auth.json state and can
+		// not repair either lane. Qualification belongs to the dispatch bridge.
+		authMode: "ephemeral_api_key_dispatch",
 	},
 ];
 
@@ -268,7 +277,7 @@ function inspectProvider(provider, probe, workspaceId, executionBackend) {
  * provider's check/login functions. The caller (main(), or a test injecting
  * fake providers) owns booting the golden image beforehand; that keeps this
  * function's tested contract free of a real Parallels dependency.
- * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, runLogin: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => void}>} [providers]
+ * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, runLogin: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => void, loginHint?: string}>} [providers]
  * @param {object} [options]
  * @param {string} [options.workspaceId] Booted golden image uuid.
  * @param {ParallelsExecutionBackend} [options.executionBackend]
@@ -282,6 +291,17 @@ export function ensureProvidersAuthenticated(
 		let wasAuthenticated = false;
 		let ranLogin = false;
 		try {
+			if (provider.authMode === "ephemeral_api_key_dispatch") {
+				console.log(
+					`\n--- ${provider.name}: API-key dispatch is BWS-backed; skipping interactive OAuth ---\n`,
+				);
+				return {
+					name: provider.name,
+					wasAuthenticated: true,
+					ranLogin: false,
+					authenticated: true,
+				};
+			}
 			const state = inspectProvider(
 				provider,
 				true,
@@ -322,6 +342,9 @@ export function ensureProvidersAuthenticated(
 					? `\n--- ${provider.name}: credential present but the provider did not answer (${state.reason}) — starting interactive login, follow the prompts ---\n`
 					: `\n--- ${provider.name}: not authenticated — starting interactive login, follow the prompts ---\n`,
 			);
+			if (provider.loginHint) {
+				console.log(`\n--- ${provider.loginHint} ---\n`);
+			}
 			ranLogin = true;
 			provider.runLogin(workspaceId, executionBackend);
 			// Re-check the same way, not the cheap way: a login that "succeeded"
@@ -376,14 +399,16 @@ export function ensureProvidersAuthenticated(
  * avoid). Reuses the same isXAuthenticated() functions the real walkthrough
  * trusts, so status and login can never disagree.
  *
- * `{live: true}` additionally asks each authenticated provider to answer a real
- * one-word request, which is the only thing that distinguishes a credential
- * from a working session. It is opt-in because it spends real quota, six
- * requests at a time, on a command people run casually — and stays read-only
- * either way. The plain form is honest about its limits rather than silently
- * cheap: it reports a credential, and a credential is not a session. (It is
- * not free either — see withBootedGoldenImage(): even the plain form needs a
- * running guest to read a credential file from.)
+ * `{live: true}` additionally asks each authenticated, probeable provider to
+ * answer a real one-word request, which is the only thing that distinguishes a
+ * credential from a working session. Ephemeral BWS API-key lanes are not
+ * probeable by this command because their keys exist only inside a disposable
+ * dispatch process; they remain explicitly unprobed. Live mode is opt-in
+ * because it spends real quota, and stays read-only either way. The plain form
+ * is honest about its limits rather than silently cheap: it reports a
+ * credential, and a credential is not a session. (It is not free either — see
+ * withBootedGoldenImage(): even the plain form needs a running guest to read a
+ * credential file from.)
  *
  * Pure with respect to VM lifecycle, same as ensureProvidersAuthenticated().
  * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, isLive?: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => object}>} [providers]
@@ -396,6 +421,14 @@ export function reportProviderStatus(
 ) {
 	return providers.map((provider) => {
 		try {
+			if (provider.authMode === "ephemeral_api_key_dispatch") {
+				return {
+					name: provider.name,
+					authenticated: true,
+					...(live ? { live: null, reason: null } : {}),
+					authMode: provider.authMode,
+				};
+			}
 			const state = inspectProvider(
 				provider,
 				live,
@@ -427,17 +460,21 @@ export function reportProviderStatus(
 
 /**
  * Print the read-only status report and set the exit code (1 if any provider
- * is unauthenticated — or, with `--live`, if any authenticated provider failed
- * to answer) — no login is ever attempted. Boots the golden image for the
+ * is unauthenticated — or, with `--live`, if any provider was not positively
+ * live-probed) — no login is ever attempted. Boots the golden image for the
  * duration of the report (see withBootedGoldenImage()).
  * @param {ParallelsExecutionBackend} executionBackend
  * @param {boolean} [live] Probe each authenticated provider with a real request.
  */
-function runCheck(executionBackend, live = false) {
+export function runCheck(
+	executionBackend,
+	live = false,
+	providers = PROVIDERS,
+) {
 	let statuses;
 	try {
 		statuses = withBootedGoldenImage(executionBackend, (workspaceId) =>
-			reportProviderStatus(PROVIDERS, { live, workspaceId, executionBackend }),
+			reportProviderStatus(providers, { live, workspaceId, executionBackend }),
 		);
 	} catch (error) {
 		console.error(error.message);
@@ -446,10 +483,18 @@ function runCheck(executionBackend, live = false) {
 	}
 	console.log(
 		live
-			? "=== Auth status (read-only — no login attempted; each provider was sent one real request) ==="
+			? "=== Auth status (read-only — no login attempted; live probes run only for probeable providers; BWS lanes remain unprobed) ==="
 			: "=== Auth status (read-only — credential presence only; add --live to probe) ===",
 	);
 	for (const status of statuses) {
+		if (status.authMode === "ephemeral_api_key_dispatch") {
+			console.log(
+				live
+					? `${status.name}: BWS runtime dispatch (no OAuth login; live status unprobed)`
+					: `${status.name}: BWS runtime dispatch (no OAuth login)`,
+			);
+			continue;
+		}
 		if (!status.authenticated) {
 			console.log(`${status.name}: NOT AUTHENTICATED`);
 			continue;
@@ -465,7 +510,7 @@ function runCheck(executionBackend, live = false) {
 		);
 	}
 	process.exitCode = statuses.some(
-		(status) => !status.authenticated || status.live === false,
+		(status) => !status.authenticated || (live && status.live !== true),
 	)
 		? 1
 		: 0;
@@ -476,8 +521,9 @@ function main(argv = process.argv.slice(2)) {
 
 	// `--check`: read-only status, never a login. The default (no flag) is the
 	// full walkthrough, which logs in anything unauthenticated. `--live` adds a
-	// real request per authenticated provider; the walkthrough always probes,
-	// because a wrong answer there costs an hour rather than a status line.
+	// real request per authenticated, probeable provider; the walkthrough always
+	// probes, because a wrong answer there costs an hour rather than a status
+	// line.
 	if (argv.includes("--check")) {
 		runCheck(executionBackend, argv.includes("--live"));
 		return;

@@ -6,7 +6,6 @@
 // the exactly-once terminal transition.
 
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { DockerExecutionBackend } from "../lifecycle/execution-backend.mjs";
 import {
 	classifyProviderDiagnostic,
 	describeExecError,
@@ -17,24 +16,36 @@ const DEFAULT_MAX_BUFFER = 128 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_DIAGNOSTIC_CHARS = 800;
-const DEFAULT_EXECUTION_BACKEND = new DockerExecutionBackend();
 
 /**
  * Resolve the complete transport invocation for one provider command. The
  * backend owns the command, the workspace prefix, any transport option needed
  * to deliver stdin, and — on a transport that re-parses its argument vector in
  * the guest — the quoting of `argv`. Callers hand over the whole command
- * vector and never splice Docker- or VM-specific flags into the result.
+ * vector and never splice VM-specific flags into the result.
  *
  * `argv` is mandatory. An adapter that builds the prefix and appends its own
- * command works on Docker and is silently word-split on the VM lane, so the
- * seam refuses the shape rather than letting it reach a guest.
+ * command is silently word-split on the VM lane, so the seam refuses the
+ * shape rather than letting it reach a guest. `executionBackend` is likewise
+ * mandatory (no default): runner/index.mjs's createQueueBackend always
+ * threads a real one, so a missing backend here means a call site failed to
+ * thread it, and that must fail loudly rather than construct an
+ * unconfigured backend with no golden image / Aqua identity.
  */
 export function getWorkspaceExecution(
 	workspaceId,
-	{ executionBackend = DEFAULT_EXECUTION_BACKEND, cwd = "/project", argv } = {},
+	{ executionBackend, cwd = "/project", argv, recordPid = true } = {},
 ) {
-	const execution = executionBackend.execArgv(workspaceId, { cwd, argv });
+	if (!executionBackend) {
+		throw new TypeError(
+			"getWorkspaceExecution requires an executionBackend — none was threaded through",
+		);
+	}
+	const execution = executionBackend.execArgv(workspaceId, {
+		cwd,
+		argv,
+		recordPid,
+	});
 	return { command: execution.command, args: [...execution.args] };
 }
 
@@ -264,6 +275,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		cleanup,
 		executionBackend,
 		onStatus,
+		cleanupContext,
 		idleExitCode,
 		...lifecycleOptions
 	} = options;
@@ -279,6 +291,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			try {
 				await executionBackend.cleanupProviderProcess(command, args, {
 					onStatus,
+					...(cleanupContext ?? {}),
 				});
 				backendHandled = true;
 			} catch (error) {
@@ -393,12 +406,14 @@ export async function captureProviderDiffAsync(
 	};
 	const stage = getWorkspaceExecution(workingContainerName, {
 		...options,
+		recordPid: false,
 		argv: ["git", "add", "-A"],
 	});
 	const add = await runProviderProcess(stage.command, stage.args, lifecycle);
 	if (!add.success) return null;
 	const capture = getWorkspaceExecution(workingContainerName, {
 		...options,
+		recordPid: false,
 		argv: ["git", "diff", "--cached", "HEAD"],
 	});
 	const diff = await runProviderProcess(
@@ -419,11 +434,13 @@ export function captureProviderDiff(workingContainerName, options = {}) {
 	try {
 		const stage = getWorkspaceExecution(workingContainerName, {
 			...options,
+			recordPid: false,
 			argv: ["git", "add", "-A"],
 		});
 		execFileSync(stage.command, stage.args, { stdio: "pipe" });
 		const capture = getWorkspaceExecution(workingContainerName, {
 			...options,
+			recordPid: false,
 			argv: ["git", "diff", "--cached", "HEAD"],
 		});
 		const diff = execFileSync(capture.command, capture.args, {
