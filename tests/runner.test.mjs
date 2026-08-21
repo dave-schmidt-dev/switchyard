@@ -895,6 +895,61 @@ describe("runner queue parsing", () => {
 		deepStrictEqual(tasks[0].requiredPaths, ["src/a.mjs", "tests/a.test.mjs"]);
 	});
 
+	it("unwraps one matching inline-code pair per Files entry", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: File task
+- **Status:** pending
+- **Files:** \`src/a.mjs\`, tests/a.test.mjs, \`HISTORY.md\`
+- **Description:** Do things with files
+`;
+		const tasks = parseFixture(markdown);
+		deepStrictEqual(tasks[0].requiredPaths, [
+			"src/a.mjs",
+			"tests/a.test.mjs",
+			"HISTORY.md",
+		]);
+	});
+
+	it("rejects malformed inline-code wrappers in Files entries", () => {
+		for (const filesValue of [
+			"`src/a.mjs",
+			"src/a.mjs`",
+			"``src/a.mjs``",
+			"`src/`a.mjs`",
+		]) {
+			const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** ${filesValue}
+- **Description:** Bad
+`;
+			throws(
+				() => parseFixture(markdown),
+				/(?:unmatched|malformed) inline-code/,
+			);
+		}
+	});
+
+	it("applies existing path validation after inline-code unwrapping", () => {
+		for (const [filesValue, message] of [
+			["`/etc/passwd`", /absolute path/],
+			["`../outside/evil.mjs`", /path traversal/],
+			["`src/*.mjs`", /wildcards/],
+			["`src/`", /directory-only/],
+		]) {
+			const markdown = `## Phase 1
+
+### Task 1.1: Bad task
+- **Status:** pending
+- **Files:** ${filesValue}
+- **Description:** Bad
+`;
+			throws(() => parseFixture(markdown), message);
+		}
+	});
+
 	it("sets requiredPaths to null when no Files: field is present on a review task", () => {
 		const markdown = `## Phase 1
 
@@ -7249,6 +7304,47 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 });
 
 describe("Files requiredPaths propagation", () => {
+	it("passes unwrapped Files paths to integrationGate", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: File task
+- **Status:** pending
+- **Files:** \`src/a.mjs\`, \`tests/a.test.mjs\`
+- **Description:** simple cleanup
+`;
+		const task = parseFixture(markdown)[0];
+		const gateCalls = [];
+		const result = executeTask(task, {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				percentLeft: 50,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: (diff, projectPath, options) => {
+				gateCalls.push({ diff, projectPath, options });
+				return { success: true, message: "ok" };
+			},
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/a b/a",
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+
+		strictEqual(result.success, true);
+		strictEqual(gateCalls.length, 1);
+		deepStrictEqual(gateCalls[0].options.requiredPaths, [
+			"src/a.mjs",
+			"tests/a.test.mjs",
+		]);
+	});
+
 	it("executeTask passes requiredPaths to integrationGate", () => {
 		const gateCalls = [];
 		const result = executeTask(

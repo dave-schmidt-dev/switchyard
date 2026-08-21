@@ -86,67 +86,70 @@ describe("agy adapter shell injection guard", () => {
 	});
 });
 
-describe("isAgyAuthenticated credential-validity check (fake guest)", () => {
-	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
-		// TASKS.md Task 15 "done when": with the CLI installed and answering
-		// `--version` (liveness passes — agy has no vendor keyword, so any
-		// non-empty output counts), a withheld or trivial credentials file must
-		// make isAgyAuthenticated() return false. A real completed OAuth login
-		// persists ~/.gemini/antigravity-cli/antigravity-oauth-token — live-
-		// verified against a real login (TASKS.md Task 24), replacing an earlier
-		// assumed path that never actually existed under a real login.
-		const credPath = ".gemini/antigravity-cli/antigravity-oauth-token";
-		const files = {};
-		const backend = createFakeExecutionBackend({
-			version: "agy 1.0.0",
-			files,
+describe("isAgyAuthenticated Keychain-status check (fake guest)", () => {
+	function createAgyKeychainBackend(state = {}) {
+		return createFakeExecutionBackend({
+			version: state.version !== undefined ? state.version : "agy 1.0.0",
+			respond(command, args) {
+				if (
+					command === "/bin/sh" &&
+					args[0] === "-c" &&
+					args[1] ===
+						"/usr/bin/security find-generic-password -s gemini -a antigravity >/dev/null 2>&1"
+				) {
+					if (state.keychainError) {
+						throw state.keychainError;
+					}
+					if (state.exitCode && state.exitCode !== 0) {
+						const error = new Error(
+							`Keychain item probe failed with exit status ${state.exitCode}`,
+						);
+						error.status = state.exitCode;
+						throw error;
+					}
+					return Buffer.from("");
+				}
+				throw new Error(`unexpected Agy command: ${command} ${args.join(" ")}`);
+			},
 		});
+	}
 
-		// Credential withheld entirely.
+	it("returns true when the Agy Keychain item is present", () => {
 		strictEqual(
-			isAgyAuthenticated("fake-workspace", backend),
-			false,
-			"withheld credential must not read as authenticated",
-		);
-
-		// Credential present but empty (the empty-file bug shape).
-		files[credPath] = "";
-		strictEqual(
-			isAgyAuthenticated("fake-workspace", backend),
-			false,
-			"empty credential file must not read as authenticated",
-		);
-
-		// Credential present but a trivial JSON stub.
-		files[credPath] = "{}";
-		strictEqual(
-			isAgyAuthenticated("fake-workspace", backend),
-			false,
-			"trivial {} stub must not read as authenticated",
-		);
-
-		// Positive control: a non-trivial credential reads as authenticated
-		// (pre-fix liveness-only logic returned true for all four states).
-		files[credPath] = '{"refresh_token":"fake-gemini-token-1234567890"}';
-		strictEqual(
-			isAgyAuthenticated("fake-workspace", backend),
+			isAgyAuthenticated("fake-workspace", createAgyKeychainBackend()),
 			true,
-			"a non-trivial persisted credential must read as authenticated",
 		);
 	});
 
-	it("returns false when the binary doesn't respond to --version at all", () => {
-		const backend = createFakeExecutionBackend({
-			version: null,
-			files: {
-				".gemini/antigravity-cli/antigravity-oauth-token":
-					'{"refresh_token":"fake-gemini-token-1234567890"}',
-			},
-		});
+	it("returns false when the Agy Keychain item is absent", () => {
 		strictEqual(
-			isAgyAuthenticated("fake-workspace", backend),
+			isAgyAuthenticated(
+				"fake-workspace",
+				createAgyKeychainBackend({ exitCode: 44 }),
+			),
 			false,
-			"missing binary must not read as authenticated even with credentials present",
+		);
+	});
+
+	it("returns false when the Keychain probe fails", () => {
+		strictEqual(
+			isAgyAuthenticated(
+				"fake-workspace",
+				createAgyKeychainBackend({
+					keychainError: new Error("Keychain unavailable"),
+				}),
+			),
+			false,
+		);
+	});
+
+	it("returns false when the Agy binary does not respond", () => {
+		strictEqual(
+			isAgyAuthenticated(
+				"fake-workspace",
+				createAgyKeychainBackend({ version: null }),
+			),
+			false,
 		);
 	});
 });

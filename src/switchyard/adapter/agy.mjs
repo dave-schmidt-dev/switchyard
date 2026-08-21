@@ -28,45 +28,22 @@ import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const AGY_CMD = "agy";
 
-// A completed OAuth login persists the token to
-// `~/.gemini/antigravity-cli/antigravity-oauth-token` under the guest
-// provider account's home directory — live-verified 2026-07-21 against the
-// real standing agent container immediately after a real `agy --print "hi"`
-// login completed (a fresh 498-byte, mode-0600 file appeared at exactly that
-// path/timestamp). The earlier assumed path, `~/.gemini/gemini-credentials.json`,
-// does not exist under a real login — it was carried over from an older
-// local-install check and was never re-verified; `isAgyAuthenticated()`
-// reported a real, working login as unauthenticated until this was caught.
-const AGY_CREDENTIALS_RELATIVE_PATH =
-	".gemini/antigravity-cli/antigravity-oauth-token";
-
-// A real credentials JSON is hundreds of bytes; this floor rejects an empty
-// file (the exact bug that shipped once — a printf writing nothing) and
-// trivial JSON stubs (`{}`, `null`, `""`). It deliberately does NOT attempt
-// server-side validity — a well-formed but revoked/garbage token still
-// passes — because that needs a network round-trip the container can't make
-// reliably. Scope: presence + substance, not liveness against the API.
-const MIN_CREDENTIAL_BYTES = 16;
-
 /**
- * Check that the persisted credential file exists inside the guest and is
- * non-trivial (not empty, not a placeholder stub). INV-1: the credential
- * VALUE never crosses to the host and never appears in argv — only the
- * constant file path and byte threshold do, and `wc -c` reports a byte
- * count, not content. The host reads only the check's exit code.
+ * Check that Agy's macOS Keychain item is present. The static guest command
+ * redirects all output and the host consumes only its exit status, so no
+ * credential value or Keychain metadata crosses the process boundary.
  * @param {string} workspaceId
  * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
  */
-function hasNonTrivialCredential(workspaceId, executionBackend) {
-	const path = `/Users/${executionBackend.providerUser}/${AGY_CREDENTIALS_RELATIVE_PATH}`;
+function hasAgyKeychainLogin(workspaceId, executionBackend) {
 	try {
 		executionBackend.execGuest(
 			workspaceId,
-			"sh",
+			"/bin/sh",
 			[
 				"-c",
-				`[ -f ${path} ] && [ "$(wc -c < ${path} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`,
+				"/usr/bin/security find-generic-password -s gemini -a antigravity >/dev/null 2>&1",
 			],
 			{ cwd: "/" },
 		);
@@ -79,11 +56,10 @@ function hasNonTrivialCredential(workspaceId, executionBackend) {
 /**
  * Check if Agy is authenticated in the guest. `agy --version` has no vendor
  * keyword to match, so liveness here is just "binary runs, non-empty
- * output"; the real signal is the credential check that supplements it — the
- * persisted OAuth token must exist and be non-trivial. Liveness alone
- * treated an installed-but-unauthenticated CLI as authenticated, so
- * `npm run auth` would have skipped a provider that still needed a real
- * interactive login (TASKS.md Task 15).
+ * output"; the real signal is the dedicated macOS Keychain item set by the
+ * supported interactive login. Liveness alone treated an installed-but-
+ * unauthenticated CLI as authenticated, so `npm run auth` would have skipped
+ * a provider that still needed a real interactive login (TASKS.md Task 15).
  * @param {string} workspaceId
  * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
@@ -99,7 +75,7 @@ export function isAgyAuthenticated(workspaceId, executionBackend) {
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(workspaceId, executionBackend);
+	return hasAgyKeychainLogin(workspaceId, executionBackend);
 }
 
 /**

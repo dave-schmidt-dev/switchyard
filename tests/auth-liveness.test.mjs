@@ -140,6 +140,18 @@ describe("probeLiveness", () => {
 		);
 	});
 
+	it("probes claude in /tmp", () => {
+		const spec = specFor("claude");
+		strictEqual(spec.cwd, "/tmp");
+		strictEqual(spec.args.includes("-p"), true);
+	});
+
+	it("probes agy in /tmp", () => {
+		const spec = specFor("agy");
+		strictEqual(spec.cwd, "/tmp");
+		strictEqual(spec.args.includes("--print"), true);
+	});
+
 	it("probes the no-variant MiMo lane used for low-capability dispatch", () => {
 		const spec = specFor("opencode");
 		deepStrictEqual(spec.args.slice(0, 4), [

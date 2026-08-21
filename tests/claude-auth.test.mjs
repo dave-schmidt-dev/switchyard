@@ -85,75 +85,82 @@ describe("claude adapter shell injection guard", () => {
 	});
 });
 
-describe("isClaudeAuthenticated credential-validity check (fake guest)", () => {
-	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
-		// TASKS.md Task 15 "done when": with the CLI installed and answering
-		// `--version` (liveness passes), a withheld or trivial credential must
-		// make isClaudeAuthenticated() return false — the exact false-positive
-		// the old liveness-only check produced. Claude's operative credential
-		// is Claude Code's own store (~/.claude/.credentials.json, plus
-		// ~/.claude.json), which `claude auth login` persists to directly
-		// (TASKS.md Task 24).
-		const credentialsPath = ".claude/.credentials.json";
-		const configPath = ".claude.json";
-		const files = {};
-		const backend = createFakeExecutionBackend({
-			version: "Claude Code stub",
-			files,
+describe("isClaudeAuthenticated auth-status check (fake guest)", () => {
+	function createClaudeStatusBackend(state = {}) {
+		return createFakeExecutionBackend({
+			version:
+				state.version !== undefined ? state.version : "Claude Code 1.0.0",
+			respond(command, args) {
+				if (
+					command === "claude" &&
+					args[0] === "auth" &&
+					args[1] === "status"
+				) {
+					if (state.statusError) {
+						throw state.statusError;
+					}
+					if (state.exitCode && state.exitCode !== 0) {
+						const err = new Error(
+							`Command failed: claude auth status (exit status ${state.exitCode})`,
+						);
+						err.status = state.exitCode;
+						throw err;
+					}
+					return Buffer.from("");
+				}
+				throw new Error(
+					`unexpected claude command: ${command} ${args.join(" ")}`,
+				);
+			},
 		});
+	}
 
-		// Credential withheld entirely.
-		strictEqual(
-			isClaudeAuthenticated("fake-workspace", backend),
-			false,
-			"withheld credential must not read as authenticated",
-		);
-
-		// Credential present but empty (the empty-file bug shape).
-		files[credentialsPath] = "";
-		files[configPath] = "";
-		strictEqual(
-			isClaudeAuthenticated("fake-workspace", backend),
-			false,
-			"empty credential file must not read as authenticated",
-		);
-
-		// Credential present but a trivial JSON stub.
-		files[credentialsPath] = "{}";
-		files[configPath] = "{}";
-		strictEqual(
-			isClaudeAuthenticated("fake-workspace", backend),
-			false,
-			"trivial {} stub must not read as authenticated",
-		);
-
-		// Positive control: a non-trivial credential reads as authenticated,
-		// proving the check isn't vacuously false and the negative cases
-		// above are meaningfully distinguished (pre-fix liveness-only logic
-		// returned true for all four states).
-		files[credentialsPath] =
-			'{"accessToken":"fake-oauth-token-value-1234567890"}';
-		files[configPath] = '{"accessToken":"fake-oauth-token-value-1234567890"}';
+	it("returns true when claude auth status exits with status 0 (authenticated)", () => {
+		const backend = createClaudeStatusBackend({ exitCode: 0 });
 		strictEqual(
 			isClaudeAuthenticated("fake-workspace", backend),
 			true,
-			"a non-trivial persisted credential must read as authenticated",
+			"exit status 0 from claude auth status should read as authenticated",
 		);
 	});
 
-	it("returns false when the binary doesn't respond to --version at all", () => {
-		const backend = createFakeExecutionBackend({
-			version: null,
-			files: {
-				".claude/.credentials.json":
-					'{"accessToken":"fake-oauth-token-value-1234567890"}',
-				".claude.json": '{"accessToken":"fake-oauth-token-value-1234567890"}',
-			},
+	it("regression: returns false when claude auth status exits with non-zero status (logged out)", () => {
+		const backend = createClaudeStatusBackend({ exitCode: 1 });
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"non-zero exit status from claude auth status must fail closed",
+		);
+	});
+
+	it("returns false on status command failure (e.g. execution error or timeout)", () => {
+		const backend = createClaudeStatusBackend({
+			statusError: new Error("ETIMEDOUT: status probe timed out"),
 		});
 		strictEqual(
 			isClaudeAuthenticated("fake-workspace", backend),
 			false,
-			"missing binary must not read as authenticated even with credentials present",
+			"status command execution failure must fail closed",
+		);
+	});
+
+	it("returns false when the binary is missing or does not respond to --version", () => {
+		const backend = createClaudeStatusBackend({ version: null });
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"missing binary must not read as authenticated",
+		);
+	});
+
+	it("returns false when the binary --version output does not identify as Claude", () => {
+		const backend = createClaudeStatusBackend({
+			version: "some-other-tool 1.0.0",
+		});
+		strictEqual(
+			isClaudeAuthenticated("fake-workspace", backend),
+			false,
+			"binary that does not output Claude in --version must not read as authenticated",
 		);
 	});
 });

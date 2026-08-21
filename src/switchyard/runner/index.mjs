@@ -1269,7 +1269,36 @@ function parseExternalBlockersField(block, taskId) {
 }
 
 /**
+ * Remove one matching Markdown inline-code wrapper from a Files entry.
+ * Wrapped and bare entries share the same path validation below; malformed
+ * wrappers fail closed instead of becoming part of the allowlist path.
+ * @param {string} token A trimmed, comma-separated Files entry
+ * @param {string} taskId Task identifier for error messages
+ * @returns {string} The unwrapped path token
+ * @throws {Error} If the token contains an unmatched or nested delimiter
+ */
+function unwrapFilesInlineCode(token, taskId) {
+	if (token.startsWith("`") && token.endsWith("`") && token.length >= 2) {
+		const inner = token.slice(1, -1);
+		if (inner.includes("`")) {
+			throw new Error(
+				`Task ${taskId}: malformed inline-code wrapper in Files: "${token}"`,
+			);
+		}
+		return inner.trim();
+	}
+	if (token.includes("`")) {
+		throw new Error(
+			`Task ${taskId}: unmatched inline-code delimiter in Files: "${token}"`,
+		);
+	}
+	return token;
+}
+
+/**
  * Parse and validate a comma-separated Files: field into an array of paths.
+ * Each entry may wrap an otherwise valid project-relative path in one matching
+ * pair of Markdown inline-code delimiters.
  * @param {string} raw The raw value of the Files: field
  * @param {string} taskId Task identifier for error messages
  * @returns {string[]} Validated project-relative POSIX paths
@@ -1283,7 +1312,9 @@ function parseFilePaths(raw, taskId) {
 		);
 	}
 
-	const paths = trimmed.split(",").map((p) => p.trim());
+	const paths = trimmed
+		.split(",")
+		.map((entry) => unwrapFilesInlineCode(entry.trim(), taskId));
 
 	for (const path of paths) {
 		if (!path) {

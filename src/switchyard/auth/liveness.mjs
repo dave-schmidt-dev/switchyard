@@ -65,7 +65,10 @@ const OPENCODE_PROBE_VARIANT =
  * @type {Readonly<Record<string, (prompt: string) => ProbeSpec>>}
  */
 export const LIVENESS_PROBES = Object.freeze({
-	claude: (prompt) => ({ args: ["claude", "-p", prompt] }),
+	claude: (prompt) => ({
+		args: ["claude", "-p", prompt],
+		cwd: "/tmp",
+	}),
 	codex: () => ({
 		// The prompt goes on stdin exactly as executeCodex() delivers it. `-w /tmp`
 		// because `codex exec` refuses to run outside a directory it trusts
@@ -76,7 +79,10 @@ export const LIVENESS_PROBES = Object.freeze({
 		cwd: "/tmp",
 		stdin: true,
 	}),
-	agy: (prompt) => ({ args: ["agy", "--print", prompt] }),
+	agy: (prompt) => ({
+		args: ["agy", "--print", prompt],
+		cwd: "/tmp",
+	}),
 	cursor: (prompt) => ({
 		args: ["cursor-agent", "-p", prompt, "--force", "--trust"],
 		cwd: "/tmp",

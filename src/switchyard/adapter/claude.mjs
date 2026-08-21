@@ -27,60 +27,11 @@ import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const CLAUDE_CMD = "claude";
 
-// `claude auth login` persists the operative credential to Claude Code's own
-// store under the guest provider account's home directory. Claude reports
-// `loggedIn: false` unless BOTH files are present, so authentication checks
-// both rather than either alone.
-const CLAUDE_CREDENTIALS_RELATIVE_PATH = ".claude/.credentials.json";
-const CLAUDE_CONFIG_RELATIVE_PATH = ".claude.json";
-
-// A real OAuth/token credential is hundreds of bytes; this floor rejects an
-// empty file (the exact bug that shipped once — a printf writing nothing)
-// and trivial JSON stubs (`{}`, `null`, `""`). It deliberately does NOT
-// attempt server-side validity — a well-formed but revoked/garbage token
-// still passes — because that needs a network round-trip the container
-// can't make reliably (the same reason `cursor-agent status` was rejected
-// as an auth signal; see cursor.mjs). Scope: presence + substance, not
-// liveness of the token against the provider's API.
-const MIN_CREDENTIAL_BYTES = 16;
-
 /**
- * Check that both persisted credential files exist inside the guest and are
- * non-trivial (not empty, not a placeholder stub). INV-1: the credential
- * VALUE never crosses to the host and never appears in argv — only the
- * constant file path and byte threshold do, and `wc -c` reports a byte
- * count, not content. The host reads only the check's exit code.
- * @param {string} workspaceId
- * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
- * @returns {boolean}
- */
-function hasNonTrivialCredential(workspaceId, executionBackend) {
-	const home = `/Users/${executionBackend.providerUser}`;
-	const check = (relativePath) =>
-		`[ -f ${home}/${relativePath} ] && [ "$(wc -c < ${home}/${relativePath} | tr -d '[:space:]')" -ge ${MIN_CREDENTIAL_BYTES} ]`;
-	try {
-		executionBackend.execGuest(
-			workspaceId,
-			"sh",
-			[
-				"-c",
-				`${check(CLAUDE_CREDENTIALS_RELATIVE_PATH)} && ${check(CLAUDE_CONFIG_RELATIVE_PATH)}`,
-			],
-			{ cwd: "/" },
-		);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Check if Claude is authenticated in the guest. Supplements the binary
- * liveness check (`--version` responds) with a real credential check: the
- * persisted credential must exist and be non-trivial. Liveness alone treated
- * an installed-but-unauthenticated CLI as authenticated, so
- * ensureProvidersAuthenticated() skipped its headless login and the first
- * real dispatch failed instead of `npm run auth` catching it (TASKS.md Task 15).
+ * Check if Claude is authenticated in the guest. Retains the executable
+ * liveness check (`--version` responds) and probes authentication using
+ * `claude auth status` exit code only. Fails closed on missing binary,
+ * non-zero exit status, or status command failure.
  * @param {string} workspaceId
  * @param {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend} executionBackend
  * @returns {boolean}
@@ -93,10 +44,13 @@ export function isClaudeAuthenticated(workspaceId, executionBackend) {
 		if (!result.includes("Claude")) {
 			return false;
 		}
+		executionBackend.execGuest(workspaceId, CLAUDE_CMD, ["auth", "status"], {
+			cwd: "/",
+		});
+		return true;
 	} catch {
 		return false;
 	}
-	return hasNonTrivialCredential(workspaceId, executionBackend);
 }
 
 /**
