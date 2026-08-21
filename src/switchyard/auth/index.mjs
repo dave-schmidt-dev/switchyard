@@ -6,6 +6,13 @@
 //   npm run auth:check        read-only status report — never attempts a login
 //   npm run auth:check:live   the same report, plus one real request per
 //                              probeable provider (BWS lanes are unprobed)
+//   node src/switchyard/auth/index.mjs --clone
+//                             read-only clone qualification: creates one
+//                             disposable linked clone, probes every OAuth
+//                             provider inside it with presence + live check,
+//                             reports BWS lanes as unprobed, emits progress to
+//                             stderr, outputs a terminal summary to stdout,
+//                             and always destroys the clone.
 //
 // Every command above boots the golden image, does its work, and stops it
 // again — there is no standing credential VM to attach to (see
@@ -38,6 +45,7 @@
 // four adapters).
 
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { isAgyAuthenticated } from "../adapter/agy.mjs";
 import { isClaudeAuthenticated } from "../adapter/claude.mjs";
 import { isCodexAuthenticated } from "../adapter/codex.mjs";
@@ -93,6 +101,71 @@ function withBootedGoldenImage(executionBackend, fn) {
 			console.error(
 				`warning: failed to stop the golden image after auth: ${error.message}`,
 			);
+		}
+	}
+}
+
+/**
+ * Create a disposable linked clone from the golden image, run `fn(workspaceId)`
+ * against it, and always destroy the clone in a finally block — fails fast if the
+ * environment isn't configured, and guarantees the clone is destroyed even if
+ * `fn` throws.
+ *
+ * Progress events are emitted exclusively to stderr.
+ *
+ * @param {ParallelsExecutionBackend} executionBackend
+ * @param {(workspaceId: string) => any} fn
+ * @param {object} [options]
+ * @returns {any}
+ */
+export function withDisposableClone(executionBackend, fn, options = {}) {
+	if (!executionBackend.goldenImage) {
+		throw new Error(
+			"SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set to check or run provider auth",
+		);
+	}
+	if (!/^\d+$/.test(String(executionBackend.aquaUid ?? ""))) {
+		throw new Error(
+			"SWITCHYARD_PARALLELS_AQUA_UID must be set to check or run provider auth",
+		);
+	}
+	console.error(
+		`Measuring linked-clone lifecycle for golden image ${executionBackend.goldenImage}...`,
+	);
+	const linkedCloneMeasurement = executionBackend.measureLinkedClone(
+		executionBackend.goldenImage,
+		{
+			aquaUid: executionBackend.aquaUid,
+			providerUser: executionBackend.providerUser,
+		},
+	);
+	console.error(
+		`Creating disposable linked clone from golden image ${executionBackend.goldenImage}...`,
+	);
+	let workspaceId;
+	try {
+		workspaceId = executionBackend.create(executionBackend.goldenImage, {
+			...options,
+			runId: `auth-qualification-${randomUUID()}`,
+			linked: true,
+			linkedCloneMeasurement,
+			aquaUid: executionBackend.aquaUid,
+			providerUser: executionBackend.providerUser,
+		});
+		console.error(
+			`Disposable linked clone created (${workspaceId}), running auth qualification...`,
+		);
+		return fn(workspaceId);
+	} finally {
+		if (workspaceId) {
+			console.error(`Destroying disposable clone (${workspaceId})...`);
+			try {
+				executionBackend.destroy(workspaceId);
+			} catch (error) {
+				console.error(
+					`warning: failed to destroy disposable linked clone after auth check: ${error.message}`,
+				);
+			}
 		}
 	}
 }
@@ -516,8 +589,100 @@ export function runCheck(
 		: 0;
 }
 
+/**
+ * Qualify provider auth inside a disposable clone: creates one disposable
+ * linked clone, checks every OAuth-backed provider with presence + live logic,
+ * reports BWS API-key lanes as unprobed, and guarantees clone destruction.
+ *
+ * Progress is emitted only via stderr; the return value is the list of provider
+ * qualification results.
+ *
+ * @param {ParallelsExecutionBackend} executionBackend
+ * @param {Array<object>} [providers]
+ * @param {object} [options]
+ * @returns {Array<{name: string, authenticated: boolean, live?: boolean|null, reason?: string|null, authMode?: string}>}
+ */
+export function qualifyCloneAuth(
+	executionBackend,
+	providers = PROVIDERS,
+	options = {},
+) {
+	return withDisposableClone(
+		executionBackend,
+		(workspaceId) =>
+			reportProviderStatus(providers, {
+				live: true,
+				workspaceId,
+				executionBackend,
+			}),
+		options,
+	);
+}
+
+/**
+ * Run clone qualification, print progress to stderr and terminal provider summary
+ * to stdout, and set the exit code (1 if any provider is unauthenticated or not
+ * positively live-probed, or if BWS lanes remain unprobed; 0 only if all pass).
+ *
+ * @param {ParallelsExecutionBackend} executionBackend
+ * @param {Array<object>} [providers]
+ * @param {object} [options]
+ */
+export function runCloneCheck(
+	executionBackend,
+	providers = PROVIDERS,
+	options = {},
+) {
+	let statuses;
+	try {
+		statuses = qualifyCloneAuth(executionBackend, providers, options);
+	} catch (error) {
+		console.error(error.message);
+		process.exitCode = 1;
+		return;
+	}
+	console.log(
+		"=== Clone auth qualification (read-only disposable clone — live probes run for OAuth providers; BWS lanes remain unprobed) ===",
+	);
+	for (const status of statuses) {
+		if (status.authMode === "ephemeral_api_key_dispatch") {
+			console.log(
+				`${status.name}: BWS runtime dispatch (no OAuth login; live status unprobed)`,
+			);
+			continue;
+		}
+		if (!status.authenticated) {
+			console.log(`${status.name}: NOT AUTHENTICATED`);
+			continue;
+		}
+		if (status.live === null) {
+			console.log(`${status.name}: authenticated`);
+			continue;
+		}
+		console.log(
+			status.live
+				? `${status.name}: authenticated (live)`
+				: `${status.name}: AUTHENTICATED BUT NOT LIVE — ${status.reason}`,
+		);
+	}
+	process.exitCode = statuses.some(
+		(status) => !status.authenticated || status.live !== true,
+	)
+		? 1
+		: 0;
+}
+
 function main(argv = process.argv.slice(2)) {
 	const executionBackend = createExecutionBackend();
+
+	// `--clone`: read-only clone qualification against a disposable clone, never
+	// a login. Measures then creates one disposable linked clone, checks presence + liveness,
+	// emits progress on stderr, prints terminal summary on stdout, and destroys
+	// the clone.
+	if (argv.includes("--clone")) {
+		runCloneCheck(executionBackend);
+		return;
+	}
 
 	// `--check`: read-only status, never a login. The default (no flag) is the
 	// full walkthrough, which logs in anything unauthenticated. `--live` adds a

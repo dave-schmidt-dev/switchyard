@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	AGY_LOGIN_COMMAND,
@@ -6,8 +6,11 @@ import {
 	COPILOT_LOGIN_COMMAND,
 	ensureProvidersAuthenticated,
 	PROVIDERS,
+	qualifyCloneAuth,
 	reportProviderStatus,
 	runCheck,
+	runCloneCheck,
+	withDisposableClone,
 } from "../src/switchyard/auth/index.mjs";
 
 function fakeProvider(name, { authenticatedSequence }) {
@@ -543,6 +546,380 @@ describe("liveness gating", () => {
 			);
 		} finally {
 			console.log = originalLog;
+			process.exitCode = originalExitCode;
+		}
+	});
+});
+
+describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposableClone)", () => {
+	it("withDisposableClone creates managed clone and destroys it in finally block", () => {
+		const calls = [];
+		const backend = {
+			goldenImage: "golden-vm",
+			aquaUid: "501",
+			providerUser: "switchyard",
+			measureLinkedClone: (goldenImage, options) => {
+				calls.push({ type: "measure", goldenImage, options });
+				return { goldenImage, diskBytes: 1, cloneToBootMs: 1 };
+			},
+			create: (goldenImage, options) => {
+				calls.push({ type: "create", goldenImage, options });
+				return "clone-uuid-1";
+			},
+			destroy: (uuid) => {
+				calls.push({ type: "destroy", uuid });
+			},
+		};
+
+		const result = withDisposableClone(backend, (uuid) => {
+			strictEqual(uuid, "clone-uuid-1");
+			return "success";
+		});
+
+		strictEqual(result, "success");
+		strictEqual(calls.length, 3);
+		strictEqual(calls[0].type, "measure");
+		strictEqual(calls[0].goldenImage, "golden-vm");
+		strictEqual(calls[0].options.aquaUid, "501");
+		strictEqual(calls[0].options.providerUser, "switchyard");
+		strictEqual(calls[1].type, "create");
+		strictEqual(calls[1].goldenImage, "golden-vm");
+		strictEqual(calls[1].options.linked, true);
+		deepStrictEqual(calls[1].options.linkedCloneMeasurement, {
+			goldenImage: "golden-vm",
+			diskBytes: 1,
+			cloneToBootMs: 1,
+		});
+		strictEqual(calls[1].options.aquaUid, "501");
+		strictEqual(calls[1].options.providerUser, "switchyard");
+		ok(
+			calls[1].options.runId.startsWith("auth-qualification-"),
+			"runId must have auth-qualification prefix",
+		);
+		strictEqual(calls[2].type, "destroy");
+		strictEqual(calls[2].uuid, "clone-uuid-1");
+	});
+
+	it("withDisposableClone fails fast when goldenImage or aquaUid is missing", () => {
+		throws(
+			() => withDisposableClone({ aquaUid: "501" }, () => {}),
+			/SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set/,
+		);
+		throws(
+			() => withDisposableClone({ goldenImage: "golden" }, () => {}),
+			/SWITCHYARD_PARALLELS_AQUA_UID must be set/,
+		);
+		throws(
+			() =>
+				withDisposableClone(
+					{ goldenImage: "golden", aquaUid: "not-a-number" },
+					() => {},
+				),
+			/SWITCHYARD_PARALLELS_AQUA_UID must be set/,
+		);
+	});
+
+	it("withDisposableClone destroys clone even when callback throws", () => {
+		const destroyed = [];
+		const backend = {
+			goldenImage: "golden-vm",
+			aquaUid: "501",
+			measureLinkedClone: () => ({}),
+			create: () => "clone-uuid-err",
+			destroy: (uuid) => destroyed.push(uuid),
+		};
+
+		throws(
+			() =>
+				withDisposableClone(backend, () => {
+					throw new Error("probe exploded");
+				}),
+			/probe exploded/,
+		);
+
+		strictEqual(destroyed.length, 1);
+		strictEqual(destroyed[0], "clone-uuid-err");
+	});
+
+	it("withDisposableClone handles destroy failure gracefully and logs to stderr", () => {
+		const stderr = [];
+		const originalError = console.error;
+		console.error = (...args) => stderr.push(args.join(" "));
+
+		const backend = {
+			goldenImage: "golden-vm",
+			aquaUid: "501",
+			measureLinkedClone: () => ({}),
+			create: () => "clone-uuid-destroy-err",
+			destroy: () => {
+				throw new Error("prlctl delete failed");
+			},
+		};
+
+		try {
+			throws(
+				() =>
+					withDisposableClone(backend, () => {
+						throw new Error("inner failure");
+					}),
+				/inner failure/,
+			);
+			ok(
+				stderr.some((line) =>
+					line.includes("failed to destroy disposable linked clone"),
+				),
+				"destroy failure must be logged as a warning to stderr",
+			);
+		} finally {
+			console.error = originalError;
+		}
+	});
+
+	it("qualifyCloneAuth creates disposable clone, checks OAuth providers live, leaves BWS unprobed, and destroys clone", () => {
+		const created = [];
+		const destroyed = [];
+		const checkedWorkspaces = [];
+		const liveWorkspaces = [];
+
+		const backend = {
+			goldenImage: "switchyard-golden-6",
+			aquaUid: "503",
+			providerUser: "switchyard",
+			measureLinkedClone: () => ({ receipt: "linked" }),
+			create: (image, opts) => {
+				created.push({ image, opts });
+				return "disposable-clone-uuid";
+			},
+			destroy: (uuid) => {
+				destroyed.push(uuid);
+			},
+		};
+
+		const providers = [
+			{
+				name: "codex",
+				isAuthenticated: (workspaceId, execBackend) => {
+					checkedWorkspaces.push({
+						name: "codex",
+						workspaceId,
+						execBackend,
+					});
+					return true;
+				},
+				isLive: (workspaceId, execBackend) => {
+					liveWorkspaces.push({ name: "codex", workspaceId, execBackend });
+					return { live: true, reason: null, kind: null };
+				},
+			},
+			{
+				name: "claude",
+				isAuthenticated: (workspaceId, execBackend) => {
+					checkedWorkspaces.push({
+						name: "claude",
+						workspaceId,
+						execBackend,
+					});
+					return true;
+				},
+				isLive: (workspaceId, execBackend) => {
+					liveWorkspaces.push({ name: "claude", workspaceId, execBackend });
+					return {
+						live: false,
+						reason: "session expired",
+						kind: "auth_expired",
+					};
+				},
+			},
+			{
+				name: "opencode",
+				authMode: "ephemeral_api_key_dispatch",
+			},
+		];
+
+		const results = qualifyCloneAuth(backend, providers);
+
+		strictEqual(created.length, 1);
+		strictEqual(destroyed.length, 1);
+		strictEqual(destroyed[0], "disposable-clone-uuid");
+
+		// Both OAuth providers were checked inside the disposable clone workspace
+		strictEqual(checkedWorkspaces.length, 2);
+		strictEqual(checkedWorkspaces[0].workspaceId, "disposable-clone-uuid");
+		strictEqual(checkedWorkspaces[1].workspaceId, "disposable-clone-uuid");
+		strictEqual(liveWorkspaces.length, 2);
+		strictEqual(liveWorkspaces[0].workspaceId, "disposable-clone-uuid");
+		strictEqual(liveWorkspaces[1].workspaceId, "disposable-clone-uuid");
+
+		deepStrictEqual(results, [
+			{ name: "codex", authenticated: true, live: true, reason: null },
+			{
+				name: "claude",
+				authenticated: true,
+				live: false,
+				reason: "session expired",
+			},
+			{
+				name: "opencode",
+				authenticated: true,
+				live: null,
+				reason: null,
+				authMode: "ephemeral_api_key_dispatch",
+			},
+		]);
+	});
+
+	it("runCloneCheck emits progress to stderr, terminal summary to stdout, and exits 0 when all OAuth providers pass", () => {
+		const stdout = [];
+		const stderr = [];
+		const originalLog = console.log;
+		const originalError = console.error;
+		const originalExitCode = process.exitCode;
+		console.log = (...args) => stdout.push(args.join(" "));
+		console.error = (...args) => stderr.push(args.join(" "));
+		process.exitCode = undefined;
+
+		const backend = {
+			goldenImage: "golden",
+			aquaUid: "501",
+			measureLinkedClone: () => ({}),
+			create: () => "clone-123",
+			destroy: () => {},
+		};
+		const providers = [
+			liveProvider("codex", { authenticated: true, live: true }),
+			liveProvider("claude", { authenticated: true, live: true }),
+		];
+
+		try {
+			runCloneCheck(backend, providers);
+			strictEqual(process.exitCode, 0);
+
+			// Progress only to stderr
+			ok(
+				stderr.some((line) =>
+					line.includes("Creating disposable linked clone"),
+				),
+				"stderr must contain clone creation progress",
+			);
+			ok(
+				stderr.some((line) => line.includes("Destroying disposable clone")),
+				"stderr must contain clone destruction progress",
+			);
+
+			// Stdout must NOT contain progress
+			ok(
+				!stdout.some((line) =>
+					line.includes("Creating disposable linked clone"),
+				),
+				"stdout must not contain progress logs",
+			);
+
+			// Stdout must contain qualification header and terminal summary
+			ok(
+				stdout.some((line) => line.includes("Clone auth qualification")),
+				"stdout must contain clone qualification header",
+			);
+			ok(
+				stdout.some((line) => line.includes("codex: authenticated (live)")),
+				"stdout must show codex live",
+			);
+			ok(
+				stdout.some((line) => line.includes("claude: authenticated (live)")),
+				"stdout must show claude live",
+			);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = originalExitCode;
+		}
+	});
+
+	it("runCloneCheck fails closed when an unprobed BWS lane or dead OAuth provider is present", () => {
+		const stdout = [];
+		const stderr = [];
+		const originalLog = console.log;
+		const originalError = console.error;
+		const originalExitCode = process.exitCode;
+		console.log = (...args) => stdout.push(args.join(" "));
+		console.error = (...args) => stderr.push(args.join(" "));
+		process.exitCode = undefined;
+
+		const backend = {
+			goldenImage: "golden",
+			aquaUid: "501",
+			measureLinkedClone: () => ({}),
+			create: () => "clone-123",
+			destroy: () => {},
+		};
+		const providers = [
+			liveProvider("codex", { authenticated: true, live: true }),
+			liveProvider("claude", { authenticated: true, live: false }),
+			{
+				name: "opencode",
+				authMode: "ephemeral_api_key_dispatch",
+			},
+		];
+
+		try {
+			runCloneCheck(backend, providers);
+			strictEqual(process.exitCode, 1);
+
+			ok(
+				stdout.some((line) =>
+					line.includes(
+						"claude: AUTHENTICATED BUT NOT LIVE — provider did not answer",
+					),
+				),
+				"stdout must report dead claude",
+			);
+			ok(
+				stdout.some((line) =>
+					line.includes(
+						"opencode: BWS runtime dispatch (no OAuth login; live status unprobed)",
+					),
+				),
+				"stdout must report opencode unprobed",
+			);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
+			process.exitCode = originalExitCode;
+		}
+	});
+
+	it("runCloneCheck handles backend clone error gracefully and exits 1", () => {
+		const stdout = [];
+		const stderr = [];
+		const originalLog = console.log;
+		const originalError = console.error;
+		const originalExitCode = process.exitCode;
+		console.log = (...args) => stdout.push(args.join(" "));
+		console.error = (...args) => stderr.push(args.join(" "));
+		process.exitCode = undefined;
+
+		const backend = {
+			goldenImage: "golden",
+			aquaUid: "501",
+			measureLinkedClone: () => ({}),
+			create: () => {
+				throw new Error("Parallels clone failure");
+			},
+			destroy: () => {},
+		};
+
+		try {
+			runCloneCheck(backend, [
+				liveProvider("codex", { authenticated: true, live: true }),
+			]);
+			strictEqual(process.exitCode, 1);
+			ok(
+				stderr.some((line) => line.includes("Parallels clone failure")),
+				"backend error must be logged to stderr",
+			);
+			strictEqual(stdout.length, 0);
+		} finally {
+			console.log = originalLog;
+			console.error = originalError;
 			process.exitCode = originalExitCode;
 		}
 	});
