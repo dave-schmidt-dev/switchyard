@@ -6,12 +6,13 @@
 //   npm run auth:check        read-only status report — never attempts a login
 //   npm run auth:check:live   the same report, plus one real request per
 //                              probeable provider (BWS lanes are unprobed)
-//   node src/switchyard/auth/index.mjs --clone
+//   node src/switchyard/auth/index.mjs --clone [--receipt <path>]
 //                             read-only clone qualification: creates one
 //                             disposable linked clone, probes every OAuth
 //                             provider inside it with presence + live check,
 //                             reports BWS lanes as unprobed, emits progress to
 //                             stderr, outputs a terminal summary to stdout,
+//                             optionally persists a sanitized qualification receipt,
 //                             and always destroys the clone.
 //
 // Every command above boots the golden image, does its work, and stops it
@@ -46,6 +47,8 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { isAgyAuthenticated } from "../adapter/agy.mjs";
 import { isClaudeAuthenticated } from "../adapter/claude.mjs";
 import { isCodexAuthenticated } from "../adapter/codex.mjs";
@@ -619,25 +622,106 @@ export function qualifyCloneAuth(
 	);
 }
 
+export const CLONE_QUALIFICATION_RECEIPT_SCHEMA_VERSION = 1;
+
+export const CLONE_RECEIPT_ERROR_KINDS = Object.freeze([
+	"clone_qualification_failed",
+	"clone_execution_failed",
+]);
+
+/**
+ * Format a strictly sanitized clone qualification receipt.
+ * Contains only fixed schemaVersion, sanitized provider entries (name, authenticated,
+ * live, authMode), and a static terminal errorKind.
+ * Deliberately excludes and drops reasons, error messages, raw output, workspace IDs,
+ * VM names, and credentials.
+ *
+ * @param {Array<object>} [statuses]
+ * @param {string|null} [errorKind]
+ * @returns {{schemaVersion: number, providers: Array<{name: string, authenticated: boolean, live: boolean|null, authMode?: string}>, errorKind: string|null}}
+ */
+export function formatCloneReceipt(statuses = [], errorKind = null) {
+	const sanitizedProviders = (statuses || []).map((status) => {
+		const entry = {
+			name: String(status?.name ?? ""),
+			authenticated: status?.authenticated === true,
+			live: typeof status?.live === "boolean" ? status.live : null,
+		};
+		if (typeof status?.authMode === "string") {
+			entry.authMode = status.authMode;
+		}
+		return entry;
+	});
+
+	return {
+		schemaVersion: CLONE_QUALIFICATION_RECEIPT_SCHEMA_VERSION,
+		providers: sanitizedProviders,
+		errorKind: errorKind ?? null,
+	};
+}
+
+/**
+ * Write a sanitized clone qualification receipt to disk atomically.
+ * Writes to a unique temporary file in the destination directory and renames
+ * it over the destination path.
+ *
+ * @param {string} receiptPath Destination file path.
+ * @param {object} receipt The receipt object to write.
+ */
+export function writeCloneReceipt(receiptPath, receipt) {
+	if (!receiptPath || typeof receiptPath !== "string") {
+		throw new TypeError("receiptPath must be a non-empty string");
+	}
+	mkdirSync(dirname(receiptPath), { recursive: true });
+	const tmpPath = `${receiptPath}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(tmpPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+	try {
+		renameSync(tmpPath, receiptPath);
+	} catch (error) {
+		try {
+			unlinkSync(tmpPath);
+		} catch {
+			// ignore cleanup error
+		}
+		throw error;
+	}
+}
+
 /**
  * Run clone qualification, print progress to stderr and terminal provider summary
- * to stdout, and set the exit code (1 if any provider is unauthenticated or not
- * positively live-probed, or if BWS lanes remain unprobed; 0 only if all pass).
+ * to stdout, optionally persist a sanitized qualification receipt, and set the exit code
+ * (1 if any provider is unauthenticated or not positively live-probed, or if BWS lanes
+ * remain unprobed; 0 only if all pass).
  *
  * @param {ParallelsExecutionBackend} executionBackend
  * @param {Array<object>} [providers]
  * @param {object} [options]
+ * @param {string} [options.receipt] File path to persist sanitized qualification receipt.
+ * @param {string} [options.receiptPath] Alias for options.receipt.
  */
 export function runCloneCheck(
 	executionBackend,
 	providers = PROVIDERS,
 	options = {},
 ) {
+	const receiptPath = options.receipt ?? options.receiptPath ?? null;
 	let statuses;
 	try {
 		statuses = qualifyCloneAuth(executionBackend, providers, options);
 	} catch (error) {
 		console.error(error.message);
+		if (receiptPath) {
+			try {
+				writeCloneReceipt(
+					receiptPath,
+					formatCloneReceipt([], "clone_execution_failed"),
+				);
+			} catch (receiptError) {
+				console.error(
+					`warning: failed to write qualification receipt: ${receiptError.message}`,
+				);
+			}
+		}
 		process.exitCode = 1;
 		return;
 	}
@@ -665,11 +749,39 @@ export function runCloneCheck(
 				: `${status.name}: AUTHENTICATED BUT NOT LIVE — ${status.reason}`,
 		);
 	}
-	process.exitCode = statuses.some(
+	const hasFailure = statuses.some(
 		(status) => !status.authenticated || status.live !== true,
-	)
-		? 1
-		: 0;
+	);
+	if (receiptPath) {
+		try {
+			writeCloneReceipt(
+				receiptPath,
+				formatCloneReceipt(
+					statuses,
+					hasFailure ? "clone_qualification_failed" : null,
+				),
+			);
+		} catch (receiptError) {
+			console.error(
+				`warning: failed to write qualification receipt: ${receiptError.message}`,
+			);
+		}
+	}
+	process.exitCode = hasFailure ? 1 : 0;
+}
+
+export function parseCloneArgs(argv) {
+	let receipt = null;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--receipt" && i + 1 < argv.length) {
+			receipt = argv[i + 1];
+			i++;
+		} else if (arg.startsWith("--receipt=")) {
+			receipt = arg.slice("--receipt=".length);
+		}
+	}
+	return { receipt };
 }
 
 function main(argv = process.argv.slice(2)) {
@@ -677,10 +789,11 @@ function main(argv = process.argv.slice(2)) {
 
 	// `--clone`: read-only clone qualification against a disposable clone, never
 	// a login. Measures then creates one disposable linked clone, checks presence + liveness,
-	// emits progress on stderr, prints terminal summary on stdout, and destroys
-	// the clone.
+	// emits progress on stderr, prints terminal summary on stdout, optionally writes
+	// a sanitized receipt, and destroys the clone.
 	if (argv.includes("--clone")) {
-		runCloneCheck(executionBackend);
+		const { receipt } = parseCloneArgs(argv);
+		runCloneCheck(executionBackend, PROVIDERS, receipt ? { receipt } : {});
 		return;
 	}
 
