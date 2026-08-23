@@ -188,16 +188,12 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
  * Providers whose golden-image-baked auth has been proven, by a real
  * clone-survival test, to persist through cloning: log in once in the
  * golden image, clone it, and confirm the clone is still authenticated with
- * no fresh login. `codex` is verified this way. OpenCode Go and Vibe/Mistral
- * are separately qualified via their fixed BWS API-key bridge, which injects
- * no persistent credential into the golden image or clone. The macOS queue
- * admits either evidence class but keeps every other provider fail-closed.
+ * no fresh login. `codex` is verified this way. OpenCode Go is separately
+ * qualified via its fixed BWS API-key bridge, which injects no persistent
+ * credential into the golden image or clone. The macOS queue admits either
+ * evidence class but keeps every other provider fail-closed.
  */
-const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
-	"codex",
-	"opencode-go",
-	"vibe",
-]);
+const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze(["codex", "opencode-go"]);
 
 /**
  * Golden-image verification is normally recorded at the adapter/harness
@@ -607,11 +603,9 @@ export function route(options = {}) {
 		if (!availableProviders) return true;
 		/*
 		 * A snapshot display name can identify a target whose harness is shared
-		 * with another target (for example `Vibe` and `OpenCode Go` both use the
-		 * OpenCode adapter). Resolve the display name to its declared harness
-		 * before comparing it with the adapter registry; normalizing `Vibe` to a
-		 * fictional `vibe` adapter would incorrectly reject the OpenCode-backed
-		 * implementation route.
+		 * with another target. Resolve the display name to its declared harness
+		 * before comparing it with the adapter registry; normalizing only the
+		 * display name would incorrectly reject a shared-harness route.
 		 */
 		const requestedIdentity = resolveTargetIdentity(name);
 		const requestedHarness = requestedIdentity.targetId

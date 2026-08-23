@@ -1953,8 +1953,9 @@ function resolveTaskExecutor(task) {
  * Resolve the required capability from the task contract. A declared
  * `task.requiredCapability` takes precedence, and explicit low/high values
  * require a non-empty justification. Missing capability fields use the
- * standard lane; this keeps legacy records readable without re-running the
- * keyword classifier or silently escalating them to high.
+ * standard lane only as a compatibility default for legacy records. Newly
+ * authored queues declare the field explicitly; runtime never infers it from
+ * task prose or silently escalates it to high.
  * @param {{id: string, requiredCapability?: string|null, requiredCapabilityJustification?: string|null, tier?: unknown, description?: string, title?: string}} task
  * @returns {string} required capability ('high'|'standard'|'low')
  * @throws {Error} if a retired task.tier or invalid capability is present

@@ -119,7 +119,7 @@ if [ -n "$descendants" ]; then
 fi
 [ -z "$survivors" ]
 `;
-const BWS_SECRET_EXEC = "/Users/dave/Documents/Projects/bws/bws-secret-exec";
+const BWS_SECRET_EXEC = "/Users/dave/Documents/Projects/bws/bws-secret-exec.py";
 const OPENCODE_BWS_CONSUMERS = Object.freeze({
 	"opencode-go/": "switchyard-opencode-go-dispatch",
 	"mistral/": "switchyard-opencode-mistral-dispatch",

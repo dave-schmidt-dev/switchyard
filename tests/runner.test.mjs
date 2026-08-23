@@ -1163,7 +1163,7 @@ describe("runner queue parsing", () => {
 - **Files:** src/a.mjs
 - **Executor:** switchyard
 - **RequiredCapability:** Standard
-- **Description:** Whatever classifyTask would guess is irrelevant here
+- **Description:** Task prose does not select the capability lane
 `;
 		const tasks = parseFixture(markdown);
 		strictEqual(tasks.length, 1);
@@ -7921,11 +7921,9 @@ describe("runner task contract resolution", () => {
 		};
 	}
 
-	it("executeTask routes at RequiredCapability, not classifyTask's guess from the description", () => {
+	it("executeTask routes at RequiredCapability regardless of description text", () => {
 		const routeCalls = [];
-		// "format the readme" is an unambiguous low-capability keyword match in
-		// classifier.mjs (format/readme) -- classifyTask would call this
-		// "low". The declared capability must win instead.
+		// Description text must never override the declared capability.
 		executeTask(
 			{
 				id: "1.1",
@@ -7941,7 +7939,7 @@ describe("runner task contract resolution", () => {
 		strictEqual(routeCalls[0].requiredCapability, "high");
 	});
 
-	it("programmatic task objects with an omitted capability use standard", () => {
+	it("legacy programmatic task objects with an omitted capability use standard", () => {
 		const routeCalls = [];
 		executeTask(
 			{
@@ -8018,7 +8016,7 @@ describe("runner task contract resolution", () => {
 		}
 	});
 
-	it("executeTaskWithOrchestrator routes at RequiredCapability, not classifyTask's guess", async () => {
+	it("executeTaskWithOrchestrator routes at RequiredCapability regardless of description", async () => {
 		const routeCalls = [];
 		const result = await executeTaskWithOrchestrator(
 			{

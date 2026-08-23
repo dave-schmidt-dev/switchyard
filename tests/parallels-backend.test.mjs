@@ -86,7 +86,7 @@ describe("Parallels execution backend lifecycle", () => {
 		const go = backend.ephemeralOpenCodeKeyExecution(WORK_UUID, request);
 		strictEqual(
 			go.command,
-			"/Users/dave/Documents/Projects/bws/bws-secret-exec",
+			"/Users/dave/Documents/Projects/bws/bws-secret-exec.py",
 		);
 		deepStrictEqual(go.args, ["switchyard-opencode-go-dispatch", "--"]);
 		deepStrictEqual(JSON.parse(go.input), {

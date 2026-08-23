@@ -432,9 +432,8 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 	});
 
 	it("skips a fixture-disabled Vibe target even with the most headroom", () => {
-		// This fixture isolates disabled-target handling. Production Vibe is an
-		// enabled OpenCode-backed implementation target; its separate exact-
-		// descriptor gate is covered above.
+		// This fixture isolates disabled-target handling. Production Vibe is also
+		// disabled until its native-harness descriptor is qualified.
 		createTestSnapshot([
 			{
 				name: "claude",

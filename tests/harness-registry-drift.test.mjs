@@ -21,9 +21,9 @@
 // switchyard-dispatch targets from ~/.agent/roster.json.
 //   - Catalog-only entries (`claude-fable-5`, `kimi-k2.7-code`) are never
 //     targets at all -- nothing to iterate.
-//   - `vibe` is an enabled implementation target backed by the existing
-//     OpenCode adapter; its exact snapshot target is checked like every other
-//     enabled target, so no standalone vibe.mjs adapter is required.
+//   - `vibe` is a disabled native-harness target until a real vibe.mjs adapter
+//     and its fixed credential transport are installed. Disabled targets are
+//     documented explicitly but are not admitted to dispatch.
 //   - `pi` is not a switchyard-dispatch target (review-wrapper only,
 //     decision #6) and has no roster.json target entry to iterate.
 //
@@ -31,7 +31,7 @@
 // tests/router-usage-provider.test.mjs, Task 1.5b) rather than via a
 // fixture: the whole point is checking the real file, not a copy.
 
-import { ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import {
 	mkdtempSync,
 	readdirSync,
@@ -148,11 +148,19 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	it("vibe is an enabled OpenCode-backed implementation target", () => {
+	it("vibe is a disabled native-harness target pending its adapter", () => {
 		ok("vibe" in targets, "expected a vibe target entry");
-		strictEqual(targets.vibe?.enabled, true);
-		strictEqual(targets.vibe?.harness, "opencode");
+		strictEqual(targets.vibe?.enabled, false);
+		strictEqual(targets.vibe?.harness, "vibe");
 		strictEqual(targets.vibe?.snapshot_name, "Vibe");
+		strictEqual(targets.vibe?.technical_ceiling, "standard");
+		deepStrictEqual(targets.vibe?.slots?.standard, [
+			{ model_ref: "mistral/zai-glm-5-2", priority: 1 },
+		]);
+		strictEqual(
+			targets.vibe?.qualifications?.["mistral/zai-glm-5-2"]?.status,
+			"untested",
+		);
 	});
 
 	it("pi is not a switchyard-dispatch target", () => {
