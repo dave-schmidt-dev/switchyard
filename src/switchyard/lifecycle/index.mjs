@@ -29,7 +29,7 @@ export function seedProjectWithBackend(
 	});
 	const receipt = executionBackend.pushTar(workspaceId, tar, "/project");
 	const script =
-		"git init -q && git add -A -f && git -c user.name=switchyard -c user.email=switchyard@localhost commit -qm baseline";
+		"git init -q && git add -A -f && git -c user.name=switchyard -c user.email=switchyard@localhost commit --allow-empty -qm baseline";
 	if (typeof executionBackend.execGuest === "function") {
 		executionBackend.execGuest(workspaceId, "/bin/bash", ["-lc", script], {
 			cwd: "/project",

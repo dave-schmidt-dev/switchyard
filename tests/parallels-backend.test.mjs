@@ -475,6 +475,7 @@ describe("Parallels execution backend lifecycle", () => {
 		// appended to a prefix the backend never sees and so cannot quote.
 		deepStrictEqual(calls[1].options.argv.slice(0, 2), ["/bin/bash", "-lc"]);
 		ok(calls[1].options.argv[2].startsWith("git init -q"));
+		ok(calls[1].options.argv[2].includes("commit --allow-empty -qm baseline"));
 	});
 
 	it("uses the reserved run-and-pid grammar and rejects malformed ownership", () => {
