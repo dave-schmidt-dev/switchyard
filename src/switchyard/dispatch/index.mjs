@@ -114,12 +114,14 @@ const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <pa
 
 const USAGE_STATUS = `Usage: switchyard-dispatch status <run-id> [--json]
 
-  --json     Output as JSON (default behavior)
+  --json                    Output as JSON (default behavior)
+  --state-root <path>       Read the run from this launch's durable state root
   --help     Show this help`;
 
 const USAGE_RESULT = `Usage: switchyard-dispatch result <run-id> [--json]
 
-  --json     Output as JSON (default behavior)
+  --json                    Output as JSON (default behavior)
+  --state-root <path>       Read the run from this launch's durable state root
   --help     Show this help`;
 
 const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>]
@@ -306,6 +308,7 @@ function parseStatusArgs(argv) {
 			options: {
 				help: { type: "boolean", default: false },
 				json: { type: "boolean", default: false },
+				"state-root": { type: "string" },
 			},
 		});
 	} catch (error) {
@@ -317,7 +320,27 @@ function parseStatusArgs(argv) {
 		help: values.help,
 		runId: positionals[0] ?? null,
 		json: values.json,
+		stateRoot: values["state-root"] ?? null,
 	};
+}
+
+function shellQuote(value) {
+	return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+async function withStateRoot(stateRoot, operation) {
+	if (!stateRoot) return operation();
+	const previous = process.env.SWITCHYARD_RUN_STORE_ROOT;
+	process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+	try {
+		return await operation();
+	} finally {
+		if (previous === undefined) {
+			delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		} else {
+			process.env.SWITCHYARD_RUN_STORE_ROOT = previous;
+		}
+	}
 }
 
 /**
@@ -850,8 +873,9 @@ async function handleLaunch(argv) {
 		runId,
 		state: "launcher_ready",
 		queueIdentity: readyRun.queueIdentity ?? null,
-		statusCommand: `switchyard-dispatch status ${runId}`,
-		resultCommand: `switchyard-dispatch result ${runId}`,
+		stateRoot,
+		statusCommand: `switchyard-dispatch status ${runId} --state-root ${shellQuote(stateRoot)}`,
+		resultCommand: `switchyard-dispatch result ${runId} --state-root ${shellQuote(stateRoot)}`,
 	};
 	console.log(JSON.stringify(envelope));
 }
@@ -1300,7 +1324,7 @@ function isCleanupComplete(cleanupState) {
  * @param {string[]} argv arguments after the subcommand
  */
 async function handleStatus(argv) {
-	const { help, runId, json: _json } = parseStatusArgs(argv);
+	const { help, runId, json: _json, stateRoot } = parseStatusArgs(argv);
 
 	if (help) {
 		console.log(USAGE_STATUS);
@@ -1311,28 +1335,30 @@ async function handleStatus(argv) {
 		throw new UsageError("missing <run-id> positional argument");
 	}
 
-	let run;
-	try {
-		run = await readRun(runId);
-	} catch (error) {
-		if (error instanceof SchemaError || error?.name === "SchemaError") {
-			console.error(
-				`status: corrupt or unsupported state for ${runId}: ${error.message}`,
-			);
-			process.exitCode = 4;
-			return;
+	return withStateRoot(stateRoot, async () => {
+		let run;
+		try {
+			run = await readRun(runId);
+		} catch (error) {
+			if (error instanceof SchemaError || error?.name === "SchemaError") {
+				console.error(
+					`status: corrupt or unsupported state for ${runId}: ${error.message}`,
+				);
+				process.exitCode = 4;
+				return;
+			}
+			if (error.message?.includes("not found")) {
+				console.error(`status: run not found: ${runId}`);
+				process.exitCode = 3;
+				return;
+			}
+			throw error;
 		}
-		if (error.message?.includes("not found")) {
-			console.error(`status: run not found: ${runId}`);
-			process.exitCode = 3;
-			return;
-		}
-		throw error;
-	}
 
-	const envelope = await buildStatusEnvelope(runId, run);
-	console.log(JSON.stringify(envelope));
-	process.exitCode = 0;
+		const envelope = await buildStatusEnvelope(runId, run);
+		console.log(JSON.stringify(envelope));
+		process.exitCode = 0;
+	});
 }
 
 /**
@@ -1340,7 +1366,7 @@ async function handleStatus(argv) {
  * @param {string[]} argv arguments after the subcommand
  */
 async function handleResult(argv) {
-	const { help, runId, json: _json } = parseResultArgs(argv);
+	const { help, runId, json: _json, stateRoot } = parseResultArgs(argv);
 
 	if (help) {
 		console.log(USAGE_RESULT);
@@ -1351,39 +1377,43 @@ async function handleResult(argv) {
 		throw new UsageError("missing <run-id> positional argument");
 	}
 
-	let run;
-	try {
-		run = await readRun(runId);
-	} catch (error) {
-		if (error instanceof SchemaError || error?.name === "SchemaError") {
+	return withStateRoot(stateRoot, async () => {
+		let run;
+		try {
+			run = await readRun(runId);
+		} catch (error) {
+			if (error instanceof SchemaError || error?.name === "SchemaError") {
+				console.error(
+					`result: corrupt or unsupported state for ${runId}: ${error.message}`,
+				);
+				process.exitCode = 4;
+				return;
+			}
+			if (error.message?.includes("not found")) {
+				console.error(`result: run not found: ${runId}`);
+				process.exitCode = 3;
+				return;
+			}
+			throw error;
+		}
+
+		if (!isTerminalState(run.state)) {
 			console.error(
-				`result: corrupt or unsupported state for ${runId}: ${error.message}`,
+				`result: run ${runId} is not terminal (state: ${run.state})`,
 			);
-			process.exitCode = 4;
+			process.exitCode = 5;
 			return;
 		}
-		if (error.message?.includes("not found")) {
-			console.error(`result: run not found: ${runId}`);
-			process.exitCode = 3;
-			return;
+
+		const envelope = await buildResultEnvelope(runId, run);
+		console.log(JSON.stringify(envelope));
+
+		if (run.state === "succeeded" && isCleanupComplete(run.cleanupState)) {
+			process.exitCode = 0;
+		} else {
+			process.exitCode = 1;
 		}
-		throw error;
-	}
-
-	if (!isTerminalState(run.state)) {
-		console.error(`result: run ${runId} is not terminal (state: ${run.state})`);
-		process.exitCode = 5;
-		return;
-	}
-
-	const envelope = await buildResultEnvelope(runId, run);
-	console.log(JSON.stringify(envelope));
-
-	if (run.state === "succeeded" && isCleanupComplete(run.cleanupState)) {
-		process.exitCode = 0;
-	} else {
-		process.exitCode = 1;
-	}
+	});
 }
 
 async function resolveIsRunDead(runId, dependencies) {

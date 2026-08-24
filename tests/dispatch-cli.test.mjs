@@ -2,7 +2,13 @@
 // and backwards compatibility. Tests parse functions directly for deterministic
 // validation and spawns the CLI for exit-code / envelope contract verification.
 
-import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	rejects,
+	strictEqual,
+} from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -610,8 +616,48 @@ describe("launch integration", () => {
 		strictEqual(envelope.schemaVersion, 2);
 		ok(typeof envelope.runId === "string" && envelope.runId.length > 0);
 		strictEqual(envelope.state, "launcher_ready");
+		strictEqual(envelope.stateRoot, stateRoot);
 		ok(envelope.statusCommand.includes("switchyard-dispatch status"));
 		ok(envelope.resultCommand.includes("switchyard-dispatch result"));
+		ok(envelope.statusCommand.includes("--state-root"));
+		ok(envelope.resultCommand.includes("--state-root"));
+	});
+
+	it("launch envelope commands let a fresh shell poll a quoted state root", () => {
+		const quotedStateRoot = join(dir, "state'root");
+		const launched = runDispatch(
+			["launch", tasksFile, "--project", projectDir],
+			{
+				...makeStateRootEnv(),
+				SWITCHYARD_RUN_STORE_ROOT: quotedStateRoot,
+			},
+		);
+		strictEqual(launched.status, 0, `stderr: ${launched.stderr}`);
+		const envelope = JSON.parse(launched.stdout.trim());
+		strictEqual(envelope.stateRoot, quotedStateRoot);
+
+		const freshEnv = {
+			...process.env,
+			PATH: `/Users/dave/.agent/bin:${process.env.PATH ?? ""}`,
+			SWITCHYARD_ROSTER_PATH: ROSTER_FIXTURE_PATH,
+			SWITCHYARD_LEDGER_PATH: join(dir, "fresh-poller-ledger.jsonl"),
+		};
+		delete freshEnv.SWITCHYARD_RUN_STORE_ROOT;
+
+		const status = spawnSync("/bin/sh", ["-c", envelope.statusCommand], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			env: freshEnv,
+		});
+		strictEqual(status.status, 0, `stderr: ${status.stderr}`);
+		strictEqual(JSON.parse(status.stdout.trim()).runId, envelope.runId);
+
+		const result = spawnSync("/bin/sh", ["-c", envelope.resultCommand], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			env: freshEnv,
+		});
+		notStrictEqual(result.status, 3, `stderr: ${result.stderr}`);
 	});
 
 	it("launch with no --exclude-provider persists excludeProviders: [] on the run record", async () => {
@@ -1195,6 +1241,7 @@ describe("envelope format", () => {
 			"schemaVersion",
 			"runId",
 			"state",
+			"stateRoot",
 			"statusCommand",
 			"resultCommand",
 		];
