@@ -638,7 +638,7 @@ describe("launch integration", () => {
 
 		const freshEnv = {
 			...process.env,
-			PATH: `/Users/dave/.agent/bin:${process.env.PATH ?? ""}`,
+			PATH: `${join(process.env.HOME ?? "/", ".agent", "bin")}:${process.env.PATH ?? ""}`,
 			SWITCHYARD_ROSTER_PATH: ROSTER_FIXTURE_PATH,
 			SWITCHYARD_LEDGER_PATH: join(dir, "fresh-poller-ledger.jsonl"),
 		};
