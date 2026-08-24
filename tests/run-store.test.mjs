@@ -55,6 +55,9 @@ const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-run-store-"));
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
+process.env.SWITCHYARD_ROSTER_PATH = resolve(
+	"tests/fixtures/roster.fixture.json",
+);
 
 after(() => {
 	try {

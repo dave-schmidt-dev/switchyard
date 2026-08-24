@@ -108,6 +108,58 @@ const TELEMETRY_WRITE_FAILURE_LABELS = new Set([
 	"write_failed",
 ]);
 
+const SUCCESS_RESULTS = new Set(["success", "success_no_diff"]);
+
+const APPROVED_EVENT_KEYS = new Set([
+	"schemaVersion",
+	"sequence",
+	"timestamp",
+	"phase",
+	"event",
+	"status",
+	"taskId",
+	"provider",
+	"model",
+	"requiredCapability",
+	"resolvedTargetId",
+	"outcome",
+	"deadline",
+	"byteCount",
+	"container",
+	"executionPlatform",
+	"percentLeft",
+	"timedOut",
+	"targetId",
+	"completedCount",
+	"totalCount",
+	"processedTasks",
+	"completedTasks",
+	"halted",
+	"dispatchContractVersion",
+	"invocationDescriptor",
+	"descriptorIdentity",
+	"descriptorHarness",
+	"roster_sha256",
+	"roster_schema_version",
+	"resolved_target",
+	"resolved_harness",
+	"resolved_selector",
+	"resolved_credential_profile",
+	"quarantinedTargetIds",
+	"retryTransitionId",
+	"retryState",
+	"attempt",
+	"transitionType",
+	"errorKind",
+	"reasonCode",
+	"reason",
+	"artifactRef",
+	"diagnosticCode",
+	"exitCode",
+	"signal",
+	"failurePhase",
+]);
+
 function isSafeTargetId(value) {
 	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
 		return false;
@@ -1089,17 +1141,29 @@ export async function createEvent(runId, event) {
 	let current = await readRun(runId);
 	const nextSeq = current.lastEventSequence + 1;
 	const isFailureEvent =
-		event?.event === "task_failed" || event?.event === "queue_halted";
-	const suppliedFailure = isFailureEvent
-		? {
-				errorKind: event.errorKind,
-				reasonCode: event.reasonCode,
-				reason: event.reason,
-				...(event.artifactRef !== undefined
-					? { artifactRef: event.artifactRef }
-					: {}),
-			}
-		: null;
+		event?.event === "task_failed" ||
+		event?.event === "queue_halted" ||
+		event?.errorKind !== undefined ||
+		(event?.result !== undefined && !SUCCESS_RESULTS.has(event.result));
+	const suppliedFailure =
+		isFailureEvent && event?.errorKind
+			? {
+					errorKind: event.errorKind,
+					reasonCode: event.reasonCode,
+					reason: event.reason,
+					...(event.artifactRef !== undefined
+						? { artifactRef: event.artifactRef }
+						: {}),
+					...(event.diagnosticCode !== undefined
+						? { diagnosticCode: event.diagnosticCode }
+						: {}),
+					...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+					...(event.signal !== undefined ? { signal: event.signal } : {}),
+					...(event.failurePhase !== undefined
+						? { failurePhase: event.failurePhase }
+						: {}),
+				}
+			: null;
 	const safeFailure = isFailureEvent
 		? isPersistentFailureMetadata(suppliedFailure)
 			? suppliedFailure
@@ -1107,7 +1171,12 @@ export async function createEvent(runId, event) {
 					taskId: event.taskId,
 					result: event.result ?? "unknown_failure",
 					errorKind: event.errorKind,
+					timedOut: event.timedOut,
 					partialDiffPath: event.partialDiffPath,
+					diagnosticCode: event.diagnosticCode,
+					exitCode: event.exitCode,
+					signal: event.signal,
+					failurePhase: event.failurePhase,
 				})
 		: null;
 
@@ -1120,22 +1189,34 @@ export async function createEvent(runId, event) {
 		status: event.status,
 	};
 
-	const extra = { ...event };
-	delete extra.phase;
-	delete extra.event;
-	delete extra.status;
-	delete extra.sequence;
-	delete extra.timestamp;
-	if (safeFailure) {
-		delete extra.error;
-		delete extra.output;
-		delete extra.partialDiff;
-		delete extra.partialDiffPath;
-		delete extra.artifactRef;
-		delete extra.reason;
-		Object.assign(extra, safeFailure);
+	if (event && typeof event === "object") {
+		for (const key of Object.keys(event)) {
+			if (APPROVED_EVENT_KEYS.has(key)) {
+				entry[key] = event[key];
+			}
+		}
 	}
-	Object.assign(entry, extra);
+
+	entry.schemaVersion = current.schemaVersion;
+	entry.sequence = nextSeq;
+	entry.timestamp = new Date().toISOString();
+	entry.phase = event.phase;
+	entry.event = event.event;
+	entry.status = event.status;
+
+	if (safeFailure) {
+		delete entry.error;
+		delete entry.output;
+		delete entry.partialDiff;
+		delete entry.partialDiffPath;
+		delete entry.artifactRef;
+		delete entry.reason;
+		delete entry.diagnosticCode;
+		delete entry.exitCode;
+		delete entry.signal;
+		delete entry.failurePhase;
+		Object.assign(entry, safeFailure);
+	}
 
 	await appendFile(eventsPath, `${JSON.stringify(entry)}\n`, {
 		mode: 0o600,

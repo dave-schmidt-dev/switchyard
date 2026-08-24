@@ -43,6 +43,7 @@ import {
 	executeCursorAsync,
 } from "../adapter/cursor.mjs";
 import {
+	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
@@ -2048,7 +2049,12 @@ export function findIgnoredDeclaredPath(paths, projectPath = process.cwd()) {
 	}
 }
 
-function declaredPathNotSeededResult(task, ignoredPath, requiredCapability) {
+function declaredPathNotSeededResult(task, requiredCapability) {
+	const failure = sanitizeFailureMetadata({
+		taskId: task.id,
+		result: "declared_path_not_seeded",
+		errorKind: "declared_path_not_seeded",
+	});
 	return {
 		taskId: task.id,
 		success: false,
@@ -2056,11 +2062,7 @@ function declaredPathNotSeededResult(task, ignoredPath, requiredCapability) {
 		model: null,
 		requiredCapability,
 		result: "declared_path_not_seeded",
-		...sanitizeFailureMetadata({
-			taskId: task.id,
-			result: "declared_path_not_seeded",
-		}),
-		reason: `Task ${task.id} declares Git-ignored path "${ignoredPath}" which cannot be seeded or captured`,
+		...(failure ?? {}),
 	};
 }
 
@@ -2071,6 +2073,10 @@ function failureMetadataFor(result, partialDiffPath) {
 		errorKind: result.errorKind,
 		timedOut: result.timedOut,
 		partialDiffPath,
+		diagnosticCode: result.diagnosticCode,
+		exitCode: result.exitCode,
+		signal: result.signal,
+		failurePhase: result.failurePhase,
 	});
 }
 
@@ -2306,10 +2312,27 @@ function isQuotaRetryCandidate(result, ownsWorkingContainer) {
 	);
 }
 
-function integrationFailureMetadata(taskId, diff, credentialFlagged) {
+function integrationFailureMetadata(
+	taskId,
+	diff,
+	credentialFlagged,
+	gateResult = null,
+) {
+	const errorKind =
+		gateResult?.errorKind &&
+		PERSISTED_ERROR_KINDS.includes(gateResult.errorKind)
+			? gateResult.errorKind
+			: "integration_failed";
+	const diagnosticCode =
+		gateResult?.diagnosticCode ??
+		(PERSISTED_DIAGNOSTIC_CODES.includes(gateResult?.reasonKind)
+			? gateResult.reasonKind
+			: undefined);
 	return sanitizeFailureMetadata({
 		taskId,
 		result: "integration_failed",
+		errorKind,
+		diagnosticCode,
 		// The queue saves this diff as `<taskId>.diff`; derive the opaque pointer
 		// before recording the dispatch so the ledger can carry the same safe
 		// artifact identity without receiving the host path or diff body.
@@ -2343,7 +2366,7 @@ export function executeTask(task, context) {
 		context.projectPath,
 	);
 	if (ignoredPath) {
-		return declaredPathNotSeededResult(task, ignoredPath, requiredCapability);
+		return declaredPathNotSeededResult(task, requiredCapability);
 	}
 	const routeResult = context.route({
 		requiredCapability,
@@ -2572,21 +2595,33 @@ export function executeTask(task, context) {
 				: captureFailed
 					? "execution_timed_out_capture_failed"
 					: "execution_timed_out";
+			const errorKind =
+				(cleanupFailed && "provider_cleanup_failed") ||
+				(captureFailed && "diff_capture_failed") ||
+				execution.errorKind ||
+				null;
+			const safeTimeoutFailure = sanitizeFailureMetadata({
+				taskId: task.id,
+				result: resultName,
+				errorKind,
+				timedOut: true,
+			});
 			const error = cleanupFailed
-				? (execution.error ?? "provider cleanup failed after timeout")
+				? (execution.error ??
+					safeTimeoutFailure?.reason ??
+					"provider cleanup failed after timeout")
 				: captureFailed
-					? "diff capture failed after timeout"
+					? (safeTimeoutFailure?.reason ?? "diff capture failed after timeout")
 					: (execution.error ?? null);
 			record({
 				provider: routeResult.provider,
 				model: routeResult.model ?? "unknown",
 				taskId: task.id,
 				result: resultName,
-				errorKind:
-					(cleanupFailed && "provider_cleanup_failed") ||
-					(captureFailed && "diff_capture_failed") ||
-					execution.errorKind ||
-					null,
+				errorKind: safeTimeoutFailure?.errorKind ?? errorKind,
+				...(safeTimeoutFailure
+					? { reasonCode: safeTimeoutFailure.reasonCode }
+					: {}),
 				reason: error ?? routeResult.reason,
 				percentLeft: routeResult.percentLeft ?? undefined,
 			});
@@ -2600,11 +2635,13 @@ export function executeTask(task, context) {
 				resolvedTargetId,
 				result: resultName,
 				error,
-				errorKind:
-					(cleanupFailed && "provider_cleanup_failed") ||
-					(captureFailed && "diff_capture_failed") ||
-					execution.errorKind ||
-					null,
+				errorKind: safeTimeoutFailure?.errorKind ?? errorKind,
+				...(safeTimeoutFailure
+					? {
+							reasonCode: safeTimeoutFailure.reasonCode,
+							reason: safeTimeoutFailure.reason,
+						}
+					: {}),
 				timedOut: true,
 				...(partialDiff ? { partialDiff } : {}),
 			};
@@ -2685,7 +2722,12 @@ export function executeTask(task, context) {
 	const terminalResult = success ? "success" : "integration_failed";
 	const safeGateFailure = success
 		? null
-		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
+		: integrationFailureMetadata(
+				task.id,
+				diff,
+				gateResult?.credentialFlagged,
+				gateResult,
+			);
 	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
 	if (context.onStatus) {
@@ -2863,7 +2905,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		context.projectPath,
 	);
 	if (ignoredPath) {
-		return declaredPathNotSeededResult(task, ignoredPath, requiredCapability);
+		return declaredPathNotSeededResult(task, requiredCapability);
 	}
 	let broker = context.broker;
 	if (!broker) {
@@ -3269,21 +3311,37 @@ async function executeTaskAsyncUnsafe(task, context) {
 			: captureFailed
 				? "execution_timed_out_capture_failed"
 				: "execution_timed_out";
+		const errorKind =
+			(cleanupFailed && "provider_cleanup_failed") ||
+			(captureFailed && "diff_capture_failed") ||
+			execution.errorKind ||
+			null;
+		const safeTimeoutFailure = sanitizeFailureMetadata({
+			taskId: task.id,
+			result: resultName,
+			errorKind,
+			timedOut: true,
+			diagnosticCode: execution.diagnosticCode,
+			exitCode: execution.exitCode,
+			signal: execution.signal,
+			failurePhase: execution.failurePhase,
+		});
 		const error = cleanupFailed
-			? (execution.error ?? "provider cleanup failed after timeout")
+			? (execution.error ??
+				safeTimeoutFailure?.reason ??
+				"provider cleanup failed after timeout")
 			: captureFailed
-				? "diff capture failed after timeout"
+				? (safeTimeoutFailure?.reason ?? "diff capture failed after timeout")
 				: (execution.error ?? null);
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: resultName,
-			errorKind:
-				(cleanupFailed && "provider_cleanup_failed") ||
-				(captureFailed && "diff_capture_failed") ||
-				execution.errorKind ||
-				null,
+			errorKind: safeTimeoutFailure?.errorKind ?? errorKind,
+			...(safeTimeoutFailure
+				? { reasonCode: safeTimeoutFailure.reasonCode }
+				: {}),
 			reason: error ?? routeResult.reason,
 			diagnosticCode: execution.diagnosticCode,
 			exitCode: execution.exitCode,
@@ -3300,11 +3358,13 @@ async function executeTaskAsyncUnsafe(task, context) {
 			resolvedTargetId,
 			result: resultName,
 			error,
-			errorKind:
-				(cleanupFailed && "provider_cleanup_failed") ||
-				(captureFailed && "diff_capture_failed") ||
-				execution.errorKind ||
-				null,
+			errorKind: safeTimeoutFailure?.errorKind ?? errorKind,
+			...(safeTimeoutFailure
+				? {
+						reasonCode: safeTimeoutFailure.reasonCode,
+						reason: safeTimeoutFailure.reason,
+					}
+				: {}),
 			timedOut: true,
 			diagnosticCode: execution.diagnosticCode,
 			exitCode: execution.exitCode,
@@ -3360,7 +3420,12 @@ async function executeTaskAsyncUnsafe(task, context) {
 	const terminalResult = success ? "success" : "integration_failed";
 	const safeGateFailure = success
 		? null
-		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
+		: integrationFailureMetadata(
+				task.id,
+				diff,
+				gateResult?.credentialFlagged,
+				gateResult,
+			);
 	await record({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
@@ -3923,7 +3988,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		context.projectPath,
 	);
 	if (ignoredPath) {
-		return declaredPathNotSeededResult(task, ignoredPath, requiredCapability);
+		return declaredPathNotSeededResult(task, requiredCapability);
 	}
 	const routeResult = context.route({
 		requiredCapability,
@@ -4249,7 +4314,12 @@ export async function executeTaskWithOrchestrator(task, context) {
 	const terminalResult = success ? "success" : "integration_failed";
 	const safeGateFailure = success
 		? null
-		: integrationFailureMetadata(task.id, diff, gateResult?.credentialFlagged);
+		: integrationFailureMetadata(
+				task.id,
+				diff,
+				gateResult?.credentialFlagged,
+				gateResult,
+			);
 	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
 	if (context.onStatus) {

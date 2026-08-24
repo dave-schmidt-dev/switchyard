@@ -8859,9 +8859,13 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		strictEqual(result.provider, null);
 		strictEqual(result.model, null);
 		strictEqual(result.result, "declared_path_not_seeded");
-		strictEqual(result.errorKind, "unknown_failure");
-		strictEqual(result.reasonCode, "unknown_failure");
-		ok(result.reason.includes("HISTORY.md"));
+		strictEqual(result.errorKind, "declared_path_not_seeded");
+		strictEqual(result.reasonCode, "declared_path_not_seeded");
+		strictEqual(
+			result.reason,
+			"The task declared a Git-ignored path that cannot be seeded or captured.",
+		);
+		ok(!result.reason.includes("HISTORY.md"));
 	});
 
 	it("executeTask preserves current behavior for tracked paths and unignored new files", () => {
@@ -8992,8 +8996,13 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		strictEqual(result.success, false);
 		strictEqual(result.provider, null);
 		strictEqual(result.result, "declared_path_not_seeded");
-		strictEqual(result.errorKind, "unknown_failure");
-		strictEqual(result.reasonCode, "unknown_failure");
+		strictEqual(result.errorKind, "declared_path_not_seeded");
+		strictEqual(result.reasonCode, "declared_path_not_seeded");
+		strictEqual(
+			result.reason,
+			"The task declared a Git-ignored path that cannot be seeded or captured.",
+		);
+		ok(!result.reason.includes("TASKS.md"));
 	});
 
 	it("executeTaskAsync rejects an ignored declared path before broker reservation or routing", async () => {
@@ -9067,7 +9076,12 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(checkpoint.results[0].result, "declared_path_not_seeded");
 		strictEqual(checkpoint.results[0].success, false);
-		strictEqual(checkpoint.results[0].errorKind, "unknown_failure");
-		strictEqual(checkpoint.results[0].reasonCode, "unknown_failure");
+		strictEqual(checkpoint.results[0].errorKind, "declared_path_not_seeded");
+		strictEqual(checkpoint.results[0].reasonCode, "declared_path_not_seeded");
+		strictEqual(
+			checkpoint.results[0].reason,
+			"The task declared a Git-ignored path that cannot be seeded or captured.",
+		);
+		ok(!checkpoint.results[0].reason.includes("HISTORY.md"));
 	});
 });

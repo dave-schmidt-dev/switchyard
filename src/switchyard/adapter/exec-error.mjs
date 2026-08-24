@@ -109,7 +109,17 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"model_unavailable",
 	"execution_failed",
 	"execution_timed_out",
+	"provider_cleanup_failed",
+	"diff_capture_failed",
+	"declared_path_not_seeded",
 	"integration_failed",
+	"required_paths_missing",
+	"undeclared_paths_touched",
+	"empty_required_diff",
+	"no_op_diff",
+	"manifest_review_required",
+	"corrupt_patch",
+	"conflict",
 	"no_provider",
 	"unsupported_provider",
 	"launch_failed",
@@ -119,7 +129,7 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"unknown_failure",
 ]);
 
-const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
+export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"auth_expired",
 	"quota_exhausted",
 	"model_unavailable",
@@ -129,6 +139,17 @@ const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"provider_output_unclassified",
 	"execution_timed_out",
 	"execution_cancelled",
+	"provider_cleanup_failed",
+	"diff_capture_failed",
+	"declared_path_not_seeded",
+	"integration_failed",
+	"required_paths_missing",
+	"undeclared_paths_touched",
+	"empty_required_diff",
+	"no_op_diff",
+	"manifest_review_required",
+	"corrupt_patch",
+	"conflict",
 ]);
 
 const PERSISTED_FAILURE_PHASES = new Set([
@@ -198,9 +219,53 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reasonCode: "execution_timed_out",
 		reason: "Provider execution exceeded its bounded deadline.",
 	}),
+	provider_cleanup_failed: Object.freeze({
+		reasonCode: "provider_cleanup_failed",
+		reason: "Working container cleanup failed after execution timeout.",
+	}),
+	diff_capture_failed: Object.freeze({
+		reasonCode: "diff_capture_failed",
+		reason: "Partial diff capture failed after execution timeout.",
+	}),
+	declared_path_not_seeded: Object.freeze({
+		reasonCode: "declared_path_not_seeded",
+		reason:
+			"The task declared a Git-ignored path that cannot be seeded or captured.",
+	}),
 	integration_failed: Object.freeze({
 		reasonCode: "integration_failed",
 		reason: "The reviewed integration gate rejected the task result.",
+	}),
+	required_paths_missing: Object.freeze({
+		reasonCode: "required_paths_missing",
+		reason: "Declared required paths were not touched by the task diff.",
+	}),
+	undeclared_paths_touched: Object.freeze({
+		reasonCode: "undeclared_paths_touched",
+		reason:
+			"The task diff touched paths not declared in its Files specification.",
+	}),
+	empty_required_diff: Object.freeze({
+		reasonCode: "empty_required_diff",
+		reason: "The task required file modifications but produced an empty diff.",
+	}),
+	no_op_diff: Object.freeze({
+		reasonCode: "no_op_diff",
+		reason: "The task diff produced no net change in the repository tree.",
+	}),
+	manifest_review_required: Object.freeze({
+		reasonCode: "manifest_review_required",
+		reason:
+			"The task diff touches execution manifests requiring explicit review.",
+	}),
+	corrupt_patch: Object.freeze({
+		reasonCode: "corrupt_patch",
+		reason: "The patch format is corrupt or unparseable by git apply.",
+	}),
+	conflict: Object.freeze({
+		reasonCode: "conflict",
+		reason:
+			"The patch could not be applied due to conflicting workspace state.",
 	}),
 	no_provider: Object.freeze({
 		reasonCode: "no_provider",
@@ -237,12 +302,25 @@ const SUCCESS_RESULTS = new Set(["success", "success_no_diff"]);
 const RESULT_TO_ERROR_KIND = Object.freeze({
 	execution_failed: "execution_failed",
 	execution_timed_out: "execution_timed_out",
+	execution_timed_out_cleanup_failed: "provider_cleanup_failed",
+	execution_timed_out_capture_failed: "diff_capture_failed",
+	provider_cleanup_failed: "provider_cleanup_failed",
+	diff_capture_failed: "diff_capture_failed",
+	declared_path_not_seeded: "declared_path_not_seeded",
 	integration_failed: "integration_failed",
+	required_paths_missing: "required_paths_missing",
+	undeclared_paths_touched: "undeclared_paths_touched",
+	empty_required_diff: "empty_required_diff",
+	no_op_diff: "no_op_diff",
+	manifest_review_required: "manifest_review_required",
+	corrupt_patch: "corrupt_patch",
+	conflict: "conflict",
 	no_provider: "no_provider",
 	unsupported_provider: "unsupported_provider",
 	launch_failed: "launch_failed",
 	result_fetch_failed: "result_fetch_failed",
 	orchestrator_timed_out: "orchestrator_timeout",
+	orchestrator_timeout: "orchestrator_timeout",
 	executor_not_switchyard: "executor_not_switchyard",
 	halted_after_commit_failure: "unknown_failure",
 	halted_after_reset_failure: "unknown_failure",
@@ -285,9 +363,8 @@ export function sanitizeFailureMetadata({
 	const requestedKind = normalizePersistentErrorKind(errorKind);
 	const kind =
 		requestedKind ??
-		(timedOut
-			? "execution_timed_out"
-			: (RESULT_TO_ERROR_KIND[result] ?? "unknown_failure"));
+		RESULT_TO_ERROR_KIND[result] ??
+		(timedOut ? "execution_timed_out" : "unknown_failure");
 	const metadata = PERSISTED_ERROR_METADATA[kind];
 	const safe = {
 		errorKind: kind,
