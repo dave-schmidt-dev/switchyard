@@ -91,6 +91,13 @@ async function inspectPrerequisites() {
 	if (!(await loadSlotPrimitive())) {
 		return "shared VM-slot primitive is unavailable";
 	}
+	try {
+		if (new ParallelsExecutionBackend().listManaged().length > 0) {
+			return "a Switchyard working VM is active";
+		}
+	} catch {
+		return "Parallels VM inventory is unavailable";
+	}
 	return null;
 }
 

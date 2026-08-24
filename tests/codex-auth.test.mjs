@@ -14,7 +14,7 @@ import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs
 
 function hasDocker() {
 	try {
-		execSync("docker --version", { stdio: "pipe" });
+		execSync("docker info", { stdio: "pipe" });
 		return true;
 	} catch {
 		return false;

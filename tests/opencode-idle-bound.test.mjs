@@ -19,7 +19,7 @@ import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs
 
 function hasDocker() {
 	try {
-		execSync("docker --version", { stdio: "pipe" });
+		execSync("docker info", { stdio: "pipe" });
 		return true;
 	} catch {
 		return false;

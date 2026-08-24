@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
@@ -113,6 +113,13 @@ function parallelsGoldenImagePrerequisiteReason() {
 	}
 	if (!/^\d+$/.test(PARALLELS_AQUA_UID) || Number(PARALLELS_AQUA_UID) <= 0) {
 		return "Aqua UID is unavailable; set SWITCHYARD_PARALLELS_AQUA_UID";
+	}
+	try {
+		if (new ParallelsExecutionBackend().listManaged().length > 0) {
+			return "a Switchyard working VM is active";
+		}
+	} catch {
+		return "Parallels VM inventory is unavailable";
 	}
 	return null;
 }

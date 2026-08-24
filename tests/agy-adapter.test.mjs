@@ -17,7 +17,7 @@ const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 function hasDocker() {
 	try {
-		execSync("docker --version", { stdio: "pipe" });
+		execSync("docker info", { stdio: "pipe" });
 		return true;
 	} catch {
 		return false;
