@@ -3,7 +3,13 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
 	captureDiff as captureAgyDiff,
@@ -2002,6 +2008,62 @@ function nonSwitchyardExecutorResult(task, executor, requiredCapability) {
 	};
 }
 
+/**
+ * Identify any declared task path that Git ignores and that therefore cannot
+ * be seeded from or captured back into the committed project tree.
+ * @param {string[]|string|null|undefined} paths
+ * @param {string} [projectPath]
+ * @returns {string|null} The first ignored path encountered, or null
+ */
+export function findIgnoredDeclaredPath(paths, projectPath = process.cwd()) {
+	if (!paths) return null;
+	const rawList = Array.isArray(paths)
+		? paths
+		: typeof paths === "string"
+			? [paths]
+			: null;
+	if (!rawList) return null;
+	const pathList = rawList
+		.map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+		.filter(Boolean);
+	if (pathList.length === 0) return null;
+	try {
+		const workingDir =
+			projectPath && existsSync(projectPath) ? projectPath : process.cwd();
+		const result = spawnSync("git", ["check-ignore", "--", ...pathList], {
+			cwd: workingDir,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (result.status === 0 && result.stdout) {
+			const ignored = result.stdout
+				.split(/\r?\n/)
+				.map((line) => line.trim())
+				.filter(Boolean);
+			return ignored[0] ?? null;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+function declaredPathNotSeededResult(task, ignoredPath, requiredCapability) {
+	return {
+		taskId: task.id,
+		success: false,
+		provider: null,
+		model: null,
+		requiredCapability,
+		result: "declared_path_not_seeded",
+		...sanitizeFailureMetadata({
+			taskId: task.id,
+			result: "declared_path_not_seeded",
+		}),
+		reason: `Task ${task.id} declares Git-ignored path "${ignoredPath}" which cannot be seeded or captured`,
+	};
+}
+
 function failureMetadataFor(result, partialDiffPath) {
 	return sanitizeFailureMetadata({
 		taskId: result.taskId,
@@ -2274,6 +2336,14 @@ export function executeTask(task, context) {
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
+	}
+	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
+	const ignoredPath = checkIgnored(
+		task.requiredPaths ?? task.files,
+		context.projectPath,
+	);
+	if (ignoredPath) {
+		return declaredPathNotSeededResult(task, ignoredPath, requiredCapability);
 	}
 	const routeResult = context.route({
 		requiredCapability,
@@ -2786,6 +2856,14 @@ async function executeTaskAsyncUnsafe(task, context) {
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
+	}
+	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
+	const ignoredPath = checkIgnored(
+		task.requiredPaths ?? task.files,
+		context.projectPath,
+	);
+	if (ignoredPath) {
+		return declaredPathNotSeededResult(task, ignoredPath, requiredCapability);
 	}
 	let broker = context.broker;
 	if (!broker) {
@@ -3449,6 +3527,7 @@ export async function runQueueAsync(options) {
 		onStatus: dependencies.onStatus ?? null,
 		onTaskRouted: dependencies.onTaskRouted ?? null,
 		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
+		checkIgnoredPath: dependencies.checkIgnoredPath,
 		exclude: mergeRetryExclusions(
 			effectiveExclude,
 			checkpoint.quarantinedTargetIds,
@@ -3837,6 +3916,14 @@ export async function executeTaskWithOrchestrator(task, context) {
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
+	}
+	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
+	const ignoredPath = checkIgnored(
+		task.requiredPaths ?? task.files,
+		context.projectPath,
+	);
+	if (ignoredPath) {
+		return declaredPathNotSeededResult(task, ignoredPath, requiredCapability);
 	}
 	const routeResult = context.route({
 		requiredCapability,
@@ -5557,6 +5644,7 @@ export function runQueue(options) {
 		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
 		resolveDescriptor: dependencies.resolveDescriptor,
+		checkIgnoredPath: dependencies.checkIgnoredPath,
 		exclude,
 		only,
 	};
@@ -6331,6 +6419,7 @@ export async function runQueueWithOrchestrator(options) {
 		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
 		resolveDescriptor: dependencies.resolveDescriptor,
+		checkIgnoredPath: dependencies.checkIgnoredPath,
 	};
 
 	try {

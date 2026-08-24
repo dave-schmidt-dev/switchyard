@@ -16,6 +16,9 @@ describe("provider prompt guardrails", () => {
 		strictEqual(guarded.includes("pnpm"), true);
 		strictEqual(guarded.includes("yarn"), true);
 		strictEqual(guarded.includes("lockfiles"), true);
+		strictEqual(guarded.includes("seedable"), true);
+		strictEqual(guarded.includes("force-add"), true);
+		strictEqual(guarded.includes("Git-ignored"), true);
 	});
 
 	it("leaves non-string prompts unchanged for the adapter boundary", () => {

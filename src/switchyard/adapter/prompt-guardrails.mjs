@@ -5,6 +5,7 @@ export const PROVIDER_PROMPT_GUARDRAIL = [
 	"Switchyard execution constraint: do not install or update dependencies, and do not modify package manifests or lockfiles unless the task explicitly declares that exact file in Files.",
 	"A project-declared lifecycle hook may have prepared dependencies; you may run its ordinary verification command, but never use npm, npx, pnpm, yarn, bun, or another package manager to install or update packages.",
 	"Keep edits limited to the task's declared Files allowlist; undeclared artifacts are rejected by the integration gate.",
+	"Declared task paths must be seedable by the committed project repository; do not force-add Git-ignored files or local records.",
 ].join("\n");
 
 /**
