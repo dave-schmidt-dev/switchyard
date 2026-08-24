@@ -96,23 +96,50 @@ function queueWrite(fn) {
 	return writeChain;
 }
 
+const RECOGNIZED_CHECKPOINT_IDENTITY_CODES = new Set([
+	"checkpoint_task_file_mismatch",
+	"checkpoint_tasks_file_mismatch",
+	"checkpoint_missing_queue_identity",
+	"checkpoint_queue_identity_missing",
+	"checkpoint_queue_identity_mismatch",
+	"checkpoint_run_options_mismatch",
+	"checkpoint_historical_checkpoint",
+	"checkpoint_historical_state",
+]);
+
+function isRecognizedCheckpointIdentityError(error) {
+	if (!error) return false;
+	if (error.name === "CheckpointIdentityError") return true;
+	if (
+		typeof error.code === "string" &&
+		RECOGNIZED_CHECKPOINT_IDENTITY_CODES.has(error.code)
+	) {
+		return true;
+	}
+	return false;
+}
+
 async function writeFatalEvent(error) {
 	try {
 		const runStore = await import("../run-store/index.mjs");
-		// Route through Diagnostics with the real Error object (not
-		// error?.message) so _serializeError's allowlist and _redactPaths
-		// actually apply — a raw message string would bypass that
-		// redaction path entirely. emit() is awaited so the payload is
-		// guaranteed to have reached the sink before this returns (and
-		// before the caller's process.exit(1) runs).
 		const diagnostics = new Diagnostics();
 		diagnostics.sink((sanitized) => runStore.createEvent(runId, sanitized));
-		await diagnostics.emit({
-			phase: "worker",
-			event: "worker_boot_failed",
-			status: "fatal",
-			error,
-		});
+		if (isRecognizedCheckpointIdentityError(error)) {
+			await diagnostics.emit({
+				phase: "worker",
+				event: "worker_boot_failed",
+				status: error.code ?? "checkpoint_identity_mismatch",
+				reasonCode: error.code ?? "checkpoint_identity_mismatch",
+				diagnosticCode: error.code ?? "checkpoint_identity_mismatch",
+				reason: error.reason ?? error.remedy ?? "checkpoint identity mismatch",
+			});
+		} else {
+			await diagnostics.emit({
+				phase: "worker",
+				event: "worker_boot_failed",
+				status: "fatal",
+			});
+		}
 	} catch {
 		// best effort
 	}

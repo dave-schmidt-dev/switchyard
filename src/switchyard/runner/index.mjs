@@ -298,9 +298,11 @@ function resolveQueueIdentity(options, tasks) {
 		options.queueIdentity !== undefined &&
 		options.queueIdentity !== expectedIdentity
 	) {
-		throw new Error(
-			`queue identity mismatch: supplied ${options.queueIdentity}, expected ${expectedIdentity}; ` +
-				"the task path, content/graph, project revision, or run options changed — create a new checkpoint or use an audited migration",
+		throw new CheckpointIdentityError(
+			CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH,
+			CHECKPOINT_IDENTITY_REMEDIES[
+				CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH
+			],
 		);
 	}
 
@@ -310,6 +312,79 @@ function resolveQueueIdentity(options, tasks) {
 		runOptions,
 		projectRevision,
 	};
+}
+
+export const CHECKPOINT_IDENTITY_CODES = Object.freeze({
+	TASK_FILE_MISMATCH: "checkpoint_task_file_mismatch",
+	MISSING_QUEUE_IDENTITY: "checkpoint_missing_queue_identity",
+	QUEUE_IDENTITY_MISMATCH: "checkpoint_queue_identity_mismatch",
+	RUN_OPTIONS_MISMATCH: "checkpoint_run_options_mismatch",
+	HISTORICAL_CHECKPOINT: "checkpoint_historical_checkpoint",
+});
+
+export const CHECKPOINT_IDENTITY_REMEDIES = Object.freeze({
+	checkpoint_task_file_mismatch:
+		"checkpoint task file mismatch: tasksFilePath does not match; create a new checkpoint or use an audited migration",
+	checkpoint_tasks_file_mismatch:
+		"checkpoint task file mismatch: tasksFilePath does not match; create a new checkpoint or use an audited migration",
+	checkpoint_missing_queue_identity:
+		"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
+	checkpoint_queue_identity_missing:
+		"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
+	checkpoint_queue_identity_mismatch:
+		"checkpoint queue identity mismatch; create a new checkpoint or use an audited migration",
+	checkpoint_run_options_mismatch:
+		"checkpoint run options mismatch: normalized run options changed; create a new checkpoint or use an audited migration",
+	checkpoint_historical_checkpoint:
+		"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
+	checkpoint_historical_state:
+		"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
+});
+
+export class CheckpointIdentityError extends Error {
+	constructor(code, remedy = null) {
+		const staticRemedy =
+			remedy ??
+			CHECKPOINT_IDENTITY_REMEDIES[code] ??
+			"checkpoint identity mismatch; create a new checkpoint or use an audited migration";
+		super(`checkpoint identity mismatch: ${staticRemedy}`);
+		this.name = "CheckpointIdentityError";
+		this.code = code;
+		this.reasonCode = code;
+		this.diagnosticCode = code;
+		this.reason = staticRemedy;
+		this.remedy = staticRemedy;
+	}
+}
+
+export class CheckpointTaskFileMismatchError extends CheckpointIdentityError {
+	constructor(remedy = null) {
+		super(CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH, remedy);
+	}
+}
+
+export class CheckpointMissingQueueIdentityError extends CheckpointIdentityError {
+	constructor(remedy = null) {
+		super(CHECKPOINT_IDENTITY_CODES.MISSING_QUEUE_IDENTITY, remedy);
+	}
+}
+
+export class CheckpointQueueIdentityMismatchError extends CheckpointIdentityError {
+	constructor(remedy = null) {
+		super(CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH, remedy);
+	}
+}
+
+export class CheckpointRunOptionsMismatchError extends CheckpointIdentityError {
+	constructor(remedy = null) {
+		super(CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH, remedy);
+	}
+}
+
+export class CheckpointHistoricalCheckpointError extends CheckpointIdentityError {
+	constructor(remedy = null) {
+		super(CHECKPOINT_IDENTITY_CODES.HISTORICAL_CHECKPOINT, remedy);
+	}
 }
 
 export class TaskSelectionError extends Error {
@@ -1550,21 +1625,30 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 		Array.isArray(parsed.results)
 	) {
 		if (parsed.tasksFilePath !== tasksFilePath) {
-			throw new Error(
-				`checkpoint identity mismatch: tasksFilePath is ${parsed.tasksFilePath}, expected ${tasksFilePath}`,
+			throw new CheckpointIdentityError(
+				CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH,
+				CHECKPOINT_IDENTITY_REMEDIES[
+					CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH
+				],
 			);
 		}
 		if (!parsed.queueIdentity || typeof parsed.queueIdentity !== "string") {
-			throw new Error(
-				"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
+			throw new CheckpointIdentityError(
+				CHECKPOINT_IDENTITY_CODES.MISSING_QUEUE_IDENTITY,
+				CHECKPOINT_IDENTITY_REMEDIES[
+					CHECKPOINT_IDENTITY_CODES.MISSING_QUEUE_IDENTITY
+				],
 			);
 		}
 		if (
 			expected?.queueIdentity &&
 			parsed.queueIdentity !== expected.queueIdentity
 		) {
-			throw new Error(
-				`checkpoint identity mismatch: supplied ${parsed.queueIdentity}, expected ${expected.queueIdentity}; create a new checkpoint or use an audited migration`,
+			throw new CheckpointIdentityError(
+				CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH,
+				CHECKPOINT_IDENTITY_REMEDIES[
+					CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH
+				],
 			);
 		}
 		if (
@@ -1572,8 +1656,11 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 			stableStringify(parsed.runOptions) !==
 				stableStringify(expected.runOptions)
 		) {
-			throw new Error(
-				"checkpoint identity mismatch: normalized run options changed; create a new checkpoint or use an audited migration",
+			throw new CheckpointIdentityError(
+				CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH,
+				CHECKPOINT_IDENTITY_REMEDIES[
+					CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH
+				],
 			);
 		}
 		validateRetryDescriptorEvidence(parsed);
@@ -1586,8 +1673,11 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 		Array.isArray(parsed.results)
 	) {
 		if (expected?.queueIdentity) {
-			throw new Error(
-				"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
+			throw new CheckpointIdentityError(
+				CHECKPOINT_IDENTITY_CODES.HISTORICAL_CHECKPOINT,
+				CHECKPOINT_IDENTITY_REMEDIES[
+					CHECKPOINT_IDENTITY_CODES.HISTORICAL_CHECKPOINT
+				],
 			);
 		}
 		validateRetryDescriptorEvidence(parsed);

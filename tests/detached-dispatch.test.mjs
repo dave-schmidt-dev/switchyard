@@ -879,7 +879,11 @@ describe("terminal run releases the project lock", () => {
 	});
 });
 
-describe("recover releases stale project locks", () => {
+describe("recover releases stale project locks", {
+	skip: PARALLELS_PREREQUISITE_REASON
+		? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
+		: undefined,
+}, () => {
 	it("recover --run clears a project lock left by a dead/terminal run", async () => {
 		const {
 			initializeRun,
@@ -1100,12 +1104,12 @@ describe("non-matching nonce", () => {
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
-		// writeFatalEvent now routes the real Error through Diagnostics
-		// (error: error, not detail: error?.message), so the persisted
-		// payload carries a serialized `error` object rather than a raw
-		// `detail` string.
-		ok(bootFailed.error, "worker_boot_failed event carries a serialized error");
-		ok(bootFailed.error.message.includes("nonce mismatch"));
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.error, undefined);
+		ok(!JSON.stringify(bootFailed).includes("wrong-nonce-value"));
+		ok(!JSON.stringify(bootFailed).includes("nonce mismatch"));
+		ok(!JSON.stringify(bootFailed).includes(projectDir));
 	});
 
 	it("bootstrap with a secret-canary-bearing nonce redacts it from the persisted worker_boot_failed event", async () => {
@@ -1126,11 +1130,6 @@ describe("non-matching nonce", () => {
 			launchArgs: [],
 		});
 
-		// The nonce-mismatch Error message interpolates both the received
-		// and expected nonce values, so a canary-shaped wrong nonce lands
-		// straight in error.message — proving writeFatalEvent's Diagnostics
-		// path (not just the Diagnostics unit tests) actually redacts it
-		// before it reaches events.jsonl.
 		const result = runBootstrap(
 			[
 				"--state-root",
@@ -1155,10 +1154,256 @@ describe("non-matching nonce", () => {
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
-		ok(bootFailed.error, "worker_boot_failed event carries a serialized error");
-		strictEqual(bootFailed.error.message, "[REDACTED]");
-
+		strictEqual(bootFailed.error, undefined);
 		assertNoSecretCanary(runId);
+	});
+});
+
+describe("checkpoint identity failures on detached worker path (Task 1.3)", () => {
+	it("bootstrap with run-options mismatch emits checkpoint_run_options_mismatch", async () => {
+		const { initializeRun, readEvents } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { normalizeRunOptions, createQueueIdentity, loadTaskQueue } =
+			await import("../src/switchyard/runner/index.mjs");
+
+		const runId = randomUUID();
+		const nonce = randomUUID();
+		const checkpointPath = `${tasksFile}.checkpoint.json`;
+
+		const tasks = loadTaskQueue(tasksFile);
+		const runOptions1 = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 1,
+			stopOnFailure: true,
+		});
+		const runOptions2 = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 2,
+			stopOnFailure: true,
+		});
+
+		const queueIdentity = createQueueIdentity({
+			tasksFilePath: tasksFile,
+			markdown: readFileSync(tasksFile, "utf8"),
+			tasks,
+			projectRevision: "rev-1",
+			runOptions: runOptions1,
+		});
+
+		writeFileSync(
+			checkpointPath,
+			JSON.stringify({
+				version: 2,
+				tasksFilePath: tasksFile,
+				queueIdentity,
+				runOptions: runOptions2,
+				completedTaskIds: [],
+				results: [],
+			}),
+			"utf8",
+		);
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: nonce,
+			launchArgs: [],
+			queueIdentity,
+			projectRevision: "rev-1",
+			runOptions: runOptions1,
+		});
+
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(
+			result.status,
+			1,
+			`expected exit 1, got ${result.status}: ${result.stderr}`,
+		);
+
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.status, "checkpoint_run_options_mismatch");
+		strictEqual(bootFailed.reasonCode, "checkpoint_run_options_mismatch");
+		strictEqual(bootFailed.diagnosticCode, "checkpoint_run_options_mismatch");
+		ok(bootFailed.reason.includes("normalized run options changed"));
+		strictEqual(bootFailed.error, undefined);
+		ok(!JSON.stringify(bootFailed).includes(projectDir));
+	});
+
+	it("five checkpoint identity regressions emit distinct static codes on the worker-fatal path", async () => {
+		const { initializeRun, readEvents } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { normalizeRunOptions, createQueueIdentity, loadTaskQueue } =
+			await import("../src/switchyard/runner/index.mjs");
+
+		const checkpointPath = `${tasksFile}.checkpoint.json`;
+		const tasks = loadTaskQueue(tasksFile);
+		const runOptions = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 1,
+			stopOnFailure: true,
+		});
+		const mismatchedRunOptions = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 2,
+			stopOnFailure: true,
+		});
+
+		const queueIdentity = createQueueIdentity({
+			tasksFilePath: tasksFile,
+			markdown: readFileSync(tasksFile, "utf8"),
+			tasks,
+			projectRevision: "rev-1",
+			runOptions,
+		});
+		const mismatchedQueueIdentity = "f".repeat(64);
+
+		const cases = [
+			{
+				name: "task-file mismatch",
+				expectedCode: "checkpoint_task_file_mismatch",
+				checkpoint: {
+					version: 2,
+					tasksFilePath: "/other/path/tasks.md",
+					queueIdentity,
+					runOptions,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+			{
+				name: "missing queue identity",
+				expectedCode: "checkpoint_missing_queue_identity",
+				checkpoint: {
+					version: 2,
+					tasksFilePath: tasksFile,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+			{
+				name: "queue-identity mismatch",
+				expectedCode: "checkpoint_queue_identity_mismatch",
+				checkpoint: {
+					version: 2,
+					tasksFilePath: tasksFile,
+					queueIdentity: mismatchedQueueIdentity,
+					runOptions,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+			{
+				name: "run-options mismatch",
+				expectedCode: "checkpoint_run_options_mismatch",
+				checkpoint: {
+					version: 2,
+					tasksFilePath: tasksFile,
+					queueIdentity,
+					runOptions: mismatchedRunOptions,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+			{
+				name: "historical checkpoint",
+				expectedCode: "checkpoint_historical_checkpoint",
+				checkpoint: {
+					version: 1,
+					tasksFilePath: tasksFile,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+		];
+
+		const observedCodes = new Set();
+
+		for (const testCase of cases) {
+			const runId = randomUUID();
+			const nonce = randomUUID();
+
+			writeFileSync(
+				checkpointPath,
+				JSON.stringify(testCase.checkpoint),
+				"utf8",
+			);
+
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: nonce,
+				launchArgs: [],
+				queueIdentity: testCase.queueIdentity,
+				projectRevision: "rev-1",
+				runOptions: testCase.runOptions,
+			});
+
+			const result = runBootstrap(
+				["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+				makeStateRootEnv(),
+			);
+
+			strictEqual(
+				result.status,
+				1,
+				`${testCase.name} expected exit 1, got ${result.status}: ${result.stderr}`,
+			);
+
+			const events = await readEvents(runId);
+			const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+			ok(bootFailed, `${testCase.name}: worker_boot_failed event recorded`);
+			strictEqual(
+				bootFailed.status,
+				testCase.expectedCode,
+				`${testCase.name} status code mismatch`,
+			);
+			strictEqual(
+				bootFailed.reasonCode,
+				testCase.expectedCode,
+				`${testCase.name} reasonCode mismatch`,
+			);
+			strictEqual(
+				bootFailed.diagnosticCode,
+				testCase.expectedCode,
+				`${testCase.name} diagnosticCode mismatch`,
+			);
+			strictEqual(
+				bootFailed.error,
+				undefined,
+				`${testCase.name} should not have raw error object`,
+			);
+			ok(
+				!JSON.stringify(bootFailed).includes(projectDir),
+				`${testCase.name} should not leak host paths`,
+			);
+			observedCodes.add(testCase.expectedCode);
+		}
+
+		strictEqual(observedCodes.size, 5, "five distinct static codes emitted");
 	});
 });
 
