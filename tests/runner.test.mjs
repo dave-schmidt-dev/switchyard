@@ -8509,6 +8509,9 @@ describe("runQueue timeout diff persistence", () => {
 							output: "",
 							error: "spawnSync docker ETIMEDOUT",
 							timedOut: true,
+							cleanupFailed: true,
+							cleanupStage: "pid_marker_removed",
+							failurePhase: "provider_cleanup",
 						}),
 						captureDiff: () => diffText,
 					},
@@ -8519,6 +8522,12 @@ describe("runQueue timeout diff persistence", () => {
 		strictEqual(result.processedTasks, 1);
 		const [taskResult] = result.results;
 		strictEqual(taskResult.timedOut, true);
+		strictEqual(taskResult.errorKind, "provider_cleanup_failed");
+		strictEqual(taskResult.cleanupStage, "pid_marker_removed");
+		strictEqual(
+			taskResult.diagnosticCode,
+			"provider_cleanup_after_pid_marker_removed",
+		);
 		strictEqual(
 			taskResult.partialDiff,
 			undefined,
@@ -8531,6 +8540,10 @@ describe("runQueue timeout diff persistence", () => {
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(checkpoint.results[0].success, false);
 		strictEqual(checkpoint.results[0].timedOut, true);
+		strictEqual(
+			checkpoint.results[0].diagnosticCode,
+			"provider_cleanup_after_pid_marker_removed",
+		);
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
 		ok(/^artifact:[a-f0-9]{24}$/.test(checkpoint.results[0].artifactRef));
 

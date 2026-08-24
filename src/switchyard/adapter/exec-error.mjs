@@ -129,6 +129,19 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"unknown_failure",
 ]);
 
+const CLEANUP_STAGE_DIAGNOSTIC_CODES = Object.freeze({
+	cleanup_started: "provider_cleanup_after_cleanup_started",
+	pid_observed: "provider_cleanup_after_pid_observed",
+	tree_terminated: "provider_cleanup_after_tree_terminated",
+	pid_marker_removed: "provider_cleanup_after_pid_marker_removed",
+	index_lock_removed: "provider_cleanup_after_index_lock_removed",
+});
+
+/** Return the durable diagnostic code for the last completed cleanup stage. */
+export function cleanupDiagnosticCodeFor(cleanupStage) {
+	return CLEANUP_STAGE_DIAGNOSTIC_CODES[cleanupStage] ?? null;
+}
+
 export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"auth_expired",
 	"quota_exhausted",
@@ -140,6 +153,7 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"execution_timed_out",
 	"execution_cancelled",
 	"provider_cleanup_failed",
+	...Object.values(CLEANUP_STAGE_DIAGNOSTIC_CODES),
 	"diff_capture_failed",
 	"declared_path_not_seeded",
 	"integration_failed",
@@ -358,6 +372,7 @@ export function sanitizeFailureMetadata({
 	exitCode,
 	signal,
 	failurePhase,
+	cleanupStage,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -371,8 +386,11 @@ export function sanitizeFailureMetadata({
 		reasonCode: metadata.reasonCode,
 		reason: metadata.reason,
 	};
+	const safeCleanupDiagnostic = cleanupDiagnosticCodeFor(cleanupStage);
 	if (PERSISTED_DIAGNOSTIC_CODES.includes(diagnosticCode)) {
 		safe.diagnosticCode = diagnosticCode;
+	} else if (safeCleanupDiagnostic) {
+		safe.diagnosticCode = safeCleanupDiagnostic;
 	}
 	if (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255) {
 		safe.exitCode = exitCode;

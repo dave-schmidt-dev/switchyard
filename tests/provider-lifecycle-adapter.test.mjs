@@ -245,7 +245,9 @@ describe("provider process lifecycle", () => {
 		let adapterCleanups = 0;
 		const executionBackend = {
 			cleanupProviderProcess: () => {
-				throw new Error("guest unreachable");
+				const error = new Error("guest unreachable");
+				error.cleanupStage = "tree_terminated";
+				throw error;
 			},
 		};
 		const result = await executeProviderInvocation("fake", [], {
@@ -259,11 +261,43 @@ describe("provider process lifecycle", () => {
 		});
 		strictEqual(result.timedOut, true);
 		strictEqual(result.cleanupFailed, true);
+		strictEqual(result.cleanupStage, "tree_terminated");
+		strictEqual(
+			result.diagnosticCode,
+			"provider_cleanup_after_tree_terminated",
+		);
+		strictEqual(result.failurePhase, "provider_cleanup");
 		strictEqual(
 			adapterCleanups,
 			1,
 			"adapter cleanup must still run as a backstop when the backend's cleanup fails",
 		);
+	});
+
+	it("retains a cleanup failure stage through cancellation", async () => {
+		const child = fakeChild();
+		const controller = new AbortController();
+		const executionBackend = {
+			cleanupProviderProcess: () => {
+				const error = new Error("guest unreachable");
+				error.cleanupStage = "pid_observed";
+				throw error;
+			},
+		};
+		const resultPromise = executeProviderInvocation("fake", [], {
+			spawnFn: () => child,
+			termGraceMs: 1,
+			signal: controller.signal,
+			executionBackend,
+		});
+		controller.abort();
+		const result = await resultPromise;
+		strictEqual(result.cancelled, true);
+		strictEqual(result.cleanupFailed, true);
+		strictEqual(result.errorKind, "provider_cleanup_failed");
+		strictEqual(result.cleanupStage, "pid_observed");
+		strictEqual(result.diagnosticCode, "provider_cleanup_after_pid_observed");
+		strictEqual(result.failurePhase, "provider_cleanup");
 	});
 
 	it("runs the adapter's cleanup when no backend cleanupProviderProcess is available", async () => {

@@ -147,6 +147,43 @@ describe("Parallels execution backend lifecycle", () => {
 		strictEqual(existsSync(markerPath), false);
 	});
 
+	it("emits completed VM cleanup stages and preserves the last stage on failure", () => {
+		const events = [];
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		backend.getGuestPid = () => 4242;
+		backend.execGuest = () => {};
+		const cleaned = backend.cleanupProviderProcess(
+			"prlctl",
+			["exec", WORK_UUID],
+			{ onStatus: (event) => events.push(event) },
+		);
+		strictEqual(cleaned.cleanupStage, "index_lock_removed");
+		deepStrictEqual(
+			events.map((event) => event.event),
+			[
+				"provider_cleanup_started",
+				"provider_pid_observed",
+				"provider_tree_gone",
+				"provider_pid_marker_removed",
+				"provider_index_lock_removed",
+				"provider_cleanup_complete",
+			],
+		);
+
+		backend.execGuest = (_workspaceId, command, args) => {
+			if (
+				command === "/bin/rm" &&
+				args.includes(backend.providerPidPath(WORK_UUID))
+			) {
+				throw new Error("marker removal failed");
+			}
+		};
+		throws(
+			() => backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID]),
+			(error) => error.cleanupStage === "tree_terminated",
+		);
+	});
+
 	// `prlctl exec` joins its argument vector with spaces and the guest applies
 	// exactly one round of shell parsing to the result. Proven live 2026-08-14:
 	// a supervised `opencode run` was truncated to its first word, `set`, which

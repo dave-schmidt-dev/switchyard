@@ -61,6 +61,11 @@ const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
 // token, or the substitution would rewrite the name along with the value.
 const XFER_URL_ASSIGNMENT = "SWITCHYARD_XFER_URL=TRANSFER_URL";
 const INDEX_LOCK_PATH = "/project/.git/index.lock";
+const CLEANUP_STARTED = "cleanup_started";
+const PID_OBSERVED = "pid_observed";
+const TREE_TERMINATED = "tree_terminated";
+const PID_MARKER_REMOVED = "pid_marker_removed";
+const INDEX_LOCK_REMOVED = "index_lock_removed";
 const KILL_GUEST_PROCESS_TREE = String.raw`
 set -eu
 root="$1"
@@ -1085,27 +1090,30 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (typeof workspaceId !== "string" || workspaceId.length === 0) {
 			throw new Error("Parallels provider cleanup received no VM handle");
 		}
+		let cleanupStage = CLEANUP_STARTED;
 		onStatus?.({
 			phase: "execution",
 			event: "provider_cleanup_started",
-			status: "Terminating timed-out guest provider",
+			status: "Guest provider cleanup started",
 		});
 		try {
+			const pid = this.getGuestPid(
+				workspaceId,
+				this.providerPidPath(workspaceId),
+			);
+			cleanupStage = PID_OBSERVED;
 			onStatus?.({
 				phase: "execution",
 				event: "provider_pid_observed",
 				status: "Guest provider PID observed",
 			});
-			const pid = this.getGuestPid(
-				workspaceId,
-				this.providerPidPath(workspaceId),
-			);
 			this.execGuest(
 				workspaceId,
 				"/bin/bash",
 				["-lc", KILL_GUEST_PROCESS_TREE, "switchyard-kill-tree", String(pid)],
 				{ cwd: "/" },
 			);
+			cleanupStage = TREE_TERMINATED;
 			onStatus?.({
 				phase: "execution",
 				event: "provider_tree_gone",
@@ -1117,16 +1125,29 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				["-f", "--", this.providerPidPath(workspaceId)],
 				{ cwd: "/" },
 			);
+			cleanupStage = PID_MARKER_REMOVED;
+			onStatus?.({
+				phase: "execution",
+				event: "provider_pid_marker_removed",
+				status: "Guest provider PID marker removed",
+			});
 			this.execGuest(workspaceId, "/bin/rm", ["-f", "--", INDEX_LOCK_PATH], {
 				cwd: "/",
+			});
+			cleanupStage = INDEX_LOCK_REMOVED;
+			onStatus?.({
+				phase: "execution",
+				event: "provider_index_lock_removed",
+				status: "Guest Git index lock removed",
 			});
 			onStatus?.({
 				phase: "execution",
 				event: "provider_cleanup_complete",
 				status: "Guest provider cleanup complete; VM retained",
 			});
-			return { workspaceId, pid };
+			return { cleanupStage, workspaceId, pid };
 		} catch (error) {
+			if (error && typeof error === "object") error.cleanupStage = cleanupStage;
 			onStatus?.({
 				phase: "execution",
 				event: "provider_cleanup_failed",

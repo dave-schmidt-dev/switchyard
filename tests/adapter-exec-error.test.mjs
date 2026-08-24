@@ -2,6 +2,7 @@ import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	classifyProviderDiagnostic,
+	cleanupDiagnosticCodeFor,
 	describeExecError,
 	isPersistentFailureMetadata,
 	PERSISTED_ERROR_KINDS,
@@ -377,6 +378,27 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		});
 		strictEqual(code, "cli_usage_error");
 		strictEqual(code.includes("SECRET_CANARY"), false);
+	});
+
+	it("maps a cleanup stage to a static durable diagnostic", () => {
+		strictEqual(
+			cleanupDiagnosticCodeFor("pid_marker_removed"),
+			"provider_cleanup_after_pid_marker_removed",
+		);
+		const metadata = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "provider_cleanup_failed",
+			cleanupStage: "pid_marker_removed",
+			failurePhase: "provider_cleanup",
+		});
+		deepStrictEqual(metadata, {
+			errorKind: "provider_cleanup_failed",
+			reasonCode: "provider_cleanup_failed",
+			reason: "Working container cleanup failed after execution timeout.",
+			diagnosticCode: "provider_cleanup_after_pid_marker_removed",
+			failurePhase: "provider_cleanup",
+		});
+		ok(isPersistentFailureMetadata(metadata));
 	});
 
 	it("maps an untrusted provider classification to static metadata and an opaque artifact ref", () => {

@@ -2167,6 +2167,7 @@ function failureMetadataFor(result, partialDiffPath) {
 		exitCode: result.exitCode,
 		signal: result.signal,
 		failurePhase: result.failurePhase,
+		cleanupStage: result.cleanupStage,
 	});
 }
 
@@ -2695,6 +2696,11 @@ export function executeTask(task, context) {
 				result: resultName,
 				errorKind,
 				timedOut: true,
+				diagnosticCode: execution.diagnosticCode,
+				exitCode: execution.exitCode,
+				signal: execution.signal,
+				failurePhase: execution.failurePhase,
+				cleanupStage: execution.cleanupStage,
 			});
 			const error = cleanupFailed
 				? (execution.error ??
@@ -2714,6 +2720,12 @@ export function executeTask(task, context) {
 					: {}),
 				reason: error ?? routeResult.reason,
 				percentLeft: routeResult.percentLeft ?? undefined,
+				diagnosticCode:
+					safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
+				exitCode: execution.exitCode,
+				signal: execution.signal,
+				failurePhase: execution.failurePhase,
+				cleanupStage: execution.cleanupStage,
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -2733,6 +2745,12 @@ export function executeTask(task, context) {
 						}
 					: {}),
 				timedOut: true,
+				diagnosticCode:
+					safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
+				exitCode: execution.exitCode,
+				signal: execution.signal,
+				failurePhase: execution.failurePhase,
+				cleanupStage: execution.cleanupStage,
 				...(partialDiff ? { partialDiff } : {}),
 			};
 		}
@@ -2745,6 +2763,11 @@ export function executeTask(task, context) {
 			errorKind: execution.errorKind ?? null,
 			reason: execution.error ?? routeResult.reason,
 			percentLeft: routeResult.percentLeft ?? undefined,
+			diagnosticCode: execution.diagnosticCode,
+			exitCode: execution.exitCode,
+			signal: execution.signal,
+			failurePhase: execution.failurePhase,
+			cleanupStage: execution.cleanupStage,
 		});
 
 		return {
@@ -2758,6 +2781,11 @@ export function executeTask(task, context) {
 			result: "execution_failed",
 			error: execution.error ?? null,
 			errorKind: execution.errorKind ?? null,
+			diagnosticCode: execution.diagnosticCode,
+			exitCode: execution.exitCode,
+			signal: execution.signal,
+			failurePhase: execution.failurePhase,
+			cleanupStage: execution.cleanupStage,
 		};
 	}
 
@@ -3349,6 +3377,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		exitCode: brokerExecution.exitCode ?? null,
 		signal: brokerExecution.signal ?? null,
 		failurePhase: brokerExecution.failurePhase ?? null,
+		cleanupStage: brokerExecution.cleanupStage ?? null,
 	};
 	if (!execution.success) {
 		if (!execution.timedOut) {
@@ -3363,6 +3392,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				cleanupStage: execution.cleanupStage,
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -3379,6 +3409,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				cleanupStage: execution.cleanupStage,
 			};
 		}
 
@@ -3415,6 +3446,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			cleanupStage: execution.cleanupStage,
 		});
 		const error = cleanupFailed
 			? (execution.error ??
@@ -3433,10 +3465,12 @@ async function executeTaskAsyncUnsafe(task, context) {
 				? { reasonCode: safeTimeoutFailure.reasonCode }
 				: {}),
 			reason: error ?? routeResult.reason,
-			diagnosticCode: execution.diagnosticCode,
+			diagnosticCode:
+				safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			cleanupStage: execution.cleanupStage,
 		});
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
@@ -3456,10 +3490,12 @@ async function executeTaskAsyncUnsafe(task, context) {
 					}
 				: {}),
 			timedOut: true,
-			diagnosticCode: execution.diagnosticCode,
+			diagnosticCode:
+				safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			cleanupStage: execution.cleanupStage,
 			...(partialDiff ? { partialDiff } : {}),
 		};
 	}

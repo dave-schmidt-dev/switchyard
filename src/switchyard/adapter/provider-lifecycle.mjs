@@ -6,8 +6,10 @@
 // the exactly-once terminal transition.
 
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
+
 import {
 	classifyProviderDiagnostic,
+	cleanupDiagnosticCodeFor,
 	describeExecError,
 } from "./exec-error.mjs";
 import { validateIdentifier } from "./shell-safety.mjs";
@@ -107,6 +109,7 @@ export function runProviderProcess(command, args, options = {}) {
 		let terminationRequested = false;
 		let cleanupPromise = null;
 		let cleanupError = null;
+		let cleanupResult = null;
 		let timedOut = false;
 		let cancelled = false;
 		let timeoutTimer = null;
@@ -146,13 +149,18 @@ export function runProviderProcess(command, args, options = {}) {
 				elapsedMs,
 				error: cleanupError ?? error,
 				cleanupFailed: Boolean(cleanupError),
+				cleanupStage:
+					cleanupError?.cleanupStage ?? cleanupResult?.cleanupStage ?? null,
 			});
 		};
 
 		const runCleanup = async () => {
 			if (cleanupPromise) return cleanupPromise;
 			cleanupPromise = Promise.resolve()
-				.then(() => (typeof cleanup === "function" ? cleanup() : undefined))
+				.then(async () => {
+					cleanupResult =
+						typeof cleanup === "function" ? await cleanup() : undefined;
+				})
 				.catch((error) => {
 					cleanupError = error;
 				});
@@ -289,11 +297,16 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		let backendHandled = false;
 		if (typeof executionBackend?.cleanupProviderProcess === "function") {
 			try {
-				await executionBackend.cleanupProviderProcess(command, args, {
-					onStatus,
-					...(cleanupContext ?? {}),
-				});
+				const backendResult = await executionBackend.cleanupProviderProcess(
+					command,
+					args,
+					{
+						onStatus,
+						...(cleanupContext ?? {}),
+					},
+				);
 				backendHandled = true;
+				return backendResult;
 			} catch (error) {
 				backendError = error;
 			}
@@ -337,7 +350,11 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				: "provider execution timed out (ETIMEDOUT)",
 			timedOut: true,
 			cleanupFailed: result.cleanupFailed,
-			diagnosticCode: "execution_timed_out",
+			diagnosticCode: result.cleanupFailed
+				? (cleanupDiagnosticCodeFor(result.cleanupStage) ??
+					"provider_cleanup_failed")
+				: "execution_timed_out",
+			cleanupStage: result.cleanupStage,
 			failurePhase: result.cleanupFailed
 				? "provider_cleanup"
 				: "provider_execution",
@@ -346,13 +363,22 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		};
 	}
 	if (result.cancelled) {
+		const cleanupFailed = result.cleanupFailed === true;
 		return {
 			output: result.output,
 			success: false,
-			error: "provider execution cancelled",
+			error: cleanupFailed
+				? "provider cleanup failed after cancellation"
+				: "provider execution cancelled",
 			cancelled: true,
-			diagnosticCode: "execution_cancelled",
-			failurePhase: "provider_execution",
+			cleanupFailed,
+			errorKind: cleanupFailed ? "provider_cleanup_failed" : undefined,
+			diagnosticCode: cleanupFailed
+				? (cleanupDiagnosticCodeFor(result.cleanupStage) ??
+					"provider_cleanup_failed")
+				: "execution_cancelled",
+			failurePhase: cleanupFailed ? "provider_cleanup" : "provider_execution",
+			cleanupStage: result.cleanupStage,
 			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 			signal: result.signal ?? null,
 		};
