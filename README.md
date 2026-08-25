@@ -26,7 +26,8 @@ The 2026-08-04 capability-reliability checkpoint adds explicit `RequiredCapabili
 | `HISTORY.md` | Meaningful changes, bugs, remediation, regression notes. (local, gitignored) |
 | `TASKS.md` | Per-project task tracking. (local, gitignored) |
 | `LICENSE` | MIT. |
-| `package.json` | Node.js/ESM project config, biome + knip + husky devDependencies; `prepare` installs the git hooks on `npm install`. Test scripts serialize the files that have shown Parallels/`prlctl`-daemon contention flakes: `test:serial` runs `dispatch-cli`, `detached-dispatch`, `no-host-rights-vm`, and `workspace-wipe-vm` at `--test-concurrency=1`, and `test:other` dynamically derives every other `tests/*.test.mjs` — the named files are an **exclusion** list, not an inclusion list, so a new test file runs by default. `test` chains both (every test file exactly once); `validate` chains lint + deadcode + test. |
+| `package.json` | Node.js/ESM project config, biome + knip + husky devDependencies; `prepare` installs the git hooks on `npm install`. Test scripts serialize the files that have shown Parallels/`prlctl`-daemon contention flakes: `test:serial` runs `dispatch-cli`, `detached-dispatch`, `no-host-rights-vm`, and `workspace-wipe-vm` at `--test-concurrency=1`, and `test:other` dynamically derives every other `tests/*.test.mjs` — the named files are an **exclusion** list, not an inclusion list, so a new test file runs by default. `test` runs both phases **unconditionally** via `scripts/run-test-phases.mjs` (every test file exactly once); it deliberately does not chain them with `&&`, because a legitimately-red `test:serial` gate would otherwise short-circuit and hide the entire second phase. `validate` chains lint + deadcode + test. |
+| `scripts/run-test-phases.mjs` | Test-phase runner behind `npm test`. Runs `test:serial` then `test:other` unconditionally, inherits stdio so each phase streams live rather than buffering, prints a `Test phase summary: <phase> (exit N), ...` line, and exits with the first non-zero phase status. Exports an injectable `runPhases({phases, run, log})` so the aggregation is tested (`tests/test-phase-aggregation.test.mjs`) without invoking the real suite. |
 | `.husky/pre-commit`, `.husky/pre-push` | Git hooks (husky, wired by the `prepare` script). `pre-commit` runs `npm run lint`; `pre-push` runs `npm run validate`. Both call the named script instead of restating its steps so a hook cannot drift from the gate. See [Git hooks](#git-hooks). |
 | `biome.json` | Biome linter/formatter config. |
 | `knip.json` | Dead code / unused dependency detection. |
@@ -449,7 +450,7 @@ preflight does not guarantee every later task.
 Execute the full suite of node unit and integration gate tests:
 
 ```bash
-npm test          # test:serial (serialized), then test:other (dynamic) — every test file exactly once
+npm test          # test:serial (serialized), then test:other (dynamic) — both run unconditionally; exit = first non-zero phase
 npm run validate  # lint + deadcode + npm test + real-roster coherence
 npm run roster:coherence  # read-only gate; requires current dispatch_qualified evidence
 ```
