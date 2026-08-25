@@ -130,6 +130,35 @@ function buildCallbacks(store, { ordered }) {
 					);
 			return fire(fn);
 		},
+		onTaskHeartbeat(info) {
+			const fn = () =>
+				store.updateRunWithRetry({
+					activeTaskElapsedMs: Number.isFinite(info.elapsedMs)
+						? Math.max(0, info.elapsedMs)
+						: 0,
+					activeTaskHeartbeatAt: 123456,
+					activeTaskProcessPhase: "provider_transport_running",
+				});
+			return fire(fn);
+		},
+		onCleanupStarted() {
+			const fn = () =>
+				store.updateRunWithRetry(
+					{
+						cleanupState: "pending",
+						activeTaskId: null,
+						activeTaskProvider: null,
+						activeTaskModel: null,
+						activeTaskDeadline: null,
+						activeTaskStartedAt: null,
+						activeTaskElapsedMs: null,
+						activeTaskHeartbeatAt: null,
+						activeTaskProcessPhase: null,
+					},
+					{},
+				);
+			return fire(fn);
+		},
 		drain: () => writeChain,
 	};
 }
@@ -215,6 +244,42 @@ describe("worker-bootstrap writeChain ordering", () => {
 			store.snapshot().activeTaskId,
 			"task-2",
 			"the last-fired callback (task-2's start) must win, not be clobbered by earlier, slower-settling writes",
+		);
+	});
+
+	it("FIX persists pending cleanup after clearing active provider telemetry", async () => {
+		const store = createFakeRunStore({
+			cleanupState: "not_started",
+			activeTaskId: "task-A",
+			activeTaskProvider: "claude",
+			activeTaskHeartbeatAt: 123,
+			activeTaskProcessPhase: "provider_running",
+		});
+		const callbacks = buildCallbacks(store, { ordered: true });
+
+		await callbacks.onCleanupStarted();
+
+		strictEqual(store.snapshot().cleanupState, "pending");
+		strictEqual(store.snapshot().activeTaskId, null);
+		strictEqual(store.snapshot().activeTaskProvider, null);
+		strictEqual(store.snapshot().activeTaskHeartbeatAt, null);
+		strictEqual(store.snapshot().activeTaskProcessPhase, null);
+	});
+
+	it("FIX persists transport heartbeat phase without claiming guest provider liveness", async () => {
+		const store = createFakeRunStore({
+			activeTaskId: "task-A",
+			activeTaskProcessPhase: "routed",
+		});
+		const callbacks = buildCallbacks(store, { ordered: true });
+
+		await callbacks.onTaskHeartbeat({ elapsedMs: 42 });
+
+		strictEqual(store.snapshot().activeTaskElapsedMs, 42);
+		strictEqual(store.snapshot().activeTaskHeartbeatAt, 123456);
+		strictEqual(
+			store.snapshot().activeTaskProcessPhase,
+			"provider_transport_running",
 		);
 	});
 });

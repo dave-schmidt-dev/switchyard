@@ -1,12 +1,85 @@
 import { rejects, strictEqual } from "node:assert";
+import { randomUUID } from "node:crypto";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { test } from "node:test";
+import { join, resolve } from "node:path";
+import { after, before, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { createReservationLedger } from "../src/switchyard/broker/reservations.mjs";
-import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import {
+	__resetRosterCacheForTests,
+	getInvocationDescriptorIdentity,
+} from "../src/switchyard/roster/index.mjs";
 import { route as productionRoute } from "../src/switchyard/router/index.mjs";
 import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
+
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
+const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+
+function writeDispatchQualifiedRosterFixture() {
+	const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+	const testedAt = new Date().toISOString();
+	for (const [targetId, target] of Object.entries(roster.targets)) {
+		if (!target.enabled) continue;
+		for (const slots of Object.values(target.slots ?? {})) {
+			for (const slot of slots ?? []) {
+				if (slot.manual_only) continue;
+				const model = roster.models[slot.model_ref];
+				if (model?.status !== "active") continue;
+				const core = {
+					target_id: targetId,
+					model_ref: slot.model_ref,
+					selector: model.selector,
+					effort: slot.effort ?? null,
+					variant: slot.variant ?? null,
+					invocation_args: slot.invocation_args ?? [],
+				};
+				const descriptorIdentity = getInvocationDescriptorIdentity(
+					core,
+					target.harness,
+				);
+				target.qualifications ??= {};
+				target.qualifications[descriptorIdentity] = {
+					...core,
+					descriptor_identity: descriptorIdentity,
+					status: "dispatch_qualified",
+					tested_at: testedAt,
+					credential_profile: target.credential_profile,
+				};
+			}
+		}
+	}
+	const fixturePath = join(
+		tmpdir(),
+		`switchyard-runner-broker-qualified-roster-${process.pid}-${randomUUID()}.json`,
+	);
+	writeFileSync(fixturePath, JSON.stringify(roster), "utf8");
+	return fixturePath;
+}
+
+let qualifiedRosterPath = null;
+
+before(() => {
+	qualifiedRosterPath = writeDispatchQualifiedRosterFixture();
+	process.env.SWITCHYARD_ROSTER_PATH = qualifiedRosterPath;
+	__resetRosterCacheForTests();
+});
+
+after(() => {
+	if (previousRosterPath === undefined) {
+		delete process.env.SWITCHYARD_ROSTER_PATH;
+	} else {
+		process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+	}
+	__resetRosterCacheForTests();
+	if (qualifiedRosterPath) {
+		try {
+			rmSync(qualifiedRosterPath, { force: true });
+		} catch {}
+	}
+});
 
 // Every dependencies object below sets queuePreflight to a trivial pass.
 // This file exercises broker reservation/fallback/adapter-launch behavior
@@ -200,7 +273,7 @@ test("production async broker forwards adapter status and heartbeats", async () 
 	);
 	strictEqual(heartbeats.length, 1);
 	strictEqual(heartbeats[0].elapsedMs, 42);
-	strictEqual(heartbeats[0].processPhase, "provider_running");
+	strictEqual(heartbeats[0].processPhase, "provider_transport_running");
 });
 
 test("production async runner drains a dependency chain in one bounded run", async () => {
@@ -996,6 +1069,7 @@ test("production async runner cleans up when broker construction fails closed", 
 			checkpointPath,
 			projectRevision: "fixed",
 			dependencies: {
+				queuePreflight: () => ({ ok: true, eligible: true }),
 				backendFactory: () => ({
 					executionBackend: {},
 					create: () => "owned-broker-construction-worker",

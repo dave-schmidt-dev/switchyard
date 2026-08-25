@@ -180,6 +180,8 @@ let dir;
 let tasksFile;
 let projectDir;
 let stateRoot;
+let detachedCleanupPending;
+let detachedCleanupRunId;
 
 function makeStateRootEnv() {
 	return { SWITCHYARD_RUN_STORE_ROOT: stateRoot };
@@ -187,6 +189,8 @@ function makeStateRootEnv() {
 
 beforeEach(async () => {
 	dir = mkdtempSync(join(tmpdir(), "switchyard-detached-dispatch-"));
+	detachedCleanupPending = false;
+	detachedCleanupRunId = null;
 	stateRoot = join(dir, "state-root");
 	tasksFile = join(dir, "tasks.md");
 	writeFileSync(
@@ -208,6 +212,12 @@ afterEach(() => {
 	delete process.env.SWITCHYARD_RUN_STORE_ROOT;
 	delete process.env.SWITCHYARD_ROSTER_PATH;
 	delete process.env.SWITCHYARD_LEDGER_PATH;
+	if (detachedCleanupPending) {
+		console.error(
+			`detached cleanup was not confirmed for run ${detachedCleanupRunId ?? "unknown"}; preserving fixture ${dir}`,
+		);
+		return;
+	}
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -225,6 +235,196 @@ async function launchAndGetRunId() {
 function pollStatus(runId, env) {
 	return runDispatch(["status", runId], env);
 }
+
+function compactDiagnostic(value) {
+	return String(value ?? "")
+		.trim()
+		.replace(/\s+/g, " ")
+		.slice(0, 256);
+}
+
+function cleanupDiagnostic(run) {
+	if (!run) return null;
+	return {
+		state: run.state ?? null,
+		cleanupState: run.cleanupState ?? null,
+		workerPid: run.workerPid ?? null,
+		activeTaskId: run.activeTaskId ?? null,
+		activeTaskProvider: run.activeTaskProvider ?? null,
+		activeTaskProcessPhase: run.activeTaskProcessPhase ?? null,
+		updatedAt: run.updatedAt ?? null,
+	};
+}
+
+async function awaitRunTerminalCleanup(
+	runId,
+	env,
+	{
+		maxWait = 300_000,
+		pollInterval = 200,
+		pollStatusFn = pollStatus,
+		sleep = (delayMs) =>
+			new Promise((resolveWait) => setTimeout(resolveWait, delayMs)),
+	} = {},
+) {
+	const start = Date.now();
+	let lastStatus = null;
+	let lastStatusResult = null;
+	let pollCount = 0;
+	while (true) {
+		pollCount += 1;
+		try {
+			const statusResult = pollStatusFn(runId, env);
+			lastStatusResult = statusResult;
+			if (statusResult.status === 0) {
+				try {
+					const status = JSON.parse(statusResult.stdout.trim());
+					lastStatus = status;
+					if (
+						(status.state === "succeeded" || status.state === "failed") &&
+						status.cleanupState === "complete"
+					) {
+						return status;
+					}
+				} catch {
+					// A partial/corrupt observation is retained in the timeout
+					// diagnostic; it can never count as completed cleanup.
+				}
+			}
+		} catch (error) {
+			lastStatusResult = { status: "threw", stderr: error.message };
+		}
+
+		const elapsed = Date.now() - start;
+		if (elapsed >= maxWait) break;
+		await sleep(Math.min(pollInterval, maxWait - elapsed));
+	}
+	let diagnosticEvents = [];
+	let diagnosticRun = null;
+	try {
+		const { readEvents, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		diagnosticEvents = await readEvents(runId);
+		diagnosticRun = await readRun(runId);
+	} catch {}
+	throw new Error(
+		`run ${runId} did not reach terminal state with completed cleanup within ${maxWait}ms after ${pollCount} polls; last status: ${JSON.stringify(cleanupDiagnostic(lastStatus))}; run record: ${JSON.stringify(cleanupDiagnostic(diagnosticRun))}; status exit: ${lastStatusResult?.status ?? "unknown"}; status stderr: ${compactDiagnostic(lastStatusResult?.stderr) || "<empty>"}; recent events: ${JSON.stringify(diagnosticEvents.slice(-5).map(({ phase, event, taskId }) => ({ phase, event, taskId: taskId ?? null })))}`,
+	);
+}
+
+function attachCleanupFailure(bodyError, cleanupError) {
+	if (!bodyError || typeof bodyError !== "object") return;
+	const property = bodyError.cause === undefined ? "cause" : "cleanupFailure";
+	try {
+		Object.defineProperty(bodyError, property, {
+			value: cleanupError,
+			configurable: true,
+		});
+	} catch {
+		// Preserve the original body error even when it is not extensible.
+	}
+}
+
+async function finishDetachedRun(runId, env, bodyError, cleanupOptions = {}) {
+	let cleanupError = null;
+	if (runId) {
+		try {
+			await awaitRunTerminalCleanup(runId, env, cleanupOptions);
+			detachedCleanupPending = false;
+		} catch (error) {
+			cleanupError = error;
+		}
+	}
+
+	if (bodyError) {
+		if (cleanupError) attachCleanupFailure(bodyError, cleanupError);
+		throw bodyError;
+	}
+	if (cleanupError) throw cleanupError;
+}
+
+describe("detached fixture terminal cleanup guard", () => {
+	it("waits through a terminal-but-pending state and fails with bounded diagnostics if cleanup never completes", async () => {
+		const statuses = [
+			{ state: "running", cleanupState: "not_started", workerPid: 123 },
+			{ state: "failed", cleanupState: "pending", workerPid: 123 },
+			{ state: "failed", cleanupState: "complete", workerPid: null },
+		];
+		let pollCount = 0;
+		const terminal = await awaitRunTerminalCleanup(
+			"fixture-run",
+			{},
+			{
+				maxWait: 100,
+				pollInterval: 0,
+				pollStatusFn: () => ({
+					status: 0,
+					stdout: JSON.stringify(statuses[pollCount++]),
+					stderr: "",
+				}),
+				sleep: async () => {},
+			},
+		);
+
+		strictEqual(pollCount, 3);
+		strictEqual(terminal.cleanupState, "complete");
+
+		await rejects(
+			awaitRunTerminalCleanup(
+				"diagnostic-run",
+				{},
+				{
+					maxWait: 0,
+					pollStatusFn: () => ({
+						status: 0,
+						stdout: JSON.stringify({
+							state: "failed",
+							cleanupState: "pending",
+							workerPid: 456,
+						}),
+						stderr: "",
+					}),
+				},
+			),
+			/diagnostic-run.*"state":"failed","cleanupState":"pending"/,
+		);
+	});
+
+	it("rethrows the original routing failure when cleanup also fails and keeps fixture preservation armed", async () => {
+		const routingError = new Error("synthetic selector assertion failure");
+		detachedCleanupPending = true;
+		detachedCleanupRunId = "masked-error-run";
+		let observedError = null;
+		try {
+			await finishDetachedRun("masked-error-run", {}, routingError, {
+				maxWait: 0,
+				pollStatusFn: () => ({
+					status: 0,
+					stdout: JSON.stringify({
+						state: "failed",
+						cleanupState: "pending",
+					}),
+					stderr: "",
+				}),
+			});
+		} catch (error) {
+			observedError = error;
+		}
+
+		strictEqual(observedError, routingError);
+		ok(
+			observedError.cause?.message.includes(
+				"did not reach terminal state with completed cleanup",
+			),
+			"cleanup failure diagnostic must be attached to the original error",
+		);
+		strictEqual(detachedCleanupPending, true);
+		// This regression deliberately simulates failure without a real detached
+		// worker, so disarm preservation before the shared afterEach runs.
+		detachedCleanupPending = false;
+	});
+});
 
 describe("launch returns before completion", () => {
 	it("launch exits 0 immediately, status returns a tracked run", async () => {
@@ -594,94 +794,109 @@ describe("--exclude-provider on the detached worker path", () => {
 		writeDispatchQualifiedRoster(runtimeRosterPath, "codex");
 		env.SWITCHYARD_ROSTER_PATH = runtimeRosterPath;
 
-		const launchResult = runDispatch(
-			[
-				"launch",
-				tasksFile,
-				"--project",
-				excludeProjectDir,
-				"--exclude-provider",
-				"claude",
-				"--platform",
-				"macos",
-			],
-			env,
-		);
-		strictEqual(
-			launchResult.status,
-			0,
-			`launch failed: ${launchResult.stderr}`,
-		);
-		const { runId } = JSON.parse(launchResult.stdout.trim());
+		let runId;
+		let bodyError = null;
+		try {
+			const launchResult = runDispatch(
+				[
+					"launch",
+					tasksFile,
+					"--project",
+					excludeProjectDir,
+					"--exclude-provider",
+					"claude",
+					"--platform",
+					"macos",
+				],
+				env,
+			);
+			strictEqual(
+				launchResult.status,
+				0,
+				`launch failed: ${launchResult.stderr}`,
+			);
+			const envelope = JSON.parse(launchResult.stdout.trim());
+			runId = envelope.runId;
+			ok(
+				typeof runId === "string" && runId.length > 0,
+				"launch must return a run id before detached cleanup can be guarded",
+			);
+			detachedCleanupPending = true;
+			detachedCleanupRunId = runId;
 
-		// onTaskRouted fires (and is persisted to activeTaskProvider) before the
-		// blocking adapter.execute call, so poll frequently: this only needs to
-		// observe routing, not wait for the task to finish executing.
-		let observedProvider = null;
-		let observedDescriptor = null;
-		let observedDescriptorIdentity = null;
-		const start = Date.now();
-		// A full linked/full clone + boot of the golden image replaces the old
-		// Docker cold-start (~24.9s under sustained load) this budget used to be
-		// tuned for. Unverified against real hardware — no golden image is
-		// configured on this dev machine — so 5 minutes is a conservative guess;
-		// tighten it once measured against a real Parallels clone+boot.
-		const maxWait = 300_000;
-		while (Date.now() - start < maxWait) {
-			const statusResult = pollStatus(runId, env);
-			if (statusResult.status === 0) {
-				const status = JSON.parse(statusResult.stdout.trim());
-				if (status.activeTaskProvider) {
-					observedProvider = status.activeTaskProvider;
-					observedDescriptor = status.activeTaskInvocationDescriptor;
-					observedDescriptorIdentity = status.activeTaskDescriptorIdentity;
-					break;
+			// onTaskRouted fires (and is persisted to activeTaskProvider) before the
+			// blocking adapter.execute call, so poll frequently: this only needs to
+			// observe routing, not wait for the task to finish executing.
+			let observedProvider = null;
+			let observedDescriptor = null;
+			let observedDescriptorIdentity = null;
+			const start = Date.now();
+			// A full linked/full clone + boot of the golden image replaces the old
+			// Docker cold-start (~24.9s under sustained load) this budget used to be
+			// tuned for. Unverified against real hardware — no golden image is
+			// configured on this dev machine — so 5 minutes is a conservative guess;
+			// tighten it once measured against a real Parallels clone+boot.
+			const maxWait = 300_000;
+			while (Date.now() - start < maxWait) {
+				const statusResult = pollStatus(runId, env);
+				if (statusResult.status === 0) {
+					const status = JSON.parse(statusResult.stdout.trim());
+					if (status.activeTaskProvider) {
+						observedProvider = status.activeTaskProvider;
+						observedDescriptor = status.activeTaskInvocationDescriptor;
+						observedDescriptorIdentity = status.activeTaskDescriptorIdentity;
+						break;
+					}
+					if (status.state === "succeeded" || status.state === "failed") {
+						break;
+					}
 				}
-				if (status.state === "succeeded" || status.state === "failed") {
-					break;
-				}
+				await new Promise((r) => setTimeout(r, 200));
 			}
-			await new Promise((r) => setTimeout(r, 200));
-		}
 
-		// Fallback for the race where the task already reached a terminal state
-		// (task_completed/task_failed) before any poll caught
-		// activeTaskProvider populated — the routed provider is still on the
-		// terminal event worker-bootstrap.mjs's onResult callback records.
-		if (!observedProvider) {
-			const { readEvents } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			const events = await readEvents(runId);
-			const routedEvent = events.find(
-				(e) =>
-					e.phase === "execution" &&
-					(e.event === "task_completed" || e.event === "task_failed"),
-			);
-			observedProvider = routedEvent?.provider ?? null;
-			observedDescriptor = routedEvent?.invocationDescriptor ?? null;
-			observedDescriptorIdentity = routedEvent?.descriptorIdentity ?? null;
-		}
+			// Fallback for the race where the task already reached a terminal state
+			// (task_completed/task_failed) before any poll caught
+			// activeTaskProvider populated — the routed provider is still on the
+			// terminal event worker-bootstrap.mjs's onResult callback records.
+			if (!observedProvider) {
+				const { readEvents } = await import(
+					"../src/switchyard/run-store/index.mjs"
+				);
+				const events = await readEvents(runId);
+				const routedEvent = events.find(
+					(e) =>
+						e.phase === "execution" &&
+						(e.event === "task_completed" || e.event === "task_failed"),
+				);
+				observedProvider = routedEvent?.provider ?? null;
+				observedDescriptor = routedEvent?.invocationDescriptor ?? null;
+				observedDescriptorIdentity = routedEvent?.descriptorIdentity ?? null;
+			}
 
-		ok(observedProvider, "expected the task to be routed to some provider");
-		strictEqual(
-			observedProvider,
-			"codex",
-			"claude is excluded and has more headroom, so codex must be routed instead",
-		);
-		ok(
-			observedProvider !== "claude",
-			"the excluded provider must never be routed",
-		);
-		ok(
-			observedDescriptor,
-			"detached worker must persist its descriptor receipt",
-		);
-		strictEqual(
-			observedDescriptor.descriptor_identity,
-			observedDescriptorIdentity,
-			"detached descriptor identity must match its receipt",
-		);
+			ok(observedProvider, "expected the task to be routed to some provider");
+			strictEqual(
+				observedProvider,
+				"codex",
+				"claude is excluded and has more headroom, so codex must be routed instead",
+			);
+			ok(
+				observedProvider !== "claude",
+				"the excluded provider must never be routed",
+			);
+			ok(
+				observedDescriptor,
+				"detached worker must persist its descriptor receipt",
+			);
+			strictEqual(
+				observedDescriptor.descriptor_identity,
+				observedDescriptorIdentity,
+				"detached descriptor identity must match its receipt",
+			);
+		} catch (error) {
+			bodyError = error;
+		} finally {
+			await finishDetachedRun(runId, env, bodyError);
+		}
 	});
 });
 
@@ -747,69 +962,84 @@ describe("--only-provider on the detached worker path", () => {
 		writeDispatchQualifiedRoster(runtimeRosterPath, "codex");
 		env.SWITCHYARD_ROSTER_PATH = runtimeRosterPath;
 
-		const launchResult = runDispatch(
-			[
-				"launch",
-				tasksFile,
-				"--project",
-				onlyProjectDir,
-				"--only-provider",
-				"codex",
-				"--platform",
-				"macos",
-			],
-			env,
-		);
-		strictEqual(
-			launchResult.status,
-			0,
-			`launch failed: ${launchResult.stderr}`,
-		);
-		const { runId } = JSON.parse(launchResult.stdout.trim());
+		let runId;
+		let bodyError = null;
+		try {
+			const launchResult = runDispatch(
+				[
+					"launch",
+					tasksFile,
+					"--project",
+					onlyProjectDir,
+					"--only-provider",
+					"codex",
+					"--platform",
+					"macos",
+				],
+				env,
+			);
+			strictEqual(
+				launchResult.status,
+				0,
+				`launch failed: ${launchResult.stderr}`,
+			);
+			const envelope = JSON.parse(launchResult.stdout.trim());
+			runId = envelope.runId;
+			ok(
+				typeof runId === "string" && runId.length > 0,
+				"launch must return a run id before detached cleanup can be guarded",
+			);
+			detachedCleanupPending = true;
+			detachedCleanupRunId = runId;
 
-		let observedProvider = null;
-		const start = Date.now();
-		// See the --exclude-provider test's matching comment: unverified against
-		// real hardware, conservative budget for a full clone + boot.
-		const maxWait = 300_000;
-		while (Date.now() - start < maxWait) {
-			const statusResult = pollStatus(runId, env);
-			if (statusResult.status === 0) {
-				const status = JSON.parse(statusResult.stdout.trim());
-				if (status.activeTaskProvider) {
-					observedProvider = status.activeTaskProvider;
-					break;
+			let observedProvider = null;
+			const start = Date.now();
+			// See the --exclude-provider test's matching comment: unverified against
+			// real hardware, conservative budget for a full clone + boot.
+			const maxWait = 300_000;
+			while (Date.now() - start < maxWait) {
+				const statusResult = pollStatus(runId, env);
+				if (statusResult.status === 0) {
+					const status = JSON.parse(statusResult.stdout.trim());
+					if (status.activeTaskProvider) {
+						observedProvider = status.activeTaskProvider;
+						break;
+					}
+					if (status.state === "succeeded" || status.state === "failed") {
+						break;
+					}
 				}
-				if (status.state === "succeeded" || status.state === "failed") {
-					break;
-				}
+				await new Promise((r) => setTimeout(r, 200));
 			}
-			await new Promise((r) => setTimeout(r, 200));
-		}
 
-		if (!observedProvider) {
-			const { readEvents } = await import(
-				"../src/switchyard/run-store/index.mjs"
-			);
-			const events = await readEvents(runId);
-			const routedEvent = events.find(
-				(e) =>
-					e.phase === "execution" &&
-					(e.event === "task_completed" || e.event === "task_failed"),
-			);
-			observedProvider = routedEvent?.provider ?? null;
-		}
+			if (!observedProvider) {
+				const { readEvents } = await import(
+					"../src/switchyard/run-store/index.mjs"
+				);
+				const events = await readEvents(runId);
+				const routedEvent = events.find(
+					(e) =>
+						e.phase === "execution" &&
+						(e.event === "task_completed" || e.event === "task_failed"),
+				);
+				observedProvider = routedEvent?.provider ?? null;
+			}
 
-		ok(observedProvider, "expected the task to be routed to some provider");
-		strictEqual(
-			observedProvider,
-			"codex",
-			"claude has more headroom but is not in the --only-provider allowlist, so codex must be routed instead",
-		);
-		ok(
-			observedProvider !== "claude",
-			"a provider outside the --only-provider allowlist must never be routed",
-		);
+			ok(observedProvider, "expected the task to be routed to some provider");
+			strictEqual(
+				observedProvider,
+				"codex",
+				"claude has more headroom but is not in the --only-provider allowlist, so codex must be routed instead",
+			);
+			ok(
+				observedProvider !== "claude",
+				"a provider outside the --only-provider allowlist must never be routed",
+			);
+		} catch (error) {
+			bodyError = error;
+		} finally {
+			await finishDetachedRun(runId, env, bodyError);
+		}
 	});
 });
 
@@ -1548,7 +1778,7 @@ describe("status and result envelope contracts", () => {
 				activeTaskDeadline: deadline,
 				activeTaskElapsedMs: 321,
 				activeTaskHeartbeatAt: 123456,
-				activeTaskProcessPhase: "provider_running",
+				activeTaskProcessPhase: "provider_transport_running",
 				telemetryWriteFailures: 2,
 				lastTelemetryWriteFailure: "revision_conflict",
 			},
@@ -1564,7 +1794,7 @@ describe("status and result envelope contracts", () => {
 		strictEqual(status.activeTaskDeadline, deadline);
 		strictEqual(status.activeTaskElapsedMs, 321);
 		strictEqual(status.activeTaskHeartbeatAt, 123456);
-		strictEqual(status.activeTaskProcessPhase, "provider_running");
+		strictEqual(status.activeTaskProcessPhase, "provider_transport_running");
 		strictEqual(status.telemetryWriteFailures, 2);
 		strictEqual(status.lastTelemetryWriteFailure, "revision_conflict");
 

@@ -372,7 +372,7 @@ try {
 							? Math.max(0, info.elapsedMs)
 							: 0,
 						activeTaskHeartbeatAt: Date.now(),
-						activeTaskProcessPhase: "provider_running",
+						activeTaskProcessPhase: "provider_transport_running",
 					});
 				queueWrite(fn);
 			},
@@ -475,6 +475,24 @@ try {
 						workingContainerName: info.workingContainerName,
 					});
 				queueWrite(fn);
+			},
+			onCleanupStarted: () => {
+				const fn = () =>
+					runStore.updateRunWithRetry(runId, {
+						cleanupState: "pending",
+						activeTaskId: null,
+						activeTaskProvider: null,
+						activeTaskModel: null,
+						activeTaskDeadline: null,
+						activeTaskStartedAt: null,
+						activeTaskElapsedMs: null,
+						activeTaskHeartbeatAt: null,
+						activeTaskProcessPhase: null,
+						activeTaskInvocationDescriptor: null,
+						activeTaskDescriptorIdentity: null,
+						activeTaskDescriptorHarness: null,
+					});
+				return queueWrite(fn);
 			},
 		},
 	});

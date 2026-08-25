@@ -1546,7 +1546,7 @@ describe("async runner provider lifecycle", () => {
 		strictEqual(heartbeats.length, 1);
 		strictEqual(heartbeats[0].taskId, "4.2");
 		strictEqual(heartbeats[0].elapsedMs, 42);
-		strictEqual(heartbeats[0].processPhase, "provider_running");
+		strictEqual(heartbeats[0].processPhase, "provider_transport_running");
 		ok(!Object.hasOwn(heartbeats[0], "stdoutBytes"));
 		ok(!JSON.stringify(heartbeats).includes("SECRET_STREAM"));
 	});
@@ -5090,6 +5090,59 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			ok(events.indexOf("acquire") < events.indexOf("create"));
 			ok(events.indexOf("destroy") < events.indexOf("release"));
 		}
+	});
+
+	it("awaits cleanup-state persistence before destroying an owned workspace", async () => {
+		const events = [];
+		let releaseCleanup;
+		let signalCleanupEntered;
+		const cleanupGate = new Promise((resolve) => {
+			releaseCleanup = resolve;
+		});
+		const cleanupEntered = new Promise((resolve) => {
+			signalCleanupEntered = resolve;
+		});
+		const tasksPath = writeTerminalQueue();
+		const queuePromise = runQueueAsyncImpl({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			platform: "macos",
+			checkpointPath: `${tasksPath}.cleanup-order.checkpoint.json`,
+			dependencies: {
+				backendFactory: () => macosBackend(events),
+				onCleanupStarted: async () => {
+					events.push("cleanup-started");
+					signalCleanupEntered();
+					await cleanupGate;
+					events.push("cleanup-resolved");
+				},
+			},
+		});
+		await cleanupEntered;
+		strictEqual(events.at(-1), "cleanup-started");
+		strictEqual(events.includes("destroy"), false);
+		releaseCleanup();
+		await queuePromise;
+		ok(events.indexOf("cleanup-resolved") < events.indexOf("destroy"));
+	});
+
+	it("destroys the workspace and releases the slot when cleanup-state persistence rejects", async () => {
+		const events = [];
+		const tasksPath = writeTerminalQueue();
+		await runQueueAsyncImpl({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			platform: "macos",
+			checkpointPath: `${tasksPath}.cleanup-rejection.checkpoint.json`,
+			dependencies: {
+				backendFactory: () => macosBackend(events),
+				onCleanupStarted: async () => {
+					throw new Error("synthetic cleanup persistence failure");
+				},
+			},
+		});
+		ok(events.indexOf("destroy") >= 0);
+		ok(events.indexOf("release") > events.indexOf("destroy"));
 	});
 
 	it("releases a slot when workspace creation fails", () => {

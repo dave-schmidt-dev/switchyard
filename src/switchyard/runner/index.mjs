@@ -4077,6 +4077,17 @@ export async function runQueueAsync(options) {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();
 		try {
 			if (ownsWorkingContainer) {
+				// The detached worker must durably mark cleanup as pending before
+				// destroying the workspace. This gives its run-store telemetry a
+				// clear lifecycle boundary and prevents a late heartbeat from
+				// describing a provider that no longer has a workspace.
+				try {
+					await dependencies.onCleanupStarted?.();
+				} catch (error) {
+					console.error(
+						`runQueueAsync: cleanup-started hook failed: ${error?.message ?? "unknown error"}`,
+					);
+				}
 				try {
 					try {
 						queueBackend.beforeRemove?.(workingContainerName, projectPath);
@@ -5117,7 +5128,7 @@ function createDispatchBroker(context, dependencies = {}) {
 						elapsedMs: Number.isFinite(poll?.elapsedMs)
 							? Math.max(0, poll.elapsedMs)
 							: 0,
-						processPhase: "provider_running",
+						processPhase: "provider_transport_running",
 						resolvedTargetId: selectedRoute.resolvedTarget,
 						descriptorIdentity: invocationDescriptor.descriptor_identity,
 						descriptorHarness: selectedRoute.harness,
