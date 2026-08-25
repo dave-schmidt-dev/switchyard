@@ -6,6 +6,10 @@
 // The network and clipboard probes are also guest-side observations. They
 // prove the golden image's C-3 posture, not host isolation: guest root can
 // still change guest policy, and no guest probe can certify the host itself.
+//
+// The C-3 endpoint manifest is DERIVED and host-verified per run rather than
+// configured, so the gate holds on any network this Mac attaches to. It is not
+// a skip condition: a manifest that proves no block rule fails the gate.
 
 import { match, ok, strictEqual } from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -17,27 +21,12 @@ import {
 	buildParallelsWorkingName,
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { deriveC3Manifest, probeTcp } from "./helpers/c3-manifest.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "macOS";
 const PROVIDER_USER =
 	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
-// The four blocked endpoints are explicit because a passing probe against a
-// closed port is not evidence of C-3. The manifest must name two host
-// identities, the LAN gateway, and a guest-subnet service known to be live.
-const C3_HOST_ENDPOINTS = parseEndpoints(
-	process.env.SWITCHYARD_PARALLELS_C3_HOST_ENDPOINTS,
-);
-const C3_GATEWAY_ENDPOINT = parseEndpoint(
-	process.env.SWITCHYARD_PARALLELS_C3_GATEWAY_ENDPOINT,
-);
-const C3_GUEST_SUBNET_ENDPOINT = parseEndpoint(
-	process.env.SWITCHYARD_PARALLELS_C3_GUEST_SUBNET_ENDPOINT,
-);
-const C3_REACHABLE_ENDPOINT = parseEndpoint(
-	process.env.SWITCHYARD_PARALLELS_C3_REACHABLE_ENDPOINT,
-);
-const C3_DNS_NAME = process.env.SWITCHYARD_PARALLELS_C3_DNS_NAME || "apple.com";
 
 function commandAvailable(command) {
 	try {
@@ -48,23 +37,6 @@ function commandAvailable(command) {
 	} catch {
 		return false;
 	}
-}
-
-function parseEndpoint(value) {
-	if (typeof value !== "string") return null;
-	const match = /^([A-Za-z0-9._:-]+):(\d{1,5})$/.exec(value);
-	if (!match || Number(match[2]) < 1 || Number(match[2]) > 65535) {
-		return null;
-	}
-	return { value, host: match[1], port: match[2] };
-}
-
-function parseEndpoints(value) {
-	if (!value) return [];
-	return value
-		.split(",")
-		.map((endpoint) => parseEndpoint(endpoint.trim()))
-		.filter(Boolean);
 }
 
 function outputText(value) {
@@ -143,19 +115,9 @@ async function inspectPrerequisites() {
 	}
 	if (!(await loadSlotPrimitive()))
 		return "shared VM-slot primitive is unavailable";
-	const blockedEndpoints = [
-		...C3_HOST_ENDPOINTS,
-		C3_GATEWAY_ENDPOINT,
-		C3_GUEST_SUBNET_ENDPOINT,
-	];
-	if (
-		blockedEndpoints.some((endpoint) => !endpoint) ||
-		new Set(blockedEndpoints.map((endpoint) => endpoint.value)).size !== 4 ||
-		!C3_REACHABLE_ENDPOINT ||
-		!C3_DNS_NAME
-	) {
-		return "C-3 endpoint manifest is unavailable";
-	}
+	// The C-3 manifest is deliberately absent from this ladder. It is derived
+	// inside the gate and asserted there, so a derivation gap fails loudly
+	// instead of reporting green through a skip.
 	return null;
 }
 
@@ -177,6 +139,7 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 		let vmUuid;
 		let vmName;
 		let originalClipboard;
+		let manifest;
 
 		try {
 			progress("acquiring the shared VM slot");
@@ -255,22 +218,44 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 				"guest host-path probe must succeed without output",
 			);
 
-			const blockedEndpoints = [
-				...C3_HOST_ENDPOINTS,
-				C3_GATEWAY_ENDPOINT,
-				C3_GUEST_SUBNET_ENDPOINT,
-			];
+			progress("deriving and host-verifying the C-3 endpoint manifest");
+			manifest = await deriveC3Manifest();
+			for (const entry of manifest.dropped) {
+				progress(`C-3 candidate dropped (${entry.reason}): ${entry.value}`);
+			}
+			ok(
+				manifest.coverage.length > 0,
+				`C-3 manifest proved no block rule. Every candidate was dropped: ${
+					manifest.dropped.map((entry) => entry.value).join(", ") ||
+					"none found"
+				}`,
+			);
+			// A reachable control the HOST cannot reach makes the guest's
+			// allow-side probe meaningless, so verify it before trusting it.
+			ok(
+				await probeTcp(manifest.reachable.host, manifest.reachable.port, 5000),
+				`C-3 reachable control ${manifest.reachable.value} is unreachable from the host`,
+			);
+			// Recorded, not implied: two of C-3's four block rules (172.16/12 and
+			// 169.254/16) usually have no live target from any host, so a passing
+			// gate is not evidence that the whole ruleset was exercised.
+			progress(
+				`C-3 blocked endpoints: ${manifest.blocked.map((endpoint) => `${endpoint.value} [${endpoint.cidr}]`).join(", ")}`,
+			);
+			progress(
+				`C-3 block rules proven: ${manifest.coverage.join(", ")}; unproven for want of a live target: ${manifest.unproven.join(", ") || "none"}`,
+			);
 			progress("running guest mount and C-3 network probes");
 			const networkScript = [
 				"set -eu",
 				'probe_blocked() { ! /usr/bin/nc -G 3 -w 3 -z "$1" "$2" >/dev/null 2>&1; }',
 				'probe_reachable() { /usr/bin/nc -G 5 -w 5 -z "$1" "$2" >/dev/null 2>&1; }',
-				...blockedEndpoints.map(
+				...manifest.blocked.map(
 					(endpoint) =>
 						`probe_blocked ${shellQuote(endpoint.host)} ${shellQuote(endpoint.port)}`,
 				),
-				`probe_reachable ${shellQuote(C3_REACHABLE_ENDPOINT.host)} ${shellQuote(C3_REACHABLE_ENDPOINT.port)}`,
-				`/usr/bin/dscacheutil -q host -a name ${shellQuote(C3_DNS_NAME)} | /usr/bin/grep -q '^ip_address:'`,
+				`probe_reachable ${shellQuote(manifest.reachable.host)} ${shellQuote(manifest.reachable.port)}`,
+				`/usr/bin/dscacheutil -q host -a name ${shellQuote(manifest.dnsName)} | /usr/bin/grep -q '^ip_address:'`,
 			].join("\n");
 			backend.execGuest(vmUuid, "/bin/bash", ["-lc", networkScript], {
 				cwd: "/",
@@ -299,6 +284,7 @@ exit 0`,
 				{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
 			);
 		} finally {
+			if (manifest) await manifest.close();
 			if (originalClipboard !== undefined) {
 				try {
 					execFileSync("pbcopy", [], { input: originalClipboard });
