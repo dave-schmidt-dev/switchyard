@@ -22,7 +22,7 @@ The Parallels gate adds host-side `prlctl list -i` assertions that host-defined 
 area: ["src/switchyard/integrate/**"]
 gate_test: tests/integration-gate.test.mjs
 threshold: 3
-rationale: The single door between the sandbox and the host. Agent output reaches real files only via a reviewed apply/merge — never a direct agent write to the host. Bypassing this is how unattended agents would silently corrupt the Mac's copy.
+rationale: The single door between the sandbox and the host. Agent output reaches real files only via a reviewed apply/merge — never a direct agent write to the host. Bypassing this is how unattended agents would silently corrupt the Mac's copy. A retained review artifact is evidence only of a captured non-empty diff, not success; its absence never upgrades a failed route or rejected integration to success.
 
 ### INV-3 — The disposable workspace is wiped at project end, and no working object ever accumulates
 area: ["src/switchyard/lifecycle/**", "src/switchyard/runner/**", "ops/switchyard-reaper.sh"]
