@@ -265,7 +265,10 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 
 			originalClipboard = execFileSync("pbpaste", [], { encoding: "utf8" });
 			progress("running the behavioral clipboard probe");
-			const sentinel = "switchyard-clipboard-sentinel";
+			// A per-run unique sentinel. A fixed literal cannot distinguish a live
+			// leak from a stale value an earlier run left on the guest pasteboard,
+			// so the probe would report the same verdict for two different faults.
+			const sentinel = `switchyard-clipboard-sentinel-${randomUUID()}`;
 			execFileSync("pbcopy", [], { input: sentinel });
 			// The hardened image disables the Parallels clipboard agent, so an
 			// empty guest pasteboard may make pbpaste exit non-zero. The gate is
@@ -283,15 +286,26 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 						"-lc",
 						`set +e
 paste="$(/usr/bin/pbpaste 2>/dev/null)"
+origin=guest
+test -e ${shellQuote(homedir())} && origin=HOST
 if printf %s "$paste" | /usr/bin/grep -Fq ${shellQuote(sentinel)}; then
-	printf 'clipboard-probe: sentinel-visible bytes=%s\\n' "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+	verdict=sentinel-visible
 else
-	printf 'clipboard-probe: sentinel-absent bytes=%s\\n' "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+	verdict=sentinel-absent
 fi
+printf 'clipboard-probe: %s origin=%s bytes=%s\\n' "$verdict" "$origin" "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
 exit 0`,
 					],
 					{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
 				),
+			);
+			// Read the origin first. A probe that accidentally observed the HOST
+			// pasteboard would report the sentinel byte-for-byte and be
+			// indistinguishable from a real guest leak, so separate the two.
+			match(
+				clipboardProbe,
+				/origin=guest/,
+				`clipboard probe did not execute in the guest; it reported: ${JSON.stringify(clipboardProbe.trim())}`,
 			);
 			match(
 				clipboardProbe,
