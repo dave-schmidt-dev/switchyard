@@ -89,11 +89,16 @@ function safeWriteFailure(error) {
 	console.error("worker-bootstrap: run-store write failed");
 }
 
-function queueWrite(fn) {
-	writeChain = writeChain.then(fn, fn).catch((error) => {
+function queueWrite(fn, { propagateFailure = false } = {}) {
+	const write = writeChain.then(fn, fn);
+	writeChain = write.catch((error) => {
 		safeWriteFailure(error);
 	});
-	return writeChain;
+	// Most callback writes are telemetry: record their failure but allow the
+	// queue to continue. Cleanup-state persistence is different: the runner
+	// must observe a failure so it can log it, while its finally block still
+	// tears down the owned container.
+	return propagateFailure ? write : writeChain;
 }
 
 const RECOGNIZED_CHECKPOINT_IDENTITY_CODES = new Set([
@@ -492,7 +497,7 @@ try {
 						activeTaskDescriptorIdentity: null,
 						activeTaskDescriptorHarness: null,
 					});
-				return queueWrite(fn);
+				return queueWrite(fn, { propagateFailure: true });
 			},
 		},
 	});

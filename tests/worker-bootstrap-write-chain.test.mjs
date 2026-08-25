@@ -28,7 +28,7 @@
 // without the fix). If worker-bootstrap.mjs's writeChain wiring ever
 // changes, keep buildCallbacks() below in sync with it.
 
-import { strictEqual } from "node:assert";
+import { rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 
 function sleep(ms) {
@@ -43,8 +43,9 @@ function sleep(ms) {
  * readDelayMs lets a caller model "this particular readRun() call takes
  * longer to resolve" without touching real I/O.
  */
-function createFakeRunStore(initialFields) {
+function createFakeRunStore(initialFields, { failUpdates = 0 } = {}) {
 	let record = { ...initialFields, revision: 1 };
+	let remainingUpdateFailures = failUpdates;
 
 	async function readRun(readDelayMs = 0) {
 		await sleep(readDelayMs);
@@ -52,6 +53,10 @@ function createFakeRunStore(initialFields) {
 	}
 
 	async function updateRun(partial, expectedRevision) {
+		if (remainingUpdateFailures > 0) {
+			remainingUpdateFailures -= 1;
+			throw new Error("synthetic durable persistence failure");
+		}
 		if (record.revision !== expectedRevision) {
 			const error = new Error(
 				`revision mismatch: expected ${expectedRevision}, got ${record.revision}`,
@@ -107,12 +112,14 @@ function createFakeRunStore(initialFields) {
 function buildCallbacks(store, { ordered }) {
 	let writeChain = Promise.resolve();
 
-	function fire(fn) {
+	function fire(fn, { propagateFailure = false } = {}) {
 		if (ordered) {
-			writeChain = writeChain.then(fn, fn).catch(() => {});
-			return writeChain;
+			const write = writeChain.then(fn, fn);
+			writeChain = write.catch(() => {});
+			return propagateFailure ? write : writeChain;
 		}
-		return fn().catch(() => {});
+		const write = fn();
+		return propagateFailure ? write : write.catch(() => {});
 	}
 
 	return {
@@ -130,18 +137,21 @@ function buildCallbacks(store, { ordered }) {
 					);
 			return fire(fn);
 		},
-		onTaskHeartbeat(info) {
+		onTaskHeartbeat(info, { readDelayMs = 0 } = {}) {
 			const fn = () =>
-				store.updateRunWithRetry({
-					activeTaskElapsedMs: Number.isFinite(info.elapsedMs)
-						? Math.max(0, info.elapsedMs)
-						: 0,
-					activeTaskHeartbeatAt: 123456,
-					activeTaskProcessPhase: "provider_transport_running",
-				});
+				store.updateRunWithRetry(
+					{
+						activeTaskElapsedMs: Number.isFinite(info.elapsedMs)
+							? Math.max(0, info.elapsedMs)
+							: 0,
+						activeTaskHeartbeatAt: 123456,
+						activeTaskProcessPhase: "provider_transport_running",
+					},
+					{ readDelayMs },
+				);
 			return fire(fn);
 		},
-		onCleanupStarted() {
+		onCleanupStarted({ readDelayMs = 0 } = {}) {
 			const fn = () =>
 				store.updateRunWithRetry(
 					{
@@ -154,10 +164,13 @@ function buildCallbacks(store, { ordered }) {
 						activeTaskElapsedMs: null,
 						activeTaskHeartbeatAt: null,
 						activeTaskProcessPhase: null,
+						activeTaskInvocationDescriptor: null,
+						activeTaskDescriptorIdentity: null,
+						activeTaskDescriptorHarness: null,
 					},
-					{},
+					{ readDelayMs },
 				);
-			return fire(fn);
+			return fire(fn, { propagateFailure: true });
 		},
 		drain: () => writeChain,
 	};
@@ -254,6 +267,9 @@ describe("worker-bootstrap writeChain ordering", () => {
 			activeTaskProvider: "claude",
 			activeTaskHeartbeatAt: 123,
 			activeTaskProcessPhase: "provider_running",
+			activeTaskInvocationDescriptor: { target_id: "claude" },
+			activeTaskDescriptorIdentity: "descriptor-1",
+			activeTaskDescriptorHarness: "claude",
 		});
 		const callbacks = buildCallbacks(store, { ordered: true });
 
@@ -264,6 +280,51 @@ describe("worker-bootstrap writeChain ordering", () => {
 		strictEqual(store.snapshot().activeTaskProvider, null);
 		strictEqual(store.snapshot().activeTaskHeartbeatAt, null);
 		strictEqual(store.snapshot().activeTaskProcessPhase, null);
+		strictEqual(store.snapshot().activeTaskInvocationDescriptor, null);
+		strictEqual(store.snapshot().activeTaskDescriptorIdentity, null);
+		strictEqual(store.snapshot().activeTaskDescriptorHarness, null);
+	});
+
+	it("orders a pending cleanup after an earlier heartbeat and clears its telemetry", async () => {
+		const store = createFakeRunStore({
+			cleanupState: "not_started",
+			activeTaskId: "task-A",
+			activeTaskInvocationDescriptor: { target_id: "claude" },
+			activeTaskDescriptorIdentity: "descriptor-1",
+			activeTaskDescriptorHarness: "claude",
+		});
+		const callbacks = buildCallbacks(store, { ordered: true });
+
+		const heartbeat = callbacks.onTaskHeartbeat(
+			{ elapsedMs: 42 },
+			{ readDelayMs: 30 },
+		);
+		const cleanup = callbacks.onCleanupStarted({ readDelayMs: 0 });
+		await Promise.all([heartbeat, cleanup, callbacks.drain()]);
+
+		const final = store.snapshot();
+		strictEqual(final.cleanupState, "pending");
+		strictEqual(final.activeTaskElapsedMs, null);
+		strictEqual(final.activeTaskHeartbeatAt, null);
+		strictEqual(final.activeTaskProcessPhase, null);
+		strictEqual(final.activeTaskInvocationDescriptor, null);
+		strictEqual(final.activeTaskDescriptorIdentity, null);
+		strictEqual(final.activeTaskDescriptorHarness, null);
+	});
+
+	it("rejects cleanup when durable state persistence fails while draining the chain", async () => {
+		const store = createFakeRunStore(
+			{ cleanupState: "not_started" },
+			{ failUpdates: 1 },
+		);
+		const callbacks = buildCallbacks(store, { ordered: true });
+
+		await rejects(
+			callbacks.onCleanupStarted(),
+			/synthetic durable persistence failure/,
+		);
+		await callbacks.drain();
+		strictEqual(store.snapshot().cleanupState, "not_started");
 	});
 
 	it("FIX persists transport heartbeat phase without claiming guest provider liveness", async () => {

@@ -576,6 +576,8 @@ The orphan-kill step (`adapter/orphan-kill.mjs`) also clears a stale `/project/.
 
 `launch` starts a task queue in a detached child process and returns immediately with a `runId`, instead of blocking the caller for the full run (useful under a harness with a bounded command timeout). The lifecycle is `launch` → poll `status` → `result` → (if needed) `recover`:
 
+At cleanup start, the worker awaits durable `cleanupState: pending` persistence and propagates a write failure to the runner for truthful diagnostics; the teardown `finally` path still destroys the owned VM.
+
 ```bash
 node src/switchyard/dispatch/index.mjs launch tasks.md --project /path/to/repo [--exclude-provider <name> | --only-provider <name>]
 # => {"runId": "...", "state": "launcher_ready", "statusCommand": "...", "resultCommand": "..."}
