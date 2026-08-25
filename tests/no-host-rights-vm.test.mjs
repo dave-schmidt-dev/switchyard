@@ -270,18 +270,33 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 			// The hardened image disables the Parallels clipboard agent, so an
 			// empty guest pasteboard may make pbpaste exit non-zero. The gate is
 			// sentinel non-visibility, matching the golden-image assertion.
-			backend.execGuest(
-				vmUuid,
-				"/bin/bash",
-				[
-					"-lc",
-					`set +e
-/usr/bin/pbpaste 2>/dev/null | /usr/bin/grep -Fq ${shellQuote(sentinel)}
-status=$?
-if [ "$status" -eq 0 ]; then exit 1; fi
+			//
+			// The probe reports its verdict on stdout and always exits 0, so a
+			// transport failure cannot masquerade as a clipboard leak. Signalling
+			// through the exit code made both surface as the same opaque
+			// `Command failed` with empty output, which is unactionable.
+			const clipboardProbe = outputText(
+				backend.execGuest(
+					vmUuid,
+					"/bin/bash",
+					[
+						"-lc",
+						`set +e
+paste="$(/usr/bin/pbpaste 2>/dev/null)"
+if printf %s "$paste" | /usr/bin/grep -Fq ${shellQuote(sentinel)}; then
+	printf 'clipboard-probe: sentinel-visible bytes=%s\\n' "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+else
+	printf 'clipboard-probe: sentinel-absent bytes=%s\\n' "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+fi
 exit 0`,
-				],
-				{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
+					],
+					{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
+				),
+			);
+			match(
+				clipboardProbe,
+				/clipboard-probe: sentinel-absent/,
+				`host clipboard must not be visible in the guest; probe reported: ${JSON.stringify(clipboardProbe.trim())}`,
 			);
 		} finally {
 			if (manifest) await manifest.close();
