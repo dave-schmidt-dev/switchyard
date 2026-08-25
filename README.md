@@ -444,7 +444,7 @@ preflight does not guarantee every later task.
 
 ### Running Tests and Linting
 
-**No hard prerequisite.** Most tests are pure-logic and need nothing installed. The live-VM gates (INV-1's `no-host-rights-vm`, INV-3's `workspace-wipe-vm`, `parallels-backend`) probe for Parallels, a stopped golden image, and a free shared VM slot, and degrade to a recorded `skip` — never a failure — when any of those prerequisites is unavailable, so `npm test` is safe to run on a machine with no Parallels VM at all. A skip costs coverage of the real boundary, not a red build; run it with the golden image available at least once per meaningful change to that path.
+**No hard prerequisite.** Most tests are pure-logic and need nothing installed. The live-VM gates (INV-3's `workspace-wipe-vm`, `parallels-backend`, and INV-1's `no-host-rights-vm`) probe for Parallels, a stopped golden image, and a free shared VM slot. All of them still degrade to a recorded `skip` when a prerequisite is unavailable, so `npm test` stays safe on a machine with no Parallels VM. What changed for INV-1's `no-host-rights-vm` is narrower than "hard gate": its C-3 endpoint manifest is now derived and host-verified per run instead of read from `SWITCHYARD_PARALLELS_C3_*` env vars, and an empty manifest **fails** rather than skipping, so it holds on any network this Mac attaches to. Note that `SWITCHYARD_PARALLELS_AQUA_UID` is still a skip prerequisite: any non-interactive context that does not source the shell profile skips INV-1 silently. A skip costs coverage of the real boundary, not a red build; run `npm test` with the golden image available at least once per meaningful change to INV-1 or INV-3's lifecycle paths.
 
 Execute the full suite of node unit and integration gate tests:
 

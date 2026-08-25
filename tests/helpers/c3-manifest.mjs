@@ -32,6 +32,9 @@ const GATEWAY_PROBE_PORTS = ["443", "80", "53"];
 
 export function classifyBlockedCidr(ip) {
 	if (typeof ip !== "string") return null;
+	// Reject octet forms Number() would silently coerce ("", 1e1, 0x0a,
+	// leading space), which would otherwise classify as a real rule.
+	if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return null;
 	const octets = ip.split(".");
 	if (octets.length !== 4) return null;
 	const parsed = octets.map(Number);
@@ -186,6 +189,21 @@ async function verifyBlocked(candidates) {
 		const value = `${candidate.host}:${candidate.port}`;
 		if (seen.has(value)) continue;
 		if (candidate.gateway && satisfiedGateways.has(candidate.host)) continue;
+		// The C-3 anchor passes the gateway above its block rules, but ONLY on
+		// tcp/53 (plus udp/53 and udp/67, which a TCP probe cannot reach). A
+		// guest probe there can never be blocked, so it is vacuous evidence.
+		// At any other port the gateway is still caught by 10.0.0.0/8 and is
+		// legitimate evidence, so this must not be a blanket exclusion.
+		// Enforced here, not at candidate construction, so an explicit env
+		// override cannot route around it.
+		if (candidate.host === C3_PASSED_GATEWAY && candidate.port === "53") {
+			dropped.push({
+				value,
+				role: candidate.role,
+				reason: "passed by C-3 on tcp/53; cannot prove a block rule",
+			});
+			continue;
+		}
 		const cidr = classifyBlockedCidr(candidate.host);
 		if (!cidr) {
 			dropped.push({
@@ -252,7 +270,15 @@ export async function deriveC3Manifest({ env = process.env } = {}) {
 		candidates = candidateEndpoints(listener.port);
 	}
 
-	const { blocked, dropped } = await verifyBlocked(candidates);
+	let blocked;
+	let dropped;
+	try {
+		({ blocked, dropped } = await verifyBlocked(candidates));
+	} catch (error) {
+		// The caller never receives the object, so it can never call close().
+		if (listener) await listener.close();
+		throw error;
+	}
 	const coverage = [...new Set(blocked.map((endpoint) => endpoint.cidr))];
 	const unproven = C3_BLOCK_RULES.map((rule) => rule.label).filter(
 		(label) => !coverage.includes(label),

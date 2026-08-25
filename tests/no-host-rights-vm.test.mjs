@@ -288,12 +288,13 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 paste="$(/usr/bin/pbpaste 2>/dev/null)"
 origin=guest
 test -e ${shellQuote(homedir())} && origin=HOST
+user="$(/usr/bin/whoami)"
 if printf %s "$paste" | /usr/bin/grep -Fq ${shellQuote(sentinel)}; then
 	verdict=sentinel-visible
 else
 	verdict=sentinel-absent
 fi
-printf 'clipboard-probe: %s origin=%s bytes=%s\\n' "$verdict" "$origin" "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+printf 'clipboard-probe: %s origin=%s user=%s bytes=%s\\n' "$verdict" "$origin" "$user" "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
 exit 0`,
 					],
 					{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
@@ -302,6 +303,15 @@ exit 0`,
 			// Read the origin first. A probe that accidentally observed the HOST
 			// pasteboard would report the sentinel byte-for-byte and be
 			// indistinguishable from a real guest leak, so separate the two.
+			//
+			// Absence of the host home is necessary but not sufficient on its own,
+			// so pair it with a positive identity: guest execution runs as the
+			// non-admin provider account, which the host session never is.
+			match(
+				clipboardProbe,
+				new RegExp(`user=${PROVIDER_USER}\\b`),
+				`clipboard probe did not run as the provider account; it reported: ${JSON.stringify(clipboardProbe.trim())}`,
+			);
 			match(
 				clipboardProbe,
 				/origin=guest/,
@@ -313,7 +323,14 @@ exit 0`,
 				`host clipboard must not be visible in the guest; probe reported: ${JSON.stringify(clipboardProbe.trim())}`,
 			);
 		} finally {
-			if (manifest) await manifest.close();
+			if (manifest) {
+				try {
+					await manifest.close();
+				} catch {
+					// Never let listener teardown strand the working VM or the
+					// shared slot released further down this chain.
+				}
+			}
 			if (originalClipboard !== undefined) {
 				try {
 					execFileSync("pbcopy", [], { input: originalClipboard });
