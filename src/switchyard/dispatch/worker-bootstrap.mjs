@@ -4,8 +4,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { Diagnostics } from "../diagnostics/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
@@ -318,8 +317,29 @@ try {
 					typeof event?.status === "string"
 						? event.status.slice(0, 256)
 						: name.replaceAll("_", " ");
+				// This handler is an INV-2 chokepoint: it forwards fields by
+				// explicit name with a type check, never by spread, so provider
+				// output has no path into events.jsonl. taskId and byteCount are
+				// forwarded because `partial_diff_captured` is the only record
+				// that a partial diff existed — the diff itself is deliberately
+				// not copied into the run store (see onResult below), so dropping
+				// these two left the event saying a diff happened somewhere, to
+				// some task, of some size. Both are content-free by construction:
+				// an identifier and a count.
+				const taskId =
+					typeof event?.taskId === "string" ? event.taskId.slice(0, 64) : null;
+				const byteCount =
+					Number.isSafeInteger(event?.byteCount) && event.byteCount >= 0
+						? event.byteCount
+						: null;
 				queueWrite(() =>
-					runStore.createEvent(runId, { phase, event: name, status }),
+					runStore.createEvent(runId, {
+						phase,
+						event: name,
+						status,
+						...(taskId !== null ? { taskId } : {}),
+						...(byteCount !== null ? { byteCount } : {}),
+					}),
 				);
 			},
 			// These callbacks all use updateRunWithRetry rather than a
@@ -443,24 +463,17 @@ try {
 					);
 				queueWrite(fn);
 
-				// Surface a timeout's partial diff through the run's existing
-				// (already-provisioned, previously-unused) artifacts channel so
-				// it shows up in `switchyard result <runId>`'s artifactRefs —
-				// same best-effort, fire-and-forget style as the rest of this
-				// callback. This copies a file rather than mutating run.json, so
-				// it doesn't race the other callbacks' writes and stays outside
-				// writeChain.
-				if (r.partialDiffPath) {
-					const artifactsDir = join(runStore.getRunRoot(runId), "artifacts");
-					mkdir(artifactsDir, { recursive: true })
-						.then(() =>
-							copyFile(
-								r.partialDiffPath,
-								join(artifactsDir, `${r.taskId}.diff`),
-							),
-						)
-						.catch(() => {});
-				}
+				// A partial diff is raw provider output and is NOT copied into the
+				// run store. The copy that used to live here existed only so a
+				// count appeared in `switchyard result <runId>`'s artifactRefs:
+				// listArtifactRefs hashes the file NAME into an opaque
+				// `artifact:<hash>` ref and never opens the file, and
+				// opaqueArtifactRef rejects any reference that is not exactly that
+				// form. So the bytes had no reader, which is the situation INV-2
+				// exists to prevent. The fact is kept instead of the content — the
+				// runner's `partial_diff_captured` status event carries the task id
+				// and the byte count (see onStatus above) — and the diff itself
+				// stays beside the checkpoint, outside the run store.
 			},
 			onCheckpointSaved: () => {
 				const fn = () => runStore.updateRunWithRetry(runId, {});
