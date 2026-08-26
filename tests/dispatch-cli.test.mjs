@@ -22,7 +22,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -2482,6 +2482,50 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 			await releaseProjectLockIfOwnedBy(projectDir, holderRunId),
 			true,
 			"the first run's lock must still be held after the second run failed",
+		);
+	});
+});
+
+describe("retention sweep call sites (Task 6.5)", () => {
+	const CALL_SITES = [
+		["dispatch/index.mjs", DISPATCH_PATH],
+		[
+			"dispatch/worker-bootstrap.mjs",
+			resolve(dirname(DISPATCH_PATH), "worker-bootstrap.mjs"),
+		],
+	];
+
+	it("no call site pins the sweep to dry-run any more", () => {
+		// The sweep shipped as dry-run-only pending a review of its logs. Both
+		// call sites now delete for real; a regression here is the difference
+		// between a retention policy and a log line about one.
+		for (const [label, path] of CALL_SITES) {
+			// Strip line comments first: the source explains that dry-run
+			// remains available, and naming the option is not using it.
+			const source = readFileSync(path, "utf8")
+				.split("\n")
+				.map((line) => line.replace(/^\s*\/\/.*$/, ""))
+				.join("\n");
+			const calls = source.match(/applyRetention\(\{[^}]*\}/g) ?? [];
+			ok(calls.length > 0, `${label} must still run a retention sweep`);
+			for (const call of calls) {
+				ok(
+					!/dryRun/.test(call),
+					`${label} must not pin its retention sweep to dry-run: ${call}`,
+				);
+			}
+		}
+	});
+
+	it("dry-run mode remains available for inspection", async () => {
+		// Removing the call-site flag must not remove the mode: an operator
+		// needs a way to see what a sweep would do before it does it.
+		const runStore = await import("../src/switchyard/run-store/index.mjs");
+		const result = await runStore.applyRetention({ dryRun: true });
+		ok(
+			Number.isInteger(result.deletedCount) &&
+				Number.isInteger(result.collectedCount),
+			"dryRun must still report what it would remove",
 		);
 	});
 });

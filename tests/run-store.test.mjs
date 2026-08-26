@@ -12,6 +12,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -606,7 +607,12 @@ describe("retention", () => {
 		}
 	});
 
-	it("leaves non-terminal runs alone", async () => {
+	// Retention is no longer gated on run state. The old rule spared a
+	// non-terminal or cleanup-failed run and reclaimed a succeeded one, which
+	// had it exactly backwards: the succeeded run is the one nobody reads.
+	// What protects a run now is having a diagnostic record — the two tests
+	// below are the state-gate cases, rewritten to assert the replacement.
+	it("removes a non-terminal run that never recorded an event", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);
 		const nonTerminal = await updateRun(
@@ -618,18 +624,173 @@ describe("retention", () => {
 		await createTerminalRun("ok");
 
 		const result = await applyRetention({ maxRuns: 0 });
-		strictEqual(result.deletedCount, 1);
-
-		const r = await readRun(nonTerminal.runId);
-		strictEqual(r.state, "failed");
+		strictEqual(result.deletedCount, 2);
+		await rejects(readRun(nonTerminal.runId), /Run not found/);
 	});
 
-	it("leaves cleanup-failed runs alone", async () => {
+	it("removes a cleanup-failed run that never recorded an event", async () => {
 		const run = await createTerminalRun("cf");
 		await updateRun(run.runId, { cleanupState: "failed" }, run.revision);
 
 		const result = await applyRetention({ maxRuns: 0 });
+		strictEqual(result.deletedCount, 1);
+		await rejects(readRun(run.runId), /Run not found/);
+	});
+
+	it("keeps run.json and events.jsonl at any age, for any run state", async () => {
+		const states = [
+			{ state: "created", cleanupState: "not_started" },
+			{ state: "running", cleanupState: "not_started" },
+			{ state: "failed", cleanupState: "failed" },
+			{ state: "succeeded", cleanupState: "complete" },
+		];
+		const runIds = [];
+		for (const [index, override] of states.entries()) {
+			const opts = makeOptions({
+				runId: `retention-keep-${index}-${uniqueRunId().slice(0, 8)}`,
+			});
+			await initializeRun(opts);
+			// One event is the whole difference between a diagnostic record
+			// and a directory that only attests it once existed.
+			await createEvent(opts.runId, {
+				phase: "execution",
+				event: "task_failed",
+				status: "Task 1.1 failed: provider_error",
+				taskId: "1.1",
+			});
+			const current = await readRun(opts.runId);
+			await updateRun(opts.runId, override, current.revision);
+			runIds.push(opts.runId);
+		}
+
+		// maxRuns: 0 and a cutoff a day in the future together say "reclaim
+		// everything you are allowed to reclaim".
+		const result = await applyRetention({
+			maxRuns: 0,
+			maxAgeDays: 0,
+			now: new Date(Date.now() + 86_400_000).toISOString(),
+		});
 		strictEqual(result.deletedCount, 0);
+
+		for (const runId of runIds) {
+			const run = await readRun(runId);
+			ok(run.runId === runId, "run.json must survive");
+			ok(
+				existsSync(join(getRunRoot(runId), "events.jsonl")),
+				"events.jsonl must survive",
+			);
+		}
+	});
+
+	it("removes a directory with no events.jsonl whatever its state", async () => {
+		const states = [
+			{ state: "created", cleanupState: "not_started" },
+			{ state: "running", cleanupState: "not_started" },
+			{ state: "failed", cleanupState: "failed" },
+			{ state: "succeeded", cleanupState: "complete" },
+		];
+		const runIds = [];
+		for (const [index, override] of states.entries()) {
+			const opts = makeOptions({
+				runId: `retention-noev-${index}-${uniqueRunId().slice(0, 8)}`,
+			});
+			await initializeRun(opts);
+			await updateRun(opts.runId, override, 1);
+			runIds.push(opts.runId);
+		}
+
+		const result = await applyRetention({ maxRuns: 0 });
+		strictEqual(result.deletedCount, 4);
+		for (const runId of runIds) {
+			await rejects(readRun(runId), /Run not found/);
+		}
+	});
+
+	it("collects artifacts from a failed run while its diagnostics survive", async () => {
+		const opts = makeOptions({
+			runId: `retention-collect-${uniqueRunId().slice(0, 8)}`,
+		});
+		await initializeRun(opts);
+		await createEvent(opts.runId, {
+			phase: "execution",
+			event: "task_failed",
+			status: "Task 1.1 failed: execution_timed_out",
+			taskId: "1.1",
+		});
+		const current = await readRun(opts.runId);
+		await updateRun(
+			opts.runId,
+			{ state: "failed", cleanupState: "complete" },
+			current.revision,
+		);
+		const artifactsDir = join(getRunRoot(opts.runId), "artifacts");
+		writeFileSync(join(artifactsDir, "1.1.diff"), "diff --git a/x b/x\n");
+
+		// No age or count limit at all: collection is unconditional, because
+		// an artifact is raw provider output at every age.
+		const result = await applyRetention({});
+		strictEqual(result.collectedCount, 1);
+		strictEqual(result.deletedCount, 0);
+
+		deepStrictEqual(readdirSync(artifactsDir), []);
+		const run = await readRun(opts.runId);
+		strictEqual(run.state, "failed");
+		ok(existsSync(join(getRunRoot(opts.runId), "events.jsonl")));
+	});
+
+	it("does not touch a run still referenced by a live checkpoint", async () => {
+		// uniquePath() is keyed on its label, so every makeOptions() run shares
+		// one tasksFilePath. This test writes a checkpoint beside that path and
+		// TEST_ROOT outlives afterEach, so it must use a path of its own and
+		// remove it — otherwise it protects every later test's runs too.
+		const tasksFilePath = join(TEST_ROOT, `ckpt-tasks-${uniqueRunId()}.md`);
+		const checkpointPath = `${tasksFilePath}.checkpoint.json`;
+		const opts = makeOptions({
+			runId: `retention-ckpt-${uniqueRunId().slice(0, 8)}`,
+			tasksFilePath,
+		});
+		await initializeRun(opts);
+		const artifactsDir = join(getRunRoot(opts.runId), "artifacts");
+		writeFileSync(join(artifactsDir, "1.1.diff"), "partial");
+		writeFileSync(
+			checkpointPath,
+			JSON.stringify({ version: 1, tasksFilePath, completedTaskIds: [] }),
+		);
+
+		try {
+			// This run has no events.jsonl, so rule 3 would remove it outright.
+			const result = await applyRetention({ maxRuns: 0 });
+			strictEqual(result.deletedCount, 0);
+			strictEqual(
+				result.collectedCount,
+				0,
+				"artifacts are not collected either",
+			);
+			const run = await readRun(opts.runId);
+			strictEqual(run.runId, opts.runId);
+			deepStrictEqual(readdirSync(artifactsDir), ["1.1.diff"]);
+		} finally {
+			rmSync(checkpointPath, { force: true });
+		}
+	});
+
+	it("dryRun reports collection without removing anything", async () => {
+		const opts = makeOptions({
+			runId: `retention-drycollect-${uniqueRunId().slice(0, 8)}`,
+		});
+		await initializeRun(opts);
+		await createEvent(opts.runId, {
+			phase: "execution",
+			event: "task_failed",
+			status: "Task 1.1 failed: provider_error",
+			taskId: "1.1",
+		});
+		const artifactsDir = join(getRunRoot(opts.runId), "artifacts");
+		writeFileSync(join(artifactsDir, "1.1.diff"), "partial");
+
+		const result = await applyRetention({ dryRun: true });
+		strictEqual(result.collectedCount, 1);
+		deepStrictEqual(readdirSync(artifactsDir), ["1.1.diff"]);
 	});
 
 	it("deletes runs older than maxAgeDays", async () => {

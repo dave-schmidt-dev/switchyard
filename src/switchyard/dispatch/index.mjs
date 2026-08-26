@@ -448,25 +448,34 @@ async function runDispatch(opts, dependencies = {}) {
 			console.error(`dispatch: pre-run sweep failed (${error.message})`);
 		});
 
-	// Retention sweep (Task D.5): dry-run only for this pass — logs what WOULD
-	// be reclaimed without deleting anything. David's explicit call: flip
-	// dryRun to false in a follow-up once a few dry-run logs have been
-	// reviewed. Failed-run directories and their .partial-diffs artifacts are
-	// explicitly OUT OF SCOPE here (CR-7/CR-11/PM-7 disposition) — this only
-	// ever reaps succeeded && cleanupState:"complete" runs, same as always.
+	// Retention sweep (Task D.5, revised by Task 6.5). This pass deletes for
+	// real; the dry-run mode it used to run in stays available for inspection
+	// via `applyRetention({ dryRun: true })`. What it can reach is bounded by
+	// what a file IS, not by run state: run.json and events.jsonl are never
+	// removed at any age, artifacts/ contents always are, and only a run
+	// directory that never recorded an event can be removed outright.
+	// maxAgeDays bounds that last rule alone, which is also what keeps a
+	// mid-flight run — run.json written, first event not yet appended — out of
+	// reach of this sweep. A run whose checkpoint still exists is skipped
+	// entirely, because a resume would read it.
 	// Malformed run directories are quarantined (moved, not deleted) on every
 	// sweep regardless of dryRun — same as always for that path — since a
-	// record that can't be read never becomes "eligible" and would otherwise
+	// record that can't be read never becomes eligible and would otherwise
 	// fail this same scan forever. The one conservative exception: a run
 	// directory whose run.json is absent (ENOENT — e.g. a concurrent
 	// initializeRun mid-flight) is left for a later sweep, not quarantined.
 	// This sweep remains synchronous-dispatch-only:
 	// detached launch and worker-bootstrap intentionally do not invoke it.
-	applyRetention({ maxAgeDays: 30, dryRun: true })
-		.then(({ deletedCount, quarantined }) => {
+	applyRetention({ maxAgeDays: 30 })
+		.then(({ deletedCount, collectedCount, quarantined }) => {
 			if (deletedCount > 0) {
 				console.error(
-					`dispatch: retention sweep (dry-run) found ${deletedCount} run-store director${deletedCount === 1 ? "y" : "ies"} older than 30 days eligible for reclaim — no deletion performed`,
+					`dispatch: retention sweep removed ${deletedCount} run-store director${deletedCount === 1 ? "y" : "ies"} older than 30 days that recorded no events`,
+				);
+			}
+			if (collectedCount > 0) {
+				console.error(
+					`dispatch: retention sweep collected ${collectedCount} run-store artifact${collectedCount === 1 ? "" : "s"}`,
 				);
 			}
 			for (const entry of quarantined) {

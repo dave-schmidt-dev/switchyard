@@ -1910,9 +1910,140 @@ async function quarantineDirectory(name) {
 }
 
 /**
- * Apply retention policy to completed runs.
- * Deletes runs where state is "succeeded" AND cleanupState is "complete".
- * Never touches non-terminal or cleanup-failed runs.
+ * Whether a run directory holds a diagnostic record.
+ *
+ * Retention splits the store by what a file IS, not by what state its run
+ * reached. `run.json` and `events.jsonl` are the diagnostic record — the two
+ * files a post-mortem actually reads — and are retained with no expiry.
+ * Everything else is either derivable or, in the case of `artifacts/`, raw
+ * provider output that INV-2 says must not persist.
+ *
+ * A directory with no `events.jsonl` never recorded a single event, so there
+ * is nothing to post-mortem: `run.json` alone attests that a run was
+ * initialized and reached some state, which the directory's absence attests
+ * just as well. Measured on 2026-08-26, 60 of 159 directories were in that
+ * shape and every one of them carried `processedTasks: 0`, so no completed
+ * work is reachable by this rule.
+ *
+ * @param {string} runId
+ */
+function hasDiagnosticRecord(runId) {
+	return existsSync(resolve(getRunRoot(runId), "events.jsonl"));
+}
+
+/**
+ * The checkpoint a run would resume from, or null when the run record names
+ * no tasks file. Mirrors dispatch's
+ * `run.runOptions?.checkpointPath ?? getCheckpointPath(run.tasksFilePath)`
+ * inline rather than importing it: run-store sits below runner/ and dispatch/
+ * and must not depend on them.
+ *
+ * @param {object} run
+ * @returns {string|null}
+ */
+function checkpointPathForRun(run) {
+	const explicit = run?.runOptions?.checkpointPath;
+	if (typeof explicit === "string" && explicit.length > 0) return explicit;
+	if (typeof run?.tasksFilePath === "string" && run.tasksFilePath.length > 0) {
+		return `${run.tasksFilePath}.checkpoint.json`;
+	}
+	return null;
+}
+
+/**
+ * Whether a resume could still read this run's checkpoint. A run in that
+ * position is left completely alone — not collected, not removed — because
+ * the checkpoint is the authoritative queue state and the run directory is
+ * what `switchyard recover` reads alongside it.
+ *
+ * Deliberately conservative: the checkpoint is keyed by tasks file, not by
+ * run, so a checkpoint left behind by a sibling run also protects this one.
+ * Over-retaining a directory costs kilobytes; deleting one out from under a
+ * resume costs the resume.
+ *
+ * @param {object} run
+ */
+function hasLiveCheckpoint(run) {
+	const path = checkpointPathForRun(run);
+	if (path === null) return false;
+	try {
+		return existsSync(path);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Remove the CONTENTS of a run's artifacts directory, leaving the directory
+ * itself in place — `initializeRun` provisions it for every run, so removing
+ * it would only be undone by the next run.
+ *
+ * Collection is unconditional rather than age-gated: an artifact is raw
+ * provider output at every age, and the age of the run that produced it does
+ * not change that. A missing or unreadable artifacts directory is not an
+ * error; it is the steady state this function drives toward.
+ *
+ * @param {string} runId
+ * @param {boolean} dryRun
+ * @returns {Promise<number>} number of entries removed (or eligible, in dryRun)
+ */
+async function collectArtifacts(runId, dryRun) {
+	const artifactsDir = resolve(getRunRoot(runId), "artifacts");
+	let entries;
+	try {
+		entries = await readdir(artifactsDir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+	let removed = 0;
+	for (const entry of entries) {
+		if (dryRun) {
+			console.error(
+				`applyRetention: would collect artifact ${sanitizeForDisplay(entry.name)} from run ${sanitizeForDisplay(runId)}`,
+			);
+			removed += 1;
+			continue;
+		}
+		try {
+			await rm(resolve(artifactsDir, entry.name), {
+				recursive: true,
+				force: true,
+			});
+			removed += 1;
+		} catch (e) {
+			console.warn(
+				`applyRetention: failed to collect artifact ${sanitizeForDisplay(entry.name)} from run ${sanitizeForDisplay(runId)}: ${sanitizeForDisplay(e.message)}`,
+			);
+		}
+	}
+	return removed;
+}
+
+/**
+ * Apply the run-store retention policy.
+ *
+ * The policy splits the store by what a file IS rather than by what state
+ * its run reached, because run state turned out to be a poor proxy for
+ * diagnostic value. The previous rule could only ever reach runs that were
+ * "succeeded" with cleanupState "complete" — the runs least worth reading —
+ * while a failed run's post-mortem aged out only by never being eligible at
+ * all. Three rules replace it:
+ *
+ *   1. `run.json` and `events.jsonl` are never deleted, at any age, for any
+ *      run state. They are the diagnostic record. At the measured rate they
+ *      project to roughly 18 MB a year, which is not a retention problem.
+ *   2. `artifacts/` contents are collected on every sweep, unconditionally.
+ *      Nothing reads them back — listArtifactRefs hashes the file NAME into
+ *      an opaque ref and never opens the file — so they are raw provider
+ *      output persisted without a consumer, which is what INV-2 forbids.
+ *   3. A run directory with no `events.jsonl` holds no diagnostic record
+ *      (see hasDiagnosticRecord) and is removed entirely, whatever its
+ *      state. maxAgeDays/maxRuns bound THIS removal and nothing else, which
+ *      is also what keeps a mid-flight run — run.json written, first event
+ *      not yet appended — out of reach of the same sweep.
+ *
+ * A run whose checkpoint still exists on disk is exempt from both 2 and 3:
+ * a resume would read it.
  *
  * Malformed run directories (invalid JSON, unsupported schema, corrupt
  * runId, etc.) fail readRun on every single scan forever — they never age
@@ -1930,20 +2061,25 @@ async function quarantineDirectory(name) {
  * quarantine loop below).
  *
  * @param {object} options
- * @param {number} [options.maxRuns] - maximum number of completed runs to keep
- * @param {number} [options.maxAgeDays] - maximum age in days for completed runs
+ * @param {number} [options.maxRuns] - maximum number of no-diagnostic run
+ *   directories to keep. Bounds rule 3 only; it can never remove a run that
+ *   has an events.jsonl.
+ * @param {number} [options.maxAgeDays] - maximum age in days for a
+ *   no-diagnostic run directory. Bounds rule 3 only, for the same reason.
  * @param {string} [options.now] - reference ISO timestamp (default: now)
- * @param {boolean} [options.dryRun] - log-only mode for DELETION: report which
- *   eligible valid runs WOULD be reclaimed (on stderr, with the reason)
+ * @param {boolean} [options.dryRun] - log-only mode for DELETION AND
+ *   COLLECTION: report what WOULD be removed (on stderr, with the reason)
  *   without calling `rm`. Malformed-run quarantine is NOT suppressed —
  *   malformed directories are still moved, since they would otherwise fail
  *   this same scan forever.
- * @returns {Promise<{deletedCount: number, quarantined: Array<{runId: string, destination: string, destinationDisplay: string, reason: string}>}>}
- *   deletedCount: number of eligible runs deleted (or eligible, in dryRun);
- *   quarantined: one entry per malformed run directory moved out of the
- *   active scan, with its sanitized runId, the actual on-disk destination it
- *   was moved to (raw, for machine use), a separately sanitized
- *   destinationDisplay safe for logs/terminal, and a static reason string.
+ * @returns {Promise<{deletedCount: number, collectedCount: number, quarantined: Array<{runId: string, destination: string, destinationDisplay: string, reason: string}>}>}
+ *   deletedCount: number of no-diagnostic run directories removed (or
+ *   eligible, in dryRun); collectedCount: number of artifact entries removed
+ *   (or eligible, in dryRun); quarantined: one entry per malformed run
+ *   directory moved out of the active scan, with its sanitized runId, the
+ *   actual on-disk destination it was moved to (raw, for machine use), a
+ *   separately sanitized destinationDisplay safe for logs/terminal, and a
+ *   static reason string.
  */
 export async function applyRetention(options = {}) {
 	const { maxRuns, maxAgeDays, now, dryRun } = options;
@@ -1953,12 +2089,14 @@ export async function applyRetention(options = {}) {
 	try {
 		entries = await readdir(runsRoot(), { withFileTypes: true });
 	} catch (e) {
-		if (e.code === "ENOENT") return { deletedCount: 0, quarantined: [] };
+		if (e.code === "ENOENT")
+			return { deletedCount: 0, collectedCount: 0, quarantined: [] };
 		throw e;
 	}
 
 	const quarantined = [];
-	const eligible = [];
+	const removable = [];
+	let collectedCount = 0;
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
 		let run;
@@ -2007,25 +2145,30 @@ export async function applyRetention(options = {}) {
 			}
 			continue;
 		}
-		if (run.state === "succeeded" && run.cleanupState === "complete") {
-			eligible.push({
+		// A quarantined directory `continue`d above, so it is never reached by
+		// the collect/remove paths below in the same sweep — the two never
+		// contend for the same directory.
+		if (hasLiveCheckpoint(run)) continue;
+		collectedCount += await collectArtifacts(entry.name, dryRun);
+		if (!hasDiagnosticRecord(entry.name)) {
+			removable.push({
 				runId: entry.name,
 				createdAt: new Date(run.createdAt).getTime(),
 			});
 		}
 	}
 
-	eligible.sort((a, b) => a.createdAt - b.createdAt);
+	removable.sort((a, b) => a.createdAt - b.createdAt);
 
 	const deleted = new Set();
 
 	if (maxAgeDays != null && Number.isFinite(maxAgeDays)) {
 		const cutoff = referenceTime - maxAgeDays * 86_400_000;
-		for (const r of eligible) {
+		for (const r of removable) {
 			if (r.createdAt < cutoff) {
 				if (dryRun) {
 					console.error(
-						`applyRetention: would delete run ${r.runId} (older than maxAgeDays cutoff)`,
+						`applyRetention: would delete run ${r.runId} (no events.jsonl, older than maxAgeDays cutoff)`,
 					);
 					deleted.add(r.runId);
 					continue;
@@ -2040,7 +2183,7 @@ export async function applyRetention(options = {}) {
 		}
 	}
 
-	const remaining = eligible.filter((r) => !deleted.has(r.runId));
+	const remaining = removable.filter((r) => !deleted.has(r.runId));
 
 	if (
 		maxRuns != null &&
@@ -2051,7 +2194,7 @@ export async function applyRetention(options = {}) {
 		for (const r of toDelete) {
 			if (dryRun) {
 				console.error(
-					`applyRetention: would delete run ${r.runId} (maxRuns trim)`,
+					`applyRetention: would delete run ${r.runId} (no events.jsonl, maxRuns trim)`,
 				);
 				deleted.add(r.runId);
 				continue;
@@ -2065,7 +2208,7 @@ export async function applyRetention(options = {}) {
 		}
 	}
 
-	return { deletedCount: deleted.size, quarantined };
+	return { deletedCount: deleted.size, collectedCount, quarantined };
 }
 
 /**

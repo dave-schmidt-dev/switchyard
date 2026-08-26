@@ -199,10 +199,12 @@ function captureCurrentFingerprint(projectPath) {
 try {
 	const runStore = await import("../run-store/index.mjs");
 	// Match the synchronous dispatch path's retention policy, but wait for its
-	// schema-only quarantine pass before this worker starts its own run.
-	// Deletion remains dry-run-only.
+	// schema-only quarantine pass before this worker starts its own run. This
+	// worker's own directory is not at risk from the sweep it runs: the sweep
+	// can only remove a directory that recorded no events AND is older than
+	// the cutoff, and this run was created moments ago.
 	try {
-		await runStore.applyRetention({ maxAgeDays: 30, dryRun: true });
+		await runStore.applyRetention({ maxAgeDays: 30 });
 	} catch (error) {
 		console.error(
 			`worker-bootstrap: retention sweep failed (${error.message})`,
