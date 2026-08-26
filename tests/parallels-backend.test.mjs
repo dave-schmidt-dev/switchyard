@@ -194,6 +194,44 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
+	it("carries the stage and exit status on provider_cleanup_failed (Task 6.3)", () => {
+		// The recorded Antigravity failure emitted provider_cleanup_started and
+		// provider_pid_observed, then provider_cleanup_failed with nothing but
+		// a fixed status string. Two causes produce that ordering and need
+		// different fixes — the guest kill script ran and found survivors, or
+		// the guest exec never ran — so the event has to name which.
+		const events = [];
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		backend.getGuestPid = () => 4242;
+		backend.execGuest = () => {
+			// What execFileSync throws when the kill script completes and its
+			// closing `[ -z "$survivors" ]` fails.
+			throw Object.assign(new Error("survivors after SIGKILL"), {
+				status: 1,
+				signal: null,
+			});
+		};
+		throws(() =>
+			backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], {
+				onStatus: (event) => events.push(event),
+			}),
+		);
+		const failure = events.find(
+			(event) => event.event === "provider_cleanup_failed",
+		);
+		ok(failure, "provider_cleanup_failed must still be emitted");
+		strictEqual(
+			failure.cleanupStage,
+			"pid_observed",
+			"the last stage reached is the whole fault localization",
+		);
+		strictEqual(failure.exitCode, 1);
+		ok(
+			!("stderr" in failure) && !("output" in failure),
+			"INV-2: no provider text may ride out on the cleanup event",
+		);
+	});
+
 	// `prlctl exec` joins its argument vector with spaces and the guest applies
 	// exactly one round of shell parsing to the result. Proven live 2026-08-14:
 	// a supervised `opencode run` was truncated to its first word, `set`, which

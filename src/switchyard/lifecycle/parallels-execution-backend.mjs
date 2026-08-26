@@ -1193,10 +1193,23 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			return { cleanupStage, workspaceId, pid };
 		} catch (error) {
 			if (error && typeof error === "object") error.cleanupStage = cleanupStage;
+			// Two causes reach here and the bare event could not tell them
+			// apart: the kill script ran and reported survivors (execFileSync
+			// sets `status`), or the guest exec never ran at all (a transport
+			// failure sets `code`/`signal` and no status). Carrying the stage
+			// and the exit status makes one event self-describing instead of
+			// requiring the reader to infer the stage from which later events
+			// are absent. All three values are content-free: a name from a
+			// fixed set, an integer, and a signal name.
+			const status = error?.status;
+			const signal = error?.signal;
 			onStatus?.({
 				phase: "execution",
 				event: "provider_cleanup_failed",
 				status: "Guest provider cleanup could not confirm process exit",
+				cleanupStage,
+				...(Number.isSafeInteger(status) ? { exitCode: status } : {}),
+				...(typeof signal === "string" ? { signal } : {}),
 			});
 			throw error;
 		}

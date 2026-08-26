@@ -138,18 +138,26 @@ export function executeClaude(prompt, workingContainerName, options = {}) {
 			// The host-side kill above only stops the exec client; the process
 			// it started keeps running in the container/guest until explicitly
 			// killed there (see orphan-kill.mjs).
-			killOrphanedProcesses(workingContainerName, {
+			const cleanup = killOrphanedProcesses(workingContainerName, {
 				executionBackend: options.executionBackend,
 				command,
 				args,
 			});
 			// Keep error.message (carries ETIMEDOUT) so the runner classifies
 			// this as execution_timed_out, not a generic failure.
+			//
+			// The cleanup fields ride along because runner/index.mjs reads
+			// `execution.cleanupFailed` to decide between
+			// `execution_timed_out` and `execution_timed_out_cleanup_failed`.
+			// Omitting them left that branch permanently false on this path,
+			// so a guest provider that survived the kill was reported as a
+			// clean timeout — an INV-3 exposure the terminal state hid.
 			return {
 				output: error.stdout || "",
 				success: false,
 				error: error.message,
 				timedOut,
+				...cleanup,
 			};
 		}
 		// Non-timeout failure: surface the provider's own diagnostic (and, on an

@@ -5,7 +5,11 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import {
+	CLEANUP_STAGES,
+	PERSISTED_SIGNALS,
+	sanitizeFailureMetadata,
+} from "../adapter/exec-error.mjs";
 import { Diagnostics } from "../diagnostics/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 
@@ -334,6 +338,25 @@ try {
 					Number.isSafeInteger(event?.byteCount) && event.byteCount >= 0
 						? event.byteCount
 						: null;
+				// The same reasoning extends `provider_cleanup_failed`. Without
+				// these three the event says only that cleanup "could not
+				// confirm process exit", which cannot distinguish a kill script
+				// that ran and found survivors from a guest exec that never ran
+				// — the two have different fixes. Each is validated against a
+				// closed set rather than length-truncated, so an unexpected
+				// value is dropped instead of persisted.
+				const cleanupStage = CLEANUP_STAGES.has(event?.cleanupStage)
+					? event.cleanupStage
+					: null;
+				const exitCode =
+					Number.isSafeInteger(event?.exitCode) &&
+					event.exitCode >= 0 &&
+					event.exitCode <= 255
+						? event.exitCode
+						: null;
+				const signal = PERSISTED_SIGNALS.has(event?.signal)
+					? event.signal
+					: null;
 				queueWrite(() =>
 					runStore.createEvent(runId, {
 						phase,
@@ -341,6 +364,9 @@ try {
 						status,
 						...(taskId !== null ? { taskId } : {}),
 						...(byteCount !== null ? { byteCount } : {}),
+						...(cleanupStage !== null ? { cleanupStage } : {}),
+						...(exitCode !== null ? { exitCode } : {}),
+						...(signal !== null ? { signal } : {}),
 					}),
 				);
 			},

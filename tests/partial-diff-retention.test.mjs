@@ -21,10 +21,14 @@
 // if a comment changes.
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { after, describe, it } from "node:test";
+import {
+	BOOTSTRAP_SOURCE,
+	makeOnStatus,
+} from "./helpers/bootstrap-handler.mjs";
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-partial-diff-"));
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
@@ -33,9 +37,6 @@ const { createEvent, getRunRoot, initializeRun, readEvents } = await import(
 	"../src/switchyard/run-store/index.mjs"
 );
 
-const BOOTSTRAP_PATH = resolve("src/switchyard/dispatch/worker-bootstrap.mjs");
-const BOOTSTRAP_SOURCE = readFileSync(BOOTSTRAP_PATH, "utf8");
-
 after(() => {
 	try {
 		rmSync(TEST_ROOT, { recursive: true, force: true });
@@ -43,60 +44,6 @@ after(() => {
 		// no-op
 	}
 });
-
-/**
- * Slice a brace-balanced arrow-function body out of the bootstrap source,
- * ignoring braces that appear inside string or template literals. Returns the
- * body text between the opening `{` and its matching `}`.
- */
-function extractHandlerBody(source, header) {
-	const start = source.indexOf(header);
-	if (start < 0) throw new Error(`handler not found: ${header}`);
-	let i = source.indexOf("{", start + header.length - 1);
-	const bodyStart = i + 1;
-	let depth = 0;
-	let quote = null;
-	for (; i < source.length; i += 1) {
-		const ch = source[i];
-		if (quote) {
-			if (ch === "\\") {
-				i += 1;
-			} else if (ch === quote) {
-				quote = null;
-			}
-			continue;
-		}
-		if (ch === '"' || ch === "'" || ch === "`") {
-			quote = ch;
-			continue;
-		}
-		if (ch === "{") depth += 1;
-		else if (ch === "}") {
-			depth -= 1;
-			if (depth === 0) return source.slice(bodyStart, i);
-		}
-	}
-	throw new Error(`unbalanced handler body: ${header}`);
-}
-
-function makeOnStatus() {
-	const body = extractHandlerBody(BOOTSTRAP_SOURCE, "onStatus: (event) => {");
-	const emitted = [];
-	const runStore = {
-		createEvent: (_runId, event) => {
-			emitted.push(event);
-			return Promise.resolve(1);
-		},
-	};
-	const queueWrite = (fn) => fn();
-	const factory = new Function(
-		"runStore",
-		"runId",
-		"queueWrite",
-		`return (event) => {${body}};`,
-	);
-	return { onStatus: factory(runStore, "test-run", queueWrite), emitted };
-}
 
 describe("partial diffs are recorded, not copied (Task 6.5)", () => {
 	it("proves the failure path no longer copies a partial diff into artifacts/", () => {

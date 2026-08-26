@@ -39,6 +39,55 @@ function killViaDocker(containerName) {
 	}
 }
 
+// Cleanup outcome vocabulary. A caller's timeout envelope needs to say
+// whether the provider process is known dead, because runner/index.mjs
+// classifies `execution_timed_out_cleanup_failed` from exactly this signal.
+// Everything reported here is content-free by construction — a boolean, a
+// stage name from the backend's own fixed set, an integer, a signal name —
+// so no provider output can reach a caller through this return value (INV-2).
+const CLEANUP_CONFIRMED = Object.freeze({
+	cleanupFailed: false,
+	cleanupStage: null,
+	exitCode: null,
+	signal: null,
+	failurePhase: null,
+});
+
+/**
+ * Classify a thrown cleanup error into the content-free outcome shape.
+ *
+ * `execFileSync` distinguishes the two causes that matter here and the
+ * backend's catch block has already tagged the stage it reached:
+ * a non-zero `status` means the guest kill script ran and reported
+ * survivors, while a transport failure (`ENOENT`, a signal, no status)
+ * means the script never ran at all. The recorded live failure could not
+ * tell those apart, which is why the stage and exit code are carried out.
+ *
+ * @param {unknown} error
+ * @returns {{cleanupFailed: true, cleanupStage: string|null,
+ *            exitCode: number|null, signal: string|null,
+ *            failurePhase: string}}
+ */
+function describeCleanupFailure(error) {
+	const stage = error?.cleanupStage;
+	const status = error?.status;
+	const signal = error?.signal;
+	return {
+		cleanupFailed: true,
+		cleanupStage: typeof stage === "string" ? stage : null,
+		exitCode:
+			Number.isSafeInteger(status) && status >= 0 && status <= 255
+				? status
+				: null,
+		signal: typeof signal === "string" ? signal : null,
+		// A member of PERSISTED_FAILURE_PHASES, so sanitizeFailureMetadata
+		// keeps it rather than dropping it. Without this the sync path's
+		// terminal envelope named a cleanup failure in `result` while every
+		// machine-readable field still said a plain timeout.
+		failurePhase: "provider_cleanup",
+	};
+}
+
 /**
  * Kill every process inside a container except PID 1 (the container's own
  * `sleep infinity` keep-alive process — see lifecycle/index.mjs). `kill -1`
@@ -64,18 +113,33 @@ function killViaDocker(containerName) {
  * @param {{cleanupProviderProcess?: Function}} [options.executionBackend]
  * @param {string} [options.command]
  * @param {string[]} [options.args]
+ * @returns {{cleanupFailed: boolean, cleanupStage: string|null,
+ *            exitCode: number|null, signal: string|null,
+ *            failurePhase: string|null}}
  */
 export function killOrphanedProcesses(containerName, options = {}) {
 	const { executionBackend, command, args, onStatus } = options;
 	if (typeof executionBackend?.cleanupProviderProcess === "function") {
 		try {
 			executionBackend.cleanupProviderProcess(command, args, { onStatus });
-			return;
-		} catch {
-			// Fall through to the Docker path as a last-resort backstop.
+			return CLEANUP_CONFIRMED;
+		} catch (error) {
+			// Fall through to the Docker path as a last-resort backstop, but
+			// keep reporting failure: the backstop reaches a Docker container,
+			// and a backend that implements cleanupProviderProcess is reaching
+			// somewhere the backstop cannot (a VM guest). A docker exec that
+			// no-ops against a container that was never there is not evidence
+			// the provider process died, so a successful backstop must not
+			// overwrite a failed guest cleanup with a clean result.
+			killViaDocker(containerName);
+			return describeCleanupFailure(error);
 		}
 	}
+	// Docker-only backends: unchanged best-effort semantics. killViaDocker
+	// swallows everything, so there is no signal to report either way, and
+	// reporting failure here would reclassify every Docker timeout.
 	killViaDocker(containerName);
+	return CLEANUP_CONFIRMED;
 }
 
 /**

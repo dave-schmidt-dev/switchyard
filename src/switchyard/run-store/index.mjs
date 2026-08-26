@@ -158,6 +158,9 @@ const APPROVED_EVENT_KEYS = new Set([
 	"exitCode",
 	"signal",
 	"failurePhase",
+	// Closed vocabulary owned by the execution backend (CLEANUP_STAGES in
+	// adapter/exec-error.mjs), never interpolated from provider output.
+	"cleanupStage",
 ]);
 
 function isSafeTargetId(value) {

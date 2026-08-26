@@ -24,6 +24,15 @@ describe("killOrphanedProcesses — backend-aware dispatch", () => {
 		});
 		strictEqual(calls.length, 1);
 		strictEqual(calls[0].command, "prlctl");
+		strictEqual(
+			killOrphanedProcesses("unsafe;name", {
+				executionBackend,
+				command: "prlctl",
+				args: [],
+			}).cleanupFailed,
+			false,
+			"a backend cleanup that returns must report success",
+		);
 		deepStrictEqual(calls[0].args, [
 			"exec",
 			"switchyard-guest",
@@ -39,17 +48,26 @@ describe("killOrphanedProcesses — backend-aware dispatch", () => {
 		killOrphanedProcesses("switchyard-nonexistent-container", {});
 	});
 
-	it("falls back silently when the backend's cleanupProviderProcess throws", () => {
+	it("still runs the Docker backstop when the backend's cleanup throws, but reports the failure", () => {
+		// This used to assert only that nothing threw, which is exactly what
+		// let a failed guest cleanup pass for a successful one: the function
+		// returned void, so no caller could tell the difference. The Docker
+		// backstop still runs — that control flow is deliberate — but a
+		// backstop that reaches a container cannot confirm a VM guest process
+		// died, so it must not overwrite the failure with a clean result.
+		// Task 6.3 covers the classification itself.
 		const executionBackend = {
 			cleanupProviderProcess() {
 				throw new Error("guest unreachable");
 			},
 		};
-		killOrphanedProcesses("switchyard-nonexistent-container", {
+		const outcome = killOrphanedProcesses("switchyard-nonexistent-container", {
 			executionBackend,
 			command: "prlctl",
 			args: ["exec", "switchyard-guest"],
 		});
+		strictEqual(outcome.cleanupFailed, true);
+		strictEqual(outcome.failurePhase, "provider_cleanup");
 	});
 });
 

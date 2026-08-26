@@ -143,6 +143,19 @@ export function cleanupDiagnosticCodeFor(cleanupStage) {
 }
 
 /**
+ * Every cleanup stage a backend may report reaching before it failed.
+ *
+ * Derived from the diagnostic-code map above rather than restated, so the
+ * vocabulary an event forwarder validates against cannot drift from the
+ * vocabulary that has a durable diagnostic code. Closed by construction:
+ * a stage name is backend-owned, never interpolated from provider output,
+ * which is what makes it safe to persist under INV-2.
+ */
+export const CLEANUP_STAGES = Object.freeze(
+	new Set(Object.keys(CLEANUP_STAGE_DIAGNOSTIC_CODES)),
+);
+
+/**
  * Every category the reviewed integration gate may refuse a diff under.
  *
  * A closed enum by construction: INV-2 forbids persisting raw provider output,
@@ -198,7 +211,8 @@ const PERSISTED_FAILURE_PHASES = new Set([
 	"provider_cleanup",
 	"terminal_reconciliation",
 ]);
-const PERSISTED_SIGNALS = new Set([
+/** Signal names that may be persisted; anything else is dropped. */
+export const PERSISTED_SIGNALS = new Set([
 	"SIGABRT",
 	"SIGHUP",
 	"SIGINT",
