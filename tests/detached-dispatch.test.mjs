@@ -131,8 +131,19 @@ function parallelsGoldenImagePrerequisiteReason() {
 	if (!/^stopped$/i.test(golden[1])) {
 		return `golden image ${PARALLELS_GOLDEN_IMAGE} is not stopped`;
 	}
+	// An unset or malformed Aqua uid is a configuration fault, not an absent
+	// dependency, so it FAILS the gate instead of skipping it. Returning a skip
+	// reason here made the gate report green having proven nothing: it passes
+	// locally only because ~/.zshrc exports the variable, so any non-interactive
+	// shell, CI runner, or launchd context silently lost the INV-1 assertions.
+	if (!PARALLELS_AQUA_UID) {
+		parallelsConfigurationFault =
+			"SWITCHYARD_PARALLELS_AQUA_UID must be set to run the VM gate";
+		return null;
+	}
 	if (!/^\d+$/.test(PARALLELS_AQUA_UID) || Number(PARALLELS_AQUA_UID) <= 0) {
-		return "Aqua UID is unavailable; set SWITCHYARD_PARALLELS_AQUA_UID";
+		parallelsConfigurationFault = `SWITCHYARD_PARALLELS_AQUA_UID must be a positive integer uid, got ${JSON.stringify(PARALLELS_AQUA_UID.slice(0, 32))}`;
+		return null;
 	}
 	try {
 		if (new ParallelsExecutionBackend().listManaged().length > 0) {
@@ -1186,6 +1197,7 @@ describe("recover releases stale project locks", {
 	});
 
 	it("recover --run does not release a lock held by a live worker", async () => {
+		assertParallelsConfigured();
 		const {
 			initializeRun,
 			advanceState,
@@ -1225,6 +1237,7 @@ describe("recover releases stale project locks", {
 	});
 
 	it("recover --run clears a lock left by a crashed worker still marked running", async () => {
+		assertParallelsConfigured();
 		const {
 			initializeRun,
 			advanceState,

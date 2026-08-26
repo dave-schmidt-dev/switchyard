@@ -124,8 +124,19 @@ async function inspectPrerequisites() {
 	if (!/^stopped$/i.test(golden[1])) {
 		return `golden image ${GOLDEN_IMAGE} is not stopped`;
 	}
+	// An unset or malformed Aqua uid is a configuration fault, not an absent
+	// dependency, so it FAILS the gate instead of skipping it. Returning a skip
+	// reason here made the gate report green having proven nothing: it passes
+	// locally only because ~/.zshrc exports the variable, so any non-interactive
+	// shell, CI runner, or launchd context silently lost the INV-1 assertions.
+	if (!AQUA_UID) {
+		configurationFault =
+			"SWITCHYARD_PARALLELS_AQUA_UID must be set to run the VM gate";
+		return null;
+	}
 	if (!/^\d+$/.test(AQUA_UID) || Number(AQUA_UID) <= 0) {
-		return "Aqua UID is unavailable; set SWITCHYARD_PARALLELS_AQUA_UID";
+		configurationFault = `SWITCHYARD_PARALLELS_AQUA_UID must be a positive integer uid, got ${JSON.stringify(AQUA_UID.slice(0, 32))}`;
+		return null;
 	}
 	if (!(await loadSlotPrimitive()))
 		return "shared VM-slot primitive is unavailable";
