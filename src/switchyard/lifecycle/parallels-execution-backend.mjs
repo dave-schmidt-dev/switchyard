@@ -6,8 +6,15 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readdirSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import {
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
@@ -549,6 +556,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		clipboardSettleMs = DEFAULT_CLIPBOARD_SETTLE_MS,
 		clipboardPollMs = DEFAULT_CLIPBOARD_POLL_MS,
 		goldenImage = null,
+		snapshotSidecarRoot = null,
+		runId = null,
 		measureLinkedCloneFn = null,
 		diskUsageFn = null,
 		requireLinkedCloneMeasurement = true,
@@ -580,6 +589,14 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.clipboardSettleMs = clipboardSettleMs;
 		this.clipboardPollMs = clipboardPollMs;
 		this.goldenImage = goldenImage;
+		// Injected rather than imported: this backend depends on Node builtins
+		// and its own base class only, and its testability rests on injected
+		// seams (nowFn, sleepFn, prlctlFn). Importing run-store here to reach
+		// getVmAdmissionRoot() would give up both. Null disables the sidecar,
+		// which is the correct posture for a backend with nowhere durable to
+		// write: destroy() still cleans up in-process.
+		this.snapshotSidecarRoot = snapshotSidecarRoot;
+		this.runId = typeof runId === "string" && runId ? runId : null;
 		this.measureLinkedCloneFn = measureLinkedCloneFn;
 		this.diskUsageFn = diskUsageFn;
 		this.linkedMeasurementReceipts = new WeakSet();
@@ -1308,6 +1325,98 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		}
 	}
 
+	/**
+	 * Directory holding one sidecar per linked clone, or null when no durable
+	 * root was injected.
+	 * @returns {string|null}
+	 */
+	snapshotSidecarDir() {
+		return this.snapshotSidecarRoot
+			? join(this.snapshotSidecarRoot, "linked-snapshots")
+			: null;
+	}
+
+	/**
+	 * Map a Parallels uuid to a sidecar filename.
+	 *
+	 * Parallels reports uuids brace-wrapped (`{9f6e...}`). Strip everything
+	 * outside the hex-and-dash alphabet so the value can never traverse out of
+	 * the sidecar directory or name a file the caller did not intend.
+	 * @param {string} uuid
+	 * @returns {string|null} null when the uuid has no usable characters
+	 */
+	snapshotSidecarPath(uuid) {
+		const dir = this.snapshotSidecarDir();
+		if (!dir || typeof uuid !== "string") return null;
+		const safe = uuid.replace(/[^A-Za-z0-9-]/g, "");
+		return safe ? join(dir, `${safe}.json`) : null;
+	}
+
+	/**
+	 * Record which golden-image snapshots a clone created, durably.
+	 *
+	 * The in-process map is enough for destroy() but useless to reclaim(),
+	 * which runs in a different process against VMs whose creator is dead. Left
+	 * in-process only, every crashed or killed run leaks its parent snapshot
+	 * onto the one VM that is not disposable: one such orphan sat on
+	 * switchyard-golden-6 for 13 days.
+	 *
+	 * Throws rather than swallowing. A lost sidecar is exactly the orphan this
+	 * record exists to prevent, and create()'s caller already rolls the clone
+	 * and its snapshots back when this stage fails.
+	 * @param {string} uuid clone VM uuid
+	 * @param {{goldenImage: string, snapshotIds: string[]}} metadata
+	 */
+	writeSnapshotSidecar(uuid, metadata) {
+		const path = this.snapshotSidecarPath(uuid);
+		if (!path) return;
+		mkdirSync(this.snapshotSidecarDir(), { recursive: true });
+		writeFileSync(
+			path,
+			`${JSON.stringify({
+				vmUuid: uuid,
+				goldenImage: metadata.goldenImage,
+				snapshotIds: metadata.snapshotIds,
+				runId: this.runId,
+				creatorPid: this.creatorPid,
+				recordedAt: this.nowFn(),
+			})}\n`,
+			"utf8",
+		);
+	}
+
+	/**
+	 * Read a clone's sidecar, or null when it is missing, unreadable, or does
+	 * not carry the two fields a delete decision needs. A corrupt sidecar is
+	 * treated as absent: the snapshots then survive for human review, which is
+	 * the safe direction on an image that cannot be recreated cheaply.
+	 * @param {string} uuid
+	 * @returns {{goldenImage: string, snapshotIds: string[]}|null}
+	 */
+	readSnapshotSidecar(uuid) {
+		const path = this.snapshotSidecarPath(uuid);
+		if (!path) return null;
+		let parsed;
+		try {
+			parsed = JSON.parse(readFileSync(path, "utf8"));
+		} catch {
+			return null;
+		}
+		if (!parsed || typeof parsed.goldenImage !== "string") return null;
+		if (!Array.isArray(parsed.snapshotIds)) return null;
+		const snapshotIds = parsed.snapshotIds.filter(
+			(id) => typeof id === "string" && id.length > 0,
+		);
+		if (snapshotIds.length !== parsed.snapshotIds.length) return null;
+		return { ...parsed, snapshotIds };
+	}
+
+	/** Remove a clone's sidecar. Absent is success. */
+	deleteSnapshotSidecar(uuid) {
+		const path = this.snapshotSidecarPath(uuid);
+		if (path) rmSync(path, { force: true });
+	}
+
 	cleanupLinkedSnapshots(goldenImage, snapshotIds) {
 		if (!goldenImage || !snapshotIds?.length) return;
 		const remaining = snapshotDifference(
@@ -1428,10 +1537,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				);
 			}
 			if (linked) {
-				this.linkedSnapshotsByUuid.set(entry.uuid, {
-					goldenImage,
-					snapshotIds: createdSnapshots,
-				});
+				const metadata = { goldenImage, snapshotIds: createdSnapshots };
+				this.linkedSnapshotsByUuid.set(entry.uuid, metadata);
+				this.writeSnapshotSidecar(entry.uuid, metadata);
 			}
 			this.boot(entry.uuid, options);
 			this._hardenClone(entry.uuid, options);
@@ -1623,18 +1731,31 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	destroy(handle) {
 		const entry = this.resolveHandle(handle);
-		const metadata = this.linkedSnapshotsByUuid.get(entry.uuid);
+		// The sidecar is the fallback, not the primary: a clone created by this
+		// same process is already in the map, and reading it back would make the
+		// common path depend on the filesystem for no gain.
+		const metadata =
+			this.linkedSnapshotsByUuid.get(entry.uuid) ??
+			this.readSnapshotSidecar(entry.uuid);
 		const result = this.stopAndDelete(entry);
 		this.linkedSnapshotsByUuid.delete(entry.uuid);
 		if (metadata) {
 			this.cleanupLinkedSnapshots(metadata.goldenImage, metadata.snapshotIds);
 		}
+		// Only after cleanup: a sidecar removed ahead of the snapshots it names
+		// converts a retryable failure into a permanent orphan.
+		this.deleteSnapshotSidecar(entry.uuid);
 		return result;
 	}
 
 	/** Reclaim only exact-prefix VMs whose embedded creator PID is dead. */
 	reclaim({ dryRun = false, onStatus } = {}) {
-		const result = { reclaimed: [], skipped: [], errors: [] };
+		const result = {
+			reclaimed: [],
+			reclaimedSnapshots: [],
+			skipped: [],
+			errors: [],
+		};
 		for (const entry of this.listManaged()) {
 			const alive = this.pidIsAlive(entry.creatorPid);
 			if (alive) {
@@ -1646,10 +1767,48 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				result.reclaimed.push({ ...entry, dryRun: true });
 				continue;
 			}
+			// Read before the delete: once the VM is gone its uuid is the only
+			// way back to the sidecar, and a failure here must not cost the
+			// record.
+			const metadata = this.readSnapshotSidecar(entry.uuid);
 			try {
 				const removed = this.stopAndDelete(entry, { forceOnly: true });
 				result.reclaimed.push(removed);
 				onStatus?.({ type: "reclaimed", name: entry.name });
+			} catch (error) {
+				result.errors.push({ name: entry.name, reason: error.message });
+				continue;
+			}
+			// The absolute rule, enforced here rather than by convention:
+			// reclaim deletes only snapshot ids it finds in a sidecar this code
+			// wrote. Nothing discovered by listing is ever eligible, so a
+			// snapshot that predates the sidecar convention — such as
+			// switchyard-golden-26-5 — survives every path through this method.
+			if (!metadata) {
+				result.skipped.push({
+					...entry,
+					reason: "no-snapshot-sidecar",
+				});
+				onStatus?.({
+					type: "skip",
+					name: entry.name,
+					reason: "no-snapshot-sidecar",
+				});
+				continue;
+			}
+			try {
+				this.cleanupLinkedSnapshots(metadata.goldenImage, metadata.snapshotIds);
+				this.deleteSnapshotSidecar(entry.uuid);
+				result.reclaimedSnapshots.push({
+					name: entry.name,
+					goldenImage: metadata.goldenImage,
+					snapshotIds: metadata.snapshotIds,
+				});
+				onStatus?.({
+					type: "reclaimed-snapshots",
+					name: entry.name,
+					count: metadata.snapshotIds.length,
+				});
 			} catch (error) {
 				result.errors.push({ name: entry.name, reason: error.message });
 			}

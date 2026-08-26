@@ -80,7 +80,11 @@ import {
 	readSnapshotAtRoute,
 	route,
 } from "../router/index.mjs";
-import { acquireVmSlot, releaseVmSlot } from "../run-store/index.mjs";
+import {
+	acquireVmSlot,
+	getVmAdmissionRoot,
+	releaseVmSlot,
+} from "../run-store/index.mjs";
 
 const CHECKPOINT_VERSION = 2;
 const BOUNDED_ERROR_KINDS = new Set(PERSISTED_ERROR_KINDS);
@@ -5394,6 +5398,10 @@ export function createQueueBackend({
 				dependencies.providerUser ??
 				process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
 				"switchyard",
+			// Durable record of which golden-image snapshots each clone creates,
+			// so a later process can reclaim them after this one dies.
+			snapshotSidecarRoot: getVmAdmissionRoot(),
+			runId: dependencies.runId ?? process.env.SWITCHYARD_RUN_ID ?? null,
 		});
 
 	const goldenImage =

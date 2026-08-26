@@ -48,6 +48,7 @@ import {
 	createEvent,
 	getRunRoot,
 	getStateRoot,
+	getVmAdmissionRoot,
 	initializeRun,
 	RevisionError,
 	readEvents,
@@ -1063,6 +1064,9 @@ function executionBackendForRun() {
 		aquaUid: process.env.SWITCHYARD_PARALLELS_AQUA_UID,
 		providerUser:
 			process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ?? "switchyard",
+		// This is the process that reclaims a dead worker's clones, so it is the
+		// one that most needs to read the sidecars a live worker wrote.
+		snapshotSidecarRoot: getVmAdmissionRoot(),
 	});
 }
 

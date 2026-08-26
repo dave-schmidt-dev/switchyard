@@ -7,7 +7,16 @@ import {
 } from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { seedProjectWithBackend } from "../src/switchyard/lifecycle/index.mjs";
 import {
@@ -965,5 +974,248 @@ describe("Parallels execution backend lifecycle", () => {
 			/guest command exceeds the macOS ARG_MAX-safe limit/,
 		);
 		strictEqual(execFnCalled, false);
+	});
+});
+
+describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () => {
+	const GOLDEN = "switchyard-golden-test";
+	// Predates the sidecar convention. Must survive every path below.
+	const FOREIGN_SNAPSHOT = "{51f4e833-0000-4000-8000-000000000000}";
+	const CLONE_SNAPSHOT = "{9f6e0d53-0000-4000-8000-000000000000}";
+
+	function snapshotJson(ids) {
+		return JSON.stringify(
+			Object.fromEntries(ids.map((id) => [id, { name: "snap" }])),
+		);
+	}
+
+	function makeSidecarRoot() {
+		return mkdtempSync(join(tmpdir(), "switchyard-sidecar-"));
+	}
+
+	/**
+	 * A backend whose golden image reports `snapshots` and whose clone lands as
+	 * `cloneName`. Records every prlctl argv for assertion.
+	 */
+	function makeCloningBackend(
+		sidecarRoot,
+		cloneName,
+		{ runId = "run-1" } = {},
+	) {
+		const calls = [];
+		let snapshots = [FOREIGN_SNAPSHOT];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			creatorPid: process.pid,
+			goldenImage: GOLDEN,
+			snapshotSidecarRoot: sidecarRoot,
+			runId,
+			requireLinkedCloneMeasurement: false,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "snapshot-list") return snapshotJson(snapshots);
+				if (args[0] === "clone") {
+					// The clone is what creates the parent snapshot.
+					snapshots = [FOREIGN_SNAPSHOT, CLONE_SNAPSHOT];
+					return "";
+				}
+				if (args[0] === "snapshot-delete") {
+					snapshots = snapshots.filter((id) => id !== args[3]);
+					return "";
+				}
+				if (args[0] === "list") {
+					return listed([
+						{ uuid: WORK_UUID, status: "running", name: cloneName },
+					]);
+				}
+				return "";
+			},
+		});
+		return { backend, calls, snapshotsNow: () => snapshots };
+	}
+
+	it("writes a sidecar at clone time carrying image, snapshots, run id, and creator pid", () => {
+		const root = makeSidecarRoot();
+		const name = buildParallelsWorkingName("live", process.pid);
+		const { backend } = makeCloningBackend(root, name);
+
+		backend.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+
+		const record = JSON.parse(
+			readFileSync(backend.snapshotSidecarPath(WORK_UUID), "utf8"),
+		);
+		strictEqual(record.goldenImage, GOLDEN);
+		deepStrictEqual(record.snapshotIds, [CLONE_SNAPSHOT]);
+		strictEqual(record.runId, "run-1");
+		strictEqual(record.creatorPid, process.pid);
+		strictEqual(record.vmUuid, WORK_UUID);
+		ok(Number.isFinite(record.recordedAt));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("removes both the snapshots and the sidecar on destroy", () => {
+		const root = makeSidecarRoot();
+		const name = buildParallelsWorkingName("live", process.pid);
+		const { backend, snapshotsNow } = makeCloningBackend(root, name);
+		backend.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+		const sidecarPath = backend.snapshotSidecarPath(WORK_UUID);
+		ok(existsSync(sidecarPath));
+
+		backend.destroy(WORK_UUID);
+
+		ok(!snapshotsNow().includes(CLONE_SNAPSHOT), "clone snapshot must be gone");
+		ok(
+			snapshotsNow().includes(FOREIGN_SNAPSHOT),
+			"a snapshot no sidecar names must survive destroy",
+		);
+		ok(!existsSync(sidecarPath), "sidecar must be removed after cleanup");
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("reclaims a dead owner's snapshots from a fresh backend with an empty map", () => {
+		// The whole point: reclaim() runs in a different process from create(),
+		// so the in-process map is always empty here. Before the sidecar, this
+		// path deleted the VM and left its parent snapshot on the golden
+		// forever — one such orphan sat on switchyard-golden-6 for 13 days.
+		const root = makeSidecarRoot();
+		const deadName = buildParallelsWorkingName("dead", 999_999);
+		const { backend: writer } = makeCloningBackend(root, deadName);
+		writer.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+
+		const { backend: fresh, snapshotsNow } = makeCloningBackend(root, deadName);
+		strictEqual(fresh.linkedSnapshotsByUuid.size, 0);
+
+		const result = fresh.reclaim();
+
+		strictEqual(result.reclaimed.length, 1);
+		deepStrictEqual(result.reclaimedSnapshots, [
+			{
+				name: deadName,
+				goldenImage: GOLDEN,
+				snapshotIds: [CLONE_SNAPSHOT],
+			},
+		]);
+		ok(!snapshotsNow().includes(CLONE_SNAPSHOT));
+		ok(!existsSync(fresh.snapshotSidecarPath(WORK_UUID)));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("never passes a snapshot absent from every sidecar to a delete call", () => {
+		// The absolute rule: reclaim deletes only ids it read from a sidecar,
+		// never one discovered by listing. switchyard-golden-26-5 predates the
+		// convention and must survive.
+		const root = makeSidecarRoot();
+		const deadName = buildParallelsWorkingName("dead", 999_999);
+		const { backend, calls, snapshotsNow } = makeCloningBackend(root, deadName);
+		// No sidecar written at all, yet the golden carries a snapshot.
+
+		const result = backend.reclaim();
+
+		strictEqual(result.reclaimed.length, 1, "the VM itself is still reclaimed");
+		deepStrictEqual(result.reclaimedSnapshots, []);
+		strictEqual(
+			result.skipped.find((s) => s.reason === "no-snapshot-sidecar")?.name,
+			deadName,
+		);
+		ok(
+			!calls.some((args) => args[0] === "snapshot-delete"),
+			`no snapshot may be deleted: ${JSON.stringify(calls)}`,
+		);
+		ok(snapshotsNow().includes(FOREIGN_SNAPSHOT));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("does not touch a live owner's clone or its snapshots", () => {
+		const root = makeSidecarRoot();
+		const liveName = buildParallelsWorkingName("live", process.pid);
+		const { backend, calls, snapshotsNow } = makeCloningBackend(root, liveName);
+		backend.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+
+		const result = backend.reclaim();
+
+		strictEqual(result.reclaimed.length, 0);
+		deepStrictEqual(result.reclaimedSnapshots, []);
+		strictEqual(result.skipped[0]?.reason, "owner-alive");
+		ok(!calls.some((args) => args[0] === "snapshot-delete"));
+		deepStrictEqual(
+			snapshotsNow(),
+			[FOREIGN_SNAPSHOT],
+			"the golden's snapshot list must be untouched",
+		);
+		ok(
+			existsSync(backend.snapshotSidecarPath(WORK_UUID)),
+			"a live owner's sidecar must survive another process's reclaim",
+		);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("skips a corrupt or unreadable sidecar without throwing and without deleting", () => {
+		const root = makeSidecarRoot();
+		const deadName = buildParallelsWorkingName("dead", 999_999);
+		const { backend, calls, snapshotsNow } = makeCloningBackend(root, deadName);
+		mkdirSync(backend.snapshotSidecarDir(), { recursive: true });
+		writeFileSync(
+			backend.snapshotSidecarPath(WORK_UUID),
+			"{not json at all",
+			"utf8",
+		);
+
+		const result = backend.reclaim();
+
+		strictEqual(result.errors.length, 0, JSON.stringify(result.errors));
+		deepStrictEqual(result.reclaimedSnapshots, []);
+		ok(!calls.some((args) => args[0] === "snapshot-delete"));
+		ok(snapshotsNow().includes(FOREIGN_SNAPSHOT));
+
+		// A structurally valid file missing the fields a delete decision needs
+		// is the same case, and must not be trusted into a delete either.
+		writeFileSync(
+			backend.snapshotSidecarPath(WORK_UUID),
+			JSON.stringify({ goldenImage: GOLDEN, snapshotIds: [null] }),
+			"utf8",
+		);
+		strictEqual(backend.readSnapshotSidecar(WORK_UUID), null);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("keeps a uuid from escaping the sidecar directory", () => {
+		const root = makeSidecarRoot();
+		const { backend } = makeCloningBackend(root, "x");
+		const path = backend.snapshotSidecarPath("../../etc/{passwd}");
+		ok(
+			path.startsWith(backend.snapshotSidecarDir()),
+			`sidecar path escaped its directory: ${path}`,
+		);
+		ok(!path.includes(".."));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("stays inert when no durable root is injected", () => {
+		// A backend with nowhere to write must not throw; destroy() still cleans
+		// up from the in-process map, which is the pre-sidecar behavior.
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			prlctlFn: () => "",
+		});
+		strictEqual(backend.snapshotSidecarDir(), null);
+		strictEqual(backend.snapshotSidecarPath(WORK_UUID), null);
+		strictEqual(backend.readSnapshotSidecar(WORK_UUID), null);
+		backend.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+		backend.deleteSnapshotSidecar(WORK_UUID);
 	});
 });
