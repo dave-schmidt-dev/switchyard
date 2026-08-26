@@ -750,6 +750,71 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
+	it("keeps watching for the clipboard agent across the whole settle window", () => {
+		// The window exists because prltoolsd supervises the agent and brings it
+		// back a few seconds after boot. Sampling once right after the teardown
+		// reads clean and misses the respawn, so this runs the real 8s default on a
+		// fake clock: the agent reappears on the third poll and the clone must still
+		// fail. Collapsing the loop to a single check makes this test stop throwing.
+		let printCount = 0;
+		let now = 0;
+		let slept = 0;
+		let cloneName = null;
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			goldenImage: "macOS",
+			nowFn: () => now,
+			sleepFn: (ms) => {
+				slept += 1;
+				now += ms;
+			},
+			prlctlFn: (args) => {
+				if (args[0] === "clone") {
+					cloneName = args[3];
+					return "";
+				}
+				if (args[0] === "list" && args[1] === "-a") {
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: "macOS" },
+						...(cloneName
+							? [{ uuid: WORK_UUID, status: "running", name: cloneName }]
+							: []),
+					]);
+				}
+				if (args.includes("print") && args.includes(CLIPBOARD_LABEL)) {
+					printCount += 1;
+					// Gone, gone, then supervised back into existence.
+					if (printCount >= 3) return "ready";
+					throw new Error("could not find service");
+				}
+				if (args.includes(CLIPBOARD_LABEL) || args.includes("/usr/bin/pgrep")) {
+					throw new Error("could not find service");
+				}
+				return "ready";
+			},
+		});
+
+		throws(
+			() =>
+				backend.create("macOS", {
+					runId: "clipboard-respawn",
+					creatorPid: process.pid,
+					linked: false,
+					providerUser: "switchyard",
+				}),
+			/clipboard isolation could not be enforced/,
+		);
+		strictEqual(
+			printCount,
+			3,
+			"the settle window must re-sample instead of checking once",
+		);
+		ok(
+			slept >= 2 && now > 0,
+			"the settle window must advance the clock between samples",
+		);
+	});
+
 	it("reclaims only dead owned VMs and force-stops a running one", () => {
 		const calls = [];
 		const entries = [
