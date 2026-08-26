@@ -72,7 +72,7 @@ function runDispatch(args, env = {}) {
 // budget below is a conservative guess a Parallels-equipped run should
 // double check.
 const PARALLELS_GOLDEN_IMAGE =
-	process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "macOS";
+	process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const PARALLELS_AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 const PARALLELS_PROVIDER_USER =
 	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
@@ -86,8 +86,28 @@ function commandAvailable(command) {
 	}
 }
 
+let parallelsConfigurationFault = null;
+
+function assertParallelsConfigured() {
+	if (parallelsConfigurationFault) {
+		throw new Error(parallelsConfigurationFault);
+	}
+}
+
 function parallelsGoldenImagePrerequisiteReason() {
 	if (!commandAvailable("prlctl")) return "Parallels prlctl is unavailable";
+	// Parallels is installed but the operator has not said which VM to clone.
+	// That is a configuration fault, not an absent dependency, so it FAILS the gate
+	// instead of skipping it. The previous `|| "macOS"` fallback pointed at the
+	// unhardened Task 1.1 base VM, which is present and stopped on this host: with
+	// the variable unset the gate would have cloned and asserted against a VM that
+	// was never hardened. Production already refuses to guess (README.md: "no
+	// default -- guessing at which VM to clone is not a safe default").
+	if (!PARALLELS_GOLDEN_IMAGE) {
+		parallelsConfigurationFault =
+			"SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set to run the VM gate";
+		return null;
+	}
 	let output;
 	try {
 		output = execFileSync("prlctl", ["list", "-a", "-o", "uuid,status,name"], {
@@ -127,11 +147,16 @@ function parallelsGoldenImagePrerequisiteReason() {
 const PARALLELS_PREREQUISITE_REASON = parallelsGoldenImagePrerequisiteReason();
 
 function parallelsBackendEnv() {
-	return {
-		SWITCHYARD_PARALLELS_GOLDEN_IMAGE: PARALLELS_GOLDEN_IMAGE,
-		SWITCHYARD_PARALLELS_AQUA_UID: PARALLELS_AQUA_UID,
-		SWITCHYARD_PARALLELS_PROVIDER_USER: PARALLELS_PROVIDER_USER,
-	};
+	// Only export what is actually set. Handing the worker an empty
+	// SWITCHYARD_PARALLELS_GOLDEN_IMAGE would recreate the fallback this file
+	// just removed, one process down, where it reads as configured-but-blank.
+	return Object.fromEntries(
+		[
+			["SWITCHYARD_PARALLELS_GOLDEN_IMAGE", PARALLELS_GOLDEN_IMAGE],
+			["SWITCHYARD_PARALLELS_AQUA_UID", PARALLELS_AQUA_UID],
+			["SWITCHYARD_PARALLELS_PROVIDER_USER", PARALLELS_PROVIDER_USER],
+		].filter(([, value]) => value !== ""),
+	);
 }
 
 function runBootstrap(args, env = {}) {
@@ -733,6 +758,7 @@ describe("--exclude-provider on the detached worker path", () => {
 			? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
 			: false,
 	}, async () => {
+		assertParallelsConfigured();
 		// The shared `projectDir` fixture (beforeEach) is just an empty `.git`
 		// directory — enough for the other tests in this file, which only care
 		// that the run reaches *some* terminal state, but seedProject's `git
@@ -906,6 +932,7 @@ describe("--only-provider on the detached worker path", () => {
 			? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
 			: false,
 	}, async () => {
+		assertParallelsConfigured();
 		// Mirrors the --exclude-provider test above, but proves the allowlist
 		// (not just the denylist) works end-to-end through the real detached
 		// worker path: without --only-provider, claude (90% left) outranks
@@ -1122,6 +1149,7 @@ describe("recover releases stale project locks", {
 		: undefined,
 }, () => {
 	it("recover --run clears a project lock left by a dead/terminal run", async () => {
+		assertParallelsConfigured();
 		const {
 			initializeRun,
 			advanceState,

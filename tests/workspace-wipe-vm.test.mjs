@@ -15,7 +15,7 @@ import {
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 
-const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "macOS";
+const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 
 function commandAvailable(command) {
@@ -68,12 +68,26 @@ async function loadSlotPrimitive() {
 		: null;
 }
 
+let configurationFault = null;
+
 async function inspectPrerequisites() {
 	if (!commandAvailable("prlctl")) return "Parallels prlctl is unavailable";
 	try {
 		execFileSync("prlctl", ["--version"], { stdio: "ignore", timeout: 5_000 });
 	} catch {
 		return "Parallels Desktop is unavailable to prlctl";
+	}
+	// Parallels is installed but the operator has not said which VM to clone.
+	// That is a configuration fault, not an absent dependency, so it FAILS the gate
+	// instead of skipping it. The previous `|| "macOS"` fallback pointed at the
+	// unhardened Task 1.1 base VM, which is present and stopped on this host: with
+	// the variable unset the gate would have cloned and asserted against a VM that
+	// was never hardened. Production already refuses to guess (README.md: "no
+	// default -- guessing at which VM to clone is not a safe default").
+	if (!GOLDEN_IMAGE) {
+		configurationFault =
+			"SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set to run the VM gate";
+		return null;
 	}
 	let golden;
 	try {
@@ -194,6 +208,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 	it("creates and normally destroys a real VM when all prerequisites are available", {
 		skip: prerequisiteReason ? `VM gate skipped: ${prerequisiteReason}` : false,
 	}, async (testContext) => {
+		if (configurationFault) throw new Error(configurationFault);
 		const slotPrimitive = await loadSlotPrimitive();
 		if (!slotPrimitive) {
 			testContext.skip(

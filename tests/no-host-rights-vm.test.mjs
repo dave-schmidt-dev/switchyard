@@ -23,7 +23,7 @@ import {
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { deriveC3Manifest, probeTcp } from "./helpers/c3-manifest.mjs";
 
-const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "macOS";
+const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const PROVIDER_USER =
 	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
@@ -89,6 +89,8 @@ async function loadSlotPrimitive() {
 		: null;
 }
 
+let configurationFault = null;
+
 async function inspectPrerequisites() {
 	if (!commandAvailable("prlctl")) return "Parallels prlctl is unavailable";
 	for (const command of ["pbcopy", "pbpaste"]) {
@@ -99,6 +101,18 @@ async function inspectPrerequisites() {
 		execFileSync("prlctl", ["--version"], { stdio: "ignore" });
 	} catch {
 		return "Parallels Desktop is unavailable to prlctl";
+	}
+	// Parallels is installed but the operator has not said which VM to clone.
+	// That is a configuration fault, not an absent dependency, so it FAILS the gate
+	// instead of skipping it. The previous `|| "macOS"` fallback pointed at the
+	// unhardened Task 1.1 base VM, which is present and stopped on this host: with
+	// the variable unset the gate would have cloned and asserted against a VM that
+	// was never hardened. Production already refuses to guess (README.md: "no
+	// default -- guessing at which VM to clone is not a safe default").
+	if (!GOLDEN_IMAGE) {
+		configurationFault =
+			"SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set to run the VM gate";
+		return null;
 	}
 	let golden;
 	try {
@@ -127,6 +141,7 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 	it("proves host sharing, guest mounts, C-3 networking, and clipboard behavior", {
 		skip: prerequisiteReason ? `VM gate skipped: ${prerequisiteReason}` : false,
 	}, async (testContext) => {
+		if (configurationFault) throw new Error(configurationFault);
 		const slotPrimitive = await loadSlotPrimitive();
 		if (!slotPrimitive) {
 			testContext.skip(
