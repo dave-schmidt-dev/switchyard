@@ -79,6 +79,64 @@ function classifyUnproven(coverage, dropped) {
 		});
 }
 
+/**
+ * How sound a candidate is as evidence that pf blocked the guest.
+ *
+ * `probeTcp` runs on the HOST. When the candidate is a host-owned address the
+ * connection rides loopback, which proves the listener is alive but says
+ * nothing about whether the guest had a route to it. A guest with no route
+ * fails its probe, `probe_blocked()` is `! nc -z`, and the failure reads as
+ * proof of a block that pf never performed.
+ */
+export const C3_CANDIDATE_SOUNDNESS = Object.freeze({
+	/** The guest has a route to it, so a blocked probe implicates pf. */
+	GUEST_ROUTABLE: "guest_routable",
+	/** This host owns the address; the guest's route to it is unproven. */
+	HOST_OWNED: "host_owned",
+	/**
+	 * A self-assigned 169.254 address. Attach any NIC with no DHCP server and
+	 * macOS invents one, which the host can then "prove" is blocked without the
+	 * guest ever having had a route to it.
+	 */
+	LINK_LOCAL: "link_local",
+});
+
+function isLinkLocal(host) {
+	return /^169\.254\./.test(String(host ?? ""));
+}
+
+/** Same /24 as the C-3 passed gateway, i.e. the subnet the guest sits on. */
+function sharesGatewaySubnet(ip, gateway) {
+	if (typeof ip !== "string" || typeof gateway !== "string") return false;
+	return (
+		ip.split(".").slice(0, 3).join(".") ===
+		gateway.split(".").slice(0, 3).join(".")
+	);
+}
+
+/**
+ * Classify a candidate by whether the guest could have reached it.
+ *
+ * The guest's own subnet is derived from the C-3 passed gateway rather than
+ * from a device name or a `prlctl list -i` call: the gateway is already the
+ * anchor's own notion of the guest network, and reusing it needs no new
+ * capability on this host.
+ * @param {{host: string, device?: string}} candidate
+ * @param {{gateway: string, hostAddresses: Set<string>}} context
+ * @returns {string} a C3_CANDIDATE_SOUNDNESS member
+ */
+export function classifyCandidateSoundness(candidate, context) {
+	const host = candidate?.host;
+	if (isLinkLocal(host)) return C3_CANDIDATE_SOUNDNESS.LINK_LOCAL;
+	if (sharesGatewaySubnet(host, context.gateway)) {
+		return C3_CANDIDATE_SOUNDNESS.GUEST_ROUTABLE;
+	}
+	if (context.hostAddresses.has(host)) {
+		return C3_CANDIDATE_SOUNDNESS.HOST_OWNED;
+	}
+	return C3_CANDIDATE_SOUNDNESS.GUEST_ROUTABLE;
+}
+
 export function isC3UnprovenReason(value) {
 	return C3_UNPROVEN_REASON_VALUES.includes(value);
 }
@@ -147,6 +205,16 @@ export function physicalInterfaces() {
 		});
 	}
 	return interfaces;
+}
+
+/** Every IPv4 address this host holds on any interface. */
+export function hostAddresses() {
+	const config = readCommand("/sbin/ifconfig", ["-a"]);
+	const addresses = new Set();
+	for (const matched of config.matchAll(/^\s+inet (\d+\.\d+\.\d+\.\d+)/gm)) {
+		addresses.add(matched[1]);
+	}
+	return addresses;
 }
 
 export function parallelsAdapters() {
@@ -233,7 +301,7 @@ function candidateEndpoints(port) {
 	return candidates;
 }
 
-async function verifyBlocked(candidates) {
+async function verifyBlocked(candidates, context) {
 	const blocked = [];
 	const dropped = [];
 	const seen = new Set();
@@ -287,9 +355,30 @@ async function verifyBlocked(candidates) {
 			}
 			continue;
 		}
+		// Classified after the liveness probe, not before: an unsound candidate
+		// that is also dead is dead first, and reporting it as unsound would
+		// send the operator to fix the wrong thing.
+		const soundness = classifyCandidateSoundness(candidate, context);
+		if (soundness !== C3_CANDIDATE_SOUNDNESS.GUEST_ROUTABLE) {
+			// Not merely excluded from coverage: left in the manifest, the guest
+			// would probe an address it has no route to, fail, and have that
+			// failure read as proof of a block pf never performed.
+			dropped.push({
+				value,
+				role: candidate.role,
+				cidr,
+				unsound: true,
+				soundness,
+				reason:
+					soundness === C3_CANDIDATE_SOUNDNESS.LINK_LOCAL
+						? "link-local self-assigned address; the guest has no route to it"
+						: "host-owned address; the host probe rides loopback and proves no guest path",
+			});
+			continue;
+		}
 		seen.add(value);
 		if (candidate.gateway) satisfiedGateways.add(candidate.host);
-		blocked.push({ ...candidate, value, cidr });
+		blocked.push({ ...candidate, value, cidr, soundness });
 	}
 	return { blocked, dropped };
 }
@@ -337,7 +426,10 @@ export async function deriveC3Manifest({ env = process.env } = {}) {
 	let blocked;
 	let dropped;
 	try {
-		({ blocked, dropped } = await verifyBlocked(candidates));
+		({ blocked, dropped } = await verifyBlocked(candidates, {
+			gateway: C3_PASSED_GATEWAY,
+			hostAddresses: hostAddresses(),
+		}));
 	} catch (error) {
 		// The caller never receives the object, so it can never call close().
 		if (listener) await listener.close();

@@ -10,9 +10,12 @@ import { describe, it } from "node:test";
 
 import {
 	C3_BLOCK_RULES,
+	C3_CANDIDATE_SOUNDNESS,
 	C3_UNPROVEN_REASONS,
 	classifyBlockedCidr,
+	classifyCandidateSoundness,
 	deriveC3Manifest,
+	hostAddresses,
 	isC3UnprovenReason,
 	parseEndpoint,
 	parseEndpoints,
@@ -199,6 +202,104 @@ describe("C-3 manifest derivation", () => {
 		);
 		strictEqual(manifest.dropped[0].cidr, null);
 		strictEqual(manifest.dropped[0].unsound, false);
+	});
+
+	it("will not prove a rule from a host-owned address alone", async () => {
+		// probeTcp runs on the HOST, so a host-owned candidate's connection
+		// rides loopback: it proves the listener is alive and says nothing about
+		// whether the guest had a route. The guest probe is `! nc -z`, so a
+		// guest with no route fails and the failure reads as proof of a block pf
+		// never performed.
+		const own = [...hostAddresses()].find(
+			(ip) => classifyBlockedCidr(ip) && !ip.startsWith("10.211.55."),
+		);
+		ok(own, "this host must own a blocked-range address for this test");
+
+		const server = net.createServer((socket) => socket.end());
+		await new Promise((resolve) => server.listen(0, own, resolve));
+		const { port } = server.address();
+		ok(await probeTcp(own, port), "fixture listener must be live");
+
+		const manifest = await deriveC3Manifest({
+			env: { SWITCHYARD_PARALLELS_C3_HOST_ENDPOINTS: `${own}:${port}` },
+		});
+		await manifest.close();
+		await new Promise((resolve) => server.close(resolve));
+
+		strictEqual(
+			manifest.blocked.length,
+			0,
+			"a host-owned candidate must not become guest evidence",
+		);
+		ok(!manifest.coverage.includes(classifyBlockedCidr(own)));
+		const entry = manifest.unproven.find(
+			(u) => u.label === classifyBlockedCidr(own),
+		);
+		strictEqual(entry?.reason, C3_UNPROVEN_REASONS.UNSOUND);
+		const drop = manifest.dropped.find((d) => d.value === `${own}:${port}`);
+		strictEqual(drop.soundness, C3_CANDIDATE_SOUNDNESS.HOST_OWNED);
+		ok(/loopback/.test(drop.reason), `reason must say why: ${drop.reason}`);
+	});
+
+	it("will not prove a rule from a link-local self-assigned address", () => {
+		// The sharpest case: attach any NIC with no DHCP server and macOS
+		// self-assigns a 169.254 address. 169.254.0.0/16 is one of the four
+		// blocked ranges, so the host can "prove" it blocked without the guest
+		// ever having had a route there.
+		const soundness = classifyCandidateSoundness(
+			{ host: "169.254.13.37" },
+			{ gateway: "10.211.55.1", hostAddresses: new Set(["169.254.13.37"]) },
+		);
+		strictEqual(soundness, C3_CANDIDATE_SOUNDNESS.LINK_LOCAL);
+		// Link-local wins over host-owned: naming it as merely host-owned would
+		// hide the reason it can never be routed.
+		strictEqual(classifyBlockedCidr("169.254.13.37"), "169.254.0.0/16");
+	});
+
+	it("reports a guest-routable candidate as proven when its probe is blocked", () => {
+		const context = {
+			gateway: "10.211.55.1",
+			hostAddresses: new Set(["10.211.55.2", "192.168.1.54"]),
+		};
+		// The guest's own subnet, derived from the passed gateway rather than a
+		// device name: the guest reaches it over its own adapter.
+		strictEqual(
+			classifyCandidateSoundness({ host: "10.211.55.2" }, context),
+			C3_CANDIDATE_SOUNDNESS.GUEST_ROUTABLE,
+		);
+		// A real third party the host does not own.
+		strictEqual(
+			classifyCandidateSoundness({ host: "192.168.1.1" }, context),
+			C3_CANDIDATE_SOUNDNESS.GUEST_ROUTABLE,
+		);
+		// A host address on some other network is not.
+		strictEqual(
+			classifyCandidateSoundness({ host: "192.168.1.54" }, context),
+			C3_CANDIDATE_SOUNDNESS.HOST_OWNED,
+		);
+	});
+
+	it("keeps every blocked endpoint sound, so coverage rests on nothing else", async () => {
+		const manifest = await deriveC3Manifest({ env: {} });
+		try {
+			for (const endpoint of manifest.blocked) {
+				strictEqual(
+					endpoint.soundness,
+					C3_CANDIDATE_SOUNDNESS.GUEST_ROUTABLE,
+					`${endpoint.value} is unsound evidence and must not be in the manifest`,
+				);
+			}
+			// Anything dropped for soundness must say which kind it was.
+			for (const drop of manifest.dropped.filter((d) => d.unsound)) {
+				ok(
+					Object.values(C3_CANDIDATE_SOUNDNESS).includes(drop.soundness) ||
+						drop.soundness === undefined,
+					`${drop.value} carried ${JSON.stringify(drop.soundness)}`,
+				);
+			}
+		} finally {
+			await manifest.close();
+		}
 	});
 
 	it("names a distinct cause for each way a rule goes unproven", async () => {
