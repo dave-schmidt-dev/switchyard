@@ -356,6 +356,18 @@ function validateTar(value) {
 	return Buffer.from(value);
 }
 
+/**
+ * The name Parallels itself gives the parent snapshot it creates for a linked
+ * clone, verified against prlctl 26.4.1 on 2026-08-26.
+ *
+ * Nothing in this module matches snapshots by name — clone-time detection is a
+ * before-and-after id diff, which needs no name. This constant exists as the
+ * single source of truth for `ops/switchyard-reaper.sh`, a standalone shell
+ * script that must duplicate the literal because it reads no project code, and
+ * `tests/reaper-script.test.mjs` fails if the two drift.
+ */
+export const PARALLELS_LINKED_SNAPSHOT_NAME = "Snapshot for linked clone";
+
 function snapshotIdsFromOutput(output) {
 	const text = outputText(output);
 	const ids = new Set();

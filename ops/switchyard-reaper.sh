@@ -20,15 +20,29 @@
 # The name prefix below MUST match PARALLELS_WORKING_PREFIX in
 # src/switchyard/lifecycle/parallels-execution-backend.mjs. A parity test
 # (tests/reaper-script.test.mjs) asserts they stay in sync so a rename there
-# can't silently disable this reaper.
+# can't silently disable this reaper. The same applies to the linked-clone
+# snapshot name and the sidecar directory below.
+#
+# Snapshots are REPORTED, never deleted. A golden-image snapshot that no
+# sidecar accounts for is unreclaimable by design — the code must never delete
+# a snapshot it did not record — but leaving it invisible is how one sat on
+# switchyard-golden-6 from 2026-08-13 unnoticed.
 set -u
 
 # --- Name source of truth (kept in sync by the parity test) ---
 WORKING_PREFIX="switchyard-work-"
+LINKED_SNAPSHOT_NAME="Snapshot for linked clone"
+SIDECAR_DIR="$HOME/.switchyard/admission/linked-snapshots"
 
 # launchd starts jobs with a minimal PATH; prlctl lives here.
 PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
 export PATH
+
+# Which prlctl to invoke. Overridable so the ops tests can run this script
+# end-to-end against a stub: because the PATH above is replaced rather than
+# extended, a test that only prepends a stub directory would silently reach the
+# real daemon instead, which is the one thing these tests must never do.
+PRLCTL="${SWITCHYARD_REAPER_PRLCTL:-prlctl}"
 
 LOG_DIR="$HOME/Library/Logs"
 mkdir -p "$LOG_DIR"
@@ -83,7 +97,7 @@ parse_owned_vm() {
 	return 0
 }
 
-if ! command -v prlctl >/dev/null 2>&1; then
+if ! command -v "$PRLCTL" >/dev/null 2>&1; then
 	log "reaper: prlctl not found on PATH — nothing to do"
 	exit 0
 fi
@@ -96,7 +110,7 @@ reaped=0
 # subshell — a piped loop would lose the $reaped count across iterations.
 LIST_TMP=$(mktemp "${TMPDIR:-/tmp}/switchyard-reaper-list.XXXXXX")
 trap 'rm -f "$LIST_TMP"' EXIT
-prlctl list -a -o uuid,status,name >"$LIST_TMP" 2>/dev/null
+"$PRLCTL" list -a -o uuid,status,name >"$LIST_TMP" 2>/dev/null
 
 while IFS= read -r line; do
 	uuid=$(printf '%s\n' "$line" | awk '{print $1}')
@@ -113,13 +127,77 @@ while IFS= read -r line; do
 	fi
 	case "$status" in
 	[Ss]topped) ;;
-	*) prlctl stop "$uuid" --kill >/dev/null 2>&1 ;;
+	*) "$PRLCTL" stop "$uuid" --kill >/dev/null 2>&1 ;;
 	esac
-	if prlctl delete "$uuid" >/dev/null 2>&1; then
+	if "$PRLCTL" delete "$uuid" >/dev/null 2>&1; then
 		reaped=$((reaped + 1))
 		log "reaper: removed VM $name ($uuid, dead owner pid $creator_pid)"
 	fi
 done <"$LIST_TMP"
+
+# --- Report unrecorded golden-image snapshots (never delete) ---
+#
+# The golden image name is not derivable from a VM listing, so take it from the
+# environment when present and otherwise from the sidecars themselves. When
+# neither yields a name, say so rather than logging a clean result that was
+# never actually checked.
+GOLDEN_IMAGES=$(
+	{
+		[ -n "${SWITCHYARD_PARALLELS_GOLDEN_IMAGE:-}" ] &&
+			printf '%s\n' "$SWITCHYARD_PARALLELS_GOLDEN_IMAGE"
+		[ -d "$SIDECAR_DIR" ] &&
+			sed -n 's/.*"goldenImage":"\([^"]*\)".*/\1/p' "$SIDECAR_DIR"/*.json \
+				2>/dev/null
+	} 2>/dev/null | sort -u
+)
+
+if [ -z "$GOLDEN_IMAGES" ]; then
+	log "reaper: no golden image name available — snapshot check skipped"
+else
+	unrecorded=0
+	for golden in $GOLDEN_IMAGES; do
+		SNAP_TMP=$(mktemp "${TMPDIR:-/tmp}/switchyard-reaper-snap.XXXXXX")
+		if ! "$PRLCTL" snapshot-list "$golden" -j >"$SNAP_TMP" 2>/dev/null; then
+			log "reaper: could not list snapshots on $golden — check skipped"
+			rm -f "$SNAP_TMP"
+			continue
+		fi
+		# Verified against prlctl 26.4.1 (2026-08-26): the -j output is a map
+		# keyed by brace-wrapped snapshot id, and each id key line precedes its
+		# own "name" line. Track the last id seen and emit it when the name
+		# matches.
+		# Listed into a temp file, not piped: a piped `while read` runs in a
+		# subshell and would lose the $unrecorded count across iterations, the
+		# same reason the VM loop above uses a file.
+		IDS_TMP=$(mktemp "${TMPDIR:-/tmp}/switchyard-reaper-ids.XXXXXX")
+		awk -v want="$LINKED_SNAPSHOT_NAME" '
+			/^[[:space:]]*"\{[^}]*\}"[[:space:]]*:/ {
+				id = $0
+				sub(/^[[:space:]]*"/, "", id)
+				sub(/"[[:space:]]*:.*$/, "", id)
+				next
+			}
+			/"name"[[:space:]]*:/ {
+				name = $0
+				sub(/^[^:]*:[[:space:]]*"/, "", name)
+				sub(/",?[[:space:]]*$/, "", name)
+				if (name == want && id != "") print id
+			}
+		' "$SNAP_TMP" >"$IDS_TMP"
+		while IFS= read -r snapshot_id; do
+			[ -n "$snapshot_id" ] || continue
+			# Recorded means a sidecar this code wrote names the id.
+			if grep -qF "$snapshot_id" "$SIDECAR_DIR"/*.json 2>/dev/null; then
+				continue
+			fi
+			unrecorded=$((unrecorded + 1))
+			log "reaper: UNRECORDED snapshot $snapshot_id on $golden — not deleted, needs human review"
+		done <"$IDS_TMP"
+		rm -f "$IDS_TMP"
+		rm -f "$SNAP_TMP"
+	done
+	log "reaper: snapshot check done (unrecorded=$unrecorded)"
+fi
 
 log "reaper: done (vms=$reaped)"
 exit 0
