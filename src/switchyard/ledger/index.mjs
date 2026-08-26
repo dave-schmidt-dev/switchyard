@@ -2,7 +2,14 @@
 // INV-4: Every dispatch records provider + model + result
 
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import {
+	appendFileSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -210,6 +217,109 @@ export function readLedger() {
 	}
 }
 
+// The store-backed ledger is a single append-only file with no rotation. On
+// 2026-08-26 it had reached 25.3 MB and 32,448 lines since 2026-08-04, about
+// 1.1 MB a day, which is 89 percent of all Switchyard log volume. Rotate on
+// size rather than age: the write rate differs by orders of magnitude between
+// an idle day and a live-run day, so an age window either keeps far too much or
+// discards a whole run's provenance in one sweep.
+const DEFAULT_LEDGER_MAX_BYTES = 8 * 1024 * 1024;
+const DEFAULT_LEDGER_SEGMENTS = 5;
+
+let ledgerRotationFailures = 0;
+let ledgerRotationWarned = false;
+
+/**
+ * Number of ledger rotations this process failed to complete.
+ * @returns {number}
+ */
+export function getLedgerRotationFailures() {
+	return ledgerRotationFailures;
+}
+
+/**
+ * Reset the rotation failure counter. Test seam only.
+ * @returns {void}
+ */
+export function resetLedgerRotationFailures() {
+	ledgerRotationFailures = 0;
+	ledgerRotationWarned = false;
+}
+
+function ledgerMaxBytes() {
+	const raw = Number(process.env.SWITCHYARD_LEDGER_MAX_BYTES);
+	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_LEDGER_MAX_BYTES;
+}
+
+function ledgerSegments() {
+	const raw = Number(process.env.SWITCHYARD_LEDGER_SEGMENTS);
+	return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_LEDGER_SEGMENTS;
+}
+
+function segmentPath(path, index) {
+	return `${path}.${index}`;
+}
+
+/**
+ * Segment paths oldest-first, for readers that want the full retained history.
+ * @param {string} path active ledger path
+ * @returns {string[]}
+ */
+function retainedSegmentPaths(path) {
+	const paths = [];
+	for (let index = ledgerSegments(); index >= 1; index -= 1) {
+		paths.push(segmentPath(path, index));
+	}
+	return paths;
+}
+
+function noteRotationFailure(error) {
+	ledgerRotationFailures += 1;
+	if (ledgerRotationWarned) return;
+	ledgerRotationWarned = true;
+	console.warn(
+		`switchyard: dispatch ledger rotation failed (${error?.code ?? "unknown"}); the ledger will keep growing but this run is unaffected`,
+	);
+}
+
+/**
+ * Rotate the active ledger once it outgrows its bound.
+ *
+ * The active file keeps its name so existing readers are unaffected; retained
+ * history moves to `.1` (newest) through `.N` (oldest). Best-effort by design:
+ * the ledger is an observability channel and a rotation failure must never be
+ * able to abort a run, for the same reason the legacy append is best-effort.
+ *
+ * @param {string} path active ledger path
+ * @returns {void}
+ */
+function rotateLedgerIfNeeded(path) {
+	try {
+		if (statSync(path).size < ledgerMaxBytes()) return;
+	} catch (error) {
+		// Nothing written yet is the normal first-call case, not a failure.
+		if (error?.code !== "ENOENT") noteRotationFailure(error);
+		return;
+	}
+	try {
+		const keep = ledgerSegments();
+		// Drop the oldest segment, then shift every survivor down one slot.
+		rmSync(segmentPath(path, keep), { force: true });
+		for (let index = keep - 1; index >= 1; index -= 1) {
+			try {
+				renameSync(segmentPath(path, index), segmentPath(path, index + 1));
+			} catch (error) {
+				if (error?.code !== "ENOENT") throw error;
+			}
+		}
+		// Rename rather than copy-and-truncate: an in-flight reader keeps a
+		// consistent view and no entry can be observed twice or lost.
+		renameSync(path, segmentPath(path, 1));
+	} catch (error) {
+		noteRotationFailure(error);
+	}
+}
+
 function resolveLedgerDir(runStorePath) {
 	const root = runStorePath ?? getStateRoot();
 	return resolve(root, "ledger");
@@ -246,6 +356,7 @@ export async function recordDispatchToStore(data, runStorePath) {
 	};
 
 	const path = resolveLedgerPath(runStorePath);
+	rotateLedgerIfNeeded(path);
 	await appendFile(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
 }
 
@@ -267,11 +378,15 @@ export function recordDispatchIntentToStore(data, runStorePath) {
 		storeBacked: true,
 		...sanitizeIntentEntry(data),
 	};
-	appendFileSync(
-		resolveLedgerPath(runStorePath),
-		`${JSON.stringify(entry)}\n`,
-		{ encoding: "utf8", mode: 0o600 },
-	);
+	const path = resolveLedgerPath(runStorePath);
+	// Rotation is best-effort; the append below is NOT. This receipt is
+	// synchronous by design and callers depend on it being durable before a
+	// provider is invoked, so its failure must still propagate.
+	rotateLedgerIfNeeded(path);
+	appendFileSync(path, `${JSON.stringify(entry)}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
 }
 
 /**
@@ -282,9 +397,20 @@ export function recordDispatchIntentToStore(data, runStorePath) {
  */
 export async function readLedgerFromStore(runStorePath) {
 	const path = resolveLedgerPath(runStorePath);
-	try {
-		const content = await readFile(path, "utf8");
-		const entries = [];
+	const entries = [];
+	// Oldest retained segment first, active file last, so a rotation boundary is
+	// invisible to callers and chronological order is preserved across it.
+	for (const candidate of [...retainedSegmentPaths(path), path]) {
+		let content;
+		try {
+			content = await readFile(candidate, "utf8");
+		} catch (e) {
+			if (e.code === "ENOENT") continue;
+			// A missing segment is normal; anything else on the ACTIVE file is
+			// not, and must still surface.
+			if (candidate === path) throw e;
+			continue;
+		}
 		for (const line of content.split("\n")) {
 			if (line.trim() === "") continue;
 			try {
@@ -295,9 +421,6 @@ export async function readLedgerFromStore(runStorePath) {
 				);
 			}
 		}
-		return entries;
-	} catch (e) {
-		if (e.code === "ENOENT") return [];
-		throw e;
 	}
+	return entries;
 }

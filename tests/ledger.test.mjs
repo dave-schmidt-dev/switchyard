@@ -1,14 +1,16 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { cwd } from "node:process";
-import { after, before, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it } from "node:test";
 import {
+	getLedgerRotationFailures,
 	readLedger,
 	readLedgerFromStore,
 	recordDispatch,
 	recordDispatchIntentToStore,
 	recordDispatchToStore,
+	resetLedgerRotationFailures,
 } from "../src/switchyard/ledger/index.mjs";
 
 const TEST_LEDGER_DIR = join(cwd(), ".switchyard-test-ledger");
@@ -201,6 +203,142 @@ describe("ledger run-store backed", () => {
 
 		const entries = readLedger();
 		ok(entries.length > 0, "legacy ledger still works");
+	});
+
+	// The store-backed ledger was a single append-only file with no rotation: on
+	// 2026-08-26 it stood at 25.3 MB and 32,448 lines since 2026-08-04, roughly
+	// 1.1 MB a day and 89 percent of all Switchyard log volume.
+	describe("store ledger rotation", () => {
+		const ROTATE_ROOT = join(STORE_DIR, "rotation");
+		const LEDGER = join(ROTATE_ROOT, "ledger", "dispatch-ledger.jsonl");
+		let originalMax;
+		let originalSegments;
+
+		function entry(n) {
+			return {
+				provider: "claude",
+				model: "claude-sonnet-5",
+				taskId: `rotate-${n}`,
+				result: "success",
+			};
+		}
+
+		before(() => {
+			originalMax = process.env.SWITCHYARD_LEDGER_MAX_BYTES;
+			originalSegments = process.env.SWITCHYARD_LEDGER_SEGMENTS;
+		});
+
+		beforeEach(() => {
+			rmSync(ROTATE_ROOT, { recursive: true, force: true });
+			resetLedgerRotationFailures();
+			// Small enough that a handful of entries crosses it.
+			process.env.SWITCHYARD_LEDGER_MAX_BYTES = "600";
+			process.env.SWITCHYARD_LEDGER_SEGMENTS = "2";
+		});
+
+		after(() => {
+			if (originalMax === undefined) {
+				delete process.env.SWITCHYARD_LEDGER_MAX_BYTES;
+			} else {
+				process.env.SWITCHYARD_LEDGER_MAX_BYTES = originalMax;
+			}
+			if (originalSegments === undefined) {
+				delete process.env.SWITCHYARD_LEDGER_SEGMENTS;
+			} else {
+				process.env.SWITCHYARD_LEDGER_SEGMENTS = originalSegments;
+			}
+			rmSync(ROTATE_ROOT, { recursive: true, force: true });
+		});
+
+		it("rotates the active file once it exceeds the configured size", async () => {
+			for (let n = 0; n < 12; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			ok(existsSync(LEDGER), "the active file must still exist");
+			ok(existsSync(`${LEDGER}.1`), "a rotated segment must exist");
+			ok(
+				readFileSync(LEDGER, "utf8").length <
+					readFileSync(`${LEDGER}.1`, "utf8").length +
+						readFileSync(LEDGER, "utf8").length,
+				"the active file must be smaller than the total retained history",
+			);
+		});
+
+		it("keeps the active file's name stable across a rotation", async () => {
+			for (let n = 0; n < 12; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			// Readers that hardcode the path must keep working, and the newest
+			// entry must be in the ACTIVE file, not in a segment.
+			const active = readFileSync(LEDGER, "utf8").trim().split("\n");
+			const newest = JSON.parse(active.at(-1));
+			strictEqual(newest.taskId, "rotate-11");
+		});
+
+		it("bounds the number of retained segments", async () => {
+			for (let n = 0; n < 60; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			ok(existsSync(`${LEDGER}.1`), "segment 1 must exist");
+			ok(existsSync(`${LEDGER}.2`), "segment 2 must exist");
+			ok(
+				!existsSync(`${LEDGER}.3`),
+				"segment 3 must not exist: the segment count is bounded at 2",
+			);
+		});
+
+		it("loses no entry across a rotation boundary", async () => {
+			// Two segments plus the active file, so nothing has aged out yet.
+			for (let n = 0; n < 12; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			ok(existsSync(`${LEDGER}.1`), "the run must actually have rotated");
+			const read = await readLedgerFromStore(ROTATE_ROOT);
+			deepStrictEqual(
+				read.map((e) => e.taskId),
+				Array.from({ length: 12 }, (_, n) => `rotate-${n}`),
+				"every entry must be readable, in order, across the boundary",
+			);
+		});
+
+		it("does not propagate a rotation failure out of the append", async () => {
+			for (let n = 0; n < 12; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			ok(existsSync(`${LEDGER}.1`), "the run must actually have rotated");
+			// A DIRECTORY where segment .2 must go: the shift renames .1 -> .2 and
+			// fails, which must be reported and swallowed rather than aborting a
+			// run. The ledger is an observability channel.
+			rmSync(`${LEDGER}.2`, { recursive: true, force: true });
+			mkdirSync(`${LEDGER}.2`, { recursive: true });
+			// Non-empty, so the rename onto it cannot succeed.
+			mkdirSync(join(`${LEDGER}.2`, "occupied"), { recursive: true });
+			resetLedgerRotationFailures();
+			for (let n = 100; n < 112; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			ok(
+				getLedgerRotationFailures() > 0,
+				"the rotation failure must be counted, not silent",
+			);
+			const read = await readLedgerFromStore(ROTATE_ROOT);
+			ok(
+				read.some((e) => e.taskId === "rotate-111"),
+				"entries must keep landing even when rotation cannot proceed",
+			);
+		});
+
+		it("does not rotate a file that is still under the bound", async () => {
+			process.env.SWITCHYARD_LEDGER_MAX_BYTES = String(8 * 1024 * 1024);
+			for (let n = 0; n < 12; n += 1) {
+				await recordDispatchToStore(entry(n), ROTATE_ROOT);
+			}
+			ok(
+				!existsSync(`${LEDGER}.1`),
+				"no segment may be created below the threshold",
+			);
+			strictEqual((await readLedgerFromStore(ROTATE_ROOT)).length, 12);
+		});
 	});
 
 	it("writes a sanitized project-local intent receipt", () => {
