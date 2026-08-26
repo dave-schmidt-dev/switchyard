@@ -271,11 +271,11 @@ function extractSummaryLines(diff, projectPath) {
  * Validate that a diff is structurally safe to apply.
  * @param {string} diff The git diff to validate
  * @param {string} projectPath Target project path (paths are resolved against this)
- * @returns {{safe: boolean, reason?: string, reasonKind?: "corrupt_patch"|"conflict", requiresReview?: boolean, sensitivePaths?: string[], touchedPaths?: string[]}}
+ * @returns {{safe: boolean, reason?: string, reasonKind?: IntegrationRefusalKind, requiresReview?: boolean, sensitivePaths?: string[], touchedPaths?: string[]}}
  */
 export function validateDiff(diff, projectPath) {
 	if (!diff || typeof diff !== "string" || !diff.trim()) {
-		return { safe: false, reason: "empty diff" };
+		return { safe: false, reason: "empty diff", reasonKind: "empty_diff" };
 	}
 
 	const { paths: touchedPaths, stderr: numstatStderr } = extractTouchedPaths(
@@ -292,15 +292,24 @@ export function validateDiff(diff, projectPath) {
 
 	for (const path of touchedPaths) {
 		if (escapesProjectRoot(projectPath, path)) {
-			return { safe: false, reason: `path escapes project root: ${path}` };
+			return {
+				safe: false,
+				reason: `path escapes project root: ${path}`,
+				reasonKind: "path_escapes_project_root",
+			};
 		}
 		if (path.split("/").includes(".git")) {
-			return { safe: false, reason: `diff touches .git internals: ${path}` };
+			return {
+				safe: false,
+				reason: `diff touches .git internals: ${path}`,
+				reasonKind: "git_internals_touched",
+			};
 		}
 		if (SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(path))) {
 			return {
 				safe: false,
 				reason: `diff touches a credential-convention path: ${path}`,
+				reasonKind: "credential_path_touched",
 				credentialFlagged: true,
 			};
 		}
@@ -309,12 +318,17 @@ export function validateDiff(diff, projectPath) {
 	const summaryLines = extractSummaryLines(diff, projectPath);
 	for (const line of summaryLines) {
 		if (/create mode 120000|rename.*120000/.test(line)) {
-			return { safe: false, reason: `diff creates a symlink: ${line.trim()}` };
+			return {
+				safe: false,
+				reason: `diff creates a symlink: ${line.trim()}`,
+				reasonKind: "symlink_creation_refused",
+			};
 		}
 		if (/mode 100755|=> 100755/.test(line)) {
 			return {
 				safe: false,
 				reason: `diff introduces an executable file: ${line.trim()}`,
+				reasonKind: "executable_file_refused",
 			};
 		}
 	}
@@ -608,6 +622,7 @@ export function integrationGate(diff, projectPath, options = {}) {
 			success: false,
 			message:
 				"diff touches a build/execution manifest file and requires AllowManifests: true plus an explicit Files: declaration",
+			reasonKind: "manifest_review_required",
 			requiresReview: true,
 			sensitivePaths: validation.sensitivePaths,
 		};

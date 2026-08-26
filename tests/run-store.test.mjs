@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
+import { INTEGRATION_REFUSAL_KINDS } from "../src/switchyard/adapter/exec-error.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import {
 	acquireLaunchLock,
@@ -437,6 +438,58 @@ describe("event ordering", () => {
 			ok(!(key in event), `raw event field ${key} must not persist`);
 		}
 		ok(!JSON.stringify(event).includes("SECRET_CANARY"));
+	});
+
+	it("carries an integration refusal kind through to events.jsonl and run.json", async () => {
+		// Before this, every refusal arrived as the same static
+		// `integration_failed`, so run eab7d23c's real cause (a manifest touched
+		// without `AllowManifests: true`) was only recoverable by reading the
+		// gate's source. The kind is a closed-enum member, so naming the cause
+		// costs nothing on the INV-2 boundary.
+		for (const kind of INTEGRATION_REFUSAL_KINDS) {
+			const opts = makeOptions();
+			await initializeRun(opts);
+
+			await createEvent(opts.runId, {
+				phase: "integration",
+				event: "task_failed",
+				status: "Task task-1 failed",
+				taskId: "task-1",
+				result: "integration_failed",
+				errorKind: "integration_failed",
+				diagnosticCode: kind,
+				reason: "SECRET_CANARY_gate_message",
+			});
+			const current = await readRun(opts.runId);
+			await updateRun(
+				opts.runId,
+				{
+					lastFailure: {
+						errorKind: "integration_failed",
+						reasonCode: "integration_failed",
+						reason: "The reviewed integration gate rejected the task result.",
+						diagnosticCode: kind,
+					},
+				},
+				current.revision,
+			);
+
+			const eventsPath = join(getRunRoot(opts.runId), "events.jsonl");
+			const [event] = (await readFile(eventsPath, "utf8"))
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			strictEqual(event.diagnosticCode, kind, `${kind} lost in events.jsonl`);
+			ok(!JSON.stringify(event).includes("SECRET_CANARY"));
+
+			const run = await readRun(opts.runId);
+			strictEqual(
+				run.lastFailure.diagnosticCode,
+				kind,
+				`${kind} lost in run.json`,
+			);
+			ok(!JSON.stringify(run.lastFailure).includes("/"));
+		}
 	});
 });
 

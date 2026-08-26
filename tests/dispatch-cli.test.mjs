@@ -10,7 +10,7 @@ import {
 	strictEqual,
 } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -1355,6 +1355,60 @@ describe("envelope format", () => {
 		}
 	});
 
+	it("drops a lastFailure artifact ref the artifacts channel cannot resolve", async () => {
+		// Run eab7d23c (2026-08-25) persisted `lastFailure.artifactRef` while
+		// `artifactRefs` was `[]`: the ref is derived unconditionally from the
+		// task id, but the copy into the artifacts channel is best-effort and
+		// swallows its own failure. An operator then cannot tell a lost artifact
+		// from a bad pointer. Report only what the run can actually produce.
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = "dangling-artifact-ref";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		const lastFailure = {
+			errorKind: "integration_failed",
+			reasonCode: "integration_failed",
+			reason: "The reviewed integration gate rejected the task result.",
+			artifactRef: "artifact:0123456789abcdef01234567",
+		};
+		let current = await readRun(runId);
+		await updateRun(runId, { lastFailure }, current.revision);
+
+		const statusEnvelope = JSON.parse(
+			runDispatch(["status", runId], makeStateRootEnv()).stdout.trim(),
+		);
+
+		current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: ["1.1"] },
+			},
+			current.revision,
+		);
+		const resultEnvelope = JSON.parse(
+			runDispatch(["result", runId], makeStateRootEnv()).stdout.trim(),
+		);
+
+		deepStrictEqual(resultEnvelope.artifactRefs, []);
+		strictEqual(resultEnvelope.lastFailure.artifactRef, undefined);
+		// Both envelopes must agree, or `status` advertises a ref `result` denies.
+		strictEqual(statusEnvelope.lastFailure.artifactRef, undefined);
+		// Dropping the ref must not drop the diagnosis with it.
+		strictEqual(resultEnvelope.lastFailure.reasonCode, "integration_failed");
+		deepStrictEqual(statusEnvelope.lastFailure, resultEnvelope.lastFailure);
+	});
+
 	it("capstone: status and result preserve the same bounded route/failure projection", async () => {
 		const { initializeRun, updateRun, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -1371,6 +1425,19 @@ describe("envelope format", () => {
 			initialHostFingerprint: "test-host",
 			launchArgs: [],
 		});
+		// The ref must be one the artifacts channel can actually resolve, or both
+		// envelopes now drop it as unresolvable. `listArtifactRefs` hashes the
+		// file NAME, so seed a real artifact and derive the ref from its name.
+		const { getRunRoot } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const artifactsDir = join(getRunRoot(runId), "artifacts");
+		mkdirSync(artifactsDir, { recursive: true });
+		writeFileSync(join(artifactsDir, "1.1.diff"), "partial\n", "utf8");
+		const resolvableRef = `artifact:${createHash("sha256")
+			.update("1.1.diff")
+			.digest("hex")
+			.slice(0, 24)}`;
 		const routeAndFailure = {
 			resolvedTargetId: "agy-gemini",
 			snapshotStatus: "stale",
@@ -1380,7 +1447,7 @@ describe("envelope format", () => {
 				errorKind: "integration_failed",
 				reasonCode: "integration_failed",
 				reason: "The reviewed integration gate rejected the task result.",
-				artifactRef: "artifact:0123456789abcdef01234567",
+				artifactRef: resolvableRef,
 			},
 		};
 		let current = await readRun(runId);

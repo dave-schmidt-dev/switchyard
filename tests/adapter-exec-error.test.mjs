@@ -4,7 +4,9 @@ import {
 	classifyProviderDiagnostic,
 	cleanupDiagnosticCodeFor,
 	describeExecError,
+	INTEGRATION_REFUSAL_KINDS,
 	isPersistentFailureMetadata,
+	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
 	reauthHintFor,
 	sanitizeFailureMetadata,
@@ -418,6 +420,39 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		match(metadata.artifactRef, /^artifact:[a-f0-9]{24}$/);
 		ok(!metadata.reason.includes("/Users/dave"));
 		ok(isPersistentFailureMetadata(metadata));
+	});
+
+	it("keeps every integration refusal kind persistable and resolvable to a named reason", () => {
+		for (const kind of INTEGRATION_REFUSAL_KINDS) {
+			ok(
+				PERSISTED_DIAGNOSTIC_CODES.includes(kind),
+				`${kind} must be persistable to reach run.json, events.jsonl, and the checkpoint`,
+			);
+			const metadata = sanitizeFailureMetadata({
+				taskId: "1.1",
+				result: "integration_failed",
+				diagnosticCode: kind,
+			});
+			strictEqual(metadata.diagnosticCode, kind, `${kind} must survive`);
+			ok(isPersistentFailureMetadata(metadata));
+		}
+	});
+
+	it("carries no path, diff hunk, or provider text on any refusal kind", () => {
+		for (const kind of INTEGRATION_REFUSAL_KINDS) {
+			const metadata = sanitizeFailureMetadata({
+				taskId: "1.1",
+				result: "integration_failed",
+				diagnosticCode: kind,
+			});
+			const serialized = JSON.stringify(metadata);
+			ok(!/\//.test(serialized), `${kind} must carry no path separator`);
+			ok(!/^\+\+\+|@@/m.test(serialized), `${kind} must carry no diff hunk`);
+			ok(
+				!/[Uu]sers|home|tmp|\.diff/.test(serialized),
+				`${kind} must name no filesystem location: ${serialized}`,
+			);
+		}
 	});
 
 	it("retains the closed auth-expired enum without persisting the adapter's raw hint", () => {

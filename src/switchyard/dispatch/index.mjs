@@ -1210,12 +1210,41 @@ async function buildStatusEnvelope(runId, run) {
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount,
 		failedCount,
-		lastFailure: run.lastFailure ?? null,
+		// Reconciled against the same artifacts channel `result` reports, so the
+		// two envelopes cannot disagree about whether a failure has an artifact.
+		lastFailure: reconcileFailureArtifactRef(
+			run.lastFailure ?? null,
+			await listArtifactRefs(runId),
+		),
 		...retryProjection,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
 		...telemetry,
 	};
+}
+
+/**
+ * Drop a `lastFailure.artifactRef` the artifacts channel cannot resolve.
+ *
+ * The ref and the channel are written by two different paths: the ref is
+ * derived unconditionally from the task id, while the copy into the run's
+ * `artifacts/` directory is best-effort and swallows its own failure. When the
+ * copy loses, the operator sees a reference in `lastFailure` that is absent
+ * from `artifactRefs` and has no way to tell a lost artifact from a bad
+ * pointer. Observed on run eab7d23c (2026-08-25): `artifactRef` was set while
+ * `artifactRefs` was `[]`. Report only what the run can actually produce.
+ * @param {object|null} lastFailure
+ * @param {string[]} artifactRefs refs the artifacts channel actually lists
+ * @returns {object|null}
+ */
+function reconcileFailureArtifactRef(lastFailure, artifactRefs) {
+	if (!lastFailure || typeof lastFailure !== "object") {
+		return lastFailure ?? null;
+	}
+	if (typeof lastFailure.artifactRef !== "string") return lastFailure;
+	if (artifactRefs.includes(lastFailure.artifactRef)) return lastFailure;
+	const { artifactRef: _unresolvable, ...rest } = lastFailure;
+	return rest;
 }
 
 async function listArtifactRefs(runId) {
@@ -1301,7 +1330,10 @@ async function buildResultEnvelope(runId, run) {
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount,
 		failedCount,
-		lastFailure: run.lastFailure ?? null,
+		lastFailure: reconcileFailureArtifactRef(
+			run.lastFailure ?? null,
+			artifactRefs,
+		),
 		...retryProjection,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,

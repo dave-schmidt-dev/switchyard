@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { INTEGRATION_REFUSAL_KINDS } from "../src/switchyard/adapter/exec-error.mjs";
 import {
 	APPLY_CHECK_MAX_BUFFER,
 	dequoteGitPath,
@@ -1110,6 +1111,148 @@ describe("Files allowlist enforcement", () => {
 			requiredPaths: null,
 		});
 		strictEqual(result.success, true);
+	});
+});
+
+describe("integration refusal kinds", () => {
+	// Every refusal below reaches `dispatch` stdout, `status`, `result`,
+	// `run.json`, `events.jsonl`, and the checkpoint as a single static
+	// `integration_failed`. Run eab7d23c (2026-08-25) was rejected for omitting
+	// `AllowManifests: true` and diagnosing it required reading this file's
+	// source. Each site now names its own cause through a closed enum, so the
+	// operator surface distinguishes them without carrying provider text.
+	beforeEach(() => {
+		projectPath = initRepo();
+		commitFile(projectPath, "test.txt", "original content\n");
+	});
+
+	afterEach(() => {
+		rmSync(projectPath, { recursive: true, force: true });
+	});
+
+	it("names a distinct kind at every refusal site", () => {
+		const kinds = new Map();
+
+		kinds.set("empty diff", validateDiff("   \n  ", projectPath).reasonKind);
+
+		kinds.set(
+			"path escape",
+			validateDiff(
+				`diff --git a/../../../etc/switchyard-poc b/../../../etc/switchyard-poc
+new file mode 100644
+index 0000000..abcdef1
+--- /dev/null
++++ b/../../../etc/switchyard-poc
+@@ -0,0 +1 @@
++pwned
+`,
+				projectPath,
+			).reasonKind,
+		);
+
+		kinds.set(
+			"git internals",
+			validateDiff(
+				`diff --git a/.git/hooks/post-checkout b/.git/hooks/post-checkout
+new file mode 100755
+index 0000000..abcdef1
+--- /dev/null
++++ b/.git/hooks/post-checkout
+@@ -0,0 +1,2 @@
++#!/bin/sh
++echo pwned
+`,
+				projectPath,
+			).reasonKind,
+		);
+
+		kinds.set(
+			"credential path",
+			validateDiff(
+				buildStagedDiff(projectPath, (dir) => {
+					writeFileSync(join(dir, ".env"), "TOKEN=abc\n", "utf8");
+				}),
+				projectPath,
+			).reasonKind,
+		);
+		// Each fixture must leave the tree clean, or the next `buildStagedDiff`
+		// re-stages it and an earlier rule claims the later diff.
+		execSync("git rm --cached -q .env", { cwd: projectPath, stdio: "pipe" });
+		rmSync(join(projectPath, ".env"), { force: true });
+
+		kinds.set(
+			"symlink",
+			validateDiff(
+				buildStagedDiff(projectPath, (dir) => {
+					execSync("ln -s /etc/passwd evil-link", { cwd: dir });
+				}),
+				projectPath,
+			).reasonKind,
+		);
+		execSync("git rm --cached -q evil-link", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		rmSync(join(projectPath, "evil-link"), { force: true });
+
+		kinds.set(
+			"executable",
+			validateDiff(
+				buildStagedDiff(projectPath, (dir) => {
+					writeFileSync(
+						join(dir, "evil.sh"),
+						"#!/bin/sh\necho pwned\n",
+						"utf8",
+					);
+					execSync("chmod +x evil.sh", { cwd: dir });
+				}),
+				projectPath,
+			).reasonKind,
+		);
+
+		for (const [site, kind] of kinds) {
+			ok(
+				INTEGRATION_REFUSAL_KINDS.includes(kind),
+				`${site} produced ${JSON.stringify(kind)}, which is not a closed-enum member`,
+			);
+		}
+		strictEqual(
+			new Set(kinds.values()).size,
+			kinds.size,
+			`each site must name its own cause, got ${JSON.stringify([...kinds])}`,
+		);
+	});
+
+	it("names the manifest refusal through the gate, not just the validator", () => {
+		commitFile(projectPath, "package.json", '{"name":"x","scripts":{}}\n');
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(
+				join(dir, "package.json"),
+				'{"name":"x","scripts":{"postinstall":"curl evil"}}\n',
+				"utf8",
+			);
+		});
+
+		const result = integrationGate(diff, projectPath);
+		strictEqual(result.success, false);
+		strictEqual(result.reasonKind, "manifest_review_required");
+		ok(INTEGRATION_REFUSAL_KINDS.includes(result.reasonKind));
+	});
+
+	it("carries the refusal kind out of the gate for a structural refusal", () => {
+		const result = integrationGate("", projectPath);
+		strictEqual(result.success, false);
+		strictEqual(result.reasonKind, "empty_diff");
+	});
+
+	it("keeps every refusal kind free of paths, diff hunks, and provider text", () => {
+		// The `reason` field still interpolates a path for the operator's live
+		// console, which is why the persisted channel is `reasonKind` and not
+		// `reason`. The enum member is what crosses the persistence boundary.
+		for (const kind of INTEGRATION_REFUSAL_KINDS) {
+			ok(/^[a-z][a-z0-9_]*$/.test(kind), `${kind} must be a bare enum member`);
+			ok(!kind.includes("/"), `${kind} must carry no path separator`);
+		}
 	});
 });
 

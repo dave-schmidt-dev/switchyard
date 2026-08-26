@@ -142,6 +142,26 @@ export function cleanupDiagnosticCodeFor(cleanupStage) {
 	return CLEANUP_STAGE_DIAGNOSTIC_CODES[cleanupStage] ?? null;
 }
 
+/**
+ * Every category the reviewed integration gate may refuse a diff under.
+ *
+ * A closed enum by construction: INV-2 forbids persisting raw provider output,
+ * and these values reach `run.json`, `events.jsonl`, and the checkpoint. A
+ * member is a fixed gate-owned category, never an interpolated message, so no
+ * path, diff hunk, or provider text can ride out on this channel.
+ */
+export const INTEGRATION_REFUSAL_KINDS = Object.freeze([
+	"empty_diff",
+	"path_escapes_project_root",
+	"git_internals_touched",
+	"credential_path_touched",
+	"symlink_creation_refused",
+	"executable_file_refused",
+	"manifest_review_required",
+	"corrupt_patch",
+	"conflict",
+]);
+
 export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"auth_expired",
 	"quota_exhausted",
@@ -164,6 +184,12 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"manifest_review_required",
 	"corrupt_patch",
 	"conflict",
+	"empty_diff",
+	"path_escapes_project_root",
+	"git_internals_touched",
+	"credential_path_touched",
+	"symlink_creation_refused",
+	"executable_file_refused",
 ]);
 
 const PERSISTED_FAILURE_PHASES = new Set([
@@ -281,6 +307,30 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reason:
 			"The patch could not be applied due to conflicting workspace state.",
 	}),
+	empty_diff: Object.freeze({
+		reasonCode: "empty_diff",
+		reason: "The task produced no diff for the integration gate to review.",
+	}),
+	path_escapes_project_root: Object.freeze({
+		reasonCode: "path_escapes_project_root",
+		reason: "The task diff touches a path outside the project root.",
+	}),
+	git_internals_touched: Object.freeze({
+		reasonCode: "git_internals_touched",
+		reason: "The task diff touches Git internals under a .git directory.",
+	}),
+	credential_path_touched: Object.freeze({
+		reasonCode: "credential_path_touched",
+		reason: "The task diff touches a path matching a credential convention.",
+	}),
+	symlink_creation_refused: Object.freeze({
+		reasonCode: "symlink_creation_refused",
+		reason: "The task diff creates a symbolic link.",
+	}),
+	executable_file_refused: Object.freeze({
+		reasonCode: "executable_file_refused",
+		reason: "The task diff introduces a file with the executable bit set.",
+	}),
 	no_provider: Object.freeze({
 		reasonCode: "no_provider",
 		reason: "No eligible provider was available for this task.",
@@ -329,6 +379,12 @@ const RESULT_TO_ERROR_KIND = Object.freeze({
 	manifest_review_required: "manifest_review_required",
 	corrupt_patch: "corrupt_patch",
 	conflict: "conflict",
+	empty_diff: "empty_diff",
+	path_escapes_project_root: "path_escapes_project_root",
+	git_internals_touched: "git_internals_touched",
+	credential_path_touched: "credential_path_touched",
+	symlink_creation_refused: "symlink_creation_refused",
+	executable_file_refused: "executable_file_refused",
 	no_provider: "no_provider",
 	unsupported_provider: "unsupported_provider",
 	launch_failed: "launch_failed",
