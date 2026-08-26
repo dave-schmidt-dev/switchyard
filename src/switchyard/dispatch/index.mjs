@@ -429,9 +429,18 @@ async function runDispatch(opts, dependencies = {}) {
 	// sweep ample time to finish. The .catch prevents an unhandledRejection.
 	sweepManagedOrphans()
 		.then((swept) => {
-			if (swept.containersReclaimed > 0 || swept.volumesReclaimed > 0) {
+			// These once read `containersReclaimed`/`volumesReclaimed`, which
+			// sweepManagedOrphans stopped returning at the Docker-to-Parallels
+			// rename. `undefined > 0` is false, so the branch was unreachable
+			// and every pre-run reclamation went unreported.
+			if (swept.vmsReclaimed > 0) {
 				console.error(
-					`dispatch: pre-run sweep reclaimed ${swept.containersReclaimed} orphaned container(s), ${swept.volumesReclaimed} volume(s)`,
+					`dispatch: pre-run sweep reclaimed ${swept.vmsReclaimed} orphaned VM(s)`,
+				);
+			}
+			for (const entry of swept.unreclaimedSnapshots) {
+				console.error(
+					`dispatch: pre-run sweep left snapshots on the golden for ${entry.name} (${entry.reason}) — human review required`,
 				);
 			}
 		})
@@ -1568,8 +1577,9 @@ function recoveryExecutionBackend(dependencies = {}) {
  * pre-dispatch sweep (Piece C of the leak-recovery loop) so every dispatch
  * self-heals the previous run's leaks before creating its own workspace.
  * @param {object} [dependencies]
- * @returns {Promise<{vmsReclaimed:number, errors:string[],
- *   projectLocksReleased:number}>}
+ * @returns {Promise<{vmsReclaimed:number,
+ *   unreclaimedSnapshots:Array<{name:string, uuid:string, reason:string}>,
+ *   errors:string[], projectLocksReleased:number}>}
  */
 async function sweepManagedOrphans(dependencies = {}) {
 	const executionBackend = recoveryExecutionBackend(dependencies);
@@ -1591,6 +1601,11 @@ async function sweepManagedOrphans(dependencies = {}) {
 
 	return {
 		vmsReclaimed: result.reclaimed.length,
+		// A reclaimed VM whose sidecar was lost leaves parent snapshots on the
+		// golden that this code may never delete (see reclaim()). That residue
+		// is the one INV-3 leak the sweep cannot fix, so it has to leave the
+		// sweep as a fact rather than dying inside it.
+		unreclaimedSnapshots: result.skippedSnapshots ?? [],
 		errors: result.errors.map((e) => `${e.name}: ${e.reason}`),
 		projectLocksReleased,
 	};
@@ -1619,6 +1634,7 @@ async function handleRecover(argv, dependencies = {}) {
 
 	let reclaimedCount = 0;
 	let errors = [];
+	let unreclaimedSnapshots = [];
 	if (runId) {
 		const target = managed.find((entry) => entry.runId === runId);
 		if (target) {
@@ -1637,6 +1653,7 @@ async function handleRecover(argv, dependencies = {}) {
 		const result = reclaim({ dryRun: false });
 		reclaimedCount = result.reclaimed.length;
 		errors = result.errors.map((e) => `${e.name}: ${e.reason}`);
+		unreclaimedSnapshots = result.skippedSnapshots ?? [];
 	}
 
 	// Filesystem project locks are not VM-managed objects, so reclaim never
@@ -1648,6 +1665,7 @@ async function handleRecover(argv, dependencies = {}) {
 
 	const output = {
 		vmsReclaimed: reclaimedCount,
+		unreclaimedSnapshots,
 		errors,
 		projectLocksReleased,
 		runId: runId ?? null,

@@ -16,6 +16,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
+	readFileSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -53,6 +54,7 @@ const ROSTER_FIXTURE_PATH = resolve(
 import {
 	captureHostFingerprint,
 	runDispatch as dispatchRun,
+	handleRecover,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseLaunchArgs,
@@ -60,6 +62,7 @@ import {
 	parseResultArgs,
 	parseStatusArgs,
 	probeProviderProcess,
+	sweepManagedOrphans,
 	USAGE,
 	USAGE_LAUNCH,
 	USAGE_RECOVER,
@@ -1071,6 +1074,113 @@ describe("recover integration", () => {
 		ok(typeof output.vmsReclaimed === "number");
 		ok(Array.isArray(output.errors));
 		ok(Array.isArray(output.candidates) || output.candidates === null);
+	});
+});
+
+describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
+	// reclaim() may delete a VM and still be forbidden from deleting the parent
+	// snapshots it left on the golden, when the sidecar naming them is gone.
+	// That is the one INV-3 leak the sweep cannot repair, so both operator
+	// paths have to say so out loud rather than reporting a clean reclaim.
+	const DEAD_VM = "switchyard-work-orphan-999999";
+
+	function reclaimWithResidue() {
+		return {
+			reclaimed: [{ uuid: "u-1", name: DEAD_VM, forced: true }],
+			reclaimedSnapshots: [],
+			skipped: [],
+			skippedSnapshots: [
+				{ name: DEAD_VM, uuid: "u-1", reason: "no-snapshot-sidecar" },
+			],
+			errors: [],
+		};
+	}
+
+	it("sweepManagedOrphans reports the residue instead of dropping it", async () => {
+		const swept = await sweepManagedOrphans({
+			listManaged: () => [{ runId: "run-1", name: DEAD_VM, status: "stopped" }],
+			reclaim: reclaimWithResidue,
+			readRun: async () => {
+				throw new Error("no such run");
+			},
+		});
+
+		strictEqual(swept.vmsReclaimed, 1);
+		deepStrictEqual(swept.unreclaimedSnapshots, [
+			{ name: DEAD_VM, uuid: "u-1", reason: "no-snapshot-sidecar" },
+		]);
+	});
+
+	it("sweepManagedOrphans reports an empty residue when every sidecar was found", async () => {
+		const swept = await sweepManagedOrphans({
+			listManaged: () => [],
+			reclaim: () => ({
+				reclaimed: [],
+				reclaimedSnapshots: [],
+				skipped: [],
+				skippedSnapshots: [],
+				errors: [],
+			}),
+			readRun: async () => {
+				throw new Error("no such run");
+			},
+		});
+
+		deepStrictEqual(swept.unreclaimedSnapshots, []);
+	});
+
+	it("recover's JSON envelope names the golden's leftover snapshots", async () => {
+		const lines = [];
+		const realLog = console.log;
+		console.log = (line) => lines.push(line);
+		const priorExitCode = process.exitCode;
+		try {
+			await handleRecover([], {
+				listManaged: () => [
+					{ runId: "run-1", name: DEAD_VM, status: "stopped" },
+				],
+				reclaim: reclaimWithResidue,
+				readRun: async () => {
+					throw new Error("no such run");
+				},
+			});
+		} finally {
+			console.log = realLog;
+			process.exitCode = priorExitCode;
+		}
+
+		strictEqual(lines.length, 1);
+		const output = JSON.parse(lines[0]);
+		strictEqual(output.vmsReclaimed, 1);
+		deepStrictEqual(output.unreclaimedSnapshots, [
+			{ name: DEAD_VM, uuid: "u-1", reason: "no-snapshot-sidecar" },
+		]);
+	});
+
+	it("the pre-dispatch sweep report reads a field sweepManagedOrphans actually returns", async () => {
+		// It read `containersReclaimed`/`volumesReclaimed` after the
+		// Docker-to-Parallels rename, so `undefined > 0` made the branch
+		// unreachable and every pre-run reclamation went unreported.
+		const source = readFileSync(DISPATCH_PATH, "utf8");
+		const swept = await sweepManagedOrphans({
+			listManaged: () => [],
+			reclaim: () => ({
+				reclaimed: [],
+				reclaimedSnapshots: [],
+				skipped: [],
+				skippedSnapshots: [],
+				errors: [],
+			}),
+			readRun: async () => {
+				throw new Error("no such run");
+			},
+		});
+		for (const match of source.matchAll(/swept\.([A-Za-z]+)/g)) {
+			ok(
+				Object.hasOwn(swept, match[1]),
+				`pre-run sweep reads swept.${match[1]}, which sweepManagedOrphans does not return`,
+			);
+		}
 	});
 });
 
