@@ -4,9 +4,19 @@
 // classification and verification logic everywhere, so a regression in "which
 // CIDR does this address prove" cannot hide behind an unavailable VM.
 
-import { deepStrictEqual, match, ok, strictEqual } from "node:assert/strict";
+import {
+	deepStrictEqual,
+	match,
+	ok,
+	rejects,
+	strictEqual,
+	throws,
+} from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import net from "node:net";
+import { dirname, resolve } from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
 	C3_BLOCK_RULES,
@@ -19,7 +29,9 @@ import {
 	isC3UnprovenReason,
 	parseEndpoint,
 	parseEndpoints,
+	physicalInterfaces,
 	probeTcp,
+	resolveC3Gateway,
 } from "./helpers/c3-manifest.mjs";
 
 describe("C-3 manifest derivation", () => {
@@ -202,6 +214,93 @@ describe("C-3 manifest derivation", () => {
 		);
 		strictEqual(manifest.dropped[0].cidr, null);
 		strictEqual(manifest.dropped[0].unsound, false);
+	});
+
+	it("derives the expected gateway from the image build script, not a literal", () => {
+		const resolved = resolveC3Gateway({ env: {} });
+		// Read from the same file the image build uses, so an image built with
+		// a non-default --gateway cannot leave this helper probing an address
+		// the guest never uses.
+		const script = readFileSync(
+			resolve(
+				dirname(fileURLToPath(import.meta.url)),
+				"../ops/macos-vm/build-golden-image.sh",
+			),
+			"utf8",
+		);
+		const inScript = /^GATEWAY="([^"]+)"/m.exec(script)?.[1];
+		ok(inScript, "the build script must carry a GATEWAY default");
+		strictEqual(resolved.derived, inScript);
+		strictEqual(resolved.gateway, inScript);
+	});
+
+	it("fails loudly when the derived and configured gateways disagree", async () => {
+		// Silently preferring either one produces a verdict about a host nobody
+		// asked about, which is worse than no verdict.
+		await rejects(
+			deriveC3Manifest({
+				env: { SWITCHYARD_PARALLELS_C3_GATEWAY: "10.99.99.1" },
+			}),
+			/C-3 gateway mismatch/,
+		);
+		throws(
+			() =>
+				resolveC3Gateway({
+					env: { SWITCHYARD_PARALLELS_C3_GATEWAY: "10.99.99.1" },
+				}),
+			/C-3 gateway mismatch/,
+		);
+		// An agreeing override is not a mismatch.
+		const agreed = resolveC3Gateway({
+			env: { SWITCHYARD_PARALLELS_C3_GATEWAY: "10.211.55.1" },
+		});
+		strictEqual(agreed.gateway, "10.211.55.1");
+		// A malformed value on either side is rejected rather than probed.
+		throws(
+			() =>
+				resolveC3Gateway({
+					env: { SWITCHYARD_PARALLELS_C3_GATEWAY: "not-an-ip" },
+				}),
+			/not an IPv4 address/,
+		);
+	});
+
+	it("refuses to fall back to a literal when no gateway is available", () => {
+		throws(
+			() =>
+				resolveC3Gateway({
+					env: {},
+					buildScriptPath: "/nonexistent/build-golden-image.sh",
+				}),
+			/no C-3 gateway available/,
+		);
+	});
+
+	it("considers every enabled physical service, not only the first", () => {
+		// A host with two live NICs tested one and reported a verdict covering
+		// both. The second NIC is exactly where a self-assigned link-local
+		// address turns up, which is what Task 5.1 classifies.
+		const services = physicalInterfaces();
+		const manifestSource = readFileSync(
+			resolve(
+				dirname(fileURLToPath(import.meta.url)),
+				"helpers/c3-manifest.mjs",
+			),
+			"utf8",
+		);
+		ok(
+			!/const \[primary\] = physicalInterfaces\(\)/.test(manifestSource),
+			"candidate construction must not destructure only the first service",
+		);
+		ok(
+			/for \(const physical of physicalInterfaces\(\)\)/.test(manifestSource),
+			"candidate construction must iterate every physical service",
+		);
+		// Whatever this host has, each service must be able to contribute.
+		for (const service of services) {
+			ok(service.device, "every service must name its device");
+			ok(service.ip, "every service must carry an address");
+		}
 	});
 
 	it("will not prove a rule from a host-owned address alone", async () => {

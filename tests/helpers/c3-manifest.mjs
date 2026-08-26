@@ -11,7 +11,9 @@
 // address passes vacuously; an unverified endpoint is not evidence.
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import net from "node:net";
+import { fileURLToPath } from "node:url";
 
 // Mirrors the `block drop quick on en0` rules in the golden image's pf anchor.
 export const C3_BLOCK_RULES = [
@@ -26,7 +28,66 @@ export const C3_BLOCK_RULES = [
 
 // The Parallels shared-network gateway is explicitly PASSED for DNS and DHCP
 // above the blocks, so it can never serve as blocked-endpoint evidence.
-const C3_PASSED_GATEWAY = "10.211.55.1";
+//
+// The value is read from the image build script rather than repeated here. A
+// literal could not be cross-checked against the image's build-time
+// `--gateway`, so on an image built with a non-default gateway the
+// passed-gateway probe targeted an address the guest never uses and the
+// resulting verdict was about the wrong host.
+const BUILD_SCRIPT = fileURLToPath(
+	new URL("../../ops/macos-vm/build-golden-image.sh", import.meta.url),
+);
+
+const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+
+/**
+ * The gateway the golden image's C-3 anchor passes.
+ *
+ * @param {object} [options]
+ * @param {NodeJS.ProcessEnv} [options.env]
+ * @param {string} [options.buildScriptPath]
+ * @returns {{gateway: string, derived: string|null, configured: string|null}}
+ * @throws when the build script's default and an explicit override disagree,
+ *   or when neither yields a usable address. Preferring either one silently
+ *   would produce a verdict about a host nobody asked about.
+ */
+export function resolveC3Gateway({
+	env = process.env,
+	buildScriptPath = BUILD_SCRIPT,
+} = {}) {
+	let derived = null;
+	try {
+		derived =
+			/^GATEWAY="([^"]+)"/m.exec(readFileSync(buildScriptPath, "utf8"))?.[1] ??
+			null;
+	} catch {
+		derived = null;
+	}
+	if (derived !== null && !IPV4.test(derived)) {
+		throw new Error(
+			`the image build script's GATEWAY is not an IPv4 address: ${JSON.stringify(derived)}`,
+		);
+	}
+	const configured = env.SWITCHYARD_PARALLELS_C3_GATEWAY || null;
+	if (configured !== null && !IPV4.test(configured)) {
+		throw new Error(
+			`SWITCHYARD_PARALLELS_C3_GATEWAY is not an IPv4 address: ${JSON.stringify(configured)}`,
+		);
+	}
+	if (derived !== null && configured !== null && derived !== configured) {
+		throw new Error(
+			`C-3 gateway mismatch: the image build script says ${derived} but SWITCHYARD_PARALLELS_C3_GATEWAY says ${configured}. ` +
+				"Rebuild the image or correct the override; a verdict against either alone would be about the wrong host.",
+		);
+	}
+	const gateway = configured ?? derived;
+	if (!gateway) {
+		throw new Error(
+			`no C-3 gateway available: ${buildScriptPath} carries no GATEWAY and SWITCHYARD_PARALLELS_C3_GATEWAY is unset`,
+		);
+	}
+	return { gateway, derived, configured };
+}
 
 const GATEWAY_PROBE_PORTS = ["443", "80", "53"];
 
@@ -265,10 +326,10 @@ function listenEphemeral() {
 	});
 }
 
-function candidateEndpoints(port) {
+function candidateEndpoints(port, gateway) {
 	const candidates = [];
 	for (const adapter of parallelsAdapters()) {
-		if (adapter.ip === C3_PASSED_GATEWAY) continue;
+		if (adapter.ip === gateway) continue;
 		candidates.push({
 			role:
 				adapter.device === "bridge100"
@@ -278,20 +339,22 @@ function candidateEndpoints(port) {
 			port,
 		});
 	}
-	// Only the FIRST physical service contributes. A Mac with two live NICs on
-	// one LAN would otherwise emit several endpoints that all prove one rule.
-	const [primary] = physicalInterfaces();
-	if (primary) {
+	// Every enabled physical service, not only the first. A Mac with two live
+	// NICs previously tested one and reported a verdict covering both, and the
+	// second NIC is exactly where a self-assigned link-local address turns up.
+	// Redundancy across services is harmless: duplicates are collapsed by
+	// `seen`, and Task 5.1's classification decides what is sound.
+	for (const physical of physicalInterfaces()) {
 		candidates.push({
-			role: `host identity on the current LAN (${primary.device})`,
-			host: primary.ip,
+			role: `host identity on the current LAN (${physical.device})`,
+			host: physical.ip,
 			port,
 		});
-		if (primary.router && primary.router !== primary.ip) {
+		if (physical.router && physical.router !== physical.ip) {
 			for (const gatewayPort of GATEWAY_PROBE_PORTS) {
 				candidates.push({
-					role: `LAN gateway (${primary.device})`,
-					host: primary.router,
+					role: `LAN gateway (${physical.device})`,
+					host: physical.router,
 					port: gatewayPort,
 					gateway: true,
 				});
@@ -317,7 +380,7 @@ async function verifyBlocked(candidates, context) {
 		// legitimate evidence, so this must not be a blanket exclusion.
 		// Enforced here, not at candidate construction, so an explicit env
 		// override cannot route around it.
-		if (candidate.host === C3_PASSED_GATEWAY && candidate.port === "53") {
+		if (candidate.host === context.gateway && candidate.port === "53") {
 			dropped.push({
 				value,
 				role: candidate.role,
@@ -394,10 +457,14 @@ async function verifyBlocked(candidates, context) {
  * @param {NodeJS.ProcessEnv} [options.env] Environment carrying optional overrides.
  * @returns {Promise<{blocked: object[], dropped: object[], coverage: string[],
  *   unproven: Array<{label: string, reason: string}>, reachable: object,
- *   dnsName: string, derived: boolean,
+ *   dnsName: string, gateway: string, derivedGateway: string|null,
+ *   derived: boolean,
  *   listenerPort: string|null, close: () => Promise<void>}>}
  */
 export async function deriveC3Manifest({ env = process.env } = {}) {
+	// Resolved first: a gateway mismatch must fail before any candidate is
+	// built, not after a manifest has been half-derived against the wrong host.
+	const { gateway, derived: derivedGateway } = resolveC3Gateway({ env });
 	const dnsName = env.SWITCHYARD_PARALLELS_C3_DNS_NAME || "apple.com";
 	const reachable =
 		parseEndpoint(env.SWITCHYARD_PARALLELS_C3_REACHABLE_ENDPOINT) ??
@@ -420,14 +487,14 @@ export async function deriveC3Manifest({ env = process.env } = {}) {
 		}));
 	} else {
 		listener = await listenEphemeral();
-		candidates = candidateEndpoints(listener.port);
+		candidates = candidateEndpoints(listener.port, gateway);
 	}
 
 	let blocked;
 	let dropped;
 	try {
 		({ blocked, dropped } = await verifyBlocked(candidates, {
-			gateway: C3_PASSED_GATEWAY,
+			gateway,
 			hostAddresses: hostAddresses(),
 		}));
 	} catch (error) {
@@ -444,6 +511,8 @@ export async function deriveC3Manifest({ env = process.env } = {}) {
 		unproven,
 		reachable,
 		dnsName,
+		gateway,
+		derivedGateway,
 		derived: listener !== null,
 		listenerPort: listener?.port ?? null,
 		close: async () => {
