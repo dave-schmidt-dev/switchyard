@@ -12,7 +12,7 @@
 		"lint": "biome check .",
 		"deadcode": "knip",
 		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",
-		"validate": "npm run lint && npm run deadcode && npm run test && npm run roster:coherence",
+		"validate": "node scripts/run-validate-phases.mjs",
 		"auth": "node src/switchyard/auth/index.mjs",
 		"auth:check": "node src/switchyard/auth/index.mjs --check",
 		"auth:check:live": "node src/switchyard/auth/index.mjs --check --live",
