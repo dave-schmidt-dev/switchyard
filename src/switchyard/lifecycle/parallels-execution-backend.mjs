@@ -15,6 +15,18 @@ export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
 const DEFAULT_AQUA_TIMEOUT_MS = 30_000;
 const DEFAULT_AQUA_POLL_MS = 250;
+
+// INV-1 clone hardening. `com.parallels.copypaste` is the only Parallels GUI
+// LaunchAgent in the guest, and `prlcopypaste` is the process it starts; the
+// prltoolsd LaunchDaemon is deliberately not touched, because `prlctl exec` --
+// including every call in this file -- rides on it.
+const CLIPBOARD_AGENT_LABEL = "com.parallels.copypaste";
+const CLIPBOARD_AGENT_PROCESS = "prlcopypaste";
+// Measured on this host: prltoolsd starts at boot and the clipboard agent
+// appears about five seconds later, so the settle window has to outlast a
+// respawn rather than sampling once into the gap.
+const DEFAULT_CLIPBOARD_SETTLE_MS = 8_000;
+const DEFAULT_CLIPBOARD_POLL_MS = 1_000;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const UUID =
 	/^\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?$/i;
@@ -534,6 +546,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		aquaUid = null,
 		aquaTimeoutMs = DEFAULT_AQUA_TIMEOUT_MS,
 		aquaPollMs = DEFAULT_AQUA_POLL_MS,
+		clipboardSettleMs = DEFAULT_CLIPBOARD_SETTLE_MS,
+		clipboardPollMs = DEFAULT_CLIPBOARD_POLL_MS,
 		goldenImage = null,
 		measureLinkedCloneFn = null,
 		diskUsageFn = null,
@@ -563,6 +577,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.aquaUid = aquaUid;
 		this.aquaTimeoutMs = aquaTimeoutMs;
 		this.aquaPollMs = aquaPollMs;
+		this.clipboardSettleMs = clipboardSettleMs;
+		this.clipboardPollMs = clipboardPollMs;
 		this.goldenImage = goldenImage;
 		this.measureLinkedCloneFn = measureLinkedCloneFn;
 		this.diskUsageFn = diskUsageFn;
@@ -1418,6 +1434,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				});
 			}
 			this.boot(entry.uuid, options);
+			this._hardenClone(entry.uuid, options);
 			this._prepareWorkspace(
 				entry.uuid,
 				options.providerUser ?? this.providerUser,
@@ -1438,6 +1455,110 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			}
 			throw error;
 		}
+	}
+
+	/**
+	 * Disarm the guest clipboard agent on this clone, then prove it is gone.
+	 *
+	 * INV-1 is asserted when the golden image is built but consumed here, at
+	 * dispatch, and the two moments drifted apart: a Parallels Guest Tools
+	 * refresh inside the golden on 2026-08-21 restored the package-owned
+	 * `com.parallels.copypaste` LaunchAgent that the build had renamed away, and
+	 * every clone taken afterwards synced the host pasteboard into the guest
+	 * with nothing on this path to notice. A clone is disposable, so enforce the
+	 * posture per clone instead of inheriting it on faith.
+	 *
+	 * Enforcement here does not retire the golden-image repair or the build-time
+	 * assertion; it removes their drift from the dispatch path.
+	 *
+	 * @param {string} workspaceId Cloned VM handle
+	 * @param {{aquaUid?: string|number, clipboardSettleMs?: number,
+	 *   clipboardPollMs?: number}} [options]
+	 */
+	_hardenClone(workspaceId, options = {}) {
+		// A missing uid fails the clone rather than skipping the teardown. An
+		// unenforced clone reporting success is the exact shape this method
+		// exists to close, and it must not be reintroduced one level down.
+		const uid = validateUid(options.aquaUid ?? this.aquaUid);
+		const label = `gui/${uid}/${CLIPBOARD_AGENT_LABEL}`;
+		const settleMs = options.clipboardSettleMs ?? this.clipboardSettleMs;
+		const pollMs = options.clipboardPollMs ?? this.clipboardPollMs;
+
+		this._disarmClipboard(workspaceId, label);
+
+		// Any sighting inside the settle window fails the clone. If prltoolsd
+		// supervises the agent directly, `bootout` and `disable` cannot hold it
+		// down, and dispatch has to stop rather than quietly run in a guest that
+		// still reaches the host pasteboard.
+		const deadline = this.nowFn() + settleMs;
+		for (;;) {
+			const residue = this._clipboardResidue(workspaceId, label);
+			if (residue) {
+				throw new Error(
+					`clipboard isolation could not be enforced on ${workspaceId}: ${residue}`,
+				);
+			}
+			const remaining = deadline - this.nowFn();
+			if (remaining <= 0) return;
+			this.sleepFn(Math.min(pollMs, remaining));
+		}
+	}
+
+	/**
+	 * Unload the clipboard agent, refuse future loads, and kill any live copy.
+	 * Every step is expected to fail on a correctly repaired golden image, where
+	 * there is nothing left to unload, so failures are not escalated here --
+	 * `_clipboardResidue` is what decides the outcome.
+	 */
+	_disarmClipboard(workspaceId, label) {
+		const attempts = [
+			["/bin/launchctl", "bootout", label],
+			["/bin/launchctl", "disable", label],
+			["/usr/bin/pkill", "-f", CLIPBOARD_AGENT_PROCESS],
+		];
+		for (const argv of attempts) {
+			try {
+				this._call(["exec", workspaceId, ...argv], { timeout: 10_000 });
+			} catch {
+				// Already absent, or launchd has nothing to unload.
+			}
+		}
+	}
+
+	/**
+	 * Describe why the guest is still clipboard-capable, or null when it is not.
+	 * Both halves matter: the launchd label proves the service is registered,
+	 * the process check catches a copy that is running without it.
+	 */
+	_clipboardResidue(workspaceId, label) {
+		try {
+			this._call(["exec", workspaceId, "/bin/launchctl", "print", label], {
+				timeout: 10_000,
+			});
+			return `${label} is still loaded`;
+		} catch {
+			// Not registered in the Aqua domain, which is the wanted state.
+		}
+		try {
+			const pids = String(
+				this._call(
+					[
+						"exec",
+						workspaceId,
+						"/usr/bin/pgrep",
+						"-f",
+						CLIPBOARD_AGENT_PROCESS,
+					],
+					{ timeout: 10_000 },
+				) ?? "",
+			).trim();
+			if (pids) {
+				return `${CLIPBOARD_AGENT_PROCESS} is running (pid ${pids.split(/\s+/).join(", ")})`;
+			}
+		} catch {
+			// pgrep exits non-zero when nothing matches.
+		}
+		return null;
 	}
 
 	/** Create the isolated logical workspace before the non-admin user enters it. */

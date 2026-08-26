@@ -21,6 +21,7 @@ import {
 
 const GOLDEN_UUID = "{11111111-1111-4111-8111-111111111111}";
 const WORK_UUID = "{22222222-2222-4222-8222-222222222222}";
+const CLIPBOARD_LABEL = "gui/501/com.parallels.copypaste";
 
 /**
  * Recover the script the guest will actually run. `prlctl exec` cannot carry a
@@ -585,6 +586,13 @@ describe("Parallels execution backend lifecycle", () => {
 							: []),
 					]);
 				}
+				// A guest with the clipboard agent already gone: launchctl cannot
+				// print the label and pgrep matches nothing. `launchctl print
+				// gui/501` (Aqua readiness) still succeeds — only the copypaste
+				// label is absent.
+				if (args.includes(CLIPBOARD_LABEL) || args.includes("/usr/bin/pgrep")) {
+					throw new Error("could not find service");
+				}
 				return "ready";
 			},
 		});
@@ -593,6 +601,7 @@ describe("Parallels execution backend lifecycle", () => {
 			creatorPid: process.pid,
 			linked: false,
 			providerUser: "switchyard",
+			clipboardSettleMs: 0,
 		});
 		ok(
 			calls.some(
@@ -609,6 +618,135 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		ok(
 			calls.some((args) => args.includes("/bin/chmod") && args.includes("700")),
+		);
+	});
+
+	// INV-1 is asserted when the golden image is built but consumed at dispatch.
+	// A Guest Tools refresh inside the golden on 2026-08-21 restored the
+	// package-owned clipboard LaunchAgent the build had renamed away, and every
+	// clone taken afterwards leaked the host pasteboard with nothing on the
+	// create path to notice. These two tests lock the enforcement in place.
+	it("disarms the guest clipboard agent on every clone before the provider user enters", () => {
+		const calls = [];
+		let cloneName = null;
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			goldenImage: "macOS",
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "clone") {
+					cloneName = args[3];
+					return "";
+				}
+				if (args[0] === "list" && args[1] === "-a") {
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: "macOS" },
+						...(cloneName
+							? [{ uuid: WORK_UUID, status: "running", name: cloneName }]
+							: []),
+					]);
+				}
+				if (args.includes(CLIPBOARD_LABEL) || args.includes("/usr/bin/pgrep")) {
+					throw new Error("could not find service");
+				}
+				return "ready";
+			},
+		});
+
+		backend.create("macOS", {
+			runId: "clipboard-harden",
+			creatorPid: process.pid,
+			linked: false,
+			providerUser: "switchyard",
+			clipboardSettleMs: 0,
+		});
+
+		const guest = calls.filter((args) => args[0] === "exec");
+		for (const verb of ["bootout", "disable"]) {
+			ok(
+				guest.some(
+					(args) =>
+						args.includes("/bin/launchctl") &&
+						args.includes(verb) &&
+						args.includes(CLIPBOARD_LABEL),
+				),
+				`create() must ${verb} ${CLIPBOARD_LABEL}`,
+			);
+		}
+		ok(
+			guest.some(
+				(args) =>
+					args.includes("/usr/bin/pkill") && args.includes("prlcopypaste"),
+			),
+			"create() must kill a running clipboard agent",
+		);
+		// Proving it, not just asking for it.
+		ok(
+			guest.some(
+				(args) =>
+					args.includes("/bin/launchctl") &&
+					args.includes("print") &&
+					args.includes(CLIPBOARD_LABEL),
+			),
+			"create() must verify the clipboard label is gone",
+		);
+		// Ordering is the point: enforcement lands before the workspace the
+		// provider user is dropped into.
+		const disarmAt = guest.findIndex((args) => args.includes("bootout"));
+		const workspaceAt = guest.findIndex((args) => args.includes("/bin/mkdir"));
+		ok(
+			disarmAt >= 0 && workspaceAt > disarmAt,
+			"clipboard teardown must precede workspace preparation",
+		);
+	});
+
+	it("fails the clone when the clipboard agent survives the teardown", () => {
+		let cloneName = null;
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			goldenImage: "macOS",
+			prlctlFn: (args) => {
+				if (args[0] === "clone") {
+					cloneName = args[3];
+					return "";
+				}
+				if (args[0] === "list" && args[1] === "-a") {
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: "macOS" },
+						...(cloneName
+							? [{ uuid: WORK_UUID, status: "running", name: cloneName }]
+							: []),
+					]);
+				}
+				// The label keeps printing: prltoolsd supervises the agent and
+				// launchctl cannot hold it down. Dispatch must stop, not proceed
+				// into a guest that still reaches the host pasteboard.
+				return "ready";
+			},
+		});
+
+		throws(
+			() =>
+				backend.create("macOS", {
+					runId: "clipboard-survives",
+					creatorPid: process.pid,
+					linked: false,
+					providerUser: "switchyard",
+					clipboardSettleMs: 0,
+				}),
+			/clipboard isolation could not be enforced/,
+		);
+	});
+
+	it("refuses to harden a clone without an Aqua uid rather than skipping the teardown", () => {
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: () => "ready",
+		});
+		// Silently skipping enforcement on a missing uid would rebuild the exact
+		// "env unset -> silent green" shape this change removes.
+		throws(
+			() => backend._hardenClone(WORK_UUID, {}),
+			/aquaUid must be a positive numeric uid/,
 		);
 	});
 

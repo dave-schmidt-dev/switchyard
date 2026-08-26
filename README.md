@@ -130,6 +130,18 @@ the requested iOS runtime, disables the guest clipboard agent, and loads the
 guest-side C-3 pf anchor. It restarts before the final Aqua, transport,
 clipboard, pf, memory, and network assertions.
 
+Those assertions run when the image is *built*, but the posture is consumed when
+a clone is *dispatched*, and the two drifted apart once: a Parallels Guest Tools
+refresh inside the golden on 2026-08-21 restored the package-owned
+`com.parallels.copypaste` LaunchAgent the build had renamed away, and every clone
+taken afterwards synced the host pasteboard into the guest. A build-time check
+cannot catch post-build drift, so `create()` now enforces the clipboard teardown
+on each clone — `launchctl bootout`, `launchctl disable`, `pkill` — and then
+proves the label is unloaded and no `prlcopypaste` is running before the provider
+user is let in. A clone that stays clipboard-capable fails to create rather than
+dispatching. The golden-image repair is still owed; this removes the drift from
+the dispatch path, it does not replace the fix.
+
 It also pins XcodeGen, and asserts it by **using** it rather than by its version
 string. Two shipped images carried a Homebrew Cellar holding `bin` and nothing
 else — no `share/xcodegen/SettingPresets` — which reports the pinned version
