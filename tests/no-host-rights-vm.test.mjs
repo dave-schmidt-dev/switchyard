@@ -269,7 +269,7 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 				`C-3 blocked endpoints: ${manifest.blocked.map((endpoint) => `${endpoint.value} [${endpoint.cidr}]`).join(", ")}`,
 			);
 			progress(
-				`C-3 block rules proven: ${manifest.coverage.join(", ")}; unproven for want of a live target: ${manifest.unproven.join(", ") || "none"}`,
+				`C-3 block rules proven: ${manifest.coverage.join(", ")}; unproven: ${manifest.unproven.map((entry) => `${entry.label} (${entry.reason})`).join(", ") || "none"}`,
 			);
 			progress("running guest mount and C-3 network probes");
 			const networkScript = [

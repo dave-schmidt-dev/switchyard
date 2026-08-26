@@ -10,8 +10,10 @@ import { describe, it } from "node:test";
 
 import {
 	C3_BLOCK_RULES,
+	C3_UNPROVEN_REASONS,
 	classifyBlockedCidr,
 	deriveC3Manifest,
+	isC3UnprovenReason,
 	parseEndpoint,
 	parseEndpoints,
 	probeTcp,
@@ -189,10 +191,108 @@ describe("C-3 manifest derivation", () => {
 		await manifest.close();
 		await new Promise((resolve) => server.close(resolve));
 		strictEqual(manifest.blocked.length, 0);
+		// Not "RFC1918": C3_BLOCK_RULES also covers 169.254.0.0/16, which is
+		// link-local, so the old wording misdescribed the rule set.
 		strictEqual(
 			manifest.dropped[0].reason,
-			"not an RFC1918 address C-3 blocks",
+			"outside every CIDR range C-3 blocks",
 		);
+		strictEqual(manifest.dropped[0].cidr, null);
+		strictEqual(manifest.dropped[0].unsound, false);
+	});
+
+	it("names a distinct cause for each way a rule goes unproven", async () => {
+		// One flat label list reported three different states as one cause. A
+		// missing candidate is a coverage bug in this harness, an unreachable
+		// one is an environment condition, and an unsound one means the probe
+		// could have succeeded for a reason other than pf. The operator's next
+		// action differs in each case.
+
+		// (1) No candidate ever constructed: an override outside every blocked
+		// range contributes to no rule, so all four go unproven for want of a
+		// candidate rather than for want of a live host.
+		const server = net.createServer((socket) => socket.end());
+		await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const { port } = server.address();
+		const noCandidate = await deriveC3Manifest({
+			env: { SWITCHYARD_PARALLELS_C3_HOST_ENDPOINTS: `127.0.0.1:${port}` },
+		});
+		await noCandidate.close();
+		await new Promise((resolve) => server.close(resolve));
+		for (const entry of noCandidate.unproven) {
+			strictEqual(
+				entry.reason,
+				C3_UNPROVEN_REASONS.NO_CANDIDATE,
+				`${entry.label} should report a missing candidate`,
+			);
+		}
+
+		// (2) A candidate in a blocked range that nothing answers at. Port 1 on
+		// a documentation-range address is not listening anywhere.
+		const unreachable = await deriveC3Manifest({
+			env: { SWITCHYARD_PARALLELS_C3_HOST_ENDPOINTS: "192.168.255.254:1" },
+		});
+		await unreachable.close();
+		const unreachableEntry = unreachable.unproven.find(
+			(entry) => entry.label === "192.168.0.0/16",
+		);
+		strictEqual(
+			unreachableEntry?.reason,
+			C3_UNPROVEN_REASONS.UNREACHABLE,
+			`expected an unreachable candidate, got ${JSON.stringify(unreachable.unproven)}`,
+		);
+		// The other three ranges still had no candidate at all, and must not
+		// borrow this one's cause.
+		strictEqual(
+			unreachable.unproven.find((entry) => entry.label === "172.16.0.0/12")
+				?.reason,
+			C3_UNPROVEN_REASONS.NO_CANDIDATE,
+		);
+
+		// (3) A candidate that answers but cannot prove the rule: the C-3 anchor
+		// passes the Parallels gateway on tcp/53, so a probe there is vacuous.
+		const unsound = await deriveC3Manifest({
+			env: { SWITCHYARD_PARALLELS_C3_HOST_ENDPOINTS: "10.211.55.1:53" },
+		});
+		await unsound.close();
+		strictEqual(
+			unsound.unproven.find((entry) => entry.label === "10.0.0.0/8")?.reason,
+			C3_UNPROVEN_REASONS.UNSOUND,
+		);
+	});
+
+	it("carries the cause per rule, so a partial manifest names the range it missed", async () => {
+		const manifest = await deriveC3Manifest({
+			env: { SWITCHYARD_PARALLELS_C3_HOST_ENDPOINTS: "192.168.255.254:1" },
+		});
+		await manifest.close();
+
+		// Per rule, not per manifest: four labels, each with its own reason.
+		deepStrictEqual(
+			manifest.unproven.map((entry) => entry.label).sort(),
+			C3_BLOCK_RULES.map((rule) => rule.label).sort(),
+		);
+		const reasons = new Set(manifest.unproven.map((entry) => entry.reason));
+		ok(
+			reasons.size > 1,
+			`a manifest with mixed causes must not collapse them: ${JSON.stringify(manifest.unproven)}`,
+		);
+		for (const entry of manifest.unproven) {
+			ok(entry.label, "every entry must name its range");
+			ok(isC3UnprovenReason(entry.reason), `${entry.reason} is not a member`);
+		}
+	});
+
+	it("keeps every unproven reason inside a closed set", () => {
+		const members = Object.values(C3_UNPROVEN_REASONS);
+		strictEqual(new Set(members).size, members.length);
+		for (const member of members) {
+			ok(isC3UnprovenReason(member));
+			ok(/^[a-z][a-z0-9_]*$/.test(member), `${member} must be a bare member`);
+		}
+		for (const outsider of ["", null, undefined, "unknown", "no_candidate"]) {
+			ok(!isC3UnprovenReason(outsider), `${outsider} must not be a member`);
+		}
 	});
 
 	it("derives a manifest whose every blocked endpoint is classified, live, and distinct", async () => {
@@ -223,10 +323,21 @@ describe("C-3 manifest derivation", () => {
 				!manifest.blocked.some((endpoint) => endpoint.host === "10.211.55.1"),
 				"the DNS/DHCP-passed Parallels gateway must never be blocked evidence",
 			);
+			// Every rule is accounted for exactly once, and each unproven one
+			// names its own cause rather than sharing a single label list.
 			deepStrictEqual(
-				[...manifest.coverage, ...manifest.unproven].sort(),
+				[
+					...manifest.coverage,
+					...manifest.unproven.map((entry) => entry.label),
+				].sort(),
 				C3_BLOCK_RULES.map((rule) => rule.label).sort(),
 			);
+			for (const entry of manifest.unproven) {
+				ok(
+					isC3UnprovenReason(entry.reason),
+					`${entry.label} carried ${JSON.stringify(entry.reason)}, which is not a closed-enum member`,
+				);
+			}
 			strictEqual(manifest.reachable.value, "1.1.1.1:443");
 			strictEqual(manifest.dnsName, "apple.com");
 		} finally {

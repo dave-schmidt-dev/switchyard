@@ -30,6 +30,59 @@ const C3_PASSED_GATEWAY = "10.211.55.1";
 
 const GATEWAY_PROBE_PORTS = ["443", "80", "53"];
 
+/**
+ * Why a C-3 block rule was not proven. A flat list of labels reported three
+ * different states as one cause, and they demand different responses: a
+ * missing candidate is a coverage bug in this harness, an unreachable one is
+ * an environment condition, and an unsound one means the probe could have
+ * succeeded for a reason other than pf. A closed enum, not an interpolated
+ * message, for the same reason the integration gate's refusal kinds are.
+ */
+export const C3_UNPROVEN_REASONS = Object.freeze({
+	/** No candidate in this range was ever constructed. Harness coverage gap. */
+	NO_CANDIDATE: "no_candidate_constructed",
+	/** A candidate existed but nothing answered at it. Environment condition. */
+	UNREACHABLE: "candidate_unreachable",
+	/**
+	 * A candidate existed and answered, but could not prove the rule: the C-3
+	 * anchor passes it, or the probe never crossed the guest's network path.
+	 */
+	UNSOUND: "candidate_unsound",
+});
+
+const C3_UNPROVEN_REASON_VALUES = Object.freeze(
+	Object.values(C3_UNPROVEN_REASONS),
+);
+
+/**
+ * Assign each unproven rule its cause, most specific first.
+ *
+ * Ordering matters: a range with both an unsound candidate and an unreachable
+ * one is reported unsound, because the operator's next action is to fix the
+ * candidate rather than to wait for the host to come back.
+ * @param {string[]} coverage rule labels actually proven
+ * @param {object[]} dropped candidates that did not become evidence
+ * @returns {Array<{label: string, reason: string}>}
+ */
+function classifyUnproven(coverage, dropped) {
+	return C3_BLOCK_RULES.map((rule) => rule.label)
+		.filter((label) => !coverage.includes(label))
+		.map((label) => {
+			const forRule = dropped.filter((entry) => entry.cidr === label);
+			if (forRule.some((entry) => entry.unsound)) {
+				return { label, reason: C3_UNPROVEN_REASONS.UNSOUND };
+			}
+			if (forRule.length > 0) {
+				return { label, reason: C3_UNPROVEN_REASONS.UNREACHABLE };
+			}
+			return { label, reason: C3_UNPROVEN_REASONS.NO_CANDIDATE };
+		});
+}
+
+export function isC3UnprovenReason(value) {
+	return C3_UNPROVEN_REASON_VALUES.includes(value);
+}
+
 export function classifyBlockedCidr(ip) {
 	if (typeof ip !== "string") return null;
 	// Reject octet forms Number() would silently coerce ("", 1e1, 0x0a,
@@ -200,6 +253,8 @@ async function verifyBlocked(candidates) {
 			dropped.push({
 				value,
 				role: candidate.role,
+				cidr: classifyBlockedCidr(candidate.host),
+				unsound: true,
 				reason: "passed by C-3 on tcp/53; cannot prove a block rule",
 			});
 			continue;
@@ -209,7 +264,13 @@ async function verifyBlocked(candidates) {
 			dropped.push({
 				value,
 				role: candidate.role,
-				reason: "not an RFC1918 address C-3 blocks",
+				cidr: null,
+				unsound: false,
+				// Not "not an RFC1918 address": C3_BLOCK_RULES also covers
+				// 169.254.0.0/16, which is link-local and not RFC1918 at all, so
+				// the old wording misdescribed both what was dropped and what
+				// the anchor blocks.
+				reason: "outside every CIDR range C-3 blocks",
 			});
 			continue;
 		}
@@ -219,6 +280,8 @@ async function verifyBlocked(candidates) {
 				dropped.push({
 					value,
 					role: candidate.role,
+					cidr,
+					unsound: false,
 					reason: "unreachable from the host",
 				});
 			}
@@ -241,7 +304,8 @@ async function verifyBlocked(candidates) {
  * @param {object} [options]
  * @param {NodeJS.ProcessEnv} [options.env] Environment carrying optional overrides.
  * @returns {Promise<{blocked: object[], dropped: object[], coverage: string[],
- *   unproven: string[], reachable: object, dnsName: string, derived: boolean,
+ *   unproven: Array<{label: string, reason: string}>, reachable: object,
+ *   dnsName: string, derived: boolean,
  *   listenerPort: string|null, close: () => Promise<void>}>}
  */
 export async function deriveC3Manifest({ env = process.env } = {}) {
@@ -280,9 +344,7 @@ export async function deriveC3Manifest({ env = process.env } = {}) {
 		throw error;
 	}
 	const coverage = [...new Set(blocked.map((endpoint) => endpoint.cidr))];
-	const unproven = C3_BLOCK_RULES.map((rule) => rule.label).filter(
-		(label) => !coverage.includes(label),
-	);
+	const unproven = classifyUnproven(coverage, dropped);
 	return {
 		blocked,
 		dropped,
