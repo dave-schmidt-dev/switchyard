@@ -1762,10 +1762,15 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	/** Reclaim only exact-prefix VMs whose embedded creator PID is dead. */
 	reclaim({ dryRun = false, onStatus } = {}) {
+		// `skipped` answers one question only: which VMs were left alone. The
+		// snapshot channels are separate because a VM can be reclaimed AND have
+		// its snapshots left behind, so a single list would have to mean two
+		// contradictory things about the same entry.
 		const result = {
 			reclaimed: [],
 			reclaimedSnapshots: [],
 			skipped: [],
+			skippedSnapshots: [],
 			errors: [],
 		};
 		for (const entry of this.listManaged()) {
@@ -1797,8 +1802,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			// snapshot that predates the sidecar convention — such as
 			// switchyard-golden-26-5 — survives every path through this method.
 			if (!metadata) {
-				result.skipped.push({
-					...entry,
+				result.skippedSnapshots.push({
+					name: entry.name,
+					uuid: entry.uuid,
 					reason: "no-snapshot-sidecar",
 				});
 				onStatus?.({

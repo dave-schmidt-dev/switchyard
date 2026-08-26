@@ -1122,10 +1122,12 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 
 		strictEqual(result.reclaimed.length, 1, "the VM itself is still reclaimed");
 		deepStrictEqual(result.reclaimedSnapshots, []);
-		strictEqual(
-			result.skipped.find((s) => s.reason === "no-snapshot-sidecar")?.name,
-			deadName,
-		);
+		deepStrictEqual(result.skippedSnapshots, [
+			{ name: deadName, uuid: WORK_UUID, reason: "no-snapshot-sidecar" },
+		]);
+		// A reclaimed VM must never also appear in `skipped`: that list answers
+		// "which VMs were left alone", and this one was not.
+		deepStrictEqual(result.skipped, []);
 		ok(
 			!calls.some((args) => args[0] === "snapshot-delete"),
 			`no snapshot may be deleted: ${JSON.stringify(calls)}`,
