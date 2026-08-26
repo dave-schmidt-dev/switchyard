@@ -22,6 +22,15 @@ import {
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { deriveC3Manifest, probeTcp } from "./helpers/c3-manifest.mjs";
+import {
+	CLIPBOARD_DIRECTIONS,
+	CLIPBOARD_VERDICTS,
+	classifyHostPasteboard,
+	classifyProbeOutput,
+	guestToHostProbeScript,
+	hostToGuestProbeScript,
+	mintSentinel,
+} from "./helpers/clipboard-probe.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const PROVIDER_USER =
@@ -290,63 +299,83 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 			});
 
 			originalClipboard = execFileSync("pbpaste", [], { encoding: "utf8" });
-			progress("running the behavioral clipboard probe");
-			// A per-run unique sentinel. A fixed literal cannot distinguish a live
-			// leak from a stale value an earlier run left on the guest pasteboard,
-			// so the probe would report the same verdict for two different faults.
-			const sentinel = `switchyard-clipboard-sentinel-${randomUUID()}`;
-			execFileSync("pbcopy", [], { input: sentinel });
-			// The hardened image disables the Parallels clipboard agent, so an
-			// empty guest pasteboard may make pbpaste exit non-zero. The gate is
-			// sentinel non-visibility, matching the golden-image assertion.
-			//
-			// The probe reports its verdict on stdout and always exits 0, so a
-			// transport failure cannot masquerade as a clipboard leak. Signalling
-			// through the exit code made both surface as the same opaque
-			// `Command failed` with empty output, which is unactionable.
-			const clipboardProbe = outputText(
-				backend.execGuest(
-					vmUuid,
-					"/bin/bash",
-					[
-						"-lc",
-						`set +e
-paste="$(/usr/bin/pbpaste 2>/dev/null)"
-origin=guest
-test -e ${shellQuote(homedir())} && origin=HOST
-user="$(/usr/bin/whoami)"
-if printf %s "$paste" | /usr/bin/grep -Fq ${shellQuote(sentinel)}; then
-	verdict=sentinel-visible
-else
-	verdict=sentinel-absent
-fi
-printf 'clipboard-probe: %s origin=%s user=%s bytes=%s\\n' "$verdict" "$origin" "$user" "$(printf %s "$paste" | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
-exit 0`,
-					],
-					{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
+			progress("running the behavioral clipboard probe (both directions)");
+
+			// prlcopypaste syncs both ways. Host-to-guest is the classic INV-1
+			// concern; guest-to-host is the more serious one, because it is the
+			// direction in which a provider running in the guest could push data
+			// onto the operator's own pasteboard. Each direction gets its own
+			// per-run sentinel so one direction's value can never satisfy the
+			// other's assertion.
+			const runProbe = (script) =>
+				outputText(
+					backend.execGuest(vmUuid, "/bin/bash", ["-lc", script], {
+						cwd: "/",
+						aquaUid: AQUA_UID,
+						providerUser: PROVIDER_USER,
+					}),
+				);
+
+			// Direction 1: host -> guest.
+			const hostSentinel = mintSentinel(CLIPBOARD_DIRECTIONS.HOST_TO_GUEST);
+			execFileSync("pbcopy", [], { input: hostSentinel });
+			const hostToGuest = classifyProbeOutput(
+				runProbe(
+					hostToGuestProbeScript({
+						sentinel: hostSentinel,
+						hostHome: homedir(),
+					}),
 				),
+				{
+					direction: CLIPBOARD_DIRECTIONS.HOST_TO_GUEST,
+					providerUser: PROVIDER_USER,
+				},
 			);
-			// Read the origin first. A probe that accidentally observed the HOST
-			// pasteboard would report the sentinel byte-for-byte and be
-			// indistinguishable from a real guest leak, so separate the two.
-			//
-			// Absence of the host home is necessary but not sufficient on its own,
-			// so pair it with a positive identity: guest execution runs as the
-			// non-admin provider account, which the host session never is.
-			match(
-				clipboardProbe,
-				new RegExp(`user=${PROVIDER_USER}\\b`),
-				`clipboard probe did not run as the provider account; it reported: ${JSON.stringify(clipboardProbe.trim())}`,
+			progress(`clipboard host-to-guest: ${hostToGuest.verdict}`);
+			strictEqual(
+				hostToGuest.verdict,
+				CLIPBOARD_VERDICTS.ISOLATED,
+				`host-to-guest clipboard check did not prove isolation (${hostToGuest.verdict}); probe reported: ${hostToGuest.detail}`,
 			);
-			match(
-				clipboardProbe,
-				/origin=guest/,
-				`clipboard probe did not execute in the guest; it reported: ${JSON.stringify(clipboardProbe.trim())}`,
+
+			// Direction 2: guest -> host. The guest confirms it staged a sentinel
+			// on its own pasteboard; only then does the host's pasteboard decide
+			// the verdict. Without that confirmation, absence on the host would
+			// prove only that nothing was ever copied in the guest.
+			const guestSentinel = mintSentinel(CLIPBOARD_DIRECTIONS.GUEST_TO_HOST);
+			const guestStaged = classifyProbeOutput(
+				runProbe(
+					guestToHostProbeScript({
+						sentinel: guestSentinel,
+						hostHome: homedir(),
+					}),
+				),
+				{
+					direction: CLIPBOARD_DIRECTIONS.GUEST_TO_HOST,
+					providerUser: PROVIDER_USER,
+				},
 			);
-			match(
-				clipboardProbe,
-				/clipboard-probe: sentinel-absent/,
-				`host clipboard must not be visible in the guest; probe reported: ${JSON.stringify(clipboardProbe.trim())}`,
+			strictEqual(
+				guestStaged.verdict,
+				CLIPBOARD_VERDICTS.ISOLATED,
+				`guest-to-host clipboard probe never staged a sentinel (${guestStaged.verdict}), so the host check would prove nothing; probe reported: ${guestStaged.detail}`,
+			);
+			let hostPasteboard = null;
+			try {
+				hostPasteboard = execFileSync("pbpaste", [], { encoding: "utf8" });
+			} catch {
+				// Left null on purpose: classifyHostPasteboard reads that as a
+				// probe that did not run, which fails. A host pbpaste that cannot
+				// run must never be read as the boundary holding.
+			}
+			const guestToHost = classifyHostPasteboard(hostPasteboard, {
+				sentinel: guestSentinel,
+			});
+			progress(`clipboard guest-to-host: ${guestToHost.verdict}`);
+			strictEqual(
+				guestToHost.verdict,
+				CLIPBOARD_VERDICTS.ISOLATED,
+				`guest clipboard content must not be visible on the host (${guestToHost.verdict}); ${guestToHost.detail}`,
 			);
 		} finally {
 			if (manifest) {
