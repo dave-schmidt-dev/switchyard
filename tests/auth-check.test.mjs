@@ -17,6 +17,7 @@ import {
 	reportProviderStatus,
 	runCheck,
 	runCloneCheck,
+	withBootedGoldenImage,
 	withDisposableClone,
 	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
@@ -529,6 +530,10 @@ describe("liveness gating", () => {
 			aquaUid: "501",
 			bootGoldenImage: () => ({ uuid: "workspace" }),
 			stopGoldenImage: () => {},
+			// Required, not optional: withBootedGoldenImage treats a posture
+			// check it cannot run as a failure, so a backend that omits this
+			// fails rather than silently skipping the assertion.
+			describePostureViolations: () => [],
 		};
 		try {
 			runCheck(backend, true, [
@@ -1293,5 +1298,157 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		deepStrictEqual(parseCloneArgs(["--receipt", "/tmp/out.json", "--clone"]), {
 			receipt: "/tmp/out.json",
 		});
+	});
+});
+
+// Task 3.2. withBootedGoldenImage boots and mutates the golden image — the one
+// VM that is not disposable — and never re-read its posture on the way out, so
+// anything a body left behind survived into every clone taken afterwards. It
+// had no test reference at all before this block.
+describe("withBootedGoldenImage golden-image posture (INV-1, INV-3)", () => {
+	const makeBackend = (overrides = {}) => {
+		const calls = [];
+		return {
+			calls,
+			goldenImage: "switchyard-golden-test",
+			aquaUid: "501",
+			bootGoldenImage: () => {
+				calls.push("boot");
+				return { uuid: "golden-uuid" };
+			},
+			stopGoldenImage: (uuid) => {
+				calls.push(`stop:${uuid}`);
+			},
+			describePostureViolations: (uuid) => {
+				calls.push(`posture:${uuid}`);
+				return [];
+			},
+			...overrides,
+		};
+	};
+
+	it("checks the posture when the body succeeds, and returns the body's value", () => {
+		const backend = makeBackend();
+		const value = withBootedGoldenImage(backend, (uuid) => `ran:${uuid}`);
+		strictEqual(value, "ran:golden-uuid");
+		deepStrictEqual(backend.calls, [
+			"boot",
+			"posture:golden-uuid",
+			"stop:golden-uuid",
+		]);
+	});
+
+	it("checks the posture while the guest is still running, before it is stopped", () => {
+		const backend = makeBackend();
+		withBootedGoldenImage(backend, () => null);
+		ok(
+			backend.calls.indexOf("posture:golden-uuid") <
+				backend.calls.indexOf("stop:golden-uuid"),
+			`the posture check must run before the stop: ${backend.calls.join(", ")}`,
+		);
+	});
+
+	it("checks the posture even when the body throws", () => {
+		const backend = makeBackend();
+		throws(
+			() =>
+				withBootedGoldenImage(backend, () => {
+					throw new Error("body blew up");
+				}),
+			/body blew up/,
+		);
+		ok(
+			backend.calls.includes("posture:golden-uuid"),
+			`a thrown body must not skip the posture check: ${backend.calls.join(", ")}`,
+		);
+		ok(backend.calls.includes("stop:golden-uuid"), "the image must still stop");
+	});
+
+	it("fails when the posture is violated on exit", () => {
+		const backend = makeBackend({
+			describePostureViolations: () => [
+				"host-defined sharing is on",
+				"clipboard is still available: gui/501/com.parallels.copypaste is still loaded",
+			],
+		});
+		throws(
+			() => withBootedGoldenImage(backend, () => "fine"),
+			(error) =>
+				/violated its posture on exit/.test(error.message) &&
+				/host-defined sharing is on/.test(error.message) &&
+				/clipboard is still available/.test(error.message),
+		);
+		ok(
+			backend.calls.includes("stop:golden-uuid"),
+			"a posture violation must not strand the image running",
+		);
+	});
+
+	it("reports BOTH causes when the body failed and the posture is violated", () => {
+		// Neither may mask the other: one of two real problems would go
+		// unreported, and which one you saw would depend on ordering.
+		const backend = makeBackend({
+			describePostureViolations: () => ["host shared folders are attached"],
+		});
+		throws(
+			() =>
+				withBootedGoldenImage(backend, () => {
+					throw new Error("the auth probe itself failed");
+				}),
+			(error) => {
+				ok(
+					/the auth probe itself failed/.test(error.message),
+					`body error is missing: ${error.message}`,
+				);
+				ok(
+					/posture check ALSO failed/.test(error.message),
+					`posture error is missing: ${error.message}`,
+				);
+				ok(
+					/host shared folders are attached/.test(error.message),
+					`the specific violation is missing: ${error.message}`,
+				);
+				strictEqual(error.cause?.message, "the auth probe itself failed");
+				return true;
+			},
+		);
+	});
+
+	it("fails, rather than passes, when the posture check itself cannot run", () => {
+		// An unverifiable posture proves nothing. Reading it as clean is the
+		// same false green this check exists to close.
+		const backend = makeBackend({
+			describePostureViolations: () => {
+				throw new Error("prlctl exec timed out");
+			},
+		});
+		throws(
+			() => withBootedGoldenImage(backend, () => "fine"),
+			/posture could not be verified on exit.*prlctl exec timed out/s,
+		);
+		ok(backend.calls.includes("stop:golden-uuid"), "the image must still stop");
+	});
+
+	it("stops the image even when stopping is all that is left to fail", () => {
+		const errors = [];
+		const realError = console.error;
+		console.error = (...args) => errors.push(args.join(" "));
+		try {
+			const backend = makeBackend({
+				stopGoldenImage: () => {
+					throw new Error("stop failed");
+				},
+			});
+			strictEqual(
+				withBootedGoldenImage(backend, () => "value"),
+				"value",
+			);
+		} finally {
+			console.error = realError;
+		}
+		ok(
+			errors.some((line) => line.includes("failed to stop the golden image")),
+			`a stop failure must be reported: ${JSON.stringify(errors)}`,
+		);
 	});
 });

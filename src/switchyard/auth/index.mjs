@@ -81,7 +81,7 @@ function createExecutionBackend() {
  * @param {ParallelsExecutionBackend} executionBackend
  * @param {(workspaceId: string) => any} fn
  */
-function withBootedGoldenImage(executionBackend, fn) {
+export function withBootedGoldenImage(executionBackend, fn) {
 	if (!executionBackend.goldenImage) {
 		throw new Error(
 			"SWITCHYARD_PARALLELS_GOLDEN_IMAGE must be set to check or run provider auth",
@@ -95,17 +95,58 @@ function withBootedGoldenImage(executionBackend, fn) {
 	// Propagates as-is (e.g. assertGoldenImageAvailable()'s "owned clones
 	// exist" refusal) — nothing was started, so there is nothing to stop.
 	const booted = executionBackend.bootGoldenImage();
+	let bodyError = null;
+	let result;
 	try {
-		return fn(booted.uuid);
-	} finally {
-		try {
-			executionBackend.stopGoldenImage(booted.uuid);
-		} catch (error) {
-			console.error(
-				`warning: failed to stop the golden image after auth: ${error.message}`,
+		result = fn(booted.uuid);
+	} catch (error) {
+		bodyError = error;
+	}
+
+	// Re-assert the posture the build certifies, while the guest is still
+	// running and can be read. The golden is the one VM that is not
+	// disposable: anything this body left behind survives into every clone
+	// taken afterwards, and nothing on this path used to notice. Report only —
+	// a repair here would hide the fact that something mutated the image.
+	let postureError = null;
+	try {
+		const violations = executionBackend.describePostureViolations(booted.uuid, {
+			aquaUid: executionBackend.aquaUid,
+		});
+		if (violations.length > 0) {
+			postureError = new Error(
+				`golden image ${executionBackend.goldenImage} violated its posture on exit: ${violations.join("; ")}`,
 			);
 		}
+	} catch (error) {
+		// A check that could not run proves nothing. Treating that as a clean
+		// posture is the same false green the check exists to prevent.
+		postureError = new Error(
+			`golden image ${executionBackend.goldenImage} posture could not be verified on exit: ${error.message}`,
+		);
 	}
+
+	try {
+		executionBackend.stopGoldenImage(booted.uuid);
+	} catch (error) {
+		console.error(
+			`warning: failed to stop the golden image after auth: ${error.message}`,
+		);
+	}
+
+	// Both causes stay visible. Letting the posture failure replace the body's
+	// error — or the reverse — would leave one of two real problems unreported.
+	if (bodyError && postureError) {
+		const combined = new Error(
+			`${bodyError.message}\n\nthe golden image posture check ALSO failed: ${postureError.message}`,
+		);
+		combined.cause = bodyError;
+		combined.postureError = postureError;
+		throw combined;
+	}
+	if (bodyError) throw bodyError;
+	if (postureError) throw postureError;
+	return result;
 }
 
 /**

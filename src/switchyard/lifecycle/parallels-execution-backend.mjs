@@ -1681,6 +1681,57 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return null;
 	}
 
+	/**
+	 * Describe every way this VM currently violates the no-host-rights posture,
+	 * or an empty array when it holds. Reports; never repairs.
+	 *
+	 * The golden image is the one VM that is not disposable, and
+	 * `withBootedGoldenImage` boots and mutates it. Anything a body left behind
+	 * survives into every clone taken afterwards, so the posture the build
+	 * certifies has to be re-read on the way out rather than assumed.
+	 *
+	 * A check that cannot run throws rather than returning "clean": an
+	 * unverifiable posture proves nothing, and reporting it as held is the
+	 * failure this method exists to close.
+	 *
+	 * @param {string} uuid a RUNNING VM handle — the guest half needs to exec
+	 * @param {{aquaUid?: string|number}} [options]
+	 * @returns {string[]} human-readable violations, empty when the posture holds
+	 */
+	describePostureViolations(uuid, options = {}) {
+		const violations = [];
+		const info = String(this._call(["list", "-i", uuid], { timeout: 30_000 }));
+		// Same three host-side facts the INV-1 gate reads off `prlctl list -i`.
+		for (const [label, pattern] of [
+			["host shared folders are attached", /Host Shared Folders:\s*\(-\)/],
+			["host-defined sharing is on", /Host defined sharing:\s*Off/],
+			["the host profile is shared", /Shared Profile:\s*\(-\)/],
+		]) {
+			if (!pattern.test(info)) violations.push(label);
+		}
+
+		const mounts = String(
+			this._call(["exec", uuid, "/sbin/mount"], { timeout: 30_000 }) ?? "",
+		);
+		const hostMounts = mounts
+			.split("\n")
+			.filter((line) => /prl_fs|\bmacOS\b.*on \//.test(line));
+		if (hostMounts.length > 0) {
+			violations.push(
+				`host filesystem is mounted (${hostMounts.length} mount(s))`,
+			);
+		}
+
+		const uid = validateUid(options.aquaUid ?? this.aquaUid);
+		const residue = this._clipboardResidue(
+			uuid,
+			`gui/${uid}/${CLIPBOARD_AGENT_LABEL}`,
+		);
+		if (residue) violations.push(`clipboard is still available: ${residue}`);
+
+		return violations;
+	}
+
 	/** Create the isolated logical workspace before the non-admin user enters it. */
 	_prepareWorkspace(workspaceId, providerUser) {
 		const user = validateUser(providerUser);
