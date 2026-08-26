@@ -2293,6 +2293,43 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		);
 	});
 
+	it("publishes activeTaskId while the task is running, so the envelope stops reading idle", async () => {
+		// Live-run feedback 2026-08-04/05 (Sentinel Tasks 1.3, 1.4, 3.1): a
+		// synchronous run reported activeTaskId=null and a stale updatedAt for
+		// the whole ~14 minutes a provider was executing. activeTaskId is the
+		// gate buildStatusEnvelope uses for activeTaskProvider, activeTaskModel,
+		// activeTaskDeadline, activeTaskAgeMs, and runningCount, so the one
+		// missing write suppressed onTaskRouted's writes too. The detached path
+		// has always written it from worker-bootstrap's onTaskStart.
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+
+		let observedDuringExecution = "unobserved";
+		const exitCode = await dispatchWithStub(async (queueOptions) => {
+			queueOptions.dependencies.onTaskStart({ id: "1.1", title: "stub" });
+			const runDirs = readdirSync(join(stateRoot, "runs"));
+			for (let attempt = 0; attempt < 100; attempt += 1) {
+				const run = await readRun(runDirs[0]);
+				if (run.activeTaskId != null) {
+					observedDuringExecution = run.activeTaskId;
+					break;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			return stubResult(true);
+		});
+
+		strictEqual(exitCode, 0);
+		strictEqual(
+			observedDuringExecution,
+			"1.1",
+			"activeTaskId must be readable from the run record while the task runs",
+		);
+		// And it must be cleared on the terminal path, or every finished run
+		// would read as permanently busy.
+		const run = await onlyRunRecord();
+		strictEqual(run.activeTaskId ?? null, null);
+	});
+
 	it("releases the project lock after a normal failed-task result", async () => {
 		const { isProjectLockHeld } = await import(
 			"../src/switchyard/run-store/index.mjs"

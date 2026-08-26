@@ -557,10 +557,26 @@ async function runDispatch(opts, dependencies = {}) {
 			projectRevision: identity?.projectRevision,
 			...(runStoreReady ? { runId } : {}),
 			dependencies: {
-				onTaskStart: (task) =>
+				onTaskStart: (task) => {
 					console.error(
 						`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd(),
-					),
+					);
+					// activeTaskId is not just one datum: buildStatusEnvelope
+					// gates activeTaskProvider, activeTaskModel,
+					// activeTaskDeadline, activeTaskAgeMs, and runningCount on
+					// it being non-null. Without this write the synchronous path
+					// reported an idle run for the entire time a provider was
+					// executing, and suppressed onTaskRouted's provider/model
+					// writes along with it. The detached path has always done
+					// this in worker-bootstrap's onTaskStart; only this one was
+					// missing. Appended to eventWriteChain so it serializes
+					// against onTaskRouted, which fires microseconds later.
+					if (runStoreReady) {
+						eventWriteChain = eventWriteChain
+							.then(() => updateRunWithRetry(runId, { activeTaskId: task.id }))
+							.catch(() => {});
+					}
+				},
 				onTaskRouted: (info) => {
 					console.error(
 						`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline ?? "orchestrator"}`,
@@ -656,9 +672,22 @@ async function runDispatch(opts, dependencies = {}) {
 				// reaps succeeded && cleanupState:"complete"). Must be one call —
 				// advanceState can only carry {state}, and a second separate
 				// write would race the releaseRunLock revision bump.
+				// The active-task cluster is cleared here, not only in
+				// onTaskComplete: a runQueue that throws mid-task never reaches
+				// that callback, and the run would then reach a terminal state
+				// still claiming a task was running. Only the three descriptor
+				// fields were cleared, despite the comment above claiming
+				// parity with worker-bootstrap's terminalPatch, which clears the
+				// whole cluster. Limited to the fields this path can actually
+				// set; the snapshot telemetry is the detached path's to own.
 				await updateRunWithRetry(runId, {
 					state: anyFailed ? "failed" : "succeeded",
 					cleanupState: "complete",
+					activeTaskId: null,
+					activeTaskProvider: null,
+					activeTaskModel: null,
+					activeTaskDeadline: null,
+					resolvedTargetId: null,
 					activeTaskInvocationDescriptor: null,
 					activeTaskDescriptorIdentity: null,
 					activeTaskDescriptorHarness: null,
