@@ -498,12 +498,16 @@ if [[ ! -e /var/db/com.apple.dt.automationmode/no-auth-required ]]; then
 fi
 
 guest_log "installing guest-side clipboard and C-3 pf hardening"
+# The override database, not the plist. \`launchctl disable\` writes to
+# /var/db/com.apple.xpc.launchd/disabled.<uid>.plist, which package installers
+# never touch: they write /Library/LaunchAgents. A Guest Tools update therefore
+# restores a plist an earlier build renamed away (observed 2026-08-21) but
+# cannot re-enable a disabled label. Disable before bootout so nothing can
+# re-bootstrap the job in between.
 if [[ "\$console_uid" =~ ^[0-9]+$ && "\$console_uid" != 0 ]]; then
+  /bin/launchctl disable "gui/\$console_uid/com.parallels.copypaste" ||
+    fail_guest "could not disable the Parallels clipboard label"
   /bin/launchctl bootout "gui/\$console_uid/com.parallels.copypaste" >/dev/null 2>&1 || true
-fi
-if [[ -e /Library/LaunchAgents/com.parallels.copypaste.plist ]]; then
-  /bin/mv /Library/LaunchAgents/com.parallels.copypaste.plist \\
-    /Library/LaunchAgents/com.parallels.copypaste.plist.switchyard-disabled
 fi
 
 umask 022
@@ -694,8 +698,16 @@ uid="\$(/usr/bin/id -u "\$provider_user")"
 /bin/launchctl print "gui/\$uid" >/dev/null || fail_guest "Aqua launchd domain is absent"
 /usr/bin/automationmodetool | /usr/bin/grep -q 'DOES NOT REQUIRE user authentication' ||
   fail_guest "automation mode still requires authentication"
-/bin/test ! -e /Library/LaunchAgents/com.parallels.copypaste.plist ||
-  fail_guest "Parallels clipboard LaunchAgent is present"
+# Under \`launchctl disable\` the plist deliberately stays present, so its
+# absence is no longer the posture and the old \`test ! -e\` here would fail
+# every correctly hardened image. What must hold is that the override database
+# reports the label disabled and that the service does not resolve in the Aqua
+# domain. print-disabled renders \`"<label>" => disabled\` on this macOS
+# generation and \`=> true\` on older ones; accept either rather than pinning a
+# format launchd owns.
+/bin/launchctl print-disabled "gui/\$uid" |
+  /usr/bin/grep -Eq '"com\.parallels\.copypaste" => (disabled|true)' ||
+  fail_guest "Parallels clipboard label is not disabled in the launchd override database"
 /bin/launchctl print "gui/\$uid/com.parallels.copypaste" >/dev/null 2>&1 &&
   fail_guest "Parallels clipboard service is loaded"
 /bin/test "\$(/usr/sbin/sysctl -n hw.memsize)" = "\$expected_memory_bytes" ||
@@ -778,33 +790,114 @@ probe_reachable() {
   log "C-3 probe table passed"
 }
 
+# A sentinel that cannot collide with one an earlier build, an earlier
+# assertion, or a concurrent run left on either pasteboard. The old fixed
+# literal made a stale value and a live leak indistinguishable, so the
+# assertion could only ever prove "this string is somewhere", never "this
+# string crossed the boundary just now".
+clipboard_sentinel() {
+  local unique
+  unique="$(uuidgen 2>/dev/null || true)"
+  [[ -n "$unique" ]] || fail "uuidgen is unavailable; cannot mint a fresh clipboard sentinel"
+  printf 'switchyard-clipboard-%s-%s' "$$" "$unique"
+}
+
+# Both directions, and a probe that reports rather than signals.
+#
+# The old assertion signalled through an exit code, which cannot distinguish a
+# probe that ran and found isolation from one that never ran at all: a missing
+# pbpaste, a dead Tools channel, or a typo all exited non-zero and were read as
+# "isolated". Every probe here prints a verdict line on stdout and exits 0, so
+# the absence of that line is itself the failure. log() writes to stderr, so
+# stdout stays clean for the verdict.
+#
+# Guest-to-host is asserted too, and is the more serious breach: prlcopypaste
+# syncs both ways, and that is the direction in which a provider running in the
+# guest could push data onto the operator's own pasteboard.
 assert_clipboard_isolation() {
-  local sentinel='switchyard-clipboard-sentinel'
-  local original_clipboard=''
-  local probe_status=0
-  log "asserting clipboard isolation with a fresh host sentinel"
+  local host_sentinel guest_sentinel original_clipboard verdict host_view status
+  host_sentinel="$(clipboard_sentinel)"
+  guest_sentinel="$(clipboard_sentinel)"
+  log "asserting clipboard isolation in both directions with fresh sentinels"
   original_clipboard="$(pbpaste 2>/dev/null || true)"
-  printf '%s' "$sentinel" | pbcopy
-  if guest_exec_script <<EOF
+
+  # Direction 1: host -> guest. Copy on the host, read the provider's Aqua
+  # pasteboard in the guest.
+  printf '%s' "$host_sentinel" | pbcopy
+  verdict="$(guest_exec_script <<EOF
 set +e
 uid="\$(/usr/bin/id -u "$PROVIDER_USER")"
-/usr/bin/perl -e 'alarm 10; exec @ARGV' /bin/launchctl asuser "\$uid" \
-  /usr/bin/sudo -u "$PROVIDER_USER" /usr/bin/pbpaste 2>/dev/null |
-  /usr/bin/grep -Fq "$sentinel"
+if [[ -z "\$uid" ]]; then
+  printf 'clipboard-probe: direction=host-to-guest verdict=probe-failed reason=no-provider-uid\n'
+  exit 0
+fi
+seen="\$(/usr/bin/perl -e 'alarm 10; exec @ARGV' /bin/launchctl asuser "\$uid" \
+  /usr/bin/sudo -u "$PROVIDER_USER" /usr/bin/pbpaste 2>/dev/null)"
 status=\$?
-if ((status == 0)); then
-  exit 1
+if ((status != 0)); then
+  printf 'clipboard-probe: direction=host-to-guest verdict=probe-failed reason=pbpaste-status-%s\n' "\$status"
+  exit 0
+fi
+if [[ "\$seen" == *"$host_sentinel"* ]]; then
+  printf 'clipboard-probe: direction=host-to-guest origin=guest verdict=sentinel-visible bytes=%s\n' "\${#seen}"
+else
+  printf 'clipboard-probe: direction=host-to-guest origin=guest verdict=sentinel-absent bytes=%s\n' "\${#seen}"
 fi
 exit 0
 EOF
-  then
-    :
-  else
-    probe_status=1
-  fi
+)" || true
   printf '%s' "$original_clipboard" | pbcopy
-  ((probe_status == 0)) || fail "host clipboard sentinel reached guest"
-  log "clipboard sentinel was not visible in guest"
+  case "$verdict" in
+    *"direction=host-to-guest origin=guest verdict=sentinel-absent"*)
+      log "host sentinel was not visible in the guest" ;;
+    *"verdict=sentinel-visible"*)
+      fail "host clipboard sentinel reached the guest: $verdict" ;;
+    *)
+      fail "host-to-guest clipboard probe did not run: ${verdict:-no verdict line}" ;;
+  esac
+
+  # Direction 2: guest -> host. The guest must confirm it actually copied,
+  # otherwise the sentinel's absence on the host proves only that nothing was
+  # ever put on the guest pasteboard.
+  verdict="$(guest_exec_script <<EOF
+set +e
+uid="\$(/usr/bin/id -u "$PROVIDER_USER")"
+if [[ -z "\$uid" ]]; then
+  printf 'clipboard-probe: direction=guest-to-host verdict=probe-failed reason=no-provider-uid\n'
+  exit 0
+fi
+/usr/bin/perl -e 'alarm 10; exec @ARGV' /bin/launchctl asuser "\$uid" \
+  /usr/bin/sudo -u "$PROVIDER_USER" /bin/bash -c "printf '%s' '$guest_sentinel' | /usr/bin/pbcopy" 2>/dev/null
+status=\$?
+if ((status != 0)); then
+  printf 'clipboard-probe: direction=guest-to-host verdict=probe-failed reason=pbcopy-status-%s\n' "\$status"
+  exit 0
+fi
+back="\$(/usr/bin/perl -e 'alarm 10; exec @ARGV' /bin/launchctl asuser "\$uid" \
+  /usr/bin/sudo -u "$PROVIDER_USER" /usr/bin/pbpaste 2>/dev/null)"
+if [[ "\$back" != *"$guest_sentinel"* ]]; then
+  printf 'clipboard-probe: direction=guest-to-host verdict=probe-failed reason=guest-copy-not-readable\n'
+  exit 0
+fi
+printf 'clipboard-probe: direction=guest-to-host origin=guest verdict=copied bytes=%s\n' "\${#back}"
+exit 0
+EOF
+)" || true
+  case "$verdict" in
+    *"direction=guest-to-host origin=guest verdict=copied"*) ;;
+    *)
+      printf '%s' "$original_clipboard" | pbcopy
+      fail "guest-to-host clipboard probe did not run: ${verdict:-no verdict line}" ;;
+  esac
+  host_view="$(pbpaste 2>/dev/null)"
+  status=$?
+  printf '%s' "$original_clipboard" | pbcopy
+  ((status == 0)) || fail "host pbpaste failed; the guest-to-host direction was never checked"
+  case "$host_view" in
+    *"$guest_sentinel"*)
+      fail "guest clipboard sentinel reached the host pasteboard" ;;
+  esac
+  log "guest sentinel was not visible on the host"
 }
 
 main() {
