@@ -40,6 +40,7 @@ import {
 	isRunLockExpired,
 	LockError,
 	RevisionError,
+	readEvents,
 	readRun,
 	releaseLaunchLock,
 	releaseOrphanedProjectLocks,
@@ -735,7 +736,17 @@ describe("retention", () => {
 		deepStrictEqual(readdirSync(artifactsDir), []);
 		const run = await readRun(opts.runId);
 		strictEqual(run.state, "failed");
-		ok(existsSync(join(getRunRoot(opts.runId), "events.jsonl")));
+
+		// The point of the rule is a readable post-mortem, so assert the
+		// failure event survives intact rather than that the file exists:
+		// a truncated or sanitized-to-nothing events.jsonl would still pass
+		// an existence check while leaving the diagnostic worthless.
+		const events = await readEvents(opts.runId);
+		const failure = events.find((e) => e.event === "task_failed");
+		ok(failure, `task_failed missing from events: ${JSON.stringify(events)}`);
+		strictEqual(failure.taskId, "1.1");
+		strictEqual(failure.status, "Task 1.1 failed: execution_timed_out");
+		strictEqual(failure.phase, "execution");
 	});
 
 	it("does not touch a run still referenced by a live checkpoint", async () => {
