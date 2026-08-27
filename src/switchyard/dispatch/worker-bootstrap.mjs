@@ -4,6 +4,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { unlinkSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	CLEANUP_STAGES,
@@ -162,11 +163,13 @@ async function writeFatalEvent(
 }
 
 process.on("uncaughtException", (error) => {
+	console.error(error?.stack ?? String(error));
 	writeFatalEvent(error, "worker_boot_exception").then(() => process.exit(1));
 });
 
 process.on("unhandledRejection", (reason) => {
 	const error = reason instanceof Error ? reason : new Error(String(reason));
+	console.error(error?.stack ?? String(error));
 	writeFatalEvent(error, "worker_boot_exception").then(() => process.exit(1));
 });
 
@@ -266,6 +269,12 @@ try {
 	// launch() and worker startup; fail closed before claiming the run lease or
 	// creating a working container. The launch record remains recoverable.
 	assertGenerationAllowed();
+
+	try {
+		unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
+	} catch {
+		// ignore every error
+	}
 
 	const pid = process.pid;
 	const startToken = randomUUID();

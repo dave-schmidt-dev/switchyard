@@ -5,6 +5,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	renameSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -1939,22 +1940,30 @@ async function quarantineDirectory(name) {
  * Whether a run directory holds a diagnostic record.
  *
  * Retention splits the store by what a file IS, not by what state its run
- * reached. `run.json` and `events.jsonl` are the diagnostic record — the two
- * files a post-mortem actually reads — and are retained with no expiry.
- * Everything else is either derivable or, in the case of `artifacts/`, raw
- * provider output that INV-2 says must not persist.
+ * reached. `run.json`, `events.jsonl`, and a non-empty `boot-stderr.log` are
+ * the diagnostic record — the files a post-mortem actually reads — and are
+ * retained with no expiry. Everything else is either derivable or, in the case
+ * of `artifacts/`, raw provider output that INV-2 says must not persist.
  *
- * A directory with no `events.jsonl` never recorded a single event, so there
- * is nothing to post-mortem: `run.json` alone attests that a run was
- * initialized and reached some state, which the directory's absence attests
- * just as well. Measured on 2026-08-26, 60 of 159 directories were in that
- * shape and every one of them carried `processedTasks: 0`, so no completed
- * work is reachable by this rule.
+ * A directory with neither `events.jsonl` nor a non-empty `boot-stderr.log`
+ * recorded no events and captured no boot failure, so there is nothing to
+ * post-mortem: `run.json` alone attests that a run was initialized and reached
+ * some state, which the directory's absence attests just as well. Measured on
+ * 2026-08-26, 60 of 159 directories were in that shape and every one of them
+ * carried `processedTasks: 0`, so no completed work is reachable by this rule.
  *
  * @param {string} runId
  */
 function hasDiagnosticRecord(runId) {
-	return existsSync(resolve(getRunRoot(runId), "events.jsonl"));
+	if (existsSync(resolve(getRunRoot(runId), "events.jsonl"))) {
+		return true;
+	}
+	try {
+		const stat = statSync(resolve(getRunRoot(runId), "boot-stderr.log"));
+		return stat.size > 0;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -2062,11 +2071,11 @@ async function collectArtifacts(runId, dryRun) {
  *      Nothing reads them back — listArtifactRefs hashes the file NAME into
  *      an opaque ref and never opens the file — so they are raw provider
  *      output persisted without a consumer, which is what INV-2 forbids.
- *   3. A run directory with no `events.jsonl` holds no diagnostic record
- *      (see hasDiagnosticRecord) and is removed entirely, whatever its
- *      state. maxAgeDays/maxRuns bound THIS removal and nothing else, which
- *      is also what keeps a mid-flight run — run.json written, first event
- *      not yet appended — out of reach of the same sweep.
+ *   3. A run directory with no diagnostic record (see hasDiagnosticRecord)
+ *      is removed entirely, whatever its state. maxAgeDays/maxRuns bound THIS
+ *      removal and nothing else, which is also what keeps a mid-flight run —
+ *      run.json written, first event not yet appended — out of reach of the
+ *      same sweep.
  *
  * A run whose checkpoint still exists on disk is exempt from both 2 and 3:
  * a resume would read it.

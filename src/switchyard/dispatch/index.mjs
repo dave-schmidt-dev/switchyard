@@ -32,7 +32,13 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	openSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
 import { readdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -876,22 +882,44 @@ async function handleLaunch(argv) {
 	await advanceState(runId, "launching");
 
 	const bootstrapPath = resolveBootstrapPath();
-	const child = spawn(
-		process.execPath,
-		[
-			bootstrapPath,
-			"--state-root",
-			stateRoot,
-			"--run-id",
-			runId,
-			"--nonce",
-			nonce,
-		],
-		{
-			detached: true,
-			stdio: "ignore",
-		},
-	);
+	let bootFd = null;
+	try {
+		bootFd = openSync(
+			resolve(getRunRoot(runId), "boot-stderr.log"),
+			"w",
+			0o600,
+		);
+	} catch {
+		// A diagnostics file must never be able to fail a launch
+	}
+
+	let child;
+	try {
+		child = spawn(
+			process.execPath,
+			[
+				bootstrapPath,
+				"--state-root",
+				stateRoot,
+				"--run-id",
+				runId,
+				"--nonce",
+				nonce,
+			],
+			{
+				detached: true,
+				stdio: bootFd !== null ? ["ignore", "ignore", bootFd] : "ignore",
+			},
+		);
+	} finally {
+		if (bootFd !== null) {
+			try {
+				closeSync(bootFd);
+			} catch {
+				// Parent copy close is best effort
+			}
+		}
+	}
 	child.unref();
 
 	let spawnError = null;
@@ -1777,7 +1805,11 @@ async function main(argv) {
 	}
 }
 
-if (import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+if (
+	process.argv[1] &&
+	existsSync(process.argv[1]) &&
+	import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+) {
 	try {
 		await main(process.argv.slice(2));
 	} catch (error) {
