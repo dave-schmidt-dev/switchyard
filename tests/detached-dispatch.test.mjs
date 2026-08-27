@@ -1341,7 +1341,7 @@ describe("recover releases stale project locks", {
 
 describe("non-matching nonce", () => {
 	it("bootstrap with wrong nonce exits 3 and records worker_boot_failed", async () => {
-		const { initializeRun } = await import(
+		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 
@@ -1376,22 +1376,42 @@ describe("non-matching nonce", () => {
 			`expected exit 3 for nonce mismatch, got ${result.status}: ${result.stderr}`,
 		);
 
-		const { readEvents } = await import(
-			"../src/switchyard/run-store/index.mjs"
-		);
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
 		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
 		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.errorKind, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_nonce_mismatch");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
+		strictEqual(bootFailed.reasonCode, "launch_failed");
+		strictEqual(
+			bootFailed.reason,
+			"The headless provider job could not be launched.",
+		);
 		strictEqual(bootFailed.error, undefined);
 		ok(!JSON.stringify(bootFailed).includes("wrong-nonce-value"));
 		ok(!JSON.stringify(bootFailed).includes("nonce mismatch"));
 		ok(!JSON.stringify(bootFailed).includes(projectDir));
+
+		const run = await readRun(runId);
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_nonce_mismatch");
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+		strictEqual(run.lastFailure.reasonCode, "launch_failed");
+		strictEqual(
+			run.lastFailure.reason,
+			"The headless provider job could not be launched.",
+		);
+		ok(!JSON.stringify(run.lastFailure).includes("wrong-nonce-value"));
+		ok(!JSON.stringify(run.lastFailure).includes("nonce mismatch"));
+		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
 	});
 
 	it("bootstrap with a secret-canary-bearing nonce redacts it from the persisted worker_boot_failed event", async () => {
-		const { initializeRun } = await import(
+		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 
@@ -1426,20 +1446,241 @@ describe("non-matching nonce", () => {
 			`expected exit 3 for nonce mismatch, got ${result.status}: ${result.stderr}`,
 		);
 
-		const { readEvents } = await import(
-			"../src/switchyard/run-store/index.mjs"
-		);
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.errorKind, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_nonce_mismatch");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
 		strictEqual(bootFailed.error, undefined);
 		assertNoSecretCanary(runId);
+
+		const run = await readRun(runId);
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_nonce_mismatch");
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+	});
+
+	it("bootstrap with unsupported dispatch contract version exits 5 and records worker_contract_unsupported", async () => {
+		const { initializeRun, readEvents, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		const nonce = "test-nonce-contract";
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		const current = await readRun(runId);
+		await updateRun(runId, { dispatchContractVersion: 2 }, current.revision);
+
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(
+			result.status,
+			5,
+			`expected exit 5 for contract version mismatch, got ${result.status}: ${result.stderr}`,
+		);
+
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.errorKind, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_contract_unsupported");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
+		strictEqual(bootFailed.reasonCode, "launch_failed");
+		strictEqual(
+			bootFailed.reason,
+			"The headless provider job could not be launched.",
+		);
+		strictEqual(bootFailed.error, undefined);
+		ok(
+			!JSON.stringify(bootFailed).includes(
+				"unsupported dispatch descriptor contract version",
+			),
+		);
+		ok(!JSON.stringify(bootFailed).includes(projectDir));
+
+		const run = await readRun(runId);
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_contract_unsupported");
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+		strictEqual(run.lastFailure.reasonCode, "launch_failed");
+		strictEqual(
+			run.lastFailure.reason,
+			"The headless provider job could not be launched.",
+		);
+		ok(
+			!JSON.stringify(run.lastFailure).includes(
+				"unsupported dispatch descriptor contract version",
+			),
+		);
+		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
+	});
+
+	it("bootstrap with host fingerprint mismatch exits 4 and records worker_fingerprint_mismatch", async () => {
+		const { initializeRun, readEvents, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const fpProjectDir = join(dir, "fp-mismatch-project");
+		mkdirSync(fpProjectDir, { recursive: true });
+		execSync("git init", { cwd: fpProjectDir, stdio: "ignore" });
+		execSync("git config user.email test@test.com", {
+			cwd: fpProjectDir,
+			stdio: "ignore",
+		});
+		execSync("git config user.name test", {
+			cwd: fpProjectDir,
+			stdio: "ignore",
+		});
+		execSync("git commit --allow-empty -m initial", {
+			cwd: fpProjectDir,
+			stdio: "ignore",
+		});
+
+		const runId = randomUUID();
+		const nonce = "test-nonce-fp";
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: fpProjectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint:
+				"git:0123456789abcdef0123456789abcdef01234567:clean",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(
+			result.status,
+			4,
+			`expected exit 4 for fingerprint mismatch, got ${result.status}: ${result.stderr}`,
+		);
+
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.errorKind, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_fingerprint_mismatch");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
+		strictEqual(bootFailed.reasonCode, "launch_failed");
+		strictEqual(
+			bootFailed.reason,
+			"The headless provider job could not be launched.",
+		);
+		strictEqual(bootFailed.error, undefined);
+		ok(!JSON.stringify(bootFailed).includes("host fingerprint mismatch"));
+		ok(!JSON.stringify(bootFailed).includes(fpProjectDir));
+
+		const run = await readRun(runId);
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_fingerprint_mismatch");
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+		strictEqual(run.lastFailure.reasonCode, "launch_failed");
+		strictEqual(
+			run.lastFailure.reason,
+			"The headless provider job could not be launched.",
+		);
+		ok(!JSON.stringify(run.lastFailure).includes("host fingerprint mismatch"));
+		ok(!JSON.stringify(run.lastFailure).includes(fpProjectDir));
+	});
+
+	it("bootstrap with uncaught boot exception persists worker_boot_exception via readRun", async () => {
+		const { initializeRun, readEvents, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		const nonce = "test-nonce-exception";
+
+		await initializeRun({
+			runId,
+			tasksFilePath: join(dir, "non-existent-tasks.md"),
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(
+			result.status,
+			1,
+			`expected exit 1 for uncaught exception, got ${result.status}: ${result.stderr}`,
+		);
+
+		const events = await readEvents(runId);
+		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
+		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.errorKind, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_boot_exception");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
+		strictEqual(bootFailed.reasonCode, "launch_failed");
+		strictEqual(
+			bootFailed.reason,
+			"The headless provider job could not be launched.",
+		);
+		strictEqual(bootFailed.error, undefined);
+		ok(!JSON.stringify(bootFailed).includes("non-existent-tasks.md"));
+		ok(!JSON.stringify(bootFailed).includes(projectDir));
+
+		const run = await readRun(runId);
+		strictEqual(run.state, "failed");
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_boot_exception");
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+		strictEqual(run.lastFailure.reasonCode, "launch_failed");
+		strictEqual(
+			run.lastFailure.reason,
+			"The headless provider job could not be launched.",
+		);
+		ok(!JSON.stringify(run.lastFailure).includes("non-existent-tasks.md"));
+		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
 	});
 });
 
 describe("checkpoint identity failures on detached worker path (Task 1.3)", () => {
 	it("bootstrap with run-options mismatch emits checkpoint_run_options_mismatch", async () => {
-		const { initializeRun, readEvents } = await import(
+		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 		const { normalizeRunOptions, createQueueIdentity, loadTaskQueue } =
@@ -1509,16 +1750,31 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
 		strictEqual(bootFailed.status, "checkpoint_run_options_mismatch");
+		strictEqual(bootFailed.errorKind, "launch_failed");
 		strictEqual(bootFailed.reasonCode, "checkpoint_run_options_mismatch");
 		strictEqual(bootFailed.diagnosticCode, "checkpoint_run_options_mismatch");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
 		ok(bootFailed.reason.includes("normalized run options changed"));
 		strictEqual(bootFailed.error, undefined);
 		ok(!JSON.stringify(bootFailed).includes(projectDir));
+
+		const run = await readRun(runId);
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.reasonCode, "launch_failed");
+		strictEqual(
+			run.lastFailure.reason,
+			"The headless provider job could not be launched.",
+		);
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
 	});
 
 	it("five checkpoint identity regressions emit distinct static codes on the worker-fatal path", async () => {
-		const { initializeRun, readEvents } = await import(
+		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 		const { normalizeRunOptions, createQueueIdentity, loadTaskQueue } =
@@ -1655,9 +1911,24 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 			const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 			ok(bootFailed, `${testCase.name}: worker_boot_failed event recorded`);
 			strictEqual(
+				bootFailed.phase,
+				"worker",
+				`${testCase.name} phase mismatch`,
+			);
+			strictEqual(
+				bootFailed.event,
+				"worker_boot_failed",
+				`${testCase.name} event mismatch`,
+			);
+			strictEqual(
 				bootFailed.status,
 				testCase.expectedCode,
 				`${testCase.name} status code mismatch`,
+			);
+			strictEqual(
+				bootFailed.errorKind,
+				"launch_failed",
+				`${testCase.name} errorKind mismatch`,
 			);
 			strictEqual(
 				bootFailed.reasonCode,
@@ -1670,6 +1941,11 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 				`${testCase.name} diagnosticCode mismatch`,
 			);
 			strictEqual(
+				bootFailed.failurePhase,
+				"worker_boot",
+				`${testCase.name} failurePhase mismatch`,
+			);
+			strictEqual(
 				bootFailed.error,
 				undefined,
 				`${testCase.name} should not have raw error object`,
@@ -1679,6 +1955,16 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 				`${testCase.name} should not leak host paths`,
 			);
 			observedCodes.add(testCase.expectedCode);
+
+			const run = await readRun(runId);
+			ok(
+				run.lastFailure !== null,
+				`${testCase.name}: lastFailure populated in run.json`,
+			);
+			strictEqual(run.lastFailure.errorKind, "launch_failed");
+			strictEqual(run.lastFailure.reasonCode, "launch_failed");
+			strictEqual(run.lastFailure.failurePhase, "worker_boot");
+			ok(!JSON.stringify(run.lastFailure).includes(projectDir));
 		}
 
 		strictEqual(observedCodes.size, 5, "five distinct static codes emitted");
@@ -1687,7 +1973,7 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 
 describe("fast/failed bootstrap", () => {
 	it("bootstrap that fails to import the runner records worker_boot_failed and does not hang", async () => {
-		const { initializeRun } = await import(
+		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 
@@ -1709,7 +1995,6 @@ describe("fast/failed bootstrap", () => {
 		writeFileSync(
 			brokenBootstrapPath,
 			`process.env.SWITCHYARD_RUN_STORE_ROOT = ${JSON.stringify(stateRoot)};
-process.env.SWITCHYARD_RUN_STORE_ROOT = process.env.SWITCHYARD_RUN_STORE_ROOT;
 import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs")}").then(async (runStore) => {
 	await runStore.advanceState("${runId}", "running");
 	throw new Error("simulated import failure: module not found");
@@ -1719,7 +2004,9 @@ import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"
 			phase: "worker",
 			event: "worker_boot_failed",
 			status: "fatal",
-			detail: err.message ?? "import failed",
+			errorKind: "launch_failed",
+			diagnosticCode: "worker_boot_exception",
+			failurePhase: "worker_boot",
 		});
 	} catch {}
 	process.exit(1);
@@ -1727,9 +2014,6 @@ import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"
 `,
 			"utf8",
 		);
-
-		// Set the run's workerNonce to the correct value so the broken
-		// bootstrap can proceed past nonce check (it doesn't validate)
 
 		const start = Date.now();
 		const result = spawnSync(process.execPath, [brokenBootstrapPath], {
@@ -1747,12 +2031,33 @@ import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"
 		);
 		ok(elapsed < 10_000, `broken bootstrap hung: ${elapsed}ms`);
 
-		const { readEvents } = await import(
-			"../src/switchyard/run-store/index.mjs"
-		);
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
 		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.phase, "worker");
+		strictEqual(bootFailed.event, "worker_boot_failed");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.errorKind, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_boot_exception");
+		strictEqual(bootFailed.failurePhase, "worker_boot");
+		strictEqual(bootFailed.reasonCode, "launch_failed");
+		strictEqual(
+			bootFailed.reason,
+			"The headless provider job could not be launched.",
+		);
+		strictEqual(bootFailed.error, undefined);
+		ok(!JSON.stringify(bootFailed).includes("simulated import failure"));
+
+		const run = await readRun(runId);
+		ok(run.lastFailure !== null, "lastFailure populated in run.json");
+		strictEqual(run.lastFailure.errorKind, "launch_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_boot_exception");
+		strictEqual(run.lastFailure.failurePhase, "worker_boot");
+		strictEqual(run.lastFailure.reasonCode, "launch_failed");
+		strictEqual(
+			run.lastFailure.reason,
+			"The headless provider job could not be launched.",
+		);
 	});
 });
 

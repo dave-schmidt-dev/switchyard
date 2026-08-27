@@ -1146,6 +1146,7 @@ export async function createEvent(runId, event) {
 	const isFailureEvent =
 		event?.event === "task_failed" ||
 		event?.event === "queue_halted" ||
+		event?.event === "worker_boot_failed" ||
 		event?.errorKind !== undefined ||
 		(event?.result !== undefined && !SUCCESS_RESULTS.has(event.result));
 	const suppliedFailure =
@@ -1208,6 +1209,9 @@ export async function createEvent(runId, event) {
 	entry.status = event.status;
 
 	if (safeFailure) {
+		const existingReasonCode = entry.reasonCode;
+		const existingReason = entry.reason;
+		const existingDiagnosticCode = entry.diagnosticCode;
 		delete entry.error;
 		delete entry.output;
 		delete entry.partialDiff;
@@ -1219,6 +1223,15 @@ export async function createEvent(runId, event) {
 		delete entry.signal;
 		delete entry.failurePhase;
 		Object.assign(entry, safeFailure);
+		if (
+			event?.event === "worker_boot_failed" &&
+			existingReasonCode &&
+			existingReasonCode !== "launch_failed"
+		) {
+			entry.reasonCode = existingReasonCode;
+			if (existingReason) entry.reason = existingReason;
+			if (existingDiagnosticCode) entry.diagnosticCode = existingDiagnosticCode;
+		}
 	}
 
 	await appendFile(eventsPath, `${JSON.stringify(entry)}\n`, {
@@ -1226,7 +1239,14 @@ export async function createEvent(runId, event) {
 	});
 
 	try {
-		await updateRun(runId, { lastEventSequence: nextSeq }, current.revision);
+		await updateRun(
+			runId,
+			{
+				lastEventSequence: nextSeq,
+				...(safeFailure ? { lastFailure: safeFailure } : {}),
+			},
+			current.revision,
+		);
 	} catch (e) {
 		if (!(e instanceof RevisionError)) throw e;
 		current = await readRun(runId);
@@ -1234,7 +1254,10 @@ export async function createEvent(runId, event) {
 			try {
 				await updateRun(
 					runId,
-					{ lastEventSequence: nextSeq },
+					{
+						lastEventSequence: nextSeq,
+						...(safeFailure ? { lastFailure: safeFailure } : {}),
+					},
 					current.revision,
 				);
 			} catch {

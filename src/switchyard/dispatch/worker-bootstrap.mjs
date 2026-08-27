@@ -127,7 +127,10 @@ function isRecognizedCheckpointIdentityError(error) {
 	return false;
 }
 
-async function writeFatalEvent(error) {
+async function writeFatalEvent(
+	error,
+	diagnosticCode = "worker_boot_exception",
+) {
 	try {
 		const runStore = await import("../run-store/index.mjs");
 		const diagnostics = new Diagnostics();
@@ -137,15 +140,20 @@ async function writeFatalEvent(error) {
 				phase: "worker",
 				event: "worker_boot_failed",
 				status: error.code ?? "checkpoint_identity_mismatch",
+				errorKind: "launch_failed",
 				reasonCode: error.code ?? "checkpoint_identity_mismatch",
 				diagnosticCode: error.code ?? "checkpoint_identity_mismatch",
 				reason: error.reason ?? error.remedy ?? "checkpoint identity mismatch",
+				failurePhase: "worker_boot",
 			});
 		} else {
 			await diagnostics.emit({
 				phase: "worker",
 				event: "worker_boot_failed",
 				status: "fatal",
+				errorKind: "launch_failed",
+				diagnosticCode,
+				failurePhase: "worker_boot",
 			});
 		}
 	} catch {
@@ -154,12 +162,12 @@ async function writeFatalEvent(error) {
 }
 
 process.on("uncaughtException", (error) => {
-	writeFatalEvent(error).then(() => process.exit(1));
+	writeFatalEvent(error, "worker_boot_exception").then(() => process.exit(1));
 });
 
 process.on("unhandledRejection", (reason) => {
 	const error = reason instanceof Error ? reason : new Error(String(reason));
-	writeFatalEvent(error).then(() => process.exit(1));
+	writeFatalEvent(error, "worker_boot_exception").then(() => process.exit(1));
 });
 
 function captureCurrentFingerprint(projectPath) {
@@ -222,6 +230,7 @@ try {
 			new Error(
 				`nonce mismatch: bootstrap received "${nonce}", run.json has "${run.workerNonce}"`,
 			),
+			"worker_nonce_mismatch",
 		);
 		process.exit(3);
 	}
@@ -233,6 +242,7 @@ try {
 			new Error(
 				`unsupported dispatch descriptor contract version: ${run.dispatchContractVersion}`,
 			),
+			"worker_contract_unsupported",
 		);
 		process.exit(5);
 	}
@@ -247,6 +257,7 @@ try {
 			new Error(
 				`host fingerprint mismatch: initial="${run.initialHostFingerprint}", current="${currentFingerprint}"`,
 			),
+			"worker_fingerprint_mismatch",
 		);
 		process.exit(4);
 	}
@@ -614,7 +625,7 @@ try {
 	try {
 		await runStore.releaseProjectLock(run.projectPath);
 	} catch (lockError) {
-		await writeFatalEvent(lockError);
+		await writeFatalEvent(lockError, "worker_boot_exception");
 	}
 } catch (error) {
 	// Same reasoning as the terminal-write drain above: a crash can land here
@@ -623,7 +634,7 @@ try {
 	// updateRun below from losing a revision race to that straggler.
 	// writeChain always resolves, so this is safe even before it's ever used.
 	await writeChain;
-	await writeFatalEvent(error);
+	await writeFatalEvent(error, "worker_boot_exception");
 	try {
 		const runStore = await import("../run-store/index.mjs");
 		const current = await runStore.readRun(runId);

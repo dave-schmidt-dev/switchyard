@@ -203,6 +203,10 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"credential_path_touched",
 	"symlink_creation_refused",
 	"executable_file_refused",
+	"worker_nonce_mismatch",
+	"worker_fingerprint_mismatch",
+	"worker_contract_unsupported",
+	"worker_boot_exception",
 ]);
 
 const PERSISTED_FAILURE_PHASES = new Set([
@@ -210,6 +214,7 @@ const PERSISTED_FAILURE_PHASES = new Set([
 	"provider_execution",
 	"provider_cleanup",
 	"terminal_reconciliation",
+	"worker_boot",
 ]);
 /** Signal names that may be persisted; anything else is dropped. */
 export const PERSISTED_SIGNALS = new Set([
