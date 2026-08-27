@@ -570,16 +570,41 @@ function defaultOrchestratorDependencies(overrides = {}) {
 	};
 }
 
-async function waitForStoreRecord(storeRoot, taskId) {
-	for (let attempts = 0; attempts < 50; attempts += 1) {
-		const entries = await readLedgerFromStore(storeRoot);
-		const record = entries.find((entry) => entry.taskId === taskId);
-		if (record) return record;
-		await new Promise((resolve) => setImmediate(resolve));
+/**
+ * Poll `check` until it returns a truthy value or `timeoutMs` elapses, then
+ * return whatever the last attempt produced.
+ *
+ * A `setImmediate` loop bounded by an attempt count is not a wait: the event
+ * loop can burn 50 turns in well under a millisecond, so under the loaded
+ * parallel test phase a pending write has not necessarily landed by the final
+ * attempt. That is a load-sensitive false failure, not a real ordering bug —
+ * observed 2026-08-27 as `["1.1"]` vs `["1.1", "1.2"]` in a pre-push gate that
+ * passed on every isolated rerun. Bound on elapsed time instead, and return
+ * the last value rather than throwing so callers keep their own assertion
+ * diffs.
+ */
+async function waitFor(check, timeoutMs = 5000) {
+	const deadline = Date.now() + timeoutMs;
+	let value = await check();
+	while (!value && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		value = await check();
 	}
-	throw new Error(
-		`timed out waiting for project-local ledger record ${taskId}`,
+	return value;
+}
+
+async function waitForStoreRecord(storeRoot, taskId) {
+	const record = await waitFor(async () =>
+		(await readLedgerFromStore(storeRoot)).find(
+			(entry) => entry.taskId === taskId,
+		),
 	);
+	if (!record) {
+		throw new Error(
+			`timed out waiting for project-local ledger record ${taskId}`,
+		);
+	}
+	return record;
 }
 
 function assertMatchingLedgerRecords(legacyRecord, storeRecord) {
@@ -683,12 +708,10 @@ describe("default runner ledger wiring", () => {
 				fixture.storeRoot,
 				fixture.taskId,
 			);
-			let legacyRecord;
-			for (let attempts = 0; attempts < 50; attempts += 1) {
-				legacyRecord = readLedger().at(-1);
-				if (legacyRecord?.taskId === fixture.taskId) break;
-				await new Promise((resolve) => setImmediate(resolve));
-			}
+			const legacyRecord = await waitFor(() => {
+				const last = readLedger().at(-1);
+				return last?.taskId === fixture.taskId ? last : undefined;
+			});
 			assertMatchingLedgerRecords(legacyRecord, storeRecord);
 		} finally {
 			restoreLedgerPaths();
@@ -764,22 +787,20 @@ describe("default runner ledger wiring", () => {
 			strictEqual(result.results.length, 2);
 
 			releaseFirst();
-			let storeRecords = [];
-			for (let attempts = 0; attempts < 50; attempts += 1) {
-				storeRecords = await readLedgerFromStore(fixture.storeRoot);
-				if (storeRecords.length === 2) break;
-				await new Promise((resolve) => setImmediate(resolve));
-			}
+			const storeRecords =
+				(await waitFor(async () => {
+					const entries = await readLedgerFromStore(fixture.storeRoot);
+					return entries.length === 2 ? entries : undefined;
+				})) ?? (await readLedgerFromStore(fixture.storeRoot));
 			deepStrictEqual(
 				storeRecords.map((record) => record.taskId),
 				["1.1", "1.2"],
 			);
-			let legacyRecords = [];
-			for (let attempts = 0; attempts < 50; attempts += 1) {
-				legacyRecords = readLedger();
-				if (legacyRecords.length === 2) break;
-				await new Promise((resolve) => setImmediate(resolve));
-			}
+			const legacyRecords =
+				(await waitFor(() => {
+					const entries = readLedger();
+					return entries.length === 2 ? entries : undefined;
+				})) ?? readLedger();
 			deepStrictEqual(
 				legacyRecords.map((record) => record.taskId),
 				["1.1", "1.2"],
@@ -1058,13 +1079,7 @@ describe("default runner ledger wiring", () => {
 			});
 			strictEqual(result.results[0].result, "success_no_diff");
 
-			for (
-				let attempts = 0;
-				attempts < 50 && warnings.length === 0;
-				attempts += 1
-			) {
-				await new Promise((resolve) => setImmediate(resolve));
-			}
+			await waitFor(() => warnings.length > 0);
 			strictEqual(warnings.length, 1);
 			ok(
 				warnings[0].startsWith(
