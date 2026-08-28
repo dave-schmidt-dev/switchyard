@@ -149,6 +149,20 @@ async function inspectPrerequisites() {
 	}
 	if (!(await loadSlotPrimitive()))
 		return "shared VM-slot primitive is unavailable";
+	// A live dispatch owning a working clone is transient capacity, not a broken
+	// environment, so it skips the way "both VM slots are held" already does
+	// rather than failing. Without this the gate threw
+	// `refusing golden image ...: owned clones exist` out of
+	// assertGoldenImageAvailable, which rejects an unrelated `git push` for the
+	// whole duration of any concurrent run. This mirrors the identical check
+	// workspace-wipe-vm.test.mjs already makes.
+	try {
+		if (new ParallelsExecutionBackend().listManaged().length > 0) {
+			return "a Switchyard working VM is active";
+		}
+	} catch {
+		return "Parallels VM inventory is unavailable";
+	}
 	// The C-3 manifest is deliberately absent from this ladder. It is derived
 	// inside the gate and asserted there, so a derivation gap fails loudly
 	// instead of reporting green through a skip.
@@ -204,6 +218,17 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 				goldenImage: GOLDEN_IMAGE,
 				providerUser: PROVIDER_USER,
 			});
+			// Re-check under the lease: the prerequisite ladder above runs once
+			// at module load, so a dispatch that starts between then and here
+			// would still hit assertGoldenImageAvailable's hard refusal. That is
+			// the race that rejected a push on 2026-08-27.
+			const owned = backend.listManaged();
+			if (owned.length > 0) {
+				testContext.skip(
+					`VM gate skipped: a Switchyard working VM is active (${owned.map((entry) => entry.name).join(", ")})`,
+				);
+				return;
+			}
 			backend.assertGoldenImageAvailable(GOLDEN_IMAGE);
 			const runId = `inv1-${process.pid}-${randomUUID()}`;
 			vmName = buildParallelsWorkingName(runId, process.pid);
