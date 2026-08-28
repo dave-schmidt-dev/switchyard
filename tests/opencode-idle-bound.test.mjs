@@ -10,6 +10,7 @@ import {
 	OPENCODE_SUPERVISOR,
 } from "../src/switchyard/adapter/opencode.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { dockerAvailable } from "./helpers/docker.mjs";
 
 // Regression coverage for the container-side idle bound. `opencode run` starts
 // an in-process local server and never exits (anomalyco/opencode#17516), and
@@ -17,16 +18,6 @@ import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs
 // cannot shorten the wait from outside. These tests stand in a stub that
 // reproduces exactly that shape: emit output, then never exit.
 
-function hasDocker() {
-	try {
-		execSync("docker info", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-opencode-idle-"));
 const realPsPath = execSync("command -v ps", { encoding: "utf8" }).trim();
 const containerName = `switchyard-opencode-idle-${Date.now()}`;

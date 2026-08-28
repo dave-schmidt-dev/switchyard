@@ -12,19 +12,10 @@ import {
 } from "../src/switchyard/adapter/agy.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { dockerAvailable } from "./helpers/docker.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
-function hasDocker() {
-	try {
-		execSync("docker info", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-agy-adapter-"));
 const containerName = `switchyard-agy-adapter-${Date.now()}`;
 

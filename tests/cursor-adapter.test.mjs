@@ -9,17 +9,8 @@ import {
 	executeCursor,
 } from "../src/switchyard/adapter/cursor.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { dockerAvailable } from "./helpers/docker.mjs";
 
-function hasDocker() {
-	try {
-		execSync("docker info", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-cursor-adapter-"));
 const containerName = `switchyard-cursor-adapter-${Date.now()}`;
 

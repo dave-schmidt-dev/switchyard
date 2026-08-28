@@ -10,18 +10,8 @@ import {
 	isCodexAuthenticated,
 } from "../src/switchyard/adapter/codex.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { dockerAvailable } from "./helpers/docker.mjs";
 import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
-
-function hasDocker() {
-	try {
-		execSync("docker info", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
 
 // getWorkspaceExecution (provider-lifecycle.mjs) now requires an
 // executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND

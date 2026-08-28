@@ -9,17 +9,8 @@ import {
 	executeClaude,
 } from "../src/switchyard/adapter/claude.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { dockerAvailable } from "./helpers/docker.mjs";
 
-function hasDocker() {
-	try {
-		execSync("docker info", { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-const dockerAvailable = hasDocker();
 const testRoot = mkdtempSync(join(tmpdir(), "switchyard-claude-adapter-"));
 const containerName = `switchyard-claude-adapter-${Date.now()}`;
 
