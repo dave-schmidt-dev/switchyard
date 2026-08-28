@@ -258,6 +258,17 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				aquaUid: AQUA_UID,
 				goldenImage: GOLDEN_IMAGE,
 			});
+			// Re-check under the lease: the prerequisite ladder above runs once
+			// at module load, so a dispatch that starts between then and here
+			// would still hit assertGoldenImageAvailable's hard refusal. That is
+			// the race that rejected a push on 2026-08-27.
+			const owned = backend.listManaged();
+			if (owned.length > 0) {
+				testContext.skip(
+					`VM gate skipped: a Switchyard working VM is active (${owned.map((entry) => entry.name).join(", ")})`,
+				);
+				return;
+			}
 			backend.assertGoldenImageAvailable(GOLDEN_IMAGE);
 			vmUuid = backend.create(GOLDEN_IMAGE, {
 				runId,
