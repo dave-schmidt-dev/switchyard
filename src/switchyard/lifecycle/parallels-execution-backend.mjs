@@ -20,7 +20,16 @@ import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
-const DEFAULT_AQUA_TIMEOUT_MS = 30_000;
+// A cold macOS guest has to reach a logged-in Aqua session before
+// `launchctl print gui/<uid>` answers, and 30s was inside the noise band of
+// how long that actually takes: the INV-3 gate's whole create-boot-destroy
+// leg measured 51s on an idle 18-core host, and the 30s budget produced two
+// observed `not ready within 30000ms` failures that each passed on rerun --
+// one of them at a load average of 4.3 with 81% CPU idle, so this was never
+// host contention. waitForAqua returns the instant the probe succeeds, so a
+// larger budget costs nothing on the happy path; it only slows how fast a
+// genuinely unbootable guest is reported.
+const DEFAULT_AQUA_TIMEOUT_MS = 120_000;
 const DEFAULT_AQUA_POLL_MS = 250;
 
 // INV-1 clone hardening. `com.parallels.copypaste` is the only Parallels GUI
