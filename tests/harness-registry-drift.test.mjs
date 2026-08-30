@@ -21,9 +21,8 @@
 // switchyard-dispatch targets from ~/.agent/roster.json.
 //   - Catalog-only entries (`claude-fable-5`, `kimi-k2.7-code`) are never
 //     targets at all -- nothing to iterate.
-//   - `vibe` is a disabled native-harness target until a real vibe.mjs adapter
-//     and its fixed credential transport are installed. Disabled targets are
-//     documented explicitly but are not admitted to dispatch.
+//   - `vibe` is admitted only with its live adapter and exact descriptor-level
+//     full-clone/write-canary qualification.
 //   - `pi` is not a switchyard-dispatch target (review-wrapper only,
 //     decision #6) and has no roster.json target entry to iterate.
 //
@@ -148,18 +147,24 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	it("vibe is a disabled native-harness target pending its adapter", () => {
+	it("vibe is enabled only with its exact VM clone and write-canary qualification", () => {
 		ok("vibe" in targets, "expected a vibe target entry");
-		strictEqual(targets.vibe?.enabled, false);
+		strictEqual(targets.vibe?.enabled, true);
 		strictEqual(targets.vibe?.harness, "vibe");
 		strictEqual(targets.vibe?.snapshot_name, "Vibe");
 		strictEqual(targets.vibe?.technical_ceiling, "standard");
 		deepStrictEqual(targets.vibe?.slots?.standard, [
 			{ model_ref: "mistral/zai-glm-5-2", priority: 1 },
 		]);
+		const identity =
+			"sha256:fcb8dc17218516f69e8609d61f768106ab301727e2e65af76b0da4285f0895b1";
 		strictEqual(
-			targets.vibe?.qualifications?.["mistral/zai-glm-5-2"]?.status,
-			"untested",
+			targets.vibe?.qualifications?.[identity]?.status,
+			"dispatch_qualified",
+		);
+		strictEqual(
+			targets.vibe?.qualifications?.[identity]?.promotion_receipt?.status,
+			"promoted",
 		);
 	});
 

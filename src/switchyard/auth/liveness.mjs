@@ -61,7 +61,7 @@ const OPENCODE_PROBE_VARIANT =
 	process.env.SWITCHYARD_OPENCODE_PROBE_VARIANT ?? "";
 
 /**
- * @typedef {{args: string[], cwd?: string, stdin?: boolean}} ProbeSpec
+ * @typedef {{args: string[], cwd?: string, stdin?: boolean, env?: string[]}} ProbeSpec
  * @type {Readonly<Record<string, (prompt: string) => ProbeSpec>>}
  */
 export const LIVENESS_PROBES = Object.freeze({
@@ -99,6 +99,26 @@ export const LIVENESS_PROBES = Object.freeze({
 		args.push("--model", OPENCODE_PROBE_MODEL, prompt);
 		return { args, cwd: "/tmp" };
 	},
+	vibe: (prompt) => ({
+		args: [
+			"vibe",
+			"-p",
+			prompt,
+			"--max-turns",
+			"1",
+			"--max-tokens",
+			"64",
+			"--output",
+			"text",
+			"--agent",
+			"ask",
+			"--trust",
+			"--disabled-tools",
+			"*",
+		],
+		cwd: "/tmp",
+		env: ["VIBE_ACTIVE_MODEL=glm-5.2"],
+	}),
 });
 
 // Built rather than written as a literal: the pattern starts with ESC, and a
@@ -181,6 +201,7 @@ export function probeLiveness(name, options = {}) {
 			: executionBackend
 					.execGuest(workspaceId, spec.args[0], spec.args.slice(1), {
 						cwd: spec.cwd,
+						env: spec.env,
 						prlctlOptions: {
 							input: spec.stdin ? LIVENESS_PROMPT : undefined,
 							timeout: timeoutMs,

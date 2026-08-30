@@ -22,14 +22,17 @@ IFS=$'\n\t'
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Sources of record: docker/Dockerfile installs these same six CLIs from these
-# same refs. A change there is a change here.
+# Sources of record for the pinned provider CLIs. A ref change here changes the
+# golden-image installer contract.
 readonly CLAUDE_URL="https://claude.ai/install.sh"
 readonly CODEX_URL="https://chatgpt.com/codex/install.sh"
 readonly AGY_URL="https://antigravity.google/cli/install.sh"
 readonly CURSOR_URL="https://cursor.com/install"
 readonly COPILOT_PACKAGE="@github/copilot"
 readonly OPENCODE_PACKAGE="opencode-ai"
+readonly VIBE_FORMULA="mistral-vibe"
+readonly VIBE_VERSION="2.24.5"
+readonly VIBE_SOURCE_URL="https://files.pythonhosted.org/packages/a9/53/30c20ad3726fbb7876d8aaf92a86cd0ebaa5eb84a0e3e2f1a899057ff4c2/mistral_vibe-2.24.5.tar.gz"
 
 OUT_PATH="${SCRIPT_DIR}/cli-manifest.txt"
 COPILOT_VERSION=""
@@ -56,7 +59,7 @@ Usage: generate-cli-manifest.sh [--out PATH]
                                 [--copilot-version VERSION]
                                 [--opencode-version VERSION]
 
-Writes the six-row CLI manifest. npm versions default to whatever the registry
+Writes the seven-row CLI manifest. npm versions default to whatever the registry
 currently publishes as `latest`; pin them explicitly to reproduce an older
 manifest. Use --out - to write to stdout instead of a file.
 USAGE
@@ -176,6 +179,14 @@ npm_row() {
   printf '%s|npm|%s|%s|%s\n' "$provider" "$package" "$version" "$packed_hash"
 }
 
+brew_row() {
+  local provider="$1" formula="$2" version="$3" url="$4"
+  local source="${WORK_DIR}/${provider}.source"
+  fetch_installer "$url" "$source"
+  log "${provider}: ${formula}@${version} source verified"
+  printf '%s|brew|%s|%s|%s\n' "$provider" "$formula" "$version" "$(sha256_of "$source")"
+}
+
 emit_manifest() {
   cat <<'HEADER'
 # CLI manifest for ops/macos-vm/build-golden-image.sh --cli-manifest
@@ -203,6 +214,7 @@ HEADER
   script_row cursor-agent "$CURSOR_URL" bash
   npm_row copilot "$COPILOT_PACKAGE" "$COPILOT_VERSION"
   npm_row opencode "$OPENCODE_PACKAGE" "$OPENCODE_VERSION"
+  brew_row vibe "$VIBE_FORMULA" "$VIBE_VERSION" "$VIBE_SOURCE_URL"
 }
 
 main() {

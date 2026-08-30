@@ -188,12 +188,16 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
  * Providers whose golden-image-baked auth has been proven, by a real
  * clone-survival test, to persist through cloning: log in once in the
  * golden image, clone it, and confirm the clone is still authenticated with
- * no fresh login. `codex` is verified this way. OpenCode Go is separately
+ * no fresh login. `codex` and Vibe are verified this way. OpenCode Go is separately
  * qualified via its fixed BWS API-key bridge, which injects no persistent
  * credential into the golden image or clone. The macOS queue admits either
  * evidence class but keeps every other provider fail-closed.
  */
-const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze(["codex", "opencode-go"]);
+const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
+	"codex",
+	"opencode-go",
+	"vibe",
+]);
 
 /**
  * Golden-image verification is normally recorded at the adapter/harness

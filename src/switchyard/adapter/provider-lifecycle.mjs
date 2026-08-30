@@ -36,7 +36,7 @@ const DEFAULT_DIAGNOSTIC_CHARS = 800;
  */
 export function getWorkspaceExecution(
 	workspaceId,
-	{ executionBackend, cwd = "/project", argv, recordPid = true } = {},
+	{ executionBackend, cwd = "/project", argv, recordPid = true, env } = {},
 ) {
 	if (!executionBackend) {
 		throw new TypeError(
@@ -47,6 +47,7 @@ export function getWorkspaceExecution(
 		cwd,
 		argv,
 		recordPid,
+		env,
 	});
 	return { command: execution.command, args: [...execution.args] };
 }

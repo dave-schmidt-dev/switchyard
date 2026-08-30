@@ -184,6 +184,10 @@ validate_cli_manifest() {
         [[ "$detail" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
           fail "CLI manifest npm version is unsafe: $provider"
         ;;
+      vibe:brew)
+        [[ "$ref" == mistral-vibe ]] || fail "CLI manifest brew formula is unsafe: $provider"
+        [[ "$detail" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] || fail "CLI manifest brew version is unsafe: $provider"
+        ;;
       *)
         fail "unsupported CLI manifest provider/kind: $provider/$kind"
         ;;
@@ -193,7 +197,7 @@ validate_cli_manifest() {
   done < "$CLI_MANIFEST"
 
   local expected
-  for expected in claude codex agy cursor-agent copilot opencode; do
+  for expected in claude codex agy cursor-agent copilot opencode vibe; do
     [[ " $seen " == *" $expected "* ]] ||
       fail "CLI manifest is missing provider: $expected"
   done
@@ -620,6 +624,19 @@ install_npm_cli() {
   fi
 }
 
+install_brew_cli() {
+  local provider="\$1" formula="\$2" version="\$3" expected="\$4"
+  local source="\$tmp_dir/\$provider-source" url
+  url="\$(/opt/homebrew/bin/brew info --json=v2 "\$formula" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["formulae"][0]["urls"]["stable"]["url"])')"
+  /usr/bin/curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "\$source" "\$url"
+  printf '%s  %s\\n' "\$expected" "\$source" | /usr/bin/shasum -a 256 -c - >/dev/null
+  /opt/homebrew/bin/brew install "\$formula" >/dev/null
+  /opt/homebrew/bin/vibe --version | /usr/bin/grep -Fq "\$version" || {
+    printf '[guest] ERROR: %s did not install expected version %s\\n' "\$provider" "\$version" >&2
+    exit 1
+  }
+}
+
 while IFS='|' read -r provider kind ref detail expected extra; do
   [[ -z "\${provider:-}" || "\$provider" == \#* ]] && continue
   [[ -z "\${extra:-}" && "\$expected" =~ ^[0-9a-fA-F]{64}$ ]] || {
@@ -629,10 +646,11 @@ while IFS='|' read -r provider kind ref detail expected extra; do
   case "\$kind" in
     script) install_script_cli "\$provider" "\$ref" "\$detail" "\$expected" ;;
     npm) install_npm_cli "\$provider" "\$ref" "\$detail" "\$expected" ;;
+    brew) install_brew_cli "\$provider" "\$ref" "\$detail" "\$expected" ;;
     *) printf '[guest] ERROR: unsupported pinned CLI kind: %s\\n' "\$kind" >&2; exit 1 ;;
   esac
 done < "\$manifest_path"
-for provider in claude codex agy cursor-agent copilot opencode; do
+for provider in claude codex agy cursor-agent copilot opencode vibe; do
   command -v "\$provider" >/dev/null 2>&1 || {
     printf '[guest] ERROR: pinned CLI is absent after installation: %s\\n' "\$provider" >&2
     exit 1
@@ -733,9 +751,9 @@ first_block_line="\$(printf '%s\\n' "\$loaded_rules" |
 # Resolve every pinned CLI through a *fresh* provider login that exports no
 # PATH of its own, using the same \`sudo -u ... /bin/bash -lc\` identity the
 # execution backend's Aqua route uses. This is the assertion the installer's
-# in-heredoc check cannot make, and without it the image ships with six CLIs
+# in-heredoc check cannot make, and without it the image ships with seven CLIs
 # that are present on disk and unreachable by name.
-for provider in claude codex agy cursor-agent copilot opencode; do
+for provider in claude codex agy cursor-agent copilot opencode vibe; do
   /bin/launchctl asuser "\$uid" /usr/bin/sudo -u "\$provider_user" /bin/bash -lc \\
     "command -v \$provider" >/dev/null 2>&1 ||
     fail_guest "pinned CLI is not on the provider login PATH: \$provider"

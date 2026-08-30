@@ -63,8 +63,8 @@ const MANIFEST = resolve(VM_OPS, "cli-manifest.txt");
 const IS_DARWIN = process.platform === "darwin";
 const notDarwin = { skip: IS_DARWIN ? false : "macOS-only ops lane" };
 
-// The build script requires exactly these six, and install_guest_tools asserts
-// all six are on PATH afterwards.
+// The build script requires exactly these providers, and install_guest_tools
+// asserts all are on PATH afterwards.
 const REQUIRED_PROVIDERS = [
 	"claude",
 	"codex",
@@ -72,6 +72,7 @@ const REQUIRED_PROVIDERS = [
 	"cursor-agent",
 	"copilot",
 	"opencode",
+	"vibe",
 ];
 
 // The pinned install ref for each provider — the manifest's own record of
@@ -84,6 +85,7 @@ const EXPECTED_REFS = {
 	"cursor-agent": "https://cursor.com/install",
 	copilot: "@github/copilot",
 	opencode: "opencode-ai",
+	vibe: "mistral-vibe",
 };
 
 const readManifestRows = () =>
@@ -538,7 +540,7 @@ describe("the pinned CLI manifest", () => {
 		ok(r.stdout.includes("MANIFEST OK"));
 	});
 
-	it("covers exactly the six providers the build asserts on PATH", () => {
+	it("covers exactly the providers the build asserts on PATH", () => {
 		const rows = readManifestRows();
 		strictEqual(rows.length, REQUIRED_PROVIDERS.length);
 		const providers = rows.map((row) => row.provider).sort();
@@ -559,7 +561,7 @@ describe("the pinned CLI manifest", () => {
 		for (const row of readManifestRows()) {
 			strictEqual(row.rest.length, 0, `trailing field: ${row.line}`);
 			ok(/^[0-9a-f]{64}$/.test(row.hash), `not a sha256: ${row.line}`);
-			if (row.kind === "npm") {
+			if (row.kind === "npm" || row.kind === "brew") {
 				// The npm rows are the only version-pinned ones; the script refs
 				// are unversioned endpoints held in place by the hash alone.
 				ok(

@@ -53,6 +53,12 @@ import {
 	execute as executeOpencode,
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
+import {
+	captureDiff as captureVibeDiff,
+	captureDiffAsync as captureVibeDiffAsync,
+	execute as executeVibe,
+	executeAsync as executeVibeAsync,
+} from "../adapter/vibe.mjs";
 import { createBroker } from "../broker/index.mjs";
 import { integrationGate } from "../integrate/index.mjs";
 import {
@@ -4943,6 +4949,12 @@ const DEFAULT_ADAPTERS = {
 		executeAsync: executeOpencodeAsync,
 		captureDiff: captureOpencodeDiff,
 		captureDiffAsync: captureOpencodeDiffAsync,
+	},
+	vibe: {
+		execute: executeVibe,
+		executeAsync: executeVibeAsync,
+		captureDiff: captureVibeDiff,
+		captureDiffAsync: captureVibeDiffAsync,
 	},
 };
 

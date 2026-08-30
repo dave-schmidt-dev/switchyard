@@ -22,3 +22,4 @@ agy|script|https://antigravity.google/cli/install.sh|bash|ee1ea43ce4e9e56356c4ab
 cursor-agent|script|https://cursor.com/install|bash|b1af27b9556c5f1c58d166742dbb33425ebd90a4bbd7e5453d66b920bf1f9f6b
 copilot|npm|@github/copilot|1.0.80|799457937f8f87de6fdc95599380de5f5a0f761ab2fdfbba7f8d1c82d2988892
 opencode|npm|opencode-ai|1.18.18|3e76f908fc945e26c0f305462755c4bee37ee52c221ccb02df6bb2bcbcbe3071
+vibe|brew|mistral-vibe|2.24.5|2f5e315e6d50a0647200d9e9aa99c55342f9a3e4d12f02c0d277ce8bba4e153e

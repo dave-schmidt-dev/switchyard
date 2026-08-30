@@ -8,7 +8,7 @@
 //                              probeable provider (BWS lanes are unprobed)
 //   node src/switchyard/auth/index.mjs --clone [--receipt <path>]
 //                             read-only clone qualification: creates one
-//                             disposable linked clone, probes every OAuth
+//                             disposable full clone, probes every OAuth
 //                             provider inside it with presence + live check,
 //                             reports BWS lanes as unprobed, emits progress to
 //                             stderr, outputs a terminal summary to stdout,
@@ -54,6 +54,7 @@ import { isClaudeAuthenticated } from "../adapter/claude.mjs";
 import { isCodexAuthenticated } from "../adapter/codex.mjs";
 import { isCopilotAuthenticated } from "../adapter/copilot.mjs";
 import { isCursorAuthenticated } from "../adapter/cursor.mjs";
+import { isVibeAuthenticated } from "../adapter/vibe.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { probeLiveness } from "./liveness.mjs";
 
@@ -150,7 +151,7 @@ export function withBootedGoldenImage(executionBackend, fn) {
 }
 
 /**
- * Create a disposable linked clone from the golden image, run `fn(workspaceId)`
+ * Create a disposable full clone from the golden image, run `fn(workspaceId)`
  * against it, and always destroy the clone in a finally block — fails fast if the
  * environment isn't configured, and guarantees the clone is destroyed even if
  * `fn` throws.
@@ -174,30 +175,19 @@ export function withDisposableClone(executionBackend, fn, options = {}) {
 		);
 	}
 	console.error(
-		`Measuring linked-clone lifecycle for golden image ${executionBackend.goldenImage}...`,
-	);
-	const linkedCloneMeasurement = executionBackend.measureLinkedClone(
-		executionBackend.goldenImage,
-		{
-			aquaUid: executionBackend.aquaUid,
-			providerUser: executionBackend.providerUser,
-		},
-	);
-	console.error(
-		`Creating disposable linked clone from golden image ${executionBackend.goldenImage}...`,
+		`Creating disposable full clone from golden image ${executionBackend.goldenImage}...`,
 	);
 	let workspaceId;
 	try {
 		workspaceId = executionBackend.create(executionBackend.goldenImage, {
 			...options,
 			runId: `auth-qualification-${randomUUID()}`,
-			linked: true,
-			linkedCloneMeasurement,
+			linked: false,
 			aquaUid: executionBackend.aquaUid,
 			providerUser: executionBackend.providerUser,
 		});
 		console.error(
-			`Disposable linked clone created (${workspaceId}), running auth qualification...`,
+			`Disposable full clone created (${workspaceId}), running auth qualification...`,
 		);
 		return fn(workspaceId);
 	} finally {
@@ -207,7 +197,7 @@ export function withDisposableClone(executionBackend, fn, options = {}) {
 				executionBackend.destroy(workspaceId);
 			} catch (error) {
 				console.error(
-					`warning: failed to destroy disposable linked clone after auth check: ${error.message}`,
+					`warning: failed to destroy disposable full clone after auth check: ${error.message}`,
 				);
 			}
 		}
@@ -337,6 +327,17 @@ const PROVIDERS = [
 		// OAuth login would create irrelevant persistent auth.json state and can
 		// not repair either lane. Qualification belongs to the dispatch bridge.
 		authMode: "ephemeral_api_key_dispatch",
+	},
+	{
+		name: "vibe",
+		isAuthenticated: isVibeAuthenticated,
+		isLive: (workspaceId, executionBackend) =>
+			probeLiveness("vibe", { workspaceId, executionBackend }),
+		runLogin: (workspaceId, executionBackend) =>
+			runInteractiveLogin(["vibe", "--setup"], {
+				workspaceId,
+				executionBackend,
+			}),
 	},
 ];
 
@@ -635,7 +636,7 @@ export function runCheck(
 
 /**
  * Qualify provider auth inside a disposable clone: creates one disposable
- * linked clone, checks every OAuth-backed provider with presence + live logic,
+ * full clone, checks every OAuth-backed provider with presence + live logic,
  * reports BWS API-key lanes as unprobed, and guarantees clone destruction.
  *
  * Progress is emitted only via stderr; the return value is the list of provider
@@ -829,7 +830,7 @@ function main(argv = process.argv.slice(2)) {
 	const executionBackend = createExecutionBackend();
 
 	// `--clone`: read-only clone qualification against a disposable clone, never
-	// a login. Measures then creates one disposable linked clone, checks presence + liveness,
+	// a login. Creates one disposable full clone, checks presence + liveness,
 	// emits progress on stderr, prints terminal summary on stdout, optionally writes
 	// a sanitized receipt, and destroys the clone.
 	if (argv.includes("--clone")) {

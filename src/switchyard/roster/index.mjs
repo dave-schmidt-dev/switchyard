@@ -111,6 +111,11 @@ export const PROVIDER_INVOCATION_VOCABULARY = Object.freeze({
 		]),
 		argv: Object.freeze({ variant: Object.freeze(["--variant", "<variant>"]) }),
 	}),
+	vibe: Object.freeze({
+		effort: Object.freeze([]),
+		variant: Object.freeze([]),
+		argv: Object.freeze({}),
+	}),
 	copilot: Object.freeze({
 		effort: Object.freeze([]),
 		variant: Object.freeze([]),
@@ -158,6 +163,7 @@ const KNOWN_PROVIDER_HARNESSES = [
 	"cursor",
 	"copilot",
 	"opencode",
+	"vibe",
 ];
 
 let cachedRoster = null;
@@ -1207,7 +1213,7 @@ function resolveCurrentDispatchDescriptor(
  * argv mapping. Disabled targets are reported as exclusions, not as missing
  * capacity classes. Enablement and eligibility are separate gates: enabled
  * targets without a current exact receipt remain invisible to automatic
- * routing without being excluded, while disabled targets such as Vibe appear
+ * routing without being excluded, while configured disabled targets appear
  * explicitly in `excludedTargets`.
  *
  * @param {object} [rosterData] Optional synthetic roster for tests.

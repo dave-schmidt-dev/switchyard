@@ -52,6 +52,7 @@ const SYNC_ADAPTERS = [
 	"copilot",
 	"cursor",
 	"opencode",
+	"vibe",
 ];
 
 /** A backend whose guest cleanup throws the given error. */

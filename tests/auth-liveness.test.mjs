@@ -106,7 +106,7 @@ describe("probeLiveness", () => {
 		match(result.reason, /no liveness probe defined/);
 	});
 
-	it("covers all six providers and passes the prompt as a single argv element", () => {
+	it("covers every provider and passes the prompt as a single argv element", () => {
 		deepStrictEqual(Object.keys(LIVENESS_PROBES).sort(), [
 			"agy",
 			"claude",
@@ -114,6 +114,7 @@ describe("probeLiveness", () => {
 			"copilot",
 			"cursor",
 			"opencode",
+			"vibe",
 		]);
 		for (const name of Object.keys(LIVENESS_PROBES)) {
 			const spec = specFor(name);

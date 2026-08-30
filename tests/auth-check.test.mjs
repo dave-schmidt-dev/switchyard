@@ -231,8 +231,8 @@ describe("ensureProvidersAuthenticated", () => {
 		strictEqual(results[1].authenticated, true);
 	});
 
-	it("defaults to the real six adapters when no providers are injected", () => {
-		strictEqual(PROVIDERS.length, 6);
+	it("defaults to every real provider when none are injected", () => {
+		strictEqual(PROVIDERS.length, 7);
 		deepStrictEqual(PROVIDERS.map((p) => p.name).sort(), [
 			"agy",
 			"claude",
@@ -240,6 +240,7 @@ describe("ensureProvidersAuthenticated", () => {
 			"copilot",
 			"cursor",
 			"opencode",
+			"vibe",
 		]);
 		for (const provider of PROVIDERS) {
 			if (provider.authMode === "ephemeral_api_key_dispatch") continue;
@@ -571,10 +572,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 			goldenImage: "golden-vm",
 			aquaUid: "501",
 			providerUser: "switchyard",
-			measureLinkedClone: (goldenImage, options) => {
-				calls.push({ type: "measure", goldenImage, options });
-				return { goldenImage, diskBytes: 1, cloneToBootMs: 1 };
-			},
 			create: (goldenImage, options) => {
 				calls.push({ type: "create", goldenImage, options });
 				return "clone-uuid-1";
@@ -590,27 +587,18 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		});
 
 		strictEqual(result, "success");
-		strictEqual(calls.length, 3);
-		strictEqual(calls[0].type, "measure");
+		strictEqual(calls.length, 2);
+		strictEqual(calls[0].type, "create");
 		strictEqual(calls[0].goldenImage, "golden-vm");
+		strictEqual(calls[0].options.linked, false);
 		strictEqual(calls[0].options.aquaUid, "501");
 		strictEqual(calls[0].options.providerUser, "switchyard");
-		strictEqual(calls[1].type, "create");
-		strictEqual(calls[1].goldenImage, "golden-vm");
-		strictEqual(calls[1].options.linked, true);
-		deepStrictEqual(calls[1].options.linkedCloneMeasurement, {
-			goldenImage: "golden-vm",
-			diskBytes: 1,
-			cloneToBootMs: 1,
-		});
-		strictEqual(calls[1].options.aquaUid, "501");
-		strictEqual(calls[1].options.providerUser, "switchyard");
 		ok(
-			calls[1].options.runId.startsWith("auth-qualification-"),
+			calls[0].options.runId.startsWith("auth-qualification-"),
 			"runId must have auth-qualification prefix",
 		);
-		strictEqual(calls[2].type, "destroy");
-		strictEqual(calls[2].uuid, "clone-uuid-1");
+		strictEqual(calls[1].type, "destroy");
+		strictEqual(calls[1].uuid, "clone-uuid-1");
 	});
 
 	it("withDisposableClone fails fast when goldenImage or aquaUid is missing", () => {
@@ -637,7 +625,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden-vm",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-uuid-err",
 			destroy: (uuid) => destroyed.push(uuid),
 		};
@@ -662,7 +649,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden-vm",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-uuid-destroy-err",
 			destroy: () => {
 				throw new Error("prlctl delete failed");
@@ -679,7 +665,7 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 			);
 			ok(
 				stderr.some((line) =>
-					line.includes("failed to destroy disposable linked clone"),
+					line.includes("failed to destroy disposable full clone"),
 				),
 				"destroy failure must be logged as a warning to stderr",
 			);
@@ -698,7 +684,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 			goldenImage: "switchyard-golden-6",
 			aquaUid: "503",
 			providerUser: "switchyard",
-			measureLinkedClone: () => ({ receipt: "linked" }),
 			create: (image, opts) => {
 				created.push({ image, opts });
 				return "disposable-clone-uuid";
@@ -794,7 +779,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-123",
 			destroy: () => {},
 		};
@@ -809,9 +793,7 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 
 			// Progress only to stderr
 			ok(
-				stderr.some((line) =>
-					line.includes("Creating disposable linked clone"),
-				),
+				stderr.some((line) => line.includes("Creating disposable full clone")),
 				"stderr must contain clone creation progress",
 			);
 			ok(
@@ -821,9 +803,7 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 
 			// Stdout must NOT contain progress
 			ok(
-				!stdout.some((line) =>
-					line.includes("Creating disposable linked clone"),
-				),
+				!stdout.some((line) => line.includes("Creating disposable full clone")),
 				"stdout must not contain progress logs",
 			);
 
@@ -860,7 +840,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-123",
 			destroy: () => {},
 		};
@@ -913,7 +892,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => {
 				throw new Error("Parallels clone failure");
 			},
@@ -953,7 +931,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-123",
 			destroy: () => {},
 		};
@@ -1002,7 +979,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-123",
 			destroy: () => {},
 		};
@@ -1050,7 +1026,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "clone-123",
 			destroy: () => {},
 		};
@@ -1106,7 +1081,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "switchyard-golden-secret-vm",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => {
 				throw new Error(
 					"Failed to clone switchyard-golden-secret-vm at /tmp/vm.pvm",
@@ -1169,7 +1143,6 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		const backend = {
 			goldenImage: "golden-vm-name-secret",
 			aquaUid: "501",
-			measureLinkedClone: () => ({}),
 			create: () => "workspace-uuid-secret-xyz",
 			destroy: () => {},
 		};
