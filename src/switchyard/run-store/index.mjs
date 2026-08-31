@@ -1938,6 +1938,11 @@ export function isProjectLockHeld(canonicalProjectPath) {
 	);
 }
 
+// Host-global ceiling on concurrently running macOS guests, imposed by Apple's
+// Virtualization.framework (Parallels rides the same framework). This is the
+// platform's maximum, not a tuning knob: raising it does not buy a third VM, it
+// buys an opaque framework failure at VM start. The two slot files live under the
+// home directory, so the pool spans every session, project and harness on this Mac.
 const VM_SLOT_COUNT = 2;
 
 function safeVmRunId(value) {
