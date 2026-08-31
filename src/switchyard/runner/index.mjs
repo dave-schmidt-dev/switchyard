@@ -411,20 +411,50 @@ export class TaskSelectionError extends Error {
 }
 
 /**
+ * Read the classification of an in-flight queue failure, if it carries one.
+ *
+ * Only an allowlisted diagnostic code crosses this boundary. The error object
+ * itself never does: its message may hold host paths or provider-controlled
+ * text, and `PERSISTED_DIAGNOSTIC_CODES` is a closed vocabulary of codes this
+ * project mints itself.
+ * @param {unknown} error
+ * @returns {string|null}
+ */
+function persistedDiagnosticCodeOf(error) {
+	if (!error || typeof error !== "object") return null;
+	for (const candidate of [
+		error.diagnosticCode,
+		error.failure?.diagnosticCode,
+		error.code,
+	]) {
+		if (PERSISTED_DIAGNOSTIC_CODES.includes(candidate)) return candidate;
+	}
+	return null;
+}
+
+/**
  * Closed signal that an owned async queue workspace could not be torn down.
  * The backend error is deliberately not retained: it may contain host paths or
  * provider-controlled text, while detached finalization needs only the fixed
  * recovery disposition and queue summary.
+ *
+ * When teardown fails while another failure is already in flight, this error
+ * replaces it -- cleanup must win so no caller finalizes success over a leaked
+ * workspace. Replacing the exception must not erase why the run failed, so the
+ * in-flight failure's diagnostic code is carried through when it is one of ours;
+ * `code` and the `recovery_incomplete` reason stay fixed, so the disposition
+ * still reads `stop` / recovery required and only the reported cause sharpens.
  */
 export class QueueCleanupError extends Error {
-	constructor(queueResult = null) {
+	constructor(queueResult = null, inFlightError = null) {
 		super("Async queue cleanup failed; recovery is required.");
 		this.name = "QueueCleanupError";
 		this.code = "recovery_incomplete";
 		this.failure = sanitizeFailureMetadata({
 			result: "unknown_failure",
 			errorKind: "unknown_failure",
-			diagnosticCode: "recovery_incomplete",
+			diagnosticCode:
+				persistedDiagnosticCodeOf(inFlightError) ?? "recovery_incomplete",
 			failurePhase: "terminal_reconciliation",
 		});
 		this.terminalSummary = {
@@ -3970,6 +4000,8 @@ export async function runQueueAsync(options) {
 		snapshotSource: dependencies.snapshotSource ?? "gradus-v2",
 	};
 	const results = [];
+	// Retained only so a teardown failure can name the failure it displaces.
+	let inFlightError = null;
 	try {
 		context.broker = createDispatchBroker(context, dependencies);
 		const initialRunnable = getRunnableTasks(tasks, checkpoint, {
@@ -4313,6 +4345,9 @@ export async function runQueueAsync(options) {
 			retryTransitionId: checkpoint.retryTransitionId,
 		};
 		return queueResult;
+	} catch (error) {
+		inFlightError = error;
+		throw error;
 	} finally {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();
 		let cleanupError = null;
@@ -4352,14 +4387,14 @@ export async function runQueueAsync(options) {
 					} catch {
 						// A progress callback cannot replace the closed cleanup failure.
 					}
-					cleanupError = new QueueCleanupError(queueResult);
+					cleanupError = new QueueCleanupError(queueResult, inFlightError);
 				}
 			}
 		} finally {
 			releaseQueueSlot(queueBackend, slotLease);
 		}
 		if (cleanupError) {
-			// biome-ignore lint/correctness/noUnsafeFinally: teardown failure must override a nominal queue return so callers cannot finalize success
+			// biome-ignore lint/correctness/noUnsafeFinally: teardown failure must override both a nominal queue return and an in-flight failure so callers cannot finalize success over a leaked workspace; the displaced failure's diagnostic code rides along on cleanupError
 			throw cleanupError;
 		}
 	}

@@ -50,6 +50,7 @@ import {
 	loadTaskQueue,
 	normalizeRunOptions,
 	parseTaskQueue,
+	QueueCleanupError,
 	resolveOrchestrator,
 	runQueueAsync as runQueueAsyncImpl,
 	runQueue as runQueueImpl,
@@ -5196,6 +5197,64 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		ok(cleanupFailed, "cleanup_failed progress is preserved");
 		strictEqual(cleanupFailed.status, "Cleanup failed; recovery required");
 		strictEqual(JSON.stringify(cleanupFailed).includes("SECRET_CANARY"), false);
+	});
+
+	it("carries a displaced closed failure code onto the cleanup error", () => {
+		const displaced = new CheckpointIdentityError(
+			CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH,
+		);
+		const error = new QueueCleanupError(null, displaced);
+		// Cleanup still wins: the code and the recovery reason are unchanged, so
+		// the caller disposition still reads recovery-required. Only the reported
+		// cause sharpens, from "something failed" to the contract that broke.
+		strictEqual(error.code, "recovery_incomplete");
+		deepStrictEqual(error.failure, {
+			errorKind: "unknown_failure",
+			reasonCode: "unknown_failure",
+			reason: "The task failed for an unclassified reason.",
+			diagnosticCode: "checkpoint_queue_identity_mismatch",
+			failurePhase: "terminal_reconciliation",
+		});
+		strictEqual(JSON.stringify(error).includes(displaced.message), false);
+	});
+
+	it("refuses a displaced code that is outside the persisted vocabulary", () => {
+		const displaced = new Error("SECRET_CANARY unclassified host failure");
+		displaced.diagnosticCode = "SECRET_CANARY_not_a_closed_code";
+		const error = new QueueCleanupError(null, displaced);
+		// The in-flight error is not a channel: only a code this project mints
+		// itself crosses, so an unrecognized one leaves the fixed code standing.
+		strictEqual(error.failure.diagnosticCode, "recovery_incomplete");
+		strictEqual(JSON.stringify(error).includes("SECRET_CANARY"), false);
+	});
+
+	it("still fails closed on teardown when a queue failure is already in flight", async () => {
+		const events = [];
+		const tasksPath = writeTerminalQueue();
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				taskIds: ["9.9"],
+				checkpointPath: `${tasksPath}.displaced-failure.checkpoint.json`,
+				dependencies: {
+					backendFactory: () => macosBackend(events, { failDestroy: true }),
+				},
+			}),
+			(error) => {
+				// Capturing the in-flight failure must not let it win the throw: a
+				// caller that saw the selection error alone would finalize without
+				// knowing a workspace is still on the host.
+				strictEqual(error.name, "QueueCleanupError");
+				strictEqual(error.code, "recovery_incomplete");
+				// TaskSelectionError carries no closed diagnostic, so the fixed one holds.
+				strictEqual(error.failure.diagnosticCode, "recovery_incomplete");
+				return true;
+			},
+		);
+		ok(events.indexOf("destroy") >= 0);
+		ok(events.indexOf("release") > events.indexOf("destroy"));
 	});
 
 	it("releases a slot when workspace creation fails", () => {

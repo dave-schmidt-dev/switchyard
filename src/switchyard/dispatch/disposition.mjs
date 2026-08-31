@@ -111,6 +111,27 @@ function hasRecoveryCommand(recoveryCommand) {
 	);
 }
 
+/**
+ * Order dotted task ids by numeric segment rather than lexically.
+ *
+ * Task ids are `\d+(\.\d+)*`, so a plain string sort ranks "10.1" ahead of
+ * "2.1" and names the wrong task as blocking on any queue past nine top-level
+ * tasks. A missing segment sorts first, so "2" precedes "2.1".
+ * @param {string} a
+ * @param {string} b
+ * @returns {number}
+ */
+function compareTaskIds(a, b) {
+	const left = a.split(".");
+	const right = b.split(".");
+	const depth = Math.max(left.length, right.length);
+	for (let index = 0; index < depth; index += 1) {
+		const delta = Number(left[index] ?? -1) - Number(right[index] ?? -1);
+		if (delta !== 0) return delta;
+	}
+	return 0;
+}
+
 function isSafeTaskId(taskId) {
 	return (
 		typeof taskId === "string" &&
@@ -173,7 +194,8 @@ function failedTargetEvidence(checkpoint, events) {
 			evidence.push({ targetId: entry.resolvedTargetId, taskId: entry.taskId });
 		}
 	}
-	const taskId = evidence.map((entry) => entry.taskId).sort()[0] ?? null;
+	const taskId =
+		evidence.map((entry) => entry.taskId).sort(compareTaskIds)[0] ?? null;
 	const targetIds = [
 		...new Set(
 			evidence

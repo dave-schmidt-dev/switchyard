@@ -93,6 +93,49 @@ function listed(entries) {
 }
 
 describe("Parallels execution backend lifecycle", () => {
+	it("refuses a wait interval that would hang a teardown instead of pacing it", () => {
+		// Every one of these values ends up as an argument to `sleepFn`, whose
+		// default is a blocking `Atomics.wait`. A NaN or a negative there is not a
+		// mistuned poll, it is a teardown that never returns and emits nothing, so
+		// the knob is refused where the caller can still see which one it named.
+		for (const knob of [
+			"aquaTimeoutMs",
+			"clipboardSettleMs",
+			"workspaceVerifyTimeoutMs",
+			"stopSettleTimeoutMs",
+		]) {
+			for (const value of [
+				Number.NaN,
+				-1,
+				1.5,
+				"1000",
+				Number.POSITIVE_INFINITY,
+			]) {
+				throws(
+					() => new ParallelsExecutionBackend({ aquaUid: 501, [knob]: value }),
+					new RegExp(`^Error: ${knob} must be an integer of at least 0ms$`),
+				);
+			}
+			// A zero budget is a real answer for a timeout: do not wait at all.
+			ok(new ParallelsExecutionBackend({ aquaUid: 501, [knob]: 0 }));
+		}
+		for (const knob of [
+			"aquaPollMs",
+			"clipboardPollMs",
+			"workspaceVerifyPollMs",
+			"stopSettlePollMs",
+		]) {
+			// A zero poll is not "no wait", it is a busy loop against prlctl.
+			for (const value of [Number.NaN, -1, 0]) {
+				throws(
+					() => new ParallelsExecutionBackend({ aquaUid: 501, [knob]: value }),
+					new RegExp(`^Error: ${knob} must be an integer of at least 1ms$`),
+				);
+			}
+			ok(new ParallelsExecutionBackend({ aquaUid: 501, [knob]: 1 }));
+		}
+	});
+
 	it("builds an Aqua execution prefix with cwd and no Docker flags", () => {
 		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
 		const execution = backend.execArgv("{vm-uuid}", {

@@ -309,6 +309,47 @@ describe("caller disposition precedence", () => {
 		deepStrictEqual(result.failedTargetIds, ["agy-gemini", "codex-standard"]);
 	});
 
+	it("names the blocking task by numeric order once a queue passes nine tasks", () => {
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: failure(),
+			}),
+			checkpoint: {
+				retryAttempts: [
+					exactFailure("agy-gemini", "10.1"),
+					exactFailure("opencode-go", "2.1"),
+				],
+			},
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "target_failed");
+		// A lexical sort ranks "10.1" ahead of "2.1" and reports the wrong task
+		// and the wrong targets as blocking.
+		strictEqual(result.taskId, "2.1");
+		deepStrictEqual(result.failedTargetIds, ["opencode-go"]);
+	});
+
+	it("ranks a parent task ahead of its own subtask", () => {
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: failure(),
+			}),
+			checkpoint: {
+				retryAttempts: [
+					exactFailure("agy-gemini", "2.1"),
+					exactFailure("opencode-go", "2"),
+				],
+			},
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.taskId, "2");
+		deepStrictEqual(result.failedTargetIds, ["opencode-go"]);
+	});
+
 	it("deduplicates six sanitized OpenCode execution failures without a cooldown schema", () => {
 		const events = Array.from({ length: 6 }, () => ({
 			...exactFailure("opencode-go", "2.3"),

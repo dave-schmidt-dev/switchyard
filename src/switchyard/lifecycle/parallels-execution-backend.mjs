@@ -494,6 +494,27 @@ function validatePid(pid) {
 }
 
 /**
+ * Validate a millisecond knob at construction rather than at the wait itself.
+ *
+ * Every one of these values ends up as an argument to `sleepFn`, whose default
+ * is a blocking `Atomics.wait`. A NaN or negative there is not a bad poll
+ * interval, it is a hung teardown with no diagnostic, so an out-of-range value
+ * has to be refused where the caller can still see which knob it named.
+ * Timeouts accept 0 -- "do not wait" is a meaningful budget -- while a poll
+ * interval of 0 is a busy loop and is refused.
+ * @param {unknown} value
+ * @param {string} name
+ * @param {number} minimum
+ * @returns {number}
+ */
+function validateDurationMs(value, name, minimum) {
+	if (!Number.isSafeInteger(value) || value < minimum) {
+		throw new Error(`${name} must be an integer of at least ${minimum}ms`);
+	}
+	return value;
+}
+
+/**
  * Build the only VM name this backend may create or reclaim.
  * @param {string} runId
  * @param {number} creatorPid
@@ -636,14 +657,38 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.pidIsAlive = pidIsAlive;
 		this.creatorPid = validatePid(creatorPid);
 		this.aquaUid = aquaUid;
-		this.aquaTimeoutMs = aquaTimeoutMs;
-		this.aquaPollMs = aquaPollMs;
-		this.clipboardSettleMs = clipboardSettleMs;
-		this.clipboardPollMs = clipboardPollMs;
-		this.workspaceVerifyTimeoutMs = workspaceVerifyTimeoutMs;
-		this.workspaceVerifyPollMs = workspaceVerifyPollMs;
-		this.stopSettleTimeoutMs = stopSettleTimeoutMs;
-		this.stopSettlePollMs = stopSettlePollMs;
+		this.aquaTimeoutMs = validateDurationMs(aquaTimeoutMs, "aquaTimeoutMs", 0);
+		this.aquaPollMs = validateDurationMs(aquaPollMs, "aquaPollMs", 1);
+		this.clipboardSettleMs = validateDurationMs(
+			clipboardSettleMs,
+			"clipboardSettleMs",
+			0,
+		);
+		this.clipboardPollMs = validateDurationMs(
+			clipboardPollMs,
+			"clipboardPollMs",
+			1,
+		);
+		this.workspaceVerifyTimeoutMs = validateDurationMs(
+			workspaceVerifyTimeoutMs,
+			"workspaceVerifyTimeoutMs",
+			0,
+		);
+		this.workspaceVerifyPollMs = validateDurationMs(
+			workspaceVerifyPollMs,
+			"workspaceVerifyPollMs",
+			1,
+		);
+		this.stopSettleTimeoutMs = validateDurationMs(
+			stopSettleTimeoutMs,
+			"stopSettleTimeoutMs",
+			0,
+		);
+		this.stopSettlePollMs = validateDurationMs(
+			stopSettlePollMs,
+			"stopSettlePollMs",
+			1,
+		);
 		this.goldenImage = goldenImage;
 		// Injected rather than imported: this backend depends on Node builtins
 		// and its own base class only, and its testability rests on injected
