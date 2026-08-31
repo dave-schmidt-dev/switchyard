@@ -22,6 +22,7 @@ function deps({ run, live }) {
 function runRec(overrides = {}) {
 	return {
 		state: "running",
+		cleanupState: "not_started",
 		workerPid: 4242,
 		createdAt: new Date().toISOString(),
 		...overrides,
@@ -33,13 +34,19 @@ describe("resolveIsRunDead — liveness gating", () => {
 		strictEqual(await resolveIsRunDead("r", deps({ run: undefined })), true);
 	});
 
-	it("terminal state => dead (succeeded)", async () => {
-		const d = deps({ run: runRec({ state: "succeeded" }), live: true });
+	it("terminal clean state => dead/reclaimable (succeeded)", async () => {
+		const d = deps({
+			run: runRec({ state: "succeeded", cleanupState: "complete" }),
+			live: true,
+		});
 		strictEqual(await resolveIsRunDead("r", d), true);
 	});
 
-	it("terminal state => dead (failed)", async () => {
-		const d = deps({ run: runRec({ state: "failed" }), live: true });
+	it("terminal clean state => dead/reclaimable (failed)", async () => {
+		const d = deps({
+			run: runRec({ state: "failed", cleanupState: "complete" }),
+			live: true,
+		});
 		strictEqual(await resolveIsRunDead("r", d), true);
 	});
 
@@ -70,11 +77,19 @@ describe("resolveIsRunDead — liveness gating", () => {
 		strictEqual(await resolveIsRunDead("r", d), true);
 	});
 
-	it("workerPid null + unparseable createdAt => dead (cannot prove youth)", async () => {
+	it("workerPid null + unparseable createdAt => held (cannot prove staleness)", async () => {
 		const d = deps({
 			run: runRec({ state: "created", workerPid: null, createdAt: "nonsense" }),
 			live: false,
 		});
-		strictEqual(await resolveIsRunDead("r", d), true);
+		strictEqual(await resolveIsRunDead("r", d), false);
+	});
+
+	it("terminal finalizer with incomplete cleanup remains live", async () => {
+		const d = deps({
+			run: runRec({ state: "failed", cleanupState: "pending" }),
+			live: true,
+		});
+		strictEqual(await resolveIsRunDead("r", d), false);
 	});
 });

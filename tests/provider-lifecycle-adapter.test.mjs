@@ -4,6 +4,8 @@ import { describe, it } from "node:test";
 import {
 	captureProviderDiff,
 	captureProviderDiffAsync,
+	captureProviderDiffDetailed,
+	captureProviderDiffDetailedAsync,
 	executeProviderInvocation,
 	getWorkspaceExecution,
 	runProviderProcess,
@@ -149,7 +151,7 @@ describe("provider process lifecycle", () => {
 		strictEqual(receivedOptions.recordPid, true);
 	});
 
-	it("captures add and diff asynchronously through spawn", async () => {
+	it("captures add and diff asynchronously through PID-safe transport", async () => {
 		const calls = [];
 		const backendOptions = [];
 		// getWorkspaceExecution now requires an executionBackend with no
@@ -183,11 +185,87 @@ describe("provider process lifecycle", () => {
 		deepStrictEqual(calls, ["-A", "HEAD"]);
 		deepStrictEqual(
 			backendOptions.map((options) => options.recordPid),
-			[false, false],
+			[true, true],
 		);
 	});
 
-	it("captures add and diff synchronously without PID recording", () => {
+	it("reports bounded async diff-capture outcomes without raw process output", async () => {
+		const backend = {
+			execArgv(_workspaceId, { argv }) {
+				return { command: "fake", args: [...argv] };
+			},
+		};
+		const run = (exitCode, output = "") =>
+			captureProviderDiffDetailedAsync("worker", {
+				executionBackend: backend,
+				spawnFn: (_command, _args) => {
+					const child = fakeChild();
+					queueMicrotask(() => {
+						if (output) child.stdout.emit("data", output);
+						child.emit("close", exitCode, null);
+					});
+					return child;
+				},
+			});
+		strictEqual((await run(0, "diff")).status, "captured");
+		strictEqual((await run(0)).status, "empty");
+		strictEqual((await run(7)).status, "stage_failed");
+
+		let call = 0;
+		const diffFailed = await captureProviderDiffDetailedAsync("worker", {
+			executionBackend: backend,
+			spawnFn: (_command, _args) => {
+				const child = fakeChild();
+				queueMicrotask(() => child.emit("close", call++ === 0 ? 0 : 9, null));
+				return child;
+			},
+		});
+		strictEqual(diffFailed.status, "diff_failed");
+
+		const transportFailed = await captureProviderDiffDetailedAsync("worker", {
+			executionBackend: backend,
+			spawnFn: () => {
+				throw new Error("transport detail must not escape");
+			},
+		});
+		strictEqual(transportFailed.status, "transport_failed");
+
+		const timedOut = await captureProviderDiffDetailedAsync("worker", {
+			executionBackend: backend,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			spawnFn: () => fakeChild(),
+		});
+		strictEqual(timedOut.status, "timed_out");
+	});
+
+	it("cleans a timed-out PID-recorded capture through the backend seam", async () => {
+		const cleanupCalls = [];
+		const backend = {
+			execArgv(_workspaceId, { argv }) {
+				return { command: "fake", args: [...argv] };
+			},
+			cleanupProviderProcess(command, args, context) {
+				cleanupCalls.push({ command, args, context });
+			},
+		};
+		const result = await captureProviderDiffDetailedAsync("worker", {
+			executionBackend: backend,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			spawnFn: () => fakeChild(),
+		});
+
+		strictEqual(result.status, "timed_out");
+		strictEqual(cleanupCalls.length, 1);
+		deepStrictEqual(cleanupCalls[0], {
+			command: "fake",
+			args: ["git", "add", "-A"],
+			context: { onStatus: undefined, workspaceId: "worker" },
+		});
+	});
+
+	it("captures add and diff synchronously through PID-safe transport", () => {
 		const backendOptions = [];
 		const executionBackend = {
 			execArgv(_workspaceId, options = {}) {
@@ -202,8 +280,77 @@ describe("provider process lifecycle", () => {
 		strictEqual(captureProviderDiff("worker", { executionBackend }), "diff");
 		deepStrictEqual(
 			backendOptions.map((options) => options.recordPid),
-			[false, false],
+			[true, true],
 		);
+	});
+
+	it("classifies synchronous detailed diff-capture outcomes", () => {
+		const cases = [
+			{
+				name: "captured",
+				stageExit: 0,
+				diffExit: 0,
+				diffOutput: "diff --git a/a b/a\n",
+				expectedStatus: "captured",
+			},
+			{
+				name: "empty",
+				stageExit: 0,
+				diffExit: 0,
+				diffOutput: "",
+				expectedStatus: "empty",
+			},
+			{
+				name: "stage failure",
+				stageExit: 7,
+				diffExit: 0,
+				diffOutput: "",
+				expectedStatus: "stage_failed",
+			},
+			{
+				name: "diff failure",
+				stageExit: 0,
+				diffExit: 9,
+				diffOutput: "",
+				expectedStatus: "diff_failed",
+			},
+			{
+				name: "transport failure",
+				expectedStatus: "transport_failed",
+				transportCall: 1,
+			},
+		];
+
+		for (const testCase of cases) {
+			let calls = 0;
+			const executionBackend = {
+				execArgv(_workspaceId, { argv }) {
+					calls += 1;
+					if (calls === testCase.transportCall) {
+						throw new Error("transport detail must not escape");
+					}
+					const isCapture = argv.at(-1) === "HEAD";
+					const exitCode = isCapture ? testCase.diffExit : testCase.stageExit;
+					const script =
+						exitCode === 0
+							? isCapture
+								? `process.stdout.write(${JSON.stringify(testCase.diffOutput ?? "")})`
+								: ""
+							: `process.exit(${exitCode})`;
+					return { command: process.execPath, args: ["-e", script] };
+				},
+			};
+
+			const result = captureProviderDiffDetailed("worker", {
+				executionBackend,
+			});
+			strictEqual(result.status, testCase.expectedStatus, testCase.name);
+			strictEqual(
+				result.diff,
+				testCase.expectedStatus === "captured" ? testCase.diffOutput : null,
+				testCase.name,
+			);
+		}
 	});
 
 	it("prefers a backend's cleanupProviderProcess and skips the adapter's own cleanup on timeout", async () => {

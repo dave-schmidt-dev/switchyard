@@ -137,6 +137,31 @@ const CLEANUP_STAGE_DIAGNOSTIC_CODES = Object.freeze({
 	index_lock_removed: "provider_cleanup_after_index_lock_removed",
 });
 
+const WORKER_BOOT_STAGE_DIAGNOSTIC_CODES = new Set([
+	"clone_hardening_failed",
+	"workspace_prepare_failed",
+]);
+
+/** A closed, content-free worker-boot stage failure. */
+export class WorkerBootStageError extends Error {
+	constructor(diagnosticCode, cause) {
+		if (!WORKER_BOOT_STAGE_DIAGNOSTIC_CODES.has(diagnosticCode)) {
+			throw new TypeError("unrecognized worker boot stage diagnostic code");
+		}
+		super(`Worker boot stage failed (${diagnosticCode})`, { cause });
+		this.name = "WorkerBootStageError";
+		Object.defineProperty(this, "diagnosticCode", {
+			value: diagnosticCode,
+			enumerable: false,
+		});
+	}
+}
+
+/** Return a stage code only from the reviewed error type, never arbitrary properties. */
+export function workerBootStageDiagnosticCode(error) {
+	return error instanceof WorkerBootStageError ? error.diagnosticCode : null;
+}
+
 /** Return the durable diagnostic code for the last completed cleanup stage. */
 export function cleanupDiagnosticCodeFor(cleanupStage) {
 	return CLEANUP_STAGE_DIAGNOSTIC_CODES[cleanupStage] ?? null;
@@ -207,6 +232,17 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"worker_fingerprint_mismatch",
 	"worker_contract_unsupported",
 	"worker_boot_exception",
+	"clone_hardening_failed",
+	"workspace_prepare_failed",
+	"recovery_incomplete",
+	"checkpoint_task_file_mismatch",
+	"checkpoint_tasks_file_mismatch",
+	"checkpoint_missing_queue_identity",
+	"checkpoint_queue_identity_missing",
+	"checkpoint_queue_identity_mismatch",
+	"checkpoint_run_options_mismatch",
+	"checkpoint_historical_checkpoint",
+	"checkpoint_historical_state",
 ]);
 
 const PERSISTED_FAILURE_PHASES = new Set([

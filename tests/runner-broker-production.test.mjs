@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createReservationLedger } from "../src/switchyard/broker/reservations.mjs";
+import { finalizeRun } from "../src/switchyard/dispatch/run-finalization.mjs";
 import {
 	__resetRosterCacheForTests,
 	getInvocationDescriptorIdentity,
@@ -105,13 +106,13 @@ function descriptor(target, model) {
 	};
 }
 
-test("production async runner uses broker reservation, fallback, and adapter launch", async () => {
+test("production async runner retains cli usage failure without peer fallback", async () => {
 	const root = await mkdtemp(join(tmpdir(), "switchyard-production-broker-"));
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Broker task\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** high\n- **RequiredCapabilityJustification:** Production broker fallback must preserve the requested high capability.\n- **Description:** exercise production broker\n",
+		"### Task 1.1: Broker task\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** high\n- **RequiredCapabilityJustification:** This production broker path must hold the requested high capability across a CLI usage failure.\n- **Description:** exercise production broker\n",
 	);
 	const calls = [];
 	const dispatches = [];
@@ -179,25 +180,21 @@ test("production async runner uses broker reservation, fallback, and adapter lau
 			},
 		},
 	});
-	strictEqual(result.results[0].success, true);
+	strictEqual(result.results[0].success, false);
 	strictEqual(result.results[0].requiredCapability, "high");
-	strictEqual(result.results[0].resolvedTargetId, "expensive");
-	strictEqual(calls.length, 2);
+	strictEqual(result.results[0].resolvedTargetId, "cheap");
+	strictEqual(calls.length, 1);
 	strictEqual(calls[0], "cheap");
-	strictEqual(calls[1], "expensive");
-	strictEqual(intents.length, 2);
+	strictEqual(intents.length, 1);
 	strictEqual(intents[0].provider, "Cheap");
-	strictEqual(intents[1].provider, "Expensive");
-	strictEqual(dispatches.length, 2);
+	strictEqual(dispatches.length, 1);
 	strictEqual(dispatches[0].provider, "Cheap");
 	strictEqual(dispatches[0].result, "execution_failed");
 	strictEqual(dispatches[0].diagnosticCode, "cli_usage_error");
 	strictEqual(dispatches[0].exitCode, 2);
 	strictEqual(dispatches[0].failurePhase, "provider_execution");
 	strictEqual(JSON.stringify(dispatches[0]).includes("SECRET_CANARY"), false);
-	strictEqual(dispatches[1].provider, "Expensive");
-	strictEqual(dispatches[1].result, "success_no_diff");
-	strictEqual(snapshotReads >= 2, true);
+	strictEqual(snapshotReads >= 1, true);
 	const projectLedger = JSON.parse(
 		await readFile(
 			join(root, ".logs", "switchyard", "broker", "reservations.json"),
@@ -205,12 +202,72 @@ test("production async runner uses broker reservation, fallback, and adapter lau
 		),
 	);
 	strictEqual(
-		projectLedger.reservations.length === 2 &&
+		projectLedger.reservations.length === 1 &&
 			projectLedger.reservations.every((entry) =>
 				["released", "reconciled"].includes(entry.state),
 			),
 		true,
 	);
+});
+
+test("production async runner never infers peer fallback from failure prose", async () => {
+	for (const reason of [
+		"provider reported transient timeout",
+		"transient provider launch failure",
+		"timeout while starting provider",
+	]) {
+		const root = await mkdtemp(join(tmpdir(), "switchyard-broker-prose-"));
+		const tasksFilePath = join(root, "TASKS.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		await writeFile(
+			tasksFilePath,
+			"### Task 1.1: Prose failure\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** no inferred retry\n",
+		);
+		let calls = 0;
+		const result = await runQueueAsync({
+			tasksFilePath,
+			projectPath: root,
+			workingContainerName: "broker-prose-worker",
+			checkpointPath,
+			dependencies: {
+				queuePreflight: () => ({ ok: true, eligible: true }),
+				backendFactory: () => ({
+					executionBackend: {},
+					create: () => "broker-prose-worker",
+					destroy: () => {},
+					seed: () => {},
+					commit: () => {},
+					reset: () => {},
+				}),
+				adapters: {
+					claude: {
+						executeAsync: async () => {
+							calls += 1;
+							return { success: false, error: reason };
+						},
+						captureDiffAsync: async () => null,
+					},
+				},
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				route: () => ({
+					provider: "Cheap",
+					resolvedTargetId: "cheap",
+					resolved_harness: "claude",
+					model: "cheap-standard",
+					reason: "ranked",
+				}),
+				resolveTargetIdentity: () => ({
+					targetId: "cheap",
+					harnessKey: "claude",
+					ambiguous: false,
+				}),
+				resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+			},
+		});
+		strictEqual(result.results[0].success, false);
+		strictEqual(calls, 1);
+	}
 });
 
 test("production async broker forwards adapter status and heartbeats", async () => {
@@ -683,7 +740,7 @@ test("production async runner clears route state after a successful task before 
 	strictEqual(dispatches.at(-1).provider, "none");
 });
 
-test("production async runner records a fallback intent failure before launching it", async () => {
+test("production async runner does not write a fallback intent for a generic failure", async () => {
 	const root = await mkdtemp(
 		join(tmpdir(), "switchyard-production-broker-fallback-intent-"),
 	);
@@ -716,11 +773,6 @@ test("production async runner records a fallback intent failure before launching
 			recordDispatch: () => {},
 			recordDispatchIntent: () => {
 				intentCalls += 1;
-				if (intentCalls === 2) {
-					const error = new Error("intent write denied");
-					error.code = "EPERM";
-					throw error;
-				}
 			},
 			route: ({ exclude, requiredCapability }) => {
 				const target = exclude.some(
@@ -748,10 +800,11 @@ test("production async runner records a fallback intent failure before launching
 				),
 		},
 	});
-	strictEqual(result.results[0].result, "intent_receipt_failed");
-	strictEqual(result.results[0].provider, "Expensive");
+	strictEqual(result.results[0].result, "execution_failed");
+	strictEqual(result.results[0].provider, "Cheap");
 	strictEqual(calls.length, 1);
-	strictEqual((await ledger.inspect()).reservations.length, 2);
+	strictEqual(intentCalls, 1);
+	strictEqual((await ledger.inspect()).reservations.length, 1);
 	strictEqual(
 		(await ledger.inspect()).reservations.every(
 			(entry) => entry.state === "released",
@@ -760,7 +813,7 @@ test("production async runner records a fallback intent failure before launching
 	);
 });
 
-test("production async runner preserves a broker precondition failure on retry", async () => {
+test("production async runner preserves a generic broker failure without retry", async () => {
 	const root = await mkdtemp(
 		join(tmpdir(), "switchyard-production-broker-precondition-"),
 	);
@@ -828,12 +881,10 @@ test("production async runner preserves a broker precondition failure on retry",
 		},
 	});
 	strictEqual(result.results[0].success, false);
-	strictEqual(result.results[0].errorKind, "unknown_failure");
-	strictEqual(
-		dispatches.at(-1).ledgerFailureCode,
-		"fallback_already_attempted",
-	);
-	strictEqual(calls, 3);
+	strictEqual(result.results[0].errorKind, "execution_failed");
+	strictEqual(dispatches.length, 1);
+	strictEqual(dispatches[0].result, "execution_failed");
+	strictEqual(calls, 1);
 });
 
 test("production async runner does not fallback a typed nonretryable failure", async () => {
@@ -941,7 +992,7 @@ test("production async runner records the routed provider when post-execution ca
 	strictEqual(dispatches.at(-1).provider, "Cheap");
 });
 
-test("production async runner records fallback after post-execution capture throws", async () => {
+test("production async runner does not retry before post-execution capture", async () => {
 	const root = await mkdtemp(
 		join(tmpdir(), "switchyard-production-broker-fallback-postexecution-"),
 	);
@@ -1001,13 +1052,11 @@ test("production async runner records fallback after post-execution capture thro
 		},
 	});
 	strictEqual(result.results[0].success, false);
-	strictEqual(executions, 2);
+	strictEqual(executions, 1);
 	strictEqual(captures, 1);
-	strictEqual(dispatches.length, 2);
+	strictEqual(dispatches.length, 1);
 	strictEqual(dispatches[0].provider, "Cheap");
 	strictEqual(dispatches[0].result, "execution_failed");
-	strictEqual(dispatches[1].provider, "Expensive");
-	strictEqual(dispatches[1].result, "execution_failed");
 });
 
 test("production async runner releases a reservation before an adapter precondition failure", async () => {
@@ -1206,12 +1255,20 @@ test("production async runner quarantines quota targets and retries the same tas
 	const calls = [];
 	const dispatches = [];
 	let resets = 0;
+	const retryStarts = new Map();
 	const result = await runQueueAsync({
 		tasksFilePath,
 		projectPath: root,
 		checkpointPath,
 		dependencies: {
 			queuePreflight: () => ({ ok: true, eligible: true }),
+			onRetryStateChanged: ({ retryState }) => {
+				if (retryState?.phase !== "retry_started") return;
+				retryStarts.set(
+					retryState.taskId,
+					(retryStarts.get(retryState.taskId) ?? 0) + 1,
+				);
+			},
 			backendFactory: () => ({
 				executionBackend: {},
 				create: () => "unused",
@@ -1268,6 +1325,11 @@ test("production async runner quarantines quota targets and retries the same tas
 	strictEqual(dispatches[0].errorKind, "quota_exhausted");
 	strictEqual(result.retryState, null);
 	strictEqual(result.quarantinedTargetIds.includes("cheap"), true);
+	strictEqual(retryStarts.get("1.1"), 1);
+	strictEqual(
+		[...retryStarts.values()].every((count) => count <= 1),
+		true,
+	);
 });
 
 test("production async runner refreshes quarantined exclusions for each task", async () => {
@@ -1350,4 +1412,80 @@ test("production async runner refreshes quarantined exclusions for each task", a
 	strictEqual(routeExclusions[0].includes("cheap"), false);
 	strictEqual(routeExclusions[1].includes("cheap"), true);
 	strictEqual(routeExclusions[2].includes("cheap"), true);
+});
+
+test("async teardown failure finalizes as recovery required, never succeeded cleanup complete", async () => {
+	const root = await mkdtemp(
+		join(tmpdir(), "switchyard-production-cleanup-finalization-"),
+	);
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Already complete\n- **Status:** done\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** exercise terminal cleanup failure\n",
+	);
+	let cleanupError = null;
+	await rejects(
+		runQueueAsync({
+			tasksFilePath,
+			projectPath: root,
+			checkpointPath,
+			dependencies: {
+				queuePreflight: () => ({ ok: true, eligible: true }),
+				backendFactory: () => ({
+					create: () => "owned-cleanup-failure-worker",
+					destroy: () => {
+						throw new Error("SECRET_CANARY backend teardown detail");
+					},
+					seed: () => {},
+					commit: () => {},
+					reset: () => {},
+				}),
+			},
+		}),
+		(error) => {
+			cleanupError = error;
+			return error?.code === "recovery_incomplete";
+		},
+	);
+
+	const persisted = {};
+	const patches = [];
+	const outcome = await finalizeRun(
+		{
+			runId: "cleanup-finalization",
+			state: "failed",
+			failure: cleanupError.failure,
+			eventName: "run_failed",
+			eventStatus: "recovery_required",
+			terminalSummary: cleanupError.terminalSummary,
+			cleanup: async () => {
+				throw new Error("queue cleanup incomplete");
+			},
+		},
+		{
+			createEvent: async () => {},
+			updateRunWithRetry: async (_runId, patch) => {
+				patches.push(patch);
+				Object.assign(persisted, patch);
+				return { ...persisted };
+			},
+			releaseRunLock: async () => {},
+		},
+	);
+
+	strictEqual(outcome.terminal, false);
+	strictEqual(outcome.cleanupComplete, false);
+	strictEqual(persisted.state, "recovery_required");
+	strictEqual(persisted.cleanupState, "failed");
+	strictEqual(persisted.lastFailure.diagnosticCode, "recovery_incomplete");
+	strictEqual(persisted.terminalizedBy, undefined);
+	strictEqual(
+		patches.some(
+			(patch) =>
+				patch.state === "succeeded" || patch.cleanupState === "complete",
+		),
+		false,
+	);
+	strictEqual(JSON.stringify(persisted).includes("SECRET_CANARY"), false);
 });

@@ -22,7 +22,10 @@ import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
-import { sanitizeFailureMetadata } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	INTEGRATION_REFUSAL_KINDS,
+	sanitizeFailureMetadata,
+} from "../src/switchyard/adapter/exec-error.mjs";
 import {
 	__resetRosterCacheForTests,
 	getInvocationDescriptorIdentity,
@@ -42,6 +45,7 @@ import {
 	executeTaskWithOrchestrator as executeTaskWithOrchestratorImpl,
 	findIgnoredDeclaredPath,
 	getRunnableTasks,
+	integrationFailureMetadata,
 	loadCheckpoint,
 	loadTaskQueue,
 	normalizeRunOptions,
@@ -609,6 +613,7 @@ function descriptorForRoute(routeResult) {
 function withTestDescriptorContext(context) {
 	let latest = null;
 	const originalRoute = context.route;
+	const originalResolveDescriptor = context.resolveDescriptor;
 	const route = (options) => {
 		const routed = originalRoute(options);
 		latest = descriptorForRoute(routed);
@@ -619,7 +624,8 @@ function withTestDescriptorContext(context) {
 	return {
 		...context,
 		route,
-		resolveDescriptor: () => latest,
+		resolveDescriptor: (...args) =>
+			latest ?? originalResolveDescriptor?.(...args) ?? null,
 	};
 }
 
@@ -5040,7 +5046,10 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 `);
 	}
 
-	function macosBackend(events, { failCreate = false } = {}) {
+	function macosBackend(
+		events,
+		{ failCreate = false, failDestroy = false } = {},
+	) {
 		return {
 			platform: "macos",
 			preflight: () => events.push("preflight"),
@@ -5059,7 +5068,12 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			seed: () => events.push("seed"),
 			commit: () => {},
 			reset: () => {},
-			destroy: () => events.push("destroy"),
+			destroy: () => {
+				events.push("destroy");
+				if (failDestroy) {
+					throw new Error("SECRET_CANARY synthetic backend teardown failure");
+				}
+			},
 		};
 	}
 
@@ -5143,6 +5157,45 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		});
 		ok(events.indexOf("destroy") >= 0);
 		ok(events.indexOf("release") > events.indexOf("destroy"));
+	});
+
+	it("rejects with closed recovery evidence when async backend teardown fails", async () => {
+		const events = [];
+		const statuses = [];
+		const tasksPath = writeTerminalQueue();
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				checkpointPath: `${tasksPath}.cleanup-failure.checkpoint.json`,
+				dependencies: {
+					backendFactory: () => macosBackend(events, { failDestroy: true }),
+					onStatus: (event) => statuses.push(event),
+				},
+			}),
+			(error) => {
+				strictEqual(error.name, "QueueCleanupError");
+				strictEqual(error.code, "recovery_incomplete");
+				deepStrictEqual(error.failure, {
+					errorKind: "unknown_failure",
+					reasonCode: "unknown_failure",
+					reason: "The task failed for an unclassified reason.",
+					diagnosticCode: "recovery_incomplete",
+					failurePhase: "terminal_reconciliation",
+				});
+				strictEqual(error.terminalSummary.failedCount, 0);
+				strictEqual(JSON.stringify(error).includes("SECRET_CANARY"), false);
+				return true;
+			},
+		);
+		ok(events.indexOf("release") > events.indexOf("destroy"));
+		const cleanupFailed = statuses.find(
+			(event) => event.event === "cleanup_failed",
+		);
+		ok(cleanupFailed, "cleanup_failed progress is preserved");
+		strictEqual(cleanupFailed.status, "Cleanup failed; recovery required");
+		strictEqual(JSON.stringify(cleanupFailed).includes("SECRET_CANARY"), false);
 	});
 
 	it("releases a slot when workspace creation fails", () => {
@@ -7527,7 +7580,7 @@ describe("Files requiredPaths propagation", () => {
 			result.reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(!JSON.stringify(result).includes("empty_required_diff"));
+		strictEqual(result.diagnosticCode, "empty_required_diff");
 		strictEqual(gateCalls.length, 1);
 		strictEqual(gateCalls[0].diff, "");
 		deepStrictEqual(gateCalls[0].options.requiredPaths, ["src/f.mjs"]);
@@ -7538,7 +7591,7 @@ describe("Files requiredPaths propagation", () => {
 			dispatches[0].reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(!JSON.stringify(dispatches).includes("empty_required_diff"));
+		strictEqual(dispatches[0].diagnosticCode, "empty_required_diff");
 	});
 
 	it("executeTaskWithOrchestrator passes requiredPaths to integrationGate", async () => {
@@ -7645,7 +7698,7 @@ describe("Files requiredPaths propagation", () => {
 			taskResult.reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(!JSON.stringify(taskResult).includes("empty_required_diff"));
+		strictEqual(taskResult.diagnosticCode, "empty_required_diff");
 		strictEqual(dispatches[0].result, "integration_failed");
 		strictEqual(dispatches[0].errorKind, "integration_failed");
 		strictEqual(dispatches[0].reasonCode, "integration_failed");
@@ -7653,7 +7706,7 @@ describe("Files requiredPaths propagation", () => {
 			dispatches[0].reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(!JSON.stringify(dispatches).includes("empty_required_diff"));
+		strictEqual(dispatches[0].diagnosticCode, "empty_required_diff");
 	});
 });
 
@@ -7915,8 +7968,9 @@ describe("executeTask timeout handling", () => {
 		strictEqual(executeCalls[1], PROVIDER_EXECUTION_TIMEOUT_MS);
 	});
 
-	it("does not capture a diff for a non-timeout execution failure (existing behavior unchanged)", () => {
+	it("captures but never integrates a diff from a non-timeout execution failure", () => {
 		const captureDiffCalls = [];
+		const gateCalls = [];
 
 		const result = executeTask(
 			{ id: "1.1", title: "task", description: "a normal failure" },
@@ -7929,7 +7983,10 @@ describe("executeTask timeout handling", () => {
 				}),
 				recordDispatch: () => {},
 				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
+				integrationGate: (...args) => {
+					gateCalls.push(args);
+					return { success: true, message: "ok" };
+				},
 				adapters: {
 					claude: {
 						execute: () => ({
@@ -7939,7 +7996,7 @@ describe("executeTask timeout handling", () => {
 						}),
 						captureDiff: (containerName) => {
 							captureDiffCalls.push(containerName);
-							return "should not be captured";
+							return "diff --git a/wip.mjs b/wip.mjs\n+recoverable work";
 						},
 					},
 				},
@@ -7950,8 +8007,13 @@ describe("executeTask timeout handling", () => {
 
 		strictEqual(result.result, "execution_failed");
 		strictEqual(result.timedOut, undefined);
-		strictEqual(result.partialDiff, undefined);
-		strictEqual(captureDiffCalls.length, 0);
+		strictEqual(result.captureStatus, "captured");
+		strictEqual(
+			result.partialDiff,
+			"diff --git a/wip.mjs b/wip.mjs\n+recoverable work",
+		);
+		strictEqual(captureDiffCalls.length, 1);
+		strictEqual(gateCalls.length, 0, "failed provider work stays review-only");
 	});
 });
 
@@ -8679,6 +8741,102 @@ describe("runQueue timeout diff persistence", () => {
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(checkpoint.results[0].timedOut, true);
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
+	});
+
+	it("keeps an explicitly empty timed-out capture distinct from capture failure", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Long-running task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** overruns its timeout without edits
+`);
+		const events = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: {
+				route: () => ({ provider: "vibe", model: "glm-5.2", reason: "spread" }),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				onStatus: (event) => events.push(event),
+				adapters: {
+					vibe: {
+						execute: () => ({
+							success: false,
+							timedOut: true,
+							error: "timed out",
+						}),
+						captureDiffDetailed: () => ({ status: "empty", diff: null }),
+					},
+				},
+			},
+		});
+		strictEqual(result.results[0].result, "execution_timed_out");
+		strictEqual(result.results[0].captureStatus, "empty");
+		ok(events.some((event) => event.event === "diff_capture_started"));
+		ok(
+			!events.some((event) => event.event === "partial_diff_capture_failed"),
+			"an explicit empty capture is not a capture failure",
+		);
+	});
+
+	it("preserves a synchronous capture failure status in the partial-diff failure event", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Long-running task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** overruns its timeout while diff capture fails
+`);
+		const events = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: {
+				route: () => ({ provider: "vibe", model: "glm-5.2", reason: "spread" }),
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				onStatus: (event) => events.push(event),
+				adapters: {
+					vibe: {
+						execute: () => ({
+							success: false,
+							timedOut: true,
+							error: "timed out",
+						}),
+						captureDiffDetailed: () => ({
+							status: "diff_failed",
+							diff: null,
+						}),
+					},
+				},
+			},
+		});
+
+		strictEqual(result.results[0].captureStatus, "diff_failed");
+		const failedEvent = events.find(
+			(event) => event.event === "partial_diff_capture_failed",
+		);
+		ok(failedEvent, "a non-empty capture status must emit a failure event");
+		strictEqual(failedEvent.captureStatus, "diff_failed");
 	});
 });
 
@@ -9503,5 +9661,457 @@ describe("typed checkpoint identity failures (Task 1.3)", () => {
 			"runQueueAsync must throw CheckpointIdentityError",
 		);
 		strictEqual(thrown.code, "checkpoint_run_options_mismatch");
+	});
+});
+
+describe("preserve closed integration rejection codes (Task 1.3)", () => {
+	const CLOSED_INTEGRATION_FIXTURES = [
+		{
+			name: "empty_required_diff",
+			code: "empty_required_diff",
+			gateResult: { success: false, message: "empty_required_diff" },
+		},
+		{
+			name: "required_paths_missing",
+			code: "required_paths_missing",
+			gateResult: { success: false, message: "required_paths_missing" },
+		},
+		{
+			name: "undeclared_paths_touched",
+			code: "undeclared_paths_touched",
+			gateResult: { success: false, message: "undeclared_paths_touched" },
+		},
+		{
+			name: "no_op_diff",
+			code: "no_op_diff",
+			gateResult: { success: false, message: "no_op_diff" },
+		},
+		{
+			name: "empty_diff",
+			code: "empty_diff",
+			gateResult: {
+				success: false,
+				message: "empty diff",
+				reasonKind: "empty_diff",
+			},
+		},
+		{
+			name: "path_escapes_project_root",
+			code: "path_escapes_project_root",
+			gateResult: {
+				success: false,
+				message: "path escapes project root: /outside",
+				reasonKind: "path_escapes_project_root",
+			},
+		},
+		{
+			name: "git_internals_touched",
+			code: "git_internals_touched",
+			gateResult: {
+				success: false,
+				message: "diff touches .git directory",
+				reasonKind: "git_internals_touched",
+			},
+		},
+		{
+			name: "credential_path_touched",
+			code: "credential_path_touched",
+			gateResult: {
+				success: false,
+				message: "diff touches credential file: .env",
+				reasonKind: "credential_path_touched",
+				credentialFlagged: true,
+			},
+		},
+		{
+			name: "symlink_creation_refused",
+			code: "symlink_creation_refused",
+			gateResult: {
+				success: false,
+				message: "refusing to create symlink: link",
+				reasonKind: "symlink_creation_refused",
+			},
+		},
+		{
+			name: "executable_file_refused",
+			code: "executable_file_refused",
+			gateResult: {
+				success: false,
+				message: "refusing executable mode: bin.sh",
+				reasonKind: "executable_file_refused",
+			},
+		},
+		{
+			name: "manifest_review_required",
+			code: "manifest_review_required",
+			gateResult: {
+				success: false,
+				message:
+					"diff touches a build/execution manifest file and requires AllowManifests: true",
+				reasonKind: "manifest_review_required",
+			},
+		},
+		{
+			name: "corrupt_patch",
+			code: "corrupt_patch",
+			gateResult: {
+				success: false,
+				message: "diff could not be parsed by git apply",
+				reasonKind: "corrupt_patch",
+			},
+		},
+		{
+			name: "conflict",
+			code: "conflict",
+			gateResult: {
+				success: false,
+				message: "Diff apply failed",
+				reasonKind: "conflict",
+			},
+		},
+	];
+
+	it("contains fixtures for every closed integration rejection code", () => {
+		const expectedCodes = new Set([
+			"empty_required_diff",
+			"required_paths_missing",
+			"undeclared_paths_touched",
+			"no_op_diff",
+			...INTEGRATION_REFUSAL_KINDS,
+		]);
+		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, expectedCodes.size);
+		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, 13);
+		for (const fixture of CLOSED_INTEGRATION_FIXTURES) {
+			ok(
+				expectedCodes.has(fixture.code),
+				`${fixture.code} is not an expected closed integration code`,
+			);
+		}
+	});
+
+	for (const fixture of CLOSED_INTEGRATION_FIXTURES) {
+		it(`preserves closed rejection '${fixture.name}' across result, event, checkpoint, lastFailure, and caller projection in runQueue`, () => {
+			const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Integration rejection task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** Test preservation of ${fixture.name}
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const events = [];
+			const dispatches = [];
+
+			const queueResult = runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				checkpointPath,
+				dependencies: {
+					onStatus: (e) => events.push(e),
+					route: () => ({
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 70,
+						reason: "spread",
+					}),
+					recordDispatch: (entry) => dispatches.push(entry),
+					integrationGate: () => fixture.gateResult,
+					adapters: {
+						claude: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+						},
+					},
+				},
+			});
+
+			// 1. Caller projection / result
+			strictEqual(queueResult.results.length, 1);
+			const [taskResult] = queueResult.results;
+			strictEqual(taskResult.success, false);
+			strictEqual(taskResult.result, "integration_failed");
+			strictEqual(taskResult.diagnosticCode, fixture.code);
+
+			// 2. Events (gate_validated and task_failed)
+			const gateValidatedEvent = events.find(
+				(e) => e.event === "gate_validated",
+			);
+			ok(gateValidatedEvent, "gate_validated event emitted");
+			strictEqual(gateValidatedEvent.outcome, "rejected");
+			strictEqual(gateValidatedEvent.diagnosticCode, fixture.code);
+
+			const taskFailedEvent = events.find((e) => e.event === "task_failed");
+			ok(taskFailedEvent, "task_failed event emitted");
+			strictEqual(taskFailedEvent.diagnosticCode, fixture.code);
+
+			// 3. Checkpoint (in-memory and durable JSON file)
+			const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+			strictEqual(checkpoint.results[0].success, false);
+			strictEqual(checkpoint.results[0].diagnosticCode, fixture.code);
+
+			const durableCheckpoint = JSON.parse(
+				readFileSync(checkpointPath, "utf8"),
+			);
+			strictEqual(durableCheckpoint.results[0].diagnosticCode, fixture.code);
+
+			// 4. lastFailure projection
+			const lastFailure = sanitizeFailureMetadata(taskResult);
+			strictEqual(lastFailure.diagnosticCode, fixture.code);
+			strictEqual(lastFailure.errorKind, "integration_failed");
+			strictEqual(lastFailure.reasonCode, "integration_failed");
+
+			// 5. Caller projection via executeTask
+			const singleResult = executeTask(
+				{
+					id: "1.1",
+					title: "task",
+					description: "test",
+					requiredPaths: ["src/a.mjs"],
+				},
+				{
+					route: () => ({
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 70,
+						reason: "spread",
+					}),
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => fixture.gateResult,
+					adapters: {
+						claude: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+						},
+					},
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+				},
+			);
+			strictEqual(singleResult.diagnosticCode, fixture.code);
+		});
+	}
+
+	it("projects reasonKind first when both reasonKind and allowlisted message are present", () => {
+		const result = integrationFailureMetadata("t-1", "", false, {
+			success: false,
+			reasonKind: "conflict",
+			message: "no_op_diff",
+		});
+		strictEqual(result.diagnosticCode, "conflict");
+	});
+
+	it("accepts allowlisted structural codes via message when reasonKind is absent", () => {
+		for (const kind of [
+			"empty_required_diff",
+			"required_paths_missing",
+			"undeclared_paths_touched",
+			"no_op_diff",
+			...INTEGRATION_REFUSAL_KINDS,
+		]) {
+			const result = integrationFailureMetadata("t-1", "", false, {
+				success: false,
+				message: kind,
+			});
+			strictEqual(result.diagnosticCode, kind);
+		}
+	});
+
+	it("prefers reasonKind over an allowlisted message for diagnostic projection", () => {
+		const result = integrationFailureMetadata("t-1", "", false, {
+			success: false,
+			reasonKind: "conflict",
+			message: "empty_required_diff",
+			diagnosticCode: "required_paths_missing",
+		});
+		strictEqual(result.diagnosticCode, "conflict");
+	});
+
+	it("discards untrusted diagnosticCode values when reasonKind/message are untrusted", () => {
+		const arbitraryCode = "PROSE_CANARY_untrusted_diagnostic_code_abc_42";
+		const result = integrationFailureMetadata("t-1", "", false, {
+			success: false,
+			message: arbitraryCode,
+			diagnosticCode: arbitraryCode,
+		});
+		strictEqual(result.diagnosticCode, undefined);
+	});
+
+	it("arbitrary gate prose produces no match in durable and JSON fixtures", () => {
+		const arbitraryProse = "PROSE_CANARY_arbitrary_untrusted_gate_prose_xyz_42";
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Arbitrary prose task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** Test discarding arbitrary gate prose
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const events = [];
+
+		const queueResult = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				onStatus: (e) => events.push(e),
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 70,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({
+					success: false,
+					message: arbitraryProse,
+					diagnosticCode: arbitraryProse,
+				}),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+					},
+				},
+			},
+		});
+
+		const [taskResult] = queueResult.results;
+		strictEqual(taskResult.diagnosticCode, undefined);
+		strictEqual(taskResult.errorKind, "integration_failed");
+		strictEqual(taskResult.reasonCode, "integration_failed");
+
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(checkpoint.results[0].diagnosticCode, undefined);
+
+		const gateValidatedEvent = events.find((e) => e.event === "gate_validated");
+		ok(gateValidatedEvent);
+		strictEqual(gateValidatedEvent.diagnosticCode, undefined);
+
+		const taskFailedEvent = events.find((e) => e.event === "task_failed");
+		ok(taskFailedEvent);
+		strictEqual(taskFailedEvent.diagnosticCode, undefined);
+
+		const lastFailure = sanitizeFailureMetadata(taskResult);
+		strictEqual(lastFailure.diagnosticCode, undefined);
+
+		// Assert that arbitrary prose text is NEVER matched in any serialized/durable fixture
+		ok(!JSON.stringify(taskResult).includes(arbitraryProse));
+		ok(!JSON.stringify(checkpoint).includes(arbitraryProse));
+		ok(!JSON.stringify(events).includes(arbitraryProse));
+		ok(!JSON.stringify(lastFailure).includes(arbitraryProse));
+		const rawCheckpointOnDisk = readFileSync(checkpointPath, "utf8");
+		ok(!rawCheckpointOnDisk.includes(arbitraryProse));
+	});
+
+	it("preserves every closed rejection code in executeTaskAsync and executeTaskWithOrchestrator", async () => {
+		for (const fixture of CLOSED_INTEGRATION_FIXTURES) {
+			const invocationDescriptor = descriptorForRoute({
+				provider: "claude",
+				model: "claude-sonnet-5",
+			});
+			const selectedRoute = {
+				reservation: { id: "res-1" },
+				provider: "claude",
+				model: "claude-sonnet-5",
+				resolvedTarget: "claude",
+				harness: "claude",
+				capability: "standard",
+				effort: null,
+				percentLeft: 70,
+				reason: "spread",
+				snapshotIdentity: {
+					status: "fresh",
+					mtime: new Date().toISOString(),
+					ageMs: 0,
+				},
+			};
+			const asyncResult = await executeTaskAsync(
+				{
+					id: "1.1",
+					title: "task",
+					description: "test",
+					requiredPaths: ["src/a.mjs"],
+				},
+				{
+					broker: {
+						selectAndReserve: async () => selectedRoute,
+						launcherIdentity: () => ({
+							provider: selectedRoute.provider,
+							resolvedTarget: selectedRoute.resolvedTarget,
+							harness: selectedRoute.harness,
+							model: selectedRoute.model,
+							effort: selectedRoute.effort,
+							descriptorIdentity: invocationDescriptor.descriptor_identity,
+							reservationId: selectedRoute.reservation.id,
+						}),
+						execute: async () => ({ success: true }),
+						release: async () => {},
+					},
+					resolveDescriptor: () => invocationDescriptor,
+					recordDispatch: async () => {},
+					recordDispatchIntent: async () => {},
+					integrationGate: () => fixture.gateResult,
+					adapters: {
+						claude: {
+							executeAsync: async () => ({ success: true, output: "ok" }),
+							captureDiffAsync: async () =>
+								"diff --git a/src/a.mjs b/src/a.mjs",
+						},
+					},
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+				},
+			);
+			strictEqual(
+				asyncResult.diagnosticCode,
+				fixture.code,
+				`executeTaskAsync failed to preserve ${fixture.code}`,
+			);
+
+			const orchEvents = [];
+			const orchResult = await executeTaskWithOrchestrator(
+				{
+					id: "1.1",
+					title: "task",
+					description: "test",
+					requiredPaths: ["src/a.mjs"],
+				},
+				{
+					route: () => ({
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 70,
+						reason: "spread",
+					}),
+					recordDispatch: async () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => fixture.gateResult,
+					orchestrator: {
+						launch: async () => "job-1",
+						status: async () => ({ state: "done" }),
+						result: async () => ({
+							success: true,
+							diff: "diff --git a/src/a.mjs b/src/a.mjs",
+						}),
+					},
+					onStatus: (e) => orchEvents.push(e),
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+				},
+			);
+			strictEqual(
+				orchResult.diagnosticCode,
+				fixture.code,
+				`executeTaskWithOrchestrator failed to preserve ${fixture.code}`,
+			);
+			const orchGateValidated = orchEvents.find(
+				(e) => e.event === "gate_validated",
+			);
+			ok(orchGateValidated);
+			strictEqual(orchGateValidated.diagnosticCode, fixture.code);
+		}
 	});
 });

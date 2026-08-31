@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { workerBootStageDiagnosticCode } from "../src/switchyard/adapter/exec-error.mjs";
 import { seedProjectWithBackend } from "../src/switchyard/lifecycle/index.mjs";
 import {
 	buildParallelsWorkingName,
@@ -31,6 +32,43 @@ import {
 const GOLDEN_UUID = "{11111111-1111-4111-8111-111111111111}";
 const WORK_UUID = "{22222222-2222-4222-8222-222222222222}";
 const CLIPBOARD_LABEL = "gui/501/com.parallels.copypaste";
+
+// What the guest reports once `_prepareWorkspace` has done its job: one
+// `<owner>:<mode>` line per directory, parent then root.
+const WORKSPACE_READY = "switchyard:700\nswitchyard:700\n";
+const WORKSPACE_UNAPPLIED = "switchyard:755\nswitchyard:755\n";
+
+/**
+ * The exact shape of the defect this suite locks out: prlctl fails on the
+ * HOST while reading the guest's result, so it reports 255 for a command the
+ * guest may well have run. Measured 2026-08-31 on `/bin/chmod 700`, one call
+ * after `mkdir -p` and `chown` succeeded on those same paths.
+ */
+function lostExitCode() {
+	const error = new Error(
+		"Command failed: prlctl exec\nPrlJob_GetRetCode: Invalid argument. An invalid argument was passed.",
+	);
+	error.status = 255;
+	error.stderr = "PrlJob_GetRetCode: Invalid argument.";
+	error.stdout = "";
+	return error;
+}
+
+/**
+ * A backend wired for workspace-preparation units: no real sleeping, and a
+ * prlctl stub that answers only what this stage asks.
+ * @param {(args: string[]) => string} respond
+ * @returns {ParallelsExecutionBackend}
+ */
+function workspaceBackend(respond, options = {}) {
+	return new ParallelsExecutionBackend({
+		aquaUid: 501,
+		sleepFn: () => {},
+		workspaceVerifyPollMs: 1,
+		prlctlFn: (args) => respond(args),
+		...options,
+	});
+}
 
 /**
  * Recover the script the guest will actually run. `prlctl exec` cannot carry a
@@ -378,6 +416,9 @@ describe("Parallels execution backend lifecycle", () => {
 		// catch and escalate.
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
+			// This VM never stops, so waiting out the settle window would only
+			// add real seconds to the assertion being made about escalation.
+			stopSettleTimeoutMs: 0,
 			prlctlFn: (args) => {
 				calls.push(args[0]);
 				if (args[0] === "list")
@@ -410,6 +451,408 @@ describe("Parallels execution backend lifecycle", () => {
 			calls.filter((verb) => verb === "stop").length >= 2,
 			`destroy did not exhaust its escalation before failing: ${calls.join(",")}`,
 		);
+	});
+
+	it("deletes after a failed stop only when an exact stopped state is reprobed", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "stop") {
+					if (args[2] === "--kill") throw new Error("stop returned 255");
+					throw new Error("stop returned 255");
+				}
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "stopped",
+							name: buildParallelsWorkingName("stopped", process.pid),
+						},
+					]);
+				if (args[0] === "delete") return "";
+				return "";
+			},
+		});
+
+		deepStrictEqual(backend.destroy(WORK_UUID), {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("stopped", process.pid),
+			forced: true,
+		});
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["list", "stop", "stop", "list", "delete"],
+		);
+	});
+
+	it("preserves a failed stop and never deletes while the exact VM is running", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							name: buildParallelsWorkingName("running", process.pid),
+						},
+					]);
+				throw new Error(`${args[0]} returned 255`);
+			},
+		});
+
+		throws(() => backend.destroy(WORK_UUID), /returned 255/);
+		ok(!calls.some((args) => args[0] === "delete"));
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["list", "stop", "stop", "list"],
+		);
+	});
+
+	it("reprobes after delete fallback before retrying deletion", () => {
+		const calls = [];
+		let deleteAttempts = 0;
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "stopped",
+							name: buildParallelsWorkingName("delete-fallback", process.pid),
+						},
+					]);
+				if (args[0] === "delete" && deleteAttempts++ === 0)
+					throw new Error("delete returned 255");
+				return "";
+			},
+		});
+
+		deepStrictEqual(backend.destroy(WORK_UUID), {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("delete-fallback", process.pid),
+			forced: true,
+		});
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["list", "stop", "delete", "stop", "list", "delete"],
+		);
+	});
+
+	it("preserves delete failure when fallback stop does not leave the exact VM stopped", () => {
+		const calls = [];
+		const deleteFailure = new Error("delete returned 255");
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							name: buildParallelsWorkingName("delete-running", process.pid),
+						},
+					]);
+				if (args[0] === "delete") throw deleteFailure;
+				return "";
+			},
+		});
+
+		throws(
+			() => backend.destroy(WORK_UUID),
+			(error) => error === deleteFailure,
+		);
+		ok(!calls.slice(3).some((args) => args[0] === "delete"));
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["list", "stop", "delete", "stop", "list"],
+		);
+	});
+
+	it("does not reprobe stale graceful-stop failure when kill succeeds", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "stop" && args[2] !== "--kill")
+					throw new Error("graceful stop returned 255");
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete({
+				uuid: WORK_UUID,
+				name: "kill-success",
+				status: "running",
+			}),
+			{ uuid: WORK_UUID, name: "kill-success", forced: true },
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "stop", "delete"],
+		);
+	});
+
+	it("treats an absent exact VM after failed delete as already deleted", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "delete") throw new Error("delete returned 255");
+				if (args[0] === "list") return listed([]);
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete({
+				uuid: WORK_UUID,
+				name: "absent",
+				status: "running",
+			}),
+			{ uuid: WORK_UUID, name: "absent", forced: true },
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "delete", "stop", "list"],
+		);
+	});
+
+	it("preserves delete failure when exact-state probing fails", () => {
+		const calls = [];
+		const deleteFailure = new Error("delete returned 255");
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") throw new Error("list unavailable");
+				if (args[0] === "delete") throw deleteFailure;
+				return "";
+			},
+		});
+
+		throws(
+			() =>
+				backend.stopAndDelete({
+					uuid: WORK_UUID,
+					name: "probe-failure",
+					status: "running",
+				}),
+			(error) => error === deleteFailure,
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "delete", "stop", "list"],
+		);
+	});
+
+	it("treats an absent exact VM after retry-delete failure as already deleted", () => {
+		const calls = [];
+		let deleteAttempts = 0;
+		let listAttempts = 0;
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "delete") {
+					deleteAttempts += 1;
+					throw new Error(`delete attempt ${deleteAttempts} returned 255`);
+				}
+				if (args[0] === "list") {
+					listAttempts += 1;
+					return listAttempts === 1
+						? listed([
+								{
+									uuid: WORK_UUID,
+									status: "stopped",
+									name: "retry-present",
+								},
+							])
+						: listed([]);
+				}
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete({
+				uuid: WORK_UUID,
+				name: "retry-present",
+				status: "running",
+			}),
+			{ uuid: WORK_UUID, name: "retry-present", forced: true },
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "delete", "stop", "list", "delete", "list"],
+		);
+	});
+
+	it("reprobes a forced VM after delete failure without issuing a second kill", () => {
+		const calls = [];
+		let deleteAttempts = 0;
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "stopped",
+							name: buildParallelsWorkingName("forced-stopped", process.pid),
+						},
+					]);
+				if (args[0] === "delete" && deleteAttempts++ === 0)
+					throw new Error("delete returned 255");
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete(
+				{
+					uuid: WORK_UUID,
+					name: "forced-stopped",
+					status: "running",
+				},
+				{ forceOnly: true },
+			),
+			{ uuid: WORK_UUID, name: "forced-stopped", forced: true },
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "delete", "list", "delete"],
+		);
+	});
+
+	it("preserves forced delete failure while the exact VM remains running", () => {
+		const calls = [];
+		const deleteFailure = new Error("delete returned 255");
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							name: buildParallelsWorkingName("forced-running", process.pid),
+						},
+					]);
+				if (args[0] === "delete") throw deleteFailure;
+				return "";
+			},
+		});
+
+		throws(
+			() =>
+				backend.stopAndDelete(
+					{
+						uuid: WORK_UUID,
+						name: "forced-running",
+						status: "running",
+					},
+					{ forceOnly: true },
+				),
+			(error) => error === deleteFailure,
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "delete", "list"],
+		);
+	});
+
+	it("waits out the shutdown settle window instead of racing its own stop", () => {
+		// The sequence measured on the INV-1 gate 2026-08-31: the stop reported
+		// success, the delete issued straight after it was refused because
+		// Parallels still had the VM running, and the VM reported stopped a
+		// moment later. Sampling that state once decides the race by coin flip
+		// and leaks the VM on the losing side.
+		const calls = [];
+		const sleeps = [];
+		let listAttempts = 0;
+		let deleteAttempts = 0;
+		const backend = new ParallelsExecutionBackend({
+			sleepFn: (ms) => sleeps.push(ms),
+			stopSettlePollMs: 1,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					listAttempts += 1;
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: listAttempts < 3 ? "running" : "stopped",
+							name: "settling",
+						},
+					]);
+				}
+				if (args[0] === "delete" && deleteAttempts++ === 0) {
+					const error = new Error("Command failed: prlctl delete");
+					error.status = 255;
+					error.stderr =
+						"Failed to remove the VM: Unable to perform the action because the virtual machine is busy. The virtual machine is currently running. Please try again later.";
+					throw error;
+				}
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete({
+				uuid: WORK_UUID,
+				name: "settling",
+				status: "running",
+			}),
+			{ uuid: WORK_UUID, name: "settling", forced: true },
+		);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "delete", "stop", "list", "list", "list", "delete"],
+		);
+		strictEqual(sleeps.length, 2);
+	});
+
+	it("preserves the delete failure when the VM never settles", () => {
+		const calls = [];
+		const deleteFailure = new Error("delete returned 255");
+		let now = 0;
+		const backend = new ParallelsExecutionBackend({
+			nowFn: () => now,
+			sleepFn: (ms) => {
+				now += ms;
+			},
+			stopSettleTimeoutMs: 3_000,
+			stopSettlePollMs: 1_000,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{ uuid: WORK_UUID, status: "running", name: "stuck" },
+					]);
+				if (args[0] === "delete") throw deleteFailure;
+				return "";
+			},
+		});
+
+		throws(
+			() =>
+				backend.stopAndDelete({
+					uuid: WORK_UUID,
+					name: "stuck",
+					status: "running",
+				}),
+			(error) => error === deleteFailure,
+		);
+		// It waited the full window before giving up, and never deleted a VM it
+		// had just observed running.
+		strictEqual(calls.filter((args) => args[0] === "list").length, 4);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
 	});
 
 	it("uses the bulk transfer hook without sending tar bytes to prlctl", () => {
@@ -640,6 +1083,7 @@ describe("Parallels execution backend lifecycle", () => {
 				if (args.includes(CLIPBOARD_LABEL) || args.includes("/usr/bin/pgrep")) {
 					throw new Error("could not find service");
 				}
+				if (args.includes("/usr/bin/stat")) return WORKSPACE_READY;
 				return "ready";
 			},
 		});
@@ -665,6 +1109,165 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		ok(
 			calls.some((args) => args.includes("/bin/chmod") && args.includes("700")),
+		);
+	});
+
+	it("classifies clone hardening and workspace preparation failures before rollback", () => {
+		for (const testCase of [
+			{
+				stage: "_hardenClone",
+				expectedCode: "clone_hardening_failed",
+			},
+			{
+				stage: "_prepareWorkspace",
+				expectedCode: "workspace_prepare_failed",
+			},
+		]) {
+			let cloneName = null;
+			let rollbackCount = 0;
+			const backend = new ParallelsExecutionBackend({
+				aquaUid: 501,
+				prlctlFn: (args) => {
+					if (args[0] === "clone") cloneName = args[3];
+					if (args[0] === "list" && args[1] === "-a") {
+						return listed([
+							{ uuid: GOLDEN_UUID, status: "stopped", name: "macOS" },
+							...(cloneName
+								? [{ uuid: WORK_UUID, status: "running", name: cloneName }]
+								: []),
+						]);
+					}
+					return "ready";
+				},
+			});
+			backend.boot = () => {};
+			backend._hardenClone = () => {};
+			backend._prepareWorkspace = () => {};
+			backend[testCase.stage] = () => {
+				throw new Error("sensitive stage detail /host/path provider output");
+			};
+			backend.rollback = () => {
+				rollbackCount += 1;
+				return true;
+			};
+
+			throws(
+				() =>
+					backend.create("macOS", {
+						runId: `stage-${testCase.expectedCode}`,
+						creatorPid: process.pid,
+						linked: false,
+					}),
+				(error) =>
+					workerBootStageDiagnosticCode(error) === testCase.expectedCode,
+			);
+			strictEqual(rollbackCount, 1, `${testCase.stage} failure must roll back`);
+		}
+	});
+
+	it("accepts a workspace whose guest state is correct despite a lost exit code", () => {
+		const execs = [];
+		const backend = workspaceBackend((args) => {
+			execs.push(args);
+			if (args.includes("/usr/bin/stat")) return WORKSPACE_READY;
+			// The silent command prlctl could not read a result for.
+			if (args.includes("/bin/chmod")) throw lostExitCode();
+			return "";
+		});
+
+		backend._prepareWorkspace(WORK_UUID, "switchyard");
+
+		strictEqual(
+			execs.filter((args) => args.includes("/bin/chmod")).length,
+			1,
+			"verified-correct state must not trigger a repair pass",
+		);
+	});
+
+	it("repairs the workspace when the first layout pass did not apply", () => {
+		let chmodCalls = 0;
+		const backend = workspaceBackend((args) => {
+			if (args.includes("/bin/chmod")) {
+				chmodCalls += 1;
+				if (chmodCalls === 1) throw lostExitCode();
+				return "";
+			}
+			if (args.includes("/usr/bin/stat")) {
+				return chmodCalls >= 2 ? WORKSPACE_READY : WORKSPACE_UNAPPLIED;
+			}
+			return "";
+		});
+
+		backend._prepareWorkspace(WORK_UUID, "switchyard");
+
+		strictEqual(chmodCalls, 2, "a real mismatch must be repaired once");
+	});
+
+	it("fails workspace preparation when the guest state stays wrong", () => {
+		let cloneName = null;
+		const backend = workspaceBackend((args) => {
+			if (args[0] === "clone") cloneName = args[3];
+			if (args[0] === "list" && args[1] === "-a") {
+				return listed([
+					{ uuid: GOLDEN_UUID, status: "stopped", name: "macOS" },
+					...(cloneName
+						? [{ uuid: WORK_UUID, status: "running", name: cloneName }]
+						: []),
+				]);
+			}
+			// chmod never takes, and the guest says so every time.
+			if (args.includes("/usr/bin/stat")) return WORKSPACE_UNAPPLIED;
+			return "ready";
+		});
+		backend.boot = () => {};
+		backend._hardenClone = () => {};
+		backend.rollback = () => true;
+
+		throws(
+			() =>
+				backend.create("macOS", {
+					runId: "workspace-unapplied",
+					creatorPid: process.pid,
+					linked: false,
+				}),
+			(error) =>
+				workerBootStageDiagnosticCode(error) === "workspace_prepare_failed",
+		);
+	});
+
+	it("retries a verification probe that produces no output", () => {
+		let statCalls = 0;
+		const backend = workspaceBackend((args) => {
+			if (args.includes("/usr/bin/stat")) {
+				statCalls += 1;
+				// An empty result is the probe failing, not a wrong workspace.
+				if (statCalls === 1) return "";
+				if (statCalls === 2) throw lostExitCode();
+				return WORKSPACE_READY;
+			}
+			return "";
+		});
+
+		backend._prepareWorkspace(WORK_UUID, "switchyard");
+
+		strictEqual(statCalls, 3, "the probe must be retried, not believed");
+	});
+
+	it("reports the layout failure, not the probe failure, when the guest is unreachable", () => {
+		const backend = workspaceBackend(
+			(args) => {
+				if (args.includes("/bin/chmod")) {
+					throw new Error("chmod: /Users/switchyard: Read-only file system");
+				}
+				if (args.includes("/usr/bin/stat")) throw lostExitCode();
+				return "";
+			},
+			{ workspaceVerifyTimeoutMs: 0 },
+		);
+
+		throws(
+			() => backend._prepareWorkspace(WORK_UUID, "switchyard"),
+			/Read-only file system/,
 		);
 	});
 
@@ -696,6 +1299,7 @@ describe("Parallels execution backend lifecycle", () => {
 				if (args.includes(CLIPBOARD_LABEL) || args.includes("/usr/bin/pgrep")) {
 					throw new Error("could not find service");
 				}
+				if (args.includes("/usr/bin/stat")) return WORKSPACE_READY;
 				return "ready";
 			},
 		});
@@ -781,7 +1385,8 @@ describe("Parallels execution backend lifecycle", () => {
 					providerUser: "switchyard",
 					clipboardSettleMs: 0,
 				}),
-			/clipboard isolation could not be enforced/,
+			(error) =>
+				workerBootStageDiagnosticCode(error) === "clone_hardening_failed",
 		);
 	});
 
@@ -849,7 +1454,8 @@ describe("Parallels execution backend lifecycle", () => {
 					linked: false,
 					providerUser: "switchyard",
 				}),
-			/clipboard isolation could not be enforced/,
+			(error) =>
+				workerBootStageDiagnosticCode(error) === "clone_hardening_failed",
 		);
 		strictEqual(
 			printCount,
@@ -895,6 +1501,69 @@ describe("Parallels execution backend lifecycle", () => {
 			),
 		);
 		ok(!calls.some((args) => args[1] === "foreign"));
+	});
+
+	it("honors an exact reclaim eligibility filter before any VM mutation", () => {
+		const calls = [];
+		const entries = [
+			{
+				uuid: WORK_UUID,
+				status: "running",
+				name: buildParallelsWorkingName("eligible", 999999),
+			},
+			{
+				uuid: GOLDEN_UUID,
+				status: "running",
+				name: buildParallelsWorkingName("foreign-run", 999998),
+			},
+		];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") return listed(entries);
+				return "ok";
+			},
+			pidIsAlive: () => false,
+		});
+
+		const result = backend.reclaim({
+			eligibility: (entry) => entry.runId === "eligible",
+		});
+		strictEqual(result.reclaimed.length, 1);
+		ok(
+			calls.some(
+				(args) =>
+					args[0] === "stop" && args[1] === WORK_UUID && args[2] === "--kill",
+			),
+		);
+		ok(!calls.some((args) => args[1] === GOLDEN_UUID));
+	});
+
+	it("retains a live creator-pid safety gate despite caller eligibility", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "stopped",
+							name: buildParallelsWorkingName("terminal", process.pid),
+						},
+					]);
+				}
+				return "ok";
+			},
+			pidIsAlive: () => true,
+		});
+
+		const result = backend.reclaim({
+			eligibility: (entry) => entry.runId === "terminal",
+		});
+		strictEqual(result.reclaimed.length, 0);
+		ok(!calls.some((args) => args[0] === "delete" && args[1] === WORK_UUID));
+		strictEqual(result.skipped[0].reason, "owner-alive");
 	});
 
 	it("rolls back a clone when Aqua readiness never appears", () => {

@@ -15,6 +15,7 @@ import { match, ok, strictEqual } from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -261,22 +262,22 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 				!/shared\s+folders|prl[_-]?(?:fs|shfs)/i.test(mountOutput),
 				"guest mount table must not expose Parallels shared folders",
 			);
-			const hostPathProbe = outputText(
-				backend.execGuest(
-					vmUuid,
-					"/bin/bash",
-					[
-						"-lc",
-						`test ! -e ${shellQuote(homedir())} && test ! -e /var/run/docker.sock`,
-					],
-					{ cwd: "/", aquaUid: AQUA_UID, providerUser: PROVIDER_USER },
-				),
-			);
-			strictEqual(
-				hostPathProbe,
-				"",
-				"guest host-path probe must succeed without output",
-			);
+			for (const [stage, path] of [
+				["host_repository_file", resolve("package.json")],
+				["docker_socket", "/var/run/docker.sock"],
+			]) {
+				try {
+					backend.execGuest(vmUuid, "/bin/test", ["!", "-e", path], {
+						cwd: "/",
+						aquaUid: AQUA_UID,
+						providerUser: PROVIDER_USER,
+					});
+				} catch (error) {
+					throw new Error(`guest host-path stage failed: ${stage}`, {
+						cause: error,
+					});
+				}
+			}
 
 			progress("deriving and host-verifying the C-3 endpoint manifest");
 			manifest = await deriveC3Manifest();
@@ -307,21 +308,43 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 			);
 			progress("running guest mount and C-3 network probes");
 			const networkScript = [
-				"set -eu",
-				'probe_blocked() { ! /usr/bin/nc -G 3 -w 3 -z "$1" "$2" >/dev/null 2>&1; }',
+				"set -u",
+				'emit_stage() { printf "C3_STAGE %s %s\\n" "$1" "$2"; }',
+				'probe_blocked() { if /usr/bin/nc -G 3 -w 3 -z "$1" "$2" >/dev/null 2>&1; then return 1; fi; return 0; }',
 				'probe_reachable() { /usr/bin/nc -G 5 -w 5 -z "$1" "$2" >/dev/null 2>&1; }',
-				...manifest.blocked.map(
-					(endpoint) =>
-						`probe_blocked ${shellQuote(endpoint.host)} ${shellQuote(endpoint.port)}`,
-				),
-				`probe_reachable ${shellQuote(manifest.reachable.host)} ${shellQuote(manifest.reachable.port)}`,
-				`/usr/bin/dscacheutil -q host -a name ${shellQuote(manifest.dnsName)} | /usr/bin/grep -q '^ip_address:'`,
+				...manifest.blocked.map((endpoint, index) => {
+					const label = `blocked_${index + 1}`;
+					return `if probe_blocked ${shellQuote(endpoint.host)} ${shellQuote(endpoint.port)}; then emit_stage ${label} pass; else emit_stage ${label} fail; fi`;
+				}),
+				`if probe_reachable ${shellQuote(manifest.reachable.host)} ${shellQuote(manifest.reachable.port)}; then emit_stage reachable pass; else emit_stage reachable fail; fi`,
+				`if /usr/bin/dscacheutil -q host -a name ${shellQuote(manifest.dnsName)} | /usr/bin/grep -q '^ip_address:'; then emit_stage dns pass; else emit_stage dns fail; fi`,
+				"exit 0",
 			].join("\n");
-			backend.execGuest(vmUuid, "/bin/bash", ["-lc", networkScript], {
-				cwd: "/",
-				aquaUid: AQUA_UID,
-				providerUser: PROVIDER_USER,
-			});
+			const networkOutput = outputText(
+				backend.execGuest(vmUuid, "/bin/bash", ["-lc", networkScript], {
+					cwd: "/",
+					aquaUid: AQUA_UID,
+					providerUser: PROVIDER_USER,
+				}),
+			);
+			const expectedNetworkStages = [
+				...manifest.blocked.map((_, index) => `blocked_${index + 1}`),
+				"reachable",
+				"dns",
+			];
+			const networkStageResults = new Map();
+			for (const line of networkOutput.split(/\r?\n/u)) {
+				const match = /^C3_STAGE ([a-z][a-z0-9_]*) (pass|fail)$/u.exec(line);
+				if (match) networkStageResults.set(match[1], match[2]);
+			}
+			const failedNetworkStages = expectedNetworkStages.filter(
+				(label) => networkStageResults.get(label) !== "pass",
+			);
+			strictEqual(
+				failedNetworkStages.length,
+				0,
+				`C-3 network stage(s) failed: ${failedNetworkStages.join(", ") || "invalid_result"}`,
+			);
 
 			originalClipboard = execFileSync("pbpaste", [], { encoding: "utf8" });
 			progress("running the behavioral clipboard probe (both directions)");

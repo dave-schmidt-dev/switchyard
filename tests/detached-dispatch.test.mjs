@@ -282,6 +282,38 @@ function compactDiagnostic(value) {
 		.slice(0, 256);
 }
 
+function boundedFailureField(value) {
+	return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,96}$/u.test(value)
+		? value
+		: value == null
+			? null
+			: "<redacted>";
+}
+
+function boundedFailureDiagnostic(entry) {
+	return {
+		failurePhase: boundedFailureField(entry?.failurePhase),
+		errorKind: boundedFailureField(entry?.errorKind),
+		diagnosticCode: boundedFailureField(entry?.diagnosticCode),
+	};
+}
+
+function providerFilterDiagnostic(run, events) {
+	return {
+		run: {
+			state: boundedFailureField(run?.state),
+			cleanupState: boundedFailureField(run?.cleanupState),
+			lastFailure: boundedFailureDiagnostic(run?.lastFailure),
+		},
+		recentEvents: (events ?? []).slice(-5).map((event) => ({
+			phase: boundedFailureField(event?.phase),
+			event: boundedFailureField(event?.event),
+			taskId: boundedFailureField(event?.taskId),
+			...boundedFailureDiagnostic(event),
+		})),
+	};
+}
+
 function cleanupDiagnostic(run) {
 	if (!run) return null;
 	return {
@@ -301,27 +333,45 @@ async function awaitRunTerminalCleanup(
 	{
 		maxWait = 300_000,
 		pollInterval = 200,
+		progressInterval = 5_000,
 		pollStatusFn = pollStatus,
+		onProgress = () => process.stderr.write("detached cleanup: polling\n"),
 		sleep = (delayMs) =>
 			new Promise((resolveWait) => setTimeout(resolveWait, delayMs)),
 	} = {},
 ) {
 	const start = Date.now();
+	let nextProgressAt = 0;
 	let lastStatus = null;
 	let lastStatusResult = null;
 	let pollCount = 0;
+	const emitProgress = (status) => {
+		const now = Date.now();
+		if (now < nextProgressAt) return;
+		nextProgressAt = now + Math.max(0, progressInterval);
+		try {
+			onProgress({
+				pollCount,
+				elapsedMs: now - start,
+				status: cleanupDiagnostic(status),
+			});
+		} catch {
+			// Progress is advisory and must never mask the cleanup result.
+		}
+	};
 	while (true) {
 		pollCount += 1;
 		try {
 			const statusResult = pollStatusFn(runId, env);
 			lastStatusResult = statusResult;
 			if (statusResult.status === 0) {
+				let status = null;
 				try {
-					const status = JSON.parse(statusResult.stdout.trim());
+					status = JSON.parse(statusResult.stdout.trim());
 					lastStatus = status;
 					if (
-						(status.state === "succeeded" || status.state === "failed") &&
-						status.cleanupState === "complete"
+						(status?.state === "succeeded" || status?.state === "failed") &&
+						status?.cleanupState === "complete"
 					) {
 						return status;
 					}
@@ -329,9 +379,23 @@ async function awaitRunTerminalCleanup(
 					// A partial/corrupt observation is retained in the timeout
 					// diagnostic; it can never count as completed cleanup.
 				}
+				emitProgress(status);
+				if (
+					status?.state === "recovery_required" ||
+					status?.cleanupState === "failed"
+				) {
+					const cleanupFailure = new Error(
+						`run ${runId} entered unrecoverable cleanup state: ${JSON.stringify(cleanupDiagnostic(status))}`,
+					);
+					cleanupFailure.code = "cleanup_recovery_required";
+					throw cleanupFailure;
+				}
 			}
+			if (statusResult.status !== 0) emitProgress(null);
 		} catch (error) {
+			if (error?.code === "cleanup_recovery_required") throw error;
 			lastStatusResult = { status: "threw", stderr: error.message };
+			emitProgress(null);
 		}
 
 		const elapsed = Date.now() - start;
@@ -391,6 +455,7 @@ describe("detached fixture terminal cleanup guard", () => {
 			{ state: "failed", cleanupState: "complete", workerPid: null },
 		];
 		let pollCount = 0;
+		const progress = [];
 		const terminal = await awaitRunTerminalCleanup(
 			"fixture-run",
 			{},
@@ -402,12 +467,45 @@ describe("detached fixture terminal cleanup guard", () => {
 					stdout: JSON.stringify(statuses[pollCount++]),
 					stderr: "",
 				}),
+				progressInterval: 0,
+				onProgress: (event) => progress.push(event),
 				sleep: async () => {},
 			},
 		);
 
 		strictEqual(pollCount, 3);
 		strictEqual(terminal.cleanupState, "complete");
+		strictEqual(progress.length, 2);
+		strictEqual(progress[0].status.state, "running");
+		strictEqual(progress[1].status.cleanupState, "pending");
+
+		let recoveryPolls = 0;
+		await rejects(
+			awaitRunTerminalCleanup(
+				"recovery-run",
+				{},
+				{
+					maxWait: 300_000,
+					pollStatusFn: () => {
+						recoveryPolls += 1;
+						return {
+							status: 0,
+							stdout: JSON.stringify({
+								state: "recovery_required",
+								cleanupState: "failed",
+								workerPid: 123,
+							}),
+							stderr: "",
+						};
+					},
+					sleep: async () => {
+						throw new Error("must not sleep after recovery failure");
+					},
+				},
+			),
+			/entered unrecoverable cleanup state.*recovery_required/,
+		);
+		strictEqual(recoveryPolls, 1);
 
 		await rejects(
 			awaitRunTerminalCleanup(
@@ -870,6 +968,7 @@ describe("--exclude-provider on the detached worker path", () => {
 			let observedProvider = null;
 			let observedDescriptor = null;
 			let observedDescriptorIdentity = null;
+			let terminalDiagnostic = null;
 			const start = Date.now();
 			// A full linked/full clone + boot of the golden image replaces the old
 			// Docker cold-start (~24.9s under sustained load) this budget used to be
@@ -899,10 +998,11 @@ describe("--exclude-provider on the detached worker path", () => {
 			// activeTaskProvider populated — the routed provider is still on the
 			// terminal event worker-bootstrap.mjs's onResult callback records.
 			if (!observedProvider) {
-				const { readEvents } = await import(
+				const { readEvents, readRun } = await import(
 					"../src/switchyard/run-store/index.mjs"
 				);
 				const events = await readEvents(runId);
+				const run = await readRun(runId);
 				const routedEvent = events.find(
 					(e) =>
 						e.phase === "execution" &&
@@ -911,9 +1011,13 @@ describe("--exclude-provider on the detached worker path", () => {
 				observedProvider = routedEvent?.provider ?? null;
 				observedDescriptor = routedEvent?.invocationDescriptor ?? null;
 				observedDescriptorIdentity = routedEvent?.descriptorIdentity ?? null;
+				terminalDiagnostic = providerFilterDiagnostic(run, events);
 			}
 
-			ok(observedProvider, "expected the task to be routed to some provider");
+			ok(
+				observedProvider,
+				`expected the task to be routed to some provider; terminal diagnostic: ${JSON.stringify(terminalDiagnostic ?? providerFilterDiagnostic(null, []))}`,
+			);
 			strictEqual(
 				observedProvider,
 				"codex",
@@ -1034,6 +1138,7 @@ describe("--only-provider on the detached worker path", () => {
 			detachedCleanupRunId = runId;
 
 			let observedProvider = null;
+			let terminalDiagnostic = null;
 			const start = Date.now();
 			// See the --exclude-provider test's matching comment: unverified against
 			// real hardware, conservative budget for a full clone + boot.
@@ -1054,19 +1159,24 @@ describe("--only-provider on the detached worker path", () => {
 			}
 
 			if (!observedProvider) {
-				const { readEvents } = await import(
+				const { readEvents, readRun } = await import(
 					"../src/switchyard/run-store/index.mjs"
 				);
 				const events = await readEvents(runId);
+				const run = await readRun(runId);
 				const routedEvent = events.find(
 					(e) =>
 						e.phase === "execution" &&
 						(e.event === "task_completed" || e.event === "task_failed"),
 				);
 				observedProvider = routedEvent?.provider ?? null;
+				terminalDiagnostic = providerFilterDiagnostic(run, events);
 			}
 
-			ok(observedProvider, "expected the task to be routed to some provider");
+			ok(
+				observedProvider,
+				`expected the task to be routed to some provider; terminal diagnostic: ${JSON.stringify(terminalDiagnostic ?? providerFilterDiagnostic(null, []))}`,
+			);
 			strictEqual(
 				observedProvider,
 				"codex",
@@ -1157,6 +1267,98 @@ describe("terminal run releases the project lock", () => {
 	});
 });
 
+describe("project-lock reconciliation without managed VMs", () => {
+	it("recover --state-root releases one stale lock once with no VM candidate", async () => {
+		const {
+			acquireProjectLock,
+			advanceState,
+			initializeRun,
+			isProjectLockHeld,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
+		const { handleRecover } = await import(
+			"../src/switchyard/dispatch/index.mjs"
+		);
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(runId, "failed");
+		const current = await readRun(runId);
+		await updateRun(runId, { cleanupState: "complete" }, current.revision);
+		await acquireProjectLock(projectDir, runId);
+
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(line);
+		const dependencies = {
+			executionBackend: {
+				listManaged: () => [],
+				reclaim: () => ({ reclaimed: [], errors: [], skippedSnapshots: [] }),
+			},
+		};
+		try {
+			await handleRecover(["--state-root", stateRoot], dependencies);
+			await handleRecover(["--state-root", stateRoot], dependencies);
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+		strictEqual(JSON.parse(output[0]).projectLocksReleased, 1);
+		strictEqual(JSON.parse(output[1]).projectLocksReleased, 0);
+		strictEqual(isProjectLockHeld(projectDir), false);
+	});
+
+	it("never enters the queue when ownership reassertion fails", async () => {
+		const { runDispatch: runDispatchInProcess } = await import(
+			"../src/switchyard/dispatch/index.mjs"
+		);
+		let queueEntries = 0;
+		await rejects(
+			runDispatchInProcess(
+				{
+					tasksFilePath: tasksFile,
+					projectPath: projectDir,
+					maxTasks: 1,
+					checkpointPath: undefined,
+					stopOnFailure: true,
+					excludeProviders: [],
+					onlyProviders: [],
+					taskIds: ["1.1"],
+					platform: "macos",
+				},
+				{
+					assertGenerationAllowed: () => {},
+					releaseOrphanedProjectLocks: async () => [],
+					reconcileProjectLockClaims: async () => [],
+					assertProjectLockOwnership: async () => false,
+					executionBackend: {
+						listManaged: () => [],
+						reclaim: () => ({
+							reclaimed: [],
+							errors: [],
+							skippedSnapshots: [],
+						}),
+					},
+					runQueue: async () => {
+						queueEntries += 1;
+						return null;
+					},
+				},
+			),
+		);
+		strictEqual(queueEntries, 0);
+	});
+});
+
 describe("recover releases stale project locks", {
 	skip: PARALLELS_PREREQUISITE_REASON
 		? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
@@ -1169,6 +1371,8 @@ describe("recover releases stale project locks", {
 			advanceState,
 			acquireProjectLock,
 			isProjectLockHeld,
+			readRun,
+			updateRun,
 		} = await import("../src/switchyard/run-store/index.mjs");
 
 		const runId = randomUUID();
@@ -1181,9 +1385,11 @@ describe("recover releases stale project locks", {
 			workerNonce: randomUUID(),
 			launchArgs: [],
 		});
-		// Terminal, dead run that still holds its project lock (the Bug 1
-		// residue a hard-crashed worker would leave behind).
+		// Terminal-clean, dead run that still holds its project lock: the stale-lock
+		// residue a hard-crashed worker would leave behind.
 		await advanceState(runId, "failed");
+		const current = await readRun(runId);
+		await updateRun(runId, { cleanupState: "complete" }, current.revision);
 		await acquireProjectLock(projectDir, runId);
 		strictEqual(isProjectLockHeld(projectDir), true);
 
@@ -1679,9 +1885,165 @@ describe("non-matching nonce", () => {
 		ok(!JSON.stringify(run.lastFailure).includes("non-existent-tasks.md"));
 		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
 	});
+
+	it("persists closed backend stage codes without durable error details", async () => {
+		const { initializeRun, readEvents, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const errorModulePath = resolve(
+			__dirname,
+			"..",
+			"src",
+			"switchyard",
+			"adapter",
+			"exec-error.mjs",
+		);
+
+		for (const diagnosticCode of [
+			"clone_hardening_failed",
+			"workspace_prepare_failed",
+		]) {
+			const runId = randomUUID();
+			const nonce = randomUUID();
+			const canary = `SECRET-${diagnosticCode}-${randomUUID()}`;
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: nonce,
+				launchArgs: [],
+			});
+			await updateRun(runId, { dispatchContractVersion: 99 }, 1);
+
+			const child = spawnSync(
+				process.execPath,
+				[
+					"--input-type=module",
+					"-e",
+					`
+					import { WorkerBootStageError } from ${JSON.stringify(errorModulePath)};
+					process.nextTick(() => {
+						const cause = Object.assign(new Error(${JSON.stringify(`${canary} /host/private/path provider output`)}), {
+							path: ${JSON.stringify(`/host/private/${canary}`)},
+							providerOutput: ${JSON.stringify(`raw provider output ${canary}`)},
+						});
+						throw new WorkerBootStageError(${JSON.stringify(diagnosticCode)}, cause);
+					});
+					await import(${JSON.stringify(BOOTSTRAP_PATH)});
+					`,
+					"--",
+					"--state-root",
+					stateRoot,
+					"--run-id",
+					runId,
+					"--nonce",
+					nonce,
+				],
+				{
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "pipe"],
+					env: { ...process.env, ...makeStateRootEnv() },
+				},
+			);
+			strictEqual(child.status, 1);
+			strictEqual(child.stderr, "");
+			ok(!child.stderr.includes(canary));
+			ok(!child.stderr.includes("/host/private/path"));
+			ok(!child.stderr.includes("raw provider output"));
+			ok(!child.stderr.includes("providerOutput"));
+
+			const events = await readEvents(runId);
+			const bootFailed = events.find(
+				(event) => event.event === "worker_boot_failed",
+			);
+			ok(bootFailed, `${diagnosticCode}: worker_boot_failed event recorded`);
+			strictEqual(bootFailed.diagnosticCode, diagnosticCode);
+			strictEqual(bootFailed.errorKind, "launch_failed");
+			strictEqual(bootFailed.failurePhase, "worker_boot");
+
+			const run = await readRun(runId);
+			strictEqual(run.lastFailure.diagnosticCode, diagnosticCode);
+			const durableEvidence = JSON.stringify({ events, run });
+			ok(!durableEvidence.includes(canary));
+			ok(!durableEvidence.includes("/host/private/path"));
+			ok(!durableEvidence.includes("raw provider output"));
+			ok(!durableEvidence.includes("providerOutput"));
+		}
+	});
 });
 
 describe("checkpoint identity failures on detached worker path (Task 1.3)", () => {
+	it("terminalizes an unknown CheckpointIdentityError with closed fatal evidence", async () => {
+		const { initializeRun, readEvents, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const runId = randomUUID();
+		const nonce = randomUUID();
+		const loaderPath = join(dir, "unknown-checkpoint-identity-loader.mjs");
+		const arbitraryCode = "checkpoint_unrecognized_test_code";
+		const arbitraryDetail = "must-not-persist:/private/example";
+
+		writeFileSync(
+			loaderPath,
+			`export async function load(url, context, nextLoad) {
+				if (url.endsWith("/src/switchyard/runner/index.mjs")) {
+					return {
+						format: "module",
+						shortCircuit: true,
+						source: ${JSON.stringify(`const error = new Error(${JSON.stringify(arbitraryDetail)});\nerror.name = "CheckpointIdentityError";\nerror.code = "${arbitraryCode}";\nthrow error;\n`)},
+					};
+				}
+				return nextLoad(url, context);
+			}`,
+			"utf8",
+		);
+
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+			{
+				...makeStateRootEnv(),
+				NODE_OPTIONS: `--experimental-loader=${loaderPath}`,
+			},
+		);
+
+		strictEqual(
+			result.status,
+			1,
+			`expected exit 1, got ${result.status}: ${result.stderr}`,
+		);
+
+		const events = await readEvents(runId);
+		const bootFailed = events.find(
+			(event) => event.event === "worker_boot_failed",
+		);
+		ok(bootFailed, "worker_boot_failed event recorded");
+		strictEqual(bootFailed.status, "fatal");
+		strictEqual(bootFailed.reasonCode, "launch_failed");
+		strictEqual(bootFailed.diagnosticCode, "worker_boot_exception");
+		ok(!JSON.stringify(bootFailed).includes(arbitraryCode));
+		ok(!JSON.stringify(bootFailed).includes(arbitraryDetail));
+
+		const run = await readRun(runId);
+		strictEqual(run.state, "failed");
+		strictEqual(run.cleanupState, "complete");
+		strictEqual(run.lastFailure.diagnosticCode, "worker_boot_exception");
+		ok(!JSON.stringify(run).includes(arbitraryCode));
+		ok(!JSON.stringify(run).includes(arbitraryDetail));
+	});
+
 	it("bootstrap with run-options mismatch emits checkpoint_run_options_mismatch", async () => {
 		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -1975,6 +2337,50 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 });
 
 describe("fast/failed bootstrap", () => {
+	it("emits one fixed diagnostic when the run record is missing", async () => {
+		const runId = `missing-${randomUUID()}`;
+		const canary = "SECRET_CANARY_MISSING_RUN";
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", canary],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(result.status, 1);
+		strictEqual(
+			result.stderr,
+			"worker-bootstrap: fatal event persistence unavailable; durable run state may be incomplete\n",
+		);
+		ok(!result.stderr.includes(canary));
+		ok(!existsSync(resolve(stateRoot, "runs", runId, "run.json")));
+	});
+
+	it("emits one fixed diagnostic and preserves corrupt run.json", async () => {
+		const runId = `corrupt-${randomUUID()}`;
+		const canary = "SECRET_CANARY_CORRUPT_RUN";
+		const runRoot = resolve(stateRoot, "runs", runId);
+		const runJsonPath = resolve(runRoot, "run.json");
+		mkdirSync(runRoot, { recursive: true });
+		// An unreadable run.json (a directory) exercises the filesystem-error
+		// path, which retention conservatively leaves in place.
+		mkdirSync(runJsonPath);
+		const canaryPath = resolve(runJsonPath, "canary");
+		writeFileSync(canaryPath, canary, "utf8");
+
+		const result = runBootstrap(
+			["--state-root", stateRoot, "--run-id", runId, "--nonce", canary],
+			makeStateRootEnv(),
+		);
+
+		strictEqual(result.status, 1);
+		strictEqual(
+			result.stderr,
+			"worker-bootstrap: fatal event persistence unavailable; durable run state may be incomplete\n",
+		);
+		ok(!result.stderr.includes(canary));
+		ok(existsSync(runJsonPath));
+		strictEqual(readFileSync(canaryPath, "utf8"), canary);
+	});
+
 	it("bootstrap that fails to import the runner records worker_boot_failed and does not hang", async () => {
 		const { initializeRun, readEvents, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -2387,22 +2793,13 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 		strictEqual(bootFailed.diagnosticCode, "worker_boot_exception");
 		strictEqual(bootFailed.failurePhase, "worker_boot");
 
-		// Check boot-stderr.log contains the stack
+		// Fatal handlers do not echo raw exception messages or stack frames.
 		ok(existsSync(bootLogPath), "boot-stderr.log must exist");
 		const bootStderr = readFileSync(bootLogPath, "utf8");
-		ok(
-			bootStderr.includes(
-				"Error: Simulated uncaught boot explosion for Task 1.1",
-			),
-			`expected stack in boot-stderr.log, got: ${bootStderr}`,
-		);
-		ok(
-			bootStderr.includes(" at "),
-			`expected stack frames in boot-stderr.log, got: ${bootStderr}`,
-		);
+		strictEqual(bootStderr, "");
 	});
 
-	it("boot past identity checks unlinks boot-stderr.log from run directory", async () => {
+	it("retains boot-stderr.log when the worker fails before provider routing", async () => {
 		const { getRunRoot, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
@@ -2426,10 +2823,9 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 			await new Promise((r) => setTimeout(r, 50));
 		}
 
-		// Absence of the file is vacuous on its own — a worker that never
-		// booted also leaves no file. The state advancing past "launching"
-		// is what proves it executed the identity checks the unlink sits
-		// immediately after.
+		// State advancement proves the worker executed its identity checks. In
+		// this fixture provider admission fails, so the boot log remains as the
+		// bounded pre-provider diagnostic channel.
 		ok(
 			finalState !== "launching",
 			`worker never advanced past launching (state=${finalState}); unlink assertion below would be vacuous`,
@@ -2437,10 +2833,7 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 
 		const runRoot = getRunRoot(runId);
 		const bootLogPath = resolve(runRoot, "boot-stderr.log");
-		ok(
-			!existsSync(bootLogPath),
-			`expected boot-stderr.log to be unlinked after successful boot, but it still exists at ${bootLogPath}`,
-		);
+		ok(existsSync(bootLogPath), "pre-provider failure retains boot-stderr.log");
 	});
 
 	it("nonce mismatch with secret canary never writes canary to boot-stderr.log bytes", async () => {

@@ -27,6 +27,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -51,9 +52,43 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"roster.fixture.json",
 );
 
+function exactFailureEvidence(targetId, harness, model, taskId = "1.1") {
+	const descriptorCore = {
+		target_id: targetId,
+		model_ref: model,
+		selector: model,
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	};
+	const descriptorIdentity = getInvocationDescriptorIdentity(
+		descriptorCore,
+		harness,
+	);
+	return {
+		taskId,
+		success: false,
+		provider: harness,
+		model,
+		resolvedTargetId: targetId,
+		invocationDescriptor: {
+			...descriptorCore,
+			descriptor_identity: descriptorIdentity,
+		},
+		descriptorIdentity,
+		descriptorHarness: harness,
+		result: "execution_failed",
+		errorKind: "execution_failed",
+		reasonCode: "execution_failed",
+		reason: "Provider execution failed before a reviewed integration.",
+		failurePhase: "provider_execution",
+	};
+}
+
 import {
 	captureHostFingerprint,
 	runDispatch as dispatchRun,
+	handleLaunch,
 	handleRecover,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
@@ -79,6 +114,29 @@ function runDispatch(args, env = {}, timeout = 10_000) {
 		timeout,
 		env: { ...process.env, ...env },
 	});
+}
+
+async function captureLaunchJson(args, dependencies = {}) {
+	const output = [];
+	const errors = [];
+	const originalLog = console.log;
+	const originalError = console.error;
+	const originalExitCode = process.exitCode;
+	console.log = (line) => output.push(String(line));
+	console.error = (line) => errors.push(String(line));
+	try {
+		await handleLaunch(args, dependencies);
+	} finally {
+		console.log = originalLog;
+		console.error = originalError;
+		process.exitCode = originalExitCode;
+	}
+	strictEqual(
+		output.length,
+		1,
+		`expected one stdout object, got ${output.length}`,
+	);
+	return { envelope: JSON.parse(output[0]), errors };
 }
 
 let dir;
@@ -365,6 +423,15 @@ describe("CLI queue-level platform selection", () => {
 						},
 					},
 				}),
+			// Keep the queue-level platform test hermetic: the pre-dispatch
+			// hygiene sweep must not query or mutate host Parallels inventory.
+			listManaged: () => [],
+			reclaim: () => ({
+				reclaimed: [],
+				reclaimedSnapshots: [],
+				skippedSnapshots: [],
+				errors: [],
+			}),
 		});
 		strictEqual(calls.includes("create-vm"), true);
 		strictEqual(calls.includes("destroy-vm"), true);
@@ -601,6 +668,173 @@ describe("launch integration", () => {
 				readdirSync(join(stateRoot, "locks")).length === 0,
 			"no project lock should be created for a 0-task queue",
 		);
+	});
+
+	it("launch --json zero-task fixture emits exactly one pre-init object", () => {
+		const emptyTasksFile = join(dir, "empty-json-tasks.md");
+		writeFileSync(emptyTasksFile, "# No task headings.\n", "utf8");
+		const result = runDispatch(
+			["launch", emptyTasksFile, "--project", projectDir, "--json"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 2);
+		strictEqual(result.stdout.trim().split("\n").length, 1);
+		const envelope = JSON.parse(result.stdout);
+		strictEqual(envelope.runId, null);
+		strictEqual(envelope.statusCommand, null);
+		strictEqual(envelope.resultCommand, null);
+		strictEqual(envelope.disposition.action, "repair_contract");
+		strictEqual(envelope.disposition.reasonCode, "queue_empty");
+	});
+
+	it("launch --json identity fixture emits exactly one pre-init object", async () => {
+		const canary = "SECRET_CANARY_identity_failure";
+		const { envelope, errors } = await captureLaunchJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			{
+				prepareRunIdentity: () => {
+					throw new Error(canary);
+				},
+			},
+		);
+		strictEqual(envelope.runId, null);
+		strictEqual(envelope.statusCommand, null);
+		strictEqual(envelope.resultCommand, null);
+		strictEqual(envelope.disposition.action, "repair_contract");
+		strictEqual(envelope.disposition.reasonCode, "queue_identity_invalid");
+		ok(!errors.join("\n").includes(canary));
+	});
+
+	for (const fixture of [
+		{
+			name: "lock-live",
+			holderLiveness: "live",
+			action: "defer",
+			reasonCode: "project_lock_owner_live",
+		},
+		{
+			name: "lock-dead",
+			holderLiveness: "dead",
+			action: "recover",
+			reasonCode: "project_lock_owner_dead",
+		},
+		{
+			name: "lock-unresolved",
+			holderLiveness: "unknown",
+			action: "stop",
+			reasonCode: "project_lock_ownership_unresolved",
+		},
+	]) {
+		it(`launch --json ${fixture.name} fixture emits one durable object`, async () => {
+			const { LockError } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			const holderRunId = `${fixture.name}-${randomUUID()}`;
+			const { envelope } = await captureLaunchJson(
+				[tasksFile, "--project", projectDir, "--json"],
+				{
+					releaseOrphanedProjectLocks: async () => [],
+					reconcileProjectLockClaims: async () => [],
+					acquireProjectLock: async () => {
+						throw new LockError("closed fixture", {
+							code: "PROJECT_LOCK_HELD",
+							holderRunId,
+						});
+					},
+					readRun: async () => ({ runId: holderRunId }),
+					classifyRunLiveness: () => fixture.holderLiveness,
+				},
+			);
+			ok(typeof envelope.runId === "string");
+			ok(envelope.statusCommand.includes(envelope.runId));
+			ok(envelope.resultCommand.includes(envelope.runId));
+			strictEqual(envelope.disposition.action, fixture.action);
+			strictEqual(envelope.disposition.reasonCode, fixture.reasonCode);
+			if (fixture.action === "defer") {
+				strictEqual(envelope.disposition.blockingRunId, holderRunId);
+			}
+			if (fixture.action === "recover") {
+				ok(envelope.disposition.recoveryCommand.includes(holderRunId));
+				ok(envelope.disposition.recoveryCommand.includes("--state-root"));
+			}
+		});
+	}
+
+	it("launch --json spawn fixture emits one durable canary-free object", async () => {
+		const canary = "SECRET_CANARY_spawn_failure";
+		const fakeChild = {
+			unref() {},
+			on(event, listener) {
+				if (event === "error") listener(new Error(canary));
+				return this;
+			},
+		};
+		const { envelope, errors } = await captureLaunchJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			{ spawn: () => fakeChild },
+		);
+		ok(typeof envelope.runId === "string");
+		ok(envelope.statusCommand.includes(envelope.runId));
+		ok(envelope.resultCommand.includes(envelope.runId));
+		strictEqual(envelope.disposition.action, "repair_contract");
+		strictEqual(envelope.disposition.reasonCode, "worker_boot_exception");
+		ok(!errors.join("\n").includes(canary));
+	});
+
+	it("launch --json success fixture emits exactly one parseable object", () => {
+		const result = runDispatch(
+			["launch", tasksFile, "--project", projectDir, "--json"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, result.stderr);
+		strictEqual(result.stdout.trim().split("\n").length, 1);
+		const envelope = JSON.parse(result.stdout);
+		strictEqual(envelope.state, "launcher_ready");
+		ok(typeof envelope.runId === "string");
+	});
+
+	it("a launched run retains its durable contract diagnosis when its checkpoint becomes unloadable", async () => {
+		const launchResponse = runDispatch(
+			["launch", tasksFile, "--project", projectDir, "--json"],
+			makeStateRootEnv(),
+		);
+		strictEqual(launchResponse.status, 0, launchResponse.stderr);
+		const launchEnvelope = JSON.parse(launchResponse.stdout.trim());
+		const { readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const current = await readRun(launchEnvelope.runId);
+		await updateRun(
+			launchEnvelope.runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: {
+					errorKind: "execution_failed",
+					reasonCode: "execution_failed",
+					reason: "Provider execution failed before a reviewed integration.",
+					diagnosticCode: "checkpoint_queue_identity_mismatch",
+					failurePhase: "adapter_validation",
+				},
+			},
+			current.revision,
+		);
+		writeFileSync(`${tasksFile}.checkpoint.json`, "{unloadable", "utf8");
+
+		const responses = [
+			[0, runDispatch(["status", launchEnvelope.runId], makeStateRootEnv())],
+			[1, runDispatch(["result", launchEnvelope.runId], makeStateRootEnv())],
+		];
+		for (const [expectedStatus, response] of responses) {
+			strictEqual(response.status, expectedStatus, response.stderr);
+			const envelope = JSON.parse(response.stdout.trim());
+			strictEqual(envelope.runId, launchEnvelope.runId);
+			strictEqual(envelope.disposition.action, "repair_contract");
+			strictEqual(
+				envelope.disposition.reasonCode,
+				"checkpoint_queue_identity_mismatch",
+			);
+		}
 	});
 
 	it("launch with valid args exits 0 and produces JSON envelope", () => {
@@ -1075,6 +1309,106 @@ describe("recover integration", () => {
 		ok(Array.isArray(output.errors));
 		ok(Array.isArray(output.candidates) || output.candidates === null);
 	});
+
+	it("finalizes a dead old run while preserving a newer live project-lock owner", async () => {
+		const {
+			acquireProjectLock,
+			advanceState,
+			initializeRun,
+			isProjectLockOwnedBy,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
+		const staleRunId = randomUUID();
+		await initializeRun({
+			runId: staleRunId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(staleRunId, "running");
+		let current = await readRun(staleRunId);
+		await updateRun(staleRunId, { workerPid: 999999 }, current.revision);
+
+		const activeRunId = randomUUID();
+		await initializeRun({
+			runId: activeRunId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(activeRunId, "running");
+		current = await readRun(activeRunId);
+		await updateRun(activeRunId, { workerPid: process.pid }, current.revision);
+		await acquireProjectLock(projectDir, activeRunId);
+
+		const output = [];
+		const originalLog = console.log;
+		const originalExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", staleRunId], { listManaged: () => [] });
+		} finally {
+			console.log = originalLog;
+			process.exitCode = originalExitCode;
+		}
+
+		const envelope = JSON.parse(output[0]);
+		deepStrictEqual(envelope.errors, []);
+		strictEqual(envelope.projectLocksReleased, 0);
+		strictEqual(await isProjectLockOwnedBy(projectDir, activeRunId), true);
+		const staleRun = await readRun(staleRunId);
+		strictEqual(staleRun.state, "failed");
+		strictEqual(staleRun.cleanupState, "complete");
+		strictEqual(staleRun.terminalizedBy, "dead_worker_recovery");
+	});
+
+	it("counts a project lock successfully released by dead-run finalization", async () => {
+		const {
+			acquireProjectLock,
+			advanceState,
+			initializeRun,
+			isProjectLockHeld,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(runId, "running");
+		const current = await readRun(runId);
+		await updateRun(runId, { workerPid: 999999 }, current.revision);
+		await acquireProjectLock(projectDir, runId);
+
+		const output = [];
+		const originalLog = console.log;
+		const originalExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", runId], { listManaged: () => [] });
+		} finally {
+			console.log = originalLog;
+			process.exitCode = originalExitCode;
+		}
+
+		const envelope = JSON.parse(output[0]);
+		deepStrictEqual(envelope.errors, []);
+		strictEqual(envelope.projectLocksReleased, 1);
+		strictEqual(isProjectLockHeld(projectDir), false);
+	});
 });
 
 describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
@@ -1127,6 +1461,69 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 		});
 
 		deepStrictEqual(swept.unreclaimedSnapshots, []);
+	});
+
+	it("pre-run sweep filters VM reclaim to readable dead runs in the current project", async () => {
+		const currentProject = join(dir, "current-project");
+		const entries = [
+			{ runId: "local-dead", name: "local-dead", status: "stopped" },
+			{ runId: "local-live", name: "local-live", status: "stopped" },
+			{ runId: "foreign-dead", name: "foreign-dead", status: "stopped" },
+			{ runId: "missing", name: "missing", status: "stopped" },
+			{ runId: "malformed", name: "malformed", status: "stopped" },
+		];
+		const runs = {
+			"local-dead": {
+				projectPath: currentProject,
+				state: "running",
+				cleanupState: "pending",
+				workerPid: 999999,
+			},
+			"local-live": {
+				projectPath: currentProject,
+				state: "running",
+				cleanupState: "pending",
+				workerPid: process.pid,
+			},
+			"foreign-dead": {
+				projectPath: join(dir, "foreign-project"),
+				state: "failed",
+				cleanupState: "complete",
+				workerPid: null,
+			},
+		};
+		let reclaimOptions;
+		const swept = await sweepManagedOrphans({
+			projectPath: currentProject,
+			listManaged: () => entries,
+			readRun: async (runId) => {
+				if (runId === "missing" || runId === "malformed") {
+					throw new Error("unavailable");
+				}
+				return runs[runId];
+			},
+			reclaim: (options) => {
+				reclaimOptions = options;
+				const reclaimed = entries.filter((entry) => options.eligibility(entry));
+				return {
+					reclaimed,
+					reclaimedSnapshots: [],
+					skippedSnapshots: [],
+					errors: [],
+				};
+			},
+			releaseOrphanedProjectLocks: async () => [],
+			reconcileProjectLockClaims: async () => [],
+		});
+
+		deepStrictEqual(
+			reclaimOptions &&
+				entries
+					.filter((entry) => reclaimOptions.eligibility(entry))
+					.map((entry) => entry.runId),
+			["local-dead"],
+		);
+		strictEqual(swept.vmsReclaimed, 1);
 	});
 
 	it("recover's JSON envelope names the golden's leftover snapshots", async () => {
@@ -1617,6 +2014,134 @@ describe("envelope format", () => {
 				"SECRET_CANARY",
 			),
 		);
+	});
+
+	it("status and result project descriptor-bound Agy-to-OpenCode checkpoint evidence", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { saveCheckpoint } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+		const runId = "agy-opencode-attempts";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		const agyFailure = exactFailureEvidence(
+			"antigravity",
+			"agy",
+			"fixture-agy-standard",
+		);
+		const opencodeFailure = exactFailureEvidence(
+			"opencode-go",
+			"opencode",
+			"fixture/opencode-standard",
+		);
+		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+			version: 1,
+			tasksFilePath: tasksFile,
+			completedTaskIds: [],
+			lastTaskId: "1.1",
+			lastUpdatedAt: new Date().toISOString(),
+			results: [opencodeFailure],
+			retryAttempts: [agyFailure],
+		});
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: {
+					errorKind: "execution_failed",
+					reasonCode: "execution_failed",
+					reason: "Provider execution failed before a reviewed integration.",
+					failurePhase: "provider_execution",
+				},
+				terminalizedBy: "worker",
+				terminalSummary: { processedTasks: 1 },
+			},
+			current.revision,
+		);
+
+		const statusEnvelope = JSON.parse(
+			runDispatch(["status", runId], makeStateRootEnv()).stdout.trim(),
+		);
+		const resultResponse = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultResponse.status, 1);
+		const resultEnvelope = JSON.parse(resultResponse.stdout.trim());
+		for (const envelope of [statusEnvelope, resultEnvelope]) {
+			strictEqual(envelope.disposition.action, "target_failed");
+			strictEqual(envelope.disposition.taskId, "1.1");
+			deepStrictEqual(envelope.disposition.failedTargetIds, [
+				"antigravity",
+				"opencode-go",
+			]);
+		}
+	});
+
+	it("six sanitized OpenCode failures emit bounded target evidence without cooldown state", async () => {
+		const { createEvent, initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { saveCheckpoint } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+		const runId = "opencode-six-failures";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+			version: 1,
+			tasksFilePath: tasksFile,
+			completedTaskIds: [],
+			lastTaskId: "1.1",
+			lastUpdatedAt: new Date().toISOString(),
+			results: [],
+		});
+		const failureEvidence = exactFailureEvidence(
+			"opencode-go",
+			"opencode",
+			"fixture/opencode-standard",
+		);
+		for (let attempt = 0; attempt < 6; attempt += 1) {
+			await createEvent(runId, {
+				...failureEvidence,
+				phase: "execution",
+				event: "task_failed",
+				status: "Task 1.1 failed",
+			});
+		}
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				terminalizedBy: "worker",
+				terminalSummary: { processedTasks: 1 },
+			},
+			current.revision,
+		);
+
+		const response = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(response.status, 1);
+		const envelope = JSON.parse(response.stdout.trim());
+		deepStrictEqual(envelope.disposition.failedTargetIds, ["opencode-go"]);
+		strictEqual(Object.hasOwn(envelope, "cooldown"), false);
+		strictEqual(Object.hasOwn(envelope.disposition, "cooldown"), false);
+		const persistedRun = await readRun(runId);
+		strictEqual(Object.hasOwn(persistedRun, "cooldown"), false);
 	});
 });
 

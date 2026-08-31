@@ -420,62 +420,168 @@ export async function captureProviderDiffAsync(
 	workingContainerName,
 	options = {},
 ) {
+	const result = await captureProviderDiffDetailedAsync(
+		workingContainerName,
+		options,
+	);
+	return result.status === "captured" ? result.diff : null;
+}
+
+/**
+ * Capture a diff while retaining a bounded, non-content outcome classification.
+ * The legacy captureProviderDiffAsync API intentionally remains string/null.
+ *
+ * @returns {Promise<{status: "captured"|"empty"|"stage_failed"|"diff_failed"|"transport_failed"|"timed_out", diff: string|null, reasonCode?: string}>}
+ */
+export async function captureProviderDiffDetailedAsync(
+	workingContainerName,
+	options = {},
+) {
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
 	} catch {
-		return null;
+		return {
+			status: "stage_failed",
+			diff: null,
+			reasonCode: "invalid_workspace",
+		};
 	}
-	const { spawnFn, timeoutMs = 30_000, ...lifecycleOptions } = options;
+	const {
+		spawnFn,
+		timeoutMs = 30_000,
+		executionBackend,
+		cleanup,
+		onStatus,
+		cleanupContext,
+		...lifecycleOptions
+	} = options;
+	const captureCleanup = (command, args) => async () => {
+		let backendError = null;
+		let backendHandled = false;
+		if (typeof executionBackend?.cleanupProviderProcess === "function") {
+			try {
+				await executionBackend.cleanupProviderProcess(command, args, {
+					onStatus,
+					workspaceId: workingContainerName,
+					...(cleanupContext ?? {}),
+				});
+				backendHandled = true;
+			} catch (error) {
+				backendError = error;
+			}
+		}
+		if (!backendHandled && typeof cleanup === "function") await cleanup();
+		if (backendError) throw backendError;
+	};
 	const lifecycle = {
 		...lifecycleOptions,
 		spawnFn,
 		timeoutMs,
 	};
-	const stage = getWorkspaceExecution(workingContainerName, {
-		...options,
-		recordPid: false,
-		argv: ["git", "add", "-A"],
+	let stage;
+	try {
+		stage = getWorkspaceExecution(workingContainerName, {
+			...options,
+			recordPid: true,
+			argv: ["git", "add", "-A"],
+		});
+	} catch {
+		return { status: "transport_failed", diff: null };
+	}
+	const add = await runProviderProcess(stage.command, stage.args, {
+		...lifecycle,
+		cleanup: captureCleanup(stage.command, stage.args),
 	});
-	const add = await runProviderProcess(stage.command, stage.args, lifecycle);
-	if (!add.success) return null;
-	const capture = getWorkspaceExecution(workingContainerName, {
-		...options,
-		recordPid: false,
-		argv: ["git", "diff", "--cached", "HEAD"],
+	if (!add.success) {
+		return {
+			status: add.timedOut
+				? "timed_out"
+				: add.error
+					? "transport_failed"
+					: "stage_failed",
+			diff: null,
+		};
+	}
+	let capture;
+	try {
+		capture = getWorkspaceExecution(workingContainerName, {
+			...options,
+			recordPid: true,
+			argv: ["git", "diff", "--cached", "HEAD"],
+		});
+	} catch {
+		return { status: "transport_failed", diff: null };
+	}
+	const diff = await runProviderProcess(capture.command, capture.args, {
+		...lifecycle,
+		cleanup: captureCleanup(capture.command, capture.args),
 	});
-	const diff = await runProviderProcess(
-		capture.command,
-		capture.args,
-		lifecycle,
-	);
-	return diff.success && /\S/u.test(diff.output) ? diff.output : null;
+	if (!diff.success) {
+		return {
+			status: diff.timedOut
+				? "timed_out"
+				: diff.error
+					? "transport_failed"
+					: "diff_failed",
+			diff: null,
+		};
+	}
+	return /\S/u.test(diff.output)
+		? { status: "captured", diff: diff.output }
+		: { status: "empty", diff: null };
 }
 
-/** Capture a working-container diff synchronously through the backend seam. */
-export function captureProviderDiff(workingContainerName, options = {}) {
+/** Capture a working-container diff synchronously with bounded outcome evidence. */
+export function captureProviderDiffDetailed(
+	workingContainerName,
+	options = {},
+) {
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
 	} catch {
-		return null;
+		return {
+			status: "stage_failed",
+			diff: null,
+			reasonCode: "invalid_workspace",
+		};
 	}
+	let stage;
 	try {
-		const stage = getWorkspaceExecution(workingContainerName, {
+		stage = getWorkspaceExecution(workingContainerName, {
 			...options,
-			recordPid: false,
+			recordPid: true,
 			argv: ["git", "add", "-A"],
 		});
 		execFileSync(stage.command, stage.args, { stdio: "pipe" });
+	} catch (error) {
+		return {
+			status: error?.status == null ? "transport_failed" : "stage_failed",
+			diff: null,
+		};
+	}
+	try {
 		const capture = getWorkspaceExecution(workingContainerName, {
 			...options,
-			recordPid: false,
+			recordPid: true,
 			argv: ["git", "diff", "--cached", "HEAD"],
 		});
 		const diff = execFileSync(capture.command, capture.args, {
 			encoding: "utf8",
 			stdio: "pipe",
 		});
-		return /\S/u.test(diff) ? diff : null;
-	} catch {
-		return null;
+		return /\S/u.test(diff)
+			? { status: "captured", diff }
+			: { status: "empty", diff: null };
+	} catch (error) {
+		return {
+			status: error?.status == null ? "transport_failed" : "diff_failed",
+			diff: null,
+		};
 	}
+}
+
+/** Capture a working-container diff synchronously through the backend seam. */
+export function captureProviderDiff(workingContainerName, options = {}) {
+	const result = captureProviderDiffDetailed(workingContainerName, options);
+	return result.status === "captured" ? result.diff : null;
 }

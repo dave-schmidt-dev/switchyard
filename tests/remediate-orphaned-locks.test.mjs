@@ -7,7 +7,13 @@
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -78,6 +84,10 @@ function projectLockFilePath(canonicalProjectPath) {
 	const resolvedPath = resolve(`project:${canonicalProjectPath}`);
 	const hash = createHash("sha256").update(resolvedPath).digest("hex");
 	return resolve(getStateRoot(), "locks", `${hash}.lock`);
+}
+
+function projectLockClaimFilePath(canonicalProjectPath) {
+	return `${projectLockFilePath(canonicalProjectPath)}.recovery-claim`;
 }
 
 async function makeStaleRun(overrides = {}) {
@@ -248,6 +258,49 @@ describe("resolveCandidates", () => {
 			[stale.runId, ghost.runId, preF1Stale.runId].sort(),
 		);
 	});
+
+	it("enumerates a valid stale recovery reservation as an ownership-safe candidate", async () => {
+		const opts = await makeStaleRun();
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const canonicalPath = projectLockFilePath(opts.projectPath);
+		const expectedRaw = await readFile(canonicalPath, "utf8");
+		writeFileSync(
+			projectLockClaimFilePath(opts.projectPath),
+			JSON.stringify({ claimState: "reservation", expectedRaw }),
+		);
+
+		const [descriptor] = (await resolveCandidates()).filter(
+			(candidate) => candidate.remediationKind === "recovery-claim",
+		);
+		ok(descriptor);
+		strictEqual(descriptor.category, "recovery-claim-reservation-stale");
+		strictEqual(descriptor.isCandidate, true);
+		strictEqual(descriptor.claimState, "reservation");
+	});
+
+	it("surfaces malformed and unbound recovery claims without making them candidates", async () => {
+		const locksDir = join(getStateRoot(), "locks");
+		mkdirSync(locksDir, { recursive: true });
+		writeFileSync(join(locksDir, "malformed.lock.recovery-claim"), "not json");
+		writeFileSync(
+			join(locksDir, "unbound.lock.recovery-claim"),
+			JSON.stringify({
+				claimState: "reservation",
+				expectedRaw: JSON.stringify({
+					runId: uniqueRunId(),
+					projectPath: uniquePath("wrong-claim-binding"),
+				}),
+			}),
+		);
+
+		const claims = (await resolveCandidates()).filter(
+			(candidate) => candidate.remediationKind === "recovery-claim",
+		);
+		strictEqual(claims.length, 2);
+		for (const claim of claims) strictEqual(claim.isCandidate, false);
+	});
 });
 
 describe("run() — printing and dry-run", () => {
@@ -301,6 +354,25 @@ describe("run() — printing and dry-run", () => {
 });
 
 describe("run() — confirmation gating", () => {
+	it("reconciles a valid recovery claim through the run-store ownership check", async () => {
+		const opts = await makeStaleRun();
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const canonicalPath = projectLockFilePath(opts.projectPath);
+		const expectedRaw = await readFile(canonicalPath, "utf8");
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeFileSync(
+			claimPath,
+			JSON.stringify({ claimState: "reservation", expectedRaw }),
+		);
+
+		const result = await run(["--confirm"], { log: () => {} });
+		strictEqual(result.removed.length, 2);
+		strictEqual(existsSync(claimPath), false);
+		strictEqual(isProjectLockHeld(opts.projectPath), false);
+	});
+
 	it("declining the interactive prompt leaves the fixture lock untouched", async () => {
 		const opts = await makeStaleRun();
 		await acquireProjectLock(opts.projectPath, opts.runId);

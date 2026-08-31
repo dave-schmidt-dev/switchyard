@@ -43,6 +43,7 @@ import {
 	executeCursorAsync,
 } from "../adapter/cursor.mjs";
 import {
+	INTEGRATION_REFUSAL_KINDS,
 	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
 	sanitizeFailureMetadata,
@@ -56,6 +57,8 @@ import {
 import {
 	captureDiff as captureVibeDiff,
 	captureDiffAsync as captureVibeDiffAsync,
+	captureDiffDetailed as captureVibeDiffDetailed,
+	captureDiffDetailedAsync as captureVibeDiffDetailedAsync,
 	execute as executeVibe,
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
@@ -404,6 +407,37 @@ export class TaskSelectionError extends Error {
 		this.taskId = taskId;
 		this.reason = reason;
 		this.code = reason;
+	}
+}
+
+/**
+ * Closed signal that an owned async queue workspace could not be torn down.
+ * The backend error is deliberately not retained: it may contain host paths or
+ * provider-controlled text, while detached finalization needs only the fixed
+ * recovery disposition and queue summary.
+ */
+export class QueueCleanupError extends Error {
+	constructor(queueResult = null) {
+		super("Async queue cleanup failed; recovery is required.");
+		this.name = "QueueCleanupError";
+		this.code = "recovery_incomplete";
+		this.failure = sanitizeFailureMetadata({
+			result: "unknown_failure",
+			errorKind: "unknown_failure",
+			diagnosticCode: "recovery_incomplete",
+			failurePhase: "terminal_reconciliation",
+		});
+		this.terminalSummary = {
+			totalTasks: queueResult?.totalTasks ?? null,
+			runnableTasks: queueResult?.runnableTasks ?? null,
+			processedTasks: queueResult?.processedTasks ?? null,
+			completedTaskIds: Array.isArray(queueResult?.completedTaskIds)
+				? [...queueResult.completedTaskIds]
+				: null,
+			failedCount: Array.isArray(queueResult?.results)
+				? queueResult.results.filter((result) => !result.success).length
+				: null,
+		};
 	}
 }
 
@@ -2413,7 +2447,17 @@ function isQuotaRetryCandidate(result, ownsWorkingContainer) {
 	);
 }
 
-function integrationFailureMetadata(
+const ALLOWED_INTEGRATION_MESSAGES = Object.freeze(
+	new Set([
+		"empty_required_diff",
+		"required_paths_missing",
+		"undeclared_paths_touched",
+		"no_op_diff",
+		...INTEGRATION_REFUSAL_KINDS,
+	]),
+);
+
+export function integrationFailureMetadata(
 	taskId,
 	diff,
 	credentialFlagged,
@@ -2424,11 +2468,16 @@ function integrationFailureMetadata(
 		PERSISTED_ERROR_KINDS.includes(gateResult.errorKind)
 			? gateResult.errorKind
 			: "integration_failed";
-	const diagnosticCode =
-		gateResult?.diagnosticCode ??
-		(PERSISTED_DIAGNOSTIC_CODES.includes(gateResult?.reasonKind)
-			? gateResult.reasonKind
-			: undefined);
+	const rawDiagnosticCode = PERSISTED_DIAGNOSTIC_CODES.includes(
+		gateResult?.reasonKind,
+	)
+		? gateResult.reasonKind
+		: ALLOWED_INTEGRATION_MESSAGES.has(gateResult?.message)
+			? gateResult.message
+			: undefined;
+	const diagnosticCode = PERSISTED_DIAGNOSTIC_CODES.includes(rawDiagnosticCode)
+		? rawDiagnosticCode
+		: undefined;
 	return sanitizeFailureMetadata({
 		taskId,
 		result: "integration_failed",
@@ -2448,6 +2497,61 @@ function opaqueArtifactRef(value) {
 	return typeof value === "string" && /^artifact:[a-f0-9]{24}$/.test(value)
 		? value
 		: undefined;
+}
+
+const DIFF_CAPTURE_STATUSES = new Set([
+	"captured",
+	"empty",
+	"stage_failed",
+	"diff_failed",
+	"transport_failed",
+	"timed_out",
+]);
+
+function normalizeDiffCaptureEvidence(value) {
+	if (typeof value === "string") {
+		return value.length > 0
+			? { status: "captured", diff: value }
+			: { status: "empty", diff: null };
+	}
+	if (
+		value &&
+		DIFF_CAPTURE_STATUSES.has(value.status) &&
+		(typeof value.diff === "string" || value.diff == null)
+	) {
+		return {
+			status: value.status,
+			diff: value.status === "captured" ? value.diff : null,
+			...(value.reasonCode ? { reasonCode: value.reasonCode } : {}),
+		};
+	}
+	// Legacy adapters expose only string/null. Preserve their existing failure
+	// semantics while allowing Vibe's detailed seam to report `empty` safely.
+	return { status: "transport_failed", diff: null };
+}
+
+function captureDiffWithEvidence(adapter, workspaceName, options) {
+	if (typeof adapter.captureDiffDetailed === "function") {
+		return normalizeDiffCaptureEvidence(
+			adapter.captureDiffDetailed(workspaceName, options),
+		);
+	}
+	const diff = adapter.captureDiff(workspaceName, options);
+	return typeof diff === "string"
+		? { status: diff.length > 0 ? "captured" : "empty", diff }
+		: { status: "transport_failed", diff: null };
+}
+
+async function captureDiffWithEvidenceAsync(adapter, workspaceName, options) {
+	if (typeof adapter.captureDiffDetailedAsync === "function") {
+		return normalizeDiffCaptureEvidence(
+			await adapter.captureDiffDetailedAsync(workspaceName, options),
+		);
+	}
+	const diff = await adapter.captureDiffAsync(workspaceName, options);
+	return typeof diff === "string"
+		? { status: diff.length > 0 ? "captured" : "empty", diff }
+		: { status: "transport_failed", diff: null };
 }
 
 /**
@@ -2681,15 +2785,34 @@ export function executeTask(task, context) {
 			// possibly mid-edit) diff can never auto-apply as if the task had
 			// succeeded. INV-2: the gate is the only reviewed door back to the
 			// host, and this diff has not been reviewed.
-			let partialDiff = null;
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_started",
+				status: `Task ${task.id} partial diff capture started`,
+				taskId: task.id,
+			});
+			let captureEvidence;
 			try {
-				partialDiff = adapter.captureDiff(context.workingContainerName, {
-					executionBackend: context.executionBackend,
-				});
+				captureEvidence = captureDiffWithEvidence(
+					adapter,
+					context.workingContainerName,
+					{ executionBackend: context.executionBackend },
+				);
 			} catch {
-				partialDiff = null;
+				captureEvidence = { status: "transport_failed", diff: null };
 			}
-			const captureFailed = !partialDiff;
+			const partialDiff = captureEvidence.diff;
+			const captureStatus = captureEvidence.status;
+			const captureFailed =
+				captureStatus !== "captured" && captureStatus !== "empty";
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_completed",
+				status: `Task ${task.id} partial diff capture ${captureStatus}`,
+				taskId: task.id,
+				captureStatus,
+				byteCount: partialDiff?.length ?? 0,
+			});
 			const cleanupFailed = execution.cleanupFailed === true;
 			const resultName = cleanupFailed
 				? "execution_timed_out_cleanup_failed"
@@ -2729,6 +2852,7 @@ export function executeTask(task, context) {
 					? { reasonCode: safeTimeoutFailure.reasonCode }
 					: {}),
 				reason: error ?? routeResult.reason,
+				captureStatus,
 				percentLeft: routeResult.percentLeft ?? undefined,
 				diagnosticCode:
 					safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
@@ -2761,9 +2885,35 @@ export function executeTask(task, context) {
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
 				cleanupStage: execution.cleanupStage,
+				captureStatus,
 				...(partialDiff ? { partialDiff } : {}),
 			};
 		}
+
+		context.onStatus?.({
+			phase: "execution",
+			event: "diff_capture_started",
+			status: `Task ${task.id} failure diff capture started`,
+			taskId: task.id,
+		});
+		let captureEvidence;
+		try {
+			captureEvidence = captureDiffWithEvidence(
+				adapter,
+				context.workingContainerName,
+				{ executionBackend: context.executionBackend },
+			);
+		} catch {
+			captureEvidence = { status: "transport_failed", diff: null };
+		}
+		context.onStatus?.({
+			phase: "execution",
+			event: "diff_capture_completed",
+			status: `Task ${task.id} failure diff capture ${captureEvidence.status}`,
+			taskId: task.id,
+			captureStatus: captureEvidence.status,
+			byteCount: captureEvidence.diff?.length ?? 0,
+		});
 
 		record({
 			provider: routeResult.provider,
@@ -2778,6 +2928,7 @@ export function executeTask(task, context) {
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
 			cleanupStage: execution.cleanupStage,
+			captureStatus: captureEvidence.status,
 		});
 
 		return {
@@ -2796,6 +2947,8 @@ export function executeTask(task, context) {
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
 			cleanupStage: execution.cleanupStage,
+			captureStatus: captureEvidence.status,
+			...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
 		};
 	}
 
@@ -2804,9 +2957,18 @@ export function executeTask(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
-	const diff = adapter.captureDiff(context.workingContainerName, {
-		executionBackend: context.executionBackend,
+	context.onStatus?.({
+		phase: "execution",
+		event: "diff_capture_started",
+		status: `Task ${task.id} diff capture started`,
+		taskId: task.id,
 	});
+	const captureEvidence = captureDiffWithEvidence(
+		adapter,
+		context.workingContainerName,
+		{ executionBackend: context.executionBackend },
+	);
+	const diff = captureEvidence.diff;
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "execution",
@@ -2816,6 +2978,7 @@ export function executeTask(task, context) {
 			provider: routeResult.provider,
 			model: invocationDescriptor.selector,
 			byteCount: diff ? diff.length : 0,
+			captureStatus: captureEvidence.status,
 		});
 	}
 
@@ -2877,6 +3040,9 @@ export function executeTask(task, context) {
 				: "rejected",
 			errorKind: safeGateFailure?.errorKind,
 			reasonCode: safeGateFailure?.reasonCode,
+			...(safeGateFailure?.diagnosticCode
+				? { diagnosticCode: safeGateFailure.diagnosticCode }
+				: {}),
 			artifactRef: safeGateFailure?.artifactRef ?? gateArtifactRef,
 		});
 		if (success) {
@@ -3391,6 +3557,33 @@ async function executeTaskAsyncUnsafe(task, context) {
 	};
 	if (!execution.success) {
 		if (!execution.timedOut) {
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_started",
+				status: `Task ${task.id} failure diff capture started`,
+				taskId: task.id,
+			});
+			let captureEvidence;
+			try {
+				captureEvidence = await captureDiffWithEvidenceAsync(
+					adapter,
+					context.workingContainerName,
+					{
+						executionBackend: context.executionBackend,
+						signal: context.signal,
+					},
+				);
+			} catch {
+				captureEvidence = { status: "transport_failed", diff: null };
+			}
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_completed",
+				status: `Task ${task.id} failure diff capture ${captureEvidence.status}`,
+				taskId: task.id,
+				captureStatus: captureEvidence.status,
+				byteCount: captureEvidence.diff?.length ?? 0,
+			});
 			await record({
 				provider: routeResult.provider,
 				model: routeResult.model ?? "unknown",
@@ -3403,6 +3596,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
 				cleanupStage: execution.cleanupStage,
+				captureStatus: captureEvidence.status,
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -3420,12 +3614,21 @@ async function executeTaskAsyncUnsafe(task, context) {
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
 				cleanupStage: execution.cleanupStage,
+				captureStatus: captureEvidence.status,
+				...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
 			};
 		}
 
-		let partialDiff = null;
+		context.onStatus?.({
+			phase: "execution",
+			event: "diff_capture_started",
+			status: `Task ${task.id} partial diff capture started`,
+			taskId: task.id,
+		});
+		let captureEvidence;
 		try {
-			partialDiff = await adapter.captureDiffAsync(
+			captureEvidence = await captureDiffWithEvidenceAsync(
+				adapter,
 				context.workingContainerName,
 				{
 					executionBackend: context.executionBackend,
@@ -3433,9 +3636,20 @@ async function executeTaskAsyncUnsafe(task, context) {
 				},
 			);
 		} catch {
-			partialDiff = null;
+			captureEvidence = { status: "transport_failed", diff: null };
 		}
-		const captureFailed = !partialDiff;
+		const partialDiff = captureEvidence.diff;
+		const captureStatus = captureEvidence.status;
+		const captureFailed =
+			captureStatus !== "captured" && captureStatus !== "empty";
+		context.onStatus?.({
+			phase: "execution",
+			event: "diff_capture_completed",
+			status: `Task ${task.id} partial diff capture ${captureStatus}`,
+			taskId: task.id,
+			captureStatus,
+			byteCount: partialDiff?.length ?? 0,
+		});
 		const cleanupFailed = execution.cleanupFailed === true;
 		const resultName = cleanupFailed
 			? "execution_timed_out_cleanup_failed"
@@ -3475,6 +3689,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				? { reasonCode: safeTimeoutFailure.reasonCode }
 				: {}),
 			reason: error ?? routeResult.reason,
+			captureStatus,
 			diagnosticCode:
 				safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
 			exitCode: execution.exitCode,
@@ -3506,6 +3721,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
 			cleanupStage: execution.cleanupStage,
+			captureStatus,
 			...(partialDiff ? { partialDiff } : {}),
 		};
 	}
@@ -3514,10 +3730,21 @@ async function executeTaskAsyncUnsafe(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
-	const diff = await adapter.captureDiffAsync(context.workingContainerName, {
-		executionBackend: context.executionBackend,
-		signal: context.signal,
+	context.onStatus?.({
+		phase: "execution",
+		event: "diff_capture_started",
+		status: `Task ${task.id} diff capture started`,
+		taskId: task.id,
 	});
+	const captureEvidence = await captureDiffWithEvidenceAsync(
+		adapter,
+		context.workingContainerName,
+		{
+			executionBackend: context.executionBackend,
+			signal: context.signal,
+		},
+	);
+	const diff = captureEvidence.diff;
 	context.onStatus?.({
 		phase: "execution",
 		event: "diff_captured",
@@ -3526,6 +3753,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		provider: routeResult.provider,
 		model: invocationDescriptor.selector,
 		byteCount: diff ? diff.length : 0,
+		captureStatus: captureEvidence.status,
 	});
 	if (!diff && task.requiredPaths === null) {
 		await record({
@@ -3652,6 +3880,7 @@ export async function runQueueAsync(options) {
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
 	let uninstallSignalCleanup = null;
+	let queueResult = null;
 	try {
 		if (!workingContainerName) {
 			queueBackend.ensureAgentContainer();
@@ -4071,7 +4300,7 @@ export async function runQueueAsync(options) {
 			if (!result.success && effectiveStopOnFailure) break;
 		}
 		saveCheckpoint(checkpointPath, checkpoint);
-		return {
+		queueResult = {
 			results,
 			totalTasks: tasks.length,
 			runnableTasks: initialRunnable.length,
@@ -4083,8 +4312,10 @@ export async function runQueueAsync(options) {
 			retryState: checkpoint.retryState,
 			retryTransitionId: checkpoint.retryTransitionId,
 		};
+		return queueResult;
 	} finally {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();
+		let cleanupError = null;
 		try {
 			if (ownsWorkingContainer) {
 				// The detached worker must durably mark cleanup as pending before
@@ -4108,11 +4339,28 @@ export async function runQueueAsync(options) {
 					}
 					queueBackend.destroy(workingContainerName);
 				} catch {
-					// Container cleanup is best effort; the run result remains authoritative.
+					// Never retain or forward the backend error: it may contain host paths
+					// or provider-controlled text. The fixed event and error below carry
+					// the only evidence terminal finalization needs.
+					console.error("runQueueAsync: queue backend teardown failed");
+					try {
+						dependencies.onStatus?.({
+							phase: "cleanup",
+							event: "cleanup_failed",
+							status: "Cleanup failed; recovery required",
+						});
+					} catch {
+						// A progress callback cannot replace the closed cleanup failure.
+					}
+					cleanupError = new QueueCleanupError(queueResult);
 				}
 			}
 		} finally {
 			releaseQueueSlot(queueBackend, slotLease);
+		}
+		if (cleanupError) {
+			// biome-ignore lint/correctness/noUnsafeFinally: teardown failure must override a nominal queue return so callers cannot finalize success
+			throw cleanupError;
 		}
 	}
 }
@@ -4488,6 +4736,9 @@ export async function executeTaskWithOrchestrator(task, context) {
 				: "rejected",
 			errorKind: safeGateFailure?.errorKind,
 			reasonCode: safeGateFailure?.reasonCode,
+			...(safeGateFailure?.diagnosticCode
+				? { diagnosticCode: safeGateFailure.diagnosticCode }
+				: {}),
 			artifactRef: safeGateFailure?.artifactRef ?? gateArtifactRef,
 		});
 		if (success) {
@@ -4955,6 +5206,8 @@ const DEFAULT_ADAPTERS = {
 		executeAsync: executeVibeAsync,
 		captureDiff: captureVibeDiff,
 		captureDiffAsync: captureVibeDiffAsync,
+		captureDiffDetailed: captureVibeDiffDetailed,
+		captureDiffDetailedAsync: captureVibeDiffDetailedAsync,
 	},
 };
 
@@ -5206,31 +5459,18 @@ function mergeBrokerRouteProvenance(routeResult, capability, provenance) {
 	}
 }
 
+// Generic broker failures are terminal. Peer retries require a future,
+// explicitly reviewed closed-enum entry here; prose and provider-supplied
+// `failureKind` values never authorize a second provider reservation.
+const BROKER_PEER_RETRY_ERROR_KINDS = new Set();
+
 function brokerFailureKind(result) {
 	if (result?.outcome !== "failure" || result?.timedOut === true) {
 		return null;
 	}
-	if (
-		result.errorKind === "auth_expired" ||
-		result.errorKind === "model_unavailable" ||
-		result.errorKind === "quota_exhausted"
-	) {
-		return null;
-	}
-	if (result.failureKind === "provider" || result.failureKind === "transient") {
-		return result.failureKind;
-	}
-	if (typeof result.reason !== "string") {
-		return null;
-	}
-	const reason = result.reason.toLowerCase();
-	if (reason.includes("transient") || reason.includes("timeout")) {
-		return "transient";
-	}
-	if (reason === "launcher_failed" || reason.includes("provider")) {
-		return "provider";
-	}
-	return null;
+	return BROKER_PEER_RETRY_ERROR_KINDS.has(result.errorKind)
+		? "transient"
+		: null;
 }
 
 function runBackendGitCommand(executionBackend, workspaceId, script) {
@@ -6226,7 +6466,7 @@ export function runQueue(options) {
 				// Raw diff text stays out of checkpoint.json / onResult payloads —
 				// the artifact on disk (partialDiffPath) is the single copy.
 				result.partialDiff = undefined;
-			} else if (result.timedOut) {
+			} else if (result.timedOut && result.captureStatus !== "empty") {
 				// The rescue attempt itself came up empty (no edits were made
 				// before the kill, or diff capture failed — e.g. a container in a
 				// state git couldn't diff). Distinct from the diff-captured case so
@@ -6237,8 +6477,9 @@ export function runQueue(options) {
 					emitStatus({
 						phase: "execution",
 						event: "partial_diff_capture_failed",
-						status: `Task ${result.taskId} timed out; no diff was recovered (no edits made, or diff capture failed)`,
+						status: `Task ${result.taskId} timed out; no diff was recovered (${result.captureStatus ?? "unknown"})`,
 						taskId: result.taskId,
+						captureStatus: result.captureStatus ?? "unknown",
 					});
 				}
 			}
@@ -6267,6 +6508,9 @@ export function runQueue(options) {
 						reasonCode: safeFailure?.reasonCode,
 						reason: safeFailure?.reason,
 						artifactRef: safeFailure?.artifactRef,
+						...(safeFailure?.diagnosticCode
+							? { diagnosticCode: safeFailure.diagnosticCode }
+							: {}),
 					});
 				}
 			}
@@ -6762,6 +7006,9 @@ export async function runQueueWithOrchestrator(options) {
 						reasonCode: safeFailure?.reasonCode,
 						reason: safeFailure?.reason,
 						artifactRef: safeFailure?.artifactRef,
+						...(safeFailure?.diagnosticCode
+							? { diagnosticCode: safeFailure.diagnosticCode }
+							: {}),
 					});
 				}
 			}

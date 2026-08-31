@@ -10,6 +10,8 @@ import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
 	captureProviderDiff,
 	captureProviderDiffAsync,
+	captureProviderDiffDetailed,
+	captureProviderDiffDetailedAsync,
 	executeProviderInvocation,
 	getWorkspaceExecution,
 } from "./provider-lifecycle.mjs";
@@ -18,6 +20,10 @@ import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 const VIBE_CMD = "vibe";
 const VIBE_KEYCHAIN_SERVICE = "ai.mistral.vibe";
 const VIBE_KEYCHAIN_ACCOUNT = "MISTRAL_API_KEY";
+// Twelve turns bounds a standard task's inspect/edit/test loop while leaving
+// room for one correction pass; the surrounding provider timeout remains the
+// hard wall for unexpectedly slow provider responses.
+const VIBE_MAX_TURNS = "12";
 
 export function isVibeAuthenticated(workspaceId, executionBackend) {
 	try {
@@ -57,11 +63,12 @@ function buildExecution(workspaceId, prompt, options) {
 			...invocationArgs,
 			"-p",
 			prompt,
-			"--agent",
-			"auto-approve",
+			"--auto-approve",
 			"--output",
-			"text",
+			"streaming",
 			"--trust",
+			"--max-turns",
+			VIBE_MAX_TURNS,
 		],
 		env: [`VIBE_ACTIVE_MODEL=${options.model}`],
 	});
@@ -139,4 +146,12 @@ export function captureDiffAsync(workingContainerName, options = {}) {
 		return Promise.resolve(null);
 	}
 	return captureProviderDiffAsync(workingContainerName, options);
+}
+
+export function captureDiffDetailed(workingContainerName, options = {}) {
+	return captureProviderDiffDetailed(workingContainerName, options);
+}
+
+export function captureDiffDetailedAsync(workingContainerName, options = {}) {
+	return captureProviderDiffDetailedAsync(workingContainerName, options);
 }

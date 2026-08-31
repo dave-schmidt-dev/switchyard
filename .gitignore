@@ -37,6 +37,8 @@ HISTORY.md
 TASKS.md
 history.md
 tasks.md
+# Session handoff pointer: same rationale, plus tracker IDs and blocker prose.
+handoff.md
 
 # Agent workflow byproducts (created by :verify / :contrarian / :overnight / :spike)
 verifications/

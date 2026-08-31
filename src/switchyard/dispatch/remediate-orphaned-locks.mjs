@@ -38,7 +38,7 @@
 // .logs/switchyard state directory.
 
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -46,15 +46,18 @@ import { pathToFileURL } from "node:url";
 import {
 	getStateRoot,
 	readRun,
+	reconcileProjectLockClaims,
 	releaseProjectLockIfOwnedBy,
 } from "../run-store/index.mjs";
+import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 
 const USAGE = `Usage: node remediate-orphaned-locks.mjs [--dry-run] [--confirm] [--help]
 
 One-time human-confirmed remediation for project locks that
 releaseOrphanedProjectLocks() cannot resolve on its own: unparseable-body
 locks, locks with no projectPath in their body (pre-F.1 shape), and locks
-whose run.json is missing entirely.
+whose run.json is missing entirely. Recovery claims are also listed; only
+valid, bound, provably stale claims are removable.
 
   --dry-run   Print the candidate set and what would be removed. Never
               unlinks anything, never prompts.
@@ -66,8 +69,9 @@ whose run.json is missing entirely.
 With neither flag, runs interactively: prints the candidate set, then asks
 for explicit y/n confirmation before removing anything.
 
-Every removal is ownership-checked via releaseProjectLockIfOwnedBy at the
-moment of deletion — never a blind unlink by filename.`;
+Every removal is ownership-checked via releaseProjectLockIfOwnedBy or the
+run-store recovery-claim reconciler at the moment of deletion — never a blind
+unlink by filename.`;
 
 class UsageError extends Error {}
 
@@ -138,6 +142,24 @@ function baseDescriptor(entry, lockPath, overrides) {
 	};
 }
 
+function recoveryClaimDescriptor(entry, claimPath, overrides) {
+	return baseDescriptor(entry, claimPath, {
+		category: "recovery-claim-malformed",
+		remediationKind: "recovery-claim",
+		claimState: null,
+		...overrides,
+	});
+}
+
+function recoveryClaimLockName(entry) {
+	return entry.name.slice(0, -".recovery-claim".length);
+}
+
+function isTerminalOrDead(run) {
+	const liveness = classifyRunLiveness(run);
+	return liveness === "terminal_clean" || liveness === "dead";
+}
+
 /**
  * Scan locksRoot() fresh and resolve every lock file into a descriptor the
  * operator can review, positively identifying (and only then flagging as a
@@ -166,7 +188,9 @@ export async function resolveCandidates(dependencies = {}) {
 	const descriptors = [];
 
 	for (const entry of entries) {
-		if (!entry.isFile() || !entry.name.endsWith(".lock")) continue;
+		const isRecoveryClaim = entry.name.endsWith(".lock.recovery-claim");
+		if (!entry.isFile() || (!entry.name.endsWith(".lock") && !isRecoveryClaim))
+			continue;
 		const lockPath = resolve(dir, entry.name);
 
 		let raw;
@@ -178,14 +202,172 @@ export async function resolveCandidates(dependencies = {}) {
 			// nothing to report.
 			continue;
 		}
-
 		let body;
 		try {
 			body = JSON.parse(raw);
 		} catch {
+			if (isRecoveryClaim) {
+				descriptors.push(
+					recoveryClaimDescriptor(entry, lockPath, {
+						reason:
+							"recovery claim body is not valid JSON — manual evidence only, never touched",
+					}),
+				);
+				continue;
+			}
 			descriptors.push(
 				baseDescriptor(entry, lockPath, {
 					reason: "lock body is not valid JSON — cannot resolve, never touched",
+				}),
+			);
+			continue;
+		}
+
+		if (isRecoveryClaim) {
+			const claimBaseName = recoveryClaimLockName(entry);
+			const reservation =
+				body?.claimState === "reservation" && body?.expectedRaw !== undefined
+					? body
+					: null;
+			if (
+				reservation === null &&
+				(body === null ||
+					typeof body !== "object" ||
+					Array.isArray(body) ||
+					typeof body.runId !== "string" ||
+					typeof body.projectPath !== "string")
+			) {
+				descriptors.push(
+					recoveryClaimDescriptor(entry, lockPath, {
+						reason:
+							"recovery claim is malformed or lacks bound owner/project data — manual evidence only, never touched",
+					}),
+				);
+				continue;
+			}
+
+			if (reservation !== null) {
+				const expectedBody =
+					typeof reservation.expectedRaw === "string"
+						? (() => {
+								try {
+									const parsed = JSON.parse(reservation.expectedRaw);
+									return parsed &&
+										typeof parsed === "object" &&
+										!Array.isArray(parsed)
+										? parsed
+										: null;
+								} catch {
+									return null;
+								}
+							})()
+						: null;
+				if (
+					reservation.claimState !== "reservation" ||
+					typeof reservation.expectedRaw !== "string" ||
+					Object.keys(reservation).some(
+						(key) => !["claimState", "expectedRaw"].includes(key),
+					) ||
+					!expectedBody ||
+					typeof expectedBody.runId !== "string" ||
+					typeof expectedBody.projectPath !== "string" ||
+					projectLockFileName(expectedBody.projectPath) !== claimBaseName
+				) {
+					descriptors.push(
+						recoveryClaimDescriptor(entry, lockPath, {
+							claimState: "reservation",
+							runId: expectedBody?.runId ?? null,
+							projectPath: expectedBody?.projectPath ?? null,
+							reason:
+								"recovery reservation is malformed or not bound to its canonical project lock — manual evidence only, never touched",
+						}),
+					);
+					continue;
+				}
+
+				let run = null;
+				try {
+					run = await readRunFn(expectedBody.runId);
+				} catch {
+					run = null;
+				}
+				const canonicalPath = resolve(
+					dir,
+					projectLockFileName(expectedBody.projectPath),
+				);
+				let canonicalRaw = null;
+				try {
+					canonicalRaw = await readFile(canonicalPath, "utf8");
+				} catch {
+					// Missing or unreadable canonical evidence is not removable.
+				}
+				const bound = canonicalRaw === reservation.expectedRaw;
+				const stale = run !== null && isTerminalOrDead(run);
+				descriptors.push(
+					recoveryClaimDescriptor(entry, lockPath, {
+						claimState: "reservation",
+						runId: expectedBody.runId,
+						projectPath: expectedBody.projectPath,
+						category:
+							bound && stale
+								? "recovery-claim-reservation-stale"
+								: "recovery-claim-reservation-blocked",
+						isCandidate: bound && stale,
+						reason:
+							bound && stale
+								? "reservation is byte-bound to the canonical lock and its run is terminal/dead — ownership-safe remediation may reconcile it"
+								: "reservation is changed, live, missing, or indeterminate — retain as manual evidence",
+					}),
+				);
+				continue;
+			}
+
+			if (projectLockFileName(body.projectPath) !== claimBaseName) {
+				descriptors.push(
+					recoveryClaimDescriptor(entry, lockPath, {
+						runId: body.runId,
+						projectPath: body.projectPath,
+						reason:
+							"recovery claim owner data is not bound to its canonical project-lock filename — manual evidence only, never touched",
+					}),
+				);
+				continue;
+			}
+			let run = null;
+			try {
+				run = await readRunFn(body.runId);
+			} catch {
+				run = null;
+			}
+			let replacementCanonical = null;
+			try {
+				replacementCanonical = JSON.parse(
+					await readFile(
+						resolve(dir, projectLockFileName(body.projectPath)),
+						"utf8",
+					),
+				);
+			} catch {
+				// A missing or malformed canonical lock cannot prove displacement.
+			}
+			const stale =
+				run !== null &&
+				(run.cleanupState === "failed"
+					? replacementCanonical?.runId !== undefined &&
+						replacementCanonical.runId !== body.runId &&
+						replacementCanonical.projectPath === body.projectPath
+					: isTerminalOrDead(run));
+			descriptors.push(
+				recoveryClaimDescriptor(entry, lockPath, {
+					runId: body.runId,
+					projectPath: body.projectPath,
+					category: stale
+						? "recovery-claim-stale"
+						: "recovery-claim-live-or-indeterminate",
+					isCandidate: stale,
+					reason: stale
+						? "recovery claim is bound to its project lock and its run is terminal/dead — ownership-safe remediation may reconcile it"
+						: "recovery claim run is live, missing, or indeterminate — retain as manual evidence",
 				}),
 			);
 			continue;
@@ -372,6 +554,8 @@ export async function run(argv, dependencies = {}) {
 	const resolveFn = dependencies.resolveCandidates ?? resolveCandidates;
 	const releaseFn =
 		dependencies.releaseProjectLockIfOwnedBy ?? releaseProjectLockIfOwnedBy;
+	const reconcileFn =
+		dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims;
 	const confirmFn = dependencies.confirmFn ?? defaultConfirm;
 
 	let opts;
@@ -425,7 +609,42 @@ export async function run(argv, dependencies = {}) {
 	}
 
 	const removed = [];
+	const claimCandidates = candidates.filter(
+		(candidate) => candidate.remediationKind === "recovery-claim",
+	);
+	const claimExisted = new Map(
+		claimCandidates.map((candidate) => [
+			candidate.name,
+			existsSync(candidate.path),
+		]),
+	);
+	if (claimCandidates.length > 0) {
+		// Reconcile the claim set once. The run-store pass re-checks every
+		// candidate's claim, canonical bytes, and liveness; this avoids a first
+		// claim's reconciliation changing the result accounting for its peers.
+		try {
+			await reconcileFn();
+		} catch (e) {
+			log(
+				`remediate-orphaned-locks: error reconciling recovery claims: ${e.message}`,
+			);
+		}
+	}
 	for (const c of candidates) {
+		if (c.remediationKind === "recovery-claim") {
+			// Reconcile re-read and validated the complete claim set above. It
+			// never accepts the earlier descriptor as authority or unlinks by
+			// filename.
+			if (claimExisted.get(c.name) && !existsSync(c.path)) {
+				removed.push(c.name);
+				log(`remediate-orphaned-locks: removed ${c.name}`);
+			} else {
+				log(
+					`remediate-orphaned-locks: skipped ${c.name} — claim changed, remains live, or is no longer safely removable`,
+				);
+			}
+			continue;
+		}
 		// Ownership-checked at the moment of removal, never a blind unlink by
 		// filename: releaseProjectLockIfOwnedBy re-reads the lock file fresh
 		// and only deletes if the recorded runId still matches what we

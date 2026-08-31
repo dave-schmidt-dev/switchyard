@@ -13,9 +13,16 @@
 // green on a host without Parallels.
 
 import { match, ok } from "node:assert";
-import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+	chmodSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -27,17 +34,6 @@ const GATES = [
 	"tests/workspace-wipe-vm.test.mjs",
 	"tests/detached-dispatch.test.mjs",
 ];
-
-function commandAvailable(command) {
-	try {
-		execFileSync("/usr/bin/which", [command], {
-			stdio: ["ignore", "ignore", "ignore"],
-		});
-		return true;
-	} catch {
-		return false;
-	}
-}
 
 describe("VM gate prerequisite ladders", () => {
 	it("never returns a skip reason derived from the Aqua uid", () => {
@@ -62,15 +58,25 @@ describe("VM gate prerequisite ladders", () => {
 		}
 	});
 
-	it("fails rather than skips when the Aqua uid is unset", () => {
-		// The ladder checks prlctl and the golden image BEFORE the Aqua rung, so
-		// on a host without them this probe cannot reach the behavior under test.
-		// The source guard above still asserts unconditionally.
-		if (!commandAvailable("prlctl")) return;
-		const golden = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE;
-		if (!golden) return;
+	it("fails rather than skips when the Aqua uid is unset", (testContext) => {
+		const golden = "switchyard-vm-gate-prerequisite-test";
+		const binDir = mkdtempSync(join(tmpdir(), "switchyard-prlctl-"));
+		const prlctl = join(binDir, "prlctl");
+		writeFileSync(
+			prlctl,
+			`#!/bin/sh
+case "$1" in
+  --version) exit 0 ;;
+  list) printf 'test-uuid stopped ${golden}\\n' ;;
+esac
+`,
+		);
+		chmodSync(prlctl, 0o755);
+		testContext.after(() => rmSync(binDir, { force: true, recursive: true }));
 
 		const env = { ...process.env };
+		env.PATH = `${binDir}:${env.PATH || ""}`;
+		env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE = golden;
 		// Unset, not empty: an empty string is a different rung.
 		delete env.SWITCHYARD_PARALLELS_AQUA_UID;
 		// node:test marks child processes it spawns via NODE_TEST_CONTEXT, which

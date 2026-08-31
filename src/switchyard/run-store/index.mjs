@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import {
 	appendFile,
+	link,
 	mkdir,
 	readdir,
 	readFile,
@@ -38,6 +39,7 @@ import {
 	resolveTargetIdentity,
 	validateInvocationDescriptor,
 } from "../roster/index.mjs";
+import { classifyRunLiveness } from "./run-liveness.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const defaultStateRoot = resolve(
@@ -164,7 +166,7 @@ const APPROVED_EVENT_KEYS = new Set([
 	"cleanupStage",
 ]);
 
-function isSafeTargetId(value) {
+export function isSafeTargetId(value) {
 	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
 		return false;
 	}
@@ -331,10 +333,34 @@ class RevisionError extends Error {
 	}
 }
 
+const LOCK_ERROR_CODES = new Set([
+	"LOCK_ERROR",
+	"RUN_LOCK_HELD",
+	"RUN_LOCK_IDENTITY_MISMATCH",
+	"LAUNCH_LOCK_HELD",
+	"PROJECT_LOCK_HELD",
+	"PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+	"PROJECT_LOCK_OWNERSHIP_FAILED",
+	"PROJECT_LOCK_OWNERSHIP_DISPLACED",
+	"PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+	"PROJECT_LOCK_RECOVERY_CLAIM_BLOCKS_EXECUTION",
+	"VM_SLOT_UNAVAILABLE",
+]);
+
 class LockError extends Error {
-	constructor(message) {
+	constructor(message, { code = "LOCK_ERROR", holderRunId = null } = {}) {
 		super(message);
 		this.name = "LockError";
+		if (!LOCK_ERROR_CODES.has(code)) {
+			throw new TypeError("LockError requires a closed code");
+		}
+		this.code = code;
+		try {
+			validateRunId(holderRunId);
+			this.holderRunId = holderRunId;
+		} catch {
+			this.holderRunId = null;
+		}
 	}
 }
 
@@ -343,9 +369,9 @@ class VmSlotUnavailableError extends LockError {
 		const holders = holderRuns.length > 0 ? holderRuns.join(", ") : "unknown";
 		super(
 			`VM_SLOT_UNAVAILABLE: VM admission capacity is unavailable (held by run ${holders})`,
+			{ code: "VM_SLOT_UNAVAILABLE" },
 		);
 		this.name = "VmSlotUnavailableError";
-		this.code = "VM_SLOT_UNAVAILABLE";
 	}
 }
 
@@ -387,6 +413,181 @@ function lockFilePath(canonicalPath) {
 	const resolvedPath = resolve(canonicalPath);
 	const hash = createHash("sha256").update(resolvedPath).digest("hex");
 	return resolve(locksRoot(), `${hash}.lock`);
+}
+
+function projectLockPath(canonicalProjectPath) {
+	return lockFilePath(`project:${canonicalProjectPath}`);
+}
+
+function projectLockClaimPath(canonicalProjectPath) {
+	return `${projectLockPath(canonicalProjectPath)}.recovery-claim`;
+}
+
+function parseProjectLockBody(raw, canonicalProjectPath = null) {
+	try {
+		const body = JSON.parse(raw);
+		if (
+			body === null ||
+			typeof body !== "object" ||
+			Array.isArray(body) ||
+			typeof body.runId !== "string" ||
+			body.runId.length === 0 ||
+			typeof body.projectPath !== "string" ||
+			body.projectPath.length === 0 ||
+			(canonicalProjectPath !== null &&
+				body.projectPath !== canonicalProjectPath)
+		) {
+			return null;
+		}
+		return body;
+	} catch {
+		return null;
+	}
+}
+
+function parseOwnedProjectLockBody(raw, canonicalProjectPath) {
+	const body = parseProjectLockBody(raw, canonicalProjectPath);
+	if (body) return body;
+	// Pre-F.1 project locks did not persist projectPath. The canonical hashed
+	// path still identifies the project, so an exact runId remains sufficient
+	// for ownership checks and release compatibility.
+	try {
+		const legacyBody = JSON.parse(raw);
+		if (
+			legacyBody !== null &&
+			typeof legacyBody === "object" &&
+			!Array.isArray(legacyBody) &&
+			typeof legacyBody.runId === "string" &&
+			legacyBody.runId.length > 0 &&
+			!Object.hasOwn(legacyBody, "projectPath")
+		) {
+			return legacyBody;
+		}
+	} catch {
+		// The strict parser already rejected malformed JSON.
+	}
+	return null;
+}
+
+async function readTextIfPresent(path) {
+	try {
+		return await readFile(path, "utf8");
+	} catch (error) {
+		if (error.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+async function unlinkBodyMatched(path, expectedRaw) {
+	const proofPath = `${path}.${process.pid}.${randomUUID()}.unlink-proof`;
+	try {
+		await link(path, proofPath);
+	} catch (error) {
+		if (error.code === "ENOENT") return false;
+		throw error;
+	}
+	let removed = false;
+	let cleanupError = null;
+	try {
+		const [currentRaw, proofRaw] = await Promise.all([
+			readTextIfPresent(path),
+			readFile(proofPath, "utf8"),
+		]);
+		if (currentRaw === expectedRaw && proofRaw === expectedRaw) {
+			await unlink(path);
+			removed = true;
+		}
+	} finally {
+		try {
+			await unlink(proofPath);
+		} catch (error) {
+			if (error.code !== "ENOENT") cleanupError = error;
+		}
+	}
+	if (cleanupError) throw cleanupError;
+	return removed;
+}
+
+async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
+	try {
+		await link(claimPath, lockPath);
+	} catch (error) {
+		if (error.code === "EEXIST" || error.code === "ENOENT") return false;
+		throw error;
+	}
+	const restoredRaw = await readTextIfPresent(lockPath);
+	if (restoredRaw !== raw) return false;
+	await unlinkBodyMatched(claimPath, raw);
+	return true;
+}
+
+async function moveProjectLockToClaim(canonicalProjectPath, expectedRaw) {
+	const lockPath = projectLockPath(canonicalProjectPath);
+	const claimPath = projectLockClaimPath(canonicalProjectPath);
+	// The reservation is recoverable evidence, not an opaque marker. Keep the
+	// exact owner body so a crash before rename can only be reconciled against
+	// the same bytes that were read before claiming the lock.
+	if (!parseOwnedProjectLockBody(expectedRaw, canonicalProjectPath)) {
+		return null;
+	}
+	const reservation = JSON.stringify({
+		claimState: "reservation",
+		expectedRaw,
+	});
+	try {
+		await writeFile(claimPath, reservation, { flag: "wx", mode: 0o600 });
+	} catch (error) {
+		if (error.code === "EEXIST") return null;
+		throw error;
+	}
+
+	try {
+		const currentRaw = await readTextIfPresent(lockPath);
+		if (currentRaw !== expectedRaw) {
+			await unlinkBodyMatched(claimPath, reservation);
+			return null;
+		}
+		try {
+			await rename(lockPath, claimPath);
+		} catch (error) {
+			await unlinkBodyMatched(claimPath, reservation);
+			if (error.code === "ENOENT") return null;
+			throw error;
+		}
+		const claimedRaw = await readTextIfPresent(claimPath);
+		if (claimedRaw === expectedRaw) return { claimPath, raw: claimedRaw };
+		if (claimedRaw !== null) {
+			await restoreClaimWithoutClobber(claimPath, lockPath, claimedRaw);
+		}
+		return null;
+	} catch (error) {
+		const claimRaw = await readTextIfPresent(claimPath).catch(() => null);
+		if (claimRaw === reservation) {
+			await unlinkBodyMatched(claimPath, reservation).catch(() => false);
+		}
+		throw error;
+	}
+}
+
+function parseRecoveryReservation(raw) {
+	try {
+		const body = JSON.parse(raw);
+		if (
+			body === null ||
+			typeof body !== "object" ||
+			Array.isArray(body) ||
+			body.claimState !== "reservation" ||
+			typeof body.expectedRaw !== "string" ||
+			Object.keys(body).some(
+				(key) => !["claimState", "expectedRaw"].includes(key),
+			)
+		) {
+			return null;
+		}
+		return body;
+	} catch {
+		return null;
+	}
 }
 
 function validateRun(data) {
@@ -758,6 +959,13 @@ function validateRun(data) {
 		!isPersistentFailureMetadata(data.lastFailure)
 	) {
 		throw new SchemaError("lastFailure contains invalid persistent metadata");
+	}
+	if (
+		data.terminalizedBy !== undefined &&
+		data.terminalizedBy !== "worker" &&
+		data.terminalizedBy !== "dead_worker_recovery"
+	) {
+		throw new SchemaError("terminalizedBy must be a known terminal writer");
 	}
 	if (data.schemaVersion === CURRENT_SCHEMA_VERSION) {
 		if (
@@ -1296,6 +1504,13 @@ export async function acquireRunLock(
 	options = {},
 ) {
 	let current = await readRun(runId);
+	if (
+		(current.state === "launching" || current.state === "launcher_ready") &&
+		typeof current.projectPath === "string"
+	) {
+		await assertProjectLockOwnership(current.projectPath, runId);
+		current = await readRun(runId);
+	}
 
 	if (current.workerPid !== null) {
 		if (current.workerPid === pid && current.workerStartToken === startToken) {
@@ -1315,6 +1530,7 @@ export async function acquireRunLock(
 		if (!options.allowRecovery) {
 			throw new LockError(
 				`Run ${runId} is already leased by pid ${current.workerPid}`,
+				{ code: "RUN_LOCK_HELD", holderRunId: runId },
 			);
 		}
 
@@ -1326,6 +1542,7 @@ export async function acquireRunLock(
 		if (!expired) {
 			throw new LockError(
 				`Run ${runId} is already leased by pid ${current.workerPid} and lease has not expired`,
+				{ code: "RUN_LOCK_HELD", holderRunId: runId },
 			);
 		}
 
@@ -1381,6 +1598,7 @@ export async function renewRunLock(runId, pid, startToken) {
 	if (current.workerPid !== pid || current.workerStartToken !== startToken) {
 		throw new LockError(
 			`Cannot renew lock: identity mismatch for ${runId} (pid ${pid} vs ${current.workerPid})`,
+			{ code: "RUN_LOCK_IDENTITY_MISMATCH", holderRunId: runId },
 		);
 	}
 
@@ -1441,6 +1659,7 @@ export async function acquireLaunchLock(canonicalTasksPath, runId) {
 			}
 			throw new LockError(
 				`Launch lock already held for ${canonicalTasksPath} by ${holder}`,
+				{ code: "LAUNCH_LOCK_HELD", holderRunId: holder },
 			);
 		}
 		throw e;
@@ -1472,12 +1691,20 @@ export async function releaseLaunchLock(canonicalTasksPath) {
  */
 export async function acquireProjectLock(canonicalProjectPath, runId) {
 	await ensureDir(locksRoot(), 0o700);
-	const lockPath = lockFilePath(`project:${canonicalProjectPath}`);
+	const lockPath = projectLockPath(canonicalProjectPath);
+	const claimPath = projectLockClaimPath(canonicalProjectPath);
 	const content = JSON.stringify({
 		runId,
 		createdAt: new Date().toISOString(),
 		projectPath: canonicalProjectPath,
+		holderPid: process.pid,
 	});
+	if (existsSync(claimPath)) {
+		throw new LockError(
+			`Project lock recovery is in progress for ${canonicalProjectPath}`,
+			{ code: "PROJECT_LOCK_RECOVERY_IN_PROGRESS" },
+		);
+	}
 	try {
 		await writeFile(lockPath, content, { flag: "wx", mode: 0o600 });
 	} catch (e) {
@@ -1491,9 +1718,17 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
 			}
 			throw new LockError(
 				`Project lock already held for ${canonicalProjectPath} by ${holder}`,
+				{ code: "PROJECT_LOCK_HELD", holderRunId: holder },
 			);
 		}
 		throw e;
+	}
+	if (existsSync(claimPath)) {
+		await unlinkBodyMatched(lockPath, content);
+		throw new LockError(
+			`Project lock recovery is in progress for ${canonicalProjectPath}`,
+			{ code: "PROJECT_LOCK_RECOVERY_IN_PROGRESS" },
+		);
 	}
 }
 
@@ -1504,12 +1739,19 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
  * @returns {Promise<void>}
  */
 export async function releaseProjectLock(canonicalProjectPath) {
-	const lockPath = lockFilePath(`project:${canonicalProjectPath}`);
-	try {
-		await unlink(lockPath);
-	} catch (e) {
-		if (e.code !== "ENOENT") throw e;
-	}
+	await reconcileProjectLockClaims();
+	const raw = await readTextIfPresent(projectLockPath(canonicalProjectPath));
+	if (raw === null) return false;
+	const body = parseProjectLockBody(raw, canonicalProjectPath);
+	if (!body) return false;
+	const runArgIndex = process.argv.indexOf("--run-id");
+	const workerRunId =
+		runArgIndex >= 0 && runArgIndex + 1 < process.argv.length
+			? process.argv[runArgIndex + 1]
+			: null;
+	if (body.holderPid !== process.pid && body.runId !== workerRunId)
+		return false;
+	return releaseProjectLockIfOwnedBy(canonicalProjectPath, body.runId);
 }
 
 /**
@@ -1530,17 +1772,156 @@ export async function releaseProjectLockIfOwnedBy(
 	canonicalProjectPath,
 	expectedRunId,
 ) {
-	const lockPath = lockFilePath(`project:${canonicalProjectPath}`);
-	let holder;
-	try {
-		const raw = await readFile(lockPath, "utf8");
-		holder = JSON.parse(raw).runId;
-	} catch (e) {
-		if (e.code === "ENOENT") return false;
-		throw e;
+	const lockPath = projectLockPath(canonicalProjectPath);
+	const raw = await readTextIfPresent(lockPath);
+	if (raw === null) return false;
+	const body = parseOwnedProjectLockBody(raw, canonicalProjectPath);
+	if (!body || body.runId !== expectedRunId) return false;
+	const claimed = await moveProjectLockToClaim(canonicalProjectPath, raw);
+	if (!claimed) return false;
+	return unlinkBodyMatched(claimed.claimPath, claimed.raw);
+}
+
+/**
+ * Check whether the canonical project lock or an in-flight recovery claim is
+ * still owned by the expected run. A lock held by another run is not evidence
+ * that cleanup for the expected run failed.
+ *
+ * @param {string} canonicalProjectPath
+ * @param {string} expectedRunId
+ * @returns {Promise<boolean>}
+ */
+export async function isProjectLockOwnedBy(
+	canonicalProjectPath,
+	expectedRunId,
+) {
+	for (const path of [
+		projectLockPath(canonicalProjectPath),
+		projectLockClaimPath(canonicalProjectPath),
+	]) {
+		const raw = await readTextIfPresent(path);
+		if (raw === null) continue;
+		const body = parseOwnedProjectLockBody(raw, canonicalProjectPath);
+		if (body?.runId === expectedRunId) return true;
 	}
-	if (holder !== expectedRunId) return false;
-	await releaseProjectLock(canonicalProjectPath);
+	return false;
+}
+
+async function markClaimCleanupFailure(runId) {
+	try {
+		await updateRunWithRetry(runId, {
+			state: "recovery_required",
+			cleanupState: "failed",
+		});
+	} catch {
+		// The caller still rejects execution; persistence failure stays bounded.
+	}
+}
+
+/**
+ * Reassert canonical project-lock ownership before queue/provider entry.
+ *
+ * @param {string} canonicalProjectPath
+ * @param {string} runId
+ * @returns {Promise<boolean>} true only while this run owns the canonical lock
+ */
+export async function assertProjectLockOwnership(
+	canonicalProjectPath,
+	runId,
+	options = {},
+) {
+	const unlinkMatched = options.unlinkBodyMatched ?? unlinkBodyMatched;
+	await reconcileProjectLockClaims();
+	const lockPath = projectLockPath(canonicalProjectPath);
+	const claimPath = projectLockClaimPath(canonicalProjectPath);
+	const claimRaw = await readTextIfPresent(claimPath);
+	if (claimRaw !== null) {
+		const claimBody = parseProjectLockBody(claimRaw, canonicalProjectPath);
+		if (claimBody?.runId === runId) {
+			const restoredBody = JSON.stringify({
+				...claimBody,
+				holderPid: process.pid,
+			});
+			try {
+				await writeFile(lockPath, restoredBody, { flag: "wx", mode: 0o600 });
+			} catch (error) {
+				if (error.code !== "EEXIST") throw error;
+				try {
+					const removed = await unlinkMatched(claimPath, claimRaw);
+					if (!removed) throw new Error("claim changed");
+				} catch {
+					await markClaimCleanupFailure(runId);
+					throw new LockError("Project lock claim cleanup failed", {
+						code: "PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+					});
+				}
+				throw new LockError("Project lock ownership was displaced", {
+					code: "PROJECT_LOCK_OWNERSHIP_DISPLACED",
+				});
+			}
+			try {
+				const removed = await unlinkMatched(claimPath, claimRaw);
+				if (!removed) throw new Error("claim changed");
+			} catch {
+				await unlinkBodyMatched(lockPath, restoredBody).catch(() => false);
+				await markClaimCleanupFailure(runId);
+				throw new LockError("Project lock claim cleanup failed", {
+					code: "PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+				});
+			}
+			return true;
+		}
+		throw new LockError("Project lock recovery claim blocks execution", {
+			code: "PROJECT_LOCK_RECOVERY_CLAIM_BLOCKS_EXECUTION",
+		});
+	}
+
+	const raw = await readTextIfPresent(lockPath);
+	const body =
+		raw === null ? null : parseProjectLockBody(raw, canonicalProjectPath);
+	if (!body || body.runId !== runId) {
+		throw new LockError("Project lock ownership assertion failed", {
+			code: "PROJECT_LOCK_OWNERSHIP_FAILED",
+		});
+	}
+	if (body.holderPid === process.pid) return true;
+
+	const claimed = await moveProjectLockToClaim(canonicalProjectPath, raw);
+	if (!claimed) {
+		throw new LockError("Project lock ownership assertion failed", {
+			code: "PROJECT_LOCK_OWNERSHIP_FAILED",
+		});
+	}
+	const refreshedRaw = JSON.stringify({ ...body, holderPid: process.pid });
+	try {
+		await writeFile(lockPath, refreshedRaw, { flag: "wx", mode: 0o600 });
+	} catch (error) {
+		try {
+			const removed = await unlinkMatched(claimed.claimPath, claimed.raw);
+			if (!removed) throw new Error("claim changed");
+		} catch {
+			await markClaimCleanupFailure(runId);
+			throw new LockError("Project lock claim cleanup failed", {
+				code: "PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+			});
+		}
+		if (error.code === "EEXIST") {
+			throw new LockError("Project lock ownership was displaced", {
+				code: "PROJECT_LOCK_OWNERSHIP_DISPLACED",
+			});
+		}
+		throw error;
+	}
+	try {
+		const removed = await unlinkMatched(claimed.claimPath, claimed.raw);
+		if (!removed) throw new Error("claim changed");
+	} catch {
+		await unlinkBodyMatched(lockPath, refreshedRaw).catch(() => false);
+		await markClaimCleanupFailure(runId);
+		throw new LockError("Project lock claim cleanup failed", {
+			code: "PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+		});
+	}
 	return true;
 }
 
@@ -1551,8 +1932,10 @@ export async function releaseProjectLockIfOwnedBy(
  * @returns {boolean}
  */
 export function isProjectLockHeld(canonicalProjectPath) {
-	const lockPath = lockFilePath(`project:${canonicalProjectPath}`);
-	return existsSync(lockPath);
+	return (
+		existsSync(projectLockPath(canonicalProjectPath)) ||
+		existsSync(projectLockClaimPath(canonicalProjectPath))
+	);
 }
 
 const VM_SLOT_COUNT = 2;
@@ -1747,54 +2130,98 @@ export const acquireMacosVmSlot = acquireVmSlot;
 export const releaseMacosVmSlot = releaseVmSlot;
 
 /**
- * Best-effort liveness probe for a run's worker process.
+ * Reconcile abandoned project-lock recovery claims in one bounded pass.
+ * Live, startup-grace, malformed, and unresolved owners are deliberately
+ * retained for their holder or a human-confirmed repair. A cleanup-failed
+ * claim is removed only when a valid canonical lock proves that a different
+ * run now owns the same project.
  *
- * Not exported: this mirrors dispatch/index.mjs's private isWorkerLive
- * exactly (signal-0 kill(2) probe: ESRCH => dead, EPERM => alive-but-
- * foreign). That copy predates this one and dispatch has not been rewired
- * to import from here, so the two definitions currently coexist as
- * module-private code in their respective files. If dispatch/index.mjs is
- * ever updated to import this instead of keeping its own copy, export this
- * function at that point. Until then, any change to the liveness rule must
- * be mirrored in dispatch/index.mjs by hand.
- *
- * @param {object} run parsed run snapshot
- * @returns {boolean} true only if a signalable worker pid still exists
+ * @returns {Promise<string[]>} run ids whose claim was removed
  */
-function isWorkerLive(run) {
-	if (run.workerPid == null) return false;
+export async function reconcileProjectLockClaims() {
+	let entries;
 	try {
-		// Signal 0 performs error checking without delivering a signal.
-		process.kill(run.workerPid, 0);
-		return true;
-	} catch (e) {
-		// ESRCH => no such process; EPERM => process exists but is not ours.
-		return e.code === "EPERM";
+		entries = await readdir(locksRoot(), { withFileTypes: true });
+	} catch (error) {
+		if (error.code === "ENOENT") return [];
+		throw error;
 	}
-}
-
-/**
- * Determine whether a run is stale/reclaimable for lock-recovery purposes:
- * its worker is provably gone (terminal state, or a non-terminal state with
- * no live worker process left).
- *
- * Factored out so this module has exactly one definition of "stale" —
- * releaseOrphanedProjectLocks below is the only current caller, but the
- * point is to avoid a second inline copy of dispatch/index.mjs's
- * `terminal || !isWorkerLive(run)` check appearing anywhere in this file.
- *
- * NOTE: container recovery (dispatch/index.mjs's resolveIsRunDead) deliberately
- * does NOT use this predicate — it gates the `!isWorkerLive` half behind
- * `isRunLockExpired` as well, so a run still inside its pre-lock startup window
- * (workerPid null but lease fresh) is not mistaken for dead and its container
- * reaped out from under a launching dispatch.
- *
- * @param {object} run parsed run snapshot
- * @returns {boolean}
- */
-function isRunStale(run) {
-	const terminal = run.state === "succeeded" || run.state === "failed";
-	return terminal || !isWorkerLive(run);
+	const reclaimed = [];
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".lock.recovery-claim")) {
+			continue;
+		}
+		const claimPath = resolve(locksRoot(), entry.name);
+		const raw = await readTextIfPresent(claimPath).catch(() => null);
+		if (raw === null) continue;
+		const reservation = parseRecoveryReservation(raw);
+		if (reservation) {
+			const ownerBody = parseProjectLockBody(reservation.expectedRaw);
+			if (!ownerBody) continue;
+			const expectedLockName = `${entry.name.slice(0, -".recovery-claim".length)}`;
+			if (
+				projectLockPath(ownerBody.projectPath) !==
+				resolve(locksRoot(), expectedLockName)
+			) {
+				continue;
+			}
+			const canonicalRaw = await readTextIfPresent(
+				projectLockPath(ownerBody.projectPath),
+			).catch(() => null);
+			// A reservation is recoverable only in the pre-rename crash window:
+			// the canonical lock must still be the exact validated owner bytes.
+			if (canonicalRaw !== reservation.expectedRaw) continue;
+			let run;
+			try {
+				run = await readRun(ownerBody.runId);
+			} catch {
+				continue;
+			}
+			const liveness = classifyRunLiveness(run);
+			if (liveness !== "terminal_clean" && liveness !== "dead") continue;
+			try {
+				if (await unlinkBodyMatched(claimPath, raw)) {
+					reclaimed.push(ownerBody.runId);
+				}
+			} catch {
+				// One attempt per claim. A later reconciliation may retry it.
+			}
+			continue;
+		}
+		const body = parseProjectLockBody(raw);
+		if (!body) continue;
+		if (
+			projectLockPath(body.projectPath) !==
+			resolve(locksRoot(), entry.name.slice(0, -".recovery-claim".length))
+		) {
+			continue;
+		}
+		let run;
+		try {
+			run = await readRun(body.runId);
+		} catch {
+			continue;
+		}
+		if (run.cleanupState === "failed") {
+			const canonicalRaw = await readTextIfPresent(
+				projectLockPath(body.projectPath),
+			).catch(() => null);
+			const canonicalBody =
+				canonicalRaw === null
+					? null
+					: parseProjectLockBody(canonicalRaw, body.projectPath);
+			if (!canonicalBody || canonicalBody.runId === body.runId) continue;
+		} else {
+			const liveness = classifyRunLiveness(run);
+			if (liveness !== "terminal_clean" && liveness !== "dead") continue;
+		}
+		try {
+			if (await unlinkBodyMatched(claimPath, raw)) reclaimed.push(body.runId);
+		} catch {
+			// One attempt per claim. A later reconciliation may retry it.
+		}
+	}
+	return reclaimed;
 }
 
 /**
@@ -1838,15 +2265,16 @@ function isRunStale(run) {
  * @returns {Promise<string[]>} runIds whose project lock was reclaimed
  */
 export async function releaseOrphanedProjectLocks() {
+	const reclaimedClaims = await reconcileProjectLockClaims();
 	let entries;
 	try {
 		entries = await readdir(locksRoot(), { withFileTypes: true });
 	} catch (e) {
-		if (e.code === "ENOENT") return [];
+		if (e.code === "ENOENT") return reclaimedClaims;
 		throw e;
 	}
 
-	const reclaimed = [];
+	const reclaimed = [...reclaimedClaims];
 
 	for (const entry of entries) {
 		if (!entry.isFile() || !entry.name.endsWith(".lock")) continue;
@@ -1883,7 +2311,9 @@ export async function releaseOrphanedProjectLocks() {
 			continue;
 		}
 
-		if (!isRunStale(run)) continue;
+		if (run.cleanupState === "failed") continue;
+		const liveness = classifyRunLiveness(run);
+		if (liveness !== "terminal_clean" && liveness !== "dead") continue;
 
 		try {
 			const didRelease = await releaseProjectLockIfOwnedBy(

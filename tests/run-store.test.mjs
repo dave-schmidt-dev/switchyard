@@ -14,6 +14,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -31,20 +32,24 @@ import {
 	acquireVmSlot,
 	advanceState,
 	applyRetention,
+	assertProjectLockOwnership,
 	createEvent,
 	getRunRoot,
 	getStateRoot,
 	getVmAdmissionRoot,
 	initializeRun,
 	isProjectLockHeld,
+	isProjectLockOwnedBy,
 	isRunLockExpired,
 	LockError,
 	RevisionError,
 	readEvents,
 	readRun,
+	reconcileProjectLockClaims,
 	releaseLaunchLock,
 	releaseOrphanedProjectLocks,
 	releaseProjectLock,
+	releaseProjectLockIfOwnedBy,
 	releaseRunLock,
 	releaseVmSlot,
 	renewRunLock,
@@ -135,6 +140,10 @@ function projectLockFilePath(canonicalProjectPath) {
 	const resolvedPath = resolve(`project:${canonicalProjectPath}`);
 	const hash = createHash("sha256").update(resolvedPath).digest("hex");
 	return resolve(getStateRoot(), "locks", `${hash}.lock`);
+}
+
+function projectLockClaimFilePath(canonicalProjectPath) {
+	return `${projectLockFilePath(canonicalProjectPath)}.recovery-claim`;
 }
 
 function makeOptions(overrides = {}) {
@@ -1306,6 +1315,382 @@ describe("project lock", () => {
 		strictEqual(body.runId, runId);
 		ok(typeof body.createdAt === "string");
 	});
+
+	it("checks project-lock ownership instead of path-wide lock presence", async () => {
+		const path = uniquePath("project-owner");
+		const ownerRunId = uniqueRunId();
+		const staleRunId = uniqueRunId();
+
+		await acquireProjectLock(path, ownerRunId);
+
+		strictEqual(await isProjectLockOwnedBy(path, ownerRunId), true);
+		strictEqual(await isProjectLockOwnedBy(path, staleRunId), false);
+		strictEqual(isProjectLockHeld(path), true);
+	});
+
+	it("keeps legacy project-lock ownership and release compatible", async () => {
+		const path = uniquePath("legacy-project-owner");
+		const runId = uniqueRunId();
+		await acquireProjectLock(path, runId);
+		writeFileSync(
+			projectLockFilePath(path),
+			JSON.stringify({ runId, createdAt: new Date().toISOString() }),
+			"utf8",
+		);
+
+		strictEqual(await isProjectLockOwnedBy(path, runId), true);
+		strictEqual(await releaseProjectLockIfOwnedBy(path, runId), true);
+		strictEqual(isProjectLockHeld(path), false);
+	});
+});
+
+describe("project lock recovery claims", () => {
+	it("allows at most one concurrent recoverer to release a terminal-clean owner", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+
+		const outcomes = await Promise.all([
+			releaseProjectLockIfOwnedBy(opts.projectPath, opts.runId),
+			releaseProjectLockIfOwnedBy(opts.projectPath, opts.runId),
+		]);
+		strictEqual(outcomes.filter(Boolean).length, 1);
+		strictEqual(isProjectLockHeld(opts.projectPath), false);
+	});
+
+	it("keeps live/startup/unknown claims and removes terminal/dead claims once", async () => {
+		const live = makeOptions({ projectPath: uniquePath("claim-live") });
+		await initializeRun(live);
+		let current = await readRun(live.runId);
+		await updateRun(
+			live.runId,
+			{ state: "running", workerPid: process.pid },
+			current.revision,
+		);
+		await acquireProjectLock(live.projectPath, live.runId);
+		renameSync(
+			projectLockFilePath(live.projectPath),
+			projectLockClaimFilePath(live.projectPath),
+		);
+		strictEqual(await isProjectLockOwnedBy(live.projectPath, live.runId), true);
+
+		const startup = makeOptions({ projectPath: uniquePath("claim-startup") });
+		await initializeRun(startup);
+		await acquireProjectLock(startup.projectPath, startup.runId);
+		renameSync(
+			projectLockFilePath(startup.projectPath),
+			projectLockClaimFilePath(startup.projectPath),
+		);
+
+		const terminal = makeOptions({ projectPath: uniquePath("claim-terminal") });
+		await initializeRun(terminal);
+		await advanceState(terminal.runId, "failed");
+		current = await readRun(terminal.runId);
+		await updateRun(
+			terminal.runId,
+			{ cleanupState: "complete" },
+			current.revision,
+		);
+		await acquireProjectLock(terminal.projectPath, terminal.runId);
+		renameSync(
+			projectLockFilePath(terminal.projectPath),
+			projectLockClaimFilePath(terminal.projectPath),
+		);
+
+		const dead = makeOptions({ projectPath: uniquePath("claim-dead") });
+		await initializeRun(dead);
+		current = await readRun(dead.runId);
+		await updateRun(
+			dead.runId,
+			{ state: "running", workerPid: 999999 },
+			current.revision,
+		);
+		await acquireProjectLock(dead.projectPath, dead.runId);
+		renameSync(
+			projectLockFilePath(dead.projectPath),
+			projectLockClaimFilePath(dead.projectPath),
+		);
+
+		const missingPath = uniquePath("claim-missing");
+		await acquireProjectLock(missingPath, uniqueRunId());
+		renameSync(
+			projectLockFilePath(missingPath),
+			projectLockClaimFilePath(missingPath),
+		);
+		const malformedPath = uniquePath("claim-malformed");
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(projectLockClaimFilePath(malformedPath), "not-json");
+
+		const reclaimed = await reconcileProjectLockClaims();
+		deepStrictEqual(new Set(reclaimed), new Set([terminal.runId, dead.runId]));
+		strictEqual(existsSync(projectLockClaimFilePath(live.projectPath)), true);
+		strictEqual(
+			existsSync(projectLockClaimFilePath(startup.projectPath)),
+			true,
+		);
+		strictEqual(existsSync(projectLockClaimFilePath(missingPath)), true);
+		strictEqual(existsSync(projectLockClaimFilePath(malformedPath)), true);
+		strictEqual(
+			await reconcileProjectLockClaims().then((ids) => ids.length),
+			0,
+		);
+	});
+
+	it("reconciles only a byte-bound reservation for a terminal owner", async () => {
+		const opts = makeOptions({
+			projectPath: uniquePath("reservation-terminal"),
+		});
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const expectedRaw = readFileSync(
+			projectLockFilePath(opts.projectPath),
+			"utf8",
+		);
+		writeFileSync(
+			projectLockClaimFilePath(opts.projectPath),
+			JSON.stringify({ claimState: "reservation", expectedRaw }),
+			{ flag: "wx", mode: 0o600 },
+		);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
+		strictEqual(existsSync(projectLockClaimFilePath(opts.projectPath)), false);
+		strictEqual(
+			readFileSync(projectLockFilePath(opts.projectPath), "utf8"),
+			expectedRaw,
+		);
+	});
+
+	it("retains reservations when canonical bytes change or owner is live", async () => {
+		const changed = makeOptions({
+			projectPath: uniquePath("reservation-changed"),
+		});
+		await initializeRun(changed);
+		await advanceState(changed.runId, "failed");
+		await acquireProjectLock(changed.projectPath, changed.runId);
+		const expectedRaw = readFileSync(
+			projectLockFilePath(changed.projectPath),
+			"utf8",
+		);
+		writeFileSync(
+			projectLockClaimFilePath(changed.projectPath),
+			JSON.stringify({ claimState: "reservation", expectedRaw }),
+		);
+		writeFileSync(
+			projectLockFilePath(changed.projectPath),
+			JSON.stringify({
+				runId: uniqueRunId(),
+				projectPath: changed.projectPath,
+				createdAt: new Date().toISOString(),
+				holderPid: process.pid,
+			}),
+		);
+
+		const live = makeOptions({ projectPath: uniquePath("reservation-live") });
+		await initializeRun(live);
+		await updateRun(
+			live.runId,
+			{ state: "running", workerPid: process.pid },
+			(await readRun(live.runId)).revision,
+		);
+		await acquireProjectLock(live.projectPath, live.runId);
+		const liveRaw = readFileSync(projectLockFilePath(live.projectPath), "utf8");
+		writeFileSync(
+			projectLockClaimFilePath(live.projectPath),
+			JSON.stringify({ claimState: "reservation", expectedRaw: liveRaw }),
+		);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), []);
+		strictEqual(
+			existsSync(projectLockClaimFilePath(changed.projectPath)),
+			true,
+		);
+		strictEqual(existsSync(projectLockClaimFilePath(live.projectPath)), true);
+	});
+
+	it("rejects a displaced holder and removes only its body-matched claim", async () => {
+		const owner = makeOptions({ projectPath: uniquePath("three-party") });
+		await initializeRun(owner);
+		await acquireProjectLock(owner.projectPath, owner.runId);
+		renameSync(
+			projectLockFilePath(owner.projectPath),
+			projectLockClaimFilePath(owner.projectPath),
+		);
+		const replacementRunId = uniqueRunId();
+		writeFileSync(
+			projectLockFilePath(owner.projectPath),
+			JSON.stringify({
+				runId: replacementRunId,
+				projectPath: owner.projectPath,
+				createdAt: new Date().toISOString(),
+				holderPid: process.pid,
+			}),
+			{ flag: "wx", mode: 0o600 },
+		);
+
+		await rejects(
+			assertProjectLockOwnership(owner.projectPath, owner.runId),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_OWNERSHIP_DISPLACED",
+		);
+		strictEqual(existsSync(projectLockClaimFilePath(owner.projectPath)), false);
+		const canonical = JSON.parse(
+			readFileSync(projectLockFilePath(owner.projectPath), "utf8"),
+		);
+		strictEqual(canonical.runId, replacementRunId);
+	});
+
+	it("reconciles failed displaced cleanup through both scanners without touching the replacement", async () => {
+		const scanners = [
+			["claim reconciler", reconcileProjectLockClaims],
+			["orphan-lock scanner", releaseOrphanedProjectLocks],
+		];
+
+		for (const [scannerName, scan] of scanners) {
+			const projectPath = uniquePath(`claim-cleanup-fail-${scannerName}`);
+			const owner = makeOptions({ projectPath });
+			await initializeRun(owner);
+			await acquireProjectLock(projectPath, owner.runId);
+			renameSync(
+				projectLockFilePath(projectPath),
+				projectLockClaimFilePath(projectPath),
+			);
+
+			const replacement = makeOptions({ projectPath });
+			await initializeRun(replacement);
+			let replacementRun = await readRun(replacement.runId);
+			await updateRun(
+				replacement.runId,
+				{ state: "running", workerPid: process.pid },
+				replacementRun.revision,
+			);
+			const replacementRaw = JSON.stringify({
+				runId: replacement.runId,
+				projectPath,
+				createdAt: new Date().toISOString(),
+				holderPid: process.pid,
+			});
+			writeFileSync(projectLockFilePath(projectPath), replacementRaw, {
+				flag: "wx",
+				mode: 0o600,
+			});
+
+			await rejects(
+				assertProjectLockOwnership(projectPath, owner.runId, {
+					unlinkBodyMatched: async () => false,
+				}),
+				(error) =>
+					error instanceof LockError &&
+					error.code === "PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+			);
+			const failed = await readRun(owner.runId);
+			strictEqual(failed.state, "recovery_required", scannerName);
+			strictEqual(failed.cleanupState, "failed", scannerName);
+			strictEqual(
+				existsSync(projectLockClaimFilePath(projectPath)),
+				true,
+				scannerName,
+			);
+
+			const reclaimed = await scan();
+			deepStrictEqual(reclaimed, [owner.runId], scannerName);
+			strictEqual(
+				existsSync(projectLockClaimFilePath(projectPath)),
+				false,
+				scannerName,
+			);
+			strictEqual(
+				readFileSync(projectLockFilePath(projectPath), "utf8"),
+				replacementRaw,
+				scannerName,
+			);
+
+			replacementRun = await readRun(replacement.runId);
+			await updateRun(
+				replacement.runId,
+				{ workerPid: 999999 },
+				replacementRun.revision,
+			);
+			const laterReclaimed = await releaseOrphanedProjectLocks();
+			deepStrictEqual(laterReclaimed, [replacement.runId], scannerName);
+			strictEqual(isProjectLockHeld(projectPath), false, scannerName);
+		}
+	});
+
+	it("retains cleanup-failed claims without a different valid canonical owner", async () => {
+		const cases = ["absent", "malformed", "same-owner"];
+		const owners = [];
+
+		for (const scenario of cases) {
+			const owner = makeOptions({
+				projectPath: uniquePath(`claim-cleanup-${scenario}`),
+			});
+			await initializeRun(owner);
+			await acquireProjectLock(owner.projectPath, owner.runId);
+			const canonicalRaw = readFileSync(
+				projectLockFilePath(owner.projectPath),
+				"utf8",
+			);
+			renameSync(
+				projectLockFilePath(owner.projectPath),
+				projectLockClaimFilePath(owner.projectPath),
+			);
+			const current = await readRun(owner.runId);
+			await updateRun(
+				owner.runId,
+				{ state: "recovery_required", cleanupState: "failed" },
+				current.revision,
+			);
+			if (scenario === "malformed") {
+				writeFileSync(projectLockFilePath(owner.projectPath), "not-json");
+			} else if (scenario === "same-owner") {
+				writeFileSync(projectLockFilePath(owner.projectPath), canonicalRaw);
+			}
+			owners.push(owner);
+		}
+
+		deepStrictEqual(await reconcileProjectLockClaims(), []);
+		deepStrictEqual(await releaseOrphanedProjectLocks(), []);
+		for (const owner of owners) {
+			strictEqual(
+				existsSync(projectLockClaimFilePath(owner.projectPath)),
+				true,
+				owner.projectPath,
+			);
+		}
+	});
+
+	it("uses closed codes for blocked and missing project ownership", async () => {
+		const missing = makeOptions({
+			projectPath: uniquePath("ownership-missing"),
+		});
+		await rejects(
+			assertProjectLockOwnership(missing.projectPath, missing.runId),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_OWNERSHIP_FAILED",
+		);
+
+		const owner = makeOptions({ projectPath: uniquePath("claim-blocked") });
+		await initializeRun(owner);
+		await acquireProjectLock(owner.projectPath, owner.runId);
+		renameSync(
+			projectLockFilePath(owner.projectPath),
+			projectLockClaimFilePath(owner.projectPath),
+		);
+		await rejects(
+			assertProjectLockOwnership(owner.projectPath, uniqueRunId()),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_RECOVERY_CLAIM_BLOCKS_EXECUTION",
+		);
+	});
 });
 
 describe("global VM admission slots", () => {
@@ -1467,6 +1852,12 @@ describe("releaseOrphanedProjectLocks", () => {
 		const deadOpts = makeOptions({ projectPath: uniquePath("dead-project") });
 		await initializeRun(deadOpts);
 		await advanceState(deadOpts.runId, "failed");
+		const deadCurrent = await readRun(deadOpts.runId);
+		await updateRun(
+			deadOpts.runId,
+			{ cleanupState: "complete" },
+			deadCurrent.revision,
+		);
 		await acquireProjectLock(deadOpts.projectPath, deadOpts.runId);
 
 		const reclaimed = await releaseOrphanedProjectLocks();
@@ -2329,5 +2720,93 @@ describe("lastCompletionAt (worker-bootstrap onResult conditional field)", () =>
 			111222,
 			"a failed task must not overwrite or null out the prior completion timestamp",
 		);
+	});
+});
+
+describe("shared run finalization", () => {
+	it("orders event, pending cleanup, ownership cleanup, terminal patch, and run-lock release", async () => {
+		const { finalizeRun } = await import(
+			"../src/switchyard/dispatch/run-finalization.mjs"
+		);
+		const calls = [];
+		await finalizeRun(
+			{
+				runId: "finalizer-order",
+				state: "succeeded",
+				terminalSummary: { processedTasks: 0, failedCount: 0 },
+				cleanup: async () => calls.push("ownership-cleanup"),
+			},
+			{
+				createEvent: async () => calls.push("event"),
+				updateRunWithRetry: async (_runId, patch) => {
+					calls.push(
+						patch.cleanupState === "pending"
+							? "pending-cleanup"
+							: "terminal-patch",
+					);
+					return patch;
+				},
+				releaseRunLock: async () => calls.push("run-lock-release"),
+			},
+		);
+		deepStrictEqual(calls, [
+			"event",
+			"pending-cleanup",
+			"ownership-cleanup",
+			"terminal-patch",
+			"run-lock-release",
+		]);
+	});
+
+	it("records cleanup failure as recovery_required without a terminal discriminator", async () => {
+		const { finalizeRun } = await import(
+			"../src/switchyard/dispatch/run-finalization.mjs"
+		);
+		const patches = [];
+		const result = await finalizeRun(
+			{
+				runId: "finalizer-cleanup-failure",
+				state: "failed",
+				terminalSummary: { processedTasks: null, failedCount: null },
+				cleanup: async () => {
+					throw new Error("raw cleanup detail");
+				},
+			},
+			{
+				createEvent: async () => {},
+				updateRunWithRetry: async (_runId, patch) => {
+					patches.push(patch);
+					return patch;
+				},
+				releaseRunLock: async () => {},
+			},
+		);
+		strictEqual(result.terminal, false);
+		strictEqual(patches.at(-1).state, "recovery_required");
+		strictEqual(patches.at(-1).cleanupState, "failed");
+		strictEqual(patches.at(-1).terminalizedBy, undefined);
+		strictEqual(
+			patches.at(-1).lastFailure.diagnosticCode,
+			"recovery_incomplete",
+		);
+		ok(!JSON.stringify(patches).includes("raw cleanup detail"));
+	});
+
+	it("persists worker terminalization while historical omission remains valid", async () => {
+		const { finalizeRun } = await import(
+			"../src/switchyard/dispatch/run-finalization.mjs"
+		);
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await finalizeRun({
+			runId: opts.runId,
+			state: "succeeded",
+			terminalSummary: { processedTasks: 0, failedCount: 0 },
+		});
+		strictEqual((await readRun(opts.runId)).terminalizedBy, "worker");
+
+		const historical = makeOptions();
+		await initializeRun(historical);
+		strictEqual((await readRun(historical.runId)).terminalizedBy, undefined);
 	});
 });

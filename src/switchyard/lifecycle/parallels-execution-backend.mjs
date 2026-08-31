@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
+import { WorkerBootStageError } from "../adapter/exec-error.mjs";
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
@@ -43,6 +44,32 @@ const CLIPBOARD_AGENT_PROCESS = "prlcopypaste";
 // respawn rather than sampling once into the gap.
 const DEFAULT_CLIPBOARD_SETTLE_MS = 8_000;
 const DEFAULT_CLIPBOARD_POLL_MS = 1_000;
+
+// Workspace preparation reconciliation. The three commands that build the
+// workspace are silent, so prlctl's exit status is the only signal they give
+// back -- and prlctl loses that signal outright when its host-side job handle
+// misfires. Measured 2026-08-31: `/bin/chmod 700 <parent> <root>` returned
+// host status 255 with empty stderr/stdout beyond `PrlJob_GetRetCode: Invalid
+// argument`, microseconds after `mkdir -p` and `chown` succeeded on those same
+// two paths. PrlJob_GetRetCode is a host-side SDK call, so that is prlctl
+// failing to read the guest's result, not the guest refusing the command.
+// Every one of these commands is idempotent, so a mismatch is safe to repair
+// by simply running the layout again.
+const DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS = 15_000;
+const DEFAULT_WORKSPACE_VERIFY_POLL_MS = 500;
+const WORKSPACE_PREPARE_ATTEMPTS = 2;
+const WORKSPACE_MODE = "700";
+
+// Shutdown settle window. `prlctl stop` returns before Parallels has finished
+// tearing the VM down, and a delete issued into that gap is refused with a
+// truthful "the virtual machine is busy. The virtual machine is currently
+// running." Measured 2026-08-31 on the INV-1 gate: the delete failed, the
+// reprobe read `running` once and gave up, and the same VM reported `stopped`
+// moments later -- so the stop had in fact succeeded and the teardown leaked a
+// VM over a race with itself. A settling state has to be polled to a deadline;
+// one instantaneous read of it decides nothing.
+const DEFAULT_STOP_SETTLE_TIMEOUT_MS = 30_000;
+const DEFAULT_STOP_SETTLE_POLL_MS = 1_000;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const UUID =
 	/^\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?$/i;
@@ -576,6 +603,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		aquaPollMs = DEFAULT_AQUA_POLL_MS,
 		clipboardSettleMs = DEFAULT_CLIPBOARD_SETTLE_MS,
 		clipboardPollMs = DEFAULT_CLIPBOARD_POLL_MS,
+		workspaceVerifyTimeoutMs = DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS,
+		workspaceVerifyPollMs = DEFAULT_WORKSPACE_VERIFY_POLL_MS,
+		stopSettleTimeoutMs = DEFAULT_STOP_SETTLE_TIMEOUT_MS,
+		stopSettlePollMs = DEFAULT_STOP_SETTLE_POLL_MS,
 		goldenImage = null,
 		snapshotSidecarRoot = null,
 		runId = null,
@@ -609,6 +640,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.aquaPollMs = aquaPollMs;
 		this.clipboardSettleMs = clipboardSettleMs;
 		this.clipboardPollMs = clipboardPollMs;
+		this.workspaceVerifyTimeoutMs = workspaceVerifyTimeoutMs;
+		this.workspaceVerifyPollMs = workspaceVerifyPollMs;
+		this.stopSettleTimeoutMs = stopSettleTimeoutMs;
+		this.stopSettlePollMs = stopSettlePollMs;
 		this.goldenImage = goldenImage;
 		// Injected rather than imported: this backend depends on Node builtins
 		// and its own base class only, and its testability rests on injected
@@ -656,6 +691,59 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 */
 	_call(args, options = {}) {
 		return this.prlctlFn(args, options);
+	}
+
+	/**
+	 * Preserve a failed stop/kill result unless the exact VM is independently
+	 * observed stopped. Parallels can return 255 after completing a stop, so the
+	 * command result alone is not sufficient evidence that deletion is unsafe.
+	 * Conversely, never let a failed stop fall through to delete while the VM
+	 * still reports running (or has disappeared from the authoritative list).
+	 */
+	_reprobeStopped(entry, cause) {
+		const current = this._awaitSettled(entry, cause);
+		if (!current) throw cause;
+		return current;
+	}
+
+	/**
+	 * Poll the authoritative list until the exact UUID is stopped or gone.
+	 *
+	 * Shutdown is asynchronous: `prlctl stop` returns while Parallels is still
+	 * releasing the VM, and during that window the VM answers `running` and
+	 * refuses deletion as busy. Waiting the window out is the whole point --
+	 * sampling once resolves the race by coin flip. Returns the stopped entry,
+	 * or undefined when the UUID has left the list; throws `cause` if the VM is
+	 * still running when the deadline expires, so a genuinely stuck VM is
+	 * reported with the failure that led here rather than a timeout of our own.
+	 */
+	_awaitSettled(entry, cause) {
+		const timeoutMs = this.stopSettleTimeoutMs;
+		const startedAt = this.nowFn();
+		for (;;) {
+			let current;
+			try {
+				current = this.listAll().find(
+					(candidate) => candidate.uuid === entry.uuid,
+				);
+			} catch {
+				throw cause;
+			}
+			if (!current) return undefined;
+			if (/^stopped$/i.test(String(current.status ?? ""))) return current;
+			const elapsedMs = this.nowFn() - startedAt;
+			if (elapsedMs >= timeoutMs) throw cause;
+			this.sleepFn(Math.min(this.stopSettlePollMs, timeoutMs - elapsedMs));
+		}
+	}
+
+	/**
+	 * Reconcile a failed delete. An absent exact UUID is positive evidence that
+	 * Parallels completed the delete despite its nonzero result; every present
+	 * state must still be stopped before a retry is allowed.
+	 */
+	_reprobeStoppedOrAbsent(entry, cause) {
+		return this._awaitSettled(entry, cause) !== undefined;
 	}
 
 	preflight() {
@@ -1576,11 +1664,19 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				this.writeSnapshotSidecar(entry.uuid, metadata);
 			}
 			this.boot(entry.uuid, options);
-			this._hardenClone(entry.uuid, options);
-			this._prepareWorkspace(
-				entry.uuid,
-				options.providerUser ?? this.providerUser,
-			);
+			try {
+				this._hardenClone(entry.uuid, options);
+			} catch (error) {
+				throw new WorkerBootStageError("clone_hardening_failed", error);
+			}
+			try {
+				this._prepareWorkspace(
+					entry.uuid,
+					options.providerUser ?? this.providerUser,
+				);
+			} catch (error) {
+				throw new WorkerBootStageError("workspace_prepare_failed", error);
+			}
 			return entry.uuid;
 		} catch (error) {
 			// The prlctl client can report an error after the bundle was created.
@@ -1754,14 +1850,107 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return violations;
 	}
 
-	/** Create the isolated logical workspace before the non-admin user enters it. */
+	/**
+	 * Create the isolated logical workspace before the non-admin user enters it.
+	 *
+	 * The stage is defined by the state it leaves behind, not by three exit
+	 * codes prlctl may never have read (see DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS).
+	 * So apply the layout, then ask the guest what the state actually is, and
+	 * repair once before giving up. That is the same posture `_reprobeStopped`
+	 * takes toward a stop Parallels reports as failed after completing it, and
+	 * it is strictly stronger than what it replaces: a passing run now proves
+	 * owner and mode on both directories, which is the INV-1 property this
+	 * stage exists to establish and which no exit code ever demonstrated.
+	 */
 	_prepareWorkspace(workspaceId, providerUser) {
 		const user = validateUser(providerUser);
 		const root = resolveWorkspacePath("/project", user);
 		const parent = root.slice(0, root.lastIndexOf("/"));
-		this._call(["exec", workspaceId, "/bin/mkdir", "-p", root]);
-		this._call(["exec", workspaceId, "/usr/sbin/chown", user, parent, root]);
-		this._call(["exec", workspaceId, "/bin/chmod", "700", parent, root]);
+		const paths = [parent, root];
+		let cause = null;
+		for (let attempt = 1; ; attempt += 1) {
+			cause =
+				this._applyWorkspaceLayout(workspaceId, user, root, paths) ?? cause;
+			const mismatch = this._reprobeWorkspace(workspaceId, user, paths, cause);
+			if (!mismatch) return;
+			if (attempt >= WORKSPACE_PREPARE_ATTEMPTS) throw mismatch;
+		}
+	}
+
+	/**
+	 * Run the three idempotent layout commands, returning the first failure
+	 * rather than throwing it. A failure here is a hypothesis about the guest,
+	 * not a verdict; `_reprobeWorkspace` decides.
+	 * @returns {Error|null}
+	 */
+	_applyWorkspaceLayout(workspaceId, user, root, paths) {
+		let firstFailure = null;
+		for (const argv of [
+			["/bin/mkdir", "-p", root],
+			["/usr/sbin/chown", user, ...paths],
+			["/bin/chmod", WORKSPACE_MODE, ...paths],
+		]) {
+			try {
+				this._call(["exec", workspaceId, ...argv]);
+			} catch (error) {
+				firstFailure ??= error;
+			}
+		}
+		return firstFailure;
+	}
+
+	/**
+	 * Read the workspace's owner and mode back out of the guest.
+	 *
+	 * `stat` is chosen because it produces output: an empty result is therefore
+	 * itself evidence that the probe -- not the workspace -- is what failed, and
+	 * is retried rather than believed. A probe that never produces output within
+	 * the budget rethrows the layout's own failure, so a genuinely broken guest
+	 * still reports the command that broke instead of this reconciliation.
+	 *
+	 * @returns {Error|null} null when the state is correct, otherwise the
+	 *   mismatch to raise if repair does not settle it.
+	 */
+	_reprobeWorkspace(workspaceId, user, paths, cause) {
+		const expected = paths.map(() => `${user}:${WORKSPACE_MODE}`).join("\n");
+		const timeoutMs = this.workspaceVerifyTimeoutMs;
+		const startedAt = this.nowFn();
+		let probeFailure = null;
+		for (;;) {
+			let observed = null;
+			try {
+				const raw = this._call([
+					"exec",
+					workspaceId,
+					"/usr/bin/stat",
+					"-f",
+					"%Su:%Lp",
+					...paths,
+				]);
+				const text = String(raw ?? "").trim();
+				if (text) observed = text;
+			} catch (error) {
+				probeFailure = error;
+			}
+			if (observed !== null) {
+				if (observed === expected) return null;
+				return new Error(
+					`workspace ${paths.join(" ")} is ${JSON.stringify(observed)}, expected ${JSON.stringify(expected)}`,
+					{ cause: cause ?? probeFailure },
+				);
+			}
+			const elapsedMs = this.nowFn() - startedAt;
+			if (elapsedMs >= timeoutMs) {
+				throw (
+					cause ??
+					probeFailure ??
+					new Error(
+						`workspace ${paths.join(" ")} could not be verified within ${timeoutMs}ms`,
+					)
+				);
+			}
+			this.sleepFn(Math.min(this.workspaceVerifyPollMs, timeoutMs - elapsedMs));
+		}
 	}
 
 	rollback(
@@ -1792,24 +1981,48 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		let forced = false;
 		if (forceOnly) {
 			if (!/^stopped$/i.test(String(entry.status ?? ""))) {
-				this._call(["stop", entry.uuid, "--kill"]);
 				forced = true;
+				try {
+					this._call(["stop", entry.uuid, "--kill"]);
+				} catch (error) {
+					this._reprobeStopped(entry, error);
+				}
 			}
 		} else {
 			try {
 				this._call(["stop", entry.uuid]);
 			} catch {
-				this._call(["stop", entry.uuid, "--kill"]);
 				forced = true;
+				try {
+					this._call(["stop", entry.uuid, "--kill"]);
+				} catch (killError) {
+					this._reprobeStopped(entry, killError);
+				}
 			}
 		}
 		try {
 			this._call(["delete", entry.uuid]);
 		} catch (error) {
-			if (forced) throw error;
-			this._call(["stop", entry.uuid, "--kill"]);
+			if (!forced) {
+				try {
+					this._call(["stop", entry.uuid, "--kill"]);
+				} catch {
+					// The state probe below decides whether a failed kill completed
+					// asynchronously; retain the original delete failure if it did not.
+				}
+			}
 			forced = true;
-			this._call(["delete", entry.uuid]);
+			if (!this._reprobeStoppedOrAbsent(entry, error))
+				return {
+					uuid: entry.uuid,
+					name: entry.name,
+					forced,
+				};
+			try {
+				this._call(["delete", entry.uuid]);
+			} catch (retryError) {
+				if (this._reprobeStoppedOrAbsent(entry, retryError)) throw retryError;
+			}
 		}
 		return { uuid: entry.uuid, name: entry.name, forced };
 	}
@@ -1833,8 +2046,13 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return result;
 	}
 
-	/** Reclaim only exact-prefix VMs whose embedded creator PID is dead. */
-	reclaim({ dryRun = false, onStatus } = {}) {
+	/**
+	 * Reclaim only exact-prefix VMs whose embedded creator PID is dead.
+	 * When supplied, eligibility is an ownership filter selected by the caller;
+	 * an ineligible entry is reported and never stopped, deleted, or inspected
+	 * for snapshots.
+	 */
+	reclaim({ dryRun = false, onStatus, eligibility = null } = {}) {
 		// `skipped` answers one question only: which VMs were left alone. The
 		// snapshot channels are separate because a VM can be reclaimed AND have
 		// its snapshots left behind, so a single list would have to mean two
@@ -1847,6 +2065,19 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			errors: [],
 		};
 		for (const entry of this.listManaged()) {
+			if (eligibility !== null) {
+				let eligible = false;
+				try {
+					eligible = eligibility(entry) === true;
+				} catch {
+					eligible = false;
+				}
+				if (!eligible) {
+					result.skipped.push({ ...entry, reason: "ineligible" });
+					onStatus?.({ type: "skip", name: entry.name, reason: "ineligible" });
+					continue;
+				}
+			}
 			const alive = this.pidIsAlive(entry.creatorPid);
 			if (alive) {
 				result.skipped.push({ ...entry, reason: "owner-alive" });

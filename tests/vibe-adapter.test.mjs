@@ -55,7 +55,15 @@ describe("Vibe adapter", () => {
 		deepStrictEqual(request.env, ["VIBE_ACTIVE_MODEL=glm-5.2"]);
 		deepStrictEqual(request.argv.slice(0, 2), ["vibe", "-p"]);
 		ok(request.argv[2].includes("change one file"));
-		ok(request.argv.includes("auto-approve"));
+		deepStrictEqual(request.argv.slice(-6), [
+			"--auto-approve",
+			"--output",
+			"streaming",
+			"--trust",
+			"--max-turns",
+			"12",
+		]);
+		ok(request.argv.includes("--auto-approve"));
 		ok(request.argv.includes("--trust"));
 	});
 

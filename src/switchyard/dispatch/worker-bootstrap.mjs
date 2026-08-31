@@ -8,11 +8,13 @@ import { unlinkSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	CLEANUP_STAGES,
+	isPersistentFailureMetadata,
 	PERSISTED_SIGNALS,
 	sanitizeFailureMetadata,
+	workerBootStageDiagnosticCode,
 } from "../adapter/exec-error.mjs";
-import { Diagnostics } from "../diagnostics/index.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
+import { finalizeRun } from "./run-finalization.mjs";
 
 function parseArg(argv, flag) {
 	const idx = argv.indexOf(flag);
@@ -37,9 +39,8 @@ process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
 try {
 	assertGenerationAllowed();
 } catch (error) {
-	console.error(
-		`worker-bootstrap: generation guard refused (${error.message})`,
-	);
+	console.error("worker-bootstrap: generation guard refused");
+	await writeFatalEvent(error, "worker_boot_exception");
 	process.exit(1);
 }
 
@@ -62,6 +63,18 @@ let writeFailureCount = 0;
 let lastWriteFailure = null;
 const shutdown = new AbortController();
 let shutdownSignal = null;
+let fatalFinalizationPromise = null;
+let QueueCleanupErrorType = null;
+let fatalPersistenceDiagnosticEmitted = false;
+
+const FATAL_PERSISTENCE_DIAGNOSTIC =
+	"worker-bootstrap: fatal event persistence unavailable; durable run state may be incomplete";
+
+function emitFatalPersistenceDiagnostic() {
+	if (fatalPersistenceDiagnosticEmitted) return;
+	fatalPersistenceDiagnosticEmitted = true;
+	console.error(FATAL_PERSISTENCE_DIAGNOSTIC);
+}
 
 function requestGracefulShutdown(signal) {
 	if (shutdownSignal) return;
@@ -117,15 +130,10 @@ const RECOGNIZED_CHECKPOINT_IDENTITY_CODES = new Set([
 ]);
 
 function isRecognizedCheckpointIdentityError(error) {
-	if (!error) return false;
-	if (error.name === "CheckpointIdentityError") return true;
-	if (
-		typeof error.code === "string" &&
+	return (
+		typeof error?.code === "string" &&
 		RECOGNIZED_CHECKPOINT_IDENTITY_CODES.has(error.code)
-	) {
-		return true;
-	}
-	return false;
+	);
 }
 
 async function writeFatalEvent(
@@ -134,43 +142,99 @@ async function writeFatalEvent(
 ) {
 	try {
 		const runStore = await import("../run-store/index.mjs");
-		const diagnostics = new Diagnostics();
-		diagnostics.sink((sanitized) => runStore.createEvent(runId, sanitized));
-		if (isRecognizedCheckpointIdentityError(error)) {
-			await diagnostics.emit({
-				phase: "worker",
-				event: "worker_boot_failed",
-				status: error.code ?? "checkpoint_identity_mismatch",
-				errorKind: "launch_failed",
-				reasonCode: error.code ?? "checkpoint_identity_mismatch",
-				diagnosticCode: error.code ?? "checkpoint_identity_mismatch",
-				reason: error.reason ?? error.remedy ?? "checkpoint identity mismatch",
-				failurePhase: "worker_boot",
-			});
-		} else {
-			await diagnostics.emit({
-				phase: "worker",
-				event: "worker_boot_failed",
-				status: "fatal",
-				errorKind: "launch_failed",
-				diagnosticCode,
-				failurePhase: "worker_boot",
-			});
-		}
+		const current = await runStore.readRun(runId);
+		const closedCode = isRecognizedCheckpointIdentityError(error)
+			? error.code
+			: (workerBootStageDiagnosticCode(error) ?? diagnosticCode);
+		const failure = sanitizeFailureMetadata({
+			result: "launch_failed",
+			errorKind: "launch_failed",
+			diagnosticCode: closedCode,
+			failurePhase: "worker_boot",
+		});
+		await finalizeRun(
+			{
+				runId,
+				state: "failed",
+				failure,
+				eventName: "worker_boot_failed",
+				eventStatus: isRecognizedCheckpointIdentityError(error)
+					? error.code
+					: "fatal",
+				eventReasonCode: isRecognizedCheckpointIdentityError(error)
+					? error.code
+					: failure.reasonCode,
+				terminalSummary: {
+					totalTasks: Array.isArray(current.orderedTaskIds)
+						? current.orderedTaskIds.length
+						: null,
+					runnableTasks: null,
+					processedTasks: null,
+					completedTaskIds: null,
+					failedCount: null,
+				},
+				cleanup: async () => {
+					await runStore.reconcileProjectLockClaims();
+					await runStore.releaseProjectLockIfOwnedBy(
+						current.projectPath,
+						runId,
+					);
+				},
+			},
+			runStore,
+		);
 	} catch {
-		// best effort
+		// A missing or corrupt run must not be mutated. Keep this fallback fixed
+		// and categorical because the original error can contain paths, provider
+		// output, or other sensitive data.
+		emitFatalPersistenceDiagnostic();
 	}
 }
 
+function isQueueCleanupError(error) {
+	return (
+		QueueCleanupErrorType !== null &&
+		error instanceof QueueCleanupErrorType &&
+		error?.code === "recovery_incomplete" &&
+		isPersistentFailureMetadata(error?.failure)
+	);
+}
+
+async function writeQueueCleanupFailure(error) {
+	const runStore = await import("../run-store/index.mjs");
+	await finalizeRun(
+		{
+			runId,
+			state: "failed",
+			failure: error.failure,
+			eventName: "run_failed",
+			eventStatus: "recovery_required",
+			terminalSummary: error.terminalSummary,
+			// runQueueAsync already attempted owned-workspace teardown. Keeping
+			// the project lock while this fixed cleanup failure drives the shared
+			// finalizer to recovery_required prevents another run from claiming
+			// the project before explicit recovery proves the workspace absent.
+			cleanup: async () => {
+				throw new Error("queue cleanup incomplete");
+			},
+		},
+		runStore,
+	);
+}
+
 process.on("uncaughtException", (error) => {
-	console.error(error?.stack ?? String(error));
-	writeFatalEvent(error, "worker_boot_exception").then(() => process.exit(1));
+	fatalFinalizationPromise = writeFatalEvent(
+		error,
+		"worker_boot_exception",
+	).then(() => process.exit(1));
 });
 
 process.on("unhandledRejection", (reason) => {
 	const error = reason instanceof Error ? reason : new Error(String(reason));
-	console.error(error?.stack ?? String(error));
-	writeFatalEvent(error, "worker_boot_exception").then(() => process.exit(1));
+	fatalFinalizationPromise = writeFatalEvent(
+		error,
+		"worker_boot_exception",
+	).then(() => process.exit(1));
 });
 
 function captureCurrentFingerprint(projectPath) {
@@ -211,6 +275,23 @@ function captureCurrentFingerprint(projectPath) {
 	return `git:${head || "no-head"}:${dirty}`;
 }
 
+async function yieldFatalHandlerTurn() {
+	await new Promise((resolveTurn) => setImmediate(resolveTurn));
+}
+
+async function exitAfterDirectFailure(error, diagnosticCode, exitCode) {
+	// A next-tick uncaught exception may already be queued by the embedding
+	// process. Give the installed fatal handler first claim so its exit 1 and
+	// worker_boot_exception evidence cannot race a direct bootstrap exit.
+	await yieldFatalHandlerTurn();
+	if (fatalFinalizationPromise) {
+		await fatalFinalizationPromise;
+		process.exit(1);
+	}
+	await writeFatalEvent(error, diagnosticCode);
+	process.exit(exitCode);
+}
+
 try {
 	const runStore = await import("../run-store/index.mjs");
 	// Match the synchronous dispatch path's retention policy, but wait for its
@@ -220,34 +301,32 @@ try {
 	// the cutoff, and this run was created moments ago.
 	try {
 		await runStore.applyRetention({ maxAgeDays: 30 });
-	} catch (error) {
-		console.error(
-			`worker-bootstrap: retention sweep failed (${error.message})`,
-		);
+	} catch (_error) {
+		console.error("worker-bootstrap: retention sweep failed");
 	}
 
 	const run = await runStore.readRun(runId);
 
 	if (run.workerNonce !== nonce) {
-		await writeFatalEvent(
+		await exitAfterDirectFailure(
 			new Error(
 				`nonce mismatch: bootstrap received "${nonce}", run.json has "${run.workerNonce}"`,
 			),
 			"worker_nonce_mismatch",
+			3,
 		);
-		process.exit(3);
 	}
 	if (
 		run.dispatchContractVersion !== undefined &&
 		run.dispatchContractVersion !== 1
 	) {
-		await writeFatalEvent(
+		await exitAfterDirectFailure(
 			new Error(
 				`unsupported dispatch descriptor contract version: ${run.dispatchContractVersion}`,
 			),
 			"worker_contract_unsupported",
+			5,
 		);
-		process.exit(5);
 	}
 
 	const currentFingerprint = captureCurrentFingerprint(run.projectPath);
@@ -256,25 +335,19 @@ try {
 		!currentFingerprint.includes(":no-head:") &&
 		!run.initialHostFingerprint.includes(":no-head:")
 	) {
-		await writeFatalEvent(
+		await exitAfterDirectFailure(
 			new Error(
 				`host fingerprint mismatch: initial="${run.initialHostFingerprint}", current="${currentFingerprint}"`,
 			),
 			"worker_fingerprint_mismatch",
+			4,
 		);
-		process.exit(4);
 	}
 
 	// Re-check after the detached handshake. A generation may begin between
 	// launch() and worker startup; fail closed before claiming the run lease or
 	// creating a working container. The launch record remains recoverable.
 	assertGenerationAllowed();
-
-	try {
-		unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
-	} catch {
-		// ignore every error
-	}
 
 	const pid = process.pid;
 	const startToken = randomUUID();
@@ -295,7 +368,9 @@ try {
 	// `recover` command, and the SIGTERM/SIGINT owned-container cleanup handler
 	// in the runner — none of which run concurrently with a foreign live run.
 
-	const { runQueueAsync: runQueueFn } = await import("../runner/index.mjs");
+	const runner = await import("../runner/index.mjs");
+	const runQueueFn = runner.runQueueAsync;
+	QueueCleanupErrorType = runner.QueueCleanupError;
 	const persistedRunOptions = run.runOptions ?? null;
 
 	const result = await runQueueFn({
@@ -419,6 +494,13 @@ try {
 				queueWrite(fn);
 			},
 			onTaskRouted: (info) => {
+				// Retain boot diagnostics through every pre-provider failure, then
+				// remove the named log synchronously at the adapter boundary.
+				try {
+					unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
+				} catch {
+					// Missing/already-removed logs are benign.
+				}
 				const fn = () =>
 					runStore.updateRunWithRetry(runId, {
 						activeTaskProvider: info.provider,
@@ -564,31 +646,19 @@ try {
 	});
 
 	const failed = result.results.filter((r) => !r.success);
-	const terminalPatchBase = {
-		state: failed.length > 0 ? "failed" : "succeeded",
-		activeTaskId: null,
-		activeTaskProvider: null,
-		activeTaskModel: null,
-		activeTaskDeadline: null,
-		activeTaskStartedAt: null,
-		activeTaskElapsedMs: null,
-		activeTaskHeartbeatAt: null,
-		activeTaskProcessPhase: null,
-		snapshotStatus: null,
-		snapshotMtime: null,
-		snapshotAgeMsAtRoute: null,
-		resolvedTargetId: null,
-		activeTaskInvocationDescriptor: null,
-		activeTaskDescriptorIdentity: null,
-		activeTaskDescriptorHarness: null,
-		cleanupState: "complete",
-		terminalSummary: {
-			totalTasks: result.totalTasks,
-			runnableTasks: result.runnableTasks,
-			processedTasks: result.processedTasks,
-			completedTaskIds: result.completedTaskIds,
-			failedCount: failed.length,
-		},
+	if (result.processedTasks === 0) {
+		try {
+			unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
+		} catch {
+			// Missing/already-removed logs are benign.
+		}
+	}
+	const terminalSummary = {
+		totalTasks: result.totalTasks,
+		runnableTasks: result.runnableTasks,
+		processedTasks: result.processedTasks,
+		completedTaskIds: result.completedTaskIds,
+		failedCount: failed.length,
 	};
 
 	// Drain writeChain before the terminal write. runQueueFn has already
@@ -602,40 +672,26 @@ try {
 	// overwrite this run's real terminal outcome with a zeroed failure
 	// placeholder. writeChain always resolves, so this await is bounded.
 	await writeChain;
-	const terminalPatch = {
-		...terminalPatchBase,
-		...(writeFailureCount > 0
-			? {
-					telemetryWriteFailures: writeFailureCount,
-					lastTelemetryWriteFailure: lastWriteFailure,
-				}
-			: {}),
-	};
-
-	try {
-		// The terminal write carries the authoritative outcome, but it can lose
-		// the revision race to a still-in-flight fire-and-forget event callback
-		// (onTaskStart/onResult). updateRunWithRetry retries against the
-		// current revision on conflict rather than letting this real
-		// terminalSummary be lost and falling through to the catch block
-		// below, which would replace it with a zeroed placeholder.
-		await runStore.updateRunWithRetry(runId, terminalPatch);
-	} finally {
-		await runStore.releaseRunLock(runId);
-	}
-	// Release the project lock on the success/failure terminal path so a
-	// subsequent launch against the same project is not blocked forever.
-	// Mirror the acquire-side canonicalization: acquireProjectLock was called
-	// with the resolved project path, which is exactly what run.projectPath
-	// persists. The run's terminal state was already committed above, so a
-	// failure here must stay contained — it must not fall into the catch
-	// block below and overwrite that already-successful state with
-	// "failed". `recover` reclaims any lock left behind by this failure.
-	try {
-		await runStore.releaseProjectLock(run.projectPath);
-	} catch (lockError) {
-		await writeFatalEvent(lockError, "worker_boot_exception");
-	}
+	await finalizeRun(
+		{
+			runId,
+			state: failed.length > 0 ? "failed" : "succeeded",
+			failure: sanitizeFailureMetadata(failed.at(-1) ?? {}),
+			terminalSummary,
+			extraPatch:
+				writeFailureCount > 0
+					? {
+							telemetryWriteFailures: writeFailureCount,
+							lastTelemetryWriteFailure: lastWriteFailure,
+						}
+					: {},
+			cleanup: async () => {
+				await runStore.reconcileProjectLockClaims();
+				await runStore.releaseProjectLockIfOwnedBy(run.projectPath, runId);
+			},
+		},
+		runStore,
+	);
 } catch (error) {
 	// Same reasoning as the terminal-write drain above: a crash can land here
 	// while a straggler writeChain write is still in flight (e.g. runQueueFn
@@ -643,60 +699,18 @@ try {
 	// updateRun below from losing a revision race to that straggler.
 	// writeChain always resolves, so this is safe even before it's ever used.
 	await writeChain;
-	await writeFatalEvent(error, "worker_boot_exception");
-	try {
-		const runStore = await import("../run-store/index.mjs");
-		const current = await runStore.readRun(runId);
-		await runStore.updateRun(
-			runId,
-			{
-				state: "failed",
-				activeTaskId: null,
-				activeTaskProvider: null,
-				activeTaskModel: null,
-				activeTaskDeadline: null,
-				activeTaskStartedAt: null,
-				activeTaskElapsedMs: null,
-				activeTaskHeartbeatAt: null,
-				activeTaskProcessPhase: null,
-				snapshotStatus: null,
-				snapshotMtime: null,
-				snapshotAgeMsAtRoute: null,
-				resolvedTargetId: null,
-				activeTaskInvocationDescriptor: null,
-				activeTaskDescriptorIdentity: null,
-				activeTaskDescriptorHarness: null,
-				...(writeFailureCount > 0
-					? {
-							telemetryWriteFailures: writeFailureCount,
-							lastTelemetryWriteFailure: lastWriteFailure,
-						}
-					: {}),
-				cleanupState: "complete",
-				terminalSummary: {
-					totalTasks: 0,
-					runnableTasks: 0,
-					processedTasks: 0,
-					completedTaskIds: [],
-					failedCount: 1,
-				},
-			},
-			current.revision,
-		);
-		await runStore.releaseRunLock(runId);
-		// Same project-lock release on the crash/catch terminal path.
-		await runStore.releaseProjectLock(current.projectPath);
-	} catch {
-		// best effort — the fatal event is already recorded, and `recover`
-		// can clear any lock that survives this fallback.
+	if (isQueueCleanupError(error)) {
 		try {
-			const runStore = await import("../run-store/index.mjs");
-			const current = await runStore.readRun(runId);
-			await runStore.releaseRunLock(runId);
-			await runStore.releaseProjectLock(current.projectPath);
+			await writeQueueCleanupFailure(error);
 		} catch {
-			// run.json unreadable — leave locks for `recover` to reclaim
+			// Do not fall through to fatal finalization: that path performs only
+			// lock cleanup and could falsely mark the still-owned workspace clean.
+			console.error(
+				"worker-bootstrap: failed to persist queue cleanup recovery evidence",
+			);
 		}
+		process.exit(1);
 	}
+	await writeFatalEvent(error, "worker_boot_exception");
 	process.exit(1);
 }

@@ -27,6 +27,7 @@
 //   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json).
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --exclude-provider <name>  Never route to this provider (repeatable).
+//   --json                 Emit one JSON object for launch success or failure.
 //   --platform <macos>     Queue workspace platform (default: macos).
 //   --help                 Show this help.
 
@@ -43,7 +44,10 @@ import { readdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import {
+	isPersistentFailureMetadata,
+	sanitizeFailureMetadata,
+} from "../adapter/exec-error.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
@@ -51,20 +55,25 @@ import {
 	acquireRunLock,
 	advanceState,
 	applyRetention,
+	assertProjectLockOwnership,
 	createEvent,
 	getRunRoot,
 	getStateRoot,
 	getVmAdmissionRoot,
 	initializeRun,
+	isProjectLockOwnedBy,
+	LockError,
 	RevisionError,
 	readEvents,
 	readRun,
+	reconcileProjectLockClaims,
+	releaseOrphanedProjectLocks,
 	releaseProjectLockIfOwnedBy,
-	releaseRunLock,
 	SchemaError,
 	updateRun,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
+import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 import {
 	computeQueueIdentityFromFile,
 	deriveQueueDiagnostics,
@@ -75,6 +84,8 @@ import {
 	normalizeRunOptions,
 	runQueueAsync,
 } from "../runner/index.mjs";
+import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
+import { finalizeRun } from "./run-finalization.mjs";
 
 const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
 
@@ -83,7 +94,7 @@ Subcommands:
   launch <tasks.md> --project <path> [options]    Launch detached run
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
-  recover [--run <run-id>]                        Recover managed objects
+  recover [--run <run-id>] [--state-root <path>]  Recover managed objects
 
 Run/Launch options:
   --project <path>       Host git repo to dispatch against (required)
@@ -117,6 +128,7 @@ const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <pa
   --exclude-provider <name>  Never route to this provider (repeatable)
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
+  --json                  Emit one JSON object on success or failure
   --help                 Show this help`;
 
 const USAGE_STATUS = `Usage: switchyard-dispatch status <run-id> [--json]
@@ -131,10 +143,11 @@ const USAGE_RESULT = `Usage: switchyard-dispatch result <run-id> [--json]
   --state-root <path>       Read the run from this launch's durable state root
   --help     Show this help`;
 
-const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>]
+const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>] [--state-root <path>]
 
-  --run <run-id>  Recover only this run's managed objects
-  --help          Show this help`;
+  --run <run-id>       Recover only this run's managed objects
+  --state-root <path>  Reconcile this launch's durable state root
+  --help               Show this help`;
 
 const KNOWN_SUBCOMMANDS = new Set([
 	"run",
@@ -154,7 +167,6 @@ class UsageError extends Error {}
 // leaves it alone; past it, a still-worker-less run is a stuck/abandoned launch
 // and is reclaimable. Generous relative to real startup (spawn + fingerprint +
 // acquireRunLock is seconds; container creation happens AFTER the lock).
-const RUN_STARTUP_GRACE_MS = 5 * 60_000;
 
 /**
  * Publish the detached-launch handshake only if the worker has not already
@@ -186,6 +198,33 @@ async function markLauncherReadyIfLaunching(runId) {
 	throw new Error(
 		`Could not publish launcher_ready for ${runId}: run changed concurrently`,
 	);
+}
+
+async function finalizeInitializedLaunchFailure(runId, projectPath) {
+	const failure = sanitizeFailureMetadata({
+		result: "launch_failed",
+		errorKind: "launch_failed",
+		diagnosticCode: "worker_boot_exception",
+		failurePhase: "worker_boot",
+	});
+	return finalizeRun({
+		runId,
+		state: "failed",
+		failure,
+		eventName: "worker_boot_failed",
+		eventStatus: "fatal",
+		terminalSummary: {
+			totalTasks: null,
+			runnableTasks: null,
+			processedTasks: null,
+			completedTaskIds: null,
+			failedCount: null,
+		},
+		cleanup: async () => {
+			await reconcileProjectLockClaims();
+			await releaseProjectLockIfOwnedBy(projectPath, runId);
+		},
+	});
 }
 
 /**
@@ -298,7 +337,11 @@ function parseDispatchArgs(argv) {
  * @throws {UsageError}
  */
 function parseLaunchArgs(argv) {
-	return parseDispatchArgs(argv);
+	const json = argv.includes("--json");
+	const parsed = parseDispatchArgs(
+		argv.filter((argument) => argument !== "--json"),
+	);
+	return parsed.help ? parsed : { ...parsed, json };
 }
 
 /**
@@ -372,6 +415,7 @@ function parseRecoverArgs(argv) {
 			allowPositionals: false,
 			options: {
 				run: { type: "string" },
+				"state-root": { type: "string" },
 				help: { type: "boolean", default: false },
 			},
 		});
@@ -379,7 +423,11 @@ function parseRecoverArgs(argv) {
 		throw new UsageError(error.message);
 	}
 
-	return { help: parsed.values.help, runId: parsed.values.run ?? null };
+	return {
+		help: parsed.values.help,
+		runId: parsed.values.run ?? null,
+		stateRoot: parsed.values["state-root"] ?? null,
+	};
 }
 
 /**
@@ -433,7 +481,7 @@ async function runDispatch(opts, dependencies = {}) {
 	// before this run's id exists, so it cannot see (or reap) our own run/
 	// container. This process lives for the whole dispatch (minutes), giving the
 	// sweep ample time to finish. The .catch prevents an unhandledRejection.
-	sweepManagedOrphans()
+	sweepManagedOrphans({ ...dependencies, projectPath: opts.projectPath })
 		.then((swept) => {
 			// These once read `containersReclaimed`/`volumesReclaimed`, which
 			// sweepManagedOrphans stopped returning at the Docker-to-Parallels
@@ -539,6 +587,7 @@ async function runDispatch(opts, dependencies = {}) {
 	}
 
 	let result;
+	let queueError = null;
 	let eventWriteChain = Promise.resolve();
 	try {
 		// Acquire the exclusive project lock immediately before queue
@@ -554,7 +603,22 @@ async function runDispatch(opts, dependencies = {}) {
 		// has. Release on every terminal path is guaranteed by the finally
 		// block below.
 		if (runStoreReady) {
-			await acquireProjectLock(opts.projectPath, runId);
+			await (
+				dependencies.releaseOrphanedProjectLocks ?? releaseOrphanedProjectLocks
+			)();
+			await (
+				dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims
+			)();
+			await (dependencies.acquireProjectLock ?? acquireProjectLock)(
+				opts.projectPath,
+				runId,
+			);
+			const ownsProjectLock = await (
+				dependencies.assertProjectLockOwnership ?? assertProjectLockOwnership
+			)(opts.projectPath, runId);
+			if (ownsProjectLock !== true) {
+				throw new LockError("Project lock ownership assertion failed");
+			}
 		}
 		result = await runQueueFn({
 			tasksFilePath: opts.tasksFilePath,
@@ -672,64 +736,57 @@ async function runDispatch(opts, dependencies = {}) {
 				},
 			},
 		});
+	} catch (error) {
+		queueError = error;
 	} finally {
 		if (runStoreReady) {
-			// Advance to a terminal state (so `recover` treats this run as
-			// reclaimable) and release the run lock. Best-effort — never mask
-			// the original outcome/throw. If runQueue threw, result is undefined:
-			// treat that as a failed run.
 			const anyFailed = result ? result.results.some((r) => !r.success) : true;
+			const failedResult = result?.results.findLast?.(
+				(entry) => !entry.success,
+			);
+			const failure = queueError
+				? sanitizeFailureMetadata({
+						result: "unknown_failure",
+						errorKind: "unknown_failure",
+						failurePhase: "terminal_reconciliation",
+					})
+				: sanitizeFailureMetadata(failedResult ?? {});
 			try {
 				await eventWriteChain;
-				// Single combined terminal write (mirrors worker-bootstrap's
-				// terminalPatch): setting cleanupState:"complete" here is what
-				// makes a sync-path run retention-eligible (applyRetention only
-				// reaps succeeded && cleanupState:"complete"). Must be one call —
-				// advanceState can only carry {state}, and a second separate
-				// write would race the releaseRunLock revision bump.
-				// The active-task cluster is cleared here, not only in
-				// onTaskComplete: a runQueue that throws mid-task never reaches
-				// that callback, and the run would then reach a terminal state
-				// still claiming a task was running. Only the three descriptor
-				// fields were cleared, despite the comment above claiming
-				// parity with worker-bootstrap's terminalPatch, which clears the
-				// whole cluster. Limited to the fields this path can actually
-				// set; the snapshot telemetry is the detached path's to own.
-				await updateRunWithRetry(runId, {
+				await finalizeRun({
+					runId,
 					state: anyFailed ? "failed" : "succeeded",
-					cleanupState: "complete",
-					activeTaskId: null,
-					activeTaskProvider: null,
-					activeTaskModel: null,
-					activeTaskDeadline: null,
-					resolvedTargetId: null,
-					activeTaskInvocationDescriptor: null,
-					activeTaskDescriptorIdentity: null,
-					activeTaskDescriptorHarness: null,
+					failure,
+					terminalSummary: result
+						? {
+								totalTasks: result.totalTasks,
+								runnableTasks: result.runnableTasks,
+								processedTasks: result.processedTasks,
+								completedTaskIds: result.completedTaskIds,
+								failedCount: result.results.filter((entry) => !entry.success)
+									.length,
+							}
+						: {
+								totalTasks: null,
+								runnableTasks: null,
+								processedTasks: null,
+								completedTaskIds: null,
+								failedCount: null,
+							},
+					cleanup: async () => {
+						await (
+							dependencies.reconcileProjectLockClaims ??
+							reconcileProjectLockClaims
+						)();
+						await releaseProjectLockIfOwnedBy(opts.projectPath, runId);
+					},
 				});
-				await releaseRunLock(runId);
 			} catch (error) {
 				console.error(`dispatch: run-store teardown failed (${error.message})`);
 			}
 		}
-		// Release the project lock on every terminal path — success, a
-		// failed-task result, a thrown runQueue error, or a lock-contention
-		// failure — so a follow-up run against the same project is never
-		// blocked (INV-6). On a contention failure the lock was never ours to
-		// hold, and the ownership check below is exactly what stops this
-		// teardown from unlinking the winner's lock. Runs AFTER the run-store
-		// teardown above (mirroring worker-bootstrap's release ordering), and
-		// independently of it: the lock is released even when runStoreReady is
-		// false. Ownership-checked so this teardown can never unlink a lock a
-		// newer run legitimately re-acquired; best-effort so a release failure
-		// can't mask the run's own outcome (`recover` reclaims any lock this
-		// leaves behind).
-		try {
-			await releaseProjectLockIfOwnedBy(opts.projectPath, runId);
-		} catch (error) {
-			console.error(`dispatch: project lock release failed (${error.message})`);
-		}
 	}
+	if (queueError) throw queueError;
 
 	const failed = result.results.filter((r) => !r.success);
 	console.error(
@@ -807,153 +864,297 @@ function resolveBootstrapPath() {
  * Handle the launch subcommand.
  * @param {string[]} argv arguments after the subcommand
  */
-async function handleLaunch(argv) {
-	const opts = parseLaunchArgs(argv);
+async function projectLaunchLockFact(error, dependencies = {}) {
+	if (!(error instanceof LockError) || error.code !== "PROJECT_LOCK_HELD") {
+		return null;
+	}
+	let holderLiveness = "unknown";
+	if (error.holderRunId) {
+		try {
+			holderLiveness = (
+				dependencies.classifyRunLiveness ?? classifyRunLiveness
+			)(await (dependencies.readRun ?? readRun)(error.holderRunId));
+		} catch {
+			// A missing, corrupt, or unreadable owner is unresolved, never dead.
+		}
+	}
+	return {
+		type: "lock_conflict",
+		code: error.code,
+		holderRunId: error.holderRunId,
+		holderLiveness,
+	};
+}
+
+function launchCommands(runId, stateRoot) {
+	return {
+		statusCommand: `switchyard-dispatch status ${runId} --state-root ${shellQuote(stateRoot)}`,
+		resultCommand: `switchyard-dispatch result ${runId} --state-root ${shellQuote(stateRoot)}`,
+	};
+}
+
+async function buildLaunchFailureEnvelope(context) {
+	const { runId = null, stateRoot = null, preInitialization = null } = context;
+	let run = null;
+	if (runId !== null) {
+		try {
+			run = await readRun(runId);
+		} catch {
+			// Commands and durable identity are emitted only after this read proves
+			// the target actually resolves in the selected state root.
+		}
+	}
+	const durable = run !== null && stateRoot !== null;
+	const recoveryTarget =
+		preInitialization?.type === "lock_conflict"
+			? preInitialization.holderRunId
+			: runId;
+	const disposition = projectDisposition({
+		...(preInitialization ? { preInitialization } : { run }),
+		...(durable && recoveryTarget
+			? { recoveryCommand: recoveryCommandFor(recoveryTarget) }
+			: {}),
+		...(run ? { liveness: classifyRunLiveness(run) } : {}),
+	});
+	return {
+		schemaVersion: run?.schemaVersion ?? 2,
+		runId: durable ? runId : null,
+		state: run?.state ?? "failed",
+		queueIdentity: run?.queueIdentity ?? null,
+		stateRoot: durable ? stateRoot : null,
+		...(durable
+			? launchCommands(runId, stateRoot)
+			: { statusCommand: null, resultCommand: null }),
+		disposition,
+	};
+}
+
+/**
+ * Handle detached launch. `--json` changes only the failure surface: legacy
+ * success already returns JSON, while legacy failure text and exit codes stay
+ * unchanged when the flag is absent.
+ */
+async function handleLaunch(argv, dependencies = {}) {
+	const jsonRequested = argv.includes("--json");
+	let opts;
+	try {
+		opts = parseLaunchArgs(argv);
+	} catch (error) {
+		if (!jsonRequested) throw error;
+		console.log(
+			JSON.stringify(
+				await buildLaunchFailureEnvelope({
+					preInitialization: {
+						type: "contract_failure",
+						code: "invalid_invocation",
+					},
+				}),
+			),
+		);
+		process.exitCode = error instanceof UsageError ? 2 : 1;
+		return;
+	}
 	if (opts.help) {
 		console.log(USAGE_LAUNCH);
 		return;
 	}
-	assertGenerationAllowed();
-	if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
-		process.env.SWITCHYARD_RUN_STORE_ROOT = resolve(
-			opts.projectPath,
-			".logs",
-			"switchyard",
-		);
-	}
 
-	const stateRoot = getStateRoot();
-	const runId = randomUUID();
-	const tasks = loadTaskQueue(opts.tasksFilePath);
-	if (tasks.length === 0) {
-		// Fail closed before any run state, lock, or worker exists — mirrors
-		// runQueue's throwOnEmptyParse, but as a UsageError (exit 2) since an
-		// empty/malformed queue is a bad-invocation condition the caller can
-		// fix, not a run-time failure.
-		throw new UsageError(
-			`no tasks parsed from ${opts.tasksFilePath} — 0 headings matching ` +
-				`"### Task <id>: <title>" were found. Expected format:\n` +
-				`### Task <id>: <title>\n- **Status:** pending\n- **Description:** ...`,
-		);
-	}
-	const orderedTaskIds = tasks.map((t) => t.id);
-	const identity = prepareRunIdentity(opts);
-
-	const launchArgs = process.argv.slice(2).filter((a) => a !== "launch");
-	const nonce = randomUUID();
-	const fingerprint = captureHostFingerprint(opts.projectPath);
-
-	await initializeRun({
-		runId,
-		tasksFilePath: opts.tasksFilePath,
-		projectPath: opts.projectPath,
-		orderedTaskIds,
-		initialHostFingerprint: fingerprint,
-		workerNonce: nonce,
-		launchArgs,
-		projectRevision: identity.projectRevision,
-		runOptions: identity.runOptions,
-		queueIdentity: identity.queueIdentity,
-	});
-
-	// NOTE: the pre-dispatch sweep runs in the detached WORKER
-	// (worker-bootstrap), NOT here — keeping the host launch handshake fast and
-	// off the VM backend (an orphan sweep on this path made `launch` slow and
-	// its exit-code tests flaky under contention). The worker sweeps just
-	// before it creates this run's workspace; the synchronous `run` path
-	// sweeps in-process (see runDispatch).
-
-	// initializeRun writes a fixed snapshot literal (run-store/index.mjs) with
-	// no options passthrough, so a launch-time option that needs to become its
-	// own named field on the run record — as opposed to just riding along
-	// inside the raw launchArgs array above — is persisted via a follow-up
-	// updateRunWithRetry rather than threaded into the initializeRun call
-	// itself. worker-bootstrap reads them back off run.excludeProviders,
-	// run.onlyProviders, and run.stopOnFailure.
-	await updateRunWithRetry(runId, {
-		excludeProviders: opts.excludeProviders,
-		onlyProviders: opts.onlyProviders,
-		stopOnFailure: opts.stopOnFailure,
-		taskIds: opts.taskIds,
-	});
-
-	await acquireProjectLock(opts.projectPath, runId);
-
-	await advanceState(runId, "launching");
-
-	const bootstrapPath = resolveBootstrapPath();
-	let bootFd = null;
+	let stateRoot = null;
+	let runId = null;
+	let initialized = false;
+	let preInitialization = null;
+	let spawnFailure = false;
 	try {
-		bootFd = openSync(
-			resolve(getRunRoot(runId), "boot-stderr.log"),
-			"w",
-			0o600,
-		);
-	} catch {
-		// A diagnostics file must never be able to fail a launch
-	}
+		(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
+		if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
+			process.env.SWITCHYARD_RUN_STORE_ROOT = resolve(
+				opts.projectPath,
+				".logs",
+				"switchyard",
+			);
+		}
 
-	let child;
-	try {
-		child = spawn(
-			process.execPath,
-			[
-				bootstrapPath,
-				"--state-root",
-				stateRoot,
-				"--run-id",
+		stateRoot = getStateRoot();
+		runId = randomUUID();
+		const tasks = loadTaskQueue(opts.tasksFilePath);
+		if (tasks.length === 0) {
+			preInitialization = {
+				type: "contract_failure",
+				code: "queue_empty",
+			};
+			throw new UsageError(
+				`no tasks parsed from ${opts.tasksFilePath} — 0 headings matching ` +
+					`"### Task <id>: <title>" were found. Expected format:\n` +
+					`### Task <id>: <title>\n- **Status:** pending\n- **Description:** ...`,
+			);
+		}
+		const orderedTaskIds = tasks.map((t) => t.id);
+		let identity;
+		try {
+			identity = (dependencies.prepareRunIdentity ?? prepareRunIdentity)(opts);
+		} catch (error) {
+			preInitialization = {
+				type: "contract_failure",
+				code: "queue_identity_invalid",
+			};
+			throw error;
+		}
+
+		const launchArgs = process.argv.slice(2).filter((a) => a !== "launch");
+		const nonce = randomUUID();
+		const fingerprint = captureHostFingerprint(opts.projectPath);
+
+		await initializeRun({
+			runId,
+			tasksFilePath: opts.tasksFilePath,
+			projectPath: opts.projectPath,
+			orderedTaskIds,
+			initialHostFingerprint: fingerprint,
+			workerNonce: nonce,
+			launchArgs,
+			projectRevision: identity.projectRevision,
+			runOptions: identity.runOptions,
+			queueIdentity: identity.queueIdentity,
+		});
+		initialized = true;
+
+		try {
+			await updateRunWithRetry(runId, {
+				excludeProviders: opts.excludeProviders,
+				onlyProviders: opts.onlyProviders,
+				stopOnFailure: opts.stopOnFailure,
+				taskIds: opts.taskIds,
+			});
+
+			await (
+				dependencies.releaseOrphanedProjectLocks ?? releaseOrphanedProjectLocks
+			)();
+			await (
+				dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims
+			)();
+			await (dependencies.acquireProjectLock ?? acquireProjectLock)(
+				opts.projectPath,
 				runId,
-				"--nonce",
-				nonce,
-			],
-			{
-				detached: true,
-				stdio: bootFd !== null ? ["ignore", "ignore", bootFd] : "ignore",
-			},
-		);
-	} finally {
-		if (bootFd !== null) {
-			try {
-				closeSync(bootFd);
-			} catch {
-				// Parent copy close is best effort
+			);
+			if (
+				(await (
+					dependencies.assertProjectLockOwnership ?? assertProjectLockOwnership
+				)(opts.projectPath, runId)) !== true
+			) {
+				throw new LockError("Project lock ownership assertion failed", {
+					code: "PROJECT_LOCK_OWNERSHIP_FAILED",
+				});
+			}
+
+			await advanceState(runId, "launching");
+		} catch (error) {
+			preInitialization = await projectLaunchLockFact(error, dependencies);
+			await finalizeInitializedLaunchFailure(runId, opts.projectPath);
+			initialized = false;
+			throw error;
+		}
+
+		const bootstrapPath = resolveBootstrapPath();
+		let bootFd = null;
+		try {
+			bootFd = openSync(
+				resolve(getRunRoot(runId), "boot-stderr.log"),
+				"w",
+				0o600,
+			);
+		} catch {
+			// A diagnostics file must never be able to fail a launch.
+		}
+
+		let child;
+		try {
+			child = (dependencies.spawn ?? spawn)(
+				process.execPath,
+				[
+					bootstrapPath,
+					"--state-root",
+					stateRoot,
+					"--run-id",
+					runId,
+					"--nonce",
+					nonce,
+				],
+				{
+					detached: true,
+					stdio: bootFd !== null ? ["ignore", "ignore", bootFd] : "ignore",
+				},
+			);
+		} finally {
+			if (bootFd !== null) {
+				try {
+					closeSync(bootFd);
+				} catch {
+					// Parent copy close is best effort.
+				}
 			}
 		}
-	}
-	child.unref();
+		child.unref();
 
-	let spawnError = null;
-	child.on("error", (err) => {
-		spawnError = err;
-	});
+		let spawnError = null;
+		child.on("error", (error) => {
+			spawnError = error;
+		});
 
-	await new Promise((resolve) => {
-		setTimeout(() => {
-			resolve();
-		}, 500);
-	});
+		await new Promise((resolveDelay) => {
+			setTimeout(resolveDelay, 500);
+		});
 
-	if (spawnError) {
-		await advanceState(runId, "failed");
-		console.error(
-			`dispatch: launch failed — child spawn error: ${spawnError.message}`,
+		if (spawnError) {
+			spawnFailure = true;
+			await finalizeInitializedLaunchFailure(runId, opts.projectPath);
+			initialized = false;
+			throw spawnError;
+		}
+
+		const readyRun = await markLauncherReadyIfLaunching(runId);
+		const envelope = {
+			schemaVersion: readyRun.schemaVersion ?? 1,
+			runId,
+			state: "launcher_ready",
+			queueIdentity: readyRun.queueIdentity ?? null,
+			stateRoot,
+			...launchCommands(runId, stateRoot),
+			disposition: projectDisposition({
+				run: readyRun,
+				liveness: classifyRunLiveness(readyRun),
+				recoveryCommand: recoveryCommandFor(runId),
+			}),
+		};
+		console.log(JSON.stringify(envelope));
+	} catch (error) {
+		if (initialized && runId !== null && opts?.projectPath) {
+			try {
+				await finalizeInitializedLaunchFailure(runId, opts.projectPath);
+			} catch {
+				// The envelope will omit unresolved durable targets.
+			}
+		}
+		if (!jsonRequested) {
+			if (spawnFailure) {
+				console.error(
+					`dispatch: launch failed — child spawn error: ${error.message}`,
+				);
+				process.exitCode = 1;
+				return;
+			}
+			throw error;
+		}
+		console.log(
+			JSON.stringify(
+				await buildLaunchFailureEnvelope({
+					runId,
+					stateRoot,
+					preInitialization,
+				}),
+			),
 		);
-		process.exitCode = 1;
-		return;
+		process.exitCode = error instanceof UsageError ? 2 : 1;
 	}
-
-	const readyRun = await markLauncherReadyIfLaunching(runId);
-
-	const envelope = {
-		schemaVersion: readyRun.schemaVersion ?? 1,
-		runId,
-		state: "launcher_ready",
-		queueIdentity: readyRun.queueIdentity ?? null,
-		stateRoot,
-		statusCommand: `switchyard-dispatch status ${runId} --state-root ${shellQuote(stateRoot)}`,
-		resultCommand: `switchyard-dispatch result ${runId} --state-root ${shellQuote(stateRoot)}`,
-	};
-	console.log(JSON.stringify(envelope));
 }
 
 // Best-effort event read: a missing/unreadable events.jsonl (e.g. a run
@@ -961,11 +1162,19 @@ async function handleLaunch(argv) {
 // failing the envelope build.
 async function readEventsSafe(runId) {
 	try {
-		return await readEvents(runId);
+		const events = await readEvents(runId);
+		Object.defineProperty(events, "evidenceValid", { value: true });
+		return events;
 	} catch {
 		// events may be absent or unreadable
-		return [];
+		const events = [];
+		Object.defineProperty(events, "evidenceValid", { value: false });
+		return events;
 	}
+}
+
+function recoveryCommandFor(runId) {
+	return `switchyard-dispatch recover --run ${runId} --state-root ${shellQuote(getStateRoot())}`;
 }
 
 function countCompletedAndFailed(events) {
@@ -980,6 +1189,29 @@ function countCompletedAndFailed(events) {
 		}
 	}
 	return { completedCount, failedCount };
+}
+
+function sanitizedExecutionFailureEvents(events) {
+	const failureFields = [
+		"errorKind",
+		"reasonCode",
+		"reason",
+		"artifactRef",
+		"diagnosticCode",
+		"exitCode",
+		"signal",
+		"failurePhase",
+	];
+	return events.filter((event) => {
+		if (event?.phase !== "execution" || event?.event !== "task_failed") {
+			return false;
+		}
+		const failure = {};
+		for (const field of failureFields) {
+			if (event[field] !== undefined) failure[field] = event[field];
+		}
+		return isPersistentFailureMetadata(failure);
+	});
 }
 
 // Best-effort checkpoint read, mirroring readEventsSafe above: status/result
@@ -1225,6 +1457,16 @@ async function buildStatusEnvelope(runId, run) {
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
 	const retryProjection = deriveRetryProjection(checkpointState);
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
+	const liveness = classifyRunLiveness(run);
+	const disposition = projectDisposition({
+		run,
+		checkpoint: checkpointState,
+		events: sanitizedExecutionFailureEvents(events),
+		liveness,
+		recoveryCommand: recoveryCommandFor(runId),
+		optionalEvidenceValid:
+			events.evidenceValid !== false && checkpointState !== null,
+	});
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
@@ -1234,7 +1476,7 @@ async function buildStatusEnvelope(runId, run) {
 		// Liveness derived from a signal-0 probe of the recorded worker pid
 		// (see isWorkerLive), so an operator doesn't have to shell out to
 		// `ps` to tell active work from a stalled/ghost run.
-		workerLive: run.state === "running" ? isWorkerLive(run) : null,
+		workerLive: run.state === "running" ? liveness === "live" : null,
 		// Presence of the routed provider's CLI process inside the working
 		// VM workspace (see probeProviderProcess) — same conditional-null-when-
 		// not-running shape as workerLive, and same "skip the shell-out
@@ -1298,6 +1540,7 @@ async function buildStatusEnvelope(runId, run) {
 		...retryProjection,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
+		disposition,
 		...telemetry,
 	};
 }
@@ -1352,13 +1595,23 @@ async function buildResultEnvelope(runId, run) {
 	const retryProjection = deriveRetryProjection(checkpointState);
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
 	const artifactRefs = await listArtifactRefs(runId);
+	const liveness = classifyRunLiveness(run);
+	const disposition = projectDisposition({
+		run,
+		checkpoint: checkpointState,
+		events: sanitizedExecutionFailureEvents(events),
+		liveness,
+		recoveryCommand: recoveryCommandFor(runId),
+		optionalEvidenceValid:
+			events.evidenceValid !== false && checkpointState !== null,
+	});
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
 		queueIdentity: run.queueIdentity ?? null,
 		state: run.state,
 		cleanupState: run.cleanupState,
-		workerLive: run.state === "running" ? isWorkerLive(run) : null,
+		workerLive: run.state === "running" ? liveness === "live" : null,
 		providerProcessDetected:
 			run.state === "running"
 				? probeProviderProcess(run, {
@@ -1416,8 +1669,12 @@ async function buildResultEnvelope(runId, run) {
 		...retryProjection,
 		queueDiagnostics,
 		updatedAt: run.updatedAt,
-		terminalSummary: run.terminalSummary ?? null,
+		terminalSummary: {
+			...(run.terminalSummary ?? {}),
+			outcome: projectTerminalOutcome(run),
+		},
 		artifactRefs,
+		disposition,
 		...telemetry,
 	};
 }
@@ -1537,46 +1794,12 @@ async function resolveIsRunDead(runId, dependencies) {
 		return true;
 	}
 
-	// A run record existing is NOT proof of life: a crashed worker or a
-	// terminal run leaves run.json behind. Disambiguate carefully so a
-	// launching dispatch is never reaped mid-startup:
-	//   1. terminal state => done, reclaimable.
-	//   2. live worker PID => alive (protects a long-running task and a
-	//      just-started sync dispatch, whose PID is stamped immediately).
-	//   3. workerPid set but not signalable => the worker HELD the lock and
-	//      died => crashed => reclaimable.
-	//   4. workerPid null => never acquired the lock => still inside the
-	//      pre-lock startup window. `workerPid: null` alone is ambiguous
-	//      ("not started yet" vs "never will"), so fall back to run age: young
-	//      => a legitimately launching run, protect it; older than the startup
-	//      grace => an abandoned/stuck launch, reclaim it.
-	if (run.state === "succeeded" || run.state === "failed") return true;
-
-	const isWorkerLiveFn = dependencies.isWorkerLive ?? isWorkerLive;
-	if (isWorkerLiveFn(run)) return false;
-
-	if (run.workerPid != null) return true;
-
-	const createdMs = new Date(run.createdAt).getTime();
-	if (!Number.isFinite(createdMs)) return true;
-	return Date.now() - createdMs > RUN_STARTUP_GRACE_MS;
-}
-
-/**
- * Best-effort liveness probe for a run's worker process.
- * @param {object} run parsed run snapshot
- * @returns {boolean} true only if a signalable worker pid still exists
- */
-function isWorkerLive(run) {
-	if (run.workerPid == null) return false;
-	try {
-		// Signal 0 performs error checking without delivering a signal.
-		process.kill(run.workerPid, 0);
-		return true;
-	} catch (e) {
-		// ESRCH => no such process; EPERM => process exists but is not ours.
-		return e.code === "EPERM";
-	}
+	const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
+	const options = dependencies.isWorkerLive
+		? { probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead") }
+		: undefined;
+	const liveness = classifier(run, options);
+	return liveness === "terminal_clean" || liveness === "dead";
 }
 
 /**
@@ -1612,8 +1835,13 @@ async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 			// run.json missing/unreadable — no projectPath to key the lock on
 			continue;
 		}
-		const terminal = run.state === "succeeded" || run.state === "failed";
-		if (terminal || !isWorkerLive(run)) {
+		if (run.cleanupState === "failed") continue;
+		const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
+		const options = dependencies.isWorkerLive
+			? { probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead") }
+			: undefined;
+		const liveness = classifier(run, options);
+		if (liveness === "terminal_clean" || liveness === "dead") {
 			try {
 				const didRelease = await releaseFn(run.projectPath, rid);
 				if (didRelease) released.push(rid);
@@ -1653,17 +1881,58 @@ async function sweepManagedOrphans(dependencies = {}) {
 		dependencies.listManaged ?? (() => executionBackend.listManaged());
 	const reclaim =
 		dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
+	const readRunFn = dependencies.readRun ?? readRun;
+	const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
+	const currentProjectPath = dependencies.projectPath ?? null;
+	let managed = [];
+	try {
+		managed = listManaged();
+	} catch {
+		managed = [];
+	}
+	const eligibleRunIds = new Set();
+	for (const entry of managed) {
+		if (
+			currentProjectPath === null ||
+			typeof entry?.runId !== "string" ||
+			typeof entry?.name !== "string"
+		)
+			continue;
+		let run;
+		try {
+			run = await readRunFn(entry.runId);
+		} catch {
+			continue;
+		}
+		if (run.projectPath !== currentProjectPath) continue;
+		const options = dependencies.isWorkerLive
+			? {
+					probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead"),
+				}
+			: undefined;
+		const liveness = classifier(run, options);
+		if (liveness === "terminal_clean" || liveness === "dead") {
+			eligibleRunIds.add(entry.runId);
+		}
+	}
 
-	const candidateIds = listManaged()
-		.map((entry) => entry.runId)
-		.filter(Boolean);
+	const result = reclaim({
+		dryRun: false,
+		eligibility: (entry) =>
+			currentProjectPath !== null && eligibleRunIds.has(entry?.runId),
+	});
 
-	const result = reclaim({ dryRun: false });
+	const candidateIds = [...eligibleRunIds];
 
-	const projectLocksReleased = await releaseStaleProjectLocks(
-		candidateIds,
-		dependencies,
-	);
+	const targeted = await releaseStaleProjectLocks(candidateIds, dependencies);
+	const direct = await (
+		dependencies.releaseOrphanedProjectLocks ?? releaseOrphanedProjectLocks
+	)();
+	const claims = await (
+		dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims
+	)();
+	const projectLocksReleased = new Set([...targeted, ...direct, ...claims])
+		.size;
 
 	return {
 		vmsReclaimed: result.reclaimed.length,
@@ -1685,68 +1954,148 @@ async function sweepManagedOrphans(dependencies = {}) {
  * @param {string[]} argv arguments after the subcommand
  */
 async function handleRecover(argv, dependencies = {}) {
-	const { help, runId } = parseRecoverArgs(argv);
+	const { help, runId, stateRoot } = parseRecoverArgs(argv);
 
 	if (help) {
 		console.log(USAGE_RECOVER);
 		return;
 	}
 
-	const executionBackend = recoveryExecutionBackend(dependencies);
-	const listManaged =
-		dependencies.listManaged ?? (() => executionBackend.listManaged());
-	const managed = listManaged();
-	const candidateIds = managed.map((entry) => entry.runId).filter(Boolean);
-
-	let reclaimedCount = 0;
-	let errors = [];
-	let unreclaimedSnapshots = [];
-	if (runId) {
-		const target = managed.find((entry) => entry.runId === runId);
-		if (target) {
-			const destroy =
-				dependencies.destroy ?? ((handle) => executionBackend.destroy(handle));
-			try {
-				destroy(target);
-				reclaimedCount = 1;
-			} catch (error) {
-				errors = [`${target.name}: ${error.message}`];
-			}
+	return withStateRoot(stateRoot, async () => {
+		const executionBackend = recoveryExecutionBackend(dependencies);
+		const listManaged =
+			dependencies.listManaged ?? (() => executionBackend.listManaged());
+		let managed = [];
+		let inventoryErrors = [];
+		try {
+			managed = listManaged();
+		} catch {
+			inventoryErrors = ["managed_inventory_unavailable"];
 		}
-	} else {
-		const reclaim =
-			dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
-		const result = reclaim({ dryRun: false });
-		reclaimedCount = result.reclaimed.length;
-		errors = result.errors.map((e) => `${e.name}: ${e.reason}`);
-		unreclaimedSnapshots = result.skippedSnapshots ?? [];
-	}
+		const candidateIds = managed.map((entry) => entry.runId).filter(Boolean);
 
-	// Filesystem project locks are not VM-managed objects, so reclaim never
-	// touches them. Clear stale ones here.
-	const projectLocksReleased = await releaseStaleProjectLocks(
-		runId ? [runId] : candidateIds,
-		dependencies,
-	);
+		let reclaimedCount = 0;
+		let errors = [...inventoryErrors];
+		let unreclaimedSnapshots = [];
+		let recoveredByFinalizer = false;
+		let projectLockReleasedByFinalizer = false;
+		if (runId) {
+			let recoveryRun = null;
+			try {
+				recoveryRun = await (dependencies.readRun ?? readRun)(runId);
+			} catch {
+				// VM-only recovery remains available when the run record is absent.
+			}
+			const target = managed.find((entry) => entry.runId === runId);
+			const liveness = recoveryRun
+				? (dependencies.classifyRunLiveness ?? classifyRunLiveness)(recoveryRun)
+				: "unknown";
+			if (
+				recoveryRun &&
+				liveness === "dead" &&
+				!isTerminalState(recoveryRun.state)
+			) {
+				const failure = sanitizeFailureMetadata({
+					result: "unknown_failure",
+					errorKind: "unknown_failure",
+					failurePhase: "terminal_reconciliation",
+				});
+				const finalized = await finalizeRun({
+					runId,
+					state: "failed",
+					terminalizedBy: "dead_worker_recovery",
+					failure,
+					terminalSummary: {
+						totalTasks: Array.isArray(recoveryRun.orderedTaskIds)
+							? recoveryRun.orderedTaskIds.length
+							: null,
+						runnableTasks: null,
+						processedTasks: null,
+						completedTaskIds: null,
+						failedCount: null,
+					},
+					cleanup: async () => {
+						if (target) {
+							const destroy =
+								dependencies.destroy ??
+								((handle) => executionBackend.destroy(handle));
+							destroy(target);
+							reclaimedCount = 1;
+						}
+						await (
+							dependencies.reconcileProjectLockClaims ??
+							reconcileProjectLockClaims
+						)();
+						projectLockReleasedByFinalizer = await (
+							dependencies.releaseProjectLockIfOwnedBy ??
+							releaseProjectLockIfOwnedBy
+						)(recoveryRun.projectPath, runId);
+						if (
+							await (dependencies.isProjectLockOwnedBy ?? isProjectLockOwnedBy)(
+								recoveryRun.projectPath,
+								runId,
+							)
+						) {
+							throw new Error("recovery ownership cleanup incomplete");
+						}
+					},
+				});
+				recoveredByFinalizer = finalized.terminal;
+				if (!finalized.cleanupComplete) errors.push("recovery_incomplete");
+			} else if (target) {
+				const destroy =
+					dependencies.destroy ??
+					((handle) => executionBackend.destroy(handle));
+				try {
+					destroy(target);
+					reclaimedCount = 1;
+				} catch {
+					errors = ["managed_reclaim_failed"];
+				}
+			}
+		} else if (inventoryErrors.length === 0) {
+			const reclaim =
+				dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
+			const result = reclaim({ dryRun: false });
+			reclaimedCount = result.reclaimed.length;
+			errors = result.errors.map((e) => `${e.name}: ${e.reason}`);
+			unreclaimedSnapshots = result.skippedSnapshots ?? [];
+		}
 
-	const output = {
-		vmsReclaimed: reclaimedCount,
-		unreclaimedSnapshots,
-		errors,
-		projectLocksReleased,
-		runId: runId ?? null,
-		candidates: !runId
-			? managed.map((entry) => ({
-					name: entry.name,
-					runId: entry.runId,
-					status: entry.status,
-				}))
-			: [{ runId }],
-	};
+		const targeted = recoveredByFinalizer
+			? projectLockReleasedByFinalizer
+				? [runId]
+				: []
+			: await releaseStaleProjectLocks(
+					runId ? [runId] : candidateIds,
+					dependencies,
+				);
+		const direct = await (
+			dependencies.releaseOrphanedProjectLocks ?? releaseOrphanedProjectLocks
+		)();
+		const claims = await (
+			dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims
+		)();
+		const releasedIds = [...new Set([...targeted, ...direct, ...claims])];
 
-	console.log(JSON.stringify(output));
+		const output = {
+			vmsReclaimed: reclaimedCount,
+			unreclaimedSnapshots,
+			errors,
+			projectLocksReleased: releasedIds.length,
+			runId: runId ?? null,
+			candidates: !runId
+				? managed.map((entry) => ({
+						name: entry.name,
+						runId: entry.runId,
+						status: entry.status,
+					}))
+				: [{ runId }],
+		};
 
-	process.exitCode = errors.length > 0 ? 1 : 0;
+		console.log(JSON.stringify(output));
+		process.exitCode = errors.length > 0 ? 1 : 0;
+	});
 }
 
 /**

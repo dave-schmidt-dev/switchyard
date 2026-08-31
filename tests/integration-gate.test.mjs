@@ -1254,6 +1254,82 @@ index 0000000..abcdef1
 			ok(!kind.includes("/"), `${kind} must carry no path separator`);
 		}
 	});
+
+	it("every closed rejection belongs to the closed code vocabulary", () => {
+		const closedCodes = new Set([
+			"empty_required_diff",
+			"required_paths_missing",
+			"undeclared_paths_touched",
+			"no_op_diff",
+			...INTEGRATION_REFUSAL_KINDS,
+		]);
+		strictEqual(closedCodes.size, 13);
+		for (const code of closedCodes) {
+			ok(/^[a-z][a-z0-9_]*$/.test(code), `${code} must be a bare identifier`);
+			ok(!code.includes("/"), `${code} must carry no path separator`);
+		}
+	});
+
+	it("maps allowlisted file-allowlist rejections to closed codes", () => {
+		const closedCodes = new Set([
+			"empty_required_diff",
+			"required_paths_missing",
+			"undeclared_paths_touched",
+			"no_op_diff",
+		]);
+
+		const emptyRequired = integrationGate("", projectPath, {
+			requiredPaths: ["test.txt"],
+		});
+		strictEqual(emptyRequired.success, false);
+		ok(closedCodes.has(emptyRequired.message));
+
+		commitFile(projectPath, "src/a.mjs", "original\n");
+		commitFile(projectPath, "src/b.mjs", "original\n");
+		const requiredPathsMissing = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "src", "a.mjs"), "modified\n", "utf8");
+		});
+		execSync("git checkout -- src/a.mjs", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+		const requiredPathsMissingResult = integrationGate(
+			requiredPathsMissing,
+			projectPath,
+			{
+				requiredPaths: ["src/a.mjs", "src/b.mjs"],
+			},
+		);
+		strictEqual(requiredPathsMissingResult.success, false);
+		ok(closedCodes.has(requiredPathsMissingResult.message));
+
+		const undeclaredPathsTouched = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "src", "a.mjs"), "modified\n", "utf8");
+			writeFileSync(join(dir, "src", "b.mjs"), "also modified\n", "utf8");
+		});
+		const undeclaredPathsTouchedResult = integrationGate(
+			undeclaredPathsTouched,
+			projectPath,
+			{ requiredPaths: ["src/a.mjs"] },
+		);
+		strictEqual(undeclaredPathsTouchedResult.success, false);
+		ok(closedCodes.has(undeclaredPathsTouchedResult.message));
+
+		const noopDiff = `${[
+			"diff --git a/target.txt b/target.txt",
+			"--- a/target.txt",
+			"+++ b/target.txt",
+			"@@ -1,3 +1,3 @@",
+			" a",
+			"-b",
+			"+b",
+			" c",
+		].join("\n")}\n`;
+		commitFile(projectPath, "target.txt", "a\nb\nc\n");
+		const noOpResult = integrationGate(noopDiff, projectPath);
+		strictEqual(noOpResult.success, false);
+		ok(closedCodes.has(noOpResult.message));
+	});
 });
 
 describe("dequoteGitPath", () => {
