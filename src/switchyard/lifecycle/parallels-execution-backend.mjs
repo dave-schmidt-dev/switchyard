@@ -16,7 +16,10 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-import { WorkerBootStageError } from "../adapter/exec-error.mjs";
+import {
+	PrlctlCallError,
+	WorkerBootStageError,
+} from "../adapter/exec-error.mjs";
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
@@ -109,6 +112,49 @@ const DEFAULT_TRANSFER_HOST = "10.211.55.2";
 // from the guest on this substrate's shared bridge.
 const DEFAULT_TRANSFER_LISTEN_HOST = DEFAULT_TRANSFER_HOST;
 const MAX_TRANSFER_BYTES = 512 * 1024 * 1024;
+// Parallels 27.0.0 intermittently loses the result of a host-side SDK job and
+// reports it as one of these on exit 255 with no other output. Measured
+// 2026-09-01 against the golden image on an idle host, in a plain shell loop
+// with switchyard entirely absent: 5 of 150 serial `prlctl exec` calls
+// misfired, 14 of 100 under four concurrent callers, and every serial misfire
+// succeeded on the very next call. It is transient and per-call, so a bounded
+// retry is the correct response; without one, a run making ~20 exec calls has
+// roughly even odds of dying on a fault that costs milliseconds to absorb.
+const PRLCTL_JOB_MISFIRE =
+	/PrlJob_(?:GetRetCode|GetResult):\s*Invalid argument/i;
+// Deliberately NOT retried here. A guest still booting refuses the session with
+// this message (48 of the first 100 calls after `prlctl start`), and the
+// readiness pollers already own that wait on a timescale of minutes. Retrying
+// it inside `_call` would both distort those polls and mask an unbootable
+// guest as a slow one. It is classified only so the run record can tell the two
+// conditions apart.
+const PRLCTL_SESSION_NOT_READY =
+	/Unable to open new session in this virtual machine/i;
+// Four attempts absorbs the measured misfire rate with margin: at the observed
+// ~3.3% serial rate a single retry already clears it, and even at the 14%
+// concurrent rate four attempts leaves a ~4-in-10,000 residual per call.
+const DEFAULT_PRLCTL_RETRY_ATTEMPTS = 4;
+const DEFAULT_PRLCTL_RETRY_BACKOFF_MS = 250;
+// Only these may be persisted as the failing subcommand. Every value is a
+// literal this file passes to `_call`; allowlisting rather than echoing argv
+// keeps a guest-influenced string from reaching a run record.
+const PRLCTL_SUBCOMMANDS = Object.freeze(
+	new Set([
+		"--version",
+		"clone",
+		"delete",
+		"exec",
+		"list",
+		"set",
+		"snapshot-delete",
+		"snapshot-list",
+		"start",
+		"stop",
+	]),
+);
+const PERSISTABLE_PRLCTL_SIGNALS = Object.freeze(
+	new Set(["SIGABRT", "SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM"]),
+);
 const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
 // The bulk-transfer URL is only known once the helper has bound its ephemeral
 // port, so it reaches the guest as a plaintext argv assignment that the helper
@@ -288,6 +334,81 @@ function defaultPidIsAlive(pid) {
 	} catch (error) {
 		return error?.code === "EPERM";
 	}
+}
+
+/**
+ * Every place a thrown prlctl failure may carry its signature.
+ *
+ * `execFileSync` puts the child's stderr on `error.stderr`, but an injected
+ * `prlctlFn` (tests, and the bulk-transfer helper) may raise a plain Error
+ * whose message is the only evidence, so all three are searched.
+ * @param {unknown} error
+ * @returns {string}
+ */
+function prlctlFailureText(error) {
+	const parts = [];
+	for (const field of ["stderr", "stdout", "message"]) {
+		const value = error?.[field];
+		if (typeof value === "string") parts.push(value);
+		else if (Buffer.isBuffer(value)) parts.push(value.toString("utf8"));
+	}
+	return parts.join("\n");
+}
+
+/**
+ * Classify a thrown prlctl failure into a closed diagnostic code.
+ *
+ * Signature matching comes first so a misfire is still recognized when the
+ * harness also killed the child, which is the ambiguous case the old code
+ * could not distinguish at all.
+ * @param {unknown} error
+ * @returns {string} member of the prlctl diagnostic vocabulary
+ */
+function classifyPrlctlFailure(error) {
+	const text = prlctlFailureText(error);
+	if (PRLCTL_JOB_MISFIRE.test(text)) return "prlctl_job_misfire";
+	if (PRLCTL_SESSION_NOT_READY.test(text)) return "prlctl_session_not_ready";
+	if (error?.killed === true || error?.code === "ETIMEDOUT") {
+		return "prlctl_call_timed_out";
+	}
+	return "prlctl_call_failed";
+}
+
+/**
+ * Wrap a thrown prlctl failure in the reviewed error type, preserving the
+ * original as `cause` for local debugging while exposing only closed,
+ * bounded fields for persistence.
+ * @param {unknown} error
+ * @param {{args: string[], attempts: number}} context
+ * @returns {PrlctlCallError}
+ */
+function describePrlctlFailure(error, { args, attempts }) {
+	const subcommand = PRLCTL_SUBCOMMANDS.has(args?.[0]) ? args[0] : null;
+	const status = error?.status;
+	const signal = error?.signal;
+	return new PrlctlCallError({
+		diagnosticCode: classifyPrlctlFailure(error),
+		subcommand,
+		attempts,
+		exitCode: Number.isSafeInteger(status) ? status : null,
+		signal: PERSISTABLE_PRLCTL_SIGNALS.has(signal) ? signal : null,
+		killed: error?.killed === true || error?.code === "ETIMEDOUT",
+		cause: error,
+	});
+}
+
+/**
+ * Validate a retry-attempt count. One means "no retry", which is a legitimate
+ * caller choice, so the floor is 1 rather than 2.
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {number}
+ */
+function validateAttemptCount(value, label) {
+	if (!Number.isSafeInteger(value) || value < 1) {
+		throw new TypeError(`${label} must be an integer >= 1`);
+	}
+	return value;
 }
 
 function outputText(value) {
@@ -638,6 +759,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		transferHost = DEFAULT_TRANSFER_HOST,
 		transferListenHost = DEFAULT_TRANSFER_LISTEN_HOST,
 		maxTransferBytes = MAX_TRANSFER_BYTES,
+		prlctlRetryAttempts = DEFAULT_PRLCTL_RETRY_ATTEMPTS,
+		prlctlRetryBackoffMs = DEFAULT_PRLCTL_RETRY_BACKOFF_MS,
 	} = {}) {
 		super();
 		if (typeof prlctlFn === "function") {
@@ -652,6 +775,15 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				});
 		}
 		this.bulkTransferFn = bulkTransferFn;
+		this.prlctlRetryAttempts = validateAttemptCount(
+			prlctlRetryAttempts,
+			"prlctlRetryAttempts",
+		);
+		this.prlctlRetryBackoffMs = validateDurationMs(
+			prlctlRetryBackoffMs,
+			"prlctlRetryBackoffMs",
+			0,
+		);
 		this.sleepFn = sleepFn;
 		this.nowFn = nowFn;
 		this.pidIsAlive = pidIsAlive;
@@ -734,8 +866,47 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * runs for minutes. Bound them by making the operation smaller, never by
 	 * killing it partway.
 	 */
+	/**
+	 * Invoke prlctl, absorbing the measured host-side SDK job misfire.
+	 *
+	 * This is the single chokepoint every one of the backend's prlctl call
+	 * sites already funnelled through, which is why the retry lives here rather
+	 * than being sprinkled across ~26 call sites that would each have to
+	 * remember it. Only `prlctl_job_misfire` is retried; a timeout, a
+	 * not-yet-booted guest, and an ordinary non-zero exit are all real answers
+	 * that a caller must see on the first attempt. Every failure that escapes
+	 * is a `PrlctlCallError` carrying exit code, signal, killed-by-us, and the
+	 * attempt count, so a run record can say what happened instead of "no
+	 * metadata recorded".
+	 *
+	 * @param {string[]} args
+	 * @param {object} [options] execFileSync options, plus `retry: false` to opt out.
+	 * @returns {string|Buffer} prlctl stdout
+	 * @throws {PrlctlCallError}
+	 */
 	_call(args, options = {}) {
-		return this.prlctlFn(args, options);
+		const { retry = true, ...invokeOptions } = options;
+		const maxAttempts = retry ? this.prlctlRetryAttempts : 1;
+		for (let attempt = 1; ; attempt += 1) {
+			try {
+				return this.prlctlFn(args, invokeOptions);
+			} catch (error) {
+				const failure = describePrlctlFailure(error, {
+					args,
+					attempts: attempt,
+				});
+				if (
+					failure.diagnosticCode !== "prlctl_job_misfire" ||
+					attempt >= maxAttempts
+				) {
+					throw failure;
+				}
+				// Linear backoff. The fault clears on the next call in every
+				// measured case, so this is a courtesy pause for the dispatcher
+				// rather than a wait for a slow resource to free up.
+				this.sleepFn(this.prlctlRetryBackoffMs * attempt);
+			}
+		}
 	}
 
 	/**
@@ -980,9 +1151,18 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
 			throw new TypeError("guest command arguments must be strings");
 		}
+		// Retry is OFF by default here and must stay that way. `execGuest` runs
+		// caller-supplied guest commands, and its callers include every provider
+		// adapter's actual execution call (codex, agy, copilot, opencode, vibe).
+		// A job misfire means prlctl could not read the RESULT of a command the
+		// guest may well have completed, so retrying one of those would re-run a
+		// paid provider task and repeat its side effects. The misfire is cheap
+		// to absorb only where the payload is idempotent, which is the backend's
+		// own provisioning and inspection calls, not this path. A caller that
+		// knows its command is safe to repeat may pass `retry: true`.
 		return this._call(
 			this._buildAquaExecArgs(workspaceId, [command, ...args], options),
-			options.prlctlOptions ?? {},
+			{ retry: false, ...(options.prlctlOptions ?? {}) },
 		);
 	}
 
@@ -1690,7 +1870,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		try {
 			const cloneArgs = ["clone", goldenImage, "--name", name];
 			if (linked) cloneArgs.push("--linked");
-			this._call(cloneArgs);
+			// Not retried: the working name is deterministic, so a second attempt
+			// after a misfire collides on the existing clone and reports a name
+			// conflict rather than the fault that actually happened.
+			this._call(cloneArgs, { retry: false });
 			if (linked) {
 				createdSnapshots = snapshotDifference(
 					this.listSnapshotIds(goldenImage),

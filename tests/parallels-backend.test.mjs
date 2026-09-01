@@ -18,7 +18,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { workerBootStageDiagnosticCode } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	PrlctlCallError,
+	prlctlDiagnosticCodeFor,
+	prlctlFailureMetadata,
+	WorkerBootStageError,
+	workerBootStageDiagnosticCode,
+} from "../src/switchyard/adapter/exec-error.mjs";
 import { seedProjectWithBackend } from "../src/switchyard/lifecycle/index.mjs";
 import {
 	buildParallelsWorkingName,
@@ -44,6 +50,23 @@ const WORKSPACE_UNAPPLIED = "switchyard:755\nswitchyard:755\n";
  * guest may well have run. Measured 2026-08-31 on `/bin/chmod 700`, one call
  * after `mkdir -p` and `chown` succeeded on those same paths.
  */
+/**
+ * A prlctl failure is now wrapped by `_call` in a `PrlctlCallError` that
+ * carries the classification and the original as `cause`, so "this failure was
+ * preserved, not masked by a later one" is an assertion about the cause chain
+ * rather than about object identity.
+ * @param {unknown} error
+ * @param {unknown} original
+ * @returns {boolean}
+ */
+function causedBy(error, original) {
+	for (let current = error, depth = 0; current && depth < 16; depth += 1) {
+		if (current === original) return true;
+		current = current.cause;
+	}
+	return false;
+}
+
 function lostExitCode() {
 	const error = new Error(
 		"Command failed: prlctl exec\nPrlJob_GetRetCode: Invalid argument. An invalid argument was passed.",
@@ -608,7 +631,7 @@ describe("Parallels execution backend lifecycle", () => {
 
 		throws(
 			() => backend.destroy(WORK_UUID),
-			(error) => error === deleteFailure,
+			(error) => causedBy(error, deleteFailure),
 		);
 		ok(!calls.slice(3).some((args) => args[0] === "delete"));
 		deepStrictEqual(
@@ -686,7 +709,7 @@ describe("Parallels execution backend lifecycle", () => {
 					name: "probe-failure",
 					status: "running",
 				}),
-			(error) => error === deleteFailure,
+			(error) => causedBy(error, deleteFailure),
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
@@ -802,7 +825,7 @@ describe("Parallels execution backend lifecycle", () => {
 					},
 					{ forceOnly: true },
 				),
-			(error) => error === deleteFailure,
+			(error) => causedBy(error, deleteFailure),
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
@@ -890,7 +913,7 @@ describe("Parallels execution backend lifecycle", () => {
 					name: "stuck",
 					status: "running",
 				}),
-			(error) => error === deleteFailure,
+			(error) => causedBy(error, deleteFailure),
 		);
 		// It waited the full window before giving up, and never deleted a VM it
 		// had just observed running.
@@ -1210,13 +1233,22 @@ describe("Parallels execution backend lifecycle", () => {
 
 	it("accepts a workspace whose guest state is correct despite a lost exit code", () => {
 		const execs = [];
-		const backend = workspaceBackend((args) => {
-			execs.push(args);
-			if (args.includes("/usr/bin/stat")) return WORKSPACE_READY;
-			// The silent command prlctl could not read a result for.
-			if (args.includes("/bin/chmod")) throw lostExitCode();
-			return "";
-		});
+		// Pinned to one attempt so this exercises the repair-pass decision and
+		// nothing else. `_call` now retries a job misfire internally, and at the
+		// prlctl stub a retry and a repair pass look identical — leaving the
+		// default in place would make this assert on both layers at once and
+		// fail for a reason it does not test. The retry itself is covered by
+		// "absorbs a job misfire" below.
+		const backend = workspaceBackend(
+			(args) => {
+				execs.push(args);
+				if (args.includes("/usr/bin/stat")) return WORKSPACE_READY;
+				// The silent command prlctl could not read a result for.
+				if (args.includes("/bin/chmod")) throw lostExitCode();
+				return "";
+			},
+			{ prlctlRetryAttempts: 1 },
+		);
 
 		backend._prepareWorkspace(WORK_UUID, "switchyard");
 
@@ -1969,5 +2001,173 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			snapshotIds: [CLONE_SNAPSHOT],
 		});
 		backend.deleteSnapshotSidecar(WORK_UUID);
+	});
+});
+
+/**
+ * The host-side SDK job misfire, and the boundary around absorbing it.
+ *
+ * Measured 2026-09-01 against the golden image with switchyard entirely out of
+ * the picture: a plain shell loop saw 5 of 150 serial `prlctl exec` calls fail
+ * with `PrlJob_GetRetCode`/`GetResult: Invalid argument`, 14 of 100 under four
+ * concurrent callers, and every serial misfire cleared on the very next call.
+ * Before this suite, one such misfire anywhere in a boot sequence killed the
+ * whole run and left no exit code, signal, or attempt count behind.
+ */
+describe("prlctl job-misfire tolerance", () => {
+	it("absorbs a job misfire and returns the retried result", () => {
+		let calls = 0;
+		const backend = workspaceBackend(() => {
+			calls += 1;
+			if (calls === 1) throw lostExitCode();
+			return "second-attempt-output";
+		});
+
+		strictEqual(backend._call(["list", "-a"]), "second-attempt-output");
+		strictEqual(calls, 2, "the misfire must cost exactly one extra call");
+	});
+
+	it("stops at the bounded attempt count instead of retrying forever", () => {
+		let calls = 0;
+		const backend = workspaceBackend(
+			() => {
+				calls += 1;
+				throw lostExitCode();
+			},
+			{ prlctlRetryAttempts: 3 },
+		);
+
+		throws(
+			() => backend._call(["list", "-a"]),
+			(error) => {
+				ok(error instanceof PrlctlCallError);
+				strictEqual(error.diagnosticCode, "prlctl_job_misfire");
+				strictEqual(error.attempts, 3);
+				strictEqual(error.exitCode, 255, "the real exit code must survive");
+				return true;
+			},
+		);
+		strictEqual(calls, 3, "a persistent misfire must not retry unbounded");
+	});
+
+	it("never retries a provider command run through execGuest", () => {
+		// The whole point of the boundary: a misfire means prlctl could not read
+		// the RESULT of a command the guest may have completed. Re-running a
+		// provider CLI would repeat a paid task and its side effects.
+		let calls = 0;
+		const backend = workspaceBackend(() => {
+			calls += 1;
+			throw lostExitCode();
+		});
+
+		throws(
+			() => backend.execGuest(WORK_UUID, "/usr/local/bin/codex", ["exec"]),
+			(error) => error instanceof PrlctlCallError,
+		);
+		strictEqual(calls, 1, "a provider invocation must be attempted once only");
+	});
+
+	it("classifies a not-yet-booted guest separately and does not retry it", () => {
+		// A distinct, informative condition on a different timescale: 48 of the
+		// first 100 calls after `prlctl start` returned this. The readiness
+		// pollers own the wait; retrying here would mask an unbootable guest.
+		let calls = 0;
+		const notReady = new Error(
+			"Unable to open new session in this virtual machine. Make sure your virtual machine has finished boot",
+		);
+		notReady.status = 255;
+		const backend = workspaceBackend(() => {
+			calls += 1;
+			throw notReady;
+		});
+
+		throws(
+			() => backend._call(["exec", WORK_UUID, "/usr/bin/true"]),
+			(error) => {
+				strictEqual(error.diagnosticCode, "prlctl_session_not_ready");
+				return true;
+			},
+		);
+		strictEqual(calls, 1, "readiness is polled, not retried inside a call");
+	});
+
+	it("records that the harness itself killed the child on a timeout", () => {
+		const timedOut = new Error("spawnSync prlctl ETIMEDOUT");
+		timedOut.code = "ETIMEDOUT";
+		timedOut.killed = true;
+		timedOut.signal = "SIGTERM";
+		const backend = workspaceBackend(() => {
+			throw timedOut;
+		});
+
+		throws(
+			() => backend._call(["exec", WORK_UUID, "/sbin/mount"]),
+			(error) => {
+				strictEqual(error.diagnosticCode, "prlctl_call_timed_out");
+				strictEqual(error.killed, true);
+				strictEqual(error.signal, "SIGTERM");
+				return true;
+			},
+		);
+	});
+
+	it("keeps the guest's own message readable on an ordinary failure", () => {
+		const denied = new Error("Command failed: prlctl exec");
+		denied.status = 1;
+		denied.stderr = "chmod: /Users/switchyard: Read-only file system";
+		const backend = workspaceBackend(() => {
+			throw denied;
+		});
+
+		throws(
+			() => backend._call(["exec", WORK_UUID, "/bin/chmod"]),
+			(error) => {
+				strictEqual(error.diagnosticCode, "prlctl_call_failed");
+				ok(
+					/Read-only file system/.test(error.message),
+					`diagnosable text was lost: ${error.message}`,
+				);
+				return true;
+			},
+		);
+	});
+
+	it("surfaces the misfire code through a wrapping boot-stage error", () => {
+		// What the run record actually reads. "workspace_prepare_failed" says
+		// which stage died; the misfire code says why, and only the why
+		// distinguishes a transient host fault from a real provisioning problem.
+		const misfire = new PrlctlCallError({
+			diagnosticCode: "prlctl_job_misfire",
+			subcommand: "exec",
+			attempts: 4,
+			exitCode: 255,
+		});
+		const staged = new WorkerBootStageError(
+			"workspace_prepare_failed",
+			misfire,
+		);
+
+		strictEqual(prlctlDiagnosticCodeFor(staged), "prlctl_job_misfire");
+		deepStrictEqual(prlctlFailureMetadata(staged), {
+			diagnosticCode: "prlctl_job_misfire",
+			exitCode: 255,
+		});
+		strictEqual(
+			workerBootStageDiagnosticCode(staged),
+			"workspace_prepare_failed",
+			"the stage code must remain available alongside the cause",
+		);
+	});
+
+	it("reports nothing for an error that is not a reviewed prlctl failure", () => {
+		strictEqual(prlctlDiagnosticCodeFor(new Error("unrelated")), null);
+		strictEqual(prlctlFailureMetadata(null), null);
+	});
+
+	it("refuses an unrecognized diagnostic code", () => {
+		throws(
+			() => new PrlctlCallError({ diagnosticCode: "prlctl_made_up" }),
+			TypeError,
+		);
 	});
 });

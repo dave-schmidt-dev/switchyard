@@ -10,6 +10,7 @@ import {
 	CLEANUP_STAGES,
 	isPersistentFailureMetadata,
 	PERSISTED_SIGNALS,
+	prlctlDiagnosticCodeFor,
 	sanitizeFailureMetadata,
 	workerBootStageDiagnosticCode,
 } from "../adapter/exec-error.mjs";
@@ -143,9 +144,16 @@ async function writeFatalEvent(
 	try {
 		const runStore = await import("../run-store/index.mjs");
 		const current = await runStore.readRun(runId);
+		// A prlctl failure is checked before the boot-stage code because it is
+		// strictly more specific: "workspace_prepare_failed" says which stage
+		// died, "prlctl_job_misfire" says why, and the why is what a reader
+		// needs to tell a transient host-side SDK fault apart from a real
+		// provisioning problem. Both are closed vocabulary.
 		const closedCode = isRecognizedCheckpointIdentityError(error)
 			? error.code
-			: (workerBootStageDiagnosticCode(error) ?? diagnosticCode);
+			: (prlctlDiagnosticCodeFor(error) ??
+				workerBootStageDiagnosticCode(error) ??
+				diagnosticCode);
 		const failure = sanitizeFailureMetadata({
 			result: "launch_failed",
 			errorKind: "launch_failed",
