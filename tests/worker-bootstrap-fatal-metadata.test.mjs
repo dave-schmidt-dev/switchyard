@@ -1,68 +1,15 @@
-// Regression coverage for worker-bootstrap.mjs's writeFatalEvent() metadata
-// composition: which closed diagnostic code wins when a prlctl misfire, a
-// boot-stage error, and a checkpoint-identity error can all be in play, and
-// when the resulting exitCode/signal are attached to (or withheld from) the
-// persisted failure.
-//
-// worker-bootstrap.mjs can't be imported directly -- it's a bare top-level
-// script that parses process.argv and calls process.exit on the spot (see
-// worker-bootstrap-write-chain.test.mjs for the same constraint on its
-// writeChain logic). This file follows that established pattern: it imports
-// the REAL classifiers (prlctlFailureMetadata, workerBootStageDiagnosticCode,
-// sanitizeFailureMetadata) and reproduces only the small glue that combines
-// them, copied verbatim from writeFatalEvent(). If that composition in
-// worker-bootstrap.mjs ever changes, keep buildFatalFailure() below in sync
-// with it -- this pins the imported pipeline's composition, it cannot catch a
-// drift introduced only inside worker-bootstrap.mjs itself.
+// Regression coverage for worker-bootstrap.mjs's production fatal metadata
+// composition.
 
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	PrlctlCallError,
 	prlctlFailureMetadata,
-	sanitizeFailureMetadata,
 	WorkerBootStageError,
 	workerBootStageDiagnosticCode,
 } from "../src/switchyard/adapter/exec-error.mjs";
-
-// Copied from worker-bootstrap.mjs's RECOGNIZED_CHECKPOINT_IDENTITY_CODES /
-// isRecognizedCheckpointIdentityError.
-const RECOGNIZED_CHECKPOINT_IDENTITY_CODES = new Set([
-	"checkpoint_task_file_mismatch",
-	"checkpoint_tasks_file_mismatch",
-	"checkpoint_missing_queue_identity",
-	"checkpoint_queue_identity_missing",
-	"checkpoint_queue_identity_mismatch",
-	"checkpoint_run_options_mismatch",
-	"checkpoint_historical_checkpoint",
-	"checkpoint_historical_state",
-]);
-
-function isRecognizedCheckpointIdentityError(error) {
-	return (
-		typeof error?.code === "string" &&
-		RECOGNIZED_CHECKPOINT_IDENTITY_CODES.has(error.code)
-	);
-}
-
-// Copied from writeFatalEvent()'s closedCode/failure construction.
-function buildFatalFailure(error, diagnosticCode = "worker_boot_exception") {
-	const prlctlFailure = prlctlFailureMetadata(error);
-	const closedCode = isRecognizedCheckpointIdentityError(error)
-		? error.code
-		: (prlctlFailure?.diagnosticCode ??
-			workerBootStageDiagnosticCode(error) ??
-			diagnosticCode);
-	return sanitizeFailureMetadata({
-		result: "launch_failed",
-		errorKind: "launch_failed",
-		diagnosticCode: closedCode,
-		failurePhase: "worker_boot",
-		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
-			? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
-			: {}),
-	});
-}
+import { buildFatalFailure } from "../src/switchyard/dispatch/worker-bootstrap.mjs";
 
 describe("writeFatalEvent metadata composition", () => {
 	it("prefers the prlctl misfire code over the boot stage it happened during, and attaches its exit code", () => {

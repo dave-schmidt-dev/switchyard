@@ -16,12 +16,10 @@
 // callback's call has fully settled — writes end up strictly ordered by
 // fire-time, not by whichever readRun() happens to resolve first.
 //
-// worker-bootstrap.mjs itself can't be imported directly: it's a bare
-// top-level script that parses process.argv and calls process.exit on the
-// spot, so pulling it into this process would kill the test runner. Instead
-// this file reproduces the exact writeChain pattern against a realistically
-// faked run-store — same revision-checked write, same updateRunWithRetry
-// retry-until-success loop as src/switchyard/run-store/index.mjs — with an
+// This file uses worker-bootstrap.mjs's production write-chain helper against
+// a realistically faked run-store — same revision-checked write, same
+// updateRunWithRetry retry-until-success loop as
+// src/switchyard/run-store/index.mjs — with an
 // injectable read latency so the out-of-order-resolution race is forced
 // deterministically instead of depending on real filesystem timing (which
 // would make this test flaky, and flaky in a way that could pass even
@@ -30,6 +28,7 @@
 
 import { rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
+import { createWriteChain } from "../src/switchyard/dispatch/worker-bootstrap.mjs";
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -110,13 +109,11 @@ function createFakeRunStore(initialFields, { failUpdates = 0 } = {}) {
  * forget shape (`updateRunWithRetry(...).catch(() => {})`, no chaining).
  */
 function buildCallbacks(store, { ordered }) {
-	let writeChain = Promise.resolve();
+	const writes = createWriteChain();
 
 	function fire(fn, { propagateFailure = false } = {}) {
 		if (ordered) {
-			const write = writeChain.then(fn, fn);
-			writeChain = write.catch(() => {});
-			return propagateFailure ? write : writeChain;
+			return writes.queueWrite(fn, { propagateFailure });
 		}
 		const write = fn();
 		return propagateFailure ? write : write.catch(() => {});
@@ -172,7 +169,7 @@ function buildCallbacks(store, { ordered }) {
 				);
 			return fire(fn, { propagateFailure: true });
 		},
-		drain: () => writeChain,
+		drain: writes.drain,
 	};
 }
 
