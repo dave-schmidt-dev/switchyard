@@ -1398,6 +1398,238 @@ describe("runner queue parsing", () => {
 		strictEqual(tasks[0].type, "review");
 		strictEqual(tasks[0].requiredPaths, null);
 	});
+
+	it("parses AllowManifests: true and returns allowManifests: true", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Opt in to manifests
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** true
+- **Description:** Update dependencies
+`;
+		const tasks = parseFixture(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].allowManifests, true);
+	});
+
+	it("parses AllowManifests: false and returns allowManifests: false without manifest authority", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Explicitly disable manifests
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** false
+- **Description:** Update dependencies
+`;
+		const tasks = parseFixture(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].allowManifests, false);
+	});
+
+	it("defaults allowManifests to false when AllowManifests is omitted", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Omitted AllowManifests
+- **Status:** pending
+- **Files:** src/index.mjs
+- **Description:** Update code
+`;
+		const tasks = parseFixture(markdown);
+		strictEqual(tasks.length, 1);
+		strictEqual(tasks[0].allowManifests, false);
+	});
+
+	it("rejects non-boolean AllowManifests values, failing closed before routing", () => {
+		const invalidValues = [
+			"True",
+			"False",
+			"TRUE",
+			"FALSE",
+			"yes",
+			"no",
+			"1",
+			"0",
+			"maybe",
+			"",
+		];
+		for (const val of invalidValues) {
+			const markdown = `## Phase 1
+
+### Task 1.1: Bad AllowManifests
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** ${val}
+- **Description:** Update dependencies
+`;
+			throws(
+				() => parseFixture(markdown),
+				/AllowManifests must be true or false when present/,
+			);
+		}
+	});
+
+	it("rejects duplicate AllowManifests declarations", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: Duplicate AllowManifests
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** true
+- **AllowManifests:** false
+- **Description:** Update dependencies
+`;
+		throws(
+			() => parseFixture(markdown),
+			/duplicate AllowManifests declarations are not allowed/,
+		);
+	});
+
+	it("rejects AllowManifests on review tasks", () => {
+		for (const boolVal of ["true", "false"]) {
+			const markdown = `## Phase 1
+
+### Task 1.1: Review task with AllowManifests
+- **Status:** pending
+- **Type:** review
+- **AllowManifests:** ${boolVal}
+- **Description:** Review dependencies
+`;
+			throws(
+				() => parseFixture(markdown),
+				/AllowManifests is only supported for implementation-type tasks/,
+			);
+		}
+	});
+});
+
+describe("AllowManifests execution authority and pre-routing rejection", () => {
+	it("passes allowSensitiveManifests: false to integrationGate when AllowManifests: false", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: AllowManifests false task
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** false
+- **Description:** No manifest authority
+`;
+		const task = parseFixture(markdown)[0];
+		strictEqual(task.allowManifests, false);
+
+		const gateCalls = [];
+		const result = executeTask(task, {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				percentLeft: 50,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: (diff, projectPath, options) => {
+				gateCalls.push({ diff, projectPath, options });
+				return { success: true, message: "ok" };
+			},
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/package.json b/package.json",
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+
+		strictEqual(result.success, true);
+		strictEqual(gateCalls.length, 1);
+		strictEqual(gateCalls[0].options.allowSensitiveManifests, false);
+	});
+
+	it("passes allowSensitiveManifests: true to integrationGate when AllowManifests: true", () => {
+		const markdown = `## Phase 1
+
+### Task 1.1: AllowManifests true task
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** true
+- **Description:** Authorized manifest change
+`;
+		const task = parseFixture(markdown)[0];
+		strictEqual(task.allowManifests, true);
+
+		const gateCalls = [];
+		const result = executeTask(task, {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				percentLeft: 50,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: (diff, projectPath, options) => {
+				gateCalls.push({ diff, projectPath, options });
+				return { success: true, message: "ok" };
+			},
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/package.json b/package.json",
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+
+		strictEqual(result.success, true);
+		strictEqual(gateCalls.length, 1);
+		strictEqual(gateCalls[0].options.allowSensitiveManifests, true);
+	});
+
+	it("fails before routing when task contains invalid AllowManifests value", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Invalid AllowManifests task
+- **Status:** pending
+- **Files:** package.json
+- **AllowManifests:** invalid_value
+- **Description:** Bad value
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		let routeCalled = false;
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+					checkpointPath,
+					dependencies: {
+						route: () => {
+							routeCalled = true;
+							return {
+								provider: "claude",
+								model: "claude-sonnet-5",
+								percentLeft: 50,
+								reason: "spread",
+							};
+						},
+						recordDispatch: () => {},
+						recordDispatchIntent: () => {},
+						integrationGate: () => ({ success: true }),
+						adapters: {
+							claude: {
+								execute: () => ({ success: true, output: "ok" }),
+								captureDiff: () => "diff",
+							},
+						},
+					},
+				}),
+			/AllowManifests must be true or false when present/,
+		);
+		strictEqual(routeCalled, false);
+	});
 });
 
 describe("async runner provider lifecycle", () => {

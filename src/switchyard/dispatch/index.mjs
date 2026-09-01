@@ -468,7 +468,7 @@ async function runDispatch(opts, dependencies = {}) {
 	console.error(`dispatch: queue    ${opts.tasksFilePath}`);
 	console.error(`dispatch: project  ${opts.projectPath}`);
 	console.error(
-		"dispatch: routing host-side by usage headroom; each task runs headless in a disposable per-provider container.",
+		"dispatch: routing host-side by usage headroom; each task runs headlessly in a disposable Parallels working VM.",
 	);
 	console.error(
 		"dispatch: expect several minutes per task while the provider CLI runs.",

@@ -1128,25 +1128,33 @@ export function parseTaskQueue(markdown) {
 			);
 		}
 
-		const allowManifestsLine = block
+		const allowManifestsLines = block
 			.split("\n")
-			.find((line) => /^- \*\*AllowManifests:\*\*(?:\s|$)/.test(line));
+			.filter((line) => /^- \*\*AllowManifests:\*\*(?:\s|$)/.test(line));
 		let allowManifests = false;
-		if (allowManifestsLine) {
+		if (allowManifestsLines.length > 0) {
 			if (type !== "implementation") {
 				throw new Error(
 					`Task ${taskId}: AllowManifests is only supported for implementation-type tasks`,
 				);
 			}
-			const value = allowManifestsLine
-				.replace(/^- \*\*AllowManifests:\*\*\s*/, "")
-				.trim();
-			if (value !== "true") {
+			if (allowManifestsLines.length > 1) {
 				throw new Error(
-					`Task ${taskId}: AllowManifests must be exactly true when present`,
+					`Task ${taskId}: duplicate AllowManifests declarations are not allowed`,
 				);
 			}
-			allowManifests = true;
+			const value = allowManifestsLines[0]
+				.replace(/^- \*\*AllowManifests:\*\*\s*/, "")
+				.trim();
+			if (value === "true") {
+				allowManifests = true;
+			} else if (value === "false") {
+				allowManifests = false;
+			} else {
+				throw new Error(
+					`Task ${taskId}: AllowManifests must be true or false when present`,
+				);
+			}
 		}
 
 		tasks.push({
