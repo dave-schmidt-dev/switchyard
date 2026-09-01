@@ -9058,7 +9058,11 @@ describe("runQueue timeout diff persistence", () => {
 			projectPath: TEST_DIR,
 			checkpointPath: `${tasksPath}.checkpoint.json`,
 			dependencies: {
-				route: () => ({ provider: "vibe", model: "glm-5.2", reason: "spread" }),
+				route: () => ({
+					provider: "vibe",
+					model: "mistral-medium-3.5",
+					reason: "spread",
+				}),
 				recordDispatch: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				ensureAgentContainer: () => {},
@@ -9105,7 +9109,11 @@ describe("runQueue timeout diff persistence", () => {
 			workingContainerName: "fake-container",
 			checkpointPath: `${tasksPath}.checkpoint.json`,
 			dependencies: {
-				route: () => ({ provider: "vibe", model: "glm-5.2", reason: "spread" }),
+				route: () => ({
+					provider: "vibe",
+					model: "mistral-medium-3.5",
+					reason: "spread",
+				}),
 				recordDispatch: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				ensureAgentContainer: () => {},

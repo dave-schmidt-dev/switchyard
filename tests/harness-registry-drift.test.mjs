@@ -148,11 +148,16 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	const vibeModelRef = "mistral/zai-glm-5-2";
-	const vibeSelector = "glm-5-2";
-	const oldVibeSelector = "glm-5.2";
-	const oldVibeDescriptorHash =
-		"sha256:fcb8dc17218516f69e8609d61f768106ab301727e2e65af76b0da4285f0895b1";
+	const vibeModelRef = "mistral/mistral-medium-3.5";
+	const vibeSelector = "mistral-medium-3.5";
+	// Both GLM spellings were demoted on 2026-09-01: the VM-side Vibe account is
+	// not entitled to GLM-5.2, so every GLM selector silently fell back to
+	// mistral-medium-3.5. Neither label may survive as a qualification record.
+	const oldVibeSelectors = ["glm-5.2", "glm-5-2"];
+	const oldVibeDescriptorHashes = [
+		"sha256:fcb8dc17218516f69e8609d61f768106ab301727e2e65af76b0da4285f0895b1",
+		"sha256:27fdd3ad8fd8ce6f1eb8478848f09956d84c432787db2c4609fcd9bef74c274b",
+	];
 
 	it("vibe is enabled with its VM clone and bounded qualifier policy", () => {
 		ok("vibe" in targets, "expected a vibe target entry");
@@ -174,12 +179,12 @@ describe("harness registry drift (Task 1.6b)", () => {
 
 		for (const [entryId, qualification] of vibeQualificationEntries) {
 			ok(
-				entryId !== oldVibeDescriptorHash,
-				`unexpected legacy vibe descriptor identity ${oldVibeDescriptorHash} was retained`,
+				!oldVibeDescriptorHashes.includes(entryId),
+				`unexpected legacy vibe descriptor identity ${entryId} was retained`,
 			);
 			ok(
-				qualification?.selector !== oldVibeSelector,
-				`unexpected legacy vibe selector ${oldVibeSelector} was retained`,
+				!oldVibeSelectors.includes(qualification?.selector),
+				`unexpected legacy vibe selector ${qualification?.selector} was retained`,
 			);
 		}
 
@@ -254,7 +259,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 			strictEqual(
 				qualification.promotion_receipt?.selector,
 				vibeSelector,
-				"vibe promotion receipt selector must be glm-5-2",
+				"vibe promotion receipt selector must be mistral-medium-3.5",
 			);
 			strictEqual(
 				qualification.promotion_receipt?.effort,

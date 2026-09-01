@@ -15,8 +15,8 @@ const WORKSPACE = "22222222-2222-4222-8222-222222222222";
 const DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "vibe",
-		model_ref: "mistral/zai-glm-5-2",
-		selector: "glm-5-2",
+		model_ref: "mistral/mistral-medium-3.5",
+		selector: "mistral-medium-3.5",
 		effort: null,
 		variant: null,
 		invocation_args: [],
@@ -55,8 +55,8 @@ describe("Vibe adapter", () => {
 		strictEqual(result.success, true);
 		strictEqual(result.output, "vibe-ran");
 		strictEqual(request.workspaceId, WORKSPACE);
-		strictEqual(VIBE_ACTIVE_MODEL, "glm-5-2");
-		deepStrictEqual(request.env, ["VIBE_ACTIVE_MODEL=glm-5-2"]);
+		strictEqual(VIBE_ACTIVE_MODEL, "mistral-medium-3.5");
+		deepStrictEqual(request.env, ["VIBE_ACTIVE_MODEL=mistral-medium-3.5"]);
 		deepStrictEqual(request.argv.slice(0, 2), ["vibe", "-p"]);
 		ok(request.argv[2].includes("change one file"));
 		deepStrictEqual(request.argv.slice(-6), [
@@ -76,8 +76,8 @@ describe("Vibe adapter", () => {
 		const inactiveDescriptor = validateInvocationDescriptor(
 			{
 				target_id: "vibe",
-				model_ref: "mistral/zai-glm-5-2",
-				selector: "glm-5.2",
+				model_ref: "mistral/mistral-medium-3.5",
+				selector: "glm-5-2",
 				effort: null,
 				variant: null,
 				invocation_args: [],
@@ -111,7 +111,7 @@ describe("Vibe adapter", () => {
 		};
 		const result = await executeAsync("change one file", WORKSPACE, {
 			...options(executionBackend),
-			model: "glm-5.2",
+			model: "glm-5-2",
 		});
 		strictEqual(result.success, false);
 		strictEqual(execArgvCalled, false);

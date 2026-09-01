@@ -156,8 +156,8 @@ describe("probeLiveness", () => {
 
 	it("probes Vibe with the adapter's fixed active-model alias", () => {
 		const spec = specFor("vibe");
-		strictEqual(VIBE_ACTIVE_MODEL, "glm-5-2");
-		deepStrictEqual(spec.env, ["VIBE_ACTIVE_MODEL=glm-5-2"]);
+		strictEqual(VIBE_ACTIVE_MODEL, "mistral-medium-3.5");
+		deepStrictEqual(spec.env, ["VIBE_ACTIVE_MODEL=mistral-medium-3.5"]);
 	});
 
 	it("probes the no-variant MiMo lane used for low-capability dispatch", () => {

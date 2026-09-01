@@ -18,7 +18,7 @@ import {
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const VIBE_CMD = "vibe";
-export const VIBE_ACTIVE_MODEL = "glm-5-2";
+export const VIBE_ACTIVE_MODEL = "mistral-medium-3.5";
 const VIBE_KEYCHAIN_SERVICE = "ai.mistral.vibe";
 const VIBE_KEYCHAIN_ACCOUNT = "MISTRAL_API_KEY";
 // Twelve turns bounds a standard task's inspect/edit/test loop while leaving
