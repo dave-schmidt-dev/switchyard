@@ -10,7 +10,7 @@ import {
 	CLEANUP_STAGES,
 	isPersistentFailureMetadata,
 	PERSISTED_SIGNALS,
-	prlctlDiagnosticCodeFor,
+	prlctlFailureMetadata,
 	sanitizeFailureMetadata,
 	workerBootStageDiagnosticCode,
 } from "../adapter/exec-error.mjs";
@@ -149,9 +149,10 @@ async function writeFatalEvent(
 		// died, "prlctl_job_misfire" says why, and the why is what a reader
 		// needs to tell a transient host-side SDK fault apart from a real
 		// provisioning problem. Both are closed vocabulary.
+		const prlctlFailure = prlctlFailureMetadata(error);
 		const closedCode = isRecognizedCheckpointIdentityError(error)
 			? error.code
-			: (prlctlDiagnosticCodeFor(error) ??
+			: (prlctlFailure?.diagnosticCode ??
 				workerBootStageDiagnosticCode(error) ??
 				diagnosticCode);
 		const failure = sanitizeFailureMetadata({
@@ -159,6 +160,12 @@ async function writeFatalEvent(
 			errorKind: "launch_failed",
 			diagnosticCode: closedCode,
 			failurePhase: "worker_boot",
+			// Only when the prlctl code is the one being recorded: an exit code
+			// belongs to the failure it came from, and attaching it to an
+			// unrelated checkpoint or boot-stage code would misattribute it.
+			...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
+				? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
+				: {}),
 		});
 		await finalizeRun(
 			{

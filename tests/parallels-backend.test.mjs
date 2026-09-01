@@ -19,8 +19,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+	describeExecError,
 	PrlctlCallError,
-	prlctlDiagnosticCodeFor,
 	prlctlFailureMetadata,
 	WorkerBootStageError,
 	workerBootStageDiagnosticCode,
@@ -2147,7 +2147,6 @@ describe("prlctl job-misfire tolerance", () => {
 			misfire,
 		);
 
-		strictEqual(prlctlDiagnosticCodeFor(staged), "prlctl_job_misfire");
 		deepStrictEqual(prlctlFailureMetadata(staged), {
 			diagnosticCode: "prlctl_job_misfire",
 			exitCode: 255,
@@ -2160,7 +2159,7 @@ describe("prlctl job-misfire tolerance", () => {
 	});
 
 	it("reports nothing for an error that is not a reviewed prlctl failure", () => {
-		strictEqual(prlctlDiagnosticCodeFor(new Error("unrelated")), null);
+		strictEqual(prlctlFailureMetadata(new Error("unrelated")), null);
 		strictEqual(prlctlFailureMetadata(null), null);
 	});
 
@@ -2169,5 +2168,100 @@ describe("prlctl job-misfire tolerance", () => {
 			() => new PrlctlCallError({ diagnosticCode: "prlctl_made_up" }),
 			TypeError,
 		);
+	});
+});
+
+describe("prlctl failures stay diagnosable downstream", () => {
+	// The wrapper introduced for job-misfire tolerance sits between the child
+	// process and every consumer that classifies a failure. Adapter tests inject
+	// a mock backend, so nothing else exercises the real-`_call`-error seam --
+	// which is exactly how a wrapper that swallowed `stdout` and `code` would
+	// ship green.
+
+	/**
+	 * The shape `execFileSync` throws: captured output plus an exit status.
+	 * @param {object} fields
+	 * @returns {Error}
+	 */
+	function childFailure(fields) {
+		return Object.assign(
+			new Error("Command failed: prlctl exec {vm} claude -p ..."),
+			{ stdout: "", stderr: "", status: 1, ...fields },
+		);
+	}
+
+	/**
+	 * @param {Error} cause
+	 * @returns {Error} whatever `_call` lets escape for that cause
+	 */
+	function thrownByCall(cause) {
+		const backend = workspaceBackend(() => {
+			throw cause;
+		});
+		try {
+			backend.execGuest("vm-1", "claude", ["-p", "task"], { cwd: "/" });
+		} catch (error) {
+			return error;
+		}
+		throw new Error("execGuest was expected to fail");
+	}
+
+	it("keeps an expired provider session classifiable as auth_expired", () => {
+		// The documented incident: the CLI printed its diagnostic to stdout and
+		// exited 1. If the wrapper hides stdout, describeExecError sees an empty
+		// haystack, every signature check is gated off, and the run record gets
+		// "Command failed: prlctl exec ..." back -- the opaque reason that cost a
+		// cross-session investigation the first time.
+		const escaped = thrownByCall(
+			childFailure({
+				stdout:
+					"Failed to authenticate: OAuth session expired and could not be refreshed\n",
+			}),
+		);
+		const described = describeExecError(escaped, { provider: "claude" });
+
+		strictEqual(described.errorKind, "auth_expired");
+		ok(
+			described.output.includes("OAuth session expired"),
+			`provider stdout was dropped: ${JSON.stringify(described.output)}`,
+		);
+		ok(
+			described.error.includes("OAuth session expired"),
+			`the surfaced reason lost the provider's words: ${described.error}`,
+		);
+	});
+
+	it("keeps a provider timeout routable on error.code", () => {
+		// Every adapter branches on `error.code === "ETIMEDOUT"` to reach its
+		// timeout path. Losing it does not fail loudly -- it misroutes a real
+		// timeout into a generic execution failure.
+		const escaped = thrownByCall(
+			childFailure({ code: "ETIMEDOUT", killed: true, status: null }),
+		);
+
+		strictEqual(escaped.code, "ETIMEDOUT");
+		strictEqual(escaped.diagnosticCode, "prlctl_call_timed_out");
+	});
+
+	it("still prefers the child's own words over Node's wrapper", () => {
+		const stderrOnly = thrownByCall(
+			childFailure({ stderr: "chmod: /x: Read-only file system\n" }),
+		);
+		ok(/Read-only file system/.test(stderrOnly.message), stderrOnly.message);
+
+		// stdout is the fallback: a CLI picks whichever stream it likes.
+		const stdoutOnly = thrownByCall(
+			childFailure({ stdout: "model 'gemini-3.7' not found\n" }),
+		);
+		ok(/gemini-3\.7/.test(stdoutOnly.message), stdoutOnly.message);
+	});
+
+	it("does not widen what an accidental serialization would carry", () => {
+		// The forwarded fields can hold provider output; they are diagnostic
+		// surface for reviewed readers, not record fields. `name` is enumerable
+		// (a plain assignment, as on any Error subclass) but is a fixed literal.
+		const escaped = thrownByCall(childFailure({ stdout: "guest-only text\n" }));
+		deepStrictEqual(Object.keys(escaped), ["name"]);
+		strictEqual(JSON.stringify(escaped), '{"name":"PrlctlCallError"}');
 	});
 });

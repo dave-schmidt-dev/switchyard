@@ -204,14 +204,17 @@ export class PrlctlCallError extends Error {
 	static #MAX_DETAIL_CHARS = 400;
 
 	/**
-	 * Prefer the child's stderr over Node's generic "Command failed: prlctl …"
+	 * Prefer the child's own output over Node's generic "Command failed: prlctl …"
 	 * wrapper, which names the command and says nothing about why it failed.
+	 * stderr first, then stdout: a provider CLI prints its diagnostic to
+	 * whichever it prefers, and the documented OAuth-expiry incident used stdout.
 	 * @param {unknown} cause
 	 * @returns {string}
 	 */
 	static #detailOf(cause) {
 		const stderr = typeof cause?.stderr === "string" ? cause.stderr.trim() : "";
-		const text = stderr || String(cause?.message ?? "").trim();
+		const stdout = typeof cause?.stdout === "string" ? cause.stdout.trim() : "";
+		const text = stderr || stdout || String(cause?.message ?? "").trim();
 		if (!text) return "";
 		return text.length <= PrlctlCallError.#MAX_DETAIL_CHARS
 			? text
@@ -268,27 +271,22 @@ export class PrlctlCallError extends Error {
 		]) {
 			Object.defineProperty(this, key, { value, enumerable: false });
 		}
+		// Forward `execFileSync`'s own failure shape. It is not decoration: the
+		// rest of the system already reads it. Every adapter routes a provider
+		// timeout on `error.code === "ETIMEDOUT"`, and describeExecError recovers
+		// the provider's own words from `error.stdout`/`error.stderr` -- its
+		// auth/quota/model classification is gated on that text being non-empty.
+		// A wrapper that dropped these would disable that classification and
+		// misroute a real timeout into a generic execution failure, reintroducing
+		// the opaque "Command failed: ..." incident this module exists to end.
+		// Non-enumerable for the same reason as the fields above; persistence
+		// projects only the closed vocabulary, never this surface.
+		for (const key of ["stdout", "stderr", "status", "code"]) {
+			const value = cause?.[key];
+			if (value === undefined) continue;
+			Object.defineProperty(this, key, { value, enumerable: false });
+		}
 	}
-}
-
-/**
- * Return a prlctl diagnostic code from the reviewed error type, walking the
- * `cause` chain so a misfire wrapped by a boot-stage error is still reported.
- *
- * Like `workerBootStageDiagnosticCode`, this reads only the reviewed type and
- * never arbitrary properties, so an error crafted elsewhere cannot inject a
- * code into a persisted record.
- * @param {unknown} error
- * @returns {string|null}
- */
-export function prlctlDiagnosticCodeFor(error) {
-	// Bounded so a self-referential or pathologically deep cause chain cannot
-	// spin here while a run is already failing.
-	for (let current = error, depth = 0; current && depth < 16; depth += 1) {
-		if (current instanceof PrlctlCallError) return current.diagnosticCode;
-		current = current.cause;
-	}
-	return null;
 }
 
 /**
@@ -298,6 +296,10 @@ export function prlctlDiagnosticCodeFor(error) {
  * @returns {{diagnosticCode: string, exitCode?: number, signal?: string}|null}
  */
 export function prlctlFailureMetadata(error) {
+	// Reads only the reviewed type and never arbitrary properties, so an error
+	// crafted elsewhere cannot inject a code into a persisted record. The walk is
+	// bounded so a self-referential or pathologically deep cause chain cannot spin
+	// here while a run is already failing.
 	for (let current = error, depth = 0; current && depth < 16; depth += 1) {
 		if (current instanceof PrlctlCallError) {
 			const safe = { diagnosticCode: current.diagnosticCode };
