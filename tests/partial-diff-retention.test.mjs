@@ -13,12 +13,11 @@
 // diff's size in bytes, and worker-bootstrap's onStatus handler now forwards
 // both instead of discarding them.
 //
-// worker-bootstrap.mjs cannot be imported: it is a bare top-level script that
-// parses process.argv and calls process.exit on the spot, so importing it
-// would kill the test runner. The onStatus regression therefore extracts the
-// real shipped handler body out of the source and executes it against a fake
-// run store, so these tests fail if the handler stops forwarding — not merely
-// if a comment changes.
+// The onStatus regression extracts the shipped handler body and executes it
+// against a fake run store because this test needs to inject partial-diff
+// events directly. It remains bound to the production callback source, while
+// the separately exported worker-bootstrap helpers are covered by direct
+// imports.
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { mkdtempSync, rmSync } from "node:fs";

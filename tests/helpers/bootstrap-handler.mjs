@@ -1,10 +1,9 @@
 // Shared harness for asserting against worker-bootstrap's real handlers.
 //
-// worker-bootstrap.mjs cannot be imported: it is a bare top-level script that
-// parses process.argv and calls process.exit on the spot, so importing it
-// would kill the test runner. These helpers slice the shipped handler body out
-// of the source and execute it, so assertions bind to the code that actually
-// runs rather than to a copy of it that can drift.
+// worker-bootstrap.mjs now exposes its production entrypoint and helpers while
+// guarding its CLI-only execution with an import-safe main check. These
+// helpers still extract the onStatus handler body so the callback can run
+// against a synthetic run store and exercise its event-forwarding contract.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
