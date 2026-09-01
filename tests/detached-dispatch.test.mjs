@@ -1931,7 +1931,10 @@ describe("non-matching nonce", () => {
 						});
 						throw new WorkerBootStageError(${JSON.stringify(diagnosticCode)}, cause);
 					});
-					await import(${JSON.stringify(BOOTSTRAP_PATH)});
+					const { runWorkerBootstrap } = await import(
+						${JSON.stringify(BOOTSTRAP_PATH)}
+					);
+					await runWorkerBootstrap(process.argv);
 					`,
 					"--",
 					"--state-root",
@@ -2708,13 +2711,10 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 			"expected exit 1 for generation guard refusal",
 		);
 
-		// No events.jsonl exists (diagnostics sink was never constructed)
 		const events = await readEvents(runId);
-		strictEqual(
-			events.length,
-			0,
-			"no events recorded because diagnostics sink never existed",
-		);
+		strictEqual(events.length, 1);
+		strictEqual(events[0].event, "worker_boot_failed");
+		strictEqual(events[0].errorKind, "launch_failed");
 
 		// boot-stderr.log exists and contains the failure reason
 		ok(existsSync(bootLogPath), "boot-stderr.log must exist");
@@ -2757,7 +2757,10 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 				process.nextTick(() => {
 					throw new Error("Simulated uncaught boot explosion for Task 1.1");
 				});
-				await import(${JSON.stringify(BOOTSTRAP_PATH)});
+				const { runWorkerBootstrap } = await import(
+					${JSON.stringify(BOOTSTRAP_PATH)}
+				);
+				await runWorkerBootstrap(process.argv);
 				`,
 				"--",
 				"--state-root",
