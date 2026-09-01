@@ -6671,16 +6671,32 @@ export function runQueue(options) {
 		}
 		if (runStore) {
 			const anyFailed = results.some((r) => !r.success);
-			runStore
-				.updateRun({
-					state: anyFailed ? "failed" : "succeeded",
-					activeTaskId: null,
-					quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
-					retryState: checkpoint.retryState,
-					retryTransitionId: checkpoint.retryTransitionId,
-					cleanupState: "complete",
-				})
-				.catch(() => {});
+			const lastFailed = results.findLast((r) => !r.success);
+			const lastFailure = lastFailed
+				? failureMetadataFor(lastFailed, lastFailed.partialDiffPath)
+				: null;
+			const terminalProjection = {
+				state: anyFailed ? "failed" : "succeeded",
+				activeTaskId: null,
+				quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+				retryState: checkpoint.retryState,
+				retryTransitionId: checkpoint.retryTransitionId,
+				cleanupState: "complete",
+				terminalizedBy: "worker",
+				...(lastFailure ? { lastFailure } : {}),
+			};
+			let writePromise;
+			try {
+				writePromise = Promise.resolve(
+					runStore.updateRun(terminalProjection),
+				).catch((error) => {
+					reportOutcomeProjectionFailure(ledgerReporting, error);
+				});
+			} catch (error) {
+				reportOutcomeProjectionFailure(ledgerReporting, error);
+				writePromise = Promise.resolve();
+			}
+			storeWriteChain = storeWriteChain.then(() => writePromise);
 		}
 
 		// Guarantee a checkpoint file exists at the path this return value
@@ -7145,13 +7161,29 @@ export async function runQueueWithOrchestrator(options) {
 		}
 		if (runStore) {
 			const anyFailed = results.some((r) => !r.success);
-			runStore
-				.updateRun({
-					state: anyFailed ? "failed" : "succeeded",
-					activeTaskId: null,
-					cleanupState: "complete",
-				})
-				.catch(() => {});
+			const lastFailed = results.findLast((r) => !r.success);
+			const lastFailure = lastFailed
+				? failureMetadataFor(lastFailed, lastFailed.partialDiffPath)
+				: null;
+			const terminalProjection = {
+				state: anyFailed ? "failed" : "succeeded",
+				activeTaskId: null,
+				cleanupState: "complete",
+				terminalizedBy: "worker",
+				...(lastFailure ? { lastFailure } : {}),
+			};
+			try {
+				await runStore.updateRun(terminalProjection);
+			} catch (error) {
+				reportOutcomeProjectionFailure(
+					ledgerReportingContext(
+						emitStatus,
+						dependencies,
+						"runQueueWithOrchestrator",
+					),
+					error,
+				);
+			}
 		}
 
 		// Guarantee a checkpoint file exists at the path this return value
