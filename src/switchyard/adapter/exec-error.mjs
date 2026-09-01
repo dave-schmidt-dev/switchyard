@@ -127,6 +127,7 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"orchestrator_timeout",
 	"executor_not_switchyard",
 	"unknown_failure",
+	"unclassified",
 ]);
 
 const CLEANUP_STAGE_DIAGNOSTIC_CODES = Object.freeze({
@@ -414,6 +415,10 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reasonCode: "unknown_failure",
 		reason: "The task failed for an unclassified reason.",
 	}),
+	unclassified: Object.freeze({
+		reasonCode: "unclassified",
+		reason: "The task failed for an unclassified reason.",
+	}),
 });
 
 const SUCCESS_RESULTS = new Set(["success", "success_no_diff"]);
@@ -449,6 +454,7 @@ const RESULT_TO_ERROR_KIND = Object.freeze({
 	executor_not_switchyard: "executor_not_switchyard",
 	halted_after_commit_failure: "unknown_failure",
 	halted_after_reset_failure: "unknown_failure",
+	unclassified: "unclassified",
 });
 
 /**

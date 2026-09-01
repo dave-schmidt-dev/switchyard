@@ -486,4 +486,20 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 			}),
 		);
 	});
+
+	it("retains the unclassified error kind and validates its failure metadata", () => {
+		ok(PERSISTED_ERROR_KINDS.includes("unclassified"));
+		const metadata = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "execution_failed",
+			errorKind: "unclassified",
+		});
+
+		deepStrictEqual(metadata, {
+			errorKind: "unclassified",
+			reasonCode: "unclassified",
+			reason: "The task failed for an unclassified reason.",
+		});
+		ok(isPersistentFailureMetadata(metadata));
+	});
 });

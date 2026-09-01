@@ -23,7 +23,10 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
-import { INTEGRATION_REFUSAL_KINDS } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	INTEGRATION_REFUSAL_KINDS,
+	isPersistentFailureMetadata,
+} from "../src/switchyard/adapter/exec-error.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import {
 	acquireLaunchLock,
@@ -2808,5 +2811,122 @@ describe("shared run finalization", () => {
 		const historical = makeOptions();
 		await initializeRun(historical);
 		strictEqual((await readRun(historical.runId)).terminalizedBy, undefined);
+	});
+});
+
+describe("terminal failure metadata invariants (Task 1.1)", () => {
+	it("substitutes unclassified lastFailure when state is updated to failed without metadata", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const updated = await updateRun(
+			opts.runId,
+			{ state: "failed" },
+			snapshot.revision,
+		);
+
+		strictEqual(updated.state, "failed");
+		ok(updated.lastFailure !== null, "lastFailure must be non-null");
+		strictEqual(updated.lastFailure.errorKind, "unclassified");
+		strictEqual(updated.lastFailure.reasonCode, "unclassified");
+		ok(isPersistentFailureMetadata(updated.lastFailure));
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "failed");
+		strictEqual(onDisk.lastFailure?.errorKind, "unclassified");
+		ok(isPersistentFailureMetadata(onDisk.lastFailure));
+	});
+
+	it("substitutes unclassified lastFailure when advanceState sets state to failed", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const updated = await advanceState(opts.runId, "failed");
+
+		strictEqual(updated.state, "failed");
+		ok(updated.lastFailure !== null, "lastFailure must be non-null");
+		strictEqual(updated.lastFailure.errorKind, "unclassified");
+		ok(isPersistentFailureMetadata(updated.lastFailure));
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "failed");
+		strictEqual(onDisk.lastFailure?.errorKind, "unclassified");
+	});
+
+	it("substitutes unclassified lastFailure when updateRunWithRetry sets state to failed", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const updated = await updateRunWithRetry(opts.runId, { state: "failed" });
+
+		strictEqual(updated.state, "failed");
+		ok(updated.lastFailure !== null, "lastFailure must be non-null");
+		strictEqual(updated.lastFailure.errorKind, "unclassified");
+		ok(isPersistentFailureMetadata(updated.lastFailure));
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "failed");
+		strictEqual(onDisk.lastFailure?.errorKind, "unclassified");
+	});
+
+	it("preserves an existing known failure cause when state is updated to failed without metadata", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await createEvent(opts.runId, {
+			phase: "dispatch",
+			event: "task_failed",
+			status: "Task failed",
+			errorKind: "launch_failed",
+			reasonCode: "launch_failed",
+			reason: "The headless provider job could not be launched.",
+		});
+
+		const current = await readRun(opts.runId);
+		strictEqual(current.lastFailure?.errorKind, "launch_failed");
+
+		const updated = await updateRun(
+			opts.runId,
+			{ state: "failed" },
+			current.revision,
+		);
+		strictEqual(updated.state, "failed");
+		strictEqual(updated.lastFailure.errorKind, "launch_failed");
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "failed");
+		strictEqual(onDisk.lastFailure?.errorKind, "launch_failed");
+	});
+
+	it("preserves explicitly supplied known failure metadata on failed state patch", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const safeFailure = {
+			errorKind: "auth_expired",
+			reasonCode: "auth_expired",
+			reason:
+				"Provider authentication expired; interactive re-authentication is required.",
+		};
+
+		const updated = await updateRun(
+			opts.runId,
+			{ state: "failed", lastFailure: safeFailure },
+			snapshot.revision,
+		);
+		strictEqual(updated.state, "failed");
+		strictEqual(updated.lastFailure.errorKind, "auth_expired");
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "failed");
+		strictEqual(onDisk.lastFailure?.errorKind, "auth_expired");
+	});
+
+	it("leaves success paths untouched with no lastFailure substituted", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const updated = await advanceState(opts.runId, "succeeded");
+
+		strictEqual(updated.state, "succeeded");
+		strictEqual(updated.lastFailure, null);
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "succeeded");
+		strictEqual(onDisk.lastFailure, null);
 	});
 });

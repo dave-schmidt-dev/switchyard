@@ -1237,6 +1237,13 @@ async function performUpdate(runId, partial, expectedRevision) {
 		revision: current.revision + 1,
 	};
 
+	if (merged.state === "failed" && !merged.lastFailure) {
+		merged.lastFailure = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "unclassified",
+		});
+	}
+
 	validateRun(merged);
 
 	const runJsonPath = resolve(getRunRoot(runId), "run.json");
