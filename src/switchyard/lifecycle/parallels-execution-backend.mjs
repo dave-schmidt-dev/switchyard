@@ -235,7 +235,7 @@ const OPENCODE_BWS_CONSUMERS = Object.freeze({
 // lifecycle API blocks the caller's event loop while prlctl is running. The
 // helper owns only an HTTP listener and an async prlctl child; all payloads
 // remain in process memory and are framed back to the parent over stdout.
-const BULK_TRANSFER_HELPER = String.raw`
+export const BULK_TRANSFER_HELPER = String.raw`
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -263,6 +263,32 @@ function run(args, stdin = null) {
     });
     child.stdin.end(stdin);
   });
+}
+
+// This process makes its own prlctl calls, so it needs its own copy of the
+// misfire tolerance the synchronous backend applies at its _call chokepoint.
+// Without it the bulk transfer was the one production path where a lost
+// host-side SDK job result killed a dispatch outright. The signature is
+// injected rather than restated here so the retry and the parent's
+// classification of the same text cannot drift apart.
+const misfire = new RegExp(config.misfireSource, "i");
+let attemptsMade = 0;
+
+// Safe to repeat: a misfire means prlctl could not read the RESULT of the
+// command, and every call here is idempotent -- loading a pf anchor, or a guest
+// fetch-and-extract (push) / tar-and-upload (pull) that lands on the same path
+// with the same bytes. Repeating one costs a transfer, not a side effect.
+async function runIdempotent(args, stdin = null) {
+  for (let attempt = 1; ; attempt += 1) {
+    attemptsMade = Math.max(attemptsMade, attempt);
+    try {
+      return await run(args, stdin);
+    } catch (error) {
+      const text = String((error && error.message) || "");
+      if (attempt >= config.retryAttempts || !misfire.test(text)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, config.retryBackoffMs * attempt));
+    }
+  }
 }
 
 const server = createServer((request, response) => {
@@ -302,9 +328,9 @@ try {
   const url = "http://" + config.transferHost + ":" + address.port + "/" + token;
   const rule = "pass out quick on en0 proto tcp from any to " + config.transferHost + " port " + address.port + "\n";
   try {
-    await run(config.pfArgs, Buffer.from(rule, "utf8"));
+    await runIdempotent(config.pfArgs, Buffer.from(rule, "utf8"));
     const guestArgs = config.guestArgs.map((value) => value.replaceAll("TRANSFER_URL", url));
-    await run(guestArgs);
+    await runIdempotent(guestArgs);
     if (config.direction === "pull" && !received) throw new Error("guest did not upload a tar");
   } finally {
     try { await run(config.cleanupArgs); } catch { /* cleanup is best effort */ }
@@ -316,7 +342,7 @@ try {
   if (config.direction === "pull") process.stdout.write(body);
 } catch (error) {
   try { server.close(); } catch { /* already closed */ }
-  process.stderr.write("bulk transfer failed: " + String(error?.message ?? "unknown") + "\n");
+  process.stderr.write("bulk transfer failed after " + attemptsMade + " attempt(s): " + String(error?.message ?? "unknown") + "\n");
   process.exitCode = 1;
 }
 `;
@@ -372,6 +398,38 @@ function classifyPrlctlFailure(error) {
 		return "prlctl_call_timed_out";
 	}
 	return "prlctl_call_failed";
+}
+
+/**
+ * Classify a failed bulk-transfer helper run.
+ *
+ * The helper is a separate process, so its prlctl failures never reach `_call`
+ * and were the one production path that surfaced a bare Error: a misfire there
+ * reached the run record as `worker_boot_exception`, naming the stage and not
+ * the cause. Both numbers in its stderr line are formats this module defines
+ * itself -- "prlctl failed (255):" from the helper's own `run`, and the attempt
+ * count added alongside it -- so reading them back is a private protocol, not
+ * prose matching. The helper process's own exit status is deliberately ignored:
+ * it is 1 for every failure and is not prlctl's.
+ * @param {string} detail Trimmed helper stderr.
+ * @returns {PrlctlCallError}
+ */
+export function describeBulkTransferFailure(detail) {
+	const text = typeof detail === "string" ? detail : "";
+	const attemptMatch = /failed after (\d{1,3}) attempt/.exec(text);
+	const exitMatch = /prlctl failed \((\d{1,3})\)/.exec(text);
+	const exitCode = exitMatch ? Number(exitMatch[1]) : null;
+	return new PrlctlCallError({
+		diagnosticCode: classifyPrlctlFailure({ message: text }),
+		subcommand: "exec",
+		attempts: attemptMatch ? Number(attemptMatch[1]) : 1,
+		exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
+		cause: new Error(
+			text
+				? `Parallels bulk transfer failed: ${text}`
+				: "Parallels bulk transfer failed",
+		),
+	});
 }
 
 /**
@@ -1195,6 +1253,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			transferHost: this.transferHost,
 			listenHost: this.transferListenHost,
 			maxBytes: this.maxTransferBytes,
+			misfireSource: PRLCTL_JOB_MISFIRE.source,
+			retryAttempts: this.prlctlRetryAttempts,
+			retryBackoffMs: this.prlctlRetryBackoffMs,
 			guestArgs,
 			pfArgs: ["exec", workspaceId, "/sbin/pfctl", "-a", anchor, "-f", "-"],
 			cleanupArgs: [
@@ -1232,12 +1293,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			},
 		);
 		if (result.error || result.status !== 0) {
-			const detail = outputText(result.stderr).trim();
-			throw new Error(
-				detail
-					? `Parallels bulk transfer failed: ${detail}`
-					: "Parallels bulk transfer failed",
-			);
+			throw describeBulkTransferFailure(outputText(result.stderr).trim());
 		}
 		const output = Buffer.from(result.stdout ?? Buffer.alloc(0));
 		const separator = output.indexOf(10);

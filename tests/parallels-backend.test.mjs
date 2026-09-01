@@ -27,7 +27,9 @@ import {
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { seedProjectWithBackend } from "../src/switchyard/lifecycle/index.mjs";
 import {
+	BULK_TRANSFER_HELPER,
 	buildParallelsWorkingName,
+	describeBulkTransferFailure,
 	MAX_AQUA_EXEC_ARGV_BYTES,
 	PARALLELS_WORKING_PREFIX,
 	ParallelsExecutionBackend,
@@ -2263,5 +2265,178 @@ describe("prlctl failures stay diagnosable downstream", () => {
 		const escaped = thrownByCall(childFailure({ stdout: "guest-only text\n" }));
 		deepStrictEqual(Object.keys(escaped), ["name"]);
 		strictEqual(JSON.stringify(escaped), '{"name":"PrlctlCallError"}');
+	});
+});
+
+describe("bulk-transfer helper misfire tolerance", () => {
+	// The helper runs prlctl in its OWN process, so none of it reaches `_call`
+	// and none of the backend's retry applies by inheritance. That is how a
+	// misfire here reached a run record as a bare `worker_boot_exception`,
+	// naming the stage and not the cause. `bulkTransferFn` is the seam every
+	// other test injects at, so this is the only coverage of the real spawn.
+
+	const MISFIRE_LINE =
+		"PrlJob_GetRetCode: Invalid argument. An invalid argument was passed.";
+
+	/**
+	 * A `prlctl` that fails its first `STUB_FAIL_UNTIL` invocations with the
+	 * misfire signature and succeeds after. The count is a file so it survives
+	 * across the separate processes the helper spawns; the bound comes from the
+	 * environment the helper passes down.
+	 * @param {string} root
+	 * @returns {{binDir: string, counterPath: string, invocations: () => number}}
+	 */
+	function stubPrlctl(root) {
+		const binDir = join(root, "bin");
+		const counterPath = join(root, "invocations");
+		mkdirSync(binDir, { recursive: true });
+		writeFileSync(counterPath, "0");
+		writeFileSync(
+			join(binDir, "prlctl"),
+			[
+				"#!/bin/sh",
+				'n=$(cat "$STUB_COUNTER")',
+				"n=$((n+1))",
+				'printf %s "$n" > "$STUB_COUNTER"',
+				'if [ "$n" -le "$STUB_FAIL_UNTIL" ]; then',
+				`  echo "${MISFIRE_LINE}" >&2`,
+				"  exit 255",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		return {
+			binDir,
+			counterPath,
+			invocations: () => Number(readFileSync(counterPath, "utf8")),
+		};
+	}
+
+	/**
+	 * Drive the real helper the way `_runBulkTransfer` does.
+	 * @param {{failUntil: number, retryAttempts: number}} input
+	 */
+	function runHelper({ failUntil, retryAttempts }) {
+		const root = mkdtempSync(join(tmpdir(), "switchyard-bulk-helper-"));
+		try {
+			const stub = stubPrlctl(root);
+			const payload = Buffer.from("payload-bytes");
+			const config = {
+				direction: "push",
+				transferHost: "127.0.0.1",
+				listenHost: "127.0.0.1",
+				maxBytes: 1024 * 1024,
+				misfireSource: "PrlJob_(?:GetRetCode|GetResult):\\s*Invalid argument",
+				retryAttempts,
+				retryBackoffMs: 1,
+				guestArgs: ["exec", "vm-1", "/usr/bin/curl", "TRANSFER_URL"],
+				pfArgs: ["exec", "vm-1", "/sbin/pfctl", "-a", "anchor", "-f", "-"],
+				cleanupArgs: [
+					"exec",
+					"vm-1",
+					"/sbin/pfctl",
+					"-a",
+					"anchor",
+					"-F",
+					"all",
+				],
+			};
+			const result = spawnSync(
+				process.execPath,
+				["--input-type=module", "-e", BULK_TRANSFER_HELPER],
+				{
+					input: Buffer.concat([
+						Buffer.from(`${JSON.stringify(config)}\n`, "utf8"),
+						payload,
+					]),
+					encoding: null,
+					env: {
+						...process.env,
+						PATH: `${stub.binDir}:${process.env.PATH}`,
+						STUB_COUNTER: stub.counterPath,
+						STUB_FAIL_UNTIL: String(failUntil),
+					},
+				},
+			);
+			return {
+				status: result.status,
+				stdout: (result.stdout ?? Buffer.alloc(0)).toString("utf8"),
+				stderr: (result.stderr ?? Buffer.alloc(0)).toString("utf8"),
+				invocations: stub.invocations(),
+				payloadBytes: payload.length,
+			};
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	it("absorbs a misfire and completes the transfer", () => {
+		// Two misfires, then the pf load lands on the third try; the guest call
+		// and the anchor flush then succeed. Five invocations for three commands
+		// is the retry doing its job.
+		const run = runHelper({ failUntil: 2, retryAttempts: 4 });
+
+		strictEqual(run.status, 0, run.stderr);
+		strictEqual(run.invocations, 5);
+		const receipt = JSON.parse(run.stdout.split("\n")[0]);
+		strictEqual(receipt.bytes, run.payloadBytes);
+	});
+
+	it("stops at the configured attempt bound and reports what it tried", () => {
+		// A misfire that never clears is a real failure, and the run record has
+		// to be able to say so rather than retry forever.
+		const run = runHelper({ failUntil: 99, retryAttempts: 3 });
+
+		strictEqual(run.status, 1);
+		ok(
+			/bulk transfer failed after 3 attempt\(s\)/.test(run.stderr),
+			`attempt count was not reported: ${run.stderr}`,
+		);
+		ok(/PrlJob_GetRetCode/.test(run.stderr), run.stderr);
+		// Three pf attempts plus the best-effort cleanup, which is not retried.
+		strictEqual(run.invocations, 4);
+	});
+
+	it("does not retry a failure that is not a misfire", () => {
+		const run = runHelper({ failUntil: 0, retryAttempts: 4 });
+		strictEqual(run.status, 0, run.stderr);
+		strictEqual(run.invocations, 3);
+	});
+});
+
+describe("bulk-transfer failures reach the run record classified", () => {
+	it("reads the misfire, the attempt count and prlctl's own exit code", () => {
+		const error = describeBulkTransferFailure(
+			"bulk transfer failed after 4 attempt(s): prlctl failed (255): " +
+				"PrlJob_GetRetCode: Invalid argument. An invalid argument was passed.",
+		);
+
+		deepStrictEqual(prlctlFailureMetadata(error), {
+			diagnosticCode: "prlctl_job_misfire",
+			exitCode: 255,
+		});
+		strictEqual(error.attempts, 4);
+	});
+
+	it("classifies an ordinary transfer failure without inventing metadata", () => {
+		// The helper's process exit status is 1 for every failure and is not
+		// prlctl's, so nothing may be recorded as an exit code here.
+		const error = describeBulkTransferFailure(
+			"bulk transfer failed after 1 attempt(s): guest did not upload a tar",
+		);
+
+		deepStrictEqual(prlctlFailureMetadata(error), {
+			diagnosticCode: "prlctl_call_failed",
+		});
+		ok(/guest did not upload a tar/.test(error.message), error.message);
+	});
+
+	it("still produces a closed code when the helper said nothing", () => {
+		const error = describeBulkTransferFailure("");
+		strictEqual(error.diagnosticCode, "prlctl_call_failed");
+		strictEqual(error.attempts, 1);
+		ok(/Parallels bulk transfer failed/.test(error.message), error.message);
 	});
 });
