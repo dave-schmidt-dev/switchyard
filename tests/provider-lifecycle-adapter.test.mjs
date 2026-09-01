@@ -461,4 +461,25 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.timedOut, true);
 		strictEqual(adapterCleanups, 1);
 	});
+
+	it("writes an EOF when input is an empty string", async () => {
+		const stdinEndArgs = [];
+		const child = fakeChild();
+		child.stdin = {
+			end(...args) {
+				stdinEndArgs.push(args);
+			},
+		};
+		const spawnFn = () => {
+			queueMicrotask(() => child.emit("close", 0, null));
+			return child;
+		};
+		const result = await executeProviderInvocation("fake", [], {
+			spawnFn,
+			input: "",
+		});
+		strictEqual(result.success, true);
+		strictEqual(stdinEndArgs.length, 1);
+		deepStrictEqual(stdinEndArgs[0], [""]);
+	});
 });

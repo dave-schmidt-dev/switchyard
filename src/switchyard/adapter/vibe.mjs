@@ -60,22 +60,25 @@ function buildExecution(workspaceId, prompt, options) {
 		expectedModel: VIBE_ACTIVE_MODEL,
 	});
 	validateModelArg(VIBE_ACTIVE_MODEL, "model");
-	return getWorkspaceExecution(workspaceId, {
-		...options,
-		argv: [
-			VIBE_CMD,
-			...invocationArgs,
-			"-p",
-			prompt,
-			"--auto-approve",
-			"--output",
-			"streaming",
-			"--trust",
-			"--max-turns",
-			VIBE_MAX_TURNS,
-		],
-		env: [`VIBE_ACTIVE_MODEL=${VIBE_ACTIVE_MODEL}`],
-	});
+	return {
+		...getWorkspaceExecution(workspaceId, {
+			...options,
+			argv: [
+				VIBE_CMD,
+				...invocationArgs,
+				"-p",
+				prompt,
+				"--auto-approve",
+				"--output",
+				"streaming",
+				"--trust",
+				"--max-turns",
+				VIBE_MAX_TURNS,
+			],
+			env: [`VIBE_ACTIVE_MODEL=${VIBE_ACTIVE_MODEL}`],
+		}),
+		input: "",
+	};
 }
 
 export function execute(prompt, workingContainerName, options = {}) {

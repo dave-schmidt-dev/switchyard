@@ -1,4 +1,5 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 
 import {
@@ -152,5 +153,49 @@ describe("Vibe adapter", () => {
 
 	it("rejects unsafe workspace identifiers before diff capture", async () => {
 		strictEqual(await captureDiffAsync("unsafe;workspace", {}), null);
+	});
+
+	it("supplies an empty stdin payload so the process does not stall on stdin", async () => {
+		const stdinEndCalls = [];
+		let resolved = false;
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.stdin = {
+			end(...args) {
+				strictEqual(
+					resolved,
+					false,
+					"stdin.end must be called before the run resolves",
+				);
+				stdinEndCalls.push(args);
+			},
+		};
+		child.signals = [];
+		child.kill = (signal) => {
+			child.signals.push(signal);
+			if (signal === "SIGKILL")
+				queueMicrotask(() => child.emit("close", null, signal));
+			return true;
+		};
+
+		const executionBackend = {
+			execArgv() {
+				return { command: "fake", args: [] };
+			},
+		};
+
+		const result = await executeAsync("change one file", WORKSPACE, {
+			...options(executionBackend),
+			spawnFn: () => {
+				queueMicrotask(() => child.emit("close", 0, null));
+				return child;
+			},
+		});
+		resolved = true;
+
+		strictEqual(result.success, true);
+		strictEqual(stdinEndCalls.length, 1);
+		deepStrictEqual(stdinEndCalls[0], [""]);
 	});
 });
