@@ -28,8 +28,14 @@ export function seedProjectWithBackend(
 		maxBuffer: 256 * 1024 * 1024,
 	});
 	const receipt = executionBackend.pushTar(workspaceId, tar, "/project");
+	// Repeat-safe on purpose: execGuest retries a prlctl job misfire, so this
+	// script can run a second time against a guest that already ran it to
+	// completion. `git init` and `git add` are no-ops on the second pass, but an
+	// unguarded `commit --allow-empty` would stack a redundant baseline commit,
+	// so the commit is gated on HEAD not already existing. `--allow-empty` stays
+	// because an empty project still needs a baseline for HEAD to resolve.
 	const script =
-		"git init -q && git add -A -f && git -c user.name=switchyard -c user.email=switchyard@localhost commit --allow-empty -qm baseline";
+		"git init -q && git add -A -f && { git rev-parse --verify -q HEAD >/dev/null || git -c user.name=switchyard -c user.email=switchyard@localhost commit --allow-empty -qm baseline; }";
 	if (typeof executionBackend.execGuest === "function") {
 		executionBackend.execGuest(workspaceId, "/bin/bash", ["-lc", script], {
 			cwd: "/project",

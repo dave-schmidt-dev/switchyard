@@ -5508,6 +5508,10 @@ function brokerFailureKind(result) {
 		: null;
 }
 
+// `script` must be repeat-safe: execGuest retries a prlctl job misfire, so a
+// script can run twice. Both callers are written that way -- the commit guards
+// on `git diff --cached --quiet ||` and reset is `--hard` -- and a new one must
+// hold that line or pass `prlctlOptions: { retry: false }`.
 function runBackendGitCommand(executionBackend, workspaceId, script) {
 	if (typeof executionBackend.execGuest === "function") {
 		executionBackend.execGuest(workspaceId, "/bin/bash", ["-lc", script], {

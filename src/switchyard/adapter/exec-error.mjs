@@ -190,6 +190,23 @@ const PRLCTL_DIAGNOSTIC_CODES = Object.freeze(
 );
 
 /**
+ * Read one of a child process's text fields as a string.
+ *
+ * `execFileSync` hands `stdout`/`stderr` back as Buffers whenever the caller
+ * does not ask for utf8, and callers here do exactly that: the bulk-transfer
+ * helper is spawned with `encoding: null`, and an injected `prlctlFn` is free
+ * to choose. A bare `typeof x === "string"` check drops the text in precisely
+ * that case, which is how a real diagnostic becomes an empty one.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function childProcessText(value) {
+	if (typeof value === "string") return value.trim();
+	if (Buffer.isBuffer(value)) return value.toString("utf8").trim();
+	return "";
+}
+
+/**
  * A failed `prlctl` invocation, classified and carrying persistable metadata.
  *
  * Before this existed, every one of the backend's `_call` sites surfaced a bare
@@ -212,8 +229,8 @@ export class PrlctlCallError extends Error {
 	 * @returns {string}
 	 */
 	static #detailOf(cause) {
-		const stderr = typeof cause?.stderr === "string" ? cause.stderr.trim() : "";
-		const stdout = typeof cause?.stdout === "string" ? cause.stdout.trim() : "";
+		const stderr = childProcessText(cause?.stderr);
+		const stdout = childProcessText(cause?.stdout);
 		const text = stderr || stdout || String(cause?.message ?? "").trim();
 		if (!text) return "";
 		return text.length <= PrlctlCallError.#MAX_DETAIL_CHARS
@@ -821,8 +838,15 @@ function isModelUnavailable(text, provider) {
  * @returns {{output: string, error: string, errorKind: ("auth_expired"|"quota_exhausted"|"model_unavailable"|null)}}
  */
 export function describeExecError(error, { provider } = {}) {
-	const stdout = typeof error?.stdout === "string" ? error.stdout : "";
-	const stderr = typeof error?.stderr === "string" ? error.stderr : "";
+	// Decoded rather than type-checked: a Buffer here would empty `combined`,
+	// and every classification below is gated on `combined.length > 0`. The
+	// failure mode is quiet and expensive -- the reason string still reads
+	// correctly, because #detailOf already lifted the text into the message, but
+	// `errorKind` comes back null and auth/index.mjs keys its headless re-login
+	// on `errorKind`. An expired session would present as an unclassified error
+	// and never trigger the re-auth that would have fixed it.
+	const stdout = childProcessText(error?.stdout);
+	const stderr = childProcessText(error?.stderr);
 	const combined = `${stdout}\n${stderr}`.trim();
 	const haystack = combined.toLowerCase();
 	const authExpired =

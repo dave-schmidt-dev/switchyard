@@ -414,19 +414,31 @@ function classifyPrlctlFailure(error) {
  * @param {string} detail Trimmed helper stderr.
  * @returns {PrlctlCallError}
  */
-export function describeBulkTransferFailure(detail) {
+export function describeBulkTransferFailure(detail, spawnError = null) {
 	const text = typeof detail === "string" ? detail : "";
 	const attemptMatch = /failed after (\d{1,3}) attempt/.exec(text);
 	const exitMatch = /prlctl failed \((\d{1,3})\)/.exec(text);
 	const exitCode = exitMatch ? Number(exitMatch[1]) : null;
+	// A spawn-level failure -- the helper killed on a timeout, or its output
+	// overrunning `maxBuffer` on a large tar -- never reaches the helper's own
+	// stderr, so `spawnError` carries the only cause there is. Forwarding its
+	// code and killed flag is what makes `prlctl_call_timed_out` reachable on
+	// this path at all: classifying a synthetic `{ message }` alone can only ever
+	// return the generic code, which puts the transfer back to failing with
+	// nothing recorded -- the exact defect this function was added to remove.
+	const reason = text || String(spawnError?.code ?? spawnError?.message ?? "");
 	return new PrlctlCallError({
-		diagnosticCode: classifyPrlctlFailure({ message: text }),
+		diagnosticCode: classifyPrlctlFailure({
+			message: reason,
+			code: spawnError?.code,
+			killed: spawnError?.killed,
+		}),
 		subcommand: "exec",
 		attempts: attemptMatch ? Number(attemptMatch[1]) : 1,
 		exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
 		cause: new Error(
-			text
-				? `Parallels bulk transfer failed: ${text}`
+			reason
+				? `Parallels bulk transfer failed: ${reason}`
 				: "Parallels bulk transfer failed",
 		),
 	});
@@ -1209,18 +1221,20 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
 			throw new TypeError("guest command arguments must be strings");
 		}
-		// Retry is OFF by default here and must stay that way. `execGuest` runs
-		// caller-supplied guest commands, and its callers include every provider
-		// adapter's actual execution call (codex, agy, copilot, opencode, vibe).
-		// A job misfire means prlctl could not read the RESULT of a command the
-		// guest may well have completed, so retrying one of those would re-run a
-		// paid provider task and repeat its side effects. The misfire is cheap
-		// to absorb only where the payload is idempotent, which is the backend's
-		// own provisioning and inspection calls, not this path. A caller that
-		// knows its command is safe to repeat may pass `retry: true`.
+		// Misfires are retried here. This is the small-control-command route, and
+		// every caller is an inspection, provisioning or cleanup command that is
+		// safe to repeat: read a marker, set a mode, `rm -f`, confirm a process
+		// tree is already gone, ask a CLI its version, check a credential's size.
+		// Paid provider work does not arrive here. Adapters execute through the
+		// `execArgv` descriptor, which the caller spawns itself and which never
+		// reaches this retry at all. That separation is a contract rather than a
+		// physical barrier -- auth/liveness.mjs does invoke a provider CLI through
+		// this path, and opts in knowingly at its own call site -- so a caller
+		// whose command is NOT safe to repeat must say so with
+		// `prlctlOptions: { retry: false }` and record why.
 		return this._call(
 			this._buildAquaExecArgs(workspaceId, [command, ...args], options),
-			{ retry: false, ...(options.prlctlOptions ?? {}) },
+			{ retry: true, ...(options.prlctlOptions ?? {}) },
 		);
 	}
 
@@ -1293,7 +1307,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			},
 		);
 		if (result.error || result.status !== 0) {
-			throw describeBulkTransferFailure(outputText(result.stderr).trim());
+			throw describeBulkTransferFailure(
+				outputText(result.stderr).trim(),
+				result.error ?? null,
+			);
 		}
 		const output = Buffer.from(result.stdout ?? Buffer.alloc(0));
 		const separator = output.indexOf(10);
@@ -1850,7 +1867,12 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		let probe = null;
 		let createdSnapshots = [];
 		try {
-			this._call(["clone", goldenImage, "--name", probeName, "--linked"]);
+			// Same reason the workspace clone opts out: `probeName` is computed
+			// once above, so a retry after a misfire reuses it and collides with
+			// the clone the first attempt may already have made.
+			this._call(["clone", goldenImage, "--name", probeName, "--linked"], {
+				retry: false,
+			});
 			probe = this.listAll().find((entry) => entry.name === probeName);
 			if (!probe?.ownership)
 				throw new Error("linked-clone probe returned no UUID");

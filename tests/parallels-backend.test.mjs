@@ -128,6 +128,7 @@ describe("Parallels execution backend lifecycle", () => {
 			"clipboardSettleMs",
 			"workspaceVerifyTimeoutMs",
 			"stopSettleTimeoutMs",
+			"prlctlRetryBackoffMs",
 		]) {
 			for (const value of [
 				Number.NaN,
@@ -1074,6 +1075,65 @@ describe("Parallels execution backend lifecycle", () => {
 		ok(calls[1].options.argv[2].includes("commit --allow-empty -qm baseline"));
 	});
 
+	it("makes the baseline-commit script itself repeat-safe, not just its JS caller", () => {
+		// execGuest retries a prlctl job misfire by default, and a misfire means
+		// prlctl lost the RESULT of a command the guest may well have completed --
+		// so this script has to survive running a second time. `git init` and
+		// `git add` are no-ops on that second pass; an unguarded
+		// `commit --allow-empty` is not, and stacks a second baseline.
+		//
+		// The literal script text is executed against a real repository rather
+		// than asserted as a substring, because what is under test is shell
+		// semantics: a guard that binds to the wrong side of the `&&` chain reads
+		// perfectly and still commits twice. Both project shapes are covered --
+		// an empty one is the case `--allow-empty` exists for, and a populated one
+		// is the case that actually stages content.
+		let script = null;
+		seedProjectWithBackend(
+			{
+				pushTar: () => ({ bytes: 1 }),
+				execArgv: (_workspaceId, options) => {
+					script = options.argv[2];
+					return { command: process.execPath, args: ["-e", ""] };
+				},
+			},
+			"vm-uuid",
+			process.cwd(),
+		);
+		ok(script, "the seed script must reach the execution seam");
+
+		for (const populated of [false, true]) {
+			const guestDir = mkdtempSync(join(tmpdir(), "switchyard-seed-repeat-"));
+			try {
+				if (populated) writeFileSync(join(guestDir, "README.txt"), "seeded\n");
+				const log = () =>
+					execFileSync("git", ["-C", guestDir, "log", "--oneline"], {
+						encoding: "utf8",
+					}).trim();
+
+				execFileSync("/bin/bash", ["-lc", script], { cwd: guestDir });
+				const first = log();
+				strictEqual(
+					first.split("\n").length,
+					1,
+					`the first run must create exactly one baseline commit (populated=${populated})`,
+				);
+
+				// The retried run: same script, same guest, HEAD already exists.
+				execFileSync("/bin/bash", ["-lc", script], { cwd: guestDir });
+				// Comparing the whole log, not just its length, also catches a
+				// retry that replaced the baseline rather than appending to it.
+				strictEqual(
+					log(),
+					first,
+					`a retried run must not stack a second baseline commit or move HEAD (populated=${populated})`,
+				);
+			} finally {
+				rmSync(guestDir, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("uses the reserved run-and-pid grammar and rejects malformed ownership", () => {
 		const name = buildParallelsWorkingName("run-with-hyphens", 4321);
 		strictEqual(name, `${PARALLELS_WORKING_PREFIX}run-with-hyphens-4321`);
@@ -1231,6 +1291,45 @@ describe("Parallels execution backend lifecycle", () => {
 			);
 			strictEqual(rollbackCount, 1, `${testCase.stage} failure must roll back`);
 		}
+	});
+
+	it("never retries a misfired clone: the working name is deterministic and a retry would collide with itself", () => {
+		let cloneCalls = 0;
+		let rollbackCount = 0;
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			prlctlFn: (args) => {
+				if (args[0] === "clone") {
+					cloneCalls += 1;
+					throw lostExitCode();
+				}
+				return "";
+			},
+		});
+		backend.rollback = () => {
+			rollbackCount += 1;
+			return true;
+		};
+
+		throws(
+			() =>
+				backend.create("macOS", {
+					runId: "clone-misfire",
+					creatorPid: process.pid,
+					linked: false,
+				}),
+			(error) => {
+				ok(error instanceof PrlctlCallError);
+				strictEqual(error.diagnosticCode, "prlctl_job_misfire");
+				return true;
+			},
+		);
+		strictEqual(
+			cloneCalls,
+			1,
+			"a clone misfire must surface, not retry into a name collision",
+		);
+		strictEqual(rollbackCount, 1);
 	});
 
 	it("accepts a workspace whose guest state is correct despite a lost exit code", () => {
@@ -2029,14 +2128,19 @@ describe("prlctl job-misfire tolerance", () => {
 		strictEqual(calls, 2, "the misfire must cost exactly one extra call");
 	});
 
-	it("stops at the bounded attempt count instead of retrying forever", () => {
+	it("stops at the bounded attempt count instead of retrying forever, pausing on a linear backoff between attempts", () => {
 		let calls = 0;
+		const sleeps = [];
 		const backend = workspaceBackend(
 			() => {
 				calls += 1;
 				throw lostExitCode();
 			},
-			{ prlctlRetryAttempts: 3 },
+			{
+				prlctlRetryAttempts: 3,
+				prlctlRetryBackoffMs: 250,
+				sleepFn: (ms) => sleeps.push(ms),
+			},
 		);
 
 		throws(
@@ -2050,12 +2154,48 @@ describe("prlctl job-misfire tolerance", () => {
 			},
 		);
 		strictEqual(calls, 3, "a persistent misfire must not retry unbounded");
+		// Linear backoff (backoffMs * attempt), and no pause after the attempt
+		// that finally gives up -- that would just be added latency on a path
+		// that is already throwing.
+		deepStrictEqual(sleeps, [250, 500]);
 	});
 
-	it("never retries a provider command run through execGuest", () => {
-		// The whole point of the boundary: a misfire means prlctl could not read
-		// the RESULT of a command the guest may have completed. Re-running a
-		// provider CLI would repeat a paid task and its side effects.
+	it("validates the retry-attempt count the same way it validates every other duration knob", () => {
+		// A distinct validator from validateDurationMs (attempts are a count, not
+		// a duration), so it earns its own boundary check: the floor is 1, not 0,
+		// because "no retry" is a legitimate caller choice (see execGuest's
+		// opt-out) while zero attempts would mean _call never even tries once.
+		for (const value of [0, -1, 1.5, Number.NaN, "3"]) {
+			throws(
+				() => workspaceBackend(() => "", { prlctlRetryAttempts: value }),
+				/prlctlRetryAttempts must be an integer >= 1/,
+			);
+		}
+		ok(workspaceBackend(() => "", { prlctlRetryAttempts: 1 }));
+	});
+
+	it("retries a misfired control command run through execGuest", () => {
+		// execGuest is the small-control-command route: read a marker, set a
+		// mode, `rm -f`, confirm a tree is gone, ask a CLI its version. All of it
+		// is safe to repeat, so a misfire is absorbed here instead of surfacing
+		// as a failed boot or a healthy provider that looks dead.
+		let calls = 0;
+		const backend = workspaceBackend(() => {
+			calls += 1;
+			if (calls < 2) throw lostExitCode();
+			return "ok";
+		});
+
+		strictEqual(
+			String(backend.execGuest(WORK_UUID, "/bin/cat", ["/tmp/pid"])),
+			"ok",
+		);
+		strictEqual(calls, 2, "the misfire must be absorbed, not surfaced");
+	});
+
+	it("honors an explicit retry opt-out at an execGuest call site", () => {
+		// The escape hatch the route's contract promises a caller whose command
+		// is not repeat-safe. It has to beat the route's own default.
 		let calls = 0;
 		const backend = workspaceBackend(() => {
 			calls += 1;
@@ -2063,10 +2203,41 @@ describe("prlctl job-misfire tolerance", () => {
 		});
 
 		throws(
-			() => backend.execGuest(WORK_UUID, "/usr/local/bin/codex", ["exec"]),
+			() =>
+				backend.execGuest(WORK_UUID, "/usr/local/bin/codex", ["exec"], {
+					prlctlOptions: { retry: false },
+				}),
 			(error) => error instanceof PrlctlCallError,
 		);
-		strictEqual(calls, 1, "a provider invocation must be attempted once only");
+		strictEqual(calls, 1, "an opt-out must be attempted once only");
+	});
+
+	it("keeps paid provider execution off the retrying route entirely", () => {
+		// The structural half of the contract. Adapters run a provider through
+		// the execArgv descriptor, which only builds argv -- it never calls
+		// prlctl, so a paid task cannot reach _call's retry at all. That is why
+		// the route above can default to retrying without risking a repeat.
+		let calls = 0;
+		const backend = workspaceBackend(() => {
+			calls += 1;
+			throw lostExitCode();
+		});
+
+		const execution = backend.execArgv(WORK_UUID, {
+			argv: ["/usr/local/bin/codex", "exec"],
+		});
+		strictEqual(execution.command, "prlctl");
+		const payload = /printf %s ([A-Za-z0-9+/=]+)/.exec(
+			execution.args.join(" "),
+		);
+		ok(payload, "the descriptor must carry an encoded guest payload");
+		ok(
+			Buffer.from(payload[1], "base64")
+				.toString()
+				.includes("/usr/local/bin/codex"),
+			"the provider command must be carried, not executed",
+		);
+		strictEqual(calls, 0, "building a descriptor must not invoke prlctl");
 	});
 
 	it("classifies a not-yet-booted guest separately and does not retry it", () => {
@@ -2129,6 +2300,51 @@ describe("prlctl job-misfire tolerance", () => {
 					/Read-only file system/.test(error.message),
 					`diagnosable text was lost: ${error.message}`,
 				);
+				return true;
+			},
+		);
+	});
+
+	it("records a persisted subcommand only from the closed allowlist, never echoing argv", () => {
+		// The literal this file passes to `_call` is safe to persist; a value
+		// `_call` merely happened to be invoked with is not the same guarantee,
+		// so an unrecognized args[0] must come through as null rather than
+		// whatever string was actually there.
+		const backend = workspaceBackend(() => {
+			throw lostExitCode();
+		});
+
+		throws(
+			() => backend._call(["exec", WORK_UUID, "/bin/true"], { retry: false }),
+			(error) => {
+				strictEqual(error.subcommand, "exec");
+				return true;
+			},
+		);
+		throws(
+			() => backend._call(["not-a-real-prlctl-subcommand"], { retry: false }),
+			(error) => {
+				strictEqual(error.subcommand, null);
+				return true;
+			},
+		);
+	});
+
+	it("drops a signal outside the persistable set instead of forwarding it verbatim", () => {
+		// Mirrors adapter/exec-error.mjs's PERSISTED_SIGNALS allowlist. SIGSEGV is
+		// real (README's prlctl process-lifetime note) but is not one of the six
+		// this module will carry into a run record.
+		const segfault = new Error("Command failed: prlctl");
+		segfault.status = null;
+		segfault.signal = "SIGSEGV";
+		const backend = workspaceBackend(() => {
+			throw segfault;
+		});
+
+		throws(
+			() => backend._call(["exec", WORK_UUID, "/bin/true"], { retry: false }),
+			(error) => {
+				strictEqual(error.signal, null);
 				return true;
 			},
 		);
@@ -2256,6 +2472,20 @@ describe("prlctl failures stay diagnosable downstream", () => {
 			childFailure({ stdout: "model 'gemini-3.7' not found\n" }),
 		);
 		ok(/gemini-3\.7/.test(stdoutOnly.message), stdoutOnly.message);
+	});
+
+	it("still reads the child's output when execFileSync hands it back as a Buffer", () => {
+		// execFileSync returns Buffers instead of strings whenever a caller
+		// overrides the backend's utf8 encoding, and an injected prlctlFn is free
+		// to do that. A detail reader that only accepted strings would drop the
+		// text here -- silently, since a wrapped error with no detail still looks
+		// like a normal, successful classification.
+		const bufferOnly = thrownByCall(
+			childFailure({
+				stderr: Buffer.from("chmod: /x: Read-only file system\n"),
+			}),
+		);
+		ok(/Read-only file system/.test(bufferOnly.message), bufferOnly.message);
 	});
 
 	it("does not widen what an accidental serialization would carry", () => {
@@ -2438,5 +2668,47 @@ describe("bulk-transfer failures reach the run record classified", () => {
 		strictEqual(error.diagnosticCode, "prlctl_call_failed");
 		strictEqual(error.attempts, 1);
 		ok(/Parallels bulk transfer failed/.test(error.message), error.message);
+	});
+
+	it("reaches prlctl_call_timed_out from the spawn error when the helper never wrote to stderr", () => {
+		// A spawnSync-level failure -- killed on a timeout, or its output blew
+		// past maxBuffer on a large tar -- never produces the helper's own
+		// stderr line, so `spawnError` is the only cause there is. Without
+		// forwarding it, this can only ever fall through to the generic
+		// prlctl_call_failed code, which is the defect this parameter exists
+		// to remove.
+		const spawnError = new Error("spawnSync helper ETIMEDOUT");
+		spawnError.code = "ETIMEDOUT";
+		spawnError.killed = true;
+
+		const error = describeBulkTransferFailure("", spawnError);
+
+		strictEqual(error.diagnosticCode, "prlctl_call_timed_out");
+		deepStrictEqual(prlctlFailureMetadata(error), {
+			diagnosticCode: "prlctl_call_timed_out",
+		});
+		strictEqual(error.attempts, 1);
+		ok(/ETIMEDOUT/.test(error.message), error.message);
+	});
+
+	it("still reports the kill even when the helper also wrote its own stderr line", () => {
+		// classifyPrlctlFailure checks spawnError.killed/code unconditionally,
+		// after the text-based regexes fail to match -- it is not gated on
+		// whether stderr was empty. So a helper that logged a specific reason
+		// and was then killed still classifies as timed_out, not as the text's
+		// own (weaker) reason; only the message's wording prefers the helper's
+		// own words over the spawn error's.
+		const spawnError = new Error("spawnSync helper ETIMEDOUT");
+		spawnError.code = "ETIMEDOUT";
+		spawnError.killed = true;
+
+		const error = describeBulkTransferFailure(
+			"bulk transfer failed after 2 attempt(s): guest did not upload a tar",
+			spawnError,
+		);
+
+		strictEqual(error.diagnosticCode, "prlctl_call_timed_out");
+		strictEqual(error.attempts, 2);
+		ok(/guest did not upload a tar/.test(error.message), error.message);
 	});
 });

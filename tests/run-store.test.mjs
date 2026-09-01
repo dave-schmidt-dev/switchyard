@@ -26,6 +26,7 @@ import { pathToFileURL } from "node:url";
 import {
 	INTEGRATION_REFUSAL_KINDS,
 	isPersistentFailureMetadata,
+	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import {
@@ -2928,5 +2929,65 @@ describe("terminal failure metadata invariants (Task 1.1)", () => {
 		const onDisk = await readRun(opts.runId);
 		strictEqual(onDisk.state, "succeeded");
 		strictEqual(onDisk.lastFailure, null);
+	});
+});
+
+describe("prlctl failure metadata survives the persistence boundary", () => {
+	// The whole point of classifying a prlctl misfire is that a reader of the
+	// FILE, not just the in-process object, can tell it apart from an ordinary
+	// provisioning failure. A wrapper that built the right object in memory but
+	// lost exitCode/signal on the way through validateRun's allowlist would
+	// still read as "no metadata recorded" to anyone who only reads run.json.
+	it("round-trips a prlctl_job_misfire lastFailure with its exit code through disk", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const misfireFailure = sanitizeFailureMetadata({
+			result: "launch_failed",
+			errorKind: "launch_failed",
+			diagnosticCode: "prlctl_job_misfire",
+			failurePhase: "worker_boot",
+			exitCode: 255,
+		});
+
+		const updated = await updateRun(
+			opts.runId,
+			{ state: "failed", lastFailure: misfireFailure },
+			snapshot.revision,
+		);
+		strictEqual(updated.lastFailure.diagnosticCode, "prlctl_job_misfire");
+		strictEqual(updated.lastFailure.exitCode, 255);
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.state, "failed");
+		strictEqual(onDisk.lastFailure?.diagnosticCode, "prlctl_job_misfire");
+		strictEqual(
+			onDisk.lastFailure?.exitCode,
+			255,
+			"the exit code must still be readable from the file, not just the in-memory return value",
+		);
+		ok(isPersistentFailureMetadata(onDisk.lastFailure));
+	});
+
+	it("round-trips a prlctl_call_timed_out lastFailure with its signal through disk", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const timeoutFailure = sanitizeFailureMetadata({
+			result: "launch_failed",
+			errorKind: "launch_failed",
+			diagnosticCode: "prlctl_call_timed_out",
+			failurePhase: "worker_boot",
+			signal: "SIGTERM",
+		});
+
+		await updateRun(
+			opts.runId,
+			{ state: "failed", lastFailure: timeoutFailure },
+			snapshot.revision,
+		);
+
+		const onDisk = await readRun(opts.runId);
+		strictEqual(onDisk.lastFailure?.diagnosticCode, "prlctl_call_timed_out");
+		strictEqual(onDisk.lastFailure?.signal, "SIGTERM");
+		ok(isPersistentFailureMetadata(onDisk.lastFailure));
 	});
 });

@@ -203,6 +203,13 @@ export function probeLiveness(name, options = {}) {
 						cwd: spec.cwd,
 						env: spec.env,
 						prlctlOptions: {
+							// The one provider invocation that rides the retrying control
+							// route, opted in deliberately. A misfire here would report a
+							// healthy provider as dead and send the caller into a needless
+							// headless re-login; the probe is a one-word prompt with no
+							// workspace side effects, so repeating it costs far less than
+							// that false negative.
+							retry: true,
 							input: spec.stdin ? LIVENESS_PROMPT : undefined,
 							timeout: timeoutMs,
 							maxBuffer: 8 * 1024 * 1024,
