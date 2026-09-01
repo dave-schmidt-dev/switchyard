@@ -18,6 +18,7 @@ import {
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const VIBE_CMD = "vibe";
+export const VIBE_ACTIVE_MODEL = "glm-5-2";
 const VIBE_KEYCHAIN_SERVICE = "ai.mistral.vibe";
 const VIBE_KEYCHAIN_ACCOUNT = "MISTRAL_API_KEY";
 // Twelve turns bounds a standard task's inspect/edit/test loop while leaving
@@ -50,12 +51,15 @@ export function isVibeAuthenticated(workspaceId, executionBackend) {
 
 function buildExecution(workspaceId, prompt, options) {
 	validateIdentifier(workspaceId, "workingContainerName");
+	if (options.model !== VIBE_ACTIVE_MODEL) {
+		throw new Error(`Vibe requires model ${VIBE_ACTIVE_MODEL}`);
+	}
 	const invocationArgs = validateAdapterInvocation(options, {
 		expectedHarness: "vibe",
 		expectedTargetId: options.resolvedTargetId,
-		expectedModel: options.model,
+		expectedModel: VIBE_ACTIVE_MODEL,
 	});
-	validateModelArg(options.model, "model");
+	validateModelArg(VIBE_ACTIVE_MODEL, "model");
 	return getWorkspaceExecution(workspaceId, {
 		...options,
 		argv: [
@@ -70,7 +74,7 @@ function buildExecution(workspaceId, prompt, options) {
 			"--max-turns",
 			VIBE_MAX_TURNS,
 		],
-		env: [`VIBE_ACTIVE_MODEL=${options.model}`],
+		env: [`VIBE_ACTIVE_MODEL=${VIBE_ACTIVE_MODEL}`],
 	});
 }
 

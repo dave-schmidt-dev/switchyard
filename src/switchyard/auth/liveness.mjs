@@ -39,6 +39,7 @@
 // (reproduced 2026-08-13, and the same non-exit already recorded in TASKS.md).
 
 import { describeExecError } from "../adapter/exec-error.mjs";
+import { VIBE_ACTIVE_MODEL } from "../adapter/vibe.mjs";
 
 /** The smallest request that still proves a round trip to the provider. */
 export const LIVENESS_PROMPT = "reply with the single word OK";
@@ -117,7 +118,7 @@ export const LIVENESS_PROBES = Object.freeze({
 			"*",
 		],
 		cwd: "/tmp",
-		env: ["VIBE_ACTIVE_MODEL=glm-5.2"],
+		env: [`VIBE_ACTIVE_MODEL=${VIBE_ACTIVE_MODEL}`],
 	}),
 });
 

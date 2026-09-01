@@ -1,5 +1,6 @@
 import { deepStrictEqual, match, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
+import { VIBE_ACTIVE_MODEL } from "../src/switchyard/adapter/vibe.mjs";
 import {
 	LIVENESS_PROBES,
 	LIVENESS_PROMPT,
@@ -151,6 +152,12 @@ describe("probeLiveness", () => {
 		const spec = specFor("agy");
 		strictEqual(spec.cwd, "/tmp");
 		strictEqual(spec.args.includes("--print"), true);
+	});
+
+	it("probes Vibe with the adapter's fixed active-model alias", () => {
+		const spec = specFor("vibe");
+		strictEqual(VIBE_ACTIVE_MODEL, "glm-5-2");
+		deepStrictEqual(spec.env, ["VIBE_ACTIVE_MODEL=glm-5-2"]);
 	});
 
 	it("probes the no-variant MiMo lane used for low-capability dispatch", () => {

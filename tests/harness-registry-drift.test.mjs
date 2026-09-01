@@ -42,6 +42,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
+import { getInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const ADAPTER_DIR = join(REPO_ROOT, "src", "switchyard", "adapter");
@@ -147,25 +148,150 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	it("vibe is enabled only with its exact VM clone and write-canary qualification", () => {
+	const vibeModelRef = "mistral/zai-glm-5-2";
+	const vibeSelector = "glm-5-2";
+	const oldVibeSelector = "glm-5.2";
+	const oldVibeDescriptorHash =
+		"sha256:fcb8dc17218516f69e8609d61f768106ab301727e2e65af76b0da4285f0895b1";
+
+	it("vibe is enabled with its VM clone and bounded qualifier policy", () => {
 		ok("vibe" in targets, "expected a vibe target entry");
 		strictEqual(targets.vibe?.enabled, true);
 		strictEqual(targets.vibe?.harness, "vibe");
 		strictEqual(targets.vibe?.snapshot_name, "Vibe");
 		strictEqual(targets.vibe?.technical_ceiling, "standard");
 		deepStrictEqual(targets.vibe?.slots?.standard, [
-			{ model_ref: "mistral/zai-glm-5-2", priority: 1 },
+			{ model_ref: vibeModelRef, priority: 1 },
 		]);
-		const identity =
-			"sha256:fcb8dc17218516f69e8609d61f768106ab301727e2e65af76b0da4285f0895b1";
+		ok(
+			roster.models?.[vibeModelRef],
+			"expected the Vibe model reference to exist",
+		);
+		strictEqual(roster.models[vibeModelRef]?.selector, vibeSelector);
+
+		const vibeQualifications = targets.vibe?.qualifications ?? {};
+		const vibeQualificationEntries = Object.entries(vibeQualifications);
+
+		for (const [entryId, qualification] of vibeQualificationEntries) {
+			ok(
+				entryId !== oldVibeDescriptorHash,
+				`unexpected legacy vibe descriptor identity ${oldVibeDescriptorHash} was retained`,
+			);
+			ok(
+				qualification?.selector !== oldVibeSelector,
+				`unexpected legacy vibe selector ${oldVibeSelector} was retained`,
+			);
+		}
+
+		const expectedDescriptor = getInvocationDescriptor("vibe", "standard");
+		if (expectedDescriptor === null) {
+			strictEqual(
+				vibeQualifications[vibeSelector]?.status,
+				"untested",
+				"pre-promotion Vibe state must retain an explicit untested intent record",
+			);
+			strictEqual(
+				vibeQualificationEntries.some(
+					([, qualification]) => qualification?.status === "dispatch_qualified",
+				),
+				false,
+				"pre-promotion Vibe state must remain fail-closed",
+			);
+			return;
+		}
+
+		const qualification =
+			vibeQualifications[expectedDescriptor.descriptor_identity];
+		ok(
+			qualification,
+			"current Vibe descriptor must have a qualification record",
+		);
 		strictEqual(
-			targets.vibe?.qualifications?.[identity]?.status,
+			qualification.status,
 			"dispatch_qualified",
+			"current Vibe qualification must be dispatch-qualified",
 		);
-		strictEqual(
-			targets.vibe?.qualifications?.[identity]?.promotion_receipt?.status,
-			"promoted",
-		);
+		{
+			const entryId = expectedDescriptor.descriptor_identity;
+			strictEqual(
+				qualification.descriptor_identity,
+				entryId,
+				"vibe qualification key must match descriptor_identity",
+			);
+			strictEqual(
+				qualification.target_id,
+				"vibe",
+				"vibe qualification target must be vibe",
+			);
+			strictEqual(qualification.model_ref, vibeModelRef);
+			strictEqual(qualification.selector, vibeSelector);
+			strictEqual(qualification.effort, null);
+			strictEqual(qualification.variant, null);
+			deepStrictEqual(
+				qualification.invocation_args,
+				expectedDescriptor.invocation_args,
+			);
+			strictEqual(
+				qualification.promotion_receipt?.status,
+				"promoted",
+				"vibe qualification must have promoted receipt",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.descriptor_identity,
+				entryId,
+				"vibe promotion receipt identity must match descriptor_identity",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.target_id,
+				"vibe",
+				"vibe promotion receipt target must be vibe",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.model_ref,
+				vibeModelRef,
+				"vibe promotion receipt model_ref must match slot model_ref",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.selector,
+				vibeSelector,
+				"vibe promotion receipt selector must be glm-5-2",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.effort,
+				null,
+				"vibe promotion receipt effort must be null",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.variant,
+				null,
+				"vibe promotion receipt variant must be null",
+			);
+			deepStrictEqual(
+				qualification.promotion_receipt?.invocation_args,
+				expectedDescriptor.invocation_args,
+				"vibe promotion receipt argv must match current descriptor argv",
+			);
+			strictEqual(
+				qualification.promotion_receipt?.descriptor_identity,
+				expectedDescriptor.descriptor_identity,
+				"vibe qualification must match current descriptor identity",
+			);
+			strictEqual(
+				qualification.model_ref,
+				expectedDescriptor.model_ref,
+				"vibe qualification must match current descriptor model_ref",
+			);
+			strictEqual(
+				qualification.selector,
+				expectedDescriptor.selector,
+				"vibe qualification must match current descriptor selector",
+			);
+			deepStrictEqual(
+				qualification.invocation_args,
+				expectedDescriptor.invocation_args,
+				"vibe qualification must match current descriptor argv",
+			);
+		}
 	});
 
 	it("pi is not a switchyard-dispatch target", () => {

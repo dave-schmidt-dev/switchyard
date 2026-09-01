@@ -4,7 +4,9 @@ import { describe, it } from "node:test";
 import {
 	captureDiffAsync,
 	execute,
+	executeAsync,
 	isVibeAuthenticated,
+	VIBE_ACTIVE_MODEL,
 } from "../src/switchyard/adapter/vibe.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 
@@ -13,7 +15,7 @@ const DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "vibe",
 		model_ref: "mistral/zai-glm-5-2",
-		selector: "glm-5.2",
+		selector: "glm-5-2",
 		effort: null,
 		variant: null,
 		invocation_args: [],
@@ -52,7 +54,8 @@ describe("Vibe adapter", () => {
 		strictEqual(result.success, true);
 		strictEqual(result.output, "vibe-ran");
 		strictEqual(request.workspaceId, WORKSPACE);
-		deepStrictEqual(request.env, ["VIBE_ACTIVE_MODEL=glm-5.2"]);
+		strictEqual(VIBE_ACTIVE_MODEL, "glm-5-2");
+		deepStrictEqual(request.env, ["VIBE_ACTIVE_MODEL=glm-5-2"]);
 		deepStrictEqual(request.argv.slice(0, 2), ["vibe", "-p"]);
 		ok(request.argv[2].includes("change one file"));
 		deepStrictEqual(request.argv.slice(-6), [
@@ -65,6 +68,53 @@ describe("Vibe adapter", () => {
 		]);
 		ok(request.argv.includes("--auto-approve"));
 		ok(request.argv.includes("--trust"));
+	});
+
+	it("rejects a descriptor with a non-active selector before provider execution", () => {
+		let execArgvCalled = false;
+		const inactiveDescriptor = validateInvocationDescriptor(
+			{
+				target_id: "vibe",
+				model_ref: "mistral/zai-glm-5-2",
+				selector: "glm-5.2",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"vibe",
+		);
+		const executionBackend = {
+			execArgv() {
+				execArgvCalled = true;
+				throw new Error("must not run");
+			},
+		};
+		const result = execute("change one file", WORKSPACE, {
+			...options(executionBackend),
+			model: inactiveDescriptor.selector,
+			invocationDescriptor: inactiveDescriptor,
+			descriptorIdentity: inactiveDescriptor.descriptor_identity,
+		});
+		strictEqual(result.success, false);
+		strictEqual(execArgvCalled, false);
+		strictEqual(result.error, `Vibe requires model ${VIBE_ACTIVE_MODEL}`);
+	});
+
+	it("rejects an async descriptor with a non-active selector before provider execution", async () => {
+		let execArgvCalled = false;
+		const executionBackend = {
+			execArgv() {
+				execArgvCalled = true;
+				throw new Error("must not run");
+			},
+		};
+		const result = await executeAsync("change one file", WORKSPACE, {
+			...options(executionBackend),
+			model: "glm-5.2",
+		});
+		strictEqual(result.success, false);
+		strictEqual(execArgvCalled, false);
+		strictEqual(result.error, `Vibe requires model ${VIBE_ACTIVE_MODEL}`);
 	});
 
 	it("requires both the CLI and its Vibe Keychain credential", () => {
