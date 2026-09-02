@@ -17,6 +17,7 @@
 //   switchyard-dispatch status <run-id> [--json]                       # read-only
 //   switchyard-dispatch result <run-id> [--json]                       # read-only
 //   switchyard-dispatch recover [--run <run-id>]                        # cleanup
+//   switchyard-dispatch --version                                      # package version
 //   node src/switchyard/dispatch/index.mjs <tasks.md> --project <path> [options]  # positional (backwards compat)
 //
 // Options (run/launch):
@@ -37,6 +38,7 @@ import {
 	closeSync,
 	existsSync,
 	openSync,
+	readFileSync,
 	realpathSync,
 	statSync,
 } from "node:fs";
@@ -89,6 +91,7 @@ import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
 
 const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
+       switchyard-dispatch --version
 
 Subcommands:
   run    <tasks.md> --project <path> [options]    Run queue synchronously
@@ -2264,6 +2267,13 @@ async function handleRecover(argv, dependencies = {}) {
  * @param {string[]} argv process.argv.slice(2)
  */
 async function main(argv) {
+	if (argv.length === 1 && argv[0] === "--version") {
+		const packageUrl = new URL("../../../package.json", import.meta.url);
+		const { version } = JSON.parse(readFileSync(packageUrl, "utf8"));
+		console.log(version);
+		return;
+	}
+
 	// Find the first positional argument (non-flag) that is a known subcommand
 	const subIdx = argv.findIndex(
 		(a) => !a.startsWith("-") && KNOWN_SUBCOMMANDS.has(a),

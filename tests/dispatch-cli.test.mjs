@@ -554,6 +554,7 @@ describe("subcommand parsing", () => {
 
 describe("usage output", () => {
 	it("USAGE contains subcommand listing", () => {
+		ok(USAGE.includes("--version"));
 		ok(USAGE.includes("run"));
 		ok(USAGE.includes("launch"));
 		ok(USAGE.includes("status"));
@@ -594,6 +595,21 @@ describe("usage output", () => {
 });
 
 describe("CLI exit codes via process spawn", () => {
+	it("--version prints the package version independently of cwd", () => {
+		const packageVersion = JSON.parse(
+			readFileSync(resolve(__dirname, "..", "package.json"), "utf8"),
+		).version;
+		strictEqual(packageVersion, "0.2.0");
+		const result = spawnSync(process.execPath, [DISPATCH_PATH, "--version"], {
+			cwd: dir,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		strictEqual(result.status, 0);
+		strictEqual(result.stdout, `${packageVersion}\n`);
+		strictEqual(result.stderr, "");
+	});
+
 	it("dispatch --help prints usage and exits 0", () => {
 		const result = runDispatch(["--help"]);
 		strictEqual(result.status, 0);
