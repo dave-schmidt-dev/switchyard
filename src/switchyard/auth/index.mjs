@@ -636,8 +636,10 @@ export function runCheck(
 
 /**
  * Qualify provider auth inside a disposable clone: creates one disposable
- * full clone, checks every OAuth-backed provider with presence + live logic,
+ * full clone, checks every probeable provider with presence + live logic,
  * reports BWS API-key lanes as unprobed, and guarantees clone destruction.
+ * Probeability is decided by `authMode`, not by OAuth: keychain-backed Vibe is
+ * probed like the OAuth providers; only the BWS lane is skipped.
  *
  * Progress is emitted only via stderr; the return value is the list of provider
  * qualification results.
@@ -768,7 +770,7 @@ export function runCloneCheck(
 		return;
 	}
 	console.log(
-		"=== Clone auth qualification (read-only disposable clone — live probes run for OAuth providers; BWS lanes remain unprobed) ===",
+		"=== Clone auth qualification (read-only disposable clone — live probes run for probeable providers; BWS lanes remain unprobed) ===",
 	);
 	for (const status of statuses) {
 		if (status.authMode === "ephemeral_api_key_dispatch") {

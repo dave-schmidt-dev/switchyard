@@ -36,7 +36,7 @@ function options(executionBackend) {
 }
 
 describe("Vibe adapter", () => {
-	it("runs the OAuth-backed CLI with a fixed model and noninteractive implementor flags", () => {
+	it("runs the keychain-backed CLI with a fixed model and noninteractive implementor flags", () => {
 		let request;
 		const executionBackend = {
 			execArgv(workspaceId, candidate) {
