@@ -431,11 +431,29 @@ export function preflightMacosQueue(options = {}) {
 	);
 	const snapshot = snapshotRead?.snapshot;
 
-	const rejectionFor = (capability, reason, excludedProviders = []) => ({
+	const rejectionFor = (
 		capability,
-		excludedProviders: [...new Set(excludedProviders)],
 		reason,
-	});
+		excludedProviders = [],
+		excludedReasons = {},
+	) => {
+		const providers = [...new Set(excludedProviders)].sort((left, right) =>
+			left.localeCompare(right),
+		);
+		const closedReasons = Object.fromEntries(
+			providers
+				.filter((provider) => Object.hasOwn(excludedReasons, provider))
+				.map((provider) => [provider, excludedReasons[provider]]),
+		);
+		return {
+			capability,
+			excludedProviders: providers,
+			...(Object.keys(closedReasons).length > 0
+				? { excludedReasons: closedReasons }
+				: {}),
+			reason,
+		};
+	};
 	const baseResult = {
 		platform,
 		snapshotStatus: snapshotRead?.snapshotStatus ?? "malformed",
@@ -538,7 +556,12 @@ export function preflightMacosQueue(options = {}) {
 		capabilityResults.push(result);
 		if (!result.eligible) {
 			rejections.push(
-				rejectionFor(capability, result.reason, result.excludedProviders),
+				rejectionFor(
+					capability,
+					result.reason,
+					result.excludedProviders,
+					result.excludedReasons,
+				),
 			);
 		}
 	}

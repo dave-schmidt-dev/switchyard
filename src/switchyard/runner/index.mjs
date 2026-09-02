@@ -5554,7 +5554,13 @@ function formatQueuePreflightFailure(result) {
 		const excluded = rejection.excludedProviders?.length
 			? rejection.excludedProviders.join(", ")
 			: "none";
-		return `${capability}: ${rejection.reason} (excluded: ${excluded})`;
+		const providerReasons = Object.entries(rejection.excludedReasons ?? {})
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([provider, reason]) => `${provider}: ${reason}`);
+		const reasonDetails = providerReasons.length
+			? `; reasons: ${providerReasons.join(", ")}`
+			: "";
+		return `${capability}: ${rejection.reason} (excluded: ${excluded}${reasonDetails})`;
 	});
 	return `macOS queue provider preflight failed: ${details.join("; ") || result.reason}`;
 }

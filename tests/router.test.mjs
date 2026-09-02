@@ -1106,12 +1106,50 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 		deepStrictEqual(result.rejection, {
 			capability: "high",
 			excludedProviders: ["OpenCode Go"],
+			excludedReasons: { "OpenCode Go": "below_required_capability" },
 			reason: "no_golden_image_verified_provider_with_quota_headroom",
 		});
 		strictEqual(
 			result.capabilityResults[0].excludedReasons["OpenCode Go"],
 			"below_required_capability",
 		);
+	});
+
+	it("carries a provider's closed invocation-descriptor reason into its rejection", () => {
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-preflight-no-descriptor-${process.pid}-${randomUUID()}.json`,
+		);
+		const previousPath = process.env.SWITCHYARD_ROSTER_PATH;
+		try {
+			writeFileSync(rosterPath, readFileSync(FIXTURE_PATH, "utf8"), "utf8");
+			process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+			__resetRosterCacheForTests();
+			const result = preflightMacosQueue({
+				tasks: [
+					{ id: "pending-high", status: "pending", requiredCapability: "high" },
+				],
+				goldenImageVerifiedProviders: ["claude"],
+				readSnapshot: freshSnapshotReader(
+					snapshotFor({
+						name: "claude",
+						ok: true,
+						windows: [{ percent_left: 80, pace_delta: 1 }],
+					}),
+					[],
+				),
+			});
+
+			strictEqual(
+				result.rejection.excludedReasons.claude,
+				"no_invocation_descriptor",
+			);
+		} finally {
+			if (previousPath === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previousPath;
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
+		}
 	});
 
 	it("rejects one unsatisfiable tier even when another tier is eligible", () => {
@@ -1145,6 +1183,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 			{
 				capability: "high",
 				excludedProviders: ["agy"],
+				excludedReasons: { agy: "below_required_capability" },
 				reason: "no_golden_image_verified_provider_with_quota_headroom",
 			},
 		]);
@@ -1179,7 +1218,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 		strictEqual(calls.length, 1);
 		strictEqual(result.eligible, false);
 		strictEqual(result.rejection.capability, "standard");
-		deepStrictEqual(result.rejection.excludedProviders, ["codex", "claude"]);
+		deepStrictEqual(result.rejection.excludedProviders, ["claude", "codex"]);
 		strictEqual(
 			result.rejection.reason,
 			"no_golden_image_verified_provider_with_quota_headroom",
