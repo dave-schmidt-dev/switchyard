@@ -375,6 +375,18 @@ class VmSlotUnavailableError extends LockError {
 	}
 }
 
+/** A closed boundary for host filesystem failures during VM admission. */
+class VmAdmissionUnavailableError extends Error {
+	constructor(cause) {
+		super("VM admission storage is unavailable", { cause });
+		this.name = "VmAdmissionUnavailableError";
+		Object.defineProperty(this, "code", {
+			value: "VM_ADMISSION_UNAVAILABLE",
+			enumerable: false,
+		});
+	}
+}
+
 class SchemaError extends Error {
 	constructor(message) {
 		super(message);
@@ -2057,48 +2069,53 @@ export function acquireVmSlot(options = {}) {
 		createdAt: new Date().toISOString(),
 	};
 
-	mkdirSync(resolveVmAdmissionRoot(), { recursive: true, mode: 0o700 });
-	const holders = [];
+	try {
+		mkdirSync(resolveVmAdmissionRoot(), { recursive: true, mode: 0o700 });
+		const holders = [];
 
-	for (let slotIndex = 0; slotIndex < VM_SLOT_COUNT; slotIndex += 1) {
-		const slotPath = vmSlotPath(slotIndex);
-		for (let attempt = 0; attempt < 2; attempt += 1) {
-			if (publishVmSlot(slotPath, body)) {
-				const lease = {
-					slot: slotIndex,
-					slotIndex,
-					path: slotPath,
-					ownerPid: process.pid,
-					runId,
-					token,
-				};
-				lease.release = () => releaseVmSlot(lease);
-				return lease;
-			}
-
-			const owner = readVmSlotBody(slotPath);
-			if (owner && !vmOwnerIsLive(owner.ownerPid)) {
-				const reclaimPath = `${slotPath}.${process.pid}.${randomUUID()}.reclaim`;
-				try {
-					renameSync(slotPath, reclaimPath);
-				} catch (error) {
-					if (error.code === "ENOENT") continue;
-					throw error;
+		for (let slotIndex = 0; slotIndex < VM_SLOT_COUNT; slotIndex += 1) {
+			const slotPath = vmSlotPath(slotIndex);
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				if (publishVmSlot(slotPath, body)) {
+					const lease = {
+						slot: slotIndex,
+						slotIndex,
+						path: slotPath,
+						ownerPid: process.pid,
+						runId,
+						token,
+					};
+					lease.release = () => releaseVmSlot(lease);
+					return lease;
 				}
-				try {
-					unlinkSync(reclaimPath);
-				} catch (error) {
-					if (error.code !== "ENOENT") throw error;
-				}
-				continue;
-			}
 
-			holders.push(owner ? safeVmRunId(owner.runId) : "unknown");
-			break;
+				const owner = readVmSlotBody(slotPath);
+				if (owner && !vmOwnerIsLive(owner.ownerPid)) {
+					const reclaimPath = `${slotPath}.${process.pid}.${randomUUID()}.reclaim`;
+					try {
+						renameSync(slotPath, reclaimPath);
+					} catch (error) {
+						if (error.code === "ENOENT") continue;
+						throw error;
+					}
+					try {
+						unlinkSync(reclaimPath);
+					} catch (error) {
+						if (error.code !== "ENOENT") throw error;
+					}
+					continue;
+				}
+
+				holders.push(owner ? safeVmRunId(owner.runId) : "unknown");
+				break;
+			}
 		}
-	}
 
-	throw new VmSlotUnavailableError([...new Set(holders)]);
+		throw new VmSlotUnavailableError([...new Set(holders)]);
+	} catch (error) {
+		if (error instanceof VmSlotUnavailableError) throw error;
+		throw new VmAdmissionUnavailableError(error);
+	}
 }
 
 /**
@@ -2710,4 +2727,10 @@ export async function readEvents(runId) {
 	}
 }
 
-export { LockError, RevisionError, SchemaError, VmSlotUnavailableError };
+export {
+	LockError,
+	RevisionError,
+	SchemaError,
+	VmAdmissionUnavailableError,
+	VmSlotUnavailableError,
+};

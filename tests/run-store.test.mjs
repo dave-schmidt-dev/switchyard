@@ -24,6 +24,7 @@ import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import {
+	classifyPreProviderFailure,
 	INTEGRATION_REFUSAL_KINDS,
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
@@ -60,6 +61,8 @@ import {
 	SchemaError,
 	updateRun,
 	updateRunWithRetry,
+	VmAdmissionUnavailableError,
+	VmSlotUnavailableError,
 } from "../src/switchyard/run-store/index.mjs";
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-run-store-"));
@@ -1757,6 +1760,62 @@ describe("global VM admission slots", () => {
 			existsSync(tmpPath),
 			"the primitive need not guess which temp files are safe to remove",
 		);
+	});
+
+	it("contains admission filesystem failures behind a closed preflight diagnostic", () => {
+		writeFileSync(VM_ADMISSION_ROOT, "HOST_ERROR_CANARY /private/admission");
+
+		try {
+			acquireVmSlot({ runId: "filesystem-failure" });
+			throw new Error("expected VM admission to fail");
+		} catch (error) {
+			ok(error instanceof VmAdmissionUnavailableError);
+			strictEqual(error.code, "VM_ADMISSION_UNAVAILABLE");
+			const classified = classifyPreProviderFailure(error);
+			deepStrictEqual(classified, {
+				diagnosticCode: "vm_admission_unavailable",
+				errorKind: "environment_incomplete",
+				failurePhase: "queue_preflight",
+			});
+			const persisted = JSON.stringify(
+				sanitizeFailureMetadata({ result: "launch_failed", ...classified }),
+			);
+			ok(!persisted.includes("HOST_ERROR_CANARY"));
+			ok(!persisted.includes("/private/admission"));
+		}
+	});
+
+	it("classifies occupied admission slots without confusing storage failure", () => {
+		mkdirSync(VM_ADMISSION_ROOT, { recursive: true });
+		for (const slotIndex of [0, 1]) {
+			writeFileSync(
+				join(VM_ADMISSION_ROOT, `vm-slot-${slotIndex}.lock`),
+				JSON.stringify({
+					ownerPid: process.pid,
+					runId: `HOLDER_CANARY_${slotIndex}`,
+					token: `holder-token-${slotIndex}`,
+				}),
+			);
+		}
+
+		try {
+			acquireVmSlot({ runId: "slot-challenger" });
+			throw new Error("expected VM slots to be unavailable");
+		} catch (error) {
+			ok(error instanceof VmSlotUnavailableError);
+			strictEqual(error.code, "VM_SLOT_UNAVAILABLE");
+			const classified = classifyPreProviderFailure(error);
+			deepStrictEqual(classified, {
+				diagnosticCode: "vm_slot_unavailable",
+				errorKind: "environment_incomplete",
+				failurePhase: "queue_preflight",
+			});
+			const persisted = JSON.stringify(
+				sanitizeFailureMetadata({ result: "launch_failed", ...classified }),
+			);
+			ok(!persisted.includes("HOLDER_CANARY"));
+			ok(!persisted.includes("holder-token"));
+		}
 	});
 
 	it("does not invoke project-lock orphan reclamation", async () => {

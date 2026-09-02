@@ -410,6 +410,8 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"worker_boot_exception",
 	"clone_hardening_failed",
 	"workspace_prepare_failed",
+	"vm_admission_unavailable",
+	"vm_slot_unavailable",
 	"prlctl_job_misfire",
 	"prlctl_session_not_ready",
 	"prlctl_call_timed_out",
@@ -478,6 +480,16 @@ export const PRE_PROVIDER_FAILURE_TRIPLES = Object.freeze([
 		errorKind: "environment_incomplete",
 		failurePhase: "queue_preflight",
 	}),
+	Object.freeze({
+		diagnosticCode: "vm_admission_unavailable",
+		errorKind: "environment_incomplete",
+		failurePhase: "queue_preflight",
+	}),
+	Object.freeze({
+		diagnosticCode: "vm_slot_unavailable",
+		errorKind: "environment_incomplete",
+		failurePhase: "queue_preflight",
+	}),
 	...[...CHECKPOINT_DIAGNOSTIC_CODES].map((diagnosticCode) =>
 		Object.freeze({
 			diagnosticCode,
@@ -534,6 +546,16 @@ export function classifyPreProviderFailure(error) {
 		Object.hasOwn(LOCK_DIAGNOSTIC_CODES, error.code)
 	) {
 		diagnosticCode = LOCK_DIAGNOSTIC_CODES[error.code];
+	} else if (
+		error.name === "VmAdmissionUnavailableError" &&
+		error.code === "VM_ADMISSION_UNAVAILABLE"
+	) {
+		diagnosticCode = "vm_admission_unavailable";
+	} else if (
+		error.name === "VmSlotUnavailableError" &&
+		error.code === "VM_SLOT_UNAVAILABLE"
+	) {
+		diagnosticCode = "vm_slot_unavailable";
 	} else {
 		const prlctl = prlctlFailureMetadata(error);
 		diagnosticCode =
@@ -553,7 +575,7 @@ export const PERSISTED_SIGNALS = new Set([
 const CLI_USAGE_SIGNATURE =
 	/\b(?:unexpected argument|unrecognized (?:option|argument)|unknown (?:option|argument)|invalid value|usage:)\b/i;
 
-/** Convert transient provider output into a content-free diagnostic code. */
+/** Convert provider execution evidence into a content-free diagnostic code. */
 export function classifyProviderDiagnostic({
 	errorKind,
 	text,
@@ -573,10 +595,13 @@ export function classifyProviderDiagnostic({
 		return "cli_usage_error";
 	}
 	if (typeof signal === "string" && signal) return "provider_signalled";
+	if (Number.isSafeInteger(exitCode) && exitCode !== 0) {
+		return "provider_exit_nonzero";
+	}
 	if (typeof text === "string" && text.trim()) {
 		return "provider_output_unclassified";
 	}
-	return Number.isSafeInteger(exitCode) ? "provider_exit_nonzero" : null;
+	return null;
 }
 
 const PERSISTED_ERROR_METADATA = Object.freeze({

@@ -494,6 +494,30 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		strictEqual(code.includes("SECRET_CANARY"), false);
 	});
 
+	it("prefers a safe nonzero exit over arbitrary provider output", () => {
+		strictEqual(
+			classifyProviderDiagnostic({
+				text: "SECRET_CANARY arbitrary provider output",
+				exitCode: 17,
+			}),
+			"provider_exit_nonzero",
+		);
+	});
+
+	it("retains specific provider diagnostics ahead of a nonzero exit", () => {
+		for (const [input, expected] of [
+			[{ cancelled: true, exitCode: 1 }, "execution_cancelled"],
+			[{ timedOut: true, exitCode: 1 }, "execution_timed_out"],
+			[{ errorKind: "auth_expired", exitCode: 1 }, "auth_expired"],
+			[{ errorKind: "quota_exhausted", exitCode: 1 }, "quota_exhausted"],
+			[{ errorKind: "model_unavailable", exitCode: 1 }, "model_unavailable"],
+			[{ text: "unexpected argument", exitCode: 2 }, "cli_usage_error"],
+			[{ signal: "SIGTERM", exitCode: 1 }, "provider_signalled"],
+		]) {
+			strictEqual(classifyProviderDiagnostic(input), expected);
+		}
+	});
+
 	it("maps a cleanup stage to a static durable diagnostic", () => {
 		strictEqual(
 			cleanupDiagnosticCodeFor("pid_marker_removed"),
