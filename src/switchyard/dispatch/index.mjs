@@ -27,7 +27,7 @@
 //   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json).
 //   --no-stop-on-failure   Keep going after a task fails (default: stop).
 //   --exclude-provider <name>  Never route to this provider (repeatable).
-//   --json                 Emit one JSON object for launch success or failure.
+//   --json                 Emit one JSON object for run/launch success or failure.
 //   --platform <macos>     Queue workspace platform (default: macos).
 //   --help                 Show this help.
 
@@ -45,6 +45,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import {
+	classifyPreProviderFailure,
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
@@ -105,6 +106,7 @@ Run/Launch options:
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --platform <macos>     Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
+  --json                  Emit one terminal JSON object
   --help                 Show this help`;
 
 const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [options]
@@ -117,6 +119,7 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --platform <macos>     Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
+  --json                  Emit one terminal JSON object
   --help                 Show this help`;
 
 const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <path> [options]
@@ -200,12 +203,18 @@ async function markLauncherReadyIfLaunching(runId) {
 	);
 }
 
-async function finalizeInitializedLaunchFailure(runId, projectPath) {
+async function finalizeInitializedLaunchFailure(
+	runId,
+	projectPath,
+	error,
+	{ projectLockOwned = false } = {},
+) {
+	const classified = classifyPreProviderFailure(error);
 	const failure = sanitizeFailureMetadata({
 		result: "launch_failed",
-		errorKind: "launch_failed",
-		diagnosticCode: "worker_boot_exception",
-		failurePhase: "worker_boot",
+		errorKind: classified?.errorKind ?? "launch_failed",
+		diagnosticCode: classified?.diagnosticCode ?? "worker_boot_exception",
+		failurePhase: classified?.failurePhase ?? "worker_boot",
 	});
 	return finalizeRun({
 		runId,
@@ -213,6 +222,7 @@ async function finalizeInitializedLaunchFailure(runId, projectPath) {
 		failure,
 		eventName: "worker_boot_failed",
 		eventStatus: "fatal",
+		eventReasonCode: failure.reasonCode,
 		terminalSummary: {
 			totalTasks: null,
 			runnableTasks: null,
@@ -221,8 +231,10 @@ async function finalizeInitializedLaunchFailure(runId, projectPath) {
 			failedCount: null,
 		},
 		cleanup: async () => {
-			await reconcileProjectLockClaims();
-			await releaseProjectLockIfOwnedBy(projectPath, runId);
+			if (projectLockOwned) {
+				await reconcileProjectLockClaims();
+				await releaseProjectLockIfOwnedBy(projectPath, runId);
+			}
 		},
 	});
 }
@@ -248,6 +260,7 @@ function parseDispatchArgs(argv) {
 				provider: { type: "string", multiple: true },
 				"task-id": { type: "string", multiple: true },
 				platform: { type: "string" },
+				json: { type: "boolean", default: false },
 				help: { type: "boolean", default: false },
 			},
 		});
@@ -328,6 +341,7 @@ function parseDispatchArgs(argv) {
 		onlyProviders,
 		taskIds: values["task-id"] ?? [],
 		platform,
+		json: values.json,
 	};
 }
 
@@ -337,11 +351,7 @@ function parseDispatchArgs(argv) {
  * @throws {UsageError}
  */
 function parseLaunchArgs(argv) {
-	const json = argv.includes("--json");
-	const parsed = parseDispatchArgs(
-		argv.filter((argument) => argument !== "--json"),
-	);
-	return parsed.help ? parsed : { ...parsed, json };
+	return parseDispatchArgs(argv);
 }
 
 /**
@@ -453,6 +463,8 @@ function parseRecoverArgs(argv) {
  *   in isolation from queue execution (no VM workspaces on that path).
  */
 async function runDispatch(opts, dependencies = {}) {
+	const jsonRequested = opts.json === true;
+	const report = jsonRequested ? () => {} : (...args) => console.error(...args);
 	// A dispatch belongs to its target project, not to this checkout. Keeping
 	// durable state beside that project avoids File Provider permissions on a
 	// separately checked-out Switchyard source tree. Explicit overrides remain
@@ -465,12 +477,12 @@ async function runDispatch(opts, dependencies = {}) {
 		);
 	}
 	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
-	console.error(`dispatch: queue    ${opts.tasksFilePath}`);
-	console.error(`dispatch: project  ${opts.projectPath}`);
-	console.error(
+	report(`dispatch: queue    ${opts.tasksFilePath}`);
+	report(`dispatch: project  ${opts.projectPath}`);
+	report(
 		"dispatch: routing host-side by usage headroom; each task runs headlessly in a disposable Parallels working VM.",
 	);
-	console.error(
+	report(
 		"dispatch: expect several minutes per task while the provider CLI runs.",
 	);
 
@@ -488,18 +500,18 @@ async function runDispatch(opts, dependencies = {}) {
 			// rename. `undefined > 0` is false, so the branch was unreachable
 			// and every pre-run reclamation went unreported.
 			if (swept.vmsReclaimed > 0) {
-				console.error(
+				report(
 					`dispatch: pre-run sweep reclaimed ${swept.vmsReclaimed} orphaned VM(s)`,
 				);
 			}
 			for (const entry of swept.unreclaimedSnapshots) {
-				console.error(
+				report(
 					`dispatch: pre-run sweep left snapshots on the golden for ${entry.name} (${entry.reason}) — human review required`,
 				);
 			}
 		})
 		.catch((error) => {
-			console.error(`dispatch: pre-run sweep failed (${error.message})`);
+			report(`dispatch: pre-run sweep failed (${error.message})`);
 		});
 
 	// Retention sweep (Task D.5, revised by Task 6.5). This pass deletes for
@@ -523,23 +535,23 @@ async function runDispatch(opts, dependencies = {}) {
 	applyRetention({ maxAgeDays: 30 })
 		.then(({ deletedCount, collectedCount, quarantined }) => {
 			if (deletedCount > 0) {
-				console.error(
+				report(
 					`dispatch: retention sweep removed ${deletedCount} run-store director${deletedCount === 1 ? "y" : "ies"} older than 30 days that recorded no events`,
 				);
 			}
 			if (collectedCount > 0) {
-				console.error(
+				report(
 					`dispatch: retention sweep collected ${collectedCount} run-store artifact${collectedCount === 1 ? "" : "s"}`,
 				);
 			}
 			for (const entry of quarantined) {
-				console.error(
+				report(
 					`dispatch: retention sweep quarantined run ${entry.runId} (${entry.reason})`,
 				);
 			}
 		})
 		.catch((error) => {
-			console.error(`dispatch: retention sweep failed (${error.message})`);
+			report(`dispatch: retention sweep failed (${error.message})`);
 		});
 
 	const runId = randomUUID();
@@ -563,9 +575,20 @@ async function runDispatch(opts, dependencies = {}) {
 	// block advances this run's already-written record to a terminal state.
 	let runStoreReady = false;
 	let identity = null;
+	let initialized = false;
+	let initializationCode = null;
 	try {
 		const tasks = loadTaskQueue(opts.tasksFilePath);
-		identity = prepareRunIdentity(opts);
+		if (tasks.length === 0) {
+			initializationCode = "queue_empty";
+			throw new UsageError("no tasks parsed from the task queue");
+		}
+		try {
+			identity = prepareRunIdentity(opts);
+		} catch (error) {
+			initializationCode = "queue_identity_invalid";
+			throw error;
+		}
 		await initializeRun({
 			runId,
 			tasksFilePath: opts.tasksFilePath,
@@ -577,18 +600,94 @@ async function runDispatch(opts, dependencies = {}) {
 			runOptions: identity.runOptions,
 			queueIdentity: identity.queueIdentity,
 		});
+		initialized = true;
 		await acquireRunLock(runId, pid, startToken, nonce);
 		await advanceState(runId, "running");
 		runStoreReady = true;
 	} catch (error) {
-		throw new Error(
-			`dispatch: run-store initialization failed before routing (${error.message})`,
+		const classified = classifyPreProviderFailure(error);
+		const diagnosticCode =
+			initializationCode ??
+			classified?.diagnosticCode ??
+			"environment_incomplete";
+		if (initialized) {
+			try {
+				const failure = sanitizeFailureMetadata({
+					result: "unknown_failure",
+					errorKind: classified?.errorKind ?? diagnosticCode,
+					diagnosticCode,
+					failurePhase: classified?.failurePhase ?? "queue_preflight",
+				});
+				await finalizeRun({
+					runId,
+					state: "failed",
+					failure,
+					eventName: "dispatch_initialization_failed",
+					eventStatus: "fatal",
+					eventReasonCode: failure.reasonCode,
+					terminalSummary: {
+						totalTasks: null,
+						runnableTasks: null,
+						processedTasks: null,
+						completedTaskIds: null,
+						failedCount: null,
+					},
+					cleanup: async () => {},
+				});
+			} catch {
+				// A JSON caller receives a null address unless the terminal record is
+				// readable below; raw initialization errors never cross that surface.
+			}
+		}
+		if (jsonRequested) {
+			let envelope = null;
+			if (initialized) {
+				try {
+					const terminalRun = await readRun(runId);
+					if (isTerminalState(terminalRun.state)) {
+						envelope = await buildResultEnvelope(runId, terminalRun);
+					}
+				} catch {
+					// No readable terminal record means no addressable run.
+				}
+			}
+			console.log(
+				JSON.stringify(
+					envelope ??
+						(await buildLaunchFailureEnvelope({
+							preInitialization: {
+								type: "contract_failure",
+								code: diagnosticCode,
+							},
+						})),
+				),
+			);
+			process.exitCode = error instanceof UsageError ? 2 : 1;
+			return { runId: envelope?.runId ?? null, error: true };
+		}
+		if (initialized) {
+			Object.defineProperty(error, "switchyardRunId", {
+				value: runId,
+				enumerable: false,
+			});
+		}
+		const wrapped = new Error(
+			"dispatch: run-store initialization failed before routing",
+			{ cause: error },
 		);
+		if (initialized) {
+			Object.defineProperty(wrapped, "switchyardRunId", {
+				value: runId,
+				enumerable: false,
+			});
+		}
+		throw wrapped;
 	}
 
 	let result;
 	let queueError = null;
 	let eventWriteChain = Promise.resolve();
+	let projectLockOwned = false;
 	try {
 		// Acquire the exclusive project lock immediately before queue
 		// execution, mirroring handleLaunch. This is deliberately NOT
@@ -619,6 +718,7 @@ async function runDispatch(opts, dependencies = {}) {
 			if (ownsProjectLock !== true) {
 				throw new LockError("Project lock ownership assertion failed");
 			}
+			projectLockOwned = true;
 		}
 		result = await runQueueFn({
 			tasksFilePath: opts.tasksFilePath,
@@ -637,9 +737,7 @@ async function runDispatch(opts, dependencies = {}) {
 			...(runStoreReady ? { runId } : {}),
 			dependencies: {
 				onTaskStart: (task) => {
-					console.error(
-						`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd(),
-					);
+					report(`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd());
 					// activeTaskId is not just one datum: buildStatusEnvelope
 					// gates activeTaskProvider, activeTaskModel,
 					// activeTaskDeadline, activeTaskAgeMs, and runningCount on
@@ -657,7 +755,7 @@ async function runDispatch(opts, dependencies = {}) {
 					}
 				},
 				onTaskRouted: (info) => {
-					console.error(
+					report(
 						`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline ?? "orchestrator"}`,
 					);
 					if (runStoreReady) {
@@ -691,7 +789,7 @@ async function runDispatch(opts, dependencies = {}) {
 					const where = `${r.provider ?? "no-provider"}${r.model ? `/${r.model}` : ""}`;
 					const displayReason =
 						safeFailure?.reason ?? (r.success ? "" : "task failed");
-					console.error(
+					report(
 						`dispatch: ${r.success ? "ok  " : "FAIL"} task ${r.taskId} [${where}] ${r.result}${displayReason ? ` (${displayReason})` : ""}`,
 					);
 					if (runStoreReady) {
@@ -744,11 +842,14 @@ async function runDispatch(opts, dependencies = {}) {
 			const failedResult = result?.results.findLast?.(
 				(entry) => !entry.success,
 			);
+			const classifiedQueueError = classifyPreProviderFailure(queueError);
 			const failure = queueError
 				? sanitizeFailureMetadata({
 						result: "unknown_failure",
-						errorKind: "unknown_failure",
-						failurePhase: "terminal_reconciliation",
+						errorKind: classifiedQueueError?.errorKind ?? "unknown_failure",
+						diagnosticCode: classifiedQueueError?.diagnosticCode,
+						failurePhase:
+							classifiedQueueError?.failurePhase ?? "terminal_reconciliation",
 					})
 				: sanitizeFailureMetadata(failedResult ?? {});
 			try {
@@ -774,26 +875,51 @@ async function runDispatch(opts, dependencies = {}) {
 								failedCount: null,
 							},
 					cleanup: async () => {
-						await (
-							dependencies.reconcileProjectLockClaims ??
-							reconcileProjectLockClaims
-						)();
-						await releaseProjectLockIfOwnedBy(opts.projectPath, runId);
+						if (projectLockOwned) {
+							await (
+								dependencies.reconcileProjectLockClaims ??
+								reconcileProjectLockClaims
+							)();
+							await releaseProjectLockIfOwnedBy(opts.projectPath, runId);
+						}
 					},
 				});
 			} catch (error) {
-				console.error(`dispatch: run-store teardown failed (${error.message})`);
+				report(`dispatch: run-store teardown failed (${error.message})`);
 			}
 		}
 	}
-	if (queueError) throw queueError;
+	if (jsonRequested) {
+		let envelope;
+		try {
+			envelope = await buildResultEnvelope(runId, await readRun(runId));
+		} catch {
+			envelope = await buildLaunchFailureEnvelope({
+				preInitialization: {
+					type: "contract_failure",
+					code: "environment_incomplete",
+				},
+			});
+		}
+		console.log(JSON.stringify(envelope));
+		const failed = result?.results?.some((entry) => !entry.success) ?? true;
+		process.exitCode = queueError || failed ? 1 : 0;
+		return { runId: envelope.runId, error: Boolean(queueError || failed) };
+	}
+	if (queueError) {
+		Object.defineProperty(queueError, "switchyardRunId", {
+			value: runId,
+			enumerable: false,
+		});
+		throw queueError;
+	}
 
 	const failed = result.results.filter((r) => !r.success);
-	console.error(
+	report(
 		`dispatch: done — ${result.processedTasks}/${result.runnableTasks} runnable processed, ` +
 			`${result.completedTaskIds.length} completed, ${failed.length} failed`,
 	);
-	console.error(`dispatch: checkpoint ${result.checkpointPath}`);
+	report(`dispatch: checkpoint ${result.checkpointPath}`);
 	process.exitCode = failed.length > 0 ? 1 : 0;
 }
 
@@ -864,28 +990,6 @@ function resolveBootstrapPath() {
  * Handle the launch subcommand.
  * @param {string[]} argv arguments after the subcommand
  */
-async function projectLaunchLockFact(error, dependencies = {}) {
-	if (!(error instanceof LockError) || error.code !== "PROJECT_LOCK_HELD") {
-		return null;
-	}
-	let holderLiveness = "unknown";
-	if (error.holderRunId) {
-		try {
-			holderLiveness = (
-				dependencies.classifyRunLiveness ?? classifyRunLiveness
-			)(await (dependencies.readRun ?? readRun)(error.holderRunId));
-		} catch {
-			// A missing, corrupt, or unreadable owner is unresolved, never dead.
-		}
-	}
-	return {
-		type: "lock_conflict",
-		code: error.code,
-		holderRunId: error.holderRunId,
-		holderLiveness,
-	};
-}
-
 function launchCommands(runId, stateRoot) {
 	return {
 		statusCommand: `switchyard-dispatch status ${runId} --state-root ${shellQuote(stateRoot)}`,
@@ -929,6 +1033,51 @@ async function buildLaunchFailureEnvelope(context) {
 	};
 }
 
+/** Handle synchronous dispatch, including its content-free JSON surface. */
+async function handleRun(argv, dependencies = {}, usage = USAGE_RUN) {
+	const jsonRequested = argv.includes("--json");
+	let opts;
+	try {
+		opts = parseDispatchArgs(argv);
+	} catch (error) {
+		if (!jsonRequested) throw error;
+		console.log(
+			JSON.stringify(
+				await buildLaunchFailureEnvelope({
+					preInitialization: {
+						type: "contract_failure",
+						code: "invalid_invocation",
+					},
+				}),
+			),
+		);
+		process.exitCode = error instanceof UsageError ? 2 : 1;
+		return;
+	}
+	if (opts.help) {
+		console.log(usage);
+		return;
+	}
+	try {
+		await runDispatch(opts, dependencies);
+	} catch (error) {
+		if (!jsonRequested) throw error;
+		console.log(
+			JSON.stringify(
+				await buildLaunchFailureEnvelope({
+					preInitialization: {
+						type: "contract_failure",
+						code:
+							classifyPreProviderFailure(error)?.diagnosticCode ??
+							"environment_incomplete",
+					},
+				}),
+			),
+		);
+		process.exitCode = error instanceof UsageError ? 2 : 1;
+	}
+}
+
 /**
  * Handle detached launch. `--json` changes only the failure surface: legacy
  * success already returns JSON, while legacy failure text and exit codes stay
@@ -964,6 +1113,7 @@ async function handleLaunch(argv, dependencies = {}) {
 	let initialized = false;
 	let preInitialization = null;
 	let spawnFailure = false;
+	let projectLockOwned = false;
 	try {
 		(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
 		if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
@@ -1045,11 +1195,13 @@ async function handleLaunch(argv, dependencies = {}) {
 					code: "PROJECT_LOCK_OWNERSHIP_FAILED",
 				});
 			}
+			projectLockOwned = true;
 
 			await advanceState(runId, "launching");
 		} catch (error) {
-			preInitialization = await projectLaunchLockFact(error, dependencies);
-			await finalizeInitializedLaunchFailure(runId, opts.projectPath);
+			await finalizeInitializedLaunchFailure(runId, opts.projectPath, error, {
+				projectLockOwned,
+			});
 			initialized = false;
 			throw error;
 		}
@@ -1106,7 +1258,14 @@ async function handleLaunch(argv, dependencies = {}) {
 
 		if (spawnError) {
 			spawnFailure = true;
-			await finalizeInitializedLaunchFailure(runId, opts.projectPath);
+			await finalizeInitializedLaunchFailure(
+				runId,
+				opts.projectPath,
+				spawnError,
+				{
+					projectLockOwned,
+				},
+			);
 			initialized = false;
 			throw spawnError;
 		}
@@ -1129,7 +1288,9 @@ async function handleLaunch(argv, dependencies = {}) {
 	} catch (error) {
 		if (initialized && runId !== null && opts?.projectPath) {
 			try {
-				await finalizeInitializedLaunchFailure(runId, opts.projectPath);
+				await finalizeInitializedLaunchFailure(runId, opts.projectPath, error, {
+					projectLockOwned,
+				});
 			} catch {
 				// The envelope will omit unresolved durable targets.
 			}
@@ -2115,13 +2276,7 @@ async function main(argv) {
 		switch (subcommand) {
 			case "run":
 			case undefined: {
-				// run subcommand is equivalent to positional dispatch
-				const opts = parseDispatchArgs(subArgs);
-				if (opts.help) {
-					console.log(subcommand === "run" ? USAGE_RUN : USAGE);
-					return;
-				}
-				await runDispatch(opts);
+				await handleRun(subArgs, {}, subcommand === "run" ? USAGE_RUN : USAGE);
 				break;
 			}
 			case "launch": {
@@ -2145,13 +2300,15 @@ async function main(argv) {
 		}
 	} else {
 		// Backwards compat: positional dispatch (no explicit subcommand)
-		const opts = parseDispatchArgs(argv);
-		if (opts.help) {
-			console.log(USAGE);
-			return;
-		}
-		await runDispatch(opts);
+		await handleRun(argv, {}, USAGE);
 	}
+}
+
+function formatRunAbort(error) {
+	const runAddress = error.switchyardRunId
+		? ` (run ${error.switchyardRunId})`
+		: "";
+	return `dispatch: run aborted${runAddress}: ${error.message}`;
 }
 
 if (
@@ -2167,7 +2324,7 @@ if (
 			console.error(USAGE);
 			process.exitCode = 2;
 		} else {
-			console.error(`dispatch: run aborted: ${error.message}`);
+			console.error(formatRunAbort(error));
 			process.exitCode = 1;
 		}
 	}
@@ -2175,9 +2332,11 @@ if (
 
 export {
 	captureHostFingerprint,
+	formatRunAbort,
 	handleLaunch,
 	handleRecover,
 	handleResult,
+	handleRun,
 	handleStatus,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,

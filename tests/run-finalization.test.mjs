@@ -1,5 +1,9 @@
 import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
+import {
+	PRE_PROVIDER_FAILURE_TRIPLES,
+	sanitizeFailureMetadata,
+} from "../src/switchyard/adapter/exec-error.mjs";
 import { finalizeRun } from "../src/switchyard/dispatch/run-finalization.mjs";
 
 function revisionError() {
@@ -9,6 +13,66 @@ function revisionError() {
 }
 
 describe("run finalization", () => {
+	it("accepts every closed pre-provider diagnostic as an event reason", async () => {
+		for (const triple of PRE_PROVIDER_FAILURE_TRIPLES) {
+			const events = [];
+			const failure = sanitizeFailureMetadata({
+				result: "launch_failed",
+				...triple,
+			});
+			const outcome = await finalizeRun(
+				{
+					runId: `closed-${triple.diagnosticCode}`,
+					state: "failed",
+					failure,
+					eventReasonCode: triple.diagnosticCode,
+					terminalSummary: { processedTasks: 0, failedCount: 1 },
+				},
+				{
+					createEvent: async (_runId, event) => events.push(event),
+					updateRunWithRetry: async (_runId, patch) => patch,
+					releaseRunLock: async () => {},
+				},
+			);
+			strictEqual(outcome.terminal, true);
+			strictEqual(events[0].reasonCode, triple.diagnosticCode);
+		}
+	});
+
+	it("rejects an arbitrary event reason before any terminal mutation", async () => {
+		let mutations = 0;
+		const failure = sanitizeFailureMetadata({
+			result: "launch_failed",
+			errorKind: "launch_failed",
+			diagnosticCode: "worker_boot_exception",
+			failurePhase: "worker_boot",
+		});
+		await rejects(
+			finalizeRun(
+				{
+					runId: "arbitrary-reason",
+					state: "failed",
+					failure,
+					eventReasonCode: "arbitrary/path/canary",
+					terminalSummary: { processedTasks: 0, failedCount: 1 },
+				},
+				{
+					createEvent: async () => {
+						mutations += 1;
+					},
+					updateRunWithRetry: async () => {
+						mutations += 1;
+					},
+					releaseRunLock: async () => {
+						mutations += 1;
+					},
+				},
+			),
+			/closed event reason code/,
+		);
+		strictEqual(mutations, 0);
+	});
+
 	it("preserves a persisted terminal success when run-lock release loses a revision race", async () => {
 		const persisted = {};
 		const patches = [];

@@ -128,6 +128,9 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"executor_not_switchyard",
 	"unknown_failure",
 	"unclassified",
+	"task_selection_failed",
+	"environment_incomplete",
+	"project_lock_failed",
 ]);
 
 const CLEANUP_STAGE_DIAGNOSTIC_CODES = Object.freeze({
@@ -420,6 +423,14 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"checkpoint_run_options_mismatch",
 	"checkpoint_historical_checkpoint",
 	"checkpoint_historical_state",
+	"task_selection_failed",
+	"environment_incomplete",
+	"project_lock_held",
+	"project_lock_recovery_in_progress",
+	"project_lock_ownership_failed",
+	"project_lock_ownership_displaced",
+	"project_lock_claim_cleanup_failed",
+	"project_lock_recovery_claim_blocks_execution",
 ]);
 
 const PERSISTED_FAILURE_PHASES = new Set([
@@ -428,7 +439,108 @@ const PERSISTED_FAILURE_PHASES = new Set([
 	"provider_cleanup",
 	"terminal_reconciliation",
 	"worker_boot",
+	"task_selection",
+	"queue_preflight",
+	"checkpoint_validation",
+	"project_lock",
 ]);
+
+const CHECKPOINT_DIAGNOSTIC_CODES = new Set([
+	"checkpoint_task_file_mismatch",
+	"checkpoint_tasks_file_mismatch",
+	"checkpoint_missing_queue_identity",
+	"checkpoint_queue_identity_missing",
+	"checkpoint_queue_identity_mismatch",
+	"checkpoint_run_options_mismatch",
+	"checkpoint_historical_checkpoint",
+	"checkpoint_historical_state",
+]);
+
+const LOCK_DIAGNOSTIC_CODES = Object.freeze({
+	PROJECT_LOCK_HELD: "project_lock_held",
+	PROJECT_LOCK_RECOVERY_IN_PROGRESS: "project_lock_recovery_in_progress",
+	PROJECT_LOCK_OWNERSHIP_FAILED: "project_lock_ownership_failed",
+	PROJECT_LOCK_OWNERSHIP_DISPLACED: "project_lock_ownership_displaced",
+	PROJECT_LOCK_CLAIM_CLEANUP_FAILED: "project_lock_claim_cleanup_failed",
+	PROJECT_LOCK_RECOVERY_CLAIM_BLOCKS_EXECUTION:
+		"project_lock_recovery_claim_blocks_execution",
+});
+
+/** Complete closed output set of classifyPreProviderFailure. */
+export const PRE_PROVIDER_FAILURE_TRIPLES = Object.freeze([
+	Object.freeze({
+		diagnosticCode: "task_selection_failed",
+		errorKind: "task_selection_failed",
+		failurePhase: "task_selection",
+	}),
+	Object.freeze({
+		diagnosticCode: "environment_incomplete",
+		errorKind: "environment_incomplete",
+		failurePhase: "queue_preflight",
+	}),
+	...[...CHECKPOINT_DIAGNOSTIC_CODES].map((diagnosticCode) =>
+		Object.freeze({
+			diagnosticCode,
+			errorKind: "launch_failed",
+			failurePhase: "worker_boot",
+		}),
+	),
+	...Object.values(LOCK_DIAGNOSTIC_CODES).map((diagnosticCode) =>
+		Object.freeze({
+			diagnosticCode,
+			errorKind: "project_lock_failed",
+			failurePhase: "project_lock",
+		}),
+	),
+	...[
+		"worker_nonce_mismatch",
+		"worker_fingerprint_mismatch",
+		"worker_contract_unsupported",
+		"worker_boot_exception",
+		"clone_hardening_failed",
+		"workspace_prepare_failed",
+		"prlctl_job_misfire",
+		"prlctl_session_not_ready",
+		"prlctl_call_timed_out",
+		"prlctl_call_failed",
+	].map((diagnosticCode) =>
+		Object.freeze({
+			diagnosticCode,
+			errorKind: "launch_failed",
+			failurePhase: "worker_boot",
+		}),
+	),
+]);
+
+const PRE_PROVIDER_TRIPLE_BY_CODE = new Map(
+	PRE_PROVIDER_FAILURE_TRIPLES.map((triple) => [triple.diagnosticCode, triple]),
+);
+
+/**
+ * Classify known failures before provider execution without retaining error text.
+ * Arbitrary codes and messages are ignored.
+ */
+export function classifyPreProviderFailure(error) {
+	if (!error || typeof error !== "object") return null;
+	let diagnosticCode = null;
+	if (error.name === "TaskSelectionError") {
+		diagnosticCode = "task_selection_failed";
+	} else if (error.name === "QueuePreflightError") {
+		diagnosticCode = "environment_incomplete";
+	} else if (CHECKPOINT_DIAGNOSTIC_CODES.has(error.code)) {
+		diagnosticCode = error.code;
+	} else if (
+		error.name === "LockError" &&
+		Object.hasOwn(LOCK_DIAGNOSTIC_CODES, error.code)
+	) {
+		diagnosticCode = LOCK_DIAGNOSTIC_CODES[error.code];
+	} else {
+		const prlctl = prlctlFailureMetadata(error);
+		diagnosticCode =
+			prlctl?.diagnosticCode ?? workerBootStageDiagnosticCode(error) ?? null;
+	}
+	return PRE_PROVIDER_TRIPLE_BY_CODE.get(diagnosticCode) ?? null;
+}
 /** Signal names that may be persisted; anything else is dropped. */
 export const PERSISTED_SIGNALS = new Set([
 	"SIGABRT",
@@ -594,6 +706,18 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 	unclassified: Object.freeze({
 		reasonCode: "unclassified",
 		reason: "The task failed for an unclassified reason.",
+	}),
+	task_selection_failed: Object.freeze({
+		reasonCode: "task_selection_failed",
+		reason: "The requested task selection does not satisfy the queue contract.",
+	}),
+	environment_incomplete: Object.freeze({
+		reasonCode: "environment_incomplete",
+		reason: "The selected queue environment did not pass preflight.",
+	}),
+	project_lock_failed: Object.freeze({
+		reasonCode: "project_lock_failed",
+		reason: "Project lock acquisition or ownership validation failed.",
 	}),
 });
 

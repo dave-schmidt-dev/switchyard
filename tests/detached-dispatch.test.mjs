@@ -19,7 +19,8 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 
@@ -1884,6 +1885,13 @@ describe("non-matching nonce", () => {
 		);
 		ok(!JSON.stringify(run.lastFailure).includes("non-existent-tasks.md"));
 		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
+		const disposition = projectDisposition({
+			run,
+			liveness: "terminal_clean",
+			optionalEvidenceValid: false,
+		});
+		strictEqual(disposition.action, "repair_contract");
+		strictEqual(disposition.reasonCode, "worker_boot_exception");
 	});
 
 	it("persists closed backend stage codes without durable error details", async () => {
@@ -1973,6 +1981,105 @@ describe("non-matching nonce", () => {
 			ok(!durableEvidence.includes("/host/private/path"));
 			ok(!durableEvidence.includes("raw provider output"));
 			ok(!durableEvidence.includes("providerOutput"));
+		}
+	});
+});
+
+describe("typed pre-provider failures on the detached terminal path", () => {
+	it("preserves exported task-selection, queue-preflight, and lock triples", async () => {
+		const runnerUrl = `${pathToFileURL(resolve(__dirname, "..", "src", "switchyard", "runner", "index.mjs")).href}?typed-terminalization`;
+		const runStoreUrl = pathToFileURL(
+			resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"),
+		).href;
+		const cases = [
+			{
+				name: "task-selection",
+				source: `import { TaskSelectionError } from ${JSON.stringify(runnerUrl)}; throw new TaskSelectionError("9.9", "external-blocked:private-canary");`,
+				diagnosticCode: "task_selection_failed",
+				errorKind: "task_selection_failed",
+				failurePhase: "task_selection",
+				action: "repair_contract",
+				direction: "repair_input",
+			},
+			{
+				name: "queue-preflight",
+				source: `import { QueuePreflightError } from ${JSON.stringify(runnerUrl)}; throw new QueuePreflightError("/private/canary raw provider output");`,
+				diagnosticCode: "environment_incomplete",
+				errorKind: "environment_incomplete",
+				failurePhase: "queue_preflight",
+				action: "repair_contract",
+				direction: "repair_input",
+			},
+			{
+				name: "project-lock",
+				source: `import { LockError } from ${JSON.stringify(runStoreUrl)}; throw new LockError("/private/canary lock detail", { code: "PROJECT_LOCK_OWNERSHIP_FAILED" });`,
+				diagnosticCode: "project_lock_ownership_failed",
+				errorKind: "project_lock_failed",
+				failurePhase: "project_lock",
+				action: "stop",
+				direction: "retry_launch",
+			},
+		];
+
+		for (const testCase of cases) {
+			const { initializeRun, readEvents, readRun } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			const runId = randomUUID();
+			const nonce = randomUUID();
+			const loaderPath = join(dir, `${testCase.name}-loader.mjs`);
+			writeFileSync(
+				loaderPath,
+				`export async function load(url, context, nextLoad) {
+					if (url.endsWith("/src/switchyard/runner/index.mjs")) {
+						return { format: "module", shortCircuit: true, source: ${JSON.stringify(testCase.source)} };
+					}
+					return nextLoad(url, context);
+				}`,
+				"utf8",
+			);
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: nonce,
+				launchArgs: [],
+			});
+
+			const result = runBootstrap(
+				["--state-root", stateRoot, "--run-id", runId, "--nonce", nonce],
+				{
+					...makeStateRootEnv(),
+					NODE_OPTIONS: `--experimental-loader=${loaderPath}`,
+				},
+			);
+			strictEqual(result.status, 1, `${testCase.name}: ${result.stderr}`);
+			const event = (await readEvents(runId)).find(
+				(entry) => entry.event === "worker_boot_failed",
+			);
+			ok(event, `${testCase.name}: terminal event missing`);
+			const run = await readRun(runId);
+			for (const evidence of [event, run.lastFailure]) {
+				strictEqual(evidence.diagnosticCode, testCase.diagnosticCode);
+				strictEqual(evidence.errorKind, testCase.errorKind);
+				strictEqual(evidence.failurePhase, testCase.failurePhase);
+				strictEqual(evidence.reasonCode, testCase.errorKind);
+				const durable = JSON.stringify(evidence);
+				ok(!durable.includes("9.9"));
+				ok(!durable.includes("private-canary"));
+				ok(!durable.includes("/private/canary"));
+				ok(!durable.includes("raw provider output"));
+			}
+			const disposition = projectDisposition({
+				run,
+				liveness: "terminal_clean",
+				optionalEvidenceValid: false,
+			});
+			strictEqual(disposition.action, testCase.action);
+			strictEqual(disposition.direction, testCase.direction);
+			strictEqual(disposition.reasonCode, testCase.diagnosticCode);
 		}
 	});
 });
@@ -2139,6 +2246,13 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 		);
 		strictEqual(run.lastFailure.failurePhase, "worker_boot");
 		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
+		const disposition = projectDisposition({
+			run,
+			liveness: "terminal_clean",
+			optionalEvidenceValid: false,
+		});
+		strictEqual(disposition.action, "repair_contract");
+		strictEqual(disposition.reasonCode, "checkpoint_run_options_mismatch");
 	});
 
 	it("five checkpoint identity regressions emit distinct static codes on the worker-fatal path", async () => {

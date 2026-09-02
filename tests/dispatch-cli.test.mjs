@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-
+import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 
@@ -88,8 +88,10 @@ function exactFailureEvidence(targetId, harness, model, taskId = "1.1") {
 import {
 	captureHostFingerprint,
 	runDispatch as dispatchRun,
+	formatRunAbort,
 	handleLaunch,
 	handleRecover,
+	handleRun,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseLaunchArgs,
@@ -105,7 +107,12 @@ import {
 	USAGE_RUN,
 	USAGE_STATUS,
 } from "../src/switchyard/dispatch/index.mjs";
-import { runQueue } from "../src/switchyard/runner/index.mjs";
+import { LockError } from "../src/switchyard/run-store/index.mjs";
+import {
+	QueuePreflightError,
+	runQueue,
+	TaskSelectionError,
+} from "../src/switchyard/runner/index.mjs";
 
 function runDispatch(args, env = {}, timeout = 10_000) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
@@ -137,6 +144,29 @@ async function captureLaunchJson(args, dependencies = {}) {
 		`expected one stdout object, got ${output.length}`,
 	);
 	return { envelope: JSON.parse(output[0]), errors };
+}
+
+async function captureRunJson(args, dependencies = {}) {
+	const output = [];
+	const errors = [];
+	const originalLog = console.log;
+	const originalError = console.error;
+	const originalExitCode = process.exitCode;
+	console.log = (line) => output.push(String(line));
+	console.error = (line) => errors.push(String(line));
+	try {
+		await handleRun(args, dependencies);
+	} finally {
+		console.log = originalLog;
+		console.error = originalError;
+		process.exitCode = originalExitCode;
+	}
+	strictEqual(
+		output.length,
+		1,
+		`expected one stdout object, got ${output.length}`,
+	);
+	return { envelope: JSON.parse(output[0]), errors, output };
 }
 
 let dir;
@@ -197,6 +227,13 @@ describe("parseDispatchArgs (backwards compat)", () => {
 				"macos",
 			]).platform,
 			"macos",
+		);
+	});
+
+	it("accepts --json for synchronous run", () => {
+		strictEqual(
+			parseDispatchArgs([tasksFile, "--project", projectDir, "--json"]).json,
+			true,
 		);
 	});
 
@@ -706,36 +743,34 @@ describe("launch integration", () => {
 	});
 
 	for (const fixture of [
-		{
-			name: "lock-live",
-			holderLiveness: "live",
-			action: "defer",
-			reasonCode: "project_lock_owner_live",
-		},
-		{
-			name: "lock-dead",
-			holderLiveness: "dead",
-			action: "recover",
-			reasonCode: "project_lock_owner_dead",
-		},
-		{
-			name: "lock-unresolved",
-			holderLiveness: "unknown",
-			action: "stop",
-			reasonCode: "project_lock_ownership_unresolved",
-		},
+		{ name: "lock-live", holderLiveness: "live" },
+		{ name: "lock-startup-grace", holderLiveness: "startup_grace" },
+		{ name: "lock-cleanup-failed", holderLiveness: "cleanup_failed" },
+		{ name: "lock-malformed", holderLiveness: "malformed" },
+		{ name: "lock-foreign", holderLiveness: "foreign" },
+		{ name: "lock-missing", holderLiveness: "missing" },
+		{ name: "lock-ambiguous", holderLiveness: "unknown" },
+		{ name: "lock-dead", holderLiveness: "dead" },
 	]) {
-		it(`launch --json ${fixture.name} fixture emits one durable object`, async () => {
+		it(`launch --json ${fixture.name} fixture emits a terminal retry-launch object`, async () => {
 			const { LockError } = await import(
 				"../src/switchyard/run-store/index.mjs"
 			);
 			const holderRunId = `${fixture.name}-${randomUUID()}`;
+			const lockCalls = [];
 			const { envelope } = await captureLaunchJson(
 				[tasksFile, "--project", projectDir, "--json"],
 				{
-					releaseOrphanedProjectLocks: async () => [],
-					reconcileProjectLockClaims: async () => [],
+					releaseOrphanedProjectLocks: async () => {
+						lockCalls.push("pre-acquisition-orphan-sweep");
+						return [];
+					},
+					reconcileProjectLockClaims: async () => {
+						lockCalls.push("pre-acquisition-claim-sweep");
+						return [];
+					},
 					acquireProjectLock: async () => {
+						lockCalls.push("contention");
 						throw new LockError("closed fixture", {
 							code: "PROJECT_LOCK_HELD",
 							holderRunId,
@@ -748,15 +783,16 @@ describe("launch integration", () => {
 			ok(typeof envelope.runId === "string");
 			ok(envelope.statusCommand.includes(envelope.runId));
 			ok(envelope.resultCommand.includes(envelope.runId));
-			strictEqual(envelope.disposition.action, fixture.action);
-			strictEqual(envelope.disposition.reasonCode, fixture.reasonCode);
-			if (fixture.action === "defer") {
-				strictEqual(envelope.disposition.blockingRunId, holderRunId);
-			}
-			if (fixture.action === "recover") {
-				ok(envelope.disposition.recoveryCommand.includes(holderRunId));
-				ok(envelope.disposition.recoveryCommand.includes("--state-root"));
-			}
+			strictEqual(envelope.disposition.action, "stop");
+			strictEqual(envelope.disposition.direction, "retry_launch");
+			strictEqual(envelope.disposition.reasonCode, "project_lock_held");
+			strictEqual(envelope.disposition.blockingRunId, null);
+			strictEqual(envelope.disposition.recoveryCommand, null);
+			deepStrictEqual(lockCalls, [
+				"pre-acquisition-orphan-sweep",
+				"pre-acquisition-claim-sweep",
+				"contention",
+			]);
 		});
 	}
 
@@ -1006,6 +1042,121 @@ describe("launch integration", () => {
 		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
 		const run = await readRun(runId);
 		strictEqual(run.stopOnFailure, false);
+	});
+});
+
+describe("synchronous run JSON envelope", () => {
+	function noVmDependencies(overrides = {}) {
+		return {
+			assertGenerationAllowed: () => {},
+			releaseOrphanedProjectLocks: async () => [],
+			reconcileProjectLockClaims: async () => [],
+			executionBackend: {
+				listManaged: () => [],
+				reclaim: () => ({
+					reclaimed: [],
+					errors: [],
+					skippedSnapshots: [],
+				}),
+			},
+			...overrides,
+		};
+	}
+
+	it("emits one result-compatible success envelope with an empty stderr", async () => {
+		const { envelope, errors, output } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				runQueue: async () => ({
+					totalTasks: 1,
+					runnableTasks: 1,
+					processedTasks: 1,
+					completedTaskIds: ["1.1"],
+					results: [{ taskId: "1.1", success: true, result: "success" }],
+					checkpointPath: join(dir, "success.checkpoint.json"),
+				}),
+			}),
+		);
+		strictEqual(output.length, 1);
+		deepStrictEqual(errors, []);
+		ok(typeof envelope.runId === "string");
+		strictEqual(envelope.state, "succeeded");
+		strictEqual(envelope.cleanupState, "complete");
+		strictEqual(envelope.disposition.action, "complete");
+		strictEqual(envelope.disposition.direction, "complete");
+	});
+
+	it("emits one closed failure envelope without raw exception text", async () => {
+		const canary = "SECRET_CANARY_sync_json_raw_error";
+		const { envelope, errors, output } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				runQueue: async () => {
+					throw new TaskSelectionError("9.9", canary);
+				},
+			}),
+		);
+		const serialized = JSON.stringify(envelope);
+		strictEqual(output.length, 1);
+		deepStrictEqual(errors, []);
+		ok(!serialized.includes(canary));
+		ok(!serialized.includes("9.9"));
+		ok(typeof envelope.runId === "string");
+		strictEqual(envelope.state, "failed");
+		strictEqual(envelope.disposition.action, "repair_contract");
+		strictEqual(envelope.disposition.direction, "repair_input");
+		strictEqual(envelope.disposition.reasonCode, "task_selection_failed");
+	});
+
+	it("emits a null-address pre-initialization contract envelope", async () => {
+		const { envelope, errors } = await captureRunJson(["--json"]);
+		deepStrictEqual(errors, []);
+		strictEqual(envelope.runId, null);
+		strictEqual(envelope.stateRoot, null);
+		strictEqual(envelope.statusCommand, null);
+		strictEqual(envelope.resultCommand, null);
+		strictEqual(envelope.disposition.action, "repair_contract");
+		strictEqual(envelope.disposition.direction, "repair_input");
+		strictEqual(envelope.disposition.reasonCode, "invalid_invocation");
+	});
+
+	it("maps an empty parsed queue before initialization without creating a run", async () => {
+		const emptyTasksFile = join(dir, "empty-run-json.md");
+		writeFileSync(emptyTasksFile, "# no task headings\n", "utf8");
+		const { envelope, errors } = await captureRunJson(
+			[emptyTasksFile, "--project", projectDir, "--json"],
+			noVmDependencies(),
+		);
+		deepStrictEqual(errors, []);
+		strictEqual(envelope.runId, null);
+		strictEqual(envelope.disposition.reasonCode, "queue_empty");
+		strictEqual(envelope.disposition.direction, "repair_input");
+	});
+
+	it("binds a durable default failure message to its run ID", async () => {
+		const canary = "closed-default-failure";
+		const originalError = console.error;
+		console.error = () => {};
+		try {
+			await rejects(
+				handleRun(
+					[tasksFile, "--project", projectDir],
+					noVmDependencies({
+						runQueue: async () => {
+							throw new TaskSelectionError("9.9", canary);
+						},
+					}),
+				),
+				(error) => {
+					ok(typeof error.switchyardRunId === "string");
+					const message = formatRunAbort(error);
+					ok(message.includes(`run ${error.switchyardRunId}`));
+					return true;
+				},
+			);
+		} finally {
+			console.error = originalError;
+		}
 	});
 });
 
@@ -2774,6 +2925,85 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		);
 		return readRun(runDirs[0]);
 	}
+
+	async function dispatchThrownFailure(error) {
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const runsRoot = join(stateRoot, "runs");
+		const before = new Set(existsSync(runsRoot) ? readdirSync(runsRoot) : []);
+		const savedExitCode = process.exitCode;
+		try {
+			await rejects(
+				dispatchRun(parseDispatchArgs([tasksFile, "--project", projectDir]), {
+					runQueue: () => {
+						throw error;
+					},
+				}),
+				error,
+			);
+		} finally {
+			process.exitCode = savedExitCode;
+		}
+		const runId = readdirSync(runsRoot).find(
+			(candidate) => !before.has(candidate),
+		);
+		ok(runId, "typed synchronous failure must leave a new durable run");
+		return readRun(runId);
+	}
+
+	it("preserves exported pre-provider triples through synchronous finalization", async () => {
+		const cases = [
+			{
+				error: new TaskSelectionError("9.9", "dependency-blocked:1.1"),
+				diagnosticCode: "task_selection_failed",
+				errorKind: "task_selection_failed",
+				failurePhase: "task_selection",
+				action: "repair_contract",
+			},
+			{
+				error: new QueuePreflightError(
+					"preflight failed at /private/canary with raw provider output",
+				),
+				diagnosticCode: "environment_incomplete",
+				errorKind: "environment_incomplete",
+				failurePhase: "queue_preflight",
+				action: "repair_contract",
+			},
+			...[
+				"PROJECT_LOCK_HELD",
+				"PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+				"PROJECT_LOCK_OWNERSHIP_FAILED",
+				"PROJECT_LOCK_OWNERSHIP_DISPLACED",
+				"PROJECT_LOCK_CLAIM_CLEANUP_FAILED",
+				"PROJECT_LOCK_RECOVERY_CLAIM_BLOCKS_EXECUTION",
+			].map((code) => ({
+				error: new LockError("private lock detail /private/canary", { code }),
+				diagnosticCode: code.toLowerCase(),
+				errorKind: "project_lock_failed",
+				failurePhase: "project_lock",
+				action: "stop",
+			})),
+		];
+
+		for (const testCase of cases) {
+			const run = await dispatchThrownFailure(testCase.error);
+			strictEqual(run.lastFailure.diagnosticCode, testCase.diagnosticCode);
+			strictEqual(run.lastFailure.errorKind, testCase.errorKind);
+			strictEqual(run.lastFailure.failurePhase, testCase.failurePhase);
+			strictEqual(run.lastFailure.reasonCode, testCase.errorKind);
+			const durable = JSON.stringify(run.lastFailure);
+			ok(!durable.includes("9.9"));
+			ok(!durable.includes("1.1"));
+			ok(!durable.includes("/private/canary"));
+			ok(!durable.includes("raw provider output"));
+			const disposition = projectDisposition({
+				run,
+				liveness: "terminal_clean",
+				optionalEvidenceValid: false,
+			});
+			strictEqual(disposition.action, testCase.action);
+			strictEqual(disposition.reasonCode, testCase.diagnosticCode);
+		}
+	});
 
 	it("releases the project lock after a successful synchronous run", async () => {
 		const { isProjectLockHeld } = await import(

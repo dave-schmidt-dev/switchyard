@@ -9,11 +9,11 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	CLEANUP_STAGES,
+	classifyPreProviderFailure,
 	isPersistentFailureMetadata,
 	PERSISTED_SIGNALS,
 	prlctlFailureMetadata,
 	sanitizeFailureMetadata,
-	workerBootStageDiagnosticCode,
 } from "../adapter/exec-error.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
@@ -132,16 +132,17 @@ export function buildFatalFailure(
 	diagnosticCode = "worker_boot_exception",
 ) {
 	const prlctlFailure = prlctlFailureMetadata(error);
-	const closedCode = isRecognizedCheckpointIdentityError(error)
-		? error.code
-		: (prlctlFailure?.diagnosticCode ??
-			workerBootStageDiagnosticCode(error) ??
-			diagnosticCode);
+	const classified = classifyPreProviderFailure(error) ?? {
+		diagnosticCode,
+		errorKind: "launch_failed",
+		failurePhase: "worker_boot",
+	};
+	const closedCode = classified.diagnosticCode;
 	return sanitizeFailureMetadata({
 		result: "launch_failed",
-		errorKind: "launch_failed",
+		errorKind: classified.errorKind,
 		diagnosticCode: closedCode,
-		failurePhase: "worker_boot",
+		failurePhase: classified.failurePhase,
 		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
 			? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
 			: {}),

@@ -1,5 +1,6 @@
 import {
 	isPersistentFailureMetadata,
+	PERSISTED_DIAGNOSTIC_CODES,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
 import * as defaultRunStore from "../run-store/index.mjs";
@@ -90,7 +91,8 @@ export async function finalizeRun(options, dependencies = {}) {
 	if (
 		eventReasonCode &&
 		eventReasonCode !== failure?.reasonCode &&
-		!Object.hasOwn(CLOSED_EVENT_REASONS, eventReasonCode)
+		!Object.hasOwn(CLOSED_EVENT_REASONS, eventReasonCode) &&
+		!PERSISTED_DIAGNOSTIC_CODES.includes(eventReasonCode)
 	) {
 		throw new TypeError("finalizeRun requires a closed event reason code");
 	}

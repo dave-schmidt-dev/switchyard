@@ -1,6 +1,7 @@
 import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
+	classifyPreProviderFailure,
 	classifyProviderDiagnostic,
 	cleanupDiagnosticCodeFor,
 	describeExecError,
@@ -8,9 +9,51 @@ import {
 	isPersistentFailureMetadata,
 	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
+	PRE_PROVIDER_FAILURE_TRIPLES,
 	reauthHintFor,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
+
+describe("closed pre-provider failure triples", () => {
+	it("enumerates only triples that round-trip through the persistence boundary", () => {
+		for (const triple of PRE_PROVIDER_FAILURE_TRIPLES) {
+			const failure = sanitizeFailureMetadata({
+				result: "launch_failed",
+				...triple,
+			});
+			strictEqual(failure.diagnosticCode, triple.diagnosticCode);
+			strictEqual(failure.errorKind, triple.errorKind);
+			strictEqual(failure.failurePhase, triple.failurePhase);
+			ok(isPersistentFailureMetadata(failure));
+		}
+	});
+
+	it("classifies fixed categories without retaining task ids, blockers, paths, or messages", () => {
+		const dynamic = new Error("dependency-blocked:9.9 /private/secret prompt");
+		dynamic.name = "TaskSelectionError";
+		dynamic.code = "dependency-blocked:9.9";
+		deepStrictEqual(classifyPreProviderFailure(dynamic), {
+			diagnosticCode: "task_selection_failed",
+			errorKind: "task_selection_failed",
+			failurePhase: "task_selection",
+		});
+		const persisted = JSON.stringify(
+			sanitizeFailureMetadata({
+				result: "launch_failed",
+				...classifyPreProviderFailure(dynamic),
+			}),
+		);
+		ok(!persisted.includes("9.9"));
+		ok(!persisted.includes("/private/secret"));
+		ok(!persisted.includes("prompt"));
+
+		const arbitrary = Object.assign(new Error("/private/canary"), {
+			name: "CheckpointIdentityError",
+			code: "checkpoint_arbitrary_canary",
+		});
+		strictEqual(classifyPreProviderFailure(arbitrary), null);
+	});
+});
 
 // Build a thrown-error stand-in shaped like the object execFileSync attaches on
 // a non-zero exit: a generic `.message` wrapper plus the captured `.stdout` /

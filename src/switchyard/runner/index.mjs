@@ -5559,6 +5559,13 @@ function formatQueuePreflightFailure(result) {
 	return `macOS queue provider preflight failed: ${details.join("; ") || result.reason}`;
 }
 
+export class QueuePreflightError extends Error {
+	constructor(message) {
+		super(message);
+		this.name = "QueuePreflightError";
+	}
+}
+
 function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
 	if (selectedPlatform !== "macos") return () => ({ ok: true, eligible: true });
 
@@ -5578,7 +5585,8 @@ function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
 				? { readSnapshot: dependencies.preflightReadSnapshot }
 				: {}),
 		});
-		if (!result.ok) throw new Error(formatQueuePreflightFailure(result));
+		if (!result.ok)
+			throw new QueuePreflightError(formatQueuePreflightFailure(result));
 		return result;
 	};
 }

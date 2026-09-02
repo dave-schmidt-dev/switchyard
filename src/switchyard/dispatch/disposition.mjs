@@ -17,11 +17,21 @@ const CONTRACT_DIAGNOSTICS = new Set([
 	"checkpoint_run_options_mismatch",
 	"checkpoint_historical_checkpoint",
 	"checkpoint_historical_state",
+	"task_selection_failed",
+	"environment_incomplete",
 ]);
 const PRE_INITIALIZATION_CONTRACT_CODES = new Set([
 	"invalid_invocation",
 	"queue_empty",
 	"queue_identity_invalid",
+	"task_selection_failed",
+	"environment_incomplete",
+	"project_lock_held",
+	"project_lock_recovery_in_progress",
+	"project_lock_ownership_failed",
+	"project_lock_ownership_displaced",
+	"project_lock_claim_cleanup_failed",
+	"project_lock_recovery_claim_blocks_execution",
 ]);
 const RUN_ID_RE = /^[\w-]+$/;
 const TASK_ID_RE = /^\d+(?:\.\d+)*$/;
@@ -54,13 +64,84 @@ const TARGET_FAILURE_KINDS = new Set([
 	"symlink_creation_refused",
 	"executable_file_refused",
 ]);
+const ADVANCE_FALLBACK_FAILURE_CODES = new Set([
+	"quota_exhausted",
+	"model_unavailable",
+	"execution_failed",
+	"cli_usage_error",
+	"provider_exit_nonzero",
+	"provider_signalled",
+	"provider_output_unclassified",
+	"execution_timed_out",
+	"execution_cancelled",
+	"provider_cleanup_failed",
+	"provider_cleanup_after_cleanup_started",
+	"provider_cleanup_after_pid_observed",
+	"provider_cleanup_after_tree_terminated",
+	"provider_cleanup_after_pid_marker_removed",
+	"provider_cleanup_after_index_lock_removed",
+	"diff_capture_failed",
+]);
+const REPAIR_INPUT_FAILURE_CODES = new Set([
+	"declared_path_not_seeded",
+	"required_paths_missing",
+	"undeclared_paths_touched",
+	"empty_required_diff",
+	"no_op_diff",
+	"manifest_review_required",
+	"corrupt_patch",
+	"conflict",
+	"empty_diff",
+]);
+const TERMINAL_LOCK_DIAGNOSTICS = new Set([
+	"project_lock_held",
+	"project_lock_recovery_in_progress",
+	"project_lock_ownership_failed",
+	"project_lock_ownership_displaced",
+	"project_lock_claim_cleanup_failed",
+	"project_lock_recovery_claim_blocks_execution",
+]);
+const PRE_PROVIDER_STOP_DIAGNOSTICS = new Set([
+	...TERMINAL_LOCK_DIAGNOSTICS,
+	"prlctl_job_misfire",
+	"prlctl_session_not_ready",
+	"prlctl_call_timed_out",
+	"prlctl_call_failed",
+]);
 
 function baseDisposition(action, reasonCode, failure = null) {
+	const diagnosticCode = failure?.diagnosticCode ?? null;
+	let direction = "stop";
+	if (action === "complete") {
+		direction = "complete";
+	} else if (action === "monitor" || action === "defer") {
+		direction = "wait";
+	} else if (action === "recover") {
+		direction = "recover_and_retry";
+	} else if (action === "repair_contract") {
+		direction = "repair_input";
+	} else if (
+		action === "stop" &&
+		diagnosticCode === reasonCode &&
+		TERMINAL_LOCK_DIAGNOSTICS.has(diagnosticCode)
+	) {
+		// A terminal record carries no fresh holder classification. Direct the
+		// caller through normal launch preflight without acting on stored identity.
+		direction = "retry_launch";
+	} else if (action === "target_failed") {
+		const closedFailureCode = diagnosticCode ?? reasonCode;
+		if (ADVANCE_FALLBACK_FAILURE_CODES.has(closedFailureCode)) {
+			direction = "advance_authorized_fallback";
+		} else if (REPAIR_INPUT_FAILURE_CODES.has(closedFailureCode)) {
+			direction = "repair_input";
+		}
+	}
 	return {
 		version: 1,
 		action,
+		direction,
 		reasonCode,
-		diagnosticCode: failure?.diagnosticCode ?? null,
+		diagnosticCode,
 		taskId: null,
 		blockingRunId: null,
 		recoveryCommand: null,
@@ -275,6 +356,9 @@ export function projectDisposition({
 				failure.diagnosticCode ?? failure.reasonCode,
 				failure,
 			);
+		}
+		if (PRE_PROVIDER_STOP_DIAGNOSTICS.has(failure?.diagnosticCode)) {
+			return baseDisposition("stop", failure.diagnosticCode, failure);
 		}
 		if (!optionalEvidenceValid || !failure) {
 			return baseDisposition("stop", "insufficient_evidence", failure);
