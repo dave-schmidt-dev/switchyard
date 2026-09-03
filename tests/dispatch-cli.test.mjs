@@ -599,7 +599,7 @@ describe("CLI exit codes via process spawn", () => {
 		const packageVersion = JSON.parse(
 			readFileSync(resolve(__dirname, "..", "package.json"), "utf8"),
 		).version;
-		strictEqual(packageVersion, "0.2.0");
+		strictEqual(packageVersion, "0.2.1");
 		const result = spawnSync(process.execPath, [DISPATCH_PATH, "--version"], {
 			cwd: dir,
 			encoding: "utf8",
