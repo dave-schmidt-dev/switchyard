@@ -122,20 +122,29 @@ function cwdDerivedProjectLockFileName(canonicalProjectPath) {
 // isWorkerLive: a third independent copy of the same signal-0 kill(2)
 // probe. See run-store's comment on releaseOrphanedProjectLocks for why
 // these live as separate module-private copies rather than a shared export.
-function isWorkerLive(run) {
-	if (run.workerPid == null) return false;
+function isPidProvenDead(pid, probePid) {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	if (probePid) {
+		try {
+			return probePid(pid) === "dead";
+		} catch {
+			return false;
+		}
+	}
 	try {
-		process.kill(run.workerPid, 0);
-		return true;
+		process.kill(pid, 0);
+		return false;
 	} catch (e) {
-		// ESRCH => no such process; EPERM => process exists but is not ours.
-		return e.code === "EPERM";
+		// Only ESRCH proves absence. Permission and unknown probe failures retain
+		// the recovery evidence conservatively.
+		return e.code === "ESRCH";
 	}
 }
 
-function isRunStale(run) {
+function isRunStale(run, options = {}) {
 	const terminal = run.state === "succeeded" || run.state === "failed";
-	return terminal || !isWorkerLive(run);
+	const liveness = classifyRunLiveness(run, options);
+	return terminal || liveness === "dead";
 }
 
 function isCleanupFailedDeadWorker(run, options = {}) {
@@ -170,11 +179,57 @@ function recoveryClaimDescriptor(entry, claimPath, overrides) {
 }
 
 function recoveryClaimLockName(entry) {
-	return entry.name.slice(0, -".recovery-claim".length);
+	const originalName =
+		recoveryProofMetadata(entry.name)?.originalName ?? entry.name;
+	return originalName.endsWith(".lock.recovery-claim")
+		? originalName.slice(0, -".recovery-claim".length)
+		: originalName;
 }
 
-function isTerminalOrDead(run) {
-	const liveness = classifyRunLiveness(run);
+const RECOVERY_PROOF_SUFFIX =
+	/^([0-9a-f]{64}\.lock(?:\.recovery-claim)?)\.([1-9]\d*)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.lock\.recovery-claim$/;
+
+function recoveryProofMetadata(name) {
+	const match = RECOVERY_PROOF_SUFFIX.exec(name);
+	if (!match) return null;
+	const ownerPid = Number(match[2]);
+	return Number.isSafeInteger(ownerPid)
+		? { originalName: match[1], ownerPid }
+		: null;
+}
+
+async function bindLegacyRecoveryOwner(body, claimBaseName, readRunFn) {
+	if (
+		body === null ||
+		typeof body !== "object" ||
+		Array.isArray(body) ||
+		typeof body.runId !== "string" ||
+		body.runId.length === 0
+	) {
+		return null;
+	}
+	if (typeof body.projectPath === "string" && body.projectPath.length > 0) {
+		return body;
+	}
+	if (Object.hasOwn(body, "projectPath")) return null;
+	try {
+		const run = await readRunFn(body.runId);
+		if (typeof run.projectPath !== "string") return null;
+		const projectPath = resolve(run.projectPath);
+		if (
+			projectLockFileName(projectPath) !== claimBaseName &&
+			cwdDerivedProjectLockFileName(projectPath) !== claimBaseName
+		) {
+			return null;
+		}
+		return { ...body, projectPath };
+	} catch {
+		return null;
+	}
+}
+
+function isTerminalOrDead(run, options = {}) {
+	const liveness = classifyRunLiveness(run, options);
 	return liveness === "terminal_clean" || liveness === "dead";
 }
 
@@ -194,6 +249,10 @@ export async function resolveCandidates(dependencies = {}) {
 	const readRunFn = dependencies.readRun ?? readRun;
 	const dir = dependencies.locksDir ?? locksDir();
 	const now = dependencies.now ?? Date.now();
+	const livenessOptions = {
+		now,
+		...(dependencies.probePid ? { probePid: dependencies.probePid } : {}),
+	};
 
 	let entries;
 	try {
@@ -242,11 +301,25 @@ export async function resolveCandidates(dependencies = {}) {
 		}
 
 		if (isRecoveryClaim) {
+			const proof = recoveryProofMetadata(entry.name);
+			if (proof && !isPidProvenDead(proof.ownerPid, dependencies.probePid)) {
+				descriptors.push(
+					recoveryClaimDescriptor(entry, lockPath, {
+						category: "recovery-claim-proof-live",
+						reason:
+							"recovery proof owner is still live — retain as active recovery evidence",
+					}),
+				);
+				continue;
+			}
 			const claimBaseName = recoveryClaimLockName(entry);
 			const reservation =
 				body?.claimState === "reservation" && body?.expectedRaw !== undefined
 					? body
 					: null;
+			if (reservation === null) {
+				body = await bindLegacyRecoveryOwner(body, claimBaseName, readRunFn);
+			}
 			if (
 				reservation === null &&
 				(body === null ||
@@ -265,7 +338,7 @@ export async function resolveCandidates(dependencies = {}) {
 			}
 
 			if (reservation !== null) {
-				const expectedBody =
+				let expectedBody =
 					typeof reservation.expectedRaw === "string"
 						? (() => {
 								try {
@@ -280,6 +353,11 @@ export async function resolveCandidates(dependencies = {}) {
 								}
 							})()
 						: null;
+				expectedBody = await bindLegacyRecoveryOwner(
+					expectedBody,
+					claimBaseName,
+					readRunFn,
+				);
 				if (
 					reservation.claimState !== "reservation" ||
 					typeof reservation.expectedRaw !== "string" ||
@@ -321,11 +399,22 @@ export async function resolveCandidates(dependencies = {}) {
 				} catch {
 					// Missing or unreadable corresponding evidence is not removable.
 				}
-				const bound = correspondingLockRaw === reservation.expectedRaw;
+				const bound =
+					proof !== null || correspondingLockRaw === reservation.expectedRaw;
 				const runProjectMatches =
 					typeof run?.projectPath === "string" &&
 					resolve(run.projectPath) === resolve(expectedBody.projectPath);
-				const stale = runProjectMatches && isTerminalOrDead(run);
+				const cleanupFailed = run?.cleanupState === "failed";
+				const stale =
+					runProjectMatches &&
+					(cleanupFailed
+						? isCleanupFailedDeadWorker(run, {
+								now,
+								...(dependencies.probePid
+									? { probePid: dependencies.probePid }
+									: {}),
+							})
+						: isTerminalOrDead(run, livenessOptions));
 				descriptors.push(
 					recoveryClaimDescriptor(entry, lockPath, {
 						claimState: "reservation",
@@ -336,6 +425,8 @@ export async function resolveCandidates(dependencies = {}) {
 								? "recovery-claim-reservation-stale"
 								: "recovery-claim-reservation-blocked",
 						isCandidate: bound && stale,
+						requiresInteractiveConfirmation: cleanupFailed && bound && stale,
+						requiresDeadWorkerRecheck: cleanupFailed && bound && stale,
 						reason:
 							bound && stale
 								? "reservation is byte-bound to the canonical lock and its run is terminal/dead — ownership-safe remediation may reconcile it"
@@ -351,27 +442,20 @@ export async function resolveCandidates(dependencies = {}) {
 			} catch {
 				run = null;
 			}
-			let replacementCanonical = null;
-			try {
-				replacementCanonical = JSON.parse(
-					await readFile(
-						resolve(dir, projectLockFileName(body.projectPath)),
-						"utf8",
-					),
-				);
-			} catch {
-				// A missing or malformed canonical lock cannot prove displacement.
-			}
 			const runProjectMatches =
 				typeof run?.projectPath === "string" &&
 				resolve(run.projectPath) === resolve(body.projectPath);
+			const cleanupFailed = run?.cleanupState === "failed";
 			const stale =
 				runProjectMatches &&
-				(run.cleanupState === "failed"
-					? replacementCanonical?.runId !== undefined &&
-						replacementCanonical.runId !== body.runId &&
-						replacementCanonical.projectPath === body.projectPath
-					: isTerminalOrDead(run));
+				(cleanupFailed
+					? isCleanupFailedDeadWorker(run, {
+							now,
+							...(dependencies.probePid
+								? { probePid: dependencies.probePid }
+								: {}),
+						})
+					: isTerminalOrDead(run, livenessOptions));
 			descriptors.push(
 				recoveryClaimDescriptor(entry, lockPath, {
 					runId: body.runId,
@@ -380,6 +464,8 @@ export async function resolveCandidates(dependencies = {}) {
 						? "recovery-claim-stale"
 						: "recovery-claim-live-or-indeterminate",
 					isCandidate: stale,
+					requiresInteractiveConfirmation: cleanupFailed && stale,
+					requiresDeadWorkerRecheck: cleanupFailed && stale,
 					reason: stale
 						? "recovery claim is bound to its project lock and its run is terminal/dead — ownership-safe remediation may reconcile it"
 						: "recovery claim run is live, missing, or indeterminate — retain as manual evidence",
@@ -448,6 +534,13 @@ export async function resolveCandidates(dependencies = {}) {
 						projectPath: body.projectPath,
 						category: "run-missing",
 						isCandidate: true,
+						remediationKind:
+							cwdDerivedName === entry.name
+								? "cwd-derived-project-lock"
+								: canonicalName === entry.name
+									? "project-lock"
+									: "historical-project-lock",
+						requiresInteractiveConfirmation: true,
 						reason:
 							"projectPath known from lock body; run.json no longer exists — cannot verify liveness independently, human judgment required",
 					}),
@@ -465,7 +558,7 @@ export async function resolveCandidates(dependencies = {}) {
 							? { probePid: dependencies.probePid }
 							: {}),
 					})
-				: isRunStale(run);
+				: isRunStale(run, livenessOptions);
 			descriptors.push(
 				baseDescriptor(entry, lockPath, {
 					ageMs,
@@ -487,6 +580,11 @@ export async function resolveCandidates(dependencies = {}) {
 							: "project-lock",
 					requiresInteractiveConfirmation: cleanupFailed && stale,
 					requiresDeadWorkerRecheck: cleanupFailed && stale,
+					requiresLivenessRecheck:
+						!cleanupFailed &&
+						stale &&
+						run.state !== "succeeded" &&
+						run.state !== "failed",
 					reason: stale
 						? cleanupFailed
 							? `cleanup failed, but the ${cwdDerived ? "cwd-derived" : "canonical"} project lock has a proven dead worker — interactive ownership-safe remediation may remove it`
@@ -544,22 +642,42 @@ export async function resolveCandidates(dependencies = {}) {
 			continue;
 		}
 
-		const stale = isRunStale(run);
+		const cleanupFailed = run.cleanupState === "failed";
+		const stale = cleanupFailed
+			? isCleanupFailedDeadWorker(run, livenessOptions)
+			: isRunStale(run, livenessOptions);
 		descriptors.push(
 			baseDescriptor(entry, lockPath, {
 				ageMs,
 				createdAt,
 				runId: body.runId,
 				projectPath: run.projectPath,
-				category: stale ? "project-lock-stale" : "project-lock-live",
+				category: cleanupFailed
+					? stale
+						? "project-lock-cleanup-failed-dead"
+						: "project-lock-cleanup-failed-retained"
+					: stale
+						? "project-lock-stale"
+						: "project-lock-live",
 				isCandidate: stale,
 				remediationKind:
 					historicalName === entry.name
 						? "cwd-derived-project-lock"
 						: "project-lock",
+				requiresInteractiveConfirmation: cleanupFailed && stale,
+				requiresDeadWorkerRecheck: cleanupFailed && stale,
+				requiresLivenessRecheck:
+					!cleanupFailed &&
+					stale &&
+					run.state !== "succeeded" &&
+					run.state !== "failed",
 				reason: stale
-					? "positively identified as this run's project lock (pre-F.1 body shape) via hash match, and the run is stale"
-					: "positively identified as this run's project lock (pre-F.1 body shape) via hash match, but the run is live — must not be removed",
+					? cleanupFailed
+						? "pre-F.1 project lock belongs to a cleanup-failed run with a proven dead worker — interactive ownership-safe remediation may remove it"
+						: "positively identified as this run's project lock (pre-F.1 body shape) via hash match, and the run is stale"
+					: cleanupFailed
+						? "pre-F.1 cleanup-failed project lock has a live, startup-grace, or indeterminate worker — retain it"
+						: "positively identified as this run's project lock (pre-F.1 body shape) via hash match, but the run is live — must not be removed",
 			}),
 		);
 	}
@@ -681,21 +799,31 @@ export async function run(argv, dependencies = {}) {
 	}
 
 	const removed = [];
+	const removedNames = new Set();
+	const candidateByPath = new Map(
+		candidates.map((candidate) => [resolve(candidate.path), candidate]),
+	);
+	const recordRemovedPath = (path, suffix = "") => {
+		const candidate = candidateByPath.get(resolve(path));
+		if (!candidate || removedNames.has(candidate.name)) return;
+		removedNames.add(candidate.name);
+		removed.push(candidate.name);
+		log(`remediate-orphaned-locks: removed ${candidate.name}${suffix}`);
+	};
 	const claimCandidates = candidates.filter(
 		(candidate) => candidate.remediationKind === "recovery-claim",
-	);
-	const claimExisted = new Map(
-		claimCandidates.map((candidate) => [
-			candidate.name,
-			existsSync(candidate.path),
-		]),
 	);
 	if (claimCandidates.length > 0) {
 		// Reconcile the claim set once. The run-store pass re-checks every
 		// candidate's claim, canonical bytes, and liveness; this avoids a first
 		// claim's reconciliation changing the result accounting for its peers.
 		try {
-			await reconcileFn();
+			await reconcileFn({
+				onRemoved: recordRemovedPath,
+				allowCleanupFailedDead: true,
+				now: dependencies.now ?? Date.now(),
+				...(dependencies.probePid ? { probePid: dependencies.probePid } : {}),
+			});
 		} catch (e) {
 			log(
 				`remediate-orphaned-locks: error reconciling recovery claims: ${e.message}`,
@@ -707,14 +835,51 @@ export async function run(argv, dependencies = {}) {
 			// Reconcile re-read and validated the complete claim set above. It
 			// never accepts the earlier descriptor as authority or unlinks by
 			// filename.
-			if (claimExisted.get(c.name) && !existsSync(c.path)) {
-				removed.push(c.name);
-				log(`remediate-orphaned-locks: removed ${c.name}`);
-			} else {
+			if (removedNames.has(c.name)) continue;
+			if (c.requiresDeadWorkerRecheck) {
+				let currentRun = null;
+				try {
+					currentRun = await (dependencies.readRun ?? readRun)(c.runId);
+				} catch {
+					// Missing recovery evidence is ambiguous, so it is not removable.
+				}
+				if (
+					!isCleanupFailedDeadWorker(currentRun, {
+						now: dependencies.now ?? Date.now(),
+						...(dependencies.probePid
+							? { probePid: dependencies.probePid }
+							: {}),
+					}) ||
+					typeof currentRun?.projectPath !== "string" ||
+					resolve(currentRun.projectPath) !== resolve(c.projectPath)
+				) {
+					log(
+						`remediate-orphaned-locks: skipped ${c.name} — cleanup-failed worker is no longer proven dead`,
+					);
+					continue;
+				}
+				try {
+					await releaseFn(c.projectPath, c.runId, {
+						onRemoved: (path) => recordRemovedPath(path, ` (runId=${c.runId})`),
+					});
+				} catch (e) {
+					log(
+						`remediate-orphaned-locks: error releasing ${c.name}: ${e.message}`,
+					);
+				}
+			}
+			if (!removedNames.has(c.name)) {
 				log(
 					`remediate-orphaned-locks: skipped ${c.name} — claim changed, remains live, or is no longer safely removable`,
 				);
 			}
+			continue;
+		}
+		if (removedNames.has(c.name)) continue;
+		if (!existsSync(c.path)) {
+			log(
+				`remediate-orphaned-locks: skipped ${c.name} — candidate is no longer present`,
+			);
 			continue;
 		}
 		if (c.requiresDeadWorkerRecheck) {
@@ -735,6 +900,24 @@ export async function run(argv, dependencies = {}) {
 				);
 				continue;
 			}
+		} else if (c.requiresLivenessRecheck) {
+			let currentRun = null;
+			try {
+				currentRun = await (dependencies.readRun ?? readRun)(c.runId);
+			} catch {
+				// A missing or unreadable run cannot establish fresh deadness.
+			}
+			if (
+				classifyRunLiveness(currentRun, {
+					now: dependencies.now ?? Date.now(),
+					...(dependencies.probePid ? { probePid: dependencies.probePid } : {}),
+				}) !== "dead"
+			) {
+				log(
+					`remediate-orphaned-locks: skipped ${c.name} — owner is no longer proven dead`,
+				);
+				continue;
+			}
 		}
 		// Ownership-checked at the moment of removal, never a blind unlink by
 		// filename: both release helpers re-read the lock file fresh and only
@@ -746,15 +929,23 @@ export async function run(argv, dependencies = {}) {
 		try {
 			didRelease =
 				c.remediationKind === "cwd-derived-project-lock"
-					? await releaseCwdDerivedFn(c.projectPath, c.runId)
-					: await releaseFn(c.projectPath, c.runId);
+					? await releaseCwdDerivedFn(c.projectPath, c.runId, {
+							onRemoved: (path) =>
+								recordRemovedPath(path, ` (runId=${c.runId})`),
+						})
+					: await releaseFn(c.projectPath, c.runId, {
+							onRemoved: (path) =>
+								recordRemovedPath(path, ` (runId=${c.runId})`),
+						});
 		} catch (e) {
 			log(`remediate-orphaned-locks: error releasing ${c.name}: ${e.message}`);
 		}
-		if (didRelease) {
-			removed.push(c.name);
-			log(`remediate-orphaned-locks: removed ${c.name} (runId=${c.runId})`);
-		} else {
+		if (didRelease && !removedNames.has(c.name) && !existsSync(c.path)) {
+			// Backward-compatible injected release seams may not implement the
+			// optional exact-path callback. Production release paths always do.
+			recordRemovedPath(c.path, ` (runId=${c.runId})`);
+		}
+		if (!removedNames.has(c.name)) {
 			log(
 				`remediate-orphaned-locks: skipped ${c.name} — no longer owned by ${c.runId} (reassigned since resolution, or already released)`,
 			);

@@ -1448,6 +1448,24 @@ describe("project lock", () => {
 		strictEqual(isProjectLockHeld(path), false);
 	});
 
+	it("matches an equivalent trailing-slash project path in a stored lock body", async () => {
+		const path = uniquePath("equivalent-project-path");
+		const runId = uniqueRunId();
+		await acquireProjectLock(path, runId);
+		const lockPath = projectLockFilePath(path);
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				runId,
+				projectPath: `${path}/`,
+				createdAt: new Date().toISOString(),
+			}),
+		);
+
+		strictEqual(await isProjectLockOwnedBy(path, runId), true);
+		strictEqual(await releaseProjectLockIfOwnedBy(path, runId), true);
+	});
+
 	it("blocks and releases a body-validated historical filename", async () => {
 		const projectPath = uniquePath("historical-project");
 		const ownerRunId = uniqueRunId();
@@ -1610,6 +1628,39 @@ describe("project lock", () => {
 		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
 		strictEqual(existsSync(retryableDeadProofPath), false);
 		strictEqual(isProjectLockHeld(opts.projectPath), false);
+	});
+
+	it("uses the injected PID probe to retain a live recovery proof", async () => {
+		const opts = makeOptions({
+			projectPath: uniquePath("injected-live-proof"),
+		});
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		const proofOwnerPid = 99999999;
+		const proofPath = `${claimPath}.${proofOwnerPid}.${randomUUID()}.lock.recovery-claim`;
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(
+			proofPath,
+			JSON.stringify({
+				runId: opts.runId,
+				projectPath: opts.projectPath,
+				createdAt: new Date().toISOString(),
+			}),
+		);
+
+		deepStrictEqual(
+			await reconcileProjectLockClaims({
+				probePid: (pid) => (pid === proofOwnerPid ? "live" : "dead"),
+			}),
+			[],
+		);
+		strictEqual(existsSync(proofPath), true);
 	});
 });
 
@@ -2029,6 +2080,56 @@ describe("project lock recovery claims", () => {
 		}
 	});
 
+	it("retains cleanup-failed reservations during automatic reconciliation", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			(await readRun(opts.runId)).revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const lockPath = projectLockFilePath(opts.projectPath);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeFileSync(
+			claimPath,
+			JSON.stringify({
+				claimState: "reservation",
+				expectedRaw: readFileSync(lockPath, "utf8"),
+			}),
+		);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), []);
+		strictEqual(existsSync(lockPath), true);
+		strictEqual(existsSync(claimPath), true);
+	});
+
+	it("reconciles an unadorned pre-F.1 claim through exact run/path evidence", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const lockPath = projectLockFilePath(opts.projectPath);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				runId: opts.runId,
+				createdAt: new Date().toISOString(),
+			}),
+		);
+		renameSync(lockPath, claimPath);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
+		strictEqual(existsSync(claimPath), false);
+	});
+
 	it("uses closed codes for blocked and missing project ownership", async () => {
 		const missing = makeOptions({
 			projectPath: uniquePath("ownership-missing"),
@@ -2240,6 +2341,51 @@ describe("global VM admission slots", () => {
 			ok(!persisted.includes("HOLDER_CANARY"));
 			ok(!persisted.includes("holder-token"));
 		}
+	});
+
+	it("classifies malformed or empty occupied slot contents as storage failure", () => {
+		for (const contents of [
+			"",
+			"not-json",
+			JSON.stringify({ runId: "missing-owner" }),
+		]) {
+			rmSync(VM_ADMISSION_ROOT, { recursive: true, force: true });
+			mkdirSync(VM_ADMISSION_ROOT, { recursive: true });
+			writeFileSync(join(VM_ADMISSION_ROOT, "vm-slot-0.lock"), contents);
+			try {
+				acquireVmSlot({ runId: "corrupt-slot-challenger" });
+				throw new Error("expected corrupted admission slot to fail");
+			} catch (error) {
+				ok(error instanceof VmAdmissionStorageError);
+				strictEqual(error.code, "VM_ADMISSION_STORAGE_FAILED");
+				strictEqual(
+					classifyPreProviderFailure(error).diagnosticCode,
+					"vm_admission_storage_failed",
+				);
+			}
+		}
+	});
+
+	it("retries a slot that disappears between failed publication and owner read", () => {
+		let publishCalls = 0;
+		let readCalls = 0;
+		const lease = runStoreTesting.acquireVmSlotWithDependencies(
+			{ runId: "slot-release-race" },
+			{
+				publishVmSlot: () => {
+					publishCalls += 1;
+					return publishCalls > 1;
+				},
+				readVmSlotBody: () => {
+					readCalls += 1;
+					throw Object.assign(new Error("slot vanished"), { code: "ENOENT" });
+				},
+			},
+		);
+
+		strictEqual(lease.slotIndex, 0);
+		strictEqual(publishCalls, 2);
+		strictEqual(readCalls, 1);
 	});
 
 	it("does not invoke project-lock orphan reclamation", async () => {

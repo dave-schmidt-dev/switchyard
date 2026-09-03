@@ -693,7 +693,7 @@ Added after a live multi-hour dispatch run produced only one completed task with
 
 #### Lock Remediation
 
-`acquireProjectLock` writes `projectPath` into a project lock's body. Recovery first reconciles recovery claims, then scans every on-disk project lock under the selected state root, while the candidate-run pass remains as a complementary path. Both use the shared `terminal_clean`/`live`/`startup_grace`/`dead`/`unknown` classifier and ownership-checked release; only a parseable lock with a resolvable `projectPath` and an eligible terminal or dead run is auto-reclaimed. Claims are atomically renamed before deletion, revalidated, and never overwrite a replacement lock. Unparseable, missing-projectPath, missing-run, live, startup-grace, unknown, and cleanup-failed records remain for human confirmation.
+`acquireProjectLock` writes `projectPath` into a project lock's body. Recovery first reconciles recovery claims, then scans every on-disk project lock under the selected state root, while the candidate-run pass remains as a complementary path. Both use the shared `terminal_clean`/`live`/`startup_grace`/`dead`/`unknown` classifier and ownership-checked release; only a parseable lock with a resolvable `projectPath` and an eligible terminal or dead run is auto-reclaimed. Claims are atomically renamed before deletion, revalidated, and never overwrite a replacement lock. A pre-`projectPath` claim may recover its project only from a matching run record plus the exact canonical or cwd-derived filename hash. PID-bearing recovery proofs remain protected unless their owner is proven dead. Unparseable, unresolvable missing-projectPath, missing-run, live, startup-grace, unknown, and cleanup-failed records remain for human confirmation.
 
 For the class of project lock orphaned on 2026-07-27 (predating `projectPath`), a separate standalone script handles one-time cleanup with a human in the loop:
 
@@ -702,7 +702,7 @@ node src/switchyard/dispatch/remediate-orphaned-locks.mjs --dry-run   # inspect 
 node src/switchyard/dispatch/remediate-orphaned-locks.mjs             # interactive, confirms before each removal
 ```
 
-It recovers `projectPath` for the pre-`projectPath` lock shape from the run's own record, confirms it by recomputing the lock's expected filename hash against the file on disk, and still enforces the existing ownership-checked `releaseProjectLockIfOwnedBy` at the moment of deletion. This installation's own 6 locks from 2026-07-27 were, as it turned out, already cleared by the time this tool was built — see `HISTORY.md`'s 2026-07-31 entry — so `--dry-run` here now correctly reports zero candidates; the tool remains the safe path for the next time this class of lock turns up.
+It recovers `projectPath` for pre-`projectPath` locks and claims from the run's own record, confirms the exact filename hash against the file on disk, and still enforces ownership-checked release at deletion time. Cleanup-failed locks, claims, and reservations require an interactive confirmation even with `--confirm`, then recheck worker liveness and project identity immediately before mutation. Missing-run candidates also force the interactive prompt. This installation's own 6 locks from 2026-07-27 were, as it turned out, already cleared by the time this tool was built — see `HISTORY.md`'s 2026-07-31 entry — so `--dry-run` here now correctly reports zero candidates; the tool remains the safe path for the next time this class of lock turns up.
 
 #### Scheduled reaping (idle autoclean)
 

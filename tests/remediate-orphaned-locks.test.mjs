@@ -11,6 +11,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -343,8 +344,61 @@ describe("resolveCandidates", () => {
 		const d = descriptors.find((x) => x.runId === ghostRunId);
 		ok(d);
 		strictEqual(d.category, "run-missing");
+		strictEqual(d.remediationKind, "project-lock");
+		strictEqual(d.requiresInteractiveConfirmation, true);
 		strictEqual(d.isCandidate, true);
 		strictEqual(d.projectPath, path);
+	});
+
+	it("retains a pre-F.1 cleanup-failed lock while its worker is live", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		await updateRun(
+			opts.runId,
+			{
+				state: "recovery_required",
+				cleanupState: "failed",
+				workerPid: process.pid,
+			},
+			(await readRun(opts.runId)).revision,
+		);
+		writeRawLockBody(projectLockFilePath(opts.projectPath), {
+			runId: opts.runId,
+			createdAt: new Date().toISOString(),
+		});
+
+		const descriptor = (await resolveCandidates()).find(
+			(candidate) => candidate.runId === opts.runId,
+		);
+		ok(descriptor);
+		strictEqual(descriptor.category, "project-lock-cleanup-failed-retained");
+		strictEqual(descriptor.isCandidate, false);
+	});
+
+	it("resolves an unadorned pre-F.1 recovery claim through its run record", async () => {
+		const opts = await makeStaleRun();
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const lockPath = projectLockFilePath(opts.projectPath);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeRawLockBody(lockPath, {
+			runId: opts.runId,
+			createdAt: new Date().toISOString(),
+		});
+		renameSync(lockPath, claimPath);
+
+		const descriptor = (await resolveCandidates()).find(
+			(candidate) => candidate.path === claimPath,
+		);
+		ok(descriptor);
+		strictEqual(descriptor.isCandidate, true);
+		const result = await run(["--confirm"], { log: () => {} });
+		deepStrictEqual(result.removed, [descriptor.name]);
+		strictEqual(existsSync(claimPath), false);
 	});
 
 	it("recovers projectPath via run.json for a pre-F.1 (no projectPath in body) stale lock and flags it a candidate", async () => {
@@ -519,6 +573,92 @@ describe("resolveCandidates", () => {
 		strictEqual(claims.length, 2);
 		for (const claim of claims) strictEqual(claim.isCandidate, false);
 	});
+
+	it("parses a dead recovery-proof filename as its original claim identity", async () => {
+		const opts = await makeStaleRun();
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		const proofPath = `${claimPath}.99999999.${randomUUID()}.lock.recovery-claim`;
+		writeRawLockBody(proofPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+
+		const descriptor = (await resolveCandidates()).find(
+			(candidate) => candidate.path === proofPath,
+		);
+		ok(descriptor);
+		strictEqual(descriptor.isCandidate, true);
+		strictEqual(descriptor.remediationKind, "recovery-claim");
+	});
+
+	it("binds a dead reservation proof-of-claim to its underlying project lock", async () => {
+		const opts = await makeStaleRun();
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const expectedRaw = JSON.stringify({
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const proofPath = `${projectLockClaimFilePath(opts.projectPath)}.99999999.${randomUUID()}.lock.recovery-claim`;
+		writeRawLockBody(proofPath, {
+			claimState: "reservation",
+			expectedRaw,
+		});
+
+		const descriptor = (await resolveCandidates()).find(
+			(candidate) => candidate.path === proofPath,
+		);
+		ok(descriptor);
+		strictEqual(descriptor.category, "recovery-claim-reservation-stale");
+		strictEqual(descriptor.isCandidate, true);
+	});
+
+	it("retains a recovery proof while its recovery owner PID is live", async () => {
+		const opts = await makeStaleRun();
+		const proofPath = `${projectLockClaimFilePath(opts.projectPath)}.${process.pid}.${randomUUID()}.lock.recovery-claim`;
+		writeRawLockBody(proofPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+
+		const descriptor = (await resolveCandidates()).find(
+			(candidate) => candidate.path === proofPath,
+		);
+		ok(descriptor);
+		strictEqual(descriptor.category, "recovery-claim-proof-live");
+		strictEqual(descriptor.isCandidate, false);
+	});
+
+	it("uses the injected PID probe when resolving recovery-proof liveness", async () => {
+		const opts = await makeStaleRun();
+		const proofOwnerPid = 99999999;
+		const proofPath = `${projectLockClaimFilePath(opts.projectPath)}.${proofOwnerPid}.${randomUUID()}.lock.recovery-claim`;
+		writeRawLockBody(proofPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+
+		const descriptor = (
+			await resolveCandidates({
+				probePid: (pid) => (pid === proofOwnerPid ? "live" : "dead"),
+			})
+		).find((candidate) => candidate.path === proofPath);
+		ok(descriptor);
+		strictEqual(descriptor.category, "recovery-claim-proof-live");
+		strictEqual(descriptor.isCandidate, false);
+	});
 });
 
 describe("run() — printing and dry-run", () => {
@@ -572,6 +712,192 @@ describe("run() — printing and dry-run", () => {
 });
 
 describe("run() — confirmation gating", () => {
+	it("skips a cleanup-failed claim when the refreshed run lacks project identity", async () => {
+		const candidatePath = join(
+			getStateRoot(),
+			"locks",
+			"missing-project.lock.recovery-claim",
+		);
+		const result = await run(["--confirm"], {
+			log: () => {},
+			confirmFn: async () => true,
+			now: RUN_STARTUP_GRACE_MS + 1,
+			resolveCandidates: async () => [
+				{
+					name: "missing-project.lock.recovery-claim",
+					path: candidatePath,
+					runId: uniqueRunId(),
+					projectPath: uniquePath("expected-project"),
+					isCandidate: true,
+					remediationKind: "recovery-claim",
+					requiresInteractiveConfirmation: true,
+					requiresDeadWorkerRecheck: true,
+				},
+			],
+			reconcileProjectLockClaims: async () => [],
+			readRun: async () => ({
+				state: "recovery_required",
+				cleanupState: "failed",
+				workerPid: null,
+				createdAt: new Date(0).toISOString(),
+			}),
+		});
+
+		deepStrictEqual(result.removed, []);
+	});
+
+	it("removes a cleanup-failed dead-worker claim only after confirmation and fresh proof", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			(await readRun(opts.runId)).revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeFileSync(
+			claimPath,
+			await readFile(projectLockFilePath(opts.projectPath), "utf8"),
+		);
+		writeFileSync(projectLockFilePath(opts.projectPath), "");
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const result = await run(["--confirm"], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => true,
+		});
+
+		deepStrictEqual(result.removed, [claimPath.split("/").at(-1)]);
+		strictEqual(existsSync(claimPath), false);
+	});
+
+	it("retains a cleanup-failed reservation when its worker revives during confirmation", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			(await readRun(opts.runId)).revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const lockPath = projectLockFilePath(opts.projectPath);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeFileSync(
+			claimPath,
+			JSON.stringify({
+				claimState: "reservation",
+				expectedRaw: await readFile(lockPath, "utf8"),
+			}),
+		);
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const result = await run([], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => {
+				const current = await readRun(opts.runId);
+				await updateRun(
+					opts.runId,
+					{ workerPid: process.pid },
+					current.revision,
+				);
+				return true;
+			},
+		});
+
+		deepStrictEqual(result.removed, []);
+		strictEqual(existsSync(lockPath), true);
+		strictEqual(existsSync(claimPath), true);
+	});
+
+	it("retains a cleanup-failed claim when its worker revives during confirmation", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			(await readRun(opts.runId)).revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const claimPath = projectLockClaimFilePath(opts.projectPath);
+		writeFileSync(
+			claimPath,
+			await readFile(projectLockFilePath(opts.projectPath), "utf8"),
+		);
+		writeFileSync(projectLockFilePath(opts.projectPath), "");
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const result = await run([], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => {
+				const current = await readRun(opts.runId);
+				await updateRun(
+					opts.runId,
+					{ workerPid: process.pid },
+					current.revision,
+				);
+				return true;
+			},
+		});
+
+		deepStrictEqual(result.removed, []);
+		strictEqual(existsSync(claimPath), true);
+	});
+
+	it("rechecks an ordinary nonterminal stale owner after confirmation", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const result = await run([], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => {
+				const current = await readRun(opts.runId);
+				await updateRun(
+					opts.runId,
+					{ workerPid: process.pid },
+					current.revision,
+				);
+				return true;
+			},
+		});
+
+		deepStrictEqual(result.removed, []);
+		strictEqual(isProjectLockHeld(opts.projectPath), true);
+	});
+
+	it("reports every matching artifact removed by one release", async () => {
+		const opts = await makeStaleRun();
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const historicalPath = noncanonicalProjectLockFilePath(opts.projectPath);
+		writeRawLockBody(historicalPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const logs = [];
+
+		const result = await run(["--confirm"], {
+			log: (line) => logs.push(line),
+		});
+
+		strictEqual(result.removed.length, 2);
+		strictEqual(logs.filter((line) => line.includes("removed ")).length, 3);
+		strictEqual(
+			logs.some((line) => line.includes("no longer owned")),
+			false,
+		);
+	});
+
 	it("reconciles a valid recovery claim through the run-store ownership check", async () => {
 		const opts = await makeStaleRun();
 		const current = await readRun(opts.runId);

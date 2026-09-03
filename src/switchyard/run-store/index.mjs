@@ -502,7 +502,8 @@ function parseProjectLockBody(raw, canonicalProjectPath = null) {
 			typeof body.projectPath !== "string" ||
 			body.projectPath.length === 0 ||
 			(canonicalProjectPath !== null &&
-				body.projectPath !== canonicalProjectPath)
+				resolveCanonicalProjectPath(body.projectPath) !==
+					resolveCanonicalProjectPath(canonicalProjectPath))
 		) {
 			return null;
 		}
@@ -605,6 +606,7 @@ async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
 }
 
 export const runStoreTesting = Object.freeze({
+	acquireVmSlotWithDependencies,
 	projectLockArtifacts,
 	readVmSlotBody,
 	unlinkBodyMatched,
@@ -1958,19 +1960,26 @@ export async function releaseProjectLock(canonicalProjectPath, expectedRunId) {
  *
  * @param {string} canonicalProjectPath
  * @param {string} expectedRunId
+ * @param {{onRemoved?: (path: string) => void}} [options]
  * @returns {Promise<boolean>} true if the lock was held by expectedRunId and released
  */
 export async function releaseProjectLockIfOwnedBy(
 	canonicalProjectPath,
 	expectedRunId,
+	options = {},
 ) {
 	const projectPath = resolveCanonicalProjectPath(canonicalProjectPath);
 	let released = false;
+	const recordRemoved = (path) => {
+		released = true;
+		options.onRemoved?.(path);
+	};
 	for (const artifact of await projectLockArtifacts(projectPath)) {
 		if (artifact.body.runId !== expectedRunId) continue;
 		if (artifact.kind === "claim") {
-			released =
-				(await unlinkBodyMatched(artifact.claimPath, artifact.raw)) || released;
+			if (await unlinkBodyMatched(artifact.claimPath, artifact.raw)) {
+				recordRemoved(artifact.claimPath);
+			}
 			continue;
 		}
 		if (artifact.kind === "reservation") {
@@ -1978,6 +1987,7 @@ export async function releaseProjectLockIfOwnedBy(
 			if (lockRaw !== artifact.reservation.expectedRaw) continue;
 			if (!(await unlinkBodyMatched(artifact.claimPath, artifact.raw)))
 				continue;
+			recordRemoved(artifact.claimPath);
 		}
 		const raw = await readTextIfPresent(artifact.lockPath);
 		if (raw === null) continue;
@@ -1995,8 +2005,9 @@ export async function releaseProjectLockIfOwnedBy(
 			raw,
 		);
 		if (claimed) {
-			released =
-				(await unlinkBodyMatched(claimed.claimPath, claimed.raw)) || released;
+			if (await unlinkBodyMatched(claimed.claimPath, claimed.raw)) {
+				recordRemoved(artifact.lockPath);
+			}
 		}
 	}
 	return released;
@@ -2010,11 +2021,13 @@ export async function releaseProjectLockIfOwnedBy(
  *
  * @param {string} canonicalProjectPath
  * @param {string} expectedRunId
+ * @param {{onRemoved?: (path: string) => void}} [options]
  * @returns {Promise<boolean>}
  */
 export async function releaseCwdDerivedProjectLockIfOwnedBy(
 	canonicalProjectPath,
 	expectedRunId,
+	options = {},
 ) {
 	canonicalProjectPath = resolveCanonicalProjectPath(canonicalProjectPath);
 	const lockPath = cwdDerivedProjectLockPath(canonicalProjectPath);
@@ -2030,7 +2043,9 @@ export async function releaseCwdDerivedProjectLockIfOwnedBy(
 		raw,
 	);
 	if (!claimed) return false;
-	return unlinkBodyMatched(claimed.claimPath, claimed.raw);
+	const released = await unlinkBodyMatched(claimed.claimPath, claimed.raw);
+	if (released) options.onRemoved?.(lockPath);
+	return released;
 }
 
 /**
@@ -2283,8 +2298,9 @@ function vmSlotBody(raw) {
 }
 
 function readVmSlotBody(slotPath, readSlot = readFileSync) {
+	let raw;
 	try {
-		return vmSlotBody(JSON.parse(readSlot(slotPath, "utf8")));
+		raw = readSlot(slotPath, "utf8");
 	} catch (error) {
 		// An unreadable occupied slot is not evidence of ordinary capacity
 		// contention. Preserve closed permission/storage failures for the
@@ -2295,8 +2311,23 @@ function readVmSlotBody(slotPath, readSlot = readFileSync) {
 		) {
 			throw error;
 		}
-		return null;
+		// A vanished occupied slot is a normal acquire/release race. The
+		// caller retries that slot within its bounded admission loop; other
+		// unclassified read failures remain within the closed admission boundary.
+		throw error;
 	}
+	try {
+		const body = vmSlotBody(JSON.parse(raw));
+		if (body) return body;
+	} catch (error) {
+		throw new VmAdmissionStorageError(error);
+	}
+	// A slot that won the atomic publish operation must contain a complete,
+	// valid owner record. Treat malformed-but-readable storage as a closed
+	// storage failure, never as ordinary contention that can poison a slot.
+	throw new VmAdmissionStorageError(
+		new Error("VM admission slot contains an invalid owner record"),
+	);
 }
 
 function removeVmTempFile(tmpPath) {
@@ -2307,7 +2338,14 @@ function removeVmTempFile(tmpPath) {
 	}
 }
 
-function vmOwnerIsLive(ownerPid) {
+function vmOwnerIsLive(ownerPid, probePid) {
+	if (probePid) {
+		try {
+			return probePid(ownerPid) !== "dead";
+		} catch {
+			return true;
+		}
+	}
 	try {
 		process.kill(ownerPid, 0);
 		return true;
@@ -2354,8 +2392,10 @@ function vmSlotIndex(value) {
  * @param {string} [options.runId] identifying the queue holding the slot
  * @returns {{slot: number, slotIndex: number, path: string, ownerPid: number, runId: string, token: string, release: () => boolean}}
  */
-export function acquireVmSlot(options = {}) {
+function acquireVmSlotWithDependencies(options = {}, dependencies = {}) {
 	const normalized = typeof options === "string" ? { runId: options } : options;
+	const publishSlot = dependencies.publishVmSlot ?? publishVmSlot;
+	const readSlotBody = dependencies.readVmSlotBody ?? readVmSlotBody;
 	const runId =
 		typeof normalized?.runId === "string" && normalized.runId.length > 0
 			? normalized.runId
@@ -2379,7 +2419,7 @@ export function acquireVmSlot(options = {}) {
 		for (let slotIndex = 0; slotIndex < VM_SLOT_COUNT; slotIndex += 1) {
 			const slotPath = vmSlotPath(slotIndex);
 			for (let attempt = 0; attempt < 2; attempt += 1) {
-				if (publishVmSlot(slotPath, body)) {
+				if (publishSlot(slotPath, body)) {
 					const lease = {
 						slot: slotIndex,
 						slotIndex,
@@ -2392,7 +2432,13 @@ export function acquireVmSlot(options = {}) {
 					return lease;
 				}
 
-				const owner = readVmSlotBody(slotPath);
+				let owner;
+				try {
+					owner = readSlotBody(slotPath);
+				} catch (error) {
+					if (error?.code === "ENOENT") continue;
+					throw error;
+				}
 				if (owner && !vmOwnerIsLive(owner.ownerPid)) {
 					const reclaimPath = `${slotPath}.${process.pid}.${randomUUID()}.reclaim`;
 					try {
@@ -2421,6 +2467,10 @@ export function acquireVmSlot(options = {}) {
 	}
 }
 
+export function acquireVmSlot(options = {}) {
+	return acquireVmSlotWithDependencies(options);
+}
+
 /**
  * Release a VM slot only when its token (and supplied identity) still match.
  * Missing or already-released slots are harmless, making this idempotent.
@@ -2440,7 +2490,13 @@ export function releaseVmSlot(leaseOrSlot, token, runId) {
 	if (slotIndex === null || typeof expectedToken !== "string") return false;
 
 	const slotPath = vmSlotPath(slotIndex);
-	const owner = readVmSlotBody(slotPath);
+	let owner;
+	try {
+		owner = readVmSlotBody(slotPath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		throw error;
+	}
 	if (!owner || owner.token !== expectedToken) return false;
 	if (lease.runId !== undefined && owner.runId !== lease.runId) return false;
 	if (lease.ownerPid !== undefined && owner.ownerPid !== lease.ownerPid) {
@@ -2465,12 +2521,15 @@ export const releaseMacosVmSlot = releaseVmSlot;
  * Reconcile abandoned project-lock recovery claims in one bounded pass.
  * Live, startup-grace, malformed, and unresolved owners are deliberately
  * retained for their holder or a human-confirmed repair. A cleanup-failed
- * claim is removed only when a valid canonical lock proves that a different
- * run now owns the same project.
+ * claim is removed automatically only when a valid canonical lock proves that
+ * a different run now owns the same project. The attended remediation CLI may
+ * opt into removal after it has confirmed the action and freshly proved the
+ * cleanup-failed worker dead.
  *
+ * @param {{onRemoved?: (path: string) => void, allowCleanupFailedDead?: boolean, now?: number, probePid?: (pid: number) => string}} [options]
  * @returns {Promise<string[]>} run ids whose claim was removed
  */
-export async function reconcileProjectLockClaims() {
+export async function reconcileProjectLockClaims(options = {}) {
 	let entries;
 	try {
 		entries = await readdir(locksRoot(), { withFileTypes: true });
@@ -2484,7 +2543,8 @@ export async function reconcileProjectLockClaims() {
 			continue;
 		}
 		const proof = recoveryProofMetadata(entry.name);
-		if (proof !== null && vmOwnerIsLive(proof.ownerPid)) continue;
+		if (proof !== null && vmOwnerIsLive(proof.ownerPid, options.probePid))
+			continue;
 		const claimPath = resolve(locksRoot(), entry.name);
 		const originalPath = proof
 			? resolve(locksRoot(), proof.originalName)
@@ -2497,7 +2557,7 @@ export async function reconcileProjectLockClaims() {
 		const reservation = parseRecoveryReservation(raw);
 		if (reservation) {
 			let parsedOwnerBody = parseProjectLockBody(reservation.expectedRaw);
-			if (!parsedOwnerBody?.projectPath && proof) {
+			if (!parsedOwnerBody?.projectPath) {
 				const legacyBody = parseLegacyProjectLockBody(reservation.expectedRaw);
 				if (legacyBody) {
 					try {
@@ -2536,11 +2596,24 @@ export async function reconcileProjectLockClaims() {
 			) {
 				continue;
 			}
-			const liveness = classifyRunLiveness(run);
-			if (liveness !== "terminal_clean" && liveness !== "dead") continue;
+			if (run.cleanupState === "failed") {
+				if (!options.allowCleanupFailedDead) continue;
+				const liveness = classifyRunLiveness(run, {
+					...(options.now !== undefined ? { now: options.now } : {}),
+					...(options.probePid ? { probePid: options.probePid } : {}),
+				});
+				if (liveness !== "dead") continue;
+			} else {
+				const liveness = classifyRunLiveness(run, {
+					...(options.now !== undefined ? { now: options.now } : {}),
+					...(options.probePid ? { probePid: options.probePid } : {}),
+				});
+				if (liveness !== "terminal_clean" && liveness !== "dead") continue;
+			}
 			try {
 				if (await unlinkBodyMatched(claimPath, raw)) {
 					reclaimed.push(parsedOwnerBody.runId);
+					options.onRemoved?.(claimPath);
 				}
 			} catch {
 				// One attempt per claim. A later reconciliation may retry it.
@@ -2548,7 +2621,7 @@ export async function reconcileProjectLockClaims() {
 			continue;
 		}
 		let parsedBody = parseProjectLockBody(raw);
-		if (!parsedBody?.projectPath && proof) {
+		if (!parsedBody?.projectPath) {
 			const legacyBody = parseLegacyProjectLockBody(raw);
 			if (legacyBody) {
 				try {
@@ -2582,22 +2655,35 @@ export async function reconcileProjectLockClaims() {
 			continue;
 		}
 		if (run.cleanupState === "failed") {
-			const replacement = (
-				await projectLockArtifacts(parsedBody.projectPath)
-			).find(
-				(artifact) =>
-					artifact.kind === "lock" &&
-					artifact.lockPath === projectLockPath(parsedBody.projectPath) &&
-					artifact.body.runId !== parsedBody.runId,
-			);
-			if (!replacement) continue;
+			if (options.allowCleanupFailedDead) {
+				const liveness = classifyRunLiveness(run, {
+					...(options.now !== undefined ? { now: options.now } : {}),
+					...(options.probePid ? { probePid: options.probePid } : {}),
+				});
+				if (liveness !== "dead") continue;
+			} else {
+				const replacement = (
+					await projectLockArtifacts(parsedBody.projectPath)
+				).find(
+					(artifact) =>
+						artifact.kind === "lock" &&
+						artifact.lockPath === projectLockPath(parsedBody.projectPath) &&
+						artifact.body.runId !== parsedBody.runId,
+				);
+				if (!replacement) continue;
+			}
 		} else {
-			const liveness = classifyRunLiveness(run);
+			const liveness = classifyRunLiveness(run, {
+				...(options.now !== undefined ? { now: options.now } : {}),
+				...(options.probePid ? { probePid: options.probePid } : {}),
+			});
 			if (liveness !== "terminal_clean" && liveness !== "dead") continue;
 		}
 		try {
-			if (await unlinkBodyMatched(claimPath, raw))
+			if (await unlinkBodyMatched(claimPath, raw)) {
 				reclaimed.push(parsedBody.runId);
+				options.onRemoved?.(claimPath);
+			}
 		} catch {
 			// One attempt per claim. A later reconciliation may retry it.
 		}
