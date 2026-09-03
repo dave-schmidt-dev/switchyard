@@ -504,6 +504,18 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		);
 	});
 
+	it("retains the unclassified-output diagnostic without a nonzero exit", () => {
+		for (const exitCode of [undefined, null, 0]) {
+			strictEqual(
+				classifyProviderDiagnostic({
+					text: "SECRET_CANARY arbitrary provider output",
+					exitCode,
+				}),
+				"provider_output_unclassified",
+			);
+		}
+	});
+
 	it("retains specific provider diagnostics ahead of a nonzero exit", () => {
 		for (const [input, expected] of [
 			[{ cancelled: true, exitCode: 1 }, "execution_cancelled"],

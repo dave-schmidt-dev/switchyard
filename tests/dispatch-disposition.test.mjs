@@ -751,6 +751,38 @@ describe("closed caller direction", () => {
 		}
 	});
 
+	it("maps terminal VM-slot exhaustion to a fresh launch retry", () => {
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: failure({ diagnosticCode: "vm_slot_unavailable" }),
+			}),
+			optionalEvidenceValid: false,
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "stop");
+		strictEqual(result.reasonCode, "vm_slot_unavailable");
+		strictEqual(result.direction, "retry_launch");
+	});
+
+	it("maps VM admission storage failure to contract repair", () => {
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: failure({
+					diagnosticCode: "vm_admission_unavailable",
+				}),
+			}),
+			optionalEvidenceValid: false,
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "repair_contract");
+		strictEqual(result.reasonCode, "vm_admission_unavailable");
+		strictEqual(result.direction, "repair_input");
+	});
+
 	it("keeps holder-aware wait and recovery confined to pre-initialization", () => {
 		const wait = projectDisposition({
 			preInitialization: {

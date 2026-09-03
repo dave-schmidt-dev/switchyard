@@ -93,12 +93,15 @@ import {
 	acquireVmSlot,
 	getVmAdmissionRoot,
 	releaseVmSlot,
+	VmSlotUnavailableError,
 } from "../run-store/index.mjs";
 
 const CHECKPOINT_VERSION = 2;
 const BOUNDED_ERROR_KINDS = new Set(PERSISTED_ERROR_KINDS);
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
+const VM_SLOT_WAIT_TIMEOUT_MS = 5 * 60_000;
+const VM_SLOT_WAIT_INTERVAL_MS = 1_000;
 export const QUEUE_PLATFORMS = Object.freeze(["macos"]);
 // Versioned contract shared by the host runner, detached worker, and any
 // external headless orchestrator.  Keep this independent from the run-store
@@ -3885,6 +3888,7 @@ export async function runQueueAsync(options) {
 	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)({
 		markerPath: dependencies.generationMarkerPath,
 	});
+	const emitStatus = _resolveOnStatus(dependencies);
 	const launch = prepareQueueLaunch({
 		tasksFilePath,
 		projectPath,
@@ -3901,11 +3905,12 @@ export async function runQueueAsync(options) {
 		projectRevision,
 		runId,
 		dependencies,
-		onStatus: dependencies.onStatus,
+		onStatus: emitStatus,
+		deferSlotAcquisition: true,
 	});
 	const {
 		queueBackend,
-		slotLease,
+		selectedPlatform,
 		tasks,
 		checkpoint,
 		effectiveMaxTasks,
@@ -3915,6 +3920,13 @@ export async function runQueueAsync(options) {
 		effectiveTaskIds,
 	} = launch;
 	ensureRetryCheckpoint(checkpoint);
+	const slotLease = await acquireQueueSlotAsync({
+		queueBackend,
+		selectedPlatform,
+		runId,
+		dependencies,
+		onStatus: emitStatus,
+	});
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
 	let uninstallSignalCleanup = null;
@@ -5833,6 +5845,7 @@ function prepareQueueLaunch({
 	runId,
 	dependencies,
 	onStatus,
+	deferSlotAcquisition = false,
 }) {
 	const selectedPlatform = queuePlatform({ platform, runOptions });
 	const tasks = loadTaskQueue(tasksFilePath);
@@ -5906,7 +5919,9 @@ function prepareQueueLaunch({
 		runOptions: identity.runOptions,
 	});
 	const slotLease =
-		selectedPlatform === "macos" ? queueBackend.acquireSlot({ runId }) : null;
+		selectedPlatform === "macos" && !deferSlotAcquisition
+			? queueBackend.acquireSlot({ runId })
+			: null;
 	return {
 		selectedPlatform,
 		tasks,
@@ -5929,6 +5944,92 @@ function releaseQueueSlot(queueBackend, slotLease) {
 	} catch {
 		// The queue outcome is authoritative; release is best effort but always
 		// attempted from the enclosing finally block.
+	}
+}
+
+function isVmSlotUnavailable(error) {
+	return (
+		error instanceof VmSlotUnavailableError ||
+		error?.code === "VM_SLOT_UNAVAILABLE"
+	);
+}
+
+function throwIfQueueAdmissionAborted(signal) {
+	if (!signal?.aborted) return;
+	if (typeof signal.throwIfAborted === "function") signal.throwIfAborted();
+	throw signal.reason ?? new Error("VM slot admission wait aborted");
+}
+
+function waitForVmSlotRetry(delayMs, signal, sleepFn) {
+	throwIfQueueAdmissionAborted(signal);
+	const delay = Promise.resolve().then(() => sleepFn(delayMs));
+	if (typeof signal?.addEventListener !== "function") return delay;
+	return new Promise((resolveDelay, rejectDelay) => {
+		const abort = () => {
+			signal.removeEventListener?.("abort", abort);
+			try {
+				throwIfQueueAdmissionAborted(signal);
+			} catch (error) {
+				rejectDelay(error);
+			}
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		delay.then(
+			(value) => {
+				signal.removeEventListener?.("abort", abort);
+				resolveDelay(value);
+			},
+			(error) => {
+				signal.removeEventListener?.("abort", abort);
+				rejectDelay(error);
+			},
+		);
+	});
+}
+
+/** Await bounded VM-slot admission for the production async queue path. */
+async function acquireQueueSlotAsync({
+	queueBackend,
+	selectedPlatform,
+	runId,
+	dependencies,
+	onStatus,
+}) {
+	if (selectedPlatform !== "macos") return null;
+	const timeoutMs = dependencies.vmSlotWaitTimeoutMs ?? VM_SLOT_WAIT_TIMEOUT_MS;
+	const intervalMs =
+		dependencies.vmSlotWaitIntervalMs ?? VM_SLOT_WAIT_INTERVAL_MS;
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+		throw new RangeError("vmSlotWaitTimeoutMs must be a non-negative number");
+	}
+	if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+		throw new RangeError("vmSlotWaitIntervalMs must be a positive number");
+	}
+	const now = dependencies.nowFn ?? Date.now;
+	const sleepFn = dependencies.sleepFn ?? sleep;
+	const signal = dependencies.signal;
+	const startedAt = now();
+
+	for (;;) {
+		throwIfQueueAdmissionAborted(signal);
+		try {
+			return queueBackend.acquireSlot({ runId });
+		} catch (error) {
+			if (!isVmSlotUnavailable(error)) throw error;
+			const elapsedMs = Math.max(0, now() - startedAt);
+			onStatus?.({
+				phase: "bootstrap",
+				event: "vm_slot_wait",
+				status: "Waiting for VM admission capacity",
+				elapsedMs,
+			});
+			if (elapsedMs >= timeoutMs) throw error;
+			await waitForVmSlotRetry(
+				Math.min(intervalMs, timeoutMs - elapsedMs),
+				signal,
+				sleepFn,
+			);
+		}
 	}
 }
 

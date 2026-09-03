@@ -19,6 +19,7 @@ const CONTRACT_DIAGNOSTICS = new Set([
 	"checkpoint_historical_state",
 	"task_selection_failed",
 	"environment_incomplete",
+	"vm_admission_unavailable",
 ]);
 const PRE_INITIALIZATION_CONTRACT_CODES = new Set([
 	"invalid_invocation",
@@ -101,8 +102,13 @@ const TERMINAL_LOCK_DIAGNOSTICS = new Set([
 	"project_lock_claim_cleanup_failed",
 	"project_lock_recovery_claim_blocks_execution",
 ]);
+const RETRY_LAUNCH_DIAGNOSTICS = new Set([
+	...TERMINAL_LOCK_DIAGNOSTICS,
+	"vm_slot_unavailable",
+]);
 const PRE_PROVIDER_STOP_DIAGNOSTICS = new Set([
 	...TERMINAL_LOCK_DIAGNOSTICS,
+	"vm_slot_unavailable",
 	"prlctl_job_misfire",
 	"prlctl_session_not_ready",
 	"prlctl_call_timed_out",
@@ -123,7 +129,7 @@ function baseDisposition(action, reasonCode, failure = null) {
 	} else if (
 		action === "stop" &&
 		diagnosticCode === reasonCode &&
-		TERMINAL_LOCK_DIAGNOSTICS.has(diagnosticCode)
+		RETRY_LAUNCH_DIAGNOSTICS.has(diagnosticCode)
 	) {
 		// A terminal record carries no fresh holder classification. Direct the
 		// caller through normal launch preflight without acting on stored identity.

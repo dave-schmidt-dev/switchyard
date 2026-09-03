@@ -33,6 +33,7 @@ import {
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
 import { route as realRoute } from "../src/switchyard/router/index.mjs";
+import { VmSlotUnavailableError } from "../src/switchyard/run-store/index.mjs";
 import {
 	CHECKPOINT_IDENTITY_CODES,
 	CheckpointIdentityError,
@@ -5338,6 +5339,185 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			ok(events.indexOf("acquire") < events.indexOf("create"));
 			ok(events.indexOf("destroy") < events.indexOf("release"));
 		}
+	});
+
+	it("waits asynchronously for a released VM slot before creating the workspace", async () => {
+		const events = [];
+		const statuses = [];
+		const tasksPath = writeTerminalQueue();
+		const backend = macosBackend(events);
+		let attempts = 0;
+		let releaseWait;
+		let signalWaitStarted;
+		const waitStarted = new Promise((resolve) => {
+			signalWaitStarted = resolve;
+		});
+		backend.acquireSlot = () => {
+			events.push("acquire");
+			attempts += 1;
+			if (attempts === 1) {
+				throw new VmSlotUnavailableError(["SECRET_HOLDER_ID"]);
+			}
+			return { token: "test-slot" };
+		};
+
+		const queue = runQueueAsyncImpl({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			platform: "macos",
+			checkpointPath: `${tasksPath}.wait-release.checkpoint.json`,
+			dependencies: {
+				backendFactory: () => backend,
+				onStatus: (event) => statuses.push(event),
+				vmSlotWaitTimeoutMs: 100,
+				vmSlotWaitIntervalMs: 10,
+				nowFn: () => 0,
+				sleepFn: () => {
+					signalWaitStarted();
+					return new Promise((resolve) => {
+						releaseWait = resolve;
+					});
+				},
+			},
+		});
+
+		await waitStarted;
+		strictEqual(events.includes("create"), false);
+		releaseWait();
+		await queue;
+		strictEqual(attempts, 2);
+		ok(events.indexOf("acquire") < events.indexOf("create"));
+		deepStrictEqual(
+			statuses
+				.filter((event) => event.event === "vm_slot_wait")
+				.map((event) => event.elapsedMs),
+			[0],
+		);
+		strictEqual(JSON.stringify(statuses).includes("SECRET_HOLDER_ID"), false);
+	});
+
+	it("emits immediate and periodic VM-slot wait progress", async () => {
+		const events = [];
+		const statuses = [];
+		const tasksPath = writeTerminalQueue();
+		const backend = macosBackend(events);
+		let attempts = 0;
+		let now = 0;
+		backend.acquireSlot = () => {
+			events.push("acquire");
+			attempts += 1;
+			if (attempts < 3) {
+				const unavailable = new Error("SECRET slot signal");
+				unavailable.code = "VM_SLOT_UNAVAILABLE";
+				throw unavailable;
+			}
+			return { token: "test-slot" };
+		};
+
+		await runQueueAsyncImpl({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			platform: "macos",
+			checkpointPath: `${tasksPath}.wait-progress.checkpoint.json`,
+			dependencies: {
+				backendFactory: () => backend,
+				onStatus: (event) => statuses.push(event),
+				vmSlotWaitTimeoutMs: 100,
+				vmSlotWaitIntervalMs: 10,
+				nowFn: () => now,
+				sleepFn: async (delayMs) => {
+					now += delayMs;
+				},
+			},
+		});
+
+		deepStrictEqual(
+			statuses
+				.filter((event) => event.event === "vm_slot_wait")
+				.map((event) => event.elapsedMs),
+			[0, 10],
+		);
+		strictEqual(JSON.stringify(statuses).includes("SECRET slot signal"), false);
+	});
+
+	it("bounds async VM-slot admission and preserves the typed timeout error", async () => {
+		const events = [];
+		const statuses = [];
+		const tasksPath = writeTerminalQueue();
+		const backend = macosBackend(events);
+		const unavailable = new VmSlotUnavailableError(["holder"]);
+		let now = 0;
+		let attempts = 0;
+		backend.acquireSlot = () => {
+			events.push("acquire");
+			attempts += 1;
+			throw unavailable;
+		};
+
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				checkpointPath: `${tasksPath}.wait-timeout.checkpoint.json`,
+				dependencies: {
+					backendFactory: () => backend,
+					onStatus: (event) => statuses.push(event),
+					vmSlotWaitTimeoutMs: 20,
+					vmSlotWaitIntervalMs: 10,
+					nowFn: () => now,
+					sleepFn: async (delayMs) => {
+						now += delayMs;
+					},
+				},
+			}),
+			(error) => error === unavailable,
+		);
+		strictEqual(attempts, 3);
+		deepStrictEqual(
+			statuses
+				.filter((event) => event.event === "vm_slot_wait")
+				.map((event) => event.elapsedMs),
+			[0, 10, 20],
+		);
+		strictEqual(events.includes("create"), false);
+	});
+
+	it("does not retry unrelated VM-admission failures", async () => {
+		const events = [];
+		const statuses = [];
+		const tasksPath = writeTerminalQueue();
+		const backend = macosBackend(events);
+		const storageFailure = new Error("admission storage failed");
+		let attempts = 0;
+		backend.acquireSlot = () => {
+			events.push("acquire");
+			attempts += 1;
+			throw storageFailure;
+		};
+
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				checkpointPath: `${tasksPath}.wait-unrelated.checkpoint.json`,
+				dependencies: {
+					backendFactory: () => backend,
+					onStatus: (event) => statuses.push(event),
+					vmSlotWaitTimeoutMs: 100,
+					vmSlotWaitIntervalMs: 10,
+					sleepFn: async () => {},
+				},
+			}),
+			(error) => error === storageFailure,
+		);
+		strictEqual(attempts, 1);
+		strictEqual(
+			statuses.some((event) => event.event === "vm_slot_wait"),
+			false,
+		);
+		strictEqual(events.includes("create"), false);
 	});
 
 	it("awaits cleanup-state persistence before destroying an owned workspace", async () => {

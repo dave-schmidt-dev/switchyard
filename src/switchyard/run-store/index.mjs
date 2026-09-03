@@ -380,10 +380,7 @@ class VmAdmissionUnavailableError extends Error {
 	constructor(cause) {
 		super("VM admission storage is unavailable", { cause });
 		this.name = "VmAdmissionUnavailableError";
-		Object.defineProperty(this, "code", {
-			value: "VM_ADMISSION_UNAVAILABLE",
-			enumerable: false,
-		});
+		this.code = "VM_ADMISSION_UNAVAILABLE";
 	}
 }
 

@@ -1771,6 +1771,7 @@ describe("global VM admission slots", () => {
 		} catch (error) {
 			ok(error instanceof VmAdmissionUnavailableError);
 			strictEqual(error.code, "VM_ADMISSION_UNAVAILABLE");
+			ok(String(error.cause?.message).includes(VM_ADMISSION_ROOT));
 			const classified = classifyPreProviderFailure(error);
 			deepStrictEqual(classified, {
 				diagnosticCode: "vm_admission_unavailable",
@@ -1782,6 +1783,7 @@ describe("global VM admission slots", () => {
 			);
 			ok(!persisted.includes("HOST_ERROR_CANARY"));
 			ok(!persisted.includes("/private/admission"));
+			ok(!persisted.includes(VM_ADMISSION_ROOT));
 		}
 	});
 
