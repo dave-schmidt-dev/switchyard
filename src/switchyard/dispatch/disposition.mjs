@@ -19,6 +19,8 @@ const CONTRACT_DIAGNOSTICS = new Set([
 	"checkpoint_historical_state",
 	"task_selection_failed",
 	"environment_incomplete",
+	"vm_admission_permission_denied",
+	"vm_admission_storage_failed",
 	"vm_admission_unavailable",
 ]);
 const PRE_INITIALIZATION_CONTRACT_CODES = new Set([
@@ -151,6 +153,7 @@ function baseDisposition(action, reasonCode, failure = null) {
 		taskId: null,
 		blockingRunId: null,
 		recoveryCommand: null,
+		remediationCommand: null,
 		failedTargetIds: [],
 		failedTargetIdsTruncated: false,
 	};
@@ -305,6 +308,7 @@ export function projectDisposition({
 	events = [],
 	liveness = "unknown",
 	recoveryCommand = null,
+	remediationCommand = null,
 	optionalEvidenceValid = true,
 }) {
 	if (preInitialization !== null) {
@@ -318,7 +322,11 @@ export function projectDisposition({
 	const cleanupPending = run?.cleanupState === "pending";
 
 	if (run?.state === "recovery_required" || run?.cleanupState === "failed") {
-		return baseDisposition("stop", "recovery_incomplete", failure);
+		const result = baseDisposition("stop", "recovery_incomplete", failure);
+		if (hasRecoveryCommand(remediationCommand)) {
+			result.remediationCommand = remediationCommand;
+		}
+		return result;
 	}
 	if (cleanupPending && LIVE_STATES.has(liveness)) {
 		return baseDisposition("monitor", "cleanup_in_progress", failure);

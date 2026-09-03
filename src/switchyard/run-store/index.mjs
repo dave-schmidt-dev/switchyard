@@ -384,6 +384,51 @@ class VmAdmissionUnavailableError extends Error {
 	}
 }
 
+/** A closed boundary for a host permission or sandbox denial during VM admission. */
+class VmAdmissionPermissionDeniedError extends Error {
+	constructor(cause) {
+		super("VM admission storage permission is denied", { cause });
+		this.name = "VmAdmissionPermissionDeniedError";
+		this.code = "VM_ADMISSION_PERMISSION_DENIED";
+	}
+}
+
+/** A closed boundary for host storage or I/O failures during VM admission. */
+class VmAdmissionStorageError extends Error {
+	constructor(cause) {
+		super("VM admission storage I/O failed", { cause });
+		this.name = "VmAdmissionStorageError";
+		this.code = "VM_ADMISSION_STORAGE_FAILED";
+	}
+}
+
+const VM_ADMISSION_PERMISSION_CODES = new Set(["EACCES", "EPERM"]);
+const VM_ADMISSION_STORAGE_CODES = new Set([
+	"EIO",
+	"ENOSPC",
+	"EDQUOT",
+	"EMFILE",
+	"ENFILE",
+	"EROFS",
+]);
+
+export function sanitizeVmAdmissionError(cause) {
+	if (
+		cause instanceof VmAdmissionUnavailableError ||
+		cause instanceof VmAdmissionPermissionDeniedError ||
+		cause instanceof VmAdmissionStorageError
+	) {
+		return cause;
+	}
+	if (VM_ADMISSION_PERMISSION_CODES.has(cause?.code)) {
+		return new VmAdmissionPermissionDeniedError(cause);
+	}
+	if (VM_ADMISSION_STORAGE_CODES.has(cause?.code)) {
+		return new VmAdmissionStorageError(cause);
+	}
+	return new VmAdmissionUnavailableError(cause);
+}
+
 class SchemaError extends Error {
 	constructor(message) {
 		super(message);
@@ -530,9 +575,12 @@ async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
 	return true;
 }
 
-async function moveProjectLockToClaim(canonicalProjectPath, expectedRaw) {
-	const lockPath = projectLockPath(canonicalProjectPath);
-	const claimPath = projectLockClaimPath(canonicalProjectPath);
+async function moveProjectLockPathToClaim(
+	lockPath,
+	claimPath,
+	canonicalProjectPath,
+	expectedRaw,
+) {
 	// The reservation is recoverable evidence, not an opaque marker. Keep the
 	// exact owner body so a crash before rename can only be reconciled against
 	// the same bytes that were read before claiming the lock.
@@ -576,6 +624,23 @@ async function moveProjectLockToClaim(canonicalProjectPath, expectedRaw) {
 		}
 		throw error;
 	}
+}
+
+async function moveProjectLockToClaim(canonicalProjectPath, expectedRaw) {
+	return moveProjectLockPathToClaim(
+		projectLockPath(canonicalProjectPath),
+		projectLockClaimPath(canonicalProjectPath),
+		canonicalProjectPath,
+		expectedRaw,
+	);
+}
+
+function cwdDerivedProjectLockPath(canonicalProjectPath) {
+	const historicalKeyPath = resolve(
+		canonicalProjectPath,
+		`project:${canonicalProjectPath}`,
+	);
+	return lockFilePath(historicalKeyPath);
 }
 
 function parseRecoveryReservation(raw) {
@@ -1809,6 +1874,36 @@ export async function releaseProjectLockIfOwnedBy(
 }
 
 /**
+ * Release the historical cwd-derived project-lock filename used when a
+ * dispatcher ran from the project root. The body must still bind the exact
+ * project and run, and removal uses the same atomic claim protocol as the
+ * canonical release path.
+ *
+ * @param {string} canonicalProjectPath
+ * @param {string} expectedRunId
+ * @returns {Promise<boolean>}
+ */
+export async function releaseCwdDerivedProjectLockIfOwnedBy(
+	canonicalProjectPath,
+	expectedRunId,
+) {
+	const lockPath = cwdDerivedProjectLockPath(canonicalProjectPath);
+	const raw = await readTextIfPresent(lockPath);
+	if (raw === null) return false;
+	const body = parseProjectLockBody(raw, canonicalProjectPath);
+	if (!body || body.runId !== expectedRunId) return false;
+	const claimPath = `${lockPath}.recovery-claim`;
+	const claimed = await moveProjectLockPathToClaim(
+		lockPath,
+		claimPath,
+		canonicalProjectPath,
+		raw,
+	);
+	if (!claimed) return false;
+	return unlinkBodyMatched(claimed.claimPath, claimed.raw);
+}
+
+/**
  * Check whether the canonical project lock or an in-flight recovery claim is
  * still owned by the expected run. A lock held by another run is not evidence
  * that cleanup for the expected run failed.
@@ -2121,7 +2216,7 @@ export function acquireVmSlot(options = {}) {
 		throw new VmSlotUnavailableError([...new Set(holders)]);
 	} catch (error) {
 		if (error instanceof VmSlotUnavailableError) throw error;
-		throw new VmAdmissionUnavailableError(error);
+		throw sanitizeVmAdmissionError(error);
 	}
 }
 
@@ -2738,6 +2833,8 @@ export {
 	LockError,
 	RevisionError,
 	SchemaError,
+	VmAdmissionPermissionDeniedError,
+	VmAdmissionStorageError,
 	VmAdmissionUnavailableError,
 	VmSlotUnavailableError,
 };

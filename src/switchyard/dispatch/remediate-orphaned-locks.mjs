@@ -14,12 +14,13 @@
 //
 // Hard invariant: this script NEVER unlinks a lock by its bare filename or
 // from a list computed at some earlier time. Every removal goes through
-// releaseProjectLockIfOwnedBy(projectPath, runId), which re-reads the lock
-// file at the moment of deletion and only removes it if the recorded runId
-// still matches what was resolved — so a lock legitimately reassigned to a
-// new, live run between candidate resolution and confirmation is never
-// pulled out from under it. The candidate set itself is also always
-// resolved fresh from disk on every invocation, never cached or hardcoded.
+// the run-store's canonical or cwd-derived ownership-checked release helper,
+// which re-reads the lock file at the moment of deletion and only removes it
+// if the recorded runId still matches what was resolved — so a lock
+// legitimately reassigned to a new, live run between candidate resolution
+// and confirmation is never pulled out from under it. The candidate set
+// itself is also always resolved fresh from disk on every invocation, never
+// cached or hardcoded.
 //
 // Usage:
 //   node src/switchyard/dispatch/remediate-orphaned-locks.mjs [--dry-run] [--confirm] [--help]
@@ -31,7 +32,8 @@
 //   --confirm    Skips the interactive prompt and removes every resolved
 //                candidate immediately. Must be passed deliberately — never
 //                implied by any other flag. Mutually exclusive with
-//                --dry-run.
+//                --dry-run. Cleanup-failed locks still require an
+//                interactive confirmation.
 //
 // Honors SWITCHYARD_RUN_STORE_ROOT the same way run-store/index.mjs does,
 // so it can be pointed at a test fixture root instead of the real
@@ -47,6 +49,7 @@ import {
 	getStateRoot,
 	readRun,
 	reconcileProjectLockClaims,
+	releaseCwdDerivedProjectLockIfOwnedBy,
 	releaseProjectLockIfOwnedBy,
 } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
@@ -63,15 +66,16 @@ valid, bound, provably stale claims are removable.
               unlinks anything, never prompts.
   --confirm   Skip the interactive y/n prompt and remove every resolved
               candidate immediately. Must be passed deliberately. Mutually
-              exclusive with --dry-run.
+              exclusive with --dry-run. Cleanup-failed locks still require
+              interactive confirmation.
   --help      Show this help.
 
 With neither flag, runs interactively: prints the candidate set, then asks
 for explicit y/n confirmation before removing anything.
 
-Every removal is ownership-checked via releaseProjectLockIfOwnedBy or the
-run-store recovery-claim reconciler at the moment of deletion — never a blind
-unlink by filename.`;
+Every removal is ownership-checked via the run-store's canonical or
+cwd-derived release helper, or its recovery-claim reconciler, at the moment of
+deletion — never a blind unlink by filename.`;
 
 class UsageError extends Error {}
 
@@ -107,6 +111,14 @@ function projectLockFileName(canonicalProjectPath) {
 	return `${createHash("sha256").update(resolvedPath).digest("hex")}.lock`;
 }
 
+function cwdDerivedProjectLockFileName(canonicalProjectPath) {
+	const historicalKeyPath = resolve(
+		canonicalProjectPath,
+		`project:${canonicalProjectPath}`,
+	);
+	return `${createHash("sha256").update(historicalKeyPath).digest("hex")}.lock`;
+}
+
 // Mirrors run-store/index.mjs's and dispatch/index.mjs's private
 // isWorkerLive: a third independent copy of the same signal-0 kill(2)
 // probe. See run-store's comment on releaseOrphanedProjectLocks for why
@@ -125,6 +137,13 @@ function isWorkerLive(run) {
 function isRunStale(run) {
 	const terminal = run.state === "succeeded" || run.state === "failed";
 	return terminal || !isWorkerLive(run);
+}
+
+function isCleanupFailedDeadWorker(run, options = {}) {
+	return (
+		run?.cleanupState === "failed" &&
+		classifyRunLiveness(run, options) === "dead"
+	);
 }
 
 function baseDescriptor(entry, lockPath, overrides) {
@@ -404,6 +423,22 @@ export async function resolveCandidates(dependencies = {}) {
 			} catch {
 				run = null;
 			}
+			const canonicalName = projectLockFileName(body.projectPath);
+			const cwdDerivedName = cwdDerivedProjectLockFileName(body.projectPath);
+			if (canonicalName !== entry.name && cwdDerivedName !== entry.name) {
+				descriptors.push(
+					baseDescriptor(entry, lockPath, {
+						ageMs,
+						createdAt,
+						runId: body.runId,
+						projectPath: body.projectPath,
+						category: "not-a-project-lock",
+						reason:
+							"projectPath does not bind this filename to the canonical project lock — never touched",
+					}),
+				);
+				continue;
+			}
 
 			if (run == null) {
 				descriptors.push(
@@ -421,18 +456,42 @@ export async function resolveCandidates(dependencies = {}) {
 				continue;
 			}
 
-			const stale = isRunStale(run);
+			const cleanupFailed = run.cleanupState === "failed";
+			const cwdDerived = cwdDerivedName === entry.name;
+			const stale = cleanupFailed
+				? isCleanupFailedDeadWorker(run, {
+						now,
+						...(dependencies.probePid
+							? { probePid: dependencies.probePid }
+							: {}),
+					})
+				: isRunStale(run);
 			descriptors.push(
 				baseDescriptor(entry, lockPath, {
 					ageMs,
 					createdAt,
 					runId: body.runId,
 					projectPath: body.projectPath,
-					category: stale ? "project-lock-stale" : "project-lock-live",
+					category: cleanupFailed
+						? stale
+							? "project-lock-cleanup-failed-dead"
+							: "project-lock-cleanup-failed-retained"
+						: stale
+							? "project-lock-stale"
+							: "project-lock-live",
 					isCandidate: stale,
+					remediationKind: cwdDerived
+						? "cwd-derived-project-lock"
+						: "project-lock",
+					requiresInteractiveConfirmation: cleanupFailed && stale,
+					requiresDeadWorkerRecheck: cleanupFailed && stale,
 					reason: stale
-						? "run is stale (terminal or worker gone) — re-verified fresh at resolution time"
-						: "run is live — must not be removed",
+						? cleanupFailed
+							? `cleanup failed, but the ${cwdDerived ? "cwd-derived" : "canonical"} project lock has a proven dead worker — interactive ownership-safe remediation may remove it`
+							: "run is stale (terminal or worker gone) — re-verified fresh at resolution time"
+						: cleanupFailed
+							? "cleanup failed but worker liveness is live, startup-grace, or indeterminate — retain the canonical lock"
+							: "run is live — must not be removed",
 				}),
 			);
 			continue;
@@ -554,6 +613,9 @@ export async function run(argv, dependencies = {}) {
 	const resolveFn = dependencies.resolveCandidates ?? resolveCandidates;
 	const releaseFn =
 		dependencies.releaseProjectLockIfOwnedBy ?? releaseProjectLockIfOwnedBy;
+	const releaseCwdDerivedFn =
+		dependencies.releaseCwdDerivedProjectLockIfOwnedBy ??
+		releaseCwdDerivedProjectLockIfOwnedBy;
 	const reconcileFn =
 		dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims;
 	const confirmFn = dependencies.confirmFn ?? defaultConfirm;
@@ -598,7 +660,10 @@ export async function run(argv, dependencies = {}) {
 		return { exitCode: 0, removed: [], candidates: descriptors };
 	}
 
-	if (!opts.confirm) {
+	if (
+		!opts.confirm ||
+		candidates.some((c) => c.requiresInteractiveConfirmation)
+	) {
 		const proceed = await confirmFn(
 			`remediate-orphaned-locks: remove ${candidates.length} candidate lock(s) listed above? [y/N] `,
 		);
@@ -645,15 +710,37 @@ export async function run(argv, dependencies = {}) {
 			}
 			continue;
 		}
+		if (c.requiresDeadWorkerRecheck) {
+			let currentRun = null;
+			try {
+				currentRun = await (dependencies.readRun ?? readRun)(c.runId);
+			} catch {
+				// Missing cleanup state is ambiguous, so it is not removable.
+			}
+			if (
+				!isCleanupFailedDeadWorker(currentRun, {
+					now: dependencies.now ?? Date.now(),
+					...(dependencies.probePid ? { probePid: dependencies.probePid } : {}),
+				})
+			) {
+				log(
+					`remediate-orphaned-locks: skipped ${c.name} — cleanup-failed worker is no longer proven dead`,
+				);
+				continue;
+			}
+		}
 		// Ownership-checked at the moment of removal, never a blind unlink by
-		// filename: releaseProjectLockIfOwnedBy re-reads the lock file fresh
-		// and only deletes if the recorded runId still matches what we
-		// resolved above. If this project's lock was reassigned to a new,
-		// live run in the time between resolution and this call, that read
-		// now returns a different runId and the delete is a safe no-op.
+		// filename: both release helpers re-read the lock file fresh and only
+		// delete if the recorded runId still matches what we resolved above.
+		// If this project's lock was reassigned to a new, live run between
+		// resolution and this call, that read returns a different runId and
+		// the delete is a safe no-op.
 		let didRelease = false;
 		try {
-			didRelease = await releaseFn(c.projectPath, c.runId);
+			didRelease =
+				c.remediationKind === "cwd-derived-project-lock"
+					? await releaseCwdDerivedFn(c.projectPath, c.runId)
+					: await releaseFn(c.projectPath, c.runId);
 		} catch (e) {
 			log(`remediate-orphaned-locks: error releasing ${c.name}: ${e.message}`);
 		}
@@ -673,7 +760,11 @@ export async function run(argv, dependencies = {}) {
 	return { exitCode: 0, removed, candidates: descriptors };
 }
 
-if (import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+const entrypointPath = process.argv[1];
+if (
+	typeof entrypointPath === "string" &&
+	import.meta.url === pathToFileURL(realpathSync(entrypointPath)).href
+) {
 	try {
 		const result = await run(process.argv.slice(2));
 		process.exitCode = result.exitCode;

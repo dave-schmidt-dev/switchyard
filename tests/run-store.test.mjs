@@ -59,8 +59,11 @@ import {
 	releaseVmSlot,
 	renewRunLock,
 	SchemaError,
+	sanitizeVmAdmissionError,
 	updateRun,
 	updateRunWithRetry,
+	VmAdmissionPermissionDeniedError,
+	VmAdmissionStorageError,
 	VmAdmissionUnavailableError,
 	VmSlotUnavailableError,
 } from "../src/switchyard/run-store/index.mjs";
@@ -1818,6 +1821,38 @@ describe("global VM admission slots", () => {
 			);
 			ok(!persisted.includes("HOST_ERROR_CANARY"));
 			ok(!persisted.includes("/private/admission"));
+			ok(!persisted.includes(VM_ADMISSION_ROOT));
+		}
+	});
+
+	it("maps admission filesystem codes to closed sanitized categories", () => {
+		for (const [code, ErrorType, diagnosticCode] of [
+			[
+				"EPERM",
+				VmAdmissionPermissionDeniedError,
+				"vm_admission_permission_denied",
+			],
+			[
+				"EACCES",
+				VmAdmissionPermissionDeniedError,
+				"vm_admission_permission_denied",
+			],
+			["EIO", VmAdmissionStorageError, "vm_admission_storage_failed"],
+			["ENOSPC", VmAdmissionStorageError, "vm_admission_storage_failed"],
+			["UNEXPECTED", VmAdmissionUnavailableError, "vm_admission_unavailable"],
+		]) {
+			const cause = Object.assign(
+				new Error(`HOST_ERROR_CANARY ${VM_ADMISSION_ROOT}`),
+				{ code },
+			);
+			const wrapped = sanitizeVmAdmissionError(cause);
+			ok(wrapped instanceof ErrorType);
+			const classified = classifyPreProviderFailure(wrapped);
+			strictEqual(classified.diagnosticCode, diagnosticCode);
+			const persisted = JSON.stringify(
+				sanitizeFailureMetadata({ result: "launch_failed", ...classified }),
+			);
+			ok(!persisted.includes("HOST_ERROR_CANARY"));
 			ok(!persisted.includes(VM_ADMISSION_ROOT));
 		}
 	});

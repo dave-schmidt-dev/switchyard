@@ -185,6 +185,22 @@ describe("caller disposition precedence", () => {
 		],
 	];
 
+	it("projects interactive cleanup remediation without changing stop behavior", () => {
+		const remediationCommand =
+			"switchyard-dispatch remediate-orphaned-locks --state-root '/tmp/state'";
+		const result = projectDisposition({
+			run: run({ state: "recovery_required", cleanupState: "failed" }),
+			liveness: "dead",
+			recoveryCommand,
+			remediationCommand,
+		});
+		strictEqual(result.action, "stop");
+		strictEqual(result.direction, "stop");
+		strictEqual(result.reasonCode, "recovery_incomplete");
+		strictEqual(result.recoveryCommand, null);
+		strictEqual(result.remediationCommand, remediationCommand);
+	});
+
 	for (const [name, evidence, action, reasonCode] of cases) {
 		it(name, () => {
 			const result = projectDisposition(evidence);

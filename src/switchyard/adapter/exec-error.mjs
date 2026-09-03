@@ -410,6 +410,8 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"worker_boot_exception",
 	"clone_hardening_failed",
 	"workspace_prepare_failed",
+	"vm_admission_permission_denied",
+	"vm_admission_storage_failed",
 	"vm_admission_unavailable",
 	"vm_slot_unavailable",
 	"prlctl_job_misfire",
@@ -481,6 +483,16 @@ export const PRE_PROVIDER_FAILURE_TRIPLES = Object.freeze([
 		failurePhase: "queue_preflight",
 	}),
 	Object.freeze({
+		diagnosticCode: "vm_admission_permission_denied",
+		errorKind: "environment_incomplete",
+		failurePhase: "queue_preflight",
+	}),
+	Object.freeze({
+		diagnosticCode: "vm_admission_storage_failed",
+		errorKind: "environment_incomplete",
+		failurePhase: "queue_preflight",
+	}),
+	Object.freeze({
 		diagnosticCode: "vm_admission_unavailable",
 		errorKind: "environment_incomplete",
 		failurePhase: "queue_preflight",
@@ -546,6 +558,16 @@ export function classifyPreProviderFailure(error) {
 		Object.hasOwn(LOCK_DIAGNOSTIC_CODES, error.code)
 	) {
 		diagnosticCode = LOCK_DIAGNOSTIC_CODES[error.code];
+	} else if (
+		error.name === "VmAdmissionPermissionDeniedError" &&
+		error.code === "VM_ADMISSION_PERMISSION_DENIED"
+	) {
+		diagnosticCode = "vm_admission_permission_denied";
+	} else if (
+		error.name === "VmAdmissionStorageError" &&
+		error.code === "VM_ADMISSION_STORAGE_FAILED"
+	) {
+		diagnosticCode = "vm_admission_storage_failed";
 	} else if (
 		error.name === "VmAdmissionUnavailableError" &&
 		error.code === "VM_ADMISSION_UNAVAILABLE"

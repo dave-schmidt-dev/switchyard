@@ -88,6 +88,7 @@ import {
 	runQueueAsync,
 } from "../runner/index.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
+import { run as runOrphanLockRemediation } from "./remediate-orphaned-locks.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
 
 const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
@@ -99,6 +100,8 @@ Subcommands:
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
+  remediate-orphaned-locks [--dry-run|--confirm] [--state-root <path>]
+                                                Interactively remediate orphaned project locks
 
 Run/Launch options:
   --project <path>       Host git repo to dispatch against (required)
@@ -161,6 +164,7 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"status",
 	"result",
 	"recover",
+	"remediate-orphaned-locks",
 ]);
 
 // Distinguishes a bad-invocation error (print usage, exit 2) from a real
@@ -1021,6 +1025,7 @@ async function buildLaunchFailureEnvelope(context) {
 		...(durable && recoveryTarget
 			? { recoveryCommand: recoveryCommandFor(recoveryTarget) }
 			: {}),
+		...(durable ? { remediationCommand: remediationCommandFor() } : {}),
 		...(run ? { liveness: classifyRunLiveness(run) } : {}),
 	});
 	return {
@@ -1341,6 +1346,10 @@ function recoveryCommandFor(runId) {
 	return `switchyard-dispatch recover --run ${runId} --state-root ${shellQuote(getStateRoot())}`;
 }
 
+function remediationCommandFor() {
+	return `switchyard-dispatch remediate-orphaned-locks --state-root ${shellQuote(getStateRoot())}`;
+}
+
 function countCompletedAndFailed(events) {
 	let completedCount = 0;
 	let failedCount = 0;
@@ -1628,6 +1637,7 @@ async function buildStatusEnvelope(runId, run) {
 		events: sanitizedExecutionFailureEvents(events),
 		liveness,
 		recoveryCommand: recoveryCommandFor(runId),
+		remediationCommand: remediationCommandFor(),
 		optionalEvidenceValid:
 			events.evidenceValid !== false && checkpointState !== null,
 	});
@@ -1766,6 +1776,7 @@ async function buildResultEnvelope(runId, run) {
 		events: sanitizedExecutionFailureEvents(events),
 		liveness,
 		recoveryCommand: recoveryCommandFor(runId),
+		remediationCommand: remediationCommandFor(),
 		optionalEvidenceValid:
 			events.evidenceValid !== false && checkpointState !== null,
 	});
@@ -2262,6 +2273,42 @@ async function handleRecover(argv, dependencies = {}) {
 	});
 }
 
+function parseOrphanLockRemediationArgs(argv) {
+	let parsed;
+	try {
+		parsed = parseArgs({
+			args: argv,
+			allowPositionals: false,
+			options: {
+				"dry-run": { type: "boolean", default: false },
+				confirm: { type: "boolean", default: false },
+				"state-root": { type: "string" },
+				help: { type: "boolean", default: false },
+			},
+		});
+	} catch (error) {
+		throw new UsageError(error.message);
+	}
+	const forwarded = [];
+	if (parsed.values["dry-run"]) forwarded.push("--dry-run");
+	if (parsed.values.confirm) forwarded.push("--confirm");
+	if (parsed.values.help) forwarded.push("--help");
+	return {
+		argv: forwarded,
+		stateRoot: parsed.values["state-root"] ?? null,
+	};
+}
+
+async function handleOrphanLockRemediation(argv) {
+	const { argv: remediationArgv, stateRoot } =
+		parseOrphanLockRemediationArgs(argv);
+	return withStateRoot(stateRoot, async () => {
+		const result = await runOrphanLockRemediation(remediationArgv);
+		process.exitCode = result.exitCode;
+		return result;
+	});
+}
+
 /**
  * Main entry point: route to subcommand or backwards-compat positional dispatch.
  * @param {string[]} argv process.argv.slice(2)
@@ -2305,6 +2352,10 @@ async function main(argv) {
 				await handleRecover(subArgs);
 				break;
 			}
+			case "remediate-orphaned-locks": {
+				await handleOrphanLockRemediation(subArgs);
+				break;
+			}
 			default:
 				throw new UsageError(`unknown subcommand: ${subcommand}`);
 		}
@@ -2344,6 +2395,7 @@ export {
 	captureHostFingerprint,
 	formatRunAbort,
 	handleLaunch,
+	handleOrphanLockRemediation,
 	handleRecover,
 	handleResult,
 	handleRun,
@@ -2351,6 +2403,7 @@ export {
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseLaunchArgs,
+	parseOrphanLockRemediationArgs,
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,

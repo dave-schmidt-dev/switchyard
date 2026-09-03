@@ -33,6 +33,7 @@ import {
 	releaseProjectLockIfOwnedBy,
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
+import { RUN_STARTUP_GRACE_MS } from "../src/switchyard/run-store/run-liveness.mjs";
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-remediate-locks-"));
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
@@ -88,6 +89,15 @@ function projectLockFilePath(canonicalProjectPath) {
 
 function projectLockClaimFilePath(canonicalProjectPath) {
 	return `${projectLockFilePath(canonicalProjectPath)}.recovery-claim`;
+}
+
+function cwdDerivedProjectLockFilePath(canonicalProjectPath) {
+	const historicalKeyPath = resolve(
+		canonicalProjectPath,
+		`project:${canonicalProjectPath}`,
+	);
+	const hash = createHash("sha256").update(historicalKeyPath).digest("hex");
+	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
 
 async function makeStaleRun(overrides = {}) {
@@ -148,6 +158,115 @@ describe("resolveCandidates", () => {
 		ok(d);
 		strictEqual(d.category, "project-lock-live");
 		strictEqual(d.isCandidate, false);
+	});
+
+	it("offers a cleanup-failed canonical lock only for a proven dead worker", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		const current = await readRun(opts.runId);
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			current.revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const [descriptor] = await resolveCandidates({ now: afterGrace });
+		strictEqual(descriptor.category, "project-lock-cleanup-failed-dead");
+		strictEqual(descriptor.isCandidate, true);
+		strictEqual(descriptor.requiresInteractiveConfirmation, true);
+		strictEqual(descriptor.requiresDeadWorkerRecheck, true);
+
+		const dryRun = await run(["--dry-run"], {
+			log: () => {},
+			now: afterGrace,
+		});
+		deepStrictEqual(dryRun.removed, []);
+		strictEqual(isProjectLockHeld(opts.projectPath), true);
+
+		let prompts = 0;
+		const result = await run(["--confirm"], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => {
+				prompts += 1;
+				return true;
+			},
+		});
+		strictEqual(prompts, 1, "cleanup-failed locks cannot bypass confirmation");
+		strictEqual(result.removed.length, 1);
+		strictEqual(isProjectLockHeld(opts.projectPath), false);
+	});
+
+	it("offers and ownership-safely removes a cleanup-failed cwd-derived lock", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		const current = await readRun(opts.runId);
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			current.revision,
+		);
+		const historicalPath = cwdDerivedProjectLockFilePath(opts.projectPath);
+		writeRawLockBody(historicalPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const [descriptor] = await resolveCandidates({ now: afterGrace });
+		strictEqual(descriptor.category, "project-lock-cleanup-failed-dead");
+		strictEqual(descriptor.remediationKind, "cwd-derived-project-lock");
+		strictEqual(descriptor.requiresInteractiveConfirmation, true);
+
+		const result = await run([], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => true,
+		});
+		strictEqual(result.removed.length, 1);
+		strictEqual(existsSync(historicalPath), false);
+	});
+
+	it("preserves a replacement owner on the cwd-derived lock path", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		const current = await readRun(opts.runId);
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			current.revision,
+		);
+		const historicalPath = cwdDerivedProjectLockFilePath(opts.projectPath);
+		writeRawLockBody(historicalPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const replacementRunId = uniqueRunId();
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+
+		const result = await run([], {
+			log: () => {},
+			now: afterGrace,
+			confirmFn: async () => {
+				writeRawLockBody(historicalPath, {
+					runId: replacementRunId,
+					projectPath: opts.projectPath,
+					createdAt: new Date().toISOString(),
+				});
+				return true;
+			},
+		});
+		deepStrictEqual(result.removed, []);
+		strictEqual(existsSync(historicalPath), true);
+		const replacement = JSON.parse(await readFile(historicalPath, "utf8"));
+		strictEqual(replacement.runId, replacementRunId);
 	});
 
 	it("flags a project lock whose runId has no run.json as a run-missing candidate", async () => {

@@ -95,6 +95,7 @@ import {
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseLaunchArgs,
+	parseOrphanLockRemediationArgs,
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,
@@ -550,6 +551,20 @@ describe("subcommand parsing", () => {
 		const parsed = parseRecoverArgs(["--help"]);
 		strictEqual(parsed.help, true);
 	});
+
+	it("parses the state-root-bound orphan-lock remediation command", () => {
+		deepStrictEqual(
+			parseOrphanLockRemediationArgs([
+				"--dry-run",
+				"--state-root",
+				"/tmp/switchyard state",
+			]),
+			{
+				argv: ["--dry-run"],
+				stateRoot: "/tmp/switchyard state",
+			},
+		);
+	});
 });
 
 describe("usage output", () => {
@@ -657,6 +672,12 @@ describe("CLI exit codes via process spawn", () => {
 	it("status with invalid subcommand name exits 2 (usage error)", () => {
 		const result = runDispatch(["nonexistent-subcommand"]);
 		strictEqual(result.status, 2);
+	});
+
+	it("orphan-lock remediation help exits 0 without changing state", () => {
+		const result = runDispatch(["remediate-orphaned-locks", "--help"]);
+		strictEqual(result.status, 0);
+		ok(result.stdout.includes("Usage: node remediate-orphaned-locks.mjs"));
 	});
 });
 

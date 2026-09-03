@@ -53,6 +53,42 @@ describe("closed pre-provider failure triples", () => {
 		});
 		strictEqual(classifyPreProviderFailure(arbitrary), null);
 	});
+
+	it("keeps admission denials, storage failures, and generic failures distinct", () => {
+		for (const [name, code, diagnosticCode] of [
+			[
+				"VmAdmissionPermissionDeniedError",
+				"VM_ADMISSION_PERMISSION_DENIED",
+				"vm_admission_permission_denied",
+			],
+			[
+				"VmAdmissionStorageError",
+				"VM_ADMISSION_STORAGE_FAILED",
+				"vm_admission_storage_failed",
+			],
+			[
+				"VmAdmissionUnavailableError",
+				"VM_ADMISSION_UNAVAILABLE",
+				"vm_admission_unavailable",
+			],
+		]) {
+			const error = Object.assign(new Error("/private/admission canary"), {
+				name,
+				code,
+			});
+			const classified = classifyPreProviderFailure(error);
+			deepStrictEqual(classified, {
+				diagnosticCode,
+				errorKind: "environment_incomplete",
+				failurePhase: "queue_preflight",
+			});
+			const persisted = JSON.stringify(
+				sanitizeFailureMetadata({ result: "launch_failed", ...classified }),
+			);
+			ok(!persisted.includes("/private/admission"));
+			ok(!persisted.includes("canary"));
+		}
+	});
 });
 
 // Build a thrown-error stand-in shaped like the object execFileSync attaches on
