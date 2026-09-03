@@ -58,6 +58,7 @@ import {
 	releaseRunLock,
 	releaseVmSlot,
 	renewRunLock,
+	runStoreTesting,
 	SchemaError,
 	sanitizeVmAdmissionError,
 	updateRun,
@@ -147,13 +148,22 @@ function uniquePath(label) {
 // Mirrors the private lockFilePath() hashing scheme in run-store/index.mjs
 // so tests can read a lock file's raw JSON body directly.
 function projectLockFilePath(canonicalProjectPath) {
-	const resolvedPath = resolve(`project:${canonicalProjectPath}`);
-	const hash = createHash("sha256").update(resolvedPath).digest("hex");
+	const identity = `project:${resolve(canonicalProjectPath)}`;
+	const hash = createHash("sha256").update(identity).digest("hex");
 	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
 
 function projectLockClaimFilePath(canonicalProjectPath) {
 	return `${projectLockFilePath(canonicalProjectPath)}.recovery-claim`;
+}
+
+function cwdDerivedProjectLockFilePath(canonicalProjectPath) {
+	const historicalKeyPath = resolve(
+		canonicalProjectPath,
+		`project:${canonicalProjectPath}`,
+	);
+	const hash = createHash("sha256").update(historicalKeyPath).digest("hex");
+	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
 
 function makeOptions(overrides = {}) {
@@ -1324,27 +1334,77 @@ describe("project lock", () => {
 		await rejects(acquireProjectLock(path, runId2), LockError);
 	});
 
+	it("uses one canonical identity across child-process working directories", async () => {
+		const projectPath = uniquePath("cross-cwd-project");
+		const cwdA = uniquePath("cross-cwd-a");
+		const cwdB = uniquePath("cross-cwd-b");
+		mkdirSync(cwdA, { recursive: true });
+		mkdirSync(cwdB, { recursive: true });
+		const firstRunId = uniqueRunId();
+		const secondRunId = uniqueRunId();
+		const childSource = (runId) => `
+			import { acquireProjectLock } from ${JSON.stringify(RUN_STORE_MODULE_URL)};
+			try {
+				await acquireProjectLock(${JSON.stringify(projectPath)}, ${JSON.stringify(runId)});
+				console.log("acquired");
+			} catch (error) {
+				console.log(error.code ?? "unknown");
+				process.exitCode = 1;
+			}`;
+		const invoke = (cwd, runId) =>
+			new Promise((resolveChild, reject) => {
+				const child = spawn(
+					process.execPath,
+					["--input-type=module", "-e", childSource(runId)],
+					{
+						cwd,
+						env: {
+							...process.env,
+							SWITCHYARD_RUN_STORE_ROOT: getStateRoot(),
+						},
+					},
+				);
+				let output = "";
+				child.stdout.setEncoding("utf8");
+				child.stdout.on("data", (chunk) => {
+					output += chunk;
+				});
+				child.once("error", reject);
+				child.once("exit", (code) => resolveChild({ code, output }));
+			});
+
+		const first = await invoke(cwdA, firstRunId);
+		const second = await invoke(cwdB, secondRunId);
+		strictEqual(first.code, 0);
+		strictEqual(first.output.trim(), "acquired");
+		strictEqual(second.code, 1);
+		strictEqual(second.output.trim(), "PROJECT_LOCK_HELD");
+		await releaseProjectLock(projectPath, firstRunId);
+	});
+
 	it("isProjectLockHeld reflects lock state", async () => {
 		const path = uniquePath("project");
+		const runId = uniqueRunId();
 		strictEqual(isProjectLockHeld(path), false);
 
-		await acquireProjectLock(path, uniqueRunId());
+		await acquireProjectLock(path, runId);
 		strictEqual(isProjectLockHeld(path), true);
 
-		await releaseProjectLock(path);
+		await releaseProjectLock(path, runId);
 		strictEqual(isProjectLockHeld(path), false);
 	});
 
 	it("release then re-acquire with a different runId succeeds", async () => {
 		const path = uniquePath("project");
-		await acquireProjectLock(path, uniqueRunId());
-		await releaseProjectLock(path);
+		const runId = uniqueRunId();
+		await acquireProjectLock(path, runId);
+		await releaseProjectLock(path, runId);
 		await acquireProjectLock(path, uniqueRunId());
 		ok(true);
 	});
 
 	it("release on non-existent lock does not throw", async () => {
-		await releaseProjectLock(uniquePath("nonexistent"));
+		await releaseProjectLock(uniquePath("nonexistent"), uniqueRunId());
 		ok(true);
 	});
 
@@ -1386,6 +1446,170 @@ describe("project lock", () => {
 		strictEqual(await isProjectLockOwnedBy(path, runId), true);
 		strictEqual(await releaseProjectLockIfOwnedBy(path, runId), true);
 		strictEqual(isProjectLockHeld(path), false);
+	});
+
+	it("blocks and releases a body-validated historical filename", async () => {
+		const projectPath = uniquePath("historical-project");
+		const ownerRunId = uniqueRunId();
+		const historicalPath = join(
+			getStateRoot(),
+			"locks",
+			`${createHash("sha256").update(uniqueRunId()).digest("hex")}.lock`,
+		);
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(
+			historicalPath,
+			JSON.stringify({
+				runId: ownerRunId,
+				projectPath,
+				createdAt: new Date().toISOString(),
+			}),
+		);
+
+		await rejects(
+			acquireProjectLock(projectPath, uniqueRunId()),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+		);
+		strictEqual(
+			await releaseProjectLockIfOwnedBy(projectPath, ownerRunId),
+			true,
+		);
+		strictEqual(existsSync(historicalPath), false);
+	});
+
+	it("fails closed when the canonical recovery claim is malformed", async () => {
+		const projectPath = uniquePath("malformed-canonical-claim");
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(projectLockClaimFilePath(projectPath), "not-json", "utf8");
+
+		await rejects(
+			acquireProjectLock(projectPath, uniqueRunId()),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+		);
+		strictEqual(existsSync(projectLockFilePath(projectPath)), false);
+		strictEqual(existsSync(projectLockClaimFilePath(projectPath)), true);
+	});
+
+	it("blocks pre-projectPath cwd-derived locks and claims", async () => {
+		const projectPath = uniquePath("pre-project-path-historical");
+		const ownerRunId = uniqueRunId();
+		const historicalLockPath = cwdDerivedProjectLockFilePath(projectPath);
+		const ownerRaw = JSON.stringify({
+			runId: ownerRunId,
+			createdAt: new Date().toISOString(),
+		});
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(historicalLockPath, ownerRaw);
+		strictEqual(isProjectLockHeld(projectPath), true);
+
+		await rejects(
+			acquireProjectLock(projectPath, uniqueRunId()),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+		);
+		strictEqual(await releaseProjectLock(projectPath, ownerRunId), true);
+		strictEqual(isProjectLockHeld(projectPath), false);
+
+		writeFileSync(`${historicalLockPath}.recovery-claim`, ownerRaw);
+		strictEqual(isProjectLockHeld(projectPath), true);
+		await rejects(
+			acquireProjectLock(projectPath, uniqueRunId()),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+		);
+		strictEqual(await releaseProjectLock(projectPath, ownerRunId), true);
+		strictEqual(isProjectLockHeld(projectPath), false);
+	});
+
+	it("never deletes a replacement published after an atomic body take", async () => {
+		const opts = makeOptions({ projectPath: uniquePath("atomic-take") });
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		const lockPath = join(
+			getStateRoot(),
+			"locks",
+			`${createHash("sha256").update(uniqueRunId()).digest("hex")}.lock`,
+		);
+		const expectedRaw = JSON.stringify({
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const replacementRaw = JSON.stringify({ runId: uniqueRunId() });
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(lockPath, expectedRaw);
+
+		strictEqual(
+			await runStoreTesting.unlinkBodyMatched(lockPath, expectedRaw, {
+				afterRename: async (proofPath) => {
+					deepStrictEqual(await reconcileProjectLockClaims(), []);
+					strictEqual(existsSync(proofPath), true);
+					writeFileSync(lockPath, replacementRaw);
+				},
+			}),
+			true,
+		);
+		strictEqual(readFileSync(lockPath, "utf8"), replacementRaw);
+	});
+
+	it("blocks and reconciles a crashed pre-projectPath claim proof", async () => {
+		const opts = makeOptions({ projectPath: uniquePath("legacy-proof") });
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		const historicalClaimPath = `${cwdDerivedProjectLockFilePath(opts.projectPath)}.recovery-claim`;
+		const ownerRaw = JSON.stringify({
+			runId: opts.runId,
+			createdAt: new Date().toISOString(),
+		});
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(historicalClaimPath, ownerRaw);
+		let liveProofPath;
+
+		await rejects(
+			runStoreTesting.unlinkBodyMatched(historicalClaimPath, ownerRaw, {
+				afterRename: async (proofPath) => {
+					liveProofPath = proofPath;
+					throw new Error("simulated crash");
+				},
+			}),
+			/simulated crash/,
+		);
+		strictEqual(isProjectLockHeld(opts.projectPath), true);
+		await rejects(
+			acquireProjectLock(opts.projectPath, uniqueRunId()),
+			(error) =>
+				error instanceof LockError &&
+				error.code === "PROJECT_LOCK_RECOVERY_IN_PROGRESS",
+		);
+
+		const deadProofPath = `${historicalClaimPath}.99999999.${randomUUID()}.lock.recovery-claim`;
+		renameSync(liveProofPath, deadProofPath);
+		let repeatedProofPath;
+		await rejects(
+			runStoreTesting.unlinkBodyMatched(deadProofPath, ownerRaw, {
+				afterRename: async (proofPath) => {
+					repeatedProofPath = proofPath;
+					throw new Error("simulated reconciliation crash");
+				},
+			}),
+			/simulated reconciliation crash/,
+		);
+		strictEqual(isProjectLockHeld(opts.projectPath), true);
+		const retryableDeadProofPath = `${historicalClaimPath}.99999998.${randomUUID()}.lock.recovery-claim`;
+		renameSync(repeatedProofPath, retryableDeadProofPath);
+		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
+		strictEqual(existsSync(retryableDeadProofPath), false);
+		strictEqual(isProjectLockHeld(opts.projectPath), false);
 	});
 });
 
@@ -1509,6 +1733,100 @@ describe("project lock recovery claims", () => {
 			readFileSync(projectLockFilePath(opts.projectPath), "utf8"),
 			expectedRaw,
 		);
+	});
+
+	it("reconciles a dead reservation proof after its lock bytes changed", async () => {
+		const opts = makeOptions({ projectPath: uniquePath("reservation-proof") });
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { cleanupState: "complete" }, current.revision);
+		const expectedRaw = JSON.stringify({
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const replacementRaw = JSON.stringify({
+			runId: uniqueRunId(),
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		const lockPath = projectLockFilePath(opts.projectPath);
+		const proofPath = `${projectLockClaimFilePath(opts.projectPath)}.99999999.${randomUUID()}.lock.recovery-claim`;
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(lockPath, replacementRaw);
+		writeFileSync(
+			proofPath,
+			JSON.stringify({ claimState: "reservation", expectedRaw }),
+		);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
+		strictEqual(existsSync(proofPath), false);
+		strictEqual(readFileSync(lockPath, "utf8"), replacementRaw);
+	});
+
+	it("reconciles historical reservation and post-rename interruption claims", async () => {
+		const opts = makeOptions({ projectPath: uniquePath("historical-claim") });
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const historicalLockPath = join(
+			getStateRoot(),
+			"locks",
+			`${createHash("sha256").update(uniqueRunId()).digest("hex")}.lock`,
+		);
+		const ownerRaw = JSON.stringify({
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(historicalLockPath, ownerRaw);
+		writeFileSync(
+			`${historicalLockPath}.recovery-claim`,
+			JSON.stringify({ claimState: "reservation", expectedRaw: ownerRaw }),
+		);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
+		strictEqual(existsSync(`${historicalLockPath}.recovery-claim`), false);
+		strictEqual(readFileSync(historicalLockPath, "utf8"), ownerRaw);
+
+		renameSync(historicalLockPath, `${historicalLockPath}.recovery-claim`);
+		deepStrictEqual(await reconcileProjectLockClaims(), [opts.runId]);
+		strictEqual(existsSync(`${historicalLockPath}.recovery-claim`), false);
+	});
+
+	it("retains a claim whose project path disagrees with its run record", async () => {
+		const opts = makeOptions({
+			projectPath: uniquePath("claim-owner-project"),
+		});
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const mismatchedProjectPath = uniquePath("claim-mismatched-project");
+		const historicalClaimPath = join(
+			getStateRoot(),
+			"locks",
+			`${createHash("sha256").update(uniqueRunId()).digest("hex")}.lock.recovery-claim`,
+		);
+		const claimRaw = JSON.stringify({
+			runId: opts.runId,
+			projectPath: mismatchedProjectPath,
+			createdAt: new Date().toISOString(),
+		});
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(historicalClaimPath, claimRaw);
+
+		deepStrictEqual(await reconcileProjectLockClaims(), []);
+		strictEqual(readFileSync(historicalClaimPath, "utf8"), claimRaw);
 	});
 
 	it("retains reservations when canonical bytes change or owner is live", async () => {
@@ -2083,6 +2401,35 @@ describe("releaseOrphanedProjectLocks", () => {
 
 		ok(!reclaimed.includes(ghostRunId));
 		strictEqual(isProjectLockHeld(path), true);
+	});
+
+	it("retains a lock whose project path disagrees with its run record", async () => {
+		const opts = makeOptions({
+			projectPath: uniquePath("orphan-owner-project"),
+		});
+		await initializeRun(opts);
+		await advanceState(opts.runId, "failed");
+		await updateRun(
+			opts.runId,
+			{ cleanupState: "complete" },
+			(await readRun(opts.runId)).revision,
+		);
+		const mismatchedProjectPath = uniquePath("orphan-mismatched-project");
+		const mismatchedLockPath = join(
+			getStateRoot(),
+			"locks",
+			`${createHash("sha256").update(uniqueRunId()).digest("hex")}.lock`,
+		);
+		const lockRaw = JSON.stringify({
+			runId: opts.runId,
+			projectPath: mismatchedProjectPath,
+			createdAt: new Date().toISOString(),
+		});
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(mismatchedLockPath, lockRaw);
+
+		deepStrictEqual(await releaseOrphanedProjectLocks(), []);
+		strictEqual(readFileSync(mismatchedLockPath, "utf8"), lockRaw);
 	});
 
 	it("does not release a lock already reassigned to a newer active run on the same project", async () => {

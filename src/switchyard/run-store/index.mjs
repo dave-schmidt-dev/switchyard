@@ -3,6 +3,7 @@ import {
 	existsSync,
 	linkSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
 	statSync,
@@ -22,7 +23,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	isPersistentFailureMetadata,
@@ -469,8 +470,20 @@ function lockFilePath(canonicalPath) {
 	return resolve(locksRoot(), `${hash}.lock`);
 }
 
+function resolveCanonicalProjectPath(projectPath) {
+	return resolve(projectPath);
+}
+
+function projectLockFileName(projectPath) {
+	// Keep the namespace as data for the hash, rather than handing a
+	// namespace-prefixed string to path.resolve(). The latter made the lock
+	// identity depend on this process's cwd.
+	const identity = `project:${resolveCanonicalProjectPath(projectPath)}`;
+	return `${createHash("sha256").update(identity).digest("hex")}.lock`;
+}
+
 function projectLockPath(canonicalProjectPath) {
-	return lockFilePath(`project:${canonicalProjectPath}`);
+	return resolve(locksRoot(), projectLockFileName(canonicalProjectPath));
 }
 
 function projectLockClaimPath(canonicalProjectPath) {
@@ -505,6 +518,10 @@ function parseOwnedProjectLockBody(raw, canonicalProjectPath) {
 	// Pre-F.1 project locks did not persist projectPath. The canonical hashed
 	// path still identifies the project, so an exact runId remains sufficient
 	// for ownership checks and release compatibility.
+	return parseLegacyProjectLockBody(raw);
+}
+
+function parseLegacyProjectLockBody(raw) {
 	try {
 		const legacyBody = JSON.parse(raw);
 		if (
@@ -532,34 +549,46 @@ async function readTextIfPresent(path) {
 	}
 }
 
-async function unlinkBodyMatched(path, expectedRaw) {
-	const proofPath = `${path}.${process.pid}.${randomUUID()}.unlink-proof`;
+async function unlinkBodyMatched(path, expectedRaw, options = {}) {
+	// Atomically take the directory entry before inspecting it. A read followed
+	// by unlink(path) can delete a replacement created in between; renaming to a
+	// unique recovery-claim path means only the inode actually taken can be
+	// deleted. A mismatched inode is restored without clobbering, or retained as
+	// discoverable recovery evidence if the original path is already occupied.
+	const existingProof = recoveryProofMetadata(basename(path));
+	const originalName = existingProof?.originalName ?? basename(path);
+	const proofPath = resolve(
+		locksRoot(),
+		`${originalName}.${process.pid}.${randomUUID()}.lock.recovery-claim`,
+	);
 	try {
-		await link(path, proofPath);
+		await rename(path, proofPath);
 	} catch (error) {
 		if (error.code === "ENOENT") return false;
 		throw error;
 	}
-	let removed = false;
-	let cleanupError = null;
-	try {
-		const [currentRaw, proofRaw] = await Promise.all([
-			readTextIfPresent(path),
-			readFile(proofPath, "utf8"),
-		]);
-		if (currentRaw === expectedRaw && proofRaw === expectedRaw) {
-			await unlink(path);
-			removed = true;
-		}
-	} finally {
-		try {
-			await unlink(proofPath);
-		} catch (error) {
-			if (error.code !== "ENOENT") cleanupError = error;
-		}
+	if (typeof options.afterRename === "function") {
+		await options.afterRename(proofPath);
 	}
-	if (cleanupError) throw cleanupError;
-	return removed;
+	const proofRaw = await readFile(proofPath, "utf8");
+	if (proofRaw === expectedRaw) {
+		await unlink(proofPath);
+		return true;
+	}
+	await restoreClaimWithoutClobber(proofPath, path, proofRaw);
+	return false;
+}
+
+const RECOVERY_PROOF_SUFFIX =
+	/^([0-9a-f]{64}\.lock(?:\.recovery-claim)?)\.([1-9]\d*)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.lock\.recovery-claim$/;
+
+function recoveryProofMetadata(name) {
+	const match = RECOVERY_PROOF_SUFFIX.exec(name);
+	if (!match) return null;
+	const ownerPid = Number(match[2]);
+	return Number.isSafeInteger(ownerPid)
+		? { originalName: match[1], ownerPid }
+		: null;
 }
 
 async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
@@ -574,6 +603,11 @@ async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
 	await unlinkBodyMatched(claimPath, raw);
 	return true;
 }
+
+export const runStoreTesting = Object.freeze({
+	projectLockArtifacts,
+	unlinkBodyMatched,
+});
 
 async function moveProjectLockPathToClaim(
 	lockPath,
@@ -626,21 +660,78 @@ async function moveProjectLockPathToClaim(
 	}
 }
 
-async function moveProjectLockToClaim(canonicalProjectPath, expectedRaw) {
-	return moveProjectLockPathToClaim(
-		projectLockPath(canonicalProjectPath),
-		projectLockClaimPath(canonicalProjectPath),
-		canonicalProjectPath,
-		expectedRaw,
-	);
-}
-
 function cwdDerivedProjectLockPath(canonicalProjectPath) {
 	const historicalKeyPath = resolve(
 		canonicalProjectPath,
 		`project:${canonicalProjectPath}`,
 	);
 	return lockFilePath(historicalKeyPath);
+}
+
+function parseProjectLockArtifact(raw, projectPath, isOwnedPath) {
+	return isOwnedPath
+		? parseOwnedProjectLockBody(raw, projectPath)
+		: parseProjectLockBody(raw, projectPath);
+}
+
+async function projectLockArtifacts(projectPath) {
+	const canonicalPath = resolveCanonicalProjectPath(projectPath);
+	const canonicalLockPath = projectLockPath(canonicalPath);
+	const cwdDerivedLockPath = cwdDerivedProjectLockPath(canonicalPath);
+	let entries;
+	try {
+		entries = await readdir(locksRoot(), { withFileTypes: true });
+	} catch (error) {
+		if (error.code === "ENOENT") return [];
+		throw error;
+	}
+	const artifacts = [];
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const isClaim = entry.name.endsWith(".lock.recovery-claim");
+		if (!isClaim && !entry.name.endsWith(".lock")) continue;
+		const path = resolve(locksRoot(), entry.name);
+		const proof = recoveryProofMetadata(entry.name);
+		const raw = await readTextIfPresent(path).catch(() => null);
+		if (raw === null) continue;
+		const originalPath = proof
+			? resolve(locksRoot(), proof.originalName)
+			: path;
+		const lockPath = originalPath.endsWith(".lock.recovery-claim")
+			? originalPath.slice(0, -".recovery-claim".length)
+			: originalPath;
+		const isOwnedPath =
+			lockPath === canonicalLockPath || lockPath === cwdDerivedLockPath;
+		if (!isClaim) {
+			const body = parseProjectLockArtifact(raw, canonicalPath, isOwnedPath);
+			if (body) artifacts.push({ body, kind: "lock", lockPath, path, raw });
+			continue;
+		}
+		const reservation = parseRecoveryReservation(raw);
+		if (reservation) {
+			const body = parseProjectLockArtifact(
+				reservation.expectedRaw,
+				canonicalPath,
+				isOwnedPath,
+			);
+			if (body) {
+				artifacts.push({
+					body,
+					claimPath: path,
+					kind: "reservation",
+					lockPath,
+					raw,
+					reservation,
+				});
+			}
+			continue;
+		}
+		const body = parseProjectLockArtifact(raw, canonicalPath, isOwnedPath);
+		if (body) {
+			artifacts.push({ body, claimPath: path, kind: "claim", lockPath, raw });
+		}
+	}
+	return artifacts;
 }
 
 function parseRecoveryReservation(raw) {
@@ -1781,16 +1872,26 @@ export async function releaseLaunchLock(canonicalTasksPath) {
  * @returns {Promise<void>}
  */
 export async function acquireProjectLock(canonicalProjectPath, runId) {
+	canonicalProjectPath = resolveCanonicalProjectPath(canonicalProjectPath);
 	await ensureDir(locksRoot(), 0o700);
 	const lockPath = projectLockPath(canonicalProjectPath);
 	const claimPath = projectLockClaimPath(canonicalProjectPath);
+	const historicalLockPath = cwdDerivedProjectLockPath(canonicalProjectPath);
+	const historicalClaimPath = `${historicalLockPath}.recovery-claim`;
 	const content = JSON.stringify({
 		runId,
 		createdAt: new Date().toISOString(),
 		projectPath: canonicalProjectPath,
 		holderPid: process.pid,
 	});
-	if (existsSync(claimPath)) {
+	if (
+		existsSync(claimPath) ||
+		existsSync(historicalLockPath) ||
+		existsSync(historicalClaimPath) ||
+		(await projectLockArtifacts(canonicalProjectPath)).some(
+			(artifact) => artifact.kind !== "lock" || artifact.lockPath !== lockPath,
+		)
+	) {
 		throw new LockError(
 			`Project lock recovery is in progress for ${canonicalProjectPath}`,
 			{ code: "PROJECT_LOCK_RECOVERY_IN_PROGRESS" },
@@ -1814,7 +1915,14 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
 		}
 		throw e;
 	}
-	if (existsSync(claimPath)) {
+	if (
+		existsSync(claimPath) ||
+		existsSync(historicalLockPath) ||
+		existsSync(historicalClaimPath) ||
+		(await projectLockArtifacts(canonicalProjectPath)).some(
+			(artifact) => artifact.path !== lockPath,
+		)
+	) {
 		await unlinkBodyMatched(lockPath, content);
 		throw new LockError(
 			`Project lock recovery is in progress for ${canonicalProjectPath}`,
@@ -1827,22 +1935,14 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
  * Release the project lock for the given canonical project path.
  *
  * @param {string} canonicalProjectPath
- * @returns {Promise<void>}
+ * @param {string} expectedRunId
+ * @returns {Promise<boolean>}
  */
-export async function releaseProjectLock(canonicalProjectPath) {
-	await reconcileProjectLockClaims();
-	const raw = await readTextIfPresent(projectLockPath(canonicalProjectPath));
-	if (raw === null) return false;
-	const body = parseProjectLockBody(raw, canonicalProjectPath);
-	if (!body) return false;
-	const runArgIndex = process.argv.indexOf("--run-id");
-	const workerRunId =
-		runArgIndex >= 0 && runArgIndex + 1 < process.argv.length
-			? process.argv[runArgIndex + 1]
-			: null;
-	if (body.holderPid !== process.pid && body.runId !== workerRunId)
+export async function releaseProjectLock(canonicalProjectPath, expectedRunId) {
+	if (typeof expectedRunId !== "string" || expectedRunId.length === 0) {
 		return false;
-	return releaseProjectLockIfOwnedBy(canonicalProjectPath, body.runId);
+	}
+	return releaseProjectLockIfOwnedBy(canonicalProjectPath, expectedRunId);
 }
 
 /**
@@ -1863,14 +1963,42 @@ export async function releaseProjectLockIfOwnedBy(
 	canonicalProjectPath,
 	expectedRunId,
 ) {
-	const lockPath = projectLockPath(canonicalProjectPath);
-	const raw = await readTextIfPresent(lockPath);
-	if (raw === null) return false;
-	const body = parseOwnedProjectLockBody(raw, canonicalProjectPath);
-	if (!body || body.runId !== expectedRunId) return false;
-	const claimed = await moveProjectLockToClaim(canonicalProjectPath, raw);
-	if (!claimed) return false;
-	return unlinkBodyMatched(claimed.claimPath, claimed.raw);
+	const projectPath = resolveCanonicalProjectPath(canonicalProjectPath);
+	let released = false;
+	for (const artifact of await projectLockArtifacts(projectPath)) {
+		if (artifact.body.runId !== expectedRunId) continue;
+		if (artifact.kind === "claim") {
+			released =
+				(await unlinkBodyMatched(artifact.claimPath, artifact.raw)) || released;
+			continue;
+		}
+		if (artifact.kind === "reservation") {
+			const lockRaw = await readTextIfPresent(artifact.lockPath);
+			if (lockRaw !== artifact.reservation.expectedRaw) continue;
+			if (!(await unlinkBodyMatched(artifact.claimPath, artifact.raw)))
+				continue;
+		}
+		const raw = await readTextIfPresent(artifact.lockPath);
+		if (raw === null) continue;
+		const body = parseProjectLockArtifact(
+			raw,
+			projectPath,
+			artifact.lockPath === projectLockPath(projectPath) ||
+				artifact.lockPath === cwdDerivedProjectLockPath(projectPath),
+		);
+		if (!body || body.runId !== expectedRunId) continue;
+		const claimed = await moveProjectLockPathToClaim(
+			artifact.lockPath,
+			`${artifact.lockPath}.recovery-claim`,
+			projectPath,
+			raw,
+		);
+		if (claimed) {
+			released =
+				(await unlinkBodyMatched(claimed.claimPath, claimed.raw)) || released;
+		}
+	}
+	return released;
 }
 
 /**
@@ -1887,10 +2015,11 @@ export async function releaseCwdDerivedProjectLockIfOwnedBy(
 	canonicalProjectPath,
 	expectedRunId,
 ) {
+	canonicalProjectPath = resolveCanonicalProjectPath(canonicalProjectPath);
 	const lockPath = cwdDerivedProjectLockPath(canonicalProjectPath);
 	const raw = await readTextIfPresent(lockPath);
 	if (raw === null) return false;
-	const body = parseProjectLockBody(raw, canonicalProjectPath);
+	const body = parseOwnedProjectLockBody(raw, canonicalProjectPath);
 	if (!body || body.runId !== expectedRunId) return false;
 	const claimPath = `${lockPath}.recovery-claim`;
 	const claimed = await moveProjectLockPathToClaim(
@@ -1916,16 +2045,9 @@ export async function isProjectLockOwnedBy(
 	canonicalProjectPath,
 	expectedRunId,
 ) {
-	for (const path of [
-		projectLockPath(canonicalProjectPath),
-		projectLockClaimPath(canonicalProjectPath),
-	]) {
-		const raw = await readTextIfPresent(path);
-		if (raw === null) continue;
-		const body = parseOwnedProjectLockBody(raw, canonicalProjectPath);
-		if (body?.runId === expectedRunId) return true;
-	}
-	return false;
+	return (await projectLockArtifacts(canonicalProjectPath)).some(
+		(artifact) => artifact.body.runId === expectedRunId,
+	);
 }
 
 async function markClaimCleanupFailure(runId) {
@@ -1953,11 +2075,21 @@ export async function assertProjectLockOwnership(
 ) {
 	const unlinkMatched = options.unlinkBodyMatched ?? unlinkBodyMatched;
 	await reconcileProjectLockClaims();
-	const lockPath = projectLockPath(canonicalProjectPath);
-	const claimPath = projectLockClaimPath(canonicalProjectPath);
-	const claimRaw = await readTextIfPresent(claimPath);
-	if (claimRaw !== null) {
-		const claimBody = parseProjectLockBody(claimRaw, canonicalProjectPath);
+	const projectPath = resolveCanonicalProjectPath(canonicalProjectPath);
+	const artifacts = await projectLockArtifacts(projectPath);
+	const claimArtifact = artifacts.find(
+		(artifact) => artifact.kind === "claim" || artifact.kind === "reservation",
+	);
+	if (claimArtifact) {
+		if (claimArtifact.kind === "reservation") {
+			throw new LockError("Project lock recovery claim blocks execution", {
+				code: "PROJECT_LOCK_RECOVERY_CLAIM_BLOCKS_EXECUTION",
+			});
+		}
+		const lockPath = claimArtifact.lockPath;
+		const claimPath = claimArtifact.claimPath;
+		const claimRaw = claimArtifact.raw;
+		const claimBody = claimArtifact.body;
 		if (claimBody?.runId === runId) {
 			const restoredBody = JSON.stringify({
 				...claimBody,
@@ -1997,9 +2129,19 @@ export async function assertProjectLockOwnership(
 		});
 	}
 
-	const raw = await readTextIfPresent(lockPath);
+	const lockArtifact = artifacts.find((artifact) => artifact.kind === "lock");
+	const lockPath = lockArtifact?.lockPath ?? projectLockPath(projectPath);
+	const claimPath = `${lockPath}.recovery-claim`;
+	const raw = lockArtifact?.raw ?? (await readTextIfPresent(lockPath));
 	const body =
-		raw === null ? null : parseProjectLockBody(raw, canonicalProjectPath);
+		raw === null
+			? null
+			: parseProjectLockArtifact(
+					raw,
+					projectPath,
+					lockPath === projectLockPath(projectPath) ||
+						lockPath === cwdDerivedProjectLockPath(projectPath),
+				);
 	if (!body || body.runId !== runId) {
 		throw new LockError("Project lock ownership assertion failed", {
 			code: "PROJECT_LOCK_OWNERSHIP_FAILED",
@@ -2007,7 +2149,12 @@ export async function assertProjectLockOwnership(
 	}
 	if (body.holderPid === process.pid) return true;
 
-	const claimed = await moveProjectLockToClaim(canonicalProjectPath, raw);
+	const claimed = await moveProjectLockPathToClaim(
+		lockPath,
+		claimPath,
+		projectPath,
+		raw,
+	);
 	if (!claimed) {
 		throw new LockError("Project lock ownership assertion failed", {
 			code: "PROJECT_LOCK_OWNERSHIP_FAILED",
@@ -2053,10 +2200,54 @@ export async function assertProjectLockOwnership(
  * @returns {boolean}
  */
 export function isProjectLockHeld(canonicalProjectPath) {
-	return (
-		existsSync(projectLockPath(canonicalProjectPath)) ||
-		existsSync(projectLockClaimPath(canonicalProjectPath))
-	);
+	const projectPath = resolveCanonicalProjectPath(canonicalProjectPath);
+	const canonicalLockPath = projectLockPath(projectPath);
+	const historicalLockPath = cwdDerivedProjectLockPath(projectPath);
+	if (
+		existsSync(canonicalLockPath) ||
+		existsSync(projectLockClaimPath(projectPath)) ||
+		existsSync(historicalLockPath) ||
+		existsSync(`${historicalLockPath}.recovery-claim`)
+	) {
+		return true;
+	}
+	try {
+		return readdirSync(locksRoot(), { withFileTypes: true }).some((entry) => {
+			if (!entry.isFile()) return false;
+			const isClaim = entry.name.endsWith(".lock.recovery-claim");
+			if (!isClaim && !entry.name.endsWith(".lock")) return false;
+			const path = resolve(locksRoot(), entry.name);
+			const proof = recoveryProofMetadata(entry.name);
+			const originalPath = proof
+				? resolve(locksRoot(), proof.originalName)
+				: path;
+			const lockPath = originalPath.endsWith(".lock.recovery-claim")
+				? originalPath.slice(0, -".recovery-claim".length)
+				: originalPath;
+			const isOwnedPath =
+				lockPath === canonicalLockPath || lockPath === historicalLockPath;
+			if (isOwnedPath) return true;
+			try {
+				const raw = readFileSync(path, "utf8");
+				if (!isClaim)
+					return (
+						parseProjectLockArtifact(raw, projectPath, isOwnedPath) !== null
+					);
+				const reservation = parseRecoveryReservation(raw);
+				return reservation
+					? parseProjectLockArtifact(
+							reservation.expectedRaw,
+							projectPath,
+							isOwnedPath,
+						) !== null
+					: parseProjectLockArtifact(raw, projectPath, isOwnedPath) !== null;
+			} catch {
+				return false;
+			}
+		});
+	} catch {
+		return false;
+	}
 }
 
 // Host-global ceiling on concurrently running macOS guests, imposed by Apple's
@@ -2282,72 +2473,121 @@ export async function reconcileProjectLockClaims() {
 		if (!entry.isFile() || !entry.name.endsWith(".lock.recovery-claim")) {
 			continue;
 		}
+		const proof = recoveryProofMetadata(entry.name);
+		if (proof !== null && vmOwnerIsLive(proof.ownerPid)) continue;
 		const claimPath = resolve(locksRoot(), entry.name);
+		const originalPath = proof
+			? resolve(locksRoot(), proof.originalName)
+			: claimPath;
+		const lockPath = originalPath.endsWith(".lock.recovery-claim")
+			? originalPath.slice(0, -".recovery-claim".length)
+			: originalPath;
 		const raw = await readTextIfPresent(claimPath).catch(() => null);
 		if (raw === null) continue;
 		const reservation = parseRecoveryReservation(raw);
 		if (reservation) {
-			const ownerBody = parseProjectLockBody(reservation.expectedRaw);
-			if (!ownerBody) continue;
-			const expectedLockName = `${entry.name.slice(0, -".recovery-claim".length)}`;
-			if (
-				projectLockPath(ownerBody.projectPath) !==
-				resolve(locksRoot(), expectedLockName)
-			) {
-				continue;
+			let parsedOwnerBody = parseProjectLockBody(reservation.expectedRaw);
+			if (!parsedOwnerBody?.projectPath && proof) {
+				const legacyBody = parseLegacyProjectLockBody(reservation.expectedRaw);
+				if (legacyBody) {
+					try {
+						const legacyRun = await readRun(legacyBody.runId);
+						const projectPath = resolveCanonicalProjectPath(
+							legacyRun.projectPath,
+						);
+						if (
+							lockPath === projectLockPath(projectPath) ||
+							lockPath === cwdDerivedProjectLockPath(projectPath)
+						) {
+							parsedOwnerBody = { ...legacyBody, projectPath };
+						}
+					} catch {
+						// Missing or malformed run evidence cannot bind a legacy proof.
+					}
+				}
 			}
-			const canonicalRaw = await readTextIfPresent(
-				projectLockPath(ownerBody.projectPath),
-			).catch(() => null);
-			// A reservation is recoverable only in the pre-rename crash window:
-			// the canonical lock must still be the exact validated owner bytes.
-			if (canonicalRaw !== reservation.expectedRaw) continue;
+			if (!parsedOwnerBody?.projectPath) continue;
+			const canonicalRaw = await readTextIfPresent(lockPath).catch(() => null);
+			// An ordinary reservation may still coordinate an active recoverer, so
+			// its lock bytes must match. A PID-bearing proof is the atomically taken
+			// reservation itself; once that PID is dead, a mismatch means the
+			// cleanup path was interrupted and the proof can be reconciled safely.
+			if (!proof && canonicalRaw !== reservation.expectedRaw) continue;
 			let run;
 			try {
-				run = await readRun(ownerBody.runId);
+				run = await readRun(parsedOwnerBody.runId);
 			} catch {
+				continue;
+			}
+			if (
+				typeof run.projectPath !== "string" ||
+				resolveCanonicalProjectPath(run.projectPath) !==
+					resolveCanonicalProjectPath(parsedOwnerBody.projectPath)
+			) {
 				continue;
 			}
 			const liveness = classifyRunLiveness(run);
 			if (liveness !== "terminal_clean" && liveness !== "dead") continue;
 			try {
 				if (await unlinkBodyMatched(claimPath, raw)) {
-					reclaimed.push(ownerBody.runId);
+					reclaimed.push(parsedOwnerBody.runId);
 				}
 			} catch {
 				// One attempt per claim. A later reconciliation may retry it.
 			}
 			continue;
 		}
-		const body = parseProjectLockBody(raw);
-		if (!body) continue;
-		if (
-			projectLockPath(body.projectPath) !==
-			resolve(locksRoot(), entry.name.slice(0, -".recovery-claim".length))
-		) {
-			continue;
+		let parsedBody = parseProjectLockBody(raw);
+		if (!parsedBody?.projectPath && proof) {
+			const legacyBody = parseLegacyProjectLockBody(raw);
+			if (legacyBody) {
+				try {
+					const legacyRun = await readRun(legacyBody.runId);
+					const projectPath = resolveCanonicalProjectPath(
+						legacyRun.projectPath,
+					);
+					if (
+						lockPath === projectLockPath(projectPath) ||
+						lockPath === cwdDerivedProjectLockPath(projectPath)
+					) {
+						parsedBody = { ...legacyBody, projectPath };
+					}
+				} catch {
+					// Missing or malformed run evidence cannot bind a legacy proof.
+				}
+			}
 		}
+		if (!parsedBody?.projectPath) continue;
 		let run;
 		try {
-			run = await readRun(body.runId);
+			run = await readRun(parsedBody.runId);
 		} catch {
 			continue;
 		}
+		if (
+			typeof run.projectPath !== "string" ||
+			resolveCanonicalProjectPath(run.projectPath) !==
+				resolveCanonicalProjectPath(parsedBody.projectPath)
+		) {
+			continue;
+		}
 		if (run.cleanupState === "failed") {
-			const canonicalRaw = await readTextIfPresent(
-				projectLockPath(body.projectPath),
-			).catch(() => null);
-			const canonicalBody =
-				canonicalRaw === null
-					? null
-					: parseProjectLockBody(canonicalRaw, body.projectPath);
-			if (!canonicalBody || canonicalBody.runId === body.runId) continue;
+			const replacement = (
+				await projectLockArtifacts(parsedBody.projectPath)
+			).find(
+				(artifact) =>
+					artifact.kind === "lock" &&
+					artifact.lockPath === projectLockPath(parsedBody.projectPath) &&
+					artifact.body.runId !== parsedBody.runId,
+			);
+			if (!replacement) continue;
 		} else {
 			const liveness = classifyRunLiveness(run);
 			if (liveness !== "terminal_clean" && liveness !== "dead") continue;
 		}
 		try {
-			if (await unlinkBodyMatched(claimPath, raw)) reclaimed.push(body.runId);
+			if (await unlinkBodyMatched(claimPath, raw))
+				reclaimed.push(parsedBody.runId);
 		} catch {
 			// One attempt per claim. A later reconciliation may retry it.
 		}
@@ -2439,6 +2679,13 @@ export async function releaseOrphanedProjectLocks() {
 			// a resolvable-but-dead run, so this cannot be proven stale.
 			// "Cannot identify, leave alone" per CR-4/CR-5 — see the doc
 			// comment above. Deferred to F.3's manual remediation.
+			continue;
+		}
+		if (
+			typeof run.projectPath !== "string" ||
+			resolveCanonicalProjectPath(run.projectPath) !==
+				resolveCanonicalProjectPath(body.projectPath)
+		) {
 			continue;
 		}
 

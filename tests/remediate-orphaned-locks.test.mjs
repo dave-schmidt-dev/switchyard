@@ -82,8 +82,8 @@ function makeOptions(overrides = {}) {
 // pre-F.1-shape lock body ({runId, createdAt}, no projectPath) directly at
 // the exact path a real project lock for that path would occupy.
 function projectLockFilePath(canonicalProjectPath) {
-	const resolvedPath = resolve(`project:${canonicalProjectPath}`);
-	const hash = createHash("sha256").update(resolvedPath).digest("hex");
+	const identity = `project:${resolve(canonicalProjectPath)}`;
+	const hash = createHash("sha256").update(identity).digest("hex");
 	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
 
@@ -229,6 +229,25 @@ describe("resolveCandidates", () => {
 			confirmFn: async () => true,
 		});
 		strictEqual(result.removed.length, 1);
+		strictEqual(existsSync(historicalPath), false);
+	});
+
+	it("confirms and removes an exact pre-F.1 cwd-derived lock", async () => {
+		const opts = await makeStaleRun();
+		const historicalPath = cwdDerivedProjectLockFilePath(opts.projectPath);
+		writeRawLockBody(historicalPath, {
+			runId: opts.runId,
+			createdAt: new Date().toISOString(),
+		});
+
+		const [descriptor] = await resolveCandidates();
+		strictEqual(descriptor.category, "project-lock-stale");
+		strictEqual(descriptor.remediationKind, "cwd-derived-project-lock");
+		const result = await run(["--confirm"], {
+			log: () => {},
+			confirmFn: async () => true,
+		});
+		deepStrictEqual(result.removed, [descriptor.name]);
 		strictEqual(existsSync(historicalPath), false);
 	});
 

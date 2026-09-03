@@ -14,7 +14,8 @@
 //
 // Hard invariant: this script NEVER unlinks a lock by its bare filename or
 // from a list computed at some earlier time. Every removal goes through
-// the run-store's canonical or cwd-derived ownership-checked release helper,
+// the run-store's canonical or body-bound historical ownership-checked release
+// path,
 // which re-reads the lock file at the moment of deletion and only removes it
 // if the recorded runId still matches what was resolved — so a lock
 // legitimately reassigned to a new, live run between candidate resolution
@@ -73,8 +74,8 @@ valid, bound, provably stale claims are removable.
 With neither flag, runs interactively: prints the candidate set, then asks
 for explicit y/n confirmation before removing anything.
 
-Every removal is ownership-checked via the run-store's canonical or
-cwd-derived release helper, or its recovery-claim reconciler, at the moment of
+Every removal is ownership-checked via the run-store's canonical or body-bound
+historical release path, or its recovery-claim reconciler, at the moment of
 deletion — never a blind unlink by filename.`;
 
 class UsageError extends Error {}
@@ -99,16 +100,14 @@ function locksDir() {
 	return resolve(getStateRoot(), "locks");
 }
 
-// Mirrors run-store/index.mjs's private lockFilePath() hashing scheme for
-// the project-lock key exactly (including the `project:` prefix passed
-// through resolve() before hashing), so a projectPath recovered via the
-// run's own record can be checked against the actual on-disk lock filename.
+// Mirrors run-store/index.mjs's canonical project-lock hashing scheme. The
+// namespace is hash input, never a path passed through resolve().
 // Read-only: this is used to positively identify a lock, never to derive an
 // unlink target directly — every removal still goes through
 // releaseProjectLockIfOwnedBy.
 function projectLockFileName(canonicalProjectPath) {
-	const resolvedPath = resolve(`project:${canonicalProjectPath}`);
-	return `${createHash("sha256").update(resolvedPath).digest("hex")}.lock`;
+	const identity = `project:${resolve(canonicalProjectPath)}`;
+	return `${createHash("sha256").update(identity).digest("hex")}.lock`;
 }
 
 function cwdDerivedProjectLockFileName(canonicalProjectPath) {
@@ -290,7 +289,12 @@ export async function resolveCandidates(dependencies = {}) {
 					!expectedBody ||
 					typeof expectedBody.runId !== "string" ||
 					typeof expectedBody.projectPath !== "string" ||
-					projectLockFileName(expectedBody.projectPath) !== claimBaseName
+					(projectLockFileName(expectedBody.projectPath) !== claimBaseName &&
+						cwdDerivedProjectLockFileName(expectedBody.projectPath) !==
+							claimBaseName &&
+						(await readFile(resolve(dir, claimBaseName), "utf8").catch(
+							() => null,
+						)) !== reservation.expectedRaw)
 				) {
 					descriptors.push(
 						recoveryClaimDescriptor(entry, lockPath, {
@@ -310,18 +314,18 @@ export async function resolveCandidates(dependencies = {}) {
 				} catch {
 					run = null;
 				}
-				const canonicalPath = resolve(
-					dir,
-					projectLockFileName(expectedBody.projectPath),
-				);
-				let canonicalRaw = null;
+				const correspondingLockPath = resolve(dir, claimBaseName);
+				let correspondingLockRaw = null;
 				try {
-					canonicalRaw = await readFile(canonicalPath, "utf8");
+					correspondingLockRaw = await readFile(correspondingLockPath, "utf8");
 				} catch {
-					// Missing or unreadable canonical evidence is not removable.
+					// Missing or unreadable corresponding evidence is not removable.
 				}
-				const bound = canonicalRaw === reservation.expectedRaw;
-				const stale = run !== null && isTerminalOrDead(run);
+				const bound = correspondingLockRaw === reservation.expectedRaw;
+				const runProjectMatches =
+					typeof run?.projectPath === "string" &&
+					resolve(run.projectPath) === resolve(expectedBody.projectPath);
+				const stale = runProjectMatches && isTerminalOrDead(run);
 				descriptors.push(
 					recoveryClaimDescriptor(entry, lockPath, {
 						claimState: "reservation",
@@ -341,17 +345,6 @@ export async function resolveCandidates(dependencies = {}) {
 				continue;
 			}
 
-			if (projectLockFileName(body.projectPath) !== claimBaseName) {
-				descriptors.push(
-					recoveryClaimDescriptor(entry, lockPath, {
-						runId: body.runId,
-						projectPath: body.projectPath,
-						reason:
-							"recovery claim owner data is not bound to its canonical project-lock filename — manual evidence only, never touched",
-					}),
-				);
-				continue;
-			}
 			let run = null;
 			try {
 				run = await readRunFn(body.runId);
@@ -369,8 +362,11 @@ export async function resolveCandidates(dependencies = {}) {
 			} catch {
 				// A missing or malformed canonical lock cannot prove displacement.
 			}
+			const runProjectMatches =
+				typeof run?.projectPath === "string" &&
+				resolve(run.projectPath) === resolve(body.projectPath);
 			const stale =
-				run !== null &&
+				runProjectMatches &&
 				(run.cleanupState === "failed"
 					? replacementCanonical?.runId !== undefined &&
 						replacementCanonical.runId !== body.runId &&
@@ -423,23 +419,26 @@ export async function resolveCandidates(dependencies = {}) {
 			} catch {
 				run = null;
 			}
-			const canonicalName = projectLockFileName(body.projectPath);
-			const cwdDerivedName = cwdDerivedProjectLockFileName(body.projectPath);
-			if (canonicalName !== entry.name && cwdDerivedName !== entry.name) {
+			if (
+				run !== null &&
+				(typeof run.projectPath !== "string" ||
+					resolve(run.projectPath) !== resolve(body.projectPath))
+			) {
 				descriptors.push(
 					baseDescriptor(entry, lockPath, {
 						ageMs,
 						createdAt,
 						runId: body.runId,
 						projectPath: body.projectPath,
-						category: "not-a-project-lock",
+						category: "project-owner-mismatch",
 						reason:
-							"projectPath does not bind this filename to the canonical project lock — never touched",
+							"lock projectPath does not match its run record — manual evidence only, never touched",
 					}),
 				);
 				continue;
 			}
-
+			const canonicalName = projectLockFileName(body.projectPath);
+			const cwdDerivedName = cwdDerivedProjectLockFileName(body.projectPath);
 			if (run == null) {
 				descriptors.push(
 					baseDescriptor(entry, lockPath, {
@@ -458,6 +457,7 @@ export async function resolveCandidates(dependencies = {}) {
 
 			const cleanupFailed = run.cleanupState === "failed";
 			const cwdDerived = cwdDerivedName === entry.name;
+			const historical = canonicalName !== entry.name && !cwdDerived;
 			const stale = cleanupFailed
 				? isCleanupFailedDeadWorker(run, {
 						now,
@@ -482,7 +482,9 @@ export async function resolveCandidates(dependencies = {}) {
 					isCandidate: stale,
 					remediationKind: cwdDerived
 						? "cwd-derived-project-lock"
-						: "project-lock",
+						: historical
+							? "historical-project-lock"
+							: "project-lock",
 					requiresInteractiveConfirmation: cleanupFailed && stale,
 					requiresDeadWorkerRecheck: cleanupFailed && stale,
 					reason: stale
@@ -523,7 +525,8 @@ export async function resolveCandidates(dependencies = {}) {
 		}
 
 		const expectedName = projectLockFileName(run.projectPath);
-		if (expectedName !== entry.name) {
+		const historicalName = cwdDerivedProjectLockFileName(run.projectPath);
+		if (expectedName !== entry.name && historicalName !== entry.name) {
 			// This lock's filename does not hash-match the recovered run's
 			// project path, so it is not that run's project lock — most
 			// likely this run's launch lock instead (same {runId, createdAt}
@@ -550,6 +553,10 @@ export async function resolveCandidates(dependencies = {}) {
 				projectPath: run.projectPath,
 				category: stale ? "project-lock-stale" : "project-lock-live",
 				isCandidate: stale,
+				remediationKind:
+					historicalName === entry.name
+						? "cwd-derived-project-lock"
+						: "project-lock",
 				reason: stale
 					? "positively identified as this run's project lock (pre-F.1 body shape) via hash match, and the run is stale"
 					: "positively identified as this run's project lock (pre-F.1 body shape) via hash match, but the run is live — must not be removed",
