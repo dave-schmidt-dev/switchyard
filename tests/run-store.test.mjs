@@ -387,6 +387,41 @@ describe("event ordering", () => {
 		strictEqual(parsed.model, "sonnet");
 	});
 
+	it("persists only valid VM-slot wait elapsed time", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+
+		await createEvent(opts.runId, {
+			phase: "bootstrap",
+			event: "vm_slot_wait",
+			status: "Waiting for VM admission capacity",
+			elapsedMs: 12.5,
+			unrelated: "SECRET_CANARY_unrelated_status_field",
+		});
+		for (const elapsedMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			await createEvent(opts.runId, {
+				phase: "bootstrap",
+				event: "vm_slot_wait",
+				status: "Waiting for VM admission capacity",
+				elapsedMs,
+			});
+		}
+		await createEvent(opts.runId, {
+			phase: "bootstrap",
+			event: "another_status",
+			status: "Other status",
+			elapsedMs: 1,
+		});
+
+		const events = await readEvents(opts.runId);
+		strictEqual(events[0].elapsedMs, 12.5);
+		ok(!("unrelated" in events[0]));
+		for (const event of events.slice(1)) {
+			ok(!("elapsedMs" in event));
+		}
+		ok(!JSON.stringify(events).includes("SECRET_CANARY"));
+	});
+
 	it("sanitizes failure events before they are persisted", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);

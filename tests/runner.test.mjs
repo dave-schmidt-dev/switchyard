@@ -5483,6 +5483,54 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		strictEqual(events.includes("create"), false);
 	});
 
+	it("uses a monotonic VM-slot deadline when the wall clock stands still", async () => {
+		const events = [];
+		const statuses = [];
+		const tasksPath = writeTerminalQueue();
+		const backend = macosBackend(events);
+		const unavailable = new VmSlotUnavailableError(["holder"]);
+		let attempts = 0;
+		backend.acquireSlot = () => {
+			events.push("acquire");
+			attempts += 1;
+			if (attempts < 3) throw unavailable;
+			return { token: "test-slot" };
+		};
+
+		const originalDateNow = Date.now;
+		Date.now = () => 0;
+		try {
+			await rejects(
+				runQueueAsyncImpl({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "macos",
+					checkpointPath: `${tasksPath}.wait-monotonic.checkpoint.json`,
+					dependencies: {
+						backendFactory: () => backend,
+						onStatus: (event) => statuses.push(event),
+						vmSlotWaitTimeoutMs: 2,
+						vmSlotWaitIntervalMs: 1,
+						sleepFn: async () =>
+							new Promise((resolve) => setTimeout(resolve, 10)),
+					},
+				}),
+				(error) => error === unavailable,
+			);
+		} finally {
+			Date.now = originalDateNow;
+		}
+
+		strictEqual(attempts, 2);
+		const elapsed = statuses
+			.filter((event) => event.event === "vm_slot_wait")
+			.map((event) => event.elapsedMs);
+		strictEqual(elapsed.length, 2);
+		ok(elapsed[0] >= 0 && elapsed[0] < 2);
+		strictEqual(elapsed[1], 2);
+		strictEqual(events.includes("create"), false);
+	});
+
 	it("does not retry unrelated VM-admission failures", async () => {
 		const events = [];
 		const statuses = [];

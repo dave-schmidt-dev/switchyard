@@ -11,6 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import {
 	captureDiff as captureAgyDiff,
 	captureDiffAsync as captureAgyDiffAsync,
@@ -6005,10 +6006,13 @@ async function acquireQueueSlotAsync({
 	if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
 		throw new RangeError("vmSlotWaitIntervalMs must be a positive number");
 	}
-	const now = dependencies.nowFn ?? Date.now;
+	// VM admission must not be extended or shortened by wall-clock adjustments.
+	// `nowFn` remains injectable for deterministic tests, but production uses the
+	// monotonic process clock.
+	const now = dependencies.nowFn ?? performance.now.bind(performance);
 	const sleepFn = dependencies.sleepFn ?? sleep;
 	const signal = dependencies.signal;
-	const startedAt = now();
+	const deadline = now() + timeoutMs;
 
 	for (;;) {
 		throwIfQueueAdmissionAborted(signal);
@@ -6016,16 +6020,17 @@ async function acquireQueueSlotAsync({
 			return queueBackend.acquireSlot({ runId });
 		} catch (error) {
 			if (!isVmSlotUnavailable(error)) throw error;
-			const elapsedMs = Math.max(0, now() - startedAt);
+			const remainingMs = Math.max(0, deadline - now());
+			const elapsedMs = timeoutMs - remainingMs;
 			onStatus?.({
 				phase: "bootstrap",
 				event: "vm_slot_wait",
 				status: "Waiting for VM admission capacity",
 				elapsedMs,
 			});
-			if (elapsedMs >= timeoutMs) throw error;
+			if (remainingMs === 0) throw error;
 			await waitForVmSlotRetry(
-				Math.min(intervalMs, timeoutMs - elapsedMs),
+				Math.min(intervalMs, remainingMs),
 				signal,
 				sleepFn,
 			);

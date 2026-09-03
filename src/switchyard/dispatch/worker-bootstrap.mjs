@@ -474,6 +474,15 @@ export async function runWorkerBootstrap(argv = process.argv) {
 						Number.isSafeInteger(event?.byteCount) && event.byteCount >= 0
 							? event.byteCount
 							: null;
+					// VM admission is the only detached status with elapsed time. Keep
+					// it scalar and bounded to finite, non-negative values; every other
+					// event field remains denylisted at this persistence boundary.
+					const elapsedMs =
+						name === "vm_slot_wait" &&
+						Number.isFinite(event?.elapsedMs) &&
+						event.elapsedMs >= 0
+							? event.elapsedMs
+							: null;
 					// The same reasoning extends `provider_cleanup_failed`. Without
 					// these three the event says only that cleanup "could not
 					// confirm process exit", which cannot distinguish a kill script
@@ -500,6 +509,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 							status,
 							...(taskId !== null ? { taskId } : {}),
 							...(byteCount !== null ? { byteCount } : {}),
+							...(elapsedMs !== null ? { elapsedMs } : {}),
 							...(cleanupStage !== null ? { cleanupStage } : {}),
 							...(exitCode !== null ? { exitCode } : {}),
 							...(signal !== null ? { signal } : {}),

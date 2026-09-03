@@ -1425,6 +1425,16 @@ export async function createEvent(runId, event) {
 			}
 		}
 	}
+	// Admission wait telemetry is deliberately opt-in rather than a general
+	// event field. This prevents arbitrary status payloads from widening the
+	// durable event schema while retaining one content-free progress measure.
+	if (
+		event?.event === "vm_slot_wait" &&
+		Number.isFinite(event.elapsedMs) &&
+		event.elapsedMs >= 0
+	) {
+		entry.elapsedMs = event.elapsedMs;
+	}
 
 	entry.schemaVersion = current.schemaVersion;
 	entry.sequence = nextSeq;
