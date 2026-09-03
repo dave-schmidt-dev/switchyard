@@ -108,7 +108,12 @@ import {
 	USAGE_RUN,
 	USAGE_STATUS,
 } from "../src/switchyard/dispatch/index.mjs";
-import { LockError } from "../src/switchyard/run-store/index.mjs";
+import {
+	acquireProjectLock,
+	advanceState,
+	initializeRun,
+	LockError,
+} from "../src/switchyard/run-store/index.mjs";
 import {
 	QueuePreflightError,
 	runQueue,
@@ -678,6 +683,39 @@ describe("CLI exit codes via process spawn", () => {
 		const result = runDispatch(["remediate-orphaned-locks", "--help"]);
 		strictEqual(result.status, 0);
 		ok(result.stdout.includes("Usage: node remediate-orphaned-locks.mjs"));
+	});
+
+	it("remediate-orphaned-locks reads a supplied state root dry without mutation and rejects invalid flags", async () => {
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["task-1"],
+			initialHostFingerprint: { git: "abc123", worktree: "clean" },
+			launchArgs: [],
+		});
+		await advanceState(runId, "failed");
+		await acquireProjectLock(projectDir, runId);
+		const lockName = `${createHash("sha256")
+			.update(`project:${resolve(projectDir)}`)
+			.digest("hex")}.lock`;
+		const lockPath = join(stateRoot, "locks", lockName);
+		const before = readFileSync(lockPath, "utf8");
+
+		const dryRun = runDispatch(
+			["remediate-orphaned-locks", "--dry-run", "--state-root", stateRoot],
+			makeStateRootEnv(),
+		);
+		strictEqual(dryRun.status, 0);
+		ok(dryRun.stdout.includes(runId));
+		strictEqual(readFileSync(lockPath, "utf8"), before);
+
+		const invalid = runDispatch(
+			["remediate-orphaned-locks", "--unknown-remediation-flag"],
+			makeStateRootEnv(),
+		);
+		strictEqual(invalid.status, 2);
 	});
 });
 

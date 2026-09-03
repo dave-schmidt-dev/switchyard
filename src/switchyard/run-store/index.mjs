@@ -606,6 +606,7 @@ async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
 
 export const runStoreTesting = Object.freeze({
 	projectLockArtifacts,
+	readVmSlotBody,
 	unlinkBodyMatched,
 });
 
@@ -2281,10 +2282,19 @@ function vmSlotBody(raw) {
 	return { ownerPid, runId: raw.runId, token: raw.token };
 }
 
-function readVmSlotBody(slotPath) {
+function readVmSlotBody(slotPath, readSlot = readFileSync) {
 	try {
-		return vmSlotBody(JSON.parse(readFileSync(slotPath, "utf8")));
-	} catch {
+		return vmSlotBody(JSON.parse(readSlot(slotPath, "utf8")));
+	} catch (error) {
+		// An unreadable occupied slot is not evidence of ordinary capacity
+		// contention. Preserve closed permission/storage failures for the
+		// admission boundary instead of collapsing them to an unknown holder.
+		if (
+			VM_ADMISSION_PERMISSION_CODES.has(error?.code) ||
+			VM_ADMISSION_STORAGE_CODES.has(error?.code)
+		) {
+			throw error;
+		}
 		return null;
 	}
 }

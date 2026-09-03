@@ -100,6 +100,13 @@ function cwdDerivedProjectLockFilePath(canonicalProjectPath) {
 	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
 
+function noncanonicalProjectLockFilePath(canonicalProjectPath) {
+	const hash = createHash("sha256")
+		.update(`historical:${resolve(canonicalProjectPath)}`)
+		.digest("hex");
+	return resolve(getStateRoot(), "locks", `${hash}.lock`);
+}
+
 async function makeStaleRun(overrides = {}) {
 	const opts = makeOptions(overrides);
 	await initializeRun(opts);
@@ -198,6 +205,45 @@ describe("resolveCandidates", () => {
 		strictEqual(prompts, 1, "cleanup-failed locks cannot bypass confirmation");
 		strictEqual(result.removed.length, 1);
 		strictEqual(isProjectLockHeld(opts.projectPath), false);
+	});
+
+	it("retains a cleanup-failed lock when its worker becomes live during confirmation", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await advanceState(opts.runId, "running");
+		const current = await readRun(opts.runId);
+		await updateRun(
+			opts.runId,
+			{ state: "recovery_required", cleanupState: "failed" },
+			current.revision,
+		);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+		const afterGrace = Date.now() + RUN_STARTUP_GRACE_MS + 1;
+		const logs = [];
+
+		const result = await run([], {
+			log: (line) => logs.push(line),
+			now: afterGrace,
+			confirmFn: async () => {
+				const duringConfirmation = await readRun(opts.runId);
+				await updateRun(
+					opts.runId,
+					{ workerPid: process.pid },
+					duringConfirmation.revision,
+				);
+				return true;
+			},
+		});
+
+		deepStrictEqual(result.removed, []);
+		strictEqual(isProjectLockHeld(opts.projectPath), true);
+		ok(
+			logs.some(
+				(line) =>
+					line.includes("skipped") && line.includes("no longer proven dead"),
+			),
+			"the remediation result should report the liveness-race skip",
+		);
 	});
 
 	it("offers and ownership-safely removes a cleanup-failed cwd-derived lock", async () => {
@@ -319,6 +365,40 @@ describe("resolveCandidates", () => {
 		strictEqual(d.isCandidate, true);
 		strictEqual(d.projectPath, opts.projectPath);
 		strictEqual(d.runId, opts.runId);
+	});
+
+	it("removes a body-bound noncanonical historical lock only with matching run/project evidence", async () => {
+		const opts = await makeStaleRun();
+		const historicalPath = noncanonicalProjectLockFilePath(opts.projectPath);
+		writeRawLockBody(historicalPath, {
+			runId: opts.runId,
+			projectPath: opts.projectPath,
+			createdAt: new Date().toISOString(),
+		});
+
+		const [candidate] = await resolveCandidates();
+		strictEqual(candidate.category, "project-lock-stale");
+		strictEqual(candidate.remediationKind, "historical-project-lock");
+		strictEqual(candidate.isCandidate, true);
+
+		const result = await run(["--confirm"], { log: () => {} });
+		deepStrictEqual(result.removed, [candidate.name]);
+		strictEqual(existsSync(historicalPath), false);
+	});
+
+	it("keeps a body-bound noncanonical historical lock noncandidate when its run project mismatches", async () => {
+		const opts = await makeStaleRun();
+		const historicalPath = noncanonicalProjectLockFilePath(opts.projectPath);
+		writeRawLockBody(historicalPath, {
+			runId: opts.runId,
+			projectPath: uniquePath("mismatched-historical-project"),
+			createdAt: new Date().toISOString(),
+		});
+
+		const [descriptor] = await resolveCandidates();
+		strictEqual(descriptor.category, "project-owner-mismatch");
+		strictEqual(descriptor.isCandidate, false);
+		strictEqual(existsSync(historicalPath), true);
 	});
 
 	it("recovers projectPath via run.json for a pre-F.1 lock but never flags it a candidate when the run is live", async () => {

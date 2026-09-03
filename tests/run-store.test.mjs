@@ -2175,6 +2175,40 @@ describe("global VM admission slots", () => {
 		}
 	});
 
+	it("preserves closed admission errors when an occupied slot cannot be read", () => {
+		for (const [code, ErrorType, diagnosticCode] of [
+			[
+				"EACCES",
+				VmAdmissionPermissionDeniedError,
+				"vm_admission_permission_denied",
+			],
+			[
+				"EPERM",
+				VmAdmissionPermissionDeniedError,
+				"vm_admission_permission_denied",
+			],
+			["EIO", VmAdmissionStorageError, "vm_admission_storage_failed"],
+		]) {
+			const cause = Object.assign(new Error("slot read failed"), { code });
+			let observed;
+			try {
+				runStoreTesting.readVmSlotBody("occupied-slot", () => {
+					throw cause;
+				});
+			} catch (error) {
+				observed = error;
+			}
+
+			strictEqual(observed, cause);
+			const classified = sanitizeVmAdmissionError(observed);
+			ok(classified instanceof ErrorType);
+			strictEqual(
+				classifyPreProviderFailure(classified).diagnosticCode,
+				diagnosticCode,
+			);
+		}
+	});
+
 	it("classifies occupied admission slots without confusing storage failure", () => {
 		mkdirSync(VM_ADMISSION_ROOT, { recursive: true });
 		for (const slotIndex of [0, 1]) {
