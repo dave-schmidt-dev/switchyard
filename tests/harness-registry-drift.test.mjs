@@ -327,6 +327,39 @@ describe("harness registry drift (Task 1.6b)", () => {
 		}
 	});
 
+	it("vibe's low slot carries its own dispatch receipt once promoted", () => {
+		const lowSelector = "glm-5.2-low";
+		strictEqual(roster.models?.[vibeLowModelRef]?.selector, lowSelector);
+		const descriptor = getInvocationDescriptor("vibe", "low");
+		const qualifications = targets.vibe?.qualifications ?? {};
+		if (descriptor === null) {
+			ok(
+				["untested", "qualified"].includes(qualifications[lowSelector]?.status),
+				`pre-promotion Vibe low state must retain an explicit non-dispatch record for ${lowSelector}`,
+			);
+			return;
+		}
+		// Each capability class earns its own receipt. The two GLM slots are the
+		// same underlying model at different thinking levels, which the provider
+		// treats as distinct routes -- a receipt for one authorizes nothing for
+		// the other.
+		const qualification = qualifications[descriptor.descriptor_identity];
+		ok(qualification, "current Vibe low descriptor must have a record");
+		strictEqual(qualification.status, "dispatch_qualified");
+		strictEqual(qualification.model_ref, vibeLowModelRef);
+		strictEqual(qualification.selector, lowSelector);
+		strictEqual(qualification.promotion_receipt?.status, "promoted");
+		strictEqual(
+			qualification.promotion_receipt?.descriptor_identity,
+			descriptor.descriptor_identity,
+		);
+		ok(
+			descriptor.descriptor_identity !==
+				getInvocationDescriptor("vibe", "standard")?.descriptor_identity,
+			"the two GLM thinking levels must not share a descriptor identity",
+		);
+	});
+
 	it("pi is not a switchyard-dispatch target", () => {
 		ok(
 			!("pi" in targets),

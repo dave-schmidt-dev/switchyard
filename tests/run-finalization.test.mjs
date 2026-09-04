@@ -1,4 +1,4 @@
-import { deepStrictEqual, rejects, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	PRE_PROVIDER_FAILURE_TRIPLES,
@@ -36,6 +36,56 @@ describe("run finalization", () => {
 			);
 			strictEqual(outcome.terminal, true);
 			strictEqual(events[0].reasonCode, triple.diagnosticCode);
+		}
+	});
+
+	it("never records a failed run without a reason", async () => {
+		const events = [];
+		const patches = [];
+		const outcome = await finalizeRun(
+			{
+				runId: "failed-without-metadata",
+				state: "failed",
+				failure: null,
+				terminalSummary: { processedTasks: 0, failedCount: 1 },
+			},
+			{
+				createEvent: async (_runId, event) => events.push(event),
+				updateRunWithRetry: async (_runId, patch) => {
+					patches.push(patch);
+					return patch;
+				},
+				releaseRunLock: async () => {},
+			},
+		);
+		strictEqual(outcome.terminal, true);
+		strictEqual(events[0].diagnosticCode, "terminal_without_failure_metadata");
+		strictEqual(events[0].reasonCode, "unknown_failure");
+		for (const patch of patches) {
+			ok(patch.lastFailure, "every terminal patch must carry failure metadata");
+		}
+	});
+
+	it("leaves a succeeded run's failure metadata absent", async () => {
+		const patches = [];
+		await finalizeRun(
+			{
+				runId: "succeeded-clean",
+				state: "succeeded",
+				failure: null,
+				terminalSummary: { processedTasks: 1, failedCount: 0 },
+			},
+			{
+				createEvent: async () => {},
+				updateRunWithRetry: async (_runId, patch) => {
+					patches.push(patch);
+					return patch;
+				},
+				releaseRunLock: async () => {},
+			},
+		);
+		for (const patch of patches) {
+			strictEqual(patch.lastFailure, undefined);
 		}
 	});
 

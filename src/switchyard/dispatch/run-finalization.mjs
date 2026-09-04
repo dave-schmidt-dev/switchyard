@@ -45,6 +45,21 @@ const CLEARED_ACTIVE_FIELDS = Object.freeze({
 	activeTaskDescriptorHarness: null,
 });
 
+/**
+ * A terminal `failed` state with no failure metadata is a run that says it broke
+ * and refuses to say how. It is not a hypothetical: the dispatch finaliser wrote
+ * 170 such records. This is the backstop for every other caller — the reason is
+ * deliberately unflattering rather than absent, so the gap stays findable.
+ */
+function unexplainedTerminalFailure() {
+	return sanitizeFailureMetadata({
+		result: "unknown_failure",
+		errorKind: "unknown_failure",
+		diagnosticCode: "terminal_without_failure_metadata",
+		failurePhase: "terminal_reconciliation",
+	});
+}
+
 function recoveryIncompleteFailure() {
 	return sanitizeFailureMetadata({
 		result: "unknown_failure",
@@ -96,8 +111,15 @@ export async function finalizeRun(options, dependencies = {}) {
 	) {
 		throw new TypeError("finalizeRun requires a closed event reason code");
 	}
+	const closedFailure =
+		state === "failed" && failure === null
+			? unexplainedTerminalFailure()
+			: failure;
+	const closedEventReasonCode = eventReasonCode ?? closedFailure?.reasonCode;
 	const eventReason =
-		CLOSED_EVENT_REASONS[eventReasonCode] ?? failure?.reason ?? null;
+		CLOSED_EVENT_REASONS[closedEventReasonCode] ??
+		closedFailure?.reason ??
+		null;
 
 	const createEvent = dependencies.createEvent ?? defaultRunStore.createEvent;
 	const updateRunWithRetry =
@@ -111,14 +133,14 @@ export async function finalizeRun(options, dependencies = {}) {
 			phase: "worker",
 			event: eventName,
 			status: eventStatus,
-			...(failure ?? {}),
-			...(eventReasonCode ? { reasonCode: eventReasonCode } : {}),
+			...(closedFailure ?? {}),
+			...(closedEventReasonCode ? { reasonCode: closedEventReasonCode } : {}),
 			...(eventReason !== null ? { reason: eventReason } : {}),
 		});
 		await updateRunWithRetry(runId, {
 			cleanupState: "pending",
 			...CLEARED_ACTIVE_FIELDS,
-			...(failure ? { lastFailure: failure } : {}),
+			...(closedFailure ? { lastFailure: closedFailure } : {}),
 		});
 		let cleanupError = null;
 		try {
@@ -141,7 +163,7 @@ export async function finalizeRun(options, dependencies = {}) {
 				terminalizedBy,
 				terminalSummary,
 				...CLEARED_ACTIVE_FIELDS,
-				...(failure ? { lastFailure: failure } : {}),
+				...(closedFailure ? { lastFailure: closedFailure } : {}),
 				...extraPatch,
 			});
 			outcome = { terminal: true, cleanupComplete: true, run };

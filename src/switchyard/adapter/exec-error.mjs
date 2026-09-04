@@ -429,6 +429,12 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"checkpoint_historical_state",
 	"task_selection_failed",
 	"environment_incomplete",
+	// A run that ends `failed` must say why. These two name the cases where the
+	// answer used to be nothing at all: the queue resolving without a result and
+	// without throwing, and a failed task result carrying no classifiable
+	// metadata. Both previously produced `lastFailure: null` on a failed run.
+	"queue_returned_no_result",
+	"terminal_without_failure_metadata",
 	"project_lock_held",
 	"project_lock_recovery_in_progress",
 	"project_lock_ownership_failed",

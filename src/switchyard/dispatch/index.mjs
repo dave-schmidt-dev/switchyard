@@ -850,7 +850,7 @@ async function runDispatch(opts, dependencies = {}) {
 				(entry) => !entry.success,
 			);
 			const classifiedQueueError = classifyPreProviderFailure(queueError);
-			const failure = queueError
+			const classifiedFailure = queueError
 				? sanitizeFailureMetadata({
 						result: "unknown_failure",
 						errorKind: classifiedQueueError?.errorKind ?? "unknown_failure",
@@ -859,6 +859,25 @@ async function runDispatch(opts, dependencies = {}) {
 							classifiedQueueError?.failurePhase ?? "terminal_reconciliation",
 					})
 				: sanitizeFailureMetadata(failedResult ?? {});
+			// `sanitizeFailureMetadata` returns null for anything it cannot classify,
+			// including the `{}` that a missing `failedResult` supplies. Combined with
+			// `anyFailed` defaulting to true when the queue produced no result, that
+			// wrote a run recorded as `failed` with `lastFailure: null` — 170 of 764
+			// historical failures, median 8ms, with no target and no event. A failed
+			// run must always carry a reason, even when the only honest reason is
+			// that the queue returned nothing and did not throw.
+			const failure =
+				classifiedFailure ??
+				(anyFailed
+					? sanitizeFailureMetadata({
+							result: "unknown_failure",
+							errorKind: "unknown_failure",
+							diagnosticCode: result
+								? "terminal_without_failure_metadata"
+								: "queue_returned_no_result",
+							failurePhase: "terminal_reconciliation",
+						})
+					: null);
 			try {
 				await eventWriteChain;
 				await finalizeRun({
