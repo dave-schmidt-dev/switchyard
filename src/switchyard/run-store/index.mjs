@@ -165,6 +165,9 @@ const APPROVED_EVENT_KEYS = new Set([
 	// Closed vocabulary owned by the execution backend (CLEANUP_STAGES in
 	// adapter/exec-error.mjs), never interpolated from provider output.
 	"cleanupStage",
+	// Boolean only: whether the adapter affirmatively read back the model the
+	// provider served. Absent when the adapter cannot report one.
+	"servedModelVerified",
 ]);
 
 export function isSafeTargetId(value) {
@@ -1561,6 +1564,7 @@ export async function createEvent(runId, event) {
 					errorKind: event.errorKind,
 					timedOut: event.timedOut,
 					partialDiffPath: event.partialDiffPath,
+					gateEvidencePath: event.gateEvidencePath,
 					diagnosticCode: event.diagnosticCode,
 					exitCode: event.exitCode,
 					signal: event.signal,
@@ -1610,6 +1614,8 @@ export async function createEvent(runId, event) {
 		delete entry.output;
 		delete entry.partialDiff;
 		delete entry.partialDiffPath;
+		delete entry.gateEvidence;
+		delete entry.gateEvidencePath;
 		delete entry.artifactRef;
 		delete entry.reason;
 		delete entry.diagnosticCode;

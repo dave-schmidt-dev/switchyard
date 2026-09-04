@@ -830,6 +830,7 @@ function normalizePersistentErrorKind(value) {
  * @param {string|null} [input.errorKind]
  * @param {boolean} [input.timedOut]
  * @param {string} [input.partialDiffPath] transient path, never returned
+ * @param {string} [input.gateEvidencePath] transient path, never returned
  * @returns {{errorKind: string, reasonCode: string, reason: string, artifactRef?: string}|null}
  */
 export function sanitizeFailureMetadata({
@@ -838,6 +839,7 @@ export function sanitizeFailureMetadata({
 	errorKind,
 	timedOut = false,
 	partialDiffPath,
+	gateEvidencePath,
 	diagnosticCode,
 	exitCode,
 	signal,
@@ -869,9 +871,18 @@ export function sanitizeFailureMetadata({
 	if (PERSISTED_FAILURE_PHASES.has(failurePhase)) {
 		safe.failurePhase = failurePhase;
 	}
-	if (partialDiffPath && typeof taskId === "string" && taskId) {
+	// The diff is the better evidence when one exists. The transcript is what
+	// an `empty_required_diff` rejection has instead of a diff, and naming it
+	// here is what stops that failure from being recorded with no evidence at
+	// all. Only the opaque reference crosses; the bytes stay on the host.
+	const artifactName = partialDiffPath
+		? `${taskId}.diff`
+		: gateEvidencePath
+			? `${taskId}.output`
+			: null;
+	if (artifactName && typeof taskId === "string" && taskId) {
 		const digest = createHash("sha256")
-			.update(`${taskId}.diff`)
+			.update(artifactName)
 			.digest("hex")
 			.slice(0, 24);
 		safe.artifactRef = `artifact:${digest}`;

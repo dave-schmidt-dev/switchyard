@@ -1675,6 +1675,44 @@ function savePartialDiff(checkpointPath, taskId, diffText) {
 	return artifactPath;
 }
 
+const GATE_EVIDENCE_LIMIT = 32 * 1024;
+const GATE_EVIDENCE_HEAD = 8 * 1024;
+
+/**
+ * Bound the provider transcript kept as gate-rejection evidence.
+ *
+ * A gate rejection whose diff is empty — `empty_required_diff` — has no diff
+ * to keep, so it used to persist no evidence at all: the run recorded that
+ * the provider changed nothing and nothing about why. The transcript is the
+ * only remaining account of that run, so it is kept, bounded, and written to
+ * the same host-only artifact directory the partial diff uses. It never
+ * crosses into events.jsonl, checkpoint.json, or the ledger; callers see only
+ * the opaque `artifact:` reference.
+ *
+ * @param {unknown} output raw provider stdout
+ * @returns {string|null} bounded transcript, or null when there is none
+ */
+function boundedGateEvidence(output) {
+	if (typeof output !== "string") return null;
+	const text = output.trim();
+	if (!text) return null;
+	if (text.length <= GATE_EVIDENCE_LIMIT) return text;
+	const dropped = text.length - GATE_EVIDENCE_LIMIT;
+	return (
+		`${text.slice(0, GATE_EVIDENCE_HEAD)}\n` +
+		`...[switchyard omitted ${dropped} characters]...\n` +
+		`${text.slice(-(GATE_EVIDENCE_LIMIT - GATE_EVIDENCE_HEAD))}`
+	);
+}
+
+function saveGateEvidence(checkpointPath, taskId, text) {
+	const dir = `${checkpointPath}.partial-diffs`;
+	mkdirSync(dir, { recursive: true });
+	const artifactPath = join(dir, `${taskId}.output`);
+	writeFileSync(artifactPath, text, "utf8");
+	return artifactPath;
+}
+
 /**
  * Load checkpoint file. A *missing* file is the normal first-run case and
  * returns an empty checkpoint. A file that *exists but fails to parse or
@@ -2249,6 +2287,7 @@ function failureMetadataFor(result, partialDiffPath) {
 		errorKind: result.errorKind,
 		timedOut: result.timedOut,
 		partialDiffPath,
+		gateEvidencePath: result.gateEvidencePath,
 		diagnosticCode: result.diagnosticCode,
 		exitCode: result.exitCode,
 		signal: result.signal,
@@ -2504,6 +2543,7 @@ export function integrationFailureMetadata(
 	diff,
 	credentialFlagged,
 	gateResult = null,
+	hasGateEvidence = false,
 ) {
 	const errorKind =
 		gateResult?.errorKind &&
@@ -2532,7 +2572,38 @@ export function integrationFailureMetadata(
 			typeof diff === "string" && diff.length > 0 && !credentialFlagged
 				? `${taskId}.diff`
 				: undefined,
+		// An empty-diff rejection has no diff to point at. When the provider
+		// transcript was kept instead, name it here so the record and the
+		// ledger carry evidence rather than a bare reason code.
+		gateEvidencePath:
+			hasGateEvidence && !credentialFlagged ? `${taskId}.output` : undefined,
 	});
+}
+
+/**
+ * Project an adapter's served-model record into one bounded fact.
+ *
+ * Only some adapters can read back which model the provider actually served.
+ * Vibe can, and is the reason this exists: its CLI silently substitutes a
+ * configured model for an unknown one and exits 0, so a whole task can run on
+ * a model nobody selected. A served/selector mismatch already fails the task,
+ * so on any task that reaches a result the served model is either the selector
+ * or unreadable — which reduces to a boolean. The boolean is what crosses the
+ * persistence boundary; the guest-supplied string never does.
+ *
+ * Absent (rather than false) for adapters that cannot report one, so "not
+ * supported here" never reads as "checked and failed".
+ *
+ * @param {object|null|undefined} execution adapter or broker execution record
+ * @returns {{servedModelVerified?: boolean}} spreadable, empty when unsupported
+ */
+function servedModelVerificationFields(execution) {
+	const projected = execution?.servedModelVerified;
+	if (projected === true || projected === false) {
+		return { servedModelVerified: projected };
+	}
+	if (execution?.servedModel === undefined) return {};
+	return { servedModelVerified: Boolean(execution.servedModel) };
 }
 
 function opaqueArtifactRef(value) {
@@ -3042,6 +3113,7 @@ export function executeTask(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "success_no_diff",
+			...servedModelVerificationFields(execution),
 		};
 	}
 
@@ -3060,6 +3132,7 @@ export function executeTask(task, context) {
 				diff,
 				gateResult?.credentialFlagged,
 				gateResult,
+				!diff && Boolean(boundedGateEvidence(execution.output)),
 			);
 	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
@@ -3123,6 +3196,7 @@ export function executeTask(task, context) {
 		requiredCapability,
 		resolvedTargetId,
 		result: terminalResult,
+		...servedModelVerificationFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
@@ -3132,6 +3206,10 @@ export function executeTask(task, context) {
 	};
 	if (!success && !gateResult?.credentialFlagged) {
 		result.partialDiff = diff;
+		// With no diff there is nothing else to keep, and a rejection that keeps
+		// nothing is not diagnosable. The provider's own transcript is then the
+		// only account of why it changed no files.
+		if (!diff) result.gateEvidence = boundedGateEvidence(execution.output);
 	}
 	return result;
 }
@@ -3197,6 +3275,7 @@ function clearAsyncTaskContext(context) {
 	context._activeTaskPrompt = null;
 	context._activeTaskTimeoutMs = null;
 	context._activeTaskDeadline = null;
+	context._activeTaskTranscript = null;
 }
 
 function asyncExecutionFailureMetadata(error, taskId) {
@@ -3596,6 +3675,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		signal: brokerExecution.signal ?? null,
 		failurePhase: brokerExecution.failurePhase ?? null,
 		cleanupStage: brokerExecution.cleanupStage ?? null,
+		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 	};
 	if (!execution.success) {
 		if (!execution.timedOut) {
@@ -3814,6 +3894,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "success_no_diff",
+			...servedModelVerificationFields(execution),
 		};
 	}
 	const gateResult = context.integrationGate(diff, context.projectPath, {
@@ -3831,6 +3912,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				diff,
 				gateResult?.credentialFlagged,
 				gateResult,
+				!diff && Boolean(context._activeTaskTranscript),
 			);
 	await record({
 		provider: routeResult.provider,
@@ -3852,10 +3934,16 @@ async function executeTaskAsyncUnsafe(task, context) {
 		requiredCapability,
 		resolvedTargetId,
 		result: terminalResult,
+		...servedModelVerificationFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(!success && !gateResult?.credentialFlagged
-			? { partialDiff: diff }
+			? {
+					partialDiff: diff,
+					...(diff
+						? {}
+						: { gateEvidence: context._activeTaskTranscript ?? null }),
+				}
 			: {}),
 	};
 }
@@ -4295,6 +4383,19 @@ export async function runQueueAsync(options) {
 				// onResult or persist it in checkpoint.json.
 				result.partialDiff = undefined;
 			}
+			if (result.gateEvidence) {
+				try {
+					result.gateEvidencePath = saveGateEvidence(
+						checkpointPath,
+						result.taskId,
+						result.gateEvidence,
+					);
+				} catch {
+					result.gateEvidencePath = null;
+				}
+				// Same rule as the diff above: host-only bytes, never onResult.
+				result.gateEvidence = undefined;
+			}
 			results.push(result);
 			dependencies.onResult?.(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
@@ -4313,6 +4414,9 @@ export async function runQueueAsync(options) {
 						}
 					: {}),
 				result: result.result,
+				...(typeof result.servedModelVerified === "boolean"
+					? { servedModelVerified: result.servedModelVerified }
+					: {}),
 				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
@@ -5277,6 +5381,7 @@ export function createBrokerAdapterLauncher({
 	workingContainerName,
 	prompt,
 	timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+	onTranscript = null,
 }) {
 	if (!adapter || typeof adapter.executeAsync !== "function") {
 		throw new TypeError("broker adapter requires executeAsync");
@@ -5319,6 +5424,10 @@ export function createBrokerAdapterLauncher({
 				resolvedTargetId: route.resolvedTarget,
 			},
 		);
+		// The bounded return shape below stays closed. The raw transcript is
+		// handed back in-process instead of crossing it, so an evidence-free
+		// gate rejection still has the provider's own account behind it.
+		onTranscript?.(execution?.output);
 		return {
 			success: execution?.success === true,
 			cancelled: signal?.aborted === true,
@@ -5338,6 +5447,12 @@ export function createBrokerAdapterLauncher({
 			exitCode: execution?.exitCode ?? null,
 			signal: execution?.signal ?? null,
 			failurePhase: execution?.failurePhase ?? null,
+			// A bounded fact, not the guest-supplied model name: whether the
+			// adapter could affirmatively read back what the provider served.
+			servedModelVerified:
+				execution?.servedModel === undefined
+					? null
+					: Boolean(execution.servedModel),
 		};
 	};
 }
@@ -5435,6 +5550,9 @@ function createDispatchBroker(context, dependencies = {}) {
 				workingContainerName: context.workingContainerName,
 				prompt: context._activeTaskPrompt,
 				timeoutMs: context._activeTaskTimeoutMs,
+				onTranscript: (output) => {
+					context._activeTaskTranscript = boundedGateEvidence(output);
+				},
 			})({
 				request,
 				route: selectedRoute,
@@ -6650,6 +6768,22 @@ export function runQueue(options) {
 					});
 				}
 			}
+			if (result.gateEvidence) {
+				try {
+					result.gateEvidencePath = saveGateEvidence(
+						checkpointPath,
+						result.taskId,
+						result.gateEvidence,
+					);
+				} catch (error) {
+					console.error(
+						`runQueue: could not save gate evidence for task ${result.taskId}: ${error.message}`,
+					);
+					result.gateEvidencePath = null;
+				}
+				// Same rule as the diff above: host-only bytes, never onResult.
+				result.gateEvidence = undefined;
+			}
 			if (onResult) onResult(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
 			if (emitStatus) {
@@ -6697,6 +6831,9 @@ export function runQueue(options) {
 						}
 					: {}),
 				result: result.result,
+				...(typeof result.servedModelVerified === "boolean"
+					? { servedModelVerified: result.servedModelVerified }
+					: {}),
 				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
@@ -7212,6 +7349,9 @@ export async function runQueueWithOrchestrator(options) {
 						}
 					: {}),
 				result: result.result,
+				...(typeof result.servedModelVerified === "boolean"
+					? { servedModelVerified: result.servedModelVerified }
+					: {}),
 				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),

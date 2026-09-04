@@ -585,7 +585,17 @@ async function runDispatch(opts, dependencies = {}) {
 	let initialized = false;
 	let initializationCode = null;
 	try {
-		const tasks = loadTaskQueue(opts.tasksFilePath);
+		let tasks;
+		try {
+			tasks = loadTaskQueue(opts.tasksFilePath);
+		} catch (error) {
+			// A queue that fails to parse is a caller contract failure with a
+			// precise, user-fixable cause. Left unclassified it fell through to
+			// `environment_incomplete`, which points at the host instead of at
+			// the line of the task file that needs editing.
+			initializationCode = "queue_contract_invalid";
+			throw new UsageError(error.message);
+		}
 		if (tasks.length === 0) {
 			initializationCode = "queue_empty";
 			throw new UsageError("no tasks parsed from the task queue");
@@ -678,8 +688,13 @@ async function runDispatch(opts, dependencies = {}) {
 				enumerable: false,
 			});
 		}
+		// A caller contract failure already carries the precise message; the
+		// fixed-string wrapper discarded the only line that says what to fix.
+		// These are host-side errors over the caller's own task file, never
+		// provider output.
+		if (error instanceof UsageError) throw error;
 		const wrapped = new Error(
-			"dispatch: run-store initialization failed before routing",
+			`dispatch: run-store initialization failed before routing: ${error.message}`,
 			{ cause: error },
 		);
 		if (initialized) {
@@ -1153,7 +1168,16 @@ async function handleLaunch(argv, dependencies = {}) {
 
 		stateRoot = getStateRoot();
 		runId = randomUUID();
-		const tasks = loadTaskQueue(opts.tasksFilePath);
+		let tasks;
+		try {
+			tasks = loadTaskQueue(opts.tasksFilePath);
+		} catch (error) {
+			preInitialization = {
+				type: "contract_failure",
+				code: "queue_contract_invalid",
+			};
+			throw new UsageError(error.message);
+		}
 		if (tasks.length === 0) {
 			preInitialization = {
 				type: "contract_failure",

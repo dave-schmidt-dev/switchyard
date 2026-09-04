@@ -606,6 +606,44 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		ok(isPersistentFailureMetadata(metadata));
 	});
 
+	it("names the transcript artifact when a rejection has no diff to point at", () => {
+		const metadata = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "integration_failed",
+			diagnosticCode: "empty_required_diff",
+			gateEvidencePath: "/Users/dave/project/.partial-diffs/1.1.output",
+		});
+
+		strictEqual(metadata.diagnosticCode, "empty_required_diff");
+		match(metadata.artifactRef, /^artifact:[a-f0-9]{24}$/);
+		ok(!JSON.stringify(metadata).includes("/Users/dave"));
+		ok(isPersistentFailureMetadata(metadata));
+	});
+
+	it("prefers the diff artifact over the transcript when both exist", () => {
+		const both = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "integration_failed",
+			partialDiffPath: "/Users/dave/project/.partial-diffs/1.1.diff",
+			gateEvidencePath: "/Users/dave/project/.partial-diffs/1.1.output",
+		});
+		const diffOnly = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "integration_failed",
+			partialDiffPath: "/Users/dave/project/.partial-diffs/1.1.diff",
+		});
+		strictEqual(both.artifactRef, diffOnly.artifactRef);
+	});
+
+	it("emits no artifact reference when a rejection kept nothing", () => {
+		const metadata = sanitizeFailureMetadata({
+			taskId: "1.1",
+			result: "integration_failed",
+			diagnosticCode: "empty_required_diff",
+		});
+		strictEqual(metadata.artifactRef, undefined);
+	});
+
 	it("keeps every integration refusal kind persistable and resolvable to a named reason", () => {
 		for (const kind of INTEGRATION_REFUSAL_KINDS) {
 			ok(

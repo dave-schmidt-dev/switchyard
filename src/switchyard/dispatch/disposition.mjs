@@ -25,6 +25,7 @@ const CONTRACT_DIAGNOSTICS = new Set([
 ]);
 const PRE_INITIALIZATION_CONTRACT_CODES = new Set([
 	"invalid_invocation",
+	"queue_contract_invalid",
 	"queue_empty",
 	"queue_identity_invalid",
 	"task_selection_failed",
@@ -167,7 +168,12 @@ function projectPreInitialization(fact, recoveryCommand) {
 		fact.type === "contract_failure" &&
 		PRE_INITIALIZATION_CONTRACT_CODES.has(fact.code)
 	) {
-		return baseDisposition("repair_contract", fact.code);
+		// The code is closed-vocabulary by the membership test above, so echoing
+		// it as the diagnostic is bounded. Leaving it null told the caller a
+		// classified contract failure had no classified cause.
+		return baseDisposition("repair_contract", fact.code, {
+			diagnosticCode: fact.code,
+		});
 	}
 	if (fact.type !== "lock_conflict" || fact.code !== "PROJECT_LOCK_HELD") {
 		return baseDisposition("stop", "insufficient_evidence");

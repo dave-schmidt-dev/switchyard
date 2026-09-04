@@ -597,6 +597,9 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								descriptorHarness: r.descriptorHarness ?? null,
 								resolvedTargetId: r.resolvedTargetId ?? null,
 								dispatchContractVersion: r.dispatchContractVersion ?? 1,
+								...(typeof r.servedModelVerified === "boolean"
+									? { servedModelVerified: r.servedModelVerified }
+									: {}),
 							}
 						: {
 								phase: "execution",
@@ -611,6 +614,9 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								descriptorHarness: r.descriptorHarness ?? null,
 								resolvedTargetId: r.resolvedTargetId ?? null,
 								dispatchContractVersion: r.dispatchContractVersion ?? 1,
+								...(typeof r.servedModelVerified === "boolean"
+									? { servedModelVerified: r.servedModelVerified }
+									: {}),
 								...(safeFailure ?? {}),
 							};
 					const fn = () =>

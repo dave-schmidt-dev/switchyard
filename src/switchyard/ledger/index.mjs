@@ -55,6 +55,8 @@ function sanitizeDispatchEntry(dispatch) {
 	delete safe.error;
 	delete safe.output;
 	delete safe.partialDiffPath;
+	delete safe.gateEvidence;
+	delete safe.gateEvidencePath;
 	if (failure) {
 		delete safe.reason;
 		Object.assign(safe, failure);

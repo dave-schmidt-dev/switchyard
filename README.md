@@ -650,7 +650,7 @@ The disposition schema is additive and closed:
 
 | Evidence, in precedence order | Disposition |
 |---|---|
-| Typed pre-initialization contract failure | `repair_contract / invalid_invocation`, `queue_empty`, or `queue_identity_invalid` |
+| Typed pre-initialization contract failure | `repair_contract / invalid_invocation`, `queue_contract_invalid`, `queue_empty`, or `queue_identity_invalid` |
 | Live/startup-grace project-lock owner | `defer / project_lock_owner_live` with `blockingRunId` |
 | Proven-dead project-lock owner with a state-root-bound recovery command | `recover / project_lock_owner_dead` |
 | Lock ownership unresolved, or dead owner without a recovery command | `stop / project_lock_ownership_unresolved` or `insufficient_evidence` |

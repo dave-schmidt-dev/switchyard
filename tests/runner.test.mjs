@@ -1,5 +1,6 @@
 import {
 	deepStrictEqual,
+	match,
 	notStrictEqual,
 	ok,
 	rejects,
@@ -9656,6 +9657,208 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 		ok(
 			!rawCheckpointJson.includes(taskResult.partialDiffPath),
 			"checkpoint.json must not persist the host artifact path",
+		);
+	});
+
+	it("records execution identity as a bounded verification flag, never the served string", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Verified task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** the adapter reads back which model actually served the run
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const baseDependencies = {
+			route: () => ({
+				provider: "vibe",
+				model: "glm-5.2-high",
+				percentLeft: 72,
+				reason: "spread",
+			}),
+			recordDispatch: () => {},
+			integrationGate: () => ({ success: true, message: "ok" }),
+			ensureAgentContainer: () => {},
+			createWorkingContainer: () => "generated-working-container",
+			provisionCredentials: () => {},
+			seedProject: () => {},
+			commitWorkingTree: () => {},
+			resetWorkingTree: () => {},
+			wipeWorkingContainer: () => {},
+		};
+		const run = (execute) =>
+			runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath: `${checkpointPath}.${randomUUID()}`,
+				dependencies: {
+					...baseDependencies,
+					adapters: {
+						vibe: {
+							execute,
+							captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs\n+ok",
+						},
+					},
+				},
+			});
+
+		const verified = run(() => ({
+			success: true,
+			output: "",
+			error: null,
+			servedModel: "glm-5.2-high",
+		}));
+		strictEqual(verified.results[0].servedModelVerified, true);
+
+		const unreadable = run(() => ({
+			success: true,
+			output: "",
+			error: null,
+			servedModel: null,
+		}));
+		strictEqual(unreadable.results[0].servedModelVerified, false);
+
+		// Absent, not false: an adapter that cannot report one has not failed a
+		// check, and recording `false` would say it had.
+		const unsupported = run(() => ({ success: true, output: "", error: null }));
+		strictEqual(unsupported.results[0].servedModelVerified, undefined);
+		ok(!("servedModelVerified" in unsupported.results[0]));
+
+		// The guest-supplied string itself never reaches a result.
+		const echoed = run(() => ({
+			success: true,
+			output: "",
+			error: null,
+			servedModel: "SECRET_CANARY_served_model",
+		}));
+		ok(
+			!JSON.stringify(echoed.results[0]).includes("SECRET_CANARY_served_model"),
+		);
+	});
+
+	it("keeps the provider transcript as evidence when the gate rejects an empty diff", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Empty-diff task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** the provider explains itself but changes nothing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const transcript =
+			"I inspected src/a.mjs and concluded no change was required.";
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: true,
+							output: transcript,
+							error: null,
+						}),
+						captureDiff: () => "",
+					},
+				},
+			},
+		});
+
+		const [taskResult] = result.results;
+		strictEqual(taskResult.success, false);
+		strictEqual(
+			taskResult.diagnosticCode ?? taskResult.reasonCode,
+			"empty_required_diff",
+		);
+		// The whole point: this rejection used to persist nothing at all.
+		const artifactPath = `${checkpointPath}.partial-diffs/1.1.output`;
+		ok(existsSync(artifactPath), "the transcript must be kept as an artifact");
+		strictEqual(readFileSync(artifactPath, "utf8"), transcript);
+		match(taskResult.artifactRef ?? "", /^artifact:[a-f0-9]{24}$/);
+		strictEqual(
+			taskResult.gateEvidence,
+			undefined,
+			"raw transcript must not ride along in the result handed to onResult",
+		);
+
+		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
+		ok(
+			!rawCheckpointJson.includes(transcript),
+			"checkpoint.json must reference the artifact, never embed the transcript",
+		);
+		ok(
+			!rawCheckpointJson.includes(taskResult.gateEvidencePath),
+			"checkpoint.json must not persist the host artifact path",
+		);
+	});
+
+	it("keeps no transcript for a credential-flagged empty-diff rejection", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Empty-diff task
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** the gate flags the rejection as credential-bearing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+
+		runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 72,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				integrationGate: () => ({
+					success: false,
+					message: "empty_required_diff",
+					credentialFlagged: true,
+				}),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: true,
+							output: "SECRET_CANARY_transcript",
+							error: null,
+						}),
+						captureDiff: () => "",
+					},
+				},
+			},
+		});
+
+		const artifactsDir = `${checkpointPath}.partial-diffs`;
+		ok(
+			!existsSync(artifactsDir) || readdirSync(artifactsDir).length === 0,
+			"a credential-flagged rejection must keep no transcript either",
 		);
 	});
 

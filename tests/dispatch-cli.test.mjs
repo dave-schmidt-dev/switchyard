@@ -799,6 +799,53 @@ describe("launch integration", () => {
 		strictEqual(envelope.disposition.reasonCode, "queue_empty");
 	});
 
+	it("run --json classifies a malformed queue as a contract failure", () => {
+		const badTasksFile = join(dir, "bad-capability-tasks.md");
+		writeFileSync(
+			badTasksFile,
+			"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n" +
+				"- **RequiredCapability:** verify\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+			"utf8",
+		);
+		const result = runDispatch(
+			["run", badTasksFile, "--project", projectDir, "--json"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 2);
+		const envelope = JSON.parse(result.stdout.trim().split("\n").at(-1));
+		strictEqual(envelope.disposition.action, "repair_contract");
+		strictEqual(envelope.disposition.direction, "repair_input");
+		strictEqual(envelope.disposition.reasonCode, "queue_contract_invalid");
+		// The classified cause used to arrive as null, which told the caller a
+		// classified contract failure had no classified cause.
+		strictEqual(envelope.disposition.diagnosticCode, "queue_contract_invalid");
+	});
+
+	it("run names the malformed queue field instead of blaming the host", () => {
+		const badTasksFile = join(dir, "bad-capability-human-tasks.md");
+		writeFileSync(
+			badTasksFile,
+			"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n" +
+				"- **RequiredCapability:** verify\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+			"utf8",
+		);
+		const result = runDispatch(
+			["run", badTasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 2);
+		ok(
+			result.stderr.includes(
+				'Task 1.1: invalid RequiredCapability field "verify"',
+			),
+			`expected the parse error on stderr, got: ${result.stderr}`,
+		);
+		ok(
+			!result.stderr.includes("run-store initialization failed"),
+			"a caller contract failure must not be reported as a run-store failure",
+		);
+	});
+
 	it("launch --json identity fixture emits exactly one pre-init object", async () => {
 		const canary = "SECRET_CANARY_identity_failure";
 		const { envelope, errors } = await captureLaunchJson(

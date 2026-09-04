@@ -505,6 +505,7 @@ describe("typed launch evidence", () => {
 	it("maps typed queue and identity failures to contract repair", () => {
 		for (const code of [
 			"invalid_invocation",
+			"queue_contract_invalid",
 			"queue_empty",
 			"queue_identity_invalid",
 		]) {
@@ -513,6 +514,7 @@ describe("typed launch evidence", () => {
 			});
 			strictEqual(result.action, "repair_contract");
 			strictEqual(result.reasonCode, code);
+			strictEqual(result.diagnosticCode, code);
 		}
 	});
 
@@ -827,6 +829,7 @@ describe("closed caller direction", () => {
 	it("maps every pre-initialization contract code without insufficient evidence", () => {
 		for (const code of [
 			"invalid_invocation",
+			"queue_contract_invalid",
 			"queue_empty",
 			"queue_identity_invalid",
 			"task_selection_failed",
@@ -842,6 +845,7 @@ describe("closed caller direction", () => {
 				preInitialization: { type: "contract_failure", code },
 			});
 			strictEqual(result.reasonCode, code);
+			strictEqual(result.diagnosticCode, code);
 			strictEqual(result.direction, "repair_input");
 		}
 	});
