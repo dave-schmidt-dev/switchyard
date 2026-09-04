@@ -1,5 +1,7 @@
-import { deepStrictEqual, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { executeBrokerRoute } from "../src/switchyard/broker/executor.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
@@ -247,5 +249,100 @@ describe("broker async executor", () => {
 			terminal: async () => ({ changed: true }),
 		});
 		strictEqual(result.servedModelVerified, null);
+	});
+	// The two regressions above were the same defect twice: a field the runner
+	// reads off the broker's result, that nothing in the frozen shapes named.
+	// Rather than pin one field at a time, derive the read set from the runner
+	// itself, so a field added there fails here until the executor forwards it.
+	it("forwards every broker field the runner reads off the result", async () => {
+		const runnerSource = readFileSync(
+			fileURLToPath(
+				new URL("../src/switchyard/runner/index.mjs", import.meta.url),
+			),
+			"utf8",
+		);
+		const readFields = new Set(
+			Array.from(
+				runnerSource.matchAll(/brokerExecution\.([A-Za-z_][A-Za-z0-9_]*)/g),
+				(match) => match[1],
+			),
+		);
+		ok(
+			readFields.size > 0,
+			"the runner must read fields off the broker result",
+		);
+
+		// Every launcher field the executor is expected to relay, set to a value
+		// its own bounding accepts so a dropped field cannot pass as a defaulted one.
+		const launcherResult = {
+			success: false,
+			timedOut: true,
+			cleanupFailed: true,
+			cleanupStage: "tree_terminated",
+			reason: "provider execution timed out",
+			errorKind: "execution_timed_out",
+			diagnosticCode: "execution_timed_out",
+			exitCode: 7,
+			signal: "SIGKILL",
+			failurePhase: "provider_cleanup",
+			failureKind: "provider",
+			servedModelVerified: true,
+		};
+		const value = fixture();
+		const failed = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => launcherResult,
+			terminal: async () => ({ changed: true }),
+		});
+		const missing = [...readFields].filter(
+			(field) => !Object.hasOwn(failed, field),
+		);
+		deepStrictEqual(
+			missing,
+			[],
+			`the executor's failure shape drops fields the runner reads: ${missing.join(", ")}`,
+		);
+		strictEqual(failed.cleanupStage, "tree_terminated");
+		strictEqual(failed.cleanupFailed, true);
+
+		// A task can succeed while the kill of its provider process fails, so
+		// the cleanup facts have to survive the success shape too.
+		const succeeded = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: true,
+				actualConsumption: 1,
+				cleanupFailed: true,
+				cleanupStage: "pid_marker_removed",
+				servedModelVerified: false,
+			}),
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(succeeded.cleanupFailed, true);
+		strictEqual(succeeded.cleanupStage, "pid_marker_removed");
+		strictEqual(succeeded.servedModelVerified, false);
+	});
+
+	it("refuses a cleanup stage outside the backend-owned vocabulary", async () => {
+		const value = fixture();
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: true,
+				actualConsumption: 1,
+				cleanupStage: "rm -rf /etc/passwd",
+			}),
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.cleanupStage, null);
 	});
 });

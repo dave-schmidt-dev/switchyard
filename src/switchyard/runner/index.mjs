@@ -44,6 +44,7 @@ import {
 	executeCursorAsync,
 } from "../adapter/cursor.mjs";
 import {
+	CLEANUP_STAGES,
 	INTEGRATION_REFUSAL_KINDS,
 	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
@@ -5435,6 +5436,13 @@ export function createBrokerAdapterLauncher({
 			actualConsumption: execution?.actualConsumption,
 			timedOut: execution?.timedOut === true,
 			cleanupFailed: execution?.cleanupFailed === true,
+			// Which kill step failed, bounded to the backend-owned vocabulary.
+			// Omitting it here left `execution.cleanupStage` permanently null on
+			// the async path, so a cleanup failure was recorded without naming
+			// the stage that failed - the fact that makes it actionable.
+			cleanupStage: CLEANUP_STAGES.has(execution?.cleanupStage)
+				? execution.cleanupStage
+				: null,
 			failureKind:
 				execution?.failureKind === "transient" ||
 				execution?.failureKind === "provider"

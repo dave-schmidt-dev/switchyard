@@ -1572,3 +1572,77 @@ test("production async runner records the adapter's served-model verification", 
 		);
 	}
 });
+
+// The same defect as above, found by auditing the boundary the served-model
+// drop exposed: the launcher never returned cleanupStage at all, so a cleanup
+// failure was persisted without naming the kill step that failed. This drives
+// the whole launcher -> executor -> runner chain, which is where it died.
+test("production async runner records which cleanup stage failed", async () => {
+	const root = await mkdtemp(join(tmpdir(), "switchyard-broker-cleanup-"));
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Cleanup stage\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** carry the cleanup stage\n",
+	);
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		workingContainerName: "broker-cleanup-worker",
+		checkpointPath,
+		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			backendFactory: () => ({
+				executionBackend: {},
+				create: () => "broker-cleanup-worker",
+				destroy: () => {},
+				seed: () => {},
+				commit: () => {},
+				reset: () => {},
+			}),
+			adapters: {
+				claude: {
+					// A provider that outlived its kill: the stage is the only
+					// fact that says how far cleanup got before it gave up.
+					executeAsync: async () => ({
+						success: false,
+						output: "",
+						error: "provider cleanup failed after timeout",
+						timedOut: true,
+						cleanupFailed: true,
+						cleanupStage: "tree_terminated",
+					}),
+					captureDiffAsync: async () => null,
+				},
+			},
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+		},
+	});
+	const record = result.results[0];
+	strictEqual(record.result, "execution_timed_out_cleanup_failed");
+	strictEqual(record.errorKind, "provider_cleanup_failed");
+	strictEqual(
+		record.diagnosticCode,
+		"provider_cleanup_after_tree_terminated",
+		"the diagnostic code is derived from the stage, so a dropped stage degrades it",
+	);
+	const checkpoint = JSON.parse(await readFile(checkpointPath, "utf8"));
+	strictEqual(
+		checkpoint.results[0].diagnosticCode,
+		"provider_cleanup_after_tree_terminated",
+	);
+});

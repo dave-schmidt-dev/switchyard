@@ -1,9 +1,27 @@
-import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import {
+	CLEANUP_STAGES,
+	sanitizeFailureMetadata,
+} from "../adapter/exec-error.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
 const TERMINAL_OUTCOMES = new Set(["success", "failure", "cancel"]);
 const FAILURE_KINDS = new Set(["provider", "transient"]);
+
+/**
+ * Bound a launcher's cleanup stage to the backend-owned vocabulary.
+ *
+ * `sanitizeFailureMetadata` reads this value to derive a diagnostic code but
+ * does not return it, so it has to be forwarded explicitly to survive the
+ * frozen result shapes below.
+ * @param {unknown} launcherResult
+ * @returns {string|null}
+ */
+function cleanupStageOf(launcherResult) {
+	return CLEANUP_STAGES.has(launcherResult?.cleanupStage)
+		? launcherResult.cleanupStage
+		: null;
+}
 function sameSnapshot(left, right) {
 	return (
 		left?.source === right?.source &&
@@ -195,6 +213,11 @@ export async function executeBrokerRoute(options) {
 			success: true,
 			outcome: "success",
 			actualConsumption,
+			// A task can succeed while the kill of its provider process fails.
+			// These carried on the failure shape only, so that case reached a
+			// result with no record that anything was left running.
+			cleanupFailed: launcherResult?.cleanupFailed === true,
+			cleanupStage: cleanupStageOf(launcherResult),
 			// A bounded boolean from the launcher, not the guest-supplied model
 			// name. Without it here the frozen allowlist silently dropped the
 			// adapter's served-model read-back before it could reach a result.
@@ -244,6 +267,7 @@ export async function executeBrokerRoute(options) {
 							: "launcher_failed",
 			timedOut: launcherResult?.timedOut === true,
 			cleanupFailed: launcherResult?.cleanupFailed === true,
+			cleanupStage: cleanupStageOf(launcherResult),
 			failureKind: FAILURE_KINDS.has(launcherResult?.failureKind)
 				? launcherResult.failureKind
 				: null,
