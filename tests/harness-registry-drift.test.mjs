@@ -31,18 +31,13 @@
 // fixture: the whole point is checking the real file, not a copy.
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import {
-	mkdtempSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import { getInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const ADAPTER_DIR = join(REPO_ROOT, "src", "switchyard", "adapter");
@@ -390,7 +385,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 		// live-roster assertions above do, and confirms the violation survives
 		// a full JSON round-trip, not just an in-memory mutation.
 		it("a corrupted on-disk roster fails the same check the live roster passes", () => {
-			const tmpDir = mkdtempSync(join(tmpdir(), "harness-drift-mutation-"));
+			const tmpDir = tempDir("harness-drift-mutation-");
 			try {
 				const corrupted = JSON.parse(JSON.stringify(roster));
 				const firstEnabledId = enabledTargetIds[0];

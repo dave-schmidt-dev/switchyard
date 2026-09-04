@@ -21,16 +21,16 @@ import {
 	constants,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { PARALLELS_LINKED_SNAPSHOT_NAME } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
@@ -178,7 +178,7 @@ describe("reaper snapshot reporting", () => {
 	 * is contacted, so this cannot touch a sibling suite's fixtures.
 	 */
 	function runReaper({ sidecars = [] } = {}) {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-reaper-"));
+		const root = tempDir("switchyard-reaper-");
 		const binDir = join(root, "bin");
 		const home = join(root, "home");
 		const sidecarDir = join(
@@ -272,7 +272,7 @@ exit 0
 	});
 
 	it("says the check was skipped rather than reporting a clean result it never ran", () => {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-reaper-"));
+		const root = tempDir("switchyard-reaper-");
 		const binDir = join(root, "bin");
 		const home = join(root, "home");
 		mkdirSync(binDir, { recursive: true });

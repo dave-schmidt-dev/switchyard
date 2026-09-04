@@ -7,12 +7,11 @@ import { execSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { INTEGRATION_REFUSAL_KINDS } from "../src/switchyard/adapter/exec-error.mjs";
@@ -22,11 +21,12 @@ import {
 	integrationGate,
 	validateDiff,
 } from "../src/switchyard/integrate/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 let projectPath;
 
 function initRepo() {
-	const dir = mkdtempSync(join(tmpdir(), "switchyard-gate-"));
+	const dir = tempDir("switchyard-gate-");
 	execSync("git init -q", { cwd: dir, stdio: "pipe" });
 	execSync('git config user.email "test@test.com"', {
 		cwd: dir,

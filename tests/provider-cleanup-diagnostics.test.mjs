@@ -19,8 +19,8 @@
 // the kill was booked as a clean timeout. That is an INV-3 exposure the
 // terminal state hid — the working object outlives the run.
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, rmSync } from "node:fs";
+
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
@@ -29,8 +29,9 @@ import {
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { killOrphanedProcesses } from "../src/switchyard/adapter/orphan-kill.mjs";
 import { makeOnStatus } from "./helpers/bootstrap-handler.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-cleanup-diag-"));
+const TEST_ROOT = tempDir("switchyard-cleanup-diag-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 
 const { createEvent, initializeRun, readEvents } = await import(

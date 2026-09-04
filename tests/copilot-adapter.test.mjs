@@ -1,7 +1,7 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
+
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
@@ -10,8 +10,9 @@ import {
 } from "../src/switchyard/adapter/copilot.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const testRoot = mkdtempSync(join(tmpdir(), "switchyard-copilot-adapter-"));
+const testRoot = tempDir("switchyard-copilot-adapter-");
 const containerName = `switchyard-copilot-adapter-${Date.now()}`;
 
 // getWorkspaceExecution (provider-lifecycle.mjs) now requires an

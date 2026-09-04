@@ -19,8 +19,8 @@
 //      default file ledger.
 
 import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+
 import { join, resolve } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -48,6 +48,7 @@ import {
 	runQueue,
 	runQueueWithOrchestrator,
 } from "../src/switchyard/runner/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
@@ -245,7 +246,7 @@ describe("resolveTargetProvenance / resolveRouteProvenance — target resolution
 		// proves resolveTargetProvenance actually picks the enabled one rather
 		// than, say, the first one found by object-key order (which would be
 		// wrong if the disabled target happened to be declared first).
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		tmpDir = tempDir("switchyard-provenance-");
 		const path = join(tmpDir, "shared-harness.json");
 		writeFileSync(
 			path,
@@ -306,7 +307,7 @@ describe("resolveTargetProvenance / resolveRouteProvenance — target resolution
 		// machines, so unsetting alone no longer makes the roster unavailable.
 		// Point HOME at an empty temp dir so the canonical default is guaranteed
 		// missing, keeping this case hermetic and independent of the real roster.
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		tmpDir = tempDir("switchyard-provenance-");
 		setHomeDir(tmpDir);
 		setRosterPath(undefined); // env unset -> canonical default is a missing file
 		const prov = resolveRouteProvenance("OpenCode Go", "low");
@@ -479,7 +480,7 @@ function restoreLedgerPaths() {
 }
 
 function makeDefaultWiringFixture(taskId) {
-	tmpDir = mkdtempSync(join(tmpdir(), "switchyard-ledger-wiring-"));
+	tmpDir = tempDir("switchyard-ledger-wiring-");
 	const tasksFilePath = join(tmpDir, `${taskId}.md`);
 	writeFileSync(
 		tasksFilePath,
@@ -1186,7 +1187,7 @@ describe("roster_sha256 is stable across a simulated `roster smoke` write-back",
 
 		// Simulate a smoke write-back: read the fixture, flip a qualification
 		// status (and stamp a timestamp, as smoke does), write to a temp path.
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		tmpDir = tempDir("switchyard-provenance-");
 		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
 		roster.targets["opencode-go"].qualifications["fixture/opencode-standard"] =
 			{
@@ -1212,7 +1213,7 @@ describe("roster_sha256 is stable across a simulated `roster smoke` write-back",
 		setRosterPath(FIXTURE_PATH);
 		const shaBefore = getRosterProvenance().roster_sha256;
 
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-"));
+		tmpDir = tempDir("switchyard-provenance-");
 		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
 		roster.targets["opencode-go"].slots.low[0].priority = 99; // real change
 		const changed = join(tmpDir, "roster.changed.json");
@@ -1227,7 +1228,7 @@ describe("roster_sha256 is stable across a simulated `roster smoke` write-back",
 
 describe("recordDispatchToStore — provenance parity with the file ledger", () => {
 	it("preserves the six provenance fields written into a store-backed ledger", async () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-store-"));
+		tmpDir = tempDir("switchyard-provenance-store-");
 		const provenance = {
 			roster_schema_version: 1,
 			roster_sha256: "a".repeat(64),
@@ -1259,7 +1260,7 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 	});
 
 	it("persists static failure metadata without raw output or host paths", async () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-failure-"));
+		tmpDir = tempDir("switchyard-provenance-failure-");
 		await recordDispatchToStore(
 			{
 				provider: "claude",
@@ -1293,7 +1294,7 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 	});
 
 	it("preserves integration failure diagnostics without gate content", async () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-provenance-integration-"));
+		tmpDir = tempDir("switchyard-provenance-integration-");
 		await recordDispatchToStore(
 			{
 				provider: "claude",

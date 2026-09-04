@@ -14,17 +14,12 @@
 
 import { match, ok } from "node:assert";
 import { spawnSync } from "node:child_process";
-import {
-	chmodSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
@@ -60,7 +55,7 @@ describe("VM gate prerequisite ladders", () => {
 
 	it("fails rather than skips when the Aqua uid is unset", (testContext) => {
 		const golden = "switchyard-vm-gate-prerequisite-test";
-		const binDir = mkdtempSync(join(tmpdir(), "switchyard-prlctl-"));
+		const binDir = tempDir("switchyard-prlctl-");
 		const prlctl = join(binDir, "prlctl");
 		writeFileSync(
 			prlctl,

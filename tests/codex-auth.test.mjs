@@ -1,7 +1,7 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync } from "node:fs";
+
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -12,6 +12,7 @@ import {
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 // getWorkspaceExecution (provider-lifecycle.mjs) now requires an
 // executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
@@ -96,9 +97,7 @@ describe("codex adapter shell injection guard", () => {
 		// RCE via task text, not merely a captured-diff bug. The current
 		// implementation delivers the prompt over stdin (never shell-parsed),
 		// so this must be a no-op regardless of the container's existence.
-		const markerDir = mkdtempSync(
-			join(tmpdir(), "switchyard-prompt-injection-"),
-		);
+		const markerDir = tempDir("switchyard-prompt-injection-");
 		const markerPath = join(markerDir, "marker");
 		const evilPrompt = `wrap up'; touch ${markerPath}; echo '`;
 

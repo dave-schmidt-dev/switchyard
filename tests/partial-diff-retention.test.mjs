@@ -20,16 +20,17 @@
 // imports.
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
+
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
 	BOOTSTRAP_SOURCE,
 	makeOnStatus,
 } from "./helpers/bootstrap-handler.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-partial-diff-"));
+const TEST_ROOT = tempDir("switchyard-partial-diff-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 
 const { createEvent, getRunRoot, initializeRun, readEvents } = await import(

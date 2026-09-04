@@ -1,15 +1,16 @@
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
+
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
 	loadWorkspaceLifecycleHooks,
 	runWorkspaceLifecycleHook,
 } from "../src/switchyard/lifecycle/hooks.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 function fixture(contents) {
-	const path = mkdtempSync(join(tmpdir(), "switchyard-hooks-"));
+	const path = tempDir("switchyard-hooks-");
 	if (contents !== null)
 		writeFileSync(join(path, "switchyard.hooks.json"), contents);
 	return path;

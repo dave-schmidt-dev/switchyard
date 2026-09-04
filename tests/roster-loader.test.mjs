@@ -4,14 +4,8 @@
 // roster-backed values against synthetic fixtures.
 
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
-import {
-	copyFileSync,
-	mkdirSync,
-	mkdtempSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+
 import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -38,6 +32,7 @@ import {
 	STALE_MAX_AGE_SECONDS,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
@@ -95,7 +90,7 @@ afterEach(() => {
 
 describe("roster loader — path resolution (default ~/.agent/roster.json & SWITCHYARD_ROSTER_PATH override)", () => {
 	it("resolves to canonical ~/.agent/roster.json when SWITCHYARD_ROSTER_PATH is unset", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		tmpDir = tempDir("switchyard-roster-home-");
 		const agentDir = join(tmpDir, ".agent");
 		mkdirSync(agentDir, { recursive: true });
 		copyFileSync(FIXTURE_PATH, join(agentDir, "roster.json"));
@@ -108,7 +103,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("resolves to canonical ~/.agent/roster.json when SWITCHYARD_ROSTER_PATH is empty string", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		tmpDir = tempDir("switchyard-roster-home-");
 		const agentDir = join(tmpDir, ".agent");
 		mkdirSync(agentDir, { recursive: true });
 		copyFileSync(FIXTURE_PATH, join(agentDir, "roster.json"));
@@ -120,7 +115,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("uses SWITCHYARD_ROSTER_PATH as an explicit override over default home roster", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		tmpDir = tempDir("switchyard-roster-home-");
 		const agentDir = join(tmpDir, ".agent");
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(
@@ -149,7 +144,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("throws fail-loud error when default ~/.agent/roster.json is missing", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		tmpDir = tempDir("switchyard-roster-home-");
 		setRosterPath(undefined);
 		setHomeDir(tmpDir);
 
@@ -160,7 +155,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("throws fail-loud error when default ~/.agent/roster.json is malformed JSON", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		tmpDir = tempDir("switchyard-roster-home-");
 		const agentDir = join(tmpDir, ".agent");
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(join(agentDir, "roster.json"), "{ not valid json", "utf8");
@@ -172,7 +167,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("throws fail-loud error when default ~/.agent/roster.json is structurally invalid", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-home-"));
+		tmpDir = tempDir("switchyard-roster-home-");
 		const agentDir = join(tmpDir, ".agent");
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(
@@ -191,7 +186,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("throws when SWITCHYARD_ROSTER_PATH override points at a nonexistent file", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		setRosterPath(join(tmpDir, "does-not-exist.json"));
 		throws(
 			() => passesCapabilityFilter("claude", "low"),
@@ -200,7 +195,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("throws when SWITCHYARD_ROSTER_PATH override file is not valid JSON", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const badPath = join(tmpDir, "malformed.json");
 		writeFileSync(badPath, "{ not valid json at all", "utf8");
 		setRosterPath(badPath);
@@ -208,7 +203,7 @@ describe("roster loader — path resolution (default ~/.agent/roster.json & SWIT
 	});
 
 	it("throws when a slot's model_ref does not resolve in the catalog", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const badPath = join(tmpDir, "dangling-ref.json");
 		writeFileSync(
 			badPath,
@@ -350,7 +345,7 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 		setRosterPath(FIXTURE_PATH);
 		strictEqual(getRightSizedModel("claude", "high"), "fixture-claude-high");
 
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const otherPath = join(tmpDir, "other.json");
 		writeFileSync(
 			otherPath,
@@ -396,7 +391,7 @@ describe("roster loader — effort-keyed qualification variants (brief §4: 'qua
 	// selector) would pass every existing test. These two cases close that
 	// gap directly against a temp roster shaped like the live one.
 	it("a qualification keyed 'selector@effort' gates a non-manual_only effort-carrying slot's ceiling", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const path = join(tmpDir, "effort-variant-qualified.json");
 		writeFileSync(
 			path,
@@ -445,7 +440,7 @@ describe("roster loader — effort-keyed qualification variants (brief §4: 'qua
 		// implementation ever fell back to matching on the bare selector, this
 		// would incorrectly qualify — proving the composite key is load-bearing,
 		// not merely present-but-unused.
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const path = join(tmpDir, "effort-variant-bare-key.json");
 		writeFileSync(
 			path,
@@ -485,7 +480,7 @@ describe("roster loader — effort-keyed qualification variants (brief §4: 'qua
 	});
 
 	it("keeps same-selector OpenCode variants independently qualified", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const path = join(tmpDir, "opencode-variant-qualification.json");
 		const modelRef = "fixture/opencode-variant";
 		const selector = "fixture-opencode-variant";
@@ -573,7 +568,7 @@ describe("roster loader — a retired catalog model never counts toward the ceil
 		// an enabled target, a fully-qualified slot, whose only problem is that
 		// its catalog model has status "retired" — must still resolve to no
 		// capability.
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-loader-"));
+		tmpDir = tempDir("switchyard-roster-loader-");
 		const path = join(tmpDir, "retired-slot.json");
 		writeFileSync(
 			path,
@@ -706,7 +701,7 @@ describe("roster loader — invocation descriptor identity", () => {
 	});
 
 	it("selector-only qualification remains readable but cannot authorize a descriptor", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		tmpDir = tempDir("switchyard-roster-descriptor-");
 		const path = join(tmpDir, "legacy-qualification.json");
 		writeFileSync(
 			path,
@@ -732,7 +727,7 @@ describe("roster loader — invocation descriptor identity", () => {
 	});
 
 	it("authorizes only the exact descriptor identity", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		tmpDir = tempDir("switchyard-roster-descriptor-");
 		const path = join(tmpDir, "exact-qualification.json");
 		const descriptor = {
 			target_id: "codex",
@@ -783,7 +778,7 @@ describe("roster loader — invocation descriptor identity", () => {
 	});
 
 	it("does not authorize qualifications whose descriptor identity changes", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		tmpDir = tempDir("switchyard-roster-descriptor-");
 		const path = join(tmpDir, "mismatch.json");
 		const base = {
 			target_id: "codex",
@@ -859,7 +854,7 @@ describe("roster loader — invocation descriptor identity", () => {
 	});
 
 	it("rejects unapproved invocation flags, values, and positions at roster load", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		tmpDir = tempDir("switchyard-roster-descriptor-");
 		const path = join(tmpDir, "unsafe-invocation.json");
 		writeFileSync(
 			path,
@@ -916,7 +911,7 @@ describe("roster loader — invocation descriptor identity", () => {
 	});
 
 	it("rejects an approved invocation flag with a bad value at roster load", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		tmpDir = tempDir("switchyard-roster-descriptor-");
 		const path = join(tmpDir, "bad-value.json");
 		writeInvocationArgsRoster(path, ["-c", "model_reasoning_effort=turbo"]);
 		setRosterPath(path);
@@ -927,7 +922,7 @@ describe("roster loader — invocation descriptor identity", () => {
 	});
 
 	it("rejects a correctly-shaped invocation pair in reversed positions at roster load", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-descriptor-"));
+		tmpDir = tempDir("switchyard-roster-descriptor-");
 		const path = join(tmpDir, "reversed-pair.json");
 		writeInvocationArgsRoster(path, ["model_reasoning_effort=xhigh", "-c"]);
 		setRosterPath(path);
@@ -984,7 +979,7 @@ describe("roster loader — dispatch qualification evidence and freshness", () =
 	}
 
 	it("authorizes a current exact dispatch_qualified receipt", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-qualification-"));
+		tmpDir = tempDir("switchyard-roster-qualification-");
 		const path = join(tmpDir, "current.json");
 		writeRoster(path, {
 			status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
@@ -1042,9 +1037,7 @@ describe("roster loader — dispatch qualification evidence and freshness", () =
 			},
 		];
 		for (const [index, record] of records.entries()) {
-			tmpDir = mkdtempSync(
-				join(tmpdir(), `switchyard-roster-qualification-${index}-`),
-			);
+			tmpDir = tempDir(`switchyard-roster-qualification-${index}-`);
 			const path = join(tmpDir, "negative.json");
 			writeRoster(path, record);
 			setRosterPath(path);
@@ -1059,7 +1052,7 @@ describe("roster loader — dispatch qualification evidence and freshness", () =
 	});
 
 	it("rejects malformed atomic promotion receipts", () => {
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-qualification-"));
+		tmpDir = tempDir("switchyard-roster-qualification-");
 		const path = join(tmpDir, "malformed-promotion.json");
 		writeRoster(path, {
 			status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
@@ -1107,9 +1100,7 @@ describe("roster loader — dispatch qualification evidence and freshness", () =
 			},
 		];
 		for (const [index, promotion_receipt] of invalidReceipts.entries()) {
-			tmpDir = mkdtempSync(
-				join(tmpdir(), `switchyard-roster-promotion-${index}-`),
-			);
+			tmpDir = tempDir(`switchyard-roster-promotion-${index}-`);
 			const path = join(tmpDir, "invalid-promotion.json");
 			writeRoster(path, {
 				status: QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
@@ -1335,7 +1326,7 @@ describe("roster loader — provider vocabularies and real-roster coherence", ()
 	it("returns no descriptor for an effort-bearing slot with empty argv", () => {
 		const roster = makeRoster();
 		roster.targets["claude-code"].slots.high[0].effort = "max";
-		tmpDir = mkdtempSync(join(tmpdir(), "switchyard-roster-argv-"));
+		tmpDir = tempDir("switchyard-roster-argv-");
 		const path = join(tmpDir, "unsupported.json");
 		writeFileSync(path, JSON.stringify(roster), "utf8");
 		setRosterPath(path);

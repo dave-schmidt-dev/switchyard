@@ -1,6 +1,6 @@
 import { ok, strictEqual } from "node:assert";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync } from "node:fs";
+
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -9,6 +9,7 @@ import {
 	isCursorAuthenticated,
 } from "../src/switchyard/adapter/cursor.mjs";
 import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("cursor adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -62,9 +63,7 @@ describe("cursor adapter shell injection guard", () => {
 		// execFileSync argv element, never through a shell. This guards against
 		// a future refactor accidentally reintroducing shell interpolation, the
 		// exact bug class already found and fixed in the claude/codex adapters.
-		const markerDir = mkdtempSync(
-			join(tmpdir(), "switchyard-prompt-injection-"),
-		);
+		const markerDir = tempDir("switchyard-prompt-injection-");
 		const markerPath = join(markerDir, "marker");
 		const evilPrompt = `wrap up'; touch ${markerPath}; echo '`;
 

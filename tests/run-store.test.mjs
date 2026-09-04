@@ -11,7 +11,6 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
@@ -19,7 +18,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -68,8 +67,9 @@ import {
 	VmAdmissionUnavailableError,
 	VmSlotUnavailableError,
 } from "../src/switchyard/run-store/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-run-store-"));
+const TEST_ROOT = tempDir("switchyard-run-store-");
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");

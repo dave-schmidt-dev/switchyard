@@ -1,7 +1,7 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
+
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
@@ -11,6 +11,7 @@ import {
 } from "../src/switchyard/adapter/opencode.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
+import { tempDir, tempDirIn } from "./helpers/tempdir.mjs";
 
 // Regression coverage for the container-side idle bound. `opencode run` starts
 // an in-process local server and never exits (anomalyco/opencode#17516), and
@@ -18,7 +19,7 @@ import { dockerAvailable } from "./helpers/docker.mjs";
 // cannot shorten the wait from outside. These tests stand in a stub that
 // reproduces exactly that shape: emit output, then never exit.
 
-const testRoot = mkdtempSync(join(tmpdir(), "switchyard-opencode-idle-"));
+const testRoot = tempDir("switchyard-opencode-idle-");
 const realPsPath = execSync("command -v ps", { encoding: "utf8" }).trim();
 const containerName = `switchyard-opencode-idle-${Date.now()}`;
 const IDLE_SECONDS = 5;
@@ -270,7 +271,7 @@ describe("opencode container-side idle bound", () => {
 
 	for (const state of ["Ss", "S+", "Z+"]) {
 		it(`matches macOS ps state prefix ${state}`, () => {
-			const commandDir = mkdtempSync(join(testRoot, `state-${state}-`));
+			const commandDir = tempDirIn(testRoot, `state-${state}-`);
 			const psCountPath = join(commandDir, "ps-count");
 			writeFileSync(psCountPath, "0\n");
 			writeExecutable(
@@ -303,7 +304,7 @@ fi
 	}
 
 	it("treats an unprobeable PID as alive", () => {
-		const commandDir = mkdtempSync(join(testRoot, "unprobeable-"));
+		const commandDir = tempDirIn(testRoot, "unprobeable-");
 		writeExecutable(join(commandDir, "ps"), "#!/bin/sh\nexit 1\n");
 		writeExecutable(
 			join(commandDir, "opencode"),
@@ -317,7 +318,7 @@ fi
 	});
 
 	it("sweeps a surviving named process and reports a nonzero count", () => {
-		const commandDir = mkdtempSync(join(testRoot, "sweep-"));
+		const commandDir = tempDirIn(testRoot, "sweep-");
 		const pidPath = join(commandDir, "survivor-pid");
 		writeExecutable(
 			join(commandDir, "pgrep"),

@@ -1,11 +1,12 @@
 import { notStrictEqual, rejects, strictEqual } from "node:assert";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
+
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createBroker } from "../src/switchyard/broker/index.mjs";
 import { createReservationLedger } from "../src/switchyard/broker/reservations.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 function request(taskId, amount = 2) {
 	return {
@@ -49,7 +50,7 @@ function dependencies(reservations, reservationCapacity) {
 }
 
 async function fixture(options = {}) {
-	const root = await mkdtemp(join(tmpdir(), "switchyard-reservations-"));
+	const root = await tempDirAsync("switchyard-reservations-");
 	let sequence = 0;
 	return createReservationLedger({
 		root,
@@ -200,7 +201,7 @@ describe("broker reservations", () => {
 	});
 
 	it("recovers an abandoned atomic lock owned by a dead process", async () => {
-		const root = await mkdtemp(join(tmpdir(), "switchyard-reservations-lock-"));
+		const root = await tempDirAsync("switchyard-reservations-lock-");
 		const lockPath = join(root, "reservations.lock");
 		await mkdir(lockPath);
 		await writeFile(

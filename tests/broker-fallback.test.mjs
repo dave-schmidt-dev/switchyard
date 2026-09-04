@@ -1,11 +1,10 @@
 import { rejects, strictEqual } from "node:assert";
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+
 import { describe, it } from "node:test";
 import { createBroker } from "../src/switchyard/broker/index.mjs";
 import { createReservationLedger } from "../src/switchyard/broker/reservations.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 const NOW = Date.parse("2026-08-16T12:00:00.000Z");
 
@@ -193,7 +192,7 @@ describe("broker fallback", () => {
 	});
 
 	it("preserves the one-fallback ceiling across broker restart", async () => {
-		const root = await mkdtemp(join(tmpdir(), "switchyard-fallback-"));
+		const root = await tempDirAsync("switchyard-fallback-");
 		const firstBroker = createBroker(
 			dependencies({ reservations: createReservationLedger({ root }) }),
 		);

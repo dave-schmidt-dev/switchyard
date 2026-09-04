@@ -10,13 +10,12 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+
 import { join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
@@ -35,8 +34,9 @@ import {
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
 import { RUN_STARTUP_GRACE_MS } from "../src/switchyard/run-store/run-liveness.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_ROOT = mkdtempSync(join(tmpdir(), "switchyard-remediate-locks-"));
+const TEST_ROOT = tempDir("switchyard-remediate-locks-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 
 after(() => {

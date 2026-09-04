@@ -1,7 +1,7 @@
 import { rejects, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
@@ -14,6 +14,7 @@ import {
 } from "../src/switchyard/roster/index.mjs";
 import { route as productionRoute } from "../src/switchyard/router/index.mjs";
 import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
+import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
@@ -107,7 +108,7 @@ function descriptor(target, model) {
 }
 
 test("production async runner retains cli usage failure without peer fallback", async () => {
-	const root = await mkdtemp(join(tmpdir(), "switchyard-production-broker-"));
+	const root = await tempDirAsync("switchyard-production-broker-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -216,7 +217,7 @@ test("production async runner never infers peer fallback from failure prose", as
 		"transient provider launch failure",
 		"timeout while starting provider",
 	]) {
-		const root = await mkdtemp(join(tmpdir(), "switchyard-broker-prose-"));
+		const root = await tempDirAsync("switchyard-broker-prose-");
 		const tasksFilePath = join(root, "TASKS.md");
 		const checkpointPath = join(root, "checkpoint.json");
 		await writeFile(
@@ -271,9 +272,7 @@ test("production async runner never infers peer fallback from failure prose", as
 });
 
 test("production async broker forwards adapter status and heartbeats", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-status-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-status-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -334,9 +333,7 @@ test("production async broker forwards adapter status and heartbeats", async () 
 });
 
 test("production async runner drains a dependency chain in one bounded run", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-chain-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-chain-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -385,9 +382,7 @@ test("production async runner drains a dependency chain in one bounded run", asy
 });
 
 test("production async runner commits each task on an owned container", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-commit-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-commit-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -446,9 +441,7 @@ test("production async runner commits each task on an owned container", async ()
 });
 
 test("production async runner resets failed tasks before continuing on an owned container", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-reset-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-reset-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -517,8 +510,8 @@ test("production async runner resets failed tasks before continuing on an owned 
 });
 
 test("production async runner reconciles an explicitly selected completed task", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-already-complete-"),
+	const root = await tempDirAsync(
+		"switchyard-production-broker-already-complete-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -544,9 +537,7 @@ test("production async runner reconciles an explicitly selected completed task",
 });
 
 test("production async runner fails closed on a persisted retry_started state", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-retry-resume-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-retry-resume-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -629,9 +620,7 @@ test("production async runner fails closed on a persisted retry_started state", 
 });
 
 test("production async runner isolates selection failures and releases early reservations", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-failure-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-failure-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -685,8 +674,8 @@ test("production async runner isolates selection failures and releases early res
 });
 
 test("production async runner clears route state after a successful task before selection fails", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-state-isolation-"),
+	const root = await tempDirAsync(
+		"switchyard-production-broker-state-isolation-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -741,8 +730,8 @@ test("production async runner clears route state after a successful task before 
 });
 
 test("production async runner does not write a fallback intent for a generic failure", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-fallback-intent-"),
+	const root = await tempDirAsync(
+		"switchyard-production-broker-fallback-intent-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -814,9 +803,7 @@ test("production async runner does not write a fallback intent for a generic fai
 });
 
 test("production async runner preserves a generic broker failure without retry", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-precondition-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-precondition-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -888,9 +875,7 @@ test("production async runner preserves a generic broker failure without retry",
 });
 
 test("production async runner does not fallback a typed nonretryable failure", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-nonretryable-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-nonretryable-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -943,8 +928,8 @@ test("production async runner does not fallback a typed nonretryable failure", a
 });
 
 test("production async runner records the routed provider when post-execution capture throws", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-postexecution-"),
+	const root = await tempDirAsync(
+		"switchyard-production-broker-postexecution-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -993,8 +978,8 @@ test("production async runner records the routed provider when post-execution ca
 });
 
 test("production async runner does not retry before post-execution capture", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-fallback-postexecution-"),
+	const root = await tempDirAsync(
+		"switchyard-production-broker-fallback-postexecution-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -1060,9 +1045,7 @@ test("production async runner does not retry before post-execution capture", asy
 });
 
 test("production async runner releases a reservation before an adapter precondition failure", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-release-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-release-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -1101,9 +1084,7 @@ test("production async runner releases a reservation before an adapter precondit
 });
 
 test("production async runner cleans up when broker construction fails closed", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-construction-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-construction-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -1137,9 +1118,7 @@ test("production async runner cleans up when broker construction fails closed", 
 });
 
 test("production router path coordinates the requested snapshot source", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-real-router-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-real-router-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -1205,8 +1184,8 @@ test("production router path coordinates the requested snapshot source", async (
 });
 
 test("production router path rejects an unknown snapshot source", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-unknown-source-"),
+	const root = await tempDirAsync(
+		"switchyard-production-broker-unknown-source-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -1243,9 +1222,7 @@ test("production router path rejects an unknown snapshot source", async () => {
 });
 
 test("production async runner quarantines quota targets and retries the same task once", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-quota-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-quota-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -1333,9 +1310,7 @@ test("production async runner quarantines quota targets and retries the same tas
 });
 
 test("production async runner refreshes quarantined exclusions for each task", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-broker-quota-queue-"),
-	);
+	const root = await tempDirAsync("switchyard-production-broker-quota-queue-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
@@ -1415,8 +1390,8 @@ test("production async runner refreshes quarantined exclusions for each task", a
 });
 
 test("async teardown failure finalizes as recovery required, never succeeded cleanup complete", async () => {
-	const root = await mkdtemp(
-		join(tmpdir(), "switchyard-production-cleanup-finalization-"),
+	const root = await tempDirAsync(
+		"switchyard-production-cleanup-finalization-",
 	);
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -1501,7 +1476,7 @@ test("production async runner records the adapter's served-model verification", 
 		[null, false],
 		[undefined, undefined],
 	]) {
-		const root = await mkdtemp(join(tmpdir(), "switchyard-broker-served-"));
+		const root = await tempDirAsync("switchyard-broker-served-");
 		const tasksFilePath = join(root, "TASKS.md");
 		const checkpointPath = join(root, "checkpoint.json");
 		await writeFile(
@@ -1578,7 +1553,7 @@ test("production async runner records the adapter's served-model verification", 
 // failure was persisted without naming the kill step that failed. This drives
 // the whole launcher -> executor -> runner chain, which is where it died.
 test("production async runner records which cleanup stage failed", async () => {
-	const root = await mkdtemp(join(tmpdir(), "switchyard-broker-cleanup-"));
+	const root = await tempDirAsync("switchyard-broker-cleanup-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(

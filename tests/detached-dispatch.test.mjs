@@ -9,20 +9,20 @@ import {
 	closeSync,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	openSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -228,7 +228,7 @@ function makeStateRootEnv() {
 }
 
 beforeEach(async () => {
-	dir = mkdtempSync(join(tmpdir(), "switchyard-detached-dispatch-"));
+	dir = tempDir("switchyard-detached-dispatch-");
 	detachedCleanupPending = false;
 	detachedCleanupRunId = null;
 	stateRoot = join(dir, "state-root");
@@ -3095,7 +3095,9 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 		// log at all would keep this test green.
 		const launchCode = `
 		import fs from "node:fs";
-		import { syncBuiltinESMExports } from "node:module";
+		import {
+	syncBuiltinESMExports,
+} from "node:module";
 		const realOpenSync = fs.openSync;
 		fs.openSync = function (path, ...rest) {
 			if (typeof path === "string" && path.endsWith("boot-stderr.log")) {

@@ -14,14 +14,13 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -119,6 +118,7 @@ import {
 	runQueue,
 	TaskSelectionError,
 } from "../src/switchyard/runner/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 function runDispatch(args, env = {}, timeout = 10_000) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
@@ -185,7 +185,7 @@ function makeStateRootEnv() {
 }
 
 beforeEach(async () => {
-	dir = mkdtempSync(join(tmpdir(), "switchyard-dispatch-cli-"));
+	dir = tempDir("switchyard-dispatch-cli-");
 	stateRoot = join(dir, "state-root");
 	tasksFile = join(dir, "tasks.md");
 	writeFileSync(

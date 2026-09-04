@@ -1,7 +1,7 @@
 import { strictEqual } from "node:assert";
 import { execFileSync, execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { captureDiff as captureAgyDiff } from "../src/switchyard/adapter/agy.mjs";
@@ -11,6 +11,7 @@ import { captureDiff as captureCopilotDiff } from "../src/switchyard/adapter/cop
 import { captureDiff as captureCursorDiff } from "../src/switchyard/adapter/cursor.mjs";
 import { captureDiff as captureOpencodeDiff } from "../src/switchyard/adapter/opencode.mjs";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const captures = [
 	["agy", captureAgyDiff],
@@ -51,7 +52,7 @@ afterEach(() => {
 });
 
 function installFakeDocker(patch) {
-	tempRoot = mkdtempSync(join(tmpdir(), "switchyard-patch-bytes-"));
+	tempRoot = tempDir("switchyard-patch-bytes-");
 	const patchPath = join(tempRoot, "patch.diff");
 	writeFileSync(patchPath, patch, "utf8");
 	const dockerPath = join(tempRoot, "docker");
@@ -70,7 +71,7 @@ esac
 }
 
 function buildProject() {
-	const project = mkdtempSync(join(tmpdir(), "switchyard-patch-gate-"));
+	const project = tempDir("switchyard-patch-gate-");
 	writeFileSync(join(project, "test.txt"), "before\n", "utf8");
 	execSync("git init -q", { cwd: project, stdio: "pipe" });
 	execSync('git config user.email "test@test.com"', {

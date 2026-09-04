@@ -1,8 +1,8 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
@@ -13,10 +13,11 @@ import {
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
-const testRoot = mkdtempSync(join(tmpdir(), "switchyard-agy-adapter-"));
+const testRoot = tempDir("switchyard-agy-adapter-");
 const containerName = `switchyard-agy-adapter-${Date.now()}`;
 
 // getWorkspaceExecution (provider-lifecycle.mjs) now requires an

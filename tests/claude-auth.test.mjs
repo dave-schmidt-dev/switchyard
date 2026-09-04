@@ -1,6 +1,6 @@
 import { ok, strictEqual } from "node:assert";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, rmSync } from "node:fs";
+
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -9,6 +9,7 @@ import {
 	isClaudeAuthenticated,
 } from "../src/switchyard/adapter/claude.mjs";
 import { createFakeExecutionBackend } from "./helpers/fake-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("claude adapter shell injection guard", () => {
 	it("rejects workingContainerName with shell metacharacters", () => {
@@ -61,9 +62,7 @@ describe("claude adapter shell injection guard", () => {
 		// Same class of bug fixed in the Codex adapter: the prompt must never be
 		// shell-interpolated. Delivered over stdin, so a single quote in a task
 		// description can't break out into host shell syntax.
-		const markerDir = mkdtempSync(
-			join(tmpdir(), "switchyard-prompt-injection-"),
-		);
+		const markerDir = tempDir("switchyard-prompt-injection-");
 		const markerPath = join(markerDir, "marker");
 		const evilPrompt = `wrap up'; touch ${markerPath}; echo '`;
 

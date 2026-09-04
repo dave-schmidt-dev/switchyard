@@ -5,13 +5,12 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	rmSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { dirname, join, relative, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -33,6 +32,7 @@ import {
 	runQueue,
 	runQueueWithOrchestrator,
 } from "../src/switchyard/runner/index.mjs";
+import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cutoverCli = join(projectRoot, "ops", "switchyard-cutover.mjs");
@@ -46,7 +46,7 @@ const workerBootstrap = join(
 const tempDirs = [];
 
 function tempDir() {
-	const path = mkdtempSync(join(tmpdir(), "switchyard-generation-test-"));
+	const path = trackedTempDir("switchyard-generation-test-");
 	tempDirs.push(path);
 	return path;
 }

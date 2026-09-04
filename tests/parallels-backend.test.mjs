@@ -10,12 +10,11 @@ import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -36,6 +35,7 @@ import {
 	parseParallelsWorkingName,
 	validateLinkedCloneMeasurement,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_UUID = "{11111111-1111-4111-8111-111111111111}";
 const WORK_UUID = "{22222222-2222-4222-8222-222222222222}";
@@ -1103,7 +1103,7 @@ describe("Parallels execution backend lifecycle", () => {
 		ok(script, "the seed script must reach the execution seam");
 
 		for (const populated of [false, true]) {
-			const guestDir = mkdtempSync(join(tmpdir(), "switchyard-seed-repeat-"));
+			const guestDir = tempDir("switchyard-seed-repeat-");
 			try {
 				if (populated) writeFileSync(join(guestDir, "README.txt"), "seeded\n");
 				const log = () =>
@@ -1873,7 +1873,7 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 	}
 
 	function makeSidecarRoot() {
-		return mkdtempSync(join(tmpdir(), "switchyard-sidecar-"));
+		return tempDir("switchyard-sidecar-");
 	}
 
 	/**
@@ -2549,7 +2549,7 @@ describe("bulk-transfer helper misfire tolerance", () => {
 	 * @param {{failUntil: number, retryAttempts: number}} input
 	 */
 	function runHelper({ failUntil, retryAttempts }) {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-bulk-helper-"));
+		const root = tempDir("switchyard-bulk-helper-");
 		try {
 			const stub = stubPrlctl(root);
 			const payload = Buffer.from("payload-bytes");

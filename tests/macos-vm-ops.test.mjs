@@ -41,15 +41,15 @@ import {
 	chmodSync,
 	constants,
 	existsSync,
-	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
@@ -109,7 +109,7 @@ const extractShellFunction = (body, name) => {
 	return body.slice(start, end + 3);
 };
 
-const scratch = () => mkdtempSync(join(tmpdir(), "switchyard-vm-ops-"));
+const scratch = () => tempDir("switchyard-vm-ops-");
 
 // Renders every `guest_exec_script <<EOF` block in the build script the way the
 // host renders it: the script's own top-level assignments, then `cat <<EOF`.
