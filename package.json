@@ -13,6 +13,7 @@
 		"deadcode": "knip",
 		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",
 		"validate": "node scripts/run-validate-phases.mjs",
+		"sweep:temp": "node scripts/sweep-temp-dirs.mjs",
 		"auth": "node src/switchyard/auth/index.mjs",
 		"auth:check": "node src/switchyard/auth/index.mjs --check",
 		"auth:check:live": "node src/switchyard/auth/index.mjs --check --live",

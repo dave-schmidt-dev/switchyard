@@ -30,6 +30,7 @@ The 2026-08-04 capability-reliability checkpoint adds explicit `RequiredCapabili
 | `LICENSE` | MIT. |
 | `package.json` | Node.js/ESM project config, biome + knip + husky devDependencies; `prepare` installs the git hooks on `npm install`. Test scripts serialize the files that have shown Parallels/`prlctl`-daemon contention flakes: `test:serial` runs `dispatch-cli`, `detached-dispatch`, `no-host-rights-vm`, and `workspace-wipe-vm` at `--test-concurrency=1`, and `test:other` dynamically derives every other `tests/*.test.mjs` — the named files are an **exclusion** list, not an inclusion list, so a new test file runs by default. `test` runs both phases **unconditionally** via `scripts/run-test-phases.mjs` (every test file exactly once); it deliberately does not chain them with `&&`, because a legitimately-red `test:serial` gate would otherwise short-circuit and hide the entire second phase. `validate` chains lint + deadcode + test. |
 | `scripts/run-test-phases.mjs` | Test-phase runner behind `npm test`. Runs `test:serial` then `test:other` unconditionally, inherits stdio so each phase streams live rather than buffering, prints a `Test phase summary: <phase> (exit N), ...` line, and exits with the first non-zero phase status. Exports an injectable `runPhases({phases, run, log})` so the aggregation is tested (`tests/test-phase-aggregation.test.mjs`) without invoking the real suite. |
+| `scripts/sweep-temp-dirs.mjs` | One-shot collector for the `switchyard-*` directories the test suite leaked into `$TMPDIR` before `tests/helpers/tempdir.mjs` existed (~9.4k of them). Dry-run by default; `npm run sweep:temp -- --apply` deletes. Only `switchyard-` prefixed **direct children** of `$TMPDIR` are ever in scope — that directory also holds other projects' state — and the prefix and parent are re-checked against the canonical path immediately before each removal. Retains anything whose tree was touched inside the age bound (default 3 days, `--days=N`), anything a live process holds open, and any symlink. **Refuses to run at all if `lsof` is unavailable** rather than deleting unchecked: the first version of this sweep compared lsof output against the raw `$TMPDIR` value while macOS reports canonical `/private/var/...` paths, so its open-handle check matched nothing and reported a truthful but vacuous zero. Deliberately not wired into `test` or `validate` — a gate has no business deleting machine state. Covered by `tests/sweep-temp-dirs.test.mjs`. |
 | `.husky/pre-commit`, `.husky/pre-push` | Git hooks (husky, wired by the `prepare` script). `pre-commit` runs `npm run lint`; `pre-push` runs `npm run validate`. Both call the named script instead of restating its steps so a hook cannot drift from the gate. See [Git hooks](#git-hooks). |
 | `biome.json` | Biome linter/formatter config. |
 | `knip.json` | Dead code / unused dependency detection. |
@@ -481,6 +482,25 @@ Run code quality check with Biome:
 ```bash
 npm run lint
 ```
+
+The suite used to leave a temp directory behind on every failing test, and macOS
+only purges `$TMPDIR` for entries untouched three days, at boot — so a machine
+that runs for weeks accumulated thousands. Every `mkdtemp` call site now goes
+through `tests/helpers/tempdir.mjs`, and `tests/tempdir-hygiene.test.mjs` fails
+if that regresses: it runs a deliberately-failing child suite against a private
+`TMPDIR` and asserts the entry set did not grow, plus a structural check that no
+test file calls `mkdtemp` directly. The behavioural leg is the one that matters —
+`integration-gate.test.mjs` leaked six directories per run while having a
+correct-looking `beforeEach`/`afterEach` pair, because a nested `describe`
+declared its own `beforeEach` that orphaned the outer one's repo.
+
+To clear a backlog left by an older checkout, dry-run first:
+
+```bash
+npm run sweep:temp             # reports what it would remove; deletes nothing
+npm run sweep:temp -- --apply  # removes them
+```
+
 
 #### Git hooks
 
