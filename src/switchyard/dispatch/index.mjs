@@ -827,6 +827,9 @@ async function runDispatch(opts, dependencies = {}) {
 							descriptorHarness: r.descriptorHarness ?? null,
 							resolvedTargetId: r.resolvedTargetId ?? null,
 							dispatchContractVersion: r.dispatchContractVersion ?? 1,
+							...(typeof r.servedModelVerified === "boolean"
+								? { servedModelVerified: r.servedModelVerified }
+								: {}),
 							result: r.result,
 							...(r.alreadyApplied ? { alreadyApplied: true } : {}),
 							...(safeFailure ?? {}),

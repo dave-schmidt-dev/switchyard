@@ -3170,6 +3170,48 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		);
 	});
 
+	// Regression: the synchronous `run` path builds its own task event object
+	// instead of reusing the detached worker's, so a field wired into one is
+	// simply absent from the other. servedModelVerified reached events.jsonl
+	// on the detached path only until this pinned both halves of the boolean
+	// and the "adapter cannot report one" case that must stay absent.
+	it("records the served-model verification on the synchronous run's task event", async () => {
+		const { readEvents } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runsRoot = join(stateRoot, "runs");
+
+		async function taskEventFor(extraResultFields) {
+			const before = new Set(existsSync(runsRoot) ? readdirSync(runsRoot) : []);
+			await dispatchWithStub((queueOptions) => {
+				const stub = stubResult(true);
+				stub.results[0] = { ...stub.results[0], ...extraResultFields };
+				queueOptions.dependencies.onResult(stub.results[0]);
+				return stub;
+			});
+			const runId = readdirSync(runsRoot).find((id) => !before.has(id));
+			ok(runId, "the dispatch must create a run record");
+			const events = await readEvents(runId);
+			const event = events.find((e) => e.event === "task_completed");
+			ok(event, "the run must record a task_completed event");
+			return event;
+		}
+
+		strictEqual(
+			(await taskEventFor({ servedModelVerified: true })).servedModelVerified,
+			true,
+		);
+		strictEqual(
+			(await taskEventFor({ servedModelVerified: false })).servedModelVerified,
+			false,
+		);
+		const unsupported = await taskEventFor({});
+		ok(
+			!Object.hasOwn(unsupported, "servedModelVerified"),
+			"an adapter that cannot report a served model must leave the field absent, not false",
+		);
+	});
+
 	it("publishes activeTaskId while the task is running, so the envelope stops reading idle", async () => {
 		// Live-run feedback 2026-08-04/05 (Sentinel Tasks 1.3, 1.4, 3.1): a
 		// synchronous run reported activeTaskId=null and a stale updatedAt for

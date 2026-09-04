@@ -197,4 +197,55 @@ describe("broker async executor", () => {
 		strictEqual(result.failurePhase, "provider_execution");
 		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
 	});
+
+	// Regression: the frozen return shapes above are allowlists, so a field the
+	// launcher sets and nothing here names is dropped in silence. That is what
+	// happened to servedModelVerified — every production dispatch goes through
+	// this boundary, so the adapter's served-model read-back reached a result
+	// only in the synchronous test path and never in a real run.
+	it("carries the launcher's served-model verification across both terminal shapes", async () => {
+		for (const verified of [true, false]) {
+			const value = fixture();
+			const success = await executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				launch: async () => ({
+					success: true,
+					actualConsumption: 1,
+					servedModelVerified: verified,
+				}),
+				terminal: async () => ({ changed: true }),
+			});
+			strictEqual(success.servedModelVerified, verified);
+
+			const failed = await executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				launch: async () => ({
+					success: false,
+					errorKind: "execution_failed",
+					servedModelVerified: verified,
+				}),
+				terminal: async () => ({ changed: true }),
+			});
+			strictEqual(failed.servedModelVerified, verified);
+		}
+	});
+
+	it("reports a null verification for a launcher that cannot read one back", async () => {
+		const value = fixture();
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({ success: true, actualConsumption: 1 }),
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.servedModelVerified, null);
+	});
 });

@@ -195,6 +195,13 @@ export async function executeBrokerRoute(options) {
 			success: true,
 			outcome: "success",
 			actualConsumption,
+			// A bounded boolean from the launcher, not the guest-supplied model
+			// name. Without it here the frozen allowlist silently dropped the
+			// adapter's served-model read-back before it could reach a result.
+			servedModelVerified:
+				typeof launcherResult?.servedModelVerified === "boolean"
+					? launcherResult.servedModelVerified
+					: null,
 			terminalEvidence,
 		});
 	} catch (error) {
@@ -245,6 +252,10 @@ export async function executeBrokerRoute(options) {
 			exitCode: failure?.exitCode ?? null,
 			signal: failure?.signal ?? null,
 			failurePhase: failure?.failurePhase ?? null,
+			servedModelVerified:
+				typeof launcherResult?.servedModelVerified === "boolean"
+					? launcherResult.servedModelVerified
+					: null,
 			terminalEvidence,
 		});
 	}

@@ -1489,3 +1489,86 @@ test("async teardown failure finalizes as recovery required, never succeeded cle
 	);
 	strictEqual(JSON.stringify(persisted).includes("SECRET_CANARY"), false);
 });
+
+// Regression: the broker executor's terminal returns are frozen allowlists, so
+// a launcher field nothing there names is dropped in silence. servedModelVerified
+// was dropped exactly that way -- every unit test passed because they drove the
+// synchronous runner, and the first live dispatch recorded no flag at all. This
+// pins the executor -> runner leg without a VM.
+test("production async runner records the adapter's served-model verification", async () => {
+	for (const [servedModel, expected] of [
+		["cheap-standard", true],
+		[null, false],
+		[undefined, undefined],
+	]) {
+		const root = await mkdtemp(join(tmpdir(), "switchyard-broker-served-"));
+		const tasksFilePath = join(root, "TASKS.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		await writeFile(
+			tasksFilePath,
+			"### Task 1.1: Served model\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** carry the served-model fact\n",
+		);
+		const result = await runQueueAsync({
+			tasksFilePath,
+			projectPath: root,
+			workingContainerName: "broker-served-worker",
+			checkpointPath,
+			dependencies: {
+				queuePreflight: () => ({ ok: true, eligible: true }),
+				backendFactory: () => ({
+					executionBackend: {},
+					create: () => "broker-served-worker",
+					destroy: () => {},
+					seed: () => {},
+					commit: () => {},
+					reset: () => {},
+				}),
+				adapters: {
+					claude: {
+						executeAsync: async () => ({
+							success: true,
+							output: "done",
+							...(servedModel === undefined ? {} : { servedModel }),
+						}),
+						captureDiffAsync: async () => null,
+					},
+				},
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				route: () => ({
+					provider: "Cheap",
+					resolvedTargetId: "cheap",
+					resolved_harness: "claude",
+					model: "cheap-standard",
+					reason: "ranked",
+				}),
+				resolveTargetIdentity: () => ({
+					targetId: "cheap",
+					harnessKey: "claude",
+					ambiguous: false,
+				}),
+				resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+			},
+		});
+		const record = result.results[0];
+		if (expected === undefined) {
+			strictEqual(
+				Object.hasOwn(record, "servedModelVerified"),
+				false,
+				"an adapter that cannot report a served model must leave the field absent",
+			);
+		} else {
+			strictEqual(record.servedModelVerified, expected);
+		}
+		const checkpoint = JSON.parse(await readFile(checkpointPath, "utf8"));
+		strictEqual(
+			checkpoint.results[0].servedModelVerified,
+			expected,
+			"the checkpoint entry must agree with the result record",
+		);
+		strictEqual(
+			JSON.stringify(result).includes("cheap-standard-served"),
+			false,
+		);
+	}
+});

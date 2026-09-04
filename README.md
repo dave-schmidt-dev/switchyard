@@ -594,6 +594,12 @@ A task that overruns its timeout is not silently discarded. On `ETIMEDOUT`, the 
 
 The orphan-kill step (`adapter/orphan-kill.mjs`) also clears a stale `/project/.git/index.lock` left behind if the killed process was itself mid `git add`/`git commit` — empirically confirmed to otherwise make the diff-capture `git add -A` fail and silently return `null`, losing the whole partial diff via its catch-all. Safe specifically because it runs after every in-VM process has already been force-killed, so nothing can still legitimately hold the lock. If the rescue attempt still recovers nothing (no edits were made before the kill, or capture failed anyway), `runQueue` emits a distinct `partial_diff_capture_failed` status event and records `partialDiffPath: null` in checkpoint.json, rather than letting a failed rescue collapse silently into the generic `task_failed`.
 
+### Gate Rejection Evidence
+
+A task the integration gate rejects for `empty_required_diff` has, by definition, no diff to keep — so before this it was recorded with no evidence at all, and the only account of why the provider changed nothing was discarded with the adapter's transcript. The rejection now persists that transcript instead, bounded to 32 KiB (8 KiB head plus tail, with an explicit `...[switchyard omitted N characters]...` marker) at `<checkpointPath>.partial-diffs/<taskId>.output`. It is kept only when there is genuinely no diff, and never when the gate flagged a credential in the output. As with partial diffs, only the opaque `artifact:<24 hex>` reference crosses into checkpoint.json, events.jsonl, or the ledger — host paths and raw bytes stay on the host.
+
+Task results, checkpoint entries, and task events also carry `servedModelVerified`: a boolean recording whether the adapter affirmatively read back the model the provider served (a served/selector mismatch already fails the task, so on any task that reaches a result the served model is either the selector or unreadable). It is absent, not `false`, for adapters that cannot report one. The guest-supplied model string itself never crosses the persistence boundary. Retry attempt records and ledger dispatch entries do not carry the flag.
+
 ### Detached Dispatch and Recovery
 
 `launch` starts a task queue in a detached child process and returns immediately with a `runId`, instead of blocking the caller for the full run (useful under a harness with a bounded command timeout). The lifecycle is `launch` → poll `status` → `result` → (if needed) `recover`:
