@@ -148,11 +148,19 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	const vibeModelRef = "mistral/mistral-medium-3.5";
-	const vibeSelector = "mistral-medium-3.5";
-	// Both GLM spellings were demoted on 2026-09-01: the VM-side Vibe account is
-	// not entitled to GLM-5.2, so every GLM selector silently fell back to
-	// mistral-medium-3.5. Neither label may survive as a qualification record.
+	const vibeLowModelRef = "zhipu/glm-5.2-low";
+	const vibeModelRef = "zhipu/glm-5.2-high";
+	const vibeSelector = "glm-5.2-high";
+	// The bare GLM spellings were demoted on 2026-09-01 after every one of them
+	// logged vibe's "Active model '<x>' is not in your configured models"
+	// fallback. That message comes from vibe's LOCAL config loader
+	// (vibe_schema.py `_apply_active_model_fallback`) and fires before any
+	// request leaves the machine -- the VM copies it was measured in carry no
+	// `~/.vibe/config.toml` at all, so no user alias could resolve there
+	// whatever the account is entitled to. Treat those two spellings as dead
+	// labels, not as evidence about entitlement. The 2026-09-04 host config
+	// defines `glm-5.2-low`/`glm-5.2-high` as explicit `[[models]]` aliases,
+	// which is a different identity from either dead spelling.
 	const oldVibeSelectors = ["glm-5.2", "glm-5-2"];
 	const oldVibeDescriptorHashes = [
 		"sha256:fcb8dc17218516f69e8609d61f768106ab301727e2e65af76b0da4285f0895b1",
@@ -165,9 +173,16 @@ describe("harness registry drift (Task 1.6b)", () => {
 		strictEqual(targets.vibe?.harness, "vibe");
 		strictEqual(targets.vibe?.snapshot_name, "Vibe");
 		strictEqual(targets.vibe?.technical_ceiling, "standard");
+		deepStrictEqual(targets.vibe?.slots?.low, [
+			{ model_ref: vibeLowModelRef, priority: 1 },
+		]);
 		deepStrictEqual(targets.vibe?.slots?.standard, [
 			{ model_ref: vibeModelRef, priority: 1 },
 		]);
+		ok(
+			roster.models?.[vibeLowModelRef],
+			"expected the Vibe low-slot model reference to exist",
+		);
 		ok(
 			roster.models?.[vibeModelRef],
 			"expected the Vibe model reference to exist",
@@ -190,17 +205,30 @@ describe("harness registry drift (Task 1.6b)", () => {
 
 		const expectedDescriptor = getInvocationDescriptor("vibe", "standard");
 		if (expectedDescriptor === null) {
-			strictEqual(
-				vibeQualifications[vibeSelector]?.status,
-				"untested",
-				"pre-promotion Vibe state must retain an explicit untested intent record",
+			// The slot selector must still carry an explicit, honest record.
+			// Host-side `roster smoke` writes `qualified` (the wrapper ran and
+			// produced parseable output); `untested` is the bare intent record.
+			// Both are fail-closed -- only `dispatch_qualified`, which a real VM
+			// canary writes, authorizes routing.
+			ok(
+				["untested", "qualified"].includes(
+					vibeQualifications[vibeSelector]?.status,
+				),
+				`pre-promotion Vibe state must retain an explicit non-dispatch record for ${vibeSelector}`,
 			);
+			// Scoped to the current selector on purpose. A promoted receipt for
+			// a selector no slot references (mistral-medium-3.5) is retained
+			// history, not an authorization: getInvocationDescriptor resolves
+			// the slot first, so a stale receipt cannot route. Deleting it would
+			// cost a fresh VM canary to restore that lane.
 			strictEqual(
 				vibeQualificationEntries.some(
-					([, qualification]) => qualification?.status === "dispatch_qualified",
+					([, qualification]) =>
+						qualification?.status === "dispatch_qualified" &&
+						qualification?.selector === vibeSelector,
 				),
 				false,
-				"pre-promotion Vibe state must remain fail-closed",
+				"pre-promotion Vibe state must remain fail-closed for the current selector",
 			);
 			return;
 		}
@@ -259,7 +287,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 			strictEqual(
 				qualification.promotion_receipt?.selector,
 				vibeSelector,
-				"vibe promotion receipt selector must be mistral-medium-3.5",
+				"vibe promotion receipt selector must match the slot selector",
 			);
 			strictEqual(
 				qualification.promotion_receipt?.effort,
