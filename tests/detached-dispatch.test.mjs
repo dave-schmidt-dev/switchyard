@@ -699,6 +699,17 @@ describe("worker reaches terminal state and result is readable", () => {
 		const result = JSON.parse(resultResult.stdout.trim());
 		ok(result.terminalSummary !== null, "terminalSummary present");
 		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
+
+		// A completed run leaves no empty artifacts/ behind. The channel has had
+		// no writer since the partial-diff copy was removed for INV-2, and every
+		// run provisioning one anyway is what accumulated 81 empty directories in
+		// the consuming project by 2026-09-04. listArtifactRefs reads the same
+		// absent path to produce the array asserted just above, so this is the
+		// end-to-end proof that absence costs the result envelope nothing.
+		ok(
+			!existsSync(resolve(stateRoot, "runs", runId, "artifacts")),
+			"a real run must not leave an empty artifacts directory",
+		);
 		strictEqual(result.dispatchContractVersion, 1);
 		if (result.lastTaskDescriptorIdentity !== null) {
 			ok(

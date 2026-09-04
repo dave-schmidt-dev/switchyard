@@ -276,13 +276,16 @@ describe("initializeRun", () => {
 		strictEqual((await readRun(legacy.runId)).schemaVersion, 1);
 	});
 
-	it("creates run directory and artifacts subdirectory", async () => {
+	it("creates the run directory but not an empty artifacts subdirectory", async () => {
+		// artifacts/ has had no writer since the partial-diff copy was removed
+		// for INV-2, so provisioning one left an empty directory behind on every
+		// single run -- 81 of them in the consuming project by 2026-09-04. Both
+		// readers treat absence as ordinary; a producer would create its own.
 		const opts = makeOptions();
 		await initializeRun(opts);
 		const runDir = getRunRoot(opts.runId);
-		const artifactsDir = join(runDir, "artifacts");
 		ok(existsSync(runDir));
-		ok(existsSync(artifactsDir));
+		ok(!existsSync(join(runDir, "artifacts")));
 	});
 
 	it("fails when runId already exists", async () => {
@@ -789,6 +792,7 @@ describe("retention", () => {
 			current.revision,
 		);
 		const artifactsDir = join(getRunRoot(opts.runId), "artifacts");
+		mkdirSync(artifactsDir, { recursive: true });
 		writeFileSync(join(artifactsDir, "1.1.diff"), "diff --git a/x b/x\n");
 
 		// No age or count limit at all: collection is unconditional, because
@@ -826,6 +830,7 @@ describe("retention", () => {
 		});
 		await initializeRun(opts);
 		const artifactsDir = join(getRunRoot(opts.runId), "artifacts");
+		mkdirSync(artifactsDir, { recursive: true });
 		writeFileSync(join(artifactsDir, "1.1.diff"), "partial");
 		writeFileSync(
 			checkpointPath,
@@ -861,6 +866,7 @@ describe("retention", () => {
 			taskId: "1.1",
 		});
 		const artifactsDir = join(getRunRoot(opts.runId), "artifacts");
+		mkdirSync(artifactsDir, { recursive: true });
 		writeFileSync(join(artifactsDir, "1.1.diff"), "partial");
 
 		const result = await applyRetention({ dryRun: true });

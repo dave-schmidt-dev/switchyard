@@ -1255,7 +1255,14 @@ export async function initializeRun(options) {
 		if (e.code !== "ENOENT") throw e;
 	}
 
-	await ensureDir(resolve(runDir, "artifacts"), 0o700);
+	// No artifacts/ directory is provisioned here. The channel's only writer --
+	// the partial-diff copy in dispatch/worker-bootstrap.mjs -- was removed
+	// because INV-2 forbids persisting raw provider output nothing reads back,
+	// so every run since has created an empty directory and left it there: 81 of
+	// them, zero bytes, found during a 2026-09-04 cleanup of the consuming
+	// project. Both readers (listArtifactRefs, collectArtifacts) already treat
+	// absence as ordinary and return empty. Should a producer ever return, it
+	// creates the directory itself.
 
 	const now = new Date().toISOString();
 	const versioned =
@@ -2920,13 +2927,13 @@ function hasLiveCheckpoint(run) {
 
 /**
  * Remove the CONTENTS of a run's artifacts directory, leaving the directory
- * itself in place — `initializeRun` provisions it for every run, so removing
- * it would only be undone by the next run.
+ * itself in place. A future producer would create it and may hold an open
+ * handle; removing it under one to save an inode is not a trade worth making.
  *
  * Collection is unconditional rather than age-gated: an artifact is raw
  * provider output at every age, and the age of the run that produced it does
- * not change that. A missing or unreadable artifacts directory is not an
- * error; it is the steady state this function drives toward.
+ * not change that. A missing artifacts directory is not an error but the
+ * normal case, since `initializeRun` no longer provisions one.
  *
  * @param {string} runId
  * @param {boolean} dryRun

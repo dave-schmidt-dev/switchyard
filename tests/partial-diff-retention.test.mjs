@@ -166,10 +166,11 @@ describe("partial diffs are recorded, not copied (Task 6.5)", () => {
 			!Object.hasOwn(captured, "partialDiffPath"),
 			"no host path may be persisted",
 		);
-		// The run's artifacts directory stays empty: the diagnostic is the
-		// event, and the diff itself lives beside the checkpoint.
+		// The run has no artifacts directory at all: the diagnostic is the event,
+		// the diff itself lives beside the checkpoint, and with the copy gone
+		// there is no writer left to provision a directory for.
 		const artifactsDir = join(getRunRoot(runId), "artifacts");
-		const { readdirSync } = await import("node:fs");
-		deepStrictEqual(readdirSync(artifactsDir), []);
+		const { existsSync } = await import("node:fs");
+		ok(!existsSync(artifactsDir), "no empty artifacts directory may be left");
 	});
 });
