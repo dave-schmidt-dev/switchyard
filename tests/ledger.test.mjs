@@ -110,6 +110,33 @@ describe("ledger", () => {
 		strictEqual(entries[entries.length - 2].taskId, "task-002");
 		strictEqual(entries[entries.length - 1].taskId, "task-003");
 	});
+
+	// Regression: the gate-evidence transcript rescue added host artifact
+	// fields (gateEvidence, the raw text; gateEvidencePath, the host path) that
+	// sanitizeDispatchEntry did not yet know about. partialDiffPath already had
+	// this exact protection; gateEvidencePath is the same host-path leak
+	// through the same boundary, and gateEvidence is raw provider transcript
+	// text, both of which INV-2 forbids ever reaching the shared ledger.
+	it("strips gate-evidence transcript and host path from a recorded dispatch", () => {
+		recordDispatch({
+			provider: "claude",
+			model: "claude-sonnet-5",
+			taskId: "task-gate-evidence",
+			result: "integration_failed",
+			diagnosticCode: "empty_required_diff",
+			gateEvidence: "SECRET_CANARY raw provider transcript",
+			gateEvidencePath:
+				"/Users/dave/project/.partial-diffs/task-gate-evidence.output",
+		});
+
+		const entries = readLedger();
+		const last = entries[entries.length - 1];
+		strictEqual(last.taskId, "task-gate-evidence");
+		strictEqual(last.gateEvidence, undefined);
+		strictEqual(last.gateEvidencePath, undefined);
+		ok(!JSON.stringify(last).includes("SECRET_CANARY"));
+		ok(!JSON.stringify(last).includes("/Users/dave/project"));
+	});
 });
 
 describe("ledger run-store backed", () => {

@@ -353,17 +353,35 @@ export function execute(prompt, workingContainerName, options = {}) {
 	}
 }
 
+/**
+ * Read Vibe's served-model record from the guest, retrying the known transient
+ * `prlctl` misfire the same number of times as every other helper exec here.
+ *
+ * This made a single attempt while `readServedModelSync` made three, so one
+ * misfire silently downgraded the substitution guard to "unverified" on the
+ * async path - which is the path detached dispatch actually uses.
+ */
 async function readServedModelAsync(workspaceId, options) {
-	try {
-		const probe = buildServedModelExecution(workspaceId, options);
-		const result = await runProviderProcess(probe.command, probe.args, {
-			timeoutMs: SERVED_MODEL_TIMEOUT_MS,
-			...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
+	const probe = buildServedModelExecution(workspaceId, options);
+	for (let attempt = 1; attempt <= VIBE_HELPER_ATTEMPTS; attempt += 1) {
+		// Each attempt can sit for SERVED_MODEL_TIMEOUT_MS with nothing on the
+		// wire, so the wait is announced rather than silent.
+		options.onStatus?.({
+			phase: "execution",
+			event: "served_model_probe_started",
+			status: `Reading Vibe's served-model record (attempt ${attempt}/${VIBE_HELPER_ATTEMPTS})`,
 		});
-		return result?.success ? result.output : null;
-	} catch {
-		return null;
+		try {
+			const result = await runProviderProcess(probe.command, probe.args, {
+				timeoutMs: SERVED_MODEL_TIMEOUT_MS,
+				...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
+			});
+			if (result?.success) return result.output;
+		} catch {
+			// Missing evidence, not contrary evidence - see classifyServedModel.
+		}
 	}
+	return null;
 }
 
 export async function executeAsync(prompt, workingContainerName, options = {}) {
@@ -381,6 +399,11 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 		);
 		let written = null;
 		for (let attempt = 1; attempt <= VIBE_HELPER_ATTEMPTS; attempt += 1) {
+			options.onStatus?.({
+				phase: "execution",
+				event: "provider_config_write_started",
+				status: `Writing Vibe's model config into the workspace (attempt ${attempt}/${VIBE_HELPER_ATTEMPTS})`,
+			});
 			written = await runProviderProcess(write.command, write.args, {
 				input: write.input,
 				timeoutMs: SERVED_MODEL_TIMEOUT_MS,
@@ -401,6 +424,15 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 				cleanup: () => killOrphanedProcessesAsync(workingContainerName),
 			},
 		);
+		// Unlike the sync path, where execFileSync throws and this line is
+		// unreachable on a failure, executeProviderInvocation *returns* a failed
+		// result. Verifying the served model here would read the newest session
+		// directory in a working container that is reused across every task in
+		// the queue, so a task that failed before Vibe wrote a session reads the
+		// PREVIOUS task's model and reports a substitution that never happened -
+		// discarding the accurate timeout, cleanup stage, exit code, and signal
+		// in favour of a false diagnosis.
+		if (!result?.success) return result;
 		const { servedModel, mismatch } = classifyServedModel(
 			await readServedModelAsync(workingContainerName, options),
 			execution.selector,

@@ -48,22 +48,29 @@ export const DEFAULT_MAX_AGE_DAYS = 3;
 const MS_PER_DAY = 86_400_000;
 
 /**
- * Every absolute path some live process currently holds open.
+ * Absolute paths from an `lsof -Fn` result, or `null` if the listing cannot be
+ * trusted to be complete.
  *
- * Returns `null` when `lsof` could not be run, which callers must treat as
- * "unknown" rather than "none": an empty result and an unavailable check are
- * the same value otherwise, and that conflation is what made the original
- * sweep's guard vacuous.
+ * `null` means "unknown", never "none held". An empty result and an absent
+ * check are otherwise the same value, and that conflation is what made the
+ * original sweep's guard vacuous. A *partial* listing is the same defect one
+ * step further in: `lsof` exits non-zero and warns on stderr when it could not
+ * inspect every process, and accepting that output as complete would let the
+ * sweep delete a directory an uninspected process still holds. Measured on
+ * this host, an unprivileged `lsof -Fn` exits 0 with empty stderr, so the
+ * strict reading costs nothing here and fails closed where it would not.
+ * @param {{error?: unknown, status?: number|null, stdout?: unknown, stderr?: unknown}} result
  * @returns {string[] | null}
  */
-export function listHeldPathsViaLsof() {
-	const result = spawnSync("lsof", ["-Fn"], {
-		encoding: "utf8",
-		maxBuffer: 512 * 1024 * 1024,
-	});
-	// A non-zero status is normal - lsof exits 1 when any process refused
-	// inspection - but no stdout at all means the check did not happen.
+export function parseLsofResult(result) {
 	if (result.error || typeof result.stdout !== "string" || !result.stdout) {
+		return null;
+	}
+	if (result.status !== 0) {
+		return null;
+	}
+	const stderr = typeof result.stderr === "string" ? result.stderr : "";
+	if (/incomplete|WARNING/i.test(stderr)) {
 		return null;
 	}
 	const held = [];
@@ -75,6 +82,22 @@ export function listHeldPathsViaLsof() {
 		}
 	}
 	return held;
+}
+
+/**
+ * Every absolute path some live process currently holds open, or `null` when
+ * that cannot be established completely.
+ * @returns {string[] | null}
+ */
+export function listHeldPathsViaLsof() {
+	// Deliberately no `-w`: suppressing lsof's warnings would suppress the
+	// evidence that its listing is incomplete.
+	return parseLsofResult(
+		spawnSync("lsof", ["-Fn"], {
+			encoding: "utf8",
+			maxBuffer: 512 * 1024 * 1024,
+		}),
+	);
 }
 
 /**

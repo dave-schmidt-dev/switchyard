@@ -14,6 +14,7 @@ import {
 	DEFAULT_MAX_AGE_DAYS,
 	inspectTree,
 	isSweepAuthorized,
+	parseLsofResult,
 	parseSweepArgs,
 	sweepTempDirs,
 } from "../scripts/sweep-temp-dirs.mjs";
@@ -213,6 +214,35 @@ describe("sweep-temp-dirs", () => {
 		// ancient top-level mtime over content written days later.
 		strictEqual(summary.skippedFresh, 1);
 		strictEqual(summary.removed, 0);
+	});
+
+	it("treats an incomplete lsof listing as unavailable, not as empty", () => {
+		const stdout = "p1\nn/private/var/folders/ab/T/switchyard-x/f\nn*:*\n";
+		deepStrictEqual(parseLsofResult({ status: 0, stdout, stderr: "" }), [
+			"/private/var/folders/ab/T/switchyard-x/f",
+		]);
+		// lsof exits non-zero and warns when a process refused inspection. Its
+		// output is then a subset of what is open, and a subset is exactly the
+		// shape that lets the sweep delete something a process still holds.
+		strictEqual(parseLsofResult({ status: 1, stdout, stderr: "" }), null);
+		strictEqual(
+			parseLsofResult({
+				status: 0,
+				stdout,
+				stderr: "lsof: WARNING: can't stat() 1 file\n",
+			}),
+			null,
+		);
+		strictEqual(
+			parseLsofResult({
+				status: 0,
+				stdout,
+				stderr: "Output information may be incomplete.\n",
+			}),
+			null,
+		);
+		strictEqual(parseLsofResult({ error: new Error("ENOENT") }), null);
+		strictEqual(parseLsofResult({ status: 0, stdout: "" }), null);
 	});
 
 	it("authorizes only prefixed direct children of the swept directory", () => {

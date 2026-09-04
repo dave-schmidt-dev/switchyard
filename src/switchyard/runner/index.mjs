@@ -2607,6 +2607,24 @@ function servedModelVerificationFields(execution) {
 	return { servedModelVerified: Boolean(execution.servedModel) };
 }
 
+/**
+ * Cleanup evidence for a task whose provider process outlived its kill.
+ *
+ * Present only when cleanup actually failed, so an ordinary result is
+ * unchanged. The failure branches carry `cleanupFailed`/`cleanupStage`
+ * already; the success branches did not, so the broker was forwarding both
+ * fields on its success shape to a reader that never looked at them and a task
+ * could complete, and be persisted as an unqualified success, while leaving a
+ * provider process running in the guest.
+ */
+function survivingProviderFields(execution) {
+	if (execution?.cleanupFailed !== true) return {};
+	return {
+		cleanupFailed: true,
+		cleanupStage: execution.cleanupStage ?? null,
+	};
+}
+
 function opaqueArtifactRef(value) {
 	return typeof value === "string" && /^artifact:[a-f0-9]{24}$/.test(value)
 		? value
@@ -3103,6 +3121,7 @@ export function executeTask(task, context) {
 			taskId: task.id,
 			result: "success_no_diff",
 			reason: safeSuccessfulRouteReason(routeResult.reason),
+			...survivingProviderFields(execution),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
@@ -3115,6 +3134,7 @@ export function executeTask(task, context) {
 			resolvedTargetId,
 			result: "success_no_diff",
 			...servedModelVerificationFields(execution),
+			...survivingProviderFields(execution),
 		};
 	}
 
@@ -3183,6 +3203,7 @@ export function executeTask(task, context) {
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
+		...survivingProviderFields(execution),
 		...(success
 			? { reason: safeSuccessfulRouteReason(routeResult.reason) }
 			: {}),
@@ -3198,6 +3219,7 @@ export function executeTask(task, context) {
 		resolvedTargetId,
 		result: terminalResult,
 		...servedModelVerificationFields(execution),
+		...survivingProviderFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
@@ -3885,6 +3907,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			taskId: task.id,
 			result: "success_no_diff",
 			reason: safeSuccessfulRouteReason(routeResult.reason),
+			...survivingProviderFields(execution),
 		});
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
@@ -3896,6 +3919,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			resolvedTargetId,
 			result: "success_no_diff",
 			...servedModelVerificationFields(execution),
+			...survivingProviderFields(execution),
 		};
 	}
 	const gateResult = context.integrationGate(diff, context.projectPath, {
@@ -3922,6 +3946,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		result: terminalResult,
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...survivingProviderFields(execution),
 		...(success
 			? { reason: safeSuccessfulRouteReason(routeResult.reason) }
 			: {}),
@@ -3936,6 +3961,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		resolvedTargetId,
 		result: terminalResult,
 		...servedModelVerificationFields(execution),
+		...survivingProviderFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(!success && !gateResult?.credentialFlagged
@@ -4419,6 +4445,15 @@ export async function runQueueAsync(options) {
 					? { servedModelVerified: result.servedModelVerified }
 					: {}),
 				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
+				// Presence is the signal: these are written only when the provider
+				// outlived its kill, so a resumed run and `switchyard status` can see
+				// that an otherwise successful task left a process in the guest.
+				...(result.cleanupFailed === true
+					? {
+							cleanupFailed: true,
+							cleanupStage: result.cleanupStage ?? null,
+						}
+					: {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
 				// The host path is transient; safeFailure carries only its opaque
@@ -6843,6 +6878,15 @@ export function runQueue(options) {
 					? { servedModelVerified: result.servedModelVerified }
 					: {}),
 				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
+				// Presence is the signal: these are written only when the provider
+				// outlived its kill, so a resumed run and `switchyard status` can see
+				// that an otherwise successful task left a process in the guest.
+				...(result.cleanupFailed === true
+					? {
+							cleanupFailed: true,
+							cleanupStage: result.cleanupStage ?? null,
+						}
+					: {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
 				partialDiffPath: null,

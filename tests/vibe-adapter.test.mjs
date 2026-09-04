@@ -272,6 +272,116 @@ describe("Vibe adapter", () => {
 		ok(result.error.includes("silently substituted"));
 	});
 
+	it("fails closed without ever invoking the Vibe CLI when the config write cannot be persisted", async () => {
+		const spawned = [];
+		const executionBackend = {
+			execArgv(_workspaceId, candidate) {
+				return { command: "fake", args: [...candidate.argv] };
+			},
+		};
+		const result = await executeAsync("change one file", WORKSPACE, {
+			...options(executionBackend),
+			spawnFn: (_command, args) => {
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.stdin = { end() {} };
+				child.kill = () => true;
+				spawned.push(args);
+				// Every config-write attempt fails; the guest command exits nonzero.
+				queueMicrotask(() => child.emit("close", 1, null));
+				return child;
+			},
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.errorKind, "environment_incomplete");
+		ok(result.error.includes("after 3 attempts"));
+		// All three retries must be the config write; the Vibe CLI itself, and
+		// the served-model probe that would follow it, must never spawn.
+		strictEqual(spawned.length, 3);
+		ok(
+			spawned.every((args) => args[0] === "/bin/bash"),
+			"must never spawn the Vibe CLI when its config could not be written",
+		);
+	});
+
+	it("treats an unreadable served-model probe as unverified rather than a mismatch", () => {
+		const statuses = [];
+		const executionBackend = {
+			execArgv(_workspaceId, candidate) {
+				const servedProbe = candidate.argv.some(
+					(arg) => typeof arg === "string" && arg.includes("logs/session"),
+				);
+				return {
+					command: process.execPath,
+					args: [
+						"-e",
+						servedProbe
+							? "process.exit(3)"
+							: 'process.stdout.write("vibe-ran")',
+					],
+				};
+			},
+		};
+		const result = execute("change one file", WORKSPACE, {
+			...options(executionBackend),
+			onStatus: (status) => statuses.push(status),
+		});
+		strictEqual(result.success, true);
+		strictEqual(result.servedModel, null);
+		ok(
+			statuses.some((status) => status.event === "served_model_unverified"),
+			"an unreadable probe must surface that the substitution guard is inactive",
+		);
+	});
+
+	it("fails the async task when Vibe reports having run a different model", async () => {
+		const spawned = [];
+		const executionBackend = {
+			execArgv(_workspaceId, candidate) {
+				return { command: "fake", args: [...candidate.argv] };
+			},
+		};
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "vibe",
+				model_ref: "zhipu/glm-5.2-low",
+				selector: "glm-5.2-low",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"vibe",
+		);
+		const result = await executeAsync("change one file", WORKSPACE, {
+			...options(executionBackend),
+			model: descriptor.selector,
+			invocationDescriptor: descriptor,
+			descriptorIdentity: descriptor.descriptor_identity,
+			spawnFn: (_command, args) => {
+				const servedProbe = args.some(
+					(arg) => typeof arg === "string" && arg.includes("logs/session"),
+				);
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.stdin = { end() {} };
+				child.kill = () => true;
+				spawned.push(args);
+				if (servedProbe) {
+					queueMicrotask(() => child.stdout.emit("data", "mistral-medium-3.5"));
+				}
+				queueMicrotask(() => child.emit("close", 0, null));
+				return child;
+			},
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.servedModel, "mistral-medium-3.5");
+		ok(result.error.includes("silently substituted"));
+		// One config write, one provider run, one served-model probe.
+		strictEqual(spawned.length, 3);
+	});
+
 	it("reports the served model on a matching run", () => {
 		const executionBackend = {
 			execArgv(_workspaceId, candidate) {

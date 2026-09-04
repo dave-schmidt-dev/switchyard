@@ -3266,6 +3266,27 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		strictEqual(run.cleanupState, "complete");
 	});
 
+	// Regression: a queue that resolves with no result and never throws used to
+	// leave `failure` at `sanitizeFailureMetadata({})`, which is null — writing
+	// a run recorded as `failed` with `lastFailure: null` (170 of 764 historical
+	// failures, median 8ms, no target, no event). The non-JSON exit path reads
+	// `result.results` unconditionally, so `--json` is the only reachable way to
+	// observe this outcome without the CLI itself throwing on the missing result.
+	it("run --json records a reason when the queue resolves with nothing and never throws", async () => {
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const { envelope } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			{ runQueue: () => undefined },
+		);
+		const run = await readRun(envelope.runId);
+		strictEqual(run.state, "failed");
+		ok(
+			run.lastFailure,
+			"a failed run must always carry failure metadata, never null",
+		);
+		strictEqual(run.lastFailure.diagnosticCode, "queue_returned_no_result");
+	});
+
 	it("defaults durable state to the target project when no override is set", async () => {
 		const savedRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		delete process.env.SWITCHYARD_RUN_STORE_ROOT;

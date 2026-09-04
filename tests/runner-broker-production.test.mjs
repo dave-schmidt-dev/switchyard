@@ -1,6 +1,6 @@
-import { rejects, strictEqual } from "node:assert";
+import { ok, rejects, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -1620,4 +1620,211 @@ test("production async runner records which cleanup stage failed", async () => {
 		checkpoint.results[0].diagnosticCode,
 		"provider_cleanup_after_tree_terminated",
 	);
+});
+
+// Regression: the empty-diff transcript rescue was only ever exercised through
+// the synchronous runQueue path (tests/runner.test.mjs). The broker path wires
+// the same evidence through a different route -- createDispatchBroker's
+// onTranscript callback, context._activeTaskTranscript, and a second
+// saveGateEvidence call site inside runQueueAsync -- and nothing drove any of
+// it. A break in that chain would leave an `empty_required_diff` rejection
+// from a real (broker) dispatch with no evidence again, exactly the gap the
+// fix closed for the synchronous path only.
+test("production async runner keeps the provider transcript as evidence when the broker gate rejects an empty diff", async () => {
+	const root = await tempDirAsync("switchyard-broker-gate-evidence-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	const transcript =
+		"I inspected src/a.mjs and concluded no change was required.";
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Empty-diff task\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** the provider explains itself but changes nothing\n",
+	);
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		workingContainerName: "broker-gate-evidence-worker",
+		checkpointPath,
+		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			backendFactory: () => ({
+				executionBackend: {},
+				create: () => "broker-gate-evidence-worker",
+				destroy: () => {},
+				seed: () => {},
+				commit: () => {},
+				reset: () => {},
+			}),
+			adapters: {
+				claude: {
+					executeAsync: async () => ({
+						success: true,
+						output: transcript,
+						error: null,
+					}),
+					captureDiffAsync: async () => null,
+				},
+			},
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+		},
+	});
+	const record = result.results[0];
+	strictEqual(record.success, false);
+	strictEqual(
+		record.diagnosticCode ?? record.reasonCode,
+		"empty_required_diff",
+	);
+	ok(
+		/^artifact:[a-f0-9]{24}$/.test(record.artifactRef ?? ""),
+		`expected an opaque artifact reference, got ${record.artifactRef}`,
+	);
+	const artifactPath = `${checkpointPath}.partial-diffs/1.1.output`;
+	ok(existsSync(artifactPath), "the transcript must be kept as an artifact");
+	strictEqual(readFileSync(artifactPath, "utf8"), transcript);
+	strictEqual(
+		record.gateEvidence,
+		undefined,
+		"raw transcript must not ride along in the result",
+	);
+
+	const rawCheckpointJson = await readFile(checkpointPath, "utf8");
+	ok(
+		!rawCheckpointJson.includes(transcript),
+		"checkpoint.json must reference the artifact, never embed the transcript",
+	);
+});
+
+// The failure branches above name the cleanup stage, but a provider can also
+// exit 0 having left its process tree alive - the launcher reports
+// `success: true` with `cleanupFailed: true`. Every success branch built its
+// record and its envelope from a fixed field list that named neither, so the
+// broker forwarded both fields to a reader that dropped them and the task was
+// persisted as an unqualified success while a provider process kept running in
+// the guest. Nothing in the suite drove success + cleanupFailed together.
+test("production async runner keeps cleanup evidence on a task that succeeded", async () => {
+	const root = await tempDirAsync("switchyard-broker-cleanup-success-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Surviving provider\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** succeed while cleanup fails\n",
+	);
+	const dispatches = [];
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		workingContainerName: "broker-cleanup-success-worker",
+		checkpointPath,
+		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			adapters: {
+				claude: {
+					executeAsync: async () => ({
+						success: true,
+						output: "",
+						cleanupFailed: true,
+						cleanupStage: "tree_terminated",
+					}),
+					captureDiffAsync: async () => null,
+				},
+			},
+			recordDispatch: (entry) => dispatches.push(entry),
+			recordDispatchIntent: () => {},
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+		},
+	});
+	const record = result.results[0];
+	strictEqual(record.result, "success_no_diff");
+	strictEqual(record.success, true);
+	strictEqual(
+		record.cleanupFailed,
+		true,
+		"a success that left a process running is not an unqualified success",
+	);
+	strictEqual(record.cleanupStage, "tree_terminated");
+	const checkpoint = JSON.parse(await readFile(checkpointPath, "utf8"));
+	strictEqual(checkpoint.results[0].cleanupFailed, true);
+	strictEqual(checkpoint.results[0].cleanupStage, "tree_terminated");
+	// The ledger is the record an operator greps to find hosts with orphaned
+	// provider processes, so it has to carry the stage too.
+	strictEqual(dispatches.at(-1).result, "success_no_diff");
+	strictEqual(dispatches.at(-1).cleanupStage, "tree_terminated");
+});
+
+// The same shape on an ordinary success must stay untouched: the fields are
+// evidence of a specific failure, and emitting `cleanupFailed: false` on every
+// clean task would make the ledger's own signal unreadable.
+test("production async runner adds no cleanup fields when cleanup succeeded", async () => {
+	const root = await tempDirAsync("switchyard-broker-cleanup-clean-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Clean exit\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** succeed with cleanup intact\n",
+	);
+	const dispatches = [];
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		workingContainerName: "broker-cleanup-clean-worker",
+		checkpointPath,
+		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			adapters: {
+				claude: {
+					executeAsync: async () => ({ success: true, output: "" }),
+					captureDiffAsync: async () => null,
+				},
+			},
+			recordDispatch: (entry) => dispatches.push(entry),
+			recordDispatchIntent: () => {},
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+		},
+	});
+	strictEqual(result.results[0].success, true);
+	strictEqual(
+		Object.hasOwn(result.results[0], "cleanupFailed"),
+		false,
+		"a clean run must not carry a cleanupFailed key at all",
+	);
+	strictEqual(Object.hasOwn(result.results[0], "cleanupStage"), false);
+	strictEqual(Object.hasOwn(dispatches.at(-1), "cleanupFailed"), false);
 });

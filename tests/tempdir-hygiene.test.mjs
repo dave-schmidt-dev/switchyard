@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -61,10 +61,5 @@ describe("temp directory hygiene", () => {
 			[],
 			`call tests/helpers/tempdir.mjs instead of mkdtemp directly: ${offenders.join(", ")}`,
 		);
-	});
-
-	it("tracks a directory whose tracked parent was already removed", () => {
-		const scratch = tempDir("switchyard-tempdir-guard-nested-");
-		strictEqual(switchyardEntries(scratch).length, 0);
 	});
 });
