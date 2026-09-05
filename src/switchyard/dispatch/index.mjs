@@ -2136,14 +2136,21 @@ async function reclaimManagedEntries({ managed, dependencies, projectPath }) {
 			continue;
 		const identity = managedIdentity(entry);
 		invoked = true;
-		const result = reclaim({
-			dryRun: false,
-			eligibility: (candidate) => managedIdentity(candidate) === identity,
-		});
-		combined.reclaimed.push(...(result.reclaimed ?? []));
-		combined.skippedSnapshots.push(...(result.skippedSnapshots ?? []));
-		combined.errors.push(...(result.errors ?? []));
 		eligibleRunIds.add(entry.runId);
+		try {
+			const result = reclaim({
+				dryRun: false,
+				eligibility: (candidate) => managedIdentity(candidate) === identity,
+			});
+			combined.reclaimed.push(...(result.reclaimed ?? []));
+			combined.skippedSnapshots.push(...(result.skippedSnapshots ?? []));
+			combined.errors.push(...(result.errors ?? []));
+		} catch {
+			combined.errors.push({
+				name: entry.name,
+				reason: "managed_reclaim_failed",
+			});
+		}
 	}
 	if (!invoked) {
 		const result = reclaim({ dryRun: false, eligibility: () => false });

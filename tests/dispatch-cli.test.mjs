@@ -2104,6 +2104,56 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 		strictEqual(claimReconciliations, 1);
 	});
 
+	it("retains prior reclaim results when a later candidate throws", async () => {
+		const projectPath = join(dir, "partial-reclaim-project");
+		const entries = ["a", "b", "c"].map((runId, index) => ({
+			uuid: `partial-${runId}`,
+			name: `switchyard-work-${runId}-${index + 1}`,
+			runId,
+			creatorPid: index + 1,
+			status: "stopped",
+		}));
+		const reclaimCalls = [];
+		let directReconciliations = 0;
+		let claimReconciliations = 0;
+		const swept = await sweepManagedOrphans({
+			projectPath,
+			listManaged: () => entries,
+			readRun: async (runId) => ({
+				runId,
+				projectPath,
+				state: "failed",
+				cleanupState: "complete",
+			}),
+			reclaim: ({ eligibility }) => {
+				const selected = entries.find(eligibility);
+				reclaimCalls.push(selected.runId);
+				if (selected.runId === "b") throw new Error("unavailable");
+				return {
+					reclaimed: selected.runId === "a" ? [selected] : [],
+					skippedSnapshots: [],
+					errors: [],
+				};
+			},
+			releaseProjectLockIfOwnedBy: async () => false,
+			releaseOrphanedProjectLocks: async () => {
+				directReconciliations += 1;
+				return [];
+			},
+			reconcileProjectLockClaims: async () => {
+				claimReconciliations += 1;
+				return [];
+			},
+		});
+		deepStrictEqual(reclaimCalls, ["a", "b", "c"]);
+		strictEqual(swept.vmsReclaimed, 1);
+		deepStrictEqual(swept.errors, [
+			"switchyard-work-b-2: managed_reclaim_failed",
+		]);
+		strictEqual(directReconciliations, 1);
+		strictEqual(claimReconciliations, 1);
+	});
+
 	it("recover's JSON envelope names the golden's leftover snapshots", async () => {
 		const projectPath = join(dir, "recover-residue-project");
 		const lines = [];
