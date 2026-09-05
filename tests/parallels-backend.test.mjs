@@ -1668,7 +1668,7 @@ describe("Parallels execution backend lifecycle", () => {
 			pidIsAlive: () => false,
 		});
 
-		const result = backend.reclaim();
+		const result = backend.reclaim({ eligibility: () => true });
 		strictEqual(result.reclaimed.length, 2);
 		ok(
 			calls.some(
@@ -1715,7 +1715,7 @@ describe("Parallels execution backend lifecycle", () => {
 		ok(!calls.some((args) => args[1] === GOLDEN_UUID));
 	});
 
-	it("retains a live creator-pid safety gate despite caller eligibility", () => {
+	it("lets the caller authorize terminal-clean ownership despite a live creator PID", () => {
 		const calls = [];
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
@@ -1737,9 +1737,61 @@ describe("Parallels execution backend lifecycle", () => {
 		const result = backend.reclaim({
 			eligibility: (entry) => entry.runId === "terminal",
 		});
+		strictEqual(result.reclaimed.length, 1);
+		ok(calls.some((args) => args[0] === "delete" && args[1] === WORK_UUID));
+	});
+
+	it("fails closed when reclaim eligibility is omitted", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							name: buildParallelsWorkingName("dead", 999999),
+						},
+					]);
+				}
+				return "ok";
+			},
+			pidIsAlive: () => false,
+		});
+		const result = backend.reclaim();
 		strictEqual(result.reclaimed.length, 0);
-		ok(!calls.some((args) => args[0] === "delete" && args[1] === WORK_UUID));
-		strictEqual(result.skipped[0].reason, "owner-alive");
+		strictEqual(result.skipped[0].reason, "ineligible");
+		ok(!calls.some((args) => args[0] === "stop" || args[0] === "delete"));
+	});
+
+	it("rechecks exact resource identity immediately before reclaim mutation", () => {
+		const calls = [];
+		let lists = 0;
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					lists += 1;
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							name: buildParallelsWorkingName(
+								lists === 1 ? "original" : "replacement",
+								999999,
+							),
+						},
+					]);
+				}
+				return "ok";
+			},
+			pidIsAlive: () => false,
+		});
+		const result = backend.reclaim({ eligibility: () => true });
+		strictEqual(result.reclaimed.length, 0);
+		strictEqual(result.skipped[0].reason, "identity-or-eligibility-changed");
+		ok(!calls.some((args) => args[0] === "stop" || args[0] === "delete"));
 	});
 
 	it("rolls back a clone when Aqua readiness never appears", () => {
@@ -1977,7 +2029,7 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		const { backend: fresh, snapshotsNow } = makeCloningBackend(root, deadName);
 		strictEqual(fresh.linkedSnapshotsByUuid.size, 0);
 
-		const result = fresh.reclaim();
+		const result = fresh.reclaim({ eligibility: () => true });
 
 		strictEqual(result.reclaimed.length, 1);
 		deepStrictEqual(result.reclaimedSnapshots, [
@@ -2001,7 +2053,7 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		const { backend, calls, snapshotsNow } = makeCloningBackend(root, deadName);
 		// No sidecar written at all, yet the golden carries a snapshot.
 
-		const result = backend.reclaim();
+		const result = backend.reclaim({ eligibility: () => true });
 
 		strictEqual(result.reclaimed.length, 1, "the VM itself is still reclaimed");
 		deepStrictEqual(result.reclaimedSnapshots, []);
@@ -2028,11 +2080,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			snapshotIds: [CLONE_SNAPSHOT],
 		});
 
-		const result = backend.reclaim();
+		const result = backend.reclaim({ eligibility: () => false });
 
 		strictEqual(result.reclaimed.length, 0);
 		deepStrictEqual(result.reclaimedSnapshots, []);
-		strictEqual(result.skipped[0]?.reason, "owner-alive");
+		strictEqual(result.skipped[0]?.reason, "ineligible");
 		ok(!calls.some((args) => args[0] === "snapshot-delete"));
 		deepStrictEqual(
 			snapshotsNow(),

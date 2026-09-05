@@ -92,4 +92,17 @@ describe("resolveIsRunDead — liveness gating", () => {
 		});
 		strictEqual(await resolveIsRunDead("r", d), false);
 	});
+
+	it("malformed and PID-ambiguous owners remain non-reclaimable", async () => {
+		strictEqual(
+			await resolveIsRunDead(
+				"r",
+				deps({ run: runRec({ workerPid: "4242" }), live: false }),
+			),
+			false,
+		);
+		const ambiguous = deps({ run: runRec(), live: false });
+		ambiguous.classifyRunLiveness = () => "unknown";
+		strictEqual(await resolveIsRunDead("r", ambiguous), false);
+	});
 });

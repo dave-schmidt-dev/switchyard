@@ -2074,6 +2074,101 @@ async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 	return released;
 }
 
+function recoveryLiveness(run, dependencies) {
+	const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
+	const options = dependencies.isWorkerLive
+		? { probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead") }
+		: undefined;
+	return classifier(run, options);
+}
+
+function managedIdentity(entry) {
+	if (
+		typeof entry?.uuid !== "string" ||
+		typeof entry?.name !== "string" ||
+		typeof entry?.runId !== "string" ||
+		!Number.isInteger(entry?.creatorPid)
+	)
+		return null;
+	return JSON.stringify([
+		entry.uuid,
+		entry.name,
+		entry.runId,
+		entry.creatorPid,
+	]);
+}
+
+async function recoveryEntryIsEligible(entry, dependencies, projectPath) {
+	const identity = managedIdentity(entry);
+	if (identity === null || typeof projectPath !== "string") return false;
+	const readRunFn = dependencies.readRun ?? readRun;
+	let run;
+	try {
+		run = await readRunFn(entry.runId);
+	} catch {
+		return false;
+	}
+	if (
+		run?.runId !== entry.runId ||
+		run.projectPath !== projectPath ||
+		run.cleanupState === "failed"
+	)
+		return false;
+	const liveness = recoveryLiveness(run, dependencies);
+	return liveness === "terminal_clean" || liveness === "dead";
+}
+
+function emptyReclaimResult() {
+	return { reclaimed: [], skippedSnapshots: [], errors: [] };
+}
+
+async function reclaimManagedEntries({ managed, dependencies, projectPath }) {
+	const executionBackend = recoveryExecutionBackend(dependencies);
+	const reclaim =
+		dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
+	const combined = emptyReclaimResult();
+	const eligibleRunIds = new Set();
+	let invoked = false;
+	for (const entry of managed) {
+		// This is the final asynchronous step before the synchronous backend call.
+		// The backend then rechecks this exact VM identity before mutation.
+		if (!(await recoveryEntryIsEligible(entry, dependencies, projectPath)))
+			continue;
+		const identity = managedIdentity(entry);
+		invoked = true;
+		const result = reclaim({
+			dryRun: false,
+			eligibility: (candidate) => managedIdentity(candidate) === identity,
+		});
+		combined.reclaimed.push(...(result.reclaimed ?? []));
+		combined.skippedSnapshots.push(...(result.skippedSnapshots ?? []));
+		combined.errors.push(...(result.errors ?? []));
+		eligibleRunIds.add(entry.runId);
+	}
+	if (!invoked) {
+		const result = reclaim({ dryRun: false, eligibility: () => false });
+		combined.errors.push(...(result.errors ?? []));
+	}
+	return { result: combined, eligibleRunIds };
+}
+
+async function canonicalRecoveryProject(managed, dependencies) {
+	const readRunFn = dependencies.readRun ?? readRun;
+	const projects = new Set();
+	for (const entry of managed) {
+		if (managedIdentity(entry) === null) continue;
+		try {
+			const run = await readRunFn(entry.runId);
+			if (run?.runId === entry.runId && typeof run.projectPath === "string") {
+				projects.add(run.projectPath);
+			}
+		} catch {
+			// Missing or malformed records contribute no destruction authority.
+		}
+	}
+	return projects.size === 1 ? [...projects][0] : null;
+}
+
 /**
  * Build the execution backend a recovery-path caller (sweep or `recover`)
  * inspects/reclaims managed VMs through. A VM's name embeds its own
@@ -2100,48 +2195,25 @@ async function sweepManagedOrphans(dependencies = {}) {
 	const executionBackend = recoveryExecutionBackend(dependencies);
 	const listManaged =
 		dependencies.listManaged ?? (() => executionBackend.listManaged());
-	const reclaim =
-		dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
-	const readRunFn = dependencies.readRun ?? readRun;
-	const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
 	const currentProjectPath = dependencies.projectPath ?? null;
 	let managed = [];
+	const errors = [];
 	try {
 		managed = listManaged();
 	} catch {
-		managed = [];
+		errors.push("managed_inventory_unavailable");
 	}
-	const eligibleRunIds = new Set();
-	for (const entry of managed) {
-		if (
-			currentProjectPath === null ||
-			typeof entry?.runId !== "string" ||
-			typeof entry?.name !== "string"
-		)
-			continue;
-		let run;
-		try {
-			run = await readRunFn(entry.runId);
-		} catch {
-			continue;
-		}
-		if (run.projectPath !== currentProjectPath) continue;
-		const options = dependencies.isWorkerLive
-			? {
-					probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead"),
-				}
-			: undefined;
-		const liveness = classifier(run, options);
-		if (liveness === "terminal_clean" || liveness === "dead") {
-			eligibleRunIds.add(entry.runId);
-		}
+	let result = emptyReclaimResult();
+	let eligibleRunIds = new Set();
+	try {
+		({ result, eligibleRunIds } = await reclaimManagedEntries({
+			managed,
+			dependencies,
+			projectPath: currentProjectPath,
+		}));
+	} catch {
+		errors.push("managed_reclaim_unavailable");
 	}
-
-	const result = reclaim({
-		dryRun: false,
-		eligibility: (entry) =>
-			currentProjectPath !== null && eligibleRunIds.has(entry?.runId),
-	});
 
 	const candidateIds = [...eligibleRunIds];
 
@@ -2162,7 +2234,7 @@ async function sweepManagedOrphans(dependencies = {}) {
 		// is the one INV-3 leak the sweep cannot fix, so it has to leave the
 		// sweep as a fact rather than dying inside it.
 		unreclaimedSnapshots: result.skippedSnapshots ?? [],
-		errors: result.errors.map((e) => `${e.name}: ${e.reason}`),
+		errors: [...errors, ...result.errors.map((e) => `${e.name}: ${e.reason}`)],
 		projectLocksReleased,
 	};
 }
@@ -2170,8 +2242,8 @@ async function sweepManagedOrphans(dependencies = {}) {
 /**
  * Handle the recover subcommand. With no `--run`, sweeps every managed VM
  * whose creator process is dead (same liveness rule as sweepManagedOrphans).
- * With `--run <run-id>`, force-reclaims that one run's VM unconditionally —
- * the operator asked for it by name, so liveness is not consulted.
+ * With `--run <run-id>`, limits recovery to that run while retaining the same
+ * ownership and liveness proof required by unattended recovery.
  * @param {string[]} argv arguments after the subcommand
  */
 async function handleRecover(argv, dependencies = {}) {
@@ -2196,7 +2268,7 @@ async function handleRecover(argv, dependencies = {}) {
 		const candidateIds = managed.map((entry) => entry.runId).filter(Boolean);
 
 		let reclaimedCount = 0;
-		let errors = [...inventoryErrors];
+		const errors = [...inventoryErrors];
 		let unreclaimedSnapshots = [];
 		let recoveredByFinalizer = false;
 		let projectLockReleasedByFinalizer = false;
@@ -2205,14 +2277,33 @@ async function handleRecover(argv, dependencies = {}) {
 			try {
 				recoveryRun = await (dependencies.readRun ?? readRun)(runId);
 			} catch {
-				// VM-only recovery remains available when the run record is absent.
+				// Missing run evidence never authorizes VM destruction.
 			}
 			const target = managed.find((entry) => entry.runId === runId);
-			const liveness = recoveryRun
-				? (dependencies.classifyRunLiveness ?? classifyRunLiveness)(recoveryRun)
+			const recoveryRunMatchesTarget =
+				recoveryRun?.runId === runId &&
+				typeof recoveryRun.projectPath === "string";
+			const liveness = recoveryRunMatchesTarget
+				? recoveryLiveness(recoveryRun, dependencies)
 				: "unknown";
+			const destroy =
+				dependencies.destroy ?? ((handle) => executionBackend.destroy(handle));
+			const destroyTarget = async () => {
+				if (
+					!target ||
+					!(await recoveryEntryIsEligible(
+						target,
+						dependencies,
+						recoveryRun?.projectPath ?? null,
+					))
+				)
+					return false;
+				destroy(target);
+				reclaimedCount = 1;
+				return true;
+			};
 			if (
-				recoveryRun &&
+				recoveryRunMatchesTarget &&
 				liveness === "dead" &&
 				!isTerminalState(recoveryRun.state)
 			) {
@@ -2236,12 +2327,14 @@ async function handleRecover(argv, dependencies = {}) {
 						failedCount: null,
 					},
 					cleanup: async () => {
+						let destroyFailed = false;
 						if (target) {
-							const destroy =
-								dependencies.destroy ??
-								((handle) => executionBackend.destroy(handle));
-							destroy(target);
-							reclaimedCount = 1;
+							try {
+								if (!(await destroyTarget())) destroyFailed = true;
+							} catch {
+								destroyFailed = true;
+								errors.push("managed_reclaim_failed");
+							}
 						}
 						await (
 							dependencies.reconcileProjectLockClaims ??
@@ -2259,28 +2352,37 @@ async function handleRecover(argv, dependencies = {}) {
 						) {
 							throw new Error("recovery ownership cleanup incomplete");
 						}
+						if (destroyFailed) throw new Error("managed reclaim failed");
 					},
 				});
 				recoveredByFinalizer = finalized.terminal;
 				if (!finalized.cleanupComplete) errors.push("recovery_incomplete");
-			} else if (target) {
-				const destroy =
-					dependencies.destroy ??
-					((handle) => executionBackend.destroy(handle));
+			} else if (
+				target &&
+				(liveness === "terminal_clean" || liveness === "dead")
+			) {
 				try {
-					destroy(target);
-					reclaimedCount = 1;
+					if (!(await destroyTarget())) {
+						errors.push("managed_recovery_evidence_changed");
+					}
 				} catch {
-					errors = ["managed_reclaim_failed"];
+					errors.push("managed_reclaim_failed");
 				}
 			}
-		} else if (inventoryErrors.length === 0) {
-			const reclaim =
-				dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
-			const result = reclaim({ dryRun: false });
-			reclaimedCount = result.reclaimed.length;
-			errors = result.errors.map((e) => `${e.name}: ${e.reason}`);
-			unreclaimedSnapshots = result.skippedSnapshots ?? [];
+		} else {
+			const projectPath = await canonicalRecoveryProject(managed, dependencies);
+			try {
+				const { result } = await reclaimManagedEntries({
+					managed,
+					dependencies,
+					projectPath,
+				});
+				reclaimedCount = result.reclaimed.length;
+				errors.push(...result.errors.map((e) => `${e.name}: ${e.reason}`));
+				unreclaimedSnapshots = result.skippedSnapshots ?? [];
+			} catch {
+				errors.push("managed_reclaim_unavailable");
+			}
 		}
 
 		const targeted = recoveredByFinalizer

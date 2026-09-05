@@ -2335,6 +2335,17 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	destroy(handle) {
 		const entry = this.resolveHandle(handle);
+		if (
+			handle &&
+			typeof handle === "object" &&
+			((handle.uuid && handle.uuid !== entry.uuid) ||
+				(handle.name && handle.name !== entry.name) ||
+				(handle.runId && handle.runId !== entry.runId) ||
+				(Number.isInteger(handle.creatorPid) &&
+					handle.creatorPid !== entry.creatorPid))
+		) {
+			throw new Error("VM identity changed before destruction");
+		}
 		// The sidecar is the fallback, not the primary: a clone created by this
 		// same process is already in the map, and reading it back would make the
 		// common path depend on the filesystem for no gain.
@@ -2353,10 +2364,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	}
 
 	/**
-	 * Reclaim only exact-prefix VMs whose embedded creator PID is dead.
-	 * When supplied, eligibility is an ownership filter selected by the caller;
-	 * an ineligible entry is reported and never stopped, deleted, or inspected
-	 * for snapshots.
+	 * Reclaim exact-prefix VMs only when the caller supplies an ownership and
+	 * liveness eligibility predicate. An omitted or failed predicate is fail
+	 * closed. Identity and eligibility are checked again immediately before any
+	 * VM mutation.
 	 */
 	reclaim({ dryRun = false, onStatus, eligibility = null } = {}) {
 		// `skipped` answers one question only: which VMs were left alone. The
@@ -2371,35 +2382,54 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			errors: [],
 		};
 		for (const entry of this.listManaged()) {
-			if (eligibility !== null) {
-				let eligible = false;
-				try {
-					eligible = eligibility(entry) === true;
-				} catch {
-					eligible = false;
-				}
-				if (!eligible) {
-					result.skipped.push({ ...entry, reason: "ineligible" });
-					onStatus?.({ type: "skip", name: entry.name, reason: "ineligible" });
-					continue;
-				}
+			let eligible = false;
+			try {
+				eligible =
+					typeof eligibility === "function" && eligibility(entry) === true;
+			} catch {
+				eligible = false;
 			}
-			const alive = this.pidIsAlive(entry.creatorPid);
-			if (alive) {
-				result.skipped.push({ ...entry, reason: "owner-alive" });
-				onStatus?.({ type: "skip", name: entry.name, reason: "owner-alive" });
+			if (!eligible) {
+				result.skipped.push({ ...entry, reason: "ineligible" });
+				onStatus?.({ type: "skip", name: entry.name, reason: "ineligible" });
 				continue;
 			}
 			if (dryRun) {
 				result.reclaimed.push({ ...entry, dryRun: true });
 				continue;
 			}
+			let current;
+			try {
+				current = this.listManaged().find(
+					(candidate) =>
+						candidate.uuid === entry.uuid &&
+						candidate.name === entry.name &&
+						candidate.runId === entry.runId &&
+						candidate.creatorPid === entry.creatorPid,
+				);
+				eligible = current !== undefined && eligibility(current) === true;
+			} catch {
+				current = undefined;
+				eligible = false;
+			}
+			if (!eligible) {
+				result.skipped.push({
+					...entry,
+					reason: "identity-or-eligibility-changed",
+				});
+				onStatus?.({
+					type: "skip",
+					name: entry.name,
+					reason: "identity-or-eligibility-changed",
+				});
+				continue;
+			}
 			// Read before the delete: once the VM is gone its uuid is the only
 			// way back to the sidecar, and a failure here must not cost the
 			// record.
-			const metadata = this.readSnapshotSidecar(entry.uuid);
+			const metadata = this.readSnapshotSidecar(current.uuid);
 			try {
-				const removed = this.stopAndDelete(entry, { forceOnly: true });
+				const removed = this.stopAndDelete(current, { forceOnly: true });
 				result.reclaimed.push(removed);
 				onStatus?.({ type: "reclaimed", name: entry.name });
 			} catch (error) {

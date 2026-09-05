@@ -1682,6 +1682,62 @@ describe("recover integration", () => {
 		strictEqual(envelope.projectLocksReleased, 1);
 		strictEqual(isProjectLockHeld(projectDir), false);
 	});
+
+	it("keeps finalizer cleanup incomplete when fresh VM proof becomes live", async () => {
+		const { initializeRun, advanceState, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await advanceState(runId, "running");
+		let current = await readRun(runId);
+		await updateRun(runId, { workerPid: 999999 }, current.revision);
+		const target = {
+			uuid: "race-uuid",
+			name: `switchyard-work-${runId}-999999`,
+			runId,
+			creatorPid: 999999,
+			status: "stopped",
+		};
+		let proofReads = 0;
+		let destroys = 0;
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", runId], {
+				listManaged: () => [target],
+				readRun: async () => ({
+					...(await readRun(runId)),
+					liveness: proofReads++ === 0 ? "dead" : "live",
+				}),
+				classifyRunLiveness: (run) => run.liveness,
+				destroy: () => {
+					destroys += 1;
+				},
+				reconcileProjectLockClaims: async () => [],
+				releaseProjectLockIfOwnedBy: async () => false,
+				isProjectLockOwnedBy: async () => false,
+				releaseOrphanedProjectLocks: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+		strictEqual(destroys, 0);
+		current = await readRun(runId);
+		strictEqual(current.cleanupState, "failed");
+		ok(JSON.parse(output[0]).errors.includes("recovery_incomplete"));
+	});
 });
 
 describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
@@ -1704,12 +1760,25 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 	}
 
 	it("sweepManagedOrphans reports the residue instead of dropping it", async () => {
+		const projectPath = join(dir, "residue-project");
 		const swept = await sweepManagedOrphans({
-			listManaged: () => [{ runId: "run-1", name: DEAD_VM, status: "stopped" }],
+			projectPath,
+			listManaged: () => [
+				{
+					uuid: "u-1",
+					runId: "run-1",
+					creatorPid: 999999,
+					name: DEAD_VM,
+					status: "stopped",
+				},
+			],
 			reclaim: reclaimWithResidue,
-			readRun: async () => {
-				throw new Error("no such run");
-			},
+			readRun: async () => ({
+				runId: "run-1",
+				projectPath,
+				state: "failed",
+				cleanupState: "complete",
+			}),
 		});
 
 		strictEqual(swept.vmsReclaimed, 1);
@@ -1739,26 +1808,59 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 	it("pre-run sweep filters VM reclaim to readable dead runs in the current project", async () => {
 		const currentProject = join(dir, "current-project");
 		const entries = [
-			{ runId: "local-dead", name: "local-dead", status: "stopped" },
-			{ runId: "local-live", name: "local-live", status: "stopped" },
-			{ runId: "foreign-dead", name: "foreign-dead", status: "stopped" },
-			{ runId: "missing", name: "missing", status: "stopped" },
-			{ runId: "malformed", name: "malformed", status: "stopped" },
+			{
+				uuid: "u1",
+				runId: "local-dead",
+				creatorPid: 11,
+				name: "local-dead",
+				status: "stopped",
+			},
+			{
+				uuid: "u2",
+				runId: "local-live",
+				creatorPid: 12,
+				name: "local-live",
+				status: "stopped",
+			},
+			{
+				uuid: "u3",
+				runId: "foreign-dead",
+				creatorPid: 13,
+				name: "foreign-dead",
+				status: "stopped",
+			},
+			{
+				uuid: "u4",
+				runId: "missing",
+				creatorPid: 14,
+				name: "missing",
+				status: "stopped",
+			},
+			{
+				uuid: "u5",
+				runId: "malformed",
+				creatorPid: 15,
+				name: "malformed",
+				status: "stopped",
+			},
 		];
 		const runs = {
 			"local-dead": {
+				runId: "local-dead",
 				projectPath: currentProject,
 				state: "running",
 				cleanupState: "pending",
 				workerPid: 999999,
 			},
 			"local-live": {
+				runId: "local-live",
 				projectPath: currentProject,
 				state: "running",
 				cleanupState: "pending",
 				workerPid: process.pid,
 			},
 			"foreign-dead": {
+				runId: "foreign-dead",
 				projectPath: join(dir, "foreign-project"),
 				state: "failed",
 				cleanupState: "complete",
@@ -1799,7 +1901,211 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 		strictEqual(swept.vmsReclaimed, 1);
 	});
 
+	it("targeted recover destroys only terminal-clean evidence and refuses unsafe owners", async () => {
+		const target = {
+			uuid: "target-uuid",
+			name: "switchyard-work-target-42",
+			runId: "target",
+			creatorPid: 42,
+			status: "stopped",
+		};
+		const unsafe = ["live", "startup_grace", "unknown"];
+		for (const liveness of unsafe) {
+			let destroys = 0;
+			const previousExitCode = process.exitCode;
+			const originalLog = console.log;
+			console.log = () => {};
+			try {
+				await handleRecover(["--run", "target"], {
+					listManaged: () => [target],
+					readRun: async () => ({
+						runId: "target",
+						projectPath: projectDir,
+						state: "running",
+						cleanupState: "pending",
+					}),
+					classifyRunLiveness: () => liveness,
+					destroy: () => {
+						destroys += 1;
+					},
+					releaseProjectLockIfOwnedBy: async () => false,
+					releaseOrphanedProjectLocks: async () => [],
+					reconcileProjectLockClaims: async () => [],
+				});
+			} finally {
+				console.log = originalLog;
+				process.exitCode = previousExitCode;
+			}
+			strictEqual(destroys, 0, `${liveness} must not authorize destroy`);
+		}
+
+		let destroys = 0;
+		const previousExitCode = process.exitCode;
+		const originalLog = console.log;
+		console.log = () => {};
+		try {
+			await handleRecover(["--run", "target"], {
+				listManaged: () => [target],
+				readRun: async () => ({
+					runId: "target",
+					projectPath: projectDir,
+					state: "failed",
+					cleanupState: "complete",
+				}),
+				classifyRunLiveness: () => "terminal_clean",
+				destroy: () => {
+					destroys += 1;
+				},
+				releaseProjectLockIfOwnedBy: async () => false,
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+		strictEqual(destroys, 1);
+	});
+
+	it("untargeted recover supplies per-resource liveness eligibility", async () => {
+		const entries = [
+			"clean",
+			"dead",
+			"live",
+			"startup",
+			"unknown",
+			"cleanup-failed",
+			"missing",
+		].map((runId, index) => ({
+			uuid: `uuid-${index}`,
+			name: `switchyard-work-${runId}-${index + 1}`,
+			runId,
+			creatorPid: index + 1,
+			status: "stopped",
+		}));
+		const states = {
+			clean: "terminal_clean",
+			dead: "dead",
+			live: "live",
+			startup: "startup_grace",
+			unknown: "unknown",
+			"cleanup-failed": "dead",
+		};
+		const authorized = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = () => {};
+		try {
+			await handleRecover([], {
+				listManaged: () => entries,
+				readRun: async (runId) => {
+					if (runId === "missing") throw new Error("missing");
+					return {
+						runId,
+						projectPath: projectDir,
+						state: runId === "clean" ? "failed" : "running",
+						cleanupState:
+							runId === "cleanup-failed"
+								? "failed"
+								: runId === "clean"
+									? "complete"
+									: "pending",
+						liveness: states[runId],
+					};
+				},
+				classifyRunLiveness: (run) => run.liveness,
+				reclaim: ({ eligibility }) => {
+					authorized.push(
+						...entries.filter(eligibility).map((entry) => entry.runId),
+					);
+					return { reclaimed: [], errors: [], skippedSnapshots: [] };
+				},
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+		deepStrictEqual(authorized, ["clean", "dead"]);
+	});
+
+	it("untargeted recovery refuses mixed projects and a dead-to-live proof race", async () => {
+		const entry = (runId, index) => ({
+			uuid: `race-${index}`,
+			name: `switchyard-work-${runId}-${index}`,
+			runId,
+			creatorPid: index,
+			status: "stopped",
+		});
+		for (const mode of ["mixed", "race"]) {
+			const entries =
+				mode === "mixed" ? [entry("a", 1), entry("b", 2)] : [entry("a", 1)];
+			let reads = 0;
+			let authorized = 0;
+			const originalLog = console.log;
+			const previousExitCode = process.exitCode;
+			console.log = () => {};
+			try {
+				await handleRecover([], {
+					listManaged: () => entries,
+					readRun: async (runId) => ({
+						runId,
+						projectPath:
+							mode === "mixed" && runId === "b" ? "/project-b" : "/project-a",
+						cleanupState: "complete",
+						state: "failed",
+						liveness:
+							mode === "race" && reads++ > 0 ? "live" : "terminal_clean",
+					}),
+					classifyRunLiveness: (run) => run.liveness,
+					reclaim: ({ eligibility }) => {
+						authorized += entries.filter(eligibility).length;
+						return { reclaimed: [], errors: [], skippedSnapshots: [] };
+					},
+					releaseOrphanedProjectLocks: async () => [],
+					reconcileProjectLockClaims: async () => [],
+				});
+			} finally {
+				console.log = originalLog;
+				process.exitCode = previousExitCode;
+			}
+			strictEqual(authorized, 0, mode);
+		}
+	});
+
+	it("preserves inventory and reclaim failures while lock reconciliation continues", async () => {
+		let directReconciliations = 0;
+		let claimReconciliations = 0;
+		const swept = await sweepManagedOrphans({
+			projectPath: projectDir,
+			listManaged: () => {
+				throw new Error("inventory unavailable");
+			},
+			reclaim: () => ({
+				reclaimed: [],
+				skippedSnapshots: [],
+				errors: [{ name: "candidate", reason: "reclaim failed" }],
+			}),
+			releaseOrphanedProjectLocks: async () => {
+				directReconciliations += 1;
+				return [];
+			},
+			reconcileProjectLockClaims: async () => {
+				claimReconciliations += 1;
+				return [];
+			},
+		});
+		deepStrictEqual(swept.errors, [
+			"managed_inventory_unavailable",
+			"candidate: reclaim failed",
+		]);
+		strictEqual(directReconciliations, 1);
+		strictEqual(claimReconciliations, 1);
+	});
+
 	it("recover's JSON envelope names the golden's leftover snapshots", async () => {
+		const projectPath = join(dir, "recover-residue-project");
 		const lines = [];
 		const realLog = console.log;
 		console.log = (line) => lines.push(line);
@@ -1807,12 +2113,21 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 		try {
 			await handleRecover([], {
 				listManaged: () => [
-					{ runId: "run-1", name: DEAD_VM, status: "stopped" },
+					{
+						uuid: "u-1",
+						runId: "run-1",
+						creatorPid: 999999,
+						name: DEAD_VM,
+						status: "stopped",
+					},
 				],
 				reclaim: reclaimWithResidue,
-				readRun: async () => {
-					throw new Error("no such run");
-				},
+				readRun: async () => ({
+					runId: "run-1",
+					projectPath,
+					state: "failed",
+					cleanupState: "complete",
+				}),
 			});
 		} finally {
 			console.log = realLog;

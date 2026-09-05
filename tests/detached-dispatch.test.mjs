@@ -1308,13 +1308,24 @@ describe("project-lock reconciliation without managed VMs", () => {
 		await acquireProjectLock(projectDir, runId);
 
 		const output = [];
+		const reclaimEligibility = [];
 		const originalLog = console.log;
 		const previousExitCode = process.exitCode;
 		console.log = (line) => output.push(line);
 		const dependencies = {
 			executionBackend: {
 				listManaged: () => [],
-				reclaim: () => ({ reclaimed: [], errors: [], skippedSnapshots: [] }),
+				reclaim: ({ eligibility }) => {
+					reclaimEligibility.push(
+						eligibility({
+							uuid: "missing-uuid",
+							name: "switchyard-work-missing-999999",
+							runId: "missing",
+							creatorPid: 999999,
+						}),
+					);
+					return { reclaimed: [], errors: [], skippedSnapshots: [] };
+				},
 			},
 		};
 		try {
@@ -1326,6 +1337,10 @@ describe("project-lock reconciliation without managed VMs", () => {
 		}
 		strictEqual(JSON.parse(output[0]).projectLocksReleased, 1);
 		strictEqual(JSON.parse(output[1]).projectLocksReleased, 0);
+		strictEqual(
+			reclaimEligibility.every((eligible) => eligible === false),
+			true,
+		);
 		strictEqual(isProjectLockHeld(projectDir), false);
 	});
 
