@@ -183,6 +183,8 @@ describe("broker async executor", () => {
 				reason: "SECRET_CANARY_raw provider stdout must not escape",
 				errorKind: "execution_failed",
 				diagnosticCode: "cli_usage_error",
+				diagnosticOrigin: "launcher",
+				diagnosticEvidenceAvailable: true,
 				exitCode: 2,
 				failurePhase: "provider_execution",
 			}),
@@ -197,6 +199,13 @@ describe("broker async executor", () => {
 		strictEqual(result.diagnosticCode, "cli_usage_error");
 		strictEqual(result.exitCode, 2);
 		strictEqual(result.failurePhase, "provider_execution");
+		strictEqual(result.diagnosticOrigin, "launcher");
+		strictEqual(result.diagnosticEvidenceAvailable, true);
+		strictEqual(result.resolvedTargetId, value.route.resolvedTarget);
+		strictEqual(
+			result.descriptorIdentity,
+			value.descriptor.descriptor_identity,
+		);
 		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
 	});
 

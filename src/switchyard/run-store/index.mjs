@@ -162,6 +162,8 @@ const APPROVED_EVENT_KEYS = new Set([
 	"exitCode",
 	"signal",
 	"failurePhase",
+	"diagnosticOrigin",
+	"diagnosticEvidenceAvailable",
 	// Closed vocabulary owned by the execution backend (CLEANUP_STAGES in
 	// adapter/exec-error.mjs), never interpolated from provider output.
 	"cleanupStage",
@@ -1560,6 +1562,14 @@ export async function createEvent(runId, event) {
 					...(event.failurePhase !== undefined
 						? { failurePhase: event.failurePhase }
 						: {}),
+					...(event.diagnosticOrigin !== undefined
+						? { diagnosticOrigin: event.diagnosticOrigin }
+						: {}),
+					...(event.diagnosticEvidenceAvailable !== undefined
+						? {
+								diagnosticEvidenceAvailable: event.diagnosticEvidenceAvailable,
+							}
+						: {}),
 				}
 			: null;
 	const safeFailure = isFailureEvent
@@ -1576,6 +1586,11 @@ export async function createEvent(runId, event) {
 					exitCode: event.exitCode,
 					signal: event.signal,
 					failurePhase: event.failurePhase,
+					diagnosticOrigin: event.diagnosticOrigin,
+					diagnosticEvidenceAvailable: event.diagnosticEvidenceAvailable,
+					resolvedTargetId: event.resolvedTargetId,
+					descriptorIdentity: event.descriptorIdentity,
+					descriptorHarness: event.descriptorHarness,
 				})
 		: null;
 
@@ -1629,6 +1644,8 @@ export async function createEvent(runId, event) {
 		delete entry.exitCode;
 		delete entry.signal;
 		delete entry.failurePhase;
+		delete entry.diagnosticOrigin;
+		delete entry.diagnosticEvidenceAvailable;
 		Object.assign(entry, safeFailure);
 		if (
 			event?.event === "worker_boot_failed" &&

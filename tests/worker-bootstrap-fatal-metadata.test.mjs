@@ -33,6 +33,8 @@ describe("writeFatalEvent metadata composition", () => {
 		strictEqual(failure.diagnosticCode, "prlctl_job_misfire");
 		strictEqual(failure.exitCode, 255);
 		strictEqual(failure.failurePhase, "worker_boot");
+		strictEqual(failure.diagnosticOrigin, "worker_boot");
+		strictEqual(failure.diagnosticEvidenceAvailable, true);
 	});
 
 	it("falls back to the boot stage code when the cause is not a prlctl failure, and records no exit code", () => {

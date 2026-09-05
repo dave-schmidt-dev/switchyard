@@ -286,6 +286,8 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		onStatus,
 		cleanupContext,
 		idleExitCode,
+		launcherDiagnosticCode,
+		adapterDiagnosticCode,
 		...lifecycleOptions
 	} = options;
 	// A backend that implements cleanupProviderProcess() (currently only
@@ -359,6 +361,8 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			failurePhase: result.cleanupFailed
 				? "provider_cleanup"
 				: "provider_execution",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
 			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 			signal: result.signal ?? null,
 		};
@@ -379,6 +383,8 @@ export async function executeProviderInvocation(command, args, options = {}) {
 					"provider_cleanup_failed")
 				: "execution_cancelled",
 			failurePhase: cleanupFailed ? "provider_cleanup" : "provider_execution",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
 			cleanupStage: result.cleanupStage,
 			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 			signal: result.signal ?? null,
@@ -394,18 +400,28 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		{ stdout: result.output, stderr: result.stderr, code: result.code },
 	);
 	const described = describeExecError(error, { provider });
+	const explicitDiagnosticCode =
+		launcherDiagnosticCode === "cli_usage_error"
+			? launcherDiagnosticCode
+			: adapterDiagnosticCode;
+	const diagnosticOrigin =
+		launcherDiagnosticCode === "cli_usage_error" ? "launcher" : "adapter";
 	return {
 		output: described.output,
 		success: false,
 		error: truncateDiagnostic(described.error),
 		errorKind: described.errorKind ?? "execution_failed",
 		diagnosticCode: classifyProviderDiagnostic({
-			errorKind: described.errorKind,
-			text: `${result.output ?? ""}\n${result.stderr ?? ""}`,
+			diagnosticCode: explicitDiagnosticCode,
+			diagnosticOrigin,
+			diagnosticEvidenceAvailable: true,
+			failurePhase: "provider_execution",
 			exitCode: result.code,
 			signal: result.signal,
 		}),
 		failurePhase: "provider_execution",
+		diagnosticOrigin,
+		diagnosticEvidenceAvailable: true,
 		exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 		signal: result.signal ?? null,
 	};

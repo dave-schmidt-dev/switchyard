@@ -1261,7 +1261,14 @@ test("production async runner quarantines quota targets and retries the same tas
 					executeAsync: async (_prompt, _container, options) => {
 						calls.push(options.resolvedTargetId);
 						return calls.length === 1
-							? { success: false, errorKind: "quota_exhausted" }
+							? {
+									success: false,
+									errorKind: "quota_exhausted",
+									diagnosticCode: "quota_exhausted",
+									diagnosticOrigin: "adapter",
+									diagnosticEvidenceAvailable: true,
+									failurePhase: "provider_execution",
+								}
 							: { success: true };
 					},
 					captureDiffAsync: async () => null,
@@ -1345,6 +1352,10 @@ test("production async runner refreshes quarantined exclusions for each task", a
 							? {
 									success: false,
 									errorKind: "quota_exhausted",
+									diagnosticCode: "quota_exhausted",
+									diagnosticOrigin: "adapter",
+									diagnosticEvidenceAvailable: true,
+									failurePhase: "provider_execution",
 									resolvedTargetId: options.resolvedTargetId,
 								}
 							: { success: true };

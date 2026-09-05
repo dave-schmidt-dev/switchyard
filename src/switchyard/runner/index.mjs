@@ -2294,6 +2294,11 @@ function failureMetadataFor(result, partialDiffPath) {
 		signal: result.signal,
 		failurePhase: result.failurePhase,
 		cleanupStage: result.cleanupStage,
+		diagnosticOrigin: result.diagnosticOrigin,
+		diagnosticEvidenceAvailable: result.diagnosticEvidenceAvailable,
+		resolvedTargetId: result.resolvedTargetId,
+		descriptorIdentity: result.descriptorIdentity,
+		descriptorHarness: result.descriptorHarness,
 	});
 }
 
@@ -2350,12 +2355,29 @@ function ensureRetryCheckpoint(checkpoint) {
 	return checkpoint;
 }
 
-function hasExactRetryDescriptorEvidence(retryState) {
-	return Boolean(
-		retryState?.invocationDescriptor &&
-			retryState.descriptorIdentity &&
-			retryState.descriptorHarness,
-	);
+function hasTrustedQuotaRetryEvidence(value) {
+	if (
+		value?.diagnosticCode !== "quota_exhausted" ||
+		value.diagnosticOrigin !== "adapter" ||
+		value.diagnosticEvidenceAvailable !== true ||
+		value.failurePhase !== "provider_execution"
+	) {
+		return false;
+	}
+	const targetId = normalizeRetryTargetId(value.resolvedTargetId);
+	if (!targetId) return false;
+	try {
+		const descriptor = validateInvocationDescriptor(
+			value.invocationDescriptor,
+			value.descriptorHarness,
+		);
+		return (
+			descriptor.target_id === targetId &&
+			descriptor.descriptor_identity === value.descriptorIdentity
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -2418,6 +2440,15 @@ function validateRetryDescriptorEvidence(checkpoint) {
 		) {
 			throw new Error(`${label} descriptor harness does not match target`);
 		}
+		const hasDiagnosticEvidence = [
+			"diagnosticCode",
+			"diagnosticOrigin",
+			"diagnosticEvidenceAvailable",
+			"failurePhase",
+		].some((field) => entry[field] !== undefined && entry[field] !== null);
+		if (hasDiagnosticEvidence && !hasTrustedQuotaRetryEvidence(entry)) {
+			throw new Error(`${label} has invalid quota diagnostic provenance`);
+		}
 	};
 
 	if (checkpoint.retryState !== undefined && checkpoint.retryState !== null) {
@@ -2460,6 +2491,11 @@ function persistRetryTransition(
 		invocationDescriptor = null,
 		descriptorIdentity = null,
 		descriptorHarness = null,
+		diagnosticCode = checkpoint.retryState?.diagnosticCode ?? null,
+		diagnosticOrigin = checkpoint.retryState?.diagnosticOrigin ?? null,
+		diagnosticEvidenceAvailable = checkpoint.retryState
+			?.diagnosticEvidenceAvailable ?? false,
+		failurePhase = checkpoint.retryState?.failurePhase ?? null,
 		phase = type,
 		clearState = false,
 		save = true,
@@ -2481,6 +2517,10 @@ function persistRetryTransition(
 		invocationDescriptor,
 		descriptorIdentity,
 		descriptorHarness,
+		diagnosticCode,
+		diagnosticOrigin,
+		diagnosticEvidenceAvailable,
+		failurePhase,
 		timestamp: new Date().toISOString(),
 	};
 	checkpoint.retryTransitionId = transitionId;
@@ -2495,6 +2535,10 @@ function persistRetryTransition(
 				invocationDescriptor,
 				descriptorIdentity,
 				descriptorHarness,
+				diagnosticCode,
+				diagnosticOrigin,
+				diagnosticEvidenceAvailable,
+				failurePhase,
 			};
 	checkpoint.lastUpdatedAt = transition.timestamp;
 	if (save) saveCheckpoint(checkpointPath, checkpoint);
@@ -2520,13 +2564,15 @@ function appendRetryAttempt(checkpoint, result, attempt) {
 }
 
 function isQuotaRetryCandidate(result, ownsWorkingContainer) {
-	return Boolean(
-		ownsWorkingContainer &&
-			result &&
-			result.result === "execution_failed" &&
-			result.errorKind === "quota_exhausted" &&
-			normalizeRetryTargetId(result.resolvedTargetId),
-	);
+	if (
+		!ownsWorkingContainer ||
+		!result ||
+		result.result !== "execution_failed" ||
+		!hasTrustedQuotaRetryEvidence(result)
+	) {
+		return false;
+	}
+	return true;
 }
 
 const ALLOWED_INTEGRATION_MESSAGES = Object.freeze(
@@ -2965,6 +3011,8 @@ export function executeTask(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				diagnosticOrigin: execution.diagnosticOrigin,
+				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				cleanupStage: execution.cleanupStage,
 			});
 			const error = cleanupFailed
@@ -2991,6 +3039,8 @@ export function executeTask(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				diagnosticOrigin: execution.diagnosticOrigin,
+				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				cleanupStage: execution.cleanupStage,
 			});
 			return {
@@ -3016,6 +3066,8 @@ export function executeTask(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				diagnosticOrigin: execution.diagnosticOrigin,
+				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				cleanupStage: execution.cleanupStage,
 				captureStatus,
 				...(partialDiff ? { partialDiff } : {}),
@@ -3059,6 +3111,8 @@ export function executeTask(task, context) {
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			diagnosticOrigin: execution.diagnosticOrigin,
+			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			cleanupStage: execution.cleanupStage,
 			captureStatus: captureEvidence.status,
 		});
@@ -3078,6 +3132,8 @@ export function executeTask(task, context) {
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			diagnosticOrigin: execution.diagnosticOrigin,
+			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			cleanupStage: execution.cleanupStage,
 			captureStatus: captureEvidence.status,
 			...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
@@ -3587,6 +3643,9 @@ async function executeTaskAsyncUnsafe(task, context) {
 						exitCode: brokerExecution.exitCode,
 						signal: brokerExecution.signal,
 						failurePhase: brokerExecution.failurePhase,
+						diagnosticOrigin: brokerExecution.diagnosticOrigin,
+						diagnosticEvidenceAvailable:
+							brokerExecution.diagnosticEvidenceAvailable,
 					},
 					{
 						recordProvenance: primaryProvenance,
@@ -3697,6 +3756,9 @@ async function executeTaskAsyncUnsafe(task, context) {
 		exitCode: brokerExecution.exitCode ?? null,
 		signal: brokerExecution.signal ?? null,
 		failurePhase: brokerExecution.failurePhase ?? null,
+		diagnosticOrigin: brokerExecution.diagnosticOrigin ?? null,
+		diagnosticEvidenceAvailable:
+			brokerExecution.diagnosticEvidenceAvailable === true,
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 	};
@@ -3740,6 +3802,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				diagnosticOrigin: execution.diagnosticOrigin,
+				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				cleanupStage: execution.cleanupStage,
 				captureStatus: captureEvidence.status,
 			});
@@ -3758,6 +3822,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 				exitCode: execution.exitCode,
 				signal: execution.signal,
 				failurePhase: execution.failurePhase,
+				diagnosticOrigin: execution.diagnosticOrigin,
+				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				cleanupStage: execution.cleanupStage,
 				captureStatus: captureEvidence.status,
 				...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
@@ -3815,6 +3881,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			diagnosticOrigin: execution.diagnosticOrigin,
+			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			cleanupStage: execution.cleanupStage,
 		});
 		const error = cleanupFailed
@@ -3840,6 +3908,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			diagnosticOrigin: execution.diagnosticOrigin,
+			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			cleanupStage: execution.cleanupStage,
 		});
 		return {
@@ -3865,6 +3935,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 			exitCode: execution.exitCode,
 			signal: execution.signal,
 			failurePhase: execution.failurePhase,
+			diagnosticOrigin: execution.diagnosticOrigin,
+			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			cleanupStage: execution.cleanupStage,
 			captureStatus,
 			...(partialDiff ? { partialDiff } : {}),
@@ -4188,7 +4260,7 @@ export async function runQueueAsync(options) {
 					? checkpoint.retryState
 					: null;
 			let result;
-			if (retryState && !hasExactRetryDescriptorEvidence(retryState)) {
+			if (retryState && !hasTrustedQuotaRetryEvidence(retryState)) {
 				result = {
 					taskId: task.id,
 					success: false,
@@ -4196,9 +4268,9 @@ export async function runQueueAsync(options) {
 					model: null,
 					resolvedTargetId: retryState.resolvedTargetId ?? null,
 					result: "unknown_failure",
-					errorKind: "descriptor_receipt",
+					errorKind: "unknown_failure",
 					reason:
-						"historical retry state lacks exact invocation descriptor evidence",
+						"historical retry state lacks trusted quota diagnostic provenance",
 				};
 				persistRetryTransition(checkpoint, checkpointPath, {
 					type: "finalized",
@@ -4331,6 +4403,10 @@ export async function runQueueAsync(options) {
 					invocationDescriptor: result.invocationDescriptor,
 					descriptorIdentity: result.descriptorIdentity,
 					descriptorHarness: result.descriptorHarness,
+					diagnosticCode: result.diagnosticCode,
+					diagnosticOrigin: result.diagnosticOrigin,
+					diagnosticEvidenceAvailable: result.diagnosticEvidenceAvailable,
+					failurePhase: result.failurePhase,
 				});
 				projectRetryState();
 				checkpoint.quarantinedTargetIds = [
@@ -5490,6 +5566,9 @@ export function createBrokerAdapterLauncher({
 			exitCode: execution?.exitCode ?? null,
 			signal: execution?.signal ?? null,
 			failurePhase: execution?.failurePhase ?? null,
+			diagnosticOrigin: execution?.diagnosticOrigin ?? null,
+			diagnosticEvidenceAvailable:
+				execution?.diagnosticEvidenceAvailable === true,
 			// A bounded fact, not the guest-supplied model name: whether the
 			// adapter could affirmatively read back what the provider served.
 			servedModelVerified:
@@ -6559,7 +6638,7 @@ export function runQueue(options) {
 			let retryUsed = Boolean(retryState);
 			let retryTargetId = retryState?.resolvedTargetId ?? null;
 			const retryEvidenceMissing =
-				Boolean(retryState) && !hasExactRetryDescriptorEvidence(retryState);
+				Boolean(retryState) && !hasTrustedQuotaRetryEvidence(retryState);
 			if (retryEvidenceMissing) {
 				// Historical model-only retry state is readable, but it cannot
 				// authorize a retry against an exact descriptor/target. Halt before
@@ -6572,9 +6651,9 @@ export function runQueue(options) {
 					model: null,
 					resolvedTargetId: retryState.resolvedTargetId ?? null,
 					result: "unknown_failure",
-					errorKind: "descriptor_receipt",
+					errorKind: "unknown_failure",
 					reason:
-						"historical retry state lacks exact invocation descriptor evidence",
+						"historical retry state lacks trusted quota diagnostic provenance",
 				};
 			} else if (retryState) {
 				const resumedTargetId = normalizeRetryTargetId(
@@ -6684,6 +6763,10 @@ export function runQueue(options) {
 						invocationDescriptor: result.invocationDescriptor,
 						descriptorIdentity: result.descriptorIdentity,
 						descriptorHarness: result.descriptorHarness,
+						diagnosticCode: result.diagnosticCode,
+						diagnosticOrigin: result.diagnosticOrigin,
+						diagnosticEvidenceAvailable: result.diagnosticEvidenceAvailable,
+						failurePhase: result.failurePhase,
 					});
 					projectRetryState();
 					checkpoint.quarantinedTargetIds = [
@@ -6854,6 +6937,13 @@ export function runQueue(options) {
 						artifactRef: safeFailure?.artifactRef,
 						...(safeFailure?.diagnosticCode
 							? { diagnosticCode: safeFailure.diagnosticCode }
+							: {}),
+						...(safeFailure?.diagnosticOrigin
+							? {
+									diagnosticOrigin: safeFailure.diagnosticOrigin,
+									diagnosticEvidenceAvailable:
+										safeFailure.diagnosticEvidenceAvailable,
+								}
 							: {}),
 					});
 				}
@@ -7288,9 +7378,9 @@ export async function runQueueWithOrchestrator(options) {
 		context.exclude = effectiveExclude;
 		context.only = effectiveOnly;
 		if (checkpoint.retryState !== null) {
-			const reason = hasExactRetryDescriptorEvidence(checkpoint.retryState)
+			const reason = hasTrustedQuotaRetryEvidence(checkpoint.retryState)
 				? "orchestrator mode cannot resume persisted retry state until an audited retry-resume state machine is implemented"
-				: "historical retry state lacks exact invocation descriptor evidence";
+				: "historical retry state lacks trusted quota diagnostic provenance";
 			throw new Error(`runQueueWithOrchestrator: ${reason}`);
 		}
 		const selectionOptions = identity.enabled
@@ -7380,6 +7470,13 @@ export async function runQueueWithOrchestrator(options) {
 						artifactRef: safeFailure?.artifactRef,
 						...(safeFailure?.diagnosticCode
 							? { diagnosticCode: safeFailure.diagnosticCode }
+							: {}),
+						...(safeFailure?.diagnosticOrigin
+							? {
+									diagnosticOrigin: safeFailure.diagnosticOrigin,
+									diagnosticEvidenceAvailable:
+										safeFailure.diagnosticEvidenceAvailable,
+								}
 							: {}),
 					});
 				}

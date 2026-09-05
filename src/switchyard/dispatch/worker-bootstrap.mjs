@@ -143,6 +143,8 @@ export function buildFatalFailure(
 		errorKind: classified.errorKind,
 		diagnosticCode: closedCode,
 		failurePhase: classified.failurePhase,
+		diagnosticOrigin: "worker_boot",
+		diagnosticEvidenceAvailable: true,
 		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
 			? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
 			: {}),

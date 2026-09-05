@@ -22,7 +22,10 @@ function failure(overrides = {}) {
 		errorKind: "execution_failed",
 		reasonCode: "execution_failed",
 		reason: "closed",
+		diagnosticCode: "provider_exit_nonzero",
 		failurePhase: "provider_execution",
+		diagnosticOrigin: "adapter",
+		diagnosticEvidenceAvailable: true,
 		...overrides,
 	};
 }
@@ -66,6 +69,9 @@ function targetDisposition({
 				reasonCode: errorKind,
 				diagnosticCode,
 				failurePhase,
+				resolvedTargetId: exact.resolvedTargetId,
+				descriptorIdentity: exact.descriptorIdentity,
+				descriptorHarness: exact.descriptorHarness,
 			}),
 		}),
 		checkpoint: {
@@ -172,7 +178,7 @@ describe("caller disposition precedence", () => {
 				liveness: "terminal_clean",
 			},
 			"target_failed",
-			"execution_failed",
+			"provider_exit_nonzero",
 		],
 		[
 			"insufficient evidence stops",
@@ -337,7 +343,7 @@ describe("caller disposition precedence", () => {
 		deepStrictEqual(result.failedTargetIds, ["agy-gemini", "opencode-go"]);
 	});
 
-	it("returns failed targets only for its bounded, validated task identity", () => {
+	it("stops when trusted failures span tasks without a current task context", () => {
 		const result = projectDisposition({
 			run: run({
 				state: "failed",
@@ -355,50 +361,132 @@ describe("caller disposition precedence", () => {
 			},
 			liveness: "terminal_clean",
 		});
-		strictEqual(result.action, "target_failed");
-		strictEqual(result.taskId, "2.3");
-		deepStrictEqual(result.failedTargetIds, ["agy-gemini", "codex-standard"]);
+		strictEqual(result.action, "stop");
+		strictEqual(result.reasonCode, "insufficient_evidence");
+		strictEqual(result.taskId, null);
+		deepStrictEqual(result.failedTargetIds, []);
 	});
 
-	it("names the blocking task by numeric order once a queue passes nine tasks", () => {
+	it("uses the current checkpoint task instead of historical task order", () => {
+		const current = exactFailure("opencode-go", "10.1");
 		const result = projectDisposition({
 			run: run({
 				state: "failed",
 				cleanupState: "complete",
-				lastFailure: failure(),
+				currentTaskId: null,
+				lastFailure: failure({
+					taskId: "10.1",
+					resolvedTargetId: current.resolvedTargetId,
+					descriptorIdentity: current.descriptorIdentity,
+					descriptorHarness: current.descriptorHarness,
+				}),
 			}),
 			checkpoint: {
-				retryAttempts: [
-					exactFailure("agy-gemini", "10.1"),
-					exactFailure("opencode-go", "2.1"),
-				],
+				lastTaskId: "10.1",
+				retryAttempts: [current, exactFailure("opencode-go", "2.1")],
 			},
 			liveness: "terminal_clean",
 		});
 		strictEqual(result.action, "target_failed");
-		// A lexical sort ranks "10.1" ahead of "2.1" and reports the wrong task
-		// and the wrong targets as blocking.
-		strictEqual(result.taskId, "2.1");
+		strictEqual(result.taskId, "10.1");
 		deepStrictEqual(result.failedTargetIds, ["opencode-go"]);
 	});
 
-	it("ranks a parent task ahead of its own subtask", () => {
+	it("does not authorize a current failure from legacy-only historical evidence", () => {
+		const legacy = exactFailure("vibe", "1.1");
+		delete legacy.diagnosticOrigin;
+		delete legacy.diagnosticEvidenceAvailable;
 		const result = projectDisposition({
 			run: run({
 				state: "failed",
 				cleanupState: "complete",
-				lastFailure: failure(),
+				currentTaskId: null,
+				lastFailure: failure({
+					taskId: "1.2",
+					resolvedTargetId: "opencode-go",
+					descriptorIdentity: `sha256:${"b".repeat(64)}`,
+					descriptorHarness: "opencode",
+				}),
 			}),
 			checkpoint: {
-				retryAttempts: [
-					exactFailure("agy-gemini", "2.1"),
-					exactFailure("opencode-go", "2"),
-				],
+				lastTaskId: "1.2",
+				completedTaskIds: ["1.1"],
+				retryAttempts: [legacy],
 			},
 			liveness: "terminal_clean",
 		});
-		strictEqual(result.taskId, "2");
-		deepStrictEqual(result.failedTargetIds, ["opencode-go"]);
+		strictEqual(result.action, "stop");
+		strictEqual(result.reasonCode, "insufficient_evidence");
+		strictEqual(result.taskId, null);
+		deepStrictEqual(result.failedTargetIds, []);
+	});
+
+	it("excludes trusted completed-task evidence without mutating the checkpoint", () => {
+		const completed = exactFailure("vibe", "1.1");
+		const checkpoint = {
+			lastTaskId: "1.2",
+			completedTaskIds: ["1.1"],
+			retryAttempts: [completed],
+		};
+		const snapshot = structuredClone(checkpoint);
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				currentTaskId: null,
+				lastFailure: failure({ taskId: "1.2" }),
+			}),
+			checkpoint,
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "stop");
+		deepStrictEqual(result.failedTargetIds, []);
+		deepStrictEqual(checkpoint, snapshot);
+	});
+
+	it("keeps all trusted current-task attempts after matching the terminal route", () => {
+		const terminal = exactFailure("opencode-go", "1.2");
+		terminal.descriptorHarness = "opencode";
+		const priorAttempt = exactFailure("agy-gemini", "1.2");
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				currentTaskId: null,
+				lastFailure: failure({
+					taskId: "1.2",
+					resolvedTargetId: terminal.resolvedTargetId,
+					descriptorIdentity: terminal.descriptorIdentity,
+					descriptorHarness: terminal.descriptorHarness,
+				}),
+			}),
+			checkpoint: {
+				lastTaskId: "1.2",
+				completedTaskIds: ["1.1"],
+				retryAttempts: [priorAttempt, terminal],
+				results: [exactFailure("vibe", "1.1")],
+			},
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "target_failed");
+		strictEqual(result.taskId, "1.2");
+		deepStrictEqual(result.failedTargetIds, ["agy-gemini", "opencode-go"]);
+	});
+
+	it("stops when terminal and checkpoint task contexts disagree", () => {
+		const current = exactFailure("opencode-go", "1.2");
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: failure({ taskId: "1.3" }),
+			}),
+			checkpoint: { lastTaskId: "1.2", retryAttempts: [current] },
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "stop");
+		strictEqual(result.reasonCode, "insufficient_evidence");
+		deepStrictEqual(result.failedTargetIds, []);
 	});
 
 	it("deduplicates six sanitized OpenCode execution failures without a cooldown schema", () => {
@@ -605,40 +693,20 @@ describe("closed caller direction", () => {
 	const targetMappings = [
 		["auth_expired", "auth_expired", "stop"],
 		["quota_exhausted", "quota_exhausted", "advance_authorized_fallback"],
-		["model_unavailable", "model_unavailable", "advance_authorized_fallback"],
-		["execution_failed", "execution_failed", "advance_authorized_fallback"],
-		["execution_failed", "cli_usage_error", "advance_authorized_fallback"],
+		["model_unavailable", "model_unavailable", "stop"],
+		["execution_failed", "execution_failed", "stop"],
+		["execution_failed", "cli_usage_error", "repair_input"],
 		[
 			"execution_failed",
 			"provider_exit_nonzero",
 			"advance_authorized_fallback",
 		],
 		["execution_failed", "provider_signalled", "advance_authorized_fallback"],
-		[
-			"execution_failed",
-			"provider_output_unclassified",
-			"advance_authorized_fallback",
-		],
-		[
-			"execution_timed_out",
-			"execution_timed_out",
-			"advance_authorized_fallback",
-		],
-		[
-			"execution_timed_out",
-			"execution_cancelled",
-			"advance_authorized_fallback",
-		],
-		[
-			"provider_cleanup_failed",
-			"provider_cleanup_failed",
-			"advance_authorized_fallback",
-		],
-		[
-			"diff_capture_failed",
-			"diff_capture_failed",
-			"advance_authorized_fallback",
-		],
+		["execution_failed", "provider_output_unclassified", "stop"],
+		["execution_timed_out", "execution_timed_out", "stop"],
+		["execution_timed_out", "execution_cancelled", "stop"],
+		["provider_cleanup_failed", "provider_cleanup_failed", "stop"],
+		["diff_capture_failed", "diff_capture_failed", "stop"],
 		...[
 			"provider_cleanup_after_cleanup_started",
 			"provider_cleanup_after_pid_observed",
@@ -648,7 +716,7 @@ describe("closed caller direction", () => {
 		].map((diagnosticCode) => [
 			"provider_cleanup_failed",
 			diagnosticCode,
-			"advance_authorized_fallback",
+			"stop",
 		]),
 		["integration_failed", "declared_path_not_seeded", "repair_input"],
 		["required_paths_missing", "required_paths_missing", "repair_input"],
@@ -694,6 +762,27 @@ describe("closed caller direction", () => {
 		});
 		strictEqual(result.action, "target_failed");
 		strictEqual(result.direction, "stop");
+	});
+
+	it("does not let a legacy closed label authorize a new fallback", () => {
+		const exact = exactFailure("codex/standard");
+		const result = projectDisposition({
+			run: run({
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: {
+					errorKind: "execution_failed",
+					reasonCode: "execution_failed",
+					reason: "closed",
+					diagnosticCode: "provider_exit_nonzero",
+					failurePhase: "provider_execution",
+				},
+			}),
+			checkpoint: { retryAttempts: [exact] },
+			liveness: "terminal_clean",
+		});
+		strictEqual(result.action, "stop");
+		strictEqual(result.reasonCode, "insufficient_evidence");
 	});
 
 	it("uses the underlying closed failure when retry_consumed is reachable", () => {
@@ -880,7 +969,10 @@ describe("closed caller direction", () => {
 					code: "invalid_invocation",
 				},
 			}).direction,
-			targetDisposition({ errorKind: "execution_failed" }).direction,
+			targetDisposition({
+				errorKind: "execution_failed",
+				diagnosticCode: "provider_exit_nonzero",
+			}).direction,
 			projectDisposition({
 				run: run({
 					state: "failed",

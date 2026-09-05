@@ -521,13 +521,41 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		strictEqual(JSON.stringify(metadata).includes("SECRET_CANARY"), false);
 	});
 
-	it("classifies provider text without returning the text", () => {
-		const code = classifyProviderDiagnostic({
-			text: "SECRET_CANARY_x: unexpected argument --bad",
-			exitCode: 2,
+	it("retains only bounded route provenance alongside a trusted diagnostic", () => {
+		const metadata = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "execution_failed",
+			diagnosticCode: "provider_exit_nonzero",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
+			failurePhase: "provider_execution",
+			resolvedTargetId: "codex/standard",
+			descriptorIdentity: `sha256:${"a".repeat(64)}`,
+			descriptorHarness: "codex",
 		});
-		strictEqual(code, "cli_usage_error");
-		strictEqual(code.includes("SECRET_CANARY"), false);
+		strictEqual(metadata.diagnosticOrigin, "adapter");
+		strictEqual(metadata.diagnosticEvidenceAvailable, true);
+		strictEqual(metadata.resolvedTargetId, "codex/standard");
+		strictEqual(metadata.descriptorHarness, "codex");
+		ok(isPersistentFailureMetadata(metadata));
+	});
+
+	it("does not let usage-like provider, task, or child-tool prose mint CLI misuse", () => {
+		for (const text of [
+			"SECRET_CANARY task says usage: npm run test",
+			"SECRET_CANARY model says invalid value is expected",
+			"SECRET_CANARY child stderr: usage: helper",
+		]) {
+			strictEqual(
+				classifyProviderDiagnostic({
+					text,
+					exitCode: 2,
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
+				}),
+				"provider_exit_nonzero",
+			);
+		}
 	});
 
 	it("prefers a safe nonzero exit over arbitrary provider output", () => {
@@ -535,19 +563,23 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 			classifyProviderDiagnostic({
 				text: "SECRET_CANARY arbitrary provider output",
 				exitCode: 17,
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
 			}),
 			"provider_exit_nonzero",
 		);
 	});
 
-	it("retains the unclassified-output diagnostic without a nonzero exit", () => {
+	it("leaves output without structured diagnostic evidence unknown", () => {
 		for (const exitCode of [undefined, null, 0]) {
 			strictEqual(
 				classifyProviderDiagnostic({
 					text: "SECRET_CANARY arbitrary provider output",
 					exitCode,
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
 				}),
-				"provider_output_unclassified",
+				null,
 			);
 		}
 	});
@@ -556,14 +588,36 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		for (const [input, expected] of [
 			[{ cancelled: true, exitCode: 1 }, "execution_cancelled"],
 			[{ timedOut: true, exitCode: 1 }, "execution_timed_out"],
-			[{ errorKind: "auth_expired", exitCode: 1 }, "auth_expired"],
-			[{ errorKind: "quota_exhausted", exitCode: 1 }, "quota_exhausted"],
-			[{ errorKind: "model_unavailable", exitCode: 1 }, "model_unavailable"],
-			[{ text: "unexpected argument", exitCode: 2 }, "cli_usage_error"],
+			[{ diagnosticCode: "auth_expired", exitCode: 1 }, "auth_expired"],
+			[{ diagnosticCode: "quota_exhausted", exitCode: 1 }, "quota_exhausted"],
+			[
+				{ diagnosticCode: "model_unavailable", exitCode: 1 },
+				"model_unavailable",
+			],
 			[{ signal: "SIGTERM", exitCode: 1 }, "provider_signalled"],
 		]) {
-			strictEqual(classifyProviderDiagnostic(input), expected);
+			strictEqual(
+				classifyProviderDiagnostic({
+					...input,
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
+				}),
+				expected,
+			);
 		}
+		strictEqual(
+			classifyProviderDiagnostic({
+				diagnosticCode: "cli_usage_error",
+				diagnosticOrigin: "launcher",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
+			}),
+			"cli_usage_error",
+		);
+		strictEqual(
+			classifyProviderDiagnostic({ diagnosticCode: "cli_usage_error" }),
+			null,
+		);
 	});
 
 	it("maps a cleanup stage to a static durable diagnostic", () => {

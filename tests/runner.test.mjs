@@ -3028,7 +3028,7 @@ describe("runner headless orchestrator mode", () => {
 						},
 					},
 				}),
-			/historical retry state lacks exact invocation descriptor evidence/,
+			/historical retry state lacks trusted quota diagnostic provenance/,
 		);
 		strictEqual(routeCalls, 0);
 		strictEqual(launchCalls, 0);
@@ -3067,6 +3067,10 @@ describe("runner headless orchestrator mode", () => {
 				invocationDescriptor: descriptor,
 				descriptorIdentity: descriptor.descriptor_identity,
 				descriptorHarness: "claude",
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
 			},
 		});
 		let routeCalls = 0;
@@ -3601,7 +3605,13 @@ describe("runner quota retry coordination", () => {
 					}
 				);
 			},
+			executeAsync: async () => {
+				executeCalls.push(provider);
+				const queue = outcomes.get(provider) ?? [];
+				return queue.shift() ?? { success: true, output: "ok" };
+			},
 			captureDiff: () => "diff --git a/a b/a\n+change",
+			captureDiffAsync: async () => "diff --git a/a b/a\n+change",
 		});
 		return {
 			routeCalls,
@@ -3655,6 +3665,10 @@ describe("runner quota retry coordination", () => {
 						output: "",
 						error: "provider quota unavailable",
 						errorKind: "quota_exhausted",
+						diagnosticCode: "quota_exhausted",
+						diagnosticOrigin: "adapter",
+						diagnosticEvidenceAvailable: true,
+						failurePhase: "provider_execution",
 					},
 					{ success: true, output: "ok" },
 				],
@@ -3786,6 +3800,56 @@ describe("runner quota retry coordination", () => {
 		strictEqual(checkpoint.retryAttempts.length, 0);
 	});
 
+	it("does not reset, quarantine, or reroute text-only quota labels in sync and async queues", async () => {
+		for (const [name, entrypoint] of [
+			["sync", runQueue],
+			["async", runQueueAsync],
+		]) {
+			const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reject ${name} text-only quota
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** legacy label is informational only
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			let resetCalls = 0;
+			const fixture = makeQuotaRetryDependencies({
+				routePlan: [
+					{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+					{ provider: "codex", model: "fixture-codex", target: "codex-main" },
+				],
+				executionOutcomes: {
+					agy: [
+						{
+							success: false,
+							output: "",
+							error: "quota-like prose",
+							errorKind: "quota_exhausted",
+						},
+					],
+				},
+				resetWorkingTree: () => {
+					resetCalls += 1;
+				},
+			});
+			const result = await entrypoint({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				stopOnFailure: true,
+				dependencies: fixture.dependencies,
+			});
+			strictEqual(result.results[0].success, false, name);
+			strictEqual(fixture.executeCalls.length, 1, name);
+			strictEqual(resetCalls, 0, name);
+			const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+			deepStrictEqual(checkpoint.quarantinedTargetIds, [], name);
+			deepStrictEqual(checkpoint.retryAttempts, [], name);
+			deepStrictEqual(checkpoint.retryTransitions, [], name);
+		}
+	});
+
 	it("resumes a quarantined task on the remaining target without repeating attempt one", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -3837,6 +3901,10 @@ describe("runner quota retry coordination", () => {
 				invocationDescriptor: resumeDescriptor,
 				descriptorIdentity: resumeDescriptor.descriptor_identity,
 				descriptorHarness: "agy",
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
 			},
 		});
 
@@ -3921,6 +3989,10 @@ describe("runner quota retry coordination", () => {
 				invocationDescriptor: resumeDescriptor,
 				descriptorIdentity: resumeDescriptor.descriptor_identity,
 				descriptorHarness: "agy",
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+				failurePhase: "provider_execution",
 			},
 		});
 
@@ -3988,8 +4060,70 @@ describe("runner quota retry coordination", () => {
 		});
 		strictEqual(result.processedTasks, 1);
 		strictEqual(result.results[0].success, false);
-		strictEqual(result.results[0].errorKind, "descriptor_receipt");
+		strictEqual(result.results[0].errorKind, "unknown_failure");
 		strictEqual(fixture.executeCalls.length, 0);
+	});
+
+	it("does not resume descriptor-only legacy retry state in sync or async queues", async () => {
+		for (const [name, entrypoint] of [
+			["sync", runQueue],
+			["async", runQueueAsync],
+		]) {
+			const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Reject ${name} legacy retry
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** descriptor evidence alone cannot authorize replay
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const descriptor = descriptorForRoute({
+				provider: "agy",
+				model: "fixture-gemini",
+				resolvedTargetId: "agy-gemini",
+			});
+			saveCheckpoint(checkpointPath, {
+				version: 1,
+				tasksFilePath: tasksPath,
+				completedTaskIds: [],
+				lastTaskId: null,
+				lastUpdatedAt: null,
+				results: [],
+				quarantinedTargetIds: ["agy-gemini"],
+				retryAttempts: [],
+				retryTransitions: [],
+				retryTransitionId: 0,
+				retryState: {
+					taskId: "1.1",
+					attempt: 1,
+					phase: "target_quarantined",
+					resolvedTargetId: "agy-gemini",
+					invocationDescriptor: descriptor,
+					descriptorIdentity: descriptor.descriptor_identity,
+					descriptorHarness: "agy",
+				},
+			});
+			let resetCalls = 0;
+			const fixture = makeQuotaRetryDependencies({
+				routePlan: [
+					{ provider: "agy", model: "fixture-other", target: "agy-other" },
+				],
+				executionOutcomes: { agy: [{ success: true, output: "must not run" }] },
+				resetWorkingTree: () => {
+					resetCalls += 1;
+				},
+			});
+			const result = await entrypoint({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: fixture.dependencies,
+			});
+			strictEqual(result.results[0].success, false, name);
+			strictEqual(result.results[0].errorKind, "unknown_failure", name);
+			strictEqual(fixture.executeCalls.length, 0, name);
+			strictEqual(resetCalls, 0, name);
+		}
 	});
 
 	it("rejects a forged Claude descriptor for antigravity before reset, reroute, or execution", () => {
@@ -4237,6 +4371,10 @@ describe("runner quota retry coordination", () => {
 						output: "",
 						error: "quota",
 						errorKind: "quota_exhausted",
+						diagnosticCode: "quota_exhausted",
+						diagnosticOrigin: "adapter",
+						diagnosticEvidenceAvailable: true,
+						failurePhase: "provider_execution",
 					},
 				],
 			},
@@ -4346,7 +4484,16 @@ runQueue({
     },
     adapters: {
       agy: {
-        execute: () => ({ success: false, output: "", error: "quota", errorKind: "quota_exhausted" }),
+        execute: () => ({
+          success: false,
+          output: "",
+          error: "quota",
+          errorKind: "quota_exhausted",
+          diagnosticCode: "quota_exhausted",
+          diagnosticOrigin: "adapter",
+          diagnosticEvidenceAvailable: true,
+          failurePhase: "provider_execution",
+        }),
         captureDiff: () => "diff --git a/a b/a\\n+change",
       },
     },
@@ -11032,6 +11179,70 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 });
 
 describe("carry real cause through runner terminal projections (Task 1.4)", () => {
+	it("carries trusted diagnostic and exact route provenance into checkpoint and run-store state", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Structured provider failure
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** retain bounded diagnostic provenance
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const runStoreCalls = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "agy",
+					model: "fixture-model",
+					resolvedTargetId: "agy-gemini",
+					percentLeft: 70,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				adapters: {
+					agy: {
+						execute: () => ({
+							success: false,
+							error: "SECRET_CANARY raw provider text",
+							errorKind: "auth_expired",
+							diagnosticCode: "auth_expired",
+							diagnosticOrigin: "adapter",
+							diagnosticEvidenceAvailable: true,
+							failurePhase: "provider_execution",
+							exitCode: 1,
+						}),
+						captureDiff: () => null,
+					},
+				},
+				runStore: {
+					updateRun: (partial) => {
+						runStoreCalls.push({ ...partial });
+						return Promise.resolve({ revision: 0 });
+					},
+				},
+			},
+		});
+		await result.ledgerWritesSettled;
+		const failure = result.results[0];
+		const checkpointFailure = loadCheckpoint(checkpointPath, tasksPath)
+			.results[0];
+		const terminalFailure = runStoreCalls.find(
+			(call) => call.state === "failed",
+		).lastFailure;
+		for (const value of [failure, checkpointFailure, terminalFailure]) {
+			strictEqual(value.diagnosticCode, "auth_expired");
+			strictEqual(value.diagnosticOrigin, "adapter");
+			strictEqual(value.diagnosticEvidenceAvailable, true);
+			strictEqual(value.resolvedTargetId, "agy-gemini");
+			strictEqual(value.descriptorHarness, "agy");
+			match(value.descriptorIdentity, /^sha256:[a-f0-9]{64}$/);
+		}
+		ok(!readFileSync(checkpointPath, "utf8").includes("SECRET_CANARY"));
+	});
 	it("runQueue terminal projection carries sanitized lastFailure and terminalizedBy on task failure", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 

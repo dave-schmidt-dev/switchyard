@@ -600,34 +600,77 @@ export const PERSISTED_SIGNALS = new Set([
 	"SIGQUIT",
 	"SIGTERM",
 ]);
-const CLI_USAGE_SIGNATURE =
-	/\b(?:unexpected argument|unrecognized (?:option|argument)|unknown (?:option|argument)|invalid value|usage:)\b/i;
+
+// A diagnostic is authoritative only when a reviewed host boundary minted it.
+// Provider/model/task output is evidence for people, never a routing authority.
+// In particular, `usage:` and `invalid value` are ordinary prose in prompts and
+// child-tool output, so they must not be promoted to CLI misuse by matching text.
+export const DIAGNOSTIC_ORIGINS = Object.freeze([
+	"adapter",
+	"launcher",
+	"worker_boot",
+	"integration",
+]);
+const DIAGNOSTIC_ORIGIN_SET = new Set(DIAGNOSTIC_ORIGINS);
+
+function trustedLauncherUsageDiagnostic({
+	diagnosticCode,
+	diagnosticOrigin,
+	diagnosticEvidenceAvailable,
+	failurePhase,
+}) {
+	return (
+		diagnosticCode === "cli_usage_error" &&
+		diagnosticOrigin === "launcher" &&
+		diagnosticEvidenceAvailable === true &&
+		failurePhase === "provider_execution"
+	);
+}
+
+const TRUSTED_ADAPTER_DIAGNOSTIC_CODES = new Set([
+	"auth_expired",
+	"quota_exhausted",
+	"model_unavailable",
+]);
 
 /** Convert provider execution evidence into a content-free diagnostic code. */
 export function classifyProviderDiagnostic({
-	errorKind,
-	text,
+	diagnosticCode,
+	diagnosticOrigin,
+	diagnosticEvidenceAvailable = false,
+	failurePhase = "provider_execution",
 	exitCode,
 	signal,
 	timedOut = false,
 	cancelled = false,
 } = {}) {
+	// `cli_usage_error` is intentionally the sole launcher-minted code. It
+	// cannot be inferred from text supplied by a provider or task.
+	if (
+		trustedLauncherUsageDiagnostic({
+			diagnosticCode,
+			diagnosticOrigin,
+			diagnosticEvidenceAvailable,
+			failurePhase,
+		})
+	) {
+		return "cli_usage_error";
+	}
+	if (
+		diagnosticOrigin !== "adapter" ||
+		diagnosticEvidenceAvailable !== true ||
+		failurePhase !== "provider_execution"
+	) {
+		return null;
+	}
 	if (cancelled) return "execution_cancelled";
 	if (timedOut) return "execution_timed_out";
-	if (
-		["auth_expired", "quota_exhausted", "model_unavailable"].includes(errorKind)
-	) {
-		return errorKind;
-	}
-	if (typeof text === "string" && CLI_USAGE_SIGNATURE.test(text)) {
-		return "cli_usage_error";
+	if (TRUSTED_ADAPTER_DIAGNOSTIC_CODES.has(diagnosticCode)) {
+		return diagnosticCode;
 	}
 	if (typeof signal === "string" && signal) return "provider_signalled";
 	if (Number.isSafeInteger(exitCode) && exitCode !== 0) {
 		return "provider_exit_nonzero";
-	}
-	if (typeof text === "string" && text.trim()) {
-		return "provider_output_unclassified";
 	}
 	return null;
 }
@@ -841,10 +884,15 @@ export function sanitizeFailureMetadata({
 	partialDiffPath,
 	gateEvidencePath,
 	diagnosticCode,
+	diagnosticOrigin,
+	diagnosticEvidenceAvailable,
 	exitCode,
 	signal,
 	failurePhase,
 	cleanupStage,
+	resolvedTargetId,
+	descriptorIdentity,
+	descriptorHarness,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -870,6 +918,28 @@ export function sanitizeFailureMetadata({
 	if (PERSISTED_SIGNALS.has(signal)) safe.signal = signal;
 	if (PERSISTED_FAILURE_PHASES.has(failurePhase)) {
 		safe.failurePhase = failurePhase;
+	}
+	if (DIAGNOSTIC_ORIGIN_SET.has(diagnosticOrigin)) {
+		safe.diagnosticOrigin = diagnosticOrigin;
+		safe.diagnosticEvidenceAvailable = diagnosticEvidenceAvailable === true;
+	}
+	// Route identity is additive, bounded provenance. It is deliberately
+	// independent from raw invocation arguments so it is safe in public state.
+	if (
+		typeof resolvedTargetId === "string" &&
+		resolvedTargetId.length > 0 &&
+		resolvedTargetId.length <= 256 &&
+		!/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(resolvedTargetId) &&
+		typeof descriptorIdentity === "string" &&
+		/^sha256:[a-f0-9]{64}$/.test(descriptorIdentity) &&
+		typeof descriptorHarness === "string" &&
+		descriptorHarness.length > 0 &&
+		descriptorHarness.length <= 128 &&
+		!/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(descriptorHarness)
+	) {
+		safe.resolvedTargetId = resolvedTargetId;
+		safe.descriptorIdentity = descriptorIdentity;
+		safe.descriptorHarness = descriptorHarness;
 	}
 	// The diff is the better evidence when one exists. The transcript is what
 	// an `empty_required_diff` rejection has instead of a diff, and naming it
@@ -906,6 +976,11 @@ export function isPersistentFailureMetadata(value) {
 		"exitCode",
 		"signal",
 		"failurePhase",
+		"diagnosticOrigin",
+		"diagnosticEvidenceAvailable",
+		"resolvedTargetId",
+		"descriptorIdentity",
+		"descriptorHarness",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
 	const expected = sanitizeFailureMetadata({
@@ -933,12 +1008,22 @@ export function isPersistentFailureMetadata(value) {
 		exitCode: value.exitCode,
 		signal: value.signal,
 		failurePhase: value.failurePhase,
+		diagnosticOrigin: value.diagnosticOrigin,
+		diagnosticEvidenceAvailable: value.diagnosticEvidenceAvailable,
+		resolvedTargetId: value.resolvedTargetId,
+		descriptorIdentity: value.descriptorIdentity,
+		descriptorHarness: value.descriptorHarness,
 	});
 	for (const field of [
 		"diagnosticCode",
 		"exitCode",
 		"signal",
 		"failurePhase",
+		"diagnosticOrigin",
+		"diagnosticEvidenceAvailable",
+		"resolvedTargetId",
+		"descriptorIdentity",
+		"descriptorHarness",
 	]) {
 		if (value[field] !== safeDiagnostics?.[field]) return false;
 	}

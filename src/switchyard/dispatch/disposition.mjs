@@ -70,23 +70,11 @@ const TARGET_FAILURE_KINDS = new Set([
 ]);
 const ADVANCE_FALLBACK_FAILURE_CODES = new Set([
 	"quota_exhausted",
-	"model_unavailable",
-	"execution_failed",
-	"cli_usage_error",
 	"provider_exit_nonzero",
 	"provider_signalled",
-	"provider_output_unclassified",
-	"execution_timed_out",
-	"execution_cancelled",
-	"provider_cleanup_failed",
-	"provider_cleanup_after_cleanup_started",
-	"provider_cleanup_after_pid_observed",
-	"provider_cleanup_after_tree_terminated",
-	"provider_cleanup_after_pid_marker_removed",
-	"provider_cleanup_after_index_lock_removed",
-	"diff_capture_failed",
 ]);
 const REPAIR_INPUT_FAILURE_CODES = new Set([
+	"cli_usage_error",
 	"declared_path_not_seeded",
 	"required_paths_missing",
 	"undeclared_paths_touched",
@@ -207,27 +195,6 @@ function hasRecoveryCommand(recoveryCommand) {
 	);
 }
 
-/**
- * Order dotted task ids by numeric segment rather than lexically.
- *
- * Task ids are `\d+(\.\d+)*`, so a plain string sort ranks "10.1" ahead of
- * "2.1" and names the wrong task as blocking on any queue past nine top-level
- * tasks. A missing segment sorts first, so "2" precedes "2.1".
- * @param {string} a
- * @param {string} b
- * @returns {number}
- */
-function compareTaskIds(a, b) {
-	const left = a.split(".");
-	const right = b.split(".");
-	const depth = Math.max(left.length, right.length);
-	for (let index = 0; index < depth; index += 1) {
-		const delta = Number(left[index] ?? -1) - Number(right[index] ?? -1);
-		if (delta !== 0) return delta;
-	}
-	return 0;
-}
-
 function isSafeTaskId(taskId) {
 	return (
 		typeof taskId === "string" &&
@@ -250,6 +217,19 @@ function hasExactDescriptorEvidence(entry) {
 	);
 }
 
+// A retained legacy result can remain readable, but its old labels did not
+// bind a code to the host boundary, evidence state, and exact route. It is
+// therefore evidence for inspection only, never fresh fallback authority.
+function hasAuthoritativeRoutingFailure(failure) {
+	return Boolean(
+		failure &&
+			failure.diagnosticEvidenceAvailable === true &&
+			["adapter", "launcher"].includes(failure.diagnosticOrigin) &&
+			failure.failurePhase === "provider_execution" &&
+			typeof failure.diagnosticCode === "string",
+	);
+}
+
 function isTargetFailure(entry, source) {
 	const isFailedEvidence =
 		source === "event"
@@ -265,44 +245,86 @@ function isTargetFailure(entry, source) {
 	);
 }
 
-function failedTargetEvidence(checkpoint, events) {
+function matchesFailureRoute(entry, failure) {
+	const routeFields = [
+		["resolvedTargetId", failure?.resolvedTargetId],
+		["descriptorIdentity", failure?.descriptorIdentity],
+		["descriptorHarness", failure?.descriptorHarness],
+	];
+	const supplied = routeFields.filter(([, value]) => value != null);
+	if (supplied.length === 0) return true;
+	return (
+		supplied.length === routeFields.length &&
+		supplied.every(([field, value]) => entry[field] === value)
+	);
+}
+
+function failedTargetEvidence(checkpoint, events, currentTaskId, failure) {
+	const completedTaskIds = new Set(
+		(checkpoint?.completedTaskIds ?? []).filter(isSafeTaskId),
+	);
 	const evidence = [];
 	for (const field of ["retryAttempts", "results"]) {
 		for (const entry of checkpoint?.[field] ?? []) {
 			if (
+				hasAuthoritativeRoutingFailure(entry) &&
 				hasExactDescriptorEvidence(entry) &&
 				isSafeTaskId(entry.taskId) &&
+				!completedTaskIds.has(entry.taskId) &&
 				isTargetFailure(entry, field)
 			) {
-				evidence.push({
-					targetId: entry.resolvedTargetId,
-					taskId: entry.taskId,
-				});
+				evidence.push(entry);
 			}
 		}
 	}
 	for (const entry of events ?? []) {
 		if (
+			hasAuthoritativeRoutingFailure(entry) &&
 			hasExactDescriptorEvidence(entry) &&
 			isSafeTaskId(entry.taskId) &&
+			!completedTaskIds.has(entry.taskId) &&
 			isTargetFailure(entry, "event")
 		) {
-			evidence.push({ targetId: entry.resolvedTargetId, taskId: entry.taskId });
+			evidence.push(entry);
 		}
 	}
-	const taskId =
-		evidence.map((entry) => entry.taskId).sort(compareTaskIds)[0] ?? null;
+	const taskIds = [...new Set(evidence.map((entry) => entry.taskId))];
+	const taskId = isSafeTaskId(currentTaskId)
+		? currentTaskId
+		: taskIds.length === 1
+			? taskIds[0]
+			: null;
+	const taskEvidence = evidence.filter((entry) => entry.taskId === taskId);
+	if (
+		completedTaskIds.has(taskId) ||
+		!taskEvidence.some((entry) => matchesFailureRoute(entry, failure))
+	) {
+		return { targetIds: [], truncated: false, taskId: null };
+	}
 	const targetIds = [
-		...new Set(
-			evidence
-				.filter((entry) => entry.taskId === taskId)
-				.map((entry) => entry.targetId),
-		),
+		...new Set(taskEvidence.map((entry) => entry.resolvedTargetId)),
 	].sort();
 	return {
 		targetIds: targetIds.slice(0, 16),
 		truncated: targetIds.length > 16,
 		taskId,
+	};
+}
+
+function currentFailureTaskContext(run, checkpoint, failure) {
+	const supplied = [
+		run?.currentTaskId,
+		run?.activeTaskId,
+		checkpoint?.lastTaskId,
+		failure?.taskId,
+	].filter((taskId) => taskId != null);
+	if (supplied.some((taskId) => !isSafeTaskId(taskId))) {
+		return { ambiguous: true, taskId: null };
+	}
+	const taskIds = [...new Set(supplied)];
+	return {
+		ambiguous: taskIds.length > 1,
+		taskId: taskIds.length === 1 ? taskIds[0] : null,
 	};
 }
 
@@ -383,7 +405,22 @@ export function projectDisposition({
 		if (!optionalEvidenceValid || !failure) {
 			return baseDisposition("stop", "insufficient_evidence", failure);
 		}
-		const failedTargets = failedTargetEvidence(checkpoint, events);
+		if (
+			TARGET_FAILURE_KINDS.has(failure.errorKind) &&
+			!hasAuthoritativeRoutingFailure(failure)
+		) {
+			return baseDisposition("stop", "insufficient_evidence", failure);
+		}
+		const taskContext = currentFailureTaskContext(run, checkpoint, failure);
+		if (taskContext.ambiguous) {
+			return baseDisposition("stop", "insufficient_evidence", failure);
+		}
+		const failedTargets = failedTargetEvidence(
+			checkpoint,
+			events,
+			taskContext.taskId,
+			failure,
+		);
 		if (
 			TARGET_FAILURE_KINDS.has(failure.errorKind) &&
 			failedTargets.targetIds.length

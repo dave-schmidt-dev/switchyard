@@ -116,6 +116,13 @@ export async function executeBrokerRoute(options) {
 	let terminalCompleted = false;
 	let terminalEvidence;
 	let launcherResult = null;
+	const descriptorIdentity =
+		typeof options.invocationDescriptor?.descriptor_identity === "string" &&
+		/^sha256:[a-f0-9]{64}$/.test(
+			options.invocationDescriptor.descriptor_identity,
+		)
+			? options.invocationDescriptor.descriptor_identity
+			: null;
 	const reconcileOnce = async (outcome, actualConsumption) => {
 		if (terminalOutcome !== null) {
 			throw new Error("broker route already reconciled");
@@ -241,6 +248,11 @@ export async function executeBrokerRoute(options) {
 			failurePhase:
 				launcherResult?.failurePhase ??
 				(!terminalCompleted ? "terminal_reconciliation" : "provider_execution"),
+			diagnosticOrigin: launcherResult?.diagnosticOrigin,
+			diagnosticEvidenceAvailable: launcherResult?.diagnosticEvidenceAvailable,
+			resolvedTargetId: route.resolvedTarget,
+			descriptorIdentity,
+			descriptorHarness: route.harness,
 		});
 		emit(
 			options.onStatus,
@@ -276,6 +288,12 @@ export async function executeBrokerRoute(options) {
 			exitCode: failure?.exitCode ?? null,
 			signal: failure?.signal ?? null,
 			failurePhase: failure?.failurePhase ?? null,
+			diagnosticOrigin: failure?.diagnosticOrigin ?? null,
+			diagnosticEvidenceAvailable:
+				failure?.diagnosticEvidenceAvailable ?? false,
+			resolvedTargetId: failure?.resolvedTargetId ?? null,
+			descriptorIdentity: failure?.descriptorIdentity ?? null,
+			descriptorHarness: failure?.descriptorHarness ?? null,
 			servedModelVerified:
 				typeof launcherResult?.servedModelVerified === "boolean"
 					? launcherResult.servedModelVerified

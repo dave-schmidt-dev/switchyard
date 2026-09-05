@@ -560,6 +560,33 @@ describe("event ordering", () => {
 			ok(!JSON.stringify(run.lastFailure).includes("/"));
 		}
 	});
+
+	it("round-trips bounded diagnostic provenance without raw text", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await createEvent(opts.runId, {
+			phase: "execution",
+			event: "task_failed",
+			status: "Task task-1 failed",
+			taskId: "task-1",
+			result: "execution_failed",
+			errorKind: "execution_failed",
+			diagnosticCode: "provider_exit_nonzero",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
+			exitCode: 255,
+			failurePhase: "provider_execution",
+			reason: "SECRET_CANARY usage: does not persist",
+		});
+		const [event] = await readEvents(opts.runId);
+		strictEqual(event.diagnosticOrigin, "adapter");
+		strictEqual(event.diagnosticEvidenceAvailable, true);
+		strictEqual(event.exitCode, 255);
+		ok(!JSON.stringify(event).includes("SECRET_CANARY"));
+		const stored = await readRun(opts.runId);
+		strictEqual(stored.lastFailure.diagnosticOrigin, "adapter");
+		strictEqual(stored.lastFailure.diagnosticEvidenceAvailable, true);
+	});
 });
 
 describe("corruption", () => {

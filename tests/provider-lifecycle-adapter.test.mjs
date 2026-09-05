@@ -482,4 +482,72 @@ describe("provider process lifecycle", () => {
 		strictEqual(stdinEndArgs.length, 1);
 		deepStrictEqual(stdinEndArgs[0], [""]);
 	});
+
+	it("mints CLI misuse only from an explicit launcher diagnostic", async () => {
+		const invoke = async (options = {}) => {
+			const child = fakeChild();
+			const promise = executeProviderInvocation("fake", [], {
+				spawnFn: () => child,
+				...options,
+			});
+			child.stdout.emit("data", "task prose: usage: helper --example\n");
+			child.emit("close", options.exitCode ?? 255, null);
+			return promise;
+		};
+
+		const observedExit = await invoke({ exitCode: 255 });
+		strictEqual(observedExit.diagnosticCode, "provider_exit_nonzero");
+		strictEqual(observedExit.diagnosticOrigin, "adapter");
+		strictEqual(observedExit.diagnosticEvidenceAvailable, true);
+
+		const launcherUsage = await invoke({
+			exitCode: 2,
+			launcherDiagnosticCode: "cli_usage_error",
+		});
+		strictEqual(launcherUsage.diagnosticCode, "cli_usage_error");
+		strictEqual(launcherUsage.diagnosticOrigin, "launcher");
+		strictEqual(launcherUsage.diagnosticEvidenceAvailable, true);
+	});
+
+	it("keeps text-derived auth and quota labels informational", async () => {
+		for (const [provider, output, expectedKind] of [
+			[
+				"codex",
+				"Test expectation: authentication failed should be displayed",
+				"auth_expired",
+			],
+			[
+				"agy",
+				"Task fixture: Individual quota reached after the child exits",
+				"quota_exhausted",
+			],
+		]) {
+			const child = fakeChild();
+			const promise = executeProviderInvocation("fake", [], {
+				provider,
+				spawnFn: () => child,
+			});
+			child.stdout.emit("data", output);
+			child.emit("close", 1, null);
+			const result = await promise;
+			strictEqual(result.errorKind, expectedKind);
+			strictEqual(result.diagnosticCode, "provider_exit_nonzero");
+			strictEqual(result.diagnosticOrigin, "adapter");
+			strictEqual(result.diagnosticEvidenceAvailable, true);
+		}
+	});
+
+	it("accepts a closed provider diagnostic only through the explicit adapter seam", async () => {
+		const child = fakeChild();
+		const promise = executeProviderInvocation("fake", [], {
+			provider: "agy",
+			adapterDiagnosticCode: "quota_exhausted",
+			spawnFn: () => child,
+		});
+		child.emit("close", 1, null);
+		const result = await promise;
+		strictEqual(result.diagnosticCode, "quota_exhausted");
+		strictEqual(result.diagnosticOrigin, "adapter");
+		strictEqual(result.diagnosticEvidenceAvailable, true);
+	});
 });
