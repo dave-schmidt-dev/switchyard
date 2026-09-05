@@ -1,35 +1,23 @@
-// Standalone-reaper ops contract tests.
-//
-// Verifies the launchd reaper artifacts (ops/switchyard-reaper.sh, the plist
-// template, install/uninstall scripts) are present, syntactically valid, render
-// a well-formed plist, and — critically — that the reaper's hardcoded VM-name
-// prefix stays in sync with the source of truth in
-// parallels-execution-backend.mjs. The reaper duplicates that prefix by
-// necessity (it is a standalone shell script that reads no project code so it
-// can run TCC-free from ~/Library); this parity test is what stops a rename
-// there from silently disabling reaping.
-//
-// Deliberately does NOT run the reaper against the live daemon: that path reaps
-// by PID liveness and could remove a sibling test file's fixtures under Node's
-// parallel test-file execution. The reap logic itself is exercised by the
-// recover suites.
+// Standalone launchd reaper contract tests. The copied script must be able to
+// inventory managed VM names without project access, while making no resource
+// changes from hourly execution.
 
 import { ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import {
 	accessSync,
+	chmodSync,
 	constants,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { PARALLELS_LINKED_SNAPSHOT_NAME } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -39,308 +27,359 @@ const BACKEND = resolve(
 	PKG_ROOT,
 	"src/switchyard/lifecycle/parallels-execution-backend.mjs",
 );
-
 const REAPER = resolve(OPS, "switchyard-reaper.sh");
 const SCRIPTS = [REAPER].concat(
 	["install-reaper.sh", "uninstall-reaper.sh"].map((f) => resolve(OPS, f)),
 );
 const TEMPLATE = resolve(OPS, "com.zerodelta.switchyard.reaper.plist.template");
+const HAS_TRUSTED_GNU_TIMEOUT = [
+	"/opt/homebrew/bin/gtimeout",
+	"/opt/homebrew/bin/timeout",
+	"/usr/local/bin/gtimeout",
+	"/usr/local/bin/timeout",
+].some((candidate) => {
+	const result = spawnSync(candidate, ["--version"], { encoding: "utf8" });
+	return (
+		result.status === 0 && result.stdout.startsWith("timeout (GNU coreutils) ")
+	);
+});
 
 describe("standalone reaper ops artifacts", () => {
 	it("ships all reaper scripts, executable", () => {
-		for (const s of SCRIPTS) {
-			ok(existsSync(s), `missing: ${s}`);
-			accessSync(s, constants.X_OK);
+		for (const script of SCRIPTS) {
+			ok(existsSync(script), `missing: ${script}`);
+			accessSync(script, constants.X_OK);
 		}
 	});
 
 	it("every reaper script passes `sh -n` syntax validation", () => {
-		for (const s of SCRIPTS) {
-			const r = spawnSync("sh", ["-n", s], { encoding: "utf8" });
-			strictEqual(r.status, 0, `sh -n failed for ${s}: ${r.stderr}`);
+		for (const script of SCRIPTS) {
+			const result = spawnSync("sh", ["-n", script], { encoding: "utf8" });
+			strictEqual(
+				result.status,
+				0,
+				`sh -n failed for ${script}: ${result.stderr}`,
+			);
 		}
 	});
 
-	it("the reaper reads managed VM names only — never invokes node/project code", () => {
+	it("is reporting-only and has no project or background metadata authority", () => {
 		const body = readFileSync(REAPER, "utf8");
-		// The load-bearing TCC guarantee: with no node invocation the reaper
-		// physically cannot execute project .mjs, so it needs nothing from the
-		// ~/Documents-protected tree at runtime. (Prose comments may still name
-		// the source file / ~/Documents to explain the design — that's why we
-		// assert on the *absence of an interpreter*, not on path mentions.)
 		ok(!/\bnode\b/.test(body), "reaper must not invoke node");
 		ok(!/\bpython3?\b/.test(body), "reaper must not invoke python");
-		// It must actually do the name-based reap. Invocations go through
-		// $PRLCTL, which defaults to `prlctl` and is overridable so the
-		// end-to-end tests below can stub it instead of reaching the daemon.
+		ok(/"\$PRLCTL" list\s+-a/.test(body), "reaper must inventory managed VMs");
 		ok(
-			/PRLCTL="\$\{SWITCHYARD_REAPER_PRLCTL:-prlctl\}"/.test(body),
-			"reaper must default its prlctl binary to prlctl",
+			!/"\$PRLCTL"\s+(?:stop|delete)\b/.test(body),
+			"hourly reaper must not stop or delete VMs",
 		);
-		ok(/"\$PRLCTL" list\s+-a/.test(body), "reaper must list managed VMs");
-		ok(/kill -0/.test(body), "reaper must probe owner liveness via kill -0");
-		ok(/"\$PRLCTL" delete/.test(body), "reaper must force-remove dead VMs");
+		ok(
+			!/kill -0 "\$creator_pid"/.test(body),
+			"hourly reaper must not treat creator PID liveness as ownership",
+		);
+		ok(
+			!/inventory_pid|watchdog_pid/.test(body),
+			"reaper must not supervise by PID",
+		);
+		ok(body.includes("/opt/homebrew/bin/gtimeout"));
+		ok(body.includes('"$TIMEOUT_BIN" --signal=TERM --kill-after=1s 3s'));
+		ok(
+			!/"\$TIMEOUT_BIN"[^\n]*--foreground/.test(body),
+			"supervisor invocation must use default process-group mode",
+		);
+		ok(
+			!body.includes("linked-snapshots"),
+			"hourly reaper must not read background snapshot metadata",
+		);
 	});
 
-	it("reaper VM-name prefix stays in sync with parallels-execution-backend.mjs (parity guard)", () => {
+	it("keeps its managed VM-name prefix in sync with the lifecycle backend", () => {
 		const reaper = readFileSync(REAPER, "utf8");
 		const backend = readFileSync(BACKEND, "utf8");
-
-		const srcPrefix = /PARALLELS_WORKING_PREFIX\s*=\s*"([^"]+)"/.exec(
+		const sourcePrefix = /PARALLELS_WORKING_PREFIX\s*=\s*"([^"]+)"/.exec(
 			backend,
 		)?.[1];
-		ok(srcPrefix, "could not read PARALLELS_WORKING_PREFIX from backend");
-
 		const reaperPrefix = /WORKING_PREFIX="([^"]+)"/.exec(reaper)?.[1];
+		ok(sourcePrefix, "could not read PARALLELS_WORKING_PREFIX from backend");
 		ok(reaperPrefix, "could not read WORKING_PREFIX from reaper");
-
-		strictEqual(
-			reaperPrefix,
-			srcPrefix,
-			"reaper WORKING_PREFIX drifted from backend PARALLELS_WORKING_PREFIX",
-		);
+		strictEqual(reaperPrefix, sourcePrefix);
 	});
 
 	it("plist template renders to a valid, placeholder-free plist", () => {
 		const template = readFileSync(TEMPLATE, "utf8");
-		for (const ph of ["__REAPER_SH__", "__REAPER_OUT__", "__REAPER_ERR__"]) {
-			ok(template.includes(ph), `template must contain ${ph}`);
+		for (const placeholder of [
+			"__REAPER_SH__",
+			"__REAPER_OUT__",
+			"__REAPER_ERR__",
+		]) {
+			ok(
+				template.includes(placeholder),
+				`template must contain ${placeholder}`,
+			);
 		}
 		const rendered = template
 			.replaceAll("__REAPER_SH__", "/tmp/switchyard-reaper.sh")
 			.replaceAll("__REAPER_OUT__", "/tmp/out.log")
 			.replaceAll("__REAPER_ERR__", "/tmp/err.log");
-		ok(!/__[A-Z_]+__/.test(rendered), "rendered plist still has a placeholder");
-
 		const lint = spawnSync("plutil", ["-lint", "-"], {
 			input: rendered,
 			encoding: "utf8",
 		});
-		if (lint.error) return; // plutil unavailable (non-macOS) — skip lint.
+		if (lint.error) return;
 		strictEqual(lint.status, 0, `plutil -lint failed: ${lint.stdout}`);
 	});
 
-	it("install/uninstall target the same label and are idempotent", () => {
-		const label = "com.zerodelta.switchyard.reaper";
-		for (const f of ["install-reaper.sh", "uninstall-reaper.sh"]) {
-			const body = readFileSync(resolve(OPS, f), "utf8");
-			ok(body.includes(label), `${f} must reference ${label}`);
-			ok(
-				body.includes('bootout "$DOMAIN/$LABEL"'),
-				`${f} must bootout before (re)install/remove (idempotent)`,
-			);
-		}
-		ok(readFileSync(TEMPLATE, "utf8").includes(label));
+	it("installer documents copied reporting-only operation", () => {
+		const installer = readFileSync(resolve(OPS, "install-reaper.sh"), "utf8");
+		ok(installer.includes("reports at load + every 3600s"));
+		ok(installer.includes("never reclaims resources"));
+		ok(installer.includes("GNU timeout required"));
 	});
 });
 
-describe("reaper snapshot reporting", () => {
-	const GOLDEN = "switchyard-golden-test";
-	const ORPHAN = "{9f6e0d53-5e8c-4b99-916d-327f334f0899}";
-	const RECORDED = "{aaaaaaaa-0000-4000-8000-000000000000}";
-	// Predates the sidecar convention; the reaper must never name it.
-	const FOREIGN = "{51f4e833-0daa-4088-8325-3cfa0c62290a}";
-
-	// The real shape, captured from prlctl 26.4.1 on 2026-08-26. Parsing a
-	// hand-simplified fixture would prove nothing about the live output.
-	function snapshotListJson() {
-		return `{
-	"${FOREIGN}": {
-	"name": "switchyard-golden-26-5",
-	"date": "2026-08-13 16:22:24",
-	"state": "poweroff",
-	"current": false,
-	"parent": ""
-}
-,
-	"${ORPHAN}": {
-	"name": "Snapshot for linked clone",
-	"date": "2026-08-13 16:25:41",
-	"state": "poweroff",
-	"current": true,
-	"parent": "${FOREIGN}"
-}
-,
-	"${RECORDED}": {
-	"name": "Snapshot for linked clone",
-	"date": "2026-08-20 10:00:00",
-	"state": "poweroff",
-	"current": false,
-	"parent": "${FOREIGN}"
-}
-
-}
-`;
-	}
-
-	/**
-	 * Run the reaper with a stubbed `prlctl` and a scratch HOME. No live daemon
-	 * is contacted, so this cannot touch a sibling suite's fixtures.
-	 */
-	function runReaper({ sidecars = [] } = {}) {
+describe("copied launchd reaper", () => {
+	function runInstalledReaper({
+		behavior = "success",
+		installCli = true,
+		supervisorMode,
+	} = {}) {
 		const root = tempDir("switchyard-reaper-");
-		const binDir = join(root, "bin");
 		const home = join(root, "home");
-		const sidecarDir = join(
+		const installDir = join(
 			home,
-			".switchyard",
-			"admission",
-			"linked-snapshots",
+			"Library",
+			"Application Support",
+			"switchyard",
 		);
-		mkdirSync(binDir, { recursive: true });
+		const deniedProject = join(root, "project-denied");
+		const binDir = join(root, "bin");
+		const installed = join(installDir, "switchyard-reaper.sh");
+		const callsPath = join(root, "prlctl-calls.log");
+		mkdirSync(installDir, { recursive: true });
 		mkdirSync(join(home, "Library", "Logs"), { recursive: true });
-		mkdirSync(sidecarDir, { recursive: true });
-		for (const [index, record] of sidecars.entries()) {
-			writeFileSync(
-				join(sidecarDir, `clone-${index}.json`),
-				JSON.stringify(record),
-				"utf8",
-			);
-		}
-
-		const callLog = join(root, "prlctl-calls.log");
-		writeFileSync(
-			join(binDir, "prlctl"),
-			`#!/bin/sh
-printf '%s\\n' "$*" >>'${callLog}'
+		mkdirSync(binDir, { recursive: true });
+		mkdirSync(deniedProject);
+		copyFileSync(REAPER, installed);
+		chmodSync(installed, 0o755);
+		const prlctl = join(binDir, "prlctl");
+		if (installCli) {
+			const body =
+				behavior === "hung"
+					? `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
+trap '' TERM
+while :; do :; done
+`
+					: behavior === "slow"
+						? `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
+while :; do :; done
+`
+						: behavior === "failed"
+							? `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
+exit 7
+`
+							: behavior === "many"
+								? `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
+printf '%s\\n' 'UUID STATUS NAME'
+i=0
+while [ "$i" -lt 300 ]; do
+	printf 'id-%s running switchyard-work-run-%s-999999\\n' "$i" "$i"
+	i=$((i + 1))
+done
+`
+								: behavior === "large"
+									? `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
+exec /bin/dd if=/dev/zero bs=1048576 count=4 2>/dev/null
+`
+									: behavior === "medium"
+										? `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
+printf '%s\\n' 'UUID STATUS NAME'
+printf '%s' 'padding running '
+/bin/dd if=/dev/zero bs=1024 count=600 2>/dev/null | /usr/bin/tr '\\000' x
+printf '\\n%s\\n' 'kept running switchyard-work-medium-999999'
+`
+										: `#!/bin/sh
+printf '%s\\n' "$*" >>'${callsPath}'
 case "$1" in
-	list) printf 'UUID STATUS NAME\\n' ;;
-	snapshot-list) cat <<'SNAPJSON'
-${snapshotListJson()}
-SNAPJSON
+	list)
+		printf '%s\\n' 'UUID STATUS NAME'
+		printf '%s\\n' 'dead-owner running switchyard-work-run-dead-999999'
+		printf '%s\\n' 'missing-metadata stopped switchyard-work-run-missing-999998'
+		printf '%s\\n' 'foreign running unrelated-vm'
 		;;
 esac
-exit 0
-`,
-			{ mode: 0o755 },
-		);
-
-		const result = spawnSync("sh", [REAPER], {
+`;
+			writeFileSync(prlctl, body, { mode: 0o755 });
+		}
+		chmodSync(deniedProject, 0o000);
+		const startedAt = Date.now();
+		const env = {
+			HOME: home,
+			PATH: "/launchd-minimal",
+			PWD: deniedProject,
+			TMPDIR: root,
+			SWITCHYARD_REAPER_PRLCTL: prlctl,
+			SWITCHYARD_RUN_STORE_ROOT: deniedProject,
+		};
+		if (supervisorMode) {
+			env.SWITCHYARD_REAPER_TESTING = "1";
+			env.SWITCHYARD_REAPER_TEST_SUPERVISOR = supervisorMode;
+		}
+		const result = spawnSync("/bin/sh", [installed], {
 			encoding: "utf8",
-			env: {
-				...process.env,
-				HOME: home,
-				// Explicit binary, not a PATH prepend: the reaper replaces PATH
-				// outright, so a prepended stub dir would be dropped and this
-				// test would reach the live daemon.
-				SWITCHYARD_REAPER_PRLCTL: join(binDir, "prlctl"),
-				SWITCHYARD_PARALLELS_GOLDEN_IMAGE: GOLDEN,
-			},
+			timeout: 8_000,
+			env,
 		});
+		chmodSync(deniedProject, 0o755);
 		const log = readFileSync(
 			join(home, "Library", "Logs", "switchyard-reaper.log"),
 			"utf8",
 		);
-		const calls = existsSync(callLog) ? readFileSync(callLog, "utf8") : "";
-		return { result, log, calls, root };
+		const calls = existsSync(callsPath) ? readFileSync(callsPath, "utf8") : "";
+		return { calls, elapsedMs: Date.now() - startedAt, log, result, root };
 	}
 
-	it("reports a matching snapshot that no sidecar accounts for", () => {
-		const { result, log, root } = runReaper({
-			sidecars: [{ goldenImage: GOLDEN, snapshotIds: [RECORDED] }],
+	function assertOnlyInventoryCalls(calls, expectedCount = 1) {
+		const lines = calls.trim() === "" ? [] : calls.trimEnd().split("\n");
+		strictEqual(lines.length, expectedCount, calls);
+		for (const line of lines) strictEqual(line, "list -a -o uuid,status,name");
+	}
+
+	it("reports candidates but never changes resources under a minimal launchd PATH", {
+		skip: !HAS_TRUSTED_GNU_TIMEOUT && "trusted GNU timeout unavailable",
+	}, () => {
+		const { calls, log, result, root } = runInstalledReaper();
+		try {
+			strictEqual(result.status, 0, result.stderr);
+			assertOnlyInventoryCalls(calls);
+			strictEqual(
+				(log.match(/ownership unverified; no resource changed/g) ?? []).length,
+				2,
+				`expected two candidate diagnostics, log was:\n${log}`,
+			);
+			ok(log.includes("managed VM inventory started"));
+			ok(log.includes("managed VM inventory complete (candidates=2"));
+			ok(
+				!log.includes("dead-owner"),
+				"diagnostics must not retain VM contents",
+			);
+			ok(!log.includes("switchyard-work-run-dead"));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts inventory above 512 KiB and below the one-MiB output cap", {
+		skip: !HAS_TRUSTED_GNU_TIMEOUT && "trusted GNU timeout unavailable",
+	}, () => {
+		const { calls, log, result, root } = runInstalledReaper({
+			behavior: "medium",
 		});
-		strictEqual(result.status, 0, result.stderr);
-		ok(
-			log.includes(`UNRECORDED snapshot ${ORPHAN}`),
-			`orphan must be reported, log was:\n${log}`,
-		);
-		ok(
-			log.includes("unrecorded=1"),
-			`exactly one unrecorded snapshot expected, log was:\n${log}`,
-		);
-		ok(
-			!log.includes(RECORDED),
-			"a snapshot a sidecar names must not be reported",
-		);
-		ok(
-			!log.includes(FOREIGN),
-			"a snapshot that is not a linked-clone parent must not be reported",
-		);
-		rmSync(root, { recursive: true, force: true });
+		try {
+			strictEqual(result.status, 0, result.stderr);
+			assertOnlyInventoryCalls(calls);
+			ok(log.includes("managed VM inventory complete (candidates=1"), log);
+			ok(!log.includes("inventory truncated"), log);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
-	it("never deletes a snapshot it reports", () => {
-		// The residue case is unreclaimable by design: code must not delete a
-		// snapshot it did not record. Reporting is the entire remedy.
-		const { calls, log, root } = runReaper();
-		ok(log.includes(`UNRECORDED snapshot ${ORPHAN}`));
-		ok(
-			!/snapshot-delete/.test(calls),
-			`no snapshot may be deleted, prlctl saw:\n${calls}`,
-		);
-		rmSync(root, { recursive: true, force: true });
-	});
-
-	it("says the check was skipped rather than reporting a clean result it never ran", () => {
-		const root = tempDir("switchyard-reaper-");
-		const binDir = join(root, "bin");
-		const home = join(root, "home");
-		mkdirSync(binDir, { recursive: true });
-		mkdirSync(join(home, "Library", "Logs"), { recursive: true });
-		writeFileSync(
-			join(binDir, "prlctl"),
-			"#!/bin/sh\ncase \"$1\" in list) printf 'UUID STATUS NAME\\n' ;; esac\nexit 0\n",
-			{ mode: 0o755 },
-		);
-		const result = spawnSync("sh", [REAPER], {
-			encoding: "utf8",
-			env: {
-				...process.env,
-				HOME: home,
-				SWITCHYARD_REAPER_PRLCTL: join(binDir, "prlctl"),
-				SWITCHYARD_PARALLELS_GOLDEN_IMAGE: "",
-			},
+	for (const fixture of [
+		{
+			name: "reports status 124 when inventory ends on the deadline TERM",
+			options: { behavior: "slow" },
+			expected: "managed VM inventory timed out",
+			maxElapsedMs: 6_000,
+			noCandidates: true,
+			expectedCalls: 1,
+		},
+		{
+			name: "kills and reaps a TERM-ignoring inventory within its absolute budget",
+			options: { behavior: "hung" },
+			expected: "inventory supervision terminated",
+			maxElapsedMs: 7_000,
+			noCandidates: true,
+			expectedCalls: 1,
+		},
+		{
+			name: "reports failed inventory without claiming completion",
+			options: { behavior: "failed" },
+			expected: "managed VM inventory unavailable",
+			maxElapsedMs: 3_000,
+			noCandidates: true,
+			expectedCalls: 1,
+		},
+		{
+			name: "reports a missing CLI without claiming completion",
+			options: { installCli: false },
+			expected: "prlctl not found on PATH",
+			maxElapsedMs: 3_000,
+			noCandidates: true,
+			expectedCalls: 0,
+		},
+		{
+			name: "reports bounded row truncation without claiming completion",
+			options: { behavior: "many" },
+			expected: "managed VM inventory truncated (row limit=256",
+			maxElapsedMs: 5_000,
+			noCandidates: false,
+			expectedCalls: 1,
+		},
+		{
+			name: "reports output-limit truncation without parsing partial content",
+			options: { behavior: "large" },
+			expected: "managed VM inventory truncated (output limit reached",
+			maxElapsedMs: 3_000,
+			noCandidates: true,
+			expectedCalls: 1,
+		},
+		{
+			name: "fails closed before inventory when the GNU supervisor is missing",
+			options: { supervisorMode: "missing" },
+			expected: "GNU timeout supervisor unavailable",
+			maxElapsedMs: 3_000,
+			noCandidates: true,
+			expectedCalls: 0,
+			requiresGnu: false,
+		},
+		{
+			name: "fails closed before inventory when the supervisor is not GNU timeout",
+			options: { supervisorMode: "wrong" },
+			expected: "GNU timeout supervisor unavailable",
+			maxElapsedMs: 3_000,
+			noCandidates: true,
+			expectedCalls: 0,
+			requiresGnu: false,
+		},
+	]) {
+		it(fixture.name, {
+			skip:
+				fixture.requiresGnu !== false &&
+				!HAS_TRUSTED_GNU_TIMEOUT &&
+				"trusted GNU timeout unavailable",
+		}, () => {
+			const { calls, elapsedMs, log, result, root } = runInstalledReaper(
+				fixture.options,
+			);
+			try {
+				strictEqual(result.status, 0, result.stderr);
+				ok(
+					elapsedMs < fixture.maxElapsedMs,
+					`reaper exceeded its test budget: ${elapsedMs}ms`,
+				);
+				ok(log.includes(fixture.expected), log);
+				ok(!log.includes("inventory complete"), log);
+				if (fixture.noCandidates)
+					ok(!log.includes("ownership unverified"), log);
+				assertOnlyInventoryCalls(calls, fixture.expectedCalls);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
 		});
-		strictEqual(result.status, 0, result.stderr);
-		const log = readFileSync(
-			join(home, "Library", "Logs", "switchyard-reaper.log"),
-			"utf8",
-		);
-		ok(
-			log.includes("snapshot check skipped"),
-			`an unchecked run must say so, log was:\n${log}`,
-		);
-		ok(!log.includes("unrecorded="), "no count may be reported for no check");
-		rmSync(root, { recursive: true, force: true });
-	});
-
-	it("linked-clone snapshot name stays in sync with the backend (parity guard)", () => {
-		const reaper = readFileSync(REAPER, "utf8");
-		const reaperName = /LINKED_SNAPSHOT_NAME="([^"]+)"/.exec(reaper)?.[1];
-		ok(reaperName, "could not read LINKED_SNAPSHOT_NAME from reaper");
-		// Compared against the imported constant, not a regex over the backend's
-		// source: the reaper is the side that must duplicate the literal, so the
-		// backend stays the single definition rather than a second string to
-		// keep in step.
-		strictEqual(
-			reaperName,
-			PARALLELS_LINKED_SNAPSHOT_NAME,
-			"reaper LINKED_SNAPSHOT_NAME drifted from the backend constant",
-		);
-		ok(
-			reaper.includes(
-				`LINKED_SNAPSHOT_NAME="${PARALLELS_LINKED_SNAPSHOT_NAME}"`,
-			),
-			"the reaper must carry the literal verbatim",
-		);
-	});
-
-	it("sidecar directory stays in sync with the backend (parity guard)", () => {
-		const backend = readFileSync(BACKEND, "utf8");
-		const reaper = readFileSync(REAPER, "utf8");
-		ok(
-			/join\(this\.snapshotSidecarRoot,\s*"linked-snapshots"\)/.test(backend),
-			"backend no longer builds its sidecar dir as <root>/linked-snapshots",
-		);
-		const reaperDir = /SIDECAR_DIR="([^"]+)"/.exec(reaper)?.[1];
-		ok(reaperDir, "could not read SIDECAR_DIR from reaper");
-		ok(
-			reaperDir.endsWith("/linked-snapshots"),
-			`reaper SIDECAR_DIR drifted from the backend layout: ${reaperDir}`,
-		);
-		ok(
-			reaperDir.includes(".switchyard/admission"),
-			`reaper SIDECAR_DIR must sit under the VM admission root: ${reaperDir}`,
-		);
-	});
+	}
 });
