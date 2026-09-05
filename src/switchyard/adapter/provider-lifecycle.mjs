@@ -39,7 +39,14 @@ const DEFAULT_DIAGNOSTIC_CHARS = 800;
  */
 export function getWorkspaceExecution(
 	workspaceId,
-	{ executionBackend, cwd = "/project", argv, recordPid = true, env } = {},
+	{
+		executionBackend,
+		cwd = "/project",
+		argv,
+		recordPid = true,
+		env,
+		cleanupContext,
+	} = {},
 ) {
 	if (!executionBackend) {
 		throw new TypeError(
@@ -51,8 +58,20 @@ export function getWorkspaceExecution(
 		argv,
 		recordPid,
 		env,
+		...(cleanupContext ? { cleanupContext } : {}),
 	});
 	return { command: execution.command, args: [...execution.args] };
+}
+
+function markerContext(cleanupContext, operation) {
+	if (!cleanupContext || typeof cleanupContext !== "object")
+		return cleanupContext;
+	return typeof cleanupContext.runId === "string" &&
+		typeof cleanupContext.taskId === "string" &&
+		typeof cleanupContext.attemptId === "string" &&
+		typeof cleanupContext.descriptorIdentity === "string"
+		? { ...cleanupContext, operation }
+		: cleanupContext;
 }
 
 function appendBounded(current, chunk, maxBuffer) {
@@ -308,7 +327,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 					args,
 					{
 						onStatus,
-						...(cleanupContext ?? {}),
+						...markerContext(cleanupContext, "provider"),
 					},
 				);
 				backendHandled = true;
@@ -501,7 +520,7 @@ export async function captureProviderDiffDetailedAsync(
 				await executionBackend.cleanupProviderProcess(command, args, {
 					onStatus,
 					workspaceId: workingContainerName,
-					...(cleanupContext ?? {}),
+					...markerContext(cleanupContext, "helper"),
 				});
 				backendHandled = true;
 			} catch (error) {
@@ -520,6 +539,7 @@ export async function captureProviderDiffDetailedAsync(
 	try {
 		stage = getWorkspaceExecution(workingContainerName, {
 			...options,
+			cleanupContext: markerContext(cleanupContext, "helper"),
 			recordPid: true,
 			argv: ["git", "add", "-A"],
 		});
@@ -570,6 +590,7 @@ export async function captureProviderDiffDetailedAsync(
 	try {
 		capture = getWorkspaceExecution(workingContainerName, {
 			...options,
+			cleanupContext: markerContext(cleanupContext, "helper"),
 			recordPid: true,
 			argv: ["git", "diff", "--cached", taskBase.tree],
 		});
@@ -644,6 +665,7 @@ export function captureProviderDiffDetailed(
 		emitCaptureStatus("diff_capture_probe_started", "diff_stage");
 		stage = getWorkspaceExecution(workingContainerName, {
 			...options,
+			cleanupContext: markerContext(options.cleanupContext, "helper"),
 			recordPid: true,
 			argv: ["git", "add", "-A"],
 		});
@@ -684,6 +706,7 @@ export function captureProviderDiffDetailed(
 		emitCaptureStatus("diff_capture_probe_started", "diff_export");
 		const capture = getWorkspaceExecution(workingContainerName, {
 			...options,
+			cleanupContext: markerContext(options.cleanupContext, "helper"),
 			recordPid: true,
 			argv: ["git", "diff", "--cached", options.taskBase.tree],
 		});

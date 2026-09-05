@@ -2982,6 +2982,105 @@ function taskBaseMatches(actual, expected) {
  * @param {{id: string, title: string, description: string}} task
  * @param {object} context
  */
+function executionCleanupContext(
+	context,
+	task,
+	descriptorIdentity,
+	attemptId = null,
+) {
+	return Object.freeze({
+		runId: context.runId,
+		taskId: String(task.id),
+		attemptId: attemptId ?? context.attemptId ?? "attempt-1",
+		descriptorIdentity,
+		workspaceId: context.workingContainerName,
+		processStartIdentity: context.processStartIdentity ?? null,
+		operation: "provider",
+	});
+}
+
+function mergeAttemptCleanupContext(bound, supplied = null) {
+	if (!bound) return supplied ? Object.freeze({ ...supplied }) : null;
+	const immutable = Object.freeze({ ...bound });
+	if (!supplied) return immutable;
+	for (const field of [
+		"runId",
+		"taskId",
+		"attemptId",
+		"descriptorIdentity",
+		"workspaceId",
+		"processStartIdentity",
+	]) {
+		if (field in supplied && supplied[field] !== immutable[field]) {
+			throw new Error(`contradictory cleanup context ${field}`);
+		}
+	}
+	const operation = supplied.operation ?? immutable.operation;
+	if (!["provider", "helper"].includes(operation)) {
+		throw new Error("cleanup context operation must be provider or helper");
+	}
+	if (immutable.operation === "helper" && operation !== "helper") {
+		throw new Error("helper cleanup context cannot become provider context");
+	}
+	return Object.freeze({ ...immutable, operation });
+}
+
+function bindAttemptExecutionBackend(executionBackend, cleanupContext) {
+	if (!executionBackend || typeof executionBackend !== "object")
+		return executionBackend;
+	const bound = Object.freeze({ ...cleanupContext });
+	return new Proxy(executionBackend, {
+		get(target, property) {
+			const value = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			if (property === "execArgv") {
+				return (workspaceId, options = {}) => {
+					if (workspaceId !== bound.workspaceId) {
+						throw new Error("contradictory cleanup context workspaceId");
+					}
+					return Reflect.apply(value, target, [
+						workspaceId,
+						{
+							...options,
+							cleanupContext: mergeAttemptCleanupContext(
+								bound,
+								options.cleanupContext,
+							),
+						},
+					]);
+				};
+			}
+			if (property === "cleanupProviderProcess") {
+				return (command, args, options = {}) => {
+					if (
+						options.workspaceId !== undefined &&
+						options.workspaceId !== bound.workspaceId
+					) {
+						throw new Error("contradictory cleanup context workspaceId");
+					}
+					return Reflect.apply(value, target, [
+						command,
+						args,
+						{
+							...options,
+							workspaceId: bound.workspaceId,
+							...mergeAttemptCleanupContext(bound, options),
+						},
+					]);
+				};
+			}
+			return value.bind(target);
+		},
+	});
+}
+
+function bindAttemptHelperBackend(executionBackend, cleanupContext) {
+	return bindAttemptExecutionBackend(
+		executionBackend,
+		mergeAttemptCleanupContext(cleanupContext, { operation: "helper" }),
+	);
+}
+
 export function executeTask(task, context) {
 	const executor = resolveTaskExecutor(task);
 	const requiredCapability = resolveTaskRequiredCapability(task);
@@ -3204,14 +3303,27 @@ export function executeTask(task, context) {
 			requiredCapability,
 		);
 	}
+	const cleanupContext = executionCleanupContext(
+		context,
+		task,
+		invocationDescriptor?.descriptor_identity,
+	);
+	const captureExecutionBackend = bindAttemptHelperBackend(
+		context.executionBackend,
+		cleanupContext,
+	);
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
 		timeoutMs,
-		executionBackend: context.executionBackend,
+		executionBackend: bindAttemptExecutionBackend(
+			context.executionBackend,
+			cleanupContext,
+		),
 		invocationDescriptor,
 		descriptorIdentity: invocationDescriptor?.descriptor_identity ?? null,
 		descriptorHarness: routeResult.resolved_harness ?? null,
 		resolvedTargetId,
+		cleanupContext,
 	});
 	if (execution.cleanupFailed === true && execution.success) {
 		record({
@@ -3259,7 +3371,7 @@ export function executeTask(task, context) {
 					adapter,
 					context.workingContainerName,
 					{
-						executionBackend: context.executionBackend,
+						executionBackend: captureExecutionBackend,
 						taskBase: context._activeTaskBase,
 					},
 				);
@@ -3374,7 +3486,7 @@ export function executeTask(task, context) {
 				adapter,
 				context.workingContainerName,
 				{
-					executionBackend: context.executionBackend,
+					executionBackend: captureExecutionBackend,
 					taskBase: context._activeTaskBase,
 				},
 			);
@@ -3446,7 +3558,7 @@ export function executeTask(task, context) {
 		adapter,
 		context.workingContainerName,
 		{
-			executionBackend: context.executionBackend,
+			executionBackend: captureExecutionBackend,
 			taskBase: context._activeTaskBase,
 		},
 	);
@@ -3911,6 +4023,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
+	let attemptCleanupContext = executionCleanupContext(
+		context,
+		task,
+		invocationDescriptor.descriptor_identity,
+	);
 	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
 		launcherIdentity: broker.launcherIdentity(selectedRoute),
 		signal: context.signal,
@@ -3986,6 +4103,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 				);
 				context._activeInvocationDescriptor = invocationDescriptor;
 				resolvedTargetId = routeResult.resolvedTargetId ?? null;
+				attemptCleanupContext = executionCleanupContext(
+					context,
+					task,
+					invocationDescriptor.descriptor_identity,
+				);
 				adapter = selectAdapter(
 					routeResult.resolved_harness ?? routeResult.provider,
 					context.adapters,
@@ -4110,7 +4232,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 					adapter,
 					context.workingContainerName,
 					{
-						executionBackend: context.executionBackend,
+						executionBackend: bindAttemptHelperBackend(
+							context.executionBackend,
+							attemptCleanupContext,
+						),
 						taskBase: context._activeTaskBase,
 						signal: context.signal,
 					},
@@ -4177,7 +4302,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 				adapter,
 				context.workingContainerName,
 				{
-					executionBackend: context.executionBackend,
+					executionBackend: bindAttemptHelperBackend(
+						context.executionBackend,
+						attemptCleanupContext,
+					),
 					taskBase: context._activeTaskBase,
 					signal: context.signal,
 				},
@@ -4294,7 +4422,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 		adapter,
 		context.workingContainerName,
 		{
-			executionBackend: context.executionBackend,
+			executionBackend: bindAttemptHelperBackend(
+				context.executionBackend,
+				attemptCleanupContext,
+			),
 			taskBase: context._activeTaskBase,
 			signal: context.signal,
 		},
@@ -5162,6 +5293,11 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 
+	const captureCleanupContext = executionCleanupContext(
+		context,
+		task,
+		invocationDescriptor.descriptor_identity,
+	);
 	let jobId;
 	try {
 		context.queueBackend?.beforeRun?.(
@@ -5364,7 +5500,10 @@ export async function executeTaskWithOrchestrator(task, context) {
 			adapter,
 			context.workingContainerName,
 			{
-				executionBackend: context.executionBackend,
+				executionBackend: bindAttemptHelperBackend(
+					context.executionBackend,
+					captureCleanupContext,
+				),
 				taskBase: context._activeTaskBase,
 				signal: context.signal,
 				onStatus: context.onStatus,
@@ -5952,6 +6091,7 @@ export function createBrokerAdapterLauncher({
 	prompt,
 	timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
 	onTranscript = null,
+	cleanupContext = null,
 }) {
 	if (!adapter || typeof adapter.executeAsync !== "function") {
 		throw new TypeError("broker adapter requires executeAsync");
@@ -5978,13 +6118,23 @@ export function createBrokerAdapterLauncher({
 		) {
 			throw new Error("broker launcher identity drift at spawn");
 		}
+		const requestCleanupContext = mergeAttemptCleanupContext(cleanupContext, {
+			taskId: String(request.taskId),
+			attemptId: cleanupContext?.attemptId ?? request.attemptId ?? "attempt-1",
+			descriptorIdentity: invocationDescriptor.descriptor_identity,
+			operation: "provider",
+		});
 		const execution = await adapter.executeAsync(
 			typeof prompt === "string" && prompt.length > 0 ? prompt : request.taskId,
 			workingContainerName,
 			{
 				model: route.model,
 				timeoutMs,
-				executionBackend,
+				executionBackend: bindAttemptExecutionBackend(
+					executionBackend,
+					requestCleanupContext,
+				),
+				cleanupContext: requestCleanupContext,
 				signal,
 				onStatus: onAdapterStatus,
 				onPoll,
@@ -6133,6 +6283,12 @@ function createDispatchBroker(context, dependencies = {}) {
 				onTranscript: (output) => {
 					context._activeTaskTranscript = boundedGateEvidence(output);
 				},
+				cleanupContext: executionCleanupContext(
+					context,
+					{ id: request.taskId },
+					invocationDescriptor.descriptor_identity,
+					request.attemptId ?? null,
+				),
 			})({
 				request,
 				route: selectedRoute,
@@ -6356,6 +6512,35 @@ function createQueueBootstrapStatusEmitter(onStatus) {
  * or a partial queue helper. It is the seam for VM admission and provider
  * preflight.
  */
+function queueOwnershipContext({
+	projectPath,
+	runId,
+	taskId = "queue-bootstrap",
+	attemptId = "bootstrap",
+	purpose = "dispatch",
+	processStartIdentity = null,
+}) {
+	const runStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+	if (!runStoreRoot) {
+		throw new Error(
+			"macos queue requires SWITCHYARD_RUN_STORE_ROOT for VM ownership metadata",
+		);
+	}
+	if (typeof runId !== "string" || !runId) {
+		throw new Error("macos queue requires a runId for VM ownership metadata");
+	}
+	return {
+		resourceRoot: join(resolve(runStoreRoot), "runs", runId, "resources"),
+		runId,
+		taskId,
+		attemptId,
+		projectRoot: resolve(projectPath),
+		creatorPid: process.pid,
+		processStartIdentity,
+		purpose,
+	};
+}
+
 export function createQueueBackend({
 	platform = "macos",
 	dependencies = {},
@@ -6531,6 +6716,13 @@ export function createQueueBackend({
 				...(dependencies.linkedCloneMeasurement
 					? { linkedCloneMeasurement: dependencies.linkedCloneMeasurement }
 					: {}),
+				ownershipContext: queueOwnershipContext({
+					projectPath: _path,
+					runId: options.runId ?? runId,
+					taskId: options.taskId ?? "queue-bootstrap",
+					attemptId: options.attemptId ?? "bootstrap",
+					processStartIdentity: dependencies.processStartIdentity ?? null,
+				}),
 			});
 		},
 		// Provider auth is baked into the golden image and survives cloning

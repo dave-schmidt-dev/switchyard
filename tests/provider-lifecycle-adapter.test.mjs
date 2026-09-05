@@ -249,6 +249,11 @@ describe("provider process lifecycle", () => {
 			argv: ["provider"],
 		});
 		strictEqual(receivedOptions.recordPid, true);
+		strictEqual(
+			"cleanupContext" in receivedOptions,
+			false,
+			"legacy callers must not invent an ambiguous marker identity",
+		);
 	});
 
 	it("captures add and diff asynchronously through PID-safe transport", async () => {

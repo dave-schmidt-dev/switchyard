@@ -8,6 +8,9 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -17,6 +20,7 @@ import {
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
+const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 
 function commandAvailable(command) {
 	try {
@@ -133,20 +137,24 @@ function listed(entries) {
 	].join("\n");
 }
 
-const prerequisiteReason = await inspectPrerequisites();
+const prerequisiteReason = SKIP_LIVE_VM_TESTS
+	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
+	: await inspectPrerequisites();
 
 describe("workspace wipe — Parallels VM (INV-3)", () => {
 	it("reclaims only exact-name VMs owned by proven-dead PIDs", () => {
 		const livePid = 424242;
 		const deadPid = 424243;
+		const deadRunningUuid = "{11111111-1111-4111-8111-111111111111}";
+		const deadStoppedUuid = "{22222222-2222-4222-8222-222222222222}";
 		const entries = [
 			{
-				uuid: "dead-running",
+				uuid: deadRunningUuid,
 				status: "running",
 				name: buildParallelsWorkingName("dead-run", deadPid),
 			},
 			{
-				uuid: "dead-stopped",
+				uuid: deadStoppedUuid,
 				status: "stopped",
 				name: buildParallelsWorkingName("dead-stopped", deadPid),
 			},
@@ -168,6 +176,11 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			},
 		];
 		const calls = [];
+		const resourceRoot = mkdtempSync(
+			join(tmpdir(), "switchyard-inv3-ownership-"),
+		);
+		const previousRunStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		process.env.SWITCHYARD_RUN_STORE_ROOT = resourceRoot;
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
@@ -177,18 +190,56 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			pidIsAlive: (pid) => pid === livePid,
 		});
 
-		const result = backend.reclaim();
+		const ownershipContext = {
+			resourceRoot: join(resourceRoot, "runs", "dead-run", "resources"),
+			runId: "dead-run",
+			taskId: "reclaim-fixture",
+			attemptId: "attempt-1",
+			projectRoot: resolve("/private/tmp"),
+			purpose: "workspace-wipe-test",
+			creatorPid: deadPid,
+			processStartIdentity: "fixture:dead",
+		};
+		backend.writeVmOwnership(
+			deadRunningUuid,
+			entries[0].name,
+			ownershipContext,
+		);
+		backend.writeVmOwnership(deadStoppedUuid, entries[1].name, {
+			...ownershipContext,
+			resourceRoot: join(resourceRoot, "runs", "dead-stopped", "resources"),
+			runId: "dead-stopped",
+			creatorPid: deadPid,
+		});
+		const omitted = backend.reclaim();
+		strictEqual(
+			omitted.reclaimed.length,
+			0,
+			"omitted eligibility must make zero destructive calls",
+		);
+		strictEqual(
+			calls.filter((args) => args[0] === "stop" || args[0] === "delete").length,
+			0,
+		);
+		const result = backend.reclaim({
+			eligibility: (entry) =>
+				entry.ownership.processStartIdentity === "fixture:dead",
+		});
 		deepStrictEqual(
 			result.reclaimed.map((entry) => entry.uuid),
-			["dead-running", "dead-stopped"],
+			[deadRunningUuid, deadStoppedUuid],
 		);
 		deepStrictEqual(
 			result.skipped.map((entry) => entry.uuid),
 			["live", "partial-live"],
 		);
-		ok(calls.some((args) => args[0] === "stop" && args[1] === "dead-running"));
+		ok(calls.some((args) => args[0] === "stop" && args[1] === deadRunningUuid));
 		ok(!calls.some((args) => args[1] === "foreign"));
 		ok(!calls.some((args) => args[1] === "malformed"));
+		rmSync(resourceRoot, { recursive: true, force: true });
+		if (previousRunStoreRoot === undefined)
+			delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRunStoreRoot;
 	});
 
 	it("normal destroy stops and deletes the owned VM", () => {
@@ -203,6 +254,19 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				return "ok";
 			},
 		});
+		const resourceRoot = mkdtempSync(
+			join(tmpdir(), "switchyard-normal-destroy-"),
+		);
+		backend.writeVmOwnership("normal", name, {
+			resourceRoot,
+			runId: "normal",
+			taskId: "normal-destroy",
+			attemptId: "attempt-1",
+			projectRoot: resolve("/private/tmp"),
+			purpose: "workspace-wipe-test",
+			creatorPid: 424244,
+			processStartIdentity: "fixture:normal",
+		});
 
 		deepStrictEqual(backend.destroy(name), {
 			uuid: "normal",
@@ -214,6 +278,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			["stop", "normal"],
 			["delete", "normal"],
 		]);
+		rmSync(resourceRoot, { recursive: true, force: true });
 	});
 
 	it("creates and normally destroys a real VM when all prerequisites are available", {
@@ -231,6 +296,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		let backend;
 		let vmUuid;
 		let destroyed = false;
+		const resourceRoot = mkdtempSync(join(tmpdir(), "switchyard-inv3-live-"));
 		const runId = `inv3-${process.pid}-${randomUUID()}`;
 
 		try {
@@ -274,6 +340,14 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				runId,
 				aquaUid: AQUA_UID,
 				linked: false,
+				ownershipContext: {
+					resourceRoot,
+					runId,
+					taskId: "inv-3-vm-gate",
+					attemptId: "fixture-1",
+					projectRoot: resolve("/private/tmp"),
+					processStartIdentity: `fixture:${process.pid}`,
+				},
 			});
 			const result = backend.destroy(vmUuid);
 			destroyed = true;
@@ -300,6 +374,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				if (typeof slotLease.release === "function") await slotLease.release();
 				else await slotPrimitive.release(slotLease);
 			}
+			rmSync(resourceRoot, { recursive: true, force: true });
 		}
 	});
 });

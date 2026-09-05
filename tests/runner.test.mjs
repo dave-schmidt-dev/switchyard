@@ -38,6 +38,7 @@ import { VmSlotUnavailableError } from "../src/switchyard/run-store/index.mjs";
 import {
 	CHECKPOINT_IDENTITY_CODES,
 	CheckpointIdentityError,
+	createBrokerAdapterLauncher,
 	createCliOrchestrator,
 	createEmptyCheckpoint,
 	createQueueBackend,
@@ -87,6 +88,35 @@ const TASK_BASE = {
 };
 
 describe("macOS queue admission", () => {
+	it("refuses a real VM allocation without the authoritative run-store root", () => {
+		let creates = 0;
+		const backend = createQueueBackend({
+			projectPath: "/private/tmp/fixture-project",
+			runId: "fixture-run",
+			dependencies: {
+				goldenImage: "fixture-golden",
+				aquaUid: "501",
+				executionBackend: {
+					create: () => {
+						creates += 1;
+					},
+				},
+			},
+		});
+		const original = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		try {
+			throws(
+				() => backend.create("/private/tmp/fixture-project"),
+				/RUN_STORE_ROOT/,
+			);
+		} finally {
+			if (original === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = original;
+		}
+		strictEqual(creates, 0);
+	});
+
 	it("rejects a missing Aqua UID before cloning", () => {
 		let creates = 0;
 		const backend = createQueueBackend({
@@ -183,6 +213,233 @@ describe("macOS queue admission", () => {
 			);
 		}
 	});
+});
+
+describe("attempt-scoped execution backend", () => {
+	it("binds immutable sync context, preserves receivers, and rejects contradiction", () => {
+		const seen = [];
+		const backend = {
+			label: "receiver",
+			execArgv(_workspaceId, options) {
+				strictEqual(this, backend);
+				seen.push(options.cleanupContext);
+				return { command: "true", args: [] };
+			},
+		};
+		let adapterOptions;
+		executeTask(
+			{ id: "1.4", title: "marker", description: "marker" },
+			{
+				runId: "run-a",
+				attemptId: "attempt-a",
+				processStartIdentity: null,
+				executionBackend: backend,
+				route: () => ({ provider: "claude", model: "claude-sonnet-5" }),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						execute: (_prompt, _workspace, options) => {
+							adapterOptions = options;
+							options.executionBackend.execArgv("vm", {});
+							options.executionBackend.execArgv("vm", {
+								cleanupContext: {
+									...options.cleanupContext,
+									operation: "helper",
+								},
+							});
+							throws(
+								() =>
+									options.executionBackend.execArgv("vm", {
+										cleanupContext: {
+											...options.cleanupContext,
+											attemptId: "other",
+										},
+									}),
+								/contradictory cleanup context attemptId/,
+							);
+							return { success: false, output: "" };
+						},
+						captureDiff: (_workspace, options) => {
+							options.executionBackend.execArgv("vm", {});
+							return null;
+						},
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "vm",
+			},
+		);
+		ok(Object.isFrozen(adapterOptions.cleanupContext));
+		strictEqual(seen[0].operation, "provider");
+		strictEqual(seen[1].operation, "helper");
+		strictEqual(seen[2].operation, "helper");
+		strictEqual(seen[0].attemptId, "attempt-a");
+		const beforeWrongWorkspace = seen.length;
+		throws(
+			() => adapterOptions.executionBackend.execArgv("other-vm", {}),
+			/contradictory cleanup context workspaceId/,
+		);
+		strictEqual(seen.length, beforeWrongWorkspace);
+	});
+
+	it("binds helper context to a successful synchronous capture", () => {
+		let observed;
+		let captureFacade;
+		let backendCalls = 0;
+		const backend = {
+			execArgv(_workspaceId, options) {
+				backendCalls += 1;
+				observed = options.cleanupContext;
+				return { command: "true", args: [] };
+			},
+		};
+		const result = executeTask(
+			{ id: "1.4-success", title: "marker", description: "marker" },
+			{
+				runId: "run-sync-success",
+				attemptId: "attempt-sync-success",
+				executionBackend: backend,
+				route: () => ({ provider: "claude", model: "claude-sonnet-5" }),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				integrationGate: () => ({ success: true }),
+				adapters: {
+					claude: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: (_workspace, options) => {
+							captureFacade = options.executionBackend;
+							options.executionBackend.execArgv("vm", {});
+							return null;
+						},
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "vm",
+			},
+		);
+		strictEqual(result.success, true);
+		strictEqual(observed.operation, "helper");
+		strictEqual(observed.attemptId, "attempt-sync-success");
+		const beforePromotion = backendCalls;
+		throws(
+			() =>
+				captureFacade.execArgv("vm", {
+					cleanupContext: { operation: "provider" },
+				}),
+			/helper cleanup context cannot become provider context/,
+		);
+		strictEqual(backendCalls, beforePromotion);
+	});
+
+	it("binds the same immutable context through the broker launcher", async () => {
+		let observed;
+		const backend = {
+			execArgv(_workspaceId, options) {
+				observed = options.cleanupContext;
+				return { command: "true", args: [] };
+			},
+		};
+		const descriptor = testDescriptor();
+		const cleanupContext = {
+			runId: "run-b",
+			taskId: "1.4",
+			attemptId: "attempt-b",
+			descriptorIdentity: descriptor.descriptor_identity,
+			workspaceId: "vm",
+			processStartIdentity: null,
+			operation: "provider",
+		};
+		const launch = createBrokerAdapterLauncher({
+			adapter: {
+				executeAsync: async (_prompt, _workspace, options) => {
+					options.executionBackend.execArgv("vm", {});
+					return { success: true, output: "ok" };
+				},
+			},
+			executionBackend: backend,
+			workingContainerName: "vm",
+			prompt: "fixture",
+			cleanupContext,
+		});
+		const route = {
+			provider: "claude",
+			resolvedTarget: "claude",
+			harness: "claude",
+			model: descriptor.selector,
+			effort: null,
+			reservation: { id: "reservation-1" },
+		};
+		await launch({
+			request: { taskId: "1.4", attemptId: "attempt-b" },
+			route,
+			invocationDescriptor: descriptor,
+			launcherIdentity: {
+				...route,
+				descriptorIdentity: descriptor.descriptor_identity,
+				reservationId: "reservation-1",
+			},
+		});
+		ok(Object.isFrozen(observed));
+		strictEqual(observed.attemptId, "attempt-b");
+	});
+
+	for (const success of [true, false]) {
+		it(`binds the final broker attempt to ${success ? "success" : "failure"} capture`, async () => {
+			let observed;
+			const backend = {
+				execArgv(_workspaceId, options) {
+					observed = options.cleanupContext;
+					return { command: "true", args: [] };
+				},
+			};
+			const route = {
+				provider: "claude",
+				model: "claude-sonnet-5",
+				resolvedTarget: "claude",
+				harness: "claude",
+				capability: "standard",
+				reason: "fixture",
+				snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+			};
+			const result = await executeTaskAsync(
+				{ id: `1.4-broker-${success}`, title: "marker", description: "marker" },
+				{
+					runId: "run-broker-capture",
+					attemptId: `attempt-broker-${success}`,
+					resolveDescriptor: () => testDescriptor(),
+					executionBackend: backend,
+					broker: {
+						selectAndReserve: async () => route,
+						launcherIdentity: () => ({}),
+						execute: async () => ({
+							success,
+							outcome: success ? "success" : "failure",
+							reason: success ? null : "fixture failure",
+						}),
+					},
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => ({ success: true }),
+					adapters: {
+						claude: {
+							executeAsync: async () => ({ success: true }),
+							captureDiffAsync: async (_workspace, options) => {
+								options.executionBackend.execArgv("vm", {});
+								return null;
+							},
+						},
+					},
+					projectPath: TEST_DIR,
+					workingContainerName: "vm",
+				},
+			);
+			strictEqual(result.success, success);
+			strictEqual(observed.operation, "helper");
+			strictEqual(observed.attemptId, `attempt-broker-${success}`);
+		});
+	}
 });
 
 function writeDispatchQualifiedRosterFixture() {
@@ -649,7 +906,11 @@ describe("dispatch descriptor receipt contract", () => {
 
 	it("uses host-captured orchestrator bytes and rejects a contradictory base receipt", async () => {
 		let gatedDiff = null;
+		let captureCleanupContext = null;
+		let captureError = null;
 		const context = {
+			runId: "orchestrator-capture-run",
+			attemptId: "orchestrator-capture-attempt",
 			route: () => ({ provider: "claude", model: "test-model" }),
 			recordDispatch: () => {},
 			recordDispatchIntent: () => {},
@@ -660,7 +921,21 @@ describe("dispatch descriptor receipt contract", () => {
 			sleepFn: async () => {},
 			adapters: {
 				claude: {
-					captureDiffAsync: async () => "authoritative-host-diff",
+					captureDiffAsync: async (_workspace, options) => {
+						try {
+							options.executionBackend.execArgv("worker", {});
+						} catch (error) {
+							captureError = error;
+							throw error;
+						}
+						return "authoritative-host-diff";
+					},
+				},
+			},
+			executionBackend: {
+				execArgv(_workspace, options) {
+					captureCleanupContext = options.cleanupContext;
+					return { command: "true", args: [] };
 				},
 			},
 			integrationGate: (diff) => {
@@ -680,8 +955,14 @@ describe("dispatch descriptor receipt contract", () => {
 			{ id: "1.7", title: "task", description: "work" },
 			context,
 		);
-		strictEqual(accepted.success, true);
+		strictEqual(
+			accepted.success,
+			true,
+			`${JSON.stringify(accepted)} capture=${captureError?.message}`,
+		);
 		strictEqual(gatedDiff, "authoritative-host-diff");
+		strictEqual(captureCleanupContext.operation, "helper");
+		strictEqual(captureCleanupContext.workspaceId, "worker");
 
 		const rejected = await executeTaskWithOrchestrator(
 			{ id: "1.8", title: "task", description: "work" },

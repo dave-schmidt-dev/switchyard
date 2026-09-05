@@ -1,6 +1,7 @@
 import {
 	deepStrictEqual,
 	equal,
+	notStrictEqual,
 	ok,
 	strictEqual,
 	throws,
@@ -40,6 +41,46 @@ import { tempDir } from "./helpers/tempdir.mjs";
 const GOLDEN_UUID = "{11111111-1111-4111-8111-111111111111}";
 const WORK_UUID = "{22222222-2222-4222-8222-222222222222}";
 const CLIPBOARD_LABEL = "gui/501/com.parallels.copypaste";
+const TEST_RUN_STORE_ROOT = tempDir("switchyard-ownership-store-");
+process.env.SWITCHYARD_RUN_STORE_ROOT = TEST_RUN_STORE_ROOT;
+
+function ownedOptions(runId, creatorPid = process.pid, overrides = {}) {
+	return {
+		runId,
+		creatorPid,
+		ownershipContext: {
+			resourceRoot: join(TEST_RUN_STORE_ROOT, "runs", runId, "resources"),
+			runId,
+			taskId: "backend-fixture",
+			attemptId: "attempt-1",
+			projectRoot: "/private/tmp/switchyard-fixture-project",
+			purpose: "backend-test",
+			creatorPid,
+			processStartIdentity: `fixture-birth:${runId}:${creatorPid}`,
+			...overrides,
+		},
+	};
+}
+
+function registerOwnedEntry(backend, entry, overrides = {}) {
+	const parsed = parseParallelsWorkingName(entry.name);
+	const options = ownedOptions(parsed.runId, parsed.creatorPid, overrides);
+	backend.writeVmOwnership(entry.uuid, entry.name, options.ownershipContext);
+	return options.ownershipContext;
+}
+
+function markerContext(operation = "provider", overrides = {}) {
+	return {
+		runId: "marker-run",
+		taskId: "1.4",
+		attemptId: "attempt-1",
+		descriptorIdentity: "descriptor-1",
+		workspaceId: WORK_UUID,
+		processStartIdentity: "fixture-birth:marker-run",
+		operation,
+		...overrides,
+	};
+}
 
 // What the guest reports once `_prepareWorkspace` has done its job: one
 // `<owner>:<mode>` line per directory, parent then root.
@@ -235,7 +276,8 @@ describe("Parallels execution backend lifecycle", () => {
 	it("records only opted-in provider commands and removes the marker on exit", () => {
 		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
 		const workspaceId = `marker-test-${randomUUID()}`;
-		const markerPath = backend.providerPidPath(workspaceId);
+		const cleanupContext = markerContext("provider", { workspaceId });
+		const markerPath = backend.providerPidPath(workspaceId, cleanupContext);
 		const controlScript = decodeGuestScript(
 			backend.execArgv(workspaceId, { cwd: "/", argv: ["true"] }).args,
 		);
@@ -245,10 +287,11 @@ describe("Parallels execution backend lifecycle", () => {
 			backend.execArgv(workspaceId, {
 				cwd: "/",
 				recordPid: true,
+				cleanupContext,
 				argv: [
 					"/bin/bash",
 					"-c",
-					'for _ in {1..100}; do test -s "$1" && break; sleep 0.01; done; test "$(cat "$1")" = "$$" || exit 9; IFS= read -r value; printf "out:%s\\n" "$value"; printf "err:%s\\n" "$value" >&2; exit 7',
+					'for _ in {1..100}; do test -s "$1" && break; sleep 0.01; done; test "$(head -n 1 "$1")" = "$$" || exit 9; IFS= read -r value; printf "out:%s\\n" "$value"; printf "err:%s\\n" "$value" >&2; exit 7',
 					"provider-test",
 					markerPath,
 				],
@@ -264,6 +307,35 @@ describe("Parallels execution backend lifecycle", () => {
 		strictEqual(existsSync(markerPath), false);
 	});
 
+	it("separates helper markers and refuses signaling without guest birth proof", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		backend.execGuest = (...args) => calls.push(args);
+		const provider = markerContext("provider");
+		const helper = markerContext("helper");
+		notStrictEqual(
+			backend.providerPidPath(WORK_UUID, provider),
+			backend.providerPidPath(WORK_UUID, helper),
+		);
+		notStrictEqual(
+			backend.providerPidPath(WORK_UUID, provider),
+			backend.providerPidPath(WORK_UUID, {
+				...provider,
+				attemptId: "attempt-2",
+			}),
+		);
+		throws(
+			() =>
+				backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], provider),
+			/process-start identity is unknown/,
+		);
+		deepStrictEqual(
+			calls,
+			[],
+			"unknown guest birth identity must produce no probe or signal",
+		);
+	});
+
 	it("emits completed VM cleanup stages and preserves the last stage on failure", () => {
 		const events = [];
 		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
@@ -272,7 +344,7 @@ describe("Parallels execution backend lifecycle", () => {
 		const cleaned = backend.cleanupProviderProcess(
 			"prlctl",
 			["exec", WORK_UUID],
-			{ onStatus: (event) => events.push(event) },
+			{ ...markerContext(), onStatus: (event) => events.push(event) },
 		);
 		strictEqual(cleaned.cleanupStage, "index_lock_removed");
 		deepStrictEqual(
@@ -290,13 +362,18 @@ describe("Parallels execution backend lifecycle", () => {
 		backend.execGuest = (_workspaceId, command, args) => {
 			if (
 				command === "/bin/rm" &&
-				args.includes(backend.providerPidPath(WORK_UUID))
+				args.includes(backend.providerPidPath(WORK_UUID, markerContext()))
 			) {
 				throw new Error("marker removal failed");
 			}
 		};
 		throws(
-			() => backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID]),
+			() =>
+				backend.cleanupProviderProcess(
+					"prlctl",
+					["exec", WORK_UUID],
+					markerContext(),
+				),
 			(error) => error.cleanupStage === "tree_terminated",
 		);
 	});
@@ -320,6 +397,7 @@ describe("Parallels execution backend lifecycle", () => {
 		};
 		throws(() =>
 			backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], {
+				...markerContext(),
 				onStatus: (event) => events.push(event),
 			}),
 		);
@@ -503,6 +581,10 @@ describe("Parallels execution backend lifecycle", () => {
 				return signalDeath();
 			},
 		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("crashed-run", process.pid),
+		});
 		throws(
 			() => backend.execGuest(WORK_UUID, "/bin/bash", ["-lc", "true"]),
 			/Command failed: prlctl/,
@@ -543,6 +625,10 @@ describe("Parallels execution backend lifecycle", () => {
 				return "";
 			},
 		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("stopped", process.pid),
+		});
 
 		deepStrictEqual(backend.destroy(WORK_UUID), {
 			uuid: WORK_UUID,
@@ -572,6 +658,10 @@ describe("Parallels execution backend lifecycle", () => {
 				throw new Error(`${args[0]} returned 255`);
 			},
 		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("running", process.pid),
+		});
 
 		throws(() => backend.destroy(WORK_UUID), /returned 255/);
 		ok(!calls.some((args) => args[0] === "delete"));
@@ -599,6 +689,10 @@ describe("Parallels execution backend lifecycle", () => {
 					throw new Error("delete returned 255");
 				return "";
 			},
+		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("delete-fallback", process.pid),
 		});
 
 		deepStrictEqual(backend.destroy(WORK_UUID), {
@@ -630,6 +724,10 @@ describe("Parallels execution backend lifecycle", () => {
 				if (args[0] === "delete") throw deleteFailure;
 				return "";
 			},
+		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("delete-running", process.pid),
 		});
 
 		throws(
@@ -1216,6 +1314,7 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 		});
 		backend.create("macOS", {
+			...ownedOptions("workspace-setup"),
 			runId: "workspace-setup",
 			creatorPid: process.pid,
 			linked: false,
@@ -1282,6 +1381,7 @@ describe("Parallels execution backend lifecycle", () => {
 			throws(
 				() =>
 					backend.create("macOS", {
+						...ownedOptions(`stage-${testCase.expectedCode}`),
 						runId: `stage-${testCase.expectedCode}`,
 						creatorPid: process.pid,
 						linked: false,
@@ -1314,6 +1414,7 @@ describe("Parallels execution backend lifecycle", () => {
 		throws(
 			() =>
 				backend.create("macOS", {
+					...ownedOptions("clone-misfire"),
 					runId: "clone-misfire",
 					creatorPid: process.pid,
 					linked: false,
@@ -1321,6 +1422,7 @@ describe("Parallels execution backend lifecycle", () => {
 			(error) => {
 				ok(error instanceof PrlctlCallError);
 				strictEqual(error.diagnosticCode, "prlctl_job_misfire");
+				strictEqual(error.cleanupUncertain, true);
 				return true;
 			},
 		);
@@ -1329,7 +1431,11 @@ describe("Parallels execution backend lifecycle", () => {
 			1,
 			"a clone misfire must surface, not retry into a name collision",
 		);
-		strictEqual(rollbackCount, 1);
+		strictEqual(
+			rollbackCount,
+			0,
+			"unknown allocation must not be reclaimed by name",
+		);
 	});
 
 	it("accepts a workspace whose guest state is correct despite a lost exit code", () => {
@@ -1402,6 +1508,7 @@ describe("Parallels execution backend lifecycle", () => {
 		throws(
 			() =>
 				backend.create("macOS", {
+					...ownedOptions("workspace-unapplied"),
 					runId: "workspace-unapplied",
 					creatorPid: process.pid,
 					linked: false,
@@ -1481,6 +1588,7 @@ describe("Parallels execution backend lifecycle", () => {
 		});
 
 		backend.create("macOS", {
+			...ownedOptions("clipboard-harden"),
 			runId: "clipboard-harden",
 			creatorPid: process.pid,
 			linked: false,
@@ -1555,6 +1663,7 @@ describe("Parallels execution backend lifecycle", () => {
 		throws(
 			() =>
 				backend.create("macOS", {
+					...ownedOptions("clipboard-survives"),
 					runId: "clipboard-survives",
 					creatorPid: process.pid,
 					linked: false,
@@ -1625,6 +1734,7 @@ describe("Parallels execution backend lifecycle", () => {
 		throws(
 			() =>
 				backend.create("macOS", {
+					...ownedOptions("clipboard-respawn"),
 					runId: "clipboard-respawn",
 					creatorPid: process.pid,
 					linked: false,
@@ -1667,6 +1777,7 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 			pidIsAlive: () => false,
 		});
+		for (const entry of entries.slice(0, 2)) registerOwnedEntry(backend, entry);
 
 		const result = backend.reclaim({ eligibility: () => true });
 		strictEqual(result.reclaimed.length, 2);
@@ -1701,6 +1812,7 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 			pidIsAlive: () => false,
 		});
+		for (const entry of entries) registerOwnedEntry(backend, entry);
 
 		const result = backend.reclaim({
 			eligibility: (entry) => entry.runId === "eligible",
@@ -1733,6 +1845,11 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 			pidIsAlive: () => true,
 		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			status: "stopped",
+			name: buildParallelsWorkingName("terminal", process.pid),
+		});
 
 		const result = backend.reclaim({
 			eligibility: (entry) => entry.runId === "terminal",
@@ -1758,6 +1875,11 @@ describe("Parallels execution backend lifecycle", () => {
 				return "ok";
 			},
 			pidIsAlive: () => false,
+		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			status: "running",
+			name: buildParallelsWorkingName("dead", 999999),
 		});
 		const result = backend.reclaim();
 		strictEqual(result.reclaimed.length, 0);
@@ -1787,6 +1909,11 @@ describe("Parallels execution backend lifecycle", () => {
 				return "ok";
 			},
 			pidIsAlive: () => false,
+		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			status: "running",
+			name: buildParallelsWorkingName("original", 999999),
 		});
 		const result = backend.reclaim({ eligibility: () => true });
 		strictEqual(result.reclaimed.length, 0);
@@ -1823,10 +1950,12 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 		});
 
-		const measurement = backend.measureLinkedClone("macOS");
+		const measurementOptions = ownedOptions("run", 1234);
+		const measurement = backend.measureLinkedClone("macOS", measurementOptions);
 		throws(
 			() =>
 				backend.create("macOS", {
+					...measurementOptions,
 					runId: "run",
 					creatorPid: 1234,
 					linkedCloneMeasurement: measurement,
@@ -1999,6 +2128,7 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			goldenImage: GOLDEN,
 			snapshotIds: [CLONE_SNAPSHOT],
 		});
+		registerOwnedEntry(backend, { uuid: WORK_UUID, name, status: "running" });
 		const sidecarPath = backend.snapshotSidecarPath(WORK_UUID);
 		ok(existsSync(sidecarPath));
 
@@ -2024,6 +2154,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		writer.writeSnapshotSidecar(WORK_UUID, {
 			goldenImage: GOLDEN,
 			snapshotIds: [CLONE_SNAPSHOT],
+		});
+		registerOwnedEntry(writer, {
+			uuid: WORK_UUID,
+			name: deadName,
+			status: "running",
 		});
 
 		const { backend: fresh, snapshotsNow } = makeCloningBackend(root, deadName);
@@ -2052,6 +2187,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		const deadName = buildParallelsWorkingName("dead", 999_999);
 		const { backend, calls, snapshotsNow } = makeCloningBackend(root, deadName);
 		// No sidecar written at all, yet the golden carries a snapshot.
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: deadName,
+			status: "running",
+		});
 
 		const result = backend.reclaim({ eligibility: () => true });
 
@@ -2078,6 +2218,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		backend.writeSnapshotSidecar(WORK_UUID, {
 			goldenImage: GOLDEN,
 			snapshotIds: [CLONE_SNAPSHOT],
+		});
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: liveName,
+			status: "running",
 		});
 
 		const result = backend.reclaim({ eligibility: () => false });
@@ -2108,10 +2253,26 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			"{not json at all",
 			"utf8",
 		);
+		registerOwnedEntry(backend, {
+			uuid: WORK_UUID,
+			name: deadName,
+			status: "running",
+		});
+		let sidecarReads = 0;
+		const readSnapshotSidecar = backend.readSnapshotSidecar.bind(backend);
+		backend.readSnapshotSidecar = (uuid) => {
+			sidecarReads += 1;
+			return readSnapshotSidecar(uuid);
+		};
 
-		const result = backend.reclaim();
+		const result = backend.reclaim({ eligibility: () => true });
 
 		strictEqual(result.errors.length, 0, JSON.stringify(result.errors));
+		strictEqual(
+			sidecarReads,
+			1,
+			"corrupt-sidecar fixture must reach the durable sidecar read",
+		);
 		deepStrictEqual(result.reclaimedSnapshots, []);
 		ok(!calls.some((args) => args[0] === "snapshot-delete"));
 		ok(snapshotsNow().includes(FOREIGN_SNAPSHOT));
@@ -2167,6 +2328,215 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
  * Before this suite, one such misfire anywhere in a boot sequence killed the
  * whole run and left no exit code, signal, or attempt count behind.
  */
+describe("VM ownership metadata", () => {
+	it("refuses an unproven bare handle before any VM mutation", () => {
+		const calls = [];
+		const name = buildParallelsWorkingName("bare-handle", 5151);
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([{ uuid: WORK_UUID, status: "stopped", name }]);
+				return "";
+			},
+		});
+		throws(() => backend.destroy(WORK_UUID), /recovery_evidence_missing/);
+		strictEqual(
+			calls.filter((args) => ["stop", "delete"].includes(args[0])).length,
+			0,
+		);
+	});
+
+	it("refuses allocation before clone when authoritative ownership context is absent", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			requireLinkedCloneMeasurement: false,
+			prlctlFn: (args) => {
+				calls.push(args);
+				return "";
+			},
+		});
+		throws(
+			() =>
+				backend.create("macOS", { linked: false, runId: "missing-context" }),
+			/ownership context/,
+		);
+		strictEqual(
+			calls.length,
+			0,
+			"metadata refusal must precede clone mutation",
+		);
+	});
+
+	it("resolves a fresh backend targeted destroy from registered UUID ownership", () => {
+		const name = buildParallelsWorkingName("fresh-destroy", 5151);
+		const context = ownedOptions("fresh-destroy", 5151).ownershipContext;
+		const writer = new ParallelsExecutionBackend({ prlctlFn: () => "" });
+		writer.writeVmOwnership(WORK_UUID, name, context);
+		const calls = [];
+		const fresh = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					return listed([{ uuid: WORK_UUID, status: "stopped", name }]);
+				}
+				return "";
+			},
+		});
+		const handle = {
+			uuid: WORK_UUID,
+			name,
+			runId: "fresh-destroy",
+			taskId: context.taskId,
+			attemptId: context.attemptId,
+			processStartIdentity: context.processStartIdentity,
+		};
+		fresh.destroy(handle);
+		ok(calls.some((args) => args[0] === "delete" && args[1] === WORK_UUID));
+
+		writer.writeVmOwnership(WORK_UUID, name, context);
+		const beforeMismatch = calls.length;
+		throws(
+			() => fresh.destroy({ ...handle, processStartIdentity: "other-birth" }),
+			/identity changed/,
+		);
+		strictEqual(
+			calls
+				.slice(beforeMismatch)
+				.filter((args) => ["stop", "delete"].includes(args[0])).length,
+			0,
+		);
+	});
+
+	it("rejects partial or noncanonical durable ownership before destruction", () => {
+		const name = buildParallelsWorkingName("partial-record", 5151);
+		const context = ownedOptions("partial-record", 5151).ownershipContext;
+		const writer = new ParallelsExecutionBackend({ prlctlFn: () => "" });
+		writer.writeVmOwnership(WORK_UUID, name, context);
+		const path = writer.vmOwnershipPath(WORK_UUID, context.resourceRoot);
+		const partial = JSON.parse(readFileSync(path, "utf8"));
+		delete partial.taskId;
+		partial.resourceRoot = join(context.resourceRoot, "other");
+		writeFileSync(path, `${JSON.stringify(partial)}\n`, "utf8");
+		const calls = [];
+		const fresh = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([{ uuid: WORK_UUID, status: "stopped", name }]);
+				return "";
+			},
+		});
+		throws(
+			() => fresh.destroy({ uuid: WORK_UUID, name, runId: "partial-record" }),
+			/recovery_evidence_missing/,
+		);
+		strictEqual(
+			calls.filter((args) => ["stop", "delete"].includes(args[0])).length,
+			0,
+		);
+	});
+
+	it("raw linked measurement refuses before clone when ownership context is absent", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				return "";
+			},
+		});
+		throws(
+			() => backend.measureLinkedCloneLifecycle("macOS"),
+			/ownership context/,
+		);
+		deepStrictEqual(calls, []);
+	});
+
+	it("records cleanup uncertainty when a raw measurement allocation has no UUID", () => {
+		const runId = "measure-unknown";
+		const options = ownedOptions(runId, 5151);
+		const golden = "golden-measurement";
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				if (args[0] === "list")
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: golden },
+					]);
+				if (args[0] === "snapshot-list") return "{}";
+				return "";
+			},
+		});
+		throws(
+			() => backend.measureLinkedCloneLifecycle(golden, options),
+			(error) => error.cleanupUncertain === true,
+		);
+		const name = buildParallelsWorkingName(runId, 5151);
+		const intent = JSON.parse(
+			readFileSync(
+				backend.allocationIntentPath(
+					name,
+					options.ownershipContext.resourceRoot,
+				),
+				"utf8",
+			),
+		);
+		strictEqual(intent.state, "cleanup_uncertain");
+		strictEqual(intent.reasonCode, "allocation_identity_unknown");
+	});
+
+	it("records cleanup uncertainty when a known raw measurement clone cannot be rolled back", () => {
+		const runId = "measure-cleanup-failed";
+		const options = ownedOptions(runId, 5151);
+		const golden = "golden-measurement";
+		const probeName = buildParallelsWorkingName(runId, 5151);
+		let cloned = false;
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				if (args[0] === "clone") {
+					cloned = true;
+					return "";
+				}
+				if (args[0] === "snapshot-list") return "{}";
+				if (args[0] === "list" && args[1] === "-i") return "size=1 B";
+				if (args[0] === "list")
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: golden },
+						...(cloned
+							? [{ uuid: WORK_UUID, status: "running", name: probeName }]
+							: []),
+					]);
+				if (args[0] === "stop") throw new Error("rollback failed");
+				return "";
+			},
+		});
+		backend.boot = () => {
+			throw new Error("measurement boot failed");
+		};
+		let failure;
+		try {
+			backend.measureLinkedCloneLifecycle(golden, options);
+		} catch (error) {
+			failure = error;
+		}
+		strictEqual(failure?.message, "measurement boot failed");
+		strictEqual(failure?.cleanupUncertain, true);
+		ok(failure?.rollbackError instanceof Error);
+		const intent = JSON.parse(
+			readFileSync(
+				backend.allocationIntentPath(
+					probeName,
+					options.ownershipContext.resourceRoot,
+				),
+				"utf8",
+			),
+		);
+		strictEqual(intent.state, "cleanup_uncertain");
+		strictEqual(intent.reasonCode, "known_allocation_cleanup_failed");
+	});
+});
+
 describe("prlctl job-misfire tolerance", () => {
 	it("absorbs a job misfire and returns the retried result", () => {
 		let calls = 0;

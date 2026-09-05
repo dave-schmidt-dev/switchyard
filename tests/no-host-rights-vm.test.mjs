@@ -14,8 +14,9 @@
 import { match, ok, strictEqual } from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -37,6 +38,7 @@ const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const PROVIDER_USER =
 	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
+const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 
 function commandAvailable(command) {
 	try {
@@ -170,7 +172,9 @@ async function inspectPrerequisites() {
 	return null;
 }
 
-const prerequisiteReason = await inspectPrerequisites();
+const prerequisiteReason = SKIP_LIVE_VM_TESTS
+	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
+	: await inspectPrerequisites();
 
 describe("no host rights — Parallels VM (INV-1)", () => {
 	it("proves host sharing, guest mounts, C-3 networking, and clipboard behavior", {
@@ -190,6 +194,9 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 		let vmName;
 		let originalClipboard;
 		let manifest;
+		const resourceRoot = mkdtempSync(
+			join(tmpdir(), "switchyard-inv1-ownership-"),
+		);
 
 		try {
 			progress("acquiring the shared VM slot");
@@ -239,6 +246,14 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 				aquaUid: AQUA_UID,
 				providerUser: PROVIDER_USER,
 				linked: false,
+				ownershipContext: {
+					resourceRoot,
+					runId,
+					taskId: "inv-1-vm-gate",
+					attemptId: "fixture-1",
+					projectRoot: resolve("/private/tmp"),
+					processStartIdentity: `fixture:${process.pid}`,
+				},
 			});
 			ok(vmUuid, "working VM must have a Parallels UUID handle");
 
@@ -452,6 +467,7 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 					else await slotPrimitive.release(slotLease);
 				}
 			}
+			rmSync(resourceRoot, { recursive: true, force: true });
 		}
 	});
 });

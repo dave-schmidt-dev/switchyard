@@ -14,7 +14,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
 	PrlctlCallError,
@@ -156,6 +156,8 @@ const PERSISTABLE_PRLCTL_SIGNALS = Object.freeze(
 	new Set(["SIGABRT", "SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM"]),
 );
 const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
+const VM_OWNERSHIP_SCHEMA_VERSION = 1;
+const PROCESS_MARKER_SCHEMA_VERSION = 1;
 // The bulk-transfer URL is only known once the helper has bound its ephemeral
 // port, so it reaches the guest as a plaintext argv assignment that the helper
 // substitutes. The variable name deliberately does not contain the placeholder
@@ -494,9 +496,10 @@ function shellQuote(value) {
 	return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
-function providerPidMarkerPath(workspaceId) {
-	const digest = createHash("sha256").update(String(workspaceId)).digest("hex");
-	return `${PROVIDER_PID_MARKER_PREFIX}${digest.slice(0, 32)}.pid`;
+function providerPidMarkerPath(workspaceId, cleanupContext = {}) {
+	const identity = markerIdentity(workspaceId, cleanupContext);
+	if (!identity) return null;
+	return `${PROVIDER_PID_MARKER_PREFIX}${identity.operation}-${identity.token.slice(0, 32)}.pid`;
 }
 
 function validateGuestPath(value, label) {
@@ -793,6 +796,111 @@ function isUuid(value) {
 	return typeof value === "string" && UUID.test(value);
 }
 
+function isBoundedRecordText(value, maxLength = 1024) {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= maxLength &&
+		![...value].some((character) => {
+			const codePoint = character.codePointAt(0);
+			return codePoint <= 31 || codePoint === 127;
+		})
+	);
+}
+
+function markerIdentity(workspaceId, cleanupContext = {}) {
+	const required = [
+		"runId",
+		"taskId",
+		"attemptId",
+		"descriptorIdentity",
+		"workspaceId",
+	];
+	if (
+		!cleanupContext ||
+		!["provider", "helper"].includes(cleanupContext.operation) ||
+		cleanupContext.workspaceId !== String(workspaceId) ||
+		required.some(
+			(field) =>
+				typeof cleanupContext[field] !== "string" ||
+				cleanupContext[field].length === 0,
+		)
+	) {
+		return null;
+	}
+	const operation = cleanupContext.operation;
+	const payload = JSON.stringify({
+		v: PROCESS_MARKER_SCHEMA_VERSION,
+		operation,
+		workspaceId: String(workspaceId),
+		runId: cleanupContext.runId,
+		taskId: cleanupContext.taskId,
+		attemptId: cleanupContext.attemptId,
+		descriptorIdentity: cleanupContext.descriptorIdentity,
+		processStartIdentity:
+			typeof cleanupContext.processStartIdentity === "string" &&
+			cleanupContext.processStartIdentity
+				? cleanupContext.processStartIdentity
+				: null,
+	});
+	return {
+		operation,
+		payload,
+		// No qualified guest birth-identity probe exists in this source scope.
+		// The host supervisor identity still fences marker names, but it never
+		// upgrades a guest PID into signaling authority.
+		strongStart: false,
+		token: createHash("sha256").update(payload).digest("hex"),
+	};
+}
+
+function ownershipContextFor(options, backend) {
+	const source = options?.ownershipContext;
+	const required = [
+		"resourceRoot",
+		"runId",
+		"taskId",
+		"attemptId",
+		"projectRoot",
+	];
+	if (
+		!source ||
+		required.some(
+			(field) =>
+				typeof source[field] !== "string" || source[field].length === 0,
+		)
+	) {
+		throw new Error(
+			"VM allocation requires explicit durable ownership context",
+		);
+	}
+	if (!isAbsolute(source.resourceRoot) || !isAbsolute(source.projectRoot)) {
+		throw new Error(
+			"VM ownership context requires absolute resourceRoot and projectRoot",
+		);
+	}
+	return Object.freeze({
+		schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
+		resourceRoot: resolve(source.resourceRoot),
+		runId: validateRunId(source.runId),
+		taskId: String(source.taskId),
+		attemptId: String(source.attemptId),
+		projectRoot: resolve(source.projectRoot),
+		purpose:
+			typeof source.purpose === "string" && source.purpose
+				? source.purpose
+				: "dispatch",
+		creatorPid: validatePid(
+			source.creatorPid ?? options.creatorPid ?? backend.creatorPid,
+		),
+		processStartIdentity:
+			typeof source.processStartIdentity === "string" &&
+			source.processStartIdentity
+				? source.processStartIdentity
+				: null,
+	});
+}
+
 /**
  * Synchronous Parallels lifecycle implementation with injectable VM calls.
  *
@@ -904,6 +1012,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.diskUsageFn = diskUsageFn;
 		this.linkedMeasurementReceipts = new WeakSet();
 		this.linkedSnapshotsByUuid = new Map();
+		this.ownedResourcesByUuid = new Map();
 		this.requireLinkedCloneMeasurement = requireLinkedCloneMeasurement;
 		this.providerUser = validateUser(providerUser);
 		this.transferHost = validateTransferHost(transferHost);
@@ -1071,6 +1180,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			providerUser,
 			recordPid = false,
 			env = [],
+			cleanupContext = null,
 		} = {},
 	) {
 		const command = normalizeExecArgv(argv);
@@ -1078,11 +1188,21 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const user = validateUser(providerUser ?? this.providerUser);
 		const resolvedCwd = resolveWorkspacePath(cwd, user);
 		validateGuestPath(resolvedCwd, "cwd");
-		const pidPath = providerPidMarkerPath(workspaceId);
+		const marker = recordPid
+			? markerIdentity(workspaceId, cleanupContext)
+			: null;
+		if (recordPid && !marker) {
+			throw new Error(
+				"provider/helper process marker requires an exact attempt identity",
+			);
+		}
+		const pidPath = marker
+			? providerPidMarkerPath(workspaceId, cleanupContext)
+			: null;
 		const quotedCommand = command.map((entry) => shellQuote(entry)).join(" ");
 		const launch = `exec ${quotedCommand}`;
 		const inner = recordPid
-			? `cd ${shellQuote(resolvedCwd)} || exit $?; trap 'rm -f -- ${shellQuote(pidPath)}' EXIT; ${quotedCommand} <&0 & provider_pid=$!; echo "$provider_pid" > ${shellQuote(pidPath)}; wait "$provider_pid"; provider_status=$?; exit "$provider_status"`
+			? `cd ${shellQuote(resolvedCwd)} || exit $?; trap 'rm -f -- ${shellQuote(pidPath)}' EXIT; ${quotedCommand} <&0 & provider_pid=$!; { printf '%s\\n' "$provider_pid"; printf '%s\\n' ${shellQuote(marker.token)}; } > ${shellQuote(pidPath)}; wait "$provider_pid"; provider_status=$?; exit "$provider_status"`
 			: `cd ${shellQuote(resolvedCwd)} && ${launch}`;
 		const payload = Buffer.from(inner, "utf8").toString("base64");
 		const args = [
@@ -1145,6 +1265,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			argv,
 			recordPid = false,
 			env,
+			cleanupContext = null,
 		} = {},
 	) {
 		return {
@@ -1155,6 +1276,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				providerUser,
 				recordPid,
 				env,
+				cleanupContext,
 			}),
 		};
 	}
@@ -1206,8 +1328,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * @param {string} workspaceId
 	 * @returns {string}
 	 */
-	providerPidPath(workspaceId) {
-		return providerPidMarkerPath(workspaceId);
+	providerPidPath(workspaceId, cleanupContext = {}) {
+		return providerPidMarkerPath(workspaceId, cleanupContext);
 	}
 
 	/** Execute one small control command through the same Aqua identity route. */
@@ -1243,15 +1365,24 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * caller that needs a supervisor; this helper keeps the guest PID handoff
 	 * explicit for the timeout task without adding one.
 	 */
-	getGuestPid(workspaceId, pidPath) {
+	getGuestPid(workspaceId, pidPath, cleanupContext = {}) {
 		validateGuestPath(pidPath, "pidPath");
+		const identity = markerIdentity(workspaceId, cleanupContext);
+		if (!identity?.strongStart)
+			throw new Error("guest PID marker process-start identity is unknown");
 		const output = outputText(
 			this.execGuest(workspaceId, "/bin/cat", [pidPath], { cwd: "/" }),
 		).trim();
-		if (!/^\d+$/.test(output) || Number(output) <= 0) {
+		const [pidText, markerToken, ...extra] = output.split(/\r?\n/);
+		if (
+			!/^\d+$/.test(pidText) ||
+			Number(pidText) <= 0 ||
+			markerToken !== identity.token ||
+			extra.length > 0
+		) {
 			throw new Error("guest PID marker was missing or invalid");
 		}
-		return Number(output);
+		return Number(pidText);
 	}
 
 	_runBulkTransfer({ direction, workspaceId, payload, guestArgs }) {
@@ -1514,7 +1645,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	cleanupProviderProcess(
 		command,
 		args,
-		{ onStatus, workspaceId: requestedWorkspaceId } = {},
+		{ onStatus, workspaceId: requestedWorkspaceId, ...cleanupContext } = {},
 	) {
 		const bridgeInvocation =
 			command === BWS_SECRET_EXEC &&
@@ -1530,6 +1661,17 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (typeof workspaceId !== "string" || workspaceId.length === 0) {
 			throw new Error("Parallels provider cleanup received no VM handle");
 		}
+		const ownerContext = {
+			...cleanupContext,
+			workspaceId: requestedWorkspaceId ?? workspaceId,
+		};
+		const marker = markerIdentity(workspaceId, ownerContext);
+		if (!marker || !["provider", "helper"].includes(ownerContext.operation)) {
+			throw new Error(
+				"refusing process cleanup without matching attempt identity",
+			);
+		}
+		const pidPath = this.providerPidPath(workspaceId, ownerContext);
 		let cleanupStage = CLEANUP_STARTED;
 		onStatus?.({
 			phase: "execution",
@@ -1537,10 +1679,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			status: "Guest provider cleanup started",
 		});
 		try {
-			const pid = this.getGuestPid(
-				workspaceId,
-				this.providerPidPath(workspaceId),
-			);
+			const pid = this.getGuestPid(workspaceId, pidPath, ownerContext);
 			cleanupStage = PID_OBSERVED;
 			onStatus?.({
 				phase: "execution",
@@ -1559,12 +1698,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				event: "provider_tree_gone",
 				status: "Guest provider tree confirmed gone",
 			});
-			this.execGuest(
-				workspaceId,
-				"/bin/rm",
-				["-f", "--", this.providerPidPath(workspaceId)],
-				{ cwd: "/" },
-			);
+			this.execGuest(workspaceId, "/bin/rm", ["-f", "--", pidPath], {
+				cwd: "/",
+			});
 			cleanupStage = PID_MARKER_REMOVED;
 			onStatus?.({
 				phase: "execution",
@@ -1846,12 +1982,142 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (remaining.length > 0) this.deleteSnapshots(goldenImage, remaining);
 	}
 
+	vmOwnershipPath(uuid, resourceRoot) {
+		if (
+			typeof uuid !== "string" ||
+			!/^[A-Za-z0-9{}-]+$/.test(uuid) ||
+			typeof resourceRoot !== "string" ||
+			!isAbsolute(resourceRoot)
+		)
+			return null;
+		return join(
+			resourceRoot,
+			`parallels-vm-${String(uuid).replace(/[^A-Za-z0-9-]/g, "")}.json`,
+		);
+	}
+
+	allocationIntentPath(name, resourceRoot) {
+		const token = createHash("sha256").update(String(name)).digest("hex");
+		return join(resourceRoot, `parallels-allocation-${token}.intent.json`);
+	}
+
+	writeAllocationIntent(name, ownership) {
+		mkdirSync(ownership.resourceRoot, { recursive: true });
+		writeFileSync(
+			this.allocationIntentPath(name, ownership.resourceRoot),
+			`${JSON.stringify({
+				schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
+				kind: "parallels_vm_allocation_intent",
+				vmName: name,
+				...ownership,
+				createdAt: this.nowFn(),
+			})}\n`,
+			"utf8",
+		);
+	}
+
+	writeAllocationUncertainty(name, ownership, reasonCode) {
+		writeFileSync(
+			this.allocationIntentPath(name, ownership.resourceRoot),
+			`${JSON.stringify({
+				schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
+				kind: "parallels_vm_allocation_intent",
+				state: "cleanup_uncertain",
+				reasonCode,
+				vmName: name,
+				...ownership,
+				createdAt: this.nowFn(),
+			})}\n`,
+			"utf8",
+		);
+	}
+
+	writeVmOwnership(uuid, name, ownership) {
+		const path = this.vmOwnershipPath(uuid, ownership.resourceRoot);
+		if (!path)
+			throw new Error("VM ownership metadata requires an exact VM UUID");
+		mkdirSync(ownership.resourceRoot, { recursive: true });
+		const record = Object.freeze({
+			schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
+			kind: "parallels_vm_ownership",
+			vmUuid: uuid,
+			vmName: name,
+			...ownership,
+			createdAt: this.nowFn(),
+		});
+		writeFileSync(path, `${JSON.stringify(record)}\n`, "utf8");
+		this.ownedResourcesByUuid.set(uuid, record);
+		return record;
+	}
+
+	readVmOwnership(uuid, resourceRoot) {
+		const path = this.vmOwnershipPath(uuid, resourceRoot);
+		if (!path) return null;
+		try {
+			const record = JSON.parse(readFileSync(path, "utf8"));
+			const expectedFields = new Set([
+				"schemaVersion",
+				"kind",
+				"vmUuid",
+				"vmName",
+				"resourceRoot",
+				"runId",
+				"taskId",
+				"attemptId",
+				"projectRoot",
+				"purpose",
+				"creatorPid",
+				"processStartIdentity",
+				"createdAt",
+			]);
+			const parsedName = parseParallelsWorkingName(record?.vmName);
+			if (
+				!record ||
+				typeof record !== "object" ||
+				Array.isArray(record) ||
+				Object.keys(record).length !== expectedFields.size ||
+				Object.keys(record).some((field) => !expectedFields.has(field)) ||
+				record?.schemaVersion !== VM_OWNERSHIP_SCHEMA_VERSION ||
+				record.kind !== "parallels_vm_ownership" ||
+				record.vmUuid !== uuid ||
+				!isUuid(record.vmUuid) ||
+				!parsedName ||
+				parsedName.runId !== record.runId ||
+				parsedName.creatorPid !== record.creatorPid ||
+				resolve(record.resourceRoot) !== resolve(resourceRoot) ||
+				record.resourceRoot !== resolve(resourceRoot) ||
+				!isBoundedRecordText(record.runId, 256) ||
+				!isBoundedRecordText(record.taskId, 256) ||
+				!isBoundedRecordText(record.attemptId, 256) ||
+				!isAbsolute(record.projectRoot) ||
+				record.projectRoot !== resolve(record.projectRoot) ||
+				!isBoundedRecordText(record.purpose, 128) ||
+				!Number.isSafeInteger(record.creatorPid) ||
+				record.creatorPid <= 0 ||
+				(record.processStartIdentity !== null &&
+					!isBoundedRecordText(record.processStartIdentity)) ||
+				!Number.isFinite(record.createdAt)
+			)
+				return null;
+			return record;
+		} catch {
+			return null;
+		}
+	}
+
+	deleteVmOwnership(uuid, resourceRoot) {
+		const path = this.vmOwnershipPath(uuid, resourceRoot);
+		if (path) rmSync(path, { force: true });
+		this.ownedResourcesByUuid.delete(uuid);
+	}
+
 	/**
 	 * Measure a real linked clone when no test probe is injected. The probe is
 	 * created, booted, measured, and destroyed before its receipt is accepted by
 	 * create(); a fabricated measurement object can never authorize cloning.
 	 */
 	measureLinkedCloneLifecycle(goldenImage, options = {}) {
+		const ownership = ownershipContextFor(options, this);
 		const golden = this.resolveHandle(goldenImage, { allowUnmanaged: true });
 		if (!/^stopped$/i.test(String(golden.status ?? ""))) {
 			throw new Error(
@@ -1860,22 +2126,28 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		}
 		const beforeSnapshots = this.listSnapshotIds(goldenImage);
 		const probeName = buildParallelsWorkingName(
-			`measurement-${randomUUID()}`,
-			this.creatorPid,
+			ownership.runId,
+			ownership.creatorPid,
 		);
+		this.writeAllocationIntent(probeName, ownership);
 		const startedAt = this.nowFn();
 		let probe = null;
 		let createdSnapshots = [];
+		let allocationAttempted = false;
+		let evidence = null;
+		let failure = null;
 		try {
 			// Same reason the workspace clone opts out: `probeName` is computed
 			// once above, so a retry after a misfire reuses it and collides with
 			// the clone the first attempt may already have made.
+			allocationAttempted = true;
 			this._call(["clone", goldenImage, "--name", probeName, "--linked"], {
 				retry: false,
 			});
 			probe = this.listAll().find((entry) => entry.name === probeName);
 			if (!probe?.ownership)
 				throw new Error("linked-clone probe returned no UUID");
+			this.writeVmOwnership(probe.uuid, probe.name, ownership);
 			createdSnapshots = snapshotDifference(
 				this.listSnapshotIds(goldenImage),
 				beforeSnapshots,
@@ -1885,19 +2157,47 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				this.diskUsageFn,
 			);
 			this.boot(probe.uuid, options);
-			return validateLinkedCloneMeasurement({
+			evidence = validateLinkedCloneMeasurement({
 				diskBytes,
 				cloneToBootMs: Math.max(0, this.nowFn() - startedAt),
 			});
-		} finally {
-			if (probe?.uuid) {
+		} catch (error) {
+			failure = error;
+		}
+		if (probe?.uuid) {
+			try {
+				this.stopAndDelete(probe);
+				this.deleteVmOwnership(probe.uuid, ownership.resourceRoot);
+				this.cleanupLinkedSnapshots(goldenImage, createdSnapshots);
+			} catch (cleanupError) {
+				failure ??= cleanupError;
+				if (failure !== cleanupError) failure.rollbackError = cleanupError;
+				failure.cleanupUncertain = true;
 				try {
-					this.stopAndDelete(probe);
-				} finally {
-					this.cleanupLinkedSnapshots(goldenImage, createdSnapshots);
+					this.writeAllocationUncertainty(
+						probeName,
+						ownership,
+						"known_allocation_cleanup_failed",
+					);
+				} catch (evidenceError) {
+					failure.uncertaintyEvidenceError = evidenceError;
 				}
 			}
+		} else if (allocationAttempted) {
+			failure ??= new Error("linked-clone allocation identity is unknown");
+			failure.cleanupUncertain = true;
+			try {
+				this.writeAllocationUncertainty(
+					probeName,
+					ownership,
+					"allocation_identity_unknown",
+				);
+			} catch (evidenceError) {
+				failure.uncertaintyEvidenceError = evidenceError;
+			}
 		}
+		if (failure) throw failure;
+		return evidence;
 	}
 
 	/**
@@ -1928,6 +2228,12 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const runId = options.runId ?? randomUUID();
 		const creatorPid = validatePid(options.creatorPid ?? this.creatorPid);
 		const name = buildParallelsWorkingName(runId, creatorPid);
+		const ownership = ownershipContextFor(options, this);
+		if (ownership.runId !== runId || ownership.creatorPid !== creatorPid) {
+			throw new Error(
+				"VM ownership context does not match requested VM identity",
+			);
+		}
 		const linked = options.linked ?? true;
 		if (linked && this.requireLinkedCloneMeasurement) {
 			const evidence = options.linkedCloneMeasurement;
@@ -1942,6 +2248,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			}
 		}
 
+		// Intent is durable before the first mutating clone call.  A failed write
+		// therefore proves that no VM allocation was attempted.
+		this.writeAllocationIntent(name, ownership);
 		const snapshotBefore = linked ? this.listSnapshotIds(goldenImage) : null;
 		let createdSnapshots = [];
 		let entry = null;
@@ -1964,6 +2273,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					`cloned VM ${name} was not returned with a UUID handle`,
 				);
 			}
+			this.writeVmOwnership(entry.uuid, entry.name, ownership);
 			if (linked) {
 				const metadata = { goldenImage, snapshotIds: createdSnapshots };
 				this.linkedSnapshotsByUuid.set(entry.uuid, metadata);
@@ -1985,14 +2295,16 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			}
 			return entry.uuid;
 		} catch (error) {
-			// The prlctl client can report an error after the bundle was created.
-			// Probe and roll back unconditionally; an absent exact name is a
-			// harmless no-op, while a partial create cannot be left behind.
+			if (!entry?.uuid) {
+				error.cleanupUncertain = true;
+				throw error;
+			}
 			try {
-				this.rollback(name, entry?.uuid, {
+				this.rollback(name, entry.uuid, {
 					goldenImage: linked ? goldenImage : null,
 					snapshotBefore,
 					snapshotIds: createdSnapshots,
+					ownershipContext: ownership,
 				});
 			} catch (rollbackError) {
 				error.rollbackError = rollbackError;
@@ -2262,13 +2574,30 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	rollback(
 		name,
 		uuid = null,
-		{ goldenImage = null, snapshotBefore = null, snapshotIds = [] } = {},
+		{
+			goldenImage = null,
+			snapshotBefore = null,
+			snapshotIds = [],
+			ownershipContext = null,
+		} = {},
 	) {
-		const target =
-			uuid ?? this.listAll().find((entry) => entry.name === name)?.uuid;
+		const target = uuid;
 		if (!target) return false;
+		const ownership =
+			this.ownedResourcesByUuid.get(target) ??
+			(ownershipContext?.resourceRoot
+				? this.readVmOwnership(target, ownershipContext.resourceRoot)
+				: null);
+		if (
+			!ownership ||
+			ownership.vmUuid !== target ||
+			ownership.vmName !== name
+		) {
+			throw new Error("refusing rollback without exact owned VM identity");
+		}
 		this.stopAndDelete({ uuid: target, name });
 		this.linkedSnapshotsByUuid.delete(target);
+		this.deleteVmOwnership(target, ownership.resourceRoot);
 		if (goldenImage) {
 			const candidates = snapshotIds.length
 				? snapshotIds
@@ -2335,6 +2664,43 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	destroy(handle) {
 		const entry = this.resolveHandle(handle);
+		const suppliedOwnership =
+			handle && typeof handle === "object" ? handle.ownershipContext : null;
+		const registeredResourceRoot =
+			handle &&
+			typeof handle === "object" &&
+			typeof handle.runId === "string" &&
+			process.env.SWITCHYARD_RUN_STORE_ROOT
+				? join(
+						resolve(process.env.SWITCHYARD_RUN_STORE_ROOT),
+						"runs",
+						handle.runId,
+						"resources",
+					)
+				: null;
+		const ownership =
+			this.ownedResourcesByUuid.get(entry.uuid) ??
+			(suppliedOwnership?.resourceRoot
+				? this.readVmOwnership(entry.uuid, suppliedOwnership.resourceRoot)
+				: registeredResourceRoot
+					? this.readVmOwnership(entry.uuid, registeredResourceRoot)
+					: null);
+		if (!ownership) {
+			throw new Error("recovery_evidence_missing for targeted VM destruction");
+		}
+		if (
+			ownership.vmUuid !== entry.uuid ||
+			ownership.vmName !== entry.name ||
+			(handle &&
+				typeof handle === "object" &&
+				((handle.runId && handle.runId !== ownership.runId) ||
+					(handle.taskId && handle.taskId !== ownership.taskId) ||
+					(handle.attemptId && handle.attemptId !== ownership.attemptId) ||
+					(handle.processStartIdentity &&
+						handle.processStartIdentity !== ownership.processStartIdentity)))
+		) {
+			throw new Error("VM identity changed before destruction");
+		}
 		if (
 			handle &&
 			typeof handle === "object" &&
@@ -2360,6 +2726,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		// Only after cleanup: a sidecar removed ahead of the snapshots it names
 		// converts a retryable failure into a permanent orphan.
 		this.deleteSnapshotSidecar(entry.uuid);
+		this.deleteVmOwnership(entry.uuid, ownership.resourceRoot);
 		return result;
 	}
 
@@ -2369,7 +2736,12 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * closed. Identity and eligibility are checked again immediately before any
 	 * VM mutation.
 	 */
-	reclaim({ dryRun = false, onStatus, eligibility = null } = {}) {
+	reclaim({
+		dryRun = false,
+		onStatus,
+		eligibility = null,
+		ownershipContext = null,
+	} = {}) {
 		// `skipped` answers one question only: which VMs were left alone. The
 		// snapshot channels are separate because a VM can be reclaimed AND have
 		// its snapshots left behind, so a single list would have to mean two
@@ -2382,10 +2754,42 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			errors: [],
 		};
 		for (const entry of this.listManaged()) {
+			const registeredRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+			const resourceRoot = registeredRoot
+				? join(resolve(registeredRoot), "runs", entry.runId, "resources")
+				: null;
+			if (
+				!resourceRoot ||
+				(ownershipContext?.resourceRoot &&
+					resolve(ownershipContext.resourceRoot) !== resourceRoot)
+			) {
+				result.skipped.push({ ...entry, reason: "recovery_evidence_missing" });
+				continue;
+			}
+			const ownership = this.readVmOwnership(entry.uuid, resourceRoot);
+			if (
+				!ownership ||
+				ownership.vmName !== entry.name ||
+				ownership.runId !== entry.runId ||
+				ownership.creatorPid !== entry.creatorPid ||
+				typeof ownership.processStartIdentity !== "string" ||
+				!ownership.processStartIdentity ||
+				(ownershipContext?.projectRoot &&
+					resolve(ownershipContext.projectRoot) !== ownership.projectRoot)
+			) {
+				result.skipped.push({ ...entry, reason: "recovery_evidence_missing" });
+				onStatus?.({
+					type: "skip",
+					name: entry.name,
+					reason: "recovery_evidence_missing",
+				});
+				continue;
+			}
 			let eligible = false;
 			try {
 				eligible =
-					typeof eligibility === "function" && eligibility(entry) === true;
+					typeof eligibility === "function" &&
+					eligibility({ ...entry, ownership }) === true;
 			} catch {
 				eligible = false;
 			}
@@ -2407,7 +2811,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 						candidate.runId === entry.runId &&
 						candidate.creatorPid === entry.creatorPid,
 				);
-				eligible = current !== undefined && eligibility(current) === true;
+				eligible =
+					current !== undefined &&
+					eligibility({ ...current, ownership }) === true;
 			} catch {
 				current = undefined;
 				eligible = false;
@@ -2457,6 +2863,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			try {
 				this.cleanupLinkedSnapshots(metadata.goldenImage, metadata.snapshotIds);
 				this.deleteSnapshotSidecar(entry.uuid);
+				this.deleteVmOwnership(entry.uuid, ownership.resourceRoot);
 				result.reclaimedSnapshots.push({
 					name: entry.name,
 					goldenImage: metadata.goldenImage,

@@ -21,6 +21,13 @@ import {
 	withDisposableClone,
 	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+
+const AUTH_TEST_RUN_STORE_ROOT = join(
+	tmpdir(),
+	`switchyard-auth-run-store-${process.pid}-${randomUUID()}`,
+);
+process.env.SWITCHYARD_RUN_STORE_ROOT = AUTH_TEST_RUN_STORE_ROOT;
 
 function fakeProvider(name, { authenticatedSequence }) {
 	let call = 0;
@@ -566,6 +573,84 @@ describe("liveness gating", () => {
 });
 
 describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposableClone)", () => {
+	it("refuses auth allocation when the registered run-store root is absent", () => {
+		const original = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		let creates = 0;
+		try {
+			throws(
+				() =>
+					withDisposableClone(
+						{
+							goldenImage: "golden",
+							aquaUid: "501",
+							create: () => {
+								creates += 1;
+							},
+						},
+						() => {},
+					),
+				/RUN_STORE_ROOT/,
+			);
+		} finally {
+			process.env.SWITCHYARD_RUN_STORE_ROOT = original;
+		}
+		strictEqual(creates, 0);
+	});
+
+	it("propagates auth ownership through the real backend allocation path", () => {
+		const resourceRoot = join(
+			tmpdir(),
+			`switchyard-auth-owned-${randomUUID()}`,
+		);
+		let cloneName = null;
+		let written = null;
+		const backend = new ParallelsExecutionBackend({
+			goldenImage: "golden",
+			aquaUid: 501,
+			requireLinkedCloneMeasurement: false,
+			prlctlFn: (args) => {
+				if (args[0] === "clone") cloneName = args[3];
+				if (args[0] === "list") {
+					return [
+						"uuid\tstatus\tname",
+						"{11111111-1111-4111-8111-111111111111}\tstopped\tgolden",
+						...(cloneName
+							? [
+									`{22222222-2222-4222-8222-222222222222}\trunning\t${cloneName}`,
+								]
+							: []),
+					].join("\n");
+				}
+				return "";
+			},
+		});
+		backend.boot = () => {};
+		backend._hardenClone = () => {};
+		backend._prepareWorkspace = () => {};
+		backend.stopAndDelete = (entry) => ({ ...entry, forced: false });
+		const originalWrite = backend.writeVmOwnership.bind(backend);
+		backend.writeVmOwnership = (uuid, name, ownership) => {
+			written = originalWrite(uuid, name, ownership);
+			return written;
+		};
+		withDisposableClone(backend, () => {}, {
+			ownershipContext: {
+				resourceRoot,
+				runId: "replaced-by-auth",
+				taskId: "auth-qualification",
+				attemptId: "qualification",
+				projectRoot: "/private/tmp/switchyard",
+				creatorPid: process.pid,
+				processStartIdentity: null,
+			},
+		});
+		strictEqual(written.purpose, "auth-qualification");
+		ok(written.runId.startsWith("auth-qualification-"));
+		strictEqual(written.projectRoot, "/private/tmp/switchyard");
+		rmSync(resourceRoot, { recursive: true, force: true });
+	});
+
 	it("withDisposableClone creates managed clone and destroys it in finally block", () => {
 		const calls = [];
 		const backend = {
@@ -593,6 +678,11 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 		strictEqual(calls[0].options.linked, false);
 		strictEqual(calls[0].options.aquaUid, "501");
 		strictEqual(calls[0].options.providerUser, "switchyard");
+		strictEqual(
+			calls[0].options.ownershipContext.purpose,
+			"auth-qualification",
+			"qualification clones carry a distinct ownership purpose",
+		);
 		ok(
 			calls[0].options.runId.startsWith("auth-qualification-"),
 			"runId must have auth-qualification prefix",

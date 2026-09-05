@@ -48,7 +48,8 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isAgyAuthenticated } from "../adapter/agy.mjs";
 import { isClaudeAuthenticated } from "../adapter/claude.mjs";
 import { isCodexAuthenticated } from "../adapter/codex.mjs";
@@ -57,6 +58,34 @@ import { isCursorAuthenticated } from "../adapter/cursor.mjs";
 import { isVibeAuthenticated } from "../adapter/vibe.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { probeLiveness } from "./liveness.mjs";
+
+const AUTH_PROJECT_ROOT = resolve(
+	dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"..",
+	"..",
+);
+
+function authOwnershipContext(options, runId) {
+	const supplied = options.ownershipContext;
+	if (supplied) return { ...supplied, runId, purpose: "auth-qualification" };
+	const runStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+	if (!runStoreRoot) {
+		throw new Error(
+			"auth qualification requires SWITCHYARD_RUN_STORE_ROOT for VM ownership metadata",
+		);
+	}
+	return {
+		resourceRoot: join(resolve(runStoreRoot), "runs", runId, "resources"),
+		runId,
+		taskId: "auth-qualification",
+		attemptId: "qualification",
+		projectRoot: AUTH_PROJECT_ROOT,
+		creatorPid: process.pid,
+		processStartIdentity: null,
+		purpose: "auth-qualification",
+	};
+}
 
 /**
  * Build the same execution backend a real macOS-platform dispatch would use
@@ -178,13 +207,16 @@ export function withDisposableClone(executionBackend, fn, options = {}) {
 		`Creating disposable full clone from golden image ${executionBackend.goldenImage}...`,
 	);
 	let workspaceId;
+	const runId = `auth-qualification-${randomUUID()}`;
+	const ownershipContext = authOwnershipContext(options, runId);
 	try {
 		workspaceId = executionBackend.create(executionBackend.goldenImage, {
 			...options,
-			runId: `auth-qualification-${randomUUID()}`,
+			runId,
 			linked: false,
 			aquaUid: executionBackend.aquaUid,
 			providerUser: executionBackend.providerUser,
+			ownershipContext,
 		});
 		console.error(
 			`Disposable full clone created (${workspaceId}), running auth qualification...`,
