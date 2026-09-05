@@ -80,6 +80,10 @@ function exactFailureEvidence(targetId, harness, model, taskId = "1.1") {
 		errorKind: "execution_failed",
 		reasonCode: "execution_failed",
 		reason: "Provider execution failed before a reviewed integration.",
+		diagnosticCode: "provider_exit_nonzero",
+		diagnosticOrigin: "adapter",
+		diagnosticEvidenceAvailable: true,
+		exitCode: 1,
 		failurePhase: "provider_execution",
 	};
 }
@@ -2686,8 +2690,7 @@ describe("envelope format", () => {
 			completedTaskIds: [],
 			lastTaskId: "1.1",
 			lastUpdatedAt: new Date().toISOString(),
-			results: [opencodeFailure],
-			retryAttempts: [agyFailure],
+			results: [agyFailure, opencodeFailure],
 		});
 		const current = await readRun(runId);
 		await updateRun(
@@ -2699,7 +2702,14 @@ describe("envelope format", () => {
 					errorKind: "execution_failed",
 					reasonCode: "execution_failed",
 					reason: "Provider execution failed before a reviewed integration.",
+					diagnosticCode: "provider_exit_nonzero",
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
+					exitCode: 1,
 					failurePhase: "provider_execution",
+					resolvedTargetId: opencodeFailure.resolvedTargetId,
+					descriptorIdentity: opencodeFailure.descriptorIdentity,
+					descriptorHarness: opencodeFailure.descriptorHarness,
 				},
 				terminalizedBy: "worker",
 				terminalSummary: { processedTasks: 1 },
@@ -2720,6 +2730,74 @@ describe("envelope format", () => {
 				"antigravity",
 				"opencode-go",
 			]);
+		}
+	});
+
+	it("keeps legacy untrusted descriptor evidence from ejecting a target", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { saveCheckpoint } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+		const runId = "legacy-untrusted-descriptor-evidence";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		const trustedFixture = exactFailureEvidence(
+			"opencode-go",
+			"opencode",
+			"fixture/opencode-standard",
+		);
+		const legacyUntrustedFixture = { ...trustedFixture };
+		delete legacyUntrustedFixture.diagnosticCode;
+		delete legacyUntrustedFixture.diagnosticOrigin;
+		delete legacyUntrustedFixture.diagnosticEvidenceAvailable;
+		delete legacyUntrustedFixture.exitCode;
+		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+			version: 1,
+			tasksFilePath: tasksFile,
+			completedTaskIds: [],
+			lastTaskId: "1.1",
+			lastUpdatedAt: new Date().toISOString(),
+			results: [legacyUntrustedFixture],
+		});
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: {
+					errorKind: "execution_failed",
+					reasonCode: "execution_failed",
+					reason: "Provider execution failed before a reviewed integration.",
+					failurePhase: "provider_execution",
+					resolvedTargetId: trustedFixture.resolvedTargetId,
+					descriptorIdentity: trustedFixture.descriptorIdentity,
+					descriptorHarness: trustedFixture.descriptorHarness,
+				},
+				terminalizedBy: "worker",
+				terminalSummary: { processedTasks: 1 },
+			},
+			current.revision,
+		);
+
+		for (const [command, expectedStatus] of [
+			["status", 0],
+			["result", 1],
+		]) {
+			const response = runDispatch([command, runId], makeStateRootEnv());
+			strictEqual(response.status, expectedStatus);
+			const envelope = JSON.parse(response.stdout.trim());
+			strictEqual(envelope.disposition.action, "stop");
+			strictEqual(envelope.disposition.reasonCode, "insufficient_evidence");
+			deepStrictEqual(envelope.disposition.failedTargetIds, []);
 		}
 	});
 
