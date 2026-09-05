@@ -1,5 +1,16 @@
-import { deepStrictEqual, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import {
+	existsSync,
+	mkdtempSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
 	captureProviderDiff,
@@ -11,6 +22,26 @@ import {
 	runProviderProcess,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import { validateIdentifier } from "../src/switchyard/adapter/shell-safety.mjs";
+import {
+	captureTaskStartTree,
+	captureTaskStartTreeAsync,
+	validateTaskStartTree,
+	validateTaskStartTreeAsync,
+} from "../src/switchyard/lifecycle/index.mjs";
+
+const TASK_BASE = {
+	ref: "refs/switchyard/task-base/test-run/1.1",
+	tree: "1".repeat(40),
+};
+
+function taskBaseValidationCommand(argv) {
+	return argv[1] === "rev-parse"
+		? {
+				command: process.execPath,
+				args: ["-e", `process.stdout.write(${JSON.stringify(TASK_BASE.tree)})`],
+			}
+		: null;
+}
 
 function fakeChild() {
 	const child = new EventEmitter();
@@ -28,6 +59,75 @@ function fakeChild() {
 }
 
 describe("provider process lifecycle", () => {
+	for (const [mode, validate] of [
+		["synchronous", validateTaskStartTree],
+		["asynchronous", validateTaskStartTreeAsync],
+	]) {
+		it(`hard-kills a SIGTERM-ignoring ${mode} host probe at its deadline`, async () => {
+			const root = mkdtempSync(join(tmpdir(), "switchyard-probe-timeout-"));
+			const readyPath = join(root, "ready");
+			const script = [
+				'process.on("SIGTERM", () => {});',
+				'require("node:fs").writeFileSync(process.argv[1], "ready");',
+				"setTimeout(() => process.exit(0), 1000);",
+			].join("");
+			const backend = {
+				execArgv() {
+					return { command: process.execPath, args: ["-e", script, readyPath] };
+				},
+			};
+			const startedAt = Date.now();
+			try {
+				if (mode === "synchronous") {
+					throws(() =>
+						validate(backend, "worker", TASK_BASE, { timeoutMs: 250 }),
+					);
+				} else {
+					await rejects(
+						validate(backend, "worker", TASK_BASE, { timeoutMs: 250 }),
+					);
+				}
+				ok(existsSync(readyPath), "child installed its handler before timeout");
+				ok(
+					Date.now() - startedAt < 700,
+					"probe returned within its hard budget",
+				);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("bounds and reports an asynchronous task-base probe", async () => {
+		const statuses = [];
+		await rejects(
+			captureTaskStartTreeAsync(
+				{
+					execArgv() {
+						return {
+							command: process.execPath,
+							args: ["-e", "setInterval(() => {}, 1000)"],
+						};
+					},
+				},
+				"worker",
+				{
+					runId: "timeout-run",
+					taskId: "1.1",
+					timeoutMs: 10,
+					onStatus: (status) => statuses.push(status),
+				},
+			),
+		);
+		deepStrictEqual(
+			statuses.map(({ event, stage }) => [event, stage]),
+			[
+				["task_base_probe_started", "task_base_stage"],
+				["task_base_probe_failed", "task_base_stage"],
+			],
+		);
+	});
+
 	it("accepts exact Parallels UUID workspace handles but rejects malformed braces", () => {
 		validateIdentifier("{11111111-1111-4111-8111-111111111111}", "workspaceId");
 		throws(
@@ -163,11 +263,14 @@ describe("provider process lifecycle", () => {
 			execArgv(_workspaceId, options = {}) {
 				backendOptions.push(options);
 				const { argv } = options;
+				const validation = taskBaseValidationCommand(argv);
+				if (validation) return validation;
 				return { command: "fake", args: [...argv] };
 			},
 		};
 		const result = await captureProviderDiffAsync("worker", {
 			executionBackend: passthroughExecutionBackend,
+			taskBase: TASK_BASE,
 			spawnFn: (_command, args) => {
 				calls.push(args.at(-1));
 				const child = fakeChild();
@@ -182,22 +285,25 @@ describe("provider process lifecycle", () => {
 			},
 		});
 		strictEqual(typeof result, "string");
-		deepStrictEqual(calls, ["-A", "HEAD"]);
+		deepStrictEqual(calls, ["-A", TASK_BASE.tree]);
 		deepStrictEqual(
 			backendOptions.map((options) => options.recordPid),
-			[true, true],
+			[true, true, true],
 		);
 	});
 
 	it("reports bounded async diff-capture outcomes without raw process output", async () => {
 		const backend = {
 			execArgv(_workspaceId, { argv }) {
+				const validation = taskBaseValidationCommand(argv);
+				if (validation) return validation;
 				return { command: "fake", args: [...argv] };
 			},
 		};
 		const run = (exitCode, output = "") =>
 			captureProviderDiffDetailedAsync("worker", {
 				executionBackend: backend,
+				taskBase: TASK_BASE,
 				spawnFn: (_command, _args) => {
 					const child = fakeChild();
 					queueMicrotask(() => {
@@ -214,6 +320,7 @@ describe("provider process lifecycle", () => {
 		let call = 0;
 		const diffFailed = await captureProviderDiffDetailedAsync("worker", {
 			executionBackend: backend,
+			taskBase: TASK_BASE,
 			spawnFn: (_command, _args) => {
 				const child = fakeChild();
 				queueMicrotask(() => child.emit("close", call++ === 0 ? 0 : 9, null));
@@ -224,6 +331,7 @@ describe("provider process lifecycle", () => {
 
 		const transportFailed = await captureProviderDiffDetailedAsync("worker", {
 			executionBackend: backend,
+			taskBase: TASK_BASE,
 			spawnFn: () => {
 				throw new Error("transport detail must not escape");
 			},
@@ -232,6 +340,7 @@ describe("provider process lifecycle", () => {
 
 		const timedOut = await captureProviderDiffDetailedAsync("worker", {
 			executionBackend: backend,
+			taskBase: TASK_BASE,
 			timeoutMs: 1,
 			termGraceMs: 1,
 			spawnFn: () => fakeChild(),
@@ -270,18 +379,97 @@ describe("provider process lifecycle", () => {
 		const executionBackend = {
 			execArgv(_workspaceId, options = {}) {
 				backendOptions.push(options);
-				const isCapture = options.argv.at(-1) === "HEAD";
+				const validation = taskBaseValidationCommand(options.argv);
+				if (validation) return validation;
+				const isCapture = options.argv.at(-1) === TASK_BASE.tree;
 				return {
 					command: process.execPath,
 					args: ["-e", isCapture ? 'process.stdout.write("diff")' : ""],
 				};
 			},
 		};
-		strictEqual(captureProviderDiff("worker", { executionBackend }), "diff");
+		strictEqual(
+			captureProviderDiff("worker", { executionBackend, taskBase: TASK_BASE }),
+			"diff",
+		);
 		deepStrictEqual(
 			backendOptions.map((options) => options.recordPid),
-			[true, true],
+			[true, true, true],
 		);
+	});
+
+	it("exports a worker commit against an anchored task-start tree and rejects a replaced anchor", () => {
+		const projectPath = mkdtempSync(join(tmpdir(), "switchyard-task-base-"));
+		try {
+			writeFileSync(join(projectPath, "tracked.txt"), "before\n");
+			writeFileSync(join(projectPath, "deleted.txt"), "delete me\n");
+			writeFileSync(join(projectPath, "rename-old.txt"), "rename me\n");
+			for (const args of [
+				["init", "-q"],
+				["config", "user.name", "Test"],
+				["config", "user.email", "test@example.invalid"],
+				["add", "."],
+				["commit", "-qm", "baseline"],
+			]) {
+				execFileSync("git", args, { cwd: projectPath });
+			}
+			const executionBackend = {
+				execArgv(_workspaceId, { argv }) {
+					return {
+						command: "git",
+						args: ["-C", projectPath, ...argv.slice(1)],
+					};
+				},
+			};
+			const taskBase = captureTaskStartTree(executionBackend, "worker", {
+				runId: "test-run",
+				taskId: "1.1",
+			});
+			writeFileSync(join(projectPath, "tracked.txt"), "after\n");
+			execFileSync("git", ["add", "tracked.txt"], { cwd: projectPath });
+			execFileSync("git", ["commit", "-qm", "worker edit"], {
+				cwd: projectPath,
+			});
+			writeFileSync(join(projectPath, "tracked.txt"), "after unstaged\n");
+			writeFileSync(join(projectPath, "new.txt"), "new file\n");
+			execFileSync("git", ["add", "new.txt"], { cwd: projectPath });
+			unlinkSync(join(projectPath, "deleted.txt"));
+			renameSync(
+				join(projectPath, "rename-old.txt"),
+				join(projectPath, "rename-new.txt"),
+			);
+			execFileSync("git", ["gc", "--prune=now"], { cwd: projectPath });
+			const diff = captureProviderDiff("worker", {
+				executionBackend,
+				taskBase,
+			});
+			ok(diff?.includes("+after unstaged"), "unstaged worker edit must export");
+			ok(diff?.includes("new.txt"), "staged new file must export");
+			ok(diff?.includes("deleted.txt"), "deleted file must export");
+			ok(diff?.includes("rename-new.txt"), "renamed file must export");
+			execFileSync("git", ["update-ref", "-d", taskBase.ref], {
+				cwd: projectPath,
+			});
+			strictEqual(
+				captureProviderDiff("worker", { executionBackend, taskBase }),
+				null,
+				"a deleted task-base ref must stop capture rather than using HEAD",
+			);
+			const replacement = execFileSync("git", ["write-tree"], {
+				cwd: projectPath,
+				encoding: "utf8",
+			}).trim();
+			execFileSync("git", ["update-ref", taskBase.ref, replacement], {
+				cwd: projectPath,
+			});
+			strictEqual(
+				captureProviderDiff("worker", { executionBackend, taskBase }),
+				null,
+				"a replaced task-base ref must stop capture rather than using HEAD",
+			);
+		} finally {
+			rmSync(projectPath, { recursive: true, force: true });
+		}
 	});
 
 	it("classifies synchronous detailed diff-capture outcomes", () => {
@@ -325,11 +513,13 @@ describe("provider process lifecycle", () => {
 			let calls = 0;
 			const executionBackend = {
 				execArgv(_workspaceId, { argv }) {
+					const validation = taskBaseValidationCommand(argv);
+					if (validation) return validation;
 					calls += 1;
 					if (calls === testCase.transportCall) {
 						throw new Error("transport detail must not escape");
 					}
-					const isCapture = argv.at(-1) === "HEAD";
+					const isCapture = argv.at(-1) === TASK_BASE.tree;
 					const exitCode = isCapture ? testCase.diffExit : testCase.stageExit;
 					const script =
 						exitCode === 0
@@ -343,6 +533,7 @@ describe("provider process lifecycle", () => {
 
 			const result = captureProviderDiffDetailed("worker", {
 				executionBackend,
+				taskBase: TASK_BASE,
 			});
 			strictEqual(result.status, testCase.expectedStatus, testCase.name);
 			strictEqual(

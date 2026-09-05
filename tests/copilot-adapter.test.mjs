@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	execute as executeCopilot,
 } from "../src/switchyard/adapter/copilot.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -109,6 +110,14 @@ describe("copilot adapter container execution", () => {
 	it("passes noninteractive prompt and tool permissions, then captures the diff", {
 		skip: !dockerAvailable,
 	}, () => {
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			containerName,
+			{
+				runId: "copilot-adapter",
+				taskId: "1.1",
+			},
+		);
 		const result = executeCopilot("apply a small change", containerName, {
 			model: "fake-model",
 			resolvedTargetId: COPILOT_DESCRIPTOR.target_id,
@@ -121,6 +130,7 @@ describe("copilot adapter container execution", () => {
 
 		const diff = captureDiff(containerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));

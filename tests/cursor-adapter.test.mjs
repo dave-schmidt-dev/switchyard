@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	executeCursor,
 } from "../src/switchyard/adapter/cursor.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -134,6 +135,14 @@ describe("cursor adapter container execution", () => {
 		// The stub exits non-zero unless the required flags, model arg, and
 		// prompt are all present and correctly paired, so a green result here is
 		// itself the assertion that executeCursor sends them.
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			containerName,
+			{
+				runId: "cursor-adapter",
+				taskId: "1.1",
+			},
+		);
 		const result = executeCursor(CURSOR_PROMPT, containerName, {
 			model: CURSOR_MODEL,
 			resolvedTargetId: CURSOR_DESCRIPTOR.target_id,
@@ -146,6 +155,7 @@ describe("cursor adapter container execution", () => {
 
 		const diff = captureDiff(containerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));

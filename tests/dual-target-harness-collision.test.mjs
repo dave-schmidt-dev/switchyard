@@ -405,6 +405,19 @@ describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's
 });
 
 describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selector per target (C.7 proof)", () => {
+	const taskBase = {
+		ref: "refs/switchyard/task-base/dual-target/T-dual-agy",
+		tree: "2".repeat(40),
+	};
+	const taskBaseContext = {
+		queueBackend: {
+			captureTaskBase: () => taskBase,
+			captureTaskBaseAsync: async () => taskBase,
+			validateTaskBase: (_workspaceId, base) => base,
+			validateTaskBaseAsync: async (_workspaceId, base) => base,
+		},
+		taskBases: {},
+	};
 	function makeAdapterContext({ provider, model, targetId }) {
 		const executeCalls = [];
 		const descriptor = syntheticDescriptor({
@@ -414,6 +427,8 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		});
 		return {
 			context: {
+				...taskBaseContext,
+				taskBases: {},
 				route: () => ({
 					provider,
 					model,
@@ -486,6 +501,8 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		});
 		return {
 			context: {
+				...taskBaseContext,
+				taskBases: {},
 				route: () => ({
 					provider,
 					model,
@@ -503,6 +520,9 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 				projectPath: "/tmp/does-not-matter",
 				workingContainerName: "test-container",
 				exclude: [],
+				adapters: {
+					agy: { captureDiffAsync: async () => "" },
+				},
 				orchestrator: {
 					launch: async (payload) => {
 						launchCalls.push(payload);

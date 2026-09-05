@@ -24,6 +24,10 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+const TASK_BASE = {
+	ref: "refs/switchyard/task-base/harness-fixture/T-1",
+	tree: "1".repeat(40),
+};
 
 before(() => {
 	process.env.SWITCHYARD_ROSTER_PATH = FIXTURE_PATH;
@@ -50,6 +54,11 @@ function makeContext({ provider, model }) {
 	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
+			queueBackend: {
+				captureTaskBase: () => TASK_BASE,
+				validateTaskBase: (_workspaceId, base) => base,
+			},
+			taskBases: {},
 			route: () => ({
 				provider,
 				model,

@@ -9,6 +9,7 @@ import {
 	execute as executeOpencode,
 	OPENCODE_SUPERVISOR,
 } from "../src/switchyard/adapter/opencode.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -153,6 +154,14 @@ describe("opencode adapter container execution", () => {
 	it("captures the applied diff", {
 		skip: !dockerAvailable,
 	}, () => {
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			containerName,
+			{
+				runId: "opencode-adapter",
+				taskId: "1.1",
+			},
+		);
 		const result = executeOpencode(PROMPT_MARKER, containerName, {
 			model: "fake-model",
 			resolvedTargetId: OPENCODE_DESCRIPTOR.target_id,
@@ -165,6 +174,7 @@ describe("opencode adapter container execution", () => {
 
 		const diff = captureDiff(containerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));

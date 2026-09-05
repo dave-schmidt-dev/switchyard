@@ -75,7 +75,15 @@ import {
 	loadWorkspaceLifecycleHooks,
 	runWorkspaceLifecycleHook,
 } from "../lifecycle/hooks.mjs";
-import { seedProjectWithBackend } from "../lifecycle/index.mjs";
+import {
+	captureTaskStartTree,
+	captureTaskStartTreeAsync,
+	releaseTaskStartTree,
+	releaseTaskStartTreeAsync,
+	seedProjectWithBackend,
+	validateTaskStartTree,
+	validateTaskStartTreeAsync,
+} from "../lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
@@ -1630,6 +1638,7 @@ export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
 		lastTaskId: null,
 		lastUpdatedAt: null,
 		results: [],
+		taskBases: {},
 	};
 	if (identity.queueIdentity) {
 		checkpoint.queueIdentity = identity.queueIdentity;
@@ -2732,6 +2741,242 @@ async function captureDiffWithEvidenceAsync(adapter, workspaceName, options) {
 		: { status: "transport_failed", diff: null };
 }
 
+// A provider must never choose its own diff base. The runner records this
+// receipt before launch, and capture revalidates the anchored ref afterwards.
+function taskBaseProbeOptions(context) {
+	return {
+		timeoutMs: 30_000,
+		signal: context.signal,
+		onStatus: context.onStatus,
+	};
+}
+
+function prepareTaskBase(context, task) {
+	try {
+		const existing = context.taskBases?.[task.id] ?? null;
+		const base = existing
+			? context.queueBackend.validateTaskBase(
+					context.workingContainerName,
+					existing,
+					taskBaseProbeOptions(context),
+				)
+			: context.queueBackend.captureTaskBase(context.workingContainerName, {
+					runId: context.runId,
+					taskId: task.id,
+					...taskBaseProbeOptions(context),
+				});
+		context.persistTaskBase?.(task.id, base);
+		context._activeTaskBase = base;
+		return base;
+	} catch {
+		context.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_failed",
+			status: `Task ${task.id} immutable base capture failed`,
+			taskId: task.id,
+		});
+		return null;
+	}
+}
+
+async function prepareTaskBaseAsync(context, task) {
+	try {
+		const existing = context.taskBases?.[task.id] ?? null;
+		const validateAsync =
+			context.queueBackend.validateTaskBaseAsync ??
+			((...args) => context.queueBackend.validateTaskBase(...args));
+		const captureAsync =
+			context.queueBackend.captureTaskBaseAsync ??
+			((...args) => context.queueBackend.captureTaskBase(...args));
+		const base = existing
+			? await validateAsync(
+					context.workingContainerName,
+					existing,
+					taskBaseProbeOptions(context),
+				)
+			: await captureAsync(context.workingContainerName, {
+					runId: context.runId,
+					taskId: task.id,
+					...taskBaseProbeOptions(context),
+				});
+		context.persistTaskBase?.(task.id, base);
+		context._activeTaskBase = base;
+		return base;
+	} catch {
+		context.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_failed",
+			status: `Task ${task.id} immutable base capture failed`,
+			taskId: task.id,
+		});
+		return null;
+	}
+}
+
+function taskBaseReleaseHalt(taskId) {
+	return {
+		taskId,
+		success: false,
+		provider: null,
+		model: null,
+		result: "halted_after_task_base_release_failure",
+		errorKind: "diff_capture_failed",
+		reason: "immutable task base release is uncertain; recovery required",
+	};
+}
+
+function providerCleanupHalt(result) {
+	return {
+		taskId: result.taskId,
+		success: false,
+		provider: result.provider ?? null,
+		model: result.model ?? null,
+		result: "halted_after_provider_cleanup_failure",
+		errorKind: "provider_cleanup_failed",
+		reason: "provider cleanup is uncertain; recovery required",
+		cleanupFailed: true,
+		cleanupStage: result.cleanupStage ?? null,
+	};
+}
+
+function markProviderCleanupUncertain(checkpoint, result) {
+	if (result.cleanupFailed !== true) return;
+	checkpoint.providerCleanupUncertain = {
+		taskId: result.taskId,
+		cleanupStage: result.cleanupStage ?? null,
+	};
+}
+
+function persistProviderCleanupUncertain(checkpoint, result, checkpointPath) {
+	if (result.cleanupFailed !== true) return;
+	markProviderCleanupUncertain(checkpoint, result);
+	checkpoint.lastUpdatedAt = new Date().toISOString();
+	saveCheckpoint(checkpointPath, checkpoint);
+}
+
+function assertCheckpointRecoverySafe(checkpoint) {
+	const marker = checkpoint.taskBaseReleaseUncertain
+		? "immutable task base release"
+		: checkpoint.providerCleanupUncertain
+			? "provider cleanup"
+			: null;
+	if (!marker) return;
+	const error = new Error(
+		`checkpoint records uncertain ${marker}; explicit recovery is required`,
+	);
+	error.code = "recovery_required";
+	throw error;
+}
+
+function finalizeTaskBase(context, taskId, checkpoint, checkpointPath) {
+	const base = checkpoint.taskBases?.[taskId];
+	if (!base) return null;
+	try {
+		context.queueBackend.releaseTaskBase(
+			context.workingContainerName,
+			base,
+			taskBaseProbeOptions(context),
+		);
+		delete checkpoint.taskBases[taskId];
+		if (checkpoint.taskBaseReleaseUncertain?.taskId === taskId) {
+			delete checkpoint.taskBaseReleaseUncertain;
+		}
+		checkpoint.lastUpdatedAt = new Date().toISOString();
+		saveCheckpoint(checkpointPath, checkpoint);
+		context.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_released",
+			status: `Task ${taskId} immutable base released`,
+			taskId,
+		});
+		return null;
+	} catch {
+		checkpoint.taskBaseReleaseUncertain = { taskId, ...base };
+		checkpoint.lastUpdatedAt = new Date().toISOString();
+		saveCheckpoint(checkpointPath, checkpoint);
+		context.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_release_failed",
+			status: `Task ${taskId} immutable base release uncertain; recovery required`,
+			taskId,
+		});
+		return taskBaseReleaseHalt(taskId);
+	}
+}
+
+async function finalizeTaskBaseAsync(
+	context,
+	taskId,
+	checkpoint,
+	checkpointPath,
+) {
+	const base = checkpoint.taskBases?.[taskId];
+	if (!base) return null;
+	try {
+		const releaseAsync =
+			context.queueBackend.releaseTaskBaseAsync ??
+			((...args) => context.queueBackend.releaseTaskBase(...args));
+		await releaseAsync(
+			context.workingContainerName,
+			base,
+			taskBaseProbeOptions(context),
+		);
+		delete checkpoint.taskBases[taskId];
+		if (checkpoint.taskBaseReleaseUncertain?.taskId === taskId) {
+			delete checkpoint.taskBaseReleaseUncertain;
+		}
+		checkpoint.lastUpdatedAt = new Date().toISOString();
+		saveCheckpoint(checkpointPath, checkpoint);
+		context.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_released",
+			status: `Task ${taskId} immutable base released`,
+			taskId,
+		});
+		return null;
+	} catch {
+		checkpoint.taskBaseReleaseUncertain = { taskId, ...base };
+		checkpoint.lastUpdatedAt = new Date().toISOString();
+		saveCheckpoint(checkpointPath, checkpoint);
+		context.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_release_failed",
+			status: `Task ${taskId} immutable base release uncertain; recovery required`,
+			taskId,
+		});
+		return taskBaseReleaseHalt(taskId);
+	}
+}
+
+function taskBaseFailure(
+	task,
+	routeResult,
+	invocationDescriptor,
+	requiredCapability,
+) {
+	return {
+		...descriptorReceiptFields(invocationDescriptor),
+		taskId: task.id,
+		success: false,
+		provider: routeResult.provider ?? null,
+		model: invocationDescriptor?.selector ?? routeResult.model ?? null,
+		requiredCapability,
+		resolvedTargetId: routeResult.resolvedTargetId ?? null,
+		result: "task_base_capture_failed",
+		errorKind: "diff_capture_failed",
+		reason: "immutable task base capture failed",
+	};
+}
+
+function taskBaseMatches(actual, expected) {
+	return (
+		actual !== null &&
+		typeof actual === "object" &&
+		actual.ref === expected?.ref &&
+		actual.tree === expected?.tree
+	);
+}
+
 /**
  * Execute one task via routed provider/model and return a structured result.
  * @param {{id: string, title: string, description: string}} task
@@ -2943,6 +3188,22 @@ export function executeTask(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
+	if (!prepareTaskBase(context, task)) {
+		record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "task_base_capture_failed",
+			errorKind: "diff_capture_failed",
+			reason: "immutable task base capture failed",
+		});
+		return taskBaseFailure(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
 		timeoutMs,
@@ -2952,6 +3213,29 @@ export function executeTask(task, context) {
 		descriptorHarness: routeResult.resolved_harness ?? null,
 		resolvedTargetId,
 	});
+	if (execution.cleanupFailed === true && execution.success) {
+		record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "provider_cleanup_failed",
+			errorKind: "provider_cleanup_failed",
+			reason: "provider cleanup is uncertain; recovery required",
+			cleanupStage: execution.cleanupStage ?? null,
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "provider_cleanup_failed",
+			errorKind: "provider_cleanup_failed",
+			...survivingProviderFields(execution),
+		};
+	}
 
 	if (!execution.success) {
 		if (execution.timedOut) {
@@ -2974,7 +3258,10 @@ export function executeTask(task, context) {
 				captureEvidence = captureDiffWithEvidence(
 					adapter,
 					context.workingContainerName,
-					{ executionBackend: context.executionBackend },
+					{
+						executionBackend: context.executionBackend,
+						taskBase: context._activeTaskBase,
+					},
 				);
 			} catch {
 				captureEvidence = { status: "transport_failed", diff: null };
@@ -3068,6 +3355,7 @@ export function executeTask(task, context) {
 				failurePhase: execution.failurePhase,
 				diagnosticOrigin: execution.diagnosticOrigin,
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+				cleanupFailed,
 				cleanupStage: execution.cleanupStage,
 				captureStatus,
 				...(partialDiff ? { partialDiff } : {}),
@@ -3085,7 +3373,10 @@ export function executeTask(task, context) {
 			captureEvidence = captureDiffWithEvidence(
 				adapter,
 				context.workingContainerName,
-				{ executionBackend: context.executionBackend },
+				{
+					executionBackend: context.executionBackend,
+					taskBase: context._activeTaskBase,
+				},
 			);
 		} catch {
 			captureEvidence = { status: "transport_failed", diff: null };
@@ -3154,7 +3445,10 @@ export function executeTask(task, context) {
 	const captureEvidence = captureDiffWithEvidence(
 		adapter,
 		context.workingContainerName,
-		{ executionBackend: context.executionBackend },
+		{
+			executionBackend: context.executionBackend,
+			taskBase: context._activeTaskBase,
+		},
 	);
 	const diff = captureEvidence.diff;
 	if (context.onStatus) {
@@ -3600,6 +3894,23 @@ async function executeTaskAsyncUnsafe(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
+	if (!(await prepareTaskBaseAsync(context, task))) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "task_base_capture_failed",
+			errorKind: "diff_capture_failed",
+			reason: "immutable task base capture failed",
+		});
+		await releaseSelected(selectedRoute);
+		return taskBaseFailure(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
 	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
 		launcherIdentity: broker.launcherIdentity(selectedRoute),
 		signal: context.signal,
@@ -3762,6 +4073,29 @@ async function executeTaskAsyncUnsafe(task, context) {
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 	};
+	if (execution.cleanupFailed === true && execution.success) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "provider_cleanup_failed",
+			errorKind: "provider_cleanup_failed",
+			reason: "provider cleanup is uncertain; recovery required",
+			cleanupStage: execution.cleanupStage ?? null,
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "provider_cleanup_failed",
+			errorKind: "provider_cleanup_failed",
+			...survivingProviderFields(execution),
+		};
+	}
 	if (!execution.success) {
 		if (!execution.timedOut) {
 			context.onStatus?.({
@@ -3777,6 +4111,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 					context.workingContainerName,
 					{
 						executionBackend: context.executionBackend,
+						taskBase: context._activeTaskBase,
 						signal: context.signal,
 					},
 				);
@@ -3843,6 +4178,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				context.workingContainerName,
 				{
 					executionBackend: context.executionBackend,
+					taskBase: context._activeTaskBase,
 					signal: context.signal,
 				},
 			);
@@ -3937,6 +4273,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			failurePhase: execution.failurePhase,
 			diagnosticOrigin: execution.diagnosticOrigin,
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+			cleanupFailed,
 			cleanupStage: execution.cleanupStage,
 			captureStatus,
 			...(partialDiff ? { partialDiff } : {}),
@@ -3958,6 +4295,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		context.workingContainerName,
 		{
 			executionBackend: context.executionBackend,
+			taskBase: context._activeTaskBase,
 			signal: context.signal,
 		},
 	);
@@ -4173,6 +4511,7 @@ export async function runQueueAsync(options) {
 		releaseQueueSlot(queueBackend, slotLease);
 		throw error;
 	}
+	checkpoint.taskBases ??= {};
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch:
@@ -4192,6 +4531,12 @@ export async function runQueueAsync(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
+		taskBases: checkpoint.taskBases,
+		persistTaskBase: (taskId, base) => {
+			checkpoint.taskBases[taskId] = base;
+			checkpoint.lastUpdatedAt = new Date().toISOString();
+			saveCheckpoint(checkpointPath, checkpoint);
+		},
 		onStatus: dependencies.onStatus ?? null,
 		onTaskRouted: dependencies.onTaskRouted ?? null,
 		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
@@ -4499,6 +4844,7 @@ export async function runQueueAsync(options) {
 				// Same rule as the diff above: host-only bytes, never onResult.
 				result.gateEvidence = undefined;
 			}
+			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
 			results.push(result);
 			dependencies.onResult?.(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
@@ -4546,15 +4892,26 @@ export async function runQueueAsync(options) {
 			checkpoint.lastUpdatedAt = new Date().toISOString();
 			saveCheckpoint(checkpointPath, checkpoint);
 			dependencies.onCheckpointSaved?.(checkpoint);
-			const haltResult = commitOrResetWorkingContainer(result, {
-				ownsWorkingContainer,
-				workingContainerName,
-				stopOnFailure: effectiveStopOnFailure,
-				commitWorkingTreeFn: queueBackend.commit,
-				resetWorkingTreeFn: queueBackend.reset,
-				emitStatus: dependencies.onStatus,
-				logPrefix: "runQueueAsync: ",
-			});
+			let haltResult =
+				result.cleanupFailed === true ? providerCleanupHalt(result) : null;
+			if (!haltResult)
+				haltResult = commitOrResetWorkingContainer(result, {
+					ownsWorkingContainer,
+					workingContainerName,
+					stopOnFailure: effectiveStopOnFailure,
+					commitWorkingTreeFn: queueBackend.commit,
+					resetWorkingTreeFn: queueBackend.reset,
+					emitStatus: dependencies.onStatus,
+					logPrefix: "runQueueAsync: ",
+				});
+			if (!haltResult) {
+				haltResult = await finalizeTaskBaseAsync(
+					context,
+					result.taskId,
+					checkpoint,
+					checkpointPath,
+				);
+			}
 			processed += 1;
 			if (haltResult) {
 				recordHalt(
@@ -4812,6 +5169,22 @@ export async function executeTaskWithOrchestrator(task, context) {
 			context.projectPath,
 			{ onStatus: context.onStatus },
 		);
+		if (!(await prepareTaskBaseAsync(context, task))) {
+			await record({
+				provider: routeResult.provider,
+				model: routeResult.model ?? "unknown",
+				taskId: task.id,
+				result: "task_base_capture_failed",
+				errorKind: "diff_capture_failed",
+				reason: "immutable task base capture failed",
+			});
+			return taskBaseFailure(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			);
+		}
 		jobId = await context.orchestrator.launch({
 			payloadVersion: ORCHESTRATOR_PAYLOAD_VERSION,
 			contractVersion: ORCHESTRATOR_PAYLOAD_VERSION,
@@ -4825,6 +5198,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			resolvedTargetId,
 			prompt: task.prompt || task.description || task.title,
 			workingContainerName: context.workingContainerName,
+			taskBase: context._activeTaskBase,
 		});
 	} catch (error) {
 		await record({
@@ -4910,6 +5284,30 @@ export async function executeTaskWithOrchestrator(task, context) {
 			errorKind: null,
 		};
 	}
+	if (jobResult?.cleanupFailed === true) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "provider_cleanup_failed",
+			errorKind: "provider_cleanup_failed",
+			reason: "provider cleanup is uncertain; recovery required",
+			cleanupStage: jobResult.cleanupStage ?? null,
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "provider_cleanup_failed",
+			errorKind: "provider_cleanup_failed",
+			cleanupFailed: true,
+			cleanupStage: jobResult.cleanupStage ?? null,
+		};
+	}
 	if (!jobResult?.success) {
 		await record({
 			provider: routeResult.provider,
@@ -4937,7 +5335,67 @@ export async function executeTaskWithOrchestrator(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
-	const diff = typeof jobResult.diff === "string" ? jobResult.diff.trim() : "";
+	if (
+		jobResult.taskBase !== undefined &&
+		!taskBaseMatches(jobResult.taskBase, context._activeTaskBase)
+	) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "task_base_capture_failed",
+			errorKind: "diff_capture_failed",
+			reason: "immutable task base capture failed",
+		});
+		return taskBaseFailure(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
+	const adapter = selectAdapter(
+		routeResult.resolved_harness ?? routeResult.provider,
+		context.adapters,
+	);
+	let captureEvidence;
+	try {
+		captureEvidence = await captureDiffWithEvidenceAsync(
+			adapter,
+			context.workingContainerName,
+			{
+				executionBackend: context.executionBackend,
+				taskBase: context._activeTaskBase,
+				signal: context.signal,
+				onStatus: context.onStatus,
+			},
+		);
+	} catch {
+		captureEvidence = { status: "transport_failed", diff: null };
+	}
+	if (!["captured", "empty"].includes(captureEvidence.status)) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "diff_capture_failed",
+			errorKind: "diff_capture_failed",
+			reason: "authoritative host diff capture failed",
+		});
+		return {
+			...taskBaseFailure(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			),
+			result: "diff_capture_failed",
+			reason: "authoritative host diff capture failed",
+			captureStatus: captureEvidence.status,
+		};
+	}
+	const diff =
+		captureEvidence.status === "captured" ? captureEvidence.diff.trim() : "";
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "execution",
@@ -5905,6 +6363,13 @@ export function createQueueBackend({
 	runId = null,
 	runOptions = null,
 } = {}) {
+	const taskBaseRunId =
+		typeof runId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(runId)
+			? runId
+			: `queue-${createHash("sha256")
+					.update(String(projectPath ?? "project"))
+					.digest("hex")
+					.slice(0, 24)}`;
 	const selectedPlatform = normalizeQueuePlatform(platform);
 	const defaultQueuePreflight = createDefaultQueuePreflight({
 		selectedPlatform,
@@ -5946,6 +6411,69 @@ export function createQueueBackend({
 				preflight: supplied.preflight ?? configuredQueuePreflight,
 				acquireSlot: supplied.acquireSlot ?? (() => null),
 				releaseSlot: supplied.releaseSlot ?? (() => {}),
+				captureTaskBase:
+					supplied.captureTaskBase ??
+					((workspaceId, { taskId, ...options } = {}) =>
+						captureTaskStartTree(supplied.executionBackend, workspaceId, {
+							runId: taskBaseRunId,
+							taskId,
+							...options,
+						})),
+				captureTaskBaseAsync:
+					supplied.captureTaskBaseAsync ??
+					(async (workspaceId, options = {}) =>
+						(
+							supplied.captureTaskBase ??
+							((id, input) =>
+								captureTaskStartTreeAsync(supplied.executionBackend, id, {
+									runId: taskBaseRunId,
+									...input,
+								}))
+						)(workspaceId, options)),
+				validateTaskBase:
+					supplied.validateTaskBase ??
+					((workspaceId, base, options = {}) =>
+						validateTaskStartTree(
+							supplied.executionBackend,
+							workspaceId,
+							base,
+							options,
+						)),
+				validateTaskBaseAsync:
+					supplied.validateTaskBaseAsync ??
+					(async (workspaceId, base, options = {}) =>
+						(
+							supplied.validateTaskBase ??
+							((id, value, input) =>
+								validateTaskStartTreeAsync(
+									supplied.executionBackend,
+									id,
+									value,
+									input,
+								))
+						)(workspaceId, base, options)),
+				releaseTaskBase:
+					supplied.releaseTaskBase ??
+					((workspaceId, base, options = {}) =>
+						releaseTaskStartTree(
+							supplied.executionBackend,
+							workspaceId,
+							base,
+							options,
+						)),
+				releaseTaskBaseAsync:
+					supplied.releaseTaskBaseAsync ??
+					(async (workspaceId, base, options = {}) =>
+						(
+							supplied.releaseTaskBase ??
+							((id, value, input) =>
+								releaseTaskStartTreeAsync(
+									supplied.executionBackend,
+									id,
+									value,
+									input,
+								))
+						)(workspaceId, base, options)),
 			};
 		}
 	}
@@ -6056,6 +6584,26 @@ export function createQueueBackend({
 				workspaceId,
 				"git reset --hard && git clean -fd",
 			),
+		captureTaskBase: (workspaceId, { taskId, ...options } = {}) =>
+			captureTaskStartTree(executionBackend, workspaceId, {
+				runId: taskBaseRunId,
+				taskId,
+				...options,
+			}),
+		captureTaskBaseAsync: (workspaceId, { taskId, ...options } = {}) =>
+			captureTaskStartTreeAsync(executionBackend, workspaceId, {
+				runId: taskBaseRunId,
+				taskId,
+				...options,
+			}),
+		validateTaskBase: (workspaceId, base, options = {}) =>
+			validateTaskStartTree(executionBackend, workspaceId, base, options),
+		validateTaskBaseAsync: (workspaceId, base, options = {}) =>
+			validateTaskStartTreeAsync(executionBackend, workspaceId, base, options),
+		releaseTaskBase: (workspaceId, base, options = {}) =>
+			releaseTaskStartTree(executionBackend, workspaceId, base, options),
+		releaseTaskBaseAsync: (workspaceId, base, options = {}) =>
+			releaseTaskStartTreeAsync(executionBackend, workspaceId, base, options),
 		destroy: (workspaceId) => executionBackend.destroy(workspaceId),
 		preflight: configuredQueuePreflight,
 		acquireSlot: dependencies.acquireVmSlot ?? acquireVmSlot,
@@ -6140,6 +6688,7 @@ function prepareQueueLaunch({
 	);
 	ensureRetryCheckpoint(checkpoint);
 	validateRetryDescriptorEvidence(checkpoint);
+	assertCheckpointRecoverySafe(checkpoint);
 	const queueBackend = createQueueBackend({
 		platform: selectedPlatform,
 		dependencies,
@@ -6502,6 +7051,7 @@ export function runQueue(options) {
 	const defaultRecordDispatchIntent = (intent) => {
 		recordDispatchIntentFn(intent, runStorePath);
 	};
+	checkpoint.taskBases ??= {};
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
@@ -6513,6 +7063,13 @@ export function runQueue(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
+		runId,
+		taskBases: checkpoint.taskBases,
+		persistTaskBase: (taskId, base) => {
+			checkpoint.taskBases[taskId] = base;
+			checkpoint.lastUpdatedAt = new Date().toISOString();
+			saveCheckpoint(checkpointPath, checkpoint);
+		},
 		onStatus: emitStatus,
 		onTaskRouted,
 		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
@@ -6910,6 +7467,7 @@ export function runQueue(options) {
 				// Same rule as the diff above: host-only bytes, never onResult.
 				result.gateEvidence = undefined;
 			}
+			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
 			if (onResult) onResult(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
 			if (emitStatus) {
@@ -7041,15 +7599,26 @@ export function runQueue(options) {
 			// a crash mid-commit) must never leave a task whose execute succeeded
 			// missing from the durable checkpoint (INV-6). The result and
 			// completedTaskIds are on disk before commit is even attempted.
-			const haltResult = commitOrResetWorkingContainer(result, {
-				ownsWorkingContainer,
-				workingContainerName,
-				stopOnFailure: effectiveStopOnFailure,
-				commitWorkingTreeFn: queueBackend.commit,
-				resetWorkingTreeFn: queueBackend.reset,
-				emitStatus,
-				logPrefix: "runQueue: ",
-			});
+			let haltResult =
+				result.cleanupFailed === true ? providerCleanupHalt(result) : null;
+			if (!haltResult)
+				haltResult = commitOrResetWorkingContainer(result, {
+					ownsWorkingContainer,
+					workingContainerName,
+					stopOnFailure: effectiveStopOnFailure,
+					commitWorkingTreeFn: queueBackend.commit,
+					resetWorkingTreeFn: queueBackend.reset,
+					emitStatus,
+					logPrefix: "runQueue: ",
+				});
+			if (!haltResult) {
+				haltResult = finalizeTaskBase(
+					context,
+					result.taskId,
+					checkpoint,
+					checkpointPath,
+				);
+			}
 			if (runStore) {
 				runStore.updateRun({}).catch(() => {});
 			}
@@ -7330,6 +7899,7 @@ export async function runQueueWithOrchestrator(options) {
 	};
 	const defaultRecordDispatchIntent = (intent) =>
 		recordDispatchIntentFn(intent, runStorePath);
+	checkpoint.taskBases ??= {};
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
@@ -7342,6 +7912,13 @@ export async function runQueueWithOrchestrator(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
+		runId,
+		taskBases: checkpoint.taskBases,
+		persistTaskBase: (taskId, base) => {
+			checkpoint.taskBases[taskId] = base;
+			checkpoint.lastUpdatedAt = new Date().toISOString();
+			saveCheckpoint(checkpointPath, checkpoint);
+		},
 		pollIntervalMs,
 		maxPolls,
 		now: dependencies.now ?? Date.now,
@@ -7443,6 +8020,7 @@ export async function runQueueWithOrchestrator(options) {
 				);
 			}
 
+			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
 			if (onResult) onResult(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
 			if (emitStatus) {
@@ -7502,6 +8080,12 @@ export async function runQueueWithOrchestrator(options) {
 					? { servedModelVerified: result.servedModelVerified }
 					: {}),
 				...(result.alreadyApplied ? { alreadyApplied: true } : {}),
+				...(result.cleanupFailed === true
+					? {
+							cleanupFailed: true,
+							cleanupStage: result.cleanupStage ?? null,
+						}
+					: {}),
 				success: result.success,
 				timedOut: Boolean(result.timedOut),
 				partialDiffPath: null,
@@ -7544,15 +8128,26 @@ export async function runQueueWithOrchestrator(options) {
 
 			// Same INV-6 ordering as runQueue: the checkpoint is on disk before
 			// the working-container commit/reset is attempted.
-			const haltResult = commitOrResetWorkingContainer(result, {
-				ownsWorkingContainer,
-				workingContainerName,
-				stopOnFailure: effectiveStopOnFailure,
-				commitWorkingTreeFn: queueBackend.commit,
-				resetWorkingTreeFn: queueBackend.reset,
-				emitStatus,
-				logPrefix: "runQueueWithOrchestrator: ",
-			});
+			let haltResult =
+				result.cleanupFailed === true ? providerCleanupHalt(result) : null;
+			if (!haltResult)
+				haltResult = commitOrResetWorkingContainer(result, {
+					ownsWorkingContainer,
+					workingContainerName,
+					stopOnFailure: effectiveStopOnFailure,
+					commitWorkingTreeFn: queueBackend.commit,
+					resetWorkingTreeFn: queueBackend.reset,
+					emitStatus,
+					logPrefix: "runQueueWithOrchestrator: ",
+				});
+			if (!haltResult) {
+				haltResult = await finalizeTaskBaseAsync(
+					context,
+					result.taskId,
+					checkpoint,
+					checkpointPath,
+				);
+			}
 			if (runStore) {
 				runStore.updateRun({}).catch(() => {});
 			}

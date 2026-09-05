@@ -21,6 +21,10 @@ const captures = [
 	["cursor", captureCursorDiff],
 	["opencode", captureOpencodeDiff],
 ];
+const TASK_BASE = {
+	ref: "refs/switchyard/task-base/patch-bytes/1.1",
+	tree: "2".repeat(40),
+};
 
 // getWorkspaceExecution (provider-lifecycle.mjs) now requires an
 // executionBackend with no default -- the removed DEFAULT_EXECUTION_BACKEND
@@ -60,7 +64,8 @@ function installFakeDocker(patch) {
 		dockerPath,
 		`#!/bin/sh
 case " $* " in
-  *" git diff --cached HEAD ") cat ${JSON.stringify(patchPath)} ;;
+  *" git rev-parse --verify "*) printf '%s' ${JSON.stringify(TASK_BASE.tree)} ;;
+  *" git diff --cached ${TASK_BASE.tree} ") cat ${JSON.stringify(patchPath)} ;;
   *) exit 0 ;;
 esac
 `,
@@ -102,6 +107,7 @@ describe("adapter patch-byte preservation", () => {
 				strictEqual(
 					capture("fake-container", {
 						executionBackend: dockerExecutionBackend,
+						taskBase: TASK_BASE,
 					}),
 					expected,
 					`${name} capture must preserve terminal patch bytes`,

@@ -813,6 +813,14 @@ describe("Task 4.3 timeout boundaries", () => {
 				requiredPaths: null,
 			},
 			{
+				queueBackend: {
+					captureTaskBaseAsync: async () => ({
+						ref: "refs/switchyard/task-base/router-timeout/4.3-docker",
+						tree: "4".repeat(40),
+					}),
+					validateTaskBaseAsync: async (_workspaceId, base) => base,
+				},
+				taskBases: {},
 				route: () => ({
 					provider: "claude",
 					resolved_harness: "claude",

@@ -6,7 +6,10 @@
 // the exactly-once terminal transition.
 
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-
+import {
+	validateTaskStartTree,
+	validateTaskStartTreeAsync,
+} from "../lifecycle/index.mjs";
 import {
 	classifyProviderDiagnostic,
 	cleanupDiagnosticCodeFor,
@@ -469,8 +472,27 @@ export async function captureProviderDiffDetailedAsync(
 		cleanup,
 		onStatus,
 		cleanupContext,
+		taskBase,
 		...lifecycleOptions
 	} = options;
+	const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
+	const remainingMs = () => {
+		const remaining = Math.floor(deadlineMs - Date.now());
+		if (remaining <= 0) throw new Error("diff capture deadline exhausted");
+		return remaining;
+	};
+	const emitCaptureStatus = (event, stage) => {
+		try {
+			onStatus?.({
+				phase: "execution",
+				event,
+				stage,
+				status: `${stage} ${event.endsWith("started") ? "started" : event.endsWith("completed") ? "completed" : "failed"}`,
+			});
+		} catch {
+			// Telemetry cannot alter capture.
+		}
+	};
 	const captureCleanup = (command, args) => async () => {
 		let backendError = null;
 		let backendHandled = false;
@@ -504,11 +526,21 @@ export async function captureProviderDiffDetailedAsync(
 	} catch {
 		return { status: "transport_failed", diff: null };
 	}
+	emitCaptureStatus("diff_capture_probe_started", "diff_stage");
+	let addTimeoutMs;
+	try {
+		addTimeoutMs = remainingMs();
+	} catch {
+		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
+		return { status: "timed_out", diff: null };
+	}
 	const add = await runProviderProcess(stage.command, stage.args, {
 		...lifecycle,
+		timeoutMs: addTimeoutMs,
 		cleanup: captureCleanup(stage.command, stage.args),
 	});
 	if (!add.success) {
+		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
 		return {
 			status: add.timedOut
 				? "timed_out"
@@ -518,21 +550,47 @@ export async function captureProviderDiffDetailedAsync(
 			diff: null,
 		};
 	}
+	emitCaptureStatus("diff_capture_probe_completed", "diff_stage");
+	try {
+		if (!taskBase) throw new Error("missing task base");
+		await validateTaskStartTreeAsync(
+			executionBackend,
+			workingContainerName,
+			taskBase,
+			{ deadlineMs, timeoutMs, signal: options.signal, onStatus },
+		);
+	} catch {
+		return {
+			status: "diff_failed",
+			diff: null,
+			reasonCode: "task_base_invalid",
+		};
+	}
 	let capture;
 	try {
 		capture = getWorkspaceExecution(workingContainerName, {
 			...options,
 			recordPid: true,
-			argv: ["git", "diff", "--cached", "HEAD"],
+			argv: ["git", "diff", "--cached", taskBase.tree],
 		});
 	} catch {
 		return { status: "transport_failed", diff: null };
 	}
+	emitCaptureStatus("diff_capture_probe_started", "diff_export");
+	let diffTimeoutMs;
+	try {
+		diffTimeoutMs = remainingMs();
+	} catch {
+		emitCaptureStatus("diff_capture_probe_failed", "diff_export");
+		return { status: "timed_out", diff: null };
+	}
 	const diff = await runProviderProcess(capture.command, capture.args, {
 		...lifecycle,
+		timeoutMs: diffTimeoutMs,
 		cleanup: captureCleanup(capture.command, capture.args),
 	});
 	if (!diff.success) {
+		emitCaptureStatus("diff_capture_probe_failed", "diff_export");
 		return {
 			status: diff.timedOut
 				? "timed_out"
@@ -542,6 +600,7 @@ export async function captureProviderDiffDetailedAsync(
 			diff: null,
 		};
 	}
+	emitCaptureStatus("diff_capture_probe_completed", "diff_export");
 	return /\S/u.test(diff.output)
 		? { status: "captured", diff: diff.output }
 		: { status: "empty", diff: null };
@@ -552,6 +611,25 @@ export function captureProviderDiffDetailed(
 	workingContainerName,
 	options = {},
 ) {
+	const timeoutMs = options.timeoutMs ?? 30_000;
+	const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
+	const remainingMs = () => {
+		const remaining = Math.floor(deadlineMs - Date.now());
+		if (remaining <= 0) throw new Error("diff capture deadline exhausted");
+		return remaining;
+	};
+	const emitCaptureStatus = (event, stage) => {
+		try {
+			options.onStatus?.({
+				phase: "execution",
+				event,
+				stage,
+				status: `${stage} ${event.endsWith("started") ? "started" : event.endsWith("completed") ? "completed" : "failed"}`,
+			});
+		} catch {
+			// Telemetry cannot alter capture.
+		}
+	};
 	try {
 		validateIdentifier(workingContainerName, "workingContainerName");
 	} catch {
@@ -563,32 +641,64 @@ export function captureProviderDiffDetailed(
 	}
 	let stage;
 	try {
+		emitCaptureStatus("diff_capture_probe_started", "diff_stage");
 		stage = getWorkspaceExecution(workingContainerName, {
 			...options,
 			recordPid: true,
 			argv: ["git", "add", "-A"],
 		});
-		execFileSync(stage.command, stage.args, { stdio: "pipe" });
+		execFileSync(stage.command, stage.args, {
+			stdio: "pipe",
+			timeout: remainingMs(),
+			signal: options.signal,
+		});
+		emitCaptureStatus("diff_capture_probe_completed", "diff_stage");
 	} catch (error) {
+		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
 		return {
 			status: error?.status == null ? "transport_failed" : "stage_failed",
 			diff: null,
 		};
 	}
 	try {
+		if (!options.taskBase) throw new Error("missing task base");
+		validateTaskStartTree(
+			options.executionBackend,
+			workingContainerName,
+			options.taskBase,
+			{
+				timeoutMs,
+				deadlineMs,
+				signal: options.signal,
+				onStatus: options.onStatus,
+			},
+		);
+	} catch {
+		return {
+			status: "diff_failed",
+			diff: null,
+			reasonCode: "task_base_invalid",
+		};
+	}
+	try {
+		emitCaptureStatus("diff_capture_probe_started", "diff_export");
 		const capture = getWorkspaceExecution(workingContainerName, {
 			...options,
 			recordPid: true,
-			argv: ["git", "diff", "--cached", "HEAD"],
+			argv: ["git", "diff", "--cached", options.taskBase.tree],
 		});
 		const diff = execFileSync(capture.command, capture.args, {
 			encoding: "utf8",
 			stdio: "pipe",
+			timeout: remainingMs(),
+			signal: options.signal,
 		});
+		emitCaptureStatus("diff_capture_probe_completed", "diff_export");
 		return /\S/u.test(diff)
 			? { status: "captured", diff }
 			: { status: "empty", diff: null };
 	} catch (error) {
+		emitCaptureStatus("diff_capture_probe_failed", "diff_export");
 		return {
 			status: error?.status == null ? "transport_failed" : "diff_failed",
 			diff: null,

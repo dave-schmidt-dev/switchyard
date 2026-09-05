@@ -1,7 +1,314 @@
 // Lifecycle module - workspace seeding
 // INV-3: The workspace is wiped at project end (see ExecutionBackend.destroy)
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+
+const TASK_BASE_REF_PREFIX = "refs/switchyard/task-base";
+const ZERO_OBJECT_ID = "0".repeat(40);
+const TASK_BASE_PROBE_TIMEOUT_MS = 30_000;
+
+function taskBaseComponent(value, label) {
+	if (
+		typeof value !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)
+	) {
+		throw new TypeError(`${label} must be a safe task-base identifier`);
+	}
+	return value;
+}
+
+function taskBaseTree(value) {
+	if (typeof value !== "string" || !/^[a-f0-9]{40}$/u.test(value)) {
+		throw new TypeError("task base tree must be a SHA-1 object id");
+	}
+	return value;
+}
+
+function taskBaseProbeOptions(options = {}) {
+	const now = options.now ?? Date.now;
+	const timeoutMs = options.timeoutMs ?? TASK_BASE_PROBE_TIMEOUT_MS;
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+		throw new TypeError("task base probe timeout must be positive");
+	}
+	return {
+		...options,
+		now,
+		deadlineMs: options.deadlineMs ?? now() + timeoutMs,
+	};
+}
+
+function probeRemainingMs(options) {
+	if (options.signal?.aborted) throw new Error("task base probe aborted");
+	const remainingMs = Math.floor(options.deadlineMs - options.now());
+	if (remainingMs <= 0) throw new Error("task base probe deadline exhausted");
+	return remainingMs;
+}
+
+function emitProbeStatus(options, event, stage) {
+	try {
+		options.onStatus?.({
+			phase: "checkpoint",
+			event,
+			stage,
+			status: `${stage} ${event === "task_base_probe_started" ? "started" : event === "task_base_probe_completed" ? "completed" : "failed"}`,
+		});
+	} catch {
+		// Telemetry cannot alter the immutable-base operation.
+	}
+}
+
+function backendExecution(executionBackend, workspaceId, argv) {
+	const execution = executionBackend.execArgv(workspaceId, {
+		cwd: "/project",
+		argv: ["git", ...argv],
+		recordPid: true,
+	});
+	return execution;
+}
+
+function backendGit(executionBackend, workspaceId, argv, options, stage) {
+	const execution = backendExecution(executionBackend, workspaceId, argv);
+	emitProbeStatus(options, "task_base_probe_started", stage);
+	try {
+		const output = execFileSync(execution.command, execution.args, {
+			encoding: "utf8",
+			stdio: "pipe",
+			timeout: probeRemainingMs(options),
+			killSignal: "SIGKILL",
+			signal: options.signal,
+		});
+		emitProbeStatus(options, "task_base_probe_completed", stage);
+		return output;
+	} catch (error) {
+		emitProbeStatus(options, "task_base_probe_failed", stage);
+		throw error;
+	}
+}
+
+function backendGitAsync(executionBackend, workspaceId, argv, options, stage) {
+	const execution = backendExecution(executionBackend, workspaceId, argv);
+	emitProbeStatus(options, "task_base_probe_started", stage);
+	let timeout;
+	try {
+		timeout = probeRemainingMs(options);
+	} catch (error) {
+		emitProbeStatus(options, "task_base_probe_failed", stage);
+		return Promise.reject(error);
+	}
+	return new Promise((resolve, reject) => {
+		execFile(
+			execution.command,
+			execution.args,
+			{
+				encoding: "utf8",
+				timeout,
+				killSignal: "SIGKILL",
+				signal: options.signal,
+			},
+			(error, stdout) => {
+				if (error) {
+					emitProbeStatus(options, "task_base_probe_failed", stage);
+					reject(error);
+					return;
+				}
+				emitProbeStatus(options, "task_base_probe_completed", stage);
+				resolve(stdout);
+			},
+		);
+	});
+}
+
+/**
+ * Create a task-scoped immutable tree anchor after hooks have prepared the
+ * workspace. The compare-and-swap creation is intentional: a mutable ref is
+ * never accepted as evidence of the host-recorded tree.
+ */
+export function captureTaskStartTree(
+	executionBackend,
+	workspaceId,
+	{ runId, taskId, ...inputOptions } = {},
+) {
+	if (!executionBackend || typeof executionBackend.execArgv !== "function") {
+		throw new TypeError("execution backend does not support task-base capture");
+	}
+	const safeRunId = taskBaseComponent(runId, "runId");
+	const safeTaskId = taskBaseComponent(taskId, "taskId");
+	const options = taskBaseProbeOptions(inputOptions);
+	backendGit(
+		executionBackend,
+		workspaceId,
+		["add", "-A"],
+		options,
+		"task_base_stage",
+	);
+	const tree = taskBaseTree(
+		backendGit(
+			executionBackend,
+			workspaceId,
+			["write-tree"],
+			options,
+			"task_base_write",
+		).trim(),
+	);
+	const ref = `${TASK_BASE_REF_PREFIX}/${safeRunId}/${safeTaskId}`;
+	backendGit(
+		executionBackend,
+		workspaceId,
+		["update-ref", ref, tree, ZERO_OBJECT_ID],
+		options,
+		"task_base_anchor",
+	);
+	return { ref, tree };
+}
+
+export async function captureTaskStartTreeAsync(
+	executionBackend,
+	workspaceId,
+	{ runId, taskId, ...inputOptions } = {},
+) {
+	if (!executionBackend || typeof executionBackend.execArgv !== "function") {
+		throw new TypeError("execution backend does not support task-base capture");
+	}
+	const safeRunId = taskBaseComponent(runId, "runId");
+	const safeTaskId = taskBaseComponent(taskId, "taskId");
+	const options = taskBaseProbeOptions(inputOptions);
+	await backendGitAsync(
+		executionBackend,
+		workspaceId,
+		["add", "-A"],
+		options,
+		"task_base_stage",
+	);
+	const tree = taskBaseTree(
+		(
+			await backendGitAsync(
+				executionBackend,
+				workspaceId,
+				["write-tree"],
+				options,
+				"task_base_write",
+			)
+		).trim(),
+	);
+	const ref = `${TASK_BASE_REF_PREFIX}/${safeRunId}/${safeTaskId}`;
+	await backendGitAsync(
+		executionBackend,
+		workspaceId,
+		["update-ref", ref, tree, ZERO_OBJECT_ID],
+		options,
+		"task_base_anchor",
+	);
+	return { ref, tree };
+}
+
+/** Validate a task base against both the durable expected hash and its ref. */
+export function validateTaskStartTree(
+	executionBackend,
+	workspaceId,
+	{ ref, tree } = {},
+	inputOptions = {},
+) {
+	const options = taskBaseProbeOptions(inputOptions);
+	const expectedTree = taskBaseTree(tree);
+	if (
+		typeof ref !== "string" ||
+		!new RegExp(
+			`^${TASK_BASE_REF_PREFIX}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`,
+			"u",
+		).test(ref)
+	) {
+		throw new TypeError("task base ref must be in refs/switchyard/task-base");
+	}
+	const actualTree = backendGit(
+		executionBackend,
+		workspaceId,
+		["rev-parse", "--verify", `${ref}^{tree}`],
+		options,
+		"task_base_validate",
+	).trim();
+	if (actualTree !== expectedTree) {
+		throw new Error("task base ref does not match the recorded tree");
+	}
+	return { ref, tree: expectedTree };
+}
+
+export async function validateTaskStartTreeAsync(
+	executionBackend,
+	workspaceId,
+	{ ref, tree } = {},
+	inputOptions = {},
+) {
+	const expectedTree = taskBaseTree(tree);
+	if (
+		typeof ref !== "string" ||
+		!new RegExp(
+			`^${TASK_BASE_REF_PREFIX}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`,
+			"u",
+		).test(ref)
+	)
+		throw new TypeError("task base ref must be in refs/switchyard/task-base");
+	const options = taskBaseProbeOptions(inputOptions);
+	const actualTree = (
+		await backendGitAsync(
+			executionBackend,
+			workspaceId,
+			["rev-parse", "--verify", `${ref}^{tree}`],
+			options,
+			"task_base_validate",
+		)
+	).trim();
+	if (actualTree !== expectedTree)
+		throw new Error("task base ref does not match the recorded tree");
+	return { ref, tree: expectedTree };
+}
+
+/** Remove a task-base anchor only after that task reaches final disposition. */
+export function releaseTaskStartTree(
+	executionBackend,
+	workspaceId,
+	{ ref, tree } = {},
+	inputOptions = {},
+) {
+	const options = taskBaseProbeOptions(inputOptions);
+	const base = validateTaskStartTree(
+		executionBackend,
+		workspaceId,
+		{
+			ref,
+			tree,
+		},
+		options,
+	);
+	backendGit(
+		executionBackend,
+		workspaceId,
+		["update-ref", "-d", base.ref, base.tree],
+		options,
+		"task_base_release",
+	);
+}
+
+export async function releaseTaskStartTreeAsync(
+	executionBackend,
+	workspaceId,
+	{ ref, tree } = {},
+	inputOptions = {},
+) {
+	const options = taskBaseProbeOptions(inputOptions);
+	const base = await validateTaskStartTreeAsync(
+		executionBackend,
+		workspaceId,
+		{ ref, tree },
+		options,
+	);
+	await backendGitAsync(
+		executionBackend,
+		workspaceId,
+		["update-ref", "-d", base.ref, base.tree],
+		options,
+		"task_base_release",
+	);
+}
 
 /**
  * Seed a backend workspace from the host repository's committed tree.

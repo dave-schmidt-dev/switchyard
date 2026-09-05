@@ -13,7 +13,7 @@ import {
 	getInvocationDescriptorIdentity,
 } from "../src/switchyard/roster/index.mjs";
 import { route as productionRoute } from "../src/switchyard/router/index.mjs";
-import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
+import { runQueueAsync as runQueueAsyncImpl } from "../src/switchyard/runner/index.mjs";
 import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -105,6 +105,61 @@ function descriptor(target, model) {
 		...core,
 		descriptor_identity: getInvocationDescriptorIdentity(core, "claude"),
 	};
+}
+
+function withTaskBaseLifecycle(backend) {
+	const bases = new Map();
+	const captureTaskBase = (_workspaceId, { taskId }) => {
+		const base = {
+			ref: `refs/switchyard/task-base/broker-fixture/${taskId}`,
+			tree: "b".repeat(40),
+		};
+		bases.set(taskId, base);
+		return base;
+	};
+	const validateTaskBase = (_workspaceId, base) => {
+		if (![...bases.values()].some((candidate) => candidate.ref === base.ref)) {
+			throw new Error("missing fixture task base");
+		}
+		return base;
+	};
+	const releaseTaskBase = (_workspaceId, base) => {
+		for (const [taskId, candidate] of bases) {
+			if (candidate.ref === base.ref) bases.delete(taskId);
+		}
+	};
+	return {
+		...backend,
+		captureTaskBase,
+		captureTaskBaseAsync: async (...args) => captureTaskBase(...args),
+		validateTaskBase,
+		validateTaskBaseAsync: async (...args) => validateTaskBase(...args),
+		releaseTaskBase,
+		releaseTaskBaseAsync: async (...args) => releaseTaskBase(...args),
+	};
+}
+
+function runQueueAsync(options) {
+	const dependencies = options.dependencies ?? {};
+	const originalFactory = dependencies.backendFactory;
+	return runQueueAsyncImpl({
+		...options,
+		dependencies: {
+			...dependencies,
+			backendFactory: (factoryOptions) =>
+				withTaskBaseLifecycle(
+					originalFactory?.(factoryOptions) ?? {
+						executionBackend: {},
+						create: () =>
+							options.workingContainerName ?? "broker-fixture-worker",
+						destroy: () => {},
+						seed: () => {},
+						commit: () => {},
+						reset: () => {},
+					},
+				),
+		},
+	});
 }
 
 test("production async runner retains cli usage failure without peer fallback", async () => {
@@ -1726,7 +1781,7 @@ test("production async runner keeps the provider transcript as evidence when the
 // broker forwarded both fields to a reader that dropped them and the task was
 // persisted as an unqualified success while a provider process kept running in
 // the guest. Nothing in the suite drove success + cleanupFailed together.
-test("production async runner keeps cleanup evidence on a task that succeeded", async () => {
+test("production async runner halts on cleanup uncertainty after a successful provider result", async () => {
 	const root = await tempDirAsync("switchyard-broker-cleanup-success-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -1771,8 +1826,8 @@ test("production async runner keeps cleanup evidence on a task that succeeded", 
 		},
 	});
 	const record = result.results[0];
-	strictEqual(record.result, "success_no_diff");
-	strictEqual(record.success, true);
+	strictEqual(record.result, "provider_cleanup_failed");
+	strictEqual(record.success, false);
 	strictEqual(
 		record.cleanupFailed,
 		true,
@@ -1782,9 +1837,15 @@ test("production async runner keeps cleanup evidence on a task that succeeded", 
 	const checkpoint = JSON.parse(await readFile(checkpointPath, "utf8"));
 	strictEqual(checkpoint.results[0].cleanupFailed, true);
 	strictEqual(checkpoint.results[0].cleanupStage, "tree_terminated");
+	strictEqual(checkpoint.providerCleanupUncertain.taskId, "1.1");
+	ok(checkpoint.taskBases["1.1"], "the immutable base remains anchored");
+	strictEqual(
+		result.results.at(-1).result,
+		"halted_after_provider_cleanup_failure",
+	);
 	// The ledger is the record an operator greps to find hosts with orphaned
 	// provider processes, so it has to carry the stage too.
-	strictEqual(dispatches.at(-1).result, "success_no_diff");
+	strictEqual(dispatches.at(-1).result, "provider_cleanup_failed");
 	strictEqual(dispatches.at(-1).cleanupStage, "tree_terminated");
 });
 

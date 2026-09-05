@@ -8,6 +8,7 @@ import {
 	captureDiff,
 	executeClaude,
 } from "../src/switchyard/adapter/claude.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -118,6 +119,14 @@ describe("claude adapter container execution", () => {
 		// The stub exits non-zero unless BOTH headless flags were passed, so a
 		// green result here is itself the assertion that executeClaude sends
 		// them (Task 25) — not just that some diff came back.
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			containerName,
+			{
+				runId: "claude-adapter",
+				taskId: "1.1",
+			},
+		);
 		const result = executeClaude("apply a small change", containerName, {
 			model: "fake-model",
 			resolvedTargetId: CLAUDE_DESCRIPTOR.target_id,
@@ -130,6 +139,7 @@ describe("claude adapter container execution", () => {
 
 		const diff = captureDiff(containerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
@@ -221,6 +231,11 @@ describe("claude adapter timeout handling", () => {
 	it("kills the orphaned in-container process on timeout instead of leaving it running", {
 		skip: !dockerAvailable,
 	}, () => {
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			timeoutContainerName,
+			{ runId: "claude-timeout", taskId: "1.1" },
+		);
 		const result = executeClaude(
 			"this will overrun its timeout",
 			timeoutContainerName,
@@ -265,6 +280,7 @@ describe("claude adapter timeout handling", () => {
 		// fails and its catch-all silently returns null, losing the edit.
 		const diff = captureDiff(timeoutContainerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(
 			typeof diff === "string",

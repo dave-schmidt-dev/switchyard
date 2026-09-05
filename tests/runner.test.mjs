@@ -81,6 +81,10 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
+const TASK_BASE = {
+	ref: "refs/switchyard/task-base/runner-tests/1.1",
+	tree: "3".repeat(40),
+};
 
 describe("macOS queue admission", () => {
 	it("rejects a missing Aqua UID before cloning", () => {
@@ -573,6 +577,165 @@ describe("dispatch descriptor receipt contract", () => {
 		strictEqual(blocked.result, "intent_receipt_failed");
 		strictEqual(launched, false);
 	});
+
+	it("fails before orchestrator launch when the task-base probe exhausts its budget", async () => {
+		let launches = 0;
+		const statuses = [];
+		const result = await executeTaskWithOrchestrator(
+			{ id: "1.6", title: "task", description: "work" },
+			{
+				route: () => ({ provider: "claude", model: "test-model" }),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				workingContainerName: "worker",
+				projectPath: TEST_DIR,
+				adapters: { claude: {} },
+				queueBackend: {
+					beforeRun: () => {},
+					captureTaskBaseAsync: async () => {
+						throw new Error("task base probe deadline exhausted");
+					},
+				},
+				onStatus: (status) => statuses.push(status),
+				orchestrator: {
+					launch: async () => {
+						launches += 1;
+						return "job";
+					},
+				},
+			},
+		);
+		strictEqual(result.result, "task_base_capture_failed");
+		strictEqual(launches, 0);
+		ok(statuses.some(({ event }) => event === "task_base_failed"));
+	});
+
+	it("does not recapture a corrupt persisted base for an active attempt", () => {
+		let captures = 0;
+		let executions = 0;
+		const result = executeTask(
+			{ id: "1.9", title: "task", description: "work" },
+			{
+				route: () => ({ provider: "claude", model: "test-model" }),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				workingContainerName: "worker",
+				projectPath: TEST_DIR,
+				taskBases: { 1.9: TASK_BASE },
+				queueBackend: {
+					beforeRun: () => {},
+					captureTaskBase: () => {
+						captures += 1;
+						return TASK_BASE;
+					},
+					validateTaskBase: () => {
+						throw new Error("missing anchor");
+					},
+				},
+				adapters: {
+					claude: {
+						execute: () => {
+							executions += 1;
+							return { success: true };
+						},
+					},
+				},
+			},
+		);
+		strictEqual(result.result, "task_base_capture_failed");
+		strictEqual(captures, 0);
+		strictEqual(executions, 0);
+	});
+
+	it("uses host-captured orchestrator bytes and rejects a contradictory base receipt", async () => {
+		let gatedDiff = null;
+		const context = {
+			route: () => ({ provider: "claude", model: "test-model" }),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			workingContainerName: "worker",
+			projectPath: TEST_DIR,
+			pollIntervalMs: 1,
+			maxPolls: 1,
+			sleepFn: async () => {},
+			adapters: {
+				claude: {
+					captureDiffAsync: async () => "authoritative-host-diff",
+				},
+			},
+			integrationGate: (diff) => {
+				gatedDiff = diff;
+				return { success: true };
+			},
+			orchestrator: {
+				launch: async () => "job",
+				status: async () => ({ state: "done" }),
+				result: async () => ({
+					success: true,
+					diff: "untrusted-returned-diff",
+				}),
+			},
+		};
+		const accepted = await executeTaskWithOrchestrator(
+			{ id: "1.7", title: "task", description: "work" },
+			context,
+		);
+		strictEqual(accepted.success, true);
+		strictEqual(gatedDiff, "authoritative-host-diff");
+
+		const rejected = await executeTaskWithOrchestrator(
+			{ id: "1.8", title: "task", description: "work" },
+			{
+				...context,
+				orchestrator: {
+					...context.orchestrator,
+					result: async () => ({
+						success: true,
+						taskBase: { ...TASK_BASE, tree: "9".repeat(40) },
+					}),
+				},
+			},
+		);
+		strictEqual(rejected.result, "task_base_capture_failed");
+
+		const opencodeDescriptor = descriptorForRoute({
+			provider: "OpenCode Go",
+			resolved_harness: "opencode",
+			resolvedTargetId: "opencode-go",
+			model: "fixture/opencode-low",
+		});
+		for (const hostDiff of ["authoritative-opencode-diff", ""]) {
+			let captures = 0;
+			const result = await executeTaskWithOrchestrator(
+				{
+					id: `1.openc-${hostDiff.length}`,
+					title: "task",
+					description: "work",
+				},
+				{
+					...context,
+					route: () => ({
+						provider: "OpenCode Go",
+						model: "fixture/opencode-low",
+						resolvedTargetId: "opencode-go",
+						resolved_harness: "opencode",
+						invocationDescriptor: opencodeDescriptor,
+					}),
+					resolveDescriptor: () => opencodeDescriptor,
+					adapters: {
+						opencode: {
+							captureDiffAsync: async () => {
+								captures += 1;
+								return hostDiff;
+							},
+						},
+					},
+				},
+			);
+			strictEqual(result.success, true);
+			strictEqual(captures, 1);
+		}
+	});
 });
 
 function testDescriptor(overrides = {}) {
@@ -616,17 +779,77 @@ function descriptorForRoute(routeResult) {
 
 function withTestDescriptorContext(context) {
 	let latest = null;
+	let launchedTaskBase = null;
+	let orchestratorDiff = "";
 	const originalRoute = context.route;
 	const originalResolveDescriptor = context.resolveDescriptor;
 	const route = (options) => {
 		const routed = originalRoute(options);
+		if (routed?.provider && !adapters[routed.provider]) {
+			adapters[routed.provider] = {
+				captureDiffAsync: async () => orchestratorDiff,
+			};
+		}
 		latest = descriptorForRoute(routed);
 		return latest && routed && !Object.hasOwn(routed, "invocationDescriptor")
 			? { ...routed, invocationDescriptor: latest }
 			: routed;
 	};
+	const orchestrator = context.orchestrator
+		? {
+				...context.orchestrator,
+				launch: async (payload) => {
+					launchedTaskBase = payload.taskBase;
+					return context.orchestrator.launch(payload);
+				},
+				result: async (jobId) => {
+					const result = await context.orchestrator.result(jobId);
+					orchestratorDiff =
+						typeof result?.diff === "string" ? result.diff : "";
+					return context.requireExplicitTaskBaseResult
+						? result
+						: { ...result, taskBase: result?.taskBase ?? launchedTaskBase };
+				},
+			}
+		: undefined;
+	const fixtureAdapters =
+		context.adapters ??
+		(context.orchestrator
+			? Object.fromEntries(
+					[
+						"claude",
+						"codex",
+						"agy",
+						"cursor",
+						"copilot",
+						"opencode",
+						"vibe",
+					].map((name) => [name, {}]),
+				)
+			: {});
+	const adapters = Object.fromEntries(
+		Object.entries(fixtureAdapters).map(([name, adapter]) => [
+			name,
+			{
+				...adapter,
+				captureDiffAsync:
+					adapter.captureDiffAsync ?? (async () => orchestratorDiff),
+			},
+		]),
+	);
 	return {
 		...context,
+		...(orchestrator ? { orchestrator } : {}),
+		adapters,
+		queueBackend: context.queueBackend ?? {
+			beforeRun: () => {},
+			afterRun: () => {},
+			captureTaskBase: () => TASK_BASE,
+			validateTaskBase: (_workspaceId, base) => base,
+			releaseTaskBase: () => {},
+		},
+		taskBases: context.taskBases ?? {},
+		persistTaskBase: context.persistTaskBase ?? (() => {}),
 		route,
 		resolveDescriptor: (...args) =>
 			latest ?? originalResolveDescriptor?.(...args) ?? null,
@@ -671,6 +894,10 @@ function legacyBackendFactory(dependencies) {
 		seed: dependencies.seedProject ?? (() => {}),
 		commit: dependencies.commitWorkingTree ?? (() => {}),
 		reset: dependencies.resetWorkingTree ?? (() => {}),
+		captureTaskBase: dependencies.captureTaskBase ?? (() => TASK_BASE),
+		validateTaskBase:
+			dependencies.validateTaskBase ?? ((_workspaceId, base) => base),
+		releaseTaskBase: dependencies.releaseTaskBase ?? (() => {}),
 		destroy: dependencies.wipeWorkingContainer ?? (() => {}),
 	});
 }
@@ -706,6 +933,8 @@ function withTestDescriptorOptions(options) {
 			...dependencies,
 			route: context.route,
 			resolveDescriptor: context.resolveDescriptor,
+			adapters: context.adapters,
+			...(context.orchestrator ? { orchestrator: context.orchestrator } : {}),
 			// macOS/Parallels is the sole execution backend now, so every
 			// runQueue* call through this helper runs the real provider
 			// preflight gate unless a test overrides it. The overwhelming
@@ -2563,6 +2792,367 @@ describe("runner orchestration", () => {
 			"already_complete",
 		);
 	});
+	it("captures and releases a fresh immutable base for each terminal task", () => {
+		const tasksPath = writeTasksFile(`
+### Task 1.1: First
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** first
+
+### Task 1.2: Second
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** second
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const captured = [];
+		const released = [];
+		const persistedBeforeExecute = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "worker",
+			checkpointPath,
+			dependencies: {
+				route: () => ({ provider: "claude", model: "test-model" }),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				captureTaskBase: (_workspaceId, { taskId }) => {
+					captured.push(taskId);
+					return {
+						ref: `refs/switchyard/task-base/run/${taskId}`,
+						tree: taskId === "1.1" ? "1".repeat(40) : "2".repeat(40),
+					};
+				},
+				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: (_workspaceId, base) => released.push(base.ref),
+				adapters: {
+					claude: {
+						execute: () => {
+							const taskId = captured.at(-1);
+							persistedBeforeExecute.push(
+								Boolean(
+									JSON.parse(readFileSync(checkpointPath, "utf8")).taskBases[
+										taskId
+									],
+								),
+							);
+							return { success: true };
+						},
+						captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+					},
+				},
+				integrationGate: () => ({ success: true }),
+			},
+		});
+		strictEqual(result.completedTaskIds.length, 2);
+		deepStrictEqual(captured, ["1.1", "1.2"]);
+		deepStrictEqual(persistedBeforeExecute, [true, true]);
+		deepStrictEqual(released, [
+			"refs/switchyard/task-base/run/1.1",
+			"refs/switchyard/task-base/run/1.2",
+		]);
+		deepStrictEqual(
+			JSON.parse(readFileSync(checkpointPath, "utf8")).taskBases,
+			{},
+		);
+	});
+
+	it("persists task-base release uncertainty and prevents reuse", () => {
+		const tasksPath = writeTasksFile(`
+### Task 1.1: First
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** first
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "worker",
+			checkpointPath,
+			dependencies: {
+				route: () => ({ provider: "claude", model: "test-model" }),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				captureTaskBase: () => TASK_BASE,
+				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: () => {
+					throw new Error("uncertain");
+				},
+				adapters: {
+					claude: {
+						execute: () => ({ success: true }),
+						captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+					},
+				},
+				integrationGate: () => ({ success: true }),
+			},
+		});
+		strictEqual(
+			result.results.at(-1).result,
+			"halted_after_task_base_release_failure",
+		);
+		const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+		deepStrictEqual(checkpoint.taskBases["1.1"], TASK_BASE);
+		strictEqual(checkpoint.taskBaseReleaseUncertain.taskId, "1.1");
+	});
+
+	it("captures a new base when a terminal failure is retried in a fresh workspace", () => {
+		const tasksPath = writeTasksFile(`
+### Task 1.1: Retryable in a new run
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** retry later
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const captured = [];
+		const makeDependencies = (success) => ({
+			route: () => ({ provider: "claude", model: "test-model" }),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			captureTaskBase: (workspaceId) => {
+				captured.push(workspaceId);
+				return {
+					ref: `refs/switchyard/task-base/run-${captured.length}/1.1`,
+					tree: String(captured.length).repeat(40),
+				};
+			},
+			validateTaskBase: (_workspaceId, base) => base,
+			releaseTaskBase: () => {},
+			adapters: {
+				claude: {
+					execute: () => ({ success }),
+					captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+				},
+			},
+			integrationGate: () => ({ success: true }),
+		});
+		const failed = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "worker-one",
+			checkpointPath,
+			dependencies: makeDependencies(false),
+		});
+		strictEqual(failed.results[0].success, false);
+		deepStrictEqual(
+			JSON.parse(readFileSync(checkpointPath, "utf8")).taskBases,
+			{},
+		);
+		const retried = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "worker-two",
+			checkpointPath,
+			dependencies: makeDependencies(true),
+		});
+		strictEqual(retried.results.at(-1).success, true);
+		deepStrictEqual(captured, ["worker-one", "worker-two"]);
+	});
+});
+
+describe("immutable-base recovery guards", () => {
+	const entrypoints = [
+		["sync", runQueue],
+		["async", runQueueAsync],
+		["orchestrator", runQueueWithOrchestrator],
+	];
+
+	function recoveryDependencies(
+		mode,
+		counters,
+		{ cleanupFailed = false } = {},
+	) {
+		const execution = cleanupFailed
+			? {
+					success: true,
+					cleanupFailed: true,
+					cleanupStage: "pid_marker_removed",
+				}
+			: { success: true };
+		const brokerExecution = cleanupFailed
+			? {
+					success: true,
+					outcome: "success",
+					cleanupFailed: true,
+					cleanupStage: "pid_marker_removed",
+				}
+			: { success: true, outcome: "success" };
+		return {
+			route: () => ({
+				provider: "claude",
+				model: "fixture-model",
+				resolved_harness: "claude",
+			}),
+			resolveDescriptor: () =>
+				testDescriptor({
+					model_ref: "fixture-model",
+					selector: "fixture-model",
+				}),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			createWorkingContainer: () => "recovery-worker",
+			seedProject: () => {},
+			commitWorkingTree: () => {
+				counters.commits += 1;
+			},
+			resetWorkingTree: () => {
+				counters.resets += 1;
+			},
+			wipeWorkingContainer: () => {},
+			captureTaskBase: (_workspaceId, { taskId }) => {
+				counters.captures += 1;
+				return {
+					ref: `refs/switchyard/task-base/recovery/${taskId}`,
+					tree: "6".repeat(40),
+				};
+			},
+			validateTaskBase: (_workspaceId, base) => base,
+			releaseTaskBase: () => {
+				counters.releases += 1;
+				if (counters.releaseThrows) throw new Error("uncertain release");
+			},
+			onTaskStart: (task) => counters.started.push(task.id),
+			integrationGate: () => ({ success: true }),
+			adapters: {
+				claude: {
+					execute: () => execution,
+					executeAsync: async () => execution,
+					captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+					captureDiffAsync: async () => "diff --git a/src/a.mjs b/src/a.mjs",
+				},
+			},
+			...(mode === "async"
+				? {
+						broker: {
+							selectAndReserve: async () => ({
+								provider: "claude",
+								model: "fixture-model",
+								resolvedTarget: "claude",
+								harness: "claude",
+								capability: "standard",
+								reason: "spread",
+								snapshotIdentity: {
+									status: "fresh",
+									mtime: null,
+									ageMs: 0,
+								},
+							}),
+							launcherIdentity: () => ({}),
+							execute: async () => brokerExecution,
+						},
+					}
+				: {}),
+			...(mode === "orchestrator"
+				? {
+						orchestrator: {
+							launch: async () => "recovery-job",
+							status: async () => ({ state: "done" }),
+							result: async () =>
+								cleanupFailed
+									? {
+											success: true,
+											cleanupFailed: true,
+											cleanupStage: "pid_marker_removed",
+										}
+									: { success: true },
+						},
+					}
+				: {}),
+		};
+	}
+
+	for (const [mode, entrypoint] of entrypoints) {
+		it(`${mode} blocks a fresh queue after task-base release becomes uncertain`, async () => {
+			const tasksPath = writeTasksFile(`
+### Task 1.1: First
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** first
+
+### Task 1.2: Second
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** second
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const counters = {
+				captures: 0,
+				commits: 0,
+				resets: 0,
+				releases: 0,
+				releaseThrows: true,
+				started: [],
+			};
+			const options = {
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				maxTasks: 1,
+				dependencies: recoveryDependencies(mode, counters),
+			};
+			const first = await entrypoint(options);
+			strictEqual(
+				first.results.at(-1).result,
+				"halted_after_task_base_release_failure",
+			);
+			await rejects(
+				Promise.resolve().then(() => entrypoint(options)),
+				/recovery is required/,
+			);
+			deepStrictEqual(counters.started, ["1.1"]);
+			strictEqual(counters.captures, 1);
+			strictEqual(counters.releases, 1);
+		});
+
+		it(`${mode} preserves the base and halts when provider cleanup is uncertain`, async () => {
+			const tasksPath = writeTasksFile(`
+### Task 1.1: Cleanup uncertainty
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** cleanup uncertainty
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const counters = {
+				captures: 0,
+				commits: 0,
+				resets: 0,
+				releases: 0,
+				releaseThrows: false,
+				started: [],
+			};
+			const options = {
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				stopOnFailure: false,
+				dependencies: recoveryDependencies(mode, counters, {
+					cleanupFailed: true,
+				}),
+			};
+			const first = await entrypoint(options);
+			strictEqual(
+				first.results.at(-1).result,
+				"halted_after_provider_cleanup_failure",
+			);
+			const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+			strictEqual(checkpoint.providerCleanupUncertain.taskId, "1.1");
+			deepStrictEqual(checkpoint.taskBases["1.1"], {
+				ref: "refs/switchyard/task-base/recovery/1.1",
+				tree: "6".repeat(40),
+			});
+			strictEqual(counters.commits, 0);
+			strictEqual(counters.resets, 0);
+			strictEqual(counters.releases, 0);
+			await rejects(
+				Promise.resolve().then(() => entrypoint(options)),
+				/recovery is required/,
+			);
+			deepStrictEqual(counters.started, ["1.1"]);
+			strictEqual(counters.captures, 1);
+		});
+	}
 });
 
 describe("runner stopOnFailure + integration gate failure", () => {
@@ -2861,6 +3451,12 @@ describe("runner headless orchestrator mode", () => {
 			checkpointPath,
 			pollIntervalMs: 1,
 			dependencies: {
+				captureTaskBase: (_workspaceId, { taskId }) => ({
+					ref: `refs/switchyard/task-base/orchestrator/${taskId}`,
+					tree: taskId === "1.1" ? "1".repeat(40) : "2".repeat(40),
+				}),
+				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: () => {},
 				route: () => ({
 					provider: "claude",
 					model: "claude-sonnet-5",
@@ -2905,6 +3501,19 @@ describe("runner headless orchestrator mode", () => {
 			[
 				"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
 				"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+			],
+		);
+		deepStrictEqual(
+			launches.map((payload) => payload.taskBase),
+			[
+				{
+					ref: "refs/switchyard/task-base/orchestrator/1.1",
+					tree: "1".repeat(40),
+				},
+				{
+					ref: "refs/switchyard/task-base/orchestrator/1.2",
+					tree: "2".repeat(40),
+				},
 			],
 		);
 		deepStrictEqual(polls, ["running", "done", "done"]);
@@ -3561,6 +4170,8 @@ describe("runner quota retry coordination", () => {
 		const routeCalls = [];
 		const executeCalls = [];
 		const retryProjections = [];
+		const taskBaseCaptures = [];
+		const taskBaseReleases = [];
 		const outcomes = new Map(
 			Object.entries(executionOutcomes ?? {}).map(([provider, values]) => [
 				provider,
@@ -3617,6 +4228,8 @@ describe("runner quota retry coordination", () => {
 			routeCalls,
 			executeCalls,
 			retryProjections,
+			taskBaseCaptures,
+			taskBaseReleases,
 			dependencies: {
 				route,
 				recordDispatch: recordDispatch ?? (() => {}),
@@ -3630,6 +4243,12 @@ describe("runner quota retry coordination", () => {
 				seedProject: () => {},
 				commitWorkingTree: () => {},
 				resetWorkingTree,
+				captureTaskBase: (_workspaceId, { taskId }) => {
+					taskBaseCaptures.push(taskId);
+					return TASK_BASE;
+				},
+				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: (_workspaceId, base) => taskBaseReleases.push(base),
 				wipeWorkingContainer: () => {},
 				adapters: {
 					agy: makeAdapter("agy"),
@@ -3694,6 +4313,8 @@ describe("runner quota retry coordination", () => {
 		strictEqual(result.results[0].success, true);
 		strictEqual(results.length, 1, "onResult receives only the final outcome");
 		strictEqual(fixture.executeCalls.length, 2);
+		deepStrictEqual(fixture.taskBaseCaptures, ["1.1"]);
+		strictEqual(fixture.taskBaseReleases.length, 1);
 		strictEqual(resetCalls, 1, "reset completes before the retry");
 		deepStrictEqual(
 			fixture.routeCalls.map((call) => call.exclude),
@@ -4477,6 +5098,8 @@ runQueue({
       seed: () => {},
       commit: () => {},
       reset: () => {},
+      captureTaskBase: () => ({ ref: "refs/switchyard/task-base/child-crash/1.1", tree: "4".repeat(40) }),
+      validateTaskBase: (_workspaceId, base) => base,
       destroy: () => {},
     }),
     onRetryStateChanged: ({ retryTransitionId }) => {

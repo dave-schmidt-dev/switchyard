@@ -11,6 +11,7 @@ import {
 	executeAgyAsync,
 } from "../src/switchyard/adapter/agy.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -143,6 +144,14 @@ describe("agy adapter container execution", () => {
 		// The stub exits non-zero unless the required flags, model arg, and
 		// prompt are all present and correctly paired, so a green result here is
 		// itself the assertion that executeAgy sends them.
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			containerName,
+			{
+				runId: "agy-adapter",
+				taskId: "1.1",
+			},
+		);
 		const result = executeAgy(AGY_PROMPT, containerName, {
 			model: AGY_MODEL,
 			resolvedTargetId: AGY_DESCRIPTOR.target_id,
@@ -155,6 +164,7 @@ describe("agy adapter container execution", () => {
 
 		const diff = captureDiff(containerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));

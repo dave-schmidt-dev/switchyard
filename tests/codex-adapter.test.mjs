@@ -5,6 +5,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { captureDiff, executeCodex } from "../src/switchyard/adapter/codex.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -111,6 +112,14 @@ describe("codex adapter container execution", () => {
 		// The stub exits non-zero unless BOTH the exec subcommand and the
 		// sandbox-bypass flag were passed, so a green result here is itself the
 		// assertion that executeCodex sends them (Task 25).
+		const taskBase = captureTaskStartTree(
+			dockerExecutionBackend,
+			containerName,
+			{
+				runId: "codex-adapter",
+				taskId: "1.1",
+			},
+		);
 		const result = executeCodex("apply a small change", containerName, {
 			model: "fake-model",
 			resolvedTargetId: CODEX_DESCRIPTOR.target_id,
@@ -123,6 +132,7 @@ describe("codex adapter container execution", () => {
 
 		const diff = captureDiff(containerName, {
 			executionBackend: dockerExecutionBackend,
+			taskBase,
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));

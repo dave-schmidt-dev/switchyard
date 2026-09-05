@@ -101,6 +101,41 @@ const PROVENANCE_KEYS = [
 	"resolved_credential_profile",
 ];
 
+function fixtureTaskBase(taskId = "1.1") {
+	return {
+		ref: `refs/switchyard/task-base/provenance/${taskId}`,
+		tree: "5".repeat(40),
+	};
+}
+
+function taskBaseContext() {
+	return {
+		queueBackend: {
+			captureTaskBase: (_workspaceId, { taskId }) => fixtureTaskBase(taskId),
+			captureTaskBaseAsync: async (_workspaceId, { taskId }) =>
+				fixtureTaskBase(taskId),
+			validateTaskBase: (_workspaceId, base) => base,
+			validateTaskBaseAsync: async (_workspaceId, base) => base,
+		},
+		taskBases: {},
+	};
+}
+
+function taskBaseDependencies() {
+	return {
+		backendFactory: () => ({
+			create: () => "test-container",
+			destroy: () => {},
+			seed: () => {},
+			commit: () => {},
+			reset: () => {},
+			captureTaskBase: (_workspaceId, { taskId }) => fixtureTaskBase(taskId),
+			validateTaskBase: (_workspaceId, base) => base,
+			releaseTaskBase: () => {},
+		}),
+	};
+}
+
 function makeContext({ provider, model, adapters }) {
 	const dispatches = [];
 	const targetId =
@@ -113,6 +148,7 @@ function makeContext({ provider, model, adapters }) {
 	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
+			...taskBaseContext(),
 			route: () => ({
 				provider,
 				model,
@@ -401,6 +437,7 @@ describe("executeTask — every dispatch record carries all six provenance field
 			log: [],
 		};
 		const context = {
+			...taskBaseContext(),
 			route: () => routeResultObj,
 			adapters: {
 				opencode: {
@@ -442,6 +479,7 @@ function makeOrchestratorContext({
 	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
+			...taskBaseContext(),
 			route: () => ({
 				provider,
 				model,
@@ -459,6 +497,9 @@ function makeOrchestratorContext({
 			projectPath: "/tmp/does-not-matter",
 			workingContainerName: "test-container",
 			exclude: [],
+			adapters: {
+				[harness]: { captureDiffAsync: async () => "" },
+			},
 			orchestrator: {
 				launch: async () => "job-1",
 				status: async () => ({ state: "done" }),
@@ -531,6 +572,7 @@ const NOOP_QUEUE_PREFLIGHT = () => ({ ok: true, eligible: true });
 
 function defaultSyncDependencies(overrides = {}) {
 	return {
+		...taskBaseDependencies(),
 		route: defaultRoute,
 		resolveDescriptor: () =>
 			syntheticDescriptor({
@@ -552,6 +594,7 @@ function defaultSyncDependencies(overrides = {}) {
 
 function defaultOrchestratorDependencies(overrides = {}) {
 	return {
+		...taskBaseDependencies(),
 		route: defaultRoute,
 		resolveDescriptor: () =>
 			syntheticDescriptor({
@@ -559,7 +602,7 @@ function defaultOrchestratorDependencies(overrides = {}) {
 				model: "fixture/opencode-low",
 				harness: "opencode",
 			}),
-		adapters: { opencode: {} },
+		adapters: { opencode: { captureDiffAsync: async () => "" } },
 		orchestrator: {
 			launch: async () => "job-default-ledger",
 			status: async () => ({ state: "done" }),
