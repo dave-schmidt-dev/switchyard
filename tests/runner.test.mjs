@@ -5069,6 +5069,14 @@ describe("runner quota retry coordination", () => {
 		strictEqual(fixture.routeCalls.length, 1);
 		strictEqual(fixture.executeOptions[0].timeoutMs, 1_800_000);
 		strictEqual(fixture.executeOptions[1].timeoutMs, 1_799_000);
+		// The continuation is the same attempt continuing: a
+		// completion_correction allocation must not move the cleanup context
+		// (and therefore the minted receipt) to attempt-2, or the route-health
+		// binding keyed on attempt-1 could never match it.
+		deepStrictEqual(
+			fixture.executeOptions.map((options) => options.cleanupContext.attemptId),
+			["attempt-1", "attempt-1"],
+		);
 		const checkpoint = loadCheckpoint(
 			`${tasksPath}.checkpoint.json`,
 			tasksPath,

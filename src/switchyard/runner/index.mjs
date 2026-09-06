@@ -3934,9 +3934,13 @@ function routeHealthAttemptId(context, taskId) {
 		retryState.attempt > 0
 	)
 		return `attempt-${retryState.attempt}`;
+	// A completion correction is the same attempt continuing, not a second
+	// one: its allocation must not move the binding or the cleanup context
+	// to attempt-2, or the continuation's lifecycle receipt can never match.
 	const allocation = context.checkpoint?.providerAttemptAllocations?.find(
 		(entry) =>
 			entry?.taskId === taskId &&
+			entry.reason !== "completion_correction" &&
 			["allocated", "running"].includes(entry.state),
 	);
 	return allocation ? "attempt-2" : "attempt-1";
