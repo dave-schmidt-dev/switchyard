@@ -99,6 +99,14 @@ import {
 	validateInvocationDescriptor,
 } from "../roster/index.mjs";
 import {
+	acquireHalfOpenClaimSync,
+	createDefaultRouteHealthDecision,
+	createRouteHealthTerminalBinding,
+	releaseHalfOpenClaimSync,
+	startHalfOpenClaimSync,
+} from "../router/health.mjs";
+import {
+	GOLDEN_IMAGE_VERIFIED_PROVIDERS,
 	preflightMacosQueue,
 	readSnapshotAtRoute,
 	route,
@@ -3912,7 +3920,173 @@ function bindAttemptHelperBackend(executionBackend, cleanupContext) {
 	);
 }
 
-export function executeTask(task, context) {
+function routeHealthAttemptId(context, taskId) {
+	if (context.healthAttempt !== undefined) return context.healthAttempt;
+	const retryState = context.checkpoint?.retryState;
+	if (
+		retryState?.taskId === taskId &&
+		Number.isSafeInteger(retryState.attempt) &&
+		retryState.attempt > 0
+	)
+		return `attempt-${retryState.attempt}`;
+	const allocation = context.checkpoint?.providerAttemptAllocations?.find(
+		(entry) =>
+			entry?.taskId === taskId &&
+			["allocated", "running"].includes(entry.state),
+	);
+	return allocation ? "attempt-2" : "attempt-1";
+}
+
+function routeHealthAttemptIdentity(context, task, routeResult, descriptor) {
+	const decision = context.healthDecision;
+	if (typeof decision?.identityFor !== "function") return null;
+	// Health evidence and half-open claims are keyed by the run identity. A
+	// queue without one (no run store) can neither claim a trial nor publish
+	// an ingestible terminal event, so it must never reach the claim path
+	// where a missing run id is a schema error instead of a routing outcome.
+	if (typeof context.runId !== "string" || context.runId.length === 0)
+		return null;
+	const identity = decision.identityFor({
+		provider: routeResult.provider,
+		requiredCapability: routeResult.requiredCapability,
+	});
+	if (
+		!identity ||
+		descriptor?.descriptor_identity !== identity.descriptorIdentity
+	)
+		return null;
+	const state = decision({
+		provider: routeResult.provider,
+		requiredCapability: routeResult.requiredCapability,
+	});
+	if (!state.available && state.initializable !== true) return null;
+	return {
+		...identity,
+		repairEpoch: state.available ? state.repairEpoch : 0,
+		runId: context.runId,
+		taskId: String(task.id),
+		attempt: routeHealthAttemptId(context, task.id),
+		workspaceId: context.workingContainerName,
+		descriptorHarness: routeResult.resolved_harness,
+		invocationDescriptor: structuredClone(descriptor),
+		provider: routeResult.provider,
+		model: descriptor.selector,
+		mode: decision.mode ?? "shadow",
+		suppress: state.suppress === true,
+		trialAvailable: state.trialAvailable === true,
+		healthStateRoot: decision.healthStateRoot,
+		onStatus: context.onStatus,
+	};
+}
+
+function prepareRouteHealthTrial(context, task, routeResult, descriptor) {
+	if (context._completionPin && context._activeRouteHealth) {
+		return { allowed: true };
+	}
+	const binding = routeHealthAttemptIdentity(
+		context,
+		task,
+		routeResult,
+		descriptor,
+	);
+	context._activeRouteHealth = binding;
+	if (binding?.suppress === true)
+		return {
+			allowed: binding.mode !== "enforce",
+			reason: "route-health-suppressed",
+		};
+	if (!binding?.trialAvailable) return { allowed: true };
+	const claimed = acquireHalfOpenClaimSync(binding);
+	if (claimed.claimed !== true) {
+		context.onStatus?.({
+			phase: "route_health",
+			event: "half_open_claim_unavailable",
+			status: `Task ${task.id} could not claim the selected health trial`,
+			taskId: task.id,
+		});
+		return { allowed: binding.mode !== "enforce", reason: claimed.reason };
+	}
+	Object.assign(binding, {
+		leaseToken: claimed.lease.token,
+		leaseRevision: claimed.lease.revision,
+		claimRevision: claimed.lease.revision,
+	});
+	return { allowed: true };
+}
+
+function startRouteHealthTrial(context) {
+	const binding = context._activeRouteHealth;
+	if (binding?.claimStarted) return { allowed: true };
+	if (!binding?.leaseToken) return { allowed: true };
+	const started = startHalfOpenClaimSync(binding);
+	if (started.started === true) {
+		binding.claimStarted = true;
+		return { allowed: true };
+	}
+	const released = releaseHalfOpenClaimSync({
+		...binding,
+		provenNeverStarted: true,
+	});
+	return {
+		allowed: binding.mode !== "enforce",
+		reason: released.reason ?? started.reason,
+	};
+}
+
+function healthDeferredResult(
+	task,
+	routeResult,
+	descriptor,
+	requiredCapability,
+) {
+	return {
+		...descriptorReceiptFields(descriptor),
+		taskId: task.id,
+		success: false,
+		provider: routeResult.provider,
+		model: descriptor.selector,
+		requiredCapability,
+		resolvedTargetId: routeResult.resolvedTargetId ?? null,
+		result: "route_health_deferred",
+		errorKind: null,
+		reason: "selected route health trial is already claimed or unavailable",
+	};
+}
+
+function attachRouteHealthTerminal(result, context) {
+	const binding = context._activeRouteHealth;
+	if (binding?.claimStarted === true && result) {
+		Object.defineProperty(result, "_routeHealthTrialStarted", {
+			value: true,
+			enumerable: false,
+		});
+	}
+	if (!binding || !result?.invocationDescriptor) return result;
+	let hostBinding;
+	try {
+		hostBinding = createRouteHealthTerminalBinding({
+			...binding,
+			...result,
+			providerExecutionSucceeded:
+				context._activeProviderExecutionSucceeded === true,
+			lifecycleReceipt: context._activeCompletionLifecycleReceipt ?? null,
+		});
+	} catch {
+		hostBinding = null;
+	}
+	if (!hostBinding) return result;
+	Object.defineProperty(result, "routeHealthBinding", {
+		value: hostBinding,
+		enumerable: false,
+	});
+	Object.defineProperty(result, "routeHealthAttempt", {
+		value: binding.attempt,
+		enumerable: false,
+	});
+	return result;
+}
+
+function executeTaskUnsafe(task, context) {
 	const executor = resolveTaskExecutor(task);
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {
@@ -3943,6 +4117,12 @@ export function executeTask(task, context) {
 							goldenImageVerifiedProviders:
 								context.goldenImageVerifiedProviders,
 						}
+					: {}),
+				...(context.healthDecision
+					? { healthDecision: context.healthDecision }
+					: {}),
+				...(context.onHealthDecision
+					? { onHealthDecision: context.onHealthDecision }
 					: {}),
 			});
 
@@ -4171,6 +4351,19 @@ export function executeTask(task, context) {
 			requiredCapability,
 		);
 	}
+	const healthPreparation = prepareRouteHealthTrial(
+		context,
+		task,
+		routeResult,
+		invocationDescriptor,
+	);
+	if (!healthPreparation.allowed)
+		return healthDeferredResult(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
 	if (context._completionPin) {
 		if (
 			context._completionPin.workspaceId !== context.workingContainerName ||
@@ -4217,6 +4410,14 @@ export function executeTask(task, context) {
 			timedOut: true,
 		};
 	}
+	const healthStart = startRouteHealthTrial(context);
+	if (!healthStart.allowed)
+		return healthDeferredResult(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
 		timeoutMs: launchTimeoutMs,
@@ -4230,6 +4431,7 @@ export function executeTask(task, context) {
 		resolvedTargetId,
 		cleanupContext,
 	});
+	context._activeProviderExecutionSucceeded = execution.success === true;
 	context._activeCompletionLifecycleReceipt =
 		execution.completionContinuationProof ?? null;
 	if (execution.cleanupFailed === true && execution.success) {
@@ -4611,6 +4813,15 @@ export function executeTask(task, context) {
 	return result;
 }
 
+export function executeTask(task, context) {
+	if (!context._completionPin) {
+		context._activeRouteHealth = null;
+		context._activeProviderExecutionSucceeded = false;
+		context._activeCompletionLifecycleReceipt = null;
+	}
+	return attachRouteHealthTerminal(executeTaskUnsafe(task, context), context);
+}
+
 /**
  * Async provider-backed execution seam. The synchronous executeTask API remains
  * for legacy callers, while queue workers that can await use each adapter's
@@ -4618,9 +4829,15 @@ export function executeTask(task, context) {
  */
 export async function executeTaskAsync(task, context) {
 	clearAsyncTaskContext(context);
+	context._activeRouteHealth = null;
+	context._activeProviderExecutionSucceeded = false;
+	context._activeCompletionLifecycleReceipt = null;
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	try {
-		return await executeTaskAsyncUnsafe(task, context);
+		return attachRouteHealthTerminal(
+			await executeTaskAsyncUnsafe(task, context),
+			context,
+		);
 	} catch (error) {
 		const route = context._activeBrokerRoute;
 		const routed = context._activeTaskRoute;
@@ -4945,6 +5162,31 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
+	const healthPreparation = prepareRouteHealthTrial(
+		context,
+		task,
+		routeResult,
+		invocationDescriptor,
+	);
+	if (!healthPreparation.allowed) {
+		await releaseSelected(selectedRoute);
+		return healthDeferredResult(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
+	const healthStart = startRouteHealthTrial(context);
+	if (!healthStart.allowed) {
+		await releaseSelected(selectedRoute);
+		return healthDeferredResult(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
 	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
 		launcherIdentity: broker.launcherIdentity(selectedRoute),
 		signal: context.signal,
@@ -4965,7 +5207,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 			standard: "standard",
 			high: "high",
 		}[requiredCapability];
-		if (failureKind && fallbackCapability) {
+		if (
+			failureKind &&
+			fallbackCapability &&
+			context._activeRouteHealth?.claimStarted !== true
+		) {
 			context._activeBrokerRoute = selectedRoute;
 			const fallbackRoute = await broker.fallbackAndReserve(
 				brokerRequest,
@@ -5088,6 +5334,25 @@ async function executeTaskAsyncUnsafe(task, context) {
 						...fallbackIntentFailure,
 					};
 				}
+				context._activeRouteHealth = null;
+				const fallbackHealth = prepareRouteHealthTrial(
+					context,
+					task,
+					routeResult,
+					invocationDescriptor,
+				);
+				if (
+					!fallbackHealth.allowed ||
+					!startRouteHealthTrial(context).allowed
+				) {
+					await releaseSelected(fallbackRoute);
+					return healthDeferredResult(
+						task,
+						routeResult,
+						invocationDescriptor,
+						requiredCapability,
+					);
+				}
 				brokerExecution = await broker.execute(brokerRequest, fallbackRoute, {
 					launcherIdentity: broker.launcherIdentity(fallbackRoute),
 					signal: context.signal,
@@ -5116,6 +5381,9 @@ async function executeTaskAsyncUnsafe(task, context) {
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 	};
+	context._activeProviderExecutionSucceeded = execution.success === true;
+	context._activeCompletionLifecycleReceipt =
+		brokerExecution.completionContinuationProof ?? null;
 	if (execution.cleanupFailed === true && execution.success) {
 		await record({
 			provider: routeResult.provider,
@@ -5592,6 +5860,8 @@ export async function runQueueAsync(options) {
 		queueBackend,
 		platform: selectedPlatform,
 		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
+		healthDecision: resolveQueueHealthDecision(dependencies),
+		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
 		checkpointPath,
 		taskBases: checkpoint.taskBases,
@@ -5820,6 +6090,7 @@ export async function runQueueAsync(options) {
 			}
 			if (
 				!retryState &&
+				result._routeHealthTrialStarted !== true &&
 				result.extraProviderInvocationUsed !== true &&
 				isQuotaRetryCandidate(result, ownsWorkingContainer) &&
 				allocateExtraProviderInvocation(
@@ -6097,6 +6368,8 @@ export async function runQueueAsync(options) {
  * @returns {Promise<object>}
  */
 export async function executeTaskWithOrchestrator(task, context) {
+	context._activeRouteHealth = null;
+	context._activeProviderExecutionSucceeded = false;
 	const executor = resolveTaskExecutor(task);
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {
@@ -6118,6 +6391,12 @@ export async function executeTaskWithOrchestrator(task, context) {
 		platform: context.platform,
 		...(context.goldenImageVerifiedProviders !== undefined
 			? { goldenImageVerifiedProviders: context.goldenImageVerifiedProviders }
+			: {}),
+		...(context.healthDecision
+			? { healthDecision: context.healthDecision }
+			: {}),
+		...(context.onHealthDecision
+			? { onHealthDecision: context.onHealthDecision }
 			: {}),
 	});
 
@@ -6290,6 +6569,27 @@ export async function executeTaskWithOrchestrator(task, context) {
 				requiredCapability,
 			);
 		}
+		const healthPreparation = prepareRouteHealthTrial(
+			context,
+			task,
+			routeResult,
+			invocationDescriptor,
+		);
+		if (!healthPreparation.allowed)
+			return healthDeferredResult(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			);
+		const healthStart = startRouteHealthTrial(context);
+		if (!healthStart.allowed)
+			return healthDeferredResult(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			);
 		jobId = await context.orchestrator.launch({
 			payloadVersion: ORCHESTRATOR_PAYLOAD_VERSION,
 			contractVersion: ORCHESTRATOR_PAYLOAD_VERSION,
@@ -6434,6 +6734,9 @@ export async function executeTaskWithOrchestrator(task, context) {
 			errorKind: jobResult?.errorKind ?? null,
 		};
 	}
+	context._activeProviderExecutionSucceeded = true;
+	context._activeCompletionLifecycleReceipt =
+		jobResult.completionContinuationProof ?? null;
 
 	context.queueBackend?.afterRun?.(
 		context.workingContainerName,
@@ -6649,6 +6952,24 @@ function _resolveOnStatus(deps) {
 			onStatus(event);
 		}
 	};
+}
+
+function resolveQueueHealthDecision(dependencies) {
+	if (dependencies.healthDecision) return dependencies.healthDecision;
+	const environmentMode = process.env.SWITCHYARD_ROUTE_HEALTH_MODE;
+	return createDefaultRouteHealthDecision({
+		healthStateRoot:
+			dependencies.healthStateRoot ??
+			process.env.SWITCHYARD_ROUTE_HEALTH_STATE_ROOT,
+		mode: dependencies.healthMode ?? environmentMode ?? "shadow",
+		qualifiedProviders:
+			dependencies.goldenImageVerifiedProviders ??
+			GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+		goldenImageReference:
+			dependencies.goldenImage ??
+			process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE ??
+			"golden-image-unconfigured",
+	});
 }
 
 function _safeError(error) {
@@ -7210,6 +7531,12 @@ function createDispatchBroker(context, dependencies = {}) {
 				...(goldenImageVerifiedProviders !== undefined
 					? { goldenImageVerifiedProviders }
 					: {}),
+				...(context.healthDecision
+					? { healthDecision: context.healthDecision }
+					: {}),
+				...(context.onHealthDecision
+					? { onHealthDecision: context.onHealthDecision }
+					: {}),
 			}),
 		resolveTargetIdentity:
 			dependencies.resolveTargetIdentity ?? resolveTargetIdentity,
@@ -7444,6 +7771,12 @@ function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
 				: {}),
 			...(dependencies.preflightReadSnapshot
 				? { readSnapshot: dependencies.preflightReadSnapshot }
+				: {}),
+			...(dependencies.healthDecision
+				? { healthDecision: dependencies.healthDecision }
+				: {}),
+			...(dependencies.onHealthDecision
+				? { onHealthDecision: dependencies.onHealthDecision }
 				: {}),
 		});
 		if (!result.ok)
@@ -8337,6 +8670,8 @@ export function runQueue(options) {
 		queueBackend,
 		platform: selectedPlatform,
 		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
+		healthDecision: resolveQueueHealthDecision(dependencies),
+		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
 		checkpointPath,
 		runId: queueBackend.taskBaseRunId ?? runId,
@@ -8609,6 +8944,7 @@ export function runQueue(options) {
 					checkpointPath,
 				);
 				if (
+					result._routeHealthTrialStarted !== true &&
 					result.extraProviderInvocationUsed !== true &&
 					isQuotaRetryCandidate(result, ownsWorkingContainer) &&
 					allocateExtraProviderInvocation(
@@ -9232,6 +9568,8 @@ export async function runQueueWithOrchestrator(options) {
 		queueBackend,
 		platform: selectedPlatform,
 		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
+		healthDecision: resolveQueueHealthDecision(dependencies),
+		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
 		checkpointPath,
 		runId: queueBackend.taskBaseRunId ?? runId,
@@ -9364,6 +9702,7 @@ export async function runQueueWithOrchestrator(options) {
 			}
 
 			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
+			attachRouteHealthTerminal(result, context);
 			if (onResult) onResult(result);
 			const safeFailure = failureMetadataFor(result, result.partialDiffPath);
 			if (emitStatus) {

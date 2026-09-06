@@ -54,12 +54,20 @@ import {
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
+	attestRouteRepair,
+	createDefaultRouteHealthDecision,
+	ingestRouteHealthEvents,
+	inspectRouteHealth,
+} from "../router/health.mjs";
+import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
+import {
 	acquireProjectLock,
 	acquireRunLock,
 	advanceState,
 	applyRetention,
 	assertProjectLockOwnership,
 	createEvent,
+	createRouteHealthEvent,
 	getRunRoot,
 	getStateRoot,
 	getVmAdmissionRoot,
@@ -112,6 +120,8 @@ Run/Launch options:
   --only-provider <name>  Restrict routing to only this provider (repeatable, mutually exclusive with --exclude-provider)
   --platform <macos>     Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
+  --health-enforce        Apply route-health exclusions (default: shadow only)
+  --health-state-root <path>  Explicit host-owned route-health root
   --json                  Emit one terminal JSON object
   --help                 Show this help`;
 
@@ -158,12 +168,20 @@ const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>] [--st
   --state-root <path>  Reconcile this launch's durable state root
   --help               Show this help`;
 
+const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest-repair> --target <target-id> [options]
+
+	identity:      --capability <low|standard|high>
+  inspect:       --repair-epoch <n> [--health-state-root <path>]
+  attest-repair: --repair-kind <image_repaired|auth_repaired|configuration_repaired> [--health-state-root <path>]
+  This records attended host control metadata only; it never reads credentials or repairs a service.`;
+
 const KNOWN_SUBCOMMANDS = new Set([
 	"run",
 	"launch",
 	"status",
 	"result",
 	"recover",
+	"health",
 	"remediate-orphaned-locks",
 ]);
 
@@ -266,6 +284,8 @@ function parseDispatchArgs(argv) {
 				"only-provider": { type: "string", multiple: true },
 				provider: { type: "string", multiple: true },
 				"task-id": { type: "string", multiple: true },
+				"health-enforce": { type: "boolean", default: false },
+				"health-state-root": { type: "string" },
 				platform: { type: "string" },
 				json: { type: "boolean", default: false },
 				help: { type: "boolean", default: false },
@@ -349,6 +369,10 @@ function parseDispatchArgs(argv) {
 		taskIds: values["task-id"] ?? [],
 		platform,
 		json: values.json,
+		healthMode: values["health-enforce"] ? "enforce" : "shadow",
+		healthStateRoot: values["health-state-root"]
+			? resolve(values["health-state-root"])
+			: undefined,
 	};
 }
 
@@ -445,6 +469,95 @@ function parseRecoverArgs(argv) {
 		runId: parsed.values.run ?? null,
 		stateRoot: parsed.values["state-root"] ?? null,
 	};
+}
+
+function parseHealthArgs(argv) {
+	let parsed;
+	try {
+		parsed = parseArgs({
+			args: argv,
+			allowPositionals: true,
+			options: {
+				target: { type: "string" },
+				descriptor: { type: "string" },
+				"public-configuration-epoch": { type: "string" },
+				"repair-epoch": { type: "string" },
+				"repair-kind": { type: "string" },
+				capability: { type: "string" },
+				"health-state-root": { type: "string" },
+				help: { type: "boolean", default: false },
+			},
+		});
+	} catch (error) {
+		throw new UsageError(error.message);
+	}
+	const action = parsed.positionals[0];
+	if (parsed.values.help) return { help: true };
+	if (!new Set(["identity", "inspect", "attest-repair"]).has(action))
+		throw new UsageError("health requires identity, inspect, or attest-repair");
+	if (!parsed.values.target)
+		throw new UsageError("health --target is required");
+	if (action === "identity") {
+		const requiredCapability = parsed.values.capability;
+		if (!new Set(["low", "standard", "high"]).has(requiredCapability))
+			throw new UsageError(
+				"health identity --capability must be low, standard, or high",
+			);
+		return { action, provider: parsed.values.target, requiredCapability };
+	}
+	for (const name of ["descriptor", "public-configuration-epoch"]) {
+		if (!parsed.values[name])
+			throw new UsageError(`health --${name} is required`);
+	}
+	const base = {
+		targetId: parsed.values.target,
+		descriptorIdentity: parsed.values.descriptor,
+		publicConfigurationEpoch: parsed.values["public-configuration-epoch"],
+		healthStateRoot: parsed.values["health-state-root"]
+			? resolve(parsed.values["health-state-root"])
+			: undefined,
+	};
+	if (action === "inspect") {
+		const repairEpochText = parsed.values["repair-epoch"];
+		if (!/^(0|[1-9]\d*)$/.test(repairEpochText ?? ""))
+			throw new UsageError(
+				"health inspect --repair-epoch must be a non-negative integer",
+			);
+		const repairEpoch = Number(repairEpochText);
+		if (!Number.isSafeInteger(repairEpoch))
+			throw new UsageError(
+				"health inspect --repair-epoch must be a non-negative integer",
+			);
+		return { action, ...base, repairEpoch };
+	}
+	if (!parsed.values["repair-kind"])
+		throw new UsageError("health attest-repair --repair-kind is required");
+	return { action, ...base, repairKind: parsed.values["repair-kind"] };
+}
+
+async function handleHealth(argv) {
+	const input = parseHealthArgs(argv);
+	if (input.help) {
+		console.log(USAGE_HEALTH);
+		return;
+	}
+	const onStatus = ({ event }) =>
+		console.error(`dispatch: route health ${event}`);
+	if (input.action === "identity") {
+		const decision = createDefaultRouteHealthDecision({
+			qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+		});
+		const identity = decision.identityFor(input);
+		if (!identity) process.exitCode = 1;
+		console.log(JSON.stringify(identity ?? { available: false }));
+		return;
+	}
+	const result =
+		input.action === "inspect"
+			? await inspectRouteHealth({ ...input, onStatus })
+			: await attestRouteRepair({ ...input, onStatus });
+	if (result?.available === false) process.exitCode = 1;
+	console.log(JSON.stringify(result));
 }
 
 /**
@@ -569,6 +682,19 @@ async function runDispatch(opts, dependencies = {}) {
 	// reservations, fallback, and provider execution. Keep the injectable
 	// override for lifecycle tests and compatibility callers.
 	const runQueueFn = dependencies.runQueue ?? runQueueAsync;
+	const healthDecision =
+		dependencies.healthDecision ??
+		createDefaultRouteHealthDecision({
+			healthStateRoot: opts.healthStateRoot,
+			mode: opts.healthMode,
+			qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+			// The runner derives the same epoch from dependencies.goldenImage;
+			// dispatch must bind to the identical golden image so both paths
+			// observe one health generation.
+			...(dependencies.goldenImage !== undefined
+				? { goldenImageReference: dependencies.goldenImage }
+				: {}),
+		});
 
 	// Initialize the run record BEFORE the project lock is ever acquired —
 	// the same ordering handleLaunch uses. The project lock is keyed by the
@@ -758,6 +884,16 @@ async function runDispatch(opts, dependencies = {}) {
 			projectRevision: identity?.projectRevision,
 			...(runStoreReady ? { runId } : {}),
 			dependencies: {
+				...dependencies,
+				healthDecision,
+				onHealthDecision: (decision) => {
+					dependencies.onHealthDecision?.(decision);
+					if (decision.state !== "healthy") {
+						report(
+							`dispatch: route health ${decision.provider} ${decision.state} (${decision.mode})`,
+						);
+					}
+				},
 				onTaskStart: (task) => {
 					report(`dispatch: -> task ${task.id} ${task.title ?? ""}`.trimEnd());
 					// activeTaskId is not just one datum: buildStatusEnvelope
@@ -834,10 +970,29 @@ async function runDispatch(opts, dependencies = {}) {
 							...(r.alreadyApplied ? { alreadyApplied: true } : {}),
 							...(safeFailure ?? {}),
 							...(artifactRef ? { artifactRef } : {}),
+							...(r.routeHealthBinding
+								? { attempt: r.routeHealthAttempt }
+								: {}),
 						};
 						eventWriteChain = eventWriteChain
 							.then(async () => {
-								await createEvent(runId, event);
+								if (r.routeHealthBinding) {
+									await createRouteHealthEvent(
+										runId,
+										event,
+										r.routeHealthBinding,
+									);
+									try {
+										await ingestRouteHealthEvents({
+											authorisedRuns: [{ runId, runRoot: getRunRoot(runId) }],
+											healthStateRoot: opts.healthStateRoot,
+										});
+									} catch {
+										report("dispatch: route health ingestion unavailable");
+									}
+								} else {
+									await createEvent(runId, event);
+								}
 								await updateRunWithRetry(runId, {
 									activeTaskId: null,
 									activeTaskProvider: null,
@@ -1288,6 +1443,15 @@ async function handleLaunch(argv, dependencies = {}) {
 				{
 					detached: true,
 					stdio: bootFd !== null ? ["ignore", "ignore", bootFd] : "ignore",
+					env: {
+						...process.env,
+						SWITCHYARD_ROUTE_HEALTH_MODE: opts.healthMode,
+						...(opts.healthStateRoot
+							? {
+									SWITCHYARD_ROUTE_HEALTH_STATE_ROOT: opts.healthStateRoot,
+								}
+							: {}),
+					},
 				},
 			);
 		} finally {
@@ -2526,6 +2690,10 @@ async function main(argv) {
 				await handleRecover(subArgs);
 				break;
 			}
+			case "health": {
+				await handleHealth(subArgs);
+				break;
+			}
 			case "remediate-orphaned-locks": {
 				await handleOrphanLockRemediation(subArgs);
 				break;
@@ -2568,6 +2736,7 @@ if (
 export {
 	captureHostFingerprint,
 	formatRunAbort,
+	handleHealth,
 	handleLaunch,
 	handleOrphanLockRemediation,
 	handleRecover,
@@ -2576,6 +2745,7 @@ export {
 	handleStatus,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
+	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
 	parseRecoverArgs,

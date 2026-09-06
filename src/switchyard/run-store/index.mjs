@@ -192,6 +192,8 @@ const ROUTE_HEALTH_BINDING_KEYS = new Set([
 	"publicConfigurationEpoch",
 	"repairEpoch",
 	"claimRevision",
+	"transportVerified",
+	"lifecycleVerified",
 ]);
 const ROUTE_HEALTH_EPOCH_RE = /^sha256:[a-f0-9]{64}$/;
 
@@ -212,6 +214,10 @@ function validateRouteHealthBinding(binding) {
 		!ROUTE_HEALTH_EPOCH_RE.test(binding.publicConfigurationEpoch) ||
 		!Number.isSafeInteger(binding.repairEpoch) ||
 		binding.repairEpoch < 0 ||
+		typeof binding.transportVerified !== "boolean" ||
+		typeof binding.lifecycleVerified !== "boolean" ||
+		(binding.claimRevision !== undefined &&
+			binding.lifecycleVerified !== true) ||
 		(binding.claimRevision !== undefined &&
 			(!Number.isSafeInteger(binding.claimRevision) ||
 				binding.claimRevision < 1))

@@ -376,6 +376,8 @@ describe("event ordering", () => {
 			adapterContractId: "switchyard-route-health-v1",
 			publicConfigurationEpoch: `sha256:${"a".repeat(64)}`,
 			repairEpoch: 0,
+			transportVerified: true,
+			lifecycleVerified: true,
 		};
 		const descriptor = validateInvocationDescriptor(
 			{

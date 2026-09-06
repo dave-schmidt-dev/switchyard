@@ -192,7 +192,7 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
  * credential into the golden image or clone. The macOS queue admits either
  * evidence class but keeps every other provider fail-closed.
  */
-const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
+export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"codex",
 	"opencode-go",
 	"vibe",
@@ -332,6 +332,49 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 		return { eligible: false, reason: "no_quota_headroom" };
 	}
 	return { eligible: true, reason: "eligible" };
+}
+
+// Health is a strictly subtractive, synchronous projection.  The ordinary
+// eligibility predicate remains the authority for provider/capability/usage;
+// this hook may remove that survivor but can never add one.  Promise-like
+// values are ignored so a mistaken async callback cannot become truthy route
+// authority in the synchronous public APIs.
+function healthExclusion(name, _provider, options) {
+	if (typeof options.healthDecision !== "function") return null;
+	try {
+		const decision = options.healthDecision({
+			provider: name,
+			resolvedTargetId: resolveTargetId(name),
+			requiredCapability: options.requiredCapability,
+			usageMode: options.usageMode,
+		});
+		if (
+			!decision ||
+			typeof decision !== "object" ||
+			typeof decision.then === "function"
+		)
+			return null;
+		const sanitized = {
+			available: decision.available === true,
+			state:
+				typeof decision.state === "string" && decision.state.length <= 64
+					? decision.state
+					: "health-unavailable",
+			mode: decision.mode === "enforce" ? "enforce" : "shadow",
+			suppress: decision.suppress === true,
+		};
+		options.onHealthDecision?.({ provider: name, ...sanitized });
+		return sanitized.suppress ? sanitized : null;
+	} catch {
+		options.onHealthDecision?.({
+			provider: name,
+			available: false,
+			state: "health-unavailable",
+			mode: "shadow",
+			suppress: false,
+		});
+		return null;
+	}
 }
 
 /**
@@ -548,11 +591,20 @@ export function preflightMacosQueue(options = {}) {
 				usageMode: "observed",
 				goldenImageVerifiedProviders: verifiedProviders,
 			});
-			if (classification.eligible) {
+			const health = classification.eligible
+				? healthExclusion(name, provider, {
+						...options,
+						requiredCapability: capability,
+						usageMode: "observed",
+					})
+				: null;
+			if (classification.eligible && !health) {
 				eligibleProviders.push(name);
 			} else {
 				excludedProviders.push(name);
-				excludedReasons[name] = classification.reason;
+				excludedReasons[name] = health
+					? "route_health_suppressed"
+					: classification.reason;
 			}
 		}
 
@@ -699,6 +751,8 @@ export function route(options = {}) {
 			availableProviders,
 			platform,
 			goldenImageVerifiedProviders,
+			healthDecision: options.healthDecision,
+			onHealthDecision: options.onHealthDecision,
 		});
 		const model = blind.provider
 			? getRightSizedModel(blind.provider, effectiveCapabilityClass)
@@ -806,6 +860,16 @@ export function route(options = {}) {
 				rejectionLog[eligibility.reason] ??
 					`provider ${name}: ${eligibility.reason}`,
 			);
+			continue;
+		}
+		const health = healthExclusion(name, provider, {
+			...options,
+			requiredCapability: effectiveCapabilityClass,
+			usageMode: "observed",
+		});
+		if (health) {
+			otherSkips += 1;
+			log.push(`provider ${name}: route health ${health.state}`);
 			continue;
 		}
 
@@ -1102,6 +1166,12 @@ export function routeBlind(
 			}
 			continue;
 		}
+		const health = healthExclusion(name, null, {
+			...options,
+			requiredCapability,
+			usageMode: "unknown",
+		});
+		if (health) continue;
 		return {
 			provider: name,
 			model: null,

@@ -36,8 +36,19 @@ import {
 	getInvocationDescriptorIdentity,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
+import {
+	attestRouteRepair,
+	createDefaultRouteHealthDecision,
+	ingestRouteHealthEvents,
+	inspectRouteHealth,
+} from "../src/switchyard/router/health.mjs";
 import { route as realRoute } from "../src/switchyard/router/index.mjs";
-import { VmSlotUnavailableError } from "../src/switchyard/run-store/index.mjs";
+import {
+	createRouteHealthEvent,
+	getRunRoot,
+	initializeRun,
+	VmSlotUnavailableError,
+} from "../src/switchyard/run-store/index.mjs";
 import {
 	acquireCheckpointLease,
 	CHECKPOINT_IDENTITY_CODES,
@@ -11583,6 +11594,548 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		strictEqual(routeCalls.length, 1);
 		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
+	});
+
+	it("executeTask carries the shared health gate into its synchronous route seam", () => {
+		const routeCalls = [];
+		const healthDecision = () => ({
+			available: false,
+			state: "health-unavailable",
+			suppress: false,
+		});
+		executeTask(
+			{ id: "1.1", title: "task", description: "op" },
+			{
+				route: (opts) => {
+					routeCalls.push(opts);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 50,
+						reason: "spread",
+					};
+				},
+				healthDecision,
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+		strictEqual(routeCalls[0].healthDecision, healthDecision);
+	});
+
+	it("turns the first real authoritative failure into a durable health hold", async () => {
+		const oldRoster = process.env.SWITCHYARD_ROSTER_PATH;
+		const oldRuns = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		const rosterPath = writeDispatchQualifiedRosterFixture();
+		const healthStateRoot = join(TEST_DIR, "first-health");
+		process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+		process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_DIR, "first-runs");
+		__resetRosterCacheForTests();
+		try {
+			const healthDecision = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			// Production path on purpose: the test wrapper's synthetic descriptor
+			// differs from the roster-derived health identity, and the binding must
+			// only attach when the real descriptor receipt matches that identity.
+			const result = executeTaskImpl(
+				{ id: "1.1", title: "task", description: "op" },
+				{
+					route: () => ({
+						provider: "codex",
+						model: "fixture-codex-standard",
+						resolvedTargetId: "codex",
+						resolved_harness: "codex",
+						requiredCapability: "standard",
+						percentLeft: 50,
+						reason: "fixture",
+					}),
+					healthDecision,
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => ({ success: false }),
+					adapters: {
+						codex: {
+							execute: () => ({
+								success: false,
+								errorKind: "auth_expired",
+								diagnosticCode: "auth_expired",
+								diagnosticOrigin: "adapter",
+								diagnosticEvidenceAvailable: true,
+								failurePhase: "provider_execution",
+							}),
+							captureDiff: () => null,
+						},
+					},
+					queueBackend: { captureTaskBase: () => TASK_BASE },
+					projectPath: TEST_DIR,
+					workingContainerName: "health-workspace",
+					runId: "health-run",
+				},
+			);
+			ok(result.routeHealthBinding);
+			await initializeRun({
+				runId: "health-run",
+				tasksFilePath: join(TEST_DIR, "tasks.md"),
+				projectPath: TEST_DIR,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: { fixture: true },
+			});
+			await createRouteHealthEvent(
+				"health-run",
+				{
+					phase: "execution",
+					event: "task_failed",
+					status: "failed",
+					taskId: "1.1",
+					attempt: result.routeHealthAttempt,
+					resolvedTargetId: result.resolvedTargetId,
+					invocationDescriptor: result.invocationDescriptor,
+					descriptorIdentity: result.descriptorIdentity,
+					descriptorHarness: result.descriptorHarness,
+					diagnosticCode: result.diagnosticCode,
+					diagnosticOrigin: result.diagnosticOrigin,
+					diagnosticEvidenceAvailable: true,
+					failurePhase: result.failurePhase,
+				},
+				result.routeHealthBinding,
+			);
+			await ingestRouteHealthEvents({
+				authorisedRuns: [
+					{ runId: "health-run", runRoot: getRunRoot("health-run") },
+				],
+				healthStateRoot,
+			});
+			const identity = healthDecision.identityFor({
+				provider: "codex",
+				requiredCapability: "standard",
+			});
+			strictEqual(
+				(await inspectRouteHealth({ ...identity, healthStateRoot })).state,
+				"repair-hold",
+			);
+		} finally {
+			if (oldRoster === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = oldRoster;
+			if (oldRuns === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = oldRuns;
+			__resetRosterCacheForTests();
+		}
+	});
+
+	// Drive the production runner (no test descriptor wrapper) so the roster
+	// descriptor receipt is the one the health identity was derived from.
+	function productionQueueOptions(options) {
+		const wrapped = withTestDescriptorOptions(options);
+		const dependencies = { ...wrapped.dependencies };
+		dependencies.route = options.dependencies.route;
+		delete dependencies.resolveDescriptor;
+		delete dependencies.resolveTargetIdentity;
+		return { ...wrapped, dependencies };
+	}
+
+	function codexHealthRoute() {
+		return {
+			provider: "codex",
+			model: "fixture-codex-standard",
+			resolvedTargetId: "codex",
+			resolved_harness: "codex",
+			requiredCapability: "standard",
+			percentLeft: 50,
+			reason: "fixture",
+		};
+	}
+
+	function authExpiredExecution() {
+		return {
+			success: false,
+			errorKind: "auth_expired",
+			diagnosticCode: "auth_expired",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
+			failurePhase: "provider_execution",
+		};
+	}
+
+	// Owned-workspace queue dependencies with a scripted codex outcome list;
+	// the legacy container stubs make the queue own its workspace so the
+	// quota fallback path is reachable.
+	function ownedCodexQueueDependencies(outcomes) {
+		const executeCalls = [];
+		const queue = [...outcomes];
+		const execute = () => {
+			executeCalls.push("codex");
+			return queue.shift() ?? { success: true, output: "ok" };
+		};
+		return {
+			executeCalls,
+			dependencies: {
+				route: codexHealthRoute,
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "owned-health-container",
+				provisionCredentials: () => {},
+				seedProject: () => {},
+				commitWorkingTree: () => {},
+				resetWorkingTree: () => {},
+				captureTaskBase: () => TASK_BASE,
+				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: () => {},
+				wipeWorkingContainer: () => {},
+				adapters: {
+					codex: {
+						execute,
+						executeAsync: async () => execute(),
+						captureDiff: () => "diff --git a/a b/a\n+change",
+						captureDiffAsync: async () => "diff --git a/a b/a\n+change",
+					},
+				},
+			},
+		};
+	}
+
+	function quotaExhaustedExecution() {
+		return {
+			success: false,
+			output: "",
+			error: "provider quota unavailable",
+			errorKind: "quota_exhausted",
+			diagnosticCode: "quota_exhausted",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: true,
+			failurePhase: "provider_execution",
+		};
+	}
+
+	// Put the codex standard route into a real repair-hold through the
+	// production evidence chain: authoritative failure -> terminal binding ->
+	// run-store event -> ingestion.
+	async function holdCodexRoute({ healthDecision, healthStateRoot, runId }) {
+		const result = executeTaskImpl(
+			{ id: "1.1", title: "task", description: "op" },
+			{
+				route: codexHealthRoute,
+				healthDecision,
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				integrationGate: () => ({ success: false }),
+				adapters: {
+					codex: { execute: authExpiredExecution, captureDiff: () => null },
+				},
+				queueBackend: { captureTaskBase: () => TASK_BASE },
+				projectPath: TEST_DIR,
+				workingContainerName: "hold-workspace",
+				runId,
+			},
+		);
+		ok(result.routeHealthBinding, "hold evidence needs a terminal binding");
+		await initializeRun({
+			runId,
+			tasksFilePath: join(TEST_DIR, "tasks.md"),
+			projectPath: TEST_DIR,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: { fixture: true },
+		});
+		await createRouteHealthEvent(
+			runId,
+			{
+				phase: "execution",
+				event: "task_failed",
+				status: "failed",
+				taskId: "1.1",
+				attempt: result.routeHealthAttempt,
+				resolvedTargetId: result.resolvedTargetId,
+				invocationDescriptor: result.invocationDescriptor,
+				descriptorIdentity: result.descriptorIdentity,
+				descriptorHarness: result.descriptorHarness,
+				diagnosticCode: result.diagnosticCode,
+				diagnosticOrigin: result.diagnosticOrigin,
+				diagnosticEvidenceAvailable: true,
+				failurePhase: result.failurePhase,
+			},
+			result.routeHealthBinding,
+		);
+		await ingestRouteHealthEvents({
+			authorisedRuns: [{ runId, runRoot: getRunRoot(runId) }],
+			healthStateRoot,
+		});
+		const identity = healthDecision.identityFor({
+			provider: "codex",
+			requiredCapability: "standard",
+		});
+		strictEqual(
+			(await inspectRouteHealth({ ...identity, healthStateRoot })).state,
+			"repair-hold",
+		);
+		return identity;
+	}
+
+	function withQualifiedRoster(fn) {
+		return async () => {
+			const oldRoster = process.env.SWITCHYARD_ROSTER_PATH;
+			const oldRuns = process.env.SWITCHYARD_RUN_STORE_ROOT;
+			process.env.SWITCHYARD_ROSTER_PATH =
+				writeDispatchQualifiedRosterFixture();
+			process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_DIR, "health-runs");
+			__resetRosterCacheForTests();
+			try {
+				await fn();
+			} finally {
+				if (oldRoster === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+				else process.env.SWITCHYARD_ROSTER_PATH = oldRoster;
+				if (oldRuns === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+				else process.env.SWITCHYARD_RUN_STORE_ROOT = oldRuns;
+				__resetRosterCacheForTests();
+			}
+		};
+	}
+
+	it(
+		"keeps a started trial fenced and skips quota fallback without lifecycle proof",
+		withQualifiedRoster(async () => {
+			for (const mode of ["sync", "async"]) {
+				const healthStateRoot = join(TEST_DIR, `trial-health-${mode}`);
+				const healthDecision = createDefaultRouteHealthDecision({
+					healthStateRoot,
+					qualifiedProviders: ["codex"],
+					goldenImageReference: "golden-a",
+				});
+				const identity = await holdCodexRoute({
+					healthDecision,
+					healthStateRoot,
+					runId: `hold-run-${mode}`,
+				});
+				await attestRouteRepair({
+					...identity,
+					healthStateRoot,
+					repairKind: "auth_repaired",
+					nowMs: Date.now() + 1_000,
+				});
+				strictEqual(
+					healthDecision({ provider: "codex", requiredCapability: "standard" })
+						.trialAvailable,
+					true,
+					mode,
+				);
+				const tasksPath = writeTasksFile(`### Task 1.1: Trial without proof
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** run the attested trial
+`);
+				const checkpointPath = `${tasksPath}.checkpoint.json`;
+				const fixture = ownedCodexQueueDependencies([
+					quotaExhaustedExecution(),
+					{ success: true, output: "ok" },
+				]);
+				fixture.dependencies.healthDecision = healthDecision;
+				const options = productionQueueOptions({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					runId: `trial-run-${mode}`,
+					dependencies: fixture.dependencies,
+				});
+				const result =
+					mode === "sync"
+						? runQueueImpl(options)
+						: await runQueueAsyncImpl(options);
+				strictEqual(result.results[0].success, false, mode);
+				strictEqual(result.results[0].result, "execution_failed", mode);
+				strictEqual(
+					fixture.executeCalls.length,
+					1,
+					`${mode}: a started trial never spends the quota fallback launch`,
+				);
+				deepStrictEqual(
+					loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations,
+					[],
+					mode,
+				);
+				const health = await inspectRouteHealth({
+					...identity,
+					healthStateRoot,
+				});
+				strictEqual(health.state, "half-open", mode);
+				strictEqual(
+					health.claimStatus,
+					"started",
+					`${mode}: without lifecycle proof the claim stays fenced`,
+				);
+			}
+		}),
+	);
+
+	it(
+		"never claims a trial for an attempt without a run identity",
+		withQualifiedRoster(async () => {
+			const healthStateRoot = join(TEST_DIR, "anonymous-health");
+			const healthDecision = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			const identity = await holdCodexRoute({
+				healthDecision,
+				healthStateRoot,
+				runId: "hold-run-anonymous",
+			});
+			await attestRouteRepair({
+				...identity,
+				healthStateRoot,
+				repairKind: "auth_repaired",
+				nowMs: Date.now() + 1_000,
+			});
+			const executeCalls = [];
+			// Before the run-identity guard this threw a health schema error out
+			// of the claim path instead of returning the provider outcome.
+			const result = executeTaskImpl(
+				{ id: "1.1", title: "task", description: "op" },
+				{
+					route: codexHealthRoute,
+					healthDecision,
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => ({ success: false }),
+					adapters: {
+						codex: {
+							execute: () => {
+								executeCalls.push("codex");
+								return quotaExhaustedExecution();
+							},
+							captureDiff: () => null,
+						},
+					},
+					queueBackend: { captureTaskBase: () => TASK_BASE },
+					projectPath: TEST_DIR,
+					workingContainerName: "anonymous-workspace",
+				},
+			);
+			strictEqual(result.result, "execution_failed");
+			strictEqual(result.errorKind, "quota_exhausted");
+			deepStrictEqual(executeCalls, ["codex"]);
+			strictEqual(result._routeHealthTrialStarted, undefined);
+			strictEqual(result.routeHealthBinding, undefined);
+			const health = await inspectRouteHealth({ ...identity, healthStateRoot });
+			strictEqual(health.state, "repair-hold");
+			strictEqual(health.claimStatus, null, "no claim without a run identity");
+		}),
+	);
+
+	it(
+		"defers a held route before the broker launches and releases its reservation",
+		withQualifiedRoster(async () => {
+			const healthStateRoot = join(TEST_DIR, "broker-health");
+			const shadow = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			await holdCodexRoute({
+				healthDecision: shadow,
+				healthStateRoot,
+				runId: "hold-run-broker",
+			});
+			const enforce = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				mode: "enforce",
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			const outcomes = [];
+			for (const healthDecision of [enforce, shadow]) {
+				const executions = [];
+				const releases = [];
+				const reservedRoute = {
+					provider: "codex",
+					model: "fixture-codex-standard",
+					resolvedTarget: "codex",
+					harness: "codex",
+					capability: "standard",
+					reason: "fixture",
+					reservation: { id: "reservation-1" },
+					snapshotIdentity: { status: "fresh", mtime: 1, ageMs: 0 },
+				};
+				const result = await executeTaskAsyncImpl(
+					{ id: "1.1", title: "task", description: "op" },
+					{
+						broker: {
+							selectAndReserve: async () => reservedRoute,
+							fallbackAndReserve: async () => {
+								throw new Error("fallback must not run");
+							},
+							execute: async (_request, route) => {
+								executions.push(route.provider);
+								return { ...authExpiredExecution(), outcome: "failure" };
+							},
+							release: async (route, outcome) =>
+								releases.push([route.reservation.id, outcome]),
+							launcherIdentity: (route) => ({ provider: route.provider }),
+						},
+						healthDecision,
+						recordDispatch: () => {},
+						recordDispatchIntent: () => {},
+						integrationGate: () => ({ success: false }),
+						adapters: {
+							codex: {
+								executeAsync: async () => authExpiredExecution(),
+								captureDiffAsync: async () => null,
+							},
+						},
+						queueBackend: { captureTaskBase: () => TASK_BASE },
+						projectPath: TEST_DIR,
+						workingContainerName: "broker-workspace",
+						runId: `broker-run-${healthDecision.mode}`,
+					},
+				);
+				outcomes.push({
+					mode: healthDecision.mode,
+					result: result.result,
+					executions,
+					releases,
+				});
+			}
+			deepStrictEqual(outcomes, [
+				{
+					mode: "enforce",
+					result: "route_health_deferred",
+					executions: [],
+					releases: [["reservation-1", "failure"]],
+				},
+				{
+					mode: "shadow",
+					result: "execution_failed",
+					executions: ["codex"],
+					releases: [],
+				},
+			]);
+		}),
+	);
+
+	it("binds route-health identity to the selected golden image", () => {
+		const first = createDefaultRouteHealthDecision({
+			qualifiedProviders: [],
+			goldenImageReference: "golden-a",
+		});
+		const second = createDefaultRouteHealthDecision({
+			qualifiedProviders: [],
+			goldenImageReference: "golden-b",
+		});
+		notStrictEqual(
+			first.publicConfigurationEpoch,
+			second.publicConfigurationEpoch,
+		);
 	});
 
 	it("runQueue forwards options.only onto context.only, reaching route() via executeTask (Task C.9)", () => {

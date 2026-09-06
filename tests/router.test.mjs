@@ -69,6 +69,7 @@ import {
 import {
 	acquireHalfOpenClaim,
 	attestRouteRepair,
+	createRouteHealthTerminalBinding,
 	derivePublicConfigurationEpoch,
 	ingestRouteHealthEvents,
 	inspectRouteHealth,
@@ -301,6 +302,8 @@ describe("fenced route-health projection", () => {
 	}
 
 	async function emitHealthEvent(run, event, binding = {}) {
+		const lifecycleVerified =
+			event.event === "task_completed" && event.servedModelVerified === true;
 		await createRouteHealthEvent(
 			run.runId,
 			{
@@ -318,6 +321,8 @@ describe("fenced route-health projection", () => {
 				adapterContractId: "switchyard-route-health-v1",
 				publicConfigurationEpoch,
 				repairEpoch: 0,
+				transportVerified: lifecycleVerified,
+				lifecycleVerified,
 				...binding,
 			},
 		);
@@ -352,6 +357,54 @@ describe("fenced route-health projection", () => {
 			repairEpoch: 0,
 		});
 		strictEqual(uninitialized.state, "health-unavailable");
+	});
+
+	it("mints terminal authority only from exact transport and lifecycle proof", () => {
+		const invocationDescriptor = descriptor();
+		const input = {
+			targetId: invocationDescriptor.target_id,
+			descriptorIdentity: invocationDescriptor.descriptor_identity,
+			descriptorHarness: "codex",
+			invocationDescriptor,
+			publicConfigurationEpoch,
+			repairEpoch: 3,
+			runId: "run-terminal",
+			taskId: "1.1",
+			attempt: "attempt-1",
+			workspaceId: "workspace-terminal",
+			servedModelVerified: true,
+			providerExecutionSucceeded: true,
+		};
+		strictEqual(createRouteHealthTerminalBinding(input), null);
+		const lifecycleReceipt = {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: input.taskId,
+			attemptId: input.attempt,
+			descriptorIdentity: input.descriptorIdentity,
+			workspaceId: input.workspaceId,
+		};
+		deepStrictEqual(
+			createRouteHealthTerminalBinding({ ...input, lifecycleReceipt }),
+			{
+				adapterContractId: "switchyard-route-health-v1",
+				publicConfigurationEpoch,
+				repairEpoch: 3,
+				transportVerified: true,
+				lifecycleVerified: true,
+			},
+		);
+		strictEqual(
+			createRouteHealthTerminalBinding({
+				...input,
+				claimRevision: 7,
+				lifecycleReceipt: { ...lifecycleReceipt, workspaceId: "other" },
+			}),
+			null,
+		);
 	});
 
 	it("ingests a real host-bound auth failure and requires one started attested trial", async () => {
@@ -2052,6 +2105,100 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 
 		strictEqual(result.eligible, true);
 		strictEqual(result.reason, "no_non_terminal_tasks");
+	});
+});
+
+describe("route-health selection gate", () => {
+	function snapshotRead() {
+		return {
+			snapshot: {
+				schema_version: 2,
+				updated_at: new Date().toISOString(),
+				providers: [
+					{
+						name: "codex",
+						ok: true,
+						windows: [{ percent_left: 80, pace_delta: 1 }],
+					},
+				],
+			},
+			snapshotStatus: "fresh",
+			snapshotMtime: 1,
+			snapshotAgeMsAtRoute: 0,
+		};
+	}
+
+	it("records shadow decisions but changes no ordinary routing path", () => {
+		const decisions = [];
+		const healthDecision = () => ({
+			available: true,
+			state: "repair-hold",
+			mode: "shadow",
+			suppress: false,
+		});
+		strictEqual(
+			route({
+				requiredCapability: "standard",
+				snapshotRead: snapshotRead(),
+				healthDecision,
+				onHealthDecision: (decision) => decisions.push(decision),
+			}).provider,
+			"codex",
+		);
+		strictEqual(decisions[0].state, "repair-hold");
+		strictEqual(
+			routeBlind(["codex"], [], "standard", { healthDecision }).provider,
+			"codex",
+		);
+	});
+
+	it("subtracts a held route identically from preflight, ranked, and blind selection", () => {
+		const healthDecision = () => ({
+			available: true,
+			state: "repair-hold",
+			mode: "enforce",
+			suppress: true,
+		});
+		strictEqual(
+			route({
+				requiredCapability: "standard",
+				snapshotRead: snapshotRead(),
+				healthDecision,
+			}).provider,
+			null,
+		);
+		strictEqual(
+			routeBlind(["codex"], [], "standard", { healthDecision }).provider,
+			null,
+		);
+		const result = preflightMacosQueue({
+			tasks: [{ id: "4.2", status: "pending", requiredCapability: "standard" }],
+			goldenImageVerifiedProviders: ["codex"],
+			readSnapshot: snapshotRead,
+			healthDecision,
+		});
+		strictEqual(result.ok, false);
+		strictEqual(
+			result.capabilityResults[0].excludedReasons.codex,
+			"route_health_suppressed",
+		);
+	});
+
+	it("does not allow unavailable health storage to suppress or create a trial", () => {
+		const healthDecision = () => ({
+			available: false,
+			state: "health-unavailable",
+			mode: "enforce",
+			suppress: false,
+		});
+		strictEqual(
+			route({
+				requiredCapability: "standard",
+				snapshotRead: snapshotRead(),
+				healthDecision,
+			}).provider,
+			"codex",
+		);
 	});
 });
 

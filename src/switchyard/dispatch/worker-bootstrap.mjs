@@ -105,6 +105,30 @@ export function createWriteChain({ onFailure = () => {} } = {}) {
 	};
 }
 
+export async function persistTerminalOutcome({
+	runStore,
+	routeHealth,
+	runId,
+	event,
+	routeHealthBinding,
+	healthStateRoot,
+	onHealthUnavailable = () => {},
+}) {
+	if (!routeHealthBinding) {
+		await runStore.createEvent(runId, event);
+		return;
+	}
+	await runStore.createRouteHealthEvent(runId, event, routeHealthBinding);
+	try {
+		await routeHealth.ingestRouteHealthEvents({
+			authorisedRuns: [{ runId, runRoot: runStore.getRunRoot(runId) }],
+			healthStateRoot,
+		});
+	} catch {
+		onHealthUnavailable();
+	}
+}
+
 const { queueWrite, drain: drainWriteChain } = createWriteChain({
 	onFailure: safeWriteFailure,
 });
@@ -410,6 +434,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		// in the runner — none of which run concurrently with a foreign live run.
 
 		const runner = await import("../runner/index.mjs");
+		const routeHealth = await import("../router/health.mjs");
 		const runQueueFn = runner.runQueueAsync;
 		QueueCleanupErrorType = runner.QueueCleanupError;
 		const persistedRunOptions = run.runOptions ?? null;
@@ -602,6 +627,9 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								...(typeof r.servedModelVerified === "boolean"
 									? { servedModelVerified: r.servedModelVerified }
 									: {}),
+								...(r.routeHealthBinding
+									? { attempt: r.routeHealthAttempt }
+									: {}),
 							}
 						: {
 								phase: "execution",
@@ -619,10 +647,24 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								...(typeof r.servedModelVerified === "boolean"
 									? { servedModelVerified: r.servedModelVerified }
 									: {}),
+								...(r.routeHealthBinding
+									? { attempt: r.routeHealthAttempt }
+									: {}),
 								...(safeFailure ?? {}),
 							};
 					const fn = () =>
-						runStore.createEvent(runId, event).then(() =>
+						persistTerminalOutcome({
+							runStore,
+							routeHealth,
+							runId,
+							event,
+							routeHealthBinding: r.routeHealthBinding,
+							healthStateRoot: process.env.SWITCHYARD_ROUTE_HEALTH_STATE_ROOT,
+							onHealthUnavailable: () =>
+								console.error(
+									"worker-bootstrap: route health ingestion unavailable",
+								),
+						}).then(() =>
 							runStore.updateRunWithRetry(runId, {
 								activeTaskId: null,
 								activeTaskProvider: null,

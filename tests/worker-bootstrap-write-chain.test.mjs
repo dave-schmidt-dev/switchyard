@@ -26,9 +26,12 @@
 // without the fix). If worker-bootstrap.mjs's writeChain wiring ever
 // changes, keep buildCallbacks() below in sync with it.
 
-import { rejects, strictEqual } from "node:assert";
+import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
-import { createWriteChain } from "../src/switchyard/dispatch/worker-bootstrap.mjs";
+import {
+	createWriteChain,
+	persistTerminalOutcome,
+} from "../src/switchyard/dispatch/worker-bootstrap.mjs";
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -174,6 +177,38 @@ function buildCallbacks(store, { ordered }) {
 }
 
 describe("worker-bootstrap writeChain ordering", () => {
+	it("serializes the production health outcome helper before later writes", async () => {
+		const order = [];
+		const writes = createWriteChain();
+		const runStore = {
+			createRouteHealthEvent: async (runId, event, binding) => {
+				order.push(["event", runId, event.event, binding.transportVerified]);
+			},
+			getRunRoot: (runId) => `/fake/${runId}`,
+		};
+		const routeHealth = {
+			ingestRouteHealthEvents: async ({ authorisedRuns }) => {
+				order.push(["ingest", authorisedRuns[0].runRoot]);
+			},
+		};
+		writes.queueWrite(() =>
+			persistTerminalOutcome({
+				runStore,
+				routeHealth,
+				runId: "run-1",
+				event: { event: "task_failed" },
+				routeHealthBinding: { transportVerified: true },
+				healthStateRoot: "/fake/health",
+			}),
+		);
+		writes.queueWrite(async () => order.push(["later-run-update"]));
+		await writes.drain();
+		deepStrictEqual(order, [
+			["event", "run-1", "task_failed", true],
+			["ingest", "/fake/run-1"],
+			["later-run-update"],
+		]);
+	});
 	it("BUG (control, unordered): a fast-resolving later callback can be clobbered by a slow-resolving earlier one", async () => {
 		// Fire order matches runQueue's real loop: task A's onResult() fires
 		// first (A just finished), then task B's onTaskStart() fires right

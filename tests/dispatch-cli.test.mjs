@@ -27,6 +27,8 @@ import { fileURLToPath } from "node:url";
 import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import { createDefaultRouteHealthDecision } from "../src/switchyard/router/health.mjs";
+import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -101,6 +103,7 @@ import {
 	handleRun,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
+	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
 	parseRecoverArgs,
@@ -434,6 +437,56 @@ describe("parseDispatchArgs (backwards compat)", () => {
 				}
 			})().includes("not a git repository"),
 			true,
+		);
+	});
+});
+
+describe("health control CLI", () => {
+	it("defaults queue routing to shadow and makes enforcement explicit", () => {
+		strictEqual(
+			parseDispatchArgs([tasksFile, "--project", projectDir]).healthMode,
+			"shadow",
+		);
+		strictEqual(
+			parseDispatchArgs([
+				tasksFile,
+				"--project",
+				projectDir,
+				"--health-enforce",
+			]).healthMode,
+			"enforce",
+		);
+	});
+
+	it("accepts only bounded inspection and attended attestation fields", () => {
+		const hash = `sha256:${"a".repeat(64)}`;
+		deepStrictEqual(
+			parseHealthArgs([
+				"inspect",
+				"--target",
+				"codex",
+				"--descriptor",
+				hash,
+				"--public-configuration-epoch",
+				hash,
+				"--repair-epoch",
+				"0",
+			]).action,
+			"inspect",
+		);
+		strictEqual(
+			parseHealthArgs([
+				"attest-repair",
+				"--target",
+				"codex",
+				"--descriptor",
+				hash,
+				"--public-configuration-epoch",
+				hash,
+				"--repair-kind",
+				"auth_repaired",
+			]).repairKind,
+			"auth_repaired",
 		);
 	});
 });
@@ -1215,6 +1268,35 @@ describe("synchronous run JSON envelope", () => {
 		strictEqual(envelope.cleanupState, "complete");
 		strictEqual(envelope.disposition.action, "complete");
 		strictEqual(envelope.disposition.direction, "complete");
+	});
+
+	it("binds the queue health epoch to the injected golden image", async () => {
+		let queueHealth = null;
+		await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				goldenImage: "golden-a",
+				runQueue: async (queueOptions) => {
+					queueHealth = queueOptions.dependencies.healthDecision;
+					return {
+						totalTasks: 1,
+						runnableTasks: 1,
+						processedTasks: 1,
+						completedTaskIds: ["1.1"],
+						results: [{ taskId: "1.1", success: true, result: "success" }],
+						checkpointPath: join(dir, "golden.checkpoint.json"),
+					};
+				},
+			}),
+		);
+		const epochFor = (goldenImageReference) =>
+			createDefaultRouteHealthDecision({
+				qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+				goldenImageReference,
+			}).publicConfigurationEpoch;
+		strictEqual(queueHealth.mode, "shadow");
+		strictEqual(queueHealth.publicConfigurationEpoch, epochFor("golden-a"));
+		notStrictEqual(queueHealth.publicConfigurationEpoch, epochFor("golden-b"));
 	});
 
 	it("emits one closed failure envelope without raw exception text", async () => {

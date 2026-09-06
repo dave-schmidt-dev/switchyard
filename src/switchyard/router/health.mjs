@@ -1,9 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import {
+	closeSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
+import {
+	getInvocationDescriptor,
+	getInvocationDescriptorIdentity,
+	resolveTargetIdentity,
+	validateInvocationDescriptor,
+} from "../roster/index.mjs";
 import { readAuthorizedRunEvidence } from "../run-store/index.mjs";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -580,6 +596,148 @@ async function updateScope(
 	}
 }
 
+function readSyncRecord(path, validate, identity, optional = false) {
+	try {
+		const stat = lstatSync(path);
+		if (
+			!stat.isFile() ||
+			stat.isSymbolicLink() ||
+			stat.uid !== process.getuid() ||
+			(stat.mode & 0o077) !== 0 ||
+			stat.size > MAX_BYTES
+		)
+			throw new RouteHealthSchemaError("route health storage is unavailable");
+		const raw = readFileSync(path, "utf8");
+		return { raw, value: validate(JSON.parse(raw), identity) };
+	} catch (error) {
+		if (optional && error?.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+/** Synchronous lock/CAS publication used at the synchronous routing boundary. */
+function updateScopeSync(input, mutate, { allowInitialize = false } = {}) {
+	const identity = identityFrom(input);
+	const root = resolveHealthStateRoot(input.healthStateRoot);
+	const location = locations(root, scopeKey(identity));
+	let lockFd = null;
+	let lease = null;
+	try {
+		emit(input, "health_update_start");
+		for (const directory of [
+			root,
+			dirname(location.control),
+			dirname(location.observations),
+			dirname(location.lock),
+		]) {
+			mkdirSync(directory, { recursive: true, mode: 0o700 });
+			const stat = lstatSync(directory);
+			if (
+				!stat.isDirectory() ||
+				stat.isSymbolicLink() ||
+				stat.uid !== process.getuid() ||
+				(stat.mode & 0o077) !== 0
+			)
+				throw new RouteHealthSchemaError("route health storage is unavailable");
+		}
+		try {
+			lockFd = openSync(location.lock, "wx", 0o600);
+		} catch (error) {
+			if (error?.code === "EEXIST") return unavailable("health-lease-held");
+			throw error;
+		}
+		lease = { token: randomUUID(), ino: lstatSync(location.lock).ino };
+		writeFileSync(lockFd, `${lease.token}\n`);
+		fsyncSync(lockFd);
+		const beforeControl = readSyncRecord(
+			location.control,
+			validateControl,
+			identity,
+			true,
+		);
+		const beforeObservations = readSyncRecord(
+			location.observations,
+			validateObservations,
+			identity,
+			true,
+		);
+		let initialized = false;
+		try {
+			const stat = lstatSync(location.initialized);
+			initialized =
+				stat.isFile() &&
+				!stat.isSymbolicLink() &&
+				stat.uid === process.getuid() &&
+				(stat.mode & 0o077) === 0 &&
+				stat.size === 0;
+		} catch (error) {
+			if (error?.code !== "ENOENT") throw error;
+		}
+		if (
+			!beforeControl &&
+			(initialized || !allowInitialize || beforeObservations)
+		)
+			return unavailable("health-control-unavailable");
+		if (beforeControl && !initialized)
+			return unavailable("health-initialization-registry-unavailable");
+		if (beforeControl && !beforeObservations)
+			return unavailable("health-observations-unavailable");
+		if (
+			beforeControl &&
+			beforeObservations &&
+			!pairMatches(beforeControl.value, beforeObservations.value)
+		)
+			return unavailable("health-observation-commit-mismatch");
+		const control = structuredClone(
+			beforeControl?.value ?? initialControl(identity),
+		);
+		const observations = structuredClone(
+			beforeObservations?.value ?? initialObservations(identity),
+		);
+		const result = mutate({ control, observations, identity });
+		if (result?.write === false)
+			return { available: true, revision: control.revision, ...result };
+		control.revision += 1;
+		observations.revision = control.revision;
+		control.observationsRevision = observations.revision;
+		control.observationsDigest = observationsDigest(observations);
+		validateControl(control, identity);
+		validateObservations(observations, identity);
+		const suffix = `${process.pid}.${randomUUID()}.tmp`;
+		const controlTemp = `${location.control}.${suffix}`;
+		const observationsTemp = `${location.observations}.${suffix}`;
+		if (!initialized)
+			writeFileSync(location.initialized, "", { mode: 0o600, flag: "wx" });
+		writeFileSync(controlTemp, JSON.stringify(control), {
+			mode: 0o600,
+			flag: "wx",
+		});
+		writeFileSync(observationsTemp, JSON.stringify(observations), {
+			mode: 0o600,
+			flag: "wx",
+		});
+		verifyLock(location, lease);
+		verifyControlCas(location, identity, beforeControl);
+		renameSync(controlTemp, location.control);
+		renameSync(observationsTemp, location.observations);
+		emit(input, "health_publish_complete");
+		return { available: true, revision: control.revision, ...result };
+	} catch {
+		emit(input, "health_update_unavailable");
+		return unavailable();
+	} finally {
+		if (lockFd !== null) {
+			try {
+				if (lease) verifyLock(location, lease);
+				unlinkSync(location.lock);
+			} catch {}
+			try {
+				closeSync(lockFd);
+			} catch {}
+		}
+	}
+}
+
 function generationFor(observations, input) {
 	const key = createRouteHealthKey(input);
 	return {
@@ -607,6 +765,17 @@ function effective(control, observations, input, now) {
 			trialAvailable: value.cooldownUntil <= now,
 		};
 	return { key, value, state: value.state };
+}
+
+function repairTrialAvailable(control, input) {
+	if (control.holds.length === 0) return false;
+	const newestHold = Math.max(...control.holds.map((hold) => hold.at));
+	return control.attestations.some(
+		(attestation) =>
+			attestation.publicConfigurationEpoch === input.publicConfigurationEpoch &&
+			attestation.repairEpoch === control.repairEpoch &&
+			attestation.at > newestHold,
+	);
 }
 
 export async function inspectRouteHealth(input) {
@@ -640,10 +809,11 @@ export async function inspectRouteHealth(input) {
 		if (!observations) return unavailable("health-observations-unavailable");
 		if (!pairMatches(control.value, observations.value))
 			return unavailable("health-observation-commit-mismatch");
+		const currentInput = { ...input, repairEpoch: control.value.repairEpoch };
 		const result = effective(
 			control.value,
 			observations.value,
-			input,
+			currentInput,
 			input.nowMs ?? Date.now(),
 		);
 		return {
@@ -652,7 +822,10 @@ export async function inspectRouteHealth(input) {
 			revision: control.value.revision,
 			repairEpoch: control.value.repairEpoch,
 			healthKey: result.key,
-			trialAvailable: result.trialAvailable === true,
+			trialAvailable:
+				result.trialAvailable === true ||
+				(result.state === "repair-hold" &&
+					repairTrialAvailable(control.value, currentInput)),
 			claimStatus: result.claim
 				? result.claim.started
 					? "started"
@@ -663,6 +836,243 @@ export async function inspectRouteHealth(input) {
 		emit(input, "health_inspect_unavailable");
 		return unavailable();
 	}
+}
+
+/**
+ * Read the committed health projection without yielding.  Router entry points
+ * are deliberately synchronous, so this is the read-only counterpart to the
+ * locked async lifecycle APIs above.  It never initializes, repairs, or
+ * claims state: an unreadable or incomplete pair is simply unavailable.
+ */
+export function inspectRouteHealthSync(input) {
+	try {
+		const identity = identityFrom(input);
+		const root = resolveHealthStateRoot(input.healthStateRoot);
+		const location = locations(root, scopeKey(identity));
+		for (const directory of [
+			root,
+			dirname(location.control),
+			dirname(location.observations),
+		]) {
+			const stat = lstatSync(directory);
+			if (
+				!stat.isDirectory() ||
+				stat.isSymbolicLink() ||
+				stat.uid !== process.getuid() ||
+				(stat.mode & 0o077) !== 0
+			)
+				throw new RouteHealthSchemaError("route health storage is unavailable");
+		}
+		const initialized = lstatSync(location.initialized);
+		if (
+			!initialized.isFile() ||
+			initialized.isSymbolicLink() ||
+			initialized.size !== 0 ||
+			initialized.uid !== process.getuid() ||
+			(initialized.mode & 0o077) !== 0
+		)
+			throw new RouteHealthSchemaError("route health storage is unavailable");
+		const readSync = (path, validate, optional = false) => {
+			try {
+				const stat = lstatSync(path);
+				if (
+					!stat.isFile() ||
+					stat.isSymbolicLink() ||
+					stat.uid !== process.getuid() ||
+					(stat.mode & 0o077) !== 0 ||
+					stat.size > MAX_BYTES
+				)
+					throw new RouteHealthSchemaError(
+						"route health storage is unavailable",
+					);
+				return validate(JSON.parse(readFileSync(path, "utf8")), identity);
+			} catch (error) {
+				if (optional && error?.code === "ENOENT") return null;
+				throw error;
+			}
+		};
+		const control = readSync(location.control, validateControl);
+		const observations = readSync(
+			location.observations,
+			validateObservations,
+			true,
+		);
+		if (!observations || !pairMatches(control, observations))
+			return unavailable("health-observations-unavailable");
+		const currentInput = { ...input, repairEpoch: control.repairEpoch };
+		const result = effective(
+			control,
+			observations,
+			currentInput,
+			input.nowMs ?? Date.now(),
+		);
+		return {
+			available: true,
+			state: result.state,
+			revision: control.revision,
+			repairEpoch: control.repairEpoch,
+			healthKey: result.key,
+			trialAvailable:
+				result.trialAvailable === true ||
+				(result.state === "repair-hold" &&
+					repairTrialAvailable(control, currentInput)),
+			claimStatus: result.claim
+				? result.claim.started
+					? "started"
+					: "allocated"
+				: null,
+		};
+	} catch {
+		return unavailable();
+	}
+}
+
+function scopeIsUninitializedSync(input) {
+	try {
+		const identity = identityFrom(input);
+		const location = locations(
+			resolveHealthStateRoot(input.healthStateRoot),
+			scopeKey(identity),
+		);
+		for (const path of [
+			location.initialized,
+			location.control,
+			location.observations,
+		]) {
+			try {
+				lstatSync(path);
+				return false;
+			} catch (error) {
+				if (error?.code !== "ENOENT") return false;
+			}
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Build the small synchronous selection facade shared by preflight, ranked,
+ * and blind routing.  Enforcement is opt-in; unavailable durable state keeps
+ * ordinary static routing intact and never manufactures a half-open trial.
+ */
+export function createRouteHealthDecision({
+	healthStateRoot,
+	mode = "shadow",
+	publicConfigurationEpoch,
+	resolveIdentity,
+	now = Date.now,
+} = {}) {
+	const enforcing = mode === "enforce";
+	return (candidate) => {
+		try {
+			const identity = resolveIdentity?.(candidate);
+			if (!identity) return { available: false, state: "health-unavailable" };
+			const health = inspectRouteHealthSync({
+				healthStateRoot,
+				publicConfigurationEpoch,
+				nowMs: now(),
+				...identity,
+			});
+			const initializable =
+				health.available !== true &&
+				scopeIsUninitializedSync({
+					healthStateRoot,
+					publicConfigurationEpoch,
+					...identity,
+				});
+			const blocked =
+				(health.state === "repair-hold" && health.trialAvailable !== true) ||
+				health.state === "half-open" ||
+				(health.state === "cooldown" && health.trialAvailable !== true);
+			return {
+				...health,
+				initializable,
+				mode: enforcing ? "enforce" : "shadow",
+				suppress: enforcing && health.available === true && blocked,
+			};
+		} catch {
+			return {
+				available: false,
+				state: "health-unavailable",
+				mode: enforcing ? "enforce" : "shadow",
+				suppress: false,
+			};
+		}
+	};
+}
+
+/** Build the production read-only router projection from public roster facts. */
+export function createDefaultRouteHealthDecision({
+	healthStateRoot,
+	mode = "shadow",
+	qualifiedProviders = [],
+	goldenImageReference = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE ??
+		"golden-image-unconfigured",
+	now,
+} = {}) {
+	const providers = normalizedList(qualifiedProviders, "qualified providers");
+	const targets = providers
+		.map((provider) => resolveTargetIdentity(provider).targetId)
+		.filter(Boolean);
+	const publicConfigurationEpoch = derivePublicConfigurationEpoch({
+		approvedConfiguration: {
+			rosterSchemaVersion: 1,
+			approvedTargets: [...new Set(targets)],
+			qualifiedProviders: providers,
+		},
+		goldenImageReference,
+	});
+	const decision = createRouteHealthDecision({
+		healthStateRoot,
+		mode,
+		publicConfigurationEpoch,
+		now,
+		resolveIdentity: ({ provider, requiredCapability }) => {
+			const targetId = resolveTargetIdentity(provider).targetId;
+			const descriptor = getInvocationDescriptor(provider, requiredCapability);
+			if (!targetId || !descriptor) return null;
+			return {
+				targetId,
+				descriptorIdentity:
+					descriptor.descriptor_identity ??
+					getInvocationDescriptorIdentity(
+						descriptor,
+						resolveTargetIdentity(provider).harnessKey,
+					),
+			};
+		},
+	});
+	Object.defineProperties(decision, {
+		publicConfigurationEpoch: { value: publicConfigurationEpoch },
+		healthStateRoot: { value: healthStateRoot },
+		mode: { value: mode },
+		identityFor: {
+			value: ({ provider, requiredCapability }) => {
+				const targetId = resolveTargetIdentity(provider).targetId;
+				const descriptor = getInvocationDescriptor(
+					provider,
+					requiredCapability,
+				);
+				const qualified = providers.some(
+					(candidate) => resolveTargetIdentity(candidate).targetId === targetId,
+				);
+				if (!targetId || !descriptor || !qualified) return null;
+				return {
+					targetId,
+					descriptorIdentity:
+						descriptor.descriptor_identity ??
+						getInvocationDescriptorIdentity(
+							descriptor,
+							resolveTargetIdentity(provider).harnessKey,
+						),
+					publicConfigurationEpoch,
+				};
+			},
+		},
+	});
+	return decision;
 }
 
 export async function attestRouteRepair(input) {
@@ -740,6 +1150,35 @@ export async function acquireHalfOpenClaim(input) {
 		};
 	});
 }
+
+export function acquireHalfOpenClaimSync(input) {
+	const claimant = claimIdentity(input);
+	safeHash(input.publicConfigurationEpoch, "public configuration epoch");
+	safeEpoch(input.repairEpoch);
+	const now = safeTime(input.nowMs ?? Date.now());
+	return updateScopeSync(input, ({ control, observations }) => {
+		if (control.repairEpoch !== input.repairEpoch)
+			return { write: false, claimed: false, reason: "stale-repair-epoch" };
+		if (control.claim)
+			return { write: false, claimed: false, reason: "claim-active" };
+		const state = effective(control, observations, input, now);
+		const eligibleRepair =
+			state.state === "repair-hold" && repairTrialAvailable(control, input);
+		const eligibleCooldown =
+			state.state === "cooldown" && state.trialAvailable === true;
+		if (!eligibleRepair && !eligibleCooldown)
+			return { write: false, claimed: false, state: state.state };
+		control.claim = {
+			token: randomUUID(),
+			healthKey: state.key,
+			revision: control.revision + 1,
+			...claimant,
+			started: false,
+			acquiredAt: now,
+		};
+		return { claimed: true, state: "half-open", lease: { ...control.claim } };
+	});
+}
 function exactClaim(claim, input) {
 	return (
 		claim &&
@@ -762,11 +1201,41 @@ export async function startHalfOpenClaim(input) {
 		return { started: true, lease: { ...control.claim } };
 	});
 }
+
+export function startHalfOpenClaimSync(input) {
+	claimIdentity(input);
+	if (!UUID_RE.test(input.leaseToken ?? ""))
+		throw new RouteHealthSchemaError("half-open lease token is invalid");
+	return updateScopeSync(input, ({ control }) => {
+		if (!exactClaim(control.claim, input) || control.claim.started)
+			return { write: false, started: false, reason: "stale-or-started-claim" };
+		control.claim.started = true;
+		return { started: true, lease: { ...control.claim } };
+	});
+}
 export async function releaseHalfOpenClaim(input) {
 	claimIdentity(input);
 	if (!UUID_RE.test(input.leaseToken ?? ""))
 		throw new RouteHealthSchemaError("half-open lease token is invalid");
 	return updateScope(input, async ({ control }) => {
+		if (!exactClaim(control.claim, input))
+			return { write: false, released: false, reason: "stale-claim" };
+		if (control.claim.started || input.provenNeverStarted !== true)
+			return {
+				write: false,
+				released: false,
+				reason: "claim-liveness-unknown",
+			};
+		control.claim = null;
+		return { released: true };
+	});
+}
+
+export function releaseHalfOpenClaimSync(input) {
+	claimIdentity(input);
+	if (!UUID_RE.test(input.leaseToken ?? ""))
+		throw new RouteHealthSchemaError("half-open lease token is invalid");
+	return updateScopeSync(input, ({ control }) => {
 		if (!exactClaim(control.claim, input))
 			return { write: false, released: false, reason: "stale-claim" };
 		if (control.claim.started || input.provenNeverStarted !== true)
@@ -916,15 +1385,21 @@ function eventObservation(event, run) {
 	)
 		return null;
 	let code;
-	if (event.event === "task_completed" && event.servedModelVerified === true)
+	if (
+		binding.transportVerified === true &&
+		binding.lifecycleVerified === true &&
+		event.servedModelVerified === true
+	)
 		code = SUCCESS_CODE;
 	else if (
+		binding.transportVerified === false &&
 		event.event === "task_failed" &&
 		hasAuthoritativeDiagnosticProvenance(event) &&
 		HOLD_CODES.has(event.diagnosticCode)
 	)
 		code = event.diagnosticCode;
 	else if (
+		binding.transportVerified === false &&
 		event.event === "task_failed" &&
 		hasAuthoritativeDiagnosticProvenance(event) &&
 		TRANSIENT_CODES.has(event.diagnosticCode)
@@ -985,6 +1460,74 @@ export async function ingestRouteHealthEvents({
 			),
 		);
 	return results;
+}
+
+function lifecycleReceiptMatches(receipt, input) {
+	return (
+		receipt?.version === 1 &&
+		receipt.kind === "completion_continuation_lifecycle" &&
+		receipt.providerExited === true &&
+		receipt.childrenExited === true &&
+		receipt.cleanupSucceeded === true &&
+		receipt.taskId === input.taskId &&
+		receipt.attemptId === input.attempt &&
+		receipt.descriptorIdentity === input.descriptorIdentity &&
+		receipt.workspaceId === input.workspaceId
+	);
+}
+
+/**
+ * Mint the closed host binding consumed by the existing serialized outcome
+ * event writer. A started trial remains claimed unless exact lifecycle cleanup
+ * proof accompanies the terminal result.
+ */
+export function createRouteHealthTerminalBinding(input) {
+	const identity = identityFrom(input);
+	const descriptor = validateInvocationDescriptor(
+		input.invocationDescriptor,
+		input.descriptorHarness,
+	);
+	if (
+		descriptor.descriptor_identity !== identity.descriptorIdentity ||
+		descriptor.target_id !== identity.targetId ||
+		input.runId === undefined ||
+		input.taskId === undefined
+	)
+		return null;
+	const trial = input.claimRevision !== undefined;
+	const lifecycleVerified = lifecycleReceiptMatches(
+		input.lifecycleReceipt,
+		input,
+	);
+	if (trial && !lifecycleVerified) return null;
+	let transportVerified = false;
+	if (
+		input.providerExecutionSucceeded === true &&
+		input.servedModelVerified === true
+	) {
+		transportVerified = true;
+	} else if (
+		input.providerExecutionSucceeded !== true &&
+		hasAuthoritativeDiagnosticProvenance(input) &&
+		(HOLD_CODES.has(input.diagnosticCode) ||
+			TRANSIENT_CODES.has(input.diagnosticCode))
+	) {
+		transportVerified = false;
+	} else {
+		return null;
+	}
+	if (transportVerified && !lifecycleVerified) return null;
+	return {
+		adapterContractId: ADAPTER_CONTRACT_VERSION,
+		publicConfigurationEpoch: safeHash(
+			input.publicConfigurationEpoch,
+			"public configuration epoch",
+		),
+		repairEpoch: safeEpoch(input.repairEpoch),
+		transportVerified,
+		lifecycleVerified,
+		...(trial ? { claimRevision: input.claimRevision } : {}),
+	};
 }
 export async function rebuildRouteHealth({
 	authorisedRuns,
