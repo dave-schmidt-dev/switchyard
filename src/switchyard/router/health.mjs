@@ -50,7 +50,7 @@ const HOLD_CODES = new Set([
 const SUCCESS_CODE = "verified_transport_success";
 // Task 4.2 may qualify closed transport codes after its producer audit. Until
 // then generic transient failures cannot create suspect/cooldown authority.
-export const QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES = Object.freeze([]);
+const QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES = Object.freeze([]);
 const TRANSIENT_CODES = new Set(QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES);
 const MAX_BYTES = 256 * 1024;
 const MAX_ATTEMPTS = 512;
@@ -58,7 +58,7 @@ const WINDOW_MS = 10 * 60 * 1000;
 const COOLDOWN_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000];
 const OBSERVATION_AUTHORITY = Symbol("route-health-observation-authority");
 
-export class RouteHealthSchemaError extends Error {
+class RouteHealthSchemaError extends Error {
 	constructor(message) {
 		super(message);
 		this.name = "RouteHealthSchemaError";
@@ -116,10 +116,7 @@ function normalizedList(value, label) {
 	return result;
 }
 
-export function getDefaultHealthStateRoot() {
-	return DEFAULT_HEALTH_STATE_ROOT;
-}
-export function resolveHealthStateRoot(healthStateRoot) {
+function resolveHealthStateRoot(healthStateRoot) {
 	if (healthStateRoot === undefined) return DEFAULT_HEALTH_STATE_ROOT;
 	if (typeof healthStateRoot !== "string" || !healthStateRoot)
 		throw new RouteHealthSchemaError("health state root is invalid");
@@ -177,7 +174,7 @@ function identityFrom(input) {
 function scopeKey(identity) {
 	return hash(JSON.stringify(identity));
 }
-export function createRouteHealthKey(input) {
+function createRouteHealthKey(input) {
 	const identity = identityFrom(input);
 	return hash(
 		JSON.stringify({
@@ -844,7 +841,7 @@ export async function inspectRouteHealth(input) {
  * locked async lifecycle APIs above.  It never initializes, repairs, or
  * claims state: an unreadable or incomplete pair is simply unavailable.
  */
-export function inspectRouteHealthSync(input) {
+function inspectRouteHealthSync(input) {
 	try {
 		const identity = identityFrom(input);
 		const root = resolveHealthStateRoot(input.healthStateRoot);
@@ -957,7 +954,7 @@ function scopeIsUninitializedSync(input) {
  * and blind routing.  Enforcement is opt-in; unavailable durable state keeps
  * ordinary static routing intact and never manufactures a half-open trial.
  */
-export function createRouteHealthDecision({
+function createRouteHealthDecision({
 	healthStateRoot,
 	mode = "shadow",
 	publicConfigurationEpoch,

@@ -209,6 +209,59 @@ describe("broker async executor", () => {
 		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
 	});
 
+	it("relays only an exact completion lifecycle proof and drops any other shape", async () => {
+		const value = fixture();
+		const proof = {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: value.descriptor.descriptor_identity,
+			workspaceId: "switchyard-work-1",
+			stdout: "SECRET_CANARY must not ride along on the proof",
+		};
+		const run = (completionContinuationProof) =>
+			executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				launch: async () => ({
+					success: true,
+					actualConsumption: 1,
+					completionContinuationProof,
+				}),
+				terminal: async () => ({ changed: true }),
+			});
+		const relayed = await run(proof);
+		deepStrictEqual(relayed.completionContinuationProof, {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: value.descriptor.descriptor_identity,
+			workspaceId: "switchyard-work-1",
+		});
+		strictEqual(JSON.stringify(relayed).includes("SECRET_CANARY"), false);
+		strictEqual(
+			(await run({ ...proof, kind: "provider_exit" }))
+				.completionContinuationProof,
+			null,
+		);
+		strictEqual(
+			(await run({ ...proof, cleanupSucceeded: "yes" }))
+				.completionContinuationProof,
+			null,
+		);
+		strictEqual((await run(undefined)).completionContinuationProof, null);
+	});
+
 	// Regression: the frozen return shapes above are allowlists, so a field the
 	// launcher sets and nothing here names is dropped in silence. That is what
 	// happened to servedModelVerified — every production dispatch goes through
