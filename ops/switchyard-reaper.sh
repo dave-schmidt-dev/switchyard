@@ -113,7 +113,7 @@ log "reaper: managed VM inventory started"
 # The supervised shell exists only to apply the output cap before replacing
 # itself with prlctl. GNU timeout uses its default process-group mode.
 "$TIMEOUT_BIN" --signal=TERM --kill-after=1s 3s \
-	/bin/sh -c 'ulimit -f 2048 || exit 125; exec "$@"' \
+	/bin/sh -c 'ulimit -f 1024 || exit 125; exec "$@"' \
 	switchyard-reaper-inventory "$PRLCTL" list -a -o uuid,status,name \
 	>"$LIST_TMP" 2>/dev/null
 inventory_status=$?

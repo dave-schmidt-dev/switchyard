@@ -192,7 +192,7 @@ done
 								: behavior === "large"
 									? `#!/bin/sh
 printf '%s\\n' "$*" >>'${callsPath}'
-exec /bin/dd if=/dev/zero bs=1048576 count=4 2>/dev/null
+exec /bin/dd if=/dev/zero bs=262144 count=5 2>/dev/null
 `
 									: behavior === "medium"
 										? `#!/bin/sh
@@ -331,7 +331,7 @@ esac
 			expectedCalls: 1,
 		},
 		{
-			name: "reports output-limit truncation without parsing partial content",
+			name: "rejects a 1.25-MiB inventory at the one-MiB output limit",
 			options: { behavior: "large" },
 			expected: "managed VM inventory truncated (output limit reached",
 			maxElapsedMs: 3_000,
