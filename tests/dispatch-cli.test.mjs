@@ -51,6 +51,10 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"roster.fixture.json",
 );
 
+function writeLegacyCheckpoint(path, checkpoint) {
+	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
+}
+
 function exactFailureEvidence(targetId, harness, model, taskId = "1.1") {
 	const descriptorCore = {
 		target_id: targetId,
@@ -458,6 +462,7 @@ describe("CLI queue-level platform selection", () => {
 						backendFactory: ({ platform }) => {
 							strictEqual(platform, "macos");
 							return {
+								readiness: () => ({ inventoryCount: 0 }),
 								create: () => {
 									calls.push("create-vm");
 									return "vm-handle";
@@ -2562,9 +2567,6 @@ describe("envelope format", () => {
 		const { initializeRun, updateRun, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { saveCheckpoint } = await import(
-			"../src/switchyard/runner/index.mjs"
-		);
 		const runId = "unconditional-contract-projection";
 		await initializeRun({
 			runId,
@@ -2603,15 +2605,10 @@ describe("envelope format", () => {
 		await updateRun(runId, routeAndFailure, current.revision);
 		const retryProjection = {
 			quarantinedTargetIds: ["agy-gemini"],
-			retryState: {
-				taskId: "1.1",
-				attempt: 1,
-				phase: "target_quarantined",
-				resolvedTargetId: "agy-gemini",
-			},
+			retryState: null,
 			retryTransitionId: 2,
 		};
-		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+		writeLegacyCheckpoint(`${tasksFile}.checkpoint.json`, {
 			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: [],
@@ -2662,9 +2659,6 @@ describe("envelope format", () => {
 		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { saveCheckpoint } = await import(
-			"../src/switchyard/runner/index.mjs"
-		);
 		const runId = "agy-opencode-attempts";
 		await initializeRun({
 			runId,
@@ -2684,7 +2678,7 @@ describe("envelope format", () => {
 			"opencode",
 			"fixture/opencode-standard",
 		);
-		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+		writeLegacyCheckpoint(`${tasksFile}.checkpoint.json`, {
 			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: [],
@@ -2737,9 +2731,6 @@ describe("envelope format", () => {
 		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { saveCheckpoint } = await import(
-			"../src/switchyard/runner/index.mjs"
-		);
 		const runId = "legacy-untrusted-descriptor-evidence";
 		await initializeRun({
 			runId,
@@ -2759,7 +2750,7 @@ describe("envelope format", () => {
 		delete legacyUntrustedFixture.diagnosticOrigin;
 		delete legacyUntrustedFixture.diagnosticEvidenceAvailable;
 		delete legacyUntrustedFixture.exitCode;
-		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+		writeLegacyCheckpoint(`${tasksFile}.checkpoint.json`, {
 			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: [],
@@ -2805,9 +2796,6 @@ describe("envelope format", () => {
 		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { saveCheckpoint } = await import(
-			"../src/switchyard/runner/index.mjs"
-		);
 		const runId = "wrong-origin-checkpoint-evidence";
 		await initializeRun({
 			runId,
@@ -2824,7 +2812,7 @@ describe("envelope format", () => {
 		);
 		wrongOrigin.diagnosticCode = "cli_usage_error";
 		wrongOrigin.diagnosticOrigin = "adapter";
-		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+		writeLegacyCheckpoint(`${tasksFile}.checkpoint.json`, {
 			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: [],
@@ -2879,9 +2867,6 @@ describe("envelope format", () => {
 		const { createEvent, initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { saveCheckpoint } = await import(
-			"../src/switchyard/runner/index.mjs"
-		);
 		const runId = "opencode-six-failures";
 		await initializeRun({
 			runId,
@@ -2891,7 +2876,7 @@ describe("envelope format", () => {
 			initialHostFingerprint: "test-host",
 			launchArgs: [],
 		});
-		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+		writeLegacyCheckpoint(`${tasksFile}.checkpoint.json`, {
 			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: [],
@@ -3222,7 +3207,7 @@ describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", (
 		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
-		const { getCheckpointPath, saveCheckpoint } = await import(
+		const { getCheckpointPath } = await import(
 			"../src/switchyard/runner/index.mjs"
 		);
 
@@ -3245,7 +3230,7 @@ describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", (
 		// silently counting an already-completed task as still pending. The
 		// checkpoint-derived computation must instead see completedTaskIds
 		// and report 2.
-		saveCheckpoint(getCheckpointPath(tasksFile), {
+		writeLegacyCheckpoint(getCheckpointPath(tasksFile), {
 			version: 1,
 			tasksFilePath: tasksFile,
 			completedTaskIds: ["1.1"],

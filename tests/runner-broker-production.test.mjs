@@ -649,31 +649,35 @@ test("production async runner fails closed on a persisted retry_started state", 
 	};
 	checkpoint.quarantinedTargetIds = ["cheap"];
 	await writeFile(checkpointPath, JSON.stringify(checkpoint));
+	const ambiguousCheckpointBytes = await readFile(checkpointPath, "utf8");
 	let launches = 0;
-	const result = await runQueueAsync({
-		tasksFilePath,
-		projectPath: root,
-		workingContainerName: "broker-retry-worker",
-		checkpointPath,
-		dependencies: {
-			...baseDependencies,
-			adapters: {
-				claude: {
-					executeAsync: async () => {
-						launches += 1;
-						return { success: true };
+	await rejects(
+		() =>
+			runQueueAsync({
+				tasksFilePath,
+				projectPath: root,
+				workingContainerName: "broker-retry-worker",
+				checkpointPath,
+				dependencies: {
+					...baseDependencies,
+					adapters: {
+						claude: {
+							executeAsync: async () => {
+								launches += 1;
+								return { success: true };
+							},
+							captureDiffAsync: async () => null,
+						},
 					},
-					captureDiffAsync: async () => null,
 				},
-			},
-		},
-	});
+			}),
+		/checkpoint owner displaced/,
+	);
 	strictEqual(launches, 0);
-	strictEqual(result.results[0].result, "unknown_failure");
-	strictEqual(result.results[0].errorKind, "unknown_failure");
 	strictEqual(
-		JSON.parse(await readFile(checkpointPath, "utf8")).retryState,
-		null,
+		await readFile(checkpointPath, "utf8"),
+		ambiguousCheckpointBytes,
+		"an unreleased pending checkpoint must remain byte-for-byte unchanged",
 	);
 });
 
@@ -1696,15 +1700,10 @@ test("production async runner records which cleanup stage failed", async () => {
 	);
 });
 
-// Regression: the empty-diff transcript rescue was only ever exercised through
-// the synchronous runQueue path (tests/runner.test.mjs). The broker path wires
-// the same evidence through a different route -- createDispatchBroker's
-// onTranscript callback, context._activeTaskTranscript, and a second
-// saveGateEvidence call site inside runQueueAsync -- and nothing drove any of
-// it. A break in that chain would leave an `empty_required_diff` rejection
-// from a real (broker) dispatch with no evidence again, exactly the gap the
-// fix closed for the synchronous path only.
-test("production async runner keeps the provider transcript as evidence when the broker gate rejects an empty diff", async () => {
+// Provider output is not durable integration evidence. The broker must retain
+// the closed rejection code without copying raw output into artifacts, results,
+// or the checkpoint.
+test("production async runner omits the provider transcript when the broker gate rejects an empty diff", async () => {
 	const root = await tempDirAsync("switchyard-broker-gate-evidence-");
 	const tasksFilePath = join(root, "TASKS.md");
 	const checkpointPath = join(root, "checkpoint.json");
@@ -1762,24 +1761,21 @@ test("production async runner keeps the provider transcript as evidence when the
 		record.diagnosticCode ?? record.reasonCode,
 		"empty_required_diff",
 	);
-	ok(
-		/^artifact:[a-f0-9]{24}$/.test(record.artifactRef ?? ""),
-		`expected an opaque artifact reference, got ${record.artifactRef}`,
-	);
+	strictEqual(record.artifactRef, undefined);
 	const artifactPath = `${checkpointPath}.partial-diffs/1.1.output`;
-	ok(existsSync(artifactPath), "the transcript must be kept as an artifact");
-	strictEqual(readFileSync(artifactPath, "utf8"), transcript);
+	ok(!existsSync(artifactPath), "raw provider output must not be retained");
 	strictEqual(
 		record.gateEvidence,
-		undefined,
+		null,
 		"raw transcript must not ride along in the result",
 	);
 
 	const rawCheckpointJson = await readFile(checkpointPath, "utf8");
 	ok(
 		!rawCheckpointJson.includes(transcript),
-		"checkpoint.json must reference the artifact, never embed the transcript",
+		"checkpoint.json must not retain the transcript",
 	);
+	ok(!rawCheckpointJson.includes(".output"));
 });
 
 // The failure branches above name the cleanup stage, but a provider can also
