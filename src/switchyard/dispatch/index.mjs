@@ -2261,7 +2261,8 @@ async function handleRecover(argv, dependencies = {}) {
 		return;
 	}
 
-	return withStateRoot(stateRoot, async () => {
+	const effectiveStateRoot = stateRoot ?? getStateRoot();
+	return withStateRoot(effectiveStateRoot, async () => {
 		const executionBackend = recoveryExecutionBackend(dependencies);
 		const listManaged =
 			dependencies.listManaged ?? (() => executionBackend.listManaged());
@@ -2293,21 +2294,39 @@ async function handleRecover(argv, dependencies = {}) {
 			const liveness = recoveryRunMatchesTarget
 				? recoveryLiveness(recoveryRun, dependencies)
 				: "unknown";
-			const destroy =
-				dependencies.destroy ?? ((handle) => executionBackend.destroy(handle));
-			const destroyTarget = async () => {
-				if (
-					!target ||
-					!(await recoveryEntryIsEligible(
-						target,
-						dependencies,
-						recoveryRun?.projectPath ?? null,
-					))
-				)
-					return false;
-				destroy(target);
-				reclaimedCount = 1;
-				return true;
+			const reclaimTarget = async () => {
+				if (!target || !recoveryRunMatchesTarget) return false;
+				const targetDependencies =
+					typeof dependencies.destroy === "function" &&
+					typeof dependencies.reclaim !== "function"
+						? {
+								...dependencies,
+								reclaim: ({ eligibility }) => {
+									if (!eligibility(target)) return emptyReclaimResult();
+									dependencies.destroy(target);
+									return {
+										...emptyReclaimResult(),
+										reclaimed: [target],
+									};
+								},
+							}
+						: dependencies;
+				const { result } = await reclaimManagedEntries({
+					managed: [target],
+					dependencies: targetDependencies,
+					projectPath: recoveryRun.projectPath,
+				});
+				const reclaimed = result.reclaimed.some(
+					(entry) => entry.uuid === target.uuid && entry.name === target.name,
+				);
+				if (reclaimed) reclaimedCount = 1;
+				unreclaimedSnapshots.push(...(result.skippedSnapshots ?? []));
+				errors.push(
+					...(result.errors ?? []).map(
+						(error) => `${error.name}: ${error.reason}`,
+					),
+				);
+				return reclaimed;
 			};
 			if (
 				recoveryRunMatchesTarget &&
@@ -2337,7 +2356,7 @@ async function handleRecover(argv, dependencies = {}) {
 						let destroyFailed = false;
 						if (target) {
 							try {
-								if (!(await destroyTarget())) destroyFailed = true;
+								if (!(await reclaimTarget())) destroyFailed = true;
 							} catch {
 								destroyFailed = true;
 								errors.push("managed_reclaim_failed");
@@ -2369,7 +2388,7 @@ async function handleRecover(argv, dependencies = {}) {
 				(liveness === "terminal_clean" || liveness === "dead")
 			) {
 				try {
-					if (!(await destroyTarget())) {
+					if (!(await reclaimTarget())) {
 						errors.push("managed_recovery_evidence_changed");
 					}
 				} catch {

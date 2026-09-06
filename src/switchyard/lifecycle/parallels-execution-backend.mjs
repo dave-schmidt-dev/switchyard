@@ -1,8 +1,9 @@
 // Parallels lifecycle backend.
 //
-// The VM name is the ownership record: no sidecar file is part of this
-// backend. Bulk transfer is deliberately a host-memory HTTP hop; the
-// prlctl stdin channel is reserved for tiny control rules, never tar bytes.
+// The reserved VM name identifies managed candidates; host-owned records bind
+// the exact VM, run, project, creator birth, and reclamation authority. Bulk
+// transfer is deliberately a host-memory HTTP hop; the prlctl stdin channel is
+// reserved for tiny control rules, never tar bytes.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -3121,6 +3122,11 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					name: entry.name,
 					reason: "no-snapshot-sidecar",
 				});
+				try {
+					this.deleteVmOwnership(entry.uuid, ownership.resourceRoot);
+				} catch (error) {
+					result.errors.push({ name: entry.name, reason: error.message });
+				}
 				continue;
 			}
 			try {

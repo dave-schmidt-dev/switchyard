@@ -2405,13 +2405,28 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		// convention and must survive.
 		const root = makeSidecarRoot();
 		const deadName = buildParallelsWorkingName("dead", 999_999);
-		const { backend, calls, snapshotsNow } = makeCloningBackend(root, deadName);
+		const { backend: writer } = makeCloningBackend(root, deadName);
 		// No sidecar written at all, yet the golden carries a snapshot.
-		registerOwnedEntry(backend, {
+		registerOwnedEntry(writer, {
 			uuid: WORK_UUID,
 			name: deadName,
 			status: "running",
 		});
+		const unrelatedMetadata = join(root, "unrelated-metadata.json");
+		writeFileSync(unrelatedMetadata, "{}\n", "utf8");
+		const { backend, calls, snapshotsNow } = makeCloningBackend(root, deadName);
+		backend.hostProcessIdentityProbe = (pid) => ({
+			state: "absent",
+			pid,
+			bootSessionUuid: TEST_BOOT_UUID,
+			identity: null,
+		});
+		strictEqual(backend.ownedResourcesByUuid.size, 0);
+		const ownershipPath = backend.vmOwnershipPath(
+			WORK_UUID,
+			join(TEST_RUN_STORE_ROOT, "runs", "dead", "resources"),
+		);
+		ok(existsSync(ownershipPath), "writer must publish durable VM ownership");
 
 		const result = backend.reclaim({ eligibility: () => true });
 
@@ -2428,6 +2443,8 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			`no snapshot may be deleted: ${JSON.stringify(calls)}`,
 		);
 		ok(snapshotsNow().includes(FOREIGN_SNAPSHOT));
+		ok(!existsSync(ownershipPath), "deleted VM must lose its ownership record");
+		ok(existsSync(unrelatedMetadata), "unrelated metadata must survive");
 		rmSync(root, { recursive: true, force: true });
 	});
 

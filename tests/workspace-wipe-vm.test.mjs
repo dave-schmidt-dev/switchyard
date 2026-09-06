@@ -192,74 +192,80 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		const resourceRoot = tempDir("switchyard-inv3-ownership-");
 		const previousRunStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = resourceRoot;
-		const backend = new ParallelsExecutionBackend({
-			prlctlFn: (args) => {
-				calls.push(args);
-				if (args[0] === "list") return listed(entries);
-				return "ok";
-			},
-			pidIsAlive: (pid) => pid === livePid,
-			hostProcessIdentityProbe: (pid) =>
-				pid === livePid
-					? {
-							state: "present",
-							pid,
-							bootSessionUuid: TEST_BOOT_UUID,
-							startTicks: String(pid * 10 + 1),
-							identity: fixtureBirth(pid),
-						}
-					: absentHostProbe(pid),
-		});
+		try {
+			const backend = new ParallelsExecutionBackend({
+				prlctlFn: (args) => {
+					calls.push(args);
+					if (args[0] === "list") return listed(entries);
+					return "ok";
+				},
+				pidIsAlive: (pid) => pid === livePid,
+				hostProcessIdentityProbe: (pid) =>
+					pid === livePid
+						? {
+								state: "present",
+								pid,
+								bootSessionUuid: TEST_BOOT_UUID,
+								startTicks: String(pid * 10 + 1),
+								identity: fixtureBirth(pid),
+							}
+						: absentHostProbe(pid),
+			});
 
-		const ownershipContext = {
-			resourceRoot: join(resourceRoot, "runs", "dead-run", "resources"),
-			runId: "dead-run",
-			taskId: "reclaim-fixture",
-			attemptId: "attempt-1",
-			projectRoot: resolve("/private/tmp"),
-			purpose: "workspace-wipe-test",
-			creatorPid: deadPid,
-			processStartIdentity: fixtureBirth(deadPid),
-		};
-		backend.writeVmOwnership(
-			deadRunningUuid,
-			entries[0].name,
-			ownershipContext,
-		);
-		backend.writeVmOwnership(deadStoppedUuid, entries[1].name, {
-			...ownershipContext,
-			resourceRoot: join(resourceRoot, "runs", "dead-stopped", "resources"),
-			runId: "dead-stopped",
-			creatorPid: deadPid,
-		});
-		const omitted = backend.reclaim();
-		strictEqual(
-			omitted.reclaimed.length,
-			0,
-			"omitted eligibility must make zero destructive calls",
-		);
-		strictEqual(
-			calls.filter((args) => args[0] === "stop" || args[0] === "delete").length,
-			0,
-		);
-		const result = backend.reclaim({
-			eligibility: (entry) =>
-				entry.ownership.processStartIdentity === fixtureBirth(deadPid),
-		});
-		deepStrictEqual(
-			result.reclaimed.map((entry) => entry.uuid),
-			[deadRunningUuid, deadStoppedUuid],
-		);
-		deepStrictEqual(
-			result.skipped.map((entry) => entry.uuid),
-			["live", "partial-live"],
-		);
-		ok(calls.some((args) => args[0] === "stop" && args[1] === deadRunningUuid));
-		ok(!calls.some((args) => args[1] === "foreign"));
-		ok(!calls.some((args) => args[1] === "malformed"));
-		if (previousRunStoreRoot === undefined)
-			delete process.env.SWITCHYARD_RUN_STORE_ROOT;
-		else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRunStoreRoot;
+			const ownershipContext = {
+				resourceRoot: join(resourceRoot, "runs", "dead-run", "resources"),
+				runId: "dead-run",
+				taskId: "reclaim-fixture",
+				attemptId: "attempt-1",
+				projectRoot: resolve("/private/tmp"),
+				purpose: "workspace-wipe-test",
+				creatorPid: deadPid,
+				processStartIdentity: fixtureBirth(deadPid),
+			};
+			backend.writeVmOwnership(
+				deadRunningUuid,
+				entries[0].name,
+				ownershipContext,
+			);
+			backend.writeVmOwnership(deadStoppedUuid, entries[1].name, {
+				...ownershipContext,
+				resourceRoot: join(resourceRoot, "runs", "dead-stopped", "resources"),
+				runId: "dead-stopped",
+				creatorPid: deadPid,
+			});
+			const omitted = backend.reclaim();
+			strictEqual(
+				omitted.reclaimed.length,
+				0,
+				"omitted eligibility must make zero destructive calls",
+			);
+			strictEqual(
+				calls.filter((args) => args[0] === "stop" || args[0] === "delete")
+					.length,
+				0,
+			);
+			const result = backend.reclaim({
+				eligibility: (entry) =>
+					entry.ownership.processStartIdentity === fixtureBirth(deadPid),
+			});
+			deepStrictEqual(
+				result.reclaimed.map((entry) => entry.uuid),
+				[deadRunningUuid, deadStoppedUuid],
+			);
+			deepStrictEqual(
+				result.skipped.map((entry) => entry.uuid),
+				["live", "partial-live"],
+			);
+			ok(
+				calls.some((args) => args[0] === "stop" && args[1] === deadRunningUuid),
+			);
+			ok(!calls.some((args) => args[1] === "foreign"));
+			ok(!calls.some((args) => args[1] === "malformed"));
+		} finally {
+			if (previousRunStoreRoot === undefined)
+				delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRunStoreRoot;
+		}
 	});
 
 	it("normal destroy stops and deletes the owned VM", () => {

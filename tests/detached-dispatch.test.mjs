@@ -1280,6 +1280,146 @@ describe("terminal run releases the project lock", () => {
 });
 
 describe("project-lock reconciliation without managed VMs", () => {
+	it("recover without --state-root binds the backend to the run-store default", async () => {
+		const { handleRecover } = await import(
+			"../src/switchyard/dispatch/index.mjs"
+		);
+		const { getStateRoot } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		const expectedRoot = getStateRoot();
+		let observedRoot = null;
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(line);
+		try {
+			await handleRecover([], {
+				executionBackend: {
+					listManaged: () => {
+						observedRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+						return [];
+					},
+					reclaim: () => ({
+						reclaimed: [],
+						errors: [],
+						skippedSnapshots: [],
+					}),
+				},
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+			if (previousRoot === undefined)
+				delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRoot;
+		}
+		strictEqual(observedRoot, expectedRoot);
+		strictEqual(JSON.parse(output[0]).vmsReclaimed, 0);
+	});
+
+	it("recover --run reclaims terminal-clean and dead-running VMs from durable ownership", async () => {
+		const { handleRecover } = await import(
+			"../src/switchyard/dispatch/index.mjs"
+		);
+		const { advanceState, initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const bootSessionUuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+		const creatorPid = 999_991;
+		const processStartIdentity = `switchyard-host-process-v1:${bootSessionUuid}:${creatorPid}:42`;
+
+		for (const state of ["terminal-clean", "dead-running"]) {
+			const runId = randomUUID();
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-fingerprint",
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			if (state === "terminal-clean") {
+				await advanceState(runId, "failed");
+				const current = await readRun(runId);
+				await updateRun(runId, { cleanupState: "complete" }, current.revision);
+			} else {
+				await advanceState(runId, "running");
+				const current = await readRun(runId);
+				await updateRun(runId, { workerPid: creatorPid }, current.revision);
+			}
+
+			const uuid = `{${randomUUID()}}`;
+			const name = `switchyard-work-${runId}-${creatorPid}`;
+			const resourceRoot = join(stateRoot, "runs", runId, "resources");
+			const writer = new ParallelsExecutionBackend({
+				creatorPid,
+				runId,
+			});
+			writer.writeVmOwnership(uuid, name, {
+				resourceRoot,
+				runId,
+				taskId: "1.1",
+				attemptId: "attempt-1",
+				projectRoot: resolve(projectDir),
+				purpose: "detached-recovery-test",
+				creatorPid,
+				processStartIdentity,
+			});
+			const ownershipPath = writer.vmOwnershipPath(uuid, resourceRoot);
+			ok(existsSync(ownershipPath));
+
+			const calls = [];
+			const reader = new ParallelsExecutionBackend({
+				prlctlFn: (args) => {
+					calls.push(args);
+					if (args[0] === "list") {
+						return `uuid\tstatus\tname\n${uuid}\tstopped\t${name}`;
+					}
+					return "";
+				},
+				hostProcessIdentityProbe: (pid) => ({
+					state: "absent",
+					pid,
+					bootSessionUuid,
+					identity: null,
+				}),
+			});
+			strictEqual(reader.ownedResourcesByUuid.size, 0);
+
+			const output = [];
+			const originalLog = console.log;
+			const previousExitCode = process.exitCode;
+			console.log = (line) => output.push(line);
+			try {
+				await handleRecover(["--run", runId, "--state-root", stateRoot], {
+					executionBackend: reader,
+					isWorkerLive: () => false,
+					releaseProjectLockIfOwnedBy: async () => false,
+					isProjectLockOwnedBy: async () => false,
+					releaseOrphanedProjectLocks: async () => [],
+					reconcileProjectLockClaims: async () => [],
+				});
+			} finally {
+				console.log = originalLog;
+				process.exitCode = previousExitCode;
+			}
+			const result = JSON.parse(output[0]);
+			strictEqual(
+				result.vmsReclaimed,
+				1,
+				`${state}: ${JSON.stringify(result)}`,
+			);
+			ok(calls.some((args) => args[0] === "delete" && args[1] === uuid));
+			ok(!existsSync(ownershipPath), `${state} ownership must be removed`);
+		}
+	});
+
 	it("recover --state-root releases one stale lock once with no VM candidate", async () => {
 		const {
 			acquireProjectLock,
