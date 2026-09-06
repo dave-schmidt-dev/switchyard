@@ -24,6 +24,7 @@ import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
 import {
+	classifyPreProviderFailure,
 	INTEGRATION_REFUSAL_KINDS,
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
@@ -38,6 +39,7 @@ import {
 import { route as realRoute } from "../src/switchyard/router/index.mjs";
 import { VmSlotUnavailableError } from "../src/switchyard/run-store/index.mjs";
 import {
+	acquireCheckpointLease,
 	CHECKPOINT_IDENTITY_CODES,
 	CheckpointIdentityError,
 	createBrokerAdapterLauncher,
@@ -54,9 +56,11 @@ import {
 	integrationFailureMetadata,
 	loadCheckpoint,
 	loadTaskQueue,
+	migrateLegacyCheckpoint,
 	normalizeRunOptions,
 	parseTaskQueue,
 	QueueCleanupError,
+	releaseCheckpointOwnership,
 	resolveOrchestrator,
 	runQueueAsync as runQueueAsyncImpl,
 	runQueue as runQueueImpl,
@@ -70,6 +74,9 @@ import {
 } from "../src/switchyard/runner/index.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-runner-test");
+function writeLegacyCheckpoint(path, checkpoint) {
+	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
+}
 // Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
 // lazily loads the roster, resolving SWITCHYARD_ROSTER_PATH or the canonical
 // ~/.agent/roster.json default (Task 4.1) and failing loud only if that
@@ -3103,7 +3110,7 @@ describe("runner task selection and queue identity", () => {
 		}
 	});
 
-	it("creates and validates an identity-bound v2 checkpoint", () => {
+	it("creates and validates an identity-bound v3 checkpoint", () => {
 		const tasksPath = writeTasksFile(`### Task 1.1: Identity task
 - **Status:** pending
 - **Executor:** switchyard
@@ -3134,7 +3141,7 @@ describe("runner task selection and queue identity", () => {
 			queueIdentity,
 			runOptions,
 		});
-		strictEqual(loaded.version, 2);
+		strictEqual(loaded.version, 3);
 		strictEqual(loaded.queueIdentity, queueIdentity);
 		throws(
 			() =>
@@ -4225,7 +4232,7 @@ describe("runner headless orchestrator mode", () => {
 - **Description:** A legacy retry record must not be reinterpreted as a fresh task
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: [],
@@ -4268,7 +4275,7 @@ describe("runner headless orchestrator mode", () => {
 						},
 					},
 				}),
-			/historical retry state lacks trusted quota diagnostic provenance/,
+			/explicit reconciliation/,
 		);
 		strictEqual(routeCalls, 0);
 		strictEqual(launchCalls, 0);
@@ -4288,7 +4295,7 @@ describe("runner headless orchestrator mode", () => {
 			model_ref: "claude-sonnet-5",
 			selector: "claude-sonnet-5",
 		});
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: [],
@@ -4338,7 +4345,7 @@ describe("runner headless orchestrator mode", () => {
 						},
 					},
 				}),
-			/orchestrator mode cannot resume persisted retry state/,
+			/explicit reconciliation/,
 		);
 		strictEqual(routeCalls, 0);
 		strictEqual(launchCalls, 0);
@@ -5182,7 +5189,7 @@ describe("runner quota retry coordination", () => {
 		}
 	});
 
-	it("resumes a quarantined task on the remaining target without repeating attempt one", () => {
+	it("does not resume a possibly applied legacy quarantined task", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Resume quota retry
@@ -5196,7 +5203,7 @@ describe("runner quota retry coordination", () => {
 			model: "fixture-gemini",
 			resolvedTargetId: "agy-gemini",
 		});
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: [],
@@ -5252,26 +5259,23 @@ describe("runner quota retry coordination", () => {
 			resetCalls += 1;
 		};
 
-		const result = runQueue({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			checkpointPath,
-			dependencies: fixture.dependencies,
-		});
-
-		strictEqual(result.processedTasks, 1);
-		strictEqual(result.results[0].success, true);
-		strictEqual(fixture.executeCalls.length, 1);
-		strictEqual(resetCalls, 1);
-		deepStrictEqual(fixture.routeCalls[0].exclude, ["agy-gemini"]);
-		strictEqual(fixture.routeCalls[0].only.length, 0);
-		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
-		deepStrictEqual(checkpoint.quarantinedTargetIds, ["agy-gemini"]);
-		strictEqual(checkpoint.retryAttempts.length, 2);
-		strictEqual(checkpoint.retryState, null);
+		const before = readFileSync(checkpointPath, "utf8");
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
+			/explicit reconciliation/,
+		);
+		strictEqual(fixture.executeCalls.length, 0);
+		strictEqual(resetCalls, 0);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
 	});
 
-	it("reconstructs quarantine when resuming after attempt recording", () => {
+	it("does not reconstruct a possibly applied legacy attempt", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Resume before quarantine
@@ -5285,7 +5289,7 @@ describe("runner quota retry coordination", () => {
 			model: "fixture-gemini",
 			resolvedTargetId: "agy-gemini",
 		});
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: [],
@@ -5336,19 +5340,19 @@ describe("runner quota retry coordination", () => {
 			executionOutcomes: { agy: [{ success: true, output: "ok" }] },
 		});
 
-		const result = runQueue({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			checkpointPath,
-			dependencies: fixture.dependencies,
-		});
-
-		strictEqual(result.results[0].success, true);
-		strictEqual(fixture.executeCalls.length, 1);
-		deepStrictEqual(fixture.routeCalls[0].exclude, ["agy-gemini"]);
-		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
-		deepStrictEqual(checkpoint.quarantinedTargetIds, ["agy-gemini"]);
-		strictEqual(checkpoint.retryTransitions[1].type, "target_quarantined");
+		const before = readFileSync(checkpointPath, "utf8");
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
+			/explicit reconciliation/,
+		);
+		strictEqual(fixture.executeCalls.length, 0);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
 	});
 
 	it("fails closed on historical model-only retry state without launching", () => {
@@ -5360,7 +5364,7 @@ describe("runner quota retry coordination", () => {
 - **Description:** an old retry record has no exact descriptor
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: [],
@@ -5384,15 +5388,16 @@ describe("runner quota retry coordination", () => {
 			],
 			executionOutcomes: { agy: [{ success: true, output: "must not run" }] },
 		});
-		const result = runQueue({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			checkpointPath,
-			dependencies: fixture.dependencies,
-		});
-		strictEqual(result.processedTasks, 1);
-		strictEqual(result.results[0].success, false);
-		strictEqual(result.results[0].errorKind, "unknown_failure");
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
+			/explicit reconciliation/,
+		);
 		strictEqual(fixture.executeCalls.length, 0);
 	});
 
@@ -5414,7 +5419,7 @@ describe("runner quota retry coordination", () => {
 				model: "fixture-gemini",
 				resolvedTargetId: "agy-gemini",
 			});
-			saveCheckpoint(checkpointPath, {
+			writeLegacyCheckpoint(checkpointPath, {
 				version: 1,
 				tasksFilePath: tasksPath,
 				completedTaskIds: [],
@@ -5445,14 +5450,15 @@ describe("runner quota retry coordination", () => {
 					resetCalls += 1;
 				},
 			});
-			const result = await entrypoint({
-				tasksFilePath: tasksPath,
-				projectPath: TEST_DIR,
-				checkpointPath,
-				dependencies: fixture.dependencies,
-			});
-			strictEqual(result.results[0].success, false, name);
-			strictEqual(result.results[0].errorKind, "unknown_failure", name);
+			const invoke = () =>
+				entrypoint({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				});
+			if (name === "sync") throws(invoke, /explicit reconciliation/);
+			else await rejects(invoke, /explicit reconciliation/);
 			strictEqual(fixture.executeCalls.length, 0, name);
 			strictEqual(resetCalls, 0, name);
 		}
@@ -5482,7 +5488,7 @@ describe("runner quota retry coordination", () => {
 				"claude",
 			),
 		};
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: [],
@@ -5570,7 +5576,7 @@ describe("runner quota retry coordination", () => {
 					"claude",
 				),
 			};
-			saveCheckpoint(checkpointPath, {
+			writeLegacyCheckpoint(checkpointPath, {
 				version: 1,
 				tasksFilePath: tasksPath,
 				completedTaskIds: [],
@@ -5654,7 +5660,7 @@ describe("runner quota retry coordination", () => {
 `);
 		for (const corruptField of ["retryAttempts", "retryTransitions"]) {
 			const checkpointPath = `${tasksPath}.${corruptField}.checkpoint.json`;
-			saveCheckpoint(checkpointPath, {
+			writeLegacyCheckpoint(checkpointPath, {
 				version: 1,
 				tasksFilePath: tasksPath,
 				completedTaskIds: [],
@@ -5735,7 +5741,7 @@ describe("runner quota retry coordination", () => {
 		);
 	});
 
-	it("recovers a real child-process crash from a durable quarantine transition", () => {
+	it("does not infer dead ownership after a real child-process crash", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Child crash recovery
@@ -5870,21 +5876,20 @@ runQueue({
 			],
 			executionOutcomes: { agy: [{ success: true, output: "ok" }] },
 		});
-		const resumed = runQueue({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			checkpointPath,
-			dependencies: fixture.dependencies,
-		});
-
-		strictEqual(resumed.processedTasks, 1);
-		strictEqual(resumed.results[0].success, false);
-		strictEqual(resumed.results[0].result, "unknown_failure");
+		const before = readFileSync(checkpointPath, "utf8");
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
+			/checkpoint owner displaced/,
+		);
 		strictEqual(fixture.executeCalls.length, 0);
 		deepStrictEqual(fixture.routeCalls, []);
-		const completed = loadCheckpoint(checkpointPath, tasksPath);
-		strictEqual(completed.retryState, null);
-		strictEqual(completed.retryTransitionId, 5);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
 	});
 });
 
@@ -6024,11 +6029,251 @@ describe("runner cli orchestrator wiring", () => {
 });
 
 describe("checkpoint durability", () => {
+	it("rejects a stale independently loaded writer using the disk revision", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const original = createEmptyCheckpoint(tasksPath);
+		saveCheckpoint(checkpointPath, original);
+		const first = loadCheckpoint(checkpointPath, tasksPath);
+		const stale = structuredClone(first);
+		first.lastTaskId = "first";
+		saveCheckpoint(checkpointPath, first);
+		const before = readFileSync(checkpointPath, "utf8");
+		stale.lastTaskId = "stale";
+		throws(() => saveCheckpoint(checkpointPath, stale), /revision mismatch/);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
+	});
+
+	it("holds an exclusive lease and rejects owner or nonce displacement", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const checkpoint = createEmptyCheckpoint(tasksPath);
+		saveCheckpoint(checkpointPath, checkpoint);
+		const lease = acquireCheckpointLease(checkpointPath, checkpoint.owner);
+		throws(
+			() => acquireCheckpointLease(checkpointPath, checkpoint.owner),
+			/lease unavailable/,
+		);
+		writeFileSync(
+			lease.lockPath,
+			JSON.stringify({ owner: checkpoint.owner, nonce: "displaced" }),
+		);
+		const before = readFileSync(checkpointPath, "utf8");
+		throws(
+			() => saveCheckpoint(checkpointPath, checkpoint, { lease }),
+			/lease displaced/,
+		);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
+	});
+
+	it("revalidates the lease after staging and before canonical publication", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const checkpoint = createEmptyCheckpoint(tasksPath);
+		saveCheckpoint(checkpointPath, checkpoint);
+		const before = readFileSync(checkpointPath, "utf8");
+		checkpoint.lastTaskId = "must-not-publish";
+		throws(
+			() =>
+				saveCheckpoint(checkpointPath, checkpoint, {
+					beforePublish: ({ lease }) => {
+						writeFileSync(lease.lockPath, "displaced", "utf8");
+					},
+				}),
+			/checkpoint lease displaced/,
+		);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
+		ok(
+			!readdirSync(join(checkpointPath, "..")).some((name) =>
+				name.endsWith(".tmp"),
+			),
+		);
+	});
+
+	it("allows a separate process queue to resume only a durably released checkpoint", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Completed task
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** already completed in the checkpoint
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const checkpoint = createEmptyCheckpoint(tasksPath);
+		checkpoint.completedTaskIds.push("1.1");
+		checkpoint.results.push({ taskId: "1.1", success: true });
+		saveCheckpoint(checkpointPath, checkpoint);
+		strictEqual(releaseCheckpointOwnership(checkpointPath, checkpoint), true);
+		const runnerUrl = pathToFileURL(
+			resolve(cwd(), "src/switchyard/runner/index.mjs"),
+		).href;
+		const child = spawnSync(
+			process.execPath,
+			[
+				"--input-type=module",
+				"-e",
+				`import { runQueue } from ${JSON.stringify(runnerUrl)}; const [tasks,checkpointPath,projectPath]=process.argv.slice(1); const backendFactory=()=>({readiness:()=>({inventoryCount:0}),ensureAgentContainer:()=>{},create:()=>"unused",provision:()=>{},seed:()=>{},commit:()=>{},reset:()=>{},destroy:()=>{},captureTaskBase:()=>({ref:"unused",tree:"1".repeat(40)}),validateTaskBase:(_id,base)=>base,releaseTaskBase:()=>{}}); const result=runQueue({tasksFilePath:tasks,checkpointPath,projectPath,workingContainerName:"fake-container",dependencies:{queuePreflight:()=>({ok:true,eligible:true}),backendFactory,acquireVmSlot:()=>null,releaseVmSlot:()=>{}}}); if(result.processedTasks!==0) throw new Error("unexpected execution");`,
+				tasksPath,
+				checkpointPath,
+				TEST_DIR,
+			],
+			{ encoding: "utf8" },
+		);
+		strictEqual(child.status, 0, child.stderr);
+		strictEqual(
+			loadCheckpoint(checkpointPath, tasksPath).ownershipReleased,
+			true,
+		);
+	});
+
+	it("uses a new fenced owner when a later run claims a released checkpoint", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Completed task
+- **Status:** done
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** already complete
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const common = {
+			tasksFilePath: tasksPath,
+			checkpointPath,
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+			dependencies: {
+				queuePreflight: () => ({ ok: true, eligible: true }),
+				acquireVmSlot: () => null,
+				releaseVmSlot: () => {},
+			},
+		};
+		runQueue({ ...common, runId: "same-process-run-a" });
+		const afterA = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(afterA.ownershipReleased, true);
+		strictEqual(afterA.owner.runId, "same-process-run-a");
+
+		runQueue({ ...common, runId: "same-process-run-b" });
+		const afterB = loadCheckpoint(checkpointPath, tasksPath);
+		strictEqual(afterB.ownershipReleased, true);
+		strictEqual(afterB.owner.runId, "same-process-run-b");
+		notStrictEqual(afterB.owner.nonce, afterA.owner.nonce);
+		const beforeStaleSave = readFileSync(checkpointPath, "utf8");
+		throws(() => saveCheckpoint(checkpointPath, afterA), /owner displaced/);
+		strictEqual(readFileSync(checkpointPath, "utf8"), beforeStaleSave);
+	});
+
+	it("durably releases checkpoint ownership in all three queue loops", async () => {
+		for (const [name, entrypoint] of [
+			["sync", runQueue],
+			["async", runQueueAsync],
+			["orchestrator", runQueueWithOrchestrator],
+		]) {
+			const tasksPath = writeTasksFile(
+				`### Task 1.1: Completed ${name}\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** already complete\n`,
+			);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			await entrypoint({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				checkpointPath,
+				dependencies: {
+					queuePreflight: () => ({ ok: true, eligible: true }),
+					acquireVmSlot: () => null,
+					releaseVmSlot: () => {},
+					orchestrator: {
+						launch: () => "unused",
+						status: () => ({ state: "done" }),
+						result: () => ({ success: true }),
+					},
+				},
+			});
+			strictEqual(
+				loadCheckpoint(checkpointPath, tasksPath).ownershipReleased,
+				true,
+				name,
+			);
+		}
+	});
+
+	it("migrates only an explicitly proven never-started legacy checkpoint", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		writeLegacyCheckpoint(checkpointPath, {
+			version: 2,
+			tasksFilePath: tasksPath,
+			queueIdentity: "queue",
+			runOptions: null,
+			completedTaskIds: ["1.1"],
+			results: [{ taskId: "1.1", success: true }],
+			taskBases: {},
+		});
+		const owner = createEmptyCheckpoint(tasksPath).owner;
+		const before = readFileSync(checkpointPath, "utf8");
+		throws(
+			() => migrateLegacyCheckpoint(checkpointPath, tasksPath, null, { owner }),
+			(error) => {
+				deepStrictEqual(classifyPreProviderFailure(error), {
+					diagnosticCode: "integration_state_unknown",
+					errorKind: "integration_failed",
+					failurePhase: "checkpoint_validation",
+				});
+				return true;
+			},
+		);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
+		const migrated = migrateLegacyCheckpoint(checkpointPath, tasksPath, null, {
+			owner,
+			provenNeverStarted: true,
+		});
+		strictEqual(migrated.version, 3);
+		deepStrictEqual(migrated.completedTaskIds, ["1.1"]);
+	});
+
+	it("revalidates migration ownership after staging", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		writeLegacyCheckpoint(checkpointPath, {
+			version: 2,
+			tasksFilePath: tasksPath,
+			queueIdentity: "queue",
+			runOptions: null,
+			completedTaskIds: [],
+			results: [],
+			taskBases: {},
+		});
+		const owner = createEmptyCheckpoint(tasksPath).owner;
+		const before = readFileSync(checkpointPath, "utf8");
+		throws(
+			() =>
+				migrateLegacyCheckpoint(checkpointPath, tasksPath, null, {
+					owner,
+					provenNeverStarted: true,
+					beforePublish: ({ lease }) => {
+						writeFileSync(lease.lockPath, "displaced", "utf8");
+					},
+				}),
+			/checkpoint lease displaced/,
+		);
+		strictEqual(readFileSync(checkpointPath, "utf8"), before);
+		ok(
+			!readdirSync(join(checkpointPath, "..")).some((name) =>
+				name.endsWith(".tmp"),
+			),
+		);
+	});
+
+	it("leaves unknown and corrupt checkpoint bytes untouched", () => {
+		const tasksPath = writeTasksFile("## Phase 1\n");
+		for (const raw of ['{"version":99}', "{broken"]) {
+			const checkpointPath = `${tasksPath}.${randomUUID()}.checkpoint.json`;
+			writeFileSync(checkpointPath, raw);
+			throws(() => loadCheckpoint(checkpointPath, tasksPath));
+			strictEqual(readFileSync(checkpointPath, "utf8"), raw);
+		}
+	});
 	it("round-trips through an atomic write with no leftover temp file", () => {
 		const tasksPath = writeTasksFile("## Phase 1\n");
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: ["1.1"],
@@ -6134,7 +6379,7 @@ describe("checkpoint durability", () => {
 - **Description:** Do the thing
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		saveCheckpoint(checkpointPath, {
+		writeLegacyCheckpoint(checkpointPath, {
 			version: 1,
 			tasksFilePath: tasksPath,
 			completedTaskIds: ["1.1"],
@@ -11290,7 +11535,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 		);
 	});
 
-	it("keeps the provider transcript as evidence when the gate rejects an empty diff", () => {
+	it("does not persist a provider transcript when the gate rejects an empty diff", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Empty-diff task
@@ -11340,14 +11585,12 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 			taskResult.diagnosticCode ?? taskResult.reasonCode,
 			"empty_required_diff",
 		);
-		// The whole point: this rejection used to persist nothing at all.
 		const artifactPath = `${checkpointPath}.partial-diffs/1.1.output`;
-		ok(existsSync(artifactPath), "the transcript must be kept as an artifact");
-		strictEqual(readFileSync(artifactPath, "utf8"), transcript);
-		match(taskResult.artifactRef ?? "", /^artifact:[a-f0-9]{24}$/);
+		ok(!existsSync(artifactPath), "raw provider output must not be retained");
+		strictEqual(taskResult.artifactRef, undefined);
 		strictEqual(
 			taskResult.gateEvidence,
-			undefined,
+			null,
 			"raw transcript must not ride along in the result handed to onResult",
 		);
 
@@ -12238,6 +12481,15 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 				reasonKind: "conflict",
 			},
 		},
+		{
+			name: "integration_state_unknown",
+			code: "integration_state_unknown",
+			gateResult: {
+				success: false,
+				message: "Diff apply failed",
+				reasonKind: "integration_state_unknown",
+			},
+		},
 	];
 
 	it("contains fixtures for every closed integration rejection code", () => {
@@ -12249,7 +12501,7 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 			...INTEGRATION_REFUSAL_KINDS,
 		]);
 		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, expectedCodes.size);
-		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, 13);
+		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, 14);
 		for (const fixture of CLOSED_INTEGRATION_FIXTURES) {
 			ok(
 				expectedCodes.has(fixture.code),
@@ -12377,7 +12629,9 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 			"required_paths_missing",
 			"undeclared_paths_touched",
 			"no_op_diff",
-			...INTEGRATION_REFUSAL_KINDS,
+			...INTEGRATION_REFUSAL_KINDS.filter(
+				(kind) => kind !== "integration_state_unknown",
+			),
 		]) {
 			const result = integrationFailureMetadata("t-1", "", false, {
 				success: false,
@@ -12395,6 +12649,14 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 			diagnosticCode: "required_paths_missing",
 		});
 		strictEqual(result.diagnosticCode, "conflict");
+	});
+
+	it("does not infer integration_state_unknown from message text", () => {
+		const result = integrationFailureMetadata("t-1", "", false, {
+			success: false,
+			message: "integration_state_unknown",
+		});
+		strictEqual(result.diagnosticCode, undefined);
 	});
 
 	it("discards untrusted diagnosticCode values when reasonKind/message are untrusted", () => {

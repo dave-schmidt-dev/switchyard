@@ -99,6 +99,11 @@ const VALID_CLEANUP_STATES = new Set([
 ]);
 
 const RUN_ID_RE = /^[\w-]+$/;
+// A random value allocated once for this module instance distinguishes two
+// Switchyard processes even when the operating system later reuses a PID. It
+// is an instance fence only; it is deliberately not presented as OS liveness
+// or process-birth evidence.
+const PROCESS_INSTANCE_ID = randomUUID();
 
 const HISTORICAL_SCHEMA_VERSION = 1;
 const CURRENT_SCHEMA_VERSION = 2;
@@ -180,6 +185,31 @@ export function isSafeTargetId(value) {
 		const codePoint = character.codePointAt(0);
 		return codePoint <= 0x1f || codePoint === 0x7f;
 	});
+}
+
+/**
+ * Produce the stable identity shape used by durable writers that must fence a
+ * later publisher. The nonce is caller-owned when a process already has one.
+ * @param {string} runId
+ * @param {string} [processStartIdentity]
+ * @param {string} [nonce]
+ * @returns {{runId: string, processStartIdentity: string, nonce: string}}
+ */
+export function createFencingIdentity(
+	runId,
+	processStartIdentity = PROCESS_INSTANCE_ID,
+	nonce = randomUUID(),
+) {
+	validateRunId(runId);
+	if (
+		typeof processStartIdentity !== "string" ||
+		processStartIdentity.length === 0 ||
+		typeof nonce !== "string" ||
+		nonce.length === 0
+	) {
+		throw new SchemaError("fencing identity is invalid");
+	}
+	return { runId, processStartIdentity, nonce };
 }
 
 const DESCRIPTOR_IDENTITY_RE = /^sha256:[a-f0-9]{64}$/;

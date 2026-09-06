@@ -46,6 +46,10 @@ after(() => {
 });
 
 describe("partial diffs are recorded, not copied (Task 6.5)", () => {
+	it("keeps checkpoint evidence references opaque", () => {
+		ok(!/raw provider transcripts/i.test(BOOTSTRAP_SOURCE));
+	});
+
 	it("proves the failure path no longer copies a partial diff into artifacts/", () => {
 		ok(
 			!/copyFile/.test(BOOTSTRAP_SOURCE),

@@ -2,12 +2,15 @@
 // Reads persisted task queue, drives serial execution, checkpoints for resume.
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+	closeSync,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -101,12 +104,14 @@ import {
 } from "../router/index.mjs";
 import {
 	acquireVmSlot,
+	createFencingIdentity,
 	getVmAdmissionRoot,
 	releaseVmSlot,
 	VmSlotUnavailableError,
 } from "../run-store/index.mjs";
 
-const CHECKPOINT_VERSION = 2;
+const CHECKPOINT_VERSION = 3;
+const checkpointOwners = new Map();
 const BOUNDED_ERROR_KINDS = new Set(PERSISTED_ERROR_KINDS);
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
@@ -410,6 +415,14 @@ export class CheckpointRunOptionsMismatchError extends CheckpointIdentityError {
 export class CheckpointHistoricalCheckpointError extends CheckpointIdentityError {
 	constructor(remedy = null) {
 		super(CHECKPOINT_IDENTITY_CODES.HISTORICAL_CHECKPOINT, remedy);
+	}
+}
+
+export class IntegrationStateUnknownError extends Error {
+	constructor() {
+		super("integration state requires explicit reconciliation");
+		this.name = "IntegrationStateUnknownError";
+		this.code = "INTEGRATION_STATE_UNKNOWN";
 	}
 }
 
@@ -1628,23 +1641,40 @@ export function getCheckpointPath(tasksFilePath) {
  */
 export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
 	const checkpoint = {
-		// Keep the historical shape for direct callers that predate queue
-		// identity. Dispatch/resume paths pass an identity and receive v2.
-		version: identity.queueIdentity
-			? CHECKPOINT_VERSION
-			: HISTORICAL_CHECKPOINT_VERSION,
+		version: CHECKPOINT_VERSION,
+		revision: 0,
+		owner:
+			identity.checkpointOwner ??
+			createFencingIdentity(identity.queueIdentity ?? "direct"),
+		ownershipReleased: false,
 		tasksFilePath,
 		completedTaskIds: [],
 		lastTaskId: null,
 		lastUpdatedAt: null,
 		results: [],
 		taskBases: {},
+		taskAttempts: {},
+		integrationIntents: {},
 	};
 	if (identity.queueIdentity) {
 		checkpoint.queueIdentity = identity.queueIdentity;
 		checkpoint.runOptions = identity.runOptions ?? null;
 	}
 	return checkpoint;
+}
+
+function checkpointOwnerFor(checkpointPath, runId, suppliedOwner) {
+	if (suppliedOwner) return suppliedOwner;
+	const effectiveRunId = runId ?? "direct";
+	let cached = checkpointOwners.get(checkpointPath);
+	if (!cached || cached.runId !== effectiveRunId) {
+		cached = {
+			runId: effectiveRunId,
+			owner: createFencingIdentity(effectiveRunId),
+		};
+		checkpointOwners.set(checkpointPath, cached);
+	}
+	return cached.owner;
 }
 
 /**
@@ -1656,11 +1686,396 @@ export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
  * @param {string} checkpointPath
  * @param {object} checkpoint
  */
-export function saveCheckpoint(checkpointPath, checkpoint) {
+export function saveCheckpoint(checkpointPath, checkpoint, options = {}) {
+	if (checkpoint?.version !== CHECKPOINT_VERSION)
+		throw new Error("legacy checkpoint requires explicit v3 migration");
+	if (!Number.isInteger(checkpoint.revision) || checkpoint.revision < 0) {
+		throw new Error("checkpoint revision is invalid");
+	}
+	if (!isCheckpointOwner(checkpoint.owner)) {
+		throw new Error("checkpoint owner is invalid");
+	}
 	mkdirSync(dirname(checkpointPath), { recursive: true });
-	const tmpPath = `${checkpointPath}.tmp`;
-	writeFileSync(tmpPath, JSON.stringify(checkpoint, null, 2), "utf8");
-	renameSync(tmpPath, checkpointPath);
+	const lease =
+		options.lease ?? acquireCheckpointLease(checkpointPath, checkpoint.owner);
+	const ownsLease = options.lease === undefined;
+	try {
+		assertCheckpointLease(lease, checkpointPath, checkpoint.owner);
+		let disk = null;
+		let diskRaw = null;
+		if (existsSync(checkpointPath)) {
+			try {
+				diskRaw = readFileSync(checkpointPath, "utf8");
+				disk = JSON.parse(diskRaw);
+			} catch {
+				throw new Error("checkpoint disk record is corrupt");
+			}
+			if (disk?.version !== CHECKPOINT_VERSION)
+				throw new Error("legacy checkpoint requires explicit v3 migration");
+			if (!sameCheckpointOwner(disk.owner, checkpoint.owner))
+				throw new Error("checkpoint owner displaced");
+			if (disk.ownershipReleased)
+				throw new Error("checkpoint ownership was released");
+		}
+		const expectedRevision = options.expectedRevision ?? checkpoint.revision;
+		const diskRevision = disk?.revision ?? 0;
+		if (
+			diskRevision !== expectedRevision ||
+			checkpoint.revision !== expectedRevision
+		)
+			throw new Error(
+				`checkpoint revision mismatch: expected ${expectedRevision}, disk ${diskRevision}`,
+			);
+		const published = structuredClone(checkpoint);
+		published.revision = diskRevision + 1;
+		const tmpPath = `${checkpointPath}.${process.pid}.${randomUUID()}.tmp`;
+		writeFileSync(tmpPath, JSON.stringify(published, null, 2), "utf8");
+		try {
+			options.beforePublish?.({ lease, tmpPath });
+			assertCheckpointLease(lease, checkpointPath, checkpoint.owner);
+			const currentRaw = existsSync(checkpointPath)
+				? readFileSync(checkpointPath, "utf8")
+				: null;
+			if (currentRaw !== diskRaw)
+				throw new Error("checkpoint revision changed before publication");
+			renameSync(tmpPath, checkpointPath);
+		} catch (error) {
+			try {
+				unlinkSync(tmpPath);
+			} catch {}
+			throw error;
+		}
+		checkpoint.revision = published.revision;
+	} finally {
+		if (ownsLease) releaseCheckpointLease(lease);
+	}
+}
+
+function checkpointLockPath(checkpointPath) {
+	return `${checkpointPath}.lock`;
+}
+
+function sameCheckpointOwner(left, right) {
+	return (
+		left?.runId === right?.runId &&
+		left?.processStartIdentity === right?.processStartIdentity &&
+		left?.nonce === right?.nonce
+	);
+}
+
+/** Acquire a cooperative exclusive checkpoint lease. Existing or malformed
+ * lease files fail closed; their age and PID are never treated as liveness. */
+export function acquireCheckpointLease(checkpointPath, owner) {
+	if (!isCheckpointOwner(owner)) throw new Error("checkpoint owner is invalid");
+	mkdirSync(dirname(checkpointPath), { recursive: true });
+	const lockPath = checkpointLockPath(checkpointPath);
+	const nonce = randomUUID();
+	const body = JSON.stringify({ owner, nonce });
+	let fd;
+	try {
+		fd = openSync(lockPath, "wx", 0o600);
+		writeFileSync(fd, body, "utf8");
+	} catch (error) {
+		if (fd !== undefined) closeSync(fd);
+		throw new Error(
+			`checkpoint lease unavailable: ${error.code ?? error.message}`,
+		);
+	}
+	closeSync(fd);
+	return {
+		checkpointPath,
+		lockPath,
+		owner: structuredClone(owner),
+		nonce,
+		body,
+	};
+}
+
+function assertCheckpointLease(lease, checkpointPath, owner) {
+	if (
+		lease?.checkpointPath !== checkpointPath ||
+		!sameCheckpointOwner(lease.owner, owner) ||
+		readFileSync(lease.lockPath, "utf8") !== lease.body
+	)
+		throw new Error("checkpoint lease displaced");
+}
+
+export function releaseCheckpointLease(lease) {
+	assertCheckpointLease(lease, lease.checkpointPath, lease.owner);
+	unlinkSync(lease.lockPath);
+}
+
+function isCheckpointOwner(owner) {
+	return (
+		owner &&
+		typeof owner === "object" &&
+		typeof owner.runId === "string" &&
+		owner.runId.length > 0 &&
+		typeof owner.processStartIdentity === "string" &&
+		owner.processStartIdentity.length > 0 &&
+		typeof owner.nonce === "string" &&
+		owner.nonce.length > 0
+	);
+}
+
+function validateCheckpointV3(parsed, tasksFilePath, expected) {
+	if (
+		!Array.isArray(parsed.completedTaskIds) ||
+		!Array.isArray(parsed.results) ||
+		!Number.isInteger(parsed.revision) ||
+		parsed.revision < 0 ||
+		!isCheckpointOwner(parsed.owner) ||
+		typeof parsed.ownershipReleased !== "boolean" ||
+		!parsed.taskAttempts ||
+		typeof parsed.taskAttempts !== "object" ||
+		Array.isArray(parsed.taskAttempts) ||
+		!parsed.integrationIntents ||
+		typeof parsed.integrationIntents !== "object" ||
+		Array.isArray(parsed.integrationIntents)
+	) {
+		throw new Error("checkpoint v3 has an invalid fencing record");
+	}
+	for (const [taskId, attempt] of Object.entries(parsed.taskAttempts)) {
+		if (!taskId || !Number.isInteger(attempt) || attempt < 0)
+			throw new Error("checkpoint v3 has invalid task attempts");
+	}
+	for (const [taskId, intent] of Object.entries(parsed.integrationIntents)) {
+		const operation = intent?.operation;
+		if (
+			!intent ||
+			!operation ||
+			operation.taskId !== taskId ||
+			typeof operation.runId !== "string" ||
+			!operation.runId ||
+			!Number.isInteger(operation.attempt) ||
+			operation.attempt < 1 ||
+			parsed.taskAttempts[taskId] !== operation.attempt ||
+			typeof operation.baseTree !== "string" ||
+			!/^[a-f0-9]{40,64}$/.test(operation.baseTree) ||
+			typeof operation.patchHash !== "string" ||
+			!/^[a-f0-9]{64}$/.test(operation.patchHash) ||
+			!Array.isArray(operation.paths) ||
+			operation.paths.some((path) => typeof path !== "string" || !path) ||
+			!["pending", "completed"].includes(intent.status) ||
+			typeof intent.beforeState !== "string" ||
+			!/^[a-f0-9]{64}$/.test(intent.beforeState) ||
+			(intent.status === "completed" &&
+				(typeof intent.afterState !== "string" ||
+					!/^[a-f0-9]{64}$/.test(intent.afterState)))
+		) {
+			throw new Error("checkpoint v3 has invalid integration intent");
+		}
+	}
+	if (parsed.tasksFilePath !== tasksFilePath) {
+		throw new CheckpointIdentityError(
+			CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH,
+			CHECKPOINT_IDENTITY_REMEDIES[
+				CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH
+			],
+		);
+	}
+	if (
+		expected?.queueIdentity &&
+		parsed.queueIdentity !== expected.queueIdentity
+	) {
+		throw new CheckpointIdentityError(
+			CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH,
+			CHECKPOINT_IDENTITY_REMEDIES[
+				CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH
+			],
+		);
+	}
+	if (
+		expected?.runOptions &&
+		stableStringify(parsed.runOptions) !== stableStringify(expected.runOptions)
+	) {
+		throw new CheckpointIdentityError(
+			CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH,
+			CHECKPOINT_IDENTITY_REMEDIES[
+				CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH
+			],
+		);
+	}
+	if (
+		expected?.checkpointOwner &&
+		!sameCheckpointOwner(parsed.owner, expected.checkpointOwner)
+	)
+		throw new Error("checkpoint owner displaced");
+	return parsed;
+}
+
+function assertLegacyCheckpointHasNoPendingOperation(parsed) {
+	const completed = new Set(parsed.completedTaskIds ?? []);
+	if (
+		parsed.retryState != null ||
+		Object.keys(parsed.taskBases ?? {}).some(
+			(taskId) => !completed.has(taskId),
+		) ||
+		Object.keys(parsed.taskAttempts ?? {}).some(
+			(taskId) => !completed.has(taskId),
+		) ||
+		Object.keys(parsed.integrationIntents ?? {}).length > 0
+	)
+		throw new IntegrationStateUnknownError();
+}
+
+function validateCheckpointTaskBases(parsed) {
+	if (
+		!parsed.taskBases ||
+		typeof parsed.taskBases !== "object" ||
+		Array.isArray(parsed.taskBases)
+	)
+		throw new Error("checkpoint has invalid taskBases");
+	for (const [taskId, base] of Object.entries(parsed.taskBases)) {
+		const helper = base?.cleanupContext;
+		if (
+			typeof base?.ref !== "string" ||
+			!base.ref ||
+			typeof base?.tree !== "string" ||
+			!/^[a-f0-9]{40,64}$/.test(base.tree) ||
+			helper?.operation !== "helper" ||
+			helper.taskId !== taskId ||
+			![
+				"runId",
+				"taskId",
+				"attemptId",
+				"descriptorIdentity",
+				"workspaceId",
+			].every(
+				(field) =>
+					typeof helper[field] === "string" && helper[field].length > 0,
+			) ||
+			(helper.processStartIdentity !== null &&
+				typeof helper.processStartIdentity !== "string")
+		)
+			throw new Error("checkpoint has invalid persisted task base");
+	}
+}
+
+/** Explicitly migrate a legacy checkpoint that the caller has independently
+ * proven never had a pending host application. Potentially-started records are
+ * left byte-for-byte unchanged. */
+export function migrateLegacyCheckpoint(
+	checkpointPath,
+	tasksFilePath,
+	expected,
+	{ owner, provenNeverStarted = false, beforePublish } = {},
+) {
+	if (!provenNeverStarted) throw new IntegrationStateUnknownError();
+	const lease = acquireCheckpointLease(checkpointPath, owner);
+	try {
+		const before = readFileSync(checkpointPath, "utf8");
+		const legacy = loadCheckpoint(checkpointPath, tasksFilePath, expected);
+		if (![1, 2].includes(legacy.version))
+			throw new Error("checkpoint is not legacy");
+		const completed = new Set(legacy.completedTaskIds);
+		if (
+			Object.keys(legacy.taskBases ?? {}).some((id) => !completed.has(id)) ||
+			Object.keys(legacy.integrationIntents ?? {}).length > 0 ||
+			Object.keys(legacy.taskAttempts ?? {}).some((id) => !completed.has(id))
+		)
+			throw new IntegrationStateUnknownError();
+		assertCheckpointLease(lease, checkpointPath, owner);
+		if (readFileSync(checkpointPath, "utf8") !== before)
+			throw new Error("checkpoint changed during migration");
+		const migrated = {
+			...legacy,
+			version: CHECKPOINT_VERSION,
+			revision: 1,
+			owner: structuredClone(owner),
+			ownershipReleased: false,
+			taskBases: structuredClone(legacy.taskBases ?? {}),
+			taskAttempts: {},
+			integrationIntents: {},
+		};
+		validateCheckpointTaskBases(migrated);
+		validateCheckpointV3(migrated, tasksFilePath, {
+			...expected,
+			checkpointOwner: owner,
+		});
+		const tmpPath = `${checkpointPath}.${process.pid}.${randomUUID()}.tmp`;
+		writeFileSync(tmpPath, JSON.stringify(migrated, null, 2), "utf8");
+		try {
+			beforePublish?.({ lease, tmpPath });
+			assertCheckpointLease(lease, checkpointPath, owner);
+			if (readFileSync(checkpointPath, "utf8") !== before)
+				throw new Error("checkpoint changed during migration");
+			renameSync(tmpPath, checkpointPath);
+		} catch (error) {
+			try {
+				unlinkSync(tmpPath);
+			} catch {}
+			throw error;
+		}
+		return migrated;
+	} finally {
+		releaseCheckpointLease(lease);
+	}
+}
+
+function checkpointCanRelease(checkpoint) {
+	return (
+		checkpoint.retryState == null &&
+		Object.keys(checkpoint.taskBases ?? {}).length === 0 &&
+		Object.values(checkpoint.integrationIntents ?? {}).every(
+			(intent) => intent.status === "completed",
+		)
+	);
+}
+
+export function releaseCheckpointOwnership(checkpointPath, checkpoint) {
+	if (!checkpointCanRelease(checkpoint)) {
+		saveCheckpoint(checkpointPath, checkpoint);
+		return false;
+	}
+	checkpoint.ownershipReleased = true;
+	try {
+		saveCheckpoint(checkpointPath, checkpoint);
+		return true;
+	} catch (error) {
+		checkpoint.ownershipReleased = false;
+		throw error;
+	}
+}
+
+export function claimCheckpointOwnership(
+	checkpointPath,
+	tasksFilePath,
+	expected,
+	owner,
+) {
+	const lease = acquireCheckpointLease(checkpointPath, owner);
+	try {
+		const raw = readFileSync(checkpointPath, "utf8");
+		const disk = JSON.parse(raw);
+		validateRetryDescriptorEvidence(disk);
+		validateCheckpointTaskBases(disk);
+		validateCheckpointV3(disk, tasksFilePath, expected);
+		if (!disk.ownershipReleased || !checkpointCanRelease(disk))
+			throw new Error("checkpoint owner displaced");
+		const claimed = {
+			...disk,
+			owner: structuredClone(owner),
+			ownershipReleased: false,
+			revision: disk.revision + 1,
+		};
+		const tmpPath = `${checkpointPath}.${process.pid}.${randomUUID()}.tmp`;
+		writeFileSync(tmpPath, JSON.stringify(claimed, null, 2), "utf8");
+		try {
+			assertCheckpointLease(lease, checkpointPath, owner);
+			if (readFileSync(checkpointPath, "utf8") !== raw)
+				throw new Error("checkpoint revision changed during claim");
+			renameSync(tmpPath, checkpointPath);
+		} catch (error) {
+			try {
+				unlinkSync(tmpPath);
+			} catch {}
+			throw error;
+		}
+		return claimed;
+	} finally {
+		releaseCheckpointLease(lease);
+	}
 }
 
 /**
@@ -1685,34 +2100,15 @@ function savePartialDiff(checkpointPath, taskId, diffText) {
 	return artifactPath;
 }
 
-const GATE_EVIDENCE_LIMIT = 32 * 1024;
-const GATE_EVIDENCE_HEAD = 8 * 1024;
-
 /**
- * Bound the provider transcript kept as gate-rejection evidence.
- *
- * A gate rejection whose diff is empty — `empty_required_diff` — has no diff
- * to keep, so it used to persist no evidence at all: the run recorded that
- * the provider changed nothing and nothing about why. The transcript is the
- * only remaining account of that run, so it is kept, bounded, and written to
- * the same host-only artifact directory the partial diff uses. It never
- * crosses into events.jsonl, checkpoint.json, or the ledger; callers see only
- * the opaque `artifact:` reference.
+ * Provider output is never durable gate evidence. Closed diagnostic codes and
+ * patch artifacts with an active reconciliation purpose are sufficient.
  *
  * @param {unknown} output raw provider stdout
  * @returns {string|null} bounded transcript, or null when there is none
  */
-function boundedGateEvidence(output) {
-	if (typeof output !== "string") return null;
-	const text = output.trim();
-	if (!text) return null;
-	if (text.length <= GATE_EVIDENCE_LIMIT) return text;
-	const dropped = text.length - GATE_EVIDENCE_LIMIT;
-	return (
-		`${text.slice(0, GATE_EVIDENCE_HEAD)}\n` +
-		`...[switchyard omitted ${dropped} characters]...\n` +
-		`${text.slice(-(GATE_EVIDENCE_LIMIT - GATE_EVIDENCE_HEAD))}`
-	);
+function boundedGateEvidence(_output) {
+	return null;
 }
 
 function saveGateEvidence(checkpointPath, taskId, text) {
@@ -1753,8 +2149,14 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 		);
 	}
 
+	if (parsed?.version === CHECKPOINT_VERSION) {
+		validateRetryDescriptorEvidence(parsed);
+		validateCheckpointTaskBases(parsed);
+		return validateCheckpointV3(parsed, tasksFilePath, expected);
+	}
+
 	if (
-		parsed?.version === CHECKPOINT_VERSION &&
+		parsed?.version === 2 &&
 		Array.isArray(parsed.completedTaskIds) &&
 		Array.isArray(parsed.results)
 	) {
@@ -1798,6 +2200,11 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 			);
 		}
 		validateRetryDescriptorEvidence(parsed);
+		validateCheckpointTaskBases({
+			...parsed,
+			taskBases: parsed.taskBases ?? {},
+		});
+		assertLegacyCheckpointHasNoPendingOperation(parsed);
 		return parsed;
 	}
 
@@ -1815,6 +2222,7 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 			);
 		}
 		validateRetryDescriptorEvidence(parsed);
+		assertLegacyCheckpointHasNoPendingOperation(parsed);
 		return parsed;
 	}
 
@@ -2590,7 +2998,9 @@ const ALLOWED_INTEGRATION_MESSAGES = Object.freeze(
 		"required_paths_missing",
 		"undeclared_paths_touched",
 		"no_op_diff",
-		...INTEGRATION_REFUSAL_KINDS,
+		...INTEGRATION_REFUSAL_KINDS.filter(
+			(kind) => kind !== "integration_state_unknown",
+		),
 	]),
 );
 
@@ -2780,6 +3190,116 @@ function persistedTaskBaseHelperContext(base, currentOwnership) {
 		}
 	}
 	return true;
+}
+
+function integrationOperation(context, task, diff) {
+	const checkpoint = context.checkpoint;
+	if (!checkpoint || typeof diff !== "string") return null;
+	const patch = diff.endsWith("\n") ? diff : `${diff}\n`;
+	const patchHash = createHash("sha256").update(patch, "utf8").digest("hex");
+	const baseTree = context._activeTaskBase?.tree;
+	if (typeof baseTree !== "string" || !baseTree) return null;
+	const existing = checkpoint.integrationIntents?.[task.id];
+	if (
+		existing &&
+		existing.operation?.patchHash === patchHash &&
+		existing.operation?.baseTree === baseTree &&
+		JSON.stringify(existing.operation?.paths) ===
+			JSON.stringify(task.requiredPaths ?? [])
+	) {
+		return {
+			...existing.operation,
+			baseTree,
+			patchHash,
+			paths: [...(task.requiredPaths ?? [])],
+		};
+	}
+	return {
+		runId: context.runId ?? checkpoint.owner.runId,
+		taskId: task.id,
+		attempt: (checkpoint.taskAttempts?.[task.id] ?? 0) + 1,
+		baseTree,
+		patchHash,
+		paths: [...(task.requiredPaths ?? [])],
+	};
+}
+
+function sameIntegrationOperation(left, right) {
+	return (
+		left?.runId === right?.runId &&
+		left?.taskId === right?.taskId &&
+		left?.attempt === right?.attempt &&
+		left?.baseTree === right?.baseTree &&
+		left?.patchHash === right?.patchHash &&
+		JSON.stringify(left?.paths) === JSON.stringify(right?.paths)
+	);
+}
+
+function checkpointIntegrationIntent(context, task, diff) {
+	const operation = integrationOperation(context, task, diff);
+	if (!operation) return undefined;
+	const read = (candidate, lease) => {
+		assertCheckpointLease(
+			lease,
+			context.checkpointPath,
+			context.checkpoint.owner,
+		);
+		const disk = JSON.parse(readFileSync(context.checkpointPath, "utf8"));
+		validateCheckpointV3(disk, context.checkpoint.tasksFilePath, {
+			checkpointOwner: context.checkpoint.owner,
+		});
+		const proof = disk.integrationIntents?.[task.id] ?? null;
+		if (proof && !sameIntegrationOperation(proof.operation, candidate))
+			return proof;
+		return proof ? structuredClone(proof) : null;
+	};
+	const persist = (proof, lease) => {
+		const checkpoint = context.checkpoint;
+		const existing = checkpoint.integrationIntents?.[task.id];
+		if (
+			existing ||
+			!sameIntegrationOperation(proof.operation, operation) ||
+			proof.status !== "pending"
+		)
+			return null;
+		checkpoint.integrationIntents ??= {};
+		checkpoint.taskAttempts ??= {};
+		checkpoint.integrationIntents[task.id] = structuredClone(proof);
+		checkpoint.taskAttempts[task.id] = operation.attempt;
+		checkpoint.lastUpdatedAt = new Date().toISOString();
+		try {
+			saveCheckpoint(context.checkpointPath, checkpoint, { lease });
+			return read(operation, lease);
+		} catch {
+			return null;
+		}
+	};
+	const complete = (proof, lease) => {
+		const entry = context.checkpoint.integrationIntents?.[task.id];
+		if (
+			!sameIntegrationOperation(entry?.operation, proof.operation) ||
+			entry?.status !== "pending" ||
+			proof.status !== "completed"
+		)
+			return null;
+		context.checkpoint.integrationIntents[task.id] = structuredClone(proof);
+		context.checkpoint.lastUpdatedAt = new Date().toISOString();
+		try {
+			saveCheckpoint(context.checkpointPath, context.checkpoint, { lease });
+			return read(operation, lease);
+		} catch {
+			return null;
+		}
+	};
+	return {
+		operation,
+		acquire: () =>
+			acquireCheckpointLease(context.checkpointPath, context.checkpoint.owner),
+		release: releaseCheckpointLease,
+		persist,
+		complete,
+		read,
+	};
 }
 
 function prepareTaskBase(context, task, cleanupContext) {
@@ -3655,6 +4175,7 @@ export function executeTask(task, context) {
 		requiredPaths: task.requiredPaths,
 		allowSensitiveManifests:
 			task.type === "implementation" && task.allowManifests === true,
+		integrationIntent: checkpointIntegrationIntent(context, task, diff),
 	});
 	const alreadyApplied = gateResult?.alreadyApplied === true;
 	const success = Boolean(gateResult?.success) || alreadyApplied;
@@ -4522,6 +5043,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		requiredPaths: task.requiredPaths,
 		allowSensitiveManifests:
 			task.type === "implementation" && task.allowManifests === true,
+		integrationIntent: checkpointIntegrationIntent(context, task, diff),
 	});
 	const alreadyApplied = gateResult?.alreadyApplied === true;
 	const success = Boolean(gateResult?.success) || alreadyApplied;
@@ -4719,6 +5241,8 @@ export async function runQueueAsync(options) {
 		queueBackend,
 		platform: selectedPlatform,
 		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
+		checkpoint,
+		checkpointPath,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
 			checkpoint.taskBases[taskId] = base;
@@ -5113,7 +5637,7 @@ export async function runQueueAsync(options) {
 			}
 			if (!result.success && effectiveStopOnFailure) break;
 		}
-		saveCheckpoint(checkpointPath, checkpoint);
+		releaseCheckpointOwnership(checkpointPath, checkpoint);
 		queueResult = {
 			results,
 			totalTasks: tasks.length,
@@ -5633,6 +6157,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		requiredPaths: task.requiredPaths,
 		allowSensitiveManifests:
 			task.type === "implementation" && task.allowManifests === true,
+		integrationIntent: checkpointIntegrationIntent(context, task, diff),
 	});
 	const alreadyApplied = gateResult?.alreadyApplied === true;
 	const success = Boolean(gateResult?.success) || alreadyApplied;
@@ -6958,7 +7483,8 @@ function prepareQueueLaunch({
 	}
 	// Read the checkpoint before backend selection so malformed or stale queue
 	// state fails without creating a workspace or reserving a VM slot.
-	loadCheckpoint(checkpointPath, tasksFilePath);
+	const checkpointExisted = existsSync(checkpointPath);
+	const observedCheckpoint = loadCheckpoint(checkpointPath, tasksFilePath);
 	const identity = resolveQueueIdentity(
 		{
 			tasksFilePath,
@@ -6991,6 +7517,30 @@ function prepareQueueLaunch({
 	const effectiveTaskIds = identity.runOptions
 		? identity.runOptions.taskIds
 		: taskIds;
+	const checkpointOwner = checkpointOwnerFor(
+		checkpointPath,
+		runId ?? identity.queueIdentity,
+		dependencies.checkpointOwner,
+	);
+	const expectedCheckpointIdentity = identity.enabled
+		? {
+				queueIdentity: identity.queueIdentity,
+				runOptions: identity.runOptions,
+			}
+		: null;
+	if (
+		checkpointExisted &&
+		observedCheckpoint.version === CHECKPOINT_VERSION &&
+		(observedCheckpoint.ownershipReleased ||
+			!sameCheckpointOwner(observedCheckpoint.owner, checkpointOwner))
+	) {
+		claimCheckpointOwnership(
+			checkpointPath,
+			tasksFilePath,
+			expectedCheckpointIdentity,
+			checkpointOwner,
+		);
+	}
 	const checkpoint = loadCheckpoint(
 		checkpointPath,
 		tasksFilePath,
@@ -6998,8 +7548,11 @@ function prepareQueueLaunch({
 			? {
 					queueIdentity: identity.queueIdentity,
 					runOptions: identity.runOptions,
+					checkpointOwner,
 				}
-			: null,
+			: {
+					checkpointOwner,
+				},
 	);
 	ensureRetryCheckpoint(checkpoint);
 	validateRetryDescriptorEvidence(checkpoint);
@@ -7391,6 +7944,8 @@ export function runQueue(options) {
 		queueBackend,
 		platform: selectedPlatform,
 		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
+		checkpoint,
+		checkpointPath,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
@@ -8014,7 +8569,8 @@ export function runQueue(options) {
 		// A halt entry was already persisted by recordHalt before the
 		// queue_halted event fired; this final save is a no-op for that entry
 		// and remains for the other fields/zero-runnable path.
-		saveCheckpoint(checkpointPath, checkpoint);
+		if (checkpoint.version === CHECKPOINT_VERSION)
+			releaseCheckpointOwnership(checkpointPath, checkpoint);
 
 		return {
 			totalTasks: tasks.length,
@@ -8243,6 +8799,8 @@ export async function runQueueWithOrchestrator(options) {
 		queueBackend,
 		platform: selectedPlatform,
 		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
+		checkpoint,
+		checkpointPath,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
@@ -8540,7 +9098,7 @@ export async function runQueueWithOrchestrator(options) {
 		// A halt entry was already persisted by recordHalt before the
 		// queue_halted event fired; this final save is a no-op for that entry
 		// and remains for the other fields/zero-runnable path.
-		saveCheckpoint(checkpointPath, checkpoint);
+		releaseCheckpointOwnership(checkpointPath, checkpoint);
 
 		return {
 			totalTasks: tasks.length,

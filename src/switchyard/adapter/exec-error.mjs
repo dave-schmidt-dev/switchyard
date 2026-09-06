@@ -382,6 +382,7 @@ export const INTEGRATION_REFUSAL_KINDS = Object.freeze([
 	"manifest_review_required",
 	"corrupt_patch",
 	"conflict",
+	"integration_state_unknown",
 ]);
 
 export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
@@ -406,6 +407,7 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"manifest_review_required",
 	"corrupt_patch",
 	"conflict",
+	"integration_state_unknown",
 	"empty_diff",
 	"path_escapes_project_root",
 	"git_internals_touched",
@@ -489,6 +491,11 @@ const LOCK_DIAGNOSTIC_CODES = Object.freeze({
 
 /** Complete closed output set of classifyPreProviderFailure. */
 export const PRE_PROVIDER_FAILURE_TRIPLES = Object.freeze([
+	Object.freeze({
+		diagnosticCode: "integration_state_unknown",
+		errorKind: "integration_failed",
+		failurePhase: "checkpoint_validation",
+	}),
 	Object.freeze({
 		diagnosticCode: "task_selection_failed",
 		errorKind: "task_selection_failed",
@@ -577,6 +584,11 @@ export function classifyPreProviderFailure(error) {
 	let diagnosticCode = null;
 	if (error.name === "TaskSelectionError") {
 		diagnosticCode = "task_selection_failed";
+	} else if (
+		error.name === "IntegrationStateUnknownError" &&
+		error.code === "INTEGRATION_STATE_UNKNOWN"
+	) {
+		diagnosticCode = "integration_state_unknown";
 	} else if (error.name === "QueuePreflightError") {
 		diagnosticCode = "environment_incomplete";
 	} else if (CHECKPOINT_DIAGNOSTIC_CODES.has(error.code)) {
@@ -838,6 +850,11 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reason:
 			"The patch could not be applied due to conflicting workspace state.",
 	}),
+	integration_state_unknown: Object.freeze({
+		reasonCode: "integration_state_unknown",
+		reason:
+			"Durable integration evidence cannot prove whether the patch was applied.",
+	}),
 	empty_diff: Object.freeze({
 		reasonCode: "empty_diff",
 		reason: "The task produced no diff for the integration gate to review.",
@@ -926,6 +943,7 @@ const RESULT_TO_ERROR_KIND = Object.freeze({
 	manifest_review_required: "manifest_review_required",
 	corrupt_patch: "corrupt_patch",
 	conflict: "conflict",
+	integration_state_unknown: "integration_state_unknown",
 	empty_diff: "empty_diff",
 	path_escapes_project_root: "path_escapes_project_root",
 	git_internals_touched: "git_internals_touched",

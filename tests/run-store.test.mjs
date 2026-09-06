@@ -4,6 +4,7 @@ import {
 	ok,
 	rejects,
 	strictEqual,
+	throws,
 } from "node:assert";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -38,6 +39,7 @@ import {
 	applyRetention,
 	assertProjectLockOwnership,
 	createEvent,
+	createFencingIdentity,
 	getRunRoot,
 	getStateRoot,
 	getVmAdmissionRoot,
@@ -296,6 +298,18 @@ describe("initializeRun", () => {
 });
 
 describe("revision", () => {
+	it("creates a validated fencing identity with a caller-owned nonce", () => {
+		deepStrictEqual(createFencingIdentity("fenced-run", "start-1", "nonce-1"), {
+			runId: "fenced-run",
+			processStartIdentity: "start-1",
+			nonce: "nonce-1",
+		});
+		throws(
+			() => createFencingIdentity("../unsafe", "start", "nonce"),
+			SchemaError,
+		);
+	});
+
 	it("throws RevisionError when expectedRevision does not match", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);

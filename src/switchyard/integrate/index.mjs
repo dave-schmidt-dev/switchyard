@@ -383,13 +383,10 @@ function applyCheckPasses(args, diff, projectPath) {
  *
  * The mutating apply runs exactly once, and only after a non-mutating
  * `git apply --check` confirms the diff still applies to the current tree.
- * When the forward check fails, a `git apply --reverse --check` probe
- * decides whether the diff is already present: if the reverse probe
- * succeeds, the diff was applied previously and the result is a successful
- * no-op (`{alreadyApplied: true}`) — the mutating apply is NOT run. When
- * both probes fail, the diff genuinely conflicts (the tree matches neither
- * the diff's before state nor its after state) and the caller reports
- * failure with the existing result shape.
+ * Idempotent success requires a gate-produced completed proof bound to the
+ * operation and an exact match with the current scoped after-state. A failed
+ * forward check without that proof is conflict or unknown state; a reverse
+ * apply probe never establishes success.
  * @param {string} diff The git diff to apply
  * @param {string} projectPath Target project path
  * @returns {boolean|{alreadyApplied: boolean}|{applied: false, reason: string}}
@@ -397,12 +394,88 @@ function applyCheckPasses(args, diff, projectPath) {
  *   in the tree; `{applied: false, reason}` carrying git's diagnostic (or the
  *   spawn error) when the diff could not be applied.
  */
-function applyReviewedDiff(diff, projectPath) {
+function proofEqual(left, right) {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function scopedStateHash(projectPath, touchedPaths) {
+	return createHash("sha256")
+		.update(getScopedFingerprint(projectPath, touchedPaths), "utf8")
+		.digest("hex");
+}
+
+function applyReviewedDiff(diff, projectPath, intent, touchedPaths) {
+	let lease = null;
+	let released = false;
+	const finish = (result) => {
+		if (!intent || !lease || released) return result;
+		released = true;
+		try {
+			intent.release(lease);
+			return result;
+		} catch (error) {
+			return {
+				applied: false,
+				reason: `integration_state_unknown: ${error.message}`,
+				reasonKind: "integration_state_unknown",
+			};
+		}
+	};
 	try {
+		if (intent) {
+			lease = intent.acquire(intent.operation);
+			if (!lease)
+				return finish({
+					applied: false,
+					reason: "integration lease unavailable",
+					reasonKind: "integration_state_unknown",
+				});
+			const currentProof = intent.read(intent.operation, lease);
+			if (currentProof) {
+				if (!proofEqual(currentProof.operation, intent.operation))
+					return finish({
+						applied: false,
+						reason: "integration intent displaced",
+						reasonKind: "integration_state_unknown",
+					});
+				if (currentProof.status !== "completed")
+					return finish({
+						applied: false,
+						reason: "integration_state_unknown",
+						reasonKind: "integration_state_unknown",
+					});
+				if (
+					currentProof.afterState !== scopedStateHash(projectPath, touchedPaths)
+				)
+					return finish({
+						applied: false,
+						reason: "completed integration state changed",
+						reasonKind: "integration_state_unknown",
+					});
+				return finish({ alreadyApplied: true });
+			}
+		}
 		// Non-mutating forward check: nothing touches the host until git
 		// confirms the diff applies cleanly to the current tree.
 		const forward = applyCheckPasses(["--check"], diff, projectPath);
 		if (forward.ok) {
+			if (intent) {
+				const pending = {
+					operation: structuredClone(intent.operation),
+					status: "pending",
+					beforeState: scopedStateHash(projectPath, touchedPaths),
+				};
+				if (
+					!proofEqual(intent.persist(pending, lease), pending) ||
+					!proofEqual(intent.read(intent.operation, lease), pending)
+				) {
+					return finish({
+						applied: false,
+						reason: "integration intent could not be durably persisted",
+						reasonKind: "integration_state_unknown",
+					});
+				}
+			}
 			// Mutating apply runs exactly once, and only after the forward
 			// check passed. stdio is captured (not inherited) so git's own
 			// diagnostic on an unexpected failure is returned as `reason`
@@ -413,53 +486,61 @@ function applyReviewedDiff(diff, projectPath) {
 				encoding: "utf8",
 				stdio: ["pipe", "pipe", "pipe"],
 			});
-			if (result.status === 0) return true;
+			if (result.status === 0) {
+				if (intent) {
+					const existing = intent.read(intent.operation, lease);
+					const completed = {
+						...existing,
+						status: "completed",
+						afterState: scopedStateHash(projectPath, touchedPaths),
+					};
+					if (
+						!proofEqual(intent.complete(completed, lease), completed) ||
+						!proofEqual(intent.read(intent.operation, lease), completed)
+					) {
+						return finish({
+							applied: false,
+							reason: "integration_state_unknown",
+							reasonKind: "integration_state_unknown",
+						});
+					}
+				}
+				return finish(true);
+			}
 			const stderr =
 				typeof result.stderr === "string" ? result.stderr.trim() : "";
-			return {
+			return finish({
 				applied: false,
 				reason:
 					stderr ||
 					(result.error
 						? `git apply failed to spawn: ${result.error.message}`
 						: `git apply exited with status ${result.status}`),
-			};
+			});
 		}
 
-		// Forward check failed. Only now probe for "already applied": a
-		// reverse apply succeeds exactly when the diff's changes are already
-		// present in the tree. This is a successful no-op for the host.
-		const reverse = applyCheckPasses(
-			["--reverse", "--check"],
-			diff,
-			projectPath,
-		);
-		if (reverse.ok) {
-			return { alreadyApplied: true };
-		}
-
-		// Both checks failed. Usually this means a genuine conflict — the tree
-		// matches neither the diff's before state nor its after state — but
-		// git reports a truncated/malformed diff (never a valid patch to begin
-		// with) through this same pair of failed --check probes, so surface
-		// which one it was: classifyApplyFailure() only ever reports
+		// A matching after-state cannot prove this operation applied: unrelated
+		// edits can produce the same bytes. Only an exact, durable completion
+		// record bound to this operation may make a retry idempotent.
+		// A failed forward check usually means a genuine conflict, but git also
+		// reports a truncated or malformed diff through this path. Surface which
+		// one it was: classifyApplyFailure() only ever reports
 		// "corrupt_patch" on git's own "corrupt patch"/"unrecognized input"
 		// diagnostic text, not on any other failure. Surface git's own
 		// `--check` diagnostic (e.g. "error: ... patch does not apply") as
 		// `reason` so the caller gets actionable text, not just a bare
 		// "Diff apply failed".
-		const combinedStderr = `${forward.stderr}\n${reverse.stderr}`;
-		return {
+		return finish({
 			applied: false,
-			reason:
-				forward.stderr.trim() ||
-				reverse.stderr.trim() ||
-				"git apply --check rejected the diff",
-			reasonKind: classifyApplyFailure(combinedStderr),
-		};
+			reason: forward.stderr.trim() || "git apply --check rejected the diff",
+			reasonKind: classifyApplyFailure(forward.stderr),
+		});
 	} catch (error) {
-		console.error("Failed to apply reviewed diff:", error.message);
-		return { applied: false, reason: error.message };
+		return finish({
+			applied: false,
+			reason: error.message,
+			reasonKind: intent ? "integration_state_unknown" : undefined,
+		});
 	}
 }
 
@@ -637,7 +718,44 @@ export function integrationGate(diff, projectPath, options = {}) {
 		preFingerprint = getScopedFingerprint(projectPath, validation.touchedPaths);
 	}
 
-	const applyResult = applyReviewedDiff(patch, projectPath);
+	let intent = null;
+	if (options.integrationIntent !== undefined) {
+		const candidate = options.integrationIntent;
+		if (
+			!candidate ||
+			typeof candidate !== "object" ||
+			typeof candidate.acquire !== "function" ||
+			typeof candidate.release !== "function" ||
+			typeof candidate.persist !== "function" ||
+			typeof candidate.complete !== "function" ||
+			typeof candidate.read !== "function" ||
+			!candidate.operation ||
+			typeof candidate.operation.patchHash !== "string" ||
+			candidate.operation.patchHash !==
+				createHash("sha256").update(patch, "utf8").digest("hex") ||
+			JSON.stringify(candidate.operation.paths) !==
+				JSON.stringify(requiredPaths ?? [])
+		) {
+			return { success: false, message: "invalid_integration_intent" };
+		}
+		intent = candidate;
+	}
+
+	let applyResult;
+	try {
+		applyResult = applyReviewedDiff(
+			patch,
+			projectPath,
+			intent,
+			validation.touchedPaths,
+		);
+	} catch (error) {
+		applyResult = {
+			applied: false,
+			reason: error.message,
+			reasonKind: "integration_state_unknown",
+		};
+	}
 	if (applyResult === true) {
 		if (requiredPaths === null) {
 			const postFingerprint = getScopedFingerprint(

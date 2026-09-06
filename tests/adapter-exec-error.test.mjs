@@ -56,6 +56,22 @@ describe("closed pre-provider failure triples", () => {
 		strictEqual(classifyPreProviderFailure(arbitrary), null);
 	});
 
+	it("classifies only the typed unknown-integration checkpoint failure", () => {
+		const typed = Object.assign(new Error("arbitrary hidden detail"), {
+			name: "IntegrationStateUnknownError",
+			code: "INTEGRATION_STATE_UNKNOWN",
+		});
+		deepStrictEqual(classifyPreProviderFailure(typed), {
+			diagnosticCode: "integration_state_unknown",
+			errorKind: "integration_failed",
+			failurePhase: "checkpoint_validation",
+		});
+		strictEqual(
+			classifyPreProviderFailure(new Error("integration_state_unknown")),
+			null,
+		);
+	});
+
 	it("keeps admission denials, storage failures, and generic failures distinct", () => {
 		for (const [name, code, diagnosticCode] of [
 			[
@@ -799,6 +815,7 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 	});
 
 	it("keeps every integration refusal kind persistable and resolvable to a named reason", () => {
+		ok(INTEGRATION_REFUSAL_KINDS.includes("integration_state_unknown"));
 		for (const kind of INTEGRATION_REFUSAL_KINDS) {
 			ok(
 				PERSISTED_DIAGNOSTIC_CODES.includes(kind),
