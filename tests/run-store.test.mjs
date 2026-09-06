@@ -40,6 +40,7 @@ import {
 	assertProjectLockOwnership,
 	createEvent,
 	createFencingIdentity,
+	createRouteHealthEvent,
 	getRunRoot,
 	getStateRoot,
 	getVmAdmissionRoot,
@@ -49,6 +50,7 @@ import {
 	isRunLockExpired,
 	LockError,
 	RevisionError,
+	readAuthorizedRunEvents,
 	readEvents,
 	readRun,
 	reconcileProjectLockClaims,
@@ -367,6 +369,67 @@ describe("revision", () => {
 });
 
 describe("event ordering", () => {
+	it("persists a closed host route-health binding and reads it from an authorised run root", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const binding = {
+			adapterContractId: "switchyard-route-health-v1",
+			publicConfigurationEpoch: `sha256:${"a".repeat(64)}`,
+			repairEpoch: 0,
+		};
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "codex",
+				model_ref: "fixture/codex-standard",
+				selector: "fixture-codex-standard",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"codex",
+		);
+		await createRouteHealthEvent(
+			opts.runId,
+			{
+				phase: "execution",
+				event: "task_completed",
+				status: "succeeded",
+				taskId: "task-1",
+				attempt: 1,
+				resolvedTargetId: "codex",
+				invocationDescriptor: descriptor,
+				descriptorIdentity: descriptor.descriptor_identity,
+				descriptorHarness: "codex",
+				servedModelVerified: true,
+			},
+			binding,
+		);
+		const events = await readAuthorizedRunEvents(getRunRoot(opts.runId));
+		deepStrictEqual(events[0].routeHealthBinding, {
+			...binding,
+			version: 1,
+			producer: "run-store",
+			runId: opts.runId,
+			runRevision: 1,
+		});
+		await rejects(
+			createEvent(opts.runId, {
+				phase: "execution",
+				event: "task_completed",
+				status: "succeeded",
+				routeHealthBinding: binding,
+			}),
+			/host producer/,
+		);
+		const eventsPath = resolve(getRunRoot(opts.runId), "events.jsonl");
+		const forged = JSON.parse(readFileSync(eventsPath, "utf8"));
+		forged.invocationDescriptor.selector = "forged-selector";
+		writeFileSync(eventsPath, `${JSON.stringify(forged)}\n`, { mode: 0o600 });
+		await rejects(
+			readAuthorizedRunEvents(getRunRoot(opts.runId)),
+			/authorised route health event is invalid/,
+		);
+	});
 	it("assigns monotonically increasing sequence numbers", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);

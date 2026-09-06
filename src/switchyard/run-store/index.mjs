@@ -13,6 +13,7 @@ import {
 import {
 	appendFile,
 	link,
+	lstat,
 	mkdir,
 	readdir,
 	readFile,
@@ -23,7 +24,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	isPersistentFailureMetadata,
@@ -175,7 +176,49 @@ const APPROVED_EVENT_KEYS = new Set([
 	// Boolean only: whether the adapter affirmatively read back the model the
 	// provider served. Absent when the adapter cannot report one.
 	"servedModelVerified",
+	// Route health binding is written only through createRouteHealthEvent().
+	// It binds an otherwise ordinary, sanitized host event to an explicit public
+	// configuration and host repair epoch.  Legacy events remain readable but
+	// deliberately have no route-health authority.
+	"routeHealthBinding",
 ]);
+
+const ROUTE_HEALTH_BINDING_KEYS = new Set([
+	"version",
+	"producer",
+	"runId",
+	"runRevision",
+	"adapterContractId",
+	"publicConfigurationEpoch",
+	"repairEpoch",
+	"claimRevision",
+]);
+const ROUTE_HEALTH_EPOCH_RE = /^sha256:[a-f0-9]{64}$/;
+
+function validateRouteHealthBinding(binding) {
+	if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
+		throw new SchemaError("route health binding is invalid");
+	}
+	if (
+		Object.keys(binding).some((key) => !ROUTE_HEALTH_BINDING_KEYS.has(key)) ||
+		binding.version !== 1 ||
+		binding.producer !== "run-store" ||
+		typeof binding.runId !== "string" ||
+		!Number.isSafeInteger(binding.runRevision) ||
+		binding.runRevision < 1 ||
+		typeof binding.adapterContractId !== "string" ||
+		binding.adapterContractId.length === 0 ||
+		binding.adapterContractId.length > 128 ||
+		!ROUTE_HEALTH_EPOCH_RE.test(binding.publicConfigurationEpoch) ||
+		!Number.isSafeInteger(binding.repairEpoch) ||
+		binding.repairEpoch < 0 ||
+		(binding.claimRevision !== undefined &&
+			(!Number.isSafeInteger(binding.claimRevision) ||
+				binding.claimRevision < 1))
+	) {
+		throw new SchemaError("route health binding is invalid");
+	}
+}
 
 export function isSafeTargetId(value) {
 	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
@@ -1509,8 +1552,17 @@ export async function advanceState(runId, newState) {
  * @param {string} event.status
  * @returns {Promise<number>} the assigned sequence number
  */
-export async function createEvent(runId, event) {
+async function createEventInternal(
+	runId,
+	event,
+	{ routeHealthAuthorised = false } = {},
+) {
 	validateRunId(runId);
+	if (event?.routeHealthBinding !== undefined) {
+		if (!routeHealthAuthorised)
+			throw new SchemaError("route health binding requires the host producer");
+		validateRouteHealthBinding(event.routeHealthBinding);
+	}
 	if (
 		event?.invocationDescriptor !== undefined &&
 		event.invocationDescriptor !== null &&
@@ -1568,6 +1620,13 @@ export async function createEvent(runId, event) {
 	const eventsPath = resolve(runDir, "events.jsonl");
 
 	let current = await readRun(runId);
+	if (
+		event?.routeHealthBinding &&
+		(event.routeHealthBinding.runId !== current.runId ||
+			event.routeHealthBinding.runRevision !== current.revision)
+	) {
+		throw new SchemaError("route health binding does not match run projection");
+	}
 	const nextSeq = current.lastEventSequence + 1;
 	const isFailureEvent =
 		event?.event === "task_failed" ||
@@ -1721,6 +1780,53 @@ export async function createEvent(runId, event) {
 	}
 
 	return nextSeq;
+}
+
+/** Persist a normal sanitized run event. */
+export async function createEvent(runId, event) {
+	return createEventInternal(runId, event);
+}
+
+/**
+ * Write a sanitized execution event bound by the host to a route-health
+ * generation.  Callers cannot retrofit this binding onto retained legacy
+ * events during projection rebuilds.
+ */
+export async function createRouteHealthEvent(runId, event, binding) {
+	validateRunId(runId);
+	if (
+		event?.phase !== "execution" ||
+		!["task_completed", "task_failed"].includes(event?.event) ||
+		typeof event?.taskId !== "string" ||
+		(!Number.isSafeInteger(event?.attempt) &&
+			typeof event?.attempt !== "string") ||
+		!event?.invocationDescriptor ||
+		!event?.descriptorIdentity ||
+		!event?.descriptorHarness ||
+		!event?.resolvedTargetId
+	) {
+		throw new SchemaError(
+			"route health event requires exact execution evidence",
+		);
+	}
+	const current = await readRun(runId);
+	if (!current.orderedTaskIds.includes(event.taskId))
+		throw new SchemaError(
+			"route health event task is outside the run contract",
+		);
+	const hostBinding = {
+		...binding,
+		version: 1,
+		producer: "run-store",
+		runId,
+		runRevision: current.revision,
+	};
+	validateRouteHealthBinding(hostBinding);
+	return createEventInternal(
+		runId,
+		{ ...event, routeHealthBinding: hostBinding },
+		{ routeHealthAuthorised: true },
+	);
 }
 
 /**
@@ -3230,6 +3336,131 @@ export async function readEvents(runId) {
 		if (e.code === "ENOENT") return [];
 		throw e;
 	}
+}
+
+/**
+ * Read retained events from an explicitly authorised run directory.  This is
+ * intentionally not a discovery API: the caller supplies each root and the
+ * filesystem object must be a bounded, owner-only, non-symlinked directory
+ * and event file.  Invalid or legacy event shapes are rejected rather than
+ * becoming durable health evidence.
+ */
+export async function readAuthorizedRunEvidence(runRoot) {
+	if (typeof runRoot !== "string" || !isAbsolute(runRoot)) {
+		throw new SchemaError("authorised run root must be absolute");
+	}
+	const root = resolve(runRoot);
+	let rootStat;
+	try {
+		rootStat = await lstat(root);
+	} catch (error) {
+		throw new SchemaError(
+			error?.code === "ENOENT"
+				? "authorised run root missing"
+				: "authorised run root unreadable",
+		);
+	}
+	if (
+		!rootStat.isDirectory() ||
+		rootStat.isSymbolicLink() ||
+		rootStat.uid !== process.getuid() ||
+		(rootStat.mode & 0o077) !== 0
+	) {
+		throw new SchemaError("authorised run root is not owner-only");
+	}
+	const eventsPath = resolve(root, "events.jsonl");
+	const runPath = resolve(root, "run.json");
+	let runStat;
+	try {
+		runStat = await lstat(runPath);
+	} catch {
+		throw new SchemaError("authorised run projection missing");
+	}
+	if (
+		!runStat.isFile() ||
+		runStat.isSymbolicLink() ||
+		runStat.uid !== process.getuid() ||
+		(runStat.mode & 0o077) !== 0 ||
+		runStat.size > 1024 * 1024
+	) {
+		throw new SchemaError("authorised run projection is not owner-only");
+	}
+	let run;
+	try {
+		run = JSON.parse(await readFile(runPath, "utf8"));
+		validateRun(run);
+	} catch {
+		throw new SchemaError("authorised run projection is invalid");
+	}
+	let eventStat;
+	try {
+		eventStat = await lstat(eventsPath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return { run, events: [] };
+		throw new SchemaError("authorised events are unreadable");
+	}
+	if (
+		!eventStat.isFile() ||
+		eventStat.isSymbolicLink() ||
+		eventStat.uid !== process.getuid() ||
+		(eventStat.mode & 0o077) !== 0 ||
+		eventStat.size > 4 * 1024 * 1024
+	) {
+		throw new SchemaError("authorised events are not owner-only");
+	}
+	const raw = await readFile(eventsPath, "utf8");
+	const lines = raw.split("\n").filter(Boolean);
+	if (lines.length > 10_000)
+		throw new SchemaError("authorised events exceed limit");
+	let sequence = 0;
+	const events = lines.map((line) => {
+		if (line.length > 32 * 1024)
+			throw new SchemaError("authorised event exceeds limit");
+		let event;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			throw new SchemaError("authorised event contains invalid JSON");
+		}
+		if (
+			!event ||
+			typeof event !== "object" ||
+			Array.isArray(event) ||
+			Object.keys(event).some((key) => !APPROVED_EVENT_KEYS.has(key)) ||
+			!Number.isSafeInteger(event.sequence) ||
+			event.sequence <= sequence
+		) {
+			throw new SchemaError("authorised event schema is invalid");
+		}
+		sequence = event.sequence;
+		if (event.routeHealthBinding !== undefined)
+			validateRouteHealthBinding(event.routeHealthBinding);
+		if (
+			event.routeHealthBinding !== undefined &&
+			(event.routeHealthBinding.runId !== run.runId ||
+				event.routeHealthBinding.runRevision > run.revision ||
+				event.phase !== "execution" ||
+				!["task_completed", "task_failed"].includes(event.event) ||
+				!run.orderedTaskIds.includes(event.taskId) ||
+				!event.invocationDescriptor ||
+				!isSafeDescriptorReceipt(
+					event.invocationDescriptor,
+					event.descriptorHarness,
+				) ||
+				event.invocationDescriptor.descriptor_identity !==
+					event.descriptorIdentity ||
+				event.invocationDescriptor.target_id !== event.resolvedTargetId)
+		)
+			throw new SchemaError("authorised route health event is invalid");
+		return event;
+	});
+	if (sequence > run.lastEventSequence)
+		throw new SchemaError("authorised event sequence exceeds run projection");
+	return { run, events };
+}
+
+export async function readAuthorizedRunEvents(runRoot) {
+	return (await readAuthorizedRunEvidence(runRoot)).events;
 }
 
 export {
