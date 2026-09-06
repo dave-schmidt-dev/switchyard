@@ -8,8 +8,6 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 
@@ -17,10 +15,25 @@ import {
 	buildParallelsWorkingName,
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
+const TEST_BOOT_UUID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+function fixtureBirth(pid) {
+	return `switchyard-host-process-v1:${TEST_BOOT_UUID}:${pid}:${pid * 10 + 1}`;
+}
+
+function absentHostProbe(pid) {
+	return {
+		state: "absent",
+		pid,
+		bootSessionUuid: TEST_BOOT_UUID,
+		identity: null,
+	};
+}
 
 function commandAvailable(command) {
 	try {
@@ -176,9 +189,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			},
 		];
 		const calls = [];
-		const resourceRoot = mkdtempSync(
-			join(tmpdir(), "switchyard-inv3-ownership-"),
-		);
+		const resourceRoot = tempDir("switchyard-inv3-ownership-");
 		const previousRunStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = resourceRoot;
 		const backend = new ParallelsExecutionBackend({
@@ -188,6 +199,16 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				return "ok";
 			},
 			pidIsAlive: (pid) => pid === livePid,
+			hostProcessIdentityProbe: (pid) =>
+				pid === livePid
+					? {
+							state: "present",
+							pid,
+							bootSessionUuid: TEST_BOOT_UUID,
+							startTicks: String(pid * 10 + 1),
+							identity: fixtureBirth(pid),
+						}
+					: absentHostProbe(pid),
 		});
 
 		const ownershipContext = {
@@ -198,7 +219,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			projectRoot: resolve("/private/tmp"),
 			purpose: "workspace-wipe-test",
 			creatorPid: deadPid,
-			processStartIdentity: "fixture:dead",
+			processStartIdentity: fixtureBirth(deadPid),
 		};
 		backend.writeVmOwnership(
 			deadRunningUuid,
@@ -223,7 +244,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		);
 		const result = backend.reclaim({
 			eligibility: (entry) =>
-				entry.ownership.processStartIdentity === "fixture:dead",
+				entry.ownership.processStartIdentity === fixtureBirth(deadPid),
 		});
 		deepStrictEqual(
 			result.reclaimed.map((entry) => entry.uuid),
@@ -236,7 +257,6 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		ok(calls.some((args) => args[0] === "stop" && args[1] === deadRunningUuid));
 		ok(!calls.some((args) => args[1] === "foreign"));
 		ok(!calls.some((args) => args[1] === "malformed"));
-		rmSync(resourceRoot, { recursive: true, force: true });
 		if (previousRunStoreRoot === undefined)
 			delete process.env.SWITCHYARD_RUN_STORE_ROOT;
 		else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRunStoreRoot;
@@ -254,9 +274,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				return "ok";
 			},
 		});
-		const resourceRoot = mkdtempSync(
-			join(tmpdir(), "switchyard-normal-destroy-"),
-		);
+		const resourceRoot = tempDir("switchyard-normal-destroy-");
 		backend.writeVmOwnership("normal", name, {
 			resourceRoot,
 			runId: "normal",
@@ -265,7 +283,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			projectRoot: resolve("/private/tmp"),
 			purpose: "workspace-wipe-test",
 			creatorPid: 424244,
-			processStartIdentity: "fixture:normal",
+			processStartIdentity: fixtureBirth(424244),
 		});
 
 		deepStrictEqual(backend.destroy(name), {
@@ -278,7 +296,6 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			["stop", "normal"],
 			["delete", "normal"],
 		]);
-		rmSync(resourceRoot, { recursive: true, force: true });
 	});
 
 	it("creates and normally destroys a real VM when all prerequisites are available", {
@@ -296,7 +313,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		let backend;
 		let vmUuid;
 		let destroyed = false;
-		const resourceRoot = mkdtempSync(join(tmpdir(), "switchyard-inv3-live-"));
+		const resourceRoot = tempDir("switchyard-inv3-live-");
 		const runId = `inv3-${process.pid}-${randomUUID()}`;
 
 		try {
@@ -346,7 +363,7 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 					taskId: "inv-3-vm-gate",
 					attemptId: "fixture-1",
 					projectRoot: resolve("/private/tmp"),
-					processStartIdentity: `fixture:${process.pid}`,
+					processStartIdentity: null,
 				},
 			});
 			const result = backend.destroy(vmUuid);
@@ -374,7 +391,6 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				if (typeof slotLease.release === "function") await slotLease.release();
 				else await slotPrimitive.release(slotLease);
 			}
-			rmSync(resourceRoot, { recursive: true, force: true });
 		}
 	});
 });

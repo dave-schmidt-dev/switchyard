@@ -1,8 +1,8 @@
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, match, ok, strictEqual, throws } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import {
 	AGY_LOGIN_COMMAND,
@@ -22,6 +22,18 @@ import {
 	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+
+const TEST_BOOT_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+function fixtureHostProbe(pid) {
+	const startTicks = String(pid * 10 + 1);
+	return {
+		state: "present",
+		pid,
+		bootSessionUuid: TEST_BOOT_UUID,
+		startTicks,
+		identity: `switchyard-host-process-v1:${TEST_BOOT_UUID}:${pid}:${startTicks}`,
+	};
+}
 
 const AUTH_TEST_RUN_STORE_ROOT = join(
 	tmpdir(),
@@ -573,29 +585,32 @@ describe("liveness gating", () => {
 });
 
 describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposableClone)", () => {
-	it("refuses auth allocation when the registered run-store root is absent", () => {
+	it("uses the installed project run-store root when no override is set", () => {
 		const original = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
-		let creates = 0;
+		let ownership;
 		try {
-			throws(
-				() =>
-					withDisposableClone(
-						{
-							goldenImage: "golden",
-							aquaUid: "501",
-							create: () => {
-								creates += 1;
-							},
-						},
-						() => {},
-					),
-				/RUN_STORE_ROOT/,
+			withDisposableClone(
+				{
+					goldenImage: "golden",
+					aquaUid: "501",
+					create: (_image, options) => {
+						ownership = options.ownershipContext;
+						return "auth-default-clone";
+					},
+					destroy: () => {},
+				},
+				() => {},
 			);
 		} finally {
-			process.env.SWITCHYARD_RUN_STORE_ROOT = original;
+			if (original === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = original;
 		}
-		strictEqual(creates, 0);
+		match(
+			ownership.resourceRoot,
+			/\/\.logs\/switchyard\/runs\/auth-qualification-[^/]+\/resources$/,
+		);
+		strictEqual(ownership.projectRoot, resolve("."));
 	});
 
 	it("propagates auth ownership through the real backend allocation path", () => {
@@ -609,6 +624,7 @@ describe("clone qualification (qualifyCloneAuth / runCloneCheck / withDisposable
 			goldenImage: "golden",
 			aquaUid: 501,
 			requireLinkedCloneMeasurement: false,
+			hostProcessIdentityProbe: fixtureHostProbe,
 			prlctlFn: (args) => {
 				if (args[0] === "clone") cloneName = args[3];
 				if (args[0] === "list") {

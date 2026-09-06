@@ -88,8 +88,101 @@ const TASK_BASE = {
 	ref: "refs/switchyard/task-base/runner-tests/1.1",
 	tree: "3".repeat(40),
 };
+const HOST_BOOT_UUID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+function hostBirth(pid) {
+	return `switchyard-host-process-v1:${HOST_BOOT_UUID}:${pid}:${pid * 10 + 1}`;
+}
+
+function presentHostProbe(pid) {
+	return {
+		state: "present",
+		pid,
+		bootSessionUuid: HOST_BOOT_UUID,
+		startTicks: String(pid * 10 + 1),
+		identity: hostBirth(pid),
+	};
+}
 
 describe("macOS queue admission", () => {
+	it("captures canonical creator identity before the shared default allocation path", () => {
+		const stateRoot = join(TEST_DIR, "host-birth-default");
+		mkdirSync(stateRoot, { recursive: true });
+		const previous = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+		let cloneName;
+		const calls = [];
+		const executionBackend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			requireLinkedCloneMeasurement: false,
+			hostProcessIdentityProbe: presentHostProbe,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "clone") cloneName = args[3];
+				if (args[0] === "list") {
+					return cloneName
+						? `{22222222-2222-4222-8222-222222222222}\trunning\t${cloneName}`
+						: "";
+				}
+				return "";
+			},
+		});
+		executionBackend.boot = () => {};
+		executionBackend._hardenClone = () => {};
+		executionBackend._prepareWorkspace = () => {};
+		try {
+			const queue = createQueueBackend({
+				projectPath: "/private/tmp/fixture-project",
+				runId: "fixture-birth-run",
+				dependencies: {
+					goldenImage: "fixture-golden",
+					aquaUid: "501",
+					executionBackend,
+				},
+			});
+			const uuid = queue.create("/private/tmp/fixture-project");
+			const ownership = executionBackend.readVmOwnership(
+				uuid,
+				join(stateRoot, "runs", "fixture-birth-run", "resources"),
+			);
+			strictEqual(ownership.processStartIdentity, hostBirth(process.pid));
+			ok(calls.some((args) => args[0] === "clone"));
+		} finally {
+			if (previous === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = previous;
+		}
+	});
+
+	it("refuses the default allocation before any VM call when birth is unavailable", () => {
+		const previous = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_DIR, "host-birth-denied");
+		let vmCalls = 0;
+		try {
+			const queue = createQueueBackend({
+				projectPath: "/private/tmp/fixture-project",
+				runId: "fixture-birth-denied",
+				dependencies: {
+					goldenImage: "fixture-golden",
+					aquaUid: "501",
+					executionBackend: new ParallelsExecutionBackend({
+						hostProcessIdentityProbe: () => ({ state: "unknown" }),
+						prlctlFn: () => {
+							vmCalls += 1;
+							return "";
+						},
+					}),
+				},
+			});
+			throws(
+				() => queue.create("/private/tmp/fixture-project"),
+				/birth identity unavailable/,
+			);
+			strictEqual(vmCalls, 0);
+		} finally {
+			if (previous === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = previous;
+		}
+	});
 	it("refuses a real VM allocation without the authoritative run-store root", () => {
 		let creates = 0;
 		const backend = createQueueBackend({

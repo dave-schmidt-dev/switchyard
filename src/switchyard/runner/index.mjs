@@ -6733,6 +6733,11 @@ export function createQueueBackend({
 			// so a later process can reclaim them after this one dies.
 			snapshotSidecarRoot: getVmAdmissionRoot(),
 			runId: dependencies.runId ?? process.env.SWITCHYARD_RUN_ID ?? null,
+			...(dependencies.hostProcessIdentityProbe
+				? {
+						hostProcessIdentityProbe: dependencies.hostProcessIdentityProbe,
+					}
+				: {}),
 		});
 
 	const goldenImage =

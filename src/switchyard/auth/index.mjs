@@ -65,16 +65,13 @@ const AUTH_PROJECT_ROOT = resolve(
 	"..",
 	"..",
 );
+const AUTH_RUN_STORE_ROOT = join(AUTH_PROJECT_ROOT, ".logs", "switchyard");
 
 function authOwnershipContext(options, runId) {
 	const supplied = options.ownershipContext;
 	if (supplied) return { ...supplied, runId, purpose: "auth-qualification" };
-	const runStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
-	if (!runStoreRoot) {
-		throw new Error(
-			"auth qualification requires SWITCHYARD_RUN_STORE_ROOT for VM ownership metadata",
-		);
-	}
+	const runStoreRoot =
+		process.env.SWITCHYARD_RUN_STORE_ROOT || AUTH_RUN_STORE_ROOT;
 	return {
 		resourceRoot: join(resolve(runStoreRoot), "runs", runId, "resources"),
 		runId,
@@ -208,7 +205,15 @@ export function withDisposableClone(executionBackend, fn, options = {}) {
 	);
 	let workspaceId;
 	const runId = `auth-qualification-${randomUUID()}`;
-	const ownershipContext = authOwnershipContext(options, runId);
+	let ownershipContext = authOwnershipContext(options, runId);
+	if (typeof executionBackend.captureCreatorOwnership === "function") {
+		ownershipContext = executionBackend.captureCreatorOwnership({
+			...options,
+			runId,
+			creatorPid: ownershipContext.creatorPid,
+			ownershipContext,
+		});
+	}
 	try {
 		workspaceId = executionBackend.create(executionBackend.goldenImage, {
 			...options,

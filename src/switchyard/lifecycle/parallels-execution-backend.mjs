@@ -24,6 +24,167 @@ import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
+const HOST_PROCESS_IDENTITY_VERSION = "switchyard-host-process-v1";
+const HOST_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
+const HOST_PROCESS_IDENTITY_MAX_BUFFER = 4_096;
+const CANONICAL_UUID =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const HOST_PROCESS_IDENTITY = new RegExp(
+	`^${HOST_PROCESS_IDENTITY_VERSION}:([0-9a-f-]{36}):([1-9]\\d*):([1-9]\\d*)$`,
+	"iu",
+);
+const HOST_PROCESS_PROBE_SOURCE = `
+import ctypes, errno, json, sys, uuid
+VERSION = "switchyard-host-process-v1"
+LIBPROC = "/usr/lib/libproc.dylib"
+LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
+class RusageInfoV0(ctypes.Structure):
+    _fields_ = [("ri_uuid", ctypes.c_ubyte * 16)] + [("u%d" % i, ctypes.c_uint64) for i in range(10)]
+if ctypes.sizeof(RusageInfoV0) != 96:
+    raise SystemExit(70)
+if len(sys.argv) != 2 or not sys.argv[1].isdigit() or int(sys.argv[1]) <= 0:
+    raise SystemExit(64)
+pid = int(sys.argv[1])
+libsystem = ctypes.CDLL(LIBSYSTEM, use_errno=True)
+sysctlbyname = libsystem.sysctlbyname
+sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+sysctlbyname.restype = ctypes.c_int
+boot_buffer = ctypes.create_string_buffer(128)
+boot_length = ctypes.c_size_t(len(boot_buffer))
+ctypes.set_errno(0)
+boot_rc = sysctlbyname(b"kern.bootsessionuuid", boot_buffer, ctypes.byref(boot_length), None, 0)
+boot_errno = ctypes.get_errno()
+if boot_rc != 0 or boot_errno != 0:
+    raise SystemExit(71)
+try:
+    boot = str(uuid.UUID(boot_buffer.value.decode("ascii")))
+except Exception:
+    raise SystemExit(72)
+libproc = ctypes.CDLL(LIBPROC, use_errno=True)
+proc_pid_rusage = libproc.proc_pid_rusage
+proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(RusageInfoV0)]
+proc_pid_rusage.restype = ctypes.c_int
+info = RusageInfoV0()
+ctypes.set_errno(0)
+proc_rc = proc_pid_rusage(pid, 0, ctypes.byref(info))
+proc_errno = ctypes.get_errno()
+if proc_rc == 0 and proc_errno == 0:
+    result = {"version": VERSION, "state": "present", "pid": str(pid), "bootSessionUuid": boot, "startTicks": str(info.u8)}
+elif proc_rc == -1 and proc_errno == errno.ESRCH:
+    result = {"version": VERSION, "state": "absent", "pid": str(pid), "bootSessionUuid": boot, "startTicks": None}
+else:
+    raise SystemExit(73)
+sys.stdout.write(json.dumps(result, separators=(",", ":")))
+`;
+
+function parseHostProcessProbe(value, expectedPid) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const fields = ["version", "state", "pid", "bootSessionUuid", "startTicks"];
+	if (
+		Object.keys(value).length !== fields.length ||
+		fields.some((field) => !Object.hasOwn(value, field)) ||
+		value.version !== HOST_PROCESS_IDENTITY_VERSION ||
+		!["present", "absent"].includes(value.state) ||
+		typeof value.pid !== "string" ||
+		!/^[1-9]\d*$/.test(value.pid) ||
+		Number(value.pid) !== expectedPid ||
+		!Number.isSafeInteger(Number(value.pid)) ||
+		typeof value.bootSessionUuid !== "string" ||
+		!CANONICAL_UUID.test(value.bootSessionUuid)
+	)
+		return null;
+	const bootSessionUuid = value.bootSessionUuid.toLowerCase();
+	if (value.state === "absent") {
+		return value.startTicks === null
+			? { state: "absent", pid: expectedPid, bootSessionUuid, identity: null }
+			: null;
+	}
+	if (
+		typeof value.startTicks !== "string" ||
+		!/^[1-9]\d*$/.test(value.startTicks) ||
+		BigInt(value.startTicks) > 18_446_744_073_709_551_615n
+	)
+		return null;
+	return {
+		state: "present",
+		pid: expectedPid,
+		bootSessionUuid,
+		startTicks: value.startTicks,
+		identity: `${HOST_PROCESS_IDENTITY_VERSION}:${bootSessionUuid}:${value.pid}:${value.startTicks}`,
+	};
+}
+
+function parseHostProcessIdentity(value) {
+	if (typeof value !== "string") return null;
+	const match = value.match(HOST_PROCESS_IDENTITY);
+	if (!match || !CANONICAL_UUID.test(match[1])) return null;
+	const pid = Number(match[2]);
+	if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+	try {
+		if (BigInt(match[3]) > 18_446_744_073_709_551_615n) return null;
+	} catch {
+		return null;
+	}
+	return {
+		bootSessionUuid: match[1].toLowerCase(),
+		pid,
+		startTicks: match[3],
+		identity: `${HOST_PROCESS_IDENTITY_VERSION}:${match[1].toLowerCase()}:${match[2]}:${match[3]}`,
+	};
+}
+
+/** Probe one host PID's kernel birth identity through a fixed macOS ABI. */
+export function probeHostProcessIdentity(
+	pid,
+	{ spawnFn = spawnSync, onStatus } = {},
+) {
+	const validatedPid = validatePid(pid);
+	onStatus?.({ type: "host-process-identity", event: "start" });
+	let child;
+	try {
+		child = spawnFn(
+			"/usr/bin/python3",
+			["-I", "-S", "-c", HOST_PROCESS_PROBE_SOURCE, String(validatedPid)],
+			{
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+				timeout: HOST_PROCESS_IDENTITY_TIMEOUT_MS,
+				killSignal: "SIGKILL",
+				maxBuffer: HOST_PROCESS_IDENTITY_MAX_BUFFER,
+				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+			},
+		);
+	} catch {
+		onStatus?.({ type: "host-process-identity", event: "unavailable" });
+		return { state: "unknown" };
+	}
+	if (
+		child?.error ||
+		child?.signal ||
+		child?.status !== 0 ||
+		typeof child?.stdout !== "string" ||
+		Buffer.byteLength(child.stdout, "utf8") > HOST_PROCESS_IDENTITY_MAX_BUFFER
+	) {
+		onStatus?.({ type: "host-process-identity", event: "unavailable" });
+		return { state: "unknown" };
+	}
+	let parsed;
+	try {
+		parsed = parseHostProcessProbe(JSON.parse(child.stdout), validatedPid);
+	} catch {
+		parsed = null;
+	}
+	if (!parsed) {
+		onStatus?.({ type: "host-process-identity", event: "unavailable" });
+		return { state: "unknown" };
+	}
+	onStatus?.({
+		type: "host-process-identity",
+		event: "complete",
+		state: parsed.state,
+	});
+	return parsed;
+}
 // A cold macOS guest has to reach a logged-in Aqua session before
 // `launchctl print gui/<uid>` answers, and 30s was inside the noise band of
 // how long that actually takes: the INV-3 gate's whole create-boot-destroy
@@ -586,18 +747,6 @@ function validateTar(value) {
 	return Buffer.from(value);
 }
 
-/**
- * The name Parallels itself gives the parent snapshot it creates for a linked
- * clone, verified against prlctl 26.4.1 on 2026-08-26.
- *
- * Nothing in this module matches snapshots by name — clone-time detection is a
- * before-and-after id diff, which needs no name. This constant exists as the
- * single source of truth for `ops/switchyard-reaper.sh`, a standalone shell
- * script that must duplicate the literal because it reads no project code, and
- * `tests/reaper-script.test.mjs` fails if the two drift.
- */
-export const PARALLELS_LINKED_SNAPSHOT_NAME = "Snapshot for linked clone";
-
 function snapshotIdsFromOutput(output) {
 	const text = outputText(output);
 	const ids = new Set();
@@ -681,7 +830,7 @@ function validateRunId(runId) {
 }
 
 function validatePid(pid) {
-	if (!Number.isInteger(pid) || pid <= 0) {
+	if (!Number.isSafeInteger(pid) || pid <= 0) {
 		throw new Error("creatorPid must be a positive integer");
 	}
 	return pid;
@@ -879,6 +1028,20 @@ function ownershipContextFor(options, backend) {
 			"VM ownership context requires absolute resourceRoot and projectRoot",
 		);
 	}
+	const suppliedProcessIdentity =
+		source.processStartIdentity === null ||
+		source.processStartIdentity === undefined
+			? null
+			: parseHostProcessIdentity(source.processStartIdentity)?.identity;
+	if (
+		source.processStartIdentity !== null &&
+		source.processStartIdentity !== undefined &&
+		!suppliedProcessIdentity
+	) {
+		throw new Error(
+			"VM ownership context has malformed creator birth identity",
+		);
+	}
 	return Object.freeze({
 		schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
 		resourceRoot: resolve(source.resourceRoot),
@@ -893,11 +1056,7 @@ function ownershipContextFor(options, backend) {
 		creatorPid: validatePid(
 			source.creatorPid ?? options.creatorPid ?? backend.creatorPid,
 		),
-		processStartIdentity:
-			typeof source.processStartIdentity === "string" &&
-			source.processStartIdentity
-				? source.processStartIdentity
-				: null,
+		processStartIdentity: suppliedProcessIdentity,
 	});
 }
 
@@ -939,6 +1098,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		maxTransferBytes = MAX_TRANSFER_BYTES,
 		prlctlRetryAttempts = DEFAULT_PRLCTL_RETRY_ATTEMPTS,
 		prlctlRetryBackoffMs = DEFAULT_PRLCTL_RETRY_BACKOFF_MS,
+		hostProcessIdentityProbe = probeHostProcessIdentity,
 	} = {}) {
 		super();
 		if (typeof prlctlFn === "function") {
@@ -966,6 +1126,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.nowFn = nowFn;
 		this.pidIsAlive = pidIsAlive;
 		this.creatorPid = validatePid(creatorPid);
+		if (typeof hostProcessIdentityProbe !== "function") {
+			throw new TypeError("hostProcessIdentityProbe must be a function");
+		}
+		this.hostProcessIdentityProbe = hostProcessIdentityProbe;
 		this.aquaUid = aquaUid;
 		this.aquaTimeoutMs = validateDurationMs(aquaTimeoutMs, "aquaTimeoutMs", 0);
 		this.aquaPollMs = validateDurationMs(aquaPollMs, "aquaPollMs", 1);
@@ -1982,6 +2146,39 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (remaining.length > 0) this.deleteSnapshots(goldenImage, remaining);
 	}
 
+	captureCreatorOwnership(options = {}) {
+		const ownership = ownershipContextFor(options, this);
+		let probe;
+		try {
+			probe = this.hostProcessIdentityProbe(ownership.creatorPid, {
+				onStatus: options.onStatus,
+			});
+		} catch {
+			probe = { state: "unknown" };
+		}
+		const captured =
+			probe?.state === "present"
+				? parseHostProcessIdentity(probe.identity)
+				: null;
+		if (!captured || captured.pid !== ownership.creatorPid) {
+			throw new Error(
+				"VM allocation refused: host creator birth identity unavailable",
+			);
+		}
+		if (
+			ownership.processStartIdentity !== null &&
+			ownership.processStartIdentity !== captured.identity
+		) {
+			throw new Error(
+				"VM allocation refused: host creator birth identity changed",
+			);
+		}
+		return Object.freeze({
+			...ownership,
+			processStartIdentity: captured.identity,
+		});
+	}
+
 	vmOwnershipPath(uuid, resourceRoot) {
 		if (
 			typeof uuid !== "string" ||
@@ -2036,6 +2233,14 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const path = this.vmOwnershipPath(uuid, ownership.resourceRoot);
 		if (!path)
 			throw new Error("VM ownership metadata requires an exact VM UUID");
+		if (
+			parseHostProcessIdentity(ownership.processStartIdentity)?.pid !==
+			ownership.creatorPid
+		) {
+			throw new Error(
+				"VM ownership metadata requires a canonical creator birth identity",
+			);
+		}
 		mkdirSync(ownership.resourceRoot, { recursive: true });
 		const record = Object.freeze({
 			schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
@@ -2094,8 +2299,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				!isBoundedRecordText(record.purpose, 128) ||
 				!Number.isSafeInteger(record.creatorPid) ||
 				record.creatorPid <= 0 ||
-				(record.processStartIdentity !== null &&
-					!isBoundedRecordText(record.processStartIdentity)) ||
+				parseHostProcessIdentity(record.processStartIdentity)?.pid !==
+					record.creatorPid ||
 				!Number.isFinite(record.createdAt)
 			)
 				return null;
@@ -2111,13 +2316,35 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.ownedResourcesByUuid.delete(uuid);
 	}
 
+	probeStoredCreator(ownership, onStatus) {
+		const stored = parseHostProcessIdentity(ownership.processStartIdentity);
+		if (!stored || stored.pid !== ownership.creatorPid) return "unknown";
+		let fresh;
+		try {
+			fresh = this.hostProcessIdentityProbe(stored.pid, { onStatus });
+		} catch {
+			return "unknown";
+		}
+		if (fresh?.state === "present") {
+			const current = parseHostProcessIdentity(fresh.identity);
+			return current?.identity === stored.identity ? "same_birth" : "changed";
+		}
+		if (
+			fresh?.state === "absent" &&
+			fresh.bootSessionUuid === stored.bootSessionUuid
+		) {
+			return "absent";
+		}
+		return "unknown";
+	}
+
 	/**
 	 * Measure a real linked clone when no test probe is injected. The probe is
 	 * created, booted, measured, and destroyed before its receipt is accepted by
 	 * create(); a fabricated measurement object can never authorize cloning.
 	 */
 	measureLinkedCloneLifecycle(goldenImage, options = {}) {
-		const ownership = ownershipContextFor(options, this);
+		const ownership = this.captureCreatorOwnership(options);
 		const golden = this.resolveHandle(goldenImage, { allowUnmanaged: true });
 		if (!/^stopped$/i.test(String(golden.status ?? ""))) {
 			throw new Error(
@@ -2228,7 +2455,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const runId = options.runId ?? randomUUID();
 		const creatorPid = validatePid(options.creatorPid ?? this.creatorPid);
 		const name = buildParallelsWorkingName(runId, creatorPid);
-		const ownership = ownershipContextFor(options, this);
+		const ownership = this.captureCreatorOwnership(options);
 		if (ownership.runId !== runId || ownership.creatorPid !== creatorPid) {
 			throw new Error(
 				"VM ownership context does not match requested VM identity",
@@ -2664,6 +2891,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	destroy(handle) {
 		const entry = this.resolveHandle(handle);
+		const ownedInThisProcess = this.ownedResourcesByUuid.has(entry.uuid);
 		const suppliedOwnership =
 			handle && typeof handle === "object" ? handle.ownershipContext : null;
 		const registeredResourceRoot =
@@ -2687,6 +2915,12 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					: null);
 		if (!ownership) {
 			throw new Error("recovery_evidence_missing for targeted VM destruction");
+		}
+		if (
+			!ownedInThisProcess &&
+			this.probeStoredCreator(ownership) !== "same_birth"
+		) {
+			throw new Error("VM creator birth identity is not current");
 		}
 		if (
 			ownership.vmUuid !== entry.uuid ||
@@ -2785,6 +3019,19 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				});
 				continue;
 			}
+			const creatorState = this.probeStoredCreator(ownership, onStatus);
+			if (creatorState !== "same_birth" && creatorState !== "absent") {
+				result.skipped.push({
+					...entry,
+					reason: "creator-birth-unverified",
+				});
+				onStatus?.({
+					type: "skip",
+					name: entry.name,
+					reason: "creator-birth-unverified",
+				});
+				continue;
+			}
 			let eligible = false;
 			try {
 				eligible =
@@ -2827,6 +3074,22 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					type: "skip",
 					name: entry.name,
 					reason: "identity-or-eligibility-changed",
+				});
+				continue;
+			}
+			const currentCreatorState = this.probeStoredCreator(ownership, onStatus);
+			if (
+				currentCreatorState !== "same_birth" &&
+				currentCreatorState !== "absent"
+			) {
+				result.skipped.push({
+					...entry,
+					reason: "creator-birth-changed-before-delete",
+				});
+				onStatus?.({
+					type: "skip",
+					name: entry.name,
+					reason: "creator-birth-changed-before-delete",
 				});
 				continue;
 			}
