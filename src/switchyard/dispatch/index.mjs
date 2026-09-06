@@ -2178,9 +2178,9 @@ async function canonicalRecoveryProject(managed, dependencies) {
 
 /**
  * Build the execution backend a recovery-path caller (sweep or `recover`)
- * inspects/reclaims managed VMs through. A VM's name embeds its own
- * creator pid (see buildParallelsWorkingName/reclaim), so no run-store
- * read is needed to decide liveness.
+ * inspects/reclaims managed VMs through. Recovery requires the exact VM and
+ * host-owned resource identity, the current authoritative run/project record
+ * and liveness/cleanup eligibility, plus fresh host process-birth proof.
  * @param {object} [dependencies]
  * @returns {import("../lifecycle/parallels-execution-backend.mjs").ParallelsExecutionBackend}
  */
