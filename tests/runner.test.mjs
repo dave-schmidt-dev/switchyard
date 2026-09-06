@@ -772,6 +772,17 @@ function writeTasksFile(content) {
 	return tasksPath;
 }
 
+function runFixtureGit(projectPath, args) {
+	const result = spawnSync("git", args, {
+		cwd: projectPath,
+		encoding: "utf8",
+	});
+	if (result.status !== 0) {
+		throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+	}
+	return result.stdout.trim();
+}
+
 afterEach(() => {
 	try {
 		rmSync(TEST_DIR, { recursive: true, force: true });
@@ -4883,10 +4894,12 @@ describe("runner quota retry coordination", () => {
 		onStatus,
 		only = [],
 		recordDispatch,
+		integrationGate = () => ({ success: true, message: "ok" }),
 		resetWorkingTree = () => {},
 	} = {}) {
 		const routeCalls = [];
 		const executeCalls = [];
+		const executeOptions = [];
 		const retryProjections = [];
 		const taskBaseCaptures = [];
 		const taskBaseReleases = [];
@@ -4924,8 +4937,9 @@ describe("runner quota retry coordination", () => {
 			};
 		};
 		const makeAdapter = (provider) => ({
-			execute: () => {
+			execute: (_prompt, _workspace, options) => {
 				executeCalls.push(provider);
+				executeOptions.push(options);
 				const queue = outcomes.get(provider) ?? [];
 				return (
 					queue.shift() ?? {
@@ -4934,8 +4948,9 @@ describe("runner quota retry coordination", () => {
 					}
 				);
 			},
-			executeAsync: async () => {
+			executeAsync: async (_prompt, _workspace, options) => {
 				executeCalls.push(provider);
+				executeOptions.push(options);
 				const queue = outcomes.get(provider) ?? [];
 				return queue.shift() ?? { success: true, output: "ok" };
 			},
@@ -4945,6 +4960,7 @@ describe("runner quota retry coordination", () => {
 		return {
 			routeCalls,
 			executeCalls,
+			executeOptions,
 			retryProjections,
 			taskBaseCaptures,
 			taskBaseReleases,
@@ -4954,7 +4970,7 @@ describe("runner quota retry coordination", () => {
 				onResult,
 				onStatus,
 				onRetryStateChanged: (projection) => retryProjections.push(projection),
-				integrationGate: () => ({ success: true, message: "ok" }),
+				integrationGate,
 				ensureAgentContainer: () => {},
 				createWorkingContainer: () => "owned-retry-container",
 				provisionCredentials: () => {},
@@ -4976,6 +4992,529 @@ describe("runner quota retry coordination", () => {
 			only,
 		};
 	}
+
+	function completionReceipt(options, overrides = {}) {
+		return {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: options.cleanupContext.taskId,
+			attemptId: options.cleanupContext.attemptId,
+			descriptorIdentity: options.cleanupContext.descriptorIdentity,
+			workspaceId: options.cleanupContext.workspaceId,
+			...overrides,
+		};
+	}
+
+	it("continues once in the owned workspace only after lifecycle proof", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Complete missing path
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** add the declared file
+`);
+		let gateCalls = 0;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
+			],
+			integrationGate: () => {
+				gateCalls += 1;
+				return gateCalls === 1
+					? {
+							success: false,
+							message: "required_paths_missing",
+							missingPaths: ["src/a.mjs"],
+						}
+					: { success: true, message: "ok" };
+			},
+		});
+		fixture.dependencies.adapters.agy.supportsCompletionContinuation = true;
+		const executeWithReceipt = fixture.dependencies.adapters.agy.execute;
+		fixture.dependencies.adapters.agy.execute = (...args) => ({
+			...executeWithReceipt(...args),
+			completionContinuationProof: completionReceipt(args[2]),
+		});
+		fixture.dependencies.completionContinuation = { enabled: true };
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: fixture.dependencies,
+		});
+		strictEqual(result.results[0].success, true);
+		deepStrictEqual(fixture.executeCalls, ["agy", "agy"]);
+		strictEqual(fixture.routeCalls.length, 1);
+		ok(
+			fixture.executeOptions[1].timeoutMs <=
+				fixture.executeOptions[0].timeoutMs,
+		);
+		const checkpoint = loadCheckpoint(
+			`${tasksPath}.checkpoint.json`,
+			tasksPath,
+		);
+		deepStrictEqual(checkpoint.providerAttemptAllocations, [
+			{
+				taskId: "1.1",
+				reason: "completion_correction",
+				state: "result_recorded",
+				allocatedAt: checkpoint.providerAttemptAllocations[0].allocatedAt,
+				deadline: checkpoint.providerAttemptAllocations[0].deadline,
+				descriptorIdentity:
+					checkpoint.providerAttemptAllocations[0].descriptorIdentity,
+				workspaceId: "owned-retry-container",
+				baseTree: TASK_BASE.tree,
+				attemptId: "attempt-1",
+			},
+		]);
+	});
+
+	it("applies one cumulative correction through the real gate and commits the worker once", () => {
+		const projectPath = join(TEST_DIR, "completion-real-gate");
+		mkdirSync(projectPath, { recursive: true });
+		runFixtureGit(projectPath, ["init", "-q"]);
+		writeFileSync(join(projectPath, "README.md"), "fixture\n");
+		runFixtureGit(projectPath, ["add", "README.md"]);
+		runFixtureGit(projectPath, [
+			"-c",
+			"user.name=Fixture",
+			"-c",
+			"user.email=fixture@example.invalid",
+			"commit",
+			"-qm",
+			"base",
+		]);
+		const headBefore = runFixtureGit(projectPath, ["rev-parse", "HEAD"]);
+		const baseTree = runFixtureGit(projectPath, [
+			"rev-parse",
+			`${headBefore}^{tree}`,
+		]);
+		const workerPath = join(TEST_DIR, "completion-worker-repo");
+		const clone = spawnSync("git", ["clone", "-q", projectPath, workerPath], {
+			encoding: "utf8",
+		});
+		strictEqual(clone.status, 0, clone.stderr);
+		const tasksPath = writeTasksFile(`### Task 1.1: Complete both files
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs, src/b.mjs
+- **Description:** add both declared files
+`);
+		let executions = 0;
+		let commits = 0;
+		let resets = 0;
+		let teardowns = 0;
+		const adapter = {
+			supportsCompletionContinuation: true,
+			execute: (_prompt, _workspace, options) => {
+				executions += 1;
+				mkdirSync(join(workerPath, "src"), { recursive: true });
+				if (executions === 1) {
+					writeFileSync(join(workerPath, "src/a.mjs"), "export const a = 1;\n");
+					runFixtureGit(workerPath, ["add", "src/a.mjs"]);
+					runFixtureGit(workerPath, [
+						"-c",
+						"user.name=Worker",
+						"-c",
+						"user.email=worker@example.invalid",
+						"commit",
+						"-qm",
+						"provider commit",
+					]);
+				} else {
+					writeFileSync(join(workerPath, "src/b.mjs"), "export const b = 2;\n");
+					runFixtureGit(workerPath, ["add", "-N", "src/b.mjs"]);
+				}
+				return {
+					success: true,
+					output: "ignored",
+					completionContinuationProof: completionReceipt(options),
+				};
+			},
+			captureDiff: () =>
+				runFixtureGit(workerPath, ["diff", "--binary", headBefore]),
+		};
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: {
+				completionContinuation: { enabled: true },
+				route: () => ({
+					provider: "agy",
+					model: "fixture-model",
+					resolvedTargetId: "agy-fixture",
+					resolved_harness: "agy",
+				}),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				adapters: { agy: adapter },
+				backendFactory: () => ({
+					readiness: () => ({ inventoryCount: 0 }),
+					ensureAgentContainer: () => {},
+					create: () => "completion-worker",
+					provision: () => {},
+					seed: () => {},
+					commit: () => {
+						commits += 1;
+						runFixtureGit(workerPath, ["add", "-A"]);
+						runFixtureGit(workerPath, [
+							"-c",
+							"user.name=Runner",
+							"-c",
+							"user.email=runner@example.invalid",
+							"commit",
+							"-qm",
+							"accepted correction",
+						]);
+					},
+					reset: () => {
+						resets += 1;
+					},
+					captureTaskBase: () => ({ ref: headBefore, tree: baseTree }),
+					validateTaskBase: (_workspace, base) => base,
+					releaseTaskBase: () => {},
+					destroy: () => {
+						teardowns += 1;
+					},
+				}),
+			},
+		});
+		strictEqual(
+			result.results[0].success,
+			true,
+			JSON.stringify(result.results[0]),
+		);
+		strictEqual(executions, 2);
+		strictEqual(commits, 1);
+		strictEqual(resets, 0);
+		strictEqual(teardowns, 1);
+		strictEqual(
+			runFixtureGit(workerPath, ["rev-list", "--count", `${headBefore}..HEAD`]),
+			"2",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "src/a.mjs"), "utf8"),
+			"export const a = 1;\n",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "src/b.mjs"), "utf8"),
+			"export const b = 2;\n",
+		);
+		strictEqual(runFixtureGit(projectPath, ["rev-parse", "HEAD"]), headBefore);
+	});
+
+	it("does not continue after lifecycle drift, declined cleanup, or an expired budget", () => {
+		for (const condition of [
+			"cleanup_declined",
+			"descriptor_drift",
+			"workspace_drift",
+			"deadline_expired",
+		]) {
+			const tasksPath = writeTasksFile(`### Task 1.1: Stop correction
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** stop safely
+`);
+			let monotonic = 0;
+			let proofCalls = 0;
+			const fixture = makeQuotaRetryDependencies({
+				routePlan: [
+					{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
+				],
+				integrationGate: () => ({
+					success: false,
+					message: "required_paths_missing",
+					missingPaths: ["src/a.mjs"],
+				}),
+			});
+			const originalExecute = fixture.dependencies.adapters.agy.execute;
+			fixture.dependencies.adapters.agy.supportsCompletionContinuation = true;
+			fixture.dependencies.adapters.agy.execute = (...args) => {
+				const execution = originalExecute(...args);
+				if (condition === "deadline_expired") monotonic = 2_000_000;
+				if (condition !== "deadline_expired") proofCalls += 1;
+				return {
+					...execution,
+					completionContinuationProof: completionReceipt(args[2], {
+						...(condition === "cleanup_declined"
+							? { cleanupSucceeded: false }
+							: {}),
+						...(condition === "descriptor_drift"
+							? { descriptorIdentity: "drifted" }
+							: {}),
+						...(condition === "workspace_drift"
+							? { workspaceId: "other-worker" }
+							: {}),
+					}),
+				};
+			};
+			fixture.dependencies.completionContinuation = { enabled: true };
+			fixture.dependencies.monotonicNow = () => monotonic;
+			const result = runQueue({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath: `${tasksPath}.checkpoint.json`,
+				dependencies: fixture.dependencies,
+			});
+			strictEqual(result.results[0].success, false, condition);
+			strictEqual(fixture.executeCalls.length, 1, condition);
+			strictEqual(
+				proofCalls,
+				condition === "deadline_expired" ? 0 : 1,
+				condition,
+			);
+			deepStrictEqual(
+				loadCheckpoint(`${tasksPath}.checkpoint.json`, tasksPath)
+					.providerAttemptAllocations,
+				[],
+				condition,
+			);
+		}
+	});
+
+	it("does not replenish allocated or running correction attempts after restart", () => {
+		for (const state of ["allocated", "running"]) {
+			const tasksPath = writeTasksFile(`### Task 1.1: Resume safely
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** do not repeat an ambiguous invocation
+`);
+			const checkpointPath = `${tasksPath}.${state}.checkpoint.json`;
+			const checkpoint = createEmptyCheckpoint(tasksPath);
+			checkpoint.providerAttemptAllocations = [
+				{
+					taskId: "1.1",
+					reason: "completion_correction",
+					state,
+					allocatedAt: "2026-09-06T03:00:00.000Z",
+					deadline: "2026-09-06T03:30:00.000Z",
+					descriptorIdentity: "descriptor-before-crash",
+					workspaceId: "worker-before-crash",
+					baseTree: "4".repeat(40),
+					attemptId: "attempt-1",
+				},
+			];
+			saveCheckpoint(checkpointPath, checkpoint);
+			strictEqual(releaseCheckpointOwnership(checkpointPath, checkpoint), true);
+			let launches = 0;
+			const result = runQueue({
+				tasksFilePath: tasksPath,
+				checkpointPath,
+				projectPath: TEST_DIR,
+				runId: `resumed-${state}`,
+				dependencies: {
+					now: () => 0,
+					monotonicNow: () => 0,
+					route: () => {
+						launches += 1;
+						return { provider: "agy", model: "fixture-model" };
+					},
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					adapters: {},
+				},
+			});
+			strictEqual(result.processedTasks, 1, state);
+			strictEqual(
+				result.results[0].reason,
+				"persisted extra provider invocation already consumed",
+			);
+			strictEqual(launches, 0, state);
+		}
+	});
+
+	it("recomputes the deadline after task-base preparation before provider launch", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Expire preparing
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** preparation consumes the budget
+`);
+		let monotonic = 0;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
+			],
+		});
+		fixture.dependencies.monotonicNow = () => monotonic;
+		fixture.dependencies.captureTaskBase = () => {
+			monotonic = 2_000_000;
+			return TASK_BASE;
+		};
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: fixture.dependencies,
+		});
+		strictEqual(result.results[0].result, "execution_timed_out");
+		strictEqual(fixture.executeCalls.length, 0);
+	});
+
+	it("shares one extra launch between empty-capture correction and quota fallback", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Empty then quota
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** finish the required file
+`);
+		let resets = 0;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
+			],
+			executionOutcomes: {
+				agy: [
+					{ success: true, output: "primary" },
+					{
+						success: false,
+						result: "execution_failed",
+						errorKind: "quota_exhausted",
+						diagnosticCode: "agy_quota_exhausted",
+						diagnosticOrigin: "adapter",
+						diagnosticEvidenceAvailable: true,
+					},
+				],
+			},
+			integrationGate: () => ({
+				success: false,
+				message: "empty_required_diff",
+			}),
+			resetWorkingTree: () => {
+				resets += 1;
+			},
+		});
+		fixture.dependencies.adapters.agy.captureDiff = () => "";
+		fixture.dependencies.adapters.agy.supportsCompletionContinuation = true;
+		const executeWithReceipt = fixture.dependencies.adapters.agy.execute;
+		fixture.dependencies.adapters.agy.execute = (...args) => ({
+			...executeWithReceipt(...args),
+			completionContinuationProof: completionReceipt(args[2]),
+		});
+		fixture.dependencies.completionContinuation = { enabled: true };
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: fixture.dependencies,
+		});
+		strictEqual(result.results[0].success, false);
+		strictEqual(fixture.executeCalls.length, 2);
+		strictEqual(fixture.routeCalls.length, 1);
+		strictEqual(resets, 0);
+		strictEqual(
+			loadCheckpoint(`${tasksPath}.checkpoint.json`, tasksPath)
+				.providerAttemptAllocations[0].reason,
+			"completion_correction",
+		);
+	});
+
+	it("does not launch correction when its durable allocation cannot publish", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Persist first
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** allocate before continuing
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
+			],
+			integrationGate: () => ({
+				success: false,
+				message: "required_paths_missing",
+				missingPaths: ["src/a.mjs"],
+			}),
+		});
+		fixture.dependencies.adapters.agy.supportsCompletionContinuation = true;
+		const executeWithReceipt = fixture.dependencies.adapters.agy.execute;
+		fixture.dependencies.adapters.agy.execute = (...args) => {
+			const execution = executeWithReceipt(...args);
+			writeFileSync(`${checkpointPath}.lock`, "ambiguous");
+			return {
+				...execution,
+				completionContinuationProof: completionReceipt(args[2]),
+			};
+		};
+		fixture.dependencies.completionContinuation = { enabled: true };
+		throws(
+			() =>
+				runQueue({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
+			/checkpoint lease unavailable/,
+		);
+		strictEqual(fixture.executeCalls.length, 1);
+	});
+
+	it("leaves completion correction unavailable in broker and orchestrator loops", async () => {
+		for (const mode of ["broker", "orchestrator"]) {
+			const tasksPath = writeTasksFile(`### Task 1.1: Unsupported continuation
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** do not infer lifecycle support
+`);
+			let launches = 0;
+			let proofCalls = 0;
+			const fixture = makeQuotaRetryDependencies({
+				routePlan: [
+					{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
+				],
+				integrationGate: () => ({
+					success: false,
+					message: "required_paths_missing",
+					missingPaths: ["src/a.mjs"],
+				}),
+			});
+			fixture.dependencies.completionContinuation = { enabled: true };
+			fixture.dependencies.adapters.agy.supportsCompletionContinuation = true;
+			fixture.dependencies.adapters.agy.verifyCompletionContinuation = () => {
+				proofCalls += 1;
+				return null;
+			};
+			if (mode === "orchestrator") {
+				fixture.dependencies.orchestrator = {
+					launch: () => {
+						launches += 1;
+						return "job-1";
+					},
+					status: () => ({ state: "done" }),
+					result: () => ({ success: true }),
+				};
+				await runQueueWithOrchestrator({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath: `${tasksPath}.checkpoint.json`,
+					dependencies: fixture.dependencies,
+				});
+			} else {
+				await runQueueAsync({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath: `${tasksPath}.checkpoint.json`,
+					dependencies: fixture.dependencies,
+				});
+			}
+			strictEqual(proofCalls, 0, mode);
+			strictEqual(
+				mode === "orchestrator" ? launches : fixture.executeCalls.length,
+				1,
+				mode,
+			);
+		}
+	});
 
 	it("quarantines one target, retries on an isolated target, and counts one logical task", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
@@ -10523,6 +11062,8 @@ describe("executeTask timeout handling", () => {
 			},
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
+			now: () => 1_000,
+			monotonicNow: () => 0,
 		});
 
 		executeTask(

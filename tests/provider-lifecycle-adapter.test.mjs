@@ -18,6 +18,7 @@ import {
 	executeProviderInvocation,
 	getWorkspaceExecution,
 	runProviderProcess,
+	verifyCompletionContinuationSync,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import { validateIdentifier } from "../src/switchyard/adapter/shell-safety.mjs";
 import {
@@ -59,6 +60,48 @@ function fakeChild() {
 }
 
 describe("provider process lifecycle", () => {
+	it("keeps completion continuation unavailable without an explicit lifecycle proof", async () => {
+		const context = {
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workingContainerName: "worker",
+			executionBackend: {},
+			deadline: "2026-09-06T04:00:00.000Z",
+			timeoutMs: 20,
+		};
+		strictEqual(verifyCompletionContinuationSync({}, context), false);
+		const adapter = {
+			supportsCompletionContinuation: true,
+		};
+		context.lifecycleReceipt = {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "worker",
+		};
+		strictEqual(verifyCompletionContinuationSync(adapter, context), true);
+		context.lifecycleReceipt = true;
+		strictEqual(verifyCompletionContinuationSync(adapter, context), false);
+		context.lifecycleReceipt = {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: "wrong-descriptor",
+			workspaceId: "worker",
+		};
+		strictEqual(verifyCompletionContinuationSync(adapter, context), false);
+	});
+
 	for (const [mode, validate] of [
 		["synchronous", validateTaskStartTree],
 		["asynchronous", validateTaskStartTreeAsync],

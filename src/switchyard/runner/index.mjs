@@ -59,6 +59,7 @@ import {
 	execute as executeOpencode,
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
+import { verifyCompletionContinuationSync } from "../adapter/provider-lifecycle.mjs";
 import {
 	captureDiff as captureVibeDiff,
 	captureDiffAsync as captureVibeDiffAsync,
@@ -1866,6 +1867,30 @@ function validateCheckpointV3(parsed, tasksFilePath, expected) {
 			throw new Error("checkpoint v3 has invalid integration intent");
 		}
 	}
+	if (
+		parsed.providerAttemptAllocations !== undefined &&
+		(!Array.isArray(parsed.providerAttemptAllocations) ||
+			parsed.providerAttemptAllocations.some(
+				(entry) =>
+					!entry ||
+					typeof entry.taskId !== "string" ||
+					!["quota_fallback", "completion_correction"].includes(entry.reason) ||
+					!["allocated", "running", "result_recorded"].includes(entry.state) ||
+					(entry.reason === "completion_correction" &&
+						(typeof entry.deadline !== "string" ||
+							!Number.isFinite(Date.parse(entry.deadline)) ||
+							typeof entry.descriptorIdentity !== "string" ||
+							!entry.descriptorIdentity ||
+							typeof entry.workspaceId !== "string" ||
+							!entry.workspaceId ||
+							typeof entry.baseTree !== "string" ||
+							!/^[a-f0-9]{40,64}$/.test(entry.baseTree) ||
+							typeof entry.attemptId !== "string" ||
+							!entry.attemptId)),
+			))
+	) {
+		throw new Error("checkpoint v3 has invalid provider attempt allocations");
+	}
 	if (parsed.tasksFilePath !== tasksFilePath) {
 		throw new CheckpointIdentityError(
 			CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH,
@@ -2992,6 +3017,241 @@ function isQuotaRetryCandidate(result, ownsWorkingContainer) {
 	return true;
 }
 
+const COMPLETION_CONTINUATION_FAILURES = new Set([
+	"empty_required_diff",
+	"required_paths_missing",
+]);
+
+function ensureProviderAttemptAllocations(checkpoint) {
+	if (checkpoint.providerAttemptAllocations === undefined) {
+		checkpoint.providerAttemptAllocations = [];
+	}
+	if (!Array.isArray(checkpoint.providerAttemptAllocations)) {
+		throw new Error("providerAttemptAllocations is invalid");
+	}
+	return checkpoint.providerAttemptAllocations;
+}
+
+// This is deliberately separate from integration operations: one describes a
+// host-side apply, the other spends the single additional provider launch.
+function allocateExtraProviderInvocation(
+	checkpoint,
+	checkpointPath,
+	taskId,
+	reason,
+	intent = null,
+) {
+	const allocations = ensureProviderAttemptAllocations(checkpoint);
+	const legacyUsed = (checkpoint.retryAttempts ?? []).some(
+		(entry) => entry?.taskId === taskId,
+	);
+	if (legacyUsed || allocations.some((entry) => entry?.taskId === taskId)) {
+		return null;
+	}
+	const allocation = {
+		taskId,
+		reason,
+		state: "allocated",
+		allocatedAt: new Date().toISOString(),
+		...(reason === "completion_correction" ? intent : {}),
+	};
+	allocations.push(allocation);
+	checkpoint.lastUpdatedAt = allocation.allocatedAt;
+	saveCheckpoint(checkpointPath, checkpoint);
+	return allocation;
+}
+
+function recordExtraProviderInvocation(
+	checkpoint,
+	checkpointPath,
+	allocation,
+	state,
+) {
+	if (!allocation || !["running", "result_recorded"].includes(state)) return;
+	allocation.state = state;
+	checkpoint.lastUpdatedAt = new Date().toISOString();
+	saveCheckpoint(checkpointPath, checkpoint);
+}
+
+function recordExtraProviderInvocationResult(
+	checkpoint,
+	checkpointPath,
+	taskId,
+) {
+	const allocation = ensureProviderAttemptAllocations(checkpoint).find(
+		(entry) => entry?.taskId === taskId,
+	);
+	if (allocation?.state === "allocated" || allocation?.state === "running") {
+		recordExtraProviderInvocation(
+			checkpoint,
+			checkpointPath,
+			allocation,
+			"result_recorded",
+		);
+	}
+}
+
+function startExtraProviderInvocation(checkpoint, checkpointPath, taskId) {
+	const allocation = ensureProviderAttemptAllocations(checkpoint).find(
+		(entry) => entry?.taskId === taskId,
+	);
+	if (allocation?.state === "allocated") {
+		recordExtraProviderInvocation(
+			checkpoint,
+			checkpointPath,
+			allocation,
+			"running",
+		);
+	}
+}
+
+function completionContinuationCandidate(result, enabled) {
+	return (
+		enabled === true &&
+		result?.success === false &&
+		result.result === "integration_failed" &&
+		["captured", "empty"].includes(result.captureStatus) &&
+		COMPLETION_CONTINUATION_FAILURES.has(result.diagnosticCode)
+	);
+}
+
+function machineMissingRequirements(task, result) {
+	if (result.diagnosticCode !== "required_paths_missing") return [];
+	return (result.missingPaths ?? task.requiredPaths ?? []).filter(
+		(path) => typeof path === "string",
+	);
+}
+
+function taskPromptForAttempt(task, requirements) {
+	const prompt = task.prompt || task.description || task.title;
+	if (!Array.isArray(requirements) || requirements.length === 0) return prompt;
+	return `${prompt}\n\nRequired paths still missing: ${requirements.join(", ")}`;
+}
+
+function taskExecutionBudget(context, task) {
+	if (context._activeTaskBudget?.taskId === task.id) {
+		const wallRemaining =
+			context._activeTaskBudget.wallDeadlineMs -
+			(context.now?.() ?? Date.now());
+		const monotonicRemaining =
+			context._activeTaskBudget.monotonicDeadlineMs -
+			(context.monotonicNow?.() ?? performance.now());
+		return {
+			...context._activeTaskBudget,
+			remainingMs: Math.max(0, Math.min(wallRemaining, monotonicRemaining)),
+		};
+	}
+	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	const wallDeadlineMs = (context.now?.() ?? Date.now()) + timeoutMs;
+	const monotonicDeadlineMs =
+		(context.monotonicNow?.() ?? performance.now()) + timeoutMs;
+	context._activeTaskBudget = {
+		taskId: task.id,
+		wallDeadlineMs,
+		monotonicDeadlineMs,
+		deadline: new Date(wallDeadlineMs).toISOString(),
+	};
+	return { ...context._activeTaskBudget, remainingMs: timeoutMs };
+}
+
+function completionLifecycleContext(context, task) {
+	const cleanupContext =
+		context._activeTaskHelperContext ??
+		executionCleanupContext(
+			context,
+			task,
+			context._activeInvocationDescriptor?.descriptor_identity,
+		);
+	const budget = taskExecutionBudget(context, task);
+	return {
+		taskId: task.id,
+		attemptId: cleanupContext.attemptId,
+		descriptorIdentity: cleanupContext.descriptorIdentity,
+		workingContainerName: context.workingContainerName,
+		executionBackend: context.executionBackend,
+		cleanupContext,
+		deadline: budget.deadline,
+		timeoutMs: budget.remainingMs,
+		onStatus: context.onStatus,
+		lifecycleReceipt: context._activeCompletionLifecycleReceipt,
+	};
+}
+
+function runCompletionCorrection(
+	task,
+	context,
+	result,
+	checkpoint,
+	checkpointPath,
+) {
+	if (
+		context.ownsWorkingContainer !== true ||
+		context.completionContinuationMode !== "sync" ||
+		!completionContinuationCandidate(
+			result,
+			context.completionContinuation?.enabled,
+		)
+	)
+		return result;
+	const budget = taskExecutionBudget(context, task);
+	const pin = context._activeCompletionPin;
+	if (!pin || budget.remainingMs <= 0) return result;
+	const requirements = machineMissingRequirements(task, result);
+	if (
+		!verifyCompletionContinuationSync(
+			context._activeCompletionAdapter,
+			completionLifecycleContext(context, task),
+		)
+	) {
+		return result;
+	}
+	if (taskExecutionBudget(context, task).remainingMs <= 0) return result;
+	const allocation = allocateExtraProviderInvocation(
+		checkpoint,
+		checkpointPath,
+		task.id,
+		"completion_correction",
+		{
+			deadline: pin.deadline,
+			descriptorIdentity: pin.descriptorIdentity,
+			workspaceId: pin.workspaceId,
+			baseTree: pin.baseTree,
+			attemptId: pin.attemptId,
+		},
+	);
+	if (!allocation) return result;
+	context.onStatus?.({
+		phase: "execution",
+		event: "completion_correction_allocated",
+		status: `Task ${task.id} completion correction allocated`,
+		taskId: task.id,
+		missingRequirements: requirements,
+	});
+	recordExtraProviderInvocation(
+		checkpoint,
+		checkpointPath,
+		allocation,
+		"running",
+	);
+	const originalRequirements = context._completionRequirements;
+	context._completionPin = pin;
+	context._completionRequirements = requirements;
+	try {
+		const correction = executeTask(task, context);
+		correction.extraProviderInvocationUsed = true;
+		recordExtraProviderInvocation(
+			checkpoint,
+			checkpointPath,
+			allocation,
+			"result_recorded",
+		);
+		return correction;
+	} finally {
+		context._completionPin = null;
+		context._completionRequirements = originalRequirements;
+	}
+}
+
 const ALLOWED_INTEGRATION_MESSAGES = Object.freeze(
 	new Set([
 		"empty_required_diff",
@@ -3662,16 +3922,21 @@ export function executeTask(task, context) {
 	if (ignoredPath) {
 		return declaredPathNotSeededResult(task, requiredCapability);
 	}
-	const routeResult = context.route({
-		requiredCapability,
-		availableProviders: Object.keys(context.adapters ?? {}),
-		exclude: context.exclude,
-		only: context.only,
-		platform: context.platform,
-		...(context.goldenImageVerifiedProviders !== undefined
-			? { goldenImageVerifiedProviders: context.goldenImageVerifiedProviders }
-			: {}),
-	});
+	const routeResult = context._completionPin
+		? structuredClone(context._completionPin.route)
+		: context.route({
+				requiredCapability,
+				availableProviders: Object.keys(context.adapters ?? {}),
+				exclude: context.exclude,
+				only: context.only,
+				platform: context.platform,
+				...(context.goldenImageVerifiedProviders !== undefined
+					? {
+							goldenImageVerifiedProviders:
+								context.goldenImageVerifiedProviders,
+						}
+					: {}),
+			});
 
 	// Provenance (Task 1.6, M7/M8): resolve the six roster-provenance fields
 	// once, attach them to routeResult, and route every dispatch record through
@@ -3685,11 +3950,13 @@ export function executeTask(task, context) {
 	Object.assign(routeResult, { requiredCapability }, provenance);
 	let invocationDescriptor;
 	try {
-		invocationDescriptor = descriptorFromRoute(
-			routeResult,
-			requiredCapability,
-			context.resolveDescriptor ?? getInvocationDescriptor,
-		);
+		invocationDescriptor = context._completionPin
+			? structuredClone(context._completionPin.invocationDescriptor)
+			: descriptorFromRoute(
+					routeResult,
+					requiredCapability,
+					context.resolveDescriptor ?? getInvocationDescriptor,
+				);
 	} catch {
 		try {
 			context.recordDispatch({
@@ -3765,6 +4032,8 @@ export function executeTask(task, context) {
 		routeResult.resolved_harness ?? routeResult.provider,
 		context.adapters,
 	);
+	context._activeCompletionAdapter = adapter;
+	context._activeCompletionRoute = structuredClone(routeResult);
 	if (!adapter) {
 		record({
 			provider: routeResult.provider,
@@ -3790,12 +4059,27 @@ export function executeTask(task, context) {
 	// A task's own `Timeout:` field (runner/index.mjs parseTimeoutField)
 	// overrides the global default for tasks known to legitimately need more
 	// (or less) than PROVIDER_EXECUTION_TIMEOUT_MS.
-	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	const executionBudget = taskExecutionBudget(context, task);
+	const timeoutMs = Math.floor(executionBudget.remainingMs);
+	if (timeoutMs <= 0) {
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: invocationDescriptor.selector,
+			requiredCapability,
+			resolvedTargetId,
+			result: "execution_timed_out",
+			errorKind: "execution_timeout",
+			timedOut: true,
+		};
+	}
 
 	// Emitted here, before the blocking adapter.execute call below, so the
 	// routed provider/model/deadline are visible immediately rather than only
 	// discoverable after the (up to timeoutMs-long) call returns.
-	const routedDeadline = new Date(Date.now() + timeoutMs).toISOString();
+	const routedDeadline = executionBudget.deadline;
 	if (context.onStatus) {
 		context.onStatus({
 			phase: "execution",
@@ -3851,7 +4135,7 @@ export function executeTask(task, context) {
 		};
 	}
 
-	const prompt = task.prompt || task.description || task.title;
+	const prompt = taskPromptForAttempt(task, context._completionRequirements);
 	const routedModel = invocationDescriptor?.selector ?? routeResult.model;
 	context.queueBackend?.beforeRun?.(
 		context.workingContainerName,
@@ -3879,13 +4163,54 @@ export function executeTask(task, context) {
 			requiredCapability,
 		);
 	}
+	if (context._completionPin) {
+		if (
+			context._completionPin.workspaceId !== context.workingContainerName ||
+			context._completionPin.baseTree !== context._activeTaskBase?.tree ||
+			context._completionPin.descriptorIdentity !==
+				invocationDescriptor.descriptor_identity
+		) {
+			return taskBaseFailure(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			);
+		}
+	} else {
+		context._activeCompletionPin = {
+			taskId: task.id,
+			route: structuredClone(routeResult),
+			invocationDescriptor: structuredClone(invocationDescriptor),
+			descriptorIdentity: invocationDescriptor.descriptor_identity,
+			workspaceId: context.workingContainerName,
+			baseTree: context._activeTaskBase.tree,
+			attemptId: cleanupContext.attemptId,
+			deadline: executionBudget.deadline,
+		};
+	}
 	const captureExecutionBackend = bindAttemptHelperBackend(
 		context.executionBackend,
 		cleanupContext,
 	);
+	const launchBudget = taskExecutionBudget(context, task);
+	if (launchBudget.remainingMs <= 0) {
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: invocationDescriptor.selector,
+			requiredCapability,
+			resolvedTargetId,
+			result: "execution_timed_out",
+			errorKind: "execution_timeout",
+			timedOut: true,
+		};
+	}
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
-		timeoutMs,
+		timeoutMs: Math.floor(launchBudget.remainingMs),
 		executionBackend: bindAttemptExecutionBackend(
 			context.executionBackend,
 			cleanupContext,
@@ -3896,6 +4221,8 @@ export function executeTask(task, context) {
 		resolvedTargetId,
 		cleanupContext,
 	});
+	context._activeCompletionLifecycleReceipt =
+		execution.completionContinuationProof ?? null;
 	if (execution.cleanupFailed === true && execution.success) {
 		record({
 			provider: routeResult.provider,
@@ -4252,6 +4579,10 @@ export function executeTask(task, context) {
 		requiredCapability,
 		resolvedTargetId,
 		result: terminalResult,
+		captureStatus: captureEvidence.status,
+		...(Array.isArray(gateResult?.missingPaths)
+			? { missingPaths: [...gateResult.missingPaths] }
+			: {}),
 		...servedModelVerificationFields(execution),
 		...survivingProviderFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
@@ -4384,7 +4715,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 		broker = createDispatchBroker(context, context.brokerDependencies);
 		context.broker = broker;
 	}
-	context._activeTaskPrompt = task.prompt || task.description || task.title;
+	context._activeTaskPrompt = taskPromptForAttempt(
+		task,
+		context._completionRequirements,
+	);
 	context._activeTaskTimeoutMs =
 		task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
 	const brokerRequest = brokerRequestForTask(task, context, requiredCapability);
@@ -4479,6 +4813,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 		routeResult.resolved_harness ?? routeResult.provider,
 		context.adapters,
 	);
+	context._activeCompletionAdapter = adapter;
+	context._activeCompletionRoute = structuredClone(routeResult);
 	if (!adapter) {
 		await releaseSelected(selectedRoute);
 		await record({
@@ -5062,6 +5398,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
 		result: terminalResult,
+		captureStatus: captureEvidence.status,
+		...(Array.isArray(gateResult?.missingPaths)
+			? { missingPaths: [...gateResult.missingPaths] }
+			: {}),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...survivingProviderFields(execution),
@@ -5154,6 +5494,7 @@ export async function runQueueAsync(options) {
 		effectiveTaskIds,
 	} = launch;
 	ensureRetryCheckpoint(checkpoint);
+	ensureProviderAttemptAllocations(checkpoint);
 	const slotLease = await acquireQueueSlotAsync({
 		queueBackend,
 		selectedPlatform,
@@ -5237,6 +5578,7 @@ export async function runQueueAsync(options) {
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
+		ownsWorkingContainer,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
 		platform: selectedPlatform,
@@ -5263,6 +5605,12 @@ export async function runQueueAsync(options) {
 		resolveDescriptor: dependencies.resolveDescriptor,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		snapshotSource: dependencies.snapshotSource ?? "gradus-v2",
+		completionContinuation: dependencies.completionContinuation ?? {
+			enabled: false,
+		},
+		completionContinuationMode: "unavailable",
+		now: dependencies.now ?? Date.now,
+		monotonicNow: dependencies.monotonicNow ?? (() => performance.now()),
 	};
 	const results = [];
 	// Retained only so a teardown failure can name the failure it displaces.
@@ -5316,8 +5664,21 @@ export async function runQueueAsync(options) {
 				checkpoint.retryState?.taskId === task.id
 					? checkpoint.retryState
 					: null;
+			const priorExtraAllocation = ensureProviderAttemptAllocations(
+				checkpoint,
+			).find((entry) => entry?.taskId === task.id);
 			let result;
-			if (retryState && !hasTrustedQuotaRetryEvidence(retryState)) {
+			if (!retryState && priorExtraAllocation) {
+				result = {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					result: "unknown_failure",
+					errorKind: "unknown_failure",
+					reason: "persisted extra provider invocation already consumed",
+				};
+			} else if (retryState && !hasTrustedQuotaRetryEvidence(retryState)) {
 				result = {
 					taskId: task.id,
 					success: false,
@@ -5424,6 +5785,7 @@ export async function runQueueAsync(options) {
 						effectiveExclude,
 						checkpoint.quarantinedTargetIds,
 					);
+					startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
 					result = await executeTaskAsync(task, context);
 					appendRetryAttempt(checkpoint, result, 2);
 					persistRetryTransition(checkpoint, checkpointPath, {
@@ -5447,7 +5809,17 @@ export async function runQueueAsync(options) {
 			} else {
 				result = await executeTaskAsync(task, context);
 			}
-			if (!retryState && isQuotaRetryCandidate(result, ownsWorkingContainer)) {
+			if (
+				!retryState &&
+				result.extraProviderInvocationUsed !== true &&
+				isQuotaRetryCandidate(result, ownsWorkingContainer) &&
+				allocateExtraProviderInvocation(
+					checkpoint,
+					checkpointPath,
+					task.id,
+					"quota_fallback",
+				)
+			) {
 				const targetId = normalizeRetryTargetId(result.resolvedTargetId);
 				appendRetryAttempt(checkpoint, result, 1);
 				persistRetryTransition(checkpoint, checkpointPath, {
@@ -5508,6 +5880,7 @@ export async function runQueueAsync(options) {
 						effectiveExclude,
 						checkpoint.quarantinedTargetIds,
 					);
+					startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
 					result = await executeTaskAsync(task, context);
 					appendRetryAttempt(checkpoint, result, 2);
 					persistRetryTransition(checkpoint, checkpointPath, {
@@ -5529,6 +5902,7 @@ export async function runQueueAsync(options) {
 					projectRetryState();
 				}
 			}
+			recordExtraProviderInvocationResult(checkpoint, checkpointPath, task.id);
 			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
@@ -5918,7 +6292,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			descriptorIdentity: invocationDescriptor.descriptor_identity,
 			descriptorHarness: routeResult.resolved_harness ?? null,
 			resolvedTargetId,
-			prompt: task.prompt || task.description || task.title,
+			prompt: taskPromptForAttempt(task, context._completionRequirements),
 			workingContainerName: context.workingContainerName,
 			taskBase: context._activeTaskBase,
 		});
@@ -6080,6 +6454,8 @@ export async function executeTaskWithOrchestrator(task, context) {
 		routeResult.resolved_harness ?? routeResult.provider,
 		context.adapters,
 	);
+	context._activeCompletionAdapter = adapter;
+	context._activeCompletionRoute = structuredClone(routeResult);
 	let captureEvidence;
 	try {
 		captureEvidence = await captureDiffWithEvidenceAsync(
@@ -6233,6 +6609,10 @@ export async function executeTaskWithOrchestrator(task, context) {
 		requiredCapability,
 		resolvedTargetId,
 		result: terminalResult,
+		captureStatus: captureEvidence.status,
+		...(Array.isArray(gateResult?.missingPaths)
+			? { missingPaths: [...gateResult.missingPaths] }
+			: {}),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
@@ -7556,6 +7936,7 @@ function prepareQueueLaunch({
 				},
 	);
 	ensureRetryCheckpoint(checkpoint);
+	ensureProviderAttemptAllocations(checkpoint);
 	validateRetryDescriptorEvidence(checkpoint);
 	assertCheckpointRecoverySafe(checkpoint);
 	const queueBackend = createQueueBackend({
@@ -7812,6 +8193,7 @@ export function runQueue(options) {
 		effectiveOnly,
 		effectiveTaskIds,
 	} = launch;
+	ensureProviderAttemptAllocations(checkpoint);
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
@@ -7941,6 +8323,7 @@ export function runQueue(options) {
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
+		ownsWorkingContainer,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
 		platform: selectedPlatform,
@@ -7960,6 +8343,12 @@ export function runQueue(options) {
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
 		resolveDescriptor: dependencies.resolveDescriptor,
 		checkIgnoredPath: dependencies.checkIgnoredPath,
+		completionContinuation: dependencies.completionContinuation ?? {
+			enabled: false,
+		},
+		completionContinuationMode: "sync",
+		now: dependencies.now ?? Date.now,
+		monotonicNow: dependencies.monotonicNow ?? (() => performance.now()),
 		exclude,
 		only,
 	};
@@ -8046,6 +8435,9 @@ export function runQueue(options) {
 				checkpoint.retryState?.taskId === task.id
 					? checkpoint.retryState
 					: null;
+			const priorExtraAllocation = ensureProviderAttemptAllocations(
+				checkpoint,
+			).find((entry) => entry?.taskId === task.id);
 			if (resumedRetryTaskId) {
 				resumedRetryTaskId = null;
 			} else {
@@ -8080,7 +8472,17 @@ export function runQueue(options) {
 			let retryTargetId = retryState?.resolvedTargetId ?? null;
 			const retryEvidenceMissing =
 				Boolean(retryState) && !hasTrustedQuotaRetryEvidence(retryState);
-			if (retryEvidenceMissing) {
+			if (!retryState && priorExtraAllocation) {
+				result = {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					result: "unknown_failure",
+					errorKind: "unknown_failure",
+					reason: "persisted extra provider invocation already consumed",
+				};
+			} else if (retryEvidenceMissing) {
 				// Historical model-only retry state is readable, but it cannot
 				// authorize a retry against an exact descriptor/target. Halt before
 				// reset, reroute, or adapter invocation; the normal finally path
@@ -8178,6 +8580,7 @@ export function runQueue(options) {
 							effectiveExclude,
 							checkpoint.quarantinedTargetIds,
 						);
+						startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
 						result = executeTask(task, context);
 					}
 				}
@@ -8189,7 +8592,23 @@ export function runQueue(options) {
 						descriptorReceiptFields(context._activeInvocationDescriptor),
 					);
 				}
-				if (isQuotaRetryCandidate(result, ownsWorkingContainer)) {
+				result = runCompletionCorrection(
+					task,
+					context,
+					result,
+					checkpoint,
+					checkpointPath,
+				);
+				if (
+					result.extraProviderInvocationUsed !== true &&
+					isQuotaRetryCandidate(result, ownsWorkingContainer) &&
+					allocateExtraProviderInvocation(
+						checkpoint,
+						checkpointPath,
+						task.id,
+						"quota_fallback",
+					)
+				) {
 					const targetId = normalizeRetryTargetId(result.resolvedTargetId);
 					retryUsed = true;
 					retryTargetId = targetId;
@@ -8265,6 +8684,7 @@ export function runQueue(options) {
 							effectiveExclude,
 							checkpoint.quarantinedTargetIds,
 						);
+						startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
 						result = executeTask(task, context);
 					}
 				}
@@ -8285,6 +8705,7 @@ export function runQueue(options) {
 			if (retryUsed) {
 				appendRetryAttempt(checkpoint, result, 2);
 			}
+			recordExtraProviderInvocationResult(checkpoint, checkpointPath, task.id);
 			if (context._activeInvocationDescriptor) {
 				Object.assign(
 					result,
@@ -8714,6 +9135,7 @@ export async function runQueueWithOrchestrator(options) {
 		effectiveOnly,
 		effectiveTaskIds,
 	} = launch;
+	ensureProviderAttemptAllocations(checkpoint);
 
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
@@ -8796,6 +9218,7 @@ export async function runQueueWithOrchestrator(options) {
 		adapters: dependencies.adapters ?? DEFAULT_ADAPTERS,
 		projectPath,
 		workingContainerName,
+		ownsWorkingContainer,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
 		platform: selectedPlatform,
@@ -8820,6 +9243,11 @@ export async function runQueueWithOrchestrator(options) {
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
 		resolveDescriptor: dependencies.resolveDescriptor,
 		checkIgnoredPath: dependencies.checkIgnoredPath,
+		completionContinuation: dependencies.completionContinuation ?? {
+			enabled: false,
+		},
+		completionContinuationMode: "unavailable",
+		monotonicNow: dependencies.monotonicNow ?? (() => performance.now()),
 	};
 
 	try {
@@ -8901,8 +9329,24 @@ export async function runQueueWithOrchestrator(options) {
 				});
 			}
 
-			// eslint-disable-next-line no-await-in-loop
-			const result = await executeTaskWithOrchestrator(task, context);
+			const priorExtraAllocation = ensureProviderAttemptAllocations(
+				checkpoint,
+			).find((entry) => entry?.taskId === task.id);
+			let result;
+			if (priorExtraAllocation) {
+				result = {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					result: "unknown_failure",
+					errorKind: "unknown_failure",
+					reason: "persisted extra provider invocation already consumed",
+				};
+			} else {
+				// eslint-disable-next-line no-await-in-loop
+				result = await executeTaskWithOrchestrator(task, context);
+			}
 			if (context._activeInvocationDescriptor) {
 				Object.assign(
 					result,

@@ -23,6 +23,56 @@ const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_DIAGNOSTIC_CHARS = 800;
 
 /**
+ * Verify the narrow lifecycle fact required before a completed provider may
+ * be invoked again in the same workspace.  Adapters must opt in explicitly:
+ * a process exit alone says nothing about children it may have left behind.
+ *
+ * This intentionally returns false for legacy adapters.  A caller must not
+ * infer support from a PID, heartbeat, or a missing status file.
+ */
+function completionProofMatches(proof, expected) {
+	return (
+		proof?.version === 1 &&
+		proof?.kind === "completion_continuation_lifecycle" &&
+		proof.providerExited === true &&
+		proof.childrenExited === true &&
+		proof.cleanupSucceeded === true &&
+		proof.taskId === expected.taskId &&
+		proof.attemptId === expected.attemptId &&
+		proof.descriptorIdentity === expected.descriptorIdentity &&
+		proof.workspaceId === expected.workingContainerName
+	);
+}
+
+/** Validate the host-owned lifecycle receipt returned with the completed
+ * invocation. This performs no callback, polling or provider I/O. */
+export function verifyCompletionContinuationSync(adapter, context) {
+	if (adapter?.supportsCompletionContinuation !== true) {
+		return false;
+	}
+	try {
+		context.onStatus?.({
+			phase: "lifecycle",
+			event: "completion_continuation_proof_started",
+			status: `Task ${context.taskId} continuation lifecycle proof started`,
+			taskId: context.taskId,
+		});
+		const proof = context.lifecycleReceipt;
+		const accepted = completionProofMatches(proof, context);
+		context.onStatus?.({
+			phase: "lifecycle",
+			event: "completion_continuation_proof_completed",
+			status: `Task ${context.taskId} continuation lifecycle proof ${accepted ? "accepted" : "declined"}`,
+			taskId: context.taskId,
+			accepted,
+		});
+		return accepted;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Resolve the complete transport invocation for one provider command. The
  * backend owns the command, the workspace prefix, any transport option needed
  * to deliver stdin, and — on a transport that re-parses its argument vector in
