@@ -56,6 +56,7 @@ import {
 	resolveTargetIdentity,
 } from "../src/switchyard/roster/index.mjs";
 import {
+	evaluateCandidateEligibility,
 	preflightMacosQueue,
 	route,
 	routeBlind,
@@ -258,13 +259,12 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 		process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
 		__resetRosterCacheForTests();
 		try {
-			createTestSnapshot([
-				{
-					name: "Vibe",
-					ok: true,
-					windows: [{ percent_left: 90, pace_delta: 50 }],
-				},
-			]);
+			const provider = {
+				name: "Vibe",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 50 }],
+			};
+			createTestSnapshot([provider]);
 			const result = route({
 				requiredCapability: "low",
 				availableProviders: ["opencode"],
@@ -285,6 +285,31 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			});
 			strictEqual(explicit.provider, null);
 			strictEqual(explicit.reason, "no_eligible");
+
+			const policy = {
+				requiredCapability: "low",
+				availableProviders: ["opencode"],
+				platform: "macos",
+				goldenImageVerifiedProviders: ["vibe"],
+			};
+			strictEqual(route({ ...policy }).provider, null);
+			strictEqual(routeBlind(["Vibe"], [], "low", policy).provider, null);
+			const preflight = preflightMacosQueue({
+				...policy,
+				tasks: [{ status: "pending", requiredCapability: "low" }],
+				readSnapshot: () => ({
+					snapshot: {
+						schema_version: 2,
+						updated_at: new Date().toISOString(),
+						providers: [provider],
+					},
+					snapshotStatus: "fresh",
+				}),
+			});
+			strictEqual(
+				preflight.capabilityResults[0].excludedReasons.Vibe,
+				"no_invocation_descriptor",
+			);
 		} finally {
 			if (previousRosterPath === undefined) {
 				delete process.env.SWITCHYARD_ROSTER_PATH;
@@ -454,6 +479,35 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			"fixture-disabled Vibe must never be selected, even at " +
 				"the lowest required capability and with the most headroom",
 		);
+		strictEqual(
+			routeBlind(["vibe"], [], "low", {
+				platform: "macos",
+				goldenImageVerifiedProviders: ["vibe"],
+			}).provider,
+			null,
+		);
+		const disabledPreflight = preflightMacosQueue({
+			tasks: [{ status: "pending", requiredCapability: "low" }],
+			goldenImageVerifiedProviders: ["vibe"],
+			readSnapshot: () => ({
+				snapshot: {
+					schema_version: 2,
+					updated_at: new Date().toISOString(),
+					providers: [
+						{
+							name: "vibe",
+							ok: true,
+							windows: [{ percent_left: 90, pace_delta: 50 }],
+						},
+					],
+				},
+				snapshotStatus: "fresh",
+			}),
+		});
+		strictEqual(
+			disabledPreflight.capabilityResults[0].excludedReasons.vibe,
+			"below_required_capability",
+		);
 	});
 
 	it("--only-provider cannot force a fixture-disabled Vibe target into the candidate set", () => {
@@ -548,7 +602,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			// Spark deliberately holds the most headroom: if the identifier matched
 			// both targets, INV-4's most-headroom spread would hand the route to
 			// Spark, so "Codex" below is a positive result and not a tie default.
-			createTestSnapshot([
+			const providers = [
 				{
 					name: "Codex",
 					ok: true,
@@ -559,10 +613,48 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 					ok: true,
 					windows: [{ percent_left: 95, pace_delta: 0 }],
 				},
-			]);
+			];
+			createTestSnapshot(providers);
+			const snapshotRead = {
+				snapshot: {
+					schema_version: 2,
+					updated_at: new Date().toISOString(),
+					providers,
+				},
+				snapshotStatus: "fresh",
+				snapshotMtime: 1,
+				snapshotAgeMsAtRoute: 0,
+			};
+			const sparkQualificationPolicy = {
+				requiredCapability: "low",
+				only: ["codex"],
+				platform: "macos",
+				goldenImageVerifiedProviders: ["codex-spark"],
+			};
 			return {
 				onlyCodex: route({ requiredCapability: "low", only: ["codex"] }),
 				unfiltered: route({ requiredCapability: "low" }),
+				codexWithOwnQualification: route({
+					requiredCapability: "low",
+					only: ["codex"],
+					platform: "macos",
+					goldenImageVerifiedProviders: ["codex"],
+				}),
+				codexWithSparkQualification: route({
+					...sparkQualificationPolicy,
+					snapshotRead,
+				}),
+				blindCodexWithSparkQualification: routeBlind(
+					["Codex"],
+					[],
+					"low",
+					sparkQualificationPolicy,
+				),
+				preflightCodexWithSparkQualification: preflightMacosQueue({
+					...sparkQualificationPolicy,
+					tasks: [{ status: "pending", requiredCapability: "low" }],
+					readSnapshot: () => snapshotRead,
+				}),
 			};
 		};
 		try {
@@ -575,6 +667,17 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			// capability filtered out), proving nothing about disambiguation.
 			strictEqual(withSnapshotName.unfiltered.provider, "Codex (Spark)");
 			strictEqual(withSnapshotName.onlyCodex.provider, "Codex");
+			strictEqual(withSnapshotName.codexWithOwnQualification.provider, "Codex");
+			strictEqual(withSnapshotName.codexWithSparkQualification.provider, null);
+			strictEqual(
+				withSnapshotName.blindCodexWithSparkQualification.provider,
+				null,
+			);
+			strictEqual(
+				withSnapshotName.preflightCodexWithSparkQualification
+					.capabilityResults[0].excludedReasons.Codex,
+				"not_golden_image_verified",
+			);
 			strictEqual(
 				routeOnlyCodex(buildDualCodexRoster({ incumbentSnapshotName: null }))
 					.onlyCodex.provider,
@@ -1399,6 +1502,213 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 
 		strictEqual(result.eligible, true);
 		strictEqual(result.reason, "no_non_terminal_tasks");
+	});
+});
+
+describe("Task 2.1 shared candidate eligibility", () => {
+	it("applies one policy table across preflight, observed routing, and blind routing", () => {
+		const cases = [
+			{
+				label: "qualified exact codex target",
+				name: "codex",
+				policy: {
+					platform: "macos",
+					goldenImageVerifiedProviders: ["codex"],
+				},
+				observed: "eligible",
+				unknown: "eligible",
+			},
+			{
+				label: "below required capability",
+				name: "OpenCode Go",
+				availableProviders: ["opencode"],
+				policy: {
+					platform: "macos",
+					requiredCapability: "high",
+					goldenImageVerifiedProviders: ["opencode-go"],
+				},
+				observed: "below_required_capability",
+				unknown: "below_required_capability",
+			},
+			{
+				label: "explicit exclusion",
+				name: "codex",
+				policy: { platform: "macos", exclude: ["codex"] },
+				observed: "explicitly_excluded",
+				unknown: "explicitly_excluded",
+			},
+			{
+				label: "only allowlist",
+				name: "codex",
+				policy: { platform: "macos", only: ["claude"] },
+				observed: "not_in_only_allowlist",
+				unknown: "not_in_only_allowlist",
+			},
+			{
+				label: "direct routing does not inherit the macOS gate",
+				name: "claude",
+				policy: {
+					platform: "direct",
+					goldenImageVerifiedProviders: [],
+				},
+				observed: "eligible",
+				unknown: "eligible",
+			},
+			{
+				label: "unknown usage does not invent quota exhaustion",
+				name: "codex",
+				percentLeft: 0,
+				policy: {
+					platform: "macos",
+					goldenImageVerifiedProviders: ["codex"],
+				},
+				observed: "no_quota_headroom",
+				unknown: "eligible",
+			},
+		];
+
+		for (const fixture of cases) {
+			const provider = {
+				name: fixture.name,
+				ok: true,
+				windows: [{ percent_left: fixture.percentLeft ?? 80, pace_delta: 1 }],
+			};
+			const policy = {
+				requiredCapability: "standard",
+				availableProviders: fixture.availableProviders ?? [fixture.name],
+				...fixture.policy,
+			};
+			const snapshotRead = {
+				snapshot: {
+					schema_version: 2,
+					updated_at: new Date().toISOString(),
+					providers: [provider],
+				},
+				snapshotStatus: "fresh",
+				snapshotMtime: 1,
+				snapshotAgeMsAtRoute: 0,
+			};
+			const observed = evaluateCandidateEligibility(fixture.name, provider, {
+				...policy,
+				usageMode: "observed",
+			});
+			const unknown = evaluateCandidateEligibility(fixture.name, null, {
+				...policy,
+				usageMode: "unknown",
+			});
+			strictEqual(
+				observed.reason,
+				fixture.observed,
+				`${fixture.label}: observed`,
+			);
+			strictEqual(unknown.reason, fixture.unknown, `${fixture.label}: unknown`);
+			strictEqual(
+				route({ ...policy, snapshotRead }).provider !== null,
+				observed.eligible,
+				`${fixture.label}: runtime`,
+			);
+			strictEqual(
+				routeBlind(
+					[fixture.name],
+					policy.exclude,
+					policy.requiredCapability,
+					policy,
+				).provider !== null,
+				unknown.eligible,
+				`${fixture.label}: blind`,
+			);
+			if (policy.platform === "macos") {
+				const preflight = preflightMacosQueue({
+					...policy,
+					tasks: [
+						{
+							status: "pending",
+							requiredCapability: policy.requiredCapability,
+						},
+					],
+					readSnapshot: () => snapshotRead,
+				});
+				strictEqual(
+					preflight.capabilityResults[0].eligible,
+					observed.eligible,
+					`${fixture.label}: preflight verdict`,
+				);
+				if (!observed.eligible) {
+					strictEqual(
+						preflight.capabilityResults[0].excludedReasons[fixture.name],
+						observed.reason,
+						`${fixture.label}: preflight reason`,
+					);
+				}
+			}
+		}
+	});
+
+	it("keeps macOS preflight, observed routing, and blind routing inside the same qualified set", () => {
+		const claude = {
+			name: "claude",
+			ok: true,
+			windows: [{ percent_left: 80, pace_delta: 1 }],
+		};
+		const policy = {
+			requiredCapability: "standard",
+			platform: "macos",
+			availableProviders: ["claude"],
+			goldenImageVerifiedProviders: ["codex"],
+		};
+		const snapshotRead = {
+			snapshot: {
+				schema_version: 2,
+				updated_at: new Date().toISOString(),
+				providers: [claude],
+			},
+			snapshotStatus: "fresh",
+			snapshotMtime: 1,
+			snapshotAgeMsAtRoute: 0,
+		};
+		strictEqual(
+			evaluateCandidateEligibility(claude.name, claude, policy).reason,
+			"not_golden_image_verified",
+		);
+		const preflight = preflightMacosQueue({
+			tasks: [{ status: "pending", requiredCapability: "standard" }],
+			availableProviders: ["claude"],
+			goldenImageVerifiedProviders: ["codex"],
+			readSnapshot: () => snapshotRead,
+		});
+		strictEqual(
+			preflight.capabilityResults[0].excludedReasons.claude,
+			"not_golden_image_verified",
+		);
+		const observed = route({
+			...policy,
+			snapshotRead,
+		});
+		strictEqual(observed.provider, null);
+		strictEqual(routeBlind(["claude"], [], "standard", policy).provider, null);
+	});
+
+	it("does not treat missing usage evidence as quota exhaustion in blind mode", () => {
+		const policy = {
+			requiredCapability: "standard",
+			platform: "macos",
+			availableProviders: ["codex"],
+			goldenImageVerifiedProviders: ["codex"],
+		};
+		strictEqual(
+			evaluateCandidateEligibility("codex", null, {
+				...policy,
+				usageMode: "unknown",
+			}).eligible,
+			true,
+		);
+		strictEqual(
+			evaluateCandidateEligibility("codex", null, {
+				...policy,
+				usageMode: "observed",
+			}).reason,
+			"provider_unavailable",
+		);
 	});
 });
 

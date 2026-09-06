@@ -15,7 +15,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	CAPABILITY_CLASS,
-	getCapabilityClass,
 	getImplementorPriority,
 	getRightSizedModel,
 	hasAutomaticInvocationDescriptor,
@@ -247,23 +246,51 @@ function hasQuotaHeadroom(name, windows, floor) {
 }
 
 /**
- * Determine whether a snapshot provider is an adapter- and selector-eligible
- * candidate for one capability tier. This intentionally mirrors the gates in
- * `route()` without invoking it, so one preflight evaluates one snapshot
- * generation for every task tier.
+ * Pure eligibility decision shared by preflight, observed routing, and blind
+ * routing. Ranking is intentionally outside this predicate.
  *
  * @param {string} name
  * @param {object} provider
- * @param {string} capability
  * @param {object} options
+ * @param {string} [options.platform="direct"]
+ * @param {"observed"|"unknown"} [options.usageMode="observed"]
  * @returns {{eligible: boolean, reason: string}}
  */
-function classifyPreflightProvider(name, provider, capability, options) {
-	const { exclude, only, floor, isAvailable, verifiedProviders } = options;
+export function evaluateCandidateEligibility(name, provider, options = {}) {
+	const {
+		requiredCapability = CAPABILITY_CLASS.standard,
+		exclude = [],
+		only = [],
+		availableProviders,
+		floor = DEFAULT_FLOOR,
+		platform = "direct",
+		usageMode = "observed",
+		goldenImageVerifiedProviders = GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+	} = options;
+	if (!new Set(["direct", "macos"]).has(platform)) {
+		return { eligible: false, reason: "invalid_platform" };
+	}
+	if (!new Set(["observed", "unknown"]).has(usageMode)) {
+		return { eligible: false, reason: "invalid_usage_mode" };
+	}
 	const targetIdentity = resolveTargetIdentity(name);
 	if (!targetIdentity.targetId) {
 		return { eligible: false, reason: "target_identity_unavailable" };
 	}
+	const isAvailable = (candidate) => {
+		if (!availableProviders) return true;
+		const requestedIdentity = resolveTargetIdentity(candidate);
+		const requestedHarness = requestedIdentity.targetId
+			? requestedIdentity.harnessKey
+			: normalizeProviderName(candidate);
+		return availableProviders.some((available) => {
+			const availableIdentity = resolveTargetIdentity(available);
+			const availableHarness = availableIdentity.targetId
+				? availableIdentity.harnessKey
+				: normalizeProviderName(available);
+			return availableHarness === requestedHarness;
+		});
+	};
 	if (!isAvailable(name)) {
 		return { eligible: false, reason: "adapter_unavailable" };
 	}
@@ -276,12 +303,23 @@ function classifyPreflightProvider(name, provider, capability, options) {
 	) {
 		return { eligible: false, reason: "not_in_only_allowlist" };
 	}
-	if (!passesCapabilityFilter(name, capability)) {
+	if (!passesCapabilityFilter(name, requiredCapability)) {
 		return { eligible: false, reason: "below_required_capability" };
 	}
-	if (!hasAutomaticInvocationDescriptor(name, capability)) {
+	if (!hasAutomaticInvocationDescriptor(name, requiredCapability)) {
 		return { eligible: false, reason: "no_invocation_descriptor" };
 	}
+	if (
+		platform === "macos" &&
+		!goldenImageVerifiedProviders.some((verified) =>
+			goldenImageProviderMatches(verified, name),
+		)
+	) {
+		return { eligible: false, reason: "not_golden_image_verified" };
+	}
+	// Unknown usage is the blind-fallback case: the absence of a snapshot is
+	// not evidence of quota exhaustion. Every non-usage gate above still holds.
+	if (usageMode === "unknown") return { eligible: true, reason: "eligible" };
 	if (!provider?.ok) {
 		return { eligible: false, reason: "provider_unavailable" };
 	}
@@ -292,13 +330,6 @@ function classifyPreflightProvider(name, provider, capability, options) {
 	);
 	if (windows.length === 0 || !hasQuotaHeadroom(name, windows, floor)) {
 		return { eligible: false, reason: "no_quota_headroom" };
-	}
-	if (
-		!verifiedProviders.some((verified) =>
-			goldenImageProviderMatches(verified, name),
-		)
-	) {
-		return { eligible: false, reason: "not_golden_image_verified" };
 	}
 	return { eligible: true, reason: "eligible" };
 }
@@ -483,20 +514,6 @@ export function preflightMacosQueue(options = {}) {
 	const verifiedProviders =
 		options.goldenImageVerifiedProviders ?? GOLDEN_IMAGE_VERIFIED_PROVIDERS;
 	const normalizedFloor = Number.isFinite(floor) ? floor : DEFAULT_FLOOR;
-	const isAvailable = (name) => {
-		if (!availableProviders) return true;
-		const requestedIdentity = resolveTargetIdentity(name);
-		const requestedHarness = requestedIdentity.targetId
-			? requestedIdentity.harnessKey
-			: normalizeProviderName(name);
-		return availableProviders.some((provider) => {
-			const providerIdentity = resolveTargetIdentity(provider);
-			const availableHarness = providerIdentity.targetId
-				? providerIdentity.harnessKey
-				: normalizeProviderName(provider);
-			return availableHarness === requestedHarness;
-		});
-	};
 	const providers = indexProviders(snapshot);
 	const capabilityResults = [];
 	const rejections = [];
@@ -521,19 +538,16 @@ export function preflightMacosQueue(options = {}) {
 		const excludedReasons = {};
 		const eligibleProviders = [];
 		for (const [name, provider] of providers) {
-			const classification = classifyPreflightProvider(
-				name,
-				provider,
-				capability,
-				{
-					exclude,
-					only,
-					availableProviders,
-					floor: normalizedFloor,
-					isAvailable,
-					verifiedProviders,
-				},
-			);
+			const classification = evaluateCandidateEligibility(name, provider, {
+				exclude,
+				only,
+				availableProviders,
+				floor: normalizedFloor,
+				platform,
+				requiredCapability: capability,
+				usageMode: "observed",
+				goldenImageVerifiedProviders: verifiedProviders,
+			});
 			if (classification.eligible) {
 				eligibleProviders.push(name);
 			} else {
@@ -613,6 +627,8 @@ export function route(options = {}) {
 		floor = DEFAULT_FLOOR,
 		requiredCapability,
 		availableProviders,
+		platform = "direct",
+		goldenImageVerifiedProviders,
 		nowMs = Date.now(),
 		snapshotRead: suppliedSnapshotRead,
 	} = options;
@@ -626,26 +642,6 @@ export function route(options = {}) {
 	// are validated by the runner boundary (and by the roster filter below).
 	const effectiveCapabilityClass =
 		requiredCapability ?? CAPABILITY_CLASS.standard;
-	const isAvailable = (name) => {
-		if (!availableProviders) return true;
-		/*
-		 * A snapshot display name can identify a target whose harness is shared
-		 * with another target. Resolve the display name to its declared harness
-		 * before comparing it with the adapter registry; normalizing only the
-		 * display name would incorrectly reject a shared-harness route.
-		 */
-		const requestedIdentity = resolveTargetIdentity(name);
-		const requestedHarness = requestedIdentity.targetId
-			? requestedIdentity.harnessKey
-			: normalizeProviderName(name);
-		return availableProviders.some((provider) => {
-			const providerIdentity = resolveTargetIdentity(provider);
-			const availableHarness = providerIdentity.targetId
-				? providerIdentity.harnessKey
-				: normalizeProviderName(provider);
-			return availableHarness === requestedHarness;
-		});
-	};
 
 	// Read snapshot host-side (WR-1). All route-time diagnostics below come
 	// from this one resolved path/content read, so status, mtime, and age cannot
@@ -660,6 +656,18 @@ export function route(options = {}) {
 		snapshotMtime,
 		snapshotAgeMsAtRoute,
 	};
+	if (platform !== "direct" && platform !== "macos") {
+		return {
+			provider: null,
+			model: null,
+			percentLeft: null,
+			resolvedTargetId: null,
+			requiredCapability: effectiveCapabilityClass,
+			reason: "invalid_platform",
+			log: [`invalid routing platform: ${platform}`],
+			...snapshotDiagnostics,
+		};
+	}
 
 	const ambiguousFilter = [...exclude, ...only].find(
 		(identifier) => resolveTargetIdentity(identifier).ambiguous,
@@ -685,21 +693,13 @@ export function route(options = {}) {
 		// must not silently halt every task behind it. Candidates are ordered
 		// by roster declaration order (highest capability first) and still
 		// respect the capability filter and caller-supplied availability/exclude.
-		const unresolvedBlind = [];
-		const blindOrder = Object.keys(PROVIDER_CAPABILITIES).filter((name) => {
-			const identity = resolveTargetIdentity(name);
-			if (!identity.targetId) {
-				if (identity.ambiguous) unresolvedBlind.push(name);
-				return false;
-			}
-			return (
-				isAvailable(name) &&
-				passesCapabilityFilter(name, effectiveCapabilityClass) &&
-				hasAutomaticInvocationDescriptor(name, effectiveCapabilityClass) &&
-				(only.length === 0 || only.some((o) => providerMatches(o, name)))
-			);
+		const blindOrder = Object.keys(PROVIDER_CAPABILITIES);
+		const blind = routeBlind(blindOrder, exclude, effectiveCapabilityClass, {
+			only,
+			availableProviders,
+			platform,
+			goldenImageVerifiedProviders,
 		});
-		const blind = routeBlind(blindOrder, exclude, effectiveCapabilityClass);
 		const model = blind.provider
 			? getRightSizedModel(blind.provider, effectiveCapabilityClass)
 			: null;
@@ -709,17 +709,8 @@ export function route(options = {}) {
 			percentLeft: null,
 			resolvedTargetId: blind.provider ? resolveTargetId(blind.provider) : null,
 			requiredCapability: effectiveCapabilityClass,
-			reason:
-				blind.provider || unresolvedBlind.length === 0
-					? blind.reason
-					: "quarantine_unresolvable",
-			log: [
-				...log,
-				...(unresolvedBlind.length > 0
-					? [`ambiguous blind targets skipped: ${unresolvedBlind.join(", ")}`]
-					: []),
-				`blind candidates: ${blindOrder.join(", ") || "none"}`,
-			],
+			reason: blind.reason,
+			log: [...log, `blind candidates: ${blindOrder.join(", ") || "none"}`],
 			...snapshotDiagnostics,
 		};
 	}
@@ -778,70 +769,46 @@ export function route(options = {}) {
 	for (const [name, provider] of providers) {
 		// CR-3: tolerate absent providers - but we're iterating present ones,
 		// absent providers simply won't be in the map. This is the tolerance.
-		const targetIdentity = resolveTargetIdentity(name);
-		if (!targetIdentity.targetId) {
-			otherSkips += 1;
-			unresolvedTargetSkips += 1;
-			if (targetIdentity.ambiguous) ambiguousTargetSkips += 1;
-			log.push(
-				`provider ${name}: target identity unavailable${targetIdentity.ambiguous ? " (ambiguous harness)" : ""}`,
-			);
-			continue;
-		}
-
-		if (!isAvailable(name)) {
-			otherSkips += 1;
-			log.push(`provider ${name}: no adapter available for this dispatcher`);
-			continue;
-		}
-
-		if (exclude.some((excluded) => providerMatches(excluded, name))) {
-			otherSkips += 1;
-			log.push(`provider ${name}: explicitly excluded`);
-			continue;
-		}
-
-		if (only.length > 0 && !only.some((o) => providerMatches(o, name))) {
-			otherSkips += 1;
-			log.push(`provider ${name}: not in --only-provider allowlist`);
-			continue;
-		}
-
-		// INV-5: Capability filter - skip providers below the task's required
-		// capability.
-		if (!passesCapabilityFilter(name, effectiveCapabilityClass)) {
-			ceilingSkips += 1;
-			log.push(
-				`provider ${name}: below required capability ${effectiveCapabilityClass}`,
-			);
-			continue;
-		}
-
-		// Selector-only compatibility qualifications can describe an eligible
-		// capability lane, but automatic dispatch needs current, exact evidence
-		// for the target/model/argv it would transmit. Keep an explicitly named
-		// target distinct: it is rejected here rather than falling through to a
-		// sibling that shares its harness.
-		if (!hasAutomaticInvocationDescriptor(name, effectiveCapabilityClass)) {
-			otherSkips += 1;
-			log.push(
-				`provider ${name}: no current exact invocation descriptor for ${effectiveCapabilityClass}`,
-			);
-			continue;
-		}
-
-		if (!provider.ok) {
-			if (firstUnavailable === null) {
-				firstUnavailable = { name, error: provider.error ?? null };
+		const eligibility = evaluateCandidateEligibility(name, provider, {
+			requiredCapability: effectiveCapabilityClass,
+			exclude,
+			only,
+			availableProviders,
+			floor,
+			platform,
+			usageMode: "observed",
+			goldenImageVerifiedProviders,
+		});
+		if (!eligibility.eligible) {
+			if (eligibility.reason === "below_required_capability") {
+				ceilingSkips += 1;
+			} else if (eligibility.reason === "provider_unavailable") {
+				if (firstUnavailable === null) {
+					firstUnavailable = { name, error: provider.error ?? null };
+				}
+			} else {
+				otherSkips += 1;
+				if (eligibility.reason === "target_identity_unavailable") {
+					unresolvedTargetSkips += 1;
+					if (resolveTargetIdentity(name).ambiguous) ambiguousTargetSkips += 1;
+				}
 			}
-			log.push(`provider ${name}: unavailable (ok=false)`);
+			const rejectionLog = {
+				target_identity_unavailable: `provider ${name}: target identity unavailable`,
+				adapter_unavailable: `provider ${name}: no adapter available for this dispatcher`,
+				explicitly_excluded: `provider ${name}: explicitly excluded`,
+				not_in_only_allowlist: `provider ${name}: not in --only-provider allowlist`,
+				below_required_capability: `provider ${name}: below required capability ${effectiveCapabilityClass}`,
+				no_invocation_descriptor: `provider ${name}: no current exact invocation descriptor for ${effectiveCapabilityClass}`,
+				provider_unavailable: `provider ${name}: unavailable (ok=false)`,
+			};
+			log.push(
+				rejectionLog[eligibility.reason] ??
+					`provider ${name}: ${eligibility.reason}`,
+			);
 			continue;
 		}
 
-		// Task 13: require finite percent_left, matching the pace filter below.
-		// typeof NaN === "number", so a NaN'd window would otherwise pass here,
-		// propagate through minPercentLeft, and (NaN < floor === false) evade the
-		// exhausted-skip — an INV-4 bypass.
 		const windows = (provider.windows ?? []).filter(
 			(w) =>
 				typeof w?.percent_left === "number" && Number.isFinite(w.percent_left),
@@ -1099,8 +1066,10 @@ export function routeBlind(
 	providerOrder,
 	exclude = [],
 	requiredCapability = CAPABILITY_CLASS.standard,
+	options = {},
 ) {
-	const ambiguousFilter = exclude.find(
+	const only = options.only ?? [];
+	const ambiguousFilter = [...exclude, ...only].find(
 		(identifier) => resolveTargetIdentity(identifier).ambiguous,
 	);
 	if (ambiguousFilter) {
@@ -1113,9 +1082,17 @@ export function routeBlind(
 	}
 
 	for (const name of providerOrder) {
-		const identity = resolveTargetIdentity(name);
-		if (!identity.targetId) {
-			if (identity.ambiguous) {
+		const eligibility = evaluateCandidateEligibility(name, null, {
+			...options,
+			exclude,
+			only,
+			requiredCapability,
+			usageMode: "unknown",
+		});
+		if (!eligibility.eligible) {
+			if (eligibility.reason === "target_identity_unavailable") {
+				const identity = resolveTargetIdentity(name);
+				if (!identity.ambiguous) continue;
 				return {
 					provider: null,
 					model: null,
@@ -1125,22 +1102,12 @@ export function routeBlind(
 			}
 			continue;
 		}
-		// Blind callers may provide an explicit order, so repeat the roster's
-		// automatic-eligibility gates here. An explicitly disabled or
-		// selector-only target cannot bypass route()'s generated blindOrder.
-		if (getCapabilityClass(name) === null) continue;
-		if (!hasAutomaticInvocationDescriptor(name, requiredCapability)) continue;
-		const excluded = exclude.some((excludedName) =>
-			providerMatches(excludedName, name),
-		);
-		if (!excluded) {
-			return {
-				provider: name,
-				model: null,
-				resolvedTargetId: identity.targetId,
-				reason: "blind_fallback",
-			};
-		}
+		return {
+			provider: name,
+			model: null,
+			resolvedTargetId: resolveTargetId(name),
+			reason: "blind_fallback",
+		};
 	}
 	return {
 		provider: null,

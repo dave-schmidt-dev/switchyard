@@ -2510,19 +2510,24 @@ describe("async runner provider lifecycle", () => {
 			model: "fake-model",
 		});
 		let settled = false;
+		const routeOptions = [];
 		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: root,
 			workingContainerName: "async-worker",
 			checkpointPath,
 			dependencies: {
-				route: () => ({
-					provider: "opencode",
-					resolved_harness: "opencode",
-					resolvedTargetId: "async-target",
-					model: "fake-model",
-					invocationDescriptor: descriptor,
-				}),
+				route: (options) => {
+					routeOptions.push(options);
+					return {
+						provider: "opencode",
+						resolved_harness: "opencode",
+						resolvedTargetId: "async-target",
+						model: "fake-model",
+						invocationDescriptor: descriptor,
+					};
+				},
+				goldenImageVerifiedProviders: ["opencode-go"],
 				resolveDescriptor: () => descriptor,
 				recordDispatch: () => {},
 				adapters: {
@@ -2540,6 +2545,13 @@ describe("async runner provider lifecycle", () => {
 		});
 		strictEqual(settled, true);
 		strictEqual(result.results[0].success, true);
+		const brokerRouteOptions = routeOptions.find(
+			(options) => options.platform === "macos",
+		);
+		strictEqual(brokerRouteOptions.platform, "macos");
+		deepStrictEqual(brokerRouteOptions.goldenImageVerifiedProviders, [
+			"opencode-go",
+		]);
 		strictEqual(result.processedTasks, 1);
 		strictEqual(result.completedTaskIds[0], "4.1");
 	});
@@ -4425,6 +4437,83 @@ describe("runner headless orchestrator mode", () => {
 });
 
 describe("runner provider spread recording", { concurrency: false }, () => {
+	it("revalidates default macOS qualification immediately before fake adapter launch", () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Runtime qualification
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** exercise the production router through the runner
+`);
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const snapshotPath = join(
+			tmpdir(),
+			`switchyard-runtime-qualification-${process.pid}-${randomUUID()}.json`,
+		);
+		const previousSnapshotPath = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
+		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		const qualifiedRosterPath = writeDispatchQualifiedRosterFixture();
+		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedRosterPath;
+		__resetRosterCacheForTests();
+		try {
+			writeFileSync(
+				snapshotPath,
+				JSON.stringify({
+					schema_version: 2,
+					updated_at: new Date().toISOString(),
+					providers: [
+						{ name: "claude", ok: true, windows: [{ percent_left: 99 }] },
+						{ name: "codex", ok: true, windows: [{ percent_left: 20 }] },
+					],
+				}),
+				"utf8",
+			);
+			const result = runQueueImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				checkpointPath,
+				platform: "macos",
+				dependencies: {
+					queuePreflight: () => ({ ok: true, eligible: true }),
+					recordDispatchIntent: () => {},
+					recordDispatch: () => {},
+					integrationGate: () => ({ success: true }),
+					backendFactory: () => ({
+						create: () => "fake-container",
+						destroy: () => {},
+						seed: () => {},
+						commit: () => {},
+						reset: () => {},
+					}),
+					adapters: {
+						claude: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/a b/a",
+						},
+						codex: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => "diff --git a/a b/a",
+						},
+					},
+				},
+			});
+			strictEqual(result.results[0].provider, "codex");
+		} finally {
+			if (previousSnapshotPath === undefined) {
+				delete process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
+			} else {
+				process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = previousSnapshotPath;
+			}
+			if (previousRosterPath === undefined)
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
+			__resetRosterCacheForTests();
+			rmSync(snapshotPath, { force: true });
+			rmSync(qualifiedRosterPath, { force: true });
+		}
+	});
 	it("records split dispatches across claude and codex", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -4564,6 +4653,7 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 				workingContainerName: "fake-container",
 				checkpointPath,
 				dependencies: {
+					goldenImageVerifiedProviders: ["claude", "codex"],
 					recordDispatch: (entry) => {
 						dispatches.push(entry);
 						if (dispatches.length === 1) {
@@ -4676,6 +4766,7 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 				checkpointPath,
 				dependencies: {
 					// Real router (not mocked) — only override recordDispatch/adapters.
+					goldenImageVerifiedProviders: ["claude"],
 					recordDispatch: (entry) => dispatches.push(entry),
 					integrationGate: () => ({ success: true, message: "ok" }),
 					adapters: {
@@ -5702,6 +5793,7 @@ runQueue({
     route,
     resolveDescriptor: () => latestDescriptor,
     recordDispatch: () => {},
+		recordDispatchIntent: () => {},
     integrationGate: () => ({ success: true }),
     // No real routing snapshot exists in this child process's cwd; the
     // default macOS preflight gate is irrelevant to what this test proves,
@@ -10619,12 +10711,16 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",
 				only: ["codex"],
+				platform: "macos",
+				goldenImageVerifiedProviders: ["codex"],
 			},
 		);
 
 		strictEqual(routeCalls.length, 1);
 		deepStrictEqual(routeCalls[0].only, ["codex"]);
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
+		strictEqual(routeCalls[0].platform, "macos");
+		deepStrictEqual(routeCalls[0].goldenImageVerifiedProviders, ["codex"]);
 	});
 
 	it("executeTaskWithOrchestrator passes both provider filters and availableProviders through to route() (Task E.1)", async () => {
@@ -10665,6 +10761,8 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 				},
 				exclude: ["claude"],
 				only: ["codex"],
+				platform: "macos",
+				goldenImageVerifiedProviders: ["codex"],
 			},
 		);
 
@@ -10673,6 +10771,8 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
 		deepStrictEqual(routeCalls[0].only, ["codex"]);
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
+		strictEqual(routeCalls[0].platform, "macos");
+		deepStrictEqual(routeCalls[0].goldenImageVerifiedProviders, ["codex"]);
 	});
 });
 

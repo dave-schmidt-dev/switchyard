@@ -3147,6 +3147,10 @@ export function executeTask(task, context) {
 		availableProviders: Object.keys(context.adapters ?? {}),
 		exclude: context.exclude,
 		only: context.only,
+		platform: context.platform,
+		...(context.goldenImageVerifiedProviders !== undefined
+			? { goldenImageVerifiedProviders: context.goldenImageVerifiedProviders }
+			: {}),
 	});
 
 	// Provenance (Task 1.6, M7/M8): resolve the six roster-provenance fields
@@ -4713,6 +4717,8 @@ export async function runQueueAsync(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
+		platform: selectedPlatform,
+		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
 			checkpoint.taskBases[taskId] = base;
@@ -5201,6 +5207,10 @@ export async function executeTaskWithOrchestrator(task, context) {
 		availableProviders: Object.keys(context.adapters ?? {}),
 		exclude: context.exclude,
 		only: context.only,
+		platform: context.platform,
+		...(context.goldenImageVerifiedProviders !== undefined
+			? { goldenImageVerifiedProviders: context.goldenImageVerifiedProviders }
+			: {}),
 	});
 
 	// Provenance (Task 1.6, M7/M8) — same treatment as executeTask: resolve the
@@ -6267,6 +6277,8 @@ function createDispatchBroker(context, dependencies = {}) {
 			snapshotSource,
 			snapshotRead,
 			exclude = [],
+			platform,
+			goldenImageVerifiedProviders,
 		}) =>
 			context.route({
 				runId,
@@ -6279,6 +6291,10 @@ function createDispatchBroker(context, dependencies = {}) {
 					...exclude,
 				],
 				only: contextOnly,
+				platform,
+				...(goldenImageVerifiedProviders !== undefined
+					? { goldenImageVerifiedProviders }
+					: {}),
 			}),
 		resolveTargetIdentity:
 			dependencies.resolveTargetIdentity ?? resolveTargetIdentity,
@@ -6308,6 +6324,12 @@ function createDispatchBroker(context, dependencies = {}) {
 			: dependencies.readSnapshot,
 		refreshSnapshot: dependencies.refreshSnapshot,
 		ownerId: context.runId ? `runner:${context.runId}` : undefined,
+		platform: context.platform,
+		...(context.goldenImageVerifiedProviders !== undefined
+			? {
+					goldenImageVerifiedProviders: context.goldenImageVerifiedProviders,
+				}
+			: {}),
 		executor: async ({
 			request,
 			route: selectedRoute,
@@ -7172,6 +7194,7 @@ export function runQueue(options) {
 	});
 	const {
 		queueBackend,
+		selectedPlatform,
 		slotLease,
 		tasks,
 		checkpoint,
@@ -7313,6 +7336,8 @@ export function runQueue(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
+		platform: selectedPlatform,
+		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
@@ -8068,6 +8093,7 @@ export async function runQueueWithOrchestrator(options) {
 	});
 	const {
 		queueBackend,
+		selectedPlatform,
 		slotLease,
 		tasks,
 		checkpoint,
@@ -8162,6 +8188,8 @@ export async function runQueueWithOrchestrator(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
+		platform: selectedPlatform,
+		goldenImageVerifiedProviders: dependencies.goldenImageVerifiedProviders,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {

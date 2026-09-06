@@ -74,6 +74,14 @@ describe("broker contract", () => {
 			() => validateBrokerRequest({ ...request(), surprise: true }),
 			/unknown field/,
 		);
+		throws(
+			() =>
+				validateBrokerRequest({
+					...request(),
+					goldenImageVerifiedProviders: ["claude"],
+				}),
+			/unknown field/,
+		);
 	});
 
 	it("passes only real caller-available adapters to the router seam", () => {
@@ -81,6 +89,8 @@ describe("broker contract", () => {
 		const result = selectBrokerRoute(
 			request(),
 			dependencies({
+				platform: "macos",
+				goldenImageVerifiedProviders: ["codex"],
 				route(value) {
 					options = value;
 					return dependencies().route();
@@ -88,6 +98,8 @@ describe("broker contract", () => {
 			}),
 		);
 		deepStrictEqual(options.availableProviders, ["codex"]);
+		strictEqual(options.platform, "macos");
+		deepStrictEqual(options.goldenImageVerifiedProviders, ["codex"]);
 		strictEqual(result.harness, "codex");
 		strictEqual(result.effort, "high");
 	});

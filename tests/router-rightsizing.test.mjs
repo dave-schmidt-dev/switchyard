@@ -234,3 +234,26 @@ describe("router INV-5 — blind fallback still filters + right-sizes", () => {
 		strictEqual(result.model, `fixture-${result.provider}-high`);
 	});
 });
+
+describe("Task 2.1 — macOS qualification precedes ranking", () => {
+	it("keeps an unqualified high-headroom provider out of observed and blind routing", () => {
+		writeSnapshot([
+			{ name: "claude", ok: true, windows: [{ percent_left: 99 }] },
+			{ name: "codex", ok: true, windows: [{ percent_left: 20 }] },
+		]);
+		const policy = {
+			platform: "macos",
+			goldenImageVerifiedProviders: ["codex"],
+		};
+		strictEqual(
+			route({ requiredCapability: "standard", ...policy }).provider,
+			"codex",
+		);
+
+		rmSync(SNAPSHOT_PATH, { force: true });
+		strictEqual(
+			route({ requiredCapability: "standard", ...policy }).provider,
+			"codex",
+		);
+	});
+});

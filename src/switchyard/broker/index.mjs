@@ -53,6 +53,11 @@ export function createBroker(dependencies = {}) {
 		throw new TypeError("broker dependency reservations is invalid");
 	}
 	const ownerId = dependencies.ownerId ?? `pid:${process.pid}`;
+	// The execution boundary, not a route request, supplies this policy. A
+	// request therefore cannot promote itself into the macOS qualified set.
+	const platform = dependencies.platform ?? "direct";
+	const goldenImageVerifiedProviders =
+		dependencies.goldenImageVerifiedProviders;
 	const snapshotSources = dependencies.snapshotSources ?? { "gradus-v2": null };
 	if (
 		!snapshotSources ||
@@ -120,6 +125,10 @@ export function createBroker(dependencies = {}) {
 			snapshotSource: request.snapshotSource,
 			snapshotRead: selectionOptions.snapshotRead,
 			exclude: selectionOptions.exclude ?? [],
+			platform,
+			...(goldenImageVerifiedProviders !== undefined
+				? { goldenImageVerifiedProviders }
+				: {}),
 		});
 		if (!routed || typeof routed !== "object" || Array.isArray(routed)) {
 			throw new Error("router returned a malformed result");
