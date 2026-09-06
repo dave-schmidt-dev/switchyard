@@ -499,6 +499,9 @@ export class QueueCleanupError extends Error {
 			completedTaskIds: Array.isArray(queueResult?.completedTaskIds)
 				? [...queueResult.completedTaskIds]
 				: null,
+			deferredTaskIds: Array.isArray(queueResult?.deferredTaskIds)
+				? [...queueResult.deferredTaskIds]
+				: null,
 			failedCount: Array.isArray(queueResult?.results)
 				? queueResult.results.filter((result) => !result.success).length
 				: null,
@@ -4075,7 +4078,27 @@ function healthDeferredResult(
 	};
 }
 
+export function isRouteHealthDeferredResult(result) {
+	return result?.result === "route_health_deferred";
+}
+
+function reportRouteHealthDeferred(result, _onResult, emitStatus) {
+	// Deferred work is not a terminal task result. In particular, do not send it
+	// through legacy onResult callbacks, whose contract maps success:false to a
+	// task_failed event. The status channel is the bounded observation path.
+	emitStatus?.({
+		phase: "execution",
+		event: "route_health_deferred",
+		status: `Task ${result.taskId} deferred: route health trial unavailable`,
+		taskId: result.taskId,
+		provider: result.provider ?? null,
+		model: result.model ?? null,
+		result: "route_health_deferred",
+	});
+}
+
 function attachRouteHealthTerminal(result, context) {
+	if (isRouteHealthDeferredResult(result)) return result;
 	const binding = context._activeRouteHealth;
 	if (binding?.claimStarted === true && result) {
 		Object.defineProperty(result, "_routeHealthTrialStarted", {
@@ -5914,6 +5937,7 @@ export async function runQueueAsync(options) {
 		monotonicNow: dependencies.monotonicNow ?? (() => performance.now()),
 	};
 	const results = [];
+	const deferredTaskIds = [];
 	// Retained only so a teardown failure can name the failure it displaces.
 	let inFlightError = null;
 	try {
@@ -6205,6 +6229,15 @@ export async function runQueueAsync(options) {
 				}
 			}
 			recordExtraProviderInvocationResult(checkpoint, checkpointPath, task.id);
+			if (isRouteHealthDeferredResult(result)) {
+				deferredTaskIds.push(result.taskId);
+				reportRouteHealthDeferred(
+					result,
+					dependencies.onResult,
+					dependencies.onStatus,
+				);
+				continue;
+			}
 			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
@@ -6311,7 +6344,12 @@ export async function runQueueAsync(options) {
 				);
 				break;
 			}
-			if (!result.success && effectiveStopOnFailure) break;
+			if (
+				!result.success &&
+				!isRouteHealthDeferredResult(result) &&
+				effectiveStopOnFailure
+			)
+				break;
 		}
 		if (checkpoint.version === CHECKPOINT_VERSION)
 			releaseCheckpointOwnership(checkpointPath, checkpoint);
@@ -6321,6 +6359,7 @@ export async function runQueueAsync(options) {
 			runnableTasks: initialRunnable.length,
 			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
+			deferredTaskIds,
 			checkpointPath,
 			ledgerWritesSettled: Promise.resolve(),
 			quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
@@ -8773,6 +8812,7 @@ export function runQueue(options) {
 		);
 		const attemptedTaskIds = new Set();
 		const results = [];
+		const deferredTaskIds = [];
 		reconcileAlreadyCompleteSelection(
 			checkpoint,
 			checkpointPath,
@@ -9080,6 +9120,11 @@ export function runQueue(options) {
 					descriptorReceiptFields(context._activeInvocationDescriptor),
 				);
 			}
+			if (isRouteHealthDeferredResult(result)) {
+				deferredTaskIds.push(result.taskId);
+				reportRouteHealthDeferred(result, onResult, emitStatus);
+				continue;
+			}
 			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
@@ -9329,12 +9374,24 @@ export function runQueue(options) {
 				? failureMetadataFor(lastFailed, lastFailed.partialDiffPath)
 				: null;
 			const terminalProjection = {
-				state: anyFailed ? "failed" : "succeeded",
+				state: anyFailed
+					? "failed"
+					: deferredTaskIds.length > 0
+						? "deferred"
+						: "succeeded",
 				activeTaskId: null,
 				quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
 				retryState: checkpoint.retryState,
 				retryTransitionId: checkpoint.retryTransitionId,
 				cleanupState: "complete",
+				terminalSummary: {
+					totalTasks: tasks.length,
+					runnableTasks: initialRunnable.length,
+					processedTasks: processed,
+					completedTaskIds: checkpoint.completedTaskIds,
+					deferredTaskIds,
+					failedCount: results.filter((result) => !result.success).length,
+				},
 				terminalizedBy: "worker",
 				...(lastFailure ? { lastFailure } : {}),
 			};
@@ -9367,6 +9424,7 @@ export function runQueue(options) {
 			runnableTasks: initialRunnable.length,
 			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
+			deferredTaskIds,
 			lastTaskId: checkpoint.lastTaskId,
 			checkpointPath,
 			// The drain boundary for the async outcome writes queued above. A
@@ -9658,6 +9716,7 @@ export async function runQueueWithOrchestrator(options) {
 		);
 		const attemptedTaskIds = new Set();
 		const results = [];
+		const deferredTaskIds = [];
 		reconcileAlreadyCompleteSelection(
 			checkpoint,
 			checkpointPath,
@@ -9722,6 +9781,12 @@ export async function runQueueWithOrchestrator(options) {
 					result,
 					descriptorReceiptFields(context._activeInvocationDescriptor),
 				);
+			}
+
+			if (isRouteHealthDeferredResult(result)) {
+				deferredTaskIds.push(result.taskId);
+				reportRouteHealthDeferred(result, onResult, emitStatus);
+				continue;
 			}
 
 			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
@@ -9887,9 +9952,21 @@ export async function runQueueWithOrchestrator(options) {
 				? failureMetadataFor(lastFailed, lastFailed.partialDiffPath)
 				: null;
 			const terminalProjection = {
-				state: anyFailed ? "failed" : "succeeded",
+				state: anyFailed
+					? "failed"
+					: deferredTaskIds.length > 0
+						? "deferred"
+						: "succeeded",
 				activeTaskId: null,
 				cleanupState: "complete",
+				terminalSummary: {
+					totalTasks: tasks.length,
+					runnableTasks: initialRunnable.length,
+					processedTasks: processed,
+					completedTaskIds: checkpoint.completedTaskIds,
+					deferredTaskIds,
+					failedCount: results.filter((result) => !result.success).length,
+				},
 				terminalizedBy: "worker",
 				...(lastFailure ? { lastFailure } : {}),
 			};
@@ -9922,6 +9999,7 @@ export async function runQueueWithOrchestrator(options) {
 			runnableTasks: initialRunnable.length,
 			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
+			deferredTaskIds,
 			lastTaskId: checkpoint.lastTaskId,
 			checkpointPath,
 			...(identity.enabled

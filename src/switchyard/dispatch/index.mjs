@@ -1023,9 +1023,18 @@ async function runDispatch(opts, dependencies = {}) {
 		queueError = error;
 	} finally {
 		if (runStoreReady) {
-			const anyFailed = result ? result.results.some((r) => !r.success) : true;
+			const failedResults = result
+				? result.results.filter(
+						(entry) =>
+							!entry.success && entry.result !== "route_health_deferred",
+					)
+				: [];
+			const anyFailed = result ? failedResults.length > 0 : true;
+			const deferredTaskIds = Array.isArray(result?.deferredTaskIds)
+				? result.deferredTaskIds
+				: [];
 			const failedResult = result?.results.findLast?.(
-				(entry) => !entry.success,
+				(entry) => !entry.success && entry.result !== "route_health_deferred",
 			);
 			const classifiedQueueError = classifyPreProviderFailure(queueError);
 			const classifiedFailure = queueError
@@ -1060,7 +1069,11 @@ async function runDispatch(opts, dependencies = {}) {
 				await eventWriteChain;
 				await finalizeRun({
 					runId,
-					state: anyFailed ? "failed" : "succeeded",
+					state: anyFailed
+						? "failed"
+						: deferredTaskIds.length > 0
+							? "deferred"
+							: "succeeded",
 					failure,
 					terminalSummary: result
 						? {
@@ -1068,14 +1081,15 @@ async function runDispatch(opts, dependencies = {}) {
 								runnableTasks: result.runnableTasks,
 								processedTasks: result.processedTasks,
 								completedTaskIds: result.completedTaskIds,
-								failedCount: result.results.filter((entry) => !entry.success)
-									.length,
+								deferredTaskIds,
+								failedCount: failedResults.length,
 							}
 						: {
 								totalTasks: null,
 								runnableTasks: null,
 								processedTasks: null,
 								completedTaskIds: null,
+								deferredTaskIds: null,
 								failedCount: null,
 							},
 					cleanup: async () => {
@@ -1106,9 +1120,19 @@ async function runDispatch(opts, dependencies = {}) {
 			});
 		}
 		console.log(JSON.stringify(envelope));
-		const failed = result?.results?.some((entry) => !entry.success) ?? true;
-		process.exitCode = queueError || failed ? 1 : 0;
-		return { runId: envelope.runId, error: Boolean(queueError || failed) };
+		const failed = result
+			? result.results.some(
+					(entry) => !entry.success && entry.result !== "route_health_deferred",
+				)
+			: true;
+		const deferred = Array.isArray(result?.deferredTaskIds)
+			? result.deferredTaskIds.length > 0
+			: false;
+		process.exitCode = queueError || failed ? 1 : deferred ? 6 : 0;
+		return {
+			runId: envelope.runId,
+			error: Boolean(queueError || failed || deferred),
+		};
 	}
 	if (queueError) {
 		Object.defineProperty(queueError, "switchyardRunId", {
@@ -1118,13 +1142,16 @@ async function runDispatch(opts, dependencies = {}) {
 		throw queueError;
 	}
 
-	const failed = result.results.filter((r) => !r.success);
+	const failed = result.results.filter(
+		(r) => !r.success && r.result !== "route_health_deferred",
+	);
+	const deferredCount = result.deferredTaskIds?.length ?? 0;
 	report(
 		`dispatch: done — ${result.processedTasks}/${result.runnableTasks} runnable processed, ` +
-			`${result.completedTaskIds.length} completed, ${failed.length} failed`,
+			`${result.completedTaskIds.length} completed, ${failed.length} failed, ${deferredCount} deferred`,
 	);
 	report(`dispatch: checkpoint ${result.checkpointPath}`);
-	process.exitCode = failed.length > 0 ? 1 : 0;
+	process.exitCode = failed.length > 0 ? 1 : deferredCount > 0 ? 6 : 0;
 }
 
 function captureHostFingerprint(projectPath) {
@@ -2070,7 +2097,7 @@ async function buildResultEnvelope(runId, run) {
 }
 
 function isTerminalState(state) {
-	return state === "succeeded" || state === "failed";
+	return state === "succeeded" || state === "failed" || state === "deferred";
 }
 
 function isCleanupComplete(cleanupState) {
@@ -2168,6 +2195,11 @@ async function handleResult(argv) {
 
 		if (run.state === "succeeded" && isCleanupComplete(run.cleanupState)) {
 			process.exitCode = 0;
+		} else if (
+			run.state === "deferred" &&
+			isCleanupComplete(run.cleanupState)
+		) {
+			process.exitCode = 6;
 		} else {
 			process.exitCode = 1;
 		}

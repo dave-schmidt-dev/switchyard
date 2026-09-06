@@ -369,6 +369,24 @@ describe("revision", () => {
 });
 
 describe("event ordering", () => {
+	it("keeps a route-health deferral observational instead of recording a failure", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await createEvent(opts.runId, {
+			phase: "execution",
+			event: "route_health_deferred",
+			status: "Task task-1 deferred: route health trial unavailable",
+			taskId: "task-1",
+			provider: "codex",
+			result: "route_health_deferred",
+		});
+		const run = await readRun(opts.runId);
+		const [event] = await readEvents(opts.runId);
+		strictEqual(run.lastFailure, null);
+		strictEqual(event.event, "route_health_deferred");
+		strictEqual(event.result, "route_health_deferred");
+	});
+
 	it("persists a closed host route-health binding and reads it from an authorised run root", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);

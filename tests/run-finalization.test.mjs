@@ -13,6 +13,36 @@ function revisionError() {
 }
 
 describe("run finalization", () => {
+	it("records deferred as terminal without failure metadata", async () => {
+		const events = [];
+		const patches = [];
+		const outcome = await finalizeRun(
+			{
+				runId: "deferred-terminal",
+				state: "deferred",
+				failure: null,
+				terminalSummary: {
+					processedTasks: 0,
+					completedTaskIds: [],
+					deferredTaskIds: ["1.1"],
+					failedCount: 0,
+				},
+			},
+			{
+				createEvent: async (_runId, event) => events.push(event),
+				updateRunWithRetry: async (_runId, patch) => {
+					patches.push(patch);
+					return patch;
+				},
+				releaseRunLock: async () => {},
+			},
+		);
+		strictEqual(outcome.terminal, true);
+		strictEqual(events[0].event, "run_deferred");
+		strictEqual(events[0].lastFailure, undefined);
+		for (const patch of patches) strictEqual(patch.lastFailure, undefined);
+	});
+
 	it("accepts every closed pre-provider diagnostic as an event reason", async () => {
 		for (const triple of PRE_PROVIDER_FAILURE_TRIPLES) {
 			const events = [];

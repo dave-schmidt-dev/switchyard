@@ -2754,6 +2754,48 @@ import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"
 });
 
 describe("status and result envelope contracts", () => {
+	it("surfaces a deferred terminal run and result exits 6", async () => {
+		const { initializeRun, updateRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fp",
+			launchArgs: [],
+		});
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "deferred",
+				cleanupState: "complete",
+				terminalSummary: {
+					processedTasks: 0,
+					completedTaskIds: [],
+					deferredTaskIds: ["1.1"],
+					failedCount: 0,
+				},
+			},
+			current.revision,
+		);
+
+		const status = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(status.status, 0);
+		strictEqual(
+			JSON.parse(status.stdout.trim()).disposition.reasonCode,
+			"deferred_work",
+		);
+		const result = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(result.status, 6);
+		const envelope = JSON.parse(result.stdout.trim());
+		strictEqual(envelope.state, "deferred");
+		strictEqual(envelope.terminalSummary.outcome, "deferred_work");
+	});
+
 	it("status shows activeTaskId when a task is running and completed/failed counts change", async () => {
 		const { initializeRun, updateRun, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"

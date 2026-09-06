@@ -362,6 +362,9 @@ function healthExclusion(name, _provider, options) {
 					: "health-unavailable",
 			mode: decision.mode === "enforce" ? "enforce" : "shadow",
 			suppress: decision.suppress === true,
+			trialAvailable: decision.trialAvailable === true,
+			initializable: decision.initializable === true,
+			resolvedTargetId: resolveTargetId(name),
 		};
 		options.onHealthDecision?.({ provider: name, ...sanitized });
 		return sanitized.suppress ? sanitized : null;

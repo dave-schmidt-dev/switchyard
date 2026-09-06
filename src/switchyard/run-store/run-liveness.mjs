@@ -1,6 +1,6 @@
 export const RUN_STARTUP_GRACE_MS = 5 * 60_000;
 
-const TERMINAL_STATES = new Set(["succeeded", "failed"]);
+const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 
 function probeWorker(pid) {
 	try {

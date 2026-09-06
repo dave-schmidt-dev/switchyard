@@ -52,6 +52,50 @@ let fatalPersistenceDiagnosticEmitted = false;
 
 const FATAL_PERSISTENCE_DIAGNOSTIC =
 	"worker-bootstrap: fatal event persistence unavailable; durable run state may be incomplete";
+const ROUTE_HEALTH_STATES = new Set([
+	"healthy",
+	"suspect",
+	"cooldown",
+	"repair-hold",
+	"half-open",
+	"health-unavailable",
+]);
+
+export function boundedRouteHealthDecisionEvent(decision) {
+	if (!decision || typeof decision !== "object") return null;
+	const provider =
+		typeof decision.provider === "string" &&
+		decision.provider.length > 0 &&
+		decision.provider.length <= 128 &&
+		!/[^\x20-\x7e]/.test(decision.provider)
+			? decision.provider
+			: null;
+	if (!provider) return null;
+	const state = ROUTE_HEALTH_STATES.has(decision.state)
+		? decision.state
+		: "health-unavailable";
+	const mode = decision.mode === "enforce" ? "enforce" : "shadow";
+	const targetId =
+		typeof decision.resolvedTargetId === "string" &&
+		decision.resolvedTargetId.length > 0 &&
+		decision.resolvedTargetId.length <= 256 &&
+		!/[^\x20-\x7e]/.test(decision.resolvedTargetId)
+			? decision.resolvedTargetId
+			: null;
+	return {
+		phase: "route_health",
+		event: "health_decision",
+		status: `Route health ${mode} decision: ${state}`,
+		provider,
+		...(targetId ? { targetId } : {}),
+		mode,
+		state,
+		available: decision.available === true,
+		suppress: decision.suppress === true,
+		trialAvailable: decision.trialAvailable === true,
+		initializable: decision.initializable === true,
+	};
+}
 
 function emitFatalPersistenceDiagnostic() {
 	if (fatalPersistenceDiagnosticEmitted) return;
@@ -529,19 +573,41 @@ export async function runWorkerBootstrap(argv = process.argv) {
 					const signal = PERSISTED_SIGNALS.has(event?.signal)
 						? event.signal
 						: null;
-					queueWrite(() =>
-						runStore.createEvent(runId, {
-							phase,
-							event: name,
-							status,
-							...(taskId !== null ? { taskId } : {}),
-							...(byteCount !== null ? { byteCount } : {}),
-							...(elapsedMs !== null ? { elapsedMs } : {}),
-							...(cleanupStage !== null ? { cleanupStage } : {}),
-							...(exitCode !== null ? { exitCode } : {}),
-							...(signal !== null ? { signal } : {}),
-						}),
-					);
+					const persistedEvent = {
+						phase,
+						event: name,
+						status,
+						...(taskId !== null ? { taskId } : {}),
+						...(byteCount !== null ? { byteCount } : {}),
+						...(elapsedMs !== null ? { elapsedMs } : {}),
+						...(cleanupStage !== null ? { cleanupStage } : {}),
+						...(exitCode !== null ? { exitCode } : {}),
+						...(signal !== null ? { signal } : {}),
+						...(name === "route_health_deferred"
+							? { result: "route_health_deferred" }
+							: {}),
+					};
+					queueWrite(async () => {
+						await runStore.createEvent(runId, persistedEvent);
+						if (name === "route_health_deferred") {
+							await runStore.updateRunWithRetry(runId, {
+								activeTaskId: null,
+								activeTaskProvider: null,
+								activeTaskModel: null,
+								activeTaskDeadline: null,
+								snapshotStatus: null,
+								snapshotMtime: null,
+								snapshotAgeMsAtRoute: null,
+								activeTaskElapsedMs: null,
+								activeTaskHeartbeatAt: null,
+								activeTaskProcessPhase: null,
+								activeTaskInvocationDescriptor: null,
+								activeTaskDescriptorIdentity: null,
+								activeTaskDescriptorHarness: null,
+								resolvedTargetId: null,
+							});
+						}
+					});
 				},
 				// These callbacks all use updateRunWithRetry rather than a
 				// read-then-updateRun(fixed revision) pair, and each one synchronously
@@ -609,7 +675,12 @@ export async function runWorkerBootstrap(argv = process.argv) {
 						});
 					queueWrite(fn);
 				},
+				onHealthDecision: (decision) => {
+					const event = boundedRouteHealthDecisionEvent(decision);
+					if (event) queueWrite(() => runStore.createEvent(runId, event));
+				},
 				onResult: (r) => {
+					if (r.result === "route_health_deferred") return;
 					const safeFailure = sanitizeFailureMetadata(r);
 					const event = r.success
 						? {
@@ -746,7 +817,12 @@ export async function runWorkerBootstrap(argv = process.argv) {
 			},
 		});
 
-		const failed = result.results.filter((r) => !r.success);
+		const failed = result.results.filter(
+			(r) => !r.success && r.result !== "route_health_deferred",
+		);
+		const deferredTaskIds = Array.isArray(result.deferredTaskIds)
+			? result.deferredTaskIds
+			: [];
 		if (result.processedTasks === 0) {
 			try {
 				unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
@@ -759,6 +835,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 			runnableTasks: result.runnableTasks,
 			processedTasks: result.processedTasks,
 			completedTaskIds: result.completedTaskIds,
+			deferredTaskIds,
 			failedCount: failed.length,
 		};
 
@@ -776,7 +853,12 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		await finalizeRun(
 			{
 				runId,
-				state: failed.length > 0 ? "failed" : "succeeded",
+				state:
+					failed.length > 0
+						? "failed"
+						: deferredTaskIds.length > 0
+							? "deferred"
+							: "succeeded",
 				failure: sanitizeFailureMetadata(failed.at(-1) ?? {}),
 				terminalSummary,
 				extraPatch:

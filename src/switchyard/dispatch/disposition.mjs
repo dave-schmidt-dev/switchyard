@@ -1,7 +1,7 @@
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
 import { isSafeTargetId } from "../run-store/index.mjs";
 
-const TERMINAL_STATES = new Set(["succeeded", "failed"]);
+const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 const LIVE_STATES = new Set(["live", "startup_grace"]);
 const CONTRACT_DIAGNOSTICS = new Set([
 	"worker_nonce_mismatch",
@@ -381,6 +381,9 @@ export function projectDisposition({
 	if (run?.state === "succeeded" && run?.cleanupState === "complete") {
 		return baseDisposition("complete", "run_succeeded", failure);
 	}
+	if (run?.state === "deferred" && run?.cleanupState === "complete") {
+		return baseDisposition("defer", "deferred_work", null);
+	}
 	if (!terminal && LIVE_STATES.has(liveness)) {
 		return baseDisposition(
 			"monitor",
@@ -467,6 +470,7 @@ export function projectTerminalOutcome(run) {
 	if (run.state === "succeeded") {
 		return processed > 0 ? "completed_work" : "no_runnable_work";
 	}
+	if (run.state === "deferred") return "deferred_work";
 	if (run.state === "failed" && run.terminalizedBy === "worker") {
 		return processed > 0 ? "failed_work" : "failed_before_work";
 	}

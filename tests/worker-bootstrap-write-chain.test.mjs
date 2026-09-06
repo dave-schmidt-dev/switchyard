@@ -29,6 +29,7 @@
 import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
+	boundedRouteHealthDecisionEvent,
 	createWriteChain,
 	persistTerminalOutcome,
 } from "../src/switchyard/dispatch/worker-bootstrap.mjs";
@@ -177,6 +178,45 @@ function buildCallbacks(store, { ordered }) {
 }
 
 describe("worker-bootstrap writeChain ordering", () => {
+	it("FIX persists bounded shadow health decisions through the detached event channel", async () => {
+		const events = [];
+		const writes = createWriteChain();
+		const runStore = {
+			createEvent: async (runId, event) => events.push({ runId, event }),
+		};
+		const decision = boundedRouteHealthDecisionEvent({
+			provider: "codex",
+			resolvedTargetId: "codex",
+			available: true,
+			state: "repair-hold",
+			mode: "shadow",
+			suppress: false,
+			trialAvailable: true,
+			initializable: false,
+			secret: "MUST_NOT_PERSIST",
+		});
+		writes.queueWrite(() => runStore.createEvent("run-shadow", decision));
+		await writes.drain();
+		deepStrictEqual(events, [
+			{
+				runId: "run-shadow",
+				event: {
+					phase: "route_health",
+					event: "health_decision",
+					status: "Route health shadow decision: repair-hold",
+					provider: "codex",
+					targetId: "codex",
+					mode: "shadow",
+					state: "repair-hold",
+					available: true,
+					suppress: false,
+					trialAvailable: true,
+					initializable: false,
+				},
+			},
+		]);
+	});
+
 	it("serializes the production health outcome helper before later writes", async () => {
 		const order = [];
 		const writes = createWriteChain();

@@ -169,10 +169,12 @@ async function captureRunJson(args, dependencies = {}) {
 	const originalLog = console.log;
 	const originalError = console.error;
 	const originalExitCode = process.exitCode;
+	let exitCode;
 	console.log = (line) => output.push(String(line));
 	console.error = (line) => errors.push(String(line));
 	try {
 		await handleRun(args, dependencies);
+		exitCode = process.exitCode;
 	} finally {
 		console.log = originalLog;
 		console.error = originalError;
@@ -183,7 +185,7 @@ async function captureRunJson(args, dependencies = {}) {
 		1,
 		`expected one stdout object, got ${output.length}`,
 	);
-	return { envelope: JSON.parse(output[0]), errors, output };
+	return { envelope: JSON.parse(output[0]), errors, output, exitCode };
 }
 
 let dir;
@@ -1268,6 +1270,29 @@ describe("synchronous run JSON envelope", () => {
 		strictEqual(envelope.cleanupState, "complete");
 		strictEqual(envelope.disposition.action, "complete");
 		strictEqual(envelope.disposition.direction, "complete");
+	});
+
+	it("emits deferred_work with exit 6 when selected work remains pending", async () => {
+		const { envelope, errors, exitCode } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				runQueue: async () => ({
+					totalTasks: 1,
+					runnableTasks: 1,
+					processedTasks: 0,
+					completedTaskIds: [],
+					deferredTaskIds: ["1.1"],
+					results: [],
+					checkpointPath: join(dir, "deferred.checkpoint.json"),
+				}),
+			}),
+		);
+		deepStrictEqual(errors, []);
+		strictEqual(exitCode, 6);
+		strictEqual(envelope.state, "deferred");
+		strictEqual(envelope.disposition.action, "defer");
+		strictEqual(envelope.disposition.reasonCode, "deferred_work");
+		deepStrictEqual(envelope.terminalSummary.deferredTaskIds, ["1.1"]);
 	});
 
 	it("classifies an invalid golden image reference instead of throwing", async () => {

@@ -89,6 +89,7 @@ const VALID_STATES = new Set([
 	"running",
 	"succeeded",
 	"failed",
+	"deferred",
 	"recovery_required",
 ]);
 
@@ -176,6 +177,17 @@ const APPROVED_EVENT_KEYS = new Set([
 	// Boolean only: whether the adapter affirmatively read back the model the
 	// provider served. Absent when the adapter cannot report one.
 	"servedModelVerified",
+	// Bounded route-health decision and deferral telemetry. These fields are
+	// accepted only from closed host events; they are observational and never
+	// participate in health authority. `result` is used only for the closed
+	// route_health_deferred execution status.
+	"result",
+	"mode",
+	"state",
+	"available",
+	"suppress",
+	"trialAvailable",
+	"initializable",
 	// Route health binding is written only through createRouteHealthEvent().
 	// It binds an otherwise ordinary, sanitized host event to an explicit public
 	// configuration and host repair epoch.  Legacy events remain readable but
@@ -196,6 +208,7 @@ const ROUTE_HEALTH_BINDING_KEYS = new Set([
 	"lifecycleVerified",
 ]);
 const ROUTE_HEALTH_EPOCH_RE = /^sha256:[a-f0-9]{64}$/;
+const ROUTE_HEALTH_DEFERRED_RESULT = "route_health_deferred";
 
 function validateRouteHealthBinding(binding) {
 	if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
@@ -1634,12 +1647,16 @@ async function createEventInternal(
 		throw new SchemaError("route health binding does not match run projection");
 	}
 	const nextSeq = current.lastEventSequence + 1;
+	const isDeferredEvent =
+		event?.event === ROUTE_HEALTH_DEFERRED_RESULT ||
+		event?.result === ROUTE_HEALTH_DEFERRED_RESULT;
 	const isFailureEvent =
-		event?.event === "task_failed" ||
-		event?.event === "queue_halted" ||
-		event?.event === "worker_boot_failed" ||
-		event?.errorKind !== undefined ||
-		(event?.result !== undefined && !SUCCESS_RESULTS.has(event.result));
+		!isDeferredEvent &&
+		(event?.event === "task_failed" ||
+			event?.event === "queue_halted" ||
+			event?.event === "worker_boot_failed" ||
+			event?.errorKind !== undefined ||
+			(event?.result !== undefined && !SUCCESS_RESULTS.has(event.result)));
 	const suppliedFailure =
 		isFailureEvent && event?.errorKind
 			? {

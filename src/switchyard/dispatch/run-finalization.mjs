@@ -5,7 +5,7 @@ import {
 } from "../adapter/exec-error.mjs";
 import * as defaultRunStore from "../run-store/index.mjs";
 
-const TERMINAL_STATES = new Set(["succeeded", "failed"]);
+const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 const TERMINAL_WRITERS = new Set(["worker", "dead_worker_recovery"]);
 
 const CLOSED_EVENT_REASONS = Object.freeze({
@@ -85,7 +85,11 @@ export async function finalizeRun(options, dependencies = {}) {
 		terminalizedBy = "worker",
 		cleanup = async () => {},
 		extraPatch = {},
-		eventName = state === "failed" ? "run_failed" : "run_completed",
+		eventName = state === "failed"
+			? "run_failed"
+			: state === "deferred"
+				? "run_deferred"
+				: "run_completed",
 		eventStatus = state,
 		eventReasonCode = failure?.reasonCode,
 	} = options ?? {};
@@ -99,7 +103,12 @@ export async function finalizeRun(options, dependencies = {}) {
 		throw new TypeError("finalizeRun accepts only sanitized failure metadata");
 	}
 	if (
-		!["run_completed", "run_failed", "worker_boot_failed"].includes(eventName)
+		![
+			"run_completed",
+			"run_failed",
+			"run_deferred",
+			"worker_boot_failed",
+		].includes(eventName)
 	) {
 		throw new TypeError("finalizeRun requires a closed terminal event name");
 	}
@@ -112,9 +121,11 @@ export async function finalizeRun(options, dependencies = {}) {
 		throw new TypeError("finalizeRun requires a closed event reason code");
 	}
 	const closedFailure =
-		state === "failed" && failure === null
-			? unexplainedTerminalFailure()
-			: failure;
+		state === "failed"
+			? failure === null
+				? unexplainedTerminalFailure()
+				: failure
+			: null;
 	const closedEventReasonCode = eventReasonCode ?? closedFailure?.reasonCode;
 	const eventReason =
 		CLOSED_EVENT_REASONS[closedEventReasonCode] ??

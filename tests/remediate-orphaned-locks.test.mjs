@@ -157,6 +157,17 @@ describe("resolveCandidates", () => {
 		strictEqual(d.projectPath, opts.projectPath);
 	});
 
+	it("treats a deferred terminal run as stale for lock remediation", async () => {
+		const opts = await makeStaleRun({});
+		const current = await readRun(opts.runId);
+		await updateRun(opts.runId, { state: "deferred" }, current.revision);
+		await acquireProjectLock(opts.projectPath, opts.runId);
+
+		const [descriptor] = await resolveCandidates();
+		strictEqual(descriptor.category, "project-lock-stale");
+		strictEqual(descriptor.isCandidate, true);
+	});
+
 	it("never flags a post-F.1 project lock on a live run", async () => {
 		const opts = await makeLiveRun();
 		await acquireProjectLock(opts.projectPath, opts.runId);

@@ -142,7 +142,10 @@ function isPidProvenDead(pid, probePid) {
 }
 
 function isRunStale(run, options = {}) {
-	const terminal = run.state === "succeeded" || run.state === "failed";
+	const terminal =
+		run.state === "succeeded" ||
+		run.state === "failed" ||
+		run.state === "deferred";
 	const liveness = classifyRunLiveness(run, options);
 	return terminal || liveness === "dead";
 }
@@ -584,7 +587,8 @@ export async function resolveCandidates(dependencies = {}) {
 						!cleanupFailed &&
 						stale &&
 						run.state !== "succeeded" &&
-						run.state !== "failed",
+						run.state !== "failed" &&
+						run.state !== "deferred",
 					reason: stale
 						? cleanupFailed
 							? `cleanup failed, but the ${cwdDerived ? "cwd-derived" : "canonical"} project lock has a proven dead worker — interactive ownership-safe remediation may remove it`
@@ -670,7 +674,8 @@ export async function resolveCandidates(dependencies = {}) {
 					!cleanupFailed &&
 					stale &&
 					run.state !== "succeeded" &&
-					run.state !== "failed",
+					run.state !== "failed" &&
+					run.state !== "deferred",
 				reason: stale
 					? cleanupFailed
 						? "pre-F.1 project lock belongs to a cleanup-failed run with a proven dead worker — interactive ownership-safe remediation may remove it"

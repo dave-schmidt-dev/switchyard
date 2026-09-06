@@ -119,6 +119,16 @@ function targetDisposition({
 }
 
 describe("caller disposition precedence", () => {
+	it("projects clean deferred terminal work as deferred_work", () => {
+		const disposition = projectDisposition({
+			run: run({ state: "deferred", cleanupState: "complete" }),
+			liveness: "terminal_clean",
+		});
+		strictEqual(disposition.action, "defer");
+		strictEqual(disposition.reasonCode, "deferred_work");
+		strictEqual(disposition.direction, "wait");
+	});
+
 	const recoveryCommand =
 		"switchyard-dispatch recover --run run-1 --state-root '/tmp/state'";
 	const cases = [
@@ -1130,6 +1140,15 @@ describe("terminal outcome projection", () => {
 				terminalSummary: summary(0),
 			}),
 			"no_runnable_work",
+		],
+		[
+			"deferred work",
+			run({
+				state: "deferred",
+				cleanupState: "complete",
+				terminalSummary: summary(0),
+			}),
+			"deferred_work",
 		],
 		[
 			"failed work",

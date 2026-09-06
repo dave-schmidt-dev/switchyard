@@ -12215,6 +12215,175 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		}),
 	);
 
+	it(
+		"keeps concurrent enforce-mode claim contention pending and continues the default queue",
+		withQualifiedRoster(async () => {
+			const healthStateRoot = join(TEST_DIR, "concurrent-claim-health");
+			const healthDecision = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				mode: "enforce",
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			const identity = await holdCodexRoute({
+				healthDecision,
+				healthStateRoot,
+				runId: "concurrent-claim-holder",
+			});
+			await attestRouteRepair({
+				...identity,
+				healthStateRoot,
+				repairKind: "auth_repaired",
+				nowMs: Date.now() + 1_000,
+			});
+			const holder = executeTaskImpl(
+				{ id: "holder", title: "claim holder", description: "op" },
+				{
+					route: codexHealthRoute,
+					healthDecision,
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => ({ success: true }),
+					adapters: {
+						codex: {
+							execute: () => ({ success: true, output: "ok" }),
+							captureDiff: () => null,
+						},
+					},
+					queueBackend: { captureTaskBase: () => TASK_BASE },
+					projectPath: TEST_DIR,
+					workingContainerName: "claim-holder-workspace",
+					runId: "claim-holder-run",
+				},
+			);
+			strictEqual(holder.success, true);
+
+			const tasksPath = writeTasksFile(`### Task 1.1: Deferred one
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** first deferred task
+
+### Task 1.2: Deferred two
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** second deferred task
+`);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const statusEvents = [];
+			const fixture = ownedCodexQueueDependencies([]);
+			const syncRunStoreCalls = [];
+			fixture.dependencies.healthDecision = healthDecision;
+			fixture.dependencies.onStatus = (event) => statusEvents.push(event);
+			fixture.dependencies.runStore = {
+				updateRun: (partial) => {
+					syncRunStoreCalls.push({ ...partial });
+					return Promise.resolve({ revision: 0 });
+				},
+			};
+			const routeCalls = [];
+			fixture.dependencies.route = () => {
+				routeCalls.push(true);
+				return codexHealthRoute();
+			};
+			const result = runQueueImpl(
+				productionQueueOptions({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "claim-contention-workspace",
+					checkpointPath,
+					runId: "claim-contention-run",
+					dependencies: fixture.dependencies,
+				}),
+			);
+			strictEqual(
+				routeCalls.length,
+				2,
+				"deferred work must not stop the queue",
+			);
+			strictEqual(fixture.executeCalls.length, 0);
+			strictEqual(result.results.length, 0);
+			strictEqual(result.processedTasks, 0);
+			deepStrictEqual(result.completedTaskIds, []);
+			strictEqual(
+				statusEvents.filter((event) => event.event === "route_health_deferred")
+					.length,
+				2,
+			);
+			deepStrictEqual(
+				loadCheckpoint(checkpointPath, tasksPath).completedTaskIds,
+				[],
+			);
+			await result.ledgerWritesSettled;
+			const syncTerminal = syncRunStoreCalls.find(
+				(call) => call.state !== undefined,
+			);
+			strictEqual(syncTerminal.state, "deferred");
+			deepStrictEqual(syncTerminal.terminalSummary.completedTaskIds, []);
+			deepStrictEqual(syncTerminal.terminalSummary.deferredTaskIds, [
+				"1.1",
+				"1.2",
+			]);
+			strictEqual(syncTerminal.terminalSummary.failedCount, 0);
+			strictEqual(syncTerminal.lastFailure, undefined);
+
+			const orchestratorTasksPath =
+				writeTasksFile(`### Task 2.1: Deferred orchestrator
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** deferred orchestrator task
+`);
+			const orchestratorCheckpointPath = `${orchestratorTasksPath}.orchestrator.checkpoint.json`;
+			const orchestratorRunStoreCalls = [];
+			const orchestratorLaunches = [];
+			const orchestratorFixture = ownedCodexQueueDependencies([]);
+			orchestratorFixture.dependencies.healthDecision = healthDecision;
+			orchestratorFixture.dependencies.runStore = {
+				updateRun: (partial) => {
+					orchestratorRunStoreCalls.push({ ...partial });
+					return Promise.resolve({ revision: 0 });
+				},
+			};
+			orchestratorFixture.dependencies.orchestrator = {
+				launch: async () => {
+					orchestratorLaunches.push(true);
+					return "must-not-launch";
+				},
+				status: async () => ({ state: "done" }),
+				result: async () => ({ success: true, diff: "" }),
+			};
+			const orchestratorResult = await runQueueWithOrchestratorImpl(
+				productionQueueOptions({
+					tasksFilePath: orchestratorTasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "claim-contention-orchestrator",
+					checkpointPath: orchestratorCheckpointPath,
+					runId: "claim-contention-orchestrator-run",
+					dependencies: orchestratorFixture.dependencies,
+				}),
+			);
+			deepStrictEqual(orchestratorLaunches, []);
+			deepStrictEqual(orchestratorResult.results, []);
+			deepStrictEqual(orchestratorResult.completedTaskIds, []);
+			deepStrictEqual(orchestratorResult.deferredTaskIds, ["2.1"]);
+			const orchestratorTerminal = orchestratorRunStoreCalls.find(
+				(call) => call.state !== undefined,
+			);
+			strictEqual(orchestratorTerminal.state, "deferred");
+			deepStrictEqual(
+				orchestratorTerminal.terminalSummary.completedTaskIds,
+				[],
+			);
+			deepStrictEqual(orchestratorTerminal.terminalSummary.deferredTaskIds, [
+				"2.1",
+			]);
+			strictEqual(orchestratorTerminal.terminalSummary.failedCount, 0);
+			strictEqual(orchestratorTerminal.lastFailure, undefined);
+		}),
+	);
+
 	it("binds route-health identity to the selected golden image", () => {
 		const first = createDefaultRouteHealthDecision({
 			qualifiedProviders: [],

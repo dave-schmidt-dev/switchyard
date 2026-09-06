@@ -27,6 +27,13 @@ describe("classifyRunLiveness", () => {
 		);
 	});
 
+	it("treats deferred as terminal_clean after complete cleanup", () => {
+		strictEqual(
+			classifyRunLiveness(run({ state: "deferred", cleanupState: "complete" })),
+			"terminal_clean",
+		);
+	});
+
 	it("protects a live terminal finalizer", () => {
 		strictEqual(
 			classifyRunLiveness(run({ state: "failed", cleanupState: "pending" }), {
