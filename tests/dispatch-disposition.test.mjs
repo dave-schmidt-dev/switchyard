@@ -53,12 +53,47 @@ function targetDisposition({
 	retryConsumed = false,
 	optionalEvidenceValid = true,
 }) {
+	const cleanupCodes = new Set([
+		"provider_cleanup_failed",
+		"provider_cleanup_after_cleanup_started",
+		"provider_cleanup_after_pid_observed",
+		"provider_cleanup_after_tree_terminated",
+		"provider_cleanup_after_pid_marker_removed",
+		"provider_cleanup_after_index_lock_removed",
+	]);
+	const integrationCodes = new Set([
+		"integration_failed",
+		"required_paths_missing",
+		"undeclared_paths_touched",
+		"empty_required_diff",
+		"no_op_diff",
+		"manifest_review_required",
+		"corrupt_patch",
+		"conflict",
+		"empty_diff",
+		"path_escapes_project_root",
+		"git_internals_touched",
+		"credential_path_touched",
+		"symlink_creation_refused",
+		"executable_file_refused",
+	]);
+	const provenance =
+		diagnosticCode === "cli_usage_error"
+			? { diagnosticOrigin: "launcher", failurePhase: "provider_execution" }
+			: cleanupCodes.has(diagnosticCode)
+				? { diagnosticOrigin: "adapter", failurePhase: "provider_cleanup" }
+				: integrationCodes.has(diagnosticCode)
+					? {
+							diagnosticOrigin: "integration",
+							failurePhase: "adapter_validation",
+						}
+					: { diagnosticOrigin: "adapter", failurePhase };
 	const exact = exactFailure("codex/standard");
 	Object.assign(exact, {
 		errorKind,
 		reasonCode: errorKind,
 		diagnosticCode,
-		failurePhase,
+		...provenance,
 	});
 	return projectDisposition({
 		run: run({
@@ -68,7 +103,7 @@ function targetDisposition({
 				errorKind,
 				reasonCode: errorKind,
 				diagnosticCode,
-				failurePhase,
+				...provenance,
 				resolvedTargetId: exact.resolvedTargetId,
 				descriptorIdentity: exact.descriptorIdentity,
 				descriptorHarness: exact.descriptorHarness,
@@ -159,6 +194,8 @@ describe("caller disposition precedence", () => {
 					cleanupState: "complete",
 					lastFailure: failure({
 						diagnosticCode: "checkpoint_queue_identity_mismatch",
+						diagnosticOrigin: "worker_boot",
+						failurePhase: "worker_boot",
 					}),
 				}),
 				liveness: "terminal_clean",
@@ -230,6 +267,44 @@ describe("caller disposition precedence", () => {
 		strictEqual(result.action, "stop");
 	});
 
+	it("wrong origin and code combinations cannot authorize routing or repair", () => {
+		for (const lastFailure of [
+			failure({
+				diagnosticCode: "cli_usage_error",
+				diagnosticOrigin: "adapter",
+			}),
+			failure({
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "launcher",
+			}),
+			failure({
+				diagnosticCode: "worker_contract_unsupported",
+				diagnosticOrigin: "adapter",
+			}),
+			failure({
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "worker_boot",
+				failurePhase: undefined,
+			}),
+			failure({
+				diagnosticCode: "worker_boot_exception",
+				diagnosticOrigin: "worker_boot",
+				failurePhase: undefined,
+			}),
+		]) {
+			const result = projectDisposition({
+				run: run({ state: "failed", cleanupState: "complete", lastFailure }),
+				checkpoint: { retryAttempts: [exactFailure("codex/standard")] },
+				liveness: "terminal_clean",
+			});
+			strictEqual(result.action, "stop");
+			strictEqual(result.direction, "stop");
+			strictEqual(result.reasonCode, "insufficient_evidence");
+			strictEqual(result.diagnosticCode, null);
+			deepStrictEqual(result.failedTargetIds, []);
+		}
+	});
+
 	it("does not emit runtime recovery without a usable command", () => {
 		for (const evidence of [
 			{
@@ -252,6 +327,8 @@ describe("caller disposition precedence", () => {
 				cleanupState: "complete",
 				lastFailure: failure({
 					diagnosticCode: "checkpoint_queue_identity_mismatch",
+					diagnosticOrigin: "worker_boot",
+					failurePhase: "worker_boot",
 				}),
 			}),
 			optionalEvidenceValid: false,
@@ -679,6 +756,7 @@ describe("typed launch evidence", () => {
 						reasonCode: diagnosticCode,
 						diagnosticCode,
 						failurePhase: "worker_boot",
+						diagnosticOrigin: "worker_boot",
 					}),
 				}),
 				liveness: "terminal_clean",
@@ -694,7 +772,6 @@ describe("closed caller direction", () => {
 		["auth_expired", "auth_expired", "stop"],
 		["quota_exhausted", "quota_exhausted", "advance_authorized_fallback"],
 		["model_unavailable", "model_unavailable", "stop"],
-		["execution_failed", "execution_failed", "stop"],
 		["execution_failed", "cli_usage_error", "repair_input"],
 		[
 			"execution_failed",
@@ -702,37 +779,8 @@ describe("closed caller direction", () => {
 			"advance_authorized_fallback",
 		],
 		["execution_failed", "provider_signalled", "advance_authorized_fallback"],
-		["execution_failed", "provider_output_unclassified", "stop"],
 		["execution_timed_out", "execution_timed_out", "stop"],
 		["execution_timed_out", "execution_cancelled", "stop"],
-		["provider_cleanup_failed", "provider_cleanup_failed", "stop"],
-		["diff_capture_failed", "diff_capture_failed", "stop"],
-		...[
-			"provider_cleanup_after_cleanup_started",
-			"provider_cleanup_after_pid_observed",
-			"provider_cleanup_after_tree_terminated",
-			"provider_cleanup_after_pid_marker_removed",
-			"provider_cleanup_after_index_lock_removed",
-		].map((diagnosticCode) => [
-			"provider_cleanup_failed",
-			diagnosticCode,
-			"stop",
-		]),
-		["integration_failed", "declared_path_not_seeded", "repair_input"],
-		["required_paths_missing", "required_paths_missing", "repair_input"],
-		["undeclared_paths_touched", "undeclared_paths_touched", "repair_input"],
-		["empty_required_diff", "empty_required_diff", "repair_input"],
-		["no_op_diff", "no_op_diff", "repair_input"],
-		["manifest_review_required", "manifest_review_required", "repair_input"],
-		["corrupt_patch", "corrupt_patch", "repair_input"],
-		["conflict", "conflict", "repair_input"],
-		["empty_diff", "empty_diff", "repair_input"],
-		["integration_failed", "path_escapes_project_root", "stop"],
-		["integration_failed", "git_internals_touched", "stop"],
-		["integration_failed", "credential_path_touched", "stop"],
-		["integration_failed", "symlink_creation_refused", "stop"],
-		["integration_failed", "executable_file_refused", "stop"],
-		["integration_failed", "integration_failed", "stop"],
 	];
 
 	it("enumerates every closed target-failure tuple without changing its legacy action", () => {
@@ -755,13 +803,23 @@ describe("closed caller direction", () => {
 		}
 	});
 
-	it("fails an unenumerated target tuple closed", () => {
-		const result = targetDisposition({
-			errorKind: "integration_failed",
-			diagnosticCode: "unknown_closed_diagnostic",
-		});
-		strictEqual(result.action, "target_failed");
-		strictEqual(result.direction, "stop");
+	it("fails unminted target tuples closed", () => {
+		for (const [errorKind, diagnosticCode] of [
+			["execution_failed", "execution_failed"],
+			["execution_failed", "provider_output_unclassified"],
+			["diff_capture_failed", "diff_capture_failed"],
+			["provider_cleanup_failed", "provider_cleanup_failed"],
+			["provider_cleanup_failed", "provider_cleanup_after_pid_marker_removed"],
+			["integration_failed", "declared_path_not_seeded"],
+			["required_paths_missing", "required_paths_missing"],
+			["integration_failed", "credential_path_touched"],
+			["integration_failed", "unknown_closed_diagnostic"],
+		]) {
+			const result = targetDisposition({ errorKind, diagnosticCode });
+			strictEqual(result.action, "stop", diagnosticCode);
+			strictEqual(result.direction, "stop", diagnosticCode);
+			strictEqual(result.reasonCode, "insufficient_evidence", diagnosticCode);
+		}
 	});
 
 	it("does not let a legacy closed label authorize a new fallback", () => {
@@ -789,7 +847,6 @@ describe("closed caller direction", () => {
 		for (const [errorKind, diagnosticCode, direction] of [
 			["quota_exhausted", "quota_exhausted", "advance_authorized_fallback"],
 			["auth_expired", "auth_expired", "stop"],
-			["integration_failed", "credential_path_touched", "stop"],
 		]) {
 			const result = targetDisposition({
 				errorKind,
@@ -822,7 +879,11 @@ describe("closed caller direction", () => {
 				run: run({
 					state: "failed",
 					cleanupState: "complete",
-					lastFailure: failure({ diagnosticCode }),
+					lastFailure: failure({
+						diagnosticCode,
+						diagnosticOrigin: "worker_boot",
+						failurePhase: "worker_boot",
+					}),
 				}),
 				optionalEvidenceValid: false,
 				liveness: "terminal_clean",
@@ -846,7 +907,11 @@ describe("closed caller direction", () => {
 				run: run({
 					state: "failed",
 					cleanupState: "complete",
-					lastFailure: failure({ diagnosticCode }),
+					lastFailure: failure({
+						diagnosticCode,
+						diagnosticOrigin: "worker_boot",
+						failurePhase: "project_lock",
+					}),
 				}),
 				optionalEvidenceValid: false,
 				liveness: "terminal_clean",
@@ -863,7 +928,11 @@ describe("closed caller direction", () => {
 			run: run({
 				state: "failed",
 				cleanupState: "complete",
-				lastFailure: failure({ diagnosticCode: "vm_slot_unavailable" }),
+				lastFailure: failure({
+					diagnosticCode: "vm_slot_unavailable",
+					diagnosticOrigin: "worker_boot",
+					failurePhase: "queue_preflight",
+				}),
 			}),
 			optionalEvidenceValid: false,
 			liveness: "terminal_clean",
@@ -880,6 +949,8 @@ describe("closed caller direction", () => {
 				cleanupState: "complete",
 				lastFailure: failure({
 					diagnosticCode: "vm_admission_unavailable",
+					diagnosticOrigin: "worker_boot",
+					failurePhase: "queue_preflight",
 				}),
 			}),
 			optionalEvidenceValid: false,
@@ -977,7 +1048,11 @@ describe("closed caller direction", () => {
 				run: run({
 					state: "failed",
 					cleanupState: "complete",
-					lastFailure: failure({ diagnosticCode: "project_lock_held" }),
+					lastFailure: failure({
+						diagnosticCode: "project_lock_held",
+						diagnosticOrigin: "worker_boot",
+						failurePhase: "project_lock",
+					}),
 				}),
 				liveness: "terminal_clean",
 			}).direction,

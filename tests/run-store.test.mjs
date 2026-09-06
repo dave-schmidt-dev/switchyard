@@ -3624,6 +3624,45 @@ describe("terminal failure metadata invariants (Task 1.1)", () => {
 });
 
 describe("prlctl failure metadata survives the persistence boundary", () => {
+	it("rejects a persisted diagnostic whose origin cannot mint its code", async () => {
+		for (const provenance of [
+			{
+				diagnosticCode: "cli_usage_error",
+				diagnosticOrigin: "adapter",
+				failurePhase: "provider_execution",
+			},
+			{
+				diagnosticCode: "quota_exhausted",
+				diagnosticOrigin: "worker_boot",
+			},
+			{
+				diagnosticCode: "worker_boot_exception",
+				diagnosticOrigin: "worker_boot",
+			},
+		]) {
+			const opts = makeOptions();
+			const snapshot = await initializeRun(opts);
+			await rejects(
+				updateRun(
+					opts.runId,
+					{
+						state: "failed",
+						lastFailure: {
+							errorKind: "execution_failed",
+							reasonCode: "execution_failed",
+							reason:
+								"Provider execution failed before a reviewed integration.",
+							diagnosticEvidenceAvailable: true,
+							...provenance,
+						},
+					},
+					snapshot.revision,
+				),
+				SchemaError,
+			);
+		}
+	});
+
 	// The whole point of classifying a prlctl misfire is that a reader of the
 	// FILE, not just the in-process object, can tell it apart from an ordinary
 	// provisioning failure. A wrapper that built the right object in memory but

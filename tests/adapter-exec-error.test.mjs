@@ -540,6 +540,61 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		ok(isPersistentFailureMetadata(metadata));
 	});
 
+	it("rejects mismatched diagnostic origins while retaining exact host provenance", () => {
+		for (const [diagnosticCode, diagnosticOrigin, failurePhase] of [
+			["cli_usage_error", "adapter", "provider_execution"],
+			["quota_exhausted", "launcher", "provider_execution"],
+			["worker_boot_exception", "adapter", "worker_boot"],
+			["quota_exhausted", "worker_boot", undefined],
+			["worker_boot_exception", "worker_boot", undefined],
+		]) {
+			const input = {
+				result: "execution_failed",
+				diagnosticCode,
+				diagnosticOrigin,
+				diagnosticEvidenceAvailable: true,
+				failurePhase,
+			};
+			const metadata = sanitizeFailureMetadata(input);
+			strictEqual(metadata.diagnosticCode, undefined);
+			strictEqual(metadata.diagnosticOrigin, undefined);
+			strictEqual(metadata.diagnosticEvidenceAvailable, undefined);
+			ok(!isPersistentFailureMetadata({ ...metadata, ...input }));
+		}
+
+		for (const input of [
+			{
+				diagnosticCode: "cli_usage_error",
+				diagnosticOrigin: "launcher",
+				failurePhase: "provider_execution",
+			},
+			{
+				diagnosticCode: "provider_exit_nonzero",
+				diagnosticOrigin: "adapter",
+				failurePhase: "provider_execution",
+			},
+			{
+				diagnosticCode: "worker_boot_exception",
+				diagnosticOrigin: "worker_boot",
+				failurePhase: "worker_boot",
+			},
+		]) {
+			const metadata = sanitizeFailureMetadata({
+				result: "execution_failed",
+				diagnosticEvidenceAvailable: true,
+				...input,
+			});
+			strictEqual(metadata.diagnosticCode, input.diagnosticCode);
+			strictEqual(metadata.diagnosticOrigin, input.diagnosticOrigin);
+			ok(isPersistentFailureMetadata(metadata));
+		}
+	});
+
+	it("uses accurate closed wording for diff capture failures", () => {
+		const metadata = sanitizeFailureMetadata({ result: "diff_capture_failed" });
+		strictEqual(metadata.reason, "Diff capture failed.");
+	});
+
 	it("does not let usage-like provider, task, or child-tool prose mint CLI misuse", () => {
 		for (const text of [
 			"SECRET_CANARY task says usage: npm run test",

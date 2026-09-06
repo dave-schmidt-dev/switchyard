@@ -2801,6 +2801,80 @@ describe("envelope format", () => {
 		}
 	});
 
+	it("checkpoint evidence with a mismatched diagnostic origin cannot eject a target", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { saveCheckpoint } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+		const runId = "wrong-origin-checkpoint-evidence";
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		const wrongOrigin = exactFailureEvidence(
+			"opencode-go",
+			"opencode",
+			"fixture/opencode-standard",
+		);
+		wrongOrigin.diagnosticCode = "cli_usage_error";
+		wrongOrigin.diagnosticOrigin = "adapter";
+		saveCheckpoint(`${tasksFile}.checkpoint.json`, {
+			version: 1,
+			tasksFilePath: tasksFile,
+			completedTaskIds: [],
+			lastTaskId: "1.1",
+			lastUpdatedAt: new Date().toISOString(),
+			results: [wrongOrigin],
+		});
+		const current = await readRun(runId);
+		const trustedTerminal = exactFailureEvidence(
+			"opencode-go",
+			"opencode",
+			"fixture/opencode-standard",
+		);
+		await updateRun(
+			runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: {
+					errorKind: trustedTerminal.errorKind,
+					reasonCode: trustedTerminal.reasonCode,
+					reason: trustedTerminal.reason,
+					diagnosticCode: trustedTerminal.diagnosticCode,
+					diagnosticOrigin: trustedTerminal.diagnosticOrigin,
+					diagnosticEvidenceAvailable: true,
+					exitCode: trustedTerminal.exitCode,
+					failurePhase: trustedTerminal.failurePhase,
+					resolvedTargetId: trustedTerminal.resolvedTargetId,
+					descriptorIdentity: trustedTerminal.descriptorIdentity,
+					descriptorHarness: trustedTerminal.descriptorHarness,
+				},
+				terminalizedBy: "worker",
+				terminalSummary: { processedTasks: 1 },
+			},
+			current.revision,
+		);
+
+		for (const [command, expectedStatus] of [
+			["status", 0],
+			["result", 1],
+		]) {
+			const response = runDispatch([command, runId], makeStateRootEnv());
+			strictEqual(response.status, expectedStatus);
+			const envelope = JSON.parse(response.stdout.trim());
+			strictEqual(envelope.disposition.action, "stop");
+			strictEqual(envelope.disposition.reasonCode, "insufficient_evidence");
+			deepStrictEqual(envelope.disposition.failedTargetIds, []);
+		}
+	});
+
 	it("six sanitized OpenCode failures emit bounded target evidence without cooldown state", async () => {
 		const { createEvent, initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"

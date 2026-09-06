@@ -605,13 +605,73 @@ export const PERSISTED_SIGNALS = new Set([
 // Provider/model/task output is evidence for people, never a routing authority.
 // In particular, `usage:` and `invalid value` are ordinary prose in prompts and
 // child-tool output, so they must not be promoted to CLI misuse by matching text.
-export const DIAGNOSTIC_ORIGINS = Object.freeze([
+const DIAGNOSTIC_ORIGINS = Object.freeze([
 	"adapter",
 	"launcher",
 	"worker_boot",
 	"integration",
 ]);
 const DIAGNOSTIC_ORIGIN_SET = new Set(DIAGNOSTIC_ORIGINS);
+
+const ADAPTER_PROVIDER_EXECUTION_CODES = new Set([
+	"auth_expired",
+	"quota_exhausted",
+	"model_unavailable",
+	"provider_exit_nonzero",
+	"provider_signalled",
+	"execution_timed_out",
+	"execution_cancelled",
+]);
+const ADAPTER_PROVIDER_CLEANUP_CODES = new Set([
+	"provider_cleanup_failed",
+	...Object.values(CLEANUP_STAGE_DIAGNOSTIC_CODES),
+]);
+const INTEGRATION_DIAGNOSTIC_CODES = new Set([
+	"integration_failed",
+	"required_paths_missing",
+	"undeclared_paths_touched",
+	"empty_required_diff",
+	"no_op_diff",
+	...INTEGRATION_REFUSAL_KINDS,
+]);
+
+/** True only for code/origin/phase combinations minted by a reviewed host boundary. */
+export function hasAuthoritativeDiagnosticProvenance({
+	diagnosticCode,
+	diagnosticOrigin,
+	diagnosticEvidenceAvailable,
+	failurePhase,
+} = {}) {
+	if (
+		diagnosticEvidenceAvailable !== true ||
+		!DIAGNOSTIC_ORIGIN_SET.has(diagnosticOrigin)
+	) {
+		return false;
+	}
+	if (diagnosticOrigin === "launcher") {
+		return (
+			diagnosticCode === "cli_usage_error" &&
+			failurePhase === "provider_execution"
+		);
+	}
+	if (diagnosticOrigin === "adapter") {
+		return (
+			(failurePhase === "provider_execution" &&
+				ADAPTER_PROVIDER_EXECUTION_CODES.has(diagnosticCode)) ||
+			(failurePhase === "provider_cleanup" &&
+				ADAPTER_PROVIDER_CLEANUP_CODES.has(diagnosticCode))
+		);
+	}
+	if (diagnosticOrigin === "worker_boot") {
+		const triple = PRE_PROVIDER_TRIPLE_BY_CODE.get(diagnosticCode);
+		return Boolean(triple && triple.failurePhase === failurePhase);
+	}
+	return (
+		diagnosticOrigin === "integration" &&
+		failurePhase === "adapter_validation" &&
+		INTEGRATION_DIAGNOSTIC_CODES.has(diagnosticCode)
+	);
+}
 
 function trustedLauncherUsageDiagnostic({
 	diagnosticCode,
@@ -705,7 +765,7 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 	}),
 	diff_capture_failed: Object.freeze({
 		reasonCode: "diff_capture_failed",
-		reason: "Partial diff capture failed after execution timeout.",
+		reason: "Diff capture failed.",
 	}),
 	declared_path_not_seeded: Object.freeze({
 		reasonCode: "declared_path_not_seeded",
@@ -907,10 +967,24 @@ export function sanitizeFailureMetadata({
 		reason: metadata.reason,
 	};
 	const safeCleanupDiagnostic = cleanupDiagnosticCodeFor(cleanupStage);
-	if (PERSISTED_DIAGNOSTIC_CODES.includes(diagnosticCode)) {
-		safe.diagnosticCode = diagnosticCode;
-	} else if (safeCleanupDiagnostic) {
-		safe.diagnosticCode = safeCleanupDiagnostic;
+	const closedDiagnosticCode = PERSISTED_DIAGNOSTIC_CODES.includes(
+		diagnosticCode,
+	)
+		? diagnosticCode
+		: safeCleanupDiagnostic;
+	const hasProvenanceInput =
+		diagnosticOrigin !== undefined || diagnosticEvidenceAvailable !== undefined;
+	const authoritativeProvenance = hasAuthoritativeDiagnosticProvenance({
+		diagnosticCode: closedDiagnosticCode,
+		diagnosticOrigin,
+		diagnosticEvidenceAvailable,
+		failurePhase,
+	});
+	if (
+		closedDiagnosticCode &&
+		(!hasProvenanceInput || authoritativeProvenance)
+	) {
+		safe.diagnosticCode = closedDiagnosticCode;
 	}
 	if (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255) {
 		safe.exitCode = exitCode;
@@ -919,9 +993,9 @@ export function sanitizeFailureMetadata({
 	if (PERSISTED_FAILURE_PHASES.has(failurePhase)) {
 		safe.failurePhase = failurePhase;
 	}
-	if (DIAGNOSTIC_ORIGIN_SET.has(diagnosticOrigin)) {
+	if (authoritativeProvenance) {
 		safe.diagnosticOrigin = diagnosticOrigin;
-		safe.diagnosticEvidenceAvailable = diagnosticEvidenceAvailable === true;
+		safe.diagnosticEvidenceAvailable = true;
 	}
 	// Route identity is additive, bounded provenance. It is deliberately
 	// independent from raw invocation arguments so it is safe in public state.

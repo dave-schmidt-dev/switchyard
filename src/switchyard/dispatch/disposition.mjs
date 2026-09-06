@@ -1,3 +1,4 @@
+import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
 import { isSafeTargetId } from "../run-store/index.mjs";
 
 const TERMINAL_STATES = new Set(["succeeded", "failed"]);
@@ -107,7 +108,7 @@ const PRE_PROVIDER_STOP_DIAGNOSTICS = new Set([
 ]);
 
 function baseDisposition(action, reasonCode, failure = null) {
-	const diagnosticCode = failure?.diagnosticCode ?? null;
+	const diagnosticCode = projectedDiagnosticCode(failure);
 	let direction = "stop";
 	if (action === "complete") {
 		direction = "complete";
@@ -146,6 +147,16 @@ function baseDisposition(action, reasonCode, failure = null) {
 		failedTargetIds: [],
 		failedTargetIdsTruncated: false,
 	};
+}
+
+function projectedDiagnosticCode(failure) {
+	if (typeof failure?.diagnosticCode !== "string") return null;
+	const hasProvenance =
+		failure.diagnosticOrigin !== undefined ||
+		failure.diagnosticEvidenceAvailable !== undefined;
+	return !hasProvenance || hasAuthoritativeDiagnosticProvenance(failure)
+		? failure.diagnosticCode
+		: null;
 }
 
 function projectPreInitialization(fact, recoveryCommand) {
@@ -222,11 +233,8 @@ function hasExactDescriptorEvidence(entry) {
 // therefore evidence for inspection only, never fresh fallback authority.
 function hasAuthoritativeRoutingFailure(failure) {
 	return Boolean(
-		failure &&
-			failure.diagnosticEvidenceAvailable === true &&
-			["adapter", "launcher"].includes(failure.diagnosticOrigin) &&
-			failure.failurePhase === "provider_execution" &&
-			typeof failure.diagnosticCode === "string",
+		hasAuthoritativeDiagnosticProvenance(failure) &&
+			failure.failurePhase === "provider_execution",
 	);
 }
 
@@ -389,18 +397,19 @@ export function projectDisposition({
 		return result;
 	}
 	if (run?.state === "failed" && run?.cleanupState === "complete") {
+		const diagnosticCode = projectedDiagnosticCode(failure);
 		if (
-			CONTRACT_DIAGNOSTICS.has(failure?.diagnosticCode) ||
+			CONTRACT_DIAGNOSTICS.has(diagnosticCode) ||
 			CONTRACT_FAILURE_KINDS.has(failure?.errorKind)
 		) {
 			return baseDisposition(
 				"repair_contract",
-				failure.diagnosticCode ?? failure.reasonCode,
+				diagnosticCode ?? failure.reasonCode,
 				failure,
 			);
 		}
-		if (PRE_PROVIDER_STOP_DIAGNOSTICS.has(failure?.diagnosticCode)) {
-			return baseDisposition("stop", failure.diagnosticCode, failure);
+		if (PRE_PROVIDER_STOP_DIAGNOSTICS.has(diagnosticCode)) {
+			return baseDisposition("stop", diagnosticCode, failure);
 		}
 		if (!optionalEvidenceValid || !failure) {
 			return baseDisposition("stop", "insufficient_evidence", failure);
@@ -429,7 +438,7 @@ export function projectDisposition({
 				"target_failed",
 				checkpoint?.retryState?.phase === "retry_halted"
 					? "retry_consumed"
-					: (failure.diagnosticCode ?? failure.reasonCode),
+					: (diagnosticCode ?? failure.reasonCode),
 				failure,
 			);
 			result.taskId = failedTargets.taskId;
