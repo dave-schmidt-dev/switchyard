@@ -124,6 +124,7 @@ function taskBaseContext() {
 function taskBaseDependencies() {
 	return {
 		backendFactory: () => ({
+			readiness: () => ({ inventoryCount: 0 }),
 			create: () => "test-container",
 			destroy: () => {},
 			seed: () => {},

@@ -249,6 +249,7 @@ describe("macOS queue admission", () => {
 			);
 			const events = [];
 			const backendFactory = () => ({
+				readiness: () => ({ inventoryCount: 0 }),
 				create(_path, { onStatus }) {
 					onStatus({
 						type: "aqua-wait",
@@ -1467,6 +1468,7 @@ async function executeTaskAsync(task, context) {
 function legacyBackendFactory(dependencies) {
 	return () => ({
 		executionBackend: dependencies.executionBackend,
+		readiness: dependencies.hostReadiness ?? (() => ({ inventoryCount: 0 })),
 		ensureAgentContainer: dependencies.ensureAgentContainer ?? (() => {}),
 		create: dependencies.createWorkingContainer ?? (() => "test-container"),
 		provision: dependencies.provisionCredentials ?? (() => null),
@@ -4481,6 +4483,7 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 					recordDispatch: () => {},
 					integrationGate: () => ({ success: true }),
 					backendFactory: () => ({
+						readiness: () => ({ inventoryCount: 0 }),
 						create: () => "fake-container",
 						destroy: () => {},
 						seed: () => {},
@@ -5801,6 +5804,7 @@ runQueue({
     // wrapper does for the rest of this file.
     queuePreflight: () => ({ ok: true, eligible: true }),
     backendFactory: () => ({
+      readiness: () => ({ inventoryCount: 0 }),
       ensureAgentContainer: () => {},
       create: () => "child-owned-retry-container",
       provision: () => {},
@@ -6768,6 +6772,10 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		return {
 			platform: "macos",
 			preflight: () => events.push("preflight"),
+			readiness: () => {
+				events.push("readiness");
+				return { inventoryCount: 0 };
+			},
 			acquireSlot: () => {
 				events.push("acquire");
 				return { token: "test-slot" };
@@ -6815,9 +6823,67 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			if (entrypoint === "orchestrator")
 				await runQueueWithOrchestratorImpl(options);
 			strictEqual(events[0], "preflight");
-			strictEqual(events[1], "acquire");
+			strictEqual(events[1], "readiness");
+			ok(events.indexOf("readiness") < events.indexOf("acquire"));
 			ok(events.indexOf("acquire") < events.indexOf("create"));
 			ok(events.indexOf("destroy") < events.indexOf("release"));
+		}
+	});
+
+	it("fails host readiness before a slot, workspace, or provider launch in every entrypoint", async () => {
+		for (const [code, message] of [
+			["vm_host_inventory_permission_denied", "inventory permission denied"],
+			["vm_host_inventory_unavailable", "inventory unavailable"],
+			["vm_host_service_degraded", "service degraded"],
+		]) {
+			for (const entrypoint of ["sync", "async", "orchestrator"]) {
+				const events = [];
+				const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Must not launch
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** fixture
+`);
+				const failure = Object.assign(new Error(message), { code });
+				const backend = macosBackend(events);
+				backend.readiness = () => {
+					events.push("readiness");
+					throw failure;
+				};
+				let providerLaunches = 0;
+				const options = {
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "macos",
+					checkpointPath: `${tasksPath}.${code}.${entrypoint}.checkpoint.json`,
+					dependencies: {
+						backendFactory: () => backend,
+						route: () => {
+							providerLaunches += 1;
+							throw new Error("provider launch must not occur");
+						},
+						orchestrator: {
+							launch: async () => "job",
+							status: async () => ({ state: "done" }),
+							result: async () => ({ success: true, diff: "" }),
+						},
+					},
+				};
+				const invoke =
+					entrypoint === "sync"
+						? () => runQueueImpl(options)
+						: entrypoint === "async"
+							? () => runQueueAsyncImpl(options)
+							: () => runQueueWithOrchestratorImpl(options);
+				await rejects(
+					Promise.resolve().then(invoke),
+					(error) => error === failure,
+				);
+				deepStrictEqual(events, ["preflight", "readiness"]);
+				strictEqual(providerLaunches, 0);
+			}
 		}
 	});
 
@@ -7215,6 +7281,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		);
 		deepStrictEqual(events, [
 			"preflight",
+			"readiness",
 			"acquire",
 			"ensure",
 			"create",

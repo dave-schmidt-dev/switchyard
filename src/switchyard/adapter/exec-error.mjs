@@ -338,6 +338,14 @@ export function prlctlFailureMetadata(error) {
 	return null;
 }
 
+/** Return a closed host errno from the actual cause of a reviewed prlctl error. */
+export function prlctlTrustedCauseCode(error) {
+	if (!(error instanceof PrlctlCallError)) return null;
+	return ["EACCES", "EPERM", "ENOENT", "ETIMEDOUT"].includes(error.cause?.code)
+		? error.cause.code
+		: null;
+}
+
 /** Return the durable diagnostic code for the last completed cleanup stage. */
 export function cleanupDiagnosticCodeFor(cleanupStage) {
 	return CLEANUP_STAGE_DIAGNOSTIC_CODES[cleanupStage] ?? null;
@@ -414,6 +422,9 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"vm_admission_storage_failed",
 	"vm_admission_unavailable",
 	"vm_slot_unavailable",
+	"vm_host_inventory_permission_denied",
+	"vm_host_inventory_unavailable",
+	"vm_host_service_degraded",
 	"prlctl_job_misfire",
 	"prlctl_session_not_ready",
 	"prlctl_call_timed_out",
@@ -508,6 +519,17 @@ export const PRE_PROVIDER_FAILURE_TRIPLES = Object.freeze([
 		errorKind: "environment_incomplete",
 		failurePhase: "queue_preflight",
 	}),
+	...[
+		"vm_host_inventory_permission_denied",
+		"vm_host_inventory_unavailable",
+		"vm_host_service_degraded",
+	].map((diagnosticCode) =>
+		Object.freeze({
+			diagnosticCode,
+			errorKind: "environment_incomplete",
+			failurePhase: "queue_preflight",
+		}),
+	),
 	...[...CHECKPOINT_DIAGNOSTIC_CODES].map((diagnosticCode) =>
 		Object.freeze({
 			diagnosticCode,
@@ -584,6 +606,15 @@ export function classifyPreProviderFailure(error) {
 		error.code === "VM_SLOT_UNAVAILABLE"
 	) {
 		diagnosticCode = "vm_slot_unavailable";
+	} else if (
+		error.name === "ParallelsHostReadinessError" &&
+		[
+			"vm_host_inventory_permission_denied",
+			"vm_host_inventory_unavailable",
+			"vm_host_service_degraded",
+		].includes(error.code)
+	) {
+		diagnosticCode = error.code;
 	} else {
 		const prlctl = prlctlFailureMetadata(error);
 		diagnosticCode =

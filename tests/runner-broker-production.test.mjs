@@ -130,6 +130,7 @@ function withTaskBaseLifecycle(backend) {
 	};
 	return {
 		...backend,
+		readiness: backend.readiness ?? (() => ({ inventoryCount: 0 })),
 		captureTaskBase,
 		captureTaskBaseAsync: async (...args) => captureTaskBase(...args),
 		validateTaskBase,
@@ -1189,9 +1190,10 @@ test("production router path coordinates the requested snapshot source", async (
 		projectPath: root,
 		workingContainerName: "broker-production-worker",
 		checkpointPath,
-		only: ["claude"],
+		only: ["claude-code"],
 		dependencies: {
 			queuePreflight: () => ({ ok: true, eligible: true }),
+			goldenImageVerifiedProviders: ["claude-code"],
 			adapters: {
 				claude: {
 					executeAsync: async () => {

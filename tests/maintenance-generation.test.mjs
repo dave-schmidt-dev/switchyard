@@ -6,6 +6,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	utimesSync,
 	writeFileSync,
@@ -14,7 +15,6 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { rollback } from "../ops/switchyard-cutover.mjs";
 import {
 	handleLaunch,
 	runDispatch,
@@ -35,7 +35,7 @@ import {
 import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const cutoverCli = join(projectRoot, "ops", "switchyard-cutover.mjs");
+const productionCutoverCli = join(projectRoot, "ops", "switchyard-cutover.mjs");
 const workerBootstrap = join(
 	projectRoot,
 	"src",
@@ -49,6 +49,29 @@ function tempDir() {
 	const path = trackedTempDir("switchyard-generation-test-");
 	tempDirs.push(path);
 	return path;
+}
+
+function cutoverFixture() {
+	const root = tempDir();
+	const roots = {
+		project: join(root, "project"),
+		plans: join(root, "plans"),
+		agent: join(root, "agent"),
+	};
+	for (const path of Object.values(roots)) mkdirSync(path, { recursive: true });
+	const cli = join(root, "switchyard-cutover.mjs");
+	const source = readFileSync(productionCutoverCli, "utf8")
+		.replace(
+			'"/Users/dave/Documents/Projects/switchyard"',
+			JSON.stringify(roots.project),
+		)
+		.replace(
+			'"/Users/dave/Documents/Projects/.plans"',
+			JSON.stringify(roots.plans),
+		)
+		.replace('"/Users/dave/.agent"', JSON.stringify(roots.agent));
+	writeFileSync(cli, source);
+	return { cli: realpathSync(cli), roots };
 }
 
 function sha256(value) {
@@ -118,9 +141,13 @@ describe("maintenance generation guard", () => {
 			(error) => error instanceof MaintenanceGenerationError,
 		);
 		process.env.SWITCHYARD_GENERATION_MARKER = path;
+		const tasksFilePath = join(tempDir(), "TASKS.md");
+		writeFileSync(
+			tasksFilePath,
+			"### Task 1.1: Guarded\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
+		);
 		await assert.rejects(
-			() =>
-				handleLaunch([join(projectRoot, "TASKS.md"), "--project", projectRoot]),
+			() => handleLaunch([tasksFilePath, "--project", projectRoot]),
 			(error) => error instanceof MaintenanceGenerationError,
 		);
 		assert.throws(
@@ -376,8 +403,9 @@ describe("maintenance generation guard", () => {
 describe("cutover transaction hashes and rollback", () => {
 	it("verifies source drift, supports rollback dry-run, and refuses hash conflicts", () => {
 		const dir = tempDir();
+		const { cli: cutoverCli, roots } = cutoverFixture();
 		const target = join(
-			projectRoot,
+			roots.project,
 			"tests",
 			`.cutover-fixture-${process.pid}.txt`,
 		);
@@ -386,6 +414,7 @@ describe("cutover transaction hashes and rollback", () => {
 		const manifest = join(manifestDir, "manifest.json");
 		mkdirSync(dirname(copy), { recursive: true });
 		mkdirSync(manifestDir, { recursive: true });
+		mkdirSync(dirname(target), { recursive: true });
 		try {
 			writeFileSync(target, "before\n");
 			mkdirSync(dirname(copy), { recursive: true });
@@ -401,7 +430,7 @@ describe("cutover transaction hashes and rollback", () => {
 					files: [
 						{
 							root: "project",
-							path: relative(projectRoot, target),
+							path: relative(roots.project, target),
 							preCutoverSha256: pre,
 							postCutoverSha256: post,
 							copyPath: relative(manifestDir, copy),
@@ -456,7 +485,7 @@ describe("cutover transaction hashes and rollback", () => {
 					files: [
 						{
 							root: "project",
-							path: relative(projectRoot, target),
+							path: relative(roots.project, target),
 							preCutoverSha256: pre,
 							postCutoverSha256: post,
 							copyPath: relative(manifestDir, copy),
@@ -480,10 +509,14 @@ describe("cutover transaction hashes and rollback", () => {
 		}
 	});
 
-	it("rejects target drift injected after rollback preflight", () => {
+	it("rejects target drift injected after rollback preflight", async () => {
 		const dir = tempDir();
+		const { cli: cutoverCli, roots } = cutoverFixture();
+		const { rollback } = await import(
+			`${pathToFileURL(cutoverCli).href}?test=${Date.now()}`
+		);
 		const target = join(
-			projectRoot,
+			roots.project,
 			"tests",
 			`.cutover-drift-fixture-${process.pid}.txt`,
 		);
@@ -491,6 +524,7 @@ describe("cutover transaction hashes and rollback", () => {
 		const copy = join(manifestDir, "copies", "fixture.txt");
 		const manifest = join(manifestDir, "manifest.json");
 		mkdirSync(dirname(copy), { recursive: true });
+		mkdirSync(dirname(target), { recursive: true });
 		try {
 			writeFileSync(target, "before\n");
 			writeFileSync(copy, "before\n");
@@ -502,7 +536,7 @@ describe("cutover transaction hashes and rollback", () => {
 					files: [
 						{
 							root: "project",
-							path: relative(projectRoot, target),
+							path: relative(roots.project, target),
 							preCutoverSha256: sha256("before\n"),
 							postCutoverSha256: sha256("after\n"),
 							copyPath: relative(manifestDir, copy),
@@ -523,8 +557,9 @@ describe("cutover transaction hashes and rollback", () => {
 
 	it("refuses a corrupt backup during rollback dry-run preflight", () => {
 		const dir = tempDir();
+		const { cli: cutoverCli, roots } = cutoverFixture();
 		const target = join(
-			projectRoot,
+			roots.project,
 			"tests",
 			`.cutover-dry-run-fixture-${process.pid}.txt`,
 		);
@@ -532,6 +567,7 @@ describe("cutover transaction hashes and rollback", () => {
 		const copy = join(manifestDir, "copies", "fixture.txt");
 		const manifest = join(manifestDir, "manifest.json");
 		mkdirSync(dirname(copy), { recursive: true });
+		mkdirSync(dirname(target), { recursive: true });
 		try {
 			writeFileSync(target, "after\n");
 			writeFileSync(copy, "corrupt-backup\n");
@@ -543,7 +579,7 @@ describe("cutover transaction hashes and rollback", () => {
 					files: [
 						{
 							root: "project",
-							path: relative(projectRoot, target),
+							path: relative(roots.project, target),
 							preCutoverSha256: sha256("before\n"),
 							postCutoverSha256: sha256("after\n"),
 							copyPath: relative(manifestDir, copy),

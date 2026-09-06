@@ -10,6 +10,8 @@ import {
 	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
 	PRE_PROVIDER_FAILURE_TRIPLES,
+	PrlctlCallError,
+	prlctlTrustedCauseCode,
 	reauthHintFor,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
@@ -88,6 +90,49 @@ describe("closed pre-provider failure triples", () => {
 			ok(!persisted.includes("/private/admission"));
 			ok(!persisted.includes("canary"));
 		}
+	});
+
+	it("classifies only exact host-readiness error names and closed codes", () => {
+		for (const diagnosticCode of [
+			"vm_host_inventory_permission_denied",
+			"vm_host_inventory_unavailable",
+			"vm_host_service_degraded",
+		]) {
+			const error = Object.assign(new Error("untrusted host prose"), {
+				name: "ParallelsHostReadinessError",
+				code: diagnosticCode,
+			});
+			deepStrictEqual(classifyPreProviderFailure(error), {
+				diagnosticCode,
+				errorKind: "environment_incomplete",
+				failurePhase: "queue_preflight",
+			});
+		}
+		strictEqual(
+			classifyPreProviderFailure(
+				Object.assign(new Error("vm_host_service_degraded"), {
+					name: "Error",
+					code: "vm_host_service_degraded",
+				}),
+			),
+			null,
+		);
+	});
+
+	it("reads permission denial only from the reviewed prlctl cause", () => {
+		const cause = Object.assign(new Error("denied"), { code: "EPERM" });
+		const failure = new PrlctlCallError({
+			diagnosticCode: "prlctl_call_failed",
+			subcommand: "list",
+			cause,
+		});
+		strictEqual(prlctlTrustedCauseCode(failure), "EPERM");
+		strictEqual(
+			prlctlTrustedCauseCode(
+				Object.assign(new Error("forged"), { code: "EPERM" }),
+			),
+			null,
+		);
 	});
 });
 

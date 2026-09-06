@@ -6572,6 +6572,22 @@ function createQueueBootstrapStatusEmitter(onStatus) {
 			});
 			return;
 		}
+		if (event?.type === "host-readiness") {
+			onStatus({
+				phase: "bootstrap",
+				event: event.event,
+				status: event.status,
+				...(event.attempt !== undefined ? { attempt: event.attempt } : {}),
+				...(event.elapsedMs !== undefined
+					? { elapsedMs: event.elapsedMs }
+					: {}),
+				...(event.delayMs !== undefined ? { delayMs: event.delayMs } : {}),
+				...(event.inventoryCount !== undefined
+					? { inventoryCount: event.inventoryCount }
+					: {}),
+			});
+			return;
+		}
 		// Preserve any future backend lifecycle events rather than dropping
 		// visibility when the backend grows its status vocabulary.
 		onStatus(event);
@@ -6656,6 +6672,8 @@ export function createQueueBackend({
 			supplied.commit &&
 			supplied.reset
 		) {
+			const suppliedReadiness =
+				supplied.readiness ?? supplied.executionBackend?.probeHostReadiness;
 			return {
 				platform: selectedPlatform,
 				...supplied,
@@ -6666,6 +6684,20 @@ export function createQueueBackend({
 						onStatus: createQueueBootstrapStatusEmitter(options.onStatus),
 					}),
 				ensureAgentContainer: supplied.ensureAgentContainer ?? (() => {}),
+				readiness: (options = {}) => {
+					if (typeof suppliedReadiness !== "function") {
+						throw new Error(
+							"backendFactory must provide readiness() for macOS queue admission",
+						);
+					}
+					return suppliedReadiness.call(
+						supplied.readiness ? supplied : supplied.executionBackend,
+						{
+							...options,
+							onStatus: createQueueBootstrapStatusEmitter(options.onStatus),
+						},
+					);
+				},
 				provision: supplied.provision ?? (() => null),
 				preflight: supplied.preflight ?? configuredQueuePreflight,
 				acquireSlot: supplied.acquireSlot ?? (() => null),
@@ -6775,6 +6807,17 @@ export function createQueueBackend({
 		taskBaseRunId,
 		executionBackend,
 		ensureAgentContainer: () => {},
+		readiness: (options = {}) => {
+			if (typeof executionBackend.probeHostReadiness !== "function") {
+				throw new Error(
+					"Parallels execution backend does not provide host readiness",
+				);
+			}
+			return executionBackend.probeHostReadiness({
+				...options,
+				onStatus: createQueueBootstrapStatusEmitter(options.onStatus),
+			});
+		},
 		create: (_path, options = {}) => {
 			if (!goldenImage) {
 				throw new Error(
@@ -6980,6 +7023,16 @@ function prepareQueueLaunch({
 		projectPath,
 		runOptions: identity.runOptions,
 	});
+	if (selectedPlatform === "macos") {
+		queueBackend.readiness({
+			platform: selectedPlatform,
+			tasks,
+			checkpoint,
+			runId,
+			projectPath,
+			onStatus,
+		});
+	}
 	const slotLease =
 		selectedPlatform === "macos" && !deferSlotAcquisition
 			? queueBackend.acquireSlot({ runId })

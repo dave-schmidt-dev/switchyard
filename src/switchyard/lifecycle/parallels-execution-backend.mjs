@@ -19,6 +19,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
 	PrlctlCallError,
+	prlctlTrustedCauseCode,
 	WorkerBootStageError,
 } from "../adapter/exec-error.mjs";
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
@@ -297,6 +298,14 @@ const PRLCTL_SESSION_NOT_READY =
 // concurrent rate four attempts leaves a ~4-in-10,000 residual per call.
 const DEFAULT_PRLCTL_RETRY_ATTEMPTS = 4;
 const DEFAULT_PRLCTL_RETRY_BACKOFF_MS = 250;
+// Queue admission needs proof that the host service can return a complete VM
+// inventory, not merely that the prlctl binary is installed. This is a small,
+// dedicated budget for that read-only check; it must not inherit _call's
+// retry policy, because clone/start/delete are not made retryable by probing.
+const DEFAULT_HOST_READINESS_ATTEMPTS = 2;
+const DEFAULT_HOST_READINESS_BACKOFF_MS = 100;
+const DEFAULT_HOST_READINESS_TIMEOUT_MS = 2_000;
+const HOST_READINESS_MAX_BUFFER = 1024 * 1024;
 // Only these may be persisted as the failing subcommand. Every value is a
 // literal this file passes to `_call`; allowlisting rather than echoing argv
 // keeps a guest-influenced string from reaching a run record.
@@ -918,6 +927,37 @@ export function validateLinkedCloneMeasurement(measurement) {
 	return { diskBytes, cloneToBootMs };
 }
 
+const HOST_READINESS_CODES = new Set([
+	"vm_host_inventory_permission_denied",
+	"vm_host_inventory_unavailable",
+	"vm_host_service_degraded",
+]);
+
+/** Closed, content-free host readiness failure for queue admission. */
+export class ParallelsHostReadinessError extends Error {
+	constructor(code, cause) {
+		if (!HOST_READINESS_CODES.has(code)) {
+			throw new TypeError("unrecognized Parallels host readiness code");
+		}
+		super(
+			code === "vm_host_inventory_permission_denied"
+				? "Parallels VM inventory permission is denied"
+				: code === "vm_host_inventory_unavailable"
+					? "Parallels VM inventory is unavailable"
+					: "Parallels host service is degraded",
+			{ cause },
+		);
+		this.name = "ParallelsHostReadinessError";
+		Object.defineProperty(this, "code", { value: code, enumerable: true });
+		if (code === "vm_host_inventory_permission_denied") {
+			Object.defineProperty(this, "boundary", {
+				value: "parallels_vm_inventory",
+				enumerable: true,
+			});
+		}
+	}
+}
+
 function parseVmList(output) {
 	return outputText(output)
 		.split(/\r?\n/)
@@ -940,6 +980,41 @@ function parseVmList(output) {
 			};
 		})
 		.filter(Boolean);
+}
+
+function parseReadinessInventory(output) {
+	const lines = outputText(output)
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (lines.length === 0) {
+		throw new Error("Parallels VM inventory is blank");
+	}
+	const rows = lines.map((line) =>
+		line.includes("\t")
+			? line.split("\t").map((field) => field.trim())
+			: line.split(/\s+/),
+	);
+	if (
+		rows[0].length === 3 &&
+		rows[0][0].toLowerCase() === "uuid" &&
+		rows[0][1].toLowerCase() === "status" &&
+		rows[0][2].toLowerCase() === "name"
+	) {
+		rows.shift();
+	}
+	for (const fields of rows) {
+		const [uuid, status, ...nameParts] = fields;
+		if (
+			fields.length < 3 ||
+			!UUID.test(uuid ?? "") ||
+			!/^[A-Za-z][A-Za-z0-9_-]*$/.test(status ?? "") ||
+			!nameParts.join(" ").trim()
+		) {
+			throw new Error("Parallels VM inventory contains an invalid row");
+		}
+	}
+	return rows;
 }
 
 function isUuid(value) {
@@ -1099,6 +1174,11 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		maxTransferBytes = MAX_TRANSFER_BYTES,
 		prlctlRetryAttempts = DEFAULT_PRLCTL_RETRY_ATTEMPTS,
 		prlctlRetryBackoffMs = DEFAULT_PRLCTL_RETRY_BACKOFF_MS,
+		hostReadinessAttempts = DEFAULT_HOST_READINESS_ATTEMPTS,
+		hostReadinessBackoffMs = DEFAULT_HOST_READINESS_BACKOFF_MS,
+		hostReadinessTimeoutMs = DEFAULT_HOST_READINESS_TIMEOUT_MS,
+		hostReadinessJitterFn = Math.random,
+		hostReadinessNowFn = () => performance.now(),
 		hostProcessIdentityProbe = probeHostProcessIdentity,
 	} = {}) {
 		super();
@@ -1123,6 +1203,28 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			"prlctlRetryBackoffMs",
 			0,
 		);
+		this.hostReadinessAttempts = validateAttemptCount(
+			hostReadinessAttempts,
+			"hostReadinessAttempts",
+		);
+		this.hostReadinessBackoffMs = validateDurationMs(
+			hostReadinessBackoffMs,
+			"hostReadinessBackoffMs",
+			0,
+		);
+		this.hostReadinessTimeoutMs = validateDurationMs(
+			hostReadinessTimeoutMs,
+			"hostReadinessTimeoutMs",
+			1,
+		);
+		if (typeof hostReadinessJitterFn !== "function") {
+			throw new TypeError("hostReadinessJitterFn must be a function");
+		}
+		if (typeof hostReadinessNowFn !== "function") {
+			throw new TypeError("hostReadinessNowFn must be a function");
+		}
+		this.hostReadinessJitterFn = hostReadinessJitterFn;
+		this.hostReadinessNowFn = hostReadinessNowFn;
 		this.sleepFn = sleepFn;
 		this.nowFn = nowFn;
 		this.pidIsAlive = pidIsAlive;
@@ -1197,8 +1299,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	/**
 	 * The single funnel for every synchronous prlctl invocation.
 	 *
-	 * Do not give this call a timeout, and do not kill an orchestrator that is
-	 * blocked in it. prlctl 26.4.1 segfaults when a signal reaches it after its
+	 * Mutating lifecycle calls do not receive a timeout, and callers do not kill
+	 * an orchestrator blocked in one. The readiness probe is the sole exception:
+	 * it owns a read-only `list` client and supplies a small absolute deadline.
+	 * prlctl 26.4.1 segfaults when a signal reaches it after its
 	 * parent has exited: it jumps to address 0 through `_sigtramp` while blocked
 	 * in `QWaitCondition::wait` inside ParallelsVirtualizationSDK. Measured
 	 * 2026-08-14 17:33:00 — pid 10735, five minutes into an operation whose
@@ -1308,6 +1412,98 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	preflight() {
 		return outputText(this._call(["--version"])).trim();
+	}
+
+	/**
+	 * Prove the read-only Parallels inventory path before a queue occupies a VM
+	 * slot. A version check only proves the client binary exists; a complete
+	 * `list` response proves the host service can answer the operation needed to
+	 * account for managed guests. This probe owns its own small retry budget so
+	 * no mutating lifecycle operation inherits a new retry path.
+	 *
+	 * @param {{onStatus?: Function}} [options]
+	 * @returns {{inventoryCount: number}}
+	 * @throws {ParallelsHostReadinessError}
+	 */
+	probeHostReadiness({ onStatus } = {}) {
+		const startedAt = this.hostReadinessNowFn();
+		const deadline = startedAt + this.hostReadinessTimeoutMs;
+		let failure = null;
+		for (let attempt = 1; attempt <= this.hostReadinessAttempts; attempt += 1) {
+			const elapsedMs = Math.max(0, this.hostReadinessNowFn() - startedAt);
+			const remainingMs = Math.floor(deadline - this.hostReadinessNowFn());
+			if (remainingMs <= 0) {
+				throw new ParallelsHostReadinessError(
+					"vm_host_inventory_unavailable",
+					failure,
+				);
+			}
+			onStatus?.({
+				type: "host-readiness",
+				event: "host_readiness_probe",
+				status: "Checking Parallels VM inventory readiness",
+				attempt,
+				elapsedMs,
+			});
+			try {
+				const inventory = parseReadinessInventory(
+					this._call(["list", "-a", "-o", "uuid,status,name"], {
+						retry: false,
+						timeout: remainingMs,
+						killSignal: "SIGKILL",
+						maxBuffer: HOST_READINESS_MAX_BUFFER,
+					}),
+				);
+				onStatus?.({
+					type: "host-readiness",
+					event: "host_readiness_ready",
+					status: "Parallels VM inventory is ready",
+					attempt,
+					elapsedMs: Math.max(0, this.hostReadinessNowFn() - startedAt),
+					inventoryCount: inventory.length,
+				});
+				return { inventoryCount: inventory.length };
+			} catch (error) {
+				const causeCode = prlctlTrustedCauseCode(error);
+				const retryable =
+					error instanceof PrlctlCallError &&
+					["prlctl_job_misfire", "prlctl_session_not_ready"].includes(
+						error.diagnosticCode,
+					);
+				const code = ["EACCES", "EPERM"].includes(causeCode)
+					? "vm_host_inventory_permission_denied"
+					: !(error instanceof PrlctlCallError) ||
+							["ENOENT", "ETIMEDOUT"].includes(causeCode) ||
+							error.diagnosticCode === "prlctl_call_timed_out"
+						? "vm_host_inventory_unavailable"
+						: "vm_host_service_degraded";
+				failure = new ParallelsHostReadinessError(code, error);
+				if (!retryable || attempt >= this.hostReadinessAttempts) {
+					throw failure;
+				}
+				const jitter = Number(this.hostReadinessJitterFn());
+				const boundedJitter = Number.isFinite(jitter)
+					? Math.min(1, Math.max(0, jitter))
+					: 0;
+				const requestedDelayMs = Math.round(
+					this.hostReadinessBackoffMs * attempt * (1 + boundedJitter),
+				);
+				const delayMs = Math.min(
+					requestedDelayMs,
+					Math.max(0, Math.floor(deadline - this.hostReadinessNowFn())),
+				);
+				onStatus?.({
+					type: "host-readiness",
+					event: "host_readiness_wait",
+					status: "Waiting to retry Parallels VM inventory readiness",
+					attempt,
+					elapsedMs: Math.max(0, this.hostReadinessNowFn() - startedAt),
+					delayMs,
+				});
+				if (delayMs > 0) this.sleepFn(delayMs);
+			}
+		}
+		throw failure;
 	}
 
 	/**

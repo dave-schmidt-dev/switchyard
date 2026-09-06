@@ -1053,6 +1053,7 @@ describe("Task 6.1 queue-level platform selection", () => {
 			strictEqual(platform, "macos");
 			return {
 				platform,
+				readiness: () => ({ inventoryCount: 0 }),
 				create: () => {
 					calls.push("create-vm");
 					return "vm-handle";
@@ -1098,6 +1099,7 @@ describe("Task 6.1 queue-level platform selection", () => {
 			platform: "macos",
 			dependencies: {
 				backendFactory: () => ({
+					readiness: () => ({ inventoryCount: 0 }),
 					create: () => "vm",
 					seed: () => {},
 					commit: () => {},
