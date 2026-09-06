@@ -6029,6 +6029,77 @@ describe("runner cli orchestrator wiring", () => {
 });
 
 describe("checkpoint durability", () => {
+	it("reads completed legacy history unchanged across all queue loops", async () => {
+		for (const version of [1, 2]) {
+			for (const [mode, entrypoint] of [
+				["sync", runQueue],
+				["async", runQueueAsync],
+				["orchestrator", runQueueWithOrchestrator],
+			]) {
+				const tasksPath = writeTasksFile(`### Task 1.1: Legacy completion
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** retain completed history
+`);
+				const checkpointPath = `${tasksPath}.checkpoint.json`;
+				writeLegacyCheckpoint(checkpointPath, {
+					version,
+					tasksFilePath: tasksPath,
+					...(version === 2
+						? { queueIdentity: "legacy-queue", runOptions: null, taskBases: {} }
+						: {}),
+					completedTaskIds: ["1.1"],
+					lastTaskId: "1.1",
+					lastUpdatedAt: "2026-01-01T00:00:00.000Z",
+					results: [{ taskId: "1.1", success: true }],
+				});
+				const before = readFileSync(checkpointPath, "utf8");
+				let providerLaunches = 0;
+				const dependencies = {
+					route: () => {
+						providerLaunches += 1;
+						return { provider: "claude", model: "fixture-model" };
+					},
+					adapters: {
+						claude: {
+							execute: () => {
+								providerLaunches += 1;
+								return { success: true };
+							},
+							executeAsync: async () => {
+								providerLaunches += 1;
+								return { success: true };
+							},
+						},
+					},
+					orchestrator: {
+						launch: () => {
+							providerLaunches += 1;
+							return "unexpected";
+						},
+						status: () => ({ state: "done" }),
+						result: () => ({ success: true }),
+					},
+				};
+				const result = await entrypoint({
+					tasksFilePath: tasksPath,
+					checkpointPath,
+					projectPath: TEST_DIR,
+					workingContainerName: `legacy-${version}-${mode}`,
+					dependencies,
+				});
+				strictEqual(result.processedTasks, 0, `${version}/${mode}`);
+				strictEqual(providerLaunches, 0, `${version}/${mode}`);
+				strictEqual(
+					readFileSync(checkpointPath, "utf8"),
+					before,
+					`${version}/${mode}`,
+				);
+			}
+		}
+	});
+
 	it("rejects a stale independently loaded writer using the disk revision", () => {
 		const tasksPath = writeTasksFile("## Phase 1\n");
 		const checkpointPath = `${tasksPath}.checkpoint.json`;

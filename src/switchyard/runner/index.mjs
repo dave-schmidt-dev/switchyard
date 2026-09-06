@@ -5637,7 +5637,8 @@ export async function runQueueAsync(options) {
 			}
 			if (!result.success && effectiveStopOnFailure) break;
 		}
-		releaseCheckpointOwnership(checkpointPath, checkpoint);
+		if (checkpoint.version === CHECKPOINT_VERSION)
+			releaseCheckpointOwnership(checkpointPath, checkpoint);
 		queueResult = {
 			results,
 			totalTasks: tasks.length,
@@ -9098,7 +9099,8 @@ export async function runQueueWithOrchestrator(options) {
 		// A halt entry was already persisted by recordHalt before the
 		// queue_halted event fired; this final save is a no-op for that entry
 		// and remains for the other fields/zero-runnable path.
-		releaseCheckpointOwnership(checkpointPath, checkpoint);
+		if (checkpoint.version === CHECKPOINT_VERSION)
+			releaseCheckpointOwnership(checkpointPath, checkpoint);
 
 		return {
 			totalTasks: tasks.length,
