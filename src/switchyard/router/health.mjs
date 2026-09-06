@@ -758,7 +758,7 @@ function effective(control, observations, input, now) {
 		return {
 			key,
 			value,
-			state: value.cooldownUntil <= now ? "cooldown" : "cooldown",
+			state: "cooldown",
 			trialAvailable: value.cooldownUntil <= now,
 		};
 	return { key, value, state: value.state };

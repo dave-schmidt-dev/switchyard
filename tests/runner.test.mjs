@@ -11902,12 +11902,13 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 	}
 
 	it(
-		"keeps a started trial fenced and skips quota fallback without lifecycle proof",
+		"keeps a started enforce-mode trial fenced and skips quota fallback without lifecycle proof",
 		withQualifiedRoster(async () => {
 			for (const mode of ["sync", "async"]) {
 				const healthStateRoot = join(TEST_DIR, `trial-health-${mode}`);
 				const healthDecision = createDefaultRouteHealthDecision({
 					healthStateRoot,
+					mode: "enforce",
 					qualifiedProviders: ["codex"],
 					goldenImageReference: "golden-a",
 				});
@@ -11973,6 +11974,89 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					"started",
 					`${mode}: without lifecycle proof the claim stays fenced`,
 				);
+			}
+		}),
+	);
+
+	it(
+		"never claims a trial in shadow mode and leaves quota fallback untouched",
+		withQualifiedRoster(async () => {
+			for (const mode of ["sync", "async"]) {
+				const healthStateRoot = join(TEST_DIR, `shadow-trial-health-${mode}`);
+				const healthDecision = createDefaultRouteHealthDecision({
+					healthStateRoot,
+					qualifiedProviders: ["codex"],
+					goldenImageReference: "golden-a",
+				});
+				strictEqual(healthDecision.mode, "shadow", mode);
+				const identity = await holdCodexRoute({
+					healthDecision,
+					healthStateRoot,
+					runId: `shadow-hold-run-${mode}`,
+				});
+				await attestRouteRepair({
+					...identity,
+					healthStateRoot,
+					repairKind: "auth_repaired",
+					nowMs: Date.now() + 1_000,
+				});
+				strictEqual(
+					healthDecision({ provider: "codex", requiredCapability: "standard" })
+						.trialAvailable,
+					true,
+					mode,
+				);
+				const tasksPath = writeTasksFile(`### Task 1.1: Shadow trial
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** shadow mode must not claim the attested trial
+`);
+				// One checkpoint per mode: a shared one would hand the async run a
+				// checkpoint whose task the sync run already completed.
+				const checkpointPath = `${tasksPath}.shadow-${mode}.checkpoint.json`;
+				const fixture = ownedCodexQueueDependencies([
+					quotaExhaustedExecution(),
+					{ success: true, output: "ok" },
+				]);
+				fixture.dependencies.healthDecision = healthDecision;
+				const statusEvents = [];
+				fixture.dependencies.onStatus = (event) => statusEvents.push(event);
+				const options = productionQueueOptions({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					runId: `shadow-trial-run-${mode}`,
+					dependencies: fixture.dependencies,
+				});
+				const result =
+					mode === "sync"
+						? runQueueImpl(options)
+						: await runQueueAsyncImpl(options);
+				strictEqual(
+					fixture.executeCalls.length,
+					2,
+					`${mode}: shadow mode still spends the quota fallback launch`,
+				);
+				strictEqual(result.results[0].success, true, mode);
+				strictEqual(
+					loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations
+						.length,
+					1,
+					mode,
+				);
+				ok(
+					statusEvents.some(
+						(event) => event?.event === "half_open_trial_shadowed",
+					),
+					`${mode}: shadow mode reports the trial it would have claimed`,
+				);
+				const health = await inspectRouteHealth({
+					...identity,
+					healthStateRoot,
+				});
+				strictEqual(health.state, "repair-hold", mode);
+				strictEqual(health.claimStatus, null, `${mode}: no claim was written`);
 			}
 		}),
 	);

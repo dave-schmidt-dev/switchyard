@@ -3830,7 +3830,12 @@ function executionCleanupContext(
 	return Object.freeze({
 		runId: context.runId,
 		taskId: String(task.id),
-		attemptId: attemptId ?? context.attemptId ?? "attempt-1",
+		// The lifecycle receipt is matched against the route-health binding by
+		// attempt id, so both must derive it from the same checkpoint state.
+		attemptId:
+			attemptId ??
+			context.attemptId ??
+			routeHealthAttemptId(context, String(task.id)),
 		descriptorIdentity,
 		workspaceId: context.workingContainerName,
 		processStartIdentity: context.processStartIdentity ?? null,
@@ -3996,6 +4001,19 @@ function prepareRouteHealthTrial(context, task, routeResult, descriptor) {
 			reason: "route-health-suppressed",
 		};
 	if (!binding?.trialAvailable) return { allowed: true };
+	// Shadow mode is observational: it never writes a half-open claim, so a
+	// shadow queue can neither flip a target to `half-open` for every later
+	// reader nor fence this task's fallback launches behind a trial it did
+	// not own. Only an enforcing queue claims and starts trials.
+	if (binding.mode !== "enforce") {
+		context.onStatus?.({
+			phase: "route_health",
+			event: "half_open_trial_shadowed",
+			status: `Task ${task.id} would claim the selected health trial in enforce mode`,
+			taskId: task.id,
+		});
+		return { allowed: true };
+	}
 	const claimed = acquireHalfOpenClaimSync(binding);
 	if (claimed.claimed !== true) {
 		context.onStatus?.({
@@ -6370,6 +6388,7 @@ export async function runQueueAsync(options) {
 export async function executeTaskWithOrchestrator(task, context) {
 	context._activeRouteHealth = null;
 	context._activeProviderExecutionSucceeded = false;
+	context._activeCompletionLifecycleReceipt = null;
 	const executor = resolveTaskExecutor(task);
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	if (executor !== "switchyard") {

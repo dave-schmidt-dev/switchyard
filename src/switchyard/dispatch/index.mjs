@@ -170,10 +170,11 @@ const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>] [--st
 
 const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest-repair> --target <target-id> [options]
 
-	identity:      --capability <low|standard|high>
-  inspect:       --repair-epoch <n> [--health-state-root <path>]
-  attest-repair: --repair-kind <image_repaired|auth_repaired|configuration_repaired> [--health-state-root <path>]
-  This records attended host control metadata only; it never reads credentials or repairs a service.`;
+  identity:      --capability <low|standard|high>
+  inspect:       --descriptor <descriptor-identity> --public-configuration-epoch <epoch> --repair-epoch <n> [--health-state-root <path>]
+  attest-repair: --descriptor <descriptor-identity> --public-configuration-epoch <epoch> --repair-kind <image_repaired|auth_repaired|configuration_repaired> [--health-state-root <path>]
+  Run \`health identity\` first: it prints the descriptor identity and public configuration epoch the other two require.
+  attest-repair records attended host control metadata only; it never reads credentials or repairs a service.`;
 
 const KNOWN_SUBCOMMANDS = new Set([
 	"run",
@@ -682,19 +683,7 @@ async function runDispatch(opts, dependencies = {}) {
 	// reservations, fallback, and provider execution. Keep the injectable
 	// override for lifecycle tests and compatibility callers.
 	const runQueueFn = dependencies.runQueue ?? runQueueAsync;
-	const healthDecision =
-		dependencies.healthDecision ??
-		createDefaultRouteHealthDecision({
-			healthStateRoot: opts.healthStateRoot,
-			mode: opts.healthMode,
-			qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
-			// The runner derives the same epoch from dependencies.goldenImage;
-			// dispatch must bind to the identical golden image so both paths
-			// observe one health generation.
-			...(dependencies.goldenImage !== undefined
-				? { goldenImageReference: dependencies.goldenImage }
-				: {}),
-		});
+	let healthDecision = null;
 
 	// Initialize the run record BEFORE the project lock is ever acquired —
 	// the same ordering handleLaunch uses. The project lock is keyed by the
@@ -726,6 +715,22 @@ async function runDispatch(opts, dependencies = {}) {
 			initializationCode = "queue_empty";
 			throw new UsageError("no tasks parsed from the task queue");
 		}
+		// Built inside the classified pre-provider block: an invalid golden
+		// image reference or health root is a host configuration failure that
+		// must produce the closed envelope, not an uncaught exception.
+		healthDecision =
+			dependencies.healthDecision ??
+			createDefaultRouteHealthDecision({
+				healthStateRoot: opts.healthStateRoot,
+				mode: opts.healthMode,
+				qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+				// The runner derives the same epoch from dependencies.goldenImage;
+				// dispatch must bind to the identical golden image so both paths
+				// observe one health generation.
+				...(dependencies.goldenImage !== undefined
+					? { goldenImageReference: dependencies.goldenImage }
+					: {}),
+			});
 		try {
 			identity = prepareRunIdentity(opts);
 		} catch (error) {

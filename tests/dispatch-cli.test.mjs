@@ -1270,6 +1270,39 @@ describe("synchronous run JSON envelope", () => {
 		strictEqual(envelope.disposition.direction, "complete");
 	});
 
+	it("classifies an invalid golden image reference instead of throwing", async () => {
+		// An empty SWITCHYARD_PARALLELS_GOLDEN_IMAGE defeats the `??` default and
+		// makes the route-health epoch unbuildable. Before the health decision
+		// moved inside the classified pre-provider block this escaped `run`
+		// as a raw RouteHealthSchemaError with no envelope.
+		const previous = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE;
+		process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE = "";
+		let queueCalls = 0;
+		try {
+			const { envelope } = await captureRunJson(
+				[tasksFile, "--project", projectDir, "--json"],
+				noVmDependencies({
+					runQueue: async () => {
+						queueCalls += 1;
+						throw new Error("queue must not run without a health epoch");
+					},
+				}),
+			);
+			strictEqual(queueCalls, 0);
+			strictEqual(envelope.state, "failed");
+			strictEqual(envelope.runId, null);
+			strictEqual(envelope.disposition.action, "repair_contract");
+			strictEqual(
+				envelope.disposition.diagnosticCode,
+				"environment_incomplete",
+			);
+		} finally {
+			if (previous === undefined)
+				delete process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE;
+			else process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE = previous;
+		}
+	});
+
 	it("binds the queue health epoch to the injected golden image", async () => {
 		let queueHealth = null;
 		await captureRunJson(
