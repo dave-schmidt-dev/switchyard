@@ -398,6 +398,18 @@ describe("provider process lifecycle", () => {
 
 	it("cleans a timed-out PID-recorded capture through the backend seam", async () => {
 		const cleanupCalls = [];
+		const timers = new Set();
+		const setTimeoutFn = (fn) => {
+			const timer = { fn };
+			timers.add(timer);
+			queueMicrotask(() => {
+				if (!timers.delete(timer)) return;
+				fn();
+			});
+			return timer;
+		};
+		const clearTimeoutFn = (timer) => timers.delete(timer);
+		let spawnedChild = null;
 		const backend = {
 			execArgv(_workspaceId, { argv }) {
 				return { command: "fake", args: [...argv] };
@@ -408,12 +420,22 @@ describe("provider process lifecycle", () => {
 		};
 		const result = await captureProviderDiffDetailedAsync("worker", {
 			executionBackend: backend,
-			timeoutMs: 1,
-			termGraceMs: 1,
-			spawnFn: () => fakeChild(),
+			timeoutMs: 50,
+			termGraceMs: 50,
+			setTimeoutFn,
+			clearTimeoutFn,
+			spawnFn: () => {
+				spawnedChild = fakeChild();
+				return spawnedChild;
+			},
 		});
 
 		strictEqual(result.status, "timed_out");
+		ok(
+			spawnedChild,
+			"the fake child spawned before the deterministic deadline",
+		);
+		deepStrictEqual(spawnedChild.signals, ["SIGTERM", "SIGKILL"]);
 		strictEqual(cleanupCalls.length, 1);
 		deepStrictEqual(cleanupCalls[0], {
 			command: "fake",
