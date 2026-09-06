@@ -3,13 +3,11 @@ import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
 	existsSync,
-	mkdtempSync,
 	renameSync,
 	rmSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -28,6 +26,8 @@ import {
 	validateTaskStartTree,
 	validateTaskStartTreeAsync,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const TASK_BASE = {
 	ref: "refs/switchyard/task-base/test-run/1.1",
@@ -64,7 +64,7 @@ describe("provider process lifecycle", () => {
 		["asynchronous", validateTaskStartTreeAsync],
 	]) {
 		it(`hard-kills a SIGTERM-ignoring ${mode} host probe at its deadline`, async () => {
-			const root = mkdtempSync(join(tmpdir(), "switchyard-probe-timeout-"));
+			const root = tempDir("switchyard-probe-timeout-");
 			const readyPath = join(root, "ready");
 			const script = [
 				'process.on("SIGTERM", () => {});',
@@ -403,8 +403,57 @@ describe("provider process lifecycle", () => {
 		);
 	});
 
+	it("validates a persisted base through the current authorized helper identity", () => {
+		const argumentBuilder = new ParallelsExecutionBackend({ aquaUid: 501 });
+		const seen = [];
+		const baseCleanupContext = {
+			runId: "base-run",
+			taskId: "1.1",
+			attemptId: "base-attempt",
+			descriptorIdentity: "base-descriptor",
+			workspaceId: "worker",
+			processStartIdentity: null,
+			operation: "helper",
+		};
+		const captureCleanupContext = {
+			...baseCleanupContext,
+			attemptId: "retry-attempt",
+			descriptorIdentity: "retry-descriptor",
+		};
+		const executionBackend = {
+			execArgv(workspaceId, options) {
+				argumentBuilder.execArgv(workspaceId, options);
+				seen.push({
+					argv: options.argv,
+					cleanupContext: options.cleanupContext,
+				});
+				const validation = taskBaseValidationCommand(options.argv);
+				if (validation) return validation;
+				const isCapture = options.argv.at(-1) === TASK_BASE.tree;
+				return {
+					command: process.execPath,
+					args: ["-e", isCapture ? 'process.stdout.write("diff")' : ""],
+				};
+			},
+		};
+		strictEqual(
+			captureProviderDiff("worker", {
+				executionBackend,
+				taskBase: { ...TASK_BASE, cleanupContext: baseCleanupContext },
+				cleanupContext: captureCleanupContext,
+			}),
+			"diff",
+		);
+		strictEqual(seen[0].cleanupContext.attemptId, "retry-attempt");
+		strictEqual(seen[1].argv[1], "rev-parse");
+		strictEqual(seen[1].cleanupContext.attemptId, "retry-attempt");
+		strictEqual(seen[2].cleanupContext.attemptId, "retry-attempt");
+		for (const entry of seen)
+			strictEqual(entry.cleanupContext.operation, "helper");
+	});
+
 	it("exports a worker commit against an anchored task-start tree and rejects a replaced anchor", () => {
-		const projectPath = mkdtempSync(join(tmpdir(), "switchyard-task-base-"));
+		const projectPath = tempDir("switchyard-task-base-");
 		try {
 			writeFileSync(join(projectPath, "tracked.txt"), "before\n");
 			writeFileSync(join(projectPath, "deleted.txt"), "delete me\n");
@@ -547,6 +596,57 @@ describe("provider process lifecycle", () => {
 				testCase.name,
 			);
 		}
+	});
+
+	it("classifies a synchronous host execution deadline as timed_out", () => {
+		const executionBackend = {
+			execArgv(_workspaceId, { argv }) {
+				const validation = taskBaseValidationCommand(argv);
+				if (validation) return validation;
+				return {
+					command: process.execPath,
+					args: [
+						"-e",
+						'process.on("SIGTERM", () => {}); setTimeout(() => {}, 1000)',
+					],
+				};
+			},
+		};
+		const startedAt = Date.now();
+		deepStrictEqual(
+			captureProviderDiffDetailed("worker", {
+				executionBackend,
+				taskBase: TASK_BASE,
+				timeoutMs: 20,
+			}),
+			{ status: "timed_out", diff: null },
+		);
+		ok(Date.now() - startedAt < 500, "capture returned within its hard budget");
+	});
+
+	it("preserves timed_out when synchronous task-base validation exhausts the budget", () => {
+		const executionBackend = {
+			execArgv(_workspaceId, { argv }) {
+				if (argv[1] === "rev-parse") {
+					return {
+						command: process.execPath,
+						args: [
+							"-e",
+							'process.on("SIGTERM", () => {}); setTimeout(() => {}, 1000)',
+						],
+					};
+				}
+				return { command: process.execPath, args: ["-e", ""] };
+			},
+		};
+		deepStrictEqual(
+			captureProviderDiffDetailed("worker", {
+				executionBackend,
+				taskBase: TASK_BASE,
+				timeoutMs: 20,
+			}),
+			{ status: "timed_out", diff: null },
+		);
 	});
 
 	it("prefers a backend's cleanupProviderProcess and skips the adapter's own cleanup on timeout", async () => {

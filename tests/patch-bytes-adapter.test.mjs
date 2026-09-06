@@ -11,6 +11,7 @@ import { captureDiff as captureCopilotDiff } from "../src/switchyard/adapter/cop
 import { captureDiff as captureCursorDiff } from "../src/switchyard/adapter/cursor.mjs";
 import { captureDiff as captureOpencodeDiff } from "../src/switchyard/adapter/opencode.mjs";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const captures = [
@@ -32,8 +33,13 @@ const TASK_BASE = {
 // binary onto PATH, so this fixture only needs to route through that:
 // command "docker" with the same argv tail the case-statement stub matches
 // against.
+const parallelsArgumentBuilder = new ParallelsExecutionBackend({
+	aquaUid: 501,
+});
 const dockerExecutionBackend = {
-	execArgv(workspaceId, { cwd = "/project", argv } = {}) {
+	execArgv(workspaceId, options = {}) {
+		const { cwd = "/project", argv } = options;
+		parallelsArgumentBuilder.execArgv(workspaceId, options);
 		return {
 			command: "docker",
 			args: ["exec", "-i", "-w", cwd, workspaceId, ...argv],
@@ -104,10 +110,20 @@ describe("adapter patch-byte preservation", () => {
 			installFakeDocker(expected);
 
 			for (const [name, capture] of captures) {
+				const cleanupContext = {
+					runId: "patch-bytes",
+					taskId: "1.1",
+					attemptId: "attempt-1",
+					descriptorIdentity: `descriptor-${name}`,
+					workspaceId: "fake-container",
+					processStartIdentity: null,
+					operation: "helper",
+				};
 				strictEqual(
 					capture("fake-container", {
 						executionBackend: dockerExecutionBackend,
 						taskBase: TASK_BASE,
+						cleanupContext,
 					}),
 					expected,
 					`${name} capture must preserve terminal patch bytes`,

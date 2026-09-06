@@ -57,17 +57,23 @@ function emitProbeStatus(options, event, stage) {
 	}
 }
 
-function backendExecution(executionBackend, workspaceId, argv) {
+function backendExecution(executionBackend, workspaceId, argv, options) {
 	const execution = executionBackend.execArgv(workspaceId, {
 		cwd: "/project",
 		argv: ["git", ...argv],
 		recordPid: true,
+		cleanupContext: options.cleanupContext,
 	});
 	return execution;
 }
 
 function backendGit(executionBackend, workspaceId, argv, options, stage) {
-	const execution = backendExecution(executionBackend, workspaceId, argv);
+	const execution = backendExecution(
+		executionBackend,
+		workspaceId,
+		argv,
+		options,
+	);
 	emitProbeStatus(options, "task_base_probe_started", stage);
 	try {
 		const output = execFileSync(execution.command, execution.args, {
@@ -86,7 +92,12 @@ function backendGit(executionBackend, workspaceId, argv, options, stage) {
 }
 
 function backendGitAsync(executionBackend, workspaceId, argv, options, stage) {
-	const execution = backendExecution(executionBackend, workspaceId, argv);
+	const execution = backendExecution(
+		executionBackend,
+		workspaceId,
+		argv,
+		options,
+	);
 	emitProbeStatus(options, "task_base_probe_started", stage);
 	let timeout;
 	try {

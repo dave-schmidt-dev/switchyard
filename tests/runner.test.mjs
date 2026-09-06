@@ -28,6 +28,8 @@ import {
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
+import { validateTaskStartTreeAsync } from "../src/switchyard/lifecycle/index.mjs";
+import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__resetRosterCacheForTests,
 	getInvocationDescriptorIdentity,
@@ -440,6 +442,160 @@ describe("attempt-scoped execution backend", () => {
 			strictEqual(observed.attemptId, `attempt-broker-${success}`);
 		});
 	}
+
+	it("uses the fallback descriptor through the bound helper facade for base validation", async () => {
+		const primaryDescriptor = testDescriptor({
+			target_id: "primary-target",
+			model_ref: "primary-model",
+			selector: "primary-model",
+		});
+		const fallbackDescriptor = testDescriptor({
+			target_id: "fallback-target",
+			model_ref: "fallback-model",
+			selector: "fallback-model",
+		});
+		const primaryRoute = {
+			provider: "claude",
+			resolvedTarget: "primary-target",
+			resolvedTargetId: "primary-target",
+			harness: "claude",
+			model: "primary-model",
+			capability: "standard",
+			reason: "fixture",
+			reservation: { id: "primary-reservation" },
+			snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+		};
+		const fallbackRoute = {
+			...primaryRoute,
+			resolvedTarget: "fallback-target",
+			resolvedTargetId: "fallback-target",
+			model: "fallback-model",
+			reservation: { id: "fallback-reservation" },
+		};
+		const argumentBuilder = new ParallelsExecutionBackend({ aquaUid: 501 });
+		const helperContexts = [];
+		let captureError = null;
+		const executionBackend = {
+			execArgv(workspaceId, options) {
+				argumentBuilder.execArgv(workspaceId, options);
+				helperContexts.push({
+					argv: options.argv,
+					cleanupContext: options.cleanupContext,
+				});
+				if (options.argv[1] === "rev-parse") {
+					return {
+						command: process.execPath,
+						args: [
+							"-e",
+							`process.stdout.write(${JSON.stringify(TASK_BASE.tree)})`,
+						],
+					};
+				}
+				const isDiff = options.argv.at(-1) === TASK_BASE.tree;
+				return {
+					command: process.execPath,
+					args: [
+						"-e",
+						isDiff ? 'process.stdout.write("diff --git a/a b/a")' : "",
+					],
+				};
+			},
+		};
+		let routeCalls = 0;
+		let brokerCalls = 0;
+		const context = {
+			runId: "fallback-run",
+			attemptId: "fallback-attempt",
+			executionBackend,
+			workingContainerName: "vm",
+			projectPath: TEST_DIR,
+			taskBases: {},
+			persistTaskBase: (taskId, base) => {
+				context.taskBases[taskId] = base;
+			},
+			queueBackend: {
+				beforeRun: () => {},
+				captureTaskBaseAsync: async () => TASK_BASE,
+				validateTaskBaseAsync: async (_workspaceId, base) => base,
+			},
+			broker: {
+				selectAndReserve: async () => {
+					routeCalls += 1;
+					return routeCalls === 1 ? primaryRoute : fallbackRoute;
+				},
+				launcherIdentity: () => ({}),
+				execute: async () => {
+					brokerCalls += 1;
+					return brokerCalls === 1
+						? {
+								success: false,
+								outcome: "failure",
+								errorKind: "quota_exhausted",
+								diagnosticCode: "quota_exhausted",
+								diagnosticOrigin: "adapter",
+								diagnosticEvidenceAvailable: true,
+								failurePhase: "provider_execution",
+							}
+						: { success: true, outcome: "success" };
+				},
+			},
+			resolveDescriptor: (target) =>
+				target === "primary-target" ? primaryDescriptor : fallbackDescriptor,
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: () => ({ success: true }),
+			adapters: {
+				claude: {
+					executeAsync: async () => ({ success: true }),
+					captureDiffDetailedAsync: async (workspaceId, options) => {
+						try {
+							await validateTaskStartTreeAsync(
+								options.executionBackend,
+								workspaceId,
+								options.taskBase,
+								{ cleanupContext: options.cleanupContext },
+							);
+						} catch (error) {
+							captureError = error;
+							return { status: "transport_failed", diff: null };
+						}
+						return { status: "captured", diff: "diff --git a/a b/a" };
+					},
+				},
+			},
+		};
+		const first = await executeTaskAsync(
+			{ id: "1.fallback", title: "fallback", description: "fallback" },
+			context,
+		);
+		strictEqual(first.success, false);
+		strictEqual(first.errorKind, "quota_exhausted");
+		helperContexts.length = 0;
+		const result = await executeTaskAsync(
+			{ id: "1.fallback", title: "fallback", description: "fallback" },
+			context,
+		);
+		strictEqual(
+			captureError,
+			null,
+			captureError?.message ?? JSON.stringify(result),
+		);
+		strictEqual(result.success, true, JSON.stringify(result));
+		strictEqual(brokerCalls, 2);
+		strictEqual(
+			context.taskBases["1.fallback"].cleanupContext.descriptorIdentity,
+			primaryDescriptor.descriptor_identity,
+		);
+		ok(helperContexts.length >= 1);
+		ok(helperContexts.some(({ argv }) => argv[1] === "rev-parse"));
+		for (const { cleanupContext: helperContext } of helperContexts) {
+			strictEqual(helperContext.operation, "helper");
+			strictEqual(
+				helperContext.descriptorIdentity,
+				fallbackDescriptor.descriptor_identity,
+			);
+		}
+	});
 });
 
 function writeDispatchQualifiedRosterFixture() {
@@ -903,6 +1059,55 @@ describe("dispatch descriptor receipt contract", () => {
 		strictEqual(captures, 0);
 		strictEqual(executions, 0);
 	});
+
+	for (const foreignField of ["runId", "taskId", "workspaceId"]) {
+		it(`rejects persisted task-base metadata with a foreign ${foreignField}`, () => {
+			let validations = 0;
+			let executions = 0;
+			const cleanupContext = {
+				runId: "run-owned",
+				taskId: "1.ownership",
+				attemptId: "attempt-original",
+				descriptorIdentity: "descriptor-original",
+				workspaceId: "worker-owned",
+				processStartIdentity: null,
+				operation: "helper",
+				[foreignField]: "foreign",
+			};
+			const result = executeTask(
+				{ id: "1.ownership", title: "task", description: "work" },
+				{
+					runId: "run-owned",
+					route: () => ({ provider: "claude", model: "test-model" }),
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					workingContainerName: "worker-owned",
+					projectPath: TEST_DIR,
+					taskBases: {
+						"1.ownership": { ...TASK_BASE, cleanupContext },
+					},
+					queueBackend: {
+						beforeRun: () => {},
+						validateTaskBase: () => {
+							validations += 1;
+							return TASK_BASE;
+						},
+					},
+					adapters: {
+						claude: {
+							execute: () => {
+								executions += 1;
+								return { success: true };
+							},
+						},
+					},
+				},
+			);
+			strictEqual(result.result, "task_base_capture_failed");
+			strictEqual(validations, 0);
+			strictEqual(executions, 0);
+		});
+	}
 
 	it("uses host-captured orchestrator bytes and rejects a contradictory base receipt", async () => {
 		let gatedDiff = null;
@@ -3175,7 +3380,9 @@ describe("runner orchestration", () => {
 			"halted_after_task_base_release_failure",
 		);
 		const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
-		deepStrictEqual(checkpoint.taskBases["1.1"], TASK_BASE);
+		strictEqual(checkpoint.taskBases["1.1"].ref, TASK_BASE.ref);
+		strictEqual(checkpoint.taskBases["1.1"].tree, TASK_BASE.tree);
+		strictEqual(checkpoint.taskBases["1.1"].cleanupContext.operation, "helper");
 		strictEqual(checkpoint.taskBaseReleaseUncertain.taskId, "1.1");
 	});
 
@@ -3245,6 +3452,15 @@ describe("immutable-base recovery guards", () => {
 		counters,
 		{ cleanupFailed = false } = {},
 	) {
+		const parallels = new ParallelsExecutionBackend({ aquaUid: 501 });
+		const validateHelperTransport = (options) => {
+			parallels.execArgv("recovery-worker", {
+				argv: ["git", "status", "--porcelain"],
+				recordPid: true,
+				cleanupContext: options.cleanupContext,
+			});
+			counters.helperContexts.push(options.cleanupContext);
+		};
 		const execution = cleanupFailed
 			? {
 					success: true,
@@ -3282,15 +3498,20 @@ describe("immutable-base recovery guards", () => {
 				counters.resets += 1;
 			},
 			wipeWorkingContainer: () => {},
-			captureTaskBase: (_workspaceId, { taskId }) => {
+			captureTaskBase: (_workspaceId, { taskId, ...options }) => {
+				validateHelperTransport(options);
 				counters.captures += 1;
 				return {
 					ref: `refs/switchyard/task-base/recovery/${taskId}`,
 					tree: "6".repeat(40),
 				};
 			},
-			validateTaskBase: (_workspaceId, base) => base,
-			releaseTaskBase: () => {
+			validateTaskBase: (_workspaceId, base, options) => {
+				validateHelperTransport(options);
+				return base;
+			},
+			releaseTaskBase: (_workspaceId, _base, options) => {
+				validateHelperTransport(options);
 				counters.releases += 1;
 				if (counters.releaseThrows) throw new Error("uncertain release");
 			},
@@ -3365,10 +3586,12 @@ describe("immutable-base recovery guards", () => {
 				releases: 0,
 				releaseThrows: true,
 				started: [],
+				helperContexts: [],
 			};
 			const options = {
 				tasksFilePath: tasksPath,
 				projectPath: TEST_DIR,
+				runId: `recovery-${mode}`,
 				checkpointPath,
 				maxTasks: 1,
 				dependencies: recoveryDependencies(mode, counters),
@@ -3385,6 +3608,16 @@ describe("immutable-base recovery guards", () => {
 			deepStrictEqual(counters.started, ["1.1"]);
 			strictEqual(counters.captures, 1);
 			strictEqual(counters.releases, 1);
+			ok(counters.helperContexts.length >= 2);
+			for (const helperContext of counters.helperContexts) {
+				strictEqual(helperContext.operation, "helper");
+				strictEqual(helperContext.runId, `recovery-${mode}`);
+				strictEqual(helperContext.taskId, "1.1");
+			}
+			deepStrictEqual(
+				new Set(counters.helperContexts.map(({ attemptId }) => attemptId)).size,
+				1,
+			);
 		});
 
 		it(`${mode} preserves the base and halts when provider cleanup is uncertain`, async () => {
@@ -3402,10 +3635,12 @@ describe("immutable-base recovery guards", () => {
 				releases: 0,
 				releaseThrows: false,
 				started: [],
+				helperContexts: [],
 			};
 			const options = {
 				tasksFilePath: tasksPath,
 				projectPath: TEST_DIR,
+				runId: `recovery-cleanup-${mode}`,
 				checkpointPath,
 				stopOnFailure: false,
 				dependencies: recoveryDependencies(mode, counters, {
@@ -3419,10 +3654,15 @@ describe("immutable-base recovery guards", () => {
 			);
 			const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
 			strictEqual(checkpoint.providerCleanupUncertain.taskId, "1.1");
-			deepStrictEqual(checkpoint.taskBases["1.1"], {
-				ref: "refs/switchyard/task-base/recovery/1.1",
-				tree: "6".repeat(40),
-			});
+			strictEqual(
+				checkpoint.taskBases["1.1"].ref,
+				"refs/switchyard/task-base/recovery/1.1",
+			);
+			strictEqual(checkpoint.taskBases["1.1"].tree, "6".repeat(40));
+			strictEqual(
+				checkpoint.taskBases["1.1"].cleanupContext.operation,
+				"helper",
+			);
 			strictEqual(counters.commits, 0);
 			strictEqual(counters.resets, 0);
 			strictEqual(counters.releases, 0);
@@ -3785,7 +4025,10 @@ describe("runner headless orchestrator mode", () => {
 			],
 		);
 		deepStrictEqual(
-			launches.map((payload) => payload.taskBase),
+			launches.map(({ taskBase }) => ({
+				ref: taskBase.ref,
+				tree: taskBase.tree,
+			})),
 			[
 				{
 					ref: "refs/switchyard/task-base/orchestrator/1.1",

@@ -867,7 +867,7 @@ describe("Task 4.3 timeout boundaries", () => {
 		);
 	});
 
-	it("kills the recorded guest tree before clearing index.lock and retains the VM", () => {
+	it("refuses guest cleanup when exact identity lacks qualified birth evidence", () => {
 		const calls = [];
 		const statuses = [];
 		const backend = new ParallelsExecutionBackend({
@@ -879,27 +879,22 @@ describe("Task 4.3 timeout boundaries", () => {
 			},
 		});
 
-		const cleanup = backend.cleanupProviderProcess(
-			"prlctl",
-			["exec", "vm-timeout"],
-			{ onStatus: (event) => statuses.push(event.event) },
+		throws(
+			() =>
+				backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"], {
+					onStatus: (event) => statuses.push(event.event),
+					workspaceId: "vm-timeout",
+					runId: "run-timeout",
+					taskId: "task-timeout",
+					attemptId: "attempt-timeout",
+					descriptorIdentity: "descriptor-timeout",
+					processStartIdentity: null,
+					operation: "provider",
+				}),
+			/guest PID marker process-start identity is unknown/,
 		);
-		strictEqual(cleanup.pid, 4321);
-		strictEqual(
-			calls.findIndex((args) =>
-				guestText(args).includes("/project/.git/index.lock"),
-			) >
-				calls.findIndex((args) =>
-					guestText(args).includes("switchyard-kill-tree"),
-				),
-			true,
-		);
-		const killCall = guestText(
-			calls.find((args) => guestText(args).includes("switchyard-kill-tree")),
-		);
-		ok(killCall.includes("signal_tree TERM") && !killCall.includes("kill -1"));
-		ok(!calls.some((args) => guestText(args).includes("destroy")));
-		strictEqual(statuses.at(-1), "provider_cleanup_complete");
+		strictEqual(calls.length, 0);
+		strictEqual(statuses.at(-1), "provider_cleanup_failed");
 	});
 
 	it("does not clear index.lock when guest tree cleanup is unconfirmed", () => {
@@ -917,9 +912,19 @@ describe("Task 4.3 timeout boundaries", () => {
 		});
 
 		throws(
-			() => backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"]),
-			/guest provider survived cleanup/,
+			() =>
+				backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"], {
+					workspaceId: "vm-timeout",
+					runId: "run-timeout",
+					taskId: "task-timeout",
+					attemptId: "attempt-timeout",
+					descriptorIdentity: "descriptor-timeout",
+					processStartIdentity: null,
+					operation: "provider",
+				}),
+			/guest PID marker process-start identity is unknown/,
 		);
+		strictEqual(calls.length, 0);
 		ok(
 			!calls.some((args) =>
 				guestText(args).includes("/project/.git/index.lock"),

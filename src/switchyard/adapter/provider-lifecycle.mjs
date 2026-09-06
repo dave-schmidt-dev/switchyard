@@ -500,6 +500,10 @@ export async function captureProviderDiffDetailedAsync(
 		if (remaining <= 0) throw new Error("diff capture deadline exhausted");
 		return remaining;
 	};
+	const timedOut = (error) =>
+		error?.code === "ETIMEDOUT" ||
+		error?.killed === true ||
+		error?.message === "diff capture deadline exhausted";
 	const emitCaptureStatus = (event, stage) => {
 		try {
 			onStatus?.({
@@ -577,13 +581,19 @@ export async function captureProviderDiffDetailedAsync(
 			executionBackend,
 			workingContainerName,
 			taskBase,
-			{ deadlineMs, timeoutMs, signal: options.signal, onStatus },
+			{
+				deadlineMs,
+				timeoutMs,
+				signal: options.signal,
+				onStatus,
+				cleanupContext: markerContext(cleanupContext, "helper"),
+			},
 		);
-	} catch {
+	} catch (error) {
 		return {
-			status: "diff_failed",
+			status: timedOut(error) ? "timed_out" : "diff_failed",
 			diff: null,
-			reasonCode: "task_base_invalid",
+			...(timedOut(error) ? {} : { reasonCode: "task_base_invalid" }),
 		};
 	}
 	let capture;
@@ -639,6 +649,10 @@ export function captureProviderDiffDetailed(
 		if (remaining <= 0) throw new Error("diff capture deadline exhausted");
 		return remaining;
 	};
+	const timedOut = (error) =>
+		error?.code === "ETIMEDOUT" ||
+		error?.killed === true ||
+		error?.message === "diff capture deadline exhausted";
 	const emitCaptureStatus = (event, stage) => {
 		try {
 			options.onStatus?.({
@@ -672,13 +686,18 @@ export function captureProviderDiffDetailed(
 		execFileSync(stage.command, stage.args, {
 			stdio: "pipe",
 			timeout: remainingMs(),
+			killSignal: "SIGKILL",
 			signal: options.signal,
 		});
 		emitCaptureStatus("diff_capture_probe_completed", "diff_stage");
 	} catch (error) {
 		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
 		return {
-			status: error?.status == null ? "transport_failed" : "stage_failed",
+			status: timedOut(error)
+				? "timed_out"
+				: error?.status == null
+					? "transport_failed"
+					: "stage_failed",
 			diff: null,
 		};
 	}
@@ -693,13 +712,14 @@ export function captureProviderDiffDetailed(
 				deadlineMs,
 				signal: options.signal,
 				onStatus: options.onStatus,
+				cleanupContext: markerContext(options.cleanupContext, "helper"),
 			},
 		);
-	} catch {
+	} catch (error) {
 		return {
-			status: "diff_failed",
+			status: timedOut(error) ? "timed_out" : "diff_failed",
 			diff: null,
-			reasonCode: "task_base_invalid",
+			...(timedOut(error) ? {} : { reasonCode: "task_base_invalid" }),
 		};
 	}
 	try {
@@ -714,6 +734,7 @@ export function captureProviderDiffDetailed(
 			encoding: "utf8",
 			stdio: "pipe",
 			timeout: remainingMs(),
+			killSignal: "SIGKILL",
 			signal: options.signal,
 		});
 		emitCaptureStatus("diff_capture_probe_completed", "diff_export");
@@ -723,7 +744,11 @@ export function captureProviderDiffDetailed(
 	} catch (error) {
 		emitCaptureStatus("diff_capture_probe_failed", "diff_export");
 		return {
-			status: error?.status == null ? "transport_failed" : "diff_failed",
+			status: timedOut(error)
+				? "timed_out"
+				: error?.status == null
+					? "transport_failed"
+					: "diff_failed",
 			diff: null,
 		};
 	}

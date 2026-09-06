@@ -2743,31 +2743,68 @@ async function captureDiffWithEvidenceAsync(adapter, workspaceName, options) {
 
 // A provider must never choose its own diff base. The runner records this
 // receipt before launch, and capture revalidates the anchored ref afterwards.
-function taskBaseProbeOptions(context) {
+function taskBaseProbeOptions(context, cleanupContext) {
 	return {
 		timeoutMs: 30_000,
 		signal: context.signal,
 		onStatus: context.onStatus,
+		cleanupContext,
 	};
 }
 
-function prepareTaskBase(context, task) {
+function persistedTaskBaseHelperContext(base, currentOwnership) {
+	const stored = base?.cleanupContext;
+	if (stored?.operation !== "helper") {
+		throw new Error("persisted task base has no exact helper identity");
+	}
+	for (const field of [
+		"runId",
+		"taskId",
+		"attemptId",
+		"descriptorIdentity",
+		"workspaceId",
+	]) {
+		if (typeof stored[field] !== "string" || stored[field].length === 0) {
+			throw new Error(`persisted task base has invalid ${field}`);
+		}
+	}
+	if (
+		stored.processStartIdentity !== null &&
+		typeof stored.processStartIdentity !== "string"
+	) {
+		throw new Error("persisted task base has invalid processStartIdentity");
+	}
+	for (const field of ["runId", "taskId", "workspaceId"]) {
+		if (stored[field] !== currentOwnership[field]) {
+			throw new Error(`persisted task base has foreign ${field}`);
+		}
+	}
+	return true;
+}
+
+function prepareTaskBase(context, task, cleanupContext) {
 	try {
 		const existing = context.taskBases?.[task.id] ?? null;
+		const helperContext = mergeAttemptCleanupContext(cleanupContext, {
+			operation: "helper",
+		});
+		if (existing) persistedTaskBaseHelperContext(existing, helperContext);
 		const base = existing
 			? context.queueBackend.validateTaskBase(
 					context.workingContainerName,
 					existing,
-					taskBaseProbeOptions(context),
+					taskBaseProbeOptions(context, helperContext),
 				)
 			: context.queueBackend.captureTaskBase(context.workingContainerName, {
 					runId: context.runId,
 					taskId: task.id,
-					...taskBaseProbeOptions(context),
+					...taskBaseProbeOptions(context, helperContext),
 				});
-		context.persistTaskBase?.(task.id, base);
-		context._activeTaskBase = base;
-		return base;
+		const recordedBase = existing ?? { ...base, cleanupContext: helperContext };
+		context.persistTaskBase?.(task.id, recordedBase);
+		context._activeTaskBase = recordedBase;
+		context._activeTaskHelperContext = helperContext;
+		return recordedBase;
 	} catch {
 		context.onStatus?.({
 			phase: "checkpoint",
@@ -2779,9 +2816,13 @@ function prepareTaskBase(context, task) {
 	}
 }
 
-async function prepareTaskBaseAsync(context, task) {
+async function prepareTaskBaseAsync(context, task, cleanupContext) {
 	try {
 		const existing = context.taskBases?.[task.id] ?? null;
+		const helperContext = mergeAttemptCleanupContext(cleanupContext, {
+			operation: "helper",
+		});
+		if (existing) persistedTaskBaseHelperContext(existing, helperContext);
 		const validateAsync =
 			context.queueBackend.validateTaskBaseAsync ??
 			((...args) => context.queueBackend.validateTaskBase(...args));
@@ -2792,16 +2833,18 @@ async function prepareTaskBaseAsync(context, task) {
 			? await validateAsync(
 					context.workingContainerName,
 					existing,
-					taskBaseProbeOptions(context),
+					taskBaseProbeOptions(context, helperContext),
 				)
 			: await captureAsync(context.workingContainerName, {
 					runId: context.runId,
 					taskId: task.id,
-					...taskBaseProbeOptions(context),
+					...taskBaseProbeOptions(context, helperContext),
 				});
-		context.persistTaskBase?.(task.id, base);
-		context._activeTaskBase = base;
-		return base;
+		const recordedBase = existing ?? { ...base, cleanupContext: helperContext };
+		context.persistTaskBase?.(task.id, recordedBase);
+		context._activeTaskBase = recordedBase;
+		context._activeTaskHelperContext = helperContext;
+		return recordedBase;
 	} catch {
 		context.onStatus?.({
 			phase: "checkpoint",
@@ -2872,10 +2915,12 @@ function finalizeTaskBase(context, taskId, checkpoint, checkpointPath) {
 	const base = checkpoint.taskBases?.[taskId];
 	if (!base) return null;
 	try {
+		const helperContext = context._activeTaskHelperContext;
+		persistedTaskBaseHelperContext(base, helperContext ?? {});
 		context.queueBackend.releaseTaskBase(
 			context.workingContainerName,
 			base,
-			taskBaseProbeOptions(context),
+			taskBaseProbeOptions(context, helperContext),
 		);
 		delete checkpoint.taskBases[taskId];
 		if (checkpoint.taskBaseReleaseUncertain?.taskId === taskId) {
@@ -2913,13 +2958,15 @@ async function finalizeTaskBaseAsync(
 	const base = checkpoint.taskBases?.[taskId];
 	if (!base) return null;
 	try {
+		const helperContext = context._activeTaskHelperContext;
+		persistedTaskBaseHelperContext(base, helperContext ?? {});
 		const releaseAsync =
 			context.queueBackend.releaseTaskBaseAsync ??
 			((...args) => context.queueBackend.releaseTaskBase(...args));
 		await releaseAsync(
 			context.workingContainerName,
 			base,
-			taskBaseProbeOptions(context),
+			taskBaseProbeOptions(context, helperContext),
 		);
 		delete checkpoint.taskBases[taskId];
 		if (checkpoint.taskBaseReleaseUncertain?.taskId === taskId) {
@@ -3287,7 +3334,12 @@ export function executeTask(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
-	if (!prepareTaskBase(context, task)) {
+	const cleanupContext = executionCleanupContext(
+		context,
+		task,
+		invocationDescriptor?.descriptor_identity,
+	);
+	if (!prepareTaskBase(context, task, cleanupContext)) {
 		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -3303,11 +3355,6 @@ export function executeTask(task, context) {
 			requiredCapability,
 		);
 	}
-	const cleanupContext = executionCleanupContext(
-		context,
-		task,
-		invocationDescriptor?.descriptor_identity,
-	);
 	const captureExecutionBackend = bindAttemptHelperBackend(
 		context.executionBackend,
 		cleanupContext,
@@ -4006,7 +4053,12 @@ async function executeTaskAsyncUnsafe(task, context) {
 		context.projectPath,
 		{ onStatus: context.onStatus },
 	);
-	if (!(await prepareTaskBaseAsync(context, task))) {
+	let attemptCleanupContext = executionCleanupContext(
+		context,
+		task,
+		invocationDescriptor.descriptor_identity,
+	);
+	if (!(await prepareTaskBaseAsync(context, task, attemptCleanupContext))) {
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -4023,11 +4075,6 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
-	let attemptCleanupContext = executionCleanupContext(
-		context,
-		task,
-		invocationDescriptor.descriptor_identity,
-	);
 	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
 		launcherIdentity: broker.launcherIdentity(selectedRoute),
 		signal: context.signal,
@@ -4107,6 +4154,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 					context,
 					task,
 					invocationDescriptor.descriptor_identity,
+				);
+				context._activeTaskHelperContext = mergeAttemptCleanupContext(
+					attemptCleanupContext,
+					{ operation: "helper" },
 				);
 				adapter = selectAdapter(
 					routeResult.resolved_harness ?? routeResult.provider,
@@ -4680,7 +4731,7 @@ export async function runQueueAsync(options) {
 		signal: dependencies.signal,
 		onPoll: dependencies.onPoll,
 		resolveDescriptor: dependencies.resolveDescriptor,
-		runId,
+		runId: queueBackend.taskBaseRunId ?? runId,
 		snapshotSource: dependencies.snapshotSource ?? "gradus-v2",
 	};
 	const results = [];
@@ -5305,7 +5356,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			context.projectPath,
 			{ onStatus: context.onStatus },
 		);
-		if (!(await prepareTaskBaseAsync(context, task))) {
+		if (!(await prepareTaskBaseAsync(context, task, captureCleanupContext))) {
 			await record({
 				provider: routeResult.provider,
 				model: routeResult.model ?? "unknown",
@@ -6586,6 +6637,7 @@ export function createQueueBackend({
 			return {
 				platform: selectedPlatform,
 				...supplied,
+				taskBaseRunId,
 				create: (path, options = {}) =>
 					supplied.create(path, {
 						...options,
@@ -6693,6 +6745,7 @@ export function createQueueBackend({
 		"switchyard";
 	return {
 		platform: selectedPlatform,
+		taskBaseRunId,
 		executionBackend,
 		ensureAgentContainer: () => {},
 		create: (_path, options = {}) => {
@@ -7255,7 +7308,7 @@ export function runQueue(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
-		runId,
+		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
 			checkpoint.taskBases[taskId] = base;
@@ -8104,7 +8157,7 @@ export async function runQueueWithOrchestrator(options) {
 		workingContainerName,
 		executionBackend: queueBackend.executionBackend,
 		queueBackend,
-		runId,
+		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
 			checkpoint.taskBases[taskId] = base;
