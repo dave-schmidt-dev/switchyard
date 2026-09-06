@@ -5017,6 +5017,7 @@ describe("runner quota retry coordination", () => {
 - **Description:** add the declared file
 `);
 		let gateCalls = 0;
+		let monotonic = 0;
 		const fixture = makeQuotaRetryDependencies({
 			routePlan: [
 				{ provider: "agy", model: "fixture-gemini", target: "agy-gemini" },
@@ -5032,12 +5033,18 @@ describe("runner quota retry coordination", () => {
 					: { success: true, message: "ok" };
 			},
 		});
+		fixture.dependencies.now = () => monotonic;
+		fixture.dependencies.monotonicNow = () => monotonic;
 		fixture.dependencies.adapters.agy.supportsCompletionContinuation = true;
 		const executeWithReceipt = fixture.dependencies.adapters.agy.execute;
-		fixture.dependencies.adapters.agy.execute = (...args) => ({
-			...executeWithReceipt(...args),
-			completionContinuationProof: completionReceipt(args[2]),
-		});
+		fixture.dependencies.adapters.agy.execute = (...args) => {
+			const execution = executeWithReceipt(...args);
+			if (fixture.executeCalls.length === 1) monotonic = 1_000;
+			return {
+				...execution,
+				completionContinuationProof: completionReceipt(args[2]),
+			};
+		};
 		fixture.dependencies.completionContinuation = { enabled: true };
 
 		const result = runQueue({
@@ -5049,10 +5056,8 @@ describe("runner quota retry coordination", () => {
 		strictEqual(result.results[0].success, true);
 		deepStrictEqual(fixture.executeCalls, ["agy", "agy"]);
 		strictEqual(fixture.routeCalls.length, 1);
-		ok(
-			fixture.executeOptions[1].timeoutMs <=
-				fixture.executeOptions[0].timeoutMs,
-		);
+		strictEqual(fixture.executeOptions[0].timeoutMs, 1_800_000);
+		strictEqual(fixture.executeOptions[1].timeoutMs, 1_799_000);
 		const checkpoint = loadCheckpoint(
 			`${tasksPath}.checkpoint.json`,
 			tasksPath,
@@ -5330,7 +5335,7 @@ describe("runner quota retry coordination", () => {
 		}
 	});
 
-	it("recomputes the deadline after task-base preparation before provider launch", () => {
+	it("rejects a fractional remaining budget after task-base preparation before provider launch", () => {
 		const tasksPath = writeTasksFile(`### Task 1.1: Expire preparing
 - **Status:** pending
 - **Executor:** switchyard
@@ -5345,7 +5350,7 @@ describe("runner quota retry coordination", () => {
 		});
 		fixture.dependencies.monotonicNow = () => monotonic;
 		fixture.dependencies.captureTaskBase = () => {
-			monotonic = 2_000_000;
+			monotonic = 1_799_999.5;
 			return TASK_BASE;
 		};
 		const result = runQueue({
@@ -5356,6 +5361,60 @@ describe("runner quota retry coordination", () => {
 		});
 		strictEqual(result.results[0].result, "execution_timed_out");
 		strictEqual(fixture.executeCalls.length, 0);
+	});
+
+	it("gives a late quota fallback its own fresh provider timeout", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Retry quota
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** reroute after qualified quota exhaustion
+`);
+		let monotonic = 0;
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-first", target: "agy-first" },
+				{ provider: "agy", model: "fixture-second", target: "agy-second" },
+			],
+			executionOutcomes: {
+				agy: [
+					{
+						success: false,
+						result: "execution_failed",
+						errorKind: "quota_exhausted",
+						diagnosticCode: "quota_exhausted",
+						diagnosticOrigin: "adapter",
+						diagnosticEvidenceAvailable: true,
+						failurePhase: "provider_execution",
+					},
+				],
+			},
+		});
+		fixture.dependencies.now = () => monotonic;
+		fixture.dependencies.monotonicNow = () => monotonic;
+		const firstExecute = fixture.dependencies.adapters.agy.execute;
+		fixture.dependencies.adapters.agy.execute = (...args) => {
+			const result = firstExecute(...args);
+			monotonic = 1_700_000;
+			return result;
+		};
+
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: fixture.dependencies,
+		});
+		strictEqual(
+			result.results[0].success,
+			true,
+			JSON.stringify(result.results[0]),
+		);
+		deepStrictEqual(fixture.executeCalls, ["agy", "agy"]);
+		deepStrictEqual(
+			fixture.executeOptions.map(({ timeoutMs }) => timeoutMs),
+			[1_800_000, 1_800_000],
+		);
 	});
 
 	it("shares one extra launch between empty-capture correction and quota fallback", () => {

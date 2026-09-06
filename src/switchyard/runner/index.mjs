@@ -3128,6 +3128,20 @@ function taskPromptForAttempt(task, requirements) {
 	return `${prompt}\n\nRequired paths still missing: ${requirements.join(", ")}`;
 }
 
+function initializeTaskExecutionBudget(context, task) {
+	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	const wallDeadlineMs = (context.now?.() ?? Date.now()) + timeoutMs;
+	const monotonicDeadlineMs =
+		(context.monotonicNow?.() ?? performance.now()) + timeoutMs;
+	context._activeTaskBudget = {
+		taskId: task.id,
+		wallDeadlineMs,
+		monotonicDeadlineMs,
+		deadline: new Date(wallDeadlineMs).toISOString(),
+	};
+	return { ...context._activeTaskBudget, remainingMs: timeoutMs };
+}
+
 function taskExecutionBudget(context, task) {
 	if (context._activeTaskBudget?.taskId === task.id) {
 		const wallRemaining =
@@ -3141,17 +3155,7 @@ function taskExecutionBudget(context, task) {
 			remainingMs: Math.max(0, Math.min(wallRemaining, monotonicRemaining)),
 		};
 	}
-	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
-	const wallDeadlineMs = (context.now?.() ?? Date.now()) + timeoutMs;
-	const monotonicDeadlineMs =
-		(context.monotonicNow?.() ?? performance.now()) + timeoutMs;
-	context._activeTaskBudget = {
-		taskId: task.id,
-		wallDeadlineMs,
-		monotonicDeadlineMs,
-		deadline: new Date(wallDeadlineMs).toISOString(),
-	};
-	return { ...context._activeTaskBudget, remainingMs: timeoutMs };
+	return initializeTaskExecutionBudget(context, task);
 }
 
 function completionLifecycleContext(context, task) {
@@ -3914,6 +3918,10 @@ export function executeTask(task, context) {
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
 	}
+	// Primary and quota-fallback invocations each own their configured timeout.
+	// A completion continuation sets _completionPin and intentionally retains the
+	// primary invocation's already-running absolute deadline.
+	if (!context._completionPin) initializeTaskExecutionBudget(context, task);
 	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
 	const ignoredPath = checkIgnored(
 		task.requiredPaths ?? task.files,
@@ -4194,7 +4202,8 @@ export function executeTask(task, context) {
 		cleanupContext,
 	);
 	const launchBudget = taskExecutionBudget(context, task);
-	if (launchBudget.remainingMs <= 0) {
+	const launchTimeoutMs = Math.floor(launchBudget.remainingMs);
+	if (launchTimeoutMs <= 0) {
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
 			taskId: task.id,
@@ -4210,7 +4219,7 @@ export function executeTask(task, context) {
 	}
 	const execution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
-		timeoutMs: Math.floor(launchBudget.remainingMs),
+		timeoutMs: launchTimeoutMs,
 		executionBackend: bindAttemptExecutionBackend(
 			context.executionBackend,
 			cleanupContext,
