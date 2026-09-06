@@ -306,6 +306,12 @@ const DEFAULT_HOST_READINESS_ATTEMPTS = 2;
 const DEFAULT_HOST_READINESS_BACKOFF_MS = 100;
 const DEFAULT_HOST_READINESS_TIMEOUT_MS = 2_000;
 const HOST_READINESS_MAX_BUFFER = 1024 * 1024;
+// This remains deliberately disabled until an attended, disposable-VM run has
+// observed both an already-satisfied postcondition and a lost SDK result for
+// each newly covered mutation.  The budget belongs to the read-only proof, not
+// to a second mutation attempt.
+const DEFAULT_LOST_MUTATION_RECONCILIATION_TIMEOUT_MS = 5_000;
+const DEFAULT_LOST_MUTATION_RECONCILIATION_POLL_MS = 250;
 // Only these may be persisted as the failing subcommand. Every value is a
 // literal this file passes to `_call`; allowlisting rather than echoing argv
 // keeps a guest-influenced string from reaching a run record.
@@ -790,6 +796,51 @@ function snapshotIdsFromOutput(output) {
 	return ids;
 }
 
+function normalizedUuid(value) {
+	if (!isUuid(value)) return null;
+	return String(value)
+		.replace(/^\{|\}$/g, "")
+		.toLowerCase();
+}
+
+/**
+ * Read only the closed structured snapshot-list shape used by the
+ * reconciliation path. The legacy parser intentionally remains permissive
+ * for existing cleanup behavior; it cannot prove absence after a lost result.
+ */
+function strictSnapshotIdsFromOutput(output) {
+	let parsed;
+	try {
+		parsed = JSON.parse(outputText(output));
+	} catch {
+		throw new Error("snapshot inventory is not a complete structured response");
+	}
+	const idsFromArray = (value) => {
+		if (!Array.isArray(value)) {
+			throw new Error("snapshot inventory has an unknown structure");
+		}
+		const ids = new Set();
+		for (const entry of value) {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+				throw new Error("snapshot inventory has an invalid entry");
+			}
+			const id = normalizedUuid(
+				entry.id ?? entry.snapshotId ?? entry.snapshot_id,
+			);
+			if (!id) throw new Error("snapshot inventory entry has no exact UUID");
+			ids.add(id);
+		}
+		return ids;
+	};
+	if (!parsed || typeof parsed !== "object") {
+		throw new Error("snapshot inventory has an unknown structure");
+	}
+	if (Object.keys(parsed).length === 1 && Object.hasOwn(parsed, "snapshots")) {
+		return idsFromArray(parsed.snapshots);
+	}
+	throw new Error("snapshot inventory has an unknown structure");
+}
+
 function snapshotDifference(after, before) {
 	return [...after].filter((id) => !before.has(id));
 }
@@ -1151,6 +1202,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		bulkTransferFn = null,
 		sleepFn = defaultSleep,
 		nowFn = Date.now,
+		lostMutationNowFn = () => performance.now(),
+		onStatus = null,
 		pidIsAlive = defaultPidIsAlive,
 		creatorPid = process.pid,
 		aquaUid = null,
@@ -1180,6 +1233,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		hostReadinessJitterFn = Math.random,
 		hostReadinessNowFn = () => performance.now(),
 		hostProcessIdentityProbe = probeHostProcessIdentity,
+		enableLostMutationReconciliation = false,
+		lostMutationReconciliationTimeoutMs = DEFAULT_LOST_MUTATION_RECONCILIATION_TIMEOUT_MS,
+		lostMutationReconciliationPollMs = DEFAULT_LOST_MUTATION_RECONCILIATION_POLL_MS,
 	} = {}) {
 		super();
 		if (typeof prlctlFn === "function") {
@@ -1227,12 +1283,34 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.hostReadinessNowFn = hostReadinessNowFn;
 		this.sleepFn = sleepFn;
 		this.nowFn = nowFn;
+		if (typeof lostMutationNowFn !== "function") {
+			throw new TypeError("lostMutationNowFn must be a function");
+		}
+		if (onStatus !== null && typeof onStatus !== "function") {
+			throw new TypeError("onStatus must be a function");
+		}
+		this.lostMutationNowFn = lostMutationNowFn;
+		this.onStatus = onStatus;
 		this.pidIsAlive = pidIsAlive;
 		this.creatorPid = validatePid(creatorPid);
 		if (typeof hostProcessIdentityProbe !== "function") {
 			throw new TypeError("hostProcessIdentityProbe must be a function");
 		}
 		this.hostProcessIdentityProbe = hostProcessIdentityProbe;
+		if (typeof enableLostMutationReconciliation !== "boolean") {
+			throw new TypeError("enableLostMutationReconciliation must be a boolean");
+		}
+		this.enableLostMutationReconciliation = enableLostMutationReconciliation;
+		this.lostMutationReconciliationTimeoutMs = validateDurationMs(
+			lostMutationReconciliationTimeoutMs,
+			"lostMutationReconciliationTimeoutMs",
+			0,
+		);
+		this.lostMutationReconciliationPollMs = validateDurationMs(
+			lostMutationReconciliationPollMs,
+			"lostMutationReconciliationPollMs",
+			1,
+		);
 		this.aquaUid = aquaUid;
 		this.aquaTimeoutMs = validateDurationMs(aquaTimeoutMs, "aquaTimeoutMs", 0);
 		this.aquaPollMs = validateDurationMs(aquaPollMs, "aquaPollMs", 1);
@@ -1355,6 +1433,203 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				this.sleepFn(this.prlctlRetryBackoffMs * attempt);
 			}
 		}
+	}
+
+	/**
+	 * Resolve a lost mutation result through bounded, non-retrying read probes.
+	 * A probe can establish only success; every contrary, malformed, or missing
+	 * identity observation preserves the original ambiguous mutation failure.
+	 */
+	_reconcileLostMutation(cause, observe, { operation, onStatus } = {}) {
+		if (
+			!this.enableLostMutationReconciliation ||
+			!(cause instanceof PrlctlCallError) ||
+			cause.diagnosticCode !== "prlctl_job_misfire"
+		) {
+			throw cause;
+		}
+		const emit = onStatus ?? this.onStatus;
+		emit?.({
+			type: "lost-mutation-reconciliation",
+			event: "start",
+			operation,
+		});
+		const startedAt = this.lostMutationNowFn();
+		if (!Number.isFinite(startedAt)) {
+			emit?.({
+				type: "lost-mutation-reconciliation",
+				event: "unavailable",
+				operation,
+			});
+			throw cause;
+		}
+		const deadline = startedAt + this.lostMutationReconciliationTimeoutMs;
+		if (!Number.isFinite(deadline)) {
+			emit?.({
+				type: "lost-mutation-reconciliation",
+				event: "unavailable",
+				operation,
+			});
+			throw cause;
+		}
+		let lastObservedAt = startedAt;
+		const remaining = () => {
+			const observedAt = this.lostMutationNowFn();
+			const remainingMs = Math.floor(deadline - observedAt);
+			if (
+				!Number.isFinite(observedAt) ||
+				observedAt < lastObservedAt ||
+				observedAt >= deadline ||
+				remainingMs < 1
+			) {
+				throw cause;
+			}
+			lastObservedAt = observedAt;
+			return remainingMs;
+		};
+		const budget = { remaining };
+		for (;;) {
+			let remainingMs;
+			try {
+				remainingMs = remaining();
+				emit?.({
+					type: "lost-mutation-reconciliation",
+					event: "probe",
+					operation,
+				});
+				const achieved = observe(budget);
+				remainingMs = remaining();
+				if (achieved) {
+					emit?.({
+						type: "lost-mutation-reconciliation",
+						event: "complete",
+						operation,
+					});
+					return;
+				}
+			} catch {
+				emit?.({
+					type: "lost-mutation-reconciliation",
+					event: "unavailable",
+					operation,
+				});
+				throw cause;
+			}
+			const sleepMs = Math.min(
+				this.lostMutationReconciliationPollMs,
+				remainingMs,
+			);
+			if (sleepMs <= 0) throw cause;
+			this.sleepFn(sleepMs);
+			try {
+				remaining();
+			} catch {
+				emit?.({
+					type: "lost-mutation-reconciliation",
+					event: "unavailable",
+					operation,
+				});
+				throw cause;
+			}
+		}
+	}
+
+	_lostMutationIdentity(entry, allowUnmanaged) {
+		if (!entry.ownership) {
+			if (allowUnmanaged) return null;
+			throw new Error("lost-result reconciliation requires owned VM metadata");
+		}
+		const record = this.ownedResourcesByUuid.get(entry.uuid);
+		if (
+			!record ||
+			record.vmUuid !== entry.uuid ||
+			record.vmName !== entry.name ||
+			record.runId !== entry.runId ||
+			record.creatorPid !== entry.creatorPid
+		) {
+			throw new Error(
+				"lost-result reconciliation requires exact owned VM metadata",
+			);
+		}
+		return Object.freeze({
+			vmUuid: record.vmUuid,
+			vmName: record.vmName,
+			runId: record.runId,
+			creatorPid: record.creatorPid,
+		});
+	}
+
+	/** Read one complete VM inventory and preserve the original exact identity. */
+	_observeExactVm(entry, budget, identity = null) {
+		if (identity) {
+			const current = this.ownedResourcesByUuid.get(entry.uuid);
+			if (
+				!current ||
+				current.vmUuid !== identity.vmUuid ||
+				current.vmName !== identity.vmName ||
+				current.runId !== identity.runId ||
+				current.creatorPid !== identity.creatorPid
+			) {
+				throw new Error("VM ownership metadata changed during reconciliation");
+			}
+		}
+		const timeout = budget.remaining();
+		const rows = parseReadinessInventory(
+			this._call(["list", "-a", "-o", "uuid,status,name"], {
+				retry: false,
+				timeout,
+				killSignal: "SIGKILL",
+				maxBuffer: HOST_READINESS_MAX_BUFFER,
+			}),
+		);
+		budget.remaining();
+		if (identity) {
+			const current = this.ownedResourcesByUuid.get(entry.uuid);
+			if (
+				!current ||
+				current.vmUuid !== identity.vmUuid ||
+				current.vmName !== identity.vmName ||
+				current.runId !== identity.runId ||
+				current.creatorPid !== identity.creatorPid
+			) {
+				throw new Error("VM ownership metadata changed during reconciliation");
+			}
+		}
+		const matches = rows.filter(([uuid, _status, ...nameParts]) => {
+			const name = nameParts.join(" ").trim();
+			if (uuid !== entry.uuid || name !== entry.name) return false;
+			const ownership =
+				entry.ownership ?? parseParallelsWorkingName(entry.name);
+			const observedOwnership = parseParallelsWorkingName(name);
+			return (
+				!ownership ||
+				(observedOwnership &&
+					observedOwnership.runId === ownership.runId &&
+					observedOwnership.creatorPid === ownership.creatorPid)
+			);
+		});
+		if (matches.length !== 1) {
+			throw new Error("VM identity changed during lost-result reconciliation");
+		}
+		return { status: matches[0][1] };
+	}
+
+	/** Read one strict snapshot inventory for the exact golden-image identity. */
+	_observeSnapshotIds(golden, budget) {
+		const current = this._observeExactVm(golden, budget);
+		// A changed or unavailable golden image is not authoritative evidence for
+		// a snapshot mutation, even if a name later happens to match.
+		if (!current.status) {
+			throw new Error("golden image status is unavailable");
+		}
+		const output = this._call(["snapshot-list", golden.uuid, "--json"], {
+			retry: false,
+			timeout: budget.remaining(),
+			killSignal: "SIGKILL",
+			maxBuffer: HOST_READINESS_MAX_BUFFER,
+		});
+		budget.remaining();
+		return strictSnapshotIdsFromOutput(output);
 	}
 
 	/**
@@ -2125,15 +2400,17 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const requested =
 			handle && typeof handle === "object"
 				? { uuid: handle.uuid, name: handle.name }
-				: { uuid: isUuid(handle) ? handle : null, name: handle };
+				: isUuid(handle)
+					? { uuid: handle, name: null }
+					: { uuid: null, name: handle };
 		if (!requested.uuid && !requested.name) {
 			throw new Error("VM handle must be a Parallels UUID or VM name");
 		}
-		const entry = this.listAll().find(
-			(candidate) =>
-				(requested.uuid && candidate.uuid === requested.uuid) ||
-				(requested.name && candidate.name === requested.name),
-		);
+		const entry = this.listAll().find((candidate) => {
+			if (requested.uuid && candidate.uuid !== requested.uuid) return false;
+			if (requested.name && candidate.name !== requested.name) return false;
+			return true;
+		});
 		if (!entry) throw new Error("VM handle does not identify an existing VM");
 		if (!entry.ownership && !allowUnmanaged) {
 			throw new Error(`refusing unmanaged Parallels VM: ${entry.name}`);
@@ -2192,7 +2469,35 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (!options.skipGoldenCheck && golden && entry.name === golden) {
 			this.assertGoldenImageAvailable(golden);
 		}
-		this._call(["start", entry.uuid]);
+		if (this.enableLostMutationReconciliation) {
+			const identity = this._lostMutationIdentity(
+				entry,
+				options.allowUnmanaged === true,
+			);
+			try {
+				// A lost SDK result is ambiguous. Do not let _call replay start before
+				// the exact owned VM's authoritative running state is observed.
+				this._call(["start", entry.uuid], { retry: false });
+			} catch (error) {
+				this._reconcileLostMutation(
+					error,
+					(budget) =>
+						/^running$/i.test(
+							this._observeExactVm(entry, budget, identity).status,
+						),
+					{ operation: "start", onStatus: options.onStatus },
+				);
+			}
+		} else {
+			// Preserve the legacy generic-retry behavior until the explicit gate is
+			// activated after its attended disposable-VM observation.
+			(options.onStatus ?? this.onStatus)?.({
+				type: "lost-mutation-reconciliation",
+				event: "unavailable",
+				operation: "start",
+			});
+			this._call(["start", entry.uuid]);
+		}
 		this.waitForAqua(entry.uuid, options);
 		return { uuid: entry.uuid, name: entry.name, status: "running" };
 	}
@@ -2236,9 +2541,36 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return snapshotIdsFromOutput(this._call(["snapshot-list", goldenImage]));
 	}
 
-	deleteSnapshots(goldenImage, snapshotIds) {
+	deleteSnapshots(goldenImage, snapshotIds, options = {}) {
+		const gatedGolden = this.enableLostMutationReconciliation
+			? this.resolveHandle(goldenImage, { allowUnmanaged: true })
+			: null;
 		for (const snapshotId of snapshotIds) {
-			this._call(["snapshot-delete", goldenImage, "--id", snapshotId]);
+			if (!this.enableLostMutationReconciliation) {
+				(options.onStatus ?? this.onStatus)?.({
+					type: "lost-mutation-reconciliation",
+					event: "unavailable",
+					operation: "snapshot_delete",
+				});
+				this._call(["snapshot-delete", goldenImage, "--id", snapshotId]);
+				continue;
+			}
+			const exactSnapshotId = normalizedUuid(snapshotId);
+			if (!exactSnapshotId) {
+				throw new Error("snapshot deletion requires an exact snapshot UUID");
+			}
+			try {
+				this._call(["snapshot-delete", gatedGolden.uuid, "--id", snapshotId], {
+					retry: false,
+				});
+			} catch (error) {
+				this._reconcileLostMutation(
+					error,
+					(budget) =>
+						!this._observeSnapshotIds(gatedGolden, budget).has(exactSnapshotId),
+					{ operation: "snapshot_delete", onStatus: options.onStatus },
+				);
+			}
 		}
 	}
 

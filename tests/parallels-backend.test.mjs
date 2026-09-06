@@ -3041,6 +3041,352 @@ describe("prlctl job-misfire tolerance", () => {
 		strictEqual(calls, 1, "an opt-out must be attempted once only");
 	});
 
+	it("keeps start on the legacy retry path until lost-result reconciliation is explicitly enabled", () => {
+		const calls = [];
+		let starts = 0;
+		const backend = workspaceBackend((args) => {
+			calls.push(args);
+			if (args[0] === "list") {
+				return listed([
+					{
+						uuid: WORK_UUID,
+						status: "stopped",
+						name: buildParallelsWorkingName("legacy-start", 1234),
+					},
+				]);
+			}
+			if (args[0] === "start") {
+				starts += 1;
+				if (starts === 1) throw lostExitCode();
+				return "";
+			}
+			if (args[0] === "exec") return "ready";
+			throw new Error(`unexpected call: ${args.join(" ")}`);
+		});
+
+		backend.boot(WORK_UUID);
+		strictEqual(starts, 2);
+		strictEqual(
+			calls.filter((args) => args[0] === "list").length,
+			1,
+			"default-off reconciliation must not add a postcondition probe",
+		);
+	});
+
+	function registerOwnedVm(backend, name, runId, creatorPid = 1234) {
+		backend.ownedResourcesByUuid.set(
+			WORK_UUID,
+			Object.freeze({
+				vmUuid: WORK_UUID,
+				vmName: name,
+				runId,
+				creatorPid,
+			}),
+		);
+	}
+
+	it("reconciles a lost start only from the exact owned VM and emits bounded progress", () => {
+		const calls = [];
+		const statuses = [];
+		let starts = 0;
+		const name = buildParallelsWorkingName("lost-start", 1234);
+		const backend = workspaceBackend(
+			(args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					return listed([
+						{ uuid: WORK_UUID, status: starts ? "running" : "stopped", name },
+					]);
+				}
+				if (args[0] === "start") {
+					starts += 1;
+					throw lostExitCode();
+				}
+				if (args[0] === "exec") return "ready";
+				throw new Error(`unexpected call: ${args.join(" ")}`);
+			},
+			{
+				enableLostMutationReconciliation: true,
+				lostMutationReconciliationTimeoutMs: 100,
+				lostMutationNowFn: () => 0,
+				onStatus: (event) => statuses.push(event),
+			},
+		);
+		registerOwnedVm(backend, name, "lost-start");
+
+		backend.boot({ uuid: WORK_UUID, name });
+		strictEqual(starts, 1);
+		strictEqual(calls.filter((args) => args[0] === "list").length, 2);
+		deepStrictEqual(
+			statuses
+				.filter((event) => event.type === "lost-mutation-reconciliation")
+				.map(({ event, operation }) => ({ event, operation })),
+			[
+				{ event: "start", operation: "start" },
+				{ event: "probe", operation: "start" },
+				{ event: "complete", operation: "start" },
+			],
+		);
+		ok(statuses.every((event) => !("argv" in event) && !("output" in event)));
+	});
+
+	it("preserves the lost start cause when the strict probe budget is zero, exhausted by inventory, or rolls back", () => {
+		for (const fixture of [
+			"zero",
+			"fractional",
+			"inventory-exhausted",
+			"rollback",
+		]) {
+			let starts = 0;
+			let lists = 0;
+			const name = buildParallelsWorkingName(`budget-${fixture}`, 1234);
+			const clock =
+				fixture === "zero"
+					? [0, 0]
+					: fixture === "fractional"
+						? [0, 0.2]
+						: fixture === "inventory-exhausted"
+							? [0, 0, 0, 100]
+							: [10, 10, 9];
+			let clockIndex = 0;
+			const backend = workspaceBackend(
+				(args) => {
+					if (args[0] === "list") {
+						lists += 1;
+						return listed([{ uuid: WORK_UUID, status: "running", name }]);
+					}
+					if (args[0] === "start") {
+						starts += 1;
+						throw lostExitCode();
+					}
+					throw new Error(`unexpected call: ${args.join(" ")}`);
+				},
+				{
+					enableLostMutationReconciliation: true,
+					lostMutationReconciliationTimeoutMs:
+						fixture === "zero" ? 0 : fixture === "fractional" ? 1 : 50,
+					lostMutationNowFn: () =>
+						clock[Math.min(clockIndex++, clock.length - 1)],
+				},
+			);
+			registerOwnedVm(backend, name, `budget-${fixture}`);
+
+			throws(
+				() => backend.boot(WORK_UUID),
+				(error) => error instanceof PrlctlCallError,
+			);
+			strictEqual(starts, 1, `${fixture}: start must not replay`);
+			strictEqual(
+				lists,
+				fixture === "inventory-exhausted" ? 2 : 1,
+				`${fixture}: no read may start without remaining budget`,
+			);
+		}
+	});
+
+	it("rejects mismatched compound handles and displaced ownership without another mutation", () => {
+		let starts = 0;
+		let lists = 0;
+		const name = buildParallelsWorkingName("owned-start", 1234);
+		const backend = workspaceBackend(
+			(args) => {
+				if (args[0] === "list") {
+					lists += 1;
+					if (lists === 3) backend.ownedResourcesByUuid.delete(WORK_UUID);
+					return listed([{ uuid: WORK_UUID, status: "running", name }]);
+				}
+				if (args[0] === "start") {
+					starts += 1;
+					throw lostExitCode();
+				}
+				throw new Error(`unexpected call: ${args.join(" ")}`);
+			},
+			{
+				enableLostMutationReconciliation: true,
+				lostMutationReconciliationTimeoutMs: 100,
+				lostMutationNowFn: () => 0,
+			},
+		);
+		registerOwnedVm(backend, name, "owned-start");
+
+		throws(
+			() => backend.boot({ uuid: WORK_UUID, name: "other-vm" }),
+			/does not identify/,
+		);
+		strictEqual(starts, 0);
+		throws(
+			() => backend.boot(WORK_UUID),
+			(error) => error instanceof PrlctlCallError,
+		);
+		strictEqual(starts, 1, "ownership displacement must not replay start");
+	});
+
+	it("reconciles lost snapshot deletion with --json and the exact golden identity", () => {
+		const calls = [];
+		let deletes = 0;
+		const snapshotId = "{9f6e0d53-0000-4000-8000-000000000000}";
+		const backend = workspaceBackend(
+			(args) => {
+				calls.push(args);
+				if (args[0] === "list") {
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: "golden-fixture" },
+					]);
+				}
+				if (args[0] === "snapshot-delete") {
+					deletes += 1;
+					throw lostExitCode();
+				}
+				if (args[0] === "snapshot-list")
+					return JSON.stringify({ snapshots: [] });
+				throw new Error(`unexpected call: ${args.join(" ")}`);
+			},
+			{
+				enableLostMutationReconciliation: true,
+				lostMutationReconciliationTimeoutMs: 100,
+				lostMutationNowFn: () => 0,
+			},
+		);
+
+		backend.deleteSnapshots({ uuid: GOLDEN_UUID, name: "golden-fixture" }, [
+			snapshotId,
+		]);
+		strictEqual(deletes, 1);
+		deepStrictEqual(calls.at(-1), ["snapshot-list", GOLDEN_UUID, "--json"]);
+	});
+
+	it("distinguishes strict snapshot parse rejection from a bounded still-present result", () => {
+		for (const fixture of [
+			"malformed",
+			"empty-output",
+			"conflicting-identity",
+			"still-present",
+		]) {
+			let deletes = 0;
+			let snapshotProbes = 0;
+			let clock = 0;
+			const sleeps = [];
+			const statuses = [];
+			const snapshotId = "{9f6e0d53-0000-4000-8000-000000000000}";
+			const backend = workspaceBackend(
+				(args) => {
+					if (args[0] === "list") {
+						return listed([
+							{
+								uuid: GOLDEN_UUID,
+								status: "stopped",
+								name:
+									fixture === "conflicting-identity" && deletes
+										? "other-golden"
+										: "golden-fixture",
+							},
+						]);
+					}
+					if (args[0] === "snapshot-delete") {
+						deletes += 1;
+						throw lostExitCode();
+					}
+					if (args[0] === "snapshot-list") {
+						snapshotProbes += 1;
+						if (fixture === "still-present") {
+							return JSON.stringify({ snapshots: [{ id: snapshotId }] });
+						}
+						return fixture === "empty-output" ? "" : "{}";
+					}
+					throw new Error(`unexpected call: ${args.join(" ")}`);
+				},
+				{
+					enableLostMutationReconciliation: true,
+					lostMutationReconciliationTimeoutMs: 500,
+					lostMutationNowFn: () => clock,
+					sleepFn: (ms) => {
+						sleeps.push(ms);
+						clock += ms;
+					},
+					onStatus: (event) => statuses.push(event),
+				},
+			);
+
+			throws(
+				() => backend.deleteSnapshots("golden-fixture", [snapshotId]),
+				(error) => error instanceof PrlctlCallError,
+			);
+			strictEqual(deletes, 1, `${fixture}: deletion must not replay`);
+			strictEqual(
+				snapshotProbes,
+				fixture === "conflicting-identity"
+					? 0
+					: fixture === "still-present"
+						? 2
+						: 1,
+				`${fixture}: probe count must identify the rejection boundary`,
+			);
+			deepStrictEqual(
+				sleeps,
+				fixture === "still-present" ? [250, 250] : [],
+				`${fixture}: malformed evidence must reject immediately`,
+			);
+			strictEqual(statuses.at(-1)?.event, "unavailable");
+		}
+	});
+
+	it("does not start snapshot-list when the exact VM inventory consumes the budget", () => {
+		let deletes = 0;
+		let snapshotProbes = 0;
+		const statuses = [];
+		const clock = [0, 0, 0, 100];
+		let clockIndex = 0;
+		const snapshotId = "{9f6e0d53-0000-4000-8000-000000000000}";
+		const backend = workspaceBackend(
+			(args) => {
+				if (args[0] === "list") {
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "stopped", name: "golden-fixture" },
+					]);
+				}
+				if (args[0] === "snapshot-delete") {
+					deletes += 1;
+					throw lostExitCode();
+				}
+				if (args[0] === "snapshot-list") {
+					snapshotProbes += 1;
+					return JSON.stringify({ snapshots: [] });
+				}
+				throw new Error(`unexpected call: ${args.join(" ")}`);
+			},
+			{
+				enableLostMutationReconciliation: true,
+				lostMutationReconciliationTimeoutMs: 50,
+				lostMutationNowFn: () =>
+					clock[Math.min(clockIndex++, clock.length - 1)],
+				onStatus: (event) => statuses.push(event),
+			},
+		);
+
+		throws(
+			() => backend.deleteSnapshots("golden-fixture", [snapshotId]),
+			(error) => error instanceof PrlctlCallError,
+		);
+		strictEqual(deletes, 1);
+		strictEqual(snapshotProbes, 0);
+		strictEqual(statuses.at(-1)?.event, "unavailable");
+	});
+
+	it("keeps snapshot deletion on the legacy retry path until reconciliation is enabled", () => {
+		let deletes = 0;
+		const backend = workspaceBackend((args) => {
+			if (args[0] !== "snapshot-delete")
+				throw new Error(`unexpected call: ${args.join(" ")}`);
+			deletes += 1;
+			if (deletes === 1) throw lostExitCode();
+			return "";
+		});
+		backend.deleteSnapshots("golden-fixture", [
+			"{9f6e0d53-0000-4000-8000-000000000000}",
+		]);
+		strictEqual(deletes, 2);
+	});
+
 	it("keeps paid provider execution off the retrying route entirely", () => {
 		// The structural half of the contract. Adapters run a provider through
 		// the execArgv descriptor, which only builds argv -- it never calls
