@@ -95,6 +95,7 @@ import {
 	loadCheckpoint,
 	loadTaskQueue,
 	normalizeRunOptions,
+	reconcileExternalCompletion,
 	runQueueAsync,
 	sanitizeQueuePreflightDetail,
 } from "../runner/index.mjs";
@@ -111,6 +112,7 @@ Subcommands:
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
+  reconcile-completion --receipt <path> ...       Record external completion
   remediate-orphaned-locks [--dry-run|--confirm] [--state-root <path>]
                                                 Interactively remediate orphaned project locks
 
@@ -179,6 +181,16 @@ const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest
   Run \`health identity\` first: it prints the descriptor identity and public configuration epoch the other two require.
   attest-repair records attended host control metadata only; it never reads credentials or repairs a service.`;
 
+const USAGE_RECONCILE_COMPLETION = `Usage: switchyard-dispatch reconcile-completion --receipt <path> --source-checkpoint <path> --successor-checkpoint <path> --tasks <path> --project <path>
+
+  --receipt <path>              Versioned bounded external-completion receipt
+  --source-checkpoint <path>    Existing checkpoint, never modified
+  --successor-checkpoint <path> Fresh checkpoint to create
+  --tasks <path>                Exact task file for successor identity
+  --project <path>              Repository containing the integrated commit
+  --json                        Emit JSON
+  --help                        Show this help`;
+
 const KNOWN_SUBCOMMANDS = new Set([
 	"run",
 	"launch",
@@ -186,6 +198,7 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"result",
 	"recover",
 	"health",
+	"reconcile-completion",
 	"remediate-orphaned-locks",
 ]);
 
@@ -544,6 +557,66 @@ function parseHealthArgs(argv) {
 	if (!parsed.values["repair-kind"])
 		throw new UsageError("health attest-repair --repair-kind is required");
 	return { action, ...base, repairKind: parsed.values["repair-kind"] };
+}
+
+function parseReconcileCompletionArgs(argv) {
+	let parsed;
+	try {
+		parsed = parseArgs({
+			args: argv,
+			allowPositionals: false,
+			options: {
+				receipt: { type: "string" },
+				"source-checkpoint": { type: "string" },
+				"successor-checkpoint": { type: "string" },
+				tasks: { type: "string" },
+				project: { type: "string" },
+				json: { type: "boolean", default: false },
+				help: { type: "boolean", default: false },
+			},
+		});
+	} catch (error) {
+		throw new UsageError(error.message);
+	}
+	if (parsed.values.help) return { help: true };
+	const required = [
+		"receipt",
+		"source-checkpoint",
+		"successor-checkpoint",
+		"tasks",
+		"project",
+	];
+	if (required.some((field) => !parsed.values[field]))
+		throw new UsageError(
+			"reconcile-completion requires --receipt, --source-checkpoint, --successor-checkpoint, --tasks, and --project",
+		);
+	return {
+		receiptPath: resolve(parsed.values.receipt),
+		sourceCheckpointPath: resolve(parsed.values["source-checkpoint"]),
+		successorCheckpointPath: resolve(parsed.values["successor-checkpoint"]),
+		tasksFilePath: resolve(parsed.values.tasks),
+		projectPath: resolve(parsed.values.project),
+		json: parsed.values.json,
+	};
+}
+
+async function handleReconcileCompletion(argv) {
+	const options = parseReconcileCompletionArgs(argv);
+	if (options.help) {
+		console.log(USAGE_RECONCILE_COMPLETION);
+		return;
+	}
+	// The runner owns every receipt trust check (lstat, bounds, owner, mode,
+	// nonsymlink, and only then JSON parsing).  Keeping the CLI path-only also
+	// prevents FIFOs and symlink targets from being opened before that gate.
+	const result = await reconcileExternalCompletion(options);
+	if (options.json) console.log(JSON.stringify(result));
+	else
+		console.log(
+			`${result.status}: ${result.result}${result.reasonCode ? ` (${result.reasonCode})` : ""}`,
+		);
+	if (["refused", "recovery-required"].includes(result.status))
+		process.exitCode = 1;
 }
 
 async function handleHealth(argv) {
@@ -2790,6 +2863,10 @@ async function main(argv) {
 				await handleHealth(subArgs);
 				break;
 			}
+			case "reconcile-completion": {
+				await handleReconcileCompletion(subArgs);
+				break;
+			}
 			case "remediate-orphaned-locks": {
 				await handleOrphanLockRemediation(subArgs);
 				break;
@@ -2835,6 +2912,7 @@ export {
 	handleHealth,
 	handleLaunch,
 	handleOrphanLockRemediation,
+	handleReconcileCompletion,
 	handleRecover,
 	handleResult,
 	handleRun,
@@ -2844,6 +2922,7 @@ export {
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
+	parseReconcileCompletionArgs,
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,

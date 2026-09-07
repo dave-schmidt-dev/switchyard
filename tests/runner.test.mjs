@@ -73,6 +73,7 @@ import {
 	planPotentialAttemptTasks,
 	QueueCleanupError,
 	QueuePreflightError,
+	reconcileExternalCompletion,
 	releaseCheckpointOwnership,
 	resolveOrchestrator,
 	runQueueAsync as runQueueAsyncImpl,
@@ -5243,6 +5244,14 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 			strictEqual(dispatches[0].result, "success");
 		});
 	}
+});
+
+describe("external completion handoff", () => {
+	it("fails closed before reading or mutating any checkpoint for malformed input", async () => {
+		const result = await reconcileExternalCompletion({});
+		strictEqual(result.status, "refused");
+		strictEqual(result.reasonCode, "malformed_receipt");
+	});
 });
 
 describe("runner quota retry coordination", () => {

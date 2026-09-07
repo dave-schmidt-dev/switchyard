@@ -1,5 +1,11 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { cwd } from "node:process";
 import { after, before, beforeEach, describe, it } from "node:test";
@@ -10,6 +16,7 @@ import {
 	recordDispatch,
 	recordDispatchIntentToStore,
 	recordDispatchToStore,
+	recordExternalCompletionToStore,
 	resetLedgerRotationFailures,
 } from "../src/switchyard/ledger/index.mjs";
 
@@ -61,6 +68,51 @@ describe("ledger", () => {
 		);
 		ok(Array.isArray(entries), "returns an array");
 		strictEqual(entries.length, 0, "returns an empty array");
+	});
+
+	it("records external completion exactly once and refuses ID reuse with different fields", async () => {
+		const store = join(TEST_LEDGER_DIR, "external-completion");
+		const data = {
+			reconciliationId: "a".repeat(64),
+			taskId: "1.1",
+			sourceRevision: 4,
+			integratedCommit: "b".repeat(40),
+			contractHash: "c".repeat(64),
+		};
+		const first = await recordExternalCompletionToStore(data, store);
+		const second = await recordExternalCompletionToStore(data, store);
+		strictEqual(first.alreadyRecorded, false);
+		strictEqual(second.alreadyRecorded, true);
+		strictEqual((await readLedgerFromStore(store)).length, 1);
+		await rejects(
+			recordExternalCompletionToStore({ ...data, taskId: "1.2" }, store),
+			(error) => error?.code === "RECONCILIATION_LEDGER_MISMATCH",
+		);
+	});
+
+	it("does not remove a ledger lock it failed to acquire", async () => {
+		const store = join(TEST_LEDGER_DIR, "locked-completion");
+		const ledgerDir = join(store, "ledger");
+		mkdirSync(ledgerDir, { recursive: true });
+		const lockPath = join(
+			ledgerDir,
+			"dispatch-ledger.jsonl.external-completion.lock",
+		);
+		writeFileSync(lockPath, "foreign-lock");
+		await rejects(
+			recordExternalCompletionToStore(
+				{
+					reconciliationId: "d".repeat(64),
+					taskId: "1.1",
+					sourceRevision: 1,
+					integratedCommit: "e".repeat(40),
+					contractHash: "f".repeat(64),
+				},
+				store,
+			),
+		);
+		strictEqual(existsSync(lockPath), true);
+		rmSync(lockPath, { force: true });
 	});
 
 	it("should record dispatch and read it back", () => {

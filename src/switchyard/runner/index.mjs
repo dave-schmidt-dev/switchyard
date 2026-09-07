@@ -4,11 +4,17 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	chmodSync,
 	closeSync,
 	existsSync,
+	constants as fsConstants,
+	fstatSync,
+	linkSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	readSync,
 	renameSync,
 	unlinkSync,
 	writeFileSync,
@@ -71,11 +77,19 @@ import {
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
 import { createBroker } from "../broker/index.mjs";
-import { integrationGate } from "../integrate/index.mjs";
 import {
+	integrationGate,
+	validateExactPathSet,
+	validateIntegratedCommitAncestry,
+	validateIntegratedCommitPaths,
+	validateNoTrackedPathOverlap,
+} from "../integrate/index.mjs";
+import {
+	readLedgerFromStore,
 	recordDispatch,
 	recordDispatchIntentToStore,
 	recordDispatchToStore,
+	recordExternalCompletionToStore,
 } from "../ledger/index.mjs";
 import {
 	loadWorkspaceLifecycleHooks,
@@ -116,7 +130,9 @@ import {
 import {
 	acquireVmSlot,
 	createFencingIdentity,
+	getStateRoot,
 	getVmAdmissionRoot,
+	isProjectLockOwnedBy,
 	releaseVmSlot,
 	VmSlotUnavailableError,
 } from "../run-store/index.mjs";
@@ -258,6 +274,1221 @@ export function createQueueIdentity({
 		runOptions: normalizeRunOptions(runOptions),
 	};
 	return createHash("sha256").update(stableStringify(payload)).digest("hex");
+}
+
+const EXTERNAL_COMPLETION_VERSION = 1;
+const RECONCILIATION_INTENT_VERSION = 1;
+const RECONCILIATION_INTENT_STATES = Object.freeze([
+	"prepared",
+	"successor_recorded",
+	"ledger_recorded",
+	"completed",
+]);
+const EXTERNAL_COMPLETION_MAX_RECEIPT_BYTES = 1024 * 1024;
+const RECONCILIATION_INTENT_MAX_BYTES = 8 * 1024 * 1024;
+
+function refusal(code, detail = null) {
+	return {
+		recorded: false,
+		status: "refused",
+		result: "external_completion_refused",
+		reasonCode: code,
+		...(detail ? { detail } : {}),
+	};
+}
+
+function sortedUnique(values) {
+	return [...new Set(Array.isArray(values) ? values : [])].sort();
+}
+
+function hashBytes(value) {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function readBoundedReceipt(receiptPath) {
+	let fd;
+	try {
+		fd = openSync(
+			receiptPath,
+			fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+		);
+		const stats = fstatSync(fd);
+		if (!stats.isFile() || stats.isSymbolicLink())
+			return { error: "receipt_not_regular" };
+		if (stats.size > EXTERNAL_COMPLETION_MAX_RECEIPT_BYTES)
+			return { error: "receipt_too_large" };
+		const ownerUid =
+			typeof process.getuid === "function" ? process.getuid() : null;
+		if (ownerUid !== null && stats.uid !== ownerUid)
+			return { error: "receipt_owner_mismatch" };
+		const mode = stats.mode & 0o7777;
+		if (mode !== 0o600) return { error: "receipt_mode_mismatch" };
+		const bytes = Buffer.alloc(stats.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const count = readSync(fd, bytes, offset, bytes.length - offset, null);
+			if (count === 0) break;
+			offset += count;
+		}
+		let value;
+		try {
+			value = JSON.parse(bytes.subarray(0, offset).toString("utf8"));
+		} catch {
+			return { error: "receipt_malformed" };
+		}
+		if (value?.ownerUid !== stats.uid || value?.mode !== mode)
+			return { error: "receipt_stat_mismatch" };
+		return { value };
+	} catch (error) {
+		return {
+			error:
+				error?.code === "ELOOP" ? "receipt_not_regular" : "receipt_missing",
+		};
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+function taskContractBytes(markdown, taskId) {
+	const taskBlockRegex =
+		/### Task ([0-9.]+):\s*(.+)\n([\s\S]*?)(?=\n### Task [0-9.]+:|\n## |\n---|$)/g;
+	for (const match of markdown.matchAll(taskBlockRegex)) {
+		if (match[1].trim() === taskId) return match[0];
+	}
+	return null;
+}
+
+function reconciliationIntentPath(sourceCheckpointPath) {
+	return `${sourceCheckpointPath}.reconciliation-intent.json`;
+}
+
+function readIntent(path) {
+	if (!existsSync(path)) return null;
+	try {
+		const stats = lstatSync(path);
+		const ownerUid =
+			typeof process.getuid === "function" ? process.getuid() : null;
+		if (
+			!stats.isFile() ||
+			stats.isSymbolicLink() ||
+			stats.size > RECONCILIATION_INTENT_MAX_BYTES ||
+			(ownerUid !== null && stats.uid !== ownerUid) ||
+			(stats.mode & 0o7777) !== 0o600
+		)
+			return { error: "reconciliation_intent_untrusted" };
+		const intent = JSON.parse(readFileSync(path, "utf8"));
+		const source = intent?.source;
+		const immutable = intent?.immutable;
+		const successor = intent?.successor;
+		const ledger = intent?.ledger;
+		if (
+			intent?.version !== RECONCILIATION_INTENT_VERSION ||
+			!RECONCILIATION_INTENT_STATES.includes(intent.state) ||
+			!/^[a-f0-9]{64}$/i.test(intent.reconciliationId ?? "") ||
+			typeof source?.checkpointPath !== "string" ||
+			typeof source?.owner !== "object" ||
+			!validSourceOwner(source.owner) ||
+			!Number.isInteger(source.revision) ||
+			source.revision < 0 ||
+			typeof source.taskId !== "string" ||
+			source.taskId.length === 0 ||
+			!Number.isInteger(source.attempt) ||
+			source.attempt < 1 ||
+			typeof source.tasksFilePath !== "string" ||
+			!/^[a-f0-9]{64}$/i.test(source.rawSha256 ?? "") ||
+			typeof immutable?.projectPath !== "string" ||
+			typeof immutable?.receiptPath !== "string" ||
+			!validAbsolutePath(immutable?.runStorePath) ||
+			!/^[a-f0-9]{64}$/i.test(immutable.contractHash ?? "") ||
+			!/^[a-f0-9]{40,64}$/i.test(immutable.integratedCommit ?? "") ||
+			!/^[a-f0-9]{40,64}$/i.test(immutable.currentHead ?? "") ||
+			!validReconciliationPathList(immutable.changedPaths) ||
+			!validReconciliationPathList(immutable.requiredPaths) ||
+			!/^[a-f0-9]{64}$/i.test(immutable.queueIdentity ?? "") ||
+			!immutable.runOptions ||
+			typeof successor?.checkpointPath !== "string" ||
+			!successor?.checkpoint ||
+			typeof ledger?.runStorePath !== "string" ||
+			!validAbsolutePath(ledger.runStorePath) ||
+			ledger.runStorePath !== immutable.runStorePath ||
+			!ledger?.fields ||
+			typeof ledger.fields === "string" ||
+			Array.isArray(ledger.fields) ||
+			ledger.fields.reconciliationId !== intent.reconciliationId
+		)
+			return { error: "reconciliation_intent_malformed" };
+		return { value: intent };
+	} catch {
+		return { error: "reconciliation_intent_malformed" };
+	}
+}
+
+function writeIntent(path, intent) {
+	mkdirSync(dirname(path), { recursive: true });
+	const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(temp, JSON.stringify(intent, null, 2), {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	chmodSync(temp, 0o600);
+	renameSync(temp, path);
+}
+
+function updateIntent(path, intent, state) {
+	writeIntent(path, {
+		...intent,
+		state,
+		updatedAt: new Date().toISOString(),
+	});
+}
+
+function sourceTaskAllocation(source, taskId) {
+	return (source.providerAttemptAllocations ?? []).filter(
+		(entry) => entry?.taskId === taskId,
+	);
+}
+
+function sourceTaskRetry(source, taskId) {
+	if (source.retryState?.taskId === taskId) return true;
+	const attempts = (source.retryAttempts ?? []).filter(
+		(entry) => entry?.taskId === taskId,
+	);
+	if (attempts.length === 0) return false;
+	// retryAttempts is durable history, not by itself a live allocation.  It
+	// is safe to archive that history only when the matching transition stream
+	// has an explicit terminal finalization; every other shape is unknown.
+	const transitions = (source.retryTransitions ?? []).filter(
+		(entry) => entry?.taskId === taskId,
+	);
+	return transitions.at(-1)?.type !== "finalized";
+}
+
+function buildSuccessorCheckpoint(source, input, queueIdentity, options, id) {
+	const timestamp = new Date().toISOString();
+	// Start from the source snapshot so unrelated task state and forward-
+	// compatible fields remain byte-for-field represented in the successor.
+	// Replace only the fencing/queue identity and the reconciled task's state.
+	const checkpoint = {
+		...structuredClone(source),
+		version: CHECKPOINT_VERSION,
+		revision: 0,
+		owner: createFencingIdentity(`reconcile-${id.slice(0, 24)}`),
+		ownershipReleased: true,
+		tasksFilePath: input.tasksFilePath,
+		queueIdentity,
+		runOptions: options,
+	};
+	checkpoint.completedTaskIds = [...(source.completedTaskIds ?? [])];
+	if (!checkpoint.completedTaskIds.includes(input.taskId))
+		checkpoint.completedTaskIds.push(input.taskId);
+	checkpoint.lastTaskId = input.taskId;
+	checkpoint.lastUpdatedAt = timestamp;
+	checkpoint.taskAttempts = { ...(source.taskAttempts ?? {}) };
+	checkpoint.taskBases = { ...(source.taskBases ?? {}) };
+	delete checkpoint.taskBases[input.taskId];
+	checkpoint.results = [
+		...(source.results ?? []),
+		{
+			taskId: input.taskId,
+			result: "external_completion_recorded",
+			success: true,
+			providerSuccess: false,
+			completionAuthority: "verified_external_integration",
+			timestamp,
+		},
+	];
+	checkpoint.integrationIntents = { ...(source.integrationIntents ?? {}) };
+	delete checkpoint.integrationIntents[input.taskId];
+	checkpoint.retryAttempts = (source.retryAttempts ?? []).filter(
+		(entry) => entry?.taskId !== input.taskId,
+	);
+	checkpoint.retryTransitions = (source.retryTransitions ?? []).filter(
+		(entry) => entry?.taskId !== input.taskId,
+	);
+	const reconciledTargetIds = new Set(
+		[...(source.retryAttempts ?? []), ...(source.retryTransitions ?? [])]
+			.filter((entry) => entry?.taskId === input.taskId)
+			.map((entry) => normalizeRetryTargetId(entry.resolvedTargetId))
+			.filter((targetId) => targetId !== null),
+	);
+	checkpoint.quarantinedTargetIds = [
+		...(source.quarantinedTargetIds ?? []),
+	].filter((targetId) => !reconciledTargetIds.has(targetId));
+	checkpoint.providerAttemptAllocations = (
+		source.providerAttemptAllocations ?? []
+	).filter((entry) => entry?.taskId !== input.taskId);
+	checkpoint.retryState =
+		source.retryState?.taskId === input.taskId
+			? null
+			: (source.retryState ?? null);
+	if (checkpoint.taskBaseReleaseUncertain?.taskId === input.taskId)
+		delete checkpoint.taskBaseReleaseUncertain;
+	if (checkpoint.providerCleanupUncertain?.taskId === input.taskId)
+		delete checkpoint.providerCleanupUncertain;
+	checkpoint.resolvedExternalBlockers = sortedUnique([
+		...(source.resolvedExternalBlockers ?? []),
+		...(input.resolvedExternalBlockers ?? []),
+	]);
+	checkpoint.externalCompletion = {
+		version: EXTERNAL_COMPLETION_VERSION,
+		reconciliationId: id,
+		sourceCheckpointPath: resolve(input.sourceCheckpointPath),
+		sourceRevision: input.sourceRevision,
+		sourceOwner: structuredClone(input.sourceOwner),
+		attempt: input.attempt,
+		integratedCommit: input.integratedCommit,
+		contractHash: input.contractHash,
+		changedPaths: sortedUnique(input.changedPaths),
+		requiredPaths: sortedUnique(input.requiredPaths),
+		resolvedExternalBlockers: sortedUnique(
+			input.resolvedExternalBlockers ?? [],
+		),
+		providerSuccess: false,
+	};
+	checkpoint.migration = {
+		kind: "external_completion",
+		fromCheckpoint: resolve(input.sourceCheckpointPath),
+		fromRevision: input.sourceRevision,
+		toQueueIdentity: queueIdentity,
+	};
+	return checkpoint;
+}
+
+function successorMatches(path, expected) {
+	if (!existsSync(path)) return { exists: false };
+	try {
+		const stats = lstatSync(path);
+		if (!stats.isFile() || stats.isSymbolicLink())
+			return { exists: true, error: "successor_checkpoint_not_regular" };
+		const value = JSON.parse(readFileSync(path, "utf8"));
+		const same = stableStringify(value) === stableStringify(expected);
+		return { exists: true, same, value };
+	} catch {
+		return { exists: true, error: "successor_checkpoint_conflict" };
+	}
+}
+
+function readSuccessorRecord(path) {
+	if (!existsSync(path)) return { exists: false };
+	try {
+		const stats = lstatSync(path);
+		if (!stats.isFile() || stats.isSymbolicLink())
+			return { exists: true, error: "successor_checkpoint_not_regular" };
+		return { exists: true, value: JSON.parse(readFileSync(path, "utf8")) };
+	} catch {
+		return { exists: true, error: "successor_checkpoint_conflict" };
+	}
+}
+
+function writeSuccessor(path, checkpoint) {
+	const parent = dirname(path);
+	mkdirSync(parent, { recursive: true });
+	const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(temp, JSON.stringify(checkpoint, null, 2), {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	chmodSync(temp, 0o600);
+	try {
+		// A hard-link publish is atomic and refuses to replace an existing
+		// successor.  That closes the concurrent replay window without allowing
+		// one reconciler to overwrite another's durable checkpoint.
+		linkSync(temp, path);
+		unlinkSync(temp);
+		return true;
+	} catch (error) {
+		try {
+			unlinkSync(temp);
+		} catch {}
+		if (error?.code === "EEXIST") {
+			const existing = successorMatches(path, checkpoint);
+			if (existing.exists && existing.same) return false;
+		}
+		throw error;
+	}
+}
+
+function intentMatchesInput(intent, input) {
+	const immutable = intent.immutable;
+	let inputOptions = null;
+	let inputRunStorePath = null;
+	try {
+		if (Object.hasOwn(input, "nextRunOptions"))
+			inputOptions = normalizeReconciliationRunOptions(input);
+		if (Object.hasOwn(input, "runStorePath"))
+			inputRunStorePath = reconciliationRunStorePath(input);
+	} catch {
+		return false;
+	}
+	if (
+		!immutable ||
+		typeof immutable.queueIdentity !== "string" ||
+		typeof immutable.runStorePath !== "string" ||
+		!immutable.runOptions ||
+		!intent.successor?.checkpoint?.externalCompletion ||
+		intent.ledger.fields.reconciliationId !== intent.reconciliationId ||
+		typeof input.successorCheckpointPath !== "string" ||
+		typeof input.tasksFilePath !== "string" ||
+		typeof input.projectPath !== "string" ||
+		typeof input.receiptPath !== "string"
+	)
+		return false;
+	const expectedId = hashBytes(
+		stableStringify({
+			version: RECONCILIATION_INTENT_VERSION,
+			taskId: intent.source.taskId,
+			attempt: intent.source.attempt,
+			sourceCheckpointPath: intent.source.checkpointPath,
+			sourceRevision: intent.source.revision,
+			sourceOwner: intent.source.owner,
+			contractHash: immutable.contractHash,
+			receiptPath: immutable.receiptPath,
+			integratedCommit: immutable.integratedCommit,
+			changedPaths: immutable.changedPaths,
+			requiredPaths: immutable.requiredPaths,
+			resolvedExternalBlockers: immutable.resolvedExternalBlockers,
+			queueIdentity: immutable.queueIdentity,
+			runOptions: immutable.runOptions,
+			runStorePath: immutable.runStorePath,
+		}),
+	);
+	const completion = intent.successor.checkpoint.externalCompletion;
+	const identityMatches =
+		expectedId === intent.reconciliationId &&
+		completion.reconciliationId === intent.reconciliationId &&
+		completion.sourceCheckpointPath === intent.source.checkpointPath &&
+		completion.sourceRevision === intent.source.revision &&
+		completion.attempt === intent.source.attempt &&
+		stableStringify(completion.sourceOwner) ===
+			stableStringify(intent.source.owner) &&
+		completion.contractHash === immutable.contractHash &&
+		completion.integratedCommit === immutable.integratedCommit &&
+		stableStringify(completion.changedPaths) ===
+			stableStringify(immutable.changedPaths) &&
+		stableStringify(completion.requiredPaths) ===
+			stableStringify(immutable.requiredPaths) &&
+		stableStringify(completion.resolvedExternalBlockers ?? []) ===
+			stableStringify(immutable.resolvedExternalBlockers) &&
+		completion.providerSuccess === false &&
+		intent.successor.checkpointPath ===
+			resolve(input.successorCheckpointPath) &&
+		intent.source.checkpointPath === resolve(input.sourceCheckpointPath) &&
+		immutable.projectPath === resolve(input.projectPath) &&
+		immutable.receiptPath === resolve(input.receiptPath) &&
+		intent.source.tasksFilePath === resolve(input.tasksFilePath);
+	if (!identityMatches) return false;
+	if (
+		Object.hasOwn(input, "runStorePath") &&
+		inputRunStorePath !== immutable.runStorePath
+	)
+		return false;
+	if (Object.hasOwn(input, "taskId") && intent.source.taskId !== input.taskId)
+		return false;
+	if (
+		Object.hasOwn(input, "attempt") &&
+		intent.source.attempt !== input.attempt
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "sourceRevision") &&
+		intent.source.revision !== input.sourceRevision
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "sourceOwner") &&
+		stableStringify(intent.source.owner) !== stableStringify(input.sourceOwner)
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "contractHash") &&
+		immutable.contractHash !== input.contractHash
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "integratedCommit") &&
+		immutable.integratedCommit !== input.integratedCommit
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "changedPaths") &&
+		stableStringify(immutable.changedPaths) !==
+			stableStringify(sortedUnique(input.changedPaths))
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "requiredPaths") &&
+		stableStringify(immutable.requiredPaths) !==
+			stableStringify(sortedUnique(input.requiredPaths))
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "nextRunOptions") &&
+		(inputOptions === null ||
+			stableStringify(immutable.runOptions) !== stableStringify(inputOptions))
+	)
+		return false;
+	if (
+		Object.hasOwn(input, "resolvedExternalBlockers") &&
+		stableStringify(immutable.resolvedExternalBlockers) !==
+			stableStringify(sortedUnique(input.resolvedExternalBlockers ?? []))
+	)
+		return false;
+	return (
+		input.reconciliationId === undefined ||
+		input.reconciliationId === intent.reconciliationId
+	);
+}
+
+async function replayReconciliationIntent(
+	intent,
+	intentPath,
+	input,
+	sourceLease = null,
+) {
+	const expected = intent.successor.checkpoint;
+	const successorPath = intent.successor.checkpointPath;
+	assertReconciliationSourceLease(sourceLease);
+	const existing = successorMatches(successorPath, expected);
+	if (existing.error || (existing.exists && !existing.same))
+		return refusal(existing.error ?? "successor_checkpoint_conflict");
+	if (!existing.exists) {
+		assertReconciliationSourceLease(sourceLease);
+		writeSuccessor(successorPath, expected);
+		// Persist the successor boundary before touching the ledger.  Recovery
+		// can then distinguish a prepared intent from one whose first durable
+		// side effect is already present, without trusting mutable worktree data.
+		updateIntent(intentPath, intent, "successor_recorded");
+	} else if (intent.state === "prepared") {
+		// A crash between the successor rename and the state transition is a
+		// recoverable window.  Reassert the state only after the exact successor
+		// bytes have been verified above.
+		updateIntent(intentPath, intent, "successor_recorded");
+	}
+	if (input.__testFault === "after_successor")
+		throw new Error("injected reconciliation crash after successor");
+	let ledger;
+	try {
+		assertReconciliationSourceLease(sourceLease);
+		if (input.__testFault === "ledger_failure") {
+			const error = new Error("injected reconciliation ledger failure");
+			error.code = "EIO";
+			throw error;
+		}
+		ledger = await recordExternalCompletionToStore(
+			intent.ledger.fields,
+			intent.ledger.runStorePath,
+		);
+	} catch (error) {
+		if (error?.code === "RECONCILIATION_LEDGER_MISMATCH")
+			return refusal("ledger_reconciliation_mismatch");
+		return recoveryRequired(
+			"completion_record_persistence_failed",
+			error?.code ?? "unknown",
+			intent,
+		);
+	}
+	assertReconciliationSourceLease(sourceLease);
+	updateIntent(intentPath, intent, "ledger_recorded");
+	if (input.__testFault === "after_ledger")
+		throw new Error("injected reconciliation crash after ledger");
+	assertReconciliationSourceLease(sourceLease);
+	updateIntent(intentPath, intent, "completed");
+	if (
+		input.__testFault === "before_finalization" ||
+		input.__testFault === "during_finalization"
+	)
+		throw new Error("injected reconciliation crash before finalization");
+	try {
+		assertReconciliationSourceLease(sourceLease);
+		unlinkSync(intentPath);
+	} catch (error) {
+		if (error?.code !== "ENOENT")
+			return recoveryRequired(
+				"reconciliation_finalization_failed",
+				error?.code ?? "unknown",
+				intent,
+			);
+	}
+	return {
+		recorded: true,
+		status:
+			existing.exists && ledger?.alreadyRecorded
+				? "already-recorded"
+				: "recorded",
+		result: "external_completion_recorded",
+		reconciliationId: intent.reconciliationId,
+		successorCheckpointPath: successorPath,
+		providerSuccess: false,
+	};
+}
+
+function validateExternalCompletionInput(input) {
+	if (!input || typeof input !== "object") return refusal("malformed_receipt");
+	const required = [
+		"sourceCheckpointPath",
+		"successorCheckpointPath",
+		"tasksFilePath",
+		"projectPath",
+		"receiptPath",
+		"taskId",
+		"attempt",
+		"contractHash",
+		"integratedCommit",
+		"changedPaths",
+		"requiredPaths",
+		"nextRunOptions",
+	];
+	if (required.some((field) => input[field] === undefined))
+		return refusal("malformed_receipt");
+	for (const field of [
+		"sourceCheckpointPath",
+		"successorCheckpointPath",
+		"tasksFilePath",
+		"projectPath",
+		"receiptPath",
+		"taskId",
+		"contractHash",
+		"integratedCommit",
+	]) {
+		if (
+			typeof input[field] !== "string" ||
+			input[field].length === 0 ||
+			input[field].length > 4096
+		)
+			return refusal("malformed_receipt");
+	}
+	if (input.taskId.length > 256) return refusal("malformed_receipt");
+	if (input.providerSuccess !== undefined && input.providerSuccess !== false)
+		return refusal("malformed_receipt");
+	if (
+		input.runStorePath !== undefined &&
+		!validAbsolutePath(input.runStorePath)
+	)
+		return refusal("malformed_receipt");
+	if (
+		input.nextRunOptions !== null &&
+		(typeof input.nextRunOptions !== "object" ||
+			Array.isArray(input.nextRunOptions))
+	)
+		return refusal("invalid_next_run_options");
+	if (
+		input.resolvedExternalBlockers !== undefined &&
+		(!Array.isArray(input.resolvedExternalBlockers) ||
+			input.resolvedExternalBlockers.some(
+				(blocker) => typeof blocker !== "string" || blocker.length === 0,
+			))
+	)
+		return refusal("malformed_receipt");
+	if (
+		resolve(input.sourceCheckpointPath) ===
+		resolve(input.successorCheckpointPath)
+	)
+		return refusal("successor_checkpoint_must_be_distinct");
+	if (
+		!validReconciliationPathList(input.changedPaths) ||
+		!validReconciliationPathList(input.requiredPaths)
+	)
+		return refusal("malformed_receipt");
+	if (
+		!/^[a-f0-9]{40,64}$/i.test(input.integratedCommit) ||
+		!/^[a-f0-9]{64}$/i.test(input.contractHash) ||
+		!Number.isInteger(input.attempt) ||
+		input.attempt < 1
+	)
+		return refusal("malformed_receipt");
+	if (
+		input.cleanup?.status !== "complete" ||
+		(input.cleanup?.taskBaseReleased !== undefined &&
+			input.cleanup.taskBaseReleased !== true) ||
+		(input.cleanup?.projectLockReleased !== undefined &&
+			input.cleanup.projectLockReleased !== true)
+	)
+		return refusal("cleanup_uncertain");
+	if (
+		!validSourceOwner(input.sourceOwner) ||
+		!Number.isInteger(input.sourceRevision) ||
+		input.sourceRevision < 0
+	)
+		return refusal("source_identity_missing");
+	try {
+		const options = normalizeReconciliationRunOptions(input);
+		if (options.checkpointPath !== resolve(input.successorCheckpointPath))
+			return refusal("next_checkpoint_option_mismatch");
+	} catch {
+		return refusal("invalid_next_run_options");
+	}
+	return null;
+}
+
+function normalizeReconciliationRunOptions(input) {
+	return normalizeRunOptions({
+		...(input.nextRunOptions ?? {}),
+		checkpointPath:
+			input.nextRunOptions?.checkpointPath ?? input.successorCheckpointPath,
+	});
+}
+
+function validReconciliationPath(value) {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= 4096 &&
+		!value.includes("\0") &&
+		!value.includes("\\") &&
+		!value.startsWith("/") &&
+		![...value].some(
+			(character) =>
+				character.codePointAt(0) <= 0x1f || character.codePointAt(0) === 0x7f,
+		) &&
+		!value.split("/").includes("..")
+	);
+}
+
+function validReconciliationPathList(value) {
+	return (
+		Array.isArray(value) &&
+		value.length <= 256 &&
+		value.every(validReconciliationPath)
+	);
+}
+
+function validSourceOwner(value) {
+	const fields = ["runId", "processStartIdentity", "nonce"];
+	return (
+		value &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		Object.keys(value).every((field) => fields.includes(field)) &&
+		fields.every(
+			(field) =>
+				typeof value[field] === "string" &&
+				value[field].length > 0 &&
+				value[field].length <= 256 &&
+				![...value[field]].some(
+					(character) =>
+						character.codePointAt(0) <= 0x1f ||
+						character.codePointAt(0) === 0x7f,
+				),
+		)
+	);
+}
+
+function validAbsolutePath(value) {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= 4096 &&
+		value.startsWith("/") &&
+		![...value].some(
+			(character) =>
+				character.codePointAt(0) <= 0x1f || character.codePointAt(0) === 0x7f,
+		)
+	);
+}
+
+function reconciliationRunStorePath(_input) {
+	return resolve(getStateRoot());
+}
+
+function intentUsesCurrentRunStore(intent) {
+	const canonical = reconciliationRunStorePath();
+	return (
+		intent?.immutable?.runStorePath === canonical &&
+		intent?.ledger?.runStorePath === canonical
+	);
+}
+
+function recoveryRequired(code, detail, intent) {
+	return {
+		recorded: false,
+		status: "recovery-required",
+		result: "external_completion_recovery_required",
+		reasonCode: code,
+		...(detail ? { detail } : {}),
+		...(intent?.reconciliationId
+			? { reconciliationId: intent.reconciliationId }
+			: {}),
+		...(intent?.successor?.checkpointPath
+			? { successorCheckpointPath: intent.successor.checkpointPath }
+			: {}),
+	};
+}
+
+function assertReconciliationSourceLease(sourceLease) {
+	if (!sourceLease) return;
+	assertCheckpointLease(
+		sourceLease,
+		sourceLease.checkpointPath,
+		sourceLease.owner,
+	);
+}
+
+/**
+ * Reconcile a host-verified external integration into a fresh checkpoint.
+ * The source checkpoint is read under its existing lease and never mutated.
+ * A versioned adjacent intent makes each crash window replayable.
+ * @param {object} input bounded receipt and paths
+ * @returns {Promise<object>}
+ */
+export async function reconcileExternalCompletion(input) {
+	if (
+		!input ||
+		typeof input !== "object" ||
+		typeof input.sourceCheckpointPath !== "string" ||
+		input.sourceCheckpointPath.length === 0
+	)
+		return refusal("malformed_receipt");
+	const intentPath = reconciliationIntentPath(input.sourceCheckpointPath);
+	const existingIntent = readIntent(intentPath);
+	if (existingIntent?.error) return refusal(existingIntent.error);
+	if (existingIntent?.value) {
+		if (!intentUsesCurrentRunStore(existingIntent.value))
+			return refusal("reconciliation_intent_mismatch");
+		let sourceLease;
+		try {
+			if (!intentMatchesInput(existingIntent.value, input))
+				return refusal("reconciliation_intent_mismatch");
+			sourceLease = acquireCheckpointLease(
+				existingIntent.value.source.checkpointPath,
+				existingIntent.value.source.owner,
+			);
+			const sourceStats = lstatSync(existingIntent.value.source.checkpointPath);
+			if (!sourceStats.isFile() || sourceStats.isSymbolicLink())
+				return refusal("source_checkpoint_not_regular");
+			const sourceRaw = readFileSync(
+				existingIntent.value.source.checkpointPath,
+				"utf8",
+			);
+			assertReconciliationSourceLease(sourceLease);
+			if (hashBytes(sourceRaw) !== existingIntent.value.source.rawSha256)
+				return refusal("source_checkpoint_changed");
+			let source;
+			try {
+				source = JSON.parse(sourceRaw);
+			} catch {
+				return refusal("source_checkpoint_malformed");
+			}
+			const sourceOwnerMatchesIntent =
+				stableStringify(source.owner) ===
+				stableStringify(existingIntent.value.source.owner);
+			if (
+				!sourceOwnerMatchesIntent ||
+				source.revision !== existingIntent.value.source.revision ||
+				source.tasksFilePath !== existingIntent.value.source.tasksFilePath
+			)
+				return refusal("source_identity_mismatch");
+			return await replayReconciliationIntent(
+				existingIntent.value,
+				intentPath,
+				input,
+				sourceLease,
+			);
+		} catch (error) {
+			if (error?.message?.startsWith("injected reconciliation crash"))
+				throw error;
+			if (error?.message?.includes("checkpoint lease unavailable"))
+				return refusal("source_checkpoint_lock_unavailable");
+			if (error?.message?.includes("checkpoint lease displaced"))
+				return refusal("source_checkpoint_lock_displaced");
+			return refusal("reconciliation_intent_malformed");
+		} finally {
+			if (sourceLease) {
+				try {
+					releaseCheckpointLease(sourceLease);
+				} catch {
+					console.error(
+						"switchyard: source checkpoint lease release failed during intent replay",
+					);
+				}
+			}
+		}
+	}
+	const receipt = readBoundedReceipt(input.receiptPath);
+	if (receipt.error) return refusal(receipt.error);
+	const inputHasNextRunOptions = Object.hasOwn(input, "nextRunOptions");
+	const effectiveInput = {
+		...receipt.value,
+		...input,
+	};
+	const invalid = validateExternalCompletionInput(effectiveInput);
+	if (invalid) return invalid;
+	if (
+		receipt.value?.version !== EXTERNAL_COMPLETION_VERSION ||
+		receipt.value?.kind !== "external_completion" ||
+		receipt.value.taskId !== effectiveInput.taskId ||
+		receipt.value.attempt !== effectiveInput.attempt ||
+		receipt.value.sourceRevision !== effectiveInput.sourceRevision ||
+		stableStringify(receipt.value.sourceOwner) !==
+			stableStringify(effectiveInput.sourceOwner) ||
+		receipt.value.contractHash !== effectiveInput.contractHash ||
+		receipt.value.integratedCommit !== effectiveInput.integratedCommit ||
+		stableStringify(sortedUnique(receipt.value.changedPaths)) !==
+			stableStringify(sortedUnique(effectiveInput.changedPaths)) ||
+		stableStringify(sortedUnique(receipt.value.requiredPaths)) !==
+			stableStringify(sortedUnique(effectiveInput.requiredPaths)) ||
+		stableStringify(
+			sortedUnique(receipt.value.resolvedExternalBlockers ?? []),
+		) !==
+			stableStringify(
+				sortedUnique(effectiveInput.resolvedExternalBlockers ?? []),
+			) ||
+		(receipt.value.runStorePath !== undefined &&
+			(!validAbsolutePath(receipt.value.runStorePath) ||
+				resolve(receipt.value.runStorePath) !==
+					reconciliationRunStorePath(effectiveInput))) ||
+		(effectiveInput.runStorePath !== undefined &&
+			(!validAbsolutePath(effectiveInput.runStorePath) ||
+				resolve(effectiveInput.runStorePath) !==
+					reconciliationRunStorePath(effectiveInput))) ||
+		receipt.value.cleanup?.status !== "complete" ||
+		(receipt.value.cleanup?.taskBaseReleased !== undefined &&
+			receipt.value.cleanup.taskBaseReleased !== true) ||
+		(receipt.value.cleanup?.projectLockReleased !== undefined &&
+			receipt.value.cleanup.projectLockReleased !== true) ||
+		receipt.value.providerSuccess !== false
+	)
+		return refusal("receipt_contract_mismatch");
+	try {
+		if (
+			stableStringify(
+				normalizeReconciliationRunOptions({
+					...effectiveInput,
+					nextRunOptions: receipt.value.nextRunOptions,
+				}),
+			) !==
+			(inputHasNextRunOptions
+				? stableStringify(normalizeReconciliationRunOptions(input))
+				: stableStringify(normalizeReconciliationRunOptions(effectiveInput)))
+		)
+			return refusal("receipt_contract_mismatch");
+	} catch {
+		return refusal("receipt_contract_mismatch");
+	}
+	input = effectiveInput;
+	let sourceRaw;
+	try {
+		const sourceStats = lstatSync(input.sourceCheckpointPath);
+		if (!sourceStats.isFile() || sourceStats.isSymbolicLink())
+			return refusal("source_checkpoint_not_regular");
+		sourceRaw = readFileSync(input.sourceCheckpointPath, "utf8");
+	} catch {
+		return refusal("source_checkpoint_missing");
+	}
+	let sourceLease;
+	try {
+		sourceLease = acquireCheckpointLease(
+			input.sourceCheckpointPath,
+			input.sourceOwner,
+		);
+	} catch {
+		return refusal("source_checkpoint_lock_unavailable");
+	}
+	let intentPrepared = false;
+	try {
+		let source;
+		try {
+			source = JSON.parse(sourceRaw);
+		} catch {
+			return refusal("source_checkpoint_malformed");
+		}
+		if (readFileSync(input.sourceCheckpointPath, "utf8") !== sourceRaw)
+			return refusal("source_checkpoint_changed");
+		if (
+			stableStringify(source.owner) !== stableStringify(input.sourceOwner) ||
+			source.revision !== input.sourceRevision ||
+			typeof source.ownershipReleased !== "boolean"
+		)
+			return refusal("source_identity_mismatch");
+		if (
+			typeof source.tasksFilePath !== "string" ||
+			resolve(source.tasksFilePath) !== resolve(input.tasksFilePath)
+		)
+			return refusal("source_tasks_path_mismatch");
+		try {
+			validateCheckpointTaskBases(source);
+			validateRetryDescriptorEvidence(source);
+			validateCheckpointV3(
+				source,
+				source.tasksFilePath,
+				{ checkpointOwner: input.sourceOwner },
+				input.sourceCheckpointPath,
+			);
+		} catch {
+			return refusal("source_checkpoint_malformed");
+		}
+		if (source.taskAttempts?.[input.taskId] !== input.attempt)
+			return refusal("attempt_identity_mismatch");
+		if ((source.completedTaskIds ?? []).includes(input.taskId))
+			return refusal("task_already_completed");
+		if (
+			source.integrationIntents?.[input.taskId]?.status !== undefined &&
+			source.integrationIntents[input.taskId]?.status !== "completed"
+		)
+			return refusal("integration_intent_unresolved");
+		if (source.taskBases?.[input.taskId] !== undefined)
+			return refusal("task_base_not_released");
+		if (
+			source.taskBaseReleaseUncertain &&
+			(typeof source.taskBaseReleaseUncertain !== "object" ||
+				source.taskBaseReleaseUncertain.taskId === input.taskId ||
+				typeof source.taskBaseReleaseUncertain.taskId !== "string")
+		)
+			return refusal("task_base_release_uncertain");
+		if (
+			source.providerCleanupUncertain &&
+			(typeof source.providerCleanupUncertain !== "object" ||
+				source.providerCleanupUncertain.taskId === input.taskId ||
+				typeof source.providerCleanupUncertain.taskId !== "string")
+		)
+			return refusal("provider_cleanup_uncertain");
+		if (
+			source.retryState &&
+			(typeof source.retryState !== "object" ||
+				source.retryState.taskId === input.taskId ||
+				typeof source.retryState.taskId !== "string")
+		)
+			return refusal("retry_state_unresolved");
+		if (sourceTaskRetry(source, input.taskId))
+			return refusal("retry_state_unresolved");
+		const allocations = sourceTaskAllocation(source, input.taskId);
+		if (allocations.some((entry) => entry?.state !== "result_recorded"))
+			return refusal("provider_allocation_unresolved");
+		try {
+			if (
+				await isProjectLockOwnedBy(
+					resolve(input.projectPath),
+					input.sourceOwner.runId,
+				)
+			)
+				return refusal("project_lock_still_owned");
+		} catch {
+			return refusal("project_lock_state_unknown");
+		}
+		const markdown = readFileSync(input.tasksFilePath, "utf8");
+		const taskBytes = taskContractBytes(markdown, input.taskId);
+		if (!taskBytes) return refusal("unknown_task");
+		if (hashBytes(taskBytes) !== input.contractHash)
+			return refusal("contract_hash_mismatch");
+		if (
+			source.taskContracts?.[input.taskId] !== undefined &&
+			source.taskContracts[input.taskId] !== input.contractHash
+		)
+			return refusal("contract_hash_mismatch");
+		const tasks = parseTaskQueue(markdown);
+		const task = tasks.find((candidate) => candidate.id === input.taskId);
+		if (!task) return refusal("unknown_task");
+		if (
+			!Array.isArray(task.requiredPaths) ||
+			!validateExactPathSet(task.requiredPaths, input.requiredPaths).ok
+		)
+			return refusal("path_scope_mismatch");
+		if (
+			(input.resolvedExternalBlockers ?? []).some(
+				(blocker) => !(task.externalBlockers ?? []).includes(blocker),
+			)
+		)
+			return refusal("external_blocker_not_declared");
+		const ancestry = validateIntegratedCommitAncestry(
+			input.projectPath,
+			input.integratedCommit,
+		);
+		if (!ancestry.ok) return refusal(ancestry.reasonCode);
+		const commitPaths = validateIntegratedCommitPaths(
+			input.projectPath,
+			input.integratedCommit,
+			input.changedPaths,
+		);
+		if (!commitPaths.ok) return refusal(commitPaths.reasonCode);
+		if (!validateExactPathSet(input.changedPaths, input.requiredPaths).ok)
+			return refusal("path_scope_mismatch");
+		const overlap = validateNoTrackedPathOverlap(
+			input.projectPath,
+			input.changedPaths,
+		);
+		if (!overlap.ok) return refusal(overlap.reasonCode);
+		const options = normalizeReconciliationRunOptions(input);
+		const queueIdentity = createQueueIdentity({
+			tasksFilePath: input.tasksFilePath,
+			markdown,
+			tasks,
+			projectRevision: ancestry.currentHead,
+			runOptions: options,
+		});
+		const reconciliationId = hashBytes(
+			stableStringify({
+				version: RECONCILIATION_INTENT_VERSION,
+				taskId: input.taskId,
+				attempt: input.attempt,
+				sourceCheckpointPath: resolve(input.sourceCheckpointPath),
+				sourceRevision: input.sourceRevision,
+				sourceOwner: input.sourceOwner,
+				contractHash: input.contractHash,
+				receiptPath: resolve(input.receiptPath),
+				integratedCommit: input.integratedCommit,
+				changedPaths: sortedUnique(input.changedPaths),
+				requiredPaths: sortedUnique(input.requiredPaths),
+				resolvedExternalBlockers: sortedUnique(
+					input.resolvedExternalBlockers ?? [],
+				),
+				queueIdentity,
+				runOptions: options,
+				runStorePath: reconciliationRunStorePath(input),
+			}),
+		);
+		if (input.reconciliationId && input.reconciliationId !== reconciliationId)
+			return refusal("reconciliation_id_mismatch");
+		const existingSuccessor = readSuccessorRecord(
+			input.successorCheckpointPath,
+		);
+		if (existingSuccessor.error) return refusal(existingSuccessor.error);
+		if (existingSuccessor.exists) {
+			const completion = existingSuccessor.value?.externalCompletion;
+			const identityMatches =
+				completion?.version === EXTERNAL_COMPLETION_VERSION &&
+				completion.reconciliationId === reconciliationId &&
+				completion.sourceCheckpointPath ===
+					resolve(input.sourceCheckpointPath) &&
+				completion.sourceRevision === input.sourceRevision &&
+				completion.attempt === input.attempt &&
+				stableStringify(completion.sourceOwner) ===
+					stableStringify(input.sourceOwner) &&
+				completion.integratedCommit === input.integratedCommit &&
+				completion.contractHash === input.contractHash &&
+				stableStringify(completion.changedPaths) ===
+					stableStringify(sortedUnique(input.changedPaths)) &&
+				stableStringify(completion.requiredPaths) ===
+					stableStringify(sortedUnique(input.requiredPaths)) &&
+				stableStringify(completion.resolvedExternalBlockers ?? []) ===
+					stableStringify(sortedUnique(input.resolvedExternalBlockers ?? [])) &&
+				completion.providerSuccess === false &&
+				existingSuccessor.value.queueIdentity === queueIdentity;
+			if (!identityMatches) return refusal("successor_checkpoint_conflict");
+			let ledger;
+			try {
+				ledger = await readLedgerFromStore(reconciliationRunStorePath(input));
+			} catch {
+				return refusal("ledger_state_unknown");
+			}
+			const recorded = ledger.find(
+				(entry) =>
+					entry?.recordType === "external_completion" &&
+					entry.reconciliationId === reconciliationId,
+			);
+			if (!recorded) return refusal("successor_without_ledger");
+			if (
+				recorded.taskId !== input.taskId ||
+				recorded.attempt !== input.attempt ||
+				recorded.sourceRevision !== input.sourceRevision ||
+				recorded.integratedCommit !== input.integratedCommit ||
+				recorded.contractHash !== input.contractHash ||
+				recorded.providerSuccess !== false ||
+				recorded.result !== "external_completion_recorded"
+			)
+				return refusal("ledger_reconciliation_mismatch");
+			return {
+				recorded: true,
+				status: "already-recorded",
+				result: "external_completion_recorded",
+				reconciliationId,
+				successorCheckpointPath: resolve(input.successorCheckpointPath),
+				providerSuccess: false,
+			};
+		}
+		const successor = buildSuccessorCheckpoint(
+			source,
+			input,
+			queueIdentity,
+			options,
+			reconciliationId,
+		);
+		const ledgerFields = {
+			reconciliationId,
+			taskId: input.taskId,
+			attempt: input.attempt,
+			sourceRevision: input.sourceRevision,
+			integratedCommit: input.integratedCommit,
+			contractHash: input.contractHash,
+		};
+		const intent = {
+			version: RECONCILIATION_INTENT_VERSION,
+			state: "prepared",
+			reconciliationId,
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			source: {
+				checkpointPath: resolve(input.sourceCheckpointPath),
+				owner: structuredClone(input.sourceOwner),
+				revision: input.sourceRevision,
+				taskId: input.taskId,
+				attempt: input.attempt,
+				tasksFilePath: resolve(input.tasksFilePath),
+				rawSha256: hashBytes(sourceRaw),
+			},
+			immutable: {
+				projectPath: resolve(input.projectPath),
+				receiptPath: resolve(input.receiptPath),
+				contractHash: input.contractHash,
+				integratedCommit: input.integratedCommit,
+				currentHead: ancestry.currentHead,
+				changedPaths: sortedUnique(input.changedPaths),
+				requiredPaths: sortedUnique(input.requiredPaths),
+				queueIdentity,
+				runOptions: options,
+				runStorePath: reconciliationRunStorePath(input),
+				resolvedExternalBlockers: sortedUnique(
+					input.resolvedExternalBlockers ?? [],
+				),
+			},
+			successor: {
+				checkpointPath: resolve(input.successorCheckpointPath),
+				checkpoint: successor,
+			},
+			ledger: {
+				runStorePath: reconciliationRunStorePath(input),
+				fields: ledgerFields,
+			},
+		};
+		if (
+			readFileSync(input.sourceCheckpointPath, "utf8") !== sourceRaw ||
+			readFileSync(sourceLease.lockPath, "utf8") !== sourceLease.body
+		)
+			return refusal("source_checkpoint_lock_displaced");
+		if (input.__testFault === "before_intent")
+			throw new Error("injected reconciliation crash before intent");
+		writeIntent(intentPath, intent);
+		intentPrepared = true;
+		if (input.__testFault === "after_intent")
+			throw new Error("injected reconciliation crash after intent");
+		return await replayReconciliationIntent(
+			intent,
+			intentPath,
+			input,
+			sourceLease,
+		);
+	} catch (error) {
+		if (error?.code === "RECONCILIATION_LEDGER_MISMATCH")
+			return refusal("ledger_reconciliation_mismatch");
+		if (error?.code === "EEXIST")
+			return refusal("successor_checkpoint_conflict");
+		if (error?.message?.startsWith("injected reconciliation crash"))
+			throw error;
+		return refusal(
+			"reconciliation_persistence_failed",
+			error?.code ?? "unknown",
+		);
+	} finally {
+		if (sourceLease) {
+			try {
+				releaseCheckpointLease(sourceLease);
+			} catch {
+				console.error(
+					intentPrepared
+						? "switchyard: source checkpoint lease release failed; durable reconciliation intent retained"
+						: "switchyard: source checkpoint lease release failed",
+				);
+			}
+		}
+	}
 }
 
 export function computeQueueIdentityFromFile(

@@ -9,15 +9,17 @@ import {
 	rejects,
 	strictEqual,
 } from "node:assert";
-import { execSync, spawnSync } from "node:child_process";
+import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 
@@ -107,6 +109,7 @@ import {
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
+	parseReconcileCompletionArgs,
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,
@@ -140,6 +143,23 @@ function runDispatch(args, env = {}, timeout = 10_000) {
 		timeout,
 		env: { ...process.env, ...env },
 	});
+}
+
+function reconcileCompletionArgs(receiptPath) {
+	return [
+		"reconcile-completion",
+		"--receipt",
+		receiptPath,
+		"--source-checkpoint",
+		join(dir, "source.checkpoint.json"),
+		"--successor-checkpoint",
+		join(dir, "successor.checkpoint.json"),
+		"--tasks",
+		tasksFile,
+		"--project",
+		projectDir,
+		"--json",
+	];
 }
 
 async function captureLaunchJson(args, dependencies = {}) {
@@ -442,6 +462,76 @@ describe("parseDispatchArgs (backwards compat)", () => {
 			})().includes("not a git repository"),
 			true,
 		);
+	});
+});
+
+describe("external completion CLI", () => {
+	it("parses the bounded reconciliation command and preserves JSON mode", () => {
+		const parsed = parseReconcileCompletionArgs([
+			"--receipt",
+			"receipt.json",
+			"--source-checkpoint",
+			"source.json",
+			"--successor-checkpoint",
+			"successor.json",
+			"--tasks",
+			"tasks.md",
+			"--project",
+			"project",
+			"--json",
+		]);
+		strictEqual(parsed.json, true);
+		strictEqual(parsed.receiptPath.endsWith("/receipt.json"), true);
+		strictEqual(parsed.sourceCheckpointPath.endsWith("/source.json"), true);
+		strictEqual(
+			parsed.successorCheckpointPath.endsWith("/successor.json"),
+			true,
+		);
+	});
+
+	it("supports help without requiring a receipt", () => {
+		deepStrictEqual(parseReconcileCompletionArgs(["--help"]), { help: true });
+	});
+
+	it("rejects a FIFO without opening it or hanging the CLI", () => {
+		const fifo = join(dir, "receipt.fifo");
+		execFileSync("mkfifo", [fifo]);
+		const started = Date.now();
+		const result = runDispatch(reconcileCompletionArgs(fifo), {}, 2_000);
+		ok(Date.now() - started < 1_500, "receipt trust gate must be bounded");
+		strictEqual(result.error, undefined, result.error?.message);
+		strictEqual(result.status, 1);
+		strictEqual(JSON.parse(result.stdout).reasonCode, "receipt_not_regular");
+	});
+
+	it("rejects a symlinked receipt before following its target", () => {
+		const fifo = join(dir, "receipt-target.fifo");
+		const symlink = join(dir, "receipt-link.json");
+		execFileSync("mkfifo", [fifo]);
+		symlinkSync(fifo, symlink);
+		const started = Date.now();
+		const result = runDispatch(reconcileCompletionArgs(symlink), {}, 2_000);
+		ok(Date.now() - started < 1_500, "symlink trust gate must be bounded");
+		strictEqual(result.error, undefined, result.error?.message);
+		strictEqual(result.status, 1);
+		strictEqual(JSON.parse(result.stdout).reasonCode, "receipt_not_regular");
+	});
+
+	it("rejects an oversized receipt without reading its content", () => {
+		const oversized = join(dir, "receipt-oversized.json");
+		writeFileSync(
+			oversized,
+			Buffer.concat([
+				Buffer.from("SECRET_CANARY_OVERSIZED_RECEIPT"),
+				Buffer.alloc(1024 * 1024 + 1, 0x41),
+			]),
+		);
+		chmodSync(oversized, 0o600);
+		const result = runDispatch(reconcileCompletionArgs(oversized), {}, 2_000);
+		strictEqual(result.error, undefined, result.error?.message);
+		strictEqual(result.status, 1);
+		strictEqual(JSON.parse(result.stdout).reasonCode, "receipt_too_large");
+		ok(!result.stdout.includes("SECRET_CANARY_OVERSIZED_RECEIPT"));
 	});
 });
 

@@ -4,11 +4,14 @@
 import { createHash } from "node:crypto";
 import {
 	appendFileSync,
+	closeSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
 	rmSync,
 	statSync,
+	unlinkSync,
 } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
@@ -360,6 +363,106 @@ export async function recordDispatchToStore(data, runStorePath) {
 	const path = resolveLedgerPath(runStorePath);
 	rotateLedgerIfNeeded(path);
 	await appendFile(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+}
+
+/**
+ * Record a host-verified completion of work performed outside Switchyard.
+ * This is deliberately separate from provider dispatch records: it never
+ * claims provider success and accepts only bounded, already-sanitized fields.
+ * @param {object} data
+ * @param {string} runStorePath
+ * @returns {Promise<void>}
+ */
+export async function recordExternalCompletionToStore(data, runStorePath) {
+	assertGenerationAllowed();
+	const dir = resolveLedgerDir(runStorePath);
+	await mkdir(dir, { recursive: true });
+	const fields = {
+		reconciliationId: data?.reconciliationId,
+		taskId: data?.taskId,
+		...(data?.attempt === undefined ? {} : { attempt: data.attempt }),
+		sourceRevision: data?.sourceRevision,
+		integratedCommit: data?.integratedCommit,
+		contractHash: data?.contractHash,
+		providerSuccess: false,
+		result: "external_completion_recorded",
+	};
+	if (
+		Object.values(fields).some(
+			(value) => (value === undefined || value === null) && value !== false,
+		)
+	)
+		throw new Error("external completion ledger entry is incomplete");
+	if (
+		!/^[a-f0-9]{64}$/i.test(fields.reconciliationId) ||
+		typeof fields.taskId !== "string" ||
+		fields.taskId.length === 0 ||
+		!Number.isSafeInteger(fields.sourceRevision) ||
+		(fields.attempt !== undefined &&
+			(!Number.isSafeInteger(fields.attempt) || fields.attempt < 1)) ||
+		!/^[a-f0-9]{40,64}$/i.test(fields.integratedCommit) ||
+		!/^[a-f0-9]{64}$/i.test(fields.contractHash)
+	)
+		throw new Error("external completion ledger entry is malformed");
+	const path = resolveLedgerPath(runStorePath);
+	const lockPath = `${path}.external-completion.lock`;
+	let fd;
+	let result;
+	let cleanupError;
+	try {
+		fd = openSync(lockPath, "wx", 0o600);
+		const entries = await readLedgerFromStore(runStorePath);
+		const existing = entries.find(
+			(entry) =>
+				entry?.recordType === "external_completion" &&
+				entry.reconciliationId === fields.reconciliationId,
+		);
+		if (existing) {
+			const comparable = [
+				"reconciliationId",
+				"taskId",
+				"attempt",
+				"sourceRevision",
+				"integratedCommit",
+				"contractHash",
+				"providerSuccess",
+				"result",
+			].every((key) => existing[key] === fields[key]);
+			if (!comparable) {
+				const error = new Error(
+					"external completion ledger reconciliation ID mismatch",
+				);
+				error.code = "RECONCILIATION_LEDGER_MISMATCH";
+				throw error;
+			}
+			result = { recorded: true, alreadyRecorded: true, entry: existing };
+		} else {
+			rotateLedgerIfNeeded(path);
+			const entry = {
+				timestamp: new Date().toISOString(),
+				host: hostname(),
+				storeBacked: true,
+				recordType: "external_completion",
+				...fields,
+			};
+			appendFileSync(path, `${JSON.stringify(entry)}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
+			result = { recorded: true, alreadyRecorded: false, entry };
+		}
+	} finally {
+		if (fd !== undefined) {
+			closeSync(fd);
+			try {
+				unlinkSync(lockPath);
+			} catch (error) {
+				if (error?.code !== "ENOENT") cleanupError = error;
+			}
+		}
+	}
+	if (cleanupError) throw cleanupError;
+	return result;
 }
 
 /**
