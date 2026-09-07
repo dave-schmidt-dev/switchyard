@@ -41,6 +41,7 @@ import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const ADAPTER_DIR = join(REPO_ROOT, "src", "switchyard", "adapter");
+const README_PATH = join(REPO_ROOT, "README.md");
 const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
 
 /**
@@ -352,6 +353,22 @@ describe("harness registry drift (Task 1.6b)", () => {
 			descriptor.descriptor_identity !==
 				getInvocationDescriptor("vibe", "standard")?.descriptor_identity,
 			"the two GLM thinking levels must not share a descriptor identity",
+		);
+	});
+
+	it("README keeps the 2026-09-01 Vibe receipt historical and the 2026-09-04 GLM receipts current", () => {
+		const readme = readFileSync(README_PATH, "utf8");
+		ok(
+			readme.includes(
+				"**Historical context (2026-09-01):** a Vibe canary qualified `mistral-medium-3.5` at `standard`",
+			),
+			"README must identify the 2026-09-01 mistral-medium-3.5 receipt as historical context",
+		);
+		ok(
+			readme.includes(
+				"The 2026-09-01 Vibe `mistral-medium-3.5` receipt is historical only; the current Vibe admission receipts are the 2026-09-04 promoted GLM-5.2 `low` and `standard` receipts",
+			),
+			"README must identify the promoted 2026-09-04 GLM-5.2 low and standard receipts as current",
 		);
 	});
 
