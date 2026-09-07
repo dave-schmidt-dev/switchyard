@@ -1506,6 +1506,39 @@ describe("synchronous run JSON envelope", () => {
 		deepStrictEqual(envelope.terminalSummary.deferredTaskIds, ["1.1"]);
 	});
 
+	it("projects battery deferral with the next task and diagnostic", async () => {
+		const { envelope, exitCode } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				runQueue: async () => ({
+					totalTasks: 1,
+					runnableTasks: 1,
+					processedTasks: 0,
+					completedTaskIds: [],
+					deferredTaskIds: ["1.1"],
+					policyDeferred: {
+						version: 1,
+						action: "policy_deferred",
+						direction: "advance_authorized_fallback",
+						reasonCode: "host_on_battery",
+						diagnosticCode: "host_on_battery",
+						nextTaskId: "1.1",
+						taskFileSha256: "a".repeat(64),
+					},
+					results: [],
+					checkpointPath: join(dir, "battery.checkpoint.json"),
+				}),
+			}),
+		);
+		strictEqual(exitCode, 6);
+		strictEqual(envelope.state, "deferred");
+		strictEqual(envelope.disposition.action, "policy_deferred");
+		strictEqual(envelope.disposition.direction, "advance_authorized_fallback");
+		strictEqual(envelope.disposition.diagnosticCode, "host_on_battery");
+		strictEqual(envelope.disposition.taskId, "1.1");
+		strictEqual(envelope.disposition.taskFileSha256, "a".repeat(64));
+	});
+
 	it("classifies an invalid golden image reference instead of throwing", async () => {
 		// An empty SWITCHYARD_PARALLELS_GOLDEN_IMAGE defeats the `??` default and
 		// makes the route-health epoch unbuildable. Before the health decision

@@ -1191,8 +1191,15 @@ async function runDispatch(opts, dependencies = {}) {
 								failedCount: null,
 							},
 					extraPatch: queueError?.preflightDetail
-						? { preflightDetail: queueError.preflightDetail }
-						: {},
+						? {
+								preflightDetail: queueError.preflightDetail,
+								...(result?.policyDeferred
+									? { policyDeferred: result.policyDeferred }
+									: {}),
+							}
+						: result?.policyDeferred
+							? { policyDeferred: result.policyDeferred }
+							: {},
 					cleanup: async () => {
 						if (projectLockOwned) {
 							await (

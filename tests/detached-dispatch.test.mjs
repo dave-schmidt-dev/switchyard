@@ -841,6 +841,112 @@ export async function resolve(specifier, context, nextResolve) {
 });
 
 describe("detached worker event ordering", () => {
+	it("persists the exact battery deferral through the real detached finalizer", async () => {
+		const { initializeRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = randomUUID();
+		const nonce = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["2.1"],
+			initialHostFingerprint: "git:no-head:unknown",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		const fakeRunnerPath = join(dir, "battery-fake-runner.mjs");
+		writeFileSync(
+			fakeRunnerPath,
+			`export class QueueCleanupError extends Error {}
+export async function runQueueAsync() {
+  return {
+    results: [],
+    totalTasks: 1,
+    runnableTasks: 1,
+    processedTasks: 0,
+    completedTaskIds: [],
+    deferredTaskIds: ["2.1"],
+    policyDeferred: {
+      version: 1,
+      action: "policy_deferred",
+      direction: "advance_authorized_fallback",
+      reasonCode: "host_on_battery",
+      diagnosticCode: "host_on_battery",
+      nextTaskId: "2.1",
+      taskFileSha256: "${"a".repeat(64)}"
+    }
+  };
+}
+`,
+			"utf8",
+		);
+		const loaderPath = join(dir, "battery-runner-loader.mjs");
+		writeFileSync(
+			loaderPath,
+			`const target = process.env.SWITCHYARD_TEST_RUNNER_URL;
+const replacement = process.env.SWITCHYARD_TEST_FAKE_RUNNER_URL;
+export async function resolve(specifier, context, nextResolve) {
+  const candidate = new URL(specifier, context.parentURL).href;
+  if (candidate === target) return { url: replacement, shortCircuit: true };
+  return nextResolve(specifier, context, nextResolve);
+}
+`,
+			"utf8",
+		);
+
+		const worker = spawnSync(
+			process.execPath,
+			[
+				"--experimental-loader",
+				pathToFileURL(loaderPath).href,
+				BOOTSTRAP_PATH,
+				"--state-root",
+				stateRoot,
+				"--run-id",
+				runId,
+				"--nonce",
+				nonce,
+			],
+			{
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+				timeout: 10_000,
+				env: {
+					...process.env,
+					...makeStateRootEnv(),
+					SWITCHYARD_TEST_RUNNER_URL: pathToFileURL(
+						resolve(__dirname, "../src/switchyard/runner/index.mjs"),
+					).href,
+					SWITCHYARD_TEST_FAKE_RUNNER_URL: pathToFileURL(fakeRunnerPath).href,
+				},
+			},
+		);
+
+		strictEqual(worker.status, 0, worker.stderr);
+		const run = await readRun(runId);
+		strictEqual(run.state, "deferred");
+		strictEqual(run.cleanupState, "complete");
+		deepStrictEqual(run.policyDeferred, {
+			version: 1,
+			action: "policy_deferred",
+			direction: "advance_authorized_fallback",
+			reasonCode: "host_on_battery",
+			diagnosticCode: "host_on_battery",
+			nextTaskId: "2.1",
+			taskFileSha256: "a".repeat(64),
+		});
+		const disposition = projectDisposition({ run });
+		strictEqual(disposition.action, "policy_deferred");
+		strictEqual(disposition.direction, "advance_authorized_fallback");
+		strictEqual(disposition.reasonCode, "host_on_battery");
+		strictEqual(disposition.diagnosticCode, "host_on_battery");
+		strictEqual(disposition.taskId, "2.1");
+		strictEqual(disposition.taskFileSha256, "a".repeat(64));
+	});
+
 	it("persists only stages reached before a real worker SIGTERM", async () => {
 		const { initializeRun, readEvents, readRun, resolveDiagnosticArtifact } =
 			await import("../src/switchyard/run-store/index.mjs");
@@ -2674,7 +2780,9 @@ describe("typed pre-provider failures on the detached terminal path", () => {
 				strictEqual(evidence.errorKind, testCase.errorKind);
 				strictEqual(evidence.failurePhase, testCase.failurePhase);
 				strictEqual(evidence.reasonCode, testCase.errorKind);
-				const durable = JSON.stringify(evidence);
+				const durable = JSON.stringify(evidence, (key, value) =>
+					key === "timestamp" ? undefined : value,
+				);
 				ok(!durable.includes("9.9"));
 				ok(!durable.includes("private-canary"));
 				ok(!durable.includes("/private/canary"));

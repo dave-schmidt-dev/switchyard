@@ -119,6 +119,28 @@ function targetDisposition({
 }
 
 describe("caller disposition precedence", () => {
+	it("projects battery policy deferral as an authorized fallback advance", () => {
+		const disposition = projectDisposition({
+			run: run({
+				state: "deferred",
+				cleanupState: "complete",
+				policyDeferred: {
+					action: "policy_deferred",
+					reasonCode: "host_on_battery",
+					nextTaskId: "2.1",
+					taskFileSha256: "a".repeat(64),
+				},
+			}),
+			liveness: "terminal_clean",
+		});
+		strictEqual(disposition.action, "policy_deferred");
+		strictEqual(disposition.direction, "advance_authorized_fallback");
+		strictEqual(disposition.reasonCode, "host_on_battery");
+		strictEqual(disposition.diagnosticCode, "host_on_battery");
+		strictEqual(disposition.taskId, "2.1");
+		strictEqual(disposition.taskFileSha256, "a".repeat(64));
+	});
+
 	it("projects clean deferred terminal work as deferred_work", () => {
 		const disposition = projectDisposition({
 			run: run({ state: "deferred", cleanupState: "complete" }),

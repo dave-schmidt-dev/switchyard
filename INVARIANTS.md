@@ -62,3 +62,17 @@ The shared liveness classifier is the only basis for automatic cleanup: `termina
 Every initialized run reaches a truthful terminal record on normal completion, clean deferral, handled exception, fatal handler, or dead-worker recovery. Terminal finalization is idempotent: a terminal success, deferred run, or failure cannot be overwritten by a later cleanup/lease error or fabricated second fatal classification. Terminal records carry sanitized failure evidence and, when applicable, `terminalizedBy: worker|dead_worker_recovery`; deferred runs carry no failure metadata, and fatal paths use `null` for unknown counts. Cleanup is persisted as pending before teardown, and teardown or ownership-release failure remains explicitly recovery-required rather than being recorded as complete. Caller envelopes preserve the bounded legacy disposition action and add `direction`, whose closed values are `repair_input`, `advance_authorized_fallback`, `recover_and_retry`, `retry_launch`, `wait`, `complete`, and `stop`. `baseDisposition` alone derives it as a pure total function of `(action, reasonCode, diagnosticCode)`; unknown tuples stop. `advance_authorized_fallback` is run-local evidence only and never authorizes, selects, or invokes a route. A terminal lock conflict carries no fresh holder classification and therefore exposes no blocking run or recovery command; only pre-initialization evidence may direct holder-aware waiting or recovery. Cleanup/recovery safety takes precedence, live run/retry progress is reported before ordinary terminal projections, and contract diagnostics remain repairable even when optional checkpoint evidence cannot be loaded; evidence is projected without prose or raw provider output, and insufficient evidence fails closed. Failed recovery claims are retried only with ownership revalidation, so a replacement project-lock owner cannot be deleted or clobbered, while recovery recognizes a legitimate newer owner as a handoff. Terminal summaries add only the closed outcomes `completed_work`, `no_runnable_work`, `deferred_work`, `failed_work`, `failed_before_work`, `recovered_dead_worker`, or `unknown_failure`.
 
 VM admission persists only closed categories: host permission or sandbox denial, storage/I/O failure, generic admission failure, and ordinary two-slot capacity remain distinct. Raw filesystem errors, paths, and host-derived messages never cross into durable diagnostics.
+
+Host-power supplement: the fixed `/usr/bin/pmset -g batt` probe is bounded and
+normalizes only `ac`, `battery`, or `unknown`. After the next task is selected
+but before VM admission, backend creation, cloning, provisioning, or seeding,
+`battery` produces a clean pending deferral with no provider attempt or managed
+resource. The same seam is sampled before every provider selection/reservation,
+including fallback reservation, so a power transition does not start another
+provider; in-flight work is not cancelled. Unknown probe results preserve the
+existing route. The durable disposition is version 1 `policy_deferred` with
+direction `advance_authorized_fallback`, reason/diagnostic `host_on_battery`,
+the exact next task ID, and the task-file SHA-256 bound to the captain manifest.
+The probe and activation seam are injectable for tests; production enforcement
+is default-on after the companion acceptance gate, with an explicit `false`
+dependency override retained for rollback.

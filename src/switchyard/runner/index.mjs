@@ -77,6 +77,7 @@ import {
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
 import { createBroker } from "../broker/index.mjs";
+import { HOST_POWER_STATES, readHostPower } from "../dispatch/host-power.mjs";
 import {
 	integrationGate,
 	validateExactPathSet,
@@ -5560,6 +5561,66 @@ function healthDeferredResult(
 	};
 }
 
+function policyDeferredTaskResult(task, power, taskFileSha256) {
+	return {
+		taskId: task.id,
+		success: false,
+		provider: null,
+		model: null,
+		result: "policy_deferred",
+		errorKind: null,
+		policyDeferred: {
+			version: 1,
+			action: "policy_deferred",
+			direction: "advance_authorized_fallback",
+			reasonCode: "host_on_battery",
+			diagnosticCode: power.diagnosticCode ?? "host_on_battery",
+			nextTaskId: task.id,
+			taskFileSha256,
+		},
+	};
+}
+
+function policyDeferredQueueResult(launch, checkpointPath) {
+	const { checkpoint, tasks, policyDeferred } = launch;
+	releaseCheckpointOwnership(checkpointPath, checkpoint);
+	return {
+		results: [],
+		totalTasks: tasks.length,
+		runnableTasks: policyDeferred.runnableTaskCount,
+		processedTasks: 0,
+		completedTaskIds: checkpoint.completedTaskIds,
+		deferredTaskIds: [policyDeferred.nextTaskId],
+		checkpointPath,
+		ledgerWritesSettled: Promise.resolve(),
+		quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+		retryState: checkpoint.retryState,
+		retryTransitionId: checkpoint.retryTransitionId,
+		policyDeferred,
+	};
+}
+
+function reportHostPowerUnknown(onStatus, taskId = null) {
+	onStatus?.({
+		phase: "policy",
+		event: "host_power_unknown",
+		status: "Host power state unknown; preserving existing routing",
+		diagnosticCode: "host_power_unknown",
+		...(typeof taskId === "string" ? { taskId } : {}),
+	});
+}
+
+function readQueueHostPower(options = {}) {
+	if (options.hostPowerPolicyEnabled !== true) {
+		return { state: HOST_POWER_STATES.AC, diagnosticCode: null };
+	}
+	const result = readHostPower(options);
+	if (result.state === HOST_POWER_STATES.UNKNOWN) {
+		reportHostPowerUnknown(options.onStatus, options.taskId);
+	}
+	return result;
+}
+
 export function isRouteHealthDeferredResult(result) {
 	return result?.result === "route_health_deferred";
 }
@@ -5630,6 +5691,17 @@ function executeTaskUnsafe(task, context) {
 	);
 	if (ignoredPath) {
 		return declaredPathNotSeededResult(task, requiredCapability);
+	}
+	const hostPower = readQueueHostPower({
+		hostPowerProbe: context.hostPowerProbe,
+		execFn: context.hostPowerExecFn,
+		timeoutMs: context.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: context.hostPowerPolicyEnabled,
+		onStatus: context.onStatus,
+		taskId: task.id,
+	});
+	if (hostPower.state === HOST_POWER_STATES.BATTERY) {
+		return policyDeferredTaskResult(task, hostPower, context.taskFileSha256);
 	}
 	const routeResult = context._completionPin
 		? structuredClone(context._completionPin.route)
@@ -6471,6 +6543,17 @@ async function executeTaskAsyncUnsafe(task, context) {
 	if (ignoredPath) {
 		return declaredPathNotSeededResult(task, requiredCapability);
 	}
+	const hostPower = readQueueHostPower({
+		hostPowerProbe: context.hostPowerProbe,
+		execFn: context.hostPowerExecFn,
+		timeoutMs: context.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: context.hostPowerPolicyEnabled,
+		onStatus: context.onStatus,
+		taskId: task.id,
+	});
+	if (hostPower.state === HOST_POWER_STATES.BATTERY) {
+		return policyDeferredTaskResult(task, hostPower, context.taskFileSha256);
+	}
 	let broker = context.broker;
 	if (!broker) {
 		broker = createDispatchBroker(context, context.brokerDependencies);
@@ -6747,6 +6830,22 @@ async function executeTaskAsyncUnsafe(task, context) {
 			fallbackCapability &&
 			context._activeRouteHealth?.claimStarted !== true
 		) {
+			const fallbackPower = readQueueHostPower({
+				hostPowerProbe: context.hostPowerProbe,
+				execFn: context.hostPowerExecFn,
+				timeoutMs: context.hostPowerProbeTimeoutMs,
+				hostPowerPolicyEnabled: context.hostPowerPolicyEnabled,
+				onStatus: context.onStatus,
+				taskId: task.id,
+			});
+			if (fallbackPower.state === HOST_POWER_STATES.BATTERY) {
+				await releaseSelected(selectedRoute);
+				return policyDeferredTaskResult(
+					task,
+					fallbackPower,
+					context.taskFileSha256,
+				);
+			}
 			context._activeBrokerRoute = selectedRoute;
 			const fallbackRoute = await broker.fallbackAndReserve(
 				brokerRequest,
@@ -7311,12 +7410,23 @@ export async function runQueueAsync(options) {
 		selectedPlatform,
 		tasks,
 		checkpoint,
+		taskFileSha256,
 		effectiveMaxTasks,
 		effectiveStopOnFailure,
 		effectiveExclude,
 		effectiveOnly,
 		effectiveTaskIds,
 	} = launch;
+	if (launch.policyDeferred) {
+		emitStatus?.({
+			phase: "policy",
+			event: "queue_deferred",
+			status: "Queue deferred while host is on battery power",
+			taskId: launch.policyDeferred.nextTaskId,
+			diagnosticCode: launch.policyDeferred.diagnosticCode,
+		});
+		return policyDeferredQueueResult(launch, checkpointPath);
+	}
 	ensureRetryCheckpoint(checkpoint);
 	ensureProviderAttemptAllocations(checkpoint);
 	const slotLease = await acquireQueueSlotAsync({
@@ -7411,6 +7521,7 @@ export async function runQueueAsync(options) {
 		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
 		checkpointPath,
+		taskFileSha256,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
 			checkpoint.taskBases[taskId] = base;
@@ -7422,6 +7533,10 @@ export async function runQueueAsync(options) {
 		onTaskRouted: dependencies.onTaskRouted ?? null,
 		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
 		checkIgnoredPath: dependencies.checkIgnoredPath,
+		hostPowerProbe: dependencies.hostPowerProbe,
+		hostPowerExecFn: dependencies.hostPowerExecFn,
+		hostPowerProbeTimeoutMs: dependencies.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: dependencies.hostPowerPolicyEnabled !== false,
 		exclude: mergeRetryExclusions(
 			effectiveExclude,
 			checkpoint.quarantinedTargetIds,
@@ -7441,6 +7556,7 @@ export async function runQueueAsync(options) {
 	};
 	const results = [];
 	const deferredTaskIds = [];
+	let policyDeferred = null;
 	// Retained only so a teardown failure can name the failure it displaces.
 	let inFlightError = null;
 	try {
@@ -7635,6 +7751,11 @@ export async function runQueueAsync(options) {
 				}
 			} else {
 				result = await executeTaskAsync(task, context);
+			}
+			if (result?.result === "policy_deferred") {
+				policyDeferred = result.policyDeferred;
+				deferredTaskIds.push(result.taskId);
+				break;
 			}
 			if (
 				!retryState &&
@@ -7863,6 +7984,7 @@ export async function runQueueAsync(options) {
 			processedTasks: processed,
 			completedTaskIds: checkpoint.completedTaskIds,
 			deferredTaskIds,
+			policyDeferred,
 			checkpointPath,
 			ledgerWritesSettled: Promise.resolve(),
 			quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
@@ -7947,6 +8069,17 @@ export async function executeTaskWithOrchestrator(task, context) {
 	);
 	if (ignoredPath) {
 		return declaredPathNotSeededResult(task, requiredCapability);
+	}
+	const hostPower = readQueueHostPower({
+		hostPowerProbe: context.hostPowerProbe,
+		execFn: context.hostPowerExecFn,
+		timeoutMs: context.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: context.hostPowerPolicyEnabled,
+		onStatus: context.onStatus,
+		taskId: task.id,
+	});
+	if (hostPower.state === HOST_POWER_STATES.BATTERY) {
+		return policyDeferredTaskResult(task, hostPower, context.taskFileSha256);
 	}
 	const routeResult = context.route({
 		requiredCapability,
@@ -9858,6 +9991,7 @@ function prepareQueueLaunch({
 	deferSlotAcquisition = false,
 }) {
 	const selectedPlatform = queuePlatform({ platform, runOptions });
+	const taskFileSha256 = hashBytes(readFileSync(tasksFilePath, "utf8"));
 	const tasks = loadTaskQueue(tasksFilePath);
 	validateProjectFileEntries(tasks, projectPath);
 	if (tasks.length === 0) {
@@ -9940,13 +10074,6 @@ function prepareQueueLaunch({
 	ensureProviderAttemptAllocations(checkpoint);
 	validateRetryDescriptorEvidence(checkpoint);
 	assertCheckpointRecoverySafe(checkpoint);
-	const queueBackend = createQueueBackend({
-		platform: selectedPlatform,
-		dependencies,
-		projectPath,
-		runId,
-		runOptions: identity.runOptions ?? runOptions,
-	});
 	let potentialAttemptTasks;
 	try {
 		potentialAttemptTasks = planPotentialAttemptTasks(tasks, checkpoint, {
@@ -9961,6 +10088,48 @@ function prepareQueueLaunch({
 		if (!(error instanceof TaskSelectionError)) throw error;
 		potentialAttemptTasks = [];
 	}
+	const hostPower = readQueueHostPower({
+		hostPowerProbe: dependencies.hostPowerProbe,
+		execFn: dependencies.hostPowerExecFn,
+		timeoutMs: dependencies.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: dependencies.hostPowerPolicyEnabled !== false,
+		onStatus,
+	});
+	if (
+		hostPower.state === HOST_POWER_STATES.BATTERY &&
+		potentialAttemptTasks.length > 0
+	) {
+		return {
+			selectedPlatform,
+			tasks,
+			checkpoint,
+			identity,
+			queueBackend: null,
+			slotLease: null,
+			effectiveMaxTasks,
+			effectiveStopOnFailure,
+			effectiveExclude,
+			effectiveOnly,
+			effectiveTaskIds,
+			policyDeferred: {
+				version: 1,
+				action: "policy_deferred",
+				direction: "advance_authorized_fallback",
+				reasonCode: "host_on_battery",
+				diagnosticCode: "host_on_battery",
+				nextTaskId: potentialAttemptTasks[0].id,
+				taskFileSha256,
+				runnableTaskCount: potentialAttemptTasks.length,
+			},
+		};
+	}
+	const queueBackend = createQueueBackend({
+		platform: selectedPlatform,
+		dependencies,
+		projectPath,
+		runId,
+		runOptions: identity.runOptions ?? runOptions,
+	});
 	queueBackend.preflight({
 		platform: selectedPlatform,
 		tasks,
@@ -9992,6 +10161,7 @@ function prepareQueueLaunch({
 		selectedPlatform,
 		tasks,
 		checkpoint,
+		taskFileSha256,
 		identity,
 		queueBackend,
 		slotLease,
@@ -10203,6 +10373,7 @@ export function runQueue(options) {
 		slotLease,
 		tasks,
 		checkpoint,
+		taskFileSha256,
 		identity,
 		effectiveMaxTasks,
 		effectiveStopOnFailure,
@@ -10210,6 +10381,16 @@ export function runQueue(options) {
 		effectiveOnly,
 		effectiveTaskIds,
 	} = launch;
+	if (launch.policyDeferred) {
+		emitStatus?.({
+			phase: "policy",
+			event: "queue_deferred",
+			status: "Queue deferred while host is on battery power",
+			taskId: launch.policyDeferred.nextTaskId,
+			diagnosticCode: launch.policyDeferred.diagnosticCode,
+		});
+		return policyDeferredQueueResult(launch, checkpointPath);
+	}
 	ensureProviderAttemptAllocations(checkpoint);
 
 	let workingContainerName = suppliedWorkingContainerName;
@@ -10349,6 +10530,7 @@ export function runQueue(options) {
 		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
 		checkpointPath,
+		taskFileSha256,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
@@ -10363,6 +10545,10 @@ export function runQueue(options) {
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
 		resolveDescriptor: dependencies.resolveDescriptor,
 		checkIgnoredPath: dependencies.checkIgnoredPath,
+		hostPowerProbe: dependencies.hostPowerProbe,
+		hostPowerExecFn: dependencies.hostPowerExecFn,
+		hostPowerProbeTimeoutMs: dependencies.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: dependencies.hostPowerPolicyEnabled !== false,
 		completionContinuation: dependencies.completionContinuation ?? {
 			enabled: false,
 		},
@@ -10427,6 +10613,7 @@ export function runQueue(options) {
 		const attemptedTaskIds = new Set();
 		const results = [];
 		const deferredTaskIds = [];
+		let policyDeferred = null;
 		reconcileAlreadyCompleteSelection(
 			checkpoint,
 			checkpointPath,
@@ -10731,6 +10918,11 @@ export function runQueue(options) {
 					descriptorReceiptFields(context._activeInvocationDescriptor),
 				);
 			}
+			if (result?.result === "policy_deferred") {
+				deferredTaskIds.push(result.taskId);
+				policyDeferred = result.policyDeferred;
+				break;
+			}
 			if (isRouteHealthDeferredResult(result)) {
 				deferredTaskIds.push(result.taskId);
 				reportRouteHealthDeferred(result, onResult, emitStatus);
@@ -11008,6 +11200,7 @@ export function runQueue(options) {
 				},
 				terminalizedBy: "worker",
 				...(lastFailure ? { lastFailure } : {}),
+				...(policyDeferred ? { policyDeferred } : {}),
 			};
 			let writePromise;
 			try {
@@ -11054,6 +11247,7 @@ export function runQueue(options) {
 					}
 				: {}),
 			results,
+			...(policyDeferred ? { policyDeferred } : {}),
 		};
 	} finally {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();
@@ -11168,6 +11362,7 @@ export async function runQueueWithOrchestrator(options) {
 		slotLease,
 		tasks,
 		checkpoint,
+		taskFileSha256,
 		identity,
 		effectiveMaxTasks,
 		effectiveStopOnFailure,
@@ -11175,6 +11370,16 @@ export async function runQueueWithOrchestrator(options) {
 		effectiveOnly,
 		effectiveTaskIds,
 	} = launch;
+	if (launch.policyDeferred) {
+		emitStatus?.({
+			phase: "policy",
+			event: "queue_deferred",
+			status: "Queue deferred while host is on battery power",
+			taskId: launch.policyDeferred.nextTaskId,
+			diagnosticCode: launch.policyDeferred.diagnosticCode,
+		});
+		return policyDeferredQueueResult(launch, checkpointPath);
+	}
 	ensureProviderAttemptAllocations(checkpoint);
 
 	let workingContainerName = suppliedWorkingContainerName;
@@ -11267,6 +11472,7 @@ export async function runQueueWithOrchestrator(options) {
 		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
 		checkpointPath,
+		taskFileSha256,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		taskBases: checkpoint.taskBases,
 		persistTaskBase: (taskId, base) => {
@@ -11285,6 +11491,10 @@ export async function runQueueWithOrchestrator(options) {
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
 		resolveDescriptor: dependencies.resolveDescriptor,
 		checkIgnoredPath: dependencies.checkIgnoredPath,
+		hostPowerProbe: dependencies.hostPowerProbe,
+		hostPowerExecFn: dependencies.hostPowerExecFn,
+		hostPowerProbeTimeoutMs: dependencies.hostPowerProbeTimeoutMs,
+		hostPowerPolicyEnabled: dependencies.hostPowerPolicyEnabled !== false,
 		completionContinuation: dependencies.completionContinuation ?? {
 			enabled: false,
 		},
@@ -11331,6 +11541,7 @@ export async function runQueueWithOrchestrator(options) {
 		const attemptedTaskIds = new Set();
 		const results = [];
 		const deferredTaskIds = [];
+		let policyDeferred = null;
 		reconcileAlreadyCompleteSelection(
 			checkpoint,
 			checkpointPath,
@@ -11395,6 +11606,11 @@ export async function runQueueWithOrchestrator(options) {
 					result,
 					descriptorReceiptFields(context._activeInvocationDescriptor),
 				);
+			}
+			if (result?.result === "policy_deferred") {
+				deferredTaskIds.push(result.taskId);
+				policyDeferred = result.policyDeferred;
+				break;
 			}
 
 			if (isRouteHealthDeferredResult(result)) {
@@ -11586,6 +11802,7 @@ export async function runQueueWithOrchestrator(options) {
 				},
 				terminalizedBy: "worker",
 				...(lastFailure ? { lastFailure } : {}),
+				...(policyDeferred ? { policyDeferred } : {}),
 			};
 			try {
 				await runStore.updateRun(terminalProjection);
@@ -11627,6 +11844,7 @@ export async function runQueueWithOrchestrator(options) {
 					}
 				: {}),
 			results,
+			...(policyDeferred ? { policyDeferred } : {}),
 		};
 	} finally {
 		if (uninstallSignalCleanup) uninstallSignalCleanup();

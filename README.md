@@ -765,7 +765,7 @@ Before running, `launch` records the worker's launch nonce and the project's cur
 The disposition schema is additive and closed:
 
 ```json
-{"disposition":{"version":1,"action":"monitor|defer|recover|repair_contract|target_failed|complete|stop","direction":"repair_input|advance_authorized_fallback|recover_and_retry|retry_launch|wait|complete|stop","reasonCode":"closed_code","diagnosticCode":null,"taskId":null,"blockingRunId":null,"recoveryCommand":null,"failedTargetIds":[],"failedTargetIdsTruncated":false}}
+{"disposition":{"version":1,"action":"monitor|defer|policy_deferred|recover|repair_contract|target_failed|complete|stop","direction":"repair_input|advance_authorized_fallback|recover_and_retry|retry_launch|wait|complete|stop","reasonCode":"closed_code","diagnosticCode":null,"taskId":null,"blockingRunId":null,"recoveryCommand":null,"failedTargetIds":[],"failedTargetIdsTruncated":false}}
 ```
 
 `direction` is a pure total function of `(action, reasonCode, diagnosticCode)` in `baseDisposition`; an unenumerated tuple returns `stop`.
@@ -773,7 +773,7 @@ The disposition schema is additive and closed:
 | Closed direction | Exact mapping |
 |---|---|
 | `repair_input` | Contract repair, or a target failure classified as required/undeclared/empty/no-op/seed/manifest/patch/conflict input evidence. |
-| `advance_authorized_fallback` | A target failure classified as provider execution, exhaustion, cleanup, or diff-capture failure. This is run-local evidence only: it does not claim capacity exhaustion, authorize or select a route, or invoke a fallback. |
+| `advance_authorized_fallback` | A target failure classified as provider execution, exhaustion, cleanup, or diff-capture failure, or a battery-policy deferral carrying the exact next task ID. This is run-local evidence only: it does not claim capacity exhaustion, authorize or select a route, or invoke a fallback. |
 | `recover_and_retry` | Legacy `recover` with a state-root-bound recovery command; after recovery the caller re-enters normal preflight. |
 | `retry_launch` | A terminal lock diagnostic without fresh holder classification; rerun normal launch preflight without acting on a stored holder identity. |
 | `wait` | Legacy `monitor` or holder-aware pre-initialization `defer`. |
@@ -851,6 +851,24 @@ launchctl kickstart gui/$(id -u)/com.zerodelta.switchyard.reaper   # run once no
 ```
 
 `ops/switchyard-reaper.sh` inventories only matching `switchyard-work-<runId>-<creatorPid>` names with a bounded `prlctl list -a` probe: TERM at three seconds, KILL after one fixed settlement second, a one-MiB output limit, and at most 256 parsed rows. Process-group supervision uses an existing GNU `timeout` resolved only from fixed absolute Homebrew/local paths; a missing or incompatible utility makes inventory unavailable before `prlctl` runs. It logs content-free start, timeout/failure/truncation, and successful-completion stages; a limited result is never called complete. Each candidate diagnostic says ownership is unverified and no resource was changed; it never probes creator-PID liveness, reads run records or sidecars, stops a VM, or deletes one. That limit is deliberate: a background launchd agent cannot read the project tree under `~/Documents` without a Full Disk Access grant (macOS TCC), so the installer copies the script to `~/Library/Application Support/switchyard/` and it needs **no privilege grant** to run. Definitive cleanup remains guarded pre-dispatch or explicit recovery work with access to the authoritative run records. Legacy, missing, or unknown ownership evidence remains blocked as `recovery_evidence_missing`; unknown guest process birth identity also supplies no authority to signal a guest PID. Its hardcoded `WORKING_PREFIX` is kept in sync with `PARALLELS_WORKING_PREFIX` in `src/switchyard/lifecycle/parallels-execution-backend.mjs` by `tests/reaper-script.test.mjs`. Installing the changed copy is a separate operation: until that copied script is verified, an already-installed hourly job has its previous behavior.
+
+### Host power policy
+
+Before macOS VM admission or working-VM creation, the runner samples the fixed
+`/usr/bin/pmset -g batt` probe after identifying the next queue task. A battery
+result defers that task with zero provider attempts and zero managed resources;
+the checkpoint remains pending and the terminal disposition is the versioned
+`policy_deferred / advance_authorized_fallback` envelope with diagnostic
+`host_on_battery`, the exact next task ID, and the task-file SHA-256 bound to the
+captain authorization manifest. The same bounded probe runs before
+each provider selection or reservation, including a quota fallback reservation,
+so a transition to battery does not launch another provider. AC continues the
+existing path. Probe failure or unrecognized output is `host_power_unknown` and
+does not alter routing. In-flight work is never cancelled. The probe and the
+activation decision are injectable seams (`dependencies.hostPowerProbe` plus
+`dependencies.hostPowerPolicyEnabled: false` to disable). Production macOS
+dispatch enables the policy by default; the accepted captain companion validates
+the disposition digest and bypasses every headless route before allocation.
 
 ### Environment Variables
 

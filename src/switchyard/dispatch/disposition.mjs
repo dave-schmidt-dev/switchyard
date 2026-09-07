@@ -40,6 +40,7 @@ const PRE_INITIALIZATION_CONTRACT_CODES = new Set([
 ]);
 const RUN_ID_RE = /^[\w-]+$/;
 const TASK_ID_RE = /^\d+(?:\.\d+)*$/;
+const SHA256_RE = /^[a-f0-9]{64}$/;
 const MAX_TASK_ID_LENGTH = 64;
 const CONTRACT_FAILURE_KINDS = new Set([
 	"no_provider",
@@ -114,6 +115,8 @@ function baseDisposition(action, reasonCode, failure = null) {
 		direction = "complete";
 	} else if (action === "monitor" || action === "defer") {
 		direction = "wait";
+	} else if (action === "policy_deferred") {
+		direction = "advance_authorized_fallback";
 	} else if (action === "recover") {
 		direction = "recover_and_retry";
 	} else if (action === "repair_contract") {
@@ -382,6 +385,19 @@ export function projectDisposition({
 		return baseDisposition("complete", "run_succeeded", failure);
 	}
 	if (run?.state === "deferred" && run?.cleanupState === "complete") {
+		if (
+			run.policyDeferred?.action === "policy_deferred" &&
+			run.policyDeferred?.reasonCode === "host_on_battery" &&
+			isSafeTaskId(run.policyDeferred.nextTaskId) &&
+			SHA256_RE.test(run.policyDeferred.taskFileSha256 ?? "")
+		) {
+			const result = baseDisposition("policy_deferred", "host_on_battery", {
+				diagnosticCode: "host_on_battery",
+			});
+			result.taskId = run.policyDeferred.nextTaskId;
+			result.taskFileSha256 = run.policyDeferred.taskFileSha256;
+			return result;
+		}
 		return baseDisposition("defer", "deferred_work", null);
 	}
 	if (!terminal && LIVE_STATES.has(liveness)) {

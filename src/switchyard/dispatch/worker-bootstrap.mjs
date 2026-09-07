@@ -943,13 +943,17 @@ export async function runWorkerBootstrap(argv = process.argv) {
 							: "succeeded",
 				failure: sanitizeFailureMetadata(failed.at(-1) ?? {}),
 				terminalSummary,
-				extraPatch:
-					writeFailureCount > 0
+				extraPatch: {
+					...(result.policyDeferred
+						? { policyDeferred: result.policyDeferred }
+						: {}),
+					...(writeFailureCount > 0
 						? {
 								telemetryWriteFailures: writeFailureCount,
 								lastTelemetryWriteFailure: lastWriteFailure,
 							}
-						: {},
+						: {}),
+				},
 				cleanup: async () => {
 					await runStore.reconcileProjectLockClaims();
 					await runStore.releaseProjectLockIfOwnedBy(run.projectPath, runId);

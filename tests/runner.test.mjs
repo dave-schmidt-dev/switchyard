@@ -8,7 +8,7 @@ import {
 	throws,
 } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -30,6 +30,11 @@ import {
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	HOST_POWER_STATES,
+	normalizeHostPower,
+	probeHostPower,
+} from "../src/switchyard/dispatch/host-power.mjs";
 import { validateTaskStartTreeAsync } from "../src/switchyard/lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
@@ -846,6 +851,174 @@ afterEach(() => {
 	} catch {
 		// no-op
 	}
+});
+
+describe("host power queue policy", () => {
+	it("defers before backend creation when the next task starts on battery", async () => {
+		const tasksPath = writeTasksFile(`### Task 2.1: Battery deferred
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** bounded task
+`);
+		const checkpointPath = `${tasksPath}.battery.checkpoint.json`;
+		let backendCreated = 0;
+		let preflightCalled = 0;
+		let providerSelected = 0;
+		const result = await runQueueAsyncImpl({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			platform: "macos",
+			checkpointPath,
+			dependencies: {
+				hostPowerProbe: () => ({ state: HOST_POWER_STATES.BATTERY }),
+				backendFactory: () => {
+					backendCreated += 1;
+					throw new Error("backend must not be created on battery");
+				},
+				queuePreflight: () => {
+					preflightCalled += 1;
+				},
+				route: () => {
+					providerSelected += 1;
+					throw new Error("provider must not be selected on battery");
+				},
+			},
+		});
+		strictEqual(backendCreated, 0);
+		strictEqual(preflightCalled, 0);
+		strictEqual(providerSelected, 0);
+		strictEqual(result.processedTasks, 0);
+		deepStrictEqual(result.deferredTaskIds, ["2.1"]);
+		strictEqual(result.policyDeferred.nextTaskId, "2.1");
+		strictEqual(result.policyDeferred.diagnosticCode, "host_on_battery");
+		strictEqual(
+			result.policyDeferred.taskFileSha256,
+			createHash("sha256")
+				.update(readFileSync(tasksPath, "utf8"))
+				.digest("hex"),
+		);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		deepStrictEqual(checkpoint.completedTaskIds, []);
+		strictEqual(checkpoint.ownershipReleased, true);
+		deepStrictEqual(
+			getRunnableTasks(loadTaskQueue(tasksPath), checkpoint).map(
+				(task) => task.id,
+			),
+			["2.1"],
+		);
+	});
+
+	it("emits fixed unknown-power status while preserving provider routing", () => {
+		const statuses = [];
+		const routeCalls = [];
+		const result = executeTaskImpl(
+			{ id: "1.1", title: "task", description: "op" },
+			{
+				hostPowerPolicyEnabled: true,
+				hostPowerProbe: () => ({
+					state: HOST_POWER_STATES.UNKNOWN,
+					diagnosticCode: "untrusted-host-text-must-not-leak",
+				}),
+				onStatus: (event) => statuses.push(event),
+				route: (options) => {
+					routeCalls.push(options);
+					return {
+						provider: "codex",
+						model: "gpt-5.6-terra",
+						percentLeft: 50,
+						reason: "spread",
+					};
+				},
+				recordDispatch: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					codex: {
+						execute: () => ({ success: true, output: "ok" }),
+						captureDiff: () => null,
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+		strictEqual(result.taskId, "1.1");
+		strictEqual(routeCalls.length, 1);
+		deepStrictEqual(statuses, [
+			{
+				phase: "policy",
+				event: "host_power_unknown",
+				status: "Host power state unknown; preserving existing routing",
+				diagnosticCode: "host_power_unknown",
+				taskId: "1.1",
+			},
+		]);
+	});
+
+	it("keeps unknown power fail-open", () => {
+		strictEqual(
+			normalizeHostPower("Now drawing from 'AC Power'"),
+			HOST_POWER_STATES.AC,
+		);
+		strictEqual(
+			normalizeHostPower("Now drawing from 'Battery Power'"),
+			HOST_POWER_STATES.BATTERY,
+		);
+		strictEqual(normalizeHostPower("unrecognized"), HOST_POWER_STATES.UNKNOWN);
+		const result = probeHostPower({
+			execFn: () => ({ status: 1, stdout: "" }),
+		});
+		strictEqual(result.state, HOST_POWER_STATES.UNKNOWN);
+		strictEqual(result.diagnosticCode, "host_power_unknown");
+	});
+
+	it("binds the task-file digest when sync, async, or orchestrated queues transition to battery", async () => {
+		const entrypoints = [
+			["sync", runQueue],
+			["async", runQueueAsync],
+			["orchestrator", runQueueWithOrchestrator],
+		];
+		for (const [name, entrypoint] of entrypoints) {
+			const tasksPath = writeTasksFile(`### Task 2.1: Battery transition ${name}
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** bounded task
+`);
+			const checkpointPath = `${tasksPath}.${name}.battery.checkpoint.json`;
+			let probeCount = 0;
+			let routeCalls = 0;
+			const result = await entrypoint({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "existing-container",
+				checkpointPath,
+				dependencies: {
+					acquireVmSlot: () => null,
+					hostPowerProbe: () => ({
+						state:
+							probeCount++ === 0
+								? HOST_POWER_STATES.AC
+								: HOST_POWER_STATES.BATTERY,
+					}),
+					route: () => {
+						routeCalls += 1;
+						throw new Error(
+							"provider must not be selected after battery transition",
+						);
+					},
+				},
+			});
+			strictEqual(routeCalls, 0, name);
+			ok(result.policyDeferred, `${name} must preserve policy deferral`);
+			strictEqual(result.policyDeferred.nextTaskId, "2.1", name);
+			strictEqual(
+				result.policyDeferred.taskFileSha256,
+				createHash("sha256")
+					.update(readFileSync(tasksPath, "utf8"))
+					.digest("hex"),
+				name,
+			);
+		}
+	});
 });
 
 describe("dispatch descriptor receipt contract", () => {
