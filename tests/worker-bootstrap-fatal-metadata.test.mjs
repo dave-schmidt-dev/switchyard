@@ -34,7 +34,12 @@ describe("writeFatalEvent metadata composition", () => {
 		strictEqual(failure.exitCode, 255);
 		strictEqual(failure.failurePhase, "worker_boot");
 		strictEqual(failure.diagnosticOrigin, "worker_boot");
-		strictEqual(failure.diagnosticEvidenceAvailable, true);
+		strictEqual(failure.diagnosticEvidenceAvailable, false);
+		strictEqual(
+			buildFatalFailure(staged, "worker_boot_exception", true)
+				.diagnosticEvidenceAvailable,
+			true,
+		);
 	});
 
 	it("falls back to the boot stage code when the cause is not a prlctl failure, and records no exit code", () => {

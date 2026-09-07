@@ -757,7 +757,7 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		ok(isPersistentFailureMetadata(metadata));
 	});
 
-	it("maps an untrusted provider classification to static metadata and an opaque artifact ref", () => {
+	it("maps an untrusted provider classification to static metadata without an artifact ref", () => {
 		const metadata = sanitizeFailureMetadata({
 			taskId: "1.1",
 			result: "execution_failed",
@@ -771,12 +771,12 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 			metadata.reason,
 			"Provider execution failed before a reviewed integration.",
 		);
-		match(metadata.artifactRef, /^artifact:[a-f0-9]{24}$/);
+		strictEqual(metadata.artifactRef, undefined);
 		ok(!metadata.reason.includes("/Users/dave"));
 		ok(isPersistentFailureMetadata(metadata));
 	});
 
-	it("names the transcript artifact when a rejection has no diff to point at", () => {
+	it("does not synthesize a transcript artifact when a rejection has no diff to point at", () => {
 		const metadata = sanitizeFailureMetadata({
 			taskId: "1.1",
 			result: "integration_failed",
@@ -785,7 +785,7 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		});
 
 		strictEqual(metadata.diagnosticCode, "empty_required_diff");
-		match(metadata.artifactRef, /^artifact:[a-f0-9]{24}$/);
+		strictEqual(metadata.artifactRef, undefined);
 		ok(!JSON.stringify(metadata).includes("/Users/dave"));
 		ok(isPersistentFailureMetadata(metadata));
 	});

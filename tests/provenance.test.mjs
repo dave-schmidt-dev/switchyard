@@ -1327,7 +1327,7 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 			entry.reason,
 			"Provider execution failed before a reviewed integration.",
 		);
-		ok(/^artifact:[a-f0-9]{24}$/.test(entry.artifactRef));
+		strictEqual(entry.artifactRef, undefined);
 		for (const key of ["error", "output", "partialDiffPath"]) {
 			ok(
 				!(key in entry),
@@ -1361,7 +1361,7 @@ describe("recordDispatchToStore — provenance parity with the file ledger", () 
 			entry.reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(/^artifact:[a-f0-9]{24}$/.test(entry.artifactRef));
+		strictEqual(entry.artifactRef, undefined);
 		for (const key of ["error", "output", "partialDiffPath"]) {
 			ok(
 				!(key in entry),

@@ -5,14 +5,12 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	rmSync,
 	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
@@ -32,6 +30,7 @@ import {
 	releaseCheckpointLease,
 	releaseCheckpointOwnership,
 } from "../src/switchyard/runner/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const fixtures = [];
 let savedRunStoreRoot;
@@ -42,7 +41,7 @@ function git(cwd, ...args) {
 }
 
 function fixture() {
-	const root = mkdtempSync(join(tmpdir(), "switchyard-reconcile-"));
+	const root = tempDir("switchyard-reconcile-");
 	if (!savedRunStoreRootSet) {
 		savedRunStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		savedRunStoreRootSet = true;

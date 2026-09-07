@@ -663,7 +663,7 @@ export const CHECKPOINT_REMEDIATION_MESSAGES = Object.freeze({
 		"checkpoint is historical state without queue identity; create a fresh checkpoint explicitly or use an audited migration",
 });
 
-export const CHECKPOINT_IDENTITY_DIMENSIONS = new Set([
+const CHECKPOINT_IDENTITY_DIMENSIONS = new Set([
 	"tasksFilePath",
 	"queueIdentity",
 	"runOptions",

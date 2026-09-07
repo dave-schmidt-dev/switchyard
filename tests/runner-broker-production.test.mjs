@@ -18,6 +18,14 @@ import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
+const QUOTA_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
+const BOUNDED_QUOTA_EVIDENCE = {
+	stdoutBytes: 64,
+	stderrBytes: 0,
+	stdoutDigest: `sha256:${"b".repeat(64)}`,
+	stderrDigest: `sha256:${"c".repeat(64)}`,
+	diagnosticKind: "usage_exhausted",
+};
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 
 function writeDispatchQualifiedRosterFixture() {
@@ -1302,6 +1310,10 @@ test("production async runner quarantines quota targets and retries the same tas
 		checkpointPath,
 		dependencies: {
 			queuePreflight: () => ({ ok: true, eligible: true }),
+			persistDiagnosticArtifact: async (evidence) => {
+				strictEqual(evidence, BOUNDED_QUOTA_EVIDENCE);
+				return QUOTA_DIAGNOSTIC_REF;
+			},
 			onRetryStateChanged: ({ retryState }) => {
 				if (retryState?.phase !== "retry_started") return;
 				retryStarts.set(
@@ -1330,6 +1342,7 @@ test("production async runner quarantines quota targets and retries the same tas
 									diagnosticCode: "quota_exhausted",
 									diagnosticOrigin: "adapter",
 									diagnosticEvidenceAvailable: true,
+									diagnosticEvidence: BOUNDED_QUOTA_EVIDENCE,
 									failurePhase: "provider_execution",
 								}
 							: { success: true };
@@ -1399,6 +1412,10 @@ test("production async runner refreshes quarantined exclusions for each task", a
 		stopOnFailure: false,
 		dependencies: {
 			queuePreflight: () => ({ ok: true, eligible: true }),
+			persistDiagnosticArtifact: async (evidence) => {
+				strictEqual(evidence, BOUNDED_QUOTA_EVIDENCE);
+				return QUOTA_DIAGNOSTIC_REF;
+			},
 			backendFactory: () => ({
 				executionBackend: {},
 				create: () => "owned-async-quota-queue-worker",
@@ -1418,6 +1435,7 @@ test("production async runner refreshes quarantined exclusions for each task", a
 									diagnosticCode: "quota_exhausted",
 									diagnosticOrigin: "adapter",
 									diagnosticEvidenceAvailable: true,
+									diagnosticEvidence: BOUNDED_QUOTA_EVIDENCE,
 									failurePhase: "provider_execution",
 									resolvedTargetId: options.resolvedTargetId,
 								}
