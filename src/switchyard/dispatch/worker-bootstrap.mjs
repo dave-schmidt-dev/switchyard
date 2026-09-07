@@ -4,7 +4,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { lstatSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -130,6 +130,52 @@ function safeWriteFailure(error) {
 	console.error("worker-bootstrap: run-store write failed");
 }
 
+const MAX_BOOT_DIAGNOSTIC_BYTES = 4096;
+
+function bootDiagnosticPath(runRoot) {
+	return resolve(runRoot, "boot-stderr.log");
+}
+
+function retainSafeBootDiagnostic(runRoot, category) {
+	if (typeof runRoot !== "string" || typeof category !== "string") return false;
+	const safeCategory = /^[a-z0-9_]+$/u.test(category)
+		? category
+		: "worker_boot_failed";
+	try {
+		try {
+			const existing = lstatSync(bootDiagnosticPath(runRoot));
+			if (
+				!existing.isFile() ||
+				existing.isSymbolicLink() ||
+				existing.nlink !== 1 ||
+				(typeof process.getuid === "function" &&
+					existing.uid !== process.getuid()) ||
+				(existing.mode & 0o077) !== 0
+			)
+				return false;
+		} catch (error) {
+			if (error?.code !== "ENOENT") return false;
+		}
+		writeFileSync(bootDiagnosticPath(runRoot), `${safeCategory}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+			flag: "w",
+		});
+		const stat = lstatSync(bootDiagnosticPath(runRoot));
+		return (
+			stat.isFile() &&
+			!stat.isSymbolicLink() &&
+			stat.nlink === 1 &&
+			(typeof process.getuid !== "function" || stat.uid === process.getuid()) &&
+			(stat.mode & 0o077) === 0 &&
+			stat.size > 0 &&
+			stat.size <= MAX_BOOT_DIAGNOSTIC_BYTES
+		);
+	} catch {
+		return false;
+	}
+}
+
 export function createWriteChain({ onFailure = () => {} } = {}) {
 	let writeChain = Promise.resolve();
 
@@ -198,6 +244,7 @@ export function isRecognizedCheckpointIdentityError(error) {
 export function buildFatalFailure(
 	error,
 	diagnosticCode = "worker_boot_exception",
+	diagnosticEvidenceAvailable = false,
 ) {
 	const prlctlFailure = prlctlFailureMetadata(error);
 	const classified = classifyPreProviderFailure(error) ?? {
@@ -212,7 +259,7 @@ export function buildFatalFailure(
 		diagnosticCode: closedCode,
 		failurePhase: classified.failurePhase,
 		diagnosticOrigin: "worker_boot",
-		diagnosticEvidenceAvailable: true,
+		diagnosticEvidenceAvailable: diagnosticEvidenceAvailable === true,
 		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
 			? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
 			: {}),
@@ -226,12 +273,20 @@ async function writeFatalEvent(
 	try {
 		const runStore = await import("../run-store/index.mjs");
 		const current = await runStore.readRun(runId);
+		const retainedBootDiagnostic = retainSafeBootDiagnostic(
+			runStore.getRunRoot(runId),
+			diagnosticCode,
+		);
 		// A prlctl failure is checked before the boot-stage code because it is
 		// strictly more specific: "workspace_prepare_failed" says which stage
 		// died, "prlctl_job_misfire" says why, and the why is what a reader
 		// needs to tell a transient host-side SDK fault apart from a real
 		// provisioning problem. Both are closed vocabulary.
-		const failure = buildFatalFailure(error, diagnosticCode);
+		const failure = buildFatalFailure(
+			error,
+			diagnosticCode,
+			retainedBootDiagnostic,
+		);
 		await finalizeRun(
 			{
 				runId,
@@ -517,6 +572,8 @@ export async function runWorkerBootstrap(argv = process.argv) {
 					}
 				: {}),
 			dependencies: {
+				persistDiagnosticArtifact: (evidence) =>
+					runStore.persistDiagnosticArtifact(runId, evidence),
 				signal: shutdown.signal,
 				onStatus: (event) => {
 					const phase =
@@ -576,6 +633,11 @@ export async function runWorkerBootstrap(argv = process.argv) {
 					const signal = PERSISTED_SIGNALS.has(event?.signal)
 						? event.signal
 						: null;
+					const diagnosticRef =
+						typeof event?.diagnosticRef === "string" &&
+						/^diagnostic:[a-f0-9]{32}$/u.test(event.diagnosticRef)
+							? event.diagnosticRef
+							: null;
 					const persistedEvent = {
 						phase,
 						event: name,
@@ -586,6 +648,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 						...(cleanupStage !== null ? { cleanupStage } : {}),
 						...(exitCode !== null ? { exitCode } : {}),
 						...(signal !== null ? { signal } : {}),
+						...(diagnosticRef !== null ? { diagnosticRef } : {}),
 						...(name === "route_health_deferred"
 							? { result: "route_health_deferred" }
 							: {}),
@@ -641,13 +704,6 @@ export async function runWorkerBootstrap(argv = process.argv) {
 					queueWrite(fn);
 				},
 				onTaskRouted: (info) => {
-					// Retain boot diagnostics through every pre-provider failure, then
-					// remove the named log synchronously at the adapter boundary.
-					try {
-						unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
-					} catch {
-						// Missing/already-removed logs are benign.
-					}
 					const fn = () =>
 						runStore.updateRunWithRetry(runId, {
 							activeTaskProvider: info.provider,
@@ -826,9 +882,22 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		const deferredTaskIds = Array.isArray(result.deferredTaskIds)
 			? result.deferredTaskIds
 			: [];
-		if (result.processedTasks === 0) {
+		if (result.success === true && failed.length === 0) {
 			try {
-				unlinkSync(resolve(runStore.getRunRoot(runId), "boot-stderr.log"));
+				const runRoot = runStore.getRunRoot(runId);
+				const bootLogPath = bootDiagnosticPath(runRoot);
+				const stat = lstatSync(bootLogPath);
+				if (
+					stat.isFile() &&
+					!stat.isSymbolicLink() &&
+					stat.nlink === 1 &&
+					(typeof process.getuid !== "function" ||
+						stat.uid === process.getuid()) &&
+					(stat.mode & 0o077) === 0 &&
+					stat.size === 0
+				) {
+					unlinkSync(bootLogPath);
+				}
 			} catch {
 				// Missing/already-removed logs are benign.
 			}
@@ -898,10 +967,8 @@ export async function runWorkerBootstrap(argv = process.argv) {
 			process.exit(1);
 		}
 		if (error?.preflightDetail) {
-			// QueuePreflightError owns this bounded, host-derived detail. Keep it in
-			// boot-stderr so detached launch has the same actionable cause as run;
-			// never echo arbitrary provider output here.
-			console.error(error.message);
+			// Keep the boot log categorical; preflight detail can contain host paths.
+			console.error("worker-bootstrap: queue preflight failed");
 		}
 		await writeFatalEvent(error, "worker_boot_exception");
 		process.exit(1);

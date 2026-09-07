@@ -299,6 +299,40 @@ describe("provider process lifecycle", () => {
 		);
 	});
 
+	it("retains the guest provider binding across a VM transport command", async () => {
+		const executionBackend = {
+			execArgv(_workspaceId, options) {
+				options.argv[0] = "prlctl";
+				return {
+					command: "prlctl",
+					args: ["exec", "fixture-vm", "base64-guest-argv"],
+				};
+			},
+		};
+		const execution = getWorkspaceExecution("worker", {
+			executionBackend,
+			argv: ["claude", "--print", "prompt"],
+		});
+		const child = fakeChild();
+		const promise = executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				provider: "claude",
+				executionBackend,
+				spawnFn: () => child,
+			},
+		);
+		child.stdout.emit("data", "Error: Session expired\n");
+		child.stderr.emit("data", "Session expired\n");
+		child.emit("close", 1, null);
+		const result = await promise;
+		strictEqual(execution.command, "prlctl");
+		strictEqual(result.diagnosticCode, "auth_expired");
+		strictEqual(result.diagnosticEvidence.diagnosticKind, "auth_required");
+		strictEqual(result.diagnosticEvidence.diagnosticCode, undefined);
+	});
+
 	it("captures add and diff asynchronously through PID-safe transport", async () => {
 		const calls = [];
 		const backendOptions = [];
@@ -806,6 +840,9 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.cleanupStage, "pid_observed");
 		strictEqual(result.diagnosticCode, "provider_cleanup_after_pid_observed");
 		strictEqual(result.failurePhase, "provider_cleanup");
+		strictEqual(result.diagnosticEvidence.stdoutBytes, 0);
+		strictEqual(result.diagnosticEvidence.stderrBytes, 0);
+		strictEqual(Object.hasOwn(result.diagnosticEvidence, "stdout"), false);
 	});
 
 	it("runs the adapter's cleanup when no backend cleanupProviderProcess is available", async () => {
@@ -859,7 +896,7 @@ describe("provider process lifecycle", () => {
 		const observedExit = await invoke({ exitCode: 255 });
 		strictEqual(observedExit.diagnosticCode, "provider_exit_nonzero");
 		strictEqual(observedExit.diagnosticOrigin, "adapter");
-		strictEqual(observedExit.diagnosticEvidenceAvailable, true);
+		strictEqual(observedExit.diagnosticEvidenceAvailable, false);
 
 		const launcherUsage = await invoke({
 			exitCode: 2,
@@ -867,7 +904,7 @@ describe("provider process lifecycle", () => {
 		});
 		strictEqual(launcherUsage.diagnosticCode, "cli_usage_error");
 		strictEqual(launcherUsage.diagnosticOrigin, "launcher");
-		strictEqual(launcherUsage.diagnosticEvidenceAvailable, true);
+		strictEqual(launcherUsage.diagnosticEvidenceAvailable, false);
 	});
 
 	it("keeps text-derived auth and quota labels informational", async () => {
@@ -894,7 +931,7 @@ describe("provider process lifecycle", () => {
 			strictEqual(result.errorKind, expectedKind);
 			strictEqual(result.diagnosticCode, "provider_exit_nonzero");
 			strictEqual(result.diagnosticOrigin, "adapter");
-			strictEqual(result.diagnosticEvidenceAvailable, true);
+			strictEqual(result.diagnosticEvidenceAvailable, false);
 		}
 	});
 
@@ -909,6 +946,38 @@ describe("provider process lifecycle", () => {
 		const result = await promise;
 		strictEqual(result.diagnosticCode, "quota_exhausted");
 		strictEqual(result.diagnosticOrigin, "adapter");
-		strictEqual(result.diagnosticEvidenceAvailable, true);
+		strictEqual(result.diagnosticEvidenceAvailable, false);
+	});
+
+	it("classifies real provider/binary bindings from separate lifecycle streams", async () => {
+		for (const [provider, binary] of [
+			["claude", "claude"],
+			["codex", "codex"],
+			["agy", "agy"],
+			["cursor", "cursor-agent"],
+			["copilot", "copilot"],
+			["opencode", "opencode"],
+			["vibe", "vibe"],
+		]) {
+			const child = fakeChild();
+			const promise = executeProviderInvocation(`/usr/bin/${binary}`, [], {
+				provider,
+				spawnFn: () => child,
+			});
+			child.stdout.emit("data", "Error: Session expired\n");
+			child.stderr.emit("data", "Session expired\n");
+			child.emit("close", 1, null);
+			const result = await promise;
+			strictEqual(
+				result.diagnosticCode,
+				"auth_expired",
+				`${provider}/${binary}`,
+			);
+			strictEqual(result.diagnosticEvidenceAvailable, false);
+			strictEqual(result.diagnosticEvidence.diagnosticKind, "auth_required");
+			strictEqual(result.diagnosticEvidence.diagnosticCode, undefined);
+			strictEqual(Object.hasOwn(result.diagnosticEvidence, "stdout"), false);
+			strictEqual(Object.hasOwn(result.diagnosticEvidence, "stderr"), false);
+		}
 	});
 });

@@ -108,6 +108,7 @@ const TASK_BASE = {
 	ref: "refs/switchyard/task-base/runner-tests/1.1",
 	tree: "3".repeat(40),
 };
+const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 const HOST_BOOT_UUID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 function hostBirth(pid) {
@@ -501,6 +502,46 @@ describe("attempt-scoped execution backend", () => {
 		strictEqual(observed.attemptId, "attempt-b");
 	});
 
+	it("keeps adapter evidence unpersisted until broker boundary", async () => {
+		const descriptor = testDescriptor();
+		const launch = createBrokerAdapterLauncher({
+			adapter: {
+				executeAsync: async () => ({
+					success: false,
+					diagnosticEvidence: {
+						stdoutBytes: 3,
+						stderrBytes: 0,
+						stdoutDigest: `sha256:${"a".repeat(64)}`,
+						stderrDigest: `sha256:${"b".repeat(64)}`,
+					},
+				}),
+			},
+			executionBackend: {},
+			workingContainerName: "vm",
+		});
+		const route = {
+			provider: "claude",
+			resolvedTarget: "claude",
+			harness: "claude",
+			model: descriptor.selector,
+			effort: null,
+			reservation: { id: "reservation-1" },
+		};
+		const result = await launch({
+			request: { taskId: "1.4", attemptId: "attempt-e" },
+			route,
+			invocationDescriptor: descriptor,
+			launcherIdentity: {
+				...route,
+				descriptorIdentity: descriptor.descriptor_identity,
+				reservationId: "reservation-1",
+			},
+		});
+		strictEqual(result.diagnosticEvidence.stdoutBytes, 3);
+		strictEqual(result.diagnosticRef, null);
+		strictEqual(result.diagnosticEvidenceAvailable, false);
+	});
+
 	for (const success of [true, false]) {
 		it(`binds the final broker attempt to ${success ? "success" : "failure"} capture`, async () => {
 			let observed;
@@ -648,6 +689,7 @@ describe("attempt-scoped execution backend", () => {
 								diagnosticCode: "quota_exhausted",
 								diagnosticOrigin: "adapter",
 								diagnosticEvidenceAvailable: true,
+								diagnosticRef: VALID_DIAGNOSTIC_REF,
 								failurePhase: "provider_execution",
 							}
 						: { success: true, outcome: "success" };
@@ -2589,6 +2631,184 @@ describe("async runner provider lifecycle", () => {
 		strictEqual(result.completedTaskIds[0], "4.1");
 	});
 
+	it("persists provider evidence once and keeps only a valid ref", async () => {
+		const outcomes = [
+			{
+				label: "valid",
+				returned: `diagnostic:${"a".repeat(32)}`,
+				expectRef: `diagnostic:${"a".repeat(32)}`,
+			},
+			{ label: "invalid", returned: "diagnostic:not-a-token", expectRef: null },
+			{ label: "null", returned: null, expectRef: null },
+			{
+				label: "throws",
+				returned: new Error("persist failed"),
+				expectRef: null,
+			},
+		];
+		for (const { label, returned, expectRef } of outcomes) {
+			const root = join(
+				TEST_DIR,
+				`diagnostic-producer-${label}-${randomUUID()}`,
+			);
+			mkdirSync(root, { recursive: true });
+			const tasksPath = join(root, "TASKS.md");
+			const checkpointPath = join(root, "checkpoint.json");
+			writeFileSync(
+				tasksPath,
+				"### Task 4.2: Diagnostic producer\n- **Status:** pending\n- **Type:** review\n- **Description:** exercise persistence\n- **Executor:** switchyard\n",
+			);
+			const descriptor = descriptorForRoute({
+				provider: "opencode",
+				resolved_harness: "opencode",
+				resolvedTargetId: "diagnostic-target",
+				model: "fake-model",
+			});
+			let persistCalls = 0;
+			const result = await runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: root,
+				workingContainerName: "diagnostic-worker",
+				checkpointPath,
+				dependencies: {
+					route: () => ({
+						provider: "opencode",
+						resolved_harness: "opencode",
+						resolvedTargetId: "diagnostic-target",
+						model: "fake-model",
+						invocationDescriptor: descriptor,
+					}),
+					resolveDescriptor: () => descriptor,
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					persistDiagnosticArtifact: async (evidence) => {
+						persistCalls += 1;
+						strictEqual(Object.hasOwn(evidence, "stdout"), false);
+						strictEqual(Object.hasOwn(evidence, "stderr"), false);
+						strictEqual(evidence.diagnosticKind, "auth_required");
+						strictEqual(evidence.diagnosticCode, undefined);
+						if (returned instanceof Error) throw returned;
+						return returned;
+					},
+					adapters: {
+						opencode: {
+							executeAsync: async () => ({
+								success: false,
+								error: "authentication required",
+								errorKind: "auth_expired",
+								diagnosticCode: "auth_expired",
+								diagnosticOrigin: "adapter",
+								diagnosticEvidenceAvailable: true,
+								failurePhase: "provider_execution",
+								diagnosticEvidence: {
+									stdoutBytes: 21,
+									stderrBytes: 0,
+									stdoutDigest: `sha256:${"b".repeat(64)}`,
+									stderrDigest: `sha256:${"c".repeat(64)}`,
+									diagnosticKind: "auth_required",
+								},
+							}),
+							captureDiffAsync: async () => null,
+						},
+					},
+				},
+			});
+			strictEqual(persistCalls, 1, `${label}: one producer call`);
+			strictEqual(result.results[0].diagnosticRef ?? null, expectRef, label);
+			strictEqual(
+				result.results[0].diagnosticEvidenceAvailable,
+				expectRef !== null,
+				label,
+			);
+			ok(!JSON.stringify(result).includes('"diagnosticEvidence":'), label);
+		}
+	});
+
+	it("fails closed for synchronous provider evidence without an artifact", async () => {
+		const root = join(TEST_DIR, "sync-diagnostic-projection");
+		mkdirSync(root, { recursive: true });
+		const tasksPath = join(root, "TASKS.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		writeFileSync(
+			tasksPath,
+			"### Task 4.3: Synchronous diagnostic\n- **Status:** pending\n- **Type:** review\n- **Description:** reject unretained evidence\n- **Executor:** switchyard\n",
+		);
+		const descriptor = descriptorForRoute({
+			provider: "opencode",
+			resolved_harness: "opencode",
+			resolvedTargetId: "sync-diagnostic-target",
+			model: "fake-model",
+		});
+		const dispatches = [];
+		const statuses = [];
+		const runStoreCalls = [];
+		const result = runQueue({
+			tasksFilePath: tasksPath,
+			projectPath: root,
+			workingContainerName: "sync-diagnostic-worker",
+			checkpointPath,
+			dependencies: {
+				route: () => ({
+					provider: "opencode",
+					resolved_harness: "opencode",
+					resolvedTargetId: "sync-diagnostic-target",
+					model: "fake-model",
+					invocationDescriptor: descriptor,
+				}),
+				resolveDescriptor: () => descriptor,
+				recordDispatch: (entry) => dispatches.push(entry),
+				recordDispatchIntent: () => {},
+				onStatus: (event) => statuses.push(event),
+				adapters: {
+					opencode: {
+						execute: () => ({
+							success: false,
+							error: "authentication required",
+							errorKind: "auth_expired",
+							diagnosticCode: "auth_expired",
+							diagnosticOrigin: "adapter",
+							diagnosticEvidenceAvailable: true,
+							failurePhase: "provider_execution",
+						}),
+						captureDiff: () => null,
+					},
+				},
+				runStore: {
+					updateRun: (partial) => {
+						runStoreCalls.push({ ...partial });
+						return Promise.resolve({ revision: 0 });
+					},
+				},
+			},
+		});
+		await result.ledgerWritesSettled;
+		const checkpointFailure = loadCheckpoint(checkpointPath, tasksPath)
+			.results[0];
+		const dispatchFailure = dispatches.find(
+			(entry) => entry.result === "execution_failed",
+		);
+		const statusFailure = statuses.find(
+			(event) => event.event === "task_failed",
+		);
+		const terminalFailure = runStoreCalls.find(
+			(call) => call.state === "failed",
+		).lastFailure;
+		for (const value of [
+			result.results[0],
+			checkpointFailure,
+			dispatchFailure,
+			statusFailure,
+			terminalFailure,
+		]) {
+			ok(value, "sync diagnostic projection is present");
+			strictEqual(value.diagnosticCode, "auth_expired");
+			strictEqual(value.diagnosticOrigin, "adapter");
+			strictEqual(value.diagnosticEvidenceAvailable, false);
+			strictEqual(value.diagnosticRef ?? null, null);
+		}
+		ok(!readFileSync(checkpointPath, "utf8").includes('"diagnosticEvidence":'));
+	});
+
 	it("emits bounded scalar heartbeats while an async provider is in flight", async () => {
 		const root = join(TEST_DIR, "async-heartbeat");
 		mkdirSync(root, { recursive: true });
@@ -2713,10 +2933,12 @@ describe("async runner provider lifecycle", () => {
 			integrationGate: () => ({ success: true }),
 		});
 		strictEqual(result.results[0].partialDiff, undefined);
+		strictEqual(result.results[0].artifactRef, undefined);
 		strictEqual(observed.partialDiff, undefined);
+		strictEqual(observed.artifactRef, undefined);
 		ok(result.results[0].partialDiffPath?.endsWith("4.2.diff"));
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
-		ok(checkpoint.results[0].artifactRef?.startsWith("artifact:"));
+		strictEqual(checkpoint.results[0].artifactRef, undefined);
 		ok(!JSON.stringify(checkpoint).includes("SECRET_RAW_DIFF"));
 	});
 
@@ -2726,10 +2948,12 @@ describe("async runner provider lifecycle", () => {
 			integrationGate: () => ({ success: false }),
 		});
 		strictEqual(result.results[0].partialDiff, undefined);
+		strictEqual(result.results[0].artifactRef, undefined);
 		strictEqual(observed.partialDiff, undefined);
+		strictEqual(observed.artifactRef, undefined);
 		ok(result.results[0].partialDiffPath?.endsWith("4.2.diff"));
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
-		ok(checkpoint.results[0].artifactRef?.startsWith("artifact:"));
+		strictEqual(checkpoint.results[0].artifactRef, undefined);
 		ok(!JSON.stringify(checkpoint).includes("SECRET_RAW_DIFF"));
 	});
 });
@@ -4491,7 +4715,7 @@ describe("runner headless orchestrator mode", () => {
 						},
 					},
 				}),
-			/explicit reconciliation/,
+			/invalid quota diagnostic provenance/,
 		);
 		strictEqual(routeCalls, 0);
 		strictEqual(launchCalls, 0);
@@ -5035,6 +5259,7 @@ describe("runner quota retry coordination", () => {
 		const routeCalls = [];
 		const executeCalls = [];
 		const executeOptions = [];
+		let latestRoutedCandidate = null;
 		const retryProjections = [];
 		const taskBaseCaptures = [];
 		const taskBaseReleases = [];
@@ -5054,6 +5279,7 @@ describe("runner quota retry coordination", () => {
 						only.includes(entry.target) ||
 						only.includes(entry.provider)),
 			);
+			latestRoutedCandidate = candidate ?? null;
 			if (!candidate) {
 				return {
 					provider: null,
@@ -5076,18 +5302,34 @@ describe("runner quota retry coordination", () => {
 				executeCalls.push(provider);
 				executeOptions.push(options);
 				const queue = outcomes.get(provider) ?? [];
-				return (
-					queue.shift() ?? {
-						success: true,
-						output: "ok",
-					}
-				);
+				const outcome = queue.shift() ?? {
+					success: true,
+					output: "ok",
+				};
+				return outcome;
 			},
 			executeAsync: async (_prompt, _workspace, options) => {
 				executeCalls.push(provider);
 				executeOptions.push(options);
 				const queue = outcomes.get(provider) ?? [];
-				return queue.shift() ?? { success: true, output: "ok" };
+				const outcome = queue.shift() ?? { success: true, output: "ok" };
+				if (
+					outcome?.diagnosticEvidenceAvailable === true &&
+					typeof outcome.diagnosticRef === "string" &&
+					/^diagnostic:[a-f0-9]{32}$/u.test(outcome.diagnosticRef)
+				) {
+					return {
+						...outcome,
+						diagnosticEvidence: outcome.diagnosticEvidence ?? {
+							stdoutBytes: 0,
+							stderrBytes: 0,
+							stdoutDigest: `sha256:${"a".repeat(64)}`,
+							stderrDigest: `sha256:${"b".repeat(64)}`,
+							diagnosticKind: "usage_exhausted",
+						},
+					};
+				}
+				return outcome;
 			},
 			captureDiff: () => "diff --git a/a b/a\n+change",
 			captureDiffAsync: async () => "diff --git a/a b/a\n+change",
@@ -5119,6 +5361,25 @@ describe("runner quota retry coordination", () => {
 				validateTaskBase: (_workspaceId, base) => base,
 				releaseTaskBase: (_workspaceId, base) => taskBaseReleases.push(base),
 				wipeWorkingContainer: () => {},
+				persistDiagnosticArtifact: async (evidence) => {
+					strictEqual(evidence?.diagnosticKind, "usage_exhausted");
+					return VALID_DIAGNOSTIC_REF;
+				},
+				resolveTargetIdentity: (provider) => {
+					const candidate = latestRoutedCandidate;
+					if (!candidate || candidate.provider !== provider) {
+						return {
+							targetId: null,
+							harnessKey: null,
+							ambiguous: true,
+						};
+					}
+					return {
+						targetId: candidate.target,
+						harnessKey: candidate.harness ?? candidate.provider,
+						ambiguous: false,
+					};
+				},
 				adapters: {
 					agy: makeAdapter("agy"),
 					codex: makeAdapter("codex"),
@@ -5506,7 +5767,7 @@ describe("runner quota retry coordination", () => {
 		strictEqual(fixture.executeCalls.length, 0);
 	});
 
-	it("gives a late quota fallback its own fresh provider timeout", () => {
+	it("gives a late quota fallback its own fresh provider timeout", async () => {
 		const tasksPath = writeTasksFile(`### Task 1.1: Retry quota
 - **Status:** pending
 - **Executor:** switchyard
@@ -5528,6 +5789,7 @@ describe("runner quota retry coordination", () => {
 						diagnosticCode: "quota_exhausted",
 						diagnosticOrigin: "adapter",
 						diagnosticEvidenceAvailable: true,
+						diagnosticRef: VALID_DIAGNOSTIC_REF,
 						failurePhase: "provider_execution",
 					},
 				],
@@ -5535,14 +5797,14 @@ describe("runner quota retry coordination", () => {
 		});
 		fixture.dependencies.now = () => monotonic;
 		fixture.dependencies.monotonicNow = () => monotonic;
-		const firstExecute = fixture.dependencies.adapters.agy.execute;
-		fixture.dependencies.adapters.agy.execute = (...args) => {
-			const result = firstExecute(...args);
+		const firstExecute = fixture.dependencies.adapters.agy.executeAsync;
+		fixture.dependencies.adapters.agy.executeAsync = async (...args) => {
+			const result = await firstExecute(...args);
 			monotonic = 1_700_000;
 			return result;
 		};
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath: `${tasksPath}.checkpoint.json`,
@@ -5558,6 +5820,45 @@ describe("runner quota retry coordination", () => {
 			fixture.executeOptions.map(({ timeoutMs }) => timeoutMs),
 			[1_800_000, 1_800_000],
 		);
+	});
+
+	it("does not authorize quota fallback from structured code without an artifact", async () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Unretained quota
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** a structured label without durable evidence cannot replay
+`);
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-first", target: "agy-first" },
+				{ provider: "agy", model: "fixture-second", target: "agy-second" },
+			],
+			executionOutcomes: {
+				agy: [
+					{
+						success: false,
+						result: "execution_failed",
+						errorKind: "quota_exhausted",
+						diagnosticCode: "quota_exhausted",
+						diagnosticOrigin: "adapter",
+						diagnosticEvidenceAvailable: true,
+						failurePhase: "provider_execution",
+					},
+				],
+			},
+		});
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			stopOnFailure: true,
+			dependencies: fixture.dependencies,
+		});
+		strictEqual(result.results[0].success, false);
+		strictEqual(result.results[0].diagnosticRef, null);
+		strictEqual(result.results[0].diagnosticEvidenceAvailable, false);
+		deepStrictEqual(fixture.executeCalls, ["agy"]);
 	});
 
 	it("shares one extra launch between empty-capture correction and quota fallback", () => {
@@ -5718,7 +6019,7 @@ describe("runner quota retry coordination", () => {
 		}
 	});
 
-	it("quarantines one target, retries on an isolated target, and counts one logical task", () => {
+	it("quarantines one target, retries on an isolated target, and counts one logical task", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Quota fallback
@@ -5746,6 +6047,7 @@ describe("runner quota retry coordination", () => {
 						diagnosticCode: "quota_exhausted",
 						diagnosticOrigin: "adapter",
 						diagnosticEvidenceAvailable: true,
+						diagnosticRef: VALID_DIAGNOSTIC_REF,
 						failurePhase: "provider_execution",
 					},
 					{ success: true, output: "ok" },
@@ -5759,7 +6061,7 @@ describe("runner quota retry coordination", () => {
 			},
 		});
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -5787,12 +6089,12 @@ describe("runner quota retry coordination", () => {
 		strictEqual(dispatches[0].errorKind, "quota_exhausted");
 		strictEqual(dispatches[0].resolvedTargetId, "agy-gemini");
 		strictEqual(dispatches[1].resolvedTargetId, "agy-claude");
-		ok(statuses.some((event) => event.event === "target_quarantined"));
+		ok(statuses.some((event) => event.event === "retry_reset_started"));
 		deepStrictEqual(
 			fixture.retryProjections.map(
 				(projection) => projection.retryTransitionId,
 			),
-			[1, 2, 3, 4, 5],
+			[1, 2, 4, 5],
 		);
 		deepStrictEqual(fixture.retryProjections.at(-1), {
 			quarantinedTargetIds: ["agy-gemini"],
@@ -6009,7 +6311,7 @@ describe("runner quota retry coordination", () => {
 					checkpointPath,
 					dependencies: fixture.dependencies,
 				}),
-			/explicit reconciliation/,
+			/invalid quota diagnostic provenance/,
 		);
 		strictEqual(fixture.executeCalls.length, 0);
 		strictEqual(resetCalls, 0);
@@ -6090,7 +6392,7 @@ describe("runner quota retry coordination", () => {
 					checkpointPath,
 					dependencies: fixture.dependencies,
 				}),
-			/explicit reconciliation/,
+			/invalid quota diagnostic provenance/,
 		);
 		strictEqual(fixture.executeCalls.length, 0);
 		strictEqual(readFileSync(checkpointPath, "utf8"), before);
@@ -6430,7 +6732,7 @@ describe("runner quota retry coordination", () => {
 		}
 	});
 
-	it("halts safely when the mandatory retry reset fails", () => {
+	it("halts safely when the mandatory retry reset fails", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reset failure
@@ -6453,6 +6755,7 @@ describe("runner quota retry coordination", () => {
 						diagnosticCode: "quota_exhausted",
 						diagnosticOrigin: "adapter",
 						diagnosticEvidenceAvailable: true,
+						diagnosticRef: VALID_DIAGNOSTIC_REF,
 						failurePhase: "provider_execution",
 					},
 				],
@@ -6462,7 +6765,7 @@ describe("runner quota retry coordination", () => {
 			},
 		});
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -6498,7 +6801,7 @@ describe("runner quota retry coordination", () => {
 			resolve(cwd(), "src/switchyard/roster/index.mjs"),
 		).href;
 		const childScript = `
-import { runQueue } from ${JSON.stringify(runnerUrl)};
+import { runQueueAsync } from ${JSON.stringify(runnerUrl)};
 import { getInvocationDescriptorIdentity } from ${JSON.stringify(rosterUrl)};
 const [tasksFilePath, checkpointPath, projectPath] = process.argv.slice(1);
 const routePlan = [
@@ -6506,6 +6809,7 @@ const routePlan = [
   { provider: "agy", model: "fixture-claude", target: "agy-claude" },
 ];
 let latestDescriptor = null;
+let latestRoutedCandidate = null;
 const descriptorFor = (candidate) => {
   const core = {
     target_id: candidate.target,
@@ -6523,11 +6827,12 @@ const route = ({ exclude = [], only = [] } = {}) => {
     !exclude.includes(entry.provider) &&
     (only.length === 0 || only.includes(entry.target) || only.includes(entry.provider))
   );
+  latestRoutedCandidate = candidate ?? null;
   return candidate
     ? (latestDescriptor = descriptorFor(candidate), { ...candidate, resolvedTargetId: candidate.target, invocationDescriptor: latestDescriptor, percentLeft: 50, log: [] })
     : { provider: null, model: null, resolvedTargetId: null, reason: "no_eligible_retry_target", log: [] };
 };
-runQueue({
+await runQueueAsync({
   tasksFilePath,
   projectPath,
   checkpointPath,
@@ -6541,6 +6846,12 @@ runQueue({
   // the queue own the container while still avoiding any real VM lifecycle.
   dependencies: {
     route,
+    resolveTargetIdentity: (provider) => {
+      const candidate = latestRoutedCandidate;
+      return candidate && candidate.provider === provider
+        ? { targetId: candidate.target, harnessKey: "agy", ambiguous: false }
+        : { targetId: null, harnessKey: null, ambiguous: true };
+    },
     resolveDescriptor: () => latestDescriptor,
     recordDispatch: () => {},
 		recordDispatchIntent: () => {},
@@ -6565,9 +6876,10 @@ runQueue({
     onRetryStateChanged: ({ retryTransitionId }) => {
       if (retryTransitionId === Number(process.env.CRASH_AT)) process.exit(73);
     },
+    persistDiagnosticArtifact: async () => "diagnostic:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     adapters: {
       agy: {
-        execute: () => ({
+        executeAsync: async () => ({
           success: false,
           output: "",
           error: "quota",
@@ -6575,9 +6887,17 @@ runQueue({
           diagnosticCode: "quota_exhausted",
           diagnosticOrigin: "adapter",
           diagnosticEvidenceAvailable: true,
+          diagnosticRef: "diagnostic:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          diagnosticEvidence: {
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            stdoutDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            stderrDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            diagnosticKind: "usage_exhausted",
+          },
           failurePhase: "provider_execution",
         }),
-        captureDiff: () => "diff --git a/a b/a\\n+change",
+        captureDiffAsync: async () => "diff --git a/a b/a\\n+change",
       },
     },
   },
@@ -10368,7 +10688,7 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 			validated.status,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(/^artifact:[a-f0-9]{24}$/.test(validated.artifactRef));
+		strictEqual(validated.artifactRef, undefined);
 		ok(
 			!events.find((e) => e.event === "gate_applied"),
 			"gate_applied not emitted on rejection",
@@ -11968,6 +12288,10 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 				validateTaskBase: (_workspaceId, base) => base,
 				releaseTaskBase: () => {},
 				wipeWorkingContainer: () => {},
+				persistDiagnosticArtifact: async (evidence) => {
+					strictEqual(evidence?.diagnosticKind, "usage_exhausted");
+					return VALID_DIAGNOSTIC_REF;
+				},
 				adapters: {
 					codex: {
 						execute,
@@ -11989,6 +12313,12 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			diagnosticCode: "quota_exhausted",
 			diagnosticOrigin: "adapter",
 			diagnosticEvidenceAvailable: true,
+			diagnosticRef: VALID_DIAGNOSTIC_REF,
+			diagnosticEvidence: {
+				stdout: "",
+				stderr: "usage exhausted",
+				diagnosticKind: "usage_exhausted",
+			},
 			failurePhase: "provider_execution",
 		};
 	}
@@ -12208,16 +12538,17 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					mode === "sync"
 						? runQueueImpl(options)
 						: await runQueueAsyncImpl(options);
+				const fallbackAuthorized = mode === "async";
 				strictEqual(
 					fixture.executeCalls.length,
-					2,
-					`${mode}: shadow mode still spends the quota fallback launch`,
+					fallbackAuthorized ? 2 : 1,
+					`${mode}: shadow mode only spends a launch when durable evidence authorizes fallback`,
 				);
-				strictEqual(result.results[0].success, true, mode);
+				strictEqual(result.results[0].success, fallbackAuthorized, mode);
 				strictEqual(
 					loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations
 						.length,
-					1,
+					fallbackAuthorized ? 1 : 0,
 					mode,
 				);
 				ok(
@@ -12816,7 +13147,7 @@ describe("runQueue timeout diff persistence", () => {
 			"provider_cleanup_after_pid_marker_removed",
 		);
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
-		ok(/^artifact:[a-f0-9]{24}$/.test(checkpoint.results[0].artifactRef));
+		strictEqual(checkpoint.results[0].artifactRef, undefined);
 
 		const rawCheckpointJson = readFileSync(checkpointPath, "utf8");
 		ok(
@@ -13062,7 +13393,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 			taskResult.reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(/^artifact:[a-f0-9]{24}$/.test(taskResult.artifactRef));
+		strictEqual(taskResult.artifactRef, undefined);
 		strictEqual(
 			taskResult.partialDiff,
 			undefined,
@@ -13080,7 +13411,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 			checkpoint.results[0].reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(/^artifact:[a-f0-9]{24}$/.test(checkpoint.results[0].artifactRef));
+		strictEqual(checkpoint.results[0].artifactRef, undefined);
 		const failedEvent = events.find((event) => event.event === "task_failed");
 		ok(failedEvent, "task_failed status event is present");
 		strictEqual(failedEvent.errorKind, "integration_failed");
@@ -13089,11 +13420,11 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 			failedEvent.reason,
 			"The reviewed integration gate rejected the task result.",
 		);
-		ok(/^artifact:[a-f0-9]{24}$/.test(failedEvent.artifactRef));
+		strictEqual(failedEvent.artifactRef, undefined);
 		strictEqual(dispatches.length, 1);
 		strictEqual(dispatches[0].errorKind, "integration_failed");
 		strictEqual(dispatches[0].reasonCode, "integration_failed");
-		ok(/^artifact:[a-f0-9]{24}$/.test(dispatches[0].artifactRef));
+		strictEqual(dispatches[0].artifactRef, undefined);
 		ok(
 			!JSON.stringify({ dispatches, events, checkpoint }).includes(
 				"SECRET_CANARY_gate_message",
@@ -14510,6 +14841,8 @@ describe("carry real cause through runner terminal projections (Task 1.4)", () =
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const runStoreCalls = [];
+		const dispatches = [];
+		const statuses = [];
 		const result = runQueue({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
@@ -14523,7 +14856,8 @@ describe("carry real cause through runner terminal projections (Task 1.4)", () =
 					percentLeft: 70,
 					reason: "spread",
 				}),
-				recordDispatch: () => {},
+				recordDispatch: (entry) => dispatches.push(entry),
+				onStatus: (event) => statuses.push(event),
 				adapters: {
 					agy: {
 						execute: () => ({
@@ -14554,10 +14888,31 @@ describe("carry real cause through runner terminal projections (Task 1.4)", () =
 		const terminalFailure = runStoreCalls.find(
 			(call) => call.state === "failed",
 		).lastFailure;
-		for (const value of [failure, checkpointFailure, terminalFailure]) {
+		const dispatchFailure = dispatches.find(
+			(entry) => entry.result === "execution_failed",
+		);
+		const statusFailure = statuses.find(
+			(event) => event.event === "task_failed",
+		);
+		for (const value of [
+			failure,
+			checkpointFailure,
+			terminalFailure,
+			dispatchFailure,
+			statusFailure,
+		]) {
+			ok(value, "sync failure projection is present");
 			strictEqual(value.diagnosticCode, "auth_expired");
 			strictEqual(value.diagnosticOrigin, "adapter");
-			strictEqual(value.diagnosticEvidenceAvailable, true);
+			strictEqual(value.diagnosticEvidenceAvailable, false);
+			strictEqual(value.diagnosticRef ?? null, null);
+		}
+		for (const value of [
+			failure,
+			checkpointFailure,
+			terminalFailure,
+			dispatchFailure,
+		]) {
 			strictEqual(value.resolvedTargetId, "agy-gemini");
 			strictEqual(value.descriptorHarness, "agy");
 			match(value.descriptorIdentity, /^sha256:[a-f0-9]{64}$/);

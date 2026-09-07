@@ -122,6 +122,7 @@ import {
 const CHECKPOINT_VERSION = 3;
 const checkpointOwners = new Map();
 const BOUNDED_ERROR_KINDS = new Set(PERSISTED_ERROR_KINDS);
+const DIAGNOSTIC_REF_RE = /^diagnostic:[a-f0-9]{32}$/u;
 const HISTORICAL_CHECKPOINT_VERSION = 1;
 const RUN_OPTIONS_VERSION = 1;
 const VM_SLOT_WAIT_TIMEOUT_MS = 5 * 60_000;
@@ -2833,6 +2834,7 @@ function failureMetadataFor(result, partialDiffPath) {
 		resolvedTargetId: result.resolvedTargetId,
 		descriptorIdentity: result.descriptorIdentity,
 		descriptorHarness: result.descriptorHarness,
+		diagnosticRef: result.diagnosticRef,
 	});
 }
 
@@ -2894,6 +2896,7 @@ function hasTrustedQuotaRetryEvidence(value) {
 		value?.diagnosticCode !== "quota_exhausted" ||
 		value.diagnosticOrigin !== "adapter" ||
 		value.diagnosticEvidenceAvailable !== true ||
+		!DIAGNOSTIC_REF_RE.test(value.diagnosticRef ?? "") ||
 		value.failurePhase !== "provider_execution"
 	) {
 		return false;
@@ -3029,6 +3032,7 @@ function persistRetryTransition(
 		diagnosticOrigin = checkpoint.retryState?.diagnosticOrigin ?? null,
 		diagnosticEvidenceAvailable = checkpoint.retryState
 			?.diagnosticEvidenceAvailable ?? false,
+		diagnosticRef = checkpoint.retryState?.diagnosticRef ?? null,
 		failurePhase = checkpoint.retryState?.failurePhase ?? null,
 		phase = type,
 		clearState = false,
@@ -3054,6 +3058,11 @@ function persistRetryTransition(
 		diagnosticCode,
 		diagnosticOrigin,
 		diagnosticEvidenceAvailable,
+		diagnosticRef:
+			diagnosticEvidenceAvailable === true &&
+			DIAGNOSTIC_REF_RE.test(diagnosticRef ?? "")
+				? diagnosticRef
+				: null,
 		failurePhase,
 		timestamp: new Date().toISOString(),
 	};
@@ -3072,6 +3081,11 @@ function persistRetryTransition(
 				diagnosticCode,
 				diagnosticOrigin,
 				diagnosticEvidenceAvailable,
+				diagnosticRef:
+					diagnosticEvidenceAvailable === true &&
+					DIAGNOSTIC_REF_RE.test(diagnosticRef ?? "")
+						? diagnosticRef
+						: null,
 				failurePhase,
 			};
 	checkpoint.lastUpdatedAt = transition.timestamp;
@@ -3439,10 +3453,40 @@ function servedModelVerificationFields(execution) {
  * provider process running in the guest.
  */
 function survivingProviderFields(execution) {
-	if (execution?.cleanupFailed !== true) return {};
+	const fields = {};
+	if (execution?.cleanupFailed === true) {
+		Object.assign(fields, {
+			cleanupFailed: true,
+			cleanupStage: execution.cleanupStage ?? null,
+		});
+	}
+	if (
+		execution?.diagnosticEvidenceAvailable === true &&
+		typeof execution?.diagnosticRef === "string" &&
+		/^diagnostic:[a-f0-9]{32}$/u.test(execution.diagnosticRef)
+	) {
+		fields.diagnosticRef = execution.diagnosticRef;
+	}
+	return fields;
+}
+
+function normalizeSynchronousProviderExecution(execution) {
+	if (!execution || typeof execution !== "object") return execution;
+	const hasProviderDiagnostic = [
+		"diagnosticEvidence",
+		"diagnosticEvidenceAvailable",
+		"diagnosticRef",
+		"diagnosticCode",
+		"diagnosticOrigin",
+	].some((field) => Object.hasOwn(execution, field));
 	return {
-		cleanupFailed: true,
-		cleanupStage: execution.cleanupStage ?? null,
+		...execution,
+		// The synchronous adapter seam has no bounded artifact producer. A
+		// provider-supplied availability bit or pre-mapped ref is therefore not
+		// durable evidence and must not reach projections or retry decisions.
+		...(hasProviderDiagnostic
+			? { diagnosticEvidenceAvailable: false, diagnosticRef: null }
+			: {}),
 	};
 }
 
@@ -4544,7 +4588,7 @@ function executeTaskUnsafe(task, context) {
 			invocationDescriptor,
 			requiredCapability,
 		);
-	const execution = adapter.execute(prompt, context.workingContainerName, {
+	const rawExecution = adapter.execute(prompt, context.workingContainerName, {
 		model: routedModel ?? undefined,
 		timeoutMs: launchTimeoutMs,
 		executionBackend: bindAttemptExecutionBackend(
@@ -4557,6 +4601,9 @@ function executeTaskUnsafe(task, context) {
 		resolvedTargetId,
 		cleanupContext,
 	});
+	const execution = context.checkpoint
+		? normalizeSynchronousProviderExecution(rawExecution)
+		: rawExecution;
 	context._activeProviderExecutionSucceeded = execution.success === true;
 	context._activeCompletionLifecycleReceipt =
 		execution.completionContinuationProof ?? null;
@@ -4647,6 +4694,7 @@ function executeTaskUnsafe(task, context) {
 				failurePhase: execution.failurePhase,
 				diagnosticOrigin: execution.diagnosticOrigin,
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+				diagnosticRef: execution.diagnosticRef,
 				cleanupStage: execution.cleanupStage,
 			});
 			const error = cleanupFailed
@@ -4675,6 +4723,7 @@ function executeTaskUnsafe(task, context) {
 				failurePhase: execution.failurePhase,
 				diagnosticOrigin: execution.diagnosticOrigin,
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+				diagnosticRef: execution.diagnosticRef,
 				cleanupStage: execution.cleanupStage,
 			});
 			return {
@@ -4702,6 +4751,7 @@ function executeTaskUnsafe(task, context) {
 				failurePhase: execution.failurePhase,
 				diagnosticOrigin: execution.diagnosticOrigin,
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+				diagnosticRef: execution.diagnosticRef,
 				cleanupFailed,
 				cleanupStage: execution.cleanupStage,
 				captureStatus,
@@ -4751,6 +4801,7 @@ function executeTaskUnsafe(task, context) {
 			failurePhase: execution.failurePhase,
 			diagnosticOrigin: execution.diagnosticOrigin,
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
 			captureStatus: captureEvidence.status,
 		});
@@ -4772,6 +4823,7 @@ function executeTaskUnsafe(task, context) {
 			failurePhase: execution.failurePhase,
 			diagnosticOrigin: execution.diagnosticOrigin,
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
 			captureStatus: captureEvidence.status,
 			...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
@@ -5363,6 +5415,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 						diagnosticOrigin: brokerExecution.diagnosticOrigin,
 						diagnosticEvidenceAvailable:
 							brokerExecution.diagnosticEvidenceAvailable,
+						diagnosticRef: brokerExecution.diagnosticRef,
 					},
 					{
 						recordProvenance: primaryProvenance,
@@ -5504,6 +5557,12 @@ async function executeTaskAsyncUnsafe(task, context) {
 		diagnosticOrigin: brokerExecution.diagnosticOrigin ?? null,
 		diagnosticEvidenceAvailable:
 			brokerExecution.diagnosticEvidenceAvailable === true,
+		diagnosticRef:
+			brokerExecution.diagnosticEvidenceAvailable === true &&
+			typeof brokerExecution.diagnosticRef === "string" &&
+			/^diagnostic:[a-f0-9]{32}$/u.test(brokerExecution.diagnosticRef)
+				? brokerExecution.diagnosticRef
+				: null,
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 	};
@@ -5579,6 +5638,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				failurePhase: execution.failurePhase,
 				diagnosticOrigin: execution.diagnosticOrigin,
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+				diagnosticRef: execution.diagnosticRef,
 				cleanupStage: execution.cleanupStage,
 				captureStatus: captureEvidence.status,
 			});
@@ -5599,6 +5659,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				failurePhase: execution.failurePhase,
 				diagnosticOrigin: execution.diagnosticOrigin,
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+				diagnosticRef: execution.diagnosticRef,
 				cleanupStage: execution.cleanupStage,
 				captureStatus: captureEvidence.status,
 				...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
@@ -5662,6 +5723,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			failurePhase: execution.failurePhase,
 			diagnosticOrigin: execution.diagnosticOrigin,
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
 		});
 		const error = cleanupFailed
@@ -5689,6 +5751,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			failurePhase: execution.failurePhase,
 			diagnosticOrigin: execution.diagnosticOrigin,
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
 		});
 		return {
@@ -5716,6 +5779,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			failurePhase: execution.failurePhase,
 			diagnosticOrigin: execution.diagnosticOrigin,
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
+			diagnosticRef: execution.diagnosticRef,
 			cleanupFailed,
 			cleanupStage: execution.cleanupStage,
 			captureStatus,
@@ -5997,6 +6061,7 @@ export async function runQueueAsync(options) {
 			saveCheckpoint(checkpointPath, checkpoint);
 		},
 		onStatus: dependencies.onStatus ?? null,
+		persistDiagnosticArtifact: dependencies.persistDiagnosticArtifact,
 		onTaskRouted: dependencies.onTaskRouted ?? null,
 		onTaskHeartbeat: dependencies.onTaskHeartbeat ?? null,
 		checkIgnoredPath: dependencies.checkIgnoredPath,
@@ -6241,6 +6306,7 @@ export async function runQueueAsync(options) {
 					diagnosticCode: result.diagnosticCode,
 					diagnosticOrigin: result.diagnosticOrigin,
 					diagnosticEvidenceAvailable: result.diagnosticEvidenceAvailable,
+					diagnosticRef: result.diagnosticRef,
 					failurePhase: result.failurePhase,
 				});
 				projectRetryState();
@@ -7616,6 +7682,12 @@ export function createBrokerAdapterLauncher({
 			diagnosticOrigin: execution?.diagnosticOrigin ?? null,
 			diagnosticEvidenceAvailable:
 				execution?.diagnosticEvidenceAvailable === true,
+			diagnosticRef:
+				typeof execution?.diagnosticRef === "string" &&
+				/^diagnostic:[a-f0-9]{32}$/u.test(execution.diagnosticRef)
+					? execution.diagnosticRef
+					: null,
+			diagnosticEvidence: execution?.diagnosticEvidence ?? null,
 			// A bounded fact, not the guest-supplied model name: whether the
 			// adapter could affirmatively read back what the provider served.
 			servedModelVerified:
@@ -7731,7 +7803,7 @@ function createDispatchBroker(context, dependencies = {}) {
 					`broker route harness '${selectedRoute.harness}' has no runner adapter`,
 				);
 			}
-			return createBrokerAdapterLauncher({
+			const launchResult = await createBrokerAdapterLauncher({
 				adapter,
 				executionBackend: context.executionBackend,
 				workingContainerName: context.workingContainerName,
@@ -7772,6 +7844,39 @@ function createDispatchBroker(context, dependencies = {}) {
 					onTaskHeartbeat?.(heartbeat);
 				},
 			});
+			const inProcessEvidence = launchResult?.diagnosticEvidence;
+			const hasInProcessEvidence =
+				inProcessEvidence && typeof inProcessEvidence === "object";
+			let diagnosticRef = null;
+			if (
+				launchResult?.success !== true &&
+				hasInProcessEvidence &&
+				typeof context.persistDiagnosticArtifact === "function"
+			) {
+				try {
+					const persisted =
+						await context.persistDiagnosticArtifact(inProcessEvidence);
+					if (
+						typeof persisted === "string" &&
+						/^diagnostic:[a-f0-9]{32}$/u.test(persisted)
+					) {
+						diagnosticRef = persisted;
+					}
+				} catch {
+					diagnosticRef = null;
+				}
+			}
+			// Raw streams are producer-local and must not reach the broker result,
+			// checkpoint, event, or status projections.
+			delete launchResult.diagnosticEvidence;
+			if (hasInProcessEvidence) {
+				launchResult.diagnosticRef = diagnosticRef;
+				launchResult.diagnosticEvidenceAvailable = diagnosticRef !== null;
+			} else {
+				launchResult.diagnosticRef = null;
+				launchResult.diagnosticEvidenceAvailable = false;
+			}
+			return launchResult;
 		},
 	});
 }
@@ -8732,6 +8837,7 @@ export function runQueue(options) {
 		runId,
 		dependencies,
 		onStatus: emitStatus,
+		persistDiagnosticArtifact: dependencies.persistDiagnosticArtifact,
 	});
 	const {
 		queueBackend,
@@ -8893,6 +8999,7 @@ export function runQueue(options) {
 			saveCheckpoint(checkpointPath, checkpoint);
 		},
 		onStatus: emitStatus,
+		persistDiagnosticArtifact: dependencies.persistDiagnosticArtifact,
 		onTaskRouted,
 		onLedgerProjectionFailure: dependencies.onLedgerProjectionFailure,
 		onIntentReceiptFailure: dependencies.onIntentReceiptFailure,
@@ -9179,6 +9286,7 @@ export function runQueue(options) {
 						diagnosticCode: result.diagnosticCode,
 						diagnosticOrigin: result.diagnosticOrigin,
 						diagnosticEvidenceAvailable: result.diagnosticEvidenceAvailable,
+						diagnosticRef: result.diagnosticRef,
 						failurePhase: result.failurePhase,
 					});
 					projectRetryState();
@@ -9365,6 +9473,9 @@ export function runQueue(options) {
 									diagnosticEvidenceAvailable:
 										safeFailure.diagnosticEvidenceAvailable,
 								}
+							: {}),
+						...(safeFailure?.diagnosticRef
+							? { diagnosticRef: safeFailure.diagnosticRef }
 							: {}),
 					});
 				}
@@ -9970,6 +10081,9 @@ export async function runQueueWithOrchestrator(options) {
 									diagnosticEvidenceAvailable:
 										safeFailure.diagnosticEvidenceAvailable,
 								}
+							: {}),
+						...(safeFailure?.diagnosticRef
+							? { diagnosticRef: safeFailure.diagnosticRef }
 							: {}),
 					});
 				}

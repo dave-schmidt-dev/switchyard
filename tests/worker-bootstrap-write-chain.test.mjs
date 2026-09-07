@@ -249,6 +249,26 @@ describe("worker-bootstrap writeChain ordering", () => {
 			["later-run-update"],
 		]);
 	});
+
+	it("forwards only the opaque diagnostic reference through terminal persistence", async () => {
+		let persisted;
+		await persistTerminalOutcome({
+			runStore: {
+				createEvent: async (_runId, event) => {
+					persisted = event;
+				},
+			},
+			routeHealth: null,
+			runId: "run-1",
+			event: {
+				event: "task_failed",
+				diagnosticRef: `diagnostic:${"e".repeat(32)}`,
+				diagnosticEvidenceAvailable: true,
+			},
+		});
+		strictEqual(persisted.diagnosticRef, `diagnostic:${"e".repeat(32)}`);
+		strictEqual(Object.hasOwn(persisted, "stdout"), false);
+	});
 	it("BUG (control, unordered): a fast-resolving later callback can be clobbered by a slow-resolving earlier one", async () => {
 		// Fire order matches runQueue's real loop: task A's onResult() fires
 		// first (A just finished), then task B's onTaskStart() fires right

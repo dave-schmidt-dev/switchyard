@@ -2,11 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	linkSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
-	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -165,6 +165,7 @@ const APPROVED_EVENT_KEYS = new Set([
 	"reasonCode",
 	"reason",
 	"artifactRef",
+	"diagnosticRef",
 	"diagnosticCode",
 	"exitCode",
 	"signal",
@@ -209,6 +210,42 @@ const ROUTE_HEALTH_BINDING_KEYS = new Set([
 ]);
 const ROUTE_HEALTH_EPOCH_RE = /^sha256:[a-f0-9]{64}$/;
 const ROUTE_HEALTH_DEFERRED_RESULT = "route_health_deferred";
+const DIAGNOSTIC_REF_RE = /^diagnostic:[a-f0-9]{32}$/u;
+const MAX_DIAGNOSTIC_ARTIFACT_BYTES = 4096;
+const DIAGNOSTIC_DIGEST_RE = /^sha256:[a-f0-9]{64}$/u;
+const MAX_DIAGNOSTIC_STREAM_BYTES = 128 * 1024 * 1024;
+const DIAGNOSTIC_ARTIFACT_KINDS = new Set([
+	"auth_required",
+	"usage_exhausted",
+	"model_unsupported",
+	"permission_denied",
+	"network_unreachable",
+	"cli_usage_error",
+]);
+
+function ownerUidMatches(stat) {
+	return typeof process.getuid !== "function" || stat.uid === process.getuid();
+}
+
+function ownerOnlyDirectoryStat(stat) {
+	return (
+		stat.isDirectory() &&
+		!stat.isSymbolicLink() &&
+		ownerUidMatches(stat) &&
+		(stat.mode & 0o077) === 0
+	);
+}
+
+function ownerOnlyRegularFileStat(stat, maxBytes) {
+	return (
+		stat.isFile() &&
+		!stat.isSymbolicLink() &&
+		stat.nlink === 1 &&
+		ownerUidMatches(stat) &&
+		(stat.mode & 0o077) === 0 &&
+		stat.size <= maxBytes
+	);
+}
 
 function validateRouteHealthBinding(binding) {
 	if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
@@ -1420,6 +1457,133 @@ export async function initializeRun(options) {
 }
 
 /**
+ * Persist only the bounded, already-sanitized provider diagnostic summary.
+ * The resource directory is owner-only and symlink-free; the returned opaque
+ * reference is the only value intended for run/event projections.
+ */
+export async function persistDiagnosticArtifact(runId, evidence) {
+	validateRunId(runId);
+	if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+		return null;
+	}
+	const evidenceKeys = new Set([
+		"stdoutBytes",
+		"stderrBytes",
+		"stdoutDigest",
+		"stderrDigest",
+		"diagnosticKind",
+	]);
+	if (Object.keys(evidence).some((key) => !evidenceKeys.has(key))) return null;
+	const runRoot = getRunRoot(runId);
+	const resources = resolve(runRoot, "resources");
+	for (const existing of [runRoot, resources]) {
+		try {
+			const stat = await lstat(existing);
+			if (!ownerOnlyDirectoryStat(stat)) return null;
+		} catch (error) {
+			if (error.code !== "ENOENT") return null;
+		}
+	}
+	await ensureDir(runRoot, 0o700);
+	await ensureDir(resources, 0o700);
+	const runRootStat = await lstat(runRoot);
+	if (!ownerOnlyDirectoryStat(runRootStat)) return null;
+	const resourceStat = await lstat(resources);
+	if (!ownerOnlyDirectoryStat(resourceStat)) return null;
+	const stdoutBytes = evidence.stdoutBytes;
+	const stderrBytes = evidence.stderrBytes;
+	if (
+		!Number.isSafeInteger(stdoutBytes) ||
+		!Number.isSafeInteger(stderrBytes) ||
+		stdoutBytes < 0 ||
+		stderrBytes < 0 ||
+		stdoutBytes > MAX_DIAGNOSTIC_STREAM_BYTES ||
+		stderrBytes > MAX_DIAGNOSTIC_STREAM_BYTES ||
+		!DIAGNOSTIC_DIGEST_RE.test(evidence.stdoutDigest ?? "") ||
+		!DIAGNOSTIC_DIGEST_RE.test(evidence.stderrDigest ?? "") ||
+		(evidence.diagnosticKind !== undefined &&
+			!DIAGNOSTIC_ARTIFACT_KINDS.has(evidence.diagnosticKind))
+	) {
+		return null;
+	}
+	const bounded = {
+		schemaVersion: 1,
+		kind: "provider_diagnostic",
+		...(DIAGNOSTIC_ARTIFACT_KINDS.has(evidence.diagnosticKind)
+			? { diagnosticKind: evidence.diagnosticKind }
+			: {}),
+		stdoutBytes,
+		stderrBytes,
+		stdoutDigest: evidence.stdoutDigest,
+		stderrDigest: evidence.stderrDigest,
+	};
+	const raw = JSON.stringify(bounded);
+	if (Buffer.byteLength(raw) > MAX_DIAGNOSTIC_ARTIFACT_BYTES) return null;
+	const token = randomUUID().replaceAll("-", "");
+	const filename = `provider-diagnostic-${token}.json`;
+	const destination = resolve(resources, filename);
+	await writeFile(destination, `${raw}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+		flag: "wx",
+	});
+	return `diagnostic:${token}`;
+}
+
+/** Resolve and validate a stored diagnostic reference without exposing raw streams. */
+export async function resolveDiagnosticArtifact(runId, diagnosticRef) {
+	if (!DIAGNOSTIC_REF_RE.test(diagnosticRef ?? "")) return null;
+	validateRunId(runId);
+	const token = diagnosticRef.slice("diagnostic:".length);
+	const path = resolve(
+		getRunRoot(runId),
+		"resources",
+		`provider-diagnostic-${token}.json`,
+	);
+	try {
+		const runRootStat = await lstat(getRunRoot(runId));
+		const resourcesStat = await lstat(resolve(getRunRoot(runId), "resources"));
+		if (
+			!ownerOnlyDirectoryStat(runRootStat) ||
+			!ownerOnlyDirectoryStat(resourcesStat)
+		)
+			return null;
+		const stat = await lstat(path);
+		if (!ownerOnlyRegularFileStat(stat, MAX_DIAGNOSTIC_ARTIFACT_BYTES))
+			return null;
+		const parsed = JSON.parse(await readFile(path, "utf8"));
+		if (parsed?.kind !== "provider_diagnostic" || parsed?.schemaVersion !== 1)
+			return null;
+		const allowed = new Set([
+			"schemaVersion",
+			"kind",
+			"diagnosticKind",
+			"stdoutBytes",
+			"stderrBytes",
+			"stdoutDigest",
+			"stderrDigest",
+		]);
+		if (Object.keys(parsed).some((key) => !allowed.has(key))) return null;
+		if (
+			(parsed.diagnosticKind !== undefined &&
+				!DIAGNOSTIC_ARTIFACT_KINDS.has(parsed.diagnosticKind)) ||
+			!Number.isSafeInteger(parsed.stdoutBytes) ||
+			!Number.isSafeInteger(parsed.stderrBytes) ||
+			parsed.stdoutBytes < 0 ||
+			parsed.stderrBytes < 0 ||
+			parsed.stdoutBytes > MAX_DIAGNOSTIC_STREAM_BYTES ||
+			parsed.stderrBytes > MAX_DIAGNOSTIC_STREAM_BYTES ||
+			!DIAGNOSTIC_DIGEST_RE.test(parsed.stdoutDigest ?? "") ||
+			!DIAGNOSTIC_DIGEST_RE.test(parsed.stderrDigest ?? "")
+		)
+			return null;
+		return parsed;
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Read and validate the run.json for a given runId.
  *
  * @param {string} runId
@@ -1508,6 +1672,20 @@ async function performUpdate(runId, partial, expectedRevision) {
 		updatedAt: new Date().toISOString(),
 		revision: current.revision + 1,
 	};
+	if (merged.lastFailure?.diagnosticRef) {
+		const diagnosticArtifact = await resolveDiagnosticArtifact(
+			runId,
+			merged.lastFailure.diagnosticRef,
+		);
+		if (!diagnosticArtifact) {
+			const withoutDiagnosticRef = { ...merged.lastFailure };
+			delete withoutDiagnosticRef.diagnosticRef;
+			merged.lastFailure = {
+				...withoutDiagnosticRef,
+				diagnosticEvidenceAvailable: false,
+			};
+		}
+	}
 
 	if (merged.state === "failed" && !merged.lastFailure) {
 		merged.lastFailure = sanitizeFailureMetadata({
@@ -1637,8 +1815,26 @@ async function createEventInternal(
 	}
 	const runDir = getRunRoot(runId);
 	const eventsPath = resolve(runDir, "events.jsonl");
+	const bootDiagnosticAvailable = () => {
+		try {
+			const stat = lstatSync(resolve(runDir, "boot-stderr.log"));
+			return (
+				ownerOnlyRegularFileStat(stat, MAX_DIAGNOSTIC_ARTIFACT_BYTES) &&
+				stat.size > 0
+			);
+		} catch {
+			return false;
+		}
+	};
 
 	let current = await readRun(runId);
+	const diagnosticArtifact = event?.diagnosticRef
+		? await resolveDiagnosticArtifact(runId, event.diagnosticRef)
+		: null;
+	const diagnosticEvidenceAvailable = event?.routeHealthBinding
+		? event?.diagnosticEvidenceAvailable === true || Boolean(diagnosticArtifact)
+		: Boolean(diagnosticArtifact) ||
+			(event?.failurePhase === "worker_boot" && bootDiagnosticAvailable());
 	if (
 		event?.routeHealthBinding &&
 		(event.routeHealthBinding.runId !== current.runId ||
@@ -1666,6 +1862,7 @@ async function createEventInternal(
 					...(event.artifactRef !== undefined
 						? { artifactRef: event.artifactRef }
 						: {}),
+					...(diagnosticArtifact ? { diagnosticRef: event.diagnosticRef } : {}),
 					...(event.diagnosticCode !== undefined
 						? { diagnosticCode: event.diagnosticCode }
 						: {}),
@@ -1679,7 +1876,7 @@ async function createEventInternal(
 						: {}),
 					...(event.diagnosticEvidenceAvailable !== undefined
 						? {
-								diagnosticEvidenceAvailable: event.diagnosticEvidenceAvailable,
+								diagnosticEvidenceAvailable,
 							}
 						: {}),
 				}
@@ -1692,14 +1889,20 @@ async function createEventInternal(
 					result: event.result ?? "unknown_failure",
 					errorKind: event.errorKind,
 					timedOut: event.timedOut,
+					artifactRef: event.artifactRef,
 					partialDiffPath: event.partialDiffPath,
 					gateEvidencePath: event.gateEvidencePath,
+					diagnosticRef: diagnosticArtifact ? event.diagnosticRef : undefined,
 					diagnosticCode: event.diagnosticCode,
 					exitCode: event.exitCode,
 					signal: event.signal,
 					failurePhase: event.failurePhase,
 					diagnosticOrigin: event.diagnosticOrigin,
-					diagnosticEvidenceAvailable: event.diagnosticEvidenceAvailable,
+					diagnosticEvidenceAvailable: diagnosticEvidenceAvailable
+						? true
+						: event.diagnosticEvidenceAvailable !== undefined
+							? false
+							: undefined,
 					resolvedTargetId: event.resolvedTargetId,
 					descriptorIdentity: event.descriptorIdentity,
 					descriptorHarness: event.descriptorHarness,
@@ -1722,6 +1925,7 @@ async function createEventInternal(
 			}
 		}
 	}
+	if (!diagnosticArtifact) delete entry.diagnosticRef;
 	// Admission wait telemetry is deliberately opt-in rather than a general
 	// event field. This prevents arbitrary status payloads from widening the
 	// durable event schema while retaining one content-free progress measure.
@@ -3052,8 +3256,11 @@ function hasDiagnosticRecord(runId) {
 		return true;
 	}
 	try {
-		const stat = statSync(resolve(getRunRoot(runId), "boot-stderr.log"));
-		return stat.size > 0;
+		const stat = lstatSync(resolve(getRunRoot(runId), "boot-stderr.log"));
+		return (
+			ownerOnlyRegularFileStat(stat, MAX_DIAGNOSTIC_ARTIFACT_BYTES) &&
+			stat.size > 0
+		);
 	} catch {
 		return false;
 	}

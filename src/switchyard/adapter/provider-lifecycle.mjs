@@ -12,8 +12,10 @@ import {
 } from "../lifecycle/index.mjs";
 import {
 	classifyProviderDiagnostic,
+	classifyProviderStreams,
 	cleanupDiagnosticCodeFor,
 	describeExecError,
+	providerDiagnosticCodeForKind,
 } from "./exec-error.mjs";
 import { validateIdentifier } from "./shell-safety.mjs";
 
@@ -21,6 +23,13 @@ const DEFAULT_MAX_BUFFER = 128 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_DIAGNOSTIC_CHARS = 800;
+
+// Keep the provider's original argv[0] attached to the exact transport args
+// array returned to the adapter. VM transports may expose only `prlctl` as the
+// host command while carrying a base64 guest argv inside their private args;
+// classification must use the original provider binding without decoding or
+// trusting caller-supplied transport text.
+const WORKSPACE_PROVIDER_COMMANDS = new WeakMap();
 
 /**
  * Verify the narrow lifecycle fact required before a completed provider may
@@ -103,6 +112,8 @@ export function getWorkspaceExecution(
 			"getWorkspaceExecution requires an executionBackend — none was threaded through",
 		);
 	}
+	const originalProviderCommand =
+		Array.isArray(argv) && typeof argv[0] === "string" ? argv[0] : null;
 	const execution = executionBackend.execArgv(workspaceId, {
 		cwd,
 		argv,
@@ -110,7 +121,11 @@ export function getWorkspaceExecution(
 		env,
 		...(cleanupContext ? { cleanupContext } : {}),
 	});
-	return { command: execution.command, args: [...execution.args] };
+	const args = [...execution.args];
+	if (originalProviderCommand !== null) {
+		WORKSPACE_PROVIDER_COMMANDS.set(args, originalProviderCommand);
+	}
+	return { command: execution.command, args };
 }
 
 function markerContext(cleanupContext, operation) {
@@ -172,7 +187,6 @@ export function runProviderProcess(command, args, options = {}) {
 		setIntervalFn = setInterval,
 		clearIntervalFn = clearInterval,
 	} = options;
-
 	return new Promise((resolve) => {
 		const startedAt = now();
 		let child;
@@ -362,6 +376,8 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		adapterDiagnosticCode,
 		...lifecycleOptions
 	} = options;
+	const classificationCommand =
+		WORKSPACE_PROVIDER_COMMANDS.get(args) ?? command;
 	// A backend that implements cleanupProviderProcess() (currently only
 	// ParallelsExecutionBackend) is authoritative for its own transport — the
 	// adapter's `cleanup` (killOrphanedProcessesAsync, Docker-only) would be a
@@ -434,9 +450,18 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				? "provider_cleanup"
 				: "provider_execution",
 			diagnosticOrigin: "adapter",
-			diagnosticEvidenceAvailable: true,
+			// Raw streams are still in-process evidence.  They become authoritative
+			// only after the run-store producer returns a resolved opaque reference.
+			diagnosticEvidenceAvailable: false,
 			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 			signal: result.signal ?? null,
+			diagnosticEvidence: classifyProviderStreams({
+				stdout: result.output,
+				stderr: result.stderr,
+				code: result.code,
+				provider,
+				command: classificationCommand,
+			}),
 		};
 	}
 	if (result.cancelled) {
@@ -456,10 +481,17 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				: "execution_cancelled",
 			failurePhase: cleanupFailed ? "provider_cleanup" : "provider_execution",
 			diagnosticOrigin: "adapter",
-			diagnosticEvidenceAvailable: true,
+			diagnosticEvidenceAvailable: false,
 			cleanupStage: result.cleanupStage,
 			exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 			signal: result.signal ?? null,
+			diagnosticEvidence: classifyProviderStreams({
+				stdout: result.output,
+				stderr: result.stderr,
+				code: result.code,
+				provider,
+				command: classificationCommand,
+			}),
 		};
 	}
 	const error = Object.assign(
@@ -478,13 +510,23 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			: adapterDiagnosticCode;
 	const diagnosticOrigin =
 		launcherDiagnosticCode === "cli_usage_error" ? "launcher" : "adapter";
+	const diagnosticEvidence = classifyProviderStreams({
+		stdout: result.output,
+		stderr: result.stderr,
+		code: result.code,
+		provider,
+		command: classificationCommand,
+	});
+	const parsedDiagnosticCode = providerDiagnosticCodeForKind(
+		diagnosticEvidence.diagnosticKind,
+	);
 	return {
 		output: described.output,
 		success: false,
 		error: truncateDiagnostic(described.error),
 		errorKind: described.errorKind ?? "execution_failed",
 		diagnosticCode: classifyProviderDiagnostic({
-			diagnosticCode: explicitDiagnosticCode,
+			diagnosticCode: explicitDiagnosticCode ?? parsedDiagnosticCode,
 			diagnosticOrigin,
 			diagnosticEvidenceAvailable: true,
 			failurePhase: "provider_execution",
@@ -493,9 +535,11 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		}),
 		failurePhase: "provider_execution",
 		diagnosticOrigin,
-		diagnosticEvidenceAvailable: true,
+		// The adapter cannot claim durable evidence before the run-store boundary.
+		diagnosticEvidenceAvailable: false,
 		exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 		signal: result.signal ?? null,
+		diagnosticEvidence,
 	};
 }
 

@@ -7,6 +7,7 @@ import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
 const TERMINAL_OUTCOMES = new Set(["success", "failure", "cancel"]);
 const FAILURE_KINDS = new Set(["provider", "transient"]);
+const DIAGNOSTIC_REF_RE = /^diagnostic:[a-f0-9]{32}$/u;
 
 /**
  * Bound a launcher's cleanup stage to the backend-owned vocabulary.
@@ -20,6 +21,12 @@ const FAILURE_KINDS = new Set(["provider", "transient"]);
 function cleanupStageOf(launcherResult) {
 	return CLEANUP_STAGES.has(launcherResult?.cleanupStage)
 		? launcherResult.cleanupStage
+		: null;
+}
+
+function diagnosticRefOf(launcherResult) {
+	return DIAGNOSTIC_REF_RE.test(launcherResult?.diagnosticRef ?? "")
+		? launcherResult.diagnosticRef
 		: null;
 }
 function sameSnapshot(left, right) {
@@ -228,6 +235,16 @@ export async function executeBrokerRoute(options) {
 			onPoll: options.onPoll,
 			onTaskHeartbeat: options.onTaskHeartbeat,
 		});
+		// Persistence is owned by the adapter/run-store boundary.  The broker
+		// only carries a strict reference returned by that producer and drops
+		// the in-process streams before constructing any durable result.
+		const diagnosticRef = diagnosticRefOf(launcherResult);
+		launcherResult = {
+			...launcherResult,
+			diagnosticRef,
+			diagnosticEvidenceAvailable: diagnosticRef !== null,
+		};
+		delete launcherResult.diagnosticEvidence;
 		if (signal?.aborted || launcherResult?.cancelled === true) {
 			await reconcileOnce("cancel", null);
 			emit(options.onStatus, "execution_cancelled", route);
@@ -292,6 +309,7 @@ export async function executeBrokerRoute(options) {
 				(!terminalCompleted ? "terminal_reconciliation" : "provider_execution"),
 			diagnosticOrigin: launcherResult?.diagnosticOrigin,
 			diagnosticEvidenceAvailable: launcherResult?.diagnosticEvidenceAvailable,
+			diagnosticRef: launcherResult?.diagnosticRef,
 			resolvedTargetId: route.resolvedTarget,
 			descriptorIdentity,
 			descriptorHarness: route.harness,
@@ -333,6 +351,7 @@ export async function executeBrokerRoute(options) {
 			diagnosticOrigin: failure?.diagnosticOrigin ?? null,
 			diagnosticEvidenceAvailable:
 				failure?.diagnosticEvidenceAvailable ?? false,
+			diagnosticRef: failure?.diagnosticRef ?? null,
 			resolvedTargetId: failure?.resolvedTargetId ?? null,
 			descriptorIdentity: failure?.descriptorIdentity ?? null,
 			descriptorHarness: failure?.descriptorHarness ?? null,

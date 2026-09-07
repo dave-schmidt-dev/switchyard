@@ -200,13 +200,45 @@ describe("broker async executor", () => {
 		strictEqual(result.exitCode, 2);
 		strictEqual(result.failurePhase, "provider_execution");
 		strictEqual(result.diagnosticOrigin, "launcher");
-		strictEqual(result.diagnosticEvidenceAvailable, true);
+		strictEqual(result.diagnosticEvidenceAvailable, false);
+		strictEqual(result.diagnosticRef, null);
 		strictEqual(result.resolvedTargetId, value.route.resolvedTarget);
 		strictEqual(
 			result.descriptorIdentity,
 			value.descriptor.descriptor_identity,
 		);
 		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
+	});
+
+	it("carries only the storage-returned diagnostic reference", async () => {
+		const value = fixture();
+		let persistenceCalls = 0;
+		const storedRef = `diagnostic:${"c".repeat(32)}`;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				diagnosticRef: storedRef,
+				diagnosticEvidenceAvailable: true,
+				diagnosticEvidence: {
+					stdoutBytes: 4,
+					stderrBytes: 0,
+					stdoutDigest: `sha256:${"a".repeat(64)}`,
+					stderrDigest: `sha256:${"b".repeat(64)}`,
+				},
+			}),
+			persistDiagnosticArtifact: async () => {
+				persistenceCalls += 1;
+				return `diagnostic:${"d".repeat(32)}`;
+			},
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.diagnosticRef, storedRef);
+		strictEqual(persistenceCalls, 0);
+		strictEqual(Object.hasOwn(result, "diagnosticEvidence"), false);
 	});
 
 	it("relays only an exact completion lifecycle proof and drops any other shape", async () => {

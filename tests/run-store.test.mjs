@@ -16,6 +16,7 @@ import {
 	readFileSync,
 	renameSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -49,6 +50,7 @@ import {
 	isProjectLockOwnedBy,
 	isRunLockExpired,
 	LockError,
+	persistDiagnosticArtifact,
 	RevisionError,
 	readAuthorizedRunEvents,
 	readEvents,
@@ -61,6 +63,7 @@ import {
 	releaseRunLock,
 	releaseVmSlot,
 	renewRunLock,
+	resolveDiagnosticArtifact,
 	runStoreTesting,
 	SchemaError,
 	sanitizeVmAdmissionError,
@@ -78,6 +81,159 @@ const TEST_ROOT = tempDir("switchyard-run-store-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
+
+describe("provider diagnostic artifact boundary", () => {
+	it("stores bounded digest/count metadata and resolves only opaque refs", async () => {
+		const runId = `diagnostic-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		const ref = await persistDiagnosticArtifact(runId, {
+			stdoutBytes: 12,
+			stderrBytes: 4,
+			stdoutDigest: `sha256:${"a".repeat(64)}`,
+			stderrDigest: `sha256:${"b".repeat(64)}`,
+			diagnosticKind: "auth_required",
+		});
+		strictEqual(ref, `diagnostic:${ref.slice("diagnostic:".length)}`);
+		const artifact = await resolveDiagnosticArtifact(runId, ref);
+		strictEqual(artifact.kind, "provider_diagnostic");
+		strictEqual(artifact.diagnosticKind, "auth_required");
+		strictEqual(artifact.diagnosticCode, undefined);
+		strictEqual(Object.keys(artifact).includes("secret"), false);
+		for (const diagnosticKind of [
+			"auth_required",
+			"usage_exhausted",
+			"model_unsupported",
+			"permission_denied",
+			"network_unreachable",
+			"cli_usage_error",
+		]) {
+			const kindRef = await persistDiagnosticArtifact(runId, {
+				stdoutBytes: 1,
+				stderrBytes: 1,
+				stdoutDigest: `sha256:${"a".repeat(64)}`,
+				stderrDigest: `sha256:${"b".repeat(64)}`,
+				diagnosticKind,
+			});
+			const kindArtifact = await resolveDiagnosticArtifact(runId, kindRef);
+			strictEqual(kindArtifact.diagnosticKind, diagnosticKind);
+			strictEqual(kindArtifact.diagnosticCode, undefined);
+		}
+		const current = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "failed",
+				lastFailure: {
+					errorKind: "execution_failed",
+					reasonCode: "execution_failed",
+					reason: "Provider execution failed before a reviewed integration.",
+					diagnosticRef: `diagnostic:${"f".repeat(32)}`,
+					diagnosticEvidenceAvailable: true,
+				},
+			},
+			current.revision,
+		);
+		const projectedFailure = (await readRun(runId)).lastFailure;
+		strictEqual(projectedFailure.diagnosticRef, undefined);
+		strictEqual(projectedFailure.diagnosticEvidenceAvailable, false);
+		const resources = join(getRunRoot(runId), "resources");
+		chmodSync(getRunRoot(runId), 0o755);
+		strictEqual(await resolveDiagnosticArtifact(runId, ref), null);
+		chmodSync(getRunRoot(runId), 0o700);
+		chmodSync(resources, 0o755);
+		strictEqual(await resolveDiagnosticArtifact(runId, ref), null);
+		chmodSync(resources, 0o700);
+		strictEqual(await resolveDiagnosticArtifact(runId, "diagnostic:bad"), null);
+		strictEqual(
+			await persistDiagnosticArtifact(runId, {
+				stdoutBytes: 1,
+				stderrBytes: 1,
+				stdoutDigest: "bad",
+				stderrDigest: `sha256:${"b".repeat(64)}`,
+			}),
+			null,
+		);
+		strictEqual(
+			await persistDiagnosticArtifact(runId, {
+				stdoutBytes: 1,
+				stderrBytes: 1,
+				stdoutDigest: `sha256:${"a".repeat(64)}`,
+				stderrDigest: `sha256:${"b".repeat(64)}`,
+				extra: "rejected",
+			}),
+			null,
+		);
+		strictEqual(
+			await persistDiagnosticArtifact(runId, {
+				stdoutBytes: 1,
+				stderrBytes: 1,
+				stdoutDigest: `sha256:${"a".repeat(64)}`,
+				stderrDigest: `sha256:${"b".repeat(64)}`,
+				diagnosticCode: "auth_required",
+			}),
+			null,
+		);
+		strictEqual(
+			await persistDiagnosticArtifact(runId, {
+				stdoutBytes: 1,
+				stderrBytes: 1,
+				stdoutDigest: `sha256:${"a".repeat(64)}`,
+				stderrDigest: `sha256:${"b".repeat(64)}`,
+				diagnosticKind: "auth_required",
+				diagnosticCode: "cli_usage_error",
+			}),
+			null,
+		);
+		const token = "d".repeat(32);
+		const destination = join(resources, `provider-diagnostic-${token}.json`);
+		writeFileSync(
+			destination,
+			JSON.stringify({
+				schemaVersion: 1,
+				kind: "provider_diagnostic",
+				diagnosticKind: "not_closed",
+				stdoutBytes: 1,
+				stderrBytes: 1,
+				stdoutDigest: `sha256:${"a".repeat(64)}`,
+				stderrDigest: `sha256:${"b".repeat(64)}`,
+			}),
+			{ mode: 0o600 },
+		);
+		strictEqual(
+			await resolveDiagnosticArtifact(runId, `diagnostic:${token}`),
+			null,
+		);
+		const directoryToken = "f".repeat(32);
+		mkdirSync(join(resources, `provider-diagnostic-${directoryToken}.json`));
+		strictEqual(
+			await resolveDiagnosticArtifact(runId, `diagnostic:${directoryToken}`),
+			null,
+		);
+		chmodSync(destination, 0o644);
+		strictEqual(
+			await resolveDiagnosticArtifact(runId, `diagnostic:${token}`),
+			null,
+		);
+		const symlinkToken = "e".repeat(32);
+		const symlinkPath = join(
+			resources,
+			`provider-diagnostic-${symlinkToken}.json`,
+		);
+		symlinkSync(destination, symlinkPath);
+		strictEqual(
+			await resolveDiagnosticArtifact(runId, `diagnostic:${symlinkToken}`),
+			null,
+		);
+	});
+});
 process.env.SWITCHYARD_ROSTER_PATH = resolve(
 	"tests/fixtures/roster.fixture.json",
 );
@@ -677,12 +833,32 @@ describe("event ordering", () => {
 		});
 		const [event] = await readEvents(opts.runId);
 		strictEqual(event.diagnosticOrigin, "adapter");
-		strictEqual(event.diagnosticEvidenceAvailable, true);
+		strictEqual(event.diagnosticEvidenceAvailable, false);
 		strictEqual(event.exitCode, 255);
 		ok(!JSON.stringify(event).includes("SECRET_CANARY"));
 		const stored = await readRun(opts.runId);
 		strictEqual(stored.lastFailure.diagnosticOrigin, "adapter");
-		strictEqual(stored.lastFailure.diagnosticEvidenceAvailable, true);
+		strictEqual(stored.lastFailure.diagnosticEvidenceAvailable, false);
+	});
+
+	it("does not trust queue-preflight or worker-boot availability without retained evidence", async () => {
+		for (const failurePhase of ["queue_preflight", "worker_boot"]) {
+			const opts = makeOptions();
+			await initializeRun(opts);
+			await createEvent(opts.runId, {
+				phase: "worker",
+				event: "worker_boot_failed",
+				status: "fatal",
+				result: "launch_failed",
+				errorKind: "launch_failed",
+				diagnosticCode: "worker_boot_exception",
+				diagnosticOrigin: "worker_boot",
+				diagnosticEvidenceAvailable: true,
+				failurePhase,
+			});
+			const [event] = await readEvents(opts.runId);
+			strictEqual(event.diagnosticEvidenceAvailable, false, failurePhase);
+		}
 	});
 });
 

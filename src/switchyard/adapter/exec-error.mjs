@@ -977,21 +977,17 @@ function normalizePersistentErrorKind(value) {
 /**
  * Build static, content-free failure metadata for persistence.
  * @param {object} input
- * @param {string} [input.taskId]
  * @param {string} [input.result]
  * @param {string|null} [input.errorKind]
  * @param {boolean} [input.timedOut]
- * @param {string} [input.partialDiffPath] transient path, never returned
- * @param {string} [input.gateEvidencePath] transient path, never returned
+ * @param {string} [input.artifactRef] storage-returned opaque reference
  * @returns {{errorKind: string, reasonCode: string, reason: string, artifactRef?: string}|null}
  */
 export function sanitizeFailureMetadata({
-	taskId,
 	result,
 	errorKind,
 	timedOut = false,
-	partialDiffPath,
-	gateEvidencePath,
+	artifactRef,
 	diagnosticCode,
 	diagnosticOrigin,
 	diagnosticEvidenceAvailable,
@@ -1002,6 +998,7 @@ export function sanitizeFailureMetadata({
 	resolvedTargetId,
 	descriptorIdentity,
 	descriptorHarness,
+	diagnosticRef,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -1029,9 +1026,15 @@ export function sanitizeFailureMetadata({
 		diagnosticEvidenceAvailable,
 		failurePhase,
 	});
+	const trustedDiagnosticShape = hasAuthoritativeDiagnosticProvenance({
+		diagnosticCode: closedDiagnosticCode,
+		diagnosticOrigin,
+		diagnosticEvidenceAvailable: true,
+		failurePhase,
+	});
 	if (
 		closedDiagnosticCode &&
-		(!hasProvenanceInput || authoritativeProvenance)
+		(!hasProvenanceInput || authoritativeProvenance || trustedDiagnosticShape)
 	) {
 		safe.diagnosticCode = closedDiagnosticCode;
 	}
@@ -1042,9 +1045,31 @@ export function sanitizeFailureMetadata({
 	if (PERSISTED_FAILURE_PHASES.has(failurePhase)) {
 		safe.failurePhase = failurePhase;
 	}
-	if (authoritativeProvenance) {
+	if (
+		(authoritativeProvenance || trustedDiagnosticShape) &&
+		diagnosticEvidenceAvailable === true
+	) {
 		safe.diagnosticOrigin = diagnosticOrigin;
 		safe.diagnosticEvidenceAvailable = true;
+	}
+	if (diagnosticEvidenceAvailable === false) {
+		safe.diagnosticEvidenceAvailable = false;
+	}
+	if (
+		typeof artifactRef === "string" &&
+		/^artifact:[a-f0-9]{24}$/u.test(artifactRef)
+	) {
+		safe.artifactRef = artifactRef;
+	}
+	if (trustedDiagnosticShape && diagnosticEvidenceAvailable !== true) {
+		safe.diagnosticOrigin = diagnosticOrigin;
+	}
+	if (
+		typeof diagnosticRef === "string" &&
+		/^diagnostic:[a-f0-9]{32}$/u.test(diagnosticRef) &&
+		diagnosticEvidenceAvailable === true
+	) {
+		safe.diagnosticRef = diagnosticRef;
 	}
 	// Route identity is additive, bounded provenance. It is deliberately
 	// independent from raw invocation arguments so it is safe in public state.
@@ -1063,22 +1088,6 @@ export function sanitizeFailureMetadata({
 		safe.resolvedTargetId = resolvedTargetId;
 		safe.descriptorIdentity = descriptorIdentity;
 		safe.descriptorHarness = descriptorHarness;
-	}
-	// The diff is the better evidence when one exists. The transcript is what
-	// an `empty_required_diff` rejection has instead of a diff, and naming it
-	// here is what stops that failure from being recorded with no evidence at
-	// all. Only the opaque reference crosses; the bytes stay on the host.
-	const artifactName = partialDiffPath
-		? `${taskId}.diff`
-		: gateEvidencePath
-			? `${taskId}.output`
-			: null;
-	if (artifactName && typeof taskId === "string" && taskId) {
-		const digest = createHash("sha256")
-			.update(artifactName)
-			.digest("hex")
-			.slice(0, 24);
-		safe.artifactRef = `artifact:${digest}`;
 	}
 	return safe;
 }
@@ -1104,6 +1113,7 @@ export function isPersistentFailureMetadata(value) {
 		"resolvedTargetId",
 		"descriptorIdentity",
 		"descriptorHarness",
+		"diagnosticRef",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
 	const expected = sanitizeFailureMetadata({
@@ -1125,6 +1135,12 @@ export function isPersistentFailureMetadata(value) {
 			return false;
 		}
 	}
+	if (
+		value.diagnosticRef !== undefined &&
+		(typeof value.diagnosticRef !== "string" ||
+			!/^diagnostic:[a-f0-9]{32}$/u.test(value.diagnosticRef))
+	)
+		return false;
 	const safeDiagnostics = sanitizeFailureMetadata({
 		result: "execution_failed",
 		diagnosticCode: value.diagnosticCode,
@@ -1136,6 +1152,7 @@ export function isPersistentFailureMetadata(value) {
 		resolvedTargetId: value.resolvedTargetId,
 		descriptorIdentity: value.descriptorIdentity,
 		descriptorHarness: value.descriptorHarness,
+		diagnosticRef: value.diagnosticRef,
 	});
 	for (const field of [
 		"diagnosticCode",
@@ -1147,6 +1164,7 @@ export function isPersistentFailureMetadata(value) {
 		"resolvedTargetId",
 		"descriptorIdentity",
 		"descriptorHarness",
+		"diagnosticRef",
 	]) {
 		if (value[field] !== safeDiagnostics?.[field]) return false;
 	}
@@ -1156,6 +1174,115 @@ export function isPersistentFailureMetadata(value) {
 // Cap the surfaced reason so a runaway provider dump can't bloat the ledger
 // line (JSONL, one object per line) or a status surface.
 const MAX_REASON_CHARS = 800;
+
+// Durable provider evidence is deliberately stricter than the legacy human
+// diagnostic helper above.  Only complete, provider-owned lines may mint a
+// closed diagnostic code; mixed or partially matching streams remain unknown.
+const STRICT_PROVIDER_LINES = Object.freeze({
+	auth_required:
+		/^(?:Error:\s*)?(?:Authentication required|Not logged in|Session expired)$/iu,
+	usage_exhausted:
+		/^(?:Error:\s*)?(?:Usage limit reached|Quota exhausted|Rate limit exceeded)$/iu,
+	model_unsupported:
+		/^(?:Error:\s*)?(?:Model unavailable|Unsupported model|Model not found)$/iu,
+	permission_denied: /^(?:Error:\s*)?(?:Permission denied|EACCES)$/iu,
+	network_unreachable:
+		/^(?:Error:\s*)?(?:Network unreachable|Connection refused|Connection error|ENOTFOUND)$/iu,
+});
+
+const PROVIDER_DIAGNOSTIC_KIND_TO_RUNTIME_CODE = Object.freeze({
+	auth_required: "auth_expired",
+	usage_exhausted: "quota_exhausted",
+	model_unsupported: "model_unavailable",
+	cli_usage_error: "cli_usage_error",
+});
+
+/** Map only established provider artifact kinds into legacy runtime codes. */
+export function providerDiagnosticCodeForKind(kind) {
+	return PROVIDER_DIAGNOSTIC_KIND_TO_RUNTIME_CODE[kind] ?? null;
+}
+
+const PROVIDER_BINARIES = Object.freeze({
+	claude: new Set(["claude"]),
+	codex: new Set(["codex"]),
+	agy: new Set(["agy"]),
+	cursor: new Set(["cursor", "cursor-agent"]),
+	copilot: new Set(["copilot"]),
+	opencode: new Set(["opencode"]),
+	vibe: new Set(["vibe"]),
+});
+
+function streamBytes(value) {
+	if (Buffer.isBuffer(value)) return value;
+	return typeof value === "string"
+		? Buffer.from(value, "utf8")
+		: Buffer.alloc(0);
+}
+
+/**
+ * Parse real stdout/stderr independently for the durable diagnostic channel.
+ * Unknown and mixed content is represented only by byte counts and SHA-256
+ * digests; no provider text crosses this boundary.
+ */
+export function classifyProviderStreams({
+	stdout = "",
+	stderr = "",
+	code = null,
+	provider = null,
+	command = null,
+} = {}) {
+	const outBytes = streamBytes(stdout);
+	const errBytes = streamBytes(stderr);
+	const out = outBytes.toString("utf8");
+	const err = errBytes.toString("utf8");
+	const digest = (bytes) =>
+		`sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+	const result = {
+		stdoutBytes: outBytes.length,
+		stderrBytes: errBytes.length,
+		stdoutDigest: digest(outBytes),
+		stderrDigest: digest(errBytes),
+	};
+	const lines = (text) =>
+		text
+			.split(/\r?\n/u)
+			.map((line) => line.trim())
+			.filter(Boolean);
+	const all = [...lines(out), ...lines(err)];
+	if (all.length === 0) return result;
+	const binary =
+		typeof command === "string" ? command.split(/[\\/]/u).at(-1) : null;
+	const providerKey =
+		typeof provider === "string" ? provider.toLowerCase() : null;
+	const approvedPair =
+		providerKey !== null &&
+		binary !== null &&
+		PROVIDER_BINARIES[providerKey]?.has(binary) === true;
+	if (
+		code === 2 &&
+		all.length > 0 &&
+		approvedPair &&
+		all[0].startsWith(`Usage: ${binary}`)
+	) {
+		return { ...result, diagnosticKind: "cli_usage_error" };
+	}
+	if (approvedPair) {
+		let matchedKind = null;
+		for (const line of all) {
+			const lineKind = Object.entries(STRICT_PROVIDER_LINES).find(
+				([, pattern]) => pattern.test(line),
+			)?.[0];
+			if (!lineKind || (matchedKind !== null && lineKind !== matchedKind)) {
+				return result;
+			}
+			matchedKind ??= lineKind;
+		}
+		if (matchedKind !== null) {
+			return { ...result, diagnosticKind: matchedKind };
+		}
+	}
+	return result;
+}
 
 // D-10: per-provider re-auth command, matching README's documented recovery step.
 // An expired-but-present token IS fixed by `npm run auth` now — liveness
