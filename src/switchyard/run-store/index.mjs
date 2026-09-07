@@ -38,6 +38,10 @@ import {
 	validateModelArg,
 } from "../adapter/shell-safety.mjs";
 import {
+	isReviewResult,
+	sanitizeReviewResult,
+} from "../diagnostics/review-result.mjs";
+import {
 	getInvocationDescriptorIdentity,
 	normalizeProviderName,
 	resolveTargetIdentity,
@@ -121,7 +125,11 @@ const TELEMETRY_WRITE_FAILURE_LABELS = new Set([
 	"write_failed",
 ]);
 
-const SUCCESS_RESULTS = new Set(["success", "success_no_diff"]);
+const SUCCESS_RESULTS = new Set([
+	"success",
+	"success_no_diff",
+	"review_completed",
+]);
 
 const APPROVED_EVENT_KEYS = new Set([
 	"schemaVersion",
@@ -197,6 +205,7 @@ const APPROVED_EVENT_KEYS = new Set([
 	// configuration and host repair epoch.  Legacy events remain readable but
 	// deliberately have no route-health authority.
 	"routeHealthBinding",
+	"reviewResult",
 ]);
 
 const ROUTE_HEALTH_BINDING_KEYS = new Set([
@@ -1275,6 +1284,13 @@ function validateRun(data) {
 		throw new SchemaError("lastFailure contains invalid persistent metadata");
 	}
 	if (
+		data.lastReviewResult !== undefined &&
+		data.lastReviewResult !== null &&
+		!isReviewResult(data.lastReviewResult)
+	) {
+		throw new SchemaError("lastReviewResult contains invalid review metadata");
+	}
+	if (
 		data.terminalizedBy !== undefined &&
 		data.terminalizedBy !== "worker" &&
 		data.terminalizedBy !== "dead_worker_recovery"
@@ -1458,6 +1474,7 @@ export async function initializeRun(options) {
 		lastLeaseHeartbeat: now,
 		lastEventSequence: 0,
 		lastFailure: null,
+		lastReviewResult: null,
 		launchArgs,
 	};
 	if (versioned) {
@@ -1677,6 +1694,13 @@ async function performUpdate(runId, partial, expectedRevision) {
 		);
 	}
 
+	if (
+		partial?.lastReviewResult !== undefined &&
+		partial.lastReviewResult !== null &&
+		!isReviewResult(partial.lastReviewResult)
+	) {
+		throw new SchemaError("lastReviewResult contains invalid review metadata");
+	}
 	const merged = {
 		...current,
 		...partial,
@@ -1926,6 +1950,10 @@ async function createEventInternal(
 					descriptorHarness: event.descriptorHarness,
 				})
 		: null;
+	const projectedReviewResult =
+		event?.reviewResult === undefined
+			? undefined
+			: sanitizeReviewResult(event.reviewResult);
 
 	const entry = {
 		schemaVersion: current.schemaVersion,
@@ -1940,21 +1968,23 @@ async function createEventInternal(
 		for (const key of Object.keys(event)) {
 			if (APPROVED_EVENT_KEYS.has(key)) {
 				entry[key] =
-					key === "progress"
-						? createProgressSnapshot({
-								stage: event.progress?.stage,
-								elapsedMs: event.progress?.elapsedMs,
-								lastSubstantiveProgressAt:
-									event.progress?.lastSubstantiveProgressAt,
-								lastSubstantiveProgressAgeMs:
-									event.progress?.lastSubstantiveProgressAgeMs,
-								stdoutBytes: event.progress?.counters?.stdoutBytes,
-								stderrBytes: event.progress?.counters?.stderrBytes,
-								pollCount: event.progress?.counters?.polls,
-								progressCount: event.progress?.counters?.progressEvents,
-								outcome: event.progress?.outcome,
-							})
-						: event[key];
+					key === "reviewResult"
+						? projectedReviewResult
+						: key === "progress"
+							? createProgressSnapshot({
+									stage: event.progress?.stage,
+									elapsedMs: event.progress?.elapsedMs,
+									lastSubstantiveProgressAt:
+										event.progress?.lastSubstantiveProgressAt,
+									lastSubstantiveProgressAgeMs:
+										event.progress?.lastSubstantiveProgressAgeMs,
+									stdoutBytes: event.progress?.counters?.stdoutBytes,
+									stderrBytes: event.progress?.counters?.stderrBytes,
+									pollCount: event.progress?.counters?.polls,
+									progressCount: event.progress?.counters?.progressEvents,
+									outcome: event.progress?.outcome,
+								})
+							: event[key];
 			}
 		}
 	}
@@ -2017,6 +2047,9 @@ async function createEventInternal(
 			{
 				lastEventSequence: nextSeq,
 				...(safeFailure ? { lastFailure: safeFailure } : {}),
+				...(projectedReviewResult !== undefined
+					? { lastReviewResult: projectedReviewResult }
+					: {}),
 			},
 			current.revision,
 		);
@@ -2030,6 +2063,9 @@ async function createEventInternal(
 					{
 						lastEventSequence: nextSeq,
 						...(safeFailure ? { lastFailure: safeFailure } : {}),
+						...(projectedReviewResult !== undefined
+							? { lastReviewResult: projectedReviewResult }
+							: {}),
 					},
 					current.revision,
 				);

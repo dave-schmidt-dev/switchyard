@@ -1061,6 +1061,7 @@ async function runDispatch(opts, dependencies = {}) {
 								? { servedModelVerified: r.servedModelVerified }
 								: {}),
 							result: r.result,
+							...(r.reviewResult ? { reviewResult: r.reviewResult } : {}),
 							...(r.alreadyApplied ? { alreadyApplied: true } : {}),
 							...(safeFailure ?? {}),
 							...(artifactRef ? { artifactRef } : {}),
@@ -1100,6 +1101,9 @@ async function runDispatch(opts, dependencies = {}) {
 									lastTaskInvocationDescriptor: r.invocationDescriptor ?? null,
 									lastTaskDescriptorIdentity: r.descriptorIdentity ?? null,
 									lastTaskDescriptorHarness: r.descriptorHarness ?? null,
+									...(r.reviewResult
+										? { lastReviewResult: r.reviewResult }
+										: {}),
 									...(safeFailure ? { lastFailure: safeFailure } : {}),
 								});
 							})
@@ -2073,6 +2077,7 @@ async function buildStatusEnvelope(runId, run) {
 			run.lastFailure ?? null,
 			await listArtifactRefs(runId),
 		),
+		lastReviewResult: run.lastReviewResult ?? null,
 		...retryProjection,
 		queueDiagnostics,
 		startedAt: run.startedAt ?? null,
@@ -2223,6 +2228,7 @@ async function buildResultEnvelope(runId, run) {
 		lastFailure: projectFailureRemedy(
 			reconcileFailureArtifactRef(run.lastFailure ?? null, artifactRefs),
 		),
+		lastReviewResult: run.lastReviewResult ?? null,
 		...retryProjection,
 		queueDiagnostics,
 		startedAt: run.startedAt ?? null,

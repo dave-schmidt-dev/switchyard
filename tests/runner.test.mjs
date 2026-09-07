@@ -2823,7 +2823,7 @@ describe("async runner provider lifecycle", () => {
 		const checkpointPath = join(root, "checkpoint.json");
 		writeFileSync(
 			tasksPath,
-			"### Task 4.1: Async provider\n- **Status:** pending\n- **Type:** review\n- **Description:** exercise async lifecycle\n- **Executor:** switchyard\n",
+			"### Task 4.1: Async provider\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** exercise async lifecycle\n- **Executor:** switchyard\n",
 		);
 		const descriptor = descriptorForRoute({
 			provider: "opencode",
@@ -2839,6 +2839,7 @@ describe("async runner provider lifecycle", () => {
 			workingContainerName: "async-worker",
 			checkpointPath,
 			dependencies: {
+				integrationGate: () => ({ success: true }),
 				route: (options) => {
 					routeOptions.push(options);
 					return {
@@ -2857,7 +2858,10 @@ describe("async runner provider lifecycle", () => {
 						executeAsync: async () => {
 							await new Promise((resolve) => setTimeout(resolve, 5));
 							settled = true;
-							return { success: true, output: "" };
+							return {
+								success: true,
+								output: JSON.stringify({ verdict: "clean", findings: [] }),
+							};
 						},
 						captureDiff: () => null,
 						captureDiffAsync: async () => null,
@@ -2903,7 +2907,7 @@ describe("async runner provider lifecycle", () => {
 			const checkpointPath = join(root, "checkpoint.json");
 			writeFileSync(
 				tasksPath,
-				"### Task 4.2: Diagnostic producer\n- **Status:** pending\n- **Type:** review\n- **Description:** exercise persistence\n- **Executor:** switchyard\n",
+				"### Task 4.2: Diagnostic producer\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** exercise persistence\n- **Executor:** switchyard\n",
 			);
 			const descriptor = descriptorForRoute({
 				provider: "opencode",
@@ -2978,7 +2982,7 @@ describe("async runner provider lifecycle", () => {
 		const checkpointPath = join(root, "checkpoint.json");
 		writeFileSync(
 			tasksPath,
-			"### Task 4.3: Synchronous diagnostic\n- **Status:** pending\n- **Type:** review\n- **Description:** reject unretained evidence\n- **Executor:** switchyard\n",
+			"### Task 4.3: Synchronous diagnostic\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** reject unretained evidence\n- **Executor:** switchyard\n",
 		);
 		const descriptor = descriptorForRoute({
 			provider: "opencode",
@@ -2995,6 +2999,7 @@ describe("async runner provider lifecycle", () => {
 			workingContainerName: "sync-diagnostic-worker",
 			checkpointPath,
 			dependencies: {
+				integrationGate: () => ({ success: true }),
 				route: () => ({
 					provider: "opencode",
 					resolved_harness: "opencode",
@@ -3063,7 +3068,7 @@ describe("async runner provider lifecycle", () => {
 		const checkpointPath = join(root, "checkpoint.json");
 		writeFileSync(
 			tasksPath,
-			"### Task 4.2: Heartbeat\n- **Status:** pending\n- **Type:** review\n- **Description:** heartbeat\n- **Executor:** switchyard\n",
+			"### Task 4.2: Heartbeat\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** heartbeat\n- **Executor:** switchyard\n",
 		);
 		const descriptor = descriptorForRoute({
 			provider: "opencode",
@@ -3078,6 +3083,7 @@ describe("async runner provider lifecycle", () => {
 			workingContainerName: "async-worker",
 			checkpointPath,
 			dependencies: {
+				integrationGate: () => ({ success: true }),
 				route: () => ({
 					provider: "opencode",
 					resolved_harness: "opencode",
@@ -3097,7 +3103,10 @@ describe("async runner provider lifecycle", () => {
 								stdoutBytes: 999,
 								stderrBytes: 999,
 							});
-							return { success: true, output: "SECRET_STREAM" };
+							return {
+								success: true,
+								output: JSON.stringify({ verdict: "clean", findings: [] }),
+							};
 						},
 						captureDiffAsync: async () => null,
 					},
@@ -3174,31 +3183,35 @@ describe("async runner provider lifecycle", () => {
 		);
 	});
 
-	it("redacts timeout partial diffs before onResult and checkpoint persistence", async () => {
+	it("does not persist timeout provider output for review tasks", async () => {
 		const { result, observed, checkpoint } = await runAsyncRedactionCase({
 			execution: { success: false, timedOut: true, error: "timed out" },
 			integrationGate: () => ({ success: true }),
 		});
-		strictEqual(result.results[0].partialDiff, undefined);
-		strictEqual(result.results[0].artifactRef, undefined);
+		strictEqual(result.results[0].result, "review_unavailable");
+		strictEqual(result.results[0].reviewResult.sourceMutationCount, 0);
+		strictEqual(result.results[0].partialDiffPath, undefined);
+		strictEqual(observed.result, "review_unavailable");
+		strictEqual(observed.reviewResult.sourceMutationCount, 0);
 		strictEqual(observed.partialDiff, undefined);
 		strictEqual(observed.artifactRef, undefined);
-		ok(result.results[0].partialDiffPath?.endsWith("4.2.diff"));
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
 		strictEqual(checkpoint.results[0].artifactRef, undefined);
 		ok(!JSON.stringify(checkpoint).includes("SECRET_RAW_DIFF"));
 	});
 
-	it("redacts integration-rejection partial diffs before onResult", async () => {
+	it("does not invoke integration for successful review execution without a result", async () => {
 		const { result, observed, checkpoint } = await runAsyncRedactionCase({
 			execution: { success: true, output: "" },
 			integrationGate: () => ({ success: false }),
 		});
-		strictEqual(result.results[0].partialDiff, undefined);
-		strictEqual(result.results[0].artifactRef, undefined);
+		strictEqual(result.results[0].result, "review_unavailable");
+		strictEqual(result.results[0].reviewResult.sourceMutationCount, 0);
+		strictEqual(result.results[0].partialDiffPath, undefined);
+		strictEqual(observed.result, "review_unavailable");
+		strictEqual(observed.reviewResult.sourceMutationCount, 0);
 		strictEqual(observed.partialDiff, undefined);
 		strictEqual(observed.artifactRef, undefined);
-		ok(result.results[0].partialDiffPath?.endsWith("4.2.diff"));
 		strictEqual(checkpoint.results[0].partialDiffPath, null);
 		strictEqual(checkpoint.results[0].artifactRef, undefined);
 		ok(!JSON.stringify(checkpoint).includes("SECRET_RAW_DIFF"));
@@ -5146,12 +5159,14 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 
 ### Task 1.1: First task
 - **Status:** pending
-- **Type:** review
+- **Type:** implementation
+- **Files:** src/switchyard/runner/index.mjs
 - **Description:** First operation
 
 ### Task 1.2: Second task
 - **Status:** pending
-- **Type:** review
+- **Type:** implementation
+- **Files:** src/switchyard/runner/index.mjs
 - **Description:** Second operation
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -5208,7 +5223,7 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 		);
 		deepStrictEqual(
 			dispatches.map((entry) => entry.result),
-			["success_no_diff", "success_no_diff"],
+			["success", "success"],
 		);
 	});
 
@@ -5217,12 +5232,14 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 
 ### Task 1.1: First task
 - **Status:** pending
-- **Type:** review
+- **Type:** implementation
+- **Files:** src/switchyard/runner/index.mjs
 - **Description:** integration task one
 
 ### Task 1.2: Second task
 - **Status:** pending
-- **Type:** review
+- **Type:** implementation
+- **Files:** src/switchyard/runner/index.mjs
 - **Description:** integration task two
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
@@ -14124,6 +14141,188 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 
 		strictEqual(routeCalls.length, 1);
 		strictEqual(result.success, true);
+	});
+
+	it("review tasks never integrate provider diffs and report zero source mutations", () => {
+		let gateCalls = 0;
+		const result = executeTask(
+			{
+				id: "1.1",
+				title: "review task",
+				type: "review",
+				description: "inspect changes",
+				requiredPaths: null,
+			},
+			{
+				route: () => ({
+					provider: "claude",
+					model: "claude-sonnet-5",
+					percentLeft: 80,
+					reason: "spread",
+				}),
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				integrationGate: () => {
+					gateCalls += 1;
+					return { success: true, message: "must not run" };
+				},
+				adapters: {
+					claude: {
+						execute: () => ({
+							success: true,
+							output: JSON.stringify({
+								verdict: "clean",
+								findings: [],
+							}),
+						}),
+						captureDiff: () => "diff --git a/secret b/secret",
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.success, true);
+		strictEqual(result.result, "review_completed");
+		strictEqual(result.reviewResult.sourceMutationCount, 0);
+		strictEqual(gateCalls, 0);
+	});
+
+	it("malformed review output stays unavailable across sync, broker, and orchestrator paths", async () => {
+		const task = {
+			id: "1.2",
+			title: "malformed review",
+			type: "review",
+			description: "inspect changes",
+			requiredPaths: null,
+		};
+		let syncGateCalls = 0;
+		let syncCaptureCalls = 0;
+		const syncResult = executeTask(task, {
+			route: () => ({ provider: "claude", model: "claude-sonnet-5" }),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: () => {
+				syncGateCalls += 1;
+				throw new Error("review must not integrate");
+			},
+			adapters: {
+				claude: {
+					execute: () => ({
+						success: true,
+						output: "PROVIDER_SECRET_CANARY plain output",
+					}),
+					captureDiff: () => {
+						syncCaptureCalls += 1;
+						throw new Error("review must not capture");
+					},
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+		strictEqual(syncResult.result, "review_unavailable");
+		strictEqual(syncResult.reviewResult.sourceMutationCount, 0);
+		strictEqual(syncGateCalls, 0);
+		strictEqual(syncCaptureCalls, 0);
+		ok(!JSON.stringify(syncResult).includes("PROVIDER_SECRET_CANARY"));
+
+		const descriptor = descriptorForRoute({
+			provider: "claude",
+			resolved_harness: "claude",
+			resolvedTargetId: "claude-target",
+			model: "claude-sonnet-5",
+		});
+		const route = {
+			provider: "claude",
+			model: "claude-sonnet-5",
+			resolvedTarget: "claude-target",
+			resolvedTargetId: "claude-target",
+			harness: "claude",
+			capability: "standard",
+			reason: "fixture",
+			snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+			reservation: { id: "review-reservation" },
+		};
+		let asyncGateCalls = 0;
+		let asyncCaptureCalls = 0;
+		const asyncResult = await executeTaskAsync(task, {
+			broker: {
+				selectAndReserve: async () => route,
+				launcherIdentity: () => ({}),
+				execute: async () => ({
+					success: true,
+					output: "PROVIDER_SECRET_CANARY plain broker output",
+				}),
+				release: async () => {},
+			},
+			resolveDescriptor: () => descriptor,
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: () => {
+				asyncGateCalls += 1;
+				throw new Error("review must not integrate");
+			},
+			adapters: {
+				claude: {
+					executeAsync: async () => ({ success: true }),
+					captureDiffAsync: async () => {
+						asyncCaptureCalls += 1;
+						throw new Error("review must not capture");
+					},
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+		strictEqual(asyncResult.result, "review_unavailable");
+		strictEqual(asyncResult.reviewResult.sourceMutationCount, 0);
+		strictEqual(asyncGateCalls, 0);
+		strictEqual(asyncCaptureCalls, 0);
+		ok(!JSON.stringify(asyncResult).includes("PROVIDER_SECRET_CANARY"));
+
+		let orchestratorGateCalls = 0;
+		let orchestratorCaptureCalls = 0;
+		const orchestratorResult = await executeTaskWithOrchestrator(task, {
+			route: () => ({
+				provider: "claude",
+				model: "claude-sonnet-5",
+				resolved_harness: "claude",
+				resolvedTargetId: "claude-target",
+			}),
+			resolveDescriptor: () => descriptor,
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: () => {
+				orchestratorGateCalls += 1;
+				throw new Error("review must not integrate");
+			},
+			orchestrator: {
+				launch: async () => "review-job",
+				status: async () => ({ state: "done" }),
+				result: async () => ({
+					success: true,
+					output: "PROVIDER_SECRET_CANARY plain orchestrator output",
+					diff: "diff --git a/secret b/secret",
+				}),
+			},
+			adapters: {
+				claude: {
+					captureDiff: () => {
+						orchestratorCaptureCalls += 1;
+						throw new Error("review must not capture");
+					},
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "fake-container",
+		});
+		strictEqual(orchestratorResult.result, "review_unavailable");
+		strictEqual(orchestratorResult.reviewResult.sourceMutationCount, 0);
+		strictEqual(orchestratorGateCalls, 0);
+		strictEqual(orchestratorCaptureCalls, 0);
+		ok(!JSON.stringify(orchestratorResult).includes("PROVIDER_SECRET_CANARY"));
 	});
 
 	it("executeTaskWithOrchestrator rejects an ignored declared path before provider routing or launch", async () => {

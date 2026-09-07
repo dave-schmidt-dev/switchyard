@@ -234,6 +234,102 @@ describe("provider diagnostic artifact boundary", () => {
 		);
 	});
 });
+
+describe("review-result projection", () => {
+	it("persists only the sanitized review projection", async () => {
+		const runId = `review-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await createEvent(runId, {
+			phase: "execution",
+			event: "task_completed",
+			status: "Task 1.1 completed",
+			taskId: "1.1",
+			result: "review_completed",
+			reviewResult: {
+				verdict: "clean",
+				findings: [],
+				comments: ["safe"],
+				transcript: "SECRET_CANARY",
+			},
+		});
+		const run = await readRun(runId);
+		strictEqual(run.lastReviewResult.sourceMutationCount, 0);
+		strictEqual(JSON.stringify(run).includes("SECRET_CANARY"), false);
+		const events = await readEvents(runId);
+		strictEqual(events[0].reviewResult.sourceMutationCount, 0);
+	});
+
+	it("rejects an untrusted direct lastReviewResult update", async () => {
+		const runId = `review-invalid-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		const current = await readRun(runId);
+		await rejects(
+			updateRun(
+				runId,
+				{
+					lastReviewResult: {
+						schemaVersion: 1,
+						status: "available",
+						verdict: "clean",
+						findings: [],
+						comments: [],
+						findingCount: 0,
+						commentCount: 0,
+						sourceMutationCount: 0,
+						transcript: "SECRET_CANARY",
+					},
+				},
+				current.revision,
+			),
+			(error) => error instanceof SchemaError,
+		);
+		await rejects(
+			updateRun(
+				runId,
+				{
+					lastReviewResult: {
+						schemaVersion: 1,
+						status: "available",
+						verdict: "findings",
+						findings: [
+							{
+								severity: undefined,
+								summary: "Missing canonical severity",
+								path: "src/example.mjs",
+							},
+						],
+						comments: [],
+						findingCount: 1,
+						commentCount: 0,
+						sourceMutationCount: 0,
+					},
+				},
+				current.revision,
+			),
+			(error) => error instanceof SchemaError,
+		);
+		strictEqual(
+			JSON.stringify(await readRun(runId)).includes("SECRET_CANARY"),
+			false,
+		);
+	});
+});
 process.env.SWITCHYARD_ROSTER_PATH = resolve(
 	"tests/fixtures/roster.fixture.json",
 );

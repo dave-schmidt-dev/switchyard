@@ -81,6 +81,7 @@ import {
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
 import { createBroker } from "../broker/index.mjs";
+import { reviewResultFromExecution } from "../diagnostics/review-result.mjs";
 import { HOST_POWER_STATES, readHostPower } from "../dispatch/host-power.mjs";
 import {
 	integrationGate,
@@ -4832,6 +4833,42 @@ function survivingProviderFields(execution) {
 	return fields;
 }
 
+function reviewTaskResult(
+	task,
+	execution,
+	routeResult,
+	invocationDescriptor,
+	requiredCapability,
+	resolvedTargetId,
+) {
+	if (task.type !== "review") return null;
+	const reviewResult = reviewResultFromExecution(execution);
+	const available = reviewResult.status === "available";
+	return {
+		...descriptorReceiptFields(invocationDescriptor),
+		taskId: task.id,
+		success: available,
+		provider: routeResult.provider,
+		model: routeResult.model ?? null,
+		requiredCapability,
+		resolvedTargetId,
+		result: available ? "review_completed" : "review_unavailable",
+		reviewResult,
+		...(available
+			? {}
+			: {
+					errorKind: "review_result_unavailable",
+					reason: "Provider review result was unavailable or malformed.",
+				}),
+		...servedModelVerificationFields(execution),
+		...survivingProviderFields(execution),
+	};
+}
+
+function isStructuredReviewExecution(task) {
+	return task.type === "review";
+}
+
 function normalizeSynchronousProviderExecution(execution) {
 	if (!execution || typeof execution !== "object") return execution;
 	const hasProviderDiagnostic = [
@@ -6063,6 +6100,33 @@ function executeTaskUnsafe(task, context) {
 			...survivingProviderFields(execution),
 		};
 	}
+	if (isStructuredReviewExecution(task, execution)) {
+		context.queueBackend?.afterRun?.(
+			context.workingContainerName,
+			context.projectPath,
+			{ onStatus: context.onStatus },
+		);
+		const review = reviewTaskResult(
+			task,
+			execution,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+			resolvedTargetId,
+		);
+		record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: review.result,
+			reviewResult: review.reviewResult,
+			...(review.success
+				? {}
+				: { errorKind: review.errorKind, reason: review.reason }),
+			...survivingProviderFields(execution),
+		});
+		return review;
+	}
 
 	if (!execution.success) {
 		if (execution.timedOut) {
@@ -7028,6 +7092,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 		progress: brokerExecution.progress ?? null,
+		reviewResult: brokerExecution.reviewResult,
+		output: brokerExecution.output,
 	};
 	context._activeProviderExecutionSucceeded = execution.success === true;
 	context._activeCompletionLifecycleReceipt =
@@ -7054,6 +7120,33 @@ async function executeTaskAsyncUnsafe(task, context) {
 			errorKind: "provider_cleanup_failed",
 			...survivingProviderFields(execution),
 		};
+	}
+	if (isStructuredReviewExecution(task, execution)) {
+		context.queueBackend?.afterRun?.(
+			context.workingContainerName,
+			context.projectPath,
+			{ onStatus: context.onStatus },
+		);
+		const review = reviewTaskResult(
+			task,
+			execution,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+			resolvedTargetId,
+		);
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: review.result,
+			reviewResult: review.reviewResult,
+			...(review.success
+				? {}
+				: { errorKind: review.errorKind, reason: review.reason }),
+			...survivingProviderFields(execution),
+		});
+		return review;
 	}
 	if (!execution.success) {
 		if (execution.silenceTimedOut) {
@@ -8460,6 +8553,33 @@ export async function executeTaskWithOrchestrator(task, context) {
 			cleanupStage: jobResult.cleanupStage ?? null,
 			...(progress ? { progress } : {}),
 		};
+	}
+	if (isStructuredReviewExecution(task, jobResult)) {
+		context.queueBackend?.afterRun?.(
+			context.workingContainerName,
+			context.projectPath,
+			{ onStatus: context.onStatus },
+		);
+		const review = reviewTaskResult(
+			task,
+			jobResult,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+			resolvedTargetId,
+		);
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: review.result,
+			reviewResult: review.reviewResult,
+			...(progress ? { progress } : {}),
+			...(review.success
+				? {}
+				: { errorKind: review.errorKind, reason: review.reason }),
+		});
+		return { ...review, ...(progress ? { progress } : {}) };
 	}
 	if (!jobResult?.success) {
 		await record({
