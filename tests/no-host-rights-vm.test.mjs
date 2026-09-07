@@ -22,6 +22,7 @@ import {
 	buildParallelsWorkingName,
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { publishVmGateOutcome } from "../src/switchyard/run-store/index.mjs";
 import { deriveC3Manifest, probeTcp } from "./helpers/c3-manifest.mjs";
 import {
 	CLIPBOARD_DIRECTIONS,
@@ -96,8 +97,11 @@ async function loadSlotPrimitive() {
 	}
 	const acquire = module.acquireVmSlot ?? module.acquireMacosVmSlot;
 	const release = module.releaseVmSlot ?? module.releaseMacosVmSlot;
-	return typeof acquire === "function" && typeof release === "function"
-		? { acquire, release }
+	const wait = module.acquireVmSlotForTest;
+	return typeof acquire === "function" &&
+		typeof release === "function" &&
+		typeof wait === "function"
+		? { acquire, release, wait }
 		: null;
 }
 
@@ -152,20 +156,6 @@ async function inspectPrerequisites() {
 	}
 	if (!(await loadSlotPrimitive()))
 		return "shared VM-slot primitive is unavailable";
-	// A live dispatch owning a working clone is transient capacity, not a broken
-	// environment, so it skips the way "both VM slots are held" already does
-	// rather than failing. Without this the gate threw
-	// `refusing golden image ...: owned clones exist` out of
-	// assertGoldenImageAvailable, which rejects an unrelated `git push` for the
-	// whole duration of any concurrent run. This mirrors the identical check
-	// workspace-wipe-vm.test.mjs already makes.
-	try {
-		if (new ParallelsExecutionBackend().listManaged().length > 0) {
-			return "a Switchyard working VM is active";
-		}
-	} catch {
-		return "Parallels VM inventory is unavailable";
-	}
 	// The C-3 manifest is deliberately absent from this ladder. It is derived
 	// inside the gate and asserted there, so a derivation gap fails loudly
 	// instead of reporting green through a skip.
@@ -176,6 +166,13 @@ const prerequisiteReason = SKIP_LIVE_VM_TESTS
 	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
 	: await inspectPrerequisites();
 
+if (prerequisiteReason) {
+	publishVmGateOutcome("inv1", {
+		status: "unavailable-with-proof",
+		reason: prerequisiteReason,
+	});
+}
+
 describe("no host rights — Parallels VM (INV-1)", () => {
 	it("proves host sharing, guest mounts, C-3 networking, and clipboard behavior", {
 		skip: prerequisiteReason ? `VM gate skipped: ${prerequisiteReason}` : false,
@@ -183,6 +180,10 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 		if (configurationFault) throw new Error(configurationFault);
 		const slotPrimitive = await loadSlotPrimitive();
 		if (!slotPrimitive) {
+			publishVmGateOutcome("inv1", {
+				status: "unavailable-with-proof",
+				reason: "shared VM-slot primitive is unavailable",
+			});
 			testContext.skip(
 				"VM gate skipped: shared VM-slot primitive is unavailable",
 			);
@@ -197,44 +198,52 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 		const resourceRoot = tempDir("switchyard-inv1-ownership-");
 
 		try {
-			progress("acquiring the shared VM slot");
-			try {
-				slotLease = await slotPrimitive.acquire({
-					platform: "macos",
-					purpose: "inv-1-vm-gate",
-				});
-			} catch (error) {
-				const message = String(error?.message ?? "");
-				if (
-					error?.code === "VM_SLOT_UNAVAILABLE" ||
-					/slot.*(held|available|capacity)/i.test(message)
-				) {
-					testContext.skip("VM gate skipped: both VM slots are held");
-					return;
-				}
-				throw error;
-			}
-			if (!slotLease) {
-				testContext.skip("VM gate skipped: both VM slots are held");
-				return;
-			}
-
 			backend = new ParallelsExecutionBackend({
 				aquaUid: AQUA_UID,
 				goldenImage: GOLDEN_IMAGE,
 				providerUser: PROVIDER_USER,
 			});
+			progress(
+				"waiting for the shared VM slot and an idle managed-VM inventory",
+			);
+			const admission = await slotPrimitive.wait({
+				runId: `inv1-${process.pid}-${randomUUID()}`,
+				onStatus: progress,
+				readinessFn: () => {
+					backend.probeHostReadiness({ onStatus: progress });
+					return (
+						backend.listManaged().length === 0 || {
+							ready: false,
+							reason: "a Switchyard working VM is active",
+						}
+					);
+				},
+			});
+			if (admission.status !== "executed") {
+				publishVmGateOutcome("inv1", {
+					status: "unavailable-with-proof",
+					reason: admission.reason,
+				});
+				testContext.skip(`VM gate unavailable-with-proof: ${admission.reason}`);
+				return;
+			}
+			slotLease = admission.lease;
 			// Re-check under the lease: the prerequisite ladder above runs once
 			// at module load, so a dispatch that starts between then and here
 			// would still hit assertGoldenImageAvailable's hard refusal. That is
 			// the race that rejected a push on 2026-08-27.
 			const owned = backend.listManaged();
 			if (owned.length > 0) {
+				publishVmGateOutcome("inv1", {
+					status: "unavailable-with-proof",
+					reason: "a Switchyard working VM is active",
+				});
 				testContext.skip(
-					`VM gate skipped: a Switchyard working VM is active (${owned.map((entry) => entry.name).join(", ")})`,
+					`VM gate unavailable-with-proof: a Switchyard working VM is active (${owned.map((entry) => entry.name).join(", ")})`,
 				);
 				return;
 			}
+			publishVmGateOutcome("inv1", { status: "executed" });
 			backend.assertGoldenImageAvailable(GOLDEN_IMAGE);
 			const runId = `inv1-${process.pid}-${randomUUID()}`;
 			vmName = buildParallelsWorkingName(runId, process.pid);

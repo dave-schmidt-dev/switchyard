@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+	appendFileSync,
 	existsSync,
 	linkSync,
 	lstatSync,
@@ -2681,6 +2682,12 @@ export function isProjectLockHeld(canonicalProjectPath) {
 // home directory, so the pool spans every session, project and harness on this Mac.
 const VM_SLOT_COUNT = 2;
 
+// The live VM gates use the same host-global admission primitive as production,
+// but their wait is deliberately shorter and injectable so fixture runs cannot
+// hide an admission race behind an unbounded test timeout.
+export const TEST_VM_SLOT_WAIT_TIMEOUT_MS = 120_000;
+export const TEST_VM_SLOT_WAIT_INTERVAL_MS = 250;
+
 function safeVmRunId(value) {
 	if (typeof value !== "string" || value.length === 0) return "unknown";
 	const safe = sanitizeForDisplay(value).slice(0, 128);
@@ -2877,6 +2884,200 @@ function acquireVmSlotWithDependencies(options = {}, dependencies = {}) {
 
 export function acquireVmSlot(options = {}) {
 	return acquireVmSlotWithDependencies(options);
+}
+
+/**
+ * Project a VM gate result into the three states the phase runners understand.
+ * An unavailable gate is valid only when its caller supplies a bounded reason;
+ * an omitted reason is a failure rather than a silent green skip.
+ *
+ * @param {{executed?: boolean, unavailableReason?: string, error?: unknown}} [result]
+ * @returns {{status: "executed"|"unavailable-with-proof"|"failed", reason?: string}}
+ */
+export function projectVmGateOutcome({
+	executed = false,
+	unavailableReason = null,
+	error = null,
+} = {}) {
+	if (error) {
+		return { status: "failed", reason: "gate-error" };
+	}
+	if (executed) return { status: "executed" };
+	if (
+		typeof unavailableReason === "string" &&
+		unavailableReason.trim().length > 0
+	) {
+		return {
+			status: "unavailable-with-proof",
+			reason: unavailableReason.trim().slice(0, 160),
+		};
+	}
+	return { status: "failed", reason: "missing-unavailability-proof" };
+}
+
+/**
+ * Publish one machine-readable live VM-gate terminal outcome for the phase
+ * runner. The side channel is opt-in and never writes to stdout or durable
+ * Switchyard state; direct `node --test` runs therefore retain their normal
+ * behavior while `run-test-phases` can fail closed on missing evidence.
+ *
+ * @param {string} gateName
+ * @param {{status: "executed"|"unavailable-with-proof"|"failed", reason?: string}} outcome
+ * @returns {boolean} whether an outcome was written
+ */
+export function publishVmGateOutcome(gateName, outcome) {
+	const path = process.env.SWITCHYARD_VM_GATE_OUTCOME_FILE;
+	if (!path) return false;
+	if (!/^[A-Za-z0-9_-]{1,64}$/.test(gateName)) {
+		throw new TypeError("VM gate name is invalid");
+	}
+	const projected = projectVmGateOutcome({
+		executed: outcome?.status === "executed",
+		unavailableReason:
+			outcome?.status === "unavailable-with-proof" ? outcome.reason : null,
+		error: outcome?.status === "failed" ? new Error("gate failed") : null,
+	});
+	const record = {
+		schemaVersion: 1,
+		gate: gateName,
+		status: projected.status,
+		...(projected.reason ? { reason: projected.reason } : {}),
+	};
+	appendFileSync(path, `${JSON.stringify(record)}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	return true;
+}
+
+function testVmReadinessUnavailable(error) {
+	return (
+		typeof error?.code === "string" &&
+		(error.code.startsWith("vm_host_") ||
+			error.code === "VM_ADMISSION_UNAVAILABLE" ||
+			error.code === "VM_ADMISSION_PERMISSION_DENIED")
+	);
+}
+
+/**
+ * Acquire a test VM slot with bounded, observable admission.
+ *
+ * The default acquire function is the production `acquireVmSlot`, including
+ * its exact owner-PID liveness predicate and stale-claim reclaim fence. Tests
+ * may inject a hermetic function, but unrelated errors are never converted to
+ * an unavailable result. A readiness probe can be supplied when a gate also
+ * needs the backend's production host-readiness predicate.
+ *
+ * @param {object} [options]
+ * @param {string} [options.runId]
+ * @param {number} [options.timeoutMs]
+ * @param {number} [options.intervalMs]
+ * @param {() => number} [options.nowFn]
+ * @param {(ms:number) => (void|Promise<void>)} [options.sleepFn]
+ * @param {(event: object) => void} [options.onStatus]
+ * @param {() => (void|boolean|object|Promise<void|boolean|object>)} [options.readinessFn]
+ * @param {(options: object) => object} [options.acquireFn]
+ * @returns {Promise<{status: "executed"|"unavailable-with-proof", lease?: object, reason?: string, attempts: number, elapsedMs: number}>}
+ */
+export async function acquireVmSlotForTest({
+	runId,
+	timeoutMs = TEST_VM_SLOT_WAIT_TIMEOUT_MS,
+	intervalMs = TEST_VM_SLOT_WAIT_INTERVAL_MS,
+	nowFn = () => performance.now(),
+	sleepFn = (delayMs) =>
+		new Promise((resolveWait) => setTimeout(resolveWait, delayMs)),
+	onStatus,
+	readinessFn,
+	acquireFn = acquireVmSlot,
+} = {}) {
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+		throw new RangeError("timeoutMs must be a non-negative number");
+	}
+	if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+		throw new RangeError("intervalMs must be a positive number");
+	}
+	if (typeof nowFn !== "function" || typeof sleepFn !== "function") {
+		throw new TypeError("nowFn and sleepFn must be functions");
+	}
+	if (typeof acquireFn !== "function") {
+		throw new TypeError("acquireFn must be a function");
+	}
+	if (readinessFn !== undefined && typeof readinessFn !== "function") {
+		throw new TypeError("readinessFn must be a function");
+	}
+
+	const startedAt = nowFn();
+	const deadline = startedAt + timeoutMs;
+	let attempts = 0;
+	let lastReason = "vm_slot_unavailable";
+	for (;;) {
+		attempts += 1;
+		let readinessAvailable = true;
+		try {
+			const readiness = readinessFn ? await readinessFn() : true;
+			if (
+				readiness === false ||
+				(readiness &&
+					typeof readiness === "object" &&
+					(readiness.ready === false ||
+						readiness.status === "unavailable-with-proof"))
+			) {
+				lastReason =
+					typeof readiness?.reason === "string" && readiness.reason.trim()
+						? readiness.reason
+						: "vm_host_not_ready";
+				throw Object.assign(new Error(lastReason), {
+					code: "VM_TEST_READINESS_UNAVAILABLE",
+				});
+			}
+		} catch (error) {
+			if (
+				!testVmReadinessUnavailable(error) &&
+				error?.code !== "VM_TEST_READINESS_UNAVAILABLE"
+			) {
+				throw error;
+			}
+			readinessAvailable = false;
+			lastReason =
+				error.code === "VM_TEST_READINESS_UNAVAILABLE"
+					? String(error.message || "vm_host_not_ready").slice(0, 160)
+					: error.code;
+		}
+
+		if (readinessAvailable) {
+			try {
+				const lease = await acquireFn({ runId });
+				return {
+					status: "executed",
+					lease,
+					attempts,
+					elapsedMs: Math.max(0, nowFn() - startedAt),
+				};
+			} catch (error) {
+				if (error?.code !== "VM_SLOT_UNAVAILABLE") throw error;
+				lastReason = "vm_slot_unavailable";
+			}
+		}
+
+		const remainingMs = Math.max(0, deadline - nowFn());
+		const elapsedMs = Math.max(0, nowFn() - startedAt);
+		onStatus?.({
+			type: "vm-test-gate",
+			event: "vm_slot_wait",
+			status: "Waiting for VM admission capacity",
+			elapsedMs,
+			reason: lastReason,
+		});
+		if (remainingMs === 0) {
+			return {
+				status: "unavailable-with-proof",
+				reason: lastReason,
+				attempts,
+				elapsedMs,
+			};
+		}
+		await sleepFn(Math.min(intervalMs, remainingMs));
+	}
 }
 
 /**

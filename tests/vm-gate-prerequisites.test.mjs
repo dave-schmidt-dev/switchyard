@@ -12,7 +12,7 @@
 // rung. The source guard exists so this file can never itself go vacuously
 // green on a host without Parallels.
 
-import { match, ok } from "node:assert";
+import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
@@ -20,6 +20,10 @@ import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { tempDir } from "./helpers/tempdir.mjs";
+
+const { acquireVmSlotForTest, projectVmGateOutcome } = await import(
+	"../src/switchyard/run-store/index.mjs"
+);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
@@ -31,6 +35,78 @@ const GATES = [
 ];
 
 describe("VM gate prerequisite ladders", () => {
+	it("waits with bounded observable progress and uses the production slot result", async () => {
+		let now = 0;
+		let attempts = 0;
+		const statuses = [];
+		const result = await acquireVmSlotForTest({
+			runId: "vm-gate-wait",
+			timeoutMs: 20,
+			intervalMs: 5,
+			nowFn: () => now,
+			sleepFn: (delayMs) => {
+				now += delayMs;
+			},
+			onStatus: (event) => statuses.push(event),
+			acquireFn: () => {
+				attempts += 1;
+				if (attempts < 3) {
+					const error = new Error("capacity");
+					error.code = "VM_SLOT_UNAVAILABLE";
+					throw error;
+				}
+				return { token: "test-lease" };
+			},
+		});
+
+		strictEqual(result.status, "executed");
+		strictEqual(result.lease.token, "test-lease");
+		deepStrictEqual(
+			statuses.map((event) => event.elapsedMs),
+			[0, 5],
+		);
+		strictEqual(attempts, 3);
+	});
+
+	it("returns unavailable-with-proof only after the bounded wait expires", async () => {
+		let now = 0;
+		const statuses = [];
+		const result = await acquireVmSlotForTest({
+			runId: "vm-gate-timeout",
+			timeoutMs: 10,
+			intervalMs: 5,
+			nowFn: () => now,
+			sleepFn: (delayMs) => {
+				now += delayMs;
+			},
+			onStatus: (event) => statuses.push(event),
+			acquireFn: () => {
+				const error = new Error("capacity");
+				error.code = "VM_SLOT_UNAVAILABLE";
+				throw error;
+			},
+		});
+
+		strictEqual(result.status, "unavailable-with-proof");
+		strictEqual(result.reason, "vm_slot_unavailable");
+		strictEqual(result.elapsedMs, 10);
+		strictEqual(statuses.length, 3);
+	});
+
+	it("does not treat an idle host with no gate execution as a green result", () => {
+		deepStrictEqual(projectVmGateOutcome({ executed: true }), {
+			status: "executed",
+		});
+		deepStrictEqual(
+			projectVmGateOutcome({ unavailableReason: "both VM slots are held" }),
+			{ status: "unavailable-with-proof", reason: "both VM slots are held" },
+		);
+		deepStrictEqual(projectVmGateOutcome(), {
+			status: "failed",
+			reason: "missing-unavailability-proof",
+		});
+	});
+
 	it("never returns a skip reason derived from the Aqua uid", () => {
 		for (const gate of GATES) {
 			const source = readFileSync(resolve(PKG_ROOT, gate), "utf8");
