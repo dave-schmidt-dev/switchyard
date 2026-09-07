@@ -520,7 +520,6 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		const startToken = randomUUID();
 
 		await runStore.acquireRunLock(runId, pid, startToken, nonce);
-		await runStore.advanceState(runId, "running");
 
 		// NOTE (leak-recovery Piece C): the detached worker deliberately does NOT
 		// run a pre-dispatch orphan sweep. An ephemeral worker whose only job is to
@@ -540,6 +539,10 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		const runQueueFn = runner.runQueueAsync;
 		QueueCleanupErrorType = runner.QueueCleanupError;
 		const persistedRunOptions = run.runOptions ?? null;
+		// Mark execution as started only after the provider-capable queue and route
+		// health modules are loaded. A boot failure before this boundary remains a
+		// pre-execution failure with startedAt unset.
+		await runStore.advanceState(runId, "running");
 
 		const result = await runQueueFn({
 			tasksFilePath: run.tasksFilePath,

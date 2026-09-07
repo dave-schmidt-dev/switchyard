@@ -176,6 +176,7 @@ export async function finalizeRun(options, dependencies = {}) {
 				...CLEARED_ACTIVE_FIELDS,
 				...(closedFailure ? { lastFailure: closedFailure } : {}),
 				...extraPatch,
+				finishedAt: new Date().toISOString(),
 			});
 			outcome = { terminal: true, cleanupComplete: true, run };
 		}

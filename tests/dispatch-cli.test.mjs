@@ -1015,6 +1015,10 @@ describe("launch integration", () => {
 		strictEqual(envelope.disposition.action, "repair_contract");
 		strictEqual(envelope.disposition.reasonCode, "worker_boot_exception");
 		ok(!errors.join("\n").includes(canary));
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(envelope.runId);
+		strictEqual(run.startedAt, null);
+		ok(typeof run.finishedAt === "string");
 	});
 
 	it("launch --json success fixture emits exactly one parseable object", () => {
@@ -2551,6 +2555,9 @@ describe("run subcommand via spawn", () => {
 		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
 		const run = await readRun(runDirs[0]);
 		strictEqual(run.cleanupState, "complete");
+		ok(typeof run.startedAt === "string");
+		ok(typeof run.finishedAt === "string");
+		ok(Date.parse(run.startedAt) <= Date.parse(run.finishedAt));
 	});
 });
 
@@ -2605,6 +2612,8 @@ describe("envelope format", () => {
 			"completedCount",
 			"failedCount",
 			"lastFailure",
+			"startedAt",
+			"finishedAt",
 			"updatedAt",
 			"queueStartedAt",
 			"elapsedMs",
@@ -2661,6 +2670,8 @@ describe("envelope format", () => {
 			"completedCount",
 			"failedCount",
 			"lastFailure",
+			"startedAt",
+			"finishedAt",
 			"updatedAt",
 			"terminalSummary",
 			"artifactRefs",
@@ -2818,6 +2829,8 @@ describe("envelope format", () => {
 				);
 			}
 		}
+		strictEqual(statusEnvelope.startedAt, resultEnvelope.startedAt);
+		strictEqual(statusEnvelope.finishedAt, resultEnvelope.finishedAt);
 		ok(
 			!JSON.stringify({ statusEnvelope, resultEnvelope }).includes(
 				"SECRET_CANARY",
@@ -3034,9 +3047,13 @@ describe("envelope format", () => {
 	});
 
 	it("six sanitized OpenCode failures emit bounded target evidence without cooldown state", async () => {
-		const { createEvent, initializeRun, readRun, updateRun } = await import(
-			"../src/switchyard/run-store/index.mjs"
-		);
+		const {
+			createEvent,
+			initializeRun,
+			persistDiagnosticArtifact,
+			readRun,
+			updateRun,
+		} = await import("../src/switchyard/run-store/index.mjs");
 		const runId = "opencode-six-failures";
 		await initializeRun({
 			runId,
@@ -3054,6 +3071,14 @@ describe("envelope format", () => {
 			lastUpdatedAt: new Date().toISOString(),
 			results: [],
 		});
+		const diagnosticRef = await persistDiagnosticArtifact(runId, {
+			stdoutBytes: 0,
+			stderrBytes: 0,
+			stdoutDigest: `sha256:${"a".repeat(64)}`,
+			stderrDigest: `sha256:${"b".repeat(64)}`,
+			diagnosticKind: "auth_required",
+		});
+		ok(diagnosticRef, "fixture must persist bounded diagnostic evidence");
 		const failureEvidence = exactFailureEvidence(
 			"opencode-go",
 			"opencode",
@@ -3065,6 +3090,7 @@ describe("envelope format", () => {
 				phase: "execution",
 				event: "task_failed",
 				status: "Task 1.1 failed",
+				diagnosticRef,
 			});
 		}
 		const current = await readRun(runId);
@@ -4090,6 +4116,8 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		const run = await onlyRunRecord();
 		strictEqual(run.state, "failed");
 		strictEqual(run.cleanupState, "complete");
+		strictEqual(run.startedAt, null);
+		ok(typeof run.finishedAt === "string");
 
 		// No queue execution: the run aborted at the lock gate, so no
 		// checkpoint was ever written for the tasks file.

@@ -40,6 +40,10 @@ describe("run finalization", () => {
 		strictEqual(outcome.terminal, true);
 		strictEqual(events[0].event, "run_deferred");
 		strictEqual(events[0].lastFailure, undefined);
+		strictEqual(patches[0].finishedAt, undefined);
+		const terminalPatch = patches.find((patch) => patch.state === "deferred");
+		ok(terminalPatch, "deferred terminal patch is present");
+		ok(typeof terminalPatch.finishedAt === "string");
 		for (const patch of patches) strictEqual(patch.lastFailure, undefined);
 	});
 
@@ -117,6 +121,38 @@ describe("run finalization", () => {
 		for (const patch of patches) {
 			strictEqual(patch.lastFailure, undefined);
 		}
+	});
+
+	it("leaves finishedAt null when cleanup requires recovery", async () => {
+		const patches = [];
+		const persisted = {
+			startedAt: new Date().toISOString(),
+			finishedAt: null,
+		};
+		const outcome = await finalizeRun(
+			{
+				runId: "cleanup-recovery-timestamp",
+				state: "failed",
+				terminalSummary: { processedTasks: 0, failedCount: 1 },
+				cleanup: async () => {
+					throw new Error("cleanup unavailable");
+				},
+			},
+			{
+				createEvent: async () => {},
+				updateRunWithRetry: async (_runId, patch) => {
+					patches.push(patch);
+					Object.assign(persisted, patch);
+					return { ...persisted };
+				},
+				releaseRunLock: async () => {},
+			},
+		);
+
+		strictEqual(outcome.terminal, false);
+		strictEqual(persisted.finishedAt, null);
+		strictEqual(patches.at(-1).state, "recovery_required");
+		strictEqual(patches.at(-1).finishedAt, undefined);
 	});
 
 	it("rejects an arbitrary event reason before any terminal mutation", async () => {

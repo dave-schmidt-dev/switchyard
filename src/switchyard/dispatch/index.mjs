@@ -751,7 +751,6 @@ async function runDispatch(opts, dependencies = {}) {
 		});
 		initialized = true;
 		await acquireRunLock(runId, pid, startToken, nonce);
-		await advanceState(runId, "running");
 		runStoreReady = true;
 	} catch (error) {
 		const classified = classifyPreProviderFailure(error);
@@ -873,6 +872,11 @@ async function runDispatch(opts, dependencies = {}) {
 				throw new LockError("Project lock ownership assertion failed");
 			}
 			projectLockOwned = true;
+		}
+		if (runStoreReady) {
+			// The run only becomes executing after exclusive project ownership is
+			// proven and the provider-capable queue call is ready to begin.
+			await advanceState(runId, "running");
 		}
 		result = await runQueueFn({
 			tasksFilePath: opts.tasksFilePath,
@@ -1970,6 +1974,8 @@ async function buildStatusEnvelope(runId, run) {
 		),
 		...retryProjection,
 		queueDiagnostics,
+		startedAt: run.startedAt ?? null,
+		finishedAt: run.finishedAt ?? null,
 		updatedAt: run.updatedAt,
 		disposition,
 		...telemetry,
@@ -2103,6 +2109,8 @@ async function buildResultEnvelope(runId, run) {
 		),
 		...retryProjection,
 		queueDiagnostics,
+		startedAt: run.startedAt ?? null,
+		finishedAt: run.finishedAt ?? null,
 		updatedAt: run.updatedAt,
 		terminalSummary: {
 			...(run.terminalSummary ?? {}),

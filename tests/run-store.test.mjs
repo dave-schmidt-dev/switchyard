@@ -376,6 +376,8 @@ describe("initializeRun", () => {
 		strictEqual(snapshot.revision, 1);
 		strictEqual(typeof snapshot.createdAt, "string");
 		strictEqual(typeof snapshot.updatedAt, "string");
+		strictEqual(snapshot.startedAt, null);
+		strictEqual(snapshot.finishedAt, null);
 		strictEqual(snapshot.tasksFilePath, opts.tasksFilePath);
 		strictEqual(snapshot.projectPath, opts.projectPath);
 		ok(Array.isArray(snapshot.orderedTaskIds));
@@ -433,7 +435,15 @@ describe("initializeRun", () => {
 		const legacy = makeOptions({ runId: uniqueRunId() });
 		const legacySnapshot = await initializeRun(legacy);
 		strictEqual(legacySnapshot.schemaVersion, 1);
-		strictEqual((await readRun(legacy.runId)).schemaVersion, 1);
+		const legacyPath = join(getRunRoot(legacy.runId), "run.json");
+		const legacyOnDisk = JSON.parse(readFileSync(legacyPath, "utf8"));
+		delete legacyOnDisk.startedAt;
+		delete legacyOnDisk.finishedAt;
+		writeFileSync(legacyPath, JSON.stringify(legacyOnDisk));
+		const legacyLoaded = await readRun(legacy.runId);
+		strictEqual(legacyLoaded.schemaVersion, 1);
+		strictEqual(legacyLoaded.startedAt, undefined);
+		strictEqual(legacyLoaded.finishedAt, undefined);
 	});
 
 	it("creates the run directory but not an empty artifacts subdirectory", async () => {
@@ -494,6 +504,9 @@ describe("revision", () => {
 		const updated = await advanceState(opts.runId, "running");
 		strictEqual(updated.revision, 2);
 		strictEqual(updated.state, "running");
+		ok(typeof updated.startedAt === "string");
+		strictEqual(updated.finishedAt, null);
+		ok(Date.parse(updated.startedAt) >= Date.parse(updated.createdAt));
 	});
 
 	it("rapid consecutive updates each increment revision", async () => {
@@ -3277,6 +3290,24 @@ describe("validateRun type checks for telemetry fields", () => {
 		strictEqual(typed.workingContainerName, "container-abc");
 	});
 
+	it("accepts independent lifecycle timestamps and rejects unsafe shapes", async () => {
+		const opts = makeOptions();
+		const snapshot = await initializeRun(opts);
+		const finishedAt = new Date().toISOString();
+		const terminal = await updateRun(
+			opts.runId,
+			{ state: "failed", finishedAt },
+			snapshot.revision,
+		);
+		strictEqual(terminal.startedAt, null);
+		strictEqual(terminal.finishedAt, finishedAt);
+
+		await rejects(
+			updateRun(opts.runId, { finishedAt: 12345 }, terminal.revision),
+			SchemaError,
+		);
+	});
+
 	it("rejects unrecognized telemetry write-failure labels", async () => {
 		const opts = makeOptions();
 		const snapshot = await initializeRun(opts);
@@ -3771,7 +3802,11 @@ describe("shared run finalization", () => {
 			state: "succeeded",
 			terminalSummary: { processedTasks: 0, failedCount: 0 },
 		});
-		strictEqual((await readRun(opts.runId)).terminalizedBy, "worker");
+		const terminal = await readRun(opts.runId);
+		strictEqual(terminal.terminalizedBy, "worker");
+		strictEqual(terminal.startedAt, null);
+		ok(typeof terminal.finishedAt === "string");
+		ok(Date.parse(terminal.finishedAt) >= Date.parse(terminal.createdAt));
 
 		const historical = makeOptions();
 		await initializeRun(historical);

@@ -922,6 +922,15 @@ function validateRun(data) {
 	if (typeof data.updatedAt !== "string") {
 		throw new SchemaError("updatedAt must be a string");
 	}
+	for (const field of ["startedAt", "finishedAt"]) {
+		if (
+			data[field] !== undefined &&
+			data[field] !== null &&
+			typeof data[field] !== "string"
+		) {
+			throw new SchemaError(`${field} must be a string or null`);
+		}
+	}
 	if (!Array.isArray(data.orderedTaskIds)) {
 		throw new SchemaError("orderedTaskIds must be an array");
 	}
@@ -1409,6 +1418,8 @@ export async function initializeRun(options) {
 		cleanupState: "not_started",
 		createdAt: now,
 		updatedAt: now,
+		startedAt: null,
+		finishedAt: null,
 		revision: 1,
 		tasksFilePath,
 		projectPath,
@@ -1735,7 +1746,11 @@ export async function updateRunWithRetry(runId, partial, maxAttempts = 10) {
  */
 export async function advanceState(runId, newState) {
 	const current = await readRun(runId);
-	return updateRun(runId, { state: newState }, current.revision);
+	const patch = { state: newState };
+	if (newState === "running" && current.startedAt == null) {
+		patch.startedAt = new Date().toISOString();
+	}
+	return updateRun(runId, patch, current.revision);
 }
 
 /**

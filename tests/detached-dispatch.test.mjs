@@ -669,6 +669,118 @@ describe("launch returns before completion", () => {
 });
 
 describe("worker reaches terminal state and result is readable", () => {
+	it("does not stamp startedAt while the provider queue is still loading", async () => {
+		const { initializeRun, readRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = randomUUID();
+		const nonce = `delayed-import-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "git:no-head:unknown",
+			workerNonce: nonce,
+			launchArgs: [],
+		});
+
+		const markerPath = join(dir, "runner-imported.marker");
+		const fakeRunnerPath = join(dir, "delayed-import-runner.mjs");
+		writeFileSync(
+			fakeRunnerPath,
+			`import { writeFileSync } from "node:fs";
+writeFileSync(process.env.SWITCHYARD_TEST_IMPORT_MARKER, "loaded", "utf8");
+await new Promise((resolve) => setTimeout(resolve, 1000));
+export class QueueCleanupError extends Error {}
+export async function runQueueAsync() {
+  return {
+    success: true,
+    totalTasks: 1,
+    runnableTasks: 1,
+    processedTasks: 0,
+    completedTaskIds: [],
+    deferredTaskIds: [],
+    results: [],
+  };
+}
+`,
+			"utf8",
+		);
+		const loaderPath = join(dir, "delayed-import-runner-loader.mjs");
+		writeFileSync(
+			loaderPath,
+			`const target = process.env.SWITCHYARD_TEST_RUNNER_URL;
+const replacement = process.env.SWITCHYARD_TEST_FAKE_RUNNER_URL;
+export async function resolve(specifier, context, nextResolve) {
+  const candidate = new URL(specifier, context.parentURL).href;
+  if (candidate === target) return { url: replacement, shortCircuit: true };
+  return nextResolve(specifier, context, nextResolve);
+}
+`,
+			"utf8",
+		);
+		const runner = spawn(
+			process.execPath,
+			[
+				"--experimental-loader",
+				pathToFileURL(loaderPath).href,
+				BOOTSTRAP_PATH,
+				"--state-root",
+				stateRoot,
+				"--run-id",
+				runId,
+				"--nonce",
+				nonce,
+			],
+			{
+				stdio: ["ignore", "ignore", "ignore"],
+				env: {
+					...process.env,
+					...makeStateRootEnv(),
+					SWITCHYARD_TEST_IMPORT_MARKER: markerPath,
+					SWITCHYARD_TEST_RUNNER_URL: pathToFileURL(
+						resolve(__dirname, "../src/switchyard/runner/index.mjs"),
+					).href,
+					SWITCHYARD_TEST_FAKE_RUNNER_URL: pathToFileURL(fakeRunnerPath).href,
+				},
+			},
+		);
+
+		let observedPreExecutionState = false;
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			if (existsSync(markerPath)) {
+				const snapshot = await readRun(runId);
+				if (snapshot.workerPid !== null) {
+					strictEqual(snapshot.startedAt, null);
+					observedPreExecutionState = true;
+					break;
+				}
+			}
+			await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+		}
+		ok(
+			observedPreExecutionState,
+			"worker must remain pre-execution while runner import is pending",
+		);
+
+		const exit = await new Promise((resolveExit, rejectExit) => {
+			const timer = setTimeout(
+				() => rejectExit(new Error("delayed runner worker timed out")),
+				5_000,
+			);
+			runner.once("error", rejectExit);
+			runner.once("exit", (code, signal) => {
+				clearTimeout(timer);
+				resolveExit({ code, signal });
+			});
+		});
+		strictEqual(exit.code, 0, `worker exit: ${JSON.stringify(exit)}`);
+		const terminal = await readRun(runId);
+		ok(typeof terminal.startedAt === "string");
+	});
+
 	it("worker runs against a real run and eventually reaches a terminal state", async () => {
 		const runId = await launchAndGetRunId();
 
@@ -699,6 +811,9 @@ describe("worker reaches terminal state and result is readable", () => {
 		const result = JSON.parse(resultResult.stdout.trim());
 		ok(result.terminalSummary !== null, "terminalSummary present");
 		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
+		ok(typeof result.startedAt === "string", "startedAt present");
+		ok(typeof result.finishedAt === "string", "finishedAt present");
+		ok(Date.parse(result.startedAt) <= Date.parse(result.finishedAt));
 
 		// A completed run leaves no empty artifacts/ behind. The channel has had
 		// no writer since the partial-diff copy was removed for INV-2, and every
