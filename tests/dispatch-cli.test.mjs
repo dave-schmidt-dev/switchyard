@@ -24,6 +24,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { checkpointRemediation } from "../src/switchyard/adapter/exec-error.mjs";
 import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
@@ -125,6 +126,7 @@ import {
 	LockError,
 } from "../src/switchyard/run-store/index.mjs";
 import {
+	CheckpointIdentityError,
 	QueuePreflightError,
 	runQueue,
 	TaskSelectionError,
@@ -1051,8 +1053,12 @@ describe("launch integration", () => {
 				cleanupState: "complete",
 				lastFailure: {
 					errorKind: "execution_failed",
-					reasonCode: "execution_failed",
-					reason: "Provider execution failed before a reviewed integration.",
+					reasonCode: "checkpoint_queue_identity_mismatch",
+					reason: checkpointRemediation("checkpoint_queue_identity_mismatch", {
+						dimensions: ["queueIdentity"],
+					}),
+					checkpointCode: "checkpoint_queue_identity_mismatch",
+					checkpointDimensions: ["queueIdentity"],
 					diagnosticCode: "checkpoint_queue_identity_mismatch",
 					failurePhase: "adapter_validation",
 				},
@@ -1060,6 +1066,7 @@ describe("launch integration", () => {
 			current.revision,
 		);
 		writeFileSync(`${tasksFile}.checkpoint.json`, "{unloadable", "utf8");
+		const checkpointBytes = readFileSync(`${tasksFile}.checkpoint.json`);
 
 		const responses = [
 			[0, runDispatch(["status", launchEnvelope.runId], makeStateRootEnv())],
@@ -1073,6 +1080,16 @@ describe("launch integration", () => {
 			strictEqual(
 				envelope.disposition.reasonCode,
 				"checkpoint_queue_identity_mismatch",
+			);
+			strictEqual(
+				envelope.lastFailure.reason,
+				checkpointRemediation("checkpoint_queue_identity_mismatch", {
+					dimensions: ["queueIdentity"],
+				}),
+			);
+			strictEqual(
+				readFileSync(`${tasksFile}.checkpoint.json`).equals(checkpointBytes),
+				true,
 			);
 		}
 	});
@@ -3773,6 +3790,30 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 	it("preserves exported pre-provider triples through synchronous finalization", async () => {
 		const cases = [
 			{
+				error: new CheckpointIdentityError(
+					"checkpoint_run_options_mismatch",
+					null,
+					{ dimensions: ["taskIds"] },
+				),
+				diagnosticCode: "checkpoint_run_options_mismatch",
+				errorKind: "launch_failed",
+				failurePhase: "worker_boot",
+				action: "repair_contract",
+				checkpointDimensions: ["taskIds"],
+			},
+			{
+				error: new CheckpointIdentityError(
+					"checkpoint_run_options_mismatch",
+					null,
+					{ dimensions: ["excludeProviders"] },
+				),
+				diagnosticCode: "checkpoint_run_options_mismatch",
+				errorKind: "launch_failed",
+				failurePhase: "worker_boot",
+				action: "repair_contract",
+				checkpointDimensions: ["excludeProviders"],
+			},
+			{
 				error: new TaskSelectionError("9.9", "dependency-blocked:1.1"),
 				diagnosticCode: "task_selection_failed",
 				errorKind: "task_selection_failed",
@@ -3820,7 +3861,28 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 			strictEqual(run.lastFailure.diagnosticCode, testCase.diagnosticCode);
 			strictEqual(run.lastFailure.errorKind, testCase.errorKind);
 			strictEqual(run.lastFailure.failurePhase, testCase.failurePhase);
-			strictEqual(run.lastFailure.reasonCode, testCase.errorKind);
+			strictEqual(
+				run.lastFailure.reasonCode,
+				testCase.checkpointDimensions
+					? "checkpoint_run_options_mismatch"
+					: testCase.errorKind,
+			);
+			if (testCase.checkpointDimensions) {
+				strictEqual(
+					run.lastFailure.checkpointCode,
+					"checkpoint_run_options_mismatch",
+				);
+				deepStrictEqual(
+					run.lastFailure.checkpointDimensions,
+					testCase.checkpointDimensions,
+				);
+				ok(
+					run.lastFailure.reason.includes(
+						`changed: ${testCase.checkpointDimensions[0]}.`,
+					),
+				);
+				ok(run.lastFailure.reason.includes("switchyard-fresh.checkpoint.json"));
+			}
 			if (testCase.error instanceof QueuePreflightError) {
 				deepStrictEqual(run.preflightDetail, testCase.error.preflightDetail);
 			}

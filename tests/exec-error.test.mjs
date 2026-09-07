@@ -1,6 +1,9 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
-import { classifyProviderStreams } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	checkpointRemediation,
+	classifyProviderStreams,
+} from "../src/switchyard/adapter/exec-error.mjs";
 
 const providers = [
 	["claude", "claude"],
@@ -43,6 +46,16 @@ function classify(stdout, stderr = "", options = {}) {
 }
 
 describe("durable provider stream diagnostics", () => {
+	it("builds a closed checkpoint remedy with changed dimensions and a fresh path", () => {
+		const remedy = checkpointRemediation("checkpoint_queue_identity_mismatch", {
+			dimensions: ["queueIdentity"],
+		});
+		ok(remedy.includes("queue identity mismatch"));
+		ok(remedy.includes("changed: queueIdentity"));
+		ok(remedy.includes("create a fresh checkpoint explicitly"));
+		ok(remedy.includes("switchyard-fresh.checkpoint.json"));
+	});
+
 	it("classifies every exact string variant, with optional Error and case folding", () => {
 		for (const [line, code] of corpus) {
 			for (const variant of [line, `Error: ${line}`, line.toLowerCase()]) {

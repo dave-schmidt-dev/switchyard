@@ -47,6 +47,8 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import {
+	CHECKPOINT_REMEDIATION_MESSAGES,
+	checkpointRemediation,
 	classifyPreProviderFailure,
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
@@ -237,11 +239,18 @@ async function finalizeInitializedLaunchFailure(
 	{ projectLockOwned = false } = {},
 ) {
 	const classified = classifyPreProviderFailure(error);
+	const checkpointCode =
+		typeof error?.code === "string" &&
+		Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, error.code)
+			? error.code
+			: undefined;
 	const failure = sanitizeFailureMetadata({
 		result: "launch_failed",
 		errorKind: classified?.errorKind ?? "launch_failed",
 		diagnosticCode: classified?.diagnosticCode ?? "worker_boot_exception",
 		failurePhase: classified?.failurePhase ?? "worker_boot",
+		checkpointCode,
+		checkpointDimensions: checkpointCode ? error.changedDimensions : undefined,
 	});
 	return finalizeRun({
 		runId,
@@ -1042,6 +1051,11 @@ async function runDispatch(opts, dependencies = {}) {
 				(entry) => !entry.success && entry.result !== "route_health_deferred",
 			);
 			const classifiedQueueError = classifyPreProviderFailure(queueError);
+			const checkpointCode =
+				typeof queueError?.code === "string" &&
+				Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, queueError.code)
+					? queueError.code
+					: undefined;
 			const classifiedFailure = queueError
 				? sanitizeFailureMetadata({
 						result: "unknown_failure",
@@ -1049,6 +1063,10 @@ async function runDispatch(opts, dependencies = {}) {
 						diagnosticCode: classifiedQueueError?.diagnosticCode,
 						failurePhase:
 							classifiedQueueError?.failurePhase ?? "terminal_reconciliation",
+						checkpointCode,
+						checkpointDimensions: checkpointCode
+							? queueError.changedDimensions
+							: undefined,
 					})
 				: sanitizeFailureMetadata(failedResult ?? {});
 			// `sanitizeFailureMetadata` returns null for anything it cannot classify,
@@ -2006,6 +2024,22 @@ function reconcileFailureArtifactRef(lastFailure, artifactRefs) {
 	return rest;
 }
 
+function projectFailureRemedy(lastFailure) {
+	if (
+		!lastFailure ||
+		typeof lastFailure !== "object" ||
+		typeof lastFailure.checkpointCode !== "string" ||
+		!Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, lastFailure.checkpointCode)
+	)
+		return lastFailure;
+	return {
+		...lastFailure,
+		reason: checkpointRemediation(lastFailure.checkpointCode, {
+			dimensions: lastFailure.checkpointDimensions,
+		}),
+	};
+}
+
 async function listArtifactRefs(runId) {
 	const artifactsDir = resolve(getRunRoot(runId), "artifacts");
 	try {
@@ -2103,9 +2137,8 @@ async function buildResultEnvelope(runId, run) {
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount,
 		failedCount,
-		lastFailure: reconcileFailureArtifactRef(
-			run.lastFailure ?? null,
-			artifactRefs,
+		lastFailure: projectFailureRemedy(
+			reconcileFailureArtifactRef(run.lastFailure ?? null, artifactRefs),
 		),
 		...retryProjection,
 		queueDiagnostics,

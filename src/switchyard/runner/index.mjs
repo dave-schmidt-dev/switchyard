@@ -47,7 +47,9 @@ import {
 	executeCursorAsync,
 } from "../adapter/cursor.mjs";
 import {
+	CHECKPOINT_REMEDIATION_MESSAGES,
 	CLEANUP_STAGES,
+	checkpointRemediation,
 	INTEGRATION_REFUSAL_KINDS,
 	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
@@ -363,38 +365,27 @@ export const CHECKPOINT_IDENTITY_CODES = Object.freeze({
 	HISTORICAL_CHECKPOINT: "checkpoint_historical_checkpoint",
 });
 
-export const CHECKPOINT_IDENTITY_REMEDIES = Object.freeze({
-	checkpoint_task_file_mismatch:
-		"checkpoint task file mismatch: tasksFilePath does not match; create a new checkpoint or use an audited migration",
-	checkpoint_tasks_file_mismatch:
-		"checkpoint task file mismatch: tasksFilePath does not match; create a new checkpoint or use an audited migration",
-	checkpoint_missing_queue_identity:
-		"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
-	checkpoint_queue_identity_missing:
-		"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
-	checkpoint_queue_identity_mismatch:
-		"checkpoint queue identity mismatch; create a new checkpoint or use an audited migration",
-	checkpoint_run_options_mismatch:
-		"checkpoint run options mismatch: normalized run options changed; create a new checkpoint or use an audited migration",
-	checkpoint_historical_checkpoint:
-		"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
-	checkpoint_historical_state:
-		"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
-});
+export const CHECKPOINT_IDENTITY_REMEDIES = CHECKPOINT_REMEDIATION_MESSAGES;
 
 export class CheckpointIdentityError extends Error {
-	constructor(code, remedy = null) {
+	constructor(code, remedy = null, details = {}) {
 		const staticRemedy =
 			remedy ??
 			CHECKPOINT_IDENTITY_REMEDIES[code] ??
 			"checkpoint identity mismatch; create a new checkpoint or use an audited migration";
-		super(`checkpoint identity mismatch: ${staticRemedy}`);
+		const actionableRemedy =
+			details && (details.checkpointPath || details.dimensions)
+				? checkpointRemediation(code, details)
+				: staticRemedy;
+		super(`checkpoint identity mismatch: ${actionableRemedy}`);
 		this.name = "CheckpointIdentityError";
 		this.code = code;
 		this.reasonCode = code;
 		this.diagnosticCode = code;
-		this.reason = staticRemedy;
-		this.remedy = staticRemedy;
+		this.reason = actionableRemedy;
+		this.remedy = actionableRemedy;
+		this.changedDimensions = Object.freeze([...(details.dimensions ?? [])]);
+		this.freshCheckpointPath = "switchyard-fresh.checkpoint.json";
 	}
 }
 
@@ -1831,7 +1822,34 @@ function isCheckpointOwner(owner) {
 	);
 }
 
-function validateCheckpointV3(parsed, tasksFilePath, expected) {
+const CHECKPOINT_OPTION_DIMENSIONS = Object.freeze([
+	"taskIds",
+	"excludeProviders",
+	"onlyProviders",
+	"maxTasks",
+	"stopOnFailure",
+]);
+
+function checkpointOptionDimensions(stored, expected) {
+	if (
+		!stored ||
+		!expected ||
+		typeof stored !== "object" ||
+		typeof expected !== "object"
+	)
+		return [];
+	return CHECKPOINT_OPTION_DIMENSIONS.filter(
+		(field) =>
+			stableStringify(stored[field]) !== stableStringify(expected[field]),
+	);
+}
+
+function validateCheckpointV3(
+	parsed,
+	tasksFilePath,
+	expected,
+	checkpointPath = null,
+) {
 	if (
 		!Array.isArray(parsed.completedTaskIds) ||
 		!Array.isArray(parsed.results) ||
@@ -1909,6 +1927,7 @@ function validateCheckpointV3(parsed, tasksFilePath, expected) {
 			CHECKPOINT_IDENTITY_REMEDIES[
 				CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH
 			],
+			{ checkpointPath, dimensions: ["tasksFilePath"] },
 		);
 	}
 	if (
@@ -1920,6 +1939,18 @@ function validateCheckpointV3(parsed, tasksFilePath, expected) {
 			CHECKPOINT_IDENTITY_REMEDIES[
 				CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH
 			],
+			{
+				checkpointPath,
+				dimensions: checkpointOptionDimensions(
+					parsed.runOptions,
+					expected.runOptions,
+				).concat(
+					checkpointOptionDimensions(parsed.runOptions, expected.runOptions)
+						.length === 0
+						? ["queueIdentity"]
+						: [],
+				),
+			},
 		);
 	}
 	if (
@@ -1931,6 +1962,13 @@ function validateCheckpointV3(parsed, tasksFilePath, expected) {
 			CHECKPOINT_IDENTITY_REMEDIES[
 				CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH
 			],
+			{
+				checkpointPath,
+				dimensions: checkpointOptionDimensions(
+					parsed.runOptions,
+					expected.runOptions,
+				),
+			},
 		);
 	}
 	if (
@@ -2189,7 +2227,12 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 	if (parsed?.version === CHECKPOINT_VERSION) {
 		validateRetryDescriptorEvidence(parsed);
 		validateCheckpointTaskBases(parsed);
-		return validateCheckpointV3(parsed, tasksFilePath, expected);
+		return validateCheckpointV3(
+			parsed,
+			tasksFilePath,
+			expected,
+			checkpointPath,
+		);
 	}
 
 	if (
@@ -2203,6 +2246,7 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				CHECKPOINT_IDENTITY_REMEDIES[
 					CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH
 				],
+				{ checkpointPath, dimensions: ["tasksFilePath"] },
 			);
 		}
 		if (!parsed.queueIdentity || typeof parsed.queueIdentity !== "string") {
@@ -2211,6 +2255,7 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				CHECKPOINT_IDENTITY_REMEDIES[
 					CHECKPOINT_IDENTITY_CODES.MISSING_QUEUE_IDENTITY
 				],
+				{ checkpointPath, dimensions: ["queueIdentity"] },
 			);
 		}
 		if (
@@ -2222,6 +2267,18 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				CHECKPOINT_IDENTITY_REMEDIES[
 					CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH
 				],
+				{
+					checkpointPath,
+					dimensions: checkpointOptionDimensions(
+						parsed.runOptions,
+						expected.runOptions,
+					).concat(
+						checkpointOptionDimensions(parsed.runOptions, expected.runOptions)
+							.length === 0
+							? ["queueIdentity"]
+							: [],
+					),
+				},
 			);
 		}
 		if (
@@ -2234,6 +2291,13 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				CHECKPOINT_IDENTITY_REMEDIES[
 					CHECKPOINT_IDENTITY_CODES.RUN_OPTIONS_MISMATCH
 				],
+				{
+					checkpointPath,
+					dimensions: checkpointOptionDimensions(
+						parsed.runOptions,
+						expected.runOptions,
+					),
+				},
 			);
 		}
 		validateRetryDescriptorEvidence(parsed);
@@ -2256,6 +2320,7 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 				CHECKPOINT_IDENTITY_REMEDIES[
 					CHECKPOINT_IDENTITY_CODES.HISTORICAL_CHECKPOINT
 				],
+				{ checkpointPath, dimensions: ["checkpointVersion"] },
 			);
 		}
 		validateRetryDescriptorEvidence(parsed);

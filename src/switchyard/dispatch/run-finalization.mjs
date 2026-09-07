@@ -1,4 +1,5 @@
 import {
+	CHECKPOINT_REMEDIATION_MESSAGES,
 	isPersistentFailureMetadata,
 	PERSISTED_DIAGNOSTIC_CODES,
 	sanitizeFailureMetadata,
@@ -8,24 +9,7 @@ import * as defaultRunStore from "../run-store/index.mjs";
 const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 const TERMINAL_WRITERS = new Set(["worker", "dead_worker_recovery"]);
 
-const CLOSED_EVENT_REASONS = Object.freeze({
-	checkpoint_task_file_mismatch:
-		"checkpoint task file mismatch: tasksFilePath does not match; create a new checkpoint or use an audited migration",
-	checkpoint_tasks_file_mismatch:
-		"checkpoint task file mismatch: tasksFilePath does not match; create a new checkpoint or use an audited migration",
-	checkpoint_missing_queue_identity:
-		"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
-	checkpoint_queue_identity_missing:
-		"checkpoint v2 is missing queueIdentity; create a new checkpoint or use an audited migration",
-	checkpoint_queue_identity_mismatch:
-		"checkpoint queue identity mismatch; create a new checkpoint or use an audited migration",
-	checkpoint_run_options_mismatch:
-		"checkpoint run options mismatch: normalized run options changed; create a new checkpoint or use an audited migration",
-	checkpoint_historical_checkpoint:
-		"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
-	checkpoint_historical_state:
-		"checkpoint v1 is historical state without queue identity; create an explicit new checkpoint or use an audited migration",
-});
+const CLOSED_EVENT_REASONS = CHECKPOINT_REMEDIATION_MESSAGES;
 
 const CLEARED_ACTIVE_FIELDS = Object.freeze({
 	activeTaskId: null,
@@ -128,8 +112,8 @@ export async function finalizeRun(options, dependencies = {}) {
 			: null;
 	const closedEventReasonCode = eventReasonCode ?? closedFailure?.reasonCode;
 	const eventReason =
-		CLOSED_EVENT_REASONS[closedEventReasonCode] ??
 		closedFailure?.reason ??
+		CLOSED_EVENT_REASONS[closedEventReasonCode] ??
 		null;
 
 	const createEvent = dependencies.createEvent ?? defaultRunStore.createEvent;

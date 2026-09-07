@@ -19,6 +19,7 @@ import {
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { checkpointRemediation } from "../src/switchyard/adapter/exec-error.mjs";
 import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
@@ -2859,11 +2860,8 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 		const run = await readRun(runId);
 		ok(run.lastFailure !== null, "lastFailure populated in run.json");
 		strictEqual(run.lastFailure.errorKind, "launch_failed");
-		strictEqual(run.lastFailure.reasonCode, "launch_failed");
-		strictEqual(
-			run.lastFailure.reason,
-			"The headless provider job could not be launched.",
-		);
+		strictEqual(run.lastFailure.reasonCode, "checkpoint_run_options_mismatch");
+		ok(run.lastFailure.reason.includes("create a fresh checkpoint explicitly"));
 		strictEqual(run.lastFailure.failurePhase, "worker_boot");
 		ok(!JSON.stringify(run.lastFailure).includes(projectDir));
 		const disposition = projectDisposition({
@@ -2894,6 +2892,18 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 			maxTasks: 2,
 			stopOnFailure: true,
 		});
+		const taskIdsRunOptions = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 1,
+			taskIds: ["9.9"],
+			stopOnFailure: true,
+		});
+		const excludeProvidersRunOptions = normalizeRunOptions({
+			checkpointPath,
+			maxTasks: 1,
+			excludeProviders: ["claude"],
+			stopOnFailure: true,
+		});
 
 		const queueIdentity = createQueueIdentity({
 			tasksFilePath: tasksFile,
@@ -2908,6 +2918,7 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 			{
 				name: "task-file mismatch",
 				expectedCode: "checkpoint_task_file_mismatch",
+				dimensions: ["tasksFilePath"],
 				checkpoint: {
 					version: 2,
 					tasksFilePath: "/other/path/tasks.md",
@@ -2922,6 +2933,7 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 			{
 				name: "missing queue identity",
 				expectedCode: "checkpoint_missing_queue_identity",
+				dimensions: ["queueIdentity"],
 				checkpoint: {
 					version: 2,
 					tasksFilePath: tasksFile,
@@ -2934,6 +2946,7 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 			{
 				name: "queue-identity mismatch",
 				expectedCode: "checkpoint_queue_identity_mismatch",
+				dimensions: ["queueIdentity"],
 				checkpoint: {
 					version: 2,
 					tasksFilePath: tasksFile,
@@ -2948,6 +2961,7 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 			{
 				name: "run-options mismatch",
 				expectedCode: "checkpoint_run_options_mismatch",
+				dimensions: ["maxTasks"],
 				checkpoint: {
 					version: 2,
 					tasksFilePath: tasksFile,
@@ -2960,8 +2974,39 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 				queueIdentity,
 			},
 			{
+				name: "taskIds option mismatch",
+				expectedCode: "checkpoint_run_options_mismatch",
+				dimensions: ["taskIds"],
+				checkpoint: {
+					version: 2,
+					tasksFilePath: tasksFile,
+					queueIdentity,
+					runOptions: taskIdsRunOptions,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+			{
+				name: "excludeProviders option mismatch",
+				expectedCode: "checkpoint_run_options_mismatch",
+				dimensions: ["excludeProviders"],
+				checkpoint: {
+					version: 2,
+					tasksFilePath: tasksFile,
+					queueIdentity,
+					runOptions: excludeProvidersRunOptions,
+					completedTaskIds: [],
+					results: [],
+				},
+				runOptions,
+				queueIdentity,
+			},
+			{
 				name: "historical checkpoint",
 				expectedCode: "checkpoint_historical_checkpoint",
+				dimensions: ["checkpointVersion"],
 				checkpoint: {
 					version: 1,
 					tasksFilePath: tasksFile,
@@ -2978,12 +3023,15 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 		for (const testCase of cases) {
 			const runId = randomUUID();
 			const nonce = randomUUID();
+			const providerCanary = "PROVIDER_OUTPUT_CANARY_identity_failure";
+			testCase.checkpoint.providerOutput = providerCanary;
 
 			writeFileSync(
 				checkpointPath,
 				JSON.stringify(testCase.checkpoint),
 				"utf8",
 			);
+			const checkpointBytes = readFileSync(checkpointPath);
 
 			await initializeRun({
 				runId,
@@ -3056,6 +3104,17 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 				!JSON.stringify(bootFailed).includes(projectDir),
 				`${testCase.name} should not leak host paths`,
 			);
+			const expectedRemedy = checkpointRemediation(testCase.expectedCode, {
+				dimensions: testCase.dimensions,
+			});
+			strictEqual(bootFailed.reason, expectedRemedy);
+			ok(
+				bootFailed.reason.includes(
+					`changed: ${testCase.dimensions.join(", ")}.`,
+				),
+			);
+			ok(bootFailed.reason.includes("switchyard-fresh.checkpoint.json"));
+			ok(!JSON.stringify(bootFailed).includes(providerCanary));
 			observedCodes.add(testCase.expectedCode);
 
 			const run = await readRun(runId);
@@ -3064,9 +3123,17 @@ describe("checkpoint identity failures on detached worker path (Task 1.3)", () =
 				`${testCase.name}: lastFailure populated in run.json`,
 			);
 			strictEqual(run.lastFailure.errorKind, "launch_failed");
-			strictEqual(run.lastFailure.reasonCode, "launch_failed");
+			strictEqual(run.lastFailure.reasonCode, testCase.expectedCode);
+			strictEqual(run.lastFailure.reason, expectedRemedy);
+			strictEqual(run.lastFailure.checkpointCode, testCase.expectedCode);
+			deepStrictEqual(
+				run.lastFailure.checkpointDimensions,
+				testCase.dimensions,
+			);
 			strictEqual(run.lastFailure.failurePhase, "worker_boot");
 			ok(!JSON.stringify(run.lastFailure).includes(projectDir));
+			ok(!JSON.stringify(run.lastFailure).includes(providerCanary));
+			strictEqual(readFileSync(checkpointPath).equals(checkpointBytes), true);
 		}
 
 		strictEqual(observedCodes.size, 5, "five distinct static codes emitted");

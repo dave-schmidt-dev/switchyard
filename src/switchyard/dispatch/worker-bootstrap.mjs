@@ -253,7 +253,7 @@ export function buildFatalFailure(
 		failurePhase: "worker_boot",
 	};
 	const closedCode = classified.diagnosticCode;
-	return sanitizeFailureMetadata({
+	const failure = sanitizeFailureMetadata({
 		result: "launch_failed",
 		errorKind: classified.errorKind,
 		diagnosticCode: closedCode,
@@ -263,7 +263,14 @@ export function buildFatalFailure(
 		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
 			? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
 			: {}),
+		...(isRecognizedCheckpointIdentityError(error)
+			? {
+					checkpointCode: error.code,
+					checkpointDimensions: error.changedDimensions,
+				}
+			: {}),
 	});
+	return failure;
 }
 
 async function writeFatalEvent(

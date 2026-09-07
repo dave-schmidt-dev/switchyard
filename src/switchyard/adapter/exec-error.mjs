@@ -644,6 +644,72 @@ export const PERSISTED_SIGNALS = new Set([
 	"SIGTERM",
 ]);
 
+export const CHECKPOINT_REMEDIATION_MESSAGES = Object.freeze({
+	checkpoint_task_file_mismatch:
+		"checkpoint task file mismatch: tasksFilePath does not match; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_tasks_file_mismatch:
+		"checkpoint task file mismatch: tasksFilePath does not match; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_missing_queue_identity:
+		"checkpoint v2 is missing queueIdentity; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_queue_identity_missing:
+		"checkpoint v2 is missing queueIdentity; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_queue_identity_mismatch:
+		"checkpoint queue identity mismatch; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_run_options_mismatch:
+		"checkpoint run options mismatch: normalized run options changed; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_historical_checkpoint:
+		"checkpoint is historical state without queue identity; create a fresh checkpoint explicitly or use an audited migration",
+	checkpoint_historical_state:
+		"checkpoint is historical state without queue identity; create a fresh checkpoint explicitly or use an audited migration",
+});
+
+export const CHECKPOINT_IDENTITY_DIMENSIONS = new Set([
+	"tasksFilePath",
+	"queueIdentity",
+	"runOptions",
+	"checkpointVersion",
+	"taskIds",
+	"excludeProviders",
+	"onlyProviders",
+	"maxTasks",
+	"stopOnFailure",
+]);
+
+function normalizedCheckpointDimensions(dimensions) {
+	if (!Array.isArray(dimensions)) return [];
+	return [
+		...new Set(
+			dimensions.filter(
+				(dimension) =>
+					typeof dimension === "string" &&
+					CHECKPOINT_IDENTITY_DIMENSIONS.has(dimension),
+			),
+		),
+	];
+}
+
+function checkpointDimensionsFromReason(code, reason) {
+	const prefix = CHECKPOINT_REMEDIATION_MESSAGES[code];
+	const marker = `${prefix} changed: `;
+	const suffix =
+		". Example fresh checkpoint: switchyard-fresh.checkpoint.json.";
+	if (typeof reason !== "string" || !reason.startsWith(marker)) return [];
+	if (!reason.endsWith(suffix)) return [];
+	return normalizedCheckpointDimensions(
+		reason
+			.slice(marker.length, -suffix.length)
+			.replace(/\.$/u, "")
+			.split(", ")
+			.filter(Boolean),
+	);
+}
+
+export function checkpointRemediation(code, { dimensions = [] } = {}) {
+	const changed = normalizedCheckpointDimensions(dimensions);
+	const suffix = changed.length > 0 ? ` changed: ${changed.join(", ")}.` : "";
+	return `${CHECKPOINT_REMEDIATION_MESSAGES[code] ?? "create a fresh checkpoint explicitly"}${suffix} Example fresh checkpoint: switchyard-fresh.checkpoint.json.`;
+}
+
 // A diagnostic is authoritative only when a reviewed host boundary minted it.
 // Provider/model/task output is evidence for people, never a routing authority.
 // In particular, `usage:` and `invalid value` are ordinary prose in prompts and
@@ -999,6 +1065,8 @@ export function sanitizeFailureMetadata({
 	descriptorIdentity,
 	descriptorHarness,
 	diagnosticRef,
+	checkpointCode,
+	checkpointDimensions,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -1012,6 +1080,21 @@ export function sanitizeFailureMetadata({
 		reasonCode: metadata.reasonCode,
 		reason: metadata.reason,
 	};
+	const normalizedCheckpointCode =
+		typeof checkpointCode === "string" &&
+		Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, checkpointCode)
+			? checkpointCode
+			: null;
+	const normalizedDimensions =
+		normalizedCheckpointDimensions(checkpointDimensions);
+	if (normalizedCheckpointCode) {
+		safe.reasonCode = normalizedCheckpointCode;
+		safe.reason = checkpointRemediation(normalizedCheckpointCode, {
+			dimensions: normalizedDimensions,
+		});
+		safe.checkpointCode = normalizedCheckpointCode;
+		safe.checkpointDimensions = normalizedDimensions;
+	}
 	const safeCleanupDiagnostic = cleanupDiagnosticCodeFor(cleanupStage);
 	const closedDiagnosticCode = PERSISTED_DIAGNOSTIC_CODES.includes(
 		diagnosticCode,
@@ -1114,6 +1197,8 @@ export function isPersistentFailureMetadata(value) {
 		"descriptorIdentity",
 		"descriptorHarness",
 		"diagnosticRef",
+		"checkpointCode",
+		"checkpointDimensions",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
 	const expected = sanitizeFailureMetadata({
@@ -1121,9 +1206,34 @@ export function isPersistentFailureMetadata(value) {
 		errorKind: value.errorKind,
 	});
 	if (!expected) return false;
+	const checkpointCode =
+		typeof value.checkpointCode === "string" &&
+		Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, value.checkpointCode)
+			? value.checkpointCode
+			: typeof value.reasonCode === "string" &&
+					Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, value.reasonCode)
+				? value.reasonCode
+				: null;
+	const checkpointDimensions =
+		value.checkpointDimensions !== undefined
+			? normalizedCheckpointDimensions(value.checkpointDimensions)
+			: checkpointDimensionsFromReason(checkpointCode, value.reason);
+	const checkpointReason = checkpointCode
+		? checkpointRemediation(checkpointCode, {
+				dimensions: checkpointDimensions,
+			})
+		: null;
 	if (
-		value.reasonCode !== expected.reasonCode ||
-		value.reason !== expected.reason
+		(value.reasonCode !== expected.reasonCode &&
+			value.reasonCode !== checkpointCode) ||
+		(value.reason !== expected.reason && value.reason !== checkpointReason) ||
+		(checkpointCode && value.reasonCode !== checkpointCode) ||
+		(checkpointCode && value.reason !== checkpointReason) ||
+		(value.checkpointDimensions !== undefined &&
+			(!Array.isArray(value.checkpointDimensions) ||
+				value.checkpointDimensions.length !== checkpointDimensions.length)) ||
+		(value.checkpointCode !== undefined &&
+			value.checkpointCode !== checkpointCode)
 	) {
 		return false;
 	}
@@ -1153,6 +1263,8 @@ export function isPersistentFailureMetadata(value) {
 		descriptorIdentity: value.descriptorIdentity,
 		descriptorHarness: value.descriptorHarness,
 		diagnosticRef: value.diagnosticRef,
+		checkpointCode: value.checkpointCode,
+		checkpointDimensions: value.checkpointDimensions,
 	});
 	for (const field of [
 		"diagnosticCode",
@@ -1165,7 +1277,23 @@ export function isPersistentFailureMetadata(value) {
 		"descriptorIdentity",
 		"descriptorHarness",
 		"diagnosticRef",
+		"checkpointCode",
+		"checkpointDimensions",
 	]) {
+		if (field === "checkpointDimensions") {
+			if (value[field] === undefined && safeDiagnostics?.[field] === undefined)
+				continue;
+			if (
+				!Array.isArray(value[field]) ||
+				!Array.isArray(safeDiagnostics?.[field]) ||
+				value[field].length !== safeDiagnostics[field].length ||
+				value[field].some(
+					(dimension, index) => dimension !== safeDiagnostics[field][index],
+				)
+			)
+				return false;
+			continue;
+		}
 		if (value[field] !== safeDiagnostics?.[field]) return false;
 	}
 	return true;

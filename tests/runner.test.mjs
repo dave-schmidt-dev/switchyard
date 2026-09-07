@@ -14143,6 +14143,9 @@ describe("typed checkpoint identity failures (Task 1.3)", () => {
 		strictEqual(thrown.reasonCode, "checkpoint_queue_identity_mismatch");
 		strictEqual(thrown.diagnosticCode, "checkpoint_queue_identity_mismatch");
 		ok(thrown.reason.includes("queue identity mismatch"));
+		deepStrictEqual(thrown.changedDimensions, ["queueIdentity"]);
+		strictEqual(thrown.freshCheckpointPath, "switchyard-fresh.checkpoint.json");
+		ok(thrown.message.includes("switchyard-fresh.checkpoint.json"));
 	});
 
 	it("run-options mismatch throws CheckpointIdentityError with checkpoint_run_options_mismatch", () => {
@@ -14193,6 +14196,54 @@ describe("typed checkpoint identity failures (Task 1.3)", () => {
 		strictEqual(thrown.diagnosticCode, "checkpoint_run_options_mismatch");
 		ok(thrown.reason.includes("normalized run options changed"));
 	});
+
+	for (const [field, value] of [
+		["taskIds", ["9.9"]],
+		["excludeProviders", ["claude"]],
+	]) {
+		it(`reports ${field} for normalized checkpoint option mismatch`, () => {
+			const tasksPath = writeTasksFile(
+				"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** T\n",
+			);
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const expectedOptions = normalizeRunOptions({ checkpointPath });
+			const storedOptions = normalizeRunOptions({
+				checkpointPath,
+				[field]: value,
+			});
+			const queueIdentity = createQueueIdentity({
+				tasksFilePath: tasksPath,
+				markdown: readFileSync(tasksPath, "utf8"),
+				tasks: loadTaskQueue(tasksPath),
+				projectRevision: "rev-1",
+				runOptions: expectedOptions,
+			});
+			writeFileSync(
+				checkpointPath,
+				JSON.stringify({
+					version: 2,
+					tasksFilePath: tasksPath,
+					queueIdentity,
+					runOptions: storedOptions,
+					completedTaskIds: [],
+					results: [],
+				}),
+				"utf8",
+			);
+			throws(
+				() =>
+					loadCheckpoint(checkpointPath, tasksPath, {
+						queueIdentity,
+						runOptions: expectedOptions,
+					}),
+				(error) => {
+					strictEqual(error.code, "checkpoint_run_options_mismatch");
+					deepStrictEqual(error.changedDimensions, [field]);
+					return true;
+				},
+			);
+		});
+	}
 
 	it("historical checkpoint throws CheckpointIdentityError with checkpoint_historical_checkpoint", () => {
 		const tasksPath = writeTasksFile(
