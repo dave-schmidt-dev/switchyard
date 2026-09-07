@@ -1,0 +1,57 @@
+[
+	{ "name": "nested-file", "path": "src/switchyard/index.mjs", "valid": true },
+	{ "name": "future-file", "path": "src/new-file.mjs", "valid": true },
+	{
+		"name": "dotdot-prefixed-name",
+		"path": "..cache/new-file.mjs",
+		"valid": true
+	},
+	{
+		"name": "empty-component",
+		"path": "src//index.mjs",
+		"valid": false,
+		"reason": "empty path component"
+	},
+	{
+		"name": "dot-component",
+		"path": "src/./index.mjs",
+		"valid": false,
+		"reason": "dot path component"
+	},
+	{
+		"name": "absolute",
+		"path": "/etc/passwd",
+		"valid": false,
+		"reason": "absolute path"
+	},
+	{
+		"name": "backslash",
+		"path": "src\\\\index.mjs",
+		"valid": false,
+		"reason": "backslash"
+	},
+	{
+		"name": "duplicate",
+		"path": "src/index.mjs, src/index.mjs",
+		"valid": false,
+		"reason": "duplicate"
+	},
+	{
+		"name": "directory-only",
+		"path": "src/",
+		"valid": false,
+		"reason": "directory-only"
+	},
+	{
+		"name": "wildcard",
+		"path": "src/*.mjs",
+		"valid": false,
+		"reason": "wildcards"
+	},
+	{
+		"name": "traversal",
+		"path": "../outside.mjs",
+		"valid": false,
+		"reason": "path traversal"
+	}
+]

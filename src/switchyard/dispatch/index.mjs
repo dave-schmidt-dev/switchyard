@@ -98,6 +98,7 @@ import {
 	reconcileExternalCompletion,
 	runQueueAsync,
 	sanitizeQueuePreflightDetail,
+	validateProjectFileEntries,
 } from "../runner/index.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
 import { run as runOrphanLockRemediation } from "./remediate-orphaned-locks.mjs";
@@ -786,6 +787,7 @@ async function runDispatch(opts, dependencies = {}) {
 		let tasks;
 		try {
 			tasks = loadTaskQueue(opts.tasksFilePath);
+			validateProjectFileEntries(tasks, opts.projectPath);
 		} catch (error) {
 			// A queue that fails to parse is a caller contract failure with a
 			// precise, user-fixable cause. Left unclassified it fell through to
@@ -1467,6 +1469,7 @@ async function handleLaunch(argv, dependencies = {}) {
 		let tasks;
 		try {
 			tasks = loadTaskQueue(opts.tasksFilePath);
+			validateProjectFileEntries(tasks, opts.projectPath);
 		} catch (error) {
 			preInitialization = {
 				type: "contract_failure",

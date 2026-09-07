@@ -15,6 +15,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1840,6 +1841,7 @@ describe("runner queue parsing", () => {
 			["`../outside/evil.mjs`", /path traversal/],
 			["`src/*.mjs`", /wildcards/],
 			["`src/`", /directory-only/],
+			["src//empty.mjs", /empty path component/],
 		]) {
 			const markdown = `## Phase 1
 
@@ -1940,6 +1942,68 @@ describe("runner queue parsing", () => {
 - **Description:** Bad
 `;
 		throws(() => parseFixture(markdown), /duplicate/);
+	});
+
+	it("matches the shared task-file path corpus", () => {
+		const corpus = JSON.parse(
+			readFileSync(
+				join(cwd(), "tests/fixtures/task-file-path-corpus.json"),
+				"utf8",
+			),
+		);
+		for (const fixture of corpus) {
+			const markdown = `### Task 1.1: Corpus\n- **Status:** pending\n- **Files:** ${fixture.path}\n`;
+			if (fixture.valid) {
+				strictEqual(parseFixture(markdown)[0].requiredPaths[0], fixture.path);
+			} else {
+				throws(() => parseFixture(markdown), new RegExp(fixture.reason));
+			}
+		}
+	});
+
+	it("validates Files entries against the project before backend preflight", () => {
+		const root = join(TEST_DIR, "files-contract");
+		mkdirSync(join(root, "existing-dir"), { recursive: true });
+		mkdirSync(join(root, "outside"), { recursive: true });
+		writeFileSync(join(root, "existing.mjs"), "export {}\n");
+		symlinkSync("existing.mjs", join(root, "link.mjs"));
+		symlinkSync("outside", join(root, "linked-dir"));
+		const cases = [
+			["existing-dir", /regular file, not a directory or symlink/],
+			["link.mjs", /regular file, not a directory or symlink/],
+			["linked-dir/future.mjs", /symlink directory/],
+			["future.mjs", null],
+			["..cache/new-file.mjs", null],
+		];
+		for (const [path, expected] of cases) {
+			const tasksPath = join(root, `${path.replaceAll("/", "-")}.md`);
+			writeFileSync(
+				tasksPath,
+				`### Task 1.1: File task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** ${path}\n- **Description:** fixture\n`,
+			);
+			let preflightCalls = 0;
+			const invoke = () =>
+				runQueueImpl({
+					tasksFilePath: tasksPath,
+					projectPath: root,
+					platform: "macos",
+					checkpointPath: `${tasksPath}.checkpoint.json`,
+					dependencies: {
+						queuePreflight: () => {
+							preflightCalls += 1;
+						},
+						backendFactory: () => ({
+							platform: "macos",
+							preflight: () => {
+								preflightCalls += 1;
+							},
+						}),
+					},
+				});
+			if (expected) throws(invoke, expected);
+			else throws(invoke);
+			strictEqual(preflightCalls, expected ? 0 : 1);
+		}
 	});
 
 	it("ignores prose-embedded Files: mentions and only matches - **Files:** lines", () => {

@@ -19,7 +19,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
 	captureDiff as captureAgyDiff,
@@ -2770,6 +2770,16 @@ function parseFilePaths(raw, taskId) {
 				`Task ${taskId}: directory-only entry not allowed in Files: "${path}"`,
 			);
 		}
+		if (path.split("/").some((component) => component === "")) {
+			throw new Error(
+				`Task ${taskId}: empty path component in Files: "${path}"`,
+			);
+		}
+		if (path.split("/").some((component) => component === ".")) {
+			throw new Error(
+				`Task ${taskId}: dot path component not allowed in Files: "${path}"`,
+			);
+		}
 	}
 
 	const seen = new Set();
@@ -2781,6 +2791,57 @@ function parseFilePaths(raw, taskId) {
 	}
 
 	return paths;
+}
+
+export function validateProjectFileEntries(tasks, projectPath) {
+	const root = resolve(projectPath);
+	for (const task of tasks) {
+		for (const relativePath of task.requiredPaths ?? []) {
+			const candidate = resolve(root, relativePath);
+			const containment = relative(root, candidate);
+			if (
+				containment === ".." ||
+				containment.startsWith(`..${sep}`) ||
+				isAbsolute(containment)
+			) {
+				const error = new Error(
+					`Task ${task.id}: Files path escapes project root: "${relativePath}"`,
+				);
+				error.code = "queue_contract_invalid";
+				throw error;
+			}
+			const components = relative(root, candidate).split(sep);
+			let prefix = root;
+			for (const component of components.slice(0, -1)) {
+				prefix = join(prefix, component);
+				try {
+					if (lstatSync(prefix).isSymbolicLink()) {
+						const error = new Error(
+							`Task ${task.id}: Files entry must not traverse a symlink directory: "${relativePath}"`,
+						);
+						error.code = "queue_contract_invalid";
+						throw error;
+					}
+				} catch (error) {
+					if (error?.code === "ENOENT") break;
+					throw error;
+				}
+			}
+			try {
+				const stat = lstatSync(candidate);
+				if (stat.isDirectory() || stat.isSymbolicLink()) {
+					const error = new Error(
+						`Task ${task.id}: Files entry must name a regular file, not a directory or symlink: "${relativePath}"`,
+					);
+					error.code = "queue_contract_invalid";
+					throw error;
+				}
+			} catch (error) {
+				if (error?.code === "ENOENT") continue;
+				throw error;
+			}
+		}
+	}
 }
 
 /**
@@ -9798,6 +9859,7 @@ function prepareQueueLaunch({
 }) {
 	const selectedPlatform = queuePlatform({ platform, runOptions });
 	const tasks = loadTaskQueue(tasksFilePath);
+	validateProjectFileEntries(tasks, projectPath);
 	if (tasks.length === 0) {
 		throwOnEmptyParse(tasksFilePath, checkpointPath, onStatus);
 	}

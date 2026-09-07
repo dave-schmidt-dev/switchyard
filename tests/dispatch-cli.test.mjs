@@ -952,6 +952,92 @@ describe("launch integration", () => {
 		);
 	});
 
+	it("rejects directory and symlink Files entries identically before run initialization", () => {
+		mkdirSync(join(projectDir, "existing-dir"), { recursive: true });
+		symlinkSync("existing-dir", join(projectDir, "existing-link"));
+		mkdirSync(join(projectDir, "outside"), { recursive: true });
+		symlinkSync("outside", join(projectDir, "linked-dir"));
+		for (const invalidPath of [
+			"existing-dir",
+			"existing-link",
+			"linked-dir/future.mjs",
+		]) {
+			writeFileSync(
+				tasksFile,
+				`### Task 1.1: Invalid\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** ${invalidPath}\n- **Description:** invalid\n`,
+				"utf8",
+			);
+			for (const command of ["run", "launch"]) {
+				const human = runDispatch(
+					[command, tasksFile, "--project", projectDir],
+					makeStateRootEnv(),
+				);
+				strictEqual(human.status, 2);
+				ok(
+					human.stderr.includes("Files entry must name a regular file") ||
+						human.stderr.includes("must not traverse a symlink directory"),
+				);
+				const json = runDispatch(
+					[command, tasksFile, "--project", projectDir, "--json"],
+					makeStateRootEnv(),
+				);
+				strictEqual(json.status, 2);
+				const envelope = JSON.parse(json.stdout.trim());
+				strictEqual(envelope.disposition.reasonCode, "queue_contract_invalid");
+				strictEqual(
+					envelope.disposition.diagnosticCode,
+					"queue_contract_invalid",
+				);
+				ok(!existsSync(join(stateRoot, "runs")));
+				ok(!existsSync(join(stateRoot, "locks")));
+			}
+		}
+	});
+
+	it("rejects invalid Files before injected queue or detached spawn seams", async () => {
+		mkdirSync(join(projectDir, "existing-dir"), { recursive: true });
+		symlinkSync("existing-dir", join(projectDir, "existing-link"));
+		mkdirSync(join(projectDir, "intermediate"), { recursive: true });
+		symlinkSync("intermediate", join(projectDir, "intermediate-link"));
+		let queueCalls = 0;
+		let spawnCalls = 0;
+		for (const invalidPath of [
+			"existing-dir",
+			"existing-link",
+			"intermediate-link/future.mjs",
+		]) {
+			writeFileSync(
+				tasksFile,
+				`### Task 1.1: Invalid\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** ${invalidPath}\n- **Description:** invalid\n`,
+				"utf8",
+			);
+			await rejects(
+				() =>
+					dispatchRun(parseDispatchArgs([tasksFile, "--project", projectDir]), {
+						runQueue: () => {
+							queueCalls += 1;
+							throw new Error("queue should not run");
+						},
+					}),
+				/Files entry|symlink directory/,
+			);
+			const { envelope } = await captureLaunchJson(
+				[tasksFile, "--project", projectDir, "--json"],
+				{
+					spawn: () => {
+						spawnCalls += 1;
+						throw new Error("spawn should not run");
+					},
+				},
+			);
+			strictEqual(envelope.disposition.reasonCode, "queue_contract_invalid");
+		}
+		strictEqual(queueCalls, 0);
+		strictEqual(spawnCalls, 0);
+		ok(!existsSync(join(stateRoot, "runs")));
+		ok(!existsSync(join(stateRoot, "locks")));
+	});
+
 	it("launch --json zero-task fixture emits exactly one pre-init object", () => {
 		const emptyTasksFile = join(dir, "empty-json-tasks.md");
 		writeFileSync(emptyTasksFile, "# No task headings.\n", "utf8");
