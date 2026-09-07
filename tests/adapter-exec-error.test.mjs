@@ -582,6 +582,23 @@ describe("sanitizeFailureMetadata — persistence boundary", () => {
 		strictEqual(JSON.stringify(metadata).includes("SECRET_CANARY"), false);
 	});
 
+	it("retains silence_timeout as a closed durable execution outcome", () => {
+		const metadata = sanitizeFailureMetadata({
+			result: "silence_timeout",
+			errorKind: "silence_timeout",
+			error: "SECRET_CANARY raw provider error",
+		});
+		deepStrictEqual(metadata, {
+			errorKind: "silence_timeout",
+			reasonCode: "silence_timeout",
+			reason:
+				"Provider made no substantive progress before the silence deadline.",
+		});
+		ok(PERSISTED_ERROR_KINDS.includes("silence_timeout"));
+		ok(isPersistentFailureMetadata(metadata));
+		strictEqual(JSON.stringify(metadata).includes("SECRET_CANARY"), false);
+	});
+
 	it("retains only bounded route provenance alongside a trusted diagnostic", () => {
 		const metadata = sanitizeFailureMetadata({
 			result: "execution_failed",

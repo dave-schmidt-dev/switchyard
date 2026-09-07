@@ -202,16 +202,35 @@ function classifyServedModel(servedModel, selector, onStatus) {
 	return { servedModel: served, mismatch: served !== selector };
 }
 
-function configWriteFailure(detail) {
+function configWriteFailure(result) {
+	const silenceTimedOut = result?.silenceTimedOut === true;
+	const timedOut = result?.timedOut === true;
 	return {
 		output: "",
 		success: false,
-		error:
-			"could not write the Vibe model config into the workspace after " +
-			`${VIBE_HELPER_ATTEMPTS} attempts; without it the guest would ` +
-			`silently run its default model. ${detail ?? ""}`.trim(),
-		errorKind: "environment_incomplete",
-		timedOut: false,
+		error: silenceTimedOut
+			? "provider made no substantive progress before the silence deadline"
+			: timedOut
+				? "provider execution timed out while writing the Vibe model config"
+				: (
+						"could not write the Vibe model config into the workspace after " +
+						`${VIBE_HELPER_ATTEMPTS} attempts; without it the guest would ` +
+						"silently run its default model. " +
+						`${result?.stderr ?? ""}`
+					).trim(),
+		errorKind: silenceTimedOut
+			? "silence_timeout"
+			: timedOut
+				? "execution_timed_out"
+				: "environment_incomplete",
+		timedOut,
+		silenceTimedOut,
+		outcome: silenceTimedOut
+			? "silence_timeout"
+			: timedOut
+				? "execution_timed_out"
+				: "failure",
+		progress: result?.progress ?? null,
 	};
 }
 
@@ -311,7 +330,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 			options,
 			execution.selector,
 		);
-		if (writeError) return configWriteFailure(writeError.message);
+		if (writeError) return configWriteFailure({ stderr: writeError.message });
 		const output = execFileSync(execution.command, execution.args, {
 			input: execution.input,
 			encoding: "utf8",
@@ -374,6 +393,9 @@ async function readServedModelAsync(workspaceId, options) {
 		try {
 			const result = await runProviderProcess(probe.command, probe.args, {
 				timeoutMs: SERVED_MODEL_TIMEOUT_MS,
+				silenceTimeoutMs: options.silenceTimeoutMs,
+				progressStage: "starting",
+				onProgress: options.onProgress,
 				...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
 			});
 			if (result?.success) return result.output;
@@ -407,11 +429,14 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 			written = await runProviderProcess(write.command, write.args, {
 				input: write.input,
 				timeoutMs: SERVED_MODEL_TIMEOUT_MS,
+				silenceTimeoutMs: options.silenceTimeoutMs,
+				progressStage: "configuring",
+				onProgress: options.onProgress,
 				...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
 			});
 			if (written?.success) break;
 		}
-		if (!written?.success) return configWriteFailure(written?.stderr);
+		if (!written?.success) return configWriteFailure(written);
 		const result = await executeProviderInvocation(
 			execution.command,
 			execution.args,
@@ -422,6 +447,9 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 				cleanupContext: execution.cleanupContext,
 				timeoutMs: options.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS,
 				cleanup: () => killOrphanedProcessesAsync(workingContainerName),
+				silenceTimeoutMs: options.silenceTimeoutMs,
+				progressStage: "working",
+				onProgress: options.onProgress,
 			},
 		);
 		// Unlike the sync path, where execFileSync throws and this line is

@@ -15,6 +15,7 @@ import {
 	prlctlFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
+import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
 
@@ -648,6 +649,21 @@ export async function runWorkerBootstrap(argv = process.argv) {
 						/^diagnostic:[a-f0-9]{32}$/u.test(event.diagnosticRef)
 							? event.diagnosticRef
 							: null;
+					const progress = event?.progress
+						? createProgressSnapshot({
+								stage: event.progress.stage,
+								elapsedMs: event.progress.elapsedMs,
+								lastSubstantiveProgressAt:
+									event.progress.lastSubstantiveProgressAt,
+								lastSubstantiveProgressAgeMs:
+									event.progress.lastSubstantiveProgressAgeMs,
+								stdoutBytes: event.progress.counters?.stdoutBytes,
+								stderrBytes: event.progress.counters?.stderrBytes,
+								pollCount: event.progress.counters?.polls,
+								progressCount: event.progress.counters?.progressEvents,
+								outcome: event.progress.outcome,
+							})
+						: null;
 					const persistedEvent = {
 						phase,
 						event: name,
@@ -659,6 +675,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 						...(exitCode !== null ? { exitCode } : {}),
 						...(signal !== null ? { signal } : {}),
 						...(diagnosticRef !== null ? { diagnosticRef } : {}),
+						...(progress !== null ? { progress } : {}),
 						...(name === "route_health_deferred"
 							? { result: "route_health_deferred" }
 							: {}),

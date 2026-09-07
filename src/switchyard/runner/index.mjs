@@ -67,7 +67,11 @@ import {
 	execute as executeOpencode,
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
-import { verifyCompletionContinuationSync } from "../adapter/provider-lifecycle.mjs";
+import {
+	createProgressSnapshot,
+	DEFAULT_SILENCE_TIMEOUT_MS,
+	verifyCompletionContinuationSync,
+} from "../adapter/provider-lifecycle.mjs";
 import {
 	captureDiff as captureVibeDiff,
 	captureDiffAsync as captureVibeDiffAsync,
@@ -7003,6 +7007,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 	const execution = {
 		success: brokerExecution.success,
 		timedOut: brokerExecution.timedOut === true,
+		silenceTimedOut: brokerExecution.silenceTimedOut === true,
+		outcome: brokerExecution.outcome ?? null,
 		cleanupFailed: brokerExecution.cleanupFailed === true,
 		error: brokerExecution.reason ?? null,
 		errorKind: brokerExecution.errorKind ?? brokerExecution.outcome,
@@ -7021,6 +7027,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				: null,
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
+		progress: brokerExecution.progress ?? null,
 	};
 	context._activeProviderExecutionSucceeded = execution.success === true;
 	context._activeCompletionLifecycleReceipt =
@@ -7049,6 +7056,31 @@ async function executeTaskAsyncUnsafe(task, context) {
 		};
 	}
 	if (!execution.success) {
+		if (execution.silenceTimedOut) {
+			await record({
+				provider: routeResult.provider,
+				model: routeResult.model ?? "unknown",
+				taskId: task.id,
+				result: "silence_timeout",
+				errorKind: "silence_timeout",
+				reason: execution.error ?? "provider made no substantive progress",
+				progress: execution.progress,
+			});
+			return {
+				...descriptorReceiptFields(invocationDescriptor),
+				taskId: task.id,
+				success: false,
+				provider: routeResult.provider,
+				model: routeResult.model ?? null,
+				requiredCapability,
+				resolvedTargetId,
+				result: "silence_timeout",
+				error: execution.error ?? "provider made no substantive progress",
+				errorKind: "silence_timeout",
+				progress: execution.progress,
+				silenceTimedOut: true,
+			};
+		}
 		if (!execution.timedOut) {
 			context.onStatus?.({
 				phase: "execution",
@@ -8332,10 +8364,23 @@ export async function executeTaskWithOrchestrator(task, context) {
 		maxPolls: context.maxPolls,
 		now: context.now,
 		sleepFn: context.sleepFn,
-		onPoll: context.onPoll,
+		onPoll: (poll) => {
+			const progress = boundedProgressProjection(poll?.status?.progress);
+			if (progress) {
+				context.onStatus?.({
+					phase: "execution",
+					event: "execution_progress",
+					status: "orchestrator progress",
+					taskId: task.id,
+					progress,
+				});
+			}
+			context.onPoll?.(poll);
+		},
 	});
 
 	if (waited.state !== "done") {
+		const progress = boundedProgressProjection(waited.status?.progress);
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -8344,6 +8389,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			reason: waited.timedOut
 				? "orchestrator timed out"
 				: "orchestrator ended before done",
+			...(progress ? { progress } : {}),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
@@ -8360,6 +8406,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			// checkpoint record (timedOut: Boolean(result.timedOut)) is
 			// truthful for an orchestrator_timed_out outcome.
 			timedOut: waited.timedOut,
+			...(progress ? { progress } : {}),
 		};
 	}
 
@@ -8387,6 +8434,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			errorKind: null,
 		};
 	}
+	const progress = boundedProgressProjection(jobResult?.progress);
 	if (jobResult?.cleanupFailed === true) {
 		await record({
 			provider: routeResult.provider,
@@ -8396,6 +8444,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			errorKind: "provider_cleanup_failed",
 			reason: "provider cleanup is uncertain; recovery required",
 			cleanupStage: jobResult.cleanupStage ?? null,
+			...(progress ? { progress } : {}),
 		});
 		return {
 			...descriptorReceiptFields(invocationDescriptor),
@@ -8409,6 +8458,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			errorKind: "provider_cleanup_failed",
 			cleanupFailed: true,
 			cleanupStage: jobResult.cleanupStage ?? null,
+			...(progress ? { progress } : {}),
 		};
 	}
 	if (!jobResult?.success) {
@@ -8418,6 +8468,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			taskId: task.id,
 			result: "execution_failed",
 			reason: jobResult?.error ?? "orchestrator job failed",
+			...(progress ? { progress } : {}),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
@@ -8430,6 +8481,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			resolvedTargetId,
 			result: "execution_failed",
 			errorKind: jobResult?.errorKind ?? null,
+			...(progress ? { progress } : {}),
 		};
 	}
 	context._activeProviderExecutionSucceeded = true;
@@ -8525,6 +8577,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			model: routeResult.model ?? "unknown",
 			taskId: task.id,
 			result: "success_no_diff",
+			...(progress ? { progress } : {}),
 			reason: safeSuccessfulRouteReason(routeResult.reason),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
@@ -8537,6 +8590,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "success_no_diff",
+			...(progress ? { progress } : {}),
 		};
 	}
 
@@ -8602,6 +8656,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 		model: routeResult.model ?? "unknown",
 		taskId: task.id,
 		result: terminalResult,
+		...(progress ? { progress } : {}),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
@@ -8683,6 +8738,21 @@ function _safeError(error) {
 	if (error.message !== undefined) out.message = error.message;
 	if (error.code !== undefined) out.code = error.code;
 	return out;
+}
+
+function boundedProgressProjection(value) {
+	if (!value || typeof value !== "object") return null;
+	return createProgressSnapshot({
+		stage: value.stage,
+		elapsedMs: value.elapsedMs,
+		lastSubstantiveProgressAt: value.lastSubstantiveProgressAt,
+		lastSubstantiveProgressAgeMs: value.lastSubstantiveProgressAgeMs,
+		stdoutBytes: value.counters?.stdoutBytes,
+		stderrBytes: value.counters?.stderrBytes,
+		pollCount: value.counters?.polls,
+		progressCount: value.counters?.progressEvents,
+		outcome: value.outcome,
+	});
 }
 
 // Injected commit/reset seams (tests) can throw any JavaScript value — null,
@@ -9085,6 +9155,7 @@ export function createBrokerAdapterLauncher({
 	workingContainerName,
 	prompt,
 	timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
+	silenceTimeoutMs = DEFAULT_SILENCE_TIMEOUT_MS,
 	onTranscript = null,
 	cleanupContext = null,
 }) {
@@ -9099,6 +9170,7 @@ export function createBrokerAdapterLauncher({
 		signal,
 		onAdapterStatus,
 		onPoll,
+		onProgress,
 	}) {
 		if (
 			!launcherIdentity ||
@@ -9125,6 +9197,7 @@ export function createBrokerAdapterLauncher({
 			{
 				model: route.model,
 				timeoutMs,
+				silenceTimeoutMs,
 				executionBackend: bindAttemptExecutionBackend(
 					executionBackend,
 					requestCleanupContext,
@@ -9133,6 +9206,7 @@ export function createBrokerAdapterLauncher({
 				signal,
 				onStatus: onAdapterStatus,
 				onPoll,
+				onProgress,
 				invocationDescriptor,
 				descriptorIdentity: invocationDescriptor.descriptor_identity,
 				descriptorHarness: route.harness,
@@ -9149,6 +9223,8 @@ export function createBrokerAdapterLauncher({
 			reason: execution?.error ?? null,
 			actualConsumption: execution?.actualConsumption,
 			timedOut: execution?.timedOut === true,
+			silenceTimedOut: execution?.silenceTimedOut === true,
+			outcome: execution?.outcome ?? null,
 			cleanupFailed: execution?.cleanupFailed === true,
 			// Which kill step failed, bounded to the backend-owned vocabulary.
 			// Omitting it here left `execution.cleanupStage` permanently null on
@@ -9164,7 +9240,9 @@ export function createBrokerAdapterLauncher({
 					: null,
 			errorKind: BOUNDED_ERROR_KINDS.has(execution?.errorKind)
 				? execution.errorKind
-				: null,
+				: execution?.errorKind === "silence_timeout"
+					? "silence_timeout"
+					: null,
 			diagnosticCode: execution?.diagnosticCode ?? null,
 			exitCode: execution?.exitCode ?? null,
 			signal: execution?.signal ?? null,
@@ -9184,6 +9262,7 @@ export function createBrokerAdapterLauncher({
 				execution?.servedModel === undefined
 					? null
 					: Boolean(execution.servedModel),
+			progress: execution?.progress ?? null,
 		};
 	};
 }
@@ -9285,6 +9364,7 @@ function createDispatchBroker(context, dependencies = {}) {
 			onStatus,
 			onAdapterStatus,
 			onPoll,
+			onProgress,
 			onTaskHeartbeat,
 		}) => {
 			const adapter = selectAdapter(selectedRoute.harness, adapters);
@@ -9315,6 +9395,7 @@ function createDispatchBroker(context, dependencies = {}) {
 				launcherIdentity,
 				signal,
 				onAdapterStatus,
+				onProgress,
 				onPoll: (poll) => {
 					onStatus?.(poll);
 					onPoll?.(poll);

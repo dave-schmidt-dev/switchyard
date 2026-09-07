@@ -23,6 +23,79 @@ const DEFAULT_MAX_BUFFER = 128 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_DIAGNOSTIC_CHARS = 800;
+// A provider that has emitted no substantive signal for this bounded interval
+// is treated as stalled. The broker/runner may override it for a controlled
+// test or a provider-specific policy, but production dispatch never leaves it
+// unset.
+export const DEFAULT_SILENCE_TIMEOUT_MS = 5 * 60 * 1000;
+const PROGRESS_SCHEMA_VERSION = 1;
+const PROGRESS_STAGE_VALUES = new Set([
+	"queued",
+	"starting",
+	"configuring",
+	"working",
+	"running",
+	"diff_stage",
+	"diff_export",
+	"cleanup",
+	"completed",
+	"failed",
+	"cancelled",
+	"unknown",
+]);
+const PROGRESS_OUTCOME_VALUES = new Set([
+	"running",
+	"success",
+	"failure",
+	"cancelled",
+	"silence_timeout",
+	"execution_timed_out",
+]);
+
+/**
+ * Return the only progress envelope allowed to cross a lifecycle boundary.
+ * Provider output, prompts, errors and arbitrary callback fields are never
+ * copied into this shape.
+ */
+export function createProgressSnapshot({
+	stage = "unknown",
+	elapsedMs = 0,
+	lastSubstantiveProgressAt = null,
+	lastSubstantiveProgressAgeMs = 0,
+	stdoutBytes = 0,
+	stderrBytes = 0,
+	pollCount = 0,
+	progressCount = 0,
+	outcome = "running",
+} = {}) {
+	const safeStage = PROGRESS_STAGE_VALUES.has(stage) ? stage : "unknown";
+	const safeOutcome = PROGRESS_OUTCOME_VALUES.has(outcome)
+		? outcome
+		: "running";
+	const bounded = (value, max = Number.MAX_SAFE_INTEGER) =>
+		Number.isSafeInteger(value) && value >= 0 ? Math.min(value, max) : 0;
+	const safeTimestamp =
+		typeof lastSubstantiveProgressAt === "string" &&
+		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(
+			lastSubstantiveProgressAt,
+		)
+			? lastSubstantiveProgressAt
+			: null;
+	return Object.freeze({
+		schemaVersion: PROGRESS_SCHEMA_VERSION,
+		stage: safeStage,
+		elapsedMs: bounded(elapsedMs),
+		lastSubstantiveProgressAt: safeTimestamp,
+		lastSubstantiveProgressAgeMs: bounded(lastSubstantiveProgressAgeMs),
+		counters: Object.freeze({
+			stdoutBytes: bounded(stdoutBytes, DEFAULT_MAX_BUFFER),
+			stderrBytes: bounded(stderrBytes, DEFAULT_MAX_BUFFER),
+			polls: bounded(pollCount, 1_000_000),
+			progressEvents: bounded(progressCount, 1_000_000),
+		}),
+		outcome: safeOutcome,
+	});
+}
 
 // Keep the provider's original argv[0] attached to the exact transport args
 // array returned to the adapter. VM transports may expose only `prlctl` as the
@@ -168,7 +241,7 @@ function safeTimer(fn, delay, setTimeoutFn) {
  * @param {string} command
  * @param {string[]} args
  * @param {object} [options]
- * @returns {Promise<{success:boolean,output:string,stderr:string,code:number|null,signal:string|null,timedOut:boolean,cancelled:boolean,elapsedMs:number}>}
+ * @returns {Promise<{success:boolean,output:string,stderr:string,code:number|null,signal:string|null,timedOut:boolean,silenceTimedOut:boolean,cancelled:boolean,elapsedMs:number,progress:object}>}
  */
 export function runProviderProcess(command, args, options = {}) {
 	const {
@@ -176,6 +249,9 @@ export function runProviderProcess(command, args, options = {}) {
 		timeoutMs = 30 * 60 * 1000,
 		maxBuffer = DEFAULT_MAX_BUFFER,
 		pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+		silenceTimeoutMs = null,
+		progressStage = "running",
+		onProgress,
 		termGraceMs = DEFAULT_TERM_GRACE_MS,
 		spawnFn = nodeSpawn,
 		cleanup,
@@ -198,16 +274,23 @@ export function runProviderProcess(command, args, options = {}) {
 		let cleanupError = null;
 		let cleanupResult = null;
 		let timedOut = false;
+		let silenceTimedOut = false;
 		let cancelled = false;
+		let pollCount = 0;
+		let progressCount = 0;
+		let lastSubstantiveProgressAt = null;
 		let timeoutTimer = null;
+		let silenceTimer = null;
 		let escalationTimer = null;
 		let pollTimer = null;
 
 		const clearTimers = () => {
 			if (timeoutTimer !== null) clearTimeoutFn(timeoutTimer);
+			if (silenceTimer !== null) clearTimeoutFn(silenceTimer);
 			if (escalationTimer !== null) clearTimeoutFn(escalationTimer);
 			if (pollTimer !== null) clearIntervalFn(pollTimer);
 			timeoutTimer = null;
+			silenceTimer = null;
 			escalationTimer = null;
 			pollTimer = null;
 		};
@@ -224,16 +307,48 @@ export function runProviderProcess(command, args, options = {}) {
 				signal.removeEventListener("abort", abort);
 			}
 			const elapsedMs = Math.max(0, now() - startedAt);
+			const outcome = silenceTimedOut
+				? "silence_timeout"
+				: timedOut
+					? "execution_timed_out"
+					: cancelled
+						? "cancelled"
+						: code === 0 && !error && !cleanupError
+							? "success"
+							: "failure";
 			resolve({
 				success:
-					!timedOut && !cancelled && !error && !cleanupError && code === 0,
+					!timedOut &&
+					!silenceTimedOut &&
+					!cancelled &&
+					!error &&
+					!cleanupError &&
+					code === 0,
 				output: stdout,
 				stderr,
 				code,
 				signal: exitSignal,
 				timedOut,
+				silenceTimedOut,
 				cancelled,
 				elapsedMs,
+				progress: createProgressSnapshot({
+					stage: outcome === "success" ? "completed" : progressStage,
+					elapsedMs,
+					lastSubstantiveProgressAt:
+						lastSubstantiveProgressAt === null
+							? null
+							: new Date(lastSubstantiveProgressAt).toISOString(),
+					lastSubstantiveProgressAgeMs: Math.max(
+						0,
+						now() - (lastSubstantiveProgressAt ?? startedAt),
+					),
+					stdoutBytes: Buffer.byteLength(stdout),
+					stderrBytes: Buffer.byteLength(stderr),
+					pollCount,
+					progressCount,
+					outcome,
+				}),
 				error: cleanupError ?? error,
 				cleanupFailed: Boolean(cleanupError),
 				cleanupStage:
@@ -259,10 +374,53 @@ export function runProviderProcess(command, args, options = {}) {
 			await terminal(details);
 		};
 
+		const emitProgress = (substantive = false) => {
+			const timestamp = now();
+			if (substantive) {
+				lastSubstantiveProgressAt = timestamp;
+				progressCount += 1;
+				armSilenceTimer();
+			}
+			try {
+				onProgress?.(
+					createProgressSnapshot({
+						stage: progressStage,
+						elapsedMs: Math.max(0, timestamp - startedAt),
+						lastSubstantiveProgressAt:
+							lastSubstantiveProgressAt === null
+								? null
+								: new Date(lastSubstantiveProgressAt).toISOString(),
+						lastSubstantiveProgressAgeMs: Math.max(
+							0,
+							timestamp - (lastSubstantiveProgressAt ?? startedAt),
+						),
+						stdoutBytes: Buffer.byteLength(stdout),
+						stderrBytes: Buffer.byteLength(stderr),
+						pollCount,
+						progressCount,
+						outcome: "running",
+					}),
+				);
+			} catch {
+				// Progress is observational and cannot alter execution.
+			}
+		};
+
+		const armSilenceTimer = () => {
+			if (!(Number.isFinite(silenceTimeoutMs) && silenceTimeoutMs > 0)) return;
+			if (silenceTimer !== null) clearTimeoutFn(silenceTimer);
+			silenceTimer = safeTimer(
+				() => requestTermination("silence"),
+				silenceTimeoutMs,
+				setTimeoutFn,
+			);
+		};
+
 		const requestTermination = (reason) => {
 			if (terminationRequested || settled) return;
 			terminationRequested = true;
 			timedOut = reason === "timeout";
+			silenceTimedOut = reason === "silence";
 			cancelled = reason === "cancel";
 			try {
 				child?.kill?.("SIGTERM");
@@ -304,9 +462,11 @@ export function runProviderProcess(command, args, options = {}) {
 
 		child.stdout?.on?.("data", (chunk) => {
 			stdout = appendBounded(stdout, chunk, maxBuffer);
+			emitProgress(true);
 		});
 		child.stderr?.on?.("data", (chunk) => {
 			stderr = appendBounded(stderr, chunk, maxBuffer);
+			emitProgress(true);
 		});
 		child.once?.("error", (error) => {
 			if (terminationRequested) return;
@@ -337,6 +497,7 @@ export function runProviderProcess(command, args, options = {}) {
 			pollTimer = setIntervalFn(() => {
 				if (settled) return;
 				const elapsedMs = Math.max(0, now() - startedAt);
+				pollCount += 1;
 				try {
 					onPoll({
 						elapsedMs,
@@ -346,8 +507,10 @@ export function runProviderProcess(command, args, options = {}) {
 				} catch {
 					// Telemetry must never alter provider execution.
 				}
+				emitProgress(false);
 			}, pollIntervalMs);
 		}
+		armSilenceTimer();
 	});
 }
 
@@ -420,6 +583,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		typeof idleExitCode === "number" &&
 		result.code === idleExitCode &&
 		!result.timedOut &&
+		!result.silenceTimedOut &&
 		!result.cancelled &&
 		!result.error
 	) {
@@ -462,6 +626,23 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				provider,
 				command: classificationCommand,
 			}),
+		};
+	}
+	if (result.silenceTimedOut) {
+		return {
+			output: result.output,
+			success: false,
+			error:
+				"provider made no substantive progress before the silence deadline",
+			errorKind: "silence_timeout",
+			timedOut: false,
+			silenceTimedOut: true,
+			outcome: "silence_timeout",
+			diagnosticCode: "silence_timeout",
+			failurePhase: "provider_execution",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: false,
+			progress: result.progress,
 		};
 	}
 	if (result.cancelled) {

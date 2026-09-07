@@ -15,6 +15,7 @@ import {
 	captureProviderDiffAsync,
 	captureProviderDiffDetailed,
 	captureProviderDiffDetailedAsync,
+	createProgressSnapshot,
 	executeProviderInvocation,
 	getWorkspaceExecution,
 	runProviderProcess,
@@ -60,6 +61,78 @@ function fakeChild() {
 }
 
 describe("provider process lifecycle", () => {
+	it("uses a closed progress envelope and does not treat polling as substantive progress", async () => {
+		const snapshot = createProgressSnapshot({
+			stage: "not-a-stage",
+			elapsedMs: 4,
+			lastSubstantiveProgressAt: "not-a-timestamp",
+			lastSubstantiveProgressAgeMs: 3,
+			stdoutBytes: 4,
+			stderrBytes: 2,
+			pollCount: 2,
+			progressCount: 1,
+			outcome: "not-an-outcome",
+		});
+		deepStrictEqual(snapshot, {
+			schemaVersion: 1,
+			stage: "unknown",
+			elapsedMs: 4,
+			lastSubstantiveProgressAt: null,
+			lastSubstantiveProgressAgeMs: 3,
+			counters: {
+				stdoutBytes: 4,
+				stderrBytes: 2,
+				polls: 2,
+				progressEvents: 1,
+			},
+			outcome: "running",
+		});
+
+		const child = fakeChild();
+		const progress = [];
+		const result = await runProviderProcess("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 100,
+			silenceTimeoutMs: 10,
+			pollIntervalMs: 1,
+			termGraceMs: 1,
+			onPoll: () => {},
+			onProgress: (value) => progress.push(value),
+		});
+		strictEqual(result.silenceTimedOut, true);
+		strictEqual(result.progress.outcome, "silence_timeout");
+		ok(result.progress.counters.polls > 0);
+		ok(
+			progress.every(
+				(value) =>
+					value.schemaVersion === 1 &&
+					!Object.hasOwn(value, "output") &&
+					!Object.hasOwn(value, "error"),
+			),
+		);
+	});
+
+	it("resets silence only on substantive output and preserves the success outcome", async () => {
+		const child = fakeChild();
+		const progress = [];
+		const resultPromise = runProviderProcess("fake", [], {
+			spawnFn: () => {
+				setTimeout(() => child.stdout.emit("data", "progress"), 4);
+				setTimeout(() => child.emit("close", 0, null), 8);
+				return child;
+			},
+			timeoutMs: 100,
+			silenceTimeoutMs: 20,
+			pollIntervalMs: 1,
+			onProgress: (value) => progress.push(value),
+		});
+		const result = await resultPromise;
+		strictEqual(result.success, true);
+		strictEqual(result.silenceTimedOut, false);
+		strictEqual(result.progress.outcome, "success");
+		ok(progress.some((value) => value.counters.progressEvents > 0));
+	});
+
 	it("keeps completion continuation unavailable without an explicit lifecycle proof", async () => {
 		const context = {
 			taskId: "1.1",
@@ -947,6 +1020,26 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.diagnosticCode, "quota_exhausted");
 		strictEqual(result.diagnosticOrigin, "adapter");
 		strictEqual(result.diagnosticEvidenceAvailable, false);
+	});
+
+	it("does not treat an idle exit as success after a silence timeout", async () => {
+		const child = fakeChild();
+		child.kill = (signal) => {
+			child.signals.push(signal);
+			if (signal === "SIGKILL")
+				queueMicrotask(() => child.emit("close", 0, signal));
+		};
+		const result = await executeProviderInvocation("fake", [], {
+			provider: "vibe",
+			idleExitCode: 0,
+			silenceTimeoutMs: 1,
+			termGraceMs: 1,
+			spawnFn: () => child,
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.silenceTimedOut, true);
+		strictEqual(result.errorKind, "silence_timeout");
+		strictEqual(result.outcome, "silence_timeout");
 	});
 
 	it("classifies real provider/binary bindings from separate lifecycle streams", async () => {

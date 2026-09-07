@@ -31,6 +31,7 @@ import {
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
+import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
 import {
 	validateIdentifier,
 	validateInvocationArgs,
@@ -135,6 +136,7 @@ const APPROVED_EVENT_KEYS = new Set([
 	"requiredCapability",
 	"resolvedTargetId",
 	"outcome",
+	"progress",
 	"deadline",
 	"byteCount",
 	"container",
@@ -1937,7 +1939,22 @@ async function createEventInternal(
 	if (event && typeof event === "object") {
 		for (const key of Object.keys(event)) {
 			if (APPROVED_EVENT_KEYS.has(key)) {
-				entry[key] = event[key];
+				entry[key] =
+					key === "progress"
+						? createProgressSnapshot({
+								stage: event.progress?.stage,
+								elapsedMs: event.progress?.elapsedMs,
+								lastSubstantiveProgressAt:
+									event.progress?.lastSubstantiveProgressAt,
+								lastSubstantiveProgressAgeMs:
+									event.progress?.lastSubstantiveProgressAgeMs,
+								stdoutBytes: event.progress?.counters?.stdoutBytes,
+								stderrBytes: event.progress?.counters?.stderrBytes,
+								pollCount: event.progress?.counters?.polls,
+								progressCount: event.progress?.counters?.progressEvents,
+								outcome: event.progress?.outcome,
+							})
+						: event[key];
 			}
 		}
 	}

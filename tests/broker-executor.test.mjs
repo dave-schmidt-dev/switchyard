@@ -122,6 +122,79 @@ describe("broker async executor", () => {
 		);
 	});
 
+	it("relays only the closed sanitized progress envelope", async () => {
+		const value = fixture();
+		const events = [];
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			onStatus: (event) => events.push(event),
+			launch: async ({ onProgress }) => {
+				onProgress({
+					stage: "working",
+					elapsedMs: 12,
+					lastSubstantiveProgressAt: "2026-09-07T00:00:00.000Z",
+					lastSubstantiveProgressAgeMs: 2,
+					counters: { polls: 3, progressEvents: 1, stdoutBytes: 4 },
+					outcome: "running",
+					output: "SECRET_CANARY",
+				});
+				return {
+					success: true,
+					actualConsumption: 1,
+					progress: {
+						stage: "working",
+						elapsedMs: 12,
+						lastSubstantiveProgressAt: "2026-09-07T00:00:00.000Z",
+						lastSubstantiveProgressAgeMs: 2,
+						counters: { polls: 3, progressEvents: 1, stdoutBytes: 4 },
+						outcome: "success",
+						output: "SECRET_CANARY",
+					},
+				};
+			},
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.progress.schemaVersion, 1);
+		strictEqual(result.progress.outcome, "success");
+		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
+		const event = events.find((entry) => entry.progress);
+		strictEqual(event.progress.counters.progressEvents, 1);
+	});
+
+	it("keeps broker failures stable for a silence timeout", async () => {
+		const value = fixture();
+		const terminals = [];
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				silenceTimedOut: true,
+				errorKind: "silence_timeout",
+				progress: {
+					stage: "timed_out",
+					elapsedMs: 100,
+					lastSubstantiveProgressAgeMs: 100,
+					counters: { polls: 4, progressEvents: 0 },
+					outcome: "silence_timeout",
+				},
+			}),
+			terminal: async (terminal) => {
+				terminals.push(terminal);
+				return { changed: true };
+			},
+		});
+		strictEqual(result.outcome, "failure");
+		strictEqual(result.errorKind, "silence_timeout");
+		strictEqual(result.silenceTimedOut, true);
+		strictEqual(terminals[0].outcome, "failure");
+	});
+
 	it("reconciles failure and cancellation exactly once", async () => {
 		for (const scenario of ["failure", "cancel"]) {
 			const value = fixture();

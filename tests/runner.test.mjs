@@ -30,6 +30,7 @@ import {
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
+import { DEFAULT_SILENCE_TIMEOUT_MS } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import {
 	HOST_POWER_STATES,
 	normalizeHostPower,
@@ -459,6 +460,7 @@ describe("attempt-scoped execution backend", () => {
 
 	it("binds the same immutable context through the broker launcher", async () => {
 		let observed;
+		let observedExecutionOptions;
 		const backend = {
 			execArgv(_workspaceId, options) {
 				observed = options.cleanupContext;
@@ -478,6 +480,7 @@ describe("attempt-scoped execution backend", () => {
 		const launch = createBrokerAdapterLauncher({
 			adapter: {
 				executeAsync: async (_prompt, _workspace, options) => {
+					observedExecutionOptions = options;
 					options.executionBackend.execArgv("vm", {});
 					return { success: true, output: "ok" };
 				},
@@ -504,9 +507,15 @@ describe("attempt-scoped execution backend", () => {
 				descriptorIdentity: descriptor.descriptor_identity,
 				reservationId: "reservation-1",
 			},
+			onProgress: () => {},
 		});
 		ok(Object.isFrozen(observed));
 		strictEqual(observed.attemptId, "attempt-b");
+		strictEqual(
+			observedExecutionOptions.silenceTimeoutMs,
+			DEFAULT_SILENCE_TIMEOUT_MS,
+		);
+		strictEqual(typeof observedExecutionOptions.onProgress, "function");
 	});
 
 	it("keeps adapter evidence unpersisted until broker boundary", async () => {

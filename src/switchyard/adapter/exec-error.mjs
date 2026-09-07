@@ -108,6 +108,7 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"quota_exhausted",
 	"model_unavailable",
 	"execution_failed",
+	"silence_timeout",
 	"execution_timed_out",
 	"provider_cleanup_failed",
 	"diff_capture_failed",
@@ -864,6 +865,11 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reasonCode: "execution_failed",
 		reason: "Provider execution failed before a reviewed integration.",
 	}),
+	silence_timeout: Object.freeze({
+		reasonCode: "silence_timeout",
+		reason:
+			"Provider made no substantive progress before the silence deadline.",
+	}),
 	execution_timed_out: Object.freeze({
 		reasonCode: "execution_timed_out",
 		reason: "Provider execution exceeded its bounded deadline.",
@@ -995,6 +1001,7 @@ const SUCCESS_RESULTS = new Set(["success", "success_no_diff"]);
 
 const RESULT_TO_ERROR_KIND = Object.freeze({
 	execution_failed: "execution_failed",
+	silence_timeout: "silence_timeout",
 	execution_timed_out: "execution_timed_out",
 	execution_timed_out_cleanup_failed: "provider_cleanup_failed",
 	execution_timed_out_capture_failed: "diff_capture_failed",

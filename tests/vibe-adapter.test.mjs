@@ -305,6 +305,38 @@ describe("Vibe adapter", () => {
 		);
 	});
 
+	it("preserves a config-write silence timeout and its closed progress envelope", async () => {
+		const spawned = [];
+		const executionBackend = {
+			execArgv(_workspaceId, candidate) {
+				return { command: "fake", args: [...candidate.argv] };
+			},
+		};
+		const result = await executeAsync("change one file", WORKSPACE, {
+			...options(executionBackend),
+			silenceTimeoutMs: 1,
+			termGraceMs: 1,
+			spawnFn: (_command, args) => {
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.stdin = { end() {} };
+				child.kill = (signal) => {
+					spawned.push({ args, signal });
+					return true;
+				};
+				return child;
+			},
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.errorKind, "silence_timeout");
+		strictEqual(result.silenceTimedOut, true);
+		strictEqual(result.outcome, "silence_timeout");
+		strictEqual(result.progress.stage, "configuring");
+		strictEqual(result.progress.outcome, "silence_timeout");
+		strictEqual(spawned.length, 6);
+	});
+
 	it("treats an unreadable served-model probe as unverified rather than a mismatch", () => {
 		const statuses = [];
 		const executionBackend = {

@@ -669,6 +669,29 @@ describe("event ordering", () => {
 		strictEqual(parsed.model, "sonnet");
 	});
 
+	it("persists only the closed progress envelope", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		await createEvent(opts.runId, {
+			phase: "execution",
+			event: "execution_progress",
+			status: "working",
+			progress: {
+				stage: "working",
+				elapsedMs: 8,
+				lastSubstantiveProgressAt: "2026-09-07T00:00:00.000Z",
+				lastSubstantiveProgressAgeMs: 2,
+				counters: { stdoutBytes: 4, polls: 2, progressEvents: 1 },
+				outcome: "running",
+				output: "SECRET_CANARY",
+			},
+		});
+		const [event] = await readEvents(opts.runId);
+		strictEqual(event.progress.schemaVersion, 1);
+		strictEqual(event.progress.counters.stderrBytes, 0);
+		strictEqual(JSON.stringify(event).includes("SECRET_CANARY"), false);
+	});
+
 	it("persists only valid VM-slot wait elapsed time", async () => {
 		const opts = makeOptions();
 		await initializeRun(opts);

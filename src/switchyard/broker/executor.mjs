@@ -2,6 +2,7 @@ import {
 	CLEANUP_STAGES,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
+import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
@@ -89,6 +90,21 @@ function boundedTerminalEvidence(value) {
 	return Object.freeze({
 		changed: value?.changed === true,
 		state,
+	});
+}
+
+function boundedProgress(value) {
+	if (!value || typeof value !== "object") return null;
+	return createProgressSnapshot({
+		stage: value.stage,
+		elapsedMs: value.elapsedMs,
+		lastSubstantiveProgressAt: value.lastSubstantiveProgressAt,
+		lastSubstantiveProgressAgeMs: value.lastSubstantiveProgressAgeMs,
+		stdoutBytes: value.counters?.stdoutBytes,
+		stderrBytes: value.counters?.stderrBytes,
+		pollCount: value.counters?.polls,
+		progressCount: value.counters?.progressEvents,
+		outcome: value.outcome,
 	});
 }
 
@@ -231,6 +247,10 @@ export async function executeBrokerRoute(options) {
 						? Math.max(0, progress.elapsedMs)
 						: null,
 				}),
+			onProgress: (progress) =>
+				emit(options.onStatus, "execution_progress", route, {
+					progress: boundedProgress(progress),
+				}),
 			onAdapterStatus: options.onAdapterStatus,
 			onPoll: options.onPoll,
 			onTaskHeartbeat: options.onTaskHeartbeat,
@@ -292,6 +312,7 @@ export async function executeBrokerRoute(options) {
 			completionContinuationProof:
 				completionContinuationProofOf(launcherResult),
 			terminalEvidence,
+			progress: boundedProgress(launcherResult?.progress),
 		});
 	} catch (error) {
 		const cancelled = signal?.aborted || error?.name === "AbortError";
@@ -326,24 +347,32 @@ export async function executeBrokerRoute(options) {
 			provider: route.provider,
 			model: route.model,
 			success: false,
-			outcome,
 			reason: cancelled
 				? "cancelled"
 				: !terminalCompleted
 					? "terminal_reconciliation_failed"
-					: launcherResult?.timedOut === true
-						? launcherResult?.reason || "provider execution timed out"
-						: error?.message?.includes("drift") ||
-								error?.message?.includes("identity")
-							? "identity_drift"
-							: "launcher_failed",
+					: launcherResult?.silenceTimedOut === true
+						? "provider made no substantive progress before the silence deadline"
+						: launcherResult?.timedOut === true
+							? launcherResult?.reason || "provider execution timed out"
+							: error?.message?.includes("drift") ||
+									error?.message?.includes("identity")
+								? "identity_drift"
+								: "launcher_failed",
 			timedOut: launcherResult?.timedOut === true,
+			silenceTimedOut: launcherResult?.silenceTimedOut === true,
+			// Broker reconciliation owns this terminal vocabulary. Provider-specific
+			// classifications remain in errorKind/silenceTimedOut/progress.
+			outcome,
 			cleanupFailed: launcherResult?.cleanupFailed === true,
 			cleanupStage: cleanupStageOf(launcherResult),
 			failureKind: FAILURE_KINDS.has(launcherResult?.failureKind)
 				? launcherResult.failureKind
 				: null,
-			errorKind: failure?.errorKind ?? null,
+			errorKind:
+				launcherResult?.errorKind === "silence_timeout"
+					? "silence_timeout"
+					: (failure?.errorKind ?? null),
 			diagnosticCode: failure?.diagnosticCode ?? null,
 			exitCode: failure?.exitCode ?? null,
 			signal: failure?.signal ?? null,
@@ -362,6 +391,7 @@ export async function executeBrokerRoute(options) {
 			completionContinuationProof:
 				completionContinuationProofOf(launcherResult),
 			terminalEvidence,
+			progress: boundedProgress(launcherResult?.progress),
 		});
 	}
 }
