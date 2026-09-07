@@ -2,7 +2,7 @@
 // worker-bootstrap nonce handshake, project locks, and failure recording.
 // These spawn real Node subprocesses.
 
-import { ok, rejects, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -2169,7 +2169,7 @@ describe("typed pre-provider failures on the detached terminal path", () => {
 			},
 			{
 				name: "queue-preflight",
-				source: `import { QueuePreflightError } from ${JSON.stringify(runnerUrl)}; throw new QueuePreflightError("/private/canary raw provider output");`,
+				source: `import { QueuePreflightError } from ${JSON.stringify(runnerUrl)}; throw new QueuePreflightError("/private/canary raw provider output", { reason: "no_eligible", rejections: [{ capability: "standard", reason: "no_provider", excludedProviders: ["claude"], excludedReasons: { claude: "no_invocation_descriptor" } }] });`,
 				diagnosticCode: "environment_incomplete",
 				errorKind: "environment_incomplete",
 				failurePhase: "queue_preflight",
@@ -2237,6 +2237,19 @@ describe("typed pre-provider failures on the detached terminal path", () => {
 				ok(!durable.includes("private-canary"));
 				ok(!durable.includes("/private/canary"));
 				ok(!durable.includes("raw provider output"));
+			}
+			if (testCase.name === "queue-preflight") {
+				deepStrictEqual(run.preflightDetail, {
+					reason: "no_eligible",
+					rejections: [
+						{
+							capability: "standard",
+							reason: "no_provider",
+							excludedProviders: ["claude"],
+							excludedReasons: { claude: "no_invocation_descriptor" },
+						},
+					],
+				});
 			}
 			const disposition = projectDisposition({
 				run,

@@ -2372,6 +2372,87 @@ export function getRunnableTasks(tasks, checkpoint, options = {}) {
 	return runnable;
 }
 
+/**
+ * Select the next queue task using the same retry-first transition as the
+ * execution loops. This is pure: callers own the returned state.
+ */
+export function selectNextQueueTask(
+	tasks,
+	checkpoint,
+	{
+		selectedTaskIds = [],
+		resolvedExternalBlockers,
+		excludedTaskIds = [],
+		retryTaskId = null,
+	} = {},
+) {
+	const excluded = new Set(excludedTaskIds);
+	const task = retryTaskId
+		? (tasks.find((candidate) => candidate.id === retryTaskId) ?? null)
+		: (getRunnableTasks(tasks, checkpoint, {
+				selectedTaskIds,
+				resolvedExternalBlockers,
+				excludedTaskIds: excluded,
+			})[0] ?? null);
+	if (!task) {
+		return { task: null, retryTaskId: null, excludedTaskIds: [...excluded] };
+	}
+	if (retryTaskId)
+		return { task, retryTaskId: null, excludedTaskIds: [...excluded] };
+	excluded.add(task.id);
+	return { task, retryTaskId: null, excludedTaskIds: [...excluded] };
+}
+
+/**
+ * Plan the bounded set of tasks that could consume provider attempts before
+ * queue admission. This mirrors the execution transition without invoking
+ * hooks, routing, providers, or lifecycle code: retry state wins once, then
+ * the first runnable task wins, and a hypothetical success unblocks the next
+ * task in queue order.
+ * @param {Array} tasks parsed queue tasks
+ * @param {object} checkpoint current checkpoint
+ * @param {object} [options]
+ * @param {Iterable<string>} [options.selectedTaskIds]
+ * @param {number} [options.maxTasks]
+ * @returns {Array<object>} hypothetical attempt tasks, in execution order
+ */
+export function planPotentialAttemptTasks(tasks, checkpoint, options = {}) {
+	const maxTasks = options.maxTasks ?? Number.POSITIVE_INFINITY;
+	const selectedTaskIds = normalizeIds(
+		options.selectedTaskIds ?? options.taskIds ?? [],
+		"task selection",
+	);
+	const simulated = {
+		...(checkpoint ?? {}),
+		completedTaskIds: [...(checkpoint?.completedTaskIds ?? [])],
+		resolvedExternalBlockers: [
+			...(options.resolvedExternalBlockers ??
+				checkpoint?.resolvedExternalBlockers ??
+				[]),
+		],
+	};
+	const planned = [];
+	let retryTaskId = checkpoint?.retryState?.taskId ?? null;
+	let excludedTaskIds = [];
+	while (planned.length < maxTasks) {
+		const selection = selectNextQueueTask(tasks, simulated, {
+			selectedTaskIds,
+			resolvedExternalBlockers: simulated.resolvedExternalBlockers,
+			excludedTaskIds,
+			retryTaskId,
+		});
+		const task = selection.task;
+		if (!task) break;
+		retryTaskId = selection.retryTaskId;
+		excludedTaskIds = selection.excludedTaskIds;
+		planned.push(task);
+		if (!simulated.completedTaskIds.includes(task.id)) {
+			simulated.completedTaskIds.push(task.id);
+		}
+	}
+	return planned;
+}
+
 const QUEUE_DIAGNOSTIC_REASONS = Object.freeze({
 	selectionExplicit: "explicit_task_ids",
 	selectionDefault: "queue_default",
@@ -5971,19 +6052,18 @@ export async function runQueueAsync(options) {
 				effectiveExclude,
 				checkpoint.quarantinedTargetIds,
 			);
-			const runnable = resumedRetryTaskId
-				? []
-				: getRunnableTasks(tasks, checkpoint, {
-						selectedTaskIds: effectiveTaskIds,
-						resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
-						excludedTaskIds: attemptedTaskIds,
-					});
-			const task = resumedRetryTaskId
-				? tasks.find((candidate) => candidate.id === resumedRetryTaskId)
-				: runnable[0];
+			const selection = selectNextQueueTask(tasks, checkpoint, {
+				selectedTaskIds: effectiveTaskIds,
+				resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
+				excludedTaskIds: attemptedTaskIds,
+				retryTaskId: resumedRetryTaskId,
+			});
+			const task = selection.task;
 			if (!task) break;
-			if (resumedRetryTaskId) resumedRetryTaskId = null;
-			else attemptedTaskIds.add(task.id);
+			resumedRetryTaskId = selection.retryTaskId;
+			attemptedTaskIds.clear();
+			for (const taskId of selection.excludedTaskIds)
+				attemptedTaskIds.add(taskId);
 			dependencies.onTaskStart?.(task);
 			const retryState =
 				checkpoint.retryState?.taskId === task.id
@@ -7809,10 +7889,61 @@ function formatQueuePreflightFailure(result) {
 	return `macOS queue provider preflight failed: ${details.join("; ") || result.reason}`;
 }
 
+export function sanitizeQueuePreflightDetail(result) {
+	if (!result || typeof result !== "object" || Array.isArray(result))
+		return null;
+	const isPlainObject = (value) =>
+		value !== null && typeof value === "object" && !Array.isArray(value);
+	const boundedText = (value, limit = 160) =>
+		typeof value === "string"
+			? value.replace(/[\p{Cc}]/gu, " ").slice(0, limit)
+			: null;
+	return {
+		reason: boundedText(result?.reason) ?? "unknown",
+		rejections: (Array.isArray(result.rejections) ? result.rejections : [])
+			.filter(isPlainObject)
+			.slice(0, 8)
+			.map((rejection) => ({
+				capability: boundedText(rejection.capability, 80),
+				reason: boundedText(rejection.reason, 160) ?? "unknown",
+				...(rejection.selector
+					? { selector: boundedText(rejection.selector, 160) }
+					: {}),
+				...(Array.isArray(rejection.excludedProviders) &&
+				rejection.excludedProviders.length
+					? {
+							excludedProviders: rejection.excludedProviders
+								.slice(0, 16)
+								.map((provider) => boundedText(provider, 80))
+								.filter(Boolean),
+						}
+					: {}),
+				...(isPlainObject(rejection.excludedReasons)
+					? {
+							excludedReasons: Object.entries(rejection.excludedReasons)
+								.slice(0, 16)
+								.reduce((reasons, [provider, reason]) => {
+									const safeProvider = boundedText(provider, 80);
+									const safeReason = boundedText(reason, 160);
+									if (safeProvider && safeReason)
+										reasons[safeProvider] = safeReason;
+									return reasons;
+								}, {}),
+						}
+					: {}),
+			})),
+	};
+}
+
+function queuePreflightDetail(result) {
+	return sanitizeQueuePreflightDetail(result);
+}
+
 export class QueuePreflightError extends Error {
-	constructor(message) {
+	constructor(message, detail = null) {
 		super(message);
 		this.name = "QueuePreflightError";
+		this.preflightDetail = sanitizeQueuePreflightDetail(detail);
 	}
 }
 
@@ -7842,7 +7973,10 @@ function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
 				: {}),
 		});
 		if (!result.ok)
-			throw new QueuePreflightError(formatQueuePreflightFailure(result));
+			throw new QueuePreflightError(
+				formatQueuePreflightFailure(result),
+				queuePreflightDetail(result),
+			);
 		return result;
 	};
 }
@@ -8350,9 +8484,24 @@ function prepareQueueLaunch({
 		runId,
 		runOptions: identity.runOptions ?? runOptions,
 	});
+	let potentialAttemptTasks;
+	try {
+		potentialAttemptTasks = planPotentialAttemptTasks(tasks, checkpoint, {
+			selectedTaskIds: effectiveTaskIds,
+			maxTasks: effectiveMaxTasks,
+			resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
+		});
+	} catch (error) {
+		// Selection/dependency errors remain owned by the execution transition;
+		// admission must not move their established failure point or teardown
+		// semantics. No task can be safely claimed for provider eligibility.
+		if (!(error instanceof TaskSelectionError)) throw error;
+		potentialAttemptTasks = [];
+	}
 	queueBackend.preflight({
 		platform: selectedPlatform,
 		tasks,
+		potentialAttemptTasks,
 		checkpoint,
 		maxTasks: effectiveMaxTasks,
 		selectedTaskIds: effectiveTaskIds,
@@ -8828,16 +8977,17 @@ export function runQueue(options) {
 		let resumedRetryTaskId = checkpoint.retryState?.taskId ?? null;
 
 		while (processed < effectiveMaxTasks) {
-			const runnable = resumedRetryTaskId
-				? []
-				: getRunnableTasks(tasks, checkpoint, {
-						excludedTaskIds: attemptedTaskIds,
-						...selectionOptions,
-					});
-			const task = resumedRetryTaskId
-				? tasks.find((candidate) => candidate.id === resumedRetryTaskId)
-				: runnable[0];
+			const selection = selectNextQueueTask(tasks, checkpoint, {
+				...selectionOptions,
+				excludedTaskIds: attemptedTaskIds,
+				retryTaskId: resumedRetryTaskId,
+			});
+			const task = selection.task;
 			if (!task) break;
+			resumedRetryTaskId = selection.retryTaskId;
+			attemptedTaskIds.clear();
+			for (const taskId of selection.excludedTaskIds)
+				attemptedTaskIds.add(taskId);
 			const retryState =
 				checkpoint.retryState?.taskId === task.id
 					? checkpoint.retryState
@@ -8845,11 +8995,6 @@ export function runQueue(options) {
 			const priorExtraAllocation = ensureProviderAttemptAllocations(
 				checkpoint,
 			).find((entry) => entry?.taskId === task.id);
-			if (resumedRetryTaskId) {
-				resumedRetryTaskId = null;
-			} else {
-				attemptedTaskIds.add(task.id);
-			}
 			context._activeInvocationDescriptor = null;
 
 			if (onTaskStart) onTaskStart(task);

@@ -784,6 +784,20 @@ describe("CLI exit codes via process spawn", () => {
 });
 
 describe("run subcommand equivalence", () => {
+	it("keeps bounded selection options available to preflight", () => {
+		const parsed = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--task-id",
+			"1.1",
+			"--max-tasks",
+			"1",
+		]);
+		deepStrictEqual(parsed.taskIds, ["1.1"]);
+		strictEqual(parsed.maxTasks, 1);
+	});
+
 	it("run subcommand parseDispatchArgs matches positional parseDispatchArgs", () => {
 		const args = [tasksFile, "--project", projectDir, "--max-tasks", "5"];
 		const positional = parseDispatchArgs(args);
@@ -1433,7 +1447,7 @@ describe("synchronous run JSON envelope", () => {
 
 describe("status integration", () => {
 	it("status with a real run produces valid status envelope", async () => {
-		const { initializeRun } = await import(
+		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
 
@@ -1445,6 +1459,18 @@ describe("status integration", () => {
 			initialHostFingerprint: "test-host",
 			launchArgs: [],
 		});
+		const current = await readRun("test-status-run");
+		await updateRun(
+			"test-status-run",
+			{
+				preflightDetail: {
+					reason: "no_eligible",
+					rejections: [{ capability: "standard", reason: "safe" }],
+					canary: "must-not-surface",
+				},
+			},
+			current.revision,
+		);
 
 		const result = runDispatch(
 			["status", "test-status-run"],
@@ -1459,6 +1485,10 @@ describe("status integration", () => {
 		strictEqual(envelope.activeTaskId, null);
 		strictEqual(envelope.completedCount, 0);
 		strictEqual(envelope.failedCount, 0);
+		deepStrictEqual(envelope.preflightDetail, {
+			reason: "no_eligible",
+			rejections: [{ capability: "standard", reason: "safe" }],
+		});
 	});
 
 	it("status --json produces same envelope", async () => {
@@ -3726,6 +3756,17 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 			{
 				error: new QueuePreflightError(
 					"preflight failed at /private/canary with raw provider output",
+					{
+						reason: "no_eligible",
+						rejections: [
+							{
+								capability: "standard",
+								reason: "no_provider",
+								excludedProviders: ["claude"],
+								excludedReasons: { claude: "no_invocation_descriptor" },
+							},
+						],
+					},
 				),
 				diagnosticCode: "environment_incomplete",
 				errorKind: "environment_incomplete",
@@ -3754,6 +3795,9 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 			strictEqual(run.lastFailure.errorKind, testCase.errorKind);
 			strictEqual(run.lastFailure.failurePhase, testCase.failurePhase);
 			strictEqual(run.lastFailure.reasonCode, testCase.errorKind);
+			if (testCase.error instanceof QueuePreflightError) {
+				deepStrictEqual(run.preflightDetail, testCase.error.preflightDetail);
+			}
 			const durable = JSON.stringify(run.lastFailure);
 			ok(!durable.includes("9.9"));
 			ok(!durable.includes("1.1"));

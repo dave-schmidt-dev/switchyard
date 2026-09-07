@@ -393,6 +393,10 @@ function healthExclusion(name, _provider, options) {
  * @param {object} options
  * @param {string} [options.platform="macos"]
  * @param {Array<object>} [options.tasks]
+ * @param {Array<object>} [options.potentialAttemptTasks] Bounded attempt set
+ *   from the runner's potential-attempt planner. When provided (including an
+ *   empty array), only those tasks contribute capability tiers. Unrelated
+ *   non-terminal work outside the attempt budget is not a preflight gate.
  * @param {string[]} [options.only]
  * @param {string[]} [options.exclude]
  * @param {string[]} [options.availableProviders]
@@ -407,6 +411,7 @@ export function preflightMacosQueue(options = {}) {
 	const {
 		platform = "macos",
 		tasks = [],
+		potentialAttemptTasks,
 		only = [],
 		exclude = [],
 		availableProviders,
@@ -473,7 +478,9 @@ export function preflightMacosQueue(options = {}) {
 	}
 
 	const taskTiers = [];
-	for (const task of Array.isArray(tasks) ? tasks : []) {
+	const tierTasks =
+		potentialAttemptTasks === undefined ? tasks : potentialAttemptTasks;
+	for (const task of Array.isArray(tierTasks) ? tierTasks : []) {
 		const executor = String(task?.executor ?? "switchyard")
 			.trim()
 			.toLowerCase();

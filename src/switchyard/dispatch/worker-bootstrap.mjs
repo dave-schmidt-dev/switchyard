@@ -253,6 +253,9 @@ async function writeFatalEvent(
 					completedTaskIds: null,
 					failedCount: null,
 				},
+				extraPatch: error?.preflightDetail
+					? { preflightDetail: error.preflightDetail }
+					: {},
 				cleanup: async () => {
 					await runStore.reconcileProjectLockClaims();
 					await runStore.releaseProjectLockIfOwnedBy(
@@ -893,6 +896,12 @@ export async function runWorkerBootstrap(argv = process.argv) {
 				);
 			}
 			process.exit(1);
+		}
+		if (error?.preflightDetail) {
+			// QueuePreflightError owns this bounded, host-derived detail. Keep it in
+			// boot-stderr so detached launch has the same actionable cause as run;
+			// never echo arbitrary provider output here.
+			console.error(error.message);
 		}
 		await writeFatalEvent(error, "worker_boot_exception");
 		process.exit(1);

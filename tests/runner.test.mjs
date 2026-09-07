@@ -70,7 +70,9 @@ import {
 	migrateLegacyCheckpoint,
 	normalizeRunOptions,
 	parseTaskQueue,
+	planPotentialAttemptTasks,
 	QueueCleanupError,
+	QueuePreflightError,
 	releaseCheckpointOwnership,
 	resolveOrchestrator,
 	runQueueAsync as runQueueAsyncImpl,
@@ -3096,6 +3098,128 @@ ${body}
 });
 
 describe("runner task selection and queue identity", () => {
+	it("plans only the bounded potential attempts and dynamically unblocks in queue order", () => {
+		const tasks = [
+			{
+				id: "1.1",
+				status: "pending",
+				executor: "native",
+				requiredCapability: "high",
+			},
+			{
+				id: "1.2",
+				status: "pending",
+				executor: "switchyard",
+				blockedBy: ["1.1"],
+				requiredCapability: "high",
+			},
+			{
+				id: "1.3",
+				status: "pending",
+				executor: "switchyard",
+				requiredCapability: "standard",
+			},
+			{
+				id: "1.4",
+				status: "pending",
+				executor: "human",
+				requiredCapability: "high",
+			},
+		];
+		const planned = planPotentialAttemptTasks(
+			tasks,
+			{ completedTaskIds: [] },
+			{ maxTasks: 1 },
+		);
+		deepStrictEqual(
+			planned.map((task) => task.id),
+			["1.3"],
+		);
+		const unblocked = planPotentialAttemptTasks(
+			tasks,
+			{ completedTaskIds: ["1.1"] },
+			{ maxTasks: 2 },
+		);
+		deepStrictEqual(
+			unblocked.map((task) => task.id),
+			["1.2", "1.3"],
+		);
+		const retryFirst = planPotentialAttemptTasks(
+			tasks,
+			{ completedTaskIds: [], retryState: { taskId: "1.3" } },
+			{ selectedTaskIds: ["1.3"], maxTasks: 1 },
+		);
+		deepStrictEqual(
+			retryFirst.map((task) => task.id),
+			["1.3"],
+		);
+		const selectedHigh = planPotentialAttemptTasks(
+			tasks,
+			{ completedTaskIds: ["1.1"] },
+			{ selectedTaskIds: ["1.2"], maxTasks: 2 },
+		);
+		deepStrictEqual(
+			selectedHigh.map((task) => task.id),
+			["1.2"],
+		);
+		const blocked = planPotentialAttemptTasks(
+			[
+				{ id: "native", status: "pending", executor: "native" },
+				{ id: "human", status: "pending", executor: "human" },
+				{ id: "external", status: "pending", externalBlockers: ["approval"] },
+			],
+			{ completedTaskIds: [] },
+			{ maxTasks: 3 },
+		);
+		deepStrictEqual(blocked, []);
+		const sanitized = new QueuePreflightError("synthetic", {
+			reason: "no_eligible",
+			rejections: [
+				{
+					capability: "standard",
+					reason: "safe",
+					excludedProviders: ["claude", "\u0000canary"],
+					excludedReasons: { claude: "no_descriptor", leak: { raw: true } },
+				},
+			],
+			canary: "must-drop",
+		});
+		deepStrictEqual(sanitized.preflightDetail, {
+			reason: "no_eligible",
+			rejections: [
+				{
+					capability: "standard",
+					reason: "safe",
+					excludedProviders: ["claude", " canary"],
+					excludedReasons: { claude: "no_descriptor" },
+				},
+			],
+		});
+		const malformed = new QueuePreflightError("synthetic", {
+			reason: "no_eligible",
+			rejections: "not-an-array",
+		});
+		deepStrictEqual(malformed.preflightDetail, {
+			reason: "no_eligible",
+			rejections: [],
+		});
+		const nestedMalformed = new QueuePreflightError("synthetic", {
+			reason: "no_eligible",
+			rejections: [
+				null,
+				"bad",
+				{
+					capability: "standard",
+					excludedProviders: "bad",
+					excludedReasons: [],
+				},
+			],
+		});
+		deepStrictEqual(nestedMalformed.preflightDetail, {
+			reason: "no_eligible",
+			rejections: [{ capability: "standard", reason: "unknown" }],
+		});
+	});
 	it("rejects explicit selection with a stable reason for each unsafe target", () => {
 		const checkpoint = { completedTaskIds: [] };
 		const tasks = [
@@ -7760,6 +7884,49 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			ok(events.indexOf("readiness") < events.indexOf("acquire"));
 			ok(events.indexOf("acquire") < events.indexOf("create"));
 			ok(events.indexOf("destroy") < events.indexOf("release"));
+		}
+	});
+
+	it("stops at a synthetic preflight rejection before slot, VM, container, provider, or adapter calls", async () => {
+		for (const entrypoint of ["sync", "async", "orchestrator"]) {
+			const events = [];
+			const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: Must not launch
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** fixture
+`);
+			const backend = macosBackend(events);
+			backend.preflight = () => {
+				events.push("preflight");
+				throw new QueuePreflightError("synthetic preflight", {
+					reason: "no_eligible",
+					rejections: [{ capability: "standard", reason: "no_provider" }],
+				});
+			};
+			const options = {
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				checkpointPath: `${tasksPath}.${entrypoint}.checkpoint.json`,
+				dependencies: {
+					backendFactory: () => backend,
+					orchestrator: {
+						launch: async () => {
+							events.push("provider");
+							return "job";
+						},
+					},
+				},
+			};
+			if (entrypoint === "sync") throws(() => runQueueImpl(options));
+			if (entrypoint === "async")
+				await rejects(() => runQueueAsyncImpl(options));
+			if (entrypoint === "orchestrator")
+				await rejects(() => runQueueWithOrchestratorImpl(options));
+			deepStrictEqual(events, ["preflight"]);
 		}
 	});
 

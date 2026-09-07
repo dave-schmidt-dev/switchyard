@@ -94,6 +94,7 @@ import {
 	loadTaskQueue,
 	normalizeRunOptions,
 	runQueueAsync,
+	sanitizeQueuePreflightDetail,
 } from "../runner/index.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
 import { run as runOrphanLockRemediation } from "./remediate-orphaned-locks.mjs";
@@ -1092,6 +1093,9 @@ async function runDispatch(opts, dependencies = {}) {
 								deferredTaskIds: null,
 								failedCount: null,
 							},
+					extraPatch: queueError?.preflightDetail
+						? { preflightDetail: queueError.preflightDetail }
+						: {},
 					cleanup: async () => {
 						if (projectLockOwned) {
 							await (
@@ -1229,7 +1233,12 @@ function launchCommands(runId, stateRoot) {
 }
 
 async function buildLaunchFailureEnvelope(context) {
-	const { runId = null, stateRoot = null, preInitialization = null } = context;
+	const {
+		runId = null,
+		stateRoot = null,
+		preInitialization = null,
+		preflightDetail = null,
+	} = context;
 	let run = null;
 	if (runId !== null) {
 		try {
@@ -1257,6 +1266,7 @@ async function buildLaunchFailureEnvelope(context) {
 		runId: durable ? runId : null,
 		state: run?.state ?? "failed",
 		queueIdentity: run?.queueIdentity ?? null,
+		...(preflightDetail ? { preflightDetail } : {}),
 		stateRoot: durable ? stateRoot : null,
 		...(durable
 			? launchCommands(runId, stateRoot)
@@ -1303,6 +1313,7 @@ async function handleRun(argv, dependencies = {}, usage = USAGE_RUN) {
 							classifyPreProviderFailure(error)?.diagnosticCode ??
 							"environment_incomplete",
 					},
+					preflightDetail: error.preflightDetail ?? null,
 				}),
 			),
 		);
@@ -1561,6 +1572,7 @@ async function handleLaunch(argv, dependencies = {}) {
 					runId,
 					stateRoot,
 					preInitialization,
+					preflightDetail: error.preflightDetail ?? null,
 				}),
 			),
 		);
@@ -1887,6 +1899,9 @@ async function buildStatusEnvelope(runId, run) {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
 		queueIdentity: run.queueIdentity ?? null,
+		...(sanitizeQueuePreflightDetail(run.preflightDetail)
+			? { preflightDetail: sanitizeQueuePreflightDetail(run.preflightDetail) }
+			: {}),
 		state: run.state,
 		cleanupState: run.cleanupState,
 		// Liveness derived from a signal-0 probe of the recorded worker pid
@@ -2026,6 +2041,9 @@ async function buildResultEnvelope(runId, run) {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
 		queueIdentity: run.queueIdentity ?? null,
+		...(sanitizeQueuePreflightDetail(run.preflightDetail)
+			? { preflightDetail: sanitizeQueuePreflightDetail(run.preflightDetail) }
+			: {}),
 		state: run.state,
 		cleanupState: run.cleanupState,
 		workerLive: run.state === "running" ? liveness === "live" : null,
