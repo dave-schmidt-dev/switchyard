@@ -222,6 +222,7 @@ export async function executeCursorAsync(
 		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "cursor",
+			input: "",
 			timeoutMs,
 			signal,
 			onPoll,

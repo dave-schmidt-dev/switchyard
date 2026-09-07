@@ -1570,11 +1570,12 @@ describe("synchronous run JSON envelope", () => {
 
 	it("emits one closed failure envelope without raw exception text", async () => {
 		const canary = "SECRET_CANARY_sync_json_raw_error";
+		const taskIdCanary = "SECRET_TASK_ID_sync_json_raw_error";
 		const { envelope, errors, output } = await captureRunJson(
 			[tasksFile, "--project", projectDir, "--json"],
 			noVmDependencies({
 				runQueue: async () => {
-					throw new TaskSelectionError("9.9", canary);
+					throw new TaskSelectionError(taskIdCanary, canary);
 				},
 			}),
 		);
@@ -1582,7 +1583,7 @@ describe("synchronous run JSON envelope", () => {
 		strictEqual(output.length, 1);
 		deepStrictEqual(errors, []);
 		ok(!serialized.includes(canary));
-		ok(!serialized.includes("9.9"));
+		ok(!serialized.includes(taskIdCanary));
 		ok(typeof envelope.runId === "string");
 		strictEqual(envelope.state, "failed");
 		strictEqual(envelope.disposition.action, "repair_contract");
@@ -2341,6 +2342,53 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 			process.exitCode = previousExitCode;
 		}
 		strictEqual(destroys, 1);
+	});
+
+	it("targeted recover preserves a specific reclaim failure", async () => {
+		const target = {
+			uuid: "target-uuid",
+			name: "switchyard-work-target-42",
+			runId: "target",
+			creatorPid: 42,
+			status: "stopped",
+		};
+		let lockReconciliations = 0;
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", "target"], {
+				listManaged: () => [target],
+				readRun: async () => ({
+					runId: "target",
+					projectPath: projectDir,
+					state: "failed",
+					cleanupState: "complete",
+				}),
+				classifyRunLiveness: () => "terminal_clean",
+				reclaim: () => ({
+					reclaimed: [],
+					skippedSnapshots: [],
+					errors: [{ name: target.name, reason: "backend deletion failed" }],
+				}),
+				releaseProjectLockIfOwnedBy: async () => {
+					lockReconciliations += 1;
+					return false;
+				},
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+			strictEqual(process.exitCode, 1);
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+
+		strictEqual(lockReconciliations, 1);
+		deepStrictEqual(JSON.parse(output[0]).errors, [
+			"switchyard-work-target-42: backend deletion failed",
+		]);
 	});
 
 	it("untargeted recover supplies per-resource liveness eligibility", async () => {
@@ -3964,6 +4012,8 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 	}
 
 	it("preserves exported pre-provider triples through synchronous finalization", async () => {
+		const taskIdCanary = "SECRET_TASK_ID_typed_failure";
+		const blockerCanary = "SECRET_BLOCKER_typed_failure";
 		const cases = [
 			{
 				error: new CheckpointIdentityError(
@@ -3990,7 +4040,7 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 				checkpointDimensions: ["excludeProviders"],
 			},
 			{
-				error: new TaskSelectionError("9.9", "dependency-blocked:1.1"),
+				error: new TaskSelectionError(taskIdCanary, blockerCanary),
 				diagnosticCode: "task_selection_failed",
 				errorKind: "task_selection_failed",
 				failurePhase: "task_selection",
@@ -4063,8 +4113,8 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 				deepStrictEqual(run.preflightDetail, testCase.error.preflightDetail);
 			}
 			const durable = JSON.stringify(run.lastFailure);
-			ok(!durable.includes("9.9"));
-			ok(!durable.includes("1.1"));
+			ok(!durable.includes(taskIdCanary));
+			ok(!durable.includes(blockerCanary));
 			ok(!durable.includes("/private/canary"));
 			ok(!durable.includes("raw provider output"));
 			const disposition = projectDisposition({

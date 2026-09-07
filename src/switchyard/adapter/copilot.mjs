@@ -172,6 +172,7 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 		return await executeProviderInvocation(command, args, {
 			...options,
 			provider: "copilot",
+			input: "",
 			timeoutMs,
 			signal,
 			onPoll,

@@ -1,5 +1,6 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { rmSync, writeFileSync } from "node:fs";
 
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { after, before, describe, it } from "node:test";
 import {
 	captureDiff,
 	executeCursor,
+	executeCursorAsync,
 } from "../src/switchyard/adapter/cursor.mjs";
 import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
@@ -80,6 +82,18 @@ esac
 echo updated >> test.txt
 echo cursor-agent
 `;
+
+function lifecycleChild(stdinEndArgs) {
+	const child = new EventEmitter();
+	child.stdout = new EventEmitter();
+	child.stderr = new EventEmitter();
+	child.stdin = {
+		end(...args) {
+			stdinEndArgs.push(args);
+		},
+	};
+	return child;
+}
 
 describe("cursor adapter container execution", () => {
 	before(() => {
@@ -159,6 +173,31 @@ describe("cursor adapter container execution", () => {
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
+	});
+
+	it("closes lifecycle stdin with an explicit empty input", async () => {
+		const stdinEndArgs = [];
+		const child = lifecycleChild(stdinEndArgs);
+		const executionBackend = {
+			execArgv(_workspaceId, { argv }) {
+				return { command: argv[0], args: argv };
+			},
+		};
+		const result = await executeCursorAsync(CURSOR_PROMPT, "cursor-worker", {
+			model: CURSOR_MODEL,
+			resolvedTargetId: CURSOR_DESCRIPTOR.target_id,
+			descriptorHarness: "cursor",
+			invocationDescriptor: CURSOR_DESCRIPTOR,
+			descriptorIdentity: CURSOR_DESCRIPTOR.descriptor_identity,
+			executionBackend,
+			spawnFn: () => {
+				queueMicrotask(() => child.emit("close", 0, null));
+				return child;
+			},
+		});
+		strictEqual(result.success, true);
+		strictEqual(stdinEndArgs.length, 1);
+		strictEqual(stdinEndArgs[0][0], "");
 	});
 });
 

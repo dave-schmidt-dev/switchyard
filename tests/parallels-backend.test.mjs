@@ -1811,6 +1811,26 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
+	it("keeps workspace verification parity for string and Buffer output", () => {
+		for (const readyOutput of [WORKSPACE_READY, Buffer.from(WORKSPACE_READY)]) {
+			let chmodCalls = 0;
+			const backend = workspaceBackend(
+				(args) => {
+					if (args.includes("/bin/chmod")) {
+						chmodCalls += 1;
+						throw lostExitCode();
+					}
+					if (args.includes("/usr/bin/stat")) return readyOutput;
+					return "";
+				},
+				{ prlctlRetryAttempts: 1 },
+			);
+
+			backend._prepareWorkspace(WORK_UUID, "switchyard");
+			strictEqual(chmodCalls, 1);
+		}
+	});
+
 	it("repairs the workspace when the first layout pass did not apply", () => {
 		let chmodCalls = 0;
 		const backend = workspaceBackend((args) => {

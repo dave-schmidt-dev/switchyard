@@ -1,5 +1,6 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { rmSync, writeFileSync } from "node:fs";
 
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { after, before, describe, it } from "node:test";
 import {
 	captureDiff,
 	execute as executeCopilot,
+	executeAsync as executeCopilotAsync,
 } from "../src/switchyard/adapter/copilot.mjs";
 import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
@@ -66,6 +68,18 @@ fi
 echo updated >> test.txt
 echo copilot
 `;
+
+function lifecycleChild(stdinEndArgs) {
+	const child = new EventEmitter();
+	child.stdout = new EventEmitter();
+	child.stderr = new EventEmitter();
+	child.stdin = {
+		end(...args) {
+			stdinEndArgs.push(args);
+		},
+	};
+	return child;
+}
 
 describe("copilot adapter container execution", () => {
 	before(() => {
@@ -134,6 +148,35 @@ describe("copilot adapter container execution", () => {
 		});
 		ok(typeof diff === "string" && diff.includes("updated"));
 		ok(diff.includes("diff --git"));
+	});
+
+	it("closes lifecycle stdin with an explicit empty input", async () => {
+		const stdinEndArgs = [];
+		const child = lifecycleChild(stdinEndArgs);
+		const executionBackend = {
+			execArgv(_workspaceId, { argv }) {
+				return { command: argv[0], args: argv };
+			},
+		};
+		const result = await executeCopilotAsync(
+			"apply a small change",
+			"copilot-worker",
+			{
+				model: "fake-model",
+				resolvedTargetId: COPILOT_DESCRIPTOR.target_id,
+				descriptorHarness: "copilot",
+				invocationDescriptor: COPILOT_DESCRIPTOR,
+				descriptorIdentity: COPILOT_DESCRIPTOR.descriptor_identity,
+				executionBackend,
+				spawnFn: () => {
+					queueMicrotask(() => child.emit("close", 0, null));
+					return child;
+				},
+			},
+		);
+		strictEqual(result.success, true);
+		strictEqual(stdinEndArgs.length, 1);
+		strictEqual(stdinEndArgs[0][0], "");
 	});
 });
 

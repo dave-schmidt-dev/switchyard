@@ -2723,8 +2723,12 @@ async function handleRecover(argv, dependencies = {}) {
 				target &&
 				(liveness === "terminal_clean" || liveness === "dead")
 			) {
+				const errorsBeforeReclaim = errors.length;
 				try {
-					if (!(await reclaimTarget())) {
+					if (
+						!(await reclaimTarget()) &&
+						errors.length === errorsBeforeReclaim
+					) {
 						errors.push("managed_recovery_evidence_changed");
 					}
 				} catch {

@@ -3301,7 +3301,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					"%Su:%Lp",
 					...paths,
 				]);
-				const text = String(raw ?? "").trim();
+				const text = outputText(raw).trim();
 				if (text) observed = text;
 			} catch (error) {
 				probeFailure = error;

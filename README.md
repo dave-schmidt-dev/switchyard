@@ -351,6 +351,14 @@ one of the closed codes `vm_host_inventory_permission_denied`,
 (`errorKind: environment_incomplete`, phase `queue_preflight`), so a broken
 host is never reported as ordinary two-slot capacity contention.
 
+When the diagnostic is `vm_host_service_degraded`, stop the queue and have a
+human at a TTY run one bounded service cycle:
+`sudo launchctl kickstart -k system/com.parallels.desktop.launchdaemon`.
+After it returns, retry the bounded host-readiness probe once; if the same
+diagnostic persists, leave the failure recorded and treat the host as
+degraded. Switchyard does not invoke `sudo`, `launchctl`, or any other
+privileged repair automation.
+
 The backend creates a full-copy clone by default, boots by UUID, and polls
 `prlctl exec <uuid> launchctl print gui/<UID>` until the Aqua domain exists or a
 bounded timeout names the missing domain. A linked clone is considered only when
@@ -653,7 +661,7 @@ macOS queue preflight uses the same `evaluateCandidateEligibility` predicate as 
 
 Dispatch attempts record provider, model, resolved target, required capability, roster provenance, result, and safe failure metadata consistently across task results, checkpoints, events, both ledgers, and detached `status`/`result` envelopes. Failures retain closed-enum `errorKind`, `diagnosticCode`, numeric exit code, allowlisted signal, failure phase, static reason codes, and opaque artifact references; raw provider output, prompts, file contents, host paths, patches, and gate text are not persisted. Integration failures remain terminal and do not trigger provider fallback. Generic provider, transient, timeout, launch, and other prose cannot authorize a peer-provider retry; that path is closed until an explicit reviewed error-kind allowlist is populated. Quota exhaustion is classified only from provider-scoped, sanitized evidence and is persisted as the static `quota_exhausted` kind, and an unresolvable provider model on the same terms as the static `model_unavailable` kind; the owned-VM retry path quarantines one exact target, resets before rerouting, and fails closed on ambiguous identity, reset failure, caller-owned VMs, and untrusted orchestrator results. No live provider call is used to manufacture exhaustion, and each provider's credential status remains a separate operational fact.
 
-An artifact reference is evidence of a captured non-empty diff, not proof that a provider completed successfully. A timeout may retain a partial diff for review; an integration rejection with no eligible diff has no artifact. The shared `headless-worktree` fallback also rejects malformed contracts before allocating a worktree or writing a receipt, so it currently has neither artifact nor durable fallback record. Treat a missing artifact as unavailable work evidence, never as success; the content-free failure-receipt follow-up is tracked in `TASKS.md`.
+An artifact reference is evidence of a captured non-empty diff, not proof that a provider completed successfully. A timeout may retain a partial diff for review; an integration rejection with no eligible diff has no artifact. The shared `headless-worktree` fallback rejects malformed contracts before allocating a worktree or provider, but now writes a content-free durable failure receipt with the closed failure kind and task-id provenance (or `unknown` when the contract cannot establish one). That receipt is evidence that the fallback failed, not an artifact, provider success, or proof that any requested work was performed. Treat a missing artifact as unavailable work evidence, never as success.
 
 Automatic descriptor eligibility has a separate qualification contract. `probe_qualified` proves only read-only harness access; `dispatch_qualified` must identify the exact target, model, effort/variant, and validated invocation arguments. Selector-only legacy qualification keys remain readable for compatibility but never authorize automatic routing, the strict descriptor, or coherence paths. The loader applies the same 30-day freshness rule as `rosterlib.smoke` and invalidates qualified evidence on selector, CLI-version, wrapper-version, or credential-profile drift. `temporarily_unavailable`, `not_transmittable`, `stale`, malformed, and wrong-argv receipts fail closed. A nested atomic promotion receipt is checked when present; descriptor-keyed records are themselves treated as the v1 promotion receipt. The router requires an exact descriptor before selecting an automatic target, and each adapter validates and forwards only that descriptor's declared argv fragment. Wrapper or CLI changes therefore require an ordered requalification: refresh the signature, run the probe, complete a dispatch qualification for the exact descriptor, then promote the receipt.
 
