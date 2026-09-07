@@ -2434,19 +2434,135 @@ function managedIdentity(entry) {
 	]);
 }
 
-async function recoveryEntryIsEligible(entry, dependencies, projectPath) {
+const RECOVERY_SKIP_REASONS = new Set([
+	"recovery_evidence_missing",
+	"creator-birth-unverified",
+	"ineligible",
+	"identity-or-eligibility-changed",
+	"creator-birth-changed-before-delete",
+]);
+
+function closedRecoverySkipReason(value) {
+	return RECOVERY_SKIP_REASONS.has(value) ? value : "recovery_evidence_changed";
+}
+
+async function assessRecoveryEntry(entry, dependencies, projectPath) {
 	const identity = managedIdentity(entry);
-	if (identity === null || typeof projectPath !== "string") return false;
+	if (identity === null)
+		return {
+			eligible: false,
+			liveness: "unknown",
+			reason: "identity_malformed",
+		};
+	if (typeof projectPath !== "string")
+		return {
+			eligible: false,
+			liveness: "unknown",
+			reason: "project_identity_unknown",
+		};
 	const readRunFn = dependencies.readRun ?? readRun;
 	let run;
 	try {
 		run = await readRunFn(entry.runId);
 	} catch {
+		return { eligible: false, liveness: "unknown", reason: "run_missing" };
+	}
+	if (run?.runId !== entry.runId)
+		return {
+			eligible: false,
+			liveness: "unknown",
+			reason: "run_identity_mismatch",
+		};
+	if (
+		typeof run.projectPath !== "string" ||
+		resolve(run.projectPath) !== resolve(projectPath)
+	)
+		return {
+			eligible: false,
+			liveness: "unknown",
+			reason: "project_identity_mismatch",
+		};
+	if (run.cleanupState === "failed")
+		return { eligible: false, liveness: "unknown", reason: "cleanup_failed" };
+	const liveness = recoveryLiveness(run, dependencies);
+	if (liveness === "terminal_clean" || liveness === "dead") {
+		const canonicalRunDigest = createHash("sha256")
+			.update(JSON.stringify(run))
+			.digest("hex");
+		const ownershipContext = {
+			resourceRoot: join(getRunRoot(run.runId), "resources"),
+			runId: run.runId,
+			projectRoot: resolve(run.projectPath),
+			creatorPid: entry.creatorPid,
+		};
+		return {
+			eligible: true,
+			liveness,
+			reason: "stale_owned_resource",
+			ownershipContext,
+			canonicalRunDigest,
+			proof: JSON.stringify([
+				identity,
+				run.runId,
+				resolve(run.projectPath),
+				ownershipContext.resourceRoot,
+				entry.creatorPid,
+				liveness,
+				canonicalRunDigest,
+			]),
+		};
+	}
+	return {
+		eligible: false,
+		liveness,
+		reason:
+			liveness === "live"
+				? "live_run"
+				: liveness === "startup_grace"
+					? "startup_grace"
+					: "liveness_unknown",
+	};
+}
+
+function recoveryEntryIsEligibleAtMutation(
+	entry,
+	dependencies,
+	ownershipContext,
+	canonicalRunDigest,
+) {
+	if (
+		managedIdentity(entry) === null ||
+		entry.runId !== ownershipContext.runId ||
+		entry.creatorPid !== ownershipContext.creatorPid ||
+		entry.ownership?.resourceRoot !== ownershipContext.resourceRoot ||
+		entry.ownership?.projectRoot !== ownershipContext.projectRoot ||
+		entry.ownership?.runId !== ownershipContext.runId ||
+		entry.ownership?.creatorPid !== ownershipContext.creatorPid
+	)
+		return false;
+	let run;
+	try {
+		run = JSON.parse(
+			readFileSync(join(getRunRoot(entry.runId), "run.json"), "utf8"),
+		);
+	} catch {
 		return false;
 	}
+	// `canonicalRunDigest` came from readRun's complete schema validation at the
+	// last async boundary. Exact binding rejects every replacement, including a
+	// parseable object that this local subset of identity checks would accept.
 	if (
-		run?.runId !== entry.runId ||
-		run.projectPath !== projectPath ||
+		createHash("sha256").update(JSON.stringify(run)).digest("hex") !==
+		canonicalRunDigest
+	)
+		return false;
+	if (
+		!run ||
+		typeof run !== "object" ||
+		Array.isArray(run) ||
+		run.runId !== entry.runId ||
+		typeof run.projectPath !== "string" ||
+		resolve(run.projectPath) !== ownershipContext.projectRoot ||
 		run.cleanupState === "failed"
 	)
 		return false;
@@ -2464,26 +2580,74 @@ async function reclaimManagedEntries({ managed, dependencies, projectPath }) {
 		dependencies.reclaim ?? ((opts) => executionBackend.reclaim(opts));
 	const combined = emptyReclaimResult();
 	const eligibleRunIds = new Set();
+	const candidates = [];
 	let invoked = false;
 	for (const entry of managed) {
-		// This is the final asynchronous step before the synchronous backend call.
-		// The backend then rechecks this exact VM identity before mutation.
-		if (!(await recoveryEntryIsEligible(entry, dependencies, projectPath)))
+		const first = await assessRecoveryEntry(entry, dependencies, projectPath);
+		if (!first.eligible) {
+			candidates.push({
+				entry,
+				disposition: "preserved",
+				reason: first.reason,
+			});
 			continue;
+		}
+		// Re-read authoritative run/liveness evidence at the last asynchronous
+		// boundary before the synchronous backend performs its own VM, creator,
+		// ownership-record, and eligibility checks immediately before mutation.
+		const final = await assessRecoveryEntry(entry, dependencies, projectPath);
+		if (!final.eligible || final.proof !== first.proof) {
+			candidates.push({
+				entry,
+				disposition: "preserved",
+				reason: final.eligible ? "recovery_evidence_changed" : final.reason,
+			});
+			continue;
+		}
 		const identity = managedIdentity(entry);
 		invoked = true;
 		eligibleRunIds.add(entry.runId);
 		try {
+			const ownershipContext = final.ownershipContext;
 			const result = reclaim({
 				dryRun: false,
-				eligibility: (candidate) => managedIdentity(candidate) === identity,
+				ownershipContext,
+				eligibility: (candidate) => {
+					if (managedIdentity(candidate) !== identity) return false;
+					if (candidate.recoveryPhase !== "pre_mutation") return true;
+					return recoveryEntryIsEligibleAtMutation(
+						candidate,
+						dependencies,
+						ownershipContext,
+						final.canonicalRunDigest,
+					);
+				},
 			});
 			combined.reclaimed.push(...(result.reclaimed ?? []));
 			combined.skippedSnapshots.push(...(result.skippedSnapshots ?? []));
 			combined.errors.push(...(result.errors ?? []));
+			const reclaimed = (result.reclaimed ?? []).some(
+				(candidate) =>
+					candidate?.uuid === entry.uuid && candidate?.name === entry.name,
+			);
+			const skipped = (result.skipped ?? []).find(
+				(candidate) => managedIdentity(candidate) === identity,
+			);
+			candidates.push({
+				entry,
+				disposition: reclaimed ? "reclaimed" : "preserved",
+				reason: reclaimed
+					? "stale_owned_resource"
+					: closedRecoverySkipReason(skipped?.reason),
+			});
 		} catch {
 			combined.errors.push({
 				name: entry.name,
+				reason: "managed_reclaim_failed",
+			});
+			candidates.push({
+				entry,
+				disposition: "preserved",
 				reason: "managed_reclaim_failed",
 			});
 		}
@@ -2492,7 +2656,75 @@ async function reclaimManagedEntries({ managed, dependencies, projectPath }) {
 		const result = reclaim({ dryRun: false, eligibility: () => false });
 		combined.errors.push(...(result.errors ?? []));
 	}
-	return { result: combined, eligibleRunIds };
+	return { result: combined, eligibleRunIds, candidates };
+}
+
+async function auditKnownAllocationIntents({
+	stateRoot,
+	runId = null,
+	managed,
+	dependencies,
+	executionBackend,
+}) {
+	let runIds;
+	if (runId) {
+		runIds = [runId];
+	} else {
+		try {
+			runIds = (await readdir(join(stateRoot, "runs"), { withFileTypes: true }))
+				.filter((entry) => entry.isDirectory())
+				.map((entry) => entry.name)
+				.sort();
+		} catch {
+			runIds = [];
+		}
+	}
+	const readRunFn = dependencies.readRun ?? readRun;
+	const knownResourceRoots = [];
+	for (const candidateRunId of runIds) {
+		const descriptor = {
+			resourceRoot: join(stateRoot, "runs", candidateRunId, "resources"),
+			runId: candidateRunId,
+			runRecordStatus: "missing",
+			projectPath: null,
+			cleanupState: null,
+			liveness: "unknown",
+		};
+		try {
+			const run = await readRunFn(candidateRunId);
+			if (
+				run?.runId === candidateRunId &&
+				typeof run.projectPath === "string"
+			) {
+				descriptor.runRecordStatus = "valid";
+				descriptor.projectPath = run.projectPath;
+				descriptor.cleanupState = run.cleanupState ?? null;
+				descriptor.liveness = recoveryLiveness(run, dependencies);
+			} else {
+				descriptor.runRecordStatus = "unknown";
+			}
+		} catch (error) {
+			descriptor.runRecordStatus =
+				error?.code === "ENOENT" ? "missing" : "unknown";
+		}
+		knownResourceRoots.push(descriptor);
+	}
+	const audit =
+		dependencies.auditAllocationIntents ??
+		((options) => executionBackend.auditAllocationIntents(options));
+	try {
+		return audit({ knownResourceRoots, managed });
+	} catch {
+		return [
+			{
+				file: null,
+				runId,
+				vmName: null,
+				classification: "unknown",
+				reason: "allocation_audit_unavailable",
+			},
+		];
+	}
 }
 
 async function canonicalRecoveryProject(managed, dependencies) {
@@ -2614,6 +2846,7 @@ async function handleRecover(argv, dependencies = {}) {
 		let reclaimedCount = 0;
 		const errors = [...inventoryErrors];
 		let unreclaimedSnapshots = [];
+		let candidateResults = [];
 		let recoveredByFinalizer = false;
 		let projectLockReleasedByFinalizer = false;
 		if (runId) {
@@ -2647,11 +2880,12 @@ async function handleRecover(argv, dependencies = {}) {
 								},
 							}
 						: dependencies;
-				const { result } = await reclaimManagedEntries({
+				const { result, candidates } = await reclaimManagedEntries({
 					managed: [target],
 					dependencies: targetDependencies,
 					projectPath: recoveryRun.projectPath,
 				});
+				candidateResults = candidates;
 				const reclaimed = result.reclaimed.some(
 					(entry) => entry.uuid === target.uuid && entry.name === target.name,
 				);
@@ -2723,26 +2957,40 @@ async function handleRecover(argv, dependencies = {}) {
 				target &&
 				(liveness === "terminal_clean" || liveness === "dead")
 			) {
-				const errorsBeforeReclaim = errors.length;
 				try {
-					if (
-						!(await reclaimTarget()) &&
-						errors.length === errorsBeforeReclaim
-					) {
-						errors.push("managed_recovery_evidence_changed");
-					}
+					await reclaimTarget();
 				} catch {
 					errors.push("managed_reclaim_failed");
 				}
 			}
+			if (candidateResults.length === 0) {
+				candidateResults = target
+					? [
+							{
+								entry: target,
+								disposition: "preserved",
+								reason: recoveryRunMatchesTarget
+									? liveness === "live"
+										? "live_run"
+										: liveness === "startup_grace"
+											? "startup_grace"
+											: "liveness_unknown"
+									: recoveryRun
+										? "run_identity_mismatch"
+										: "run_missing",
+							},
+						]
+					: [];
+			}
 		} else {
 			const projectPath = await canonicalRecoveryProject(managed, dependencies);
 			try {
-				const { result } = await reclaimManagedEntries({
+				const { result, candidates } = await reclaimManagedEntries({
 					managed,
 					dependencies,
 					projectPath,
 				});
+				candidateResults = candidates;
 				reclaimedCount = result.reclaimed.length;
 				errors.push(...result.errors.map((e) => `${e.name}: ${e.reason}`));
 				unreclaimedSnapshots = result.skippedSnapshots ?? [];
@@ -2766,20 +3014,47 @@ async function handleRecover(argv, dependencies = {}) {
 			dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims
 		)();
 		const releasedIds = [...new Set([...targeted, ...direct, ...claims])];
+		const allocationIntents = await auditKnownAllocationIntents({
+			stateRoot: effectiveStateRoot,
+			runId,
+			managed,
+			dependencies,
+			executionBackend,
+		});
 
 		const output = {
+			disposition:
+				errors.length > 0
+					? "partial_failure"
+					: reclaimedCount > 0
+						? "reclaimed"
+						: managed.length === 0
+							? "no_candidates"
+							: "preserved",
 			vmsReclaimed: reclaimedCount,
 			unreclaimedSnapshots,
+			allocationIntents,
 			errors,
 			projectLocksReleased: releasedIds.length,
 			runId: runId ?? null,
-			candidates: !runId
-				? managed.map((entry) => ({
-						name: entry.name,
-						runId: entry.runId,
-						status: entry.status,
-					}))
-				: [{ runId }],
+			candidates:
+				candidateResults.length > 0
+					? candidateResults.map(({ entry, disposition, reason }) => ({
+							name: entry.name,
+							runId: entry.runId,
+							status: entry.status,
+							disposition,
+							reason,
+						}))
+					: runId
+						? [
+								{
+									runId,
+									disposition: "preserved",
+									reason: "resource_missing",
+								},
+							]
+						: [],
 		};
 
 		console.log(JSON.stringify(output));
@@ -2914,6 +3189,8 @@ if (
 }
 
 export {
+	assessRecoveryEntry,
+	auditKnownAllocationIntents,
 	captureHostFingerprint,
 	formatRunAbort,
 	handleHealth,

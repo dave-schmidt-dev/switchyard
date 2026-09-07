@@ -2331,6 +2331,69 @@ describe("Parallels execution backend lifecycle", () => {
 		ok(!calls.some((args) => args[0] === "stop" || args[0] === "delete"));
 	});
 
+	it("rechecks caller liveness eligibility at the final mutation boundary", () => {
+		const calls = [];
+		const entry = {
+			uuid: WORK_UUID,
+			status: "running",
+			name: buildParallelsWorkingName("liveness-race", 999999),
+		};
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				return args[0] === "list" ? listed([entry]) : "ok";
+			},
+			pidIsAlive: () => false,
+		});
+		const ownershipContext = registerOwnedEntry(backend, entry);
+
+		const result = backend.reclaim({
+			ownershipContext,
+			eligibility: (candidate) => candidate.recoveryPhase !== "pre_mutation",
+		});
+
+		strictEqual(result.reclaimed.length, 0);
+		strictEqual(result.skipped[0].reason, "identity-or-eligibility-changed");
+		strictEqual(
+			calls.filter((args) => args[0] === "stop" || args[0] === "delete").length,
+			0,
+		);
+	});
+
+	it("preserves well-formed ownership from a different project", () => {
+		const calls = [];
+		const entry = {
+			uuid: WORK_UUID,
+			status: "stopped",
+			name: buildParallelsWorkingName("project-mismatch", 999999),
+		};
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				return args[0] === "list" ? listed([entry]) : "ok";
+			},
+			pidIsAlive: () => false,
+		});
+		const stored = registerOwnedEntry(backend, entry, {
+			projectRoot: "/private/tmp/foreign-project",
+		});
+
+		const result = backend.reclaim({
+			ownershipContext: {
+				...stored,
+				projectRoot: "/private/tmp/authoritative-project",
+			},
+			eligibility: () => true,
+		});
+
+		strictEqual(result.reclaimed.length, 0);
+		strictEqual(result.skipped[0].reason, "recovery_evidence_missing");
+		strictEqual(
+			calls.filter((args) => args[0] === "stop" || args[0] === "delete").length,
+			0,
+		);
+	});
+
 	it("rolls back a clone when Aqua readiness never appears", () => {
 		const calls = [];
 		let now = 0;
@@ -2756,6 +2819,95 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
  * whole run and left no exit code, signal, or attempt count behind.
  */
 describe("VM ownership metadata", () => {
+	it("audits known allocation intents as valid, stale, malformed, or unknown without mutation", () => {
+		const root = tempDir("switchyard-allocation-audit-");
+		const projectRoot = "/private/tmp/switchyard-fixture-project";
+		let mutations = 0;
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: () => {
+				mutations += 1;
+				return "";
+			},
+		});
+		const descriptors = [];
+		for (const [runId, liveness, runRecordStatus] of [
+			["active-intent", "live", "valid"],
+			["stale-intent", "dead", "valid"],
+			["unknown-intent", "unknown", "missing"],
+		]) {
+			const resourceRoot = join(root, "runs", runId, "resources");
+			const context = ownedOptions(runId, 5151, {
+				resourceRoot,
+				projectRoot,
+			}).ownershipContext;
+			backend.writeAllocationIntent(
+				buildParallelsWorkingName(runId, 5151),
+				context,
+			);
+			descriptors.push({
+				resourceRoot,
+				runId,
+				runRecordStatus,
+				projectPath: projectRoot,
+				cleanupState: "pending",
+				liveness,
+			});
+		}
+		const malformedRoot = join(root, "runs", "malformed", "resources");
+		mkdirSync(malformedRoot, { recursive: true });
+		writeFileSync(
+			join(
+				malformedRoot,
+				"parallels-allocation-0000000000000000000000000000000000000000000000000000000000000000.intent.json",
+			),
+			"{not-json",
+			"utf8",
+		);
+		descriptors.push({
+			resourceRoot: malformedRoot,
+			runId: "malformed",
+			runRecordStatus: "valid",
+			projectPath: projectRoot,
+			cleanupState: "pending",
+			liveness: "dead",
+		});
+
+		const audit = backend.auditAllocationIntents({
+			knownResourceRoots: descriptors,
+		});
+		deepStrictEqual(
+			audit.map(({ runId, classification, reason }) => ({
+				runId,
+				classification,
+				reason,
+			})),
+			[
+				{
+					runId: "active-intent",
+					classification: "valid",
+					reason: "active_run",
+				},
+				{
+					runId: "stale-intent",
+					classification: "stale",
+					reason: "stale_run",
+				},
+				{
+					runId: "unknown-intent",
+					classification: "unknown",
+					reason: "run_missing",
+				},
+				{
+					runId: null,
+					classification: "malformed",
+					reason: "intent_malformed",
+				},
+			],
+		);
+		strictEqual(mutations, 0, "the allocation-intent audit is read-only");
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("refuses an unproven bare handle before any VM mutation", () => {
 		const calls = [];
 		const name = buildParallelsWorkingName("bare-handle", 5151);

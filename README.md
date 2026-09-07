@@ -342,6 +342,12 @@ identity) and records an allocation intent
 a VM ownership record (`parallels-vm-<uuid>.json`) once it does, both under the
 run's `resources/` directory. An intent whose cleanup cannot be proven is left
 marked `cleanup_uncertain` for attended recovery rather than deleted.
+`recover` audits allocation intents across the known run resource roots without
+mutating them and classifies each as `valid`, `stale`, `malformed`, or `unknown`.
+Only an exact VM ownership record whose run, project, creator birth, and resource
+identity still match, and whose dead or terminal-clean liveness is re-read at
+the final pre-mutation boundary, can be reclaimed. Live, mismatched, missing-run,
+malformed, cleanup-failed, and unknown evidence is preserved.
 
 Before the queue claims a VM slot, the backend probes host readiness with a
 bounded `prlctl list` (two attempts, 100 ms backoff, 2 s timeout, 1 MiB
@@ -746,7 +752,10 @@ node src/switchyard/dispatch/index.mjs result <run-id> --json
 
 node src/switchyard/dispatch/index.mjs recover [--run <run-id>] [--state-root <path>]
 # => reclaims orphaned managed VM workspaces and reconciles project locks and
-#    recovery claims under the selected durable state root
+#    recovery claims under the selected durable state root; emits the read-only
+#    allocationIntents audit and an explicit reclaimed|preserved|no_candidates|
+#    partial_failure disposition while every preserved candidate carries a
+#    closed reason
 ```
 
 Before running, `launch` records the worker's launch nonce and the project's current host git fingerprint (`git rev-parse HEAD` + `git status --porcelain`) in the run; `worker-bootstrap.mjs` re-verifies both on start and refuses to run (exit 3/4) if either has changed, so a worker never executes against a checkout other than the one it was launched against. Every terminal path — success, a failed task, or a crash — releases the run's lease and its project lock (a project allows only one active run at a time), and `recover` is the backstop for anything a hard kill (`SIGKILL`, host reboot) leaves behind: it only releases a lock it can prove is unowned by a live, still-active run, so recovering a stale run can never yank the lock out from under a different run that's genuinely still in progress.

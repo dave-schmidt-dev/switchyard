@@ -27,6 +27,8 @@ import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
 const HOST_PROCESS_IDENTITY_VERSION = "switchyard-host-process-v1";
+const ALLOCATION_INTENT_PREFIX = "parallels-allocation-";
+const ALLOCATION_INTENT_SUFFIX = ".intent.json";
 const HOST_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const HOST_PROCESS_IDENTITY_MAX_BUFFER = 4_096;
 const CANONICAL_UUID =
@@ -2724,7 +2726,191 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 
 	allocationIntentPath(name, resourceRoot) {
 		const token = createHash("sha256").update(String(name)).digest("hex");
-		return join(resourceRoot, `parallels-allocation-${token}.intent.json`);
+		return join(
+			resourceRoot,
+			`${ALLOCATION_INTENT_PREFIX}${token}${ALLOCATION_INTENT_SUFFIX}`,
+		);
+	}
+
+	/**
+	 * Audit allocation intents under caller-enumerated run resource roots.
+	 * This method is read-only: it never invokes prlctl or changes an intent.
+	 */
+	auditAllocationIntents({ knownResourceRoots = [] } = {}) {
+		const audits = [];
+		for (const root of knownResourceRoots) {
+			const resourceRoot = root?.resourceRoot;
+			if (
+				typeof resourceRoot !== "string" ||
+				!isAbsolute(resourceRoot) ||
+				resolve(resourceRoot) !== resourceRoot
+			) {
+				audits.push({
+					file: null,
+					runId: null,
+					vmName: null,
+					classification: "unknown",
+					reason: "resource_root_unknown",
+				});
+				continue;
+			}
+			let entries;
+			try {
+				const stat = lstatSync(resourceRoot);
+				if (!stat.isDirectory() || stat.isSymbolicLink()) {
+					throw new Error("not an owned directory");
+				}
+				entries = readdirSync(resourceRoot, { withFileTypes: true });
+			} catch (error) {
+				if (error?.code === "ENOENT") continue;
+				audits.push({
+					file: null,
+					runId: typeof root?.runId === "string" ? root.runId : null,
+					vmName: null,
+					classification: "unknown",
+					reason: "resource_root_unreadable",
+				});
+				continue;
+			}
+			for (const entry of entries
+				.filter((candidate) =>
+					candidate.name.startsWith(ALLOCATION_INTENT_PREFIX),
+				)
+				.sort((left, right) => left.name.localeCompare(right.name))) {
+				const base = {
+					file: entry.name,
+					runId: null,
+					vmName: null,
+				};
+				const filePattern =
+					/^parallels-allocation-([0-9a-f]{64})\.intent\.json$/u;
+				const fileMatch = entry.name.match(filePattern);
+				let record;
+				try {
+					if (!entry.isFile() || !fileMatch) {
+						throw new Error("invalid intent file");
+					}
+					record = JSON.parse(
+						readFileSync(join(resourceRoot, entry.name), "utf8"),
+					);
+				} catch {
+					audits.push({
+						...base,
+						classification: "malformed",
+						reason: "intent_malformed",
+					});
+					continue;
+				}
+				const parsedName = parseParallelsWorkingName(record?.vmName);
+				const uncertain = record?.state === "cleanup_uncertain";
+				const expectedFields = new Set([
+					"schemaVersion",
+					"kind",
+					"vmName",
+					"resourceRoot",
+					"runId",
+					"taskId",
+					"attemptId",
+					"projectRoot",
+					"purpose",
+					"creatorPid",
+					"processStartIdentity",
+					"createdAt",
+					...(uncertain ? ["state", "reasonCode"] : []),
+				]);
+				const malformed =
+					!record ||
+					typeof record !== "object" ||
+					Array.isArray(record) ||
+					Object.keys(record).length !== expectedFields.size ||
+					Object.keys(record).some((field) => !expectedFields.has(field)) ||
+					record.schemaVersion !== VM_OWNERSHIP_SCHEMA_VERSION ||
+					record.kind !== "parallels_vm_allocation_intent" ||
+					!parsedName ||
+					parsedName.runId !== record.runId ||
+					parsedName.creatorPid !== record.creatorPid ||
+					fileMatch?.[1] !==
+						createHash("sha256").update(String(record.vmName)).digest("hex") ||
+					record.resourceRoot !== resourceRoot ||
+					!isBoundedRecordText(record.runId, 256) ||
+					!isBoundedRecordText(record.taskId, 256) ||
+					!isBoundedRecordText(record.attemptId, 256) ||
+					!isAbsolute(record.projectRoot) ||
+					record.projectRoot !== resolve(record.projectRoot) ||
+					!isBoundedRecordText(record.purpose, 128) ||
+					!Number.isSafeInteger(record.creatorPid) ||
+					record.creatorPid <= 0 ||
+					parseHostProcessIdentity(record.processStartIdentity)?.pid !==
+						record.creatorPid ||
+					!Number.isFinite(record.createdAt) ||
+					(uncertain && !isBoundedRecordText(record.reasonCode, 128));
+				if (malformed) {
+					audits.push({
+						...base,
+						classification: "malformed",
+						reason: "intent_malformed",
+					});
+					continue;
+				}
+
+				const identified = {
+					file: entry.name,
+					runId: record.runId,
+					vmName: record.vmName,
+				};
+				if (root.runRecordStatus !== "valid") {
+					audits.push({
+						...identified,
+						classification: "unknown",
+						reason:
+							root.runRecordStatus === "missing"
+								? "run_missing"
+								: "run_record_unknown",
+					});
+					continue;
+				}
+				if (
+					record.runId !== root.runId ||
+					typeof root.projectPath !== "string" ||
+					record.projectRoot !== resolve(root.projectPath)
+				) {
+					audits.push({
+						...identified,
+						classification: "unknown",
+						reason: "run_identity_mismatch",
+					});
+					continue;
+				}
+				if (
+					root.cleanupState !== "failed" &&
+					["dead", "terminal_clean"].includes(root.liveness)
+				) {
+					audits.push({
+						...identified,
+						classification: "stale",
+						reason: "stale_run",
+					});
+					continue;
+				}
+				if (["live", "startup_grace"].includes(root.liveness)) {
+					audits.push({
+						...identified,
+						classification: "valid",
+						reason: "active_run",
+					});
+					continue;
+				}
+				audits.push({
+					...identified,
+					classification: "unknown",
+					reason:
+						root.cleanupState === "failed"
+							? "cleanup_failed"
+							: "liveness_unknown",
+				});
+			}
+		}
+		return audits;
 	}
 
 	writeAllocationIntent(name, ownership) {
@@ -3538,7 +3724,11 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				typeof ownership.processStartIdentity !== "string" ||
 				!ownership.processStartIdentity ||
 				(ownershipContext?.projectRoot &&
-					resolve(ownershipContext.projectRoot) !== ownership.projectRoot)
+					resolve(ownershipContext.projectRoot) !== ownership.projectRoot) ||
+				(ownershipContext?.runId &&
+					ownershipContext.runId !== ownership.runId) ||
+				(Number.isInteger(ownershipContext?.creatorPid) &&
+					ownershipContext.creatorPid !== ownership.creatorPid)
 			) {
 				result.skipped.push({ ...entry, reason: "recovery_evidence_missing" });
 				onStatus?.({
@@ -3579,6 +3769,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				continue;
 			}
 			let current;
+			let currentOwnership;
 			try {
 				current = this.listManaged().find(
 					(candidate) =>
@@ -3587,11 +3778,31 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 						candidate.runId === entry.runId &&
 						candidate.creatorPid === entry.creatorPid,
 				);
+				currentOwnership = current
+					? this.readVmOwnership(current.uuid, resourceRoot)
+					: null;
 				eligible =
 					current !== undefined &&
-					eligibility({ ...current, ownership }) === true;
+					currentOwnership !== null &&
+					currentOwnership.vmUuid === current.uuid &&
+					currentOwnership.vmName === current.name &&
+					currentOwnership.runId === current.runId &&
+					currentOwnership.creatorPid === current.creatorPid &&
+					(!ownershipContext?.projectRoot ||
+						currentOwnership.projectRoot ===
+							resolve(ownershipContext.projectRoot)) &&
+					(!ownershipContext?.runId ||
+						currentOwnership.runId === ownershipContext.runId) &&
+					(!Number.isInteger(ownershipContext?.creatorPid) ||
+						currentOwnership.creatorPid === ownershipContext.creatorPid) &&
+					eligibility({
+						...current,
+						ownership: currentOwnership,
+						recoveryPhase: "pre_mutation",
+					}) === true;
 			} catch {
 				current = undefined;
+				currentOwnership = undefined;
 				eligible = false;
 			}
 			if (!eligible) {
@@ -3606,7 +3817,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				});
 				continue;
 			}
-			const currentCreatorState = this.probeStoredCreator(ownership, onStatus);
+			const currentCreatorState = this.probeStoredCreator(
+				currentOwnership,
+				onStatus,
+			);
 			if (
 				currentCreatorState !== "same_birth" &&
 				currentCreatorState !== "absent"
@@ -3651,7 +3865,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					reason: "no-snapshot-sidecar",
 				});
 				try {
-					this.deleteVmOwnership(entry.uuid, ownership.resourceRoot);
+					this.deleteVmOwnership(entry.uuid, currentOwnership.resourceRoot);
 				} catch (error) {
 					result.errors.push({ name: entry.name, reason: error.message });
 				}
@@ -3660,7 +3874,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			try {
 				this.cleanupLinkedSnapshots(metadata.goldenImage, metadata.snapshotIds);
 				this.deleteSnapshotSidecar(entry.uuid);
-				this.deleteVmOwnership(entry.uuid, ownership.resourceRoot);
+				this.deleteVmOwnership(entry.uuid, currentOwnership.resourceRoot);
 				result.reclaimedSnapshots.push({
 					name: entry.name,
 					goldenImage: metadata.goldenImage,

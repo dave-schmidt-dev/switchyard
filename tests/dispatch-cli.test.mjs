@@ -2344,6 +2344,312 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 		strictEqual(destroys, 1);
 	});
 
+	it("recover reports reclaimed stale ownership and preserves every unsafe fixture", async () => {
+		const baseTarget = {
+			uuid: "target-uuid",
+			name: "switchyard-work-target-42",
+			runId: "target",
+			creatorPid: 42,
+			status: "stopped",
+		};
+		const fixtures = [
+			{ label: "stale", liveness: "terminal_clean", expected: "reclaimed" },
+			{ label: "live", liveness: "live", reason: "live_run" },
+			{ label: "unknown", liveness: "unknown", reason: "liveness_unknown" },
+			{ label: "missing", missing: true, reason: "run_missing" },
+			{
+				label: "mismatched",
+				mismatchAfterInitialRead: true,
+				reason: "project_identity_mismatch",
+			},
+			{
+				label: "malformed",
+				target: { ...baseTarget, creatorPid: "42" },
+				liveness: "terminal_clean",
+				reason: "identity_malformed",
+			},
+		];
+		for (const fixture of fixtures) {
+			const target = fixture.target ?? baseTarget;
+			let reads = 0;
+			let destroys = 0;
+			const lines = [];
+			const originalLog = console.log;
+			const previousExitCode = process.exitCode;
+			console.log = (line) => lines.push(String(line));
+			try {
+				await handleRecover(["--run", "target"], {
+					listManaged: () => [target],
+					readRun: async () => {
+						reads += 1;
+						if (fixture.missing) {
+							const error = new Error("missing");
+							error.code = "ENOENT";
+							throw error;
+						}
+						return {
+							runId: "target",
+							projectPath:
+								fixture.mismatchAfterInitialRead && reads > 2
+									? join(dir, "other-project")
+									: projectDir,
+							state: "failed",
+							cleanupState: "complete",
+						};
+					},
+					classifyRunLiveness: () => fixture.liveness ?? "terminal_clean",
+					destroy: () => {
+						destroys += 1;
+					},
+					releaseProjectLockIfOwnedBy: async () => false,
+					releaseOrphanedProjectLocks: async () => [],
+					reconcileProjectLockClaims: async () => [],
+				});
+			} finally {
+				console.log = originalLog;
+				process.exitCode = previousExitCode;
+			}
+			const output = JSON.parse(lines[0]);
+			if (fixture.expected === "reclaimed") {
+				strictEqual(destroys, 1, fixture.label);
+				strictEqual(output.disposition, "reclaimed", fixture.label);
+				strictEqual(output.vmsReclaimed, 1, fixture.label);
+				strictEqual(output.candidates[0].disposition, "reclaimed");
+			} else {
+				strictEqual(destroys, 0, `${fixture.label} must remain untouched`);
+				strictEqual(output.disposition, "preserved", fixture.label);
+				strictEqual(output.candidates[0].disposition, "preserved");
+				strictEqual(output.candidates[0].reason, fixture.reason);
+			}
+		}
+	});
+
+	it("maps production-shaped backend reclaim output to the exact candidate", async () => {
+		const target = {
+			uuid: "target-uuid",
+			name: "switchyard-work-target-42",
+			runId: "target",
+			creatorPid: 42,
+			status: "stopped",
+		};
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", "target"], {
+				listManaged: () => [target],
+				readRun: async () => ({
+					runId: "target",
+					projectPath: projectDir,
+					state: "failed",
+					cleanupState: "complete",
+				}),
+				classifyRunLiveness: () => "terminal_clean",
+				reclaim: () => ({
+					reclaimed: [{ uuid: target.uuid, name: target.name, forced: false }],
+					skipped: [],
+					skippedSnapshots: [],
+					errors: [],
+				}),
+				releaseProjectLockIfOwnedBy: async () => false,
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+
+		const envelope = JSON.parse(output[0]);
+		strictEqual(envelope.disposition, "reclaimed");
+		strictEqual(envelope.vmsReclaimed, 1);
+		strictEqual(envelope.candidates[0].disposition, "reclaimed");
+		strictEqual(envelope.candidates[0].reason, "stale_owned_resource");
+	});
+
+	it("recover preserves a candidate that becomes live at backend mutation", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		let terminalRun = await readRun(runId);
+		terminalRun = await updateRun(
+			runId,
+			{ state: "failed", cleanupState: "complete" },
+			terminalRun.revision,
+		);
+		const target = {
+			uuid: "race-uuid",
+			name: `switchyard-work-${runId}-42`,
+			runId,
+			creatorPid: 42,
+			status: "stopped",
+		};
+		let destructiveCalls = 0;
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", runId], {
+				listManaged: () => [target],
+				reclaim: ({ eligibility, ownershipContext }) => {
+					const candidate = {
+						...target,
+						ownership: {
+							...ownershipContext,
+							vmUuid: target.uuid,
+							vmName: target.name,
+						},
+					};
+					strictEqual(eligibility(candidate), true);
+					strictEqual(
+						eligibility({ ...candidate, recoveryPhase: "pre_mutation" }),
+						true,
+					);
+					writeFileSync(
+						join(stateRoot, "runs", runId, "run.json"),
+						JSON.stringify({
+							...terminalRun,
+							state: "running",
+							cleanupState: "not_started",
+							workerPid: process.pid,
+						}),
+						"utf8",
+					);
+					const allowed = eligibility({
+						...candidate,
+						recoveryPhase: "pre_mutation",
+					});
+					if (allowed) destructiveCalls += 1;
+					return {
+						reclaimed: allowed ? [target] : [],
+						skipped: allowed
+							? []
+							: [{ ...target, reason: "identity-or-eligibility-changed" }],
+						skippedSnapshots: [],
+						errors: [],
+					};
+				},
+				releaseProjectLockIfOwnedBy: async () => false,
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+
+		strictEqual(destructiveCalls, 0);
+		const envelope = JSON.parse(output[0]);
+		strictEqual(envelope.disposition, "preserved");
+		strictEqual(envelope.vmsReclaimed, 0);
+		strictEqual(
+			envelope.candidates[0].reason,
+			"identity-or-eligibility-changed",
+		);
+	});
+
+	it("recover preserves canonical-schema-malformed evidence at backend mutation", async () => {
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const runId = randomUUID();
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		let terminalRun = await readRun(runId);
+		terminalRun = await updateRun(
+			runId,
+			{ state: "failed", cleanupState: "complete" },
+			terminalRun.revision,
+		);
+		const target = {
+			uuid: "malformed-race-uuid",
+			name: `switchyard-work-${runId}-42`,
+			runId,
+			creatorPid: 42,
+			status: "stopped",
+		};
+		let destructiveCalls = 0;
+		const output = [];
+		const originalLog = console.log;
+		const previousExitCode = process.exitCode;
+		console.log = (line) => output.push(String(line));
+		try {
+			await handleRecover(["--run", runId], {
+				listManaged: () => [target],
+				reclaim: ({ eligibility, ownershipContext }) => {
+					const candidate = {
+						...target,
+						ownership: {
+							...ownershipContext,
+							vmUuid: target.uuid,
+							vmName: target.name,
+						},
+					};
+					strictEqual(eligibility(candidate), true);
+					strictEqual(
+						eligibility({ ...candidate, recoveryPhase: "pre_mutation" }),
+						true,
+					);
+					writeFileSync(
+						join(stateRoot, "runs", runId, "run.json"),
+						JSON.stringify({
+							...terminalRun,
+							orderedTaskIds: "schema-malformed",
+						}),
+						"utf8",
+					);
+					const allowed = eligibility({
+						...candidate,
+						recoveryPhase: "pre_mutation",
+					});
+					if (allowed) destructiveCalls += 1;
+					return {
+						reclaimed: allowed ? [target] : [],
+						skipped: allowed
+							? []
+							: [{ ...target, reason: "identity-or-eligibility-changed" }],
+						skippedSnapshots: [],
+						errors: [],
+					};
+				},
+				releaseProjectLockIfOwnedBy: async () => false,
+				releaseOrphanedProjectLocks: async () => [],
+				reconcileProjectLockClaims: async () => [],
+			});
+		} finally {
+			console.log = originalLog;
+			process.exitCode = previousExitCode;
+		}
+
+		strictEqual(destructiveCalls, 0);
+		const envelope = JSON.parse(output[0]);
+		strictEqual(envelope.disposition, "preserved");
+		strictEqual(envelope.vmsReclaimed, 0);
+		strictEqual(
+			envelope.candidates[0].reason,
+			"identity-or-eligibility-changed",
+		);
+	});
+
 	it("targeted recover preserves a specific reclaim failure", async () => {
 		const target = {
 			uuid: "target-uuid",

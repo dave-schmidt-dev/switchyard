@@ -1,6 +1,9 @@
 import { strictEqual } from "node:assert";
 import { describe, it } from "node:test";
-import { resolveIsRunDead } from "../src/switchyard/dispatch/index.mjs";
+import {
+	assessRecoveryEntry,
+	resolveIsRunDead,
+} from "../src/switchyard/dispatch/index.mjs";
 
 // Liveness rule that decides whether `recover` may reap a managed container.
 // This is the data-loss-critical branch: a false "dead" reaps a live
@@ -104,5 +107,98 @@ describe("resolveIsRunDead — liveness gating", () => {
 		const ambiguous = deps({ run: runRec(), live: false });
 		ambiguous.classifyRunLiveness = () => "unknown";
 		strictEqual(await resolveIsRunDead("r", ambiguous), false);
+	});
+});
+
+describe("recovery candidate proof", () => {
+	const entry = {
+		uuid: "fixture-uuid",
+		name: "switchyard-work-run-4242",
+		runId: "run",
+		creatorPid: 4242,
+		status: "stopped",
+	};
+	const projectPath = "/private/tmp/recovery-project";
+
+	it("authorizes only exact dead or terminal-clean run evidence", async () => {
+		for (const liveness of ["dead", "terminal_clean"]) {
+			const result = await assessRecoveryEntry(
+				entry,
+				{
+					readRun: async () => ({
+						runId: "run",
+						projectPath,
+						cleanupState: "pending",
+					}),
+					classifyRunLiveness: () => liveness,
+				},
+				projectPath,
+			);
+			strictEqual(result.eligible, true, liveness);
+			strictEqual(result.reason, "stale_owned_resource", liveness);
+		}
+	});
+
+	it("preserves live, mismatched, missing, malformed, and unknown evidence", async () => {
+		const cases = [
+			{
+				label: "live",
+				dependencies: {
+					readRun: async () => ({
+						runId: "run",
+						projectPath,
+						cleanupState: "pending",
+					}),
+					classifyRunLiveness: () => "live",
+				},
+				reason: "live_run",
+			},
+			{
+				label: "mismatched",
+				dependencies: {
+					readRun: async () => ({
+						runId: "other",
+						projectPath,
+						cleanupState: "complete",
+					}),
+				},
+				reason: "run_identity_mismatch",
+			},
+			{
+				label: "missing",
+				dependencies: {
+					readRun: async () => Promise.reject(new Error("missing")),
+				},
+				reason: "run_missing",
+			},
+			{
+				label: "unknown",
+				dependencies: {
+					readRun: async () => ({
+						runId: "run",
+						projectPath,
+						cleanupState: "pending",
+					}),
+					classifyRunLiveness: () => "unknown",
+				},
+				reason: "liveness_unknown",
+			},
+		];
+		for (const testCase of cases) {
+			const result = await assessRecoveryEntry(
+				entry,
+				testCase.dependencies,
+				projectPath,
+			);
+			strictEqual(result.eligible, false, testCase.label);
+			strictEqual(result.reason, testCase.reason, testCase.label);
+		}
+		const malformed = await assessRecoveryEntry(
+			{ ...entry, creatorPid: "4242" },
+			{},
+			projectPath,
+		);
+		strictEqual(malformed.eligible, false);
+		strictEqual(malformed.reason, "identity_malformed");
 	});
 });
