@@ -38,7 +38,11 @@ import {
 	normalizeHostPower,
 	probeHostPower,
 } from "../src/switchyard/dispatch/host-power.mjs";
-import { validateTaskStartTreeAsync } from "../src/switchyard/lifecycle/index.mjs";
+import { integrationGate } from "../src/switchyard/integrate/index.mjs";
+import {
+	captureDirtyOverlay,
+	validateTaskStartTreeAsync,
+} from "../src/switchyard/lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__resetRosterCacheForTests,
@@ -344,6 +348,263 @@ describe("macOS queue admission", () => {
 });
 
 describe("attempt-scoped execution backend", () => {
+	it("returns one dirty-overlay receipt identity across sync, async, and orchestrator paths", async () => {
+		const project = join(TEST_DIR, "dirty-overlay-paths");
+		mkdirSync(join(project, "src"), { recursive: true });
+		writeFileSync(
+			join(project, "src", "changed.mjs"),
+			"export const value = 1;\n",
+		);
+		runFixtureGit(project, ["init", "-q"]);
+		runFixtureGit(project, ["config", "user.email", "test@example.invalid"]);
+		runFixtureGit(project, ["config", "user.name", "Test"]);
+		runFixtureGit(project, ["add", "src/changed.mjs"]);
+		runFixtureGit(project, ["commit", "-qm", "base"]);
+		writeFileSync(
+			join(project, "src", "changed.mjs"),
+			"export const value = 2;\n",
+		);
+		const receipt = captureDirtyOverlay(project, ["src/changed.mjs"]);
+		const task = (id) => ({
+			id,
+			title: "overlay",
+			description: "overlay",
+			executor: "switchyard",
+			requiredPaths: ["src/changed.mjs"],
+			files: ["src/changed.mjs"],
+		});
+		const base = {
+			projectPath: project,
+			workingContainerName: "overlay-worker",
+			dirtyOverlayReceipt: receipt,
+			route: () => ({ provider: "claude", model: "fixture-model" }),
+			resolveDescriptor: () =>
+				descriptorForRoute({ provider: "claude", model: "fixture-model" }),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: () => ({ success: true }),
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/src/changed.mjs b/src/changed.mjs\n",
+					executeAsync: async () => ({ success: true, output: "ok" }),
+					captureDiffAsync: async () =>
+						"diff --git a/src/changed.mjs b/src/changed.mjs\n",
+				},
+			},
+		};
+		const results = [
+			executeTask(task("1.1"), base),
+			await executeTaskAsync(task("1.2"), base),
+			await executeTaskWithOrchestrator(task("1.3"), {
+				...base,
+				orchestrator: {
+					launch: async () => "overlay-job",
+					status: async () => ({ state: "done" }),
+					result: async () => ({ success: true, diff: null }),
+				},
+			}),
+		];
+		deepStrictEqual(
+			results.map((result) => result.dirtyOverlayReceiptHash),
+			[receipt.receiptHash, receipt.receiptHash, receipt.receiptHash],
+		);
+		let routeCalls = 0;
+		let providerCalls = 0;
+		const rejected = executeTask(task("1.4"), {
+			...base,
+			route: () => {
+				routeCalls += 1;
+				return { provider: "claude", model: "fixture-model" };
+			},
+			dirtyOverlayReceipt: { ...receipt, receiptHash: "f".repeat(64) },
+			adapters: {
+				claude: {
+					execute: () => {
+						providerCalls += 1;
+						return { success: true, output: "ok" };
+					},
+				},
+			},
+		});
+		strictEqual(rejected.result, "dirty_overlay_rejected");
+		strictEqual(routeCalls, 0);
+		strictEqual(providerCalls, 0);
+
+		// A task that declares nothing satisfies `every()` vacuously. Without an
+		// explicit non-empty check it would reach provider allocation inside a
+		// workspace seeded with overlay bytes it never scoped — the review path,
+		// where `Files:` is otherwise optional, is exactly where that happens.
+		const undeclared = executeTask(
+			{ ...task("1.5"), type: "review", requiredPaths: null, files: [] },
+			{
+				...base,
+				route: () => {
+					routeCalls += 1;
+					return { provider: "claude", model: "fixture-model" };
+				},
+				adapters: {
+					claude: {
+						execute: () => {
+							providerCalls += 1;
+							return { success: true, output: "ok" };
+						},
+					},
+				},
+			},
+		);
+		strictEqual(undeclared.result, "dirty_overlay_rejected");
+		strictEqual(undeclared.reasonCode, "dirty_overlay_scope_mismatch");
+		strictEqual(undeclared.dirtyOverlayReceiptHash, receipt.receiptHash);
+		strictEqual(routeCalls, 0);
+		strictEqual(providerCalls, 0);
+	});
+
+	// The receipt is immutable and never recaptured, so integrating the first
+	// task rewrites exactly the declared bytes and the next task revalidates
+	// against a worktree that no longer matches. An overlay queue therefore
+	// carries at most one integrating task; this pins that boundary rather than
+	// leaving it to be discovered as an unexplained mid-queue rejection.
+	it("integrates one overlay task and then refuses the drift that integration created", () => {
+		const project = join(TEST_DIR, "dirty-overlay-one-integration");
+		mkdirSync(join(project, "src"), { recursive: true });
+		const target = join(project, "src", "changed.mjs");
+		writeFileSync(target, "export const value = 1;\n");
+		runFixtureGit(project, ["init", "-q"]);
+		runFixtureGit(project, ["config", "user.email", "test@example.invalid"]);
+		runFixtureGit(project, ["config", "user.name", "Test"]);
+		runFixtureGit(project, ["add", "src/changed.mjs"]);
+		runFixtureGit(project, ["commit", "-qm", "base"]);
+		const overlay = "export const value = 2;\n";
+		const applied = "export const value = 3;\n";
+		writeFileSync(target, overlay);
+		const receipt = captureDirtyOverlay(project, ["src/changed.mjs"]);
+		// A patch whose preimage is the overlay bytes: stage the overlay, write
+		// the result, diff, then restore exactly what the receipt captured.
+		runFixtureGit(project, ["add", "src/changed.mjs"]);
+		writeFileSync(target, applied);
+		const diff = `${runFixtureGit(project, ["diff", "--no-color"])}\n`;
+		runFixtureGit(project, ["reset", "-q"]);
+		writeFileSync(target, overlay);
+
+		let providerCalls = 0;
+		const base = {
+			projectPath: project,
+			workingContainerName: "overlay-worker",
+			dirtyOverlayReceipt: receipt,
+			route: () => ({ provider: "claude", model: "fixture-model" }),
+			resolveDescriptor: () =>
+				descriptorForRoute({ provider: "claude", model: "fixture-model" }),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate,
+			adapters: {
+				claude: {
+					execute: () => {
+						providerCalls += 1;
+						return { success: true, output: "ok" };
+					},
+					captureDiff: () => diff,
+				},
+			},
+		};
+		const overlayTask = (id) => ({
+			id,
+			title: "overlay",
+			description: "overlay",
+			executor: "switchyard",
+			requiredPaths: ["src/changed.mjs"],
+			files: ["src/changed.mjs"],
+		});
+		const bytes = receipt.paths[0].bytes;
+
+		const first = executeTask(overlayTask("1.1"), base);
+		strictEqual(first.result, "success");
+		strictEqual(readFileSync(target, "utf8"), applied);
+		strictEqual(providerCalls, 1);
+		strictEqual(first.dirtyOverlayReceiptHash, receipt.receiptHash);
+		// Raw overlay bytes never reach a result projection.
+		strictEqual(JSON.stringify(first).includes(bytes), false);
+
+		const second = executeTask(overlayTask("1.2"), base);
+		strictEqual(second.result, "dirty_overlay_rejected");
+		strictEqual(second.reasonCode, "dirty_overlay_file_drift");
+		strictEqual(providerCalls, 1);
+		strictEqual(JSON.stringify(second).includes(bytes), false);
+	});
+
+	// The overlay is opt-in, so a queue that never asks for one must hash to the
+	// same queue identity it did before the feature existed. Emitting the overlay
+	// keys unconditionally would invalidate every in-flight checkpoint.
+	it("keeps overlay identity out of normalized run options until it is opted into", () => {
+		const off = normalizeRunOptions({
+			checkpointPath: "/tmp/q.checkpoint.json",
+		});
+		deepStrictEqual(Object.keys(off), [
+			"version",
+			"platform",
+			"maxTasks",
+			"checkpointPath",
+			"stopOnFailure",
+			"onlyProviders",
+			"excludeProviders",
+			"taskIds",
+		]);
+		deepStrictEqual(
+			normalizeRunOptions({
+				checkpointPath: "/tmp/q.checkpoint.json",
+				dirtyOverlay: false,
+			}),
+			off,
+		);
+		// The opt-in alone decides the shape. A stray receipt path or hash that
+		// dispatch preparation ignores because the opt-in is unset must not shift
+		// a non-overlay queue's identity.
+		deepStrictEqual(
+			normalizeRunOptions({
+				checkpointPath: "/tmp/q.checkpoint.json",
+				dirtyOverlayReceiptPath: "/tmp/stray.dirty-overlay.json",
+				dirtyOverlayReceiptHash: "b".repeat(64),
+			}),
+			off,
+		);
+
+		const hash = "a".repeat(64);
+		const on = normalizeRunOptions({
+			checkpointPath: "/tmp/q.checkpoint.json",
+			dirtyOverlay: true,
+			dirtyOverlayReceiptPath: "/tmp/q.checkpoint.json.dirty-overlay.json",
+			dirtyOverlayReceiptHash: hash,
+		});
+		strictEqual(on.dirtyOverlay, true);
+		strictEqual(on.dirtyOverlayReceiptHash, hash);
+		strictEqual(
+			normalizeRunOptions({
+				checkpointPath: "/tmp/q.checkpoint.json",
+				dirtyOverlay: true,
+				dirtyOverlayReceiptHash: "not-a-hash",
+			}).dirtyOverlayReceiptHash,
+			null,
+		);
+
+		const markdown =
+			"### Task 1.1: Overlay\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** d\n";
+		const tasksFilePath = join(TEST_DIR, "overlay-identity-tasks.md");
+		mkdirSync(TEST_DIR, { recursive: true });
+		writeFileSync(tasksFilePath, markdown);
+		const tasks = parseTaskQueue(markdown);
+		const identityFor = (runOptions) =>
+			createQueueIdentity({
+				tasksFilePath,
+				markdown,
+				tasks,
+				projectRevision: "deadbeef",
+				runOptions,
+			});
+		strictEqual(identityFor(off), identityFor({ ...off }));
+		notStrictEqual(identityFor(off), identityFor(on));
+	});
+
 	it("binds immutable sync context, preserves receivers, and rejects contradiction", () => {
 		const seen = [];
 		const backend = {

@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
+	integrationGate,
 	validateExactPathSet,
 	validateIntegratedCommitAncestry,
 	validateIntegratedCommitPaths,
@@ -23,6 +24,7 @@ import {
 	readLedgerFromStore,
 	recordExternalCompletionToStore,
 } from "../src/switchyard/ledger/index.mjs";
+import { captureDirtyOverlay } from "../src/switchyard/lifecycle/index.mjs";
 import {
 	acquireCheckpointLease,
 	claimCheckpointOwnership,
@@ -648,5 +650,51 @@ describe("external completion reconciliation", () => {
 			true,
 		);
 		deepStrictEqual(validateExactPathSet(["b", "a", "a"], ["a", "b"]).ok, true);
+	});
+});
+
+describe("dirty overlay integration identity", () => {
+	// A worker seeded from an overlay returns a patch whose preimage is the
+	// overlay bytes, not committed HEAD. The gate must apply it against the
+	// still-dirty host worktree and stamp the receipt that authorized it.
+	it("applies a patch over an overlay-dirty worktree and stamps the receipt", () => {
+		const data = fixture();
+		const target = join(data.project, "src", "changed.mjs");
+		const overlay = "export const done = true;\nexport const overlay = 1;\n";
+		const applied = "export const done = true;\nexport const overlay = 2;\n";
+
+		writeFileSync(target, overlay);
+		const receipt = captureDirtyOverlay(data.project, ["src/changed.mjs"]);
+		// Stage the overlay bytes so `git diff` yields an overlay -> result patch,
+		// then restore the worktree to exactly what the receipt captured.
+		git(data.project, "add", "src/changed.mjs");
+		writeFileSync(target, applied);
+		const diff = `${git(data.project, "diff", "--no-color")}\n`;
+		git(data.project, "reset", "-q");
+		writeFileSync(target, overlay);
+
+		const result = integrationGate(diff, data.project, {
+			requiredPaths: ["src/changed.mjs"],
+			dirtyOverlayReceiptHash: receipt.receiptHash,
+		});
+		strictEqual(result.success, true);
+		strictEqual(result.dirtyOverlayReceiptHash, receipt.receiptHash);
+		strictEqual(readFileSync(target, "utf8"), applied);
+	});
+
+	it("stamps the receipt on a refused integration and omits it when unused", () => {
+		const data = fixture();
+		const refused = integrationGate("", data.project, {
+			requiredPaths: ["src/changed.mjs"],
+			dirtyOverlayReceiptHash: "b".repeat(64),
+		});
+		strictEqual(refused.success, false);
+		strictEqual(refused.message, "empty_required_diff");
+		strictEqual(refused.dirtyOverlayReceiptHash, "b".repeat(64));
+
+		const plain = integrationGate("", data.project, {
+			requiredPaths: ["src/changed.mjs"],
+		});
+		strictEqual(Object.hasOwn(plain, "dirtyOverlayReceiptHash"), false);
 	});
 });

@@ -78,3 +78,6 @@ the exact next task ID, and the task-file SHA-256 bound to the captain manifest.
 The probe and activation seam are injectable for tests; production enforcement
 is default-on after the companion acceptance gate, with an explicit `false`
 dependency override retained for rollback.
+### Dirty tracked overlay supplement
+
+When enabled, a queue has exactly one immutable receipt for its declared tracked overlay. The receipt hash is part of normalized run options and queue identity, is persisted in `run.json`/checkpoint state, and is consumed by detached workers without recapture. Receipt publication is owner-only and create-only; source HEAD, file mode/link count/size, and bytes are revalidated before allocation and again before integration. Rejection is fail-closed and occurs before any provider call for untracked, ignored, symlinked, secret-shaped, duplicate, traversal, out-of-scope, or drifted input. Raw overlay bytes never appear in events, results, or run-store projections.

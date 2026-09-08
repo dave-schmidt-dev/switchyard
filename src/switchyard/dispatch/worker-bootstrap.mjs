@@ -543,10 +543,18 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		// in the runner — none of which run concurrently with a foreign live run.
 
 		const runner = await import("../runner/index.mjs");
+		const lifecycle = await import("../lifecycle/index.mjs");
 		const routeHealth = await import("../router/health.mjs");
 		const runQueueFn = runner.runQueueAsync;
 		QueueCleanupErrorType = runner.QueueCleanupError;
 		const persistedRunOptions = run.runOptions ?? null;
+		const dirtyOverlayReceipt =
+			persistedRunOptions?.dirtyOverlay === true &&
+			persistedRunOptions?.dirtyOverlayReceiptPath
+				? lifecycle.readDirtyOverlayReceipt(
+						persistedRunOptions.dirtyOverlayReceiptPath,
+					)
+				: null;
 		// Mark execution as started only after the provider-capable queue and route
 		// health modules are loaded. A boot failure before this boundary remains a
 		// pre-execution failure with startedAt unset.
@@ -583,6 +591,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 					}
 				: {}),
 			dependencies: {
+				dirtyOverlayReceipt,
 				persistDiagnosticArtifact: (evidence) =>
 					runStore.persistDiagnosticArtifact(runId, evidence),
 				signal: shutdown.signal,
@@ -787,6 +796,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								...(r.routeHealthBinding
 									? { attempt: r.routeHealthAttempt }
 									: {}),
+								...(r.reviewResult ? { reviewResult: r.reviewResult } : {}),
 							}
 						: {
 								phase: "execution",
@@ -807,6 +817,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								...(r.routeHealthBinding
 									? { attempt: r.routeHealthAttempt }
 									: {}),
+								...(r.reviewResult ? { reviewResult: r.reviewResult } : {}),
 								...(safeFailure ?? {}),
 							};
 					const fn = () =>

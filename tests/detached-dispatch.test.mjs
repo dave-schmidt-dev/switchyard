@@ -2,7 +2,7 @@
 // worker-bootstrap nonce handshake, project locks, and failure recording.
 // These spawn real Node subprocesses.
 
-import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
+import { deepStrictEqual, match, ok, rejects, strictEqual } from "node:assert";
 import { execFileSync, execSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -13,6 +13,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 
@@ -261,6 +262,32 @@ afterEach(() => {
 	}
 	rmSync(dir, { recursive: true, force: true });
 });
+
+// A real git project with exactly one dirty tracked file, matching the single
+// declared path of its queue. The shared fixture's projectDir is a bare .git
+// directory, which no overlay capture can read.
+function buildOverlayProject() {
+	const project = join(dir, "overlay-project");
+	mkdirSync(join(project, "src"), { recursive: true });
+	const git = (...args) =>
+		execFileSync("git", args, { cwd: project, stdio: "pipe" });
+	writeFileSync(join(project, "src", "a.mjs"), "export const value = 1;\n");
+	git("init", "-q");
+	git("config", "user.email", "test@example.invalid");
+	git("config", "user.name", "Test");
+	git("add", "src/a.mjs");
+	git("commit", "-qm", "base");
+	writeFileSync(join(project, "src", "a.mjs"), "export const value = 2;\n");
+	// Queue artifacts stay outside the project: the checkpoint and receipt are
+	// untracked, and an overlay capture rejects untracked content in scope.
+	const tasksPath = join(dir, "overlay-tasks.md");
+	writeFileSync(
+		tasksPath,
+		"### Task 1.1: Overlay task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+		"utf8",
+	);
+	return { project, tasksPath };
+}
 
 async function launchAndGetRunId() {
 	const result = runDispatch(
@@ -607,6 +634,141 @@ describe("launch returns before completion", () => {
 		strictEqual(run.runOptions.taskIds[0], "1.1");
 	});
 
+	// The overlay is captured once by the launching process. The detached worker
+	// must consume that receipt by path, so the launch record has to carry the
+	// path and the exact hash the worker will revalidate against.
+	it("binds a launch-time overlay receipt into the detached run options", async () => {
+		const { project, tasksPath } = buildOverlayProject();
+		const result = runDispatch(
+			["launch", tasksPath, "--project", project, "--dirty-overlay"],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 0, `launch failed: ${result.stderr}`);
+		const { runId } = JSON.parse(result.stdout.trim());
+		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
+		const run = await readRun(runId);
+		strictEqual(run.runOptions.dirtyOverlay, true);
+		const receiptPath = run.runOptions.dirtyOverlayReceiptPath;
+		strictEqual(receiptPath, `${tasksPath}.checkpoint.json.dirty-overlay.json`);
+		strictEqual(statSync(receiptPath).mode & 0o777, 0o600);
+		const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+		strictEqual(run.runOptions.dirtyOverlayReceiptHash, receipt.receiptHash);
+		deepStrictEqual(
+			receipt.paths.map((entry) => entry.path),
+			["src/a.mjs"],
+		);
+		strictEqual(
+			Buffer.from(receipt.paths[0].bytes, "base64").toString("utf8"),
+			"export const value = 2;\n",
+		);
+		// The run-store projection and the launch output carry the receipt hash,
+		// never the bytes it stands for.
+		strictEqual(JSON.stringify(run).includes(receipt.paths[0].bytes), false);
+		strictEqual(result.stdout.includes(receipt.paths[0].bytes), false);
+	});
+
+	// Receipt publication is create-only, so a second launch reuses whatever is
+	// on disk. Revalidate at launch: otherwise the parent exits 0 on a stale hash
+	// and the detached worker is the first thing to see the drift.
+	it("refuses to relaunch against a receipt the worktree has outgrown", () => {
+		const { project, tasksPath } = buildOverlayProject();
+		const first = runDispatch(
+			["launch", tasksPath, "--project", project, "--dirty-overlay"],
+			makeStateRootEnv(),
+		);
+		strictEqual(first.status, 0, `launch failed: ${first.stderr}`);
+		const receiptPath = `${tasksPath}.checkpoint.json.dirty-overlay.json`;
+		const before = readFileSync(receiptPath, "utf8");
+
+		writeFileSync(join(project, "src", "a.mjs"), "export const value = 3;\n");
+		const second = runDispatch(
+			["launch", tasksPath, "--project", project, "--dirty-overlay"],
+			makeStateRootEnv(),
+		);
+		ok(second.status !== 0, "a stale receipt must fail the launch");
+		match(second.stderr, /dirty_overlay_file_drift/u);
+		match(second.stderr, /remove .* to recapture/u);
+		strictEqual(readFileSync(receiptPath, "utf8"), before);
+	});
+
+	it("refuses to launch an overlay with undeclared dirty content", () => {
+		const { project, tasksPath } = buildOverlayProject();
+		writeFileSync(join(project, "src", "b.mjs"), "export const extra = 1;\n");
+		execFileSync("git", ["add", "src/b.mjs"], { cwd: project, stdio: "pipe" });
+		execFileSync("git", ["commit", "-qm", "add b"], {
+			cwd: project,
+			stdio: "pipe",
+		});
+		writeFileSync(join(project, "src", "b.mjs"), "export const extra = 2;\n");
+
+		const result = runDispatch(
+			["launch", tasksPath, "--project", project, "--dirty-overlay"],
+			makeStateRootEnv(),
+		);
+		ok(result.status !== 0, "undeclared dirty content must fail the launch");
+		ok(
+			/out-of-scope|src\/b\.mjs/.test(`${result.stderr}${result.stdout}`),
+			`expected an out-of-scope rejection, got: ${result.stderr}`,
+		);
+		strictEqual(
+			existsSync(`${tasksPath}.checkpoint.json.dirty-overlay.json`),
+			false,
+		);
+	});
+
+	// A queue whose checkpoint or receipt lands inside the project would capture
+	// cleanly on the first launch and then fail every task, because the files it
+	// wrote during the run are themselves untracked strays the scope check
+	// refuses. Refuse at launch instead, before either file exists.
+	it("refuses an overlay whose checkpoint would land inside the project", () => {
+		const { project } = buildOverlayProject();
+		const inProjectTasks = join(project, "queue.md");
+		writeFileSync(
+			inProjectTasks,
+			"### Task 1.1: Overlay task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "queue.md"], { cwd: project, stdio: "pipe" });
+		execFileSync("git", ["commit", "-qm", "queue"], {
+			cwd: project,
+			stdio: "pipe",
+		});
+
+		const result = runDispatch(
+			["launch", inProjectTasks, "--project", project, "--dirty-overlay"],
+			makeStateRootEnv(),
+		);
+		ok(result.status !== 0, "an in-project checkpoint must fail the launch");
+		match(result.stderr, /outside the project or be ignored/u);
+		strictEqual(
+			existsSync(`${inProjectTasks}.checkpoint.json.dirty-overlay.json`),
+			false,
+		);
+	});
+
+	// `Files:` is optional for review work, so a review task in an overlay queue
+	// declares nothing and its empty path list satisfies the per-task scope check
+	// vacuously. One undeclared task refuses the whole queue.
+	it("refuses an overlay queue containing a task that declares no files", () => {
+		const { project, tasksPath } = buildOverlayProject();
+		writeFileSync(
+			tasksPath,
+			`${readFileSync(tasksPath, "utf8")}\n### Task 1.2: Review task\n- **Status:** pending\n- **Executor:** switchyard\n- **Type:** review\n- **Description:** A review\n`,
+			"utf8",
+		);
+
+		const result = runDispatch(
+			["launch", tasksPath, "--project", project, "--dirty-overlay"],
+			makeStateRootEnv(),
+		);
+		ok(result.status !== 0, "an undeclared task must fail the launch");
+		match(result.stderr, /task 1\.2 declares none/u);
+		strictEqual(
+			existsSync(`${tasksPath}.checkpoint.json.dirty-overlay.json`),
+			false,
+		);
+	});
+
 	it("quarantines malformed records during the awaited worker startup sweep without touching a sibling launch", async () => {
 		const { initializeRun, readRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -946,6 +1108,150 @@ export async function resolve(specifier, context, nextResolve) {
 		strictEqual(disposition.taskId, "2.1");
 		strictEqual(disposition.taskFileSha256, "a".repeat(64));
 	});
+
+	// The synchronous dispatch path forwards `reviewResult` onto the terminal
+	// event, which is the only way `lastReviewResult` is ever projected. A
+	// detached worker that dropped it produced a run whose review verdict was
+	// permanently absent even though the review itself ran. The worker builds
+	// the completed and failed events separately, so both shapes are pinned.
+	for (const outcome of [
+		{
+			label: "completed",
+			success: true,
+			event: "task_completed",
+			result: "review_completed",
+			verdict:
+				'{ verdict: "approved", summary: "one finding raised", findings: [{ severity: "medium", title: "unbounded receipt reuse", path: "src/switchyard/dispatch/index.mjs", line: 12 }], comments: [], rawOutput: "SECRET_CANARY_REVIEW_OUTPUT" }',
+			expected: { status: "available", verdict: "findings", findingCount: 1 },
+		},
+		{
+			label: "failed",
+			success: false,
+			event: "task_failed",
+			result: "review_unavailable",
+			verdict:
+				'{ verdict: "unknown", reason: "provider_failed", rawOutput: "SECRET_CANARY_REVIEW_OUTPUT" }',
+			expected: {
+				status: "unavailable",
+				verdict: "unavailable",
+				findingCount: 0,
+			},
+		},
+	])
+		it(`carries a review verdict onto the detached ${outcome.label} event`, async () => {
+			const { initializeRun, readEvents, readRun } = await import(
+				"../src/switchyard/run-store/index.mjs"
+			);
+			const runId = randomUUID();
+			const nonce = randomUUID();
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "git:no-head:unknown",
+				workerNonce: nonce,
+				launchArgs: [],
+			});
+
+			const fakeRunnerPath = join(
+				dir,
+				`review-fake-runner-${outcome.label}.mjs`,
+			);
+			writeFileSync(
+				fakeRunnerPath,
+				`export class QueueCleanupError extends Error {}
+export async function runQueueAsync(options) {
+  const dependencies = options.dependencies;
+  const outcome = {
+    taskId: "1.1",
+    success: ${outcome.success},
+    result: "${outcome.result}",
+    provider: "opencode",
+    model: "fake-model",
+    reviewResult: ${outcome.verdict},
+  };
+  dependencies.onResult?.(outcome);
+  return {
+    success: ${outcome.success},
+    totalTasks: 1,
+    runnableTasks: 1,
+    processedTasks: 1,
+    completedTaskIds: ${outcome.success ? '["1.1"]' : "[]"},
+    deferredTaskIds: [],
+    results: [outcome],
+  };
+}
+`,
+				"utf8",
+			);
+			const loaderPath = join(dir, `review-runner-loader-${outcome.label}.mjs`);
+			writeFileSync(
+				loaderPath,
+				`const target = process.env.SWITCHYARD_TEST_RUNNER_URL;
+const replacement = process.env.SWITCHYARD_TEST_FAKE_RUNNER_URL;
+export async function resolve(specifier, context, nextResolve) {
+  const candidate = new URL(specifier, context.parentURL).href;
+  if (candidate === target) return { url: replacement, shortCircuit: true };
+  return nextResolve(specifier, context, nextResolve);
+}
+`,
+				"utf8",
+			);
+
+			const worker = spawnSync(
+				process.execPath,
+				[
+					"--experimental-loader",
+					pathToFileURL(loaderPath).href,
+					BOOTSTRAP_PATH,
+					"--state-root",
+					stateRoot,
+					"--run-id",
+					runId,
+					"--nonce",
+					nonce,
+				],
+				{
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "pipe"],
+					timeout: 10_000,
+					env: {
+						...process.env,
+						...makeStateRootEnv(),
+						SWITCHYARD_TEST_RUNNER_URL: pathToFileURL(
+							resolve(__dirname, "../src/switchyard/runner/index.mjs"),
+						).href,
+						SWITCHYARD_TEST_FAKE_RUNNER_URL: pathToFileURL(fakeRunnerPath).href,
+					},
+				},
+			);
+
+			strictEqual(worker.status, 0, worker.stderr);
+			const events = await readEvents(runId);
+			const terminal = events.find((event) => event.event === outcome.event);
+			ok(terminal, `no ${outcome.event} event: ${JSON.stringify(events)}`);
+			strictEqual(terminal.reviewResult.status, outcome.expected.status);
+			strictEqual(terminal.reviewResult.verdict, outcome.expected.verdict);
+			strictEqual(
+				terminal.reviewResult.findingCount,
+				outcome.expected.findingCount,
+			);
+			strictEqual(terminal.reviewResult.sourceMutationCount, 0);
+			// Projection is by approved key, so an unapproved provider field on
+			// the verdict is dropped rather than carried into durable state.
+			strictEqual(terminal.reviewResult.rawOutput, undefined);
+			const run = await readRun(runId);
+			strictEqual(run.lastReviewResult?.verdict, outcome.expected.verdict);
+			strictEqual(
+				run.lastReviewResult?.findingCount,
+				outcome.expected.findingCount,
+			);
+			strictEqual(
+				JSON.stringify(run).includes("SECRET_CANARY_REVIEW_OUTPUT"),
+				false,
+			);
+		});
 
 	it("persists only stages reached before a real worker SIGTERM", async () => {
 		const { initializeRun, readEvents, readRun, resolveDiagnosticArtifact } =

@@ -778,7 +778,7 @@ function getScopedFingerprint(projectPath, touchedPaths) {
  *   structural_error?: string, alreadyApplied?: boolean, reason?: string,
  *   reasonKind?: "corrupt_patch"|"conflict"}} Result
  */
-export function integrationGate(diff, projectPath, options = {}) {
+function integrationGateUnsafe(diff, projectPath, options = {}) {
 	const { requiredPaths = null } = options;
 
 	// Required-paths: empty diff check runs BEFORE patch normalization so we
@@ -965,6 +965,15 @@ export function integrationGate(diff, projectPath, options = {}) {
 	}
 	if (applyResult && typeof applyResult.reasonKind === "string") {
 		result.reasonKind = applyResult.reasonKind;
+	}
+	return result;
+}
+
+/** Add the immutable dirty-input identity to every integration outcome. */
+export function integrationGate(diff, projectPath, options = {}) {
+	const result = integrationGateUnsafe(diff, projectPath, options);
+	if (typeof options.dirtyOverlayReceiptHash === "string") {
+		result.dirtyOverlayReceiptHash = options.dirtyOverlayReceiptHash;
 	}
 	return result;
 }

@@ -108,11 +108,14 @@ import {
 	runWorkspaceLifecycleHook,
 } from "../lifecycle/hooks.mjs";
 import {
+	captureDirtyOverlay,
 	captureTaskStartTree,
 	captureTaskStartTreeAsync,
+	readDirtyOverlayReceipt,
 	releaseTaskStartTree,
 	releaseTaskStartTreeAsync,
 	seedProjectWithBackend,
+	validateDirtyOverlayReceipt,
 	validateTaskStartTree,
 	validateTaskStartTreeAsync,
 } from "../lifecycle/index.mjs";
@@ -249,6 +252,25 @@ export function normalizeRunOptions(options = {}) {
 			options.taskIds ?? options.selectedTaskIds ?? [],
 			"runOptions.taskIds",
 		),
+		// Overlay identity is present only when the opt-in is exercised, and the
+		// opt-in alone decides it. Emitting these keys unconditionally, or on a
+		// stray receipt path that the dispatch preparation ignores because the
+		// opt-in is unset, would change the normalized shape — and so the
+		// queue-identity hash — for a queue that never asked for an overlay,
+		// invalidating in-flight checkpoints written before the feature existed.
+		...(options.dirtyOverlay === true
+			? {
+					dirtyOverlay: options.dirtyOverlay === true,
+					dirtyOverlayReceiptPath: options.dirtyOverlayReceiptPath
+						? resolve(options.dirtyOverlayReceiptPath)
+						: null,
+					dirtyOverlayReceiptHash:
+						typeof options.dirtyOverlayReceiptHash === "string" &&
+						/^[a-f0-9]{64}$/u.test(options.dirtyOverlayReceiptHash)
+							? options.dirtyOverlayReceiptHash
+							: null,
+				}
+			: {}),
 	};
 }
 
@@ -1550,6 +1572,7 @@ function isIdentityRequested(options) {
 	return (
 		options.queueIdentity != null ||
 		options.runOptions != null ||
+		options.dirtyOverlay === true ||
 		(options.taskIds ?? []).length > 0
 	);
 }
@@ -3180,6 +3203,8 @@ function validateCheckpointV3(
 	}
 	for (const [taskId, intent] of Object.entries(parsed.integrationIntents)) {
 		const operation = intent?.operation;
+		const expectedReceiptHash =
+			expected?.runOptions?.dirtyOverlayReceiptHash ?? null;
 		if (
 			!intent ||
 			!operation ||
@@ -3195,6 +3220,10 @@ function validateCheckpointV3(
 			!/^[a-f0-9]{64}$/.test(operation.patchHash) ||
 			!Array.isArray(operation.paths) ||
 			operation.paths.some((path) => typeof path !== "string" || !path) ||
+			(operation.dirtyOverlayReceiptHash != null &&
+				!/^[a-f0-9]{64}$/u.test(operation.dirtyOverlayReceiptHash)) ||
+			(expectedReceiptHash != null &&
+				operation.dirtyOverlayReceiptHash !== expectedReceiptHash) ||
 			!["pending", "completed"].includes(intent.status) ||
 			typeof intent.beforeState !== "string" ||
 			!/^[a-f0-9]{64}$/.test(intent.beforeState) ||
@@ -3329,7 +3358,9 @@ function validateCheckpointTaskBases(parsed) {
 					typeof helper[field] === "string" && helper[field].length > 0,
 			) ||
 			(helper.processStartIdentity !== null &&
-				typeof helper.processStartIdentity !== "string")
+				typeof helper.processStartIdentity !== "string") ||
+			(base.dirtyOverlayReceiptHash != null &&
+				!/^[a-f0-9]{64}$/u.test(base.dirtyOverlayReceiptHash))
 		)
 			throw new Error("checkpoint has invalid persisted task base");
 	}
@@ -4299,6 +4330,74 @@ function declaredPathNotSeededResult(task, requiredCapability) {
 	};
 }
 
+function dirtyOverlayResult(task, context, requiredCapability) {
+	if (!context.dirtyOverlayReceipt) return null;
+	const checked = validateDirtyOverlayReceipt(
+		context.projectPath,
+		context.dirtyOverlayReceipt,
+	);
+	const receiptPaths = new Set(
+		context.dirtyOverlayReceipt.paths?.map((entry) => entry.path) ?? [],
+	);
+	// An empty `requiredPaths` passes `.every()` vacuously, which would admit a
+	// task that declared nothing into a workspace seeded with overlay bytes.
+	// Every task in an overlay queue declares its own scope or is refused.
+	const requiredPaths = task.requiredPaths ?? [];
+	if (
+		checked.ok &&
+		requiredPaths.length > 0 &&
+		requiredPaths.every((path) => receiptPaths.has(path))
+	)
+		return null;
+	const reason = checked.ok ? "dirty_overlay_scope_mismatch" : checked.reason;
+	context.onStatus?.({
+		phase: "preflight",
+		event: "dirty_overlay_rejected",
+		status: "Dirty overlay rejected before provider allocation",
+		taskId: task.id,
+		reasonCode: reason,
+	});
+	return {
+		taskId: task.id,
+		success: false,
+		provider: null,
+		model: null,
+		requiredCapability,
+		result: "dirty_overlay_rejected",
+		errorKind: "queue_contract",
+		reasonCode: reason,
+		dirtyOverlayReceiptHash: context.dirtyOverlayReceipt.receiptHash,
+	};
+}
+
+function decorateDirtyOverlayResult(result, context) {
+	if (context?.dirtyOverlayReceipt && result && typeof result === "object") {
+		result.dirtyOverlayReceiptHash = context.dirtyOverlayReceipt.receiptHash;
+	}
+	return result;
+}
+
+function dirtyOverlayIntegrationGate(context) {
+	if (!context.dirtyOverlayReceipt) return null;
+	const checked = validateDirtyOverlayReceipt(
+		context.projectPath,
+		context.dirtyOverlayReceipt,
+	);
+	if (checked.ok) return null;
+	context.onStatus?.({
+		phase: "integration",
+		event: "dirty_overlay_rejected",
+		status: "Dirty overlay drifted before integration",
+		reasonCode: checked.reason,
+	});
+	return {
+		success: false,
+		message: "Dirty overlay changed before integration",
+		reason: "dirty_overlay_drift",
+		reasonKind: "dirty_overlay_drift",
+	};
+}
+
 function failureMetadataFor(result, partialDiffPath) {
 	return sanitizeFailureMetadata({
 		taskId: result.taskId,
@@ -5148,13 +5247,16 @@ function integrationOperation(context, task, diff) {
 		existing.operation?.patchHash === patchHash &&
 		existing.operation?.baseTree === baseTree &&
 		JSON.stringify(existing.operation?.paths) ===
-			JSON.stringify(task.requiredPaths ?? [])
+			JSON.stringify(task.requiredPaths ?? []) &&
+		(existing.operation?.dirtyOverlayReceiptHash ?? null) ===
+			(context.dirtyOverlayReceipt?.receiptHash ?? null)
 	) {
 		return {
 			...existing.operation,
 			baseTree,
 			patchHash,
 			paths: [...(task.requiredPaths ?? [])],
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
 		};
 	}
 	return {
@@ -5164,6 +5266,7 @@ function integrationOperation(context, task, diff) {
 		baseTree,
 		patchHash,
 		paths: [...(task.requiredPaths ?? [])],
+		dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
 	};
 }
 
@@ -5174,7 +5277,9 @@ function sameIntegrationOperation(left, right) {
 		left?.attempt === right?.attempt &&
 		left?.baseTree === right?.baseTree &&
 		left?.patchHash === right?.patchHash &&
-		JSON.stringify(left?.paths) === JSON.stringify(right?.paths)
+		JSON.stringify(left?.paths) === JSON.stringify(right?.paths) &&
+		(left?.dirtyOverlayReceiptHash ?? null) ===
+			(right?.dirtyOverlayReceiptHash ?? null)
 	);
 }
 
@@ -5248,6 +5353,12 @@ function checkpointIntegrationIntent(context, task, diff) {
 function prepareTaskBase(context, task, cleanupContext) {
 	try {
 		const existing = context.taskBases?.[task.id] ?? null;
+		if (
+			existing &&
+			(existing.dirtyOverlayReceiptHash ?? null) !==
+				(context.dirtyOverlayReceipt?.receiptHash ?? null)
+		)
+			throw new Error("dirty overlay receipt changed for persisted task base");
 		const helperContext = mergeAttemptCleanupContext(cleanupContext, {
 			operation: "helper",
 		});
@@ -5263,7 +5374,11 @@ function prepareTaskBase(context, task, cleanupContext) {
 					taskId: task.id,
 					...taskBaseProbeOptions(context, helperContext),
 				});
-		const recordedBase = existing ?? { ...base, cleanupContext: helperContext };
+		const recordedBase = existing ?? {
+			...base,
+			cleanupContext: helperContext,
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
+		};
 		context.persistTaskBase?.(task.id, recordedBase);
 		context._activeTaskBase = recordedBase;
 		context._activeTaskHelperContext = helperContext;
@@ -5282,6 +5397,12 @@ function prepareTaskBase(context, task, cleanupContext) {
 async function prepareTaskBaseAsync(context, task, cleanupContext) {
 	try {
 		const existing = context.taskBases?.[task.id] ?? null;
+		if (
+			existing &&
+			(existing.dirtyOverlayReceiptHash ?? null) !==
+				(context.dirtyOverlayReceipt?.receiptHash ?? null)
+		)
+			throw new Error("dirty overlay receipt changed for persisted task base");
 		const helperContext = mergeAttemptCleanupContext(cleanupContext, {
 			operation: "helper",
 		});
@@ -5303,7 +5424,11 @@ async function prepareTaskBaseAsync(context, task, cleanupContext) {
 					taskId: task.id,
 					...taskBaseProbeOptions(context, helperContext),
 				});
-		const recordedBase = existing ?? { ...base, cleanupContext: helperContext };
+		const recordedBase = existing ?? {
+			...base,
+			cleanupContext: helperContext,
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
+		};
 		context.persistTaskBase?.(task.id, recordedBase);
 		context._activeTaskBase = recordedBase;
 		context._activeTaskHelperContext = helperContext;
@@ -5865,6 +5990,8 @@ function executeTaskUnsafe(task, context) {
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
 	}
+	const overlayFailure = dirtyOverlayResult(task, context, requiredCapability);
+	if (overlayFailure) return overlayFailure;
 	// Primary and quota-fallback invocations each own their configured timeout.
 	// A completion continuation sets _completionPin and intentionally retains the
 	// primary invocation's already-running absolute deadline.
@@ -6540,12 +6667,15 @@ function executeTaskUnsafe(task, context) {
 		};
 	}
 
-	const gateResult = context.integrationGate(diff, context.projectPath, {
-		requiredPaths: task.requiredPaths,
-		allowSensitiveManifests:
-			task.type === "implementation" && task.allowManifests === true,
-		integrationIntent: checkpointIntegrationIntent(context, task, diff),
-	});
+	const gateResult =
+		dirtyOverlayIntegrationGate(context) ??
+		context.integrationGate(diff, context.projectPath, {
+			requiredPaths: task.requiredPaths,
+			allowSensitiveManifests:
+				task.type === "implementation" && task.allowManifests === true,
+			integrationIntent: checkpointIntegrationIntent(context, task, diff),
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
+		});
 	const alreadyApplied = gateResult?.alreadyApplied === true;
 	const success = Boolean(gateResult?.success) || alreadyApplied;
 	const terminalResult = success ? "success" : "integration_failed";
@@ -6650,7 +6780,10 @@ export function executeTask(task, context) {
 		context._activeProviderExecutionSucceeded = false;
 		context._activeCompletionLifecycleReceipt = null;
 	}
-	return attachRouteHealthTerminal(executeTaskUnsafe(task, context), context);
+	return decorateDirtyOverlayResult(
+		attachRouteHealthTerminal(executeTaskUnsafe(task, context), context),
+		context,
+	);
 }
 
 /**
@@ -6665,8 +6798,11 @@ export async function executeTaskAsync(task, context) {
 	context._activeCompletionLifecycleReceipt = null;
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	try {
-		return attachRouteHealthTerminal(
-			await executeTaskAsyncUnsafe(task, context),
+		return decorateDirtyOverlayResult(
+			attachRouteHealthTerminal(
+				await executeTaskAsyncUnsafe(task, context),
+				context,
+			),
 			context,
 		);
 	} catch (error) {
@@ -6706,6 +6842,7 @@ export async function executeTaskAsync(task, context) {
 			requiredCapability,
 			result: "execution_failed",
 			...failure,
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
 		};
 	} finally {
 		clearAsyncTaskContext(context);
@@ -6760,6 +6897,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
 	}
+	const overlayFailure = dirtyOverlayResult(task, context, requiredCapability);
+	if (overlayFailure) return overlayFailure;
 	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
 	const ignoredPath = checkIgnored(
 		task.requiredPaths ?? task.files,
@@ -7602,12 +7741,15 @@ async function executeTaskAsyncUnsafe(task, context) {
 			...survivingProviderFields(execution),
 		};
 	}
-	const gateResult = context.integrationGate(diff, context.projectPath, {
-		requiredPaths: task.requiredPaths,
-		allowSensitiveManifests:
-			task.type === "implementation" && task.allowManifests === true,
-		integrationIntent: checkpointIntegrationIntent(context, task, diff),
-	});
+	const gateResult =
+		dirtyOverlayIntegrationGate(context) ??
+		context.integrationGate(diff, context.projectPath, {
+			requiredPaths: task.requiredPaths,
+			allowSensitiveManifests:
+				task.type === "implementation" && task.allowManifests === true,
+			integrationIntent: checkpointIntegrationIntent(context, task, diff),
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
+		});
 	const alreadyApplied = gateResult?.alreadyApplied === true;
 	const success = Boolean(gateResult?.success) || alreadyApplied;
 	const terminalResult = success ? "success" : "integration_failed";
@@ -7711,6 +7853,7 @@ export async function runQueueAsync(options) {
 	});
 	const {
 		queueBackend,
+		dirtyOverlayReceipt,
 		selectedPlatform,
 		tasks,
 		checkpoint,
@@ -7746,6 +7889,11 @@ export async function runQueueAsync(options) {
 	let queueResult = null;
 	try {
 		if (!workingContainerName) {
+			assertDirtyOverlayReceiptCurrent(
+				projectPath,
+				dirtyOverlayReceipt,
+				"immediately before allocation",
+			);
 			queueBackend.ensureAgentContainer();
 			workingContainerName = queueBackend.create(projectPath, {
 				runId,
@@ -7775,7 +7923,9 @@ export async function runQueueAsync(options) {
 					`runQueueAsync: credential provisioning failed, continuing unauthenticated: ${error.message}`,
 				);
 			}
-			queueBackend.seed(workingContainerName, projectPath);
+			queueBackend.seed(workingContainerName, projectPath, {
+				dirtyOverlayReceipt,
+			});
 			queueBackend.afterCreate?.(workingContainerName, projectPath, {
 				onStatus: dependencies.onStatus,
 			});
@@ -7824,6 +7974,7 @@ export async function runQueueAsync(options) {
 		healthDecision: resolveQueueHealthDecision(dependencies),
 		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
+		dirtyOverlayReceipt,
 		checkpointPath,
 		taskFileSha256,
 		taskBases: checkpoint.taskBases,
@@ -8061,6 +8212,7 @@ export async function runQueueAsync(options) {
 				deferredTaskIds.push(result.taskId);
 				break;
 			}
+			decorateDirtyOverlayResult(result, context);
 			if (
 				!retryState &&
 				result._routeHealthTrialStarted !== true &&
@@ -8234,6 +8386,7 @@ export async function runQueueAsync(options) {
 						}
 					: {}),
 				success: result.success,
+				dirtyOverlayReceiptHash: result.dirtyOverlayReceiptHash ?? null,
 				timedOut: Boolean(result.timedOut),
 				// The host path is transient; safeFailure carries only its opaque
 				// artifactRef into the durable checkpoint.
@@ -8365,7 +8518,7 @@ export async function runQueueAsync(options) {
  * @param {object} context
  * @returns {Promise<object>}
  */
-export async function executeTaskWithOrchestrator(task, context) {
+async function executeTaskWithOrchestratorUnsafe(task, context) {
 	context._activeRouteHealth = null;
 	context._activeProviderExecutionSucceeded = false;
 	context._activeCompletionLifecycleReceipt = null;
@@ -8374,6 +8527,8 @@ export async function executeTaskWithOrchestrator(task, context) {
 	if (executor !== "switchyard") {
 		return nonSwitchyardExecutorResult(task, executor, requiredCapability);
 	}
+	const overlayFailure = dirtyOverlayResult(task, context, requiredCapability);
+	if (overlayFailure) return overlayFailure;
 	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
 	const ignoredPath = checkIgnored(
 		task.requiredPaths ?? task.files,
@@ -8903,12 +9058,15 @@ export async function executeTaskWithOrchestrator(task, context) {
 		};
 	}
 
-	const gateResult = context.integrationGate(diff, context.projectPath, {
-		requiredPaths: task.requiredPaths,
-		allowSensitiveManifests:
-			task.type === "implementation" && task.allowManifests === true,
-		integrationIntent: checkpointIntegrationIntent(context, task, diff),
-	});
+	const gateResult =
+		dirtyOverlayIntegrationGate(context) ??
+		context.integrationGate(diff, context.projectPath, {
+			requiredPaths: task.requiredPaths,
+			allowSensitiveManifests:
+				task.type === "implementation" && task.allowManifests === true,
+			integrationIntent: checkpointIntegrationIntent(context, task, diff),
+			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
+		});
 	const alreadyApplied = gateResult?.alreadyApplied === true;
 	const success = Boolean(gateResult?.success) || alreadyApplied;
 	const terminalResult = success ? "success" : "integration_failed";
@@ -10300,8 +10458,8 @@ export function createQueueBackend({
 		// no runtime credential-provisioning step; each adapter's own auth
 		// check decides at exec time.
 		provision: dependencies.provisionCredentials ?? (() => null),
-		seed: (workspaceId, path) =>
-			seedProjectWithBackend(executionBackend, workspaceId, path),
+		seed: (workspaceId, path, options = {}) =>
+			seedProjectWithBackend(executionBackend, workspaceId, path, options),
 		afterCreate: (workspaceId, path, options = {}) =>
 			runWorkspaceLifecycleHook(
 				executionBackend,
@@ -10379,6 +10537,49 @@ function queuePlatform(options) {
 	);
 }
 
+function prepareDirtyOverlayReceipt({
+	projectPath,
+	tasks,
+	potentialAttemptTasks,
+	runOptions,
+	dependencies,
+}) {
+	if (
+		runOptions?.dirtyOverlay !== true &&
+		dependencies.dirtyOverlay !== true &&
+		!dependencies.dirtyOverlayReceipt
+	)
+		return null;
+	const supplied = dependencies.dirtyOverlayReceipt;
+	const receipt =
+		supplied ??
+		(runOptions?.dirtyOverlayReceiptPath
+			? readDirtyOverlayReceipt(runOptions.dirtyOverlayReceiptPath)
+			: null);
+	const paths = [
+		...new Set(
+			(potentialAttemptTasks.length > 0
+				? potentialAttemptTasks
+				: tasks
+			).flatMap((task) => task.requiredPaths ?? []),
+		),
+	];
+	if (paths.length === 0)
+		throw new Error("dirty overlay requires exact declared task paths");
+	if (!receipt) return captureDirtyOverlay(projectPath, paths);
+	const validation = validateDirtyOverlayReceipt(projectPath, receipt, paths);
+	if (!validation.ok)
+		throw new Error(`dirty overlay receipt rejected: ${validation.reason}`);
+	return receipt;
+}
+
+function assertDirtyOverlayReceiptCurrent(projectPath, receipt, phase) {
+	if (!receipt) return;
+	const validation = validateDirtyOverlayReceipt(projectPath, receipt);
+	if (!validation.ok)
+		throw new Error(`dirty overlay drift ${phase}: ${validation.reason}`);
+}
+
 function prepareQueueLaunch({
 	tasksFilePath,
 	projectPath,
@@ -10405,11 +10606,12 @@ function prepareQueueLaunch({
 	if (tasks.length === 0) {
 		throwOnEmptyParse(tasksFilePath, checkpointPath, onStatus);
 	}
+	let dirtyOverlayReceipt = null;
 	// Read the checkpoint before backend selection so malformed or stale queue
 	// state fails without creating a workspace or reserving a VM slot.
 	const checkpointExisted = existsSync(checkpointPath);
 	const observedCheckpoint = loadCheckpoint(checkpointPath, tasksFilePath);
-	const identity = resolveQueueIdentity(
+	let identity = resolveQueueIdentity(
 		{
 			tasksFilePath,
 			projectPath,
@@ -10496,6 +10698,40 @@ function prepareQueueLaunch({
 		if (!(error instanceof TaskSelectionError)) throw error;
 		potentialAttemptTasks = [];
 	}
+	dirtyOverlayReceipt = prepareDirtyOverlayReceipt({
+		projectPath,
+		tasks,
+		potentialAttemptTasks,
+		runOptions: identity.runOptions ?? runOptions,
+		dependencies,
+	});
+	if (
+		dirtyOverlayReceipt &&
+		(identity.runOptions?.dirtyOverlayReceiptHash ?? null) !==
+			dirtyOverlayReceipt.receiptHash
+	) {
+		runOptions = {
+			...(runOptions ?? {}),
+			dirtyOverlayReceiptHash: dirtyOverlayReceipt.receiptHash,
+		};
+		identity = resolveQueueIdentity(
+			{
+				tasksFilePath,
+				projectPath,
+				checkpointPath,
+				maxTasks,
+				stopOnFailure,
+				exclude,
+				only,
+				taskIds: identityTaskIds,
+				platform: selectedPlatform,
+				runOptions,
+				queueIdentity,
+				projectRevision,
+			},
+			tasks,
+		);
+	}
 	const hostPower = readQueueHostPower({
 		hostPowerProbe: dependencies.hostPowerProbe,
 		execFn: dependencies.hostPowerExecFn,
@@ -10561,6 +10797,11 @@ function prepareQueueLaunch({
 			onStatus,
 		});
 	}
+	assertDirtyOverlayReceiptCurrent(
+		projectPath,
+		dirtyOverlayReceipt,
+		"before allocation",
+	);
 	const slotLease =
 		selectedPlatform === "macos" && !deferSlotAcquisition
 			? queueBackend.acquireSlot({ runId })
@@ -10572,6 +10813,7 @@ function prepareQueueLaunch({
 		taskFileSha256,
 		identity,
 		queueBackend,
+		dirtyOverlayReceipt,
 		slotLease,
 		effectiveMaxTasks,
 		effectiveStopOnFailure,
@@ -10777,6 +11019,7 @@ export function runQueue(options) {
 	});
 	const {
 		queueBackend,
+		dirtyOverlayReceipt,
 		selectedPlatform,
 		slotLease,
 		tasks,
@@ -10806,6 +11049,11 @@ export function runQueue(options) {
 	let uninstallSignalCleanup = null;
 	try {
 		if (!workingContainerName) {
+			assertDirtyOverlayReceiptCurrent(
+				projectPath,
+				dirtyOverlayReceipt,
+				"immediately before allocation",
+			);
 			queueBackend.ensureAgentContainer();
 			// Pass runId so the cloned VM's name embeds it (see
 			// buildParallelsWorkingName) — that embedding is the only ownership
@@ -10970,7 +11218,9 @@ export function runQueue(options) {
 	try {
 		if (ownsWorkingContainer) {
 			try {
-				queueBackend.seed(workingContainerName, projectPath);
+				queueBackend.seed(workingContainerName, projectPath, {
+					dirtyOverlayReceipt,
+				});
 				queueBackend.afterCreate?.(workingContainerName, projectPath, {
 					onStatus: emitStatus,
 				});
@@ -11331,6 +11581,7 @@ export function runQueue(options) {
 				policyDeferred = result.policyDeferred;
 				break;
 			}
+			decorateDirtyOverlayResult(result, context);
 			if (isRouteHealthDeferredResult(result)) {
 				deferredTaskIds.push(result.taskId);
 				reportRouteHealthDeferred(result, onResult, emitStatus);
@@ -11476,6 +11727,7 @@ export function runQueue(options) {
 						}
 					: {}),
 				success: result.success,
+				dirtyOverlayReceiptHash: result.dirtyOverlayReceiptHash ?? null,
 				timedOut: Boolean(result.timedOut),
 				partialDiffPath: null,
 				...(safeFailure ?? {}),
@@ -11711,6 +11963,14 @@ export function runQueue(options) {
 	}
 }
 
+/** Preserve the same receipt identity on direct orchestrator callers. */
+export async function executeTaskWithOrchestrator(task, context) {
+	return decorateDirtyOverlayResult(
+		await executeTaskWithOrchestratorUnsafe(task, context),
+		context,
+	);
+}
+
 /**
  * Run queue serially by supervising headless orchestrator jobs with poll/wait.
  * @param {object} options
@@ -11774,6 +12034,7 @@ export async function runQueueWithOrchestrator(options) {
 	});
 	const {
 		queueBackend,
+		dirtyOverlayReceipt,
 		selectedPlatform,
 		slotLease,
 		tasks,
@@ -11803,6 +12064,11 @@ export async function runQueueWithOrchestrator(options) {
 	let uninstallSignalCleanup = null;
 	try {
 		if (!workingContainerName) {
+			assertDirtyOverlayReceiptCurrent(
+				projectPath,
+				dirtyOverlayReceipt,
+				"immediately before allocation",
+			);
 			queueBackend.ensureAgentContainer();
 			// Pass runId so the container is labeled managed + run_id (see runQueue).
 			workingContainerName = queueBackend.create(projectPath, {
@@ -11887,6 +12153,7 @@ export async function runQueueWithOrchestrator(options) {
 		healthDecision: resolveQueueHealthDecision(dependencies),
 		onHealthDecision: dependencies.onHealthDecision,
 		checkpoint,
+		dirtyOverlayReceipt,
 		checkpointPath,
 		taskFileSha256,
 		runId: queueBackend.taskBaseRunId ?? runId,
@@ -11921,7 +12188,9 @@ export async function runQueueWithOrchestrator(options) {
 	try {
 		if (ownsWorkingContainer) {
 			try {
-				queueBackend.seed(workingContainerName, projectPath);
+				queueBackend.seed(workingContainerName, projectPath, {
+					dirtyOverlayReceipt,
+				});
 				queueBackend.afterCreate?.(workingContainerName, projectPath, {
 					onStatus: emitStatus,
 				});
@@ -12028,6 +12297,7 @@ export async function runQueueWithOrchestrator(options) {
 				policyDeferred = result.policyDeferred;
 				break;
 			}
+			decorateDirtyOverlayResult(result, context);
 
 			if (isRouteHealthDeferredResult(result)) {
 				deferredTaskIds.push(result.taskId);
@@ -12112,6 +12382,7 @@ export async function runQueueWithOrchestrator(options) {
 						}
 					: {}),
 				success: result.success,
+				dirtyOverlayReceiptHash: result.dirtyOverlayReceiptHash ?? null,
 				timedOut: Boolean(result.timedOut),
 				partialDiffPath: null,
 				...(safeFailure ?? {}),
