@@ -275,11 +275,21 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 	it("normal destroy stops and deletes the owned VM", () => {
 		const name = buildParallelsWorkingName("normal", 424244);
 		const calls = [];
+		// The stub actually stops. It used to report `running` forever and still
+		// be read as a clean graceful destroy, because the old code trusted
+		// `stop`'s exit code; since 2026-09-08 the postcondition is observed, so
+		// a VM that never stops is a forced destroy and this test would be
+		// asserting the escalation path rather than the normal one it is named
+		// for.
+		let running = true;
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
+				if (args[0] === "stop") running = false;
 				if (args[0] === "list") {
-					return listed([{ uuid: "normal", status: "running", name }]);
+					return listed([
+						{ uuid: "normal", status: running ? "running" : "stopped", name },
+					]);
 				}
 				return "ok";
 			},
@@ -304,6 +314,9 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		deepStrictEqual(calls, [
 			["list", "-a", "-o", "uuid,status,name"],
 			["stop", "normal"],
+			// The observation that the stop actually took, between the stop and
+			// the delete it authorizes.
+			["list", "-a", "-o", "uuid,status,name"],
 			["delete", "normal"],
 		]);
 	});

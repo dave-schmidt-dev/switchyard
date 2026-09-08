@@ -36,6 +36,31 @@ state. Here the operation reports success while nothing changed, and no amount o
 the return code catches it. Any caller treating a zero exit from `stop` as "the VM is down"
 is wrong; the state must be polled.
 
+### Confound: the two observations are not independent
+
+Written in the order they were understood, which is the wrong order for judging them.
+Observation 1 was made **minutes after** the wedged `prlctl stop --kill` of observation 2
+was SIGTERM'd by hand — a 3.5-hour job in flight against **this same VM**. So a plausible
+alternative to "graceful stop returns on ACPI delivery" is that the Parallels dispatcher
+still held a stop job for this VM and answered the new request from that state. On that
+reading observation 1 is an artifact of observation 2, not an independent CLI defect.
+
+**A prior, uncontaminated sighting exists in this repo.** Found while fixing the backend:
+`tests/parallels-backend.test.mjs`, in "waits out the shutdown settle window instead of racing
+its own stop", opens with a sequence measured on the INV-1 gate **2026-08-31** — "the stop
+reported success, the delete issued straight after it was refused because Parallels still had
+the VM running, and the VM reported stopped a moment later." That is a graceful stop exiting 0
+on a still-running VM, observed eight days earlier, with no wedged kill job anywhere near it.
+It does not prove the 2h-scale persistence seen below — there the VM settled "a moment later" —
+but it does establish the false success itself independently of the confound.
+
+Nothing here distinguishes the two durations: one contaminated observation cannot support the
+stronger claim. Treat section 1's mechanism as **unproven** and its consequence as sound regardless —
+observing state after a stop is correct whether the false success is general or arises only
+after a wedged job, and it is the only thing that catches either. A clean reproduction would
+be a fresh full clone, waited until `exec` answers, stopped gracefully with no prior stop job
+against it, and polled.
+
 ## 2. `stop --kill` hung for three and a half hours
 
 An automated harness issued `prlctl stop <vm> --kill` roughly 40 seconds after
@@ -61,4 +86,7 @@ suspected trigger, not confirmed.
   claims to have reached.
 - `src/switchyard/lifecycle/parallels-execution-backend.mjs` should be audited for any
   `stop` whose success is inferred from the call rather than from an observed `stopped`
-  status. Not yet done.
+  status. **Done 2026-09-08** (TASKS.md Task 29). Three defects found and fixed: no default
+  timeout at the `_call` chokepoint; `stopGoldenImage` returning `status: "stopped"` from a
+  zero exit alone; and `stopAndDelete` escalating to `--kill` only on a *thrown* stop, so a
+  false success fell straight through to `delete` on a running VM.

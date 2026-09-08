@@ -1016,6 +1016,123 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
+	it("gives every prlctl call a deadline, and lets an explicit one win", () => {
+		// A `prlctl stop --kill` with no timeout hung for 3h32m on 2026-09-08,
+		// taking a VM and a harness with it. The default is applied at the _call
+		// chokepoint so it covers an injected client too, and any site that
+		// already chose its own bound keeps it.
+		const options = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlCallTimeoutMs: 4_000,
+			prlctlFn: (args, opts) => {
+				options.push([args[0], opts]);
+				return "";
+			},
+		});
+
+		backend.preflight();
+		strictEqual(options[0][1].timeout, 4_000);
+		strictEqual(options[0][1].killSignal, "SIGKILL");
+
+		backend._call(["list", "-a"], { timeout: 250 });
+		strictEqual(options[1][1].timeout, 250);
+	});
+
+	it("surfaces a timed-out prlctl call instead of retrying it as a misfire", () => {
+		// A timeout is not a lost SDK job result: retrying it three more times
+		// turns one stuck call into four, which is how a bounded call becomes an
+		// unbounded one again.
+		let attempts = 0;
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: () => {
+				attempts += 1;
+				const error = new Error("Command failed: prlctl list");
+				error.code = "ETIMEDOUT";
+				error.killed = true;
+				throw error;
+			},
+		});
+
+		throws(
+			() => backend.preflight(),
+			(error) => {
+				strictEqual(error.diagnosticCode, "prlctl_call_timed_out");
+				return true;
+			},
+		);
+		strictEqual(attempts, 1);
+	});
+
+	it("refuses to report the golden stopped while it is observed running", () => {
+		// `prlctl stop` has been seen exiting 0 with the VM still serving. The
+		// whole purpose of stopGoldenImage is that the next boot or clone is not
+		// blocked by the golden still running, so the postcondition is observed.
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			goldenImage: GOLDEN_UUID,
+			// The golden waits its own, longer window; both are zeroed so the
+			// test asserts the observation, not the wait.
+			stopSettleTimeoutMs: 0,
+			goldenStopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args[0]);
+				if (args[0] === "list")
+					return listed([
+						{ uuid: GOLDEN_UUID, status: "running", name: "golden" },
+					]);
+				return "";
+			},
+		});
+
+		throws(
+			() => backend.stopGoldenImage(GOLDEN_UUID),
+			/still running 0ms after prlctl stop exited 0/,
+		);
+		// Never forced: the golden is not disposable.
+		ok(!calls.includes("--kill"));
+	});
+
+	it("escalates to a kill when a graceful stop exits 0 without stopping", () => {
+		// The inverse of prlctl_job_misfire: success reported for a mutation that
+		// did not happen. Without the observation the false success fell straight
+		// through to `delete` on a running VM.
+		const calls = [];
+		let stopped = false;
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args.slice(0, 3).join(" "));
+				if (args[0] === "stop" && args[2] === "--kill") stopped = true;
+				if (args[0] === "list")
+					return listed([
+						{
+							uuid: WORK_UUID,
+							status: stopped ? "stopped" : "running",
+							name: "lying-stop",
+						},
+					]);
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete({
+				uuid: WORK_UUID,
+				name: "lying-stop",
+				status: "running",
+			}),
+			{ uuid: WORK_UUID, name: "lying-stop", forced: true },
+		);
+		// Ordering is the claim, not the mere presence of a kill: the escalation
+		// has to follow the observation that the graceful stop did not take.
+		deepStrictEqual(calls, [
+			`stop ${WORK_UUID}`,
+			"list -a -o",
+			`stop ${WORK_UUID} --kill`,
+			`delete ${WORK_UUID}`,
+		]);
+	});
+
 	it("reprobes after delete fallback before retrying deletion", () => {
 		const calls = [];
 		let deleteAttempts = 0;
@@ -1047,7 +1164,7 @@ describe("Parallels execution backend lifecycle", () => {
 		});
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["list", "stop", "delete", "stop", "list", "delete"],
+			["list", "stop", "list", "delete", "stop", "list", "delete"],
 		);
 	});
 
@@ -1079,10 +1196,13 @@ describe("Parallels execution backend lifecycle", () => {
 			() => backend.destroy(WORK_UUID),
 			(error) => causedBy(error, deleteFailure),
 		);
-		ok(!calls.slice(3).some((args) => args[0] === "delete"));
+		// The intent is "no second delete after the reprobe found it running",
+		// which a positional slice no longer expresses now that the settle probe
+		// sits between the stop and the delete.
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["list", "stop", "delete", "stop", "list"],
+			["list", "stop", "list", "stop", "delete", "list"],
 		);
 	});
 
@@ -1132,7 +1252,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "stop", "list"],
+			["stop", "list", "delete", "stop", "list"],
 		);
 	});
 
@@ -1159,7 +1279,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "stop", "list"],
+			["stop", "list", "stop", "delete", "list"],
 		);
 	});
 
@@ -1176,7 +1296,11 @@ describe("Parallels execution backend lifecycle", () => {
 				}
 				if (args[0] === "list") {
 					listAttempts += 1;
-					return listAttempts === 1
+					// Two present-and-stopped answers, not one: the first is
+					// consumed by the post-stop settle probe. Absence has to fall
+					// on the reprobe after the retry delete or this test stops
+					// covering the path it is named for.
+					return listAttempts <= 2
 						? listed([
 								{
 									uuid: WORK_UUID,
@@ -1200,7 +1324,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "stop", "list", "delete", "list"],
+			["stop", "list", "delete", "stop", "list", "delete", "list"],
 		);
 	});
 
@@ -1285,6 +1409,11 @@ describe("Parallels execution backend lifecycle", () => {
 		// Parallels still had the VM running, and the VM reported stopped a
 		// moment later. Sampling that state once decides the race by coin flip
 		// and leaks the VM on the losing side.
+		//
+		// Since 2026-09-08 the settle window is waited on the stop rather than on
+		// the refused delete, so the racing delete is no longer how the wait gets
+		// entered. The stub still fails the first delete, which is what keeps the
+		// old reconciliation path covered here as well.
 		const calls = [];
 		const sleeps = [];
 		let listAttempts = 0;
@@ -1325,7 +1454,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "stop", "list", "list", "list", "delete"],
+			["stop", "list", "list", "list", "delete", "stop", "list", "delete"],
 		);
 		strictEqual(sleeps.length, 2);
 	});
@@ -1363,7 +1492,9 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		// It waited the full window before giving up, and never deleted a VM it
 		// had just observed running.
-		strictEqual(calls.filter((args) => args[0] === "list").length, 4);
+		// Two full windows: once confirming the graceful stop, once reconciling
+		// the delete failure.
+		strictEqual(calls.filter((args) => args[0] === "list").length, 8);
 		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
 	});
 
@@ -2005,6 +2136,11 @@ describe("Parallels execution backend lifecycle", () => {
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
 			goldenImage: "macOS",
+			// The stub never lets the clone reach `stopped`, so the rollback's
+			// post-stop observation waits out the whole settle window before it
+			// escalates. Zeroed because this test is about the clipboard
+			// teardown, not about how long a rollback is willing to wait.
+			stopSettleTimeoutMs: 0,
 			prlctlFn: (args) => {
 				if (args[0] === "clone") {
 					cloneName = args[3];
@@ -2541,6 +2677,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 	) {
 		const calls = [];
 		let snapshots = [FOREIGN_SNAPSHOT];
+		// The clone honours `stop`. Destroy observes the postcondition rather
+		// than reading the exit code, so a stub whose VM reports `running`
+		// forever waits out the settle window and escalates to a kill -- turning
+		// a snapshot-cleanup test into a slow test of the forced path.
+		let running = true;
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
 			creatorPid: process.pid,
@@ -2550,6 +2691,7 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			requireLinkedCloneMeasurement: false,
 			prlctlFn: (args) => {
 				calls.push(args);
+				if (args[0] === "stop") running = false;
 				if (args[0] === "snapshot-list") return snapshotJson(snapshots);
 				if (args[0] === "clone") {
 					// The clone is what creates the parent snapshot.
@@ -2562,7 +2704,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 				}
 				if (args[0] === "list") {
 					return listed([
-						{ uuid: WORK_UUID, status: "running", name: cloneName },
+						{
+							uuid: WORK_UUID,
+							status: running ? "running" : "stopped",
+							name: cloneName,
+						},
 					]);
 				}
 				return "";

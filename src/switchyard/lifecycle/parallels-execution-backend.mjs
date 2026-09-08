@@ -237,6 +237,12 @@ const WORKSPACE_MODE = "700";
 // VM over a race with itself. A settling state has to be polled to a deadline;
 // one instantaneous read of it decides nothing.
 const DEFAULT_STOP_SETTLE_TIMEOUT_MS = 30_000;
+// The golden gets its own, longer settle budget. 30s was calibrated for
+// disposable clones, where overrunning it costs a `--kill` on a VM that was
+// going to be discarded anyway. The golden is not disposable and is never
+// killed, so overrunning it instead reports a healthy macOS guest -- which can
+// take well past 30s to reach `stopped` after ACPI shutdown -- as stuck.
+const DEFAULT_GOLDEN_STOP_SETTLE_TIMEOUT_MS = 120_000;
 const DEFAULT_STOP_SETTLE_POLL_MS = 1_000;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const UUID =
@@ -304,6 +310,16 @@ const DEFAULT_PRLCTL_RETRY_BACKOFF_MS = 250;
 // inventory, not merely that the prlctl binary is installed. This is a small,
 // dedicated budget for that read-only check; it must not inherit _call's
 // retry policy, because clone/start/delete are not made retryable by probing.
+// Every prlctl call gets a deadline. Observed 2026-09-08: a `prlctl stop --kill`
+// issued while a guest was still booting hung for 3h32m and had to be killed by
+// hand, taking a VM and a test harness with it. No _call site is long-running --
+// the bulk transfer runs in its own helper process and never reaches here -- so
+// this is generous for clone/delete/start/stop rather than a tuned bound, and
+// every site that needs a tighter one already passes its own. The kill signal is
+// SIGKILL because the failure being bounded is a wedged client that a SIGTERM
+// may not reach; a killed mutation of unknown outcome is what the state probes
+// exist to resolve, and it is strictly better than blocking forever.
+const DEFAULT_PRLCTL_CALL_TIMEOUT_MS = 300_000;
 const DEFAULT_HOST_READINESS_ATTEMPTS = 2;
 const DEFAULT_HOST_READINESS_BACKOFF_MS = 100;
 const DEFAULT_HOST_READINESS_TIMEOUT_MS = 2_000;
@@ -1216,6 +1232,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		workspaceVerifyTimeoutMs = DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS,
 		workspaceVerifyPollMs = DEFAULT_WORKSPACE_VERIFY_POLL_MS,
 		stopSettleTimeoutMs = DEFAULT_STOP_SETTLE_TIMEOUT_MS,
+		goldenStopSettleTimeoutMs = DEFAULT_GOLDEN_STOP_SETTLE_TIMEOUT_MS,
 		stopSettlePollMs = DEFAULT_STOP_SETTLE_POLL_MS,
 		goldenImage = null,
 		snapshotSidecarRoot = null,
@@ -1229,6 +1246,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		maxTransferBytes = MAX_TRANSFER_BYTES,
 		prlctlRetryAttempts = DEFAULT_PRLCTL_RETRY_ATTEMPTS,
 		prlctlRetryBackoffMs = DEFAULT_PRLCTL_RETRY_BACKOFF_MS,
+		prlctlCallTimeoutMs = DEFAULT_PRLCTL_CALL_TIMEOUT_MS,
 		hostReadinessAttempts = DEFAULT_HOST_READINESS_ATTEMPTS,
 		hostReadinessBackoffMs = DEFAULT_HOST_READINESS_BACKOFF_MS,
 		hostReadinessTimeoutMs = DEFAULT_HOST_READINESS_TIMEOUT_MS,
@@ -1255,6 +1273,11 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.prlctlRetryAttempts = validateAttemptCount(
 			prlctlRetryAttempts,
 			"prlctlRetryAttempts",
+		);
+		this.prlctlCallTimeoutMs = validateDurationMs(
+			prlctlCallTimeoutMs,
+			"prlctlCallTimeoutMs",
+			1,
 		);
 		this.prlctlRetryBackoffMs = validateDurationMs(
 			prlctlRetryBackoffMs,
@@ -1336,6 +1359,11 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			"workspaceVerifyPollMs",
 			1,
 		);
+		this.goldenStopSettleTimeoutMs = validateDurationMs(
+			goldenStopSettleTimeoutMs,
+			"goldenStopSettleTimeoutMs",
+			0,
+		);
 		this.stopSettleTimeoutMs = validateDurationMs(
 			stopSettleTimeoutMs,
 			"stopSettleTimeoutMs",
@@ -1413,7 +1441,16 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * @throws {PrlctlCallError}
 	 */
 	_call(args, options = {}) {
-		const { retry = true, ...invokeOptions } = options;
+		const { retry = true, ...callerOptions } = options;
+		// Defaulted here rather than in the prlctlFn factory so the deadline
+		// covers every path into prlctl, including an injected client. A timeout
+		// classifies as `prlctl_call_timed_out`, never `prlctl_job_misfire`, so
+		// it is surfaced rather than retried.
+		const invokeOptions = {
+			timeout: this.prlctlCallTimeoutMs,
+			killSignal: "SIGKILL",
+			...callerOptions,
+		};
 		const maxAttempts = retry ? this.prlctlRetryAttempts : 1;
 		for (let attempt = 1; ; attempt += 1) {
 			try {
@@ -1657,9 +1694,13 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 * or undefined when the UUID has left the list; throws `cause` if the VM is
 	 * still running when the deadline expires, so a genuinely stuck VM is
 	 * reported with the failure that led here rather than a timeout of our own.
+	 *
+	 * A `listAll()` that throws also surfaces as `cause`, which means an
+	 * unreachable or timed-out list reads as whatever state `cause` names. The
+	 * list failure is attached as `cause.cause` when nothing else claims that
+	 * slot, so the reader can tell "the VM is stuck" from "we could not see it".
 	 */
-	_awaitSettled(entry, cause) {
-		const timeoutMs = this.stopSettleTimeoutMs;
+	_awaitSettled(entry, cause, { timeoutMs = this.stopSettleTimeoutMs } = {}) {
 		const startedAt = this.nowFn();
 		for (;;) {
 			let current;
@@ -1667,7 +1708,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				current = this.listAll().find(
 					(candidate) => candidate.uuid === entry.uuid,
 				);
-			} catch {
+			} catch (listError) {
+				if (cause instanceof Error && cause.cause === undefined) {
+					cause.cause = listError;
+				}
 				throw cause;
 			}
 			if (!current) return undefined;
@@ -1676,6 +1720,33 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			if (elapsedMs >= timeoutMs) throw cause;
 			this.sleepFn(Math.min(this.stopSettlePollMs, timeoutMs - elapsedMs));
 		}
+	}
+
+	/**
+	 * Prove a VM is down by observing it, not by reading a return code.
+	 *
+	 * `prlctl stop` has been observed printing "The VM has been successfully
+	 * stopped" and exiting 0 while the VM kept running for at least two minutes,
+	 * with `prlctl exec` still answering and uptime unbroken -- the inverse of
+	 * `prlctl_job_misfire`, and uncatchable by any check on the call itself. So
+	 * every caller that needs the VM to actually be down polls for it. The
+	 * synthesized cause names the state that is wrong rather than whatever
+	 * collateral failure happened to surface it.
+	 * The message names the window that was waited out, because "still running"
+	 * on its own does not distinguish a wedged VM from one that simply needed
+	 * longer than the budget it was given.
+	 * @param {{uuid: string, name?: string}} entry
+	 * @param {string} after Human-readable description of what already ran.
+	 * @param {number} [timeoutMs] Settle budget; defaults to the clone budget.
+	 */
+	_assertNotRunning(entry, after, timeoutMs = this.stopSettleTimeoutMs) {
+		return this._awaitSettled(
+			entry,
+			new Error(
+				`${entry.name ?? entry.uuid} is still running ${timeoutMs}ms after ${after}`,
+			),
+			{ timeoutMs },
+		);
 	}
 
 	/**
@@ -2456,6 +2527,16 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (!handle) throw new Error("goldenImage is required");
 		const entry = this.resolveHandle(handle, { allowUnmanaged: true });
 		this._call(["stop", entry.uuid]);
+		// The whole point of this method is that the next bootGoldenImage() or
+		// clone is not blocked by the golden still running, which is exactly the
+		// postcondition a false success breaks. No `--kill` escalation here: the
+		// golden is not disposable, so a golden that will not stop is reported to
+		// the caller rather than forced.
+		this._assertNotRunning(
+			entry,
+			"prlctl stop exited 0",
+			this.goldenStopSettleTimeoutMs,
+		);
 		return { uuid: entry.uuid, name: entry.name, status: "stopped" };
 	}
 
@@ -3568,7 +3649,14 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		} else {
 			try {
 				this._call(["stop", entry.uuid]);
+				this._assertNotRunning(entry, "prlctl stop exited 0");
 			} catch {
+				// Covers both a thrown stop and a stop that reported success
+				// without stopping; the escalation is the same either way. The
+				// kill below is deliberately not re-observed: a kill that also
+				// reported a false success is caught by `delete` failing on a
+				// running VM, which `_reprobeStoppedOrAbsent` already reconciles,
+				// and observing here would poll the settle window a second time.
 				forced = true;
 				try {
 					this._call(["stop", entry.uuid, "--kill"]);
