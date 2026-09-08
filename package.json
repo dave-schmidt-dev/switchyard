@@ -2,6 +2,9 @@
 	"name": "switchyard",
 	"version": "0.2.1",
 	"type": "module",
+	"bin": {
+		"switchyard-dispatch": "src/switchyard/dispatch/index.mjs"
+	},
 	"license": "MIT",
 	"private": true,
 	"scripts": {
