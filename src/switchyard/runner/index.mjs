@@ -71,6 +71,7 @@ import {
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
 import {
+	boundCompletionContinuationProof,
 	createProgressSnapshot,
 	DEFAULT_SILENCE_TIMEOUT_MS,
 	verifyCompletionContinuationSync,
@@ -6346,8 +6347,9 @@ function executeTaskUnsafe(task, context) {
 		? normalizeSynchronousProviderExecution(rawExecution)
 		: rawExecution;
 	context._activeProviderExecutionSucceeded = execution.success === true;
-	context._activeCompletionLifecycleReceipt =
-		execution.completionContinuationProof ?? null;
+	context._activeCompletionLifecycleReceipt = boundCompletionContinuationProof(
+		execution.completionContinuationProof,
+	);
 	if (execution.cleanupFailed === true && execution.success) {
 		record({
 			provider: routeResult.provider,
@@ -7400,8 +7402,9 @@ async function executeTaskAsyncUnsafe(task, context) {
 		reviewResult: brokerExecution.reviewResult ?? null,
 	};
 	context._activeProviderExecutionSucceeded = execution.success === true;
-	context._activeCompletionLifecycleReceipt =
-		brokerExecution.completionContinuationProof ?? null;
+	context._activeCompletionLifecycleReceipt = boundCompletionContinuationProof(
+		brokerExecution.completionContinuationProof,
+	);
 	if (execution.cleanupFailed === true && execution.success) {
 		await record({
 			provider: routeResult.provider,
@@ -8949,8 +8952,9 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 		};
 	}
 	context._activeProviderExecutionSucceeded = true;
-	context._activeCompletionLifecycleReceipt =
-		jobResult.completionContinuationProof ?? null;
+	context._activeCompletionLifecycleReceipt = boundCompletionContinuationProof(
+		jobResult.completionContinuationProof,
+	);
 
 	context.queueBackend?.afterRun?.(
 		context.workingContainerName,

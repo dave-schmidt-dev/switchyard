@@ -2,7 +2,10 @@ import {
 	CLEANUP_STAGES,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
-import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
+import {
+	boundCompletionContinuationProof,
+	createProgressSnapshot,
+} from "../adapter/provider-lifecycle.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
@@ -128,44 +131,19 @@ function boundedProgress(value) {
  * Provider output remains inside the launcher; only bounded status and terminal
  * evidence cross this boundary.
  */
-const PROOF_ID_RE = /^[A-Za-z0-9._:/-]{1,256}$/;
-
 /**
  * Relay the launcher's completion-continuation lifecycle receipt only in its
  * exact closed shape. The runner reads it off every broker result to decide
  * whether a same-task continuation or a route-health terminal binding may
  * trust the invocation's cleanup; a partial or free-form object is dropped
- * to null so it can never pass as proof or carry launcher output.
+ * to null so it can never pass as proof or carry launcher output. The shape
+ * itself is owned by the adapter that mints it, so the bound lives there and
+ * every execution path shares this one implementation.
  */
 function completionContinuationProofOf(launcherResult) {
-	const proof = launcherResult?.completionContinuationProof;
-	if (
-		!proof ||
-		typeof proof !== "object" ||
-		proof.version !== 1 ||
-		proof.kind !== "completion_continuation_lifecycle" ||
-		typeof proof.providerExited !== "boolean" ||
-		typeof proof.childrenExited !== "boolean" ||
-		typeof proof.cleanupSucceeded !== "boolean" ||
-		![
-			proof.taskId,
-			proof.attemptId,
-			proof.descriptorIdentity,
-			proof.workspaceId,
-		].every((value) => typeof value === "string" && PROOF_ID_RE.test(value))
-	)
-		return null;
-	return Object.freeze({
-		version: 1,
-		kind: "completion_continuation_lifecycle",
-		providerExited: proof.providerExited,
-		childrenExited: proof.childrenExited,
-		cleanupSucceeded: proof.cleanupSucceeded,
-		taskId: proof.taskId,
-		attemptId: proof.attemptId,
-		descriptorIdentity: proof.descriptorIdentity,
-		workspaceId: proof.workspaceId,
-	});
+	return boundCompletionContinuationProof(
+		launcherResult?.completionContinuationProof,
+	);
 }
 
 export async function executeBrokerRoute(options) {

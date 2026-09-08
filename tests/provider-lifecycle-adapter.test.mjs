@@ -11,6 +11,7 @@ import {
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+	boundCompletionContinuationProof,
 	captureProviderDiff,
 	captureProviderDiffAsync,
 	captureProviderDiffDetailed,
@@ -131,6 +132,53 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.silenceTimedOut, false);
 		strictEqual(result.progress.outcome, "success");
 		ok(progress.some((value) => value.counters.progressEvents > 0));
+	});
+
+	it("bounds a completion-continuation receipt to its closed frozen shape", () => {
+		const valid = {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "worker",
+		};
+
+		const bound = boundCompletionContinuationProof({
+			...valid,
+			launcherStdout: "provider output that must not ride along",
+		});
+		deepStrictEqual(bound, valid);
+		ok(Object.isFrozen(bound));
+		strictEqual(bound.launcherStdout, undefined);
+
+		// The accepted receipt is a copy, so mutating the caller's object after
+		// the bound cannot change what the verifier later reads.
+		const source = { ...valid };
+		const copied = boundCompletionContinuationProof(source);
+		source.cleanupSucceeded = false;
+		strictEqual(copied.cleanupSucceeded, true);
+
+		for (const malformed of [
+			null,
+			undefined,
+			true,
+			"receipt",
+			{ ...valid, version: 2 },
+			{ ...valid, kind: "something_else" },
+			{ ...valid, providerExited: "true" },
+			{ ...valid, childrenExited: 1 },
+			{ ...valid, cleanupSucceeded: undefined },
+			{ ...valid, taskId: "" },
+			{ ...valid, attemptId: "attempt 1 with spaces" },
+			{ ...valid, descriptorIdentity: 7 },
+			{ ...valid, workspaceId: "w".repeat(257) },
+		]) {
+			strictEqual(boundCompletionContinuationProof(malformed), null);
+		}
 	});
 
 	it("keeps completion continuation unavailable without an explicit lifecycle proof", async () => {

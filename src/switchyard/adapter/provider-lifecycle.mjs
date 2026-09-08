@@ -104,6 +104,50 @@ export function createProgressSnapshot({
 // trusting caller-supplied transport text.
 const WORKSPACE_PROVIDER_COMMANDS = new WeakMap();
 
+const PROOF_ID_RE = /^[A-Za-z0-9._:/-]{1,256}$/;
+
+/**
+ * Bound a completion-continuation lifecycle receipt to its exact closed shape.
+ *
+ * Every execution path that carries a receipt toward
+ * `verifyCompletionContinuationSync` must pass it through here first. The
+ * verifier compares fields against the live task context, so a malformed
+ * receipt could not authorize a continuation on its own; what this adds is
+ * that no caller-supplied object reaches the runner context by reference.
+ * A partial or free-form receipt becomes null rather than a partial object,
+ * and the accepted shape is copied and frozen so it can neither be mutated
+ * after the check nor carry extra launcher fields alongside it.
+ */
+export function boundCompletionContinuationProof(proof) {
+	if (
+		!proof ||
+		typeof proof !== "object" ||
+		proof.version !== 1 ||
+		proof.kind !== "completion_continuation_lifecycle" ||
+		typeof proof.providerExited !== "boolean" ||
+		typeof proof.childrenExited !== "boolean" ||
+		typeof proof.cleanupSucceeded !== "boolean" ||
+		![
+			proof.taskId,
+			proof.attemptId,
+			proof.descriptorIdentity,
+			proof.workspaceId,
+		].every((value) => typeof value === "string" && PROOF_ID_RE.test(value))
+	)
+		return null;
+	return Object.freeze({
+		version: 1,
+		kind: "completion_continuation_lifecycle",
+		providerExited: proof.providerExited,
+		childrenExited: proof.childrenExited,
+		cleanupSucceeded: proof.cleanupSucceeded,
+		taskId: proof.taskId,
+		attemptId: proof.attemptId,
+		descriptorIdentity: proof.descriptorIdentity,
+		workspaceId: proof.workspaceId,
+	});
+}
+
 /**
  * Verify the narrow lifecycle fact required before a completed provider may
  * be invoked again in the same workspace.  Adapters must opt in explicitly:
