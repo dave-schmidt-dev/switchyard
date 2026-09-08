@@ -191,6 +191,11 @@ function syntheticDescriptor({ targetId, model, harness }) {
 	);
 }
 
+// The ledger-wiring fixtures dispatch review-typed tasks, which terminate on
+// their own verdict rather than on diff capture. The subject under test is
+// ledger wiring, so the provider returns the smallest well-formed verdict.
+const REVIEW_OUTPUT = JSON.stringify({ verdict: "clean" });
+
 const TASK = {
 	id: "T-1",
 	title: "trivial task",
@@ -583,7 +588,7 @@ function defaultSyncDependencies(overrides = {}) {
 			}),
 		adapters: {
 			opencode: {
-				execute: () => ({ success: true }),
+				execute: () => ({ success: true, output: REVIEW_OUTPUT }),
 				captureDiff: () => "",
 			},
 		},
@@ -607,7 +612,7 @@ function defaultOrchestratorDependencies(overrides = {}) {
 		orchestrator: {
 			launch: async () => "job-default-ledger",
 			status: async () => ({ state: "done" }),
-			result: async () => ({ success: true, diff: "" }),
+			result: async () => ({ success: true, diff: "", output: REVIEW_OUTPUT }),
 		},
 		recordDispatchIntent: () => {},
 		queuePreflight: NOOP_QUEUE_PREFLIGHT,
@@ -747,7 +752,7 @@ describe("default runner ledger wiring", () => {
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies(),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 
 			const storeRecord = await waitForStoreRecord(
 				fixture.storeRoot,
@@ -774,7 +779,7 @@ describe("default runner ledger wiring", () => {
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies(),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 
 			const legacyRecord = readLedger().at(-1);
 			const storeRecord = (await readLedgerFromStore(fixture.storeRoot)).at(-1);
@@ -885,7 +890,7 @@ describe("default runner ledger wiring", () => {
 					recordDispatchToStore: gatedStoreWriter,
 				}),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 
 			// Control: the write really is still in flight at return, so the
 			// assertion after the drain below is about the drain and not about a
@@ -937,7 +942,7 @@ describe("default runner ledger wiring", () => {
 			});
 			// The dispatch itself is unaffected: a ledger projection failure is
 			// reported, never promoted into a task failure.
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 			await result.ledgerWritesSettled;
 
 			const reported = statuses.find(
@@ -989,7 +994,7 @@ describe("default runner ledger wiring", () => {
 					onStatus: (event) => statuses.push(event),
 				}),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 			await result.ledgerWritesSettled;
 
 			const reported = statuses.find(
@@ -1037,7 +1042,7 @@ describe("default runner ledger wiring", () => {
 						projectionFailures.push(metadata),
 				}),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 
 			const reported = statuses.find(
 				(event) => event.event === "outcome_projection_failed",
@@ -1122,7 +1127,7 @@ describe("default runner ledger wiring", () => {
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultSyncDependencies(),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 
 			await waitFor(() => warnings.length > 0);
 			strictEqual(warnings.length, 1);
@@ -1170,7 +1175,7 @@ describe("default runner ledger wiring", () => {
 					},
 				}),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 
 			let rejected = null;
 			await result.ledgerWritesSettled.catch((error) => {
@@ -1211,7 +1216,7 @@ describe("default runner ledger wiring", () => {
 				checkpointPath: fixture.checkpointPath,
 				dependencies: defaultOrchestratorDependencies(),
 			});
-			strictEqual(result.results[0].result, "success_no_diff");
+			strictEqual(result.results[0].result, "review_completed");
 			strictEqual(
 				readLedger().filter((record) => record.taskId === fixture.taskId)
 					.length,
