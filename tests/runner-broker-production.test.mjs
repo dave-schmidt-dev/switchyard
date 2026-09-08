@@ -26,6 +26,16 @@ const BOUNDED_QUOTA_EVIDENCE = {
 	stderrDigest: `sha256:${"c".repeat(64)}`,
 	diagnosticKind: "usage_exhausted",
 };
+// Task 3.2 branches review tasks on their structured result, so a fixture
+// standing in for a completed review run has to return one. Without it the task
+// terminates as `review_unavailable` and the mechanics these tests cover --
+// heartbeats, dependency draining, reservation release, quarantine, route state
+// -- never run.
+const REVIEW_SUCCESS = Object.freeze({
+	success: true,
+	reviewResult: Object.freeze({ verdict: "clean" }),
+});
+
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 
 function writeDispatchQualifiedRosterFixture() {
@@ -381,7 +391,7 @@ test("production async broker forwards adapter status and heartbeats", async () 
 							status: "cleanup",
 						});
 						options.onPoll?.({ elapsedMs: 42 });
-						return { success: true };
+						return REVIEW_SUCCESS;
 					},
 					captureDiffAsync: async () => null,
 				},
@@ -435,7 +445,7 @@ test("production async runner drains a dependency chain in one bounded run", asy
 				claude: {
 					executeAsync: async (prompt) => {
 						calls.push(prompt);
-						return { success: true };
+						return REVIEW_SUCCESS;
 					},
 					captureDiffAsync: async () => null,
 				},
@@ -453,7 +463,7 @@ test("production async runner commits each task on an owned container", async ()
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: A\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** A\n\n### Task 1.2: B\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** B\n",
+		"### Task 1.1: A\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A\n\n### Task 1.2: B\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/b.mjs\n- **Description:** B\n",
 	);
 	const invocation = descriptor("cheap", "cheap-standard");
 	let commits = 0;
@@ -493,10 +503,12 @@ test("production async runner commits each task on an owned container", async ()
 			resolveDescriptor: () => invocation,
 			recordDispatch: () => {},
 			recordDispatchIntent: () => {},
+			integrationGate: () => ({ success: true }),
 			adapters: {
 				claude: {
 					executeAsync: async () => ({ success: true }),
-					captureDiffAsync: async () => null,
+					captureDiffAsync: async (_container, task) =>
+						`diff --git a/src/${task?.id === "1.2" ? "b" : "a"}.mjs b/src/${task?.id === "1.2" ? "b" : "a"}.mjs\n`,
 				},
 			},
 		},
@@ -560,7 +572,7 @@ test("production async runner resets failed tasks before continuing on an owned 
 						executions += 1;
 						return executions === 1
 							? { success: false, errorKind: "auth_expired" }
-							: { success: true };
+							: REVIEW_SUCCESS;
 					},
 					captureDiffAsync: async () => null,
 				},
@@ -709,7 +721,7 @@ test("production async runner isolates selection failures and releases early res
 			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
-					executeAsync: async () => ({ success: true }),
+					executeAsync: async () => REVIEW_SUCCESS,
 					captureDiffAsync: async () => null,
 				},
 			},
@@ -765,7 +777,7 @@ test("production async runner clears route state after a successful task before 
 			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
-					executeAsync: async () => ({ success: true }),
+					executeAsync: async () => REVIEW_SUCCESS,
 					captureDiffAsync: async () => null,
 				},
 			},
@@ -1005,7 +1017,7 @@ test("production async runner records the routed provider when post-execution ca
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Capture failure\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** preserve route identity\n",
+		"### Task 1.1: Capture failure\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** preserve route identity\n",
 	);
 	const dispatches = [];
 	const result = await runQueueAsync({
@@ -1055,7 +1067,7 @@ test("production async runner does not retry before post-execution capture", asy
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Fallback capture failure\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** record both provider outcomes\n",
+		"### Task 1.1: Fallback capture failure\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** record both provider outcomes\n",
 	);
 	const dispatches = [];
 	let executions = 0;
@@ -1210,7 +1222,7 @@ test("production router path coordinates the requested snapshot source", async (
 				claude: {
 					executeAsync: async () => {
 						calls += 1;
-						return { success: true };
+						return REVIEW_SUCCESS;
 					},
 					captureDiffAsync: async () => null,
 				},
@@ -1345,7 +1357,7 @@ test("production async runner quarantines quota targets and retries the same tas
 									diagnosticEvidence: BOUNDED_QUOTA_EVIDENCE,
 									failurePhase: "provider_execution",
 								}
-							: { success: true };
+							: REVIEW_SUCCESS;
 					},
 					captureDiffAsync: async () => null,
 				},
@@ -1439,7 +1451,7 @@ test("production async runner refreshes quarantined exclusions for each task", a
 									failurePhase: "provider_execution",
 									resolvedTargetId: options.resolvedTargetId,
 								}
-							: { success: true };
+							: REVIEW_SUCCESS;
 					},
 					captureDiffAsync: async () => null,
 				},
@@ -1729,7 +1741,7 @@ test("production async runner omits the provider transcript when the broker gate
 		"I inspected src/a.mjs and concluded no change was required.";
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Empty-diff task\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** the provider explains itself but changes nothing\n",
+		"### Task 1.1: Empty-diff task\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** the provider explains itself but changes nothing\n",
 	);
 	const result = await runQueueAsync({
 		tasksFilePath,
@@ -1892,7 +1904,7 @@ test("production async runner adds no cleanup fields when cleanup succeeded", as
 			queuePreflight: () => ({ ok: true, eligible: true }),
 			adapters: {
 				claude: {
-					executeAsync: async () => ({ success: true, output: "" }),
+					executeAsync: async () => REVIEW_SUCCESS,
 					captureDiffAsync: async () => null,
 				},
 			},

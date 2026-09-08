@@ -3,6 +3,7 @@ import {
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
 import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
+import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
@@ -30,6 +31,20 @@ function diagnosticRefOf(launcherResult) {
 		? launcherResult.diagnosticRef
 		: null;
 }
+/**
+ * Relay the launcher's review verdict in its closed, already-sanitized shape.
+ * A review task's structured result is the whole of what the runner may act on,
+ * so without it here the frozen allowlist dropped every verdict a broker route
+ * produced and each review terminated as an undiagnosed `review_unavailable`.
+ * Raw provider bytes still never cross: the launcher derives the result while
+ * the transcript is in hand, and this boundary only re-validates the closed
+ * schema. Anything else is dropped to null.
+ */
+function reviewResultOf(launcherResult) {
+	const relayed = launcherResult?.reviewResult;
+	return isReviewResult(relayed) ? relayed : null;
+}
+
 function sameSnapshot(left, right) {
 	return (
 		left?.source === right?.source &&
@@ -311,6 +326,7 @@ export async function executeBrokerRoute(options) {
 					: null,
 			completionContinuationProof:
 				completionContinuationProofOf(launcherResult),
+			reviewResult: reviewResultOf(launcherResult),
 			terminalEvidence,
 			progress: boundedProgress(launcherResult?.progress),
 		});
@@ -361,6 +377,9 @@ export async function executeBrokerRoute(options) {
 								: "launcher_failed",
 			timedOut: launcherResult?.timedOut === true,
 			silenceTimedOut: launcherResult?.silenceTimedOut === true,
+			// A failed execution carries no verdict the runner may act on; the runner
+			// attaches the explicit unavailable reason for the failure it classified.
+			reviewResult: null,
 			// Broker reconciliation owns this terminal vocabulary. Provider-specific
 			// classifications remain in errorKind/silenceTimedOut/progress.
 			outcome,

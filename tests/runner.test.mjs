@@ -3191,10 +3191,16 @@ describe("async runner provider lifecycle", () => {
 			execution: { success: false, timedOut: true, error: "timed out" },
 			integrationGate: () => ({ success: true }),
 		});
-		strictEqual(result.results[0].result, "review_unavailable");
+		// A review task that timed out is a provider failure first: it keeps the
+		// sanitized failure classification that quarantine, retry and fallback read,
+		// and carries an explicit unavailable verdict instead of collapsing into an
+		// undiagnosed `review_unavailable`. No provider bytes survive either way.
+		strictEqual(result.results[0].result, "execution_timed_out");
+		strictEqual(result.results[0].reviewResult.reason, "timeout");
 		strictEqual(result.results[0].reviewResult.sourceMutationCount, 0);
 		strictEqual(result.results[0].partialDiffPath, undefined);
-		strictEqual(observed.result, "review_unavailable");
+		strictEqual(observed.result, "execution_timed_out");
+		strictEqual(observed.reviewResult.reason, "timeout");
 		strictEqual(observed.reviewResult.sourceMutationCount, 0);
 		strictEqual(observed.partialDiff, undefined);
 		strictEqual(observed.artifactRef, undefined);

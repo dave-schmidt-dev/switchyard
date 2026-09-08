@@ -84,7 +84,10 @@ import {
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
 import { createBroker } from "../broker/index.mjs";
-import { reviewResultFromExecution } from "../diagnostics/review-result.mjs";
+import {
+	reviewResultFromExecution,
+	unavailableReviewResult,
+} from "../diagnostics/review-result.mjs";
 import { HOST_POWER_STATES, readHostPower } from "../dispatch/host-power.mjs";
 import {
 	integrationGate,
@@ -4982,8 +4985,32 @@ function reviewTaskResult(
 	};
 }
 
-function isStructuredReviewExecution(task) {
-	return task.type === "review";
+// Only a completed provider execution can carry a structured review result.
+// Task 3.2 branches review work away from integration so an unreviewed diff can
+// never reach the host; it must not also bypass Task 3.1's failure
+// classification, or a review task that hit a CLI usage error, a timeout or a
+// quota wall would be recorded as an undiagnosed `review_unavailable` and would
+// never be quarantined, retried or re-routed. Failed review executions take the
+// ordinary failure path instead, with raw diff capture suppressed and an
+// explicit unavailable review result attached.
+function isStructuredReviewExecution(task, execution) {
+	return task.type === "review" && execution?.success === true;
+}
+
+// A review task retains no raw provider bytes (Task 3.2), so the failure paths
+// skip the diff capture they perform for implementation work rather than
+// capturing a diff that must then be discarded unread.
+function retainsFailureDiff(task) {
+	return task.type !== "review";
+}
+
+function reviewFailureFields(task, execution) {
+	if (task.type !== "review") return {};
+	return {
+		reviewResult: unavailableReviewResult(
+			execution?.timedOut === true ? "timeout" : "provider_failed",
+		),
+	};
 }
 
 function normalizeSynchronousProviderExecution(execution) {
@@ -6255,37 +6282,43 @@ function executeTaskUnsafe(task, context) {
 			// possibly mid-edit) diff can never auto-apply as if the task had
 			// succeeded. INV-2: the gate is the only reviewed door back to the
 			// host, and this diff has not been reviewed.
-			context.onStatus?.({
-				phase: "execution",
-				event: "diff_capture_started",
-				status: `Task ${task.id} partial diff capture started`,
-				taskId: task.id,
-			});
-			let captureEvidence;
-			try {
-				captureEvidence = captureDiffWithEvidence(
-					adapter,
-					context.workingContainerName,
-					{
-						executionBackend: captureExecutionBackend,
-						taskBase: context._activeTaskBase,
-					},
-				);
-			} catch {
-				captureEvidence = { status: "transport_failed", diff: null };
+			let captureEvidence = null;
+			if (retainsFailureDiff(task)) {
+				context.onStatus?.({
+					phase: "execution",
+					event: "diff_capture_started",
+					status: `Task ${task.id} partial diff capture started`,
+					taskId: task.id,
+				});
+				try {
+					captureEvidence = captureDiffWithEvidence(
+						adapter,
+						context.workingContainerName,
+						{
+							executionBackend: captureExecutionBackend,
+							taskBase: context._activeTaskBase,
+						},
+					);
+				} catch {
+					captureEvidence = { status: "transport_failed", diff: null };
+				}
 			}
-			const partialDiff = captureEvidence.diff;
-			const captureStatus = captureEvidence.status;
+			const partialDiff = captureEvidence?.diff ?? null;
+			const captureStatus = captureEvidence?.status;
 			const captureFailed =
-				captureStatus !== "captured" && captureStatus !== "empty";
-			context.onStatus?.({
-				phase: "execution",
-				event: "diff_capture_completed",
-				status: `Task ${task.id} partial diff capture ${captureStatus}`,
-				taskId: task.id,
-				captureStatus,
-				byteCount: partialDiff?.length ?? 0,
-			});
+				captureEvidence !== null &&
+				captureStatus !== "captured" &&
+				captureStatus !== "empty";
+			if (captureEvidence !== null) {
+				context.onStatus?.({
+					phase: "execution",
+					event: "diff_capture_completed",
+					status: `Task ${task.id} partial diff capture ${captureStatus}`,
+					taskId: task.id,
+					captureStatus,
+					byteCount: partialDiff?.length ?? 0,
+				});
+			}
 			const cleanupFailed = execution.cleanupFailed === true;
 			const resultName = cleanupFailed
 				? "execution_timed_out_cleanup_failed"
@@ -6328,7 +6361,8 @@ function executeTaskUnsafe(task, context) {
 					? { reasonCode: safeTimeoutFailure.reasonCode }
 					: {}),
 				reason: error ?? routeResult.reason,
-				captureStatus,
+				...(captureStatus ? { captureStatus } : {}),
+				...reviewFailureFields(task, execution),
 				percentLeft: routeResult.percentLeft ?? undefined,
 				diagnosticCode:
 					safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
@@ -6368,38 +6402,41 @@ function executeTaskUnsafe(task, context) {
 				diagnosticRef: execution.diagnosticRef,
 				cleanupFailed,
 				cleanupStage: execution.cleanupStage,
-				captureStatus,
+				...(captureStatus ? { captureStatus } : {}),
+				...reviewFailureFields(task, execution),
 				...(partialDiff ? { partialDiff } : {}),
 			};
 		}
 
-		context.onStatus?.({
-			phase: "execution",
-			event: "diff_capture_started",
-			status: `Task ${task.id} failure diff capture started`,
-			taskId: task.id,
-		});
-		let captureEvidence;
-		try {
-			captureEvidence = captureDiffWithEvidence(
-				adapter,
-				context.workingContainerName,
-				{
-					executionBackend: captureExecutionBackend,
-					taskBase: context._activeTaskBase,
-				},
-			);
-		} catch {
-			captureEvidence = { status: "transport_failed", diff: null };
+		let captureEvidence = null;
+		if (retainsFailureDiff(task)) {
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_started",
+				status: `Task ${task.id} failure diff capture started`,
+				taskId: task.id,
+			});
+			try {
+				captureEvidence = captureDiffWithEvidence(
+					adapter,
+					context.workingContainerName,
+					{
+						executionBackend: captureExecutionBackend,
+						taskBase: context._activeTaskBase,
+					},
+				);
+			} catch {
+				captureEvidence = { status: "transport_failed", diff: null };
+			}
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_completed",
+				status: `Task ${task.id} failure diff capture ${captureEvidence.status}`,
+				taskId: task.id,
+				captureStatus: captureEvidence.status,
+				byteCount: captureEvidence.diff?.length ?? 0,
+			});
 		}
-		context.onStatus?.({
-			phase: "execution",
-			event: "diff_capture_completed",
-			status: `Task ${task.id} failure diff capture ${captureEvidence.status}`,
-			taskId: task.id,
-			captureStatus: captureEvidence.status,
-			byteCount: captureEvidence.diff?.length ?? 0,
-		});
 
 		record({
 			provider: routeResult.provider,
@@ -6417,7 +6454,8 @@ function executeTaskUnsafe(task, context) {
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
-			captureStatus: captureEvidence.status,
+			...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
+			...reviewFailureFields(task, execution),
 		});
 
 		return {
@@ -6439,8 +6477,9 @@ function executeTaskUnsafe(task, context) {
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
-			captureStatus: captureEvidence.status,
-			...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
+			...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
+			...reviewFailureFields(task, execution),
+			...(captureEvidence?.diff ? { partialDiff: captureEvidence.diff } : {}),
 		};
 	}
 
@@ -7209,8 +7248,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 		progress: brokerExecution.progress ?? null,
-		reviewResult: brokerExecution.reviewResult,
-		output: brokerExecution.output,
+		// The broker relays a sanitized verdict and never raw provider bytes, so
+		// there is no output to read back on this path; a route that produced no
+		// verdict relays null and the review result resolves to an explicit
+		// `missing` instead of inheriting a placeholder.
+		reviewResult: brokerExecution.reviewResult ?? null,
 	};
 	context._activeProviderExecutionSucceeded = execution.success === true;
 	context._activeCompletionLifecycleReceipt =
@@ -7275,6 +7317,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				errorKind: "silence_timeout",
 				reason: execution.error ?? "provider made no substantive progress",
 				progress: execution.progress,
+				...reviewFailureFields(task, execution),
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -7289,40 +7332,43 @@ async function executeTaskAsyncUnsafe(task, context) {
 				errorKind: "silence_timeout",
 				progress: execution.progress,
 				silenceTimedOut: true,
+				...reviewFailureFields(task, execution),
 			};
 		}
 		if (!execution.timedOut) {
-			context.onStatus?.({
-				phase: "execution",
-				event: "diff_capture_started",
-				status: `Task ${task.id} failure diff capture started`,
-				taskId: task.id,
-			});
-			let captureEvidence;
-			try {
-				captureEvidence = await captureDiffWithEvidenceAsync(
-					adapter,
-					context.workingContainerName,
-					{
-						executionBackend: bindAttemptHelperBackend(
-							context.executionBackend,
-							attemptCleanupContext,
-						),
-						taskBase: context._activeTaskBase,
-						signal: context.signal,
-					},
-				);
-			} catch {
-				captureEvidence = { status: "transport_failed", diff: null };
+			let captureEvidence = null;
+			if (retainsFailureDiff(task)) {
+				context.onStatus?.({
+					phase: "execution",
+					event: "diff_capture_started",
+					status: `Task ${task.id} failure diff capture started`,
+					taskId: task.id,
+				});
+				try {
+					captureEvidence = await captureDiffWithEvidenceAsync(
+						adapter,
+						context.workingContainerName,
+						{
+							executionBackend: bindAttemptHelperBackend(
+								context.executionBackend,
+								attemptCleanupContext,
+							),
+							taskBase: context._activeTaskBase,
+							signal: context.signal,
+						},
+					);
+				} catch {
+					captureEvidence = { status: "transport_failed", diff: null };
+				}
+				context.onStatus?.({
+					phase: "execution",
+					event: "diff_capture_completed",
+					status: `Task ${task.id} failure diff capture ${captureEvidence.status}`,
+					taskId: task.id,
+					captureStatus: captureEvidence.status,
+					byteCount: captureEvidence.diff?.length ?? 0,
+				});
 			}
-			context.onStatus?.({
-				phase: "execution",
-				event: "diff_capture_completed",
-				status: `Task ${task.id} failure diff capture ${captureEvidence.status}`,
-				taskId: task.id,
-				captureStatus: captureEvidence.status,
-				byteCount: captureEvidence.diff?.length ?? 0,
-			});
 			await record({
 				provider: routeResult.provider,
 				model: routeResult.model ?? "unknown",
@@ -7338,7 +7384,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				diagnosticRef: execution.diagnosticRef,
 				cleanupStage: execution.cleanupStage,
-				captureStatus: captureEvidence.status,
+				...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
+				...reviewFailureFields(task, execution),
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -7359,46 +7406,53 @@ async function executeTaskAsyncUnsafe(task, context) {
 				diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 				diagnosticRef: execution.diagnosticRef,
 				cleanupStage: execution.cleanupStage,
-				captureStatus: captureEvidence.status,
-				...(captureEvidence.diff ? { partialDiff: captureEvidence.diff } : {}),
+				...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
+				...reviewFailureFields(task, execution),
+				...(captureEvidence?.diff ? { partialDiff: captureEvidence.diff } : {}),
 			};
 		}
 
-		context.onStatus?.({
-			phase: "execution",
-			event: "diff_capture_started",
-			status: `Task ${task.id} partial diff capture started`,
-			taskId: task.id,
-		});
-		let captureEvidence;
-		try {
-			captureEvidence = await captureDiffWithEvidenceAsync(
-				adapter,
-				context.workingContainerName,
-				{
-					executionBackend: bindAttemptHelperBackend(
-						context.executionBackend,
-						attemptCleanupContext,
-					),
-					taskBase: context._activeTaskBase,
-					signal: context.signal,
-				},
-			);
-		} catch {
-			captureEvidence = { status: "transport_failed", diff: null };
+		let captureEvidence = null;
+		if (retainsFailureDiff(task)) {
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_started",
+				status: `Task ${task.id} partial diff capture started`,
+				taskId: task.id,
+			});
+			try {
+				captureEvidence = await captureDiffWithEvidenceAsync(
+					adapter,
+					context.workingContainerName,
+					{
+						executionBackend: bindAttemptHelperBackend(
+							context.executionBackend,
+							attemptCleanupContext,
+						),
+						taskBase: context._activeTaskBase,
+						signal: context.signal,
+					},
+				);
+			} catch {
+				captureEvidence = { status: "transport_failed", diff: null };
+			}
 		}
-		const partialDiff = captureEvidence.diff;
-		const captureStatus = captureEvidence.status;
+		const partialDiff = captureEvidence?.diff ?? null;
+		const captureStatus = captureEvidence?.status;
 		const captureFailed =
-			captureStatus !== "captured" && captureStatus !== "empty";
-		context.onStatus?.({
-			phase: "execution",
-			event: "diff_capture_completed",
-			status: `Task ${task.id} partial diff capture ${captureStatus}`,
-			taskId: task.id,
-			captureStatus,
-			byteCount: partialDiff?.length ?? 0,
-		});
+			captureEvidence !== null &&
+			captureStatus !== "captured" &&
+			captureStatus !== "empty";
+		if (captureEvidence !== null) {
+			context.onStatus?.({
+				phase: "execution",
+				event: "diff_capture_completed",
+				status: `Task ${task.id} partial diff capture ${captureStatus}`,
+				taskId: task.id,
+				captureStatus,
+				byteCount: partialDiff?.length ?? 0,
+			});
+		}
 		const cleanupFailed = execution.cleanupFailed === true;
 		const resultName = cleanupFailed
 			? "execution_timed_out_cleanup_failed"
@@ -7441,7 +7495,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 				? { reasonCode: safeTimeoutFailure.reasonCode }
 				: {}),
 			reason: error ?? routeResult.reason,
-			captureStatus,
+			...(captureStatus ? { captureStatus } : {}),
+			...reviewFailureFields(task, execution),
 			diagnosticCode:
 				safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
 			exitCode: execution.exitCode,
@@ -7480,7 +7535,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 			diagnosticRef: execution.diagnosticRef,
 			cleanupFailed,
 			cleanupStage: execution.cleanupStage,
-			captureStatus,
+			...(captureStatus ? { captureStatus } : {}),
+			...reviewFailureFields(task, execution),
 			...(partialDiff ? { partialDiff } : {}),
 		};
 	}
@@ -8714,6 +8770,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			result: "execution_failed",
 			reason: jobResult?.error ?? "orchestrator job failed",
 			...(progress ? { progress } : {}),
+			...reviewFailureFields(task, jobResult),
 			percentLeft: routeResult.percentLeft ?? undefined,
 		});
 		return {
@@ -8727,6 +8784,7 @@ export async function executeTaskWithOrchestrator(task, context) {
 			result: "execution_failed",
 			errorKind: jobResult?.errorKind ?? null,
 			...(progress ? { progress } : {}),
+			...reviewFailureFields(task, jobResult),
 		};
 	}
 	context._activeProviderExecutionSucceeded = true;
@@ -9394,6 +9452,18 @@ const DEFAULT_ADAPTERS = {
  * Bind an existing async provider adapter to the complete broker identity.
  * The returned identity is checked by the broker before adapter execution.
  */
+/**
+ * Derive a review task's closed verdict here, where the provider's own output
+ * is still in hand and before the bounded launcher shape drops it. A `missing`
+ * result means there was nothing to derive, and stays null so the reader on the
+ * far side of the broker records it as missing rather than re-deriving it into
+ * a provider failure that never happened.
+ */
+function launchReviewResult(execution) {
+	const derived = reviewResultFromExecution(execution);
+	return derived.reason === "missing" ? null : derived;
+}
+
 export function createBrokerAdapterLauncher({
 	adapter,
 	executionBackend,
@@ -9470,6 +9540,10 @@ export function createBrokerAdapterLauncher({
 			timedOut: execution?.timedOut === true,
 			silenceTimedOut: execution?.silenceTimedOut === true,
 			outcome: execution?.outcome ?? null,
+			// The verdict, not the transcript it was parsed out of. Omitting it here
+			// left every review dispatched through the broker with no result to act
+			// on, so each one terminated as an undiagnosed `review_unavailable`.
+			reviewResult: launchReviewResult(execution),
 			cleanupFailed: execution?.cleanupFailed === true,
 			// Which kill step failed, bounded to the backend-owned vocabulary.
 			// Omitting it here left `execution.cleanupStage` permanently null on
