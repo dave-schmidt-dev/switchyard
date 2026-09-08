@@ -1075,7 +1075,10 @@ describe("Parallels execution backend lifecycle", () => {
 			stopSettleTimeoutMs: 0,
 			goldenStopSettleTimeoutMs: 0,
 			prlctlFn: (args) => {
-				calls.push(args[0]);
+				// The whole argv, not args[0]: recording the verb alone made the
+				// "never forced" assertion below vacuously true, since a graceful
+				// stop and a `stop --kill` are both `stop`.
+				calls.push(args.join(" "));
 				if (args[0] === "list")
 					return listed([
 						{ uuid: GOLDEN_UUID, status: "running", name: "golden" },
@@ -1088,8 +1091,15 @@ describe("Parallels execution backend lifecycle", () => {
 			() => backend.stopGoldenImage(GOLDEN_UUID),
 			/still running 0ms after prlctl stop exited 0/,
 		);
-		// Never forced: the golden is not disposable.
-		ok(!calls.includes("--kill"));
+		// Never forced, and never deleted: the golden is not disposable. The
+		// exact sequence is the claim -- one graceful stop, one observation of
+		// it, and nothing else.
+		deepStrictEqual(calls, [
+			// stopGoldenImage resolves the handle before it stops it.
+			"list -a -o uuid,status,name",
+			`stop ${GOLDEN_UUID}`,
+			"list -a -o uuid,status,name",
+		]);
 	});
 
 	it("escalates to a kill when a graceful stop exits 0 without stopping", () => {
