@@ -86,7 +86,8 @@ suspected trigger, not confirmed.
   claims to have reached.
 - `src/switchyard/lifecycle/parallels-execution-backend.mjs` should be audited for any
   `stop` whose success is inferred from the call rather than from an observed `stopped`
-  status. **Done 2026-09-08** (TASKS.md Task 29). Three defects found and fixed: no default
+  status. **Done 2026-09-08** — see the `Observed stop postconditions and bounded prlctl
+  calls` entry in `HISTORY.md`, landed as commit `f533687`. Three defects found and fixed: no default
   timeout at the `_call` chokepoint; `stopGoldenImage` returning `status: "stopped"` from a
   zero exit alone; and `stopAndDelete` escalating to `--kill` only on a *thrown* stop, so a
   false success fell straight through to `delete` on a running VM.
