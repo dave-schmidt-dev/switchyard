@@ -6721,6 +6721,7 @@ function clearAsyncTaskContext(context) {
 	context._activeTaskTimeoutMs = null;
 	context._activeTaskDeadline = null;
 	context._activeTaskTranscript = null;
+	context._activeTaskIsReview = false;
 }
 
 function asyncExecutionFailureMetadata(error, taskId) {
@@ -6789,6 +6790,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 	);
 	context._activeTaskTimeoutMs =
 		task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	// Only a review task has a verdict to derive. Deriving unconditionally would
+	// parse an implementation task's transcript and relay text sanitized out of it
+	// across the broker boundary, which is the one thing that boundary exists to
+	// prevent.
+	context._activeTaskIsReview = task.type === "review";
 	const brokerRequest = brokerRequestForTask(task, context, requiredCapability);
 	let selectedRoute = await broker.selectAndReserve(brokerRequest);
 	context._activeBrokerRoute = selectedRoute;
@@ -9473,6 +9479,7 @@ export function createBrokerAdapterLauncher({
 	silenceTimeoutMs = DEFAULT_SILENCE_TIMEOUT_MS,
 	onTranscript = null,
 	cleanupContext = null,
+	deriveReviewResult = false,
 }) {
 	if (!adapter || typeof adapter.executeAsync !== "function") {
 		throw new TypeError("broker adapter requires executeAsync");
@@ -9543,7 +9550,7 @@ export function createBrokerAdapterLauncher({
 			// The verdict, not the transcript it was parsed out of. Omitting it here
 			// left every review dispatched through the broker with no result to act
 			// on, so each one terminated as an undiagnosed `review_unavailable`.
-			reviewResult: launchReviewResult(execution),
+			reviewResult: deriveReviewResult ? launchReviewResult(execution) : null,
 			cleanupFailed: execution?.cleanupFailed === true,
 			// Which kill step failed, bounded to the backend-owned vocabulary.
 			// Omitting it here left `execution.cleanupStage` permanently null on
@@ -9698,6 +9705,7 @@ function createDispatchBroker(context, dependencies = {}) {
 				workingContainerName: context.workingContainerName,
 				prompt: context._activeTaskPrompt,
 				timeoutMs: context._activeTaskTimeoutMs,
+				deriveReviewResult: context._activeTaskIsReview === true,
 				onTranscript: (output) => {
 					context._activeTaskTranscript = boundedGateEvidence(output);
 				},

@@ -13,7 +13,10 @@ import {
 	getInvocationDescriptorIdentity,
 } from "../src/switchyard/roster/index.mjs";
 import { route as productionRoute } from "../src/switchyard/router/index.mjs";
-import { runQueueAsync as runQueueAsyncImpl } from "../src/switchyard/runner/index.mjs";
+import {
+	createBrokerAdapterLauncher,
+	runQueueAsync as runQueueAsyncImpl,
+} from "../src/switchyard/runner/index.mjs";
 import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -516,6 +519,126 @@ test("production async runner commits each task on an owned container", async ()
 	strictEqual(result.processedTasks, 2);
 	strictEqual(commits, 2);
 	strictEqual(resets, 0);
+});
+
+test("production async runner keeps implementation transcripts off the broker boundary", async () => {
+	const root = await tempDirAsync("switchyard-production-broker-canary-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: A\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A\n",
+	);
+	const invocation = descriptor("cheap", "cheap-standard");
+	const records = [];
+	// A JSON-shaped implementation transcript is the hazard: the review-result
+	// parser accepts any `{...}` payload, so deriving a verdict for every task
+	// would sanitize this text and relay it across the boundary that exists to
+	// keep provider bytes out of the runner.
+	const canary = "SWITCHYARD_TRANSCRIPT_CANARY";
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		checkpointPath,
+		maxTasks: 1,
+		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			backendFactory: () => ({
+				executionBackend: {},
+				ensureAgentContainer: () => {},
+				create: () => "owned-async-canary-worker",
+				destroy: () => {},
+				seed: () => {},
+				commit: () => {},
+				reset: () => {},
+			}),
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => invocation,
+			recordDispatch: (entry) => {
+				records.push(entry);
+			},
+			recordDispatchIntent: () => {},
+			integrationGate: () => ({ success: true }),
+			adapters: {
+				claude: {
+					executeAsync: async () => ({
+						success: true,
+						output: JSON.stringify({
+							verdict: "clean",
+							summary: canary,
+							findings: [{ severity: "high", detail: canary }],
+						}),
+					}),
+					captureDiffAsync: async () => "diff --git a/src/a.mjs b/src/a.mjs\n",
+				},
+			},
+		},
+	});
+	strictEqual(result.processedTasks, 1);
+	strictEqual(JSON.stringify(result).includes(canary), false);
+	strictEqual(JSON.stringify(records).includes(canary), false);
+	strictEqual((await readFile(checkpointPath, "utf8")).includes(canary), false);
+});
+
+test("broker launcher derives a verdict only for review work", async () => {
+	const invocation = descriptor("cheap", "cheap-standard");
+	const route = {
+		provider: "Cheap",
+		resolvedTarget: "cheap",
+		harness: "claude",
+		model: invocation.selector,
+		effort: null,
+		reservation: { id: "reservation-canary" },
+	};
+	const launcherIdentity = {
+		...route,
+		descriptorIdentity: invocation.descriptor_identity,
+		reservationId: "reservation-canary",
+	};
+	// A JSON-shaped transcript parses as a verdict whatever the task was, so the
+	// launcher must be told which kind of work it ran. Without that, an
+	// implementation task's own words are sanitized into a review result and
+	// relayed across the boundary that exists to stop provider bytes.
+	const canary = "SWITCHYARD_LAUNCHER_CANARY";
+	const adapter = {
+		executeAsync: async () => ({
+			success: true,
+			output: JSON.stringify({ verdict: "clean", summary: canary }),
+		}),
+	};
+	const launchFor = (deriveReviewResult) =>
+		createBrokerAdapterLauncher({
+			adapter,
+			executionBackend: {},
+			workingContainerName: "vm",
+			prompt: "fixture",
+			deriveReviewResult,
+		})({
+			request: { taskId: "1.1", attemptId: "attempt-canary" },
+			route,
+			invocationDescriptor: invocation,
+			launcherIdentity,
+		});
+
+	const implementation = await launchFor(false);
+	strictEqual(implementation.success, true);
+	strictEqual(implementation.reviewResult, null);
+	strictEqual(JSON.stringify(implementation).includes(canary), false);
+
+	const review = await launchFor(true);
+	strictEqual(review.reviewResult.status, "available");
+	strictEqual(review.reviewResult.summary, canary);
 });
 
 test("production async runner resets failed tasks before continuing on an owned container", async () => {
