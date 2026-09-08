@@ -1,11 +1,13 @@
 // Bounded, host-safe review result contract. Provider text is never persisted;
 // only this closed projection may cross the run-store boundary.
 
-export const REVIEW_RESULT_SCHEMA_VERSION = 1;
-export const REVIEW_RESULT_MAX_FINDINGS = 50;
-export const REVIEW_RESULT_MAX_COMMENTS = 20;
-export const REVIEW_RESULT_MAX_TEXT = 512;
-export const REVIEW_RESULT_MAX_COMMENT = 1_024;
+// Module-local bounds. Nothing outside this file reads them: the closed
+// projection below is the contract, not the numbers behind it.
+const REVIEW_RESULT_SCHEMA_VERSION = 1;
+const REVIEW_RESULT_MAX_FINDINGS = 50;
+const REVIEW_RESULT_MAX_COMMENTS = 20;
+const REVIEW_RESULT_MAX_TEXT = 512;
+const REVIEW_RESULT_MAX_COMMENT = 1_024;
 
 const VERDICTS = new Set(["clean", "findings", "unavailable"]);
 const SEVERITIES = new Set(["critical", "high", "medium", "low", "info"]);
