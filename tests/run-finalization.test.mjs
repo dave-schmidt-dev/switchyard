@@ -1,11 +1,18 @@
 import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
+import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 import {
 	PRE_PROVIDER_FAILURE_TRIPLES,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { finalizeRun } from "../src/switchyard/dispatch/run-finalization.mjs";
-import { createStageOutcome } from "../src/switchyard/run-store/index.mjs";
+import {
+	activateOutcomeWriter,
+	initializeRun,
+	readEvents,
+	readRun,
+	updateRun,
+} from "../src/switchyard/run-store/index.mjs";
 
 function revisionError() {
 	const error = new Error("run lock changed while releasing");
@@ -15,36 +22,43 @@ function revisionError() {
 
 describe("run finalization", () => {
 	it("records typed cleanup, run, and postcondition facts beside legacy terminalization", async () => {
-		const typed = [];
-		const runStore = {
-			readRun: async () => ({
-				outcomeWriterEpoch: "epoch-finalize",
-				workerPid: process.pid,
-				workerStartToken: "start-token",
-				workerNonce: "worker-nonce",
-			}),
-			createStageOutcome,
-			appendOutcomeEvent: async (_runId, outcome) => {
-				typed.push(outcome);
-				return typed.length;
-			},
-			createEvent: async () => {},
-			updateRunWithRetry: async (_runId, patch) => patch,
-			releaseRunLock: async () => {},
-		};
-		const outcome = await finalizeRun(
-			{
-				runId: "typed-finalize",
-				state: "succeeded",
-				terminalSummary: { processedTasks: 1, failedCount: 0 },
-			},
-			runStore,
-		);
+		const runId = `typed-finalize-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "fixture",
+			workerPid: process.pid,
+			workerNonce: randomUUID(),
+		});
+		let current = await readRun(runId);
+		await activateOutcomeWriter(runId, {
+			pid: process.pid,
+			startToken: "start-token",
+			nonce: current.workerNonce,
+			writerEpoch: "epoch-finalize",
+		});
+		current = await readRun(runId);
+		await updateRun(runId, { state: "created" }, current.revision);
+		const outcome = await finalizeRun({
+			runId,
+			state: "succeeded",
+			terminalSummary: { processedTasks: 1, failedCount: 0 },
+		});
 		strictEqual(outcome.terminal, true);
+		const persisted = await readRun(runId);
+		const events = await readEvents(runId);
+		const shadow = persisted.outcomeShadow;
+		ok(shadow, "finalization persists a run-store shadow");
 		deepStrictEqual(
-			typed.map((event) => event.stage),
+			events
+				.filter((event) => typeof event.stage === "string")
+				.map((event) => event.stage),
 			["cleanup", "cleanup", "run", "postcondition"],
 		);
+		strictEqual(shadow.parity.legacyStatus, "succeeded");
+		strictEqual(shadow.parity.evidence, "shadow");
 	});
 
 	it("records deferred as terminal without failure metadata", async () => {

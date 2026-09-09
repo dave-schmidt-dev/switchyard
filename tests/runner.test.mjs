@@ -57,10 +57,14 @@ import {
 } from "../src/switchyard/router/health.mjs";
 import { route as realRoute } from "../src/switchyard/router/index.mjs";
 import {
+	appendOutcomeEvent,
 	applyCheckpointArtifactRetention,
 	createRouteHealthEvent,
+	createStageOutcome,
 	getRunRoot,
 	initializeRun,
+	readRun,
+	updateRun,
 	VmSlotUnavailableError,
 } from "../src/switchyard/run-store/index.mjs";
 import {
@@ -8026,6 +8030,143 @@ describe("checkpoint durability", () => {
 				true,
 				name,
 			);
+		}
+	});
+
+	it("persists terminal shadow evidence before releasing all three checkpoint shapes", async () => {
+		const replayFixture = JSON.parse(
+			readFileSync(
+				resolve(__dirname, "fixtures", "outcome-replay.json"),
+				"utf8",
+			),
+		);
+		const typedTerminalEvidence = replayFixture.records
+			.filter(
+				(record) =>
+					record.evidenceStatus === "observed" && record.stage !== "provider",
+			)
+			.map((record, index) =>
+				createStageOutcome({
+					runId: "terminal-shadow-fixture",
+					taskId: "1.1",
+					attempt: record.counter,
+					attemptId: `fixture-attempt-${index + 1}`,
+					stage: record.stage,
+					status: "failed",
+					producer: "runner",
+					code:
+						record.stage === "artifact"
+							? "diff_capture_failed"
+							: "task_postcondition",
+					detail: { artifactKind: "diff", captured: false },
+				}),
+			);
+		const runId = "terminal-shadow-fixture";
+		const previousStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+		const projections = [];
+		try {
+			for (const [name, entrypoint] of [
+				["sync", runQueue],
+				["async", runQueueAsync],
+				["orchestrator", runQueueWithOrchestrator],
+			]) {
+				const storeRoot = join(
+					TEST_DIR,
+					`shadow-cross-path-${name}-${randomUUID()}`,
+				);
+				mkdirSync(storeRoot, { recursive: true });
+				process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
+				const tasksPath = writeTasksFile(
+					`### Task 1.1: Terminal shadow ${name}\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** terminal shadow evidence\n`,
+				);
+				const checkpointPath = `${tasksPath}.checkpoint.json`;
+				await initializeRun({
+					runId,
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					orderedTaskIds: ["1.1"],
+					initialHostFingerprint: "fixture",
+					workerPid: process.pid,
+					workerStartToken: "shadow-start-token",
+					workerNonce: randomUUID(),
+				});
+				let current = await readRun(runId);
+				const writerEpoch = `epoch-${runId}`;
+				current = await updateRun(
+					runId,
+					{
+						outcomeWriterEpoch: writerEpoch,
+						state: "succeeded",
+						cleanupState: "complete",
+						terminalSummary: {
+							totalTasks: 1,
+							runnableTasks: 0,
+							processedTasks: 0,
+							completedTaskIds: ["1.1"],
+							deferredTaskIds: [],
+							failedCount: 0,
+						},
+					},
+					current.revision,
+				);
+				for (const [index, evidence] of typedTerminalEvidence.entries()) {
+					const terminalEvidence = createStageOutcome({
+						...evidence,
+						runId,
+						code: "artifact_capture",
+						writerEpoch,
+						recordedAt: `2026-09-09T00:00:0${index}.000Z`,
+					});
+					await appendOutcomeEvent(runId, terminalEvidence, {
+						writerEpoch,
+					});
+				}
+				const runStore = {
+					updateRun: async (partial) => {
+						const latest = await readRun(runId);
+						return updateRun(runId, partial, latest.revision);
+					},
+					readRun: () => readRun(runId),
+				};
+				const dependencies = {
+					queuePreflight: () => ({ ok: true, eligible: true }),
+					acquireVmSlot: () => null,
+					releaseVmSlot: () => {},
+					runStore,
+					enableTypedOutcomes: false,
+					orchestrator: {
+						launch: () => "unused",
+						status: () => ({ state: "done" }),
+						result: () => ({ success: true }),
+					},
+				};
+				const result = await entrypoint({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+					checkpointPath,
+					runId,
+					dependencies,
+				});
+				await result.ledgerWritesSettled;
+				const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+				const persistedRun = await readRun(runId);
+				strictEqual(checkpoint.outcomeShadow.parity.evidence, "shadow", name);
+				strictEqual(checkpoint.outcomeShadow.parity.cutoverBlocked, true, name);
+				strictEqual(
+					JSON.stringify(checkpoint.outcomeShadow.projection),
+					JSON.stringify(persistedRun.outcomeShadow.projection),
+					name,
+				);
+				projections.push(checkpoint.outcomeShadow.projection);
+				strictEqual(checkpoint.ownershipReleased, true, name);
+			}
+			for (const projection of projections.slice(1))
+				strictEqual(JSON.stringify(projection), JSON.stringify(projections[0]));
+		} finally {
+			if (previousStoreRoot === undefined)
+				delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+			else process.env.SWITCHYARD_RUN_STORE_ROOT = previousStoreRoot;
 		}
 	});
 

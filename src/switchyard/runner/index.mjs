@@ -2995,6 +2995,8 @@ export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
 		taskBases: {},
 		taskAttempts: {},
 		integrationIntents: {},
+		// Additive reducer evidence; legacy checkpoint readers ignore this field.
+		outcomeShadow: null,
 	};
 	if (identity.queueIdentity) {
 		checkpoint.queueIdentity = identity.queueIdentity;
@@ -6965,6 +6967,26 @@ function clearAsyncTaskContext(context) {
 	context._activeTaskIsReview = false;
 }
 
+async function persistCheckpointOutcomeShadow(
+	checkpointPath,
+	checkpoint,
+	runStore,
+	runId,
+) {
+	if (
+		!runStore ||
+		typeof runStore.readRun !== "function" ||
+		typeof runId !== "string"
+	)
+		return false;
+	const run = await runStore.readRun(runId).catch(() => null);
+	if (!run?.outcomeShadow) return false;
+	checkpoint.outcomeShadow = structuredClone(run.outcomeShadow);
+	checkpoint.lastUpdatedAt = new Date().toISOString();
+	saveCheckpoint(checkpointPath, checkpoint);
+	return true;
+}
+
 function asyncExecutionFailureMetadata(error, taskId) {
 	const errorKind = BOUNDED_ERROR_KINDS.has(error?.errorKind)
 		? error.errorKind
@@ -8694,8 +8716,35 @@ export async function runQueueAsync(options) {
 			)
 				break;
 		}
-		if (checkpoint.version === CHECKPOINT_VERSION)
-			releaseCheckpointOwnership(checkpointPath, checkpoint);
+		// Keep ownership until the terminal reducer projection has been observed
+		// and copied into the checkpoint. Shadow persistence is additive evidence:
+		// a read/write failure must never change the queue result or strand the
+		// checkpoint lease.
+		let checkpointShadowSettled = Promise.resolve();
+		if (checkpoint.version === CHECKPOINT_VERSION) {
+			const checkpointRunStore = dependencies.runStore ?? { readRun };
+			checkpointShadowSettled = Promise.resolve(
+				context._outcomeWriteChain ?? Promise.resolve(),
+			)
+				.then(() =>
+					persistCheckpointOutcomeShadow(
+						checkpointPath,
+						checkpoint,
+						checkpointRunStore,
+						runId,
+					).catch(() => false),
+				)
+				.catch(() => false)
+				.finally(() => {
+					try {
+						releaseCheckpointOwnership(checkpointPath, checkpoint);
+					} catch {
+						// Checkpoint shadow/release failures are best effort and must
+						// not alter the established async caller result.
+					}
+				});
+			await checkpointShadowSettled;
+		}
 		queueResult = {
 			results,
 			totalTasks: tasks.length,
@@ -8705,7 +8754,7 @@ export async function runQueueAsync(options) {
 			deferredTaskIds,
 			policyDeferred,
 			checkpointPath,
-			ledgerWritesSettled: Promise.resolve(),
+			ledgerWritesSettled: checkpointShadowSettled,
 			quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
 			retryState: checkpoint.retryState,
 			retryTransitionId: checkpoint.retryTransitionId,
@@ -12289,8 +12338,41 @@ export function runQueue(options) {
 		// A halt entry was already persisted by recordHalt before the
 		// queue_halted event fired; this final save is a no-op for that entry
 		// and remains for the other fields/zero-runnable path.
-		if (checkpoint.version === CHECKPOINT_VERSION)
+		let checkpointShadowSettled = null;
+		if (
+			checkpoint.version === CHECKPOINT_VERSION &&
+			runStore &&
+			typeof runStore.readRun === "function" &&
+			typeof runId === "string"
+		) {
+			// runQueue is intentionally synchronous. Defer checkpoint release to
+			// the returned drain boundary so terminal shadow evidence observes both
+			// the terminal run update and the final typed outcome writes.
+			checkpointShadowSettled = Promise.all([
+				storeWriteChain,
+				context._outcomeWriteChain ?? Promise.resolve(),
+			])
+				.then(() =>
+					persistCheckpointOutcomeShadow(
+						checkpointPath,
+						checkpoint,
+						runStore,
+						runId,
+					).catch(() => false),
+				)
+				.catch(() => false)
+				.finally(() => {
+					try {
+						releaseCheckpointOwnership(checkpointPath, checkpoint);
+					} catch {
+						// Shadow/release failures are best effort and must not alter
+						// the established synchronous caller result.
+					}
+				});
+		}
+		if (checkpoint.version === CHECKPOINT_VERSION && !checkpointShadowSettled) {
 			releaseCheckpointOwnership(checkpointPath, checkpoint);
+		}
 
 		return {
 			totalTasks: tasks.length,
@@ -12307,6 +12389,7 @@ export function runQueue(options) {
 			ledgerWritesSettled: Promise.all([
 				storeWriteChain,
 				context._outcomeWriteChain ?? Promise.resolve(),
+				checkpointShadowSettled ?? Promise.resolve(),
 			]),
 			...(identity.enabled
 				? {
@@ -12366,10 +12449,14 @@ export function runQueue(options) {
 
 /** Preserve the same receipt identity on direct orchestrator callers. */
 export async function executeTaskWithOrchestrator(task, context) {
-	return decorateDirtyOverlayResult(
+	const result = decorateDirtyOverlayResult(
 		await executeTaskWithOrchestratorUnsafe(task, context),
 		context,
 	);
+	if (context?.recordOutcomeEvent && context?.outcomeWriterEpoch) {
+		await emitTaskStageOutcomes(context, task, result);
+	}
+	return result;
 }
 
 /**
@@ -12585,6 +12672,9 @@ export async function runQueueWithOrchestrator(options) {
 			enabled: false,
 		},
 		completionContinuationMode: "unavailable",
+		emitNonProviderOutcomes:
+			dependencies.enableNonProviderOutcomes === true ||
+			typeof dependencies.recordOutcomeEvent !== "function",
 		monotonicNow: dependencies.monotonicNow ?? (() => performance.now()),
 	};
 
@@ -12911,6 +13001,18 @@ export async function runQueueWithOrchestrator(options) {
 					),
 					error,
 				);
+			}
+			// Shadow evidence is strictly additive. Isolate its failure from the
+			// legacy terminal update and caller result.
+			try {
+				await persistCheckpointOutcomeShadow(
+					checkpointPath,
+					checkpoint,
+					runStore,
+					runId,
+				);
+			} catch {
+				// Best effort only: release below still completes the legacy path.
 			}
 		}
 

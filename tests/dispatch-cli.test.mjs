@@ -125,8 +125,13 @@ import {
 import {
 	acquireProjectLock,
 	advanceState,
+	appendOutcomeEvent,
+	createStageOutcome,
 	initializeRun,
 	LockError,
+	projectOutcomeShadow,
+	readRun,
+	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
 import {
 	CheckpointIdentityError,
@@ -1840,6 +1845,78 @@ describe("status integration", () => {
 		const serialized = JSON.stringify(status.queueDiagnostics);
 		ok(!serialized.includes("provider-secret-name.mjs"));
 		ok(!serialized.includes("provider task description"));
+	});
+
+	it("detached status/result preserve the fixture-reduced shadow and legacy disposition", async () => {
+		const runId = `typed-shadow-envelope-${randomUUID()}`;
+		const replayFixture = JSON.parse(
+			readFileSync(
+				resolve(__dirname, "fixtures", "outcome-replay.json"),
+				"utf8",
+			),
+		);
+		const source = replayFixture.records.find(
+			(record) =>
+				record.evidenceStatus === "observed" && record.stage === "artifact",
+		);
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		let current = await readRun(runId);
+		current = await updateRun(
+			runId,
+			{ outcomeWriterEpoch: `epoch-${runId}` },
+			current.revision,
+		);
+		const typed = createStageOutcome({
+			runId,
+			taskId: "1.1",
+			attempt: source.counter,
+			attemptId: "fixture-attempt-1",
+			stage: "artifact",
+			status: "failed",
+			producer: "runner",
+			code: "artifact_capture",
+			detail: {
+				artifactKind: "diff",
+				captured: false,
+				contentHash: source.identityHash,
+			},
+			writerEpoch: current.outcomeWriterEpoch,
+		});
+		await appendOutcomeEvent(runId, typed, {
+			writerEpoch: current.outcomeWriterEpoch,
+		});
+		current = await readRun(runId);
+		current = await updateRun(
+			runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				terminalSummary: { processedTasks: 1, failedCount: 1 },
+			},
+			current.revision,
+		);
+		const expectedShadow = projectOutcomeShadow([typed], { run: current });
+		deepStrictEqual(current.outcomeShadow, expectedShadow);
+
+		const status = JSON.parse(
+			runDispatch(["status", runId], makeStateRootEnv()).stdout.trim(),
+		);
+		const result = JSON.parse(
+			runDispatch(["result", runId], makeStateRootEnv()).stdout.trim(),
+		);
+		deepStrictEqual(status.outcomeShadow, expectedShadow);
+		deepStrictEqual(result.outcomeShadow, expectedShadow);
+		strictEqual(status.disposition.action, result.disposition.action);
+		strictEqual(status.disposition.outcomeShadow.parity.evidence, "shadow");
+		strictEqual(result.disposition.outcomeShadow.parity.evidence, "shadow");
 	});
 });
 

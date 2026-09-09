@@ -1225,3 +1225,22 @@ describe("terminal outcome projection", () => {
 		it(name, () => strictEqual(projectTerminalOutcome(evidence), expected));
 	}
 });
+
+describe("shadow disposition parity", () => {
+	it("carries reducer evidence without changing the legacy action", () => {
+		const outcomeShadow = {
+			version: 1,
+			projection: { finalStatus: "failed" },
+			parity: { version: 1, status: "match", evidence: "shadow" },
+			recoveryQueue: [],
+		};
+		const result = projectDisposition({
+			run: run({ state: "running" }),
+			liveness: "live",
+			outcomeShadow,
+		});
+		strictEqual(result.action, "monitor");
+		strictEqual(result.direction, "wait");
+		deepStrictEqual(result.outcomeShadow, outcomeShadow);
+	});
+});

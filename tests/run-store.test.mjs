@@ -53,7 +53,9 @@ import {
 	isProjectLockOwnedBy,
 	isRunLockExpired,
 	LockError,
+	mergeOutcomeShadow,
 	persistDiagnosticArtifact,
+	projectOutcomeShadow,
 	RevisionError,
 	readAuthorizedRunEvents,
 	readEvents,
@@ -85,6 +87,141 @@ const TEST_ROOT = tempDir("switchyard-run-store-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
+
+describe("shadow reducer projection", () => {
+	it("keeps legacy status authoritative and exposes sanitized parity", () => {
+		const provider = createStageOutcome({
+			runId: "shadow-projection",
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			stage: "artifact",
+			status: "failed",
+			producer: "runner",
+			code: "execution_failed",
+			detail: { artifactKind: "diff", captured: false },
+		});
+		const shadow = projectOutcomeShadow([provider], {
+			run: {
+				runId: "shadow-projection",
+				state: "failed",
+				cleanupState: "complete",
+			},
+		});
+		strictEqual(shadow.version, 1);
+		strictEqual(shadow.projection.finalStatus, "failed");
+		strictEqual(shadow.parity.status, "match");
+		strictEqual(shadow.parity.evidence, "shadow");
+		strictEqual(shadow.recoveryQueue.length, 0);
+		ok(!Object.hasOwn(shadow.parity, "detail"));
+	});
+
+	it("queues orphan attempts for operator recovery without retry or slot use", () => {
+		const orphan = createStageOutcome({
+			runId: "shadow-orphan",
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			stage: "recovery",
+			status: "failed",
+			producer: "recovery",
+			code: "orphan_attempt",
+			detail: {
+				reasonCode: "orphan_attempt",
+				operatorCommand: "switchyard-dispatch recover",
+			},
+		});
+		const shadow = projectOutcomeShadow([orphan], {
+			run: { runId: "shadow-orphan", state: "recovery_required" },
+		});
+		strictEqual(shadow.projection.finalStatus, "recovery_required");
+		strictEqual(shadow.recoveryQueue.length, 1);
+		strictEqual(shadow.recoveryQueue[0].automaticRetry, false);
+		strictEqual(shadow.recoveryQueue[0].executionSlotConsumed, false);
+		strictEqual(
+			shadow.recoveryQueue[0].operatorCommand,
+			"switchyard-dispatch recover",
+		);
+	});
+
+	it("latches a mismatch across later matching observations", () => {
+		const mismatch = projectOutcomeShadow(
+			[
+				createStageOutcome({
+					runId: "shadow-latch",
+					taskId: "1.1",
+					stage: "recovery",
+					status: "failed",
+					producer: "recovery",
+					code: "orphan_attempt",
+					detail: { reasonCode: "orphan_attempt" },
+				}),
+			],
+			{ run: { runId: "shadow-latch", state: "failed" } },
+		);
+		const matching = projectOutcomeShadow(
+			[
+				createStageOutcome({
+					runId: "shadow-latch",
+					taskId: "1.1",
+					stage: "artifact",
+					status: "failed",
+					producer: "runner",
+					code: "artifact_capture",
+					detail: { artifactKind: "diff", captured: false },
+				}),
+			],
+			{ run: { runId: "shadow-latch", state: "failed" } },
+		);
+		const latched = mergeOutcomeShadow(mismatch, matching);
+		strictEqual(mismatch.parity.status, "mismatch");
+		strictEqual(matching.parity.status, "match");
+		strictEqual(latched.parity.status, "mismatch");
+		strictEqual(latched.parity.cutoverBlocked, true);
+	});
+
+	it("refreshes parity after a terminal run-state transition", async () => {
+		const runId = `shadow-terminal-${randomUUID()}`;
+		const initial = await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "fixture",
+			workerNonce: randomUUID(),
+		});
+		const active = await updateRun(
+			runId,
+			{ outcomeWriterEpoch: "epoch-shadow-terminal" },
+			initial.revision,
+		);
+		await appendOutcomeEvent(
+			runId,
+			createStageOutcome({
+				runId,
+				taskId: "1.1",
+				stage: "artifact",
+				status: "failed",
+				producer: "runner",
+				code: "artifact_capture",
+				detail: { artifactKind: "diff", captured: false },
+				writerEpoch: active.outcomeWriterEpoch,
+			}),
+			{ writerEpoch: active.outcomeWriterEpoch },
+		);
+		const before = await readRun(runId);
+		strictEqual(before.outcomeShadow.parity.legacyStatus, "unknown");
+		const terminal = await updateRun(
+			runId,
+			{
+				state: "failed",
+				cleanupState: "complete",
+				terminalSummary: { processedTasks: 1 },
+			},
+			before.revision,
+		);
+		strictEqual(terminal.outcomeShadow.parity.legacyStatus, "failed");
+		strictEqual(terminal.outcomeShadow.projection.finalStatus, "failed");
+	});
+});
 
 describe("typed stage append boundary", () => {
 	it("keeps retry and causality identities distinct", () => {
@@ -162,6 +299,10 @@ describe("typed stage append boundary", () => {
 		const [persisted] = await readEvents(runId);
 		strictEqual(persisted.stage, "provider");
 		strictEqual(persisted.detail.code, "process_completed");
+		const shadowRun = await readRun(runId);
+		strictEqual(shadowRun.outcomeShadow.version, 1);
+		strictEqual(shadowRun.outcomeShadow.parity.evidence, "shadow");
+		strictEqual(shadowRun.outcomeShadow.projection.finalStatus, "unknown");
 	});
 
 	it("assigns one sequenced typed fact per stage and preserves causality", async () => {

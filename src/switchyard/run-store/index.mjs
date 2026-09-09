@@ -41,6 +41,7 @@ import {
 	isReviewResult,
 	sanitizeReviewResult,
 } from "../diagnostics/review-result.mjs";
+import { reduceOutcomeEvents } from "../outcome/reducer.mjs";
 import {
 	createOversizeRejectionFact,
 	isOutcomeEvent,
@@ -238,6 +239,263 @@ const APPROVED_EVENT_KEYS = new Set([
 
 const EVENT_RESERVE_BYTES = 1024;
 const EVENT_LOCK_WAIT_MS = 5_000;
+
+// Reducer output is additive shadow evidence during the migration.  Keep the
+// stored shape intentionally small and content-free: the typed event log is
+// the source for replay, while run.json carries the latest bounded summary.
+const OUTCOME_SHADOW_VERSION = 1;
+const OUTCOME_SHADOW_FAILURE_LIMIT = 16;
+
+function shadowCanonical(value) {
+	if (Array.isArray(value)) return `[${value.map(shadowCanonical).join(",")}]`;
+	if (value && typeof value === "object")
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${shadowCanonical(value[key])}`)
+			.join(",")}}`;
+	return JSON.stringify(value);
+}
+
+function shadowDigest(value) {
+	return `sha256:${createHash("sha256")
+		.update(shadowCanonical(value), "utf8")
+		.digest("hex")}`;
+}
+
+function boundedShadowFailures(failures) {
+	return (Array.isArray(failures) ? failures : [])
+		.slice(0, OUTCOME_SHADOW_FAILURE_LIMIT)
+		.map((failure) => {
+			const result = {};
+			for (const key of [
+				"stage",
+				"status",
+				"code",
+				"reasonCode",
+				"sequence",
+				"outcomeId",
+				"taskId",
+				"attemptId",
+				"attempt",
+				"operationId",
+				"causedBy",
+				"evidence",
+				"legacyPhase",
+				"legacyEvent",
+				"diagnosticRef",
+			]) {
+				if (failure?.[key] !== undefined) result[key] = failure[key];
+			}
+			return result;
+		});
+}
+
+function boundedShadowProjection(projection) {
+	return {
+		projectionVersion: projection.projectionVersion,
+		runId: projection.runId,
+		finalStatus: projection.finalStatus,
+		primaryFailure: projection.primaryFailure
+			? boundedShadowFailures([projection.primaryFailure])[0]
+			: null,
+		secondaryFailures: boundedShadowFailures(projection.secondaryFailures),
+		diagnosticEvidence: {
+			status: projection.diagnosticEvidence?.status ?? "unknown",
+			available: projection.diagnosticEvidence?.available === true,
+			diagnosticRefs: Array.isArray(
+				projection.diagnosticEvidence?.diagnosticRefs,
+			)
+				? projection.diagnosticEvidence.diagnosticRefs.slice(0, 16)
+				: [],
+			origins: Array.isArray(projection.diagnosticEvidence?.origins)
+				? projection.diagnosticEvidence.origins.slice(0, 16)
+				: [],
+		},
+		artifactOutcome: projection.artifactOutcome
+			? boundedShadowFailures([projection.artifactOutcome])[0]
+			: null,
+		integrationOutcome: projection.integrationOutcome
+			? boundedShadowFailures([projection.integrationOutcome])[0]
+			: null,
+		cleanupOutcome: projection.cleanupOutcome
+			? boundedShadowFailures([projection.cleanupOutcome])[0]
+			: null,
+		recoveryOutcome: projection.recoveryOutcome
+			? boundedShadowFailures([projection.recoveryOutcome])[0]
+			: null,
+		postconditionOutcome: projection.postconditionOutcome
+			? boundedShadowFailures([projection.postconditionOutcome])[0]
+			: null,
+		taskCounters: projection.taskCounters ?? null,
+		attempts: Array.isArray(projection.attempts)
+			? projection.attempts.slice(0, OUTCOME_SHADOW_FAILURE_LIMIT)
+			: [],
+		causalIntegrity: projection.causalIntegrity ?? null,
+		identityConflicts: Array.isArray(projection.identityConflicts)
+			? projection.identityConflicts.slice(0, OUTCOME_SHADOW_FAILURE_LIMIT)
+			: [],
+		duplicateOutcomes: Array.isArray(projection.duplicateOutcomes)
+			? projection.duplicateOutcomes.slice(0, OUTCOME_SHADOW_FAILURE_LIMIT)
+			: [],
+	};
+}
+
+function legacyStatusForShadow(run) {
+	if (run?.state === "recovery_required") return "recovery_required";
+	if (run?.state === "failed") return "failed";
+	if (run?.state === "succeeded") return "succeeded";
+	if (run?.state === "deferred") return "skipped";
+	return "unknown";
+}
+
+function shadowRecoveryQueue(projection) {
+	if (projection?.finalStatus !== "recovery_required") return [];
+	const orphan = projection.outcomes?.find(
+		(event) =>
+			event.stage === "recovery" &&
+			(event.detail?.reasonCode === "orphan_attempt" ||
+				event.detail?.code === "recovery_required"),
+	);
+	return [
+		{
+			version: 1,
+			status: "queued",
+			reasonCode: orphan?.detail?.reasonCode ?? "recovery_required",
+			automaticRetry: false,
+			executionSlotConsumed: false,
+			operatorCommand:
+				orphan?.detail?.operatorCommand ?? "switchyard-dispatch recover",
+		},
+	];
+}
+
+export function mergeOutcomeShadow(previous, next) {
+	if (!previous || typeof previous !== "object") return next;
+	const priorParity = previous.parity;
+	const nextParity = next.parity;
+	const priorBlocked = priorParity?.cutoverBlocked === true;
+	const priorDigest = priorParity?.mismatchDigest ?? null;
+	const nextMismatch = nextParity.status === "mismatch";
+	const mismatchDigest = nextMismatch
+		? shadowDigest({
+				legacyStatus: nextParity.legacyStatus,
+				reducerStatus: nextParity.reducerStatus,
+				mismatchFields: nextParity.mismatchFields,
+			})
+		: priorDigest;
+	const mismatchCount =
+		(previous.parity?.mismatchCount ?? 0) +
+		(nextMismatch && mismatchDigest !== priorDigest ? 1 : 0);
+	if (!priorBlocked && !nextMismatch) {
+		return {
+			...next,
+			parity: { ...nextParity, mismatchCount, mismatchDigest },
+		};
+	}
+	return {
+		...next,
+		parity: {
+			...nextParity,
+			status: "mismatch",
+			mismatchFields: [
+				...new Set([
+					...(priorParity?.mismatchFields ?? []),
+					...(nextParity.mismatchFields ?? []),
+				]),
+			],
+			cutoverBlocked: true,
+			mismatchCount,
+			mismatchDigest: mismatchDigest ?? priorDigest,
+		},
+	};
+}
+
+/**
+ * Build the latest reducer projection and a sanitized parity record.
+ *
+ * This helper is deliberately pure and additive.  Callers may persist its
+ * result, but no legacy status, result, or disposition is read from it during
+ * the shadow phase.
+ */
+export function projectOutcomeShadow(events, { run = null } = {}) {
+	if (!Array.isArray(events))
+		throw new TypeError("shadow events must be an array");
+	try {
+		const reduced = reduceOutcomeEvents(events, {
+			runId: run?.runId,
+		});
+		const projection = boundedShadowProjection(reduced);
+		const legacyStatus = legacyStatusForShadow(run);
+		const unavailable =
+			legacyStatus !== "unknown" && projection.finalStatus === "unknown";
+		const mismatch =
+			legacyStatus !== "unknown" &&
+			projection.finalStatus !== "unknown" &&
+			((legacyStatus === "succeeded" &&
+				projection.finalStatus !== "succeeded") ||
+				(legacyStatus === "failed" && projection.finalStatus !== "failed") ||
+				(legacyStatus === "recovery_required" &&
+					projection.finalStatus !== "recovery_required"));
+		const parity = {
+			version: OUTCOME_SHADOW_VERSION,
+			status: unavailable ? "unavailable" : mismatch ? "mismatch" : "match",
+			legacyStatus,
+			reducerStatus: projection.finalStatus,
+			legacyDigest: shadowDigest({
+				state: run?.state ?? null,
+				cleanupState: run?.cleanupState ?? null,
+				terminalSummary: run?.terminalSummary ?? null,
+			}),
+			reducerDigest: shadowDigest(projection),
+			mismatchFields: unavailable
+				? ["history"]
+				: mismatch
+					? ["finalStatus"]
+					: [],
+			cutoverBlocked: mismatch,
+			mismatchCount: mismatch ? 1 : 0,
+			mismatchDigest: mismatch
+				? shadowDigest({ legacyStatus, reducerStatus: projection.finalStatus })
+				: null,
+			evidence: "shadow",
+		};
+		return {
+			version: OUTCOME_SHADOW_VERSION,
+			projection,
+			parity,
+			recoveryQueue: shadowRecoveryQueue(reduced),
+		};
+	} catch {
+		return {
+			version: OUTCOME_SHADOW_VERSION,
+			projection: {
+				projectionVersion: 1,
+				runId: run?.runId ?? null,
+				finalStatus: "unknown",
+				primaryFailure: null,
+				secondaryFailures: [],
+				diagnosticEvidence: {
+					status: "unavailable",
+					available: false,
+					diagnosticRefs: [],
+					origins: [],
+				},
+				taskCounters: null,
+			},
+			parity: {
+				version: OUTCOME_SHADOW_VERSION,
+				status: "unavailable",
+				legacyStatus: legacyStatusForShadow(run),
+				reducerStatus: "unknown",
+				legacyDigest: null,
+				reducerDigest: null,
+				mismatchFields: ["history"],
+				evidence: "shadow",
+			},
+			recoveryQueue: [],
+		};
+	}
+}
 
 const ROUTE_HEALTH_BINDING_KEYS = new Set([
 	"version",
@@ -1056,6 +1314,39 @@ function validateRun(data) {
 			throw new SchemaError("outcomeRecovery is invalid");
 		}
 	}
+	if (data.outcomeShadow !== undefined && data.outcomeShadow !== null) {
+		const shadow = data.outcomeShadow;
+		if (
+			!shadow ||
+			typeof shadow !== "object" ||
+			Array.isArray(shadow) ||
+			shadow.version !== OUTCOME_SHADOW_VERSION ||
+			!shadow.projection ||
+			!shadow.parity ||
+			!Array.isArray(shadow.recoveryQueue) ||
+			Object.keys(shadow).some(
+				(key) =>
+					!["version", "projection", "parity", "recoveryQueue"].includes(key),
+			) ||
+			shadow.parity.version !== OUTCOME_SHADOW_VERSION ||
+			!new Set(["match", "mismatch", "unavailable"]).has(shadow.parity.status)
+		) {
+			throw new SchemaError("outcomeShadow is invalid");
+		}
+		for (const item of shadow.recoveryQueue) {
+			if (
+				!item ||
+				typeof item !== "object" ||
+				item.version !== 1 ||
+				item.status !== "queued" ||
+				item.automaticRetry !== false ||
+				item.executionSlotConsumed !== false ||
+				item.operatorCommand !== "switchyard-dispatch recover"
+			) {
+				throw new SchemaError("outcomeShadow recovery queue is invalid");
+			}
+		}
+	}
 	if (
 		data.activeTaskStartedAt !== undefined &&
 		data.activeTaskStartedAt !== null &&
@@ -1571,6 +1862,7 @@ export async function initializeRun(options) {
 		minimumOutcomeReaderVersion: SUPPORTED_OUTCOME_READER_VERSION,
 		outcomeWriterEpoch: null,
 		outcomeRecovery: null,
+		outcomeShadow: null,
 		lastFailure: null,
 		lastReviewResult: null,
 		launchArgs,
@@ -1836,6 +2128,19 @@ async function performUpdate(runId, partial, expectedRevision) {
 			result: "execution_failed",
 			errorKind: "unclassified",
 		});
+	}
+	// Recompute against the post-update run state so a terminal transition does
+	// not leave the shadow parity record describing the prior live state. This
+	// remains additive; callers continue reading the legacy fields above.
+	const eventLog = await inspectEventLog(runId).catch(() => null);
+	if (eventLog) {
+		const refreshedShadow = projectOutcomeShadow(eventLog.events, {
+			run: merged,
+		});
+		merged.outcomeShadow = mergeOutcomeShadow(
+			current.outcomeShadow,
+			refreshedShadow,
+		);
 	}
 
 	validateRun(merged);
@@ -2289,11 +2594,13 @@ async function createEventInternal(
 	await appendFile(eventsPath, serialized, {
 		mode: 0o600,
 	});
+	const shadow = projectOutcomeShadow([...log.events, entry], { run: current });
 
 	await performUpdate(
 		runId,
 		{
 			lastEventSequence: nextSeq,
+			outcomeShadow: mergeOutcomeShadow(current.outcomeShadow, shadow),
 			...(safeFailure ? { lastFailure: safeFailure } : {}),
 			...(projectedReviewResult !== undefined
 				? { lastReviewResult: projectedReviewResult }
@@ -2475,9 +2782,15 @@ export async function appendOutcomeEvent(
 				)
 					throw new SchemaError("event reserve cannot be proven intact");
 				await appendFile(log.path, candidateRaw, { mode: 0o600 });
+				const shadow = projectOutcomeShadow([...log.events, candidate], {
+					run,
+				});
 				await performUpdate(
 					runId,
-					{ lastEventSequence: sequence },
+					{
+						lastEventSequence: sequence,
+						outcomeShadow: mergeOutcomeShadow(run.outcomeShadow, shadow),
+					},
 					run.revision,
 				);
 				return sequence;

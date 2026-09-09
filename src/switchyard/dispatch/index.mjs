@@ -1829,6 +1829,19 @@ function countCompletedAndFailed(events) {
 	return { completedCount, failedCount };
 }
 
+function shadowEnvelope(run) {
+	const shadow = run?.outcomeShadow;
+	if (!shadow || typeof shadow !== "object") return null;
+	return {
+		version: shadow.version ?? 1,
+		projection: shadow.projection ?? null,
+		parity: shadow.parity ?? null,
+		recoveryQueue: Array.isArray(shadow.recoveryQueue)
+			? shadow.recoveryQueue
+			: [],
+	};
+}
+
 function sanitizedExecutionFailureEvents(events) {
 	const failureFields = [
 		"errorKind",
@@ -2106,6 +2119,8 @@ async function buildStatusEnvelope(runId, run) {
 		optionalEvidenceValid:
 			events.evidenceValid !== false && checkpointState !== null,
 	});
+	const outcomeShadow = shadowEnvelope(run);
+	if (outcomeShadow) disposition.outcomeShadow = outcomeShadow;
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
@@ -2186,6 +2201,7 @@ async function buildStatusEnvelope(runId, run) {
 		finishedAt: run.finishedAt ?? null,
 		updatedAt: run.updatedAt,
 		disposition,
+		outcomeShadow,
 		...telemetry,
 	};
 }
@@ -2267,6 +2283,8 @@ async function buildResultEnvelope(runId, run) {
 		optionalEvidenceValid:
 			events.evidenceValid !== false && checkpointState !== null,
 	});
+	const outcomeShadow = shadowEnvelope(run);
+	if (outcomeShadow) disposition.outcomeShadow = outcomeShadow;
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
@@ -2342,6 +2360,7 @@ async function buildResultEnvelope(runId, run) {
 		},
 		artifactRefs,
 		disposition,
+		outcomeShadow,
 		...telemetry,
 	};
 }

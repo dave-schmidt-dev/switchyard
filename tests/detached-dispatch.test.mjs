@@ -952,6 +952,7 @@ export async function resolve(specifier, context, nextResolve) {
 		const runId = await launchAndGetRunId();
 
 		let terminalReached = false;
+		let terminalStatus = null;
 		const start = Date.now();
 		const maxWait = 15_000;
 
@@ -964,6 +965,7 @@ export async function resolve(specifier, context, nextResolve) {
 			const status = JSON.parse(statusResult.stdout.trim());
 
 			if (status.state === "succeeded" || status.state === "failed") {
+				terminalStatus = status;
 				terminalReached = true;
 				break;
 			}
@@ -976,6 +978,20 @@ export async function resolve(specifier, context, nextResolve) {
 		strictEqual(resultResult.status, 1, "result exits 1 for failed run");
 
 		const result = JSON.parse(resultResult.stdout.trim());
+		ok(
+			terminalStatus?.outcomeShadow,
+			"detached status carries shadow evidence",
+		);
+		deepStrictEqual(
+			terminalStatus.outcomeShadow,
+			result.outcomeShadow,
+			"detached status/result shadow parity",
+		);
+		deepStrictEqual(
+			terminalStatus.disposition.outcomeShadow,
+			result.disposition.outcomeShadow,
+			"detached disposition carries the same shadow evidence",
+		);
 		ok(result.terminalSummary !== null, "terminalSummary present");
 		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
 		ok(typeof result.startedAt === "string", "startedAt present");

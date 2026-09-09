@@ -340,7 +340,7 @@ function currentFailureTaskContext(run, checkpoint, failure) {
 }
 
 /** Pure caller disposition projection over already-validated durable evidence. */
-export function projectDisposition({
+function projectLegacyDisposition({
 	run = null,
 	preInitialization = null,
 	checkpoint = null,
@@ -467,6 +467,19 @@ export function projectDisposition({
 		}
 	}
 	return baseDisposition("stop", "insufficient_evidence", failure);
+}
+
+/**
+ * Project the legacy caller action and, when supplied, carry reducer parity as
+ * additive shadow evidence. The action and routing hint remain computed solely
+ * from legacy durable fields until the reader cutover gate passes.
+ */
+export function projectDisposition(options = {}) {
+	const result = projectLegacyDisposition(options);
+	if (options.outcomeShadow !== undefined) {
+		result.outcomeShadow = options.outcomeShadow;
+	}
+	return result;
 }
 
 /** Derive an additive closed terminal outcome without mutating history. */
