@@ -35,6 +35,7 @@ build/
 # (real names, amounts, dates) that must not enter git history. Both cases.
 HISTORY.md
 TASKS.md
+STABILIZATION.md
 history.md
 tasks.md
 # Session handoff pointer: same rationale, plus tracker IDs and blocker prose.
