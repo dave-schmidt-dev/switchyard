@@ -12,7 +12,7 @@ describe("stabilization ledger", () => {
 		const rows = validateStabilizationLedger(
 			readFileSync("STABILIZATION.md", "utf8"),
 		);
-		strictEqual(rows.length, 1);
+		strictEqual(rows.length >= 1, true);
 		deepStrictEqual(LEDGER_COLUMNS, [
 			"task",
 			"candidate",
@@ -23,8 +23,9 @@ describe("stabilization ledger", () => {
 			"deadcode",
 			"phase-gate",
 		]);
-		strictEqual(rows[0].candidate, "326bc7b");
-		strictEqual(rows[0]["phase-gate"], "passed");
+		const taskZeroOne = rows.find((row) => row.task === "0.1");
+		strictEqual(taskZeroOne?.candidate, "326bc7b");
+		strictEqual(taskZeroOne?.["phase-gate"], "passed");
 	});
 
 	it("rejects extra columns and candidate drift", () => {
