@@ -1,0 +1,149 @@
+{
+	"schemaVersion": 1,
+	"sourceFieldAllowlist": [
+		"stage",
+		"classification",
+		"counter",
+		"identityHash",
+		"evidenceStatus"
+	],
+	"sortPrecedence": [
+		"identityHash",
+		"classification",
+		"stage",
+		"counter",
+		"evidenceStatus"
+	],
+	"classificationPrecedence": [
+		"preflight_failure",
+		"auth_expiry",
+		"provider_failure",
+		"artifact_failure",
+		"integration_rejection",
+		"cleanup_uncertainty",
+		"detached_fatal",
+		"ambiguous_completion",
+		"duplicate_event",
+		"success"
+	],
+	"records": [
+		{
+			"stage": "integration",
+			"classification": "integration_rejection",
+			"counter": 1,
+			"identityHash": "sha256:00efbc2f1792b7c4e73410f0b56b5683249eb733091b803221ed885bf2f589f2",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "detached",
+			"classification": "detached_fatal",
+			"counter": 1,
+			"identityHash": "sha256:084170988701733d033b9e4aaeb54c627b893b9b9ef9dfa91dc2d34c3d464555",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "provider",
+			"classification": "provider_failure",
+			"counter": 1,
+			"identityHash": "sha256:090a54f2100b877965ff25fefcf7d9f71b24e9aaf8ba794d06b39fe541f23ce0",
+			"evidenceStatus": "observed"
+		},
+		{
+			"stage": "artifact",
+			"classification": "artifact_failure",
+			"counter": 1,
+			"identityHash": "sha256:090a54f2100b877965ff25fefcf7d9f71b24e9aaf8ba794d06b39fe541f23ce0",
+			"evidenceStatus": "observed"
+		},
+		{
+			"stage": "artifact",
+			"classification": "artifact_failure",
+			"counter": 2,
+			"identityHash": "sha256:090a54f2100b877965ff25fefcf7d9f71b24e9aaf8ba794d06b39fe541f23ce0",
+			"evidenceStatus": "observed"
+		},
+		{
+			"stage": "artifact",
+			"classification": "artifact_failure",
+			"counter": 3,
+			"identityHash": "sha256:090a54f2100b877965ff25fefcf7d9f71b24e9aaf8ba794d06b39fe541f23ce0",
+			"evidenceStatus": "observed"
+		},
+		{
+			"stage": "provider",
+			"classification": "provider_failure",
+			"counter": 1,
+			"identityHash": "sha256:0970b6ae6baf39bf8a252b96c9bf4db6e8fe25e5f9d0d8e15ffa80cf5e2110f0",
+			"evidenceStatus": "observed"
+		},
+		{
+			"stage": "artifact",
+			"classification": "artifact_failure",
+			"counter": 1,
+			"identityHash": "sha256:0970b6ae6baf39bf8a252b96c9bf4db6e8fe25e5f9d0d8e15ffa80cf5e2110f0",
+			"evidenceStatus": "observed"
+		},
+		{
+			"stage": "provider",
+			"classification": "provider_failure",
+			"counter": 1,
+			"identityHash": "sha256:11c4fa13ef4d4a103dde1a1c750c929729c5f4a745f784d06a0aa5378df61d0f",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "run",
+			"classification": "success",
+			"counter": 1,
+			"identityHash": "sha256:a0ba4f11c3fa5528ecbfd4ec11fbe3bfec62f0f4e7415ce97f1b6d426935dc8d",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "preflight",
+			"classification": "preflight_failure",
+			"counter": 1,
+			"identityHash": "sha256:a873c69bee9db60b481c2e44da42815a43859db6d4208d6ca14867f83804a61c",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "preflight",
+			"classification": "auth_expiry",
+			"counter": 1,
+			"identityHash": "sha256:a94e94086450ac6251efd0f727de8f29961c3eefa16c4449474bcc4145d3212f",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "artifact",
+			"classification": "artifact_failure",
+			"counter": 1,
+			"identityHash": "sha256:b1d653ec346160873f62c44487b2d40efe67f602d5f31123f8e21106ee4af2cc",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "completion",
+			"classification": "ambiguous_completion",
+			"counter": 1,
+			"identityHash": "sha256:b4618cade31582e1edba9b977114da24e194d075ddf2aaabb31d7a56b553d251",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "cleanup",
+			"classification": "cleanup_uncertainty",
+			"counter": 1,
+			"identityHash": "sha256:b79886128a3b04378ea63cfacd1e93d51798116a5ac000f52c4c1c2d98755787",
+			"evidenceStatus": "sanitized"
+		},
+		{
+			"stage": "completion",
+			"classification": "duplicate_event",
+			"counter": 1,
+			"identityHash": "sha256:e8ddeb6e3930f30fa7d67607bb2ffd01e9a2da8db142e643d2240d8bf0595a13",
+			"evidenceStatus": "sanitized"
+		}
+	],
+	"baselines": {
+		"maskingPrimary": "provider_failure",
+		"maskingSecondary": "artifact_failure",
+		"logicalFailedTasks": 1,
+		"failureFacts": 2
+	}
+}
