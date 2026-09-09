@@ -19,6 +19,7 @@ import {
 	serializeOutcomeReplayCorpus,
 	validateSanitizedRecord,
 } from "../scripts/build-outcome-replay-corpus.mjs";
+import { reduceOutcomeEvents } from "../src/switchyard/outcome/reducer.mjs";
 
 const TEMP_ROOT = mkdtempSync(join(tmpdir(), "switchyard-outcome-replay-"));
 
@@ -154,5 +155,57 @@ describe("outcome replay corpus", () => {
 				.length >= 2,
 			true,
 		);
+	});
+
+	it("replays both masking runs with provider primary and artifact secondary", () => {
+		const maskingRuns = [
+			[
+				{
+					sequence: 1,
+					phase: "provider",
+					event: "execution_failed",
+					taskId: "1.1",
+					reasonCode: "execution_failed",
+					runId: "mask-a",
+				},
+				{
+					sequence: 2,
+					phase: "artifact",
+					event: "diff_capture_failed",
+					taskId: "1.1",
+					reasonCode: "diff_capture_failed",
+					runId: "mask-a",
+				},
+			],
+			[
+				{
+					sequence: 4,
+					phase: "artifact",
+					event: "diff_capture_failed",
+					taskId: "1.1",
+					reasonCode: "diff_capture_failed",
+					runId: "mask-b",
+				},
+				{
+					sequence: 3,
+					phase: "provider",
+					event: "execution_failed",
+					taskId: "1.1",
+					reasonCode: "execution_failed",
+					runId: "mask-b",
+				},
+			],
+		];
+		for (const events of maskingRuns) {
+			const projection = reduceOutcomeEvents(events);
+			strictEqual(projection.primaryFailure.reasonCode, "execution_failed");
+			strictEqual(projection.primaryFailure.stage, "provider");
+			strictEqual(projection.secondaryFailures.length, 1);
+			strictEqual(
+				projection.secondaryFailures[0].reasonCode,
+				"diff_capture_failed",
+			);
+			strictEqual(projection.taskCounters.failed, 1);
+		}
 	});
 });
