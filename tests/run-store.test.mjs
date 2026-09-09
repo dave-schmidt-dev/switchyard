@@ -56,6 +56,7 @@ import {
 	readAuthorizedRunEvents,
 	readEvents,
 	readRun,
+	reconcileEventSequence,
 	reconcileProjectLockClaims,
 	releaseLaunchLock,
 	releaseOrphanedProjectLocks,
@@ -3949,6 +3950,52 @@ describe("lastEventSequence tracking", () => {
 			}),
 			SchemaError,
 		);
+	});
+
+	it("allocates unique sequences for concurrent appends and reconciles a torn ceiling", async () => {
+		const opts = makeOptions();
+		await initializeRun(opts);
+		const sequences = await Promise.all(
+			Array.from({ length: 40 }, (_, index) =>
+				createEvent(opts.runId, {
+					phase: "execution",
+					event: `concurrent_${index}`,
+					status: "ok",
+				}),
+			),
+		);
+		deepStrictEqual(
+			[...sequences].sort((a, b) => a - b),
+			Array.from({ length: 40 }, (_, index) => index + 1),
+		);
+
+		const run = await readRun(opts.runId);
+		writeFileSync(
+			join(getRunRoot(opts.runId), "run.json"),
+			JSON.stringify({ ...run, lastEventSequence: 39 }),
+			{ mode: 0o600 },
+		);
+		await rejects(readEvents(opts.runId), /ceiling is unresolved/);
+		const repair = await reconcileEventSequence(opts.runId);
+		strictEqual(repair.repaired, true);
+		strictEqual((await readRun(opts.runId)).lastEventSequence, 40);
+	});
+
+	it("rejects a sequence gap and a persisted minimum reader above this binary", async () => {
+		const opts = makeOptions();
+		const run = await initializeRun(opts);
+		writeFileSync(
+			join(getRunRoot(opts.runId), "events.jsonl"),
+			`${JSON.stringify({ schemaVersion: 1, sequence: 2, timestamp: new Date().toISOString(), phase: "execution", event: "task_started", status: "ok" })}\n`,
+			{ mode: 0o600 },
+		);
+		await rejects(reconcileEventSequence(opts.runId), /sequence gap/);
+		writeFileSync(
+			join(getRunRoot(opts.runId), "run.json"),
+			JSON.stringify({ ...run, minimumOutcomeReaderVersion: 2 }),
+			{ mode: 0o600 },
+		);
+		await rejects(readRun(opts.runId), /minimum outcome reader version/);
 	});
 });
 

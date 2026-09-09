@@ -42,6 +42,15 @@ import {
 	sanitizeReviewResult,
 } from "../diagnostics/review-result.mjs";
 import {
+	createOversizeRejectionFact,
+	isOutcomeEvent,
+	OUTCOME_EVENT_MAX_BYTES,
+	OUTCOME_FILE_MAX_BYTES,
+	OUTCOME_FILE_MAX_LINES,
+	SUPPORTED_OUTCOME_READER_VERSION,
+	validateOutcomeEvent,
+} from "../outcome/schema.mjs";
+import {
 	getInvocationDescriptorIdentity,
 	normalizeProviderName,
 	resolveTargetIdentity,
@@ -206,7 +215,28 @@ const APPROVED_EVENT_KEYS = new Set([
 	// deliberately have no route-health authority.
 	"routeHealthBinding",
 	"reviewResult",
+	// Reader-first outcome compatibility fields. Production writers do not
+	// populate these in this checkpoint.
+	"minimumReaderVersion",
+	"writerEpoch",
+	"outcomeId",
+	"runId",
+	"scope",
+	"attemptId",
+	"resumesOutcomeId",
+	"stage",
+	"legacyPhase",
+	"legacyEvent",
+	"dispatchCausality",
+	"recordedAt",
+	"producer",
+	"causedBy",
+	"operationId",
+	"detail",
 ]);
+
+const EVENT_RESERVE_BYTES = 1024;
+const EVENT_LOCK_WAIT_MS = 5_000;
 
 const ROUTE_HEALTH_BINDING_KEYS = new Set([
 	"version",
@@ -762,6 +792,12 @@ async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
 
 export const runStoreTesting = Object.freeze({
 	acquireVmSlotWithDependencies,
+	eventLimits: Object.freeze({
+		fileBytes: OUTCOME_FILE_MAX_BYTES,
+		lines: OUTCOME_FILE_MAX_LINES,
+		lineBytes: OUTCOME_EVENT_MAX_BYTES,
+		reserveBytes: EVENT_RESERVE_BYTES,
+	}),
 	projectLockArtifacts,
 	readVmSlotBody,
 	unlinkBodyMatched,
@@ -969,6 +1005,53 @@ function validateRun(data) {
 		!Number.isInteger(data.lastEventSequence)
 	) {
 		throw new SchemaError("lastEventSequence must be an integer");
+	}
+	if (
+		data.minimumOutcomeReaderVersion !== undefined &&
+		(!Number.isSafeInteger(data.minimumOutcomeReaderVersion) ||
+			data.minimumOutcomeReaderVersion < 1)
+	) {
+		throw new SchemaError(
+			"minimumOutcomeReaderVersion must be a positive integer",
+		);
+	}
+	if (
+		(data.minimumOutcomeReaderVersion ?? 1) > SUPPORTED_OUTCOME_READER_VERSION
+	) {
+		throw new SchemaError(
+			"persisted minimum outcome reader version is unsupported",
+		);
+	}
+	if (
+		data.outcomeWriterEpoch !== undefined &&
+		data.outcomeWriterEpoch !== null &&
+		(typeof data.outcomeWriterEpoch !== "string" ||
+			!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(data.outcomeWriterEpoch))
+	) {
+		throw new SchemaError("outcomeWriterEpoch is invalid");
+	}
+	if (data.outcomeRecovery !== undefined && data.outcomeRecovery !== null) {
+		const recovery = data.outcomeRecovery;
+		if (
+			!recovery ||
+			typeof recovery !== "object" ||
+			Array.isArray(recovery) ||
+			Object.keys(recovery).some(
+				(key) =>
+					![
+						"reasonCode",
+						"contentHash",
+						"automaticRetry",
+						"operatorCommand",
+					].includes(key),
+			) ||
+			recovery.reasonCode !== "event_reserve_unavailable" ||
+			!DIAGNOSTIC_DIGEST_RE.test(recovery.contentHash ?? "") ||
+			recovery.automaticRetry !== false ||
+			recovery.operatorCommand !== "switchyard-dispatch recover"
+		) {
+			throw new SchemaError("outcomeRecovery is invalid");
+		}
 	}
 	if (
 		data.activeTaskStartedAt !== undefined &&
@@ -1482,6 +1565,9 @@ export async function initializeRun(options) {
 		cleanupError: null,
 		lastLeaseHeartbeat: now,
 		lastEventSequence: 0,
+		minimumOutcomeReaderVersion: SUPPORTED_OUTCOME_READER_VERSION,
+		outcomeWriterEpoch: null,
+		outcomeRecovery: null,
 		lastFailure: null,
 		lastReviewResult: null,
 		launchArgs,
@@ -1671,6 +1757,18 @@ export async function readRun(runId) {
 // silently clobbers an earlier write with no error thrown.
 const updateQueues = new Map();
 
+function enqueueRunMutation(runId, operation) {
+	const previous = updateQueues.get(runId) ?? Promise.resolve();
+	const result = previous.catch(() => {}).then(operation);
+	updateQueues.set(runId, result);
+	void result
+		.finally(() => {
+			if (updateQueues.get(runId) === result) updateQueues.delete(runId);
+		})
+		.catch(() => {});
+	return result;
+}
+
 /**
  * Atomically update a run snapshot with a revision check.
  * Merges `partial` into the current snapshot, increments revision,
@@ -1685,13 +1783,9 @@ const updateQueues = new Map();
  */
 export async function updateRun(runId, partial, expectedRevision) {
 	validateRunId(runId);
-	const previous = updateQueues.get(runId) ?? Promise.resolve();
-	const settledPrevious = previous.catch(() => {});
-	const result = settledPrevious.then(() =>
+	return enqueueRunMutation(runId, () =>
 		performUpdate(runId, partial, expectedRevision),
 	);
-	updateQueues.set(runId, result);
-	return result;
 }
 
 async function performUpdate(runId, partial, expectedRevision) {
@@ -1789,6 +1883,138 @@ export async function advanceState(runId, newState) {
 	return updateRun(runId, patch, current.revision);
 }
 
+function eventAppendLockPath(runId) {
+	return resolve(getRunRoot(runId), ".event-append.lock");
+}
+
+async function withEventAppendLock(runId, operation) {
+	const path = eventAppendLockPath(runId);
+	const token = JSON.stringify({
+		runId,
+		pid: process.pid,
+		processInstanceId: PROCESS_INSTANCE_ID,
+		nonce: randomUUID(),
+	});
+	const deadline = Date.now() + EVENT_LOCK_WAIT_MS;
+	for (;;) {
+		try {
+			await writeFile(path, token, { flag: "wx", mode: 0o600 });
+			break;
+		} catch (error) {
+			if (error.code !== "EEXIST") throw error;
+			const staleRaw = await readFile(path, "utf8").catch(() => null);
+			if (staleRaw !== null) {
+				let staleOwner = null;
+				try {
+					staleOwner = JSON.parse(staleRaw);
+				} catch {
+					/* fail closed */
+				}
+				if (
+					staleOwner?.runId === runId &&
+					Number.isSafeInteger(staleOwner.pid) &&
+					!vmOwnerIsLive(staleOwner.pid)
+				) {
+					const currentRaw = await readFile(path, "utf8").catch(() => null);
+					if (currentRaw === staleRaw) await unlink(path).catch(() => {});
+					continue;
+				}
+			}
+			if (Date.now() >= deadline)
+				throw new LockError(`Event append lock unavailable for ${runId}`, {
+					code: "EVENT_APPEND_LOCK_HELD",
+					holderRunId: runId,
+				});
+			await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+		}
+	}
+	try {
+		return await operation();
+	} finally {
+		const currentToken = await readFile(path, "utf8").catch(() => null);
+		if (currentToken === token) await unlink(path).catch(() => {});
+	}
+}
+
+async function inspectEventLog(runId) {
+	const path = resolve(getRunRoot(runId), "events.jsonl");
+	let raw;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch (error) {
+		if (error.code === "ENOENT")
+			return { path, raw: "", events: [], bytes: 0, lines: 0, ceiling: 0 };
+		throw error;
+	}
+	const bytes = Buffer.byteLength(raw, "utf8");
+	if (bytes > OUTCOME_FILE_MAX_BYTES)
+		throw new SchemaError("events exceed file limit");
+	if (raw.length > 0 && !raw.endsWith("\n"))
+		throw new SchemaError("events contain a corrupt tail");
+	const lines = raw.split("\n").filter(Boolean);
+	if (lines.length > OUTCOME_FILE_MAX_LINES)
+		throw new SchemaError("events exceed line limit");
+	const events = [];
+	let expected = 1;
+	for (const line of lines) {
+		if (Buffer.byteLength(line, "utf8") + 1 > OUTCOME_EVENT_MAX_BYTES)
+			throw new SchemaError("event exceeds line limit");
+		let event;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			throw new SchemaError("events contain invalid JSON");
+		}
+		if (
+			!event ||
+			typeof event !== "object" ||
+			Array.isArray(event) ||
+			event.sequence !== expected
+		)
+			throw new SchemaError("event sequence gap is unresolved");
+		if (event.stage !== undefined || event.outcomeId !== undefined) {
+			try {
+				validateOutcomeEvent(event);
+			} catch {
+				throw new SchemaError("typed outcome event is invalid");
+			}
+		}
+		events.push(event);
+		expected += 1;
+	}
+	return {
+		path,
+		raw,
+		events,
+		bytes,
+		lines: lines.length,
+		ceiling: expected - 1,
+	};
+}
+
+async function reconcileEventCeilingLocked(runId) {
+	const log = await inspectEventLog(runId);
+	const run = await readRun(runId);
+	if (run.lastEventSequence > log.ceiling)
+		throw new SchemaError("run projection exceeds durable event sequence");
+	if (run.lastEventSequence < log.ceiling) {
+		await performUpdate(
+			runId,
+			{ lastEventSequence: log.ceiling },
+			run.revision,
+		);
+	}
+	return { ...log, repaired: run.lastEventSequence < log.ceiling };
+}
+
+/** Repair only a proven contiguous append/ceiling drift. Gaps fail closed. */
+export async function reconcileEventSequence(runId) {
+	validateRunId(runId);
+	return enqueueRunMutation(runId, () =>
+		withEventAppendLock(runId, () => reconcileEventCeilingLocked(runId)),
+	);
+}
+
 /**
  * Append an event to the run's events.jsonl with a monotonically increasing
  * sequence number.
@@ -1878,7 +2104,8 @@ async function createEventInternal(
 		}
 	};
 
-	let current = await readRun(runId);
+	const log = await reconcileEventCeilingLocked(runId);
+	const current = await readRun(runId);
 	const diagnosticArtifact = event?.diagnosticRef
 		? await resolveDiagnosticArtifact(runId, event.diagnosticRef)
 		: null;
@@ -2046,50 +2273,167 @@ async function createEventInternal(
 		}
 	}
 
-	await appendFile(eventsPath, `${JSON.stringify(entry)}\n`, {
+	const serialized = `${JSON.stringify(entry)}\n`;
+	const entryBytes = Buffer.byteLength(serialized, "utf8");
+	if (entryBytes > OUTCOME_EVENT_MAX_BYTES)
+		throw new SchemaError("event exceeds line limit");
+	if (
+		log.lines + 1 >= OUTCOME_FILE_MAX_LINES ||
+		log.bytes + entryBytes + EVENT_RESERVE_BYTES > OUTCOME_FILE_MAX_BYTES
+	)
+		throw new SchemaError("event reserve cannot be proven intact");
+
+	await appendFile(eventsPath, serialized, {
 		mode: 0o600,
 	});
 
-	try {
-		await updateRun(
-			runId,
-			{
-				lastEventSequence: nextSeq,
-				...(safeFailure ? { lastFailure: safeFailure } : {}),
-				...(projectedReviewResult !== undefined
-					? { lastReviewResult: projectedReviewResult }
-					: {}),
-			},
-			current.revision,
-		);
-	} catch (e) {
-		if (!(e instanceof RevisionError)) throw e;
-		current = await readRun(runId);
-		if (current.lastEventSequence < nextSeq) {
-			try {
-				await updateRun(
-					runId,
-					{
-						lastEventSequence: nextSeq,
-						...(safeFailure ? { lastFailure: safeFailure } : {}),
-						...(projectedReviewResult !== undefined
-							? { lastReviewResult: projectedReviewResult }
-							: {}),
-					},
-					current.revision,
-				);
-			} catch {
-				// best effort; event is already persisted
-			}
-		}
-	}
+	await performUpdate(
+		runId,
+		{
+			lastEventSequence: nextSeq,
+			...(safeFailure ? { lastFailure: safeFailure } : {}),
+			...(projectedReviewResult !== undefined
+				? { lastReviewResult: projectedReviewResult }
+				: {}),
+		},
+		current.revision,
+	);
 
 	return nextSeq;
 }
 
 /** Persist a normal sanitized run event. */
 export async function createEvent(runId, event) {
-	return createEventInternal(runId, event);
+	validateRunId(runId);
+	return enqueueRunMutation(runId, () =>
+		withEventAppendLock(runId, () => createEventInternal(runId, event)),
+	);
+}
+
+/**
+ * Append a validated typed outcome without activating any production caller.
+ * Oversized inputs consume the pre-reserved terminal rejection slot once.
+ */
+export async function appendOutcomeEvent(runId, outcome, { writerEpoch } = {}) {
+	validateRunId(runId);
+	return enqueueRunMutation(runId, () =>
+		withEventAppendLock(runId, async () => {
+			const log = await reconcileEventCeilingLocked(runId);
+			const run = await readRun(runId);
+			if (
+				typeof writerEpoch !== "string" ||
+				run.outcomeWriterEpoch !== writerEpoch
+			)
+				throw new SchemaError("typed outcome writer epoch is stale");
+
+			const existing = log.events.find(
+				(event) => event.outcomeId === outcome?.outcomeId,
+			);
+			if (existing) return existing.sequence;
+
+			const sequence = log.ceiling + 1;
+			const candidate = { ...outcome, runId, sequence };
+			let candidateRaw;
+			try {
+				candidateRaw = `${JSON.stringify(candidate)}\n`;
+			} catch {
+				throw new SchemaError("typed outcome is not serializable");
+			}
+			if (Buffer.byteLength(candidateRaw, "utf8") <= OUTCOME_EVENT_MAX_BYTES) {
+				try {
+					validateOutcomeEvent(candidate);
+				} catch {
+					throw new SchemaError("typed outcome event is invalid");
+				}
+				if (
+					log.lines + 1 >= OUTCOME_FILE_MAX_LINES ||
+					log.bytes +
+						Buffer.byteLength(candidateRaw, "utf8") +
+						EVENT_RESERVE_BYTES >
+						OUTCOME_FILE_MAX_BYTES
+				)
+					throw new SchemaError("event reserve cannot be proven intact");
+				await appendFile(log.path, candidateRaw, { mode: 0o600 });
+				await performUpdate(
+					runId,
+					{ lastEventSequence: sequence },
+					run.revision,
+				);
+				return sequence;
+			}
+
+			let rejection;
+			const approvedDiagnostic = outcome?.detail?.diagnosticRef
+				? await resolveDiagnosticArtifact(runId, outcome.detail.diagnosticRef)
+				: null;
+			try {
+				rejection = createOversizeRejectionFact(outcome, {
+					diagnosticRef: approvedDiagnostic
+						? outcome.detail.diagnosticRef
+						: null,
+				});
+			} catch {
+				rejection = createOversizeRejectionFact(outcome);
+			}
+			const duplicate = log.events.find(
+				(event) =>
+					event.stage === "recovery" &&
+					event.detail?.reasonCode === "outcome_too_large" &&
+					event.detail?.contentHash === rejection.contentHash,
+			);
+			if (duplicate) return duplicate.sequence;
+
+			const rejectionEvent = {
+				schemaVersion: 1,
+				minimumReaderVersion: SUPPORTED_OUTCOME_READER_VERSION,
+				writerEpoch,
+				outcomeId: `outcome-rejected-${rejection.contentHash.slice(7)}`,
+				sequence,
+				runId,
+				scope: "run",
+				taskId: null,
+				attemptId: null,
+				resumesOutcomeId: null,
+				stage: "recovery",
+				legacyPhase: null,
+				legacyEvent: null,
+				dispatchCausality: null,
+				attempt: 0,
+				recordedAt: new Date().toISOString(),
+				producer: "run-store",
+				causedBy: null,
+				operationId: null,
+				status: "failed",
+				detail: rejection,
+			};
+			validateOutcomeEvent(rejectionEvent);
+			const rejectionRaw = `${JSON.stringify(rejectionEvent)}\n`;
+			const rejectionBytes = Buffer.byteLength(rejectionRaw, "utf8");
+			if (
+				rejectionBytes > EVENT_RESERVE_BYTES ||
+				log.lines + 1 > OUTCOME_FILE_MAX_LINES ||
+				log.bytes + rejectionBytes > OUTCOME_FILE_MAX_BYTES
+			) {
+				await performUpdate(
+					runId,
+					{
+						state: "recovery_required",
+						outcomeRecovery: {
+							reasonCode: "event_reserve_unavailable",
+							contentHash: rejection.contentHash,
+							automaticRetry: false,
+							operatorCommand: "switchyard-dispatch recover",
+						},
+					},
+					run.revision,
+				);
+				throw new SchemaError("event reserve unavailable; recovery required");
+			}
+			await appendFile(log.path, rejectionRaw, { mode: 0o600 });
+			await performUpdate(runId, { lastEventSequence: sequence }, run.revision);
+			return sequence;
+		}),
+	);
 }
 
 /**
@@ -2127,10 +2471,14 @@ export async function createRouteHealthEvent(runId, event, binding) {
 		runRevision: current.revision,
 	};
 	validateRouteHealthBinding(hostBinding);
-	return createEventInternal(
-		runId,
-		{ ...event, routeHealthBinding: hostBinding },
-		{ routeHealthAuthorised: true },
+	return enqueueRunMutation(runId, () =>
+		withEventAppendLock(runId, () =>
+			createEventInternal(
+				runId,
+				{ ...event, routeHealthBinding: hostBinding },
+				{ routeHealthAuthorised: true },
+			),
+		),
 	);
 }
 
@@ -4355,18 +4703,11 @@ export async function applyRetention(options = {}) {
  */
 export async function readEvents(runId) {
 	validateRunId(runId);
-	const eventsPath = resolve(getRunRoot(runId), "events.jsonl");
-	try {
-		const raw = await readFile(eventsPath, "utf8");
-		return raw
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => JSON.parse(line));
-	} catch (e) {
-		if (e.code === "ENOENT") return [];
-		throw e;
-	}
+	const log = await inspectEventLog(runId);
+	const run = await readRun(runId);
+	if (log.ceiling !== run.lastEventSequence)
+		throw new SchemaError("event sequence ceiling is unresolved");
+	return log.events;
 }
 
 /**
@@ -4445,7 +4786,7 @@ export async function readAuthorizedRunEvidence(runRoot) {
 		throw new SchemaError("authorised events exceed limit");
 	let sequence = 0;
 	const events = lines.map((line) => {
-		if (line.length > 32 * 1024)
+		if (Buffer.byteLength(line, "utf8") + 1 > OUTCOME_EVENT_MAX_BYTES)
 			throw new SchemaError("authorised event exceeds limit");
 		let event;
 		try {
@@ -4459,11 +4800,16 @@ export async function readAuthorizedRunEvidence(runRoot) {
 			Array.isArray(event) ||
 			Object.keys(event).some((key) => !APPROVED_EVENT_KEYS.has(key)) ||
 			!Number.isSafeInteger(event.sequence) ||
-			event.sequence <= sequence
+			event.sequence !== sequence + 1
 		) {
 			throw new SchemaError("authorised event schema is invalid");
 		}
 		sequence = event.sequence;
+		if (
+			(event.stage !== undefined || event.outcomeId !== undefined) &&
+			!isOutcomeEvent(event)
+		)
+			throw new SchemaError("authorised typed outcome is invalid");
 		if (event.routeHealthBinding !== undefined)
 			validateRouteHealthBinding(event.routeHealthBinding);
 		if (
@@ -4485,8 +4831,10 @@ export async function readAuthorizedRunEvidence(runRoot) {
 			throw new SchemaError("authorised route health event is invalid");
 		return event;
 	});
-	if (sequence > run.lastEventSequence)
-		throw new SchemaError("authorised event sequence exceeds run projection");
+	if (sequence !== run.lastEventSequence)
+		throw new SchemaError(
+			"authorised event sequence does not match run projection",
+		);
 	return { run, events };
 }
 
