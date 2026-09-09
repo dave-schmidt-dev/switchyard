@@ -148,6 +148,7 @@ esac
 		const env = { ...process.env };
 		env.PATH = `${binDir}:${env.PATH || ""}`;
 		env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE = golden;
+		delete env.SWITCHYARD_SKIP_LIVE_VM_TESTS;
 		// Unset, not empty: an empty string is a different rung.
 		delete env.SWITCHYARD_PARALLELS_AQUA_UID;
 		// node:test marks child processes it spawns via NODE_TEST_CONTEXT, which

@@ -176,18 +176,22 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				name: buildParallelsWorkingName("dead-stopped", deadPid),
 			},
 			{
-				uuid: "live",
+				uuid: "{33333333-3333-4333-8333-333333333333}",
 				status: "running",
 				name: buildParallelsWorkingName("live-run", livePid),
 			},
 			{
-				uuid: "partial-live",
+				uuid: "{44444444-4444-4444-8444-444444444444}",
 				status: "stopped",
 				name: buildParallelsWorkingName("partial-create", livePid),
 			},
-			{ uuid: "foreign", status: "running", name: "developer-vm" },
 			{
-				uuid: "malformed",
+				uuid: "{55555555-5555-4555-8555-555555555555}",
+				status: "running",
+				name: "developer-vm",
+			},
+			{
+				uuid: "{66666666-6666-4666-8666-666666666666}",
 				status: "running",
 				name: "switchyard-work-not-a-pid",
 			},
@@ -201,6 +205,18 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 				prlctlFn: (args) => {
 					calls.push(args);
 					if (args[0] === "list") return listed(entries);
+					if (args[0] === "stop") {
+						const entry = entries.find(
+							(candidate) => candidate.uuid === args[1],
+						);
+						if (entry) entry.status = "stopped";
+					}
+					if (args[0] === "delete") {
+						const index = entries.findIndex(
+							(candidate) => candidate.uuid === args[1],
+						);
+						if (index >= 0) entries.splice(index, 1);
+					}
 					return "ok";
 				},
 				pidIsAlive: (pid) => pid === livePid,
@@ -258,7 +274,10 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 			);
 			deepStrictEqual(
 				result.skipped.map((entry) => entry.uuid),
-				["live", "partial-live"],
+				[
+					"{33333333-3333-4333-8333-333333333333}",
+					"{44444444-4444-4444-8444-444444444444}",
+				],
 			);
 			ok(
 				calls.some((args) => args[0] === "stop" && args[1] === deadRunningUuid),
@@ -282,20 +301,24 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		// asserting the escalation path rather than the normal one it is named
 		// for.
 		let running = true;
+		let deleted = false;
+		const normalUuid = "{77777777-7777-4777-8777-777777777777}";
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "stop") running = false;
 				if (args[0] === "list") {
+					if (deleted) return listed([]);
 					return listed([
-						{ uuid: "normal", status: running ? "running" : "stopped", name },
+						{ uuid: normalUuid, status: running ? "running" : "stopped", name },
 					]);
 				}
+				if (args[0] === "delete") deleted = true;
 				return "ok";
 			},
 		});
 		const resourceRoot = tempDir("switchyard-normal-destroy-");
-		backend.writeVmOwnership("normal", name, {
+		backend.writeVmOwnership(normalUuid, name, {
 			resourceRoot,
 			runId: "normal",
 			taskId: "normal-destroy",
@@ -307,17 +330,18 @@ describe("workspace wipe — Parallels VM (INV-3)", () => {
 		});
 
 		deepStrictEqual(backend.destroy(name), {
-			uuid: "normal",
+			uuid: normalUuid,
 			name,
 			forced: false,
 		});
 		deepStrictEqual(calls, [
 			["list", "-a", "-o", "uuid,status,name"],
-			["stop", "normal"],
+			["stop", normalUuid],
 			// The observation that the stop actually took, between the stop and
 			// the delete it authorizes.
 			["list", "-a", "-o", "uuid,status,name"],
-			["delete", "normal"],
+			["delete", normalUuid],
+			["list", "-a", "-o", "uuid,status,name"],
 		]);
 	});
 

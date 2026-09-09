@@ -531,6 +531,10 @@ describe("Parallels execution backend lifecycle", () => {
 			// A zero budget is a real answer for a timeout: do not wait at all.
 			ok(new ParallelsExecutionBackend({ aquaUid: 501, [knob]: 0 }));
 		}
+		throws(
+			() => new ParallelsExecutionBackend({ deleteSettlementNowFn: null }),
+			/deleteSettlementNowFn must be a function/,
+		);
 		for (const knob of [
 			"aquaPollMs",
 			"clipboardPollMs",
@@ -951,6 +955,7 @@ describe("Parallels execution backend lifecycle", () => {
 
 	it("deletes after a failed stop only when an exact stopped state is reprobed", () => {
 		const calls = [];
+		let deleted = false;
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
@@ -959,14 +964,19 @@ describe("Parallels execution backend lifecycle", () => {
 					throw new Error("stop returned 255");
 				}
 				if (args[0] === "list")
-					return listed([
-						{
-							uuid: WORK_UUID,
-							status: "stopped",
-							name: buildParallelsWorkingName("stopped", process.pid),
-						},
-					]);
-				if (args[0] === "delete") return "";
+					return deleted
+						? listed([])
+						: listed([
+								{
+									uuid: WORK_UUID,
+									status: "stopped",
+									name: buildParallelsWorkingName("stopped", process.pid),
+								},
+							]);
+				if (args[0] === "delete") {
+					deleted = true;
+					return "";
+				}
 				return "";
 			},
 		});
@@ -982,7 +992,7 @@ describe("Parallels execution backend lifecycle", () => {
 		});
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["list", "stop", "stop", "list", "delete"],
+			["list", "stop", "stop", "list", "delete", "list"],
 		);
 	});
 
@@ -1102,7 +1112,7 @@ describe("Parallels execution backend lifecycle", () => {
 		]);
 	});
 
-	it("escalates to a kill when a graceful stop exits 0 without stopping", () => {
+	it("forced destroy rejects lying graceful stop, kill, and delete", () => {
 		// The inverse of prlctl_job_misfire: success reported for a mutation that
 		// did not happen. Without the observation the false success fell straight
 		// through to `delete` on a running VM.
@@ -1125,13 +1135,14 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 		});
 
-		deepStrictEqual(
-			backend.stopAndDelete({
-				uuid: WORK_UUID,
-				name: "lying-stop",
-				status: "running",
-			}),
-			{ uuid: WORK_UUID, name: "lying-stop", forced: true },
+		throws(
+			() =>
+				backend.stopAndDelete({
+					uuid: WORK_UUID,
+					name: "lying-stop",
+					status: "running",
+				}),
+			/remained present after delete/,
 		);
 		// Ordering is the claim, not the mere presence of a kill: the escalation
 		// has to follow the observation that the graceful stop did not take.
@@ -1140,25 +1151,34 @@ describe("Parallels execution backend lifecycle", () => {
 			"list -a -o",
 			`stop ${WORK_UUID} --kill`,
 			`delete ${WORK_UUID}`,
+			"list -a -o",
 		]);
 	});
 
 	it("reprobes after delete fallback before retrying deletion", () => {
 		const calls = [];
 		let deleteAttempts = 0;
+		let deleted = false;
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "list")
-					return listed([
-						{
-							uuid: WORK_UUID,
-							status: "stopped",
-							name: buildParallelsWorkingName("delete-fallback", process.pid),
-						},
-					]);
-				if (args[0] === "delete" && deleteAttempts++ === 0)
-					throw new Error("delete returned 255");
+					return deleted
+						? listed([])
+						: listed([
+								{
+									uuid: WORK_UUID,
+									status: "stopped",
+									name: buildParallelsWorkingName(
+										"delete-fallback",
+										process.pid,
+									),
+								},
+							]);
+				if (args[0] === "delete") {
+					if (deleteAttempts++ === 0) throw new Error("delete returned 255");
+					deleted = true;
+				}
 				return "";
 			},
 		});
@@ -1174,7 +1194,7 @@ describe("Parallels execution backend lifecycle", () => {
 		});
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["list", "stop", "list", "delete", "stop", "list", "delete"],
+			["list", "stop", "list", "delete", "stop", "list", "delete", "list"],
 		);
 	});
 
@@ -1223,6 +1243,7 @@ describe("Parallels execution backend lifecycle", () => {
 				calls.push(args);
 				if (args[0] === "stop" && args[2] !== "--kill")
 					throw new Error("graceful stop returned 255");
+				if (args[0] === "list") return listed([]);
 				return "";
 			},
 		});
@@ -1237,7 +1258,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "stop", "delete"],
+			["stop", "stop", "delete", "list"],
 		);
 	});
 
@@ -1341,19 +1362,27 @@ describe("Parallels execution backend lifecycle", () => {
 	it("reprobes a forced VM after delete failure without issuing a second kill", () => {
 		const calls = [];
 		let deleteAttempts = 0;
+		let deleted = false;
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "list")
-					return listed([
-						{
-							uuid: WORK_UUID,
-							status: "stopped",
-							name: buildParallelsWorkingName("forced-stopped", process.pid),
-						},
-					]);
-				if (args[0] === "delete" && deleteAttempts++ === 0)
-					throw new Error("delete returned 255");
+					return deleted
+						? listed([])
+						: listed([
+								{
+									uuid: WORK_UUID,
+									status: "stopped",
+									name: buildParallelsWorkingName(
+										"forced-stopped",
+										process.pid,
+									),
+								},
+							]);
+				if (args[0] === "delete") {
+					if (deleteAttempts++ === 0) throw new Error("delete returned 255");
+					deleted = true;
+				}
 				return "";
 			},
 		});
@@ -1371,7 +1400,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "list", "delete"],
+			["stop", "delete", "list", "delete", "list"],
 		);
 	});
 
@@ -1428,6 +1457,7 @@ describe("Parallels execution backend lifecycle", () => {
 		const sleeps = [];
 		let listAttempts = 0;
 		let deleteAttempts = 0;
+		let deleted = false;
 		const backend = new ParallelsExecutionBackend({
 			sleepFn: (ms) => sleeps.push(ms),
 			stopSettlePollMs: 1,
@@ -1435,6 +1465,7 @@ describe("Parallels execution backend lifecycle", () => {
 				calls.push(args);
 				if (args[0] === "list") {
 					listAttempts += 1;
+					if (deleted) return listed([]);
 					return listed([
 						{
 							uuid: WORK_UUID,
@@ -1443,12 +1474,15 @@ describe("Parallels execution backend lifecycle", () => {
 						},
 					]);
 				}
-				if (args[0] === "delete" && deleteAttempts++ === 0) {
-					const error = new Error("Command failed: prlctl delete");
-					error.status = 255;
-					error.stderr =
-						"Failed to remove the VM: Unable to perform the action because the virtual machine is busy. The virtual machine is currently running. Please try again later.";
-					throw error;
+				if (args[0] === "delete") {
+					if (deleteAttempts++ === 0) {
+						const error = new Error("Command failed: prlctl delete");
+						error.status = 255;
+						error.stderr =
+							"Failed to remove the VM: Unable to perform the action because the virtual machine is busy. The virtual machine is currently running. Please try again later.";
+						throw error;
+					}
+					deleted = true;
 				}
 				return "";
 			},
@@ -1464,7 +1498,17 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "list", "list", "list", "delete", "stop", "list", "delete"],
+			[
+				"stop",
+				"list",
+				"list",
+				"list",
+				"delete",
+				"stop",
+				"list",
+				"delete",
+				"list",
+			],
 		);
 		strictEqual(sleeps.length, 2);
 	});
@@ -1475,6 +1519,7 @@ describe("Parallels execution backend lifecycle", () => {
 		let now = 0;
 		const backend = new ParallelsExecutionBackend({
 			nowFn: () => now,
+			deleteSettlementNowFn: () => now,
 			sleepFn: (ms) => {
 				now += ms;
 			},
@@ -1502,10 +1547,137 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		// It waited the full window before giving up, and never deleted a VM it
 		// had just observed running.
-		// Two full windows: once confirming the graceful stop, once reconciling
-		// the delete failure.
-		strictEqual(calls.filter((args) => args[0] === "list").length, 8);
+		// The failed-delete observation reuses the one delete-settlement window;
+		// it does not start a second full settle period.
+		strictEqual(calls.filter((args) => args[0] === "list").length, 5);
 		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
+	});
+
+	it("fails closed on malformed deletion inventory", () => {
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args, options) => {
+				calls.push({ args, options });
+				if (args[0] === "list") return "not-a-complete-inventory-row";
+				return "";
+			},
+		});
+
+		throws(
+			() =>
+				backend.stopAndDelete(
+					{ uuid: WORK_UUID, name: "malformed", status: "stopped" },
+					{ forceOnly: true },
+				),
+			/error|remained present|inventory/i,
+		);
+		strictEqual(calls.filter(({ args }) => args[0] === "delete").length, 1);
+		strictEqual(calls.filter(({ args }) => args[0] === "list").length, 1);
+		strictEqual(calls.at(-1).options.timeout, 1);
+	});
+
+	it("uses one delete settle budget across failed-delete retry and final absence", () => {
+		const calls = [];
+		let now = 0;
+		let deleteAttempts = 0;
+		let finalPolls = 0;
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 10,
+			stopSettlePollMs: 4,
+			nowFn: () => now,
+			deleteSettlementNowFn: () => now,
+			sleepFn: (milliseconds) => {
+				now += milliseconds;
+			},
+			prlctlFn: (args, options) => {
+				calls.push({ args, options });
+				if (args[0] === "delete" && deleteAttempts++ === 0)
+					throw new Error("delete returned 255");
+				if (args[0] === "list") {
+					finalPolls += 1;
+					return finalPolls < 3
+						? listed([{ uuid: WORK_UUID, status: "stopped", name: "budgeted" }])
+						: listed([]);
+				}
+				return "";
+			},
+		});
+
+		deepStrictEqual(
+			backend.stopAndDelete(
+				{ uuid: WORK_UUID, name: "budgeted", status: "stopped" },
+				{ forceOnly: true },
+			),
+			{ uuid: WORK_UUID, name: "budgeted", forced: true },
+		);
+		deepStrictEqual(
+			calls
+				.filter(({ args }) => args[0] === "list")
+				.map(({ options }) => options.timeout),
+			[10, 10, 6],
+		);
+		strictEqual(now, 4);
+	});
+
+	it("allows one immediate deletion observation for a zero settle timeout", () => {
+		const calls = [];
+		let listCalls = 0;
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			sleepFn: () => {
+				throw new Error("zero-budget deletion must not sleep");
+			},
+			prlctlFn: (args, options) => {
+				calls.push({ args, options });
+				if (args[0] === "list") {
+					listCalls += 1;
+					return listed([
+						{ uuid: WORK_UUID, status: "stopped", name: "zero-budget" },
+					]);
+				}
+				return "";
+			},
+		});
+
+		throws(
+			() =>
+				backend.stopAndDelete(
+					{ uuid: WORK_UUID, name: "zero-budget", status: "stopped" },
+					{ forceOnly: true },
+				),
+			/remained present after delete/,
+		);
+		strictEqual(listCalls, 1);
+		strictEqual(calls.at(-1).options.timeout, 1);
+	});
+
+	it("rejects absence returned after a positive deletion budget expires", () => {
+		let now = 0;
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 10,
+			deleteSettlementNowFn: () => now,
+			prlctlFn: (args, options) => {
+				calls.push({ args, options });
+				if (args[0] === "list") {
+					now = 10;
+					return listed([]);
+				}
+				return "";
+			},
+		});
+
+		throws(
+			() =>
+				backend.stopAndDelete(
+					{ uuid: WORK_UUID, name: "expired-absence", status: "stopped" },
+					{ forceOnly: true },
+				),
+			/could not verify absence/,
+		);
+		strictEqual(calls.filter(({ args }) => args[0] === "list").length, 1);
+		strictEqual(calls.at(-1).options.timeout, 10);
 	});
 
 	it("uses the bulk transfer hook without sending tar bytes to prlctl", () => {
@@ -2212,6 +2384,7 @@ describe("Parallels execution backend lifecycle", () => {
 			aquaUid: 501,
 			goldenImage: "macOS",
 			nowFn: () => now,
+			deleteSettlementNowFn: () => now,
 			sleepFn: (ms) => {
 				slept += 1;
 				now += ms;
@@ -2278,12 +2451,24 @@ describe("Parallels execution backend lifecycle", () => {
 				status: "stopped",
 				name: buildParallelsWorkingName("dead-stopped", 999998),
 			},
-			{ uuid: "foreign", status: "running", name: "developer-vm" },
+			{
+				uuid: "{88888888-8888-4888-8888-888888888888}",
+				status: "running",
+				name: "developer-vm",
+			},
 		];
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "list") return listed(entries);
+				if (args[0] === "stop") {
+					const current = entries.find((entry) => entry.uuid === args[1]);
+					if (current) current.status = "stopped";
+				}
+				if (args[0] === "delete") {
+					const index = entries.findIndex((entry) => entry.uuid === args[1]);
+					if (index >= 0) entries.splice(index, 1);
+				}
 				return "ok";
 			},
 			pidIsAlive: () => false,
@@ -2319,6 +2504,14 @@ describe("Parallels execution backend lifecycle", () => {
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "list") return listed(entries);
+				if (args[0] === "stop") {
+					const current = entries.find((entry) => entry.uuid === args[1]);
+					if (current) current.status = "stopped";
+				}
+				if (args[0] === "delete") {
+					const index = entries.findIndex((entry) => entry.uuid === args[1]);
+					if (index >= 0) entries.splice(index, 1);
+				}
 				return "ok";
 			},
 			pidIsAlive: () => false,
@@ -2340,10 +2533,12 @@ describe("Parallels execution backend lifecycle", () => {
 
 	it("lets the caller authorize terminal-clean ownership despite a live creator PID", () => {
 		const calls = [];
+		let deleted = false;
 		const backend = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "list") {
+					if (deleted) return listed([]);
 					return listed([
 						{
 							uuid: WORK_UUID,
@@ -2352,6 +2547,7 @@ describe("Parallels execution backend lifecycle", () => {
 						},
 					]);
 				}
+				if (args[0] === "delete") deleted = true;
 				return "ok";
 			},
 			pidIsAlive: () => true,
@@ -2543,6 +2739,7 @@ describe("Parallels execution backend lifecycle", () => {
 	it("rolls back a clone when Aqua readiness never appears", () => {
 		const calls = [];
 		let now = 0;
+		let deleted = false;
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
 			aquaTimeoutMs: 10,
@@ -2557,13 +2754,18 @@ describe("Parallels execution backend lifecycle", () => {
 				if (args[0] === "list") {
 					return listed([
 						{ uuid: GOLDEN_UUID, status: "stopped", name: "macOS" },
-						{
-							uuid: WORK_UUID,
-							status: "stopped",
-							name: buildParallelsWorkingName("run", 1234),
-						},
+						...(deleted
+							? []
+							: [
+									{
+										uuid: WORK_UUID,
+										status: "stopped",
+										name: buildParallelsWorkingName("run", 1234),
+									},
+								]),
 					]);
 				}
+				if (args[0] === "delete") deleted = true;
 				if (args[0] === "exec") throw new Error("Aqua is not ready");
 				return "ok";
 			},
@@ -2683,7 +2885,13 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 	function makeCloningBackend(
 		sidecarRoot,
 		cloneName,
-		{ runId = "run-1" } = {},
+		{
+			runId = "run-1",
+			deleteRemoves = true,
+			deleteFailure = null,
+			inventoryFailure = false,
+			stopSettleTimeoutMs,
+		} = {},
 	) {
 		const calls = [];
 		let snapshots = [FOREIGN_SNAPSHOT];
@@ -2692,12 +2900,15 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		// forever waits out the settle window and escalates to a kill -- turning
 		// a snapshot-cleanup test into a slow test of the forced path.
 		let running = true;
+		let deleted = false;
+		let deleteAttempted = false;
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
 			creatorPid: process.pid,
 			goldenImage: GOLDEN,
 			snapshotSidecarRoot: sidecarRoot,
 			runId,
+			...(stopSettleTimeoutMs === undefined ? {} : { stopSettleTimeoutMs }),
 			requireLinkedCloneMeasurement: false,
 			prlctlFn: (args) => {
 				calls.push(args);
@@ -2713,6 +2924,9 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 					return "";
 				}
 				if (args[0] === "list") {
+					if (inventoryFailure && deleteAttempted)
+						throw new Error("inventory unavailable after delete");
+					if (deleted) return listed([]);
 					return listed([
 						{
 							uuid: WORK_UUID,
@@ -2720,6 +2934,11 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 							name: cloneName,
 						},
 					]);
+				}
+				if (args[0] === "delete") {
+					deleteAttempted = true;
+					if (deleteFailure) throw deleteFailure;
+					if (deleteRemoves) deleted = true;
 				}
 				return "";
 			},
@@ -2769,6 +2988,69 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 			"a snapshot no sidecar names must survive destroy",
 		);
 		ok(!existsSync(sidecarPath), "sidecar must be removed after cleanup");
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("preserves sidecar evidence when final VM absence is uncertain", () => {
+		const root = makeSidecarRoot();
+		const name = buildParallelsWorkingName("uncertain", process.pid);
+		const { backend } = makeCloningBackend(root, name, {
+			deleteRemoves: false,
+			stopSettleTimeoutMs: 0,
+		});
+		backend.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+		registerOwnedEntry(backend, { uuid: WORK_UUID, name, status: "stopped" });
+		const sidecarPath = backend.snapshotSidecarPath(WORK_UUID);
+
+		throws(() => backend.destroy(WORK_UUID), /remained present after delete/);
+		ok(existsSync(sidecarPath));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("deleted VM inventory failure preserves sidecars", () => {
+		const root = makeSidecarRoot();
+		const name = buildParallelsWorkingName("inventory-failure", process.pid);
+		const { backend } = makeCloningBackend(root, name, {
+			inventoryFailure: true,
+			stopSettleTimeoutMs: 0,
+		});
+		backend.writeSnapshotSidecar(WORK_UUID, {
+			goldenImage: GOLDEN,
+			snapshotIds: [CLONE_SNAPSHOT],
+		});
+		registerOwnedEntry(backend, { uuid: WORK_UUID, name, status: "stopped" });
+		const sidecarPath = backend.snapshotSidecarPath(WORK_UUID);
+		const ownershipPath = backend.vmOwnershipPath(
+			WORK_UUID,
+			join(TEST_RUN_STORE_ROOT, "runs", "inventory-failure", "resources"),
+		);
+
+		throws(() => backend.destroy(WORK_UUID), /could not verify absence/);
+		ok(existsSync(sidecarPath));
+		ok(existsSync(ownershipPath));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("deleted VM inventory failure reports uncertainty", () => {
+		const root = makeSidecarRoot();
+		const name = buildParallelsWorkingName("inventory-cause", process.pid);
+		const deleteFailure = new Error("delete returned 255");
+		const { backend } = makeCloningBackend(root, name, {
+			deleteFailure,
+			inventoryFailure: true,
+			stopSettleTimeoutMs: 0,
+		});
+		registerOwnedEntry(backend, { uuid: WORK_UUID, name, status: "running" });
+
+		throws(
+			() => backend.destroy(WORK_UUID),
+			(error) =>
+				error.message.includes("could not verify absence") &&
+				causedBy(error, deleteFailure),
+		);
 		rmSync(root, { recursive: true, force: true });
 	});
 
@@ -3110,12 +3392,15 @@ describe("VM ownership metadata", () => {
 		const writer = new ParallelsExecutionBackend({ prlctlFn: () => "" });
 		writer.writeVmOwnership(WORK_UUID, name, context);
 		const calls = [];
+		let destroyed = false;
 		const fresh = new ParallelsExecutionBackend({
 			prlctlFn: (args) => {
 				calls.push(args);
 				if (args[0] === "list") {
+					if (destroyed) return listed([]);
 					return listed([{ uuid: WORK_UUID, status: "stopped", name }]);
 				}
+				if (args[0] === "delete") destroyed = true;
 				return "";
 			},
 		});
@@ -3131,6 +3416,7 @@ describe("VM ownership metadata", () => {
 		ok(calls.some((args) => args[0] === "delete" && args[1] === WORK_UUID));
 
 		writer.writeVmOwnership(WORK_UUID, name, context);
+		destroyed = false;
 		const beforeMismatch = calls.length;
 		throws(
 			() => fresh.destroy({ ...handle, processStartIdentity: "other-birth" }),

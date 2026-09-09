@@ -1232,6 +1232,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		workspaceVerifyTimeoutMs = DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS,
 		workspaceVerifyPollMs = DEFAULT_WORKSPACE_VERIFY_POLL_MS,
 		stopSettleTimeoutMs = DEFAULT_STOP_SETTLE_TIMEOUT_MS,
+		deleteSettlementNowFn = () => performance.now(),
 		goldenStopSettleTimeoutMs = DEFAULT_GOLDEN_STOP_SETTLE_TIMEOUT_MS,
 		stopSettlePollMs = DEFAULT_STOP_SETTLE_POLL_MS,
 		goldenImage = null,
@@ -1308,6 +1309,10 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		this.hostReadinessNowFn = hostReadinessNowFn;
 		this.sleepFn = sleepFn;
 		this.nowFn = nowFn;
+		if (typeof deleteSettlementNowFn !== "function") {
+			throw new TypeError("deleteSettlementNowFn must be a function");
+		}
+		this.deleteSettlementNowFn = deleteSettlementNowFn;
 		if (typeof lostMutationNowFn !== "function") {
 			throw new TypeError("lostMutationNowFn must be a function");
 		}
@@ -1750,12 +1755,124 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	}
 
 	/**
-	 * Reconcile a failed delete. An absent exact UUID is positive evidence that
-	 * Parallels completed the delete despite its nonzero result; every present
-	 * state must still be stopped before a retry is allowed.
+	 * Create the lazy, monotonic budget used only by deletion postconditions.
+	 *
+	 * The first inventory read starts the deadline. Mutation calls retain their
+	 * independent command deadlines, while every subsequent inventory read gets
+	 * only the time that remains in this one settlement window.
 	 */
-	_reprobeStoppedOrAbsent(entry, cause) {
-		return this._awaitSettled(entry, cause) !== undefined;
+	_createDeleteSettlementBudget() {
+		let deadline = null;
+		let lastNow = null;
+		return {
+			remainingForObservation: () => {
+				const now = this.deleteSettlementNowFn();
+				if (!Number.isFinite(now) || (lastNow !== null && now < lastNow)) {
+					throw new Error("delete settlement clock is not monotonic");
+				}
+				lastNow = now;
+				if (deadline === null) {
+					deadline = now + this.stopSettleTimeoutMs;
+					return this.stopSettleTimeoutMs;
+				}
+				const remaining = Math.floor(deadline - now);
+				if (remaining <= 0) {
+					throw new Error("delete settlement budget exhausted");
+				}
+				return remaining;
+			},
+			remainingForPoll: () => {
+				const now = this.deleteSettlementNowFn();
+				if (
+					deadline === null ||
+					!Number.isFinite(now) ||
+					(lastNow !== null && now < lastNow)
+				) {
+					throw new Error("delete settlement clock is not monotonic");
+				}
+				lastNow = now;
+				return Math.max(0, Math.floor(deadline - now));
+			},
+			recheckAfterObservation: () => {
+				const now = this.deleteSettlementNowFn();
+				if (!Number.isFinite(now) || (lastNow !== null && now < lastNow)) {
+					throw new Error("delete settlement clock is not monotonic");
+				}
+				lastNow = now;
+				// A zero budget explicitly permits one immediate inventory read.
+				if (this.stopSettleTimeoutMs === 0) return;
+				if (deadline === null || now >= deadline) {
+					throw new Error("delete settlement budget exhausted");
+				}
+			},
+		};
+	}
+
+	_deletionAbsenceUncertainty(entry, cause, detail) {
+		if (cause instanceof Error && cause.cause === undefined && detail) {
+			cause.cause = detail;
+		}
+		return new Error(
+			`${entry.name ?? entry.uuid} could not verify absence after delete`,
+			{ cause },
+		);
+	}
+
+	/**
+	 * Read one complete inventory for a delete postcondition.
+	 *
+	 * This path is deliberately retry-free and strict: a malformed or failed
+	 * inventory cannot prove that the exact UUID is absent. `null` is the only
+	 * successful absence result; a present VM, including one reported stopped,
+	 * remains present evidence for the absence-only poll.
+	 */
+	_observeDeletionVm(entry, budget) {
+		const timeout = budget.remainingForObservation();
+		const output = this._call(["list", "-a", "-o", "uuid,status,name"], {
+			retry: false,
+			timeout: Math.max(1, timeout),
+			killSignal: "SIGKILL",
+			maxBuffer: HOST_READINESS_MAX_BUFFER,
+		});
+		budget.recheckAfterObservation();
+		const rows = parseReadinessInventory(output);
+		const match = rows.find(([uuid]) => uuid === entry.uuid);
+		if (!match) return null;
+		return {
+			uuid: match[0],
+			status: match[1],
+			name: match.slice(2).join(" ").trim(),
+		};
+	}
+
+	/**
+	 * Poll only for exact-UUID absence. A stopped row is not deletion evidence.
+	 */
+	_awaitDeletionAbsent(entry, budget, cause, initialState = undefined) {
+		let current = initialState;
+		for (;;) {
+			if (current === undefined) {
+				try {
+					current = this._observeDeletionVm(entry, budget);
+				} catch (observationError) {
+					throw this._deletionAbsenceUncertainty(
+						entry,
+						cause,
+						observationError,
+					);
+				}
+			}
+			if (current === null) return;
+			let remaining;
+			try {
+				remaining = budget.remainingForPoll();
+			} catch (budgetError) {
+				throw this._deletionAbsenceUncertainty(entry, cause, budgetError);
+			}
+			if (remaining <= 0) throw cause;
+			this.sleepFn(Math.min(this.stopSettlePollMs, remaining));
+			current = undefined;
+		}
 	}
 
 	preflight() {
@@ -3655,7 +3772,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				// without stopping; the escalation is the same either way. The
 				// kill below is deliberately not re-observed: a kill that also
 				// reported a false success is caught by `delete` failing on a
-				// running VM, which `_reprobeStoppedOrAbsent` already reconciles,
+				// running VM, which the absence-only deletion observer reconciles,
 				// and observing here would poll the settle window a second time.
 				forced = true;
 				try {
@@ -3665,9 +3782,23 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				}
 			}
 		}
+		const deleteSettlement = this._createDeleteSettlementBudget();
+		let deleteError = null;
 		try {
 			this._call(["delete", entry.uuid]);
 		} catch (error) {
+			deleteError = error;
+		}
+		if (!deleteError) {
+			this._awaitDeletionAbsent(
+				entry,
+				deleteSettlement,
+				new Error(`${entry.name ?? entry.uuid} remained present after delete`),
+			);
+			return { uuid: entry.uuid, name: entry.name, forced };
+		}
+		{
+			const error = deleteError;
 			if (!forced) {
 				try {
 					this._call(["stop", entry.uuid, "--kill"]);
@@ -3677,17 +3808,33 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				}
 			}
 			forced = true;
-			if (!this._reprobeStoppedOrAbsent(entry, error))
+			let current;
+			try {
+				current = this._observeDeletionVm(entry, deleteSettlement);
+			} catch (observationError) {
+				throw this._deletionAbsenceUncertainty(entry, error, observationError);
+			}
+			if (current === null)
 				return {
 					uuid: entry.uuid,
 					name: entry.name,
 					forced,
 				};
+			if (!/^stopped$/i.test(String(current.status ?? ""))) throw error;
 			try {
 				this._call(["delete", entry.uuid]);
 			} catch (retryError) {
-				if (this._reprobeStoppedOrAbsent(entry, retryError)) throw retryError;
+				if (retryError instanceof Error && retryError.cause === undefined) {
+					retryError.cause = error;
+				}
+				this._awaitDeletionAbsent(entry, deleteSettlement, retryError);
+				return {
+					uuid: entry.uuid,
+					name: entry.name,
+					forced,
+				};
 			}
+			this._awaitDeletionAbsent(entry, deleteSettlement, error);
 		}
 		return { uuid: entry.uuid, name: entry.name, forced };
 	}

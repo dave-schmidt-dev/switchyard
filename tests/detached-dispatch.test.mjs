@@ -79,6 +79,8 @@ function runDispatch(args, env = {}) {
 // double check.
 const PARALLELS_GOLDEN_IMAGE =
 	process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
+const SWITCHYARD_SKIP_LIVE_VM_TESTS =
+	process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 const PARALLELS_AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 const PARALLELS_PROVIDER_USER =
 	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
@@ -161,7 +163,9 @@ function parallelsGoldenImagePrerequisiteReason() {
 	return null;
 }
 
-const PARALLELS_PREREQUISITE_REASON = parallelsGoldenImagePrerequisiteReason();
+const PARALLELS_PREREQUISITE_REASON = SWITCHYARD_SKIP_LIVE_VM_TESTS
+	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
+	: parallelsGoldenImagePrerequisiteReason();
 
 function parallelsBackendEnv() {
 	// Only export what is actually set. Handing the worker an empty
@@ -1911,6 +1915,20 @@ describe("--exclude-provider on the detached worker path", () => {
 });
 
 describe("--only-provider on the detached worker path", () => {
+	it("fixture-only skips detached provider routes", () => {
+		if (SWITCHYARD_SKIP_LIVE_VM_TESTS) {
+			strictEqual(
+				PARALLELS_PREREQUISITE_REASON,
+				"fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1",
+			);
+		} else {
+			ok(
+				PARALLELS_PREREQUISITE_REASON !==
+					"fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1",
+			);
+		}
+	});
+
 	it("restricts routing to the given provider end-to-end via `launch` (not just the foreground path) (Task C.9)", {
 		skip: PARALLELS_PREREQUISITE_REASON
 			? `VM gate skipped: ${PARALLELS_PREREQUISITE_REASON}`
@@ -2229,12 +2247,16 @@ describe("project-lock reconciliation without managed VMs", () => {
 			ok(existsSync(ownershipPath));
 
 			const calls = [];
+			let present = true;
 			const reader = new ParallelsExecutionBackend({
 				prlctlFn: (args) => {
 					calls.push(args);
 					if (args[0] === "list") {
-						return `uuid\tstatus\tname\n${uuid}\tstopped\t${name}`;
+						return present
+							? `uuid\tstatus\tname\n${uuid}\tstopped\t${name}`
+							: "uuid\tstatus\tname";
 					}
+					if (args[0] === "delete") present = false;
 					return "";
 				},
 				hostProcessIdentityProbe: (pid) => ({
