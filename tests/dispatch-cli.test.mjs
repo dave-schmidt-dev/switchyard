@@ -1999,6 +1999,7 @@ describe("recover integration", () => {
 			advanceState,
 			initializeRun,
 			isProjectLockOwnedBy,
+			readEvents,
 			readRun,
 			updateRun,
 		} = await import("../src/switchyard/run-store/index.mjs");
@@ -2030,13 +2031,43 @@ describe("recover integration", () => {
 		current = await readRun(activeRunId);
 		await updateRun(activeRunId, { workerPid: process.pid }, current.revision);
 		await acquireProjectLock(projectDir, activeRunId);
+		const target = {
+			uuid: "dead-worker-vm",
+			name: `switchyard-work-${staleRunId}-fixture`,
+			runId: staleRunId,
+			creatorPid: 999999,
+			status: "stopped",
+		};
 
 		const output = [];
 		const originalLog = console.log;
 		const originalExitCode = process.exitCode;
 		console.log = (line) => output.push(String(line));
 		try {
-			await handleRecover(["--run", staleRunId], { listManaged: () => [] });
+			await handleRecover(["--run", staleRunId], {
+				listManaged: () => [target],
+				reclaim: ({ eligibility, ownershipContext }) => {
+					const candidate = {
+						...target,
+						ownership: {
+							...ownershipContext,
+							vmUuid: target.uuid,
+							vmName: target.name,
+						},
+					};
+					strictEqual(eligibility(candidate), true);
+					strictEqual(
+						eligibility({ ...candidate, recoveryPhase: "pre_mutation" }),
+						true,
+					);
+					return {
+						reclaimed: [target],
+						skipped: [],
+						skippedSnapshots: [],
+						errors: [],
+					};
+				},
+			});
 		} finally {
 			console.log = originalLog;
 			process.exitCode = originalExitCode;
@@ -2044,12 +2075,22 @@ describe("recover integration", () => {
 
 		const envelope = JSON.parse(output[0]);
 		deepStrictEqual(envelope.errors, []);
+		strictEqual(envelope.vmsReclaimed, 1);
 		strictEqual(envelope.projectLocksReleased, 0);
 		strictEqual(await isProjectLockOwnedBy(projectDir, activeRunId), true);
 		const staleRun = await readRun(staleRunId);
 		strictEqual(staleRun.state, "failed");
 		strictEqual(staleRun.cleanupState, "complete");
 		strictEqual(staleRun.terminalizedBy, "dead_worker_recovery");
+		const typedStages = (await readEvents(staleRunId))
+			.filter((event) => typeof event.stage === "string")
+			.map((event) => event.stage);
+		deepStrictEqual(typedStages, [
+			"cleanup",
+			"cleanup",
+			"run",
+			"postcondition",
+		]);
 	});
 
 	it("counts a project lock successfully released by dead-run finalization", async () => {

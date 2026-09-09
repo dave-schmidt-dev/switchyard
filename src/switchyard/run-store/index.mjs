@@ -47,6 +47,7 @@ import {
 	OUTCOME_EVENT_MAX_BYTES,
 	OUTCOME_FILE_MAX_BYTES,
 	OUTCOME_FILE_MAX_LINES,
+	OUTCOME_STAGES,
 	SUPPORTED_OUTCOME_READER_VERSION,
 	validateOutcomeEvent,
 } from "../outcome/schema.mjs";
@@ -2304,6 +2305,95 @@ async function createEventInternal(
 	return nextSeq;
 }
 
+/**
+ * Build a closed stage fact for the dual-write migration.
+ *
+ * The returned event uses a provisional sequence because appendOutcomeEvent
+ * assigns the authoritative per-run sequence while holding the run-store
+ * critical section. Keeping construction here gives every production stage
+ * one schema-checked identity/causality shape without duplicating field lists
+ * in runner, dispatch, and recovery callers.
+ */
+export function createStageOutcome({
+	runId,
+	taskId = null,
+	attemptId = null,
+	attempt = taskId === null ? 0 : 1,
+	stage,
+	status,
+	producer,
+	code,
+	reasonCode = code,
+	detail = {},
+	writerEpoch = null,
+	causedBy = null,
+	resumesOutcomeId = causedBy,
+	operationId = null,
+	dispatchCausality = null,
+	outcomeId = null,
+	recordedAt = new Date().toISOString(),
+} = {}) {
+	if (!OUTCOME_STAGES.includes(stage) || stage === "provider")
+		throw new SchemaError("stage outcome requires a non-provider stage");
+	if (!detail || typeof detail !== "object" || Array.isArray(detail))
+		throw new SchemaError("stage outcome detail must be an object");
+	if (
+		typeof code !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(code)
+	)
+		throw new SchemaError("stage outcome code is invalid");
+	if (typeof runId !== "string" || !RUN_ID_RE.test(runId))
+		throw new SchemaError("stage outcome runId is invalid");
+	const safeAttemptId =
+		taskId === null ? null : (attemptId ?? `attempt-${attempt}`);
+	const identitySeed = [
+		runId,
+		taskId ?? "run",
+		safeAttemptId ?? "run",
+		stage,
+		code,
+		status,
+		causedBy ?? "root",
+		operationId ?? "default-operation",
+	].join(":");
+	const identityHash = createHash("sha256")
+		.update(identitySeed, "utf8")
+		.digest("hex")
+		.slice(0, 32);
+	const safeOutcomeId = outcomeId ?? `outcome-${identityHash}`;
+	const safeOperationId = operationId ?? `operation-${identityHash}`;
+	const safeCausality =
+		dispatchCausality ??
+		`sha256:${createHash("sha256")
+			.update(`${runId}:${taskId ?? "run"}`, "utf8")
+			.digest("hex")}`;
+	const event = {
+		schemaVersion: 1,
+		minimumReaderVersion: SUPPORTED_OUTCOME_READER_VERSION,
+		writerEpoch,
+		outcomeId: safeOutcomeId,
+		sequence: 1,
+		runId,
+		scope: taskId === null ? "run" : "task",
+		taskId,
+		attemptId: safeAttemptId,
+		resumesOutcomeId,
+		stage,
+		legacyPhase: null,
+		legacyEvent: null,
+		dispatchCausality: safeCausality,
+		attempt,
+		recordedAt,
+		producer,
+		causedBy,
+		operationId: safeOperationId,
+		status,
+		detail: { ...detail, code, ...(reasonCode ? { reasonCode } : {}) },
+	};
+	validateOutcomeEvent(event);
+	return Object.freeze(event);
+}
+
 /** Persist a normal sanitized run event. */
 export async function createEvent(runId, event) {
 	validateRunId(runId);
@@ -2501,30 +2591,6 @@ export async function activateOutcomeWriter(
 	)
 		throw new SchemaError("outcome writer epoch is invalid");
 	const existing = await readRun(runId);
-	const siblingEntries = await readdir(runsRoot(), {
-		withFileTypes: true,
-	}).catch((error) => {
-		if (error.code === "ENOENT") return [];
-		throw error;
-	});
-	for (const entry of siblingEntries) {
-		if (!entry.isDirectory() || entry.name === runId) continue;
-		const sibling = await readRun(entry.name).catch(() => null);
-		if (
-			sibling?.projectPath === existing.projectPath &&
-			Number.isSafeInteger(sibling.workerPid) &&
-			sibling.workerPid > 0 &&
-			vmOwnerIsLive(sibling.workerPid)
-		) {
-			throw new LockError(
-				"another live project worker blocks writer activation",
-				{
-					code: "OUTCOME_WRITER_COMPATIBILITY_BLOCKED",
-					holderRunId: sibling.runId,
-				},
-			);
-		}
-	}
 	startToken ??= existing.workerStartToken;
 	nonce ??= existing.workerNonce;
 	if (typeof startToken !== "string" || startToken.length === 0)
@@ -2545,6 +2611,35 @@ export async function activateOutcomeWriter(
 		existing.workerPid === pid &&
 		existing.workerStartToken === startToken &&
 		existing.workerNonce === nonce;
+	// A recovery caller that has already fenced the dead run with its own lease
+	// may publish to that run while a newer sibling is live. Normal activation
+	// remains blocked by any live sibling during the compatibility migration.
+	if (!(allowRecovery && sameLease)) {
+		const siblingEntries = await readdir(runsRoot(), {
+			withFileTypes: true,
+		}).catch((error) => {
+			if (error.code === "ENOENT") return [];
+			throw error;
+		});
+		for (const entry of siblingEntries) {
+			if (!entry.isDirectory() || entry.name === runId) continue;
+			const sibling = await readRun(entry.name).catch(() => null);
+			if (
+				sibling?.projectPath === existing.projectPath &&
+				Number.isSafeInteger(sibling.workerPid) &&
+				sibling.workerPid > 0 &&
+				vmOwnerIsLive(sibling.workerPid)
+			) {
+				throw new LockError(
+					"another live project worker blocks writer activation",
+					{
+						code: "OUTCOME_WRITER_COMPATIBILITY_BLOCKED",
+						holderRunId: sibling.runId,
+					},
+				);
+			}
+		}
+	}
 	const leased = sameLease
 		? existing
 		: await acquireRunLock(runId, pid, startToken, nonce, {

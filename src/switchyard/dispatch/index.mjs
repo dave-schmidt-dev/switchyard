@@ -81,6 +81,7 @@ import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
 import {
 	acquireProjectLock,
 	acquireRunLock,
+	activateOutcomeWriter,
 	advanceState,
 	applyRetention,
 	assertProjectLockOwnership,
@@ -3017,6 +3018,38 @@ async function handleRecover(argv, dependencies = {}) {
 				liveness === "dead" &&
 				!isTerminalState(recoveryRun.state)
 			) {
+				// Preserve the dead-worker proof through the destructive boundary.
+				// Claiming the recovery writer lease first would make the run appear
+				// live and correctly disqualify its managed VM from reclamation.
+				let destroyFailed = false;
+				if (target) {
+					try {
+						if (!(await reclaimTarget())) destroyFailed = true;
+					} catch {
+						destroyFailed = true;
+						errors.push("managed_reclaim_failed");
+					}
+				}
+				const recoveryStartToken = randomUUID();
+				const recoveryNonce = randomUUID();
+				await acquireRunLock(
+					runId,
+					process.pid,
+					recoveryStartToken,
+					recoveryNonce,
+					{
+						allowRecovery: true,
+						maxAgeMs: 0,
+						now: new Date(Date.now() + 1).toISOString(),
+					},
+				);
+				await activateOutcomeWriter(runId, {
+					pid: process.pid,
+					startToken: recoveryStartToken,
+					nonce: recoveryNonce,
+					writerEpoch: `epoch-recovery-${randomUUID()}`,
+					allowRecovery: true,
+				});
 				const failure = sanitizeFailureMetadata({
 					result: "unknown_failure",
 					errorKind: "unknown_failure",
@@ -3037,15 +3070,6 @@ async function handleRecover(argv, dependencies = {}) {
 						failedCount: null,
 					},
 					cleanup: async () => {
-						let destroyFailed = false;
-						if (target) {
-							try {
-								if (!(await reclaimTarget())) destroyFailed = true;
-							} catch {
-								destroyFailed = true;
-								errors.push("managed_reclaim_failed");
-							}
-						}
 						await (
 							dependencies.reconcileProjectLockClaims ??
 							reconcileProjectLockClaims

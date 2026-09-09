@@ -29,6 +29,44 @@ const CLEARED_ACTIVE_FIELDS = Object.freeze({
 	activeTaskDescriptorHarness: null,
 });
 
+async function emitTypedFinalizationStage(runStore, runId, options) {
+	if (
+		typeof runStore?.readRun !== "function" ||
+		typeof runStore?.createStageOutcome !== "function" ||
+		typeof runStore?.appendOutcomeEvent !== "function"
+	)
+		return null;
+	try {
+		const run = await runStore.readRun(runId);
+		if (
+			typeof run?.outcomeWriterEpoch !== "string" ||
+			!Number.isSafeInteger(run.workerPid) ||
+			typeof run.workerStartToken !== "string" ||
+			typeof run.workerNonce !== "string"
+		)
+			return null;
+		const outcome = runStore.createStageOutcome({
+			runId,
+			writerEpoch: run.outcomeWriterEpoch,
+			...options,
+		});
+		await runStore.appendOutcomeEvent(runId, outcome, {
+			writerEpoch: run.outcomeWriterEpoch,
+			owner: {
+				pid: run.workerPid,
+				startToken: run.workerStartToken,
+				nonce: run.workerNonce,
+			},
+		});
+		return outcome;
+	} catch {
+		// Finalization remains fail-closed on the established legacy run state;
+		// typed shadow evidence must never erase terminal cleanup or its recovery
+		// diagnostic when the compatibility writer is unavailable.
+		return null;
+	}
+}
+
 /**
  * A terminal `failed` state with no failure metadata is a run that says it broke
  * and refuses to say how. It is not a hypothetical: the dispatch finaliser wrote
@@ -117,6 +155,13 @@ export async function finalizeRun(options, dependencies = {}) {
 		null;
 
 	const createEvent = dependencies.createEvent ?? defaultRunStore.createEvent;
+	const stageStore =
+		typeof dependencies.createStageOutcome === "function" &&
+		typeof dependencies.appendOutcomeEvent === "function"
+			? dependencies
+			: defaultRunStore;
+	const recordFinalizationStage = (options) =>
+		emitTypedFinalizationStage(stageStore, runId, options);
 	const updateRunWithRetry =
 		dependencies.updateRunWithRetry ?? defaultRunStore.updateRunWithRetry;
 	const releaseRunLock =
@@ -124,6 +169,13 @@ export async function finalizeRun(options, dependencies = {}) {
 	let primaryError = null;
 	let outcome = null;
 	try {
+		await recordFinalizationStage({
+			stage: "cleanup",
+			status: "started",
+			producer: "runner",
+			code: "cleanup_started",
+			detail: { cleanupCode: "cleanup_started", observed: false },
+		});
 		await createEvent(runId, {
 			phase: "worker",
 			event: eventName,
@@ -143,6 +195,20 @@ export async function finalizeRun(options, dependencies = {}) {
 		} catch (error) {
 			cleanupError = error;
 			const recoveryFailure = recoveryIncompleteFailure();
+			await recordFinalizationStage({
+				stage: "cleanup",
+				status: "failed",
+				producer: "recovery",
+				code: "cleanup_failed",
+				detail: { cleanupCode: "cleanup_failed", observed: false },
+			});
+			await recordFinalizationStage({
+				stage: "recovery",
+				status: "failed",
+				producer: "recovery",
+				code: "recovery_required",
+				detail: { originalStage: "cleanup" },
+			});
 			await updateRunWithRetry(runId, {
 				state: "recovery_required",
 				cleanupState: "failed",
@@ -152,6 +218,13 @@ export async function finalizeRun(options, dependencies = {}) {
 			outcome = { terminal: false, cleanupComplete: false, error };
 		}
 		if (!cleanupError) {
+			await recordFinalizationStage({
+				stage: "cleanup",
+				status: "succeeded",
+				producer: "runner",
+				code: "cleanup_completed",
+				detail: { cleanupCode: "cleanup_completed", observed: true },
+			});
 			const run = await updateRunWithRetry(runId, {
 				state,
 				cleanupState: "complete",
@@ -161,6 +234,24 @@ export async function finalizeRun(options, dependencies = {}) {
 				...(closedFailure ? { lastFailure: closedFailure } : {}),
 				...extraPatch,
 				finishedAt: new Date().toISOString(),
+			});
+			await recordFinalizationStage({
+				stage: "run",
+				status:
+					state === "succeeded"
+						? "succeeded"
+						: state === "deferred"
+							? "skipped"
+							: "failed",
+				producer: "runner",
+				code: state === "succeeded" ? "run_completed" : `run_${state}`,
+			});
+			await recordFinalizationStage({
+				stage: "postcondition",
+				status: "succeeded",
+				producer: "runner",
+				code: "run_terminalized",
+				detail: { commandResult: state, observedState: "cleanup_complete" },
 			});
 			outcome = { terminal: true, cleanupComplete: true, run };
 		}

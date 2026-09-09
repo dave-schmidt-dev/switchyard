@@ -1428,8 +1428,11 @@ export async function resolve(specifier, context, nextResolve) {
 		strictEqual(exit.code, 0, `worker exit: ${JSON.stringify(exit)}`);
 
 		const events = await readEvents(runId);
+		const legacyEvents = events.filter(
+			(event) => typeof event.event === "string",
+		);
 		deepStrictEqual(
-			events.map((event) => event.event),
+			legacyEvents.map((event) => event.event),
 			[
 				"aqua_ready",
 				"container_created",
@@ -1442,6 +1445,17 @@ export async function resolve(specifier, context, nextResolve) {
 			events.every((event, index) => event.sequence === index + 1),
 			true,
 		);
+		const typedStages = events
+			.filter((event) => typeof event.stage === "string")
+			.map((event) => event.stage);
+		deepStrictEqual(typedStages, [
+			"worker",
+			"run",
+			"cleanup",
+			"cleanup",
+			"run",
+			"postcondition",
+		]);
 		strictEqual((await readRun(runId)).state, "failed");
 		const failedEvent = events.find((event) => event.event === "task_failed");
 		strictEqual(failedEvent.diagnosticEvidenceAvailable, true);

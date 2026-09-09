@@ -73,6 +73,7 @@ import {
 	createQueueBackend,
 	createQueueIdentity,
 	deriveQueueDiagnostics,
+	emitStageOutcome,
 	executeTaskAsync as executeTaskAsyncImpl,
 	executeTask as executeTaskImpl,
 	executeTaskWithOrchestrator as executeTaskWithOrchestratorImpl,
@@ -344,6 +345,138 @@ describe("macOS queue admission", () => {
 				`${name} queue path must surface Aqua lifecycle status`,
 			);
 		}
+	});
+});
+
+describe("typed non-provider stage facts", () => {
+	it("emits the closed stage vocabulary without replacing legacy callbacks", async () => {
+		const recorded = [];
+		const context = {
+			runId: "typed-stage-fixture",
+			outcomeWriterEpoch: "epoch-typed-stage",
+			recordOutcomeEvent: async (event) => recorded.push(event),
+		};
+		const stages = [
+			["run", null, {}],
+			["preflight", "1.1", { eligible: true }],
+			["worker", "1.1", { launchVerified: true }],
+			["artifact", "1.1", { artifactKind: "diff", captured: true }],
+			["integration", "1.1", { gateCode: "ok", accepted: true }],
+			["cleanup", null, { cleanupCode: "cleanup_completed", observed: true }],
+			["recovery", null, { originalStage: "cleanup" }],
+			[
+				"postcondition",
+				null,
+				{
+					commandResult: "success",
+					observedState: "accepted",
+				},
+			],
+		];
+		for (const [stage, taskId, detail] of stages) {
+			await emitStageOutcome(context, {
+				stage,
+				taskId,
+				status: "succeeded",
+				producer: "runner",
+				code: `${stage}_fixture`,
+				detail,
+			});
+		}
+		strictEqual(recorded.length, stages.length);
+		for (const [index, event] of recorded.entries()) {
+			strictEqual(event.stage, stages[index][0]);
+			strictEqual(event.sequence, 1);
+			strictEqual(event.writerEpoch, "epoch-typed-stage");
+			ok(event.outcomeId.startsWith("outcome-"));
+		}
+	});
+
+	it("records production artifact and integration facts after a successful implementation", async () => {
+		const recorded = [];
+		const context = withTestDescriptorContext({
+			runId: "typed-task-success",
+			outcomeWriterEpoch: "epoch-typed-task-success",
+			emitNonProviderOutcomes: true,
+			recordOutcomeEvent: async (event) => recorded.push(event),
+			route: () => ({ provider: "claude", model: "fixture-model" }),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			integrationGate: () => ({ success: true }),
+			adapters: {
+				claude: {
+					execute: () => ({ success: true, output: "ok" }),
+					captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+				},
+			},
+			projectPath: TEST_DIR,
+			workingContainerName: "typed-task-worker",
+		});
+		const result = executeTaskImpl(
+			{
+				id: "1.1",
+				title: "typed task",
+				type: "implementation",
+				description: "exercise production task stages",
+				requiredPaths: ["src/a.mjs"],
+			},
+			context,
+		);
+		await context._outcomeWriteChain;
+		strictEqual(result.success, true);
+		deepStrictEqual(
+			recorded.map(({ stage, status }) => [stage, status]),
+			[
+				["artifact", "succeeded"],
+				["integration", "succeeded"],
+				["postcondition", "succeeded"],
+			],
+		);
+	});
+
+	it("records explicit unavailable evidence when an implementation stops before capture", async () => {
+		const recorded = [];
+		const context = {
+			runId: "typed-task-unavailable",
+			outcomeWriterEpoch: "epoch-typed-task-unavailable",
+			emitNonProviderOutcomes: true,
+			recordOutcomeEvent: async (event) => recorded.push(event),
+			route: () => ({
+				provider: "claude",
+				model: "fixture-model",
+				resolved_harness: "claude",
+			}),
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			resolveDescriptor: () => {
+				throw new Error("fixture descriptor unavailable");
+			},
+			integrationGate: () => ({ success: true }),
+			adapters: {},
+			projectPath: TEST_DIR,
+			workingContainerName: "typed-task-worker",
+		};
+		const result = executeTaskImpl(
+			{
+				id: "1.1",
+				title: "typed unavailable task",
+				type: "implementation",
+				description: "stop before capture",
+				requiredPaths: ["src/a.mjs"],
+			},
+			context,
+		);
+		await context._outcomeWriteChain;
+		strictEqual(result.success, false);
+		deepStrictEqual(
+			recorded
+				.slice(0, 2)
+				.map(({ stage, status, detail }) => [stage, status, detail.code]),
+			[
+				["artifact", "uncertain", "artifact_evidence_unavailable"],
+				["integration", "uncertain", "integration_evidence_unavailable"],
+			],
+		);
 	});
 });
 
@@ -3097,12 +3230,17 @@ describe("async runner provider lifecycle", () => {
 		});
 		let settled = false;
 		const routeOptions = [];
+		const typedOutcomes = [];
 		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: root,
 			workingContainerName: "async-worker",
 			checkpointPath,
+			runId: "typed-async-lifecycle",
 			dependencies: {
+				enableNonProviderOutcomes: true,
+				outcomeWriterEpoch: "epoch-typed-async-lifecycle",
+				recordOutcomeEvent: async (outcome) => typedOutcomes.push(outcome),
 				integrationGate: () => ({ success: true }),
 				route: (options) => {
 					routeOptions.push(options);
@@ -3128,7 +3266,7 @@ describe("async runner provider lifecycle", () => {
 							};
 						},
 						captureDiff: () => null,
-						captureDiffAsync: async () => null,
+						captureDiffAsync: async () => "",
 					},
 				},
 			},
@@ -3144,6 +3282,30 @@ describe("async runner provider lifecycle", () => {
 		]);
 		strictEqual(result.processedTasks, 1);
 		strictEqual(result.completedTaskIds[0], "4.1");
+		for (const requiredStage of [
+			"worker",
+			"run",
+			"preflight",
+			"provider",
+			"artifact",
+			"integration",
+			"postcondition",
+		]) {
+			ok(
+				typedOutcomes.some(({ stage }) => stage === requiredStage),
+				`missing typed ${requiredStage} production fact`,
+			);
+		}
+		const artifactOutcome = typedOutcomes.find(
+			({ stage }) => stage === "artifact",
+		);
+		const integrationOutcome = typedOutcomes.find(
+			({ stage }) => stage === "integration",
+		);
+		strictEqual(artifactOutcome.status, "succeeded");
+		strictEqual(artifactOutcome.detail.code, "artifact_capture");
+		strictEqual(integrationOutcome.status, "succeeded");
+		strictEqual(integrationOutcome.detail.code, "integration_gate");
 	});
 
 	it("persists provider evidence once and keeps only a valid ref", async () => {

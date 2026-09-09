@@ -37,12 +37,14 @@ import {
 	acquireRunLock,
 	acquireVmSlot,
 	advanceState,
+	appendOutcomeEvent,
 	applyCheckpointArtifactRetention,
 	applyRetention,
 	assertProjectLockOwnership,
 	createEvent,
 	createFencingIdentity,
 	createRouteHealthEvent,
+	createStageOutcome,
 	getRunRoot,
 	getStateRoot,
 	getVmAdmissionRoot,
@@ -83,6 +85,123 @@ const TEST_ROOT = tempDir("switchyard-run-store-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
+
+describe("typed stage append boundary", () => {
+	it("keeps retry and causality identities distinct", () => {
+		const base = {
+			runId: "stage-identity",
+			taskId: "1.1",
+			stage: "artifact",
+			status: "succeeded",
+			producer: "runner",
+			code: "artifact_capture",
+			detail: { artifactKind: "diff", captured: true },
+			writerEpoch: "epoch-stage-identity",
+		};
+		const first = createStageOutcome({
+			...base,
+			attempt: 1,
+			attemptId: "attempt-primary",
+			causedBy: "process-primary",
+		});
+		const retry = createStageOutcome({
+			...base,
+			attempt: 2,
+			attemptId: "attempt-retry",
+			causedBy: "process-retry",
+		});
+		notStrictEqual(first.outcomeId, retry.outcomeId);
+		notStrictEqual(first.operationId, retry.operationId);
+	});
+
+	it("accepts the provider fact required beside non-provider production stages", async () => {
+		const runId = `provider-stage-${randomUUID()}`;
+		const initial = await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "fixture",
+			workerNonce: randomUUID(),
+		});
+		const active = await updateRun(
+			runId,
+			{ outcomeWriterEpoch: "epoch-provider-stage" },
+			initial.revision,
+		);
+		const providerFact = {
+			schemaVersion: 1,
+			minimumReaderVersion: 1,
+			writerEpoch: active.outcomeWriterEpoch,
+			outcomeId: `provider-${randomUUID()}`,
+			sequence: 1,
+			runId,
+			scope: "task",
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			resumesOutcomeId: null,
+			stage: "provider",
+			legacyPhase: null,
+			legacyEvent: null,
+			dispatchCausality: `sha256:${"a".repeat(64)}`,
+			attempt: 1,
+			recordedAt: new Date().toISOString(),
+			producer: "provider-lifecycle",
+			causedBy: null,
+			operationId: "operation-provider-stage",
+			status: "succeeded",
+			detail: {
+				code: "process_completed",
+				servedModelVerified: true,
+				targetId: "fixture-target",
+			},
+		};
+		await appendOutcomeEvent(runId, providerFact, {
+			writerEpoch: active.outcomeWriterEpoch,
+		});
+		const [persisted] = await readEvents(runId);
+		strictEqual(persisted.stage, "provider");
+		strictEqual(persisted.detail.code, "process_completed");
+	});
+
+	it("assigns one sequenced typed fact per stage and preserves causality", async () => {
+		const runId = `stage-${randomUUID()}`;
+		const initial = await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "fixture",
+			workerNonce: randomUUID(),
+		});
+		const active = await updateRun(
+			runId,
+			{ outcomeWriterEpoch: "epoch-stage" },
+			initial.revision,
+		);
+		const processOutcomeId = `outcome-process-${randomUUID()}`;
+		const stage = createStageOutcome({
+			runId,
+			taskId: "1.1",
+			stage: "integration",
+			status: "succeeded",
+			producer: "runner",
+			code: "integration_gate",
+			detail: { gateCode: "success", accepted: true },
+			writerEpoch: active.outcomeWriterEpoch,
+			causedBy: processOutcomeId,
+		});
+		const sequence = await appendOutcomeEvent(runId, stage, {
+			writerEpoch: active.outcomeWriterEpoch,
+		});
+		strictEqual(sequence, 1);
+		const [persisted] = await readEvents(runId);
+		strictEqual(persisted.stage, "integration");
+		strictEqual(persisted.detail.accepted, true);
+		strictEqual(persisted.causedBy, processOutcomeId);
+		strictEqual(persisted.minimumReaderVersion, 1);
+	});
+});
 
 describe("provider diagnostic artifact boundary", () => {
 	it("stores bounded digest/count metadata and resolves only opaque refs", async () => {

@@ -528,6 +528,28 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		const startToken = randomUUID();
 
 		await runStore.acquireRunLock(runId, pid, startToken, nonce);
+		const activeWriter = await runStore.activateOutcomeWriter(runId, {
+			pid,
+			startToken,
+			nonce,
+			writerEpoch: run.outcomeWriterEpoch ?? `epoch-${runId}-${nonce}`,
+		});
+		await runStore.appendOutcomeEvent(
+			runId,
+			runStore.createStageOutcome({
+				runId,
+				stage: "worker",
+				status: "succeeded",
+				producer: "worker-bootstrap",
+				code: "worker_started",
+				detail: { launchVerified: true },
+				writerEpoch: activeWriter.outcomeWriterEpoch,
+			}),
+			{
+				writerEpoch: activeWriter.outcomeWriterEpoch,
+				owner: { pid, startToken, nonce },
+			},
+		);
 
 		// NOTE (leak-recovery Piece C): the detached worker deliberately does NOT
 		// run a pre-dispatch orphan sweep. An ephemeral worker whose only job is to
@@ -559,6 +581,21 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		// health modules are loaded. A boot failure before this boundary remains a
 		// pre-execution failure with startedAt unset.
 		await runStore.advanceState(runId, "running");
+		await runStore.appendOutcomeEvent(
+			runId,
+			runStore.createStageOutcome({
+				runId,
+				stage: "run",
+				status: "started",
+				producer: "worker-bootstrap",
+				code: "run_started",
+				writerEpoch: activeWriter.outcomeWriterEpoch,
+			}),
+			{
+				writerEpoch: activeWriter.outcomeWriterEpoch,
+				owner: { pid, startToken, nonce },
+			},
+		);
 
 		const result = await runQueueFn({
 			tasksFilePath: run.tasksFilePath,

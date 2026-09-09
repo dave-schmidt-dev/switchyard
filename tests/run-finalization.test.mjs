@@ -5,6 +5,7 @@ import {
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { finalizeRun } from "../src/switchyard/dispatch/run-finalization.mjs";
+import { createStageOutcome } from "../src/switchyard/run-store/index.mjs";
 
 function revisionError() {
 	const error = new Error("run lock changed while releasing");
@@ -13,6 +14,39 @@ function revisionError() {
 }
 
 describe("run finalization", () => {
+	it("records typed cleanup, run, and postcondition facts beside legacy terminalization", async () => {
+		const typed = [];
+		const runStore = {
+			readRun: async () => ({
+				outcomeWriterEpoch: "epoch-finalize",
+				workerPid: process.pid,
+				workerStartToken: "start-token",
+				workerNonce: "worker-nonce",
+			}),
+			createStageOutcome,
+			appendOutcomeEvent: async (_runId, outcome) => {
+				typed.push(outcome);
+				return typed.length;
+			},
+			createEvent: async () => {},
+			updateRunWithRetry: async (_runId, patch) => patch,
+			releaseRunLock: async () => {},
+		};
+		const outcome = await finalizeRun(
+			{
+				runId: "typed-finalize",
+				state: "succeeded",
+				terminalSummary: { processedTasks: 1, failedCount: 0 },
+			},
+			runStore,
+		);
+		strictEqual(outcome.terminal, true);
+		deepStrictEqual(
+			typed.map((event) => event.stage),
+			["cleanup", "cleanup", "run", "postcondition"],
+		);
+	});
+
 	it("records deferred as terminal without failure metadata", async () => {
 		const events = [];
 		const patches = [];

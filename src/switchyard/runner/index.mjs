@@ -150,6 +150,7 @@ import {
 	activateOutcomeWriter,
 	appendOutcomeEvent,
 	createFencingIdentity,
+	createStageOutcome,
 	getStateRoot,
 	getVmAdmissionRoot,
 	isProjectLockOwnedBy,
@@ -6676,6 +6677,7 @@ function executeTaskUnsafe(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "success_no_diff",
+			captureStatus: captureEvidence.status,
 			...servedModelVerificationFields(execution),
 			...survivingProviderFields(execution),
 		};
@@ -6794,10 +6796,18 @@ export function executeTask(task, context) {
 		context._activeProviderExecutionSucceeded = false;
 		context._activeCompletionLifecycleReceipt = null;
 	}
-	return decorateDirtyOverlayResult(
+	const result = decorateDirtyOverlayResult(
 		attachRouteHealthTerminal(executeTaskUnsafe(task, context), context),
 		context,
 	);
+	if (context.recordOutcomeEvent) {
+		context._outcomeWriteChain = (
+			context._outcomeWriteChain ?? Promise.resolve()
+		)
+			.then(() => emitTaskStageOutcomes(context, task, result))
+			.catch(() => {});
+	}
+	return result;
 }
 
 /**
@@ -6812,13 +6822,15 @@ export async function executeTaskAsync(task, context) {
 	context._activeCompletionLifecycleReceipt = null;
 	const requiredCapability = resolveTaskRequiredCapability(task);
 	try {
-		return decorateDirtyOverlayResult(
+		const result = decorateDirtyOverlayResult(
 			attachRouteHealthTerminal(
 				await executeTaskAsyncUnsafe(task, context),
 				context,
 			),
 			context,
 		);
+		await emitTaskStageOutcomes(context, task, result);
+		return result;
 	} catch (error) {
 		const route = context._activeBrokerRoute;
 		const routed = context._activeTaskRoute;
@@ -6848,7 +6860,7 @@ export async function executeTaskAsync(task, context) {
 				// Preserve the bounded task result if outcome projection is unavailable.
 			}
 		}
-		return {
+		const result = {
 			taskId: task.id,
 			success: false,
 			provider: routed?.provider ?? null,
@@ -6858,15 +6870,91 @@ export async function executeTaskAsync(task, context) {
 			...failure,
 			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
 		};
+		await emitTaskStageOutcomes(context, task, result);
+		return result;
 	} finally {
 		clearAsyncTaskContext(context);
 	}
 }
 
+async function emitTaskStageOutcomes(context, task, result) {
+	if (
+		context?.emitNonProviderOutcomes !== true ||
+		!context?.recordOutcomeEvent ||
+		!context?.outcomeWriterEpoch
+	)
+		return;
+	const captureStatus = result?.captureStatus ?? null;
+	const expectsArtifact = task.type === "implementation";
+	const artifactAvailable = ["captured", "empty"].includes(captureStatus);
+	const artifactStatus = !expectsArtifact
+		? "skipped"
+		: captureStatus === null
+			? "uncertain"
+			: artifactAvailable
+				? "succeeded"
+				: "failed";
+	await emitStageOutcome(context, {
+		taskId: task.id,
+		attempt: context._activeOutcomeAttempt ?? 1,
+		stage: "artifact",
+		status: artifactStatus,
+		producer: "runner",
+		code: !expectsArtifact
+			? "artifact_not_applicable"
+			: captureStatus === null
+				? "artifact_evidence_unavailable"
+				: "artifact_capture",
+		detail: {
+			artifactKind: "diff",
+			captured: captureStatus === "captured",
+		},
+	});
+	const integrationReached =
+		expectsArtifact &&
+		artifactAvailable &&
+		["success", "integration_failed"].includes(result?.result);
+	const integrationStatus = !expectsArtifact
+		? "skipped"
+		: !integrationReached
+			? "uncertain"
+			: result.result === "success"
+				? "succeeded"
+				: "failed";
+	await emitStageOutcome(context, {
+		taskId: task.id,
+		attempt: context._activeOutcomeAttempt ?? 1,
+		stage: "integration",
+		status: integrationStatus,
+		producer: "runner",
+		code: !expectsArtifact
+			? "integration_not_applicable"
+			: !integrationReached
+				? "integration_evidence_unavailable"
+				: "integration_gate",
+		detail: {
+			gateCode: integrationReached ? result.result : "not_observed",
+			accepted: integrationReached && result?.success === true,
+		},
+	});
+	await emitStageOutcome(context, {
+		taskId: task.id,
+		attempt: context._activeOutcomeAttempt ?? 1,
+		stage: "postcondition",
+		status: result?.success === true ? "succeeded" : "failed",
+		producer: "runner",
+		code: "task_postcondition",
+		detail: {
+			commandResult: result?.result ?? "unknown",
+			observedState: result?.success === true ? "accepted" : "rejected",
+		},
+	});
+}
+
 function clearAsyncTaskContext(context) {
 	context._activeBrokerRoute = null;
 	context._activeProcessOutcomeId = null;
-	context._activeOutcomeAttempt = 1;
+	context._activeOutcomeAttempt = null;
 	context._activeTaskRoute = null;
 	context._activeInvocationDescriptor = null;
 	context._activeDispatchOutcomeRecorded = false;
@@ -7190,6 +7278,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
+	context._outcomeAttemptCursor = (context._outcomeAttemptCursor ?? 0) + 1;
+	context._activeOutcomeAttempt = context._outcomeAttemptCursor;
 	let clearExecutionPolicy = () => {};
 	if (selectedRoute.reservation?.id) {
 		clearExecutionPolicy = registerBrokerExecutionPolicy(
@@ -7201,11 +7291,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 				writerEpoch: context.outcomeWriterEpoch ?? null,
 				operationId: `operation-${task.id}-execution`,
 				causedBy: () => context._activeProcessOutcomeId ?? null,
-				attempt: 1,
+				attempt: context._activeOutcomeAttempt,
 			},
 		);
 	}
-	context._activeOutcomeAttempt = 1;
 	let brokerExecution;
 	try {
 		brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
@@ -7288,7 +7377,9 @@ async function executeTaskAsyncUnsafe(task, context) {
 				context._activeDispatchOutcomeRecorded = false;
 				context._activeBrokerRoute = fallbackRoute;
 				context._activeProcessOutcomeId = null;
-				context._activeOutcomeAttempt = 2;
+				context._outcomeAttemptCursor =
+					(context._outcomeAttemptCursor ?? 0) + 1;
+				context._activeOutcomeAttempt = context._outcomeAttemptCursor;
 				selectedRoute = fallbackRoute;
 				routeCapability = fallbackRoute.capability;
 				routeResult = normalizeBrokerRoute(fallbackRoute);
@@ -7407,7 +7498,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 							writerEpoch: context.outcomeWriterEpoch ?? null,
 							operationId: `operation-${task.id}-execution`,
 							causedBy: () => context._activeProcessOutcomeId ?? null,
-							attempt: 2,
+							attempt: context._activeOutcomeAttempt,
 						},
 					);
 				}
@@ -7823,6 +7914,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "success_no_diff",
+			captureStatus: captureEvidence.status,
 			...servedModelVerificationFields(execution),
 			...survivingProviderFields(execution),
 		};
@@ -7873,6 +7965,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		requiredCapability,
 		resolvedTargetId,
 		result: terminalResult,
+		captureStatus: captureEvidence.status,
 		...servedModelVerificationFields(execution),
 		...survivingProviderFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
@@ -7918,25 +8011,62 @@ export async function runQueueAsync(options) {
 		markerPath: dependencies.generationMarkerPath,
 	});
 	const emitStatus = _resolveOnStatus(dependencies);
-	const launch = prepareQueueLaunch({
-		tasksFilePath,
-		projectPath,
-		checkpointPath,
-		maxTasks,
-		stopOnFailure,
-		exclude,
-		only,
-		taskIds,
-		identityTaskIds: [],
-		platform,
-		runOptions,
-		queueIdentity,
-		projectRevision,
+	// Discover the run writer before any queue parsing, backend preflight, or
+	// VM admission. Those are authoritative preflight boundaries: if one fails,
+	// the run must still receive an explicit typed failure when its lease exists.
+	const outcomeWriter = await prepareOutcomeWriter(runId, dependencies);
+	const stageContext = {
 		runId,
-		dependencies,
+		recordOutcomeEvent:
+			dependencies.recordOutcomeEvent ?? outcomeWriter?.record ?? null,
+		outcomeWriterEpoch:
+			dependencies.outcomeWriterEpoch ?? outcomeWriter?.writerEpoch ?? null,
 		onStatus: emitStatus,
-		deferSlotAcquisition: true,
+	};
+	await emitStageOutcome(stageContext, {
+		stage: "worker",
+		status: "succeeded",
+		producer: "runner",
+		code: "worker_started",
+		detail: { launchVerified: true },
 	});
+	await emitStageOutcome(stageContext, {
+		stage: "run",
+		status: "started",
+		producer: "runner",
+		code: "run_started",
+	});
+	let launch;
+	try {
+		launch = prepareQueueLaunch({
+			tasksFilePath,
+			projectPath,
+			checkpointPath,
+			maxTasks,
+			stopOnFailure,
+			exclude,
+			only,
+			taskIds,
+			identityTaskIds: [],
+			platform,
+			runOptions,
+			queueIdentity,
+			projectRevision,
+			runId,
+			dependencies,
+			onStatus: emitStatus,
+			deferSlotAcquisition: true,
+		});
+	} catch (error) {
+		await emitStageOutcome(stageContext, {
+			stage: "preflight",
+			status: "failed",
+			producer: "runner",
+			code: "queue_preflight_failed",
+			detail: { eligible: false },
+		});
+		throw error;
+	}
 	const {
 		queueBackend,
 		dirtyOverlayReceipt,
@@ -7951,6 +8081,13 @@ export async function runQueueAsync(options) {
 		effectiveTaskIds,
 	} = launch;
 	if (launch.policyDeferred) {
+		await emitStageOutcome(stageContext, {
+			stage: "preflight",
+			status: "skipped",
+			producer: "runner",
+			code: "queue_deferred",
+			detail: { eligible: false },
+		});
 		emitStatus?.({
 			phase: "policy",
 			event: "queue_deferred",
@@ -7962,12 +8099,33 @@ export async function runQueueAsync(options) {
 	}
 	ensureRetryCheckpoint(checkpoint);
 	ensureProviderAttemptAllocations(checkpoint);
-	const slotLease = await acquireQueueSlotAsync({
-		queueBackend,
-		selectedPlatform,
-		runId,
-		dependencies,
-		onStatus: emitStatus,
+	let slotLease;
+	try {
+		slotLease = await acquireQueueSlotAsync({
+			queueBackend,
+			selectedPlatform,
+			runId,
+			dependencies,
+			onStatus: emitStatus,
+		});
+	} catch (error) {
+		await emitStageOutcome(stageContext, {
+			stage: "preflight",
+			status: "failed",
+			producer: "runner",
+			code: isVmSlotUnavailable(error)
+				? "vm_slot_unavailable"
+				: "queue_admission_failed",
+			detail: { eligible: false },
+		});
+		throw error;
+	}
+	await emitStageOutcome(stageContext, {
+		stage: "preflight",
+		status: "succeeded",
+		producer: "runner",
+		code: "queue_preflight",
+		detail: { eligible: true },
 	});
 	let workingContainerName = suppliedWorkingContainerName;
 	let ownsWorkingContainer = false;
@@ -8035,7 +8193,6 @@ export async function runQueueAsync(options) {
 		throw error;
 	}
 	checkpoint.taskBases ??= {};
-	const outcomeWriter = await prepareOutcomeWriter(runId, dependencies);
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch:
@@ -8051,7 +8208,8 @@ export async function runQueueAsync(options) {
 		outcomeWriterEpoch:
 			dependencies.outcomeWriterEpoch ?? outcomeWriter?.writerEpoch ?? null,
 		_activeProcessOutcomeId: null,
-		_activeOutcomeAttempt: 1,
+		_activeOutcomeAttempt: null,
+		_outcomeAttemptCursor: 0,
 		recordDispatchIntent:
 			dependencies.recordDispatchIntent ??
 			((intent) => recordDispatchIntentToStore(intent, runStorePath)),
@@ -8090,6 +8248,9 @@ export async function runQueueAsync(options) {
 			checkpoint.quarantinedTargetIds,
 		),
 		only: effectiveOnly,
+		emitNonProviderOutcomes:
+			dependencies.enableNonProviderOutcomes === true ||
+			typeof dependencies.recordOutcomeEvent !== "function",
 		signal: dependencies.signal,
 		onPoll: dependencies.onPoll,
 		resolveDescriptor: dependencies.resolveDescriptor,
@@ -10108,6 +10269,7 @@ export async function prepareOutcomeWriter(runId, dependencies) {
 		nonce: current.workerNonce,
 		writerEpoch:
 			dependencies.outcomeWriterEpoch ??
+			current.outcomeWriterEpoch ??
 			`epoch-${runId}-${current.revision + 1}`,
 		minimumReaderVersion: dependencies.minimumOutcomeReaderVersion ?? 1,
 	});
@@ -10135,6 +10297,36 @@ export async function prepareOutcomeWriter(runId, dependencies) {
 				minimumReaderVersion: activated.minimumOutcomeReaderVersion ?? 1,
 			}),
 	};
+}
+
+/** Emit one non-provider stage fact while preserving the legacy projection. */
+export async function emitStageOutcome(context, options = {}) {
+	if (
+		!context ||
+		typeof context.recordOutcomeEvent !== "function" ||
+		typeof context.outcomeWriterEpoch !== "string"
+	)
+		return null;
+	try {
+		const outcome = createStageOutcome({
+			runId: context.runId,
+			writerEpoch: context.outcomeWriterEpoch,
+			causedBy: context._activeProcessOutcomeId ?? null,
+			resumesOutcomeId: context._activeProcessOutcomeId ?? null,
+			...options,
+		});
+		await context.recordOutcomeEvent(outcome);
+		return outcome;
+	} catch {
+		// Typed outcomes are shadow writes in this phase. A failed typed write
+		// cannot erase the already-authoritative legacy event or result.
+		context.onStatus?.({
+			phase: options.stage ?? "run",
+			event: "outcome_write_unavailable",
+			status: "Typed stage evidence unavailable",
+		});
+		return null;
+	}
 }
 
 function mergeBrokerRouteProvenance(routeResult, capability, provenance) {
@@ -11343,6 +11535,7 @@ export function runQueue(options) {
 		outcomeWriterEpoch: dependencies.outcomeWriterEpoch ?? null,
 		_activeProcessOutcomeId: null,
 		_activeOutcomeAttempt: 1,
+		_outcomeAttemptCursor: 0,
 		recordDispatchIntent:
 			dependencies.recordDispatchIntent ?? defaultRecordDispatchIntent,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
@@ -11385,7 +11578,40 @@ export function runQueue(options) {
 		monotonicNow: dependencies.monotonicNow ?? (() => performance.now()),
 		exclude,
 		only,
+		emitNonProviderOutcomes:
+			dependencies.enableNonProviderOutcomes === true ||
+			typeof dependencies.recordOutcomeEvent !== "function",
 	};
+	if (context.recordOutcomeEvent && context.outcomeWriterEpoch) {
+		context._outcomeWriteChain = Promise.resolve()
+			.then(() =>
+				emitStageOutcome(context, {
+					stage: "preflight",
+					status: "succeeded",
+					producer: "runner",
+					code: "queue_preflight",
+					detail: { eligible: true },
+				}),
+			)
+			.then(() =>
+				emitStageOutcome(context, {
+					stage: "run",
+					status: "started",
+					producer: "runner",
+					code: "run_started",
+				}),
+			)
+			.then(() =>
+				emitStageOutcome(context, {
+					stage: "worker",
+					status: "started",
+					producer: "runner",
+					code: "worker_started",
+					detail: { launchVerified: true },
+				}),
+			)
+			.catch(() => {});
+	}
 
 	try {
 		if (ownsWorkingContainer) {
@@ -12078,7 +12304,10 @@ export function runQueue(options) {
 			// caller that terminates on return (or that reads the ledger right
 			// after it) must await this; every other caller can ignore it, which
 			// is why runQueue's own signature stays synchronous.
-			ledgerWritesSettled: storeWriteChain,
+			ledgerWritesSettled: Promise.all([
+				storeWriteChain,
+				context._outcomeWriteChain ?? Promise.resolve(),
+			]),
 			...(identity.enabled
 				? {
 						queueIdentity: identity.queueIdentity,
