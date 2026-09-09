@@ -11,6 +11,7 @@ import {
 	validateTaskStartTreeAsync,
 } from "../lifecycle/index.mjs";
 import {
+	CLEANUP_STAGES,
 	classifyProviderDiagnostic,
 	classifyProviderStreams,
 	cleanupDiagnosticCodeFor,
@@ -581,6 +582,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		idleExitCode,
 		launcherDiagnosticCode,
 		adapterDiagnosticCode,
+		onProcessCompleted,
 		...lifecycleOptions
 	} = options;
 	const classificationCommand =
@@ -618,7 +620,24 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		...lifecycleOptions,
 		cleanup: cleanupWithBackend,
 	});
-	if (result.success) return { output: result.output, success: true };
+	const complete = async (value) => {
+		if (typeof onProcessCompleted === "function") {
+			await onProcessCompleted({
+				success: value.success === true,
+				cancelled: value.cancelled === true,
+				timedOut: value.timedOut === true,
+				silenceTimedOut: value.silenceTimedOut === true,
+				cleanupFailed: value.cleanupFailed === true,
+				cleanupStage: CLEANUP_STAGES.has(value.cleanupStage)
+					? value.cleanupStage
+					: null,
+				code: Number.isSafeInteger(value.code) ? value.code : null,
+				signal: typeof value.signal === "string" ? value.signal : null,
+			});
+		}
+		return value;
+	};
+	if (result.success) return complete({ output: result.output, success: true });
 	// A provider whose container-side supervisor reports this reserved exit code
 	// finished its work but could not exit on its own (see opencode.mjs). The
 	// work is in the working tree, so it is mapped to success and the captured
@@ -631,15 +650,15 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		!result.cancelled &&
 		!result.error
 	) {
-		return {
+		return complete({
 			output: result.output,
 			stderr: result.stderr,
 			success: true,
 			idleTerminated: true,
-		};
+		});
 	}
 	if (result.timedOut) {
-		return {
+		return complete({
 			output: result.output,
 			success: false,
 			error: result.cleanupFailed
@@ -670,10 +689,10 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				provider,
 				command: classificationCommand,
 			}),
-		};
+		});
 	}
 	if (result.silenceTimedOut) {
-		return {
+		return complete({
 			output: result.output,
 			success: false,
 			error:
@@ -687,11 +706,11 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			diagnosticOrigin: "adapter",
 			diagnosticEvidenceAvailable: false,
 			progress: result.progress,
-		};
+		});
 	}
 	if (result.cancelled) {
 		const cleanupFailed = result.cleanupFailed === true;
-		return {
+		return complete({
 			output: result.output,
 			success: false,
 			error: cleanupFailed
@@ -717,7 +736,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				provider,
 				command: classificationCommand,
 			}),
-		};
+		});
 	}
 	const error = Object.assign(
 		new Error(
@@ -745,7 +764,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 	const parsedDiagnosticCode = providerDiagnosticCodeForKind(
 		diagnosticEvidence.diagnosticKind,
 	);
-	return {
+	return complete({
 		output: described.output,
 		success: false,
 		error: truncateDiagnostic(described.error),
@@ -765,7 +784,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 		signal: result.signal ?? null,
 		diagnosticEvidence,
-	};
+	});
 }
 
 /**

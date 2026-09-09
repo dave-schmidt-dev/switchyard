@@ -1706,6 +1706,7 @@ test("production async runner records the adapter's served-model verification", 
 		const root = await tempDirAsync("switchyard-broker-served-");
 		const tasksFilePath = join(root, "TASKS.md");
 		const checkpointPath = join(root, "checkpoint.json");
+		const typedOutcomes = [];
 		await writeFile(
 			tasksFilePath,
 			"### Task 1.1: Served model\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** carry the served-model fact\n",
@@ -1716,6 +1717,8 @@ test("production async runner records the adapter's served-model verification", 
 			workingContainerName: "broker-served-worker",
 			checkpointPath,
 			dependencies: {
+				recordOutcomeEvent: (outcome) => typedOutcomes.push(outcome),
+				outcomeWriterEpoch: "epoch-1",
 				queuePreflight: () => ({ ok: true, eligible: true }),
 				backendFactory: () => ({
 					executionBackend: {},
@@ -1753,6 +1756,9 @@ test("production async runner records the adapter's served-model verification", 
 			},
 		});
 		const record = result.results[0];
+		strictEqual(typedOutcomes.length, 1);
+		strictEqual(record.executionOutcome.outcomeId, typedOutcomes[0].outcomeId);
+		strictEqual(record.executionOutcome.detail.targetId, "cheap");
 		if (expected === undefined) {
 			strictEqual(
 				Object.hasOwn(record, "servedModelVerified"),
@@ -1773,6 +1779,67 @@ test("production async runner records the adapter's served-model verification", 
 			false,
 		);
 	}
+});
+
+test("production async runner fails closed when typed outcome persistence fails", async () => {
+	const root = await tempDirAsync("switchyard-broker-outcome-write-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Outcome write\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fail closed on outcome persistence\n",
+	);
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		workingContainerName: "broker-outcome-write-worker",
+		checkpointPath,
+		dependencies: {
+			recordOutcomeEvent: () => {
+				throw new Error("outcome store unavailable");
+			},
+			outcomeWriterEpoch: "epoch-1",
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			backendFactory: () => ({
+				executionBackend: {},
+				create: () => "broker-outcome-write-worker",
+				destroy: () => {},
+				seed: () => {},
+				commit: () => {},
+				reset: () => {},
+			}),
+			adapters: {
+				claude: {
+					executeAsync: async (_prompt, options) => {
+						await options.onProcessCompleted({ success: true });
+						return { success: true, output: "done" };
+					},
+					captureDiffAsync: async () => null,
+				},
+			},
+			recordDispatch: () => {},
+			recordDispatchIntent: () => {},
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+		},
+	});
+	strictEqual(result.results[0].success, false);
+	strictEqual(result.results[0].result, "recovery_required");
+	strictEqual(result.results[0].errorKind, "recovery_incomplete");
+	strictEqual(result.results[0].failurePhase, "terminal_reconciliation");
+	strictEqual(result.results[0].executionOutcome.status, "failed");
+	strictEqual(result.results[0].executionOutcome.causedBy, null);
 });
 
 // The same defect as above, found by auditing the boundary the served-model

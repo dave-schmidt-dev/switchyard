@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { executeBrokerRoute } from "../src/switchyard/broker/executor.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { sanitizeReviewResult } from "../src/switchyard/diagnostics/review-result.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 
 function fixture() {
@@ -511,5 +512,117 @@ describe("broker async executor", () => {
 			terminal: async () => ({ changed: true }),
 		});
 		strictEqual(result.cleanupStage, null);
+	});
+
+	it("constructs one complete typed outcome for success, failure, and cancellations", async () => {
+		const value = fixture();
+		const outcomes = [];
+		const common = {
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			terminal: async () => ({ changed: true }),
+			recordOutcome: async (outcome) => outcomes.push(outcome),
+			writerEpoch: "epoch-1",
+			dispatchCausality: `sha256:${"e".repeat(64)}`,
+		};
+		await executeBrokerRoute({
+			...common,
+			launch: async () => ({
+				success: true,
+				servedModelVerified: true,
+				reviewResult: sanitizeReviewResult({ verdict: "clean" }),
+				completionContinuationProof: {
+					version: 1,
+					kind: "completion_continuation_lifecycle",
+					providerExited: true,
+					childrenExited: true,
+					cleanupSucceeded: true,
+					taskId: "1.1",
+					attemptId: "attempt-1",
+					descriptorIdentity: value.descriptor.descriptor_identity,
+					workspaceId: "switchyard-work-1",
+				},
+			}),
+		});
+		await executeBrokerRoute({
+			...common,
+			launch: async () => ({ success: false, errorKind: "execution_failed" }),
+		});
+		const controller = new AbortController();
+		controller.abort();
+		await executeBrokerRoute({
+			...common,
+			signal: controller.signal,
+			launch: async () => ({ success: true }),
+		});
+		await executeBrokerRoute({
+			...common,
+			launch: async () => ({ success: false, cancelled: true }),
+		});
+		strictEqual(outcomes.length, 4);
+		strictEqual(
+			outcomes.filter((outcome) => outcome.stage === "provider").length,
+			4,
+		);
+		strictEqual(outcomes[0].status, "succeeded");
+		strictEqual(outcomes[0].detail.servedModelVerified, true);
+		strictEqual(outcomes[0].detail.reviewResult.status, "available");
+		strictEqual(
+			outcomes[0].detail.completionContinuationProof.kind,
+			"completion_continuation_lifecycle",
+		);
+		strictEqual(outcomes[1].status, "failed");
+		strictEqual(outcomes[2].status, "skipped");
+		strictEqual(
+			Object.hasOwn(outcomes[2].detail, "servedModelVerified"),
+			false,
+		);
+		strictEqual(outcomes[3].status, "skipped");
+		strictEqual(outcomes[0].causedBy, null);
+		strictEqual(outcomes[0].operationId, outcomes[1].operationId);
+		strictEqual(outcomes[0].dispatchCausality, outcomes[1].dispatchCausality);
+	});
+
+	it("does not retry a failed outcome write or reclassify provider success", async () => {
+		const value = fixture();
+		let writes = 0;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({ success: true }),
+			terminal: async () => ({ changed: true }),
+			recordOutcome: async () => {
+				writes += 1;
+				throw new Error("ledger unavailable");
+			},
+		});
+		strictEqual(writes, 1);
+		strictEqual(result.success, true);
+		strictEqual(result.outcome, "success");
+		strictEqual(result.executionOutcome.status, "succeeded");
+		strictEqual(result.outcomePersistenceFailed, true);
+	});
+
+	it("binds the execution fact to the process fact completed by the launcher", async () => {
+		const value = fixture();
+		let processOutcomeId = null;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => {
+				processOutcomeId = "outcome-process-completed";
+				return { success: true };
+			},
+			terminal: async () => ({ changed: true }),
+			causedBy: () => processOutcomeId,
+		});
+		strictEqual(result.executionOutcome.causedBy, processOutcomeId);
+		strictEqual(result.executionOutcome.resumesOutcomeId, processOutcomeId);
 	});
 });

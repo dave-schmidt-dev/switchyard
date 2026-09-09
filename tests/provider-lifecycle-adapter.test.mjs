@@ -1121,4 +1121,22 @@ describe("provider process lifecycle", () => {
 			strictEqual(Object.hasOwn(result.diagnosticEvidence, "stderr"), false);
 		}
 	});
+
+	it("awaits the durable process-completed callback before returning", async () => {
+		const child = fakeChild();
+		const order = [];
+		const pending = executeProviderInvocation("fake", [], {
+			provider: "codex",
+			spawnFn: () => child,
+			onProcessCompleted: async (fact) => {
+				order.push(["persist", fact.success, fact.cleanupFailed]);
+				await new Promise((resolve) => setTimeout(resolve, 2));
+				order.push("persisted");
+			},
+		});
+		child.emit("close", 0, null);
+		const result = await pending;
+		deepStrictEqual(order, [["persist", true, false], "persisted"]);
+		strictEqual(result.success, true);
+	});
 });

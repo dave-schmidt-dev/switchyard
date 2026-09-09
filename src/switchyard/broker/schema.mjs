@@ -1,3 +1,5 @@
+import { validateOutcomeEvent } from "../outcome/schema.mjs";
+
 const BROKER_SCHEMA_VERSION = 1;
 
 const CAPABILITIES = new Set(["low", "standard", "high"]);
@@ -257,4 +259,9 @@ export function validateBrokerResult(value) {
 		reservation,
 		reason: requireSafeText(value.reason, "broker result.reason"),
 	});
+}
+
+/** Validate the typed execution fact relayed by the broker to runner callers. */
+export function validateBrokerExecutionOutcome(value, options = {}) {
+	return validateOutcomeEvent(value, options);
 }

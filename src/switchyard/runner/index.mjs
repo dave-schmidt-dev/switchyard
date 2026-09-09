@@ -84,7 +84,9 @@ import {
 	execute as executeVibe,
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
+import { registerBrokerExecutionPolicy } from "../broker/executor.mjs";
 import { createBroker } from "../broker/index.mjs";
+import { createProviderProcessCompletedOutcome } from "../broker/outcome.mjs";
 import {
 	reviewResultFromExecution,
 	unavailableReviewResult,
@@ -145,10 +147,14 @@ import {
 } from "../router/index.mjs";
 import {
 	acquireVmSlot,
+	activateOutcomeWriter,
+	appendOutcomeEvent,
 	createFencingIdentity,
 	getStateRoot,
 	getVmAdmissionRoot,
 	isProjectLockOwnedBy,
+	readRun,
+	recoverExecutionOutcome,
 	releaseVmSlot,
 	VmSlotUnavailableError,
 } from "../run-store/index.mjs";
@@ -5037,6 +5043,12 @@ function servedModelVerificationFields(execution) {
  */
 function survivingProviderFields(execution) {
 	const fields = {};
+	if (
+		execution?.executionOutcome &&
+		typeof execution.executionOutcome === "object"
+	) {
+		fields.executionOutcome = execution.executionOutcome;
+	}
 	if (execution?.cleanupFailed === true) {
 		Object.assign(fields, {
 			cleanupFailed: true,
@@ -6853,6 +6865,8 @@ export async function executeTaskAsync(task, context) {
 
 function clearAsyncTaskContext(context) {
 	context._activeBrokerRoute = null;
+	context._activeProcessOutcomeId = null;
+	context._activeOutcomeAttempt = 1;
 	context._activeTaskRoute = null;
 	context._activeInvocationDescriptor = null;
 	context._activeDispatchOutcomeRecorded = false;
@@ -7176,14 +7190,35 @@ async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
-	let brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
-		launcherIdentity: broker.launcherIdentity(selectedRoute),
-		signal: context.signal,
-		onStatus: context.onStatus,
-		onAdapterStatus: context.onStatus,
-		onPoll: context.onPoll,
-		onTaskHeartbeat: context.onTaskHeartbeat,
-	});
+	let clearExecutionPolicy = () => {};
+	if (selectedRoute.reservation?.id) {
+		clearExecutionPolicy = registerBrokerExecutionPolicy(
+			selectedRoute.reservation.id,
+			{
+				recordOutcome: context.recordOutcomeEvent
+					? (outcome) => context.recordOutcomeEvent(outcome)
+					: undefined,
+				writerEpoch: context.outcomeWriterEpoch ?? null,
+				operationId: `operation-${task.id}-execution`,
+				causedBy: () => context._activeProcessOutcomeId ?? null,
+				attempt: 1,
+			},
+		);
+	}
+	context._activeOutcomeAttempt = 1;
+	let brokerExecution;
+	try {
+		brokerExecution = await broker.execute(brokerRequest, selectedRoute, {
+			launcherIdentity: broker.launcherIdentity(selectedRoute),
+			signal: context.signal,
+			onStatus: context.onStatus,
+			onAdapterStatus: context.onStatus,
+			onPoll: context.onPoll,
+			onTaskHeartbeat: context.onTaskHeartbeat,
+		});
+	} finally {
+		clearExecutionPolicy();
+	}
 	context._activeBrokerRoute = null;
 	if (!brokerExecution.success) {
 		const primaryRoute = routeResult;
@@ -7252,6 +7287,8 @@ async function executeTaskAsyncUnsafe(task, context) {
 				);
 				context._activeDispatchOutcomeRecorded = false;
 				context._activeBrokerRoute = fallbackRoute;
+				context._activeProcessOutcomeId = null;
+				context._activeOutcomeAttempt = 2;
 				selectedRoute = fallbackRoute;
 				routeCapability = fallbackRoute.capability;
 				routeResult = normalizeBrokerRoute(fallbackRoute);
@@ -7359,14 +7396,33 @@ async function executeTaskAsyncUnsafe(task, context) {
 						requiredCapability,
 					);
 				}
-				brokerExecution = await broker.execute(brokerRequest, fallbackRoute, {
-					launcherIdentity: broker.launcherIdentity(fallbackRoute),
-					signal: context.signal,
-					onStatus: context.onStatus,
-					onAdapterStatus: context.onStatus,
-					onPoll: context.onPoll,
-					onTaskHeartbeat: context.onTaskHeartbeat,
-				});
+				clearExecutionPolicy = () => {};
+				if (fallbackRoute.reservation?.id) {
+					clearExecutionPolicy = registerBrokerExecutionPolicy(
+						fallbackRoute.reservation.id,
+						{
+							recordOutcome: context.recordOutcomeEvent
+								? (outcome) => context.recordOutcomeEvent(outcome)
+								: undefined,
+							writerEpoch: context.outcomeWriterEpoch ?? null,
+							operationId: `operation-${task.id}-execution`,
+							causedBy: () => context._activeProcessOutcomeId ?? null,
+							attempt: 2,
+						},
+					);
+				}
+				try {
+					brokerExecution = await broker.execute(brokerRequest, fallbackRoute, {
+						launcherIdentity: broker.launcherIdentity(fallbackRoute),
+						signal: context.signal,
+						onStatus: context.onStatus,
+						onAdapterStatus: context.onStatus,
+						onPoll: context.onPoll,
+						onTaskHeartbeat: context.onTaskHeartbeat,
+					});
+				} finally {
+					clearExecutionPolicy();
+				}
 				context._activeBrokerRoute = null;
 			}
 		}
@@ -7400,7 +7456,34 @@ async function executeTaskAsyncUnsafe(task, context) {
 		// verdict relays null and the review result resolves to an explicit
 		// `missing` instead of inheriting a placeholder.
 		reviewResult: brokerExecution.reviewResult ?? null,
+		executionOutcome: brokerExecution.executionOutcome ?? null,
+		outcomePersistenceFailed: brokerExecution.outcomePersistenceFailed === true,
 	};
+	if (execution.outcomePersistenceFailed) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "recovery_required",
+			errorKind: "recovery_incomplete",
+			reason: "typed execution outcome persistence failed; recovery required",
+			failurePhase: "terminal_reconciliation",
+		});
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "recovery_required",
+			errorKind: "recovery_incomplete",
+			reason: "typed execution outcome persistence failed; recovery required",
+			failurePhase: "terminal_reconciliation",
+			executionOutcome: execution.executionOutcome,
+		};
+	}
 	context._activeProviderExecutionSucceeded = execution.success === true;
 	context._activeCompletionLifecycleReceipt = boundCompletionContinuationProof(
 		brokerExecution.completionContinuationProof,
@@ -7952,6 +8035,7 @@ export async function runQueueAsync(options) {
 		throw error;
 	}
 	checkpoint.taskBases ??= {};
+	const outcomeWriter = await prepareOutcomeWriter(runId, dependencies);
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch:
@@ -7962,6 +8046,12 @@ export async function runQueueAsync(options) {
 					(data) => recordDispatchToStore(data, runStorePath),
 					ledgerReportingContext(dependencies.onStatus ?? null, dependencies),
 				)),
+		recordOutcomeEvent:
+			dependencies.recordOutcomeEvent ?? outcomeWriter?.record ?? null,
+		outcomeWriterEpoch:
+			dependencies.outcomeWriterEpoch ?? outcomeWriter?.writerEpoch ?? null,
+		_activeProcessOutcomeId: null,
+		_activeOutcomeAttempt: 1,
 		recordDispatchIntent:
 			dependencies.recordDispatchIntent ??
 			((intent) => recordDispatchIntentToStore(intent, runStorePath)),
@@ -9642,6 +9732,7 @@ export function createBrokerAdapterLauncher({
 	onTranscript = null,
 	cleanupContext = null,
 	deriveReviewResult = false,
+	onProcessCompleted = null,
 }) {
 	if (!adapter || typeof adapter.executeAsync !== "function") {
 		throw new TypeError("broker adapter requires executeAsync");
@@ -9691,6 +9782,7 @@ export function createBrokerAdapterLauncher({
 				onStatus: onAdapterStatus,
 				onPoll,
 				onProgress,
+				onProcessCompleted,
 				invocationDescriptor,
 				descriptorIdentity: invocationDescriptor.descriptor_identity,
 				descriptorHarness: route.harness,
@@ -9877,6 +9969,21 @@ function createDispatchBroker(context, dependencies = {}) {
 					invocationDescriptor.descriptor_identity,
 					request.attemptId ?? null,
 				),
+				onProcessCompleted:
+					typeof context.recordOutcomeEvent === "function"
+						? async (processResult) => {
+								const processOutcome = createProviderProcessCompletedOutcome({
+									request,
+									route: selectedRoute,
+									processResult,
+									writerEpoch: context.outcomeWriterEpoch ?? null,
+									operationId: `operation-${request.taskId}-process`,
+									attempt: context._activeOutcomeAttempt ?? 1,
+								});
+								await context.recordOutcomeEvent(processOutcome);
+								context._activeProcessOutcomeId = processOutcome.outcomeId;
+							}
+						: null,
 			})({
 				request,
 				route: selectedRoute,
@@ -9970,6 +10077,63 @@ function normalizeBrokerRoute(result) {
 		snapshotStatus: result.snapshotIdentity.status,
 		snapshotMtime: result.snapshotIdentity.mtime,
 		snapshotAgeMsAtRoute: result.snapshotIdentity.ageMs,
+	};
+}
+
+export async function prepareOutcomeWriter(runId, dependencies) {
+	if (
+		typeof runId !== "string" ||
+		runId.length === 0 ||
+		dependencies.enableTypedOutcomes === false
+	)
+		return null;
+	let current;
+	try {
+		current = await readRun(runId);
+	} catch {
+		return null;
+	}
+	if (!Number.isSafeInteger(current.workerPid) || current.workerPid < 1)
+		return null;
+	if (current.workerPid !== process.pid) {
+		const error = new Error(
+			"typed outcome writer lease belongs to another process",
+		);
+		error.code = "OUTCOME_WRITER_LEASE_STALE";
+		throw error;
+	}
+	const activated = await activateOutcomeWriter(runId, {
+		pid: current.workerPid,
+		startToken: current.workerStartToken,
+		nonce: current.workerNonce,
+		writerEpoch:
+			dependencies.outcomeWriterEpoch ??
+			`epoch-${runId}-${current.revision + 1}`,
+		minimumReaderVersion: dependencies.minimumOutcomeReaderVersion ?? 1,
+	});
+	const owner = {
+		pid: activated.workerPid,
+		startToken: activated.workerStartToken,
+		nonce: activated.workerNonce,
+	};
+	while (
+		(await recoverExecutionOutcome(runId, {
+			writerEpoch: activated.outcomeWriterEpoch,
+			owner,
+			minimumReaderVersion: activated.minimumOutcomeReaderVersion ?? 1,
+		})) !== null
+	) {
+		// Recover every durable process fact whose execution fact was interrupted.
+	}
+	return {
+		writerEpoch: activated.outcomeWriterEpoch,
+		owner,
+		record: (outcome) =>
+			appendOutcomeEvent(runId, outcome, {
+				writerEpoch: activated.outcomeWriterEpoch,
+				owner,
+				minimumReaderVersion: activated.minimumOutcomeReaderVersion ?? 1,
+			}),
 	};
 }
 
@@ -11175,6 +11339,10 @@ export function runQueue(options) {
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
+		recordOutcomeEvent: dependencies.recordOutcomeEvent ?? null,
+		outcomeWriterEpoch: dependencies.outcomeWriterEpoch ?? null,
+		_activeProcessOutcomeId: null,
+		_activeOutcomeAttempt: 1,
 		recordDispatchIntent:
 			dependencies.recordDispatchIntent ?? defaultRecordDispatchIntent,
 		integrationGate: dependencies.integrationGate ?? integrationGate,
@@ -12142,6 +12310,8 @@ export async function runQueueWithOrchestrator(options) {
 	const context = {
 		route: dependencies.route ?? route,
 		recordDispatch: dependencies.recordDispatch ?? defaultRecordDispatch,
+		recordOutcomeEvent: dependencies.recordOutcomeEvent ?? null,
+		outcomeWriterEpoch: dependencies.outcomeWriterEpoch ?? null,
 		recordDispatchIntent:
 			dependencies.recordDispatchIntent ?? defaultRecordDispatchIntent,
 		integrationGate: dependencies.integrationGate ?? integrationGate,

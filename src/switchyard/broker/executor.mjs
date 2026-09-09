@@ -8,11 +8,37 @@ import {
 } from "../adapter/provider-lifecycle.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
+import { createExecutionOutcome } from "./outcome.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
 
 const TERMINAL_OUTCOMES = new Set(["success", "failure", "cancel"]);
 const FAILURE_KINDS = new Set(["provider", "transient"]);
 const DIAGNOSTIC_REF_RE = /^diagnostic:[a-f0-9]{32}$/u;
+
+// The public broker keeps execution options narrow. The runner registers
+// persistence policy against the already-reserved route so this boundary can
+// consume it without reopening or reacquiring the run lease.
+const executionPolicies = new Map();
+
+export function registerBrokerExecutionPolicy(reservationId, policy = {}) {
+	if (typeof reservationId !== "string" || reservationId.length === 0)
+		throw new TypeError("broker execution policy requires a reservation id");
+	if (!policy || typeof policy !== "object" || Array.isArray(policy))
+		throw new TypeError("broker execution policy must be an object");
+	const registered = Object.freeze({ ...policy });
+	executionPolicies.set(reservationId, registered);
+	return () => {
+		if (executionPolicies.get(reservationId) === registered)
+			executionPolicies.delete(reservationId);
+	};
+}
+
+function consumeBrokerExecutionPolicy(reservationId) {
+	if (typeof reservationId !== "string") return null;
+	const policy = executionPolicies.get(reservationId) ?? null;
+	executionPolicies.delete(reservationId);
+	return policy;
+}
 
 /**
  * Bound a launcher's cleanup stage to the backend-owned vocabulary.
@@ -167,11 +193,54 @@ export async function executeBrokerRoute(options) {
 	if (typeof options.terminal !== "function") {
 		throw new TypeError("broker terminal reconciler must be a function");
 	}
+	const registeredPolicy = consumeBrokerExecutionPolicy(route.reservation.id);
+	const executionPolicy = registeredPolicy ?? {};
+	const recordOutcome = options.recordOutcome ?? executionPolicy.recordOutcome;
+	const writerEpoch =
+		options.writerEpoch ?? executionPolicy.writerEpoch ?? null;
+	const operationId =
+		options.operationId ?? executionPolicy.operationId ?? null;
+	const causedBy = options.causedBy ?? executionPolicy.causedBy ?? null;
+	const dispatchCausality =
+		options.dispatchCausality ?? executionPolicy.dispatchCausality ?? null;
+	const attempt = options.attempt ?? executionPolicy.attempt ?? 1;
 	const signal = options.signal ?? null;
 	let terminalOutcome = null;
 	let terminalCompleted = false;
 	let terminalEvidence;
 	let launcherResult = null;
+	let executionOutcome = null;
+	let outcomeAttempted = false;
+	let outcomePersistenceError = null;
+	const persistExecutionOutcome = async ({
+		preLaunch = false,
+		cancelled = false,
+	} = {}) => {
+		if (outcomeAttempted) return executionOutcome;
+		outcomeAttempted = true;
+		executionOutcome = createExecutionOutcome({
+			request,
+			route,
+			launcherResult,
+			writerEpoch,
+			operationId,
+			causedBy: typeof causedBy === "function" ? causedBy() : causedBy,
+			dispatchCausality,
+			attempt,
+			preLaunch,
+			cancelled,
+		});
+		if (typeof recordOutcome === "function") {
+			try {
+				await recordOutcome(executionOutcome);
+			} catch (error) {
+				// Ledger availability is not provider execution state. This outcome
+				// was attempted once; never recurse from the catch path.
+				outcomePersistenceError = error;
+			}
+		}
+		return executionOutcome;
+	};
 	const descriptorIdentity =
 		typeof options.invocationDescriptor?.descriptor_identity === "string" &&
 		/^sha256:[a-f0-9]{64}$/.test(
@@ -197,6 +266,10 @@ export async function executeBrokerRoute(options) {
 	emit(options.onStatus, "execution_waiting", route);
 	if (signal?.aborted) {
 		await reconcileOnce("cancel", null);
+		const executionOutcome = await persistExecutionOutcome({
+			preLaunch: true,
+			cancelled: true,
+		});
 		emit(options.onStatus, "execution_cancelled", route);
 		return Object.freeze({
 			runId: route.runId,
@@ -207,6 +280,8 @@ export async function executeBrokerRoute(options) {
 			outcome: "cancel",
 			reason: "cancelled before launch",
 			terminalEvidence,
+			executionOutcome,
+			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});
 	}
 
@@ -260,6 +335,9 @@ export async function executeBrokerRoute(options) {
 		delete launcherResult.diagnosticEvidence;
 		if (signal?.aborted || launcherResult?.cancelled === true) {
 			await reconcileOnce("cancel", null);
+			const executionOutcome = await persistExecutionOutcome({
+				cancelled: true,
+			});
 			emit(options.onStatus, "execution_cancelled", route);
 			return Object.freeze({
 				runId: route.runId,
@@ -270,6 +348,8 @@ export async function executeBrokerRoute(options) {
 				outcome: "cancel",
 				reason: "cancelled",
 				terminalEvidence,
+				executionOutcome,
+				outcomePersistenceFailed: outcomePersistenceError !== null,
 			});
 		}
 		if (launcherResult?.success !== true) {
@@ -281,6 +361,7 @@ export async function executeBrokerRoute(options) {
 				? launcherResult.actualConsumption
 				: request.estimatedConsumption;
 		await reconcileOnce("success", actualConsumption);
+		const executionOutcome = await persistExecutionOutcome();
 		emit(options.onStatus, "execution_succeeded", route);
 		return Object.freeze({
 			runId: route.runId,
@@ -307,6 +388,8 @@ export async function executeBrokerRoute(options) {
 			reviewResult: reviewResultOf(launcherResult),
 			terminalEvidence,
 			progress: boundedProgress(launcherResult?.progress),
+			executionOutcome,
+			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});
 	} catch (error) {
 		const cancelled = signal?.aborted || error?.name === "AbortError";
@@ -329,6 +412,7 @@ export async function executeBrokerRoute(options) {
 			descriptorIdentity,
 			descriptorHarness: route.harness,
 		});
+		const executionOutcome = await persistExecutionOutcome({ cancelled });
 		emit(
 			options.onStatus,
 			cancelled ? "execution_cancelled" : "execution_failed",
@@ -389,6 +473,8 @@ export async function executeBrokerRoute(options) {
 				completionContinuationProofOf(launcherResult),
 			terminalEvidence,
 			progress: boundedProgress(launcherResult?.progress),
+			executionOutcome,
+			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});
 	}
 }
