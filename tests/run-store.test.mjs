@@ -557,6 +557,8 @@ describe("provider diagnostic artifact boundary", () => {
 			diagnosticKind: "auth_required",
 		});
 		strictEqual(ref, `diagnostic:${ref.slice("diagnostic:".length)}`);
+		const resources = join(getRunRoot(runId), "resources");
+		strictEqual((await stat(resources)).mode & 0o777, 0o700);
 		const artifact = await resolveDiagnosticArtifact(runId, ref);
 		strictEqual(artifact.kind, "provider_diagnostic");
 		strictEqual(artifact.diagnosticKind, "auth_required");
@@ -599,7 +601,6 @@ describe("provider diagnostic artifact boundary", () => {
 		const projectedFailure = (await readRun(runId)).lastFailure;
 		strictEqual(projectedFailure.diagnosticRef, undefined);
 		strictEqual(projectedFailure.diagnosticEvidenceAvailable, false);
-		const resources = join(getRunRoot(runId), "resources");
 		chmodSync(getRunRoot(runId), 0o755);
 		strictEqual(await resolveDiagnosticArtifact(runId, ref), null);
 		chmodSync(getRunRoot(runId), 0o700);

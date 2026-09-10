@@ -14,6 +14,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 
@@ -3451,6 +3452,11 @@ describe("VM ownership metadata", () => {
 			backend.writeAllocationIntent(name, context);
 			const intentPath = backend.allocationIntentPath(name, resourceRoot);
 			ok(existsSync(intentPath));
+			strictEqual(
+				statSync(resourceRoot).mode & 0o777,
+				0o700,
+				"allocation metadata must be written beneath an owner-only resource root",
+			);
 			const fresh = new ParallelsExecutionBackend({
 				prlctlFn: () => {
 					throw new Error("allocation audit must remain read-only");
@@ -3505,7 +3511,7 @@ describe("VM ownership metadata", () => {
 		const source = readFileSync(sourcePath, "utf8");
 		strictEqual(
 			createHash("sha256").update(source, "utf8").digest("hex"),
-			"efcfd718e53a06f950eb637157b4c4b02b3e9d395d292894128839c1d3497fc2",
+			"16c8104c0654f6376edd7a78e7e8898c4dd4ed852186def824e2ad4e6898edf2",
 		);
 
 		const calls = [];

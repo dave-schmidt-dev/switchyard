@@ -3195,7 +3195,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	}
 
 	writeAllocationIntent(name, ownership) {
-		mkdirSync(ownership.resourceRoot, { recursive: true });
+		mkdirSync(ownership.resourceRoot, { recursive: true, mode: 0o700 });
 		writeFileSync(
 			this.allocationIntentPath(name, ownership.resourceRoot),
 			`${JSON.stringify({
@@ -3237,7 +3237,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				"VM ownership metadata requires a canonical creator birth identity",
 			);
 		}
-		mkdirSync(ownership.resourceRoot, { recursive: true });
+		mkdirSync(ownership.resourceRoot, { recursive: true, mode: 0o700 });
 		const record = Object.freeze({
 			schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
 			kind: "parallels_vm_ownership",
