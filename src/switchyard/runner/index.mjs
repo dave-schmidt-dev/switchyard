@@ -124,6 +124,7 @@ import {
 } from "../lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
+import { projectOutcomeReader } from "../outcome/projection.mjs";
 import { validateShadowEnvelope } from "../outcome/shadow.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
@@ -155,6 +156,7 @@ import {
 	getStateRoot,
 	getVmAdmissionRoot,
 	isProjectLockOwnedBy,
+	readEvents,
 	readRun,
 	recoverExecutionOutcome,
 	releaseVmSlot,
@@ -2998,6 +3000,8 @@ export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
 		integrationIntents: {},
 		// Additive reducer evidence; legacy checkpoint readers ignore this field.
 		outcomeShadow: null,
+		// Reader-owned projection captured at checkpoint/resume boundaries.
+		outcomeProjection: null,
 	};
 	if (identity.queueIdentity) {
 		checkpoint.queueIdentity = identity.queueIdentity;
@@ -6981,13 +6985,24 @@ async function persistCheckpointOutcomeShadow(
 	)
 		return false;
 	const run = await runStore.readRun(runId).catch(() => null);
-	if (!run?.outcomeShadow) return false;
-	try {
-		validateShadowEnvelope(run.outcomeShadow);
-	} catch {
-		return false;
+	if (!run) return false;
+	const events =
+		typeof runStore.readEvents === "function"
+			? await runStore.readEvents(runId).catch(() => [])
+			: [];
+	const outcomeProjection = projectOutcomeReader({ run, events });
+	checkpoint.outcomeProjection = null;
+	if (outcomeProjection.reader === "reducer")
+		checkpoint.outcomeProjection = structuredClone(outcomeProjection);
+	checkpoint.outcomeShadow = null;
+	if (run.outcomeShadow) {
+		try {
+			validateShadowEnvelope(run.outcomeShadow);
+			checkpoint.outcomeShadow = structuredClone(run.outcomeShadow);
+		} catch {
+			// Invalid shadow evidence cannot authorize a checkpoint cutover.
+		}
 	}
-	checkpoint.outcomeShadow = structuredClone(run.outcomeShadow);
 	checkpoint.lastUpdatedAt = new Date().toISOString();
 	saveCheckpoint(checkpointPath, checkpoint);
 	return true;
@@ -8728,7 +8743,10 @@ export async function runQueueAsync(options) {
 		// checkpoint lease.
 		let checkpointShadowSettled = Promise.resolve();
 		if (checkpoint.version === CHECKPOINT_VERSION) {
-			const checkpointRunStore = dependencies.runStore ?? { readRun };
+			const checkpointRunStore = dependencies.runStore ?? {
+				readRun,
+				readEvents,
+			};
 			checkpointShadowSettled = Promise.resolve(
 				context._outcomeWriteChain ?? Promise.resolve(),
 			)

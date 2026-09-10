@@ -1914,6 +1914,10 @@ describe("status integration", () => {
 		);
 		deepStrictEqual(status.outcomeShadow, expectedShadow);
 		deepStrictEqual(result.outcomeShadow, expectedShadow);
+		strictEqual(status.outcomeProjection.reader, "reducer");
+		strictEqual(result.outcomeProjection.reader, "reducer");
+		strictEqual(status.outcomeProjection.finalStatus, "failed");
+		deepStrictEqual(status.outcomeProjection, result.outcomeProjection);
 		strictEqual(status.disposition.action, result.disposition.action);
 		strictEqual(status.disposition.outcomeShadow.parity.evidence, "shadow");
 		strictEqual(result.disposition.outcomeShadow.parity.evidence, "shadow");
@@ -3326,6 +3330,7 @@ describe("envelope format", () => {
 		for (const key of required) {
 			ok(key in envelope, `status envelope missing field: ${key}`);
 		}
+		strictEqual(envelope.outcomeProjection.reader, "legacy");
 	});
 
 	it("result envelope has required fields", async () => {
@@ -3386,6 +3391,7 @@ describe("envelope format", () => {
 		for (const key of required) {
 			ok(key in envelope, `result envelope missing field: ${key}`);
 		}
+		strictEqual(envelope.outcomeProjection.reader, "legacy");
 	});
 
 	it("drops a lastFailure artifact ref the artifacts channel cannot resolve", async () => {

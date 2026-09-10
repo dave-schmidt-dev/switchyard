@@ -45,12 +45,17 @@ import {
 	createMutationIntent,
 	executeMutation,
 } from "../lifecycle/mutation-protocol.mjs";
+import { projectOutcomeReader } from "../outcome/projection.mjs";
 import {
 	mergeOutcomeShadow,
 	projectOutcomeShadow,
 	validateShadowEnvelope,
 } from "../outcome/shadow.mjs";
 
+export {
+	projectCheckpointOutcome,
+	projectOutcomeReader,
+} from "../outcome/projection.mjs";
 export {
 	mergeOutcomeShadow,
 	projectOutcomeShadow,
@@ -1935,6 +1940,10 @@ async function performUpdate(runId, partial, expectedRevision) {
 			current.outcomeShadow,
 			refreshedShadow,
 		);
+		merged.outcomeProjection = projectOutcomeReader({
+			run: merged,
+			events: eventLog.events,
+		});
 	}
 
 	validateRun(merged);

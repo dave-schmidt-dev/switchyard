@@ -475,32 +475,82 @@ function projectLegacyDisposition({
  * from legacy durable fields until the reader cutover gate passes.
  */
 export function projectDisposition(options = {}) {
-	const result = projectLegacyDisposition(options);
+	const projectedRun = options.outcomeProjection
+		? projectRunWithOutcome(options.run, options.outcomeProjection)
+		: options.run;
+	const result = projectLegacyDisposition({ ...options, run: projectedRun });
 	if (options.outcomeShadow !== undefined) {
 		result.outcomeShadow = options.outcomeShadow;
+	}
+	if (options.outcomeProjection !== undefined) {
+		result.outcomeProjection = options.outcomeProjection;
 	}
 	return result;
 }
 
+function projectRunWithOutcome(run, projection) {
+	if (!run || projection?.reader !== "reducer") return run;
+	const lifecycleTerminal = [
+		"succeeded",
+		"failed",
+		"deferred",
+		"recovery_required",
+	].includes(run.state);
+	if (!lifecycleTerminal && projection.finalStatus !== "recovery_required")
+		return run;
+	const state =
+		projection.finalStatus === "recovery_required"
+			? "recovery_required"
+			: projection.finalStatus === "succeeded"
+				? "succeeded"
+				: projection.finalStatus === "failed"
+					? "failed"
+					: projection.finalStatus === "skipped"
+						? "deferred"
+						: projection.finalStatus === "uncertain"
+							? "recovery_required"
+							: run.state;
+	if (state === run.state) return run;
+	return { ...run, state };
+}
+
 /** Derive an additive closed terminal outcome without mutating history. */
-export function projectTerminalOutcome(run) {
+export function projectTerminalOutcome(run, projection = null) {
+	const projected = projectRunWithOutcome(run, projection);
 	if (
-		run?.state === "failed" &&
-		run?.cleanupState === "complete" &&
-		run?.terminalizedBy === "dead_worker_recovery"
+		projected?.cleanupState !== "complete" ||
+		!["succeeded", "failed", "deferred", "recovery_required"].includes(
+			projected?.state,
+		)
+	)
+		return "unknown_failure";
+	if (projection?.reader === "reducer") {
+		if (projection.finalStatus === "succeeded") {
+			const completed = projection.taskCounters?.completed;
+			return completed > 0 ? "completed_work" : "no_runnable_work";
+		}
+		if (projection.finalStatus === "skipped") return "deferred_work";
+		if (
+			["failed", "uncertain", "recovery_required"].includes(
+				projection.finalStatus,
+			)
+		)
+			return "unknown_failure";
+	}
+	if (
+		projected?.state === "failed" &&
+		projected?.cleanupState === "complete" &&
+		projected?.terminalizedBy === "dead_worker_recovery"
 	) {
 		return "recovered_dead_worker";
 	}
-	if (run?.cleanupState !== "complete") {
-		return "unknown_failure";
-	}
-	const processed = run?.terminalSummary?.processedTasks;
+	const processed = projected?.terminalSummary?.processedTasks;
 	if (!Number.isInteger(processed) || processed < 0) return "unknown_failure";
-	if (run.state === "succeeded") {
+	if (projected.state === "succeeded") {
 		return processed > 0 ? "completed_work" : "no_runnable_work";
 	}
-	if (run.state === "deferred") return "deferred_work";
-	if (run.state === "failed" && run.terminalizedBy === "worker") {
+	if (projected.state === "deferred") return "deferred_work";
+	if (projected.state === "failed" && projected.terminalizedBy === "worker") {
 		return processed > 0 ? "failed_work" : "failed_before_work";
 	}
 	return "unknown_failure";

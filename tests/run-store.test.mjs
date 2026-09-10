@@ -55,6 +55,8 @@ import {
 	LockError,
 	mergeOutcomeShadow,
 	persistDiagnosticArtifact,
+	projectCheckpointOutcome,
+	projectOutcomeReader,
 	projectOutcomeShadow,
 	RevisionError,
 	readAuthorizedRunEvents,
@@ -222,6 +224,195 @@ describe("shadow reducer projection", () => {
 		);
 		strictEqual(terminal.outcomeShadow.parity.legacyStatus, "failed");
 		strictEqual(terminal.outcomeShadow.projection.finalStatus, "failed");
+	});
+});
+
+describe("outcome reader cutover", () => {
+	function failedArtifact(runId) {
+		return createStageOutcome({
+			runId,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			stage: "artifact",
+			status: "failed",
+			producer: "runner",
+			code: "artifact_capture",
+			detail: { artifactKind: "diff", captured: false },
+		});
+	}
+
+	it("uses the reducer only after matching shadow evidence", () => {
+		const runId = "reader-cutover";
+		const event = failedArtifact(runId);
+		const run = {
+			runId,
+			state: "failed",
+			cleanupState: "complete",
+		};
+		run.outcomeShadow = projectOutcomeShadow([event], { run });
+		const projection = projectOutcomeReader({ run, events: [event] });
+		strictEqual(projection.reader, "reducer");
+		strictEqual(projection.finalStatus, "failed");
+		strictEqual(projection.taskCounters.failed, 1);
+	});
+
+	it("reduces the exact mixed event set approved by parity", () => {
+		const runId = "reader-mixed-events";
+		const typed = createStageOutcome({
+			runId,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			stage: "run",
+			status: "succeeded",
+			producer: "runner",
+			code: "task_completed",
+		});
+		const legacyFailure = {
+			runId,
+			sequence: 2,
+			event: "task_failed",
+			phase: "execution",
+			status: "failed",
+			taskId: "1.1",
+		};
+		const events = [typed, legacyFailure];
+		const run = { runId, state: "failed", cleanupState: "complete" };
+		run.outcomeShadow = projectOutcomeShadow(events, { run });
+		strictEqual(run.outcomeShadow.parity.status, "match");
+		const projection = projectOutcomeReader({ run, events });
+		strictEqual(projection.reader, "reducer");
+		strictEqual(projection.finalStatus, "failed");
+	});
+
+	it("binds persisted approval to the current event snapshot", () => {
+		const runId = "reader-current-snapshot";
+		const success = createStageOutcome({
+			runId,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			stage: "run",
+			status: "succeeded",
+			producer: "runner",
+			code: "task_completed",
+		});
+		const run = { runId, state: "succeeded", cleanupState: "complete" };
+		run.outcomeShadow = projectOutcomeShadow([success], { run });
+		const newerFailure = {
+			runId,
+			sequence: 2,
+			event: "task_failed",
+			phase: "execution",
+			status: "failed",
+			taskId: "1.1",
+		};
+		strictEqual(
+			projectOutcomeReader({ run, events: [success, newerFailure] }).reader,
+			"legacy",
+		);
+	});
+
+	it("falls back conservatively for history, mismatch, and the test rollback", () => {
+		const runId = "reader-fallback";
+		const event = failedArtifact(runId);
+		const historical = projectOutcomeReader({
+			run: { runId, state: "succeeded" },
+			events: [],
+		});
+		strictEqual(historical.reader, "legacy");
+		strictEqual(Object.hasOwn(historical, "taskCounters"), false);
+
+		const mismatchRun = {
+			runId,
+			state: "succeeded",
+			cleanupState: "complete",
+		};
+		mismatchRun.outcomeShadow = projectOutcomeShadow([event], {
+			run: mismatchRun,
+		});
+		strictEqual(mismatchRun.outcomeShadow.parity.status, "mismatch");
+		strictEqual(
+			projectOutcomeReader({ run: mismatchRun, events: [event] }).reader,
+			"legacy",
+		);
+
+		const matchedRun = {
+			runId,
+			state: "failed",
+			cleanupState: "complete",
+		};
+		matchedRun.outcomeShadow = projectOutcomeShadow([event], {
+			run: matchedRun,
+		});
+		const shadowSnapshot = structuredClone(matchedRun.outcomeShadow);
+		strictEqual(
+			projectOutcomeReader({
+				run: matchedRun,
+				events: [event],
+				reader: "legacy",
+			}).reader,
+			"legacy",
+		);
+		deepStrictEqual(matchedRun.outcomeShadow, shadowSnapshot);
+		strictEqual(
+			projectOutcomeReader({
+				run: { ...matchedRun, outcomeShadow: { invalid: true } },
+				events: [event],
+			}).reader,
+			"legacy",
+		);
+	});
+
+	it("reads reducer evidence retained by current checkpoints", () => {
+		const run = {
+			runId: "checkpoint-reader",
+			state: "failed",
+			cleanupState: "complete",
+		};
+		const event = failedArtifact(run.runId);
+		const outcomeShadow = projectOutcomeShadow([event], { run });
+		const captured = projectOutcomeReader({
+			run: { ...run, outcomeShadow },
+			events: [event],
+		});
+		const projection = projectCheckpointOutcome({
+			outcomeShadow,
+			outcomeProjection: captured,
+		});
+		strictEqual(projection.reader, "reducer");
+		strictEqual(projection.finalStatus, "failed");
+		strictEqual(
+			projectCheckpointOutcome({
+				outcomeProjection: { reader: "reducer", finalStatus: "succeeded" },
+			}),
+			null,
+		);
+		strictEqual(
+			projectCheckpointOutcome({
+				outcomeShadow: projectOutcomeShadow([], {
+					run: { runId: "legacy-checkpoint", state: "created" },
+				}),
+				outcomeProjection: {
+					reader: "reducer",
+					historical: false,
+					projectionVersion: 1,
+					typedEventCount: 0,
+				},
+			}),
+			null,
+		);
+		strictEqual(
+			projectCheckpointOutcome({
+				outcomeShadow: {
+					version: 1,
+					projection: {},
+					parity: { version: 1, status: "match" },
+					recoveryQueue: [],
+				},
+				outcomeProjection: captured,
+			}),
+			null,
+		);
+		strictEqual(projectCheckpointOutcome({ version: 2 }), null);
 	});
 });
 

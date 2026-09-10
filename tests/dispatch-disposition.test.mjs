@@ -46,6 +46,22 @@ function exactFailure(targetId, taskId = "2.1") {
 	};
 }
 
+describe("reducer terminal projection", () => {
+	it("does not report completed work before lifecycle cleanup is terminal", () => {
+		strictEqual(
+			projectTerminalOutcome(
+				run({ state: "running", cleanupState: "not_started" }),
+				{
+					reader: "reducer",
+					finalStatus: "succeeded",
+					taskCounters: { completed: 1 },
+				},
+			),
+			"unknown_failure",
+		);
+	});
+});
+
 function targetDisposition({
 	errorKind,
 	diagnosticCode = errorKind,

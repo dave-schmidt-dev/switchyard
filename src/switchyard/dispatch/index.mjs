@@ -72,6 +72,10 @@ import {
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
+	applyOutcomeProjection,
+	projectOutcomeReader,
+} from "../outcome/projection.mjs";
+import {
 	attestRouteRepair,
 	createDefaultRouteHealthDecision,
 	ingestRouteHealthEvents,
@@ -2103,6 +2107,8 @@ function probeProviderProcess(run, { executionBackend, execFn } = {}) {
 
 async function buildStatusEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
+	const outcomeProjection = projectOutcomeReader({ run, events });
+	const projectedRun = applyOutcomeProjection(run, outcomeProjection);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
@@ -2110,7 +2116,8 @@ async function buildStatusEnvelope(runId, run) {
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
 	const liveness = classifyRunLiveness(run);
 	const disposition = projectDisposition({
-		run,
+		run: projectedRun,
+		outcomeProjection,
 		checkpoint: checkpointState,
 		events: sanitizedExecutionFailureEvents(events),
 		liveness,
@@ -2128,7 +2135,7 @@ async function buildStatusEnvelope(runId, run) {
 		...(sanitizeQueuePreflightDetail(run.preflightDetail)
 			? { preflightDetail: sanitizeQueuePreflightDetail(run.preflightDetail) }
 			: {}),
-		state: run.state,
+		state: projectedRun.state,
 		cleanupState: run.cleanupState,
 		// Liveness derived from a signal-0 probe of the recorded worker pid
 		// (see isWorkerLive), so an operator doesn't have to shell out to
@@ -2186,8 +2193,14 @@ async function buildStatusEnvelope(runId, run) {
 		snapshotStatus: run.snapshotStatus ?? null,
 		snapshotMtime: run.snapshotMtime ?? null,
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
-		completedCount,
-		failedCount,
+		completedCount:
+			outcomeProjection.reader === "reducer"
+				? (outcomeProjection.taskCounters?.completed ?? completedCount)
+				: completedCount,
+		failedCount:
+			outcomeProjection.reader === "reducer"
+				? (outcomeProjection.taskCounters?.failed ?? failedCount)
+				: failedCount,
 		// Reconciled against the same artifacts channel `result` reports, so the
 		// two envelopes cannot disagree about whether a failure has an artifact.
 		lastFailure: reconcileFailureArtifactRef(
@@ -2202,6 +2215,7 @@ async function buildStatusEnvelope(runId, run) {
 		updatedAt: run.updatedAt,
 		disposition,
 		outcomeShadow,
+		outcomeProjection,
 		...telemetry,
 	};
 }
@@ -2266,6 +2280,8 @@ async function listArtifactRefs(runId) {
 
 async function buildResultEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
+	const outcomeProjection = projectOutcomeReader({ run, events });
+	const projectedRun = applyOutcomeProjection(run, outcomeProjection);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
@@ -2274,7 +2290,8 @@ async function buildResultEnvelope(runId, run) {
 	const artifactRefs = await listArtifactRefs(runId);
 	const liveness = classifyRunLiveness(run);
 	const disposition = projectDisposition({
-		run,
+		run: projectedRun,
+		outcomeProjection,
 		checkpoint: checkpointState,
 		events: sanitizedExecutionFailureEvents(events),
 		liveness,
@@ -2292,7 +2309,7 @@ async function buildResultEnvelope(runId, run) {
 		...(sanitizeQueuePreflightDetail(run.preflightDetail)
 			? { preflightDetail: sanitizeQueuePreflightDetail(run.preflightDetail) }
 			: {}),
-		state: run.state,
+		state: projectedRun.state,
 		cleanupState: run.cleanupState,
 		workerLive: run.state === "running" ? liveness === "live" : null,
 		providerProcessDetected:
@@ -2343,8 +2360,14 @@ async function buildResultEnvelope(runId, run) {
 		snapshotStatus: run.snapshotStatus ?? null,
 		snapshotMtime: run.snapshotMtime ?? null,
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
-		completedCount,
-		failedCount,
+		completedCount:
+			outcomeProjection.reader === "reducer"
+				? (outcomeProjection.taskCounters?.completed ?? completedCount)
+				: completedCount,
+		failedCount:
+			outcomeProjection.reader === "reducer"
+				? (outcomeProjection.taskCounters?.failed ?? failedCount)
+				: failedCount,
 		lastFailure: projectFailureRemedy(
 			reconcileFailureArtifactRef(run.lastFailure ?? null, artifactRefs),
 		),
@@ -2356,11 +2379,12 @@ async function buildResultEnvelope(runId, run) {
 		updatedAt: run.updatedAt,
 		terminalSummary: {
 			...(run.terminalSummary ?? {}),
-			outcome: projectTerminalOutcome(run),
+			outcome: projectTerminalOutcome(projectedRun, outcomeProjection),
 		},
 		artifactRefs,
 		disposition,
 		outcomeShadow,
+		outcomeProjection,
 		...telemetry,
 	};
 }

@@ -63,6 +63,7 @@ import {
 	createStageOutcome,
 	getRunRoot,
 	initializeRun,
+	readEvents,
 	readRun,
 	updateRun,
 	VmSlotUnavailableError,
@@ -8127,6 +8128,7 @@ describe("checkpoint durability", () => {
 						return updateRun(runId, partial, latest.revision);
 					},
 					readRun: () => readRun(runId),
+					readEvents: () => readEvents(runId),
 				};
 				const dependencies = {
 					queuePreflight: () => ({ ok: true, eligible: true }),
@@ -8158,6 +8160,7 @@ describe("checkpoint durability", () => {
 					JSON.stringify(persistedRun.outcomeShadow.projection),
 					name,
 				);
+				strictEqual(checkpoint.outcomeProjection, null, name);
 				projections.push(checkpoint.outcomeShadow.projection);
 				strictEqual(checkpoint.ownershipReleased, true, name);
 			}
