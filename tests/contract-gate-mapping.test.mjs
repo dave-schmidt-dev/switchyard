@@ -24,6 +24,12 @@ import {
 	validateExecutionSnapshot,
 } from "../scripts/check-contract-gates.mjs";
 import { checkPreCommitReceipt } from "../scripts/check-contract-receipt.mjs";
+import {
+	CRITICAL_MODULE_COVERAGE,
+	coverageFailures,
+	parseCoverageReport,
+} from "../scripts/run-contract-coverage.mjs";
+import { loadIncidentMutations } from "../scripts/run-incident-mutations.mjs";
 
 const ROOT = join(process.cwd());
 
@@ -91,6 +97,88 @@ function createValidationFixture() {
 }
 
 describe("source-boundary contract gate mapping", () => {
+	it("declares mapped critical modules with explicit native coverage thresholds", () => {
+		const manifest = loadContractGateManifest(ROOT);
+		const mapped = new Set(manifest.flatMap((gate) => gate.areas));
+		ok(CRITICAL_MODULE_COVERAGE.length >= 8);
+		for (const module of CRITICAL_MODULE_COVERAGE) {
+			ok(
+				mapped.has(module.path),
+				`critical module is not mapped: ${module.path}`,
+			);
+			for (const kind of ["lines", "branches", "functions"])
+				ok(
+					Number.isInteger(module[kind]) &&
+						module[kind] > 0 &&
+						module[kind] <= 100,
+					`explicit ${kind} threshold missing for ${module.path}`,
+				);
+		}
+	});
+
+	it("parses native coverage and rejects missing or below-threshold modules", () => {
+		const modules = [
+			{ path: "src/one.mjs", lines: 80, branches: 60, functions: 70 },
+			{ path: "src/two.mjs", lines: 50, branches: 40, functions: 50 },
+		];
+		const report = [
+			"src/one.mjs | 81.00 | 61.00 | 71.00 |",
+			"src/two.mjs | 49.00 | 40.00 | 50.00 |",
+		].join("\n");
+		const metrics = parseCoverageReport(report, modules);
+		strictEqual(coverageFailures(metrics, modules).length, 1);
+		strictEqual(
+			coverageFailures(metrics, [
+				...modules,
+				{ path: "src/missing.mjs", lines: 1, branches: 1, functions: 1 },
+			]).length,
+			2,
+		);
+	});
+
+	it("keeps every historical incident mutation explicit and disposable", () => {
+		const mutations = loadIncidentMutations(ROOT);
+		strictEqual(mutations.length, 7);
+		strictEqual(new Set(mutations.map((mutation) => mutation.id)).size, 7);
+		deepStrictEqual(
+			new Set(mutations.map((mutation) => mutation.defectClass)),
+			new Set([
+				"field-drop",
+				"vacuous-consumer-guard",
+				"failure-overwrite",
+				"duplicate-terminal-count",
+				"omitted-boundary-suite",
+				"false-command-success",
+				"unsafe-retry",
+			]),
+		);
+		for (const mutation of mutations) {
+			ok(
+				mutation.source.startsWith("src/") ||
+					mutation.source.startsWith("scripts/"),
+			);
+			ok(mutation.tests.every((suite) => suite.startsWith("tests/")));
+		}
+	});
+
+	it("CI pins the local Node major and fails when live gates are unavailable", () => {
+		strictEqual(readFileIfPresent(join(ROOT, ".node-version")), "26\n");
+		const workflow = readFileIfPresent(
+			join(ROOT, ".github/workflows/validate.yml"),
+		);
+		ok(workflow?.includes("node-version-file: .node-version"));
+		ok(workflow?.includes("npm run validate"));
+		ok(workflow?.includes("npm run test:contracts"));
+		ok(workflow?.includes("npm run test:mutation:contracts"));
+		const packageJson = JSON.parse(requireText(join(ROOT, "package.json")));
+		ok(
+			packageJson.scripts["test:contracts"].includes(
+				"run-contract-coverage.mjs",
+			),
+		);
+		ok(workflow?.includes("status=1"));
+	});
+
 	it("maps each declared production boundary to existing suites", () => {
 		const manifest = loadContractGateManifest(ROOT);
 		const ledger = loadLedgerGateMapping(ROOT);

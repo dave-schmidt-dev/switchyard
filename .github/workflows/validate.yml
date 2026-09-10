@@ -1,0 +1,40 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - name: Validate (live gates required)
+        run: |
+          set -o pipefail
+          npm run validate 2>&1 | tee validate.log
+          status=${PIPESTATUS[0]}
+          if rg -n -i 'VM gate skipped|# SKIP VM gate|provider[^\n]*(skip|unavailable)' validate.log; then
+            echo "A skipped live VM/provider gate is unavailable evidence, not a green validation result." >&2
+            status=1
+          fi
+          exit "$status"
+      - name: Contract gates (live gates required)
+        run: |
+          set -o pipefail
+          npm run test:contracts 2>&1 | tee contract-gates.log
+          status=${PIPESTATUS[0]}
+          if rg -n -i 'VM gate skipped|# SKIP VM gate|provider[^\n]*(skip|unavailable)' contract-gates.log; then
+            echo "A skipped live VM/provider contract gate is unavailable evidence, not a green result." >&2
+            status=1
+          fi
+          exit "$status"
+      - run: npm run test:mutation:contracts

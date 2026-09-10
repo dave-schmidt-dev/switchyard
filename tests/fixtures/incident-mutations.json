@@ -1,0 +1,61 @@
+{
+	"schemaVersion": 1,
+	"mutations": [
+		{
+			"id": "field-drop-served-model",
+			"defectClass": "field-drop",
+			"source": "src/switchyard/broker/executor.mjs",
+			"needle": "\t\t\t// A bounded boolean from the launcher, not the guest-supplied model\n\t\t\t// name. Without it here the frozen allowlist silently dropped the\n\t\t\t// adapter's served-model read-back before it could reach a result.\n\t\t\tservedModelVerified:\n\t\t\t\ttypeof launcherResult?.servedModelVerified === \"boolean\"\n\t\t\t\t\t? launcherResult.servedModelVerified\n\t\t\t\t\t: null,",
+			"replacement": "\t\t\t// historical field-drop mutation\n\t\t\tservedModelVerified: null,",
+			"tests": ["tests/broker-executor.test.mjs"]
+		},
+		{
+			"id": "vacuous-consumer-guard",
+			"defectClass": "vacuous-consumer-guard",
+			"source": "scripts/check-contract-gates.mjs",
+			"needle": "if (!status) errors.push(`suite_omitted:${suite}`);\n\t\telse if (status === \"skipped\") errors.push(`suite_skipped:${suite}`);\n\t\telse if (status !== \"executed\")\n\t\t\terrors.push(`suite_not_executed:${suite}:${status}`);",
+			"replacement": "if (false) errors.push(`suite_omitted:${suite}`);\n\t\telse if (false) errors.push(`suite_skipped:${suite}`);\n\t\telse if (false)\n\t\t\terrors.push(`suite_not_executed:${suite}:${status}`);",
+			"tests": ["tests/contract-gate-mapping.test.mjs"]
+		},
+		{
+			"id": "primary-failure-overwrite",
+			"defectClass": "failure-overwrite",
+			"source": "src/switchyard/outcome/reducer.mjs",
+			"needle": "failures.find(\n\t\t\t(event) =>\n\t\t\t\tstageOf(event) !== \"artifact\" &&\n\t\t\t\tstageOf(event) !== \"cleanup\" &&\n\t\t\t\tstageOf(event) !== \"recovery\",\n\t\t) ??",
+			"replacement": "failures.find((event) => stageOf(event) === \"artifact\") ??",
+			"tests": ["tests/outcome-reducer.test.mjs"]
+		},
+		{
+			"id": "duplicate-terminal-count",
+			"defectClass": "duplicate-terminal-count",
+			"source": "src/switchyard/outcome/reducer.mjs",
+			"needle": "counters.total = byTask.size;",
+			"replacement": "counters.total = byTask.size + 1;",
+			"tests": ["tests/outcome-reducer.test.mjs"]
+		},
+		{
+			"id": "omitted-boundary-suite",
+			"defectClass": "omitted-boundary-suite",
+			"source": "scripts/check-contract-gates.mjs",
+			"needle": "if (dynamicOther) {",
+			"replacement": "if (dynamicOther && false) {",
+			"tests": ["tests/contract-gate-mapping.test.mjs"]
+		},
+		{
+			"id": "false-command-success",
+			"defectClass": "false-command-success",
+			"source": "src/switchyard/lifecycle/mutation-protocol.mjs",
+			"needle": "if (observed.status === \"confirmed\") {\n\t\t\tconst completed = Object.freeze({",
+			"replacement": "if (observed.status !== \"failed\") {\n\t\t\tconst completed = Object.freeze({",
+			"tests": ["tests/mutation-protocol.test.mjs"]
+		},
+		{
+			"id": "unsafe-retry",
+			"defectClass": "unsafe-retry",
+			"source": "src/switchyard/lifecycle/mutation-protocol.mjs",
+			"needle": "normalizedPolicy.idempotency !== \"unknown\" &&",
+			"replacement": "true &&",
+			"tests": ["tests/mutation-protocol.test.mjs"]
+		}
+	]
+}
