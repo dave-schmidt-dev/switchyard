@@ -124,6 +124,7 @@ import {
 } from "../lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
+import { validateShadowEnvelope } from "../outcome/shadow.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
 	getInvocationDescriptor,
@@ -6981,6 +6982,11 @@ async function persistCheckpointOutcomeShadow(
 		return false;
 	const run = await runStore.readRun(runId).catch(() => null);
 	if (!run?.outcomeShadow) return false;
+	try {
+		validateShadowEnvelope(run.outcomeShadow);
+	} catch {
+		return false;
+	}
 	checkpoint.outcomeShadow = structuredClone(run.outcomeShadow);
 	checkpoint.lastUpdatedAt = new Date().toISOString();
 	saveCheckpoint(checkpointPath, checkpoint);
