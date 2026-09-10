@@ -160,22 +160,25 @@ describe("source-boundary contract gate mapping", () => {
 		}
 	});
 
-	it("CI pins the local Node major and fails when live gates are unavailable", () => {
+	it("pins the local Node major and enforces local validation gates", () => {
 		strictEqual(readFileIfPresent(join(ROOT, ".node-version")), "26\n");
-		const workflow = readFileIfPresent(
-			join(ROOT, ".github/workflows/validate.yml"),
-		);
-		ok(workflow?.includes("node-version-file: .node-version"));
-		ok(workflow?.includes("npm run validate"));
-		ok(workflow?.includes("npm run test:contracts"));
-		ok(workflow?.includes("npm run test:mutation:contracts"));
+		const prePush = readFileIfPresent(join(ROOT, ".husky/pre-push"));
+		ok(prePush?.includes("npm run validate"));
 		const packageJson = JSON.parse(requireText(join(ROOT, "package.json")));
 		ok(
 			packageJson.scripts["test:contracts"].includes(
 				"run-contract-coverage.mjs",
 			),
 		);
-		ok(workflow?.includes("status=1"));
+		ok(
+			packageJson.scripts["test:mutation:contracts"].includes(
+				"run-incident-mutations.mjs",
+			),
+		);
+		strictEqual(
+			readFileIfPresent(join(ROOT, ".github/workflows/validate.yml")),
+			null,
+		);
 	});
 
 	it("maps each declared production boundary to existing suites", () => {
