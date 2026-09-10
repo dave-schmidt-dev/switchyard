@@ -8,7 +8,7 @@ import {
 	throws,
 } from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -3257,6 +3257,130 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
  * whole run and left no exit code, signal, or attempt count behind.
  */
 describe("VM ownership metadata", () => {
+	it("retains allocation intent evidence across crash fixtures", () => {
+		const root = tempDir("switchyard-allocation-crash-");
+		const runId = "crash-after-intent";
+		const resourceRoot = join(root, "runs", runId, "resources");
+		const context = ownedOptions(runId, 5151, {
+			resourceRoot,
+		}).ownershipContext;
+		const name = buildParallelsWorkingName(runId, 5151);
+		const backend = new ParallelsExecutionBackend({ prlctlFn: () => "" });
+
+		try {
+			// Crash before the clone call: intent is the only durable evidence and
+			// must remain auditable without invoking a mutating command.
+			backend.writeAllocationIntent(name, context);
+			const intentPath = backend.allocationIntentPath(name, resourceRoot);
+			ok(existsSync(intentPath));
+			const fresh = new ParallelsExecutionBackend({
+				prlctlFn: () => {
+					throw new Error("allocation audit must remain read-only");
+				},
+			});
+			deepStrictEqual(
+				fresh.auditAllocationIntents({
+					knownResourceRoots: [
+						{
+							resourceRoot,
+							runId,
+							runRecordStatus: "valid",
+							projectPath: context.projectRoot,
+							cleanupState: "pending",
+							liveness: "dead",
+						},
+					],
+				}),
+				[
+					{
+						file: `parallels-allocation-${createHash("sha256")
+							.update(name)
+							.digest("hex")}.intent.json`,
+						runId,
+						vmName: name,
+						classification: "stale",
+						reason: "stale_run",
+					},
+				],
+			);
+
+			// Crash after a clone side effect but before a UUID receipt: preserve
+			// the explicit uncertainty rather than inventing an allocation identity.
+			backend.writeAllocationUncertainty(
+				name,
+				context,
+				"allocation_identity_unknown",
+			);
+			const persisted = JSON.parse(readFileSync(intentPath, "utf8"));
+			strictEqual(persisted.state, "cleanup_uncertain");
+			strictEqual(persisted.reasonCode, "allocation_identity_unknown");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds every Parallels call and preserves the production backend bytes", () => {
+		const sourcePath = new URL(
+			"../src/switchyard/lifecycle/parallels-execution-backend.mjs",
+			import.meta.url,
+		);
+		const source = readFileSync(sourcePath, "utf8");
+		strictEqual(
+			createHash("sha256").update(source, "utf8").digest("hex"),
+			"9782322046e1147e1acceaca4c67283bfa3051a96f6f98f0ba51e4a6c7f5f750",
+		);
+
+		const calls = [];
+		const backend = new ParallelsExecutionBackend({
+			prlctlCallTimeoutMs: 321,
+			prlctlFn: (args, options) => {
+				calls.push({ args, options });
+				return "ok";
+			},
+		});
+		strictEqual(backend._call(["list", "-a"]), "ok");
+		strictEqual(calls[0].options.timeout, 321);
+		strictEqual(calls[0].options.killSignal, "SIGKILL");
+	});
+
+	it("uses the exact UUID when a false-success delete leaves a similarly named VM", () => {
+		const calls = [];
+		const otherUuid = "{33333333-3333-4333-8333-333333333333}";
+		const entry = {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("uuid-proof", process.pid),
+			status: "running",
+		};
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([
+						{ ...entry, status: "running" },
+						{ uuid: otherUuid, status: "stopped", name: entry.name },
+					]);
+				if (args[0] === "delete") return "";
+				return "";
+			},
+		});
+
+		throws(
+			() => backend.stopAndDelete(entry, { forceOnly: true }),
+			/remained present after delete/,
+		);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
+		deepStrictEqual(
+			calls.find((args) => args[0] === "delete"),
+			["delete", WORK_UUID],
+		);
+		ok(
+			calls
+				.filter((args) => args[0] === "list")
+				.every((args) => args[1] === "-a"),
+		);
+	});
+
 	it("audits known allocation intents as valid, stale, malformed, or unknown without mutation", () => {
 		const root = tempDir("switchyard-allocation-audit-");
 		const projectRoot = "/private/tmp/switchyard-fixture-project";

@@ -179,6 +179,43 @@ describe("mutation protocol", () => {
 		strictEqual(result.reconciled, true);
 	});
 
+	it("reconciles an observed crash fixture without replaying the command", async () => {
+		const intent = createMutationIntent({
+			operation: "provider_cleanup",
+			resource: "attempt-observed-crash",
+		});
+		const observed = {
+			...intent,
+			state: "observed",
+			outcome: "confirmed",
+			attempt: 1,
+		};
+		let commandCalls = 0;
+		let reconcileCalls = 0;
+		const result = await executeMutation({
+			operation: observed.operation,
+			resource: observed.resource,
+			operationId: observed.operationId,
+			resume: observed,
+			command: async () => {
+				commandCalls += 1;
+			},
+			observe: async () => ({ status: "confirmed", ownership: "confirmed" }),
+			reconcile: async ({ resumed, operationId, attempt }) => {
+				reconcileCalls += 1;
+				strictEqual(resumed, true);
+				strictEqual(operationId, observed.operationId);
+				strictEqual(attempt, 1);
+				return { status: "confirmed", ownership: "confirmed" };
+			},
+		});
+		strictEqual(commandCalls, 0);
+		strictEqual(reconcileCalls, 1);
+		strictEqual(result.state, "completed");
+		strictEqual(result.reconciled, true);
+		strictEqual(result.operationId, observed.operationId);
+	});
+
 	it("stops a resumed mutation when reconciliation is ambiguous", async () => {
 		const intent = createMutationIntent({
 			operation: "orphan_termination",
