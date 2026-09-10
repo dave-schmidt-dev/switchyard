@@ -11,8 +11,9 @@
 		"prepare": "husky",
 		"test": "node scripts/run-test-phases.mjs",
 		"test:serial": "node --test --test-concurrency=1 tests/dispatch-cli.test.mjs tests/detached-dispatch.test.mjs tests/no-host-rights-vm.test.mjs tests/workspace-wipe-vm.test.mjs",
-		"test:other": "files=\"\"; for f in tests/*.test.mjs; do case \"$f\" in tests/dispatch-cli.test.mjs|tests/detached-dispatch.test.mjs|tests/no-host-rights-vm.test.mjs|tests/workspace-wipe-vm.test.mjs) ;; *) files=\"$files $f\";; esac; done; node --test $files",
+		"test:other": "files=\"\"; for f in tests/*.test.mjs; do case \"$f\" in tests/dispatch-cli.test.mjs|tests/detached-dispatch.test.mjs|tests/no-host-rights-vm.test.mjs|tests/workspace-wipe-vm.test.mjs|tests/outcome-properties.test.mjs|tests/mutation-properties.test.mjs) ;; *) files=\"$files $f\";; esac; done; node --test $files",
 		"test:stabilization": "node --test tests/outcome-replay.test.mjs tests/stabilization-ledger.test.mjs",
+		"test:properties": "node scripts/run-test-phases.mjs --properties",
 		"test:contracts": "node scripts/check-contract-gates.mjs --run",
 		"lint": "biome check .",
 		"deadcode": "knip",
@@ -26,6 +27,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.2",
+		"fast-check": "^4.9.0",
 		"husky": "^9.1.7",
 		"knip": "^6.24.0"
 	}
