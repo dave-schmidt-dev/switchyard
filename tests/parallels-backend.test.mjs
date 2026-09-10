@@ -1018,12 +1018,18 @@ describe("Parallels execution backend lifecycle", () => {
 			name: buildParallelsWorkingName("running", process.pid),
 		});
 
-		throws(() => backend.destroy(WORK_UUID), /returned 255/);
-		ok(!calls.some((args) => args[0] === "delete"));
-		deepStrictEqual(
-			calls.map((args) => args[0]),
-			["list", "stop", "stop", "list"],
+		let failure;
+		throws(
+			() => backend.destroy(WORK_UUID),
+			(error) => {
+				failure = error;
+				return /returned 255/.test(error.message);
+			},
 		);
+		ok(!calls.some((args) => args[0] === "delete"));
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
+		strictEqual(calls.filter((args) => args[0] === "stop").length, 3);
+		ok(failure?.cleanupUncertain);
 	});
 
 	it("gives every prlctl call a deadline, and lets an explicit one win", () => {
@@ -1112,37 +1118,41 @@ describe("Parallels execution backend lifecycle", () => {
 		]);
 	});
 
-	it("forced destroy rejects lying graceful stop, kill, and delete", () => {
+	it("observes a force-stop before deleting after a lying graceful stop", () => {
 		// The inverse of prlctl_job_misfire: success reported for a mutation that
 		// did not happen. Without the observation the false success fell straight
 		// through to `delete` on a running VM.
 		const calls = [];
 		let stopped = false;
+		let deleted = false;
+		const lyingName = buildParallelsWorkingName("lying-stop", process.pid);
 		const backend = new ParallelsExecutionBackend({
 			stopSettleTimeoutMs: 0,
 			prlctlFn: (args) => {
 				calls.push(args.slice(0, 3).join(" "));
 				if (args[0] === "stop" && args[2] === "--kill") stopped = true;
 				if (args[0] === "list")
-					return listed([
-						{
-							uuid: WORK_UUID,
-							status: stopped ? "stopped" : "running",
-							name: "lying-stop",
-						},
-					]);
+					if (deleted) return listed([]);
+					else
+						return listed([
+							{
+								uuid: WORK_UUID,
+								status: stopped ? "stopped" : "running",
+								name: lyingName,
+							},
+						]);
+				if (args[0] === "delete") deleted = true;
 				return "";
 			},
 		});
 
-		throws(
-			() =>
-				backend.stopAndDelete({
-					uuid: WORK_UUID,
-					name: "lying-stop",
-					status: "running",
-				}),
-			/remained present after delete/,
+		deepStrictEqual(
+			backend.stopAndDelete({
+				uuid: WORK_UUID,
+				name: lyingName,
+				status: "running",
+			}),
+			{ uuid: WORK_UUID, name: lyingName, forced: true },
 		);
 		// Ordering is the claim, not the mere presence of a kill: the escalation
 		// has to follow the observation that the graceful stop did not take.
@@ -1150,9 +1160,119 @@ describe("Parallels execution backend lifecycle", () => {
 			`stop ${WORK_UUID}`,
 			"list -a -o",
 			`stop ${WORK_UUID} --kill`,
+			"list -a -o",
 			`delete ${WORK_UUID}`,
 			"list -a -o",
 		]);
+	});
+
+	it("retries a false-success force-stop once before deleting", () => {
+		const calls = [];
+		let killAttempts = 0;
+		let deleted = false;
+		const sleeps = [];
+		const entry = {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("force-retry", process.pid),
+			status: "running",
+		};
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			sleepFn: (milliseconds) => sleeps.push(milliseconds),
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "stop" && args[2] === "--kill") {
+					killAttempts += 1;
+					return "success reported";
+				}
+				if (args[0] === "list") {
+					return deleted
+						? listed([])
+						: listed([
+								{
+									...entry,
+									status: killAttempts >= 2 ? "stopped" : "running",
+								},
+							]);
+				}
+				if (args[0] === "delete") deleted = true;
+				return "";
+			},
+		});
+
+		deepStrictEqual(backend.stopAndDelete(entry, { forceOnly: true }), {
+			uuid: WORK_UUID,
+			name: entry.name,
+			forced: true,
+		});
+		strictEqual(killAttempts, 2);
+		deepStrictEqual(sleeps, [25]);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "list", "stop", "list", "delete", "list"],
+		);
+	});
+
+	it("fails closed after force-stop exhaustion without deleting", () => {
+		const calls = [];
+		const entry = {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("force-stuck", process.pid),
+			status: "running",
+		};
+		const backend = new ParallelsExecutionBackend({
+			stopSettleTimeoutMs: 0,
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list")
+					return listed([{ ...entry, status: "running" }]);
+				return "";
+			},
+		});
+
+		let failure;
+		throws(
+			() => backend.stopAndDelete(entry, { forceOnly: true }),
+			(error) => {
+				failure = error;
+				return true;
+			},
+		);
+		ok(failure.cleanupUncertain);
+		strictEqual(calls.filter((args) => args[0] === "stop").length, 2);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
+		deepStrictEqual(
+			calls.map((args) => args[0]),
+			["stop", "list", "stop", "list"],
+		);
+	});
+
+	it("does not retry a force-stop when inventory is ambiguous", () => {
+		const calls = [];
+		const entry = {
+			uuid: WORK_UUID,
+			name: buildParallelsWorkingName("force-malformed", process.pid),
+			status: "running",
+		};
+		const backend = new ParallelsExecutionBackend({
+			prlctlFn: (args) => {
+				calls.push(args);
+				if (args[0] === "list") return "not-an-inventory";
+				return "";
+			},
+		});
+
+		let failure;
+		throws(
+			() => backend.stopAndDelete(entry, { forceOnly: true }),
+			(error) => {
+				failure = error;
+				return true;
+			},
+		);
+		ok(failure.cleanupUncertain);
+		strictEqual(calls.filter((args) => args[0] === "stop").length, 1);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
 	});
 
 	it("reprobes after delete fallback before retrying deletion", () => {
@@ -1194,7 +1314,17 @@ describe("Parallels execution backend lifecycle", () => {
 		});
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["list", "stop", "list", "delete", "stop", "list", "delete", "list"],
+			[
+				"list",
+				"stop",
+				"list",
+				"delete",
+				"stop",
+				"list",
+				"list",
+				"delete",
+				"list",
+			],
 		);
 	});
 
@@ -1222,17 +1352,19 @@ describe("Parallels execution backend lifecycle", () => {
 			name: buildParallelsWorkingName("delete-running", process.pid),
 		});
 
+		let failure;
 		throws(
 			() => backend.destroy(WORK_UUID),
-			(error) => causedBy(error, deleteFailure),
+			(error) => {
+				failure = error;
+				return /still running/.test(error.message);
+			},
 		);
-		// The intent is "no second delete after the reprobe found it running",
-		// which a positional slice no longer expresses now that the settle probe
-		// sits between the stop and the delete.
-		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
+		ok(failure.cleanupUncertain);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["list", "stop", "list", "stop", "delete", "list"],
+			["list", "stop", "list", "stop", "list", "stop", "list"],
 		);
 	});
 
@@ -1258,7 +1390,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "stop", "delete", "list"],
+			["stop", "stop", "list", "delete", "list"],
 		);
 	});
 
@@ -1283,7 +1415,7 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "list", "delete", "stop", "list"],
+			["stop", "list", "delete", "stop", "list", "list"],
 		);
 	});
 
@@ -1299,6 +1431,7 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 		});
 
+		let failure;
 		throws(
 			() =>
 				backend.stopAndDelete({
@@ -1306,11 +1439,15 @@ describe("Parallels execution backend lifecycle", () => {
 					name: "probe-failure",
 					status: "running",
 				}),
-			(error) => causedBy(error, deleteFailure),
+			(error) => {
+				failure = error;
+				return /still running/.test(error.message);
+			},
 		);
+		ok(failure.cleanupUncertain);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "list", "stop", "delete", "list"],
+			["stop", "list", "stop", "list"],
 		);
 	});
 
@@ -1336,7 +1473,7 @@ describe("Parallels execution backend lifecycle", () => {
 								{
 									uuid: WORK_UUID,
 									status: "stopped",
-									name: "retry-present",
+									name: buildParallelsWorkingName("retry-present", process.pid),
 								},
 							])
 						: listed([]);
@@ -1348,14 +1485,18 @@ describe("Parallels execution backend lifecycle", () => {
 		deepStrictEqual(
 			backend.stopAndDelete({
 				uuid: WORK_UUID,
-				name: "retry-present",
+				name: buildParallelsWorkingName("retry-present", process.pid),
 				status: "running",
 			}),
-			{ uuid: WORK_UUID, name: "retry-present", forced: true },
+			{
+				uuid: WORK_UUID,
+				name: buildParallelsWorkingName("retry-present", process.pid),
+				forced: true,
+			},
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "list", "delete", "stop", "list", "delete", "list"],
+			["stop", "list", "delete", "stop", "list", "list"],
 		);
 	});
 
@@ -1391,16 +1532,20 @@ describe("Parallels execution backend lifecycle", () => {
 			backend.stopAndDelete(
 				{
 					uuid: WORK_UUID,
-					name: "forced-stopped",
+					name: buildParallelsWorkingName("forced-stopped", process.pid),
 					status: "running",
 				},
 				{ forceOnly: true },
 			),
-			{ uuid: WORK_UUID, name: "forced-stopped", forced: true },
+			{
+				uuid: WORK_UUID,
+				name: buildParallelsWorkingName("forced-stopped", process.pid),
+				forced: true,
+			},
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "list", "delete", "list"],
+			["stop", "list", "delete", "list", "delete", "list"],
 		);
 	});
 
@@ -1424,21 +1569,27 @@ describe("Parallels execution backend lifecycle", () => {
 			},
 		});
 
+		let failure;
 		throws(
 			() =>
 				backend.stopAndDelete(
 					{
 						uuid: WORK_UUID,
-						name: "forced-running",
+						name: buildParallelsWorkingName("forced-running", process.pid),
 						status: "running",
 					},
 					{ forceOnly: true },
 				),
-			(error) => causedBy(error, deleteFailure),
+			(error) => {
+				failure = error;
+				return /force-stop failed/.test(error.message);
+			},
 		);
+		ok(failure.cleanupUncertain);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
-			["stop", "delete", "list"],
+			["stop", "list", "stop", "list"],
 		);
 	});
 
@@ -1470,7 +1621,7 @@ describe("Parallels execution backend lifecycle", () => {
 						{
 							uuid: WORK_UUID,
 							status: listAttempts < 3 ? "running" : "stopped",
-							name: "settling",
+							name: buildParallelsWorkingName("settling", process.pid),
 						},
 					]);
 				}
@@ -1491,10 +1642,14 @@ describe("Parallels execution backend lifecycle", () => {
 		deepStrictEqual(
 			backend.stopAndDelete({
 				uuid: WORK_UUID,
-				name: "settling",
+				name: buildParallelsWorkingName("settling", process.pid),
 				status: "running",
 			}),
-			{ uuid: WORK_UUID, name: "settling", forced: true },
+			{
+				uuid: WORK_UUID,
+				name: buildParallelsWorkingName("settling", process.pid),
+				forced: true,
+			},
 		);
 		deepStrictEqual(
 			calls.map((args) => args[0]),
@@ -1505,6 +1660,7 @@ describe("Parallels execution backend lifecycle", () => {
 				"list",
 				"delete",
 				"stop",
+				"list",
 				"list",
 				"delete",
 				"list",
@@ -1529,28 +1685,37 @@ describe("Parallels execution backend lifecycle", () => {
 				calls.push(args);
 				if (args[0] === "list")
 					return listed([
-						{ uuid: WORK_UUID, status: "running", name: "stuck" },
+						{
+							uuid: WORK_UUID,
+							status: "running",
+							name: buildParallelsWorkingName("stuck", process.pid),
+						},
 					]);
 				if (args[0] === "delete") throw deleteFailure;
 				return "";
 			},
 		});
 
+		let failure;
 		throws(
 			() =>
 				backend.stopAndDelete({
 					uuid: WORK_UUID,
-					name: "stuck",
+					name: buildParallelsWorkingName("stuck", process.pid),
 					status: "running",
 				}),
-			(error) => causedBy(error, deleteFailure),
+			(error) => {
+				failure = error;
+				return /still running/.test(error.message);
+			},
 		);
+		ok(failure.cleanupUncertain);
 		// It waited the full window before giving up, and never deleted a VM it
 		// had just observed running.
 		// The failed-delete observation reuses the one delete-settlement window;
 		// it does not start a second full settle period.
-		strictEqual(calls.filter((args) => args[0] === "list").length, 5);
-		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
+		strictEqual(calls.filter((args) => args[0] === "list").length, 12);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
 	});
 
 	it("fails closed on malformed deletion inventory", () => {
@@ -1597,7 +1762,13 @@ describe("Parallels execution backend lifecycle", () => {
 				if (args[0] === "list") {
 					finalPolls += 1;
 					return finalPolls < 3
-						? listed([{ uuid: WORK_UUID, status: "stopped", name: "budgeted" }])
+						? listed([
+								{
+									uuid: WORK_UUID,
+									status: "stopped",
+									name: buildParallelsWorkingName("budgeted", process.pid),
+								},
+							])
 						: listed([]);
 				}
 				return "";
@@ -1606,18 +1777,26 @@ describe("Parallels execution backend lifecycle", () => {
 
 		deepStrictEqual(
 			backend.stopAndDelete(
-				{ uuid: WORK_UUID, name: "budgeted", status: "stopped" },
+				{
+					uuid: WORK_UUID,
+					name: buildParallelsWorkingName("budgeted", process.pid),
+					status: "stopped",
+				},
 				{ forceOnly: true },
 			),
-			{ uuid: WORK_UUID, name: "budgeted", forced: true },
+			{
+				uuid: WORK_UUID,
+				name: buildParallelsWorkingName("budgeted", process.pid),
+				forced: true,
+			},
 		);
 		deepStrictEqual(
 			calls
 				.filter(({ args }) => args[0] === "list")
 				.map(({ options }) => options.timeout),
-			[10, 10, 6],
+			[300_000, 10, 10],
 		);
-		strictEqual(now, 4);
+		strictEqual(now, 0);
 	});
 
 	it("allows one immediate deletion observation for a zero settle timeout", () => {
@@ -3048,8 +3227,7 @@ describe("linked-clone snapshot sidecar (INV-3 cross-process reclamation)", () =
 		throws(
 			() => backend.destroy(WORK_UUID),
 			(error) =>
-				error.message.includes("could not verify absence") &&
-				causedBy(error, deleteFailure),
+				error.cleanupUncertain === true && causedBy(error, deleteFailure),
 		);
 		rmSync(root, { recursive: true, force: true });
 	});
@@ -3327,7 +3505,7 @@ describe("VM ownership metadata", () => {
 		const source = readFileSync(sourcePath, "utf8");
 		strictEqual(
 			createHash("sha256").update(source, "utf8").digest("hex"),
-			"9782322046e1147e1acceaca4c67283bfa3051a96f6f98f0ba51e4a6c7f5f750",
+			"efcfd718e53a06f950eb637157b4c4b02b3e9d395d292894128839c1d3497fc2",
 		);
 
 		const calls = [];
@@ -3360,20 +3538,16 @@ describe("VM ownership metadata", () => {
 						{ ...entry, status: "running" },
 						{ uuid: otherUuid, status: "stopped", name: entry.name },
 					]);
-				if (args[0] === "delete") return "";
+				if (args[0] === "delete") deleted = true;
 				return "";
 			},
 		});
 
 		throws(
 			() => backend.stopAndDelete(entry, { forceOnly: true }),
-			/remained present after delete/,
+			(error) => error.cleanupUncertain === true,
 		);
-		strictEqual(calls.filter((args) => args[0] === "delete").length, 1);
-		deepStrictEqual(
-			calls.find((args) => args[0] === "delete"),
-			["delete", WORK_UUID],
-		);
+		strictEqual(calls.filter((args) => args[0] === "delete").length, 0);
 		ok(
 			calls
 				.filter((args) => args[0] === "list")

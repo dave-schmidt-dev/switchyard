@@ -23,6 +23,7 @@ import {
 	WorkerBootStageError,
 } from "../adapter/exec-error.mjs";
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
+import { executeMutationSync } from "./mutation-protocol.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
@@ -1724,6 +1725,88 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			const elapsedMs = this.nowFn() - startedAt;
 			if (elapsedMs >= timeoutMs) throw cause;
 			this.sleepFn(Math.min(this.stopSettlePollMs, timeoutMs - elapsedMs));
+		}
+	}
+
+	/**
+	 * Force a VM down and prove the exact owned identity settled before delete.
+	 * A successful `stop --kill` is not evidence of a stopped VM: Parallels has
+	 * returned zero while leaving the guest running. Retry one time only when a
+	 * complete authoritative inventory still reports that exact VM running.
+	 */
+	_forceStopAndAwaitSettled(entry, cause) {
+		const policy = {
+			maxAttempts: 2,
+			retryOn: ["failed"],
+			retryAmbiguous: false,
+			idempotency: "conditional",
+		};
+		const result = executeMutationSync({
+			operation: "parallels-force-stop",
+			resource: entry.uuid.replace(/[{}]/gu, ""),
+			policy,
+			command: () => this._call(["stop", entry.uuid, "--kill"]),
+			observe: () => this._observeForceStop(entry),
+			sleepFn: this.sleepFn,
+		});
+		if (result.state === "completed") return result;
+		const error =
+			cause ?? new Error(`${entry.name ?? entry.uuid} force-stop failed`);
+		error.cleanupUncertain = true;
+		if (result.outcome === "ambiguous") {
+			error.cause ??= new Error(
+				`${entry.name ?? entry.uuid} force-stop observation was not authoritative`,
+			);
+		}
+		throw error;
+	}
+
+	_observeForceStop(entry) {
+		const startedAt = this.nowFn();
+		for (;;) {
+			let rows;
+			try {
+				rows = parseReadinessInventory(
+					this._call(["list", "-a", "-o", "uuid,status,name"], {
+						retry: false,
+						timeout: this.prlctlCallTimeoutMs,
+						killSignal: "SIGKILL",
+						maxBuffer: HOST_READINESS_MAX_BUFFER,
+					}),
+				);
+			} catch {
+				return { status: "ambiguous", ownership: "unknown" };
+			}
+			const matches = rows.filter(([uuid]) => uuid === entry.uuid);
+			if (matches.length !== 1) {
+				return matches.length === 0
+					? { status: "confirmed", ownership: "confirmed" }
+					: { status: "ambiguous", ownership: "unknown" };
+			}
+			const [, status, ...nameParts] = matches[0];
+			const name = nameParts.join(" ").trim();
+			const expectedOwnership =
+				entry.ownership ??
+				this.ownedResourcesByUuid.get(entry.uuid) ??
+				parseParallelsWorkingName(entry.name);
+			const observedOwnership = parseParallelsWorkingName(name);
+			if (
+				!expectedOwnership ||
+				entry.name !== name ||
+				!observedOwnership ||
+				observedOwnership.runId !== expectedOwnership.runId ||
+				observedOwnership.creatorPid !== expectedOwnership.creatorPid
+			) {
+				return { status: "ambiguous", ownership: "unknown" };
+			}
+			if (/^stopped$/i.test(String(status)))
+				return { status: "confirmed", ownership: "confirmed" };
+			const elapsedMs = this.nowFn() - startedAt;
+			if (elapsedMs >= this.stopSettleTimeoutMs)
+				return { status: "failed", ownership: "confirmed" };
+			this.sleepFn(
+				Math.min(this.stopSettlePollMs, this.stopSettleTimeoutMs - elapsedMs),
+			);
 		}
 	}
 
@@ -3757,29 +3840,17 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		if (forceOnly) {
 			if (!/^stopped$/i.test(String(entry.status ?? ""))) {
 				forced = true;
-				try {
-					this._call(["stop", entry.uuid, "--kill"]);
-				} catch (error) {
-					this._reprobeStopped(entry, error);
-				}
+				this._forceStopAndAwaitSettled(entry);
 			}
 		} else {
 			try {
 				this._call(["stop", entry.uuid]);
 				this._assertNotRunning(entry, "prlctl stop exited 0");
-			} catch {
+			} catch (stopError) {
 				// Covers both a thrown stop and a stop that reported success
-				// without stopping; the escalation is the same either way. The
-				// kill below is deliberately not re-observed: a kill that also
-				// reported a false success is caught by `delete` failing on a
-				// running VM, which the absence-only deletion observer reconciles,
-				// and observing here would poll the settle window a second time.
+				// without stopping; the escalation is the same either way.
 				forced = true;
-				try {
-					this._call(["stop", entry.uuid, "--kill"]);
-				} catch (killError) {
-					this._reprobeStopped(entry, killError);
-				}
+				this._forceStopAndAwaitSettled(entry, stopError);
 			}
 		}
 		const deleteSettlement = this._createDeleteSettlementBudget();
@@ -3800,12 +3871,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		{
 			const error = deleteError;
 			if (!forced) {
-				try {
-					this._call(["stop", entry.uuid, "--kill"]);
-				} catch {
-					// The state probe below decides whether a failed kill completed
-					// asynchronously; retain the original delete failure if it did not.
-				}
+				this._forceStopAndAwaitSettled(entry, error);
 			}
 			forced = true;
 			let current;
