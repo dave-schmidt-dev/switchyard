@@ -1,1 +1,11 @@
-npm run lint
+lint_status=0
+npm run lint || lint_status=$?
+deadcode_status=0
+npm run deadcode || deadcode_status=$?
+if [ "$lint_status" -ne 0 ]; then
+	exit "$lint_status"
+fi
+if [ "$deadcode_status" -ne 0 ]; then
+	exit "$deadcode_status"
+fi
+node scripts/check-contract-receipt.mjs --pre-commit

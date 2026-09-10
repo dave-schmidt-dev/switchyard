@@ -14,6 +14,63 @@ Task 0.1 begins a 20 reviewed integrated-change observation window. Until it clo
 
 If the ledger schema, receipt semantics, or gate mapping changes, revalidate or exclude earlier rows. Exit requires zero recurrence of contract-loss, causal-overwrite, duplicate-terminal-count, missing-production-gate, or unobserved-postcondition defects; all relevant mapped gates run; no unexplained shadow mismatch; historical-defect mutations are killed; operational failures remain separately classified; and `recovery_required` items are empty or explicitly owner-disposed without consuming an execution slot. Provider success percentage is not the criterion; only the owner may unfreeze features. Task 8 feeds worker-boot replay coverage, Task 30 remains the separate owner-authorized live Parallels gate before refactor, and Task 26 route-health activation remains deferred until stabilization exits. Local source/fixture work does not authorize credentialed provider calls, live VM mutation, roster change, external issue creation, push/publication, deployment, or irreversible legacy deletion.
 
+## Contract gate declarations
+
+<!-- contract-gates/v1: this is the source-boundary manifest. ledger.yaml stores
+     only observed status and receipt identity for these declarations. -->
+
+### Contract gate: provider-lifecycle
+
+area: ["src/switchyard/adapter/provider-lifecycle.mjs"]
+gate_test: tests/provider-lifecycle-adapter.test.mjs, tests/provider-cleanup-diagnostics.test.mjs
+
+### Contract gate: broker-executor-schema
+
+area: ["src/switchyard/broker/executor.mjs", "src/switchyard/broker/schema.mjs"]
+gate_test: tests/broker-executor.test.mjs, tests/broker-contract.test.mjs
+
+### Contract gate: outcome-schema-reducer
+
+area: ["src/switchyard/outcome/schema.mjs", "src/switchyard/outcome/reducer.mjs"]
+gate_test: tests/outcome-schema.test.mjs, tests/outcome-reducer.test.mjs, tests/outcome-replay.test.mjs
+
+### Contract gate: production-runner
+
+area: ["src/switchyard/runner/index.mjs"]
+gate_test: tests/runner.test.mjs, tests/runner-broker-production.test.mjs
+
+### Contract gate: worker-bootstrap
+
+area: ["src/switchyard/dispatch/worker-bootstrap.mjs"]
+gate_test: tests/worker-bootstrap-write-chain.test.mjs, tests/worker-bootstrap-fatal-metadata.test.mjs
+
+### Contract gate: dispatch-cli-counters
+
+area: ["src/switchyard/dispatch/index.mjs"]
+gate_test: tests/dispatch-cli.test.mjs, tests/detached-dispatch.test.mjs
+
+### Contract gate: run-store
+
+area: ["src/switchyard/run-store/index.mjs"]
+gate_test: tests/run-store.test.mjs
+
+### Contract gate: finalization
+
+area: ["src/switchyard/dispatch/run-finalization.mjs"]
+gate_test: tests/run-finalization.test.mjs
+
+### Contract gate: diagnostics
+
+area: ["src/switchyard/diagnostics/index.mjs"]
+gate_test: tests/diagnostics.test.mjs
+
+### Contract gate: mutation-protocol
+
+area: ["src/switchyard/lifecycle/mutation-protocol.mjs"]
+gate_test: tests/mutation-protocol.test.mjs, tests/orphan-kill.test.mjs
+
+<!-- /contract-gates/v1 -->
+
 ### INV-1 — Agents have no rights to the Mac host
 area: ["src/switchyard/lifecycle/**", "src/switchyard/auth/**"]
 gate_test: tests/no-host-rights-vm.test.mjs

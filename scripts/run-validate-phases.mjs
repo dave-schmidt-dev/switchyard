@@ -20,6 +20,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { runContractSuites } from "./check-contract-gates.mjs";
 import { runPhases } from "./run-test-phases.mjs";
 
 /** Ordered so the cheap static checks report before the expensive suites. */
@@ -42,5 +43,15 @@ if (
 		(existsSync(process.argv[1]) &&
 			import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href))
 ) {
-	process.exit(runValidatePhases());
+	const status = runValidatePhases();
+	if (status !== 0) process.exit(status);
+	try {
+		const contractExecution = await runContractSuites({ root: process.cwd() });
+		process.exit(contractExecution.phases["test:contracts"] === 0 ? 0 : 1);
+	} catch (error) {
+		console.error(
+			`contract gates: ${error.code ?? "validation_failed"}${error.errors ? ` ${error.errors.join(",")}` : ""}`,
+		);
+		process.exit(1);
+	}
 }

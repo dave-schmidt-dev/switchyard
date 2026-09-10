@@ -13,6 +13,7 @@
 		"test:serial": "node --test --test-concurrency=1 tests/dispatch-cli.test.mjs tests/detached-dispatch.test.mjs tests/no-host-rights-vm.test.mjs tests/workspace-wipe-vm.test.mjs",
 		"test:other": "files=\"\"; for f in tests/*.test.mjs; do case \"$f\" in tests/dispatch-cli.test.mjs|tests/detached-dispatch.test.mjs|tests/no-host-rights-vm.test.mjs|tests/workspace-wipe-vm.test.mjs) ;; *) files=\"$files $f\";; esac; done; node --test $files",
 		"test:stabilization": "node --test tests/outcome-replay.test.mjs tests/stabilization-ledger.test.mjs",
+		"test:contracts": "node scripts/check-contract-gates.mjs --run",
 		"lint": "biome check .",
 		"deadcode": "knip",
 		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",

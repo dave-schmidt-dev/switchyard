@@ -59,3 +59,17 @@ resolutions:
       authoritative, transitions are monotonic and atomically persisted, exact target quarantine
       survives resume, reset precedes reroute, and detached status/result reconcile the derived
       projection. Caller-owned containers and the untrusted orchestrator path fail closed.
+
+# Source-boundary declarations live in INVARIANTS.md. This section stores
+# observations only; it is not a second source-of-truth manifest.
+contract_gates:
+  provider-lifecycle: {gate_test_status: not-run}
+  broker-executor-schema: {gate_test_status: not-run}
+  outcome-schema-reducer: {gate_test_status: not-run}
+  production-runner: {gate_test_status: not-run}
+  worker-bootstrap: {gate_test_status: not-run}
+  dispatch-cli-counters: {gate_test_status: not-run}
+  run-store: {gate_test_status: not-run}
+  finalization: {gate_test_status: not-run}
+  diagnostics: {gate_test_status: not-run}
+  mutation-protocol: {gate_test_status: not-run}

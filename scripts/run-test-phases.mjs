@@ -11,6 +11,10 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	computeContractSnapshot,
+	writeExecutionRecord,
+} from "./check-contract-gates.mjs";
 
 export const DEFAULT_PHASES = ["test:serial", "test:other"];
 export const VM_GATE_OUTCOMES = Object.freeze([
@@ -175,6 +179,7 @@ export function runPhases({
 	log(summary);
 
 	const firstNonZero = results.find((r) => r.status !== 0);
+	runPhases.lastResults = results;
 	return firstNonZero ? firstNonZero.status : 0;
 }
 
@@ -184,6 +189,11 @@ if (
 		(existsSync(process.argv[1]) &&
 			import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href))
 ) {
+	const snapshot = computeContractSnapshot(process.cwd());
 	const status = runPhases();
+	writeExecutionRecord(runPhases.lastResults ?? [], {
+		root: process.cwd(),
+		snapshot,
+	});
 	process.exit(status);
 }
