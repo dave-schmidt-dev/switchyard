@@ -3,20 +3,25 @@
 //
 // This file is deliberately self-contained and content-pinned by
 // bws-secret-exec. It reads a non-secret JSON request on stdin, accepts exactly
-// one broker-injected key, and sends that key across a one-use memory-only HTTP
-// hop. The guest receives it only in the final OpenCode process environment;
-// no key enters argv, auth.json, a shell profile, a log, or a host child env.
+// one broker-injected key, then writes that key once to the pinned prlctl
+// child's stdin. The guest shell consumes the line before launching OpenCode,
+// whose stdin is already EOF. No key enters argv, auth.json, a shell profile, a
+// log, or a host child env.
 
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { pathToFileURL } from "node:url";
 
 const PRLCTL = "/usr/local/bin/prlctl";
-const TRANSFER_HOST = "10.211.55.2";
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 128 * 1024 * 1024;
 const MAX_GUEST_ARGV_BYTES = 600000;
+const MAX_CREDENTIAL_BYTES = 64 * 1024;
+const LOST_RESULT_PROBE_ATTEMPTS = 10;
+const LOST_RESULT_WAIT_MS = 1000;
+const MAX_PROVIDER_WAIT_ATTEMPTS = 1800;
+const PRLCTL_MISFIRE = /PrlJob_(?:GetRetCode|GetResult):\s*Invalid argument/u;
 const WORKSPACE_ID =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VARIANTS = new Set([
@@ -221,21 +226,34 @@ function readRequest() {
 	return { workspaceId, model, invocationArgs, prompt, idleSeconds };
 }
 
-function takeCredential(model) {
-	const go = process.env.OPENCODE_GO_API_KEY;
-	const mistral = process.env.MISTRAL_API_KEY;
+export function takeCredential(model, environment = process.env) {
+	const go = environment.OPENCODE_GO_API_KEY;
+	const mistral = environment.MISTRAL_API_KEY;
 	if (Boolean(go) === Boolean(mistral))
 		fail("exactly one broker credential is required");
 	if (go) {
 		if (!model.startsWith("opencode-go/"))
 			fail("OpenCode Go credential cannot run this model");
-		delete process.env.OPENCODE_GO_API_KEY;
+		delete environment.OPENCODE_GO_API_KEY;
 		return { secret: go, guestEnv: "OPENCODE_API_KEY" };
 	}
 	if (!model.startsWith("mistral/"))
 		fail("Mistral credential cannot run this model");
-	delete process.env.MISTRAL_API_KEY;
+	delete environment.MISTRAL_API_KEY;
 	return { secret: mistral, guestEnv: "MISTRAL_API_KEY" };
+}
+
+export function credentialInput(secret) {
+	if (typeof secret !== "string" || secret.length === 0) {
+		fail("credential must be a non-empty string");
+	}
+	if (Buffer.byteLength(secret) > MAX_CREDENTIAL_BYTES) {
+		fail("credential exceeds the bounded stdin limit");
+	}
+	if (/[\r\n\0]/u.test(secret)) {
+		fail("credential contains a forbidden line or NUL character");
+	}
+	return `${secret}\n`;
 }
 
 function runPrlctl(args, input = null) {
@@ -260,8 +278,42 @@ function runPrlctl(args, input = null) {
 	});
 }
 
-function guestArgs(request, url, guestEnv) {
-	const marker = `/tmp/switchyard-provider-${createHash("sha256").update(request.workspaceId).digest("hex").slice(0, 32)}.pid`;
+function wait(milliseconds) {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function runControl(args) {
+	let result;
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		result = await runPrlctl(args);
+		if (
+			result.code !== 255 ||
+			!PRLCTL_MISFIRE.test(result.stderr.toString("utf8"))
+		) {
+			return result;
+		}
+		if (attempt < 3) await wait(100 * attempt);
+	}
+	return result;
+}
+
+export function guestJobPaths(workspaceId) {
+	const suffix = createHash("sha256")
+		.update(workspaceId)
+		.digest("hex")
+		.slice(0, 32);
+	const base = `/tmp/switchyard-opencode-bridge-${suffix}`;
+	return {
+		marker: `/tmp/switchyard-provider-${suffix}.pid`,
+		stdout: `${base}.out`,
+		stderr: `${base}.err`,
+		status: `${base}.status`,
+		statusTemp: `${base}.status.tmp`,
+	};
+}
+
+export function guestArgs(request, guestEnv) {
+	const paths = guestJobPaths(request.workspaceId);
 	const provider = [
 		"sh",
 		"-c",
@@ -276,18 +328,32 @@ function guestArgs(request, url, guestEnv) {
 		request.prompt,
 	];
 	const bootstrap = [
+		"set +x",
 		"set -eu",
-		`key=$(/usr/bin/curl --fail --silent --show-error --location --max-time 30 ${shellQuote(url)})`,
+		"umask 077",
+		"IFS= read -r key",
 		'[ -n "$key" ]',
+		"if IFS= read -r extra; then exit 64; fi",
 		`export ${guestEnv}="$key"`,
-		"unset key",
+		"unset key extra",
 		// Do not exec here: the marker must remain until the provider child exits
 		// and then be removed by the EXIT trap. Its PID is the outer shell, so
 		// Parallels' existing process-tree cleanup also reaches the supervisor.
-		`marker=${shellQuote(marker)}`,
+		`marker=${shellQuote(paths.marker)}`,
+		`out=${shellQuote(paths.stdout)}`,
+		`err=${shellQuote(paths.stderr)}`,
+		`status=${shellQuote(paths.status)}`,
+		`status_tmp=${shellQuote(paths.statusTemp)}`,
+		'rm -f -- "$out" "$err" "$status" "$status_tmp"',
 		'printf "%s\\n" "$$" >"$marker"',
 		"trap 'rm -f -- \"$marker\"' EXIT HUP INT TERM",
-		'"$@"',
+		"set +e",
+		'"$@" >"$out" 2>"$err"',
+		"rc=$?",
+		"set -e",
+		'printf "%s\\n" "$rc" >"$status_tmp"',
+		'mv -f -- "$status_tmp" "$status"',
+		'exit "$rc"',
 	].join("; ");
 	const command = ["/bin/bash", "-lc", bootstrap, "bridge", ...provider];
 	const quoted = command.map(shellQuote).join(" ");
@@ -322,99 +388,114 @@ function guestArgs(request, url, guestEnv) {
 	return args;
 }
 
+async function guestFile(workspaceId, path, runControlFn = runControl) {
+	return runControlFn(["exec", workspaceId, "/bin/cat", path]);
+}
+
+async function cleanupGuestJob(workspaceId, paths, runControlFn = runControl) {
+	return runControlFn([
+		"exec",
+		workspaceId,
+		"/bin/rm",
+		"-f",
+		paths.stdout,
+		paths.stderr,
+		paths.status,
+		paths.statusTemp,
+	]);
+}
+
+export async function reconcileGuestResult(
+	request,
+	launchResult,
+	{
+		runControlFn = runControl,
+		waitFn = wait,
+		maxAttempts = MAX_PROVIDER_WAIT_ATTEMPTS,
+		lostResultProbeAttempts = LOST_RESULT_PROBE_ATTEMPTS,
+		waitMs = LOST_RESULT_WAIT_MS,
+	} = {},
+) {
+	const paths = guestJobPaths(request.workspaceId);
+	let sawMarker = false;
+	let statusResult = null;
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		statusResult = await guestFile(
+			request.workspaceId,
+			paths.status,
+			runControlFn,
+		);
+		if (statusResult.code === 0) break;
+		const markerResult = await runControlFn([
+			"exec",
+			request.workspaceId,
+			"/usr/bin/test",
+			"-s",
+			paths.marker,
+		]);
+		sawMarker ||= markerResult.code === 0;
+		if (!sawMarker && attempt >= lostResultProbeAttempts) {
+			return launchResult;
+		}
+		if (attempt % 15 === 0) {
+			process.stderr.write(
+				`switchyard: awaiting reconciled OpenCode result ${attempt}s\n`,
+			);
+		}
+		await waitFn(waitMs);
+	}
+	if (statusResult?.code !== 0) return launchResult;
+	const statusText = statusResult.stdout.toString("utf8").trim();
+	if (
+		!/^(?:0|[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/u.test(statusText)
+	) {
+		return launchResult;
+	}
+	const [stdoutResult, stderrResult] = await Promise.all([
+		guestFile(request.workspaceId, paths.stdout, runControlFn),
+		guestFile(request.workspaceId, paths.stderr, runControlFn),
+	]);
+	if (stdoutResult.code !== 0 || stderrResult.code !== 0) return launchResult;
+	const cleanupResult = await cleanupGuestJob(
+		request.workspaceId,
+		paths,
+		runControlFn,
+	);
+	if (cleanupResult.code !== 0) return launchResult;
+	return {
+		code: Number.parseInt(statusText, 10),
+		signal: null,
+		stdout: stdoutResult.stdout,
+		stderr: stderrResult.stdout,
+	};
+}
+
 async function main() {
 	const request = readRequest();
 	const { secret, guestEnv } = takeCredential(request.model);
-	const token = randomUUID();
-	let served = false;
-	const server = createServer((req, res) => {
-		if (req.method !== "GET" || req.url !== `/${token}` || served) {
-			res.writeHead(404).end();
-			return;
-		}
-		served = true;
-		res.writeHead(200, {
-			"content-type": "application/octet-stream",
-			"content-length": Buffer.byteLength(secret),
-		});
-		res.end(secret);
-	});
-	let cleanupTransfer = null;
-	let terminating = false;
-	const stopOnSignal = () => {
-		if (terminating) return;
-		terminating = true;
-		void (async () => {
-			try {
-				await cleanupTransfer?.();
-			} finally {
-				server.close();
-				process.exitCode = 143;
-			}
-		})();
-	};
-	process.once("SIGINT", stopOnSignal);
-	process.once("SIGTERM", stopOnSignal);
-	try {
-		await new Promise((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(0, TRANSFER_HOST, resolve);
-		});
-		const address = server.address();
-		if (!address || typeof address === "string")
-			fail("transfer listener did not bind a TCP port");
-		const anchor = `com.apple/switchyard-c3/opencode-key/${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-		const rule = `pass out quick on en0 proto tcp from any to ${TRANSFER_HOST} port ${address.port}\n`;
-		const enabled = await runPrlctl(
-			["exec", request.workspaceId, "/sbin/pfctl", "-a", anchor, "-f", "-"],
-			rule,
+	const input = credentialInput(secret);
+	const launchResult = await runPrlctl(guestArgs(request, guestEnv), input);
+	const result = await reconcileGuestResult(request, launchResult);
+	const visibleOutput = safeProviderOutput(result.stdout, secret).trim();
+	const visibleError = safeProviderOutput(result.stderr, secret).trim();
+	if (visibleOutput.length === 0 && visibleError.length === 0) {
+		process.stderr.write(
+			`opencode-api-key-bridge: guest exited ${result.code ?? result.signal ?? "unknown"} without a provider diagnostic (stdout bytes: ${result.stdout.length}; stderr bytes: ${result.stderr.length})\n`,
 		);
-		if (enabled.code !== 0)
-			fail("could not authorize the one-use guest transfer");
-		cleanupTransfer = () =>
-			runPrlctl([
-				"exec",
-				request.workspaceId,
-				"/sbin/pfctl",
-				"-a",
-				anchor,
-				"-F",
-				"all",
-			]);
-		try {
-			const result = await runPrlctl(
-				guestArgs(
-					request,
-					`http://${TRANSFER_HOST}:${address.port}/${token}`,
-					guestEnv,
-				),
-			);
-			const visibleOutput = safeProviderOutput(result.stdout, secret).trim();
-			const visibleError = safeProviderOutput(result.stderr, secret).trim();
-			if (visibleOutput.length === 0 && visibleError.length === 0) {
-				process.stderr.write(
-					`opencode-api-key-bridge: guest exited ${result.code ?? result.signal ?? "unknown"} without a provider diagnostic (credential consumed: ${served ? "yes" : "no"}; stdout bytes: ${result.stdout.length}; stderr bytes: ${result.stderr.length})\n`,
-				);
-			}
-			process.stdout.write(safeProviderOutput(result.stdout, secret));
-			process.stderr.write(safeProviderOutput(result.stderr, secret));
-			if (result.code !== 0) process.exitCode = result.code ?? 1;
-		} finally {
-			await cleanupTransfer();
-			cleanupTransfer = null;
-		}
-		if (!served && process.exitCode === undefined)
-			fail("guest did not consume the one-use credential");
-	} finally {
-		process.removeListener("SIGINT", stopOnSignal);
-		process.removeListener("SIGTERM", stopOnSignal);
-		server.close();
 	}
+	process.stdout.write(safeProviderOutput(result.stdout, secret));
+	process.stderr.write(safeProviderOutput(result.stderr, secret));
+	if (result.code !== 0) process.exitCode = result.code ?? 1;
 }
 
-main().catch((error) => {
-	process.stderr.write(
-		`opencode-api-key-bridge: ${error?.message ?? "unknown failure"}\n`,
-	);
-	process.exitCode = 1;
-});
+if (
+	process.argv[1] &&
+	import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+	main().catch((error) => {
+		process.stderr.write(
+			`opencode-api-key-bridge: ${error?.message ?? "unknown failure"}\n`,
+		);
+		process.exitCode = 1;
+	});
+}
