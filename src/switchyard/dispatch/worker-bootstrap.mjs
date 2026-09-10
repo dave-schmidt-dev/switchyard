@@ -18,6 +18,10 @@ import {
 import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { validateShadowEnvelope } from "../outcome/shadow.mjs";
+import {
+	failureTransition,
+	successTransition,
+} from "../outcome/transitions.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
 
 function parseArg(argv, flag) {
@@ -255,11 +259,11 @@ export function buildFatalFailure(
 		failurePhase: "worker_boot",
 	};
 	const closedCode = classified.diagnosticCode;
-	const failure = sanitizeFailureMetadata({
+	const decision = failureTransition({
 		result: "launch_failed",
 		errorKind: classified.errorKind,
-		diagnosticCode: closedCode,
 		failurePhase: classified.failurePhase,
+		diagnosticCode: closedCode,
 		diagnosticOrigin: "worker_boot",
 		diagnosticEvidenceAvailable: diagnosticEvidenceAvailable === true,
 		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
@@ -272,6 +276,7 @@ export function buildFatalFailure(
 				}
 			: {}),
 	});
+	const failure = decision.failureMetadata;
 	return failure;
 }
 
@@ -823,8 +828,13 @@ export async function runWorkerBootstrap(argv = process.argv) {
 				},
 				onResult: (r) => {
 					if (r.result === "route_health_deferred") return;
-					const safeFailure = sanitizeFailureMetadata(r);
-					const event = r.success
+					const decision = r.success
+						? successTransition(r)
+						: failureTransition(r);
+					const safeFailure = decision.success
+						? null
+						: decision.failureMetadata;
+					const event = decision.success
 						? {
 								phase: "execution",
 								event: "task_completed",
@@ -852,7 +862,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 								taskId: r.taskId,
 								provider: r.provider ?? null,
 								model: r.model ?? null,
-								result: r.result,
+								result: decision.result,
 								invocationDescriptor: r.invocationDescriptor ?? null,
 								descriptorIdentity: r.descriptorIdentity ?? null,
 								descriptorHarness: r.descriptorHarness ?? null,

@@ -1,12 +1,13 @@
-import {
-	CLEANUP_STAGES,
-	sanitizeFailureMetadata,
-} from "../adapter/exec-error.mjs";
+import { CLEANUP_STAGES } from "../adapter/exec-error.mjs";
 import {
 	boundCompletionContinuationProof,
 	createProgressSnapshot,
 } from "../adapter/provider-lifecycle.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
+import {
+	failureTransition,
+	successTransition,
+} from "../outcome/transitions.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 import { createExecutionOutcome } from "./outcome.mjs";
 import { validateBrokerRequest, validateBrokerResult } from "./schema.mjs";
@@ -265,7 +266,13 @@ export async function executeBrokerRoute(options) {
 
 	emit(options.onStatus, "execution_waiting", route);
 	if (signal?.aborted) {
-		await reconcileOnce("cancel", null);
+		const decision = failureTransition({
+			cancelled: true,
+			result: "execution_failed",
+			provider: route.provider,
+			model: route.model,
+		});
+		await reconcileOnce(decision.outcome, null);
 		const executionOutcome = await persistExecutionOutcome({
 			preLaunch: true,
 			cancelled: true,
@@ -276,8 +283,8 @@ export async function executeBrokerRoute(options) {
 			taskId: route.taskId,
 			provider: route.provider,
 			model: route.model,
-			success: false,
-			outcome: "cancel",
+			success: decision.success,
+			outcome: decision.outcome,
 			reason: "cancelled before launch",
 			terminalEvidence,
 			executionOutcome,
@@ -334,7 +341,13 @@ export async function executeBrokerRoute(options) {
 		};
 		delete launcherResult.diagnosticEvidence;
 		if (signal?.aborted || launcherResult?.cancelled === true) {
-			await reconcileOnce("cancel", null);
+			const decision = failureTransition({
+				cancelled: true,
+				result: "execution_failed",
+				provider: route.provider,
+				model: route.model,
+			});
+			await reconcileOnce(decision.outcome, null);
 			const executionOutcome = await persistExecutionOutcome({
 				cancelled: true,
 			});
@@ -344,8 +357,8 @@ export async function executeBrokerRoute(options) {
 				taskId: route.taskId,
 				provider: route.provider,
 				model: route.model,
-				success: false,
-				outcome: "cancel",
+				success: decision.success,
+				outcome: decision.outcome,
 				reason: "cancelled",
 				terminalEvidence,
 				executionOutcome,
@@ -362,14 +375,20 @@ export async function executeBrokerRoute(options) {
 				: request.estimatedConsumption;
 		await reconcileOnce("success", actualConsumption);
 		const executionOutcome = await persistExecutionOutcome();
+		const successDecision = successTransition({
+			provider: route.provider,
+			model: route.model,
+			actualConsumption,
+			cleanupFailed: launcherResult?.cleanupFailed === true,
+		});
 		emit(options.onStatus, "execution_succeeded", route);
 		return Object.freeze({
 			runId: route.runId,
 			taskId: route.taskId,
 			provider: route.provider,
 			model: route.model,
-			success: true,
-			outcome: "success",
+			success: successDecision.success,
+			outcome: successDecision.outcome,
 			actualConsumption,
 			// A task can succeed while the kill of its provider process fails.
 			// These carried on the failure shape only, so that case reached a
@@ -393,10 +412,15 @@ export async function executeBrokerRoute(options) {
 		});
 	} catch (error) {
 		const cancelled = signal?.aborted || error?.name === "AbortError";
-		const outcome = cancelled ? "cancel" : "failure";
-		if (terminalOutcome === null) await reconcileOnce(outcome, null);
-		const failure = sanitizeFailureMetadata({
+		if (terminalOutcome === null) {
+			const outcomeDecision = failureTransition({ cancelled });
+			await reconcileOnce(outcomeDecision.outcome, null);
+		}
+		const failureDecision = failureTransition({
+			cancelled,
 			result: "execution_failed",
+			provider: route.provider,
+			model: route.model,
 			errorKind: launcherResult?.errorKind,
 			timedOut: launcherResult?.timedOut === true,
 			diagnosticCode: launcherResult?.diagnosticCode,
@@ -411,7 +435,9 @@ export async function executeBrokerRoute(options) {
 			resolvedTargetId: route.resolvedTarget,
 			descriptorIdentity,
 			descriptorHarness: route.harness,
+			cleanupFailed: launcherResult?.cleanupFailed === true,
 		});
+		const failure = failureDecision.failureMetadata;
 		const executionOutcome = await persistExecutionOutcome({ cancelled });
 		emit(
 			options.onStatus,
@@ -424,7 +450,7 @@ export async function executeBrokerRoute(options) {
 			taskId: route.taskId,
 			provider: route.provider,
 			model: route.model,
-			success: false,
+			success: failureDecision.success,
 			reason: cancelled
 				? "cancelled"
 				: !terminalCompleted
@@ -444,7 +470,7 @@ export async function executeBrokerRoute(options) {
 			reviewResult: null,
 			// Broker reconciliation owns this terminal vocabulary. Provider-specific
 			// classifications remain in errorKind/silenceTimedOut/progress.
-			outcome,
+			outcome: failureDecision.outcome,
 			cleanupFailed: launcherResult?.cleanupFailed === true,
 			cleanupStage: cleanupStageOf(launcherResult),
 			failureKind: FAILURE_KINDS.has(launcherResult?.failureKind)

@@ -126,6 +126,14 @@ import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-back
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { projectOutcomeReader } from "../outcome/projection.mjs";
 import { validateShadowEnvelope } from "../outcome/shadow.mjs";
+import {
+	artifactTransition,
+	failureTransition,
+	integrationTransition,
+	retryTransition,
+	reviewTransition,
+	terminalTransition,
+} from "../outcome/transitions.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
 	getInvocationDescriptor,
@@ -1762,20 +1770,16 @@ export class QueueCleanupError extends Error {
 				persistedDiagnosticCodeOf(inFlightError) ?? "recovery_incomplete",
 			failurePhase: "terminal_reconciliation",
 		});
-		this.terminalSummary = {
-			totalTasks: queueResult?.totalTasks ?? null,
-			runnableTasks: queueResult?.runnableTasks ?? null,
-			processedTasks: queueResult?.processedTasks ?? null,
-			completedTaskIds: Array.isArray(queueResult?.completedTaskIds)
-				? [...queueResult.completedTaskIds]
-				: null,
-			deferredTaskIds: Array.isArray(queueResult?.deferredTaskIds)
-				? [...queueResult.deferredTaskIds]
-				: null,
+		this.terminalSummary = terminalTransition({
+			totalTasks: queueResult?.totalTasks,
+			runnableTasks: queueResult?.runnableTasks,
+			processedTasks: queueResult?.processedTasks,
+			completedTaskIds: queueResult?.completedTaskIds,
+			deferredTaskIds: queueResult?.deferredTaskIds,
 			failedCount: Array.isArray(queueResult?.results)
 				? queueResult.results.filter((result) => !result.success).length
 				: null,
-		};
+		}).terminalSummary;
 	}
 }
 
@@ -4414,35 +4418,13 @@ function dirtyOverlayIntegrationGate(context) {
 }
 
 function failureMetadataFor(result, partialDiffPath) {
-	return sanitizeFailureMetadata({
-		taskId: result.taskId,
+	const decision = failureTransition({
+		...result,
 		result: result.result,
-		errorKind: result.errorKind,
-		timedOut: result.timedOut,
-		partialDiffPath,
-		gateEvidencePath: result.gateEvidencePath,
-		diagnosticCode: result.diagnosticCode,
-		exitCode: result.exitCode,
-		signal: result.signal,
-		failurePhase: result.failurePhase,
-		cleanupStage: result.cleanupStage,
-		diagnosticOrigin: result.diagnosticOrigin,
-		diagnosticEvidenceAvailable: result.diagnosticEvidenceAvailable,
-		resolvedTargetId: result.resolvedTargetId,
-		descriptorIdentity: result.descriptorIdentity,
-		descriptorHarness: result.descriptorHarness,
-		diagnosticRef: result.diagnosticRef,
+		artifactRef: partialDiffPath,
 	});
+	return decision.failureMetadata;
 }
-
-const RETRY_TRANSITION_TYPES = new Set([
-	"attempt_recorded",
-	"target_quarantined",
-	"reset_completed",
-	"retry_started",
-	"finalized",
-	"retry_halted",
-]);
 
 function normalizeRetryTargetId(value) {
 	if (typeof value !== "string" || value.length === 0 || value.length > 256) {
@@ -4636,31 +4618,42 @@ function persistRetryTransition(
 		save = true,
 	},
 ) {
-	if (!RETRY_TRANSITION_TYPES.has(type)) {
-		throw new Error(`unknown retry transition: ${type}`);
-	}
-	const targetId = normalizeRetryTargetId(resolvedTargetId);
-	const transitionId = checkpoint.retryTransitionId + 1;
-	const transition = {
-		transitionId,
-		type,
+	const retryDecision = retryTransition({
+		kind: type,
 		taskId,
 		attempt,
-		provider: typeof provider === "string" ? provider : null,
-		model: typeof model === "string" ? model : null,
-		resolvedTargetId: targetId,
+		provider,
+		model,
+		resolvedTargetId,
 		invocationDescriptor,
 		descriptorIdentity,
 		descriptorHarness,
 		diagnosticCode,
 		diagnosticOrigin,
 		diagnosticEvidenceAvailable,
-		diagnosticRef:
-			diagnosticEvidenceAvailable === true &&
-			DIAGNOSTIC_REF_RE.test(diagnosticRef ?? "")
-				? diagnosticRef
-				: null,
+		diagnosticRef,
 		failurePhase,
+		phase,
+		clearState,
+	});
+	const targetId = retryDecision.resolvedTargetId;
+	const transitionId = checkpoint.retryTransitionId + 1;
+	const transition = {
+		transitionId,
+		type: retryDecision.kind,
+		taskId: retryDecision.taskId,
+		attempt: retryDecision.attempt,
+		provider: retryDecision.provider,
+		model: retryDecision.model,
+		resolvedTargetId: targetId,
+		invocationDescriptor: retryDecision.invocationDescriptor,
+		descriptorIdentity: retryDecision.descriptorIdentity,
+		descriptorHarness: retryDecision.descriptorHarness,
+		diagnosticCode: retryDecision.diagnosticCode,
+		diagnosticOrigin: retryDecision.diagnosticOrigin,
+		diagnosticEvidenceAvailable: retryDecision.diagnosticEvidenceAvailable,
+		diagnosticRef: retryDecision.diagnosticRef,
+		failurePhase: retryDecision.failurePhase,
 		timestamp: new Date().toISOString(),
 	};
 	checkpoint.retryTransitionId = transitionId;
@@ -4668,22 +4661,18 @@ function persistRetryTransition(
 	checkpoint.retryState = clearState
 		? null
 		: {
-				taskId,
-				attempt,
-				phase,
+				taskId: retryDecision.taskId,
+				attempt: retryDecision.attempt,
+				phase: retryDecision.phase,
 				resolvedTargetId: targetId,
-				invocationDescriptor,
-				descriptorIdentity,
-				descriptorHarness,
-				diagnosticCode,
-				diagnosticOrigin,
-				diagnosticEvidenceAvailable,
-				diagnosticRef:
-					diagnosticEvidenceAvailable === true &&
-					DIAGNOSTIC_REF_RE.test(diagnosticRef ?? "")
-						? diagnosticRef
-						: null,
-				failurePhase,
+				invocationDescriptor: retryDecision.invocationDescriptor,
+				descriptorIdentity: retryDecision.descriptorIdentity,
+				descriptorHarness: retryDecision.descriptorHarness,
+				diagnosticCode: retryDecision.diagnosticCode,
+				diagnosticOrigin: retryDecision.diagnosticOrigin,
+				diagnosticEvidenceAvailable: retryDecision.diagnosticEvidenceAvailable,
+				diagnosticRef: retryDecision.diagnosticRef,
+				failurePhase: retryDecision.failurePhase,
 			};
 	checkpoint.lastUpdatedAt = transition.timestamp;
 	if (save) saveCheckpoint(checkpointPath, checkpoint);
@@ -5083,7 +5072,16 @@ function reviewTaskResult(
 ) {
 	if (task.type !== "review") return null;
 	const reviewResult = reviewResultFromExecution(execution);
-	const available = reviewResult.status === "available";
+	const reviewDecision = reviewTransition({
+		status: reviewResult.status === "available" ? "succeeded" : "uncertain",
+		reviewResult,
+		available: reviewResult.status === "available",
+		code:
+			reviewResult.status === "available"
+				? "review_completed"
+				: "review_unavailable",
+	});
+	const available = reviewDecision.available;
 	return {
 		...descriptorReceiptFields(invocationDescriptor),
 		taskId: task.id,
@@ -5093,7 +5091,7 @@ function reviewTaskResult(
 		requiredCapability,
 		resolvedTargetId,
 		result: available ? "review_completed" : "review_unavailable",
-		reviewResult,
+		reviewResult: reviewDecision.reviewResult,
 		...(available
 			? {}
 			: {
@@ -5126,10 +5124,16 @@ function retainsFailureDiff(task) {
 
 function reviewFailureFields(task, execution) {
 	if (task.type !== "review") return {};
-	return {
+	const reviewDecision = reviewTransition({
+		status: "uncertain",
+		code: "review_unavailable",
 		reviewResult: unavailableReviewResult(
 			execution?.timedOut === true ? "timeout" : "provider_failed",
 		),
+		available: false,
+	});
+	return {
+		reviewResult: reviewDecision.reviewResult,
 	};
 }
 
@@ -6893,55 +6897,43 @@ async function emitTaskStageOutcomes(context, task, result) {
 		return;
 	const captureStatus = result?.captureStatus ?? null;
 	const expectsArtifact = task.type === "implementation";
+	const artifactDecision = artifactTransition({
+		expectsArtifact,
+		captureStatus,
+	});
 	const artifactAvailable = ["captured", "empty"].includes(captureStatus);
-	const artifactStatus = !expectsArtifact
-		? "skipped"
-		: captureStatus === null
-			? "uncertain"
-			: artifactAvailable
-				? "succeeded"
-				: "failed";
 	await emitStageOutcome(context, {
 		taskId: task.id,
 		attempt: context._activeOutcomeAttempt ?? 1,
 		stage: "artifact",
-		status: artifactStatus,
+		status: artifactDecision.status,
 		producer: "runner",
-		code: !expectsArtifact
-			? "artifact_not_applicable"
-			: captureStatus === null
-				? "artifact_evidence_unavailable"
-				: "artifact_capture",
+		code: artifactDecision.code,
 		detail: {
-			artifactKind: "diff",
-			captured: captureStatus === "captured",
+			artifactKind: artifactDecision.artifactKind,
+			captured: artifactDecision.captured,
 		},
 	});
 	const integrationReached =
 		expectsArtifact &&
 		artifactAvailable &&
 		["success", "integration_failed"].includes(result?.result);
-	const integrationStatus = !expectsArtifact
-		? "skipped"
-		: !integrationReached
-			? "uncertain"
-			: result.result === "success"
-				? "succeeded"
-				: "failed";
+	const integrationDecision = integrationTransition({
+		expectsArtifact,
+		reached: integrationReached,
+		accepted: integrationReached && result?.success === true,
+		gateCode: integrationReached ? result.result : "not_observed",
+	});
 	await emitStageOutcome(context, {
 		taskId: task.id,
 		attempt: context._activeOutcomeAttempt ?? 1,
 		stage: "integration",
-		status: integrationStatus,
+		status: integrationDecision.status,
 		producer: "runner",
-		code: !expectsArtifact
-			? "integration_not_applicable"
-			: !integrationReached
-				? "integration_evidence_unavailable"
-				: "integration_gate",
+		code: integrationDecision.code,
 		detail: {
-			gateCode: integrationReached ? result.result : "not_observed",
-			accepted: integrationReached && result?.success === true,
+			gateCode: integrationDecision.gateCode,
+			accepted: integrationDecision.accepted,
 		},
 	});
 	await emitStageOutcome(context, {
@@ -12313,30 +12305,27 @@ export function runQueue(options) {
 			});
 		}
 		if (runStore) {
-			const anyFailed = results.some((r) => !r.success);
+			const terminalDecision = terminalTransition({
+				results,
+				totalTasks: tasks.length,
+				runnableTasks: initialRunnable.length,
+				processedTasks: processed,
+				completedTaskIds: checkpoint.completedTaskIds,
+				deferredTaskIds,
+				failedCount: results.filter((result) => !result.success).length,
+			});
 			const lastFailed = results.findLast((r) => !r.success);
 			const lastFailure = lastFailed
 				? failureMetadataFor(lastFailed, lastFailed.partialDiffPath)
 				: null;
 			const terminalProjection = {
-				state: anyFailed
-					? "failed"
-					: deferredTaskIds.length > 0
-						? "deferred"
-						: "succeeded",
+				state: terminalDecision.state,
 				activeTaskId: null,
 				quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
 				retryState: checkpoint.retryState,
 				retryTransitionId: checkpoint.retryTransitionId,
 				cleanupState: "complete",
-				terminalSummary: {
-					totalTasks: tasks.length,
-					runnableTasks: initialRunnable.length,
-					processedTasks: processed,
-					completedTaskIds: checkpoint.completedTaskIds,
-					deferredTaskIds,
-					failedCount: results.filter((result) => !result.success).length,
-				},
+				terminalSummary: terminalDecision.terminalSummary,
 				terminalizedBy: "worker",
 				...(lastFailure ? { lastFailure } : {}),
 				...(policyDeferred ? { policyDeferred } : {}),
@@ -12989,27 +12978,27 @@ export async function runQueueWithOrchestrator(options) {
 			});
 		}
 		if (runStore) {
-			const anyFailed = results.some((r) => !r.success);
+			const terminalDecision = terminalTransition({
+				results,
+				totalTasks: tasks.length,
+				runnableTasks: initialRunnable.length,
+				processedTasks: processed,
+				completedTaskIds: checkpoint.completedTaskIds,
+				deferredTaskIds,
+				failedCount: results.filter((result) => !result.success).length,
+			});
 			const lastFailed = results.findLast((r) => !r.success);
 			const lastFailure = lastFailed
 				? failureMetadataFor(lastFailed, lastFailed.partialDiffPath)
 				: null;
 			const terminalProjection = {
-				state: anyFailed
-					? "failed"
-					: deferredTaskIds.length > 0
-						? "deferred"
-						: "succeeded",
+				state: terminalDecision.state,
 				activeTaskId: null,
+				quarantinedTargetIds: [...checkpoint.quarantinedTargetIds],
+				retryState: checkpoint.retryState,
+				retryTransitionId: checkpoint.retryTransitionId,
 				cleanupState: "complete",
-				terminalSummary: {
-					totalTasks: tasks.length,
-					runnableTasks: initialRunnable.length,
-					processedTasks: processed,
-					completedTaskIds: checkpoint.completedTaskIds,
-					deferredTaskIds,
-					failedCount: results.filter((result) => !result.success).length,
-				},
+				terminalSummary: terminalDecision.terminalSummary,
 				terminalizedBy: "worker",
 				...(lastFailure ? { lastFailure } : {}),
 				...(policyDeferred ? { policyDeferred } : {}),

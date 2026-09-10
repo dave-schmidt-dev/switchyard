@@ -8,6 +8,11 @@ import {
 	executeMutation,
 	MutationProtocolError,
 } from "../lifecycle/mutation-protocol.mjs";
+import {
+	cleanupTransition,
+	recoveryTransition,
+	terminalTransition,
+} from "../outcome/transitions.mjs";
 import * as defaultRunStore from "../run-store/index.mjs";
 
 const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
@@ -130,6 +135,7 @@ export async function finalizeRun(options, dependencies = {}) {
 	if (failure !== null && !isPersistentFailureMetadata(failure)) {
 		throw new TypeError("finalizeRun accepts only sanitized failure metadata");
 	}
+	const terminalDecision = terminalTransition({ state, terminalSummary });
 	if (
 		![
 			"run_completed",
@@ -227,6 +233,18 @@ export async function finalizeRun(options, dependencies = {}) {
 		} catch (error) {
 			cleanupError = error;
 			const recoveryFailure = recoveryIncompleteFailure();
+			const cleanupDecision = cleanupTransition({
+				status: "failed",
+				code: "cleanup_failed",
+				cleanupCode: "cleanup_failed",
+				observed: false,
+			});
+			const recoveryDecision = recoveryTransition({
+				status: "failed",
+				code: "recovery_required",
+				reasonCode: "recovery_incomplete",
+				originalStage: "cleanup",
+			});
 			await recordFinalizationStage({
 				stage: "cleanup",
 				status: "failed",
@@ -236,8 +254,8 @@ export async function finalizeRun(options, dependencies = {}) {
 					? { operationId: cleanupMutation.operationId }
 					: {}),
 				detail: {
-					cleanupCode: "cleanup_failed",
-					observed: false,
+					cleanupCode: cleanupDecision.cleanupCode,
+					observed: cleanupDecision.observed,
 					...(cleanupMutation
 						? { mutationState: "uncertain", mutationOutcome: "ambiguous" }
 						: {}),
@@ -247,8 +265,8 @@ export async function finalizeRun(options, dependencies = {}) {
 				stage: "recovery",
 				status: "failed",
 				producer: "recovery",
-				code: "recovery_required",
-				detail: { originalStage: "cleanup" },
+				code: recoveryDecision.code,
+				detail: { originalStage: recoveryDecision.originalStage },
 			});
 			await updateRunWithRetry(runId, {
 				state: "recovery_required",
@@ -288,7 +306,7 @@ export async function finalizeRun(options, dependencies = {}) {
 				state,
 				cleanupState: "complete",
 				terminalizedBy,
-				terminalSummary,
+				terminalSummary: terminalDecision.terminalSummary,
 				...CLEARED_ACTIVE_FIELDS,
 				...(closedFailure ? { lastFailure: closedFailure } : {}),
 				...extraPatch,
