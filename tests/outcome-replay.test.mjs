@@ -1,12 +1,5 @@
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
-import {
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
@@ -20,8 +13,9 @@ import {
 	validateSanitizedRecord,
 } from "../scripts/build-outcome-replay-corpus.mjs";
 import { reduceOutcomeEvents } from "../src/switchyard/outcome/reducer.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEMP_ROOT = mkdtempSync(join(tmpdir(), "switchyard-outcome-replay-"));
+const TEMP_ROOT = tempDir("switchyard-outcome-replay-");
 
 after(() => rmSync(TEMP_ROOT, { force: true, recursive: true }));
 

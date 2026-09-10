@@ -3,12 +3,10 @@ import { execFileSync } from "node:child_process";
 import {
 	cpSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -30,11 +28,12 @@ import {
 	parseCoverageReport,
 } from "../scripts/run-contract-coverage.mjs";
 import { loadIncidentMutations } from "../scripts/run-incident-mutations.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const ROOT = join(process.cwd());
 
 function createReceiptFixture() {
-	const fixture = mkdtempSync(join(tmpdir(), "switchyard-contract-cli-"));
+	const fixture = tempDir("switchyard-contract-cli-");
 	const manifest = loadContractGateManifest(ROOT);
 	const paths = [
 		"INVARIANTS.md",

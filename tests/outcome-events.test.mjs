@@ -1,12 +1,5 @@
 import { rejects, strictEqual } from "node:assert";
-import {
-	existsSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -23,6 +16,7 @@ import {
 	readRun,
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 function typedOutcome(runId, outcomeId, writerEpoch = "epoch-1") {
 	return {
@@ -76,7 +70,7 @@ describe("reader-first outcome event floor", () => {
 	});
 
 	it("reads and retains a typed-outcome-only fixture without activating production writes", async () => {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-outcome-reader-"));
+		const root = tempDir("switchyard-outcome-reader-");
 		process.env.SWITCHYARD_RUN_STORE_ROOT = root;
 		const runId = "typed-only-run";
 		try {
@@ -126,7 +120,7 @@ describe("reader-first outcome event floor", () => {
 	});
 
 	it("writes exact-limit typed outcomes and one deduplicated reserved rejection fact", async () => {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-outcome-limit-"));
+		const root = tempDir("switchyard-outcome-limit-");
 		process.env.SWITCHYARD_RUN_STORE_ROOT = root;
 		const runId = "typed-limit-run";
 		try {
@@ -181,7 +175,7 @@ describe("reader-first outcome event floor", () => {
 	});
 
 	it("marks recovery_required when the rejection reserve is unavailable", async () => {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-outcome-reserve-"));
+		const root = tempDir("switchyard-outcome-reserve-");
 		process.env.SWITCHYARD_RUN_STORE_ROOT = root;
 		const runId = "typed-reserve-run";
 		try {

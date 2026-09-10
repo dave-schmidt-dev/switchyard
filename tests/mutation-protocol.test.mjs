@@ -3,13 +3,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
 	mkdirSync,
-	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { killOrphanedProcesses } from "../src/switchyard/adapter/orphan-kill.mjs";
@@ -23,6 +21,7 @@ import {
 	validateMutationRecord,
 } from "../src/switchyard/lifecycle/mutation-protocol.mjs";
 import { initializeRun, readRun } from "../src/switchyard/run-store/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("mutation protocol", () => {
 	it("creates stable intent identities and rejects unbounded policies", () => {
@@ -350,7 +349,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("routes the default orphan adapter path through mutation progress", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const events = [];
@@ -414,7 +413,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("persists and replays default provider cleanup by operation id", async () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-mutation-"));
+		const storeRoot = tempDir("switchyard-mutation-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const runId = "provider-cleanup-replay";
@@ -467,7 +466,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("reconciles a commanded orphan sidecar before reissuing cleanup", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const containerName = `container-crashed-${randomUUID()}`;
@@ -533,7 +532,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("replays an ambiguous orphan crash without retrying cleanup", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const containerName = `container-crash-${randomUUID()}`;
@@ -572,7 +571,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("fails closed when a valid sidecar record does not match its filename", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const containerName = `container-mismatch-${randomUUID()}`;
@@ -630,7 +629,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("bounds unresolved orphan sidecars and blocks mutation at capacity", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const runId = `run-overflow-${randomUUID()}`;
@@ -686,7 +685,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("reclaims completed sidecars before admitting a bounded replacement", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const runId = `run-complete-${randomUUID()}`;
@@ -744,7 +743,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("binds scoped orphan completion to the retained attempt identity", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const containerName = `container-scoped-${randomUUID()}`;
@@ -779,7 +778,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("reconciles a crashed scoped attempt without reissuing cleanup", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const containerName = `container-scoped-crash-${randomUUID()}`;
@@ -833,7 +832,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("keeps unrelated run-scoped cleanup available when legacy sidecars are full", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const globalDirectory = join(storeRoot, "mutations", "orphan-termination");
@@ -882,7 +881,7 @@ describe("mutation protocol", () => {
 	});
 
 	it("keeps no-context compatibility cleanup independent of sidecars", () => {
-		const storeRoot = mkdtempSync(join(tmpdir(), "switchyard-orphan-"));
+		const storeRoot = tempDir("switchyard-orphan-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
 		const globalDirectory = join(storeRoot, "mutations", "orphan-termination");

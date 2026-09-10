@@ -1,7 +1,5 @@
 import { deepStrictEqual, rejects, strictEqual, throws } from "node:assert";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import { describe, it } from "node:test";
 import {
 	createBroker,
@@ -24,6 +22,7 @@ import {
 	releaseRunLock,
 } from "../src/switchyard/run-store/index.mjs";
 import { prepareOutcomeWriter } from "../src/switchyard/runner/index.mjs";
+import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 function request(overrides = {}) {
 	return {
@@ -187,7 +186,7 @@ describe("broker contract", () => {
 	});
 
 	it("fences the active writer and recovers a missing execution outcome", async () => {
-		const root = await mkdtemp(join(tmpdir(), "switchyard-outcome-contract-"));
+		const root = await tempDirAsync("switchyard-outcome-contract-");
 		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		process.env.SWITCHYARD_RUN_STORE_ROOT = root;
 		const runId = "outcome-fencing-1";
