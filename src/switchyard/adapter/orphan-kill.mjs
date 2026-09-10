@@ -12,7 +12,192 @@
 // mechanism there, since a VM has no `docker exec` to fall back to. The
 // Docker path below is the fallback for backends that don't provide one.
 import { execFile, execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	createMutationIntent,
+	executeMutation,
+	executeMutationSync,
+	validateMutationRecord,
+} from "../lifecycle/mutation-protocol.mjs";
+import { getRunRoot } from "../run-store/index.mjs";
 import { validateIdentifier } from "./shell-safety.mjs";
+
+const ORPHAN_MUTATION_LIMIT = 64;
+const ORPHAN_MUTATION_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\.json$/u;
+const MUTATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const MUTATION_CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const RUN_ID_RE = /^[\w-]+$/u;
+const ORPHAN_MUTATION_DIR = "mutations/orphan-termination";
+const DEFAULT_STATE_ROOT = resolve(
+	dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"..",
+	"..",
+	".logs",
+	"switchyard",
+);
+
+function normalizeCleanupContext(cleanupContext) {
+	if (cleanupContext == null) return null;
+	if (
+		typeof cleanupContext !== "object" ||
+		typeof cleanupContext.runId !== "string" ||
+		!RUN_ID_RE.test(cleanupContext.runId) ||
+		typeof cleanupContext.attemptId !== "string" ||
+		!MUTATION_ID_RE.test(cleanupContext.attemptId)
+	)
+		return undefined;
+	return {
+		runId: cleanupContext.runId,
+		attemptId: cleanupContext.attemptId,
+	};
+}
+
+function orphanMutationRoot(cleanupContext = null) {
+	if (cleanupContext) {
+		return resolve(getRunRoot(cleanupContext.runId), ORPHAN_MUTATION_DIR);
+	}
+	return resolve(
+		process.env.SWITCHYARD_RUN_STORE_ROOT || DEFAULT_STATE_ROOT,
+		ORPHAN_MUTATION_DIR,
+	);
+}
+
+function orphanMutationPath(operationId, cleanupContext = null) {
+	return resolve(orphanMutationRoot(cleanupContext), `${operationId}.json`);
+}
+
+function listOrphanMutationSidecars(cleanupContext = null) {
+	try {
+		return readdirSync(orphanMutationRoot(cleanupContext))
+			.filter((name) => ORPHAN_MUTATION_FILE_RE.test(name))
+			.map((name) => {
+				const path = resolve(orphanMutationRoot(cleanupContext), name);
+				try {
+					return { path, mtimeMs: statSync(path).mtimeMs };
+				} catch {
+					return null;
+				}
+			})
+			.filter(Boolean)
+			.sort((left, right) => left.mtimeMs - right.mtimeMs);
+	} catch {
+		return [];
+	}
+}
+
+function persistOrphanMutation(record, cleanupContext = null) {
+	validateMutationRecord(record);
+	const durableRecord = {
+		version: record.version,
+		operationId: record.operationId,
+		operation: record.operation,
+		resource: record.resource,
+		state: record.state,
+		outcome: record.outcome,
+		attempt: record.attempt,
+		maxAttempts: record.maxAttempts,
+		idempotency: record.idempotency,
+		retryAmbiguous: record.retryAmbiguous,
+		recordedAt: record.recordedAt,
+		...(typeof record.code === "string" && MUTATION_CODE_RE.test(record.code)
+			? { code: record.code }
+			: {}),
+		...(record.reconciled === true ? { reconciled: true } : {}),
+	};
+	validateMutationRecord(durableRecord);
+	const directory = orphanMutationRoot(cleanupContext);
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const destination = orphanMutationPath(record.operationId, cleanupContext);
+	const destinationExists = listOrphanMutationSidecars(cleanupContext).some(
+		(candidate) => candidate.path === destination,
+	);
+	trimOrphanMutationSidecars(
+		destinationExists ? ORPHAN_MUTATION_LIMIT : ORPHAN_MUTATION_LIMIT - 1,
+		cleanupContext,
+	);
+	const existing = listOrphanMutationSidecars(cleanupContext);
+	if (
+		!existing.some((candidate) => candidate.path === destination) &&
+		existing.length >= ORPHAN_MUTATION_LIMIT
+	)
+		throw new Error("orphan mutation sidecar capacity exhausted");
+	const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(temporary, JSON.stringify(durableRecord), { mode: 0o600 });
+		renameSync(temporary, destination);
+	} finally {
+		try {
+			if (existsSync(temporary)) unlinkSync(temporary);
+		} catch {
+			// The atomic destination is already authoritative.
+		}
+	}
+	trimOrphanMutationSidecars(ORPHAN_MUTATION_LIMIT, cleanupContext);
+}
+
+function trimOrphanMutationSidecars(
+	targetLimit = ORPHAN_MUTATION_LIMIT,
+	cleanupContext = null,
+) {
+	const files = listOrphanMutationSidecars(cleanupContext);
+	if (files.length <= targetLimit) return;
+	let remaining = files.length;
+	for (const candidate of files) {
+		if (remaining <= targetLimit) break;
+		try {
+			const record = JSON.parse(readFileSync(candidate.path, "utf8"));
+			if (record.state === "completed") {
+				unlinkSync(candidate.path);
+				remaining -= 1;
+			}
+		} catch {
+			// Preserve malformed or uncertain evidence for manual reconciliation.
+		}
+	}
+}
+
+function readOrphanMutation(operationId, cleanupContext = null) {
+	try {
+		const record = JSON.parse(
+			readFileSync(orphanMutationPath(operationId, cleanupContext), "utf8"),
+		);
+		return { record: validateMutationRecord(record), corrupt: false };
+	} catch (error) {
+		if (error?.code === "ENOENT") return { record: null, corrupt: false };
+		return { record: null, corrupt: true };
+	}
+}
+
+function emitOrphanMutationStatus(onStatus, event, operationId) {
+	try {
+		onStatus?.({ phase: "mutation", event, operationId });
+	} catch {
+		// Cleanup telemetry cannot replace the primary timeout result.
+	}
+}
+
+function legacyOrphanResult(mutation) {
+	if (mutation?.commandResult) return mutation.commandResult;
+	if (mutation?.state === "completed") return CLEANUP_CONFIRMED;
+	return {
+		...CLEANUP_CONFIRMED,
+		cleanupFailed: true,
+		failurePhase: "provider_cleanup",
+	};
+}
 
 function killViaDocker(containerName) {
 	try {
@@ -119,6 +304,121 @@ function describeCleanupFailure(error) {
  */
 export function killOrphanedProcesses(containerName, options = {}) {
 	const { executionBackend, command, args, onStatus } = options;
+	if (
+		!options._mutationRaw &&
+		!options.mutationProtocol &&
+		options.cleanupContext != null
+	) {
+		const cleanupContext = normalizeCleanupContext(options.cleanupContext);
+		if (options.cleanupContext != null && cleanupContext === undefined) {
+			emitOrphanMutationStatus(onStatus, "mutation_uncertain", "invalid");
+			return {
+				...CLEANUP_CONFIRMED,
+				cleanupFailed: true,
+				failurePhase: "provider_cleanup",
+			};
+		}
+		const identity = cleanupContext
+			? `${cleanupContext.runId}:${cleanupContext.attemptId}:${String(containerName)}`
+			: String(containerName);
+		const resource = `container-${createHash("sha256")
+			.update(identity, "utf8")
+			.digest("hex")
+			.slice(0, 32)}`;
+		const operation = "orphan_termination";
+		const policy = {
+			maxAttempts: 1,
+			idempotency: "conditional",
+			reconcile: true,
+			...(options.policy ?? {}),
+		};
+		const expectedOperationId = createMutationIntent({
+			operation,
+			resource,
+			policy,
+		}).operationId;
+		const operationId = options.operationId ?? expectedOperationId;
+		if (typeof operationId !== "string" || !MUTATION_ID_RE.test(operationId)) {
+			emitOrphanMutationStatus(onStatus, "mutation_uncertain", "invalid");
+			return {
+				...CLEANUP_CONFIRMED,
+				cleanupFailed: true,
+				failurePhase: "provider_cleanup",
+			};
+		}
+		if (cleanupContext && operationId !== expectedOperationId) {
+			emitOrphanMutationStatus(onStatus, "mutation_uncertain", operationId);
+			return {
+				...CLEANUP_CONFIRMED,
+				cleanupFailed: true,
+				failurePhase: "provider_cleanup",
+			};
+		}
+		const loaded = options.resume
+			? { record: options.resume, corrupt: false }
+			: readOrphanMutation(operationId, cleanupContext);
+		if (loaded.corrupt) {
+			emitOrphanMutationStatus(onStatus, "mutation_uncertain", operationId);
+			return {
+				...CLEANUP_CONFIRMED,
+				cleanupFailed: true,
+				failurePhase: "provider_cleanup",
+			};
+		}
+		try {
+			const mutation = executeMutationSync({
+				operation,
+				resource,
+				operationId,
+				policy,
+				resume: loaded.record,
+				command: () =>
+					killOrphanedProcesses(containerName, {
+						...options,
+						_mutationRaw: true,
+					}),
+				observe:
+					options.observe ??
+					((result) =>
+						result?.cleanupFailed === false
+							? { status: "confirmed", ownership: "confirmed" }
+							: { status: "ambiguous", ownership: "unknown" }),
+				reconcile: options.reconcile,
+				persist: (record) => persistOrphanMutation(record, cleanupContext),
+				onStatus,
+			});
+			return legacyOrphanResult(mutation);
+		} catch {
+			emitOrphanMutationStatus(onStatus, "mutation_uncertain", operationId);
+			return {
+				...CLEANUP_CONFIRMED,
+				cleanupFailed: true,
+				failurePhase: "provider_cleanup",
+			};
+		}
+	}
+	if (options.mutationProtocol) {
+		const protocol = options.mutationProtocol;
+		return executeMutation({
+			...protocol,
+			operation: protocol.operation ?? "orphan_termination",
+			resource: protocol.resource ?? containerName,
+			command:
+				protocol.command ??
+				(() =>
+					killOrphanedProcesses(containerName, {
+						...options,
+						mutationProtocol: null,
+					})),
+			observe:
+				protocol.observe ??
+				((result) =>
+					result?.cleanupFailed === false
+						? { status: "confirmed", ownership: "confirmed" }
+						: { status: "ambiguous", ownership: "unknown" }),
+			onStatus: protocol.onStatus ?? onStatus,
+		});
+	}
 	if (typeof executionBackend?.cleanupProviderProcess === "function") {
 		try {
 			executionBackend.cleanupProviderProcess(command, args, { onStatus });

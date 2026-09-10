@@ -4,6 +4,10 @@ import {
 	PERSISTED_DIAGNOSTIC_CODES,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
+import {
+	executeMutation,
+	MutationProtocolError,
+} from "../lifecycle/mutation-protocol.mjs";
 import * as defaultRunStore from "../run-store/index.mjs";
 
 const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
@@ -106,6 +110,8 @@ export async function finalizeRun(options, dependencies = {}) {
 		failure = null,
 		terminalizedBy = "worker",
 		cleanup = async () => {},
+		cleanupMutation = null,
+		releaseMutation = null,
 		extraPatch = {},
 		eventName = state === "failed"
 			? "run_failed"
@@ -166,6 +172,9 @@ export async function finalizeRun(options, dependencies = {}) {
 		dependencies.updateRunWithRetry ?? defaultRunStore.updateRunWithRetry;
 	const releaseRunLock =
 		dependencies.releaseRunLock ?? defaultRunStore.releaseRunLock;
+	const persistMutation =
+		dependencies.recordMutationOperation ??
+		defaultRunStore.recordMutationOperation;
 	let primaryError = null;
 	let outcome = null;
 	try {
@@ -174,7 +183,16 @@ export async function finalizeRun(options, dependencies = {}) {
 			status: "started",
 			producer: "runner",
 			code: "cleanup_started",
-			detail: { cleanupCode: "cleanup_started", observed: false },
+			...(cleanupMutation?.operationId
+				? { operationId: cleanupMutation.operationId }
+				: {}),
+			detail: {
+				cleanupCode: "cleanup_started",
+				observed: false,
+				...(cleanupMutation
+					? { mutationState: "intent", mutationOutcome: "unknown" }
+					: {}),
+			},
 		});
 		await createEvent(runId, {
 			phase: "worker",
@@ -191,7 +209,21 @@ export async function finalizeRun(options, dependencies = {}) {
 		});
 		let cleanupError = null;
 		try {
-			await cleanup();
+			if (cleanupMutation !== null) {
+				const mutation = await executeMutation({
+					...cleanupMutation,
+					command: cleanupMutation.command ?? (() => cleanup()),
+					persist:
+						cleanupMutation.persist ??
+						(typeof persistMutation === "function"
+							? (record) => persistMutation(runId, record)
+							: undefined),
+				});
+				if (mutation.state !== "completed")
+					throw new MutationProtocolError("cleanup_postcondition_uncertain");
+			} else {
+				await cleanup();
+			}
 		} catch (error) {
 			cleanupError = error;
 			const recoveryFailure = recoveryIncompleteFailure();
@@ -200,7 +232,16 @@ export async function finalizeRun(options, dependencies = {}) {
 				status: "failed",
 				producer: "recovery",
 				code: "cleanup_failed",
-				detail: { cleanupCode: "cleanup_failed", observed: false },
+				...(cleanupMutation?.operationId
+					? { operationId: cleanupMutation.operationId }
+					: {}),
+				detail: {
+					cleanupCode: "cleanup_failed",
+					observed: false,
+					...(cleanupMutation
+						? { mutationState: "uncertain", mutationOutcome: "ambiguous" }
+						: {}),
+				},
 			});
 			await recordFinalizationStage({
 				stage: "recovery",
@@ -213,9 +254,18 @@ export async function finalizeRun(options, dependencies = {}) {
 				state: "recovery_required",
 				cleanupState: "failed",
 				...CLEARED_ACTIVE_FIELDS,
-				lastFailure: recoveryFailure,
+				// Keep the task's primary failure authoritative. Cleanup uncertainty is
+				// a separate recovery fact and must never overwrite it.
+				lastFailure: failure ?? recoveryFailure,
+				cleanupFailure: recoveryFailure,
 			});
-			outcome = { terminal: false, cleanupComplete: false, error };
+			outcome = {
+				terminal: false,
+				cleanupComplete: false,
+				primaryFailure: failure,
+				cleanupFailure: recoveryFailure,
+				error,
+			};
 		}
 		if (!cleanupError) {
 			await recordFinalizationStage({
@@ -223,7 +273,16 @@ export async function finalizeRun(options, dependencies = {}) {
 				status: "succeeded",
 				producer: "runner",
 				code: "cleanup_completed",
-				detail: { cleanupCode: "cleanup_completed", observed: true },
+				...(cleanupMutation?.operationId
+					? { operationId: cleanupMutation.operationId }
+					: {}),
+				detail: {
+					cleanupCode: "cleanup_completed",
+					observed: true,
+					...(cleanupMutation
+						? { mutationState: "completed", mutationOutcome: "confirmed" }
+						: {}),
+				},
 			});
 			const run = await updateRunWithRetry(runId, {
 				state,
@@ -260,7 +319,20 @@ export async function finalizeRun(options, dependencies = {}) {
 	}
 	let releaseError = null;
 	try {
-		await releaseRunLock(runId);
+		if (releaseMutation !== null) {
+			const mutation = await executeMutation({
+				...releaseMutation,
+				persist:
+					releaseMutation.persist ??
+					(typeof persistMutation === "function"
+						? (record) => persistMutation(runId, record)
+						: undefined),
+			});
+			if (mutation.state !== "completed")
+				throw new MutationProtocolError("run_lock_release_uncertain");
+		} else {
+			await releaseRunLock(runId);
+		}
 	} catch (error) {
 		releaseError = error;
 	}

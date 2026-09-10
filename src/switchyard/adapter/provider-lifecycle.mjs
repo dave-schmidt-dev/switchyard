@@ -11,6 +11,10 @@ import {
 	validateTaskStartTreeAsync,
 } from "../lifecycle/index.mjs";
 import {
+	createMutationIntent,
+	executeMutation,
+} from "../lifecycle/mutation-protocol.mjs";
+import {
 	CLEANUP_STAGES,
 	classifyProviderDiagnostic,
 	classifyProviderStreams,
@@ -579,6 +583,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		executionBackend,
 		onStatus,
 		cleanupContext,
+		cleanupMutation,
 		idleExitCode,
 		launcherDiagnosticCode,
 		adapterDiagnosticCode,
@@ -587,6 +592,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 	} = options;
 	const classificationCommand =
 		WORKSPACE_PROVIDER_COMMANDS.get(args) ?? command;
+	let cleanupFailure = null;
 	// A backend that implements cleanupProviderProcess() (currently only
 	// ParallelsExecutionBackend) is authoritative for its own transport — the
 	// adapter's `cleanup` (killOrphanedProcessesAsync, Docker-only) would be a
@@ -606,19 +612,109 @@ export async function executeProviderInvocation(command, args, options = {}) {
 					},
 				);
 				backendHandled = true;
-				return backendResult;
+				const normalized = backendResult ?? {
+					cleanupFailed: false,
+					postcondition: true,
+				};
+				if (normalized?.cleanupFailed === true) cleanupFailure = normalized;
+				return normalized;
 			} catch (error) {
 				backendError = error;
+				cleanupFailure = error;
 			}
 		}
 		if (!backendHandled && typeof cleanup === "function") {
-			await cleanup();
+			let cleanupResult;
+			try {
+				cleanupResult = await cleanup();
+			} catch (error) {
+				if (!backendError) cleanupFailure = error;
+			}
+			if (backendError) throw backendError;
+			if (cleanupFailure) throw cleanupFailure;
+			const normalized = cleanupResult ?? {
+				cleanupFailed: false,
+				postcondition: true,
+			};
+			if (normalized?.cleanupFailed === true) cleanupFailure = normalized;
+			return normalized;
 		}
 		if (backendError) throw backendError;
+		return { cleanupFailed: true, postcondition: false };
+	};
+	const cleanupPolicy = cleanupMutation ?? {
+		operation: "provider_cleanup",
+		resource: cleanupContext?.attemptId ?? "provider-cleanup",
+		policy: {
+			maxAttempts: 1,
+			idempotency: "conditional",
+			reconcile: true,
+		},
+	};
+	const operation = cleanupPolicy.operation ?? "provider_cleanup";
+	const resource = cleanupPolicy.resource ?? "provider-cleanup";
+	const policy = cleanupPolicy.policy ?? {};
+	const operationId =
+		cleanupPolicy.operationId ??
+		createMutationIntent({ operation, resource, policy }).operationId;
+	const cleanupWithProtocol = async () => {
+		let cleanupStore = null;
+		let resume = cleanupPolicy.resume ?? null;
+		if (cleanupContext?.runId) {
+			cleanupStore = await import("../run-store/index.mjs");
+			if (!resume) {
+				try {
+					resume = await cleanupStore.readMutationOperation(
+						cleanupContext.runId,
+						operationId,
+					);
+				} catch (error) {
+					if (error?.code !== "ENOENT") throw error;
+				}
+			}
+		}
+		const mutation = await executeMutation({
+			...cleanupPolicy,
+			operation,
+			resource,
+			operationId,
+			policy,
+			resume,
+			command: cleanupMutation?.command ?? (() => cleanupWithBackend()),
+			observe:
+				cleanupMutation?.observe ??
+				((result) =>
+					result?.postcondition === true || result?.cleanupFailed === false
+						? { status: "confirmed", ownership: "confirmed" }
+						: { status: "ambiguous", ownership: "unknown" }),
+			persist:
+				cleanupMutation?.persist ??
+				(cleanupStore
+					? async (record) => {
+							await cleanupStore.recordMutationOperation(
+								cleanupContext.runId,
+								record,
+							);
+						}
+					: undefined),
+			onStatus: cleanupMutation?.onStatus ?? onStatus,
+		});
+		if (mutation.state !== "completed") {
+			const error = new Error("provider cleanup postcondition is uncertain");
+			error.code = "provider_cleanup_uncertain";
+			if (cleanupFailure && typeof cleanupFailure === "object") {
+				for (const field of ["cleanupStage", "status", "signal"]) {
+					if (cleanupFailure[field] !== undefined)
+						error[field] = cleanupFailure[field];
+				}
+			}
+			throw error;
+		}
+		return mutation;
 	};
 	const result = await runProviderProcess(command, args, {
 		...lifecycleOptions,
-		cleanup: cleanupWithBackend,
+		cleanup: cleanupWithProtocol,
 	});
 	const complete = async (value) => {
 		if (typeof onProcessCompleted === "function") {

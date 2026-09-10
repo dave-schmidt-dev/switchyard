@@ -41,6 +41,10 @@ import {
 	isReviewResult,
 	sanitizeReviewResult,
 } from "../diagnostics/review-result.mjs";
+import {
+	createMutationIntent,
+	executeMutation,
+} from "../lifecycle/mutation-protocol.mjs";
 import { reduceOutcomeEvents } from "../outcome/reducer.mjs";
 import {
 	createOversizeRejectionFact,
@@ -245,6 +249,56 @@ const EVENT_LOCK_WAIT_MS = 5_000;
 // the source for replay, while run.json carries the latest bounded summary.
 const OUTCOME_SHADOW_VERSION = 1;
 const OUTCOME_SHADOW_FAILURE_LIMIT = 16;
+const MUTATION_OPERATION_LIMIT = 64;
+const MUTATION_OPERATION_STATES = new Set([
+	"intent",
+	"commanded",
+	"observed",
+	"completed",
+	"failed",
+	"uncertain",
+]);
+const MUTATION_OPERATION_OUTCOMES = new Set([
+	"confirmed",
+	"failed",
+	"ambiguous",
+	"unknown",
+	"timed_out",
+]);
+const MUTATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const MUTATION_RESOURCE_RE = /^[A-Za-z0-9._:/-]{1,256}$/u;
+
+function validateMutationOperations(value) {
+	if (value === undefined) return;
+	if (!Array.isArray(value) || value.length > MUTATION_OPERATION_LIMIT)
+		throw new SchemaError("mutationOperations must be a bounded array");
+	for (const operation of value) {
+		if (
+			!operation ||
+			typeof operation !== "object" ||
+			Array.isArray(operation) ||
+			!MUTATION_ID_RE.test(operation.operationId ?? "") ||
+			!MUTATION_ID_RE.test(operation.operation ?? "") ||
+			!MUTATION_RESOURCE_RE.test(operation.resource ?? "") ||
+			!MUTATION_OPERATION_STATES.has(operation.state) ||
+			!MUTATION_OPERATION_OUTCOMES.has(operation.outcome) ||
+			!Number.isSafeInteger(operation.attempt) ||
+			operation.attempt < 0 ||
+			!Number.isSafeInteger(operation.maxAttempts) ||
+			operation.maxAttempts < 1 ||
+			operation.maxAttempts > 3 ||
+			(operation.idempotency !== undefined &&
+				!["idempotent", "conditional", "unknown"].includes(
+					operation.idempotency,
+				)) ||
+			(operation.retryAmbiguous !== undefined &&
+				typeof operation.retryAmbiguous !== "boolean") ||
+			typeof operation.recordedAt !== "string" ||
+			Number.isNaN(Date.parse(operation.recordedAt))
+		)
+			throw new SchemaError("mutationOperations contains invalid metadata");
+	}
+}
 
 function shadowCanonical(value) {
 	if (Array.isArray(value)) return `[${value.map(shadowCanonical).join(",")}]`;
@@ -1347,6 +1401,7 @@ function validateRun(data) {
 			}
 		}
 	}
+	validateMutationOperations(data.mutationOperations);
 	if (
 		data.activeTaskStartedAt !== undefined &&
 		data.activeTaskStartedAt !== null &&
@@ -1670,6 +1725,15 @@ function validateRun(data) {
 		throw new SchemaError("lastFailure contains invalid persistent metadata");
 	}
 	if (
+		data.cleanupFailure !== undefined &&
+		data.cleanupFailure !== null &&
+		!isPersistentFailureMetadata(data.cleanupFailure)
+	) {
+		throw new SchemaError(
+			"cleanupFailure contains invalid persistent metadata",
+		);
+	}
+	if (
 		data.lastReviewResult !== undefined &&
 		data.lastReviewResult !== null &&
 		!isReviewResult(data.lastReviewResult)
@@ -1863,6 +1927,7 @@ export async function initializeRun(options) {
 		outcomeWriterEpoch: null,
 		outcomeRecovery: null,
 		outcomeShadow: null,
+		mutationOperations: [],
 		lastFailure: null,
 		lastReviewResult: null,
 		launchArgs,
@@ -2173,6 +2238,50 @@ export async function updateRunWithRetry(runId, partial, maxAttempts = 10) {
 			}
 		}
 	}
+}
+
+/**
+ * Persist the latest bounded state for a mutation operation. Replacing the
+ * same operationId is idempotent, while unrelated operations remain capped so
+ * a recovery record cannot grow run.json without limit.
+ */
+export async function recordMutationOperation(runId, operation) {
+	validateRunId(runId);
+	validateMutationOperations([operation]);
+	for (;;) {
+		const current = await readRun(runId);
+		const operations = Array.isArray(current.mutationOperations)
+			? [...current.mutationOperations]
+			: [];
+		const index = operations.findIndex(
+			(candidate) => candidate.operationId === operation.operationId,
+		);
+		if (index >= 0) operations[index] = { ...operation };
+		else operations.push({ ...operation });
+		if (operations.length > MUTATION_OPERATION_LIMIT)
+			operations.splice(0, operations.length - MUTATION_OPERATION_LIMIT);
+		try {
+			return await updateRun(
+				runId,
+				{ mutationOperations: operations },
+				current.revision,
+			);
+		} catch (error) {
+			if (!(error instanceof RevisionError)) throw error;
+		}
+	}
+}
+
+/** Read one durable mutation record by its stable operationId. */
+export async function readMutationOperation(runId, operationId) {
+	validateRunId(runId);
+	if (!MUTATION_ID_RE.test(operationId ?? "")) return null;
+	const run = await readRun(runId);
+	return (
+		(Array.isArray(run.mutationOperations) ? run.mutationOperations : []).find(
+			(operation) => operation.operationId === operationId,
+		) ?? null
+	);
 }
 
 /**
@@ -3432,6 +3541,78 @@ export async function releaseProjectLockIfOwnedBy(
 	expectedRunId,
 	options = {},
 ) {
+	if (typeof expectedRunId !== "string" || expectedRunId.length === 0)
+		return false;
+	if (!options._mutationRaw) {
+		const protocol = options.mutationProtocol ?? options.mutation ?? {};
+		const operation = protocol.operation ?? "project_lock_release";
+		const resource =
+			protocol.resource ??
+			`lock-${createHash("sha256")
+				.update(
+					`${resolveCanonicalProjectPath(canonicalProjectPath)}:${expectedRunId}`,
+					"utf8",
+				)
+				.digest("hex")
+				.slice(0, 32)}`;
+		const policy = protocol.policy ?? {
+			maxAttempts: 2,
+			idempotency: "idempotent",
+			reconcile: true,
+		};
+		const operationId =
+			protocol.operationId ??
+			createMutationIntent({ operation, resource, policy }).operationId;
+		let resume = protocol.resume ?? null;
+		if (!resume) {
+			try {
+				resume = await readMutationOperation(expectedRunId, operationId);
+			} catch (error) {
+				if (error?.code !== "ENOENT") throw error;
+			}
+		}
+		let releasedValue = false;
+		const mutation = await executeMutation({
+			...protocol,
+			operation,
+			resource,
+			operationId,
+			policy,
+			resume,
+			command:
+				protocol.command ??
+				(async () => {
+					releasedValue = await releaseProjectLockIfOwnedBy(
+						canonicalProjectPath,
+						expectedRunId,
+						{ ...options, _mutationRaw: true },
+					);
+					return releasedValue;
+				}),
+			observe:
+				protocol.observe ??
+				(async () => {
+					const owned = await isProjectLockOwnedBy(
+						canonicalProjectPath,
+						expectedRunId,
+					);
+					return owned
+						? { status: "ambiguous", ownership: "unknown" }
+						: { status: "confirmed", ownership: "confirmed" };
+				}),
+			persist:
+				protocol.persist ??
+				(async (record) => {
+					try {
+						await recordMutationOperation(expectedRunId, record);
+					} catch (error) {
+						if (error?.code !== "ENOENT") throw error;
+					}
+				}),
+			onStatus: protocol.onStatus ?? options.onStatus,
+		});
+		return mutation.state === "completed" ? releasedValue : false;
+	}
 	const projectPath = resolveCanonicalProjectPath(canonicalProjectPath);
 	let released = false;
 	const recordRemoved = (path) => {

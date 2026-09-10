@@ -352,6 +352,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 				executionBackend: options.executionBackend,
 				command: execution.command,
 				args: execution.args,
+				cleanupContext: options.cleanupContext,
 			});
 			return {
 				output: error.stdout || "",

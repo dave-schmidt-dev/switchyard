@@ -203,6 +203,45 @@ describe("run finalization", () => {
 		strictEqual(patches.at(-1).finishedAt, undefined);
 	});
 
+	it("preserves the primary task failure when cleanup becomes uncertain", async () => {
+		const failure = sanitizeFailureMetadata({
+			result: "execution_failed",
+			errorKind: "execution_failed",
+			diagnosticCode: "provider_failed",
+			failurePhase: "provider_execution",
+		});
+		const patches = [];
+		const outcome = await finalizeRun(
+			{
+				runId: "primary-failure-cleanup-uncertain",
+				state: "failed",
+				failure,
+				terminalSummary: { processedTasks: 1, failedCount: 1 },
+				cleanup: async () => {
+					throw new Error("cleanup response lost");
+				},
+			},
+			{
+				createEvent: async () => {},
+				updateRunWithRetry: async (_runId, patch) => {
+					patches.push(patch);
+					return patch;
+				},
+				releaseRunLock: async () => {},
+			},
+		);
+		strictEqual(outcome.terminal, false);
+		strictEqual(
+			patches.at(-1).lastFailure.diagnosticCode,
+			failure.diagnosticCode,
+		);
+		strictEqual(
+			patches.at(-1).cleanupFailure.diagnosticCode,
+			"recovery_incomplete",
+		);
+		strictEqual(outcome.primaryFailure.diagnosticCode, failure.diagnosticCode);
+	});
+
 	it("rejects an arbitrary event reason before any terminal mutation", async () => {
 		let mutations = 0;
 		const failure = sanitizeFailureMetadata({

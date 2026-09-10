@@ -1,4 +1,5 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
+import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 import {
 	killOrphanedProcesses,
@@ -8,6 +9,7 @@ import {
 describe("killOrphanedProcesses — backend-aware dispatch", () => {
 	it("prefers a backend's cleanupProviderProcess over the Docker fallback", () => {
 		const calls = [];
+		const containerName = `unsafe;name-${randomUUID()}`;
 		const executionBackend = {
 			cleanupProviderProcess(command, args, opts) {
 				calls.push({ command, args, opts });
@@ -16,7 +18,7 @@ describe("killOrphanedProcesses — backend-aware dispatch", () => {
 		// An identifier the Docker fallback would reject outright, so a pass here
 		// can only be explained by the backend path — proof the Docker branch was
 		// never reached, not just that it silently no-oped on a bad name.
-		killOrphanedProcesses("unsafe;name", {
+		killOrphanedProcesses(containerName, {
 			executionBackend,
 			command: "prlctl",
 			args: ["exec", "switchyard-guest", "sh", "-lc", "kill-tree"],
@@ -25,7 +27,7 @@ describe("killOrphanedProcesses — backend-aware dispatch", () => {
 		strictEqual(calls.length, 1);
 		strictEqual(calls[0].command, "prlctl");
 		strictEqual(
-			killOrphanedProcesses("unsafe;name", {
+			killOrphanedProcesses(containerName, {
 				executionBackend,
 				command: "prlctl",
 				args: [],
@@ -61,11 +63,14 @@ describe("killOrphanedProcesses — backend-aware dispatch", () => {
 				throw new Error("guest unreachable");
 			},
 		};
-		const outcome = killOrphanedProcesses("switchyard-nonexistent-container", {
-			executionBackend,
-			command: "prlctl",
-			args: ["exec", "switchyard-guest"],
-		});
+		const outcome = killOrphanedProcesses(
+			`switchyard-nonexistent-container-throw-${randomUUID()}`,
+			{
+				executionBackend,
+				command: "prlctl",
+				args: ["exec", "switchyard-guest"],
+			},
+		);
 		strictEqual(outcome.cleanupFailed, true);
 		strictEqual(outcome.failurePhase, "provider_cleanup");
 	});

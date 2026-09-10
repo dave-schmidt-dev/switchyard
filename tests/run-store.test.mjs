@@ -59,9 +59,11 @@ import {
 	RevisionError,
 	readAuthorizedRunEvents,
 	readEvents,
+	readMutationOperation,
 	readRun,
 	reconcileEventSequence,
 	reconcileProjectLockClaims,
+	recordMutationOperation,
 	releaseLaunchLock,
 	releaseOrphanedProjectLocks,
 	releaseProjectLock,
@@ -723,6 +725,31 @@ describe("getStateRoot", () => {
 });
 
 describe("initializeRun", () => {
+	it("persists and replays one bounded mutation operation by operationId", async () => {
+		const runId = `mutation-record-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: join(TEST_ROOT, "tasks.md"),
+			projectPath: TEST_ROOT,
+			orderedTaskIds: [],
+			initialHostFingerprint: "test-host",
+		});
+		const operation = {
+			version: 1,
+			operationId: "operation-lock-release",
+			operation: "project_lock_release",
+			resource: "lock-project-a",
+			state: "intent",
+			outcome: "unknown",
+			attempt: 0,
+			maxAttempts: 2,
+			idempotency: "conditional",
+			recordedAt: new Date().toISOString(),
+		};
+		await recordMutationOperation(runId, operation);
+		const replay = await readMutationOperation(runId, operation.operationId);
+		deepStrictEqual(replay, operation);
+	});
 	it("creates run.json with state created and all required fields", async () => {
 		const opts = makeOptions();
 		const snapshot = await initializeRun(opts);
@@ -2477,6 +2504,51 @@ describe("project lock", () => {
 		strictEqual(await isProjectLockOwnedBy(path, runId), true);
 		strictEqual(await releaseProjectLockIfOwnedBy(path, runId), true);
 		strictEqual(isProjectLockHeld(path), false);
+	});
+
+	it("persists the default ownership-checked release mutation", async () => {
+		const projectPath = uniquePath("durable-project-owner");
+		const runId = uniqueRunId();
+		await initializeRun({
+			runId,
+			tasksFilePath: uniquePath("durable-tasks"),
+			projectPath,
+			orderedTaskIds: [],
+			initialHostFingerprint: "test-host",
+		});
+		await acquireProjectLock(projectPath, runId);
+
+		let firstRemovals = 0;
+		strictEqual(
+			await releaseProjectLockIfOwnedBy(projectPath, runId, {
+				onRemoved: () => {
+					firstRemovals += 1;
+				},
+			}),
+			true,
+		);
+		strictEqual(await isProjectLockOwnedBy(projectPath, runId), false);
+		strictEqual(firstRemovals, 1);
+		let replayRemovals = 0;
+		strictEqual(
+			await releaseProjectLockIfOwnedBy(projectPath, runId, {
+				onRemoved: () => {
+					replayRemovals += 1;
+				},
+			}),
+			false,
+		);
+		strictEqual(replayRemovals, 0);
+		const run = await readRun(runId);
+		strictEqual(run.mutationOperations.length, 1);
+		const [operation] = run.mutationOperations;
+		strictEqual(operation.operation, "project_lock_release");
+		strictEqual(operation.state, "completed");
+		strictEqual(operation.outcome, "confirmed");
+		strictEqual(
+			(await readMutationOperation(runId, operation.operationId)).state,
+			"completed",
+		);
 	});
 
 	it("matches an equivalent trailing-slash project path in a stored lock body", async () => {

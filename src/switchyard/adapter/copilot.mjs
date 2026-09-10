@@ -106,6 +106,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 				executionBackend: options.executionBackend,
 				command,
 				args,
+				cleanupContext: options.cleanupContext,
 			});
 			// Keep error.message (carries ETIMEDOUT) so the runner classifies
 			// this as execution_timed_out, not a generic failure.

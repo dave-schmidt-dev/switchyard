@@ -19,6 +19,7 @@
 // the kill was booked as a clean timeout. That is an INV-3 exposure the
 // terminal state hid — the working object outlives the run.
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 
 import { join } from "node:path";
@@ -69,7 +70,7 @@ function kill(backend) {
 	// A container name the Docker backstop rejects outright. The backstop still
 	// runs after a backend failure by design, and this keeps it a guaranteed
 	// no-op so a passing assertion can only be explained by the backend branch.
-	return killOrphanedProcesses("unsafe;name", {
+	return killOrphanedProcesses(`unsafe;name-${randomUUID()}`, {
 		executionBackend: backend,
 		command: "prlctl",
 		args: ["exec", "switchyard-guest"],
@@ -113,11 +114,14 @@ describe("killOrphanedProcesses reports its cleanup outcome (Task 6.3)", () => {
 	});
 
 	it("reports success when the backend's cleanup returns", () => {
-		const outcome = killOrphanedProcesses("switchyard-nonexistent-container", {
-			executionBackend: { cleanupProviderProcess() {} },
-			command: "prlctl",
-			args: ["exec", "switchyard-guest"],
-		});
+		const outcome = killOrphanedProcesses(
+			`switchyard-nonexistent-container-success-${randomUUID()}`,
+			{
+				executionBackend: { cleanupProviderProcess() {} },
+				command: "prlctl",
+				args: ["exec", "switchyard-guest"],
+			},
+		);
 		strictEqual(outcome.cleanupFailed, false);
 		strictEqual(outcome.failurePhase, null);
 	});
@@ -127,7 +131,7 @@ describe("killOrphanedProcesses reports its cleanup outcome (Task 6.3)", () => {
 		// signal either way; reporting failure here would reclassify every
 		// Docker timeout as a cleanup failure.
 		const outcome = killOrphanedProcesses(
-			"switchyard-nonexistent-container",
+			`switchyard-nonexistent-container-docker-${randomUUID()}`,
 			{},
 		);
 		strictEqual(outcome.cleanupFailed, false);
