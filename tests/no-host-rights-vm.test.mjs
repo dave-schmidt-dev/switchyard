@@ -22,7 +22,10 @@ import {
 	buildParallelsWorkingName,
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
-import { publishVmGateOutcome } from "../src/switchyard/run-store/index.mjs";
+import {
+	acquireVmSlotForTest,
+	publishVmGateOutcome,
+} from "../src/switchyard/run-store/index.mjs";
 import { deriveC3Manifest, probeTcp } from "./helpers/c3-manifest.mjs";
 import {
 	CLIPBOARD_DIRECTIONS,
@@ -60,8 +63,33 @@ function shellQuote(value) {
 	return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
+function boundedProgressValue(value, maxLength = 96) {
+	return String(value ?? "")
+		.replaceAll(/\s+/gu, " ")
+		.trim()
+		.slice(0, maxLength);
+}
+
 function progress(message) {
-	console.error(`[no-host-rights-vm] ${message}`);
+	if (typeof message === "string") {
+		console.error(`[no-host-rights-vm] ${message}`);
+		return;
+	}
+	const fields = [
+		["type", message?.type],
+		["event", message?.event],
+		["status", message?.status],
+		["reason", message?.reason],
+		["attempt", message?.attempt],
+		["elapsedMs", message?.elapsedMs],
+		["delayMs", message?.delayMs],
+		["inventoryCount", message?.inventoryCount],
+	]
+		.filter(([, value]) => value !== undefined && value !== null)
+		.map(([key, value]) => `${key}=${boundedProgressValue(value)}`);
+	console.error(
+		`[no-host-rights-vm] ${(fields.join(" ") || "status=unknown").slice(0, 240)}`,
+	);
 }
 
 function listInfo(name) {
@@ -174,6 +202,32 @@ if (prerequisiteReason) {
 }
 
 describe("no host rights — Parallels VM (INV-1)", () => {
+	it("renders bounded structured admission progress", async (testContext) => {
+		const writes = [];
+		testContext.mock.method(console, "error", (line) => writes.push(line));
+		progress("preserved string progress");
+		const result = await acquireVmSlotForTest({
+			runId: "no-host-rights-progress",
+			timeoutMs: 0,
+			onStatus: progress,
+			acquireFn: () => {
+				const error = new Error("capacity");
+				error.code = "VM_SLOT_UNAVAILABLE";
+				throw error;
+			},
+		});
+
+		strictEqual(result.status, "unavailable-with-proof");
+		strictEqual(result.reason, "vm_slot_unavailable");
+		strictEqual(writes[0], "[no-host-rights-vm] preserved string progress");
+		match(
+			writes[1],
+			/^\[no-host-rights-vm\] type=vm-test-gate event=vm_slot_wait status=Waiting for VM admission capacity reason=vm_slot_unavailable elapsedMs=\d+(?:\.\d+)?$/u,
+		);
+		ok(writes[1].length <= 300);
+		ok(!writes[1].includes("[object Object]"));
+	});
+
 	it("proves host sharing, guest mounts, C-3 networking, and clipboard behavior", {
 		skip: prerequisiteReason ? `VM gate skipped: ${prerequisiteReason}` : false,
 	}, async (testContext) => {
