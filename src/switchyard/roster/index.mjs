@@ -811,6 +811,16 @@ export function mapInvocationArgs(providerOrHarness, intent = {}) {
 	}
 	if (variant !== null) {
 		if (!vocabulary.variant.includes(variant)) return null;
+		// OpenCode's "default" is the absence of a provider override. Passing
+		// `--variant default` asks the selected model to support a literal
+		// variant it may not offer (GLM-5.2 exposes only high/max), so preserve
+		// the roster intent while emitting no variant argv.
+		if (
+			normalizeProviderName(providerOrHarness) === "opencode" &&
+			variant === "default"
+		) {
+			return Object.freeze([]);
+		}
 		return Object.freeze(["--variant", variant]);
 	}
 	return Object.freeze([]);

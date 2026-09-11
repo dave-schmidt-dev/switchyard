@@ -18,7 +18,9 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 128 * 1024 * 1024;
 const MAX_GUEST_ARGV_BYTES = 600000;
 const MAX_CREDENTIAL_BYTES = 64 * 1024;
+const BRIDGE_FAILURE_CODE = 75;
 const LOST_RESULT_PROBE_ATTEMPTS = 10;
+const LOST_RESULT_INITIAL_GRACE_ATTEMPTS = 60;
 const LOST_RESULT_WAIT_MS = 1000;
 const MAX_PROVIDER_WAIT_ATTEMPTS = 1800;
 const PRLCTL_MISFIRE = /PrlJob_(?:GetRetCode|GetResult):\s*Invalid argument/u;
@@ -62,6 +64,7 @@ const HOST_ENV = Object.freeze({
 // Kept local rather than importing the adapter: BWS pins this exact file, and
 // importing mutable workspace code would let a post-pin edit inherit a key.
 const OPENCODE_SUPERVISOR = String.raw`set -u
+set -m
 idle=$1
 shift
 cmd=$1
@@ -76,6 +79,21 @@ last=0
 quiet=0
 elapsed=0
 killed=0
+failed=0
+
+job_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+group_verified() {
+	[ "$job_pgid" = "$pid" ]
+}
+
+signal_group() {
+	signal=$1
+	job_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+	if ! group_verified; then
+		return 1
+	fi
+	/bin/kill -"$signal" -- "-$pid" 2>/dev/null
+}
 
 is_alive() {
 	st=$(ps -o state= -p "$1" 2>/dev/null)
@@ -101,7 +119,12 @@ while :; do
 		quiet=$(( quiet + 1 ))
 	fi
 	if [ "$osize" -gt 0 ] && [ "$quiet" -ge "$idle" ]; then
-		/bin/kill -TERM "$pid" 2>/dev/null || true
+		if ! signal_group TERM; then
+			printf 'switchyard: refusing to signal unverified OpenCode process group\n' >&2
+			rc=75
+			failed=1
+			break
+		fi
 		killed=1
 		break
 	fi
@@ -112,7 +135,6 @@ while :; do
 	sleep 1
 done
 if [ "$killed" -eq 1 ]; then
-	kill -TERM "$pid" 2>/dev/null
 	i=0
 	while [ "$i" -lt 5 ]; do
 		if ! is_alive "$pid"; then
@@ -121,20 +143,23 @@ if [ "$killed" -eq 1 ]; then
 		sleep 1
 		i=$(( i + 1 ))
 	done
-	kill -KILL "$pid" 2>/dev/null
-	wait "$pid" 2>/dev/null
-	swept=0
-	cmd_name=\${cmd##*/}
-	for q in $(pgrep -x "$cmd_name" 2>/dev/null); do
-		if [ "$q" = "$$" ] || [ "$q" = 1 ]; then
-			continue
+	if is_alive "$pid"; then
+		if ! signal_group KILL; then
+			printf 'switchyard: refusing to kill unverified OpenCode process group\n' >&2
+		else
+			i=0
+			while [ "$i" -lt 5 ]; do
+				if ! is_alive "$pid"; then
+					break
+				fi
+				sleep 1
+				i=$(( i + 1 ))
+			done
 		fi
-		kill -KILL "$q" 2>/dev/null
-		swept=$(( swept + 1 ))
-	done
-	if [ "$swept" -gt 0 ]; then
-		printf 'switchyard: swept %s surviving %s process(es)\\n' "$swept" "$cmd" >&2
 	fi
+	rc=75
+	failed=0
+elif [ "$failed" -eq 1 ]; then
 	rc=75
 else
 	wait "$pid" 2>/dev/null
@@ -145,8 +170,53 @@ cat "$err" >&2
 rm -f "$out" "$err"
 exit "$rc"`;
 
+// This process owns the marker and terminal status after the foreground
+// advanced-terminal launch returns. Its marker is published atomically before
+// it can invoke the provider, so reconciliation can distinguish a running job
+// from a failed bootstrap without ever reissuing the provider command.
+const OPENCODE_GUEST_JOB = String.raw`set -eu
+marker=$1
+out=$2
+err=$3
+status=$4
+status_tmp=$5
+shift 5
+marker_tmp="$marker.tmp.$$"
+
+cleanup_before_start() {
+	rm -f -- "$marker_tmp" "$marker" "$status_tmp"
+}
+
+trap 'cleanup_before_start; exit 75' HUP INT TERM
+printf '%s\n' "$$" >"$marker_tmp"
+mv -f -- "$marker_tmp" "$marker"
+set +e
+"$@" >"$out" 2>"$err"
+rc=$?
+set -e
+printf '%s\n' "$rc" >"$status_tmp"
+mv -f -- "$status_tmp" "$status"
+rm -f -- "$marker"
+rm -f -- "$marker_tmp" "$status_tmp"
+exit "$rc"`;
+
 function fail(message) {
 	throw new Error(`opencode-api-key-bridge: ${message}`);
+}
+
+function bridgeFailure(reason) {
+	return {
+		code: BRIDGE_FAILURE_CODE,
+		signal: null,
+		stdout: Buffer.alloc(0),
+		stderr: Buffer.from(`bridge failure: ${reason}\n`),
+	};
+}
+
+export function normalizeWorkspaceId(value) {
+	const normalized = String(value ?? "").replace(/^\{|\}$/gu, "");
+	if (!WORKSPACE_ID.test(normalized)) fail("workspaceId must be a VM UUID");
+	return normalized;
 }
 
 function shellQuote(value) {
@@ -190,9 +260,7 @@ function readRequest() {
 		fail("request must be an object");
 	}
 	const { workspaceId, model, invocationArgs, prompt, idleSeconds } = request;
-	if (typeof workspaceId !== "string" || !WORKSPACE_ID.test(workspaceId)) {
-		fail("workspaceId must be a VM UUID");
-	}
+	const canonicalWorkspaceId = normalizeWorkspaceId(workspaceId);
 	if (
 		typeof model !== "string" ||
 		!/^(opencode-go|mistral)\/[a-z0-9][a-z0-9._-]*$/i.test(model)
@@ -223,7 +291,13 @@ function readRequest() {
 	if (!Number.isInteger(idleSeconds) || idleSeconds < 5 || idleSeconds > 3600) {
 		fail("idleSeconds must be an integer from 5 through 3600");
 	}
-	return { workspaceId, model, invocationArgs, prompt, idleSeconds };
+	return {
+		workspaceId: canonicalWorkspaceId,
+		model,
+		invocationArgs,
+		prompt,
+		idleSeconds,
+	};
 }
 
 export function takeCredential(model, environment = process.env) {
@@ -254,6 +328,28 @@ export function credentialInput(secret) {
 		fail("credential contains a forbidden line or NUL character");
 	}
 	return `${secret}\n`;
+}
+
+/**
+ * Return the non-secret runtime config OpenCode needs to bind a provider key.
+ *
+ * OpenCode's provider catalog is not guaranteed to read a provider-specific
+ * environment variable directly. Its documented, ephemeral configuration path
+ * resolves `{env:...}` at launch, so this keeps the Mistral key in the guest
+ * process environment and out of auth.json, project files, and argv.
+ */
+export function runtimeConfigFor(model, guestEnv) {
+	if (!model.startsWith("mistral/")) return null;
+	if (guestEnv !== "MISTRAL_API_KEY") {
+		fail("Mistral runtime config requires the MISTRAL_API_KEY environment");
+	}
+	return JSON.stringify({
+		provider: {
+			mistral: {
+				options: { apiKey: "{env:MISTRAL_API_KEY}" },
+			},
+		},
+	});
 }
 
 function runPrlctl(args, input = null) {
@@ -314,6 +410,7 @@ export function guestJobPaths(workspaceId) {
 
 export function guestArgs(request, guestEnv) {
 	const paths = guestJobPaths(request.workspaceId);
+	const runtimeConfig = runtimeConfigFor(request.model, guestEnv);
 	const provider = [
 		"sh",
 		"-c",
@@ -327,35 +424,74 @@ export function guestArgs(request, guestEnv) {
 		request.model,
 		request.prompt,
 	];
+	const detachedJob = [
+		"/usr/bin/nohup",
+		"/bin/bash",
+		"-c",
+		OPENCODE_GUEST_JOB,
+		"switchyard-opencode-job",
+		paths.marker,
+		paths.stdout,
+		paths.stderr,
+		paths.status,
+		paths.statusTemp,
+		...provider,
+	];
 	const bootstrap = [
 		"set +x",
 		"set -eu",
+		"set -m",
 		"umask 077",
 		"IFS= read -r key",
 		'[ -n "$key" ]',
 		"if IFS= read -r extra; then exit 64; fi",
 		`export ${guestEnv}="$key"`,
+		...(runtimeConfig
+			? [`export OPENCODE_CONFIG_CONTENT=${shellQuote(runtimeConfig)}`]
+			: []),
 		"unset key extra",
-		// Do not exec here: the marker must remain until the provider child exits
-		// and then be removed by the EXIT trap. Its PID is the outer shell, so
-		// Parallels' existing process-tree cleanup also reaches the supervisor.
 		`marker=${shellQuote(paths.marker)}`,
 		`out=${shellQuote(paths.stdout)}`,
 		`err=${shellQuote(paths.stderr)}`,
 		`status=${shellQuote(paths.status)}`,
 		`status_tmp=${shellQuote(paths.statusTemp)}`,
-		'rm -f -- "$out" "$err" "$status" "$status_tmp"',
-		'printf "%s\\n" "$$" >"$marker"',
-		"trap 'rm -f -- \"$marker\"' EXIT HUP INT TERM",
-		"set +e",
-		'"$@" >"$out" 2>"$err"',
-		"rc=$?",
-		"set -e",
-		'printf "%s\\n" "$rc" >"$status_tmp"',
-		'mv -f -- "$status_tmp" "$status"',
-		'exit "$rc"',
+		'rm -f -- "$out" "$err" "$status" "$status_tmp" "$marker" "$marker.tmp."*',
+		`"$@" </dev/null >/dev/null 2>&1 &
+job_pid=$!
+job_pgid=$(ps -o pgid= -p "$job_pid" 2>/dev/null | tr -d '[:space:]')
+signal_job_group() {
+  signal=$1
+  job_pgid=$(ps -o pgid= -p "$job_pid" 2>/dev/null | tr -d '[:space:]')
+  [ "$job_pgid" = "$job_pid" ] || return 1
+  /bin/kill -"$signal" -- "-$job_pid" 2>/dev/null
+}
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+  [ -s "$marker" ] && exit 0
+  if ! kill -0 "$job_pid" 2>/dev/null; then exit 75; fi
+  attempt=$(( attempt + 1 ))
+  sleep 0.1
+done
+if signal_job_group TERM; then
+  attempt=0
+  while [ "$attempt" -lt 5 ]; do
+    kill -0 "$job_pid" 2>/dev/null || break
+    attempt=$(( attempt + 1 ))
+    sleep 1
+  done
+  if kill -0 "$job_pid" 2>/dev/null; then
+    signal_job_group KILL || true
+    attempt=0
+    while [ "$attempt" -lt 5 ]; do
+      kill -0 "$job_pid" 2>/dev/null || break
+      attempt=$(( attempt + 1 ))
+      sleep 1
+    done
+  fi
+fi
+exit 75`,
 	].join("; ");
-	const command = ["/bin/bash", "-lc", bootstrap, "bridge", ...provider];
+	const command = ["/bin/bash", "-lc", bootstrap, "bridge", ...detachedJob];
 	const quoted = command.map(shellQuote).join(" ");
 	const payload = Buffer.from(
 		`cd /Users/switchyard/.switchyard/project && exec ${quoted}`,
@@ -396,12 +532,15 @@ async function cleanupGuestJob(workspaceId, paths, runControlFn = runControl) {
 	return runControlFn([
 		"exec",
 		workspaceId,
-		"/bin/rm",
-		"-f",
-		paths.stdout,
-		paths.stderr,
-		paths.status,
-		paths.statusTemp,
+		"/bin/sh",
+		"-c",
+		`rm -f -- \
+${shellQuote(paths.stdout)} \
+${shellQuote(paths.stderr)} \
+${shellQuote(paths.status)} \
+${shellQuote(paths.statusTemp)} \
+${shellQuote(paths.marker)} \
+${shellQuote(paths.marker)}.tmp.*`,
 	]);
 }
 
@@ -417,25 +556,46 @@ export async function reconcileGuestResult(
 	} = {},
 ) {
 	const paths = guestJobPaths(request.workspaceId);
+	const failClosed = (reason) =>
+		launchResult.code === 0 ? bridgeFailure(reason) : launchResult;
+	const launchLostResult =
+		launchResult.code === 255 &&
+		PRLCTL_MISFIRE.test(launchResult.stderr.toString("utf8"));
+	const initialGraceAttempts = launchLostResult
+		? Math.max(lostResultProbeAttempts, LOST_RESULT_INITIAL_GRACE_ATTEMPTS)
+		: lostResultProbeAttempts;
 	let sawMarker = false;
 	let statusResult = null;
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		statusResult = await guestFile(
-			request.workspaceId,
-			paths.status,
-			runControlFn,
-		);
+		try {
+			statusResult = await guestFile(
+				request.workspaceId,
+				paths.status,
+				runControlFn,
+			);
+		} catch {
+			return failClosed("status read failed");
+		}
 		if (statusResult.code === 0) break;
-		const markerResult = await runControlFn([
-			"exec",
-			request.workspaceId,
-			"/usr/bin/test",
-			"-s",
-			paths.marker,
-		]);
+		if (statusResult.code !== 1) return failClosed("status read failed");
+		let markerResult;
+		try {
+			markerResult = await runControlFn([
+				"exec",
+				request.workspaceId,
+				"/bin/test",
+				"-s",
+				paths.marker,
+			]);
+		} catch {
+			return failClosed("marker read failed");
+		}
+		if (markerResult.code !== 0 && markerResult.code !== 1) {
+			return failClosed("marker read failed");
+		}
 		sawMarker ||= markerResult.code === 0;
-		if (!sawMarker && attempt >= lostResultProbeAttempts) {
-			return launchResult;
+		if (!sawMarker && attempt >= initialGraceAttempts) {
+			return failClosed("marker missing");
 		}
 		if (attempt % 15 === 0) {
 			process.stderr.write(
@@ -444,24 +604,39 @@ export async function reconcileGuestResult(
 		}
 		await waitFn(waitMs);
 	}
-	if (statusResult?.code !== 0) return launchResult;
+	if (statusResult?.code !== 0) {
+		return failClosed(sawMarker ? "status timeout" : "marker missing");
+	}
 	const statusText = statusResult.stdout.toString("utf8").trim();
 	if (
 		!/^(?:0|[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/u.test(statusText)
 	) {
-		return launchResult;
+		return failClosed("status invalid");
 	}
-	const [stdoutResult, stderrResult] = await Promise.all([
-		guestFile(request.workspaceId, paths.stdout, runControlFn),
-		guestFile(request.workspaceId, paths.stderr, runControlFn),
-	]);
-	if (stdoutResult.code !== 0 || stderrResult.code !== 0) return launchResult;
-	const cleanupResult = await cleanupGuestJob(
-		request.workspaceId,
-		paths,
-		runControlFn,
-	);
-	if (cleanupResult.code !== 0) return launchResult;
+	let stdoutResult;
+	let stderrResult;
+	try {
+		[stdoutResult, stderrResult] = await Promise.all([
+			guestFile(request.workspaceId, paths.stdout, runControlFn),
+			guestFile(request.workspaceId, paths.stderr, runControlFn),
+		]);
+	} catch {
+		return failClosed("provider output read failed");
+	}
+	if (stdoutResult.code !== 0 || stderrResult.code !== 0) {
+		return failClosed("provider output read failed");
+	}
+	let cleanupResult;
+	try {
+		cleanupResult = await cleanupGuestJob(
+			request.workspaceId,
+			paths,
+			runControlFn,
+		);
+	} catch {
+		return failClosed("cleanup failed");
+	}
+	if (cleanupResult.code !== 0) return failClosed("cleanup failed");
 	return {
 		code: Number.parseInt(statusText, 10),
 		signal: null,

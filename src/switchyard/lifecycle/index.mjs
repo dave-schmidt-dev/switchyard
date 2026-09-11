@@ -22,6 +22,8 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 const TASK_BASE_REF_PREFIX = "refs/switchyard/task-base";
 const ZERO_OBJECT_ID = "0".repeat(40);
 const TASK_BASE_PROBE_TIMEOUT_MS = 30_000;
+const PRLCTL_LOST_RESULT =
+	/PrlJob_(?:GetRetCode|GetResult):\s*Invalid argument\b/u;
 const DIRTY_OVERLAY_VERSION = 1;
 const DIRTY_OVERLAY_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const DIRTY_OVERLAY_SECRET_PATHS = [
@@ -478,22 +480,59 @@ function backendExecution(executionBackend, workspaceId, argv, options) {
 	return execution;
 }
 
-function backendGit(executionBackend, workspaceId, argv, options, stage) {
-	const execution = backendExecution(
-		executionBackend,
-		workspaceId,
-		argv,
-		options,
+function isParallelsLostResult(error) {
+	return PRLCTL_LOST_RESULT.test(
+		[String(error?.stderr ?? ""), String(error?.message ?? "")].join("\n"),
 	);
+}
+
+function emitTaskBaseRecovery(options, stage, mode) {
+	try {
+		options.onStatus?.({
+			phase: "checkpoint",
+			event: "task_base_probe_recovered",
+			stage,
+			mode,
+			status: `${stage} recovered from a Parallels lost result`,
+		});
+	} catch {
+		// Status cannot alter immutable-base capture.
+	}
+}
+
+function backendGit(
+	executionBackend,
+	workspaceId,
+	argv,
+	options,
+	stage,
+	{ retryLostResult = false } = {},
+) {
 	emitProbeStatus(options, "task_base_probe_started", stage);
 	try {
-		const output = execFileSync(execution.command, execution.args, {
-			encoding: "utf8",
-			stdio: "pipe",
-			timeout: probeRemainingMs(options),
-			killSignal: "SIGKILL",
-			signal: options.signal,
-		});
+		const run = () => {
+			const execution = backendExecution(
+				executionBackend,
+				workspaceId,
+				argv,
+				options,
+			);
+			return execFileSync(execution.command, execution.args, {
+				encoding: "utf8",
+				stdio: "pipe",
+				timeout: probeRemainingMs(options),
+				killSignal: "SIGKILL",
+				signal: options.signal,
+			});
+		};
+		let output;
+		try {
+			output = run();
+		} catch (error) {
+			if (!retryLostResult || !isParallelsLostResult(error)) throw error;
+			emitTaskBaseRecovery(options, stage, "replay");
+			output = run();
+		}
 		emitProbeStatus(options, "task_base_probe_completed", stage);
 		return output;
 	} catch (error) {
@@ -502,42 +541,57 @@ function backendGit(executionBackend, workspaceId, argv, options, stage) {
 	}
 }
 
-function backendGitAsync(executionBackend, workspaceId, argv, options, stage) {
-	const execution = backendExecution(
-		executionBackend,
-		workspaceId,
-		argv,
-		options,
-	);
+function backendGitAsync(
+	executionBackend,
+	workspaceId,
+	argv,
+	options,
+	stage,
+	{ retryLostResult = false } = {},
+) {
 	emitProbeStatus(options, "task_base_probe_started", stage);
-	let timeout;
-	try {
-		timeout = probeRemainingMs(options);
-	} catch (error) {
-		emitProbeStatus(options, "task_base_probe_failed", stage);
-		return Promise.reject(error);
-	}
-	return new Promise((resolve, reject) => {
-		execFile(
-			execution.command,
-			execution.args,
-			{
-				encoding: "utf8",
-				timeout,
-				killSignal: "SIGKILL",
-				signal: options.signal,
-			},
-			(error, stdout) => {
-				if (error) {
-					emitProbeStatus(options, "task_base_probe_failed", stage);
-					reject(error);
-					return;
-				}
-				emitProbeStatus(options, "task_base_probe_completed", stage);
-				resolve(stdout);
-			},
+	const run = () => {
+		const execution = backendExecution(
+			executionBackend,
+			workspaceId,
+			argv,
+			options,
 		);
-	});
+		return new Promise((resolve, reject) => {
+			execFile(
+				execution.command,
+				execution.args,
+				{
+					encoding: "utf8",
+					timeout: probeRemainingMs(options),
+					killSignal: "SIGKILL",
+					signal: options.signal,
+				},
+				(error, stdout) => {
+					if (error) {
+						reject(error);
+						return;
+					}
+					resolve(stdout);
+				},
+			);
+		});
+	};
+	return Promise.resolve()
+		.then(run)
+		.catch(async (error) => {
+			if (!retryLostResult || !isParallelsLostResult(error)) throw error;
+			emitTaskBaseRecovery(options, stage, "replay");
+			return run();
+		})
+		.then((output) => {
+			emitProbeStatus(options, "task_base_probe_completed", stage);
+			return output;
+		})
+		.catch((error) => {
+			emitProbeStatus(options, "task_base_probe_failed", stage);
+			throw error;
+		});
 }
 
 /**
@@ -562,6 +616,7 @@ export function captureTaskStartTree(
 		["add", "-A"],
 		options,
 		"task_base_stage",
+		{ retryLostResult: true },
 	);
 	const tree = taskBaseTree(
 		backendGit(
@@ -570,16 +625,38 @@ export function captureTaskStartTree(
 			["write-tree"],
 			options,
 			"task_base_write",
+			{ retryLostResult: true },
 		).trim(),
 	);
 	const ref = `${TASK_BASE_REF_PREFIX}/${safeRunId}/${safeTaskId}`;
-	backendGit(
-		executionBackend,
-		workspaceId,
-		["update-ref", ref, tree, ZERO_OBJECT_ID],
-		options,
-		"task_base_anchor",
-	);
+	try {
+		backendGit(
+			executionBackend,
+			workspaceId,
+			["update-ref", ref, tree, ZERO_OBJECT_ID],
+			options,
+			"task_base_anchor",
+		);
+	} catch (error) {
+		if (!isParallelsLostResult(error)) throw error;
+		let observed;
+		try {
+			observed = taskBaseTree(
+				backendGit(
+					executionBackend,
+					workspaceId,
+					["rev-parse", "--verify", `${ref}^{tree}`],
+					options,
+					"task_base_anchor_reconcile",
+					{ retryLostResult: true },
+				).trim(),
+			);
+		} catch {
+			throw error;
+		}
+		if (observed !== tree) throw error;
+		emitTaskBaseRecovery(options, "task_base_anchor", "reconcile");
+	}
 	return { ref, tree };
 }
 
@@ -600,6 +677,7 @@ export async function captureTaskStartTreeAsync(
 		["add", "-A"],
 		options,
 		"task_base_stage",
+		{ retryLostResult: true },
 	);
 	const tree = taskBaseTree(
 		(
@@ -609,17 +687,41 @@ export async function captureTaskStartTreeAsync(
 				["write-tree"],
 				options,
 				"task_base_write",
+				{ retryLostResult: true },
 			)
 		).trim(),
 	);
 	const ref = `${TASK_BASE_REF_PREFIX}/${safeRunId}/${safeTaskId}`;
-	await backendGitAsync(
-		executionBackend,
-		workspaceId,
-		["update-ref", ref, tree, ZERO_OBJECT_ID],
-		options,
-		"task_base_anchor",
-	);
+	try {
+		await backendGitAsync(
+			executionBackend,
+			workspaceId,
+			["update-ref", ref, tree, ZERO_OBJECT_ID],
+			options,
+			"task_base_anchor",
+		);
+	} catch (error) {
+		if (!isParallelsLostResult(error)) throw error;
+		let observed;
+		try {
+			observed = taskBaseTree(
+				(
+					await backendGitAsync(
+						executionBackend,
+						workspaceId,
+						["rev-parse", "--verify", `${ref}^{tree}`],
+						options,
+						"task_base_anchor_reconcile",
+						{ retryLostResult: true },
+					)
+				).trim(),
+			);
+		} catch {
+			throw error;
+		}
+		if (observed !== tree) throw error;
+		emitTaskBaseRecovery(options, "task_base_anchor", "reconcile");
+	}
 	return { ref, tree };
 }
 

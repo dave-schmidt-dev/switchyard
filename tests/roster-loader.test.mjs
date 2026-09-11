@@ -1249,6 +1249,7 @@ describe("roster loader — provider vocabularies and real-roster coherence", ()
 			"--variant",
 			"thinking",
 		]);
+		deepStrictEqual(mapInvocationArgs("opencode", { variant: "default" }), []);
 		deepStrictEqual(mapInvocationArgs("opencode", {}), []);
 		strictEqual(mapInvocationArgs("agy", { effort: "high" }), null);
 		strictEqual(mapInvocationArgs("cursor", { variant: "high" }), null);
