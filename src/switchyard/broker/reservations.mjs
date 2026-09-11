@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const LEDGER_VERSION = 1;
@@ -70,21 +70,12 @@ export function createReservationLedger(options = {}) {
 	const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
 	const lockRetryMs = options.lockRetryMs ?? DEFAULT_LOCK_RETRY_MS;
 	const lockStaleMs = options.lockStaleMs ?? DEFAULT_LEASE_MS;
+	// An ownerless lock is bounded by the acquisition timeout, not the lease:
+	// see `recoverOwnerlessLock`.
+	const ownerlessLockStaleMs = options.ownerlessLockStaleMs ?? lockTimeoutMs;
 	const makeId = options.makeId ?? randomUUID;
 
-	async function recoverStaleLock() {
-		let owner;
-		try {
-			owner = JSON.parse(
-				await readFile(resolve(lockPath, "owner.json"), "utf8"),
-			);
-		} catch {
-			return false;
-		}
-		const expired =
-			Number.isFinite(owner.acquiredAt) &&
-			owner.acquiredAt + lockStaleMs <= now();
-		if (!expired && ownerAlive(owner.pid) !== false) return false;
+	async function reclaimLock() {
 		const stalePath = resolve(root, `.reservations.lock.stale.${randomUUID()}`);
 		try {
 			await rename(lockPath, stalePath);
@@ -94,6 +85,43 @@ export function createReservationLedger(options = {}) {
 		}
 		await rm(stalePath, { recursive: true, force: true });
 		return true;
+	}
+
+	/**
+	 * A lock directory whose `owner.json` never became readable names no owner,
+	 * so liveness cannot be tested. It is either a live acquirer inside the
+	 * `mkdir` -> `writeFile` publication gap or the debris of one that died
+	 * there. That gap is microseconds wide, so the directory's own mtime decides
+	 * — against the short acquisition bound rather than `lockStaleMs`, since
+	 * holding an unrecoverable lock for a full lease would fail every reserve
+	 * for that lease's duration, which is the wedge this recovers from.
+	 */
+	async function recoverOwnerlessLock() {
+		let stats;
+		try {
+			stats = await stat(lockPath);
+		} catch (error) {
+			if (error?.code === "ENOENT") return true;
+			throw error;
+		}
+		if (stats.mtimeMs + ownerlessLockStaleMs > now()) return false;
+		return await reclaimLock();
+	}
+
+	async function recoverStaleLock() {
+		let owner;
+		try {
+			owner = JSON.parse(
+				await readFile(resolve(lockPath, "owner.json"), "utf8"),
+			);
+		} catch {
+			return await recoverOwnerlessLock();
+		}
+		const expired =
+			Number.isFinite(owner.acquiredAt) &&
+			owner.acquiredAt + lockStaleMs <= now();
+		if (!expired && ownerAlive(owner.pid) !== false) return false;
+		return await reclaimLock();
 	}
 
 	async function acquireLock() {

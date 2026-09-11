@@ -1,5 +1,5 @@
 import { notStrictEqual, rejects, strictEqual } from "node:assert";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, utimes, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -224,5 +224,53 @@ describe("broker reservations", () => {
 			capacity: 1,
 		});
 		strictEqual(reservation.id, "reservation-1");
+	});
+
+	it("recovers a lock abandoned before its owner record was published", async () => {
+		const root = await tempDirAsync("switchyard-reservations-ownerless-");
+		const lockPath = join(root, "reservations.lock");
+		await mkdir(lockPath);
+		const aged = (Date.now() - 60_000) / 1000;
+		await utimes(lockPath, aged, aged);
+		const ledger = createReservationLedger({
+			root,
+			ownerlessLockStaleMs: 5_000,
+			makeId: () => "reservation-1",
+		});
+		const reservation = await ledger.reserve({
+			provider: "Codex",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-001",
+			ownerId: "owner-1",
+			ownerPid: 202,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		strictEqual(reservation.id, "reservation-1");
+	});
+
+	it("refuses a freshly created ownerless lock rather than stealing it", async () => {
+		const root = await tempDirAsync("switchyard-reservations-ownerless-fresh-");
+		await mkdir(join(root, "reservations.lock"));
+		const ledger = createReservationLedger({
+			root,
+			ownerlessLockStaleMs: 60_000,
+			lockTimeoutMs: 50,
+			lockRetryMs: 5,
+		});
+		await rejects(
+			ledger.reserve({
+				provider: "Codex",
+				window: "window-1",
+				runId: "run-1",
+				taskId: "TASK-001",
+				ownerId: "owner-1",
+				ownerPid: 202,
+				estimatedConsumption: 1,
+				capacity: 1,
+			}),
+			/timed out acquiring broker reservation lock/,
+		);
 	});
 });
