@@ -13,6 +13,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { snapshotAdmissionFailure } from "../broker/snapshots.mjs";
 import {
 	CAPABILITY_CLASS,
 	getImplementorPriority,
@@ -550,9 +551,25 @@ export function preflightMacosQueue(options = {}) {
 		checkedCapabilities: [...taskTiers],
 	};
 
-	if (!snapshot || snapshotRead?.snapshotStatus === "malformed") {
+	// One admission rule, shared with the broker (`snapshotAdmissionFailure`).
+	// Preflight used to refuse only a malformed or missing snapshot, so a stale
+	// or future generation passed here and was refused later by the broker --
+	// after the queue had already paid for workspace create, provision and seed.
+	// Refusing on the same terms puts that cost behind the same gate. Production
+	// wires no snapshot refresh hook, so the broker's one refresh attempt cannot
+	// rescue a stale read there either; if one is ever wired, mirror it here.
+	const admissionFailure = !snapshot
+		? "snapshot_malformed"
+		: snapshotAdmissionFailure(snapshotRead?.snapshotStatus);
+	if (admissionFailure !== null) {
+		const reason =
+			admissionFailure === "snapshot_future"
+				? "routing_snapshot_future"
+				: admissionFailure === "snapshot_stale"
+					? "routing_snapshot_stale"
+					: "routing_snapshot_unavailable";
 		const rejections = taskTiers.map((capability) =>
-			rejectionFor(capability, "routing_snapshot_unavailable"),
+			rejectionFor(capability, reason),
 		);
 		return {
 			...baseResult,

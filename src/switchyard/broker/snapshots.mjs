@@ -44,6 +44,24 @@ function normalizeRead(value, source, nowMs, maxAgeMs) {
 	});
 }
 
+/**
+ * The one admission rule for a snapshot generation, shared by everything that
+ * decides whether a routing observation may be acted on. It exists so queue
+ * preflight and the broker cannot drift: before this, preflight refused only a
+ * malformed or missing snapshot and let a stale or future one through, so a
+ * queue paid full workspace allocation for quota the broker was always going
+ * to refuse.
+ *
+ * @param {string|null|undefined} status normalized snapshot status
+ * @returns {string|null} failure code, or null when the snapshot is admissible
+ */
+export function snapshotAdmissionFailure(status) {
+	if (status === "fresh") return null;
+	if (status === "future") return "snapshot_future";
+	if (status === "stale") return "snapshot_stale";
+	return "snapshot_malformed";
+}
+
 /** Read one snapshot generation, refreshing a stale source exactly once. */
 export function createSnapshotCoordinator(options = {}) {
 	if (typeof options.read !== "function") {
@@ -68,17 +86,19 @@ export function createSnapshotCoordinator(options = {}) {
 
 	async function prepare(source) {
 		let current = await readOnce(source);
-		if (current.snapshotStatus === "future") {
+		let failure = snapshotAdmissionFailure(current.snapshotStatus);
+		if (failure === "snapshot_future") {
 			throw new BrokerSnapshotError("snapshot_future");
 		}
-		if (current.snapshotStatus === "fresh") return current;
+		if (failure === null) return current;
 
 		await refresh({ source });
 		current = await readOnce(source);
-		if (current.snapshotStatus === "future") {
+		failure = snapshotAdmissionFailure(current.snapshotStatus);
+		if (failure === "snapshot_future") {
 			throw new BrokerSnapshotError("snapshot_future");
 		}
-		if (current.snapshotStatus !== "fresh") {
+		if (failure !== null) {
 			throw new BrokerSnapshotError("snapshot_stale_after_refresh");
 		}
 		return current;

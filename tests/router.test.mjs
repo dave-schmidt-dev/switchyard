@@ -57,6 +57,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { createSnapshotCoordinator } from "../src/switchyard/broker/snapshots.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__resetRosterCacheForTests,
@@ -1799,6 +1800,112 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 			};
 		};
 	}
+
+	// F6: preflight used to admit a stale or future snapshot that the broker
+	// would refuse moments later, after the queue had already paid for workspace
+	// create/provision/seed. Both now decide on one shared rule, so the two
+	// cannot disagree about any generation.
+	describe("snapshot admission parity with the broker", () => {
+		const fundedSnapshot = () =>
+			snapshotFor({
+				name: "codex",
+				ok: true,
+				windows: [{ percent_left: 80, pace_delta: 1 }],
+			});
+
+		async function brokerAdmits(read) {
+			const coordinator = createSnapshotCoordinator({ read });
+			try {
+				await coordinator.prepare("gradus-v2");
+				return true;
+			} catch {
+				return false;
+			}
+		}
+
+		function preflightAdmits(snapshotStatus, snapshot = fundedSnapshot()) {
+			const result = preflightMacosQueue({
+				tasks: [{ id: "t", status: "pending", requiredCapability: "standard" }],
+				goldenImageVerifiedProviders: ["codex"],
+				readSnapshot: () => ({
+					snapshot,
+					snapshotStatus,
+					snapshotMtime: 1,
+					snapshotAgeMsAtRoute: 0,
+				}),
+			});
+			return result;
+		}
+
+		// Each case pairs the normalized status preflight sees with a raw
+		// `updated_at` the broker's own normalizer classifies the same way, so
+		// neither side is told the answer.
+		const cases = [
+			{ status: "fresh", updatedAtMs: 0, admitted: true },
+			{ status: "stale", updatedAtMs: -10 * 60 * 1000, admitted: false },
+			{ status: "future", updatedAtMs: 60 * 1000, admitted: false },
+		];
+
+		for (const { status, updatedAtMs, admitted } of cases) {
+			it(`admits a ${status} snapshot on both sides: ${admitted}`, async () => {
+				const preflight = preflightAdmits(status);
+				strictEqual(preflight.eligible, admitted);
+				// Assert the cause, not just the verdict: before the shared rule,
+				// a stale or future snapshot that reached the eligibility loop
+				// could be refused for an unrelated quota reason, which would make
+				// a bare `eligible === false` assertion prove nothing.
+				if (!admitted) {
+					strictEqual(preflight.rejection.reason, `routing_snapshot_${status}`);
+				}
+				strictEqual(
+					await brokerAdmits(({ nowMs }) => ({
+						snapshot: {
+							schema_version: 2,
+							updated_at: new Date(nowMs + updatedAtMs).toISOString(),
+							providers: [
+								{
+									name: "codex",
+									ok: true,
+									windows: [{ percent_left: 80, pace_delta: 1 }],
+								},
+							],
+						},
+						snapshotMtime: 1,
+					})),
+					admitted,
+				);
+			});
+		}
+
+		it("names why a refused snapshot was refused", () => {
+			strictEqual(
+				preflightAdmits("stale").rejection.reason,
+				"routing_snapshot_stale",
+			);
+			strictEqual(
+				preflightAdmits("future").rejection.reason,
+				"routing_snapshot_future",
+			);
+			strictEqual(
+				preflightAdmits("malformed").rejection.reason,
+				"routing_snapshot_unavailable",
+			);
+			strictEqual(
+				preflightAdmits("fresh", null).rejection.reason,
+				"routing_snapshot_unavailable",
+			);
+		});
+
+		it("refuses before anything is allocated", () => {
+			// preflight is a pure decision; the proof that nothing was allocated
+			// is that it refuses without the queue ever being entered. The runner
+			// turns !ok into QueuePreflightError before backend bootstrap.
+			const result = preflightAdmits("stale");
+			strictEqual(result.ok, false);
+			strictEqual(result.reason, "provider_eligibility_preflight_failed");
+			deepStrictEqual(result.capabilityResults, []);
+		});
+	});
 
 	it("reads one snapshot for all tiers and counts blocked tasks as non-terminal", () => {
 		const reads = [];
