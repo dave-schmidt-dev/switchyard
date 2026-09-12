@@ -405,6 +405,9 @@ export function createBroker(dependencies = {}) {
 			reservations
 				.renew({ reservationId, ownerId })
 				.then((outcome) => {
+					// A tick already in flight when the terminal write lands reads the
+					// reconciled record and would report a loss on a task that succeeded.
+					if (stopped) return;
 					if (outcome?.renewed) return;
 					report("reservation_renewal_lost", {
 						reason: outcome?.reason ?? "unknown",
@@ -412,6 +415,7 @@ export function createBroker(dependencies = {}) {
 					stop();
 				})
 				.catch((error) => {
+					if (stopped) return;
 					// Transient: keep renewing, or one lock timeout would surrender
 					// the reservation for the remainder of the run.
 					report("reservation_renewal_failed", {

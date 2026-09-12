@@ -458,6 +458,45 @@ describe("broker reservations", () => {
 		);
 	});
 
+	it("does not report renewal loss for a task that already succeeded", async () => {
+		const ledger = await fixture({ leaseMs: 1_000 });
+		let releaseRenew = () => {};
+		const renewGate = new Promise((resolve) => {
+			releaseRenew = resolve;
+		});
+		// Park the in-flight tick until after the terminal write so the renewal
+		// resolves against a record the broker has already reconciled.
+		const parked = {
+			...ledger,
+			renew: async (input) => {
+				await renewGate;
+				return await ledger.renew(input);
+			},
+		};
+		const events = [];
+		const broker = createBroker({
+			...dependencies(parked, 4),
+			getInvocationDescriptor: () => codexDescriptor(),
+			reservationRenewIntervalMs: 5,
+			executor: async () => {
+				await new Promise((done) => setTimeout(done, 40));
+				return { success: true };
+			},
+		});
+		const result = await broker.selectAndReserve(request("TASK-001"));
+		const execution = await broker.execute(request("TASK-001"), result, {
+			launcherIdentity: broker.launcherIdentity(result),
+			onStatus: (status) => events.push(status),
+		});
+		strictEqual(execution.success, true);
+		releaseRenew();
+		await new Promise((done) => setTimeout(done, 20));
+		deepStrictEqual(
+			events.filter((event) => event.event === "reservation_renewal_lost"),
+			[],
+		);
+	});
+
 	it("refuses a freshly created ownerless lock rather than stealing it", async () => {
 		const root = await tempDirAsync("switchyard-reservations-ownerless-fresh-");
 		await mkdir(join(root, "reservations.lock"));

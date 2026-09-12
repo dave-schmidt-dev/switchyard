@@ -519,6 +519,15 @@ available adapter but no clone-survival proof is rejected
 This is a launch gate only: quota can drain while the queue runs, so passing
 preflight does not guarantee every later task.
 
+Preflight applies the broker's snapshot admission rule, not a weaker one. Both
+call `snapshotAdmissionFailure()` (`broker/snapshots.mjs`), so a snapshot that
+the broker would refuse at reservation time — stale, future-dated, or
+unreadable — is refused before a working VM exists, with the matching closed
+reason `routing_snapshot_stale`, `routing_snapshot_future`, or
+`routing_snapshot_unavailable`. Previously preflight rejected only a malformed
+snapshot and admitted a stale or future one, so a queue could pass admission,
+allocate a VM, and then have the broker refuse every task.
+
 Preflight and per-task routing share one eligibility predicate,
 `evaluateCandidateEligibility` (`router/index.mjs`), so a provider cannot pass
 admission on one rule set and be rejected at routing on another. Its closed
@@ -691,6 +700,23 @@ Provider diagnostics have a separate sanitized evidence artifact. On a failed pr
 Patches are captured against the recorded task-start tree, not the working VM's current `HEAD`. The runner records the seeded base tree when a task starts (`_activeTaskBase`), the adapter lifecycle exports the diff relative to that tree even if the provider committed inside the workspace, and a missing recorded tree is a capture failure, never a fallback to `HEAD`. Completion continuations and integration intents pin the same `baseTree`.
 
 Checkpoint integration transitions are crash safe. `acquireCheckpointLease(checkpointPath, owner)` takes `<checkpoint>.lock` for an owner built from the run id, the process-start identity, and a nonce; an existing or malformed lease fails closed rather than being stolen, and every checkpoint write is revision-checked through a unique atomic staging file. Before `applyReviewedDiff` touches the project, the checkpoint records an integration intent per task (`integrationIntents`: `baseTree`, the sha256 `patchHash` of the exact patch, and the declared paths). A crash between intent and completion leaves an intent that the next writer must either complete against the same patch or report as `integration_state_unknown` ("integration intent displaced" or "could not be durably persisted"); it is never silently retried against a different patch.
+
+Reservation leases are held for as long as execution runs, not for a fixed
+window. A broker reservation's lease defaults to 15 minutes while
+`PROVIDER_EXECUTION_TIMEOUT_MS` allows 30, so `broker.execute` heartbeats
+`reservations.renew()` every 60 s (`reservationRenewIntervalMs`) for the life of
+the execution and stops on the terminal write. A renewal that finds the record
+superseded, reclaimed, or already reconciled reports a closed reason on the
+status channel and stops; it never rewrites the record. Each record also carries
+a monotonic `fence` that a takeover increments, so a superseded writer's
+`terminal()` is refused by both owner identity and stale fence rather than
+overwriting the new owner's outcome. The lock itself is a directory
+(`reservations.lock`) plus an `owner.json` published inside it. Recovery of a
+held lock requires a proven-dead owner; a lock with no `owner.json` — the crash
+window between `mkdir` and the owner write — is reclaimed only after
+`ownerlessLockStaleMs`, which defaults to the lock **acquisition timeout**
+(seconds) rather than the lease, since a lease-length threshold would wedge
+every writer for 15 minutes on a crash that left no owner.
 
 Run lifecycle timestamps are durable independent fields: `createdAt` identifies initialization, `startedAt` is set when the run enters `running`, `finishedAt` is terminalization time, `activeTaskStartedAt` marks task start, and `lastCompletionAt` advances only after a successful task. `queueStartedAt` is a derived output alias of `createdAt`, not a durable field. `status`/`result` derive `elapsedMs`, `elapsedSinceLastCompletionMs`, `activeTaskAgeMs`, and `activeTaskRemainingMs`; these ages are output telemetry, not durable fields. Failures do not overwrite a prior successful completion timestamp, and an inactive task reports a null active age. These fields are not a provider liveness or completion guarantee.
 
