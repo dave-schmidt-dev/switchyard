@@ -502,8 +502,13 @@ export function createReservationLedger(options = {}) {
 				// Distinguish the result-loss path from an ordinary double
 				// terminal: recovery released this reservation while its owner was
 				// still working, so the outcome now being reported has nowhere to
-				// land. The generic message hid that.
-				if (record.terminalReason === "owner_recovered") {
+				// land. The generic message hid that. Losing the shared account row
+				// mid-lease releases the reservation the same way, so it reports the
+				// same loss rather than reading as a caller mistake.
+				if (
+					record.terminalReason === "owner_recovered" ||
+					record.terminalReason === "account_lost"
+				) {
 					throw new Error(
 						"reservation was reclaimed before its owner finalized",
 					);

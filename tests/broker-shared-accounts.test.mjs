@@ -8,7 +8,7 @@
 // with neither ledger ever recording an overdraft. The cases below run two
 // ledgers against one account root, which is the only shape that catches it.
 
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -210,6 +210,30 @@ describe("shared account reservations", () => {
 		const record = (await one.inspect()).reservations[0];
 		strictEqual(record.state, "released");
 		strictEqual(record.terminalReason, "account_lost");
+	});
+
+	it("reports a finalized result that lost its account row as result loss", async () => {
+		// The owner keeps executing after the account row is gone, so its terminal
+		// write still arrives. It must read as a lost result, not as the caller
+		// double-terminating a reservation it never finalized once.
+		let clock = 1_700_000_000_000;
+		const now = () => clock;
+		const one = reservationLedger({ leaseMs: 1_000, now });
+		const other = reservationLedger({ leaseMs: 10_000, now });
+		const held = await one.reserve(reservation("TASK-A", 2));
+		clock += 1_001;
+		ok(await other.reserve(reservation("TASK-B", 2)));
+		clock -= 1_001;
+		await one.renew({ reservationId: held.id, ownerId: "owner-TASK-A" });
+		await rejects(
+			one.terminal({
+				reservationId: held.id,
+				ownerId: "owner-TASK-A",
+				outcome: "success",
+				actualConsumption: 2,
+			}),
+			/reservation was reclaimed before its owner finalized/,
+		);
 	});
 
 	it("re-admits a renewal when the account window still has room", async () => {
