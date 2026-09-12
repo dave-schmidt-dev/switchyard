@@ -2,6 +2,7 @@ import { rejects, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import { createBroker } from "../src/switchyard/broker/index.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { accountingWindowKey } from "../src/switchyard/broker/snapshots.mjs";
 
 const NOW = Date.parse("2026-08-16T12:00:00.000Z");
 
@@ -183,6 +184,179 @@ describe("broker snapshot freshness", () => {
 				snapshotSource: "/tmp/arbitrary-caller-path",
 			}),
 			/snapshot_source_unknown/,
+		);
+	});
+});
+
+function capturingLedger() {
+	const windows = [];
+	return {
+		get windows() {
+			return windows;
+		},
+		async reserveWithSelection(select) {
+			const selected = await select([]);
+			if (!selected) return null;
+			windows.push(selected.window);
+			return {
+				id: `reservation-${windows.length}`,
+				provider: selected.provider,
+				runId: selected.runId,
+				taskId: selected.taskId,
+				amount: selected.estimatedConsumption,
+			};
+		},
+		async terminal() {
+			return { changed: true };
+		},
+	};
+}
+
+function windowedDependencies(reservations, accountingWindows, snapshotMtime) {
+	return dependencies({
+		reservations,
+		readSnapshot: async () => ({
+			...snapshot(new Date(NOW - 1_000).toISOString()),
+			snapshotMtime,
+		}),
+		route: ({ snapshotRead }) => ({
+			provider: "Codex",
+			model: "codex-standard",
+			resolvedTargetId: "codex",
+			reason: "ranked",
+			snapshotStatus: snapshotRead.snapshotStatus,
+			snapshotMtime: snapshotRead.snapshotMtime,
+			snapshotAgeMsAtRoute: snapshotRead.snapshotAgeMsAtRoute,
+			accountingWindows,
+		}),
+	});
+}
+
+describe("broker accounting window", () => {
+	it("charges two dispatches to one window when the quota bucket has not reset", async () => {
+		// Telemetry is rewritten constantly; only a real reset may retire a window.
+		const reservations = capturingLedger();
+		const windows = [{ id: "weekly", reset_iso: "2026-08-18T02:00:00.000Z" }];
+		await createBroker(
+			windowedDependencies(reservations, windows, 111),
+		).selectAndReserve(request());
+		await createBroker(
+			windowedDependencies(reservations, windows, 222),
+		).selectAndReserve(request());
+		strictEqual(reservations.windows.length, 2);
+		strictEqual(reservations.windows[0], reservations.windows[1]);
+	});
+
+	it("opens a new window once the bucket resets", async () => {
+		const reservations = capturingLedger();
+		await createBroker(
+			windowedDependencies(
+				reservations,
+				[{ id: "weekly", reset_iso: "2026-08-18T02:00:00.000Z" }],
+				111,
+			),
+		).selectAndReserve(request());
+		await createBroker(
+			windowedDependencies(
+				reservations,
+				[{ id: "weekly", reset_iso: "2026-08-25T02:00:00.000Z" }],
+				111,
+			),
+		).selectAndReserve(request());
+		strictEqual(reservations.windows.length, 2);
+		strictEqual(reservations.windows[0] === reservations.windows[1], false);
+	});
+
+	it("falls back to the snapshot generation when the route carries no windows", async () => {
+		const reservations = capturingLedger();
+		await createBroker(
+			windowedDependencies(reservations, null, 111),
+		).selectAndReserve(request());
+		await createBroker(
+			windowedDependencies(reservations, null, 222),
+		).selectAndReserve(request());
+		strictEqual(reservations.windows[0], "gradus-v2@111");
+		strictEqual(reservations.windows[1], "gradus-v2@222");
+	});
+});
+
+describe("accounting window identity", () => {
+	it("does not mint a new window when telemetry is rewritten with unchanged quota", () => {
+		const windows = [{ id: "weekly", reset_iso: "2026-09-14T22:35:00-04:00" }];
+		strictEqual(
+			accountingWindowKey("gradus-v2", windows, 1000),
+			accountingWindowKey("gradus-v2", windows, 2000),
+		);
+	});
+
+	it("mints a new window when the bucket actually resets", () => {
+		const before = [{ id: "weekly", reset_iso: "2026-09-14T22:35:00-04:00" }];
+		const after = [{ id: "weekly", reset_iso: "2026-09-21T22:35:00-04:00" }];
+		strictEqual(
+			accountingWindowKey("gradus-v2", before, 1000) ===
+				accountingWindowKey("gradus-v2", after, 1000),
+			false,
+		);
+	});
+
+	it("fingerprints every simultaneous bucket, in a stable order", () => {
+		// A task on a dual-window provider draws on both, so either rolling over
+		// has to invalidate the reservation.
+		const fiveHourFirst = [
+			{ id: "five_hour", reset_iso: "2026-09-12T00:31:00-04:00" },
+			{ id: "weekly", reset_iso: "2026-09-15T18:09:00-04:00" },
+		];
+		const weeklyFirst = [fiveHourFirst[1], fiveHourFirst[0]];
+		strictEqual(
+			accountingWindowKey("gradus-v2", fiveHourFirst, 1000),
+			accountingWindowKey("gradus-v2", weeklyFirst, 1000),
+		);
+		const rolled = [
+			fiveHourFirst[0],
+			{ id: "weekly", reset_iso: "2026-09-22T18:09:00-04:00" },
+		];
+		strictEqual(
+			accountingWindowKey("gradus-v2", fiveHourFirst, 1000) ===
+				accountingWindowKey("gradus-v2", rolled, 1000),
+			false,
+		);
+	});
+
+	it("reads one instant written two ways as one window", () => {
+		strictEqual(
+			accountingWindowKey(
+				"gradus-v2",
+				[{ id: "weekly", reset_iso: "2026-09-14T22:35:00-04:00" }],
+				1000,
+			),
+			accountingWindowKey(
+				"gradus-v2",
+				[{ id: "weekly", reset_iso: "2026-09-15T02:35:00.000Z" }],
+				1000,
+			),
+		);
+	});
+
+	it("keeps an unparseable reset value verbatim rather than discarding it", () => {
+		strictEqual(
+			accountingWindowKey(
+				"gradus-v2",
+				[{ id: "weekly", reset_iso: "soon" }],
+				1000,
+			),
+			"gradus-v2@weekly:soon",
+		);
+	});
+
+	it("keeps the generation key when no bucket reports an identity", () => {
+		strictEqual(accountingWindowKey("gradus-v2", [], 1000), "gradus-v2@1000");
+		strictEqual(
+			accountingWindowKey("gradus-v2", null, "fresh"),
+			"gradus-v2@fresh",
+		);
+		strictEqual(
+			accountingWindowKey("gradus-v2", [{ percent_left: 50 }], 1000),
+			"gradus-v2@1000",
 		);
 	});
 });

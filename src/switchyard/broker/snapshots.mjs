@@ -63,6 +63,51 @@ export function snapshotAdmissionFailure(status) {
 }
 
 /** Read one snapshot generation, refreshing a stale source exactly once. */
+/**
+ * The identity of the quota bucket generation a reservation is accounted
+ * against.
+ *
+ * Before this, the window was `<source>@<snapshot mtime>`: every rewrite of the
+ * telemetry file minted a fresh accounting window, so two tasks reserved
+ * against the *same* real bucket could both be admitted at capacity 1 simply
+ * because the file had been touched between them. A bucket's identity is its
+ * own reset boundary, not the age of the file that reported it, so a real reset
+ * mints a new window and a rewrite carrying unchanged quota does not.
+ *
+ * Providers with simultaneous buckets (a five-hour and a weekly, say) are
+ * fingerprinted across all of them: one task draws on every bucket it is
+ * eligible under, so the reservation has to be invalidated when any of them
+ * rolls over. Windows with no reset boundary contribute their id alone.
+ *
+ * @param {string} source snapshot source identifier
+ * @param {ReadonlyArray<{id?: string, reset_iso?: string}>|null|undefined} windows
+ * @param {string|number|null} fallbackGeneration used when no bucket reports an identity
+ * @returns {string}
+ */
+// The same instant may be written "…-04:00" or "…Z". Identity is the instant,
+// not the spelling, or a formatting change in telemetry would retire a window
+// that never reset.
+function normalizeResetInstant(value) {
+	if (typeof value !== "string" || value === "") return "";
+	const parsed = Date.parse(value);
+	return Number.isNaN(parsed) ? value : new Date(parsed).toISOString();
+}
+
+export function accountingWindowKey(source, windows, fallbackGeneration) {
+	const parts = (windows ?? [])
+		.map((window) => {
+			const id = typeof window?.id === "string" ? window.id : "";
+			const reset = normalizeResetInstant(window?.reset_iso);
+			return id || reset ? `${id}:${reset}` : "";
+		})
+		.filter((part) => part !== "")
+		.sort();
+	// No bucket identity at all: keep the previous generation-based key rather
+	// than collapsing every provider onto one shared window.
+	if (parts.length === 0) return `${source}@${fallbackGeneration}`;
+	return `${source}@${parts.join("|")}`;
+}
+
 export function createSnapshotCoordinator(options = {}) {
 	if (typeof options.read !== "function") {
 		throw new TypeError("snapshot dependency read must be a function");

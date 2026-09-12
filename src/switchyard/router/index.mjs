@@ -935,6 +935,10 @@ export function route(options = {}) {
 						percentLeft: acWindow.percent_left,
 						pace: computePace([acWindow]),
 						priority,
+						// The bucket this candidate would actually draw on. Cursor's
+						// ac and ap are separate accounts, so the reservation must be
+						// keyed to the one that wins, not to both.
+						accountingWindows: [acWindow],
 					});
 					log.push(
 						`provider ${name}: eligible for priority fill via ac (${acWindow.percent_left}% left, priority ${priority})`,
@@ -958,6 +962,7 @@ export function route(options = {}) {
 						name,
 						percentLeft: apWindow.percent_left,
 						pace: computePace([apWindow]),
+						accountingWindows: [apWindow],
 					});
 					log.push(
 						`provider ${name}: eligible as last-resort via ap (${apWindow.percent_left}% left)`,
@@ -993,6 +998,7 @@ export function route(options = {}) {
 					percentLeft: minPercentLeft,
 					pace: computePace(windows),
 					priority,
+					accountingWindows: windows,
 				});
 				log.push(
 					`provider ${name}: eligible for priority fill (${minPercentLeft}% left, priority ${priority})`,
@@ -1016,7 +1022,12 @@ export function route(options = {}) {
 		}
 
 		const pace = computePace(windows);
-		unrankedPool.push({ name, percentLeft: minPercentLeft, pace });
+		unrankedPool.push({
+			name,
+			percentLeft: minPercentLeft,
+			pace,
+			accountingWindows: windows,
+		});
 		log.push(
 			`provider ${name}: eligible (${minPercentLeft}% left, pace=${pace})`,
 		);
@@ -1138,6 +1149,11 @@ export function route(options = {}) {
 		percentLeft: winner.percentLeft,
 		resolvedTargetId: resolveTargetId(winner.name),
 		requiredCapability: effectiveCapabilityClass,
+		// The exact quota buckets this selection draws on, carried so the broker
+		// can key a reservation to the real accounting window instead of to the
+		// snapshot file's mtime. Observation metadata stays in
+		// `snapshotDiagnostics`; this is billing identity.
+		accountingWindows: winner.accountingWindows ?? null,
 		reason,
 		log,
 		...snapshotDiagnostics,

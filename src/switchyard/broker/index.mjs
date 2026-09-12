@@ -11,7 +11,10 @@ import {
 	validateBrokerRequest,
 	validateBrokerResult,
 } from "./schema.mjs";
-import { createSnapshotCoordinator } from "./snapshots.mjs";
+import {
+	accountingWindowKey,
+	createSnapshotCoordinator,
+} from "./snapshots.mjs";
 
 function requireDependency(value, label) {
 	if (typeof value !== "function") {
@@ -137,6 +140,10 @@ export function createBroker(dependencies = {}) {
 		if (!routed || typeof routed !== "object" || Array.isArray(routed)) {
 			throw new Error("router returned a malformed result");
 		}
+		// The raw route carries the winner's quota buckets, which the closed
+		// broker result schema does not admit. Hand them to the caller here
+		// rather than widening a contract-gated shape for one internal reader.
+		selectionOptions.onRouted?.(routed);
 
 		const snapshotIdentity = {
 			source: request.snapshotSource,
@@ -248,6 +255,10 @@ export function createBroker(dependencies = {}) {
 		// waterfall runs, against a candidate set that no longer contains
 		// providers with no room.
 		const excluded = new Set();
+		let accountingWindows = null;
+		const onRouted = (routed) => {
+			accountingWindows = routed.accountingWindows ?? null;
+		};
 		const reservation = await reservations.reserveWithSelection(
 			(active, refusals) => {
 				for (const refusal of refusals ?? []) {
@@ -256,17 +267,24 @@ export function createBroker(dependencies = {}) {
 				selected = selectPrepared(request, {
 					snapshotRead,
 					exclude: [...excluded],
+					onRouted,
 				});
-				if (!selected.provider) return null;
-				const generation =
-					selected.snapshotIdentity.mtime ?? selected.snapshotIdentity.status;
-				const window = `${selected.snapshotIdentity.source}@${generation}`;
-				// Subtract every provider already saturated in this window at once,
+				// The accounting window belongs to the *winner*, not to the snapshot,
+				// so it is recomputed on every re-selection. Keying it once outside
+				// this loop would charge the second candidate against the first
+				// candidate's buckets.
+				const windowFor = () =>
+					accountingWindowKey(
+						selected.snapshotIdentity.source,
+						accountingWindows,
+						selected.snapshotIdentity.mtime ?? selected.snapshotIdentity.status,
+					);
+				let window = "";
+				// Subtract every provider already saturated in its own window,
 				// rather than discovering them one refusal at a time.
-				while (
-					selected.provider &&
-					saturated(active, selected.provider, window, request)
-				) {
+				while (selected.provider) {
+					window = windowFor();
+					if (!saturated(active, selected.provider, window, request)) break;
 					// Each pass must retire one provider or the loop cannot end. A
 					// router that hands back a provider already in `exclude` is not
 					// honouring it, so stop rather than spin: the attempt refuses on
@@ -276,6 +294,7 @@ export function createBroker(dependencies = {}) {
 					selected = selectPrepared(request, {
 						snapshotRead,
 						exclude: [...excluded],
+						onRouted,
 					});
 				}
 				if (!selected.provider) return null;
