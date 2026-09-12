@@ -1,0 +1,160 @@
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+	chmodSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+
+import { resolveTargetIdentity } from "../roster/index.mjs";
+
+const IDENTIFIER_DOMAIN = "switchyard.account.v1|";
+const IDENTIFIER_HEX_LENGTH = 32; // 128 bits of a SHA-256 digest.
+const HOST_KEY_BYTES = 32;
+const HOST_KEY_FILENAME = "host-key";
+
+const defaultAccountsRoot = resolve(homedir(), ".switchyard", "accounts");
+
+/**
+ * Root holding one directory per independently metered account. Overridable so
+ * tests never touch the host's real accounts, following the
+ * `SWITCHYARD_VM_ADMISSION_ROOT` precedent in the run store.
+ * @returns {string}
+ */
+export function resolveAccountsRoot() {
+	const envOverride = process.env.SWITCHYARD_ACCOUNT_ROOT;
+	if (envOverride) return resolve(envOverride);
+	return defaultAccountsRoot;
+}
+
+/**
+ * Namespacing digest of a roster target id. Keyed rather than bare: the input
+ * is a short owner-authored string, so an unkeyed digest would be trivially
+ * reversible by dictionary and would disclose which subscriptions this host
+ * holds to anyone who can list the directory.
+ *
+ * @param {string} targetId resolved roster target id, not a credential or CLI name
+ * @param {Buffer} hostKey host-local namespacing key
+ * @returns {string} 32 lowercase hex characters
+ */
+export function accountIdentifier(targetId, hostKey) {
+	if (typeof targetId !== "string" || targetId.trim() === "") {
+		throw new TypeError("account targetId must be non-empty text");
+	}
+	if (!Buffer.isBuffer(hostKey) || hostKey.length !== HOST_KEY_BYTES) {
+		throw new TypeError(`account host key must be ${HOST_KEY_BYTES} bytes`);
+	}
+	return createHmac("sha256", hostKey)
+		.update(`${IDENTIFIER_DOMAIN}${targetId}`)
+		.digest("hex")
+		.slice(0, IDENTIFIER_HEX_LENGTH);
+}
+
+/**
+ * Read the host-local namespacing key, generating it on first use. The key is
+ * never logged and never leaves this host: losing or rotating it renumbers
+ * every account root, which is why callers must treat a read failure as a
+ * fail-closed signal rather than minting a replacement.
+ *
+ * @param {{root?: string}} [options]
+ * @returns {Buffer|null} the key, or null when it cannot be read or created
+ */
+export function readHostKey(options = {}) {
+	const root = resolve(options.root ?? resolveAccountsRoot());
+	const keyPath = resolve(root, HOST_KEY_FILENAME);
+	try {
+		const existing = readFileSync(keyPath);
+		if (existing.length !== HOST_KEY_BYTES) return null;
+		return existing;
+	} catch (error) {
+		if (error?.code !== "ENOENT") return null;
+	}
+	try {
+		mkdirSync(root, { recursive: true, mode: 0o700 });
+		chmodSync(root, 0o700);
+		const generated = randomBytes(HOST_KEY_BYTES);
+		// Write-then-rename so a concurrent reader never sees a short key, and
+		// keep whichever key won the race rather than overwriting it.
+		const staging = resolve(root, `${HOST_KEY_FILENAME}.${process.pid}.tmp`);
+		writeFileSync(staging, generated, { mode: 0o600 });
+		try {
+			statSync(keyPath);
+			return readHostKeyAfterRace(keyPath, staging);
+		} catch (error) {
+			if (error?.code !== "ENOENT") return null;
+		}
+		renameSync(staging, keyPath);
+		return generated;
+	} catch {
+		return null;
+	}
+}
+
+function readHostKeyAfterRace(keyPath, staging) {
+	try {
+		const winner = readFileSync(keyPath);
+		return winner.length === HOST_KEY_BYTES ? winner : null;
+	} catch {
+		return null;
+	} finally {
+		try {
+			renameSync(staging, `${staging}.discard`);
+		} catch {
+			// The staging file is inside the 0700 root; a failed cleanup is not
+			// worth failing the resolution over.
+		}
+	}
+}
+
+/**
+ * Resolve the account root for a provider selector, or null when the account
+ * cannot be identified with certainty.
+ *
+ * Fail-closed is the whole point: an unreadable roster, an unresolved or
+ * ambiguous selector, or an unreadable host key must send the caller back to
+ * its project-local ledger. Minting a fresh identifier instead would be
+ * indistinguishable from a genuinely new account and would let two projects
+ * double-book one subscription.
+ *
+ * @param {unknown} providerName snapshot provider name to resolve through the roster
+ * @param {{root?: string}} [options]
+ * @returns {{root: string, targetId: string, identifier: string}|null}
+ */
+export function resolveAccountRoot(providerName, options = {}) {
+	let identity = null;
+	try {
+		identity = resolveTargetIdentity(providerName);
+	} catch {
+		return null;
+	}
+	if (!identity?.targetId || identity.ambiguous) return null;
+	const accountsRoot = resolve(options.root ?? resolveAccountsRoot());
+	const hostKey = readHostKey({ root: accountsRoot });
+	if (!hostKey) return null;
+	const identifier = accountIdentifier(identity.targetId, hostKey);
+	const root = resolve(accountsRoot, identifier);
+	try {
+		mkdirSync(root, { recursive: true, mode: 0o700 });
+		chmodSync(root, 0o700);
+	} catch {
+		return null;
+	}
+	return Object.freeze({ root, targetId: identity.targetId, identifier });
+}
+
+/**
+ * Constant-time comparison helper used by the tests to assert two identifiers
+ * match without leaking a timing oracle into any future caller.
+ * @param {string} left
+ * @param {string} right
+ * @returns {boolean}
+ */
+export function identifiersMatch(left, right) {
+	if (typeof left !== "string" || typeof right !== "string") return false;
+	if (left.length !== right.length) return false;
+	return timingSafeEqual(Buffer.from(left), Buffer.from(right));
+}
