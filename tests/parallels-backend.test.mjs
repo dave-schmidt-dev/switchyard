@@ -3511,7 +3511,7 @@ describe("VM ownership metadata", () => {
 		const source = readFileSync(sourcePath, "utf8");
 		strictEqual(
 			createHash("sha256").update(source, "utf8").digest("hex"),
-			"0d5938ca14b4be3bd34c4897f9bc6338c5767d4a1077938780bca2edf87a452a",
+			"9baa894b91bebd98968f2ec8b2c8a8a2cd016d67a70bad5001e035210f93590c",
 		);
 
 		const calls = [];

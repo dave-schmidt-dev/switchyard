@@ -54,6 +54,23 @@ function hasAgyKeychainLogin(workspaceId, executionBackend) {
 }
 
 /**
+ * The Keychain item is the only corroboration measured for agy, and it exists
+ * only on macOS. A backend that declares any other substrate is refused rather
+ * than falling back to a file-presence check: whether agy on Linux keeps its
+ * OAuth token in `~/.gemini/antigravity-cli/antigravity-oauth-token` or in a
+ * keyring is unmeasured (see the container-lane credential survey), and
+ * guessing it wrong readmits exactly the defect Task 15 closed -- an installed
+ * but unauthenticated CLI reported as authenticated. An undeclared kind keeps
+ * the macOS path, so every backend shipped today is unaffected.
+ * @param {{kind?: string|null}} executionBackend
+ * @returns {boolean}
+ */
+function guestCorroborationIsMeasured(executionBackend) {
+	const kind = executionBackend?.kind;
+	return kind == null || kind === "macos";
+}
+
+/**
  * Check if Agy is authenticated in the guest. `agy --version` has no vendor
  * keyword to match, so liveness here is just "binary runs, non-empty
  * output"; the real signal is the dedicated macOS Keychain item set by the
@@ -75,6 +92,7 @@ export function isAgyAuthenticated(workspaceId, executionBackend) {
 	} catch {
 		return false;
 	}
+	if (!guestCorroborationIsMeasured(executionBackend)) return false;
 	return hasAgyKeychainLogin(workspaceId, executionBackend);
 }
 

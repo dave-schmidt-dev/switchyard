@@ -38,6 +38,9 @@ function evalCredentialCheckScript(script, files, home) {
 /**
  * @param {object} [options]
  * @param {string} [options.providerUser]
+ * @param {string|null} [options.kind] Substrate reported by the backend's
+ *   `kind` getter. Undeclared by default, which every adapter treats as the
+ *   macOS path.
  * @param {string} [options.home] Guest home directory reported by
  *   `guestHomePath()`; defaults to the macOS shape. Set it to a POSIX home to
  *   prove an adapter builds credential paths from the backend rather than
@@ -54,6 +57,7 @@ function evalCredentialCheckScript(script, files, home) {
 export function createFakeExecutionBackend({
 	providerUser = FAKE_PROVIDER_USER,
 	home,
+	kind = null,
 	version = null,
 	files = {},
 	respond,
@@ -61,6 +65,7 @@ export function createFakeExecutionBackend({
 	const guestHome = home ?? `/Users/${providerUser}`;
 	return {
 		providerUser,
+		kind,
 		guestHomePath() {
 			return guestHome;
 		},

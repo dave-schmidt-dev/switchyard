@@ -86,6 +86,17 @@ export class ExecutionBackend {
 	}
 
 	/**
+	 * Which substrate this backend runs workspaces on, or `null` when a backend
+	 * does not declare one. Adapters read it only to refuse a guest whose
+	 * credential lookup has not been measured -- never to relax a check, which
+	 * is how an unauthenticated provider gets admitted.
+	 * @returns {string|null}
+	 */
+	get kind() {
+		return null;
+	}
+
+	/**
 	 * Absolute home directory of the provider user inside the workspace.
 	 * Credential-presence predicates build their paths from this rather than
 	 * interpolating `/Users/<user>` themselves: that prefix is a macOS fact, and

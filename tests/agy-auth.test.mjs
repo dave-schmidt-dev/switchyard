@@ -89,6 +89,7 @@ describe("isAgyAuthenticated Keychain-status check (fake guest)", () => {
 	function createAgyKeychainBackend(state = {}) {
 		return createFakeExecutionBackend({
 			version: state.version !== undefined ? state.version : "agy 1.0.0",
+			kind: state.kind ?? null,
 			respond(command, args) {
 				if (
 					command === "/bin/sh" &&
@@ -139,6 +140,30 @@ describe("isAgyAuthenticated Keychain-status check (fake guest)", () => {
 				}),
 			),
 			false,
+		);
+	});
+
+	it("refuses a guest whose credential lookup has not been measured", () => {
+		// The `security` probe would succeed here. agy must still report
+		// unauthenticated on a substrate where the Keychain does not exist and no
+		// replacement corroboration has been measured, rather than degrade to a
+		// weaker check -- that degradation is Task 15's defect.
+		strictEqual(
+			isAgyAuthenticated(
+				"fake-workspace",
+				createAgyKeychainBackend({ kind: "container" }),
+			),
+			false,
+		);
+	});
+
+	it("keeps the macOS path for a backend that declares macos", () => {
+		strictEqual(
+			isAgyAuthenticated(
+				"fake-workspace",
+				createAgyKeychainBackend({ kind: "macos" }),
+			),
+			true,
 		);
 	});
 

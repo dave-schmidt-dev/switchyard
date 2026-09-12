@@ -90,6 +90,14 @@ describe("execution backend selection", () => {
 		}
 	});
 
+	it("declares the substrate it runs on, where the base class declares none", () => {
+		// Adapters read `kind` to refuse a guest whose credential lookup has not
+		// been measured, so a backend that leaves it undeclared is treated as
+		// macOS -- the built backend has to say so itself.
+		strictEqual(createExecutionBackend({ execFn: () => "" }).kind, "macos");
+		strictEqual(new (class extends ExecutionBackend {})().kind, null);
+	});
+
 	it("fails at the seam when a backend omits execGuest", () => {
 		// The declaration is the whole point of the change: without it, every
 		// adapter's `try { execGuest(...) } catch { return false }` reports each

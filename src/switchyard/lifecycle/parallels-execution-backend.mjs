@@ -2241,6 +2241,11 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return providerPidMarkerPath(workspaceId, cleanupContext);
 	}
 
+	/** @returns {string} */
+	get kind() {
+		return "macos";
+	}
+
 	/**
 	 * Home directory of the provider user in the guest. macOS-shaped because
 	 * this backend is macOS; adapters ask for it instead of assembling it so
