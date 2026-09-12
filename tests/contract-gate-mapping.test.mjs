@@ -32,7 +32,7 @@ import { tempDir } from "./helpers/tempdir.mjs";
 
 const ROOT = join(process.cwd());
 
-function createReceiptFixture() {
+function createReceiptFixture({ stage = true } = {}) {
 	const fixture = tempDir("switchyard-contract-cli-");
 	const manifest = loadContractGateManifest(ROOT);
 	const paths = [
@@ -66,14 +66,16 @@ function createReceiptFixture() {
 	execFileSync("git", ["config", "user.name", "Gate Test"], { cwd: fixture });
 	execFileSync("git", ["add", "."], { cwd: fixture });
 	execFileSync("git", ["commit", "-qm", "fixture"], { cwd: fixture });
-	const diagnostics = join(fixture, "src/switchyard/diagnostics/index.mjs");
-	writeFileSync(
-		diagnostics,
-		`${requireText(diagnostics)}\n// staged boundary edit\n`,
-	);
-	execFileSync("git", ["add", "src/switchyard/diagnostics/index.mjs"], {
-		cwd: fixture,
-	});
+	if (stage) {
+		const diagnostics = join(fixture, "src/switchyard/diagnostics/index.mjs");
+		writeFileSync(
+			diagnostics,
+			`${requireText(diagnostics)}\n// staged boundary edit\n`,
+		);
+		execFileSync("git", ["add", "src/switchyard/diagnostics/index.mjs"], {
+			cwd: fixture,
+		});
+	}
 	return fixture;
 }
 
@@ -317,12 +319,24 @@ describe("source-boundary contract gate mapping", () => {
 	});
 
 	it("selects only exact boundary owners and emits status for mapped staged paths", () => {
-		const manifest = loadContractGateManifest(ROOT);
-		const status = statusReport({ root: ROOT });
-		ok(Array.isArray(status.changedPaths));
-		strictEqual(status.owners.length, 0);
+		// Reported against a fixture, not this checkout: reading the real index
+		// made the result depend on what the committer happened to have staged,
+		// so preparing any mapped commit failed validate with a bare `1 !== 0`.
+		const fixture = createReceiptFixture();
+		try {
+			const status = statusReport({ root: fixture });
+			deepStrictEqual(status.changedPaths, [
+				"src/switchyard/diagnostics/index.mjs",
+			]);
+			deepStrictEqual(status.owners, ["diagnostics"]);
+			deepStrictEqual(status.suites, {
+				"tests/diagnostics.test.mjs": "not-run",
+			});
+		} finally {
+			rmSync(fixture, { recursive: true, force: true });
+		}
 		deepStrictEqual(
-			ownersForPaths(manifest, [
+			ownersForPaths(loadContractGateManifest(ROOT), [
 				"src/switchyard/run-store/index.mjs",
 				"src/switchyard/runner/index.mjs",
 			]).map((owner) => owner.id),
@@ -331,8 +345,14 @@ describe("source-boundary contract gate mapping", () => {
 	});
 
 	it("does not require a receipt when no mapped production path is staged", () => {
-		const result = checkPreCommitReceipt({ root: ROOT });
-		strictEqual(result.required, false);
+		const fixture = createReceiptFixture({ stage: false });
+		try {
+			const result = checkPreCommitReceipt({ root: fixture });
+			strictEqual(result.required, false);
+			deepStrictEqual(result.owners, []);
+		} finally {
+			rmSync(fixture, { recursive: true, force: true });
+		}
 	});
 
 	it("runs the real contract CLI, validates its receipt, and rejects a post-gate staged edit", () => {
