@@ -453,7 +453,13 @@ function taskBaseProbeOptions(options = {}) {
 function probeRemainingMs(options) {
 	if (options.signal?.aborted) throw new Error("task base probe aborted");
 	const remainingMs = Math.floor(options.deadlineMs - options.now());
-	if (remainingMs <= 0) throw new Error("task base probe deadline exhausted");
+	if (remainingMs <= 0) {
+		// Carries the same code a killed child would: a caller classifying the
+		// failure must read "out of budget", not "this task base is invalid".
+		throw Object.assign(new Error("task base probe deadline exhausted"), {
+			code: "ETIMEDOUT",
+		});
+	}
 	return remainingMs;
 }
 

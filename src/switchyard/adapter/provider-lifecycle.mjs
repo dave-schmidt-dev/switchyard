@@ -926,12 +926,17 @@ export async function captureProviderDiffDetailedAsync(
 		onStatus,
 		cleanupContext,
 		taskBase,
+		now = Date.now,
 		...lifecycleOptions
 	} = options;
-	const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
+	const deadlineMs = options.deadlineMs ?? now() + timeoutMs;
 	const remainingMs = () => {
-		const remaining = Math.floor(deadlineMs - Date.now());
-		if (remaining <= 0) throw new Error("diff capture deadline exhausted");
+		const remaining = Math.floor(deadlineMs - now());
+		if (remaining <= 0) {
+			throw Object.assign(new Error("diff capture deadline exhausted"), {
+				code: "ETIMEDOUT",
+			});
+		}
 		return remaining;
 	};
 	const timedOut = (error) =>
@@ -1018,6 +1023,7 @@ export async function captureProviderDiffDetailedAsync(
 			{
 				deadlineMs,
 				timeoutMs,
+				now,
 				signal: options.signal,
 				onStatus,
 				cleanupContext: markerContext(cleanupContext, "helper"),
@@ -1077,10 +1083,15 @@ export function captureProviderDiffDetailed(
 	options = {},
 ) {
 	const timeoutMs = options.timeoutMs ?? 30_000;
-	const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
+	const now = options.now ?? Date.now;
+	const deadlineMs = options.deadlineMs ?? now() + timeoutMs;
 	const remainingMs = () => {
-		const remaining = Math.floor(deadlineMs - Date.now());
-		if (remaining <= 0) throw new Error("diff capture deadline exhausted");
+		const remaining = Math.floor(deadlineMs - now());
+		if (remaining <= 0) {
+			throw Object.assign(new Error("diff capture deadline exhausted"), {
+				code: "ETIMEDOUT",
+			});
+		}
 		return remaining;
 	};
 	const timedOut = (error) =>
@@ -1144,6 +1155,7 @@ export function captureProviderDiffDetailed(
 			{
 				timeoutMs,
 				deadlineMs,
+				now,
 				signal: options.signal,
 				onStatus: options.onStatus,
 				cleanupContext: markerContext(options.cleanupContext, "helper"),

@@ -845,17 +845,16 @@ describe("provider process lifecycle", () => {
 	});
 
 	it("preserves timed_out when synchronous task-base validation exhausts the budget", () => {
+		// The budget is spent by an injected clock rather than by real elapsed
+		// time: it jumps past the deadline exactly when validation asks the
+		// backend for its command, which is the call before the probe reads what
+		// is left. The wall-clock version of this test decided its outcome by
+		// machine load, and never reached validation at all -- a 20ms budget was
+		// already gone by the time the staging probe returned.
+		let clock = 1_000_000;
 		const executionBackend = {
 			execArgv(_workspaceId, { argv }) {
-				if (argv[1] === "rev-parse") {
-					return {
-						command: process.execPath,
-						args: [
-							"-e",
-							'process.on("SIGTERM", () => {}); setTimeout(() => {}, 1000)',
-						],
-					};
-				}
+				if (argv[1] === "rev-parse") clock += 60_000;
 				return { command: process.execPath, args: ["-e", ""] };
 			},
 		};
@@ -863,9 +862,57 @@ describe("provider process lifecycle", () => {
 			captureProviderDiffDetailed("worker", {
 				executionBackend,
 				taskBase: TASK_BASE,
-				timeoutMs: 20,
+				timeoutMs: 30_000,
+				now: () => clock,
 			}),
 			{ status: "timed_out", diff: null },
+		);
+	});
+
+	it("preserves timed_out when asynchronous task-base validation exhausts the budget", async () => {
+		let clock = 1_000_000;
+		const executionBackend = {
+			execArgv(_workspaceId, { argv }) {
+				if (argv[1] === "rev-parse") clock += 60_000;
+				return { command: "fake", args: [...argv] };
+			},
+		};
+		deepStrictEqual(
+			await captureProviderDiffDetailedAsync("worker", {
+				executionBackend,
+				taskBase: TASK_BASE,
+				timeoutMs: 30_000,
+				now: () => clock,
+				spawnFn: () => {
+					const child = fakeChild();
+					queueMicrotask(() => child.emit("close", 0, null));
+					return child;
+				},
+			}),
+			{ status: "timed_out", diff: null },
+		);
+	});
+
+	it("still blames the task base when the anchored ref holds another tree", () => {
+		// The counterpart to the two budget cases: running out of time must not
+		// be reported as an invalid base, and an invalid base must still be.
+		const executionBackend = {
+			execArgv(_workspaceId, { argv }) {
+				return argv[1] === "rev-parse"
+					? {
+							command: process.execPath,
+							args: ["-e", 'process.stdout.write("2".repeat(40))'],
+						}
+					: { command: process.execPath, args: ["-e", ""] };
+			},
+		};
+		deepStrictEqual(
+			captureProviderDiffDetailed("worker", {
+				executionBackend,
+				taskBase: TASK_BASE,
+				timeoutMs: 30_000,
+			}),
+			{ status: "diff_failed", diff: null, reasonCode: "task_base_invalid" },
 		);
 	});
 
