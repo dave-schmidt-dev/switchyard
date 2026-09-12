@@ -55,6 +55,37 @@ function dependencies(reservations, reservationCapacity) {
 	};
 }
 
+function rankedDependencies(reservations, reservationCapacity, order) {
+	// A router stub that actually honours `exclude`, unlike `dependencies()`'s
+	// fixed-winner stub. Selection order is the caller's ranking.
+	return {
+		...dependencies(reservations, reservationCapacity),
+		route: ({ exclude = [] } = {}) => {
+			const skip = new Set(exclude.map((value) => String(value).toLowerCase()));
+			const winner = order.find((name) => !skip.has(name.toLowerCase()));
+			if (!winner) {
+				return {
+					provider: null,
+					reason: "no_eligible",
+					snapshotStatus: "fresh",
+					snapshotMtime: 123,
+					snapshotAgeMsAtRoute: 10,
+				};
+			}
+			return {
+				provider: winner,
+				model: "codex-standard",
+				resolvedTargetId: "codex",
+				reason: "priority_fill",
+				snapshotStatus: "fresh",
+				snapshotMtime: 123,
+				snapshotAgeMsAtRoute: 10,
+			};
+		},
+		getInvocationDescriptor: () => codexDescriptor(),
+	};
+}
+
 function codexDescriptor() {
 	const core = {
 		target_id: "codex",
@@ -531,6 +562,88 @@ describe("broker reservations", () => {
 			true,
 			`expected the reclaim well inside the acquisition window, took ${elapsed}ms of ${lockTimeoutMs}ms`,
 		);
+	});
+
+	it("skips a provider whose in-flight reservations already fill the window", async () => {
+		const ledger = await fixture();
+		// Fill Codex's capacity in the window the broker will compute
+		// (`<source>@<mtime>` = gradus-v2@123) before the broker ever routes.
+		await ledger.reserve({
+			provider: "Codex",
+			window: "gradus-v2@123",
+			runId: "run-0",
+			taskId: "TASK-000",
+			ownerId: "worker-0",
+			// A live owner: recovery reclaims a reservation whose pid is dead, and
+			// a reclaimed record is not in-flight, so a fake pid would empty `active`
+			// and make this test pass for the wrong reason.
+			ownerPid: process.pid,
+			estimatedConsumption: 2,
+			capacity: 2,
+		});
+		const broker = createBroker(
+			rankedDependencies(ledger, 2, ["Codex", "Vibe"]),
+		);
+		const result = await broker.selectAndReserve(request("TASK-001"));
+		strictEqual(result.provider, "Vibe");
+		strictEqual(Boolean(result.reservation), true);
+	});
+
+	it("keeps the ranked winner when it still has room", async () => {
+		const ledger = await fixture();
+		const broker = createBroker(
+			rankedDependencies(ledger, 4, ["Codex", "Vibe"]),
+		);
+		const result = await broker.selectAndReserve(request("TASK-001"));
+		strictEqual(result.provider, "Codex");
+	});
+
+	it("still answers capacity_unavailable when every candidate is full", async () => {
+		const ledger = await fixture();
+		for (const [index, provider] of ["Codex", "Vibe"].entries()) {
+			await ledger.reserve({
+				provider,
+				window: "gradus-v2@123",
+				runId: "run-0",
+				taskId: `TASK-00${index}`,
+				ownerId: "worker-0",
+				ownerPid: process.pid,
+				estimatedConsumption: 2,
+				capacity: 2,
+			});
+		}
+		const broker = createBroker(
+			rankedDependencies(ledger, 2, ["Codex", "Vibe"]),
+		);
+		const result = await broker.selectAndReserve(request("TASK-001"));
+		strictEqual(result.reservation, null);
+		strictEqual(result.reason, "capacity_unavailable");
+	});
+
+	it("bounds how many times one lock acquisition may re-run the selector", async () => {
+		const ledger = await fixture({ selectionAttemptLimit: 3 });
+		let calls = 0;
+		const reservation = await ledger.reserveWithSelection(
+			(_active, refusals) => {
+				calls += 1;
+				// A selector that never retires the refused provider: the ledger's own
+				// bound is the only thing standing between this and an unbounded hold
+				// on the lock every other reserver is waiting for.
+				strictEqual(refusals.length, calls - 1);
+				return {
+					provider: "Codex",
+					window: "window-1",
+					runId: "run-1",
+					taskId: `TASK-00${calls}`,
+					ownerId: "owner-1",
+					ownerPid: 202,
+					estimatedConsumption: 5,
+					capacity: 1,
+				};
+			},
+		);
+		strictEqual(reservation, null);
+		strictEqual(calls, 3);
 	});
 
 	it("refuses a freshly created ownerless lock rather than stealing it", async () => {

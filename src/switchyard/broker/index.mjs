@@ -214,30 +214,96 @@ export function createBroker(dependencies = {}) {
 		return selectPrepared(requestValue);
 	}
 
+	/**
+	 * Would this provider's in-flight reservations leave no room for the request
+	 * in this accounting window? `active` is the ledger's own view of every
+	 * reserved record, taken under the same lock that will write ours, so this
+	 * is the same arithmetic the ledger applies — run before the candidate is
+	 * committed to rather than after it is refused.
+	 *
+	 * @param {ReadonlyArray<{provider: string, window: string, amount: number}>} active
+	 * @param {string} provider
+	 * @param {string} window
+	 * @param {{estimatedConsumption: number}} request
+	 * @returns {boolean}
+	 */
+	function saturated(active, provider, window, request) {
+		const consumed = (active ?? [])
+			.filter(
+				(record) => record.provider === provider && record.window === window,
+			)
+			.reduce((total, record) => total + record.amount, 0);
+		return consumed + request.estimatedConsumption > reservationCapacity;
+	}
+
 	async function selectAndReserve(requestValue) {
 		const request = validateBrokerRequest(requestValue);
 		const snapshotRead = snapshots
 			? await snapshots.prepare(request.snapshotSource)
 			: undefined;
 		let selected = null;
-		const reservation = await reservations.reserveWithSelection(() => {
-			selected = selectPrepared(request, { snapshotRead });
-			if (!selected.provider) return null;
-			const generation =
-				selected.snapshotIdentity.mtime ?? selected.snapshotIdentity.status;
-			return {
-				provider: selected.provider,
-				window: `${selected.snapshotIdentity.source}@${generation}`,
-				runId: request.runId,
-				taskId: request.taskId,
-				ownerId,
-				ownerPid: process.pid,
-				estimatedConsumption: request.estimatedConsumption,
-				capacity: reservationCapacity,
-			};
-		});
+		// Providers this attempt has already proven cannot take the task: either
+		// the ledger refused them on capacity, or their in-flight reservations
+		// already fill the window. The ranking itself is untouched — the same
+		// waterfall runs, against a candidate set that no longer contains
+		// providers with no room.
+		const excluded = new Set();
+		const reservation = await reservations.reserveWithSelection(
+			(active, refusals) => {
+				for (const refusal of refusals ?? []) {
+					if (refusal?.provider) excluded.add(refusal.provider);
+				}
+				selected = selectPrepared(request, {
+					snapshotRead,
+					exclude: [...excluded],
+				});
+				if (!selected.provider) return null;
+				const generation =
+					selected.snapshotIdentity.mtime ?? selected.snapshotIdentity.status;
+				const window = `${selected.snapshotIdentity.source}@${generation}`;
+				// Subtract every provider already saturated in this window at once,
+				// rather than discovering them one refusal at a time.
+				while (
+					selected.provider &&
+					saturated(active, selected.provider, window, request)
+				) {
+					// Each pass must retire one provider or the loop cannot end. A
+					// router that hands back a provider already in `exclude` is not
+					// honouring it, so stop rather than spin: the attempt refuses on
+					// capacity exactly as it did before this loop existed.
+					if (excluded.has(selected.provider)) return null;
+					excluded.add(selected.provider);
+					selected = selectPrepared(request, {
+						snapshotRead,
+						exclude: [...excluded],
+					});
+				}
+				if (!selected.provider) return null;
+				return {
+					provider: selected.provider,
+					window,
+					runId: request.runId,
+					taskId: request.taskId,
+					ownerId,
+					ownerPid: process.pid,
+					estimatedConsumption: request.estimatedConsumption,
+					capacity: reservationCapacity,
+				};
+			},
+		);
 		if (!selected) {
 			throw new Error("reservation selector did not produce a broker result");
+		}
+		if (!selected.provider && excluded.size > 0) {
+			// The router ran out of candidates only because this attempt removed
+			// the ones with no room. That is a capacity answer, not "nothing
+			// qualifies" — collapsing them would tell the queue to stop looking
+			// for a provider that is merely busy.
+			return validateBrokerResult({
+				...selected,
+				reservation: null,
+				reason: "capacity_unavailable",
+			});
 		}
 		if (!selected.provider || reservation) {
 			return validateBrokerResult({ ...selected, reservation });

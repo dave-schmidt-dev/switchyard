@@ -80,6 +80,11 @@ export function createReservationLedger(options = {}) {
 	const ownerlessLockStaleMs =
 		options.ownerlessLockStaleMs ?? Math.max(1, Math.floor(lockTimeoutMs / 2));
 	const makeId = options.makeId ?? randomUUID;
+	// How many times one acquisition may re-run the caller's selector after a
+	// capacity refusal. The selector runs *inside* the lock, so this is a direct
+	// bound on how long one reserver can hold it away from every other reserver;
+	// it is not a routing knob. The caller ends the loop earlier by returning null.
+	const selectionAttemptLimit = options.selectionAttemptLimit ?? 8;
 
 	async function reclaimLock() {
 		const stalePath = resolve(root, `.reservations.lock.stale.${randomUUID()}`);
@@ -303,53 +308,81 @@ export function createReservationLedger(options = {}) {
 						}),
 					),
 			);
-			let input;
-			try {
-				input = await select(active);
-			} catch (error) {
-				if (recovered || fallbackContext !== null) await persist(ledger);
-				throw error;
-			}
-			if (input === null) {
-				if (recovered || fallbackContext !== null) await persist(ledger);
-				return null;
-			}
-			const provider = requireText(input.provider, "reservation.provider");
-			const window = requireText(input.window, "reservation.window");
-			const runId = requireText(input.runId, "reservation.runId");
-			const taskId = requireText(input.taskId, "reservation.taskId");
-			const ownerId = requireText(input.ownerId, "reservation.ownerId");
-			const estimatedConsumption = requirePositive(
-				input.estimatedConsumption,
-				"reservation.estimatedConsumption",
-			);
-			const capacity = requirePositive(input.capacity, "reservation.capacity");
+			// A refused candidate is offered back to the selector instead of ending
+			// the attempt: the selector owns which provider comes next, the ledger
+			// owns whether that provider still fits. `active` does not change while
+			// this loop runs, because nothing is written until one candidate fits.
+			const refusals = [];
+			let input = null;
+			let provider = "";
+			let window = "";
+			let runId = "";
+			let taskId = "";
+			let ownerId = "";
+			let estimatedConsumption = 0;
+			let attempts = 0;
+			while (true) {
+				attempts += 1;
+				try {
+					input = await select(active, Object.freeze(refusals.slice()));
+				} catch (error) {
+					if (recovered || fallbackContext !== null) await persist(ledger);
+					throw error;
+				}
+				if (input === null) {
+					if (recovered || fallbackContext !== null) await persist(ledger);
+					return null;
+				}
+				provider = requireText(input.provider, "reservation.provider");
+				window = requireText(input.window, "reservation.window");
+				runId = requireText(input.runId, "reservation.runId");
+				taskId = requireText(input.taskId, "reservation.taskId");
+				ownerId = requireText(input.ownerId, "reservation.ownerId");
+				estimatedConsumption = requirePositive(
+					input.estimatedConsumption,
+					"reservation.estimatedConsumption",
+				);
+				const capacity = requirePositive(
+					input.capacity,
+					"reservation.capacity",
+				);
 
-			const duplicate = ledger.reservations.find(
-				(record) =>
-					record.state === "reserved" &&
-					record.provider === provider &&
-					record.window === window &&
-					record.runId === runId &&
-					record.taskId === taskId &&
-					record.ownerId === ownerId,
-			);
-			if (duplicate) {
-				if (recovered) await persist(ledger);
-				return publicReservation(duplicate);
-			}
-
-			const consumed = ledger.reservations
-				.filter(
+				const duplicate = ledger.reservations.find(
 					(record) =>
 						record.state === "reserved" &&
 						record.provider === provider &&
-						record.window === window,
-				)
-				.reduce((total, record) => total + record.estimatedConsumption, 0);
-			if (consumed + estimatedConsumption > capacity) {
-				if (recovered) await persist(ledger);
-				return null;
+						record.window === window &&
+						record.runId === runId &&
+						record.taskId === taskId &&
+						record.ownerId === ownerId,
+				);
+				if (duplicate) {
+					if (recovered) await persist(ledger);
+					return publicReservation(duplicate);
+				}
+
+				const consumed = ledger.reservations
+					.filter(
+						(record) =>
+							record.state === "reserved" &&
+							record.provider === provider &&
+							record.window === window,
+					)
+					.reduce((total, record) => total + record.estimatedConsumption, 0);
+				if (consumed + estimatedConsumption <= capacity) break;
+				refusals.push(
+					Object.freeze({
+						provider,
+						window,
+						capacity,
+						consumed,
+						requested: estimatedConsumption,
+					}),
+				);
+				if (attempts >= selectionAttemptLimit) {
+					if (recovered) await persist(ledger);
+					return null;
+				}
 			}
 
 			const record = {
