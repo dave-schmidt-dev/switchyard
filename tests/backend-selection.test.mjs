@@ -1,10 +1,23 @@
-import { strictEqual } from "node:assert";
+import { strictEqual, throws } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	createExecutionBackend,
 	hostBackendDefaults,
 	resolveExecutionBackendKind,
 } from "../src/switchyard/lifecycle/backend-selection.mjs";
+import { ExecutionBackend } from "../src/switchyard/lifecycle/execution-backend.mjs";
+
+const SEAM_METHODS = [
+	"preflight",
+	"create",
+	"execArgv",
+	"pushTar",
+	"pullTar",
+	"destroy",
+	"listManaged",
+	"inspectProcess",
+	"execGuest",
+];
 
 function withEnv(overrides, fn) {
 	const saved = new Map();
@@ -61,24 +74,29 @@ describe("execution backend selection", () => {
 		});
 	});
 
-	it("builds a backend that satisfies the execution seam", () => {
+	it("builds a backend that implements every seam method itself", () => {
+		// `typeof backend[method] === "function"` would pass for a subclass that
+		// implements nothing, because the base class declares each method as an
+		// abstract that throws. Identity against the prototype is what proves the
+		// backend actually overrides it.
 		const backend = createExecutionBackend({ execFn: () => "" });
-		for (const method of [
-			"preflight",
-			"create",
-			"execArgv",
-			"pushTar",
-			"pullTar",
-			"destroy",
-			"listManaged",
-			"inspectProcess",
-			"execGuest",
-		]) {
+		for (const method of SEAM_METHODS) {
 			strictEqual(
-				typeof backend[method],
-				"function",
-				`backend is missing ${method}`,
+				backend[method] === ExecutionBackend.prototype[method],
+				false,
+				`backend does not implement ${method}`,
 			);
 		}
+	});
+
+	it("fails at the seam when a backend omits execGuest", () => {
+		// The declaration is the whole point of the change: without it, every
+		// adapter's `try { execGuest(...) } catch { return false }` reports each
+		// provider as unauthenticated instead of surfacing a missing method.
+		class Incomplete extends ExecutionBackend {}
+		throws(
+			() => new Incomplete().execGuest("workspace", ["true"]),
+			/ExecutionBackend\.execGuest\(\) must be implemented/,
+		);
 	});
 });
