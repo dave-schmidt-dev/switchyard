@@ -214,6 +214,12 @@ export function createReservationLedger(options = {}) {
 		}
 	}
 
+	// Records written before ownership generations existed carry no fence; they
+	// are the first generation by definition.
+	function fenceOf(record) {
+		return Number.isInteger(record.fence) ? record.fence : 1;
+	}
+
 	function reclaimable(record, timestamp) {
 		if (record.state !== "reserved") return false;
 		if (record.expiresAt <= timestamp) return true;
@@ -356,6 +362,9 @@ export function createReservationLedger(options = {}) {
 				expiresAt: timestamp + leaseMs,
 				terminalReason: null,
 				terminalAt: null,
+				// Monotonic ownership generation. Bumped by every takeover so a
+				// superseded writer that still holds the old value is refused.
+				fence: 1,
 			};
 			ledger.reservations.push(record);
 			await persist(ledger);
@@ -387,6 +396,9 @@ export function createReservationLedger(options = {}) {
 			if (record.ownerId !== ownerId) {
 				throw new Error("reservation owner identity mismatch");
 			}
+			if (input.fence !== undefined && fenceOf(record) !== input.fence) {
+				throw new Error("reservation fence is stale; ownership was superseded");
+			}
 			const nextState = outcome === "success" ? "reconciled" : "released";
 			if (record.state !== "reserved") {
 				if (record.state === nextState && record.terminalReason === outcome) {
@@ -395,6 +407,15 @@ export function createReservationLedger(options = {}) {
 						state: record.state,
 						changed: false,
 					});
+				}
+				// Distinguish the result-loss path from an ordinary double
+				// terminal: recovery released this reservation while its owner was
+				// still working, so the outcome now being reported has nowhere to
+				// land. The generic message hid that.
+				if (record.terminalReason === "owner_recovered") {
+					throw new Error(
+						"reservation was reclaimed before its owner finalized",
+					);
 				}
 				throw new Error(
 					"reservation already terminated with a different outcome",
@@ -441,10 +462,59 @@ export function createReservationLedger(options = {}) {
 				: null;
 			record.expiresAt = timestamp + leaseMs;
 			record.updatedAt = timestamp;
+			record.fence = fenceOf(record) + 1;
 			await persist(ledger);
 			return Object.freeze({
 				reservation: publicReservation(record),
 				ownerId: record.ownerId,
+				fence: record.fence,
+			});
+		});
+	}
+
+	/**
+	 * Extend a live owner's lease. This is what keeps expiry authoritative
+	 * without expiring an owner that is still working: a task whose execution
+	 * outlives the lease keeps proving liveness, while a stuck owner stops
+	 * renewing and is reclaimed on schedule.
+	 *
+	 * Ownership problems are reported, not thrown, so a caller polling on a
+	 * timer never has to match on error text. Only caller mistakes throw.
+	 */
+	async function renew(input) {
+		return withLock(async (ledger, persist) => {
+			const reservationId = requireText(
+				input.reservationId,
+				"renew.reservationId",
+			);
+			const ownerId = requireText(input.ownerId, "renew.ownerId");
+			const record = ledger.reservations.find(
+				(candidate) => candidate.id === reservationId,
+			);
+			if (!record) throw new Error("reservation not found");
+			if (record.ownerId !== ownerId) {
+				return Object.freeze({ renewed: false, reason: "superseded" });
+			}
+			if (input.fence !== undefined && fenceOf(record) !== input.fence) {
+				return Object.freeze({ renewed: false, reason: "superseded" });
+			}
+			if (record.state !== "reserved") {
+				return Object.freeze({
+					renewed: false,
+					reason:
+						record.terminalReason === "owner_recovered"
+							? "reclaimed"
+							: "not_reserved",
+				});
+			}
+			const timestamp = now();
+			record.expiresAt = timestamp + leaseMs;
+			record.updatedAt = timestamp;
+			await persist(ledger);
+			return Object.freeze({
+				renewed: true,
+				expiresAt: record.expiresAt,
+				fence: fenceOf(record),
 			});
 		});
 	}
@@ -456,6 +526,7 @@ export function createReservationLedger(options = {}) {
 	return Object.freeze({
 		reserve,
 		reserveWithSelection,
+		renew,
 		terminal,
 		takeover,
 		inspect,

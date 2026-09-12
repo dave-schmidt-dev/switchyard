@@ -1,4 +1,9 @@
-import { notStrictEqual, rejects, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	rejects,
+	strictEqual,
+} from "node:assert";
 import { mkdir, utimes, writeFile } from "node:fs/promises";
 
 import { join } from "node:path";
@@ -6,6 +11,7 @@ import { describe, it } from "node:test";
 import { createBroker } from "../src/switchyard/broker/index.mjs";
 import { createReservationLedger } from "../src/switchyard/broker/reservations.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 import { tempDirAsync } from "./helpers/tempdir.mjs";
 
 function request(taskId, amount = 2) {
@@ -46,6 +52,21 @@ function dependencies(reservations, reservationCapacity) {
 			selector: "codex-standard",
 			effort: "high",
 		}),
+	};
+}
+
+function codexDescriptor() {
+	const core = {
+		target_id: "codex",
+		model_ref: "codex-standard",
+		selector: "codex-standard",
+		effort: "high",
+		variant: null,
+		invocation_args: ["-c", "model_reasoning_effort=high"],
+	};
+	return {
+		...core,
+		descriptor_identity: getInvocationDescriptorIdentity(core, "codex"),
 	};
 }
 
@@ -248,6 +269,193 @@ describe("broker reservations", () => {
 			capacity: 1,
 		});
 		strictEqual(reservation.id, "reservation-1");
+	});
+
+	it("renews a live owner's lease instead of letting it expire", async () => {
+		let timestamp = 1_000;
+		const ledger = await fixture({
+			now: () => timestamp,
+			leaseMs: 100,
+			ownerAlive: () => true,
+		});
+		const reservation = await ledger.reserve({
+			provider: "Codex",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-001",
+			ownerId: "owner-1",
+			ownerPid: 101,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		timestamp = 1_080;
+		const renewed = await ledger.renew({
+			reservationId: reservation.id,
+			ownerId: "owner-1",
+		});
+		strictEqual(renewed.renewed, true);
+		strictEqual(renewed.expiresAt, 1_180);
+		// Past the original lease, but inside the renewed one: a second owner
+		// must still be refused where it previously would have taken the slot.
+		timestamp = 1_150;
+		await rejects(
+			ledger.takeover({ reservationId: reservation.id, ownerId: "owner-2" }),
+			/live reservation owner/,
+		);
+	});
+
+	it("reports lost ownership from renew rather than throwing", async () => {
+		let timestamp = 1_000;
+		const ledger = await fixture({
+			now: () => timestamp,
+			leaseMs: 100,
+			ownerAlive: () => true,
+		});
+		const reservation = await ledger.reserve({
+			provider: "Codex",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-001",
+			ownerId: "owner-1",
+			ownerPid: 101,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		timestamp = 1_101;
+		await ledger.takeover({
+			reservationId: reservation.id,
+			ownerId: "owner-2",
+			ownerPid: 202,
+		});
+		deepStrictEqual(
+			await ledger.renew({
+				reservationId: reservation.id,
+				ownerId: "owner-1",
+			}),
+			{ renewed: false, reason: "superseded" },
+		);
+	});
+
+	it("refuses a superseded writer's terminal and names the reason", async () => {
+		let timestamp = 1_000;
+		const ledger = await fixture({
+			now: () => timestamp,
+			leaseMs: 100,
+			ownerAlive: () => true,
+		});
+		const reservation = await ledger.reserve({
+			provider: "Codex",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-001",
+			ownerId: "owner-1",
+			ownerPid: 101,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		timestamp = 1_101;
+		const takeover = await ledger.takeover({
+			reservationId: reservation.id,
+			ownerId: "owner-2",
+			ownerPid: 202,
+		});
+		strictEqual(takeover.fence, 2);
+		await rejects(
+			ledger.terminal({
+				reservationId: reservation.id,
+				ownerId: "owner-1",
+				outcome: "success",
+				actualConsumption: 1,
+			}),
+			/reservation owner identity mismatch/,
+		);
+		await rejects(
+			ledger.terminal({
+				reservationId: reservation.id,
+				ownerId: "owner-2",
+				fence: 1,
+				outcome: "success",
+				actualConsumption: 1,
+			}),
+			/reservation fence is stale/,
+		);
+	});
+
+	it("names reclamation when a recovered owner reports its outcome", async () => {
+		let timestamp = 1_000;
+		const ledger = await fixture({
+			now: () => timestamp,
+			leaseMs: 100,
+			ownerAlive: () => true,
+		});
+		const reservation = await ledger.reserve({
+			provider: "Codex",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-001",
+			ownerId: "owner-1",
+			ownerPid: 101,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		// Every reserve runs recovery first, which releases the expired-but-still
+		// working owner out from under it. That is the result-loss path.
+		timestamp = 1_101;
+		await ledger.reserve({
+			provider: "Claude",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-002",
+			ownerId: "owner-2",
+			ownerPid: 202,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		await rejects(
+			ledger.terminal({
+				reservationId: reservation.id,
+				ownerId: "owner-1",
+				outcome: "success",
+				actualConsumption: 1,
+			}),
+			/reservation was reclaimed before its owner finalized/,
+		);
+		deepStrictEqual(
+			await ledger.renew({
+				reservationId: reservation.id,
+				ownerId: "owner-1",
+			}),
+			{ renewed: false, reason: "reclaimed" },
+		);
+	});
+
+	it("holds a reservation for the whole of a long execution", async () => {
+		const ledger = await fixture({ leaseMs: 1_000 });
+		let observed = null;
+		const broker = createBroker({
+			...dependencies(ledger, 4),
+			getInvocationDescriptor: () => codexDescriptor(),
+			reservationRenewIntervalMs: 5,
+			executor: async () => {
+				await new Promise((done) => setTimeout(done, 60));
+				observed = (await ledger.inspect()).reservations[0].expiresAt;
+				throw new Error("provider failed");
+			},
+		});
+		const result = await broker.selectAndReserve(request("TASK-001"));
+		const before = (await ledger.inspect()).reservations[0].expiresAt;
+		try {
+			await broker.execute(request("TASK-001"), result, {
+				launcherIdentity: broker.launcherIdentity(result),
+			});
+		} catch {
+			// The executor's failure is the vehicle, not the assertion.
+		}
+		strictEqual(
+			observed > before,
+			true,
+			`expected the lease to advance during execution (${before} -> ${observed})`,
+		);
 	});
 
 	it("refuses a freshly created ownerless lock rather than stealing it", async () => {

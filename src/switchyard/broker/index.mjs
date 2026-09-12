@@ -53,6 +53,10 @@ export function createBroker(dependencies = {}) {
 		throw new TypeError("broker dependency reservations is invalid");
 	}
 	const ownerId = dependencies.ownerId ?? `pid:${process.pid}`;
+	// Must stay well under the reservation lease. The broker does not own the
+	// lease length, so this is a fixed cadence rather than a derived one.
+	const reservationRenewIntervalMs =
+		dependencies.reservationRenewIntervalMs ?? 60_000;
 	// The execution boundary, not a route request, supplies this policy. A
 	// request therefore cannot promote itself into the macOS qualified set.
 	const platform = dependencies.platform ?? "direct";
@@ -369,6 +373,61 @@ export function createBroker(dependencies = {}) {
 		});
 	}
 
+	/**
+	 * Hold the reservation for as long as the route is actually executing.
+	 * Provider execution is allowed to outlive the reservation lease, so without
+	 * this a still-running owner is reclaimed mid-task and its result has
+	 * nowhere to land. Renewal stops only when ownership is genuinely gone; a
+	 * transient lock timeout must not disable it for the rest of the run.
+	 */
+	function startReservationRenewal(result, onStatus) {
+		const reservationId = result.reservation?.id;
+		if (!reservationId || typeof reservations.renew !== "function") {
+			return () => {};
+		}
+		const report = (event, extra) => {
+			try {
+				onStatus?.({
+					phase: "broker_execution",
+					event,
+					status: event.replaceAll("_", " "),
+					runId: result.runId,
+					taskId: result.taskId,
+					provider: result.provider,
+					...extra,
+				});
+			} catch {
+				// Status is a best-effort side channel and never owns task state.
+			}
+		};
+		let stopped = false;
+		const timer = setInterval(() => {
+			reservations
+				.renew({ reservationId, ownerId })
+				.then((outcome) => {
+					if (outcome?.renewed) return;
+					report("reservation_renewal_lost", {
+						reason: outcome?.reason ?? "unknown",
+					});
+					stop();
+				})
+				.catch((error) => {
+					// Transient: keep renewing, or one lock timeout would surrender
+					// the reservation for the remainder of the run.
+					report("reservation_renewal_failed", {
+						reason: error?.message ?? "unknown",
+					});
+				});
+		}, reservationRenewIntervalMs);
+		timer.unref?.();
+		function stop() {
+			if (stopped) return;
+			stopped = true;
+			clearInterval(timer);
+		}
+		return stop;
+	}
+
 	async function execute(requestValue, resultValue, options = {}) {
 		const request = validateBrokerRequest(requestValue);
 		const result = validateBrokerResult(resultValue);
@@ -387,22 +446,32 @@ export function createBroker(dependencies = {}) {
 			result.resolvedTarget,
 			executionRequest.capability,
 		);
-		return executeBrokerRoute({
-			request: executionRequest,
-			route: result,
-			invocationDescriptor: descriptor,
-			launcherIdentity: options.launcherIdentity,
-			launch: dependencies.executor,
-			signal: options.signal,
-			onStatus: options.onStatus,
-			onAdapterStatus: options.onAdapterStatus,
-			onPoll: options.onPoll,
-			onTaskHeartbeat: options.onTaskHeartbeat,
-			terminal: ({ outcome, actualConsumption }) =>
-				outcome === "success"
-					? reconcile(result, actualConsumption)
-					: release(result, outcome),
-		});
+		const stopRenewal = startReservationRenewal(result, options.onStatus);
+		try {
+			return await executeBrokerRoute({
+				request: executionRequest,
+				route: result,
+				invocationDescriptor: descriptor,
+				launcherIdentity: options.launcherIdentity,
+				launch: dependencies.executor,
+				signal: options.signal,
+				onStatus: options.onStatus,
+				onAdapterStatus: options.onAdapterStatus,
+				onPoll: options.onPoll,
+				onTaskHeartbeat: options.onTaskHeartbeat,
+				// Terminal runs before the route resolves, so stop here rather
+				// than relying on the backstop below: a tick landing between the
+				// terminal write and unwind would renew a finished reservation.
+				terminal: ({ outcome, actualConsumption }) => {
+					stopRenewal();
+					return outcome === "success"
+						? reconcile(result, actualConsumption)
+						: release(result, outcome);
+				},
+			});
+		} finally {
+			stopRenewal();
+		}
 	}
 
 	function launcherIdentity(resultValue) {
