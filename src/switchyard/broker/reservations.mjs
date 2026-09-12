@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
+import { createCommitmentStore } from "./commitments.mjs";
+import {
+	createLockedJsonStore,
+	DEFAULT_LEASE_MS,
+	processIsAlive,
+} from "./store.mjs";
+
 const LEDGER_VERSION = 1;
-const DEFAULT_LEASE_MS = 15 * 60 * 1000;
-const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
-const DEFAULT_LOCK_RETRY_MS = 10;
 
 function requireText(value, label) {
 	if (typeof value !== "string" || value.trim() === "" || value.length > 1024) {
@@ -21,16 +24,6 @@ function requirePositive(value, label) {
 	return value;
 }
 
-function processIsAlive(pid) {
-	if (!Number.isInteger(pid) || pid <= 0) return null;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return error?.code !== "ESRCH";
-	}
-}
-
 function emptyLedger() {
 	return {
 		schemaVersion: LEDGER_VERSION,
@@ -38,6 +31,33 @@ function emptyLedger() {
 		reservations: [],
 		fallbackAttempts: [],
 	};
+}
+
+function localConsumed(ledger, provider, window) {
+	return ledger.reservations
+		.filter(
+			(record) =>
+				record.state === "reserved" &&
+				record.provider === provider &&
+				record.window === window,
+		)
+		.reduce((total, record) => total + record.estimatedConsumption, 0);
+}
+
+function parseLedger(value) {
+	if (
+		value?.schemaVersion !== LEDGER_VERSION ||
+		!Number.isInteger(value.revision) ||
+		value.revision < 0 ||
+		!Array.isArray(value.reservations)
+	) {
+		throw new Error("broker reservation ledger has an unsupported schema");
+	}
+	if (value.fallbackAttempts === undefined) value.fallbackAttempts = [];
+	if (!Array.isArray(value.fallbackAttempts)) {
+		throw new Error("broker reservation ledger has an unsupported schema");
+	}
+	return value;
 }
 
 function publicReservation(record) {
@@ -50,10 +70,6 @@ function publicReservation(record) {
 	});
 }
 
-async function delay(ms) {
-	await new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
-
 /**
  * Project-local durable reservation ledger. Every read/modify/write decision is
  * serialized by an atomic directory lock and committed by rename.
@@ -62,167 +78,64 @@ export function createReservationLedger(options = {}) {
 	const root = resolve(
 		options.root ?? resolve(process.cwd(), ".logs", "switchyard", "broker"),
 	);
-	const ledgerPath = resolve(root, "reservations.json");
-	const lockPath = resolve(root, "reservations.lock");
 	const now = options.now ?? Date.now;
 	const ownerAlive = options.ownerAlive ?? processIsAlive;
 	const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
-	const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
-	const lockRetryMs = options.lockRetryMs ?? DEFAULT_LOCK_RETRY_MS;
-	const lockStaleMs = options.lockStaleMs ?? DEFAULT_LEASE_MS;
-	// An ownerless lock is bounded by the acquisition timeout, not the lease, and
-	// strictly *below* it: at exactly `lockTimeoutMs` the acquirer that finds the
-	// debris can never reclaim it inside its own deadline, so the caller that
-	// discovers the wedge is still the one that eats a hard timeout. Half the
-	// bound is thousands of times the real mkdir -> writeFile publication gap and
-	// leaves the discovering acquirer a full retry window. See
-	// `recoverOwnerlessLock`.
-	const ownerlessLockStaleMs =
-		options.ownerlessLockStaleMs ?? Math.max(1, Math.floor(lockTimeoutMs / 2));
-	const makeId = options.makeId ?? randomUUID;
 	// How many times one acquisition may re-run the caller's selector after a
 	// capacity refusal. The selector runs *inside* the lock, so this is a direct
 	// bound on how long one reserver can hold it away from every other reserver;
 	// it is not a routing knob. The caller ends the loop earlier by returning null.
 	const selectionAttemptLimit = options.selectionAttemptLimit ?? 8;
+	const makeId = options.makeId ?? randomUUID;
+	const store = createLockedJsonStore({
+		root,
+		name: "reservations",
+		now,
+		ownerAlive,
+		lockTimeoutMs: options.lockTimeoutMs,
+		lockRetryMs: options.lockRetryMs,
+		lockStaleMs: options.lockStaleMs,
+		ownerlessLockStaleMs: options.ownerlessLockStaleMs,
+		lockErrorMessage: "timed out acquiring broker reservation lock",
+		malformedMessage: "broker reservation ledger is malformed",
+		empty: emptyLedger,
+		parse: parseLedger,
+	});
+	const withLock = store.withLock;
 
-	async function reclaimLock() {
-		const stalePath = resolve(root, `.reservations.lock.stale.${randomUUID()}`);
+	// Shared account accounting (increment 6 / F3.2). `accountRootFor` maps a
+	// provider to the root of the account it meters against, or null when this
+	// host cannot say with certainty. Unset, every path below is skipped and the
+	// ledger behaves exactly as it did before shared accounting existed.
+	//
+	// Lock order is project lock outer, account lock inner, in every operation.
+	// There is no path that takes them the other way round. The cost is that a
+	// contended account lock is waited for while this project's lock is held.
+	const accountRootFor = options.accountRootFor ?? null;
+	const accountStores = new Map();
+	function accountStoreFor(provider) {
+		if (!accountRootFor) return null;
+		let accountRoot = null;
 		try {
-			await rename(lockPath, stalePath);
-		} catch (error) {
-			if (error?.code === "ENOENT") return true;
-			throw error;
-		}
-		await rm(stalePath, { recursive: true, force: true });
-		return true;
-	}
-
-	/**
-	 * A lock directory whose `owner.json` never became readable names no owner,
-	 * so liveness cannot be tested. It is either a live acquirer inside the
-	 * `mkdir` -> `writeFile` publication gap or the debris of one that died
-	 * there. That gap is microseconds wide, so the directory's own mtime decides
-	 * — against the short acquisition bound rather than `lockStaleMs`, since
-	 * holding an unrecoverable lock for a full lease would fail every reserve
-	 * for that lease's duration, which is the wedge this recovers from.
-	 */
-	async function recoverOwnerlessLock() {
-		let stats;
-		try {
-			stats = await stat(lockPath);
-		} catch (error) {
-			if (error?.code === "ENOENT") return true;
-			throw error;
-		}
-		if (stats.mtimeMs + ownerlessLockStaleMs > now()) return false;
-		return await reclaimLock();
-	}
-
-	async function recoverStaleLock() {
-		let owner;
-		try {
-			owner = JSON.parse(
-				await readFile(resolve(lockPath, "owner.json"), "utf8"),
-			);
+			accountRoot = accountRootFor(provider);
 		} catch {
-			return await recoverOwnerlessLock();
+			return null;
 		}
-		const expired =
-			Number.isFinite(owner.acquiredAt) &&
-			owner.acquiredAt + lockStaleMs <= now();
-		if (!expired && ownerAlive(owner.pid) !== false) return false;
-		return await reclaimLock();
-	}
-
-	async function acquireLock() {
-		await mkdir(root, { recursive: true, mode: 0o700 });
-		const deadline = now() + lockTimeoutMs;
-		while (true) {
-			const token = randomUUID();
-			try {
-				await mkdir(lockPath, { mode: 0o700 });
-				try {
-					await writeFile(
-						resolve(lockPath, "owner.json"),
-						`${JSON.stringify({ token, pid: process.pid, acquiredAt: now() })}\n`,
-						{ mode: 0o600 },
-					);
-				} catch (error) {
-					await rm(lockPath, { recursive: true, force: true });
-					throw error;
-				}
-				return token;
-			} catch (error) {
-				if (error?.code !== "EEXIST") throw error;
-				if (await recoverStaleLock()) continue;
-				if (now() >= deadline) {
-					throw new Error("timed out acquiring broker reservation lock");
-				}
-				await delay(lockRetryMs);
-			}
+		if (!accountRoot) return null;
+		let commitmentStore = accountStores.get(accountRoot);
+		if (!commitmentStore) {
+			commitmentStore = createCommitmentStore({
+				root: accountRoot,
+				now,
+				ownerAlive,
+				lockTimeoutMs: options.lockTimeoutMs,
+				lockRetryMs: options.lockRetryMs,
+				lockStaleMs: options.lockStaleMs,
+				ownerlessLockStaleMs: options.ownerlessLockStaleMs,
+			});
+			accountStores.set(accountRoot, commitmentStore);
 		}
-	}
-
-	async function readLedger() {
-		let raw;
-		try {
-			raw = await readFile(ledgerPath, "utf8");
-		} catch (error) {
-			if (error?.code === "ENOENT") return emptyLedger();
-			throw error;
-		}
-		let value;
-		try {
-			value = JSON.parse(raw);
-		} catch {
-			throw new Error("broker reservation ledger is malformed");
-		}
-		if (
-			value?.schemaVersion !== LEDGER_VERSION ||
-			!Number.isInteger(value.revision) ||
-			value.revision < 0 ||
-			!Array.isArray(value.reservations)
-		) {
-			throw new Error("broker reservation ledger has an unsupported schema");
-		}
-		if (value.fallbackAttempts === undefined) value.fallbackAttempts = [];
-		if (!Array.isArray(value.fallbackAttempts)) {
-			throw new Error("broker reservation ledger has an unsupported schema");
-		}
-		return value;
-	}
-
-	async function writeLedger(ledger) {
-		const next = { ...ledger, revision: ledger.revision + 1 };
-		const temporaryPath = resolve(
-			root,
-			`.reservations.${process.pid}.${randomUUID()}.tmp`,
-		);
-		await writeFile(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, {
-			mode: 0o600,
-		});
-		await rename(temporaryPath, ledgerPath);
-		return next;
-	}
-
-	async function withLock(operation) {
-		const token = await acquireLock();
-		try {
-			const ledger = await readLedger();
-			return await operation(ledger, writeLedger);
-		} finally {
-			try {
-				const owner = JSON.parse(
-					await readFile(resolve(lockPath, "owner.json"), "utf8"),
-				);
-				if (owner.token === token) {
-					await rm(lockPath, { recursive: true, force: true });
-				}
-			} catch {
-				// A reclaimed lock is intentionally not removed by its former owner.
-			}
-		}
+		return commitmentStore;
 	}
 
 	// Records written before ownership generations existed carry no fence; they
@@ -237,6 +150,11 @@ export function createReservationLedger(options = {}) {
 		return ownerAlive(record.ownerPid) === false;
 	}
 
+	// Recovered records leave their shared commitment behind. That is deliberate
+	// and not a leak: the commitment carries the same `expiresAt` and the same
+	// pid as the record, so the shared store drops it on exactly the condition
+	// that reclaimed the record here, without this project having to reach into
+	// another lock while holding its own.
 	function recover(ledger, timestamp) {
 		let changed = false;
 		for (const record of ledger.reservations) {
@@ -321,6 +239,12 @@ export function createReservationLedger(options = {}) {
 			let ownerId = "";
 			let estimatedConsumption = 0;
 			let attempts = 0;
+			// The id is minted before the capacity decision because the shared
+			// account store is written first and has to name the reservation it is
+			// holding room for. Only one candidate can ever commit: the loop breaks
+			// on the first success, so the id is never reused across accounts.
+			const pendingId = makeId();
+			let committedId = null;
 			while (true) {
 				attempts += 1;
 				try {
@@ -347,6 +271,14 @@ export function createReservationLedger(options = {}) {
 					"reservation.capacity",
 				);
 
+				// Capacity is decided by the shared account store when this provider
+				// resolves to one, and by this project's own rows when it does not.
+				// Never by both: every row this project holds for that provider is
+				// already in the shared store, so adding the local sum would count
+				// this project's own reservations twice and refuse a window that
+				// actually has room.
+				const commitments = accountStoreFor(provider);
+
 				const duplicate = ledger.reservations.find(
 					(record) =>
 						record.state === "reserved" &&
@@ -356,20 +288,56 @@ export function createReservationLedger(options = {}) {
 						record.taskId === taskId &&
 						record.ownerId === ownerId,
 				);
+				let consumed = 0;
+				let refusalReason = "capacity";
 				if (duplicate) {
-					if (recovered) await persist(ledger);
-					return publicReservation(duplicate);
+					// A retry of a reservation this project already holds still has to
+					// be backed by a live account row. The first attempt's row can be
+					// gone — expired, pruned after a stalled renewal, or lost with the
+					// store — and handing the caller a reservation the account no
+					// longer knows about is how two projects end up running against
+					// one subscription with neither ledger showing it.
+					if (!commitments) {
+						if (recovered) await persist(ledger);
+						return publicReservation(duplicate);
+					}
+					const reattached = await commitDecision(commitments, {
+						reservationId: duplicate.id,
+						provider,
+						window,
+						amount: duplicate.estimatedConsumption,
+						capacity,
+						expiresAt: duplicate.expiresAt,
+						ownerPid: duplicate.ownerPid,
+					});
+					if (reattached.committed) {
+						if (recovered) await persist(ledger);
+						return publicReservation(duplicate);
+					}
+					consumed = reattached.consumed;
+					refusalReason = reattached.reason;
+				} else if (commitments) {
+					const decision = await commitDecision(commitments, {
+						reservationId: pendingId,
+						provider,
+						window,
+						amount: estimatedConsumption,
+						capacity,
+						// The commitment carries the same lease as the record below,
+						// so both sides of the accounting expire on one schedule.
+						expiresAt: timestamp + leaseMs,
+						ownerPid: Number.isInteger(input.ownerPid) ? input.ownerPid : null,
+					});
+					if (decision.committed) {
+						committedId = pendingId;
+						break;
+					}
+					consumed = decision.consumed;
+					refusalReason = decision.reason;
+				} else {
+					consumed = localConsumed(ledger, provider, window);
+					if (consumed + estimatedConsumption <= capacity) break;
 				}
-
-				const consumed = ledger.reservations
-					.filter(
-						(record) =>
-							record.state === "reserved" &&
-							record.provider === provider &&
-							record.window === window,
-					)
-					.reduce((total, record) => total + record.estimatedConsumption, 0);
-				if (consumed + estimatedConsumption <= capacity) break;
 				refusals.push(
 					Object.freeze({
 						provider,
@@ -377,6 +345,7 @@ export function createReservationLedger(options = {}) {
 						capacity,
 						consumed,
 						requested: estimatedConsumption,
+						reason: refusalReason,
 					}),
 				);
 				if (attempts >= selectionAttemptLimit) {
@@ -386,7 +355,7 @@ export function createReservationLedger(options = {}) {
 			}
 
 			const record = {
-				id: makeId(),
+				id: committedId ?? pendingId,
 				provider,
 				window,
 				runId,
@@ -394,6 +363,9 @@ export function createReservationLedger(options = {}) {
 				ownerId,
 				ownerPid: Number.isInteger(input.ownerPid) ? input.ownerPid : null,
 				estimatedConsumption,
+				// Kept so a later renewal can re-admit this reservation into its
+				// account window without a fresh snapshot read.
+				capacity: requirePositive(input.capacity, "reservation.capacity"),
 				actualConsumption: null,
 				state: "reserved",
 				createdAt: timestamp,
@@ -409,6 +381,86 @@ export function createReservationLedger(options = {}) {
 			await persist(ledger);
 			return publicReservation(record);
 		});
+	}
+
+	/**
+	 * Ask the shared account store whether this reservation fits, treating an
+	 * unreachable store as a refusal.
+	 *
+	 * Falling back to this project's own rows here would be fail-open, not
+	 * fail-closed: a wedged lock or a flapping filesystem would put every
+	 * project back on its private view of a window it is sharing, and two of
+	 * them with empty local ledgers would both reserve the last unit. Only an
+	 * account that never resolved at all may use project-local accounting,
+	 * because there is then no shared view to contradict.
+	 */
+	async function commitDecision(commitments, input) {
+		try {
+			const decision = await commitments.commit(input);
+			return {
+				committed: decision.committed,
+				consumed: decision.consumed,
+				reason: "capacity",
+			};
+		} catch {
+			return { committed: false, consumed: 0, reason: "account_unavailable" };
+		}
+	}
+
+	// Commitment upkeep after the project record has already changed. A failure
+	// here cannot be reported to the caller without lying about the reservation
+	// it just completed, so the row is left to expire on its own lease instead:
+	// the shared store and the ledger carry the same `expiresAt` and the same
+	// pid, so both sides heal on one schedule.
+	async function releaseCommitment(record) {
+		const commitments = accountStoreFor(record.provider);
+		if (!commitments) return;
+		try {
+			await commitments.release({ reservationId: record.id });
+		} catch {
+			// Left to lease expiry.
+		}
+	}
+
+	/**
+	 * Hold the shared account row for a reservation whose lease is being
+	 * extended, and report whether the account still grants it.
+	 *
+	 * A renewal that silently tolerated a missing row would be the quiet
+	 * double-booking path: the local reservation would keep advancing while the
+	 * account had already handed that capacity to another project, and nothing
+	 * would record the overlap. So the answer is returned rather than swallowed,
+	 * and an unreachable store counts as a refusal for the same reason a
+	 * refusing one does.
+	 *
+	 * @returns {Promise<boolean>} true when this project still owns the capacity
+	 */
+	async function holdCommitment(record, expiresAt) {
+		const commitments = accountStoreFor(record.provider);
+		if (!commitments) return true;
+		try {
+			const result = await commitments.renew({
+				reservationId: record.id,
+				provider: record.provider,
+				window: record.window,
+				amount: record.estimatedConsumption,
+				// Records written before shared accounting carry no capacity. Sizing
+				// the window at this one reservation is the conservative reading: it
+				// re-admits into an empty window and refuses a shared one, rather
+				// than inventing headroom the account never quoted.
+				capacity:
+					typeof record.capacity === "number" &&
+					Number.isFinite(record.capacity) &&
+					record.capacity > 0
+						? record.capacity
+						: record.estimatedConsumption,
+				expiresAt,
+				ownerPid: record.ownerPid,
+			});
+			return result.renewed === true;
+		} catch {
+			return false;
+		}
 	}
 
 	async function reserve(input) {
@@ -474,6 +526,7 @@ export function createReservationLedger(options = {}) {
 			record.terminalAt = timestamp;
 			record.updatedAt = timestamp;
 			await persist(ledger);
+			await releaseCommitment(record);
 			return Object.freeze({
 				reservation: publicReservation(record),
 				state: record.state,
@@ -502,6 +555,12 @@ export function createReservationLedger(options = {}) {
 			record.expiresAt = timestamp + leaseMs;
 			record.updatedAt = timestamp;
 			record.fence = fenceOf(record) + 1;
+			// A dead owner's commitment has usually already been pruned, so this is
+			// a re-admission under current capacity rather than a lease bump. It
+			// must not succeed locally if the account has meanwhile been filled.
+			if (!(await holdCommitment(record, record.expiresAt))) {
+				throw new Error("account capacity for this reservation is gone");
+			}
 			await persist(ledger);
 			return Object.freeze({
 				reservation: publicReservation(record),
@@ -547,7 +606,20 @@ export function createReservationLedger(options = {}) {
 				});
 			}
 			const timestamp = now();
-			record.expiresAt = timestamp + leaseMs;
+			const expiresAt = timestamp + leaseMs;
+			if (!(await holdCommitment(record, expiresAt))) {
+				// The account no longer grants this capacity, so the reservation is
+				// over whatever the local ledger says. Releasing it here is what
+				// stops the owner from carrying on against a subscription another
+				// project now holds.
+				record.state = "released";
+				record.terminalReason = "account_lost";
+				record.terminalAt = timestamp;
+				record.updatedAt = timestamp;
+				await persist(ledger);
+				return Object.freeze({ renewed: false, reason: "reclaimed" });
+			}
+			record.expiresAt = expiresAt;
 			record.updatedAt = timestamp;
 			await persist(ledger);
 			return Object.freeze({

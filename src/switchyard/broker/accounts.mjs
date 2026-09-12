@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
 	chmodSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
 	statSync,
@@ -63,6 +64,27 @@ export function accountIdentifier(targetId, hostKey) {
  * @param {{root?: string}} [options]
  * @returns {Buffer|null} the key, or null when it cannot be read or created
  */
+/**
+ * Whether an accounts root has already numbered accounts under a key it no
+ * longer has. A root that does not exist, or holds nothing but staging debris,
+ * is a genuine first use.
+ * @param {string} root
+ * @returns {boolean}
+ */
+function initializedWithoutKey(root) {
+	let entries;
+	try {
+		entries = readdirSync(root);
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		// An unreadable root is not provably first use, so treat it as numbered.
+		return true;
+	}
+	return entries.some(
+		(entry) => !entry.startsWith(".") && !entry.startsWith(HOST_KEY_FILENAME),
+	);
+}
+
 export function readHostKey(options = {}) {
 	const root = resolve(options.root ?? resolveAccountsRoot());
 	const keyPath = resolve(root, HOST_KEY_FILENAME);
@@ -74,6 +96,12 @@ export function readHostKey(options = {}) {
 		if (error?.code !== "ENOENT") return null;
 	}
 	try {
+		// Generating a key is only safe when nothing has been numbered with the
+		// old one. An accounts root that already holds account directories but
+		// has lost its key would otherwise be silently renumbered, and a project
+		// still using the old numbering would reserve against a different root
+		// for the same subscription. Fail closed and let the owner decide.
+		if (initializedWithoutKey(root)) return null;
 		mkdirSync(root, { recursive: true, mode: 0o700 });
 		chmodSync(root, 0o700);
 		const generated = randomBytes(HOST_KEY_BYTES);
@@ -157,4 +185,46 @@ export function identifiersMatch(left, right) {
 	if (typeof left !== "string" || typeof right !== "string") return false;
 	if (left.length !== right.length) return false;
 	return timingSafeEqual(Buffer.from(left), Buffer.from(right));
+}
+
+const SHARED_LEDGER_FLAG = "SWITCHYARD_SHARED_ACCOUNT_LEDGER";
+
+/**
+ * Whether this process coordinates reservations through shared account roots.
+ *
+ * Opt-in, and deliberately not the same control as `SWITCHYARD_ACCOUNT_ROOT`:
+ * that one says *where* accounts live and exists so tests never touch the
+ * host's real ones. Overloading it as the enable switch would mean any test
+ * that redirected the location also silently turned shared accounting on.
+ *
+ * Default off keeps every project on its own ledger, byte-identical to the
+ * behaviour before this existed, until the attended cutover.
+ * @returns {boolean}
+ */
+function sharedAccountLedgerEnabled() {
+	const value = process.env[SHARED_LEDGER_FLAG];
+	return value === "1" || value === "true";
+}
+
+/**
+ * Build the provider -> account root resolver the reservation ledger consumes,
+ * or null when shared accounting is off. Resolution is cached per provider for
+ * the life of the resolver: the roster is stable within a dispatch, and the
+ * alternative is a roster read inside the reservation lock.
+ *
+ * @param {{root?: string, enabled?: boolean}} [options]
+ * @returns {((provider: string) => string|null)|null}
+ */
+export function createAccountRootResolver(options = {}) {
+	const enabled = options.enabled ?? sharedAccountLedgerEnabled();
+	if (!enabled) return null;
+	const cache = new Map();
+	return (provider) => {
+		if (typeof provider !== "string" || provider === "") return null;
+		if (cache.has(provider)) return cache.get(provider);
+		const account = resolveAccountRoot(provider, options);
+		const root = account ? account.root : null;
+		cache.set(provider, root);
+		return root;
+	};
 }

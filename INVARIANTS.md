@@ -71,8 +71,8 @@ gate_test: tests/mutation-protocol.test.mjs, tests/orphan-kill.test.mjs
 
 ### Contract gate: reservation-ledger
 
-area: ["src/switchyard/broker/index.mjs", "src/switchyard/broker/reservations.mjs", "src/switchyard/broker/snapshots.mjs", "src/switchyard/broker/accounts.mjs"]
-gate_test: tests/broker-reservations.test.mjs, tests/broker-snapshots.test.mjs, tests/broker-fallback.test.mjs, tests/broker-accounts.test.mjs
+area: ["src/switchyard/broker/index.mjs", "src/switchyard/broker/reservations.mjs", "src/switchyard/broker/snapshots.mjs", "src/switchyard/broker/accounts.mjs", "src/switchyard/broker/commitments.mjs", "src/switchyard/broker/store.mjs"]
+gate_test: tests/broker-reservations.test.mjs, tests/broker-snapshots.test.mjs, tests/broker-fallback.test.mjs, tests/broker-accounts.test.mjs, tests/broker-shared-accounts.test.mjs
 
 ### Contract gate: route-selection
 

@@ -386,6 +386,10 @@ export function createBroker(dependencies = {}) {
 				? [request.capability]
 				: [request.capability, ceiling];
 		let selected = null;
+		let accountingWindows = null;
+		const onRouted = (routed) => {
+			accountingWindows = routed.accountingWindows ?? null;
+		};
 		const reservation = await reservations.reserveWithSelection(
 			() => {
 				for (const capability of capabilities) {
@@ -393,14 +397,23 @@ export function createBroker(dependencies = {}) {
 					selected = selectPrepared(candidateRequest, {
 						snapshotRead,
 						exclude: [previous.provider],
+						onRouted,
 					});
 					if (selected.provider) {
-						const generation =
-							selected.snapshotIdentity.mtime ??
-							selected.snapshotIdentity.status;
 						return {
 							provider: selected.provider,
-							window: `${selected.snapshotIdentity.source}@${generation}`,
+							// The same key ordinary selection would compute. Keying a
+							// fallback by the raw snapshot generation instead charged the
+							// winner's real quota bucket under a second name, so neither
+							// reservation counted against the other — invisible within one
+							// project, and a straight overdraft once two projects share the
+							// account.
+							window: accountingWindowKey(
+								selected.snapshotIdentity.source,
+								accountingWindows,
+								selected.snapshotIdentity.mtime ??
+									selected.snapshotIdentity.status,
+							),
 							runId: request.runId,
 							taskId: request.taskId,
 							ownerId,

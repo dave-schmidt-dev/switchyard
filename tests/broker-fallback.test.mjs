@@ -191,6 +191,57 @@ describe("broker fallback", () => {
 		);
 	});
 
+	it("charges a fallback to the same accounting window as ordinary selection", async () => {
+		// The fallback path used to key its reservation by the raw snapshot
+		// generation while selection keyed it by the quota bucket, so one real
+		// window was accounted under two names and neither amount counted against
+		// the other. Within a project that hid a saturated provider; across two
+		// projects sharing an account it is a straight overdraft.
+		const windows = [{ id: "weekly", reset_iso: "2026-08-18T02:00:00.000Z" }];
+		const seen = [];
+		const broker = createBroker(
+			dependencies({
+				reservations: {
+					async reserveWithSelection(select) {
+						const selected = await select([]);
+						if (!selected) return null;
+						seen.push(selected.window);
+						return {
+							id: `reservation-${seen.length}`,
+							provider: selected.provider,
+							runId: selected.runId,
+							taskId: selected.taskId,
+							amount: selected.estimatedConsumption,
+						};
+					},
+					async terminal() {
+						return { changed: true };
+					},
+				},
+				route: ({ requiredCapability, exclude, snapshotRead }) => {
+					const provider = !exclude.includes("Cheap") ? "Cheap" : "Peer";
+					return {
+						provider,
+						model: `${provider.toLowerCase()}-${requiredCapability}`,
+						resolvedTargetId: provider.toLowerCase(),
+						reason: "ranked",
+						snapshotStatus: snapshotRead.snapshotStatus,
+						snapshotMtime: snapshotRead.snapshotMtime,
+						snapshotAgeMsAtRoute: snapshotRead.snapshotAgeMsAtRoute,
+						accountingWindows: windows,
+					};
+				},
+			}),
+		);
+		const first = await broker.selectAndReserve(request());
+		await broker.fallbackAndReserve(request(), first, {
+			failureKind: "transient",
+		});
+		strictEqual(seen.length, 2);
+		strictEqual(seen[1], seen[0]);
+		strictEqual(seen[0].includes("weekly"), true);
+	});
+
 	it("preserves the one-fallback ceiling across broker restart", async () => {
 		const root = await tempDirAsync("switchyard-fallback-");
 		const firstBroker = createBroker(

@@ -32,6 +32,20 @@ import { tempDir } from "./helpers/tempdir.mjs";
 
 const ROOT = join(process.cwd());
 
+/**
+ * Remove a fixture checkout, tolerating a git process that still holds a file
+ * inside it. Under a loaded run that surfaced as an ENOTEMPTY thrown from the
+ * cleanup, failing the test and reporting a cleanup race as a contract-gate
+ * defect. Whatever survives is collected by the tracked-tempdir exit handler.
+ */
+function discardFixture(path) {
+	try {
+		rmSync(path, { recursive: true, force: true });
+	} catch (error) {
+		if (error?.code !== "ENOTEMPTY") throw error;
+	}
+}
+
 function createReceiptFixture({ stage = true } = {}) {
 	const fixture = tempDir("switchyard-contract-cli-");
 	const manifest = loadContractGateManifest(ROOT);
@@ -333,7 +347,10 @@ describe("source-boundary contract gate mapping", () => {
 				"tests/diagnostics.test.mjs": "not-run",
 			});
 		} finally {
-			rmSync(fixture, { recursive: true, force: true });
+			// Left to the tracked-tempdir exit handler. Removing a git fixture
+			// inline raced a git process that still held a file in it and failed
+			// the test with ENOTEMPTY under a loaded run.
+			discardFixture(fixture);
 		}
 		deepStrictEqual(
 			ownersForPaths(loadContractGateManifest(ROOT), [
@@ -351,7 +368,7 @@ describe("source-boundary contract gate mapping", () => {
 			strictEqual(result.required, false);
 			deepStrictEqual(result.owners, []);
 		} finally {
-			rmSync(fixture, { recursive: true, force: true });
+			discardFixture(fixture);
 		}
 	});
 
@@ -394,7 +411,7 @@ describe("source-boundary contract gate mapping", () => {
 					),
 			);
 		} finally {
-			rmSync(fixture, { recursive: true, force: true });
+			discardFixture(fixture);
 		}
 	});
 
@@ -439,7 +456,7 @@ describe("source-boundary contract gate mapping", () => {
 					),
 			);
 		} finally {
-			rmSync(fixture, { recursive: true, force: true });
+			discardFixture(fixture);
 		}
 	});
 });

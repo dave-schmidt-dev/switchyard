@@ -84,6 +84,7 @@ import {
 	execute as executeVibe,
 	executeAsync as executeVibeAsync,
 } from "../adapter/vibe.mjs";
+import { createAccountRootResolver } from "../broker/accounts.mjs";
 import { registerBrokerExecutionPolicy } from "../broker/executor.mjs";
 import { createBroker } from "../broker/index.mjs";
 import { createProviderProcessCompletedOutcome } from "../broker/outcome.mjs";
@@ -10137,6 +10138,10 @@ function createDispatchBroker(context, dependencies = {}) {
 		reservations: dependencies.brokerReservations,
 		reservationOptions: dependencies.brokerReservationOptions ?? {
 			root: projectLedgerRoot,
+			// Null unless shared account accounting is switched on, in which case
+			// capacity for a provider is decided against the account root shared by
+			// every project on this host instead of this project's ledger alone.
+			accountRootFor: createAccountRootResolver(),
 		},
 		snapshotSources,
 		readSnapshot: usesProductionRouter

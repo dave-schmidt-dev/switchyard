@@ -11,7 +11,7 @@
 import { notStrictEqual, ok, strictEqual } from "node:assert";
 import { createHash, randomBytes } from "node:crypto";
 import {
-	mkdtempSync,
+	existsSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
@@ -25,12 +25,14 @@ import { fileURLToPath } from "node:url";
 
 import {
 	accountIdentifier,
+	createAccountRootResolver,
 	identifiersMatch,
 	readHostKey,
 	resolveAccountRoot,
 	resolveAccountsRoot,
 } from "../src/switchyard/broker/accounts.mjs";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
@@ -74,7 +76,7 @@ after(() => {
 });
 
 beforeEach(() => {
-	scratch = mkdtempSync(join(tmpdir(), "switchyard-accounts-"));
+	scratch = tempDir("switchyard-accounts-");
 	process.env.SWITCHYARD_ACCOUNT_ROOT = scratch;
 	useRoster(FIXTURE_PATH);
 });
@@ -140,6 +142,18 @@ describe("host key", () => {
 		strictEqual(readHostKey().equals(first), true);
 	});
 
+	it("refuses to renumber an accounts root whose key is gone", () => {
+		const account = resolveAccountRoot("antigravity");
+		ok(account);
+		rmSync(join(scratch, "host-key"), { force: true });
+		// A replacement key would renumber every account here, and a project
+		// still holding the old numbering would reserve against a different root
+		// for the same subscription.
+		strictEqual(readHostKey(), null);
+		strictEqual(resolveAccountRoot("antigravity"), null);
+		ok(!existsSync(join(scratch, "host-key")));
+	});
+
 	it("fails closed when the stored key is the wrong length", () => {
 		writeFileSync(join(scratch, "host-key"), randomBytes(8), { mode: 0o600 });
 		strictEqual(readHostKey(), null);
@@ -182,6 +196,26 @@ describe("account root", () => {
 	it("fails closed when the roster cannot be read", () => {
 		useRoster(join(scratch, "missing-roster.json"));
 		strictEqual(resolveAccountRoot("antigravity"), null);
+	});
+
+	it("is off until the shared-account flag is set", () => {
+		const previous = process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
+		delete process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
+		try {
+			strictEqual(createAccountRootResolver(), null);
+			process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER = "1";
+			const resolver = createAccountRootResolver();
+			ok(resolver);
+			const root = resolver("antigravity");
+			ok(root?.startsWith(resolve(scratch)));
+			strictEqual(resolver("no-such-provider"), null);
+		} finally {
+			if (previous === undefined) {
+				delete process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
+			} else {
+				process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER = previous;
+			}
+		}
 	});
 
 	it("fails closed when the host key cannot be read", () => {
