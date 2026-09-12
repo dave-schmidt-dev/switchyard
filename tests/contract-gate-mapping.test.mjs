@@ -43,13 +43,21 @@ function createReceiptFixture() {
 		"scripts/check-contract-receipt.mjs",
 		"scripts/run-test-phases.mjs",
 		"scripts/run-validate-phases.mjs",
-		...manifest.flatMap((gate) => [...gate.areas, ...gate.tests]),
+		// An area may be declared as a directory glob, which is a pattern rather
+		// than a path: copy the directory it names, or the fixture cannot be built
+		// at all and every gate in the manifest goes unexercised.
+		...manifest.flatMap((gate) => [
+			...gate.areas.map((area) =>
+				area.endsWith("/**") ? area.slice(0, -3) : area,
+			),
+			...gate.tests,
+		]),
 	];
 	for (const sourcePath of new Set(paths)) {
 		const source = join(ROOT, sourcePath);
 		const destination = join(fixture, sourcePath);
 		mkdirSync(join(destination, ".."), { recursive: true });
-		cpSync(source, destination);
+		cpSync(source, destination, { recursive: true });
 	}
 	execFileSync("git", ["init", "-q"], { cwd: fixture });
 	execFileSync("git", ["config", "user.email", "test@example.invalid"], {
@@ -184,7 +192,7 @@ describe("source-boundary contract gate mapping", () => {
 	it("maps each declared production boundary to existing suites", () => {
 		const manifest = loadContractGateManifest(ROOT);
 		const ledger = loadLedgerGateMapping(ROOT);
-		strictEqual(manifest.length, 10);
+		strictEqual(manifest.length, 13);
 		strictEqual(
 			validateContractGateMapping({ manifest, ledger, root: ROOT }),
 			true,

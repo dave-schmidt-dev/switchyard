@@ -69,6 +69,21 @@ gate_test: tests/diagnostics.test.mjs
 area: ["src/switchyard/lifecycle/mutation-protocol.mjs"]
 gate_test: tests/mutation-protocol.test.mjs, tests/orphan-kill.test.mjs
 
+### Contract gate: reservation-ledger
+
+area: ["src/switchyard/broker/index.mjs", "src/switchyard/broker/reservations.mjs", "src/switchyard/broker/snapshots.mjs"]
+gate_test: tests/broker-reservations.test.mjs, tests/broker-snapshots.test.mjs, tests/broker-fallback.test.mjs
+
+### Contract gate: route-selection
+
+area: ["src/switchyard/router/index.mjs", "src/switchyard/router/scorer.mjs"]
+gate_test: tests/router.test.mjs, tests/router-rightsizing.test.mjs, tests/router-usage-provider.test.mjs
+
+### Contract gate: provider-authentication
+
+area: ["src/switchyard/auth/**", "src/switchyard/adapter/agy.mjs", "src/switchyard/adapter/claude.mjs", "src/switchyard/adapter/codex.mjs", "src/switchyard/adapter/copilot.mjs", "src/switchyard/adapter/cursor.mjs", "src/switchyard/adapter/opencode.mjs"]
+gate_test: tests/auth-check.test.mjs, tests/auth-liveness.test.mjs, tests/agy-auth.test.mjs, tests/claude-auth.test.mjs, tests/codex-auth.test.mjs, tests/copilot-auth.test.mjs, tests/cursor-auth.test.mjs, tests/opencode-auth.test.mjs
+
 <!-- /contract-gates/v1 -->
 
 ### INV-1 — Agents have no rights to the Mac host

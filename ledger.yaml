@@ -73,3 +73,6 @@ contract_gates:
   finalization: {gate_test_status: not-run}
   diagnostics: {gate_test_status: not-run}
   mutation-protocol: {gate_test_status: not-run}
+  reservation-ledger: {gate_test_status: not-run}
+  route-selection: {gate_test_status: not-run}
+  provider-authentication: {gate_test_status: not-run}
