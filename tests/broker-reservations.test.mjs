@@ -497,6 +497,42 @@ describe("broker reservations", () => {
 		);
 	});
 
+	it("lets the acquirer that finds ownerless debris reclaim it inside its own deadline", async () => {
+		const root = await tempDirAsync(
+			"switchyard-reservations-ownerless-deadline-",
+		);
+		await mkdir(join(root, "reservations.lock"));
+		// No ownerlessLockStaleMs: the default must leave this acquirer a real
+		// recovery window. At a threshold equal to lockTimeoutMs the reclaim still
+		// happens, but only on the tick that also satisfies the deadline check one
+		// line later — correct by evaluation order alone. Asserting the elapsed
+		// time is what distinguishes a real window from that knife edge.
+		const lockTimeoutMs = 400;
+		const ledger = createReservationLedger({
+			root,
+			lockTimeoutMs,
+			lockRetryMs: 20,
+		});
+		const startedAt = Date.now();
+		const reservation = await ledger.reserve({
+			provider: "Codex",
+			window: "window-1",
+			runId: "run-1",
+			taskId: "TASK-001",
+			ownerId: "owner-1",
+			ownerPid: 202,
+			estimatedConsumption: 1,
+			capacity: 1,
+		});
+		strictEqual(reservation.taskId, "TASK-001");
+		const elapsed = Date.now() - startedAt;
+		strictEqual(
+			elapsed < lockTimeoutMs * 0.75,
+			true,
+			`expected the reclaim well inside the acquisition window, took ${elapsed}ms of ${lockTimeoutMs}ms`,
+		);
+	});
+
 	it("refuses a freshly created ownerless lock rather than stealing it", async () => {
 		const root = await tempDirAsync("switchyard-reservations-ownerless-fresh-");
 		await mkdir(join(root, "reservations.lock"));

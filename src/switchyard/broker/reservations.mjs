@@ -70,9 +70,15 @@ export function createReservationLedger(options = {}) {
 	const lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
 	const lockRetryMs = options.lockRetryMs ?? DEFAULT_LOCK_RETRY_MS;
 	const lockStaleMs = options.lockStaleMs ?? DEFAULT_LEASE_MS;
-	// An ownerless lock is bounded by the acquisition timeout, not the lease:
-	// see `recoverOwnerlessLock`.
-	const ownerlessLockStaleMs = options.ownerlessLockStaleMs ?? lockTimeoutMs;
+	// An ownerless lock is bounded by the acquisition timeout, not the lease, and
+	// strictly *below* it: at exactly `lockTimeoutMs` the acquirer that finds the
+	// debris can never reclaim it inside its own deadline, so the caller that
+	// discovers the wedge is still the one that eats a hard timeout. Half the
+	// bound is thousands of times the real mkdir -> writeFile publication gap and
+	// leaves the discovering acquirer a full retry window. See
+	// `recoverOwnerlessLock`.
+	const ownerlessLockStaleMs =
+		options.ownerlessLockStaleMs ?? Math.max(1, Math.floor(lockTimeoutMs / 2));
 	const makeId = options.makeId ?? randomUUID;
 
 	async function reclaimLock() {
