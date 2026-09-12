@@ -63,13 +63,16 @@ import {
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
 import {
+	createExecutionBackend,
+	hostBackendDefaults,
+} from "../lifecycle/backend-selection.mjs";
+import {
 	captureDirtyOverlay,
 	ignoredPath,
 	readDirtyOverlayReceipt,
 	validateDirtyOverlayReceipt,
 	writeDirtyOverlayReceipt,
 } from "../lifecycle/index.mjs";
-import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import {
 	applyOutcomeProjection,
@@ -2021,11 +2024,8 @@ const PROVIDER_BINARY_NAMES = {
  * @returns {import("../lifecycle/execution-backend.mjs").ExecutionBackend}
  */
 function executionBackendForRun() {
-	return new ParallelsExecutionBackend({
-		goldenImage: process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
-		aquaUid: process.env.SWITCHYARD_PARALLELS_AQUA_UID,
-		providerUser:
-			process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ?? "switchyard",
+	return createExecutionBackend({
+		...hostBackendDefaults(),
 		// This is the process that reclaims a dead worker's clones, so it is the
 		// one that most needs to read the sidecars a live worker wrote.
 		snapshotSidecarRoot: getVmAdmissionRoot(),
@@ -2092,7 +2092,7 @@ function probeProviderProcess(run, { executionBackend, execFn } = {}) {
 
 	try {
 		const backend = execFn
-			? new ParallelsExecutionBackend({ execFn })
+			? createExecutionBackend({ execFn })
 			: (executionBackend ?? executionBackendForRun());
 		const output = backend.inspectProcess(workingContainerName).toString();
 		return output

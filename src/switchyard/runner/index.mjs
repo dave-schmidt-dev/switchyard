@@ -107,6 +107,10 @@ import {
 	recordExternalCompletionToStore,
 } from "../ledger/index.mjs";
 import {
+	createExecutionBackend,
+	hostBackendDefaults,
+} from "../lifecycle/backend-selection.mjs";
+import {
 	loadWorkspaceLifecycleHooks,
 	runWorkspaceLifecycleHook,
 } from "../lifecycle/hooks.mjs";
@@ -122,7 +126,6 @@ import {
 	validateTaskStartTree,
 	validateTaskStartTreeAsync,
 } from "../lifecycle/index.mjs";
-import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 import { projectOutcomeReader } from "../outcome/projection.mjs";
 import { validateShadowEnvelope } from "../outcome/shadow.mjs";
@@ -10803,16 +10806,8 @@ export function createQueueBackend({
 		supplied?.executionBackend ??
 		supplied?.backend ??
 		dependencies.executionBackend ??
-		new ParallelsExecutionBackend({
-			goldenImage:
-				dependencies.goldenImage ??
-				process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
-			aquaUid:
-				dependencies.aquaUid ?? process.env.SWITCHYARD_PARALLELS_AQUA_UID,
-			providerUser:
-				dependencies.providerUser ??
-				process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
-				"switchyard",
+		createExecutionBackend({
+			...hostBackendDefaults(dependencies),
 			// Durable record of which golden-image snapshots each clone creates,
 			// so a later process can reclaim them after this one dies.
 			snapshotSidecarRoot: getVmAdmissionRoot(),
@@ -10824,14 +10819,8 @@ export function createQueueBackend({
 				: {}),
 		});
 
-	const goldenImage =
-		dependencies.goldenImage ?? process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE;
-	const aquaUid =
-		dependencies.aquaUid ?? process.env.SWITCHYARD_PARALLELS_AQUA_UID;
-	const providerUser =
-		dependencies.providerUser ??
-		process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ??
-		"switchyard";
+	const { goldenImage, aquaUid, providerUser } =
+		hostBackendDefaults(dependencies);
 	return {
 		platform: selectedPlatform,
 		taskBaseRunId,

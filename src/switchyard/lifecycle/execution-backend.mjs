@@ -73,4 +73,15 @@ export class ExecutionBackend {
 	inspectProcess(...args) {
 		return abstractMethod("inspectProcess", args);
 	}
+
+	/**
+	 * Run one command in the workspace and return its captured output, throwing
+	 * on a non-zero exit. Every provider adapter's authentication predicate calls
+	 * this (14 call sites) inside a `try {} catch { return false }`, so a backend
+	 * that omits it does not fail as a missing method — it silently reports every
+	 * provider as unauthenticated. Declaring it here makes that a seam error.
+	 */
+	execGuest(...args) {
+		return abstractMethod("execGuest", args);
+	}
 }

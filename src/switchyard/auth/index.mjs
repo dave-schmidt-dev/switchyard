@@ -56,7 +56,10 @@ import { isCodexAuthenticated } from "../adapter/codex.mjs";
 import { isCopilotAuthenticated } from "../adapter/copilot.mjs";
 import { isCursorAuthenticated } from "../adapter/cursor.mjs";
 import { isVibeAuthenticated } from "../adapter/vibe.mjs";
-import { ParallelsExecutionBackend } from "../lifecycle/parallels-execution-backend.mjs";
+import {
+	createExecutionBackend as createResolvedExecutionBackend,
+	hostBackendDefaults,
+} from "../lifecycle/backend-selection.mjs";
 import { probeLiveness } from "./liveness.mjs";
 
 const AUTH_PROJECT_ROOT = resolve(
@@ -91,12 +94,7 @@ function authOwnershipContext(options, runId) {
  * @returns {ParallelsExecutionBackend}
  */
 function createExecutionBackend() {
-	return new ParallelsExecutionBackend({
-		goldenImage: process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE,
-		aquaUid: process.env.SWITCHYARD_PARALLELS_AQUA_UID,
-		providerUser:
-			process.env.SWITCHYARD_PARALLELS_PROVIDER_USER ?? "switchyard",
-	});
+	return createResolvedExecutionBackend(hostBackendDefaults());
 }
 
 /**
