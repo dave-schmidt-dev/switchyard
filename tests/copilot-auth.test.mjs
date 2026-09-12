@@ -102,6 +102,23 @@ describe("isCopilotAuthenticated credential-validity check (fake guest)", () => 
 		);
 	});
 
+	it("finds the credential under a non-macOS guest home", () => {
+		// Copilot is the first container lane in the credential survey, so its
+		// predicate must not assume `/Users/<user>`: a POSIX home has to resolve
+		// through the backend, or the lane reports an authenticated provider as
+		// unauthenticated and is skipped.
+		const backend = createFakeExecutionBackend({
+			home: "/home/switchyard",
+			version: "Copilot stub",
+			files: {
+				".copilot/config.json":
+					'{"accessToken":"fake-oauth-token-value-1234567890"}',
+			},
+		});
+
+		strictEqual(isCopilotAuthenticated("fake-workspace", backend), true);
+	});
+
 	it("returns false when the credential is withheld/corrupt even though the binary responds", () => {
 		const credPath = ".copilot/config.json";
 		const files = {};

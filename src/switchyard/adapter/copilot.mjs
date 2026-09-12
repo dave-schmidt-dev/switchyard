@@ -23,7 +23,7 @@ const CREDENTIALS_RELATIVE_PATH = ".copilot/config.json";
 const MIN_CREDENTIAL_BYTES = 16;
 
 function hasNonTrivialCredential(workspaceId, executionBackend) {
-	const path = `/Users/${executionBackend.providerUser}/${CREDENTIALS_RELATIVE_PATH}`;
+	const path = `${executionBackend.guestHomePath()}/${CREDENTIALS_RELATIVE_PATH}`;
 	try {
 		executionBackend.execGuest(
 			workspaceId,

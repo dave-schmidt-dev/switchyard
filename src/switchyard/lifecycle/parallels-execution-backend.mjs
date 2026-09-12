@@ -2241,6 +2241,16 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		return providerPidMarkerPath(workspaceId, cleanupContext);
 	}
 
+	/**
+	 * Home directory of the provider user in the guest. macOS-shaped because
+	 * this backend is macOS; adapters ask for it instead of assembling it so
+	 * that the shape stays a backend fact.
+	 * @returns {string}
+	 */
+	guestHomePath() {
+		return providerHomePath(this.providerUser);
+	}
+
 	/** Execute one small control command through the same Aqua identity route. */
 	execGuest(workspaceId, command, args = [], options = {}) {
 		if (

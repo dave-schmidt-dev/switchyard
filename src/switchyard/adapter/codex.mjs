@@ -50,7 +50,7 @@ const MIN_CREDENTIAL_BYTES = 16;
  * @returns {boolean}
  */
 function hasNonTrivialCredential(workspaceId, executionBackend) {
-	const path = `/Users/${executionBackend.providerUser}/${CODEX_CREDENTIALS_RELATIVE_PATH}`;
+	const path = `${executionBackend.guestHomePath()}/${CODEX_CREDENTIALS_RELATIVE_PATH}`;
 	try {
 		executionBackend.execGuest(
 			workspaceId,

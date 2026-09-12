@@ -84,4 +84,15 @@ export class ExecutionBackend {
 	execGuest(...args) {
 		return abstractMethod("execGuest", args);
 	}
+
+	/**
+	 * Absolute home directory of the provider user inside the workspace.
+	 * Credential-presence predicates build their paths from this rather than
+	 * interpolating `/Users/<user>` themselves: that prefix is a macOS fact, and
+	 * an adapter that hardcodes it silently reports every provider as
+	 * unauthenticated on any substrate that puts homes elsewhere.
+	 */
+	guestHomePath(...args) {
+		return abstractMethod("guestHomePath", args);
+	}
 }

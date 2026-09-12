@@ -9,8 +9,8 @@
 
 export const FAKE_PROVIDER_USER = "switchyard";
 
-function evalCredentialCheckScript(script, files, providerUser) {
-	const prefix = `/Users/${providerUser}/`;
+function evalCredentialCheckScript(script, files, home) {
+	const prefix = `${home}/`;
 	const paths = [...script.matchAll(/-f (\S+) \]/g)].map((m) => m[1]);
 	const thresholds = [...script.matchAll(/-ge (\d+) \]/g)].map((m) =>
 		Number(m[1]),
@@ -38,10 +38,14 @@ function evalCredentialCheckScript(script, files, providerUser) {
 /**
  * @param {object} [options]
  * @param {string} [options.providerUser]
+ * @param {string} [options.home] Guest home directory reported by
+ *   `guestHomePath()`; defaults to the macOS shape. Set it to a POSIX home to
+ *   prove an adapter builds credential paths from the backend rather than
+ *   assuming `/Users`.
  * @param {string} [options.version] `--version` stdout; omit/null to make the
  *   binary appear absent (execGuest throws).
  * @param {Record<string, string>} [options.files] Credential files, keyed by
- *   path relative to `/Users/<providerUser>/`. Mutate this object between
+ *   path relative to the guest home. Mutate this object between
  *   assertions in the same test to simulate a changing guest filesystem.
  * @param {(command: string, args: string[], options: object) => (Buffer|string)} [options.respond]
  *   Fallback handler for any command/args shape not covered by the built-in
@@ -49,15 +53,20 @@ function evalCredentialCheckScript(script, files, providerUser) {
  */
 export function createFakeExecutionBackend({
 	providerUser = FAKE_PROVIDER_USER,
+	home,
 	version = null,
 	files = {},
 	respond,
 } = {}) {
+	const guestHome = home ?? `/Users/${providerUser}`;
 	return {
 		providerUser,
+		guestHomePath() {
+			return guestHome;
+		},
 		execGuest(_workspaceId, command, args = [], _execOptions = {}) {
 			if (command === "sh" && args[0] === "-c") {
-				return evalCredentialCheckScript(args[1], files, providerUser);
+				return evalCredentialCheckScript(args[1], files, guestHome);
 			}
 			if (args[0] === "--version") {
 				if (version == null) {

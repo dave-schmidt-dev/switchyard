@@ -17,6 +17,7 @@ const SEAM_METHODS = [
 	"listManaged",
 	"inspectProcess",
 	"execGuest",
+	"guestHomePath",
 ];
 
 function withEnv(overrides, fn) {

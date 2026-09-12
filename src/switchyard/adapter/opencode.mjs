@@ -236,7 +236,7 @@ function annotateIdleTermination(output, stderr) {
 }
 
 function hasNonTrivialCredential(workspaceId, executionBackend) {
-	const path = `/Users/${executionBackend.providerUser}/${CREDENTIALS_RELATIVE_PATH}`;
+	const path = `${executionBackend.guestHomePath()}/${CREDENTIALS_RELATIVE_PATH}`;
 	try {
 		executionBackend.execGuest(
 			workspaceId,
