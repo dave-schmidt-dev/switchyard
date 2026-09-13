@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	checkpointRemediation,
 	classifyProviderStreams,
+	providerDiagnosticCodeForKind,
 } from "../src/switchyard/adapter/exec-error.mjs";
 
 const providers = [
@@ -20,6 +21,10 @@ const corpus = [
 	["Authentication required", "auth_required"],
 	["Not logged in", "auth_required"],
 	["Session expired", "auth_required"],
+	[
+		"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+		"auth_required",
+	],
 	["Usage limit reached", "usage_exhausted"],
 	["Quota exhausted", "usage_exhausted"],
 	["Rate limit exceeded", "usage_exhausted"],
@@ -66,7 +71,7 @@ describe("durable provider stream diagnostics", () => {
 		}
 	});
 
-	it("requires every nonempty stdout/stderr line to match the same artifact", () => {
+	it("refuses to classify two recognized artifacts that disagree", () => {
 		const same = classify(
 			"Error: Session expired\nSESSION EXPIRED\n",
 			"session expired\n",
@@ -74,15 +79,51 @@ describe("durable provider stream diagnostics", () => {
 		strictEqual(same.diagnosticKind, "auth_required");
 
 		for (const [stdout, stderr] of [
-			["Session expired\nextra provider text\n", ""],
 			["Session expired\n", "Permission denied\n"],
-			["", "Session expired\nextra provider text\n"],
+			["Session expired\nQuota exhausted\n", ""],
 		]) {
 			const result = classify(stdout, stderr);
 			strictEqual(result.diagnosticKind, undefined);
 			ok(result.stdoutDigest.startsWith("sha256:"));
 			ok(result.stderrDigest.startsWith("sha256:"));
 		}
+	});
+
+	it("reads a recognized artifact through the provider's own transport noise", () => {
+		for (const [stdout, stderr] of [
+			["Session expired\nextra provider text\n", ""],
+			["", "extra provider text\nSession expired\n"],
+		]) {
+			const result = classify(stdout, stderr);
+			strictEqual(result.diagnosticKind, "auth_required");
+		}
+	});
+
+	it("names a rotated-out refresh token as an auth artifact, not a bare nonzero exit", () => {
+		// The shape codex actually emitted in the guest on 2026-09-12: its own
+		// timestamped logger lines and websocket 401s around two terminal
+		// re-login lines. Only the terminal lines are an approved artifact.
+		const stderr = [
+			"2026-09-13T02:52:59.385044Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed",
+			"2026-09-13T02:52:59.395795Z ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+			"2026-09-13T02:53:00.340379Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized",
+			"ERROR: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+			"",
+		].join("\n");
+		const result = classifyProviderStreams({
+			stdout: "",
+			stderr,
+			code: 1,
+			provider: "codex",
+			command: "/Users/switchyard/.local/bin/codex",
+		});
+		strictEqual(result.diagnosticKind, "auth_required");
+		strictEqual(
+			providerDiagnosticCodeForKind(result.diagnosticKind),
+			"auth_expired",
+		);
+		ok(!Object.hasOwn(result, "stderr"));
+		strictEqual(result.stderrBytes, Buffer.byteLength(stderr));
 	});
 
 	it("keeps stdout and stderr separate while authorizing agreeing streams", () => {
@@ -193,7 +234,7 @@ describe("durable provider stream diagnostics", () => {
 				"Session expired\nTOKEN=do-not-persist\n",
 				"Permission denied\n",
 			),
-			classify("provider preamble\nAuthentication required\n"),
+			classify("provider preamble\nno approved artifact here\n"),
 		]) {
 			strictEqual(Object.hasOwn(result, "diagnosticKind"), false);
 			strictEqual(Object.hasOwn(result, "diagnosticCode"), false);

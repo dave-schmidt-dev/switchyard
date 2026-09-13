@@ -1314,8 +1314,13 @@ const MAX_REASON_CHARS = 800;
 // diagnostic helper above.  Only complete, provider-owned lines may mint a
 // closed diagnostic code; mixed or partially matching streams remain unknown.
 const STRICT_PROVIDER_LINES = Object.freeze({
+	// The last alternative is codex's terminal line when a golden-image-baked
+	// OAuth credential has had its refresh token rotated out from under it,
+	// measured 2026-09-12 in the guest. Before it was here the whole failure
+	// reached the operator as `provider_exit_nonzero`, which says nothing about
+	// needing to log in again.
 	auth_required:
-		/^(?:Error:\s*)?(?:Authentication required|Not logged in|Session expired)$/iu,
+		/^(?:Error:\s*)?(?:Authentication required|Not logged in|Session expired|Your access token could not be refreshed because your refresh token was already used\. Please log out and sign in again\.)$/iu,
 	usage_exhausted:
 		/^(?:Error:\s*)?(?:Usage limit reached|Quota exhausted|Rate limit exceeded)$/iu,
 	model_unsupported:
@@ -1402,15 +1407,20 @@ export function classifyProviderStreams({
 		return { ...result, diagnosticKind: "cli_usage_error" };
 	}
 	if (approvedPair) {
+		// An unrecognized line is not evidence against the lines that were
+		// recognized. Requiring every line to match meant a provider that prints
+		// its own transport noise around an unmistakable auth failure -- codex
+		// interleaves websocket 401s with the re-login line -- classified as
+		// nothing at all. Two different recognized kinds still refuse to
+		// classify, because that is genuine disagreement rather than noise.
 		let matchedKind = null;
 		for (const line of all) {
 			const lineKind = Object.entries(STRICT_PROVIDER_LINES).find(
 				([, pattern]) => pattern.test(line),
 			)?.[0];
-			if (!lineKind || (matchedKind !== null && lineKind !== matchedKind)) {
-				return result;
-			}
-			matchedKind ??= lineKind;
+			if (!lineKind) continue;
+			if (matchedKind !== null && lineKind !== matchedKind) return result;
+			matchedKind = lineKind;
 		}
 		if (matchedKind !== null) {
 			return { ...result, diagnosticKind: matchedKind };
