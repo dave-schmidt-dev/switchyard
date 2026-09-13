@@ -327,10 +327,10 @@ describe("ensureProvidersAuthenticated", () => {
 			// a named reason there is none. Neither would leave the walkthrough
 			// with nothing to say about a provider it cannot authenticate.
 			strictEqual(
-				typeof provider.runLogin === "function" ||
-					typeof provider.loginUnavailable?.reason === "string",
+				(typeof provider.runLogin === "function") !==
+					(typeof provider.loginUnavailable?.reason === "string"),
 				true,
-				`${provider.name} declares neither runLogin nor loginUnavailable`,
+				`${provider.name} must declare exactly one of runLogin and loginUnavailable`,
 			);
 		}
 	});
@@ -1473,13 +1473,17 @@ describe("withBootedGoldenImage golden-image posture (INV-1, INV-3)", () => {
 		};
 	};
 
-	// Task 44. Ctrl+C is the documented escape from a login that will not
-	// finish, and it used to kill node before anything stopped the guest —
-	// leaving the golden image running with baked credentials, which blocks
-	// the next dispatch until someone notices. Driven as a real child process
-	// because the defect is in signal delivery, which cannot be faked
-	// in-process.
-	it("stops the golden image when the walkthrough is interrupted", async () => {
+	// Task 44, narrowed 2026-09-13. This is the residual case, NOT the escape:
+	// a body that blocks the event loop with no login child to die of the
+	// signal, which is what a login that traps its own interrupt looks like
+	// (Task 46). Exit 0 is the honest outcome there and not a false green --
+	// the signal is queued behind the blocked call and discarded when the
+	// normal path removes the listeners. What it guarantees is the one thing
+	// that still holds: node does not take the default disposition and go away
+	// with the guest running. The escape itself is in-band and covered by "an
+	// interrupted login ends the walkthrough" below. Driven as a real child
+	// process because signal delivery cannot be faked in-process.
+	it("stops the golden image when a signal cannot reach a login child", async () => {
 		const scratch = tempDir("switchyard-auth-sigint-");
 		try {
 			const stopMarker = join(scratch, "stopped");
@@ -1541,10 +1545,7 @@ withBootedGoldenImage(backend, () => {
 			strictEqual(readFileSync(stopMarker, "utf8"), "golden-uuid");
 			// Without the handlers node takes the default disposition and dies
 			// on the spot with the guest still running: the child reports
-			// signal SIGINT and never reaches its stop. What is asserted is the
-			// guarantee that matters -- the process did not go away until the
-			// guest was stopped -- not that the signal aborts a blocked
-			// execFileSync, which no handler can do.
+			// signal SIGINT and never reaches its stop.
 			strictEqual(signal, null, "node must not die on the default disposition");
 			strictEqual(code, 0);
 		} finally {
@@ -1713,6 +1714,39 @@ describe("an interrupted login ends the walkthrough", () => {
 		// declined prompt or a nonzero exit is decided by the re-check, not by
 		// a throw.
 		codex.runLogin("workspace-1", fakeBackend("sh", ["-c", "exit 1"]));
+	});
+
+	it("keeps the interrupt marker when the posture check ALSO fails", () => {
+		// External review finding, 2026-09-13. withBootedGoldenImage wraps both
+		// causes in a new Error so neither is lost, and main() reads `code` off
+		// what it catches without walking `cause` -- so without carrying the
+		// marker onto the wrapper, interrupting a walkthrough that also left
+		// the posture violated exits 1, indistinguishable from a provider that
+		// simply failed to authenticate.
+		const stops = [];
+		const backend = {
+			goldenImage: "switchyard-golden-test",
+			aquaUid: "501",
+			bootGoldenImage: () => ({ uuid: "golden-uuid" }),
+			stopGoldenImage: (uuid) => stops.push(uuid),
+			describePostureViolations: () => ["aqua uid drifted"],
+		};
+		const interrupted = new Error("walkthrough interrupted by SIGINT");
+		interrupted.code = "WALKTHROUGH_INTERRUPTED";
+		interrupted.signal = "SIGINT";
+		let thrown = null;
+		try {
+			withBootedGoldenImage(backend, () => {
+				throw interrupted;
+			});
+		} catch (error) {
+			thrown = error;
+		}
+		ok(thrown, "both causes must still surface as a throw");
+		match(thrown.message, /posture check ALSO failed/);
+		strictEqual(thrown.code, "WALKTHROUGH_INTERRUPTED");
+		strictEqual(thrown.signal, "SIGINT");
+		deepStrictEqual(stops, ["golden-uuid"]);
 	});
 
 	it("stops walking the remaining providers", () => {

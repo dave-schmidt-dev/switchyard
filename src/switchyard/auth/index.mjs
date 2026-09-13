@@ -229,7 +229,12 @@ export function withBootedGoldenImage(executionBackend, fn) {
 		);
 	}
 
-	stopOnce("auth");
+	// Name the real reason in the progress line: "after auth" is a lie when the
+	// body is unwinding from the operator's Ctrl+C, and that line is the only
+	// thing on screen during a stop that takes tens of seconds.
+	stopOnce(
+		bodyError?.code === WALKTHROUGH_INTERRUPTED ? bodyError.signal : "auth",
+	);
 	for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 
 	// Both causes stay visible. Letting the posture failure replace the body's
@@ -240,6 +245,15 @@ export function withBootedGoldenImage(executionBackend, fn) {
 		);
 		combined.cause = bodyError;
 		combined.postureError = postureError;
+		// Carry the interrupt marker onto the wrapper. main() reads `code` off
+		// what it catches and does not walk `cause`, so without this an operator
+		// who interrupts a walkthrough that ALSO leaves the posture violated gets
+		// exit 1 -- indistinguishable from a provider that failed to authenticate
+		// -- for the one path where both things went wrong at once.
+		if (bodyError.code === WALKTHROUGH_INTERRUPTED) {
+			combined.code = bodyError.code;
+			combined.signal = bodyError.signal;
+		}
 		throw combined;
 	}
 	if (bodyError) throw bodyError;
