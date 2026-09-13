@@ -6881,6 +6881,13 @@ export async function executeTaskAsync(task, context) {
 			provider: routed?.provider ?? null,
 			model: routed?.model ?? null,
 			requiredCapability,
+			// Read from the same routed record as provider and model, and from
+			// the same expression the ledger entry above already uses. Omitting
+			// it here left a throw after routing -- a broker reservation lock
+			// timeout under load is the one seen in the wild -- returning a
+			// failed result that no ledger reader or route-health reader could
+			// attribute, while the ledger's own copy of the id was intact.
+			resolvedTargetId: routed?.resolvedTargetId ?? null,
 			result: "execution_failed",
 			...failure,
 			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,

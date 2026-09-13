@@ -1524,6 +1524,77 @@ test("production async runner writes a real diagnostic artifact for a failed lau
 	}
 });
 
+// Task 41. Observed once under 8-way concurrent load: a failed result whose
+// resolvedTargetId was undefined where the routed target was known. The cause
+// is executeTaskAsync's catch, which rebuilds the result from
+// context._activeTaskRoute for provider and model but omits the target id --
+// so the ledger entry it writes two lines earlier keeps it and the result the
+// queue returns does not. Pinned with a throw rather than with the timing that
+// exposed it: any throw after routing reaches the same path, and the real
+// trigger (a broker reservation lock timeout under load) is not reproducible
+// on demand.
+test("production async runner keeps the resolved target id when a routed task throws", async () => {
+	const root = await tempDirAsync("switchyard-production-broker-throw-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Throwing task\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** throw after routing\n",
+	);
+	const result = await runQueueAsync({
+		tasksFilePath,
+		projectPath: root,
+		checkpointPath,
+		dependencies: {
+			queuePreflight: () => ({ ok: true, eligible: true }),
+			backendFactory: () => ({
+				executionBackend: {},
+				create: () => "owned-async-throw-worker",
+				destroy: () => {},
+				seed: () => {},
+				commit: () => {},
+				reset: () => {},
+			}),
+			adapters: {
+				claude: {
+					executeAsync: async () => ({
+						success: false,
+						errorKind: "execution_failed",
+						failurePhase: "provider_execution",
+						exitCode: 1,
+					}),
+					captureDiffAsync: async () => null,
+				},
+			},
+			// Throws only once the route is already selected, which is the state
+			// the real reservation-lock timeout throws from.
+			recordDispatch: () => {
+				throw new Error("dispatch ledger unavailable");
+			},
+			recordDispatchIntent: () => {},
+			route: () => ({
+				provider: "Cheap",
+				resolvedTargetId: "cheap",
+				resolved_harness: "claude",
+				model: "cheap-standard",
+				reason: "ranked",
+			}),
+			resolveTargetIdentity: () => ({
+				targetId: "cheap",
+				harnessKey: "claude",
+				ambiguous: false,
+			}),
+			resolveDescriptor: () => descriptor("cheap", "cheap-standard"),
+		},
+	});
+	strictEqual(result.results[0].success, false);
+	strictEqual(result.results[0].provider, "Cheap");
+	// The field that went missing. A failed record with no resolved target id
+	// cannot be attributed in the dispatch ledger or in route health, both of
+	// which key on the target.
+	strictEqual(result.results[0].resolvedTargetId, "cheap");
+});
+
 test("production async runner quarantines quota targets and retries the same task once", async () => {
 	const root = await tempDirAsync("switchyard-production-broker-quota-");
 	const tasksFilePath = join(root, "TASKS.md");
