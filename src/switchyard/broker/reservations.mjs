@@ -635,8 +635,15 @@ export function createReservationLedger(options = {}) {
 		});
 	}
 
+	/**
+	 * Read the ledger without taking the write lock. Every write publishes by
+	 * rename, so a reader can never observe a partial document and never needed
+	 * the lock; taking it made readers compete with writers instead. Under a
+	 * fast renewal loop that is starvation — a reader would wait out the whole
+	 * lock timeout and fail while the ledger was healthy the entire time.
+	 */
 	async function inspect() {
-		return withLock(async (ledger) => structuredClone(ledger));
+		return structuredClone(await store.readDocument());
 	}
 
 	return Object.freeze({

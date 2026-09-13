@@ -460,16 +460,62 @@ describe("broker reservations", () => {
 		);
 	});
 
+	it("reads the ledger while a live writer holds the lock", async () => {
+		// Task 40. Reads used to take the write lock, so a reader competed with
+		// every writer: under the 5 ms renewal loop below, `inspect()` waited out
+		// the whole lock timeout and failed on a ledger that was healthy
+		// throughout. Writes publish by rename, so a reader never needed the
+		// lock at all. Holding the lock here is deterministic — no sleep decides
+		// the outcome.
+		const root = await tempDirAsync("switchyard-reservations-");
+		const ledger = createReservationLedger({ root, lockTimeoutMs: 250 });
+		const lockPath = join(root, "reservations.lock");
+		await mkdir(lockPath, { recursive: true, mode: 0o700 });
+		await writeFile(
+			join(lockPath, "owner.json"),
+			`${JSON.stringify({
+				token: "held-by-a-live-writer",
+				pid: process.pid,
+				acquiredAt: Date.now(),
+			})}\n`,
+			{ mode: 0o600 },
+		);
+		const document = await ledger.inspect();
+		deepStrictEqual(document.reservations, []);
+		// The lock is still held: the read neither waited for it nor took it.
+		await rejects(
+			ledger.reserve({
+				provider: "codex",
+				window: "gradus@1",
+				runId: "run-1",
+				taskId: "TASK-001",
+				ownerId: "owner-1",
+				estimatedConsumption: 1,
+				capacity: 4,
+			}),
+			/timed out acquiring broker reservation lock/,
+		);
+	});
+
 	it("holds a reservation for the whole of a long execution", async () => {
 		const ledger = await fixture({ leaseMs: 1_000 });
 		let observed = null;
+		let executorError = null;
 		const broker = createBroker({
 			...dependencies(ledger, 4),
 			getInvocationDescriptor: () => codexDescriptor(),
 			reservationRenewIntervalMs: 5,
 			executor: async () => {
 				await new Promise((done) => setTimeout(done, 60));
-				observed = (await ledger.inspect()).reservations[0].expiresAt;
+				// Capture rather than let the broker swallow it: anything thrown
+				// here used to surface as "the lease did not advance", which named
+				// the wrong defect for two separate real failures.
+				try {
+					observed =
+						(await ledger.inspect()).reservations[0]?.expiresAt ?? null;
+				} catch (error) {
+					executorError = error;
+				}
 				throw new Error("provider failed");
 			},
 		});
@@ -482,6 +528,11 @@ describe("broker reservations", () => {
 		} catch {
 			// The executor's failure is the vehicle, not the assertion.
 		}
+		strictEqual(
+			executorError,
+			null,
+			`reading the ledger failed: ${executorError}`,
+		);
 		strictEqual(
 			observed > before,
 			true,

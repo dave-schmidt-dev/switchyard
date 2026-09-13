@@ -478,6 +478,25 @@ function parseVmGateOutcomeFile(path, requiredGates) {
 	return aggregateVmGateOutcomes(gates);
 }
 
+/**
+ * Redirect the shared account root away from the host's real one for a test
+ * phase. Shared account coordination is on by default, so any test that reaches
+ * the runner's default resolver would otherwise mint a host key under
+ * `~/.switchyard/accounts` and number the owner's real subscriptions from a
+ * suite run. An explicit override from the caller always wins.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function withIsolatedAccountRoot(env) {
+	if (env.SWITCHYARD_ACCOUNT_ROOT) return env;
+	return {
+		...env,
+		SWITCHYARD_ACCOUNT_ROOT: mkdtempSync(
+			join(tmpdir(), "switchyard-test-accounts-"),
+		),
+	};
+}
+
 export function defaultRun(
 	phase,
 	{ spawn = spawnSync, env = process.env } = {},
@@ -488,12 +507,17 @@ export function defaultRun(
 		? mkdtempSync(join(tmpdir(), "switchyard-vm-gates-"))
 		: null;
 	const outcomePath = captureDir ? join(captureDir, "outcomes.jsonl") : null;
+	const phaseEnv = withIsolatedAccountRoot(env);
+	const accountRoot =
+		phaseEnv.SWITCHYARD_ACCOUNT_ROOT === env.SWITCHYARD_ACCOUNT_ROOT
+			? null
+			: phaseEnv.SWITCHYARD_ACCOUNT_ROOT;
 	try {
 		const result = spawn(npmCmd, ["run", phase], {
 			stdio: "inherit",
 			env: requiredGates
-				? { ...env, SWITCHYARD_VM_GATE_OUTCOME_FILE: outcomePath }
-				: env,
+				? { ...phaseEnv, SWITCHYARD_VM_GATE_OUTCOME_FILE: outcomePath }
+				: phaseEnv,
 		});
 		if (result.error) throw result.error;
 		if (requiredGates) {
@@ -509,6 +533,7 @@ export function defaultRun(
 		return result.status ?? 1;
 	} finally {
 		if (captureDir) rmSync(captureDir, { force: true, recursive: true });
+		if (accountRoot) rmSync(accountRoot, { force: true, recursive: true });
 	}
 }
 

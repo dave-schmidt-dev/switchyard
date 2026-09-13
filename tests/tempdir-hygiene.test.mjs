@@ -1,9 +1,11 @@
 import { deepStrictEqual, ok } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { withIsolatedAccountRoot } from "../scripts/run-test-phases.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const testsDir = fileURLToPath(new URL(".", import.meta.url));
@@ -61,5 +63,30 @@ describe("temp directory hygiene", () => {
 			[],
 			`call tests/helpers/tempdir.mjs instead of mkdtemp directly: ${offenders.join(", ")}`,
 		);
+	});
+
+	// $TMPDIR is not the only thing a suite can dirty. Shared account
+	// coordination is on by default, so a phase that inherited the ambient
+	// environment would mint a host key under the owner's real
+	// ~/.switchyard/accounts and number their live subscriptions from a test
+	// run — somewhere no temp sweep looks and no assertion above would see.
+	it("redirects the shared account root away from the real one", () => {
+		const withoutOverride = { PATH: process.env.PATH };
+		const isolated = withIsolatedAccountRoot(withoutOverride);
+		const redirected = isolated.SWITCHYARD_ACCOUNT_ROOT;
+		try {
+			ok(redirected, "a phase with no override must be given one");
+			ok(
+				!redirected.startsWith(join(homedir(), ".switchyard")),
+				`the redirect must not resolve inside the real root: ${redirected}`,
+			);
+			// An explicit override is the caller's, and is left alone.
+			deepStrictEqual(
+				withIsolatedAccountRoot({ SWITCHYARD_ACCOUNT_ROOT: "/tmp/explicit" }),
+				{ SWITCHYARD_ACCOUNT_ROOT: "/tmp/explicit" },
+			);
+		} finally {
+			if (redirected) rmSync(redirected, { force: true, recursive: true });
+		}
 	});
 });

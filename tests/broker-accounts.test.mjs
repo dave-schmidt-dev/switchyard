@@ -8,7 +8,8 @@
 // case that forgets would write a host key into the real ~/.switchyard, so the
 // root assertions check the tempdir prefix rather than just "not null".
 
-import { notStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
 	existsSync,
@@ -22,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import {
 	accountIdentifier,
@@ -34,7 +36,12 @@ import {
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
+const execFileAsync = promisify(execFile);
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const ACCOUNTS_MODULE = new URL(
+	"../src/switchyard/broker/accounts.mjs",
+	import.meta.url,
+).href;
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 const DUAL_FIXTURE_PATH = resolve(
 	__dirname,
@@ -198,23 +205,84 @@ describe("account root", () => {
 		strictEqual(resolveAccountRoot("antigravity"), null);
 	});
 
-	it("is off until the shared-account flag is set", () => {
+	it("is on unless the shared-account flag opts out", () => {
 		const previous = process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
-		delete process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
 		try {
-			strictEqual(createAccountRootResolver(), null);
-			process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER = "1";
+			// Unset is the shipped configuration, so it is the one that has to
+			// coordinate: an unset flag falling back to project-local ledgers
+			// would silently restore the overdraft this increment closed.
+			delete process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
 			const resolver = createAccountRootResolver();
 			ok(resolver);
 			const root = resolver("antigravity");
 			ok(root?.startsWith(resolve(scratch)));
 			strictEqual(resolver("no-such-provider"), null);
+			for (const optOut of ["0", "false"]) {
+				process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER = optOut;
+				strictEqual(createAccountRootResolver(), null);
+			}
+			process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER = "1";
+			ok(createAccountRootResolver());
 		} finally {
 			if (previous === undefined) {
 				delete process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER;
 			} else {
 				process.env.SWITCHYARD_SHARED_ACCOUNT_LEDGER = previous;
 			}
+		}
+	});
+
+	it("reports each provider that falls back to the project ledger once", () => {
+		// Default-on makes silence the dangerous outcome: an unresolvable
+		// provider reserves against its own ledger, which looks identical to
+		// shared accounting working until two projects overdraw one account.
+		const fallbacks = [];
+		const resolver = createAccountRootResolver({
+			onFallback: (provider) => fallbacks.push(provider),
+		});
+		ok(resolver("antigravity"));
+		strictEqual(resolver("no-such-provider"), null);
+		strictEqual(resolver("no-such-provider"), null);
+		deepStrictEqual(fallbacks, ["no-such-provider"]);
+	});
+
+	it("publishes exactly one host key when first use races itself", async () => {
+		// Two projects starting together is the norm on this host. A stat-then-
+		// rename first use lets both see no key and both publish, and the loser
+		// then numbers its accounts under a key no other process can read. The
+		// processes are spawned together and barrier on a shared start time so
+		// they contend for real rather than running one after another.
+		const racingRoot = tempDir("switchyard-accounts-race-");
+		try {
+			const startAt = Date.now() + 750;
+			const script = `
+				import { readHostKey } from ${JSON.stringify(ACCOUNTS_MODULE)};
+				while (Date.now() < ${startAt}) {}
+				const key = readHostKey({ root: ${JSON.stringify(racingRoot)} });
+				process.stdout.write(key === null ? "null" : key.toString("hex"));
+			`;
+			const results = await Promise.all(
+				Array.from({ length: 8 }, () =>
+					execFileAsync(process.execPath, [
+						"--input-type=module",
+						"-e",
+						script,
+					]),
+				),
+			);
+			const keys = results.map((result) => result.stdout);
+			const distinct = new Set(keys);
+			strictEqual(distinct.size, 1, `racing keys diverged: ${[...distinct]}`);
+			ok(!distinct.has("null"));
+			// Every process agrees with what is actually on disk, and the staging
+			// files the losers wrote are all cleaned up.
+			strictEqual(
+				readFileSync(join(racingRoot, "host-key")).toString("hex"),
+				keys[0],
+			);
+			deepStrictEqual(readdirSync(racingRoot), ["host-key"]);
+		} finally {
+			rmSync(racingRoot, { recursive: true, force: true });
 		}
 	});
 
