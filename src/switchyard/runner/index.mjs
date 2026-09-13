@@ -10097,6 +10097,8 @@ function createDispatchBroker(context, dependencies = {}) {
 		"broker",
 	);
 	const usesProductionRouter = context.route === route;
+	const brokerResolveTargetIdentity =
+		dependencies.resolveTargetIdentity ?? resolveTargetIdentity;
 	return createBroker({
 		adapters,
 		route: ({
@@ -10131,8 +10133,7 @@ function createDispatchBroker(context, dependencies = {}) {
 					? { onHealthDecision: context.onHealthDecision }
 					: {}),
 			}),
-		resolveTargetIdentity:
-			dependencies.resolveTargetIdentity ?? resolveTargetIdentity,
+		resolveTargetIdentity: brokerResolveTargetIdentity,
 		getInvocationDescriptor:
 			context.resolveDescriptor ?? getInvocationDescriptor,
 		reservations: dependencies.brokerReservations,
@@ -10141,7 +10142,12 @@ function createDispatchBroker(context, dependencies = {}) {
 			// Null unless shared account accounting is switched on, in which case
 			// capacity for a provider is decided against the account root shared by
 			// every project on this host instead of this project's ledger alone.
-			accountRootFor: createAccountRootResolver(),
+			// The account resolver reads identity through the same seam the broker
+			// does, so a caller that injected one never gets a second answer from
+			// the host roster behind its back.
+			accountRootFor: createAccountRootResolver({
+				resolveTargetIdentity: brokerResolveTargetIdentity,
+			}),
 		},
 		snapshotSources,
 		readSnapshot: usesProductionRouter

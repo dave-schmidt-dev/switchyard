@@ -145,13 +145,19 @@ export function readHostKey(options = {}) {
  * double-book one subscription.
  *
  * @param {unknown} providerName snapshot provider name to resolve through the roster
- * @param {{root?: string}} [options]
+ * @param {{root?: string, resolveTargetIdentity?: (provider: unknown) => {targetId?: string, ambiguous?: boolean}}} [options]
  * @returns {{root: string, targetId: string, identifier: string}|null}
  */
 export function resolveAccountRoot(providerName, options = {}) {
+	// The identity lookup is a seam because callers that already have one must
+	// not get a second, different answer here. The runner hands the broker a
+	// resolver; reaching past it to the module-level roster read would make a
+	// caller's stub inert and put the host's real roster back in the path.
+	const resolveIdentity =
+		options.resolveTargetIdentity ?? resolveTargetIdentity;
 	let identity = null;
 	try {
-		identity = resolveTargetIdentity(providerName);
+		identity = resolveIdentity(providerName);
 	} catch {
 		return null;
 	}
@@ -218,7 +224,7 @@ function sharedAccountLedgerEnabled() {
  * fallback therefore warns once. `process.emitWarning` keeps it on stderr, off
  * the stdout channel a caller may be parsing.
  *
- * @param {{root?: string, enabled?: boolean, onFallback?: (provider: string) => void}} [options]
+ * @param {{root?: string, enabled?: boolean, onFallback?: (provider: string) => void, resolveTargetIdentity?: (provider: unknown) => {targetId?: string, ambiguous?: boolean}}} [options]
  * @returns {((provider: string) => string|null)|null}
  */
 export function createAccountRootResolver(options = {}) {

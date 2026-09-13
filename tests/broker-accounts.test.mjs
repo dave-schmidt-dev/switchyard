@@ -256,6 +256,26 @@ describe("account root", () => {
 		}
 	});
 
+	it("resolves identity through an injected resolver, not the host roster", () => {
+		// The runner already hands the broker a target-identity resolver, and
+		// callers stub it precisely so a dispatch never depends on this host's
+		// roster. Reading the module-level roster here instead would make that
+		// stub inert and put ~/.agent/roster.json back inside the test gate.
+		useRoster(join(scratch, "missing-roster.json"));
+		const seen = [];
+		const resolver = createAccountRootResolver({
+			resolveTargetIdentity: (provider) => {
+				seen.push(provider);
+				return { targetId: `stub-${provider}`, ambiguous: false };
+			},
+		});
+		const root = resolver("Cheap");
+		ok(root?.startsWith(resolve(scratch)));
+		deepStrictEqual(seen, ["Cheap"]);
+		// A stubbed identity still separates two targets the way a real one does.
+		notStrictEqual(root, resolver("Expensive"));
+	});
+
 	it("reports each provider that falls back to the project ledger once", () => {
 		// Default-on makes silence the dangerous outcome: an unresolvable
 		// provider reserves against its own ledger, which looks identical to
