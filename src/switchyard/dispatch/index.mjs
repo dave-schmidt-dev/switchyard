@@ -100,6 +100,7 @@ import {
 	initializeRun,
 	isProjectLockOwnedBy,
 	LockError,
+	persistDiagnosticArtifact,
 	RevisionError,
 	readEvents,
 	readRun,
@@ -1006,6 +1007,16 @@ async function runDispatch(opts, dependencies = {}) {
 			...(runStoreReady ? { runId } : {}),
 			dependencies: {
 				...dependencies,
+				// The detached worker has always wired this (worker-bootstrap).
+				// Without it here the runner's persist block is skipped outright,
+				// so a provider failure on the synchronous path deletes its own
+				// evidence and records diagnosticEvidenceAvailable: false with no
+				// artifact ever offered to the run store.
+				persistDiagnosticArtifact:
+					dependencies.persistDiagnosticArtifact ??
+					(runStoreReady
+						? (evidence) => persistDiagnosticArtifact(runId, evidence)
+						: undefined),
 				healthDecision,
 				onHealthDecision: (decision) => {
 					dependencies.onHealthDecision?.(decision);

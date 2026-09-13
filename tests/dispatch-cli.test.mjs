@@ -1577,6 +1577,52 @@ describe("synchronous run JSON envelope", () => {
 		}
 	});
 
+	// The detached worker wires this (worker-bootstrap.mjs), the synchronous path
+	// did not, so a provider failure on the in-process path deleted its evidence
+	// without ever offering it to the run store and reported
+	// diagnosticEvidenceAvailable: false with no artifact on disk.
+	it("hands the synchronous queue a run-store diagnostic artifact writer", async () => {
+		let persistDiagnosticArtifact;
+		const { envelope } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				runQueue: async (queueOptions) => {
+					persistDiagnosticArtifact =
+						queueOptions.dependencies.persistDiagnosticArtifact;
+					return {
+						totalTasks: 1,
+						runnableTasks: 1,
+						processedTasks: 1,
+						completedTaskIds: ["1.1"],
+						results: [{ taskId: "1.1", success: true, result: "success" }],
+						checkpointPath: join(dir, "diagnostic.checkpoint.json"),
+					};
+				},
+			}),
+		);
+		strictEqual(
+			typeof persistDiagnosticArtifact,
+			"function",
+			"synchronous dispatch must give the runner a way to persist evidence",
+		);
+		const ref = await persistDiagnosticArtifact({
+			stdoutBytes: 0,
+			stderrBytes: 38,
+			stdoutDigest: `sha256:${"a".repeat(64)}`,
+			stderrDigest: `sha256:${"b".repeat(64)}`,
+		});
+		ok(
+			/^diagnostic:[a-f0-9]{32}$/u.test(ref ?? ""),
+			`expected a diagnostic reference, got ${ref}`,
+		);
+		const { resolveDiagnosticArtifact } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const artifact = await resolveDiagnosticArtifact(envelope.runId, ref);
+		strictEqual(artifact?.stderrBytes, 38);
+		strictEqual(artifact?.stdoutDigest, `sha256:${"a".repeat(64)}`);
+	});
+
 	it("binds the queue health epoch to the injected golden image", async () => {
 		let queueHealth = null;
 		await captureRunJson(
