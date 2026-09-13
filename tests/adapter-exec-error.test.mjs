@@ -199,6 +199,24 @@ describe("describeExecError — auth-expiry classification", () => {
 		match(described.error, /codex login --device-auth/);
 	});
 
+	it("classifies a rotated-out codex refresh token, not a bare execution failure", () => {
+		// Measured in switchyard-golden-6 on 2026-09-12. Before this phrase was
+		// an auth signature, errorKind came back null, the persisted reasonCode
+		// was `execution_failed`, and the operator's FAIL line said only
+		// "Provider execution failed before a reviewed integration."
+		const stderr = [
+			"2026-09-13T02:52:59.395795Z ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+			"2026-09-13T02:53:00.340379Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized",
+			"ERROR: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+			"",
+		].join("\n");
+		const described = describeExecError(fakeExecError({ stderr, code: 1 }), {
+			provider: "codex",
+		});
+		strictEqual(described.errorKind, "auth_expired");
+		match(described.error, /codex login --device-auth/);
+	});
+
 	it("classifies auth expiry even without a provider, but adds no guessed hint", () => {
 		const described = describeExecError(
 			fakeExecError({ stdout: CLAUDE_AUTH_EXPIRED_STDOUT, code: 1 }),

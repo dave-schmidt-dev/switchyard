@@ -50,6 +50,12 @@ const AUTH_FAILURE_SIGNATURES = [
 	"token expired",
 	"credentials expired",
 	"re-authenticate",
+	// Measured 2026-09-12 in switchyard-golden-6: codex's terminal line when a
+	// rotating OAuth refresh token has been spent by another consumer. None of
+	// the phrases above appear anywhere in that output, so the operator's FAIL
+	// line read `execution_failed` -- "something went wrong" -- for a failure
+	// whose only fix is an interactive re-login.
+	"refresh token was already used",
 ];
 
 // Provider-specific quota signatures are intentionally narrow. These are
