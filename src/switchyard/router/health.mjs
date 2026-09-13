@@ -33,6 +33,9 @@ const DEFAULT_HEALTH_STATE_ROOT = resolve(
 	"route-health",
 );
 const SCHEMA_VERSION = 1;
+// A health update is a bounded read-modify-write over two small files. Anything
+// still holding the lock after a minute is not in that critical section.
+const HEALTH_LOCK_STALE_MS = 60_000;
 const ADAPTER_CONTRACT_VERSION = "switchyard-route-health-v1";
 const HASH_RE = /^sha256:[a-f0-9]{64}$/;
 const UUID_RE =
@@ -436,13 +439,105 @@ function unavailable(reason = "health-storage-unavailable") {
 function emit(input, event) {
 	input.onStatus?.({ phase: "route_health", event });
 }
+/**
+ * A health lock records who holds it. Without an owner the lock was a pure
+ * mutual-exclusion file, so a process killed between creating it and removing
+ * it left the target reporting `health-lease-held` to every reader forever,
+ * with no path back short of deleting the file by hand.
+ * @param {string} token
+ * @returns {string}
+ */
+function lockRecord(token) {
+	return `${token}\n${JSON.stringify({
+		pid: process.pid,
+		acquiredAt: Date.now(),
+	})}\n`;
+}
+
+/**
+ * @param {string} raw
+ * @returns {{token: string, pid: number|null, acquiredAt: number|null}|null}
+ */
+function parseLockRecord(raw) {
+	const [token, owner] = String(raw).split("\n");
+	if (!UUID_RE.test(token ?? "")) return null;
+	let pid = null;
+	let acquiredAt = null;
+	try {
+		const parsed = JSON.parse(owner ?? "");
+		if (Number.isInteger(parsed?.pid) && parsed.pid > 0) pid = parsed.pid;
+		if (Number.isFinite(parsed?.acquiredAt)) acquiredAt = parsed.acquiredAt;
+	} catch {
+		// A lock written before owners were recorded, or a truncated write. It
+		// has no owner to check, so only the age bound below can retire it.
+	}
+	return { token, pid, acquiredAt };
+}
+
+/**
+ * Whether a pid is running. `null` means unknowable — a pid this process may
+ * not signal — and is deliberately not "dead": reclaiming on an unknown owner
+ * would let two writers into the critical section.
+ * @param {number|null} pid
+ * @returns {boolean|null}
+ */
+function lockOwnerIsAlive(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error?.code !== "ESRCH";
+	}
+}
+
+/**
+ * Retire a lock whose owner is provably gone, or which is older than any real
+ * critical section. Renaming first is what makes the reclaim safe under
+ * concurrency: two reclaimers race on the rename, exactly one wins, and a lock
+ * recreated in between keeps a different inode and is left alone.
+ *
+ * @param {{lock: string}} location
+ * @param {{now?: () => number, ownerAlive?: (pid: number|null) => boolean|null}} [seams]
+ * @returns {boolean} whether the caller may retry acquisition
+ */
+function reclaimAbandonedLock(location, seams = {}) {
+	const now = seams.now ?? Date.now;
+	const ownerAlive = seams.ownerAlive ?? lockOwnerIsAlive;
+	let before;
+	let raw;
+	try {
+		before = lstatSync(location.lock);
+		if (!before.isFile() || before.isSymbolicLink()) return false;
+		raw = readFileSync(location.lock, "utf8");
+	} catch {
+		// Gone already, or unreadable. Either way this caller reclaims nothing.
+		return false;
+	}
+	const record = parseLockRecord(raw);
+	const expired =
+		record === null ||
+		!Number.isFinite(record.acquiredAt) ||
+		record.acquiredAt + HEALTH_LOCK_STALE_MS <= now();
+	if (!expired && ownerAlive(record.pid) !== false) return false;
+	const stalePath = `${location.lock}.abandoned.${randomUUID()}`;
+	try {
+		if (lstatSync(location.lock).ino !== before.ino) return false;
+		renameSync(location.lock, stalePath);
+		unlinkSync(stalePath);
+	} catch {
+		return false;
+	}
+	return true;
+}
+
 function verifyLock(location, lease) {
 	const stat = lstatSync(location.lock);
 	if (
 		!stat.isFile() ||
 		stat.isSymbolicLink() ||
 		stat.ino !== lease.ino ||
-		readFileSync(location.lock, "utf8") !== `${lease.token}\n`
+		parseLockRecord(readFileSync(location.lock, "utf8"))?.token !== lease.token
 	)
 		throw new RouteHealthSchemaError("route health lease displaced");
 }
@@ -495,11 +590,22 @@ async function updateScope(
 		try {
 			descriptor = await open(location.lock, "wx", 0o600);
 		} catch (error) {
-			if (error?.code === "EEXIST") return unavailable("health-lease-held");
-			throw error;
+			if (error?.code !== "EEXIST") throw error;
+			// One retry, and only behind a proven-abandoned lock: a held lock
+			// still reports held, but a killed writer no longer strands the
+			// target for every future reader.
+			if (!reclaimAbandonedLock(location, input))
+				return unavailable("health-lease-held");
+			try {
+				descriptor = await open(location.lock, "wx", 0o600);
+			} catch (retryError) {
+				if (retryError?.code === "EEXIST")
+					return unavailable("health-lease-held");
+				throw retryError;
+			}
 		}
 		lease = { token: randomUUID(), ino: (await descriptor.stat()).ino };
-		await descriptor.writeFile(`${lease.token}\n`);
+		await descriptor.writeFile(lockRecord(lease.token));
 		await descriptor.sync();
 		const beforeControl = await boundedRead(
 			location.control,
@@ -640,11 +746,19 @@ function updateScopeSync(input, mutate, { allowInitialize = false } = {}) {
 		try {
 			lockFd = openSync(location.lock, "wx", 0o600);
 		} catch (error) {
-			if (error?.code === "EEXIST") return unavailable("health-lease-held");
-			throw error;
+			if (error?.code !== "EEXIST") throw error;
+			if (!reclaimAbandonedLock(location, input))
+				return unavailable("health-lease-held");
+			try {
+				lockFd = openSync(location.lock, "wx", 0o600);
+			} catch (retryError) {
+				if (retryError?.code === "EEXIST")
+					return unavailable("health-lease-held");
+				throw retryError;
+			}
 		}
 		lease = { token: randomUUID(), ino: lstatSync(location.lock).ino };
-		writeFileSync(lockFd, `${lease.token}\n`);
+		writeFileSync(lockFd, lockRecord(lease.token));
 		fsyncSync(lockFd);
 		const beforeControl = readSyncRecord(
 			location.control,
@@ -1446,13 +1560,17 @@ export async function ingestRouteHealthEvents({
 	authorisedRuns,
 	healthStateRoot,
 	onStatus,
+	// Lock-reclaim seams. Injectable so a test can prove the abandoned-lock
+	// path without guessing a pid that is genuinely dead on the host.
+	ownerAlive,
+	now,
 } = {}) {
 	const observations = await collectAuthorized(authorisedRuns, onStatus);
 	const results = [];
 	for (const observation of observations)
 		results.push(
 			await recordAuthorizedObservation(
-				{ ...observation, healthStateRoot, onStatus },
+				{ ...observation, healthStateRoot, onStatus, ownerAlive, now },
 				OBSERVATION_AUTHORITY,
 			),
 		);

@@ -529,6 +529,89 @@ describe("fenced route-health projection", () => {
 		strictEqual((await inspectRouteHealth(claimInput)).state, "healthy");
 	});
 
+	it("reclaims a health lock whose writer was killed, but not one still held", async () => {
+		// A process killed between creating the lock and removing it used to
+		// strand the target: every later reader got health-lease-held, forever,
+		// with no path back short of deleting the file by hand. That is the one
+		// failure mode shadow mode cannot recover from on its own.
+		//
+		// Private state root: these cases plant lock files by hand, and the
+		// shared root's other cases find locks by scanning the directory.
+		const lockRoot = join(
+			tmpdir(),
+			`switchyard-health-locks-${process.pid}-${randomUUID()}`,
+		);
+		try {
+			const run = await initializeHealthRun({ targetId: "abandoned-lock" });
+			await emitHealthEvent(run, {
+				event: "task_completed",
+				servedModelVerified: true,
+			});
+			const source = evidenceSource(run);
+			// One clean ingest so the scope's files, and its lock leaf, exist.
+			const first = await ingestRouteHealthEvents({
+				authorisedRuns: [source],
+				healthStateRoot: lockRoot,
+			});
+			strictEqual(first[0].available, true, JSON.stringify(first[0]));
+			const leaf = readdirSync(join(lockRoot, "control")).find((name) =>
+				name.endsWith(".json"),
+			);
+			const lockPath = join(
+				lockRoot,
+				"locks",
+				`${leaf.replace(/\.json$/, "")}.lock`,
+			);
+			mkdirSync(join(lockRoot, "locks"), { recursive: true, mode: 0o700 });
+
+			// A live owner is still exclusive: this must NOT be reclaimed.
+			writeFileSync(
+				lockPath,
+				`${randomUUID()}\n${JSON.stringify({
+					pid: process.pid,
+					acquiredAt: Date.now(),
+				})}\n`,
+				{ mode: 0o600 },
+			);
+			const held = await ingestRouteHealthEvents({
+				authorisedRuns: [source],
+				healthStateRoot: lockRoot,
+			});
+			strictEqual(held[0].available, false);
+			strictEqual(held[0].reason, "health-lease-held");
+			strictEqual(existsSync(lockPath), true);
+
+			// The same lock, owned by a process that is gone, is reclaimed and the
+			// update goes through. `ownerAlive` is the seam so the case does not
+			// depend on guessing a pid that is really dead on this host.
+			const recovered = await ingestRouteHealthEvents({
+				authorisedRuns: [source],
+				healthStateRoot: lockRoot,
+				ownerAlive: () => false,
+			});
+			strictEqual(recovered[0].available, true, JSON.stringify(recovered[0]));
+			strictEqual(existsSync(lockPath), false);
+
+			// An age-expired lock is retired too, whatever its pid says: after a
+			// reboot the recorded pid can belong to an unrelated live process.
+			writeFileSync(
+				lockPath,
+				`${randomUUID()}\n${JSON.stringify({
+					pid: process.pid,
+					acquiredAt: Date.now() - 3_600_000,
+				})}\n`,
+				{ mode: 0o600 },
+			);
+			const aged = await ingestRouteHealthEvents({
+				authorisedRuns: [source],
+				healthStateRoot: lockRoot,
+			});
+			strictEqual(aged[0].available, true, JSON.stringify(aged[0]));
+		} finally {
+			rmSync(lockRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("recovers an interrupted control-first publication without losing its auth hold", async () => {
 		const run = await initializeHealthRun({ targetId: "interrupted-auth" });
 		await emitHealthEvent(run, {
