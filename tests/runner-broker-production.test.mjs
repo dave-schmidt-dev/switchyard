@@ -1427,6 +1427,103 @@ test("production router path rejects an unknown snapshot source", async () => {
 	strictEqual(calls, 0);
 });
 
+// Task 43. Every other persistDiagnosticArtifact case in the suite injects a
+// stub, so none of them can tell a wired producer from an unwired one. This
+// drives the real run-store writer and asserts a file lands on disk.
+test("production async runner writes a real diagnostic artifact for a failed launch", async () => {
+	const root = await tempDirAsync("switchyard-production-broker-artifact-");
+	const stateRoot = join(root, "state-root");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Artifact\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **Description:** fail once\n",
+	);
+	const previousStateRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
+	process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
+	try {
+		const runStore = await import("../src/switchyard/run-store/index.mjs");
+		const runId = randomUUID();
+		await runStore.initializeRun({
+			runId,
+			tasksFilePath,
+			projectPath: root,
+			orderedTaskIds: ["1.1"],
+		});
+		const result = await runQueueAsync({
+			tasksFilePath,
+			projectPath: root,
+			checkpointPath,
+			dependencies: {
+				queuePreflight: () => ({ ok: true, eligible: true }),
+				persistDiagnosticArtifact: (evidence) =>
+					runStore.persistDiagnosticArtifact(runId, evidence),
+				backendFactory: () => ({
+					executionBackend: {},
+					create: () => "owned-async-artifact-worker",
+					destroy: () => {},
+					seed: () => {},
+					commit: () => {},
+					reset: () => {},
+				}),
+				adapters: {
+					claude: {
+						executeAsync: async () => ({
+							success: false,
+							errorKind: "execution_failed",
+							diagnosticCode: "provider_exit_nonzero",
+							diagnosticOrigin: "adapter",
+							diagnosticEvidenceAvailable: false,
+							diagnosticEvidence: BOUNDED_QUOTA_EVIDENCE,
+							failurePhase: "provider_execution",
+							exitCode: 1,
+						}),
+						captureDiffAsync: async () => null,
+					},
+				},
+				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
+				route: () => ({
+					provider: "Cheap",
+					resolvedTargetId: "cheap",
+					resolved_harness: "claude",
+					model: "cheap-review",
+					reason: "ranked",
+				}),
+				resolveTargetIdentity: () => ({
+					targetId: "cheap",
+					harnessKey: "claude",
+					ambiguous: false,
+				}),
+				resolveDescriptor: () => descriptor("cheap", "cheap-review"),
+			},
+		});
+		strictEqual(result.results[0].success, false);
+		const diagnosticRef = result.results[0].diagnosticRef;
+		ok(
+			/^diagnostic:[a-f0-9]{32}$/u.test(diagnosticRef ?? ""),
+			`expected a diagnostic reference on the failed result, got ${diagnosticRef}`,
+		);
+		strictEqual(result.results[0].diagnosticEvidenceAvailable, true);
+		const artifactPath = join(
+			runStore.getRunRoot(runId),
+			"resources",
+			`provider-diagnostic-${diagnosticRef.slice("diagnostic:".length)}.json`,
+		);
+		ok(existsSync(artifactPath), `expected ${artifactPath} on disk`);
+		const stored = JSON.parse(await readFile(artifactPath, "utf8"));
+		strictEqual(stored.kind, "provider_diagnostic");
+		strictEqual(stored.stdoutDigest, BOUNDED_QUOTA_EVIDENCE.stdoutDigest);
+		// The raw streams stay producer-local: the durable record carries sizes
+		// and digests only, and the result never carries the evidence itself.
+		strictEqual(result.results[0].diagnosticEvidence, undefined);
+	} finally {
+		if (previousStateRoot === undefined)
+			delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+		else process.env.SWITCHYARD_RUN_STORE_ROOT = previousStateRoot;
+	}
+});
+
 test("production async runner quarantines quota targets and retries the same task once", async () => {
 	const root = await tempDirAsync("switchyard-production-broker-quota-");
 	const tasksFilePath = join(root, "TASKS.md");
