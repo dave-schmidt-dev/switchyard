@@ -13,6 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import {
 	AGY_LOGIN_UNAVAILABLE,
+	authWalkthroughExitCode,
 	CLAUDE_LOGIN_HINT,
 	CLONE_QUALIFICATION_RECEIPT_SCHEMA_VERSION,
 	COPILOT_LOGIN_COMMAND,
@@ -445,6 +446,45 @@ function liveProvider(name, { authenticated, live, kind = null }) {
 }
 
 describe("liveness gating", () => {
+	it("preserves an unclassified liveness failure without a runnable login as inconclusive", () => {
+		const unresolved = {
+			name: "unresolved",
+			isAuthenticated: () => true,
+			isLive: () => ({
+				live: false,
+				reason: "probe transport failed",
+				kind: null,
+			}),
+			loginUnavailable: {
+				reason: "no supported login command",
+				remediation: "sign in from the provider console",
+			},
+		};
+
+		const [result] = ensureProvidersAuthenticated([unresolved]);
+
+		deepStrictEqual(result, {
+			name: "unresolved",
+			ranLogin: false,
+			inconclusive: true,
+			loginUnavailable: "no supported login command",
+		});
+		strictEqual("authenticated" in result, false);
+		strictEqual("wasAuthenticated" in result, false);
+		strictEqual(authWalkthroughExitCode([result]), 2);
+	});
+
+	it("keeps exit 1 for known failures when inconclusive results also exist", () => {
+		strictEqual(
+			authWalkthroughExitCode([
+				{ inconclusive: true },
+				{ authenticated: false },
+			]),
+			1,
+		);
+		strictEqual(authWalkthroughExitCode([{ authenticated: true }]), 0);
+	});
+
 	it("regression: runs the login for a provider whose credential is present but dead", () => {
 		// The defect this closes. An expired OAuth session leaves the credential
 		// file exactly where it was, so presence kept answering "already
@@ -532,7 +572,11 @@ describe("liveness gating", () => {
 		const provider = {
 			name: "half-fixed",
 			isAuthenticated: () => true,
-			isLive: () => ({ live, reason: live ? null : "still dead", kind: null }),
+			isLive: () => ({
+				live,
+				reason: live ? null : "still dead",
+				kind: live ? null : "auth_expired",
+			}),
 			runLogin: () => {},
 		};
 
@@ -542,6 +586,12 @@ describe("liveness gating", () => {
 			false,
 			"a login that did not restore the session is not success",
 		);
+		strictEqual(
+			failed.ranLogin,
+			true,
+			"an expired session with a runnable login must attempt that login",
+		);
+		strictEqual(authWalkthroughExitCode([failed]), 1);
 
 		live = true;
 		const [fixed] = ensureProvidersAuthenticated([provider]);

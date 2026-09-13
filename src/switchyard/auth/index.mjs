@@ -540,15 +540,17 @@ function inspectProvider(provider, probe, workspaceId, executionBackend) {
  * fake providers) owns booting the golden image beforehand; that keeps this
  * function's tested contract free of a real Parallels dependency.
  *
- * A provider may declare `loginUnavailable` instead of a `runLogin` (agy):
- * it is reported as unauthenticated with its remediation and stepped over.
+ * A provider may declare `loginUnavailable` instead of a `runLogin` (agy).
+ * When a present credential has an unclassified failed liveness probe, that
+ * result is inconclusive rather than being mistaken for a known missing
+ * credential or a known failed authentication.
  * One provider failing never stops the walk — except an interrupted login,
  * which rethrows so the operator's Ctrl+C ends the walkthrough.
  * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, runLogin?: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => void, loginUnavailable?: {reason: string, remediation: string}, loginHint?: string}>} [providers]
  * @param {object} [options]
  * @param {string} [options.workspaceId] Booted golden image uuid.
  * @param {ParallelsExecutionBackend} [options.executionBackend]
- * @returns {Array<{name: string, wasAuthenticated: boolean, ranLogin: boolean, authenticated: boolean, loginUnavailable?: string}>}
+ * @returns {Array<{name: string, wasAuthenticated?: boolean, ranLogin: boolean, authenticated?: boolean, inconclusive?: true, loginUnavailable?: string}>}
  */
 export function ensureProvidersAuthenticated(
 	providers = PROVIDERS,
@@ -593,6 +595,29 @@ export function ensureProvidersAuthenticated(
 					wasAuthenticated: true,
 					ranLogin: false,
 					authenticated: true,
+				};
+			}
+			// A present credential with a failed probe that has no classification
+			// is neither a known auth failure nor proof that the provider is dead.
+			// If this provider has no runnable login, preserve that uncertainty for
+			// the caller instead of collapsing it into "not authenticated".
+			if (
+				provider.loginUnavailable &&
+				state.authenticated &&
+				state.live === false &&
+				state.kind === null
+			) {
+				console.log(
+					`\n--- ${provider.name}: INCONCLUSIVE — credential present, but the provider did not answer (${state.reason}); no login can be run here (${provider.loginUnavailable.reason}) ---\n`,
+				);
+				console.log(
+					`\n--- ${provider.name}: to resolve it, ${provider.loginUnavailable.remediation} ---\n`,
+				);
+				return {
+					name: provider.name,
+					ranLogin: false,
+					inconclusive: true,
+					loginUnavailable: provider.loginUnavailable.reason,
 				};
 			}
 			wasAuthenticated = state.authenticated && state.live !== false;
@@ -678,6 +703,18 @@ export function ensureProvidersAuthenticated(
 			};
 		}
 	});
+}
+
+/**
+ * Derive the walkthrough's process status without conflating an inconclusive
+ * probe with a known failed authentication. Known failures take precedence so
+ * existing callers continue to receive exit 1 when both conditions occur.
+ * @param {Array<{authenticated?: boolean, inconclusive?: boolean}>} results
+ * @returns {0|1|2}
+ */
+export function authWalkthroughExitCode(results) {
+	if (results.some((result) => result.authenticated === false)) return 1;
+	return results.some((result) => result.inconclusive === true) ? 2 : 0;
 }
 
 /**
@@ -1046,17 +1083,23 @@ function main(argv = process.argv.slice(2)) {
 	}
 	console.log("\n=== Auth summary ===");
 	for (const result of results) {
-		const status = result.authenticated ? "authenticated" : "NOT AUTHENTICATED";
-		const action = result.wasAuthenticated
-			? "already authenticated"
-			: result.ranLogin
-				? "ran interactive login"
-				: result.loginUnavailable
-					? `no login available here: ${result.loginUnavailable}`
-					: "auth check failed";
+		const status = result.inconclusive
+			? "INCONCLUSIVE"
+			: result.authenticated
+				? "authenticated"
+				: "NOT AUTHENTICATED";
+		const action = result.inconclusive
+			? `no login available here: ${result.loginUnavailable}`
+			: result.wasAuthenticated
+				? "already authenticated"
+				: result.ranLogin
+					? "ran interactive login"
+					: result.loginUnavailable
+						? `no login available here: ${result.loginUnavailable}`
+						: "auth check failed";
 		console.log(`${result.name}: ${status} (${action})`);
 	}
-	process.exitCode = results.some((result) => !result.authenticated) ? 1 : 0;
+	process.exitCode = authWalkthroughExitCode(results);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
