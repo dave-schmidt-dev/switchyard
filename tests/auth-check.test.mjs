@@ -1523,7 +1523,17 @@ withBootedGoldenImage(backend, () => {
 			}
 			ok(existsSync(readyMarker), "child never entered the walkthrough body");
 			child.kill("SIGINT");
-			const { code, signal } = await exit;
+			// node:test has no default timeout, so an unbounded await here would
+			// hang the whole suite on a regression instead of failing it.
+			const { code, signal } = await Promise.race([
+				exit,
+				new Promise((_, rejectExit) =>
+					setTimeout(
+						() => rejectExit(new Error("interrupted child never exited")),
+						15000,
+					).unref(),
+				),
+			]);
 			ok(
 				existsSync(stopMarker),
 				"an interrupted walkthrough must still stop the golden image",
@@ -1664,6 +1674,80 @@ withBootedGoldenImage(backend, () => {
 		ok(
 			errors.some((line) => line.includes("failed to stop the golden image")),
 			`a stop failure must be reported: ${JSON.stringify(errors)}`,
+		);
+	});
+});
+
+describe("an interrupted login ends the walkthrough", () => {
+	// Review finding, 2026-09-13. Registering the SIGINT handler took away the
+	// operator's escape without replacing it: a signal arriving while a login's
+	// execFileSync holds the event loop is queued, then discarded when the
+	// normal path removes the listeners, so Ctrl+C killed one login and the
+	// walkthrough immediately started the next provider's. The child's own
+	// death is the only in-band evidence that arrives in time.
+	const fakeBackend = (command, args) => ({
+		goldenImage: "switchyard-golden-test",
+		aquaUid: "501",
+		execArgv: () => ({ command, args }),
+	});
+	const codex = PROVIDERS.find((provider) => provider.name === "codex");
+
+	it("rethrows when the login's own child is killed by SIGINT", () => {
+		ok(codex, "codex must still be a real provider with a login");
+		let thrown = null;
+		try {
+			// `sh -c 'kill -INT $$'` reproduces exactly what was measured against
+			// the golden image on 2026-09-13: `prlctl exec` does not trap SIGINT,
+			// so execFileSync throws with signal SIGINT and a null status.
+			codex.runLogin("workspace-1", fakeBackend("sh", ["-c", "kill -INT $$"]));
+		} catch (error) {
+			thrown = error;
+		}
+		ok(thrown, "a login killed by SIGINT must not be swallowed");
+		strictEqual(thrown.code, "WALKTHROUGH_INTERRUPTED");
+		strictEqual(thrown.signal, "SIGINT");
+	});
+
+	it("still swallows an ordinary failed login", () => {
+		// The control case, and the older contract this must not break: a
+		// declined prompt or a nonzero exit is decided by the re-check, not by
+		// a throw.
+		codex.runLogin("workspace-1", fakeBackend("sh", ["-c", "exit 1"]));
+	});
+
+	it("stops walking the remaining providers", () => {
+		// The exception to "one provider's problem can't stop the rest": an
+		// operator who interrupted this login wants out, not a prompt for the
+		// next provider.
+		let laterProviderChecked = false;
+		const interrupted = new Error("walkthrough interrupted by SIGINT");
+		interrupted.code = "WALKTHROUGH_INTERRUPTED";
+		interrupted.signal = "SIGINT";
+		const providers = [
+			{
+				name: "first",
+				isAuthenticated: () => false,
+				runLogin: () => {
+					throw interrupted;
+				},
+			},
+			{
+				name: "second",
+				isAuthenticated: () => {
+					laterProviderChecked = true;
+					return true;
+				},
+				runLogin: () => {},
+			},
+		];
+		throws(
+			() => ensureProvidersAuthenticated(providers),
+			(error) => error.code === "WALKTHROUGH_INTERRUPTED",
+		);
+		strictEqual(
+			laterProviderChecked,
+			false,
+			"an interrupt must not fall through to the next provider's login",
 		);
 	});
 });

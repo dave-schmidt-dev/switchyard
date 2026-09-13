@@ -97,6 +97,33 @@ function createExecutionBackend() {
 	return createResolvedExecutionBackend(hostBackendDefaults());
 }
 
+// The shell convention (128 + signo) and the single source of truth for both
+// the interrupt handlers below and main()'s exit code, so an operator who
+// interrupts a walkthrough gets the same code whichever path noticed.
+const INTERRUPT_EXIT_CODES = Object.freeze({
+	SIGINT: 130,
+	SIGTERM: 143,
+	SIGHUP: 129,
+});
+
+// Thrown when a login's own child process was killed by one of those signals.
+// Measured 2026-09-13 against the golden image: `prlctl exec` does not trap
+// SIGINT, so Ctrl+C during a login surfaces as execFileSync throwing with
+// `signal: "SIGINT"`, `status: null`. That is the only in-band evidence the
+// walkthrough gets, because a signal arriving while a synchronous child holds
+// the event loop is queued and never reaches a handler until the whole
+// synchronous walk has finished. Carrying it as a throw is what stops the walk
+// at the provider the operator interrupted instead of marching on to the next
+// one and demanding another Ctrl+C for each.
+const WALKTHROUGH_INTERRUPTED = "WALKTHROUGH_INTERRUPTED";
+
+function interruptedError(signal) {
+	const error = new Error(`walkthrough interrupted by ${signal}`);
+	error.code = WALKTHROUGH_INTERRUPTED;
+	error.signal = signal;
+	return error;
+}
+
 /**
  * Boot the golden image, run `fn` against it, and always stop it again —
  * fails fast, before ever starting the VM, if the environment isn't
@@ -133,6 +160,12 @@ export function withBootedGoldenImage(executionBackend, fn) {
 	const stopOnce = (why) => {
 		if (stopped) return;
 		stopped = true;
+		// INV-1: stopGoldenImage is a synchronous `prlctl stop` that can take
+		// tens of seconds. Without this the terminal goes silent right after an
+		// interrupt, which reads as a hang at exactly the moment the operator is
+		// already reaching for a second Ctrl+C. stderr, not stdout: the summary
+		// on stdout is the command's output, this is progress.
+		console.error(`stopping the golden image after ${why}...`);
 		try {
 			executionBackend.stopGoldenImage(booted.uuid);
 		} catch (error) {
@@ -143,25 +176,27 @@ export function withBootedGoldenImage(executionBackend, fn) {
 	};
 	// Exits rather than re-raising: the point is that the guest is stopped
 	// before this process goes away, and 128+signo are the conventional shell
-	// codes. Note what this can and cannot do. A signal that arrives while a
-	// synchronous child holds the event loop (every login runs through
-	// execFileSync) is queued, not delivered, so the handler runs only once
-	// that child returns. What registering it buys is that node no longer
-	// dies on the spot from the default disposition with the guest still
-	// running -- the stop happens either here or on the normal path below,
-	// and `stopped` makes it happen exactly once. SIGHUP is included because
-	// closing the terminal on a stuck login is how this actually leaked.
-	const signalHandlers = [
-		["SIGINT", 130],
-		["SIGTERM", 143],
-		["SIGHUP", 129],
-	].map(([signal, code]) => [
-		signal,
-		() => {
-			stopOnce(signal);
-			process.exit(code);
-		},
-	]);
+	// codes. This handler covers the signals that arrive while the event loop
+	// is free. It does NOT cover the common case on its own: a signal arriving
+	// while a synchronous child holds the loop (every login runs through
+	// execFileSync) is queued, not delivered, and is then discarded when the
+	// normal path removes these listeners -- which on its own would absorb the
+	// operator's Ctrl+C and march on to the next provider. runInteractiveLogin
+	// is what closes that: it reads the signal off the dead child and throws,
+	// so the walk stops at the provider that was interrupted and unwinds
+	// through the stop below. Registering here still matters, because without
+	// it node's default disposition kills the process on the spot with the
+	// guest running. SIGHUP is included because closing the terminal on a stuck
+	// login is how this actually leaked.
+	const signalHandlers = Object.entries(INTERRUPT_EXIT_CODES).map(
+		([signal, code]) => [
+			signal,
+			() => {
+				stopOnce(signal);
+				process.exit(code);
+			},
+		],
+	);
 	for (const [signal, handler] of signalHandlers) process.on(signal, handler);
 	let bodyError = null;
 	let result;
@@ -308,9 +343,21 @@ function runInteractiveLogin(
 	});
 	try {
 		execFileSync(command, args, { stdio: "inherit" });
-	} catch {
-		// Expected on Ctrl+C, a declined prompt, or a real login failure — the
-		// isAuthenticated() re-check the caller performs is what matters.
+	} catch (error) {
+		// Ctrl+C reaches the whole foreground process group, so the login child
+		// dies of the signal too, and that is the only evidence of the interrupt
+		// that arrives in time to act on: node's own handler for the same signal
+		// is queued behind this synchronous call. Measured against the golden
+		// image -- `prlctl exec` does not trap SIGINT, it dies with
+		// `signal: "SIGINT"`, `status: null`. Rethrown so the caller stops
+		// walking; swallowing it is what forced an operator to interrupt every
+		// remaining provider one at a time.
+		if (INTERRUPT_EXIT_CODES[error?.signal]) {
+			throw interruptedError(error.signal);
+		}
+		// Everything else -- a declined prompt, a nonzero exit, a real login
+		// failure — is expected here: the isAuthenticated() re-check the caller
+		// performs is what decides the outcome.
 	}
 }
 
@@ -478,11 +525,16 @@ function inspectProvider(provider, probe, workspaceId, executionBackend) {
  * provider's check/login functions. The caller (main(), or a test injecting
  * fake providers) owns booting the golden image beforehand; that keeps this
  * function's tested contract free of a real Parallels dependency.
- * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, runLogin: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => void, loginHint?: string}>} [providers]
+ *
+ * A provider may declare `loginUnavailable` instead of a `runLogin` (agy):
+ * it is reported as unauthenticated with its remediation and stepped over.
+ * One provider failing never stops the walk — except an interrupted login,
+ * which rethrows so the operator's Ctrl+C ends the walkthrough.
+ * @param {Array<{name: string, isAuthenticated: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => boolean, runLogin?: (workspaceId?: string, executionBackend?: ParallelsExecutionBackend) => void, loginUnavailable?: {reason: string, remediation: string}, loginHint?: string}>} [providers]
  * @param {object} [options]
  * @param {string} [options.workspaceId] Booted golden image uuid.
  * @param {ParallelsExecutionBackend} [options.executionBackend]
- * @returns {Array<{name: string, wasAuthenticated: boolean, ranLogin: boolean, authenticated: boolean}>}
+ * @returns {Array<{name: string, wasAuthenticated: boolean, ranLogin: boolean, authenticated: boolean, loginUnavailable?: string}>}
  */
 export function ensureProvidersAuthenticated(
 	providers = PROVIDERS,
@@ -584,6 +636,11 @@ export function ensureProvidersAuthenticated(
 				authenticated: after.authenticated && after.live !== false,
 			};
 		} catch (error) {
+			// The one exception to the "keep walking" contract below: an operator
+			// who interrupted this provider's login wants out of the walkthrough,
+			// not a prompt for the next provider. Rethrown out of the map so
+			// withBootedGoldenImage stops the guest and main() reports 128+signo.
+			if (error?.code === WALKTHROUGH_INTERRUPTED) throw error;
 			// A provider's isAuthenticated()/runLogin() throwing must not abort
 			// the walkthrough for every other provider — this function's own
 			// tested contract (see "processes every provider even when an
@@ -964,7 +1021,13 @@ function main(argv = process.argv.slice(2)) {
 		);
 	} catch (error) {
 		console.error(error.message);
-		process.exitCode = 1;
+		// An interrupted walkthrough is not an auth failure, and reporting it as
+		// exit 1 would make "someone pressed Ctrl+C" indistinguishable from "a
+		// provider is unauthenticated" to anything scripting this.
+		process.exitCode =
+			INTERRUPT_EXIT_CODES[
+				error?.code === WALKTHROUGH_INTERRUPTED ? error.signal : ""
+			] ?? 1;
 		return;
 	}
 	console.log("\n=== Auth summary ===");
