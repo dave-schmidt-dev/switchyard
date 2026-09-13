@@ -232,6 +232,30 @@ describe("account root", () => {
 		}
 	});
 
+	it("never resolves the host's real accounts root from a test process", () => {
+		// Observed 2026-09-12: the phase runner's SWITCHYARD_ACCOUNT_ROOT
+		// redirect does not reach a bare `node --test tests/x.test.mjs` or the
+		// contract-gate runner, and a suite that reached the production default
+		// minted a host key under the owner's real ~/.switchyard/accounts and
+		// wrote three account directories there. Env redirection is the
+		// convenience; this is the guard.
+		const previous = process.env.SWITCHYARD_ACCOUNT_ROOT;
+		try {
+			delete process.env.SWITCHYARD_ACCOUNT_ROOT;
+			ok(process.env.NODE_TEST_CONTEXT, "this must run under the test runner");
+			strictEqual(createAccountRootResolver(), null);
+			// An explicit root is a deliberate caller choice and still resolves.
+			const explicit = createAccountRootResolver({ root: scratch });
+			ok(explicit?.("antigravity")?.startsWith(resolve(scratch)));
+		} finally {
+			if (previous === undefined) {
+				delete process.env.SWITCHYARD_ACCOUNT_ROOT;
+			} else {
+				process.env.SWITCHYARD_ACCOUNT_ROOT = previous;
+			}
+		}
+	});
+
 	it("reports each provider that falls back to the project ledger once", () => {
 		// Default-on makes silence the dangerous outcome: an unresolvable
 		// provider reserves against its own ledger, which looks identical to

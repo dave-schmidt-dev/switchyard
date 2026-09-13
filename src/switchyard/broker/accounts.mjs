@@ -224,9 +224,26 @@ function sharedAccountLedgerEnabled() {
 export function createAccountRootResolver(options = {}) {
 	const enabled = options.enabled ?? sharedAccountLedgerEnabled();
 	if (!enabled) return null;
+	// A test process never coordinates through the host's real accounts. Env
+	// redirection in the phase runner is not enough on its own: a bare
+	// `node --test tests/x.test.mjs`, and the contract-gate runner, both spawn
+	// suites without it, and any of those reaching the production default here
+	// would mint a host key under ~/.switchyard/accounts and number the owner's
+	// live subscriptions from a suite run. Observed doing exactly that.
+	if (
+		options.root === undefined &&
+		process.env.NODE_TEST_CONTEXT &&
+		!process.env.SWITCHYARD_ACCOUNT_ROOT
+	) {
+		return null;
+	}
 	const report =
 		options.onFallback ??
 		((provider) => {
+			// Suites route synthetic provider names that are not in any roster, so
+			// under the test runner this fires on almost every case and buries the
+			// output. The cases that assert on it inject `onFallback` instead.
+			if (process.env.NODE_TEST_CONTEXT) return;
 			process.emitWarning(
 				`shared account accounting is on but "${provider}" could not be resolved to an account; this project is reserving against its own ledger and cannot see another project's holds`,
 				{ code: "SWITCHYARD_ACCOUNT_UNRESOLVED" },
