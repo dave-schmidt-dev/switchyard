@@ -120,6 +120,49 @@ export function withBootedGoldenImage(executionBackend, fn) {
 	// Propagates as-is (e.g. assertGoldenImageAvailable()'s "owned clones
 	// exist" refusal) — nothing was started, so there is nothing to stop.
 	const booted = executionBackend.bootGoldenImage();
+	// Ctrl+C is the documented escape from a login that will not finish, and
+	// until this existed it killed node before anything stopped the guest —
+	// leaving the golden image running with baked credentials, which blocks
+	// the next dispatch (assertGoldenImageAvailable) until someone notices.
+	// Registered after the boot, so an interrupt arriving before it still
+	// falls through to node's default with nothing started to leak, and
+	// removed only after the normal-path stop, so a signal that libuv queued
+	// while a synchronous child held the event loop still finds a live
+	// handler instead of node's default.
+	let stopped = false;
+	const stopOnce = (why) => {
+		if (stopped) return;
+		stopped = true;
+		try {
+			executionBackend.stopGoldenImage(booted.uuid);
+		} catch (error) {
+			console.error(
+				`warning: failed to stop the golden image after ${why}: ${error.message}`,
+			);
+		}
+	};
+	// Exits rather than re-raising: the point is that the guest is stopped
+	// before this process goes away, and 128+signo are the conventional shell
+	// codes. Note what this can and cannot do. A signal that arrives while a
+	// synchronous child holds the event loop (every login runs through
+	// execFileSync) is queued, not delivered, so the handler runs only once
+	// that child returns. What registering it buys is that node no longer
+	// dies on the spot from the default disposition with the guest still
+	// running -- the stop happens either here or on the normal path below,
+	// and `stopped` makes it happen exactly once. SIGHUP is included because
+	// closing the terminal on a stuck login is how this actually leaked.
+	const signalHandlers = [
+		["SIGINT", 130],
+		["SIGTERM", 143],
+		["SIGHUP", 129],
+	].map(([signal, code]) => [
+		signal,
+		() => {
+			stopOnce(signal);
+			process.exit(code);
+		},
+	]);
+	for (const [signal, handler] of signalHandlers) process.on(signal, handler);
 	let bodyError = null;
 	let result;
 	try {
@@ -151,13 +194,8 @@ export function withBootedGoldenImage(executionBackend, fn) {
 		);
 	}
 
-	try {
-		executionBackend.stopGoldenImage(booted.uuid);
-	} catch (error) {
-		console.error(
-			`warning: failed to stop the golden image after auth: ${error.message}`,
-		);
-	}
+	stopOnce("auth");
+	for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 
 	// Both causes stay visible. Letting the posture failure replace the body's
 	// error — or the reverse — would leave one of two real problems unreported.
@@ -285,7 +323,22 @@ export const COPILOT_LOGIN_COMMAND = Object.freeze([
 	"--device-code",
 ]);
 
-export const AGY_LOGIN_COMMAND = Object.freeze(["agy"]);
+// agy 1.2.2 has no login or auth subcommand (confirmed against the installed
+// CLI's own --help, not from documentation): invoked plainly it opens a
+// full-screen interactive TUI. Over `prlctl exec` that TUI never presents a
+// credential prompt and never returns, so the walkthrough hung on agy and
+// every provider ordered after it — cursor, copilot, vibe — became
+// unreachable. The credential it would have to produce is a macOS Keychain
+// item (`security find-generic-password -s gemini -a antigravity`, see
+// adapter/agy.mjs), which needs an unlocked login keychain and therefore a
+// real GUI session; a non-interactive guest exec has neither. So there is no
+// login to run here, and pretending otherwise costs the whole walkthrough.
+export const AGY_LOGIN_UNAVAILABLE = Object.freeze({
+	reason:
+		"agy has no login subcommand and its Keychain credential needs a GUI session",
+	remediation:
+		"open the golden image in the Parallels window, sign in to agy there once, then re-run this walkthrough",
+});
 
 export const CLAUDE_LOGIN_HINT =
 	"Claude login: when the browser shows an Authentication code, copy/paste that code back into this terminal; browser authorization alone does not complete VM login.";
@@ -318,17 +371,12 @@ const PROVIDERS = [
 	},
 	{
 		name: "agy",
-		// agy has no explicit login subcommand. Current CLI releases begin the
-		// Google OAuth flow only when invoked plainly; `--print` is an execution
-		// flag and can fail before the credential UI is reached.
 		isAuthenticated: isAgyAuthenticated,
 		isLive: (workspaceId, executionBackend) =>
 			probeLiveness("agy", { workspaceId, executionBackend }),
-		runLogin: (workspaceId, executionBackend) =>
-			runInteractiveLogin(AGY_LOGIN_COMMAND, {
-				workspaceId,
-				executionBackend,
-			}),
+		// No runLogin: see AGY_LOGIN_UNAVAILABLE. Reported and stepped over
+		// rather than attempted, so the providers after it still get their turn.
+		loginUnavailable: AGY_LOGIN_UNAVAILABLE,
 	},
 	{
 		name: "cursor",
@@ -488,6 +536,26 @@ export function ensureProvidersAuthenticated(
 					wasAuthenticated: true,
 					ranLogin: false,
 					authenticated: true,
+				};
+			}
+			// A provider with no login to run is reported and stepped over. The
+			// alternative is what agy did: hand the terminal to a command that
+			// never returns, which costs not just this provider but every one
+			// ordered after it. Reported as unauthenticated, because it is —
+			// this is a named dead end, not a pass.
+			if (provider.loginUnavailable) {
+				console.log(
+					`\n--- ${provider.name}: ${state.authenticated ? `credential present but the provider did not answer (${state.reason})` : "not authenticated"}, and no login can be run here (${provider.loginUnavailable.reason}) ---\n`,
+				);
+				console.log(
+					`\n--- ${provider.name}: to fix it, ${provider.loginUnavailable.remediation} ---\n`,
+				);
+				return {
+					name: provider.name,
+					wasAuthenticated: false,
+					ranLogin: false,
+					authenticated: false,
+					loginUnavailable: provider.loginUnavailable.reason,
 				};
 			}
 			console.log(
@@ -906,7 +974,9 @@ function main(argv = process.argv.slice(2)) {
 			? "already authenticated"
 			: result.ranLogin
 				? "ran interactive login"
-				: "auth check failed";
+				: result.loginUnavailable
+					? `no login available here: ${result.loginUnavailable}`
+					: "auth check failed";
 		console.log(`${result.name}: ${status} (${action})`);
 	}
 	process.exitCode = results.some((result) => !result.authenticated) ? 1 : 0;

@@ -1,11 +1,18 @@
 import { deepStrictEqual, match, ok, strictEqual, throws } from "node:assert";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import {
-	AGY_LOGIN_COMMAND,
+	AGY_LOGIN_UNAVAILABLE,
 	CLAUDE_LOGIN_HINT,
 	CLONE_QUALIFICATION_RECEIPT_SCHEMA_VERSION,
 	COPILOT_LOGIN_COMMAND,
@@ -22,6 +29,7 @@ import {
 	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_BOOT_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 function fixtureHostProbe(pid) {
@@ -86,8 +94,59 @@ describe("ensureProvidersAuthenticated", () => {
 		strictEqual(loggedIn, 0);
 	});
 
-	it("uses agy's plain interactive login invocation", () => {
-		deepStrictEqual(AGY_LOGIN_COMMAND, ["agy"]);
+	// Task 44. The bare `agy` invocation this used to assert opened a
+	// full-screen TUI inside the guest over `prlctl exec`, which never
+	// prompted and never returned, so the walkthrough hung here and never
+	// reached cursor, copilot or vibe.
+	it("declares agy's login unavailable instead of running one that cannot finish", () => {
+		const agy = PROVIDERS.find((provider) => provider.name === "agy");
+		strictEqual(typeof agy.runLogin, "undefined");
+		strictEqual(agy.loginUnavailable, AGY_LOGIN_UNAVAILABLE);
+		ok(AGY_LOGIN_UNAVAILABLE.reason.length > 0);
+		ok(AGY_LOGIN_UNAVAILABLE.remediation.length > 0);
+	});
+
+	it("reports a provider whose login is unavailable and keeps walking the rest", () => {
+		const logs = [];
+		const originalLog = console.log;
+		console.log = (line) => logs.push(String(line));
+		let laterProviderChecked = 0;
+		let results;
+		try {
+			results = ensureProvidersAuthenticated([
+				{
+					name: "stuck",
+					isAuthenticated: () => false,
+					loginUnavailable: {
+						reason: "no login subcommand exists",
+						remediation: "sign in from the console once",
+					},
+				},
+				{
+					name: "after",
+					isAuthenticated: () => {
+						laterProviderChecked += 1;
+						return true;
+					},
+				},
+			]);
+		} finally {
+			console.log = originalLog;
+		}
+		deepStrictEqual(results[0], {
+			name: "stuck",
+			wasAuthenticated: false,
+			ranLogin: false,
+			authenticated: false,
+			loginUnavailable: "no login subcommand exists",
+		});
+		strictEqual(results[1].authenticated, true);
+		// The whole point: one provider with no runnable login must not cost
+		// every provider ordered after it.
+		strictEqual(laterProviderChecked, 1);
+		const printed = logs.join("\n");
+		match(printed, /no login can be run here \(no login subcommand exists\)/);
+		match(printed, /sign in from the console once/);
 	});
 
 	it("uses the supported Copilot CLI login subcommand", () => {
@@ -264,7 +323,15 @@ describe("ensureProvidersAuthenticated", () => {
 		for (const provider of PROVIDERS) {
 			if (provider.authMode === "ephemeral_api_key_dispatch") continue;
 			strictEqual(typeof provider.isAuthenticated, "function");
-			strictEqual(typeof provider.runLogin, "function");
+			// Every provider offers exactly one of the two: a login to run, or
+			// a named reason there is none. Neither would leave the walkthrough
+			// with nothing to say about a provider it cannot authenticate.
+			strictEqual(
+				typeof provider.runLogin === "function" ||
+					typeof provider.loginUnavailable?.reason === "string",
+				true,
+				`${provider.name} declares neither runLogin nor loginUnavailable`,
+			);
 		}
 	});
 });
@@ -1405,6 +1472,75 @@ describe("withBootedGoldenImage golden-image posture (INV-1, INV-3)", () => {
 			...overrides,
 		};
 	};
+
+	// Task 44. Ctrl+C is the documented escape from a login that will not
+	// finish, and it used to kill node before anything stopped the guest —
+	// leaving the golden image running with baked credentials, which blocks
+	// the next dispatch until someone notices. Driven as a real child process
+	// because the defect is in signal delivery, which cannot be faked
+	// in-process.
+	it("stops the golden image when the walkthrough is interrupted", async () => {
+		const scratch = tempDir("switchyard-auth-sigint-");
+		try {
+			const stopMarker = join(scratch, "stopped");
+			const readyMarker = join(scratch, "ready");
+			const scriptPath = join(scratch, "interrupt.mjs");
+			const moduleUrl = new URL(
+				"../src/switchyard/auth/index.mjs",
+				import.meta.url,
+			).href;
+			writeFileSync(
+				scriptPath,
+				`import { writeFileSync } from "node:fs";
+import { withBootedGoldenImage } from ${JSON.stringify(moduleUrl)};
+const backend = {
+	goldenImage: "switchyard-golden-test",
+	aquaUid: "501",
+	bootGoldenImage: () => ({ uuid: "golden-uuid" }),
+	stopGoldenImage: (uuid) => writeFileSync(${JSON.stringify(stopMarker)}, uuid),
+	describePostureViolations: () => [],
+};
+withBootedGoldenImage(backend, () => {
+	writeFileSync(${JSON.stringify(readyMarker)}, "ready");
+	// Blocks the event loop the way execFileSync(stdio: "inherit") does while
+	// an interactive login holds the terminal, so the signal is delivered the
+	// same way it is in the real hang.
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3000);
+	return "finished";
+});
+`,
+				"utf8",
+			);
+			const child = spawn(process.execPath, [scriptPath], {
+				stdio: ["ignore", "ignore", "pipe"],
+			});
+			const exit = new Promise((resolveExit) => {
+				child.on("exit", (code, signal) => resolveExit({ code, signal }));
+			});
+			const deadline = Date.now() + 15000;
+			while (!existsSync(readyMarker) && Date.now() < deadline) {
+				await new Promise((tick) => setTimeout(tick, 20));
+			}
+			ok(existsSync(readyMarker), "child never entered the walkthrough body");
+			child.kill("SIGINT");
+			const { code, signal } = await exit;
+			ok(
+				existsSync(stopMarker),
+				"an interrupted walkthrough must still stop the golden image",
+			);
+			strictEqual(readFileSync(stopMarker, "utf8"), "golden-uuid");
+			// Without the handlers node takes the default disposition and dies
+			// on the spot with the guest still running: the child reports
+			// signal SIGINT and never reaches its stop. What is asserted is the
+			// guarantee that matters -- the process did not go away until the
+			// guest was stopped -- not that the signal aborts a blocked
+			// execFileSync, which no handler can do.
+			strictEqual(signal, null, "node must not die on the default disposition");
+			strictEqual(code, 0);
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
+		}
+	});
 
 	it("checks the posture when the body succeeds, and returns the body's value", () => {
 		const backend = makeBackend();
