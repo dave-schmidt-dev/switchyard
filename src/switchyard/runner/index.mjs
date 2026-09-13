@@ -6883,10 +6883,16 @@ export async function executeTaskAsync(task, context) {
 			requiredCapability,
 			// Read from the same routed record as provider and model, and from
 			// the same expression the ledger entry above already uses. Omitting
-			// it here left a throw after routing -- a broker reservation lock
-			// timeout under load is the one seen in the wild -- returning a
+			// it here left any throw between routing and completion returning a
 			// failed result that no ledger reader or route-health reader could
 			// attribute, while the ledger's own copy of the id was intact.
+			// Scope, stated precisely: `routed` is `context._activeTaskRoute`,
+			// set only after selectAndReserve returns, so this covers throws
+			// AFTER routing. A reservation lock timeout raised inside the
+			// selector still leaves the id null, because there is no route yet to
+			// read one from -- that is a different, unattributed case, not this
+			// one. The reproduction is a post-routing ledger throw; no specific
+			// production throw has been measured as the source.
 			resolvedTargetId: routed?.resolvedTargetId ?? null,
 			result: "execution_failed",
 			...failure,

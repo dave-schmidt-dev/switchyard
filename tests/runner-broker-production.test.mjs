@@ -1427,9 +1427,13 @@ test("production router path rejects an unknown snapshot source", async () => {
 	strictEqual(calls, 0);
 });
 
-// Task 43. Every other persistDiagnosticArtifact case in the suite injects a
-// stub, so none of them can tell a wired producer from an unwired one. This
-// drives the real run-store writer and asserts a file lands on disk.
+// Task 43. This injects its dependency like every other case in the suite, so
+// it is NOT the regression guard for dispatch/index.mjs wiring the producer --
+// that is "wires a diagnostic artifact writer into the synchronous queue" in
+// dispatch-cli.test.mjs, which is the one that fails against the unfixed path.
+// What this adds is the half nothing covered: the run store's real writer,
+// driven end to end, asserting a provider_diagnostic file actually lands on
+// disk rather than a stub reporting that it would have.
 test("production async runner writes a real diagnostic artifact for a failed launch", async () => {
 	const root = await tempDirAsync("switchyard-production-broker-artifact-");
 	const stateRoot = join(root, "state-root");
