@@ -43,6 +43,8 @@ import {
 	captureDirtyOverlay,
 	captureTaskStartTree,
 	captureTaskStartTreeAsync,
+	releaseTaskStartTree,
+	releaseTaskStartTreeAsync,
 	validateTaskStartTreeAsync,
 	writeDirtyOverlayReceipt,
 } from "../src/switchyard/lifecycle/index.mjs";
@@ -255,7 +257,42 @@ describe("task-base Parallels lost-result recovery", () => {
 		);
 	});
 
-	it("preserves the lost anchor error when reconciliation cannot read the ref", async () => {
+	it("replays the anchor when a lost result left no ref", async () => {
+		let updateAttempts = 0;
+		let readAttempts = 0;
+		const backend = {
+			execArgv(_workspaceId, { argv }) {
+				if (argv[1] === "add") return outputCommand();
+				if (argv[1] === "write-tree") return outputCommand(`${TREE}\n`);
+				if (argv[1] === "update-ref") {
+					updateAttempts += 1;
+					return updateAttempts === 1 ? lostResultCommand() : outputCommand();
+				}
+				if (argv[1] === "rev-parse") {
+					readAttempts += 1;
+					return {
+						command: process.execPath,
+						args: [
+							"-e",
+							'process.stderr.write("fatal: ref not found\\n"); process.exit(128)',
+						],
+					};
+				}
+				throw new Error(`unexpected git helper: ${argv.join(" ")}`);
+			},
+		};
+		deepStrictEqual(
+			await captureTaskStartTreeAsync(backend, "workspace", {
+				runId: "recovery",
+				taskId: "1.1",
+			}),
+			{ ref: REF, tree: TREE },
+		);
+		strictEqual(updateAttempts, 2);
+		strictEqual(readAttempts, 1);
+	});
+
+	it("preserves the lost anchor error when replay and reconciliation both fail", async () => {
 		const backend = {
 			execArgv(_workspaceId, { argv }) {
 				if (argv[1] === "add") return outputCommand();
@@ -280,6 +317,62 @@ describe("task-base Parallels lost-result recovery", () => {
 			/PrlJob_GetResult: Invalid argument/,
 		);
 	});
+
+	for (const [mode, release] of [
+		["synchronous", releaseTaskStartTree],
+		["asynchronous", releaseTaskStartTreeAsync],
+	]) {
+		it(`${mode} reconciles a lost release result when the ref is absent`, async () => {
+			const calls = [];
+			const backend = {
+				execArgv(_workspaceId, { argv }) {
+					calls.push(argv);
+					if (argv[1] === "rev-parse") return outputCommand(`${TREE}\n`);
+					if (argv[1] === "update-ref") return lostResultCommand();
+					if (argv[1] === "for-each-ref") return outputCommand();
+					throw new Error(`unexpected git helper: ${argv.join(" ")}`);
+				},
+			};
+			await release(backend, "workspace", { ref: REF, tree: TREE });
+			strictEqual(calls.filter((argv) => argv[1] === "update-ref").length, 1);
+			strictEqual(calls.filter((argv) => argv[1] === "for-each-ref").length, 1);
+		});
+
+		it(`${mode} safely replays a lost release that left the expected ref`, async () => {
+			let updateAttempts = 0;
+			const backend = {
+				execArgv(_workspaceId, { argv }) {
+					if (argv[1] === "rev-parse") return outputCommand(`${TREE}\n`);
+					if (argv[1] === "update-ref") {
+						updateAttempts += 1;
+						return updateAttempts === 1 ? lostResultCommand() : outputCommand();
+					}
+					if (argv[1] === "for-each-ref") return outputCommand(`${TREE}\n`);
+					throw new Error(`unexpected git helper: ${argv.join(" ")}`);
+				},
+			};
+			await release(backend, "workspace", { ref: REF, tree: TREE });
+			strictEqual(updateAttempts, 2);
+		});
+
+		it(`${mode} fails closed when release reconciliation finds a different ref`, async () => {
+			const backend = {
+				execArgv(_workspaceId, { argv }) {
+					if (argv[1] === "rev-parse") return outputCommand(`${TREE}\n`);
+					if (argv[1] === "update-ref") return lostResultCommand();
+					if (argv[1] === "for-each-ref")
+						return outputCommand(`${"b".repeat(40)}\n`);
+					throw new Error(`unexpected git helper: ${argv.join(" ")}`);
+				},
+			};
+			await rejects(
+				Promise.resolve().then(() =>
+					release(backend, "workspace", { ref: REF, tree: TREE }),
+				),
+				/PrlJob_GetResult/,
+			);
+		});
+	}
 
 	it("reports a synchronous backend execution failure after async probe start", async () => {
 		const statuses = [];
@@ -1143,6 +1236,42 @@ describe("attempt-scoped execution backend", () => {
 			DEFAULT_SILENCE_TIMEOUT_MS,
 		);
 		strictEqual(typeof observedExecutionOptions.onProgress, "function");
+	});
+
+	it("lets agy reach its own print timeout before the silence cutoff", async () => {
+		let observedSilenceTimeoutMs;
+		const descriptor = testDescriptor();
+		const launch = createBrokerAdapterLauncher({
+			adapter: {
+				executeAsync: async (_prompt, _workspace, options) => {
+					observedSilenceTimeoutMs = options.silenceTimeoutMs;
+					return { success: true, output: "ok" };
+				},
+			},
+			executionBackend: {},
+			workingContainerName: "vm",
+			prompt: "fixture",
+		});
+		const route = {
+			provider: "Antigravity",
+			resolvedTarget: "antigravity",
+			harness: "agy",
+			model: descriptor.selector,
+			effort: null,
+			reservation: { id: "reservation-1" },
+		};
+		await launch({
+			request: { taskId: "1.4", attemptId: "attempt-agy" },
+			route,
+			invocationDescriptor: descriptor,
+			launcherIdentity: {
+				...route,
+				descriptorIdentity: descriptor.descriptor_identity,
+				reservationId: "reservation-1",
+			},
+			onProgress: () => {},
+		});
+		strictEqual(observedSilenceTimeoutMs, 10 * 60 * 1000);
 	});
 
 	it("keeps adapter evidence unpersisted until broker boundary", async () => {

@@ -1179,6 +1179,25 @@ function resolveCurrentDispatchDescriptor(
 	slot,
 	options = {},
 ) {
+	const descriptor = resolveConfiguredDispatchDescriptor(
+		targetId,
+		target,
+		models,
+		slot,
+	);
+	if (!descriptor) return null;
+	return qualificationAuthorizesDescriptor(
+		target,
+		descriptor,
+		slot,
+		models?.[slot?.model_ref],
+		options,
+	)
+		? descriptor
+		: null;
+}
+
+function resolveConfiguredDispatchDescriptor(targetId, target, models, slot) {
 	if (
 		!targetId ||
 		!target?.harness ||
@@ -1204,15 +1223,7 @@ function resolveCurrentDispatchDescriptor(
 	} catch {
 		return null;
 	}
-	return qualificationAuthorizesDescriptor(
-		target,
-		descriptor,
-		slot,
-		model,
-		options,
-	)
-		? descriptor
-		: null;
+	return descriptor;
 }
 
 /**
@@ -1352,9 +1363,30 @@ export function assertRealRosterCoherence(
  * @returns {Readonly<object>|null}
  */
 export function getInvocationDescriptor(providerName, capabilityClass) {
+	return getDescriptorForCapability(providerName, capabilityClass, true);
+}
+
+/**
+ * Resolve the active owner-configured invocation without requiring a separate
+ * dispatch-qualification receipt. This is for the one-shot local path, where
+ * the selected CLI's sandbox and the task result itself are the bounded
+ * availability check. Legacy automatic VM routing remains qualification-gated.
+ */
+export function getConfiguredInvocationDescriptor(
+	providerName,
+	capabilityClass,
+) {
+	return getDescriptorForCapability(providerName, capabilityClass, false);
+}
+
+function getDescriptorForCapability(
+	providerName,
+	capabilityClass,
+	requireQualification,
+) {
 	if (!Object.hasOwn(CAPABILITY_CLASS_ORDER, capabilityClass)) {
 		throw new Error(
-			`getInvocationDescriptor: unrecognized capability ${JSON.stringify(capabilityClass)}`,
+			`getDescriptorForCapability: unrecognized capability ${JSON.stringify(capabilityClass)}`,
 		);
 	}
 	const roster = getRoster();
@@ -1371,12 +1403,14 @@ export function getInvocationDescriptor(providerName, capabilityClass) {
 		if (!slot || typeof slot !== "object" || slot.manual_only) continue;
 		const model = models[slot.model_ref];
 		if (model?.status !== "active") continue;
-		const descriptor = resolveCurrentDispatchDescriptor(
-			entry.id,
-			entry.target,
-			models,
-			slot,
-		);
+		const descriptor = requireQualification
+			? resolveCurrentDispatchDescriptor(entry.id, entry.target, models, slot)
+			: resolveConfiguredDispatchDescriptor(
+					entry.id,
+					entry.target,
+					models,
+					slot,
+				);
 		if (!descriptor) continue;
 		candidates.push({
 			priority: Number.isInteger(slot.priority)

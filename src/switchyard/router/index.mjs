@@ -1,12 +1,14 @@
 // Router module - selects provider for task dispatch
-// INV-4: Dispatch only to funded providers, spreading load across funded providers
+// INV-4: Dispatch only to funded providers, draining tier 1 in roster order and
+// spreading load within later ranked and legacy pools.
 // INV-5: Capability filter applied before spread selection
 // Low-capability economics: easy tasks become eligible for cheap/low-cost
 // lanes (e.g. opencode-go), while high-capability tasks remain reserved for
 // high-capability providers (Claude/Codex).
-// INV-4 most-headroom spread selects among eligible lanes without cost-override or fixed ratios.
+// Tier 1 is deterministic and sticky; tiers 2/3 and unranked lanes retain
+// headroom spread selection without cost-override or fixed ratios.
 //
-// Reuses review-plugin's capacity scoring (0.9·pace + 0.1·jitter, floor/skip, blind fallback)
+// Reuses review-plugin's capacity scoring for tier 2/3 and legacy pools.
 // CR-2: EXCLUDED_FAMILIES removed - Claude is routable
 // CR-3: Tolerate absent providers - skip, never crash
 
@@ -175,6 +177,33 @@ function indexProviders(snapshot) {
 	return map;
 }
 
+/**
+ * Read the target declaration order used to make tier-1 selection stable.
+ * The roster loader owns validation and capability metadata; this small
+ * read-only projection is kept here because the router must distinguish two
+ * enabled targets that share one harness (for example, the two agy buckets).
+ * A malformed or unavailable roster yields an empty map and the deterministic
+ * target-id/name fallback remains available to the caller.
+ *
+ * @returns {Map<string, number>}
+ */
+function readRosterTargetOrder() {
+	const rosterPath =
+		process.env.SWITCHYARD_ROSTER_PATH ||
+		join(homedir(), ".agent", "roster.json");
+	try {
+		const roster = JSON.parse(readFileSync(rosterPath, "utf8"));
+		return new Map(
+			Object.keys(roster?.targets ?? {}).map((targetId, index) => [
+				targetId,
+				index,
+			]),
+		);
+	} catch {
+		return new Map();
+	}
+}
+
 const TERMINAL_PREFLIGHT_STATUSES = new Set([
 	"done",
 	"succeeded",
@@ -186,18 +215,22 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
 
 /**
  * Providers whose golden-image-baked auth has been proven, by a real
- * clone-survival test, to persist through cloning: log in once in the
- * golden image, clone it, and confirm the clone is still authenticated with
- * no fresh login. `codex` and Vibe are verified this way. OpenCode Go and
- * OpenCode Mistral are separately qualified through their fixed BWS API-key
- * bridge lanes, which inject no persistent credential into the golden image or
- * clone. The macOS queue admits either
+ * clone-survival test, to persist through cloning: log in once in the golden
+ * image, clone it, and confirm the clone is still authenticated with no fresh
+ * login. Codex, Codex Spark, both Antigravity targets, Copilot, and Vibe are
+ * verified this way. OpenCode Go and OpenCode Mistral are separately qualified
+ * through their fixed BWS API-key bridge lanes, which inject no persistent
+ * credential into the golden image or clone. The macOS queue admits either
  * evidence class but keeps every other provider fail-closed. Bridge admission
  * alone never routes a target: the roster still requires its own exact current
  * dispatch-qualified descriptor receipt.
  */
 export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"codex",
+	"codex-spark",
+	"antigravity",
+	"antigravity-claude",
+	"copilot-student",
 	"opencode-go",
 	"opencode-mistral",
 	"vibe",
@@ -271,6 +304,7 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 		platform = "direct",
 		usageMode = "observed",
 		goldenImageVerifiedProviders = GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+		hasInvocationDescriptor = hasAutomaticInvocationDescriptor,
 	} = options;
 	if (!new Set(["direct", "macos"]).has(platform)) {
 		return { eligible: false, reason: "invalid_platform" };
@@ -311,7 +345,7 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 	if (!passesCapabilityFilter(name, requiredCapability)) {
 		return { eligible: false, reason: "below_required_capability" };
 	}
-	if (!hasAutomaticInvocationDescriptor(name, requiredCapability)) {
+	if (!hasInvocationDescriptor(name, requiredCapability)) {
 		return { eligible: false, reason: "no_invocation_descriptor" };
 	}
 	if (
@@ -678,13 +712,13 @@ export function preflightMacosQueue(options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Routing with spread selection (INV-4)
+// Routing with tiered selection (INV-4)
 
 /**
- * Route to the provider with most remaining headroom.
+ * Route to a provider using roster implementor-priority tiers.
  * Filters: not absent from snapshot (CR-3), not exhausted (below floor),
- * capability filter (INV-5) applied before spread selection.
- * Spread: pick highest headroom among eligible.
+ * capability filter (INV-5) applied before selection. Tier 1 drains in
+ * roster order; tiers 2 and 3 spread by headroom within their own tier.
  * Model: right-sized to the task's required capability (INV-5).
  *
  * @param {object} options
@@ -725,6 +759,7 @@ export function route(options = {}) {
 	// are validated by the runner boundary (and by the roster filter below).
 	const effectiveCapabilityClass =
 		requiredCapability ?? CAPABILITY_CLASS.standard;
+	const modelForCapability = options.modelForCapability ?? getRightSizedModel;
 
 	// Read snapshot host-side (WR-1). All route-time diagnostics below come
 	// from this one resolved path/content read, so status, mtime, and age cannot
@@ -782,11 +817,12 @@ export function route(options = {}) {
 			availableProviders,
 			platform,
 			goldenImageVerifiedProviders,
+			hasInvocationDescriptor: options.hasInvocationDescriptor,
 			healthDecision: options.healthDecision,
 			onHealthDecision: options.onHealthDecision,
 		});
 		const model = blind.provider
-			? getRightSizedModel(blind.provider, effectiveCapabilityClass)
+			? modelForCapability(blind.provider, effectiveCapabilityClass)
 			: null;
 		return {
 			...blind,
@@ -818,22 +854,35 @@ export function route(options = {}) {
 	let unresolvedTargetSkips = 0;
 	let ambiguousTargetSkips = 0;
 
-	// implementor-priority-waterfall-routing plan: survivors of the checks
-	// above partition into three pools instead of one flat scored array.
-	//   - rankedPool: providers whose roster target sets implementor_priority
-	//     (the "cheap implementor" waterfall — Antigravity's two buckets,
-	//     Copilot, Cursor's `ac` window). Drained to a hardcoded 0% floor,
-	//     strictly in priority order — INV-4's headroom spread does not apply
-	//     WITHIN this pool.
+	// Implementor-priority routing partitions survivors by roster-declared tier.
+	// Tier 1 drains in roster order; tiers 2 and 3 spread within their own tier.
+	// Other numeric priorities remain in the legacy ranked pool so older roster
+	// entries retain their prior behavior.
 	//   - unrankedPool: every other funded provider (Claude, Codex,
 	//     opencode-go, ...), using the EXACT pre-existing floor+spread
 	//     semantics, byte-identical to today.
 	//   - lastResortPool: Cursor's `ap` (API) window alone, gated by the
 	//     ordinary DEFAULT_FLOOR — only reachable once both pools above are
 	//     empty (see the winner-resolution precedence below).
-	const rankedPool = [];
+	const tierPools = new Map([
+		[1, []],
+		[2, []],
+		[3, []],
+	]);
+	const legacyRankedPool = [];
 	const unrankedPool = [];
 	const lastResortPool = [];
+	const rosterTargetOrder = readRosterTargetOrder();
+
+	function rosterOrderOf(name) {
+		const identity = resolveTargetIdentity(name);
+		return {
+			index:
+				rosterTargetOrder.get(identity.targetId) ?? Number.POSITIVE_INFINITY,
+			targetId: identity.targetId ?? "",
+			name,
+		};
+	}
 
 	// Minimum finite pace_delta across a set of windows — Task 10's
 	// reduce-based min (never Math.min(...spread), which blows the call stack
@@ -850,7 +899,8 @@ export function route(options = {}) {
 			: 0;
 	}
 
-	// Score each provider by headroom (percent_left)
+	// Classify each provider by eligibility, then add it to the appropriate
+	// policy tier. Snapshot iteration order is never used for tier-1 choice.
 	for (const [name, provider] of providers) {
 		// CR-3: tolerate absent providers - but we're iterating present ones,
 		// absent providers simply won't be in the map. This is the tolerance.
@@ -863,6 +913,7 @@ export function route(options = {}) {
 			platform,
 			usageMode: "observed",
 			goldenImageVerifiedProviders,
+			hasInvocationDescriptor: options.hasInvocationDescriptor,
 		});
 		if (!eligibility.eligible) {
 			if (eligibility.reason === "below_required_capability") {
@@ -884,7 +935,7 @@ export function route(options = {}) {
 				explicitly_excluded: `provider ${name}: explicitly excluded`,
 				not_in_only_allowlist: `provider ${name}: not in --only-provider allowlist`,
 				below_required_capability: `provider ${name}: below required capability ${effectiveCapabilityClass}`,
-				no_invocation_descriptor: `provider ${name}: no current exact invocation descriptor for ${effectiveCapabilityClass}`,
+				no_invocation_descriptor: `provider ${name}: no usable invocation descriptor for ${effectiveCapabilityClass}`,
 				provider_unavailable: `provider ${name}: unavailable (ok=false)`,
 			};
 			log.push(
@@ -930,16 +981,19 @@ export function route(options = {}) {
 
 			if (acWindow && priority !== null) {
 				if (acWindow.percent_left > 0) {
-					rankedPool.push({
+					const candidate = {
 						name,
 						percentLeft: acWindow.percent_left,
 						pace: computePace([acWindow]),
 						priority,
+						rosterOrder: rosterOrderOf(name),
 						// The bucket this candidate would actually draw on. Cursor's
 						// ac and ap are separate accounts, so the reservation must be
 						// keyed to the one that wins, not to both.
 						accountingWindows: [acWindow],
-					});
+					};
+					if (tierPools.has(priority)) tierPools.get(priority).push(candidate);
+					else legacyRankedPool.push(candidate);
 					log.push(
 						`provider ${name}: eligible for priority fill via ac (${acWindow.percent_left}% left, priority ${priority})`,
 					);
@@ -993,13 +1047,16 @@ export function route(options = {}) {
 			// regardless of the caller-supplied floor option — a deliberate
 			// policy override, not just a new default.
 			if (minPercentLeft > 0) {
-				rankedPool.push({
+				const candidate = {
 					name,
 					percentLeft: minPercentLeft,
 					pace: computePace(windows),
 					priority,
+					rosterOrder: rosterOrderOf(name),
 					accountingWindows: windows,
-				});
+				};
+				if (tierPools.has(priority)) tierPools.get(priority).push(candidate);
+				else legacyRankedPool.push(candidate);
 				log.push(
 					`provider ${name}: eligible for priority fill (${minPercentLeft}% left, priority ${priority})`,
 				);
@@ -1033,11 +1090,8 @@ export function route(options = {}) {
 		);
 	}
 
-	// Resolve the winner of a pool by best metric (lowest for priority rank,
-	// highest for percentLeft headroom), tie-breaking equal-metric candidates
-	// with the documented scorer (0.9·normPace + 0.1·jitter, Task 11) — the
-	// SAME mechanism the pre-existing equal-percentLeft tie-break used, now
-	// shared by both the unranked spread pool and the ranked priority pool.
+	// Resolve a load-balanced pool by best metric (highest percentLeft),
+	// tie-breaking equal metrics with the documented scorer.
 	function resolveWinner(pool, metricOf, isBetter, describeMetric) {
 		let best = pool[0];
 		for (const item of pool) {
@@ -1064,19 +1118,52 @@ export function route(options = {}) {
 		return best;
 	}
 
+	// Tier 1 is a simple sequential drain. It deliberately does not inspect
+	// headroom, pace, jitter, seed, or snapshot order once eligibility has been
+	// established. The roster target order is the policy's stable tie-break;
+	// target id/name keeps malformed or synthetic rosters deterministic.
+	function resolveTierOneWinner(pool) {
+		return pool.reduce((best, candidate) => {
+			const current = candidate.rosterOrder;
+			const incumbent = best.rosterOrder;
+			if (current.index !== incumbent.index) {
+				return current.index < incumbent.index ? candidate : best;
+			}
+			if (current.targetId !== incumbent.targetId) {
+				return current.targetId < incumbent.targetId ? candidate : best;
+			}
+			return current.name < incumbent.name ? candidate : best;
+		});
+	}
+
 	let winner;
 	let reason;
 
-	if (rankedPool.length > 0) {
-		// True waterfall: strictly lowest implementor_priority wins, never
-		// compared against headroom across ranks (rank 1 wins over rank 2 even
-		// with less headroom left). Equal-priority candidates (the two
-		// Antigravity buckets, both priority 1) fall to the scorer.
+	if (tierPools.get(1).length > 0) {
+		winner = resolveTierOneWinner(tierPools.get(1));
+		reason = "priority_fill";
+	} else if (tierPools.get(2).length > 0) {
 		winner = resolveWinner(
-			rankedPool,
+			tierPools.get(2),
+			(s) => s.percentLeft,
+			(a, b) => a > b,
+			(metric) => `tier 2 at ${metric}%`,
+		);
+		reason = "priority_fill";
+	} else if (tierPools.get(3).length > 0) {
+		winner = resolveWinner(
+			tierPools.get(3),
+			(s) => s.percentLeft,
+			(a, b) => a > b,
+			(metric) => `tier 3 at ${metric}%`,
+		);
+		reason = "priority_fill";
+	} else if (legacyRankedPool.length > 0) {
+		winner = resolveWinner(
+			legacyRankedPool,
 			(s) => s.priority,
 			(a, b) => a < b,
-			(metric) => `at priority ${metric}`,
+			(metric) => `legacy priority ${metric}`,
 		);
 		reason = "priority_fill";
 	} else if (unrankedPool.length > 0) {
@@ -1136,7 +1223,7 @@ export function route(options = {}) {
 	log.push(`winner: ${winner.name} with ${winner.percentLeft}% left`);
 
 	// INV-5: Model right-sizing
-	const model = getRightSizedModel(winner.name, effectiveCapabilityClass);
+	const model = modelForCapability(winner.name, effectiveCapabilityClass);
 	if (!model) {
 		log.push(
 			`no model for ${winner.name} at required capability ${effectiveCapabilityClass}`,
@@ -1192,7 +1279,8 @@ export function routeBlind(
 		};
 	}
 
-	for (const name of providerOrder) {
+	const survivors = [];
+	for (const [providerOrderIndex, name] of providerOrder.entries()) {
 		const eligibility = evaluateCandidateEligibility(name, null, {
 			...options,
 			exclude,
@@ -1219,10 +1307,48 @@ export function routeBlind(
 			usageMode: "unknown",
 		});
 		if (health) continue;
+		survivors.push({
+			name,
+			priority: getImplementorPriority(name),
+			providerOrderIndex,
+		});
+	}
+
+	if (survivors.length > 0) {
+		const rosterOrder = readRosterTargetOrder();
+		const priorityOrder = (candidate) => {
+			if (candidate.priority === 1) return 1;
+			if (candidate.priority === 2) return 2;
+			if (candidate.priority === 3) return 3;
+			if (candidate.priority !== null) return 4;
+			return 5;
+		};
+		const winner = survivors.toSorted((left, right) => {
+			const tierDelta = priorityOrder(left) - priorityOrder(right);
+			if (tierDelta !== 0) return tierDelta;
+			if (left.priority === 1) {
+				const leftId = resolveTargetId(left.name) ?? "";
+				const rightId = resolveTargetId(right.name) ?? "";
+				const rosterDelta =
+					(rosterOrder.get(leftId) ?? Number.POSITIVE_INFINITY) -
+					(rosterOrder.get(rightId) ?? Number.POSITIVE_INFINITY);
+				if (rosterDelta !== 0) return rosterDelta;
+				const idDelta = leftId.localeCompare(rightId);
+				if (idDelta !== 0) return idDelta;
+			}
+			if (
+				left.priority !== null &&
+				right.priority !== null &&
+				left.priority !== right.priority
+			) {
+				return left.priority - right.priority;
+			}
+			return left.providerOrderIndex - right.providerOrderIndex;
+		})[0];
 		return {
-			provider: name,
+			provider: winner.name,
 			model: null,
-			resolvedTargetId: resolveTargetId(name),
+			resolvedTargetId: resolveTargetId(winner.name),
 			reason: "blind_fallback",
 		};
 	}

@@ -61,6 +61,7 @@ import { createSnapshotCoordinator } from "../src/switchyard/broker/snapshots.mj
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__resetRosterCacheForTests,
+	getImplementorPriority,
 	getInvocationDescriptorIdentity,
 	PROVIDER_CAPABILITIES,
 	passesCapabilityFilter,
@@ -81,6 +82,7 @@ import {
 } from "../src/switchyard/router/health.mjs";
 import {
 	evaluateCandidateEligibility,
+	GOLDEN_IMAGE_VERIFIED_PROVIDERS,
 	preflightMacosQueue,
 	route,
 	routeBlind,
@@ -982,7 +984,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			strictEqual(result.reason, "no_eligible");
 			ok(
 				result.log.some((entry) =>
-					entry.includes("Vibe: no current exact invocation descriptor"),
+					entry.includes("Vibe: no usable invocation descriptor"),
 				),
 				"selector-only Vibe must not become an automatic OpenCode route",
 			);
@@ -1828,9 +1830,9 @@ describe("Task 6.1 queue-level platform selection", () => {
 	});
 
 	it("wires the default macOS preflight into the queue backend", () => {
-		// "claude" has quota and meets the "high" capability bar, but the
-		// default GOLDEN_IMAGE_VERIFIED_PROVIDERS allowlist is codex-only, so
-		// the default wiring (no override) must still fail closed on it.
+		// "claude" has quota and meets the "high" capability bar, but remains
+		// outside the verified golden-image allowlist, so the default wiring (no
+		// override) must still fail closed on it.
 		const helper = createQueueBackend({
 			platform: "macos",
 			dependencies: {
@@ -1860,6 +1862,47 @@ describe("Task 6.1 queue-level platform selection", () => {
 				}),
 			/high: no_golden_image_verified_provider_with_quota_headroom.*claude/,
 		);
+	});
+
+	it("admits clone-verified tier-1 targets through the default macOS preflight", () => {
+		for (const targetId of [
+			"codex-spark",
+			"antigravity",
+			"copilot-student",
+			"antigravity-claude",
+		]) {
+			ok(
+				GOLDEN_IMAGE_VERIFIED_PROVIDERS.includes(targetId),
+				`${targetId} should be recorded as clone verified`,
+			);
+		}
+		const cases = [
+			["antigravity", "low"],
+			["copilot-student", "low"],
+		];
+		for (const [targetId, requiredCapability] of cases) {
+			const result = preflightMacosQueue({
+				tasks: [{ status: "pending", requiredCapability }],
+				only: [targetId],
+				readSnapshot: () => ({
+					snapshot: {
+						schema_version: 2,
+						updated_at: new Date().toISOString(),
+						providers: [
+							{
+								name: targetId,
+								ok: true,
+								windows: [{ percent_left: 80, pace_delta: 1 }],
+							},
+						],
+					},
+					snapshotStatus: "fresh",
+					snapshotMtime: 1,
+					snapshotAgeMsAtRoute: 0,
+				}),
+			});
+			strictEqual(result.eligible, true, `${targetId} should be admitted`);
+		}
 	});
 });
 
@@ -2624,6 +2667,15 @@ describe("Task 2.1 shared candidate eligibility", () => {
 });
 
 describe("router (INV-4: blind fallback still respects funding/eligibility)", () => {
+	it("keeps tier 1 ahead of later tiers during blind fallback", () => {
+		const result = routeBlind(
+			["claude", "codex", "cursor", "agy"],
+			[],
+			"standard",
+		);
+		strictEqual(result.provider, "agy");
+	});
+
 	it("handles a missing snapshot gracefully, picking the first capability-eligible roster harness", () => {
 		// A missing/broken snapshot must not silently halt every task behind
 		// it -- route() wires the blind fallback into the real path. The
@@ -2641,9 +2693,12 @@ describe("router (INV-4: blind fallback still respects funding/eligibility)", ()
 		const result = route();
 		strictEqual(result.reason, "blind_fallback");
 
-		const expectedOrder = Object.keys(PROVIDER_CAPABILITIES).filter((name) =>
-			passesCapabilityFilter(name, "high"),
-		);
+		const expectedOrder = Object.keys(PROVIDER_CAPABILITIES)
+			.filter((name) => passesCapabilityFilter(name, "standard"))
+			.toSorted((left, right) => {
+				const priority = (name) => getImplementorPriority(name) ?? 4;
+				return priority(left) - priority(right);
+			});
 		ok(
 			expectedOrder.length > 0,
 			"fixture must have at least one high-capable harness for this test to mean anything",
@@ -2651,8 +2706,7 @@ describe("router (INV-4: blind fallback still respects funding/eligibility)", ()
 		strictEqual(
 			result.provider,
 			expectedOrder[0],
-			"blind fallback must pick the first capability-eligible roster harness, " +
-				"in the roster's own declared order",
+			"blind fallback must honor implementor tiers before legacy roster order",
 		);
 	});
 
@@ -3090,22 +3144,9 @@ describe("router (implementor-priority waterfall routing)", () => {
 		);
 	});
 
-	it("two same-priority ranked providers (the two Antigravity buckets) tie-break via the scorer", () => {
-		// Dedicated fixture (not the shared dual-agy one, which asserts
-		// headroom-based winner flips that a priority tie-break would break):
-		// both agy-harness targets carry implementor_priority: 1, so the tie
-		// is decided by priority equality, then the SAME scorer mechanism
-		// (0.9*normPace + 0.1*jitter) equal-percentLeft ties use elsewhere.
-		// The two buckets are given DELIBERATELY UNEQUAL headroom (90% vs
-		// 40%) to prove headroom plays no role in a same-rank tie: the
-		// ranked-pool tie set is built from priority equality alone, so both
-		// still enter the tie-break despite the headroom gap, and the
-		// LOWER-headroom/higher-pace bucket wins — showing this is not
-		// secretly the ordinary headroom-spread path in disguise. With two
-		// candidates and distinct finite paces, the one at normPace===1 (max
-		// pace) always outscores the one at normPace===0 regardless of
-		// jitter, so the higher-pace bucket deterministically wins even
-		// though it holds less headroom.
+	it("tier 1 drains in roster order and stays sticky as quota falls", () => {
+		// The fixture declares antigravity-claude before antigravity. Snapshot
+		// order, headroom, pace, and seed must not change that tier-1 choice.
 		const tiebreakFixturePath = resolve(
 			__dirname,
 			"fixtures",
@@ -3141,13 +3182,30 @@ describe("router (implementor-priority waterfall routing)", () => {
 				},
 			]);
 
-			const result = route({ requiredCapability: "standard" });
+			let result = route({ requiredCapability: "standard", seed: 1 });
 			strictEqual(
 				result.provider,
 				"Antigravity (Claude)",
-				"both buckets tie at priority 1 — the scorer's higher-pace candidate must win even though it holds LESS headroom (90% vs 40%), proving headroom is not compared within a same-rank tie",
+				"tier 1 follows roster order despite the other candidate having more headroom and a different pace",
 			);
 			strictEqual(result.reason, "priority_fill");
+
+			// The incumbent remains first while it has any usable quota, even
+			// when its headroom drops below the later roster candidate.
+			createTestSnapshot([
+				{
+					name: "Antigravity",
+					ok: true,
+					windows: [{ percent_left: 99, pace_delta: 1 }],
+				},
+				{
+					name: "Antigravity (Claude)",
+					ok: true,
+					windows: [{ percent_left: 1, pace_delta: 999 }],
+				},
+			]);
+			result = route({ requiredCapability: "standard", seed: 999 });
+			strictEqual(result.provider, "Antigravity (Claude)");
 		} finally {
 			if (savedRosterPath === undefined) {
 				delete process.env.SWITCHYARD_ROSTER_PATH;
@@ -3157,6 +3215,121 @@ describe("router (implementor-priority waterfall routing)", () => {
 			__resetRosterCacheForTests();
 			rmSync(qualifiedTiebreakFixturePath, { force: true });
 		}
+	});
+
+	it("balances within tier 2 and does not enter tier 3 before tier 2 is unusable", () => {
+		const rosterPath = join(
+			tmpdir(),
+			`switchyard-router-tier-balance-${process.pid}-${randomUUID()}.json`,
+		);
+		const roster = withDispatchQualifiedDescriptors(
+			JSON.parse(readFileSync(FIXTURE_PATH, "utf8")),
+		);
+		// The fixture normally places Cursor in tier 3. Move it to tier 2 for
+		// this synthetic roster so two independently eligible tier-2 targets
+		// prove that balancing is scoped to the tier.
+		roster.targets["cursor-pro"].implementor_priority = 2;
+		writeFileSync(rosterPath, JSON.stringify(roster), "utf8");
+		const savedRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "antigravity",
+					ok: true,
+					windows: [{ percent_left: 0, pace_delta: 0 }],
+				},
+				{
+					name: "copilot",
+					ok: true,
+					windows: [{ percent_left: 20, pace_delta: 0 }],
+				},
+				{
+					name: "cursor",
+					ok: true,
+					windows: [
+						{ id: "ac", percent_left: 80, pace_delta: 0 },
+						{ id: "ap", percent_left: 80, pace_delta: 0 },
+					],
+				},
+				{
+					name: "claude",
+					ok: true,
+					windows: [{ percent_left: 99, pace_delta: 0 }],
+				},
+			]);
+			let result = route({ requiredCapability: "standard" });
+			strictEqual(result.provider, "cursor");
+			strictEqual(result.reason, "priority_fill");
+
+			// Once Cursor's tier-2 quota is exhausted, the remaining tier-2
+			// provider wins before the tier-3/unranked fallbacks.
+			createTestSnapshot([
+				{
+					name: "antigravity",
+					ok: true,
+					windows: [{ percent_left: 0, pace_delta: 0 }],
+				},
+				{
+					name: "copilot",
+					ok: true,
+					windows: [{ percent_left: 20, pace_delta: 0 }],
+				},
+				{
+					name: "cursor",
+					ok: true,
+					windows: [
+						{ id: "ac", percent_left: 0, pace_delta: 0 },
+						{ id: "ap", percent_left: 80, pace_delta: 0 },
+					],
+				},
+				{
+					name: "claude",
+					ok: true,
+					windows: [{ percent_left: 99, pace_delta: 0 }],
+				},
+			]);
+			result = route({ requiredCapability: "standard" });
+			strictEqual(result.provider, "copilot");
+		} finally {
+			if (savedRosterPath === undefined)
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = savedRosterPath;
+			__resetRosterCacheForTests();
+			rmSync(rosterPath, { force: true });
+		}
+	});
+
+	it("enters tier 3 only after tier 1 and tier 2 are unusable", () => {
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 0, pace_delta: 0 }],
+			},
+			{
+				name: "copilot",
+				ok: true,
+				windows: [{ percent_left: 0, pace_delta: 0 }],
+			},
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 80, pace_delta: 0 },
+					{ id: "ap", percent_left: 80, pace_delta: 0 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 0 }],
+			},
+		]);
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "cursor");
+		strictEqual(result.reason, "priority_fill");
 	});
 });
 

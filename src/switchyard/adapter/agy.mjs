@@ -27,6 +27,9 @@ import {
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
 const AGY_CMD = "agy";
+export const AGY_PRINT_TIMEOUT_MINUTES = 9;
+export const AGY_SILENCE_TIMEOUT_MS =
+	(AGY_PRINT_TIMEOUT_MINUTES + 1) * 60 * 1000;
 
 /**
  * Check that Agy's macOS Keychain item is present. The static guest command
@@ -164,7 +167,7 @@ export function executeAgy(prompt, workingContainerName, options = {}) {
 		"--add-dir",
 		cwd,
 		"--print-timeout",
-		"9m",
+		`${AGY_PRINT_TIMEOUT_MINUTES}m`,
 		"--print",
 		guardedPrompt,
 	);
@@ -266,7 +269,7 @@ export async function executeAgyAsync(
 			"--add-dir",
 			cwd,
 			"--print-timeout",
-			"9m",
+			`${AGY_PRINT_TIMEOUT_MINUTES}m`,
 			"--print",
 			guardedPrompt,
 		);

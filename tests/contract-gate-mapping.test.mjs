@@ -208,7 +208,7 @@ describe("source-boundary contract gate mapping", () => {
 	it("maps each declared production boundary to existing suites", () => {
 		const manifest = loadContractGateManifest(ROOT);
 		const ledger = loadLedgerGateMapping(ROOT);
-		strictEqual(manifest.length, 13);
+		strictEqual(manifest.length, 14);
 		strictEqual(
 			validateContractGateMapping({ manifest, ledger, root: ROOT }),
 			true,

@@ -18,6 +18,7 @@ import {
 	filterByCapability,
 	formatRealRosterCoherenceFailure,
 	getCapabilityClass,
+	getConfiguredInvocationDescriptor,
 	getImplementorPriority,
 	getInvocationDescriptor,
 	getInvocationDescriptorIdentity,
@@ -724,6 +725,10 @@ describe("roster loader — invocation descriptor identity", () => {
 		setRosterPath(path);
 		strictEqual(getRightSizedModel("codex", "high"), "fixture-codex");
 		strictEqual(getInvocationDescriptor("codex", "high"), null);
+		strictEqual(
+			getConfiguredInvocationDescriptor("codex", "high")?.selector,
+			"fixture-codex",
+		);
 	});
 
 	it("authorizes only the exact descriptor identity", () => {

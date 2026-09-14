@@ -12,6 +12,7 @@
 // project.
 //
 // Usage:
+//   switchyard-dispatch simple <prompt-file> --project <path> [options] # small local path
 //   switchyard-dispatch run <tasks.md> --project <path> [options]      # legacy, same as positional
 //   switchyard-dispatch launch <tasks.md> --project <path> [options]   # detached
 //   switchyard-dispatch status <run-id> [--json]                       # read-only
@@ -127,6 +128,7 @@ import {
 	validateCallerInputs,
 	validateProjectFileEntries,
 } from "../runner/index.mjs";
+import { handleSimple, SIMPLE_USAGE } from "../simple/index.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
 import { run as runOrphanLockRemediation } from "./remediate-orphaned-locks.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
@@ -135,6 +137,7 @@ const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
        switchyard-dispatch --version
 
 Subcommands:
+  simple <prompt-file> --project <path> ...         Run one local bounded task
   run    <tasks.md> --project <path> [options]    Run queue synchronously
   launch <tasks.md> --project <path> [options]    Launch detached run
   validate-inputs <tasks.md> --project <path> [options]  Validate caller inputs
@@ -235,6 +238,7 @@ const USAGE_RECONCILE_COMPLETION = `Usage: switchyard-dispatch reconcile-complet
   --help                        Show this help`;
 
 const KNOWN_SUBCOMMANDS = new Set([
+	"simple",
 	"run",
 	"launch",
 	"validate-inputs",
@@ -3488,6 +3492,10 @@ async function main(argv) {
 
 	if (KNOWN_SUBCOMMANDS.has(subcommand)) {
 		switch (subcommand) {
+			case "simple": {
+				await handleSimple(subArgs);
+				break;
+			}
 			case "run": {
 				await handleRun(subArgs, {}, subcommand === "run" ? USAGE_RUN : USAGE);
 				break;
@@ -3589,6 +3597,7 @@ export {
 	probeProviderProcess,
 	resolveIsRunDead,
 	runDispatch,
+	SIMPLE_USAGE,
 	sweepManagedOrphans,
 	USAGE,
 	USAGE_LAUNCH,

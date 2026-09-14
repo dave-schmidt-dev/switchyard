@@ -645,7 +645,7 @@ export function captureTaskStartTree(
 		);
 	} catch (error) {
 		if (!isParallelsLostResult(error)) throw error;
-		let observed;
+		let observed = null;
 		try {
 			observed = taskBaseTree(
 				backendGit(
@@ -658,10 +658,40 @@ export function captureTaskStartTree(
 				).trim(),
 			);
 		} catch {
-			throw error;
+			// The lost result may mean update-ref never ran. An absent ref leaves
+			// the original compare-and-swap safe to replay once.
 		}
-		if (observed !== tree) throw error;
-		emitTaskBaseRecovery(options, "task_base_anchor", "reconcile");
+		if (observed === tree) {
+			emitTaskBaseRecovery(options, "task_base_anchor", "reconcile");
+			return { ref, tree };
+		}
+		if (observed !== null) throw error;
+		try {
+			backendGit(
+				executionBackend,
+				workspaceId,
+				["update-ref", ref, tree, ZERO_OBJECT_ID],
+				options,
+				"task_base_anchor_replay",
+			);
+		} catch {
+			try {
+				observed = taskBaseTree(
+					backendGit(
+						executionBackend,
+						workspaceId,
+						["rev-parse", "--verify", `${ref}^{tree}`],
+						options,
+						"task_base_anchor_replay_reconcile",
+						{ retryLostResult: true },
+					).trim(),
+				);
+			} catch {
+				throw error;
+			}
+			if (observed !== tree) throw error;
+		}
+		emitTaskBaseRecovery(options, "task_base_anchor", "replay");
 	}
 	return { ref, tree };
 }
@@ -708,7 +738,7 @@ export async function captureTaskStartTreeAsync(
 		);
 	} catch (error) {
 		if (!isParallelsLostResult(error)) throw error;
-		let observed;
+		let observed = null;
 		try {
 			observed = taskBaseTree(
 				(
@@ -723,10 +753,42 @@ export async function captureTaskStartTreeAsync(
 				).trim(),
 			);
 		} catch {
-			throw error;
+			// The lost result may mean update-ref never ran. An absent ref leaves
+			// the original compare-and-swap safe to replay once.
 		}
-		if (observed !== tree) throw error;
-		emitTaskBaseRecovery(options, "task_base_anchor", "reconcile");
+		if (observed === tree) {
+			emitTaskBaseRecovery(options, "task_base_anchor", "reconcile");
+			return { ref, tree };
+		}
+		if (observed !== null) throw error;
+		try {
+			await backendGitAsync(
+				executionBackend,
+				workspaceId,
+				["update-ref", ref, tree, ZERO_OBJECT_ID],
+				options,
+				"task_base_anchor_replay",
+			);
+		} catch {
+			try {
+				observed = taskBaseTree(
+					(
+						await backendGitAsync(
+							executionBackend,
+							workspaceId,
+							["rev-parse", "--verify", `${ref}^{tree}`],
+							options,
+							"task_base_anchor_replay_reconcile",
+							{ retryLostResult: true },
+						)
+					).trim(),
+				);
+			} catch {
+				throw error;
+			}
+			if (observed !== tree) throw error;
+		}
+		emitTaskBaseRecovery(options, "task_base_anchor", "replay");
 	}
 	return { ref, tree };
 }
@@ -792,6 +854,44 @@ export async function validateTaskStartTreeAsync(
 	return { ref, tree: expectedTree };
 }
 
+function observeTaskStartTreeRef(
+	executionBackend,
+	workspaceId,
+	ref,
+	options,
+	stage,
+) {
+	const observed = backendGit(
+		executionBackend,
+		workspaceId,
+		["for-each-ref", "--format=%(objectname)", ref],
+		options,
+		stage,
+		{ retryLostResult: true },
+	).trim();
+	return observed === "" ? null : taskBaseTree(observed);
+}
+
+async function observeTaskStartTreeRefAsync(
+	executionBackend,
+	workspaceId,
+	ref,
+	options,
+	stage,
+) {
+	const observed = (
+		await backendGitAsync(
+			executionBackend,
+			workspaceId,
+			["for-each-ref", "--format=%(objectname)", ref],
+			options,
+			stage,
+			{ retryLostResult: true },
+		)
+	).trim();
+	return observed === "" ? null : taskBaseTree(observed);
+}
+
 /** Remove a task-base anchor only after that task reaches final disposition. */
 export function releaseTaskStartTree(
 	executionBackend,
@@ -809,13 +909,49 @@ export function releaseTaskStartTree(
 		},
 		options,
 	);
-	backendGit(
-		executionBackend,
-		workspaceId,
-		["update-ref", "-d", base.ref, base.tree],
-		options,
-		"task_base_release",
-	);
+	try {
+		backendGit(
+			executionBackend,
+			workspaceId,
+			["update-ref", "-d", base.ref, base.tree],
+			options,
+			"task_base_release",
+		);
+	} catch (error) {
+		if (!isParallelsLostResult(error)) throw error;
+		const observed = observeTaskStartTreeRef(
+			executionBackend,
+			workspaceId,
+			base.ref,
+			options,
+			"task_base_release_reconcile",
+		);
+		if (observed === null) {
+			emitTaskBaseRecovery(options, "task_base_release", "reconcile");
+			return;
+		}
+		if (observed !== base.tree) throw error;
+		try {
+			backendGit(
+				executionBackend,
+				workspaceId,
+				["update-ref", "-d", base.ref, base.tree],
+				options,
+				"task_base_release_replay",
+			);
+		} catch (replayError) {
+			if (!isParallelsLostResult(replayError)) throw replayError;
+			const replayObserved = observeTaskStartTreeRef(
+				executionBackend,
+				workspaceId,
+				base.ref,
+				options,
+				"task_base_release_replay_reconcile",
+			);
+			if (replayObserved !== null) throw error;
+		}
+		emitTaskBaseRecovery(options, "task_base_release", "replay");
+	}
 }
 
 export async function releaseTaskStartTreeAsync(
@@ -831,13 +967,49 @@ export async function releaseTaskStartTreeAsync(
 		{ ref, tree },
 		options,
 	);
-	await backendGitAsync(
-		executionBackend,
-		workspaceId,
-		["update-ref", "-d", base.ref, base.tree],
-		options,
-		"task_base_release",
-	);
+	try {
+		await backendGitAsync(
+			executionBackend,
+			workspaceId,
+			["update-ref", "-d", base.ref, base.tree],
+			options,
+			"task_base_release",
+		);
+	} catch (error) {
+		if (!isParallelsLostResult(error)) throw error;
+		const observed = await observeTaskStartTreeRefAsync(
+			executionBackend,
+			workspaceId,
+			base.ref,
+			options,
+			"task_base_release_reconcile",
+		);
+		if (observed === null) {
+			emitTaskBaseRecovery(options, "task_base_release", "reconcile");
+			return;
+		}
+		if (observed !== base.tree) throw error;
+		try {
+			await backendGitAsync(
+				executionBackend,
+				workspaceId,
+				["update-ref", "-d", base.ref, base.tree],
+				options,
+				"task_base_release_replay",
+			);
+		} catch (replayError) {
+			if (!isParallelsLostResult(replayError)) throw replayError;
+			const replayObserved = await observeTaskStartTreeRefAsync(
+				executionBackend,
+				workspaceId,
+				base.ref,
+				options,
+				"task_base_release_replay_reconcile",
+			);
+			if (replayObserved !== null) throw error;
+		}
+		emitTaskBaseRecovery(options, "task_base_release", "replay");
+	}
 }
 
 /**

@@ -26,6 +26,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+	AGY_SILENCE_TIMEOUT_MS,
 	captureDiff as captureAgyDiff,
 	captureDiffAsync as captureAgyDiffAsync,
 	executeAgy,
@@ -5779,7 +5780,21 @@ async function prepareTaskBaseAsync(context, task, cleanupContext) {
 	}
 }
 
-function taskBaseReleaseHalt(taskId) {
+function taskBaseReleaseDiagnosticCode(error) {
+	const message = String(error?.message ?? "");
+	if (message.startsWith("persisted task base"))
+		return "task_base_release_ownership_invalid";
+	if (message.includes("process marker requires an exact attempt identity"))
+		return "task_base_release_marker_invalid";
+	if (message.includes("task base probe aborted"))
+		return "task_base_release_aborted";
+	if (error?.code === "ETIMEDOUT") return "task_base_release_timed_out";
+	if (/PrlJob_Get(?:RetCode|Result):\s*Invalid argument/iu.test(message))
+		return "task_base_release_transport_lost";
+	return "task_base_release_failed";
+}
+
+function taskBaseReleaseHalt(taskId, error) {
 	return {
 		taskId,
 		success: false,
@@ -5788,6 +5803,7 @@ function taskBaseReleaseHalt(taskId) {
 		result: "halted_after_task_base_release_failure",
 		errorKind: "diff_capture_failed",
 		reason: "immutable task base release is uncertain; recovery required",
+		diagnosticCode: taskBaseReleaseDiagnosticCode(error),
 	};
 }
 
@@ -5858,8 +5874,12 @@ function finalizeTaskBase(context, taskId, checkpoint, checkpointPath) {
 			taskId,
 		});
 		return null;
-	} catch {
-		checkpoint.taskBaseReleaseUncertain = { taskId, ...base };
+	} catch (error) {
+		checkpoint.taskBaseReleaseUncertain = {
+			taskId,
+			...base,
+			diagnosticCode: taskBaseReleaseDiagnosticCode(error),
+		};
 		checkpoint.lastUpdatedAt = new Date().toISOString();
 		saveCheckpoint(checkpointPath, checkpoint);
 		context.onStatus?.({
@@ -5868,7 +5888,7 @@ function finalizeTaskBase(context, taskId, checkpoint, checkpointPath) {
 			status: `Task ${taskId} immutable base release uncertain; recovery required`,
 			taskId,
 		});
-		return taskBaseReleaseHalt(taskId);
+		return taskBaseReleaseHalt(taskId, error);
 	}
 }
 
@@ -5904,8 +5924,12 @@ async function finalizeTaskBaseAsync(
 			taskId,
 		});
 		return null;
-	} catch {
-		checkpoint.taskBaseReleaseUncertain = { taskId, ...base };
+	} catch (error) {
+		checkpoint.taskBaseReleaseUncertain = {
+			taskId,
+			...base,
+			diagnosticCode: taskBaseReleaseDiagnosticCode(error),
+		};
 		checkpoint.lastUpdatedAt = new Date().toISOString();
 		saveCheckpoint(checkpointPath, checkpoint);
 		context.onStatus?.({
@@ -5914,7 +5938,7 @@ async function finalizeTaskBaseAsync(
 			status: `Task ${taskId} immutable base release uncertain; recovery required`,
 			taskId,
 		});
-		return taskBaseReleaseHalt(taskId);
+		return taskBaseReleaseHalt(taskId, error);
 	}
 }
 
@@ -10277,7 +10301,7 @@ export function createBrokerAdapterLauncher({
 	workingContainerName,
 	prompt,
 	timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS,
-	silenceTimeoutMs = DEFAULT_SILENCE_TIMEOUT_MS,
+	silenceTimeoutMs,
 	onTranscript = null,
 	cleanupContext = null,
 	deriveReviewResult = false,
@@ -10321,7 +10345,11 @@ export function createBrokerAdapterLauncher({
 			{
 				model: route.model,
 				timeoutMs,
-				silenceTimeoutMs,
+				silenceTimeoutMs:
+					silenceTimeoutMs ??
+					(route.harness === "agy"
+						? AGY_SILENCE_TIMEOUT_MS
+						: DEFAULT_SILENCE_TIMEOUT_MS),
 				executionBackend: bindAttemptExecutionBackend(
 					executionBackend,
 					requestCleanupContext,

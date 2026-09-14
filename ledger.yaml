@@ -75,4 +75,5 @@ contract_gates:
   mutation-protocol: {gate_test_status: not-run}
   reservation-ledger: {gate_test_status: not-run}
   route-selection: {gate_test_status: not-run}
+  simple-execution: {gate_test_status: not-run}
   provider-authentication: {gate_test_status: not-run}

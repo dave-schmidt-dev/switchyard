@@ -1,11 +1,13 @@
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
+	AGY_PRINT_TIMEOUT_MINUTES,
+	AGY_SILENCE_TIMEOUT_MS,
 	captureDiff,
 	executeAgy,
 	executeAgyAsync,
@@ -15,8 +17,6 @@ import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { dockerAvailable } from "./helpers/docker.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
-
-const PROJECT_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 const testRoot = tempDir("switchyard-agy-adapter-");
 const containerName = `switchyard-agy-adapter-${Date.now()}`;
@@ -193,33 +193,9 @@ describe("agy adapter host-side timeout", () => {
 		// itself. A valid run between 5 and 9 minutes was force-killed by the
 		// host before agy's own timeout could fire — the host timeout is
 		// meant as a backstop for a hung process, not the primary limit.
-		const adapterPath = join(PROJECT_ROOT, "src/switchyard/adapter/agy.mjs");
-		const source = readFileSync(adapterPath, "utf8");
-
-		const printTimeoutMatch = source.match(
-			/--print-timeout["'\s,]+["'](\d+)m["']/,
-		);
-		ok(
-			printTimeoutMatch,
-			"expected to find the --print-timeout CLI flag value",
-		);
-		const printTimeoutMs = Number(printTimeoutMatch[1]) * 60 * 1000;
-
-		// The host-side timeout defaults to the shared
-		// PROVIDER_EXECUTION_TIMEOUT_MS constant (see adapter/constants.mjs),
-		// but is overridable per task (options.timeoutMs, e.g. a task's
-		// `Timeout:` field) — so the literal passed to execFileSync is the
-		// `timeoutMs` local, not the constant directly. What must still hold
-		// is the DEFAULT: `timeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS` in the
-		// options destructuring, and `timeout: timeoutMs` at the call site.
-		ok(
-			/timeoutMs\s*=\s*PROVIDER_EXECUTION_TIMEOUT_MS/.test(source),
-			"expected agy.mjs to default options.timeoutMs to PROVIDER_EXECUTION_TIMEOUT_MS",
-		);
-		ok(
-			/timeout:\s*timeoutMs/.test(source),
-			"expected agy.mjs to pass timeoutMs as the host-side execFileSync timeout",
-		);
+		strictEqual(AGY_PRINT_TIMEOUT_MINUTES, 9);
+		strictEqual(AGY_SILENCE_TIMEOUT_MS, 10 * 60 * 1000);
+		const printTimeoutMs = AGY_PRINT_TIMEOUT_MINUTES * 60 * 1000;
 		const hostTimeoutMs = PROVIDER_EXECUTION_TIMEOUT_MS;
 
 		ok(
