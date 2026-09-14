@@ -290,7 +290,7 @@ function safeTimer(fn, delay, setTimeoutFn) {
  * @param {string} command
  * @param {string[]} args
  * @param {object} [options]
- * @returns {Promise<{success:boolean,output:string,stderr:string,code:number|null,signal:string|null,timedOut:boolean,silenceTimedOut:boolean,cancelled:boolean,elapsedMs:number,progress:object}>}
+ * @returns {Promise<{success:boolean,output:string,stderr:string,code:number|null,signal:string|null,timedOut:boolean,silenceTimedOut:boolean,cancelled:boolean,elapsedMs:number,progress:object,writerLifecycle:"stopped"|"never_started"|"unavailable"}>}
  */
 export function runProviderProcess(command, args, options = {}) {
 	const {
@@ -327,6 +327,10 @@ export function runProviderProcess(command, args, options = {}) {
 		let cancelled = false;
 		let pollCount = 0;
 		let progressCount = 0;
+		// This is intentionally tri-state. A normal close proves that the child
+		// stopped; a spawn throw proves that it never started. Timeout/cancel
+		// escalation is not proof when the child never emits close.
+		let writerLifecycle = "unavailable";
 		let lastSubstantiveProgressAt = null;
 		let timeoutTimer = null;
 		let silenceTimer = null;
@@ -402,6 +406,7 @@ export function runProviderProcess(command, args, options = {}) {
 				cleanupFailed: Boolean(cleanupError),
 				cleanupStage:
 					cleanupError?.cleanupStage ?? cleanupResult?.cleanupStage ?? null,
+				writerLifecycle,
 			});
 		};
 
@@ -505,6 +510,7 @@ export function runProviderProcess(command, args, options = {}) {
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 		} catch (error) {
+			writerLifecycle = "never_started";
 			void terminal({ error });
 			return;
 		}
@@ -523,6 +529,7 @@ export function runProviderProcess(command, args, options = {}) {
 		});
 		child.once?.("close", (code, exitSignal) => {
 			if (settled) return;
+			writerLifecycle = "stopped";
 			if (terminationRequested) {
 				void finishAfterCleanup({ code, signal: exitSignal });
 				return;
@@ -731,7 +738,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				signal: typeof value.signal === "string" ? value.signal : null,
 			});
 		}
-		return value;
+		return { ...value, writerLifecycle: result.writerLifecycle };
 	};
 	if (result.success) return complete({ output: result.output, success: true });
 	// A provider whose container-side supervisor reports this reserved exit code

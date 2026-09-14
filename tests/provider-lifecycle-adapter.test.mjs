@@ -318,6 +318,26 @@ describe("provider process lifecycle", () => {
 		deepStrictEqual(result.success, true);
 		strictEqual(result.output, "ok\n");
 		strictEqual(terminalEvents, 1);
+		strictEqual(result.writerLifecycle, "stopped");
+	});
+
+	it("distinguishes never-started spawn failures from an unobserved timeout", async () => {
+		const neverStarted = await runProviderProcess("fake", [], {
+			spawnFn: () => {
+				throw new Error("spawn failed");
+			},
+		});
+		strictEqual(neverStarted.writerLifecycle, "never_started");
+
+		const child = fakeChild();
+		child.kill = () => true;
+		const unresolvedStop = await runProviderProcess("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 1,
+			termGraceMs: 1,
+		});
+		strictEqual(unresolvedStop.timedOut, true);
+		strictEqual(unresolvedStop.writerLifecycle, "unavailable");
 	});
 
 	it("escalates timeout TERM then KILL and cleans once", async () => {

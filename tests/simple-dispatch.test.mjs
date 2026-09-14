@@ -14,6 +14,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	assessSimpleRecoveryEvidence,
 	buildSimpleProviderInvocation,
 	parseSimpleArgs,
 	runSimpleTask,
@@ -72,6 +73,7 @@ function dependencies(overrides = {}) {
 	return {
 		now: () => 1_000,
 		taskId: "simple-test",
+		attemptId: "attempt-1",
 		acquireProjectLock: async () => {},
 		releaseProjectLock: async () => true,
 		route: () => ({ provider: "Codex (Spark)", reason: "priority_fill" }),
@@ -88,7 +90,7 @@ function dependencies(overrides = {}) {
 		assertFundedRoute: () => {},
 		executeProvider: async ({ worktreePath }) => {
 			writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n", "utf8");
-			return { success: true, code: 0 };
+			return { success: true, code: 0, writerLifecycle: "stopped" };
 		},
 		...overrides,
 	};
@@ -516,7 +518,13 @@ describe("simple local execution path", () => {
 						`${secret}\n`,
 						"utf8",
 					);
-					return { success: false, code: 1, output: secret, stderr: secret };
+					return {
+						success: false,
+						code: 1,
+						output: secret,
+						stderr: secret,
+						writerLifecycle: "stopped",
+					};
 				},
 			}),
 		);
@@ -524,6 +532,194 @@ describe("simple local execution path", () => {
 		strictEqual(result.failureReason, "provider_exit_nonzero");
 		ok(result.partialWorktree);
 		ok(!JSON.stringify(result).includes(secret));
+	});
+
+	it("returns bound recovery evidence for safe attended continuation", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"partial\n",
+						"utf8",
+					);
+					return { success: false, code: 1, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		retain(result, repo.projectPath);
+		const baseRevision = execFileSync("git", ["rev-parse", "HEAD"], {
+			cwd: repo.projectPath,
+			encoding: "utf8",
+		}).trim();
+		strictEqual(result.attemptId, "attempt-1");
+		strictEqual(result.recovery.identity.taskId, "simple-test");
+		strictEqual(result.recovery.identity.attemptId, "attempt-1");
+		strictEqual(result.recovery.identity.baseRevision, baseRevision);
+		deepStrictEqual(result.recovery.identity.scope.files, ["src/a.txt"]);
+		strictEqual(result.recovery.identity.scope.checks[0].index, 1);
+		ok(
+			/^sha256:[0-9a-f]{64}$/u.test(
+				result.recovery.identity.scope.checks[0].digest,
+			),
+		);
+		strictEqual(result.recovery.result.status, "failed");
+		strictEqual(result.recovery.cleanup.writer.state, "stopped");
+		strictEqual(result.recovery.cleanup.projectLock.state, "released");
+		strictEqual(result.recovery.cleanup.worktree.state, "retained");
+		strictEqual(result.recovery.continuation.available, true);
+	});
+
+	it("refuses drift, missing evidence, a possibly running writer, and an unconfirmed lock", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"partial\n",
+						"utf8",
+					);
+					return { success: false, code: 1, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		retain(result, repo.projectPath);
+		const expected = {
+			taskId: "simple-test",
+			attemptId: "attempt-1",
+			baseRevision: result.recovery.identity.baseRevision,
+			files: ["src/a.txt"],
+			checks: ["test -f src/a.txt"],
+		};
+		strictEqual(assessSimpleRecoveryEvidence(null, expected).available, false);
+		strictEqual(
+			assessSimpleRecoveryEvidence(
+				{
+					...result.recovery,
+					identity: {
+						...result.recovery.identity,
+						baseRevision: "0".repeat(40),
+					},
+				},
+				expected,
+			).reason,
+			"recovery_identity_mismatch",
+		);
+		strictEqual(
+			assessSimpleRecoveryEvidence(
+				{
+					...result.recovery,
+					cleanup: {
+						...result.recovery.cleanup,
+						writer: { state: "unavailable" },
+					},
+				},
+				expected,
+			).available,
+			false,
+		);
+		strictEqual(
+			assessSimpleRecoveryEvidence(
+				{
+					...result.recovery,
+					cleanup: {
+						...result.recovery.cleanup,
+						projectLock: { state: "unavailable" },
+					},
+				},
+				expected,
+			).available,
+			false,
+		);
+		const sha256Expected = { ...expected, baseRevision: "a".repeat(64) };
+		const sha256Recovery = {
+			...result.recovery,
+			identity: {
+				...result.recovery.identity,
+				baseRevision: sha256Expected.baseRevision,
+			},
+		};
+		strictEqual(
+			assessSimpleRecoveryEvidence(sha256Recovery, sha256Expected).available,
+			true,
+		);
+	});
+
+	it("preserves partial work but refuses continuation when lock release is unconfirmed", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({
+				releaseProjectLock: async () => false,
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"partial\n",
+						"utf8",
+					);
+					return { success: false, code: 1, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		retain(result, repo.projectPath);
+		strictEqual(result.recovery.cleanup.projectLock.state, "unavailable");
+		strictEqual(result.recovery.continuation.available, false);
+		strictEqual(
+			result.recovery.continuation.reason,
+			"project_lock_release_unconfirmed",
+		);
+		ok(result.partialWorktree);
+	});
+
+	it("cleans a completed empty provider capture instead of inventing partial work", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({
+				executeProvider: async () => ({
+					success: false,
+					code: 1,
+					writerLifecycle: "stopped",
+				}),
+			}),
+		);
+		strictEqual(result.failureReason, "provider_exit_nonzero");
+		strictEqual(result.changedFiles.length, 0);
+		strictEqual(result.partialWorktree, null);
+		strictEqual(result.recovery.continuation.reason, "no_partial_work");
+	});
+
+	it("refuses continuation when a failing check leaves its writer lifecycle unavailable", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"partial\n",
+						"utf8",
+					);
+					return { success: true, writerLifecycle: "stopped" };
+				},
+				runCheck: async () => ({
+					success: false,
+					timedOut: true,
+					writerLifecycle: "unavailable",
+				}),
+			}),
+		);
+		retain(result, repo.projectPath);
+		strictEqual(result.failureReason, "check_deadline_exceeded");
+		ok(result.partialWorktree);
+		strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+		strictEqual(result.recovery.cleanup.projectLock.state, "released");
+		strictEqual(result.recovery.continuation.available, false);
+		strictEqual(result.recovery.continuation.reason, "writer_stop_unconfirmed");
 	});
 
 	it("maps silence to a specific terminal diagnosis without retries", async () => {
