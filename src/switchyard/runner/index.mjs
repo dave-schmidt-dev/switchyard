@@ -17,6 +17,7 @@ import {
 	openSync,
 	readFileSync,
 	readSync,
+	realpathSync,
 	renameSync,
 	unlinkSync,
 	writeFileSync,
@@ -119,6 +120,7 @@ import {
 	captureDirtyOverlay,
 	captureTaskStartTree,
 	captureTaskStartTreeAsync,
+	ignoredPath,
 	readDirtyOverlayReceipt,
 	releaseTaskStartTree,
 	releaseTaskStartTreeAsync,
@@ -1724,6 +1726,304 @@ export class TaskSelectionError extends Error {
 		this.taskId = taskId;
 		this.reason = reason;
 		this.code = reason;
+	}
+}
+
+/** A bounded caller-owned rejection which is safe to expose from the CLI. */
+export class CallerInputValidationError extends Error {
+	constructor(code, remedy, details = {}) {
+		super(remedy);
+		this.name = "CallerInputValidationError";
+		this.code = code;
+		this.remedy = remedy;
+		this.taskId = details.taskId ?? null;
+		this.path = details.path ?? null;
+	}
+}
+
+class CallerInputValidationUnavailableError extends Error {
+	constructor() {
+		super("caller-input validation is unavailable");
+		this.name = "CallerInputValidationUnavailableError";
+		this.code = "validation_unavailable";
+		this.remedy = "restore the local git validation runtime and retry";
+	}
+}
+
+function relativeProjectPath(projectPath, candidatePath) {
+	const root = realpathPathOrSelf(resolve(projectPath));
+	const candidate = resolve(candidatePath);
+	const parent = realpathPathOrSelf(dirname(candidate));
+	const relativePath = relative(
+		root,
+		join(parent, candidate.split(sep).at(-1)),
+	);
+	if (
+		relativePath === ".." ||
+		relativePath.startsWith(`..${sep}`) ||
+		isAbsolute(relativePath)
+	) {
+		return null;
+	}
+	return relativePath || ".";
+}
+
+function realpathPathOrSelf(path) {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+}
+
+function assertCommittedDeclaredFiles(tasks, projectPath) {
+	for (const task of tasks) {
+		for (const path of task.requiredPaths ?? []) {
+			const candidate = resolve(projectPath, path);
+			if (!existsSync(candidate)) continue;
+			let stats;
+			try {
+				stats = lstatSync(candidate);
+				if (!stats.isFile() || stats.isSymbolicLink()) {
+					throw new CallerInputValidationError(
+						"declared_path_unreadable",
+						"declared Files entries must be readable regular files",
+						{ taskId: task.id, path },
+					);
+				}
+				const descriptor = openSync(
+					candidate,
+					fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+				);
+				closeSync(descriptor);
+			} catch (error) {
+				if (error instanceof CallerInputValidationError) throw error;
+				throw new CallerInputValidationError(
+					"declared_path_unreadable",
+					"declared Files entries must be readable regular files",
+					{ taskId: task.id, path },
+				);
+			}
+			// A host-only file cannot be seeded by `git archive HEAD`; reject it
+			// before a VM/provider boundary. A launcher failure is host/runtime
+			// unavailability, not evidence that the path is absent from HEAD.
+			const committed = spawnSync("git", ["cat-file", "-e", `HEAD:${path}`], {
+				cwd: projectPath,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			if (committed.error || committed.status === null) {
+				throw new CallerInputValidationUnavailableError();
+			}
+			if (committed.status !== 0) {
+				throw new CallerInputValidationError(
+					"declared_path_not_committed",
+					"existing declared Files entries must be visible from committed HEAD",
+					{ taskId: task.id, path },
+				);
+			}
+		}
+	}
+}
+
+/**
+ * Validate caller-owned queue inputs without writing state, locks, receipts,
+ * workspaces, or provider work. A returned overlay receipt stays in memory.
+ */
+export function validateCallerInputs(options = {}) {
+	const tasksFilePath = resolve(options.tasksFilePath);
+	const projectPath = resolve(options.projectPath);
+	const checkpointPath = resolve(
+		options.checkpointPath ?? getCheckpointPath(tasksFilePath),
+	);
+	let tasks;
+	try {
+		tasks = loadTaskQueue(tasksFilePath);
+		validateProjectFileEntries(tasks, projectPath);
+		if (tasks.length === 0) {
+			throw new CallerInputValidationError(
+				"queue_empty",
+				"no tasks parsed from task file — 0 headings matching the required task format",
+			);
+		}
+		assertCommittedDeclaredFiles(tasks, projectPath);
+	} catch (error) {
+		if (
+			error instanceof CallerInputValidationError ||
+			error instanceof CallerInputValidationUnavailableError
+		)
+			throw error;
+		const rejection = new CallerInputValidationError(
+			"queue_contract_invalid",
+			"task queue, graph, and declared Files entries must be valid",
+		);
+		// The CLI's legacy text surface may retain the parser's caller-owned
+		// diagnostic; JSON validation output deliberately uses `remedy` instead.
+		rejection.message = error?.message ?? rejection.message;
+		throw rejection;
+	}
+
+	const dirtyOverlay =
+		options.dirtyOverlay === true || options.runOptions?.dirtyOverlay === true;
+	const receiptPath = dirtyOverlay
+		? resolve(
+				options.dirtyOverlayReceiptPath ??
+					options.runOptions?.dirtyOverlayReceiptPath ??
+					`${checkpointPath}.dirty-overlay.json`,
+			)
+		: null;
+	const selection = options.runOptions?.taskIds ?? options.taskIds ?? [];
+	let dirtyOverlayReceipt = null;
+	if (dirtyOverlay) {
+		const undeclared = tasks.find(
+			(task) => (task.requiredPaths ?? []).length === 0,
+		);
+		const paths = [
+			...new Set(tasks.flatMap((task) => task.requiredPaths ?? [])),
+		];
+		if (undeclared || paths.length === 0) {
+			throw new CallerInputValidationError(
+				"dirty_overlay_invalid",
+				undeclared
+					? `dirty overlay requires exact declared task paths: task ${undeclared.id} declares none`
+					: "dirty overlay requires exact declared task paths",
+				undeclared ? { taskId: undeclared.id } : {},
+			);
+		}
+		for (const path of [checkpointPath, receiptPath]) {
+			const relativePath = relativeProjectPath(projectPath, path);
+			if (relativePath !== null && !ignoredPath(projectPath, relativePath)) {
+				throw new CallerInputValidationError(
+					"dirty_overlay_invalid",
+					"dirty overlay state must live outside the project or be ignored",
+					{ path: relativePath },
+				);
+			}
+		}
+		try {
+			if (existsSync(receiptPath)) {
+				dirtyOverlayReceipt = readDirtyOverlayReceipt(receiptPath);
+				const result = validateDirtyOverlayReceipt(
+					projectPath,
+					dirtyOverlayReceipt,
+					paths,
+				);
+				if (!result.ok) {
+					throw new CallerInputValidationError(
+						"dirty_overlay_invalid",
+						`${result.reason}; remove the existing receipt to recapture`,
+					);
+				}
+			} else {
+				dirtyOverlayReceipt = captureDirtyOverlay(projectPath, paths);
+			}
+		} catch (error) {
+			if (error instanceof CallerInputValidationError) throw error;
+			throw new CallerInputValidationError(
+				"dirty_overlay_invalid",
+				String(error?.message ?? "dirty overlay input is not eligible").slice(
+					0,
+					512,
+				),
+			);
+		}
+	}
+
+	const runOptions = normalizeRunOptions({
+		maxTasks: options.runOptions?.maxTasks ?? options.maxTasks,
+		checkpointPath,
+		stopOnFailure: options.runOptions?.stopOnFailure ?? options.stopOnFailure,
+		onlyProviders:
+			options.runOptions?.onlyProviders ??
+			options.only ??
+			options.onlyProviders,
+		excludeProviders:
+			options.runOptions?.excludeProviders ??
+			options.exclude ??
+			options.excludeProviders,
+		taskIds: selection,
+		platform: options.runOptions?.platform ?? options.platform,
+		...(dirtyOverlay
+			? {
+					dirtyOverlay: true,
+					dirtyOverlayReceiptPath: receiptPath,
+					dirtyOverlayReceiptHash: dirtyOverlayReceipt.receiptHash,
+				}
+			: {}),
+	});
+	const projectRevision =
+		options.projectRevision ?? getProjectRevision(projectPath);
+	let queueIdentity;
+	try {
+		queueIdentity = computeQueueIdentityFromFile(
+			tasksFilePath,
+			projectRevision,
+			runOptions,
+		).queueIdentity;
+	} catch {
+		throw new CallerInputValidationError(
+			"queue_contract_invalid",
+			"task queue changed or became unreadable during validation",
+		);
+	}
+	if (
+		options.queueIdentity !== null &&
+		options.queueIdentity !== undefined &&
+		options.queueIdentity !== queueIdentity
+	) {
+		throw new CheckpointIdentityError(
+			CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH,
+			CHECKPOINT_IDENTITY_REMEDIES[
+				CHECKPOINT_IDENTITY_CODES.QUEUE_IDENTITY_MISMATCH
+			],
+		);
+	}
+	let checkpoint;
+	try {
+		checkpoint = loadCheckpoint(checkpointPath, tasksFilePath, {
+			queueIdentity,
+			runOptions,
+			...(options.checkpointOwner
+				? { checkpointOwner: options.checkpointOwner }
+				: {}),
+		});
+	} catch (error) {
+		if (error instanceof CheckpointIdentityError) throw error;
+		throw new CallerInputValidationError(
+			"checkpoint_invalid",
+			"checkpoint must be absent or readable, valid, and safe to resume",
+		);
+	}
+	let potentialAttemptTasks;
+	try {
+		potentialAttemptTasks = planPotentialAttemptTasks(tasks, checkpoint, {
+			selectedTaskIds: runOptions.taskIds,
+			maxTasks: runOptions.maxTasks ?? Number.POSITIVE_INFINITY,
+			resolvedExternalBlockers: checkpoint.resolvedExternalBlockers,
+		});
+		return {
+			tasks,
+			checkpoint,
+			checkpointPath,
+			projectRevision,
+			runOptions,
+			queueIdentity,
+			potentialAttemptTasks,
+			dirtyOverlayReceipt,
+			dirtyOverlayReceiptPath: receiptPath,
+		};
+	} catch (error) {
+		if (error instanceof TaskSelectionError) {
+			throw new CallerInputValidationError(
+				"task_selection_failed",
+				"selected task is not runnable with the current checkpoint",
+				{ taskId: error.taskId },
+			);
+		}
+		throw new CallerInputValidationError(
+			"queue_contract_invalid",
+			"task queue, graph, and declared Files entries must remain valid",
+		);
 	}
 }
 
@@ -3682,8 +3982,14 @@ export function loadCheckpoint(checkpointPath, tasksFilePath, expected = null) {
 	let raw;
 	try {
 		raw = readFileSync(checkpointPath, "utf8");
-	} catch {
-		return createEmptyCheckpoint(tasksFilePath, expected ?? {}); // no checkpoint yet
+	} catch (error) {
+		if (error?.code === "ENOENT") {
+			return createEmptyCheckpoint(tasksFilePath, expected ?? {}); // no checkpoint yet
+		}
+		throw new Error(
+			`checkpoint file exists but is unreadable, refusing to silently discard ` +
+				`completed-task history: ${checkpointPath}`,
+		);
 	}
 
 	let parsed;

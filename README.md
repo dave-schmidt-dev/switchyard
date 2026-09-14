@@ -631,7 +631,18 @@ Working VMs inherit the golden image's provider binaries and baked-in credential
 
 The host-side runner parses markdown task queues and dispatches tasks serially through the router, adapters, and integration gate. It seeds a working VM from the project's committed tree, routes each task by usage headroom, runs the provider CLI headless inside the VM, returns the diff to the host only through the reviewed integration gate (INV-2), commits/resets the VM's baseline between tasks, and wipes the VM at the end (INV-3). All seven adapters execute commands with a 30-minute default execution timeout (`PROVIDER_EXECUTION_TIMEOUT_MS`, `1,800,000` ms) and 128 MB `maxBuffer` to prevent ENOBUFS errors and premature process termination on complex tasks — overridable per task via `- **Timeout:**` (see below). On a timeout, the adapter kills the orphaned in-VM process (the host-side kill alone doesn't forward the signal into it — see `adapter/orphan-kill.mjs` above) and the runner still captures whatever diff exists at that point as a review artifact — see "Timeout handling" below.
 
-The current package release is `0.2.1`. Check the installed dispatcher version with `switchyard-dispatch --version` (or `node src/switchyard/dispatch/index.mjs --version`); it prints the semantic version and exits successfully without requiring a project or provider configuration.
+The current package release is `0.2.1`. Check the installed dispatcher version with `/Users/dave/.agent/bin/switchyard-dispatch --version` (or `node src/switchyard/dispatch/index.mjs --version`); it prints the semantic version and exits successfully without requiring a project or provider configuration. Automation uses the absolute installed launcher path so shell `PATH` configuration cannot turn a valid invocation into `command not found`; this path alone does not establish installed/source byte parity.
+
+Validate caller-owned inputs before every synchronous or detached dispatch:
+
+```bash
+/Users/dave/.agent/bin/switchyard-dispatch validate-inputs tasks.md --project /path/to/repo
+/Users/dave/.agent/bin/switchyard-dispatch run tasks.md --project /path/to/repo
+```
+
+`validate-inputs` always emits exactly one bounded JSON object; adding `--json` is accepted and produces the same result. Exit `0` means the current task file, graph, declared paths, selection, checkpoint, committed seed visibility, and optional dirty overlay pass caller-input validation. Exit `2` is a caller/input rejection with a bounded code and remedy. Exit `1` is an unexpected internal validation-command failure. Execution re-reads and revalidates current inputs, so validation success is advisory and does not prove later input stability, checkpoint ownership, installed/source parity, provider readiness, VM readiness, integration success, or terminal success.
+
+An identity-mismatched or otherwise stale checkpoint is never overwritten. Preserve it for diagnosis and retry with an explicit checkpoint path that does not exist yet, for example `--checkpoint /absolute/path/to/fresh.checkpoint.json`; Switchyard creates that new checkpoint only when execution begins. A policy-only deferral remains exit `6`, while execution or integration failure remains exit `1`. Do not pipe `validate-inputs`, `run`, `launch`, or `result` through `head` or `tail`: the pipeline can mask the dispatcher's real exit status.
 
 The thin CLI wraps `runQueue` for standalone use (the `--project` must be a git repo — its committed HEAD seeds each working VM):
 

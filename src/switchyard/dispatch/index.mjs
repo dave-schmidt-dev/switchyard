@@ -113,6 +113,7 @@ import {
 } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 import {
+	CallerInputValidationError,
 	computeQueueIdentityFromFile,
 	deriveQueueDiagnostics,
 	getCheckpointPath,
@@ -123,6 +124,7 @@ import {
 	reconcileExternalCompletion,
 	runQueueAsync,
 	sanitizeQueuePreflightDetail,
+	validateCallerInputs,
 	validateProjectFileEntries,
 } from "../runner/index.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
@@ -135,6 +137,7 @@ const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
 Subcommands:
   run    <tasks.md> --project <path> [options]    Run queue synchronously
   launch <tasks.md> --project <path> [options]    Launch detached run
+  validate-inputs <tasks.md> --project <path> [options]  Validate caller inputs
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
@@ -167,6 +170,20 @@ const USAGE_RUN = `Usage: switchyard-dispatch run <tasks.md> --project <path> [o
   --platform <macos>     Queue workspace platform (default: macos)
   --task-id <id>          Select an exact task (repeatable; identity-bound)
   --json                  Emit one terminal JSON object
+  --help                 Show this help`;
+
+const USAGE_VALIDATE_INPUTS = `Usage: switchyard-dispatch validate-inputs <tasks.md> --project <path> [options]
+
+  --project <path>       Host git repo to validate against (required)
+  --max-tasks <n>        Validate the same bounded execution selection
+  --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
+  --no-stop-on-failure   Include the execution option in queue identity
+  --exclude-provider <name>  Include this provider filter in queue identity (repeatable)
+  --only-provider <name>  Include this provider filter in queue identity (repeatable, mutually exclusive with --exclude-provider)
+  --platform <macos>     Queue workspace platform (default: macos)
+  --task-id <id>         Select an exact task (repeatable; identity-bound)
+  --dirty-overlay        Validate declared tracked dirty bytes without publishing a receipt
+  --json                 Idempotent; output is always one JSON object
   --help                 Show this help`;
 
 const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <path> [options]
@@ -220,6 +237,7 @@ const USAGE_RECONCILE_COMPLETION = `Usage: switchyard-dispatch reconcile-complet
 const KNOWN_SUBCOMMANDS = new Set([
 	"run",
 	"launch",
+	"validate-inputs",
 	"status",
 	"result",
 	"recover",
@@ -435,6 +453,109 @@ function parseDispatchArgs(argv) {
  */
 function parseLaunchArgs(argv) {
 	return parseDispatchArgs(argv);
+}
+
+function validationEnvelope(result) {
+	return {
+		valid: true,
+		checkpointPath: result.checkpointPath,
+		queueIdentity: result.queueIdentity,
+		runnableTaskIds: result.potentialAttemptTasks.map((task) => task.id),
+		...(result.dirtyOverlayReceipt ? { dirtyOverlay: true } : {}),
+	};
+}
+
+function validationFailureEnvelope(error, { standalone = false } = {}) {
+	if (error?.name === "CallerInputValidationUnavailableError") {
+		return {
+			valid: false,
+			code: error.code,
+			remedy: error.remedy,
+		};
+	}
+	if (error instanceof UsageError) {
+		return {
+			valid: false,
+			code: standalone ? "invalid_invocation" : "queue_contract_invalid",
+			remedy: standalone
+				? "invocation options must follow validate-inputs usage"
+				: "caller invocation or queue inputs must be corrected",
+		};
+	}
+	if (error instanceof CallerInputValidationError) {
+		return {
+			valid: false,
+			code: error.code,
+			...(error.taskId ? { taskId: error.taskId } : {}),
+			...(error.path ? { path: error.path } : {}),
+			remedy: error.remedy,
+		};
+	}
+	if (error?.name === "CheckpointIdentityError") {
+		return {
+			valid: false,
+			code: standalone ? error.code : "queue_identity_invalid",
+			remedy: standalone
+				? error.remedy
+				: "checkpoint identity or run options do not match this queue",
+		};
+	}
+	return {
+		valid: false,
+		code: "queue_contract_invalid",
+		remedy: "caller inputs could not be read and validated",
+	};
+}
+
+function validationContractCode(error, validation) {
+	if (error?.name === "CallerInputValidationUnavailableError")
+		return "environment_incomplete";
+	if (error?.name === "CheckpointIdentityError")
+		return "queue_identity_invalid";
+	if (validation.code === "queue_empty") return "queue_empty";
+	if (validation.code === "task_selection_failed")
+		return "task_selection_failed";
+	return "queue_contract_invalid";
+}
+
+function materializeValidatedDirtyOverlay(opts, validation) {
+	if (!validation.dirtyOverlayReceipt) return;
+	const receiptPath = validation.dirtyOverlayReceiptPath;
+	const checkpointPath = validation.checkpointPath;
+	for (const path of [checkpointPath, receiptPath]) {
+		const relativePath = relativeWithin(opts.projectPath, path);
+		if (relativePath !== null && !ignoredPath(opts.projectPath, relativePath)) {
+			throw new UsageError(
+				`dirty overlay checkpoint and receipt must live outside the project or be ignored by it: ${relativePath}`,
+			);
+		}
+	}
+	if (!existsSync(receiptPath)) {
+		writeDirtyOverlayReceipt(receiptPath, validation.dirtyOverlayReceipt);
+	}
+	opts.dirtyOverlayReceiptPath = receiptPath;
+}
+
+async function handleValidateInputs(argv) {
+	try {
+		const opts = parseDispatchArgs(argv);
+		if (opts.help) {
+			console.log(USAGE_VALIDATE_INPUTS);
+			return;
+		}
+		const result = validateCallerInputs(opts);
+		console.log(JSON.stringify(validationEnvelope(result)));
+	} catch (error) {
+		console.log(
+			JSON.stringify(validationFailureEnvelope(error, { standalone: true })),
+		);
+		process.exitCode =
+			error instanceof CallerInputValidationError ||
+			error instanceof UsageError ||
+			error?.name === "CheckpointIdentityError"
+				? 2
+				: 1;
+	}
 }
 
 /**
@@ -697,6 +818,12 @@ async function handleHealth(argv) {
 async function runDispatch(opts, dependencies = {}) {
 	const jsonRequested = opts.json === true;
 	const report = jsonRequested ? () => {} : (...args) => console.error(...args);
+	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
+	// This must precede every sweep, run-store write, lock, receipt publication,
+	// or backend/provider operation. It is the single caller-input boundary used
+	// again by the detached runner with persisted options.
+	const callerInputs = validateCallerInputs(opts);
+	materializeValidatedDirtyOverlay(opts, callerInputs);
 	// A dispatch belongs to its target project, not to this checkout. Keeping
 	// durable state beside that project avoids File Provider permissions on a
 	// separately checked-out Switchyard source tree. Explicit overrides remain
@@ -708,7 +835,6 @@ async function runDispatch(opts, dependencies = {}) {
 			"switchyard",
 		);
 	}
-	(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
 	report(`dispatch: queue    ${opts.tasksFilePath}`);
 	report(`dispatch: project  ${opts.projectPath}`);
 	report(
@@ -1520,7 +1646,12 @@ async function handleRun(argv, dependencies = {}, usage = USAGE_RUN) {
 				}),
 			),
 		);
-		process.exitCode = error instanceof UsageError ? 2 : 1;
+		process.exitCode =
+			error instanceof UsageError ||
+			error instanceof CallerInputValidationError ||
+			error?.name === "CheckpointIdentityError"
+				? 2
+				: 1;
 		return;
 	}
 	if (opts.help) {
@@ -1531,20 +1662,34 @@ async function handleRun(argv, dependencies = {}, usage = USAGE_RUN) {
 		await runDispatch(opts, dependencies);
 	} catch (error) {
 		if (!jsonRequested) throw error;
+		const validation = validationFailureEnvelope(error);
+		const callerInputFailure =
+			error instanceof CallerInputValidationError ||
+			error instanceof UsageError ||
+			error?.name === "CallerInputValidationUnavailableError" ||
+			error?.name === "CheckpointIdentityError";
 		console.log(
 			JSON.stringify(
 				await buildLaunchFailureEnvelope({
 					preInitialization: {
 						type: "contract_failure",
-						code:
-							classifyPreProviderFailure(error)?.diagnosticCode ??
-							"environment_incomplete",
+						code: callerInputFailure
+							? validationContractCode(error, validation)
+							: (classifyPreProviderFailure(error)?.diagnosticCode ??
+								"environment_incomplete"),
 					},
-					preflightDetail: error.preflightDetail ?? null,
+					preflightDetail: callerInputFailure
+						? validation
+						: (error.preflightDetail ?? null),
 				}),
 			),
 		);
-		process.exitCode = error instanceof UsageError ? 2 : 1;
+		process.exitCode =
+			error instanceof UsageError ||
+			error instanceof CallerInputValidationError ||
+			error?.name === "CheckpointIdentityError"
+				? 2
+				: 1;
 	}
 }
 
@@ -1561,6 +1706,8 @@ async function handleLaunch(argv, dependencies = {}) {
 	} catch (error) {
 		if (!jsonRequested) throw error;
 		console.log(
+			// Detailed caller-validation codes remain in preflightDetail. The
+			// top-level disposition uses its existing closed contract vocabulary.
 			JSON.stringify(
 				await buildLaunchFailureEnvelope({
 					preInitialization: {
@@ -1570,7 +1717,12 @@ async function handleLaunch(argv, dependencies = {}) {
 				}),
 			),
 		);
-		process.exitCode = error instanceof UsageError ? 2 : 1;
+		process.exitCode =
+			error instanceof UsageError ||
+			error instanceof CallerInputValidationError ||
+			error?.name === "CheckpointIdentityError"
+				? 2
+				: 1;
 		return;
 	}
 	if (opts.help) {
@@ -1586,6 +1738,10 @@ async function handleLaunch(argv, dependencies = {}) {
 	let projectLockOwned = false;
 	try {
 		(dependencies.assertGenerationAllowed ?? assertGenerationAllowed)();
+		// Parent launch has no durable run state until this read-only validation
+		// succeeds. Later host changes are intentionally rechecked by the child.
+		const callerInputs = validateCallerInputs(opts);
+		materializeValidatedDirtyOverlay(opts, callerInputs);
 		if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
 			process.env.SWITCHYARD_RUN_STORE_ROOT = resolve(
 				opts.projectPath,
@@ -1800,12 +1956,36 @@ async function handleLaunch(argv, dependencies = {}) {
 				await buildLaunchFailureEnvelope({
 					runId,
 					stateRoot,
-					preInitialization,
-					preflightDetail: error.preflightDetail ?? null,
+					preInitialization:
+						preInitialization ??
+						(error instanceof CallerInputValidationError ||
+						error instanceof UsageError ||
+						error?.name === "CallerInputValidationUnavailableError" ||
+						error?.name === "CheckpointIdentityError"
+							? {
+									type: "contract_failure",
+									code: validationContractCode(
+										error,
+										validationFailureEnvelope(error),
+									),
+								}
+							: null),
+					preflightDetail:
+						error instanceof CallerInputValidationError ||
+						error instanceof UsageError ||
+						error?.name === "CallerInputValidationUnavailableError" ||
+						error?.name === "CheckpointIdentityError"
+							? validationFailureEnvelope(error)
+							: (error.preflightDetail ?? null),
 				}),
 			),
 		);
-		process.exitCode = error instanceof UsageError ? 2 : 1;
+		process.exitCode =
+			error instanceof UsageError ||
+			error instanceof CallerInputValidationError ||
+			error?.name === "CheckpointIdentityError"
+				? 2
+				: 1;
 	}
 }
 
@@ -3302,23 +3482,22 @@ async function main(argv) {
 		return;
 	}
 
-	// Find the first positional argument (non-flag) that is a known subcommand
-	const subIdx = argv.findIndex(
-		(a) => !a.startsWith("-") && KNOWN_SUBCOMMANDS.has(a),
-	);
+	// A subcommand is only recognized in argv[0]. Treating a later positional
+	// as a command silently reinterprets task paths and options.
+	const [subcommand, ...subArgs] = argv;
 
-	if (subIdx >= 0) {
-		const subcommand = argv[subIdx];
-		const subArgs = [...argv.slice(0, subIdx), ...argv.slice(subIdx + 1)];
-
+	if (KNOWN_SUBCOMMANDS.has(subcommand)) {
 		switch (subcommand) {
-			case "run":
-			case undefined: {
+			case "run": {
 				await handleRun(subArgs, {}, subcommand === "run" ? USAGE_RUN : USAGE);
 				break;
 			}
 			case "launch": {
 				await handleLaunch(subArgs);
+				break;
+			}
+			case "validate-inputs": {
+				await handleValidateInputs(subArgs);
 				break;
 			}
 			case "status": {
@@ -3369,7 +3548,11 @@ if (
 	try {
 		await main(process.argv.slice(2));
 	} catch (error) {
-		if (error instanceof UsageError) {
+		if (
+			error instanceof UsageError ||
+			error instanceof CallerInputValidationError ||
+			error?.name === "CheckpointIdentityError"
+		) {
 			console.error(`dispatch: ${error.message}\n`);
 			console.error(USAGE);
 			process.exitCode = 2;
@@ -3393,6 +3576,7 @@ export {
 	handleResult,
 	handleRun,
 	handleStatus,
+	handleValidateInputs,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
 	parseHealthArgs,
@@ -3412,4 +3596,5 @@ export {
 	USAGE_RESULT,
 	USAGE_RUN,
 	USAGE_STATUS,
+	USAGE_VALIDATE_INPUTS,
 };

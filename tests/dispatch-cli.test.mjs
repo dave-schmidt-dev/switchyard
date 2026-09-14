@@ -121,6 +121,7 @@ import {
 	USAGE_RESULT,
 	USAGE_RUN,
 	USAGE_STATUS,
+	USAGE_VALIDATE_INPUTS,
 } from "../src/switchyard/dispatch/index.mjs";
 import {
 	acquireProjectLock,
@@ -135,9 +136,12 @@ import {
 } from "../src/switchyard/run-store/index.mjs";
 import {
 	CheckpointIdentityError,
+	computeQueueIdentityFromFile,
+	getProjectRevision,
 	QueuePreflightError,
 	runQueue,
 	TaskSelectionError,
+	validateCallerInputs,
 } from "../src/switchyard/runner/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -470,6 +474,188 @@ describe("parseDispatchArgs (backwards compat)", () => {
 	});
 });
 
+describe("validate-inputs CLI", () => {
+	it("returns one idempotent bounded JSON object without creating a checkpoint", () => {
+		const args = ["validate-inputs", tasksFile, "--project", projectDir];
+		const first = runDispatch(args, makeStateRootEnv());
+		const second = runDispatch([...args, "--json"], makeStateRootEnv());
+		strictEqual(first.status, 0, first.stderr);
+		strictEqual(second.status, 0, second.stderr);
+		strictEqual(first.stdout.trim().split("\n").length, 1);
+		deepStrictEqual(JSON.parse(first.stdout), JSON.parse(second.stdout));
+		strictEqual(JSON.parse(first.stdout).valid, true);
+		ok(!existsSync(`${tasksFile}.checkpoint.json`));
+	});
+
+	it("classifies malformed validator invocation without exposing parser text", () => {
+		const result = runDispatch(
+			["validate-inputs", tasksFile],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 2);
+		deepStrictEqual(JSON.parse(result.stdout), {
+			valid: false,
+			code: "invalid_invocation",
+			remedy: "invocation options must follow validate-inputs usage",
+		});
+	});
+
+	it("preserves the legacy-shaped queue identity", () => {
+		const opts = parseDispatchArgs([tasksFile, "--project", projectDir]);
+		const validated = validateCallerInputs(opts);
+		const legacy = computeQueueIdentityFromFile(
+			tasksFile,
+			getProjectRevision(projectDir),
+			validated.runOptions,
+		);
+		strictEqual(validated.queueIdentity, legacy.queueIdentity);
+	});
+
+	it("rejects an empty queue before durable state and only recognizes argv[0]", () => {
+		writeFileSync(tasksFile, "# empty\n", "utf8");
+		const rejection = runDispatch(
+			["validate-inputs", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(rejection.status, 2);
+		const output = JSON.parse(rejection.stdout);
+		deepStrictEqual(Object.keys(output).sort(), ["code", "remedy", "valid"]);
+		strictEqual(output.code, "queue_empty");
+		ok(!existsSync(join(stateRoot, "runs")));
+
+		const misplaced = runDispatch(
+			["--json", "validate-inputs", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(misplaced.status, 2);
+	});
+
+	it("returns bounded exit-2 diagnostics for malformed graph and selection", () => {
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Invalid graph\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Blocked by:** 9.9\n- **Description:** private description must not escape\n",
+			"utf8",
+		);
+		const malformed = runDispatch(
+			["validate-inputs", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(malformed.status, 2, malformed.stderr);
+		deepStrictEqual(Object.keys(JSON.parse(malformed.stdout)).sort(), [
+			"code",
+			"remedy",
+			"valid",
+		]);
+		strictEqual(JSON.parse(malformed.stdout).code, "queue_contract_invalid");
+		ok(!malformed.stdout.includes("private description"));
+		ok(!existsSync(join(stateRoot, "runs")));
+
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Valid\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** valid\n",
+			"utf8",
+		);
+		const selected = runDispatch(
+			[
+				"validate-inputs",
+				tasksFile,
+				"--project",
+				projectDir,
+				"--task-id",
+				"9.9",
+			],
+			makeStateRootEnv(),
+		);
+		strictEqual(selected.status, 2, selected.stderr);
+		deepStrictEqual(JSON.parse(selected.stdout), {
+			valid: false,
+			code: "task_selection_failed",
+			taskId: "9.9",
+			remedy: "selected task is not runnable with the current checkpoint",
+		});
+		ok(!existsSync(join(stateRoot, "runs")));
+	});
+
+	it("keeps detailed path rejection while run and launch project repair", () => {
+		mkdirSync(join(projectDir, "generated"), { recursive: true });
+		writeFileSync(join(projectDir, "generated", "new.mjs"), "untracked\n");
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Unseeded\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** generated/new.mjs\n- **Description:** valid\n",
+			"utf8",
+		);
+
+		const validated = runDispatch(
+			["validate-inputs", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(validated.status, 2);
+		strictEqual(
+			JSON.parse(validated.stdout).code,
+			"declared_path_not_committed",
+		);
+
+		for (const command of ["run", "launch"]) {
+			const result = runDispatch(
+				[command, tasksFile, "--project", projectDir, "--json"],
+				makeStateRootEnv(),
+			);
+			strictEqual(result.status, 2, result.stderr);
+			const envelope = JSON.parse(result.stdout);
+			strictEqual(envelope.disposition.action, "repair_contract");
+			strictEqual(envelope.disposition.direction, "repair_input");
+			strictEqual(envelope.disposition.reasonCode, "queue_contract_invalid");
+			strictEqual(envelope.preflightDetail.code, "declared_path_not_committed");
+			strictEqual(envelope.runId, null);
+		}
+
+		rmSync(projectDir, { recursive: true, force: true });
+		mkdirSync(join(projectDir, "src"), { recursive: true });
+		const unreadablePath = join(projectDir, "src", "unreadable.mjs");
+		writeFileSync(unreadablePath, "committed but unreadable\n");
+		execFileSync("git", ["init", "-q"], { cwd: projectDir });
+		execFileSync("git", ["add", "src/unreadable.mjs"], { cwd: projectDir });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Test",
+				"-c",
+				"user.email=test@example.invalid",
+				"commit",
+				"-qm",
+				"seed",
+			],
+			{ cwd: projectDir },
+		);
+		chmodSync(unreadablePath, 0o000);
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Unreadable\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/unreadable.mjs\n- **Description:** valid\n",
+			"utf8",
+		);
+		const unreadable = runDispatch(
+			["validate-inputs", tasksFile, "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(unreadable.status, 2);
+		strictEqual(JSON.parse(unreadable.stdout).code, "declared_path_unreadable");
+
+		chmodSync(unreadablePath, 0o600);
+		for (const command of ["run", "launch"]) {
+			const unavailable = runDispatch(
+				[command, tasksFile, "--project", projectDir, "--json"],
+				{ ...makeStateRootEnv(), PATH: "" },
+			);
+			strictEqual(unavailable.status, 1, unavailable.stderr);
+			const envelope = JSON.parse(unavailable.stdout);
+			strictEqual(envelope.disposition.reasonCode, "environment_incomplete");
+			strictEqual(envelope.preflightDetail.code, "validation_unavailable");
+			strictEqual(envelope.runId, null);
+		}
+	});
+});
+
 describe("external completion CLI", () => {
 	it("parses the bounded reconciliation command and preserves JSON mode", () => {
 		const parsed = parseReconcileCompletionArgs([
@@ -746,6 +932,12 @@ describe("usage output", () => {
 	it("USAGE_RUN describes run options", () => {
 		ok(USAGE_RUN.includes("--project"));
 		ok(USAGE_RUN.includes("--max-tasks"));
+	});
+
+	it("USAGE_VALIDATE_INPUTS names the validation command and JSON behavior", () => {
+		ok(USAGE_VALIDATE_INPUTS.includes("validate-inputs <tasks.md>"));
+		ok(USAGE_VALIDATE_INPUTS.includes("--dirty-overlay"));
+		ok(USAGE_VALIDATE_INPUTS.includes("output is always one JSON object"));
 	});
 
 	it("USAGE_LAUNCH describes launch options", () => {
