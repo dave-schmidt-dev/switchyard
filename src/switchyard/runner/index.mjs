@@ -74,6 +74,7 @@ import {
 } from "../adapter/opencode.mjs";
 import {
 	boundCompletionContinuationProof,
+	boundProviderLifecycleSnapshot,
 	createProgressSnapshot,
 	DEFAULT_SILENCE_TIMEOUT_MS,
 	verifyCompletionContinuationSync,
@@ -5352,6 +5353,14 @@ function servedModelVerificationFields(execution) {
 function survivingProviderFields(execution) {
 	const fields = {};
 	if (
+		execution?.providerLifecycle &&
+		typeof execution.providerLifecycle === "object"
+	) {
+		fields.providerLifecycle = boundProviderLifecycleSnapshot(
+			execution.providerLifecycle,
+		);
+	}
+	if (
 		execution?.executionOutcome &&
 		typeof execution.executionOutcome === "object"
 	) {
@@ -7924,6 +7933,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		cleanupStage: brokerExecution.cleanupStage ?? null,
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 		progress: brokerExecution.progress ?? null,
+		providerLifecycle: brokerExecution.providerLifecycle ?? null,
 		// The broker relays a sanitized verdict and never raw provider bytes, so
 		// there is no output to read back on this path; a route that produced no
 		// verdict relays null and the review result resolves to an explicit
@@ -8012,33 +8022,6 @@ async function executeTaskAsyncUnsafe(task, context) {
 		return review;
 	}
 	if (!execution.success) {
-		if (execution.silenceTimedOut) {
-			await record({
-				provider: routeResult.provider,
-				model: routeResult.model ?? "unknown",
-				taskId: task.id,
-				result: "silence_timeout",
-				errorKind: "silence_timeout",
-				reason: execution.error ?? "provider made no substantive progress",
-				progress: execution.progress,
-				...reviewFailureFields(task, execution),
-			});
-			return {
-				...descriptorReceiptFields(invocationDescriptor),
-				taskId: task.id,
-				success: false,
-				provider: routeResult.provider,
-				model: routeResult.model ?? null,
-				requiredCapability,
-				resolvedTargetId,
-				result: "silence_timeout",
-				error: execution.error ?? "provider made no substantive progress",
-				errorKind: "silence_timeout",
-				progress: execution.progress,
-				silenceTimedOut: true,
-				...reviewFailureFields(task, execution),
-			};
-		}
 		if (!execution.timedOut) {
 			let captureEvidence = null;
 			if (retainsFailureDiff(task)) {
@@ -8090,6 +8073,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				cleanupStage: execution.cleanupStage,
 				...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
 				...reviewFailureFields(task, execution),
+				...survivingProviderFields(execution),
 			});
 			return {
 				...descriptorReceiptFields(invocationDescriptor),
@@ -8112,6 +8096,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 				cleanupStage: execution.cleanupStage,
 				...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
 				...reviewFailureFields(task, execution),
+				...survivingProviderFields(execution),
 				...(captureEvidence?.diff ? { partialDiff: captureEvidence.diff } : {}),
 			};
 		}
@@ -8181,6 +8166,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
+			...survivingProviderFields(execution),
 		});
 		const error = cleanupFailed
 			? (execution.error ??
@@ -8241,6 +8227,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 			cleanupStage: execution.cleanupStage,
 			...(captureStatus ? { captureStatus } : {}),
 			...reviewFailureFields(task, execution),
+			...survivingProviderFields(execution),
 			...(partialDiff ? { partialDiff } : {}),
 		};
 	}
@@ -10420,6 +10407,7 @@ export function createBrokerAdapterLauncher({
 					? null
 					: Boolean(execution.servedModel),
 			progress: execution?.progress ?? null,
+			providerLifecycle: execution?.providerLifecycle ?? null,
 		};
 	};
 }

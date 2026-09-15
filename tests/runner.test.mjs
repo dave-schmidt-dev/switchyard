@@ -1317,6 +1317,22 @@ describe("attempt-scoped execution backend", () => {
 	for (const success of [true, false]) {
 		it(`binds the final broker attempt to ${success ? "success" : "failure"} capture`, async () => {
 			let observed;
+			const providerLifecycle = {
+				schemaVersion: 1,
+				pid: 4321,
+				startedAt: "2026-09-15T12:00:00.000Z",
+				deadlineAt: "2026-09-15T12:05:00.000Z",
+				lastOutputAt: null,
+				silenceObserved: true,
+				silenceTimeoutMs: 300_000,
+				terminalStatus: "terminated",
+				terminationReason: "deadline",
+				exitCode: null,
+				signal: "SIGKILL",
+				writerLifecycle: "stopped",
+				cleanupStatus: "succeeded",
+				cleanupStage: null,
+			};
 			const backend = {
 				execArgv(_workspaceId, options) {
 					observed = options.cleanupContext;
@@ -1346,6 +1362,7 @@ describe("attempt-scoped execution backend", () => {
 							success,
 							outcome: success ? "success" : "failure",
 							reason: success ? null : "fixture failure",
+							providerLifecycle,
 						}),
 					},
 					recordDispatch: () => {},
@@ -1365,6 +1382,7 @@ describe("attempt-scoped execution backend", () => {
 				},
 			);
 			strictEqual(result.success, success);
+			deepStrictEqual(result.providerLifecycle, providerLifecycle);
 			strictEqual(observed.operation, "helper");
 			strictEqual(observed.attemptId, `attempt-broker-${success}`);
 		});

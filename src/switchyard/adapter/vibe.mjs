@@ -92,6 +92,20 @@ const VIBE_MAX_TURNS = "12";
 // Both helper execs are single short guest commands; the provider timeout is the
 // wrong scale for them and would turn a wedged transport into a 30-minute stall.
 const SERVED_MODEL_TIMEOUT_MS = 60_000;
+
+function lifecycleClockOptions(options) {
+	return Object.fromEntries(
+		[
+			"now",
+			"setTimeoutFn",
+			"clearTimeoutFn",
+			"setIntervalFn",
+			"clearIntervalFn",
+		]
+			.filter((key) => typeof options[key] === "function")
+			.map((key) => [key, options[key]]),
+	);
+}
 // `prlctl exec` misfires transiently on this substrate (documented in
 // ParallelsExecutionBackend: 5 of 150 serial calls on an idle host, worse under
 // load). The backend retries its own calls, but these two helpers spawn the
@@ -233,6 +247,10 @@ function configWriteFailure(result) {
 				? "execution_timed_out"
 				: "failure",
 		progress: result?.progress ?? null,
+		providerLifecycle: result?.providerLifecycle ?? null,
+		writerLifecycle: result?.writerLifecycle ?? "unavailable",
+		cleanupFailed: result?.cleanupFailed === true,
+		cleanupStage: result?.cleanupStage ?? null,
 	};
 }
 
@@ -414,6 +432,7 @@ async function readServedModelAsync(workspaceId, options) {
 		});
 		try {
 			const result = await runProviderProcess(probe.command, probe.args, {
+				...lifecycleClockOptions(options),
 				timeoutMs: SERVED_MODEL_TIMEOUT_MS,
 				silenceTimeoutMs: options.silenceTimeoutMs,
 				progressStage: "starting",
@@ -449,6 +468,7 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 				status: `Writing Vibe's model config into the workspace (attempt ${attempt}/${VIBE_HELPER_ATTEMPTS})`,
 			});
 			written = await runProviderProcess(write.command, write.args, {
+				...lifecycleClockOptions(options),
 				input: write.input,
 				timeoutMs: SERVED_MODEL_TIMEOUT_MS,
 				silenceTimeoutMs: options.silenceTimeoutMs,

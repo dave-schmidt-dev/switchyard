@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
 	existsSync,
@@ -118,6 +118,100 @@ afterEach(() => {
 });
 
 describe("simple dispatch argument boundary", () => {
+	it("accepts an explicit dirty overlay with read-only inputs", () => {
+		const repo = makeRepo();
+		writeFileSync(
+			join(repo.projectPath, "src", "input.txt"),
+			"input\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"input",
+			],
+			{ cwd: repo.projectPath },
+		);
+		const parsed = parseSimpleArgs(
+			[
+				repo.promptPath,
+				"--project",
+				repo.projectPath,
+				"--capability",
+				"low",
+				"--file",
+				"src/a.txt",
+				"--input",
+				"src/input.txt",
+				"--dirty-overlay",
+				"--check",
+				"true",
+				"--deadline",
+				"1970-01-01T00:10:00Z",
+			],
+			{ now: () => 1_000 },
+		);
+		deepStrictEqual(parsed.readOnlyInputs, ["src/input.txt"]);
+		strictEqual(parsed.dirtyOverlay, true);
+	});
+
+	it("rejects read-only inputs unless dirty overlay is explicitly enabled", () => {
+		const repo = makeRepo();
+		throws(
+			() =>
+				parseSimpleArgs(
+					[
+						repo.promptPath,
+						"--project",
+						repo.projectPath,
+						"--capability",
+						"low",
+						"--file",
+						"src/a.txt",
+						"--input",
+						"src/a.txt",
+						"--check",
+						"true",
+						"--deadline",
+						"1970-01-01T00:10:00Z",
+					],
+					{ now: () => 1_000 },
+				),
+			/overlap|dirty-overlay/,
+		);
+	});
+
+	it("rejects the Docker credential path under the simple union filter", () => {
+		const repo = makeRepo();
+		throws(
+			() =>
+				parseSimpleArgs(
+					[
+						repo.promptPath,
+						"--project",
+						repo.projectPath,
+						"--capability",
+						"low",
+						"--file",
+						".docker/config.json",
+						"--check",
+						"true",
+						"--deadline",
+						"1970-01-01T00:10:00Z",
+					],
+					{ now: () => 1_000 },
+				),
+			/unsafe --file path/,
+		);
+	});
+
 	it("requires one bounded absolute deadline and rejects missing or excessive values", () => {
 		const repo = makeRepo();
 		const base = [
@@ -771,5 +865,316 @@ describe("simple local execution path", () => {
 		strictEqual(result.failureReason, "no_eligible_provider");
 		strictEqual(result.failurePhase, "route");
 		strictEqual(executed, false);
+	});
+
+	it("transports authorized dirty writable and read-only bytes while preserving unrelated dirt", async () => {
+		const repo = makeRepo();
+		writeFileSync(
+			join(repo.projectPath, "src", "input.txt"),
+			"input base\n",
+			"utf8",
+		);
+		writeFileSync(
+			join(repo.projectPath, "src", "unrelated.txt"),
+			"unrelated base\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"inputs",
+			],
+			{ cwd: repo.projectPath },
+		);
+		writeFileSync(
+			join(repo.projectPath, "src", "a.txt"),
+			"dirty writable\n",
+			"utf8",
+		);
+		writeFileSync(
+			join(repo.projectPath, "src", "input.txt"),
+			"dirty input\n",
+			"utf8",
+		);
+		writeFileSync(
+			join(repo.projectPath, "src", "unrelated.txt"),
+			"owner dirt\n",
+			"utf8",
+		);
+		const result = await runSimpleTask(
+			options(repo, {
+				files: ["src/a.txt"],
+				readOnlyInputs: ["src/input.txt"],
+				dirtyOverlay: true,
+			}),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					strictEqual(
+						readFileSync(join(worktreePath, "src", "a.txt"), "utf8"),
+						"dirty writable\n",
+					);
+					strictEqual(
+						readFileSync(join(worktreePath, "src", "input.txt"), "utf8"),
+						"dirty input\n",
+					);
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"provider\n",
+						"utf8",
+					);
+					return { success: true };
+				},
+				runCheck: async ({ worktreePath }) => {
+					strictEqual(
+						readFileSync(join(worktreePath, "src", "input.txt"), "utf8"),
+						"dirty input\n",
+					);
+					return { success: true };
+				},
+			}),
+		);
+		strictEqual(result.status, "succeeded");
+		strictEqual(result.dirtyBaseline.writable_paths[0], "src/a.txt");
+		strictEqual(result.dirtyBaseline.read_only_inputs[0], "src/input.txt");
+		const sharedExpected = JSON.parse(
+			execFileSync(
+				"python3",
+				[
+					"-c",
+					`import hashlib,json,platform,subprocess,sys
+from pathlib import Path
+b=json.load(sys.stdin)
+r=b.pop("receipt_sha256")
+common=Path(subprocess.check_output(["git","rev-parse","--git-common-dir"],cwd=sys.argv[1],text=True).strip())
+if not common.is_absolute(): common=Path(sys.argv[1])/common
+print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).encode()).hexdigest(),"host_identity":platform.node().strip() or "unknown-host","receipt_sha256":hashlib.sha256(json.dumps(b,sort_keys=True,separators=(",",":")).encode()).hexdigest(),"received_receipt":r}))`,
+					repo.projectPath,
+				],
+				{
+					encoding: "utf8",
+					input: JSON.stringify(result.dirtyBaseline),
+				},
+			),
+		);
+		strictEqual(
+			result.dirtyBaseline.repository_identity,
+			sharedExpected.repository_identity,
+		);
+		strictEqual(
+			result.dirtyBaseline.host_identity,
+			sharedExpected.host_identity,
+		);
+		strictEqual(sharedExpected.received_receipt, sharedExpected.receipt_sha256);
+		deepStrictEqual(Object.keys(result.dirtyBaseline).sort(), [
+			"base_commit",
+			"files",
+			"host_identity",
+			"read_only_inputs",
+			"receipt_sha256",
+			"repository_identity",
+			"task_id",
+			"writable_paths",
+		]);
+		strictEqual(
+			readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
+			"provider\n",
+		);
+		strictEqual(
+			readFileSync(join(repo.projectPath, "src", "input.txt"), "utf8"),
+			"dirty input\n",
+		);
+		strictEqual(
+			readFileSync(join(repo.projectPath, "src", "unrelated.txt"), "utf8"),
+			"owner dirt\n",
+		);
+	});
+
+	it("rejects scoped untracked and deleted inputs before provider routing", async () => {
+		for (const mode of ["untracked", "deleted"]) {
+			const repo = makeRepo();
+			const path = join(repo.projectPath, "src", "input.txt");
+			if (mode === "untracked") writeFileSync(path, "new\n", "utf8");
+			else {
+				writeFileSync(path, "tracked\n", "utf8");
+				execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+				execFileSync(
+					"git",
+					[
+						"-c",
+						"user.name=Switchyard Tests",
+						"-c",
+						"user.email=switchyard@example.invalid",
+						"commit",
+						"-qm",
+						"input",
+					],
+					{ cwd: repo.projectPath },
+				);
+				rmSync(path);
+			}
+			let routed = false;
+			const result = await runSimpleTask(
+				options(repo, { files: ["src/input.txt"], dirtyOverlay: true }),
+				dependencies({
+					route: () => {
+						routed = true;
+						return { provider: null };
+					},
+				}),
+			);
+			strictEqual(routed, false, mode);
+			strictEqual(result.failurePhase, "preflight", mode);
+			strictEqual(result.preflightDetail.condition.includes(mode), true, mode);
+			const retry = await runSimpleTask(
+				options(repo, { files: ["src/input.txt"], dirtyOverlay: true }),
+				dependencies({ taskId: "simple-test-retry" }),
+			);
+			strictEqual(
+				retry.preflightDetail.identity,
+				result.preflightDetail.identity,
+				`${mode} retry identity`,
+			);
+			strictEqual(retry.preflightDetail.taskId, "simple-test-retry", mode);
+		}
+	});
+
+	it("rejects provider writes to read-only inputs", async () => {
+		const repo = makeRepo();
+		writeFileSync(
+			join(repo.projectPath, "src", "input.txt"),
+			"input\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"input",
+			],
+			{ cwd: repo.projectPath },
+		);
+		writeFileSync(join(repo.projectPath, "src", "a.txt"), "dirty\n", "utf8");
+		writeFileSync(
+			join(repo.projectPath, "src", "input.txt"),
+			"dirty input\n",
+			"utf8",
+		);
+		const result = await runSimpleTask(
+			options(repo, { readOnlyInputs: ["src/input.txt"], dirtyOverlay: true }),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "src", "input.txt"),
+						"provider write\n",
+						"utf8",
+					);
+					return { success: true };
+				},
+			}),
+		);
+		strictEqual(result.failureReason, "read_only_input_changed");
+		strictEqual(
+			readFileSync(join(repo.projectPath, "src", "input.txt"), "utf8"),
+			"dirty input\n",
+		);
+	});
+
+	it("accepts a simple overlay path beyond the legacy tar-name limit", async () => {
+		const repo = makeRepo();
+		const longPath = `src/${"nested".repeat(18)}.txt`;
+		writeFileSync(join(repo.projectPath, longPath), "base\n", "utf8");
+		execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"long path",
+			],
+			{ cwd: repo.projectPath },
+		);
+		writeFileSync(join(repo.projectPath, longPath), "dirty\n", "utf8");
+		const result = await runSimpleTask(
+			options(repo, { files: [longPath], dirtyOverlay: true }),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(join(worktreePath, longPath), "provider\n", "utf8");
+					return { success: true, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		strictEqual(result.status, "succeeded");
+		strictEqual(
+			readFileSync(join(repo.projectPath, longPath), "utf8"),
+			"provider\n",
+		);
+	});
+
+	it("rejects host drift on a read-only baseline before integration", async () => {
+		const repo = makeRepo();
+		writeFileSync(
+			join(repo.projectPath, "src", "input.txt"),
+			"input\n",
+			"utf8",
+		);
+		execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"input",
+			],
+			{ cwd: repo.projectPath },
+		);
+		writeFileSync(join(repo.projectPath, "src", "a.txt"), "dirty\n", "utf8");
+		const result = await runSimpleTask(
+			options(repo, {
+				readOnlyInputs: ["src/input.txt"],
+				dirtyOverlay: true,
+			}),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"provider\n",
+						"utf8",
+					);
+					writeFileSync(
+						join(repo.projectPath, "src", "input.txt"),
+						"owner drift\n",
+						"utf8",
+					);
+					return { success: true, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		retain(result, repo.projectPath);
+		strictEqual(result.failureReason, "dirty_overlay_drift");
+		strictEqual(
+			readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
+			"dirty\n",
+		);
 	});
 });

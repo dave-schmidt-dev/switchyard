@@ -28,10 +28,8 @@ const DEFAULT_MAX_BUFFER = 128 * 1024 * 1024;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_DIAGNOSTIC_CHARS = 800;
-// A provider that has emitted no substantive signal for this bounded interval
-// is treated as stalled. The broker/runner may override it for a controlled
-// test or a provider-specific policy, but production dispatch never leaves it
-// unset.
+// Retained for compatibility with adapter options. Silence is observational;
+// the absolute execution deadline below is the only lifecycle kill condition.
 export const DEFAULT_SILENCE_TIMEOUT_MS = 5 * 60 * 1000;
 const PROGRESS_SCHEMA_VERSION = 1;
 const PROGRESS_STAGE_VALUES = new Set([
@@ -100,6 +98,106 @@ export function createProgressSnapshot({
 		}),
 		outcome: safeOutcome,
 	});
+}
+
+const LIFECYCLE_TERMINAL_STATUSES = new Set([
+	"running",
+	"exited",
+	"terminated",
+	"spawn_failed",
+	"unobserved",
+]);
+const LIFECYCLE_TERMINATION_REASONS = new Set([
+	"none",
+	"completed",
+	"deadline",
+	"cancelled",
+	"admission",
+	"unobserved",
+]);
+const LIFECYCLE_CLEANUP_STATUSES = new Set([
+	"not_required",
+	"succeeded",
+	"failed",
+	"uncertain",
+]);
+
+function lifecycleTimestamp(value) {
+	if (Number.isFinite(value)) return new Date(value).toISOString();
+	if (typeof value === "string" && Number.isFinite(Date.parse(value))) {
+		return new Date(Date.parse(value)).toISOString();
+	}
+	return null;
+}
+
+function lifecyclePid(value) {
+	return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Create a bounded process-lifecycle receipt. It intentionally contains no
+ * provider output, command line, prompt, or error text.
+ */
+function createProviderLifecycleSnapshot({
+	pid = null,
+	startedAt = null,
+	deadlineAt = null,
+	lastOutputAt = null,
+	silenceObserved = false,
+	silenceTimeoutMs = null,
+	terminalStatus = "unobserved",
+	terminationReason = "none",
+	exitCode = null,
+	signal = null,
+	writerLifecycle = "unavailable",
+	cleanupStatus = "not_required",
+	cleanupStage = null,
+} = {}) {
+	const safeSignal =
+		typeof signal === "string" && /^[A-Z0-9_:-]{1,32}$/u.test(signal)
+			? signal
+			: null;
+	const safeCode = Number.isSafeInteger(exitCode) ? exitCode : null;
+	const safeWriter = new Set(["stopped", "never_started", "unavailable"]).has(
+		writerLifecycle,
+	)
+		? writerLifecycle
+		: "unavailable";
+	const safeCleanupStage = CLEANUP_STAGES.has(cleanupStage)
+		? cleanupStage
+		: null;
+	const safeSilenceTimeout =
+		Number.isFinite(silenceTimeoutMs) && silenceTimeoutMs > 0
+			? Math.min(Math.max(0, silenceTimeoutMs), Number.MAX_SAFE_INTEGER)
+			: null;
+	return Object.freeze({
+		schemaVersion: 1,
+		pid: lifecyclePid(pid),
+		startedAt: lifecycleTimestamp(startedAt),
+		deadlineAt: lifecycleTimestamp(deadlineAt),
+		lastOutputAt: lifecycleTimestamp(lastOutputAt),
+		silenceObserved: silenceObserved === true,
+		silenceTimeoutMs: safeSilenceTimeout,
+		terminalStatus: LIFECYCLE_TERMINAL_STATUSES.has(terminalStatus)
+			? terminalStatus
+			: "unobserved",
+		terminationReason: LIFECYCLE_TERMINATION_REASONS.has(terminationReason)
+			? terminationReason
+			: "none",
+		exitCode: safeCode,
+		signal: safeSignal,
+		writerLifecycle: safeWriter,
+		cleanupStatus: LIFECYCLE_CLEANUP_STATUSES.has(cleanupStatus)
+			? cleanupStatus
+			: "uncertain",
+		cleanupStage: safeCleanupStage,
+	});
+}
+
+/** Re-bind a lifecycle receipt received across the broker boundary. */
+export function boundProviderLifecycleSnapshot(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	return createProviderLifecycleSnapshot(value);
 }
 
 // Keep the provider's original argv[0] attached to the exact transport args
@@ -449,7 +547,6 @@ export function runProviderProcess(command, args, options = {}) {
 		let cleanupError = null;
 		let cleanupResult = null;
 		let timedOut = false;
-		let silenceTimedOut = false;
 		let cancelled = false;
 		let pollCount = 0;
 		let progressCount = 0;
@@ -458,18 +555,20 @@ export function runProviderProcess(command, args, options = {}) {
 		// escalation is not proof when the child never emits close.
 		let writerLifecycle = "unavailable";
 		let lastSubstantiveProgressAt = null;
+		let lastOutputAt = null;
+		let silenceObserved = false;
+		let terminalStatus = "running";
+		let terminationReason = "none";
+		let cleanupStatus = "not_required";
 		let timeoutTimer = null;
-		let silenceTimer = null;
 		let escalationTimer = null;
 		let pollTimer = null;
 
 		const clearTimers = () => {
 			if (timeoutTimer !== null) clearTimeoutFn(timeoutTimer);
-			if (silenceTimer !== null) clearTimeoutFn(silenceTimer);
 			if (escalationTimer !== null) clearTimeoutFn(escalationTimer);
 			if (pollTimer !== null) clearIntervalFn(pollTimer);
 			timeoutTimer = null;
-			silenceTimer = null;
 			escalationTimer = null;
 			pollTimer = null;
 		};
@@ -486,29 +585,62 @@ export function runProviderProcess(command, args, options = {}) {
 				signal.removeEventListener("abort", abort);
 			}
 			const elapsedMs = Math.max(0, now() - startedAt);
-			const outcome = silenceTimedOut
-				? "silence_timeout"
-				: timedOut
-					? "execution_timed_out"
-					: cancelled
-						? "cancelled"
-						: code === 0 && !error && !cleanupError
-							? "success"
-							: "failure";
+			if (
+				Number.isFinite(silenceTimeoutMs) &&
+				silenceTimeoutMs > 0 &&
+				now() - (lastOutputAt ?? startedAt) >= silenceTimeoutMs
+			) {
+				silenceObserved = true;
+			}
+			const outcome = timedOut
+				? "execution_timed_out"
+				: cancelled
+					? "cancelled"
+					: code === 0 &&
+							!error &&
+							!cleanupError &&
+							cleanupResult?.cleanupFailed !== true
+						? "success"
+						: "failure";
+			if (terminalStatus === "running") {
+				terminalStatus = terminationRequested ? "unobserved" : "exited";
+			}
+			if (cleanupError || cleanupResult?.cleanupFailed === true) {
+				cleanupStatus = "failed";
+			}
+			const lifecycle = createProviderLifecycleSnapshot({
+				pid: child?.pid,
+				startedAt,
+				deadlineAt: Number.isFinite(timeoutMs)
+					? startedAt + Math.max(0, timeoutMs)
+					: null,
+				lastOutputAt,
+				silenceObserved,
+				silenceTimeoutMs,
+				terminalStatus,
+				terminationReason,
+				exitCode: code,
+				signal: exitSignal,
+				writerLifecycle,
+				cleanupStatus,
+				cleanupStage:
+					cleanupError?.cleanupStage ?? cleanupResult?.cleanupStage ?? null,
+			});
 			resolve({
 				success:
 					!timedOut &&
-					!silenceTimedOut &&
 					!cancelled &&
 					!error &&
 					!cleanupError &&
+					cleanupResult?.cleanupFailed !== true &&
 					code === 0,
 				output: stdout,
 				stderr,
 				code,
 				signal: exitSignal,
 				timedOut,
-				silenceTimedOut,
+				// Legacy projection only; silence never independently terminates.
+				silenceTimedOut: false,
 				cancelled,
 				elapsedMs,
 				progress: createProgressSnapshot({
@@ -529,10 +661,20 @@ export function runProviderProcess(command, args, options = {}) {
 					outcome,
 				}),
 				error: cleanupError ?? error,
-				cleanupFailed: Boolean(cleanupError),
+				cleanupFailed:
+					Boolean(cleanupError) || cleanupResult?.cleanupFailed === true,
 				cleanupStage:
 					cleanupError?.cleanupStage ?? cleanupResult?.cleanupStage ?? null,
 				writerLifecycle,
+				providerLifecycle: lifecycle,
+				pid: lifecycle.pid,
+				startedAt: lifecycle.startedAt,
+				deadlineAt: lifecycle.deadlineAt,
+				lastOutputAt: lifecycle.lastOutputAt,
+				silenceObserved: lifecycle.silenceObserved,
+				terminationReason: lifecycle.terminationReason,
+				terminalStatus: lifecycle.terminalStatus,
+				cleanupStatus: lifecycle.cleanupStatus,
 			});
 		};
 
@@ -542,9 +684,16 @@ export function runProviderProcess(command, args, options = {}) {
 				.then(async () => {
 					cleanupResult =
 						typeof cleanup === "function" ? await cleanup() : undefined;
+					cleanupStatus =
+						typeof cleanup !== "function"
+							? "not_required"
+							: cleanupResult?.cleanupFailed === true
+								? "failed"
+								: "succeeded";
 				})
 				.catch((error) => {
 					cleanupError = error;
+					cleanupStatus = "failed";
 				});
 			return cleanupPromise;
 		};
@@ -556,10 +705,18 @@ export function runProviderProcess(command, args, options = {}) {
 
 		const emitProgress = (substantive = false) => {
 			const timestamp = now();
+			if (
+				Number.isFinite(silenceTimeoutMs) &&
+				silenceTimeoutMs > 0 &&
+				timestamp - (lastOutputAt ?? startedAt) >= silenceTimeoutMs
+			) {
+				silenceObserved = true;
+			}
 			if (substantive) {
+				lastOutputAt = timestamp;
+				silenceObserved = false;
 				lastSubstantiveProgressAt = timestamp;
 				progressCount += 1;
-				armSilenceTimer();
 			}
 			try {
 				onProgress?.(
@@ -586,22 +743,20 @@ export function runProviderProcess(command, args, options = {}) {
 			}
 		};
 
-		const armSilenceTimer = () => {
-			if (!(Number.isFinite(silenceTimeoutMs) && silenceTimeoutMs > 0)) return;
-			if (silenceTimer !== null) clearTimeoutFn(silenceTimer);
-			silenceTimer = safeTimer(
-				() => requestTermination("silence"),
-				silenceTimeoutMs,
-				setTimeoutFn,
-			);
-		};
-
 		const requestTermination = (reason) => {
 			if (terminationRequested || settled) return;
 			terminationRequested = true;
 			timedOut = reason === "timeout";
-			silenceTimedOut = reason === "silence";
 			cancelled = reason === "cancel";
+			terminationReason = timedOut ? "deadline" : "cancelled";
+			if (
+				timedOut &&
+				Number.isFinite(silenceTimeoutMs) &&
+				silenceTimeoutMs > 0 &&
+				now() - (lastOutputAt ?? startedAt) >= silenceTimeoutMs
+			) {
+				silenceObserved = true;
+			}
 			try {
 				child?.kill?.("SIGTERM");
 			} catch {
@@ -637,6 +792,8 @@ export function runProviderProcess(command, args, options = {}) {
 			});
 		} catch (error) {
 			writerLifecycle = "never_started";
+			terminalStatus = "spawn_failed";
+			terminationReason = "admission";
 			void terminal({ error });
 			return;
 		}
@@ -651,15 +808,20 @@ export function runProviderProcess(command, args, options = {}) {
 		});
 		child.once?.("error", (error) => {
 			if (terminationRequested) return;
+			terminalStatus = "spawn_failed";
+			terminationReason = "admission";
 			void terminal({ error });
 		});
 		child.once?.("close", (code, exitSignal) => {
 			if (settled) return;
 			writerLifecycle = "stopped";
 			if (terminationRequested) {
+				terminalStatus = "terminated";
 				void finishAfterCleanup({ code, signal: exitSignal });
 				return;
 			}
+			terminalStatus = "exited";
+			terminationReason = "completed";
 			void terminal({ code, signal: exitSignal });
 		});
 
@@ -692,7 +854,6 @@ export function runProviderProcess(command, args, options = {}) {
 				emitProgress(false);
 			}, pollIntervalMs);
 		}
-		armSilenceTimer();
 	});
 }
 
@@ -917,9 +1078,25 @@ export async function executeProviderInvocation(command, args, options = {}) {
 					: null,
 				code: Number.isSafeInteger(value.code) ? value.code : null,
 				signal: typeof value.signal === "string" ? value.signal : null,
+				providerLifecycle: result.providerLifecycle,
 			});
 		}
-		return { ...value, writerLifecycle: result.writerLifecycle };
+		return {
+			...value,
+			// Kept as an explicit false compatibility fact: silence is an
+			// observation, never a terminal outcome.
+			silenceTimedOut: false,
+			writerLifecycle: result.writerLifecycle,
+			providerLifecycle: result.providerLifecycle,
+			pid: result.pid,
+			startedAt: result.startedAt,
+			deadlineAt: result.deadlineAt,
+			lastOutputAt: result.lastOutputAt,
+			silenceObserved: result.silenceObserved,
+			terminationReason: result.terminationReason,
+			terminalStatus: result.terminalStatus,
+			cleanupStatus: result.cleanupStatus,
+		};
 	};
 	if (result.success) {
 		return complete({
@@ -991,23 +1168,6 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			}),
 		});
 	}
-	if (result.silenceTimedOut) {
-		return complete({
-			output: result.output,
-			success: false,
-			error:
-				"provider made no substantive progress before the silence deadline",
-			errorKind: "silence_timeout",
-			timedOut: false,
-			silenceTimedOut: true,
-			outcome: "silence_timeout",
-			diagnosticCode: "silence_timeout",
-			failurePhase: "provider_execution",
-			diagnosticOrigin: "adapter",
-			diagnosticEvidenceAvailable: false,
-			progress: result.progress,
-		});
-	}
 	if (result.cancelled) {
 		const cleanupFailed = result.cleanupFailed === true;
 		return complete({
@@ -1036,6 +1196,24 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				provider,
 				command: classificationCommand,
 			}),
+		});
+	}
+	if (result.terminalStatus === "spawn_failed") {
+		return complete({
+			output: result.output,
+			stderr: result.stderr,
+			success: false,
+			error: truncateDiagnostic(
+				result.error?.message ?? "provider process could not be started",
+			),
+			errorKind: "launch_failed",
+			admissionFailed: true,
+			diagnosticCode: "launch_failed",
+			failurePhase: "provider_execution",
+			diagnosticOrigin: "adapter",
+			diagnosticEvidenceAvailable: false,
+			exitCode: null,
+			signal: null,
 		});
 	}
 	const error = Object.assign(

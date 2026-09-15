@@ -1,6 +1,7 @@
 import { CLEANUP_STAGES } from "../adapter/exec-error.mjs";
 import {
 	boundCompletionContinuationProof,
+	boundProviderLifecycleSnapshot,
 	createProgressSnapshot,
 } from "../adapter/provider-lifecycle.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
@@ -151,6 +152,10 @@ function boundedProgress(value) {
 		progressCount: value.counters?.progressEvents,
 		outcome: value.outcome,
 	});
+}
+
+function boundedProviderLifecycle(value) {
+	return boundProviderLifecycleSnapshot(value);
 }
 
 /**
@@ -407,6 +412,9 @@ export async function executeBrokerRoute(options) {
 			reviewResult: reviewResultOf(launcherResult),
 			terminalEvidence,
 			progress: boundedProgress(launcherResult?.progress),
+			providerLifecycle: boundedProviderLifecycle(
+				launcherResult?.providerLifecycle,
+			),
 			executionOutcome,
 			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});
@@ -499,6 +507,9 @@ export async function executeBrokerRoute(options) {
 				completionContinuationProofOf(launcherResult),
 			terminalEvidence,
 			progress: boundedProgress(launcherResult?.progress),
+			providerLifecycle: boundedProviderLifecycle(
+				launcherResult?.providerLifecycle,
+			),
 			executionOutcome,
 			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});

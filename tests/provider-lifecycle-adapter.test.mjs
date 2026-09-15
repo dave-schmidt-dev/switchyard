@@ -102,8 +102,9 @@ describe("provider process lifecycle", () => {
 			onPoll: () => {},
 			onProgress: (value) => progress.push(value),
 		});
-		strictEqual(result.silenceTimedOut, true);
-		strictEqual(result.progress.outcome, "silence_timeout");
+		strictEqual(result.silenceTimedOut, false);
+		strictEqual(result.timedOut, true);
+		strictEqual(result.progress.outcome, "execution_timed_out");
 		ok(result.progress.counters.polls > 0);
 		ok(
 			progress.every(
@@ -321,6 +322,51 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.output, "ok\n");
 		strictEqual(terminalEvents, 1);
 		strictEqual(result.writerLifecycle, "stopped");
+	});
+
+	it("retains bounded process identity, deadline, silence observation, and cleanup outcome", async () => {
+		const child = fakeChild();
+		child.pid = 4242;
+		const promise = runProviderProcess("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 100,
+			silenceTimeoutMs: 1,
+			cleanup: () => ({ cleanupFailed: true, cleanupStage: "tree_terminated" }),
+		});
+		child.stdout.emit("data", "buffered\n");
+		await new Promise((resolve) => setTimeout(resolve, 4));
+		child.emit("close", 1, null);
+		const result = await promise;
+		strictEqual(result.success, false);
+		strictEqual(result.providerLifecycle.schemaVersion, 1);
+		strictEqual(result.providerLifecycle.pid, 4242);
+		ok(typeof result.providerLifecycle.startedAt === "string");
+		ok(typeof result.providerLifecycle.deadlineAt === "string");
+		ok(typeof result.providerLifecycle.lastOutputAt === "string");
+		strictEqual(result.providerLifecycle.silenceObserved, true);
+		strictEqual(result.providerLifecycle.terminalStatus, "exited");
+		strictEqual(result.providerLifecycle.terminationReason, "completed");
+		strictEqual(result.providerLifecycle.writerLifecycle, "stopped");
+		strictEqual(result.providerLifecycle.cleanupStatus, "not_required");
+		strictEqual(result.silenceTimedOut, false);
+	});
+
+	it("classifies a spawn admission failure separately and redacts lifecycle output", async () => {
+		const result = await executeProviderInvocation("fake", [], {
+			provider: "vibe",
+			spawnFn: () => {
+				throw new Error("SECRET_CANARY spawn unavailable");
+			},
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.admissionFailed, true);
+		strictEqual(result.errorKind, "launch_failed");
+		strictEqual(result.diagnosticCode, "launch_failed");
+		strictEqual(result.providerLifecycle.terminalStatus, "spawn_failed");
+		strictEqual(
+			JSON.stringify(result.providerLifecycle).includes("SECRET_CANARY"),
+			false,
+		);
 	});
 
 	it("distinguishes never-started spawn failures from an unobserved timeout", async () => {
@@ -1538,7 +1584,7 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.diagnosticEvidenceAvailable, false);
 	});
 
-	it("does not treat an idle exit as success after a silence timeout", async () => {
+	it("keeps silence observational and uses the absolute deadline", async () => {
 		const child = fakeChild();
 		child.kill = (signal) => {
 			child.signals.push(signal);
@@ -1549,13 +1595,15 @@ describe("provider process lifecycle", () => {
 			provider: "vibe",
 			idleExitCode: 0,
 			silenceTimeoutMs: 1,
+			timeoutMs: 5,
 			termGraceMs: 1,
+			cleanup: () => ({ cleanupFailed: false, postcondition: true }),
 			spawnFn: () => child,
 		});
 		strictEqual(result.success, false);
-		strictEqual(result.silenceTimedOut, true);
-		strictEqual(result.errorKind, "silence_timeout");
-		strictEqual(result.outcome, "silence_timeout");
+		strictEqual(result.silenceTimedOut, false);
+		strictEqual(result.timedOut, true);
+		strictEqual(result.diagnosticCode, "execution_timed_out");
 	});
 
 	it("classifies real provider/binary bindings from separate lifecycle streams", async () => {

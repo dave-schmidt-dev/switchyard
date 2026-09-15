@@ -305,8 +305,9 @@ describe("Vibe adapter", () => {
 		);
 	});
 
-	it("preserves a config-write silence timeout and its closed progress envelope", async () => {
+	it("lets the absolute deadline terminate a silent config write without a private silence timeout", async () => {
 		const spawned = [];
+		let clock = 0;
 		const executionBackend = {
 			execArgv(_workspaceId, candidate) {
 				return { command: "fake", args: [...candidate.argv] };
@@ -316,6 +317,12 @@ describe("Vibe adapter", () => {
 			...options(executionBackend),
 			silenceTimeoutMs: 1,
 			termGraceMs: 1,
+			now: () => (clock += 2),
+			setTimeoutFn: (callback) => {
+				queueMicrotask(callback);
+				return callback;
+			},
+			clearTimeoutFn: () => {},
 			spawnFn: (_command, args) => {
 				const child = new EventEmitter();
 				child.stdout = new EventEmitter();
@@ -329,11 +336,13 @@ describe("Vibe adapter", () => {
 			},
 		});
 		strictEqual(result.success, false);
-		strictEqual(result.errorKind, "silence_timeout");
-		strictEqual(result.silenceTimedOut, true);
-		strictEqual(result.outcome, "silence_timeout");
+		strictEqual(result.errorKind, "execution_timed_out");
+		strictEqual(result.silenceTimedOut, false);
+		strictEqual(result.outcome, "execution_timed_out");
 		strictEqual(result.progress.stage, "configuring");
-		strictEqual(result.progress.outcome, "silence_timeout");
+		strictEqual(result.progress.outcome, "execution_timed_out");
+		strictEqual(result.providerLifecycle.silenceObserved, true);
+		strictEqual(result.providerLifecycle.terminationReason, "deadline");
 		strictEqual(spawned.length, 6);
 	});
 

@@ -241,6 +241,45 @@ describe("broker async executor", () => {
 		strictEqual(result.cleanupFailed, true);
 	});
 
+	it("propagates only bounded provider lifecycle diagnostics without retrying silence", async () => {
+		const value = fixture();
+		let launches = 0;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => {
+				launches += 1;
+				return {
+					success: false,
+					timedOut: true,
+					errorKind: "execution_timed_out",
+					providerLifecycle: {
+						pid: 4242,
+						startedAt: "2026-09-15T12:00:00.000Z",
+						deadlineAt: "2026-09-15T12:00:01.000Z",
+						lastOutputAt: null,
+						silenceObserved: true,
+						terminalStatus: "terminated",
+						terminationReason: "deadline",
+						exitCode: null,
+						signal: "SIGKILL",
+						writerLifecycle: "unavailable",
+						cleanupStatus: "succeeded",
+						cleanupStage: null,
+						secret: "SECRET_CANARY",
+					},
+				};
+			},
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(launches, 1);
+		strictEqual(result.providerLifecycle.pid, 4242);
+		strictEqual(result.providerLifecycle.terminationReason, "deadline");
+		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
+	});
+
 	it("retains safe structured diagnostics without exposing launcher output", async () => {
 		const value = fixture();
 		let terminals = 0;

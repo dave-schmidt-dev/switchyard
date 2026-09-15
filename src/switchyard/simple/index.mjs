@@ -12,11 +12,19 @@ import {
 	realpathSync,
 	rmSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
-import { runProviderProcess } from "../adapter/provider-lifecycle.mjs";
+import {
+	boundProviderLifecycleSnapshot,
+	runProviderProcess,
+} from "../adapter/provider-lifecycle.mjs";
 import { integrationGate, validateDiff } from "../integrate/index.mjs";
+import {
+	captureDirtyOverlay,
+	materializeDirtyOverlay,
+	validateDirtyOverlayReceipt,
+} from "../lifecycle/index.mjs";
 import {
 	getConfiguredInvocationDescriptor,
 	normalizeProviderName,
@@ -28,10 +36,11 @@ import {
 	releaseProjectLockIfOwnedBy,
 } from "../run-store/index.mjs";
 
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> --check <command> --deadline <RFC3339> [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
---check as needed. Output is always one JSON result; progress is written to stderr.`;
+--input and --check as needed. --input is read-only and requires --dirty-overlay.
+Output is always one JSON result; progress is written to stderr.`;
 
 const MAX_PROMPT_BYTES = 256 * 1024;
 const MAX_DEADLINE_MS = 30 * 60 * 1000;
@@ -51,6 +60,7 @@ const SECRET_PATHS = [
 	/\.(?:pem|key)$/iu,
 	/(^|\/)credentials(?:\.|$)/iu,
 	/(^|\/)secrets?(?:\.|$)/iu,
+	/(^|\/)\.docker\/config\.json$/iu,
 ];
 
 class SimpleUsageError extends Error {
@@ -83,9 +93,11 @@ function requireGit(projectPath, args, code, options = {}) {
 	return result.stdout;
 }
 
-function normalizeDeclaredPath(projectPath, value) {
+function normalizeDeclaredPath(projectPath, value, flagName = "--file") {
 	if (typeof value !== "string" || value.trim() === "") {
-		throw new SimpleUsageError("--file requires a non-empty relative path");
+		throw new SimpleUsageError(
+			`${flagName} requires a non-empty relative path`,
+		);
 	}
 	const path = value.trim();
 	const components = path.split("/");
@@ -105,14 +117,14 @@ function normalizeDeclaredPath(projectPath, value) {
 		) ||
 		SECRET_PATHS.some((pattern) => pattern.test(path))
 	) {
-		throw new SimpleUsageError(`unsafe --file path: ${value}`);
+		throw new SimpleUsageError(`unsafe ${flagName} path: ${value}`);
 	}
 	const absolute = resolve(projectPath, path);
 	if (
 		absolute !== projectPath &&
 		!absolute.startsWith(`${projectPath}${sep}`)
 	) {
-		throw new SimpleUsageError(`--file escapes project: ${value}`);
+		throw new SimpleUsageError(`${flagName} escapes project: ${value}`);
 	}
 	return path;
 }
@@ -170,6 +182,8 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				project: { type: "string" },
 				capability: { type: "string" },
 				file: { type: "string", multiple: true },
+				input: { type: "string", multiple: true },
+				"dirty-overlay": { type: "boolean", default: false },
 				check: { type: "string", multiple: true },
 				deadline: { type: "string" },
 				json: { type: "boolean", default: false },
@@ -225,8 +239,29 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 	) {
 		throw new SimpleUsageError("at least one unique --file is required");
 	}
-	for (const path of files) {
-		assertDeclaredPathBoundary(canonicalProjectPath, path);
+	const dirtyOverlay = parsed.values["dirty-overlay"] === true;
+	if (!dirtyOverlay) {
+		for (const path of files)
+			assertDeclaredPathBoundary(canonicalProjectPath, path);
+	}
+	const inputs = (parsed.values.input ?? []).map((path) =>
+		normalizeDeclaredPath(canonicalProjectPath, path, "--input"),
+	);
+	if (inputs.some((path) => files.includes(path))) {
+		throw new SimpleUsageError("--file and --input scopes must not overlap");
+	}
+	if (
+		files.length + inputs.length > MAX_DECLARED_FILES ||
+		new Set(inputs).size !== inputs.length
+	) {
+		throw new SimpleUsageError("--input paths must be unique and bounded");
+	}
+	if (inputs.length > 0 && !dirtyOverlay) {
+		throw new SimpleUsageError("--input requires --dirty-overlay");
+	}
+	if (!dirtyOverlay) {
+		for (const path of inputs)
+			assertDeclaredPathBoundary(canonicalProjectPath, path);
 	}
 	const checks = parsed.values.check ?? [];
 	if (
@@ -247,6 +282,8 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		projectPath: canonicalProjectPath,
 		capability,
 		files,
+		readOnlyInputs: inputs,
+		dirtyOverlay,
 		checks: checks.map((check) => check.trim()),
 		deadlineMs: parseDeadline(parsed.values.deadline, nowMs),
 	};
@@ -298,6 +335,124 @@ function fileFingerprint(projectPath, files) {
 		hash.update("\0");
 	}
 	return hash.digest("hex");
+}
+
+function dirtyBaselineScopeIdentity({ baseRevision, files, inputs }) {
+	return sha256(
+		JSON.stringify({
+			baseRevision,
+			writablePaths: files,
+			readOnlyInputs: inputs,
+		}),
+	);
+}
+
+function canonicalJson(value) {
+	if (typeof value === "string") {
+		return JSON.stringify(value).replaceAll(
+			/[\u007f-\uffff]/g,
+			(unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`,
+		);
+	}
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	return `{${Object.keys(value)
+		.sort()
+		.map((key) => `${canonicalJson(key)}:${canonicalJson(value[key])}`)
+		.join(",")}}`;
+}
+
+function makeDirtyBaseline({
+	taskId,
+	baseRevision,
+	projectPath,
+	files,
+	inputs,
+	receipt,
+}) {
+	const allPaths = [...files, ...inputs];
+	const commonDir = git(projectPath, ["rev-parse", "--git-common-dir"]);
+	if (commonDir.status !== 0)
+		throw new Error("dirty baseline repository identity unavailable");
+	const commonPath = commonDir.stdout.trim();
+	const repositoryPath = realpathSync(
+		isAbsolute(commonPath) ? commonPath : resolve(projectPath, commonPath),
+	);
+	const baseline = {
+		task_id: taskId,
+		base_commit: baseRevision,
+		repository_identity: sha256Hex(repositoryPath),
+		host_identity: hostname().trim() || "unknown-host",
+		writable_paths: [...files],
+		read_only_inputs: [...inputs],
+		files: Object.fromEntries(
+			allPaths.map((path) => {
+				const entry = receipt.paths.find(
+					(candidate) => candidate.path === path,
+				);
+				return [
+					path,
+					{
+						sha256: entry.sha256,
+						size: entry.size,
+						mode: entry.mode & 0o111 ? 0o100755 : 0o100644,
+					},
+				];
+			}),
+		),
+	};
+	return {
+		...baseline,
+		receipt_sha256: sha256Hex(canonicalJson(baseline)),
+	};
+}
+
+function dirtyOverlayFailure(error, { taskId, baseRevision, files, inputs }) {
+	const message = String(error?.message ?? "dirty overlay preflight failed");
+	let code = "dirty_overlay_preflight_failed";
+	let condition = "declared dirty input could not be captured";
+	let remedy =
+		"keep the declared inputs tracked, regular, non-secret files and retry";
+	if (/untracked/u.test(message)) {
+		code = "dirty_overlay_untracked";
+		condition = "a scoped input is untracked";
+		remedy = "track the input or remove it from --file/--input";
+	} else if (/deleted|ENOENT/u.test(message)) {
+		code = "dirty_overlay_deleted";
+		condition = "a scoped input is deleted or unavailable";
+		remedy = "restore the input or remove it from --file/--input";
+	} else if (/ignored/u.test(message)) {
+		code = "dirty_overlay_ignored";
+		condition = "a scoped input is ignored by Git";
+		remedy = "remove the ignore rule or remove the input from --file/--input";
+	} else if (/symlink/u.test(message)) {
+		code = "dirty_overlay_symlink";
+		condition = "a scoped input crosses or names a symlink";
+		remedy = "declare a regular tracked file without symlink parents";
+	} else if (/too large/u.test(message)) {
+		code = "dirty_overlay_oversized";
+		condition = "a scoped input exceeds the 8 MiB simple transport limit";
+		remedy = "reduce the file below 8 MiB or remove it from the scope";
+	} else if (/regular file/u.test(message)) {
+		code = "dirty_overlay_not_regular";
+		condition = "a scoped input is not one regular file";
+		remedy = "replace the scoped path with a tracked regular file";
+	} else if (/secret-shaped|credential/u.test(message)) {
+		code = "dirty_overlay_secret_path";
+		condition = "a scoped input matches a credential or secret path convention";
+		remedy = "remove the secret-shaped path from the scope";
+	}
+	return {
+		code,
+		condition,
+		remedy,
+		identity: dirtyBaselineScopeIdentity({
+			baseRevision,
+			files,
+			inputs,
+		}),
+		taskId,
+	};
 }
 
 function declaredPathsAreClean(projectPath, files) {
@@ -494,8 +649,12 @@ function aggregateWriterLifecycle(previous, current) {
 	return "stopped";
 }
 
+function sha256Hex(value) {
+	return createHash("sha256").update(value).digest("hex");
+}
+
 function sha256(value) {
-	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+	return `sha256:${sha256Hex(value)}`;
 }
 
 function recoveryScope(files, checks) {
@@ -525,6 +684,7 @@ function recoveryContract(options) {
 		taskId: options.taskId,
 		attemptId: options.attemptId,
 		baseRevision: options.baseRevision,
+		...(options.dirtyBaseline ? { dirtyBaseline: options.dirtyBaseline } : {}),
 		scope: recoveryScope(options.files, options.checks),
 	};
 }
@@ -689,6 +849,11 @@ function terminalResult(base, overrides = {}) {
 		checks: overrides.checks ?? [],
 		failureReason: overrides.failureReason ?? null,
 		failurePhase: overrides.failurePhase ?? null,
+		providerLifecycle: overrides.providerLifecycle ?? null,
+		...(overrides.preflightDetail
+			? { preflightDetail: overrides.preflightDetail }
+			: {}),
+		dirtyBaseline: overrides.dirtyBaseline ?? null,
 		partialWorktree: overrides.partialWorktree ?? null,
 		recovery: overrides.recovery ?? recoveryUnavailable(),
 	};
@@ -712,6 +877,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let finalResult = null;
 	let currentPhase = "preflight";
 	let baseRevision = null;
+	let worktreeBaseRevision = null;
+	let dirtyOverlayReceipt = null;
+	let dirtyBaseline = null;
+	let preflightDetail = null;
+	let providerLifecycle = null;
 	let writerLifecycle = "never_started";
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
@@ -745,6 +915,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checks,
 			failureReason,
 			failurePhase,
+			preflightDetail,
+			dirtyBaseline,
+			providerLifecycle,
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
 		return finalResult;
@@ -758,18 +931,48 @@ export async function runSimpleTask(options, dependencies = {}) {
 		await acquireLock(options.projectPath, runId);
 		projectLocked = true;
 		projectLockState = "held";
-		if (!declaredPathsAreClean(options.projectPath, options.files)) {
-			return fail("declared_path_has_owner_edits", "preflight");
-		}
-		const initialFingerprint = fileFingerprint(
-			options.projectPath,
-			options.files,
-		);
 		baseRevision = requireGit(
 			options.projectPath,
 			["rev-parse", "HEAD"],
 			"project_revision_unavailable",
 		).trim();
+		const baselinePaths = [...options.files, ...(options.readOnlyInputs ?? [])];
+		if (options.dirtyOverlay) {
+			try {
+				dirtyOverlayReceipt = captureDirtyOverlay(
+					options.projectPath,
+					baselinePaths,
+					{
+						allowUnrelated: true,
+						maxFileBytes: MAX_CAPTURE_BYTES,
+						enforceTarPathLimit: false,
+						secretPaths: SECRET_PATHS,
+					},
+				);
+				dirtyBaseline = makeDirtyBaseline({
+					taskId,
+					baseRevision,
+					projectPath: options.projectPath,
+					files: options.files,
+					inputs: options.readOnlyInputs ?? [],
+					receipt: dirtyOverlayReceipt,
+				});
+			} catch (error) {
+				preflightDetail = dirtyOverlayFailure(error, {
+					taskId,
+					baseRevision,
+					files: options.files,
+					inputs: options.readOnlyInputs ?? [],
+				});
+				return fail(preflightDetail.code, "preflight");
+			}
+		} else if (!declaredPathsAreClean(options.projectPath, options.files)) {
+			return fail("declared_path_has_owner_edits", "preflight");
+		}
+		const initialFingerprint = fileFingerprint(
+			options.projectPath,
+			options.dirtyOverlay ? baselinePaths : options.files,
+		);
 
 		currentPhase = "route";
 		emitStatus(onStatus, taskId, "route");
@@ -824,8 +1027,53 @@ export async function runSimpleTask(options, dependencies = {}) {
 			"workspace_checkout_failed",
 			{ timeout: deadlineTimeout(options.deadlineMs, now) },
 		);
+		worktreeBaseRevision = baseRevision;
+		if (dirtyOverlayReceipt) {
+			materializeDirtyOverlay(worktreePath, dirtyOverlayReceipt, {
+				maxFileBytes: MAX_CAPTURE_BYTES,
+				secretPaths: SECRET_PATHS,
+			});
+			requireGit(
+				worktreePath,
+				["add", "-A", "--", ...baselinePaths],
+				"dirty_overlay_stage_failed",
+				{ timeout: deadlineTimeout(options.deadlineMs, now) },
+			);
+			const overlayDiff = git(worktreePath, ["diff", "--cached", "--quiet"], {
+				timeout: deadlineTimeout(options.deadlineMs, now),
+			});
+			if (overlayDiff.status === 1) {
+				requireGit(
+					worktreePath,
+					[
+						"-c",
+						"user.name=switchyard",
+						"-c",
+						"user.email=switchyard@localhost",
+						"commit",
+						"-qm",
+						"switchyard-dirty-overlay",
+					],
+					"dirty_overlay_baseline_failed",
+					{ timeout: deadlineTimeout(options.deadlineMs, now) },
+				);
+			} else if (overlayDiff.status !== 0) {
+				throw Object.assign(new Error("dirty_overlay_baseline_failed"), {
+					code: "dirty_overlay_baseline_failed",
+				});
+			}
+			worktreeBaseRevision = requireGit(
+				worktreePath,
+				["rev-parse", "HEAD"],
+				"dirty_overlay_baseline_revision_unavailable",
+				{ timeout: deadlineTimeout(options.deadlineMs, now) },
+			).trim();
+		}
 
-		const guardedPrompt = `${readFileSync(options.promptPath, "utf8")}\n\nWork only in the current disposable checkout. Change only these declared files: ${options.files.join(", ")}. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
+		const readOnlyNotice = (options.readOnlyInputs ?? []).length
+			? ` Read-only input paths (do not modify): ${(options.readOnlyInputs ?? []).join(", ")}.`
+			: "";
+		const guardedPrompt = `${readFileSync(options.promptPath, "utf8")}\n\nWork only in the current disposable checkout. Change only these writable files: ${options.files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
 		const harness = normalizeProviderName(identity.harnessKey);
 		currentPhase = "execute";
 		emitStatus(onStatus, taskId, "execute");
@@ -842,6 +1090,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 			timeoutMs: executionBudget,
 			onProgress: () => emitStatus(onStatus, taskId, "execute"),
 		});
+		providerLifecycle = boundProviderLifecycleSnapshot(
+			providerResult?.providerLifecycle,
+		);
 		writerLifecycle = aggregateWriterLifecycle(
 			"never_started",
 			providerResult?.writerLifecycle,
@@ -851,7 +1102,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			if (remainingMs(options.deadlineMs, now) > 0) {
 				const captured = captureWorktreeDiff(
 					worktreePath,
-					baseRevision,
+					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
 				);
@@ -870,7 +1121,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		currentPhase = "diff";
 		const captured = captureWorktreeDiff(
 			worktreePath,
-			baseRevision,
+			worktreeBaseRevision,
 			options.deadlineMs,
 			now,
 		);
@@ -881,7 +1132,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 		);
 		if (undeclared.length > 0) {
 			keepWorktree = true;
-			return fail("undeclared_paths_changed", "diff");
+			return fail(
+				(options.readOnlyInputs ?? []).some((path) => undeclared.includes(path))
+					? "read_only_input_changed"
+					: "undeclared_paths_changed",
+				"diff",
+			);
 		}
 		const validated = validateDiff(captured.diff, options.projectPath);
 		if (!validated.safe || validated.requiresReview) {
@@ -936,7 +1192,41 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		currentPhase = "integrate";
 		if (
-			fileFingerprint(options.projectPath, options.files) !== initialFingerprint
+			requireGit(
+				options.projectPath,
+				["rev-parse", "HEAD"],
+				"project_revision_unavailable",
+				{ timeout: deadlineTimeout(options.deadlineMs, now) },
+			).trim() !== baseRevision
+		) {
+			keepWorktree = true;
+			return fail("project_head_changed_concurrently", "integrate");
+		}
+		if (dirtyOverlayReceipt) {
+			const checked = validateDirtyOverlayReceipt(
+				options.projectPath,
+				dirtyOverlayReceipt,
+				baselinePaths,
+				{
+					allowUnrelated: true,
+					maxFileBytes: MAX_CAPTURE_BYTES,
+					enforceTarPathLimit: false,
+					secretPaths: SECRET_PATHS,
+				},
+			);
+			if (
+				!checked.ok ||
+				checked.receiptHash !== dirtyOverlayReceipt.receiptHash
+			) {
+				keepWorktree = true;
+				return fail("dirty_overlay_drift", "integrate");
+			}
+		}
+		if (
+			fileFingerprint(
+				options.projectPath,
+				options.dirtyOverlay ? baselinePaths : options.files,
+			) !== initialFingerprint
 		) {
 			keepWorktree = true;
 			return fail("declared_path_changed_concurrently", "integrate");
@@ -989,6 +1279,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 			targetId,
 			changedFiles,
 			checks,
+			dirtyBaseline,
+			providerLifecycle,
 		});
 		return finalResult;
 	} catch (error) {
@@ -1044,6 +1336,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					attemptId,
 					baseRevision,
 					files: options.files,
+					...(dirtyBaseline ? { dirtyBaseline } : {}),
 					checks: options.checks,
 				}),
 				result: finalResult,

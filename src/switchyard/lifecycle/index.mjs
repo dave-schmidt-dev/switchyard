@@ -82,10 +82,14 @@ function normalizeOverlayPath(projectPath, value) {
 	return normalized;
 }
 
-function assertOverlayPathSafe(projectPath, path) {
-	if (Buffer.byteLength(path, "utf8") > 100)
+function assertOverlayPathSafe(
+	projectPath,
+	path,
+	{ enforceTarPathLimit = true, secretPaths = DIRTY_OVERLAY_SECRET_PATHS } = {},
+) {
+	if (enforceTarPathLimit && Buffer.byteLength(path, "utf8") > 100)
 		throw new Error(`dirty overlay path exceeds tar name limit: ${path}`);
-	if (DIRTY_OVERLAY_SECRET_PATHS.some((pattern) => pattern.test(path))) {
+	if (secretPaths.some((pattern) => pattern.test(path))) {
 		throw new Error(`dirty overlay rejects secret-shaped path: ${path}`);
 	}
 	let prefix = resolve(projectPath);
@@ -188,7 +192,13 @@ function assertReceiptParentSafe(receiptPath) {
 export function captureDirtyOverlay(
 	projectPath,
 	paths,
-	{ hostFingerprint = null } = {},
+	{
+		hostFingerprint = null,
+		allowUnrelated = false,
+		maxFileBytes = DIRTY_OVERLAY_MAX_FILE_BYTES,
+		enforceTarPathLimit = true,
+		secretPaths = DIRTY_OVERLAY_SECRET_PATHS,
+	} = {},
 ) {
 	if (!Array.isArray(paths) || paths.length === 0)
 		throw new Error("dirty overlay requires at least one declared path");
@@ -202,22 +212,32 @@ export function captureDirtyOverlay(
 	const declared = new Set(normalized);
 	for (const changed of status) {
 		const candidate = changed.replace(/^\?\?\s+/u, "").replace(/^..\s+/u, "");
-		if (!declared.has(candidate))
+		if (!allowUnrelated && !declared.has(candidate))
 			throw new Error(
 				`dirty overlay rejects out-of-scope or untracked path: ${candidate}`,
 			);
 	}
 	const entries = normalized.map((path) => {
-		assertOverlayPathSafe(projectPath, path);
+		assertOverlayPathSafe(projectPath, path, {
+			enforceTarPathLimit,
+			secretPaths,
+		});
 		if (!trackedPath(projectPath, path))
 			throw new Error(`dirty overlay rejects untracked path: ${path}`);
 		if (ignoredPath(projectPath, path))
 			throw new Error(`dirty overlay rejects ignored path: ${path}`);
 		const target = resolve(projectPath, path);
-		const stats = lstatSync(target);
+		let stats;
+		try {
+			stats = lstatSync(target);
+		} catch (error) {
+			if (error?.code === "ENOENT")
+				throw new Error(`dirty overlay rejects deleted path: ${path}`);
+			throw error;
+		}
 		if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1)
 			throw new Error(`dirty overlay requires one regular file: ${path}`);
-		if (stats.size > DIRTY_OVERLAY_MAX_FILE_BYTES)
+		if (stats.size > maxFileBytes)
 			throw new Error(`dirty overlay file is too large: ${path}`);
 		const bytes = readFileSync(target);
 		const afterRead = lstatSync(target);
@@ -252,6 +272,12 @@ export function validateDirtyOverlayReceipt(
 	projectPath,
 	receipt,
 	expectedPaths = null,
+	{
+		allowUnrelated = false,
+		maxFileBytes = DIRTY_OVERLAY_MAX_FILE_BYTES,
+		enforceTarPathLimit = true,
+		secretPaths = DIRTY_OVERLAY_SECRET_PATHS,
+	} = {},
 ) {
 	if (
 		!receipt ||
@@ -268,7 +294,7 @@ export function validateDirtyOverlayReceipt(
 				typeof entry.path !== "string" ||
 				!Number.isInteger(entry.size) ||
 				entry.size < 0 ||
-				entry.size > DIRTY_OVERLAY_MAX_FILE_BYTES ||
+				entry.size > maxFileBytes ||
 				!/^[0-7]+$/.test(String(entry.mode)) ||
 				!/^[a-f0-9]{64}$/u.test(entry.sha256 ?? "") ||
 				typeof entry.bytes !== "string",
@@ -298,11 +324,17 @@ export function validateDirtyOverlayReceipt(
 		if (receipt.hostFingerprint !== overlayFingerprint(projectPath))
 			return { ok: false, reason: "dirty_overlay_host_drift" };
 		for (const changed of currentStatus) {
-			if (!receipt.paths.some((entry) => entry.path === changed))
+			if (
+				!allowUnrelated &&
+				!receipt.paths.some((entry) => entry.path === changed)
+			)
 				return { ok: false, reason: "dirty_overlay_scope_mismatch" };
 		}
 		for (const entry of receipt.paths) {
-			assertOverlayPathSafe(projectPath, entry.path);
+			assertOverlayPathSafe(projectPath, entry.path, {
+				enforceTarPathLimit,
+				secretPaths,
+			});
 			if (!trackedPath(projectPath, entry.path))
 				return { ok: false, reason: "dirty_overlay_untracked" };
 			if (ignoredPath(projectPath, entry.path))
@@ -380,6 +412,45 @@ export function readDirtyOverlayReceipt(receiptPath) {
 	if (stats.size > DIRTY_OVERLAY_MAX_FILE_BYTES * 2)
 		throw new Error("dirty overlay receipt is too large");
 	return JSON.parse(readFileSync(receiptPath, "utf8"));
+}
+
+/**
+ * Materialize an already validated receipt into a disposable local checkout.
+ * This is deliberately separate from the legacy tar transport: simple keeps
+ * the receipt's exact bytes while avoiding the legacy 100-byte tar-name cap.
+ */
+export function materializeDirtyOverlay(
+	worktreePath,
+	receipt,
+	{
+		maxFileBytes = DIRTY_OVERLAY_MAX_FILE_BYTES,
+		secretPaths = DIRTY_OVERLAY_SECRET_PATHS,
+	} = {},
+) {
+	if (typeof worktreePath !== "string" || !worktreePath)
+		throw new TypeError("dirty overlay worktree path is required");
+	if (!receipt || !Array.isArray(receipt.paths))
+		throw new TypeError("dirty overlay receipt is required");
+	const root = realpathSync(worktreePath);
+	for (const entry of receipt.paths) {
+		const path = normalizeOverlayPath(root, entry.path);
+		assertOverlayPathSafe(root, path, {
+			enforceTarPathLimit: false,
+			secretPaths,
+		});
+		if (entry.size > maxFileBytes)
+			throw new Error(`dirty overlay file is too large: ${path}`);
+		const target = resolve(root, path);
+		const parent = dirname(target);
+		mkdirSync(parent, { recursive: true, mode: 0o755 });
+		const parentStats = lstatSync(parent);
+		if (!parentStats.isDirectory() || parentStats.isSymbolicLink())
+			throw new Error(`dirty overlay rejects symlink parent: ${path}`);
+		const bytes = Buffer.from(entry.bytes, "base64");
+		writeFileSync(target, bytes, { encoding: null, mode: entry.mode });
+		chmodSync(target, entry.mode & 0o777);
+	}
+	return root;
 }
 
 function tarField(value, length) {
