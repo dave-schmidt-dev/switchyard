@@ -29,7 +29,7 @@ import {
 const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
 
 // Gradus provider display names -- verified live (M12) against
-// ~/Documents/Projects/gradus/.state/snapshot-v2.json, first on 2026-07-30
+// ~/Library/Application Support/Gradus/Installed/snapshot-v2.json, first on 2026-07-30
 // (brief §5 / tasks.md Task 1.5b) and re-verified 2026-08-14 when gradus
 // added the Spark bucket. Committed here instead of read live so this
 // test is deterministic and doesn't depend on gradus's on-disk snapshot

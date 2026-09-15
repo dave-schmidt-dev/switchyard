@@ -163,17 +163,23 @@ describe("harness registry drift (Task 1.6b)", () => {
 		"sha256:27fdd3ad8fd8ce6f1eb8478848f09956d84c432787db2c4609fcd9bef74c274b",
 	];
 
-	it("vibe is enabled with its VM clone and bounded qualifier policy", () => {
+	it("vibe keeps its accounting identity while using the direct Vibe harness", () => {
 		ok("vibe" in targets, "expected a vibe target entry");
 		strictEqual(targets.vibe?.enabled, true);
 		strictEqual(targets.vibe?.harness, "vibe");
 		strictEqual(targets.vibe?.snapshot_name, "Vibe");
 		strictEqual(targets.vibe?.technical_ceiling, "standard");
 		deepStrictEqual(targets.vibe?.slots?.low, [
-			{ model_ref: vibeLowModelRef, priority: 1 },
+			{
+				model_ref: vibeLowModelRef,
+				priority: 1,
+			},
 		]);
 		deepStrictEqual(targets.vibe?.slots?.standard, [
-			{ model_ref: vibeModelRef, priority: 1 },
+			{
+				model_ref: vibeModelRef,
+				priority: 1,
+			},
 		]);
 		ok(
 			roster.models?.[vibeLowModelRef],
@@ -202,12 +208,12 @@ describe("harness registry drift (Task 1.6b)", () => {
 		const expectedDescriptor = getInvocationDescriptor("vibe", "standard");
 		if (expectedDescriptor === null) {
 			// The slot selector must still carry an explicit, honest record.
-			// Host-side `roster smoke` writes `qualified` (the wrapper ran and
-			// produced parseable output); `untested` is the bare intent record.
-			// Both are fail-closed -- only `dispatch_qualified`, which a real VM
+			// Host-side `roster smoke` writes `qualified` or
+			// `failed_qualification`; `untested` is the bare intent record. All
+			// three are fail-closed -- only `dispatch_qualified`, which a real VM
 			// canary writes, authorizes routing.
 			ok(
-				["untested", "qualified"].includes(
+				["untested", "qualified", "failed_qualification"].includes(
 					vibeQualifications[vibeSelector]?.status,
 				),
 				`pre-promotion Vibe state must retain an explicit non-dispatch record for ${vibeSelector}`,
@@ -235,6 +241,14 @@ describe("harness registry drift (Task 1.6b)", () => {
 			qualification,
 			"current Vibe descriptor must have a qualification record",
 		);
+		if (qualification.status === "failed_qualification") {
+			strictEqual(
+				qualification.descriptor_identity,
+				expectedDescriptor.descriptor_identity,
+				"a failed current Vibe receipt must still be bound to its descriptor",
+			);
+			return;
+		}
 		strictEqual(
 			qualification.status,
 			"dispatch_qualified",
@@ -290,11 +304,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 				null,
 				"vibe promotion receipt effort must be null",
 			);
-			strictEqual(
-				qualification.promotion_receipt?.variant,
-				null,
-				"vibe promotion receipt variant must be null",
-			);
+			strictEqual(qualification.promotion_receipt?.variant, null);
 			deepStrictEqual(
 				qualification.promotion_receipt?.invocation_args,
 				expectedDescriptor.invocation_args,
@@ -330,7 +340,9 @@ describe("harness registry drift (Task 1.6b)", () => {
 		const qualifications = targets.vibe?.qualifications ?? {};
 		if (descriptor === null) {
 			ok(
-				["untested", "qualified"].includes(qualifications[lowSelector]?.status),
+				["untested", "qualified", "failed_qualification"].includes(
+					qualifications[lowSelector]?.status,
+				),
 				`pre-promotion Vibe low state must retain an explicit non-dispatch record for ${lowSelector}`,
 			);
 			return;
@@ -344,6 +356,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 		strictEqual(qualification.status, "dispatch_qualified");
 		strictEqual(qualification.model_ref, vibeLowModelRef);
 		strictEqual(qualification.selector, lowSelector);
+		strictEqual(qualification.variant, null);
 		strictEqual(qualification.promotion_receipt?.status, "promoted");
 		strictEqual(
 			qualification.promotion_receipt?.descriptor_identity,
@@ -356,7 +369,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	it("README keeps the 2026-09-01 Vibe receipt historical and the 2026-09-04 GLM receipts current", () => {
+	it("README documents direct Vibe admission and retains OpenCode failures as historical", () => {
 		const readme = readFileSync(README_PATH, "utf8");
 		ok(
 			readme.includes(
@@ -365,10 +378,12 @@ describe("harness registry drift (Task 1.6b)", () => {
 			"README must identify the 2026-09-01 mistral-medium-3.5 receipt as historical context",
 		);
 		ok(
-			readme.includes(
-				"The 2026-09-01 Vibe `mistral-medium-3.5` receipt is historical only; the current Vibe admission receipts are the 2026-09-04 promoted GLM-5.2 `low` and `standard` receipts",
-			),
-			"README must identify the promoted 2026-09-04 GLM-5.2 low and standard receipts as current",
+			readme.includes("Vibe's direct-CLI GLM receipts"),
+			"README must identify direct Vibe receipts",
+		);
+		ok(
+			readme.includes("OpenCode Mistral GLM-5.2 status"),
+			"README must retain the failed OpenCode qualification as historical context",
 		);
 	});
 

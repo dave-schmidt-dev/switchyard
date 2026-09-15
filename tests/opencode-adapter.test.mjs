@@ -112,6 +112,49 @@ describe("opencode adapter container execution", () => {
 		ok(request.prompt.includes("bridge prompt"));
 	});
 
+	it("accepts a Vibe-owned Mistral GLM descriptor without inheriting the opencode-go target", () => {
+		let request = null;
+		const bridgeBackend = {
+			ephemeralOpenCodeKeyExecution(workspaceId, candidate) {
+				request = { workspaceId, ...candidate };
+				return {
+					command: process.execPath,
+					args: ["-e", 'process.stdout.write("mistral-bridge-ran")'],
+					input: "",
+				};
+			},
+		};
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "vibe",
+				model_ref: "mistral/zai-glm-5-2",
+				selector: "mistral/zai-glm-5-2",
+				effort: null,
+				variant: "max",
+				invocation_args: ["--variant", "max"],
+			},
+			"opencode",
+		);
+
+		const result = executeOpencode(
+			"bridge prompt",
+			"33333333-3333-4333-8333-333333333333",
+			{
+				model: descriptor.selector,
+				resolvedTargetId: descriptor.target_id,
+				descriptorHarness: "opencode",
+				invocationDescriptor: descriptor,
+				descriptorIdentity: descriptor.descriptor_identity,
+				executionBackend: bridgeBackend,
+			},
+		);
+
+		strictEqual(result.success, true);
+		strictEqual(result.output, "mistral-bridge-ran");
+		strictEqual(request.model, "mistral/zai-glm-5-2");
+		strictEqual(request.invocationArgs.join(" "), "--variant max");
+	});
+
 	before(() => {
 		if (!dockerAvailable) return;
 

@@ -124,7 +124,7 @@ function guestText(args) {
 // src/switchyard/router/index.mjs). This file and tests/runner.test.mjs both
 // exercise the real snapshot loader, and `node --test` runs test files
 // concurrently as separate processes -- both used to read/write/rm the SAME
-// real on-disk SNAPSHOT_PATH (the host-side gradus snapshot), which raced.
+// real on-disk SNAPSHOT_PATH (the installed Gradus snapshot), which raced.
 // The suffix is unique per test run (not a fixed test-only name), so this
 // file never collides with another isolated run either.
 const SNAPSHOT_PATH = join(
@@ -1432,7 +1432,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 	});
 
 	it("--exclude-provider still excludes when the live snapshot uses title-cased provider names (regression)", () => {
-		// The real production snapshot (gradus/.state/snapshot-v2.json) stores
+		// The real production snapshot (Gradus/Installed/snapshot-v2.json) stores
 		// provider.name title-cased ("Claude", "Antigravity", ...), not the
 		// lowercase harness key ("claude", "agy") documented for
 		// --exclude-provider and used everywhere else in this file's fixtures.

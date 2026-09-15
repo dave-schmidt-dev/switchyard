@@ -411,6 +411,91 @@ test("production async broker forwards adapter status and heartbeats", async () 
 	strictEqual(heartbeats[0].processPhase, "provider_transport_running");
 });
 
+test("qualification attempt reserves the configured Vibe descriptor without an automatic receipt", async () => {
+	const root = await tempDirAsync("switchyard-broker-qualification-attempt-");
+	const tasksFilePath = join(root, "TASKS.md");
+	const checkpointPath = join(root, "checkpoint.json");
+	const requalificationRosterPath = join(
+		tmpdir(),
+		`switchyard-runner-broker-requalification-roster-${process.pid}-${randomUUID()}.json`,
+	);
+	const requalificationRoster = JSON.parse(
+		readFileSync(qualifiedRosterPath, "utf8"),
+	);
+	requalificationRoster.targets.vibe.enabled = true;
+	delete requalificationRoster.targets.vibe.disabled_reason;
+	requalificationRoster.targets.vibe.qualifications = {};
+	writeFileSync(
+		requalificationRosterPath,
+		JSON.stringify(requalificationRoster),
+		"utf8",
+	);
+	process.env.SWITCHYARD_ROSTER_PATH = requalificationRosterPath;
+	__resetRosterCacheForTests();
+	await writeFile(
+		tasksFilePath,
+		"### Task 1.1: Requalify Vibe\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** standard\n- **Description:** exercise the explicitly authorized descriptor path\n",
+	);
+	const observed = [];
+	try {
+		const runAttempt = (qualificationAttempt) =>
+			runQueueAsync({
+				tasksFilePath,
+				projectPath: root,
+				workingContainerName: "broker-qualification-attempt-worker",
+				checkpointPath: qualificationAttempt
+					? checkpointPath
+					: join(root, "ordinary-checkpoint.json"),
+				only: ["Vibe"],
+				maxTasks: 1,
+				qualificationAttempt,
+				dependencies: {
+					queuePreflight: () => ({ ok: true, eligible: true }),
+					route: () => ({
+						provider: "Vibe",
+						resolvedTargetId: "vibe",
+						resolved_harness: "vibe",
+						model: "fixture-vibe-standard",
+						reason: "qualification_attempt",
+					}),
+					resolveTargetIdentity: () => ({
+						targetId: "vibe",
+						harnessKey: "vibe",
+						ambiguous: false,
+					}),
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					adapters: {
+						vibe: {
+							executeAsync: async (_prompt, _container, options) => {
+								observed.push(options.invocationDescriptor);
+								return REVIEW_SUCCESS;
+							},
+							captureDiffAsync: async () => null,
+						},
+					},
+				},
+			});
+		const ordinary = await runAttempt(false);
+		strictEqual(ordinary.results[0].success, false);
+		strictEqual(observed.length, 0);
+
+		const result = await runAttempt(true);
+		strictEqual(
+			result.results[0].success,
+			true,
+			JSON.stringify(result.results[0]),
+		);
+		strictEqual(observed.length, 1);
+		strictEqual(observed[0].target_id, "vibe");
+		strictEqual(observed[0].selector, "fixture-vibe-standard");
+	} finally {
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedRosterPath;
+		__resetRosterCacheForTests();
+		rmSync(requalificationRosterPath, { force: true });
+	}
+});
+
 test("production async runner drains a dependency chain in one bounded run", async () => {
 	const root = await tempDirAsync("switchyard-production-broker-chain-");
 	const tasksFilePath = join(root, "TASKS.md");

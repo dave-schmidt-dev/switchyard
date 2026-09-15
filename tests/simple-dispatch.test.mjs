@@ -246,6 +246,84 @@ describe("simple dispatch argument boundary", () => {
 		strictEqual(parsed.deadlineMs, 600_000);
 	});
 
+	it("accepts one supported provider pin and rejects ambiguous or unsupported pins", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"standard",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+			"--deadline",
+			"1970-01-01T00:10:00Z",
+		];
+		strictEqual(
+			parseSimpleArgs([...base, "--only-provider", "antigravity-claude"], {
+				now: () => 1_000,
+			}).onlyProviders[0],
+			"antigravity-claude",
+		);
+		strictEqual(
+			parseSimpleArgs([...base, "--only-provider", "cursor"], {
+				now: () => 1_000,
+			}).onlyProviders[0],
+			"cursor",
+		);
+		for (const pin of ["antigravity-claude, codex", "agy"]) {
+			throws(() =>
+				parseSimpleArgs([...base, "--only-provider", pin], {
+					now: () => 1_000,
+				}),
+			);
+		}
+		throws(() =>
+			parseSimpleArgs(
+				[
+					...base,
+					"--only-provider",
+					"codex",
+					"--only-provider",
+					"antigravity-claude",
+				],
+				{ now: () => 1_000 },
+			),
+		);
+	});
+
+	it("pins the local Antigravity invocation to Claude Sonnet with bounded-safe flags", () => {
+		const invocation = buildSimpleProviderInvocation(
+			"agy",
+			{ selector: "claude-sonnet-4-6" },
+			"work",
+			"/tmp/worktree",
+		);
+		strictEqual(invocation.command, "agy");
+		deepStrictEqual(invocation.args, [
+			"-p",
+			"work",
+			"--model",
+			"claude-sonnet-4-6",
+			"--mode=accept-edits",
+			"--sandbox",
+			"--output-format",
+			"json",
+			"--print-timeout",
+			"30m",
+		]);
+		throws(() =>
+			buildSimpleProviderInvocation(
+				"agy",
+				{ selector: "other" },
+				"work",
+				"/tmp/worktree",
+			),
+		);
+	});
+
 	it("rejects credential-shaped and escaping file declarations", () => {
 		const repo = makeRepo();
 		for (const path of [

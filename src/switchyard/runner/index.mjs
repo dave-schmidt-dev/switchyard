@@ -144,6 +144,7 @@ import {
 } from "../outcome/transitions.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import {
+	getConfiguredInvocationDescriptor,
 	getInvocationDescriptor,
 	normalizeProviderName,
 	resolveRouteProvenance,
@@ -297,6 +298,9 @@ export function normalizeRunOptions(options = {}) {
 							? options.dirtyOverlayReceiptHash
 							: null,
 				}
+			: {}),
+		...(options.qualificationAttempt === true
+			? { qualificationAttempt: true }
 			: {}),
 	};
 }
@@ -1945,6 +1949,9 @@ export function validateCallerInputs(options = {}) {
 			options.excludeProviders,
 		taskIds: selection,
 		platform: options.runOptions?.platform ?? options.platform,
+		qualificationAttempt:
+			options.runOptions?.qualificationAttempt === true ||
+			options.qualificationAttempt === true,
 		...(dirtyOverlay
 			? {
 					dirtyOverlay: true,
@@ -6403,6 +6410,9 @@ function executeTaskUnsafe(task, context) {
 				...(context.onHealthDecision
 					? { onHealthDecision: context.onHealthDecision }
 					: {}),
+				...(context.qualificationAttempt
+					? { hasInvocationDescriptor: context.hasInvocationDescriptor }
+					: {}),
 			});
 
 	// Provenance (Task 1.6, M7/M8): resolve the six roster-provenance fields
@@ -6422,7 +6432,10 @@ function executeTaskUnsafe(task, context) {
 			: descriptorFromRoute(
 					routeResult,
 					requiredCapability,
-					context.resolveDescriptor ?? getInvocationDescriptor,
+					context.resolveDescriptor ??
+						(context.qualificationAttempt
+							? getConfiguredInvocationDescriptor
+							: getInvocationDescriptor),
 				);
 	} catch {
 		try {
@@ -7456,7 +7469,10 @@ async function executeTaskAsyncUnsafe(task, context) {
 		invocationDescriptor = descriptorFromRoute(
 			routeResult,
 			routeCapability,
-			context.resolveDescriptor ?? getInvocationDescriptor,
+			context.resolveDescriptor ??
+				(context.qualificationAttempt
+					? getConfiguredInvocationDescriptor
+					: getInvocationDescriptor),
 		);
 	} catch {
 		await releaseSelected(selectedRoute);
@@ -8623,6 +8639,14 @@ export async function runQueueAsync(options) {
 		signal: dependencies.signal,
 		onPoll: dependencies.onPoll,
 		resolveDescriptor: dependencies.resolveDescriptor,
+		qualificationAttempt:
+			runOptions?.qualificationAttempt === true ||
+			options.qualificationAttempt === true,
+		hasInvocationDescriptor:
+			runOptions?.qualificationAttempt === true ||
+			options.qualificationAttempt === true
+				? getConfiguredInvocationDescriptor
+				: undefined,
 		runId: queueBackend.taskBaseRunId ?? runId,
 		snapshotSource: dependencies.snapshotSource ?? "gradus-v2",
 		completionContinuation: dependencies.completionContinuation ?? {
@@ -9216,6 +9240,9 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 		...(context.onHealthDecision
 			? { onHealthDecision: context.onHealthDecision }
 			: {}),
+		...(context.qualificationAttempt
+			? { hasInvocationDescriptor: context.hasInvocationDescriptor }
+			: {}),
 	});
 
 	// Provenance (Task 1.6, M7/M8) — same treatment as executeTask: resolve the
@@ -9231,7 +9258,10 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 		invocationDescriptor = descriptorFromRoute(
 			routeResult,
 			requiredCapability,
-			context.resolveDescriptor ?? getInvocationDescriptor,
+			context.resolveDescriptor ??
+				(context.qualificationAttempt
+					? getConfiguredInvocationDescriptor
+					: getInvocationDescriptor),
 		);
 	} catch {
 		try {
@@ -10461,6 +10491,9 @@ function createDispatchBroker(context, dependencies = {}) {
 				...(goldenImageVerifiedProviders !== undefined
 					? { goldenImageVerifiedProviders }
 					: {}),
+				...(context.qualificationAttempt
+					? { hasInvocationDescriptor: context.hasInvocationDescriptor }
+					: {}),
 				...(context.healthDecision
 					? { healthDecision: context.healthDecision }
 					: {}),
@@ -10470,7 +10503,10 @@ function createDispatchBroker(context, dependencies = {}) {
 			}),
 		resolveTargetIdentity: brokerResolveTargetIdentity,
 		getInvocationDescriptor:
-			context.resolveDescriptor ?? getInvocationDescriptor,
+			context.resolveDescriptor ??
+			(context.qualificationAttempt
+				? getConfiguredInvocationDescriptor
+				: getInvocationDescriptor),
 		reservations: dependencies.brokerReservations,
 		reservationOptions: dependencies.brokerReservationOptions ?? {
 			root: projectLedgerRoot,
@@ -10906,6 +10942,9 @@ function createDefaultQueuePreflight({ selectedPlatform, dependencies }) {
 			...(dependencies.onHealthDecision
 				? { onHealthDecision: dependencies.onHealthDecision }
 				: {}),
+			...(dependencies.qualificationAttempt === true
+				? { hasInvocationDescriptor: getConfiguredInvocationDescriptor }
+				: {}),
 		});
 		if (!result.ok)
 			throw new QueuePreflightError(
@@ -11026,7 +11065,10 @@ export function createQueueBackend({
 	const selectedPlatform = normalizeQueuePlatform(platform);
 	const defaultQueuePreflight = createDefaultQueuePreflight({
 		selectedPlatform,
-		dependencies,
+		dependencies: {
+			...dependencies,
+			qualificationAttempt: runOptions?.qualificationAttempt === true,
+		},
 	});
 	const configuredQueuePreflight =
 		dependencies.queuePreflight ?? defaultQueuePreflight;

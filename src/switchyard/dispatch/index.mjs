@@ -360,6 +360,7 @@ function parseDispatchArgs(argv) {
 				"health-state-root": { type: "string" },
 				platform: { type: "string" },
 				"dirty-overlay": { type: "boolean", default: false },
+				"qualification-attempt": { type: "boolean", default: false },
 				json: { type: "boolean", default: false },
 				help: { type: "boolean", default: false },
 			},
@@ -429,6 +430,19 @@ function parseDispatchArgs(argv) {
 			"--only-provider/--provider and --exclude-provider are mutually exclusive",
 		);
 	}
+	if (values["qualification-attempt"] === true) {
+		if (onlyProviders.length !== 1 || (values["task-id"] ?? []).length !== 1) {
+			throw new UsageError(
+				"--qualification-attempt requires exactly one --only-provider and one --task-id",
+			);
+		}
+		if (values["max-tasks"] !== undefined && maxTasks !== 1) {
+			throw new UsageError(
+				"--qualification-attempt requires --max-tasks 1 when supplied",
+			);
+		}
+		maxTasks = 1;
+	}
 
 	return {
 		help: false,
@@ -442,6 +456,7 @@ function parseDispatchArgs(argv) {
 		taskIds: values["task-id"] ?? [],
 		platform,
 		dirtyOverlay: values["dirty-overlay"] === true,
+		qualificationAttempt: values["qualification-attempt"] === true,
 		json: values.json,
 		healthMode: values["health-enforce"] ? "enforce" : "shadow",
 		healthStateRoot: values["health-state-root"]
@@ -1484,6 +1499,7 @@ function prepareRunIdentity(opts) {
 		taskIds: opts.taskIds,
 		platform: opts.platform,
 		dirtyOverlay: opts.dirtyOverlay,
+		qualificationAttempt: opts.qualificationAttempt,
 		dirtyOverlayReceiptPath: opts.dirtyOverlayReceiptPath,
 		dirtyOverlayReceiptHash: opts.dirtyOverlayReceiptPath
 			? readDirtyOverlayReceipt(opts.dirtyOverlayReceiptPath).receiptHash

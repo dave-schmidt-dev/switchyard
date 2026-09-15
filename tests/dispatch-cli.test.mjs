@@ -393,6 +393,40 @@ describe("parseDispatchArgs (backwards compat)", () => {
 		deepStrictEqual(opts.taskIds, ["1.2", "2.1"]);
 	});
 
+	it("bounds a qualification attempt to one selected provider and task", () => {
+		const opts = parseDispatchArgs([
+			tasksFile,
+			"--project",
+			projectDir,
+			"--qualification-attempt",
+			"--only-provider",
+			"vibe",
+			"--task-id",
+			"1.1",
+		]);
+		strictEqual(opts.qualificationAttempt, true);
+		strictEqual(opts.maxTasks, 1);
+	});
+
+	it("rejects an unscoped qualification attempt before provider allocation", () => {
+		strictEqual(
+			(() => {
+				try {
+					parseDispatchArgs([
+						tasksFile,
+						"--project",
+						projectDir,
+						"--qualification-attempt",
+					]);
+					return false;
+				} catch (error) {
+					return error.message.includes("exactly one --only-provider");
+				}
+			})(),
+			true,
+		);
+	});
+
 	it("throws a UsageError when --only-provider and --exclude-provider are combined", () => {
 		strictEqual(
 			(() => {

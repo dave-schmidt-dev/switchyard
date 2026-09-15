@@ -36,7 +36,7 @@ import {
 	releaseProjectLockIfOwnedBy,
 } from "../run-store/index.mjs";
 
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] --check <command> --deadline <RFC3339> [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -49,7 +49,20 @@ const MAX_DECLARED_FILES = 64;
 const MAX_CHECKS = 16;
 const MAX_PATH_CHARS = 1024;
 const MAX_CHECK_CHARS = 8192;
-const SIMPLE_PROVIDERS = Object.freeze(["codex"]);
+// A pin is a routing contract, not an adapter promise. Every known target may
+// be selected explicitly; targets without a local adapter fail closed at the
+// adapter boundary instead of silently falling back to Codex.
+const SIMPLE_PROVIDERS = Object.freeze([
+	"claude-code",
+	"codex",
+	"codex-spark",
+	"antigravity",
+	"antigravity-claude",
+	"cursor",
+	"opencode-go",
+	"vibe",
+	"copilot",
+]);
 const CAPABILITIES = new Set(["low", "standard", "high"]);
 const SECRET_PATHS = [
 	/(^|\/)\.env(?:\.|$)/iu,
@@ -184,6 +197,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				file: { type: "string", multiple: true },
 				input: { type: "string", multiple: true },
 				"dirty-overlay": { type: "boolean", default: false },
+				"only-provider": { type: "string", multiple: true },
 				check: { type: "string", multiple: true },
 				deadline: { type: "string" },
 				json: { type: "boolean", default: false },
@@ -228,6 +242,17 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 	const capability = String(parsed.values.capability ?? "").toLowerCase();
 	if (!CAPABILITIES.has(capability)) {
 		throw new SimpleUsageError("--capability must be low, standard, or high");
+	}
+	const onlyProviders = parsed.values["only-provider"] ?? [];
+	if (
+		onlyProviders.length > 1 ||
+		(onlyProviders.length === 1 &&
+			(!SIMPLE_PROVIDERS.includes(onlyProviders[0]) ||
+				onlyProviders[0].includes(",")))
+	) {
+		throw new SimpleUsageError(
+			"--only-provider must name exactly one supported simple provider",
+		);
 	}
 	const files = (parsed.values.file ?? []).map((path) =>
 		normalizeDeclaredPath(canonicalProjectPath, path),
@@ -281,6 +306,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		promptPath,
 		projectPath: canonicalProjectPath,
 		capability,
+		onlyProviders,
 		files,
 		readOnlyInputs: inputs,
 		dirtyOverlay,
@@ -529,6 +555,28 @@ export function buildSimpleProviderInvocation(
 			],
 		};
 	}
+	if (harness === "agy") {
+		if (descriptor.selector !== "claude-sonnet-4-6") {
+			throw Object.assign(new Error("local_descriptor_model_unavailable"), {
+				code: "local_descriptor_model_unavailable",
+			});
+		}
+		return {
+			command: "agy",
+			args: [
+				"-p",
+				_prompt,
+				"--model",
+				descriptor.selector,
+				"--mode=accept-edits",
+				"--sandbox",
+				"--output-format",
+				"json",
+				"--print-timeout",
+				"30m",
+			],
+		};
+	}
 	throw Object.assign(new Error("local_adapter_unavailable"), {
 		code: "local_adapter_unavailable",
 	});
@@ -541,7 +589,7 @@ async function defaultExecuteProvider(context) {
 		context.prompt,
 		context.worktreePath,
 	);
-	return runProviderProcess(invocation.command, invocation.args, {
+	const result = await runProviderProcess(invocation.command, invocation.args, {
 		input: context.prompt,
 		timeoutMs: context.timeoutMs,
 		silenceTimeoutMs: Math.min(5 * 60 * 1000, context.timeoutMs),
@@ -549,6 +597,14 @@ async function defaultExecuteProvider(context) {
 		progressStage: "running",
 		onPoll: () => context.onProgress?.(),
 	});
+	if (context.harness !== "agy" || !result.success) return result;
+	try {
+		return JSON.parse(result.output)?.status === "SUCCESS"
+			? result
+			: { ...result, success: false, code: 1 };
+	} catch {
+		return { ...result, success: false, code: 1 };
+	}
 }
 
 async function defaultRunCheck({
@@ -978,13 +1034,16 @@ export async function runSimpleTask(options, dependencies = {}) {
 		emitStatus(onStatus, taskId, "route");
 		const routed = routeProvider({
 			requiredCapability: options.capability,
-			availableProviders: SIMPLE_PROVIDERS,
+			availableProviders: (options.onlyProviders ?? []).length
+				? options.onlyProviders
+				: ["codex"],
 			platform: "direct",
 			nowMs: now(),
 			hasInvocationDescriptor: (name, capability) =>
 				Boolean(descriptorFor(name, capability)),
 			modelForCapability: (name, capability) =>
 				descriptorFor(name, capability)?.selector ?? null,
+			only: options.onlyProviders ?? [],
 		});
 		if (!routed?.provider)
 			return fail(routed?.reason ?? "no_eligible_provider", "route");

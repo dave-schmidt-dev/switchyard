@@ -58,10 +58,12 @@ function providerMatches(identifier, name) {
 	return normalizeProviderName(identifier) === normalizeProviderName(name);
 }
 
-// Snapshot path - host-side, code constant (WR-1: routing is host-side)
-const SNAPSHOT_PATH = join(
+// Installed Gradus is the production snapshot owner. Source mode has its own
+// checkout-local canonical file, but the bundled refresh agent deliberately
+// writes only this Installed root (Gradus INV-1/INV-7).
+export const SNAPSHOT_PATH = join(
 	homedir(),
-	"Documents/Projects/gradus/.state/snapshot-v2.json",
+	"Library/Application Support/Gradus/Installed/snapshot-v2.json",
 );
 
 // Test-only escape hatch: tests/router.test.mjs and tests/runner.test.mjs both
@@ -73,7 +75,7 @@ const SNAPSHOT_PATH = join(
 // path — a value read once at import time would be fixed before a test ever
 // gets to set it. Production callers never set this env var, so
 // resolveSnapshotPath() always returns the real SNAPSHOT_PATH for them.
-function resolveSnapshotPath() {
+export function resolveSnapshotPath() {
 	return process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE || SNAPSHOT_PATH;
 }
 
@@ -457,6 +459,7 @@ export function preflightMacosQueue(options = {}) {
 		floor = DEFAULT_FLOOR,
 		nowMs = Date.now(),
 		readSnapshot = readSnapshotAtRoute,
+		hasInvocationDescriptor = hasAutomaticInvocationDescriptor,
 	} = options;
 
 	if (platform !== "macos") {
@@ -655,6 +658,7 @@ export function preflightMacosQueue(options = {}) {
 				requiredCapability: capability,
 				usageMode: "observed",
 				goldenImageVerifiedProviders: verifiedProviders,
+				hasInvocationDescriptor,
 			});
 			const health = classification.eligible
 				? healthExclusion(name, provider, {

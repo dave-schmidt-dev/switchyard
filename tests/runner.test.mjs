@@ -14966,10 +14966,15 @@ describe("runQueue timeout diff persistence", () => {
 			checkpointPath: `${tasksPath}.checkpoint.json`,
 			dependencies: {
 				route: () => ({
-					provider: "vibe",
-					model: "mistral-medium-3.5",
+					provider: "claude",
+					model: "claude-sonnet-5",
 					reason: "spread",
 				}),
+				resolveDescriptor: () =>
+					descriptorForRoute({
+						provider: "claude",
+						model: "claude-sonnet-5",
+					}),
 				recordDispatch: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				ensureAgentContainer: () => {},
@@ -14981,7 +14986,7 @@ describe("runQueue timeout diff persistence", () => {
 				wipeWorkingContainer: () => {},
 				onStatus: (event) => events.push(event),
 				adapters: {
-					vibe: {
+					claude: {
 						execute: () => ({
 							success: false,
 							timedOut: true,
@@ -15017,10 +15022,15 @@ describe("runQueue timeout diff persistence", () => {
 			checkpointPath: `${tasksPath}.checkpoint.json`,
 			dependencies: {
 				route: () => ({
-					provider: "vibe",
-					model: "mistral-medium-3.5",
+					provider: "claude",
+					model: "claude-sonnet-5",
 					reason: "spread",
 				}),
+				resolveDescriptor: () =>
+					descriptorForRoute({
+						provider: "claude",
+						model: "claude-sonnet-5",
+					}),
 				recordDispatch: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				ensureAgentContainer: () => {},
@@ -15032,7 +15042,7 @@ describe("runQueue timeout diff persistence", () => {
 				wipeWorkingContainer: () => {},
 				onStatus: (event) => events.push(event),
 				adapters: {
-					vibe: {
+					claude: {
 						execute: () => ({
 							success: false,
 							timedOut: true,
@@ -15174,11 +15184,16 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const baseDependencies = {
 			route: () => ({
-				provider: "vibe",
-				model: "glm-5.2-high",
+				provider: "claude",
+				model: "claude-sonnet-5",
 				percentLeft: 72,
 				reason: "spread",
 			}),
+			resolveDescriptor: () =>
+				descriptorForRoute({
+					provider: "claude",
+					model: "claude-sonnet-5",
+				}),
 			recordDispatch: () => {},
 			integrationGate: () => ({ success: true, message: "ok" }),
 			ensureAgentContainer: () => {},
@@ -15197,7 +15212,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 				dependencies: {
 					...baseDependencies,
 					adapters: {
-						vibe: {
+						claude: {
 							execute,
 							captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs\n+ok",
 						},
@@ -15209,7 +15224,7 @@ describe("runQueue non-timeout rejection diff persistence (Task D.4)", () => {
 			success: true,
 			output: "",
 			error: null,
-			servedModel: "glm-5.2-high",
+			servedModel: "claude-sonnet-5",
 		}));
 		strictEqual(verified.results[0].servedModelVerified, true);
 

@@ -10,6 +10,7 @@
 // actually invoked and the dispatch is NOT recorded as unsupported_provider.
 
 import { strictEqual } from "node:assert";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,9 +20,12 @@ import {
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
 import { executeTask } from "../src/switchyard/runner/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
+const crossHarnessRoot = tempDir("switchyard-vibe-opencode-roster-");
+const CROSS_HARNESS_FIXTURE_PATH = resolve(crossHarnessRoot, "roster.json");
 
 const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
 const TASK_BASE = {
@@ -41,16 +45,20 @@ after(() => {
 		process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
 	}
 	__resetRosterCacheForTests();
+	rmSync(crossHarnessRoot, { recursive: true, force: true });
 });
 
 // Build a context whose route() returns a fixed result and whose adapters are
 // keyed by harness (exactly as runQueue wires them). Records every dispatch.
-function makeContext({ provider, model }) {
+function makeContext({
+	provider,
+	model,
+	targetId = provider === "OpenCode Go" ? "opencode-go" : "claude-code",
+	harness = provider === "OpenCode Go" ? "opencode" : "claude",
+}) {
 	const dispatches = [];
 	const dispatchIntents = [];
 	const calls = { execute: 0, lastModel: null };
-	const targetId = provider === "OpenCode Go" ? "opencode-go" : "claude-code";
-	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
 	const descriptor = syntheticDescriptor({ targetId, model, harness });
 	return {
 		context: {
@@ -142,6 +150,35 @@ describe("runner M1b — adapter selected by resolved harness", () => {
 		strictEqual(dispatches[0].result, "success_no_diff");
 		strictEqual(dispatchIntents.length, 1);
 		strictEqual(dispatchIntents[0].taskId, TASK.id);
+	});
+
+	it("keeps a Vibe accounting target while executing its Mistral GLM selector through OpenCode", () => {
+		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+		roster.targets.vibe.harness = "opencode";
+		roster.targets.vibe.snapshot_name = "Vibe";
+		writeFileSync(CROSS_HARNESS_FIXTURE_PATH, JSON.stringify(roster), "utf8");
+		process.env.SWITCHYARD_ROSTER_PATH = CROSS_HARNESS_FIXTURE_PATH;
+		__resetRosterCacheForTests();
+		try {
+			const { context, dispatches, calls } = makeContext({
+				provider: "Vibe",
+				targetId: "vibe",
+				harness: "opencode",
+				model: "mistral/zai-glm-5-2",
+			});
+
+			const result = executeTask(TASK, context);
+
+			strictEqual(calls.execute, 1, "the resolved OpenCode adapter must run");
+			strictEqual(calls.lastModel, "mistral/zai-glm-5-2");
+			strictEqual(result.provider, "Vibe");
+			strictEqual(result.resolvedTargetId, "vibe");
+			strictEqual(result.success, true);
+			strictEqual(dispatches[0].resolvedTargetId, "vibe");
+		} finally {
+			process.env.SWITCHYARD_ROSTER_PATH = FIXTURE_PATH;
+			__resetRosterCacheForTests();
+		}
 	});
 
 	it("still records unsupported_provider when no adapter exists for the resolved harness", () => {
