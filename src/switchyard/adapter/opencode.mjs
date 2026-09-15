@@ -10,8 +10,10 @@ import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
 	captureProviderDiff,
 	captureProviderDiffAsync,
+	completeSynchronousProviderExit,
 	executeProviderInvocation,
 	getWorkspaceExecution,
+	reconcileSynchronousProviderExit,
 } from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
@@ -298,7 +300,7 @@ export function execute(prompt, workingContainerName, options = {}) {
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
-		return { output: result, success: true };
+		return completeSynchronousProviderExit(result, execution.args, options);
 	} catch (error) {
 		// The supervisor terminated a finished-but-not-exiting provider. The work
 		// is already in the working tree, so this is a success for the runner and
@@ -335,6 +337,11 @@ export function execute(prompt, workingContainerName, options = {}) {
 				...cleanup,
 			};
 		}
+		const reconciled = reconcileSynchronousProviderExit(error, execution.args, {
+			...options,
+			provider: "opencode",
+		});
+		if (reconciled) return reconciled;
 		// Non-timeout failure: surface the provider's own diagnostic (and, on an
 		// expired session, an actionable re-auth hint) instead of Node's opaque
 		// "Command failed: docker exec …" wrapper — see exec-error.mjs.

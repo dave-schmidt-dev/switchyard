@@ -16,9 +16,11 @@ import {
 	captureProviderDiffAsync,
 	captureProviderDiffDetailed,
 	captureProviderDiffDetailedAsync,
+	completeSynchronousProviderExit,
 	createProgressSnapshot,
 	executeProviderInvocation,
 	getWorkspaceExecution,
+	reconcileSynchronousProviderExit,
 	runProviderProcess,
 	verifyCompletionContinuationSync,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
@@ -1093,6 +1095,405 @@ describe("provider process lifecycle", () => {
 		strictEqual(launcherUsage.diagnosticCode, "cli_usage_error");
 		strictEqual(launcherUsage.diagnosticOrigin, "launcher");
 		strictEqual(launcherUsage.diagnosticEvidenceAvailable, false);
+	});
+
+	it("reconciles a legacy transport exit 255 from exact terminal evidence without replay", async () => {
+		const child = fakeChild();
+		let descriptorBuilds = 0;
+		let providerSpawns = 0;
+		let reads = 0;
+		let removals = 0;
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		const executionBackend = {
+			execArgv() {
+				descriptorBuilds += 1;
+				return {
+					command: "fake",
+					args: [],
+					terminalEvidence: {
+						token: "11111111-1111-4111-8111-111111111111",
+					},
+				};
+			},
+			readProviderTerminalEvidence(_workspaceId, _context, { token }) {
+				reads += 1;
+				strictEqual(token, "11111111-1111-4111-8111-111111111111");
+				return { status: "confirmed", exitCode: 17 };
+			},
+			clearProviderTerminalEvidence() {
+				removals += 1;
+				return { status: "removed" };
+			},
+		};
+		const execution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const promise = executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				provider: "codex",
+				executionBackend,
+				cleanupContext,
+				spawnFn: () => {
+					providerSpawns += 1;
+					queueMicrotask(() => child.emit("close", 255, null));
+					return child;
+				},
+			},
+		);
+		const result = await promise;
+		strictEqual(result.success, false);
+		strictEqual(result.exitCode, 17);
+		strictEqual(result.terminalEvidenceStatus, "confirmed");
+		strictEqual(result.terminalEvidenceCleanupStatus, "removed");
+		strictEqual(reads, 1);
+		strictEqual(removals, 1);
+		strictEqual(descriptorBuilds, 1);
+		strictEqual(
+			providerSpawns,
+			1,
+			"the provider process must spawn exactly once",
+		);
+	});
+
+	it("accepts a confirmed zero provider exit after a legacy transport exit 255", async () => {
+		const child = fakeChild();
+		let providerSpawns = 0;
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48-zero",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		const executionBackend = {
+			execArgv: () => ({
+				command: "fake",
+				args: [],
+				terminalEvidence: {
+					token: "11111111-1111-4111-8111-111111111111",
+				},
+			}),
+			readProviderTerminalEvidence: () => ({
+				status: "confirmed",
+				exitCode: 0,
+			}),
+			clearProviderTerminalEvidence: () => ({ status: "removed" }),
+		};
+		const execution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const result = await executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				provider: "codex",
+				executionBackend,
+				cleanupContext,
+				spawnFn: () => {
+					providerSpawns += 1;
+					queueMicrotask(() => child.emit("close", 255, null));
+					return child;
+				},
+			},
+		);
+		strictEqual(result.success, true);
+		strictEqual("exitCode" in result, false);
+		strictEqual(result.terminalEvidenceStatus, "confirmed");
+		strictEqual(result.terminalEvidenceCleanupStatus, "removed");
+		strictEqual(providerSpawns, 1);
+	});
+
+	it("reconciles synchronous legacy transport loss without replay", () => {
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48-sync",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		for (const exitCode of [0, 23]) {
+			let reads = 0;
+			let removals = 0;
+			const executionBackend = {
+				execArgv: () => ({
+					command: "fake",
+					args: [],
+					terminalEvidence: {
+						token: "11111111-1111-4111-8111-111111111111",
+					},
+				}),
+				readProviderTerminalEvidence: () => {
+					reads += 1;
+					return { status: "confirmed", exitCode };
+				},
+				clearProviderTerminalEvidence: () => {
+					removals += 1;
+					return { status: "removed" };
+				},
+			};
+			const execution = getWorkspaceExecution("legacy-vm", {
+				executionBackend,
+				argv: ["codex", "exec"],
+				recordPid: true,
+				cleanupContext,
+			});
+			const result = reconcileSynchronousProviderExit(
+				{ status: 255, signal: null, stdout: "provider output" },
+				execution.args,
+				{ provider: "codex", executionBackend, cleanupContext },
+			);
+			strictEqual(result.success, exitCode === 0);
+			strictEqual(result.terminalEvidenceStatus, "confirmed");
+			strictEqual(result.terminalEvidenceCleanupStatus, "removed");
+			if (exitCode !== 0) strictEqual(result.exitCode, exitCode);
+			strictEqual(reads, 1);
+			strictEqual(removals, 1);
+		}
+	});
+
+	it("removes terminal evidence after a direct synchronous success", () => {
+		let removals = 0;
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48-sync-success",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		const executionBackend = {
+			execArgv: () => ({
+				command: "fake",
+				args: [],
+				terminalEvidence: {
+					token: "11111111-1111-4111-8111-111111111111",
+				},
+			}),
+			clearProviderTerminalEvidence: () => {
+				removals += 1;
+				return { status: "removed" };
+			},
+		};
+		const execution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const result = completeSynchronousProviderExit("done", execution.args, {
+			executionBackend,
+			cleanupContext,
+		});
+		strictEqual(result.success, true);
+		strictEqual(result.terminalEvidenceCleanupStatus, "removed");
+		strictEqual(removals, 1);
+	});
+
+	it("reports terminal evidence removal after a direct asynchronous success", async () => {
+		const child = fakeChild();
+		let removals = 0;
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48-async-success",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		const executionBackend = {
+			execArgv: () => ({
+				command: "fake",
+				args: [],
+				terminalEvidence: {
+					token: "11111111-1111-4111-8111-111111111111",
+				},
+			}),
+			readProviderTerminalEvidence: () => ({ status: "uncertain" }),
+			clearProviderTerminalEvidence: () => {
+				removals += 1;
+				return { status: "removed" };
+			},
+		};
+		const execution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const promise = executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				provider: "codex",
+				executionBackend,
+				cleanupContext,
+				spawnFn: () => child,
+			},
+		);
+		child.emit("close", 0, null);
+		const result = await promise;
+		strictEqual(result.success, true);
+		strictEqual(result.terminalEvidenceCleanupStatus, "removed");
+		strictEqual(removals, 1);
+	});
+
+	it("does not let terminal evidence override timeout or cancellation", async () => {
+		const child = fakeChild();
+		child.kill = () => {
+			queueMicrotask(() => child.emit("close", 255, null));
+			return true;
+		};
+		let reads = 0;
+		let removals = 0;
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48-timeout",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		const executionBackend = {
+			execArgv: () => ({
+				command: "fake",
+				args: [],
+				terminalEvidence: {
+					token: "11111111-1111-4111-8111-111111111111",
+				},
+			}),
+			cleanupProviderProcess: () => {},
+			readProviderTerminalEvidence: () => {
+				reads += 1;
+				return { status: "confirmed", exitCode: 0 };
+			},
+			clearProviderTerminalEvidence: () => {
+				removals += 1;
+				return { status: "removed" };
+			},
+		};
+		const execution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const result = await executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				provider: "codex",
+				executionBackend,
+				cleanupContext,
+				spawnFn: () => child,
+				timeoutMs: 1,
+				termGraceMs: 1,
+			},
+		);
+		strictEqual(result.success, false);
+		strictEqual(result.timedOut, true);
+		strictEqual(reads, 0);
+		strictEqual(removals, 0);
+
+		const cancelledChild = fakeChild();
+		cancelledChild.kill = () => {
+			queueMicrotask(() => cancelledChild.emit("close", 255, null));
+			return true;
+		};
+		const cancelledExecution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const controller = new AbortController();
+		const cancelledPromise = executeProviderInvocation(
+			cancelledExecution.command,
+			cancelledExecution.args,
+			{
+				provider: "codex",
+				executionBackend,
+				cleanupContext,
+				spawnFn: () => cancelledChild,
+				signal: controller.signal,
+				termGraceMs: 1,
+			},
+		);
+		controller.abort();
+		const cancelled = await cancelledPromise;
+		strictEqual(cancelled.success, false);
+		strictEqual(cancelled.cancelled, true);
+		strictEqual(reads, 0);
+		strictEqual(removals, 0);
+	});
+
+	it("keeps a lost legacy result uncertain when terminal evidence is missing", async () => {
+		const child = fakeChild();
+		let removals = 0;
+		const cleanupContext = {
+			runId: "legacy-run",
+			taskId: "48",
+			attemptId: "attempt-1",
+			descriptorIdentity: "descriptor-1",
+			workspaceId: "legacy-vm",
+			operation: "provider",
+		};
+		const executionBackend = {
+			execArgv: () => ({
+				command: "fake",
+				args: [],
+				terminalEvidence: {
+					token: "11111111-1111-4111-8111-111111111111",
+				},
+			}),
+			readProviderTerminalEvidence: () => ({
+				status: "uncertain",
+				reason: "evidence_missing_or_unreadable",
+			}),
+			clearProviderTerminalEvidence: () => {
+				removals += 1;
+				return { status: "removed" };
+			},
+		};
+		const execution = getWorkspaceExecution("legacy-vm", {
+			executionBackend,
+			argv: ["codex", "exec"],
+			recordPid: true,
+			cleanupContext,
+		});
+		const promise = executeProviderInvocation(
+			execution.command,
+			execution.args,
+			{
+				provider: "codex",
+				executionBackend,
+				cleanupContext,
+				spawnFn: () => {
+					queueMicrotask(() => child.emit("close", 255, null));
+					return child;
+				},
+			},
+		);
+		const result = await promise;
+		strictEqual(result.success, false);
+		strictEqual(result.terminalEvidenceStatus, "uncertain");
+		strictEqual(removals, 0);
 	});
 
 	it("keeps text-derived auth and quota labels informational", async () => {

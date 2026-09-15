@@ -354,6 +354,9 @@ const PERSISTABLE_PRLCTL_SIGNALS = Object.freeze(
 const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
 const VM_OWNERSHIP_SCHEMA_VERSION = 1;
 const PROCESS_MARKER_SCHEMA_VERSION = 1;
+const PROVIDER_TERMINAL_EVIDENCE_SCHEMA_VERSION = 1;
+const PROVIDER_TERMINAL_EVIDENCE_MAX_BYTES = 1024;
+const PROVIDER_TERMINAL_EVIDENCE_KIND = "switchyard_provider_terminal";
 // The bulk-transfer URL is only known once the helper has bound its ephemeral
 // port, so it reaches the guest as a plaintext argv assignment that the helper
 // substitutes. The variable name deliberately does not contain the placeholder
@@ -696,6 +699,12 @@ function providerPidMarkerPath(workspaceId, cleanupContext = {}) {
 	const identity = markerIdentity(workspaceId, cleanupContext);
 	if (!identity) return null;
 	return `${PROVIDER_PID_MARKER_PREFIX}${identity.operation}-${identity.token.slice(0, 32)}.pid`;
+}
+
+function providerTerminalEvidencePath(workspaceId, cleanupContext = {}) {
+	const identity = markerIdentity(workspaceId, cleanupContext);
+	if (identity?.operation !== "provider") return null;
+	return `${PROVIDER_PID_MARKER_PREFIX}${identity.operation}-${identity.token.slice(0, 32)}.terminal.json`;
 }
 
 function validateGuestPath(value, label) {
@@ -2090,6 +2099,7 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			recordPid = false,
 			env = [],
 			cleanupContext = null,
+			terminalEvidenceToken = null,
 		} = {},
 	) {
 		const command = normalizeExecArgv(argv);
@@ -2108,10 +2118,23 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		const pidPath = marker
 			? providerPidMarkerPath(workspaceId, cleanupContext)
 			: null;
+		const terminalEvidencePath =
+			recordPid && cleanupContext?.operation === "provider"
+				? providerTerminalEvidencePath(workspaceId, cleanupContext)
+				: null;
+		if (
+			terminalEvidencePath &&
+			(typeof terminalEvidenceToken !== "string" ||
+				!isUuid(terminalEvidenceToken))
+		) {
+			throw new Error("provider terminal evidence token is missing or invalid");
+		}
 		const quotedCommand = command.map((entry) => shellQuote(entry)).join(" ");
 		const launch = `exec ${quotedCommand}`;
 		const inner = recordPid
-			? `cd ${shellQuote(resolvedCwd)} || exit $?; trap 'rm -f -- ${shellQuote(pidPath)}' EXIT; ${quotedCommand} <&0 & provider_pid=$!; { printf '%s\\n' "$provider_pid"; printf '%s\\n' ${shellQuote(marker.token)}; } > ${shellQuote(pidPath)}; wait "$provider_pid"; provider_status=$?; exit "$provider_status"`
+			? terminalEvidencePath
+				? `cd ${shellQuote(resolvedCwd)} || exit $?; umask 077; rm -f -- ${shellQuote(terminalEvidencePath)} ${shellQuote(`${terminalEvidencePath}.tmp`)}; trap 'rm -f -- ${shellQuote(pidPath)}' EXIT; ${quotedCommand} <&0 & provider_pid=$!; { printf '%s\\n' "$provider_pid"; printf '%s\\n' ${shellQuote(marker.token)}; } > ${shellQuote(pidPath)}; wait "$provider_pid"; provider_status=$?; { printf '%s\\n' '{"schemaVersion":${PROVIDER_TERMINAL_EVIDENCE_SCHEMA_VERSION},"kind":"${PROVIDER_TERMINAL_EVIDENCE_KIND}","token":"${terminalEvidenceToken}","status":"stopped","exitCode":'; printf '%s\\n' "$provider_status"; printf '%s\\n' '}'; } > ${shellQuote(`${terminalEvidencePath}.tmp`)} && mv -f -- ${shellQuote(`${terminalEvidencePath}.tmp`)} ${shellQuote(terminalEvidencePath)}; exit "$provider_status"`
+				: `cd ${shellQuote(resolvedCwd)} || exit $?; trap 'rm -f -- ${shellQuote(pidPath)}' EXIT; ${quotedCommand} <&0 & provider_pid=$!; { printf '%s\\n' "$provider_pid"; printf '%s\\n' ${shellQuote(marker.token)}; } > ${shellQuote(pidPath)}; wait "$provider_pid"; provider_status=$?; exit "$provider_status"`
 			: `cd ${shellQuote(resolvedCwd)} && ${launch}`;
 		const payload = Buffer.from(inner, "utf8").toString("base64");
 		const args = [
@@ -2177,6 +2200,13 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			cleanupContext = null,
 		} = {},
 	) {
+		const terminalEvidence =
+			recordPid && cleanupContext?.operation === "provider"
+				? {
+						path: providerTerminalEvidencePath(workspaceId, cleanupContext),
+						token: randomUUID(),
+					}
+				: null;
 		return {
 			command: "prlctl",
 			args: this._buildAquaExecArgs(workspaceId, argv, {
@@ -2186,7 +2216,9 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				recordPid,
 				env,
 				cleanupContext,
+				terminalEvidenceToken: terminalEvidence?.token ?? null,
 			}),
+			...(terminalEvidence ? { terminalEvidence } : {}),
 		};
 	}
 
@@ -2239,6 +2271,117 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	 */
 	providerPidPath(workspaceId, cleanupContext = {}) {
 		return providerPidMarkerPath(workspaceId, cleanupContext);
+	}
+
+	/** Return the content-free terminal evidence path for one provider attempt. */
+	providerTerminalEvidencePath(workspaceId, cleanupContext = {}) {
+		const path = providerTerminalEvidencePath(workspaceId, cleanupContext);
+		if (!path)
+			throw new Error(
+				"provider terminal evidence requires an exact provider attempt identity",
+			);
+		return path;
+	}
+
+	/**
+	 * Read and validate one provider attempt's terminal status. A transport
+	 * exit of 255 is ambiguous by itself; this accepts only a fresh, exact
+	 * token-bound, closed sidecar and never invokes the provider command.
+	 */
+	readProviderTerminalEvidence(
+		workspaceId,
+		cleanupContext = {},
+		{ token, onStatus } = {},
+	) {
+		const emit = onStatus ?? this.onStatus;
+		emit?.({
+			phase: "execution",
+			event: "provider_terminal_evidence_started",
+			status: "Reading provider terminal evidence",
+		});
+		let path;
+		try {
+			path = this.providerTerminalEvidencePath(workspaceId, cleanupContext);
+		} catch {
+			return { status: "uncertain", reason: "evidence_identity_unavailable" };
+		}
+		if (!isUuid(token)) {
+			return { status: "uncertain", reason: "evidence_identity_unavailable" };
+		}
+		let raw;
+		try {
+			raw = this.execGuest(workspaceId, "/bin/cat", [path], {
+				cwd: "/",
+				// Read one extra byte so an oversized sidecar is distinguishable
+				// from an unavailable transport while keeping the read bounded.
+				prlctlOptions: {
+					maxBuffer: PROVIDER_TERMINAL_EVIDENCE_MAX_BYTES + 1,
+				},
+			});
+		} catch {
+			return { status: "uncertain", reason: "evidence_missing_or_unreadable" };
+		}
+		const text = outputText(raw);
+		if (
+			Buffer.byteLength(text, "utf8") > PROVIDER_TERMINAL_EVIDENCE_MAX_BYTES
+		) {
+			return { status: "uncertain", reason: "evidence_oversized" };
+		}
+		let record;
+		try {
+			record = JSON.parse(text);
+		} catch {
+			return { status: "uncertain", reason: "evidence_malformed" };
+		}
+		const fields = ["schemaVersion", "kind", "token", "status", "exitCode"];
+		if (
+			!record ||
+			typeof record !== "object" ||
+			Array.isArray(record) ||
+			Object.keys(record).length !== fields.length ||
+			fields.some((field) => !Object.hasOwn(record, field)) ||
+			record.schemaVersion !== PROVIDER_TERMINAL_EVIDENCE_SCHEMA_VERSION ||
+			record.kind !== PROVIDER_TERMINAL_EVIDENCE_KIND ||
+			record.token !== token ||
+			record.status !== "stopped" ||
+			!Number.isSafeInteger(record.exitCode) ||
+			record.exitCode < 0 ||
+			record.exitCode > 255
+		) {
+			return { status: "uncertain", reason: "evidence_mismatched" };
+		}
+		emit?.({
+			phase: "execution",
+			event: "provider_terminal_evidence_completed",
+			status: "Provider terminal evidence confirmed",
+		});
+		return { status: "confirmed", exitCode: record.exitCode };
+	}
+
+	/** Remove confirmed terminal evidence without touching an uncertain file. */
+	clearProviderTerminalEvidence(
+		workspaceId,
+		cleanupContext = {},
+		{ onStatus } = {},
+	) {
+		const emit = onStatus ?? this.onStatus;
+		try {
+			const path = this.providerTerminalEvidencePath(
+				workspaceId,
+				cleanupContext,
+			);
+			this.execGuest(workspaceId, "/bin/rm", ["-f", "--", path], {
+				cwd: "/",
+			});
+			emit?.({
+				phase: "execution",
+				event: "provider_terminal_evidence_removed",
+				status: "Provider terminal evidence removed",
+			});
+			return { status: "removed" };
+		} catch {
+			return { status: "uncertain", reason: "evidence_cleanup_uncertain" };
+		}
 	}
 
 	/** @returns {string} */

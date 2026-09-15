@@ -23,8 +23,10 @@ import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
 	captureProviderDiff,
 	captureProviderDiffAsync,
+	completeSynchronousProviderExit,
 	executeProviderInvocation,
 	getWorkspaceExecution,
+	reconcileSynchronousProviderExit,
 } from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
 
@@ -142,7 +144,7 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 			maxBuffer: 128 * 1024 * 1024, // 128 MB
 		});
 
-		return { output: result, success: true };
+		return completeSynchronousProviderExit(result, args, options);
 	} catch (error) {
 		const timedOut = error.code === "ETIMEDOUT";
 		if (timedOut) {
@@ -169,6 +171,11 @@ export function executeCursor(prompt, workingContainerName, options = {}) {
 				...cleanup,
 			};
 		}
+		const reconciled = reconcileSynchronousProviderExit(error, args, {
+			...options,
+			provider: "cursor",
+		});
+		if (reconciled) return reconciled;
 		// Non-timeout failure: surface the provider's own diagnostic (and, on an
 		// expired session, an actionable re-auth hint) instead of Node's opaque
 		// "Command failed: docker exec …" wrapper — see exec-error.mjs.

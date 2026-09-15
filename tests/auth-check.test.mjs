@@ -1734,8 +1734,8 @@ describe("an interrupted login ends the walkthrough", () => {
 	// operator's escape without replacing it: a signal arriving while a login's
 	// execFileSync holds the event loop is queued, then discarded when the
 	// normal path removes the listeners, so Ctrl+C killed one login and the
-	// walkthrough immediately started the next provider's. The child's own
-	// death is the only in-band evidence that arrives in time.
+	// walkthrough immediately started the next provider's. The signal-aware
+	// wrapper now returns a conventional signal-derived status in-band.
 	const fakeBackend = (command, args) => ({
 		goldenImage: "switchyard-golden-test",
 		aquaUid: "501",
@@ -1743,20 +1743,117 @@ describe("an interrupted login ends the walkthrough", () => {
 	});
 	const codex = PROVIDERS.find((provider) => provider.name === "codex");
 
-	it("rethrows when the login's own child is killed by SIGINT", () => {
+	it("rethrows a signal-derived wrapper exit status", () => {
 		ok(codex, "codex must still be a real provider with a login");
 		let thrown = null;
 		try {
-			// `sh -c 'kill -INT $$'` reproduces exactly what was measured against
-			// the golden image on 2026-09-13: `prlctl exec` does not trap SIGINT,
-			// so execFileSync throws with signal SIGINT and a null status.
-			codex.runLogin("workspace-1", fakeBackend("sh", ["-c", "kill -INT $$"]));
+			codex.runLogin("workspace-1", fakeBackend("sh", ["-c", "exit 130"]));
 		} catch (error) {
 			thrown = error;
 		}
-		ok(thrown, "a login killed by SIGINT must not be swallowed");
+		ok(thrown, "a signal-derived wrapper status must not be swallowed");
 		strictEqual(thrown.code, "WALKTHROUGH_INTERRUPTED");
 		strictEqual(thrown.signal, "SIGINT");
+	});
+
+	it("kills a login transport whose guest child traps SIGINT", async () => {
+		const authSource = readFileSync(
+			new URL("../src/switchyard/auth/index.mjs", import.meta.url),
+			"utf8",
+		);
+		strictEqual(
+			authSource.includes("set -m"),
+			false,
+			"the interactive child must remain in the terminal foreground process group",
+		);
+		const scratch = tempDir("switchyard-auth-trapping-login-");
+		const ready = join(scratch, "ready");
+		const login = join(scratch, "login.mjs");
+		const driver = join(scratch, "driver.mjs");
+		const stopReport = join(scratch, "golden-stop-count");
+		const loginPidReport = join(scratch, "login-pid");
+		try {
+			writeFileSync(
+				login,
+				`import { readSync, writeFileSync } from "node:fs";
+process.on("SIGINT", () => {});
+const input = Buffer.alloc(1);
+if (readSync(0, input, 0, 1, null) !== 1 || input.toString() !== "x") process.exit(2);
+writeFileSync(${JSON.stringify(ready)}, "ready");
+writeFileSync(${JSON.stringify(loginPidReport)}, String(process.pid));
+setInterval(() => {}, 1000);\n`,
+			);
+			writeFileSync(
+				driver,
+				`process.on("SIGINT", () => {});
+import { writeFileSync } from "node:fs";
+import { PROVIDERS, withBootedGoldenImage } from ${JSON.stringify(new URL("../src/switchyard/auth/index.mjs", import.meta.url).href)};
+const provider = PROVIDERS.find((entry) => entry.name === "codex");
+let stopCalls = 0;
+const backend = {
+  goldenImage: "golden-image",
+  aquaUid: "501",
+  bootGoldenImage: () => ({ uuid: "golden-uuid" }),
+  stopGoldenImage: () => {
+    stopCalls += 1;
+    writeFileSync(${JSON.stringify(stopReport)}, String(stopCalls));
+  },
+  execArgv: () => ({ command: process.execPath, args: [${JSON.stringify(login)}] }),
+};
+try {
+  withBootedGoldenImage(backend, (workspaceId) => provider.runLogin(workspaceId, backend));
+} catch (error) {
+  if (error?.code === "WALKTHROUGH_INTERRUPTED") process.exit(130);
+  throw error;
+}\n`,
+			);
+			const child = spawn(process.execPath, [driver], {
+				detached: true,
+				stdio: ["pipe", "ignore", "pipe"],
+			});
+			child.stdin.end("x");
+			const exited = new Promise((resolveExit) =>
+				child.once("exit", (code, signal) => resolveExit({ code, signal })),
+			);
+			const readyDeadline = Date.now() + 5000;
+			while (!existsSync(ready) && Date.now() < readyDeadline)
+				await new Promise((resolveReady) => setTimeout(resolveReady, 20));
+			ok(existsSync(ready), "trapping login child never started");
+			process.kill(-child.pid, "SIGINT");
+			const result = await Promise.race([
+				exited,
+				new Promise((_, reject) =>
+					setTimeout(
+						() => reject(new Error("trapping login did not exit")),
+						5000,
+					),
+				),
+			]);
+			strictEqual(result.signal, null);
+			strictEqual(result.code, 130);
+			const loginPid = Number(readFileSync(loginPidReport, "utf8"));
+			let transportAlive = true;
+			const transportDeadline = Date.now() + 1000;
+			while (transportAlive && Date.now() < transportDeadline) {
+				try {
+					process.kill(loginPid, 0);
+					await new Promise((resolveTransport) =>
+						setTimeout(resolveTransport, 10),
+					);
+				} catch (error) {
+					if (error?.code !== "ESRCH") throw error;
+					transportAlive = false;
+				}
+			}
+			strictEqual(transportAlive, false, "the exact login transport must exit");
+			strictEqual(
+				readFileSync(stopReport, "utf8"),
+				"1",
+				"interrupted walkthrough stops the golden image exactly once",
+			);
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
+		}
 	});
 
 	it("still swallows an ordinary failed login", () => {

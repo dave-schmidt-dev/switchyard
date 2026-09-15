@@ -107,15 +107,38 @@ const INTERRUPT_EXIT_CODES = Object.freeze({
 });
 
 // Thrown when a login's own child process was killed by one of those signals.
-// Measured 2026-09-13 against the golden image: `prlctl exec` does not trap
-// SIGINT, so Ctrl+C during a login surfaces as execFileSync throwing with
-// `signal: "SIGINT"`, `status: null`. That is the only in-band evidence the
-// walkthrough gets, because a signal arriving while a synchronous child holds
-// the event loop is queued and never reaches a handler until the whole
-// synchronous walk has finished. Carrying it as a throw is what stops the walk
-// at the provider the operator interrupted instead of marching on to the next
-// one and demanding another Ctrl+C for each.
+// The signal-aware shell wrapper converts Ctrl+C into the conventional
+// 128+signo status after killing the exact prlctl transport. execFileSync still
+// blocks Node while that happens, so the status is the in-band evidence that
+// stops the walk at the interrupted provider instead of marching on to the
+// next one and demanding another Ctrl+C for each.
 const WALKTHROUGH_INTERRUPTED = "WALKTHROUGH_INTERRUPTED";
+
+// Keep job control disabled: the child stays in the terminal's foreground
+// process group and can read interactive input, while the shell can still trap
+// the same signal and terminate that exact child if it refuses to exit.
+const SIGNAL_AWARE_LOGIN_WRAPPER = `"$@" <&0 &
+child=$!
+interrupt() {
+  status=$1
+  kill -KILL "$child" 2>/dev/null || :
+  wait "$child" 2>/dev/null || :
+  exit "$status"
+}
+trap 'interrupt 129' HUP
+trap 'interrupt 130' INT
+trap 'interrupt 143' TERM
+wait "$child"
+status=$?
+trap - HUP INT TERM
+exit "$status"`;
+
+function interruptedSignalForStatus(status) {
+	for (const [signal, code] of Object.entries(INTERRUPT_EXIT_CODES)) {
+		if (status === code) return signal;
+	}
+	return null;
+}
 
 function interruptedError(signal) {
 	const error = new Error(`walkthrough interrupted by ${signal}`);
@@ -154,8 +177,8 @@ export function withBootedGoldenImage(executionBackend, fn) {
 	// Registered after the boot, so an interrupt arriving before it still
 	// falls through to node's default with nothing started to leak, and
 	// removed only after the normal-path stop, so a signal that libuv queued
-	// while a synchronous child held the event loop still finds a live
-	// handler instead of node's default.
+	// while a synchronous child held the event loop still finds a live handler
+	// instead of node's default if the wrapper did not consume it first.
 	let stopped = false;
 	const stopOnce = (why) => {
 		if (stopped) return;
@@ -182,8 +205,8 @@ export function withBootedGoldenImage(executionBackend, fn) {
 	// execFileSync) is queued, not delivered, and is then discarded when the
 	// normal path removes these listeners -- which on its own would absorb the
 	// operator's Ctrl+C and march on to the next provider. runInteractiveLogin
-	// is what closes that: it reads the signal off the dead child and throws,
-	// so the walk stops at the provider that was interrupted and unwinds
+	// is what closes that: it reads the wrapper's signal-derived exit status and
+	// throws, so the walk stops at the provider that was interrupted and unwinds
 	// through the stop below. Registering here still matters, because without
 	// it node's default disposition kills the process on the spot with the
 	// guest running. SIGHUP is included because closing the terminal on a stuck
@@ -356,18 +379,27 @@ function runInteractiveLogin(
 		env: Object.entries(env).map(([key, value]) => `${key}=${value}`),
 	});
 	try {
-		execFileSync(command, args, { stdio: "inherit" });
+		// execFileSync still blocks Node while the login runs. The wrapper is a
+		// separate foreground process that receives the process-group signal while
+		// its exact prlctl child is blocked. It kills that child on the first
+		// signal, so a guest login that traps or ignores SIGINT cannot hold the
+		// walkthrough.
+		execFileSync(
+			"/bin/sh",
+			["-c", SIGNAL_AWARE_LOGIN_WRAPPER, "switchyard-login", command, ...args],
+			{ stdio: "inherit" },
+		);
 	} catch (error) {
-		// Ctrl+C reaches the whole foreground process group, so the login child
-		// dies of the signal too, and that is the only evidence of the interrupt
-		// that arrives in time to act on: node's own handler for the same signal
-		// is queued behind this synchronous call. Measured against the golden
-		// image -- `prlctl exec` does not trap SIGINT, it dies with
-		// `signal: "SIGINT"`, `status: null`. Rethrown so the caller stops
-		// walking; swallowing it is what forced an operator to interrupt every
-		// remaining provider one at a time.
-		if (INTERRUPT_EXIT_CODES[error?.signal]) {
-			throw interruptedError(error.signal);
+		// Ctrl+C reaches the whole foreground process group. The wrapper traps it,
+		// kills the exact login transport, and exits with the signal-derived code;
+		// node's own handler for the same signal is queued behind this synchronous
+		// call. Rethrown so the caller stops walking; swallowing it is what forced
+		// an operator to interrupt every remaining provider one at a time.
+		const signal = INTERRUPT_EXIT_CODES[error?.signal]
+			? error.signal
+			: interruptedSignalForStatus(error?.status);
+		if (signal) {
+			throw interruptedError(signal);
 		}
 		// Everything else -- a declined prompt, a nonzero exit, a real login
 		// failure — is expected here: the isAuthenticated() re-check the caller

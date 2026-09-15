@@ -633,28 +633,224 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 		ok(!controlScript.includes(markerPath));
 
-		const providerScript = decodeGuestScript(
-			backend.execArgv(workspaceId, {
-				cwd: "/",
-				recordPid: true,
-				cleanupContext,
-				argv: [
-					"/bin/bash",
-					"-c",
-					'for _ in {1..100}; do test -s "$1" && break; sleep 0.01; done; test "$(head -n 1 "$1")" = "$$" || exit 9; IFS= read -r value; printf "out:%s\\n" "$value"; printf "err:%s\\n" "$value" >&2; exit 7',
-					"provider-test",
-					markerPath,
-				],
-			}).args,
-		);
+		const execution = backend.execArgv(workspaceId, {
+			cwd: "/",
+			recordPid: true,
+			cleanupContext,
+			argv: [
+				"/bin/bash",
+				"-c",
+				'for _ in {1..100}; do test -s "$1" && break; sleep 0.01; done; test "$(head -n 1 "$1")" = "$$" || exit 9; IFS= read -r value; printf "out:%s\\n" "$value"; printf "err:%s\\n" "$value" >&2; exit 7',
+				"provider-test",
+				markerPath,
+			],
+		});
+		const providerScript = decodeGuestScript(execution.args);
 		const result = spawnSync("/bin/bash", ["-c", providerScript], {
 			input: "payload\n",
 			encoding: "utf8",
 		});
-		strictEqual(result.status, 7);
-		strictEqual(result.stdout, "out:payload\n");
-		strictEqual(result.stderr, "err:payload\n");
-		strictEqual(existsSync(markerPath), false);
+		try {
+			strictEqual(result.status, 7);
+			strictEqual(result.stdout, "out:payload\n");
+			strictEqual(result.stderr, "err:payload\n");
+			strictEqual(existsSync(markerPath), false);
+			const evidenceText = readFileSync(
+				execution.terminalEvidence.path,
+				"utf8",
+			);
+			ok(Buffer.byteLength(evidenceText, "utf8") <= 1024);
+			const evidence = JSON.parse(evidenceText);
+			deepStrictEqual(Object.keys(evidence).sort(), [
+				"exitCode",
+				"kind",
+				"schemaVersion",
+				"status",
+				"token",
+			]);
+			strictEqual(evidence.exitCode, 7);
+			strictEqual(evidence.token, execution.terminalEvidence.token);
+			for (const forbidden of [
+				"output",
+				"prompt",
+				"command",
+				"environment",
+				"env",
+				"credential",
+				"credentials",
+			]) {
+				strictEqual(
+					Object.hasOwn(evidence, forbidden),
+					false,
+					`terminal evidence must not contain ${forbidden}`,
+				);
+			}
+		} finally {
+			rmSync(execution.terminalEvidence.path, { force: true });
+		}
+	});
+
+	it("binds a fresh content-free terminal evidence token to each legacy provider attempt", () => {
+		const backend = workspaceBackend(() => "");
+		const context = markerContext("provider");
+		const execution = backend.execArgv(WORK_UUID, {
+			argv: ["/usr/local/bin/codex", "exec"],
+			recordPid: true,
+			cleanupContext: context,
+		});
+		const script = decodeGuestScript(execution.args);
+		const evidencePath = backend.providerTerminalEvidencePath(
+			WORK_UUID,
+			context,
+		);
+		ok(execution.terminalEvidence?.token);
+		ok(script.includes(`rm -f -- '${evidencePath}'`));
+		ok(script.includes(execution.terminalEvidence.token));
+		ok(script.includes('"kind":"switchyard_provider_terminal"'));
+		ok(!script.includes("prompt"));
+		ok(!script.includes("OPENAI_API_KEY"));
+	});
+
+	it("accepts only exact token-bound terminal evidence and leaves malformed evidence uncertain", () => {
+		const context = markerContext("provider");
+		const calls = [];
+		const backend = workspaceBackend((args) => {
+			calls.push(args);
+			return JSON.stringify({
+				schemaVersion: 1,
+				kind: "switchyard_provider_terminal",
+				token: "11111111-1111-4111-8111-111111111111",
+				status: "stopped",
+				exitCode: 0,
+			});
+		});
+		const path = backend.providerTerminalEvidencePath(WORK_UUID, context);
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, {
+				token: "11111111-1111-4111-8111-111111111111",
+			}).status,
+			"confirmed",
+		);
+		strictEqual(calls.length, 1);
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, {
+				token: "other-token",
+			}).status,
+			"uncertain",
+		);
+		ok(path.startsWith("/tmp/switchyard-provider-provider-"));
+	});
+
+	it("fails closed for stale, malformed, oversized, or mismatched terminal evidence", () => {
+		const context = markerContext("provider");
+		const token = "11111111-1111-4111-8111-111111111111";
+		let response = JSON.stringify({
+			schemaVersion: 1,
+			kind: "switchyard_provider_terminal",
+			token,
+			status: "stopped",
+			exitCode: 17,
+		});
+		const calls = [];
+		const backend = workspaceBackend((args) => {
+			calls.push(args);
+			return response;
+		});
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, { token })
+				.status,
+			"confirmed",
+		);
+		response = JSON.stringify({
+			schemaVersion: 1,
+			kind: "switchyard_provider_terminal",
+			token: "22222222-2222-4222-8222-222222222222",
+			status: "stopped",
+			exitCode: 17,
+		});
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, { token })
+				.reason,
+			"evidence_mismatched",
+		);
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, {
+				token: "333333333333333333333333333333333333",
+			}).reason,
+			"evidence_identity_unavailable",
+		);
+		response = "{";
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, { token })
+				.reason,
+			"evidence_malformed",
+		);
+		response = "x".repeat(1025);
+		strictEqual(
+			backend.readProviderTerminalEvidence(WORK_UUID, context, { token })
+				.reason,
+			"evidence_oversized",
+		);
+		strictEqual(
+			backend.readProviderTerminalEvidence(
+				WORK_UUID,
+				{
+					...context,
+					operation: "helper",
+				},
+				{ token },
+			).reason,
+			"evidence_identity_unavailable",
+		);
+		strictEqual(
+			backend.readProviderTerminalEvidence(
+				"{33333333-3333-4333-8333-333333333333}",
+				context,
+				{ token },
+			).reason,
+			"evidence_identity_unavailable",
+		);
+		strictEqual(
+			calls.length,
+			4,
+			"identity validation must avoid an unsafe guest read",
+		);
+	});
+
+	it("reports terminal evidence cleanup removal or uncertainty", () => {
+		const context = markerContext("provider");
+		const calls = [];
+		const statuses = [];
+		const backend = new ParallelsExecutionBackend({
+			aquaUid: 501,
+			onStatus: (status) => statuses.push(status),
+		});
+		backend.execGuest = (...args) => {
+			calls.push(args);
+			return "";
+		};
+		deepStrictEqual(backend.clearProviderTerminalEvidence(WORK_UUID, context), {
+			status: "removed",
+		});
+		strictEqual(calls.length, 1);
+		strictEqual(statuses.at(-1)?.event, "provider_terminal_evidence_removed");
+		backend.execGuest = () => {
+			throw new Error("transport unavailable");
+		};
+		deepStrictEqual(backend.clearProviderTerminalEvidence(WORK_UUID, context), {
+			status: "uncertain",
+			reason: "evidence_cleanup_uncertain",
+		});
+		deepStrictEqual(
+			backend.clearProviderTerminalEvidence(WORK_UUID, {
+				...context,
+				operation: "helper",
+			}),
+			{
+				status: "uncertain",
+				reason: "evidence_cleanup_uncertain",
+			},
+		);
 	});
 
 	it("separates helper markers and refuses signaling without guest birth proof", () => {
@@ -3511,7 +3707,7 @@ describe("VM ownership metadata", () => {
 		const source = readFileSync(sourcePath, "utf8");
 		strictEqual(
 			createHash("sha256").update(source, "utf8").digest("hex"),
-			"9baa894b91bebd98968f2ec8b2c8a8a2cd016d67a70bad5001e035210f93590c",
+			"36fa41ae30d18d70e005502d7518711e4195fdf2fa830f1a8b3a7b2cc1a9aa28",
 		);
 
 		const calls = [];

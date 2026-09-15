@@ -12,8 +12,10 @@ import {
 	captureProviderDiffAsync,
 	captureProviderDiffDetailed,
 	captureProviderDiffDetailedAsync,
+	completeSynchronousProviderExit,
 	executeProviderInvocation,
 	getWorkspaceExecution,
+	reconcileSynchronousProviderExit,
 	runProviderProcess,
 } from "./provider-lifecycle.mjs";
 import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
@@ -344,7 +346,10 @@ export function execute(prompt, workingContainerName, options = {}) {
 			options.onStatus,
 		);
 		if (mismatch) return servedModelFailure(execution.selector, servedModel);
-		return { output, success: true, servedModel };
+		return {
+			...completeSynchronousProviderExit(output, execution.args, options),
+			servedModel,
+		};
 	} catch (error) {
 		const timedOut = error?.code === "ETIMEDOUT";
 		if (timedOut && execution) {
@@ -362,6 +367,22 @@ export function execute(prompt, workingContainerName, options = {}) {
 				...cleanup,
 			};
 		}
+		const reconciled = execution
+			? reconcileSynchronousProviderExit(error, execution.args, {
+					...options,
+					provider: "vibe",
+				})
+			: null;
+		if (reconciled?.success) {
+			const { servedModel, mismatch } = classifyServedModel(
+				readServedModelSync(workingContainerName, options),
+				execution.selector,
+				options.onStatus,
+			);
+			if (mismatch) return servedModelFailure(execution.selector, servedModel);
+			return { ...reconciled, servedModel };
+		}
+		if (reconciled) return reconciled;
 		const described = describeExecError(error, { provider: "vibe" });
 		return {
 			output: described.output,

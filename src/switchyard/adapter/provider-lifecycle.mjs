@@ -108,6 +108,126 @@ export function createProgressSnapshot({
 // classification must use the original provider binding without decoding or
 // trusting caller-supplied transport text.
 const WORKSPACE_PROVIDER_COMMANDS = new WeakMap();
+const WORKSPACE_PROVIDER_TERMINAL_EVIDENCE = new WeakMap();
+
+function terminalEvidenceFor(args) {
+	return WORKSPACE_PROVIDER_TERMINAL_EVIDENCE.get(args) ?? null;
+}
+
+function reconcileProviderTerminalEvidence(
+	args,
+	{ executionBackend, cleanupContext, onStatus },
+) {
+	const evidence = terminalEvidenceFor(args);
+	let reconciled;
+	try {
+		reconciled = executionBackend.readProviderTerminalEvidence(
+			cleanupContext.workspaceId,
+			cleanupContext,
+			{ token: evidence?.token, onStatus },
+		);
+	} catch {
+		return { status: "uncertain" };
+	}
+	if (reconciled?.status !== "confirmed") {
+		return { status: "uncertain" };
+	}
+	let cleanupStatus = "uncertain";
+	try {
+		const cleanup = executionBackend.clearProviderTerminalEvidence(
+			cleanupContext.workspaceId,
+			cleanupContext,
+			{ onStatus },
+		);
+		if (cleanup?.status === "removed") cleanupStatus = "removed";
+	} catch {
+		// The provider result remains exact, but sidecar removal is unavailable.
+	}
+	return {
+		status: "confirmed",
+		exitCode: reconciled.exitCode,
+		cleanupStatus,
+	};
+}
+
+/**
+ * Reconcile an ambiguous synchronous Parallels provider result. Returns null
+ * when the failure is not an eligible transport exit, so adapter-specific
+ * timeout and ordinary error handling remain authoritative.
+ */
+export function reconcileSynchronousProviderExit(
+	error,
+	args,
+	{ provider, executionBackend, cleanupContext, onStatus } = {},
+) {
+	if (
+		error?.code === "ETIMEDOUT" ||
+		error?.status !== 255 ||
+		error?.signal != null ||
+		typeof executionBackend?.readProviderTerminalEvidence !== "function" ||
+		cleanupContext?.operation !== "provider"
+	) {
+		return null;
+	}
+	const terminal = reconcileProviderTerminalEvidence(args, {
+		executionBackend,
+		cleanupContext,
+		onStatus,
+	});
+	const described = describeExecError(error, { provider });
+	if (terminal.status === "confirmed" && terminal.exitCode === 0) {
+		return {
+			output: described.output,
+			success: true,
+			terminalEvidenceStatus: "confirmed",
+			terminalEvidenceCleanupStatus: terminal.cleanupStatus,
+		};
+	}
+	return {
+		output: described.output,
+		success: false,
+		error: described.error,
+		errorKind: described.errorKind,
+		timedOut: false,
+		exitCode:
+			terminal.status === "confirmed" ? terminal.exitCode : error.status,
+		terminalEvidenceStatus: terminal.status,
+		...(terminal.cleanupStatus
+			? { terminalEvidenceCleanupStatus: terminal.cleanupStatus }
+			: {}),
+	};
+}
+
+/** Remove the exact-attempt sidecar after a synchronous transport succeeds. */
+export function completeSynchronousProviderExit(
+	output,
+	args,
+	{ executionBackend, cleanupContext, onStatus } = {},
+) {
+	if (
+		!terminalEvidenceFor(args) ||
+		cleanupContext?.operation !== "provider" ||
+		typeof executionBackend?.clearProviderTerminalEvidence !== "function"
+	) {
+		return { output, success: true };
+	}
+	let cleanupStatus = "uncertain";
+	try {
+		const cleanup = executionBackend.clearProviderTerminalEvidence(
+			cleanupContext.workspaceId,
+			cleanupContext,
+			{ onStatus },
+		);
+		if (cleanup?.status === "removed") cleanupStatus = "removed";
+	} catch {
+		// Direct provider success stands; only sidecar cleanup is unavailable.
+	}
+	return {
+		output,
+		success: true,
+		terminalEvidenceCleanupStatus: cleanupStatus,
+	};
+}
 
 const PROOF_ID_RE = /^[A-Za-z0-9._:/-]{1,256}$/;
 
@@ -246,6 +366,12 @@ export function getWorkspaceExecution(
 	const args = [...execution.args];
 	if (originalProviderCommand !== null) {
 		WORKSPACE_PROVIDER_COMMANDS.set(args, originalProviderCommand);
+		if (execution.terminalEvidence) {
+			WORKSPACE_PROVIDER_TERMINAL_EVIDENCE.set(
+				args,
+				execution.terminalEvidence,
+			);
+		}
 	}
 	return { command: execution.command, args };
 }
@@ -719,10 +845,65 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		}
 		return mutation;
 	};
-	const result = await runProviderProcess(command, args, {
+	let result = await runProviderProcess(command, args, {
 		...lifecycleOptions,
 		cleanup: cleanupWithProtocol,
 	});
+	let terminalEvidenceStatus = null;
+	let terminalEvidenceCleanupStatus = null;
+	if (
+		result.code === 255 &&
+		result.signal === null &&
+		!result.timedOut &&
+		!result.silenceTimedOut &&
+		!result.cancelled &&
+		!result.cleanupFailed &&
+		typeof executionBackend?.readProviderTerminalEvidence === "function" &&
+		cleanupContext?.operation === "provider"
+	) {
+		const terminal = reconcileProviderTerminalEvidence(args, {
+			executionBackend,
+			cleanupContext,
+			onStatus,
+		});
+		terminalEvidenceStatus = terminal.status;
+		terminalEvidenceCleanupStatus = terminal.cleanupStatus ?? null;
+		if (terminal.status === "confirmed") {
+			result = {
+				...result,
+				code: terminal.exitCode,
+				error: null,
+				terminalEvidenceStatus: "confirmed",
+			};
+		} else {
+			result = { ...result, terminalEvidenceStatus: "uncertain" };
+		}
+	}
+	if (
+		terminalEvidenceFor(args) &&
+		result.code !== 255 &&
+		result.signal === null &&
+		!result.timedOut &&
+		!result.silenceTimedOut &&
+		!result.cancelled &&
+		!result.cleanupFailed &&
+		terminalEvidenceStatus === null &&
+		cleanupContext?.operation === "provider" &&
+		typeof executionBackend?.clearProviderTerminalEvidence === "function" &&
+		typeof executionBackend?.readProviderTerminalEvidence === "function"
+	) {
+		try {
+			const cleanup = executionBackend.clearProviderTerminalEvidence(
+				cleanupContext.workspaceId,
+				cleanupContext,
+				{ onStatus },
+			);
+			terminalEvidenceCleanupStatus =
+				cleanup?.status === "removed" ? "removed" : "uncertain";
+		} catch {
+			terminalEvidenceCleanupStatus = "uncertain";
+		}
+	}
 	const complete = async (value) => {
 		if (typeof onProcessCompleted === "function") {
 			await onProcessCompleted({
@@ -740,7 +921,23 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		}
 		return { ...value, writerLifecycle: result.writerLifecycle };
 	};
-	if (result.success) return complete({ output: result.output, success: true });
+	if (result.success) {
+		return complete({
+			output: result.output,
+			success: true,
+			...(terminalEvidenceCleanupStatus
+				? { terminalEvidenceCleanupStatus }
+				: {}),
+		});
+	}
+	if (result.terminalEvidenceStatus === "confirmed" && result.code === 0) {
+		return complete({
+			output: result.output,
+			success: true,
+			terminalEvidenceStatus: "confirmed",
+			terminalEvidenceCleanupStatus,
+		});
+	}
 	// A provider whose container-side supervisor reports this reserved exit code
 	// finished its work but could not exit on its own (see opencode.mjs). The
 	// work is in the working tree, so it is mapped to success and the captured
@@ -887,6 +1084,8 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		exitCode: Number.isSafeInteger(result.code) ? result.code : null,
 		signal: result.signal ?? null,
 		diagnosticEvidence,
+		terminalEvidenceStatus,
+		...(terminalEvidenceCleanupStatus ? { terminalEvidenceCleanupStatus } : {}),
 	});
 }
 
