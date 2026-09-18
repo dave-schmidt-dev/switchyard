@@ -37,6 +37,39 @@ function outcome(overrides = {}) {
 }
 
 describe("closed outcome schema", () => {
+	// The artifact detail whitelist is closed, and an unlisted key does not
+	// raise -- the event is simply dropped. Adding `captureStatus` to the
+	// transition without adding it here silently removed every artifact fact
+	// and failed two runner tests with "missing typed artifact production
+	// fact" rather than a schema error. Lock both directions.
+	it("carries an artifact capture status and still rejects unlisted keys", () => {
+		const accepted = outcome({
+			stage: "artifact",
+			producer: "runner",
+			status: "failed",
+			detail: {
+				code: "artifact_capture",
+				artifactKind: "diff",
+				captured: false,
+				captureStatus: "transport_failed",
+			},
+		});
+		strictEqual(validateOutcomeEvent(accepted), accepted);
+
+		const rejected = outcome({
+			stage: "artifact",
+			producer: "runner",
+			status: "failed",
+			detail: {
+				code: "artifact_capture",
+				artifactKind: "diff",
+				captured: false,
+				captureNotes: "free prose",
+			},
+		});
+		throws(() => validateOutcomeEvent(rejected), /detail/);
+	});
+
 	it("reads every version-1 stage and rejects forward minimum-reader requirements", () => {
 		for (const stage of OUTCOME_STAGES) {
 			const event = outcome({

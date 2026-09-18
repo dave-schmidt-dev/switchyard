@@ -71,6 +71,7 @@ describe("shared outcome transitions", () => {
 			status: "succeeded",
 			code: "artifact_capture",
 			artifactKind: "diff",
+			captureStatus: "captured",
 			captured: true,
 			contentHash: null,
 		});
@@ -86,6 +87,45 @@ describe("shared outcome transitions", () => {
 			"retry_started",
 		);
 		throws(() => retryTransition({ kind: "provider_retry" }), /unknown retry/);
+	});
+
+	// Regression: a failed capture and an empty one both land on
+	// `artifact_capture` with `captured: false`. Before captureStatus rode
+	// along, the durable record could not tell them apart, and an agy
+	// investigation on 2026-09-18 burned three VM probes re-establishing that
+	// the provider had written its file and the CAPTURE had failed.
+	it("distinguishes every capture failure mode from an empty capture", () => {
+		const empty = artifactTransition({ captureStatus: "empty" });
+		strictEqual(empty.status, "succeeded");
+		strictEqual(empty.captured, false);
+		strictEqual(empty.captureStatus, "empty");
+
+		for (const status of [
+			"stage_failed",
+			"transport_failed",
+			"diff_failed",
+			"invalid_workspace",
+			"timed_out",
+		]) {
+			const decision = artifactTransition({ captureStatus: status });
+			strictEqual(decision.status, "failed", status);
+			strictEqual(decision.captured, false, status);
+			strictEqual(decision.captureStatus, status, status);
+		}
+
+		// An absent status stays uncertain and reports no capture status at all,
+		// rather than inventing one.
+		const unknown = artifactTransition({});
+		strictEqual(unknown.status, "uncertain");
+		strictEqual(unknown.code, "artifact_evidence_unavailable");
+		strictEqual(unknown.captureStatus, null);
+
+		// A skipped artifact carries no capture status either.
+		strictEqual(
+			artifactTransition({ expectsArtifact: false, captureStatus: "captured" })
+				.status,
+			"skipped",
+		);
 	});
 
 	it("keeps review, cleanup, recovery, and summary decisions deterministic", () => {

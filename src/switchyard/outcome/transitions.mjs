@@ -279,6 +279,16 @@ export function artifactTransition(input = {}) {
 				? "artifact_evidence_unavailable"
 				: "artifact_capture",
 		artifactKind: "diff",
+		// The exact capture status rides along with the verdict. Without it a
+		// failed capture is indistinguishable from an empty one in the durable
+		// record: `artifact_capture` covers `stage_failed`, `transport_failed`,
+		// `diff_failed`, `task_base_invalid`, `invalid_workspace` and
+		// `timed_out` alike, and on 2026-09-18 that cost a full agy
+		// investigation -- the provider had succeeded and the capture had
+		// failed, but the record could not say which capture step. These are
+		// fixed enum codes produced by switchyard, never provider output, so
+		// carrying one does not touch INV-2.
+		captureStatus,
 		captured: captureStatus === "captured",
 		contentHash:
 			typeof input.contentHash === "string" &&

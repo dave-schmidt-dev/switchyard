@@ -99,6 +99,11 @@ const DETAIL_KEYS = Object.freeze({
 		"reasonCode",
 		"artifactKind",
 		"captured",
+		// Which capture step produced the verdict. `code` alone collapses
+		// `stage_failed`, `transport_failed`, `diff_failed`, `task_base_invalid`,
+		// `invalid_workspace` and `timed_out` into one `artifact_capture`, which
+		// made a failed capture unreadable as anything but an empty diff.
+		"captureStatus",
 		"contentHash",
 	]),
 	integration: new Set(["code", "reasonCode", "gateCode", "accepted"]),

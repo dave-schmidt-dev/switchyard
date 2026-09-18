@@ -7281,6 +7281,9 @@ async function emitTaskStageOutcomes(context, task, result) {
 		detail: {
 			artifactKind: artifactDecision.artifactKind,
 			captured: artifactDecision.captured,
+			...(artifactDecision.captureStatus
+				? { captureStatus: artifactDecision.captureStatus }
+				: {}),
 		},
 	});
 	const integrationReached =
