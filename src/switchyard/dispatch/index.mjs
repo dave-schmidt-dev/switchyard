@@ -45,6 +45,7 @@ import {
 	statSync,
 } from "node:fs";
 import { readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import {
 	basename,
 	dirname,
@@ -1446,7 +1447,59 @@ async function runDispatch(opts, dependencies = {}) {
 			`${result.completedTaskIds.length} completed, ${failed.length} failed, ${deferredCount} deferred`,
 	);
 	report(`dispatch: checkpoint ${result.checkpointPath}`);
+	renewDispatchReceipts(result.checkpointPath, report);
 	process.exitCode = failed.length > 0 ? 1 : deferredCount > 0 ? 6 : 0;
+}
+
+/**
+ * Extend the dispatch receipts this run just re-earned.
+ *
+ * A `dispatch_qualified` receipt expires after 30 days, and until now the only
+ * way to refresh one was a human running a canary per target. On 2026-09-18 a
+ * batch promoted together aged out together and left six targets
+ * un-dispatchable, every one of which answered a direct call perfectly well.
+ * A successful dispatch is strictly better evidence than a canary -- it is the
+ * real workload rather than a marker-file proxy -- so a descriptor that just
+ * completed one has re-earned its receipt.
+ *
+ * Delegated to `roster renew` rather than written here, so `rosterlib` remains
+ * the single writer of roster.json (`rosterlib/promote.py`'s module docstring);
+ * a second implementation in JS is exactly the writer drift that invariant
+ * exists to prevent. `roster renew` itself refuses to create a receipt or to
+ * touch a slot that has moved, so this call cannot widen routing authority.
+ *
+ * Best-effort by construction: the run has already succeeded and its result is
+ * already durable. A roster that is locked, missing, or refuses the renewal is
+ * reported and stepped over, because failing a completed dispatch over a
+ * bookkeeping write would be a worse regression than the expiry it prevents.
+ */
+// Bounded so a wedged roster lock cannot hold a finished dispatch open. Thirty
+// seconds is the lock's own ten-second default wait plus headroom for the node
+// startup `roster renew` pays to resolve each slot it checks.
+const RENEWAL_TIMEOUT_MS = 30_000;
+
+function renewDispatchReceipts(checkpointPath, report) {
+	if (!checkpointPath) return;
+	const cli = resolve(homedir(), ".agent", "bin", "roster");
+	if (!existsSync(cli)) return;
+	const renewal = spawnSync(cli, ["renew", checkpointPath], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		timeout: RENEWAL_TIMEOUT_MS,
+	});
+	if (renewal.status !== 0) {
+		const detail = (renewal.stderr || renewal.stdout || "")
+			.trim()
+			.split("\n")
+			.pop();
+		report(
+			`dispatch: receipt renewal skipped (${detail || "roster renew failed"})`,
+		);
+		return;
+	}
+	for (const line of (renewal.stdout || "").trim().split("\n")) {
+		if (line.startsWith("renewed")) report(`dispatch: ${line}`);
+	}
 }
 
 function captureHostFingerprint(projectPath) {
@@ -3611,6 +3664,7 @@ export {
 	parseResultArgs,
 	parseStatusArgs,
 	probeProviderProcess,
+	renewDispatchReceipts,
 	resolveIsRunDead,
 	runDispatch,
 	SIMPLE_USAGE,
