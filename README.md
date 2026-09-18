@@ -546,8 +546,21 @@ admission on one rule set and be rejected at routing on another. Its closed
 reason codes are `invalid_platform`, `invalid_usage_mode`,
 `target_identity_unavailable`, `adapter_unavailable`, `explicitly_excluded`,
 `not_in_only_allowlist`, `below_required_capability`,
-`no_invocation_descriptor`, `not_golden_image_verified`,
-`provider_unavailable`, `no_quota_headroom`, and `eligible`; preflight adds
+`not_golden_image_verified`,
+`provider_unavailable`, `no_quota_headroom`, and `eligible`. A target with no
+usable invocation descriptor is reported as one of five specific gaps rather
+than a single opaque code, because each has a different remedy:
+`not_configured` (no slot for that capability resolves a descriptor — roster
+data, not qualification), `qualification_missing` (never dispatch-qualified;
+run an authorized canary), `qualification_superseded` (dispatch receipts exist
+but none for today's descriptor, because the slot moved), `qualification_expired`
+(the exact receipt no longer describes the environment — it aged past
+`STALE_MAX_AGE_SECONDS`, or the CLI, wrapper or credential profile drifted;
+re-canary and promote),
+and `qualification_invalid` (a receipt that cannot authorize dispatch). The
+older collapsed `no_invocation_descriptor` survives only for a caller that
+injects its own descriptor predicate, such as `--qualification-attempt`.
+Preflight adds
 `route_health_suppressed` when route health is in `enforce` mode and the
 target is held (see [Route health](#route-health-shadow-by-default)). Host
 readiness is probed before any slot is occupied, so a host problem surfaces as

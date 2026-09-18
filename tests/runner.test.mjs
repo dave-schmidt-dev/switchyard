@@ -10268,7 +10268,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 					strictEqual(error.name, "QueuePreflightError");
 					strictEqual(
 						error.message,
-						"macOS queue provider preflight failed: high: no_golden_image_verified_provider_with_quota_headroom (excluded: claude; reasons: claude: no_invocation_descriptor)",
+						"macOS queue provider preflight failed: high: no_golden_image_verified_provider_with_quota_headroom (excluded: claude; reasons: claude: qualification_missing)",
 					);
 					return true;
 				},
@@ -10359,7 +10359,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 					strictEqual(error.name, "QueuePreflightError");
 					strictEqual(
 						error.message,
-						"macOS queue provider preflight failed: high: no_golden_image_verified_provider_with_quota_headroom (excluded: claude, codex; reasons: claude: no_invocation_descriptor, codex: no_invocation_descriptor)",
+						"macOS queue provider preflight failed: high: no_golden_image_verified_provider_with_quota_headroom (excluded: claude, codex; reasons: claude: qualification_missing, codex: qualification_missing)",
 					);
 					return true;
 				},

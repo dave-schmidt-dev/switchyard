@@ -1425,6 +1425,156 @@ function getDescriptorForCapability(
 }
 
 /**
+ * Why a target has no automatically usable descriptor at a capability class.
+ *
+ * `getInvocationDescriptor` answers yes/no, and every no reached the operator
+ * as the single router reason `no_invocation_descriptor` — which reads as
+ * "this provider is not supported here". On 2026-09-18 that sent two sessions
+ * chasing a nonexistent routing-flag bug: every target except Vibe had simply
+ * aged past STALE_MAX_AGE_SECONDS, five days after a batch qualified together
+ * on 2026-08-14. The five states below have five different remedies, so the
+ * router reports which one applies rather than collapsing them.
+ */
+export const DESCRIPTOR_GAP = Object.freeze({
+	// No owner-configured slot resolves a descriptor at all: no slot for this
+	// capability, an inactive model, a manual-only slot, or an invocation the
+	// harness cannot express. Not a qualification problem — roster data.
+	NOT_CONFIGURED: "not_configured",
+	// A descriptor is configured but the target carries no dispatch receipt of
+	// any kind. Remedy: run an authorized qualification canary.
+	QUALIFICATION_MISSING: "qualification_missing",
+	// Dispatch receipts exist, but none for the identity this slot resolves
+	// today — the slot's model, selector, effort or argv moved after the last
+	// canary. The old evidence is permanently dead; remedy is a canary against
+	// the new descriptor, not a refresh of the old one.
+	QUALIFICATION_SUPERSEDED: "qualification_superseded",
+	// An exact receipt for today's identity exists but is stale: past the age
+	// window, or its recorded signature no longer matches the live one.
+	// Remedy: re-run the same canary and promote the refreshed receipt.
+	QUALIFICATION_EXPIRED: "qualification_expired",
+	// An exact, non-stale receipt exists but cannot authorize dispatch —
+	// a non-atomic or otherwise malformed promotion receipt, or evidence
+	// explicitly marked untransmittable or temporarily unavailable.
+	QUALIFICATION_INVALID: "qualification_invalid",
+});
+
+/**
+ * Classify why automatic dispatch is unavailable for (provider, capability).
+ *
+ * Returns `null` when a descriptor IS automatically usable, so the result
+ * reads as "the gap, if any". Never throws: this runs per-provider inside the
+ * preflight eligibility loop, where an exception would convert a classified
+ * preflight failure into an unclassified `environment_incomplete` — the exact
+ * failure mode this export exists to make legible.
+ *
+ * @param {string} providerName target id, snapshot name, or unambiguous harness
+ * @param {string} capabilityClass
+ * @param {object} [options] forwarded to the qualification age check (tests)
+ * @returns {string|null} a DESCRIPTOR_GAP value, or null when usable
+ */
+export function describeDescriptorGap(
+	providerName,
+	capabilityClass,
+	options = {},
+) {
+	try {
+		if (getInvocationDescriptor(providerName, capabilityClass)) return null;
+	} catch {
+		// getInvocationDescriptor throws only on an unrecognized capability
+		// class. Nothing is configured for a capability that does not exist,
+		// and saying so beats propagating into the preflight loop.
+		return DESCRIPTOR_GAP.NOT_CONFIGURED;
+	}
+	try {
+		const roster = getRoster();
+		const models =
+			roster.models && typeof roster.models === "object" ? roster.models : {};
+		const targets =
+			roster.targets && typeof roster.targets === "object"
+				? roster.targets
+				: {};
+		const entry = findTargetEntryForDescriptor(targets, providerName);
+		if (!entry) return DESCRIPTOR_GAP.NOT_CONFIGURED;
+
+		// The configured descriptors this slot resolves today, in the same
+		// priority order getDescriptorForCapability would have preferred.
+		const slots = entry.target.slots?.[capabilityClass];
+		const configured = [];
+		for (const slot of Array.isArray(slots) ? slots : []) {
+			if (!slot || typeof slot !== "object" || slot.manual_only) continue;
+			const model = models[slot.model_ref];
+			if (model?.status !== "active") continue;
+			const descriptor = resolveConfiguredDispatchDescriptor(
+				entry.id,
+				entry.target,
+				models,
+				slot,
+			);
+			if (!descriptor) continue;
+			configured.push({
+				priority: Number.isInteger(slot.priority)
+					? slot.priority
+					: Number.POSITIVE_INFINITY,
+				descriptor,
+				slot,
+				model,
+			});
+		}
+		if (configured.length === 0) return DESCRIPTOR_GAP.NOT_CONFIGURED;
+		configured.sort((a, b) => a.priority - b.priority);
+
+		const qualifications =
+			entry.target.qualifications &&
+			typeof entry.target.qualifications === "object"
+				? entry.target.qualifications
+				: {};
+		const dispatchRecords = Object.values(qualifications).filter(
+			(record) =>
+				record &&
+				typeof record === "object" &&
+				record.status === QUALIFICATION_STATUS.DISPATCH_QUALIFIED,
+		);
+		if (dispatchRecords.length === 0)
+			return DESCRIPTOR_GAP.QUALIFICATION_MISSING;
+
+		// Classify against the highest-priority configured descriptor: that is
+		// the one the operator would re-canary, so its state is the one worth
+		// naming. A lower-priority slot in a different state does not change
+		// the remedy for this capability.
+		const { descriptor, slot, model } = configured[0];
+		const exact = dispatchRecords.filter(
+			(record) => record.descriptor_identity === descriptor.descriptor_identity,
+		);
+		if (exact.length === 0) return DESCRIPTOR_GAP.QUALIFICATION_SUPERSEDED;
+
+		const currentSignature = currentQualificationSignature(
+			entry.target,
+			slot,
+			model,
+			descriptor,
+		);
+		const nowIso = options.nowIso ?? new Date().toISOString();
+		const maxAgeSeconds = options.maxAgeSeconds ?? STALE_MAX_AGE_SECONDS;
+		const anyStale = exact.some(
+			(record) =>
+				computeQualificationStatus(
+					record,
+					currentSignature,
+					nowIso,
+					maxAgeSeconds,
+				) !== QUALIFICATION_STATUS.DISPATCH_QUALIFIED ||
+				record.freshness === "stale" ||
+				record.freshness?.status === "stale",
+		);
+		return anyStale
+			? DESCRIPTOR_GAP.QUALIFICATION_EXPIRED
+			: DESCRIPTOR_GAP.QUALIFICATION_INVALID;
+	} catch {
+		return DESCRIPTOR_GAP.QUALIFICATION_MISSING;
+	}
+}
+
+/**
  * Whether a target has current exact qualification evidence for automatic
  * dispatch at a capability class. This is intentionally stricter than the
  * legacy capability helpers, which remain readable for compatibility but must

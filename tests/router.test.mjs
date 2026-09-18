@@ -984,7 +984,11 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			strictEqual(result.reason, "no_eligible");
 			ok(
 				result.log.some((entry) =>
-					entry.includes("Vibe: no usable invocation descriptor"),
+					// `qualified` is probe evidence, not a dispatch receipt, so
+					// this target has never been dispatch-qualified — the log
+					// names that gap specifically rather than the old collapsed
+					// "no usable invocation descriptor".
+					entry.includes("Vibe: never dispatch-qualified"),
 				),
 				"selector-only Vibe must not become an automatic OpenCode route",
 			);
@@ -1017,9 +1021,11 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 					snapshotStatus: "fresh",
 				}),
 			});
+			// This fixture's target carries no dispatch receipt at all, which is
+			// the "never canaried" gap rather than a receipt that aged out.
 			strictEqual(
 				preflight.capabilityResults[0].excludedReasons.Vibe,
-				"no_invocation_descriptor",
+				"qualification_missing",
 			);
 		} finally {
 			if (previousRosterPath === undefined) {
@@ -2118,7 +2124,7 @@ describe("Task 6.3 macOS provider-eligibility preflight", () => {
 
 			strictEqual(
 				result.rejection.excludedReasons.claude,
-				"no_invocation_descriptor",
+				"qualification_missing",
 			);
 		} finally {
 			if (previousPath === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;

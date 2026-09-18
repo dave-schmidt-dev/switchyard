@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { snapshotAdmissionFailure } from "../broker/snapshots.mjs";
 import {
 	CAPABILITY_CLASS,
+	describeDescriptorGap,
 	getImplementorPriority,
 	getRightSizedModel,
 	hasAutomaticInvocationDescriptor,
@@ -348,7 +349,17 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 		return { eligible: false, reason: "below_required_capability" };
 	}
 	if (!hasInvocationDescriptor(name, requiredCapability)) {
-		return { eligible: false, reason: "no_invocation_descriptor" };
+		// Name which of the four descriptor gaps applies, because each has a
+		// different remedy and the collapsed reason read as "unsupported here"
+		// (see DESCRIPTOR_GAP). Only the roster-backed default predicate can be
+		// explained this way: a caller that injected its own predicate — the
+		// qualification-attempt path does — is asking a different question, and
+		// the classifier's answer would not describe the refusal that happened.
+		const gap =
+			hasInvocationDescriptor === hasAutomaticInvocationDescriptor
+				? describeDescriptorGap(name, requiredCapability)
+				: null;
+		return { eligible: false, reason: gap ?? "no_invocation_descriptor" };
 	}
 	if (
 		platform === "macos" &&
@@ -940,6 +951,11 @@ export function route(options = {}) {
 				not_in_only_allowlist: `provider ${name}: not in --only-provider allowlist`,
 				below_required_capability: `provider ${name}: below required capability ${effectiveCapabilityClass}`,
 				no_invocation_descriptor: `provider ${name}: no usable invocation descriptor for ${effectiveCapabilityClass}`,
+				not_configured: `provider ${name}: no ${effectiveCapabilityClass} slot resolves a descriptor (roster data, not qualification)`,
+				qualification_missing: `provider ${name}: never dispatch-qualified; run an authorized canary for ${effectiveCapabilityClass}`,
+				qualification_superseded: `provider ${name}: dispatch receipts exist but none for today's ${effectiveCapabilityClass} descriptor; the slot moved — re-canary the new one`,
+				qualification_expired: `provider ${name}: ${effectiveCapabilityClass} dispatch receipt no longer describes this environment (aged out, or CLI/wrapper/credential drift); re-run the canary and promote the refreshed receipt`,
+				qualification_invalid: `provider ${name}: ${effectiveCapabilityClass} dispatch receipt cannot authorize dispatch (missing promotion receipt or untransmittable evidence)`,
 				provider_unavailable: `provider ${name}: unavailable (ok=false)`,
 			};
 			log.push(
