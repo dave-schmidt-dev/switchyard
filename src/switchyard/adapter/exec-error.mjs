@@ -405,6 +405,19 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"provider_cleanup_failed",
 	...Object.values(CLEANUP_STAGE_DIAGNOSTIC_CODES),
 	"diff_capture_failed",
+	// The codes `taskBaseReleaseDiagnosticCode()` computes. Without them the
+	// sanitizer's closed filter silently dropped `diagnosticCode`, so every
+	// release failure recorded the same generic `diff_capture_failed` /
+	// "Diff capture failed." — which is how a Parallels job misfire spent a
+	// session looking like a provider or capture defect. These are fixed enum
+	// strings switchyard derives from an error's own shape, never provider
+	// output, so INV-2 is untouched.
+	"task_base_release_ownership_invalid",
+	"task_base_release_marker_invalid",
+	"task_base_release_aborted",
+	"task_base_release_timed_out",
+	"task_base_release_transport_lost",
+	"task_base_release_failed",
 	"declared_path_not_seeded",
 	"integration_failed",
 	"required_paths_missing",

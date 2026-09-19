@@ -882,12 +882,23 @@ export function validateTaskStartTree(
 	) {
 		throw new TypeError("task base ref must be in refs/switchyard/task-base");
 	}
+	// `rev-parse --verify` is a pure read, and every other idempotent task-base
+	// probe already absorbs the Parallels 27.0.0 job misfire this way (see
+	// `task_base_stage`, `task_base_write`, and both `_reconcile` probes). This
+	// one was the omission, and it sits first in `releaseTaskStartTree` —
+	// ahead of the try block that reconciles a lost `update-ref -d`. So a
+	// misfire here aborted the release before any of that recovery could run,
+	// stamped the base `taskBaseReleaseUncertain`, and reported
+	// `task_base_release_transport_lost` for a release that was never attempted.
+	// Measured on 2026-09-18: 2 of 12 canaries, against a documented ~3.3%
+	// per-call serial misfire rate that a single retry clears.
 	const actualTree = backendGit(
 		executionBackend,
 		workspaceId,
 		["rev-parse", "--verify", `${ref}^{tree}`],
 		options,
 		"task_base_validate",
+		{ retryLostResult: true },
 	).trim();
 	if (actualTree !== expectedTree) {
 		throw new Error("task base ref does not match the recorded tree");
@@ -918,6 +929,7 @@ export async function validateTaskStartTreeAsync(
 			["rev-parse", "--verify", `${ref}^{tree}`],
 			options,
 			"task_base_validate",
+			{ retryLostResult: true },
 		)
 	).trim();
 	if (actualTree !== expectedTree)
