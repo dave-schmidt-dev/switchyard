@@ -29,18 +29,24 @@ import {
 	AGY_SILENCE_TIMEOUT_MS,
 	captureDiff as captureAgyDiff,
 	captureDiffAsync as captureAgyDiffAsync,
+	captureDiffDetailed as captureAgyDiffDetailed,
+	captureDiffDetailedAsync as captureAgyDiffDetailedAsync,
 	executeAgy,
 	executeAgyAsync,
 } from "../adapter/agy.mjs";
 import {
 	captureDiff as captureClaudeDiff,
 	captureDiffAsync as captureClaudeDiffAsync,
+	captureDiffDetailed as captureClaudeDiffDetailed,
+	captureDiffDetailedAsync as captureClaudeDiffDetailedAsync,
 	executeClaude,
 	executeClaudeAsync,
 } from "../adapter/claude.mjs";
 import {
 	captureDiff as captureCodexDiff,
 	captureDiffAsync as captureCodexDiffAsync,
+	captureDiffDetailed as captureCodexDiffDetailed,
+	captureDiffDetailedAsync as captureCodexDiffDetailedAsync,
 	executeCodex,
 	executeCodexAsync,
 } from "../adapter/codex.mjs";
@@ -48,12 +54,16 @@ import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../adapter/constants.mjs";
 import {
 	captureDiff as captureCopilotDiff,
 	captureDiffAsync as captureCopilotDiffAsync,
+	captureDiffDetailed as captureCopilotDiffDetailed,
+	captureDiffDetailedAsync as captureCopilotDiffDetailedAsync,
 	execute as executeCopilot,
 	executeAsync as executeCopilotAsync,
 } from "../adapter/copilot.mjs";
 import {
 	captureDiff as captureCursorDiff,
 	captureDiffAsync as captureCursorDiffAsync,
+	captureDiffDetailed as captureCursorDiffDetailed,
+	captureDiffDetailedAsync as captureCursorDiffDetailedAsync,
 	executeCursor,
 	executeCursorAsync,
 } from "../adapter/cursor.mjs";
@@ -69,6 +79,8 @@ import {
 import {
 	captureDiff as captureOpencodeDiff,
 	captureDiffAsync as captureOpencodeDiffAsync,
+	captureDiffDetailed as captureOpencodeDiffDetailed,
+	captureDiffDetailedAsync as captureOpencodeDiffDetailedAsync,
 	execute as executeOpencode,
 	executeAsync as executeOpencodeAsync,
 } from "../adapter/opencode.mjs";
@@ -10252,42 +10264,54 @@ function throwOnEmptyParse(tasksFilePath, checkpointPath, emitStatus) {
 // the orchestrator path never calls execute()/captureDiff() on these (its
 // dispatch goes through context.orchestrator.launch()), but still needs the
 // same key set so its availableProviders filter isn't always empty (Task E.1).
-const DEFAULT_ADAPTERS = {
+export const DEFAULT_ADAPTERS = {
 	claude: {
 		execute: executeClaude,
 		executeAsync: executeClaudeAsync,
 		captureDiff: captureClaudeDiff,
 		captureDiffAsync: captureClaudeDiffAsync,
+		captureDiffDetailed: captureClaudeDiffDetailed,
+		captureDiffDetailedAsync: captureClaudeDiffDetailedAsync,
 	},
 	codex: {
 		execute: executeCodex,
 		executeAsync: executeCodexAsync,
 		captureDiff: captureCodexDiff,
 		captureDiffAsync: captureCodexDiffAsync,
+		captureDiffDetailed: captureCodexDiffDetailed,
+		captureDiffDetailedAsync: captureCodexDiffDetailedAsync,
 	},
 	agy: {
 		execute: executeAgy,
 		executeAsync: executeAgyAsync,
 		captureDiff: captureAgyDiff,
 		captureDiffAsync: captureAgyDiffAsync,
+		captureDiffDetailed: captureAgyDiffDetailed,
+		captureDiffDetailedAsync: captureAgyDiffDetailedAsync,
 	},
 	cursor: {
 		execute: executeCursor,
 		executeAsync: executeCursorAsync,
 		captureDiff: captureCursorDiff,
 		captureDiffAsync: captureCursorDiffAsync,
+		captureDiffDetailed: captureCursorDiffDetailed,
+		captureDiffDetailedAsync: captureCursorDiffDetailedAsync,
 	},
 	copilot: {
 		execute: executeCopilot,
 		executeAsync: executeCopilotAsync,
 		captureDiff: captureCopilotDiff,
 		captureDiffAsync: captureCopilotDiffAsync,
+		captureDiffDetailed: captureCopilotDiffDetailed,
+		captureDiffDetailedAsync: captureCopilotDiffDetailedAsync,
 	},
 	opencode: {
 		execute: executeOpencode,
 		executeAsync: executeOpencodeAsync,
 		captureDiff: captureOpencodeDiff,
 		captureDiffAsync: captureOpencodeDiffAsync,
+		captureDiffDetailed: captureOpencodeDiffDetailed,
+		captureDiffDetailedAsync: captureOpencodeDiffDetailedAsync,
 	},
 	vibe: {
 		execute: executeVibe,

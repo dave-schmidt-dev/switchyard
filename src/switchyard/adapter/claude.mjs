@@ -20,6 +20,8 @@ import { addProviderPromptGuardrail } from "./prompt-guardrails.mjs";
 import {
 	captureProviderDiff,
 	captureProviderDiffAsync,
+	captureProviderDiffDetailed,
+	captureProviderDiffDetailedAsync,
 	completeSynchronousProviderExit,
 	executeProviderInvocation,
 	getWorkspaceExecution,
@@ -247,4 +249,12 @@ export function captureDiffAsync(workingContainerName, options = {}) {
 		return Promise.resolve(null);
 	}
 	return captureProviderDiffAsync(workingContainerName, options);
+}
+
+export function captureDiffDetailed(workingContainerName, options = {}) {
+	return captureProviderDiffDetailed(workingContainerName, options);
+}
+
+export function captureDiffDetailedAsync(workingContainerName, options = {}) {
+	return captureProviderDiffDetailedAsync(workingContainerName, options);
 }

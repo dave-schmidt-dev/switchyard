@@ -25,13 +25,37 @@ import { join, resolve } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	captureDiffDetailed as captureAgyDiffDetailed,
+	captureDiffDetailedAsync as captureAgyDiffDetailedAsync,
+} from "../src/switchyard/adapter/agy.mjs";
+import {
+	captureDiffDetailed as captureClaudeDiffDetailed,
+	captureDiffDetailedAsync as captureClaudeDiffDetailedAsync,
+} from "../src/switchyard/adapter/claude.mjs";
+import {
+	captureDiffDetailed as captureCodexDiffDetailed,
+	captureDiffDetailedAsync as captureCodexDiffDetailedAsync,
+} from "../src/switchyard/adapter/codex.mjs";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../src/switchyard/adapter/constants.mjs";
+import {
+	captureDiffDetailed as captureCopilotDiffDetailed,
+	captureDiffDetailedAsync as captureCopilotDiffDetailedAsync,
+} from "../src/switchyard/adapter/copilot.mjs";
+import {
+	captureDiffDetailed as captureCursorDiffDetailed,
+	captureDiffDetailedAsync as captureCursorDiffDetailedAsync,
+} from "../src/switchyard/adapter/cursor.mjs";
 import {
 	classifyPreProviderFailure,
 	INTEGRATION_REFUSAL_KINDS,
 	isPersistentFailureMetadata,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	captureDiffDetailed as captureOpencodeDiffDetailed,
+	captureDiffDetailedAsync as captureOpencodeDiffDetailedAsync,
+} from "../src/switchyard/adapter/opencode.mjs";
 import { DEFAULT_SILENCE_TIMEOUT_MS } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import {
 	HOST_POWER_STATES,
@@ -82,6 +106,7 @@ import {
 	createEmptyCheckpoint,
 	createQueueBackend,
 	createQueueIdentity,
+	DEFAULT_ADAPTERS,
 	deriveQueueDiagnostics,
 	emitStageOutcome,
 	executeTaskAsync as executeTaskAsyncImpl,
@@ -13026,6 +13051,148 @@ describe("runner runStore dependency", () => {
 });
 
 describe("executeTask timeout handling", () => {
+	it("retains every detailed diff-capture status after a timed-out execution", () => {
+		const statuses = [
+			"captured",
+			"empty",
+			"stage_failed",
+			"diff_failed",
+			"transport_failed",
+			"timed_out",
+		];
+
+		for (const status of statuses) {
+			const result = executeTask(
+				{ id: "1.1", title: "task", description: "failed task" },
+				{
+					route: () => ({
+						provider: "claude",
+						model: "claude-sonnet-5",
+						percentLeft: 50,
+						reason: "spread",
+					}),
+					recordDispatch: () => {},
+					recordDispatchIntent: () => {},
+					integrationGate: () => ({ success: true, message: "ok" }),
+					adapters: {
+						claude: {
+							execute: () => ({
+								success: false,
+								error: "provider timed out",
+								timedOut: true,
+							}),
+							captureDiffDetailed: () => ({
+								status,
+								diff: status === "captured" ? "diff --git a/a b/a" : null,
+							}),
+						},
+					},
+					projectPath: TEST_DIR,
+					workingContainerName: "fake-container",
+				},
+			);
+
+			strictEqual(result.captureStatus, status);
+			strictEqual(
+				result.result,
+				["captured", "empty"].includes(status)
+					? "execution_timed_out"
+					: "execution_timed_out_capture_failed",
+			);
+			strictEqual(
+				result.partialDiff,
+				status === "captured" ? "diff --git a/a b/a" : undefined,
+			);
+		}
+	});
+
+	it("uses detailed async capture evidence after a timed-out broker execution", async () => {
+		let legacyCaptureCalled = false;
+		const result = await executeTaskAsync(
+			{ id: "1.1", title: "task", description: "timed out task" },
+			{
+				broker: {
+					selectAndReserve: async () => ({
+						provider: "claude",
+						model: "claude-sonnet-5",
+						resolvedTarget: "claude",
+						harness: "claude",
+						capability: "standard",
+						reason: "spread",
+						snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+					}),
+					launcherIdentity: () => ({}),
+					execute: async () => ({
+						success: false,
+						timedOut: true,
+						reason: "provider timed out",
+					}),
+				},
+				resolveDescriptor: () => testDescriptor(),
+				recordDispatch: async () => {},
+				recordDispatchIntent: async () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						executeAsync: async () => ({ success: false }),
+						captureDiffAsync: async () => {
+							legacyCaptureCalled = true;
+							return null;
+						},
+						captureDiffDetailedAsync: async () => ({
+							status: "timed_out",
+							diff: null,
+						}),
+					},
+				},
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+			},
+		);
+
+		strictEqual(result.result, "execution_timed_out_capture_failed");
+		strictEqual(result.captureStatus, "timed_out");
+		strictEqual(legacyCaptureCalled, false);
+	});
+
+	it("wires each legacy adapter's real detailed seams into DEFAULT_ADAPTERS", async () => {
+		const adapters = {
+			agy: [captureAgyDiffDetailed, captureAgyDiffDetailedAsync],
+			claude: [captureClaudeDiffDetailed, captureClaudeDiffDetailedAsync],
+			codex: [captureCodexDiffDetailed, captureCodexDiffDetailedAsync],
+			copilot: [captureCopilotDiffDetailed, captureCopilotDiffDetailedAsync],
+			cursor: [captureCursorDiffDetailed, captureCursorDiffDetailedAsync],
+			opencode: [captureOpencodeDiffDetailed, captureOpencodeDiffDetailedAsync],
+		};
+
+		for (const [
+			name,
+			[captureDetailed, captureDetailedAsync],
+		] of Object.entries(adapters)) {
+			strictEqual(DEFAULT_ADAPTERS[name].captureDiffDetailed, captureDetailed);
+			strictEqual(
+				DEFAULT_ADAPTERS[name].captureDiffDetailedAsync,
+				captureDetailedAsync,
+			);
+			deepStrictEqual(
+				DEFAULT_ADAPTERS[name].captureDiffDetailed("invalid name"),
+				{
+					status: "stage_failed",
+					diff: null,
+					reasonCode: "invalid_workspace",
+				},
+			);
+			deepStrictEqual(
+				await DEFAULT_ADAPTERS[name].captureDiffDetailedAsync("invalid name"),
+				{
+					status: "stage_failed",
+					diff: null,
+					reasonCode: "invalid_workspace",
+				},
+			);
+		}
+	});
+
 	it("captures a partial diff and returns execution_timed_out without calling integrationGate when the adapter reports timedOut", () => {
 		const gateCalls = [];
 		const captureDiffCalls = [];
