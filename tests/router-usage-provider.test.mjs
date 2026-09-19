@@ -16,15 +16,12 @@
 // SNAPSHOT_PATH in src/switchyard/router/index.mjs) rather than via a
 // fixture: this test's whole point is checking the real file, not a copy.
 
-import { notStrictEqual, ok, strictEqual } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import {
-	normalizeProviderName,
-	resolveTargetIdentity,
-} from "../src/switchyard/roster/index.mjs";
+import { normalizeProviderName } from "../src/switchyard/roster/index.mjs";
 
 const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
 
@@ -45,7 +42,6 @@ const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
 // keep the list a faithful mirror of what gradus actually publishes.
 const GRADUS_PROVIDER_DISPLAY_NAMES = [
 	"Codex",
-	"Codex (Spark)",
 	"Claude",
 	"Antigravity",
 	"Antigravity (Claude)",
@@ -108,105 +104,17 @@ describe("target -> usage_provider mapping (INV-4, Task 1.5b)", () => {
 	});
 });
 
-// Task 6.2 (codex-spark-bucket plan): regression lock for the Task 6.1 fix
-// that keeps a bare "codex" identifier resolving to ONLY the incumbent
-// target now that a second codex-harness target (codex-spark, snapshot_name
-// "Codex (Spark)") is enabled alongside it.
+// The Task 6.2 block that lived here is deleted, not disabled. It proved a bare
+// "codex" identifier still resolved to the incumbent target while a SECOND
+// codex-harness target (codex-spark, snapshot_name "Codex (Spark)") was enabled
+// alongside it. The owner retired Codex Spark on 2026-09-19, so there is no
+// second codex target and the block's own guard test — "both codex-harness
+// targets are enabled, or this block proves nothing" — would now fail by
+// design. Keeping it green by deleting only that guard would have left four
+// vacuous assertions that look like coverage.
 //
-// Scope, deliberately: this asserts the LIVE ~/.agent/roster.json resolves
-// correctly right now (same pattern as the rest of this file). The behavioural
-// lock on router/index.mjs's providerMatches() itself lives in
-// tests/router.test.mjs ("keeps --only-provider codex on the incumbent target
-// ..."), which drives the real, unexported helper through route({only}) against
-// a fixture roster it builds both-targets-enabled. Kept separate on purpose: a
-// fixture test cannot notice the live roster regressing, and a live-roster test
-// cannot prove the code path. Neither replaces the other.
-//
-// providerMatches() resolves both sides, returns false if either is ambiguous,
-// and compares targetId when both resolve; these cases assert that resolution.
-// Each pins BOTH resolved targetIds rather than only asserting they differ --
-// a null targetId also "differs", and providerMatches falls through to a
-// normalizeProviderName comparison in that state, which would return true where
-// these tests read as proving false.
-describe("providerMatches disambiguates the two codex-harness targets (Task 6.2)", () => {
-	// Without this the whole block passes vacuously if codex-spark is ever
-	// disabled: the snapshot_name scan ignores `enabled`, and the harness
-	// tie-break stops being ambiguous once only one codex target is enabled --
-	// so the Task 6.1 fix could be reverted with every case below still green.
-	it("both codex-harness targets are enabled, or this block proves nothing", () => {
-		ok(
-			targets.codex?.enabled === true,
-			"expected the incumbent 'codex' target to be enabled in ~/.agent/roster.json",
-		);
-		ok(
-			targets["codex-spark"]?.enabled === true,
-			"expected the 'codex-spark' target to be enabled in ~/.agent/roster.json",
-		);
-	});
-
-	it("providerMatches('codex', 'Codex') stays true", () => {
-		const identifierResolution = resolveTargetIdentity("codex");
-		const nameResolution = resolveTargetIdentity("Codex");
-		ok(
-			!identifierResolution.ambiguous,
-			`identifier 'codex' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
-		);
-		ok(
-			!nameResolution.ambiguous,
-			`name 'Codex' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
-		);
-		strictEqual(identifierResolution.targetId, nameResolution.targetId);
-		strictEqual(identifierResolution.targetId, "codex");
-	});
-
-	it("providerMatches('codex', 'Codex (Spark)') is false", () => {
-		const identifierResolution = resolveTargetIdentity("codex");
-		const nameResolution = resolveTargetIdentity("Codex (Spark)");
-		ok(
-			!identifierResolution.ambiguous,
-			`identifier 'codex' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
-		);
-		ok(
-			!nameResolution.ambiguous,
-			`name 'Codex (Spark)' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
-		);
-		notStrictEqual(identifierResolution.targetId, nameResolution.targetId);
-		strictEqual(identifierResolution.targetId, "codex");
-		strictEqual(nameResolution.targetId, "codex-spark");
-	});
-
-	// The mirror of the two cases above. Without these, the lock only proves
-	// the incumbent identifier still resolves correctly -- it would stay green
-	// if `codex-spark` itself became unroutable or collapsed back onto the
-	// incumbent target, which is the other half of the same ambiguity failure.
-	it("providerMatches('codex-spark', 'Codex (Spark)') stays true", () => {
-		const identifierResolution = resolveTargetIdentity("codex-spark");
-		const nameResolution = resolveTargetIdentity("Codex (Spark)");
-		ok(
-			!identifierResolution.ambiguous,
-			`identifier 'codex-spark' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
-		);
-		ok(
-			!nameResolution.ambiguous,
-			`name 'Codex (Spark)' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
-		);
-		strictEqual(identifierResolution.targetId, nameResolution.targetId);
-		strictEqual(identifierResolution.targetId, "codex-spark");
-	});
-
-	it("providerMatches('codex-spark', 'Codex') is false", () => {
-		const identifierResolution = resolveTargetIdentity("codex-spark");
-		const nameResolution = resolveTargetIdentity("Codex");
-		ok(
-			!identifierResolution.ambiguous,
-			`identifier 'codex-spark' resolved ambiguously: ${JSON.stringify(identifierResolution)}`,
-		);
-		ok(
-			!nameResolution.ambiguous,
-			`name 'Codex' resolved ambiguously: ${JSON.stringify(nameResolution)}`,
-		);
-		notStrictEqual(identifierResolution.targetId, nameResolution.targetId);
-		strictEqual(identifierResolution.targetId, "codex-spark");
-		strictEqual(nameResolution.targetId, "codex");
-	});
-});
+// The behavioural lock survives and is the one that mattered: tests/router.test.mjs
+// ("keeps --only-provider codex on the incumbent target ...") drives the real
+// providerMatches() through route({only}) against a fixture roster it builds
+// with both targets enabled. That is fixture-based, so it still guards the code
+// path if a second codex-harness target is ever added again.

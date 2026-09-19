@@ -1890,7 +1890,7 @@ describe("Task 6.1 queue-level platform selection", () => {
 
 	it("admits clone-verified tier-1 targets through the default macOS preflight", () => {
 		for (const targetId of [
-			"codex-spark",
+			"codex",
 			"antigravity",
 			"copilot-student",
 			"antigravity-claude",

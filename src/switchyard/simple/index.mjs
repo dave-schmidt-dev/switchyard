@@ -55,7 +55,6 @@ const MAX_CHECK_CHARS = 8192;
 const SIMPLE_PROVIDERS = Object.freeze([
 	"claude-code",
 	"codex",
-	"codex-spark",
 	"antigravity",
 	"antigravity-claude",
 	"cursor",

@@ -220,8 +220,9 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
  * Providers whose golden-image-baked auth has been proven, by a real
  * clone-survival test, to persist through cloning: log in once in the golden
  * image, clone it, and confirm the clone is still authenticated with no fresh
- * login. Codex, Codex Spark, both Antigravity targets, Copilot, Vibe, Claude
- * Code and Cursor Pro are verified this way. Claude Code and Cursor Pro were
+ * login. Codex, both Antigravity targets, Copilot, Vibe, Claude Code and
+ * Cursor Pro are verified this way. Codex Spark was removed 2026-09-19 when
+ * the owner retired the product. Claude Code and Cursor Pro were
  * added 2026-09-18 after `auth --clone` probed both live inside a disposable
  * full clone; before that their golden-image login had never been completed,
  * and five slots across the two were rejected at preflight as
@@ -234,7 +235,6 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
  */
 export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"codex",
-	"codex-spark",
 	"antigravity",
 	"antigravity-claude",
 	"claude-code",
