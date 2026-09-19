@@ -220,8 +220,12 @@ const TERMINAL_PREFLIGHT_STATUSES = new Set([
  * Providers whose golden-image-baked auth has been proven, by a real
  * clone-survival test, to persist through cloning: log in once in the golden
  * image, clone it, and confirm the clone is still authenticated with no fresh
- * login. Codex, Codex Spark, both Antigravity targets, Copilot, and Vibe are
- * verified this way. OpenCode Go and OpenCode Mistral are separately qualified
+ * login. Codex, Codex Spark, both Antigravity targets, Copilot, Vibe, Claude
+ * Code and Cursor Pro are verified this way. Claude Code and Cursor Pro were
+ * added 2026-09-18 after `auth --clone` probed both live inside a disposable
+ * full clone; before that their golden-image login had never been completed,
+ * and five slots across the two were rejected at preflight as
+ * `not_golden_image_verified` no matter what the roster said. OpenCode Go and OpenCode Mistral are separately qualified
  * through their fixed BWS API-key bridge lanes, which inject no persistent
  * credential into the golden image or clone. The macOS queue admits either
  * evidence class but keeps every other provider fail-closed. Bridge admission
@@ -233,7 +237,9 @@ export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"codex-spark",
 	"antigravity",
 	"antigravity-claude",
+	"claude-code",
 	"copilot-student",
+	"cursor-pro",
 	"opencode-go",
 	"opencode-mistral",
 	"vibe",

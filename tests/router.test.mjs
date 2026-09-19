@@ -104,6 +104,12 @@ import {
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 
+// A provider that is deliberately not on the golden-image allowlist and never
+// will be, for the tests that need "unverified" to mean unverified. Naming a
+// real provider here made those tests depend on which logins happened to be
+// baked into the image.
+const UNVERIFIED_PROVIDER = "unverified-provider-fixture";
+
 /**
  * The Parallels transport ships the guest command as a base64 payload, because
  * `prlctl exec` cannot carry a byte above 0x7F. Assertions about what the guest
@@ -1836,9 +1842,15 @@ describe("Task 6.1 queue-level platform selection", () => {
 	});
 
 	it("wires the default macOS preflight into the queue backend", () => {
-		// "claude" has quota and meets the "high" capability bar, but remains
-		// outside the verified golden-image allowlist, so the default wiring (no
-		// override) must still fail closed on it.
+		// What this proves is the hand-through: the queue backend reaches the
+		// default preflight with the default gates, none of them injected by the
+		// caller. The allowlist gate itself is covered below by the test that
+		// injects `goldenImageVerifiedProviders: ["codex"]` against a real
+		// target. This one used a real name ("claude") as its stand-in for
+		// "unverified" and broke on 2026-09-18 the moment claude-code was
+		// actually verified, so the name is now synthetic and the test encodes
+		// nothing about which real logins happen to exist.
+		strictEqual(resolveTargetIdentity(UNVERIFIED_PROVIDER).targetId, null);
 		const helper = createQueueBackend({
 			platform: "macos",
 			dependencies: {
@@ -1848,7 +1860,7 @@ describe("Task 6.1 queue-level platform selection", () => {
 						updated_at: new Date().toISOString(),
 						providers: [
 							{
-								name: "claude",
+								name: UNVERIFIED_PROVIDER,
 								ok: true,
 								windows: [{ percent_left: 80, pace_delta: 1 }],
 							},
@@ -1866,7 +1878,13 @@ describe("Task 6.1 queue-level platform selection", () => {
 				helper.preflight({
 					tasks: [{ status: "pending", requiredCapability: "high" }],
 				}),
-			/high: no_golden_image_verified_provider_with_quota_headroom.*claude/,
+			// The reason is asserted, not just the name: without it this passes
+			// for whichever default gate happens to fire first, which is not the
+			// same claim. A name no roster resolves is rejected at the identity
+			// gate, and only the default preflight can reject it there.
+			new RegExp(
+				`high: no_golden_image_verified_provider_with_quota_headroom.*${UNVERIFIED_PROVIDER}: target_identity_unavailable`,
+			),
 		);
 	});
 

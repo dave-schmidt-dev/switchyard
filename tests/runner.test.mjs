@@ -114,6 +114,10 @@ import {
 } from "../src/switchyard/runner/index.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-runner-test");
+// A provider deliberately absent from every roster, for tests that need a name
+// the identity gate rejects. Using a real provider here made those tests depend
+// on which logins happened to be baked into the golden image.
+const UNVERIFIED_PROVIDER = "unverified-provider-fixture";
 function writeLegacyCheckpoint(path, checkpoint) {
 	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
 }
@@ -6117,6 +6121,14 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 				checkpointPath,
 				platform: "macos",
 				dependencies: {
+					// The point is precedence: claude has far more headroom (99 vs
+					// 20) and still must lose to codex because it is off the
+					// golden-image allowlist. The allowlist is injected rather
+					// than defaulted, so the test states its own premise instead
+					// of inheriting whichever real logins exist — it silently
+					// stopped testing anything on 2026-09-18, when claude-code
+					// joined the default list and claude began winning on quota.
+					goldenImageVerifiedProviders: ["codex"],
 					queuePreflight: () => ({ ok: true, eligible: true }),
 					recordDispatchIntent: () => {},
 					recordDispatch: () => {},
@@ -10173,18 +10185,21 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 							destroy: () => {},
 							acquireSlot: () => events.push("acquire"),
 						}),
-						// "claude" has quota and meets the "high" capability bar, but
-						// the default GOLDEN_IMAGE_VERIFIED_PROVIDERS allowlist is
-						// codex-only, so the default preflight must still fail closed
-						// on it (mirrors tests/router.test.mjs's equivalent case).
-						adapters: { claude: {} },
+						// A name no roster resolves, so only the default preflight
+						// can reject it, and it must do so before any backend work.
+						// This used to be "claude" on the premise that the default
+						// allowlist excluded it; claude-code was verified on
+						// 2026-09-18 and the premise died. The allowlist gate itself
+						// is covered in tests/router.test.mjs by the case that
+						// injects `goldenImageVerifiedProviders`.
+						adapters: { [UNVERIFIED_PROVIDER]: {} },
 						preflightReadSnapshot: () => ({
 							snapshot: {
 								schema_version: 2,
 								updated_at: new Date().toISOString(),
 								providers: [
 									{
-										name: "claude",
+										name: UNVERIFIED_PROVIDER,
 										ok: true,
 										windows: [{ percent_left: 80, pace_delta: 1 }],
 									},
@@ -10196,7 +10211,9 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 						}),
 					},
 				}),
-			/high: no_golden_image_verified_provider_with_quota_headroom.*claude/,
+			new RegExp(
+				`high: no_golden_image_verified_provider_with_quota_headroom.*${UNVERIFIED_PROVIDER}: target_identity_unavailable`,
+			),
 		);
 		deepStrictEqual(events, []);
 	});
