@@ -48,6 +48,14 @@ case " $* " in
   *) echo "stub: executeOpencode did not invoke the run subcommand; args: $*" >&2; exit 4 ;;
 esac
 case " $* " in
+  *" --agent build "*) ;;
+  *) echo "stub: executeOpencode did not pass --agent build; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
+  *" --auto "*) ;;
+  *) echo "stub: executeOpencode did not pass --auto; args: $*" >&2; exit 3 ;;
+esac
+case " $* " in
   *" --variant thinking "*) ;;
   *) echo "stub: executeOpencode did not forward descriptor variant; args: $*" >&2; exit 3 ;;
 esac
@@ -65,6 +73,53 @@ describe("opencode adapter container execution", () => {
 		ok(OPENCODE_SUPERVISOR.includes("ps -o state= -p"));
 		ok(OPENCODE_SUPERVISOR.includes("Z*)"));
 		ok(OPENCODE_SUPERVISOR.includes("pgrep -x"));
+	});
+
+	it("invokes ordinary opencode run with --agent build and --auto while preserving variant and model", () => {
+		let captured = null;
+		const backend = {
+			execArgv(workspaceId, { argv } = {}) {
+				captured = { workspaceId, argv };
+				return {
+					command: process.execPath,
+					args: ["-e", 'process.stdout.write("ordinary-ran")'],
+				};
+			},
+		};
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "opencode-target",
+				model_ref: "fake-model",
+				selector: "fake-model",
+				effort: null,
+				variant: "thinking",
+				invocation_args: ["--variant", "thinking"],
+			},
+			"opencode",
+		);
+		const result = executeOpencode("test prompt", "container-test-123", {
+			model: descriptor.selector,
+			resolvedTargetId: descriptor.target_id,
+			descriptorHarness: "opencode",
+			invocationDescriptor: descriptor,
+			descriptorIdentity: descriptor.descriptor_identity,
+			executionBackend: backend,
+		});
+		strictEqual(result.success, true);
+		strictEqual(result.output, "ordinary-ran");
+		strictEqual(captured.workspaceId, "container-test-123");
+		const runIdx = captured.argv.indexOf("run");
+		ok(runIdx !== -1, "must include run subcommand");
+		strictEqual(captured.argv[runIdx + 1], "--agent");
+		strictEqual(captured.argv[runIdx + 2], "build");
+		strictEqual(captured.argv[runIdx + 3], "--auto");
+		const variantIdx = captured.argv.indexOf("--variant");
+		strictEqual(variantIdx, runIdx + 4);
+		strictEqual(captured.argv[variantIdx + 1], "thinking");
+		const modelIdx = captured.argv.indexOf("--model");
+		strictEqual(modelIdx, variantIdx + 2);
+		strictEqual(captured.argv[modelIdx + 1], "fake-model");
+		ok(captured.argv.at(-1).includes("test prompt"));
 	});
 
 	it("hands approved API-key models to the backend's fixed bridge over stdin", () => {

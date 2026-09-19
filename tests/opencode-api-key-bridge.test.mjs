@@ -78,6 +78,35 @@ describe("OpenCode API-key bridge", () => {
 		strictEqual(credentialInput(secret), `${secret}\n`);
 	});
 
+	it("invokes opencode run with --agent build and --auto while preserving variant and model", () => {
+		const args = guestArgs(REQUEST, "OPENCODE_API_KEY");
+		const joined = args.join(" ");
+		const encoded = joined.match(/printf %s ([A-Za-z0-9+/=]+) \|/)?.[1];
+		ok(encoded);
+		const guestScript = Buffer.from(encoded, "base64").toString("utf8");
+		match(
+			guestScript,
+			/'\/Users\/switchyard\/\.local\/bin\/opencode'\s+'run'\s+'--agent'\s+'build'\s+'--auto'\s+'--variant'\s+'low'\s+'--model'\s+'opencode-go\/deepseek-flash'\s+'write the marker'/,
+		);
+
+		const argsNoVariant = guestArgs(
+			{ ...REQUEST, invocationArgs: [] },
+			"OPENCODE_API_KEY",
+		);
+		const encodedNoVariant = argsNoVariant
+			.join(" ")
+			.match(/printf %s ([A-Za-z0-9+/=]+) \|/)?.[1];
+		ok(encodedNoVariant);
+		const guestScriptNoVariant = Buffer.from(
+			encodedNoVariant,
+			"base64",
+		).toString("utf8");
+		match(
+			guestScriptNoVariant,
+			/'\/Users\/switchyard\/\.local\/bin\/opencode'\s+'run'\s+'--agent'\s+'build'\s+'--auto'\s+'--model'\s+'opencode-go\/deepseek-flash'\s+'write the marker'/,
+		);
+	});
+
 	it("configures Mistral from its ephemeral environment without auth.json", () => {
 		const config = runtimeConfigFor("mistral/zai-glm-5-2", "MISTRAL_API_KEY");
 		deepStrictEqual(JSON.parse(config), {
@@ -122,7 +151,9 @@ describe("OpenCode API-key bridge", () => {
 		ok(!guestScript.includes('wait "$job_pid"'));
 		ok(!guestScript.includes("pgrep"));
 		match(guestScript, /"\$marker\.tmp\."\*/);
-		match(guestScript, /rm -f -- "\$marker_tmp" "\$marker" "\$status_tmp"/);
+		match(guestScript, /rm -f "\$marker_tmp" "\$marker" "\$status_tmp"/);
+		match(guestScript, /then exit 76; fi/);
+		match(guestScript, /\nexit 76' 'bridge'/);
 		ok(!guestScript.includes("auth.json"));
 	});
 
@@ -160,6 +191,13 @@ describe("OpenCode API-key bridge", () => {
 				runControlFn: async (args) => {
 					calls.push(args);
 					const path = args.at(-1);
+					if (args[2] === "/bin/rm") {
+						return {
+							code: 0,
+							stdout: Buffer.alloc(0),
+							stderr: Buffer.alloc(0),
+						};
+					}
 					if (args[2] === "/bin/test") {
 						return {
 							code: 0,
@@ -212,7 +250,7 @@ describe("OpenCode API-key bridge", () => {
 		strictEqual(statusReads, 2);
 		ok(calls.some((args) => args[2] === "/bin/test"));
 		ok(calls.every((args) => !args.includes("opencode")));
-		ok(calls.some((args) => args[2] === "/bin/sh"));
+		ok(calls.some((args) => args[2] === "/bin/rm"));
 	});
 
 	it("does not abandon an exact Parallels lost result during marker startup", async () => {
@@ -267,7 +305,7 @@ describe("OpenCode API-key bridge", () => {
 			maxAttempts: 2,
 			lostResultProbeAttempts: 2,
 		});
-		strictEqual(result.code, 75);
+		strictEqual(result.code, 76);
 		strictEqual(
 			result.stderr.toString("utf8"),
 			"bridge failure: marker missing\n",
@@ -282,7 +320,7 @@ describe("OpenCode API-key bridge", () => {
 			maxAttempts: 2,
 			lostResultProbeAttempts: 1,
 		});
-		strictEqual(result.code, 75);
+		strictEqual(result.code, 76);
 		strictEqual(
 			result.stderr.toString("utf8"),
 			"bridge failure: status timeout\n",
@@ -294,7 +332,7 @@ describe("OpenCode API-key bridge", () => {
 			runControlFn: async () => controlResult(0, "not-a-status\n"),
 			waitFn: async () => {},
 		});
-		strictEqual(result.code, 75);
+		strictEqual(result.code, 76);
 		strictEqual(
 			result.stderr.toString("utf8"),
 			"bridge failure: status invalid\n",
@@ -310,16 +348,16 @@ describe("OpenCode API-key bridge", () => {
 			},
 			waitFn: async () => {},
 		});
-		strictEqual(result.code, 75);
+		strictEqual(result.code, 76);
 		strictEqual(
 			result.stderr.toString("utf8"),
 			"bridge failure: provider output read failed\n",
 		);
 	});
 
-	it("cleans marker temp paths using bounded shell expansion", async () => {
+	it("cleans the read result files without a nested guest shell", async () => {
 		const paths = guestJobPaths(WORKSPACE_ID);
-		let cleanupCommand;
+		let cleanupArgs;
 		const result = await reconcileGuestResult(REQUEST, successfulLaunch, {
 			runControlFn: async (args) => {
 				if (args[2] === "/bin/cat" && args.at(-1) === paths.status) {
@@ -331,20 +369,23 @@ describe("OpenCode API-key bridge", () => {
 				if (args[2] === "/bin/cat" && args.at(-1) === paths.stderr) {
 					return controlResult(0, "provider-error\n");
 				}
-				if (args[2] === "/bin/sh") {
-					cleanupCommand = args.at(-1) ?? "";
+				if (args[2] === "/bin/rm") {
+					cleanupArgs = args;
 					return controlResult(0);
 				}
 				throw new Error(`unexpected control command: ${args.join(" ")}`);
 			},
 			waitFn: async () => {},
 		});
-		const wildcardPath = `'${paths.marker}'.tmp.*`;
-		ok(cleanupCommand);
 		strictEqual(result.code, 0);
-		strictEqual(cleanupCommand?.includes("rm -f --"), true);
-		ok(cleanupCommand?.includes(wildcardPath));
-		ok(!cleanupCommand?.includes(`${paths.marker}.tmp.*`));
+		deepStrictEqual(cleanupArgs, [
+			"exec",
+			WORKSPACE_ID,
+			"/bin/rm",
+			paths.stdout,
+			paths.stderr,
+			paths.status,
+		]);
 	});
 
 	it("fails closed when cleanup cannot remove the guest artifacts", async () => {
@@ -359,10 +400,10 @@ describe("OpenCode API-key bridge", () => {
 			},
 			waitFn: async () => {},
 		});
-		strictEqual(result.code, 75);
+		strictEqual(result.code, 76);
 		strictEqual(
 			result.stderr.toString("utf8"),
-			"bridge failure: cleanup failed\n",
+			"bridge failure: cleanup failed (exit 2)\n",
 		);
 	});
 

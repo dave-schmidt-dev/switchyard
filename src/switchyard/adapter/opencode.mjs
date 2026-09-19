@@ -196,8 +196,11 @@ function buildSupervisedExecution(
 		String(idleSeconds),
 		OPENCODE_CMD,
 		"run",
-		// OpenCode variant argv is forwarded verbatim immediately after the
-		// `run` subcommand and before the model selector.
+		"--agent",
+		"build",
+		"--auto",
+		// OpenCode variant argv is forwarded verbatim immediately after
+		// unattended dispatch flags and before the model selector.
 		...invocationArgs,
 	];
 	if (model) {

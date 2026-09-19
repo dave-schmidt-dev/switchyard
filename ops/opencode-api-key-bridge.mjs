@@ -18,7 +18,10 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 128 * 1024 * 1024;
 const MAX_GUEST_ARGV_BYTES = 600000;
 const MAX_CREDENTIAL_BYTES = 64 * 1024;
-const BRIDGE_FAILURE_CODE = 75;
+// The OpenCode adapter reserves 75 for a provider that produced output but did
+// not exit after its idle grace period. Bridge/bootstrap failures must use a
+// different code or the adapter will misclassify them as successful work.
+const BRIDGE_FAILURE_CODE = 76;
 const LOST_RESULT_PROBE_ATTEMPTS = 10;
 const LOST_RESULT_INITIAL_GRACE_ATTEMPTS = 60;
 const LOST_RESULT_WAIT_MS = 1000;
@@ -184,7 +187,7 @@ shift 5
 marker_tmp="$marker.tmp.$$"
 
 cleanup_before_start() {
-	rm -f -- "$marker_tmp" "$marker" "$status_tmp"
+	rm -f "$marker_tmp" "$marker" "$status_tmp"
 }
 
 trap 'cleanup_before_start; exit 75' HUP INT TERM
@@ -196,8 +199,8 @@ rc=$?
 set -e
 printf '%s\n' "$rc" >"$status_tmp"
 mv -f -- "$status_tmp" "$status"
-rm -f -- "$marker"
-rm -f -- "$marker_tmp" "$status_tmp"
+rm -f "$marker"
+rm -f "$marker_tmp" "$status_tmp"
 exit "$rc"`;
 
 function fail(message) {
@@ -419,6 +422,9 @@ export function guestArgs(request, guestEnv) {
 		String(request.idleSeconds),
 		"/Users/switchyard/.local/bin/opencode",
 		"run",
+		"--agent",
+		"build",
+		"--auto",
 		...request.invocationArgs,
 		"--model",
 		request.model,
@@ -455,7 +461,7 @@ export function guestArgs(request, guestEnv) {
 		`err=${shellQuote(paths.stderr)}`,
 		`status=${shellQuote(paths.status)}`,
 		`status_tmp=${shellQuote(paths.statusTemp)}`,
-		'rm -f -- "$out" "$err" "$status" "$status_tmp" "$marker" "$marker.tmp."*',
+		'rm -f "$out" "$err" "$status" "$status_tmp" "$marker" "$marker.tmp."*',
 		`"$@" </dev/null >/dev/null 2>&1 &
 job_pid=$!
 job_pgid=$(ps -o pgid= -p "$job_pid" 2>/dev/null | tr -d '[:space:]')
@@ -468,7 +474,7 @@ signal_job_group() {
 attempt=0
 while [ "$attempt" -lt 50 ]; do
   [ -s "$marker" ] && exit 0
-  if ! kill -0 "$job_pid" 2>/dev/null; then exit 75; fi
+  if ! kill -0 "$job_pid" 2>/dev/null; then exit ${BRIDGE_FAILURE_CODE}; fi
   attempt=$(( attempt + 1 ))
   sleep 0.1
 done
@@ -489,7 +495,7 @@ if signal_job_group TERM; then
     done
   fi
 fi
-exit 75`,
+exit ${BRIDGE_FAILURE_CODE}`,
 	].join("; ");
 	const command = ["/bin/bash", "-lc", bootstrap, "bridge", ...detachedJob];
 	const quoted = command.map(shellQuote).join(" ");
@@ -532,15 +538,10 @@ async function cleanupGuestJob(workspaceId, paths, runControlFn = runControl) {
 	return runControlFn([
 		"exec",
 		workspaceId,
-		"/bin/sh",
-		"-c",
-		`rm -f -- \
-${shellQuote(paths.stdout)} \
-${shellQuote(paths.stderr)} \
-${shellQuote(paths.status)} \
-${shellQuote(paths.statusTemp)} \
-${shellQuote(paths.marker)} \
-${shellQuote(paths.marker)}.tmp.*`,
+		"/bin/rm",
+		paths.stdout,
+		paths.stderr,
+		paths.status,
 	]);
 }
 
@@ -636,7 +637,9 @@ export async function reconcileGuestResult(
 	} catch {
 		return failClosed("cleanup failed");
 	}
-	if (cleanupResult.code !== 0) return failClosed("cleanup failed");
+	if (cleanupResult.code !== 0) {
+		return failClosed(`cleanup failed (exit ${cleanupResult.code})`);
+	}
 	return {
 		code: Number.parseInt(statusText, 10),
 		signal: null,
