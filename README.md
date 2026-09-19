@@ -518,16 +518,21 @@ allocate a different uid.
 Before a working VM is created, `preflightMacosQueue()` (`router/index.mjs`)
 reads one routing snapshot for every non-terminal capability tier and requires
 at least one funded, adapter-available provider per tier that is also on the
-**golden-image-verified allowlist** (`GOLDEN_IMAGE_VERIFIED_PROVIDERS`,
-currently `["codex", "opencode-go", "opencode-mistral", "vibe"]`). Probeable providers are
-added only after their clone-survival test proves the golden image's baked-in
-credential state — an OAuth session for Codex, a guest-keychain API key for
-Vibe; OpenCode Go is admitted from its separate bounded BWS-bridge
-qualification. OpenCode Mistral uses its own fixed BWS-bridge qualification;
-its GLM-5.2 coding routes remain unqualified pending the upstream streamed-tool
-call fix. A provider with quota and an
-available adapter but no clone-survival proof is rejected
+**golden-image-verified allowlist** (`GOLDEN_IMAGE_VERIFIED_PROVIDERS`). Probeable
+providers are added only after their clone-survival test proves the golden
+image's baked-in credential state — `node src/switchyard/auth/index.mjs --clone`
+creates one disposable full clone, live-probes every probeable provider inside
+it, and always destroys the clone. `npm run auth:check:live` probes the golden
+image itself and is *not* sufficient evidence for this list: the question is
+whether a credential survives cloning, not whether it works on the image.
+OpenCode Go and OpenCode Mistral are admitted instead from their separate
+bounded BWS-bridge qualification; OpenCode Mistral's GLM-5.2 coding routes
+remain unqualified pending the upstream streamed-tool-call fix. A provider with
+quota and an available adapter but no clone-survival proof is rejected
 (`not_golden_image_verified`), not admitted on the assumption that it works.
+Read the current membership from the exported constant rather than from this
+paragraph — it changes as logins are proved, and a stale list here once claimed
+four entries while the code carried ten.
 This is a launch gate only: quota can drain while the queue runs, so passing
 preflight does not guarantee every later task.
 
