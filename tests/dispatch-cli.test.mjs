@@ -101,6 +101,7 @@ import {
 	captureHostFingerprint,
 	runDispatch as dispatchRun,
 	formatRunAbort,
+	handleBackendHealth,
 	handleLaunch,
 	handleRecover,
 	handleRun,
@@ -553,7 +554,13 @@ describe("validate-inputs CLI", () => {
 		);
 		strictEqual(rejection.status, 2);
 		const output = JSON.parse(rejection.stdout);
-		deepStrictEqual(Object.keys(output).sort(), ["code", "remedy", "valid"]);
+		deepStrictEqual(Object.keys(output).sort(), [
+			"code",
+			"evaluatedTaskIds",
+			"remedy",
+			"selectedTaskIds",
+			"valid",
+		]);
 		strictEqual(output.code, "queue_empty");
 		ok(!existsSync(join(stateRoot, "runs")));
 
@@ -577,7 +584,9 @@ describe("validate-inputs CLI", () => {
 		strictEqual(malformed.status, 2, malformed.stderr);
 		deepStrictEqual(Object.keys(JSON.parse(malformed.stdout)).sort(), [
 			"code",
+			"evaluatedTaskIds",
 			"remedy",
+			"selectedTaskIds",
 			"valid",
 		]);
 		strictEqual(JSON.parse(malformed.stdout).code, "queue_contract_invalid");
@@ -605,9 +614,54 @@ describe("validate-inputs CLI", () => {
 			valid: false,
 			code: "task_selection_failed",
 			taskId: "9.9",
+			selectedTaskIds: ["9.9"],
+			evaluatedTaskIds: [],
 			remedy: "selected task is not runnable with the current checkpoint",
 		});
 		ok(!existsSync(join(stateRoot, "runs")));
+	});
+
+	it("filters task-specific path validation before inspecting declarations", () => {
+		mkdirSync(join(projectDir, "generated"), { recursive: true });
+		writeFileSync(join(projectDir, "generated", "uncommitted.mjs"), "owner\n");
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Excluded\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** generated/uncommitted.mjs\n- **Description:** excluded\n\n### Task 2.1: Selected\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** selected\n",
+			"utf8",
+		);
+
+		const selected = runDispatch(
+			[
+				"validate-inputs",
+				tasksFile,
+				"--project",
+				projectDir,
+				"--task-id",
+				"2.1",
+			],
+			makeStateRootEnv(),
+		);
+		strictEqual(selected.status, 0, selected.stderr);
+		const envelope = JSON.parse(selected.stdout);
+		deepStrictEqual(envelope.selectedTaskIds, ["2.1"]);
+		deepStrictEqual(envelope.evaluatedTaskIds, ["2.1"]);
+
+		const excluded = runDispatch(
+			[
+				"validate-inputs",
+				tasksFile,
+				"--project",
+				projectDir,
+				"--task-id",
+				"1.1",
+			],
+			makeStateRootEnv(),
+		);
+		strictEqual(excluded.status, 2);
+		strictEqual(
+			JSON.parse(excluded.stdout).code,
+			"declared_path_not_committed",
+		);
 	});
 
 	it("keeps detailed path rejection while run and launch project repair", () => {
@@ -686,6 +740,51 @@ describe("validate-inputs CLI", () => {
 			strictEqual(envelope.disposition.reasonCode, "environment_incomplete");
 			strictEqual(envelope.preflightDetail.code, "validation_unavailable");
 			strictEqual(envelope.runId, null);
+		}
+	});
+});
+
+describe("backend-health CLI", () => {
+	it("reports bounded read-only readiness and typed degraded evidence", async () => {
+		const lines = [];
+		const originalLog = console.log;
+		const originalExitCode = process.exitCode;
+		console.log = (line) => lines.push(line);
+		try {
+			await handleBackendHealth([], {
+				now: () => Date.parse("2026-09-21T14:00:00.000Z"),
+				executionBackend: { probeHostReadiness: () => ({ inventoryCount: 1 }) },
+			});
+			deepStrictEqual(JSON.parse(lines.pop()), {
+				schemaVersion: 1,
+				backend: "parallels",
+				observedAt: "2026-09-21T14:00:00.000Z",
+				ready: true,
+				errorKind: null,
+				diagnosticCode: null,
+			});
+
+			await handleBackendHealth([], {
+				now: () => Date.parse("2026-09-21T14:00:01.000Z"),
+				executionBackend: {
+					probeHostReadiness: () => {
+						throw Object.assign(new Error("private host detail"), {
+							code: "vm_host_service_degraded",
+						});
+					},
+				},
+			});
+			const degraded = JSON.parse(lines.pop());
+			strictEqual(degraded.ready, false);
+			strictEqual(degraded.errorKind, "environment_incomplete");
+			strictEqual(degraded.diagnosticCode, "vm_host_service_degraded");
+			strictEqual(
+				JSON.stringify(degraded).includes("private host detail"),
+				false,
+			);
+		} finally {
+			console.log = originalLog;
+			process.exitCode = originalExitCode;
 		}
 	});
 });

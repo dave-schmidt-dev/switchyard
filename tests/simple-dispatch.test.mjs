@@ -476,6 +476,39 @@ describe("simple dispatch argument boundary", () => {
 });
 
 describe("simple local execution path", () => {
+	it("rejects manifest declarations before provider launch with a typed failure", async () => {
+		const repo = makeRepo();
+		writeFileSync(join(repo.projectPath, "package.json"), "{}\n", "utf8");
+		execFileSync("git", ["add", "package.json"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"manifest",
+			],
+			{ cwd: repo.projectPath },
+		);
+		let executions = 0;
+		const result = await runSimpleTask(
+			options(repo, { files: ["package.json"] }),
+			dependencies({
+				executeProvider: async () => {
+					executions += 1;
+					return { success: true };
+				},
+			}),
+		);
+		strictEqual(executions, 0);
+		strictEqual(result.failureReason, "manifest_review_required");
+		strictEqual(result.failurePhase, "input_validation");
+		strictEqual(result.errorKind, "validation_failed");
+	});
+
 	it("executes one routed provider, checks in the worktree, and applies only its diff", async () => {
 		const repo = makeRepo();
 		const seen = { executions: 0, checks: 0 };
@@ -529,6 +562,63 @@ describe("simple local execution path", () => {
 			"",
 		);
 		strictEqual(result.partialWorktree, null);
+	});
+
+	it("emits evidence-only provider, change, capture, and check milestones", async () => {
+		const repo = makeRepo();
+		const events = [];
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({ onStatus: (event) => events.push(event) }),
+		);
+		strictEqual(result.status, "succeeded");
+		const milestones = events.map((event) => event.milestone).filter(Boolean);
+		ok(milestones.includes("provider_started"));
+		ok(milestones.includes("capture_started"));
+		ok(milestones.includes("first_change_observed"));
+		ok(milestones.includes("check_started"));
+		ok(milestones.includes("check_finished"));
+		const check = events.find((event) => event.milestone === "check_started");
+		strictEqual(check.checkIndex, 1);
+		strictEqual(check.checkIdentity.length, 64);
+		strictEqual(JSON.stringify(events).includes("test -f src/a.txt"), false);
+	});
+
+	it("throttles first-change probes while keeping provider heartbeats", async () => {
+		const repo = makeRepo();
+		const events = [];
+		let clock = 1_000;
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies({
+				now: () => clock,
+				onStatus: (event) => events.push(event),
+				executeProvider: async ({ worktreePath, onProgress }) => {
+					onProgress();
+					writeFileSync(
+						join(worktreePath, "src", "a.txt"),
+						"provider\n",
+						"utf8",
+					);
+					clock += 1_000;
+					onProgress();
+					clock += 1_000;
+					onProgress();
+					return { success: true, code: 0, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		strictEqual(result.status, "succeeded");
+		strictEqual(
+			events.filter((event) => event.processPhase === "provider_running")
+				.length,
+			3,
+		);
+		strictEqual(
+			events.find((event) => event.milestone === "first_change_observed")
+				?.phase,
+			"diff",
+		);
 	});
 
 	it("runs real shell checks from the disposable worktree", async () => {

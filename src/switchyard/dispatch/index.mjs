@@ -15,6 +15,7 @@
 //   switchyard-dispatch simple <prompt-file> --project <path> [options] # small local path
 //   switchyard-dispatch run <tasks.md> --project <path> [options]      # legacy, same as positional
 //   switchyard-dispatch launch <tasks.md> --project <path> [options]   # detached
+//   switchyard-dispatch backend-health [--json]                       # read-only backend probe
 //   switchyard-dispatch status <run-id> [--json]                       # read-only
 //   switchyard-dispatch result <run-id> [--json]                       # read-only
 //   switchyard-dispatch recover [--run <run-id>]                        # cleanup
@@ -142,6 +143,7 @@ Subcommands:
   run    <tasks.md> --project <path> [options]    Run queue synchronously
   launch <tasks.md> --project <path> [options]    Launch detached run
   validate-inputs <tasks.md> --project <path> [options]  Validate caller inputs
+  backend-health [--json]                             Probe execution backend readiness
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
@@ -189,6 +191,11 @@ const USAGE_VALIDATE_INPUTS = `Usage: switchyard-dispatch validate-inputs <tasks
   --dirty-overlay        Validate declared tracked dirty bytes without publishing a receipt
   --json                 Idempotent; output is always one JSON object
   --help                 Show this help`;
+
+const USAGE_BACKEND_HEALTH = `Usage: switchyard-dispatch backend-health [--json]
+
+Runs one bounded read-only execution-backend readiness probe. It never starts,
+repairs, or mutates a service, VM, workspace, or provider.`;
 
 const USAGE_LAUNCH = `Usage: switchyard-dispatch launch <tasks.md> --project <path> [options]
 
@@ -243,6 +250,7 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"run",
 	"launch",
 	"validate-inputs",
+	"backend-health",
 	"status",
 	"result",
 	"recover",
@@ -481,6 +489,8 @@ function validationEnvelope(result) {
 		checkpointPath: result.checkpointPath,
 		queueIdentity: result.queueIdentity,
 		runnableTaskIds: result.potentialAttemptTasks.map((task) => task.id),
+		selectedTaskIds: result.selectedTaskIds,
+		evaluatedTaskIds: result.evaluatedTaskIds,
 		...(result.dirtyOverlayReceipt ? { dirtyOverlay: true } : {}),
 	};
 }
@@ -508,6 +518,12 @@ function validationFailureEnvelope(error, { standalone = false } = {}) {
 			code: error.code,
 			...(error.taskId ? { taskId: error.taskId } : {}),
 			...(error.path ? { path: error.path } : {}),
+			...(Array.isArray(error.selectedTaskIds)
+				? { selectedTaskIds: error.selectedTaskIds }
+				: {}),
+			...(Array.isArray(error.evaluatedTaskIds)
+				? { evaluatedTaskIds: error.evaluatedTaskIds }
+				: {}),
 			remedy: error.remedy,
 		};
 	}
@@ -575,6 +591,67 @@ async function handleValidateInputs(argv) {
 			error?.name === "CheckpointIdentityError"
 				? 2
 				: 1;
+	}
+}
+
+export async function handleBackendHealth(argv, dependencies = {}) {
+	let parsed;
+	try {
+		parsed = parseArgs({
+			args: argv,
+			options: {
+				json: { type: "boolean", default: false },
+				help: { type: "boolean", default: false },
+			},
+			allowPositionals: false,
+			strict: true,
+		});
+	} catch (error) {
+		throw new UsageError(error.message);
+	}
+	if (parsed.values.help) {
+		console.log(USAGE_BACKEND_HEALTH);
+		return;
+	}
+	const observedAt = new Date((dependencies.now ?? Date.now)()).toISOString();
+	const backend =
+		dependencies.executionBackend ??
+		createExecutionBackend(hostBackendDefaults(dependencies));
+	try {
+		if (typeof backend.probeHostReadiness !== "function") {
+			throw Object.assign(new Error("backend readiness probe unavailable"), {
+				code: "backend_readiness_probe_unavailable",
+			});
+		}
+		await Promise.resolve(backend.probeHostReadiness());
+		console.log(
+			JSON.stringify({
+				schemaVersion: 1,
+				backend: "parallels",
+				observedAt,
+				ready: true,
+				errorKind: null,
+				diagnosticCode: null,
+			}),
+		);
+	} catch (error) {
+		const classified = classifyPreProviderFailure(error);
+		console.log(
+			JSON.stringify({
+				schemaVersion: 1,
+				backend: "parallels",
+				observedAt,
+				ready: false,
+				errorKind: classified?.errorKind ?? "environment_incomplete",
+				diagnosticCode:
+					classified?.diagnosticCode ??
+					(typeof error?.code === "string"
+						? error.code
+						: "backend_readiness_unavailable"),
+				failurePhase: "backend_preflight",
+			}),
+		);
+		process.exitCode = 1;
 	}
 }
 
@@ -1210,6 +1287,27 @@ async function runDispatch(opts, dependencies = {}) {
 									snapshotStatus: info.snapshotStatus ?? null,
 									snapshotMtime: info.snapshotMtime ?? null,
 									snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
+								}),
+							)
+							.catch(() => {});
+					}
+				},
+				onTaskHeartbeat: (info) => {
+					const phase =
+						typeof info.processPhase === "string"
+							? info.processPhase
+							: "provider_running";
+					report(
+						`dispatch:    progress task ${info.taskId} phase=${phase} elapsed=${Math.max(0, info.elapsedMs ?? 0)}ms${info.milestone ? ` milestone=${info.milestone}` : ""}`,
+					);
+					dependencies.onTaskHeartbeat?.(info);
+					if (runStoreReady) {
+						eventWriteChain = eventWriteChain
+							.then(() =>
+								updateRunWithRetry(runId, {
+									activeTaskElapsedMs: Math.max(0, info.elapsedMs ?? 0),
+									activeTaskHeartbeatAt: Date.now(),
+									activeTaskProcessPhase: phase,
 								}),
 							)
 							.catch(() => {});
@@ -3575,6 +3673,10 @@ async function main(argv) {
 			}
 			case "validate-inputs": {
 				await handleValidateInputs(subArgs);
+				break;
+			}
+			case "backend-health": {
+				await handleBackendHealth(subArgs);
 				break;
 			}
 			case "status": {

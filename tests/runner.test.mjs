@@ -2001,15 +2001,21 @@ describe("host power queue policy", () => {
 		);
 		strictEqual(result.taskId, "1.1");
 		strictEqual(routeCalls.length, 1);
-		deepStrictEqual(statuses, [
-			{
-				phase: "policy",
-				event: "host_power_unknown",
-				status: "Host power state unknown; preserving existing routing",
-				diagnosticCode: "host_power_unknown",
-				taskId: "1.1",
-			},
-		]);
+		deepStrictEqual(statuses[0], {
+			phase: "policy",
+			event: "host_power_unknown",
+			status: "Host power state unknown; preserving existing routing",
+			diagnosticCode: "host_power_unknown",
+			taskId: "1.1",
+		});
+		strictEqual(
+			statuses.some((event) => event.event === "task_routed"),
+			true,
+		);
+		strictEqual(
+			JSON.stringify(statuses).includes("untrusted-host-text-must-not-leak"),
+			false,
+		);
 	});
 
 	it("keeps unknown power fail-open", () => {

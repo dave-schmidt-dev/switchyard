@@ -19,7 +19,11 @@ import {
 	boundProviderLifecycleSnapshot,
 	runProviderProcess,
 } from "../adapter/provider-lifecycle.mjs";
-import { integrationGate, validateDiff } from "../integrate/index.mjs";
+import {
+	integrationGate,
+	manifestReviewPaths,
+	validateDiff,
+} from "../integrate/index.mjs";
 import {
 	captureDirtyOverlay,
 	materializeDirtyOverlay,
@@ -506,9 +510,11 @@ function deadlineTimeout(deadlineMs, now) {
 	return value;
 }
 
-function emitStatus(onStatus, taskId, phase) {
+const FIRST_CHANGE_PROBE_INTERVAL_MS = 5_000;
+
+function emitStatus(onStatus, taskId, phase, details = {}) {
 	try {
-		onStatus?.({ schemaVersion: 1, taskId, phase });
+		onStatus?.({ schemaVersion: 1, taskId, phase, ...details });
 	} catch {
 		// Status reporting cannot change execution.
 	}
@@ -892,11 +898,12 @@ function createRecoveryEvidence({
 }
 
 function terminalResult(base, overrides = {}) {
+	const status = overrides.status ?? "failed";
 	return {
 		schemaVersion: 1,
 		taskId: base.taskId,
 		attemptId: base.attemptId,
-		status: overrides.status ?? "failed",
+		status,
 		provider: overrides.provider ?? null,
 		targetId: overrides.targetId ?? null,
 		elapsedMs: Math.max(0, base.now() - base.startedAt),
@@ -904,6 +911,9 @@ function terminalResult(base, overrides = {}) {
 		checks: overrides.checks ?? [],
 		failureReason: overrides.failureReason ?? null,
 		failurePhase: overrides.failurePhase ?? null,
+		errorKind:
+			overrides.errorKind ??
+			(status === "succeeded" ? null : "unclassified_failure"),
 		providerLifecycle: overrides.providerLifecycle ?? null,
 		...(overrides.preflightDetail
 			? { preflightDetail: overrides.preflightDetail }
@@ -941,6 +951,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
 	let executionFailureCaptureComplete = false;
+	let lastMilestoneAt = startedAt;
+	let firstChangeObserved = false;
+	let lastFirstChangeProbeAt = Number.NEGATIVE_INFINITY;
 	const checks = [];
 	const acquireLock = dependencies.acquireProjectLock ?? acquireProjectLock;
 	const releaseLock =
@@ -954,7 +967,42 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const resolveIdentity =
 		dependencies.resolveTargetIdentity ?? resolveTargetIdentity;
 
-	const fail = (failureReason, failurePhase) => {
+	const classifyErrorKind = (failureReason, failurePhase) => {
+		if (failureReason === "manifest_review_required") {
+			return failurePhase === "input_validation"
+				? "validation_failed"
+				: "policy_violation";
+		}
+		if (failurePhase === "input_validation" || failurePhase === "preflight")
+			return "validation_failed";
+		if (failurePhase === "diff" || failurePhase === "integrate")
+			return "policy_violation";
+		if (failurePhase === "checks") return "check_failed";
+		if (failurePhase === "execute") return "execution_failed";
+		if (failurePhase === "cleanup") return "cleanup_failed";
+		return "unclassified_failure";
+	};
+	const milestone = (phase, name, details = {}) => {
+		const observedAt = now();
+		emitStatus(onStatus, taskId, phase, {
+			milestone: name,
+			elapsedMs: Math.max(0, observedAt - startedAt),
+			elapsedSinceLastMilestoneMs: Math.max(0, observedAt - lastMilestoneAt),
+			firstChangeObserved,
+			...details,
+		});
+		lastMilestoneAt = observedAt;
+	};
+	const heartbeat = (phase, details = {}) => {
+		const observedAt = now();
+		emitStatus(onStatus, taskId, phase, {
+			elapsedMs: Math.max(0, observedAt - startedAt),
+			elapsedSinceLastMilestoneMs: Math.max(0, observedAt - lastMilestoneAt),
+			firstChangeObserved,
+			...details,
+		});
+	};
+	const fail = (failureReason, failurePhase, errorKind = null) => {
 		if (
 			worktreePath &&
 			!(currentPhase === "execute" && executionFailureCaptureComplete) &&
@@ -963,6 +1011,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		) {
 			keepWorktree = true;
 		}
+		if (keepWorktree && worktreePath) {
+			milestone(failurePhase, "salvage_retained");
+		}
+		milestone("terminal", "failed", { failurePhase });
 		finalResult = terminalResult(base, {
 			provider,
 			targetId,
@@ -970,6 +1022,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checks,
 			failureReason,
 			failurePhase,
+			errorKind: errorKind ?? classifyErrorKind(failureReason, failurePhase),
 			preflightDetail,
 			dirtyBaseline,
 			providerLifecycle,
@@ -979,6 +1032,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 	};
 
 	try {
+		if (manifestReviewPaths(options.files).length > 0) {
+			return fail(
+				"manifest_review_required",
+				"input_validation",
+				"validation_failed",
+			);
+		}
 		if (remainingMs(options.deadlineMs, now) <= 0) {
 			return fail("deadline_expired", "preflight");
 		}
@@ -1134,7 +1194,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		const guardedPrompt = `${readFileSync(options.promptPath, "utf8")}\n\nWork only in the current disposable checkout. Change only these writable files: ${options.files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
 		const harness = normalizeProviderName(identity.harnessKey);
 		currentPhase = "execute";
-		emitStatus(onStatus, taskId, "execute");
+		milestone("execute", "provider_started");
 		const executionBudget = remainingMs(options.deadlineMs, now);
 		if (executionBudget <= 0) {
 			return fail("deadline_expired", "execute");
@@ -1146,7 +1206,29 @@ export async function runSimpleTask(options, dependencies = {}) {
 			prompt: guardedPrompt,
 			worktreePath,
 			timeoutMs: executionBudget,
-			onProgress: () => emitStatus(onStatus, taskId, "execute"),
+			onProgress: () => {
+				const progressObservedAt = now();
+				if (
+					!firstChangeObserved &&
+					progressObservedAt - lastFirstChangeProbeAt >=
+						FIRST_CHANGE_PROBE_INTERVAL_MS
+				) {
+					lastFirstChangeProbeAt = progressObservedAt;
+					const observed = git(worktreePath, [
+						"status",
+						"--porcelain=v1",
+						"--untracked-files=all",
+						"--",
+						...options.files,
+					]);
+					if (observed.status === 0 && observed.stdout.length > 0) {
+						firstChangeObserved = true;
+						milestone("execute", "first_change_observed");
+						return;
+					}
+				}
+				heartbeat("execute", { processPhase: "provider_running" });
+			},
 		});
 		providerLifecycle = boundProviderLifecycleSnapshot(
 			providerResult?.providerLifecycle,
@@ -1177,6 +1259,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail("deadline_expired", "checks");
 		}
 		currentPhase = "diff";
+		milestone("diff", "capture_started");
 		const captured = captureWorktreeDiff(
 			worktreePath,
 			worktreeBaseRevision,
@@ -1184,6 +1267,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 			now,
 		);
 		changedFiles = captured.changedFiles;
+		if (changedFiles.length > 0 && !firstChangeObserved) {
+			firstChangeObserved = true;
+			milestone("diff", "first_change_observed");
+		}
 		if (changedFiles.length === 0) return fail("empty_diff", "diff");
 		const undeclared = changedFiles.filter(
 			(path) => !options.files.includes(path),
@@ -1213,7 +1300,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 				keepWorktree = true;
 				return fail("deadline_expired", "checks");
 			}
-			emitStatus(onStatus, taskId, "checks");
+			const checkIdentity = createHash("sha256")
+				.update(options.checks[index])
+				.digest("hex");
+			milestone("checks", "check_started", {
+				checkIndex: index + 1,
+				checkIdentity,
+			});
 			const settledWriterLifecycle = writerLifecycle;
 			// A check may still be writing the checkout until it resolves.
 			writerLifecycle = "unavailable";
@@ -1221,7 +1314,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 				command: options.checks[index],
 				worktreePath,
 				timeoutMs: remaining,
-				onProgress: () => emitStatus(onStatus, taskId, "checks"),
+				onProgress: () =>
+					heartbeat("checks", {
+						processPhase: "check_running",
+						checkIndex: index + 1,
+						checkIdentity,
+					}),
 			});
 			writerLifecycle = aggregateWriterLifecycle(
 				settledWriterLifecycle,
@@ -1230,6 +1328,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checks.push({
 				index: index + 1,
 				status: check?.success ? "passed" : "failed",
+			});
+			milestone("checks", "check_finished", {
+				checkIndex: index + 1,
+				checkIdentity,
+				checkStatus: check?.success ? "passed" : "failed",
 			});
 			if (!check?.success) {
 				keepWorktree = true;
@@ -1340,6 +1443,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			dirtyBaseline,
 			providerLifecycle,
 		});
+		milestone("terminal", "succeeded");
 		return finalResult;
 	} catch (error) {
 		return fail(
@@ -1432,7 +1536,7 @@ export async function handleSimple(argv, dependencies = {}) {
 				dependencies.onStatus ??
 				((event) =>
 					console.error(
-						`dispatch: simple task=${event.taskId} phase=${event.phase}`,
+						`dispatch: simple task=${event.taskId} phase=${event.phase}${event.milestone ? ` milestone=${event.milestone}` : ""}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
 					)),
 		});
 	} catch (error) {
@@ -1450,6 +1554,10 @@ export async function handleSimple(argv, dependencies = {}) {
 					? "invalid_invocation"
 					: "preflight_failed",
 			failurePhase: "preflight",
+			errorKind:
+				error instanceof SimpleUsageError
+					? "validation_failed"
+					: "unclassified_failure",
 			partialWorktree: null,
 			recovery: recoveryUnavailable(),
 		};

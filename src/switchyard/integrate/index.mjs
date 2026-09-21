@@ -55,6 +55,13 @@ const MANIFEST_REVIEW_PATTERNS = [
 	/(^|\/)\.gitlab-ci\.ya?ml$/i,
 ];
 
+/** Return declared paths that require explicit manifest review. */
+export function manifestReviewPaths(paths) {
+	return paths.filter((path) =>
+		MANIFEST_REVIEW_PATTERNS.some((pattern) => pattern.test(path)),
+	);
+}
+
 /**
  * Normalize a patch only when it lacks git's required final line terminator.
  * Already-terminated patches, including those with two trailing newlines,
@@ -333,9 +340,7 @@ export function validateDiff(diff, projectPath) {
 		}
 	}
 
-	const sensitiveManifestPaths = touchedPaths.filter((path) =>
-		MANIFEST_REVIEW_PATTERNS.some((pattern) => pattern.test(path)),
-	);
+	const sensitiveManifestPaths = manifestReviewPaths(touchedPaths);
 	if (sensitiveManifestPaths.length > 0) {
 		return {
 			safe: true,

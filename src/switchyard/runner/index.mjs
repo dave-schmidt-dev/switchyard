@@ -1855,22 +1855,50 @@ export function validateCallerInputs(options = {}) {
 		options.checkpointPath ?? getCheckpointPath(tasksFilePath),
 	);
 	let tasks;
+	const requestedSelection =
+		options.runOptions?.taskIds ?? options.taskIds ?? [];
+	let selectedTaskIds = [];
+	let evaluatedTaskIds = [];
 	try {
 		tasks = loadTaskQueue(tasksFilePath);
-		validateProjectFileEntries(tasks, projectPath);
 		if (tasks.length === 0) {
 			throw new CallerInputValidationError(
 				"queue_empty",
 				"no tasks parsed from task file — 0 headings matching the required task format",
 			);
 		}
-		assertCommittedDeclaredFiles(tasks, projectPath);
+		selectedTaskIds = normalizeIds(requestedSelection, "task selection");
+		const byId = new Map(tasks.map((task) => [task.id, task]));
+		const selectedTasks =
+			selectedTaskIds.length > 0
+				? selectedTaskIds.map((taskId) => {
+						const task = byId.get(taskId);
+						if (!task) throw new TaskSelectionError(taskId, "unknown-task");
+						return task;
+					})
+				: tasks;
+		evaluatedTaskIds = selectedTasks.map((task) => task.id);
+		validateProjectFileEntries(selectedTasks, projectPath);
+		assertCommittedDeclaredFiles(selectedTasks, projectPath);
 	} catch (error) {
+		if (error instanceof TaskSelectionError) {
+			const rejection = new CallerInputValidationError(
+				"task_selection_failed",
+				"selected task is not runnable with the current checkpoint",
+				{ taskId: error.taskId },
+			);
+			rejection.selectedTaskIds = selectedTaskIds;
+			rejection.evaluatedTaskIds = evaluatedTaskIds;
+			throw rejection;
+		}
 		if (
 			error instanceof CallerInputValidationError ||
 			error instanceof CallerInputValidationUnavailableError
-		)
+		) {
+			error.selectedTaskIds = selectedTaskIds;
+			error.evaluatedTaskIds = evaluatedTaskIds;
 			throw error;
+		}
 		const rejection = new CallerInputValidationError(
 			"queue_contract_invalid",
 			"task queue, graph, and declared Files entries must be valid",
@@ -1878,6 +1906,8 @@ export function validateCallerInputs(options = {}) {
 		// The CLI's legacy text surface may retain the parser's caller-owned
 		// diagnostic; JSON validation output deliberately uses `remedy` instead.
 		rejection.message = error?.message ?? rejection.message;
+		rejection.selectedTaskIds = selectedTaskIds;
+		rejection.evaluatedTaskIds = evaluatedTaskIds;
 		throw rejection;
 	}
 
@@ -1890,14 +1920,18 @@ export function validateCallerInputs(options = {}) {
 					`${checkpointPath}.dirty-overlay.json`,
 			)
 		: null;
-	const selection = options.runOptions?.taskIds ?? options.taskIds ?? [];
+	const selection = selectedTaskIds;
+	const evaluatedTasks =
+		selection.length > 0
+			? tasks.filter((task) => selection.includes(task.id))
+			: tasks;
 	let dirtyOverlayReceipt = null;
 	if (dirtyOverlay) {
-		const undeclared = tasks.find(
+		const undeclared = evaluatedTasks.find(
 			(task) => (task.requiredPaths ?? []).length === 0,
 		);
 		const paths = [
-			...new Set(tasks.flatMap((task) => task.requiredPaths ?? [])),
+			...new Set(evaluatedTasks.flatMap((task) => task.requiredPaths ?? [])),
 		];
 		if (undeclared || paths.length === 0) {
 			throw new CallerInputValidationError(
@@ -2024,6 +2058,11 @@ export function validateCallerInputs(options = {}) {
 		});
 		return {
 			tasks,
+			selectedTaskIds:
+				runOptions.taskIds.length > 0
+					? [...runOptions.taskIds]
+					: tasks.map((task) => task.id),
+			evaluatedTaskIds: [...evaluatedTaskIds],
 			checkpoint,
 			checkpointPath,
 			projectRevision,
