@@ -164,6 +164,29 @@ describe("Parallels host readiness", () => {
 		strictEqual(calls, 1);
 	});
 
+	it("classifies a sandbox-denied ps probe from the prlctl wrapper as permission denied", () => {
+		let calls = 0;
+		const backend = new ParallelsExecutionBackend({
+			hostReadinessAttempts: 2,
+			prlctlFn: () => {
+				calls += 1;
+				const denied = new Error("wrapper refused host process inspection");
+				denied.status = 7;
+				denied.stderr =
+					"/usr/local/bin/prlctl: line 82: /bin/ps: Operation not permitted\n";
+				throw denied;
+			},
+		});
+
+		throws(
+			() => backend.probeHostReadiness(),
+			(error) =>
+				error instanceof ParallelsHostReadinessError &&
+				error.code === "vm_host_inventory_permission_denied",
+		);
+		strictEqual(calls, 1);
+	});
+
 	it("uses its bounded read-only retry budget only for qualified transient codes", () => {
 		let calls = 0;
 		let now = 0;
@@ -3707,7 +3730,7 @@ describe("VM ownership metadata", () => {
 		const source = readFileSync(sourcePath, "utf8");
 		strictEqual(
 			createHash("sha256").update(source, "utf8").digest("hex"),
-			"36fa41ae30d18d70e005502d7518711e4195fdf2fa830f1a8b3a7b2cc1a9aa28",
+			"b50de8df37a0c2697c10ff8d034c64ac07bb279b2c97849e200f1f8744db002f",
 		);
 
 		const calls = [];

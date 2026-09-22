@@ -5050,4 +5050,80 @@ describe("prlctl failure metadata survives the persistence boundary", () => {
 		strictEqual(onDisk.lastFailure?.signal, "SIGTERM");
 		ok(isPersistentFailureMetadata(onDisk.lastFailure));
 	});
+
+	describe("simple dispatch durable evidence and milestones", () => {
+		it("stores valid workerPid in initializeRun and round-trips to disk", async () => {
+			const opts = makeOptions({ workerPid: 12345 });
+			const snapshot = await initializeRun(opts);
+			strictEqual(snapshot.workerPid, 12345);
+
+			const onDisk = await readRun(opts.runId);
+			strictEqual(onDisk.workerPid, 12345);
+		});
+
+		it("defaults workerPid to null when omitted or undefined", async () => {
+			const opts = makeOptions();
+			const snapshot = await initializeRun(opts);
+			strictEqual(snapshot.workerPid, null);
+
+			const onDisk = await readRun(opts.runId);
+			strictEqual(onDisk.workerPid, null);
+		});
+
+		it("rejects invalid workerPid values in initializeRun", async () => {
+			for (const badPid of [-1, 0, 1.5, "12345", {}, []]) {
+				await rejects(
+					initializeRun(makeOptions({ workerPid: badPid })),
+					SchemaError,
+				);
+			}
+		});
+
+		it("persists named milestone events with approved milestone keys and elapsedMs", async () => {
+			const opts = makeOptions();
+			await initializeRun(opts);
+
+			await createEvent(opts.runId, {
+				phase: "route",
+				event: "milestone",
+				status: "route_completed",
+				milestone: "route_selected",
+				elapsedMs: 250,
+				checkIndex: 1,
+				checkIdentity: "preflight-check",
+				checkStatus: "passed",
+				firstChangeObserved: true,
+				elapsedSinceLastMilestoneMs: 150,
+			});
+
+			const events = await readEvents(opts.runId);
+			strictEqual(events.length, 1);
+			const ev = events[0];
+			strictEqual(ev.event, "milestone");
+			strictEqual(ev.milestone, "route_selected");
+			strictEqual(ev.elapsedMs, 250);
+			strictEqual(ev.checkIndex, 1);
+			strictEqual(ev.checkIdentity, "preflight-check");
+			strictEqual(ev.checkStatus, "passed");
+			strictEqual(ev.firstChangeObserved, true);
+			strictEqual(ev.elapsedSinceLastMilestoneMs, 150);
+		});
+
+		it("does not persist elapsedMs for generic unapproved events", async () => {
+			const opts = makeOptions();
+			await initializeRun(opts);
+
+			await createEvent(opts.runId, {
+				phase: "execute",
+				event: "heartbeat",
+				status: "running",
+				elapsedMs: 500,
+			});
+
+			const events = await readEvents(opts.runId);
+			strictEqual(events.length, 1);
+			strictEqual(events[0].event, "heartbeat");
+			strictEqual(events[0].elapsedMs, undefined);
+		});
+	});
 });

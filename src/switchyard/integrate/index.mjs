@@ -774,23 +774,27 @@ function getScopedFingerprint(projectPath, touchedPaths) {
  * @param {object} [options]
  * @param {boolean} [options.allowSensitiveManifests] The parsed
  *   `AllowManifests: true` task opt-in. It permits a manifest diff only when
- *   `requiredPaths` also explicitly declares every touched manifest path.
+ *   the task scope explicitly declares every touched manifest path.
+ * @param {string[]|null} [options.allowedPaths] When non-null, enforce an
+ *   allowlist: every touched path must be declared, but declared paths do not
+ *   all have to be touched.
  * @param {string[]|null} [options.requiredPaths] When non-null, enforce exact
- *   Files allowlist: every declared path must be touched and every touched
- *   path must be declared. Composes with (does not replace) structural checks.
+ *   required output: every declared path must be touched and every touched
+ *   path must be declared. Retained for callers that truly require every path.
  * @returns {{success: boolean, message: string, requiresReview?: boolean,
  *   sensitivePaths?: string[], missingPaths?: string[], extraPaths?: string[],
  *   structural_error?: string, alreadyApplied?: boolean, reason?: string,
  *   reasonKind?: "corrupt_patch"|"conflict"}} Result
  */
 function integrationGateUnsafe(diff, projectPath, options = {}) {
-	const { requiredPaths = null } = options;
+	const { allowedPaths = null, requiredPaths = null } = options;
+	const declaredPaths = allowedPaths ?? requiredPaths;
 
 	// Required-paths: empty diff check runs BEFORE patch normalization so we
 	// don't accidentally re-terminate an empty string into "\n" and treat it
 	// as a (weird) non-empty patch.
 	if (
-		requiredPaths !== null &&
+		declaredPaths !== null &&
 		(!diff || typeof diff !== "string" || !diff.trim())
 	) {
 		return { success: false, message: "empty_required_diff" };
@@ -806,7 +810,20 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 	// Runs BEFORE the structural checks in validateDiff; still calls
 	// validateDiff afterward so structural errors compose (both sets of
 	// errors are reported).
-	if (requiredPaths !== null) {
+	if (declaredPaths !== null) {
+		for (const p of declaredPaths) {
+			if (
+				typeof p === "string" &&
+				(p.includes("=>") || p.includes("{") || p.includes("}"))
+			) {
+				return {
+					success: false,
+					message: "ambiguous_combined_rename_spelling",
+					reasonKind: "ambiguous_combined_rename_spelling",
+				};
+			}
+		}
+
 		const { paths: touchedPaths, stderr: numstatStderr } = extractTouchedPaths(
 			patch,
 			projectPath,
@@ -820,20 +837,27 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		}
 
 		const summaryLines = extractSummaryLines(patch, projectPath);
-		const touchedForDeclaration = new Set(touchedPaths);
+		const renameEndpoints = [];
 		for (const line of summaryLines) {
 			const paths = parseRenamePaths(line);
 			if (paths) {
-				touchedForDeclaration.add(paths.old);
-				touchedForDeclaration.add(paths.new);
+				renameEndpoints.push(paths.old, paths.new);
 			}
 		}
 
-		const requiredSet = new Set(requiredPaths);
-		const missingPaths = requiredPaths.filter(
+		const touchedForDeclaration = new Set([
+			...touchedPaths.filter((p) => !p.includes("=>")),
+			...renameEndpoints,
+		]);
+
+		const declaredSet = new Set(declaredPaths);
+		const missingPaths = (requiredPaths ?? []).filter(
 			(p) => !touchedForDeclaration.has(p),
 		);
-		const extraPaths = touchedPaths.filter((p) => !requiredSet.has(p));
+		const extraPaths =
+			allowedPaths !== null
+				? [...touchedForDeclaration].filter((p) => !declaredSet.has(p))
+				: touchedPaths.filter((p) => !declaredSet.has(p));
 
 		if (missingPaths.length > 0) {
 			const validation = validateDiff(patch, projectPath);
@@ -878,9 +902,9 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 	}
 
 	const manifestsAreDeclared =
-		requiredPaths !== null &&
+		declaredPaths !== null &&
 		(validation.sensitivePaths ?? []).every((path) =>
-			requiredPaths.includes(path),
+			declaredPaths.includes(path),
 		);
 	if (
 		validation.requiresReview &&
@@ -901,7 +925,7 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 	// function. Scoped to touched-path content/state so pre-existing unrelated
 	// dirty state in other files never triggers a false no-op report.
 	let preFingerprint = "";
-	if (requiredPaths === null) {
+	if (declaredPaths === null) {
 		preFingerprint = getScopedFingerprint(projectPath, validation.touchedPaths);
 	}
 
@@ -921,7 +945,7 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 			candidate.operation.patchHash !==
 				createHash("sha256").update(patch, "utf8").digest("hex") ||
 			JSON.stringify(candidate.operation.paths) !==
-				JSON.stringify(requiredPaths ?? [])
+				JSON.stringify(declaredPaths ?? [])
 		) {
 			return { success: false, message: "invalid_integration_intent" };
 		}
@@ -944,7 +968,7 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		};
 	}
 	if (applyResult === true) {
-		if (requiredPaths === null) {
+		if (declaredPaths === null) {
 			const postFingerprint = getScopedFingerprint(
 				projectPath,
 				validation.touchedPaths,

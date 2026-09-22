@@ -255,6 +255,12 @@ const APPROVED_EVENT_KEYS = new Set([
 	"causedBy",
 	"operationId",
 	"detail",
+	"milestone",
+	"checkIndex",
+	"checkIdentity",
+	"checkStatus",
+	"firstChangeObserved",
+	"elapsedSinceLastMilestoneMs",
 ]);
 
 const EVENT_RESERVE_BYTES = 1024;
@@ -1069,6 +1075,13 @@ function validateRun(data) {
 	if (data.initialHostFingerprint == null) {
 		throw new SchemaError("initialHostFingerprint is required");
 	}
+	if (
+		data.workerPid !== undefined &&
+		data.workerPid !== null &&
+		(!Number.isSafeInteger(data.workerPid) || data.workerPid <= 0)
+	) {
+		throw new SchemaError("workerPid must be a positive integer or null");
+	}
 	if (typeof data.workerNonce !== "string") {
 		throw new SchemaError("workerNonce must be a string");
 	}
@@ -1578,6 +1591,7 @@ export async function initializeRun(options) {
 		projectPath,
 		orderedTaskIds,
 		initialHostFingerprint,
+		workerPid = null,
 		workerNonce = "",
 		launchArgs = [],
 		projectRevision = null,
@@ -1586,6 +1600,13 @@ export async function initializeRun(options) {
 	} = options;
 
 	validateRunId(runId);
+	if (
+		workerPid !== undefined &&
+		workerPid !== null &&
+		(!Number.isSafeInteger(workerPid) || workerPid <= 0)
+	) {
+		throw new SchemaError("workerPid must be a positive integer or null");
+	}
 
 	const runDir = getRunRoot(runId);
 	await ensureDir(runDir, 0o700);
@@ -1628,7 +1649,7 @@ export async function initializeRun(options) {
 		projectPath,
 		orderedTaskIds,
 		initialHostFingerprint,
-		workerPid: null,
+		workerPid: workerPid ?? null,
 		workerStartToken: null,
 		workerNonce,
 		activeTaskId: null,
@@ -2384,7 +2405,9 @@ async function createEventInternal(
 	// event field. This prevents arbitrary status payloads from widening the
 	// durable event schema while retaining one content-free progress measure.
 	if (
-		event?.event === "vm_slot_wait" &&
+		(event?.event === "vm_slot_wait" ||
+			event?.milestone !== undefined ||
+			event?.event === "milestone") &&
 		Number.isFinite(event.elapsedMs) &&
 		event.elapsedMs >= 0
 	) {
@@ -3009,7 +3032,14 @@ export async function acquireRunLock(
 	}
 
 	if (current.workerPid !== null) {
-		if (current.workerPid === pid && current.workerStartToken === startToken) {
+		const sameProcessInitialClaim =
+			current.workerPid === pid &&
+			current.workerStartToken === null &&
+			current.workerNonce === nonce;
+		if (
+			(current.workerPid === pid && current.workerStartToken === startToken) ||
+			sameProcessInitialClaim
+		) {
 			const updated = await updateRun(
 				runId,
 				{

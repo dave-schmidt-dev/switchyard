@@ -15,6 +15,7 @@ import {
 import { homedir, hostname, tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
+import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import {
 	boundProviderLifecycleSnapshot,
 	runProviderProcess,
@@ -27,6 +28,7 @@ import {
 import {
 	captureDirtyOverlay,
 	materializeDirtyOverlay,
+	parsePredecessorReceipt,
 	validateDirtyOverlayReceipt,
 } from "../lifecycle/index.mjs";
 import {
@@ -37,13 +39,18 @@ import {
 import { route } from "../router/index.mjs";
 import {
 	acquireProjectLock,
+	createEvent,
+	initializeRun,
+	readRun,
 	releaseProjectLockIfOwnedBy,
+	updateRunWithRetry,
 } from "../run-store/index.mjs";
 
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
+--predecessor-receipt binds output of a previous run and requires --dirty-overlay.
 Output is always one JSON result; progress is written to stderr.`;
 
 const MAX_PROMPT_BYTES = 256 * 1024;
@@ -53,9 +60,10 @@ const MAX_DECLARED_FILES = 64;
 const MAX_CHECKS = 16;
 const MAX_PATH_CHARS = 1024;
 const MAX_CHECK_CHARS = 8192;
-// A pin is a routing contract, not an adapter promise. Every known target may
-// be selected explicitly; targets without a local adapter fail closed at the
-// adapter boundary instead of silently falling back to Codex.
+// A pin is a routing contract, not an adapter promise. The simple lane keeps
+// this target-aware registry as its one local-compatibility boundary. In
+// particular, the two Agy targets share a CLI harness but do not share a
+// model contract.
 const SIMPLE_PROVIDERS = Object.freeze([
 	"claude-code",
 	"codex",
@@ -65,6 +73,36 @@ const SIMPLE_PROVIDERS = Object.freeze([
 	"opencode-go",
 	"vibe",
 	"copilot",
+	"copilot-student",
+]);
+const SIMPLE_TARGET_ADAPTERS = Object.freeze([
+	Object.freeze({
+		targetId: "codex",
+		harness: "codex",
+		kind: "codex",
+		selectors: null,
+	}),
+	Object.freeze({
+		targetId: "antigravity",
+		harness: "agy",
+		kind: "agy",
+		selectors: Object.freeze([
+			"gemini-3.8-flash-medium",
+			"gemini-3.8-flash-high",
+		]),
+	}),
+	Object.freeze({
+		targetId: "antigravity-claude",
+		harness: "agy",
+		kind: "agy",
+		selectors: Object.freeze(["claude-sonnet-4-6"]),
+	}),
+	Object.freeze({
+		targetId: "copilot-student",
+		harness: "copilot",
+		kind: "copilot",
+		selectors: Object.freeze(["auto"]),
+	}),
 ]);
 const CAPABILITIES = new Set(["low", "standard", "high"]);
 const SECRET_PATHS = [
@@ -200,6 +238,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				file: { type: "string", multiple: true },
 				input: { type: "string", multiple: true },
 				"dirty-overlay": { type: "boolean", default: false },
+				"predecessor-receipt": { type: "string" },
 				"only-provider": { type: "string", multiple: true },
 				check: { type: "string", multiple: true },
 				deadline: { type: "string" },
@@ -291,6 +330,25 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		for (const path of inputs)
 			assertDeclaredPathBoundary(canonicalProjectPath, path);
 	}
+	const predecessorReceiptPath = parsed.values["predecessor-receipt"]
+		? resolve(parsed.values["predecessor-receipt"])
+		: null;
+	if (predecessorReceiptPath) {
+		if (!dirtyOverlay) {
+			throw new SimpleUsageError(
+				"--predecessor-receipt requires --dirty-overlay",
+			);
+		}
+		if (!existsSync(predecessorReceiptPath)) {
+			throw new SimpleUsageError("predecessor receipt file does not exist");
+		}
+		const predStats = lstatSync(predecessorReceiptPath);
+		if (!predStats.isFile() || predStats.isSymbolicLink()) {
+			throw new SimpleUsageError(
+				"predecessor receipt must be a regular non-symlink file",
+			);
+		}
+	}
 	const checks = parsed.values.check ?? [];
 	if (
 		checks.length === 0 ||
@@ -313,6 +371,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		files,
 		readOnlyInputs: inputs,
 		dirtyOverlay,
+		predecessorReceiptPath,
 		checks: checks.map((check) => check.trim()),
 		deadlineMs: parseDeadline(parsed.values.deadline, nowMs),
 	};
@@ -322,6 +381,14 @@ function rosterPath() {
 	return (
 		process.env.SWITCHYARD_ROSTER_PATH ||
 		join(homedir(), ".agent", "roster.json")
+	);
+}
+
+export function simpleRouteIsFunded(target) {
+	return (
+		target?.enabled === true &&
+		["subscription", "quota"].includes(target.funding?.included?.mode) &&
+		target.funding?.overage?.enabled === false
 	);
 }
 
@@ -335,11 +402,7 @@ function assertFundedRoute(targetId) {
 		});
 	}
 	const target = roster?.targets?.[targetId];
-	if (
-		target?.enabled !== true ||
-		target.funding?.included?.mode !== "subscription" ||
-		target.funding?.overage?.enabled !== false
-	) {
+	if (!simpleRouteIsFunded(target)) {
 		throw Object.assign(new Error("paid_overage_not_allowed"), {
 			code: "paid_overage_not_allowed",
 		});
@@ -425,6 +488,9 @@ function makeDirtyBaseline({
 						sha256: entry.sha256,
 						size: entry.size,
 						mode: entry.mode & 0o111 ? 0o100755 : 0o100644,
+						...(entry.tracked === false
+							? { tracked: false, predecessor: entry.predecessor }
+							: { tracked: true }),
 					},
 				];
 			}),
@@ -436,13 +502,71 @@ function makeDirtyBaseline({
 	};
 }
 
+function extractErrno(error) {
+	if (!error) return null;
+	const candidates = [
+		error.code,
+		error.errno,
+		error.cause?.code,
+		error.cause?.errno,
+	];
+	for (const candidate of candidates) {
+		if (typeof candidate === "string" && /^[A-Z0-9]+$/u.test(candidate)) {
+			return candidate;
+		}
+	}
+	if (typeof error.message === "string") {
+		const match =
+			/\b(EPERM|EACCES|EROFS|ENOSPC|EMFILE|ENFILE|EIO|EDQUOT|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|ENETDOWN)\b/u.exec(
+				error.message,
+			);
+		if (match) return match[1];
+	}
+	return null;
+}
+
 function dirtyOverlayFailure(error, { taskId, baseRevision, files, inputs }) {
 	const message = String(error?.message ?? "dirty overlay preflight failed");
-	let code = "dirty_overlay_preflight_failed";
+	const errno = extractErrno(error);
+	let code = errno ?? "dirty_overlay_preflight_failed";
 	let condition = "declared dirty input could not be captured";
 	let remedy =
 		"keep the declared inputs tracked, regular, non-secret files and retry";
-	if (/untracked/u.test(message)) {
+	if (errno === "EPERM" || errno === "EACCES") {
+		code = errno;
+		condition = "filesystem permission denied during overlay capture";
+		remedy = "ensure read access to declared input files";
+	} else if (errno) {
+		code = errno;
+		condition = "filesystem error during overlay capture";
+		remedy = "resolve filesystem issue";
+	} else if (
+		/predecessor.*mismatch/iu.test(message) ||
+		error?.code === "predecessor_receipt_mismatch"
+	) {
+		code = "predecessor_receipt_mismatch";
+		condition = "predecessor receipt base revision or digest mismatched";
+		remedy = "provide a valid matching predecessor receipt or track the file";
+	} else if (
+		/predecessor.*missing/iu.test(message) ||
+		error?.code === "predecessor_receipt_missing"
+	) {
+		code = "predecessor_receipt_missing";
+		condition = "predecessor receipt file is missing";
+		remedy = "provide an existing predecessor receipt file";
+	} else if (error?.code === "predecessor_receipt_unverified") {
+		code = "predecessor_receipt_unverified";
+		condition = "predecessor run is not a completed accepted result";
+		remedy =
+			"wait for predecessor cleanup to complete and use its durable receipt";
+	} else if (
+		/predecessor/iu.test(message) ||
+		error?.code === "predecessor_receipt_invalid"
+	) {
+		code = "predecessor_receipt_invalid";
+		condition = "predecessor receipt is invalid";
+		remedy = "provide a valid predecessor receipt";
+	} else if (/untracked/u.test(message)) {
 		code = "dirty_overlay_untracked";
 		condition = "a scoped input is untracked";
 		remedy = "track the input or remove it from --file/--input";
@@ -525,7 +649,18 @@ export function buildSimpleProviderInvocation(
 	descriptor,
 	_prompt,
 	worktreePath,
+	targetId = descriptor?.target_id ?? null,
 ) {
+	const compatibility = simpleProviderCompatibility({
+		targetId,
+		harness,
+		descriptor,
+	});
+	if (!compatibility.compatible) {
+		throw Object.assign(new Error(compatibility.reason), {
+			code: compatibility.reason,
+		});
+	}
 	if (harness === "codex") {
 		const invocationArgs = descriptor.invocation_args ?? [];
 		for (let index = 0; index < invocationArgs.length; index += 2) {
@@ -561,30 +696,74 @@ export function buildSimpleProviderInvocation(
 		};
 	}
 	if (harness === "agy") {
-		if (descriptor.selector !== "claude-sonnet-4-6") {
-			throw Object.assign(new Error("local_descriptor_model_unavailable"), {
-				code: "local_descriptor_model_unavailable",
-			});
-		}
 		return {
 			command: "agy",
 			args: [
-				"-p",
-				_prompt,
+				"--new-project",
+				"--mode",
+				"accept-edits",
+				"--dangerously-skip-permissions",
+				"--sandbox",
 				"--model",
 				descriptor.selector,
-				"--mode=accept-edits",
-				"--sandbox",
+				"--add-dir",
+				worktreePath,
 				"--output-format",
 				"json",
 				"--print-timeout",
 				"30m",
+				"--print",
+				_prompt,
 			],
 		};
 	}
-	throw Object.assign(new Error("local_adapter_unavailable"), {
-		code: "local_adapter_unavailable",
-	});
+	return {
+		command: "copilot",
+		args: [
+			"--experimental",
+			"--sandbox",
+			"-C",
+			worktreePath,
+			"--model",
+			descriptor.selector,
+			"--available-tools",
+			"apply_patch,create,edit,view,glob,grep",
+			"--allow-tool",
+			"read,write",
+			"--disallow-temp-dir",
+			"--disable-builtin-mcps",
+			"--no-custom-instructions",
+			"--no-ask-user",
+			"--no-auto-update",
+			"--output-format",
+			"json",
+			"--stream",
+			"off",
+			"-p",
+			_prompt,
+		],
+	};
+}
+
+/**
+ * Check the exact target, harness, and descriptor before it may enter the
+ * simple lane. Target identity is intentional: Antigravity and Antigravity
+ * (Claude) share the `agy` harness but are separate owner-selected routes.
+ */
+export function simpleProviderCompatibility({ targetId, harness, descriptor }) {
+	if (!descriptor || descriptor.target_id !== targetId) {
+		return { compatible: false, reason: "invocation_descriptor_unavailable" };
+	}
+	const adapter = SIMPLE_TARGET_ADAPTERS.find(
+		(candidate) => candidate.targetId === targetId,
+	);
+	if (!adapter || adapter.harness !== harness) {
+		return { compatible: false, reason: "local_adapter_unavailable" };
+	}
+	if (adapter.selectors && !adapter.selectors.includes(descriptor.selector)) {
+		return { compatible: false, reason: "local_descriptor_model_unavailable" };
+	}
+	return { compatible: true, reason: null };
 }
 
 async function defaultExecuteProvider(context) {
@@ -593,9 +772,11 @@ async function defaultExecuteProvider(context) {
 		context.descriptor,
 		context.prompt,
 		context.worktreePath,
+		context.targetId,
 	);
 	const result = await runProviderProcess(invocation.command, invocation.args, {
 		input: context.prompt,
+		cwd: context.worktreePath,
 		timeoutMs: context.timeoutMs,
 		silenceTimeoutMs: Math.min(5 * 60 * 1000, context.timeoutMs),
 		maxBuffer: MAX_CAPTURE_BYTES,
@@ -901,6 +1082,7 @@ function terminalResult(base, overrides = {}) {
 	const status = overrides.status ?? "failed";
 	return {
 		schemaVersion: 1,
+		runId: overrides.runId ?? base.runId ?? `simple-${base.taskId}`,
 		taskId: base.taskId,
 		attemptId: base.attemptId,
 		status,
@@ -908,6 +1090,8 @@ function terminalResult(base, overrides = {}) {
 		targetId: overrides.targetId ?? null,
 		elapsedMs: Math.max(0, base.now() - base.startedAt),
 		changedFiles: safeChangedFiles(overrides.changedFiles ?? []),
+		outputs: overrides.outputs ?? [],
+		baseRevision: overrides.baseRevision ?? null,
 		checks: overrides.checks ?? [],
 		failureReason: overrides.failureReason ?? null,
 		failurePhase: overrides.failurePhase ?? null,
@@ -924,13 +1108,55 @@ function terminalResult(base, overrides = {}) {
 	};
 }
 
+async function resolvePredecessorReceipt(input, projectPath, dependencies) {
+	const supplied = parsePredecessorReceipt(input, { projectPath });
+	let predecessor;
+	try {
+		predecessor = await (dependencies.readRun ?? readRun)(supplied.runId);
+	} catch {
+		const error = new Error("predecessor run record is unavailable");
+		error.code = "predecessor_receipt_unverified";
+		throw error;
+	}
+	if (
+		predecessor.state !== "succeeded" ||
+		predecessor.cleanupState !== "complete" ||
+		realpathSync(predecessor.projectPath) !== realpathSync(projectPath) ||
+		predecessor.terminalSummary?.status !== "succeeded"
+	) {
+		const error = new Error(
+			"predecessor run is not an accepted project result",
+		);
+		error.code = "predecessor_receipt_unverified";
+		throw error;
+	}
+	const durable = parsePredecessorReceipt(
+		{ runId: predecessor.runId, ...predecessor.terminalSummary },
+		{ projectPath },
+	);
+	if (
+		supplied.baseRevision !== durable.baseRevision ||
+		JSON.stringify(supplied.outputs) !== JSON.stringify(durable.outputs)
+	) {
+		const error = new Error(
+			"predecessor receipt does not match durable result",
+		);
+		error.code = "predecessor_receipt_unverified";
+		throw error;
+	}
+	return durable;
+}
+
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
 	const taskId = dependencies.taskId ?? randomUUID();
 	const attemptId = dependencies.attemptId ?? randomUUID();
-	const runId = `simple-${taskId}`;
+	// A caller may bind an explicit run id for durable recovery or inspection.
+	// Otherwise allocate a unique id: test seams and attended callers can reuse
+	// a task id across attempts, while run-store records are create-only.
+	const runId = dependencies.runId ?? `simple-${taskId}-${randomUUID()}`;
 	const startedAt = now();
-	const base = { taskId, attemptId, startedAt, now };
+	const base = { taskId, attemptId, runId, startedAt, now };
 	const onStatus = dependencies.onStatus;
 	let provider = null;
 	let targetId = null;
@@ -954,6 +1180,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let lastMilestoneAt = startedAt;
 	let firstChangeObserved = false;
 	let lastFirstChangeProbeAt = Number.NEGATIVE_INFINITY;
+	let runInitialized = false;
+	const pendingDurability = new Set();
 	const checks = [];
 	const acquireLock = dependencies.acquireProjectLock ?? acquireProjectLock;
 	const releaseLock =
@@ -967,31 +1195,153 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const resolveIdentity =
 		dependencies.resolveTargetIdentity ?? resolveTargetIdentity;
 
-	const classifyErrorKind = (failureReason, failurePhase) => {
+	const classifyErrorKind = (failureReason, failurePhase, error = null) => {
+		const errno =
+			extractErrno(error) ??
+			(typeof failureReason === "string" && /^[A-Z0-9]+$/u.test(failureReason)
+				? failureReason
+				: null);
+		if (errno === "EPERM" || errno === "EACCES") {
+			return "permission_denied";
+		}
+		if (
+			[
+				"EROFS",
+				"ENOSPC",
+				"EMFILE",
+				"ENFILE",
+				"EIO",
+				"EDQUOT",
+				"ETIMEDOUT",
+				"ECONNREFUSED",
+				"ENETUNREACH",
+				"ENETDOWN",
+			].includes(errno)
+		) {
+			return "environment_failure";
+		}
+		if (failureReason === "run_store_write_failed") {
+			return "run_store_write_failed";
+		}
+		if (
+			failureReason === "paid_overage_not_allowed" ||
+			failureReason === "ambiguous_combined_rename_spelling"
+		) {
+			return "policy_violation";
+		}
 		if (failureReason === "manifest_review_required") {
 			return failurePhase === "input_validation"
 				? "validation_failed"
 				: "policy_violation";
 		}
-		if (failurePhase === "input_validation" || failurePhase === "preflight")
+		if (
+			failureReason === "invalid_invocation" ||
+			failureReason === "predecessor_receipt_invalid" ||
+			failureReason === "predecessor_receipt_missing" ||
+			failureReason === "predecessor_receipt_mismatch" ||
+			failureReason === "predecessor_receipt_unverified" ||
+			(failureReason?.startsWith("dirty_overlay_") &&
+				failureReason !== "dirty_overlay_drift")
+		) {
 			return "validation_failed";
-		if (failurePhase === "diff" || failurePhase === "integrate")
+		}
+		if (
+			failureReason === "dirty_overlay_drift" ||
+			failureReason === "project_head_changed_concurrently" ||
+			failureReason === "declared_path_changed_concurrently" ||
+			failureReason === "read_only_input_changed" ||
+			failureReason === "undeclared_paths_changed" ||
+			failureReason === "unsafe_diff" ||
+			failureReason === "empty_diff" ||
+			failureReason === "integration_failed"
+		) {
 			return "policy_violation";
-		if (failurePhase === "checks") return "check_failed";
-		if (failurePhase === "execute") return "execution_failed";
-		if (failurePhase === "cleanup") return "cleanup_failed";
+		}
+		if (
+			failurePhase === "checks" ||
+			failureReason === "check_failed" ||
+			failureReason === "check_deadline_exceeded" ||
+			failureReason === "check_silence_timeout"
+		) {
+			return "check_failed";
+		}
+		if (
+			failureReason === "provider_silence_timeout" ||
+			failureReason === "provider_deadline_exceeded" ||
+			failureReason === "provider_cancelled" ||
+			failureReason === "provider_exit_nonzero" ||
+			failureReason === "provider_launch_failed" ||
+			failurePhase === "execute"
+		) {
+			return "execution_failed";
+		}
+		if (
+			failureReason === "worktree_cleanup_failed" ||
+			failureReason === "project_lock_release_unconfirmed" ||
+			failurePhase === "cleanup"
+		) {
+			return "cleanup_failed";
+		}
+		if (failureReason === "deadline_expired") {
+			if (failurePhase === "preflight" || failurePhase === "input_validation")
+				return "validation_failed";
+			if (failurePhase === "execute") return "execution_failed";
+			if (failurePhase === "checks") return "check_failed";
+			if (failurePhase === "cleanup") return "cleanup_failed";
+			return "policy_violation";
+		}
+		if (
+			failureReason === "project_revision_unavailable" ||
+			failureReason === "workspace_clone_failed" ||
+			failureReason === "workspace_checkout_failed" ||
+			failureReason === "dirty_overlay_stage_failed" ||
+			failureReason === "dirty_overlay_baseline_failed"
+		) {
+			return "environment_failure";
+		}
+		if (failurePhase === "input_validation") {
+			return "validation_failed";
+		}
 		return "unclassified_failure";
 	};
 	const milestone = (phase, name, details = {}) => {
 		const observedAt = now();
+		const elapsedSinceLastMilestoneMs = Math.max(
+			0,
+			observedAt - lastMilestoneAt,
+		);
 		emitStatus(onStatus, taskId, phase, {
 			milestone: name,
 			elapsedMs: Math.max(0, observedAt - startedAt),
-			elapsedSinceLastMilestoneMs: Math.max(0, observedAt - lastMilestoneAt),
+			elapsedSinceLastMilestoneMs,
 			firstChangeObserved,
 			...details,
 		});
 		lastMilestoneAt = observedAt;
+		if (runInitialized) {
+			try {
+				const eventWrite = (dependencies.createEvent ?? createEvent)(runId, {
+					phase,
+					event: "milestone",
+					milestone: name,
+					status: details.status ?? "in_progress",
+					elapsedMs: Math.max(0, observedAt - startedAt),
+					elapsedSinceLastMilestoneMs,
+					...(details.checkIndex !== undefined
+						? { checkIndex: details.checkIndex }
+						: {}),
+					...(details.checkIdentity !== undefined
+						? { checkIdentity: details.checkIdentity }
+						: {}),
+					...(details.checkStatus !== undefined
+						? { checkStatus: details.checkStatus }
+						: {}),
+					firstChangeObserved,
+				}).catch(() => {});
+				pendingDurability.add(eventWrite);
+				void eventWrite.finally(() => pendingDurability.delete(eventWrite));
+			} catch {}
+		}
 	};
 	const heartbeat = (phase, details = {}) => {
 		const observedAt = now();
@@ -1002,7 +1352,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 			...details,
 		});
 	};
-	const fail = (failureReason, failurePhase, errorKind = null) => {
+	const fail = (
+		failureReason,
+		failurePhase,
+		errorKind = null,
+		error = null,
+	) => {
+		const computedErrorKind =
+			errorKind ?? classifyErrorKind(failureReason, failurePhase, error);
 		if (
 			worktreePath &&
 			!(currentPhase === "execute" && executionFailureCaptureComplete) &&
@@ -1022,16 +1379,56 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checks,
 			failureReason,
 			failurePhase,
-			errorKind: errorKind ?? classifyErrorKind(failureReason, failurePhase),
+			errorKind: computedErrorKind,
 			preflightDetail,
 			dirtyBaseline,
 			providerLifecycle,
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
+		if (runInitialized) {
+			try {
+				const terminalWrite = (
+					dependencies.updateRunWithRetry ?? updateRunWithRetry
+				)(runId, {
+					state: "failed",
+					finishedAt: new Date(now()).toISOString(),
+					lastFailure: sanitizeFailureMetadata({
+						taskId,
+						result: failureReason,
+						errorKind: computedErrorKind,
+						failurePhase,
+					}),
+				}).catch(() => {});
+				pendingDurability.add(terminalWrite);
+				void terminalWrite.finally(() =>
+					pendingDurability.delete(terminalWrite),
+				);
+			} catch {}
+		}
 		return finalResult;
 	};
 
 	try {
+		try {
+			await (dependencies.initializeRun ?? initializeRun)({
+				runId,
+				tasksFilePath: options.promptPath,
+				projectPath: options.projectPath,
+				orderedTaskIds: [taskId],
+				initialHostFingerprint: "simple",
+				workerPid: process.pid,
+				workerNonce: randomUUID(),
+			});
+			runInitialized = true;
+		} catch (error) {
+			return fail(
+				"run_store_write_failed",
+				"preflight",
+				classifyErrorKind("run_store_write_failed", "preflight", error),
+				error,
+			);
+		}
+
 		if (manifestReviewPaths(options.files).length > 0) {
 			return fail(
 				"manifest_review_required",
@@ -1043,9 +1440,22 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail("deadline_expired", "preflight");
 		}
 		emitStatus(onStatus, taskId, "lock");
-		await acquireLock(options.projectPath, runId);
-		projectLocked = true;
-		projectLockState = "held";
+		try {
+			await acquireLock(options.projectPath, runId);
+			projectLocked = true;
+			projectLockState = "held";
+		} catch (error) {
+			return fail(
+				error?.code ?? "project_lock_failed",
+				"preflight",
+				classifyErrorKind(
+					error?.code ?? "project_lock_failed",
+					"preflight",
+					error,
+				),
+				error,
+			);
+		}
 		baseRevision = requireGit(
 			options.projectPath,
 			["rev-parse", "HEAD"],
@@ -1054,6 +1464,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 		const baselinePaths = [...options.files, ...(options.readOnlyInputs ?? [])];
 		if (options.dirtyOverlay) {
 			try {
+				const predecessorInput =
+					options.predecessorReceiptPath ??
+					options.predecessorReceipt ??
+					dependencies.predecessorReceipt ??
+					null;
+				const predecessorReceipt = predecessorInput
+					? await resolvePredecessorReceipt(
+							predecessorInput,
+							options.projectPath,
+							dependencies,
+						)
+					: null;
 				dirtyOverlayReceipt = captureDirtyOverlay(
 					options.projectPath,
 					baselinePaths,
@@ -1062,6 +1484,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						maxFileBytes: MAX_CAPTURE_BYTES,
 						enforceTarPathLimit: false,
 						secretPaths: SECRET_PATHS,
+						predecessorReceipt,
 					},
 				);
 				dirtyBaseline = makeDirtyBaseline({
@@ -1079,7 +1502,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 					files: options.files,
 					inputs: options.readOnlyInputs ?? [],
 				});
-				return fail(preflightDetail.code, "preflight");
+				return fail(
+					preflightDetail.code,
+					"preflight",
+					classifyErrorKind(preflightDetail.code, "preflight", error),
+					error,
+				);
 			}
 		} else if (!declaredPathsAreClean(options.projectPath, options.files)) {
 			return fail("declared_path_has_owner_edits", "preflight");
@@ -1091,11 +1519,43 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 		currentPhase = "route";
 		emitStatus(onStatus, taskId, "route");
+		const requestedSimpleTargets = (options.onlyProviders ?? []).length
+			? options.onlyProviders
+			: SIMPLE_TARGET_ADAPTERS.map((adapter) => adapter.targetId);
+		const compatibleSimpleTargets = [];
+		let pinnedIncompatibility = null;
+		for (const candidate of requestedSimpleTargets) {
+			const candidateIdentity = resolveIdentity(candidate);
+			const candidateTargetId = candidateIdentity.targetId;
+			const candidateHarness = candidateIdentity.harnessKey
+				? normalizeProviderName(candidateIdentity.harnessKey)
+				: null;
+			const candidateDescriptor = candidateTargetId
+				? descriptorFor(candidateTargetId, options.capability)
+				: null;
+			const compatibility = simpleProviderCompatibility({
+				targetId: candidateTargetId,
+				harness: candidateHarness,
+				descriptor: candidateDescriptor,
+			});
+			if (compatibility.compatible) {
+				compatibleSimpleTargets.push(candidateTargetId);
+			} else if ((options.onlyProviders ?? []).length) {
+				pinnedIncompatibility = compatibility.reason;
+			}
+		}
+		if (
+			(options.onlyProviders ?? []).length &&
+			compatibleSimpleTargets.length === 0
+		) {
+			return fail(
+				pinnedIncompatibility ?? "local_adapter_unavailable",
+				"route",
+			);
+		}
 		const routed = routeProvider({
 			requiredCapability: options.capability,
-			availableProviders: (options.onlyProviders ?? []).length
-				? options.onlyProviders
-				: ["codex"],
+			availableProviders: compatibleSimpleTargets,
 			platform: "direct",
 			nowMs: now(),
 			hasInvocationDescriptor: (name, capability) =>
@@ -1116,7 +1576,33 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (!descriptor || descriptor.target_id !== targetId) {
 			return fail("invocation_descriptor_unavailable", "route");
 		}
+		const compatibility = simpleProviderCompatibility({
+			targetId,
+			harness: normalizeProviderName(identity.harnessKey),
+			descriptor,
+		});
+		if (!compatibility.compatible) {
+			return fail(compatibility.reason, "route");
+		}
 		(dependencies.assertFundedRoute ?? assertFundedRoute)(targetId);
+
+		milestone("route", "route_selected", { provider, targetId });
+		if (runInitialized) {
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					resolvedTargetId: targetId,
+					activeTaskProvider: provider,
+					activeTaskModel: descriptor?.selector ?? null,
+				});
+			} catch (error) {
+				return fail(
+					"run_store_write_failed",
+					"route",
+					classifyErrorKind("run_store_write_failed", "route", error),
+					error,
+				);
+			}
+		}
 
 		worktreeRoot = realpathSync(
 			mkdtempSync(join(tmpdir(), "switchyard-simple-")),
@@ -1201,6 +1687,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		writerLifecycle = "unavailable";
 		const providerResult = await executeProvider({
+			targetId,
 			harness,
 			descriptor,
 			prompt: guardedPrompt,
@@ -1393,24 +1880,81 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail("declared_path_changed_concurrently", "integrate");
 		}
 		emitStatus(onStatus, taskId, "integrate");
+		milestone("integrate", "integration_started");
 		const integration = dependencies.integrate
 			? await dependencies.integrate({
 					diff: captured.diff,
 					projectPath: options.projectPath,
 					changedFiles,
+					allowedPaths: options.files,
 				})
 			: integrationGate(captured.diff, options.projectPath, {
-					requiredPaths: changedFiles,
+					allowedPaths: options.files,
 				});
 		if (!integration?.success) {
 			keepWorktree = true;
-			return fail("integration_failed", "integrate");
+			return fail(
+				integration?.message === "ambiguous_combined_rename_spelling"
+					? "ambiguous_combined_rename_spelling"
+					: integration?.message === "undeclared_paths_touched"
+						? "undeclared_paths_changed"
+						: "integration_failed",
+				"integrate",
+			);
+		}
+		milestone("integrate", "integration_completed");
+		const terminalOutputs = changedFiles.map((path) => {
+			const absolute = resolve(options.projectPath, path);
+			try {
+				const stats = lstatSync(absolute);
+				const bytes = stats.isFile() ? readFileSync(absolute) : Buffer.alloc(0);
+				return {
+					path,
+					size: bytes.length,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+					mode: stats.mode & 0o777,
+				};
+			} catch {
+				return { path, size: 0, sha256: null, mode: 0 };
+			}
+		});
+		if (runInitialized) {
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					state: "running",
+					cleanupState: "pending",
+					terminalSummary: {
+						status: "integration_applied",
+						baseRevision,
+						changedFiles,
+						outputs: terminalOutputs,
+					},
+				});
+			} catch (error) {
+				keepWorktree = true;
+				return fail(
+					"run_store_write_failed",
+					"integrate",
+					classifyErrorKind("run_store_write_failed", "integrate", error),
+					error,
+				);
+			}
 		}
 		emitStatus(onStatus, taskId, "cleanup");
 		currentPhase = "cleanup";
 		const cleanupBudget = remainingMs(options.deadlineMs, now);
 		if (cleanupBudget <= 0) {
 			keepWorktree = true;
+			return fail("deadline_expired", "cleanup");
+		}
+		const released = await releaseLock(options.projectPath, runId);
+		if (released !== true) {
+			projectLockState = "unavailable";
+			return fail("project_lock_release_unconfirmed", "cleanup");
+		}
+		projectLocked = false;
+		projectLockState = "released";
+		if (remainingMs(options.deadlineMs, now) <= 0) {
 			return fail("deadline_expired", "cleanup");
 		}
 		try {
@@ -1424,16 +1968,30 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		worktreePath = null;
 		worktreeRoot = null;
-		const released = await releaseLock(options.projectPath, runId);
-		if (released !== true) {
-			projectLockState = "unavailable";
-			return fail("project_lock_release_unconfirmed", "cleanup");
+		if (runInitialized) {
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					state: "succeeded",
+					cleanupState: "complete",
+					finishedAt: new Date(now()).toISOString(),
+					terminalSummary: {
+						status: "succeeded",
+						baseRevision,
+						changedFiles,
+						outputs: terminalOutputs,
+					},
+				});
+			} catch (error) {
+				return fail(
+					"run_store_write_failed",
+					"cleanup",
+					classifyErrorKind("run_store_write_failed", "cleanup", error),
+					error,
+				);
+			}
 		}
-		projectLocked = false;
-		projectLockState = "released";
-		if (remainingMs(options.deadlineMs, now) <= 0) {
-			return fail("deadline_expired", "cleanup");
-		}
+		milestone("cleanup", "cleanup_completed");
+
 		finalResult = terminalResult(base, {
 			status: "succeeded",
 			provider,
@@ -1442,15 +2000,24 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checks,
 			dirtyBaseline,
 			providerLifecycle,
+			outputs: terminalOutputs,
+			baseRevision,
 		});
 		milestone("terminal", "succeeded");
 		return finalResult;
 	} catch (error) {
+		const failureReason =
+			typeof error?.code === "string" ? error.code : "simple_execution_failed";
 		return fail(
-			typeof error?.code === "string" ? error.code : "simple_execution_failed",
+			failureReason,
 			currentPhase,
+			classifyErrorKind(failureReason, currentPhase, error),
+			error,
 		);
 	} finally {
+		if (pendingDurability.size > 0) {
+			await Promise.allSettled([...pendingDurability]);
+		}
 		if (worktreePath && !keepWorktree) {
 			const cleanupBudget = remainingMs(options.deadlineMs, now);
 			if (

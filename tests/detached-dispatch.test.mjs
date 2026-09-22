@@ -805,33 +805,43 @@ describe("launch returns before completion", () => {
 			0,
 			`launch failed: ${launchResult.stderr}`,
 		);
+		const { runId } = JSON.parse(launchResult.stdout.trim());
+		detachedCleanupPending = true;
+		detachedCleanupRunId = runId;
+		let bodyError = null;
 
-		// The quarantine move happens inside applyRetention, which bootstrap
-		// awaits before claiming its lease. Seeing the moved directory confirms
-		// that startup sweep completed before we inspect the sibling record.
-		const quarantineRoot = join(stateRoot, ".quarantine");
-		let sweepCompleted = false;
-		const start = Date.now();
-		while (Date.now() - start < 10_000) {
-			try {
-				const quarantined = readdirSync(quarantineRoot);
-				if (quarantined.some((entry) => entry.startsWith(malformedRunId))) {
-					sweepCompleted = true;
-					break;
+		try {
+			// The quarantine move happens inside applyRetention, which bootstrap
+			// awaits before claiming its lease. Seeing the moved directory confirms
+			// that startup sweep completed before we inspect the sibling record.
+			const quarantineRoot = join(stateRoot, ".quarantine");
+			let sweepCompleted = false;
+			const start = Date.now();
+			while (Date.now() - start < 10_000) {
+				try {
+					const quarantined = readdirSync(quarantineRoot);
+					if (quarantined.some((entry) => entry.startsWith(malformedRunId))) {
+						sweepCompleted = true;
+						break;
+					}
+				} catch (error) {
+					if (error.code !== "ENOENT") throw error;
 				}
-			} catch (error) {
-				if (error.code !== "ENOENT") throw error;
+				await new Promise((resolveWait) => setTimeout(resolveWait, 50));
 			}
-			await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-		}
-		ok(
-			sweepCompleted,
-			"worker startup retention sweep did not quarantine malformed record",
-		);
+			ok(
+				sweepCompleted,
+				"worker startup retention sweep did not quarantine malformed record",
+			);
 
-		const sibling = await readRun(siblingRunId);
-		strictEqual(sibling.state, "created");
-		strictEqual(sibling.workerPid, null);
+			const sibling = await readRun(siblingRunId);
+			strictEqual(sibling.state, "created");
+			strictEqual(sibling.workerPid, null);
+		} catch (error) {
+			bodyError = error;
+		} finally {
+			await finishDetachedRun(runId, makeStateRootEnv(), bodyError);
+		}
 	});
 });
 

@@ -1,5 +1,6 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -13,13 +14,23 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { readEvents, readRun } from "../src/switchyard/run-store/index.mjs";
 import {
 	assessSimpleRecoveryEvidence,
 	buildSimpleProviderInvocation,
 	parseSimpleArgs,
 	runSimpleTask,
+	simpleProviderCompatibility,
+	simpleRouteIsFunded,
 } from "../src/switchyard/simple/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
+
+if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
+	process.env.SWITCHYARD_RUN_STORE_ROOT = join(
+		tempDir("switchyard-simple-run-store-"),
+		"store",
+	);
+}
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -78,12 +89,12 @@ function dependencies(overrides = {}) {
 		releaseProjectLock: async () => true,
 		route: () => ({ provider: "Codex (Spark)", reason: "priority_fill" }),
 		resolveTargetIdentity: () => ({
-			targetId: "codex-spark",
+			targetId: "codex",
 			harnessKey: "codex",
 			ambiguous: false,
 		}),
 		getInvocationDescriptor: () => ({
-			target_id: "codex-spark",
+			target_id: "codex",
 			selector: "gpt-5.3-codex-spark",
 			invocation_args: [],
 		}),
@@ -294,33 +305,130 @@ describe("simple dispatch argument boundary", () => {
 		);
 	});
 
-	it("pins the local Antigravity invocation to Claude Sonnet with bounded-safe flags", () => {
-		const invocation = buildSimpleProviderInvocation(
+	it("keeps Gemini and Claude Antigravity targets distinct", () => {
+		const gemini = buildSimpleProviderInvocation(
 			"agy",
-			{ selector: "claude-sonnet-4-6" },
+			{
+				target_id: "antigravity",
+				selector: "gemini-3.8-flash-high",
+			},
 			"work",
 			"/tmp/worktree",
+			"antigravity",
 		);
-		strictEqual(invocation.command, "agy");
-		deepStrictEqual(invocation.args, [
-			"-p",
-			"work",
-			"--model",
-			"claude-sonnet-4-6",
-			"--mode=accept-edits",
+		strictEqual(gemini.command, "agy");
+		deepStrictEqual(gemini.args, [
+			"--new-project",
+			"--mode",
+			"accept-edits",
+			"--dangerously-skip-permissions",
 			"--sandbox",
+			"--model",
+			"gemini-3.8-flash-high",
+			"--add-dir",
+			"/tmp/worktree",
 			"--output-format",
 			"json",
 			"--print-timeout",
 			"30m",
+			"--print",
+			"work",
 		]);
+		const claude = buildSimpleProviderInvocation(
+			"agy",
+			{
+				target_id: "antigravity-claude",
+				selector: "claude-sonnet-4-6",
+			},
+			"work",
+			"/tmp/worktree",
+			"antigravity-claude",
+		);
+		strictEqual(
+			claude.args[claude.args.indexOf("--model") + 1],
+			"claude-sonnet-4-6",
+		);
 		throws(() =>
 			buildSimpleProviderInvocation(
 				"agy",
-				{ selector: "other" },
+				{ target_id: "antigravity", selector: "claude-sonnet-4-6" },
 				"work",
 				"/tmp/worktree",
+				"antigravity",
 			),
+		);
+	});
+
+	it("runs Copilot with a session-only sandbox and no shell or broad permissions", () => {
+		const invocation = buildSimpleProviderInvocation(
+			"copilot",
+			{ target_id: "copilot-student", selector: "auto" },
+			"work",
+			"/tmp/worktree",
+			"copilot-student",
+		);
+		strictEqual(invocation.command, "copilot");
+		for (const flag of [
+			"--experimental",
+			"--sandbox",
+			"--disallow-temp-dir",
+			"--disable-builtin-mcps",
+			"--no-custom-instructions",
+			"--no-ask-user",
+			"--no-auto-update",
+		]) {
+			ok(invocation.args.includes(flag), flag);
+		}
+		strictEqual(
+			invocation.args[invocation.args.indexOf("--available-tools") + 1],
+			"apply_patch,create,edit,view,glob,grep",
+		);
+		strictEqual(invocation.args.includes("shell"), false);
+		strictEqual(invocation.args.includes("--allow-all"), false);
+		strictEqual(invocation.args.includes("--allow-all-paths"), false);
+		strictEqual(invocation.args.includes("--yolo"), false);
+		strictEqual(
+			invocation.args[invocation.args.indexOf("-C") + 1],
+			"/tmp/worktree",
+		);
+	});
+
+	it("fails closed when a target and shared harness descriptor do not match", () => {
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "antigravity-claude",
+				harness: "agy",
+				descriptor: {
+					target_id: "antigravity-claude",
+					selector: "gemini-3.8-flash-high",
+				},
+			}),
+			{ compatible: false, reason: "local_descriptor_model_unavailable" },
+		);
+	});
+
+	it("admits included subscription and quota funding without paid overage", () => {
+		for (const mode of ["subscription", "quota"]) {
+			strictEqual(
+				simpleRouteIsFunded({
+					enabled: true,
+					funding: {
+						included: { mode },
+						overage: { enabled: false },
+					},
+				}),
+				true,
+			);
+		}
+		strictEqual(
+			simpleRouteIsFunded({
+				enabled: true,
+				funding: {
+					included: { mode: "quota" },
+					overage: { enabled: true },
+				},
+			}),
+			false,
 		);
 	});
 
@@ -418,9 +526,14 @@ describe("simple dispatch argument boundary", () => {
 		const repo = makeRepo();
 		const invocation = buildSimpleProviderInvocation(
 			"codex",
-			{ selector: "gpt-5.3-codex-spark", invocation_args: [] },
+			{
+				target_id: "codex",
+				selector: "gpt-5.3-codex-spark",
+				invocation_args: [],
+			},
 			"bounded task",
 			join(repo.root, "worktree"),
+			"codex",
 		);
 		strictEqual(invocation.command, "codex");
 		ok(invocation.args.includes("--ephemeral"));
@@ -444,11 +557,13 @@ describe("simple dispatch argument boundary", () => {
 		const safe = buildSimpleProviderInvocation(
 			"codex",
 			{
+				target_id: "codex",
 				selector: "gpt-5.3-codex-spark",
 				invocation_args: ["-c", "model_reasoning_effort=high"],
 			},
 			"bounded task",
 			join(repo.root, "worktree"),
+			"codex",
 		);
 		ok(safe.args.includes("model_reasoning_effort=high"));
 		for (const invocationArgs of [
@@ -461,11 +576,13 @@ describe("simple dispatch argument boundary", () => {
 				buildSimpleProviderInvocation(
 					"codex",
 					{
+						target_id: "codex",
 						selector: "gpt-5.3-codex-spark",
 						invocation_args: invocationArgs,
 					},
 					"bounded task",
 					join(repo.root, "worktree"),
+					"codex",
 				);
 			} catch (error) {
 				threw = error?.code === "local_descriptor_args_unsafe";
@@ -476,6 +593,99 @@ describe("simple dispatch argument boundary", () => {
 });
 
 describe("simple local execution path", () => {
+	it("offers only exact locally compatible targets to automatic routing", async () => {
+		const repo = makeRepo();
+		let routedOptions = null;
+		const identities = {
+			codex: { targetId: "codex", harnessKey: "codex", ambiguous: false },
+			antigravity: {
+				targetId: "antigravity",
+				harnessKey: "agy",
+				ambiguous: false,
+			},
+			"antigravity-claude": {
+				targetId: "antigravity-claude",
+				harnessKey: "agy",
+				ambiguous: false,
+			},
+			"copilot-student": {
+				targetId: "copilot-student",
+				harnessKey: "copilot",
+				ambiguous: false,
+			},
+		};
+		const descriptors = {
+			codex: {
+				target_id: "codex",
+				selector: "gpt-5.6-luna",
+				invocation_args: [],
+			},
+			antigravity: {
+				target_id: "antigravity",
+				selector: "gemini-3.8-flash-medium",
+				invocation_args: [],
+			},
+			"copilot-student": {
+				target_id: "copilot-student",
+				selector: "auto",
+				invocation_args: [],
+			},
+		};
+		const result = await runSimpleTask(
+			options(repo, { capability: "low" }),
+			dependencies({
+				route: (routeOptions) => {
+					routedOptions = routeOptions;
+					return { provider: null, reason: "test_stop" };
+				},
+				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
+				getInvocationDescriptor: (name) => descriptors[name] ?? null,
+			}),
+		);
+		deepStrictEqual(routedOptions.availableProviders, [
+			"codex",
+			"antigravity",
+			"copilot-student",
+		]);
+		strictEqual(result.failureReason, "test_stop");
+		strictEqual(result.failurePhase, "route");
+	});
+
+	it("rejects an incompatible explicit pin before routing or launch", async () => {
+		const repo = makeRepo();
+		let routeCalls = 0;
+		let executeCalls = 0;
+		const result = await runSimpleTask(
+			options(repo, {
+				onlyProviders: ["antigravity"],
+			}),
+			dependencies({
+				route: () => {
+					routeCalls += 1;
+					return { provider: "Antigravity" };
+				},
+				resolveTargetIdentity: () => ({
+					targetId: "antigravity",
+					harnessKey: "agy",
+					ambiguous: false,
+				}),
+				getInvocationDescriptor: () => ({
+					target_id: "antigravity",
+					selector: "claude-sonnet-4-6",
+					invocation_args: [],
+				}),
+				executeProvider: async () => {
+					executeCalls += 1;
+					return { success: true };
+				},
+			}),
+		);
+		strictEqual(result.failureReason, "local_descriptor_model_unavailable");
+		strictEqual(result.failurePhase, "route");
+		strictEqual(routeCalls, 0);
+		strictEqual(executeCalls, 0);
+	});
+
 	it("rejects manifest declarations before provider launch with a typed failure", async () => {
 		const repo = makeRepo();
 		writeFileSync(join(repo.projectPath, "package.json"), "{}\n", "utf8");
@@ -524,7 +734,7 @@ describe("simple local execution path", () => {
 				},
 				executeProvider: async ({ worktreePath, descriptor }) => {
 					seen.executions += 1;
-					strictEqual(descriptor.target_id, "codex-spark");
+					strictEqual(descriptor.target_id, "codex");
 					execFileSync("git", ["branch", "provider-local"], {
 						cwd: worktreePath,
 					});
@@ -1344,5 +1554,488 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
 			"dirty\n",
 		);
+	});
+
+	describe("simple dispatch reliability and regression invariants (SW-R1)", () => {
+		it("produces a durable discoverable record without provider launch on preflight rejection", async () => {
+			const repo = makeRepo();
+			let providerLaunched = false;
+			const taskId = `preflight-reject-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const result = await runSimpleTask(
+				options(repo, {
+					deadlineMs: 0,
+				}),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async () => {
+						providerLaunched = true;
+						return { success: true };
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failurePhase, "preflight");
+			strictEqual(providerLaunched, false);
+
+			const record = await readRun(runId);
+			ok(record, "run record must exist in run-store");
+			strictEqual(record.runId, runId);
+			strictEqual(record.state, "failed");
+			strictEqual(record.lastFailure?.failurePhase, "preflight");
+		});
+
+		it("classifies injected EPERM at preflight as permission_denied with accurate failurePhase", async () => {
+			const repo = makeRepo();
+			const eperm = Object.assign(new Error("EPERM: operation not permitted"), {
+				code: "EPERM",
+			});
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					acquireProjectLock: async () => {
+						throw eperm;
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failurePhase, "preflight");
+			strictEqual(result.errorKind, "permission_denied");
+		});
+
+		it("classifies non-preflight filesystem errno as environment_failure with accurate failurePhase", async () => {
+			const repo = makeRepo();
+			const enospc = Object.assign(
+				new Error("ENOSPC: no space left on device"),
+				{
+					code: "ENOSPC",
+				},
+			);
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					executeProvider: async () => {
+						throw enospc;
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failurePhase, "execute");
+			strictEqual(result.errorKind, "environment_failure");
+		});
+
+		it("succeeds when a changed subset of declared outputs is modified", async () => {
+			const repo = makeRepo();
+			writeFileSync(join(repo.projectPath, "src", "b.txt"), "base b\n", "utf8");
+			execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+			execFileSync(
+				"git",
+				[
+					"-c",
+					"user.name=Switchyard Tests",
+					"-c",
+					"user.email=switchyard@example.invalid",
+					"commit",
+					"-qm",
+					"add b",
+				],
+				{ cwd: repo.projectPath },
+			);
+			const result = await runSimpleTask(
+				options(repo, { files: ["src/a.txt", "src/b.txt"] }),
+				dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider a\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			strictEqual(result.status, "succeeded");
+			deepStrictEqual(result.changedFiles, ["src/a.txt"]);
+			strictEqual(
+				readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
+				"provider a\n",
+			);
+			strictEqual(
+				readFileSync(join(repo.projectPath, "src", "b.txt"), "utf8"),
+				"base b\n",
+			);
+		});
+
+		it("fails when an undeclared file is touched by provider", async () => {
+			const repo = makeRepo();
+			writeFileSync(join(repo.projectPath, "src", "b.txt"), "base b\n", "utf8");
+			execFileSync("git", ["add", "-A"], { cwd: repo.projectPath });
+			execFileSync(
+				"git",
+				[
+					"-c",
+					"user.name=Switchyard Tests",
+					"-c",
+					"user.email=switchyard@example.invalid",
+					"commit",
+					"-qm",
+					"add b",
+				],
+				{ cwd: repo.projectPath },
+			);
+			const result = await runSimpleTask(
+				options(repo, { files: ["src/a.txt"] }),
+				dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider a\n",
+							"utf8",
+						);
+						writeFileSync(
+							join(worktreePath, "src", "b.txt"),
+							"provider b\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "undeclared_paths_changed");
+		});
+
+		it("succeeds with declared untracked predecessor output when legacy backend is unavailable", async () => {
+			const repo = makeRepo();
+			const trackedPath = join(repo.projectPath, "src", "a.txt");
+			const trackedContent = "predecessor tracked content\n";
+			writeFileSync(trackedPath, trackedContent, "utf8");
+			const untrackedPath = join(repo.projectPath, "src", "pred.txt");
+			const untrackedContent = "predecessor content\n";
+			const predecessor = await runSimpleTask(
+				options(repo, {
+					files: ["src/pred.txt"],
+					checks: ["test -f src/pred.txt"],
+				}),
+				dependencies({
+					taskId: "predecessor-producer",
+					runId: "simple-predecessor-producer",
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "pred.txt"),
+							untrackedContent,
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			strictEqual(predecessor.status, "succeeded");
+			strictEqual(typeof predecessor.baseRevision, "string");
+			const receiptPath = join(repo.root, "pred-receipt.json");
+			writeFileSync(receiptPath, JSON.stringify(predecessor), "utf8");
+
+			const result = await runSimpleTask(
+				options(repo, {
+					files: ["src/a.txt", "src/pred.txt"],
+					dirtyOverlay: true,
+					predecessorReceipt: receiptPath,
+				}),
+				dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						strictEqual(
+							readFileSync(join(worktreePath, "src", "a.txt"), "utf8"),
+							trackedContent,
+						);
+						strictEqual(
+							readFileSync(join(worktreePath, "src", "pred.txt"), "utf8"),
+							untrackedContent,
+						);
+						writeFileSync(
+							join(worktreePath, "src", "pred.txt"),
+							"new content\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			strictEqual(result.status, "succeeded");
+			strictEqual(readFileSync(trackedPath, "utf8"), trackedContent);
+			strictEqual(readFileSync(untrackedPath, "utf8"), "new content\n");
+		});
+
+		it("fails before provider execution when predecessor receipt digest mismatches", async () => {
+			const repo = makeRepo();
+			const untrackedPath = join(repo.projectPath, "src", "pred.txt");
+			writeFileSync(untrackedPath, "actual content\n", "utf8");
+
+			const baseRevision = execFileSync("git", ["rev-parse", "HEAD"], {
+				cwd: repo.projectPath,
+				encoding: "utf8",
+			}).trim();
+			const receiptPath = join(repo.root, "bad-receipt.json");
+			writeFileSync(
+				receiptPath,
+				JSON.stringify({
+					runId: "predecessor-run-mismatch",
+					baseRevision,
+					outputs: [
+						{
+							path: "src/pred.txt",
+							size: 999,
+							sha256: "0".repeat(64),
+							mode: 0o644,
+						},
+					],
+				}),
+				"utf8",
+			);
+
+			let providerLaunched = false;
+			const result = await runSimpleTask(
+				options(repo, {
+					files: ["src/pred.txt"],
+					dirtyOverlay: true,
+					predecessorReceipt: receiptPath,
+				}),
+				dependencies({
+					executeProvider: async () => {
+						providerLaunched = true;
+						return { success: true };
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failurePhase, "preflight");
+			strictEqual(providerLaunched, false);
+		});
+
+		it("rejects a succeeded predecessor whose cleanup is still pending", async () => {
+			const repo = makeRepo();
+			const content = "pending predecessor\n";
+			writeFileSync(join(repo.projectPath, "src", "pred.txt"), content, "utf8");
+			const baseRevision = execFileSync("git", ["rev-parse", "HEAD"], {
+				cwd: repo.projectPath,
+				encoding: "utf8",
+			}).trim();
+			const receipt = {
+				runId: "pending-predecessor",
+				baseRevision,
+				outputs: [
+					{
+						path: "src/pred.txt",
+						size: Buffer.byteLength(content),
+						sha256: createHash("sha256").update(content).digest("hex"),
+						mode: 0o644,
+					},
+				],
+			};
+			const receiptPath = join(repo.root, "pending-receipt.json");
+			writeFileSync(receiptPath, JSON.stringify(receipt), "utf8");
+			let providerLaunched = false;
+			const result = await runSimpleTask(
+				options(repo, {
+					files: ["src/pred.txt"],
+					dirtyOverlay: true,
+					predecessorReceipt: receiptPath,
+				}),
+				dependencies({
+					readRun: async () => ({
+						runId: receipt.runId,
+						state: "succeeded",
+						cleanupState: "pending",
+						projectPath: repo.projectPath,
+						terminalSummary: { status: "succeeded", ...receipt },
+					}),
+					executeProvider: async () => {
+						providerLaunched = true;
+						return { success: true };
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "predecessor_receipt_unverified");
+			strictEqual(result.failurePhase, "preflight");
+			strictEqual(providerLaunched, false);
+		});
+
+		it("fails before provider execution when predecessor receipt file is missing", async () => {
+			const repo = makeRepo();
+			const untrackedPath = join(repo.projectPath, "src", "pred.txt");
+			writeFileSync(untrackedPath, "actual content\n", "utf8");
+
+			let providerLaunched = false;
+			const result = await runSimpleTask(
+				options(repo, {
+					files: ["src/pred.txt"],
+					dirtyOverlay: true,
+					predecessorReceipt: join(repo.root, "non-existent-receipt.json"),
+				}),
+				dependencies({
+					executeProvider: async () => {
+						providerLaunched = true;
+						return { success: true };
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failurePhase, "preflight");
+			strictEqual(providerLaunched, false);
+		});
+
+		it("fails at integration when untracked predecessor output drifts on host", async () => {
+			const repo = makeRepo();
+			const untrackedPath = join(repo.projectPath, "src", "pred.txt");
+			const originalContent = "predecessor content\n";
+			const predecessor = await runSimpleTask(
+				options(repo, {
+					files: ["src/pred.txt"],
+					checks: ["test -f src/pred.txt"],
+				}),
+				dependencies({
+					taskId: "predecessor-drift-producer",
+					runId: "simple-predecessor-drift-producer",
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "pred.txt"),
+							originalContent,
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			strictEqual(predecessor.status, "succeeded");
+			const receiptPath = join(repo.root, "pred-receipt.json");
+			writeFileSync(receiptPath, JSON.stringify(predecessor), "utf8");
+
+			const result = await runSimpleTask(
+				options(repo, {
+					files: ["src/pred.txt"],
+					dirtyOverlay: true,
+					predecessorReceipt: receiptPath,
+				}),
+				dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "pred.txt"),
+							"provider modification\n",
+							"utf8",
+						);
+						// Host file drifts during provider execution
+						writeFileSync(untrackedPath, "host drift content\n", "utf8");
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			retain(result, repo.projectPath);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "dirty_overlay_drift");
+			strictEqual(result.failurePhase, "integrate");
+		});
+
+		it("run-store write fault before preflight cannot launch provider", async () => {
+			const repo = makeRepo();
+			let providerLaunched = false;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					initializeRun: async () => {
+						throw new Error("disk full");
+					},
+					executeProvider: async () => {
+						providerLaunched = true;
+						return { success: true };
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.errorKind, "run_store_write_failed");
+			strictEqual(result.failurePhase, "preflight");
+			strictEqual(providerLaunched, false);
+		});
+
+		it("run-store write fault at terminal success cannot publish success", async () => {
+			const repo = makeRepo();
+			const durablePatches = [];
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					updateRunWithRetry: async (_runId, patch) => {
+						durablePatches.push(patch);
+						if (patch.state === "succeeded") {
+							throw new Error("run-store write error");
+						}
+						return patch;
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.errorKind, "run_store_write_failed");
+			strictEqual(result.failurePhase, "cleanup");
+			ok(
+				durablePatches.some(
+					(patch) =>
+						patch.state === "running" &&
+						patch.cleanupState === "pending" &&
+						patch.terminalSummary?.status === "integration_applied",
+				),
+				"host integration must be durable before terminal publication",
+			);
+		});
+
+		it("persists named milestones while repetitive heartbeats are not persisted", async () => {
+			const repo = makeRepo();
+			const taskId = `milestone-heartbeat-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			strictEqual(result.status, "succeeded");
+
+			const events = await readEvents(runId);
+			ok(events.length > 0, "events must be recorded");
+			const milestoneEvents = events.filter((e) => e.event === "milestone");
+			ok(milestoneEvents.length > 0, "named milestone events must be recorded");
+			const milestoneNames = milestoneEvents.map((e) => e.milestone);
+			ok(
+				milestoneNames.includes("route_selected"),
+				"route_selected milestone present",
+			);
+			ok(
+				milestoneNames.includes("integration_started") ||
+					milestoneNames.includes("integration_completed"),
+				"integrate milestone present",
+			);
+
+			const heartbeatEvents = events.filter((e) => e.event === "heartbeat");
+			strictEqual(
+				heartbeatEvents.length,
+				0,
+				"heartbeats must not be persisted in run store",
+			);
+		});
 	});
 });

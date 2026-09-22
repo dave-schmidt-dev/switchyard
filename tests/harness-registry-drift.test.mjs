@@ -144,9 +144,10 @@ describe("harness registry drift (Task 1.6b)", () => {
 		);
 	});
 
-	const vibeLowModelRef = "zhipu/glm-5.2-low";
-	const vibeModelRef = "zhipu/glm-5.2-high";
-	const vibeSelector = "glm-5.2-high";
+	const vibeLowModelRef = "zhipu/glm-5.3-medium";
+	const vibeModelRef = "zhipu/glm-5.3";
+	const vibeLowSelector = "glm-5-3-medium";
+	const vibeSelector = "glm-5-3";
 	// The bare GLM spellings were demoted on 2026-09-01 after every one of them
 	// logged vibe's "Active model '<x>' is not in your configured models"
 	// fallback. That message comes from vibe's LOCAL config loader
@@ -333,29 +334,24 @@ describe("harness registry drift (Task 1.6b)", () => {
 		}
 	});
 
-	it("vibe's low slot carries its own dispatch receipt once promoted", () => {
-		const lowSelector = "glm-5.2-low";
-		strictEqual(roster.models?.[vibeLowModelRef]?.selector, lowSelector);
+	it("vibe's low and standard slots keep distinct GLM 5.3 thinking descriptors", () => {
+		strictEqual(roster.models?.[vibeLowModelRef]?.selector, vibeLowSelector);
 		const descriptor = getInvocationDescriptor("vibe", "low");
 		const qualifications = targets.vibe?.qualifications ?? {};
 		if (descriptor === null) {
 			ok(
 				["untested", "qualified", "failed_qualification"].includes(
-					qualifications[lowSelector]?.status,
+					qualifications[vibeLowSelector]?.status,
 				),
-				`pre-promotion Vibe low state must retain an explicit non-dispatch record for ${lowSelector}`,
+				`pre-promotion Vibe low state must retain an explicit non-dispatch record for ${vibeLowSelector}`,
 			);
 			return;
 		}
-		// Each capability class earns its own receipt. The two GLM slots are the
-		// same underlying model at different thinking levels, which the provider
-		// treats as distinct routes -- a receipt for one authorizes nothing for
-		// the other.
 		const qualification = qualifications[descriptor.descriptor_identity];
 		ok(qualification, "current Vibe low descriptor must have a record");
 		strictEqual(qualification.status, "dispatch_qualified");
 		strictEqual(qualification.model_ref, vibeLowModelRef);
-		strictEqual(qualification.selector, lowSelector);
+		strictEqual(qualification.selector, vibeLowSelector);
 		strictEqual(qualification.variant, null);
 		strictEqual(qualification.promotion_receipt?.status, "promoted");
 		strictEqual(
@@ -365,7 +361,7 @@ describe("harness registry drift (Task 1.6b)", () => {
 		ok(
 			descriptor.descriptor_identity !==
 				getInvocationDescriptor("vibe", "standard")?.descriptor_identity,
-			"the two GLM thinking levels must not share a descriptor identity",
+			"medium and max thinking must remain separately qualified descriptors",
 		);
 	});
 
@@ -378,8 +374,8 @@ describe("harness registry drift (Task 1.6b)", () => {
 			"README must identify the 2026-09-01 mistral-medium-3.5 receipt as historical context",
 		);
 		ok(
-			readme.includes("Vibe's direct-CLI GLM receipts"),
-			"README must identify direct Vibe receipts",
+			readme.includes("Vibe GLM 5.3 low"),
+			"README must identify the promoted direct Vibe GLM 5.3 descriptors",
 		);
 		ok(
 			readme.includes("OpenCode Mistral GLM-5.2 status"),

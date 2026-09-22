@@ -12,8 +12,8 @@ const WORKSPACE = "22222222-2222-4222-8222-222222222222";
 const DESCRIPTOR = validateInvocationDescriptor(
 	{
 		target_id: "vibe",
-		model_ref: "zhipu/glm-5.2-high",
-		selector: "glm-5.2-high",
+		model_ref: "zhipu/glm-5.3",
+		selector: "glm-5-3",
 		effort: null,
 		variant: null,
 		invocation_args: [],
@@ -63,7 +63,7 @@ describe("Vibe async failure evidence", () => {
 					// so the newest session directory belongs to whichever task last
 					// got far enough to write one. Reading it after a failure names
 					// the PREVIOUS task's model.
-					return node('process.stdout.write("glm-5.2-low")');
+					return node('process.stdout.write("glm-5-3")');
 				}
 				if (isConfigWrite(candidate)) return node("");
 				return node('process.stderr.write("vibe blew up")', { exit: 1 });
@@ -99,7 +99,7 @@ describe("Vibe async failure evidence", () => {
 			// Two transient prlctl misfires, then the real answer. A single
 			// attempt would leave the substitution guard inactive here.
 			"if (n < 3) process.exit(1);",
-			'process.stdout.write("glm-5.2-high");',
+			'process.stdout.write("glm-5-3");',
 		].join(" ");
 		const executionBackend = {
 			execArgv(_workspaceId, candidate) {
@@ -117,7 +117,7 @@ describe("Vibe async failure evidence", () => {
 		const attempts = existsSync(tally) ? readFileSync(tally, "utf8").length : 0;
 		strictEqual(attempts, 3);
 		strictEqual(result.success, true);
-		strictEqual(result.servedModel, "glm-5.2-high");
+		strictEqual(result.servedModel, "glm-5-3");
 	});
 
 	it("announces each helper wait rather than blocking silently", async () => {
@@ -125,7 +125,7 @@ describe("Vibe async failure evidence", () => {
 		const executionBackend = {
 			execArgv(_workspaceId, candidate) {
 				if (isServedProbe(candidate))
-					return node('process.stdout.write("glm-5.2-high")');
+					return node('process.stdout.write("glm-5-3")');
 				if (isConfigWrite(candidate)) return node("");
 				return node('process.stdout.write("vibe-ran")');
 			},

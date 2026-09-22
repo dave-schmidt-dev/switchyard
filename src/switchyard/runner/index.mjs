@@ -4026,6 +4026,73 @@ function saveGateEvidence(checkpointPath, taskId, text, attempt = 1) {
 	return artifactPath;
 }
 
+export function persistAsyncResultArtifacts({
+	result,
+	checkpointPath,
+	resultAttempt,
+	onStatus,
+	savePartialDiffFn = savePartialDiff,
+	saveGateEvidenceFn = saveGateEvidence,
+}) {
+	const markPersistenceFailure = (event, status) => {
+		result.success = false;
+		result.result = "diff_capture_failed";
+		result.errorKind = "diff_capture_failed";
+		result.diagnosticCode = "diff_capture_failed";
+		onStatus?.({
+			phase: "artifact",
+			event,
+			status,
+			taskId: result.taskId,
+		});
+	};
+
+	if (result.partialDiff) {
+		const byteCount = Buffer.byteLength(result.partialDiff);
+		try {
+			result.partialDiffPath = savePartialDiffFn(
+				checkpointPath,
+				result.taskId,
+				result.partialDiff,
+				resultAttempt,
+			);
+			onStatus?.({
+				phase: "artifact",
+				event: "partial_diff_captured",
+				status: `Task ${result.taskId} partial diff saved for review`,
+				taskId: result.taskId,
+				byteCount,
+			});
+		} catch {
+			result.partialDiffPath = null;
+			markPersistenceFailure(
+				"partial_diff_persistence_failed",
+				`Task ${result.taskId} partial diff could not be saved`,
+			);
+		}
+		result.partialDiff = undefined;
+	}
+
+	if (result.gateEvidence) {
+		try {
+			result.gateEvidencePath = saveGateEvidenceFn(
+				checkpointPath,
+				result.taskId,
+				result.gateEvidence,
+				resultAttempt,
+			);
+		} catch {
+			result.gateEvidencePath = null;
+			markPersistenceFailure(
+				"gate_evidence_persistence_failed",
+				`Task ${result.taskId} gate evidence could not be saved`,
+			);
+		}
+		result.gateEvidence = undefined;
+	}
+	return result;
+}
+
 /**
  * Load checkpoint file. A *missing* file is the normal first-run case and
  * returns an empty checkpoint. A file that *exists but fails to parse or
@@ -7104,7 +7171,7 @@ function executeTaskUnsafe(task, context) {
 	const gateResult =
 		dirtyOverlayIntegrationGate(context) ??
 		context.integrationGate(diff, context.projectPath, {
-			requiredPaths: task.requiredPaths,
+			allowedPaths: task.requiredPaths,
 			allowSensitiveManifests:
 				task.type === "implementation" && task.allowManifests === true,
 			integrationIntent: checkpointIntegrationIntent(context, task, diff),
@@ -8361,7 +8428,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 	const gateResult =
 		dirtyOverlayIntegrationGate(context) ??
 		context.integrationGate(diff, context.projectPath, {
-			requiredPaths: task.requiredPaths,
+			allowedPaths: task.requiredPaths,
 			allowSensitiveManifests:
 				task.type === "implementation" && task.allowManifests === true,
 			integrationIntent: checkpointIntegrationIntent(context, task, diff),
@@ -9024,35 +9091,12 @@ export async function runQueueAsync(options) {
 				checkpointPath,
 				result.taskId,
 			);
-			if (result.partialDiff) {
-				try {
-					result.partialDiffPath = savePartialDiff(
-						checkpointPath,
-						result.taskId,
-						result.partialDiff,
-						resultAttempt,
-					);
-				} catch {
-					result.partialDiffPath = null;
-				}
-				// Raw diff text is an in-memory transient only; never expose it to
-				// onResult or persist it in checkpoint.json.
-				result.partialDiff = undefined;
-			}
-			if (result.gateEvidence) {
-				try {
-					result.gateEvidencePath = saveGateEvidence(
-						checkpointPath,
-						result.taskId,
-						result.gateEvidence,
-						resultAttempt,
-					);
-				} catch {
-					result.gateEvidencePath = null;
-				}
-				// Same rule as the diff above: host-only bytes, never onResult.
-				result.gateEvidence = undefined;
-			}
+			persistAsyncResultArtifacts({
+				result,
+				checkpointPath,
+				resultAttempt,
+				onStatus: dependencies.onStatus,
+			});
 			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
 			results.push(result);
 			dependencies.onResult?.(result);
@@ -9799,7 +9843,7 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 	const gateResult =
 		dirtyOverlayIntegrationGate(context) ??
 		context.integrationGate(diff, context.projectPath, {
-			requiredPaths: task.requiredPaths,
+			allowedPaths: task.requiredPaths,
 			allowSensitiveManifests:
 				task.type === "implementation" && task.allowManifests === true,
 			integrationIntent: checkpointIntegrationIntent(context, task, diff),

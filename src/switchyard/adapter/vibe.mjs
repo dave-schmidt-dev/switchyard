@@ -29,7 +29,7 @@ const VIBE_CMD = "vibe";
  * absent, `_apply_active_model_fallback` swaps in the first configured model,
  * logs a warning, and exits 0 (measured against mistral-vibe 2.24.5). The guest
  * image carries no `~/.vibe/config.toml`, so its configured set is Vibe's own
- * defaults — which contain no GLM entry. Asking a bare guest for `glm-5.2-high`
+ * defaults — which contain no GLM entry. Asking a bare guest for `glm-5-3`
  * therefore runs `mistral-medium-3.5` and reports success. `renderVibeConfig`
  * exists to close that hole: switchyard declares the models itself rather than
  * trusting whatever the guest happens to have.
@@ -39,8 +39,8 @@ export const VIBE_MODELS = Object.freeze({
 		name: "mistral-vibe-cli-latest",
 		thinking: "high",
 	}),
-	"glm-5.2-low": Object.freeze({ name: "zai-glm-5-2", thinking: "low" }),
-	"glm-5.2-high": Object.freeze({ name: "zai-glm-5-2", thinking: "high" }),
+	"glm-5-3-medium": Object.freeze({ name: "zai-glm-5-3", thinking: "medium" }),
+	"glm-5-3": Object.freeze({ name: "zai-glm-5-3", thinking: "max" }),
 });
 /**
  * The default selector: what an auth liveness probe asks for when no roster slot
@@ -165,7 +165,8 @@ function buildConfigWriteExecution(workspaceId, options, selector) {
  * Vibe's own session metadata is the only affirmative record of which model
  * actually ran: `config.active_model` there is the value *after* the fallback
  * validator, so a substitution that exits 0 is still visible. Measured both ways
- * on 2026-09-04 — asking for `glm-5.2-low` records `glm-5.2-low`, asking for a
+ * on 2026-09-04 — asking for an explicitly configured GLM alias records that
+ * alias, while asking for a
  * name Vibe does not know records `mistral-medium-3.5`. The streaming envelope
  * names no model at all, which is why this reads a file instead of the output.
  *

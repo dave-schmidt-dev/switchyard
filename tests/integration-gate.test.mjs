@@ -1053,6 +1053,31 @@ describe("Files allowlist enforcement", () => {
 		);
 	});
 
+	it("allows a changed subset of declared allowed paths", () => {
+		commitFile(projectPath, "src/a.mjs", "original\n");
+		commitFile(projectPath, "src/b.mjs", "original\n");
+		const diff = buildDiff(projectPath, (dir) => {
+			writeFileSync(join(dir, "src", "a.mjs"), "modified\n", "utf8");
+		});
+		execSync("git checkout -- src/a.mjs", {
+			cwd: projectPath,
+			stdio: "pipe",
+		});
+
+		const result = integrationGate(diff, projectPath, {
+			allowedPaths: ["src/a.mjs", "src/b.mjs"],
+		});
+		strictEqual(result.success, true);
+		strictEqual(
+			readFileSync(join(projectPath, "src/a.mjs"), "utf8"),
+			"modified\n",
+		);
+		strictEqual(
+			readFileSync(join(projectPath, "src/b.mjs"), "utf8"),
+			"original\n",
+		);
+	});
+
 	it("returns required_paths_missing when a declared path is not touched", () => {
 		commitFile(projectPath, "src/a.mjs", "original\n");
 		commitFile(projectPath, "src/b.mjs", "original\n");
@@ -1419,7 +1444,7 @@ index 0000000..abcdef1
 			"no_op_diff",
 			...INTEGRATION_REFUSAL_KINDS,
 		]);
-		strictEqual(closedCodes.size, 14);
+		strictEqual(closedCodes.size, 15);
 		for (const code of closedCodes) {
 			ok(/^[a-z][a-z0-9_]*$/.test(code), `${code} must be a bare identifier`);
 			ok(!code.includes("/"), `${code} must carry no path separator`);
@@ -1485,6 +1510,117 @@ index 0000000..abcdef1
 		const noOpResult = integrationGate(noopDiff, projectPath);
 		strictEqual(noOpResult.success, false);
 		ok(closedCodes.has(noOpResult.message));
+	});
+});
+
+describe("exact allowlist enforcement", () => {
+	let projectDir;
+	beforeEach(() => {
+		projectDir = initRepo();
+		commitFile(projectDir, "src/a.txt", "alpha\n");
+		commitFile(projectDir, "src/b.txt", "beta\n");
+		commitFile(projectDir, "src/c.txt", "gamma\n");
+	});
+	afterEach(() => {
+		rmSync(projectDir, { recursive: true, force: true });
+	});
+
+	it("succeeds when only a subset of declared allowedPaths is changed", () => {
+		const diff = buildDiff(projectDir, (dir) => {
+			writeFileSync(join(dir, "src", "a.txt"), "alpha modified\n", "utf8");
+		});
+		execSync("git checkout -- src/a.txt", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt", "src/b.txt", "src/c.txt"],
+		});
+		strictEqual(result.success, true, result.message);
+		strictEqual(
+			readFileSync(join(projectDir, "src", "a.txt"), "utf8"),
+			"alpha modified\n",
+		);
+	});
+
+	it("fails when an undeclared addition is touched", () => {
+		const diff = buildStagedDiff(projectDir, (dir) => {
+			writeFileSync(join(dir, "src", "a.txt"), "alpha modified\n", "utf8");
+			writeFileSync(join(dir, "src", "new.txt"), "new file\n", "utf8");
+		});
+		execSync("git checkout -- src/a.txt", { cwd: projectDir, stdio: "pipe" });
+		rmSync(join(projectDir, "src", "new.txt"), { force: true });
+		execSync("git reset -q", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt", "src/b.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		deepStrictEqual(result.extraPaths, ["src/new.txt"]);
+	});
+
+	it("fails when an undeclared deletion is touched", () => {
+		const diff = buildStagedDiff(projectDir, (dir) => {
+			writeFileSync(join(dir, "src", "a.txt"), "alpha modified\n", "utf8");
+			rmSync(join(dir, "src", "c.txt"), { force: true });
+		});
+		execSync("git checkout -- src/a.txt", { cwd: projectDir, stdio: "pipe" });
+		execSync("git checkout HEAD -- src/c.txt", {
+			cwd: projectDir,
+			stdio: "pipe",
+		});
+		execSync("git reset -q", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt", "src/b.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		deepStrictEqual(result.extraPaths, ["src/c.txt"]);
+	});
+
+	it("fails when an undeclared rename endpoint is touched", () => {
+		const diff = buildStagedDiff(projectDir, (dir) => {
+			execSync("git mv src/b.txt src/renamed.txt", {
+				cwd: dir,
+				stdio: "pipe",
+			});
+		});
+		execSync("git reset --hard HEAD -q", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt", "src/b.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		deepStrictEqual(result.extraPaths, ["src/renamed.txt"]);
+	});
+
+	it("succeeds when both rename endpoints are declared in allowedPaths", () => {
+		const diff = buildStagedDiff(projectDir, (dir) => {
+			execSync("git mv src/b.txt src/renamed.txt", {
+				cwd: dir,
+				stdio: "pipe",
+			});
+		});
+		execSync("git reset --hard HEAD -q", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt", "src/b.txt", "src/renamed.txt"],
+		});
+		strictEqual(result.success, true, result.message);
+	});
+
+	it("rejects ambiguous combined rename spellings in allowedPaths", () => {
+		const diff = buildDiff(projectDir, (dir) => {
+			writeFileSync(join(dir, "src", "a.txt"), "alpha modified\n", "utf8");
+		});
+		execSync("git checkout -- src/a.txt", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt => src/b.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.reasonKind, "ambiguous_combined_rename_spelling");
 	});
 });
 

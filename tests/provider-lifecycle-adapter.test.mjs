@@ -64,6 +64,21 @@ function fakeChild() {
 }
 
 describe("provider process lifecycle", () => {
+	it("binds a provider process to the disposable worktree cwd", async () => {
+		const child = fakeChild();
+		let spawnOptions = null;
+		const result = await runProviderProcess("fake", [], {
+			cwd: "/tmp/disposable-worktree",
+			spawnFn: (_command, _args, options) => {
+				spawnOptions = options;
+				queueMicrotask(() => child.emit("close", 0, null));
+				return child;
+			},
+		});
+		strictEqual(result.success, true);
+		strictEqual(spawnOptions.cwd, "/tmp/disposable-worktree");
+	});
+
 	it("uses a closed progress envelope and does not treat polling as substantive progress", async () => {
 		const snapshot = createProgressSnapshot({
 			stage: "not-a-stage",

@@ -519,6 +519,7 @@ function safeTimer(fn, delay, setTimeoutFn) {
 export function runProviderProcess(command, args, options = {}) {
 	const {
 		input,
+		cwd,
 		timeoutMs = 30 * 60 * 1000,
 		maxBuffer = DEFAULT_MAX_BUFFER,
 		pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
@@ -788,6 +789,7 @@ export function runProviderProcess(command, args, options = {}) {
 
 		try {
 			child = spawnFn(command, args, {
+				cwd,
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 		} catch (error) {

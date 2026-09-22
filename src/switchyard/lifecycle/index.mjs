@@ -24,7 +24,7 @@ const ZERO_OBJECT_ID = "0".repeat(40);
 const TASK_BASE_PROBE_TIMEOUT_MS = 30_000;
 const PRLCTL_LOST_RESULT =
 	/PrlJob_(?:GetRetCode|GetResult):\s*Invalid argument\b/u;
-const DIRTY_OVERLAY_VERSION = 1;
+const DIRTY_OVERLAY_VERSION = 2;
 const DIRTY_OVERLAY_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const DIRTY_OVERLAY_SECRET_PATHS = [
 	/(^|\/)\.env(?:\.|$)/iu,
@@ -185,9 +185,167 @@ function assertReceiptParentSafe(receiptPath) {
 }
 
 /**
+ * Parse and validate a predecessor simple-attempt durable receipt.
+ * Normalizes input (JSON string, path, or object) and validates run identity,
+ * base revision, and output entries.
+ */
+export function parsePredecessorReceipt(input, { projectPath = null } = {}) {
+	let data = input;
+	if (typeof input === "string") {
+		const raw = input.trim();
+		if (raw.startsWith("{")) {
+			try {
+				data = JSON.parse(raw);
+			} catch {
+				const error = new Error("predecessor receipt contains invalid JSON");
+				error.code = "predecessor_receipt_invalid";
+				throw error;
+			}
+		} else {
+			const resolvedPath = resolve(input);
+			try {
+				const stats = lstatSync(resolvedPath);
+				if (!stats.isFile() || stats.isSymbolicLink()) {
+					const error = new Error(
+						"predecessor receipt must be a regular non-symlink file",
+					);
+					error.code = "predecessor_receipt_invalid";
+					throw error;
+				}
+				data = JSON.parse(readFileSync(resolvedPath, "utf8"));
+			} catch (err) {
+				const error = new Error(
+					`predecessor receipt unavailable: ${err.message}`,
+				);
+				error.code =
+					err.code === "ENOENT"
+						? "predecessor_receipt_missing"
+						: "predecessor_receipt_invalid";
+				throw error;
+			}
+		}
+	}
+	if (!data || typeof data !== "object" || Array.isArray(data)) {
+		const error = new Error("predecessor receipt must be an object");
+		error.code = "predecessor_receipt_invalid";
+		throw error;
+	}
+	const runId = data.runId ?? (data.taskId ? `simple-${data.taskId}` : null);
+	if (typeof runId !== "string" || !runId.trim()) {
+		const error = new Error("predecessor receipt requires runId or taskId");
+		error.code = "predecessor_receipt_invalid";
+		throw error;
+	}
+	const baseRevision =
+		data.baseRevision ??
+		data.base_commit ??
+		data.dirtyBaseline?.base_commit ??
+		data.projectRevision ??
+		null;
+	if (
+		typeof baseRevision !== "string" ||
+		!/^[0-9a-f]{40,64}$/i.test(baseRevision)
+	) {
+		const error = new Error(
+			"predecessor receipt requires a valid baseRevision",
+		);
+		error.code = "predecessor_receipt_invalid";
+		throw error;
+	}
+	const rawOutputs = data.outputs ?? data.files ?? data.changedFiles ?? [];
+	const outputs = [];
+	if (Array.isArray(rawOutputs)) {
+		for (const item of rawOutputs) {
+			if (typeof item === "string") {
+				const fileMeta =
+					data.outputHashes?.[item] ?? data.dirtyBaseline?.files?.[item];
+				if (!fileMeta) {
+					const error = new Error(
+						`predecessor receipt output missing metadata: ${item}`,
+					);
+					error.code = "predecessor_receipt_invalid";
+					throw error;
+				}
+				outputs.push({
+					path: item,
+					size: fileMeta.size,
+					sha256: fileMeta.sha256,
+					mode: fileMeta.mode ?? 0o644,
+				});
+			} else if (item && typeof item === "object") {
+				outputs.push(item);
+			}
+		}
+	} else if (rawOutputs && typeof rawOutputs === "object") {
+		for (const [path, meta] of Object.entries(rawOutputs)) {
+			if (meta && typeof meta === "object") {
+				outputs.push({ path, ...meta });
+			}
+		}
+	}
+	if (outputs.length === 0) {
+		const error = new Error("predecessor receipt has no outputs");
+		error.code = "predecessor_receipt_invalid";
+		throw error;
+	}
+	const normalizedOutputs = [];
+	for (const entry of outputs) {
+		if (
+			!entry ||
+			typeof entry.path !== "string" ||
+			!Number.isInteger(entry.size) ||
+			entry.size < 0 ||
+			!/^[a-f0-9]{64}$/i.test(entry.sha256 ?? "")
+		) {
+			const error = new Error(
+				`predecessor receipt invalid output entry: ${JSON.stringify(entry)}`,
+			);
+			error.code = "predecessor_receipt_invalid";
+			throw error;
+		}
+		const path = entry.path.trim().replaceAll("\\", "/").replace(/^\.\//u, "");
+		if (
+			isAbsolute(path) ||
+			path.split("/").includes("..") ||
+			path.split("/").includes(".git") ||
+			DIRTY_OVERLAY_SECRET_PATHS.some((p) => p.test(path))
+		) {
+			const error = new Error(
+				`predecessor receipt unsafe output path: ${entry.path}`,
+			);
+			error.code = "predecessor_receipt_invalid";
+			throw error;
+		}
+		if (projectPath) {
+			const resolved = resolve(projectPath, path);
+			const root = resolve(projectPath);
+			if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) {
+				const error = new Error(
+					`predecessor receipt path escapes project: ${entry.path}`,
+				);
+				error.code = "predecessor_receipt_invalid";
+				throw error;
+			}
+		}
+		normalizedOutputs.push({
+			path,
+			size: entry.size,
+			sha256: entry.sha256.toLowerCase(),
+			mode: Number(entry.mode) || 0o644,
+		});
+	}
+	return {
+		runId,
+		baseRevision,
+		outputs: normalizedOutputs,
+	};
+}
+
+/**
  * Capture an immutable, content-addressed overlay of exact tracked regular
- * files. The returned receipt contains the bytes needed by a detached worker;
- * callers may persist it with writeDirtyOverlayReceipt().
+ * files and validated untracked predecessor outputs. The returned receipt
+ * contains the bytes needed by a detached worker; callers may persist it
+ * with writeDirtyOverlayReceipt().
  */
 export function captureDirtyOverlay(
 	projectPath,
@@ -198,6 +356,7 @@ export function captureDirtyOverlay(
 		maxFileBytes = DIRTY_OVERLAY_MAX_FILE_BYTES,
 		enforceTarPathLimit = true,
 		secretPaths = DIRTY_OVERLAY_SECRET_PATHS,
+		predecessorReceipt = null,
 	} = {},
 ) {
 	if (!Array.isArray(paths) || paths.length === 0)
@@ -217,15 +376,34 @@ export function captureDirtyOverlay(
 				`dirty overlay rejects out-of-scope or untracked path: ${candidate}`,
 			);
 	}
+	const parsedPredecessor = predecessorReceipt
+		? parsePredecessorReceipt(predecessorReceipt, { projectPath })
+		: null;
 	const entries = normalized.map((path) => {
 		assertOverlayPathSafe(projectPath, path, {
 			enforceTarPathLimit,
 			secretPaths,
 		});
-		if (!trackedPath(projectPath, path))
-			throw new Error(`dirty overlay rejects untracked path: ${path}`);
+		const isTracked = trackedPath(projectPath, path);
 		if (ignoredPath(projectPath, path))
 			throw new Error(`dirty overlay rejects ignored path: ${path}`);
+		let predEntry = null;
+		if (!isTracked) {
+			if (!parsedPredecessor) {
+				throw new Error(`dirty overlay rejects untracked path: ${path}`);
+			}
+			predEntry = parsedPredecessor.outputs.find((o) => o.path === path);
+			if (!predEntry) {
+				throw new Error(`dirty overlay rejects untracked path: ${path}`);
+			}
+			if (parsedPredecessor.baseRevision !== sourceHead) {
+				const error = new Error(
+					`dirty overlay predecessor base revision mismatch: ${path}`,
+				);
+				error.code = "predecessor_receipt_mismatch";
+				throw error;
+			}
+		}
 		const target = resolve(projectPath, path);
 		let stats;
 		try {
@@ -239,6 +417,11 @@ export function captureDirtyOverlay(
 			throw new Error(`dirty overlay requires one regular file: ${path}`);
 		if (stats.size > maxFileBytes)
 			throw new Error(`dirty overlay file is too large: ${path}`);
+		if (predEntry && stats.size !== predEntry.size) {
+			const error = new Error(`dirty overlay predecessor file drift: ${path}`);
+			error.code = "predecessor_receipt_mismatch";
+			throw error;
+		}
 		const bytes = readFileSync(target);
 		const afterRead = lstatSync(target);
 		if (
@@ -249,13 +432,29 @@ export function captureDirtyOverlay(
 			(afterRead.mode & 0o777) !== (stats.mode & 0o777)
 		)
 			throw new Error(`dirty overlay file changed while reading: ${path}`);
-		return {
+		const sha256 = createHash("sha256").update(bytes).digest("hex");
+		if (predEntry && sha256 !== predEntry.sha256) {
+			const error = new Error(`dirty overlay predecessor file drift: ${path}`);
+			error.code = "predecessor_receipt_mismatch";
+			throw error;
+		}
+		const entry = {
 			path,
 			mode: stats.mode & 0o777,
 			size: bytes.length,
-			sha256: createHash("sha256").update(bytes).digest("hex"),
+			sha256,
 			bytes: bytes.toString("base64"),
+			tracked: isTracked,
 		};
+		if (!isTracked && predEntry) {
+			entry.predecessor = {
+				runId: parsedPredecessor.runId,
+				baseRevision: parsedPredecessor.baseRevision,
+				sha256: predEntry.sha256,
+				size: predEntry.size,
+			};
+		}
+		return entry;
 	});
 	const body = {
 		schemaVersion: DIRTY_OVERLAY_VERSION,
@@ -263,6 +462,14 @@ export function captureDirtyOverlay(
 		sourceHead,
 		hostFingerprint: hostFingerprint ?? overlayFingerprint(projectPath),
 		paths: entries,
+		...(parsedPredecessor
+			? {
+					predecessor: {
+						runId: parsedPredecessor.runId,
+						baseRevision: parsedPredecessor.baseRevision,
+					},
+				}
+			: {}),
 	};
 	return { ...body, receiptHash: overlayHash(body) };
 }
@@ -281,7 +488,7 @@ export function validateDirtyOverlayReceipt(
 ) {
 	if (
 		!receipt ||
-		receipt.schemaVersion !== DIRTY_OVERLAY_VERSION ||
+		(receipt.schemaVersion !== 1 && receipt.schemaVersion !== 2) ||
 		receipt.kind !== "tracked_dirty_overlay"
 	)
 		return { ok: false, reason: "dirty_overlay_receipt_invalid" };
@@ -335,10 +542,22 @@ export function validateDirtyOverlayReceipt(
 				enforceTarPathLimit,
 				secretPaths,
 			});
-			if (!trackedPath(projectPath, entry.path))
-				return { ok: false, reason: "dirty_overlay_untracked" };
+			const isTracked = trackedPath(projectPath, entry.path);
 			if (ignoredPath(projectPath, entry.path))
 				return { ok: false, reason: "dirty_overlay_ignored" };
+			if (!isTracked) {
+				if (entry.tracked !== false || !entry.predecessor) {
+					return { ok: false, reason: "dirty_overlay_untracked" };
+				}
+				if (
+					typeof entry.predecessor.runId !== "string" ||
+					typeof entry.predecessor.baseRevision !== "string" ||
+					entry.predecessor.sha256 !== entry.sha256 ||
+					entry.predecessor.size !== entry.size
+				) {
+					return { ok: false, reason: "dirty_overlay_file_drift" };
+				}
+			}
 			const stats = lstatSync(resolve(projectPath, entry.path));
 			const bytes = readFileSync(resolve(projectPath, entry.path));
 			const receiptBytes = Buffer.from(entry.bytes, "base64");
@@ -447,6 +666,9 @@ export function materializeDirtyOverlay(
 		if (!parentStats.isDirectory() || parentStats.isSymbolicLink())
 			throw new Error(`dirty overlay rejects symlink parent: ${path}`);
 		const bytes = Buffer.from(entry.bytes, "base64");
+		if (createHash("sha256").update(bytes).digest("hex") !== entry.sha256) {
+			throw new Error(`dirty overlay file corrupted in receipt: ${path}`);
+		}
 		writeFileSync(target, bytes, { encoding: null, mode: entry.mode });
 		chmodSync(target, entry.mode & 0o777);
 	}

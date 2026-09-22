@@ -74,18 +74,22 @@ const ADVANCE_FALLBACK_FAILURE_CODES = new Set([
 	"quota_exhausted",
 	"provider_exit_nonzero",
 	"provider_signalled",
+	"empty_diff",
+	"empty_required_diff",
+]);
+const EMPTY_TARGET_OUTPUT_CODES = new Set([
+	"empty_diff",
+	"empty_required_diff",
 ]);
 const REPAIR_INPUT_FAILURE_CODES = new Set([
 	"cli_usage_error",
 	"declared_path_not_seeded",
 	"required_paths_missing",
 	"undeclared_paths_touched",
-	"empty_required_diff",
 	"no_op_diff",
 	"manifest_review_required",
 	"corrupt_patch",
 	"conflict",
-	"empty_diff",
 ]);
 const TERMINAL_LOCK_DIAGNOSTICS = new Set([
 	"project_lock_held",
@@ -237,7 +241,9 @@ function hasExactDescriptorEvidence(entry) {
 function hasAuthoritativeRoutingFailure(failure) {
 	return Boolean(
 		hasAuthoritativeDiagnosticProvenance(failure) &&
-			failure.failurePhase === "provider_execution",
+			(failure.failurePhase === "provider_execution" ||
+				(failure.failurePhase === "adapter_validation" &&
+					EMPTY_TARGET_OUTPUT_CODES.has(projectedDiagnosticCode(failure)))),
 	);
 }
 

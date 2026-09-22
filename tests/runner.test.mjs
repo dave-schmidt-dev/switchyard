@@ -6852,7 +6852,7 @@ describe("runner quota retry coordination", () => {
 		]);
 	});
 
-	it("applies one cumulative correction through the real gate and commits the worker once", () => {
+	it("accepts a declared subset through the real gate without correction", () => {
 		const projectPath = join(TEST_DIR, "completion-real-gate");
 		mkdirSync(projectPath, { recursive: true });
 		runFixtureGit(projectPath, ["init", "-q"]);
@@ -6968,22 +6968,19 @@ describe("runner quota retry coordination", () => {
 			true,
 			JSON.stringify(result.results[0]),
 		);
-		strictEqual(executions, 2);
+		strictEqual(executions, 1);
 		strictEqual(commits, 1);
 		strictEqual(resets, 0);
 		strictEqual(teardowns, 1);
 		strictEqual(
 			runFixtureGit(workerPath, ["rev-list", "--count", `${headBefore}..HEAD`]),
-			"2",
+			"1",
 		);
 		strictEqual(
 			readFileSync(join(projectPath, "src/a.mjs"), "utf8"),
 			"export const a = 1;\n",
 		);
-		strictEqual(
-			readFileSync(join(projectPath, "src/b.mjs"), "utf8"),
-			"export const b = 2;\n",
-		);
+		ok(!existsSync(join(projectPath, "src/b.mjs")));
 		strictEqual(runFixtureGit(projectPath, ["rev-parse", "HEAD"]), headBefore);
 	});
 
@@ -12593,8 +12590,8 @@ describe("runner progress hooks (INV-1: no silent waits)", () => {
 	});
 });
 
-describe("Files requiredPaths propagation", () => {
-	it("passes unwrapped Files paths to integrationGate", () => {
+describe("Files allowlist propagation", () => {
+	it("passes unwrapped Files paths as allowedPaths to integrationGate", () => {
 		const markdown = `## Phase 1
 
 ### Task 1.1: File task
@@ -12629,13 +12626,13 @@ describe("Files requiredPaths propagation", () => {
 
 		strictEqual(result.success, true);
 		strictEqual(gateCalls.length, 1);
-		deepStrictEqual(gateCalls[0].options.requiredPaths, [
+		deepStrictEqual(gateCalls[0].options.allowedPaths, [
 			"src/a.mjs",
 			"tests/a.test.mjs",
 		]);
 	});
 
-	it("executeTask passes requiredPaths to integrationGate", () => {
+	it("executeTask passes Files as allowedPaths to integrationGate", () => {
 		const gateCalls = [];
 		const result = executeTask(
 			{
@@ -12670,13 +12667,13 @@ describe("Files requiredPaths propagation", () => {
 
 		strictEqual(result.success, true);
 		strictEqual(gateCalls.length, 1);
-		deepStrictEqual(gateCalls[0].options.requiredPaths, [
+		deepStrictEqual(gateCalls[0].options.allowedPaths, [
 			"src/a.mjs",
 			"tests/a.test.mjs",
 		]);
 	});
 
-	it("executeTask passes null requiredPaths to integrationGate when task has none", () => {
+	it("executeTask passes null allowedPaths to integrationGate when task has none", () => {
 		const gateCalls = [];
 		const result = executeTask(
 			{
@@ -12711,7 +12708,7 @@ describe("Files requiredPaths propagation", () => {
 
 		strictEqual(result.success, true);
 		strictEqual(gateCalls.length, 1);
-		strictEqual(gateCalls[0].options.requiredPaths, null);
+		strictEqual(gateCalls[0].options.allowedPaths, null);
 	});
 
 	it("executeTask calls integrationGate with empty diff when requiredPaths is set (not success_no_diff)", () => {
@@ -12759,7 +12756,7 @@ describe("Files requiredPaths propagation", () => {
 		strictEqual(result.diagnosticCode, "empty_required_diff");
 		strictEqual(gateCalls.length, 1);
 		strictEqual(gateCalls[0].diff, "");
-		deepStrictEqual(gateCalls[0].options.requiredPaths, ["src/f.mjs"]);
+		deepStrictEqual(gateCalls[0].options.allowedPaths, ["src/f.mjs"]);
 		strictEqual(dispatches[0].result, "integration_failed");
 		strictEqual(dispatches[0].errorKind, "integration_failed");
 		strictEqual(dispatches[0].reasonCode, "integration_failed");
@@ -12770,7 +12767,7 @@ describe("Files requiredPaths propagation", () => {
 		strictEqual(dispatches[0].diagnosticCode, "empty_required_diff");
 	});
 
-	it("executeTaskWithOrchestrator passes requiredPaths to integrationGate", async () => {
+	it("executeTaskWithOrchestrator passes Files as allowedPaths to integrationGate", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: File task
@@ -12819,7 +12816,7 @@ describe("Files requiredPaths propagation", () => {
 		});
 
 		strictEqual(gateCalls.length, 1);
-		deepStrictEqual(gateCalls[0].options.requiredPaths, ["src/a.mjs"]);
+		deepStrictEqual(gateCalls[0].options.allowedPaths, ["src/a.mjs"]);
 	});
 
 	it("executeTaskWithOrchestrator calls gate with empty diff when requiredPaths is set", async () => {
@@ -16685,6 +16682,15 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 				reasonKind: "integration_state_unknown",
 			},
 		},
+		{
+			name: "ambiguous_combined_rename_spelling",
+			code: "ambiguous_combined_rename_spelling",
+			gateResult: {
+				success: false,
+				message: "ambiguous_combined_rename_spelling",
+				reasonKind: "ambiguous_combined_rename_spelling",
+			},
+		},
 	];
 
 	it("contains fixtures for every closed integration rejection code", () => {
@@ -16696,7 +16702,7 @@ describe("preserve closed integration rejection codes (Task 1.3)", () => {
 			...INTEGRATION_REFUSAL_KINDS,
 		]);
 		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, expectedCodes.size);
-		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, 14);
+		strictEqual(CLOSED_INTEGRATION_FIXTURES.length, 15);
 		for (const fixture of CLOSED_INTEGRATION_FIXTURES) {
 			ok(
 				expectedCodes.has(fixture.code),

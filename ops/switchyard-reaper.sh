@@ -153,8 +153,12 @@ while IFS= read -r line; do
 		truncated=1
 		break
 	fi
-	uuid=$(printf '%s\n' "$line" | awk '{print $1}')
-	name=$(printf '%s\n' "$line" | awk '{$1=""; $2=""; sub(/^[ \t]+/, ""); print}')
+	# Parse the three-column inventory with shell builtins. The final read
+	# variable receives the complete name, including spaces, without spawning
+	# two subprocesses for every row.
+	IFS=' 	' read -r uuid status name <<EOF
+$line
+EOF
 	case "$uuid" in
 	'' | UUID) continue ;;
 	esac

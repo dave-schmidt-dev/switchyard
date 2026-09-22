@@ -4799,11 +4799,11 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		};
 	}
 
-	async function dispatchWithStub(runQueueFn) {
+	async function dispatchWithStub(runQueueFn, extraDependencies = {}) {
 		const opts = parseDispatchArgs([tasksFile, "--project", projectDir]);
 		const savedExitCode = process.exitCode;
 		try {
-			await dispatchRun(opts, { runQueue: runQueueFn });
+			await dispatchRun(opts, { runQueue: runQueueFn, ...extraDependencies });
 			return process.exitCode;
 		} finally {
 			process.exitCode = savedExitCode;
@@ -5098,6 +5098,112 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 		const run = await onlyRunRecord();
 		strictEqual(run.state, "failed");
 		strictEqual(run.cleanupState, "complete");
+	});
+
+	it("fails closed when run-store callback event persistence fails", async () => {
+		const { isProjectLockHeld, createEvent } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const secretCanary =
+			"SECRET_CANARY_raw_event_write_failure_never_persisted";
+		const exitCode = await dispatchWithStub(
+			(queueOptions) => {
+				const stub = stubResult(true);
+				queueOptions.dependencies.onResult(stub.results[0]);
+				return stub;
+			},
+			{
+				createEvent: (runId, event) => {
+					if (event.phase === "execution") {
+						throw new Error(`disk failure: ${secretCanary}`);
+					}
+					return createEvent(runId, event);
+				},
+			},
+		);
+
+		strictEqual(
+			exitCode,
+			1,
+			"CLI must report failure on event persistence error",
+		);
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released after persistence failure",
+		);
+		const run = await onlyRunRecord();
+		strictEqual(run.state, "failed");
+		strictEqual(run.cleanupState, "complete");
+		ok(
+			run.lastFailure,
+			"durable failure metadata must be present on failed run",
+		);
+		strictEqual(run.lastFailure.errorKind, "run_store_write_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "run_store_write_failed");
+		strictEqual(run.lastTelemetryWriteFailure, "write_failed");
+		strictEqual(run.telemetryWriteFailures, 1);
+
+		const durable = JSON.stringify(run);
+		ok(
+			!durable.includes(secretCanary),
+			"raw injected error text must not be persisted into run record",
+		);
+	});
+
+	it("run --json fails closed and reports failed envelope on callback event persistence error", async () => {
+		const { isProjectLockHeld, createEvent } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+
+		const secretCanary = "SECRET_CANARY_raw_json_write_failure_never_persisted";
+		const { envelope, exitCode } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			{
+				runQueue: async (queueOptions) => {
+					const stub = stubResult(true);
+					queueOptions.dependencies.onResult(stub.results[0]);
+					return stub;
+				},
+				createEvent: (runId, event) => {
+					if (event.phase === "execution") {
+						throw new Error(`disk failure: ${secretCanary}`);
+					}
+					return createEvent(runId, event);
+				},
+			},
+		);
+
+		strictEqual(
+			exitCode,
+			1,
+			"CLI --json must exit 1 on event persistence error",
+		);
+		strictEqual(envelope.state, "failed");
+		strictEqual(envelope.cleanupState, "complete");
+		strictEqual(envelope.lastTelemetryWriteFailure, "write_failed");
+		strictEqual(envelope.telemetryWriteFailures, 1);
+		ok(
+			!isProjectLockHeld(projectDir),
+			"project lock must be released after JSON persistence failure",
+		);
+		const run = await onlyRunRecord();
+		strictEqual(run.state, "failed");
+		strictEqual(run.cleanupState, "complete");
+		ok(run.lastFailure);
+		strictEqual(run.lastFailure.errorKind, "run_store_write_failed");
+		strictEqual(run.lastFailure.diagnosticCode, "run_store_write_failed");
+		strictEqual(run.lastTelemetryWriteFailure, "write_failed");
+
+		const durable = JSON.stringify(run);
+		ok(
+			!durable.includes(secretCanary),
+			"raw injected error text must not be in durable run record",
+		);
+		ok(
+			!JSON.stringify(envelope).includes(secretCanary),
+			"raw injected error text must not be in stdout JSON envelope",
+		);
 	});
 
 	// Regression: a queue that resolves with no result and never throws used to

@@ -827,6 +827,12 @@ describe("closed caller direction", () => {
 			"advance_authorized_fallback",
 		],
 		["execution_failed", "provider_signalled", "advance_authorized_fallback"],
+		["integration_failed", "empty_diff", "advance_authorized_fallback"],
+		[
+			"integration_failed",
+			"empty_required_diff",
+			"advance_authorized_fallback",
+		],
 		["execution_timed_out", "execution_timed_out", "stop"],
 		["execution_timed_out", "execution_cancelled", "stop"],
 	];

@@ -223,8 +223,10 @@ describe("Vibe adapter", () => {
 	});
 
 	it("writes a config that declares every routable selector so Vibe cannot substitute", () => {
-		const config = renderVibeConfig("glm-5.2-low");
-		ok(config.includes('active_model = "glm-5.2-low"'));
+		const config = renderVibeConfig("glm-5-3");
+		ok(config.includes('active_model = "glm-5-3"'));
+		strictEqual(VIBE_MODELS["glm-5-3-medium"].thinking, "medium");
+		strictEqual(VIBE_MODELS["glm-5-3"].thinking, "max");
 		for (const [alias, model] of Object.entries(VIBE_MODELS)) {
 			ok(config.includes(`alias = ${JSON.stringify(alias)}`));
 			ok(config.includes(`name = ${JSON.stringify(model.name)}`));
@@ -253,8 +255,8 @@ describe("Vibe adapter", () => {
 		const descriptor = validateInvocationDescriptor(
 			{
 				target_id: "vibe",
-				model_ref: "zhipu/glm-5.2-high",
-				selector: "glm-5.2-high",
+				model_ref: "zhipu/glm-5.3",
+				selector: "glm-5-3",
 				effort: null,
 				variant: null,
 				invocation_args: [],
@@ -386,8 +388,8 @@ describe("Vibe adapter", () => {
 		const descriptor = validateInvocationDescriptor(
 			{
 				target_id: "vibe",
-				model_ref: "zhipu/glm-5.2-low",
-				selector: "glm-5.2-low",
+				model_ref: "zhipu/glm-5.3",
+				selector: "glm-5-3",
 				effort: null,
 				variant: null,
 				invocation_args: [],
@@ -434,7 +436,7 @@ describe("Vibe adapter", () => {
 					args: [
 						"-e",
 						servedProbe
-							? 'process.stdout.write("glm-5.2-low\\n")'
+							? 'process.stdout.write("glm-5-3\\n")'
 							: 'process.stdout.write("vibe-ran")',
 					],
 				};
@@ -443,8 +445,8 @@ describe("Vibe adapter", () => {
 		const descriptor = validateInvocationDescriptor(
 			{
 				target_id: "vibe",
-				model_ref: "zhipu/glm-5.2-low",
-				selector: "glm-5.2-low",
+				model_ref: "zhipu/glm-5.3",
+				selector: "glm-5-3",
 				effort: null,
 				variant: null,
 				invocation_args: [],
@@ -458,6 +460,6 @@ describe("Vibe adapter", () => {
 			descriptorIdentity: descriptor.descriptor_identity,
 		});
 		strictEqual(result.success, true);
-		strictEqual(result.servedModel, "glm-5.2-low");
+		strictEqual(result.servedModel, "glm-5-3");
 	});
 });

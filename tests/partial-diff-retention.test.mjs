@@ -30,6 +30,10 @@ import {
 } from "./helpers/bootstrap-handler.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
+const { persistAsyncResultArtifacts } = await import(
+	"../src/switchyard/runner/index.mjs"
+);
+
 const TEST_ROOT = tempDir("switchyard-partial-diff-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 
@@ -46,6 +50,63 @@ after(() => {
 });
 
 describe("partial diffs are recorded, not copied (Task 6.5)", () => {
+	it("fails closed and emits a bounded event when a partial diff cannot be saved", () => {
+		const events = [];
+		const result = {
+			taskId: "1.1",
+			success: false,
+			result: "integration_failed",
+			partialDiff: "diff bytes that must not escape",
+		};
+		persistAsyncResultArtifacts({
+			result,
+			checkpointPath: "/unused/checkpoint.json",
+			resultAttempt: 1,
+			onStatus: (event) => events.push(event),
+			savePartialDiffFn: () => {
+				throw new Error("synthetic save failure");
+			},
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.result, "diff_capture_failed");
+		strictEqual(result.errorKind, "diff_capture_failed");
+		strictEqual(result.partialDiffPath, null);
+		strictEqual(result.partialDiff, undefined);
+		deepStrictEqual(events, [
+			{
+				phase: "artifact",
+				event: "partial_diff_persistence_failed",
+				status: "Task 1.1 partial diff could not be saved",
+				taskId: "1.1",
+			},
+		]);
+		ok(!JSON.stringify(events).includes("diff bytes"));
+	});
+
+	it("fails closed when gate evidence cannot be saved", () => {
+		const events = [];
+		const result = {
+			taskId: "1.2",
+			success: false,
+			result: "integration_failed",
+			gateEvidence: "provider output that must not escape",
+		};
+		persistAsyncResultArtifacts({
+			result,
+			checkpointPath: "/unused/checkpoint.json",
+			resultAttempt: 1,
+			onStatus: (event) => events.push(event),
+			saveGateEvidenceFn: () => {
+				throw new Error("synthetic save failure");
+			},
+		});
+		strictEqual(result.result, "diff_capture_failed");
+		strictEqual(result.gateEvidencePath, null);
+		strictEqual(result.gateEvidence, undefined);
+		strictEqual(events[0].event, "gate_evidence_persistence_failed");
+		ok(!JSON.stringify(events).includes("provider output"));
+	});
+
 	it("keeps checkpoint evidence references opaque", () => {
 		ok(!/raw provider transcripts/i.test(BOOTSTRAP_SOURCE));
 	});

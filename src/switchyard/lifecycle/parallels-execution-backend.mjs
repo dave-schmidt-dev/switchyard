@@ -325,6 +325,8 @@ const DEFAULT_HOST_READINESS_ATTEMPTS = 2;
 const DEFAULT_HOST_READINESS_BACKOFF_MS = 100;
 const DEFAULT_HOST_READINESS_TIMEOUT_MS = 2_000;
 const HOST_READINESS_MAX_BUFFER = 1024 * 1024;
+const HOST_PERMISSION_DENIED_SIGNATURE =
+	/(?:^|\n)(?:\/usr\/local\/bin\/prlctl: line \d+: )?\/bin\/ps:\s*Operation not permitted(?:\n|$)/u;
 // This remains deliberately disabled until an attended, disposable-VM run has
 // observed both an already-satisfied postcondition and a lost SDK result for
 // each newly covered mutation.  The budget belongs to the read-only proof, not
@@ -351,6 +353,16 @@ const PRLCTL_SUBCOMMANDS = Object.freeze(
 const PERSISTABLE_PRLCTL_SIGNALS = Object.freeze(
 	new Set(["SIGABRT", "SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM"]),
 );
+
+function prlctlHostPermissionDenied(error) {
+	if (!(error instanceof PrlctlCallError)) return false;
+	const text = Buffer.isBuffer(error.stderr)
+		? error.stderr.toString("utf8")
+		: typeof error.stderr === "string"
+			? error.stderr
+			: "";
+	return HOST_PERMISSION_DENIED_SIGNATURE.test(text);
+}
 const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
 const VM_OWNERSHIP_SCHEMA_VERSION = 1;
 const PROCESS_MARKER_SCHEMA_VERSION = 1;
@@ -2027,13 +2039,15 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 					["prlctl_job_misfire", "prlctl_session_not_ready"].includes(
 						error.diagnosticCode,
 					);
-				const code = ["EACCES", "EPERM"].includes(causeCode)
-					? "vm_host_inventory_permission_denied"
-					: !(error instanceof PrlctlCallError) ||
-							["ENOENT", "ETIMEDOUT"].includes(causeCode) ||
-							error.diagnosticCode === "prlctl_call_timed_out"
-						? "vm_host_inventory_unavailable"
-						: "vm_host_service_degraded";
+				const code =
+					["EACCES", "EPERM"].includes(causeCode) ||
+					prlctlHostPermissionDenied(error)
+						? "vm_host_inventory_permission_denied"
+						: !(error instanceof PrlctlCallError) ||
+								["ENOENT", "ETIMEDOUT"].includes(causeCode) ||
+								error.diagnosticCode === "prlctl_call_timed_out"
+							? "vm_host_inventory_unavailable"
+							: "vm_host_service_degraded";
 				failure = new ParallelsHostReadinessError(code, error);
 				if (!retryable || attempt >= this.hostReadinessAttempts) {
 					throw failure;

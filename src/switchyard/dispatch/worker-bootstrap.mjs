@@ -225,6 +225,30 @@ export async function persistTerminalOutcome({
 	}
 }
 
+export function detachedTerminalOutcome({
+	failed = [],
+	deferredTaskIds = [],
+	writeFailureCount: failedWrites = 0,
+} = {}) {
+	const persistenceFailure =
+		failedWrites > 0
+			? sanitizeFailureMetadata({
+					result: "run_store_write_failed",
+					errorKind: "run_store_write_failed",
+					failurePhase: "terminal_reconciliation",
+				})
+			: null;
+	return {
+		state:
+			failed.length > 0 || persistenceFailure
+				? "failed"
+				: deferredTaskIds.length > 0
+					? "deferred"
+					: "succeeded",
+		failure: persistenceFailure ?? sanitizeFailureMetadata(failed.at(-1) ?? {}),
+	};
+}
+
 const { queueWrite, drain: drainWriteChain } = createWriteChain({
 	onFailure: safeWriteFailure,
 });
@@ -1017,16 +1041,16 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		// overwrite this run's real terminal outcome with a zeroed failure
 		// placeholder. writeChain always resolves, so this await is bounded.
 		await drainWriteChain();
+		const terminalOutcome = detachedTerminalOutcome({
+			failed,
+			deferredTaskIds,
+			writeFailureCount,
+		});
 		await finalizeRun(
 			{
 				runId,
-				state:
-					failed.length > 0
-						? "failed"
-						: deferredTaskIds.length > 0
-							? "deferred"
-							: "succeeded",
-				failure: sanitizeFailureMetadata(failed.at(-1) ?? {}),
+				state: terminalOutcome.state,
+				failure: terminalOutcome.failure,
 				terminalSummary,
 				extraPatch: {
 					...(result.policyDeferred

@@ -31,6 +31,7 @@ import { describe, it } from "node:test";
 import {
 	boundedRouteHealthDecisionEvent,
 	createWriteChain,
+	detachedTerminalOutcome,
 	persistTerminalOutcome,
 } from "../src/switchyard/dispatch/worker-bootstrap.mjs";
 
@@ -178,6 +179,35 @@ function buildCallbacks(store, { ordered }) {
 }
 
 describe("worker-bootstrap writeChain ordering", () => {
+	it("fails the detached run when any queued durable write failed", async () => {
+		let failedWrites = 0;
+		const writes = createWriteChain({
+			onFailure: () => {
+				failedWrites += 1;
+			},
+		});
+		writes.queueWrite(async () => {
+			throw new Error("synthetic persistence failure");
+		});
+		await writes.drain();
+		const outcome = detachedTerminalOutcome({
+			failed: [],
+			deferredTaskIds: [],
+			writeFailureCount: failedWrites,
+		});
+		strictEqual(outcome.state, "failed");
+		strictEqual(outcome.failure.errorKind, "run_store_write_failed");
+		strictEqual(outcome.failure.failurePhase, "terminal_reconciliation");
+	});
+
+	it("preserves success and deferred states when durable writes succeed", () => {
+		strictEqual(detachedTerminalOutcome().state, "succeeded");
+		strictEqual(
+			detachedTerminalOutcome({ deferredTaskIds: ["task-1"] }).state,
+			"deferred",
+		);
+	});
+
 	it("FIX persists bounded shadow health decisions through the detached event channel", async () => {
 		const events = [];
 		const writes = createWriteChain();

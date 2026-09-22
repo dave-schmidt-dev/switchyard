@@ -131,6 +131,7 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"unsupported_provider",
 	"launch_failed",
 	"result_fetch_failed",
+	"run_store_write_failed",
 	"orchestrator_timeout",
 	"executor_not_switchyard",
 	"unknown_failure",
@@ -138,6 +139,14 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"task_selection_failed",
 	"environment_incomplete",
 	"project_lock_failed",
+	"permission_denied",
+	"environment_failure",
+	"validation_failed",
+	"policy_violation",
+	"check_failed",
+	"cleanup_failed",
+	"unclassified_failure",
+	"ambiguous_combined_rename_spelling",
 ]);
 
 const CLEANUP_STAGE_DIAGNOSTIC_CODES = Object.freeze({
@@ -390,6 +399,7 @@ export const INTEGRATION_REFUSAL_KINDS = Object.freeze([
 	"corrupt_patch",
 	"conflict",
 	"integration_state_unknown",
+	"ambiguous_combined_rename_spelling",
 ]);
 
 export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
@@ -405,6 +415,7 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"provider_cleanup_failed",
 	...Object.values(CLEANUP_STAGE_DIAGNOSTIC_CODES),
 	"diff_capture_failed",
+	"run_store_write_failed",
 	// The codes `taskBaseReleaseDiagnosticCode()` computes. Without them the
 	// sanitizer's closed filter silently dropped `diagnosticCode`, so every
 	// release failure recorded the same generic `diff_capture_failed` /
@@ -474,6 +485,15 @@ export const PERSISTED_DIAGNOSTIC_CODES = Object.freeze([
 	"project_lock_ownership_displaced",
 	"project_lock_claim_cleanup_failed",
 	"project_lock_recovery_claim_blocks_execution",
+	"ambiguous_combined_rename_spelling",
+	"permission_denied",
+	"environment_failure",
+	"validation_failed",
+	"policy_violation",
+	"check_failed",
+	"cleanup_failed",
+	"unclassified_failure",
+	"run_store_write_failed",
 ]);
 
 const PERSISTED_FAILURE_PHASES = new Set([
@@ -486,6 +506,14 @@ const PERSISTED_FAILURE_PHASES = new Set([
 	"queue_preflight",
 	"checkpoint_validation",
 	"project_lock",
+	"preflight",
+	"input_validation",
+	"route",
+	"prepare",
+	"diff",
+	"checks",
+	"integrate",
+	"cleanup",
 ]);
 
 const CHECKPOINT_DIAGNOSTIC_CODES = new Set([
@@ -986,6 +1014,11 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 		reasonCode: "result_fetch_failed",
 		reason: "The headless provider result could not be fetched.",
 	}),
+	run_store_write_failed: Object.freeze({
+		reasonCode: "run_store_write_failed",
+		reason:
+			"Durable run-state persistence failed, so terminal success cannot be trusted.",
+	}),
 	orchestrator_timeout: Object.freeze({
 		reasonCode: "orchestrator_timeout",
 		reason: "The headless provider job exceeded its bounded wait.",
@@ -1013,6 +1046,38 @@ const PERSISTED_ERROR_METADATA = Object.freeze({
 	project_lock_failed: Object.freeze({
 		reasonCode: "project_lock_failed",
 		reason: "Project lock acquisition or ownership validation failed.",
+	}),
+	permission_denied: Object.freeze({
+		reasonCode: "permission_denied",
+		reason: "Filesystem or environment permission was denied.",
+	}),
+	environment_failure: Object.freeze({
+		reasonCode: "environment_failure",
+		reason: "Filesystem or host environment failed.",
+	}),
+	validation_failed: Object.freeze({
+		reasonCode: "validation_failed",
+		reason: "Caller contract, input, or schema validation failed.",
+	}),
+	policy_violation: Object.freeze({
+		reasonCode: "policy_violation",
+		reason: "Execution policy violation.",
+	}),
+	check_failed: Object.freeze({
+		reasonCode: "check_failed",
+		reason: "Task check command failed.",
+	}),
+	cleanup_failed: Object.freeze({
+		reasonCode: "cleanup_failed",
+		reason: "Workspace or container cleanup failed.",
+	}),
+	unclassified_failure: Object.freeze({
+		reasonCode: "unclassified_failure",
+		reason: "Execution failed with an unclassified error.",
+	}),
+	ambiguous_combined_rename_spelling: Object.freeze({
+		reasonCode: "ambiguous_combined_rename_spelling",
+		reason: "Declared path contains ambiguous combined rename syntax.",
 	}),
 });
 
@@ -1046,6 +1111,7 @@ const RESULT_TO_ERROR_KIND = Object.freeze({
 	unsupported_provider: "unsupported_provider",
 	launch_failed: "launch_failed",
 	result_fetch_failed: "result_fetch_failed",
+	run_store_write_failed: "run_store_write_failed",
 	orchestrator_timed_out: "orchestrator_timeout",
 	orchestrator_timeout: "orchestrator_timeout",
 	executor_not_switchyard: "executor_not_switchyard",

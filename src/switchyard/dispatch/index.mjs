@@ -1176,6 +1176,49 @@ async function runDispatch(opts, dependencies = {}) {
 	let queueError = null;
 	let eventWriteChain = Promise.resolve();
 	let projectLockOwned = false;
+	let firstCallbackFailure = null;
+	let callbackFailureCount = 0;
+
+	const createEventFn =
+		dependencies.createEvent ??
+		dependencies.runStore?.createEvent ??
+		createEvent;
+	const createRouteHealthEventFn =
+		dependencies.createRouteHealthEvent ??
+		dependencies.runStore?.createRouteHealthEvent ??
+		createRouteHealthEvent;
+	const ingestRouteHealthEventsFn =
+		dependencies.ingestRouteHealthEvents ?? ingestRouteHealthEvents;
+	const updateRunWithRetryFn =
+		dependencies.updateRunWithRetry ??
+		dependencies.runStore?.updateRunWithRetry ??
+		updateRunWithRetry;
+
+	function queueEventWrite(fn) {
+		const write = eventWriteChain.then(fn, fn);
+		eventWriteChain = write.catch((error) => {
+			callbackFailureCount += 1;
+			if (!firstCallbackFailure) {
+				const categories = {
+					RevisionError: "revision_conflict",
+					SchemaError: "schema_invalid",
+					LockError: "lock_error",
+					TypeError: "type_error",
+					Error: "write_failed",
+				};
+				const name = typeof error?.name === "string" ? error.name : "";
+				const diagnostic = Object.hasOwn(categories, name)
+					? categories[name]
+					: "write_failed";
+				firstCallbackFailure = {
+					name,
+					diagnostic,
+				};
+				report("dispatch: run-store write failed");
+			}
+		});
+		return eventWriteChain;
+	}
 	try {
 		// Acquire the exclusive project lock immediately before queue
 		// execution, mirroring handleLaunch. This is deliberately NOT
@@ -1262,9 +1305,9 @@ async function runDispatch(opts, dependencies = {}) {
 					// missing. Appended to eventWriteChain so it serializes
 					// against onTaskRouted, which fires microseconds later.
 					if (runStoreReady) {
-						eventWriteChain = eventWriteChain
-							.then(() => updateRunWithRetry(runId, { activeTaskId: task.id }))
-							.catch(() => {});
+						queueEventWrite(() =>
+							updateRunWithRetryFn(runId, { activeTaskId: task.id }),
+						);
 					}
 				},
 				onTaskRouted: (info) => {
@@ -1272,24 +1315,22 @@ async function runDispatch(opts, dependencies = {}) {
 						`dispatch:    routed to ${info.provider}${info.model ? `/${info.model}` : ""} — deadline ${info.deadline ?? "orchestrator"}`,
 					);
 					if (runStoreReady) {
-						eventWriteChain = eventWriteChain
-							.then(() =>
-								updateRunWithRetry(runId, {
-									activeTaskProvider: info.provider,
-									activeTaskModel: info.model,
-									activeTaskDeadline: info.deadline ?? null,
-									resolvedTargetId: info.resolvedTargetId ?? null,
-									activeTaskInvocationDescriptor:
-										info.invocationDescriptor ?? null,
-									activeTaskDescriptorIdentity: info.descriptorIdentity ?? null,
-									activeTaskDescriptorHarness: info.descriptorHarness ?? null,
-									dispatchContractVersion: info.dispatchContractVersion ?? 1,
-									snapshotStatus: info.snapshotStatus ?? null,
-									snapshotMtime: info.snapshotMtime ?? null,
-									snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
-								}),
-							)
-							.catch(() => {});
+						queueEventWrite(() =>
+							updateRunWithRetryFn(runId, {
+								activeTaskProvider: info.provider,
+								activeTaskModel: info.model,
+								activeTaskDeadline: info.deadline ?? null,
+								resolvedTargetId: info.resolvedTargetId ?? null,
+								activeTaskInvocationDescriptor:
+									info.invocationDescriptor ?? null,
+								activeTaskDescriptorIdentity: info.descriptorIdentity ?? null,
+								activeTaskDescriptorHarness: info.descriptorHarness ?? null,
+								dispatchContractVersion: info.dispatchContractVersion ?? 1,
+								snapshotStatus: info.snapshotStatus ?? null,
+								snapshotMtime: info.snapshotMtime ?? null,
+								snapshotAgeMsAtRoute: info.snapshotAgeMsAtRoute ?? null,
+							}),
+						);
 					}
 				},
 				onTaskHeartbeat: (info) => {
@@ -1302,15 +1343,13 @@ async function runDispatch(opts, dependencies = {}) {
 					);
 					dependencies.onTaskHeartbeat?.(info);
 					if (runStoreReady) {
-						eventWriteChain = eventWriteChain
-							.then(() =>
-								updateRunWithRetry(runId, {
-									activeTaskElapsedMs: Math.max(0, info.elapsedMs ?? 0),
-									activeTaskHeartbeatAt: Date.now(),
-									activeTaskProcessPhase: phase,
-								}),
-							)
-							.catch(() => {});
+						queueEventWrite(() =>
+							updateRunWithRetryFn(runId, {
+								activeTaskElapsedMs: Math.max(0, info.elapsedMs ?? 0),
+								activeTaskHeartbeatAt: Date.now(),
+								activeTaskProcessPhase: phase,
+							}),
+						);
 					}
 				},
 				onResult: (r) => {
@@ -1351,45 +1390,41 @@ async function runDispatch(opts, dependencies = {}) {
 								? { attempt: r.routeHealthAttempt }
 								: {}),
 						};
-						eventWriteChain = eventWriteChain
-							.then(async () => {
-								if (r.routeHealthBinding) {
-									await createRouteHealthEvent(
-										runId,
-										event,
-										r.routeHealthBinding,
-									);
-									try {
-										await ingestRouteHealthEvents({
-											authorisedRuns: [{ runId, runRoot: getRunRoot(runId) }],
-											healthStateRoot: opts.healthStateRoot,
-										});
-									} catch {
-										report("dispatch: route health ingestion unavailable");
-									}
-								} else {
-									await createEvent(runId, event);
+						queueEventWrite(async () => {
+							if (r.routeHealthBinding) {
+								await createRouteHealthEventFn(
+									runId,
+									event,
+									r.routeHealthBinding,
+								);
+								try {
+									await ingestRouteHealthEventsFn({
+										authorisedRuns: [{ runId, runRoot: getRunRoot(runId) }],
+										healthStateRoot: opts.healthStateRoot,
+									});
+								} catch {
+									report("dispatch: route health ingestion unavailable");
 								}
-								await updateRunWithRetry(runId, {
-									activeTaskId: null,
-									activeTaskProvider: null,
-									activeTaskModel: null,
-									activeTaskDeadline: null,
-									activeTaskInvocationDescriptor: null,
-									activeTaskDescriptorIdentity: null,
-									activeTaskDescriptorHarness: null,
-									resolvedTargetId: null,
-									lastResolvedTargetId: r.resolvedTargetId ?? null,
-									lastTaskInvocationDescriptor: r.invocationDescriptor ?? null,
-									lastTaskDescriptorIdentity: r.descriptorIdentity ?? null,
-									lastTaskDescriptorHarness: r.descriptorHarness ?? null,
-									...(r.reviewResult
-										? { lastReviewResult: r.reviewResult }
-										: {}),
-									...(safeFailure ? { lastFailure: safeFailure } : {}),
-								});
-							})
-							.catch(() => {});
+							} else {
+								await createEventFn(runId, event);
+							}
+							await updateRunWithRetryFn(runId, {
+								activeTaskId: null,
+								activeTaskProvider: null,
+								activeTaskModel: null,
+								activeTaskDeadline: null,
+								activeTaskInvocationDescriptor: null,
+								activeTaskDescriptorIdentity: null,
+								activeTaskDescriptorHarness: null,
+								resolvedTargetId: null,
+								lastResolvedTargetId: r.resolvedTargetId ?? null,
+								lastTaskInvocationDescriptor: r.invocationDescriptor ?? null,
+								lastTaskDescriptorIdentity: r.descriptorIdentity ?? null,
+								lastTaskDescriptorHarness: r.descriptorHarness ?? null,
+								...(r.reviewResult ? { lastReviewResult: r.reviewResult } : {}),
+								...(safeFailure ? { lastFailure: safeFailure } : {}),
+							});
+						});
 					}
 				},
 			},
@@ -1398,13 +1433,21 @@ async function runDispatch(opts, dependencies = {}) {
 		queueError = error;
 	} finally {
 		if (runStoreReady) {
+			try {
+				await eventWriteChain;
+			} catch {
+				// queueEventWrite absorbs rejections and records categorical diagnostics.
+			}
+			const persistenceFailed = Boolean(firstCallbackFailure);
 			const failedResults = result
 				? result.results.filter(
 						(entry) =>
 							!entry.success && entry.result !== "route_health_deferred",
 					)
 				: [];
-			const anyFailed = result ? failedResults.length > 0 : true;
+			const anyFailed = result
+				? failedResults.length > 0 || persistenceFailed
+				: true;
 			const deferredTaskIds = Array.isArray(result?.deferredTaskIds)
 				? result.deferredTaskIds
 				: [];
@@ -1417,19 +1460,26 @@ async function runDispatch(opts, dependencies = {}) {
 				Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, queueError.code)
 					? queueError.code
 					: undefined;
-			const classifiedFailure = queueError
+			const classifiedFailure = firstCallbackFailure
 				? sanitizeFailureMetadata({
-						result: "unknown_failure",
-						errorKind: classifiedQueueError?.errorKind ?? "unknown_failure",
-						diagnosticCode: classifiedQueueError?.diagnosticCode,
-						failurePhase:
-							classifiedQueueError?.failurePhase ?? "terminal_reconciliation",
-						checkpointCode,
-						checkpointDimensions: checkpointCode
-							? queueError.changedDimensions
-							: undefined,
+						result: "run_store_write_failed",
+						errorKind: "run_store_write_failed",
+						diagnosticCode: "run_store_write_failed",
+						failurePhase: "terminal_reconciliation",
 					})
-				: sanitizeFailureMetadata(failedResult ?? {});
+				: queueError
+					? sanitizeFailureMetadata({
+							result: "unknown_failure",
+							errorKind: classifiedQueueError?.errorKind ?? "unknown_failure",
+							diagnosticCode: classifiedQueueError?.diagnosticCode,
+							failurePhase:
+								classifiedQueueError?.failurePhase ?? "terminal_reconciliation",
+							checkpointCode,
+							checkpointDimensions: checkpointCode
+								? queueError.changedDimensions
+								: undefined,
+						})
+					: sanitizeFailureMetadata(failedResult ?? {});
 			// `sanitizeFailureMetadata` returns null for anything it cannot classify,
 			// including the `{}` that a missing `failedResult` supplies. Combined with
 			// `anyFailed` defaulting to true when the queue produced no result, that
@@ -1450,7 +1500,6 @@ async function runDispatch(opts, dependencies = {}) {
 						})
 					: null);
 			try {
-				await eventWriteChain;
 				await finalizeRun({
 					runId,
 					state: anyFailed
@@ -1476,23 +1525,30 @@ async function runDispatch(opts, dependencies = {}) {
 								deferredTaskIds: null,
 								failedCount: null,
 							},
-					extraPatch: queueError?.preflightDetail
-						? {
-								preflightDetail: queueError.preflightDetail,
-								...(result?.policyDeferred
-									? { policyDeferred: result.policyDeferred }
-									: {}),
-							}
-						: result?.policyDeferred
+					extraPatch: {
+						...(queueError?.preflightDetail
+							? { preflightDetail: queueError.preflightDetail }
+							: {}),
+						...(result?.policyDeferred
 							? { policyDeferred: result.policyDeferred }
-							: {},
+							: {}),
+						...(callbackFailureCount > 0
+							? {
+									telemetryWriteFailures: callbackFailureCount,
+									lastTelemetryWriteFailure: firstCallbackFailure.diagnostic,
+								}
+							: {}),
+					},
 					cleanup: async () => {
 						if (projectLockOwned) {
 							await (
 								dependencies.reconcileProjectLockClaims ??
 								reconcileProjectLockClaims
 							)();
-							await releaseProjectLockIfOwnedBy(opts.projectPath, runId);
+							await (
+								dependencies.releaseProjectLockIfOwnedBy ??
+								releaseProjectLockIfOwnedBy
+							)(opts.projectPath, runId);
 						}
 					},
 				});
@@ -1514,11 +1570,13 @@ async function runDispatch(opts, dependencies = {}) {
 			});
 		}
 		console.log(JSON.stringify(envelope));
-		const failed = result
-			? result.results.some(
-					(entry) => !entry.success && entry.result !== "route_health_deferred",
-				)
-			: true;
+		const failed =
+			(result
+				? result.results.some(
+						(entry) =>
+							!entry.success && entry.result !== "route_health_deferred",
+					)
+				: true) || Boolean(firstCallbackFailure);
 		const deferred = Array.isArray(result?.deferredTaskIds)
 			? result.deferredTaskIds.length > 0
 			: false;
@@ -1540,13 +1598,20 @@ async function runDispatch(opts, dependencies = {}) {
 		(r) => !r.success && r.result !== "route_health_deferred",
 	);
 	const deferredCount = result.deferredTaskIds?.length ?? 0;
-	report(
-		`dispatch: done — ${result.processedTasks}/${result.runnableTasks} runnable processed, ` +
-			`${result.completedTaskIds.length} completed, ${failed.length} failed, ${deferredCount} deferred`,
-	);
-	report(`dispatch: checkpoint ${result.checkpointPath}`);
-	renewDispatchReceipts(result.checkpointPath, report);
-	process.exitCode = failed.length > 0 ? 1 : deferredCount > 0 ? 6 : 0;
+	if (firstCallbackFailure) {
+		report(
+			`dispatch: run-store persistence failed (${firstCallbackFailure.diagnostic})`,
+		);
+	} else {
+		report(
+			`dispatch: done — ${result.processedTasks}/${result.runnableTasks} runnable processed, ` +
+				`${result.completedTaskIds.length} completed, ${failed.length} failed, ${deferredCount} deferred`,
+		);
+		report(`dispatch: checkpoint ${result.checkpointPath}`);
+		renewDispatchReceipts(result.checkpointPath, report);
+	}
+	process.exitCode =
+		failed.length > 0 || firstCallbackFailure ? 1 : deferredCount > 0 ? 6 : 0;
 }
 
 /**
