@@ -35,7 +35,7 @@ usage() {
 Usage:
   update-opencode-cli.sh --vm NAME --cli-manifest PATH
 
-The manifest must contain exactly one opencode|npm|opencode-ai|VERSION|SHA256
+The manifest must contain exactly one opencode|npm|opencode-ai|VERSION|SHA256|VERSION
 row. The named VM must be stopped before this script starts it.
 EOF
 }
@@ -93,20 +93,23 @@ parse_args() {
 }
 
 read_manifest() {
-  local line provider kind ref detail hash extra
+  local line provider kind ref detail hash version extra
   local matches=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" == \#* ]] && continue
-    IFS='|' read -r provider kind ref detail hash extra <<<"$line"
-    [[ -z "${extra:-}" ]] || fail "malformed manifest row: $line"
+    IFS='|' read -r provider kind ref detail hash version extra <<<"$line"
+    [[ -n "$provider" && -n "$kind" && -n "$ref" && -n "$detail" && -n "$hash" && -n "$version" && -z "${extra:-}" ]] ||
+      fail "malformed manifest row: $line"
     if [[ "$provider" == opencode ]]; then
       ((matches += 1))
       [[ "$kind" == npm && "$ref" == opencode-ai ]] ||
-        fail "opencode row must be opencode|npm|opencode-ai|VERSION|SHA256"
+        fail "opencode row must be opencode|npm|opencode-ai|VERSION|SHA256|VERSION"
       [[ "$detail" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
         fail "unsafe OpenCode version: $detail"
       [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] ||
         fail "OpenCode row must contain a 64-character SHA-256"
+      [[ "$version" == "$detail" ]] ||
+        fail "opencode row must be opencode|npm|opencode-ai|VERSION|SHA256|VERSION"
       PACKAGE="$ref"
       VERSION="$detail"
       SHA256="$(printf '%s' "$hash" | tr '[:upper:]' '[:lower:]')"

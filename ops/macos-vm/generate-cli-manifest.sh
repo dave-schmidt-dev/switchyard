@@ -35,6 +35,8 @@ readonly VIBE_VERSION="2.24.5"
 readonly VIBE_SOURCE_URL="https://files.pythonhosted.org/packages/a9/53/30c20ad3726fbb7876d8aaf92a86cd0ebaa5eb84a0e3e2f1a899057ff4c2/mistral_vibe-2.24.5.tar.gz"
 
 OUT_PATH="${SCRIPT_DIR}/cli-manifest.txt"
+CLAUDE_VERSION=""
+CODEX_VERSION=""
 COPILOT_VERSION=""
 OPENCODE_VERSION=""
 WORK_DIR=""
@@ -55,13 +57,16 @@ trap cleanup EXIT
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: generate-cli-manifest.sh [--out PATH]
+Usage: generate-cli-manifest.sh --claude-version VERSION
+                                --codex-version VERSION
+                                [--out PATH]
                                 [--copilot-version VERSION]
                                 [--opencode-version VERSION]
 
-Writes the seven-row CLI manifest. npm versions default to whatever the registry
-currently publishes as `latest`; pin them explicitly to reproduce an older
-manifest. Use --out - to write to stdout instead of a file.
+Writes the seven-row CLI manifest. claude and codex versions are required.
+npm versions default to whatever the registry currently publishes as `latest`;
+pin them explicitly to reproduce an older manifest. Use --out - to write to
+stdout instead of a file.
 USAGE
 }
 
@@ -71,6 +76,16 @@ parse_args() {
       --out)
         [[ $# -ge 2 ]] || fail "--out requires a value"
         OUT_PATH="$2"
+        shift 2
+        ;;
+      --claude-version)
+        [[ $# -ge 2 ]] || fail "--claude-version requires a value"
+        CLAUDE_VERSION="$2"
+        shift 2
+        ;;
+      --codex-version)
+        [[ $# -ge 2 ]] || fail "--codex-version requires a value"
+        CODEX_VERSION="$2"
         shift 2
         ;;
       --copilot-version)
@@ -93,11 +108,22 @@ parse_args() {
         ;;
     esac
   done
+
+  [[ -n "$CLAUDE_VERSION" ]] || fail "--claude-version is required"
+  [[ "$CLAUDE_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid claude version: $CLAUDE_VERSION"
+  [[ -n "$CODEX_VERSION" ]] || fail "--codex-version is required"
+  [[ "$CODEX_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid codex version: $CODEX_VERSION"
+  [[ -z "$COPILOT_VERSION" || "$COPILOT_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid copilot version: $COPILOT_VERSION"
+  [[ -z "$OPENCODE_VERSION" || "$OPENCODE_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid opencode version: $OPENCODE_VERSION"
 }
 
 require_host_tools() {
   local tool
-  for tool in curl npm shasum; do
+  for tool in curl npm shasum python3; do
     command -v "$tool" >/dev/null 2>&1 || fail "missing host tool: $tool"
   done
 }
@@ -117,15 +143,78 @@ fetch_installer() {
   [[ -s "$destination" ]] || fail "installer download was empty: $url"
 }
 
+extract_cursor_version() {
+  local installer="$1"
+  local versions=()
+  local v
+  while IFS= read -r v; do
+    [[ -n "$v" ]] && versions+=("$v")
+  done < <(grep -o -E 'downloads\.cursor\.com/lab/[^/]+' "$installer" 2>/dev/null | sed -E 's|^downloads\.cursor\.com/lab/||' | sort -u || true)
+  if ((${#versions[@]} != 1)); then
+    fail "expected exactly one distinct cursor version in installer, found ${#versions[@]}"
+  fi
+  local version="${versions[0]}"
+  [[ "$version" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid cursor version extracted: $version"
+  printf '%s\n' "$version"
+}
+
+extract_agy_version() {
+  local installer="$1"
+  local base_url
+  base_url="$(grep -E 'DOWNLOAD_BASE_URL=' "$installer" 2>/dev/null | sed -E 's/.*DOWNLOAD_BASE_URL=["'\'']([^"'\'']+)["'\''].*/\1/' || true)"
+  [[ -n "$base_url" && "$base_url" == https://* ]] ||
+    fail "could not read DOWNLOAD_BASE_URL from agy installer"
+
+  local manifest_url="${base_url%/}/manifests/darwin_arm64.json"
+  local manifest_file="${WORK_DIR}/agy-manifest.json"
+  fetch_installer "$manifest_url" "$manifest_file"
+
+  local version
+  version="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    v = d.get("version")
+    if isinstance(v, str) and v:
+        print(v)
+    else:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+' "$manifest_file" 2>/dev/null || true)"
+
+  [[ -n "$version" && "$version" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "agy manifest version is absent or malformed"
+  printf '%s\n' "$version"
+}
+
 script_row() {
   local provider="$1" url="$2" shell="$3"
+  local version="${4:-}"
   local destination="${WORK_DIR}/${provider}.installer"
   fetch_installer "$url" "$destination"
   local hash size
   hash="$(sha256_of "$destination")"
   size="$(wc -c <"$destination" | tr -d ' ')"
-  log "${provider}: ${size} bytes from ${url}"
-  printf '%s|script|%s|%s|%s\n' "$provider" "$url" "$shell" "$hash"
+  if [[ -z "$version" ]]; then
+    case "$provider" in
+      cursor-agent)
+        version="$(extract_cursor_version "$destination")"
+        ;;
+      agy)
+        version="$(extract_agy_version "$destination")"
+        ;;
+      *)
+        fail "missing version for script provider: $provider"
+        ;;
+    esac
+  fi
+  [[ "$version" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid version for $provider: $version"
+  log "${provider}: ${size} bytes from ${url} (version ${version})"
+  printf '%s|script|%s|%s|%s|%s\n' "$provider" "$url" "$shell" "$hash" "$version"
 }
 
 resolve_npm_version() {
@@ -176,7 +265,7 @@ npm_row() {
     fail "npm pack and the registry tarball disagree for ${package}@${version}"
 
   log "${provider}: ${package}@${version} verified against the registry tarball"
-  printf '%s|npm|%s|%s|%s\n' "$provider" "$package" "$version" "$packed_hash"
+  printf '%s|npm|%s|%s|%s|%s\n' "$provider" "$package" "$version" "$packed_hash" "$version"
 }
 
 brew_row() {
@@ -184,19 +273,23 @@ brew_row() {
   local source="${WORK_DIR}/${provider}.source"
   fetch_installer "$url" "$source"
   log "${provider}: ${formula}@${version} source verified"
-  printf '%s|brew|%s|%s|%s\n' "$provider" "$formula" "$version" "$(sha256_of "$source")"
+  printf '%s|brew|%s|%s|%s|%s\n' "$provider" "$formula" "$version" "$(sha256_of "$source")" "$version"
 }
 
 emit_manifest() {
   cat <<'HEADER'
 # CLI manifest for ops/macos-vm/build-golden-image.sh --cli-manifest
 #
-# Format: provider|kind|ref|detail|sha256
-#   script rows: ref is the installer URL, detail is the interpreter, and the
-#                hash covers the downloaded installer file.
-#   npm rows:    ref is the package, detail is the pinned version, and the hash
+# Format: provider|kind|ref|detail|sha256|version
+#   script rows: ref is the installer URL, detail is the interpreter, the hash
+#                covers the downloaded installer file, and version is the pinned
+#                release version. Script rows now pin the release version, not
+#                just installer bytes.
+#   npm rows:    ref is the package, detail is the pinned version, the hash
 #                covers the `npm pack` tarball -- which is the registry's own
-#                published tarball, byte for byte.
+#                published tarball, byte for byte -- and version equals detail.
+#   brew rows:   ref is the formula, detail is the pinned version, the hash
+#                covers the formula source archive, and version equals detail.
 #
 # GENERATED BY generate-cli-manifest.sh. Do not hand-edit a hash. If the build
 # fails its in-guest shasum check, the vendor changed the artifact: regenerate,
@@ -208,8 +301,8 @@ emit_manifest() {
 # checkable against the public registry.
 HEADER
   printf '\n'
-  script_row claude "$CLAUDE_URL" bash
-  script_row codex "$CODEX_URL" bash
+  script_row claude "$CLAUDE_URL" bash "$CLAUDE_VERSION"
+  script_row codex "$CODEX_URL" bash "$CODEX_VERSION"
   script_row agy "$AGY_URL" bash
   script_row cursor-agent "$CURSOR_URL" bash
   npm_row copilot "$COPILOT_PACKAGE" "$COPILOT_VERSION"

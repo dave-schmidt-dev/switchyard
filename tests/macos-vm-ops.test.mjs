@@ -41,6 +41,7 @@ import {
 	chmodSync,
 	constants,
 	existsSync,
+	mkdirSync,
 	readdirSync,
 	readFileSync,
 	writeFileSync,
@@ -94,8 +95,9 @@ const readManifestRows = () =>
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0 && !line.startsWith("#"))
 		.map((line) => {
-			const [provider, kind, ref, detail, hash, ...rest] = line.split("|");
-			return { provider, kind, ref, detail, hash, rest, line };
+			const [provider, kind, ref, detail, hash, version, ...rest] =
+				line.split("|");
+			return { provider, kind, ref, detail, hash, version, rest, line };
 		});
 
 // Pulls a top-level `name() { ... }` block out of a shell script by matching
@@ -512,6 +514,276 @@ describe("macOS golden-image ops artifacts", () => {
 			"a stdin-reading xcodegen ate the probe's remaining lines, so the check silently never ran",
 		);
 	});
+
+	it("renders guest install script passing pinned version to claude and codex installers", () => {
+		const rendered = renderBuildGuestScripts(scratch());
+		const block = rendered.find((entry) =>
+			entry.body.includes("install_script_cli"),
+		);
+		ok(block, "no guest block contains install_script_cli");
+		ok(
+			/\/bin\/bash\s+"\$installer"\s+"\$version"/.test(block.body),
+			"claude installer does not receive version as its first positional argument",
+		);
+		// sudo -iu resets the environment, so the non-interactive flag has to
+		// ride on the installer's own command line.
+		ok(
+			block.body.includes(
+				'CODEX_NON_INTERACTIVE=1 /bin/bash "$installer" --release "$version"',
+			),
+			"codex installer does not run non-interactively with version via --release",
+		);
+	});
+
+	it(
+		"in-guest version check accepts exact shapes, rejects mismatch and substring trap",
+		notDarwin,
+		() => {
+			const rendered = renderBuildGuestScripts(scratch());
+			const block = rendered.find(
+				(entry) =>
+					entry.body.includes("extract_cli_version") &&
+					entry.body.includes("verify_cli_versions"),
+			);
+			ok(
+				block,
+				"no guest block carries extract_cli_version and verify_cli_versions",
+			);
+			const dir = scratch();
+			const binDir = join(dir, "bin");
+			mkdirSync(binDir);
+
+			const extractCliVersion = extractShellFunction(
+				block.body,
+				"extract_cli_version",
+			);
+			const verifyCliVersions = extractShellFunction(
+				block.body,
+				"verify_cli_versions",
+			);
+
+			const makeCli = (name, stdout, dir = binDir) => {
+				const path = join(dir, name);
+				writeFileSync(
+					path,
+					`#!/bin/bash\nprintf '%s\\n' ${JSON.stringify(stdout)}\n`,
+				);
+				chmodSync(path, 0o755);
+			};
+
+			// 1. Verify copilot extracts 1.0.87 specifically
+			makeCli(
+				"copilot",
+				"GitHub Copilot CLI 1.0.87. Run 'copilot update' to check for updates.",
+			);
+			const harnessCopilot = join(dir, "copilot_extract.sh");
+			writeFileSync(
+				harnessCopilot,
+				[
+					"#!/bin/bash",
+					"set -Eeuo pipefail",
+					extractCliVersion,
+					'extract_cli_version "$(copilot --version 2>&1 || true)"',
+				].join("\n"),
+			);
+			const runCopilot = spawnSync("/bin/bash", [harnessCopilot], {
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+			});
+			strictEqual(
+				runCopilot.status,
+				0,
+				`copilot extraction failed: ${runCopilot.stderr}`,
+			);
+			strictEqual(
+				runCopilot.stdout.trim(),
+				"1.0.87",
+				"copilot version token must be 1.0.87",
+			);
+
+			// 2. Set up fake CLIs for each of the 7 providers covering all output shapes.
+			// The versions below mirror cli-manifest.txt on purpose: the exact-match
+			// run checks them against the committed manifest, so a manifest refresh
+			// must update this table in the same change.
+			const shapes = {
+				claude: "2.1.280 (Claude Code)",
+				codex: "codex-cli 0.155.1",
+				agy: "1.2.8",
+				"cursor-agent": "2026.09.18-9a7762b",
+				copilot:
+					"GitHub Copilot CLI 1.0.87. Run 'copilot update' to check for updates.",
+				opencode: "1.18.30",
+				vibe: "vibe 2.24.5",
+			};
+			for (const [provider, output] of Object.entries(shapes)) {
+				makeCli(provider, output);
+			}
+
+			// Exact match pass: using committed MANIFEST
+			const harness = join(dir, "verify_harness.sh");
+			writeFileSync(
+				harness,
+				[
+					"#!/bin/bash",
+					"set -Eeuo pipefail",
+					extractCliVersion,
+					verifyCliVersions,
+					'verify_cli_versions "$1"',
+				].join("\n"),
+			);
+
+			const runGood = spawnSync("/bin/bash", [harness, MANIFEST], {
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+			});
+			strictEqual(
+				runGood.status,
+				0,
+				`exact match check failed: ${runGood.stderr}`,
+			);
+			for (const provider of REQUIRED_PROVIDERS) {
+				ok(
+					runGood.stderr.includes(`[guest] verifying ${provider} --version`),
+					`no progress line before checking ${provider}: ${runGood.stderr}`,
+				);
+			}
+
+			// Mismatched release failure
+			const badManifest = join(dir, "bad-manifest.txt");
+			writeFileSync(
+				badManifest,
+				readFileSync(MANIFEST, "utf8").replaceAll("2.24.5", "2.24.4"),
+			);
+			const runMismatch = spawnSync("/bin/bash", [harness, badManifest], {
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+			});
+			strictEqual(
+				runMismatch.status,
+				1,
+				`mismatch unexpectedly passed: ${runMismatch.stdout}`,
+			);
+			ok(
+				runMismatch.stderr.includes(
+					"[guest] ERROR: vibe reports version 2.24.5, manifest pins 2.24.4 (raw: vibe 2.24.5)",
+				),
+				`unexpected stderr on mismatch: ${runMismatch.stderr}`,
+			);
+
+			// 2.1.28 vs 2.1.280 substring trap
+			const substringManifest = join(dir, "substring-manifest.txt");
+			writeFileSync(
+				substringManifest,
+				readFileSync(MANIFEST, "utf8").replace("2.1.280", "2.1.28"),
+			);
+			const runSubstring = spawnSync(
+				"/bin/bash",
+				[harness, substringManifest],
+				{
+					encoding: "utf8",
+					env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+				},
+			);
+			strictEqual(
+				runSubstring.status,
+				1,
+				`substring trap passed: ${runSubstring.stdout}`,
+			);
+			ok(
+				runSubstring.stderr.includes(
+					"[guest] ERROR: claude reports version 2.1.280, manifest pins 2.1.28",
+				),
+				`unexpected stderr on substring trap: ${runSubstring.stderr}`,
+			);
+
+			// The cases below run on a PATH that cannot reach CLIs installed on
+			// the host, so a missing fake cannot be masked by a real binary.
+			const isolatedEnv = (label, { omit = [], scripts = {} } = {}) => {
+				const isolatedBin = join(dir, label);
+				mkdirSync(isolatedBin);
+				for (const [provider, output] of Object.entries(shapes)) {
+					if (!omit.includes(provider)) makeCli(provider, output, isolatedBin);
+				}
+				for (const [provider, body] of Object.entries(scripts)) {
+					const path = join(isolatedBin, provider);
+					writeFileSync(path, `#!/bin/bash\n${body}\n`);
+					chmodSync(path, 0o755);
+				}
+				return { ...process.env, PATH: `${isolatedBin}:/usr/bin:/bin` };
+			};
+
+			// A pinned provider missing from PATH fails, after its progress line.
+			const runAbsent = spawnSync("/bin/bash", [harness, MANIFEST], {
+				encoding: "utf8",
+				env: isolatedEnv("absent-bin", { omit: ["cursor-agent"] }),
+			});
+			strictEqual(
+				runAbsent.status,
+				1,
+				`absent CLI unexpectedly passed: ${runAbsent.stderr}`,
+			);
+			ok(
+				runAbsent.stderr.includes(
+					"[guest] ERROR: pinned CLI is absent after installation: cursor-agent",
+				),
+				`unexpected stderr on absent CLI: ${runAbsent.stderr}`,
+			);
+			ok(
+				runAbsent.stderr.includes("[guest] verifying cursor-agent --version"),
+				`no progress line before the absent CLI: ${runAbsent.stderr}`,
+			);
+
+			// Output with no version token fails with the first raw line only.
+			// Written to stderr with a non-zero exit, so it also proves the check
+			// captures 2>&1 and survives a failing --version.
+			const runUnparseable = spawnSync("/bin/bash", [harness, MANIFEST], {
+				encoding: "utf8",
+				env: isolatedEnv("unparseable-bin", {
+					scripts: {
+						agy: "printf '%s\\n' 'error: unknown flag --version' 'usage: agy [flags]' >&2\nexit 2",
+					},
+				}),
+			});
+			strictEqual(
+				runUnparseable.status,
+				1,
+				`unparseable version unexpectedly passed: ${runUnparseable.stderr}`,
+			);
+			ok(
+				runUnparseable.stderr.includes(
+					"[guest] ERROR: agy reports no parseable version, manifest pins 1.2.8 (raw: error: unknown flag --version)",
+				),
+				`unexpected stderr on unparseable version: ${runUnparseable.stderr}`,
+			);
+			ok(
+				!runUnparseable.stderr.includes("usage: agy"),
+				`raw excerpt went past the first line: ${runUnparseable.stderr}`,
+			);
+
+			// The loop reads the manifest on stdin. A CLI that drains stdin must
+			// not swallow the remaining rows and turn a mismatch into a pass.
+			const runDrain = spawnSync("/bin/bash", [harness, badManifest], {
+				encoding: "utf8",
+				env: isolatedEnv("drain-bin", {
+					scripts: {
+						claude:
+							"/bin/cat >/dev/null\nprintf '%s\\n' '2.1.280 (Claude Code)'",
+					},
+				}),
+			});
+			strictEqual(
+				runDrain.status,
+				1,
+				`a stdin-reading CLI hid the vibe mismatch: ${runDrain.stderr}`,
+			);
+			ok(
+				runDrain.stderr.includes(
+					"[guest] ERROR: vibe reports version 2.24.5, manifest pins 2.24.4",
+				),
+				`unexpected stderr with a stdin-reading CLI: ${runDrain.stderr}`,
+			);
+		},
+	);
 });
 
 describe("the pinned CLI manifest", () => {
@@ -557,16 +829,23 @@ describe("the pinned CLI manifest", () => {
 		}
 	});
 
-	it("carries a full sha256 on every row and a version on every npm row", () => {
+	it("carries a full sha256 and release version on every row", () => {
 		for (const row of readManifestRows()) {
 			strictEqual(row.rest.length, 0, `trailing field: ${row.line}`);
 			ok(/^[0-9a-f]{64}$/.test(row.hash), `not a sha256: ${row.line}`);
+			ok(
+				/^[0-9][0-9A-Za-z.+_-]*$/.test(row.version),
+				`bad version: ${row.line}`,
+			);
 			if (row.kind === "npm" || row.kind === "brew") {
-				// The npm rows are the only version-pinned ones; the script refs
-				// are unversioned endpoints held in place by the hash alone.
 				ok(
 					/^[0-9][0-9A-Za-z.+_-]*$/.test(row.detail),
-					`bad version: ${row.line}`,
+					`bad version detail: ${row.line}`,
+				);
+				strictEqual(
+					row.version,
+					row.detail,
+					`version must equal detail: ${row.line}`,
 				);
 			} else {
 				strictEqual(row.kind, "script");
@@ -582,6 +861,60 @@ describe("the pinned CLI manifest", () => {
 		}
 	});
 
+	it(
+		"validator rejects a five-field row and an npm version mismatch",
+		notDarwin,
+		() => {
+			const body = readFileSync(BUILD, "utf8");
+			const validate = (manifestContent) => {
+				const dir = scratch();
+				const manifestPath = join(dir, "cli-manifest.txt");
+				writeFileSync(manifestPath, manifestContent);
+				const harness = join(dir, "validate.sh");
+				writeFileSync(
+					harness,
+					[
+						"#!/bin/bash",
+						"set -Eeuo pipefail",
+						'readonly SCRIPT_NAME="validator-harness"',
+						extractShellFunction(body, "log"),
+						extractShellFunction(body, "fail"),
+						extractShellFunction(body, "validate_cli_manifest"),
+						`CLI_MANIFEST=${JSON.stringify(manifestPath)}`,
+						"validate_cli_manifest",
+					].join("\n"),
+				);
+				return spawnSync("bash", [harness], { encoding: "utf8" });
+			};
+
+			const goodManifest = readFileSync(MANIFEST, "utf8");
+
+			// Five-field row (missing sixth column)
+			const fiveField = goodManifest.replace(
+				/^(claude\|script\|[^|]+\|[^|]+\|[^|]+)\|.*$/m,
+				"$1",
+			);
+			const rFive = validate(fiveField);
+			strictEqual(
+				rFive.status,
+				1,
+				`validator accepted 5-field row: ${rFive.stdout}`,
+			);
+
+			// npm row whose version differs from detail
+			const npmMismatch = goodManifest.replace(
+				/^(opencode\|npm\|opencode-ai\|[0-9.]+)\|([0-9a-f]{64})\|([0-9.]+)$/m,
+				"$1|$2|999.999.999",
+			);
+			const rMismatch = validate(npmMismatch);
+			strictEqual(
+				rMismatch.status,
+				1,
+				`validator accepted npm version mismatch: ${rMismatch.stdout}`,
+			);
+		},
+	);
+
 	it("is generated, and says so, so no one hand-edits a hash", () => {
 		const header = readFileSync(MANIFEST, "utf8");
 		ok(/GENERATED BY generate-cli-manifest\.sh/.test(header));
@@ -596,6 +929,105 @@ describe("the pinned CLI manifest", () => {
 		ok(
 			/\[\[ "\$packed_hash" == "\$registry_hash" \]\] \|\|/.test(body),
 			"generator no longer compares the packed and registry tarballs",
+		);
+	});
+
+	it("generator requires --claude-version and --codex-version before network access", () => {
+		const rNoClaude = spawnSync(
+			"/bin/bash",
+			[GENERATOR, "--codex-version", "0.155.1"],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: "/nonexistent" },
+			},
+		);
+		strictEqual(rNoClaude.status, 1);
+		ok(rNoClaude.stderr.includes("--claude-version is required"));
+
+		const rNoCodex = spawnSync(
+			"/bin/bash",
+			[GENERATOR, "--claude-version", "2.1.280"],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: "/nonexistent" },
+			},
+		);
+		strictEqual(rNoCodex.status, 1);
+		ok(rNoCodex.stderr.includes("--codex-version is required"));
+
+		const rBadPattern = spawnSync(
+			"/bin/bash",
+			[
+				GENERATOR,
+				"--claude-version",
+				"bad/version",
+				"--codex-version",
+				"0.155.1",
+			],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: "/nonexistent" },
+			},
+		);
+		strictEqual(rBadPattern.status, 1);
+		ok(rBadPattern.stderr.includes("invalid claude version"));
+	});
+
+	it("cursor version extraction behavior: one version passes, zero or two fail", () => {
+		const genBody = readFileSync(GENERATOR, "utf8");
+		const dir = scratch();
+		const extractCursorVersion = extractShellFunction(
+			genBody,
+			"extract_cursor_version",
+		);
+		const harness = join(dir, "cursor_extract.sh");
+		writeFileSync(
+			harness,
+			[
+				"#!/bin/bash",
+				"set -Eeuo pipefail",
+				'fail() { printf "FAIL: %s\\n" "$*" >&2; exit 1; }',
+				extractCursorVersion,
+				'extract_cursor_version "$1"',
+			].join("\n"),
+		);
+
+		const oneFile = join(dir, "one.sh");
+		writeFileSync(
+			oneFile,
+			"curl -s https://downloads.cursor.com/lab/2026.09.18-9a7762b/darwin-arm64\n" +
+				"curl -s https://downloads.cursor.com/lab/2026.09.18-9a7762b/darwin-x64\n",
+		);
+		const rOne = spawnSync("/bin/bash", [harness, oneFile], {
+			encoding: "utf8",
+		});
+		strictEqual(rOne.status, 0, `one version failed: ${rOne.stderr}`);
+		strictEqual(rOne.stdout.trim(), "2026.09.18-9a7762b");
+
+		const zeroFile = join(dir, "zero.sh");
+		writeFileSync(zeroFile, "echo 'no version url here'\n");
+		const rZero = spawnSync("/bin/bash", [harness, zeroFile], {
+			encoding: "utf8",
+		});
+		strictEqual(
+			rZero.status,
+			1,
+			`zero versions unexpectedly succeeded: ${rZero.stdout}`,
+		);
+
+		const twoFile = join(dir, "two.sh");
+		writeFileSync(
+			twoFile,
+			"curl -s https://downloads.cursor.com/lab/1.0.0/darwin-arm64\n" +
+				"curl -s https://downloads.cursor.com/lab/2.0.0/darwin-arm64\n",
+		);
+		const rTwo = spawnSync("/bin/bash", [harness, twoFile], {
+			encoding: "utf8",
+		});
+		strictEqual(
+			rTwo.status,
+			1,
+			`two versions unexpectedly succeeded: ${rTwo.stdout}`,
 		);
 	});
 });

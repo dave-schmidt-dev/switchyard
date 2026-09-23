@@ -84,7 +84,10 @@ function fixture({
 	writeFileSync(statePath, state);
 	writeFileSync(log, "");
 	writeFileSync(guest, "");
-	writeFileSync(manifest, `opencode|npm|opencode-ai|${VERSION}|${SHA256}\n`);
+	writeFileSync(
+		manifest,
+		`opencode|npm|opencode-ai|${VERSION}|${SHA256}|${VERSION}\n`,
+	);
 	writeFileSync(join(dir, "prlctl"), mockPrlctl);
 	writeFileSync(sleep, "#!/bin/bash\nexit 0\n");
 	chmodSync(join(dir, "prlctl"), 0o755);
@@ -156,10 +159,12 @@ describe("update-opencode-cli.sh", () => {
 
 	it("rejects manifests without exactly one valid OpenCode npm row", () => {
 		for (const contents of [
-			`copilot|npm|@github/copilot|1.0.80|${"b".repeat(64)}\n`,
-			`opencode|npm|other-package|1.18.30|${SHA256}\n`,
-			`opencode|npm|opencode-ai|1.18.30|${SHA256}\n` +
-				`opencode|npm|opencode-ai|1.18.30|${SHA256}\n`,
+			`copilot|npm|@github/copilot|1.0.80|${"b".repeat(64)}|1.0.80\n`,
+			`opencode|npm|other-package|1.18.30|${SHA256}|1.18.30\n`,
+			`opencode|npm|opencode-ai|1.18.30|${SHA256}\n`,
+			`opencode|npm|opencode-ai|1.18.30|${SHA256}|1.18.31\n`,
+			`opencode|npm|opencode-ai|1.18.30|${SHA256}|1.18.30\n` +
+				`opencode|npm|opencode-ai|1.18.30|${SHA256}|1.18.30\n`,
 		]) {
 			const f = fixture();
 			writeFileSync(f.manifest, contents);

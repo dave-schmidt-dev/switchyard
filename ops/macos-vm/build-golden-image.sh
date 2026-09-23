@@ -162,13 +162,13 @@ parse_args() {
 }
 
 validate_cli_manifest() {
-  local line provider kind ref detail hash extra
+  local line provider kind ref detail hash version extra
   local seen=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" == \#* ]] && continue
-    IFS='|' read -r provider kind ref detail hash extra <<<"$line"
-    [[ -n "$provider" && -n "$kind" && -n "$ref" && -n "$detail" && -n "$hash" && -z "${extra:-}" ]] ||
-      fail "invalid CLI manifest row (expected provider|kind|ref|detail|sha256): $line"
+    IFS='|' read -r provider kind ref detail hash version extra <<<"$line"
+    [[ -n "$provider" && -n "$kind" && -n "$ref" && -n "$detail" && -n "$hash" && -n "$version" && -z "${extra:-}" ]] ||
+      fail "invalid CLI manifest row (expected provider|kind|ref|detail|sha256|version): $line"
     [[ " $seen " != *" $provider "* ]] || fail "duplicate CLI manifest provider: $provider"
     seen+=" $provider"
     case "$provider:$kind" in
@@ -194,6 +194,12 @@ validate_cli_manifest() {
     esac
     [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] ||
       fail "CLI manifest hash must be a 64-character SHA-256: $provider"
+    [[ "$version" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+      fail "CLI manifest version is unsafe: $provider"
+    if [[ "$kind" == npm || "$kind" == brew ]]; then
+      [[ "$version" == "$detail" ]] ||
+        fail "CLI manifest $kind version must match detail: $provider"
+    fi
   done < "$CLI_MANIFEST"
 
   local expected
@@ -594,16 +600,24 @@ tmp_dir="\$(/usr/bin/mktemp -d "\$HOME/.switchyard-cli.XXXXXX")"
 trap '/bin/rm -rf "\$tmp_dir"' EXIT
 
 install_script_cli() {
-  local provider="\$1" url="\$2" shell="\$3" expected="\$4"
+  local provider="\$1" url="\$2" shell="\$3" expected="\$4" version="\$5"
   local installer="\$tmp_dir/\$provider-installer"
   /usr/bin/curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \\
     --output "\$installer" "\$url"
   printf '%s  %s\\n' "\$expected" "\$installer" | /usr/bin/shasum -a 256 -c - >/dev/null
   /bin/chmod 700 "\$installer"
-  case "\$shell" in
-    bash) /bin/bash "\$installer" >/dev/null ;;
-    sh) /bin/sh "\$installer" >/dev/null ;;
-    *) printf '[guest] ERROR: invalid installer shell for %s\\n' "\$provider" >&2; exit 1 ;;
+  case "\$provider" in
+    claude)
+      /bin/bash "\$installer" "\$version" >/dev/null
+      ;;
+    codex) CODEX_NON_INTERACTIVE=1 /bin/bash "\$installer" --release "\$version" >/dev/null ;;
+    *)
+      case "\$shell" in
+        bash) /bin/bash "\$installer" >/dev/null ;;
+        sh) /bin/sh "\$installer" >/dev/null ;;
+        *) printf '[guest] ERROR: invalid installer shell for %s\\n' "\$provider" >&2; exit 1 ;;
+      esac
+      ;;
   esac
 }
 
@@ -631,31 +645,69 @@ install_brew_cli() {
   /usr/bin/curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "\$source" "\$url"
   printf '%s  %s\\n' "\$expected" "\$source" | /usr/bin/shasum -a 256 -c - >/dev/null
   /opt/homebrew/bin/brew install "\$formula" >/dev/null
-  /opt/homebrew/bin/vibe --version | /usr/bin/grep -Fq "\$version" || {
-    printf '[guest] ERROR: %s did not install expected version %s\\n' "\$provider" "\$version" >&2
-    exit 1
-  }
 }
 
-while IFS='|' read -r provider kind ref detail expected extra; do
+# Reads the raw \`--version\` text from \$1 and prints the version token, or
+# nothing. awk consumes all of its input, so the pipe cannot SIGPIPE printf.
+extract_cli_version() {
+  local raw="\$1"
+  printf '%s\\n' "\$raw" | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        w = \$i
+        sub(/[^0-9A-Za-z]+$/, "", w)
+        if (ver == "" && w ~ /^[0-9][0-9A-Za-z.+_-]*$/) {
+          ver = w
+        }
+      }
+    }
+    END {
+      if (ver != "") print ver
+    }
+  '
+}
+
+verify_cli_versions() {
+  local manifest="\$1"
+  local provider kind ref detail expected version extra
+  local raw raw_first actual
+  while IFS='|' read -r provider kind ref detail expected version extra; do
+    [[ -z "\${provider:-}" || "\$provider" == \#* ]] && continue
+    printf '[guest] verifying %s --version\\n' "\$provider" >&2
+    command -v "\$provider" >/dev/null 2>&1 || {
+      printf '[guest] ERROR: pinned CLI is absent after installation: %s\\n' "\$provider" >&2
+      exit 1
+    }
+    # stdin is the manifest; a CLI that reads it would silently skip later rows.
+    raw="\$("\$provider" --version </dev/null 2>&1 || true)"
+    raw_first="\${raw%%\$'\\n'*}"
+    actual="\$(extract_cli_version "\$raw")"
+    if [[ -z "\$actual" ]]; then
+      printf '[guest] ERROR: %s reports no parseable version, manifest pins %s (raw: %s)\\n' "\$provider" "\$version" "\$raw_first" >&2
+      exit 1
+    fi
+    if [[ "\$actual" != "\$version" ]]; then
+      printf '[guest] ERROR: %s reports version %s, manifest pins %s (raw: %s)\\n' "\$provider" "\$actual" "\$version" "\$raw_first" >&2
+      exit 1
+    fi
+  done < "\$manifest"
+}
+
+while IFS='|' read -r provider kind ref detail expected version extra; do
   [[ -z "\${provider:-}" || "\$provider" == \#* ]] && continue
-  [[ -z "\${extra:-}" && "\$expected" =~ ^[0-9a-fA-F]{64}$ ]] || {
+  [[ -n "\${provider:-}" && -n "\${kind:-}" && -n "\${ref:-}" && -n "\${detail:-}" && -n "\${expected:-}" && -n "\${version:-}" && -z "\${extra:-}" && "\$expected" =~ ^[0-9a-fA-F]{64}$ ]] || {
     printf '[guest] ERROR: malformed pinned CLI manifest row\\n' >&2
     exit 1
   }
   case "\$kind" in
-    script) install_script_cli "\$provider" "\$ref" "\$detail" "\$expected" ;;
+    script) install_script_cli "\$provider" "\$ref" "\$detail" "\$expected" "\$version" ;;
     npm) install_npm_cli "\$provider" "\$ref" "\$detail" "\$expected" ;;
     brew) install_brew_cli "\$provider" "\$ref" "\$detail" "\$expected" ;;
     *) printf '[guest] ERROR: unsupported pinned CLI kind: %s\\n' "\$kind" >&2; exit 1 ;;
   esac
 done < "\$manifest_path"
-for provider in claude codex agy cursor-agent copilot opencode vibe; do
-  command -v "\$provider" >/dev/null 2>&1 || {
-    printf '[guest] ERROR: pinned CLI is absent after installation: %s\\n' "\$provider" >&2
-    exit 1
-  }
-done
+
+verify_cli_versions "\$manifest_path"
 INSTALL_SCRIPT
 # The CLIs land in the provider's ~/.local/bin, which is not on a default macOS
 # login PATH. The installer heredoc above exports that directory itself, so its
