@@ -1269,6 +1269,45 @@ export async function executeProviderInvocation(command, args, options = {}) {
 	});
 }
 
+const PRLCTL_LOST_RESULT_SIGNATURE =
+	/^PrlJob_(?:GetRetCode|GetResult): Invalid argument(?:\. An invalid argument was passed\.)?\r?\n?$/u;
+
+function extractChildProcessStderr(value) {
+	if (typeof value === "string") return value;
+	if (Buffer.isBuffer(value)) return value.toString("utf8");
+	return "";
+}
+
+function isParallelsLostResultAsync(result) {
+	return (
+		result?.code === 255 &&
+		result?.signal === null &&
+		!result?.timedOut &&
+		!result?.cancelled &&
+		!result?.cleanupFailed &&
+		PRLCTL_LOST_RESULT_SIGNATURE.test(extractChildProcessStderr(result?.stderr))
+	);
+}
+
+function isParallelsLostResultSync(error) {
+	if (
+		error?.status !== 255 ||
+		error?.signal != null ||
+		error?.code === "ETIMEDOUT" ||
+		error?.killed === true ||
+		error?.message === "diff capture deadline exhausted"
+	) {
+		return false;
+	}
+	const stderr =
+		error?.stderr != null
+			? extractChildProcessStderr(error.stderr)
+			: typeof error?.message === "string"
+				? error.message
+				: "";
+	return PRLCTL_LOST_RESULT_SIGNATURE.test(stderr);
+}
+
 /**
  * Capture a working-container diff without blocking the host event loop.
  * Both git operations use the shared supervised process lifecycle, allowing
@@ -1335,7 +1374,11 @@ export async function captureProviderDiffDetailedAsync(
 				phase: "execution",
 				event,
 				stage,
-				status: `${stage} ${event.endsWith("started") ? "started" : event.endsWith("completed") ? "completed" : "failed"}`,
+				...(event === "diff_capture_probe_recovered" ? { mode: "replay" } : {}),
+				status:
+					event === "diff_capture_probe_recovered"
+						? `${stage} recovered from a Parallels lost result`
+						: `${stage} ${event.endsWith("started") ? "started" : event.endsWith("completed") ? "completed" : "failed"}`,
 			});
 		} catch {
 			// Telemetry cannot alter capture.
@@ -1383,20 +1426,50 @@ export async function captureProviderDiffDetailedAsync(
 		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
 		return { status: "timed_out", diff: null };
 	}
-	const add = await runProviderProcess(stage.command, stage.args, {
+	let add = await runProviderProcess(stage.command, stage.args, {
 		...lifecycle,
 		timeoutMs: addTimeoutMs,
 		cleanup: captureCleanup(stage.command, stage.args),
 	});
+	if (!add.success && isParallelsLostResultAsync(add)) {
+		emitCaptureStatus("diff_capture_probe_recovered", "diff_stage");
+		let replayTimeoutMs;
+		try {
+			replayTimeoutMs = remainingMs();
+		} catch {
+			emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
+			return { status: "timed_out", diff: null };
+		}
+		let replayStage;
+		try {
+			replayStage = getWorkspaceExecution(workingContainerName, {
+				...options,
+				cleanupContext: markerContext(cleanupContext, "helper"),
+				recordPid: true,
+				argv: ["git", "add", "-A"],
+			});
+		} catch {
+			emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
+			return { status: "transport_failed", diff: null };
+		}
+		add = await runProviderProcess(replayStage.command, replayStage.args, {
+			...lifecycle,
+			timeoutMs: replayTimeoutMs,
+			cleanup: captureCleanup(replayStage.command, replayStage.args),
+		});
+	}
 	if (!add.success) {
 		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
 		return {
 			status: add.timedOut
 				? "timed_out"
-				: add.error
+				: add.error || isParallelsLostResultAsync(add)
 					? "transport_failed"
 					: "stage_failed",
 			diff: null,
+			...(isParallelsLostResultAsync(add)
+				? { reasonCode: "prlctl_job_misfire" }
+				: {}),
 		};
 	}
 	emitCaptureStatus("diff_capture_probe_completed", "diff_stage");
@@ -1441,20 +1514,50 @@ export async function captureProviderDiffDetailedAsync(
 		emitCaptureStatus("diff_capture_probe_failed", "diff_export");
 		return { status: "timed_out", diff: null };
 	}
-	const diff = await runProviderProcess(capture.command, capture.args, {
+	let diff = await runProviderProcess(capture.command, capture.args, {
 		...lifecycle,
 		timeoutMs: diffTimeoutMs,
 		cleanup: captureCleanup(capture.command, capture.args),
 	});
+	if (!diff.success && isParallelsLostResultAsync(diff)) {
+		emitCaptureStatus("diff_capture_probe_recovered", "diff_export");
+		let replayTimeoutMs;
+		try {
+			replayTimeoutMs = remainingMs();
+		} catch {
+			emitCaptureStatus("diff_capture_probe_failed", "diff_export");
+			return { status: "timed_out", diff: null };
+		}
+		let replayCapture;
+		try {
+			replayCapture = getWorkspaceExecution(workingContainerName, {
+				...options,
+				cleanupContext: markerContext(cleanupContext, "helper"),
+				recordPid: true,
+				argv: ["git", "diff", "--cached", taskBase.tree],
+			});
+		} catch {
+			emitCaptureStatus("diff_capture_probe_failed", "diff_export");
+			return { status: "transport_failed", diff: null };
+		}
+		diff = await runProviderProcess(replayCapture.command, replayCapture.args, {
+			...lifecycle,
+			timeoutMs: replayTimeoutMs,
+			cleanup: captureCleanup(replayCapture.command, replayCapture.args),
+		});
+	}
 	if (!diff.success) {
 		emitCaptureStatus("diff_capture_probe_failed", "diff_export");
 		return {
 			status: diff.timedOut
 				? "timed_out"
-				: diff.error
+				: diff.error || isParallelsLostResultAsync(diff)
 					? "transport_failed"
 					: "diff_failed",
 			diff: null,
+			...(isParallelsLostResultAsync(diff)
+				? { reasonCode: "prlctl_job_misfire" }
+				: {}),
 		};
 	}
 	emitCaptureStatus("diff_capture_probe_completed", "diff_export");
@@ -1490,7 +1593,11 @@ export function captureProviderDiffDetailed(
 				phase: "execution",
 				event,
 				stage,
-				status: `${stage} ${event.endsWith("started") ? "started" : event.endsWith("completed") ? "completed" : "failed"}`,
+				...(event === "diff_capture_probe_recovered" ? { mode: "replay" } : {}),
+				status:
+					event === "diff_capture_probe_recovered"
+						? `${stage} recovered from a Parallels lost result`
+						: `${stage} ${event.endsWith("started") ? "started" : event.endsWith("completed") ? "completed" : "failed"}`,
 			});
 		} catch {
 			// Telemetry cannot alter capture.
@@ -1514,22 +1621,43 @@ export function captureProviderDiffDetailed(
 			recordPid: true,
 			argv: ["git", "add", "-A"],
 		});
-		execFileSync(stage.command, stage.args, {
-			stdio: "pipe",
-			timeout: remainingMs(),
-			killSignal: "SIGKILL",
-			signal: options.signal,
-		});
+		try {
+			execFileSync(stage.command, stage.args, {
+				stdio: "pipe",
+				timeout: remainingMs(),
+				killSignal: "SIGKILL",
+				signal: options.signal,
+			});
+		} catch (error) {
+			if (!isParallelsLostResultSync(error)) throw error;
+			emitCaptureStatus("diff_capture_probe_recovered", "diff_stage");
+			const replayTimeoutMs = remainingMs();
+			const replayStage = getWorkspaceExecution(workingContainerName, {
+				...options,
+				cleanupContext: markerContext(options.cleanupContext, "helper"),
+				recordPid: true,
+				argv: ["git", "add", "-A"],
+			});
+			execFileSync(replayStage.command, replayStage.args, {
+				stdio: "pipe",
+				timeout: replayTimeoutMs,
+				killSignal: "SIGKILL",
+				signal: options.signal,
+			});
+		}
 		emitCaptureStatus("diff_capture_probe_completed", "diff_stage");
 	} catch (error) {
 		emitCaptureStatus("diff_capture_probe_failed", "diff_stage");
 		return {
 			status: timedOut(error)
 				? "timed_out"
-				: error?.status == null
+				: error?.status == null || isParallelsLostResultSync(error)
 					? "transport_failed"
 					: "stage_failed",
 			diff: null,
+			...(isParallelsLostResultSync(error)
+				? { reasonCode: "prlctl_job_misfire" }
+				: {}),
 		};
 	}
 	try {
@@ -1562,13 +1690,33 @@ export function captureProviderDiffDetailed(
 			recordPid: true,
 			argv: ["git", "diff", "--cached", options.taskBase.tree],
 		});
-		const diff = execFileSync(capture.command, capture.args, {
-			encoding: "utf8",
-			stdio: "pipe",
-			timeout: remainingMs(),
-			killSignal: "SIGKILL",
-			signal: options.signal,
-		});
+		let diff;
+		try {
+			diff = execFileSync(capture.command, capture.args, {
+				encoding: "utf8",
+				stdio: "pipe",
+				timeout: remainingMs(),
+				killSignal: "SIGKILL",
+				signal: options.signal,
+			});
+		} catch (error) {
+			if (!isParallelsLostResultSync(error)) throw error;
+			emitCaptureStatus("diff_capture_probe_recovered", "diff_export");
+			const replayTimeoutMs = remainingMs();
+			const replayCapture = getWorkspaceExecution(workingContainerName, {
+				...options,
+				cleanupContext: markerContext(options.cleanupContext, "helper"),
+				recordPid: true,
+				argv: ["git", "diff", "--cached", options.taskBase.tree],
+			});
+			diff = execFileSync(replayCapture.command, replayCapture.args, {
+				encoding: "utf8",
+				stdio: "pipe",
+				timeout: replayTimeoutMs,
+				killSignal: "SIGKILL",
+				signal: options.signal,
+			});
+		}
 		emitCaptureStatus("diff_capture_probe_completed", "diff_export");
 		return /\S/u.test(diff)
 			? { status: "captured", diff }
@@ -1578,10 +1726,13 @@ export function captureProviderDiffDetailed(
 		return {
 			status: timedOut(error)
 				? "timed_out"
-				: error?.status == null
+				: error?.status == null || isParallelsLostResultSync(error)
 					? "transport_failed"
 					: "diff_failed",
 			diff: null,
+			...(isParallelsLostResultSync(error)
+				? { reasonCode: "prlctl_job_misfire" }
+				: {}),
 		};
 	}
 }
