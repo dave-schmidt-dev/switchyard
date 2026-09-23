@@ -1,6 +1,7 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
 	existsSync,
 	mkdirSync,
@@ -18,6 +19,7 @@ import { readEvents, readRun } from "../src/switchyard/run-store/index.mjs";
 import {
 	assessSimpleRecoveryEvidence,
 	buildSimpleProviderInvocation,
+	defaultExecuteProvider,
 	parseSimpleArgs,
 	runSimpleTask,
 	simpleProviderCompatibility,
@@ -593,6 +595,67 @@ describe("simple dispatch argument boundary", () => {
 });
 
 describe("simple local execution path", () => {
+	for (const [label, output, verdict, expectedStatus] of [
+		["non-JSON", "provider prose", "agy_unparseable", "failed"],
+		["non-SUCCESS", '{"status":"FAILED"}', "agy_non_success", "failed"],
+		["SUCCESS", '{"status":"SUCCESS"}', "agy_success", "succeeded"],
+	]) {
+		it(`runs diff capture and checks after agy exit 0 with ${label} output`, async () => {
+			const repo = makeRepo();
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					route: () => ({ provider: "Antigravity", reason: "priority_fill" }),
+					resolveTargetIdentity: () => ({
+						targetId: "antigravity",
+						harnessKey: "agy",
+						ambiguous: false,
+					}),
+					getInvocationDescriptor: () => ({
+						target_id: "antigravity",
+						selector: "gemini-3.8-flash-high",
+						invocation_args: [],
+					}),
+					executeProvider: (context) =>
+						defaultExecuteProvider({
+							...context,
+							spawnFn: () => {
+								writeFileSync(
+									join(context.worktreePath, "src", "a.txt"),
+									"provider\n",
+								);
+								const child = new EventEmitter();
+								child.stdout = new EventEmitter();
+								child.stderr = new EventEmitter();
+								child.stdin = { end() {} };
+								queueMicrotask(() => {
+									child.stdout.emit("data", Buffer.from(output));
+									child.emit("close", 0, null);
+								});
+								return child;
+							},
+						}),
+				}),
+			);
+			retain(result, repo.projectPath);
+			strictEqual(result.status, expectedStatus);
+			strictEqual(result.providerLifecycle?.exitCode, 0);
+			strictEqual(result.providerVerdictCode, verdict);
+			deepStrictEqual(result.changedFiles, ["src/a.txt"]);
+			ok(result.checks.length > 0);
+			ok(result.checks.every((check) => check.status === "passed"));
+			if (expectedStatus === "failed") {
+				strictEqual(result.failureReason, "provider_verdict_rejected");
+				strictEqual(result.errorKind, "execution_failed");
+				ok(result.partialWorktree);
+			}
+			strictEqual(
+				readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
+				expectedStatus === "succeeded" ? "provider\n" : "base\n",
+			);
+		});
+	}
+
 	it("offers only exact locally compatible targets to automatic routing", async () => {
 		const repo = makeRepo();
 		let routedOptions = null;

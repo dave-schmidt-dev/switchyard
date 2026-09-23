@@ -1622,6 +1622,32 @@ describe("exact allowlist enforcement", () => {
 		strictEqual(result.success, false);
 		strictEqual(result.reasonKind, "ambiguous_combined_rename_spelling");
 	});
+
+	it("refuses an undeclared path containing => when allowedPaths is enforced", () => {
+		commitFile(projectDir, "src/a.mjs", "original\n");
+		const diff = buildStagedDiff(projectDir, (dir) => {
+			writeFileSync(join(dir, "src", "a.mjs"), "modified\n", "utf8");
+			mkdirSync(join(dir, "tests"), { recursive: true });
+			writeFileSync(
+				join(dir, "tests", "x=>y.test.mjs"),
+				"test content\n",
+				"utf8",
+			);
+		});
+		execSync("git checkout -- src/a.mjs", {
+			cwd: projectDir,
+			stdio: "pipe",
+		});
+		rmSync(join(projectDir, "tests", "x=>y.test.mjs"), { force: true });
+		execSync("git reset -q", { cwd: projectDir, stdio: "pipe" });
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.mjs"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.message, "undeclared_paths_touched");
+		deepStrictEqual(result.extraPaths, ["tests/x=>y.test.mjs"]);
+	});
 });
 
 describe("dequoteGitPath", () => {

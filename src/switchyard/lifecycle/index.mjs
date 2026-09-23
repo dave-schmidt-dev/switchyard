@@ -502,7 +502,9 @@ export function validateDirtyOverlayReceipt(
 				!Number.isInteger(entry.size) ||
 				entry.size < 0 ||
 				entry.size > maxFileBytes ||
-				!/^[0-7]+$/.test(String(entry.mode)) ||
+				!Number.isInteger(entry.mode) ||
+				entry.mode < 0 ||
+				entry.mode > 0o777 ||
 				!/^[a-f0-9]{64}$/u.test(entry.sha256 ?? "") ||
 				typeof entry.bytes !== "string",
 		)

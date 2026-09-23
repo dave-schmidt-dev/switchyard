@@ -766,7 +766,8 @@ export function simpleProviderCompatibility({ targetId, harness, descriptor }) {
 	return { compatible: true, reason: null };
 }
 
-async function defaultExecuteProvider(context) {
+/** Execute one local provider without changing its observed process exit code. */
+export async function defaultExecuteProvider(context) {
 	const invocation = buildSimpleProviderInvocation(
 		context.harness,
 		context.descriptor,
@@ -782,14 +783,19 @@ async function defaultExecuteProvider(context) {
 		maxBuffer: MAX_CAPTURE_BYTES,
 		progressStage: "running",
 		onPoll: () => context.onProgress?.(),
+		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
 	if (context.harness !== "agy" || !result.success) return result;
 	try {
-		return JSON.parse(result.output)?.status === "SUCCESS"
-			? result
-			: { ...result, success: false, code: 1 };
+		return {
+			...result,
+			providerVerdictCode:
+				JSON.parse(result.output)?.status === "SUCCESS"
+					? "agy_success"
+					: "agy_non_success",
+		};
 	} catch {
-		return { ...result, success: false, code: 1 };
+		return { ...result, providerVerdictCode: "agy_unparseable" };
 	}
 }
 
@@ -1099,6 +1105,7 @@ function terminalResult(base, overrides = {}) {
 			overrides.errorKind ??
 			(status === "succeeded" ? null : "unclassified_failure"),
 		providerLifecycle: overrides.providerLifecycle ?? null,
+		providerVerdictCode: overrides.providerVerdictCode ?? null,
 		...(overrides.preflightDetail
 			? { preflightDetail: overrides.preflightDetail }
 			: {}),
@@ -1173,6 +1180,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let dirtyBaseline = null;
 	let preflightDetail = null;
 	let providerLifecycle = null;
+	let providerVerdictCode = null;
 	let writerLifecycle = "never_started";
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
@@ -1383,6 +1391,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			preflightDetail,
 			dirtyBaseline,
 			providerLifecycle,
+			providerVerdictCode,
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
 		if (runInitialized) {
@@ -1720,6 +1729,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		providerLifecycle = boundProviderLifecycleSnapshot(
 			providerResult?.providerLifecycle,
 		);
+		providerVerdictCode = providerResult?.providerVerdictCode ?? null;
 		writerLifecycle = aggregateWriterLifecycle(
 			"never_started",
 			providerResult?.writerLifecycle,
@@ -1832,6 +1842,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 					"checks",
 				);
 			}
+		}
+		if (
+			providerVerdictCode === "agy_non_success" ||
+			providerVerdictCode === "agy_unparseable"
+		) {
+			// Keep the checked diff available for salvage without applying a provider-
+			// reported failure to the host checkout.
+			keepWorktree = true;
+			return fail("provider_verdict_rejected", "integrate", "execution_failed");
 		}
 
 		if (remainingMs(options.deadlineMs, now) <= 0) {
@@ -2000,6 +2019,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checks,
 			dirtyBaseline,
 			providerLifecycle,
+			providerVerdictCode,
 			outputs: terminalOutputs,
 			baseRevision,
 		});

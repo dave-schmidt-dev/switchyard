@@ -235,6 +235,67 @@ describe("Vibe adapter", () => {
 		ok(!/api_key\s*=/.test(config), "the config must carry no key material");
 	});
 
+	it("reconciles exit 255 from a confirmed sidecar using the caller cleanup context", async () => {
+		const token = "11111111-1111-4111-8111-111111111111";
+		const cleanupContext = {
+			runId: "vibe-run",
+			taskId: "R8",
+			attemptId: "attempt-1",
+			descriptorIdentity: DESCRIPTOR.descriptor_identity,
+			workspaceId: WORKSPACE,
+			operation: "provider",
+		};
+		let reads = 0;
+		let clears = 0;
+		const executionBackend = {
+			execArgv(_workspaceId, candidate) {
+				const isVibe = candidate.argv[0] === "vibe";
+				if (isVibe) deepStrictEqual(candidate.cleanupContext, cleanupContext);
+				return {
+					command: "fake",
+					args: [...candidate.argv],
+					...(isVibe ? { terminalEvidence: { token } } : {}),
+				};
+			},
+			readProviderTerminalEvidence(_workspaceId, context, evidence) {
+				reads += 1;
+				deepStrictEqual(context, cleanupContext);
+				strictEqual(evidence.token, token);
+				return { status: "confirmed", exitCode: 0 };
+			},
+			clearProviderTerminalEvidence() {
+				clears += 1;
+				return { status: "removed" };
+			},
+		};
+		const result = await executeAsync("change one file", WORKSPACE, {
+			...options(executionBackend),
+			cleanupContext,
+			spawnFn: (_command, args) => {
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.stdin = { end() {} };
+				child.kill = () => true;
+				const isVibe = args[0] === "vibe";
+				const servedProbe = args.some(
+					(arg) => typeof arg === "string" && arg.includes("logs/session"),
+				);
+				queueMicrotask(() => {
+					if (servedProbe) child.stdout.emit("data", "mistral-medium-3.5");
+					child.emit("close", isVibe ? 255 : 0, null);
+				});
+				return child;
+			},
+		});
+		strictEqual(result.success, true);
+		strictEqual(result.terminalEvidenceStatus, "confirmed");
+		strictEqual(result.terminalEvidenceCleanupStatus, "removed");
+		strictEqual(result.servedModel, "mistral-medium-3.5");
+		strictEqual(reads, 1);
+		strictEqual(clears, 1);
+	});
+
 	it("fails the task when Vibe reports having run a different model", () => {
 		const executionBackend = {
 			execArgv(_workspaceId, candidate) {

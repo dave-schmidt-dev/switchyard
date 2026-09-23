@@ -785,6 +785,61 @@ describe("review-result projection", () => {
 			false,
 		);
 	});
+
+	it("persists changes_requested with comments through createEvent and finalizes as succeeded", async () => {
+		const runId = `review-changes-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: "/tmp/tasks.md",
+			projectPath: "/tmp/project",
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-fingerprint",
+			workerNonce: randomUUID(),
+			launchArgs: [],
+		});
+		await createEvent(runId, {
+			phase: "execution",
+			event: "task_completed",
+			status: "Task 1.1 completed",
+			taskId: "1.1",
+			result: "review_completed",
+			reviewResult: {
+				verdict: "changes_requested",
+				comments: ["Handle the empty response"],
+			},
+		});
+		const run = await readRun(runId);
+		ok(run.lastReviewResult, "lastReviewResult must be persisted");
+		strictEqual(run.lastReviewResult.status, "available");
+		strictEqual(run.lastReviewResult.verdict, "clean");
+		strictEqual(run.lastReviewResult.findingCount, 0);
+		strictEqual(run.lastReviewResult.commentCount, 1);
+		deepStrictEqual(run.lastReviewResult.comments, [
+			"Handle the empty response",
+		]);
+
+		const events = await readEvents(runId);
+		strictEqual(events.length, 1);
+		ok(events[0].reviewResult);
+		strictEqual(events[0].reviewResult.status, "available");
+		strictEqual(events[0].reviewResult.verdict, "clean");
+		deepStrictEqual(events[0].reviewResult.comments, [
+			"Handle the empty response",
+		]);
+
+		const finalized = await updateRunWithRetry(runId, { state: "succeeded" });
+		strictEqual(finalized.state, "succeeded");
+		strictEqual(finalized.lastReviewResult.status, "available");
+		strictEqual(finalized.lastReviewResult.verdict, "clean");
+
+		const onDisk = await readRun(runId);
+		strictEqual(onDisk.state, "succeeded");
+		strictEqual(onDisk.lastReviewResult.status, "available");
+		strictEqual(onDisk.lastReviewResult.verdict, "clean");
+		deepStrictEqual(onDisk.lastReviewResult.comments, [
+			"Handle the empty response",
+		]);
+	});
 });
 process.env.SWITCHYARD_ROSTER_PATH = resolve(
 	"tests/fixtures/roster.fixture.json",

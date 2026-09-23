@@ -236,7 +236,7 @@ export function sanitizeReviewResult(input) {
 	return {
 		schemaVersion: REVIEW_RESULT_SCHEMA_VERSION,
 		status: "available",
-		verdict: findings.length > 0 ? "findings" : verdict,
+		verdict: findings.length > 0 ? "findings" : "clean",
 		...(summary ? { summary } : {}),
 		findings,
 		comments,

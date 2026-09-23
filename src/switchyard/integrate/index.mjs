@@ -837,18 +837,15 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		}
 
 		const summaryLines = extractSummaryLines(patch, projectPath);
-		const renameEndpoints = [];
+		const renameSources = [];
 		for (const line of summaryLines) {
 			const paths = parseRenamePaths(line);
 			if (paths) {
-				renameEndpoints.push(paths.old, paths.new);
+				renameSources.push(paths.old);
 			}
 		}
 
-		const touchedForDeclaration = new Set([
-			...touchedPaths.filter((p) => !p.includes("=>")),
-			...renameEndpoints,
-		]);
+		const touchedForDeclaration = new Set([...touchedPaths, ...renameSources]);
 
 		const declaredSet = new Set(declaredPaths);
 		const missingPaths = (requiredPaths ?? []).filter(

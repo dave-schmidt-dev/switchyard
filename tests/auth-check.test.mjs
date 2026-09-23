@@ -1779,8 +1779,8 @@ describe("an interrupted login ends the walkthrough", () => {
 process.on("SIGINT", () => {});
 const input = Buffer.alloc(1);
 if (readSync(0, input, 0, 1, null) !== 1 || input.toString() !== "x") process.exit(2);
-writeFileSync(${JSON.stringify(ready)}, "ready");
 writeFileSync(${JSON.stringify(loginPidReport)}, String(process.pid));
+writeFileSync(${JSON.stringify(ready)}, "ready");
 setInterval(() => {}, 1000);\n`,
 			);
 			writeFileSync(

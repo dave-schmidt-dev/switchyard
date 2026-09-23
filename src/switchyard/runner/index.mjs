@@ -3838,6 +3838,36 @@ export function releaseCheckpointOwnership(checkpointPath, checkpoint) {
 	}
 }
 
+/** Release only this run's safely quiescent checkpoint after a queue error. */
+function releaseCheckpointAfterQueueError(options) {
+	const { tasksFilePath, runId = null, dependencies = {} } = options;
+	const checkpointPath =
+		options.checkpointPath ?? getCheckpointPath(tasksFilePath);
+	if (!existsSync(checkpointPath)) return;
+	const checkpoint = loadCheckpoint(checkpointPath, tasksFilePath);
+	if (checkpoint.ownershipReleased || !checkpointCanRelease(checkpoint)) return;
+	const owner = checkpointOwnerFor(
+		checkpointPath,
+		runId ?? checkpoint.queueIdentity,
+		dependencies.checkpointOwner,
+	);
+	if (!sameCheckpointOwner(checkpoint.owner, owner)) return;
+	releaseCheckpointOwnership(checkpointPath, checkpoint);
+}
+
+/** Preserve the queue error while reporting a failed ownership release. */
+function reportCheckpointReleaseFailure(options) {
+	try {
+		releaseCheckpointAfterQueueError(options);
+	} catch {
+		options.dependencies?.onStatus?.({
+			phase: "cleanup",
+			event: "checkpoint_release_failed",
+			status: "Checkpoint ownership release failed",
+		});
+	}
+}
+
 export function claimCheckpointOwnership(
 	checkpointPath,
 	tasksFilePath,
@@ -8494,7 +8524,7 @@ async function executeTaskAsyncUnsafe(task, context) {
  * Workspace creation/seeding is delegated to the same injectable lifecycle
  * dependencies; callers with a supplied working container avoid VM setup.
  */
-export async function runQueueAsync(options) {
+async function runQueueAsyncImpl(options) {
 	const {
 		tasksFilePath,
 		projectPath,
@@ -8653,10 +8683,12 @@ export async function runQueueAsync(options) {
 				throw new Error("runQueueAsync: failed to create working container");
 			}
 			ownsWorkingContainer = true;
-			uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
-				workingContainerName,
-				queueBackend.destroy,
-			);
+			if (!dependencies.signal) {
+				uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+					workingContainerName,
+					queueBackend.destroy,
+				);
+			}
 			dependencies.onStatus?.({
 				phase: "bootstrap",
 				event: "container_created",
@@ -11880,7 +11912,7 @@ function recordDispatchToBothLedgers(
  * @param {string[]} [options.only] Provider names/target ids to restrict routing to.
  * @param {object} [options.dependencies]
  */
-export function runQueue(options) {
+function runQueueImpl(options) {
 	const {
 		tasksFilePath,
 		projectPath,
@@ -11979,10 +12011,12 @@ export function runQueue(options) {
 				throw new Error("runQueue: failed to create working container");
 			}
 			ownsWorkingContainer = true;
-			uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
-				workingContainerName,
-				queueBackend.destroy,
-			);
+			if (!dependencies.signal) {
+				uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+					workingContainerName,
+					queueBackend.destroy,
+				);
+			}
 			if (emitStatus) {
 				emitStatus({
 					phase: "bootstrap",
@@ -12972,7 +13006,7 @@ export async function executeTaskWithOrchestrator(task, context) {
  * @param {number} [options.maxPolls]
  * @param {object} [options.dependencies]
  */
-export async function runQueueWithOrchestrator(options) {
+async function runQueueWithOrchestratorImpl(options) {
 	const {
 		tasksFilePath,
 		projectPath,
@@ -13069,10 +13103,12 @@ export async function runQueueWithOrchestrator(options) {
 				);
 			}
 			ownsWorkingContainer = true;
-			uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
-				workingContainerName,
-				queueBackend.destroy,
-			);
+			if (!dependencies.signal) {
+				uninstallSignalCleanup = _installOwnedContainerSignalCleanup(
+					workingContainerName,
+					queueBackend.destroy,
+				);
+			}
 			if (emitStatus) {
 				emitStatus({
 					phase: "bootstrap",
@@ -13587,6 +13623,42 @@ export async function runQueueWithOrchestrator(options) {
 		} finally {
 			releaseQueueSlot(queueBackend, slotLease);
 		}
+	}
+}
+
+/** Run the asynchronous queue and release safe checkpoint ownership on errors. */
+export async function runQueueAsync(options) {
+	let failed = true;
+	try {
+		const result = await runQueueAsyncImpl(options);
+		failed = false;
+		return result;
+	} finally {
+		if (failed) reportCheckpointReleaseFailure(options);
+	}
+}
+
+/** Run the synchronous queue and release safe checkpoint ownership on errors. */
+export function runQueue(options) {
+	let failed = true;
+	try {
+		const result = runQueueImpl(options);
+		failed = false;
+		return result;
+	} finally {
+		if (failed) reportCheckpointReleaseFailure(options);
+	}
+}
+
+/** Run the orchestrator queue and release safe checkpoint ownership on errors. */
+export async function runQueueWithOrchestrator(options) {
+	let failed = true;
+	try {
+		const result = await runQueueWithOrchestratorImpl(options);
+		failed = false;
+		return result;
+	} finally {
+		if (failed) reportCheckpointReleaseFailure(options);
 	}
 }
 

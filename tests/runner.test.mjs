@@ -8658,6 +8658,176 @@ describe("checkpoint durability", () => {
 		strictEqual(readFileSync(checkpointPath, "utf8"), beforeStaleSave);
 	});
 
+	it("releases a claimed checkpoint after preflight errors in all queue entrypoints", async () => {
+		for (const [name, entrypoint] of [
+			["sync", runQueueImpl],
+			["async", runQueueAsyncImpl],
+			["orchestrator", runQueueWithOrchestratorImpl],
+		]) {
+			const tasksPath = writeTasksFile(`### Task 1.1: Completed ${name}
+- **Status:** done
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** already complete
+`);
+			const checkpointPath = `${tasksPath}.${name}.checkpoint.json`;
+			const checkpoint = createEmptyCheckpoint(tasksPath);
+			saveCheckpoint(checkpointPath, checkpoint);
+			strictEqual(releaseCheckpointOwnership(checkpointPath, checkpoint), true);
+			const options = {
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				checkpointPath,
+				dependencies: {
+					backendFactory: () => ({
+						platform: "macos",
+						readiness: () => ({ inventoryCount: 0 }),
+						create: () => "fake-vm",
+						seed: () => {},
+						commit: () => {},
+						reset: () => {},
+						destroy: () => {},
+					}),
+					queuePreflight: () => {
+						throw new Error("synthetic post-claim preflight error");
+					},
+					acquireVmSlot: () => null,
+					releaseVmSlot: () => {},
+				},
+			};
+			await rejects(
+				Promise.resolve().then(() => entrypoint(options)),
+				/synthetic post-claim preflight error/,
+			);
+			strictEqual(
+				loadCheckpoint(checkpointPath, tasksPath).ownershipReleased,
+				true,
+				name,
+			);
+			const result = await entrypoint({
+				...options,
+				dependencies: {
+					...options.dependencies,
+					queuePreflight: () => ({ ok: true, eligible: true }),
+				},
+			});
+			strictEqual(result.processedTasks, 0, name);
+			strictEqual(
+				loadCheckpoint(checkpointPath, tasksPath).ownershipReleased,
+				true,
+				name,
+			);
+		}
+	});
+
+	it("a detached-style SIGTERM lets runQueueAsync destroy an owned VM exactly once", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Already complete
+- **Status:** done
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** no provider launch
+`);
+		const checkpointPath = `${tasksPath}.sigterm.checkpoint.json`;
+		const runnerUrl = pathToFileURL(
+			resolve(cwd(), "src/switchyard/runner/index.mjs"),
+		).href;
+		const script = `
+import { runQueueAsync, loadCheckpoint } from ${JSON.stringify(runnerUrl)};
+const [tasksFilePath, checkpointPath, projectPath] = process.argv.slice(1);
+const shutdown = new AbortController();
+process.on("SIGTERM", () => shutdown.abort());
+let destroys = 0;
+const backendFactory = () => ({
+  platform: "macos",
+  preflight: () => {},
+  readiness: () => ({ inventoryCount: 0 }),
+  acquireSlot: () => ({ token: "fake-slot" }),
+  releaseSlot: () => {},
+  ensureAgentContainer: () => {},
+  create: () => "fake-vm",
+  provision: () => {},
+  seed: () => {},
+  commit: () => {},
+  reset: () => {},
+  destroy: () => { destroys += 1; if (destroys > 1) throw new Error("double destroy"); },
+});
+const result = await runQueueAsync({
+  tasksFilePath, checkpointPath, projectPath,
+  dependencies: {
+    backendFactory,
+    signal: shutdown.signal,
+    hostPowerPolicyEnabled: false,
+    onContainerReady: () => process.emit("SIGTERM"),
+  },
+});
+console.log(JSON.stringify({ destroys, processedTasks: result.processedTasks,
+  released: loadCheckpoint(checkpointPath, tasksFilePath).ownershipReleased }));
+`;
+		const child = spawnSync(
+			process.execPath,
+			[
+				"--input-type=module",
+				"-e",
+				script,
+				tasksPath,
+				checkpointPath,
+				TEST_DIR,
+			],
+			{ encoding: "utf8", timeout: 5_000 },
+		);
+		strictEqual(child.status, 0, child.stderr);
+		deepStrictEqual(JSON.parse(child.stdout.trim()), {
+			destroys: 1,
+			processedTasks: 0,
+			released: true,
+		});
+	});
+
+	it("foreground SIGINT still invokes owned VM cleanup", () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Already complete
+- **Status:** done
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** no provider launch
+`);
+		const checkpointPath = `${tasksPath}.sigint.checkpoint.json`;
+		const destroyPath = `${tasksPath}.sigint-destroyed`;
+		const runnerUrl = pathToFileURL(
+			resolve(cwd(), "src/switchyard/runner/index.mjs"),
+		).href;
+		const script = `
+import { appendFileSync } from "node:fs";
+import { runQueueAsync } from ${JSON.stringify(runnerUrl)};
+const [tasksFilePath, checkpointPath, projectPath, destroyPath] = process.argv.slice(1);
+const backendFactory = () => ({
+  platform: "macos", preflight: () => {}, readiness: () => ({ inventoryCount: 0 }),
+  acquireSlot: () => ({ token: "fake-slot" }), releaseSlot: () => {},
+  ensureAgentContainer: () => {}, create: () => "fake-vm", provision: () => {},
+  seed: () => {}, commit: () => {}, reset: () => {},
+  destroy: () => appendFileSync(destroyPath, "destroy\\n"),
+});
+await runQueueAsync({ tasksFilePath, checkpointPath, projectPath,
+  dependencies: { backendFactory, hostPowerPolicyEnabled: false,
+    onContainerReady: () => process.emit("SIGINT") } });
+`;
+		const child = spawnSync(
+			process.execPath,
+			[
+				"--input-type=module",
+				"-e",
+				script,
+				tasksPath,
+				checkpointPath,
+				TEST_DIR,
+				destroyPath,
+			],
+			{ encoding: "utf8", timeout: 5_000 },
+		);
+		ok(child.signal !== null || child.status !== 0, child.stderr);
+		strictEqual(readFileSync(destroyPath, "utf8"), "destroy\n");
+	});
+
 	it("durably releases checkpoint ownership in all three queue loops", async () => {
 		for (const [name, entrypoint] of [
 			["sync", runQueue],

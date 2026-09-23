@@ -487,7 +487,10 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 				...options,
 				provider: "vibe",
 				input: execution.input,
-				cleanupContext: execution.cleanupContext,
+				cleanupContext: {
+					...options.cleanupContext,
+					...execution.cleanupContext,
+				},
 				timeoutMs: options.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS,
 				cleanup: () => killOrphanedProcessesAsync(workingContainerName),
 				silenceTimeoutMs: options.silenceTimeoutMs,
