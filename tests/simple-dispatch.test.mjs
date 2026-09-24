@@ -1,5 +1,5 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -16,9 +16,10 @@ import { open, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	getRunRoot,
+	isProjectLockHeld,
 	readEvents,
 	readRun,
 	runStoreTesting,
@@ -28,6 +29,7 @@ import {
 	assessSimpleRecoveryEvidence,
 	buildSimpleProviderInvocation,
 	defaultExecuteProvider,
+	handleSimple,
 	parseSimpleArgs,
 	runSimpleTask,
 	simpleProviderCompatibility,
@@ -87,6 +89,159 @@ function options(repo, overrides = {}) {
 		deadlineMs: 100_000,
 		...overrides,
 	};
+}
+
+function simpleCliArgs(repo, checks = ["test -f src/a.txt"]) {
+	return [
+		repo.promptPath,
+		"--project",
+		repo.projectPath,
+		"--capability",
+		"standard",
+		"--file",
+		"src/a.txt",
+		...checks.flatMap((command) => ["--check", command]),
+		"--deadline",
+		new Date(61_000).toISOString(),
+	];
+}
+
+function spawnSignalHarness(repo, runId, signal, mode = "provider") {
+	const moduleDirectory = resolve(__dirname, "..", "src", "switchyard");
+	const bootstrap = `
+import { EventEmitter } from "node:events";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const simpleModule = await import(process.env.SWITCHYARD_SIMPLE_MODULE);
+const runStore = await import(process.env.SWITCHYARD_RUN_STORE_MODULE);
+let terminalWrites = [];
+let lockReleases = 0;
+const directChildKills = [];
+const providerChild = new EventEmitter();
+providerChild.stdout = new EventEmitter();
+providerChild.stderr = new EventEmitter();
+providerChild.stdin = { end() {} };
+providerChild.kill = (signal) => {
+  directChildKills.push(signal);
+  queueMicrotask(() => providerChild.emit("close", null, signal));
+  return true;
+};
+const argv = [
+  process.env.SWITCHYARD_PROMPT,
+  "--project", process.env.SWITCHYARD_PROJECT,
+  "--capability", "standard",
+  "--file", "src/a.txt",
+  "--check", "test -f src/a.txt",
+  "--deadline", new Date(61_000).toISOString(),
+];
+const executeProvider = (context) => {
+  if (process.env.SWITCHYARD_MODE === "provider") {
+    return simpleModule.defaultExecuteProvider({
+      ...context,
+      spawnFn: () => {
+        process.stdout.write("READY\\n");
+        return providerChild;
+      },
+    });
+  }
+  writeFileSync(join(context.worktreePath, "src", "a.txt"), "provider\\n");
+  return Promise.resolve({ success: true, writerLifecycle: "stopped" });
+};
+const integrate = process.env.SWITCHYARD_MODE === "integration"
+  ? async ({ projectPath }) => {
+      process.stdout.write("INTEGRATING\\n");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      writeFileSync(join(projectPath, "src", "a.txt"), "provider\\n");
+      return { success: true };
+    }
+  : undefined;
+await simpleModule.handleSimple(argv, {
+  now: () => 1_000,
+  taskId: process.env.SWITCHYARD_TASK_ID,
+  runId: process.env.SWITCHYARD_RUN_ID,
+  tmpdir: process.env.TMPDIR,
+  acquireProjectLock: runStore.acquireProjectLock,
+  releaseProjectLock: async (projectPath, id) => {
+    lockReleases += 1;
+    return runStore.releaseProjectLockIfOwnedBy(projectPath, id);
+  },
+  route: () => ({ provider: "Codex (Spark)", reason: "priority_fill" }),
+  resolveTargetIdentity: () => ({ targetId: "codex", harnessKey: "codex", ambiguous: false }),
+  getInvocationDescriptor: () => ({ target_id: "codex", selector: "gpt-5.3-codex-spark", invocation_args: [] }),
+  assertFundedRoute: () => {},
+  executeProvider,
+  runCheck: async () => process.env.SWITCHYARD_MODE === "provider"
+    ? Promise.reject(new Error("check launched after provider cancellation"))
+    : { success: true, writerLifecycle: "stopped" },
+  ...(integrate ? { integrate } : {}),
+  updateRunWithRetry: async (id, patch) => {
+    if (patch.state === "failed" || patch.state === "succeeded") terminalWrites.push(patch.state);
+    return runStore.updateRunWithRetry(id, patch);
+  },
+  writeResult: (line) => process.stdout.write("RESULT " + line + "\\n"),
+});
+process.stdout.write("META " + JSON.stringify({ terminalWrites, lockReleases, directChildKills }) + "\\n");
+`;
+	const taskId = runId.replace(/^simple-/u, "");
+	const child = spawn(
+		process.execPath,
+		["--input-type=module", "-e", bootstrap],
+		{
+			cwd: repo.projectPath,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: {
+				PATH: process.env.PATH ?? "/usr/bin:/bin",
+				HOME: process.env.HOME ?? SUITE_TMPDIR,
+				TMPDIR: SUITE_TMPDIR,
+				SWITCHYARD_RUN_STORE_ROOT: join(SUITE_TMPDIR, "run-store"),
+				SWITCHYARD_SIMPLE_MODULE: pathToFileURL(
+					join(moduleDirectory, "simple", "index.mjs"),
+				).href,
+				SWITCHYARD_RUN_STORE_MODULE: pathToFileURL(
+					join(moduleDirectory, "run-store", "index.mjs"),
+				).href,
+				SWITCHYARD_PROMPT: repo.promptPath,
+				SWITCHYARD_PROJECT: repo.projectPath,
+				SWITCHYARD_TASK_ID: taskId,
+				SWITCHYARD_RUN_ID: runId,
+				SWITCHYARD_MODE: mode,
+			},
+		},
+	);
+
+	return new Promise((resolveResult, rejectResult) => {
+		let stdout = "";
+		let stderr = "";
+		let signalSent = false;
+		const readyMarker = mode === "integration" ? "INTEGRATING\n" : "READY\n";
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			rejectResult(new Error(`signal child did not settle: ${stderr}`));
+		}, 10_000);
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk;
+			if (!signalSent && stdout.includes(readyMarker)) {
+				signalSent = true;
+				if (!child.kill(signal)) {
+					clearTimeout(timer);
+					rejectResult(new Error(`could not send ${signal} to signal child`));
+				}
+			}
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk;
+		});
+		child.once("error", (error) => {
+			clearTimeout(timer);
+			rejectResult(error);
+		});
+		child.once("close", (code, exitSignal) => {
+			clearTimeout(timer);
+			resolveResult({ code, exitSignal, signalSent, stdout, stderr });
+		});
+	});
 }
 
 function dependencies(overrides = {}) {
@@ -551,6 +706,28 @@ describe("simple dispatch argument boundary", () => {
 		);
 		strictEqual(legacy.status, 0);
 		ok(legacy.stdout.includes("switchyard-dispatch run"));
+	});
+
+	it("prints simple help directly instead of writing it as a result", async () => {
+		const originalLog = console.log;
+		const signalProcess = new EventEmitter();
+		let printed = "";
+		let resultWrites = 0;
+		console.log = (message) => {
+			printed = message;
+		};
+		try {
+			await handleSimple(["--help"], {
+				signalProcess,
+				writeResult: () => {
+					resultWrites += 1;
+				},
+			});
+		} finally {
+			console.log = originalLog;
+		}
+		ok(printed.includes("switchyard-dispatch simple"));
+		strictEqual(resultWrites, 0);
 	});
 
 	it("runs Codex ephemerally with the workspace-write sandbox", () => {
@@ -2407,6 +2584,450 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(run.worktree.reason, "worktree_cleanup_failed");
 			ok(typeof run.worktree.retainedAt === "string");
 		});
+
+		it("settles SIGINT during a provider, retains uncertain work, and releases the lock", async () => {
+			const repo = makeRepo();
+			const signalProcess = new EventEmitter();
+			const taskId = `sigint-provider-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const terminalWrites = [];
+			let providerStartedResolve;
+			const providerStarted = new Promise((resolveStarted) => {
+				providerStartedResolve = resolveStarted;
+			});
+			let checkStarted = false;
+			let output = null;
+			let lockReleases = 0;
+			const child = new EventEmitter();
+			child.stdout = new EventEmitter();
+			child.stderr = new EventEmitter();
+			child.stdin = { end() {} };
+			child.kill = (signal) => {
+				queueMicrotask(() => child.emit("close", null, signal));
+				return true;
+			};
+
+			const running = handleSimple(
+				simpleCliArgs(repo),
+				dependencies({
+					now: () => 1_000,
+					taskId,
+					runId,
+					tmpdir: SUITE_TMPDIR,
+					signalProcess,
+					writeResult: (line) => {
+						output = line;
+					},
+					releaseProjectLock: async () => {
+						lockReleases += 1;
+						return true;
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.state === "failed" || patch.state === "succeeded") {
+							terminalWrites.push(patch.state);
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					executeProvider: (context) =>
+						defaultExecuteProvider({
+							...context,
+							spawnFn: () => {
+								providerStartedResolve();
+								return child;
+							},
+						}),
+					runCheck: async () => {
+						checkStarted = true;
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			await providerStarted;
+			signalProcess.emit("SIGINT");
+			await running;
+
+			const result = JSON.parse(output);
+			retain(result, repo.projectPath);
+			strictEqual(signalProcess.exitCode, 130);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "provider_cancelled");
+			ok(result.partialWorktree);
+			strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+			strictEqual(existsSync(result.partialWorktree), true);
+			strictEqual(checkStarted, false);
+			strictEqual(lockReleases, 1);
+			deepStrictEqual(terminalWrites, ["failed"]);
+			const run = await readRun(runId);
+			strictEqual(run.state, "failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(run.cleanupState, "pending");
+			strictEqual(signalProcess.listenerCount("SIGINT"), 0);
+			strictEqual(signalProcess.listenerCount("SIGTERM"), 0);
+		});
+
+		it("retains a cloned checkout when SIGINT arrives before provider launch", async () => {
+			const repo = makeRepo();
+			const signalProcess = new EventEmitter();
+			const taskId = `sigint-before-provider-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const terminalWrites = [];
+			let output = null;
+			let providerLaunches = 0;
+			let lockReleases = 0;
+
+			await handleSimple(
+				simpleCliArgs(repo),
+				dependencies({
+					now: () => 1_000,
+					taskId,
+					runId,
+					tmpdir: SUITE_TMPDIR,
+					signalProcess,
+					writeResult: (line) => {
+						output = line;
+					},
+					onStatus: (event) => {
+						if (event.milestone === "provider_started") {
+							signalProcess.emit("SIGINT");
+						}
+					},
+					releaseProjectLock: async () => {
+						lockReleases += 1;
+						return true;
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.state === "failed" || patch.state === "succeeded") {
+							terminalWrites.push(patch.state);
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					executeProvider: async () => {
+						providerLaunches += 1;
+						return { success: false, writerLifecycle: "never_started" };
+					},
+				}),
+			);
+
+			const result = JSON.parse(output);
+			retain(result, repo.projectPath);
+			strictEqual(signalProcess.exitCode, 130);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "provider_cancelled");
+			strictEqual(providerLaunches, 0);
+			ok(result.partialWorktree);
+			strictEqual(
+				existsSync(join(result.partialWorktree, "src", "a.txt")),
+				true,
+			);
+			strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+			strictEqual(lockReleases, 1);
+			deepStrictEqual(terminalWrites, ["failed"]);
+			const run = await readRun(runId);
+			strictEqual(run.state, "failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(run.cleanupState, "pending");
+		});
+
+		it("settles SIGTERM during a check without starting integration", async () => {
+			const repo = makeRepo();
+			const signalProcess = new EventEmitter();
+			const taskId = `sigterm-check-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const terminalWrites = [];
+			let checkStartedResolve;
+			const checkStarted = new Promise((resolveStarted) => {
+				checkStartedResolve = resolveStarted;
+			});
+			let output = null;
+			let lockReleases = 0;
+			let checkStarts = 0;
+
+			const running = handleSimple(
+				simpleCliArgs(repo, ["read -r value", "true"]),
+				dependencies({
+					now: () => 1_000,
+					taskId,
+					runId,
+					tmpdir: SUITE_TMPDIR,
+					signalProcess,
+					writeResult: (line) => {
+						output = line;
+					},
+					onStatus: (event) => {
+						if (event.milestone === "check_started") checkStarts += 1;
+						if (event.milestone === "check_started") checkStartedResolve();
+					},
+					releaseProjectLock: async () => {
+						lockReleases += 1;
+						return true;
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.state === "failed" || patch.state === "succeeded") {
+							terminalWrites.push(patch.state);
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					integrate: async () => {
+						throw new Error("integration must not start after SIGTERM");
+					},
+				}),
+			);
+			await checkStarted;
+			signalProcess.emit("SIGTERM");
+			await running;
+
+			const result = JSON.parse(output);
+			retain(result, repo.projectPath);
+			strictEqual(signalProcess.exitCode, 143);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "provider_cancelled");
+			ok(result.partialWorktree);
+			strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+			strictEqual(lockReleases, 1);
+			strictEqual(checkStarts, 1);
+			deepStrictEqual(terminalWrites, ["failed"]);
+			const run = await readRun(runId);
+			strictEqual(run.state, "failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(signalProcess.listenerCount("SIGINT"), 0);
+			strictEqual(signalProcess.listenerCount("SIGTERM"), 0);
+		});
+
+		it("uses a normal failure exit when an interrupted integration later fails", async () => {
+			const repo = makeRepo();
+			const signalProcess = new EventEmitter();
+			const taskId = `sigint-integration-failure-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const terminalWrites = [];
+			let output = null;
+			let lockReleases = 0;
+
+			await handleSimple(
+				simpleCliArgs(repo),
+				dependencies({
+					now: () => 1_000,
+					taskId,
+					runId,
+					tmpdir: SUITE_TMPDIR,
+					signalProcess,
+					writeResult: (line) => {
+						output = line;
+					},
+					onStatus: () => {},
+					releaseProjectLock: async () => {
+						lockReleases += 1;
+						return true;
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.state === "failed" || patch.state === "succeeded") {
+							terminalWrites.push(patch.state);
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					integrate: async () => {
+						signalProcess.emit("SIGINT");
+						await new Promise((resolveDelay) => setImmediate(resolveDelay));
+						return {
+							success: false,
+							message: "unrelated integration conflict",
+						};
+					},
+				}),
+			);
+
+			const result = JSON.parse(output);
+			retain(result, repo.projectPath);
+			strictEqual(signalProcess.exitCode, 1);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "integration_failed");
+			ok(result.partialWorktree);
+			strictEqual(lockReleases, 1);
+			deepStrictEqual(terminalWrites, ["failed"]);
+			const run = await readRun(runId);
+			strictEqual(run.state, "failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(signalProcess.listenerCount("SIGINT"), 0);
+			strictEqual(signalProcess.listenerCount("SIGTERM"), 0);
+		});
+
+		it("keeps successful integration succeeded when SIGTERM arrives during failed cleanup", async () => {
+			const repo = makeRepo();
+			const signalProcess = new EventEmitter();
+			const taskId = `sigterm-cleanup-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const terminalWrites = [];
+			let output = null;
+			let lockReleases = 0;
+
+			await handleSimple(
+				simpleCliArgs(repo),
+				dependencies({
+					now: () => 1_000,
+					taskId,
+					runId,
+					tmpdir: SUITE_TMPDIR,
+					signalProcess,
+					writeResult: (line) => {
+						output = line;
+					},
+					releaseProjectLock: async () => {
+						lockReleases += 1;
+						return true;
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.state === "failed" || patch.state === "succeeded") {
+							terminalWrites.push(patch.state);
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					rmSync: () => {
+						signalProcess.emit("SIGTERM");
+						throw Object.assign(new Error("cleanup interrupted"), {
+							code: "EIO",
+						});
+					},
+				}),
+			);
+
+			const result = JSON.parse(output);
+			retain(result, repo.projectPath);
+			strictEqual(signalProcess.exitCode, 143);
+			strictEqual(result.status, "succeeded");
+			ok(result.partialWorktree);
+			strictEqual(existsSync(result.partialWorktree), true);
+			strictEqual(
+				readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
+				"provider\n",
+			);
+			strictEqual(lockReleases, 1);
+			deepStrictEqual(terminalWrites, ["succeeded"]);
+			const run = await readRun(runId);
+			strictEqual(run.state, "succeeded");
+			strictEqual(run.cleanupState, "failed");
+			strictEqual(run.cleanupFailure.result, "worktree_cleanup_failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(signalProcess.listenerCount("SIGINT"), 0);
+			strictEqual(signalProcess.listenerCount("SIGTERM"), 0);
+		});
+
+		for (const [signal, expectedExitCode] of [
+			["SIGINT", 130],
+			["SIGTERM", 143],
+		]) {
+			it(`settles real ${signal} in a child process with one terminal record`, async () => {
+				const repo = makeRepo();
+				const taskId = `real-${signal.toLowerCase()}-${Date.now()}`;
+				const runId = `simple-${taskId}`;
+				const child = await spawnSignalHarness(repo, runId, signal);
+				const resultLine = child.stdout
+					.split("\n")
+					.find((line) => line.startsWith("RESULT "));
+				const resultLineCount = child.stdout
+					.split("\n")
+					.filter((line) => line.startsWith("RESULT ")).length;
+				const metaLine = child.stdout
+					.split("\n")
+					.find((line) => line.startsWith("META "));
+				ok(
+					child.signalSent,
+					`${signal} should be sent after provider start; stdout=${child.stdout}; stderr=${child.stderr}; exit=${child.code}/${child.exitSignal}`,
+				);
+				strictEqual(child.code, expectedExitCode, child.stderr);
+				strictEqual(child.exitSignal, null);
+				ok(resultLine, child.stdout);
+				strictEqual(resultLineCount, 1);
+				ok(metaLine, child.stdout);
+				const result = JSON.parse(resultLine.slice("RESULT ".length));
+				const meta = JSON.parse(metaLine.slice("META ".length));
+				retain(result, repo.projectPath);
+				strictEqual(result.status, "failed");
+				strictEqual(result.failureReason, "provider_cancelled");
+				ok(result.partialWorktree);
+				strictEqual(existsSync(result.partialWorktree), true);
+				strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+				deepStrictEqual(meta.terminalWrites, ["failed"]);
+				strictEqual(meta.lockReleases, 1);
+				const run = await readRun(runId);
+				strictEqual(run.state, "failed");
+				strictEqual(run.worktree.state, "retained");
+				strictEqual(run.cleanupState, "pending");
+				strictEqual(isProjectLockHeld(repo.projectPath), false);
+				deepStrictEqual(meta.directChildKills, ["SIGTERM"]);
+				const terminalEvents = (await readEvents(runId)).filter(
+					(event) => event.phase === "terminal",
+				);
+				strictEqual(terminalEvents.length, 1);
+			});
+		}
+
+		for (const [signal, expectedExitCode] of [
+			["SIGINT", 130],
+			["SIGTERM", 143],
+		]) {
+			it(`finishes an async integration after real ${signal} and records success`, async () => {
+				const repo = makeRepo();
+				const taskId = `integration-${signal.toLowerCase()}-${Date.now()}`;
+				const runId = `simple-${taskId}`;
+				const child = await spawnSignalHarness(
+					repo,
+					runId,
+					signal,
+					"integration",
+				);
+				const resultLines = child.stdout
+					.split("\n")
+					.filter((line) => line.startsWith("RESULT "));
+				const metaLine = child.stdout
+					.split("\n")
+					.find((line) => line.startsWith("META "));
+				ok(
+					child.signalSent,
+					`${signal} should arrive during integration; stdout=${child.stdout}; stderr=${child.stderr}; exit=${child.code}/${child.exitSignal}`,
+				);
+				strictEqual(child.code, expectedExitCode, child.stderr);
+				strictEqual(child.exitSignal, null);
+				strictEqual(resultLines.length, 1);
+				ok(metaLine, child.stdout);
+				ok(
+					child.stderr.includes(
+						`received ${signal} during integration; waiting for it to finish`,
+					),
+					child.stderr,
+				);
+				ok(
+					child.stderr.includes("milestone=integration_completed"),
+					child.stderr,
+				);
+				const result = JSON.parse(resultLines[0].slice("RESULT ".length));
+				const meta = JSON.parse(metaLine.slice("META ".length));
+				strictEqual(result.status, "succeeded");
+				strictEqual(result.partialWorktree, null);
+				strictEqual(
+					readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
+					"provider\n",
+				);
+				deepStrictEqual(meta.terminalWrites, ["succeeded"]);
+				strictEqual(meta.lockReleases, 1);
+				deepStrictEqual(meta.directChildKills, []);
+				strictEqual(isProjectLockHeld(repo.projectPath), false);
+				const run = await readRun(runId);
+				strictEqual(run.state, "succeeded");
+				strictEqual(run.cleanupState, "complete");
+				strictEqual(run.worktree.state, "removed");
+				const terminalEvents = (await readEvents(runId)).filter(
+					(event) => event.phase === "terminal",
+				);
+				strictEqual(terminalEvents.length, 1);
+			});
+		}
 
 		it("keeps all test roots and run records inside its private TMPDIR", () => {
 			strictEqual(realpathSync(tmpdir()), SUITE_TMPDIR);

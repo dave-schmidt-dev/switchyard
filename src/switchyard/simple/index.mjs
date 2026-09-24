@@ -51,7 +51,10 @@ export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --p
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
 --predecessor-receipt binds output of a previous run and requires --dirty-overlay.
-Output is always one JSON result; progress is written to stderr.`;
+Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
+SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
+for attended recovery. An integration already in progress finishes before the
+terminal result is recorded.`;
 
 const MAX_PROMPT_BYTES = 256 * 1024;
 const MAX_DEADLINE_MS = 30 * 60 * 1000;
@@ -783,6 +786,7 @@ export async function defaultExecuteProvider(context) {
 		maxBuffer: MAX_CAPTURE_BYTES,
 		progressStage: "running",
 		onPoll: () => context.onProgress?.(),
+		signal: context.signal,
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
 	if (context.harness !== "agy" || !result.success) return result;
@@ -804,6 +808,7 @@ async function defaultRunCheck({
 	worktreePath,
 	timeoutMs,
 	onProgress,
+	signal,
 }) {
 	return runProviderProcess(
 		"/bin/sh",
@@ -820,6 +825,7 @@ async function defaultRunCheck({
 			maxBuffer: MAX_CAPTURE_BYTES,
 			progressStage: "running",
 			onPoll: onProgress,
+			signal,
 		},
 	);
 }
@@ -1165,6 +1171,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const startedAt = now();
 	const base = { taskId, attemptId, runId, startedAt, now };
 	const onStatus = dependencies.onStatus;
+	const signal = dependencies.signal;
 	let provider = null;
 	let targetId = null;
 	let projectLocked = false;
@@ -1419,6 +1426,16 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		return finalResult;
 	};
+	const failForSignal = (failurePhase = currentPhase) => {
+		if (!signal?.aborted) return null;
+		// A direct child closing does not prove that a provider or check left no
+		// detached writer behind. Keep the checkout for attended recovery.
+		if (worktreePath) {
+			keepWorktree = true;
+			writerLifecycle = "unavailable";
+		}
+		return fail("provider_cancelled", failurePhase, "execution_failed");
+	};
 
 	try {
 		try {
@@ -1440,6 +1457,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				error,
 			);
 		}
+		if (signal?.aborted) return failForSignal("preflight");
 
 		if (manifestReviewPaths(options.files).length > 0) {
 			return fail(
@@ -1468,6 +1486,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				error,
 			);
 		}
+		if (signal?.aborted) return failForSignal("preflight");
 		baseRevision = requireGit(
 			options.projectPath,
 			["rev-parse", "HEAD"],
@@ -1759,6 +1778,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (executionBudget <= 0) {
 			return fail("deadline_expired", "execute");
 		}
+		if (signal?.aborted) return failForSignal("execute");
 		writerLifecycle = "unavailable";
 		const providerResult = await executeProvider({
 			targetId,
@@ -1767,6 +1787,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			prompt: guardedPrompt,
 			worktreePath,
 			timeoutMs: executionBudget,
+			signal,
 			onProgress: () => {
 				const progressObservedAt = now();
 				if (
@@ -1800,6 +1821,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			providerResult?.writerLifecycle,
 		);
 
+		if (signal?.aborted) return failForSignal("execute");
 		if (!providerResult?.success) {
 			if (remainingMs(options.deadlineMs, now) > 0) {
 				const captured = captureWorktreeDiff(
@@ -1857,6 +1879,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 		for (let index = 0; index < options.checks.length; index += 1) {
 			currentPhase = "checks";
+			if (signal?.aborted) return failForSignal("checks");
 			const remaining = remainingMs(options.deadlineMs, now);
 			if (remaining <= 0) {
 				keepWorktree = true;
@@ -1876,6 +1899,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				command: options.checks[index],
 				worktreePath,
 				timeoutMs: remaining,
+				signal,
 				onProgress: () =>
 					heartbeat("checks", {
 						processPhase: "check_running",
@@ -1887,6 +1911,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				settledWriterLifecycle,
 				check?.writerLifecycle,
 			);
+			if (signal?.aborted) return failForSignal("checks");
 			checks.push({
 				index: index + 1,
 				status: check?.success ? "passed" : "failed",
@@ -1908,6 +1933,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				);
 			}
 		}
+		if (signal?.aborted) return failForSignal("integrate");
 		if (
 			providerVerdictCode === "agy_non_success" ||
 			providerVerdictCode === "agy_unparseable"
@@ -2295,47 +2321,90 @@ export async function runSimpleTask(options, dependencies = {}) {
 export async function handleSimple(argv, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
 	const startedAt = now();
+	const signalProcess = dependencies.signalProcess ?? process;
+	const abortController = new AbortController();
+	let receivedSignal = null;
+	let integrationStarted = false;
+	let signalDuringIntegration = false;
+	const reportStatus =
+		dependencies.onStatus ??
+		((event) =>
+			console.error(
+				`dispatch: simple task=${event.taskId} phase=${event.phase}${event.milestone ? ` milestone=${event.milestone}` : ""}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
+			));
+	const onInterrupt = (signal) => {
+		if (receivedSignal !== null) return;
+		receivedSignal = signal;
+		if (integrationStarted) {
+			signalDuringIntegration = true;
+			try {
+				console.error(
+					`dispatch: simple received ${signal} during integration; waiting for it to finish`,
+				);
+			} catch {}
+		}
+		abortController.abort(signal);
+	};
+	const onSigint = () => onInterrupt("SIGINT");
+	const onSigterm = () => onInterrupt("SIGTERM");
+	signalProcess.on("SIGINT", onSigint);
+	signalProcess.on("SIGTERM", onSigterm);
 	let result;
 	try {
-		const options = parseSimpleArgs(argv, { now });
-		if (options.help) {
-			console.log(SIMPLE_USAGE);
-			return;
+		try {
+			const options = parseSimpleArgs(argv, { now });
+			if (options.help) {
+				console.log(SIMPLE_USAGE);
+				return;
+			}
+			result = await runSimpleTask(options, {
+				...dependencies,
+				now,
+				signal: abortController.signal,
+				onStatus: (event) => {
+					if (event.milestone === "integration_started") {
+						integrationStarted = true;
+					} else if (event.milestone === "integration_completed") {
+						integrationStarted = false;
+					}
+					reportStatus(event);
+				},
+			});
+		} catch (error) {
+			result = {
+				schemaVersion: 1,
+				taskId: null,
+				status: "failed",
+				provider: null,
+				targetId: null,
+				elapsedMs: Math.max(0, now() - startedAt),
+				changedFiles: [],
+				checks: [],
+				failureReason:
+					error instanceof SimpleUsageError
+						? "invalid_invocation"
+						: "preflight_failed",
+				failurePhase: "preflight",
+				errorKind:
+					error instanceof SimpleUsageError
+						? "validation_failed"
+						: "unclassified_failure",
+				partialWorktree: null,
+				recovery: recoveryUnavailable(),
+			};
 		}
-		result = await runSimpleTask(options, {
-			...dependencies,
-			now,
-			onStatus:
-				dependencies.onStatus ??
-				((event) =>
-					console.error(
-						`dispatch: simple task=${event.taskId} phase=${event.phase}${event.milestone ? ` milestone=${event.milestone}` : ""}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
-					)),
-		});
-	} catch (error) {
-		result = {
-			schemaVersion: 1,
-			taskId: null,
-			status: "failed",
-			provider: null,
-			targetId: null,
-			elapsedMs: Math.max(0, now() - startedAt),
-			changedFiles: [],
-			checks: [],
-			failureReason:
-				error instanceof SimpleUsageError
-					? "invalid_invocation"
-					: "preflight_failed",
-			failurePhase: "preflight",
-			errorKind:
-				error instanceof SimpleUsageError
-					? "validation_failed"
-					: "unclassified_failure",
-			partialWorktree: null,
-			recovery: recoveryUnavailable(),
-		};
+		(dependencies.writeResult ?? console.log)(JSON.stringify(result));
+		if (
+			receivedSignal !== null &&
+			!(signalDuringIntegration && result?.status !== "succeeded")
+		) {
+			signalProcess.exitCode = receivedSignal === "SIGINT" ? 130 : 143;
+		} else if (result.status !== "succeeded") {
+			signalProcess.exitCode =
+				result.failureReason === "invalid_invocation" ? 2 : 1;
+		}
+	} finally {
+		signalProcess.removeListener("SIGINT", onSigint);
+		signalProcess.removeListener("SIGTERM", onSigterm);
 	}
-	console.log(JSON.stringify(result));
-	if (result.status !== "succeeded")
-		process.exitCode = result.failureReason === "invalid_invocation" ? 2 : 1;
 }
