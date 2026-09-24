@@ -152,6 +152,10 @@ const WORKTREE_RECORD_KEYS = new Set([
 	"state",
 	"reason",
 	"retainedAt",
+	"device",
+	"inode",
+	"nonce",
+	"writerStopped",
 ]);
 
 const RUN_ID_RE = /^[\w-]+$/;
@@ -1056,6 +1060,29 @@ function validateWorktreeRecord(worktree) {
 		if (!WORKTREE_RECORD_KEYS.has(key)) {
 			throw new SchemaError(`worktree contains invalid key: ${key}`);
 		}
+	}
+	const identityKeys = ["device", "inode", "nonce"];
+	const presentIdentityKeys = identityKeys.filter(
+		(key) => worktree[key] !== undefined,
+	);
+	if (presentIdentityKeys.length !== 0 && presentIdentityKeys.length !== 3) {
+		throw new SchemaError("worktree identity must be complete");
+	}
+	if (
+		presentIdentityKeys.length === 3 &&
+		(!/^[0-9]+$/.test(worktree.device) ||
+			!/^[0-9]+$/.test(worktree.inode) ||
+			!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+				worktree.nonce,
+			))
+	) {
+		throw new SchemaError("worktree identity is invalid");
+	}
+	if (
+		worktree.writerStopped !== undefined &&
+		typeof worktree.writerStopped !== "boolean"
+	) {
+		throw new SchemaError("worktree.writerStopped must be a boolean");
 	}
 	if (
 		typeof worktree.canonicalParent !== "string" ||

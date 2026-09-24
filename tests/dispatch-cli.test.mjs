@@ -11,17 +11,21 @@ import {
 } from "node:assert";
 import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
 	chmodSync,
+	closeSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 
@@ -36,6 +40,7 @@ import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 import { createDefaultRouteHealthDecision } from "../src/switchyard/router/health.mjs";
 import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
+import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -104,9 +109,11 @@ function exactFailureEvidence(targetId, harness, model, taskId = "1.1") {
 import {
 	captureHostFingerprint,
 	collectGcInventory,
+	defaultMeasureApfsPrivateBytes,
 	runDispatch as dispatchRun,
 	formatRunAbort,
 	handleBackendHealth,
+	handleGc,
 	handleLaunch,
 	handleRecover,
 	handleRun,
@@ -140,6 +147,7 @@ import {
 	LockError,
 	projectOutcomeShadow,
 	readRun,
+	releaseProjectLockIfOwnedBy,
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
 import {
@@ -1615,12 +1623,22 @@ describe("launch integration", () => {
 	});
 
 	it("a launched run retains its durable contract diagnosis when its checkpoint becomes unloadable", async () => {
-		const launchResponse = runDispatch(
-			["launch", tasksFile, "--project", projectDir, "--json"],
-			makeStateRootEnv(),
-		);
-		strictEqual(launchResponse.status, 0, launchResponse.stderr);
-		const launchEnvelope = JSON.parse(launchResponse.stdout.trim());
+		// Keep the launcher child test-owned. A real detached worker can overwrite
+		// the injected terminal diagnosis before the status assertions run.
+		const fakeChild = new EventEmitter();
+		fakeChild.pid = 999999;
+		fakeChild.unref = () => {};
+		const launchLines = [];
+		const originalLog = console.log;
+		try {
+			console.log = (line) => launchLines.push(line);
+			await handleLaunch([tasksFile, "--project", projectDir, "--json"], {
+				spawn: () => fakeChild,
+			});
+		} finally {
+			console.log = originalLog;
+		}
+		const launchEnvelope = JSON.parse(launchLines.at(-1));
 		const { readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
 		);
@@ -1644,6 +1662,7 @@ describe("launch integration", () => {
 			},
 			current.revision,
 		);
+		await releaseProjectLockIfOwnedBy(projectDir, launchEnvelope.runId);
 		writeFileSync(`${tasksFile}.checkpoint.json`, "{unloadable", "utf8");
 		const checkpointBytes = readFileSync(`${tasksFile}.checkpoint.json`);
 
@@ -2495,6 +2514,81 @@ describe("result integration", () => {
 });
 
 describe("recover integration", () => {
+	it("recover --run removes an expired, stopped, exact recorded salvage root", async () => {
+		const runId = `recover-owned-${randomUUID()}`;
+		const nonce = randomUUID();
+		const canonicalParent = "/private/tmp";
+		const candidateChild = `switchyard-simple-${randomUUID()}`;
+		const path = join(canonicalParent, candidateChild);
+		const quarantine = simpleQuarantinePath(nonce);
+		const oldDate = new Date(Date.now() - 26 * 60 * 60 * 1000);
+		mkdirSync(path, { mode: 0o700 });
+		const marker = join(path, ".switchyard-cleanup-owner.json");
+		writeFileSync(marker, JSON.stringify({ runId, nonce }), { mode: 0o600 });
+		writeFileSync(join(path, "payload.txt"), "salvage", { mode: 0o600 });
+		for (const entry of [marker, join(path, "payload.txt"), path])
+			utimesSync(entry, oldDate, oldDate);
+		const info = lstatSync(path, { bigint: true });
+		try {
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "simple",
+				workerPid: process.pid,
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			const initial = await readRun(runId);
+			await updateRun(
+				runId,
+				{
+					state: "failed",
+					cleanupState: "pending",
+					worktree: {
+						canonicalParent,
+						candidateChild,
+						path,
+						state: "retained",
+						reason: "provider_exit_nonzero",
+						retainedAt: oldDate.toISOString(),
+						device: info.dev.toString(),
+						inode: info.ino.toString(),
+						nonce,
+						writerStopped: true,
+					},
+				},
+				initial.revision,
+			);
+			const lines = [];
+			const progress = [];
+			const originalLog = console.log;
+			const originalError = console.error;
+			const priorExit = process.exitCode;
+			try {
+				console.log = (line) => lines.push(line);
+				console.error = (line) => progress.push(line);
+				await handleRecover(["--run", runId, "--state-root", stateRoot]);
+			} finally {
+				console.log = originalLog;
+				console.error = originalError;
+				process.exitCode = priorExit;
+			}
+			ok(progress.some((line) => line.includes("cleanup_scan_started")));
+			ok(progress.some((line) => line.includes("cleanup_remove_started")));
+			const result = JSON.parse(lines.at(-1));
+			strictEqual(result.worktreesReclaimed, 1);
+			strictEqual(result.disposition, "reclaimed");
+			strictEqual((await readRun(runId)).worktree.state, "removed");
+			strictEqual(existsSync(path), false);
+			strictEqual(existsSync(quarantine), false);
+		} finally {
+			if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+			if (existsSync(quarantine))
+				rmSync(quarantine, { recursive: true, force: true });
+		}
+	});
 	it("recover --help prints usage and exits 0", () => {
 		const result = runDispatch(["recover", "--help"]);
 		strictEqual(result.status, 0);
@@ -2522,7 +2616,7 @@ describe("recover integration", () => {
 			[
 				retained,
 				"retained",
-				"retained_for_recovery",
+				"identity_unavailable",
 				retained.worktreePath,
 				"preserved",
 			],
@@ -5720,6 +5814,186 @@ describe("retention sweep call sites (Task 6.5)", () => {
 });
 
 describe("gc subcommand (T62)", () => {
+	it("dry-run preserves an old recorded root and --apply removes exactly that root", async () => {
+		const runId = `gc-owned-${randomUUID()}`;
+		const nonce = randomUUID();
+		const parent = "/private/tmp";
+		const candidateChild = `switchyard-simple-${randomUUID()}`;
+		const path = join(parent, candidateChild);
+		const quarantine = simpleQuarantinePath(nonce);
+		const oldDate = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		mkdirSync(path, { mode: 0o700 });
+		const marker = join(path, ".switchyard-cleanup-owner.json");
+		const payload = join(path, "payload.txt");
+		writeFileSync(marker, JSON.stringify({ runId, nonce }), { mode: 0o600 });
+		writeFileSync(payload, "owned fixture", { mode: 0o600 });
+		for (const entry of [marker, payload, path])
+			utimesSync(entry, oldDate, oldDate);
+		const info = lstatSync(path, { bigint: true });
+		try {
+			await initializeRun({
+				runId,
+				tasksFilePath: tasksFile,
+				projectPath: projectDir,
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "simple",
+				workerPid: process.pid,
+				workerNonce: randomUUID(),
+				launchArgs: [],
+			});
+			const initial = await readRun(runId);
+			await updateRun(
+				runId,
+				{
+					state: "succeeded",
+					cleanupState: "failed",
+					worktree: {
+						canonicalParent: parent,
+						candidateChild,
+						path,
+						state: "active",
+						reason: "worktree_cleanup_failed",
+						retainedAt: null,
+						device: info.dev.toString(),
+						inode: info.ino.toString(),
+						nonce,
+						writerStopped: true,
+					},
+				},
+				initial.revision,
+			);
+			const logs = [];
+			const originalLog = console.log;
+			const priorExit = process.exitCode;
+			const dependencies = {
+				tmpdir: () => parent,
+				measurePrivateBytes: async () => ({ status: "error", roots: {} }),
+			};
+			try {
+				const inspected = async () =>
+					(
+						await collectGcInventory(
+							{ stateRoot, checkEligibility: true },
+							dependencies,
+						)
+					).roots.find((entry) => entry.path === path);
+				utimesSync(payload, new Date(), new Date());
+				strictEqual((await inspected()).eligibilityReason, "recently_modified");
+				utimesSync(payload, oldDate, oldDate);
+				await acquireProjectLock(projectDir, runId);
+				try {
+					strictEqual((await inspected()).eligibilityReason, "project_locked");
+				} finally {
+					await releaseProjectLockIfOwnedBy(projectDir, runId);
+				}
+				const current = await readRun(runId);
+				await updateRun(
+					runId,
+					{
+						state: "failed",
+						worktree: {
+							...current.worktree,
+							state: "active",
+							reason: "provider_exit_nonzero",
+							retainedAt: null,
+						},
+					},
+					current.revision,
+				);
+				strictEqual(
+					(await inspected()).eligibilityReason,
+					"active_claim_unresolved",
+				);
+				const unresolved = await readRun(runId);
+				await updateRun(
+					runId,
+					{
+						worktree: {
+							...unresolved.worktree,
+							state: "retained",
+							reason: "provider_exit_nonzero",
+							retainedAt: new Date().toISOString(),
+						},
+					},
+					unresolved.revision,
+				);
+				strictEqual(
+					(await inspected()).eligibilityReason,
+					"salvage_not_expired",
+				);
+				const retained = await readRun(runId);
+				await updateRun(
+					runId,
+					{
+						state: "succeeded",
+						worktree: {
+							...retained.worktree,
+							state: "active",
+							reason: "worktree_cleanup_failed",
+							retainedAt: null,
+						},
+					},
+					retained.revision,
+				);
+				const active = await readRun(runId);
+				await updateRun(
+					runId,
+					{
+						worktree: {
+							...active.worktree,
+							state: "retained",
+							retainedAt: new Date().toISOString(),
+						},
+					},
+					active.revision,
+				);
+				strictEqual(
+					(await inspected()).deletionEligible,
+					true,
+					"failed cleanup is non-salvage even with a recent retainedAt",
+				);
+				const nonSalvage = await readRun(runId);
+				await updateRun(
+					runId,
+					{
+						worktree: {
+							...nonSalvage.worktree,
+							state: "active",
+							retainedAt: null,
+						},
+					},
+					nonSalvage.revision,
+				);
+				const fd = openSync(payload, "r");
+				try {
+					strictEqual((await inspected()).eligibilityReason, "open_handles");
+				} finally {
+					closeSync(fd);
+				}
+				console.log = (line) => logs.push(line);
+				await handleGc(["--state-root", stateRoot], dependencies);
+				const dry = JSON.parse(logs.pop());
+				strictEqual(
+					dry.roots.find((entry) => entry.path === path).deletionEligible,
+					true,
+				);
+				ok(existsSync(path));
+				await handleGc(["--apply", "--state-root", stateRoot], dependencies);
+				const applied = JSON.parse(logs.pop());
+				strictEqual(applied.apply.removed, 1);
+				strictEqual(existsSync(path), false);
+				strictEqual(existsSync(quarantine), false);
+				strictEqual((await readRun(runId)).worktree.state, "removed");
+			} finally {
+				console.log = originalLog;
+				process.exitCode = priorExit;
+			}
+		} finally {
+			if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+			if (existsSync(quarantine))
+				rmSync(quarantine, { recursive: true, force: true });
+		}
+	});
 	it("parseGcArgs parses valid flags", () => {
 		const parsed = parseGcArgs(["--state-root", "/tmp/state", "--json"]);
 		strictEqual(parsed.stateRoot, resolve("/tmp/state"));
@@ -5732,18 +6006,9 @@ describe("gc subcommand (T62)", () => {
 		strictEqual(parsed.help, true);
 	});
 
-	it("parseGcArgs rejects --apply with UsageError", () => {
-		let thrown = null;
-		try {
-			parseGcArgs(["--apply"]);
-		} catch (err) {
-			thrown = err;
-		}
-		ok(thrown instanceof Error);
-		ok(
-			thrown.message.includes("does not support --apply") ||
-				thrown.message.includes("apply"),
-		);
+	it("parseGcArgs accepts explicit --apply while defaulting to dry-run", () => {
+		strictEqual(parseGcArgs([]).apply, false);
+		strictEqual(parseGcArgs(["--apply"]).apply, true);
 	});
 
 	it("parseGcArgs rejects unexpected positionals or options", () => {
@@ -6052,7 +6317,7 @@ describe("gc subcommand (T62)", () => {
 		strictEqual(found.deletionEligible, false);
 	});
 
-	it("CLI output explicitly refuses --apply and leaves every fixture path unchanged", () => {
+	it("CLI --apply preserves fixture and unknown paths", () => {
 		const localStateRoot = tempDir("gc-apply-state-");
 		const rawParent = tempDir("gc-apply-parent-");
 		const parent = realpathSync(rawParent);
@@ -6075,12 +6340,9 @@ describe("gc subcommand (T62)", () => {
 			{ TMPDIR: parent },
 		);
 
-		// Must exit with code 2 (usage error)
-		strictEqual(result.status, 2);
-		ok(
-			result.stderr.includes("does not support --apply"),
-			`expected refusal in stderr, got: ${result.stderr}`,
-		);
+		strictEqual(result.status, 0, result.stderr);
+		const inventory = JSON.parse(result.stdout);
+		strictEqual(inventory.apply.removed, 0);
 
 		// Every fixture path must remain intact and unchanged
 		ok(existsSync(fixtureDir), "fixture dir must exist after --apply refusal");
@@ -6205,18 +6467,19 @@ describe("gc subcommand (T62)", () => {
 		strictEqual(readFileSync(file, "utf8"), "keep");
 	});
 
-	it("rejects programmatic apply before performing inventory reads", async () => {
-		await rejects(
-			collectGcInventory(
-				{ apply: true },
-				{
-					realpathSync: () => {
-						throw new Error("must not read paths");
-					},
-				},
-			),
-			/does not support --apply/,
+	it("programmatic inventory remains read-only even when apply is requested", async () => {
+		const parent = realpathSync(tempDir("gc-inventory-apply-"));
+		const root = join(parent, "switchyard-simple-unknown");
+		mkdirSync(root);
+		const inventory = await collectGcInventory(
+			{ apply: true, stateRoot: tempDir("gc-inventory-state-") },
+			{ tmpdir: () => parent },
 		);
+		strictEqual(
+			inventory.roots.find((entry) => entry.path === root).deletionEligible,
+			false,
+		);
+		ok(existsSync(root));
 	});
 
 	it("fails closed when the OS temp parent cannot be canonicalized", async () => {
@@ -6338,5 +6601,490 @@ describe("gc subcommand (T62)", () => {
 		strictEqual(inventory.roots[0].bytes, null);
 		strictEqual(inventory.roots[0].unavailableReason, "path_ambiguity");
 		strictEqual(inventory.roots[0].deletionEligible, false);
+	});
+
+	it("measures APFS private bytes for fresh regular file fixtures (allows unavailable on non-APFS)", async () => {
+		const localStateRoot = tempDir("gc-measure-state-");
+		const rawParent = tempDir("gc-measure-parent-");
+		const parent = realpathSync(rawParent);
+
+		const candidate = "switchyard-simple-fixture-1mb";
+		const rootPath = join(parent, candidate);
+		mkdirSync(rootPath, { recursive: true });
+
+		// Fresh 1 MiB regular file:
+		const payload1MiB = Buffer.alloc(1024 * 1024, 0x42);
+		writeFileSync(join(rootPath, "payload-1mb.bin"), payload1MiB);
+
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot, measureBytes: true },
+			{ tmpdir: () => parent },
+		);
+
+		const root = inventory.roots.find((r) => r.path === rootPath);
+		ok(root, "fixture root must be discovered in inventory");
+		strictEqual(root.exists, true);
+		strictEqual(root.deletionEligible, false);
+
+		if (root.measurable) {
+			strictEqual(typeof root.bytes, "number");
+			// Host probe confirmed getattrlist ATTR_CMNEXT_PRIVATESIZE returns 1048576 for fresh 1 MiB regular file
+			strictEqual(root.bytes, 1048576);
+			strictEqual(root.unavailableReason, null);
+			strictEqual(inventory.summary.measurable, true);
+			strictEqual(inventory.summary.totalBytes, 1048576);
+		} else {
+			// On non-APFS or unsupported platform
+			strictEqual(root.bytes, null);
+			ok(typeof root.unavailableReason === "string");
+			strictEqual(inventory.summary.measurable, false);
+			strictEqual(inventory.summary.totalBytes, null);
+		}
+	});
+
+	it("distinguishes APFS clone private bytes from allocated bytes", {
+		skip: process.platform !== "darwin",
+	}, async () => {
+		const parent = realpathSync(tempDir("gc-clone-parent-"));
+		const rootPath = join(parent, "switchyard-simple-fixture-clone");
+		mkdirSync(rootPath);
+		const source = join(rootPath, "source.bin");
+		const clone = join(rootPath, "clone.bin");
+		writeFileSync(source, Buffer.alloc(1024 * 1024, 0x42));
+		const before = await defaultMeasureApfsPrivateBytes([rootPath]);
+		strictEqual(
+			before.roots[rootPath]?.measurable,
+			true,
+			"APFS private-byte measurement must work on the macOS test volume",
+		);
+		strictEqual(before.roots[rootPath].bytes, 1024 * 1024);
+		const copied = spawnSync("/bin/cp", ["-c", source, clone], {
+			encoding: "utf8",
+		});
+		strictEqual(copied.status, 0, copied.stderr);
+		const after = await defaultMeasureApfsPrivateBytes([rootPath]);
+		strictEqual(after.roots[rootPath].measurable, true);
+		strictEqual(after.roots[rootPath].bytes, 0);
+		ok(statSync(source).blocks > 0, "shared blocks remain allocated");
+	});
+
+	it("sums only complete measurements into each class total and whole-inventory summary", async () => {
+		const localStateRoot = tempDir("gc-totals-state-");
+		const runsDir = join(localStateRoot, "runs");
+		mkdirSync(runsDir, { recursive: true });
+
+		const rawParent = tempDir("gc-totals-parent-");
+		const parent = realpathSync(rawParent);
+
+		// 1. recorded root with 1 MiB file
+		const candidateRec = "switchyard-simple-recorded-tot";
+		const pathRec = join(parent, candidateRec);
+		mkdirSync(pathRec, { recursive: true });
+		writeFileSync(
+			join(pathRec, "rec-1mb.bin"),
+			Buffer.alloc(1024 * 1024, 0x52),
+		);
+
+		const runDirRec = join(runsDir, "run-tot-rec");
+		mkdirSync(runDirRec, { recursive: true });
+		writeFileSync(
+			join(runDirRec, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-tot-rec",
+				state: "running",
+				cleanupState: "pending",
+				revision: 1,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent,
+					candidateChild: candidateRec,
+					path: pathRec,
+					state: "active",
+					reason: null,
+					retainedAt: null,
+				},
+			}),
+			"utf8",
+		);
+
+		// 2. unknown root with 1 MiB file
+		const candidateUnk = "switchyard-simple-unknown-tot";
+		const pathUnk = join(parent, candidateUnk);
+		mkdirSync(pathUnk, { recursive: true });
+		writeFileSync(
+			join(pathUnk, "unk-1mb.bin"),
+			Buffer.alloc(1024 * 1024, 0x55),
+		);
+
+		// 3. missing root (recorded, but does not exist on disk)
+		const candidateMiss = "switchyard-simple-missing-tot";
+		const pathMiss = join(parent, candidateMiss);
+		const runDirMiss = join(runsDir, "run-tot-miss");
+		mkdirSync(runDirMiss, { recursive: true });
+		writeFileSync(
+			join(runDirMiss, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-tot-miss",
+				state: "failed",
+				cleanupState: "failed",
+				revision: 1,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.2"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent,
+					candidateChild: candidateMiss,
+					path: pathMiss,
+					state: "retained",
+					reason: null,
+					retainedAt: null,
+				},
+			}),
+			"utf8",
+		);
+
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot, measureBytes: true },
+			{ tmpdir: () => parent },
+		);
+
+		const rootRec = inventory.roots.find((r) => r.path === pathRec);
+		const rootUnk = inventory.roots.find((r) => r.path === pathUnk);
+		const rootMiss = inventory.roots.find((r) => r.path === pathMiss);
+
+		ok(rootRec);
+		ok(rootUnk);
+		ok(rootMiss);
+		strictEqual(rootMiss.bytes, null);
+		strictEqual(rootMiss.measurable, false);
+
+		if (rootRec.measurable && rootUnk.measurable) {
+			strictEqual(rootRec.bytes, 1048576);
+			strictEqual(rootUnk.bytes, 1048576);
+			strictEqual(inventory.summary.byClass.recorded.bytes, 1048576);
+			strictEqual(inventory.summary.byClass.recorded.measurable, true);
+			strictEqual(inventory.summary.byClass.unknown.bytes, 1048576);
+			strictEqual(inventory.summary.byClass.unknown.measurable, true);
+			strictEqual(inventory.summary.byClass.missing.bytes, null);
+			strictEqual(inventory.summary.byClass.missing.measurable, false);
+			strictEqual(inventory.summary.totalBytes, null);
+			strictEqual(inventory.summary.measurable, false);
+		} else {
+			strictEqual(inventory.summary.totalBytes, null);
+			strictEqual(inventory.summary.measurable, false);
+		}
+	});
+
+	it("does not label a partially measured class as a complete private-byte total", async () => {
+		const parent = realpathSync(tempDir("gc-partial-parent-"));
+		const stateRoot = tempDir("gc-partial-state-");
+		const goodPath = join(parent, "switchyard-simple-fixture-complete");
+		const badPath = join(parent, "switchyard-simple-fixture-unavailable");
+		mkdirSync(goodPath);
+		mkdirSync(badPath);
+		const inventory = await collectGcInventory(
+			{ stateRoot, measureBytes: true },
+			{
+				tmpdir: () => parent,
+				measurePrivateBytes: async () => ({
+					status: "ok",
+					roots: {
+						[goodPath]: { measurable: true, bytes: 1024 },
+						[badPath]: {
+							measurable: false,
+							bytes: null,
+							unavailableReason: "inaccessible",
+						},
+					},
+				}),
+			},
+		);
+		strictEqual(inventory.summary.byClass.fixture.count, 2);
+		strictEqual(inventory.summary.byClass.fixture.bytes, null);
+		strictEqual(inventory.summary.byClass.fixture.measurable, false);
+		strictEqual(inventory.summary.totalBytes, null);
+		strictEqual(inventory.summary.measurable, false);
+	});
+
+	it("refuses symlinks and never follows symlink targets outside or inside roots", async () => {
+		const localStateRoot = tempDir("gc-symlink-refuse-state-");
+		const rawParent = tempDir("gc-symlink-refuse-parent-");
+		const parent = realpathSync(rawParent);
+
+		// Outside directory with a large 5 MiB payload:
+		const outsideDir = tempDir("gc-outside-data-");
+		writeFileSync(
+			join(outsideDir, "external.bin"),
+			Buffer.alloc(1024 * 1024 * 5, 0x58),
+		);
+
+		// 1. Root directory containing a regular file and a symlink to outsideDir:
+		const candidateDir = "switchyard-simple-symlink-dir";
+		const rootPath = join(parent, candidateDir);
+		mkdirSync(rootPath, { recursive: true });
+		writeFileSync(
+			join(rootPath, "payload-1mb.bin"),
+			Buffer.alloc(1024 * 1024, 0x59),
+		);
+		symlinkSync(outsideDir, join(rootPath, "symlink-to-outside"));
+
+		// 2. Root that is itself a symlink pointing to outsideDir:
+		const candidateSymlink = "switchyard-simple-symlink-root";
+		const symlinkRootPath = join(parent, candidateSymlink);
+		symlinkSync(outsideDir, symlinkRootPath);
+
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot, measureBytes: true },
+			{ tmpdir: () => parent },
+		);
+
+		const symlinkRoot = inventory.roots.find((r) => r.path === symlinkRootPath);
+		ok(symlinkRoot);
+		strictEqual(symlinkRoot.pathAmbiguity, true);
+		strictEqual(symlinkRoot.measurable, false);
+		strictEqual(symlinkRoot.bytes, null);
+		strictEqual(symlinkRoot.deletionEligible, false);
+
+		const dirRoot = inventory.roots.find((r) => r.path === rootPath);
+		ok(dirRoot);
+		strictEqual(dirRoot.deletionEligible, false);
+		if (dirRoot.measurable) {
+			// Must count ONLY the 1 MiB regular file, never following the 5 MiB symlink!
+			strictEqual(dirRoot.bytes, 1048576);
+		} else {
+			strictEqual(dirRoot.bytes, null);
+		}
+	});
+
+	it("handles timeout, measurement error, or inaccessible roots by reporting unavailable without affecting deletion eligibility", async () => {
+		const localStateRoot = tempDir("gc-error-state-");
+		const rawParent = tempDir("gc-error-parent-");
+		const parent = realpathSync(rawParent);
+
+		const candidate = "switchyard-simple-error-root";
+		const rootPath = join(parent, candidate);
+		mkdirSync(rootPath, { recursive: true });
+		writeFileSync(join(rootPath, "file.bin"), Buffer.alloc(1024 * 1024, 0x60));
+
+		// Case A: Measurement timeout
+		const inventoryTimeout = await collectGcInventory(
+			{ stateRoot: localStateRoot, measureBytes: true },
+			{
+				tmpdir: () => parent,
+				measurePrivateBytes: async () => ({
+					status: "timeout",
+					roots: {},
+				}),
+			},
+		);
+		const rootTimeout = inventoryTimeout.roots.find((r) => r.path === rootPath);
+		ok(rootTimeout);
+		strictEqual(rootTimeout.measurable, false);
+		strictEqual(rootTimeout.bytes, null);
+		strictEqual(rootTimeout.unavailableReason, "private_bytes_unavailable");
+		strictEqual(rootTimeout.deletionEligible, false);
+		strictEqual(inventoryTimeout.summary.measurable, false);
+		strictEqual(inventoryTimeout.summary.totalBytes, null);
+
+		// Case B: Injected measurement exception/crash
+		const inventoryError = await collectGcInventory(
+			{ stateRoot: localStateRoot, measureBytes: true },
+			{
+				tmpdir: () => parent,
+				measurePrivateBytes: async () => {
+					throw new Error("subprocess spawned failure");
+				},
+			},
+		);
+		const rootError = inventoryError.roots.find((r) => r.path === rootPath);
+		ok(rootError);
+		strictEqual(rootError.measurable, false);
+		strictEqual(rootError.bytes, null);
+		strictEqual(rootError.unavailableReason, "private_bytes_unavailable");
+		strictEqual(rootError.deletionEligible, false);
+		strictEqual(inventoryError.summary.measurable, false);
+		strictEqual(inventoryError.summary.totalBytes, null);
+	});
+
+	it("emits live progress on stderr during gc run and produces safe valid JSON on stdout", () => {
+		const localStateRoot = tempDir("gc-progress-state-");
+		const rawParent = tempDir("gc-progress-parent-");
+		const parent = realpathSync(rawParent);
+
+		const candidate = "switchyard-simple-progress-root";
+		const rootPath = join(parent, candidate);
+		mkdirSync(rootPath, { recursive: true });
+		writeFileSync(join(rootPath, "data.bin"), Buffer.alloc(1024 * 1024, 0x61));
+
+		const result = runDispatch(["gc", "--state-root", localStateRoot], {
+			TMPDIR: parent,
+		});
+
+		strictEqual(result.status, 0, `gc failed: ${result.stderr}`);
+		ok(
+			result.stderr.includes("[gc]"),
+			`expected [gc] progress on stderr, got: ${result.stderr}`,
+		);
+		ok(
+			result.stderr.includes("Reading run records and direct temp children") ||
+				result.stderr.includes("APFS private bytes"),
+			`expected progress messages on stderr, got: ${result.stderr}`,
+		);
+
+		const parsed = JSON.parse(result.stdout.trim());
+		strictEqual(parsed.schemaVersion, 1);
+		ok(Array.isArray(parsed.roots));
+		const root = parsed.roots.find((r) => r.path === rootPath);
+		ok(root);
+		strictEqual(root.deletionEligible, false);
+	});
+
+	it("apfs-private-bytes.py standalone helper respects file count bound and returns valid JSON", async () => {
+		const rawParent = tempDir("gc-helper-parent-");
+		const parent = realpathSync(rawParent);
+
+		const candidate = "switchyard-simple-helper-bound";
+		const rootPath = join(parent, candidate);
+		mkdirSync(rootPath, { recursive: true });
+		for (let i = 0; i < 5; i++) {
+			writeFileSync(join(rootPath, `file-${i}.bin`), Buffer.alloc(1024, 0x62));
+		}
+
+		// When maxFiles is 2, visiting 5 files must trigger file_count_exceeded bound
+		const result = await defaultMeasureApfsPrivateBytes(
+			[rootPath],
+			{ maxFiles: 2 },
+			{},
+		);
+		ok(result.roots[rootPath]);
+		if (process.platform === "darwin") {
+			strictEqual(result.roots[rootPath].measurable, false);
+			strictEqual(result.roots[rootPath].bytes, null);
+			strictEqual(result.totalBytes, null);
+			strictEqual(
+				result.roots[rootPath].unavailableReason,
+				"file_count_exceeded",
+			);
+		}
+	});
+
+	it("rejects malformed APFS helper stdin instead of reporting an empty success", () => {
+		const helper = resolve(__dirname, "..", "scripts", "apfs-private-bytes.py");
+		const result = spawnSync("/usr/bin/python3", [helper, "--stdin"], {
+			input: "{invalid",
+			encoding: "utf8",
+		});
+		strictEqual(result.status, 2);
+		ok(result.stderr.includes("Invalid root list on stdin"));
+		strictEqual(result.stdout, "");
+	});
+
+	it("forces a hung measurement helper to stop after its timeout", async () => {
+		const kills = [];
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.stdin = { end() {} };
+		child.killed = false;
+		child.kill = (signal) => {
+			kills.push(signal);
+			child.killed = true;
+			if (signal === "SIGKILL") queueMicrotask(() => child.emit("close", null));
+			return true;
+		};
+		const result = await defaultMeasureApfsPrivateBytes(
+			["/disposable-test-root"],
+			{ timeoutMs: 5, termGraceMs: 5 },
+			{ spawnFn: () => child, stderr: { write() {} } },
+		);
+		strictEqual(result.status, "timeout");
+		deepStrictEqual(kills, ["SIGTERM", "SIGKILL"]);
+	});
+
+	it("handles an asynchronous stdin EPIPE when measurement exits early", async () => {
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.stdin = new EventEmitter();
+		child.stdin.end = () => {
+			queueMicrotask(() => {
+				child.stdin.emit("error", new Error("EPIPE"));
+				child.emit("close", 1);
+			});
+		};
+		const roots = Array.from({ length: 51 }, (_, i) => `/fixture-${i}`);
+		const result = await defaultMeasureApfsPrivateBytes(
+			roots,
+			{},
+			{
+				spawnFn: () => child,
+				stderr: { write() {} },
+			},
+		);
+		strictEqual(result.status, "error");
+	});
+
+	it("decodes split UTF-8 output and escalates an overflowing helper", async () => {
+		const unicodePath = "/fixture-ü";
+		const payload = Buffer.from(
+			JSON.stringify({
+				status: "ok",
+				roots: { [unicodePath]: { measurable: true, bytes: 1 } },
+			}),
+		);
+		const split = payload.indexOf(Buffer.from("ü")) + 1;
+		const decoded = new EventEmitter();
+		decoded.stdout = new EventEmitter();
+		decoded.stderr = new EventEmitter();
+		decoded.stdin = { end() {} };
+		queueMicrotask(() => {
+			decoded.stdout.emit("data", payload.subarray(0, split));
+			decoded.stdout.emit("data", payload.subarray(split));
+			decoded.emit("close", 0);
+		});
+		const result = await defaultMeasureApfsPrivateBytes(
+			[unicodePath],
+			{},
+			{
+				spawnFn: () => decoded,
+				stderr: { write() {} },
+			},
+		);
+		strictEqual(result.roots[unicodePath].bytes, 1);
+
+		const hung = new EventEmitter();
+		hung.stdout = new EventEmitter();
+		hung.stderr = new EventEmitter();
+		hung.stdin = { end() {} };
+		const kills = [];
+		hung.kill = (signal) => {
+			kills.push(signal);
+			if (signal === "SIGKILL") queueMicrotask(() => hung.emit("close", null));
+			return true;
+		};
+		queueMicrotask(() => hung.stdout.emit("data", Buffer.alloc(16)));
+		const overflow = await defaultMeasureApfsPrivateBytes(
+			[unicodePath],
+			{
+				maxOutputBytes: 1,
+				timeoutMs: 500,
+				termGraceMs: 5,
+			},
+			{ spawnFn: () => hung, stderr: { write() {} } },
+		);
+		strictEqual(overflow.status, "output_exceeded");
+		deepStrictEqual(kills, ["SIGTERM", "SIGKILL"]);
 	});
 });

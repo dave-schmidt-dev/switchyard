@@ -32,13 +32,51 @@ import {
 	handleSimple,
 	parseSimpleArgs,
 	runSimpleTask,
+	runSimpleWriter,
 	simpleProviderCompatibility,
 	simpleRouteIsFunded,
 } from "../src/switchyard/simple/index.mjs";
+import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalTmpdirEnv = process.env.TMPDIR;
 const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
+const ORIGINAL_REAL_TMPDIR = realpathSync(tmpdir());
+
+function listRealTmpSimpleDirectoryNames(
+	dir = ORIGINAL_REAL_TMPDIR,
+	prefix = "switchyard-simple-",
+) {
+	return new Set(
+		readdirSync(dir, { withFileTypes: true })
+			.filter((dirent) => dirent.name.startsWith(prefix))
+			.map((dirent) => dirent.name),
+	);
+}
+
+function findNewSimpleRoots(
+	initialSnapshot,
+	currentEntries,
+	prefix = "switchyard-simple-",
+) {
+	const initialSet =
+		initialSnapshot instanceof Set ? initialSnapshot : new Set(initialSnapshot);
+	return Array.from(currentEntries).filter(
+		(name) => name.startsWith(prefix) && !initialSet.has(name),
+	);
+}
+
+function assertNoLeakedSimpleRoots(initialSnapshot, currentEntries, prefix) {
+	const leaked = findNewSimpleRoots(initialSnapshot, currentEntries, prefix);
+	deepStrictEqual(
+		leaked,
+		[],
+		`isolated simple tests leaked real temp roots: ${leaked.join(", ")}`,
+	);
+}
+
+const initialRealTmpSimpleRoots =
+	listRealTmpSimpleDirectoryNames(ORIGINAL_REAL_TMPDIR);
 const SUITE_TMPDIR = realpathSync(tempDir("switchyard-suite-tmp-"));
 process.env.TMPDIR = SUITE_TMPDIR;
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(SUITE_TMPDIR, "run-store");
@@ -304,6 +342,19 @@ afterEach(() => {
 });
 
 after(() => {
+	const ownQuarantineRoots = [];
+	const runsDir = join(SUITE_TMPDIR, "run-store", "runs");
+	if (existsSync(runsDir)) {
+		for (const entry of readdirSync(runsDir)) {
+			const recordPath = join(runsDir, entry, "run.json");
+			if (!existsSync(recordPath)) continue;
+			const record = JSON.parse(readFileSync(recordPath, "utf8"));
+			if (record.worktree?.nonce) {
+				const quarantine = simpleQuarantinePath(record.worktree.nonce);
+				if (existsSync(quarantine)) ownQuarantineRoots.push(quarantine);
+			}
+		}
+	}
 	if (originalTmpdirEnv === undefined) delete process.env.TMPDIR;
 	else process.env.TMPDIR = originalTmpdirEnv;
 	if (originalRunStoreEnv === undefined)
@@ -312,6 +363,32 @@ after(() => {
 	try {
 		rmSync(SUITE_TMPDIR, { recursive: true, force: true });
 	} catch {}
+
+	const syntheticRoot = "switchyard-simple-synthetic-leak-check";
+	deepStrictEqual(
+		findNewSimpleRoots(initialRealTmpSimpleRoots, [
+			...initialRealTmpSimpleRoots,
+			syntheticRoot,
+		]),
+		[syntheticRoot],
+	);
+	throws(
+		() =>
+			assertNoLeakedSimpleRoots(initialRealTmpSimpleRoots, [
+				...initialRealTmpSimpleRoots,
+				syntheticRoot,
+			]),
+		/isolated simple tests leaked real temp roots/,
+	);
+
+	const finalRealTmpSimpleRoots =
+		listRealTmpSimpleDirectoryNames(ORIGINAL_REAL_TMPDIR);
+	assertNoLeakedSimpleRoots(initialRealTmpSimpleRoots, finalRealTmpSimpleRoots);
+	deepStrictEqual(
+		ownQuarantineRoots,
+		[],
+		"simple tests leaked owned quarantines",
+	);
 });
 
 describe("simple dispatch argument boundary", () => {
@@ -801,6 +878,36 @@ describe("simple dispatch argument boundary", () => {
 });
 
 describe("simple local execution path", () => {
+	it("confirms the dedicated process group is gone after its leader exits", async () => {
+		const result = await runSimpleWriter(
+			"/bin/sh",
+			["-c", "sleep 0.2 </dev/null >/dev/null 2>&1 & exit 0"],
+			{ timeoutMs: 5_000, termGraceMs: 100 },
+		);
+		strictEqual(result.success, true);
+		strictEqual(result.writerLifecycle, "stopped");
+		ok(Number.isSafeInteger(result.processGroupId));
+		throws(() => process.kill(-result.processGroupId, 0), { code: "ESRCH" });
+	});
+
+	it("settles a dedicated process group on cancellation", async () => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 50);
+		try {
+			const result = await runSimpleWriter("/bin/sleep", ["30"], {
+				signal: controller.signal,
+				timeoutMs: 5_000,
+				termGraceMs: 100,
+			});
+			strictEqual(result.cancelled, true);
+			strictEqual(result.writerLifecycle, "stopped");
+			throws(() => process.kill(-result.processGroupId, 0), {
+				code: "ESRCH",
+			});
+		} finally {
+			clearTimeout(timer);
+		}
+	});
 	for (const [label, output, verdict, expectedStatus] of [
 		["non-JSON", "provider prose", "agy_unparseable", "failed"],
 		["non-SUCCESS", '{"status":"FAILED"}', "agy_non_success", "failed"],
@@ -2585,7 +2692,7 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			ok(typeof run.worktree.retainedAt === "string");
 		});
 
-		it("settles SIGINT during a provider, retains uncertain work, and releases the lock", async () => {
+		it("settles SIGINT during a clean provider, removes the root, and releases the lock", async () => {
 			const repo = makeRepo();
 			const signalProcess = new EventEmitter();
 			const taskId = `sigint-provider-${Date.now()}`;
@@ -2651,21 +2758,20 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(signalProcess.exitCode, 130);
 			strictEqual(result.status, "failed");
 			strictEqual(result.failureReason, "provider_cancelled");
-			ok(result.partialWorktree);
-			strictEqual(result.recovery.cleanup.writer.state, "unavailable");
-			strictEqual(existsSync(result.partialWorktree), true);
+			strictEqual(result.partialWorktree, null);
+			strictEqual(result.recovery.cleanup.writer.state, "stopped");
 			strictEqual(checkStarted, false);
 			strictEqual(lockReleases, 1);
 			deepStrictEqual(terminalWrites, ["failed"]);
 			const run = await readRun(runId);
 			strictEqual(run.state, "failed");
-			strictEqual(run.worktree.state, "retained");
-			strictEqual(run.cleanupState, "pending");
+			strictEqual(run.worktree.state, "removed");
+			strictEqual(run.cleanupState, "complete");
 			strictEqual(signalProcess.listenerCount("SIGINT"), 0);
 			strictEqual(signalProcess.listenerCount("SIGTERM"), 0);
 		});
 
-		it("retains a cloned checkout when SIGINT arrives before provider launch", async () => {
+		it("removes a cloned checkout when SIGINT arrives before provider launch", async () => {
 			const repo = makeRepo();
 			const signalProcess = new EventEmitter();
 			const taskId = `sigint-before-provider-${Date.now()}`;
@@ -2714,18 +2820,14 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(result.status, "failed");
 			strictEqual(result.failureReason, "provider_cancelled");
 			strictEqual(providerLaunches, 0);
-			ok(result.partialWorktree);
-			strictEqual(
-				existsSync(join(result.partialWorktree, "src", "a.txt")),
-				true,
-			);
-			strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+			strictEqual(result.partialWorktree, null);
+			strictEqual(result.recovery.cleanup.writer.state, "never_started");
 			strictEqual(lockReleases, 1);
 			deepStrictEqual(terminalWrites, ["failed"]);
 			const run = await readRun(runId);
 			strictEqual(run.state, "failed");
-			strictEqual(run.worktree.state, "retained");
-			strictEqual(run.cleanupState, "pending");
+			strictEqual(run.worktree.state, "removed");
+			strictEqual(run.cleanupState, "complete");
 		});
 
 		it("settles SIGTERM during a check without starting integration", async () => {
@@ -2786,7 +2888,7 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(result.status, "failed");
 			strictEqual(result.failureReason, "provider_cancelled");
 			ok(result.partialWorktree);
-			strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+			strictEqual(result.recovery.cleanup.writer.state, "stopped");
 			strictEqual(lockReleases, 1);
 			strictEqual(checkStarts, 1);
 			deepStrictEqual(terminalWrites, ["failed"]);
@@ -2950,15 +3052,14 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				retain(result, repo.projectPath);
 				strictEqual(result.status, "failed");
 				strictEqual(result.failureReason, "provider_cancelled");
-				ok(result.partialWorktree);
-				strictEqual(existsSync(result.partialWorktree), true);
-				strictEqual(result.recovery.cleanup.writer.state, "unavailable");
+				strictEqual(result.partialWorktree, null);
+				strictEqual(result.recovery.cleanup.writer.state, "stopped");
 				deepStrictEqual(meta.terminalWrites, ["failed"]);
 				strictEqual(meta.lockReleases, 1);
 				const run = await readRun(runId);
 				strictEqual(run.state, "failed");
-				strictEqual(run.worktree.state, "retained");
-				strictEqual(run.cleanupState, "pending");
+				strictEqual(run.worktree.state, "removed");
+				strictEqual(run.cleanupState, "complete");
 				strictEqual(isProjectLockHeld(repo.projectPath), false);
 				deepStrictEqual(meta.directChildKills, ["SIGTERM"]);
 				const terminalEvents = (await readEvents(runId)).filter(
@@ -3036,6 +3137,23 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				join(SUITE_TMPDIR, "run-store"),
 			);
 			strictEqual(dirname(makeRepo().root), SUITE_TMPDIR);
+
+			const syntheticRoot = "switchyard-simple-synthetic-leak-check";
+			deepStrictEqual(
+				findNewSimpleRoots(initialRealTmpSimpleRoots, [
+					...initialRealTmpSimpleRoots,
+					syntheticRoot,
+				]),
+				[syntheticRoot],
+			);
+			throws(
+				() =>
+					assertNoLeakedSimpleRoots(initialRealTmpSimpleRoots, [
+						...initialRealTmpSimpleRoots,
+						syntheticRoot,
+					]),
+				/isolated simple tests leaked real temp roots/,
+			);
 		});
 	});
 });

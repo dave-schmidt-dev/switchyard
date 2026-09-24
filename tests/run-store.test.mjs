@@ -2039,6 +2039,29 @@ describe("retention", () => {
 		await rejects(readRun(removedId), /Run not found/);
 	});
 
+	it("accepts complete durable worktree identity and rejects partial identity", async () => {
+		const runId = uniqueRunId();
+		const canonicalParent = TEST_ROOT;
+		const candidateChild = `switchyard-simple-${runId}`;
+		const worktree = {
+			canonicalParent,
+			candidateChild,
+			path: join(canonicalParent, candidateChild),
+			state: "active",
+			device: "1",
+			inode: "42",
+			nonce: "12345678-1234-4234-8234-123456789abc",
+		};
+		await initializeRun(makeOptions({ runId, worktree }));
+		strictEqual((await readRun(runId)).worktree.inode, "42");
+		await rejects(
+			initializeRun(
+				makeOptions({ worktree: { ...worktree, nonce: undefined } }),
+			),
+			/worktree identity must be complete/,
+		);
+	});
+
 	it("keeps run.json and events.jsonl at any age, for any run state", async () => {
 		const states = [
 			{ state: "created", cleanupState: "not_started" },

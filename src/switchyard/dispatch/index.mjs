@@ -102,6 +102,7 @@ import {
 	getStateRoot,
 	getVmAdmissionRoot,
 	initializeRun,
+	isProjectLockHeld,
 	isProjectLockOwnedBy,
 	LockError,
 	persistDiagnosticArtifact,
@@ -133,6 +134,12 @@ import {
 	validateProjectFileEntries,
 } from "../runner/index.mjs";
 import { handleSimple, SIMPLE_USAGE } from "../simple/index.mjs";
+import {
+	cleanupSimpleWorktree,
+	scanSimpleWorktreeOpenHandles,
+	simpleQuarantinePath,
+	verifySimpleWorktreeClaim,
+} from "../simple/worktree-cleanup.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
 import { run as runOrphanLockRemediation } from "./remediate-orphaned-locks.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
@@ -233,10 +240,11 @@ const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>] [--st
   Simple candidates include runLiveness (worker PID state, not writer proof).
   Running simple targets skip global project-lock cleanup to protect possible child writers.`;
 
-const USAGE_GC = `Usage: switchyard-dispatch gc [--state-root <path>] [--json]
+const USAGE_GC = `Usage: switchyard-dispatch gc [--state-root <path>] [--json] [--apply]
 
   --state-root <path>  Read run records from this durable state root
   --json               Output as JSON (default behavior)
+  --apply              Remove only eligible recorded roots
   --help               Show this help`;
 
 const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest-repair> --target <target-id> [options]
@@ -3764,6 +3772,74 @@ async function handleRecover(argv, dependencies = {}) {
 					dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims
 				)();
 		const releasedIds = [...new Set([...targeted, ...direct, ...claims])];
+		let simpleWorktreesReclaimed = 0;
+		const recoveryProgress =
+			dependencies.onStatus ?? ((event) => console.error(`[recover] ${event}`));
+		if (
+			simpleRun &&
+			recoveryRun.worktree &&
+			isTerminalState(recoveryRun.state) &&
+			["retained", "preserved"].includes(simpleWorktreeCandidate?.disposition)
+		) {
+			const claim = recoveryRun.worktree;
+			let observedPath = claim.path;
+			try {
+				if (!existsSync(observedPath) && typeof claim.nonce === "string") {
+					const quarantine = simpleQuarantinePath(claim.nonce);
+					if (existsSync(quarantine)) observedPath = quarantine;
+				}
+				if (existsSync(observedPath) && claim.state !== "removed") {
+					// A terminal run's own stale lock can be released by exact owner ID;
+					// another run's project lock remains untouched and blocks cleanup.
+					await (
+						dependencies.releaseProjectLockIfOwnedBy ??
+						releaseProjectLockIfOwnedBy
+					)(recoveryRun.projectPath, runId);
+					const root = {
+						path: observedPath,
+						classification: "recorded",
+						pathAmbiguity: false,
+						runId,
+						deletionEligible: false,
+					};
+					const assessment = await assessGcRootBeforeOpenScan(
+						root,
+						recoveryRun,
+						{ ...dependencies, onStatus: recoveryProgress },
+					);
+					root.deletionEligible = assessment.eligible;
+					root.eligibilityReason = assessment.reason;
+					if (assessment.eligible) {
+						const scan = await (
+							dependencies.scanOpenHandles ?? scanSimpleWorktreeOpenHandles
+						)([observedPath], recoveryProgress);
+						if (scan.complete && !scan.openPaths.includes(observedPath)) {
+							const result = await applyRecordedSimpleCleanup(root, {
+								...dependencies,
+								onStatus: recoveryProgress,
+							});
+							if (result.disposition === "removed")
+								simpleWorktreesReclaimed = 1;
+							else simpleWorktreeCandidate.reason = result.reason;
+						} else {
+							simpleWorktreeCandidate.reason = scan.complete
+								? "open_handles"
+								: "open_handle_scan_unavailable";
+						}
+					} else {
+						simpleWorktreeCandidate.reason = assessment.reason;
+					}
+					if (simpleWorktreesReclaimed) {
+						simpleWorktreeCandidate = inspectSimpleWorktreeRecovery(
+							await (dependencies.readRun ?? readRun)(runId),
+							dependencies,
+						);
+					}
+				}
+			} catch {
+				errors.push("simple_worktree_recovery_unavailable");
+			}
+		}
 		const allocationIntents = simpleRun
 			? []
 			: await auditKnownAllocationIntents({
@@ -3778,7 +3854,7 @@ async function handleRecover(argv, dependencies = {}) {
 			disposition:
 				errors.length > 0
 					? "partial_failure"
-					: reclaimedCount > 0
+					: reclaimedCount > 0 || simpleWorktreesReclaimed > 0
 						? "reclaimed"
 						: simpleWorktreeCandidate
 							? ["removed", "missing"].includes(
@@ -3790,6 +3866,7 @@ async function handleRecover(argv, dependencies = {}) {
 								? "no_candidates"
 								: "preserved",
 			vmsReclaimed: reclaimedCount,
+			worktreesReclaimed: simpleWorktreesReclaimed,
 			unreclaimedSnapshots,
 			allocationIntents,
 			errors,
@@ -3877,13 +3954,8 @@ function parseGcArgs(argv) {
 		throw new UsageError(error.message);
 	}
 
-	if (parsed.values.apply) {
-		throw new UsageError(
-			"switchyard-dispatch gc does not support --apply; it is a dry-run inventory only",
-		);
-	}
-
 	return {
+		apply: parsed.values.apply,
 		help: parsed.values.help,
 		json: parsed.values.json,
 		stateRoot: parsed.values["state-root"]
@@ -3899,6 +3971,141 @@ const GC_PRIVATE_BYTES_UNAVAILABLE = Object.freeze({
 	measurable: false,
 	unavailableReason: "private_bytes_unavailable",
 });
+
+async function defaultMeasureApfsPrivateBytes(
+	paths,
+	options = {},
+	dependencies = {},
+) {
+	if (!paths || paths.length === 0) {
+		return { status: "ok", roots: {} };
+	}
+
+	const scriptPath =
+		dependencies.scriptPath ??
+		resolve(
+			dirname(fileURLToPath(import.meta.url)),
+			"..",
+			"..",
+			"..",
+			"scripts",
+			"apfs-private-bytes.py",
+		);
+
+	const pythonBin = dependencies.pythonBin ?? "/usr/bin/python3";
+	const timeoutMs = options.timeoutMs ?? 15_000;
+	const termGraceMs = options.termGraceMs ?? 2_000;
+	const maxOutputBytes = options.maxOutputBytes ?? 10 * 1024 * 1024;
+	const maxFiles = options.maxFiles ?? 100_000;
+	const stderrStream = dependencies.stderr ?? process.stderr;
+	const spawnFn = dependencies.spawnFn ?? spawn;
+
+	return new Promise((resolveResult) => {
+		const useStdin = paths.length > 50;
+		const args = [
+			scriptPath,
+			"--max-files",
+			String(maxFiles),
+			...(useStdin ? ["--stdin"] : paths),
+		];
+
+		let child;
+		try {
+			child = spawnFn(pythonBin, args, {
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} catch (err) {
+			return resolveResult({ status: "error", error: err.message, roots: {} });
+		}
+
+		const stdoutChunks = [];
+		let stdoutBytes = 0;
+		let timedOut = false;
+		let outputExceeded = false;
+		let settled = false;
+		let escalationTimer = null;
+
+		const finish = (result) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (escalationTimer) clearTimeout(escalationTimer);
+			resolveResult(result);
+		};
+
+		const stopHelper = () => {
+			try {
+				child.kill("SIGTERM");
+			} catch {}
+			escalationTimer ??= setTimeout(() => {
+				try {
+					if (!settled) child.kill("SIGKILL");
+				} catch {}
+			}, termGraceMs);
+			escalationTimer.unref();
+		};
+		const timer = setTimeout(() => {
+			timedOut = true;
+			stopHelper();
+		}, timeoutMs);
+
+		child.stdin?.on?.("error", () => {});
+		if (useStdin && child.stdin) {
+			try {
+				child.stdin.end(JSON.stringify(paths));
+			} catch {}
+		} else if (child.stdin) {
+			try {
+				child.stdin.end();
+			} catch {}
+		}
+
+		if (child.stdout) {
+			child.stdout.on("data", (chunk) => {
+				const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+				stdoutBytes += bytes.length;
+				if (stdoutBytes > maxOutputBytes) {
+					outputExceeded = true;
+					stopHelper();
+					return;
+				}
+				stdoutChunks.push(bytes);
+			});
+		}
+
+		if (child.stderr) {
+			child.stderr.on("data", (chunk) => {
+				try {
+					stderrStream.write(chunk);
+				} catch {}
+			});
+		}
+
+		child.on("error", (err) => {
+			finish({ status: "error", error: err.message, roots: {} });
+		});
+
+		child.on("close", (code) => {
+			if (outputExceeded) {
+				return finish({ status: "output_exceeded", roots: {} });
+			}
+			if (timedOut) {
+				return finish({ status: "timeout", roots: {} });
+			}
+			if (code !== 0) {
+				return finish({ status: "error", exitCode: code, roots: {} });
+			}
+			try {
+				const parsed = JSON.parse(
+					Buffer.concat(stdoutChunks).toString("utf8").trim(),
+				);
+				finish(parsed);
+			} catch (err) {
+				finish({ status: "parse_error", error: err.message, roots: {} });
+			}
+		});
+	});
+}
 
 function isFixture(name, worktreeRecord, dirPath, exists = existsSync) {
 	if (typeof name === "string" && /fixture/i.test(name)) return true;
@@ -3924,14 +4131,103 @@ function isFixture(name, worktreeRecord, dirPath, exists = existsSync) {
 	return false;
 }
 
+async function hasRecentWorktreeEntry(rootPath, cutoffMs, dependencies = {}) {
+	const readDirectory = dependencies.readdir ?? readdir;
+	const stat = dependencies.lstat ?? lstat;
+	const stack = [rootPath];
+	let visited = 0;
+	try {
+		while (stack.length > 0) {
+			if (++visited > 100_000) return null;
+			if (visited === 1 || visited % 1000 === 0)
+				dependencies.onStatus?.("cleanup_age_scan_running");
+			const path = stack.pop();
+			const info = await stat(path);
+			if (info.mtimeMs > cutoffMs) return true;
+			if (!info.isDirectory() || info.isSymbolicLink()) continue;
+			const entries = await readDirectory(path, { withFileTypes: true });
+			for (const entry of entries) stack.push(join(path, entry.name));
+		}
+		return false;
+	} catch {
+		return null;
+	}
+}
+
+function claimMatchesObservedPath(claim, path) {
+	if (claim?.path === path) return true;
+	try {
+		return path === simpleQuarantinePath(claim?.nonce);
+	} catch {
+		return false;
+	}
+}
+
+const NON_SALVAGE_RETENTION_REASONS = new Set([
+	"worktree_cleanup_failed",
+	"worktree_identity_or_quarantine_unavailable",
+	"open_handles_or_scan_unavailable",
+	"guarded_removal_failed",
+	"guarded_removal_unconfirmed",
+	"recently_modified_or_unavailable",
+]);
+
+async function assessGcRootBeforeOpenScan(root, run, dependencies = {}) {
+	const reject = (reason) => ({ eligible: false, reason });
+	if (!run || root.classification !== "recorded" || root.pathAmbiguity)
+		return reject("unrecorded_or_ambiguous");
+	const claim = run.worktree;
+	if (
+		!claimMatchesObservedPath(claim, root.path) ||
+		claim.state === "removed" ||
+		!/^\d+$/.test(claim?.device ?? "") ||
+		!/^\d+$/.test(claim?.inode ?? "") ||
+		typeof claim?.nonce !== "string"
+	)
+		return reject("identity_unavailable");
+	if (!isTerminalState(run.state)) return reject("run_not_terminal");
+	if (claim.writerStopped !== true) return reject("writer_stop_unconfirmed");
+	if (claim.state === "active" && run.state !== "succeeded")
+		return reject("active_claim_unresolved");
+	if (
+		!(dependencies.verifySimpleWorktreeClaim ?? verifySimpleWorktreeClaim)(
+			root.path,
+			claim,
+			run.runId,
+		)
+	)
+		return reject("identity_unavailable");
+	const nowMs = dependencies.now?.() ?? Date.now();
+	if (
+		claim.state === "retained" &&
+		run.state !== "succeeded" &&
+		!NON_SALVAGE_RETENTION_REASONS.has(claim.reason)
+	) {
+		const retainedMs = Date.parse(claim.retainedAt ?? "");
+		if (
+			!Number.isFinite(retainedMs) ||
+			nowMs - retainedMs < 24 * 60 * 60 * 1000
+		)
+			return reject("salvage_not_expired");
+	}
+	try {
+		if ((dependencies.isProjectLockHeld ?? isProjectLockHeld)(run.projectPath))
+			return reject("project_locked");
+	} catch {
+		return reject("project_lock_unavailable");
+	}
+	const recent = await hasRecentWorktreeEntry(
+		root.path,
+		nowMs - 30 * 60 * 1000,
+		dependencies,
+	);
+	if (recent === null) return reject("modification_time_unavailable");
+	if (recent) return reject("recently_modified");
+	return { eligible: true, reason: null };
+}
+
 /** Collect a read-only inventory from run records and direct temp children. */
 async function collectGcInventory(options = {}, dependencies = {}) {
-	if (options?.apply) {
-		throw new UsageError(
-			"switchyard-dispatch gc does not support --apply; it is a dry-run inventory only",
-		);
-	}
-
 	const realpath = dependencies.realpathSync ?? realpathSync;
 	const readDirectory = dependencies.readdir ?? readdir;
 	const stat = dependencies.lstat ?? lstat;
@@ -3985,7 +4281,7 @@ async function collectGcInventory(options = {}, dependencies = {}) {
 			typeof wt?.canonicalParent !== "string" ||
 			!isAbsolute(wt.canonicalParent) ||
 			typeof wt.candidateChild !== "string" ||
-			!wt.candidateChild.startsWith("switchyard-simple-") ||
+			!/^switchyard-(?:simple|quarantine)-/.test(wt.candidateChild) ||
 			wt.candidateChild.includes("/") ||
 			wt.candidateChild.includes("\\") ||
 			!VALID_WORKTREE_STATES.has(wt.state)
@@ -4015,6 +4311,18 @@ async function collectGcInventory(options = {}, dependencies = {}) {
 		parents.add(parent);
 		const path = join(parent, wt.candidateChild);
 		records.set(path, [...(records.get(path) ?? []), run]);
+		if (wt.state !== "removed" && typeof wt.nonce === "string") {
+			try {
+				const quarantine = simpleQuarantinePath(wt.nonce);
+				if (
+					quarantine !== path &&
+					(dependencies.existsSync ?? existsSync)(quarantine)
+				) {
+					records.set(quarantine, [...(records.get(quarantine) ?? []), run]);
+					parents.add("/private/tmp");
+				}
+			} catch {}
+		}
 	}
 
 	const roots = [...unavailableRoots];
@@ -4025,7 +4333,7 @@ async function collectGcInventory(options = {}, dependencies = {}) {
 		const entries = await readDirectory(parent, { withFileTypes: true });
 		for (const entry of entries) {
 			if (
-				!entry.name.startsWith("switchyard-simple-") ||
+				!/^switchyard-(?:simple|quarantine)-/.test(entry.name) ||
 				(!entry.isDirectory() && !entry.isSymbolicLink())
 			)
 				continue;
@@ -4105,6 +4413,75 @@ async function collectGcInventory(options = {}, dependencies = {}) {
 		});
 	}
 	roots.sort((a, b) => a.path.localeCompare(b.path));
+
+	if (options.measureBytes) {
+		const candidateRoots = roots.filter(
+			(r) =>
+				r.exists === true &&
+				!r.pathAmbiguity &&
+				r.canonicalParent &&
+				r.candidateChild,
+		);
+		if (candidateRoots.length > 0) {
+			const measureFn =
+				dependencies.measurePrivateBytes ?? defaultMeasureApfsPrivateBytes;
+			let measurementResult = null;
+			try {
+				measurementResult = await measureFn(
+					candidateRoots.map((r) => r.path),
+					options,
+					dependencies,
+				);
+			} catch {
+				measurementResult = { status: "error", roots: {} };
+			}
+			const measuredRoots = measurementResult?.roots ?? {};
+			for (const root of candidateRoots) {
+				const m = measuredRoots[root.path];
+				if (m && m.measurable === true && typeof m.bytes === "number") {
+					root.bytes = m.bytes;
+					root.measurable = true;
+					root.unavailableReason = null;
+				} else {
+					root.bytes = null;
+					root.measurable = false;
+					root.unavailableReason =
+						m?.unavailableReason ?? "private_bytes_unavailable";
+				}
+			}
+		}
+	}
+	if (options.checkEligibility) {
+		const potentiallyEligible = [];
+		for (const root of roots) {
+			const claims = records.get(root.path) ?? [];
+			const assessment = await assessGcRootBeforeOpenScan(
+				root,
+				claims.length === 1 ? claims[0] : null,
+				dependencies,
+			);
+			root.deletionEligible = assessment.eligible;
+			root.eligibilityReason = assessment.reason;
+			if (assessment.eligible) potentiallyEligible.push(root);
+		}
+		if (potentiallyEligible.length > 0) {
+			const scan = await (
+				dependencies.scanOpenHandles ?? scanSimpleWorktreeOpenHandles
+			)(
+				potentiallyEligible.map((root) => root.path),
+				dependencies.onStatus,
+			);
+			for (const root of potentiallyEligible) {
+				if (!scan.complete || scan.openPaths.includes(root.path)) {
+					root.deletionEligible = false;
+					root.eligibilityReason = scan.complete
+						? "open_handles"
+						: "open_handle_scan_unavailable";
+				}
+			}
+		}
+	}
+
 	const byClass = Object.fromEntries(
 		[
 			"recorded",
@@ -4116,7 +4493,35 @@ async function collectGcInventory(options = {}, dependencies = {}) {
 			"conflicting-records",
 		].map((name) => [name, { count: 0, ...GC_PRIVATE_BYTES_UNAVAILABLE }]),
 	);
-	for (const root of roots) byClass[root.classification].count += 1;
+
+	let totalMeasuredBytes = 0;
+	let allComplete = roots.length > 0;
+	const classComplete = Object.fromEntries(
+		Object.keys(byClass).map((name) => [name, true]),
+	);
+
+	for (const root of roots) {
+		const cls = byClass[root.classification];
+		cls.count += 1;
+		if (root.measurable === true && typeof root.bytes === "number") {
+			totalMeasuredBytes += root.bytes;
+			cls.bytes = (cls.bytes ?? 0) + root.bytes;
+		} else {
+			allComplete = false;
+			classComplete[root.classification] = false;
+		}
+	}
+	for (const [name, cls] of Object.entries(byClass)) {
+		if (cls.count > 0 && classComplete[name]) {
+			cls.measurable = true;
+			cls.unavailableReason = null;
+		} else {
+			cls.bytes = null;
+			cls.measurable = false;
+			cls.unavailableReason = "private_bytes_unavailable";
+		}
+	}
+
 	return {
 		schemaVersion: 1,
 		canonicalParents: [...parents].sort(),
@@ -4124,15 +4529,118 @@ async function collectGcInventory(options = {}, dependencies = {}) {
 		summary: {
 			totalRoots: roots.length,
 			byClass,
-			totalBytes: null,
-			measurable: false,
-			unavailableReason: "private_bytes_unavailable",
+			totalBytes: allComplete ? totalMeasuredBytes : null,
+			measurable: allComplete,
+			unavailableReason: allComplete ? null : "private_bytes_unavailable",
 		},
 	};
 }
 
+async function applyRecordedSimpleCleanup(root, dependencies = {}) {
+	const reject = (reason) => ({
+		runId: root.runId,
+		path: root.path,
+		disposition: "preserved",
+		reason,
+	});
+	if (
+		root.classification !== "recorded" ||
+		!root.runId ||
+		!root.deletionEligible
+	)
+		return reject(root.eligibilityReason ?? "not_eligible");
+	let run;
+	try {
+		run = await (dependencies.readRun ?? readRun)(root.runId);
+	} catch {
+		return reject("run_record_unavailable");
+	}
+	if (!claimMatchesObservedPath(run.worktree, root.path))
+		return reject("run_record_changed");
+	const gcRunId = `gc-${randomUUID()}`;
+	let locked = false;
+	try {
+		await (dependencies.acquireProjectLock ?? acquireProjectLock)(
+			run.projectPath,
+			gcRunId,
+		);
+		locked = true;
+		const current = await (dependencies.readRun ?? readRun)(root.runId);
+		if (
+			current.revision !== run.revision ||
+			!claimMatchesObservedPath(current.worktree, root.path)
+		)
+			return reject("run_record_changed");
+		const assessment = await assessGcRootBeforeOpenScan(root, current, {
+			...dependencies,
+			isProjectLockHeld: () => false,
+		});
+		if (!assessment.eligible) return reject(assessment.reason);
+		const open = await (
+			dependencies.scanOpenHandles ?? scanSimpleWorktreeOpenHandles
+		)([root.path], dependencies.onStatus);
+		if (!open.complete) return reject("open_handle_scan_unavailable");
+		if (open.openPaths.includes(root.path)) return reject("open_handles");
+		const cleanup = await (
+			dependencies.cleanupSimpleWorktree ?? cleanupSimpleWorktree
+		)(current.runId, current.worktree, {
+			writerStopped: current.worktree.writerStopped === true,
+			onStatus: dependencies.onStatus,
+			postQuarantineCheck: async (path) =>
+				(await hasRecentWorktreeEntry(
+					path,
+					(dependencies.now?.() ?? Date.now()) - 30 * 60 * 1000,
+					dependencies,
+				)) === false,
+		});
+		const nextPath = cleanup.path ?? root.path;
+		const changedWorktree = {
+			...current.worktree,
+			canonicalParent: dirname(nextPath),
+			candidateChild: basename(nextPath),
+			path: nextPath,
+			state: cleanup.removed ? "removed" : "retained",
+			reason: cleanup.removed ? null : cleanup.reason,
+			retainedAt: cleanup.removed
+				? null
+				: (current.worktree.retainedAt ??
+					new Date(dependencies.now?.() ?? Date.now()).toISOString()),
+		};
+		await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(
+			current.runId,
+			{
+				worktree: changedWorktree,
+				cleanupState: cleanup.removed ? "complete" : "failed",
+			},
+		);
+		return {
+			runId: root.runId,
+			path: nextPath,
+			disposition: cleanup.removed ? "removed" : "preserved",
+			reason: cleanup.reason,
+		};
+	} catch {
+		return reject(
+			locked
+				? "cleanup_or_record_write_failed"
+				: "project_locked_or_unavailable",
+		);
+	} finally {
+		if (locked) {
+			try {
+				await (
+					dependencies.releaseProjectLockIfOwnedBy ??
+					releaseProjectLockIfOwnedBy
+				)(run.projectPath, gcRunId);
+			} catch {
+				dependencies.onStatus?.("cleanup_lock_release_unavailable");
+			}
+		}
+	}
+}
+
 async function handleGc(argv, dependencies = {}) {
-	const { help, stateRoot } = parseGcArgs(argv);
+	const { apply, help, stateRoot } = parseGcArgs(argv);
 	if (help) {
 		console.log(USAGE_GC);
 		return;
@@ -4140,11 +4648,32 @@ async function handleGc(argv, dependencies = {}) {
 
 	const effectiveStateRoot = stateRoot ?? getStateRoot();
 	return withStateRoot(effectiveStateRoot, async () => {
+		const gcDependencies = {
+			...dependencies,
+			onStatus:
+				dependencies.onStatus ?? ((event) => console.error(`[gc] ${event}`)),
+		};
 		console.error("[gc] Reading run records and direct temp children");
 		const inventory = await collectGcInventory(
-			{ stateRoot: effectiveStateRoot },
-			dependencies,
+			{
+				stateRoot: effectiveStateRoot,
+				measureBytes: true,
+				checkEligibility: true,
+			},
+			gcDependencies,
 		);
+		if (apply) {
+			inventory.apply = { attempted: 0, removed: 0, results: [] };
+			for (const root of inventory.roots.filter(
+				(candidate) => candidate.deletionEligible,
+			)) {
+				console.error(`[gc] Checking recorded root ${root.runId}`);
+				const result = await applyRecordedSimpleCleanup(root, gcDependencies);
+				inventory.apply.attempted += 1;
+				if (result.disposition === "removed") inventory.apply.removed += 1;
+				inventory.apply.results.push(result);
+			}
+		}
 		console.log(JSON.stringify(inventory));
 		process.exitCode = 0;
 		return inventory;
@@ -4261,6 +4790,7 @@ export {
 	auditKnownAllocationIntents,
 	captureHostFingerprint,
 	collectGcInventory,
+	defaultMeasureApfsPrivateBytes,
 	formatRunAbort,
 	handleGc,
 	handleHealth,

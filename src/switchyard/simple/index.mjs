@@ -2,18 +2,23 @@
 // one absolute deadline, one bounded result. The legacy VM queue remains the
 // rollback path and deliberately does not call this module.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	closeSync,
 	existsSync,
+	fsyncSync,
 	lstatSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
+	statSync,
+	writeSync,
 } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import {
@@ -45,6 +50,7 @@ import {
 	releaseProjectLockIfOwnedBy,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
+import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
 export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
 
@@ -769,6 +775,80 @@ export function simpleProviderCompatibility({ targetId, harness, descriptor }) {
 	return { compatible: true, reason: null };
 }
 
+function processGroupPresent(pgid) {
+	if (!Number.isSafeInteger(pgid) || pgid <= 0) return null;
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		if (error?.code === "ESRCH") return false;
+		return null;
+	}
+}
+
+async function waitForProcessGroupExit(pgid, timeoutMs, onProgress) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const present = processGroupPresent(pgid);
+		if (present === false) return true;
+		onProgress?.();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	return processGroupPresent(pgid) === false;
+}
+
+/** Settle a dedicated provider/check process group after its leader completes. */
+async function settleSimpleProcessGroup(pgid, onProgress) {
+	const present = processGroupPresent(pgid);
+	if (present === false) return "stopped";
+	if (present === null) {
+		return (await waitForProcessGroupExit(pgid, 5_000, onProgress))
+			? "stopped"
+			: "unavailable";
+	}
+	try {
+		process.kill(-pgid, "SIGTERM");
+	} catch (error) {
+		if (error?.code === "ESRCH") return "stopped";
+		return (await waitForProcessGroupExit(pgid, 5_000, onProgress))
+			? "stopped"
+			: "unavailable";
+	}
+	if (await waitForProcessGroupExit(pgid, 1_000, onProgress)) return "stopped";
+	try {
+		process.kill(-pgid, "SIGKILL");
+	} catch (error) {
+		if (error?.code === "ESRCH") return "stopped";
+		return (await waitForProcessGroupExit(pgid, 4_000, onProgress))
+			? "stopped"
+			: "unavailable";
+	}
+	return (await waitForProcessGroupExit(pgid, 4_000, onProgress))
+		? "stopped"
+		: "unavailable";
+}
+
+export async function runSimpleWriter(command, args, options = {}) {
+	// Test-injected spawns retain their own lifecycle contract. The production
+	// spawn creates a new session so a negative PID targets only this writer's
+	// process group, never the dispatcher group.
+	if (options.spawnFn) return runProviderProcess(command, args, options);
+	let pgid = null;
+	const result = await runProviderProcess(command, args, {
+		...options,
+		spawnFn: (cmd, argv, spawnOptions) => {
+			const child = spawn(cmd, argv, { ...spawnOptions, detached: true });
+			pgid = child.pid;
+			return child;
+		},
+	});
+	const writerLifecycle =
+		result.writerLifecycle === "never_started"
+			? "never_started"
+			: await settleSimpleProcessGroup(pgid, options.onPoll);
+	return { ...result, writerLifecycle, processGroupId: pgid };
+}
+
 /** Execute one local provider without changing its observed process exit code. */
 export async function defaultExecuteProvider(context) {
 	const invocation = buildSimpleProviderInvocation(
@@ -778,7 +858,7 @@ export async function defaultExecuteProvider(context) {
 		context.worktreePath,
 		context.targetId,
 	);
-	const result = await runProviderProcess(invocation.command, invocation.args, {
+	const result = await runSimpleWriter(invocation.command, invocation.args, {
 		input: context.prompt,
 		cwd: context.worktreePath,
 		timeoutMs: context.timeoutMs,
@@ -810,7 +890,7 @@ async function defaultRunCheck({
 	onProgress,
 	signal,
 }) {
-	return runProviderProcess(
+	return runSimpleWriter(
 		"/bin/sh",
 		[
 			"-lc",
@@ -1194,6 +1274,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let writerLifecycle = "never_started";
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
+	let worktreeIdentity = null;
+	let worktreeCleanupReason = null;
 	let executionFailureCaptureComplete = false;
 	let lastMilestoneAt = startedAt;
 	let firstChangeObserved = false;
@@ -1370,6 +1452,62 @@ export async function runSimpleTask(options, dependencies = {}) {
 			...details,
 		});
 	};
+	let cleanupAttempted = false;
+	const removeNonSalvageWorktree = async () => {
+		if (cleanupAttempted || !worktreeRoot) return !worktreeRoot;
+		cleanupAttempted = true;
+		try {
+			if (
+				dependencies.rmSync ||
+				dependencies.executeProvider ||
+				dependencies.runCheck
+			) {
+				const safeParent =
+					canonicalParent ??
+					realpathSync(dependencies.tmpdir ? dependencies.tmpdir() : tmpdir());
+				if (!worktreeRoot.startsWith(`${safeParent}${sep}`))
+					throw new Error("unsafe workspace root");
+				(dependencies.rmSync ?? rmSync)(worktreeRoot, {
+					recursive: true,
+					force: true,
+				});
+			} else {
+				const outcome = await cleanupSimpleWorktree(
+					runId,
+					{
+						canonicalParent,
+						candidateChild,
+						path: candidatePath,
+						...worktreeIdentity,
+					},
+					{
+						writerStopped:
+							writerLifecycle === "stopped" ||
+							writerLifecycle === "never_started",
+						onStatus: (processPhase) => heartbeat("cleanup", { processPhase }),
+					},
+				);
+				if (outcome.path && outcome.path !== candidatePath) {
+					canonicalParent = dirname(outcome.path);
+					candidateChild = basename(outcome.path);
+					candidatePath = outcome.path;
+					worktreeRoot = outcome.path;
+					worktreePath = join(outcome.path, "worktree");
+				}
+				if (!outcome.removed) {
+					worktreeCleanupReason = outcome.reason;
+					throw new Error(outcome.reason);
+				}
+			}
+			worktreePath = null;
+			worktreeRoot = null;
+			return true;
+		} catch {
+			worktreeCleanupReason ??= "worktree_cleanup_failed";
+			keepWorktree = true;
+			return false;
+		}
+	};
 	const fail = (
 		failureReason,
 		failurePhase,
@@ -1380,6 +1518,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			errorKind ?? classifyErrorKind(failureReason, failurePhase, error);
 		if (
 			worktreePath &&
+			!signal?.aborted &&
 			!(currentPhase === "execute" && executionFailureCaptureComplete) &&
 			(remainingMs(options.deadlineMs, now) <= 0 ||
 				(currentPhase === "execute" && !keepWorktree))
@@ -1428,11 +1567,22 @@ export async function runSimpleTask(options, dependencies = {}) {
 	};
 	const failForSignal = (failurePhase = currentPhase) => {
 		if (!signal?.aborted) return null;
-		// A direct child closing does not prove that a provider or check left no
-		// detached writer behind. Keep the checkout for attended recovery.
 		if (worktreePath) {
-			keepWorktree = true;
-			writerLifecycle = "unavailable";
+			if (
+				writerLifecycle !== "stopped" &&
+				writerLifecycle !== "never_started"
+			) {
+				keepWorktree = true;
+			} else if (changedFiles.length > 0) {
+				keepWorktree = true;
+			} else {
+				const status = git(worktreePath, [
+					"status",
+					"--porcelain=v1",
+					"--untracked-files=all",
+				]);
+				keepWorktree = status.status !== 0 || status.stdout.length > 0;
+			}
 		}
 		return fail("provider_cancelled", failurePhase, "execution_failed");
 	};
@@ -1683,6 +1833,44 @@ export async function runSimpleTask(options, dependencies = {}) {
 		worktreeRoot = candidatePath;
 		worktreeCreated = true;
 		worktreePath = join(worktreeRoot, "worktree");
+		try {
+			const rootStat = statSync(candidatePath, { bigint: true });
+			if (!rootStat.isDirectory()) throw new Error("root_not_directory");
+			const nonce = randomUUID();
+			const markerPath = join(candidatePath, ".switchyard-cleanup-owner.json");
+			let markerFd = null;
+			try {
+				markerFd = openSync(markerPath, "wx", 0o600);
+				writeSync(markerFd, `${JSON.stringify({ runId, nonce })}\n`);
+				fsyncSync(markerFd);
+			} finally {
+				if (markerFd !== null) closeSync(markerFd);
+			}
+			let dirFd = null;
+			try {
+				dirFd = openSync(candidatePath, "r");
+				fsyncSync(dirFd);
+			} finally {
+				if (dirFd !== null) closeSync(dirFd);
+			}
+			const confirmed = statSync(candidatePath, { bigint: true });
+			if (confirmed.dev !== rootStat.dev || confirmed.ino !== rootStat.ino) {
+				throw new Error("root_identity_changed");
+			}
+			worktreeIdentity = {
+				device: rootStat.dev.toString(),
+				inode: rootStat.ino.toString(),
+				nonce,
+			};
+		} catch (error) {
+			keepWorktree = true;
+			return fail(
+				"worktree_ownership_failed",
+				"prepare",
+				"cleanup_failed",
+				error,
+			);
+		}
 		if (runInitialized) {
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
@@ -1693,6 +1881,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						state: "active",
 						reason: null,
 						retainedAt: null,
+						...worktreeIdentity,
 					},
 				});
 			} catch (error) {
@@ -1822,6 +2011,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		);
 
 		if (signal?.aborted) return failForSignal("execute");
+		if (
+			executeProvider === defaultExecuteProvider &&
+			writerLifecycle === "unavailable"
+		) {
+			keepWorktree = true;
+			return fail("provider_group_unconfirmed", "execute", "cleanup_failed");
+		}
 		if (!providerResult?.success) {
 			if (remainingMs(options.deadlineMs, now) > 0) {
 				const captured = captureWorktreeDiff(
@@ -1912,6 +2108,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 				check?.writerLifecycle,
 			);
 			if (signal?.aborted) return failForSignal("checks");
+			if (runCheck === defaultRunCheck && writerLifecycle === "unavailable") {
+				keepWorktree = true;
+				return fail("check_group_unconfirmed", "checks", "cleanup_failed");
+			}
 			checks.push({
 				index: index + 1,
 				status: check?.success ? "passed" : "failed",
@@ -2120,23 +2320,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 			worktreeReason = cleanupFailure?.result ?? "salvage_retained";
 			worktreeRetainedAt = new Date(now()).toISOString();
 		} else {
-			try {
-				const safeParent =
-					canonicalParent ??
-					realpathSync(dependencies.tmpdir ? dependencies.tmpdir() : tmpdir());
-				if (!worktreeRoot?.startsWith(`${safeParent}${sep}`)) {
-					throw new Error("unsafe workspace root");
-				}
-				(dependencies.rmSync ?? rmSync)(worktreeRoot, {
-					recursive: true,
-					force: true,
-				});
-				worktreePath = null;
-				worktreeRoot = null;
-			} catch {
+			if (!(await removeNonSalvageWorktree())) {
 				keepWorktree = true;
 				worktreeTerminalState = "retained";
-				worktreeReason = "worktree_cleanup_failed";
+				worktreeReason = worktreeCleanupReason;
 				worktreeRetainedAt = new Date(now()).toISOString();
 				if (!cleanupFailure) {
 					cleanupFailure = cleanupMetadata({
@@ -2172,6 +2359,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 									state: worktreeTerminalState,
 									reason: worktreeReason,
 									retainedAt: worktreeRetainedAt,
+									writerStopped:
+										writerLifecycle === "stopped" ||
+										writerLifecycle === "never_started",
+									...(worktreeIdentity ?? {}),
 								},
 							}
 						: {}),
@@ -2219,25 +2410,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			await Promise.allSettled([...pendingDurability]);
 		}
 		if (worktreePath && !keepWorktree) {
-			const cleanupBudget = remainingMs(options.deadlineMs, now);
-			const safeParent =
-				canonicalParent ??
-				realpathSync(dependencies.tmpdir ? dependencies.tmpdir() : tmpdir());
-			if (
-				cleanupBudget > 0 &&
-				worktreeRoot?.startsWith(`${safeParent}${sep}`)
-			) {
-				try {
-					(dependencies.rmSync ?? rmSync)(worktreeRoot, {
-						recursive: true,
-						force: true,
-					});
-					worktreePath = null;
-					worktreeRoot = null;
-				} catch {
-					// Preserve the exact checkout path for attended recovery below.
-				}
-			}
+			await removeNonSalvageWorktree();
 			if (worktreePath && finalResult?.status === "failed") {
 				keepWorktree = true;
 				finalResult.partialWorktree = worktreePath;
@@ -2296,14 +2469,31 @@ export async function runSimpleTask(options, dependencies = {}) {
 			finalResult?.status !== "succeeded"
 		) {
 			const isRetained = Boolean(keepWorktree || worktreePath);
+			const cleanupFailed = cleanupAttempted && isRetained;
 			const terminalState = isRetained ? "retained" : "removed";
 			const reason = isRetained
-				? (finalResult?.failureReason ?? "salvage_retained")
+				? (worktreeCleanupReason ??
+					finalResult?.failureReason ??
+					"salvage_retained")
 				: null;
 			const retainedAt = isRetained ? new Date(now()).toISOString() : null;
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
-					cleanupState: isRetained ? "pending" : "complete",
+					cleanupState: cleanupFailed
+						? "failed"
+						: isRetained
+							? "pending"
+							: "complete",
+					...(cleanupFailed
+						? {
+								cleanupFailure: cleanupMetadata({
+									taskId,
+									result: "worktree_cleanup_failed",
+									errorKind: "cleanup_failed",
+									failurePhase: "cleanup",
+								}),
+							}
+						: {}),
 					worktree: {
 						canonicalParent,
 						candidateChild,
@@ -2311,6 +2501,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 						state: terminalState,
 						reason,
 						retainedAt,
+						writerStopped:
+							writerLifecycle === "stopped" ||
+							writerLifecycle === "never_started",
+						...(worktreeIdentity ?? {}),
 					},
 				});
 			} catch {}
