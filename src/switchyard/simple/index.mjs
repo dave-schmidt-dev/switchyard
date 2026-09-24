@@ -52,10 +52,13 @@ import {
 } from "../run-store/index.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
+--allow-manifest opts one declared --file that is a build/execution manifest
+(package.json, lockfiles, Makefile, Dockerfile, *.sh/*.bash, CI configs) into
+editing; repeat it per path. Any other manifest still fails closed.
 --predecessor-receipt binds output of a previous run and requires --dirty-overlay.
 Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
 SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
@@ -245,6 +248,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				project: { type: "string" },
 				capability: { type: "string" },
 				file: { type: "string", multiple: true },
+				"allow-manifest": { type: "string", multiple: true },
 				input: { type: "string", multiple: true },
 				"dirty-overlay": { type: "boolean", default: false },
 				"predecessor-receipt": { type: "string" },
@@ -315,6 +319,24 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 	) {
 		throw new SimpleUsageError("at least one unique --file is required");
 	}
+	const allowManifests = (parsed.values["allow-manifest"] ?? []).map((path) =>
+		normalizeDeclaredPath(canonicalProjectPath, path, "--allow-manifest"),
+	);
+	if (new Set(allowManifests).size !== allowManifests.length) {
+		throw new SimpleUsageError("--allow-manifest paths must be unique");
+	}
+	for (const path of allowManifests) {
+		if (!files.includes(path)) {
+			throw new SimpleUsageError(
+				`--allow-manifest path must also be declared with --file: ${path}`,
+			);
+		}
+		if (manifestReviewPaths([path]).length === 0) {
+			throw new SimpleUsageError(
+				`--allow-manifest path is not a build/execution manifest: ${path}`,
+			);
+		}
+	}
 	const dirtyOverlay = parsed.values["dirty-overlay"] === true;
 	if (!dirtyOverlay) {
 		for (const path of files)
@@ -378,6 +400,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		capability,
 		onlyProviders,
 		files,
+		allowManifests,
 		readOnlyInputs: inputs,
 		dirtyOverlay,
 		predecessorReceiptPath,
@@ -1609,7 +1632,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		if (signal?.aborted) return failForSignal("preflight");
 
-		if (manifestReviewPaths(options.files).length > 0) {
+		if (
+			manifestReviewPaths(options.files).some(
+				(path) => !(options.allowManifests ?? []).includes(path),
+			)
+		) {
 			return fail(
 				"manifest_review_required",
 				"input_validation",
@@ -2065,7 +2092,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 			);
 		}
 		const validated = validateDiff(captured.diff, options.projectPath);
-		if (!validated.safe || validated.requiresReview) {
+		if (
+			!validated.safe ||
+			(validated.requiresReview &&
+				!(validated.sensitivePaths ?? []).every((path) =>
+					(options.allowManifests ?? []).includes(path),
+				))
+		) {
 			keepWorktree = true;
 			return fail(
 				validated.requiresReview ? "manifest_review_required" : "unsafe_diff",
@@ -2197,9 +2230,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 					projectPath: options.projectPath,
 					changedFiles,
 					allowedPaths: options.files,
+					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
 				})
 			: integrationGate(captured.diff, options.projectPath, {
 					allowedPaths: options.files,
+					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
 				});
 		if (!integration?.success) {
 			keepWorktree = true;

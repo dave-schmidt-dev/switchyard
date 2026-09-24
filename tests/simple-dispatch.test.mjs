@@ -3,12 +3,14 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -392,6 +394,65 @@ after(() => {
 });
 
 describe("simple dispatch argument boundary", () => {
+	it("requires an exact manifest opt-in for declared manifest files", () => {
+		const repo = makeRepo();
+		writeFileSync(join(repo.projectPath, "package.json"), "{}\n", "utf8");
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"standard",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+			"--deadline",
+			"1970-01-01T00:10:00Z",
+		];
+		throws(
+			() =>
+				parseSimpleArgs([...base, "--allow-manifest", "package.json"], {
+					now: () => 1_000,
+				}),
+			/--allow-manifest path must also be declared with --file: package\.json/,
+		);
+		throws(
+			() =>
+				parseSimpleArgs([...base, "--allow-manifest", "src/a.txt"], {
+					now: () => 1_000,
+				}),
+			/--allow-manifest path is not a build\/execution manifest: src\/a\.txt/,
+		);
+		throws(
+			() =>
+				parseSimpleArgs(
+					[
+						...base,
+						"--file",
+						"package.json",
+						"--allow-manifest",
+						"package.json",
+						"--allow-manifest",
+						"package.json",
+					],
+					{ now: () => 1_000 },
+				),
+			/--allow-manifest paths must be unique/,
+		);
+		deepStrictEqual(
+			parseSimpleArgs(
+				[...base, "--file", "package.json", "--allow-manifest", "package.json"],
+				{ now: () => 1_000 },
+			).allowManifests,
+			["package.json"],
+		);
+		deepStrictEqual(
+			parseSimpleArgs(base, { now: () => 1_000 }).allowManifests,
+			[],
+		);
+	});
+
 	it("accepts an explicit dirty overlay with read-only inputs", () => {
 		const repo = makeRepo();
 		writeFileSync(
@@ -1093,6 +1154,173 @@ describe("simple local execution path", () => {
 		strictEqual(result.failureReason, "manifest_review_required");
 		strictEqual(result.failurePhase, "input_validation");
 		strictEqual(result.errorKind, "validation_failed");
+	});
+
+	it("rejects an unallowed manifest declaration before provider launch", async () => {
+		const repo = makeRepo();
+		writeFileSync(join(repo.projectPath, "package.json"), "{}\n", "utf8");
+		writeFileSync(join(repo.projectPath, "Makefile"), "all:\n\ttrue\n", "utf8");
+		execFileSync("git", ["add", "package.json", "Makefile"], {
+			cwd: repo.projectPath,
+		});
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"manifests",
+			],
+			{ cwd: repo.projectPath },
+		);
+		let executions = 0;
+		const result = await runSimpleTask(
+			options(repo, {
+				files: ["package.json", "Makefile"],
+				allowManifests: ["package.json"],
+			}),
+			dependencies({
+				executeProvider: async () => {
+					executions += 1;
+					return { success: true };
+				},
+			}),
+		);
+		strictEqual(executions, 0);
+		strictEqual(result.failureReason, "manifest_review_required");
+		strictEqual(result.failurePhase, "input_validation");
+	});
+
+	it("integrates an opted-in executable shell script without changing its mode", async () => {
+		const repo = makeRepo();
+		mkdirSync(join(repo.projectPath, "scripts"));
+		const scriptPath = join(repo.projectPath, "scripts", "check.sh");
+		writeFileSync(scriptPath, "#!/bin/sh\necho base\n", "utf8");
+		chmodSync(scriptPath, 0o755);
+		execFileSync("git", ["add", "scripts/check.sh"], {
+			cwd: repo.projectPath,
+		});
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"script",
+			],
+			{ cwd: repo.projectPath },
+		);
+		const result = await runSimpleTask(
+			options(repo, {
+				files: ["scripts/check.sh"],
+				allowManifests: ["scripts/check.sh"],
+				checks: ["test -x scripts/check.sh"],
+			}),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "scripts", "check.sh"),
+						"#!/bin/sh\necho changed\n",
+						"utf8",
+					);
+					return { success: true, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		strictEqual(result.status, "succeeded");
+		strictEqual(readFileSync(scriptPath, "utf8"), "#!/bin/sh\necho changed\n");
+		strictEqual(statSync(scriptPath).mode & 0o777, 0o755);
+	});
+
+	it("integrates an opted-in package manifest", async () => {
+		const repo = makeRepo();
+		const packagePath = join(repo.projectPath, "package.json");
+		writeFileSync(packagePath, '{"name":"base"}\n', "utf8");
+		execFileSync("git", ["add", "package.json"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"package",
+			],
+			{ cwd: repo.projectPath },
+		);
+		const result = await runSimpleTask(
+			options(repo, {
+				files: ["package.json"],
+				allowManifests: ["package.json"],
+				checks: ["test -f package.json"],
+			}),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(
+						join(worktreePath, "package.json"),
+						'{"name":"changed"}\n',
+						"utf8",
+					);
+					return { success: true, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		strictEqual(result.status, "succeeded");
+		strictEqual(readFileSync(packagePath, "utf8"), '{"name":"changed"}\n');
+	});
+
+	it("retains an opted-in worktree when the provider changes an undeclared script", async () => {
+		const repo = makeRepo();
+		mkdirSync(join(repo.projectPath, "scripts"));
+		const checkPath = join(repo.projectPath, "scripts", "check.sh");
+		const otherPath = join(repo.projectPath, "scripts", "other.sh");
+		writeFileSync(checkPath, "#!/bin/sh\necho check\n", "utf8");
+		writeFileSync(otherPath, "#!/bin/sh\necho other\n", "utf8");
+		chmodSync(checkPath, 0o755);
+		chmodSync(otherPath, 0o755);
+		execFileSync("git", ["add", "scripts"], { cwd: repo.projectPath });
+		execFileSync(
+			"git",
+			[
+				"-c",
+				"user.name=Switchyard Tests",
+				"-c",
+				"user.email=switchyard@example.invalid",
+				"commit",
+				"-qm",
+				"scripts",
+			],
+			{ cwd: repo.projectPath },
+		);
+		const result = await runSimpleTask(
+			options(repo, {
+				files: ["scripts/check.sh"],
+				allowManifests: ["scripts/check.sh"],
+				checks: ["test -x scripts/check.sh"],
+			}),
+			dependencies({
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(join(worktreePath, "scripts", "check.sh"), "changed\n");
+					writeFileSync(join(worktreePath, "scripts", "other.sh"), "changed\n");
+					return { success: true, writerLifecycle: "stopped" };
+				},
+			}),
+		);
+		retain(result, repo.projectPath);
+		strictEqual(result.status === "succeeded", false);
+		strictEqual(result.failureReason, "undeclared_paths_changed");
+		strictEqual(result.failurePhase, "diff");
+		ok(result.partialWorktree);
+		strictEqual(readFileSync(checkPath, "utf8"), "#!/bin/sh\necho check\n");
+		strictEqual(readFileSync(otherPath, "utf8"), "#!/bin/sh\necho other\n");
 	});
 
 	it("executes one routed provider, checks in the worktree, and applies only its diff", async () => {
