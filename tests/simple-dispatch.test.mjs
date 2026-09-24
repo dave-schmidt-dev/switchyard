@@ -5,17 +5,25 @@ import { EventEmitter } from "node:events";
 import {
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { open, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { after, afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { readEvents, readRun } from "../src/switchyard/run-store/index.mjs";
+import {
+	getRunRoot,
+	readEvents,
+	readRun,
+	runStoreTesting,
+	updateRunWithRetry,
+} from "../src/switchyard/run-store/index.mjs";
 import {
 	assessSimpleRecoveryEvidence,
 	buildSimpleProviderInvocation,
@@ -27,12 +35,11 @@ import {
 } from "../src/switchyard/simple/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
-if (!process.env.SWITCHYARD_RUN_STORE_ROOT) {
-	process.env.SWITCHYARD_RUN_STORE_ROOT = join(
-		tempDir("switchyard-simple-run-store-"),
-		"store",
-	);
-}
+const originalTmpdirEnv = process.env.TMPDIR;
+const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
+const SUITE_TMPDIR = realpathSync(tempDir("switchyard-suite-tmp-"));
+process.env.TMPDIR = SUITE_TMPDIR;
+process.env.SWITCHYARD_RUN_STORE_ROOT = join(SUITE_TMPDIR, "run-store");
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 const DISPATCH_PATH = resolve(
@@ -122,12 +129,34 @@ afterEach(() => {
 	for (const { worktreePath } of retainedWorktrees.splice(0)) {
 		const root = dirname(resolve(worktreePath));
 		if (
-			dirname(root) === realpathSync(tmpdir()) &&
+			dirname(root) === SUITE_TMPDIR &&
 			basename(root).startsWith("switchyard-simple-")
 		) {
-			rmSync(root, { recursive: true, force: true });
+			try {
+				rmSync(root, { recursive: true, force: true });
+			} catch {}
 		}
 	}
+	if (existsSync(SUITE_TMPDIR)) {
+		for (const entry of readdirSync(SUITE_TMPDIR)) {
+			if (/^switchyard-simple-[0-9a-f-]{36}$/u.test(entry)) {
+				try {
+					rmSync(join(SUITE_TMPDIR, entry), { recursive: true, force: true });
+				} catch {}
+			}
+		}
+	}
+});
+
+after(() => {
+	if (originalTmpdirEnv === undefined) delete process.env.TMPDIR;
+	else process.env.TMPDIR = originalTmpdirEnv;
+	if (originalRunStoreEnv === undefined)
+		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
+	else process.env.SWITCHYARD_RUN_STORE_ROOT = originalRunStoreEnv;
+	try {
+		rmSync(SUITE_TMPDIR, { recursive: true, force: true });
+	} catch {}
 });
 
 describe("simple dispatch argument boundary", () => {
@@ -1526,6 +1555,7 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				},
 			}),
 		);
+		retain(result, repo.projectPath);
 		strictEqual(result.failureReason, "read_only_input_changed");
 		strictEqual(
 			readFileSync(join(repo.projectPath, "src", "input.txt"), "utf8"),
@@ -1683,6 +1713,7 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 					},
 				}),
 			);
+			retain(result, repo.projectPath);
 			strictEqual(result.status, "failed");
 			strictEqual(result.failurePhase, "execute");
 			strictEqual(result.errorKind, "environment_failure");
@@ -1765,6 +1796,7 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 					},
 				}),
 			);
+			retain(result, repo.projectPath);
 			strictEqual(result.status, "failed");
 			strictEqual(result.failureReason, "undeclared_paths_changed");
 		});
@@ -2099,6 +2131,290 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				0,
 				"heartbeats must not be persisted in run store",
 			);
+		});
+
+		it("persists allocating intent before mkdir, then active and removed states", async () => {
+			const repo = makeRepo();
+			const runId = `simple-allocation-${Date.now()}`;
+			const order = [];
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					updateRunWithRetry: async (id, patch) => {
+						const written = await updateRunWithRetry(id, patch);
+						if (patch.worktree) {
+							const root = written.worktree;
+							strictEqual(root.canonicalParent, SUITE_TMPDIR);
+							strictEqual(root.path, join(SUITE_TMPDIR, root.candidateChild));
+							strictEqual(existsSync(root.path), root.state === "active");
+							order.push(root.state);
+						}
+						return written;
+					},
+					mkdirSync: (path, opts) => {
+						const run = JSON.parse(
+							readFileSync(join(getRunRoot(runId), "run.json"), "utf8"),
+						);
+						strictEqual(run.worktree.state, "allocating");
+						strictEqual(run.worktree.path, path);
+						order.push("mkdir");
+						return mkdirSync(path, opts);
+					},
+				}),
+			);
+			strictEqual(result.status, "succeeded");
+			deepStrictEqual(order, ["allocating", "mkdir", "active", "removed"]);
+			const run = await readRun(runId);
+			strictEqual(run.worktree.state, "removed");
+			strictEqual(run.worktree.reason, null);
+			strictEqual(run.cleanupState, "complete");
+			strictEqual(existsSync(run.worktree.path), false);
+		});
+
+		it("accepts a string temp parent and records its canonical path", async () => {
+			const repo = makeRepo();
+			const runId = `simple-string-tmpdir-${Date.now()}`;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({ runId, tmpdir: SUITE_TMPDIR }),
+			);
+			strictEqual(result.status, "succeeded");
+			const run = await readRun(runId);
+			strictEqual(run.worktree.canonicalParent, SUITE_TMPDIR);
+			strictEqual(run.worktree.state, "removed");
+			strictEqual(existsSync(run.worktree.path), false);
+		});
+
+		it("retains allocation intent when mkdir fails without proving absence", async () => {
+			const repo = makeRepo();
+			const runId = `simple-mkdir-failure-${Date.now()}`;
+			let candidatePath;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					mkdirSync: (path) => {
+						candidatePath = path;
+						throw Object.assign(new Error("allocation unavailable"), {
+							code: "EACCES",
+						});
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "worktree_allocation_failed");
+			strictEqual(result.errorKind, "environment_failure");
+			const run = await readRun(runId);
+			strictEqual(run.worktree.path, candidatePath);
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(run.worktree.reason, "worktree_allocation_failed");
+			strictEqual(run.cleanupState, "pending");
+		});
+
+		for (const fault of ["file", "directory"]) {
+			it(`does not allocate a root when intent ${fault} sync fails`, async () => {
+				const repo = makeRepo();
+				const runId = `simple-sync-${fault}-${Date.now()}`;
+				let mkdirCalled = false;
+				let providerCalled = false;
+				let injected = false;
+				let candidatePath;
+				const result = await runSimpleTask(
+					options(repo),
+					dependencies({
+						runId,
+						updateRunWithRetry: async (id, patch) => {
+							if (patch.worktree?.state !== "allocating")
+								return updateRunWithRetry(id, patch);
+							candidatePath = patch.worktree.path;
+							const current = await readRun(id);
+							return runStoreTesting.writeRunAtomically(
+								join(getRunRoot(id), "run.json"),
+								{
+									...current,
+									...patch,
+									revision: current.revision + 1,
+								},
+								{
+									rename,
+									unlink,
+									open: async (path, flags, mode) => {
+										const handle = await open(path, flags, mode);
+										return {
+											writeFile: (...args) => handle.writeFile(...args),
+											close: () => handle.close(),
+											sync: async () => {
+												if ((flags === "r") === (fault === "directory")) {
+													injected = true;
+													throw Object.assign(
+														new Error("injected sync failure"),
+														{ code: "EIO" },
+													);
+												}
+												await handle.sync();
+											},
+										};
+									},
+								},
+							);
+						},
+						mkdirSync: () => {
+							mkdirCalled = true;
+						},
+						executeProvider: async () => {
+							providerCalled = true;
+						},
+					}),
+				);
+				strictEqual(injected, true);
+				strictEqual(result.status, "failed");
+				strictEqual(result.failureReason, "run_store_write_failed");
+				strictEqual(result.failurePhase, "prepare");
+				strictEqual(mkdirCalled, false);
+				strictEqual(providerCalled, false);
+				strictEqual(existsSync(candidatePath), false);
+			});
+		}
+
+		it("retains salvage and records retained worktree state when checks fail", async () => {
+			const repo = makeRepo();
+			const taskId = `worktree-salvage-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+
+			const result = await runSimpleTask(
+				options(repo, { checks: ["false"] }),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			retain(result, repo.projectPath);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "check_failed");
+			ok(result.partialWorktree);
+
+			const run = await readRun(runId);
+			strictEqual(run.state, "failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(run.worktree.reason, "check_failed");
+			ok(typeof run.worktree.retainedAt === "string");
+			strictEqual(run.cleanupState, "pending");
+			strictEqual(join(run.worktree.path, "worktree"), result.partialWorktree);
+			strictEqual(existsSync(run.worktree.path), true);
+		});
+
+		it("preserves succeeded status when lock release fails during cleanup", async () => {
+			const repo = makeRepo();
+			const taskId = `cleanup-lock-fail-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					releaseProjectLock: async () => false,
+				}),
+			);
+			strictEqual(
+				result.status,
+				"succeeded",
+				"cleanup failure must not rewrite a successful integration as failed",
+			);
+
+			const run = await readRun(runId);
+			strictEqual(run.state, "succeeded");
+			strictEqual(run.cleanupState, "failed");
+			ok(run.cleanupFailure !== null);
+			strictEqual(
+				run.cleanupFailure.result,
+				"project_lock_release_unconfirmed",
+			);
+			strictEqual(run.worktree.state, "removed");
+		});
+
+		it("preserves succeeded status and marks worktree retained when worktree cleanup fails", async () => {
+			const repo = makeRepo();
+			const taskId = `cleanup-rm-fail-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			let allocatedWorktreeRoot = null;
+
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					taskId,
+					runId,
+					rmSync: () => {
+						throw Object.assign(new Error("injected removal failure"), {
+							code: "EACCES",
+						});
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.worktree?.state === "active") {
+							allocatedWorktreeRoot = patch.worktree.path;
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider\n",
+							"utf8",
+						);
+						return { success: true, writerLifecycle: "stopped" };
+					},
+				}),
+			);
+			retain(result, repo.projectPath);
+
+			strictEqual(
+				result.status,
+				"succeeded",
+				"worktree cleanup failure must not rewrite successful integration",
+			);
+			strictEqual(
+				result.partialWorktree,
+				join(allocatedWorktreeRoot, "worktree"),
+			);
+			strictEqual(
+				readFileSync(join(repo.projectPath, "src/a.txt"), "utf8"),
+				"provider\n",
+			);
+
+			const run = await readRun(runId);
+			strictEqual(run.state, "succeeded");
+			strictEqual(run.cleanupState, "failed");
+			ok(run.cleanupFailure !== null);
+			strictEqual(run.cleanupFailure.result, "worktree_cleanup_failed");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(run.worktree.reason, "worktree_cleanup_failed");
+			ok(typeof run.worktree.retainedAt === "string");
+		});
+
+		it("keeps all test roots and run records inside its private TMPDIR", () => {
+			strictEqual(realpathSync(tmpdir()), SUITE_TMPDIR);
+			strictEqual(
+				process.env.SWITCHYARD_RUN_STORE_ROOT,
+				join(SUITE_TMPDIR, "run-store"),
+			);
+			strictEqual(dirname(makeRepo().root), SUITE_TMPDIR);
 		});
 	});
 });

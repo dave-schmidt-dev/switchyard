@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
-	mkdtempSync,
+	mkdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -1168,6 +1168,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let provider = null;
 	let targetId = null;
 	let projectLocked = false;
+	let canonicalParent = null;
+	let candidateChild = null;
+	let candidatePath = null;
 	let worktreeRoot = null;
 	let worktreePath = null;
 	let keepWorktree = false;
@@ -1613,13 +1616,75 @@ export async function runSimpleTask(options, dependencies = {}) {
 			}
 		}
 
-		worktreeRoot = realpathSync(
-			mkdtempSync(join(tmpdir(), "switchyard-simple-")),
-		);
-		worktreeCreated = true;
-		worktreePath = join(worktreeRoot, "worktree");
 		currentPhase = "prepare";
 		emitStatus(onStatus, taskId, "prepare");
+		const tempBase =
+			typeof dependencies.tmpdir === "function"
+				? dependencies.tmpdir()
+				: (dependencies.tmpdir ?? tmpdir());
+		canonicalParent = realpathSync(tempBase);
+		candidateChild = `switchyard-simple-${randomUUID()}`;
+		candidatePath = join(canonicalParent, candidateChild);
+
+		if (runInitialized) {
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					worktree: {
+						canonicalParent,
+						candidateChild,
+						path: candidatePath,
+						state: "allocating",
+						reason: null,
+						retainedAt: null,
+					},
+				});
+			} catch (error) {
+				return fail(
+					"run_store_write_failed",
+					"prepare",
+					classifyErrorKind("run_store_write_failed", "prepare", error),
+					error,
+				);
+			}
+		}
+
+		try {
+			(dependencies.mkdirSync ?? mkdirSync)(candidatePath, { mode: 0o700 });
+		} catch (error) {
+			// An allocation error does not prove the candidate is absent. Keep the
+			// durable claim until recovery can inspect the exact path.
+			keepWorktree = true;
+			return fail(
+				"worktree_allocation_failed",
+				"prepare",
+				"environment_failure",
+				error,
+			);
+		}
+		worktreeRoot = candidatePath;
+		worktreeCreated = true;
+		worktreePath = join(worktreeRoot, "worktree");
+		if (runInitialized) {
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					worktree: {
+						canonicalParent,
+						candidateChild,
+						path: candidatePath,
+						state: "active",
+						reason: null,
+						retainedAt: null,
+					},
+				});
+			} catch (error) {
+				return fail(
+					"run_store_write_failed",
+					"prepare",
+					classifyErrorKind("run_store_write_failed", "prepare", error),
+					error,
+				);
+			}
+		}
 		requireGit(
 			worktreeRoot,
 			[
@@ -1961,37 +2026,110 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		emitStatus(onStatus, taskId, "cleanup");
 		currentPhase = "cleanup";
+		const cleanupMetadata = (input) => ({
+			...sanitizeFailureMetadata(input),
+			result: input.result,
+		});
+		let cleanupFailure = null;
+		let cleanupState = "complete";
 		const cleanupBudget = remainingMs(options.deadlineMs, now);
 		if (cleanupBudget <= 0) {
 			keepWorktree = true;
-			return fail("deadline_expired", "cleanup");
+			cleanupFailure = cleanupMetadata({
+				taskId,
+				result: "deadline_expired",
+				errorKind: "cleanup_failed",
+				failurePhase: "cleanup",
+			});
+			cleanupState = "failed";
 		}
-		const released = await releaseLock(options.projectPath, runId);
-		if (released !== true) {
-			projectLockState = "unavailable";
-			return fail("project_lock_release_unconfirmed", "cleanup");
-		}
-		projectLocked = false;
-		projectLockState = "released";
-		if (remainingMs(options.deadlineMs, now) <= 0) {
-			return fail("deadline_expired", "cleanup");
-		}
-		try {
-			if (!worktreeRoot?.startsWith(`${realpathSync(tmpdir())}${sep}`)) {
-				throw new Error("unsafe workspace root");
+		if (projectLocked) {
+			try {
+				const released = await releaseLock(options.projectPath, runId);
+				if (released === true) {
+					projectLockState = "released";
+					projectLocked = false;
+				} else {
+					projectLockState = "unavailable";
+					if (!cleanupFailure) {
+						cleanupFailure = cleanupMetadata({
+							taskId,
+							result: "project_lock_release_unconfirmed",
+							errorKind: "cleanup_failed",
+							failurePhase: "cleanup",
+						});
+						cleanupState = "failed";
+					}
+				}
+			} catch {
+				projectLockState = "unavailable";
+				if (!cleanupFailure) {
+					cleanupFailure = cleanupMetadata({
+						taskId,
+						result: "project_lock_release_unconfirmed",
+						errorKind: "cleanup_failed",
+						failurePhase: "cleanup",
+					});
+					cleanupState = "failed";
+				}
 			}
-			rmSync(worktreeRoot, { recursive: true, force: true });
-		} catch {
-			keepWorktree = true;
-			return fail("worktree_cleanup_failed", "cleanup");
 		}
-		worktreePath = null;
-		worktreeRoot = null;
+		if (!cleanupFailure && remainingMs(options.deadlineMs, now) <= 0) {
+			keepWorktree = true;
+			cleanupFailure = cleanupMetadata({
+				taskId,
+				result: "deadline_expired",
+				errorKind: "cleanup_failed",
+				failurePhase: "cleanup",
+			});
+			cleanupState = "failed";
+		}
+
+		let worktreeTerminalState = "removed";
+		let worktreeReason = null;
+		let worktreeRetainedAt = null;
+
+		if (keepWorktree) {
+			worktreeTerminalState = "retained";
+			worktreeReason = cleanupFailure?.result ?? "salvage_retained";
+			worktreeRetainedAt = new Date(now()).toISOString();
+		} else {
+			try {
+				const safeParent =
+					canonicalParent ??
+					realpathSync(dependencies.tmpdir ? dependencies.tmpdir() : tmpdir());
+				if (!worktreeRoot?.startsWith(`${safeParent}${sep}`)) {
+					throw new Error("unsafe workspace root");
+				}
+				(dependencies.rmSync ?? rmSync)(worktreeRoot, {
+					recursive: true,
+					force: true,
+				});
+				worktreePath = null;
+				worktreeRoot = null;
+			} catch {
+				keepWorktree = true;
+				worktreeTerminalState = "retained";
+				worktreeReason = "worktree_cleanup_failed";
+				worktreeRetainedAt = new Date(now()).toISOString();
+				if (!cleanupFailure) {
+					cleanupFailure = cleanupMetadata({
+						taskId,
+						result: "worktree_cleanup_failed",
+						errorKind: "cleanup_failed",
+						failurePhase: "cleanup",
+					});
+					cleanupState = "failed";
+				}
+			}
+		}
+
 		if (runInitialized) {
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
 					state: "succeeded",
-					cleanupState: "complete",
+					cleanupState,
+					...(cleanupFailure ? { cleanupFailure } : {}),
 					finishedAt: new Date(now()).toISOString(),
 					terminalSummary: {
 						status: "succeeded",
@@ -1999,6 +2137,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 						changedFiles,
 						outputs: terminalOutputs,
 					},
+					...(candidateChild
+						? {
+								worktree: {
+									canonicalParent,
+									candidateChild,
+									path: candidatePath,
+									state: worktreeTerminalState,
+									reason: worktreeReason,
+									retainedAt: worktreeRetainedAt,
+								},
+							}
+						: {}),
 				});
 			} catch (error) {
 				return fail(
@@ -2009,7 +2159,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 				);
 			}
 		}
-		milestone("cleanup", "cleanup_completed");
+		milestone(
+			"cleanup",
+			cleanupFailure ? "cleanup_failed" : "cleanup_completed",
+		);
 
 		finalResult = terminalResult(base, {
 			status: "succeeded",
@@ -2022,6 +2175,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			providerVerdictCode,
 			outputs: terminalOutputs,
 			baseRevision,
+			partialWorktree: keepWorktree ? (worktreePath ?? candidatePath) : null,
 		});
 		milestone("terminal", "succeeded");
 		return finalResult;
@@ -2040,13 +2194,20 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		if (worktreePath && !keepWorktree) {
 			const cleanupBudget = remainingMs(options.deadlineMs, now);
+			const safeParent =
+				canonicalParent ??
+				realpathSync(dependencies.tmpdir ? dependencies.tmpdir() : tmpdir());
 			if (
 				cleanupBudget > 0 &&
-				worktreeRoot?.startsWith(`${realpathSync(tmpdir())}${sep}`)
+				worktreeRoot?.startsWith(`${safeParent}${sep}`)
 			) {
 				try {
-					rmSync(worktreeRoot, { recursive: true, force: true });
+					(dependencies.rmSync ?? rmSync)(worktreeRoot, {
+						recursive: true,
+						force: true,
+					});
 					worktreePath = null;
+					worktreeRoot = null;
 				} catch {
 					// Preserve the exact checkout path for attended recovery below.
 				}
@@ -2102,6 +2263,31 @@ export async function runSimpleTask(options, dependencies = {}) {
 					},
 				},
 			});
+		}
+		if (
+			runInitialized &&
+			candidateChild &&
+			finalResult?.status !== "succeeded"
+		) {
+			const isRetained = Boolean(keepWorktree || worktreePath);
+			const terminalState = isRetained ? "retained" : "removed";
+			const reason = isRetained
+				? (finalResult?.failureReason ?? "salvage_retained")
+				: null;
+			const retainedAt = isRetained ? new Date(now()).toISOString() : null;
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					cleanupState: isRetained ? "pending" : "complete",
+					worktree: {
+						canonicalParent,
+						candidateChild,
+						path: candidatePath,
+						state: terminalState,
+						reason,
+						retainedAt,
+					},
+				});
+			} catch {}
 		}
 	}
 }

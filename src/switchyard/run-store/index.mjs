@@ -16,6 +16,7 @@ import {
 	link,
 	lstat,
 	mkdir,
+	open,
 	readdir,
 	readFile,
 	rename,
@@ -135,6 +136,22 @@ const VALID_CLEANUP_STATES = new Set([
 	"pending",
 	"complete",
 	"failed",
+]);
+
+const VALID_WORKTREE_STATES = new Set([
+	"allocating",
+	"active",
+	"removed",
+	"retained",
+]);
+
+const WORKTREE_RECORD_KEYS = new Set([
+	"canonicalParent",
+	"candidateChild",
+	"path",
+	"state",
+	"reason",
+	"retainedAt",
 ]);
 
 const RUN_ID_RE = /^[\w-]+$/;
@@ -882,6 +899,7 @@ export const runStoreTesting = Object.freeze({
 	projectLockArtifacts,
 	readVmSlotBody,
 	unlinkBodyMatched,
+	writeRunAtomically,
 });
 
 async function moveProjectLockPathToClaim(
@@ -1028,6 +1046,86 @@ function parseRecoveryReservation(raw) {
 	} catch {
 		return null;
 	}
+}
+
+function validateWorktreeRecord(worktree) {
+	if (!worktree || typeof worktree !== "object" || Array.isArray(worktree)) {
+		throw new SchemaError("worktree must be an object");
+	}
+	for (const key of Object.keys(worktree)) {
+		if (!WORKTREE_RECORD_KEYS.has(key)) {
+			throw new SchemaError(`worktree contains invalid key: ${key}`);
+		}
+	}
+	if (
+		typeof worktree.canonicalParent !== "string" ||
+		!isAbsolute(worktree.canonicalParent)
+	) {
+		throw new SchemaError(
+			"worktree.canonicalParent must be an absolute string path",
+		);
+	}
+	if (
+		typeof worktree.candidateChild !== "string" ||
+		!worktree.candidateChild ||
+		worktree.candidateChild.includes("/") ||
+		worktree.candidateChild.includes("\\") ||
+		worktree.candidateChild === "." ||
+		worktree.candidateChild === ".."
+	) {
+		throw new SchemaError(
+			"worktree.candidateChild must be a single directory segment",
+		);
+	}
+	if (
+		typeof worktree.path !== "string" ||
+		worktree.path !== resolve(worktree.canonicalParent, worktree.candidateChild)
+	) {
+		throw new SchemaError(
+			"worktree.path must match canonicalParent and candidateChild",
+		);
+	}
+	if (
+		typeof worktree.state !== "string" ||
+		!VALID_WORKTREE_STATES.has(worktree.state)
+	) {
+		throw new SchemaError(
+			"worktree.state must be allocating, active, removed, or retained",
+		);
+	}
+	if (
+		worktree.reason !== undefined &&
+		worktree.reason !== null &&
+		typeof worktree.reason !== "string"
+	) {
+		throw new SchemaError("worktree.reason must be a string or null");
+	}
+	if (worktree.retainedAt !== undefined && worktree.retainedAt !== null) {
+		if (
+			typeof worktree.retainedAt !== "string" ||
+			Number.isNaN(Date.parse(worktree.retainedAt))
+		) {
+			throw new SchemaError(
+				"worktree.retainedAt must be a valid ISO timestamp or null",
+			);
+		}
+	}
+}
+
+// Cleanup causes are host-owned closed codes, never raw exception text.
+function isCleanupFailureMetadata(value) {
+	if (isPersistentFailureMetadata(value)) return true;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const { result, ...metadata } = value;
+	return (
+		[
+			"deadline_expired",
+			"project_lock_release_unconfirmed",
+			"worktree_cleanup_failed",
+		].includes(result) &&
+		metadata.errorKind === "cleanup_failed" &&
+		isPersistentFailureMetadata(metadata)
+	);
 }
 
 function validateRun(data) {
@@ -1474,7 +1572,7 @@ function validateRun(data) {
 	if (
 		data.cleanupFailure !== undefined &&
 		data.cleanupFailure !== null &&
-		!isPersistentFailureMetadata(data.cleanupFailure)
+		!isCleanupFailureMetadata(data.cleanupFailure)
 	) {
 		throw new SchemaError(
 			"cleanupFailure contains invalid persistent metadata",
@@ -1493,6 +1591,9 @@ function validateRun(data) {
 		data.terminalizedBy !== "dead_worker_recovery"
 	) {
 		throw new SchemaError("terminalizedBy must be a known terminal writer");
+	}
+	if (data.worktree !== undefined && data.worktree !== null) {
+		validateWorktreeRecord(data.worktree);
 	}
 	if (data.schemaVersion === CURRENT_SCHEMA_VERSION) {
 		if (
@@ -1539,25 +1640,55 @@ function validateRun(data) {
 	}
 }
 
-async function writeRunAtomically(runJsonPath, data) {
-	// Unique tmp path per write call: process.pid + a random UUID. A fixed
-	// shared tmp path lets concurrent writers to the same run.json collide —
-	// writer A renames (and removes) the tmp before writer B's rename runs,
-	// so B fails with ENOENT. Per-call uniqueness means each writer's rename
-	// only ever touches its own tmp file.
+async function writeRunAtomically(
+	runJsonPath,
+	data,
+	io = { open, rename, unlink },
+) {
+	// Publish only synced bytes, then sync the directory entry before callers
+	// may act on the record (in particular, before allocating a simple root).
 	const tmpPath = `${runJsonPath}.${process.pid}.${randomUUID()}.tmp`;
-	await writeFile(tmpPath, JSON.stringify(data), { mode: 0o600 });
 	try {
-		await rename(tmpPath, runJsonPath);
-	} catch (e) {
-		// Best-effort cleanup so a failed rename never orphans a unique tmp.
-		await unlink(tmpPath).catch(() => {});
-		throw e;
+		const file = await io.open(tmpPath, "wx", 0o600);
+		try {
+			await file.writeFile(JSON.stringify(data));
+			await file.sync();
+		} finally {
+			await file.close();
+		}
+		await io.rename(tmpPath, runJsonPath);
+		const directory = await io.open(dirname(runJsonPath), "r");
+		try {
+			await directory.sync();
+		} finally {
+			await directory.close();
+		}
+	} catch (error) {
+		await io.unlink(tmpPath).catch(() => {});
+		throw error;
 	}
 }
 
 async function ensureDir(dirPath, mode) {
-	await mkdir(dirPath, { recursive: true, mode, force: true });
+	const firstCreated = await mkdir(dirPath, {
+		recursive: true,
+		mode,
+		force: true,
+	});
+	if (firstCreated) {
+		let path = resolve(dirPath);
+		const boundary = dirname(resolve(firstCreated));
+		while (true) {
+			const directory = await open(path, "r");
+			try {
+				await directory.sync();
+			} finally {
+				await directory.close();
+			}
+			if (path === boundary) break;
+			path = dirname(path);
+		}
+	}
 }
 
 // Strip control characters (C0, DEL, C1 — \p{Cc}), Unicode format controls
@@ -1685,8 +1816,12 @@ export async function initializeRun(options) {
 		mutationOperations: [],
 		lastFailure: null,
 		lastReviewResult: null,
+		worktree: options.worktree ?? null,
 		launchArgs,
 	};
+	if (options.worktree !== undefined && options.worktree !== null) {
+		validateWorktreeRecord(options.worktree);
+	}
 	if (versioned) {
 		snapshot.projectRevision = projectRevision ?? "unknown";
 		snapshot.runOptions = runOptions ?? null;
@@ -5223,7 +5358,12 @@ export async function applyRetention(options = {}) {
 		// contend for the same directory.
 		if (hasLiveCheckpoint(run)) continue;
 		collectedCount += await collectArtifacts(entry.name, dryRun);
-		if (!hasDiagnosticRecord(entry.name)) {
+		// This may be the only ownership evidence after a crash before the
+		// first event. Do not discard it until removal was recorded.
+		const ownsSimpleRoot = ["allocating", "active", "retained"].includes(
+			run.worktree?.state,
+		);
+		if (!hasDiagnosticRecord(entry.name) && !ownsSimpleRoot) {
 			removable.push({
 				runId: entry.name,
 				createdAt: new Date(run.createdAt).getTime(),
@@ -5440,6 +5580,7 @@ export {
 	LockError,
 	RevisionError,
 	SchemaError,
+	VALID_WORKTREE_STATES,
 	VmAdmissionPermissionDeniedError,
 	VmAdmissionStorageError,
 	VmAdmissionUnavailableError,

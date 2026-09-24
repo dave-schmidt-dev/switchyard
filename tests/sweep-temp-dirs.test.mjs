@@ -63,6 +63,37 @@ function makeFixture() {
 const noneHeld = () => [];
 
 describe("sweep-temp-dirs", () => {
+	for (const apply of [false, true]) {
+		for (const maxAgeDays of [0, DEFAULT_MAX_AGE_DAYS, 365]) {
+			it(`excludes simple roots with apply=${apply} and days=${maxAgeDays}`, () => {
+				const root = tempDir("switchyard-sweep-simple-exclusion-");
+				const stale = makeEntry(root, "switchyard-simplex-stale", 400);
+				const simple = ["switchyard-simple-", "switchyard-simple-stale"].map(
+					(name) => makeEntry(root, name, 400),
+				);
+				const expectedBytes = inspectTree(stale).bytes;
+
+				const { status, summary } = sweepTempDirs({
+					tmpDir: root,
+					apply,
+					maxAgeDays,
+					now: NOW,
+					listHeldPaths: noneHeld,
+					log: silent,
+				});
+
+				strictEqual(status, 0);
+				strictEqual(summary.candidates, 1);
+				strictEqual(summary.removed, 1);
+				strictEqual(summary.apparentBytes, expectedBytes);
+				strictEqual(existsSync(stale), !apply);
+				for (const retained of simple) {
+					ok(existsSync(join(retained, "payload.txt")));
+				}
+			});
+		}
+	}
+
 	it("removes only stale switchyard entries and reports what it removed", () => {
 		const { root, entries } = makeFixture();
 		const expectedBytes = inspectTree(entries.stale).bytes;
@@ -251,6 +282,9 @@ describe("sweep-temp-dirs", () => {
 		// through a sweep, where the earlier filter would mask a regression.
 		const tmp = "/private/var/folders/ab/T";
 		strictEqual(isSweepAuthorized(`${tmp}/switchyard-abc`, tmp), true);
+		strictEqual(isSweepAuthorized(`${tmp}/switchyard-simplex-abc`, tmp), true);
+		strictEqual(isSweepAuthorized(`${tmp}/switchyard-simple-`, tmp), false);
+		strictEqual(isSweepAuthorized(`${tmp}/switchyard-simple-abc`, tmp), false);
 		strictEqual(isSweepAuthorized(`${tmp}/other-project`, tmp), false);
 		strictEqual(isSweepAuthorized(`${tmp}/nested/switchyard-abc`, tmp), false);
 		strictEqual(isSweepAuthorized("/private/var/switchyard-abc", tmp), false);

@@ -45,8 +45,8 @@ import {
 	realpathSync,
 	statSync,
 } from "node:fs";
-import { readdir } from "node:fs/promises";
-import { homedir } from "node:os";
+import { lstat, readdir } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import {
 	basename,
 	dirname,
@@ -113,6 +113,7 @@ import {
 	SchemaError,
 	updateRun,
 	updateRunWithRetry,
+	VALID_WORKTREE_STATES,
 } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 import {
@@ -147,6 +148,7 @@ Subcommands:
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
+  gc [--state-root <path>] [--json]               Dry-run JSON inventory of simple roots
   reconcile-completion --receipt <path> ...       Record external completion
   remediate-orphaned-locks [--dry-run|--confirm] [--state-root <path>]
                                                 Interactively remediate orphaned project locks
@@ -227,6 +229,12 @@ const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>] [--st
   --state-root <path>  Reconcile this launch's durable state root
   --help               Show this help`;
 
+const USAGE_GC = `Usage: switchyard-dispatch gc [--state-root <path>] [--json]
+
+  --state-root <path>  Read run records from this durable state root
+  --json               Output as JSON (default behavior)
+  --help               Show this help`;
+
 const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest-repair> --target <target-id> [options]
 
   identity:      --capability <low|standard|high>
@@ -254,6 +262,7 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"status",
 	"result",
 	"recover",
+	"gc",
 	"health",
 	"reconcile-completion",
 	"remediate-orphaned-locks",
@@ -3706,6 +3715,297 @@ async function handleOrphanLockRemediation(argv) {
 	});
 }
 
+function parseGcArgs(argv) {
+	let parsed;
+	try {
+		parsed = parseArgs({
+			args: argv,
+			allowPositionals: false,
+			options: {
+				"state-root": { type: "string" },
+				json: { type: "boolean", default: false },
+				help: { type: "boolean", default: false },
+				apply: { type: "boolean", default: false },
+			},
+		});
+	} catch (error) {
+		throw new UsageError(error.message);
+	}
+
+	if (parsed.values.apply) {
+		throw new UsageError(
+			"switchyard-dispatch gc does not support --apply; it is a dry-run inventory only",
+		);
+	}
+
+	return {
+		help: parsed.values.help,
+		json: parsed.values.json,
+		stateRoot: parsed.values["state-root"]
+			? resolve(parsed.values["state-root"])
+			: null,
+	};
+}
+
+// Apparent file sizes and allocated blocks cannot establish APFS private bytes.
+// This inventory deliberately performs no recursive content measurement.
+const GC_PRIVATE_BYTES_UNAVAILABLE = Object.freeze({
+	bytes: null,
+	measurable: false,
+	unavailableReason: "private_bytes_unavailable",
+});
+
+function isFixture(name, worktreeRecord, dirPath, exists = existsSync) {
+	if (typeof name === "string" && /fixture/i.test(name)) return true;
+	if (worktreeRecord) {
+		if (worktreeRecord.worktree?.reason === "fixture") return true;
+		if (
+			typeof worktreeRecord.runId === "string" &&
+			/fixture/i.test(worktreeRecord.runId)
+		) {
+			return true;
+		}
+	}
+	if (dirPath && exists(dirPath)) {
+		try {
+			if (
+				exists(join(dirPath, ".fixture")) ||
+				exists(join(dirPath, "fixture"))
+			) {
+				return true;
+			}
+		} catch {}
+	}
+	return false;
+}
+
+/** Collect a read-only inventory from run records and direct temp children. */
+async function collectGcInventory(options = {}, dependencies = {}) {
+	if (options?.apply) {
+		throw new UsageError(
+			"switchyard-dispatch gc does not support --apply; it is a dry-run inventory only",
+		);
+	}
+
+	const realpath = dependencies.realpathSync ?? realpathSync;
+	const readDirectory = dependencies.readdir ?? readdir;
+	const stat = dependencies.lstat ?? lstat;
+	const canonicalParent = async (path, recorded = false) => {
+		try {
+			const canonical = realpath(path);
+			if (
+				!isAbsolute(canonical) ||
+				(recorded && canonical !== path) ||
+				!(await stat(canonical)).isDirectory() ||
+				realpath(canonical) !== canonical
+			)
+				throw new Error();
+			return canonical;
+		} catch {
+			throw new Error(
+				"gc inventory unavailable: parent_canonicalization_failed",
+			);
+		}
+	};
+	const stateRoot = options.stateRoot ?? getStateRoot();
+	const runsDir = resolve(stateRoot, "runs");
+	const osTemp =
+		typeof dependencies.tmpdir === "function"
+			? dependencies.tmpdir()
+			: (dependencies.tmpdir ?? tmpdir());
+	const parents = new Set([await canonicalParent(osTemp)]);
+	const records = new Map();
+	const unavailableRoots = [];
+	const readRunFn =
+		dependencies.readRun ??
+		((id) => withStateRoot(stateRoot, () => readRun(id)));
+
+	let runEntries;
+	try {
+		runEntries = await readDirectory(runsDir, { withFileTypes: true });
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+		runEntries = [];
+	}
+	for (const entry of runEntries) {
+		if (!entry.isDirectory() || !/^[\w-]+$/.test(entry.name)) continue;
+		let run;
+		try {
+			run = await readRunFn(entry.name);
+		} catch {
+			continue;
+		}
+		const wt = run?.worktree;
+		if (
+			typeof wt?.canonicalParent !== "string" ||
+			!isAbsolute(wt.canonicalParent) ||
+			typeof wt.candidateChild !== "string" ||
+			!wt.candidateChild.startsWith("switchyard-simple-") ||
+			wt.candidateChild.includes("/") ||
+			wt.candidateChild.includes("\\") ||
+			!VALID_WORKTREE_STATES.has(wt.state)
+		)
+			continue;
+		let parent;
+		try {
+			parent = await canonicalParent(wt.canonicalParent, true);
+		} catch {
+			// An old parent may have been removed or replaced. Preserve the
+			// record without claiming that its child is absent.
+			unavailableRoots.push({
+				path: join(wt.canonicalParent, wt.candidateChild),
+				canonicalParent: wt.canonicalParent,
+				candidateChild: wt.candidateChild,
+				classification: "unavailable",
+				runId: run.runId,
+				recordedState: wt.state,
+				exists: null,
+				...GC_PRIVATE_BYTES_UNAVAILABLE,
+				unavailableReason: "parent_canonicalization_failed",
+				deletionEligible: false,
+				pathAmbiguity: true,
+			});
+			continue;
+		}
+		parents.add(parent);
+		const path = join(parent, wt.candidateChild);
+		records.set(path, [...(records.get(path) ?? []), run]);
+	}
+
+	const roots = [...unavailableRoots];
+	const seen = new Set();
+	for (const parent of parents) {
+		// Recheck before enumeration; unreadable or replaced parents cannot prove absence.
+		await canonicalParent(parent, true);
+		const entries = await readDirectory(parent, { withFileTypes: true });
+		for (const entry of entries) {
+			if (
+				!entry.name.startsWith("switchyard-simple-") ||
+				(!entry.isDirectory() && !entry.isSymbolicLink())
+			)
+				continue;
+			const path = join(parent, entry.name);
+			seen.add(path);
+			let pathAmbiguity = true;
+			try {
+				pathAmbiguity =
+					entry.isSymbolicLink() ||
+					(await stat(path)).isSymbolicLink() ||
+					realpath(path) !== path;
+			} catch {
+				// An unresolved child is unavailable, never silently canonicalized.
+			}
+			const claims = records.get(path) ?? [];
+			const run = claims.length === 1 ? claims[0] : null;
+			const conflictingClaims = claims.length > 1;
+			const fixture = isFixture(
+				entry.name,
+				run,
+				pathAmbiguity ? null : path,
+				dependencies.existsSync ?? existsSync,
+			);
+			const classification = conflictingClaims
+				? "conflicting-records"
+				: fixture
+					? "fixture"
+					: run
+						? run.worktree.state === "removed"
+							? "removed-but-exists"
+							: "recorded"
+						: "unknown";
+			roots.push({
+				path,
+				canonicalParent: parent,
+				candidateChild: entry.name,
+				classification,
+				runId: run?.runId ?? null,
+				...(conflictingClaims
+					? { runIds: claims.map((claim) => claim.runId).sort() }
+					: {}),
+				recordedState: run?.worktree.state ?? null,
+				exists: true,
+				...GC_PRIVATE_BYTES_UNAVAILABLE,
+				unavailableReason: conflictingClaims
+					? "conflicting_records"
+					: pathAmbiguity
+						? "path_ambiguity"
+						: "private_bytes_unavailable",
+				deletionEligible: false,
+				pathAmbiguity: pathAmbiguity || conflictingClaims,
+			});
+		}
+	}
+	for (const [path, claims] of records) {
+		if (seen.has(path)) continue;
+		const run = claims.length === 1 ? claims[0] : null;
+		if (run?.worktree.state === "removed") continue;
+		const conflictingClaims = claims.length > 1;
+		roots.push({
+			path,
+			canonicalParent: claims[0].worktree.canonicalParent,
+			candidateChild: claims[0].worktree.candidateChild,
+			classification: conflictingClaims ? "conflicting-records" : "missing",
+			runId: run?.runId ?? null,
+			...(conflictingClaims
+				? { runIds: claims.map((claim) => claim.runId).sort() }
+				: {}),
+			recordedState: run?.worktree.state ?? null,
+			exists: conflictingClaims ? null : false,
+			...GC_PRIVATE_BYTES_UNAVAILABLE,
+			...(conflictingClaims
+				? { unavailableReason: "conflicting_records" }
+				: {}),
+			deletionEligible: false,
+			pathAmbiguity: conflictingClaims,
+		});
+	}
+	roots.sort((a, b) => a.path.localeCompare(b.path));
+	const byClass = Object.fromEntries(
+		[
+			"recorded",
+			"unknown",
+			"fixture",
+			"missing",
+			"removed-but-exists",
+			"unavailable",
+			"conflicting-records",
+		].map((name) => [name, { count: 0, ...GC_PRIVATE_BYTES_UNAVAILABLE }]),
+	);
+	for (const root of roots) byClass[root.classification].count += 1;
+	return {
+		schemaVersion: 1,
+		canonicalParents: [...parents].sort(),
+		roots,
+		summary: {
+			totalRoots: roots.length,
+			byClass,
+			totalBytes: null,
+			measurable: false,
+			unavailableReason: "private_bytes_unavailable",
+		},
+	};
+}
+
+async function handleGc(argv, dependencies = {}) {
+	const { help, stateRoot } = parseGcArgs(argv);
+	if (help) {
+		console.log(USAGE_GC);
+		return;
+	}
+
+	const effectiveStateRoot = stateRoot ?? getStateRoot();
+	return withStateRoot(effectiveStateRoot, async () => {
+		console.error("[gc] Reading run records and direct temp children");
+		const inventory = await collectGcInventory(
+			{ stateRoot: effectiveStateRoot },
+			dependencies,
+		);
+		console.log(JSON.stringify(inventory));
+		process.exitCode = 0;
+		return inventory;
+	});
+}
+
 /**
  * Main entry point: route to subcommand or backwards-compat positional dispatch.
  * @param {string[]} argv process.argv.slice(2)
@@ -3768,6 +4068,10 @@ async function main(argv) {
 				await handleOrphanLockRemediation(subArgs);
 				break;
 			}
+			case "gc": {
+				await handleGc(subArgs);
+				break;
+			}
 			default:
 				throw new UsageError(`unknown subcommand: ${subcommand}`);
 		}
@@ -3811,7 +4115,9 @@ export {
 	assessRecoveryEntry,
 	auditKnownAllocationIntents,
 	captureHostFingerprint,
+	collectGcInventory,
 	formatRunAbort,
+	handleGc,
 	handleHealth,
 	handleLaunch,
 	handleOrphanLockRemediation,
@@ -3823,6 +4129,7 @@ export {
 	handleValidateInputs,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
+	parseGcArgs,
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
@@ -3837,6 +4144,7 @@ export {
 	SIMPLE_USAGE,
 	sweepManagedOrphans,
 	USAGE,
+	USAGE_GC,
 	USAGE_LAUNCH,
 	USAGE_RECOVER,
 	USAGE_RESULT,

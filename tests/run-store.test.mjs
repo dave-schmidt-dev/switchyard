@@ -19,7 +19,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
@@ -79,6 +79,7 @@ import {
 	sanitizeVmAdmissionError,
 	updateRun,
 	updateRunWithRetry,
+	VALID_WORKTREE_STATES,
 	VmAdmissionPermissionDeniedError,
 	VmAdmissionStorageError,
 	VmAdmissionUnavailableError,
@@ -2002,6 +2003,40 @@ describe("retention", () => {
 		const result = await applyRetention({ maxRuns: 0 });
 		strictEqual(result.deletedCount, 1);
 		await rejects(readRun(run.runId), /Run not found/);
+	});
+
+	it("pins allocating, active, and retained roots without events, but reclaims removed roots", async () => {
+		const pinned = [];
+		let removedId;
+		for (const state of ["allocating", "active", "retained", "removed"]) {
+			const canonicalParent = TEST_ROOT;
+			const candidateChild = `switchyard-simple-${state}`;
+			const opts = makeOptions({
+				worktree: {
+					canonicalParent,
+					candidateChild,
+					path: join(canonicalParent, candidateChild),
+					state,
+					reason: state === "retained" ? "salvage_retained" : null,
+					retainedAt: state === "retained" ? new Date().toISOString() : null,
+				},
+			});
+			await initializeRun(opts);
+			strictEqual(
+				existsSync(join(getRunRoot(opts.runId), "events.jsonl")),
+				false,
+			);
+			if (state === "removed") removedId = opts.runId;
+			else pinned.push(opts.runId);
+		}
+		const result = await applyRetention({
+			maxRuns: 0,
+			maxAgeDays: 0,
+			now: new Date(Date.now() + 86_400_000).toISOString(),
+		});
+		strictEqual(result.deletedCount, 1);
+		for (const id of pinned) strictEqual((await readRun(id)).runId, id);
+		await rejects(readRun(removedId), /Run not found/);
 	});
 
 	it("keeps run.json and events.jsonl at any age, for any run state", async () => {
@@ -5179,6 +5214,273 @@ describe("prlctl failure metadata survives the persistence boundary", () => {
 			strictEqual(events.length, 1);
 			strictEqual(events[0].event, "heartbeat");
 			strictEqual(events[0].elapsedMs, undefined);
+		});
+
+		it("syncs run bytes before rename and the containing directory before completion", async () => {
+			const root = tempDir("switchyard-run-sync-");
+			const path = join(root, "run.json");
+			const order = [];
+			await runStoreTesting.writeRunAtomically(
+				path,
+				{ intent: "allocating" },
+				{
+					unlink,
+					rename: async (...args) => {
+						order.push("rename");
+						await rename(...args);
+					},
+					open: async (openedPath, flags, mode) => {
+						const handle = await open(openedPath, flags, mode);
+						const kind = flags === "r" ? "directory" : "file";
+						return {
+							writeFile: async (...args) => {
+								order.push("write");
+								await handle.writeFile(...args);
+							},
+							sync: async () => {
+								order.push(`sync-${kind}`);
+								await handle.sync();
+							},
+							close: async () => {
+								order.push(`close-${kind}`);
+								await handle.close();
+							},
+						};
+					},
+				},
+			);
+			deepStrictEqual(order, [
+				"write",
+				"sync-file",
+				"close-file",
+				"rename",
+				"sync-directory",
+				"close-directory",
+			]);
+			deepStrictEqual(JSON.parse(readFileSync(path, "utf8")), {
+				intent: "allocating",
+			});
+		});
+
+		for (const fault of ["file", "directory"]) {
+			it(`propagates ${fault} sync failures and closes handles without leaving temporary files`, async () => {
+				const root = tempDir("switchyard-run-sync-failure-");
+				const path = join(root, "run.json");
+				writeFileSync(path, JSON.stringify({ intent: "old" }));
+				const closed = [];
+				await rejects(
+					runStoreTesting.writeRunAtomically(
+						path,
+						{ intent: "allocating" },
+						{
+							rename,
+							unlink,
+							open: async (openedPath, flags, mode) => {
+								const handle = await open(openedPath, flags, mode);
+								const kind = flags === "r" ? "directory" : "file";
+								return {
+									writeFile: (...args) => handle.writeFile(...args),
+									sync: async () => {
+										if (kind === fault)
+											throw new Error("injected sync failure");
+										await handle.sync();
+									},
+									close: async () => {
+										closed.push(kind);
+										await handle.close();
+									},
+								};
+							},
+						},
+					),
+					/injected sync failure/,
+				);
+				deepStrictEqual(
+					closed,
+					fault === "file" ? ["file"] : ["file", "directory"],
+				);
+				deepStrictEqual(readdirSync(root), ["run.json"]);
+				strictEqual(
+					JSON.parse(readFileSync(path, "utf8")).intent,
+					fault === "file" ? "old" : "allocating",
+				);
+			});
+		}
+
+		it("accepts only bounded cleanup result codes and preserves generic historical metadata", async () => {
+			const opts = makeOptions();
+			await initializeRun(opts);
+			const metadata = sanitizeFailureMetadata({
+				result: "failed",
+				errorKind: "cleanup_failed",
+			});
+			await updateRunWithRetry(opts.runId, { cleanupFailure: metadata });
+			for (const result of [
+				"deadline_expired",
+				"project_lock_release_unconfirmed",
+				"worktree_cleanup_failed",
+			]) {
+				await updateRunWithRetry(opts.runId, {
+					cleanupFailure: { ...metadata, result },
+				});
+				strictEqual((await readRun(opts.runId)).cleanupFailure.result, result);
+			}
+			await rejects(
+				updateRunWithRetry(opts.runId, {
+					cleanupFailure: { ...metadata, result: "untrusted detail" },
+				}),
+				SchemaError,
+			);
+			await rejects(
+				updateRunWithRetry(opts.runId, {
+					cleanupFailure: {
+						...metadata,
+						result: "worktree_cleanup_failed",
+						extra: "untrusted detail",
+					},
+				}),
+				SchemaError,
+			);
+		});
+
+		it("accepts valid allocating, active, removed, and retained worktree records", async () => {
+			const canonicalParent = resolve("/tmp");
+			const candidateChild = "switchyard-simple-active-1";
+			const candidatePath = resolve(canonicalParent, candidateChild);
+
+			const activeOpts = makeOptions({
+				worktree: {
+					canonicalParent,
+					candidateChild,
+					path: candidatePath,
+					state: "allocating",
+					reason: null,
+					retainedAt: null,
+				},
+			});
+			const activeSnapshot = await initializeRun(activeOpts);
+			deepStrictEqual(activeSnapshot.worktree, {
+				canonicalParent,
+				candidateChild,
+				path: candidatePath,
+				state: "allocating",
+				reason: null,
+				retainedAt: null,
+			});
+
+			const onDiskActive = await readRun(activeOpts.runId);
+			deepStrictEqual(onDiskActive.worktree, activeSnapshot.worktree);
+
+			const active = await updateRun(
+				activeOpts.runId,
+				{
+					worktree: { ...activeSnapshot.worktree, state: "active" },
+				},
+				activeSnapshot.revision,
+			);
+			strictEqual(active.worktree.state, "active");
+
+			// Transition to removed
+			const removed = await updateRun(
+				activeOpts.runId,
+				{
+					worktree: {
+						canonicalParent,
+						candidateChild,
+						path: candidatePath,
+						state: "removed",
+						reason: null,
+						retainedAt: null,
+					},
+				},
+				active.revision,
+			);
+			strictEqual(removed.worktree.state, "removed");
+
+			// Transition to retained
+			const retainedTime = new Date().toISOString();
+			const retained = await updateRun(
+				activeOpts.runId,
+				{
+					worktree: {
+						canonicalParent,
+						candidateChild,
+						path: candidatePath,
+						state: "retained",
+						reason: "salvage_retained",
+						retainedAt: retainedTime,
+					},
+				},
+				removed.revision,
+			);
+			strictEqual(retained.worktree.state, "retained");
+			strictEqual(retained.worktree.reason, "salvage_retained");
+			strictEqual(retained.worktree.retainedAt, retainedTime);
+		});
+
+		it("preserves historical schema compatibility when worktree is null or omitted", async () => {
+			const opts = makeOptions();
+			const snapshot = await initializeRun(opts);
+			strictEqual(snapshot.worktree, null);
+
+			const onDisk = await readRun(opts.runId);
+			strictEqual(onDisk.worktree, null);
+
+			// Historical update omitting worktree passes validation cleanly
+			const updated = await updateRun(
+				opts.runId,
+				{ state: "running" },
+				snapshot.revision,
+			);
+			strictEqual(updated.state, "running");
+			strictEqual(updated.worktree, null);
+		});
+
+		it("rejects invalid worktree record shapes and states", async () => {
+			const canonicalParent = resolve("/tmp");
+			const candidateChild = "switchyard-simple-test";
+			const candidatePath = resolve(canonicalParent, candidateChild);
+
+			const validWorktree = {
+				canonicalParent,
+				candidateChild,
+				path: candidatePath,
+				state: "active",
+				reason: null,
+				retainedAt: null,
+			};
+
+			const invalidShapes = [
+				"not-an-object",
+				123,
+				[],
+				{ ...validWorktree, state: "unknown_state" },
+				{ ...validWorktree, state: "pending" },
+				{ ...validWorktree, canonicalParent: "relative/path" },
+				{ ...validWorktree, canonicalParent: 123 },
+				{ ...validWorktree, candidateChild: "nested/path" },
+				{ ...validWorktree, candidateChild: "../parent" },
+				{ ...validWorktree, candidateChild: "." },
+				{ ...validWorktree, candidateChild: ".." },
+				{ ...validWorktree, candidateChild: "" },
+				{ ...validWorktree, path: "/mismatched/path" },
+				{ ...validWorktree, reason: 123 },
+				{ ...validWorktree, retainedAt: "not-a-valid-date" },
+				{ ...validWorktree, unexpectedKey: true },
+			];
+
+			for (const badWorktree of invalidShapes) {
+				const opts = makeOptions({ worktree: badWorktree });
+				await rejects(initializeRun(opts), SchemaError);
+			}
+		});
+
+		it("exports all four worktree lifecycle states", () => {
+			ok(VALID_WORKTREE_STATES.has("allocating"));
+			ok(VALID_WORKTREE_STATES.has("active"));
+			ok(VALID_WORKTREE_STATES.has("removed"));
+			ok(VALID_WORKTREE_STATES.has("retained"));
+			strictEqual(VALID_WORKTREE_STATES.size, 4);
 		});
 	});
 });

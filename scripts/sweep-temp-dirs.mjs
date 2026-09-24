@@ -18,6 +18,8 @@
  *    thousands of unattributed entries; nothing else is in scope. The prefix
  *    and parent are re-checked against the *canonical* path immediately before
  *    each removal, not only when candidates are collected.
+ *    `switchyard-simple-*` roots are excluded: their retained work requires
+ *    separate lifecycle evidence before removal.
  * 2. **It refuses to run rather than skip its own safety check.** The first
  *    version of this sweep grepped `lsof` output for paths under the raw
  *    `$TMPDIR` value (`/var/folders/...`) while macOS `lsof` reports
@@ -41,6 +43,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 /** The only prefix this sweep is authorized to remove. Not a parameter. */
 export const SWEEP_PREFIX = "switchyard-";
+
+/** Retained simple worktrees are never owned by this broad sweep. */
+const SIMPLE_PREFIX = "switchyard-simple-";
 
 /** macOS purges `$TMPDIR` at boot for entries untouched this long. */
 export const DEFAULT_MAX_AGE_DAYS = 3;
@@ -157,7 +162,8 @@ export function inspectTree(root) {
 export function isSweepAuthorized(canonicalPath, canonicalTmpDir) {
 	return (
 		dirname(canonicalPath) === canonicalTmpDir &&
-		basename(canonicalPath).startsWith(SWEEP_PREFIX)
+		basename(canonicalPath).startsWith(SWEEP_PREFIX) &&
+		!basename(canonicalPath).startsWith(SIMPLE_PREFIX)
 	);
 }
 
@@ -217,8 +223,9 @@ export function sweepTempDirs({
 	const cutoffMs = now - maxAgeDays * MS_PER_DAY;
 	let names;
 	try {
-		names = readdirSync(canonicalTmp).filter((name) =>
-			name.startsWith(SWEEP_PREFIX),
+		names = readdirSync(canonicalTmp).filter(
+			(name) =>
+				name.startsWith(SWEEP_PREFIX) && !name.startsWith(SIMPLE_PREFIX),
 		);
 	} catch {
 		log(`sweep: cannot read ${canonicalTmp}`);

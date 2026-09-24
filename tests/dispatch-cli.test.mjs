@@ -17,11 +17,14 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+
+import { lstat, readdir } from "node:fs/promises";
 
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -99,6 +102,7 @@ function exactFailureEvidence(targetId, harness, model, taskId = "1.1") {
 
 import {
 	captureHostFingerprint,
+	collectGcInventory,
 	runDispatch as dispatchRun,
 	formatRunAbort,
 	handleBackendHealth,
@@ -107,6 +111,7 @@ import {
 	handleRun,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
+	parseGcArgs,
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
@@ -5409,5 +5414,627 @@ describe("retention sweep call sites (Task 6.5)", () => {
 				Number.isInteger(result.collectedCount),
 			"dryRun must still report what it would remove",
 		);
+	});
+});
+
+describe("gc subcommand (T62)", () => {
+	it("parseGcArgs parses valid flags", () => {
+		const parsed = parseGcArgs(["--state-root", "/tmp/state", "--json"]);
+		strictEqual(parsed.stateRoot, resolve("/tmp/state"));
+		strictEqual(parsed.json, true);
+		strictEqual(parsed.help, false);
+	});
+
+	it("parseGcArgs returns help: true for --help", () => {
+		const parsed = parseGcArgs(["--help"]);
+		strictEqual(parsed.help, true);
+	});
+
+	it("parseGcArgs rejects --apply with UsageError", () => {
+		let thrown = null;
+		try {
+			parseGcArgs(["--apply"]);
+		} catch (err) {
+			thrown = err;
+		}
+		ok(thrown instanceof Error);
+		ok(
+			thrown.message.includes("does not support --apply") ||
+				thrown.message.includes("apply"),
+		);
+	});
+
+	it("parseGcArgs rejects unexpected positionals or options", () => {
+		let thrown = null;
+		try {
+			parseGcArgs(["unexpected-positional"]);
+		} catch (err) {
+			thrown = err;
+		}
+		ok(thrown instanceof Error);
+	});
+
+	it("classifies roots across two private temp parents without claiming apparent sizes as private bytes", async () => {
+		const localStateRoot = tempDir("gc-state-root-");
+		const runsDir = join(localStateRoot, "runs");
+		mkdirSync(runsDir, { recursive: true });
+
+		const rawParent1 = tempDir("gc-temp-p1-");
+		const rawParent2 = tempDir("gc-temp-p2-");
+		const parent1 = realpathSync(rawParent1);
+		const parent2 = realpathSync(rawParent2);
+
+		// 1. recorded: exists on disk under parent1, active worktree in run record
+		const candidate1 = "switchyard-simple-recorded-01";
+		const path1 = join(parent1, candidate1);
+		mkdirSync(path1, { recursive: true });
+		writeFileSync(join(path1, "payload.txt"), "hello recorded root", "utf8"); // 19 bytes
+		const runDir1 = join(runsDir, "run-recorded-1");
+		mkdirSync(runDir1, { recursive: true });
+		writeFileSync(
+			join(runDir1, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-recorded-1",
+				state: "running",
+				cleanupState: "pending",
+				revision: 1,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent1,
+					candidateChild: candidate1,
+					path: path1,
+					state: "active",
+					reason: null,
+					retainedAt: null,
+				},
+			}),
+			"utf8",
+		);
+
+		// 2. removed-but-exists: exists on disk under parent1, removed worktree in run record
+		const candidate2 = "switchyard-simple-removed-02";
+		const path2 = join(parent1, candidate2);
+		mkdirSync(path2, { recursive: true });
+		writeFileSync(join(path2, "residual.txt"), "residual data", "utf8"); // 13 bytes
+		const runDir2 = join(runsDir, "run-removed-2");
+		mkdirSync(runDir2, { recursive: true });
+		writeFileSync(
+			join(runDir2, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-removed-2",
+				state: "succeeded",
+				cleanupState: "complete",
+				revision: 2,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.2"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent1,
+					candidateChild: candidate2,
+					path: path2,
+					state: "removed",
+					reason: null,
+					retainedAt: null,
+				},
+			}),
+			"utf8",
+		);
+
+		// 3. missing: not on disk under parent1, active worktree in run record
+		const candidate3 = "switchyard-simple-missing-03";
+		const path3 = join(parent1, candidate3);
+		// Note: directory path3 is NOT created on disk!
+		const runDir3 = join(runsDir, "run-missing-3");
+		mkdirSync(runDir3, { recursive: true });
+		writeFileSync(
+			join(runDir3, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-missing-3",
+				state: "failed",
+				cleanupState: "failed",
+				revision: 3,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.3"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent1,
+					candidateChild: candidate3,
+					path: path3,
+					state: "retained",
+					reason: "salvage_retained",
+					retainedAt: new Date().toISOString(),
+				},
+			}),
+			"utf8",
+		);
+
+		// 4. fixture: exists on disk under parent2, name includes fixture, active worktree in run record
+		const candidate4 = "switchyard-simple-fixture-04";
+		const path4 = join(parent2, candidate4);
+		mkdirSync(path4, { recursive: true });
+		writeFileSync(join(path4, "fixture.txt"), "fixture content bytes", "utf8"); // 21 bytes
+		const runDir4 = join(runsDir, "run-fixture-4");
+		mkdirSync(runDir4, { recursive: true });
+		writeFileSync(
+			join(runDir4, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-fixture-4",
+				state: "running",
+				cleanupState: "pending",
+				revision: 1,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.4"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent2,
+					candidateChild: candidate4,
+					path: path4,
+					state: "active",
+					reason: "fixture",
+					retainedAt: null,
+				},
+			}),
+			"utf8",
+		);
+
+		// 5. unknown: exists on disk under parent2, no run record
+		const candidate5 = "switchyard-simple-unknown-05";
+		const path5 = join(parent2, candidate5);
+		mkdirSync(path5, { recursive: true });
+		writeFileSync(
+			join(path5, "untracked.txt"),
+			"untracked unknown bytes",
+			"utf8",
+		); // 23 bytes
+
+		// Collect GC inventory with parent1 as default tmpdir
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{ tmpdir: () => parent1 },
+		);
+
+		// Both canonical parents discovered (parent1 from tmpdir, parent2 from run-fixture-4)
+		ok(inventory.canonicalParents.includes(parent1));
+		ok(inventory.canonicalParents.includes(parent2));
+
+		// Check roots classification
+		const root1 = inventory.roots.find((r) => r.path === path1);
+		ok(root1, "recorded root must be found");
+		strictEqual(root1.classification, "recorded");
+		strictEqual(root1.runId, "run-recorded-1");
+		strictEqual(root1.recordedState, "active");
+		strictEqual(root1.exists, true);
+		strictEqual(root1.bytes, null);
+		strictEqual(root1.measurable, false);
+		strictEqual(root1.unavailableReason, "private_bytes_unavailable");
+		strictEqual(root1.deletionEligible, false);
+
+		const root2 = inventory.roots.find((r) => r.path === path2);
+		ok(root2, "removed-but-exists root must be found");
+		strictEqual(root2.classification, "removed-but-exists");
+		strictEqual(root2.runId, "run-removed-2");
+		strictEqual(root2.recordedState, "removed");
+		strictEqual(root2.exists, true);
+		strictEqual(root2.bytes, null);
+		strictEqual(root2.measurable, false);
+		strictEqual(root2.unavailableReason, "private_bytes_unavailable");
+		strictEqual(root2.deletionEligible, false);
+
+		const root3 = inventory.roots.find((r) => r.path === path3);
+		ok(root3, "missing root must be found");
+		strictEqual(root3.classification, "missing");
+		strictEqual(root3.runId, "run-missing-3");
+		strictEqual(root3.recordedState, "retained");
+		strictEqual(root3.exists, false);
+		strictEqual(root3.bytes, null);
+		strictEqual(root3.measurable, false);
+		strictEqual(root3.unavailableReason, "private_bytes_unavailable");
+		strictEqual(root3.deletionEligible, false);
+
+		const root4 = inventory.roots.find((r) => r.path === path4);
+		ok(root4, "fixture root must be found");
+		strictEqual(root4.classification, "fixture");
+		strictEqual(root4.runId, "run-fixture-4");
+		strictEqual(root4.recordedState, "active");
+		strictEqual(root4.exists, true);
+		strictEqual(root4.bytes, null);
+		strictEqual(root4.measurable, false);
+		strictEqual(root4.unavailableReason, "private_bytes_unavailable");
+		strictEqual(root4.deletionEligible, false);
+
+		const root5 = inventory.roots.find((r) => r.path === path5);
+		ok(root5, "unknown root must be found");
+		strictEqual(root5.classification, "unknown");
+		strictEqual(root5.runId, null);
+		strictEqual(root5.recordedState, null);
+		strictEqual(root5.exists, true);
+		strictEqual(root5.bytes, null);
+		strictEqual(root5.measurable, false);
+		strictEqual(root5.unavailableReason, "private_bytes_unavailable");
+		strictEqual(root5.deletionEligible, false);
+
+		// Summary checks
+		strictEqual(inventory.summary.totalRoots, 5);
+		strictEqual(inventory.summary.measurable, false);
+		strictEqual(inventory.summary.totalBytes, null);
+
+		strictEqual(inventory.summary.byClass.recorded.count, 1);
+		strictEqual(inventory.summary.byClass.recorded.bytes, null);
+
+		strictEqual(inventory.summary.byClass["removed-but-exists"].count, 1);
+		strictEqual(inventory.summary.byClass["removed-but-exists"].bytes, null);
+
+		strictEqual(inventory.summary.byClass.missing.count, 1);
+		strictEqual(inventory.summary.byClass.missing.bytes, null);
+
+		strictEqual(inventory.summary.byClass.fixture.count, 1);
+		strictEqual(inventory.summary.byClass.fixture.bytes, null);
+
+		strictEqual(inventory.summary.byClass.unknown.count, 1);
+		strictEqual(inventory.summary.byClass.unknown.bytes, null);
+	});
+
+	it("CLI output produces valid JSON inventory across discovered parents", () => {
+		const localStateRoot = tempDir("gc-cli-state-");
+		const runsDir = join(localStateRoot, "runs");
+		mkdirSync(runsDir, { recursive: true });
+
+		const rawParent1 = tempDir("gc-cli-p1-");
+		const parent1 = realpathSync(rawParent1);
+		const candidate1 = "switchyard-simple-cli-rec";
+		const path1 = join(parent1, candidate1);
+		mkdirSync(path1, { recursive: true });
+		writeFileSync(join(path1, "file.txt"), "cli test payload", "utf8");
+
+		const runDir1 = join(runsDir, "run-cli-1");
+		mkdirSync(runDir1, { recursive: true });
+		writeFileSync(
+			join(runDir1, "run.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				runId: "run-cli-1",
+				state: "running",
+				cleanupState: "pending",
+				revision: 1,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+				orderedTaskIds: ["1.1"],
+				initialHostFingerprint: "test-host",
+				workerNonce: randomUUID(),
+				lastLeaseHeartbeat: new Date().toISOString(),
+				lastEventSequence: 0,
+				worktree: {
+					canonicalParent: parent1,
+					candidateChild: candidate1,
+					path: path1,
+					state: "active",
+					reason: null,
+					retainedAt: null,
+				},
+			}),
+			"utf8",
+		);
+
+		const result = runDispatch(["gc", "--state-root", localStateRoot], {
+			TMPDIR: parent1,
+		});
+		strictEqual(result.status, 0, `CLI failed: ${result.stderr}`);
+		const parsed = JSON.parse(result.stdout.trim());
+		ok(parsed.roots.length >= 1);
+		const found = parsed.roots.find((r) => r.path === path1);
+		ok(found);
+		strictEqual(found.classification, "recorded");
+		strictEqual(found.runId, "run-cli-1");
+		strictEqual(found.deletionEligible, false);
+	});
+
+	it("CLI output explicitly refuses --apply and leaves every fixture path unchanged", () => {
+		const localStateRoot = tempDir("gc-apply-state-");
+		const rawParent = tempDir("gc-apply-parent-");
+		const parent = realpathSync(rawParent);
+
+		const fixtureChild = "switchyard-simple-fixture-keep";
+		const fixtureDir = join(parent, fixtureChild);
+		mkdirSync(fixtureDir, { recursive: true });
+		const fixtureFile = join(fixtureDir, "important-fixture.txt");
+		writeFileSync(fixtureFile, "precious-fixture-content", "utf8");
+
+		const unknownChild = "switchyard-simple-unknown-keep";
+		const unknownDir = join(parent, unknownChild);
+		mkdirSync(unknownDir, { recursive: true });
+		const unknownFile = join(unknownDir, "keep.txt");
+		writeFileSync(unknownFile, "precious-unknown-content", "utf8");
+
+		// Run switchyard-dispatch gc --apply
+		const result = runDispatch(
+			["gc", "--apply", "--state-root", localStateRoot],
+			{ TMPDIR: parent },
+		);
+
+		// Must exit with code 2 (usage error)
+		strictEqual(result.status, 2);
+		ok(
+			result.stderr.includes("does not support --apply"),
+			`expected refusal in stderr, got: ${result.stderr}`,
+		);
+
+		// Every fixture path must remain intact and unchanged
+		ok(existsSync(fixtureDir), "fixture dir must exist after --apply refusal");
+		ok(
+			existsSync(fixtureFile),
+			"fixture file must exist after --apply refusal",
+		);
+		strictEqual(
+			readFileSync(fixtureFile, "utf8"),
+			"precious-fixture-content",
+			"fixture content must remain unchanged",
+		);
+
+		// Unknown path must also remain intact
+		ok(existsSync(unknownDir), "unknown dir must exist after --apply refusal");
+		ok(
+			existsSync(unknownFile),
+			"unknown file must exist after --apply refusal",
+		);
+		strictEqual(
+			readFileSync(unknownFile, "utf8"),
+			"precious-unknown-content",
+			"unknown content must remain unchanged",
+		);
+	});
+
+	it("reports path ambiguity as unavailable when a symlink is encountered", async () => {
+		const localStateRoot = tempDir("gc-symlink-state-");
+		const rawParent = tempDir("gc-symlink-parent-");
+		const parent = realpathSync(rawParent);
+
+		const targetDir = join(parent, "switchyard-simple-target");
+		mkdirSync(targetDir, { recursive: true });
+		writeFileSync(join(targetDir, "file.txt"), "target file", "utf8");
+
+		const symlinkChild = "switchyard-simple-symlink-entry";
+		const symlinkPath = join(parent, symlinkChild);
+		symlinkSync(targetDir, symlinkPath);
+
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{ tmpdir: () => parent },
+		);
+
+		const symlinkRoot = inventory.roots.find((r) => r.path === symlinkPath);
+		ok(symlinkRoot, "symlink root must be listed in inventory");
+		strictEqual(symlinkRoot.pathAmbiguity, true);
+		strictEqual(symlinkRoot.measurable, false);
+		strictEqual(symlinkRoot.unavailableReason, "path_ambiguity");
+		strictEqual(symlinkRoot.deletionEligible, false);
+
+		strictEqual(inventory.summary.measurable, false);
+		strictEqual(inventory.summary.totalBytes, null);
+		strictEqual(
+			inventory.summary.unavailableReason,
+			"private_bytes_unavailable",
+		);
+	});
+	it("reads only direct inventory directories and preserves nested content", async () => {
+		const localStateRoot = tempDir("gc-bounded-state-");
+		const parent = realpathSync(tempDir("gc-bounded-parent-"));
+		const root = join(parent, "switchyard-simple-kept");
+		const nested = join(root, "nested", "switchyard-simple-not-a-root");
+		mkdirSync(nested, { recursive: true });
+		const payload = join(nested, "payload.txt");
+		writeFileSync(payload, "preserved content");
+		const directoriesRead = [];
+		const pathsStatted = [];
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{
+				tmpdir: parent,
+				readdir: async (path, options) => {
+					directoriesRead.push(path);
+					return readdir(path, options);
+				},
+				lstat: async (path) => {
+					pathsStatted.push(path);
+					return lstat(path);
+				},
+			},
+		);
+		deepStrictEqual(directoriesRead, [join(localStateRoot, "runs"), parent]);
+		ok(pathsStatted.every((path) => path === parent || path === root));
+		strictEqual(inventory.roots.length, 1);
+		strictEqual(inventory.roots[0].bytes, null);
+		strictEqual(
+			inventory.roots[0].unavailableReason,
+			"private_bytes_unavailable",
+		);
+		strictEqual(inventory.roots[0].deletionEligible, false);
+		strictEqual(readFileSync(payload, "utf8"), "preserved content");
+	});
+
+	it("skips regular files and detects fixture markers through injected existence", async () => {
+		const localStateRoot = tempDir("gc-entry-types-state-");
+		const parent = realpathSync(tempDir("gc-entry-types-parent-"));
+		const file = join(parent, "switchyard-simple-regular-file");
+		const root = join(parent, "switchyard-simple-marker-root");
+		writeFileSync(file, "keep");
+		mkdirSync(root);
+		const marker = join(root, ".fixture");
+		const existsCalls = [];
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{
+				tmpdir: parent,
+				existsSync: (path) => {
+					existsCalls.push(path);
+					return path === root || path === marker;
+				},
+			},
+		);
+		strictEqual(
+			inventory.roots.some((entry) => entry.path === file),
+			false,
+		);
+		strictEqual(inventory.roots.length, 1);
+		strictEqual(inventory.roots[0].path, root);
+		strictEqual(inventory.roots[0].classification, "fixture");
+		ok(existsCalls.includes(marker));
+		strictEqual(readFileSync(file, "utf8"), "keep");
+	});
+
+	it("rejects programmatic apply before performing inventory reads", async () => {
+		await rejects(
+			collectGcInventory(
+				{ apply: true },
+				{
+					realpathSync: () => {
+						throw new Error("must not read paths");
+					},
+				},
+			),
+			/does not support --apply/,
+		);
+	});
+
+	it("fails closed when the OS temp parent cannot be canonicalized", async () => {
+		const localStateRoot = tempDir("gc-canonical-state-");
+		let reads = 0;
+		await rejects(
+			collectGcInventory(
+				{ stateRoot: localStateRoot },
+				{
+					tmpdir: "/missing-temp-parent",
+					realpathSync: () => {
+						throw new Error("unavailable");
+					},
+					readdir: () => {
+						reads += 1;
+						return [];
+					},
+				},
+			),
+			/parent_canonicalization_failed/,
+		);
+		strictEqual(reads, 0);
+	});
+
+	it("reports an unavailable record when its canonical parent now resolves elsewhere", async () => {
+		const localStateRoot = tempDir("gc-parent-alias-state-");
+		mkdirSync(join(localStateRoot, "runs", "run-alias"), { recursive: true });
+		const parent = realpathSync(tempDir("gc-parent-alias-"));
+		const alias = join(parent, "alias");
+		symlinkSync(parent, alias);
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{
+				tmpdir: parent,
+				readRun: async () => ({
+					runId: "run-alias",
+					worktree: {
+						canonicalParent: alias,
+						candidateChild: "switchyard-simple-retained",
+						state: "retained",
+					},
+				}),
+			},
+		);
+		strictEqual(inventory.roots.length, 1);
+		strictEqual(inventory.roots[0].classification, "unavailable");
+		strictEqual(inventory.roots[0].exists, null);
+		strictEqual(
+			inventory.roots[0].unavailableReason,
+			"parent_canonicalization_failed",
+		);
+		strictEqual(inventory.roots[0].deletionEligible, false);
+	});
+
+	it("preserves both run claims when records name the same root", async () => {
+		const localStateRoot = tempDir("gc-conflict-state-");
+		const parent = realpathSync(tempDir("gc-conflict-parent-"));
+		const candidateChild = "switchyard-simple-conflict";
+		const path = join(parent, candidateChild);
+		mkdirSync(path);
+		for (const runId of ["run-first", "run-second"]) {
+			mkdirSync(join(localStateRoot, "runs", runId), { recursive: true });
+		}
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{
+				tmpdir: parent,
+				readRun: async (runId) => ({
+					runId,
+					worktree: {
+						canonicalParent: parent,
+						candidateChild,
+						state: "retained",
+					},
+				}),
+			},
+		);
+		const root = inventory.roots.find((entry) => entry.path === path);
+		deepStrictEqual(root.runIds, ["run-first", "run-second"]);
+		strictEqual(root.classification, "conflicting-records");
+		strictEqual(root.pathAmbiguity, true);
+		strictEqual(root.deletionEligible, false);
+	});
+
+	it("does not label an unreadable parent as missing roots", async () => {
+		const localStateRoot = tempDir("gc-parent-read-state-");
+		const parent = realpathSync(tempDir("gc-parent-read-"));
+		await rejects(
+			collectGcInventory(
+				{ stateRoot: localStateRoot },
+				{
+					tmpdir: parent,
+					readdir: async (path, options) => {
+						if (path === parent) throw new Error("parent unreadable");
+						return readdir(path, options);
+					},
+				},
+			),
+			/parent unreadable/,
+		);
+	});
+
+	it("reports unresolved child canonicalization as path ambiguity", async () => {
+		const localStateRoot = tempDir("gc-child-realpath-state-");
+		const parent = realpathSync(tempDir("gc-child-realpath-"));
+		const root = join(parent, "switchyard-simple-unresolved");
+		mkdirSync(root);
+		const inventory = await collectGcInventory(
+			{ stateRoot: localStateRoot },
+			{
+				tmpdir: parent,
+				realpathSync: (path) => {
+					if (path === root) throw new Error("unavailable");
+					return realpathSync(path);
+				},
+			},
+		);
+		strictEqual(inventory.roots[0].pathAmbiguity, true);
+		strictEqual(inventory.roots[0].bytes, null);
+		strictEqual(inventory.roots[0].unavailableReason, "path_ambiguity");
+		strictEqual(inventory.roots[0].deletionEligible, false);
 	});
 });
