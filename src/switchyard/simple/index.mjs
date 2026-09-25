@@ -41,7 +41,7 @@ import {
 	normalizeProviderName,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
-import { route } from "../router/index.mjs";
+import { readSnapshotAtRoute, route } from "../router/index.mjs";
 import {
 	acquireProjectLock,
 	createEvent,
@@ -50,6 +50,7 @@ import {
 	releaseProjectLockIfOwnedBy,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
+import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
 export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
@@ -120,10 +121,15 @@ const SIMPLE_TARGET_ADAPTERS = Object.freeze([
 		harness: "vibe",
 		kind: "bridge",
 		defaultEligible: true,
-		capabilities: Object.freeze(["standard"]),
-		selectors: Object.freeze(["glm-5-3"]),
+		defaultCapabilities: Object.freeze(["low", "standard"]),
+		capabilities: Object.freeze(["low", "standard"]),
+		selectors: Object.freeze(["glm-5-3", "glm-5-3-medium"]),
 		validateInvocationArgs: (args) => Array.isArray(args) && args.length === 0,
 		expectedDescriptors: Object.freeze({
+			low: Object.freeze({
+				selector: "glm-5-3-medium",
+				invocationArgs: Object.freeze([]),
+			}),
 			standard: Object.freeze({
 				selector: "glm-5-3",
 				invocationArgs: Object.freeze([]),
@@ -134,7 +140,7 @@ const SIMPLE_TARGET_ADAPTERS = Object.freeze([
 		targetId: "opencode-go",
 		harness: "opencode",
 		kind: "bridge",
-		defaultEligible: false,
+		defaultEligible: true,
 		capabilities: Object.freeze(["low", "standard"]),
 		selectors: Object.freeze(["opencode-go/deepseek-v4.1-flash"]),
 		validateInvocationArgs: (args) =>
@@ -454,12 +460,83 @@ function rosterPath() {
 	);
 }
 
-export function simpleRouteIsFunded(target) {
-	return (
-		target?.enabled === true &&
-		["subscription", "quota"].includes(target.funding?.included?.mode) &&
-		target.funding?.overage?.enabled === false
+const SIMPLE_INCLUDED_USAGE_FLOOR = 5;
+const SIMPLE_INCLUDED_USAGE_WINDOWS = Object.freeze([
+	"five_hour",
+	"weekly",
+	"monthly",
+]);
+
+/**
+ * Return the funding admission failure for a simple target, if any.
+ * OpenCode Go can use its included subscription headroom when its distinct
+ * installed usage snapshot is fresh and every required window retains the
+ * router's existing 5% reserve. This is a local admission check; it does not
+ * change OpenCode's account-side balance fallback setting.
+ *
+ * @param {object} target
+ * @param {{targetId?: string, snapshotRead?: object}} [options]
+ * @returns {string|null}
+ */
+export function simpleRouteFundingFailure(target, options = {}) {
+	if (
+		target?.enabled !== true ||
+		!["subscription", "quota"].includes(target.funding?.included?.mode)
+	) {
+		return "paid_overage_not_allowed";
+	}
+	if (target.funding?.overage?.enabled === false) return null;
+	if (
+		options.targetId !== "opencode-go" ||
+		target.funding?.included?.mode !== "subscription"
+	) {
+		return "paid_overage_not_allowed";
+	}
+
+	const snapshotRead = options.snapshotRead ?? readSnapshotAtRoute(Date.now());
+	if (
+		snapshotRead?.snapshotStatus !== "fresh" ||
+		!Array.isArray(snapshotRead.snapshot?.providers)
+	) {
+		return "included_usage_unverified";
+	}
+	const matchingProviders = snapshotRead.snapshot.providers.filter(
+		(provider) =>
+			typeof target.snapshot_name === "string" &&
+			provider?.name === target.snapshot_name,
 	);
+	if (matchingProviders.length !== 1 || matchingProviders[0]?.ok !== true) {
+		return "included_usage_unverified";
+	}
+
+	const providerWindows = matchingProviders[0].windows;
+	if (!Array.isArray(providerWindows)) return "included_usage_unverified";
+	const requiredWindows = new Map();
+	for (const window of providerWindows) {
+		if (!window || typeof window !== "object") {
+			return "included_usage_unverified";
+		}
+		if (!SIMPLE_INCLUDED_USAGE_WINDOWS.includes(window.id)) continue;
+		if (requiredWindows.has(window.id)) return "included_usage_unverified";
+		requiredWindows.set(window.id, window);
+	}
+	for (const id of SIMPLE_INCLUDED_USAGE_WINDOWS) {
+		const window = requiredWindows.get(id);
+		if (
+			!window ||
+			typeof window.percent_left !== "number" ||
+			!Number.isFinite(window.percent_left) ||
+			window.percent_left < SIMPLE_INCLUDED_USAGE_FLOOR ||
+			window.percent_left > 100
+		) {
+			return "included_usage_unverified";
+		}
+	}
+	return null;
+}
+
+export function simpleRouteIsFunded(target, options = {}) {
+	return simpleRouteFundingFailure(target, options) === null;
 }
 
 function assertFundedRoute(targetId) {
@@ -472,9 +549,10 @@ function assertFundedRoute(targetId) {
 		});
 	}
 	const target = roster?.targets?.[targetId];
-	if (!simpleRouteIsFunded(target)) {
-		throw Object.assign(new Error("paid_overage_not_allowed"), {
-			code: "paid_overage_not_allowed",
+	const failure = simpleRouteFundingFailure(target, { targetId });
+	if (failure) {
+		throw Object.assign(new Error(failure), {
+			code: failure,
 		});
 	}
 }
@@ -902,65 +980,12 @@ export function simpleProviderCompatibility({
 	return { compatible: true, reason: null };
 }
 
-function processGroupPresent(pgid) {
-	if (!Number.isSafeInteger(pgid) || pgid <= 0) return null;
-	try {
-		process.kill(-pgid, 0);
-		return true;
-	} catch (error) {
-		if (error?.code === "ESRCH") return false;
-		return null;
-	}
-}
-
-async function waitForProcessGroupExit(pgid, timeoutMs, onProgress) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const present = processGroupPresent(pgid);
-		if (present === false) return true;
-		onProgress?.();
-		await new Promise((resolve) => setTimeout(resolve, 50));
-	}
-	return processGroupPresent(pgid) === false;
-}
-
-/** Settle a dedicated provider/check process group after its leader completes. */
-async function settleSimpleProcessGroup(pgid, onProgress) {
-	const present = processGroupPresent(pgid);
-	if (present === false) return "stopped";
-	if (present === null) {
-		return (await waitForProcessGroupExit(pgid, 5_000, onProgress))
-			? "stopped"
-			: "unavailable";
-	}
-	try {
-		process.kill(-pgid, "SIGTERM");
-	} catch (error) {
-		if (error?.code === "ESRCH") return "stopped";
-		return (await waitForProcessGroupExit(pgid, 5_000, onProgress))
-			? "stopped"
-			: "unavailable";
-	}
-	if (await waitForProcessGroupExit(pgid, 1_000, onProgress)) return "stopped";
-	try {
-		process.kill(-pgid, "SIGKILL");
-	} catch (error) {
-		if (error?.code === "ESRCH") return "stopped";
-		return (await waitForProcessGroupExit(pgid, 4_000, onProgress))
-			? "stopped"
-			: "unavailable";
-	}
-	return (await waitForProcessGroupExit(pgid, 4_000, onProgress))
-		? "stopped"
-		: "unavailable";
-}
-
 export async function runSimpleWriter(command, args, options = {}) {
-	// Test-injected spawns retain their own lifecycle contract. The production
-	// spawn creates a new session so a negative PID targets only this writer's
-	// process group, never the dispatcher group.
+	// Test-injected spawns retain their own lifecycle contract. Production spawns
+	// create a session and settle both its group and any escaped worktree holder.
 	if (options.spawnFn) return runProviderProcess(command, args, options);
 	let pgid = null;
+	const launchedAt = Date.now();
 	const result = await runProviderProcess(command, args, {
 		...options,
 		spawnFn: (cmd, argv, spawnOptions) => {
@@ -972,7 +997,12 @@ export async function runSimpleWriter(command, args, options = {}) {
 	const writerLifecycle =
 		result.writerLifecycle === "never_started"
 			? "never_started"
-			: await settleSimpleProcessGroup(pgid, options.onPoll);
+			: await settleSimpleWriterProcesses({
+					processGroupId: pgid,
+					processScopePath: options.processScopePath,
+					launchedAt,
+					onProgress: options.onPoll,
+				});
 	return { ...result, writerLifecycle, processGroupId: pgid };
 }
 
@@ -989,6 +1019,7 @@ export async function defaultExecuteProvider(context) {
 	const result = await runSimpleWriter(invocation.command, invocation.args, {
 		input: context.prompt,
 		cwd: context.worktreePath,
+		processScopePath: context.worktreePath,
 		timeoutMs: context.timeoutMs,
 		silenceTimeoutMs: Math.min(5 * 60 * 1000, context.timeoutMs),
 		maxBuffer: MAX_CAPTURE_BYTES,
@@ -997,6 +1028,15 @@ export async function defaultExecuteProvider(context) {
 		signal: context.signal,
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
+	if (context.harness === "opencode" && !result.success) {
+		const providerVerdictCode = parseOpenCodeGoBridgeDiagnostic(result.output);
+		return {
+			...result,
+			output: "",
+			stderr: "",
+			...(providerVerdictCode ? { providerVerdictCode } : {}),
+		};
+	}
 	if (context.harness !== "agy" || !result.success) return result;
 	try {
 		return {
@@ -1009,6 +1049,18 @@ export async function defaultExecuteProvider(context) {
 	} catch {
 		return { ...result, providerVerdictCode: "agy_unparseable" };
 	}
+}
+
+/** Parse only the fixed numeric diagnostic emitted by the OpenCode Go bridge. */
+export function parseOpenCodeGoBridgeDiagnostic(output) {
+	if (typeof output !== "string") return null;
+	const match =
+		/^SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=(0|[1-9]\d{0,5}) upstream_status=(0|[1-5]\d{2}) proxy_rejections=(0|[1-9]\d{0,5})\r?\n?$/u.exec(
+			output,
+		);
+	if (!match) return null;
+	const [, requests, upstreamStatus, proxyRejections] = match;
+	return `opencode_go_diag_requests_${requests}_status_${upstreamStatus}_rejections_${proxyRejections}`;
 }
 
 async function defaultRunCheck({
@@ -1028,6 +1080,7 @@ async function defaultRunCheck({
 			command,
 		],
 		{
+			processScopePath: worktreePath,
 			timeoutMs,
 			silenceTimeoutMs: Math.min(60 * 1000, timeoutMs),
 			maxBuffer: MAX_CAPTURE_BYTES,
@@ -1409,6 +1462,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let firstChangeObserved = false;
 	let lastFirstChangeProbeAt = Number.NEGATIVE_INFINITY;
 	let runInitialized = false;
+	let failureTerminalDurable = true;
 	const pendingDurability = new Set();
 	const checks = [];
 	const acquireLock = dependencies.acquireProjectLock ?? acquireProjectLock;
@@ -1453,6 +1507,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		if (
 			failureReason === "paid_overage_not_allowed" ||
+			failureReason === "included_usage_unverified" ||
 			failureReason === "ambiguous_combined_rename_spelling"
 		) {
 			return "policy_violation";
@@ -1672,6 +1727,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
 		if (runInitialized) {
+			failureTerminalDurable = false;
 			try {
 				const terminalWrite = (
 					dependencies.updateRunWithRetry ?? updateRunWithRetry
@@ -1684,7 +1740,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 						errorKind: computedErrorKind,
 						failurePhase,
 					}),
-				}).catch(() => {});
+				}).then(
+					() => {
+						failureTerminalDurable = true;
+					},
+					() => {},
+				);
 				pendingDurability.add(terminalWrite);
 				void terminalWrite.finally(() =>
 					pendingDurability.delete(terminalWrite),
@@ -1835,7 +1896,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		const requestedSimpleTargets = (options.onlyProviders ?? []).length
 			? options.onlyProviders
 			: SIMPLE_TARGET_ADAPTERS.filter(
-					(adapter) => adapter.defaultEligible !== false,
+					(adapter) =>
+						adapter.defaultEligible !== false &&
+						(!adapter.defaultCapabilities ||
+							adapter.defaultCapabilities.includes(options.capability)),
 				).map((adapter) => adapter.targetId);
 		const compatibleSimpleTargets = [];
 		let pinnedIncompatibility = null;
@@ -2394,6 +2458,47 @@ export async function runSimpleTask(options, dependencies = {}) {
 					error,
 				);
 			}
+			// Publish the accepted output receipt and cleanup intent before any
+			// root removal. A crash here leaves a terminal, recoverable claim.
+			try {
+				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+					state: "succeeded",
+					cleanupState: "pending",
+					finishedAt: new Date(now()).toISOString(),
+					terminalSummary: {
+						status: "succeeded",
+						baseRevision,
+						changedFiles,
+						outputs: terminalOutputs,
+					},
+					...(candidateChild
+						? {
+								worktree: {
+									canonicalParent,
+									candidateChild,
+									path: candidatePath,
+									state: keepWorktree ? "retained" : "active",
+									reason: keepWorktree ? "salvage_retained" : null,
+									retainedAt: keepWorktree
+										? new Date(now()).toISOString()
+										: null,
+									writerStopped:
+										writerLifecycle === "stopped" ||
+										writerLifecycle === "never_started",
+									...(worktreeIdentity ?? {}),
+								},
+							}
+						: {}),
+				});
+			} catch (error) {
+				keepWorktree = true;
+				return fail(
+					"run_store_write_failed",
+					"cleanup",
+					classifyErrorKind("run_store_write_failed", "cleanup", error),
+					error,
+				);
+			}
 		}
 		emitStatus(onStatus, taskId, "cleanup");
 		currentPhase = "cleanup";
@@ -2485,7 +2590,6 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (runInitialized) {
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
-					state: "succeeded",
 					cleanupState,
 					...(cleanupFailure ? { cleanupFailure } : {}),
 					finishedAt: new Date(now()).toISOString(),
@@ -2553,6 +2657,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 	} finally {
 		if (pendingDurability.size > 0) {
 			await Promise.allSettled([...pendingDurability]);
+		}
+		if (!failureTerminalDurable && worktreePath) {
+			keepWorktree = true;
+			if (finalResult?.status === "failed")
+				finalResult.partialWorktree = worktreePath;
 		}
 		if (worktreePath && !keepWorktree) {
 			await removeNonSalvageWorktree();

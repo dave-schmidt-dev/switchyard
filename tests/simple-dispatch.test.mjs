@@ -32,10 +32,12 @@ import {
 	buildSimpleProviderInvocation,
 	defaultExecuteProvider,
 	handleSimple,
+	parseOpenCodeGoBridgeDiagnostic,
 	parseSimpleArgs,
 	runSimpleTask,
 	runSimpleWriter,
 	simpleProviderCompatibility,
+	simpleRouteFundingFailure,
 	simpleRouteIsFunded,
 } from "../src/switchyard/simple/index.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
@@ -753,7 +755,20 @@ describe("simple dispatch argument boundary", () => {
 					invocation_args: [],
 				},
 			}),
-			{ compatible: false, reason: "local_adapter_unavailable" },
+			{ compatible: true, reason: null },
+		);
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "vibe",
+				harness: "vibe",
+				capability: "low",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3",
+					invocation_args: [],
+				},
+			}),
+			{ compatible: false, reason: "local_descriptor_model_unavailable" },
 		);
 		for (const [targetId, harness, descriptor] of [
 			[
@@ -795,6 +810,26 @@ describe("simple dispatch argument boundary", () => {
 		const worktreePath = "/tmp/worktree";
 		const prompt = "bounded task";
 		const cases = [
+			{
+				harness: "vibe",
+				capability: "low",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3-medium",
+					invocation_args: [],
+				},
+				command: "/Users/dave/.agent/bin/bws-secret-exec",
+				args: [
+					"switchyard-simple-vibe-dispatch",
+					"--",
+					"--target",
+					"vibe",
+					"--model",
+					"glm-5-3-medium",
+					"--worktree",
+					worktreePath,
+				],
+			},
 			{
 				harness: "vibe",
 				capability: "standard",
@@ -892,7 +927,7 @@ describe("simple dispatch argument boundary", () => {
 		const result = await defaultExecuteProvider({
 			targetId: "vibe",
 			harness: "vibe",
-			descriptor: cases[0].descriptor,
+			descriptor: cases[1].descriptor,
 			capability: "standard",
 			prompt,
 			worktreePath,
@@ -995,6 +1030,94 @@ describe("simple dispatch argument boundary", () => {
 				},
 			}),
 			false,
+		);
+	});
+
+	it("admits OpenCode Go overage-enabled subscription only with fresh included headroom", () => {
+		const target = {
+			enabled: true,
+			snapshot_name: "OpenCode Go",
+			funding: {
+				included: { mode: "subscription" },
+				overage: { enabled: true },
+			},
+		};
+		const includedUsage = (windows = [100, 94, 97], overrides = {}) => ({
+			snapshotStatus: "fresh",
+			snapshot: {
+				providers: [
+					{
+						name: "OpenCode Go",
+						ok: true,
+						windows: ["five_hour", "weekly", "monthly"].map((id, index) => ({
+							id,
+							percent_left: windows[index],
+						})),
+						...overrides,
+					},
+				],
+			},
+		});
+		const options = (snapshotRead) => ({
+			targetId: "opencode-go",
+			snapshotRead,
+		});
+
+		strictEqual(
+			simpleRouteFundingFailure(target, options(includedUsage())),
+			null,
+			"the reproduced 100/94/97 Go subscription snapshot is included usage",
+		);
+		strictEqual(
+			simpleRouteIsFunded(target, options(includedUsage([5, 5, 5]))),
+			true,
+			"the router's 5% reserve boundary is admitted",
+		);
+
+		for (const snapshotStatus of ["missing", "stale", "future", "malformed"]) {
+			strictEqual(
+				simpleRouteFundingFailure(
+					target,
+					options({ snapshotStatus, snapshot: null }),
+				),
+				"included_usage_unverified",
+				`${snapshotStatus} Go usage must fail closed`,
+			);
+		}
+		for (const snapshotRead of [
+			includedUsage([100, 4.99, 97]),
+			includedUsage([100, 94, 0]),
+			includedUsage([100, Number.NaN, 97]),
+			includedUsage([100, 101, 97]),
+			includedUsage([100, 94]),
+			includedUsage([100, 94, 97], { name: "OpenCode Zen" }),
+			includedUsage([100, 94, 97], { ok: false }),
+			{ snapshotStatus: "fresh", snapshot: { providers: [] } },
+		]) {
+			strictEqual(
+				simpleRouteFundingFailure(target, options(snapshotRead)),
+				"included_usage_unverified",
+				"unavailable, malformed, or under-reserve Go usage must fail closed",
+			);
+		}
+		strictEqual(
+			simpleRouteFundingFailure(
+				{
+					...target,
+					funding: { ...target.funding, included: { mode: "quota" } },
+				},
+				options(includedUsage()),
+			),
+			"paid_overage_not_allowed",
+			"this exception is limited to the OpenCode Go subscription",
+		);
+		strictEqual(
+			simpleRouteFundingFailure(target, {
+				...options(includedUsage()),
+				targetId: "vibe",
+			}),
+			"paid_overage_not_allowed",
+			"other targets retain the no-overage rule",
 		);
 	});
 
@@ -1181,6 +1304,57 @@ describe("simple dispatch argument boundary", () => {
 });
 
 describe("simple local execution path", () => {
+	it("parses only the fixed numeric OpenCode Go diagnostic and suppresses CLI text", async () => {
+		const marker =
+			"SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=2 upstream_status=429 proxy_rejections=0\n";
+		strictEqual(
+			parseOpenCodeGoBridgeDiagnostic(marker),
+			"opencode_go_diag_requests_2_status_429_rejections_0",
+		);
+		for (const invalid of [
+			`${marker}private text`,
+			"SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=1000000 upstream_status=429 proxy_rejections=0\n",
+			"SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=1 upstream_status=600 proxy_rejections=0\n",
+			"prefix SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=1 upstream_status=429 proxy_rejections=0\n",
+		]) {
+			strictEqual(parseOpenCodeGoBridgeDiagnostic(invalid), null);
+		}
+
+		const context = {
+			targetId: "opencode-go",
+			harness: "opencode",
+			descriptor: {
+				target_id: "opencode-go",
+				selector: "opencode-go/deepseek-v4.1-flash",
+				invocation_args: ["--variant", "low"],
+			},
+			capability: "low",
+			prompt: "private prompt sentinel",
+			worktreePath: "/tmp/switchyard-simple-test/worktree",
+			timeoutMs: 5_000,
+			spawnFn: () => {
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.stdin = { end() {} };
+				queueMicrotask(() => {
+					child.stdout.emit("data", Buffer.from(marker));
+					child.stderr.emit("data", Buffer.from("private CLI stderr sentinel"));
+					child.emit("close", 1, null);
+				});
+				return child;
+			},
+		};
+		const result = await defaultExecuteProvider(context);
+		strictEqual(result.success, false);
+		strictEqual(
+			result.providerVerdictCode,
+			"opencode_go_diag_requests_2_status_429_rejections_0",
+		);
+		strictEqual(result.output, "");
+		strictEqual(result.stderr, "");
+	});
+
 	it("confirms the dedicated process group is gone after its leader exits", async () => {
 		const result = await runSimpleWriter(
 			"/bin/sh",
@@ -1191,6 +1365,73 @@ describe("simple local execution path", () => {
 		strictEqual(result.writerLifecycle, "stopped");
 		ok(Number.isSafeInteger(result.processGroupId));
 		throws(() => process.kill(-result.processGroupId, 0), { code: "ESRCH" });
+	});
+
+	it("stops a detached child that still holds the disposable worktree", async (t) => {
+		const identityProbe = spawnSync(
+			"ps",
+			["-o", "lstart=", "-o", "stat=", "-p", String(process.pid)],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+		);
+		if (identityProbe.status !== 0 || identityProbe.error) {
+			t.skip("process identity inspection is denied by the active sandbox");
+			return;
+		}
+		const worktreePath = tempDir("switchyard-simple-detached-holder-");
+		const pidPath = join(worktreePath, "helper.pid");
+		const termPath = join(worktreePath, "helper.term");
+		const helperProgram = `
+import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => writeFileSync(${JSON.stringify(termPath)}, "term"));
+setInterval(() => {}, 1_000);
+setTimeout(() => process.exit(0), 3_000).unref();
+`;
+		const providerProgram = `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const helper = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(helperProgram)}], {
+  cwd: process.argv[1], detached: true, stdio: "ignore"
+});
+writeFileSync(process.argv[2], String(helper.pid));
+helper.unref();
+`;
+		let helperPid = null;
+		try {
+			const result = await runSimpleWriter(
+				process.execPath,
+				["--input-type=module", "-e", providerProgram, worktreePath, pidPath],
+				{
+					cwd: worktreePath,
+					processScopePath: worktreePath,
+					timeoutMs: 5_000,
+					termGraceMs: 100,
+				},
+			);
+			if (existsSync(pidPath))
+				helperPid = Number(readFileSync(pidPath, "utf8"));
+			strictEqual(result.success, true);
+			strictEqual(result.writerLifecycle, "stopped");
+			strictEqual(readFileSync(termPath, "utf8"), "term");
+			const stopped = spawnSync(
+				"ps",
+				["-o", "stat=", "-p", String(helperPid)],
+				{
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "ignore"],
+				},
+			);
+			ok(
+				stopped.status === 1 || /^Z/u.test(stopped.stdout.trim()),
+				"detached helper should be gone or reaped after teardown",
+			);
+		} finally {
+			if (helperPid !== null) {
+				try {
+					process.kill(helperPid, "SIGKILL");
+				} catch {}
+			}
+			rmSync(worktreePath, { recursive: true, force: true });
+		}
 	});
 
 	it("settles a dedicated process group on cancellation", async () => {
@@ -1341,9 +1582,26 @@ describe("simple local execution path", () => {
 			"codex",
 			"antigravity",
 			"copilot-student",
+			"vibe",
+			"opencode-go",
 		]);
 		strictEqual(result.failureReason, "test_stop");
 		strictEqual(result.failurePhase, "route");
+		let pinnedOptions = null;
+		const pinnedLowResult = await runSimpleTask(
+			options(repo, { capability: "low", onlyProviders: ["vibe"] }),
+			dependencies({
+				route: (routeOptions) => {
+					pinnedOptions = routeOptions;
+					return { provider: null, reason: "test_stop" };
+				},
+				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
+				getInvocationDescriptor: (name) => descriptors[name] ?? null,
+			}),
+		);
+		deepStrictEqual(pinnedOptions.availableProviders, ["vibe"]);
+		strictEqual(pinnedLowResult.failureReason, "test_stop");
+		strictEqual(pinnedLowResult.failurePhase, "route");
 		routedOptions = null;
 		const standardResult = await runSimpleTask(
 			options(repo, { capability: "standard" }),
@@ -1353,18 +1611,21 @@ describe("simple local execution path", () => {
 					return { provider: null, reason: "test_stop" };
 				},
 				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
-				getInvocationDescriptor: (name) =>
-					name === "vibe"
-						? { ...descriptors.vibe, selector: "glm-5-3" }
-						: (descriptors[name] ?? null),
+				getInvocationDescriptor: (name) => {
+					if (name === "vibe")
+						return { ...descriptors.vibe, selector: "glm-5-3" };
+					if (name === "opencode-go")
+						return {
+							...descriptors[name],
+							invocation_args: ["--variant", "max"],
+						};
+					return descriptors[name] ?? null;
+				},
 			}),
 		);
 		strictEqual(standardResult.failureReason, "test_stop");
 		strictEqual(routedOptions.availableProviders.includes("vibe"), true);
-		strictEqual(
-			routedOptions.availableProviders.includes("opencode-go"),
-			false,
-		);
+		strictEqual(routedOptions.availableProviders.includes("opencode-go"), true);
 	});
 
 	it("rejects an incompatible explicit pin before routing or launch", async () => {
@@ -2869,6 +3130,8 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(result.status, "failed");
 			strictEqual(result.errorKind, "run_store_write_failed");
 			strictEqual(result.failurePhase, "cleanup");
+			ok(result.partialWorktree);
+			strictEqual(existsSync(dirname(result.partialWorktree)), true);
 			ok(
 				durablePatches.some(
 					(patch) =>
@@ -2878,6 +3141,28 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				),
 				"host integration must be durable before terminal publication",
 			);
+		});
+
+		it("retains an empty-result root when its failed terminal receipt is not durable", async () => {
+			const repo = makeRepo();
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					executeProvider: async () => ({
+						success: true,
+						writerLifecycle: "stopped",
+					}),
+					updateRunWithRetry: async (runId, patch) => {
+						if (patch.state === "failed")
+							throw new Error("terminal receipt unavailable");
+						return updateRunWithRetry(runId, patch);
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "empty_diff");
+			ok(result.partialWorktree);
+			strictEqual(existsSync(dirname(result.partialWorktree)), true);
 		});
 
 		it("persists named milestones while repetitive heartbeats are not persisted", async () => {
@@ -2928,12 +3213,21 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			const repo = makeRepo();
 			const runId = `simple-allocation-${Date.now()}`;
 			const order = [];
+			let terminalReceiptPrecededRemoval = false;
 			const result = await runSimpleTask(
 				options(repo),
 				dependencies({
 					runId,
 					updateRunWithRetry: async (id, patch) => {
 						const written = await updateRunWithRetry(id, patch);
+						if (
+							patch.state === "succeeded" &&
+							patch.cleanupState === "pending"
+						) {
+							strictEqual(patch.terminalSummary?.status, "succeeded");
+							strictEqual(existsSync(written.worktree.path), true);
+							terminalReceiptPrecededRemoval = true;
+						}
 						if (patch.worktree) {
 							const root = written.worktree;
 							strictEqual(root.canonicalParent, SUITE_TMPDIR);
@@ -2955,7 +3249,14 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				}),
 			);
 			strictEqual(result.status, "succeeded");
-			deepStrictEqual(order, ["allocating", "mkdir", "active", "removed"]);
+			strictEqual(terminalReceiptPrecededRemoval, true);
+			deepStrictEqual(order, [
+				"allocating",
+				"mkdir",
+				"active",
+				"active",
+				"removed",
+			]);
 			const run = await readRun(runId);
 			strictEqual(run.worktree.state, "removed");
 			strictEqual(run.worktree.reason, null);

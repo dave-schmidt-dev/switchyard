@@ -1,21 +1,28 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
+	readFileSync,
 	realpathSync,
+	renameSync,
 	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { describe, it } from "node:test";
+import { listHeldPathsViaLsof } from "../scripts/simple-orphan-collector.mjs";
 import {
 	DEFAULT_MAX_AGE_DAYS,
 	inspectTree,
 	isSweepAuthorized,
 	parseLsofResult,
 	parseSweepArgs,
+	SIMPLE_ORPHAN_TTL_MS,
+	sweepSimpleOrphans,
 	sweepTempDirs,
 } from "../scripts/sweep-temp-dirs.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -61,6 +68,74 @@ function makeFixture() {
 }
 
 const noneHeld = () => [];
+
+const makeRunStore = (parent) => {
+	const root = join(parent, "state");
+	mkdirSync(join(root, "runs"), { recursive: true });
+	return root;
+};
+
+const addRunRecord = (root, runId, state, worktree, overrides = {}) => {
+	const dir = join(root, "runs", runId);
+	mkdirSync(dir, { recursive: true });
+	const terminal = ["succeeded", "failed", "deferred"].includes(state);
+	writeFileSync(
+		join(dir, "run.json"),
+		JSON.stringify({
+			runId,
+			state,
+			cleanupState: terminal ? "complete" : "pending",
+			createdAt: new Date(NOW).toISOString(),
+			workerPid: state === "running" ? process.pid : null,
+			worktree,
+			...overrides,
+		}),
+	);
+};
+
+function makeSimpleRoot(
+	parent,
+	suffix,
+	runId = `simple-task-${suffix}`,
+	ageMs = SIMPLE_ORPHAN_TTL_MS + 1,
+) {
+	const root = join(parent, `switchyard-simple-${suffix}`);
+	mkdirSync(root);
+	const nonce = randomUUID();
+	const marker = join(root, ".switchyard-cleanup-owner.json");
+	const payload = join(root, "payload.txt");
+	writeFileSync(marker, `${JSON.stringify({ runId, nonce })}\n`, {
+		mode: 0o600,
+	});
+	writeFileSync(payload, "orphan fixture");
+	const at = new Date(NOW - ageMs);
+	for (const path of [marker, payload, root]) utimesSync(path, at, at);
+	return { root, nonce, runId };
+}
+
+function worktreeRecord(root, parent, nonce, state) {
+	const stat = lstatSync(root);
+	return {
+		canonicalParent: realpathSync(parent),
+		candidateChild: basename(root),
+		path: realpathSync(root),
+		state,
+		nonce,
+		device: String(stat.dev),
+		inode: String(stat.ino),
+	};
+}
+
+const collectSimple = (tmpDir, stateRoot, options = {}) =>
+	sweepSimpleOrphans({
+		tmpDir,
+		stateRoot,
+		now: NOW,
+		listHeldPaths: noneHeld,
+		log: silent,
+		progress: options.progress ?? silent,
+		...options,
+	});
 
 describe("sweep-temp-dirs", () => {
 	for (const apply of [false, true]) {
@@ -276,6 +351,29 @@ describe("sweep-temp-dirs", () => {
 		strictEqual(parseLsofResult({ status: 0, stdout: "" }), null);
 	});
 
+	it("uses a bounded lsof invocation with a sanitized environment", () => {
+		let invocation;
+		const result = listHeldPathsViaLsof((command, args, options) => {
+			invocation = { command, args, options };
+			return { status: 0, stdout: "p1\nn/private/tmp/held\n", stderr: "" };
+		});
+		deepStrictEqual(result, ["/private/tmp/held"]);
+		strictEqual(invocation.command, "/usr/sbin/lsof");
+		deepStrictEqual(invocation.args, ["-Fn"]);
+		strictEqual(invocation.options.timeout, 30_000);
+		strictEqual(invocation.options.killSignal, "SIGKILL");
+		strictEqual(Number.isFinite(invocation.options.maxBuffer), true);
+		deepStrictEqual(Object.keys(invocation.options.env).sort(), [
+			"LANG",
+			"LC_ALL",
+			"PATH",
+		]);
+		strictEqual(
+			listHeldPathsViaLsof(() => ({ error: { code: "ETIMEDOUT" } })),
+			null,
+		);
+	});
+
 	it("authorizes only prefixed direct children of the swept directory", () => {
 		// The last check before `rm -rf`, and redundant with the filter applied
 		// when candidates are collected - so it is tested directly rather than
@@ -304,5 +402,271 @@ describe("sweep-temp-dirs", () => {
 		// safe no-op while doing the opposite of what it says.
 		ok("error" in parseSweepArgs(["--dry-run"]));
 		ok("error" in parseSweepArgs(["--aply"]));
+	});
+
+	it("dry-runs old UUID roots and inventories legacy six-character roots only", async () => {
+		const parent = tempDir("switchyard-simple-orphan-dry-run-");
+		const stateRoot = makeRunStore(parent);
+		const roots = Array.from({ length: 11 }, () =>
+			makeSimpleRoot(parent, randomUUID()),
+		);
+		const legacy = join(parent, "switchyard-simple-abcdef");
+		mkdirSync(legacy);
+		writeFileSync(join(legacy, "payload.txt"), "legacy");
+		const messages = [];
+		const progress = [];
+		const { status, summary } = await collectSimple(parent, stateRoot, {
+			log: (message) => messages.push(message),
+			progress: (message) => progress.push(message),
+		});
+		strictEqual(status, 0);
+		deepStrictEqual(
+			[
+				summary.apply,
+				summary.candidates,
+				summary.legacyInventory,
+				summary.wouldRemove,
+				summary.removed,
+			],
+			[false, 11, 1, 11, 0],
+		);
+		ok(
+			summary.apparentBytes > 0 && roots.every((root) => existsSync(root.root)),
+		);
+		ok(progress.includes("simple-orphans: progress rootsChecked=10/11"));
+		ok(existsSync(join(legacy, "payload.txt")));
+		const report = messages.find((message) =>
+			message.startsWith("simple-orphans dry-run"),
+		);
+		ok(report?.includes(`apparentBytes=${summary.apparentBytes}`));
+	});
+
+	it("keeps roots whose run records are active or retained", async () => {
+		const parent = tempDir("switchyard-simple-orphan-run-state-");
+		const stateRoot = makeRunStore(parent);
+		const activeId = "simple-task-22222222-3333-4444-8555-666666666666";
+		const retainedId = "simple-task-33333333-4444-4555-8666-777777777777";
+		const active = makeSimpleRoot(parent, activeId.slice(-36));
+		const retained = makeSimpleRoot(parent, retainedId.slice(-36));
+		const startup = makeSimpleRoot(
+			parent,
+			"44444444-5555-4666-8777-888888888888",
+		);
+		const unknown = makeSimpleRoot(
+			parent,
+			"55555555-6666-4777-8888-999999999999",
+		);
+		addRunRecord(
+			stateRoot,
+			active.runId,
+			"running",
+			worktreeRecord(active.root, parent, active.nonce, "active"),
+		);
+		addRunRecord(
+			stateRoot,
+			retained.runId,
+			"failed",
+			worktreeRecord(retained.root, parent, retained.nonce, "retained"),
+		);
+		addRunRecord(
+			stateRoot,
+			startup.runId,
+			"running",
+			worktreeRecord(startup.root, parent, startup.nonce, "active"),
+			{ workerPid: null, createdAt: new Date(NOW - 60_000).toISOString() },
+		);
+		addRunRecord(
+			stateRoot,
+			unknown.runId,
+			"running",
+			worktreeRecord(unknown.root, parent, unknown.nonce, "active"),
+			{ workerPid: undefined, createdAt: new Date(NOW - DAY).toISOString() },
+		);
+		const { status, summary } = await collectSimple(parent, stateRoot);
+		strictEqual(status, 0);
+		deepStrictEqual(
+			[summary.skippedActive, summary.skippedRetained, summary.wouldRemove],
+			[3, 1, 0],
+		);
+		ok(
+			[active, retained, startup, unknown].every((root) =>
+				existsSync(root.root),
+			),
+		);
+	});
+
+	it("allows an old active root after its recorded worker is proven dead", async () => {
+		const parent = tempDir("switchyard-simple-orphan-dead-worker-");
+		const stateRoot = makeRunStore(parent);
+		const orphan = makeSimpleRoot(
+			parent,
+			"66666666-7777-4888-8999-aaaaaaaaaaaa",
+		);
+		addRunRecord(
+			stateRoot,
+			orphan.runId,
+			"running",
+			worktreeRecord(orphan.root, parent, orphan.nonce, "active"),
+			{ workerPid: null, createdAt: new Date(NOW - 10 * 60_000).toISOString() },
+		);
+		const { status, summary } = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[status, summary.skippedActive, summary.wouldRemove],
+			[0, 0, 1],
+		);
+		ok(existsSync(orphan.root), "dry-run keeps the fixture on disk");
+	});
+
+	it("honors full-tree TTL and canonical open-handle evidence", async () => {
+		const parent = tempDir("switchyard-simple-orphan-guards-");
+		const stateRoot = makeRunStore(parent);
+		const fresh = makeSimpleRoot(
+			parent,
+			"44444444-5555-4666-8777-888888888888",
+			undefined,
+			SIMPLE_ORPHAN_TTL_MS - 1,
+		);
+		const held = makeSimpleRoot(parent, "55555555-6666-4777-8888-999999999999");
+		const { summary } = await collectSimple(parent, stateRoot, {
+			listHeldPaths: () => [join(realpathSync(held.root), "payload.txt")],
+		});
+		deepStrictEqual(
+			[summary.skippedFresh, summary.skippedHeld, summary.wouldRemove],
+			[1, 1, 0],
+		);
+		ok(existsSync(fresh.root) && existsSync(held.root));
+	});
+
+	it("fails closed for corrupt relevant records and skips malformed markers", async () => {
+		const parent = tempDir("switchyard-simple-orphan-evidence-");
+		const unknownRunId = "broken-simple-run";
+		const orphan = makeSimpleRoot(
+			parent,
+			"66666666-7777-4888-8999-aaaaaaaaaaaa",
+			unknownRunId,
+		);
+		const unrelated = makeSimpleRoot(
+			parent,
+			"77777777-8888-4999-8aaa-bbbbbbbbbbbb",
+		);
+		const missing = await collectSimple(parent, join(parent, "missing"));
+		strictEqual(missing.status, 1);
+		strictEqual(missing.summary.wouldRemove, 0);
+		const stateRoot = makeRunStore(parent);
+		const runs = join(stateRoot, "runs");
+		const legacyRunId = "legacy-run-without-record";
+		const legacyDir = join(runs, legacyRunId);
+		mkdirSync(join(legacyDir, "legacy-artifacts"), { recursive: true });
+		const missingRecordRoot = makeSimpleRoot(
+			parent,
+			"99999999-aaaa-4bbb-8ccc-dddddddddddd",
+			legacyRunId,
+		);
+		const badRunDir = join(runs, unknownRunId);
+		mkdirSync(badRunDir);
+		writeFileSync(join(badRunDir, "run.json"), "{");
+		const malformed = await collectSimple(parent, stateRoot);
+		strictEqual(malformed.status, 1);
+		strictEqual(malformed.summary.wouldRemove, 0);
+		writeFileSync(
+			join(badRunDir, "run.json"),
+			JSON.stringify({
+				runId: unknownRunId,
+				state: "failed",
+				cleanupState: "complete",
+				createdAt: new Date(NOW).toISOString(),
+				workerPid: null,
+			}),
+		);
+		const invalid = makeSimpleRoot(
+			parent,
+			"88888888-9999-4aaa-8bbb-cccccccccccc",
+		);
+		writeFileSync(join(invalid.root, ".switchyard-cleanup-owner.json"), "{}");
+		const unavailable = await collectSimple(parent, stateRoot, {
+			listHeldPaths: () => null,
+		});
+		strictEqual(unavailable.status, 1);
+		const safe = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[
+				safe.status,
+				safe.summary.skippedRecordMismatch,
+				safe.summary.skippedRecordUnavailable,
+				safe.summary.skippedMarker,
+				safe.summary.wouldRemove,
+			],
+			[0, 1, 1, 1, 1],
+		);
+		ok(existsSync(orphan.root) && existsSync(unrelated.root));
+		ok(existsSync(missingRecordRoot.root) && existsSync(invalid.root));
+	});
+
+	it("refuses a replaced root and uses guarded cleanup on intact fixtures", async () => {
+		const parent = tempDir("switchyard-simple-orphan-identity-");
+		const stateRoot = makeRunStore(parent);
+		const suffix = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
+		const original = makeSimpleRoot(parent, suffix);
+		const runId = original.runId;
+		const displaced = `${original.root}-displaced`;
+		let scans = 0;
+		let replacement;
+		const swapped = await collectSimple(parent, stateRoot, {
+			apply: true,
+			listHeldPaths: () => {
+				if (++scans === 2) {
+					renameSync(original.root, displaced);
+					replacement = makeSimpleRoot(parent, suffix, runId);
+					writeFileSync(join(replacement.root, "payload.txt"), "replacement");
+					const oldAt = new Date(NOW - SIMPLE_ORPHAN_TTL_MS - 1);
+					for (const path of [
+						join(replacement.root, "payload.txt"),
+						replacement.root,
+					])
+						utimesSync(path, oldAt, oldAt);
+				}
+				return [];
+			},
+		});
+		deepStrictEqual(
+			[swapped.status, swapped.summary.refused, swapped.summary.removed],
+			[1, 1, 0],
+		);
+		strictEqual(
+			readFileSync(join(original.root, "payload.txt"), "utf8"),
+			"replacement",
+		);
+		strictEqual(
+			readFileSync(join(displaced, "payload.txt"), "utf8"),
+			"orphan fixture",
+		);
+		addRunRecord(
+			stateRoot,
+			runId,
+			"running",
+			worktreeRecord(replacement.root, parent, replacement.nonce, "active"),
+		);
+		const intact = makeSimpleRoot(
+			parent,
+			"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		);
+		const cleaned = await collectSimple(parent, stateRoot, { apply: true });
+		deepStrictEqual(
+			[cleaned.status, cleaned.summary.removed, existsSync(intact.root)],
+			[0, 1, false],
+		);
+		ok(existsSync(original.root), "the replacement survives guarded cleanup");
+	});
+
+	it("uses a fixed TTL in simple-orphan mode without changing broad-sweep parsing", () => {
+		deepStrictEqual(parseSweepArgs(["--simple-orphans"]), {
+			apply: false,
+			simpleOrphans: true,
+		});
+		ok("error" in parseSweepArgs(["--simple-orphans", "--days=2"]));
+		deepStrictEqual(parseSweepArgs(["--days=7"]), {
+			apply: false,
+			maxAgeDays: 7,
+		});
 	});
 });

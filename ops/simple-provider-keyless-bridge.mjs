@@ -201,6 +201,21 @@ function readBody(request) {
 function redactBuffer(buffer, secret) {
 	return Buffer.from(buffer.toString("utf8").split(secret).join("[redacted]"));
 }
+export function formatOpenCodeGoBridgeDiagnostic({
+	chatRequestCount = 0,
+	lastUpstreamStatus = 0,
+	proxyRejectionCount = 0,
+} = {}) {
+	const boundedCount = (value) =>
+		Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 999999) : 0;
+	const status =
+		Number.isInteger(lastUpstreamStatus) &&
+		lastUpstreamStatus >= 100 &&
+		lastUpstreamStatus <= 599
+			? lastUpstreamStatus
+			: 0;
+	return `SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=${boundedCount(chatRequestCount)} upstream_status=${status} proxy_rejections=${boundedCount(proxyRejectionCount)}\n`;
+}
 export async function startProxy({
 	target,
 	model,
@@ -223,29 +238,60 @@ export async function startProxy({
 	)
 		fail("upstream URL contains unsupported components");
 	const inflight = new Set();
+	let chatRequestCount = 0;
+	let lastUpstreamStatus = 0;
+	let proxyRejectionCount = 0;
+	const incrementDiagnosticCount = (current) => Math.min(current + 1, 999999);
 	const server = http.createServer(async (request, response) => {
 		try {
+			if (request.url === "/v1/chat/completions") {
+				chatRequestCount = incrementDiagnosticCount(chatRequestCount);
+			}
 			if (
 				request.method !== "POST" ||
 				request.url !== "/v1/chat/completions" ||
 				!constantTimeEquals(request.headers.authorization, `Bearer ${nonce}`) ||
 				request.headers.host !== `127.0.0.1:${server.address().port}`
-			)
+			) {
+				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
 				return reject(response, 403);
+			}
 			const body = await readBody(request);
 			let document;
 			try {
 				document = JSON.parse(body.toString("utf8"));
 			} catch {
+				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
 				return reject(response, 400);
 			}
 			if (
 				!document ||
 				Array.isArray(document) ||
 				document.model !== MODELS[model].upstreamModel
-			)
+			) {
+				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
 				return reject(response, 403);
+			}
 			const transport = upstreamUrl.protocol === "https:" ? https : http;
+			// Preserve only the two client identity fields required by OpenCode Go.
+			// Node has already parsed headers; bound values again before forwarding.
+			const clientAgent = request.headers["user-agent"];
+			const clientSession = request.headers["x-opencode-session"];
+			const goHeaders =
+				target === "opencode-go"
+					? {
+							...(typeof clientAgent === "string" &&
+							clientAgent.length <= 256 &&
+							/^[\x20-\x7e]+$/u.test(clientAgent)
+								? { "user-agent": clientAgent }
+								: {}),
+							...(typeof clientSession === "string" &&
+							clientSession.length <= 128 &&
+							/^[A-Za-z0-9._:-]+$/u.test(clientSession)
+								? { "x-opencode-session": clientSession }
+								: {}),
+						}
+					: {};
 			const outbound = transport.request(
 				upstreamUrl,
 				{
@@ -258,16 +304,24 @@ export async function startProxy({
 								? "text/event-stream"
 								: "application/json",
 						"content-length": body.length,
+						...goHeaders,
 					},
 					timeout: 120_000,
 				},
 				(upstreamResponse) => {
+					lastUpstreamStatus =
+						Number.isInteger(upstreamResponse.statusCode) &&
+						upstreamResponse.statusCode >= 100 &&
+						upstreamResponse.statusCode <= 599
+							? upstreamResponse.statusCode
+							: 0;
 					// No redirect is followed. A 3xx remains a failed provider response.
 					if (
 						(upstreamResponse.statusCode ?? 500) >= 300 &&
 						(upstreamResponse.statusCode ?? 500) < 400
 					) {
 						upstreamResponse.resume();
+						proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
 						return reject(response, 502);
 					}
 					const headers = {
@@ -287,8 +341,11 @@ export async function startProxy({
 						response.end(redactBuffer(Buffer.concat(pieces), secret));
 					});
 					upstreamResponse.on("error", () => {
-						if (!response.headersSent) reject(response, 502);
-						else response.destroy();
+						if (!response.headersSent) {
+							proxyRejectionCount =
+								incrementDiagnosticCount(proxyRejectionCount);
+							reject(response, 502);
+						} else response.destroy();
 					});
 				},
 			);
@@ -298,13 +355,17 @@ export async function startProxy({
 				outbound.destroy(new Error("upstream timeout")),
 			);
 			outbound.on("error", () => {
-				if (!response.headersSent) reject(response, 502);
-				else response.destroy();
+				if (!response.headersSent) {
+					proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
+					reject(response, 502);
+				} else response.destroy();
 			});
 			outbound.end(body);
 		} catch {
-			if (!response.headersSent) reject(response, 400);
-			else response.destroy();
+			if (!response.headersSent) {
+				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
+				reject(response, 400);
+			} else response.destroy();
 		}
 	});
 	await new Promise((resolveListen, rejectListen) => {
@@ -315,6 +376,11 @@ export async function startProxy({
 		server,
 		nonce,
 		port: server.address().port,
+		getDiagnostic: () => ({
+			chatRequestCount,
+			lastUpstreamStatus,
+			proxyRejectionCount,
+		}),
 		close: () => {
 			for (const request of inflight) request.destroy();
 			server.closeAllConnections();
@@ -324,7 +390,8 @@ export async function startProxy({
 }
 
 function renderVibeConfig(model, port, runtime) {
-	return `active_model = ${JSON.stringify(model)}\nenable_telemetry = false\nenable_otel = false\nenable_update_checks = false\nenable_auto_update = false\n\n[session_logging]\nsave_dir = ${JSON.stringify(join(runtime, "vibe", "logs", "session"))}\n\n[[providers]]\nname = "mistral"\napi_base = "http://127.0.0.1:${port}/v1"\napi_key_env_var = "MISTRAL_API_KEY"\n\n[[models]]\nname = "zai-glm-5-3"\nprovider = "mistral"\nalias = "glm-5-3-medium"\nthinking = "medium"\n\n[[models]]\nname = "zai-glm-5-3"\nprovider = "mistral"\nalias = "glm-5-3"\nthinking = "max"\n`;
+	// The simple medium alias follows Vibe's UI mapping to API reasoning_effort=high.
+	return `active_model = ${JSON.stringify(model)}\nenable_telemetry = false\nenable_otel = false\nenable_update_checks = false\nenable_auto_update = false\n\n[session_logging]\nsave_dir = ${JSON.stringify(join(runtime, "vibe", "logs", "session"))}\n\n[[providers]]\nname = "mistral"\napi_base = "http://127.0.0.1:${port}/v1"\napi_key_env_var = "MISTRAL_API_KEY"\n\n[[models]]\nname = "zai-glm-5-3"\nprovider = "mistral"\nalias = "glm-5-3-medium"\nthinking = "high"\n\n[[models]]\nname = "zai-glm-5-3"\nprovider = "mistral"\nalias = "glm-5-3"\nthinking = "max"\n`;
 }
 function renderOpenCodeConfig(port) {
 	return JSON.stringify({
@@ -518,7 +585,6 @@ export async function runBridge({
 				variant,
 				"--model",
 				model,
-				prompt,
 			];
 		}
 		const sandbox = "/usr/bin/sandbox-exec";
@@ -526,16 +592,14 @@ export async function runBridge({
 			cwd: worktree,
 			env,
 			detached: true,
-			stdio: [target === "vibe" ? "pipe" : "ignore", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe"],
 		});
 		let stdinError = null;
-		if (target === "vibe") {
-			child.stdin.on("error", (error) => {
-				stdinError = error;
-				killGroup(child, "SIGTERM");
-			});
-			child.stdin.end(prompt);
-		}
+		child.stdin.on("error", (error) => {
+			stdinError = error;
+			killGroup(child, "SIGTERM");
+		});
+		child.stdin.end(prompt);
 		const output = [];
 		const errors = [];
 		let outputSize = 0;
@@ -580,7 +644,9 @@ export async function runBridge({
 			process.removeListener("SIGINT", onTerm);
 		}
 		if (stdinError)
-			fail(`Vibe prompt pipe failed (${stdinError.code ?? "unknown"})`);
+			fail(
+				`${target === "vibe" ? "Vibe" : "OpenCode"} prompt pipe failed (${stdinError.code ?? "unknown"})`,
+			);
 		if (
 			interrupted ||
 			status.error ||
@@ -591,12 +657,20 @@ export async function runBridge({
 			fail(
 				`provider terminated before a verified completion (code ${status.code ?? "none"}, signal ${status.signal ?? "none"}, error ${status.error?.code ?? "none"}; ${boundedText(Buffer.concat(errors), secret).slice(0, 300)})`,
 			);
-		if (status.code !== 0)
+		if (status.code !== 0 && target === "opencode-go") {
+			return {
+				code: status.code || 76,
+				stdout: formatOpenCodeGoBridgeDiagnostic(proxy.getDiagnostic()),
+				stderr: "",
+			};
+		}
+		if (status.code !== 0) {
 			return {
 				code: status.code || 76,
 				stdout: boundedText(Buffer.concat(output), secret),
 				stderr: boundedText(Buffer.concat(errors), secret),
 			};
+		}
 		if (
 			target === "vibe" &&
 			verifySession &&

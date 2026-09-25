@@ -18,8 +18,8 @@
  *    thousands of unattributed entries; nothing else is in scope. The prefix
  *    and parent are re-checked against the *canonical* path immediately before
  *    each removal, not only when candidates are collected.
- *    `switchyard-simple-*` roots are excluded: their retained work requires
- *    separate lifecycle evidence before removal.
+ *    `switchyard-simple-*` roots stay outside this broad sweep and use the
+ *    separate evidence-checked collector.
  * 2. **It refuses to run rather than skip its own safety check.** The first
  *    version of this sweep grepped `lsof` output for paths under the raw
  *    `$TMPDIR` value (`/var/folders/...`) while macOS `lsof` reports
@@ -40,6 +40,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	SIMPLE_ORPHAN_TTL_MS,
+	sweepSimpleOrphans,
+} from "./simple-orphan-collector.mjs";
+
+export { SIMPLE_ORPHAN_TTL_MS, sweepSimpleOrphans };
 
 /** The only prefix this sweep is authorized to remove. Not a parameter. */
 export const SWEEP_PREFIX = "switchyard-";
@@ -322,18 +328,29 @@ export function sweepTempDirs({
 export function parseSweepArgs(argv) {
 	let apply = false;
 	let maxAgeDays = DEFAULT_MAX_AGE_DAYS;
+	let simpleOrphans = false;
+	let daysSpecified = false;
 	for (const arg of argv) {
 		if (arg === "--apply") {
 			apply = true;
 			continue;
 		}
+		if (arg === "--simple-orphans") {
+			simpleOrphans = true;
+			continue;
+		}
 		const days = /^--days=(\d+)$/.exec(arg);
 		if (days) {
+			daysSpecified = true;
 			maxAgeDays = Number(days[1]);
 			continue;
 		}
 		return { error: `unknown argument: ${arg}` };
 	}
+	if (simpleOrphans && daysSpecified) {
+		return { error: "--simple-orphans uses a fixed 24-hour TTL" };
+	}
+	if (simpleOrphans) return { apply, simpleOrphans };
 	return { apply, maxAgeDays };
 }
 
@@ -347,9 +364,12 @@ if (
 	if ("error" in parsed) {
 		console.error(`sweep: ${parsed.error}`);
 		console.error(
-			"usage: node scripts/sweep-temp-dirs.mjs [--apply] [--days=N]",
+			"usage: node scripts/sweep-temp-dirs.mjs [--apply] [--days=N] [--simple-orphans]",
 		);
 		process.exit(2);
 	}
-	process.exit(sweepTempDirs(parsed).status);
+	const result = parsed.simpleOrphans
+		? await sweepSimpleOrphans(parsed)
+		: sweepTempDirs(parsed);
+	process.exit(result.status);
 }
