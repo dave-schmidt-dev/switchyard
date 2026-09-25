@@ -115,6 +115,44 @@ const SIMPLE_TARGET_ADAPTERS = Object.freeze([
 		kind: "copilot",
 		selectors: Object.freeze(["auto"]),
 	}),
+	Object.freeze({
+		targetId: "vibe",
+		harness: "vibe",
+		kind: "bridge",
+		defaultEligible: true,
+		capabilities: Object.freeze(["standard"]),
+		selectors: Object.freeze(["glm-5-3"]),
+		validateInvocationArgs: (args) => Array.isArray(args) && args.length === 0,
+		expectedDescriptors: Object.freeze({
+			standard: Object.freeze({
+				selector: "glm-5-3",
+				invocationArgs: Object.freeze([]),
+			}),
+		}),
+	}),
+	Object.freeze({
+		targetId: "opencode-go",
+		harness: "opencode",
+		kind: "bridge",
+		defaultEligible: false,
+		capabilities: Object.freeze(["low", "standard"]),
+		selectors: Object.freeze(["opencode-go/deepseek-v4.1-flash"]),
+		validateInvocationArgs: (args) =>
+			Array.isArray(args) &&
+			args.length === 2 &&
+			args[0] === "--variant" &&
+			["low", "max"].includes(args[1]),
+		expectedDescriptors: Object.freeze({
+			low: Object.freeze({
+				selector: "opencode-go/deepseek-v4.1-flash",
+				invocationArgs: Object.freeze(["--variant", "low"]),
+			}),
+			standard: Object.freeze({
+				selector: "opencode-go/deepseek-v4.1-flash",
+				invocationArgs: Object.freeze(["--variant", "max"]),
+			}),
+		}),
+	}),
 ]);
 const CAPABILITIES = new Set(["low", "standard", "high"]);
 const SECRET_PATHS = [
@@ -682,11 +720,13 @@ export function buildSimpleProviderInvocation(
 	_prompt,
 	worktreePath,
 	targetId = descriptor?.target_id ?? null,
+	capability = null,
 ) {
 	const compatibility = simpleProviderCompatibility({
 		targetId,
 		harness,
 		descriptor,
+		capability,
 	});
 	if (!compatibility.compatible) {
 		throw Object.assign(new Error(compatibility.reason), {
@@ -749,6 +789,38 @@ export function buildSimpleProviderInvocation(
 			],
 		};
 	}
+	if (harness === "vibe") {
+		return {
+			command: "/Users/dave/.agent/bin/bws-secret-exec",
+			args: [
+				"switchyard-simple-vibe-dispatch",
+				"--",
+				"--target",
+				"vibe",
+				"--model",
+				descriptor.selector,
+				"--worktree",
+				worktreePath,
+			],
+		};
+	}
+	if (harness === "opencode") {
+		return {
+			command: "/Users/dave/.agent/bin/bws-secret-exec",
+			args: [
+				"switchyard-simple-opencode-go-dispatch",
+				"--",
+				"--target",
+				"opencode-go",
+				"--model",
+				descriptor.selector,
+				"--worktree",
+				worktreePath,
+				"--variant",
+				descriptor.invocation_args[1],
+			],
+		};
+	}
 	return {
 		command: "copilot",
 		args: [
@@ -782,7 +854,12 @@ export function buildSimpleProviderInvocation(
  * simple lane. Target identity is intentional: Antigravity and Antigravity
  * (Claude) share the `agy` harness but are separate owner-selected routes.
  */
-export function simpleProviderCompatibility({ targetId, harness, descriptor }) {
+export function simpleProviderCompatibility({
+	targetId,
+	harness,
+	descriptor,
+	capability = null,
+}) {
 	if (!descriptor || descriptor.target_id !== targetId) {
 		return { compatible: false, reason: "invocation_descriptor_unavailable" };
 	}
@@ -792,8 +869,35 @@ export function simpleProviderCompatibility({ targetId, harness, descriptor }) {
 	if (!adapter || adapter.harness !== harness) {
 		return { compatible: false, reason: "local_adapter_unavailable" };
 	}
+	if (adapter.capabilities && !adapter.capabilities.includes(capability)) {
+		return { compatible: false, reason: "local_adapter_unavailable" };
+	}
 	if (adapter.selectors && !adapter.selectors.includes(descriptor.selector)) {
 		return { compatible: false, reason: "local_descriptor_model_unavailable" };
+	}
+	if (
+		adapter.validateInvocationArgs &&
+		!adapter.validateInvocationArgs(descriptor.invocation_args)
+	) {
+		return { compatible: false, reason: "local_descriptor_args_unsafe" };
+	}
+	const expectedDescriptor = adapter.expectedDescriptors?.[capability];
+	if (expectedDescriptor?.selector !== undefined) {
+		if (descriptor.selector !== expectedDescriptor.selector) {
+			return {
+				compatible: false,
+				reason: "local_descriptor_model_unavailable",
+			};
+		}
+		if (
+			descriptor.invocation_args.length !==
+				expectedDescriptor.invocationArgs.length ||
+			descriptor.invocation_args.some(
+				(value, index) => value !== expectedDescriptor.invocationArgs[index],
+			)
+		) {
+			return { compatible: false, reason: "local_descriptor_args_unsafe" };
+		}
 	}
 	return { compatible: true, reason: null };
 }
@@ -880,6 +984,7 @@ export async function defaultExecuteProvider(context) {
 		context.prompt,
 		context.worktreePath,
 		context.targetId,
+		context.capability,
 	);
 	const result = await runSimpleWriter(invocation.command, invocation.args, {
 		input: context.prompt,
@@ -1729,7 +1834,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 		emitStatus(onStatus, taskId, "route");
 		const requestedSimpleTargets = (options.onlyProviders ?? []).length
 			? options.onlyProviders
-			: SIMPLE_TARGET_ADAPTERS.map((adapter) => adapter.targetId);
+			: SIMPLE_TARGET_ADAPTERS.filter(
+					(adapter) => adapter.defaultEligible !== false,
+				).map((adapter) => adapter.targetId);
 		const compatibleSimpleTargets = [];
 		let pinnedIncompatibility = null;
 		for (const candidate of requestedSimpleTargets) {
@@ -1745,6 +1852,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				targetId: candidateTargetId,
 				harness: candidateHarness,
 				descriptor: candidateDescriptor,
+				capability: options.capability,
 			});
 			if (compatibility.compatible) {
 				compatibleSimpleTargets.push(candidateTargetId);
@@ -1788,6 +1896,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			targetId,
 			harness: normalizeProviderName(identity.harnessKey),
 			descriptor,
+			capability: options.capability,
 		});
 		if (!compatibility.compatible) {
 			return fail(compatibility.reason, "route");
@@ -2000,6 +2109,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			targetId,
 			harness,
 			descriptor,
+			capability: options.capability,
 			prompt: guardedPrompt,
 			worktreePath,
 			timeoutMs: executionBudget,

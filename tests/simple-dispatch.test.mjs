@@ -729,6 +729,248 @@ describe("simple dispatch argument boundary", () => {
 			}),
 			{ compatible: false, reason: "local_descriptor_model_unavailable" },
 		);
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "opencode-go",
+				harness: "opencode",
+				capability: "low",
+				descriptor: {
+					target_id: "opencode-go",
+					selector: "opencode-go/deepseek-v4.1-flash",
+					invocation_args: ["--variant", "max"],
+				},
+			}),
+			{ compatible: false, reason: "local_descriptor_args_unsafe" },
+		);
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "vibe",
+				harness: "vibe",
+				capability: "low",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3-medium",
+					invocation_args: [],
+				},
+			}),
+			{ compatible: false, reason: "local_adapter_unavailable" },
+		);
+		for (const [targetId, harness, descriptor] of [
+			[
+				"vibe",
+				"vibe",
+				{ target_id: "vibe", selector: "glm-5-3", invocation_args: [] },
+			],
+			[
+				"opencode-go",
+				"opencode",
+				{
+					target_id: "opencode-go",
+					selector: "opencode-go/deepseek-v4.1-flash",
+					invocation_args: ["--variant", "low"],
+				},
+			],
+		]) {
+			deepStrictEqual(
+				simpleProviderCompatibility({ targetId, harness, descriptor }),
+				{ compatible: false, reason: "local_adapter_unavailable" },
+			);
+		}
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "vibe",
+				harness: "vibe",
+				capability: "standard",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3-medium",
+					invocation_args: [],
+				},
+			}),
+			{ compatible: false, reason: "local_descriptor_model_unavailable" },
+		);
+	});
+
+	it("uses only fixed bridge consumers for Vibe and OpenCode Go", async () => {
+		const worktreePath = "/tmp/worktree";
+		const prompt = "bounded task";
+		const cases = [
+			{
+				harness: "vibe",
+				capability: "standard",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3",
+					invocation_args: [],
+				},
+				command: "/Users/dave/.agent/bin/bws-secret-exec",
+				args: [
+					"switchyard-simple-vibe-dispatch",
+					"--",
+					"--target",
+					"vibe",
+					"--model",
+					"glm-5-3",
+					"--worktree",
+					worktreePath,
+				],
+			},
+			{
+				harness: "opencode",
+				capability: "low",
+				descriptor: {
+					target_id: "opencode-go",
+					selector: "opencode-go/deepseek-v4.1-flash",
+					invocation_args: ["--variant", "low"],
+				},
+				command: "/Users/dave/.agent/bin/bws-secret-exec",
+				args: [
+					"switchyard-simple-opencode-go-dispatch",
+					"--",
+					"--target",
+					"opencode-go",
+					"--model",
+					"opencode-go/deepseek-v4.1-flash",
+					"--worktree",
+					worktreePath,
+					"--variant",
+					"low",
+				],
+			},
+			{
+				harness: "opencode",
+				capability: "standard",
+				descriptor: {
+					target_id: "opencode-go",
+					selector: "opencode-go/deepseek-v4.1-flash",
+					invocation_args: ["--variant", "max"],
+				},
+				command: "/Users/dave/.agent/bin/bws-secret-exec",
+				args: [
+					"switchyard-simple-opencode-go-dispatch",
+					"--",
+					"--target",
+					"opencode-go",
+					"--model",
+					"opencode-go/deepseek-v4.1-flash",
+					"--worktree",
+					worktreePath,
+					"--variant",
+					"max",
+				],
+			},
+		];
+		for (const testCase of cases) {
+			const invocation = buildSimpleProviderInvocation(
+				testCase.harness,
+				testCase.descriptor,
+				prompt,
+				worktreePath,
+				testCase.descriptor.target_id,
+				testCase.capability,
+			);
+			strictEqual(invocation.command, testCase.command);
+			deepStrictEqual(invocation.args, testCase.args);
+			strictEqual(invocation.args.includes(prompt), false);
+			strictEqual(
+				/(?:api[_-]?key|token|secret|password)/iu.test(
+					invocation.args.join(" "),
+				),
+				false,
+			);
+		}
+
+		let receivedInput = null;
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.stdin = {
+			end: (value) => {
+				receivedInput = value;
+			},
+		};
+		const result = await defaultExecuteProvider({
+			targetId: "vibe",
+			harness: "vibe",
+			descriptor: cases[0].descriptor,
+			capability: "standard",
+			prompt,
+			worktreePath,
+			timeoutMs: 1_000,
+			spawnFn: () => {
+				queueMicrotask(() => child.emit("close", 0, null));
+				return child;
+			},
+		});
+		strictEqual(result.success, true);
+		strictEqual(receivedInput, prompt);
+	});
+
+	it("rejects malformed bridge descriptors and harness mismatches", () => {
+		const opencode = {
+			target_id: "opencode-go",
+			selector: "opencode-go/deepseek-v4.1-flash",
+		};
+		for (const invocation_args of [
+			undefined,
+			[],
+			["--variant", "standard"],
+			["--variant", "low", "--extra", "value"],
+		]) {
+			throws(
+				() =>
+					buildSimpleProviderInvocation(
+						"opencode",
+						{ ...opencode, invocation_args },
+						"work",
+						"/tmp/worktree",
+						"opencode-go",
+						"low",
+					),
+				{ code: "local_descriptor_args_unsafe" },
+			);
+		}
+		throws(
+			() =>
+				buildSimpleProviderInvocation(
+					"vibe",
+					{
+						target_id: "vibe",
+						selector: "glm-5-3",
+						invocation_args: ["--variant", "low"],
+					},
+					"work",
+					"/tmp/worktree",
+					"vibe",
+					"standard",
+				),
+			{ code: "local_descriptor_args_unsafe" },
+		);
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "vibe",
+				harness: "opencode",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3",
+					invocation_args: [],
+				},
+			}),
+			{ compatible: false, reason: "local_adapter_unavailable" },
+		);
+		deepStrictEqual(
+			simpleProviderCompatibility({
+				targetId: "vibe",
+				harness: "vibe",
+				capability: "standard",
+				descriptor: {
+					target_id: "vibe",
+					selector: "glm-5-3-unknown",
+					invocation_args: [],
+				},
+			}),
+			{ compatible: false, reason: "local_descriptor_model_unavailable" },
+		);
 	});
 
 	it("admits included subscription and quota funding without paid overage", () => {
@@ -1050,6 +1292,12 @@ describe("simple local execution path", () => {
 				harnessKey: "copilot",
 				ambiguous: false,
 			},
+			vibe: { targetId: "vibe", harnessKey: "vibe", ambiguous: false },
+			"opencode-go": {
+				targetId: "opencode-go",
+				harnessKey: "opencode",
+				ambiguous: false,
+			},
 		};
 		const descriptors = {
 			codex: {
@@ -1066,6 +1314,16 @@ describe("simple local execution path", () => {
 				target_id: "copilot-student",
 				selector: "auto",
 				invocation_args: [],
+			},
+			vibe: {
+				target_id: "vibe",
+				selector: "glm-5-3-medium",
+				invocation_args: [],
+			},
+			"opencode-go": {
+				target_id: "opencode-go",
+				selector: "opencode-go/deepseek-v4.1-flash",
+				invocation_args: ["--variant", "low"],
 			},
 		};
 		const result = await runSimpleTask(
@@ -1086,6 +1344,27 @@ describe("simple local execution path", () => {
 		]);
 		strictEqual(result.failureReason, "test_stop");
 		strictEqual(result.failurePhase, "route");
+		routedOptions = null;
+		const standardResult = await runSimpleTask(
+			options(repo, { capability: "standard" }),
+			dependencies({
+				route: (routeOptions) => {
+					routedOptions = routeOptions;
+					return { provider: null, reason: "test_stop" };
+				},
+				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
+				getInvocationDescriptor: (name) =>
+					name === "vibe"
+						? { ...descriptors.vibe, selector: "glm-5-3" }
+						: (descriptors[name] ?? null),
+			}),
+		);
+		strictEqual(standardResult.failureReason, "test_stop");
+		strictEqual(routedOptions.availableProviders.includes("vibe"), true);
+		strictEqual(
+			routedOptions.availableProviders.includes("opencode-go"),
+			false,
+		);
 	});
 
 	it("rejects an incompatible explicit pin before routing or launch", async () => {

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchyard feedback: systemic investigation — 2026-09-25</title>
+<style>
+  :root { color-scheme: dark; --bg:#11161b; --panel:#1a2229; --ink:#edf2f4; --muted:#aebbc3; --line:#34424b; --accent:#75c6d9; --good:#9bd4ae; --warn:#e6c78a; --bad:#eea49d; }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  main { max-width:960px; margin:auto; padding:40px 24px 96px; }
+  header { border-bottom:2px solid var(--accent); padding-bottom:24px; }
+  h1 { font-size:clamp(2rem,5vw,3.2rem); line-height:1.12; letter-spacing:-.04em; margin:6px 0 16px; }
+  h2 { font-size:1.6rem; line-height:1.2; border-bottom:1px solid var(--line); padding-bottom:10px; margin:56px 0 18px; scroll-margin-top:20px; }
+  h3 { font-size:1.06rem; margin:24px 0 8px; }
+  p,li { max-width:78ch; }
+  a { color:var(--accent); text-underline-offset:3px; }
+  code { font:0.88em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:#27323a; padding:2px 4px; border-radius:3px; overflow-wrap:anywhere; }
+  .eyebrow,.meta,.label { color:var(--muted); font:700 0.75rem/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; letter-spacing:.1em; text-transform:uppercase; }
+  .lede { font-size:1.18rem; max-width:72ch; }
+  .callout { background:var(--panel); border-left:4px solid var(--accent); padding:16px 20px; margin:24px 0; }
+  .callout strong { color:var(--good); }
+  .warning { border-left-color:var(--warn); }
+  .warning strong { color:var(--warn); }
+  nav { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin:24px 0 0; }
+  nav a { display:block; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; text-decoration:none; }
+  nav small { display:block; color:var(--muted); }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:16px 0 24px; }
+  th,td { border-bottom:1px solid var(--line); text-align:left; vertical-align:top; padding:11px 12px; }
+  th { color:var(--muted); font-size:.78rem; letter-spacing:.06em; text-transform:uppercase; }
+  tr:nth-child(even) td { background:#171e24; }
+  .chip { display:inline-block; border:1px solid currentColor; border-radius:100px; padding:1px 8px; font-size:.76rem; font-weight:700; white-space:nowrap; }
+  .confirmed { color:var(--good); } .lead { color:var(--warn); } .fixed { color:var(--accent); } .contract { color:var(--muted); }
+  .flow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:20px 0; }
+  .flow span { border:1px solid var(--line); border-radius:5px; background:var(--panel); padding:10px 12px; }
+  .flow b { color:var(--muted); }
+  .small { color:var(--muted); font-size:.89rem; }
+  @media print { :root { color-scheme:light; --bg:#fff; --panel:#f3f5f6; --ink:#111; --muted:#444; --line:#bbb; --accent:#086378; --good:#205e33; --warn:#805600; --bad:#9b241b; } body { background:white; } main { padding:0; max-width:none; } nav { display:none; } h2 { break-after:avoid; } table { break-inside:avoid; } a { color:#086378; } }
+</style>
+</head>
+<body><main>
+<header>
+  <p class="eyebrow">Switchyard · investigation · 25 September 2026</p>
+  <h1>Feedback from the recent runs</h1>
+  <p class="lede">One success-accounting defect is confirmed. Several other reports expose weak diagnostics or contract friction. OpenCode's low use has two concrete routing causes; the available run history does not support a provider-quality ranking. A same-day follow-up qualified Vibe standard for the local simple lane and exposed two exact remaining gates.</p>
+  <p class="meta">Scope: 22–24 September feedback, source baseline <code>d787de9</code>, and 25 September follow-up implementation. Source, local BWS consumers, and docs changed; the owner roster and VM routes did not. Provider calls and test outcomes are recorded below.</p>
+  <nav aria-label="Report chapters">
+    <a href="#taxonomy">1. Feedback categories<small>38 blocks, 33 distinct texts</small></a>
+    <a href="#integrity">2. Success accounting<small>Confirmed defect</small></a>
+    <a href="#failures">3. Failures and diagnostics<small>Mixed confidence</small></a>
+    <a href="#routing">4. OpenCode and Vibe<small>Two routing funnels</small></a>
+    <a href="#actions">5. Fix order<small>Bounded next work</small></a>
+  </nav>
+</header>
+
+<section id="taxonomy">
+  <h2>1. Categorize the feedback</h2>
+  <p>The <a href="../.logs/feedback-sweep-2026-09-24.md">source index</a> groups 38 blocks into 33 distinct texts. Its source IDs overlap across categories, so the table is a classification, not a count of independent failures. I compared the index with current code, the Task 51 run, the task queue, and the September 24 fix history.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Category</th><th>Evidence and status</th><th>Systemic reading</th></tr></thead><tbody>
+      <tr><td>Success and exit accounting</td><td><span class="chip confirmed">Confirmed</span> Task 51 queue success ignored a failed declared lint check (S26). <span class="chip lead">Lead</span> Other zero-exit contradictions (S15, S24–S25) lack matching receipts.</td><td>A single success label currently covers different boundaries: provider completion, diff integration, checks, and captain acceptance.</td></tr>
+      <tr><td>Failure visibility</td><td><span class="chip confirmed">Confirmed in source</span> <code>simple</code> records failed check index/status without exit details. Reports also describe opaque <code>no_eligible</code>, unsafe-diff and fallback errors (S14–S19, S23–S24, S28, S33).</td><td>Closed reason codes and a precise recovery pointer are preferable to raw command or provider output.</td></tr>
+      <tr><td>Scope and containment</td><td><span class="chip fixed">Fixed later</span> Declared shell/build manifests gained per-path <code>--allow-manifest</code> in <code>d787de9</code>. <span class="chip contract">Contract</span> Arbitrary untracked dirty-overlay inputs remain restricted.</td><td>Some fallback volume was caused by a missing safe opt-in; other refusals enforce the current boundary.</td></tr>
+      <tr><td>Check environment and coverage</td><td><span class="chip lead">Repeated reports</span> Disposable checkouts lacked dependencies or used a different baseline; build-only checks missed lint/UI failures (S01, S10, S12, S16–S17, S22).</td><td>Task checks and full project validation need explicit, distinct contracts. The engine should not infer setup from a green build.</td></tr>
+      <tr><td>Progress, limits and scheduling</td><td><span class="chip lead">Route-specific</span> Repeated heartbeats obscured progress; a review was reported beyond its deadline; same-project runs serialized (S10, S16, S19, S21, S24–S26).</td><td>The project lock is intentional. Milestones, deadlines and known lock conflicts need clearer, closed status.</td></tr>
+      <tr><td>Provider and review quality</td><td><span class="chip lead">Heterogeneous</span> Empty work, unrelated edits, failed launches and disputed review findings occurred on different routes.</td><td>No common provider defect or comparative quality ranking follows from these reports alone. Empty review is unavailable evidence.</td></tr>
+    </tbody></table></div>
+  <p>Positive evidence also matters: bounded Antigravity, Codex and Copilot tasks completed, a Vibe review returned findings, and retained failed worktrees enabled salvage. Those are task-specific outcomes, not broad reliability estimates.</p>
+</section>
+
+<section id="integrity">
+  <h2>2. A queue success was premature</h2>
+  <p>Task 51's <a href="../.logs/delivery/switchyard-task51-cli-version-pins-20260922-tasks.md">contract</a> declared <code>npm run lint</code> among its Quick checks. Run <code>4d72698c-18de-45e7-a816-ff86a3e04f38</code> reached <code>succeeded</code>, and its <a href="../.logs/switchyard/runs/4d72698c-18de-45e7-a816-ff86a3e04f38/events.jsonl">events</a> show provider completion, artifact capture, integration and task completion, with no check event. The <a href="../.logs/delivery/switchyard-task51-cli-version-pins-20260922-delivery.json">delivery record</a> later recorded that the worker ran lint and it failed on formatting; the captain fixed formatting and passed lint afterward. Absence of a queue check event alone would not prove the worker never ran a check. The defect is that the queue did not require a passing check receipt for its success claim.</p>
+  <div class="flow"><span>Provider finished</span><b>→</b><span>Diff integrated</span><b>→</b><span>Queue marked success</span><b>↛</b><span>Declared lint passed</span></div>
+  <p>The cause is structural: <a href="../src/switchyard/runner/index.mjs">runner/index.mjs:7201–7212</a> derives task success from the structural integration gate; <code>parseTaskQueue</code> does not parse Quick checks. By contrast, <a href="../src/switchyard/simple/index.mjs">simple/index.mjs:2109–2168</a> runs its explicit <code>--check</code> list before integration. Thus the two dispatch lanes do not mean the same thing by task success.</p>
+  <div class="callout"><strong>Recommended immediate contract fix:</strong> represent artifact integration, check state and captain acceptance as separate facts. Missing check evidence is <code>unverified</code>; a known failed check is <code>failed</code>. Neither may produce an accepted-task receipt. Changing only a display string would leave downstream consumers of <code>success=true</code> exposed.</div>
+  <p>Astra's read-only consultation challenged this recommendation on one point: if existing consumers cannot distinguish integration from acceptance, an additive check field is cosmetic. The implementation must audit queue summaries, exit behavior, checkpoint dependencies and consuming automation before changing the status. A later shared check runner may be useful, but it must meet the owner-approved fresh-clone, hardened-Git, allowlisted-environment and non-login-shell requirements before executing provider-written commands on the host.</p>
+</section>
+
+<section id="failures">
+  <h2>3. Failure classification and diagnostics</h2>
+  <h3>Exit-zero reports remain unproven as one defect</h3>
+  <p>At HEAD, <a href="../src/switchyard/simple/index.mjs">simple/index.mjs:970–975</a> calls any otherwise-unclassified unsuccessful provider result <code>provider_exit_nonzero</code>. This can mislabel a <code>success:false, code:0</code> result. The normal diff/check path starts only after the success branch. Agy's separate exit/verdict contradiction was fixed in R9 and has tests; that fix should not be generalized to other routes. Matching durable receipts for PaperPal, Slabtastic and CipherBlade were not recovered, so their reported shared cause remains a lead.</p>
+  <p><strong>Fix test:</strong> simulate a non-Agy provider that exits zero with no diff and verify the observed exit stays zero, the result is <code>empty_diff</code> or an explicit unconfirmed-completion reason, and it never says <code>provider_exit_nonzero</code>. Keep a nonzero-exit case distinct. Reconcile the actual adapter result shape before changing production branching.</p>
+  <h3>Failed checks have too little safe detail</h3>
+  <p><code>simple</code> currently stores <code>{index,status}</code> per check (<a href="../src/switchyard/simple/index.mjs">simple/index.mjs:2148–2168</a>). The retained <code>partialWorktree</code> helps salvage, but callers cannot see the closed exit code or signal and often rerun the check. Record only bounded status fields plus the existing exact worktree/check index pointer. Do not persist raw stdout, stderr, command text or provider content.</p>
+  <h3>Caller-facing reasons and progress</h3>
+  <p>The source already has a 30-minute <code>simple</code> deadline validation and route skip classifications, but some callers received an unhelpful envelope or repeated heartbeat text. Test the exact CLI result path for known invalid deadlines, pinned-provider ineligibility, lock conflict and unsafe diff. Surface a closed reason and remedy, and distinguish a heartbeat from a milestone. Keep same-project serialization because it protects one host checkout.</p>
+</section>
+
+<section id="routing">
+  <h2>4. Why OpenCode is scarcely selected</h2>
+  <p>At the start of this investigation, the ordinary <code>simple</code> lane registered only Codex, Antigravity Gemini, Antigravity Claude and Copilot Student. OpenCode and Vibe therefore could not run through <code>simple</code>, regardless of quota or dispatch qualification. The disposable clone alone did not confine host file reads or network access, and the VM OpenCode bridge was tied to its guest transport. A read-only route call with that original simple list selected Codex for low and standard work.</p>
+  <p><strong>September 25 follow-up:</strong> <a href="../src/switchyard/simple/index.mjs">simple/index.mjs</a> now has exact local descriptors for both targets. A <a href="../ops/simple-provider-keyless-bridge.mjs">pinned keyless bridge</a> receives each BWS credential through an anonymous pipe and gives the CLI only a proxy nonce inside a restricted Seatbelt profile. Eight bridge tests passed under host Seatbelt, including synthetic requests from both installed CLIs and ancestor-directory read denial. Vibe standard passed two real one-file simple dispatches, each with its declared check, integration and cleanup: <a href="../.logs/switchyard/runs/simple-39442129-9179-429a-b1a0-0b762226369b-b4556e3c-9b3a-452f-a077-41a5f4b98b71/events.jsonl">first canary</a> and <a href="../.logs/switchyard/runs/simple-ba699224-065f-4e4e-9bce-3ffe6a684137-7113fd69-8c71-4b27-9e31-8244e9d3210e/events.jsonl">post-remediation canary</a>. Its low descriptor failed before editing: the live API returned HTTP 400 because <code>thinking=medium</code> is unsupported for <code>zai-glm-5-3</code>; supported values are low, high and max. OpenCode Go has the local adapter but its pinned simple canary stopped at <code>paid_overage_not_allowed</code> before the BWS consumer or CLI ran. An earlier invalid-clone invocation confirmed that its new BWS consumer resolved the existing key and reached the pinned bridge without contacting the provider. A repeat after the bridge hash changed was rejected by automatic approval review because it would access the credential; the 39 broker tests and matching consumer pins passed without another credentialed probe. The remaining live gate is funding policy.</p>
+  <p>The retained VM queue can consider both. Its owner-selected roster places Vibe in priority 1 and OpenCode Go in priority 2; the router selects a surviving tier 1 target before tier 2 (<a href="../src/switchyard/router/index.mjs">router/index.mjs:1165–1205</a>). With Agy, Cursor and Copilot exhausted in the current snapshot, Vibe is the remaining funded priority 1 low/standard target. A read-only full-roster route call selected Vibe and logged OpenCode as eligible. OpenCode has no high-capability slot.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Route</th><th>Vibe</th><th>OpenCode Go</th><th>Current result</th></tr></thead><tbody>
+      <tr><td><code>simple</code></td><td>Standard/max enabled and live qualified; low/medium blocked by API</td><td>Pinned adapter and synthetic containment qualified; funding gate blocks live launch</td><td>Vibe standard enters the automatic candidate set. OpenCode Go remains explicit-pin only.</td></tr>
+      <tr><td>VM queue, low/standard</td><td>Priority 1; qualified</td><td>Priority 2; qualified</td><td>Vibe wins while funded.</td></tr>
+      <tr><td>High capability</td><td>No high slot</td><td>No high slot</td><td>Both excluded by capability.</td></tr>
+    </tbody></table></div>
+  <p>At about 09:50 EDT on September 25, the installed Gradus snapshot marked both available; OpenCode showed 100/94/97% across its reported windows and Vibe about 57% on its relevant window. A read-only <code>npm run roster:coherence</code> exited 0; the owner roster entries at <code>/Users/dave/.agent/roster.json:1736–1737,1980–1998</code> showed the priorities and current low/standard qualification receipts. These are a dated snapshot and qualification facts, not performance comparisons. Historical event counts mix model eras and include failures without matching route events; they cannot serve as success-rate denominators. Vibe and OpenCode have been tested less than the other routes.</p>
+  <p><strong>Independent review:</strong> The first static cross-family review found two Medium issues and a Low stdin cleanup issue. The remediated candidate narrowed ancestor reads to metadata, rejects bridge adapters with missing capability, and handles prompt-pipe errors; eight host bridge tests, 39 BWS broker tests, 84 simple tests and the full <code>npm run validate</code> gate passed. The one permitted remediation review accepted those fixes. It retained Low limits: broad reads of two system paths, OpenCode prompt text in process arguments, no hard-kill child recovery, and no proxy request cap. Tasks 70–71 track these limits; the invariant text now states the actual read and cleanup boundaries. The review did not run tests or provider calls itself.</p>
+  <div class="callout warning"><strong>Owner decisions remain:</strong> David owns roster priority, model, effort, funding and fallback membership. A valid low Vibe thinking value needs an exact owner-selected descriptor change; OpenCode Go needs an explicit no-overage/funding decision before a simple live canary. Neither was silently changed.</div>
+</section>
+
+<section id="actions">
+  <h2>5. Fix order and acceptance checks</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Order</th><th>Bounded change</th><th>Acceptance evidence</th></tr></thead><tbody>
+      <tr><td>1 · Integrity</td><td>Correct legacy queue check accounting and consumer interpretation. Keep integration, checks and captain acceptance distinct; preserve old receipts as historical evidence.</td><td>Task 51 regression: integrated diff plus missing, failed, stale or partial Quick-check evidence cannot become accepted. Queue summary, checkpoint and terminal CLI agree; later host lint is recorded separately.</td></tr>
+      <tr><td>2 · Failure truth</td><td>Normalize <code>simple</code> exit-zero/no-diff versus true nonzero, using observed process status and explicit result states.</td><td>Fail-first non-Agy zero-exit and nonzero cases; no loss of observed exit; exact historical reports remain leads until matched.</td></tr>
+      <tr><td>3 · Safe diagnosis</td><td>Add closed check exit/signal details and exact retained-worktree pointer; improve known route/lock/deadline reason codes.</td><td>No raw streams or secrets in result/run records; targeted tests for failed check, lock, invalid deadline and pinned provider.</td></tr>
+      <tr><td>4 · Check substrate</td><td>Make one hardened candidate-check path serve both lanes only after host-boundary safeguards are verified. Contracts name setup and distinguish quick checks from full validation.</td><td>Fresh clone contains only gated diff; no provider-planted Git hook/fsmonitor runs; minimal environment and non-login shell; failure prevents acceptance.</td></tr>
+      <tr><td>5 · Provider exposure</td><td>Vibe standard is qualified for simple. Resolve its unsupported low thinking descriptor and OpenCode Go's paid-overage gate through exact owner decisions, then run matching one-file canaries.</td><td>Exact descriptor, task, check, lifecycle, cleanup and run receipt per canary; no reliability claim from unmatched event counts.</td></tr>
+    </tbody></table></div>
+  <p><strong>Already addressed:</strong> <code>--allow-manifest</code> shipped in <code>d787de9</code> with focused and full tests recorded in <a href="../HISTORY.md">HISTORY.md</a>. The stale Task 67 row was removed from the local queue; the September 22 bug report has owner-managed uncommitted edits and was left untouched.</p>
+  <p class="small">Evidence boundary: the historical investigation read source, task contracts, run/checkpoint records, the local usage snapshot and a read-only Astra consultation. The same-day follow-up added fixed consumers and a local bridge, ran focused tests and two successful Vibe standard simple canaries. OpenCode Go received no live simple provider call; Vibe low failed before editing. No VM canary, roster change, public push or provider reliability comparison was made.</p>
+</section>
+</main></body></html>
