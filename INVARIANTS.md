@@ -41,7 +41,7 @@ gate_test: tests/runner.test.mjs, tests/runner-broker-production.test.mjs
 
 ### Contract gate: quick-checks
 
-area: ["src/switchyard/runner/checks.mjs", "src/switchyard/runner/check-contract.mjs"]
+area: ["src/switchyard/runner/checks.mjs", "src/switchyard/runner/check-contract.mjs", "src/switchyard/runner/check-dependencies.mjs"]
 gate_test: tests/runner-quick-checks.test.mjs
 
 ### Contract gate: worker-bootstrap

@@ -221,6 +221,7 @@ describe("source-boundary contract gate mapping", () => {
 		);
 		const extractedOnly = ownersForPaths(manifest, [
 			"src/switchyard/runner/checks.mjs",
+			"src/switchyard/runner/check-dependencies.mjs",
 		]);
 		deepStrictEqual(
 			extractedOnly.map((owner) => owner.id),

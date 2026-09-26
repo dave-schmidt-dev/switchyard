@@ -4924,7 +4924,8 @@ function quickCheckDecision(task, context, diff) {
 	const { checks = [], setup = null } = task.quickChecks ?? {};
 	// No candidate exists when capture failed or returned an empty diff. Let the
 	// existing capture/integration path report that failure; a check cannot run.
-	if (checks.length === 0 || !diff) return { passed: true, receipt: null };
+	if (checks.length === 0) return { passed: true, receipt: null };
+	if (!diff) return { passed: false, receipt: null };
 	const attempt =
 		integrationOperation(context, task, diff)?.attempt ??
 		(context.checkpoint?.taskAttempts?.[task.id] ?? 0) + 1;
@@ -4963,7 +4964,8 @@ function quickCheckDecision(task, context, diff) {
 
 async function quickCheckDecisionAsync(task, context, diff) {
 	const { checks = [], setup = null } = task.quickChecks ?? {};
-	if (checks.length === 0 || !diff) return { passed: true, receipt: null };
+	if (checks.length === 0) return { passed: true, receipt: null };
+	if (!diff) return { passed: false, receipt: null };
 	const attempt =
 		integrationOperation(context, task, diff)?.attempt ??
 		(context.checkpoint?.taskAttempts?.[task.id] ?? 0) + 1;
@@ -7321,7 +7323,11 @@ function executeTaskUnsafe(task, context) {
 		});
 	}
 
-	if (!diff && task.requiredPaths === null) {
+	if (
+		!diff &&
+		task.requiredPaths === null &&
+		(task.quickChecks?.checks?.length ?? 0) === 0
+	) {
 		record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -8617,7 +8623,11 @@ async function executeTaskAsyncUnsafe(task, context) {
 		byteCount: diff ? diff.length : 0,
 		captureStatus: captureEvidence.status,
 	});
-	if (!diff && task.requiredPaths === null) {
+	if (
+		!diff &&
+		task.requiredPaths === null &&
+		(task.quickChecks?.checks?.length ?? 0) === 0
+	) {
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",
@@ -10053,7 +10063,11 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 		});
 	}
 
-	if (!diff && task.requiredPaths === null) {
+	if (
+		!diff &&
+		task.requiredPaths === null &&
+		(task.quickChecks?.checks?.length ?? 0) === 0
+	) {
 		await record({
 			provider: routeResult.provider,
 			model: routeResult.model ?? "unknown",

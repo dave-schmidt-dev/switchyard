@@ -369,6 +369,14 @@ describe("Task 51 quick-check regression", () => {
 			"diff_capture_failed",
 		);
 
+		patch = "";
+		const empty = runQueue(options);
+		deepStrictEqual(empty.completedTaskIds, []);
+		strictEqual(
+			loadCheckpoint(checkpointPath, tasksPath).results.at(-1).result,
+			"check_failed",
+		);
+
 		patch = patchFor("export const answer = 2;\n");
 		const passed = runQueue(options);
 		ok(passed.completedTaskIds.includes("51"));
@@ -378,7 +386,7 @@ describe("Task 51 quick-check regression", () => {
 			(item) => item.taskId === "51" && item.success,
 		).quickCheckReceipt;
 		strictEqual(passingReceipt.status, "passed");
-		strictEqual(passingReceipt.attempt, 4);
+		strictEqual(passingReceipt.attempt, 5);
 		notStrictEqual(
 			passingReceipt.diffSha256,
 			second.results[0].quickCheckReceipt.diffSha256,
@@ -496,12 +504,18 @@ ${declaration}
 		);
 	});
 
-	it("kills escaped check helpers after normal and abrupt runner exits", async () => {
-		for (const abrupt of [false, true]) {
-			const project = join(TEST_DIR, `task-check-child-${abrupt}`);
+	it("kills escaped check helpers after normal, failed, timed out, and abrupt runs", async () => {
+		for (const mode of ["normal", "failed", "timeout", "abrupt"]) {
+			const project = join(TEST_DIR, `task-check-child-${mode}`);
 			mkdirSync(project, { recursive: true });
 			let marker = null;
-			const script = `import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: process.cwd(), detached: true, stdio: "ignore" });\nwriteFileSync(join(process.env.HOME, "check-helper.pid"), String(child.pid));\nchild.unref();\n${abrupt ? "setInterval(() => {}, 1000);" : "await new Promise((resolve) => setTimeout(resolve, 200));"}\n`;
+			const ending =
+				mode === "normal"
+					? "await new Promise((resolve) => setTimeout(resolve, 200));"
+					: mode === "failed"
+						? "process.exit(3);"
+						: "setInterval(() => {}, 1000);";
+			const script = `import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: process.cwd(), detached: true, stdio: "ignore" });\nwriteFileSync(join(process.env.HOME, "check-helper.pid"), String(child.pid));\nchild.unref();\n${ending}\n`;
 			writeFileSync(join(project, "check.mjs"), script);
 			writeFileSync(join(project, "a.mjs"), "export const a = 1;\n");
 			runFixtureGit(project, ["init", "-q"]);
@@ -524,11 +538,12 @@ ${declaration}
 			try {
 				const pending = runQuickChecksAsync({
 					projectPath: project,
-					taskId: abrupt ? "56" : "55",
+					taskId: `helper-${mode}`,
 					attempt: 1,
 					baseTree,
 					diff,
 					checks: [["node", "--test", "check.mjs"]],
+					checkTimeoutMs: mode === "timeout" ? 1_000 : undefined,
 					allowedPaths: ["a.mjs"],
 					onRunnerStarted: (value, root) => {
 						runnerPid = value;
@@ -539,14 +554,16 @@ ${declaration}
 					await new Promise((resolve) => setTimeout(resolve, 20));
 				ok(existsSync(marker), "check helper must start before cleanup");
 				pid = Number(readFileSync(marker, "utf8"));
-				if (abrupt) {
+				if (mode === "abrupt") {
 					process.kill(runnerPid, "SIGKILL");
 				}
 				const receipt = await pending;
-				if (abrupt) strictEqual(receipt, null);
+				if (mode === "abrupt") strictEqual(receipt, null);
 				else {
-					strictEqual(receipt?.status, "passed");
+					strictEqual(receipt?.status, mode === "normal" ? "passed" : "failed");
 					strictEqual(receipt.cleanup.status, "complete");
+					if (mode === "timeout") strictEqual(receipt.checks[0].timedOut, true);
+					if (mode === "failed") ok(receipt.checks[0].exitCode !== 0);
 				}
 				ok(Number.isSafeInteger(pid) && pid > 0);
 				const stopped = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
@@ -642,25 +659,52 @@ child.unref();
 
 	it("runs declared offline dependency setup before the check", () => {
 		const project = join(TEST_DIR, "task-setup");
+		const root = join(TEST_DIR, "task-setup-root");
+		const tool = join(project, "fixture-tool");
+		const forbidden = join(TEST_DIR, "postinstall-ran");
 		mkdirSync(project, { recursive: true });
+		mkdirSync(root, { recursive: true });
+		mkdirSync(tool, { recursive: true });
 		writeFileSync(
 			join(project, "package.json"),
 			JSON.stringify({
 				name: "task-setup-fixture",
 				version: "1.0.0",
 				private: true,
+				devDependencies: { "fixture-tool": "file:./fixture-tool" },
+				scripts: { probe: "fixture-tool" },
 			}),
 		);
 		writeFileSync(
-			join(project, "package-lock.json"),
+			join(tool, "package.json"),
 			JSON.stringify({
-				name: "task-setup-fixture",
+				name: "fixture-tool",
 				version: "1.0.0",
-				lockfileVersion: 3,
-				requires: true,
-				packages: { "": { name: "task-setup-fixture", version: "1.0.0" } },
+				bin: { "fixture-tool": "bin.mjs" },
+				scripts: {
+					postinstall: `node -e "require('fs').writeFileSync(${JSON.stringify(forbidden)}, 'unsafe')"`,
+				},
 			}),
 		);
+		writeFileSync(
+			join(tool, "bin.mjs"),
+			'#!/usr/bin/env node\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nwriteFileSync(join(process.env.HOME, "local-bin-ran"), "yes");\n',
+			{ mode: 0o755 },
+		);
+		writeFileSync(join(project, ".gitignore"), "node_modules/\n");
+		const lock = spawnSync(
+			"npm",
+			[
+				"install",
+				"--package-lock-only",
+				"--ignore-scripts",
+				"--offline",
+				"--no-audit",
+				"--no-fund",
+			],
+			{ cwd: project, encoding: "utf8" },
+		);
+		strictEqual(lock.status, 0);
 		writeFileSync(join(project, "a.mjs"), "export const answer = 1;\n");
 		runFixtureGit(project, ["init", "-q"]);
 		runFixtureGit(project, ["add", "."]);
@@ -681,7 +725,7 @@ child.unref();
 - **Status:** pending
 - **Executor:** switchyard
 - **Files:** a.mjs
-- **Quick checks:** node --check a.mjs
+- **Quick checks:** npm run probe
 - **Quick check setup:** npm ci --ignore-scripts --offline
 `)[0].quickChecks;
 		const receipt = runQuickChecks({
@@ -692,9 +736,31 @@ child.unref();
 			diff,
 			...quickChecks,
 			allowedPaths: ["a.mjs"],
+			ownedRoot: root,
 		});
-		strictEqual(receipt.status, "passed");
+		strictEqual(receipt.status, "passed", JSON.stringify(receipt));
 		strictEqual(receipt.setup.exitCode, 0);
 		strictEqual(receipt.checks[0].exitCode, 0);
+		strictEqual(readFileSync(join(root, "local-bin-ran"), "utf8"), "yes");
+		ok(!existsSync(forbidden), "npm lifecycle scripts must stay disabled");
+		const manifestPath = join(project, "package.json");
+		const originalManifest = readFileSync(manifestPath, "utf8");
+		const editedManifest = JSON.parse(originalManifest);
+		editedManifest.scripts.probe = "node --version";
+		writeFileSync(manifestPath, JSON.stringify(editedManifest));
+		const manifestDiff = runFixtureGit(project, ["diff", "--", "package.json"]);
+		writeFileSync(manifestPath, originalManifest);
+		const untrusted = runQuickChecks({
+			projectPath: project,
+			taskId: "53-untrusted",
+			attempt: 1,
+			baseTree,
+			diff: manifestDiff,
+			...quickChecks,
+			allowedPaths: ["package.json"],
+			allowSensitiveManifests: true,
+		});
+		strictEqual(untrusted.status, "unknown");
+		strictEqual(untrusted.failureCode, "setup_unavailable");
 	});
 });

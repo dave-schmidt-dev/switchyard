@@ -3,12 +3,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { integrationGate } from "../integrate/index.mjs";
 import { settleSimpleWriterProcesses } from "../simple/process-teardown.mjs";
 import { MAX_CHECKS, parseCommand } from "./check-contract.mjs";
+import { trustedOfflineNpmEnv } from "./check-dependencies.mjs";
 
 export { parseQuickChecks } from "./check-contract.mjs";
 
@@ -116,7 +117,7 @@ function git(cwd, env, args, input) {
 	return result.stdout.trim();
 }
 
-function runCommand(cwd, env, argv, timeoutMs) {
+function runCommand(cwd, env, argv, timeoutMs, { sandbox = true } = {}) {
 	if (process.platform !== "darwin")
 		return {
 			exitCode: null,
@@ -133,14 +134,15 @@ function runCommand(cwd, env, argv, timeoutMs) {
 				cwd,
 				argv,
 				timeoutMs,
-				profile: quickCheckSandboxProfile(cwd, env.HOME),
+				sandbox,
+				profile: sandbox ? quickCheckSandboxProfile(cwd, env.HOME) : null,
 			}),
 		],
 		{
 			cwd,
 			env,
 			encoding: "utf8",
-			timeout: timeoutMs + 5_000,
+			timeout: timeoutMs + 10_000,
 			maxBuffer: 1024,
 			stdio: ["ignore", "pipe", "inherit"],
 		},
@@ -270,6 +272,8 @@ export function runQuickChecks({
 	diff,
 	checks,
 	setup = null,
+	checkTimeoutMs = MAX_CHECK_MS,
+	hostNpmCache = join(homedir(), ".npm"),
 	allowedPaths = null,
 	allowSensitiveManifests = false,
 	snapshotPaths = [],
@@ -277,6 +281,9 @@ export function runQuickChecks({
 	onStatus,
 }) {
 	if (
+		!Number.isSafeInteger(checkTimeoutMs) ||
+		checkTimeoutMs < 100 ||
+		checkTimeoutMs > MAX_CHECK_MS ||
 		!Array.isArray(checks) ||
 		checks.length < 1 ||
 		checks.length > MAX_CHECKS ||
@@ -341,7 +348,16 @@ export function runQuickChecks({
 				status: `Task ${taskId} installing declared dependencies`,
 				taskId,
 			});
-			const outcome = runCommand(clone, env, setup, 5 * 60_000);
+			const setupEnv = trustedOfflineNpmEnv(
+				projectPath,
+				clone,
+				env,
+				hostNpmCache,
+			);
+			if (!setupEnv) throw new Error("setup_unavailable");
+			const outcome = runCommand(clone, setupEnv, setup, 5 * 60_000, {
+				sandbox: false,
+			});
 			receipt.setup = { commandSha256: sha(JSON.stringify(setup)), ...outcome };
 			if (outcome.exitCode !== 0 || outcome.groupCleanup !== "complete")
 				throw new Error("setup_failed");
@@ -353,7 +369,7 @@ export function runQuickChecks({
 				status: `Task ${taskId} check ${index + 1}/${checks.length} running`,
 				taskId,
 			});
-			const outcome = runCommand(clone, env, argv, MAX_CHECK_MS);
+			const outcome = runCommand(clone, env, argv, checkTimeoutMs);
 			receipt.checks.push({
 				index,
 				commandSha256: sha(JSON.stringify(argv)),
@@ -374,6 +390,7 @@ export function runQuickChecks({
 		receipt.failureCode = [
 			"base_mismatch",
 			"setup_failed",
+			"setup_unavailable",
 			"check_failed",
 		].includes(error.message)
 			? error.message
@@ -429,7 +446,8 @@ export function runQuickChecksAsync(input) {
 		const root = mkdtempSync(join(tmpdir(), "switchyard-quick-check-"));
 		const launchedAt = Date.now();
 		const maxMs =
-			(input.checks?.length ?? MAX_CHECKS) * MAX_CHECK_MS +
+			(input.checks?.length ?? MAX_CHECKS) *
+				(input.checkTimeoutMs ?? MAX_CHECK_MS) +
 			(input.setup ? 5 * 60_000 : 0) +
 			90_000;
 		let child;
@@ -525,6 +543,7 @@ export function runQuickChecksAsync(input) {
 			JSON.stringify({
 				...input,
 				ownedRoot: root,
+				hostNpmCache: join(homedir(), ".npm"),
 				onStatus: undefined,
 				onRunnerStarted: undefined,
 			}),
@@ -652,9 +671,10 @@ if (process.argv[2] === "--quick-check-worker") {
 		process.exit(2);
 	}
 	const [command, ...args] = payload.argv;
+	const sandboxed = payload.sandbox !== false;
 	const child = spawn(
-		"/usr/bin/sandbox-exec",
-		["-p", payload.profile, "--", command, ...args],
+		sandboxed ? "/usr/bin/sandbox-exec" : command,
+		sandboxed ? ["-p", payload.profile, "--", command, ...args] : args,
 		{
 			cwd: payload.cwd,
 			env: process.env,
