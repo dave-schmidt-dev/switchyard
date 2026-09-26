@@ -391,7 +391,10 @@ export async function executeAsync(prompt, workingContainerName, options = {}) {
 				...options,
 				provider: "opencode",
 				input: execution.input ?? guardedPrompt,
-				cleanupContext: execution.cleanupContext,
+				cleanupContext: {
+					...options.cleanupContext,
+					...execution.cleanupContext,
+				},
 				timeoutMs,
 				signal,
 				onPoll,

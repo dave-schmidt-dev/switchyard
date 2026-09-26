@@ -387,6 +387,12 @@ function projectLegacyDisposition({
 	if (terminal && cleanupIncomplete) {
 		return baseDisposition("stop", "cleanup_incomplete", failure);
 	}
+	if ((checkpoint?.quickCheckInvalidTaskIds?.length ?? 0) > 0) {
+		return baseDisposition("stop", "check_failed", {
+			errorKind: "check_failed",
+			reasonCode: "check_failed",
+		});
+	}
 	if (run?.state === "succeeded" && run?.cleanupState === "complete") {
 		return baseDisposition("complete", "run_succeeded", failure);
 	}
@@ -423,6 +429,12 @@ function projectLegacyDisposition({
 	}
 	if (run?.state === "failed" && run?.cleanupState === "complete") {
 		const diagnosticCode = projectedDiagnosticCode(failure);
+		if (
+			failure?.errorKind === "check_failed" &&
+			failure?.reasonCode === "check_failed"
+		) {
+			return baseDisposition("stop", "check_failed", failure);
+		}
 		if (
 			CONTRACT_DIAGNOSTICS.has(diagnosticCode) ||
 			CONTRACT_FAILURE_KINDS.has(failure?.errorKind)

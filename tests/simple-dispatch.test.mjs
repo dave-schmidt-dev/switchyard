@@ -2140,15 +2140,88 @@ helper.unref();
 						output: secret,
 						stderr: secret,
 						writerLifecycle: "stopped",
+						providerLifecycle: {
+							terminalStatus: "exited",
+							exitCode: 1,
+							writerLifecycle: "stopped",
+						},
 					};
 				},
 			}),
 		);
 		retain(result, repo.projectPath);
 		strictEqual(result.failureReason, "provider_exit_nonzero");
+		strictEqual(result.providerLifecycle?.exitCode, 1);
 		ok(result.partialWorktree);
 		ok(!JSON.stringify(result).includes(secret));
 	});
+
+	for (const [label, providerFields, reason, errorKind] of [
+		[
+			"adapter error",
+			{ error: new Error("adapter rejected the result") },
+			"provider_adapter_error",
+			"execution_failed",
+		],
+		[
+			"uncertain cleanup",
+			{ cleanupStatus: "uncertain" },
+			"provider_cleanup_failed",
+			"cleanup_failed",
+		],
+		[
+			"otherwise inconsistent result",
+			{},
+			"provider_result_inconsistent",
+			"execution_failed",
+		],
+	]) {
+		it(`keeps code-zero ${label} failed without checks or integration`, async () => {
+			const repo = makeRepo();
+			let checks = 0;
+			let integrations = 0;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(
+							join(worktreePath, "src", "a.txt"),
+							"provider partial\n",
+							"utf8",
+						);
+						return {
+							success: false,
+							code: 0,
+							writerLifecycle: "stopped",
+							providerLifecycle: {
+								terminalStatus: "exited",
+								exitCode: 0,
+								writerLifecycle: "stopped",
+								cleanupStatus: providerFields.cleanupStatus ?? "not_required",
+							},
+							...providerFields,
+						};
+					},
+					runCheck: async () => {
+						checks += 1;
+						return { success: true };
+					},
+					integrate: async () => {
+						integrations += 1;
+						return { success: true };
+					},
+				}),
+			);
+			retain(result, repo.projectPath);
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, reason);
+			strictEqual(result.errorKind, errorKind);
+			strictEqual(result.providerLifecycle?.exitCode, 0);
+			strictEqual(result.partialWorktree !== null, true);
+			strictEqual(checks, 0);
+			strictEqual(integrations, 0);
+		});
+	}
 
 	it("returns bound recovery evidence for safe attended continuation", async () => {
 		const repo = makeRepo();
@@ -3150,7 +3223,13 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 				dependencies({
 					executeProvider: async () => ({
 						success: true,
+						code: 0,
 						writerLifecycle: "stopped",
+						providerLifecycle: {
+							terminalStatus: "exited",
+							exitCode: 0,
+							writerLifecycle: "stopped",
+						},
 					}),
 					updateRunWithRetry: async (runId, patch) => {
 						if (patch.state === "failed")
@@ -3161,6 +3240,7 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			);
 			strictEqual(result.status, "failed");
 			strictEqual(result.failureReason, "empty_diff");
+			strictEqual(result.providerLifecycle?.exitCode, 0);
 			ok(result.partialWorktree);
 			strictEqual(existsSync(dirname(result.partialWorktree)), true);
 		});
@@ -3402,6 +3482,133 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(run.cleanupState, "pending");
 			strictEqual(join(run.worktree.path, "worktree"), result.partialWorktree);
 			strictEqual(existsSync(run.worktree.path), true);
+		});
+
+		it("records bounded failed-check exit evidence and the exact local recovery identity", async () => {
+			const repo = makeRepo();
+			const taskId = `failed-check-evidence-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const secretOutput = "PRIVATE_CHECK_OUTPUT_CANARY";
+			const result = await runSimpleTask(
+				options(repo, { checks: ["test command that must not be persisted"] }),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					runCheck: async () => ({
+						success: false,
+						code: 37,
+						signal: null,
+						output: secretOutput,
+						stderr: secretOutput,
+						writerLifecycle: "stopped",
+					}),
+				}),
+			);
+			retain(result, repo.projectPath);
+
+			deepStrictEqual(result.checks, [
+				{ index: 1, status: "failed", exitCode: 37, signal: null },
+			]);
+			strictEqual(result.partialWorktree, result.recovery.partialWorktree);
+			strictEqual(result.recovery.identity.taskId, taskId);
+			strictEqual(result.recovery.identity.attemptId, result.attemptId);
+			strictEqual(result.recovery.cleanup.worktree.state, "retained");
+			strictEqual(result.recovery.cleanup.projectLock.state, "released");
+			const run = await readRun(runId);
+			strictEqual(join(run.worktree.path, "worktree"), result.partialWorktree);
+			strictEqual(run.worktree.state, "retained");
+			ok(run.worktree.device);
+			ok(run.worktree.inode);
+			ok(run.worktree.nonce);
+
+			const checkEvent = (await readEvents(runId)).find(
+				(event) => event.milestone === "check_finished",
+			);
+			strictEqual(checkEvent.checkIndex, 1);
+			strictEqual(checkEvent.checkStatus, "failed");
+			strictEqual(checkEvent.exitCode, 37);
+			strictEqual(checkEvent.signal, null);
+			ok(!JSON.stringify({ result, run, checkEvent }).includes(secretOutput));
+			ok(
+				!JSON.stringify({ result, run, checkEvent }).includes(
+					"test command that must not be persisted",
+				),
+			);
+		});
+
+		it("records an allowlisted signal when a failed check has no exit code", async () => {
+			const repo = makeRepo();
+			const taskId = `failed-check-signal-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					runCheck: async () => ({
+						success: false,
+						code: null,
+						signal: "SIGTERM",
+						writerLifecycle: "stopped",
+					}),
+				}),
+			);
+			retain(result, repo.projectPath);
+
+			deepStrictEqual(result.checks, [
+				{ index: 1, status: "failed", exitCode: null, signal: "SIGTERM" },
+			]);
+			const checkEvent = (await readEvents(runId)).find(
+				(event) => event.milestone === "check_finished",
+			);
+			strictEqual(checkEvent.exitCode, null);
+			strictEqual(checkEvent.signal, "SIGTERM");
+		});
+
+		it("drops out-of-range exit codes and unapproved signals from failed checks", async () => {
+			const repo = makeRepo();
+			const taskId = `failed-check-untrusted-status-${Date.now()}`;
+			const runId = `simple-${taskId}`;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					taskId,
+					runId,
+					executeProvider: async ({ worktreePath }) => {
+						writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+						return { success: true, writerLifecycle: "stopped" };
+					},
+					runCheck: async () => ({
+						success: false,
+						code: 900,
+						signal: "UNTRUSTED_SIGNAL_CANARY",
+						writerLifecycle: "stopped",
+					}),
+				}),
+			);
+			retain(result, repo.projectPath);
+
+			deepStrictEqual(result.checks, [
+				{ index: 1, status: "failed", exitCode: null, signal: null },
+			]);
+			const checkEvent = (await readEvents(runId)).find(
+				(event) => event.milestone === "check_finished",
+			);
+			strictEqual(checkEvent.exitCode, null);
+			strictEqual(checkEvent.signal, null);
+			ok(
+				!JSON.stringify({ result, checkEvent }).includes(
+					"UNTRUSTED_SIGNAL_CANARY",
+				),
+			);
 		});
 
 		it("preserves succeeded status when lock release fails during cleanup", async () => {

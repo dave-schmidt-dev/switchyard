@@ -1126,7 +1126,7 @@ describe("attempt-scoped execution backend", () => {
 		);
 
 		const markdown =
-			"### Task 1.1: Overlay\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** d\n";
+			"### Task 1.1: Overlay\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** d\n";
 		const tasksFilePath = join(TEST_DIR, "overlay-identity-tasks.md");
 		mkdirSync(TEST_DIR, { recursive: true });
 		writeFileSync(tasksFilePath, markdown);
@@ -1190,7 +1190,7 @@ describe("attempt-scoped execution backend", () => {
 						},
 						captureDiff: (_workspace, options) => {
 							options.executionBackend.execArgv("vm", {});
-							return null;
+							return "";
 						},
 					},
 				},
@@ -1238,7 +1238,7 @@ describe("attempt-scoped execution backend", () => {
 						captureDiff: (_workspace, options) => {
 							captureFacade = options.executionBackend;
 							options.executionBackend.execArgv("vm", {});
-							return null;
+							return "";
 						},
 					},
 				},
@@ -1455,7 +1455,7 @@ describe("attempt-scoped execution backend", () => {
 							executeAsync: async () => ({ success: true }),
 							captureDiffAsync: async (_workspace, options) => {
 								options.executionBackend.execArgv("vm", {});
-								return null;
+								return "";
 							},
 						},
 					},
@@ -1683,7 +1683,14 @@ function withExplicitSwitchyardExecutor(markdown) {
 			const hasExecutor = lines
 				.slice(index + 1, blockEnd)
 				.some((candidate) => /^- \*\*Executor:\*\*/.test(candidate));
-			return hasExecutor ? [line] : [line, "- **Executor:** switchyard"];
+			const hasQuickChecks = lines
+				.slice(index + 1, blockEnd)
+				.some((candidate) => /^- \*\*Quick checks:\*\*/.test(candidate));
+			return [
+				line,
+				...(hasExecutor ? [] : ["- **Executor:** switchyard"]),
+				...(hasQuickChecks ? [] : ["- **Quick checks:** none"]),
+			];
 		})
 		.join("\n");
 }
@@ -1992,7 +1999,7 @@ describe("host power queue policy", () => {
 				adapters: {
 					codex: {
 						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => null,
+						captureDiff: () => "",
 					},
 				},
 				projectPath: TEST_DIR,
@@ -2153,7 +2160,7 @@ describe("dispatch descriptor receipt contract", () => {
 							executions += 1;
 							return { success: true };
 						},
-						captureDiff: () => null,
+						captureDiff: () => "",
 					},
 				},
 				workingContainerName: "fake-container",
@@ -2279,7 +2286,7 @@ describe("dispatch descriptor receipt contract", () => {
 							executions += 1;
 							return { success: true };
 						},
-						captureDiff: () => null,
+						captureDiff: () => "",
 					},
 				},
 				integrationGate: () => ({ success: true }),
@@ -3216,7 +3223,7 @@ describe("runner queue parsing", () => {
 			const tasksPath = join(root, `${path.replaceAll("/", "-")}.md`);
 			writeFileSync(
 				tasksPath,
-				`### Task 1.1: File task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** ${path}\n- **Description:** fixture\n`,
+				`### Task 1.1: File task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** ${path}\n- **Description:** fixture\n`,
 			);
 			let preflightCalls = 0;
 			const invoke = () =>
@@ -3878,7 +3885,7 @@ describe("async runner provider lifecycle", () => {
 		const checkpointPath = join(root, "checkpoint.json");
 		writeFileSync(
 			tasksPath,
-			"### Task 4.1: Async provider\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** exercise async lifecycle\n- **Executor:** switchyard\n",
+			"### Task 4.1: Async provider\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** exercise async lifecycle\n- **Executor:** switchyard\n- **Quick checks:** none\n",
 		);
 		const descriptor = descriptorForRoute({
 			provider: "opencode",
@@ -3991,7 +3998,7 @@ describe("async runner provider lifecycle", () => {
 			const checkpointPath = join(root, "checkpoint.json");
 			writeFileSync(
 				tasksPath,
-				"### Task 4.2: Diagnostic producer\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** exercise persistence\n- **Executor:** switchyard\n",
+				"### Task 4.2: Diagnostic producer\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** exercise persistence\n- **Executor:** switchyard\n- **Quick checks:** none\n",
 			);
 			const descriptor = descriptorForRoute({
 				provider: "opencode",
@@ -4066,7 +4073,7 @@ describe("async runner provider lifecycle", () => {
 		const checkpointPath = join(root, "checkpoint.json");
 		writeFileSync(
 			tasksPath,
-			"### Task 4.3: Synchronous diagnostic\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** reject unretained evidence\n- **Executor:** switchyard\n",
+			"### Task 4.3: Synchronous diagnostic\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** reject unretained evidence\n- **Executor:** switchyard\n- **Quick checks:** none\n",
 		);
 		const descriptor = descriptorForRoute({
 			provider: "opencode",
@@ -4152,7 +4159,7 @@ describe("async runner provider lifecycle", () => {
 		const checkpointPath = join(root, "checkpoint.json");
 		writeFileSync(
 			tasksPath,
-			"### Task 4.2: Heartbeat\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** heartbeat\n- **Executor:** switchyard\n",
+			"### Task 4.2: Heartbeat\n- **Status:** pending\n- **Type:** implementation\n- **Files:** src/switchyard/runner/index.mjs\n- **Description:** heartbeat\n- **Executor:** switchyard\n- **Quick checks:** none\n",
 		);
 		const descriptor = descriptorForRoute({
 			provider: "opencode",
@@ -4192,7 +4199,7 @@ describe("async runner provider lifecycle", () => {
 								output: JSON.stringify({ verdict: "clean", findings: [] }),
 							};
 						},
-						captureDiffAsync: async () => null,
+						captureDiffAsync: async () => "",
 					},
 				},
 			},
@@ -4977,8 +4984,8 @@ describe("runner orchestration", () => {
 		strictEqual(result.completedTaskIds.length, 2);
 		strictEqual(dispatches.length, 2);
 		deepStrictEqual(prompts, [
-			"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
-			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+			"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 
 		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
@@ -5043,8 +5050,8 @@ describe("runner orchestration", () => {
 		});
 
 		deepStrictEqual(prompts, [
-			"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
-			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+			"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** First operation",
+			"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 		]);
 	});
 
@@ -5854,8 +5861,8 @@ describe("runner headless orchestrator mode", () => {
 		deepStrictEqual(
 			launches.map((payload) => payload.prompt),
 			[
-				"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** First operation",
-				"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Second operation",
+				"### Task 1.1: First task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** First operation",
+				"### Task 1.2: Second task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** Second operation",
 			],
 		);
 		deepStrictEqual(
@@ -13992,7 +13999,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 								diagnosticEvidenceAvailable: true,
 								failurePhase: "provider_execution",
 							}),
-							captureDiff: () => null,
+							captureDiff: () => "",
 						},
 					},
 					queueBackend: { captureTaskBase: () => TASK_BASE },
@@ -14568,7 +14575,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					adapters: {
 						codex: {
 							execute: () => ({ success: true, output: "ok" }),
-							captureDiff: () => null,
+							captureDiff: () => "",
 						},
 					},
 					queueBackend: { captureTaskBase: () => TASK_BASE },
@@ -15124,9 +15131,7 @@ describe("runQueue timeout diff persistence", () => {
 									timedOut: true,
 								},
 					captureDiff: () =>
-						shouldSucceed
-							? null
-							: "diff --git a/retry.mjs b/retry.mjs\n+pending",
+						shouldSucceed ? "" : "diff --git a/retry.mjs b/retry.mjs\n+pending",
 				},
 			},
 		};

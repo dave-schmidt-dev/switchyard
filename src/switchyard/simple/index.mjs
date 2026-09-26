@@ -20,7 +20,10 @@ import {
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
-import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import {
+	PERSISTED_SIGNALS,
+	sanitizeFailureMetadata,
+} from "../adapter/exec-error.mjs";
 import {
 	boundProviderLifecycleSnapshot,
 	runProviderProcess,
@@ -1129,8 +1132,30 @@ function classifyExecutionFailure(result) {
 	if (result?.silenceTimedOut) return "provider_silence_timeout";
 	if (result?.timedOut) return "provider_deadline_exceeded";
 	if (result?.cancelled) return "provider_cancelled";
+	const lifecycle = result?.providerLifecycle;
+	const exitCode = Number.isSafeInteger(result?.code)
+		? result.code
+		: Number.isSafeInteger(lifecycle?.exitCode)
+			? lifecycle.exitCode
+			: null;
+	const signal = result?.signal ?? lifecycle?.signal ?? null;
+	const cleanupStatus = result?.cleanupStatus ?? lifecycle?.cleanupStatus;
+	const cleanupUnconfirmed =
+		result?.cleanupFailed === true ||
+		cleanupStatus === "failed" ||
+		cleanupStatus === "uncertain" ||
+		result?.writerLifecycle === "unavailable" ||
+		lifecycle?.writerLifecycle === "unavailable";
+	if (exitCode !== null && exitCode !== 0) return "provider_exit_nonzero";
+	if (exitCode === 0) {
+		if (cleanupUnconfirmed) return "provider_cleanup_failed";
+		if (result?.error) return "provider_adapter_error";
+		return "provider_result_inconsistent";
+	}
+	if (signal) return "provider_signalled";
+	if (cleanupUnconfirmed) return "provider_cleanup_failed";
 	if (result?.error && result.code === null) return "provider_launch_failed";
-	return "provider_exit_nonzero";
+	return "provider_result_inconsistent";
 }
 
 const SIMPLE_RECOVERY_SCHEMA_VERSION = 1;
@@ -1549,21 +1574,25 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return "check_failed";
 		}
 		if (
-			failureReason === "provider_silence_timeout" ||
-			failureReason === "provider_deadline_exceeded" ||
-			failureReason === "provider_cancelled" ||
-			failureReason === "provider_exit_nonzero" ||
-			failureReason === "provider_launch_failed" ||
-			failurePhase === "execute"
-		) {
-			return "execution_failed";
-		}
-		if (
+			failureReason === "provider_cleanup_failed" ||
 			failureReason === "worktree_cleanup_failed" ||
 			failureReason === "project_lock_release_unconfirmed" ||
 			failurePhase === "cleanup"
 		) {
 			return "cleanup_failed";
+		}
+		if (
+			failureReason === "provider_silence_timeout" ||
+			failureReason === "provider_deadline_exceeded" ||
+			failureReason === "provider_cancelled" ||
+			failureReason === "provider_signalled" ||
+			failureReason === "provider_adapter_error" ||
+			failureReason === "provider_result_inconsistent" ||
+			failureReason === "provider_exit_nonzero" ||
+			failureReason === "provider_launch_failed" ||
+			failurePhase === "execute"
+		) {
+			return "execution_failed";
 		}
 		if (failureReason === "deadline_expired") {
 			if (failurePhase === "preflight" || failurePhase === "input_validation")
@@ -1619,6 +1648,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 					...(details.checkStatus !== undefined
 						? { checkStatus: details.checkStatus }
 						: {}),
+					...(details.exitCode !== undefined
+						? { exitCode: details.exitCode }
+						: {}),
+					...(details.signal !== undefined ? { signal: details.signal } : {}),
 					firstChangeObserved,
 				}).catch(() => {});
 				pendingDurability.add(eventWrite);
@@ -2319,14 +2352,30 @@ export async function runSimpleTask(options, dependencies = {}) {
 				keepWorktree = true;
 				return fail("check_group_unconfirmed", "checks", "cleanup_failed");
 			}
+			const checkStatus = check?.success ? "passed" : "failed";
+			const checkExitCode =
+				Number.isSafeInteger(check?.code) &&
+				check.code >= 0 &&
+				check.code <= 255
+					? check.code
+					: null;
+			const checkSignal = PERSISTED_SIGNALS.has(check?.signal)
+				? check.signal
+				: null;
 			checks.push({
 				index: index + 1,
-				status: check?.success ? "passed" : "failed",
+				status: checkStatus,
+				...(checkStatus === "failed"
+					? { exitCode: checkExitCode, signal: checkSignal }
+					: {}),
 			});
 			milestone("checks", "check_finished", {
 				checkIndex: index + 1,
 				checkIdentity,
-				checkStatus: check?.success ? "passed" : "failed",
+				checkStatus,
+				...(checkStatus === "failed"
+					? { exitCode: checkExitCode, signal: checkSignal }
+					: {}),
 			});
 			if (!check?.success) {
 				keepWorktree = true;

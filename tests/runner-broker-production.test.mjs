@@ -551,7 +551,7 @@ test("production async runner commits each task on an owned container", async ()
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: A\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A\n\n### Task 1.2: B\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/b.mjs\n- **Description:** B\n",
+		"### Task 1.1: A\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** A\n\n### Task 1.2: B\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/b.mjs\n- **Quick checks:** none\n- **Description:** B\n",
 	);
 	const invocation = descriptor("cheap", "cheap-standard");
 	let commits = 0;
@@ -612,7 +612,7 @@ test("production async runner keeps implementation transcripts off the broker bo
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: A\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A\n",
+		"### Task 1.1: A\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** A\n",
 	);
 	const invocation = descriptor("cheap", "cheap-standard");
 	const records = [];
@@ -1225,7 +1225,7 @@ test("production async runner records the routed provider when post-execution ca
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Capture failure\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** preserve route identity\n",
+		"### Task 1.1: Capture failure\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** preserve route identity\n",
 	);
 	const dispatches = [];
 	const result = await runQueueAsync({
@@ -1275,7 +1275,7 @@ test("production async runner does not retry before post-execution capture", asy
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Fallback capture failure\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** record both provider outcomes\n",
+		"### Task 1.1: Fallback capture failure\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** record both provider outcomes\n",
 	);
 	const dispatches = [];
 	let executions = 0;
@@ -2045,7 +2045,7 @@ test("production async runner fails closed when typed outcome persistence fails"
 	const checkpointPath = join(root, "checkpoint.json");
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Outcome write\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fail closed on outcome persistence\n",
+		"### Task 1.1: Outcome write\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** fail closed on outcome persistence\n",
 	);
 	const result = await runQueueAsync({
 		tasksFilePath,
@@ -2189,7 +2189,7 @@ test("production async runner omits the provider transcript when the broker gate
 		"I inspected src/a.mjs and concluded no change was required.";
 	await writeFile(
 		tasksFilePath,
-		"### Task 1.1: Empty-diff task\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** the provider explains itself but changes nothing\n",
+		"### Task 1.1: Empty-diff task\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** the provider explains itself but changes nothing\n",
 	);
 	const result = await runQueueAsync({
 		tasksFilePath,
@@ -2213,7 +2213,7 @@ test("production async runner omits the provider transcript when the broker gate
 						output: transcript,
 						error: null,
 					}),
-					captureDiffAsync: async () => null,
+					captureDiffAsync: async () => "",
 				},
 			},
 			recordDispatch: () => {},

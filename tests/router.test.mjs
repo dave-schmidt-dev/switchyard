@@ -1791,7 +1791,7 @@ describe("Task 6.1 queue-level platform selection", () => {
 		mkdirSync(root, { recursive: true });
 		writeFileSync(
 			tasksFilePath,
-			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
+			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** fixture\n",
 			"utf8",
 		);
 		const base = {

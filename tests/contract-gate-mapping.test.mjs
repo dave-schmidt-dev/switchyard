@@ -208,7 +208,7 @@ describe("source-boundary contract gate mapping", () => {
 	it("maps each declared production boundary to existing suites", () => {
 		const manifest = loadContractGateManifest(ROOT);
 		const ledger = loadLedgerGateMapping(ROOT);
-		strictEqual(manifest.length, 14);
+		strictEqual(manifest.length, 15);
 		strictEqual(
 			validateContractGateMapping({ manifest, ledger, root: ROOT }),
 			true,
@@ -218,6 +218,32 @@ describe("source-boundary contract gate mapping", () => {
 				(owner) => owner.id,
 			),
 			["outcome-schema-reducer"],
+		);
+		const extractedOnly = ownersForPaths(manifest, [
+			"src/switchyard/runner/checks.mjs",
+		]);
+		deepStrictEqual(
+			extractedOnly.map((owner) => owner.id),
+			["quick-checks"],
+		);
+		throws(
+			() =>
+				validateExecution({
+					manifest: extractedOnly,
+					execution: { suites: {} },
+				}),
+			/contract_gate_execution_invalid/,
+		);
+		deepStrictEqual(
+			validateExecution({
+				manifest: extractedOnly,
+				execution: {
+					suites: {
+						"tests/runner-quick-checks.test.mjs": { status: "executed" },
+					},
+				},
+			}).requiredSuites,
+			["tests/runner-quick-checks.test.mjs"],
 		);
 	});
 

@@ -241,7 +241,7 @@ beforeEach(async () => {
 	tasksFile = join(dir, "tasks.md");
 	writeFileSync(
 		tasksFile,
-		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** A test\n",
 		"utf8",
 	);
 	projectDir = join(dir, "project");
@@ -264,7 +264,7 @@ afterEach(() => {
 		);
 		return;
 	}
-	rmSync(dir, { recursive: true, force: true });
+	rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 // A real git project with exactly one dirty tracked file, matching the single
@@ -287,7 +287,7 @@ function buildOverlayProject() {
 	const tasksPath = join(dir, "overlay-tasks.md");
 	writeFileSync(
 		tasksPath,
-		"### Task 1.1: Overlay task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+		"### Task 1.1: Overlay task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** A test\n",
 		"utf8",
 	);
 	return { project, tasksPath };
@@ -729,7 +729,7 @@ describe("launch returns before completion", () => {
 		const inProjectTasks = join(project, "queue.md");
 		writeFileSync(
 			inProjectTasks,
-			"### Task 1.1: Overlay task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+			"### Task 1.1: Overlay task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** A test\n",
 			"utf8",
 		);
 		execFileSync("git", ["add", "queue.md"], { cwd: project, stdio: "pipe" });

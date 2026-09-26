@@ -26,6 +26,17 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+	enforceQuickCheckCompletion,
+	invalidCompletedQuickCheckTaskIds,
+	isPassingQuickCheckReceipt,
+	parseQuickChecks,
+	runQuickChecks,
+	runQuickChecksAsync,
+} from "./checks.mjs";
+
+export { invalidCompletedQuickCheckTaskIds } from "./checks.mjs";
+
+import {
 	AGY_SILENCE_TIMEOUT_MS,
 	captureDiff as captureAgyDiff,
 	captureDiffAsync as captureAgyDiffAsync,
@@ -1355,6 +1366,8 @@ export async function reconcileExternalCompletion(input) {
 		const tasks = parseTaskQueue(markdown);
 		const task = tasks.find((candidate) => candidate.id === input.taskId);
 		if (!task) return refusal("unknown_task");
+		if (task.quickChecks?.checks?.length)
+			return refusal("quick_check_receipt_missing");
 		if (
 			!Array.isArray(task.requiredPaths) ||
 			!validateExactPathSet(task.requiredPaths, input.requiredPaths).ok
@@ -2049,6 +2062,7 @@ export function validateCallerInputs(options = {}) {
 			"checkpoint must be absent or readable, valid, and safe to resume",
 		);
 	}
+	assertCompletedQuickChecks(tasks, checkpoint);
 	let potentialAttemptTasks;
 	try {
 		potentialAttemptTasks = planPotentialAttemptTasks(tasks, checkpoint, {
@@ -2803,6 +2817,7 @@ export function parseTaskQueue(markdown) {
 				`Task ${taskId}: switchyard implementation task requires a Files: field (declare project-relative paths)`,
 			);
 		}
+		const quickChecks = parseQuickChecks(block, taskId, type, executor);
 
 		const allowManifestsLines = block
 			.split("\n")
@@ -2841,6 +2856,7 @@ export function parseTaskQueue(markdown) {
 			prompt: fullPrompt,
 			requiredPaths,
 			allowManifests,
+			quickChecks,
 			timeoutMs,
 			requiredCapability,
 			requiredCapabilityJustification,
@@ -4882,6 +4898,116 @@ function dirtyOverlayIntegrationGate(context) {
 		reason: "dirty_overlay_drift",
 		reasonKind: "dirty_overlay_drift",
 	};
+}
+
+function quickCheckSnapshotPaths(context) {
+	const trusted = new Set(
+		(context.dirtyOverlayReceipt?.paths ?? []).map((entry) => entry.path),
+	);
+	for (const [id, intent] of Object.entries(
+		context.checkpoint?.integrationIntents ?? {},
+	)) {
+		if (
+			intent?.status !== "completed" ||
+			!context.checkpoint.completedTaskIds?.includes(id) ||
+			!context.checkpoint.results?.some(
+				(entry) => entry.taskId === id && entry.success === true,
+			)
+		)
+			continue;
+		for (const path of intent.operation?.paths ?? []) trusted.add(path);
+	}
+	return [...trusted];
+}
+
+function quickCheckDecision(task, context, diff) {
+	const { checks = [], setup = null } = task.quickChecks ?? {};
+	// No candidate exists when capture failed or returned an empty diff. Let the
+	// existing capture/integration path report that failure; a check cannot run.
+	if (checks.length === 0 || !diff) return { passed: true, receipt: null };
+	const attempt =
+		integrationOperation(context, task, diff)?.attempt ??
+		(context.checkpoint?.taskAttempts?.[task.id] ?? 0) + 1;
+	const baseTree = context._activeTaskBase?.tree ?? null;
+	let receipt;
+	try {
+		receipt = runQuickChecks({
+			projectPath: context.projectPath,
+			taskId: task.id,
+			attempt,
+			baseTree,
+			diff,
+			checks,
+			setup,
+			onStatus: context.onStatus,
+			allowedPaths: task.requiredPaths,
+			snapshotPaths: quickCheckSnapshotPaths(context),
+			allowSensitiveManifests:
+				task.type === "implementation" && task.allowManifests === true,
+		});
+	} catch {
+		return { passed: false, receipt: null };
+	}
+	return {
+		passed: isPassingQuickCheckReceipt(receipt, {
+			taskId: task.id,
+			attempt,
+			baseTree,
+			diff,
+			checks,
+			setup,
+		}),
+		receipt,
+	};
+}
+
+async function quickCheckDecisionAsync(task, context, diff) {
+	const { checks = [], setup = null } = task.quickChecks ?? {};
+	if (checks.length === 0 || !diff) return { passed: true, receipt: null };
+	const attempt =
+		integrationOperation(context, task, diff)?.attempt ??
+		(context.checkpoint?.taskAttempts?.[task.id] ?? 0) + 1;
+	const baseTree = context._activeTaskBase?.tree ?? null;
+	let receipt;
+	try {
+		receipt = await runQuickChecksAsync({
+			projectPath: context.projectPath,
+			taskId: task.id,
+			attempt,
+			baseTree,
+			diff,
+			checks,
+			setup,
+			onStatus: context.onStatus,
+			allowedPaths: task.requiredPaths,
+			snapshotPaths: quickCheckSnapshotPaths(context),
+			allowSensitiveManifests:
+				task.type === "implementation" && task.allowManifests === true,
+		});
+	} catch {
+		return { passed: false, receipt: null };
+	}
+	return {
+		passed: isPassingQuickCheckReceipt(receipt, {
+			taskId: task.id,
+			attempt,
+			baseTree,
+			diff,
+			checks,
+			setup,
+		}),
+		receipt,
+	};
+}
+
+function assertCompletedQuickChecks(tasks, checkpoint) {
+	const [taskId] = invalidCompletedQuickCheckTaskIds(tasks, checkpoint);
+	if (!taskId) return;
+	const error = new Error(
+		`Task ${taskId}: completed checkpoint lacks an exact passing Quick check receipt`,
+	);
+	error.code = "check_failed";
+	throw error;
 }
 
 function failureMetadataFor(result, partialDiffPath) {
@@ -7159,6 +7285,28 @@ function executeTaskUnsafe(task, context) {
 			taskBase: context._activeTaskBase,
 		},
 	);
+	if (!["captured", "empty"].includes(captureEvidence.status)) {
+		record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "diff_capture_failed",
+			errorKind: "diff_capture_failed",
+			captureStatus: captureEvidence.status,
+			reason: "authoritative host diff capture failed",
+		});
+		return {
+			...taskBaseFailure(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			),
+			result: "diff_capture_failed",
+			reason: "authoritative host diff capture failed",
+			captureStatus: captureEvidence.status,
+		};
+	}
 	const diff = captureEvidence.diff;
 	if (context.onStatus) {
 		context.onStatus({
@@ -7198,27 +7346,41 @@ function executeTaskUnsafe(task, context) {
 		};
 	}
 
-	const gateResult =
-		dirtyOverlayIntegrationGate(context) ??
-		context.integrationGate(diff, context.projectPath, {
-			allowedPaths: task.requiredPaths,
-			allowSensitiveManifests:
-				task.type === "implementation" && task.allowManifests === true,
-			integrationIntent: checkpointIntegrationIntent(context, task, diff),
-			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
-		});
+	const quickCheck = quickCheckDecision(task, context, diff);
+	const gateResult = !quickCheck.passed
+		? { success: false, message: "check_failed" }
+		: (dirtyOverlayIntegrationGate(context) ??
+			context.integrationGate(diff, context.projectPath, {
+				allowedPaths: task.requiredPaths,
+				allowSensitiveManifests:
+					task.type === "implementation" && task.allowManifests === true,
+				integrationIntent: checkpointIntegrationIntent(context, task, diff),
+				dirtyOverlayReceiptHash:
+					context.dirtyOverlayReceipt?.receiptHash ?? null,
+			}));
 	const alreadyApplied = gateResult?.alreadyApplied === true;
-	const success = Boolean(gateResult?.success) || alreadyApplied;
-	const terminalResult = success ? "success" : "integration_failed";
-	const safeGateFailure = success
-		? null
-		: integrationFailureMetadata(
-				task.id,
-				diff,
-				gateResult?.credentialFlagged,
-				gateResult,
-				!diff && Boolean(boundedGateEvidence(execution.output)),
-			);
+	const gateSuccess = Boolean(gateResult?.success) || alreadyApplied;
+	const success = gateSuccess && quickCheck.passed;
+	const terminalResult = !quickCheck.passed
+		? "check_failed"
+		: gateSuccess
+			? "success"
+			: "integration_failed";
+	const safeGateFailure = !quickCheck.passed
+		? {
+				errorKind: "check_failed",
+				reasonCode: "check_failed",
+				reason: "Task check command failed.",
+			}
+		: !gateSuccess
+			? integrationFailureMetadata(
+					task.id,
+					diff,
+					gateResult?.credentialFlagged,
+					gateResult,
+					!diff && Boolean(boundedGateEvidence(execution.output)),
+				)
+			: null;
 	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
 	if (context.onStatus) {
@@ -7277,6 +7439,7 @@ function executeTaskUnsafe(task, context) {
 	const result = {
 		taskId: task.id,
 		success,
+		...(quickCheck.receipt ? { quickCheckReceipt: quickCheck.receipt } : {}),
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		requiredCapability,
@@ -8421,6 +8584,28 @@ async function executeTaskAsyncUnsafe(task, context) {
 			signal: context.signal,
 		},
 	);
+	if (!["captured", "empty"].includes(captureEvidence.status)) {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "diff_capture_failed",
+			errorKind: "diff_capture_failed",
+			captureStatus: captureEvidence.status,
+			reason: "authoritative host diff capture failed",
+		});
+		return {
+			...taskBaseFailure(
+				task,
+				routeResult,
+				invocationDescriptor,
+				requiredCapability,
+			),
+			result: "diff_capture_failed",
+			reason: "authoritative host diff capture failed",
+			captureStatus: captureEvidence.status,
+		};
+	}
 	const diff = captureEvidence.diff;
 	context.onStatus?.({
 		phase: "execution",
@@ -8455,27 +8640,41 @@ async function executeTaskAsyncUnsafe(task, context) {
 			...survivingProviderFields(execution),
 		};
 	}
-	const gateResult =
-		dirtyOverlayIntegrationGate(context) ??
-		context.integrationGate(diff, context.projectPath, {
-			allowedPaths: task.requiredPaths,
-			allowSensitiveManifests:
-				task.type === "implementation" && task.allowManifests === true,
-			integrationIntent: checkpointIntegrationIntent(context, task, diff),
-			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
-		});
+	const quickCheck = await quickCheckDecisionAsync(task, context, diff);
+	const gateResult = !quickCheck.passed
+		? { success: false, message: "check_failed" }
+		: (dirtyOverlayIntegrationGate(context) ??
+			context.integrationGate(diff, context.projectPath, {
+				allowedPaths: task.requiredPaths,
+				allowSensitiveManifests:
+					task.type === "implementation" && task.allowManifests === true,
+				integrationIntent: checkpointIntegrationIntent(context, task, diff),
+				dirtyOverlayReceiptHash:
+					context.dirtyOverlayReceipt?.receiptHash ?? null,
+			}));
 	const alreadyApplied = gateResult?.alreadyApplied === true;
-	const success = Boolean(gateResult?.success) || alreadyApplied;
-	const terminalResult = success ? "success" : "integration_failed";
-	const safeGateFailure = success
-		? null
-		: integrationFailureMetadata(
-				task.id,
-				diff,
-				gateResult?.credentialFlagged,
-				gateResult,
-				!diff && Boolean(context._activeTaskTranscript),
-			);
+	const gateSuccess = Boolean(gateResult?.success) || alreadyApplied;
+	const success = gateSuccess && quickCheck.passed;
+	const terminalResult = !quickCheck.passed
+		? "check_failed"
+		: gateSuccess
+			? "success"
+			: "integration_failed";
+	const safeGateFailure = !quickCheck.passed
+		? {
+				errorKind: "check_failed",
+				reasonCode: "check_failed",
+				reason: "Task check command failed.",
+			}
+		: !gateSuccess
+			? integrationFailureMetadata(
+					task.id,
+					diff,
+					gateResult?.credentialFlagged,
+					gateResult,
+					!diff && Boolean(context._activeTaskTranscript),
+				)
+			: null;
 	await record({
 		provider: routeResult.provider,
 		model: routeResult.model ?? "unknown",
@@ -8496,6 +8695,7 @@ async function executeTaskAsyncUnsafe(task, context) {
 		...descriptorReceiptFields(invocationDescriptor),
 		taskId: task.id,
 		success,
+		...(quickCheck.receipt ? { quickCheckReceipt: quickCheck.receipt } : {}),
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		requiredCapability,
@@ -9123,6 +9323,7 @@ async function runQueueAsyncImpl(options) {
 				checkpointPath,
 				result.taskId,
 			);
+			enforceQuickCheckCompletion(task, result, resultAttempt, checkpoint);
 			persistAsyncResultArtifacts({
 				result,
 				checkpointPath,
@@ -9149,6 +9350,9 @@ async function runQueueAsyncImpl(options) {
 						}
 					: {}),
 				result: result.result,
+				...(result.quickCheckReceipt
+					? { quickCheckReceipt: result.quickCheckReceipt }
+					: {}),
 				...(typeof result.servedModelVerified === "boolean"
 					? { servedModelVerified: result.servedModelVerified }
 					: {}),
@@ -9872,26 +10076,40 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 		};
 	}
 
-	const gateResult =
-		dirtyOverlayIntegrationGate(context) ??
-		context.integrationGate(diff, context.projectPath, {
-			allowedPaths: task.requiredPaths,
-			allowSensitiveManifests:
-				task.type === "implementation" && task.allowManifests === true,
-			integrationIntent: checkpointIntegrationIntent(context, task, diff),
-			dirtyOverlayReceiptHash: context.dirtyOverlayReceipt?.receiptHash ?? null,
-		});
+	const quickCheck = await quickCheckDecisionAsync(task, context, diff);
+	const gateResult = !quickCheck.passed
+		? { success: false, message: "check_failed" }
+		: (dirtyOverlayIntegrationGate(context) ??
+			context.integrationGate(diff, context.projectPath, {
+				allowedPaths: task.requiredPaths,
+				allowSensitiveManifests:
+					task.type === "implementation" && task.allowManifests === true,
+				integrationIntent: checkpointIntegrationIntent(context, task, diff),
+				dirtyOverlayReceiptHash:
+					context.dirtyOverlayReceipt?.receiptHash ?? null,
+			}));
 	const alreadyApplied = gateResult?.alreadyApplied === true;
-	const success = Boolean(gateResult?.success) || alreadyApplied;
-	const terminalResult = success ? "success" : "integration_failed";
-	const safeGateFailure = success
-		? null
-		: integrationFailureMetadata(
-				task.id,
-				diff,
-				gateResult?.credentialFlagged,
-				gateResult,
-			);
+	const gateSuccess = Boolean(gateResult?.success) || alreadyApplied;
+	const success = gateSuccess && quickCheck.passed;
+	const terminalResult = !quickCheck.passed
+		? "check_failed"
+		: gateSuccess
+			? "success"
+			: "integration_failed";
+	const safeGateFailure = !quickCheck.passed
+		? {
+				errorKind: "check_failed",
+				reasonCode: "check_failed",
+				reason: "Task check command failed.",
+			}
+		: !gateSuccess
+			? integrationFailureMetadata(
+					task.id,
+					diff,
+					gateResult?.credentialFlagged,
+					gateResult,
+				)
+			: null;
 	const gateArtifactRef = opaqueArtifactRef(gateResult?.artifactRef);
 
 	if (context.onStatus) {
@@ -9950,6 +10168,7 @@ async function executeTaskWithOrchestratorUnsafe(task, context) {
 	const result = {
 		taskId: task.id,
 		success,
+		...(quickCheck.receipt ? { quickCheckReceipt: quickCheck.receipt } : {}),
 		provider: routeResult.provider,
 		model: routeResult.model ?? null,
 		requiredCapability,
@@ -11624,6 +11843,7 @@ function prepareQueueLaunch({
 					checkpointOwner,
 				},
 	);
+	assertCompletedQuickChecks(tasks, checkpoint);
 	ensureRetryCheckpoint(checkpoint);
 	ensureProviderAttemptAllocations(checkpoint);
 	validateRetryDescriptorEvidence(checkpoint);
@@ -12576,6 +12796,7 @@ function runQueueImpl(options) {
 				checkpointPath,
 				result.taskId,
 			);
+			enforceQuickCheckCompletion(task, result, resultAttempt, checkpoint);
 			if (result.partialDiff) {
 				try {
 					result.partialDiffPath = savePartialDiff(
@@ -12697,6 +12918,9 @@ function runQueueImpl(options) {
 						}
 					: {}),
 				result: result.result,
+				...(result.quickCheckReceipt
+					? { quickCheckReceipt: result.quickCheckReceipt }
+					: {}),
 				...(typeof result.servedModelVerified === "boolean"
 					? { servedModelVerified: result.servedModelVerified }
 					: {}),
@@ -13339,6 +13563,7 @@ async function runQueueWithOrchestratorImpl(options) {
 				checkpointPath,
 				result.taskId,
 			);
+			enforceQuickCheckCompletion(task, result, resultAttempt, checkpoint);
 			persistProviderCleanupUncertain(checkpoint, result, checkpointPath);
 			attachRouteHealthTerminal(result, context);
 			if (onResult) onResult(result);
@@ -13400,6 +13625,9 @@ async function runQueueWithOrchestratorImpl(options) {
 						}
 					: {}),
 				result: result.result,
+				...(result.quickCheckReceipt
+					? { quickCheckReceipt: result.quickCheckReceipt }
+					: {}),
 				...(typeof result.servedModelVerified === "boolean"
 					? { servedModelVerified: result.servedModelVerified }
 					: {}),

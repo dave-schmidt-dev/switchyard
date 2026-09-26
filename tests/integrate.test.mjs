@@ -52,7 +52,7 @@ function fixture() {
 	fixtures.push(root);
 	const project = join(root, "project");
 	const tasks =
-		"### Task 1.1: External\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/changed.mjs\n";
+		"### Task 1.1: External\n- **Status:** pending\n- **Type:** implementation\n- **Executor:** switchyard\n- **Files:** src/changed.mjs\n- **Quick checks:** none\n";
 	const tasksFilePath = join(project, "tasks.md");
 	const sourceCheckpointPath = join(root, "source.checkpoint.json");
 	const successorCheckpointPath = join(root, "successor.checkpoint.json");

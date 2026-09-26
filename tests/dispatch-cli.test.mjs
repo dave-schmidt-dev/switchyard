@@ -308,7 +308,7 @@ beforeEach(async () => {
 	tasksFile = join(dir, "tasks.md");
 	writeFileSync(
 		tasksFile,
-		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** A test\n",
+		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** A test\n",
 		"utf8",
 	);
 	projectDir = join(dir, "project");
@@ -673,7 +673,7 @@ describe("validate-inputs CLI", () => {
 
 		writeFileSync(
 			tasksFile,
-			"### Task 1.1: Valid\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** valid\n",
+			"### Task 1.1: Valid\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** valid\n",
 			"utf8",
 		);
 		const selected = runDispatch(
@@ -704,7 +704,7 @@ describe("validate-inputs CLI", () => {
 		writeFileSync(join(projectDir, "generated", "uncommitted.mjs"), "owner\n");
 		writeFileSync(
 			tasksFile,
-			"### Task 1.1: Excluded\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** generated/uncommitted.mjs\n- **Description:** excluded\n\n### Task 2.1: Selected\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** selected\n",
+			"### Task 1.1: Excluded\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** generated/uncommitted.mjs\n- **Description:** excluded\n\n### Task 2.1: Selected\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** selected\n",
 			"utf8",
 		);
 
@@ -747,7 +747,7 @@ describe("validate-inputs CLI", () => {
 		writeFileSync(join(projectDir, "generated", "new.mjs"), "untracked\n");
 		writeFileSync(
 			tasksFile,
-			"### Task 1.1: Unseeded\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** generated/new.mjs\n- **Description:** valid\n",
+			"### Task 1.1: Unseeded\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** generated/new.mjs\n- **Description:** valid\n",
 			"utf8",
 		);
 
@@ -797,7 +797,7 @@ describe("validate-inputs CLI", () => {
 		chmodSync(unreadablePath, 0o000);
 		writeFileSync(
 			tasksFile,
-			"### Task 1.1: Unreadable\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/unreadable.mjs\n- **Description:** valid\n",
+			"### Task 1.1: Unreadable\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/unreadable.mjs\n- **Description:** valid\n",
 			"utf8",
 		);
 		const unreadable = runDispatch(
@@ -991,7 +991,7 @@ describe("CLI queue-level platform selection", () => {
 	it("runs the macOS queue path through a VM helper without Docker workspace calls", async () => {
 		writeFileSync(
 			tasksFile,
-			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
+			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
 			"utf8",
 		);
 		const calls = [];
@@ -1375,7 +1375,7 @@ describe("launch integration", () => {
 		]) {
 			writeFileSync(
 				tasksFile,
-				`### Task 1.1: Invalid\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** ${invalidPath}\n- **Description:** invalid\n`,
+				`### Task 1.1: Invalid\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** ${invalidPath}\n- **Description:** invalid\n`,
 				"utf8",
 			);
 			for (const command of ["run", "launch"]) {
@@ -1419,7 +1419,7 @@ describe("launch integration", () => {
 		]) {
 			writeFileSync(
 				tasksFile,
-				`### Task 1.1: Invalid\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** ${invalidPath}\n- **Description:** invalid\n`,
+				`### Task 1.1: Invalid\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** ${invalidPath}\n- **Description:** invalid\n`,
 				"utf8",
 			);
 			await rejects(
@@ -1882,6 +1882,48 @@ describe("synchronous run JSON envelope", () => {
 		};
 	}
 
+	it("reports failed quick checks as a failed disposition", () => {
+		const disposition = projectDisposition({
+			run: {
+				state: "failed",
+				cleanupState: "complete",
+				lastFailure: {
+					errorKind: "check_failed",
+					reasonCode: "check_failed",
+				},
+			},
+		});
+		strictEqual(disposition.action, "stop");
+		strictEqual(disposition.reasonCode, "check_failed");
+	});
+
+	it("run --json exits failed for a Task 51 style check result", async () => {
+		const { envelope, exitCode } = await captureRunJson(
+			[tasksFile, "--project", projectDir, "--json"],
+			noVmDependencies({
+				runQueue: async () => ({
+					totalTasks: 1,
+					runnableTasks: 1,
+					processedTasks: 1,
+					completedTaskIds: [],
+					results: [
+						{
+							taskId: "1.1",
+							success: false,
+							result: "check_failed",
+							errorKind: "check_failed",
+							reasonCode: "check_failed",
+						},
+					],
+					checkpointPath: join(dir, "check-failed.checkpoint.json"),
+				}),
+			}),
+		);
+		strictEqual(exitCode, 1);
+		strictEqual(envelope.state, "failed");
+		strictEqual(envelope.terminalSummary.completedTaskIds.length, 0);
+	});
+
 	it("emits one result-compatible success envelope with an empty stderr", async () => {
 		const { envelope, errors, output } = await captureRunJson(
 			[tasksFile, "--project", projectDir, "--json"],
@@ -2220,6 +2262,7 @@ describe("status integration", () => {
 			`### Task 1.1: Provider task with sensitive description
 - **Status:** pending
 - **Executor:** switchyard
+- **Quick checks:** none
 - **Files:** src/provider-secret-name.mjs
 - **Description:** provider task description
 
@@ -2236,18 +2279,21 @@ describe("status integration", () => {
 ### Task 1.4: Dependency gate
 - **Status:** pending
 - **Executor:** switchyard
+- **Quick checks:** none
 - **Files:** src/dependent.mjs
 - **Blocked by:** Task 1.1
 
 ### Task 1.5: External gate
 - **Status:** pending
 - **Executor:** switchyard
+- **Quick checks:** none
 - **Files:** src/external.mjs
 - **External blockers:** decision:approval
 
 ### Task 1.6: Completed task
 - **Status:** done
 - **Executor:** switchyard
+- **Quick checks:** none
 - **Files:** src/completed.mjs
 `,
 			"utf8",
@@ -3985,7 +4031,7 @@ describe("run subcommand via spawn", () => {
 		const tasksPath = join(dir, "run-tasks.md");
 		writeFileSync(
 			tasksPath,
-			"### Task 1.1: Test run task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** Run test\n",
+			"### Task 1.1: Test run task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** Run test\n",
 			"utf8",
 		);
 
@@ -4938,6 +4984,60 @@ describe("pendingCount telemetry field (checkpoint-derived, CR-3 regression)", (
 		strictEqual(resultResult.status, 0, `stderr: ${resultResult.stderr}`);
 		const resultEnvelope = JSON.parse(resultResult.stdout.trim());
 		strictEqual(resultEnvelope.pendingCount, 2);
+	});
+
+	it("rejects a real pre-receipt checkpoint on detached status and result", async () => {
+		writeFileSync(
+			tasksFile,
+			"### Task 1.1: Checked task\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** npm run lint\n- **Description:** fixture\n",
+		);
+		const { initializeRun, readRun, updateRun } = await import(
+			"../src/switchyard/run-store/index.mjs"
+		);
+		const { getCheckpointPath } = await import(
+			"../src/switchyard/runner/index.mjs"
+		);
+		const runId = `pre-receipt-${randomUUID()}`;
+		await initializeRun({
+			runId,
+			tasksFilePath: tasksFile,
+			projectPath: projectDir,
+			orderedTaskIds: ["1.1"],
+			initialHostFingerprint: "test-host",
+			launchArgs: [],
+		});
+		writeLegacyCheckpoint(getCheckpointPath(tasksFile), {
+			version: 1,
+			tasksFilePath: tasksFile,
+			completedTaskIds: ["1.1"],
+			lastTaskId: "1.1",
+			lastUpdatedAt: new Date().toISOString(),
+			results: [
+				{ taskId: "1.1", attempt: 1, success: true, result: "success" },
+			],
+		});
+		const run = await readRun(runId);
+		await updateRun(
+			runId,
+			{
+				state: "succeeded",
+				cleanupState: "complete",
+				terminalSummary: { completedTaskIds: ["1.1"], failedCount: 0 },
+			},
+			run.revision,
+		);
+		const statusResult = runDispatch(["status", runId], makeStateRootEnv());
+		strictEqual(statusResult.status, 0);
+		const status = JSON.parse(statusResult.stdout.trim());
+		strictEqual(status.state, "failed");
+		strictEqual(status.pendingCount, 1);
+		strictEqual(status.disposition.reasonCode, "check_failed");
+		const resultCall = runDispatch(["result", runId], makeStateRootEnv());
+		strictEqual(resultCall.status, 1);
+		const result = JSON.parse(resultCall.stdout.trim());
+		strictEqual(result.state, "failed");
+		deepStrictEqual(result.terminalSummary.completedTaskIds, []);
+		strictEqual(result.disposition.action, "stop");
 	});
 
 	it("status degrades pendingCount rather than crashing when the checkpoint file exists but is corrupt", async () => {

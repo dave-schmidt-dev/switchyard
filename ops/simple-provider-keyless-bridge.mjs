@@ -33,6 +33,7 @@ const MAX_PROMPT = 256 * 1024;
 const MAX_BODY = 8 * 1024 * 1024;
 const MAX_OUTPUT = 8 * 1024 * 1024;
 const MAX_WAIT_MS = 30 * 60 * 1000;
+export const MAX_CHAT_REQUESTS = 64;
 const MODELS = Object.freeze({
 	"glm-5-3-medium": {
 		target: "vibe",
@@ -142,8 +143,6 @@ export function seatbeltProfile({
 		"/bin",
 		"/sbin",
 		"/dev",
-		"/private/etc",
-		"/Library/Preferences",
 		worktree,
 		runtime,
 		...cliReads,
@@ -239,6 +238,7 @@ export async function startProxy({
 		fail("upstream URL contains unsupported components");
 	const inflight = new Set();
 	let chatRequestCount = 0;
+	let admittedChatRequests = 0;
 	let lastUpstreamStatus = 0;
 	let proxyRejectionCount = 0;
 	const incrementDiagnosticCount = (current) => Math.min(current + 1, 999999);
@@ -272,6 +272,13 @@ export async function startProxy({
 				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
 				return reject(response, 403);
 			}
+			// This check and increment run in one event-loop turn, so concurrent
+			// authenticated requests cannot cross the per-run funding bound.
+			if (admittedChatRequests >= MAX_CHAT_REQUESTS) {
+				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
+				return reject(response, 429);
+			}
+			admittedChatRequests += 1;
 			const transport = upstreamUrl.protocol === "https:" ? https : http;
 			// Preserve only the two client identity fields required by OpenCode Go.
 			// Node has already parsed headers; bound values again before forwarding.

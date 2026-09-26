@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	mkdirSync,
@@ -15,10 +15,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
 	formatOpenCodeGoBridgeDiagnostic,
+	MAX_CHAT_REQUESTS,
 	parseBridgeArgs,
 	runBridge,
+	seatbeltProfile,
 	startProxy,
 } from "../ops/simple-provider-keyless-bridge.mjs";
+import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
 
 const SECRET = "synthetic-real-api-key-bridge-123456";
 function setup() {
@@ -53,6 +56,130 @@ function post(port, path, nonce, model) {
 		body: JSON.stringify({ model }),
 	});
 }
+
+test("Seatbelt grants no broad host preferences or etc read", () => {
+	const profile = seatbeltProfile({
+		worktree: "/private/tmp/switchyard-simple-test/worktree",
+		runtime: "/private/tmp/switchyard-simple-test/runtime",
+		proxyPort: 12345,
+	});
+	assert.equal(profile.includes('(subpath "/private/etc")'), false);
+	assert.equal(profile.includes('(subpath "/Library/Preferences")'), false);
+});
+
+test("proxy admits at most the fixed request budget across concurrent calls", async () => {
+	let upstreamCalls = 0;
+	const upstream = await localServer((request, response) => {
+		upstreamCalls += 1;
+		request.resume();
+		response.writeHead(200, { "content-type": "application/json" });
+		response.end("{}");
+	});
+	const proxy = await startProxy({
+		target: "opencode-go",
+		model: "opencode-go/deepseek-v4.1-flash",
+		secret: SECRET,
+		upstream: upstream.url,
+	});
+	try {
+		const responses = await Promise.all(
+			Array.from({ length: MAX_CHAT_REQUESTS + 8 }, () =>
+				post(
+					proxy.port,
+					"/v1/chat/completions",
+					proxy.nonce,
+					"deepseek-v4.1-flash",
+				),
+			),
+		);
+		assert.equal(
+			responses.filter((response) => response.status === 200).length,
+			MAX_CHAT_REQUESTS,
+		);
+		assert.equal(
+			responses.filter((response) => response.status === 429).length,
+			8,
+		);
+		assert.equal(upstreamCalls, MAX_CHAT_REQUESTS);
+	} finally {
+		await proxy.close();
+		await upstream.close();
+	}
+});
+
+test("Switchyard teardown stops a detached CLI after bridge SIGKILL", async (t) => {
+	const check = spawnSync(
+		"/usr/bin/sandbox-exec",
+		[
+			"-p",
+			"(version 1) (deny default) (allow process*) (allow file-read*)",
+			"/usr/bin/true",
+		],
+		{ encoding: "utf8" },
+	);
+	if (check.status !== 0 && /Operation not permitted/u.test(check.stderr)) {
+		t.skip("host Seatbelt unavailable under outer sandbox");
+		return;
+	}
+	const item = setup();
+	const fake = join(item.worktree, "fake-cli");
+	writeFileSync(
+		fake,
+		"#!/bin/sh\nprintf '%s' \"$$\" > cli.pid\nexec sleep 30\n",
+		{ mode: 0o755 },
+	);
+	const launchedAt = Date.now();
+	const script = `import { runBridge } from ${JSON.stringify(new URL("../ops/simple-provider-keyless-bridge.mjs", import.meta.url).href)}; await runBridge({ target: "opencode-go", model: "opencode-go/deepseek-v4.1-flash", variant: "low", worktree: ${JSON.stringify(item.worktree)}, prompt: "synthetic", secret: ${JSON.stringify(SECRET)}, cliPath: ${JSON.stringify(fake)}, timeoutMs: 30000 });`;
+	const bridge = spawn(
+		process.execPath,
+		["--input-type=module", "-e", script],
+		{
+			cwd: item.worktree,
+			detached: true,
+			stdio: "ignore",
+		},
+	);
+	let cliPid = null;
+	try {
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			try {
+				cliPid = Number(readFileSync(join(item.worktree, "cli.pid"), "utf8"));
+				if (Number.isSafeInteger(cliPid) && cliPid > 1) break;
+			} catch {}
+			await new Promise((done) => setTimeout(done, 50));
+		}
+		assert.ok(cliPid, "detached CLI did not start");
+		process.kill(bridge.pid, "SIGKILL");
+		assert.equal(
+			await settleSimpleWriterProcesses({
+				processGroupId: bridge.pid,
+				processScopePath: item.worktree,
+				launchedAt,
+			}),
+			"stopped",
+		);
+		const probe = spawnSync("ps", ["-o", "stat=", "-p", String(cliPid)], {
+			encoding: "utf8",
+		});
+		assert.ok(
+			probe.status !== 0 || /^Z/u.test(probe.stdout.trim()),
+			"detached CLI survived teardown",
+		);
+	} finally {
+		if (bridge.pid) {
+			try {
+				process.kill(-bridge.pid, "SIGKILL");
+			} catch {}
+		}
+		if (cliPid) {
+			try {
+				process.kill(cliPid, "SIGKILL");
+			} catch {}
+		}
+		item.cleanup();
+	}
+});
 
 test("fixed invocation rejects unapproved target, model, variant, and clone", () => {
 	const item = setup();

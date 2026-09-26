@@ -1,0 +1,13 @@
+# Existing integration files. Each needs a behavior-preserving split across its
+# checkpoint, lifecycle, or fixture boundaries; splitting during a reliability
+# repair would enlarge the review surface beyond the tested behavior.
+src/switchyard/dispatch/index.mjs: CLI and dispatch lifecycle remain coupled to receipt state; split with a dedicated dispatch contract pass.
+src/switchyard/runner/index.mjs: Queue and broker state share checkpoint transitions; quick-check execution was extracted to runner/checks.mjs in this repair.
+src/switchyard/simple/index.mjs: Simple admission, worker teardown, and terminal receipts share one state machine; split after lifecycle stabilization.
+tests/detached-dispatch.test.mjs: Existing subprocess fixtures span launch and recovery protocols; split with their common fixture harness.
+tests/dispatch-cli.test.mjs: CLI scenarios share a large setup harness; split by command after fixture extraction.
+tests/router.test.mjs: Roster routing cases share fixture state; split by policy boundary with explicit isolation.
+tests/runner-broker-production.test.mjs: Broker production fixtures share reservation setup; split with a common fixture harness.
+tests/runner.test.mjs: Legacy queue scenarios share checkpoint fixtures; quick-check regressions were extracted to runner-quick-checks.test.mjs in this repair.
+tests/simple-dispatch.test.mjs: Simple lifecycle scenarios share host worktree fixtures; split after isolating fixture setup.
+tests/simple-provider-keyless-bridge.test.mjs: Bridge cases share Seatbelt and broker fixtures; split with the shared fixture setup.

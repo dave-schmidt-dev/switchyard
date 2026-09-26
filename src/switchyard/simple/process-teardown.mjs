@@ -268,7 +268,12 @@ export async function settleSimpleWriterProcesses({
 	launchedAt,
 	onProgress,
 }) {
-	const groupState = await settleProcessGroup(processGroupId, onProgress);
+	// A synchronous caller can hand this helper only a scoped root after its
+	// direct child has exited; the identity-checked cwd sweep still applies.
+	const groupState =
+		processGroupId == null
+			? "stopped"
+			: await settleProcessGroup(processGroupId, onProgress);
 	const scopeState = processScopePath
 		? await settleScopedProcesses(processScopePath, launchedAt, onProgress)
 		: "stopped";

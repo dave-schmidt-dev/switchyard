@@ -67,6 +67,7 @@ contract_gates:
   broker-executor-schema: {gate_test_status: not-run}
   outcome-schema-reducer: {gate_test_status: not-run}
   production-runner: {gate_test_status: not-run}
+  quick-checks: {gate_test_status: not-run}
   worker-bootstrap: {gate_test_status: not-run}
   dispatch-cli-counters: {gate_test_status: not-run}
   run-store: {gate_test_status: not-run}

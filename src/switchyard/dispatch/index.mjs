@@ -124,6 +124,7 @@ import {
 	deriveQueueDiagnostics,
 	getCheckpointPath,
 	getProjectRevision,
+	invalidCompletedQuickCheckTaskIds,
 	loadCheckpoint,
 	loadTaskQueue,
 	normalizeRunOptions,
@@ -2339,7 +2340,7 @@ function readCheckpointStateForRun(run) {
 	try {
 		const checkpointPath =
 			run.runOptions?.checkpointPath ?? getCheckpointPath(run.tasksFilePath);
-		return loadCheckpoint(
+		const checkpoint = loadCheckpoint(
 			checkpointPath,
 			run.tasksFilePath,
 			run.queueIdentity
@@ -2349,6 +2350,24 @@ function readCheckpointStateForRun(run) {
 					}
 				: null,
 		);
+		try {
+			const invalidIds = invalidCompletedQuickCheckTaskIds(
+				loadTaskQueue(run.tasksFilePath),
+				checkpoint,
+			);
+			if (invalidIds.length)
+				return {
+					...checkpoint,
+					quickCheckInvalidTaskIds: invalidIds,
+					completedTaskIds: checkpoint.completedTaskIds.filter(
+						(id) => !invalidIds.includes(id),
+					),
+				};
+		} catch {
+			// The ordinary observation path still reports a malformed queue as
+			// unavailable; it must not echo task text or parser diagnostics.
+		}
+		return checkpoint;
 	} catch {
 		// checkpoint exists but is corrupt/unreadable — degrade rather than
 		// failing an otherwise-healthy status/result read
@@ -2556,9 +2575,12 @@ function probeProviderProcess(run, { executionBackend, execFn } = {}) {
 async function buildStatusEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const outcomeProjection = projectOutcomeReader({ run, events });
-	const projectedRun = applyOutcomeProjection(run, outcomeProjection);
+	let projectedRun = applyOutcomeProjection(run, outcomeProjection);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
+	const quickCheckInvalid =
+		(checkpointState?.quickCheckInvalidTaskIds?.length ?? 0) > 0;
+	if (quickCheckInvalid) projectedRun = { ...projectedRun, state: "failed" };
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
 	const retryProjection = deriveRetryProjection(checkpointState);
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
@@ -2641,18 +2663,22 @@ async function buildStatusEnvelope(runId, run) {
 		snapshotStatus: run.snapshotStatus ?? null,
 		snapshotMtime: run.snapshotMtime ?? null,
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
-		completedCount:
-			outcomeProjection.reader === "reducer"
+		completedCount: quickCheckInvalid
+			? checkpointState.completedTaskIds.length
+			: outcomeProjection.reader === "reducer"
 				? (outcomeProjection.taskCounters?.completed ?? completedCount)
 				: completedCount,
-		failedCount:
-			outcomeProjection.reader === "reducer"
+		failedCount: quickCheckInvalid
+			? Math.max(1, failedCount)
+			: outcomeProjection.reader === "reducer"
 				? (outcomeProjection.taskCounters?.failed ?? failedCount)
 				: failedCount,
 		// Reconciled against the same artifacts channel `result` reports, so the
 		// two envelopes cannot disagree about whether a failure has an artifact.
 		lastFailure: reconcileFailureArtifactRef(
-			run.lastFailure ?? null,
+			quickCheckInvalid
+				? { errorKind: "check_failed", reasonCode: "check_failed" }
+				: (run.lastFailure ?? null),
 			await listArtifactRefs(runId),
 		),
 		lastReviewResult: run.lastReviewResult ?? null,
@@ -2729,9 +2755,12 @@ async function listArtifactRefs(runId) {
 async function buildResultEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const outcomeProjection = projectOutcomeReader({ run, events });
-	const projectedRun = applyOutcomeProjection(run, outcomeProjection);
+	let projectedRun = applyOutcomeProjection(run, outcomeProjection);
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
+	const quickCheckInvalid =
+		(checkpointState?.quickCheckInvalidTaskIds?.length ?? 0) > 0;
+	if (quickCheckInvalid) projectedRun = { ...projectedRun, state: "failed" };
 	const telemetry = deriveTelemetryFields(run, events, checkpointState);
 	const retryProjection = deriveRetryProjection(checkpointState);
 	const queueDiagnostics = readQueueDiagnosticsForRun(run, checkpointState);
@@ -2808,16 +2837,23 @@ async function buildResultEnvelope(runId, run) {
 		snapshotStatus: run.snapshotStatus ?? null,
 		snapshotMtime: run.snapshotMtime ?? null,
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
-		completedCount:
-			outcomeProjection.reader === "reducer"
+		completedCount: quickCheckInvalid
+			? checkpointState.completedTaskIds.length
+			: outcomeProjection.reader === "reducer"
 				? (outcomeProjection.taskCounters?.completed ?? completedCount)
 				: completedCount,
-		failedCount:
-			outcomeProjection.reader === "reducer"
+		failedCount: quickCheckInvalid
+			? Math.max(1, failedCount)
+			: outcomeProjection.reader === "reducer"
 				? (outcomeProjection.taskCounters?.failed ?? failedCount)
 				: failedCount,
 		lastFailure: projectFailureRemedy(
-			reconcileFailureArtifactRef(run.lastFailure ?? null, artifactRefs),
+			reconcileFailureArtifactRef(
+				quickCheckInvalid
+					? { errorKind: "check_failed", reasonCode: "check_failed" }
+					: (run.lastFailure ?? null),
+				artifactRefs,
+			),
 		),
 		lastReviewResult: run.lastReviewResult ?? null,
 		...retryProjection,
@@ -2827,7 +2863,15 @@ async function buildResultEnvelope(runId, run) {
 		updatedAt: run.updatedAt,
 		terminalSummary: {
 			...(run.terminalSummary ?? {}),
-			outcome: projectTerminalOutcome(projectedRun, outcomeProjection),
+			...(quickCheckInvalid
+				? {
+						completedTaskIds: checkpointState.completedTaskIds,
+						failedCount: Math.max(1, failedCount),
+					}
+				: {}),
+			outcome: quickCheckInvalid
+				? "failed_work"
+				: projectTerminalOutcome(projectedRun, outcomeProjection),
 		},
 		artifactRefs,
 		disposition,
@@ -2934,11 +2978,14 @@ async function handleResult(argv) {
 		const envelope = await buildResultEnvelope(runId, run);
 		console.log(JSON.stringify(envelope));
 
-		if (run.state === "succeeded" && isCleanupComplete(run.cleanupState)) {
+		if (
+			envelope.state === "succeeded" &&
+			isCleanupComplete(envelope.cleanupState)
+		) {
 			process.exitCode = 0;
 		} else if (
-			run.state === "deferred" &&
-			isCleanupComplete(run.cleanupState)
+			envelope.state === "deferred" &&
+			isCleanupComplete(envelope.cleanupState)
 		) {
 			process.exitCode = 6;
 		} else {
