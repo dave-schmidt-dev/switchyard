@@ -1542,6 +1542,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 				? "validation_failed"
 				: "policy_violation";
 		}
+		if (failureReason === "empty_diff") {
+			return "empty_diff";
+		}
 		if (
 			failureReason === "invalid_invocation" ||
 			failureReason === "predecessor_receipt_invalid" ||
@@ -1560,7 +1563,6 @@ export async function runSimpleTask(options, dependencies = {}) {
 			failureReason === "read_only_input_changed" ||
 			failureReason === "undeclared_paths_changed" ||
 			failureReason === "unsafe_diff" ||
-			failureReason === "empty_diff" ||
 			failureReason === "integration_failed"
 		) {
 			return "policy_violation";

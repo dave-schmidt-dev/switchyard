@@ -637,6 +637,113 @@ test("Vibe completion fails closed when persisted served alias differs", async (
 	}
 });
 
+test("Vibe auto-approves bash while OpenCode argv stays fixed", async (t) => {
+	const check = spawnSync(
+		"/usr/bin/sandbox-exec",
+		[
+			"-p",
+			"(version 1) (deny default) (allow process*) (allow file-read*)",
+			"/usr/bin/true",
+		],
+		{ encoding: "utf8" },
+	);
+	if (check.status !== 0 && /Operation not permitted/u.test(check.stderr)) {
+		t.skip("host Seatbelt unavailable under outer sandbox");
+		return;
+	}
+	const item = setup();
+	const fake = join(item.worktree, "fake-provider.sh");
+	writeFileSync(
+		fake,
+		`#!/bin/sh
+printf '%s\\n' "$@" > provider-argv.txt
+cat >/dev/null
+agent=""
+auto_approve=false
+previous=""
+for arg in "$@"; do
+	if [ "$previous" = "--agent" ]; then agent="$arg"; fi
+	if [ "$arg" = "--auto-approve" ]; then auto_approve=true; fi
+	previous="$arg"
+done
+if [ "$1" = "-p" ] && [ "$agent" = "accept-edits" ]; then
+	if [ "$auto_approve" != true ]; then
+		printf 'Allow bash? approval callback; bash effect cancelled\\n'
+		exit 0
+	fi
+	/bin/bash -c "printf 'approved edit\\n' > approval-edit.txt"
+	mkdir -p "$VIBE_HOME/logs/session/session_approval"
+	printf '{"config":{"active_model":"glm-5-3"}}' > "$VIBE_HOME/logs/session/session_approval/meta.json"
+fi
+`,
+		{ mode: 0o755 },
+	);
+	try {
+		const vibe = await runBridge({
+			target: "vibe",
+			model: "glm-5-3",
+			worktree: item.worktree,
+			prompt: "Use bash to create approval-edit.txt.",
+			secret: SECRET,
+			cliPath: fake,
+			timeoutMs: 5_000,
+		});
+		assert.equal(vibe.code, 0, vibe.stderr);
+		assert.equal(
+			readFileSync(join(item.worktree, "approval-edit.txt"), "utf8"),
+			"approved edit\n",
+		);
+		assert.deepEqual(
+			readFileSync(join(item.worktree, "provider-argv.txt"), "utf8")
+				.trimEnd()
+				.split("\n"),
+			[
+				"-p",
+				"--agent",
+				"accept-edits",
+				"--auto-approve",
+				"--trust",
+				"--workdir",
+				item.worktree,
+				"--max-turns",
+				"12",
+				"--output",
+				"json",
+			],
+		);
+
+		const opencode = await runBridge({
+			target: "opencode-go",
+			model: "opencode-go/deepseek-v4.1-flash",
+			variant: "low",
+			worktree: item.worktree,
+			prompt: "synthetic task",
+			secret: SECRET,
+			cliPath: fake,
+			timeoutMs: 5_000,
+		});
+		assert.equal(opencode.code, 0, opencode.stderr);
+		assert.deepEqual(
+			readFileSync(join(item.worktree, "provider-argv.txt"), "utf8")
+				.trimEnd()
+				.split("\n"),
+			[
+				"run",
+				"--pure",
+				"--agent",
+				"build",
+				"--auto",
+				"--variant",
+				"low",
+				"--model",
+				"opencode-go/deepseek-v4.1-flash",
+			],
+		);
+	} finally {
+		item.cleanup();
+	}
+});
+
 test("Vibe prompt EPIPE fails closed and removes its runtime", async (t) => {
 	const check = spawnSync(
 		"/usr/bin/sandbox-exec",

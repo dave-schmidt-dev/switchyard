@@ -122,6 +122,7 @@ export const PERSISTED_ERROR_KINDS = Object.freeze([
 	"integration_failed",
 	"required_paths_missing",
 	"undeclared_paths_touched",
+	"empty_diff",
 	"empty_required_diff",
 	"no_op_diff",
 	"manifest_review_required",

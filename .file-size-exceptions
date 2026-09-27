@@ -2,6 +2,7 @@
 # checkpoint, lifecycle, or fixture boundaries; splitting during a reliability
 # repair would enlarge the review surface beyond the tested behavior.
 src/switchyard/dispatch/index.mjs: CLI and dispatch lifecycle remain coupled to receipt state; split with a dedicated dispatch contract pass.
+src/switchyard/adapter/exec-error.mjs: This one-line persisted-error enum correction is small and coherent, while a split now would expand reliability-repair review risk.
 src/switchyard/runner/index.mjs: Queue and broker state share checkpoint transitions; quick-check execution was extracted to runner/checks.mjs in this repair.
 src/switchyard/simple/index.mjs: Simple admission, worker teardown, and terminal receipts share one state machine; split after lifecycle stabilization.
 tests/detached-dispatch.test.mjs: Existing subprocess fixtures span launch and recovery protocols; split with their common fixture harness.

@@ -571,6 +571,7 @@ export async function runBridge({
 				"-p",
 				"--agent",
 				"accept-edits",
+				"--auto-approve",
 				"--trust",
 				"--workdir",
 				worktree,

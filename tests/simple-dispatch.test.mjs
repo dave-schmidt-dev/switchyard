@@ -1857,6 +1857,7 @@ helper.unref();
 		retain(result, repo.projectPath);
 		strictEqual(result.status === "succeeded", false);
 		strictEqual(result.failureReason, "undeclared_paths_changed");
+		strictEqual(result.errorKind, "policy_violation");
 		strictEqual(result.failurePhase, "diff");
 		ok(result.partialWorktree);
 		strictEqual(readFileSync(checkPath, "utf8"), "#!/bin/sh\necho check\n");
@@ -3243,6 +3244,37 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(result.providerLifecycle?.exitCode, 0);
 			ok(result.partialWorktree);
 			strictEqual(existsSync(dirname(result.partialWorktree)), true);
+		});
+
+		it("persists empty successful provider output as empty_diff", async () => {
+			const repo = makeRepo();
+			const runId = "simple-empty-diff-durable";
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					taskId: "empty-diff-durable",
+					runId,
+					executeProvider: async () => ({
+						success: true,
+						code: 0,
+						writerLifecycle: "stopped",
+					}),
+				}),
+			);
+			retain(result, repo.projectPath);
+
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "empty_diff");
+			strictEqual(result.errorKind, "empty_diff");
+			strictEqual(result.failurePhase, "diff");
+			strictEqual(result.changedFiles.length, 0);
+
+			const record = await readRun(runId);
+			ok(record, "failed run must be durable in run-store");
+			strictEqual(record.state, "failed");
+			strictEqual(record.lastFailure?.errorKind, "empty_diff");
+			strictEqual(record.lastFailure?.reasonCode, "empty_diff");
+			strictEqual(record.lastFailure?.failurePhase, "diff");
 		});
 
 		it("persists named milestones while repetitive heartbeats are not persisted", async () => {
