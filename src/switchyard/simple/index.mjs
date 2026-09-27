@@ -1675,10 +1675,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (cleanupAttempted || !worktreeRoot) return !worktreeRoot;
 		cleanupAttempted = true;
 		try {
+			// Injected provider/check tests normally use the direct cleanup seam;
+			// a supplied cleanup function exercises the guarded path instead.
 			if (
-				dependencies.rmSync ||
-				dependencies.executeProvider ||
-				dependencies.runCheck
+				!dependencies.cleanupSimpleWorktree &&
+				(dependencies.rmSync ||
+					dependencies.executeProvider ||
+					dependencies.runCheck)
 			) {
 				const safeParent =
 					canonicalParent ??
@@ -1690,7 +1693,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 					force: true,
 				});
 			} else {
-				const outcome = await cleanupSimpleWorktree(
+				const outcome = await (
+					dependencies.cleanupSimpleWorktree ?? cleanupSimpleWorktree
+				)(
 					runId,
 					{
 						canonicalParent,

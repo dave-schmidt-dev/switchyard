@@ -92,9 +92,8 @@ export function listHeldPathsViaLsof(run = spawnSync) {
 	);
 }
 /**
- * Inspect every descendant without following links. A link or unreadable node
- * makes the candidate ineligible because its complete age and size are not
- * known.
+ * Inspect every descendant without following links. A symlink's own metadata
+ * is measurable with lstat; special nodes and unreadable entries fail closed.
  * @param {string} root
  * @returns {{newestMs:number,bytes:number}|null}
  */
@@ -114,8 +113,8 @@ function inspectSimpleTree(root, onProgress = () => {}) {
 			return null;
 		}
 		if (
-			stat.isSymbolicLink() ||
-			(!stat.isDirectory() && !stat.isFile()) ||
+			(current === root && !stat.isDirectory()) ||
+			(!stat.isDirectory() && !stat.isFile() && !stat.isSymbolicLink()) ||
 			(rootDevice !== null && rootDevice !== stat.dev)
 		)
 			return null;
@@ -311,8 +310,30 @@ function classifySimpleRun(candidatePath, rootStat, owner, runIndex, now) {
 	) {
 		return "record_mismatch";
 	}
-	if (worktree.state === "retained") return "retained";
 	const liveness = classifyRunLiveness(byId, { now });
+	if (worktree.state === "retained") {
+		// A retained salvage root needs the durable identity fields, not just a
+		// matching path and marker, before it can enter guarded collection.
+		if (
+			worktree.nonce == null ||
+			worktree.device == null ||
+			worktree.inode == null
+		)
+			return "retained";
+		const retainedMs =
+			typeof worktree.retainedAt === "string"
+				? Date.parse(worktree.retainedAt)
+				: NaN;
+		if (
+			!Number.isFinite(retainedMs) ||
+			new Date(retainedMs).toISOString() !== worktree.retainedAt ||
+			retainedMs > now - SIMPLE_ORPHAN_TTL_MS
+		)
+			return "retained";
+		return liveness === "dead" || liveness === "terminal_clean"
+			? "eligible"
+			: "retained";
+	}
 	return liveness === "dead" || liveness === "terminal_clean"
 		? "eligible"
 		: "active";

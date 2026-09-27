@@ -40,7 +40,10 @@ import {
 	simpleRouteFundingFailure,
 	simpleRouteIsFunded,
 } from "../src/switchyard/simple/index.mjs";
-import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
+import {
+	cleanupSimpleWorktree,
+	simpleQuarantinePath,
+} from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalTmpdirEnv = process.env.TMPDIR;
@@ -347,12 +350,20 @@ afterEach(() => {
 
 after(() => {
 	const ownQuarantineRoots = [];
+	const ownRealTmpRoots = [];
 	const runsDir = join(SUITE_TMPDIR, "run-store", "runs");
 	if (existsSync(runsDir)) {
 		for (const entry of readdirSync(runsDir)) {
 			const recordPath = join(runsDir, entry, "run.json");
 			if (!existsSync(recordPath)) continue;
 			const record = JSON.parse(readFileSync(recordPath, "utf8"));
+			const recordedPath = record.worktree?.path;
+			if (
+				typeof recordedPath === "string" &&
+				dirname(recordedPath) === ORIGINAL_REAL_TMPDIR &&
+				existsSync(recordedPath)
+			)
+				ownRealTmpRoots.push(recordedPath);
 			if (record.worktree?.nonce) {
 				const quarantine = simpleQuarantinePath(record.worktree.nonce);
 				if (existsSync(quarantine)) ownQuarantineRoots.push(quarantine);
@@ -385,9 +396,11 @@ after(() => {
 		/isolated simple tests leaked real temp roots/,
 	);
 
-	const finalRealTmpSimpleRoots =
-		listRealTmpSimpleDirectoryNames(ORIGINAL_REAL_TMPDIR);
-	assertNoLeakedSimpleRoots(initialRealTmpSimpleRoots, finalRealTmpSimpleRoots);
+	deepStrictEqual(
+		ownRealTmpRoots,
+		[],
+		"simple tests leaked owned real temp roots",
+	);
 	deepStrictEqual(
 		ownQuarantineRoots,
 		[],
@@ -3388,6 +3401,66 @@ print(json.dumps({"repository_identity":hashlib.sha256(str(common.resolve()).enc
 			strictEqual(run.worktree.canonicalParent, SUITE_TMPDIR);
 			strictEqual(run.worktree.state, "removed");
 			strictEqual(existsSync(run.worktree.path), false);
+		});
+
+		it("removes a successful root from the system temp directory through guarded cleanup", async () => {
+			const repo = makeRepo();
+			const runId = `simple-guarded-success-${Date.now()}`;
+			const statuses = [];
+			let ownedPath;
+			let ownedNonce;
+			try {
+				const result = await runSimpleTask(
+					options(repo),
+					dependencies({
+						runId,
+						tmpdir: ORIGINAL_REAL_TMPDIR,
+						cleanupSimpleWorktree,
+						onStatus: (status) => statuses.push(status),
+						updateRunWithRetry: async (id, patch) => {
+							if (
+								patch.worktree?.path &&
+								dirname(patch.worktree.path) === ORIGINAL_REAL_TMPDIR
+							)
+								ownedPath = patch.worktree.path;
+							if (patch.worktree?.nonce) ownedNonce = patch.worktree.nonce;
+							return updateRunWithRetry(id, patch);
+						},
+					}),
+				);
+				strictEqual(result.status, "succeeded");
+				const run = await readRun(runId);
+				strictEqual(run.cleanupState, "complete");
+				strictEqual(run.worktree.state, "removed");
+				strictEqual(dirname(ownedPath), ORIGINAL_REAL_TMPDIR);
+				strictEqual(existsSync(ownedPath), false);
+				strictEqual(existsSync(run.worktree.path), false);
+				ok(
+					statuses.some(
+						(status) => status.processPhase === "cleanup_quarantine_started",
+					),
+					"production guarded cleanup quarantined the root",
+				);
+				ok(
+					statuses.some(
+						(status) => status.processPhase === "cleanup_remove_started",
+					),
+					"production guarded cleanup removed the root",
+				);
+			} finally {
+				// A failing assertion must not leave this test's real TMPDIR root behind.
+				if (
+					ownedPath &&
+					dirname(ownedPath) === ORIGINAL_REAL_TMPDIR &&
+					/^switchyard-simple-[0-9a-f-]{36}$/u.test(basename(ownedPath))
+				)
+					rmSync(ownedPath, { recursive: true, force: true });
+				if (ownedNonce && /^[0-9a-f-]{36}$/u.test(ownedNonce)) {
+					const quarantine = simpleQuarantinePath(ownedNonce);
+					if (existsSync(quarantine))
+						rmSync(quarantine, { recursive: true, force: true });
+				}
+			}
 		});
 
 		it("retains allocation intent when mkdir fails without proving absence", async () => {

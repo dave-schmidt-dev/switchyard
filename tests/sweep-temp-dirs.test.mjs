@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
+	lutimesSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -120,6 +121,9 @@ function worktreeRecord(root, parent, nonce, state) {
 		candidateChild: basename(root),
 		path: realpathSync(root),
 		state,
+		...(state === "retained"
+			? { retainedAt: new Date(NOW - 2 * DAY).toISOString() }
+			: {}),
 		nonce,
 		device: String(stat.dev),
 		inode: String(stat.ino),
@@ -441,7 +445,7 @@ describe("sweep-temp-dirs", () => {
 		ok(report?.includes(`apparentBytes=${summary.apparentBytes}`));
 	});
 
-	it("keeps roots whose run records are active or retained", async () => {
+	it("keeps active roots and allows an old terminal retained root", async () => {
 		const parent = tempDir("switchyard-simple-orphan-run-state-");
 		const stateRoot = makeRunStore(parent);
 		const activeId = "simple-task-22222222-3333-4444-8555-666666666666";
@@ -486,13 +490,161 @@ describe("sweep-temp-dirs", () => {
 		strictEqual(status, 0);
 		deepStrictEqual(
 			[summary.skippedActive, summary.skippedRetained, summary.wouldRemove],
-			[3, 1, 0],
+			[3, 0, 1],
 		);
 		ok(
 			[active, retained, startup, unknown].every((root) =>
 				existsSync(root.root),
 			),
 		);
+	});
+
+	it("allows an old dead retained root with a symlink without following its target", async () => {
+		const parent = tempDir("switchyard-simple-orphan-retained-link-");
+		const stateRoot = makeRunStore(parent);
+		const retained = makeSimpleRoot(
+			parent,
+			"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+		);
+		const outside = join(parent, "outside.txt");
+		writeFileSync(outside, "outside remains");
+		const link = join(retained.root, "outside-link");
+		symlinkSync(outside, link);
+		const oldAt = new Date(NOW - SIMPLE_ORPHAN_TTL_MS - 1);
+		lutimesSync(link, oldAt, oldAt);
+		utimesSync(retained.root, oldAt, oldAt);
+		addRunRecord(
+			stateRoot,
+			retained.runId,
+			"failed",
+			worktreeRecord(retained.root, parent, retained.nonce, "retained"),
+			{
+				cleanupState: "pending",
+				workerPid: null,
+				createdAt: oldAt.toISOString(),
+			},
+		);
+		const { status, summary } = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[
+				status,
+				summary.wouldRemove,
+				summary.skippedRetained,
+				summary.skippedUnreadable,
+			],
+			[0, 1, 0, 0],
+		);
+		strictEqual(readFileSync(outside, "utf8"), "outside remains");
+		ok(existsSync(retained.root), "dry-run keeps the retained root");
+		lutimesSync(link, new Date(NOW), new Date(NOW));
+		const freshLink = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[freshLink.summary.skippedFresh, freshLink.summary.wouldRemove],
+			[1, 0],
+		);
+		lutimesSync(link, oldAt, oldAt);
+		const applied = await collectSimple(parent, stateRoot, { apply: true });
+		deepStrictEqual([applied.status, applied.summary.removed], [0, 1]);
+		strictEqual(existsSync(retained.root), false);
+		strictEqual(readFileSync(outside, "utf8"), "outside remains");
+	});
+
+	it("keeps an old retained tree until its retention is at least one day old", async () => {
+		const parent = tempDir("switchyard-simple-orphan-retention-age-");
+		const stateRoot = makeRunStore(parent);
+		const retained = makeSimpleRoot(
+			parent,
+			"eeeeeeee-ffff-4000-8111-222222222222",
+		);
+		const worktree = worktreeRecord(
+			retained.root,
+			parent,
+			retained.nonce,
+			"retained",
+		);
+		worktree.retainedAt = new Date(NOW - 60_000).toISOString();
+		addRunRecord(stateRoot, retained.runId, "failed", worktree);
+		const recent = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[
+				recent.status,
+				recent.summary.skippedRetained,
+				recent.summary.wouldRemove,
+			],
+			[0, 1, 0],
+		);
+		worktree.retainedAt = "not-a-date";
+		addRunRecord(stateRoot, retained.runId, "failed", worktree);
+		const malformed = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[
+				malformed.status,
+				malformed.summary.skippedRetained,
+				malformed.summary.wouldRemove,
+			],
+			[0, 1, 0],
+		);
+		ok(existsSync(retained.root));
+	});
+
+	it("refuses a retained root whose recorded inode no longer matches", async () => {
+		const parent = tempDir("switchyard-simple-orphan-retained-identity-");
+		const stateRoot = makeRunStore(parent);
+		const retained = makeSimpleRoot(
+			parent,
+			"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		);
+		const worktree = worktreeRecord(
+			retained.root,
+			parent,
+			retained.nonce,
+			"retained",
+		);
+		worktree.inode = String(BigInt(worktree.inode) + 1n);
+		addRunRecord(stateRoot, retained.runId, "failed", worktree);
+		const result = await collectSimple(parent, stateRoot, { apply: true });
+		deepStrictEqual(
+			[
+				result.status,
+				result.summary.skippedRecordMismatch,
+				result.summary.removed,
+			],
+			[0, 1, 0],
+		);
+		ok(existsSync(retained.root));
+	});
+
+	it("keeps retained roots with a live worker or incomplete durable identity", async () => {
+		const parent = tempDir("switchyard-simple-orphan-retained-guards-");
+		const stateRoot = makeRunStore(parent);
+		const live = makeSimpleRoot(parent, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa");
+		const legacy = makeSimpleRoot(
+			parent,
+			"dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb",
+		);
+		addRunRecord(
+			stateRoot,
+			live.runId,
+			"failed",
+			worktreeRecord(live.root, parent, live.nonce, "retained"),
+			{ cleanupState: "pending", workerPid: process.pid },
+		);
+		const incomplete = worktreeRecord(
+			legacy.root,
+			parent,
+			legacy.nonce,
+			"retained",
+		);
+		delete incomplete.nonce;
+		delete incomplete.device;
+		delete incomplete.inode;
+		addRunRecord(stateRoot, legacy.runId, "failed", incomplete);
+		const { status, summary } = await collectSimple(parent, stateRoot);
+		deepStrictEqual(
+			[status, summary.skippedRetained, summary.wouldRemove],
+			[0, 2, 0],
+		);
+		ok(existsSync(live.root) && existsSync(legacy.root));
 	});
 
 	it("allows an old active root after its recorded worker is proven dead", async () => {
