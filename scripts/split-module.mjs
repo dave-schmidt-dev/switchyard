@@ -784,7 +784,7 @@ function split({ source, spec }) {
 	}
 	writeFileSync(
 		source,
-		`${[...facadeTargetImports, ...facadeSiblingImports, ...facadeExports, ...facade].join("\n")}\n`,
+		`${[...facade, ...facadeTargetImports, ...facadeSiblingImports, ...facadeExports].join("\n")}\n`,
 	);
 }
 try {

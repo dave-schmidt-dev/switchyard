@@ -76,33 +76,28 @@ export function createTestChecker(shared) {
 		return true;
 	}
 
-	function indexBy(entries, key) {
-		const indexes = new Map();
-		for (const [index, entry] of entries.entries()) {
-			const value = entry[key];
-			const values = indexes.get(value) ?? [];
-			values.push(index);
-			indexes.set(value, values);
-		}
-		return indexes;
+	function scopedStatementKey(entry) {
+		return JSON.stringify([entry.text, entry.scope]);
+	}
+
+	function carriedEntryKey(entry) {
+		return entry.kind === "describe"
+			? JSON.stringify([entry.kind, entry.scope])
+			: JSON.stringify([entry.kind, entry.text, entry.scope]);
 	}
 
 	function carriedOrder(entries, baseEntries) {
-		const byText = indexBy(baseEntries, "text");
-		const describeByTitle = new Map();
+		const byEntry = new Map();
 		for (const [index, entry] of baseEntries.entries()) {
-			if (entry.kind !== "describe") continue;
-			const indexes = describeByTitle.get(entry.title) ?? [];
+			const key = carriedEntryKey(entry);
+			const indexes = byEntry.get(key) ?? [];
 			indexes.push(index);
-			describeByTitle.set(entry.title, indexes);
+			byEntry.set(key, indexes);
 		}
 		let previous = -1;
 		const used = new Set();
 		for (const entry of entries) {
-			const candidates =
-				entry.kind === "describe"
-					? describeByTitle.get(entry.title)
-					: byText.get(entry.text);
+			const candidates = byEntry.get(carriedEntryKey(entry));
 			if (!candidates) return false;
 			const index = candidates.find(
 				(candidate) => candidate >= previous && !used.has(candidate),
@@ -119,13 +114,19 @@ export function createTestChecker(shared) {
 	}
 
 	function missingCarriedStatement(baseEntries, partEntries, fixtureCounts) {
+		const required = new Map();
+		for (const entry of baseEntries) {
+			if (entry.kind !== "non-test") continue;
+			const key = scopedStatementKey(entry);
+			if (fixtureCounts.has(key)) continue;
+			const current = required.get(key) ?? { entry, count: 0 };
+			current.count += 1;
+			required.set(key, current);
+		}
 		for (const { entries } of partEntries) {
 			const tests = entries.filter((entry) => entry.kind === "test");
 			if (!tests.length) continue;
-			for (const entry of baseEntries.filter(
-				(item) => item.kind === "non-test",
-			)) {
-				if (fixtureCounts.has(entry.text)) continue;
+			for (const [key, { entry, count }] of required) {
 				const applies = entry.scope.length
 					? tests.some((test) =>
 							entry.scope.every((title, i) => test.scope[i] === title),
@@ -133,16 +134,13 @@ export function createTestChecker(shared) {
 					: isHook(entry) ||
 						entry.statementType === "ExpressionStatement" ||
 						entry.statementKind === "let";
-				if (
-					applies &&
-					!entries.some(
-						(item) =>
-							item.kind === "non-test" &&
-							item.text === entry.text &&
-							JSON.stringify(item.scope) === JSON.stringify(entry.scope),
-					)
-				)
-					return `${isHook(entry) ? "hook" : "state"} carried statement is missing from a part`;
+				if (!applies) continue;
+				const actual = entries.filter(
+					(item) =>
+						item.kind === "non-test" && scopedStatementKey(item) === key,
+				).length;
+				if (actual !== count)
+					return `${isHook(entry) ? "hook" : "state"} carried statement occurrence count differs in a part`;
 			}
 		}
 		return null;
@@ -163,7 +161,10 @@ export function createTestChecker(shared) {
 						'const __dirname = resolve(fileURLToPath(import.meta.url), "..", "..");',
 						'const __dirname = fileURLToPath(new URL("..", import.meta.url));',
 					].some((rebased) => text.includes(rebased)));
-			if (carried) counts.set(source, (counts.get(source) ?? 0) + 1);
+			if (carried) {
+				const key = JSON.stringify([source, []]);
+				counts.set(key, (counts.get(key) ?? 0) + 1);
+			}
 		}
 		return counts;
 	}
@@ -291,39 +292,45 @@ export function createTestChecker(shared) {
 		const baseNonTests = multiset(
 			baseEntries
 				.filter((entry) => entry.kind === "non-test")
-				.map((entry) => entry.text),
+				.map(scopedStatementKey),
 		);
 		const outputNonTests = multiset(
 			partEntries.flatMap(({ entries }) =>
 				entries
 					.filter((entry) => entry.kind === "non-test")
-					.map((entry) => entry.text),
+					.map(scopedStatementKey),
 			),
 		);
-		for (const [text, count] of baseNonTests)
+		for (const [key, count] of baseNonTests)
 			if (
-				(outputNonTests.get(text) ?? 0) + (fixtureCounts.get(text) ?? 0) <
+				(outputNonTests.get(key) ?? 0) + (fixtureCounts.get(key) ?? 0) <
 				count
 			)
 				fail(
 					errors,
 					"non-test carried statements do not cover the base multiset",
 				);
-		const baseTitles = new Set(
+		const baseDescribeScopes = new Set(
 			baseEntries
 				.filter((entry) => entry.kind === "describe")
-				.map((entry) => entry.title),
+				.map((entry) => JSON.stringify(entry.scope)),
 		);
 		for (const { file, entries } of partEntries) {
 			for (const entry of entries.filter((item) => item.kind === "describe")) {
-				if (!baseTitles.has(entry.title))
+				if (!baseDescribeScopes.has(JSON.stringify(entry.scope)))
 					fail(
 						errors,
-						`${relative(process.cwd(), file.path)}: describe title differs from base`,
+						`${relative(process.cwd(), file.path)}: describe scope differs from base`,
 					);
 			}
 			for (const entry of entries.filter((item) => item.kind === "non-test")) {
-				if (!baseEntries.some((baseEntry) => baseEntry.text === entry.text))
+				if (
+					!baseEntries.some(
+						(baseEntry) =>
+							baseEntry.kind === "non-test" &&
+							scopedStatementKey(baseEntry) === scopedStatementKey(entry),
+					)
+				)
 					fail(
 						errors,
 						`${relative(process.cwd(), file.path)}: repeated non-test statement differs from base`,

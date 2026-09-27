@@ -153,6 +153,19 @@ describe("check-seam-move module mode", () => {
 		const result = check(root);
 		strictEqual(result.status, 0, result.stderr);
 	});
+	it("keeps original façade imports before generated target imports", (t) => {
+		const root = fixture(
+			t,
+			'import "./external.mjs";\nexport const beta = 2;\n',
+		);
+		split(
+			root,
+			'import "./external.mjs";\nimport "./part.mjs";\nexport { beta } from "./part.mjs";\n',
+			{ "lib/part.mjs": "export const beta = 2;\n" },
+		);
+		const result = check(root);
+		strictEqual(result.status, 0, result.stderr);
+	});
 	it("rejects a configured target alias that changes the moved binding", (t) => {
 		const base = "export const beta = 2;\nexport const evil = 3;\n";
 		const root = fixture(t, base);
@@ -169,7 +182,7 @@ describe("check-seam-move module mode", () => {
 		);
 		split(
 			root,
-			'import "./part.mjs";\nexport { beta } from "./part.mjs";\nimport { parent } from "../parent.mjs";\nexport const alpha = 1;\n',
+			'import { parent } from "../parent.mjs";\nimport "./part.mjs";\nexport { beta } from "./part.mjs";\nexport const alpha = 1;\n',
 			{
 				"lib/part.mjs":
 					'import { parent } from "../parent.mjs";\nexport const beta = parent;\n',
@@ -177,6 +190,22 @@ describe("check-seam-move module mode", () => {
 		);
 		const result = check(root);
 		strictEqual(result.status, 0, result.stderr);
+	});
+	it("rejects an added binding from an existing import source", (t) => {
+		const root = fixture(
+			t,
+			'import { parent } from "../parent.mjs";\nexport const beta = parent;\n',
+		);
+		split(
+			root,
+			'import { parent } from "../parent.mjs";\nimport "./part.mjs";\nexport { beta } from "./part.mjs";\n',
+			{
+				"lib/part.mjs":
+					'import { evil as parent } from "../parent.mjs";\nexport const beta = parent;\n',
+			},
+		);
+		const result = check(root);
+		strictEqual(result.status, 1);
 	});
 
 	it("accepts a pre-existing export star", (t) => {
@@ -368,6 +397,35 @@ describe("check-seam-move module mode", () => {
 				);
 			},
 		],
+		[
+			"side-effecting default export moved ahead of an earlier kept effect",
+			(root) => {
+				const base =
+					'process.env.FLAG = "before";\nexport default sideEffect();\n';
+				write(root, SOURCE, base);
+				execFileSync("git", ["add", SOURCE], { cwd: root });
+				commit(root, "default export order");
+				split(
+					root,
+					'import "./part.mjs";\nexport { default } from "./part.mjs";\nprocess.env.FLAG = "before";\n',
+					{ "lib/part.mjs": "export default sideEffect();\n" },
+				);
+			},
+		],
+		[
+			"generated target import precedes an original external import",
+			(root) => {
+				const base = 'import "./external.mjs";\nexport const beta = 2;\n';
+				write(root, SOURCE, base);
+				execFileSync("git", ["add", SOURCE], { cwd: root });
+				commit(root, "external import order");
+				split(
+					root,
+					'import "./part.mjs";\nimport "./external.mjs";\nexport { beta } from "./part.mjs";\n',
+					{ "lib/part.mjs": "export const beta = 2;\n" },
+				);
+			},
+		],
 	]) {
 		it(`rejects a ${name}`, (t) => {
 			const root = validFixture(t);
@@ -375,6 +433,24 @@ describe("check-seam-move module mode", () => {
 			strictEqual(check(root).status, 1);
 		});
 	}
+	it("keeps default function and class declarations exempt from effect order", (t) => {
+		for (const declaration of [
+			"function moved() { return sideEffect(); }",
+			"class Moved { static { sideEffect(); } }",
+		]) {
+			const root = fixture(
+				t,
+				`process.env.FLAG = "before";\nexport default ${declaration}\n`,
+			);
+			split(
+				root,
+				'import "./part.mjs";\nexport { default } from "./part.mjs";\nprocess.env.FLAG = "before";\n',
+				{ "lib/part.mjs": `export default ${declaration}\n` },
+			);
+			const result = check(root);
+			strictEqual(result.status, 0, result.stderr);
+		}
+	});
 });
 
 const BASE_TEST = [
@@ -424,6 +500,77 @@ describe("check-seam-move test mode", () => {
 			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
 		});
 		strictEqual(result.status, 0, result.stderr);
+	});
+	it("accepts state and hook copies in each matching nested scope", (t) => {
+		const base = [
+			'import { describe, it, beforeEach } from "node:test";',
+			"let state = 0;",
+			'describe("outer", () => {',
+			"	beforeEach(() => { state = 0; });",
+			'	it("first", () => state);',
+			'	it("second", () => state);',
+			"});",
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTestParts(root, "", {
+			"tests/parts/first.mjs":
+				'let state = 0;\ndescribe("outer", () => { beforeEach(() => { state = 0; }); it("first", () => state); });\n',
+			"tests/parts/second.mjs":
+				'let state = 0;\ndescribe("outer", () => { beforeEach(() => { state = 0; }); it("second", () => state); });\n',
+		});
+		const result = checkTest(root, {
+			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
+		});
+		strictEqual(result.status, 0, result.stderr);
+	});
+	it("rejects a hook hoisted into an unrelated sibling describe", (t) => {
+		const base = [
+			'import { describe, it, beforeEach } from "node:test";',
+			"let state = 0;",
+			'describe("first", () => {',
+			"	beforeEach(() => { state = 0; });",
+			'	it("a", () => state);',
+			"});",
+			'describe("second", () => { it("b", () => state); });',
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTestParts(root, "", {
+			"tests/parts/first.mjs":
+				'let state = 0;\ndescribe("first", () => { beforeEach(() => { state = 0; }); it("a", () => state); });\n',
+			"tests/parts/second.mjs":
+				'let state = 0;\nbeforeEach(() => { state = 0; });\ndescribe("second", () => { it("b", () => state); });\n',
+		});
+		const result = checkTest(root, {
+			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
+		});
+		strictEqual(result.status, 1);
+	});
+	it("rejects a hook hoisted from a nested describe to its parent", (t) => {
+		const base = [
+			'import { describe, it, beforeEach } from "node:test";',
+			"let state = 0;",
+			'describe("outer", () => {',
+			'	describe("first", () => {',
+			"		beforeEach(() => { state = 0; });",
+			'		it("a", () => state);',
+			"	});",
+			'	describe("second", () => { it("b", () => state); });',
+			"});",
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTestParts(root, "", {
+			"tests/parts/first.mjs":
+				'let state = 0;\ndescribe("outer", () => { describe("first", () => { beforeEach(() => { state = 0; }); it("a", () => state); }); });\n',
+			"tests/parts/second.mjs":
+				'let state = 0;\ndescribe("outer", () => { beforeEach(() => { state = 0; }); describe("second", () => { it("b", () => state); }); });\n',
+		});
+		const result = checkTest(root, {
+			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
+		});
+		strictEqual(result.status, 1);
 	});
 	it("rejects a nested hook missing from one part", (t) => {
 		const base = [

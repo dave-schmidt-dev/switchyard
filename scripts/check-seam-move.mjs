@@ -117,6 +117,28 @@ function moduleSource(statement) {
 	);
 }
 
+function importBindingKey(specifier) {
+	const imported =
+		specifier.type === "ImportDefaultSpecifier"
+			? "default"
+			: specifier.type === "ImportNamespaceSpecifier"
+				? "*"
+				: (specifier.imported.name ?? specifier.imported.value);
+	return JSON.stringify([imported, specifier.local.name]);
+}
+
+function baseImportBindings(program) {
+	const imports = new Map();
+	for (const statement of program.body) {
+		if (statement.type !== "ImportDeclaration") continue;
+		const bindings = imports.get(statement.source.value) ?? new Set();
+		for (const specifier of statement.specifiers)
+			bindings.add(importBindingKey(specifier));
+		imports.set(statement.source.value, bindings);
+	}
+	return imports;
+}
+
 function exportsOf(program) {
 	const names = new Set();
 	for (const statement of program.body) {
@@ -197,6 +219,15 @@ function effectful(statement) {
 		statement.type === "ExportNamedDeclaration"
 			? statement.declaration
 			: statement;
+	if (declaration?.type === "ExportDefaultDeclaration") {
+		const value = declaration.declaration;
+		return ![
+			"FunctionDeclaration",
+			"FunctionExpression",
+			"ClassDeclaration",
+			"ClassExpression",
+		].includes(value?.type);
+	}
 	if (
 		!declaration ||
 		["FunctionDeclaration", "ClassDeclaration"].includes(declaration.type)
@@ -262,11 +293,17 @@ function inferredTargets(source, facade) {
 
 function addedModuleProblem(statement, file, targets, baseImports) {
 	const target = (source) => resolveSpecifier(file.path, source, targets);
-	if (statement.type === "ImportDeclaration")
-		return baseImports.has(statementText(file.text, statement)) ||
-			target(statement.source.value)
+	if (statement.type === "ImportDeclaration") {
+		const sourceBindings = baseImports.get(statement.source.value);
+		const copiedBindings =
+			sourceBindings &&
+			statement.specifiers.every((specifier) =>
+				sourceBindings.has(importBindingKey(specifier)),
+			);
+		return copiedBindings || target(statement.source.value)
 			? null
-			: "added import is not from a configured target";
+			: "added import is not from a configured target or copied base binding";
+	}
 	if (
 		statement.type === "ExportNamedDeclaration" &&
 		!statement.declaration &&
@@ -334,11 +371,7 @@ function checkModule(options) {
 		},
 	);
 	const base = parse(options.source, baseText);
-	const baseImports = new Set(
-		base.body
-			.filter((statement) => statement.type === "ImportDeclaration")
-			.map((statement) => statementText(baseText, statement)),
-	);
+	const baseImports = baseImportBindings(base);
 	const facadeText = readFileSync(sourcePath, "utf8");
 	const facade = parse(options.source, facadeText);
 	const configured = expectedTargets(options.source, options.expect);
@@ -372,29 +405,38 @@ function checkModule(options) {
 		remaining.set(item.text, list);
 	}
 	const carriedByFile = new Map();
+	const carriedByPosition = new Map();
 	for (const [path, file] of files) {
 		const carried = [];
+		const positioned = [];
 		for (const statement of file.program.body) {
 			const text = statementText(file.text, statement);
 			const occurrences = remaining.get(text);
-			if (occurrences?.length) carried.push(occurrences.shift());
-			else if (!allowedAddedSyntax(statement)) {
-				fail(
-					errors,
-					`${relative(process.cwd(), path)}: added non-carried declaration`,
-				);
+			if (occurrences?.length) {
+				const index = occurrences.shift();
+				carried.push(index);
+				positioned.push(index);
 			} else {
-				const problem = addedModuleProblem(
-					statement,
-					file,
-					targetPaths,
-					baseImports,
-				);
-				if (problem)
-					fail(errors, `${relative(process.cwd(), path)}: ${problem}`);
+				positioned.push(null);
+				if (!allowedAddedSyntax(statement)) {
+					fail(
+						errors,
+						`${relative(process.cwd(), path)}: added non-carried declaration`,
+					);
+				} else {
+					const problem = addedModuleProblem(
+						statement,
+						file,
+						targetPaths,
+						baseImports,
+					);
+					if (problem)
+						fail(errors, `${relative(process.cwd(), path)}: ${problem}`);
+				}
 			}
 		}
 		carriedByFile.set(path, carried);
+		carriedByPosition.set(path, positioned);
 		if (
 			carried.some((value, index) => index > 0 && value < carried[index - 1])
 		) {
@@ -404,6 +446,29 @@ function checkModule(options) {
 			);
 		}
 	}
+	const facadeCarriedPositions = carriedByPosition.get(sourcePath) ?? [];
+	const originalFacadeImports = [];
+	const generatedTargetImports = [];
+	for (const [index, statement] of facade.body.entries()) {
+		if (statement.type !== "ImportDeclaration") continue;
+		const carriedIndex = facadeCarriedPositions[index];
+		if (carriedIndex !== null && carriedIndex !== undefined) {
+			if (base.body[carriedIndex]?.type === "ImportDeclaration")
+				originalFacadeImports.push(index);
+			continue;
+		}
+		if (resolveSpecifier(sourcePath, statement.source.value, targetPaths))
+			generatedTargetImports.push(index);
+	}
+	if (
+		generatedTargetImports.some((addedIndex) =>
+			originalFacadeImports.some((originalIndex) => originalIndex > addedIndex),
+		)
+	)
+		fail(
+			errors,
+			"generated target imports precede preserved original façade imports",
+		);
 	for (const item of baseStatements) {
 		if ((remaining.get(item.text) ?? []).includes(item.index))
 			fail(errors, `dropped statement ${item.index + 1}`);
@@ -433,7 +498,7 @@ function checkModule(options) {
 			if (!specifier?.startsWith(".")) continue;
 			const imported = resolve(dirname(path), specifier);
 			if (
-				!baseImports.has(statementText(file.text, statement)) &&
+				!baseImports.has(specifier) &&
 				(relative(root, imported).startsWith(`..${sep}`) ||
 					imported === resolve(root, ".."))
 			) {

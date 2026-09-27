@@ -1,4 +1,4 @@
-import { strictEqual } from "node:assert/strict";
+import { deepStrictEqual, strictEqual } from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
 	mkdirSync,
@@ -53,6 +53,20 @@ function split(root, spec) {
 		{ cwd: root, encoding: "utf8" },
 	);
 	strictEqual(result.status, 0, result.stderr);
+}
+
+function runtimeTrace(root) {
+	const result = spawnSync(
+		process.execPath,
+		[
+			"--input-type=module",
+			"-e",
+			'globalThis.trace = []; await import("./lib/facade.mjs"); process.stdout.write(JSON.stringify(globalThis.trace));',
+		],
+		{ cwd: root, encoding: "utf8" },
+	);
+	strictEqual(result.status, 0, result.stderr);
+	return JSON.parse(result.stdout);
 }
 
 function check(root) {
@@ -155,6 +169,37 @@ describe("split-module", () => {
 			targets: { "lib/part.mjs": { names: ["left"] } },
 			facade: { keeps: [] },
 		});
+		const result = check(root);
+		strictEqual(result.status, 0, result.stderr);
+	});
+
+	it("preserves external import evaluation order across a module split", (t) => {
+		const root = fixture(
+			t,
+			[
+				'import "./first.mjs";',
+				'import "./second.mjs";',
+				'export const moved = (globalThis.trace.push("moved"), true);',
+				'export const kept = (globalThis.trace.push("kept"), true);',
+				"",
+			].join("\n"),
+		);
+		write(root, "lib/first.mjs", 'globalThis.trace.push("first");\n');
+		write(root, "lib/second.mjs", 'globalThis.trace.push("second");\n');
+		execFileSync("git", ["add", "lib/first.mjs", "lib/second.mjs"], {
+			cwd: root,
+		});
+		execFileSync("git", ["commit", "-qm", "side-effect imports"], {
+			cwd: root,
+		});
+		const before = runtimeTrace(root);
+
+		split(root, {
+			targets: { "lib/part.mjs": { names: ["moved"] } },
+			facade: { keeps: [] },
+		});
+
+		deepStrictEqual(runtimeTrace(root), before);
 		const result = check(root);
 		strictEqual(result.status, 0, result.stderr);
 	});
