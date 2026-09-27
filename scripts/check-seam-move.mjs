@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { parseSync } from "oxc-parser";
+import { createTestChecker } from "./check-seam-test.mjs";
 
 const PURE_CALLEES = new Set([
 	"Object.freeze",
@@ -105,6 +106,15 @@ function allowedAddedSyntax(statement) {
 
 function importSource(statement) {
 	return statement.type === "ImportDeclaration" ? statement.source.value : null;
+}
+
+function moduleSource(statement) {
+	return (
+		importSource(statement) ??
+		(statement.type === "ExportNamedDeclaration" && !statement.declaration
+			? statement.source?.value
+			: null)
+	);
 }
 
 function exportsOf(program) {
@@ -229,7 +239,7 @@ function inferredTargets(source, facade) {
 	while (todo.length) {
 		const current = todo.pop();
 		for (const statement of current.program.body) {
-			const specifier = importSource(statement);
+			const specifier = moduleSource(statement);
 			if (!specifier?.startsWith(".")) continue;
 			const path = resolve(dirname(current.path), specifier);
 			const candidates = [
@@ -250,260 +260,67 @@ function inferredTargets(source, facade) {
 	return [...targets];
 }
 
-function callName(statement) {
-	if (statement?.type !== "ExpressionStatement") return null;
-	const expression = statement.expression;
-	if (expression?.type !== "CallExpression") return null;
-	if (expression.callee.type === "Identifier") return expression.callee.name;
+function addedModuleProblem(statement, file, targets, baseImports) {
+	const target = (source) => resolveSpecifier(file.path, source, targets);
+	if (statement.type === "ImportDeclaration")
+		return baseImports.has(statementText(file.text, statement)) ||
+			target(statement.source.value)
+			? null
+			: "added import is not from a configured target";
 	if (
-		expression.callee.type === "MemberExpression" &&
-		expression.callee.object.type === "Identifier"
+		statement.type === "ExportNamedDeclaration" &&
+		!statement.declaration &&
+		statement.source
 	)
-		return expression.callee.object.name;
+		return target(statement.source.value)
+			? null
+			: "added re-export is not from a configured target";
 	return null;
 }
 
-function callbackBody(statement) {
-	const callback = statement.expression.arguments?.[1];
-	return callback?.body?.type === "BlockStatement" ? callback.body.body : [];
-}
-
-function titleOf(statement, text) {
-	const title = statement.expression.arguments?.[0];
-	if (typeof title?.value === "string") return title.value;
-	if (title?.type === "TemplateLiteral" && title.expressions.length === 0)
-		return title.quasis[0]?.value.cooked ?? title.quasis[0]?.value.raw;
-	return title ? statementText(text, title) : null;
-}
-
-function testStructure(program, text) {
-	const entries = [];
-	const visit = (body) => {
-		for (const statement of body) {
-			if (statement.type === "ImportDeclaration") continue;
-			const name = callName(statement);
-			const entry = {
-				kind: ["it", "test"].includes(name)
-					? "test"
-					: name === "describe"
-						? "describe"
-						: "non-test",
-				text: statementText(text, statement),
-			};
-			if (entry.kind === "describe") entry.title = titleOf(statement, text);
-			entries.push(entry);
-			if (entry.kind === "describe") visit(callbackBody(statement));
-		}
-	};
-	visit(program.body);
-	return entries;
-}
-
-function multiset(values) {
-	const counts = new Map();
-	for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
-	return counts;
-}
-
-function sameMultiset(left, right) {
-	if (left.size !== right.size) return false;
-	for (const [value, count] of left) {
-		if (right.get(value) !== count) return false;
+function facadeExportProblem(facade, targets, files, baseStatements, carried) {
+	const imports = new Map(),
+		baseTexts = new Set(baseStatements.map((item) => item.text));
+	for (const item of facade.program.body) {
+		if (item.type !== "ImportDeclaration") continue;
+		const target = resolveSpecifier(facade.path, item.source.value, targets);
+		for (const specifier of item.specifiers)
+			if (target)
+				imports.set(specifier.local.name, {
+					target,
+					name:
+						specifier.type === "ImportSpecifier"
+							? (specifier.imported.name ?? specifier.imported.value)
+							: "default",
+				});
 	}
-	return true;
-}
-
-function indexBy(entries, key) {
-	const indexes = new Map();
-	for (const [index, entry] of entries.entries()) {
-		const value = entry[key];
-		const values = indexes.get(value) ?? [];
-		values.push(index);
-		indexes.set(value, values);
-	}
-	return indexes;
-}
-
-function carriedOrder(entries, baseEntries) {
-	const byText = indexBy(baseEntries, "text");
-	const describeByTitle = new Map();
-	for (const [index, entry] of baseEntries.entries()) {
-		if (entry.kind !== "describe") continue;
-		const indexes = describeByTitle.get(entry.title) ?? [];
-		indexes.push(index);
-		describeByTitle.set(entry.title, indexes);
-	}
-	let previous = -1;
-	for (const entry of entries) {
-		const candidates =
-			entry.kind === "describe"
-				? describeByTitle.get(entry.title)
-				: byText.get(entry.text);
-		if (!candidates) return false;
-		const index = candidates.find((candidate) => candidate >= previous);
-		if (index === undefined) return false;
-		previous = index;
-	}
-	return true;
-}
-
-function fixtureImportsAreExported(file, fixturePath, fixtureExports, errors) {
-	for (const statement of file.program.body) {
-		if (statement.type !== "ImportDeclaration") continue;
+	for (const item of facade.program.body) {
 		if (
-			resolveSpecifier(file.path, statement.source.value, [fixturePath]) !==
-			fixturePath
+			item.type !== "ExportNamedDeclaration" ||
+			item.declaration ||
+			baseTexts.has(statementText(facade.text, item))
 		)
 			continue;
-		for (const specifier of statement.specifiers) {
-			if (specifier.type === "ImportNamespaceSpecifier") {
-				fail(
-					errors,
-					`${relative(process.cwd(), file.path)}: fixture namespace import is not allowed`,
-				);
-				continue;
-			}
-			const imported =
-				specifier.type === "ImportDefaultSpecifier"
-					? "default"
-					: (specifier.imported.name ?? specifier.imported.value);
-			if (!fixtureExports.has(imported))
-				fail(
-					errors,
-					`${relative(process.cwd(), file.path)}: fixture import ${imported} is not exported`,
-				);
+		const target =
+			item.source && resolveSpecifier(facade.path, item.source.value, targets);
+		for (const specifier of item.specifiers) {
+			const name = specifier.exported.name ?? specifier.exported.value;
+			const binding = item.source
+				? { target, name: specifier.local.name ?? specifier.local.value }
+				: imports.get(specifier.local.name ?? specifier.local.value);
+			const module = binding?.target && files.get(binding.target);
+			if (
+				binding?.name !== name ||
+				!module ||
+				!exportsOf(module.program).includes(name) ||
+				!(carried.get(binding.target) ?? []).some((index) =>
+					baseStatements[index].exports.includes(name),
+				)
+			)
+				return "façade re-export does not preserve the moved binding";
 		}
 	}
-}
-
-function isDirnameDeclaration(statement) {
-	return (
-		statement.type === "VariableDeclaration" &&
-		statement.declarations.some((item) => item.id?.name === "__dirname")
-	);
-}
-
-function allowedDirnameRebase(baseText, fixtureText) {
-	const rewrites = [
-		[
-			'resolve(fileURLToPath(import.meta.url), "..")',
-			'resolve(fileURLToPath(import.meta.url), "..", "..")',
-		],
-		[
-			'fileURLToPath(new URL(".", import.meta.url))',
-			'fileURLToPath(new URL("..", import.meta.url))',
-		],
-	];
-	return rewrites.some(
-		([from, to]) =>
-			baseText.includes(from) && baseText.replace(from, to) === fixtureText,
-	);
-}
-
-function checkFixturePins(options, base, fixture, errors) {
-	if (
-		!options.fixture ||
-		!/^tests\/helpers\/[^/]+-fixtures\.mjs$/u.test(options.fixture)
-	)
-		return;
-	for (const statement of fixture.program.body) {
-		const text = statementText(fixture.text, statement);
-		if (!text.includes("import.meta") && !text.includes("__filename")) continue;
-		const rebased = base.program.body.some(
-			(baseStatement) =>
-				isDirnameDeclaration(baseStatement) &&
-				isDirnameDeclaration(statement) &&
-				allowedDirnameRebase(statementText(base.text, baseStatement), text),
-		);
-		if (!rebased)
-			fail(
-				errors,
-				`${options.fixture}: fixture pin must be a sanctioned __dirname rebase`,
-			);
-	}
-}
-
-function checkTest(options) {
-	const errors = [];
-	const sourcePath = resolve(options.source);
-	const baseText = execFileSync(
-		"git",
-		["show", `${options.base}:${options.source}`],
-		{
-			encoding: "utf8",
-		},
-	);
-	const base = { text: baseText, program: parse(options.source, baseText) };
-	const paths = [sourcePath, ...options.parts.map((path) => resolve(path))];
-	const files = [];
-	for (const path of paths) {
-		if (!existsSync(path)) {
-			fail(errors, `missing test part: ${relative(process.cwd(), path)}`);
-			continue;
-		}
-		const text = readFileSync(path, "utf8");
-		files.push({ path, text, program: parse(path, text) });
-	}
-	const baseEntries = testStructure(base.program, base.text);
-	const partEntries = files.map((file) => ({
-		file,
-		entries: testStructure(file.program, file.text),
-	}));
-	const baseTests = baseEntries.filter((entry) => entry.kind === "test");
-	const outputTests = partEntries.flatMap(({ entries }) =>
-		entries.filter((entry) => entry.kind === "test"),
-	);
-	if (
-		!sameMultiset(
-			multiset(baseTests.map((entry) => entry.text)),
-			multiset(outputTests.map((entry) => entry.text)),
-		)
-	)
-		fail(errors, "it/test calls do not match the base multiset");
-	const baseTitles = new Set(
-		baseEntries
-			.filter((entry) => entry.kind === "describe")
-			.map((entry) => entry.title),
-	);
-	for (const { file, entries } of partEntries) {
-		for (const entry of entries.filter((item) => item.kind === "describe")) {
-			if (!baseTitles.has(entry.title))
-				fail(
-					errors,
-					`${relative(process.cwd(), file.path)}: describe title differs from base`,
-				);
-		}
-		for (const entry of entries.filter((item) => item.kind === "non-test")) {
-			if (!baseEntries.some((baseEntry) => baseEntry.text === entry.text))
-				fail(
-					errors,
-					`${relative(process.cwd(), file.path)}: repeated non-test statement differs from base`,
-				);
-		}
-		if (!carriedOrder(entries, baseEntries))
-			fail(
-				errors,
-				`${relative(process.cwd(), file.path)}: carried statements are out of source order`,
-			);
-	}
-	if (options.fixture) {
-		const fixturePath = resolve(options.fixture);
-		if (!existsSync(fixturePath))
-			fail(errors, `missing fixture: ${options.fixture}`);
-		else {
-			const text = readFileSync(fixturePath, "utf8");
-			const fixture = {
-				path: fixturePath,
-				text,
-				program: parse(fixturePath, text),
-			};
-			const fixtureExports = new Set(exportsOf(fixture.program));
-			for (const file of files)
-				fixtureImportsAreExported(file, fixturePath, fixtureExports, errors);
-			checkFixturePins(options, base, fixture, errors);
-		}
-	}
-	return errors;
+	return null;
 }
 
 function checkModule(options) {
@@ -517,10 +334,10 @@ function checkModule(options) {
 		},
 	);
 	const base = parse(options.source, baseText);
-	const baseImportSources = new Set(
+	const baseImports = new Set(
 		base.body
 			.filter((statement) => statement.type === "ImportDeclaration")
-			.map((statement) => statement.source.value),
+			.map((statement) => statementText(baseText, statement)),
 	);
 	const facadeText = readFileSync(sourcePath, "utf8");
 	const facade = parse(options.source, facadeText);
@@ -545,6 +362,7 @@ function checkModule(options) {
 	const baseStatements = base.body.map((statement, index) => ({
 		index,
 		text: statementText(baseText, statement),
+		exports: exportsOf({ body: [statement] }),
 		effectful: effectful(statement),
 	}));
 	const remaining = new Map();
@@ -565,6 +383,15 @@ function checkModule(options) {
 					errors,
 					`${relative(process.cwd(), path)}: added non-carried declaration`,
 				);
+			} else {
+				const problem = addedModuleProblem(
+					statement,
+					file,
+					targetPaths,
+					baseImports,
+				);
+				if (problem)
+					fail(errors, `${relative(process.cwd(), path)}: ${problem}`);
 			}
 		}
 		carriedByFile.set(path, carried);
@@ -581,6 +408,14 @@ function checkModule(options) {
 		if ((remaining.get(item.text) ?? []).includes(item.index))
 			fail(errors, `dropped statement ${item.index + 1}`);
 	}
+	const exportProblem = facadeExportProblem(
+		files.get(sourcePath),
+		targetPaths,
+		files,
+		baseStatements,
+		carriedByFile,
+	);
+	if (exportProblem) fail(errors, exportProblem);
 	for (const [text, indexes] of remaining) {
 		if (indexes.length === 0) continue;
 		if (!baseStatements.some((item) => item.text === text))
@@ -598,7 +433,7 @@ function checkModule(options) {
 			if (!specifier?.startsWith(".")) continue;
 			const imported = resolve(dirname(path), specifier);
 			if (
-				!baseImportSources.has(specifier) &&
+				!baseImports.has(statementText(file.text, statement)) &&
 				(relative(root, imported).startsWith(`..${sep}`) ||
 					imported === resolve(root, ".."))
 			) {
@@ -614,9 +449,9 @@ function checkModule(options) {
 		graph.set(
 			path,
 			file.program.body
-				.filter((statement) => statement.type === "ImportDeclaration")
+				.filter((statement) => moduleSource(statement))
 				.map((statement) =>
-					resolveSpecifier(path, statement.source.value, [...files.keys()]),
+					resolveSpecifier(path, moduleSource(statement), [...files.keys()]),
 				)
 				.filter(Boolean),
 		);
@@ -656,6 +491,14 @@ function checkModule(options) {
 	}
 	return errors;
 }
+
+const checkTest = createTestChecker({
+	fail,
+	parse,
+	resolveSpecifier,
+	statementText,
+	exportsOf,
+});
 
 try {
 	const options = argumentsFrom(process.argv.slice(2));

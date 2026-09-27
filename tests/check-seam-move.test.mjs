@@ -115,6 +115,12 @@ function splitTest(root, facade, part) {
 	write(root, TEST_PART, part);
 }
 
+function splitTestParts(root, facade, parts) {
+	write(root, TEST_SOURCE, facade);
+	for (const [path, contents] of Object.entries(parts))
+		write(root, path, contents);
+}
+
 const BASE = `export const alpha = 1;
 export const beta = 2;
 console.log(alpha);
@@ -136,6 +142,25 @@ describe("check-seam-move module mode", () => {
 	it("accepts a correct split", (t) => {
 		const result = check(validFixture(t));
 		strictEqual(result.status, 0, result.stderr);
+	});
+	it("accepts a direct re-export from a configured target", (t) => {
+		const root = fixture(t, BASE);
+		split(
+			root,
+			'import "./part.mjs";\nexport { beta } from "./part.mjs";\nexport const alpha = 1;\nconsole.log(alpha);\n',
+			{ "lib/part.mjs": VALID_TARGET },
+		);
+		const result = check(root);
+		strictEqual(result.status, 0, result.stderr);
+	});
+	it("rejects a configured target alias that changes the moved binding", (t) => {
+		const base = "export const beta = 2;\nexport const evil = 3;\n";
+		const root = fixture(t, base);
+		split(root, 'import "./part.mjs";\nexport { evil as beta, evil };\n', {
+			"lib/part.mjs": base,
+		});
+		const result = check(root);
+		strictEqual(result.status, 1);
 	});
 	it("accepts a copied parent import from the base source", (t) => {
 		const root = fixture(
@@ -218,6 +243,28 @@ describe("check-seam-move module mode", () => {
 					`import { beta } from "./part.mjs";\nexport * from "./part.mjs";\nexport const alpha = 1;\nconsole.log(alpha);\n`,
 					{ "lib/part.mjs": VALID_TARGET },
 				),
+		],
+		[
+			"forged import binding from an arbitrary module",
+			(root) => {
+				split(
+					root,
+					'import "./part.mjs";\nimport { beta } from "./decoy.mjs";\nexport { beta };\nexport const alpha = 1;\nconsole.log(alpha);\n',
+					{ "lib/part.mjs": VALID_TARGET },
+				);
+				write(root, "lib/decoy.mjs", "export const beta = 2;\n");
+			},
+		],
+		[
+			"forged re-export from an arbitrary module",
+			(root) => {
+				split(
+					root,
+					'import "./part.mjs";\nexport { beta } from "./decoy.mjs";\nexport const alpha = 1;\nconsole.log(alpha);\n',
+					{ "lib/part.mjs": VALID_TARGET },
+				);
+				write(root, "lib/decoy.mjs", "export const beta = 2;\n");
+			},
 		],
 		[
 			"import cycle",
@@ -357,6 +404,85 @@ describe("check-seam-move test mode", () => {
 		splitTest(root, TEST_FACADE, TEST_PART_CONTENTS);
 		const result = checkTest(root);
 		strictEqual(result.status, 0, result.stderr);
+	});
+	it("accepts identical state carried into separate parts", (t) => {
+		const base = [
+			'import { describe, it } from "node:test";',
+			"const helper = 1;",
+			'describe("first", () => { it("a", () => helper); });',
+			'describe("second", () => { it("b", () => helper); });',
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTestParts(root, "", {
+			"tests/parts/first.mjs":
+				'const helper = 1;\ndescribe("first", () => { it("a", () => helper); });\n',
+			"tests/parts/second.mjs":
+				'const helper = 1;\ndescribe("second", () => { it("b", () => helper); });\n',
+		});
+		const result = checkTest(root, {
+			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
+		});
+		strictEqual(result.status, 0, result.stderr);
+	});
+	it("rejects a nested hook missing from one part", (t) => {
+		const base = [
+			'import { describe, it, beforeEach } from "node:test";',
+			"let state = 0;",
+			'describe("group", () => {',
+			"\tbeforeEach(() => { state = 0; });",
+			'\tit("first", () => state);',
+			'\tit("second", () => state);',
+			"});",
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTestParts(root, "", {
+			"tests/parts/first.mjs":
+				'let state = 0;\ndescribe("group", () => { beforeEach(() => { state = 0; }); it("first", () => state); });\n',
+			"tests/parts/second.mjs":
+				'let state = 0;\ndescribe("group", () => { it("second", () => state); });\n',
+		});
+		const result = checkTest(root, {
+			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
+		});
+		strictEqual(result.status, 1);
+	});
+	it("rejects a duplicated hook within one part", (t) => {
+		const base = [
+			'import { describe, it, beforeEach } from "node:test";',
+			"let state = 0;",
+			"beforeEach(() => { state = 0; });",
+			'describe("group", () => { it("first", () => state); });',
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTest(
+			root,
+			"",
+			'let state = 0;\nbeforeEach(() => { state = 0; });\nbeforeEach(() => { state = 0; });\ndescribe("group", () => { it("first", () => state); });\n',
+		);
+		strictEqual(checkTest(root).status, 1);
+	});
+	it("rejects state omitted from one part even when another carries it", (t) => {
+		const base = [
+			'import { describe, it } from "node:test";',
+			"let state = 0;",
+			'describe("first", () => { it("a", () => state); });',
+			'describe("second", () => { it("b", () => state); });',
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTestParts(root, "", {
+			"tests/parts/first.mjs":
+				'let state = 0;\ndescribe("first", () => { it("a", () => state); });\n',
+			"tests/parts/second.mjs":
+				'describe("second", () => { it("b", () => state); });\n',
+		});
+		const result = checkTest(root, {
+			parts: ["tests/parts/first.mjs", "tests/parts/second.mjs"],
+		});
+		strictEqual(result.status, 1);
 	});
 
 	for (const [name, contents] of [
