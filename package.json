@@ -19,6 +19,7 @@
 		"test:mutation:contracts": "node scripts/run-incident-mutations.mjs",
 		"lint": "biome check .",
 		"deadcode": "knip",
+		"check:seams": "node scripts/check-seam-move.mjs",
 		"check:size": "node scripts/check-file-size.mjs --all",
 		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",
 		"validate": "node scripts/run-validate-phases.mjs",
@@ -32,6 +33,7 @@
 		"@biomejs/biome": "^2.5.2",
 		"fast-check": "^4.9.0",
 		"husky": "^9.1.7",
-		"knip": "^6.24.0"
+		"knip": "^6.24.0",
+		"oxc-parser": "0.137.0"
 	}
 }
