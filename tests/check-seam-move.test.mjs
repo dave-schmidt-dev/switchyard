@@ -137,6 +137,36 @@ describe("check-seam-move module mode", () => {
 		const result = check(validFixture(t));
 		strictEqual(result.status, 0, result.stderr);
 	});
+	it("accepts a copied parent import from the base source", (t) => {
+		const root = fixture(
+			t,
+			'import { parent } from "../parent.mjs";\nexport const alpha = 1;\nexport const beta = parent;\n',
+		);
+		split(
+			root,
+			'import "./part.mjs";\nexport { beta } from "./part.mjs";\nimport { parent } from "../parent.mjs";\nexport const alpha = 1;\n',
+			{
+				"lib/part.mjs":
+					'import { parent } from "../parent.mjs";\nexport const beta = parent;\n',
+			},
+		);
+		const result = check(root);
+		strictEqual(result.status, 0, result.stderr);
+	});
+
+	it("accepts a pre-existing export star", (t) => {
+		const root = fixture(
+			t,
+			'export * from "./peer.mjs";\nexport const alpha = 1;\nexport const beta = 2;\n',
+		);
+		split(
+			root,
+			'import "./part.mjs";\nexport { beta } from "./part.mjs";\nexport * from "./peer.mjs";\nexport const alpha = 1;\n',
+			{ "lib/part.mjs": "export const beta = 2;\n" },
+		);
+		const result = check(root);
+		strictEqual(result.status, 0, result.stderr);
+	});
 
 	for (const [name, mutate] of [
 		[

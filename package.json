@@ -20,6 +20,7 @@
 		"lint": "biome check .",
 		"deadcode": "knip",
 		"check:seams": "node scripts/check-seam-move.mjs",
+		"split:module": "node scripts/split-module.mjs",
 		"check:size": "node scripts/check-file-size.mjs --all",
 		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",
 		"validate": "node scripts/run-validate-phases.mjs",

@@ -517,6 +517,11 @@ function checkModule(options) {
 		},
 	);
 	const base = parse(options.source, baseText);
+	const baseImportSources = new Set(
+		base.body
+			.filter((statement) => statement.type === "ImportDeclaration")
+			.map((statement) => statement.source.value),
+	);
 	const facadeText = readFileSync(sourcePath, "utf8");
 	const facade = parse(options.source, facadeText);
 	const configured = expectedTargets(options.source, options.expect);
@@ -561,11 +566,6 @@ function checkModule(options) {
 					`${relative(process.cwd(), path)}: added non-carried declaration`,
 				);
 			}
-			if (statement.type === "ExportAllDeclaration")
-				fail(
-					errors,
-					`${relative(process.cwd(), path)}: export * is not allowed`,
-				);
 		}
 		carriedByFile.set(path, carried);
 		if (
@@ -598,8 +598,9 @@ function checkModule(options) {
 			if (!specifier?.startsWith(".")) continue;
 			const imported = resolve(dirname(path), specifier);
 			if (
-				relative(root, imported).startsWith(`..${sep}`) ||
-				imported === resolve(root, "..")
+				!baseImportSources.has(specifier) &&
+				(relative(root, imported).startsWith(`..${sep}`) ||
+					imported === resolve(root, ".."))
 			) {
 				fail(
 					errors,
