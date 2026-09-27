@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	loadContractGateManifest,
@@ -137,14 +139,95 @@ export function parseCoverageReport(
 	);
 }
 
+function coveragePath(path, root) {
+	const absolute = isAbsolute(path) ? path : resolve(root, path);
+	return relative(root, absolute).split(sep).join("/");
+}
+
+function percentage(hit, found) {
+	return found === 0 ? 100 : (hit / found) * 100;
+}
+
+/** Parse native Node's lcov output and aggregate each façade with its members. */
+export function parseLcovCoverageReport(
+	output,
+	modules = CRITICAL_MODULE_COVERAGE,
+	root = process.cwd(),
+) {
+	const records = new Map();
+	let record = null;
+	const finishRecord = () => {
+		if (!record?.source) return;
+		const path = coveragePath(record.source, root);
+		const totals = record.totals;
+		if (Object.values(totals).some((value) => value === null)) {
+			records.set(path, null);
+			return;
+		}
+		// Node emits repeated SF records across test workers. The text reporter
+		// exposes the final row per path, so retain the same last-row semantics.
+		records.set(path, totals);
+	};
+	for (const line of String(output).split(/\r?\n/u)) {
+		if (line.startsWith("SF:")) {
+			finishRecord();
+			record = {
+				source: line.slice(3).trim(),
+				totals: {
+					LF: null,
+					LH: null,
+					BRF: null,
+					BRH: null,
+					FNF: null,
+					FNH: null,
+				},
+			};
+			continue;
+		}
+		if (line === "end_of_record") {
+			finishRecord();
+			record = null;
+			continue;
+		}
+		const match = line.match(/^(LF|LH|BRF|BRH|FNF|FNH):(\d+)$/u);
+		if (record && match) record.totals[match[1]] = Number(match[2]);
+	}
+	finishRecord();
+
+	return Object.fromEntries(
+		modules.map((module) => {
+			const paths = [...new Set([module.path, ...(module.members ?? [])])];
+			const memberRecords = paths.map((path) =>
+				records.get(coveragePath(path, root)),
+			);
+			if (memberRecords.some((entry) => !entry)) return [module.path, null];
+			const totals = memberRecords.reduce(
+				(sum, entry) => {
+					for (const key of Object.keys(sum)) sum[key] += entry[key];
+					return sum;
+				},
+				{ LF: 0, LH: 0, BRF: 0, BRH: 0, FNF: 0, FNH: 0 },
+			);
+			return [
+				module.path,
+				{
+					lines: percentage(totals.LH, totals.LF),
+					branches: percentage(totals.BRH, totals.BRF),
+					functions: percentage(totals.FNH, totals.FNF),
+				},
+			];
+		}),
+	);
+}
+
 /** Resolve the mapped suites for critical modules and reject missing coverage. */
 export function criticalCoveragePlan(root = process.cwd()) {
 	const manifest = loadContractGateManifest(root);
 	const ledger = loadLedgerGateMapping(root);
 	validateContractGateMapping({ manifest, ledger, root });
 	const suites = suitesForOwners(
-		CRITICAL_MODULE_COVERAGE.flatMap(({ path }) => {
-			const owners = ownersForPaths(manifest, [path]);
+		CRITICAL_MODULE_COVERAGE.flatMap(({ path, members = [] }) => {
+			const owners = ownersForPaths(manifest, [path, ...members]);
 			if (owners.length === 0) fail(`critical_module_unmapped:${path}`);
 			return owners;
 		}),
@@ -172,40 +255,62 @@ export function runContractCoverage({
 	run = spawnSync,
 } = {}) {
 	const plan = criticalCoveragePlan(root);
+	const temporaryDirectory = mkdtempSync(
+		join(tmpdir(), "switchyard-coverage-"),
+	);
+	const lcovPath = join(temporaryDirectory, "coverage.lcov");
 	const global = ["lines", "branches", "functions"].map((kind) =>
 		Math.min(...plan.modules.map((module) => module[kind])),
 	);
-	const args = [
-		"--experimental-test-coverage",
-		"--test-coverage-include-all",
-		`--test-coverage-lines=${global[0]}`,
-		`--test-coverage-branches=${global[1]}`,
-		`--test-coverage-functions=${global[2]}`,
-		...plan.modules.map(({ path }) => `--test-coverage-include=${path}`),
-		"--test",
-		...plan.suites,
+	const includedPaths = [
+		...new Set(
+			plan.modules.flatMap(({ path, members = [] }) => [path, ...members]),
+		),
 	];
-	const result = run(process.execPath, args, {
-		cwd: root,
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-		env: { ...process.env },
-	});
-	const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-	process.stdout.write(result.stdout ?? "");
-	process.stderr.write(result.stderr ?? "");
-	const metrics = parseCoverageReport(output, plan.modules);
-	const failures = coverageFailures(metrics, plan.modules);
-	if (result.error || result.status !== 0)
-		failures.unshift("coverage_test_process_failed");
-	if (failures.length) fail(failures.join(","));
-	for (const module of plan.modules) {
-		const metric = metrics[module.path];
-		console.log(
-			`coverage: ${module.path} lines=${metric.lines}% branches=${metric.branches}% functions=${metric.functions}% (thresholds ${module.lines}/${module.branches}/${module.functions})`,
-		);
+	try {
+		const args = [
+			"--experimental-test-coverage",
+			"--test-coverage-include-all",
+			`--test-coverage-lines=${global[0]}`,
+			`--test-coverage-branches=${global[1]}`,
+			`--test-coverage-functions=${global[2]}`,
+			...includedPaths.map((path) => `--test-coverage-include=${path}`),
+			"--test-reporter=spec",
+			"--test-reporter-destination=stdout",
+			"--test-reporter=lcov",
+			`--test-reporter-destination=${lcovPath}`,
+			"--test",
+			...plan.suites,
+		];
+		const result = run(process.execPath, args, {
+			cwd: root,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env },
+		});
+		const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		process.stdout.write(result.stdout ?? "");
+		process.stderr.write(result.stderr ?? "");
+		const textMetrics = parseCoverageReport(output, plan.modules);
+		const lcov =
+			!result.error && result.status === 0
+				? readFileSync(lcovPath, "utf8")
+				: "";
+		const metrics = parseLcovCoverageReport(lcov, plan.modules, root);
+		const failures = coverageFailures(metrics, plan.modules);
+		if (result.error || result.status !== 0)
+			failures.unshift("coverage_test_process_failed");
+		if (failures.length) fail(failures.join(","));
+		for (const module of plan.modules) {
+			const metric = metrics[module.path];
+			console.log(
+				`coverage: ${module.path} lines=${metric.lines}% branches=${metric.branches}% functions=${metric.functions}% (thresholds ${module.lines}/${module.branches}/${module.functions})`,
+			);
+		}
+		return { status: 0, metrics, textMetrics, suites: plan.suites };
+	} finally {
+		rmSync(temporaryDirectory, { recursive: true, force: true });
 	}
-	return { status: 0, metrics, suites: plan.suites };
 }
 
 if (
