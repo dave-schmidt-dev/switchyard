@@ -8,4 +8,5 @@ fi
 if [ "$deadcode_status" -ne 0 ]; then
 	exit "$deadcode_status"
 fi
+node scripts/check-file-size.mjs --staged
 node scripts/check-contract-receipt.mjs --pre-commit

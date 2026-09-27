@@ -19,6 +19,7 @@
 		"test:mutation:contracts": "node scripts/run-incident-mutations.mjs",
 		"lint": "biome check .",
 		"deadcode": "knip",
+		"check:size": "node scripts/check-file-size.mjs --all",
 		"roster:coherence": "node src/switchyard/roster/index.mjs --coherence",
 		"validate": "node scripts/run-validate-phases.mjs",
 		"sweep:temp": "node scripts/sweep-temp-dirs.mjs",

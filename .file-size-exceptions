@@ -12,3 +12,31 @@ tests/runner-broker-production.test.mjs: Broker production fixtures share reserv
 tests/runner.test.mjs: Legacy queue scenarios share checkpoint fixtures; quick-check regressions were extracted to runner-quick-checks.test.mjs in this repair.
 tests/simple-dispatch.test.mjs: Simple lifecycle scenarios share host worktree fixtures; split after isolating fixture setup.
 tests/simple-provider-keyless-bridge.test.mjs: Bridge cases share Seatbelt and broker fixtures; split with the shared fixture setup.
+
+# Legacy entries for the 2026-09-27 reviewed refactor inventory.
+ops/macos-vm/build-golden-image.sh: legacy 2026-09-27: Task 60 owns it and validating a change needs a live golden-image rebuild (Red)
+src/switchyard/adapter/provider-lifecycle.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.2; preserve the current implementation until its named gate clears
+src/switchyard/auth/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.2; retain the existing module until its phase gate passes
+src/switchyard/dispatch/remediate-orphaned-locks.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.7; retain the existing module until its phase gate passes
+src/switchyard/dispatch/worker-bootstrap.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.7; retain the existing module until its phase gate passes
+src/switchyard/integrate/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.3; retain the existing module until its phase gate passes
+src/switchyard/lifecycle/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.6; retain the existing module until its phase gate passes
+src/switchyard/lifecycle/parallels-execution-backend.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.1; preserve the current implementation until its named gate clears
+src/switchyard/roster/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.8; retain the existing module until its phase gate passes
+src/switchyard/router/health.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.5; retain the existing module until its phase gate passes
+src/switchyard/router/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 3.4; retain the existing module until its phase gate passes
+src/switchyard/run-store/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 4.1, 4.2; retain the existing module until its phase gate passes
+tests/adapter-exec-error.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.14; retain the existing fixture and test order until its phase gate passes
+tests/auth-check.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.12; retain the existing fixture and test order until its phase gate passes
+tests/dispatch-disposition.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.13; retain the existing fixture and test order until its phase gate passes
+tests/integration-gate.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.12; retain the existing fixture and test order until its phase gate passes
+tests/macos-vm-ops.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.6; preserve the current implementation until its named gate clears
+tests/mutation-protocol.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.14; retain the existing fixture and test order until its phase gate passes
+tests/outcome-shadow-parity.test.mjs: legacy 2026-09-27: shrinks below 500 when Task 1.5 moves its data literal
+tests/parallels-backend.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.1; preserve the current implementation until its named gate clears
+tests/provenance.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.13; retain the existing fixture and test order until its phase gate passes
+tests/provider-lifecycle-adapter.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.2; preserve the current implementation until its named gate clears
+tests/remediate-orphaned-locks.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.13; retain the existing fixture and test order until its phase gate passes
+tests/roster-loader.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.11; retain the existing fixture and test order until its phase gate passes
+tests/run-store.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.8, 2.9; retain the existing fixture and test order until its phase gate passes
+tests/sweep-temp-dirs.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.15; retain the existing fixture and test order until its phase gate passes
