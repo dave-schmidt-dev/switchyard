@@ -9,6 +9,8 @@ const CHECKER = fileURLToPath(
 	new URL("../scripts/check-seam-move.mjs", import.meta.url),
 );
 const SOURCE = "lib/facade.mjs";
+const TEST_PART = "tests/parts/suite-part.mjs";
+const TEST_SOURCE = "tests/suite.test.mjs";
 
 function fixture(t, base, targets = ["lib/part.mjs"]) {
 	const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "seam-move-"));
@@ -79,6 +81,40 @@ function split(root, facade, targets) {
 		write(root, path, contents);
 }
 
+function testFixture(t, base) {
+	const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "seam-test-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	execFileSync("git", ["init", "-q"], { cwd: root });
+	write(root, TEST_SOURCE, base);
+	execFileSync("git", ["add", "."], { cwd: root });
+	commit(root, "base tests");
+	return root;
+}
+
+function checkTest(
+	root,
+	{ fixture: fixturePath = null, parts = [TEST_PART] } = {},
+) {
+	const args = [
+		CHECKER,
+		"--mode",
+		"test",
+		"--base",
+		"HEAD",
+		"--source",
+		TEST_SOURCE,
+		"--parts",
+		parts.join(","),
+	];
+	if (fixturePath) args.push("--fixture", fixturePath);
+	return spawnSync(process.execPath, args, { cwd: root, encoding: "utf8" });
+}
+
+function splitTest(root, facade, part) {
+	write(root, TEST_SOURCE, facade);
+	write(root, TEST_PART, part);
+}
+
 const BASE = `export const alpha = 1;
 export const beta = 2;
 console.log(alpha);
@@ -98,7 +134,8 @@ function validFixture(t) {
 
 describe("check-seam-move module mode", () => {
 	it("accepts a correct split", (t) => {
-		strictEqual(check(validFixture(t)).status, 0);
+		const result = check(validFixture(t));
+		strictEqual(result.status, 0, result.stderr);
 	});
 
 	for (const [name, mutate] of [
@@ -261,4 +298,165 @@ describe("check-seam-move module mode", () => {
 			strictEqual(check(root).status, 1);
 		});
 	}
+});
+
+const BASE_TEST = [
+	'import { strictEqual } from "node:assert/strict";',
+	'import { describe, it, test } from "node:test";',
+	"",
+	"const helper = 1;",
+	'describe("group", () => {',
+	'\tit("first", () => strictEqual(helper, 1));',
+	'\ttest("second", () => strictEqual(helper, 1));',
+	"});",
+	"",
+].join("\n");
+const TEST_FACADE = 'import "./parts/suite-part.mjs";\n';
+const TEST_PART_CONTENTS = [
+	"const helper = 1;",
+	'describe("group", () => {',
+	'\tit("first", () => strictEqual(helper, 1));',
+	'\ttest("second", () => strictEqual(helper, 1));',
+	"});",
+	"",
+].join("\n");
+
+describe("check-seam-move test mode", () => {
+	it("accepts a correct split", (t) => {
+		const root = testFixture(t, BASE_TEST);
+		splitTest(root, TEST_FACADE, TEST_PART_CONTENTS);
+		const result = checkTest(root);
+		strictEqual(result.status, 0, result.stderr);
+	});
+
+	for (const [name, contents] of [
+		[
+			"lost test",
+			[
+				"const helper = 1;",
+				'describe("group", () => {',
+				'\tit("first", () => strictEqual(helper, 1));',
+				"});",
+				"",
+			].join("\n"),
+		],
+		[
+			"duplicated test",
+			`${TEST_PART_CONTENTS}it("first", () => strictEqual(helper, 1));\n`,
+		],
+		[
+			"edited assertion",
+			TEST_PART_CONTENTS.replace(
+				"strictEqual(helper, 1));",
+				"strictEqual(helper, 2));",
+			),
+		],
+		["changed describe title", TEST_PART_CONTENTS.replace("group", "other")],
+		[
+			"altered repeated helper",
+			TEST_PART_CONTENTS.replace("helper = 1", "helper = 2"),
+		],
+		[
+			"swapped tests inside one part",
+			[
+				"const helper = 1;",
+				'describe("group", () => {',
+				'\ttest("second", () => strictEqual(helper, 1));',
+				'\tit("first", () => strictEqual(helper, 1));',
+				"});",
+				"",
+			].join("\n"),
+		],
+	]) {
+		it(`rejects a ${name}`, (t) => {
+			const root = testFixture(t, BASE_TEST);
+			splitTest(root, TEST_FACADE, contents);
+			strictEqual(checkTest(root).status, 1);
+		});
+	}
+
+	it("rejects a moved fixture import.meta statement", (t) => {
+		const root = testFixture(
+			t,
+			`${BASE_TEST}const location = import.meta.url;\n`,
+		);
+		splitTest(root, TEST_FACADE, TEST_PART_CONTENTS);
+		write(
+			root,
+			"tests/helpers/sample-fixtures.mjs",
+			"export const location = import.meta.url;\n",
+		);
+		strictEqual(
+			checkTest(root, { fixture: "tests/helpers/sample-fixtures.mjs" }).status,
+			1,
+		);
+	});
+
+	it("accepts the resolve-based fixture __dirname rebase", (t) => {
+		const root = testFixture(
+			t,
+			'const __dirname = resolve(fileURLToPath(import.meta.url), "..");\ntest("kept", () => __dirname);\n',
+		);
+		splitTest(root, TEST_FACADE, 'test("kept", () => __dirname);\n');
+		write(
+			root,
+			"tests/helpers/sample-fixtures.mjs",
+			'const __dirname = resolve(fileURLToPath(import.meta.url), "..", "..");\nexport { __dirname };\n',
+		);
+		const result = checkTest(root, {
+			fixture: "tests/helpers/sample-fixtures.mjs",
+		});
+		strictEqual(result.status, 0, result.stderr);
+	});
+
+	it("rejects an unsanctioned fixture __dirname path rewrite", (t) => {
+		const root = testFixture(
+			t,
+			'const __dirname = fileURLToPath(new URL(".", import.meta.url));\ntest("kept", () => __dirname);\n',
+		);
+		splitTest(root, TEST_FACADE, 'test("kept", () => __dirname);\n');
+		write(
+			root,
+			"tests/helpers/sample-fixtures.mjs",
+			'const __dirname = fileURLToPath(new URL("../", import.meta.url));\nexport { __dirname };\n',
+		);
+		strictEqual(
+			checkTest(root, { fixture: "tests/helpers/sample-fixtures.mjs" }).status,
+			1,
+		);
+	});
+
+	it("accepts a fixture __dirname rebase and exported fixture import", (t) => {
+		const base = [
+			'import { fileURLToPath } from "node:url";',
+			'import { test } from "node:test";',
+			'const __dirname = fileURLToPath(new URL(".", import.meta.url));',
+			'test("kept", () => strictEqual(__dirname.length > 0, true));',
+			"",
+		].join("\n");
+		const root = testFixture(t, base);
+		splitTest(
+			root,
+			[
+				'import { fixtureValue } from "./helpers/sample-fixtures.mjs";',
+				'import "./parts/suite-part.mjs";',
+				"",
+			].join("\n"),
+			'test("kept", () => strictEqual(__dirname.length > 0, true));\n',
+		);
+		write(
+			root,
+			"tests/helpers/sample-fixtures.mjs",
+			[
+				'import { fileURLToPath } from "node:url";',
+				"export const fixtureValue = 1;",
+				'const __dirname = fileURLToPath(new URL("..", import.meta.url));',
+				"",
+			].join("\n"),
+		);
+		const result = checkTest(root, {
+			fixture: "tests/helpers/sample-fixtures.mjs",
+		});
+		strictEqual(result.status, 0, result.stderr);
+	});
 });
