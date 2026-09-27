@@ -76,7 +76,6 @@ import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels
 import {
 	__resetRosterCacheForTests,
 	getInvocationDescriptorIdentity,
-	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
 import {
 	attestRouteRepair,
@@ -84,7 +83,6 @@ import {
 	ingestRouteHealthEvents,
 	inspectRouteHealth,
 } from "../src/switchyard/router/health.mjs";
-import { route as realRoute } from "../src/switchyard/router/index.mjs";
 import {
 	appendOutcomeEvent,
 	applyCheckpointArtifactRetention,
@@ -111,7 +109,6 @@ import {
 	emitStageOutcome,
 	executeTaskAsync as executeTaskAsyncImpl,
 	executeTask as executeTaskImpl,
-	executeTaskWithOrchestrator as executeTaskWithOrchestratorImpl,
 	findIgnoredDeclaredPath,
 	getRunnableTasks,
 	integrationFailureMetadata,
@@ -137,8 +134,28 @@ import {
 	writeDispatchIntent,
 	writeDispatchIntentAsync,
 } from "../src/switchyard/runner/index.mjs";
+import {
+	authExpiredExecution,
+	codexHealthRoute,
+	completionReceipt,
+	descriptorForRoute,
+	executeTask,
+	executeTaskAsync,
+	executeTaskWithOrchestrator,
+	macosBackend,
+	parseFixture,
+	productionQueueOptions,
+	runnerTestDir,
+	runQueue,
+	runQueueAsync,
+	runQueueWithOrchestrator,
+	TASK_BASE,
+	testDescriptor,
+	withExplicitSwitchyardExecutor,
+	withTestDescriptorContext,
+} from "./helpers/runner-fixtures.mjs";
 
-const TEST_DIR = join(cwd(), ".switchyard-runner-test");
+const TEST_DIR = runnerTestDir(import.meta.url);
 // A provider deliberately absent from every roster, for tests that need a name
 // the identity gate rejects. Using a real provider here made those tests depend
 // on which logins happened to be baked into the golden image.
@@ -160,10 +177,6 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
-const TASK_BASE = {
-	ref: "refs/switchyard/task-base/runner-tests/1.1",
-	tree: "3".repeat(40),
-};
 const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 const HOST_BOOT_UUID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
@@ -1667,38 +1680,6 @@ function writeDispatchQualifiedRosterFixture() {
 	return fixturePath;
 }
 
-// These older runner fixtures predate the mandatory task-contract Executor:
-// field. Normalize only the fixture text so the real parser receives an
-// explicit field; the missing-Executor rejection is tested directly below.
-function withExplicitSwitchyardExecutor(markdown) {
-	const lines = markdown.split("\n");
-	return lines
-		.flatMap((line, index) => {
-			if (!/^- \*\*Status:\*\*/.test(line)) return [line];
-			const nextHeading = lines.findIndex(
-				(candidate, candidateIndex) =>
-					candidateIndex > index && /^### Task /.test(candidate),
-			);
-			const blockEnd = nextHeading === -1 ? lines.length : nextHeading;
-			const hasExecutor = lines
-				.slice(index + 1, blockEnd)
-				.some((candidate) => /^- \*\*Executor:\*\*/.test(candidate));
-			const hasQuickChecks = lines
-				.slice(index + 1, blockEnd)
-				.some((candidate) => /^- \*\*Quick checks:\*\*/.test(candidate));
-			return [
-				line,
-				...(hasExecutor ? [] : ["- **Executor:** switchyard"]),
-				...(hasQuickChecks ? [] : ["- **Quick checks:** none"]),
-			];
-		})
-		.join("\n");
-}
-
-function parseFixture(markdown) {
-	return parseTaskQueue(withExplicitSwitchyardExecutor(markdown));
-}
-
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");
@@ -2636,238 +2617,6 @@ describe("dispatch descriptor receipt contract", () => {
 		}
 	});
 });
-
-function testDescriptor(overrides = {}) {
-	const core = {
-		target_id: "claude",
-		model_ref: "claude-sonnet-5",
-		selector: "claude-sonnet-5",
-		effort: null,
-		variant: null,
-		invocation_args: [],
-		...overrides,
-	};
-	return validateInvocationDescriptor(
-		{
-			...core,
-			descriptor_identity: getInvocationDescriptorIdentity(core, "claude"),
-		},
-		"claude",
-	);
-}
-
-function descriptorForRoute(routeResult) {
-	if (!routeResult?.provider) return null;
-	const harness = routeResult.provider
-		.replace(/^antigravity-claude$/, "agy")
-		.replace(/^opencode-go$/, "opencode");
-	const model = routeResult.model ?? "test-model";
-	const core = {
-		target_id: routeResult.resolvedTargetId ?? routeResult.provider,
-		model_ref: model,
-		selector: model,
-		effort: null,
-		variant: null,
-		invocation_args: [],
-	};
-	return {
-		...core,
-		descriptor_identity: getInvocationDescriptorIdentity(core, harness),
-	};
-}
-
-function withTestDescriptorContext(context) {
-	let latest = null;
-	let launchedTaskBase = null;
-	let orchestratorDiff = "";
-	const originalRoute = context.route;
-	const originalResolveDescriptor = context.resolveDescriptor;
-	const route = (options) => {
-		const routed = originalRoute(options);
-		if (routed?.provider && !adapters[routed.provider]) {
-			adapters[routed.provider] = {
-				captureDiffAsync: async () => orchestratorDiff,
-			};
-		}
-		latest = descriptorForRoute(routed);
-		return latest && routed && !Object.hasOwn(routed, "invocationDescriptor")
-			? { ...routed, invocationDescriptor: latest }
-			: routed;
-	};
-	const orchestrator = context.orchestrator
-		? {
-				...context.orchestrator,
-				launch: async (payload) => {
-					launchedTaskBase = payload.taskBase;
-					return context.orchestrator.launch(payload);
-				},
-				result: async (jobId) => {
-					const result = await context.orchestrator.result(jobId);
-					orchestratorDiff =
-						typeof result?.diff === "string" ? result.diff : "";
-					return context.requireExplicitTaskBaseResult
-						? result
-						: { ...result, taskBase: result?.taskBase ?? launchedTaskBase };
-				},
-			}
-		: undefined;
-	const fixtureAdapters =
-		context.adapters ??
-		(context.orchestrator
-			? Object.fromEntries(
-					[
-						"claude",
-						"codex",
-						"agy",
-						"cursor",
-						"copilot",
-						"opencode",
-						"vibe",
-					].map((name) => [name, {}]),
-				)
-			: {});
-	const adapters = Object.fromEntries(
-		Object.entries(fixtureAdapters).map(([name, adapter]) => [
-			name,
-			{
-				...adapter,
-				captureDiffAsync:
-					adapter.captureDiffAsync ?? (async () => orchestratorDiff),
-			},
-		]),
-	);
-	return {
-		...context,
-		...(orchestrator ? { orchestrator } : {}),
-		adapters,
-		queueBackend: context.queueBackend ?? {
-			beforeRun: () => {},
-			afterRun: () => {},
-			captureTaskBase: () => TASK_BASE,
-			validateTaskBase: (_workspaceId, base) => base,
-			releaseTaskBase: () => {},
-		},
-		taskBases: context.taskBases ?? {},
-		persistTaskBase: context.persistTaskBase ?? (() => {}),
-		route,
-		resolveDescriptor: (...args) =>
-			latest ?? originalResolveDescriptor?.(...args) ?? null,
-	};
-}
-
-function executeTask(task, context) {
-	return executeTaskImpl(task, withTestDescriptorContext(context));
-}
-
-async function executeTaskWithOrchestrator(task, context) {
-	return executeTaskWithOrchestratorImpl(
-		task,
-		withTestDescriptorContext(context),
-	);
-}
-
-async function executeTaskAsync(task, context) {
-	return executeTaskAsyncImpl(task, withTestDescriptorContext(context));
-}
-
-// Legacy per-method container-lifecycle stubs (ensureAgentContainer,
-// createWorkingContainer, provisionCredentials, seedProject,
-// commitWorkingTree, resetWorkingTree, wipeWorkingContainer) predate
-// createQueueBackend's dependencies.backendFactory seam and are no longer
-// read directly by production code -- only a backendFactory returning a
-// full {create, destroy, seed, commit, reset, ...} object is honored (see
-// runner/index.mjs's createQueueBackend, which falls through to the real
-// ParallelsExecutionBackend when no backendFactory -- or an incomplete one
-// -- is supplied). Synthesize a backendFactory from these flat keys here so
-// the dozens of tests written against the old shape keep exercising the
-// same stub behavior without a per-test rewrite. Call signatures mirror the
-// real production call sites exactly: create(projectPath, {runId}),
-// provision(name), seed(name, projectPath), commit(name), reset(name),
-// destroy(name), ensureAgentContainer().
-function legacyBackendFactory(dependencies) {
-	return () => ({
-		executionBackend: dependencies.executionBackend,
-		readiness: dependencies.hostReadiness ?? (() => ({ inventoryCount: 0 })),
-		ensureAgentContainer: dependencies.ensureAgentContainer ?? (() => {}),
-		create: dependencies.createWorkingContainer ?? (() => "test-container"),
-		provision: dependencies.provisionCredentials ?? (() => null),
-		seed: dependencies.seedProject ?? (() => {}),
-		commit: dependencies.commitWorkingTree ?? (() => {}),
-		reset: dependencies.resetWorkingTree ?? (() => {}),
-		captureTaskBase: dependencies.captureTaskBase ?? (() => TASK_BASE),
-		validateTaskBase:
-			dependencies.validateTaskBase ?? ((_workspaceId, base) => base),
-		releaseTaskBase: dependencies.releaseTaskBase ?? (() => {}),
-		destroy: dependencies.wipeWorkingContainer ?? (() => {}),
-	});
-}
-
-function withTestDescriptorOptions(options) {
-	const dependencies = options.dependencies ?? {};
-	const context = withTestDescriptorContext({
-		...dependencies,
-		route: dependencies.route ?? realRoute,
-	});
-	const testIdentityResolver =
-		dependencies.resolveTargetIdentity ??
-		(dependencies.route
-			? (provider) => {
-					const routed = context.route({
-						requiredCapability: "standard",
-						availableProviders: Object.keys(context.adapters ?? {}),
-					});
-					if (routed?.provider !== provider) {
-						return { targetId: null, harnessKey: null, ambiguous: true };
-					}
-					return {
-						targetId: routed.resolvedTargetId ?? routed.resolvedTarget ?? null,
-						harnessKey: routed.resolved_harness ?? routed.harness ?? provider,
-						ambiguous: false,
-					};
-				}
-			: undefined);
-	return {
-		...options,
-		platform: options.platform ?? "macos",
-		dependencies: {
-			...dependencies,
-			route: context.route,
-			resolveDescriptor: context.resolveDescriptor,
-			adapters: context.adapters,
-			...(context.orchestrator ? { orchestrator: context.orchestrator } : {}),
-			// macOS/Parallels is the sole execution backend now, so every
-			// runQueue* call through this helper runs the real provider
-			// preflight gate unless a test overrides it. The overwhelming
-			// majority of these tests exercise dispatch/retry/ledger/
-			// orchestration logic downstream of admission, not the gate
-			// itself (that's covered directly in the "Task 6.1"/"Task 6.3"
-			// describe blocks below, which call runQueueImpl or
-			// preflightMacosQueue directly and so never pass through this
-			// helper) -- so default preflight to a no-op here and let a
-			// test that actually wants real gate behavior override
-			// dependencies.queuePreflight explicitly.
-			queuePreflight:
-				dependencies.queuePreflight ?? (() => ({ ok: true, eligible: true })),
-			backendFactory:
-				dependencies.backendFactory ?? legacyBackendFactory(dependencies),
-			...(testIdentityResolver
-				? { resolveTargetIdentity: testIdentityResolver }
-				: {}),
-		},
-	};
-}
-
-function runQueue(options) {
-	return runQueueImpl(withTestDescriptorOptions(options));
-}
-
-async function runQueueAsync(options) {
-	return runQueueAsyncImpl(withTestDescriptorOptions(options));
-}
-
-async function runQueueWithOrchestrator(options) {
-	return runQueueWithOrchestratorImpl(withTestDescriptorOptions(options));
-}
 
 describe("runner queue parsing", () => {
 	it("parses task blocks with status and description", () => {
@@ -6766,21 +6515,6 @@ describe("runner quota retry coordination", () => {
 		};
 	}
 
-	function completionReceipt(options, overrides = {}) {
-		return {
-			version: 1,
-			kind: "completion_continuation_lifecycle",
-			providerExited: true,
-			childrenExited: true,
-			cleanupSucceeded: true,
-			taskId: options.cleanupContext.taskId,
-			attemptId: options.cleanupContext.attemptId,
-			descriptorIdentity: options.cleanupContext.descriptorIdentity,
-			workspaceId: options.cleanupContext.workspaceId,
-			...overrides,
-		};
-	}
-
 	it("continues once in the owned workspace only after lifecycle proof", () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -9823,41 +9557,6 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 - **Description:** no provider work
 - **Executor:** switchyard
 `);
-	}
-
-	function macosBackend(
-		events,
-		{ failCreate = false, failDestroy = false } = {},
-	) {
-		return {
-			platform: "macos",
-			preflight: () => events.push("preflight"),
-			readiness: () => {
-				events.push("readiness");
-				return { inventoryCount: 0 };
-			},
-			acquireSlot: () => {
-				events.push("acquire");
-				return { token: "test-slot" };
-			},
-			releaseSlot: () => events.push("release"),
-			ensureAgentContainer: () => events.push("ensure"),
-			create: () => {
-				events.push("create");
-				if (failCreate) throw new Error("create failed");
-				return "test-vm";
-			},
-			provision: () => events.push("provision"),
-			seed: () => events.push("seed"),
-			commit: () => {},
-			reset: () => {},
-			destroy: () => {
-				events.push("destroy");
-				if (failDestroy) {
-					throw new Error("SECRET_CANARY synthetic backend teardown failure");
-				}
-			},
-		};
 	}
 
 	it("runs preflight and admission before create, then releases after teardown on all three entrypoints", async () => {
@@ -14057,40 +13756,6 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			__resetRosterCacheForTests();
 		}
 	});
-
-	// Drive the production runner (no test descriptor wrapper) so the roster
-	// descriptor receipt is the one the health identity was derived from.
-	function productionQueueOptions(options) {
-		const wrapped = withTestDescriptorOptions(options);
-		const dependencies = { ...wrapped.dependencies };
-		dependencies.route = options.dependencies.route;
-		delete dependencies.resolveDescriptor;
-		delete dependencies.resolveTargetIdentity;
-		return { ...wrapped, dependencies };
-	}
-
-	function codexHealthRoute() {
-		return {
-			provider: "codex",
-			model: "fixture-codex-standard",
-			resolvedTargetId: "codex",
-			resolved_harness: "codex",
-			requiredCapability: "standard",
-			percentLeft: 50,
-			reason: "fixture",
-		};
-	}
-
-	function authExpiredExecution() {
-		return {
-			success: false,
-			errorKind: "auth_expired",
-			diagnosticCode: "auth_expired",
-			diagnosticOrigin: "adapter",
-			diagnosticEvidenceAvailable: true,
-			failurePhase: "provider_execution",
-		};
-	}
 
 	// Owned-workspace queue dependencies with a scripted codex outcome list;
 	// the legacy container stubs make the queue own its workspace so the
