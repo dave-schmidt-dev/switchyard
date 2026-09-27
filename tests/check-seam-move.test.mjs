@@ -153,18 +153,30 @@ describe("check-seam-move module mode", () => {
 		const result = check(root);
 		strictEqual(result.status, 0, result.stderr);
 	});
-	it("keeps original façade imports before generated target imports", (t) => {
+	it("keeps original module edges before generated target re-exports", (t) => {
 		const root = fixture(
 			t,
 			'import "./external.mjs";\nexport const beta = 2;\n',
 		);
 		split(
 			root,
-			'import "./external.mjs";\nimport "./part.mjs";\nexport { beta } from "./part.mjs";\n',
+			'import "./external.mjs";\nexport { beta } from "./part.mjs";\n',
 			{ "lib/part.mjs": "export const beta = 2;\n" },
 		);
 		const result = check(root);
 		strictEqual(result.status, 0, result.stderr);
+	});
+	it("rejects a generated re-export before an original external import", (t) => {
+		const root = fixture(
+			t,
+			'import "./external.mjs";\nexport const beta = 2;\n',
+		);
+		split(
+			root,
+			'export { beta } from "./part.mjs";\nimport "./external.mjs";\n',
+			{ "lib/part.mjs": "export const beta = 2;\n" },
+		);
+		strictEqual(check(root).status, 1);
 	});
 	it("rejects a configured target alias that changes the moved binding", (t) => {
 		const base = "export const beta = 2;\nexport const evil = 3;\n";

@@ -447,27 +447,28 @@ function checkModule(options) {
 		}
 	}
 	const facadeCarriedPositions = carriedByPosition.get(sourcePath) ?? [];
-	const originalFacadeImports = [];
-	const generatedTargetImports = [];
+	const originalFacadeEdges = [];
+	const generatedTargetEdges = [];
 	for (const [index, statement] of facade.body.entries()) {
-		if (statement.type !== "ImportDeclaration") continue;
+		const specifier = moduleSource(statement);
+		if (!specifier) continue;
 		const carriedIndex = facadeCarriedPositions[index];
 		if (carriedIndex !== null && carriedIndex !== undefined) {
-			if (base.body[carriedIndex]?.type === "ImportDeclaration")
-				originalFacadeImports.push(index);
+			if (moduleSource(base.body[carriedIndex]))
+				originalFacadeEdges.push(index);
 			continue;
 		}
-		if (resolveSpecifier(sourcePath, statement.source.value, targetPaths))
-			generatedTargetImports.push(index);
+		if (resolveSpecifier(sourcePath, specifier, targetPaths))
+			generatedTargetEdges.push(index);
 	}
 	if (
-		generatedTargetImports.some((addedIndex) =>
-			originalFacadeImports.some((originalIndex) => originalIndex > addedIndex),
+		generatedTargetEdges.some((addedIndex) =>
+			originalFacadeEdges.some((originalIndex) => originalIndex > addedIndex),
 		)
 	)
 		fail(
 			errors,
-			"generated target imports precede preserved original façade imports",
+			"generated target edges precede preserved original façade edges",
 		);
 	for (const item of baseStatements) {
 		if ((remaining.get(item.text) ?? []).includes(item.index))
