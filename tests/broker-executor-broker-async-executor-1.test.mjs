@@ -1,0 +1,441 @@
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { describe, it } from "node:test";
+import { executeBrokerRoute } from "../src/switchyard/broker/executor.mjs";
+import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { sanitizeReviewResult } from "../src/switchyard/diagnostics/review-result.mjs";
+import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import { sourceText } from "./helpers/source-text.mjs";
+
+function fixture() {
+	const core = {
+		target_id: "claude",
+		model_ref: "claude-standard",
+		selector: "claude-standard",
+		effort: null,
+		variant: null,
+		invocation_args: [],
+	};
+	const descriptor = {
+		...core,
+		descriptor_identity: getInvocationDescriptorIdentity(core, "claude"),
+	};
+	const request = {
+		schemaVersion: BROKER_CONTRACT_VERSION,
+		capability: "standard",
+		dataClass: "repository",
+		estimatedConsumption: 2,
+		runId: "run-1",
+		taskId: "TASK-001",
+		snapshotSource: "gradus-v2",
+		availableAdapters: ["claude"],
+	};
+	const route = {
+		schemaVersion: BROKER_CONTRACT_VERSION,
+		runId: "run-1",
+		taskId: "TASK-001",
+		capability: "standard",
+		provider: "Claude",
+		resolvedTarget: "claude",
+		harness: "claude",
+		model: "claude-standard",
+		effort: null,
+		snapshotIdentity: {
+			source: "gradus-v2",
+			status: "fresh",
+			mtime: 1,
+			ageMs: 2,
+		},
+		reservation: {
+			id: "reservation-1",
+			provider: "Claude",
+			runId: "run-1",
+			taskId: "TASK-001",
+			amount: 2,
+		},
+		reason: "ranked",
+	};
+	const launcherIdentity = {
+		provider: "Claude",
+		resolvedTarget: "claude",
+		harness: "claude",
+		model: "claude-standard",
+		effort: null,
+		descriptorIdentity: descriptor.descriptor_identity,
+		reservationId: "reservation-1",
+		snapshotIdentity: route.snapshotIdentity,
+	};
+	return { request, route, descriptor, launcherIdentity };
+}
+
+describe("broker async executor", () => {
+	it("rejects identity drift before launch and reconciles failure", async () => {
+		const value = fixture();
+		let launches = 0;
+		let terminals = 0;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: { ...value.launcherIdentity, model: "drifted" },
+			launch: async () => {
+				launches += 1;
+			},
+			terminal: async () => {
+				terminals += 1;
+			},
+		});
+		strictEqual(launches, 0);
+		strictEqual(terminals, 1);
+		strictEqual(result.reason, "identity_drift");
+	});
+
+	it("emits progress and reconciles success once", async () => {
+		const value = fixture();
+		const events = [];
+		const terminals = [];
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			onStatus: (event) => events.push(event),
+			launch: async ({ onStatus }) => {
+				onStatus({ stage: "working", elapsedMs: 5 });
+				return { success: true, actualConsumption: 1 };
+			},
+			terminal: async (terminal) => {
+				terminals.push(terminal);
+				return { changed: true };
+			},
+		});
+		strictEqual(result.success, true);
+		deepStrictEqual(terminals, [{ outcome: "success", actualConsumption: 1 }]);
+		deepStrictEqual(
+			events.map(({ event }) => event),
+			[
+				"execution_waiting",
+				"execution_started",
+				"execution_progress",
+				"terminal_reconciling",
+				"execution_succeeded",
+			],
+		);
+	});
+
+	it("relays only the closed sanitized progress envelope", async () => {
+		const value = fixture();
+		const events = [];
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			onStatus: (event) => events.push(event),
+			launch: async ({ onProgress }) => {
+				onProgress({
+					stage: "working",
+					elapsedMs: 12,
+					lastSubstantiveProgressAt: "2026-09-07T00:00:00.000Z",
+					lastSubstantiveProgressAgeMs: 2,
+					counters: { polls: 3, progressEvents: 1, stdoutBytes: 4 },
+					outcome: "running",
+					output: "SECRET_CANARY",
+				});
+				return {
+					success: true,
+					actualConsumption: 1,
+					progress: {
+						stage: "working",
+						elapsedMs: 12,
+						lastSubstantiveProgressAt: "2026-09-07T00:00:00.000Z",
+						lastSubstantiveProgressAgeMs: 2,
+						counters: { polls: 3, progressEvents: 1, stdoutBytes: 4 },
+						outcome: "success",
+						output: "SECRET_CANARY",
+					},
+				};
+			},
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.progress.schemaVersion, 1);
+		strictEqual(result.progress.outcome, "success");
+		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
+		const event = events.find((entry) => entry.progress);
+		strictEqual(event.progress.counters.progressEvents, 1);
+	});
+
+	it("keeps broker failures stable for a silence timeout", async () => {
+		const value = fixture();
+		const terminals = [];
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				silenceTimedOut: true,
+				errorKind: "silence_timeout",
+				progress: {
+					stage: "timed_out",
+					elapsedMs: 100,
+					lastSubstantiveProgressAgeMs: 100,
+					counters: { polls: 4, progressEvents: 0 },
+					outcome: "silence_timeout",
+				},
+			}),
+			terminal: async (terminal) => {
+				terminals.push(terminal);
+				return { changed: true };
+			},
+		});
+		strictEqual(result.outcome, "failure");
+		strictEqual(result.errorKind, "silence_timeout");
+		strictEqual(result.silenceTimedOut, true);
+		strictEqual(terminals[0].outcome, "failure");
+	});
+
+	it("reconciles failure and cancellation exactly once", async () => {
+		for (const scenario of ["failure", "cancel"]) {
+			const value = fixture();
+			const terminals = [];
+			const controller = new AbortController();
+			if (scenario === "cancel") controller.abort();
+			const result = await executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				signal: controller.signal,
+				launch: async () => {
+					throw new Error("provider failed");
+				},
+				terminal: async (terminal) => {
+					terminals.push(terminal);
+					return { changed: true };
+				},
+			});
+			strictEqual(result.outcome, scenario);
+			strictEqual(terminals.length, 1);
+			strictEqual(terminals[0].outcome, scenario);
+		}
+	});
+
+	it("preserves bounded timeout metadata from the launcher", async () => {
+		const value = fixture();
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				timedOut: true,
+				cleanupFailed: true,
+			}),
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.reason, "provider execution timed out");
+		strictEqual(result.timedOut, true);
+		strictEqual(result.cleanupFailed, true);
+	});
+
+	it("propagates only bounded provider lifecycle diagnostics without retrying silence", async () => {
+		const value = fixture();
+		let launches = 0;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => {
+				launches += 1;
+				return {
+					success: false,
+					timedOut: true,
+					errorKind: "execution_timed_out",
+					providerLifecycle: {
+						pid: 4242,
+						startedAt: "2026-09-15T12:00:00.000Z",
+						deadlineAt: "2026-09-15T12:00:01.000Z",
+						lastOutputAt: null,
+						silenceObserved: true,
+						terminalStatus: "terminated",
+						terminationReason: "deadline",
+						exitCode: null,
+						signal: "SIGKILL",
+						writerLifecycle: "unavailable",
+						cleanupStatus: "succeeded",
+						cleanupStage: null,
+						secret: "SECRET_CANARY",
+					},
+				};
+			},
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(launches, 1);
+		strictEqual(result.providerLifecycle.pid, 4242);
+		strictEqual(result.providerLifecycle.terminationReason, "deadline");
+		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
+	});
+
+	it("retains safe structured diagnostics without exposing launcher output", async () => {
+		const value = fixture();
+		let terminals = 0;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			onStatus: () => {
+				throw new Error("status sink failed");
+			},
+			launch: async () => ({
+				success: false,
+				reason: "SECRET_CANARY_raw provider stdout must not escape",
+				errorKind: "execution_failed",
+				diagnosticCode: "cli_usage_error",
+				diagnosticOrigin: "launcher",
+				diagnosticEvidenceAvailable: true,
+				exitCode: 2,
+				failurePhase: "provider_execution",
+			}),
+			terminal: async () => {
+				terminals += 1;
+				return { changed: true };
+			},
+		});
+		strictEqual(terminals, 1);
+		strictEqual(result.reason, "launcher_failed");
+		strictEqual(result.errorKind, "execution_failed");
+		strictEqual(result.diagnosticCode, "cli_usage_error");
+		strictEqual(result.exitCode, 2);
+		strictEqual(result.failurePhase, "provider_execution");
+		strictEqual(result.diagnosticOrigin, "launcher");
+		strictEqual(result.diagnosticEvidenceAvailable, false);
+		strictEqual(result.diagnosticRef, null);
+		strictEqual(result.resolvedTargetId, value.route.resolvedTarget);
+		strictEqual(
+			result.descriptorIdentity,
+			value.descriptor.descriptor_identity,
+		);
+		strictEqual(JSON.stringify(result).includes("SECRET_CANARY"), false);
+	});
+
+	it("carries only the storage-returned diagnostic reference", async () => {
+		const value = fixture();
+		let persistenceCalls = 0;
+		const storedRef = `diagnostic:${"c".repeat(32)}`;
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				diagnosticRef: storedRef,
+				diagnosticEvidenceAvailable: true,
+				diagnosticEvidence: {
+					stdoutBytes: 4,
+					stderrBytes: 0,
+					stdoutDigest: `sha256:${"a".repeat(64)}`,
+					stderrDigest: `sha256:${"b".repeat(64)}`,
+				},
+			}),
+			persistDiagnosticArtifact: async () => {
+				persistenceCalls += 1;
+				return `diagnostic:${"d".repeat(32)}`;
+			},
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.diagnosticRef, storedRef);
+		strictEqual(persistenceCalls, 0);
+		strictEqual(Object.hasOwn(result, "diagnosticEvidence"), false);
+	});
+
+	it("relays only an exact completion lifecycle proof and drops any other shape", async () => {
+		const value = fixture();
+		const proof = {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: value.descriptor.descriptor_identity,
+			workspaceId: "switchyard-work-1",
+			stdout: "SECRET_CANARY must not ride along on the proof",
+		};
+		const run = (completionContinuationProof) =>
+			executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				launch: async () => ({
+					success: true,
+					actualConsumption: 1,
+					completionContinuationProof,
+				}),
+				terminal: async () => ({ changed: true }),
+			});
+		const relayed = await run(proof);
+		deepStrictEqual(relayed.completionContinuationProof, {
+			version: 1,
+			kind: "completion_continuation_lifecycle",
+			providerExited: true,
+			childrenExited: true,
+			cleanupSucceeded: true,
+			taskId: "1.1",
+			attemptId: "attempt-1",
+			descriptorIdentity: value.descriptor.descriptor_identity,
+			workspaceId: "switchyard-work-1",
+		});
+		strictEqual(JSON.stringify(relayed).includes("SECRET_CANARY"), false);
+		strictEqual(
+			(await run({ ...proof, kind: "provider_exit" }))
+				.completionContinuationProof,
+			null,
+		);
+		strictEqual(
+			(await run({ ...proof, cleanupSucceeded: "yes" }))
+				.completionContinuationProof,
+			null,
+		);
+		strictEqual((await run(undefined)).completionContinuationProof, null);
+	});
+
+	it("carries the launcher's served-model verification across both terminal shapes", async () => {
+		for (const verified of [true, false]) {
+			const value = fixture();
+			const success = await executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				launch: async () => ({
+					success: true,
+					actualConsumption: 1,
+					servedModelVerified: verified,
+				}),
+				terminal: async () => ({ changed: true }),
+			});
+			strictEqual(success.servedModelVerified, verified);
+
+			const failed = await executeBrokerRoute({
+				request: value.request,
+				route: value.route,
+				invocationDescriptor: value.descriptor,
+				launcherIdentity: value.launcherIdentity,
+				launch: async () => ({
+					success: false,
+					errorKind: "execution_failed",
+					servedModelVerified: verified,
+				}),
+				terminal: async () => ({ changed: true }),
+			});
+			strictEqual(failed.servedModelVerified, verified);
+		}
+	});
+});

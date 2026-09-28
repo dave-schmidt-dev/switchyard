@@ -27,7 +27,7 @@ gate_test: tests/provider-lifecycle-adapter.test.mjs, tests/provider-cleanup-dia
 ### Contract gate: broker-executor-schema
 
 area: ["src/switchyard/broker/executor.mjs", "src/switchyard/broker/schema.mjs"]
-gate_test: tests/broker-executor.test.mjs, tests/broker-contract.test.mjs
+gate_test: tests/broker-executor-broker-async-executor-1.test.mjs, tests/broker-executor-broker-async-executor-2.test.mjs, tests/broker-contract.test.mjs
 
 ### Contract gate: outcome-schema-reducer
 
@@ -37,7 +37,7 @@ gate_test: tests/outcome-schema.test.mjs, tests/outcome-reducer.test.mjs, tests/
 ### Contract gate: production-runner
 
 area: ["src/switchyard/runner/index.mjs"]
-gate_test: tests/runner-task-base-parallels-lost.test.mjs, tests/runner-macos-queue-admission.test.mjs, tests/runner-attempt-scoped-execution-backend.test.mjs, tests/runner-attempt-scoped-execution-backend-2.test.mjs, tests/runner-caller-input-validation.test.mjs, tests/runner-dispatch-descriptor-receipt-contract.test.mjs, tests/runner-dispatch-descriptor-receipt-contract-2.test.mjs, tests/runner-runner-queue-parsing-1.test.mjs, tests/runner-runner-queue-parsing-2.test.mjs, tests/runner-allowmanifests-execution-authority-pre.test.mjs, tests/runner-async-runner-provider-lifecycle.test.mjs, tests/runner-async-runner-provider-lifecycle-2.test.mjs, tests/runner-runner-dependency-metadata.test.mjs, tests/runner-runner-task-selection-queue.test.mjs, tests/runner-runner-orchestration.test.mjs, tests/runner-immutable-base-recovery-guards.test.mjs, tests/runner-runner-poll-wait-loop.test.mjs, tests/runner-runner-provider-spread-recording.test.mjs, tests/runner-runner-provider-spread-recording-2.test.mjs, tests/runner-external-completion-handoff.test.mjs, tests/runner-runner-quota-retry-coordination.test.mjs, tests/runner-runner-quota-retry-coordination-2.test.mjs, tests/runner-runner-quota-retry-coordination-3.test.mjs, tests/runner-runner-quota-retry-coordination-4.test.mjs, tests/runner-runner-quota-retry-coordination-5.test.mjs, tests/runner-runner-quota-retry-coordination-6.test.mjs, tests/runner-runner-quota-retry-coordination-7.test.mjs, tests/runner-checkpoint-durability-1.test.mjs, tests/runner-checkpoint-durability-2.test.mjs, tests/runner-container-lifecycle-wiring-1.test.mjs, tests/runner-container-lifecycle-wiring-2.test.mjs, tests/runner-queue-platform-admission-ordering.test.mjs, tests/runner-queue-platform-admission-ordering-2.test.mjs, tests/runner-queue-platform-admission-ordering-3.test.mjs, tests/runner-runner-commit-reset-behavior.test.mjs, tests/runner-runner-commit-reset-behavior-2.test.mjs, tests/runner-runner-commit-reset-behavior-3.test.mjs, tests/runner-runner-commit-reset-behavior-4.test.mjs, tests/runner-runner-progress-hooks-1.test.mjs, tests/runner-runner-progress-hooks-2.test.mjs, tests/runner-files-allowlist-propagation.test.mjs, tests/runner-executetask-timeout-handling.test.mjs, tests/runner-runner-task-contract-resolution.test.mjs, tests/runner-exclude-provider-threading-1.test.mjs, tests/runner-exclude-provider-threading-2.test.mjs, tests/runner-exclude-provider-threading-3.test.mjs, tests/runner-exclude-provider-threading-4.test.mjs, tests/runner-runqueue-timeout-diff-persistence.test.mjs, tests/runner-runqueue-timeout-diff-persistence-2.test.mjs, tests/runner-runqueue-non-timeout-rejection.test.mjs, tests/runner-reject-declared-paths-that.test.mjs, tests/runner-typed-checkpoint-identity-failures.test.mjs, tests/runner-preserve-closed-integration-rejection.test.mjs, tests/runner-preserve-closed-integration-rejection-2.test.mjs, tests/runner-carry-real-cause-through.test.mjs, tests/runner-broker-production.test.mjs
+gate_test: tests/runner-task-base-parallels-lost.test.mjs, tests/runner-macos-queue-admission.test.mjs, tests/runner-attempt-scoped-execution-backend.test.mjs, tests/runner-attempt-scoped-execution-backend-2.test.mjs, tests/runner-caller-input-validation.test.mjs, tests/runner-dispatch-descriptor-receipt-contract.test.mjs, tests/runner-dispatch-descriptor-receipt-contract-2.test.mjs, tests/runner-runner-queue-parsing-1.test.mjs, tests/runner-runner-queue-parsing-2.test.mjs, tests/runner-allowmanifests-execution-authority-pre.test.mjs, tests/runner-async-runner-provider-lifecycle.test.mjs, tests/runner-async-runner-provider-lifecycle-2.test.mjs, tests/runner-runner-dependency-metadata.test.mjs, tests/runner-runner-task-selection-queue.test.mjs, tests/runner-runner-orchestration.test.mjs, tests/runner-immutable-base-recovery-guards.test.mjs, tests/runner-runner-poll-wait-loop.test.mjs, tests/runner-runner-provider-spread-recording.test.mjs, tests/runner-runner-provider-spread-recording-2.test.mjs, tests/runner-external-completion-handoff.test.mjs, tests/runner-runner-quota-retry-coordination.test.mjs, tests/runner-runner-quota-retry-coordination-2.test.mjs, tests/runner-runner-quota-retry-coordination-3.test.mjs, tests/runner-runner-quota-retry-coordination-4.test.mjs, tests/runner-runner-quota-retry-coordination-5.test.mjs, tests/runner-runner-quota-retry-coordination-6.test.mjs, tests/runner-runner-quota-retry-coordination-7.test.mjs, tests/runner-checkpoint-durability-1.test.mjs, tests/runner-checkpoint-durability-2.test.mjs, tests/runner-container-lifecycle-wiring-1.test.mjs, tests/runner-container-lifecycle-wiring-2.test.mjs, tests/runner-queue-platform-admission-ordering.test.mjs, tests/runner-queue-platform-admission-ordering-2.test.mjs, tests/runner-queue-platform-admission-ordering-3.test.mjs, tests/runner-runner-commit-reset-behavior.test.mjs, tests/runner-runner-commit-reset-behavior-2.test.mjs, tests/runner-runner-commit-reset-behavior-3.test.mjs, tests/runner-runner-commit-reset-behavior-4.test.mjs, tests/runner-runner-progress-hooks-1.test.mjs, tests/runner-runner-progress-hooks-2.test.mjs, tests/runner-files-allowlist-propagation.test.mjs, tests/runner-executetask-timeout-handling.test.mjs, tests/runner-runner-task-contract-resolution.test.mjs, tests/runner-exclude-provider-threading-1.test.mjs, tests/runner-exclude-provider-threading-2.test.mjs, tests/runner-exclude-provider-threading-3.test.mjs, tests/runner-exclude-provider-threading-4.test.mjs, tests/runner-runqueue-timeout-diff-persistence.test.mjs, tests/runner-runqueue-timeout-diff-persistence-2.test.mjs, tests/runner-runqueue-non-timeout-rejection.test.mjs, tests/runner-reject-declared-paths-that.test.mjs, tests/runner-typed-checkpoint-identity-failures.test.mjs, tests/runner-preserve-closed-integration-rejection.test.mjs, tests/runner-preserve-closed-integration-rejection-2.test.mjs, tests/runner-carry-real-cause-through.test.mjs, tests/runner-broker-production-production-async-runner-retains.test.mjs, tests/runner-broker-production-production-async-runner-commits.test.mjs, tests/runner-broker-production-production-async-runner-isolates.test.mjs, tests/runner-broker-production-production-async-runner-does.test.mjs, tests/runner-broker-production-production-async-runner-keeps.test.mjs, tests/runner-broker-production-production-async-runner-records.test.mjs
 
 ### Contract gate: quick-checks
 
@@ -57,7 +57,7 @@ gate_test: tests/dispatch-cli-parsedispatchargs.test.mjs, tests/dispatch-cli-val
 ### Contract gate: run-store
 
 area: ["src/switchyard/run-store/index.mjs"]
-gate_test: tests/run-store.test.mjs
+gate_test: tests/run-store-shadow-reducer-projection.test.mjs, tests/run-store-provider-diagnostic-artifact-boundary.test.mjs, tests/run-store-initializerun.test.mjs, tests/run-store-event-ordering.test.mjs, tests/run-store-corruption.test.mjs, tests/run-store-retention-1.test.mjs, tests/run-store-retention-2.test.mjs, tests/run-store-retention-3.test.mjs, tests/run-store-project-lock.test.mjs, tests/run-store-project-lock-recovery-claims.test.mjs, tests/run-store-project-lock-recovery-claims-2.test.mjs, tests/run-store-global-vm-admission-slots.test.mjs, tests/run-store-releaseorphanedprojectlocks.test.mjs, tests/run-store-initialhostfingerprint-validation.test.mjs, tests/run-store-lock-file-path-resolution.test.mjs, tests/run-store-prlctl-failure-metadata-survives.test.mjs
 
 ### Contract gate: finalization
 
@@ -72,17 +72,17 @@ gate_test: tests/diagnostics.test.mjs
 ### Contract gate: mutation-protocol
 
 area: ["src/switchyard/lifecycle/mutation-protocol.mjs"]
-gate_test: tests/mutation-protocol.test.mjs, tests/orphan-kill.test.mjs
+gate_test: tests/mutation-protocol-mutation-protocol-1.test.mjs, tests/mutation-protocol-mutation-protocol-2.test.mjs, tests/mutation-protocol-mutation-protocol-3.test.mjs, tests/orphan-kill.test.mjs
 
 ### Contract gate: reservation-ledger
 
 area: ["src/switchyard/broker/index.mjs", "src/switchyard/broker/reservations.mjs", "src/switchyard/broker/snapshots.mjs", "src/switchyard/broker/accounts.mjs", "src/switchyard/broker/commitments.mjs", "src/switchyard/broker/store.mjs"]
-gate_test: tests/broker-reservations.test.mjs, tests/broker-snapshots.test.mjs, tests/broker-fallback.test.mjs, tests/broker-accounts.test.mjs, tests/broker-shared-accounts.test.mjs
+gate_test: tests/broker-reservations-broker-reservations-1.test.mjs, tests/broker-reservations-broker-reservations-2.test.mjs, tests/broker-snapshots.test.mjs, tests/broker-fallback.test.mjs, tests/broker-accounts.test.mjs, tests/broker-shared-accounts.test.mjs
 
 ### Contract gate: route-selection
 
 area: ["src/switchyard/router/index.mjs", "src/switchyard/router/scorer.mjs"]
-gate_test: tests/router.test.mjs, tests/router-rightsizing.test.mjs, tests/router-usage-provider.test.mjs
+gate_test: tests/router-fenced-route-health-projection.test.mjs, tests/router-router-1.test.mjs, tests/router-router-2.test.mjs, tests/router-task-4-3-timeout.test.mjs, tests/router-task-6-3-macos.test.mjs, tests/router-route-health-selection-gate.test.mjs, tests/router-router-route-time-snapshot.test.mjs, tests/router-router.test.mjs, tests/router-providermatches-fallback-roster-unresolvable.test.mjs, tests/router-rightsizing.test.mjs, tests/router-usage-provider.test.mjs
 
 ### Contract gate: simple-execution
 
@@ -92,7 +92,7 @@ gate_test: tests/simple-dispatch.test.mjs
 ### Contract gate: provider-authentication
 
 area: ["src/switchyard/auth/**", "src/switchyard/adapter/agy.mjs", "src/switchyard/adapter/claude.mjs", "src/switchyard/adapter/codex.mjs", "src/switchyard/adapter/copilot.mjs", "src/switchyard/adapter/cursor.mjs", "src/switchyard/adapter/opencode.mjs"]
-gate_test: tests/auth-check.test.mjs, tests/auth-liveness.test.mjs, tests/agy-auth.test.mjs, tests/claude-auth.test.mjs, tests/codex-auth.test.mjs, tests/copilot-auth.test.mjs, tests/cursor-auth.test.mjs, tests/opencode-auth.test.mjs
+gate_test: tests/auth-check-ensureprovidersauthenticated.test.mjs, tests/auth-check-liveness-gating.test.mjs, tests/auth-check-clone-qualification-1.test.mjs, tests/auth-check-clone-qualification-2.test.mjs, tests/auth-check-withbootedgoldenimage-golden-image-posture.test.mjs, tests/auth-liveness.test.mjs, tests/agy-auth.test.mjs, tests/claude-auth.test.mjs, tests/codex-auth.test.mjs, tests/copilot-auth.test.mjs, tests/cursor-auth.test.mjs, tests/opencode-auth.test.mjs
 
 <!-- /contract-gates/v1 -->
 
@@ -116,7 +116,7 @@ The Parallels gate adds host-side `prlctl list -i` assertions that host-defined 
 
 ### INV-2 — Code returns to the Mac only through the explicit, reviewed integration step
 area: ["src/switchyard/integrate/**", "src/switchyard/simple/**"]
-gate_test: tests/integration-gate.test.mjs, tests/simple-dispatch.test.mjs
+gate_test: tests/integration-gate-integration-gate-1.test.mjs, tests/integration-gate-integration-gate-2.test.mjs, tests/integration-gate-integration-gate-3.test.mjs, tests/integration-gate-files-allowlist-enforcement.test.mjs, tests/integration-gate-exact-allowlist-enforcement.test.mjs, tests/simple-dispatch.test.mjs
 threshold: 3
 rationale: The single door between the sandbox and the host. Agent output reaches real files only via a reviewed apply/merge — never a direct agent write to the host. Bypassing this is how unattended agents would silently corrupt the Mac's copy. A retained review artifact is evidence only of a captured non-empty diff, not success; its absence never upgrades a failed route or rejected integration to success. The reviewed apply is itself crash safe: before `applyReviewedDiff` touches the project the checkpoint durably records an integration intent (task id, `baseTree`, sha256 `patchHash`, declared paths) under a fenced checkpoint lease, and a later writer either completes that exact intent or reports `integration_state_unknown`; it never applies a different patch under an old intent. The diff being applied is always captured against the recorded task-start tree, never the working VM's current `HEAD`.
 
@@ -136,7 +136,7 @@ The `simple` path's disposable unit is one local Git clone. After integration it
 
 ### INV-4 — Implementation consumes eligible tier 1 and tier 2 capacity before tier 3
 area: ["src/switchyard/router/**", "src/switchyard/roster/**", "src/switchyard/ledger/**", "src/switchyard/adapter/**", "src/switchyard/runner/**", "src/switchyard/simple/**"]
-gate_test: tests/router.test.mjs, tests/simple-dispatch.test.mjs
+gate_test: tests/router-fenced-route-health-projection.test.mjs, tests/router-router-1.test.mjs, tests/router-router-2.test.mjs, tests/router-task-4-3-timeout.test.mjs, tests/router-task-6-3-macos.test.mjs, tests/router-route-health-selection-gate.test.mjs, tests/router-router-route-time-snapshot.test.mjs, tests/router-router.test.mjs, tests/router-providermatches-fallback-roster-unresolvable.test.mjs, tests/simple-dispatch.test.mjs
 threshold: 3
 <!-- Retry supplement: only verified provider-scoped signatures become quota_exhausted; an owned working-VM target may be quarantined for one reset-before-reroute retry, while generic/auth/unknown failures remain terminal. -->
 <!-- Reliability supplement (2026-09-05): preflight and routing share evaluateCandidateEligibility; route health is shadow by default and only enforce mode suppresses a held target; one half-open trial per target; clean route-health deferral is terminal run state deferred/deferred_work, not task success or failure; deferred tasks remain pending and do not create result/completion entries or provider callbacks; sync, orchestrator, and detached paths persist the same truth and release ownership; run --json/result exit 6 for clean deferral and real failures take precedence; enforce remains off pending at least 20 shadow dispatches, a shipped lifecycle-receipt producer, and safe stale route-health lock recovery; the completion continuation is off by default and bound to the original attempt; primary and quota-fallback invocations own distinct timeout budgets; diagnostic authority is the adapter-originated (origin, code, phase, evidence) tuple. -->
@@ -160,7 +160,7 @@ Current qualification supplement (2026-09-21), which supersedes the dated Gemini
 
 ### INV-6 — Run state is durable and race-free, and a project is never left permanently locked
 area: ["src/switchyard/run-store/**", "src/switchyard/dispatch/**", "src/switchyard/diagnostics/**", "src/switchyard/runner/**"]
-gate_test: tests/run-store.test.mjs, tests/simple-dispatch.test.mjs
+gate_test: tests/run-store-shadow-reducer-projection.test.mjs, tests/run-store-provider-diagnostic-artifact-boundary.test.mjs, tests/run-store-initializerun.test.mjs, tests/run-store-event-ordering.test.mjs, tests/run-store-corruption.test.mjs, tests/run-store-retention-1.test.mjs, tests/run-store-retention-2.test.mjs, tests/run-store-retention-3.test.mjs, tests/run-store-project-lock.test.mjs, tests/run-store-project-lock-recovery-claims.test.mjs, tests/run-store-project-lock-recovery-claims-2.test.mjs, tests/run-store-global-vm-admission-slots.test.mjs, tests/run-store-releaseorphanedprojectlocks.test.mjs, tests/run-store-initialhostfingerprint-validation.test.mjs, tests/run-store-lock-file-path-resolution.test.mjs, tests/run-store-prlctl-failure-metadata-survives.test.mjs, tests/simple-dispatch.test.mjs
 threshold: 3
 <!-- Retry supplement: checkpoint transitions are monotonic and atomic; retry state is authoritative over derived run-store projections, status/result overlay it, and resume reconstructs an interrupted target quarantine before selection. -->
 <!-- Transition supplement (2026-09-10): lifecycle classification is owned by the pure outcome/transitions.mjs constructors; adapters may persist or relay their returned closed decisions but never mint identities, authorize retries, or perform cleanup there. -->

@@ -4,6 +4,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ## [Unreleased]
 
+- Partition the remaining contract test families into bounded files while preserving registrations, scoped hooks, runtime leaf results and incident mutation coverage.
+
 ### Changed
 
 - Split runner, dispatch CLI, and detached-dispatch coverage into 55, 24, and 18 flat test files; keep VM-sensitive test execution explicit and TAP-reported.
