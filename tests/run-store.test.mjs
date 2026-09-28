@@ -23,7 +23,6 @@ import { open, readFile, rename, stat, unlink } from "node:fs/promises";
 
 import { join, relative, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
-import { pathToFileURL } from "node:url";
 import {
 	classifyPreProviderFailure,
 	INTEGRATION_REFUSAL_KINDS,
@@ -85,12 +84,17 @@ import {
 	VmAdmissionUnavailableError,
 	VmSlotUnavailableError,
 } from "../src/switchyard/run-store/index.mjs";
+import {
+	makeOptions,
+	RUN_STORE_MODULE_URL,
+	TEST_ROOT,
+	uniquePath,
+	uniqueRunId,
+	VM_ADMISSION_ROOT,
+} from "./helpers/run-store-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_ROOT = tempDir("switchyard-run-store-");
-
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
-const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
 
 describe("shadow reducer projection", () => {
@@ -863,14 +867,6 @@ afterEach(() => {
 	}
 });
 
-function uniqueRunId() {
-	return randomUUID();
-}
-
-const RUN_STORE_MODULE_URL = pathToFileURL(
-	resolve("src/switchyard/run-store/index.mjs"),
-).href;
-
 function spawnSlotChild(source) {
 	return spawn(process.execPath, ["--input-type=module", "-e", source], {
 		env: { ...process.env, SWITCHYARD_VM_ADMISSION_ROOT: VM_ADMISSION_ROOT },
@@ -908,11 +904,6 @@ function waitForChild(child) {
 		child.once("exit", (code, signal) => resolveExit({ code, signal }));
 	});
 }
-
-function uniquePath(label) {
-	return join(TEST_ROOT, `path-${label || uniqueRunId()}`);
-}
-
 // Mirrors the private lockFilePath() hashing scheme in run-store/index.mjs
 // so tests can read a lock file's raw JSON body directly.
 function projectLockFilePath(canonicalProjectPath) {
@@ -933,19 +924,6 @@ function cwdDerivedProjectLockFilePath(canonicalProjectPath) {
 	const hash = createHash("sha256").update(historicalKeyPath).digest("hex");
 	return resolve(getStateRoot(), "locks", `${hash}.lock`);
 }
-
-function makeOptions(overrides = {}) {
-	return {
-		runId: uniqueRunId(),
-		tasksFilePath: uniquePath("tasks"),
-		projectPath: uniquePath("project"),
-		orderedTaskIds: ["task-1", "task-2", "task-3"],
-		initialHostFingerprint: { git: "abc123", worktree: "clean" },
-		launchArgs: ["--provider", "claude"],
-		...overrides,
-	};
-}
-
 describe("getStateRoot", () => {
 	it("returns an absolute path ending in .logs/switchyard by default", () => {
 		const saved = process.env.SWITCHYARD_RUN_STORE_ROOT;

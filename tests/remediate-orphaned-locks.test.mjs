@@ -34,9 +34,14 @@ import {
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
 import { RUN_STARTUP_GRACE_MS } from "../src/switchyard/run-store/run-liveness.mjs";
-import { tempDir } from "./helpers/tempdir.mjs";
+import {
+	makeOptions,
+	projectLockFilePath,
+	TEST_ROOT,
+	uniquePath,
+	uniqueRunId,
+} from "./helpers/remediate-orphaned-locks-fixtures.mjs";
 
-const TEST_ROOT = tempDir("switchyard-remediate-locks-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 
 after(() => {
@@ -55,38 +60,10 @@ afterEach(() => {
 	}
 });
 
-function uniqueRunId() {
-	return randomUUID();
-}
-
-function uniquePath(label) {
-	return join(TEST_ROOT, `path-${label || uniqueRunId()}`);
-}
-
-function makeOptions(overrides = {}) {
-	// uniquePath() with no label falls back to a fresh uuid per call — unlike
-	// a fixed literal label, which would hand every unlabeled makeOptions()
-	// call in a test the same path and collide on acquireProjectLock.
-	return {
-		runId: uniqueRunId(),
-		tasksFilePath: uniquePath(),
-		projectPath: uniquePath(),
-		orderedTaskIds: ["task-1"],
-		initialHostFingerprint: { git: "abc123", worktree: "clean" },
-		launchArgs: [],
-		...overrides,
-	};
-}
-
 // Mirrors the private lockFilePath() hashing scheme in run-store/index.mjs
 // (same mirror tests/run-store.test.mjs uses) so fixtures can write a raw
 // pre-F.1-shape lock body ({runId, createdAt}, no projectPath) directly at
 // the exact path a real project lock for that path would occupy.
-function projectLockFilePath(canonicalProjectPath) {
-	const identity = `project:${resolve(canonicalProjectPath)}`;
-	const hash = createHash("sha256").update(identity).digest("hex");
-	return resolve(getStateRoot(), "locks", `${hash}.lock`);
-}
 
 function projectLockClaimFilePath(canonicalProjectPath) {
 	return `${projectLockFilePath(canonicalProjectPath)}.recovery-claim`;
