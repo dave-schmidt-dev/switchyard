@@ -51,6 +51,10 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 	},
 	{
 		path: "src/switchyard/dispatch/worker-bootstrap.mjs",
+		members: [
+			"src/switchyard/dispatch/worker-bootstrap-support.mjs",
+			"src/switchyard/dispatch/worker-bootstrap-state.mjs",
+		],
 		lines: 55,
 		branches: 30,
 		functions: 55,

@@ -1,7 +1,3 @@
-// Dispatched by launch(), never run directly.
-// Minimal bootstrap: install fatal handlers, verify nonce + host fingerprint,
-// claim lease, advance state, then dynamically import and run the queue.
-
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstatSync, unlinkSync, writeFileSync } from "node:fs";
@@ -23,458 +19,50 @@ import {
 	successTransition,
 } from "../outcome/transitions.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
+import {
+	createWorkerBootstrapIdentityState,
+	drainWriteChain,
+	emitFatalPersistenceDiagnostic,
+	lastWriteFailure,
+	queueWrite,
+	requestGracefulShutdown,
+	shutdown,
+	writeFailureCount,
+} from "./worker-bootstrap-state.mjs";
+import {
+	bootDiagnosticPath,
+	boundedRouteHealthDecisionEvent,
+	buildFatalFailure,
+	createWorkerBootstrapFatalHelpers,
+	detachedTerminalOutcome,
+	isRecognizedCheckpointIdentityError,
+	parseArg,
+	persistTerminalOutcome,
+	retainSafeBootDiagnostic,
+	yieldFatalHandlerTurn,
+} from "./worker-bootstrap-support.mjs";
 
-function parseArg(argv, flag) {
-	const idx = argv.indexOf(flag);
-	if (idx < 0 || idx + 1 >= argv.length) return null;
-	return argv[idx + 1];
-}
-
-let stateRoot = null;
-let runId = null;
-let nonce = null;
-
-// Module-scope write chain serializing every run-store mutation this worker
-// fires outside a direct `await` (the onTaskStart/onTaskRouted/onResult/
-// onCheckpointSaved/onContainerReady callbacks below). Each callback must
-// synchronously extend this chain the moment it fires — `writeChain =
-// writeChain.then(fn, fn).catch(() => {})` — so the *call* to
-// updateRunWithRetry for a later-firing callback can never start before an
-// earlier-firing callback's call has settled. Without this, two callbacks
-// firing close together race independently for I/O (their internal readRun()
-// calls), and whichever happens to resolve first reaches the per-runId
-// update queue first — which can let an earlier-firing callback's write land
-// *after* a later-firing one's, silently corrupting the run record with a
-// stale value even though updateRunWithRetry guarantees no write is ever
-// lost. Chaining on fire order (not completion order) fixes that. It always
-// resolves (never rejects), so awaiting it anywhere is safe and bounded.
-let writeFailureCount = 0;
-let lastWriteFailure = null;
-const shutdown = new AbortController();
-let shutdownSignal = null;
-let fatalFinalizationPromise = null;
-let QueueCleanupErrorType = null;
-let fatalPersistenceDiagnosticEmitted = false;
-
-const FATAL_PERSISTENCE_DIAGNOSTIC =
-	"worker-bootstrap: fatal event persistence unavailable; durable run state may be incomplete";
-const ROUTE_HEALTH_STATES = new Set([
-	"healthy",
-	"suspect",
-	"cooldown",
-	"repair-hold",
-	"half-open",
-	"health-unavailable",
-]);
-
-export function boundedRouteHealthDecisionEvent(decision) {
-	if (!decision || typeof decision !== "object") return null;
-	const provider =
-		typeof decision.provider === "string" &&
-		decision.provider.length > 0 &&
-		decision.provider.length <= 128 &&
-		!/[^\x20-\x7e]/.test(decision.provider)
-			? decision.provider
-			: null;
-	if (!provider) return null;
-	const state = ROUTE_HEALTH_STATES.has(decision.state)
-		? decision.state
-		: "health-unavailable";
-	const mode = decision.mode === "enforce" ? "enforce" : "shadow";
-	const targetId =
-		typeof decision.resolvedTargetId === "string" &&
-		decision.resolvedTargetId.length > 0 &&
-		decision.resolvedTargetId.length <= 256 &&
-		!/[^\x20-\x7e]/.test(decision.resolvedTargetId)
-			? decision.resolvedTargetId
-			: null;
-	return {
-		phase: "route_health",
-		event: "health_decision",
-		status: `Route health ${mode} decision: ${state}`,
-		provider,
-		...(targetId ? { targetId } : {}),
-		mode,
-		state,
-		available: decision.available === true,
-		suppress: decision.suppress === true,
-		trialAvailable: decision.trialAvailable === true,
-		initializable: decision.initializable === true,
-	};
-}
-
-function emitFatalPersistenceDiagnostic() {
-	if (fatalPersistenceDiagnosticEmitted) return;
-	fatalPersistenceDiagnosticEmitted = true;
-	console.error(FATAL_PERSISTENCE_DIAGNOSTIC);
-}
-
-function requestGracefulShutdown(signal) {
-	if (shutdownSignal) return;
-	shutdownSignal = signal;
-	shutdown.abort();
-	console.error(
-		`worker-bootstrap: received ${signal}; finishing durable cleanup`,
-	);
-}
-
-function safeWriteFailure(error) {
-	writeFailureCount += 1;
-	// Keep diagnostics categorical and scalar; Error.message can contain host
-	// paths or provider-generated text and must not cross the telemetry boundary.
-	const categories = {
-		RevisionError: "revision_conflict",
-		SchemaError: "schema_invalid",
-		LockError: "lock_error",
-		TypeError: "type_error",
-		Error: "write_failed",
-	};
-	const name = typeof error?.name === "string" ? error.name : "";
-	lastWriteFailure = Object.hasOwn(categories, name)
-		? categories[name]
-		: "write_failed";
-	console.error("worker-bootstrap: run-store write failed");
-}
-
-const MAX_BOOT_DIAGNOSTIC_BYTES = 4096;
-
-function bootDiagnosticPath(runRoot) {
-	return resolve(runRoot, "boot-stderr.log");
-}
-
-function retainSafeBootDiagnostic(runRoot, category) {
-	if (typeof runRoot !== "string" || typeof category !== "string") return false;
-	const safeCategory = /^[a-z0-9_]+$/u.test(category)
-		? category
-		: "worker_boot_failed";
-	try {
-		try {
-			const existing = lstatSync(bootDiagnosticPath(runRoot));
-			if (
-				!existing.isFile() ||
-				existing.isSymbolicLink() ||
-				existing.nlink !== 1 ||
-				(typeof process.getuid === "function" &&
-					existing.uid !== process.getuid()) ||
-				(existing.mode & 0o077) !== 0
-			)
-				return false;
-		} catch (error) {
-			if (error?.code !== "ENOENT") return false;
-		}
-		writeFileSync(bootDiagnosticPath(runRoot), `${safeCategory}\n`, {
-			encoding: "utf8",
-			mode: 0o600,
-			flag: "w",
-		});
-		const stat = lstatSync(bootDiagnosticPath(runRoot));
-		return (
-			stat.isFile() &&
-			!stat.isSymbolicLink() &&
-			stat.nlink === 1 &&
-			(typeof process.getuid !== "function" || stat.uid === process.getuid()) &&
-			(stat.mode & 0o077) === 0 &&
-			stat.size > 0 &&
-			stat.size <= MAX_BOOT_DIAGNOSTIC_BYTES
-		);
-	} catch {
-		return false;
-	}
-}
-
-export function createWriteChain({ onFailure = () => {} } = {}) {
-	let writeChain = Promise.resolve();
-
-	return {
-		queueWrite(fn, { propagateFailure = false } = {}) {
-			const write = writeChain.then(fn, fn);
-			writeChain = write.catch((error) => {
-				onFailure(error);
-			});
-			// Most callback writes are telemetry: record their failure but allow the
-			// queue to continue. Cleanup-state persistence is different: the runner
-			// must observe a failure so it can log it, while its finally block still
-			// tears down the owned container.
-			return propagateFailure ? write : writeChain;
-		},
-		drain: () => writeChain,
-	};
-}
-
-export async function persistTerminalOutcome({
-	runStore,
-	routeHealth,
-	runId,
-	event,
-	routeHealthBinding,
-	healthStateRoot,
-	onHealthUnavailable = () => {},
-}) {
-	if (!routeHealthBinding) {
-		await runStore.createEvent(runId, event);
-		return;
-	}
-	await runStore.createRouteHealthEvent(runId, event, routeHealthBinding);
-	try {
-		await routeHealth.ingestRouteHealthEvents({
-			authorisedRuns: [{ runId, runRoot: runStore.getRunRoot(runId) }],
-			healthStateRoot,
-		});
-	} catch {
-		onHealthUnavailable();
-	}
-}
-
-export function detachedTerminalOutcome({
-	failed = [],
-	deferredTaskIds = [],
-	writeFailureCount: failedWrites = 0,
-} = {}) {
-	const persistenceFailure =
-		failedWrites > 0
-			? sanitizeFailureMetadata({
-					result: "run_store_write_failed",
-					errorKind: "run_store_write_failed",
-					failurePhase: "terminal_reconciliation",
-				})
-			: null;
-	return {
-		state:
-			failed.length > 0 || persistenceFailure
-				? "failed"
-				: deferredTaskIds.length > 0
-					? "deferred"
-					: "succeeded",
-		failure: persistenceFailure ?? sanitizeFailureMetadata(failed.at(-1) ?? {}),
-	};
-}
-
-const { queueWrite, drain: drainWriteChain } = createWriteChain({
-	onFailure: safeWriteFailure,
+const bootstrapIdentityState = createWorkerBootstrapIdentityState();
+const fatalHelpers = createWorkerBootstrapFatalHelpers({
+	state: bootstrapIdentityState,
+	finalizeRun,
+	retainSafeBootDiagnostic,
+	buildFatalFailure,
+	isRecognizedCheckpointIdentityError,
+	emitFatalPersistenceDiagnostic,
+	isPersistentFailureMetadata,
+	requestGracefulShutdown,
+	yieldFatalHandlerTurn,
+	spawnSync,
+	isAbsolute,
+	relative,
+	resolve,
+	sep,
 });
-
-const RECOGNIZED_CHECKPOINT_IDENTITY_CODES = new Set([
-	"checkpoint_task_file_mismatch",
-	"checkpoint_tasks_file_mismatch",
-	"checkpoint_missing_queue_identity",
-	"checkpoint_queue_identity_missing",
-	"checkpoint_queue_identity_mismatch",
-	"checkpoint_run_options_mismatch",
-	"checkpoint_historical_checkpoint",
-	"checkpoint_historical_state",
-]);
-
-export function isRecognizedCheckpointIdentityError(error) {
-	return (
-		typeof error?.code === "string" &&
-		RECOGNIZED_CHECKPOINT_IDENTITY_CODES.has(error.code)
-	);
-}
-
-export function buildFatalFailure(
-	error,
-	diagnosticCode = "worker_boot_exception",
-	diagnosticEvidenceAvailable = false,
-) {
-	const prlctlFailure = prlctlFailureMetadata(error);
-	const classified = classifyPreProviderFailure(error) ?? {
-		diagnosticCode,
-		errorKind: "launch_failed",
-		failurePhase: "worker_boot",
-	};
-	const closedCode = classified.diagnosticCode;
-	const decision = failureTransition({
-		result: "launch_failed",
-		errorKind: classified.errorKind,
-		failurePhase: classified.failurePhase,
-		diagnosticCode: closedCode,
-		diagnosticOrigin: "worker_boot",
-		diagnosticEvidenceAvailable: diagnosticEvidenceAvailable === true,
-		...(prlctlFailure && closedCode === prlctlFailure.diagnosticCode
-			? { exitCode: prlctlFailure.exitCode, signal: prlctlFailure.signal }
-			: {}),
-		...(isRecognizedCheckpointIdentityError(error)
-			? {
-					checkpointCode: error.code,
-					checkpointDimensions: error.changedDimensions,
-				}
-			: {}),
-	});
-	const failure = decision.failureMetadata;
-	return failure;
-}
-
-async function writeFatalEvent(
-	error,
-	diagnosticCode = "worker_boot_exception",
-) {
-	try {
-		const runStore = await import("../run-store/index.mjs");
-		const current = await runStore.readRun(runId);
-		const retainedBootDiagnostic = retainSafeBootDiagnostic(
-			runStore.getRunRoot(runId),
-			diagnosticCode,
-		);
-		// A prlctl failure is checked before the boot-stage code because it is
-		// strictly more specific: "workspace_prepare_failed" says which stage
-		// died, "prlctl_job_misfire" says why, and the why is what a reader
-		// needs to tell a transient host-side SDK fault apart from a real
-		// provisioning problem. Both are closed vocabulary.
-		const failure = buildFatalFailure(
-			error,
-			diagnosticCode,
-			retainedBootDiagnostic,
-		);
-		await finalizeRun(
-			{
-				runId,
-				state: "failed",
-				failure,
-				eventName: "worker_boot_failed",
-				eventStatus: isRecognizedCheckpointIdentityError(error)
-					? error.code
-					: "fatal",
-				eventReasonCode: isRecognizedCheckpointIdentityError(error)
-					? error.code
-					: failure.reasonCode,
-				terminalSummary: {
-					totalTasks: Array.isArray(current.orderedTaskIds)
-						? current.orderedTaskIds.length
-						: null,
-					runnableTasks: null,
-					processedTasks: null,
-					completedTaskIds: null,
-					failedCount: null,
-				},
-				extraPatch: error?.preflightDetail
-					? { preflightDetail: error.preflightDetail }
-					: {},
-				cleanup: async () => {
-					await runStore.reconcileProjectLockClaims();
-					await runStore.releaseProjectLockIfOwnedBy(
-						current.projectPath,
-						runId,
-					);
-				},
-			},
-			runStore,
-		);
-	} catch {
-		// A missing or corrupt run must not be mutated. Keep this fallback fixed
-		// and categorical because the original error can contain paths, provider
-		// output, or other sensitive data.
-		emitFatalPersistenceDiagnostic();
-	}
-}
-
-function isQueueCleanupError(error) {
-	return (
-		QueueCleanupErrorType !== null &&
-		error instanceof QueueCleanupErrorType &&
-		error?.code === "recovery_incomplete" &&
-		isPersistentFailureMetadata(error?.failure)
-	);
-}
-
-async function writeQueueCleanupFailure(error) {
-	const runStore = await import("../run-store/index.mjs");
-	await finalizeRun(
-		{
-			runId,
-			state: "failed",
-			failure: error.failure,
-			eventName: "run_failed",
-			eventStatus: "recovery_required",
-			terminalSummary: error.terminalSummary,
-			// runQueueAsync already attempted owned-workspace teardown. Keeping
-			// the project lock while this fixed cleanup failure drives the shared
-			// finalizer to recovery_required prevents another run from claiming
-			// the project before explicit recovery proves the workspace absent.
-			cleanup: async () => {
-				throw new Error("queue cleanup incomplete");
-			},
-		},
-		runStore,
-	);
-}
-
-function installProcessHandlers() {
-	process.on("SIGINT", () => requestGracefulShutdown("SIGINT"));
-	process.on("SIGTERM", () => requestGracefulShutdown("SIGTERM"));
-	process.on("uncaughtException", (error) => {
-		fatalFinalizationPromise = writeFatalEvent(
-			error,
-			"worker_boot_exception",
-		).then(() => process.exit(1));
-	});
-	process.on("unhandledRejection", (reason) => {
-		const error = reason instanceof Error ? reason : new Error(String(reason));
-		fatalFinalizationPromise = writeFatalEvent(
-			error,
-			"worker_boot_exception",
-		).then(() => process.exit(1));
-	});
-}
-
-function captureCurrentFingerprint(projectPath) {
-	let head = "";
-	let dirty = "unknown";
-	try {
-		const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
-			cwd: projectPath,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		if (headResult.status === 0) {
-			head = headResult.stdout.trim();
-		}
-		const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
-		const relativeStateRoot = relative(
-			resolve(projectPath),
-			resolve(stateRoot),
-		);
-		if (
-			relativeStateRoot &&
-			!isAbsolute(relativeStateRoot) &&
-			!relativeStateRoot.startsWith(`..${sep}`)
-		) {
-			statusArgs.push("--", ".", `:(exclude)${relativeStateRoot}/**`);
-		}
-		const statusResult = spawnSync("git", statusArgs, {
-			cwd: projectPath,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		if (statusResult.status === 0) {
-			dirty = statusResult.stdout.trim().length > 0 ? "dirty" : "clean";
-		}
-	} catch {
-		// git unavailable
-	}
-	return `git:${head || "no-head"}:${dirty}`;
-}
-
-async function yieldFatalHandlerTurn() {
-	await new Promise((resolveTurn) => setImmediate(resolveTurn));
-}
-
-async function exitAfterDirectFailure(error, diagnosticCode, exitCode) {
-	// A next-tick uncaught exception may already be queued by the embedding
-	// process. Give the installed fatal handler first claim so its exit 1 and
-	// worker_boot_exception evidence cannot race a direct bootstrap exit.
-	await yieldFatalHandlerTurn();
-	if (fatalFinalizationPromise) {
-		await fatalFinalizationPromise;
-		process.exit(1);
-	}
-	await writeFatalEvent(error, diagnosticCode);
-	process.exit(exitCode);
-}
-
 export async function runWorkerBootstrap(argv = process.argv) {
-	stateRoot = parseArg(argv, "--state-root");
-	runId = parseArg(argv, "--run-id");
-	nonce = parseArg(argv, "--nonce");
+	const stateRoot = parseArg(argv, "--state-root");
+	const runId = parseArg(argv, "--run-id");
+	const nonce = parseArg(argv, "--nonce");
 
 	if (!stateRoot || !runId || !nonce) {
 		console.error(
@@ -483,8 +71,9 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		process.exit(1);
 	}
 
+	bootstrapIdentityState.setIdentity({ stateRoot, runId, nonce });
 	process.env.SWITCHYARD_RUN_STORE_ROOT = stateRoot;
-	installProcessHandlers();
+	fatalHelpers.installProcessHandlers();
 
 	// Refuse before importing run-store or running retention. A maintenance
 	// generation freezes every producer, including detached workers; the later
@@ -493,7 +82,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		assertGenerationAllowed();
 	} catch (error) {
 		console.error("worker-bootstrap: generation guard refused");
-		await writeFatalEvent(error, "worker_boot_exception");
+		await fatalHelpers.writeFatalEvent(error, "worker_boot_exception");
 		process.exit(1);
 	}
 
@@ -522,7 +111,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		}
 
 		if (run.workerNonce !== nonce) {
-			await exitAfterDirectFailure(
+			await fatalHelpers.exitAfterDirectFailure(
 				new Error(
 					`nonce mismatch: bootstrap received "${nonce}", run.json has "${run.workerNonce}"`,
 				),
@@ -534,7 +123,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 			run.dispatchContractVersion !== undefined &&
 			run.dispatchContractVersion !== 1
 		) {
-			await exitAfterDirectFailure(
+			await fatalHelpers.exitAfterDirectFailure(
 				new Error(
 					`unsupported dispatch descriptor contract version: ${run.dispatchContractVersion}`,
 				),
@@ -543,13 +132,15 @@ export async function runWorkerBootstrap(argv = process.argv) {
 			);
 		}
 
-		const currentFingerprint = captureCurrentFingerprint(run.projectPath);
+		const currentFingerprint = fatalHelpers.captureCurrentFingerprint(
+			run.projectPath,
+		);
 		if (
 			run.initialHostFingerprint !== currentFingerprint &&
 			!currentFingerprint.includes(":no-head:") &&
 			!run.initialHostFingerprint.includes(":no-head:")
 		) {
-			await exitAfterDirectFailure(
+			await fatalHelpers.exitAfterDirectFailure(
 				new Error(
 					`host fingerprint mismatch: initial="${run.initialHostFingerprint}", current="${currentFingerprint}"`,
 				),
@@ -607,7 +198,7 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		const lifecycle = await import("../lifecycle/index.mjs");
 		const routeHealth = await import("../router/health.mjs");
 		const runQueueFn = runner.runQueueAsync;
-		QueueCleanupErrorType = runner.QueueCleanupError;
+		bootstrapIdentityState.setQueueCleanupErrorType(runner.QueueCleanupError);
 		const persistedRunOptions = run.runOptions ?? null;
 		const dirtyOverlayReceipt =
 			persistedRunOptions?.dirtyOverlay === true &&
@@ -1077,9 +668,9 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		// updateRun below from losing a revision race to that straggler.
 		// writeChain always resolves, so this is safe even before it's ever used.
 		await drainWriteChain();
-		if (isQueueCleanupError(error)) {
+		if (fatalHelpers.isQueueCleanupError(error)) {
 			try {
-				await writeQueueCleanupFailure(error);
+				await fatalHelpers.writeQueueCleanupFailure(error);
 			} catch {
 				// Do not fall through to fatal finalization: that path performs only
 				// lock cleanup and could falsely mark the still-owned workspace clean.
@@ -1093,14 +684,22 @@ export async function runWorkerBootstrap(argv = process.argv) {
 			// Keep the boot log categorical; preflight detail can contain host paths.
 			console.error("worker-bootstrap: queue preflight failed");
 		}
-		await writeFatalEvent(error, "worker_boot_exception");
+		await fatalHelpers.writeFatalEvent(error, "worker_boot_exception");
 		process.exit(1);
 	}
 }
-
 const invokedPath = process.argv[1]
 	? pathToFileURL(resolve(process.argv[1])).href
 	: null;
 if (invokedPath === import.meta.url) {
 	await runWorkerBootstrap();
 }
+
+export {
+	boundedRouteHealthDecisionEvent,
+	buildFatalFailure,
+	createWriteChain,
+	detachedTerminalOutcome,
+	isRecognizedCheckpointIdentityError,
+	persistTerminalOutcome,
+} from "./worker-bootstrap-support.mjs";

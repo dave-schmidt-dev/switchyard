@@ -39,6 +39,8 @@ The 2026-09-05 reliability changes (Phases 1–4 of the reliability plan) are im
 
 ## Layout
 
+Public entrypoints remain in their existing modules. Error classification, authentication, integration validation, ledger sanitization, routing and health, lifecycle overlays, roster descriptors, and orphan scanning now use adjacent modules; callers continue to import the existing entrypoints.
+
 | Path | Purpose |
 |---|---|
 | `README.md` | This file. |

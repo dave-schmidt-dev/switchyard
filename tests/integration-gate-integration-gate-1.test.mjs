@@ -190,7 +190,12 @@ index 0000000..abcdef1
 			APPLY_CHECK_MAX_BUFFER > 1024 * 1024,
 			"bound must be larger than the default 1 MiB the probe would otherwise fall back to",
 		);
-		const source = sourceText("src/switchyard/integrate/index.mjs");
+		const source = sourceText(
+			"src/switchyard/integrate/index.mjs",
+			"src/switchyard/integrate/diff-validation.mjs",
+			"src/switchyard/integrate/commit-validation.mjs",
+			"src/switchyard/integrate/apply.mjs",
+		);
 		// Anchor the wiring to the probe implementation itself rather than
 		// to an unanchored module-wide count: a refactor could move the
 		// single maxBuffer site to a different spawnSync (e.g. the mutating

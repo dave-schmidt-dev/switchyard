@@ -46,7 +46,7 @@ gate_test: tests/runner-quick-checks.test.mjs
 
 ### Contract gate: worker-bootstrap
 
-area: ["src/switchyard/dispatch/worker-bootstrap.mjs"]
+area: ["src/switchyard/dispatch/worker-bootstrap.mjs", "src/switchyard/dispatch/worker-bootstrap-support.mjs", "src/switchyard/dispatch/worker-bootstrap-state.mjs"]
 gate_test: tests/worker-bootstrap-write-chain.test.mjs, tests/worker-bootstrap-fatal-metadata.test.mjs
 
 ### Contract gate: dispatch-cli-counters
@@ -81,7 +81,7 @@ gate_test: tests/broker-reservations-broker-reservations-1.test.mjs, tests/broke
 
 ### Contract gate: route-selection
 
-area: ["src/switchyard/router/index.mjs", "src/switchyard/router/scorer.mjs"]
+area: ["src/switchyard/router/index.mjs", "src/switchyard/router/scorer.mjs", "src/switchyard/router/eligibility.mjs", "src/switchyard/router/preflight.mjs"]
 gate_test: tests/router-fenced-route-health-projection.test.mjs, tests/router-router-1.test.mjs, tests/router-router-2.test.mjs, tests/router-task-4-3-timeout.test.mjs, tests/router-task-6-3-macos.test.mjs, tests/router-route-health-selection-gate.test.mjs, tests/router-router-route-time-snapshot.test.mjs, tests/router-router.test.mjs, tests/router-providermatches-fallback-roster-unresolvable.test.mjs, tests/router-rightsizing.test.mjs, tests/router-usage-provider.test.mjs
 
 ### Contract gate: simple-execution

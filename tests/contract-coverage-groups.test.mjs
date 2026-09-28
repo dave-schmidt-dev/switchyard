@@ -36,15 +36,17 @@ function lcovRecord(path, { LF, LH, BRF, BRH, FNF, FNH }) {
 }
 
 function passingCoverageFixture() {
-	return CRITICAL_MODULE_COVERAGE.map((module) =>
-		lcovRecord(module.path, {
-			LF: 100,
-			LH: 100,
-			BRF: 100,
-			BRH: 100,
-			FNF: 100,
-			FNH: 100,
-		}),
+	return CRITICAL_MODULE_COVERAGE.flatMap((module) =>
+		[module.path, ...(module.members ?? [])].map((path) =>
+			lcovRecord(path, {
+				LF: 100,
+				LH: 100,
+				BRF: 100,
+				BRH: 100,
+				FNF: 100,
+				FNH: 100,
+			}),
+		),
 	).join("\n");
 }
 

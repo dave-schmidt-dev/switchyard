@@ -8,6 +8,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Split source modules around error classification, authentication, integration validation, routing, lifecycle overlays, roster descriptors, and orphan scanning while preserving public entrypoints.
+
 - Split runner, dispatch CLI, and detached-dispatch coverage into 55, 24, and 18 flat test files; keep VM-sensitive test execution explicit and TAP-reported.
 
 ### Fixed

@@ -325,7 +325,12 @@ describe("an interrupted login ends the walkthrough", () => {
 	});
 
 	it("kills a login transport whose guest child traps SIGINT", async () => {
-		const authSource = sourceText("src/switchyard/auth/index.mjs");
+		const authSource = sourceText(
+			"src/switchyard/auth/index.mjs",
+			"src/switchyard/auth/sessions.mjs",
+			"src/switchyard/auth/providers.mjs",
+			"src/switchyard/auth/clone-check.mjs",
+		);
 		strictEqual(
 			authSource.includes("set -m"),
 			false,
