@@ -23,6 +23,136 @@ export function createTestChecker(shared) {
 		return callback?.body?.type === "BlockStatement" ? callback.body.body : [];
 	}
 
+	function directTestCall(statement) {
+		const expression = statement?.expression;
+		return (
+			expression?.type === "CallExpression" &&
+			expression.callee.type === "Identifier" &&
+			["it", "test"].includes(expression.callee.name)
+		);
+	}
+
+	function registrationCallee(callee) {
+		if (callee?.type === "Identifier") return callee.name;
+		if (callee?.type === "MemberExpression")
+			return registrationCallee(callee.object);
+		return null;
+	}
+
+	function registrationCall(node) {
+		return (
+			node?.type === "CallExpression" &&
+			["it", "test"].includes(registrationCallee(node.callee))
+		);
+	}
+
+	function isFunction(node) {
+		return [
+			"FunctionDeclaration",
+			"FunctionExpression",
+			"ArrowFunctionExpression",
+		].includes(node?.type);
+	}
+
+	function containsRegistration(node) {
+		if (!node || typeof node !== "object") return false;
+		if (registrationCall(node)) return true;
+		if (isFunction(node)) return false;
+		if (
+			node.type === "CallExpression" &&
+			node.arguments.some(
+				(argument) =>
+					isFunction(argument) && containsRegistration(argument.body),
+			)
+		)
+			return true;
+		return Object.entries(node).some(([key, value]) => {
+			if (["loc", "start", "end", "range", "raw"].includes(key)) return false;
+			if (Array.isArray(value)) return value.some(containsRegistration);
+			return containsRegistration(value);
+		});
+	}
+
+	function potentialEffect(node) {
+		if (!node || typeof node !== "object") return false;
+		if (Array.isArray(node)) return node.some(potentialEffect);
+		if (
+			[
+				"FunctionDeclaration",
+				"FunctionExpression",
+				"ArrowFunctionExpression",
+			].includes(node.type)
+		)
+			return false;
+		if (
+			[
+				"CallExpression",
+				"NewExpression",
+				"AwaitExpression",
+				"YieldExpression",
+				"AssignmentExpression",
+				"UpdateExpression",
+			].includes(node.type)
+		)
+			return true;
+		return Object.entries(node)
+			.filter(
+				([key]) => !["type", "start", "end", "range", "loc"].includes(key),
+			)
+			.some(([, value]) => potentialEffect(value));
+	}
+
+	function effectfulVariable(statement) {
+		const declaration =
+			statement?.type === "ExportNamedDeclaration"
+				? statement.declaration
+				: statement;
+		return (
+			declaration?.type === "VariableDeclaration" &&
+			["const", "var"].includes(declaration.kind) &&
+			declaration.declarations.some(
+				(item) => item.init && potentialEffect(item.init),
+			)
+		);
+	}
+
+	function literalValue(node) {
+		if (!node) return false;
+		if (node.type === "Literal") return true;
+		if (node.type === "TemplateLiteral") return node.expressions.length === 0;
+		if (node.type === "ArrayExpression")
+			return node.elements.every((element) => element && literalValue(element));
+		if (node.type !== "ObjectExpression") return false;
+		return node.properties.every(
+			(property) =>
+				["Property", "ObjectProperty"].includes(property.type) &&
+				property.kind === "init" &&
+				!property.computed &&
+				!property.method &&
+				literalValue(property.value),
+		);
+	}
+
+	function factoryRegistration(statement) {
+		if (statement?.type !== "ForOfStatement" || statement.await) return null;
+		const declaration = statement.left;
+		if (
+			declaration?.type !== "VariableDeclaration" ||
+			declaration.kind !== "const" ||
+			declaration.declarations.length !== 1 ||
+			declaration.declarations[0].id.type !== "Identifier" ||
+			declaration.declarations[0].init ||
+			statement.right?.type !== "ArrayExpression" ||
+			!statement.right.elements.every(
+				(element) => element && literalValue(element),
+			)
+		)
+			return null;
+		const body =
+			statement.body?.type === "BlockStatement" ? statement.body.body : [];
+		return body.length === 1 && directTestCall(body[0]) ? body[0] : null;
+	}
+
 	function titleOf(statement, text) {
 		const title = statement.expression.arguments?.[0];
 		if (typeof title?.value === "string") return title.value;
@@ -37,18 +167,32 @@ export function createTestChecker(shared) {
 			for (const statement of body) {
 				if (statement.type === "ImportDeclaration") continue;
 				const name = callName(statement);
+				const registration = factoryRegistration(statement);
+				const opaqueRegistration =
+					!registration &&
+					!directTestCall(statement) &&
+					containsRegistration(statement);
 				const entry = {
-					kind: ["it", "test"].includes(name)
-						? "test"
-						: name === "describe"
-							? "describe"
-							: "non-test",
+					kind: registration
+						? "factory"
+						: directTestCall(statement)
+							? "test"
+							: name === "describe"
+								? "describe"
+								: opaqueRegistration
+									? "opaque-registration"
+									: "non-test",
 					text: statementText(text, statement),
 					scope,
 					call: name,
 					statementType: statement.type,
 					statementKind: statement.kind,
+					effectfulVariable: effectfulVariable(statement),
 				};
+				if (registration) {
+					entry.registration = statementText(text, registration);
+					entry.registrationCall = callName(registration);
+				}
 				if (entry.kind === "describe") {
 					entry.title = titleOf(statement, text);
 					entry.scope = [...scope, entry.title];
@@ -84,6 +228,14 @@ export function createTestChecker(shared) {
 		return entry.kind === "describe"
 			? JSON.stringify([entry.kind, entry.scope])
 			: JSON.stringify([entry.kind, entry.text, entry.scope]);
+	}
+
+	function factoryKey(entry) {
+		return JSON.stringify([entry.text, entry.scope, entry.registration]);
+	}
+
+	function opaqueRegistrationKey(entry) {
+		return JSON.stringify([entry.text, entry.scope]);
 	}
 
 	function carriedOrder(entries, baseEntries) {
@@ -124,7 +276,9 @@ export function createTestChecker(shared) {
 			required.set(key, current);
 		}
 		for (const { entries } of partEntries) {
-			const tests = entries.filter((entry) => entry.kind === "test");
+			const tests = entries.filter((entry) =>
+				["test", "factory", "opaque-registration"].includes(entry.kind),
+			);
 			if (!tests.length) continue;
 			for (const [key, { entry, count }] of required) {
 				const applies = entry.scope.length
@@ -133,7 +287,8 @@ export function createTestChecker(shared) {
 						)
 					: isHook(entry) ||
 						entry.statementType === "ExpressionStatement" ||
-						entry.statementKind === "let";
+						entry.statementKind === "let" ||
+						entry.effectfulVariable;
 				if (!applies) continue;
 				const actual = entries.filter(
 					(item) =>
@@ -289,6 +444,42 @@ export function createTestChecker(shared) {
 			)
 		)
 			fail(errors, "it/test calls do not match the base multiset");
+		const baseFactories = baseEntries.filter(
+			(entry) => entry.kind === "factory",
+		);
+		const outputFactories = partEntries.flatMap(({ entries }) =>
+			entries.filter((entry) => entry.kind === "factory"),
+		);
+		if (
+			!sameMultiset(
+				multiset(baseFactories.map(factoryKey)),
+				multiset(outputFactories.map(factoryKey)),
+			)
+		)
+			fail(errors, "test factory statements do not match the base multiset");
+		if (
+			!sameMultiset(
+				multiset(baseFactories.map((entry) => entry.registration)),
+				multiset(outputFactories.map((entry) => entry.registration)),
+			)
+		)
+			fail(errors, "test factory registrations do not match the base multiset");
+		const baseOpaqueRegistrations = baseEntries.filter(
+			(entry) => entry.kind === "opaque-registration",
+		);
+		const outputOpaqueRegistrations = partEntries.flatMap(({ entries }) =>
+			entries.filter((entry) => entry.kind === "opaque-registration"),
+		);
+		if (
+			!sameMultiset(
+				multiset(baseOpaqueRegistrations.map(opaqueRegistrationKey)),
+				multiset(outputOpaqueRegistrations.map(opaqueRegistrationKey)),
+			)
+		)
+			fail(
+				errors,
+				"opaque registration statements do not match the base multiset",
+			);
 		const baseNonTests = multiset(
 			baseEntries
 				.filter((entry) => entry.kind === "non-test")

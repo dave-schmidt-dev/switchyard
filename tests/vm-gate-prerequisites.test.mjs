@@ -31,7 +31,9 @@ const PKG_ROOT = resolve(__dirname, "..");
 const GATES = [
 	"tests/no-host-rights-vm.test.mjs",
 	"tests/workspace-wipe-vm.test.mjs",
-	"tests/detached-dispatch.test.mjs",
+	"tests/detached-dispatch-exclude-provider-detached-worker.test.mjs",
+	"tests/detached-dispatch-only-provider-detached-worker.test.mjs",
+	"tests/detached-dispatch-recover-releases-stale-project.test.mjs",
 ];
 
 describe("VM gate prerequisite ladders", () => {

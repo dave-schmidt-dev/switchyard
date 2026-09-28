@@ -243,7 +243,11 @@ export function validateContractGateMapping({
 }
 
 export function readGit(root, args) {
-	return execFileSync("git", args, { cwd: root, encoding: "utf8" });
+	return execFileSync("git", args, {
+		cwd: root,
+		encoding: "utf8",
+		maxBuffer: 64 * 1024 * 1024,
+	});
 }
 
 export function computeStagedSnapshot(root = process.cwd()) {
