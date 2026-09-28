@@ -49,6 +49,38 @@ describe("reader-first outcome event floor", () => {
 	it("does not activate a typed production writer", () => {
 		const production = sourceText(
 			new URL("../src/switchyard/run-store/index.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/errors.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/constants.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/receipt-validation.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/validate-run.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/run-records.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/vm-slots.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/project-lock-files.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/run-updates.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/events.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/project-locks.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/project-lock-claims.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/run-locks.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/evidence.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/outcomes.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/checkpoint-artifacts.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/run-store/checkpoint-retention.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/retention.mjs", import.meta.url),
 		);
 		strictEqual(production.match(/appendOutcomeEvent\s*\(/gu)?.length, 1);
 		strictEqual(production.includes('stage: "provider"'), false);

@@ -321,6 +321,38 @@ describe("global VM admission slots", () => {
 	it("does not invoke project-lock orphan reclamation", async () => {
 		const source = sourceText(
 			new URL("../src/switchyard/run-store/index.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/errors.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/constants.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/receipt-validation.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/validate-run.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/run-records.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/vm-slots.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/project-lock-files.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/run-updates.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/events.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/project-locks.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/project-lock-claims.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/run-locks.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/evidence.mjs", import.meta.url),
+			new URL("../src/switchyard/run-store/outcomes.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/run-store/checkpoint-artifacts.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/run-store/checkpoint-retention.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/run-store/retention.mjs", import.meta.url),
 		);
 		const primitive = source.slice(
 			source.indexOf("export function acquireVmSlot"),

@@ -11,7 +11,6 @@ tests/simple-provider-keyless-bridge.test.mjs: Bridge cases share Seatbelt and b
 ops/macos-vm/build-golden-image.sh: legacy 2026-09-27: Task 60 owns it and validating a change needs a live golden-image rebuild (Red)
 src/switchyard/adapter/provider-lifecycle.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.2; preserve the current implementation until its named gate clears
 src/switchyard/lifecycle/parallels-execution-backend.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.1; preserve the current implementation until its named gate clears
-src/switchyard/run-store/index.mjs: legacy 2026-09-27: behavior-preserving source split assigned to Task 4.1, 4.2; retain the existing module until its phase gate passes
 tests/macos-vm-ops.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.6; preserve the current implementation until its named gate clears
 tests/helpers/outcome-shadow-historical-snapshot.mjs: data literal: historical outcome snapshot, one value
 tests/parallels-backend.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.1; preserve the current implementation until its named gate clears
