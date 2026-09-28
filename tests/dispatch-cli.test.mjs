@@ -33,7 +33,6 @@ import { lstat, readdir } from "node:fs/promises";
 
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import { checkpointRemediation } from "../src/switchyard/adapter/exec-error.mjs";
 import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
@@ -41,29 +40,12 @@ import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.
 import { createDefaultRouteHealthDecision } from "../src/switchyard/router/health.mjs";
 import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
-
-const __dirname = resolve(fileURLToPath(import.meta.url), "..");
-const DISPATCH_PATH = resolve(
+import {
 	__dirname,
-	"..",
-	"src",
-	"switchyard",
-	"dispatch",
-	"index.mjs",
-);
-// Task 1.5 (roster-unification plan): src/switchyard/roster/index.mjs now
-// lazily loads the roster, resolving SWITCHYARD_ROSTER_PATH or the canonical
-// ~/.agent/roster.json default (Task 4.1) and failing loud only if that
-// resolved file can't load. This file's `launch` subcommand spawns a
-// detached worker that eventually reaches the real, unmocked router/roster
-// on the way to routing a task — point at this committed synthetic fixture
-// (not the real ~/.agent/roster.json) so a background routing failure can't
-// leak into this suite as stray errors or a stuck run.
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
+	DISPATCH_PATH,
+	ROSTER_FIXTURE_PATH,
+	runDispatch,
+} from "./helpers/dispatch-cli-fixtures.mjs";
 
 function writeLegacyCheckpoint(path, checkpoint) {
 	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
@@ -160,15 +142,6 @@ import {
 	validateCallerInputs,
 } from "../src/switchyard/runner/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
-
-function runDispatch(args, env = {}, timeout = 10_000) {
-	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-		timeout,
-		env: { ...process.env, ...env },
-	});
-}
 
 function reconcileCompletionArgs(receiptPath) {
 	return [
