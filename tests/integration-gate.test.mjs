@@ -28,6 +28,7 @@ import {
 	commitFile,
 	initRepo,
 } from "./helpers/integration-gate-fixtures.mjs";
+import { sourceText } from "./helpers/source-text.mjs";
 
 let projectPath;
 
@@ -189,10 +190,7 @@ index 0000000..abcdef1
 			APPLY_CHECK_MAX_BUFFER > 1024 * 1024,
 			"bound must be larger than the default 1 MiB the probe would otherwise fall back to",
 		);
-		const source = readFileSync(
-			new URL("../src/switchyard/integrate/index.mjs", import.meta.url),
-			"utf8",
-		);
+		const source = sourceText("src/switchyard/integrate/index.mjs");
 		// Anchor the wiring to the probe implementation itself rather than
 		// to an unanchored module-wide count: a refactor could move the
 		// single maxBuffer site to a different spawnSync (e.g. the mutating

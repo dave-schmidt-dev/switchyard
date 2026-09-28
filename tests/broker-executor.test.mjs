@@ -1,11 +1,10 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import { executeBrokerRoute } from "../src/switchyard/broker/executor.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
 import { sanitizeReviewResult } from "../src/switchyard/diagnostics/review-result.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import { sourceText } from "./helpers/source-text.mjs";
 
 function fixture() {
 	const core = {
@@ -462,12 +461,7 @@ describe("broker async executor", () => {
 	// Rather than pin one field at a time, derive the read set from the runner
 	// itself, so a field added there fails here until the executor forwards it.
 	it("forwards every broker field the runner reads off the result", async () => {
-		const runnerSource = readFileSync(
-			fileURLToPath(
-				new URL("../src/switchyard/runner/index.mjs", import.meta.url),
-			),
-			"utf8",
-		);
+		const runnerSource = sourceText("src/switchyard/runner/index.mjs");
 		const readFields = new Set(
 			Array.from(
 				runnerSource.matchAll(/brokerExecution\.([A-Za-z_][A-Za-z0-9_]*)/g),

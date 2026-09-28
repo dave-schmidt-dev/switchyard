@@ -92,6 +92,7 @@ import {
 	uniqueRunId,
 	VM_ADMISSION_ROOT,
 } from "./helpers/run-store-fixtures.mjs";
+import { sourceText } from "./helpers/source-text.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
@@ -3775,9 +3776,8 @@ describe("global VM admission slots", () => {
 	});
 
 	it("does not invoke project-lock orphan reclamation", async () => {
-		const source = await readFile(
+		const source = sourceText(
 			new URL("../src/switchyard/run-store/index.mjs", import.meta.url),
-			"utf8",
 		);
 		const primitive = source.slice(
 			source.indexOf("export function acquireVmSlot"),

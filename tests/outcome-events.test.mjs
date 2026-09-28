@@ -1,5 +1,5 @@
 import { rejects, strictEqual } from "node:assert";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -16,6 +16,7 @@ import {
 	readRun,
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
+import { sourceText } from "./helpers/source-text.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 function typedOutcome(runId, outcomeId, writerEpoch = "epoch-1") {
@@ -46,9 +47,8 @@ function typedOutcome(runId, outcomeId, writerEpoch = "epoch-1") {
 
 describe("reader-first outcome event floor", () => {
 	it("does not activate a typed production writer", () => {
-		const production = readFileSync(
+		const production = sourceText(
 			new URL("../src/switchyard/run-store/index.mjs", import.meta.url),
-			"utf8",
 		);
 		strictEqual(production.match(/appendOutcomeEvent\s*\(/gu)?.length, 1);
 		strictEqual(production.includes('stage: "provider"'), false);

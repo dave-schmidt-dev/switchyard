@@ -1,17 +1,17 @@
 import { match, strictEqual } from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const CHECKER = fileURLToPath(
 	new URL("../scripts/check-file-size.mjs", import.meta.url),
 );
 
 function fixture(t) {
-	const root = mkdtempSync(join(tmpdir(), "switchyard-size-test-"));
+	const root = tempDir("switchyard-size-test-");
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	return root;

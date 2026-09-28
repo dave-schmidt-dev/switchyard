@@ -32,7 +32,7 @@ tests/dispatch-disposition.test.mjs: legacy 2026-09-27: test partition and TAP p
 tests/integration-gate.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.12; retain the existing fixture and test order until its phase gate passes
 tests/macos-vm-ops.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.6; preserve the current implementation until its named gate clears
 tests/mutation-protocol.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.14; retain the existing fixture and test order until its phase gate passes
-tests/outcome-shadow-parity.test.mjs: legacy 2026-09-27: shrinks below 500 when Task 1.5 moves its data literal
+tests/helpers/outcome-shadow-historical-snapshot.mjs: data literal: historical outcome snapshot, one value
 tests/parallels-backend.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.1; preserve the current implementation until its named gate clears
 tests/provenance.test.mjs: legacy 2026-09-27: test partition and TAP parity assigned to Task 2.13; retain the existing fixture and test order until its phase gate passes
 tests/provider-lifecycle-adapter.test.mjs: legacy 2026-09-27: phase-5 split assigned to Task 5.2; preserve the current implementation until its named gate clears

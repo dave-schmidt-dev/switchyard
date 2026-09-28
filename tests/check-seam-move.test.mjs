@@ -1,9 +1,10 @@
 import { strictEqual } from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const CHECKER = fileURLToPath(
 	new URL("../scripts/check-seam-move.mjs", import.meta.url),
@@ -13,7 +14,7 @@ const TEST_PART = "tests/parts/suite-part.mjs";
 const TEST_SOURCE = "tests/suite.test.mjs";
 
 function fixture(t, base, targets = ["lib/part.mjs"]) {
-	const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "seam-move-"));
+	const root = tempDir("seam-move-");
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	write(root, SOURCE, base);
@@ -82,7 +83,7 @@ function split(root, facade, targets) {
 }
 
 function testFixture(t, base) {
-	const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "seam-test-"));
+	const root = tempDir("seam-test-");
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	write(root, TEST_SOURCE, base);

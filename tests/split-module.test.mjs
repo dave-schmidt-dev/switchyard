@@ -1,17 +1,11 @@
 import { deepStrictEqual, strictEqual } from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import {
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseSync } from "oxc-parser";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO = fileURLToPath(new URL("../", import.meta.url));
 const SPLITTER = fileURLToPath(
@@ -28,7 +22,7 @@ function write(root, path, contents) {
 }
 
 function fixture(t, source) {
-	const root = mkdtempSync(join(tmpdir(), "split-module-"));
+	const root = tempDir("split-module-");
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	execFileSync("git", ["config", "user.email", "test@example.invalid"], {
@@ -126,7 +120,7 @@ function checkTest(root, parts, fixturePath) {
 }
 
 function testFixture(t, source) {
-	const root = mkdtempSync(join(tmpdir(), "split-module-test-"));
+	const root = tempDir("split-module-test-");
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	execFileSync("git", ["config", "user.email", "test@example.invalid"], {
@@ -430,7 +424,7 @@ const ERROR_TEST_SPEC = {
 };
 
 function goldenFixture(t, source) {
-	const root = mkdtempSync(join(tmpdir(), "split-golden-"));
+	const root = tempDir("split-golden-");
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	write(

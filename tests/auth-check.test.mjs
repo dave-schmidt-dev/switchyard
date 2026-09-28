@@ -30,6 +30,7 @@ import {
 	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { sourceText } from "./helpers/source-text.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_BOOT_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -1757,10 +1758,7 @@ describe("an interrupted login ends the walkthrough", () => {
 	});
 
 	it("kills a login transport whose guest child traps SIGINT", async () => {
-		const authSource = readFileSync(
-			new URL("../src/switchyard/auth/index.mjs", import.meta.url),
-			"utf8",
-		);
+		const authSource = sourceText("src/switchyard/auth/index.mjs");
 		strictEqual(
 			authSource.includes("set -m"),
 			false,

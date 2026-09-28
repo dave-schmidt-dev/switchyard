@@ -6,16 +6,7 @@ import {
 	projectDisposition,
 	projectTerminalOutcome,
 } from "../src/switchyard/dispatch/disposition.mjs";
-
-function run(overrides = {}) {
-	return {
-		runId: "run-1",
-		state: "running",
-		cleanupState: "not_started",
-		lastFailure: null,
-		...overrides,
-	};
-}
+import { run } from "./helpers/dispatch-disposition-fixtures.mjs";
 
 function failure(overrides = {}) {
 	return {
