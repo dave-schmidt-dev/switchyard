@@ -22,47 +22,19 @@ import {
 	integrationGate,
 	validateDiff,
 } from "../src/switchyard/integrate/index.mjs";
-import { tempDir } from "./helpers/tempdir.mjs";
+import {
+	buildDiff,
+	buildStagedDiff,
+	commitFile,
+	initRepo,
+} from "./helpers/integration-gate-fixtures.mjs";
 
 let projectPath;
-
-function initRepo() {
-	const dir = tempDir("switchyard-gate-");
-	execSync("git init -q", { cwd: dir, stdio: "pipe" });
-	execSync('git config user.email "test@test.com"', {
-		cwd: dir,
-		stdio: "pipe",
-	});
-	execSync('git config user.name "Test"', { cwd: dir, stdio: "pipe" });
-	return dir;
-}
-
-function commitFile(dir, relativePath, content) {
-	const fullPath = join(dir, relativePath);
-	mkdirSync(join(fullPath, ".."), { recursive: true });
-	writeFileSync(fullPath, content, "utf8");
-	execSync(`git add ${relativePath}`, { cwd: dir, stdio: "pipe" });
-	execSync('git commit -q -m "base"', { cwd: dir, stdio: "pipe" });
-}
 
 // Build a diff by making a change against a real git working tree and
 // capturing git's own diff output — every fixture below is a diff git
 // itself produced, not hand-written unified-diff text, so the parsing
 // assumptions match real dispatches.
-function buildDiff(dir, mutate) {
-	mutate(dir);
-	return execSync("git diff --no-color", { cwd: dir, encoding: "utf8" });
-}
-
-function buildStagedDiff(dir, mutate) {
-	mutate(dir);
-	execSync("git add -A", { cwd: dir, stdio: "pipe" });
-	return execSync("git diff --cached --no-color", {
-		cwd: dir,
-		encoding: "utf8",
-	});
-}
-
 beforeEach(() => {
 	projectPath = initRepo();
 	commitFile(projectPath, "test.txt", "original content\n");
