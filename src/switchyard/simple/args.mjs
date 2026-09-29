@@ -3,7 +3,8 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { manifestReviewPaths } from "../integrate/index.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] --check <command> --deadline <RFC3339> [--json]
+import { validateRoutingRunId } from "./routing-state.mjs";
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -237,6 +238,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				"only-provider": { type: "string", multiple: true },
 				check: { type: "string", multiple: true },
 				deadline: { type: "string" },
+				"routing-run-id": { type: "string" },
 				json: { type: "boolean", default: false },
 				help: { type: "boolean", default: false },
 			},
@@ -375,6 +377,17 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 	) {
 		throw new SimpleUsageError("at least one non-empty --check is required");
 	}
+	const routingRunId =
+		parsed.values["routing-run-id"] ??
+		process.env.SWITCHYARD_ROUTING_RUN_ID ??
+		null;
+	if (routingRunId !== null) {
+		try {
+			validateRoutingRunId(routingRunId);
+		} catch {
+			throw new SimpleUsageError("invalid routing run id");
+		}
+	}
 	const nowMs = now();
 	return {
 		promptPath,
@@ -388,6 +401,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		predecessorReceiptPath,
 		checks: checks.map((check) => check.trim()),
 		deadlineMs: parseDeadline(parsed.values.deadline, nowMs),
+		routingRunId,
 	};
 }
 export {

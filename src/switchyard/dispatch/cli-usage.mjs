@@ -2,6 +2,7 @@ const USAGE = `Usage: switchyard-dispatch <subcommand> [args]
        switchyard-dispatch --version
 
 Subcommands:
+  routing-run <inspect|native-start> ...             Inspect or acknowledge native routing
   simple <prompt-file> --project <path> ...         Run one local bounded task
   run    <tasks.md> --project <path> [options]    Run queue synchronously
   launch <tasks.md> --project <path> [options]    Launch detached run
@@ -16,6 +17,7 @@ Subcommands:
                                                 Interactively remediate orphaned project locks
 
 Run/Launch options:
+  --routing-run-id <id>  Honor the native latch (or SWITCHYARD_ROUTING_RUN_ID)
   --project <path>       Host git repo to dispatch against (required)
   --max-tasks <n>        Cap how many tasks are processed this run
   --checkpoint <path>    Checkpoint file (default: <tasks>.checkpoint.json)
@@ -121,6 +123,7 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"health",
 	"reconcile-completion",
 	"remediate-orphaned-locks",
+	"routing-run",
 ]);
 class UsageError extends Error {}
 

@@ -167,6 +167,11 @@ async function main(argv) {
 				await handleOrphanLockRemediation(subArgs);
 				break;
 			}
+			case "routing-run": {
+				const { handleRoutingRun } = await import("../simple/routing-cli.mjs");
+				await handleRoutingRun(subArgs);
+				break;
+			}
 			case "gc": {
 				await handleGc(subArgs);
 				break;
@@ -241,7 +246,6 @@ export {
 	defaultMeasureApfsPrivateBytes,
 	handleGc,
 } from "./gc.mjs";
-export { handleLaunch, handleRun } from "./launch.mjs";
 export {
 	captureHostFingerprint,
 	renewDispatchReceipts,
@@ -256,7 +260,7 @@ export {
 export { handleResult, handleStatus } from "./result.mjs";
 export { runDispatch } from "./run-dispatch.mjs";
 export { probeProviderProcess } from "./status-envelope.mjs";
-export { formatRunAbort, SIMPLE_USAGE };
+export { formatRunAbort, handleLaunch, handleRun, SIMPLE_USAGE };
 
 import "./cli-usage.mjs";
 import "./cli-args.mjs";
@@ -268,6 +272,7 @@ import "./status-envelope.mjs";
 import "./result.mjs";
 import "./recover-liveness.mjs";
 import "./recover-reclaim.mjs";
+import { guardRoutingLaunch } from "../simple/routing-cli.mjs";
 import { parseGcArgs, parseRecoverArgs, withStateRoot } from "./cli-args.mjs";
 import {
 	handleBackendHealth,
@@ -284,7 +289,20 @@ import {
 	USAGE_RUN,
 	UsageError,
 } from "./cli-usage.mjs";
-import { handleLaunch, handleRun } from "./launch.mjs";
+import {
+	handleLaunch as launchDetached,
+	handleRun as launchRun,
+} from "./launch.mjs";
+
+async function handleRun(argv, deps = {}, usage) {
+	const guarded = guardRoutingLaunch(argv, deps);
+	if (!guarded.blocked) return launchRun(guarded.argv, deps, usage);
+}
+async function handleLaunch(argv, deps = {}) {
+	const guarded = guardRoutingLaunch(argv, deps);
+	if (!guarded.blocked) return launchDetached(guarded.argv, deps);
+}
+
 import {
 	inspectSimpleWorktreeRecovery,
 	recoveryLiveness,
