@@ -114,6 +114,86 @@ describe("broker async executor", () => {
 			new URL("../src/switchyard/runner/task-routing.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/route-health.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/task-base.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/retry-transitions.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/runner/halts.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/broker.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/outcome-writer.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/execute-task-unsafe.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-unsafe-prepare.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-unsafe-failure.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-unsafe-success.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-async-unsafe.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-async-unsafe-prepare.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-async-unsafe-failure.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/execute-task-async-unsafe-success.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/runner/execute-task.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/execute-orchestrator-unsafe.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/runner/queue-preflight.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/queue-backend.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/queue-launch.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/run-queue-async-impl.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/run-queue-async-loop.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/run-queue-async-terminal.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/runner/run-queue-impl.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/run-queue-task-attempt.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/run-queue-task-settlement.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/run-queue-terminal.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/run-queue-orchestrator-impl.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/run-queue-orchestrator-core.mjs",
+				import.meta.url,
+			),
 		);
 		const readFields = new Set(
 			Array.from(

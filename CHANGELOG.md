@@ -8,6 +8,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Partition the production runner into 44 ownership modules while retaining its public queue facade API.
+
 - Split queue task parsing, checkpoints, reconciliation, routing, and result support into bounded runner modules while preserving the queue API.
 
 - Split dispatch arguments, handlers, execution, launch, status/results, recovery, and collection into bounded modules while preserving the CLI API.
