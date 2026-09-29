@@ -1,5 +1,3 @@
-// Host-only, captain-authored quick checks. No provider transcript or check output
-// crosses this boundary. The worker owns the process group and timeout.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -15,108 +13,6 @@ export { parseQuickChecks } from "./check-contract.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const MAX_CHECK_MS = 10 * 60_000;
-const GIT_ARGS = [
-	"-c",
-	"core.hooksPath=/dev/null",
-	"-c",
-	"core.fsmonitor=false",
-	"-c",
-	"core.attributesFile=/dev/null",
-	"-c",
-	"diff.external=",
-	"-c",
-	"diff.trustExitCode=false",
-	"-c",
-	"filter.lfs.smudge=",
-	"-c",
-	"filter.lfs.required=false",
-];
-
-function sha(value) {
-	return createHash("sha256").update(value).digest("hex");
-}
-
-function safeEnv(home) {
-	home = realpathSync(home);
-	return {
-		PATH: "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
-		HOME: home,
-		TMPDIR: home,
-		XDG_CONFIG_HOME: home,
-		CI: "true",
-		GIT_CONFIG_NOSYSTEM: "1",
-		GIT_CONFIG_GLOBAL: "/dev/null",
-		GIT_CONFIG_SYSTEM: "/dev/null",
-		GIT_ATTR_NOSYSTEM: "1",
-		GIT_NO_REPLACE_OBJECTS: "1",
-		GIT_LFS_SKIP_SMUDGE: "1",
-		GIT_TERMINAL_PROMPT: "0",
-		GIT_ASKPASS: "/usr/bin/false",
-	};
-}
-
-/** Confine provider-edited check scripts to their disposable candidate tree. */
-export function quickCheckSandboxProfile(clone, runtime) {
-	clone = realpathSync(clone);
-	runtime = realpathSync(runtime);
-	const nodeRoot = dirname(dirname(realpathSync(process.execPath)));
-	const npmRoot = dirname(dirname(realpathSync("/opt/homebrew/bin/npm")));
-	const reads = [
-		"/System",
-		"/usr",
-		"/bin",
-		"/sbin",
-		"/dev",
-		"/opt/homebrew/Cellar",
-		"/opt/homebrew/opt",
-		"/opt/homebrew/etc/openssl@3/openssl.cnf",
-		nodeRoot,
-		npmRoot,
-		"/opt/homebrew/bin/node",
-		"/opt/homebrew/bin/npm",
-		clone,
-		runtime,
-	];
-	const ancestors = new Set(["/"]);
-	for (const path of reads) {
-		let current = dirname(path);
-		while (current !== "/") {
-			ancestors.add(current);
-			current = dirname(current);
-		}
-	}
-	const literals = [...ancestors]
-		.filter((path) => path !== "/")
-		.map((path) => `(literal ${JSON.stringify(path)})`)
-		.join(" ");
-	return [
-		"(version 1)",
-		"(deny default)",
-		"(allow process-exec)",
-		"(allow process-fork)",
-		"(allow sysctl-read)",
-		'(allow file-read* (literal "/"))',
-		`(allow file-read-metadata ${literals})`,
-		`(allow file-read* ${reads.map((path) => `(subpath ${JSON.stringify(path)})`).join(" ")})`,
-		`(allow file-write* (subpath ${JSON.stringify(clone)}) (subpath ${JSON.stringify(runtime)}) (literal "/dev/null"))`,
-	].join("\n");
-}
-
-function git(cwd, env, args, input) {
-	const result = spawnSync("git", [...GIT_ARGS, ...args], {
-		cwd,
-		env,
-		input,
-		encoding: "utf8",
-		timeout: 30_000,
-		maxBuffer: 1024 * 1024,
-		stdio: ["pipe", "pipe", "pipe"],
-	});
-	if (result.status !== 0 || result.error)
-		throw new Error("git_operation_failed");
-	return result.stdout.trim();
-}
-
 function runCommand(cwd, env, argv, timeoutMs, { sandbox = true } = {}) {
 	if (process.platform !== "darwin")
 		return {
@@ -168,7 +64,6 @@ function runCommand(cwd, env, argv, timeoutMs, { sandbox = true } = {}) {
 		groupCleanup: "unknown",
 	};
 }
-
 function settleScopedChecksSync(root, launchedAt) {
 	const result = spawnSync(
 		process.execPath,
@@ -183,73 +78,6 @@ function settleScopedChecksSync(root, launchedAt) {
 	);
 	return result.status === 0 && result.stdout === "stopped";
 }
-
-function validSnapshotPath(path) {
-	return (
-		typeof path === "string" &&
-		path.length > 0 &&
-		!isAbsolute(path) &&
-		!path.includes("\0") &&
-		!path.includes("\\") &&
-		path
-			.split("/")
-			.every((part) => part && part !== "." && part !== ".." && part !== ".git")
-	);
-}
-
-function prepareExactBase(clone, projectPath, env, baseTree, snapshotPaths) {
-	if (
-		!Array.isArray(snapshotPaths) ||
-		snapshotPaths.length > 4096 ||
-		!snapshotPaths.every(validSnapshotPath)
-	)
-		throw new Error("base_mismatch");
-	const trusted = new Set(snapshotPaths);
-	const observed = spawnSync(
-		"git",
-		[
-			...GIT_ARGS,
-			"status",
-			"--porcelain=v1",
-			"--no-renames",
-			"-z",
-			"--untracked-files=all",
-		],
-		{
-			cwd: projectPath,
-			env,
-			encoding: "utf8",
-			timeout: 30_000,
-			maxBuffer: 1024 * 1024,
-			stdio: ["ignore", "pipe", "pipe"],
-		},
-	);
-	if (
-		observed.status !== 0 ||
-		observed.error ||
-		typeof observed.stdout !== "string"
-	)
-		throw new Error("base_mismatch");
-	for (const row of observed.stdout.split("\0").filter(Boolean)) {
-		const changedPath = row.slice(3);
-		if (row.length < 4) throw new Error("base_mismatch");
-		if (row.startsWith("?? ")) continue;
-		if (!trusted.has(changedPath)) throw new Error("base_mismatch");
-	}
-	git(clone, env, ["read-tree", "HEAD"]);
-	if (trusted.size) {
-		git(
-			clone,
-			{ ...env, GIT_WORK_TREE: projectPath, GIT_LITERAL_PATHSPECS: "1" },
-			["add", "-A", "--", ...trusted],
-		);
-	}
-	if (git(clone, env, ["write-tree"]) !== baseTree)
-		throw new Error("base_mismatch");
-	git(clone, env, ["checkout-index", "-a", "-f"]);
-	git(clone, env, ["diff", "--quiet"]);
-}
-
 function gateCandidate(cwd, env, diff, allowedPaths, allowSensitiveManifests) {
 	const result = spawnSync(process.execPath, [SELF, "--quick-check-gate"], {
 		cwd,
@@ -262,8 +90,6 @@ function gateCandidate(cwd, env, diff, allowedPaths, allowSensitiveManifests) {
 	});
 	return result.status === 0 && result.stdout === "passed";
 }
-
-/** Build a fresh clone from the exact base tree, apply the gated patch, and check it. */
 export function runQuickChecks({
 	projectPath,
 	taskId,
@@ -424,7 +250,6 @@ export function runQuickChecks({
 	}
 	return receipt;
 }
-
 if (process.argv[2] === "--quick-check-settle") {
 	let input;
 	try {
@@ -439,8 +264,6 @@ if (process.argv[2] === "--quick-check-settle") {
 	});
 	process.stdout.write(state);
 }
-
-/** Keep the production event loop and detached status writer live during checks. */
 export function runQuickChecksAsync(input) {
 	return new Promise((resolve) => {
 		const root = mkdtempSync(join(tmpdir(), "switchyard-quick-check-"));
@@ -550,119 +373,6 @@ export function runQuickChecksAsync(input) {
 		);
 	});
 }
-
-/** Exact, closed passing receipt for the current candidate only. */
-export function isPassingQuickCheckReceipt(
-	receipt,
-	{ taskId, attempt, baseTree, diff, checks, setup = null },
-) {
-	return (
-		receipt?.version === 1 &&
-		receipt.status === "passed" &&
-		Object.keys(receipt).sort().join(",") ===
-			"attempt,baseTree,candidateTree,checks,cleanup,commandSetSha256,diffSha256,setup,status,taskId,version" &&
-		Object.keys(receipt.cleanup ?? {}).join(",") === "status" &&
-		receipt.cleanup?.status === "complete" &&
-		receipt.taskId === taskId &&
-		Number.isSafeInteger(attempt) &&
-		attempt > 0 &&
-		receipt.attempt === attempt &&
-		/^[a-f0-9]{40,64}$/u.test(baseTree ?? "") &&
-		receipt.baseTree === baseTree &&
-		/^[a-f0-9]{40,64}$/u.test(receipt.candidateTree ?? "") &&
-		/^[a-f0-9]{64}$/u.test(receipt.diffSha256 ?? "") &&
-		(diff === undefined ||
-			receipt.diffSha256 === sha(diff.endsWith("\n") ? diff : `${diff}\n`)) &&
-		receipt.commandSetSha256 === sha(JSON.stringify({ setup, checks })) &&
-		Array.isArray(receipt.checks) &&
-		receipt.checks.length === checks.length &&
-		receipt.checks.every(
-			(item, index) =>
-				Object.keys(item).sort().join(",") ===
-					"commandSha256,exitCode,groupCleanup,index,signal,timedOut" &&
-				item.index === index &&
-				item.commandSha256 === sha(JSON.stringify(checks[index])) &&
-				item.exitCode === 0 &&
-				item.signal === null &&
-				item.timedOut === false &&
-				item.groupCleanup === "complete",
-		) &&
-		(setup === null
-			? receipt.setup === null
-			: Object.keys(receipt.setup ?? {})
-					.sort()
-					.join(",") ===
-					"commandSha256,exitCode,groupCleanup,signal,timedOut" &&
-				receipt.setup?.commandSha256 === sha(JSON.stringify(setup)) &&
-				receipt.setup.exitCode === 0 &&
-				receipt.setup.signal === null &&
-				receipt.setup.timedOut === false &&
-				receipt.setup.groupCleanup === "complete")
-	);
-}
-
-/** A missing or stale check receipt cannot become a completed task. */
-export function enforceQuickCheckCompletion(task, result, attempt, checkpoint) {
-	if (result.success !== true || (task.quickChecks?.checks?.length ?? 0) === 0)
-		return;
-	const integration = checkpoint.integrationIntents?.[task.id];
-	const intent = integration?.operation;
-	if (
-		integration?.status === "completed" &&
-		intent?.taskId === task.id &&
-		intent.attempt === attempt &&
-		intent.baseTree === checkpoint.taskBases?.[task.id]?.tree &&
-		result.quickCheckReceipt?.diffSha256 === intent.patchHash &&
-		isPassingQuickCheckReceipt(result.quickCheckReceipt, {
-			taskId: task.id,
-			attempt,
-			baseTree: intent.baseTree,
-			checks: task.quickChecks.checks,
-			setup: task.quickChecks.setup,
-		})
-	)
-		return;
-	result.success = false;
-	result.result = "check_failed";
-	result.errorKind = "check_failed";
-	result.reasonCode = "check_failed";
-	result.reason = "Task check receipt missing or invalid.";
-}
-
-/** Identify historical completed rows that lack exact candidate evidence. */
-export function invalidCompletedQuickCheckTaskIds(tasks, checkpoint) {
-	const invalid = [];
-	for (const task of tasks) {
-		if (
-			!checkpoint.completedTaskIds?.includes(task.id) ||
-			(task.quickChecks?.checks?.length ?? 0) === 0
-		)
-			continue;
-		const entry = [...(checkpoint.results ?? [])]
-			.reverse()
-			.find((item) => item.taskId === task.id && item.success === true);
-		const integration = checkpoint.integrationIntents?.[task.id];
-		const intent = integration?.operation;
-		if (
-			!entry ||
-			integration?.status !== "completed" ||
-			!intent ||
-			intent.taskId !== task.id ||
-			intent.attempt !== entry.attempt ||
-			entry.quickCheckReceipt?.diffSha256 !== intent.patchHash ||
-			!isPassingQuickCheckReceipt(entry.quickCheckReceipt, {
-				taskId: task.id,
-				attempt: entry.attempt,
-				baseTree: intent.baseTree,
-				checks: task.quickChecks.checks,
-				setup: task.quickChecks.setup,
-			})
-		)
-			invalid.push(task.id);
-	}
-	return invalid;
-}
-
 if (process.argv[2] === "--quick-check-worker") {
 	let payload;
 	try {
@@ -737,7 +447,6 @@ if (process.argv[2] === "--quick-check-worker") {
 		);
 	});
 }
-
 if (process.argv[2] === "--quick-check-gate") {
 	let raw = "";
 	process.stdin.setEncoding("utf8");
@@ -758,7 +467,6 @@ if (process.argv[2] === "--quick-check-gate") {
 		}
 	});
 }
-
 if (process.argv[2] === "--quick-check-runner") {
 	let raw = "";
 	process.stdin.setEncoding("utf8");
@@ -775,3 +483,20 @@ if (process.argv[2] === "--quick-check-runner") {
 		}
 	});
 }
+
+import "./checks-sandbox.mjs";
+import "./checks-receipts.mjs";
+import {
+	git,
+	prepareExactBase,
+	quickCheckSandboxProfile,
+	safeEnv,
+	sha,
+} from "./checks-sandbox.mjs";
+
+export {
+	enforceQuickCheckCompletion,
+	invalidCompletedQuickCheckTaskIds,
+	isPassingQuickCheckReceipt,
+} from "./checks-receipts.mjs";
+export { quickCheckSandboxProfile } from "./checks-sandbox.mjs";

@@ -25,1207 +25,134 @@ import {
 import { ExecutionBackend, normalizeExecArgv } from "./execution-backend.mjs";
 import { executeMutationSync } from "./mutation-protocol.mjs";
 
-export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
-export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
-const HOST_PROCESS_IDENTITY_VERSION = "switchyard-host-process-v1";
-const ALLOCATION_INTENT_PREFIX = "parallels-allocation-";
-const ALLOCATION_INTENT_SUFFIX = ".intent.json";
-const HOST_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
-const HOST_PROCESS_IDENTITY_MAX_BUFFER = 4_096;
-const CANONICAL_UUID =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-const HOST_PROCESS_IDENTITY = new RegExp(
-	`^${HOST_PROCESS_IDENTITY_VERSION}:([0-9a-f-]{36}):([1-9]\\d*):([1-9]\\d*)$`,
-	"iu",
-);
-const HOST_PROCESS_PROBE_SOURCE = `
-import ctypes, errno, json, sys, uuid
-VERSION = "switchyard-host-process-v1"
-LIBPROC = "/usr/lib/libproc.dylib"
-LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
-class RusageInfoV0(ctypes.Structure):
-    _fields_ = [("ri_uuid", ctypes.c_ubyte * 16)] + [("u%d" % i, ctypes.c_uint64) for i in range(10)]
-if ctypes.sizeof(RusageInfoV0) != 96:
-    raise SystemExit(70)
-if len(sys.argv) != 2 or not sys.argv[1].isdigit() or int(sys.argv[1]) <= 0:
-    raise SystemExit(64)
-pid = int(sys.argv[1])
-libsystem = ctypes.CDLL(LIBSYSTEM, use_errno=True)
-sysctlbyname = libsystem.sysctlbyname
-sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
-sysctlbyname.restype = ctypes.c_int
-boot_buffer = ctypes.create_string_buffer(128)
-boot_length = ctypes.c_size_t(len(boot_buffer))
-ctypes.set_errno(0)
-boot_rc = sysctlbyname(b"kern.bootsessionuuid", boot_buffer, ctypes.byref(boot_length), None, 0)
-boot_errno = ctypes.get_errno()
-if boot_rc != 0 or boot_errno != 0:
-    raise SystemExit(71)
-try:
-    boot = str(uuid.UUID(boot_buffer.value.decode("ascii")))
-except Exception:
-    raise SystemExit(72)
-libproc = ctypes.CDLL(LIBPROC, use_errno=True)
-proc_pid_rusage = libproc.proc_pid_rusage
-proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(RusageInfoV0)]
-proc_pid_rusage.restype = ctypes.c_int
-info = RusageInfoV0()
-ctypes.set_errno(0)
-proc_rc = proc_pid_rusage(pid, 0, ctypes.byref(info))
-proc_errno = ctypes.get_errno()
-if proc_rc == 0 and proc_errno == 0:
-    result = {"version": VERSION, "state": "present", "pid": str(pid), "bootSessionUuid": boot, "startTicks": str(info.u8)}
-elif proc_rc == -1 and proc_errno == errno.ESRCH:
-    result = {"version": VERSION, "state": "absent", "pid": str(pid), "bootSessionUuid": boot, "startTicks": None}
-else:
-    raise SystemExit(73)
-sys.stdout.write(json.dumps(result, separators=(",", ":")))
-`;
+import {
+	ALLOCATION_INTENT_PREFIX,
+	ALLOCATION_INTENT_SUFFIX,
+	CANONICAL_UUID,
+	CLEANUP_STARTED,
+	CLIPBOARD_AGENT_LABEL,
+	CLIPBOARD_AGENT_PROCESS,
+	DEFAULT_AQUA_POLL_MS,
+	DEFAULT_AQUA_TIMEOUT_MS,
+	DEFAULT_CLIPBOARD_POLL_MS,
+	DEFAULT_CLIPBOARD_SETTLE_MS,
+	DEFAULT_GOLDEN_STOP_SETTLE_TIMEOUT_MS,
+	DEFAULT_HOST_READINESS_ATTEMPTS,
+	DEFAULT_HOST_READINESS_BACKOFF_MS,
+	DEFAULT_HOST_READINESS_TIMEOUT_MS,
+	DEFAULT_LOST_MUTATION_RECONCILIATION_POLL_MS,
+	DEFAULT_LOST_MUTATION_RECONCILIATION_TIMEOUT_MS,
+	DEFAULT_PRLCTL_CALL_TIMEOUT_MS,
+	DEFAULT_PRLCTL_RETRY_ATTEMPTS,
+	DEFAULT_PRLCTL_RETRY_BACKOFF_MS,
+	DEFAULT_STOP_SETTLE_POLL_MS,
+	DEFAULT_STOP_SETTLE_TIMEOUT_MS,
+	DEFAULT_TRANSFER_HOST,
+	DEFAULT_WORKSPACE_VERIFY_POLL_MS,
+	DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS,
+	HOST_PERMISSION_DENIED_SIGNATURE,
+	HOST_PROCESS_IDENTITY,
+	HOST_PROCESS_IDENTITY_MAX_BUFFER,
+	HOST_PROCESS_IDENTITY_TIMEOUT_MS,
+	HOST_PROCESS_IDENTITY_VERSION,
+	HOST_PROCESS_PROBE_SOURCE,
+	HOST_READINESS_MAX_BUFFER,
+	INDEX_LOCK_PATH,
+	INDEX_LOCK_REMOVED,
+	KILL_GUEST_PROCESS_TREE,
+	MAX_AQUA_EXEC_ARGV_BYTES,
+	MAX_TRANSFER_BYTES,
+	PARALLELS_WORKING_PREFIX,
+	PERSISTABLE_PRLCTL_SIGNALS,
+	PID_MARKER_REMOVED,
+	PID_OBSERVED,
+	PRLCTL_JOB_MISFIRE,
+	PRLCTL_SESSION_NOT_READY,
+	PRLCTL_SUBCOMMANDS,
+	PROCESS_MARKER_SCHEMA_VERSION,
+	PROVIDER_PID_MARKER_PREFIX,
+	PROVIDER_TERMINAL_EVIDENCE_KIND,
+	PROVIDER_TERMINAL_EVIDENCE_MAX_BYTES,
+	PROVIDER_TERMINAL_EVIDENCE_SCHEMA_VERSION,
+	parseHostProcessIdentity,
+	parseHostProcessProbe,
+	prlctlHostPermissionDenied,
+	probeHostProcessIdentity,
+	SAFE_GUEST_PATH,
+	SAFE_RUN_ID,
+	SAFE_USER,
+	TREE_TERMINATED,
+	UUID,
+	VM_CREDENTIAL_LAYOUTS,
+	VM_OWNERSHIP_SCHEMA_VERSION,
+	validatePid,
+	WORKSPACE_MODE,
+	WORKSPACE_PREPARE_ATTEMPTS,
+	XFER_URL_ASSIGNMENT,
+} from "./parallels-primitives.mjs";
+import {
+	BULK_TRANSFER_HELPER,
+	BWS_SECRET_EXEC,
+	classifyPrlctlFailure,
+	defaultPidIsAlive,
+	defaultSleep,
+	describeBulkTransferFailure,
+	describePrlctlFailure,
+	OPENCODE_BWS_CONSUMERS,
+	outputText,
+	prlctlFailureText,
+	shellQuote,
+	validateAttemptCount,
+} from "./parallels-transfer.mjs";
+import {
+	buildParallelsWorkingName,
+	diskBytesFromInfo,
+	HOST_READINESS_CODES,
+	isBoundedRecordText,
+	isUuid,
+	markerIdentity,
+	measurePathBytes,
+	normalizedUuid,
+	ownershipContextFor,
+	ParallelsHostReadinessError,
+	parseParallelsWorkingName,
+	parseReadinessInventory,
+	parseVmList,
+	providerHomePath,
+	providerPidMarkerPath,
+	providerTerminalEvidencePath,
+	resolveWorkspacePath,
+	snapshotDifference,
+	snapshotIdsFromOutput,
+	strictSnapshotIdsFromOutput,
+	validateDurationMs,
+	validateEnvAssignment,
+	validateGuestPath,
+	validateLinkedCloneMeasurement,
+	validateRunId,
+	validateTar,
+	validateTransferHost,
+	validateUid,
+	validateUser,
+} from "./parallels-validation.mjs";
 
-function parseHostProcessProbe(value, expectedPid) {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	const fields = ["version", "state", "pid", "bootSessionUuid", "startTicks"];
-	if (
-		Object.keys(value).length !== fields.length ||
-		fields.some((field) => !Object.hasOwn(value, field)) ||
-		value.version !== HOST_PROCESS_IDENTITY_VERSION ||
-		!["present", "absent"].includes(value.state) ||
-		typeof value.pid !== "string" ||
-		!/^[1-9]\d*$/.test(value.pid) ||
-		Number(value.pid) !== expectedPid ||
-		!Number.isSafeInteger(Number(value.pid)) ||
-		typeof value.bootSessionUuid !== "string" ||
-		!CANONICAL_UUID.test(value.bootSessionUuid)
-	)
-		return null;
-	const bootSessionUuid = value.bootSessionUuid.toLowerCase();
-	if (value.state === "absent") {
-		return value.startTicks === null
-			? { state: "absent", pid: expectedPid, bootSessionUuid, identity: null }
-			: null;
-	}
-	if (
-		typeof value.startTicks !== "string" ||
-		!/^[1-9]\d*$/.test(value.startTicks) ||
-		BigInt(value.startTicks) > 18_446_744_073_709_551_615n
-	)
-		return null;
-	return {
-		state: "present",
-		pid: expectedPid,
-		bootSessionUuid,
-		startTicks: value.startTicks,
-		identity: `${HOST_PROCESS_IDENTITY_VERSION}:${bootSessionUuid}:${value.pid}:${value.startTicks}`,
-	};
-}
+export {
+	MAX_AQUA_EXEC_ARGV_BYTES,
+	PARALLELS_WORKING_PREFIX,
+	probeHostProcessIdentity,
+} from "./parallels-primitives.mjs";
+export {
+	BULK_TRANSFER_HELPER,
+	describeBulkTransferFailure,
+} from "./parallels-transfer.mjs";
+export {
+	buildParallelsWorkingName,
+	ParallelsHostReadinessError,
+	parseParallelsWorkingName,
+	validateLinkedCloneMeasurement,
+} from "./parallels-validation.mjs";
 
-function parseHostProcessIdentity(value) {
-	if (typeof value !== "string") return null;
-	const match = value.match(HOST_PROCESS_IDENTITY);
-	if (!match || !CANONICAL_UUID.test(match[1])) return null;
-	const pid = Number(match[2]);
-	if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-	try {
-		if (BigInt(match[3]) > 18_446_744_073_709_551_615n) return null;
-	} catch {
-		return null;
-	}
-	return {
-		bootSessionUuid: match[1].toLowerCase(),
-		pid,
-		startTicks: match[3],
-		identity: `${HOST_PROCESS_IDENTITY_VERSION}:${match[1].toLowerCase()}:${match[2]}:${match[3]}`,
-	};
-}
-
-/** Probe one host PID's kernel birth identity through a fixed macOS ABI. */
-export function probeHostProcessIdentity(
-	pid,
-	{ spawnFn = spawnSync, onStatus } = {},
-) {
-	const validatedPid = validatePid(pid);
-	onStatus?.({ type: "host-process-identity", event: "start" });
-	let child;
-	try {
-		child = spawnFn(
-			"/usr/bin/python3",
-			["-I", "-S", "-c", HOST_PROCESS_PROBE_SOURCE, String(validatedPid)],
-			{
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "ignore"],
-				timeout: HOST_PROCESS_IDENTITY_TIMEOUT_MS,
-				killSignal: "SIGKILL",
-				maxBuffer: HOST_PROCESS_IDENTITY_MAX_BUFFER,
-				env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
-			},
-		);
-	} catch {
-		onStatus?.({ type: "host-process-identity", event: "unavailable" });
-		return { state: "unknown" };
-	}
-	if (
-		child?.error ||
-		child?.signal ||
-		child?.status !== 0 ||
-		typeof child?.stdout !== "string" ||
-		Buffer.byteLength(child.stdout, "utf8") > HOST_PROCESS_IDENTITY_MAX_BUFFER
-	) {
-		onStatus?.({ type: "host-process-identity", event: "unavailable" });
-		return { state: "unknown" };
-	}
-	let parsed;
-	try {
-		parsed = parseHostProcessProbe(JSON.parse(child.stdout), validatedPid);
-	} catch {
-		parsed = null;
-	}
-	if (!parsed) {
-		onStatus?.({ type: "host-process-identity", event: "unavailable" });
-		return { state: "unknown" };
-	}
-	onStatus?.({
-		type: "host-process-identity",
-		event: "complete",
-		state: parsed.state,
-	});
-	return parsed;
-}
-// A cold macOS guest has to reach a logged-in Aqua session before
-// `launchctl print gui/<uid>` answers, and 30s was inside the noise band of
-// how long that actually takes: the INV-3 gate's whole create-boot-destroy
-// leg measured 51s on an idle 18-core host, and the 30s budget produced two
-// observed `not ready within 30000ms` failures that each passed on rerun --
-// one of them at a load average of 4.3 with 81% CPU idle, so this was never
-// host contention. waitForAqua returns the instant the probe succeeds, so a
-// larger budget costs nothing on the happy path; it only slows how fast a
-// genuinely unbootable guest is reported.
-const DEFAULT_AQUA_TIMEOUT_MS = 120_000;
-const DEFAULT_AQUA_POLL_MS = 250;
-
-// INV-1 clone hardening. `com.parallels.copypaste` is the only Parallels GUI
-// LaunchAgent in the guest, and `prlcopypaste` is the process it starts; the
-// prltoolsd LaunchDaemon is deliberately not touched, because `prlctl exec` --
-// including every call in this file -- rides on it.
-const CLIPBOARD_AGENT_LABEL = "com.parallels.copypaste";
-const CLIPBOARD_AGENT_PROCESS = "prlcopypaste";
-// Measured on this host: prltoolsd starts at boot and the clipboard agent
-// appears about five seconds later, so the settle window has to outlast a
-// respawn rather than sampling once into the gap.
-const DEFAULT_CLIPBOARD_SETTLE_MS = 8_000;
-const DEFAULT_CLIPBOARD_POLL_MS = 1_000;
-
-// Workspace preparation reconciliation. The three commands that build the
-// workspace are silent, so prlctl's exit status is the only signal they give
-// back -- and prlctl loses that signal outright when its host-side job handle
-// misfires. Measured 2026-08-31: `/bin/chmod 700 <parent> <root>` returned
-// host status 255 with empty stderr/stdout beyond `PrlJob_GetRetCode: Invalid
-// argument`, microseconds after `mkdir -p` and `chown` succeeded on those same
-// two paths. PrlJob_GetRetCode is a host-side SDK call, so that is prlctl
-// failing to read the guest's result, not the guest refusing the command.
-// Every one of these commands is idempotent, so a mismatch is safe to repair
-// by simply running the layout again.
-const DEFAULT_WORKSPACE_VERIFY_TIMEOUT_MS = 15_000;
-const DEFAULT_WORKSPACE_VERIFY_POLL_MS = 500;
-const WORKSPACE_PREPARE_ATTEMPTS = 2;
-const WORKSPACE_MODE = "700";
-
-// Shutdown settle window. `prlctl stop` returns before Parallels has finished
-// tearing the VM down, and a delete issued into that gap is refused with a
-// truthful "the virtual machine is busy. The virtual machine is currently
-// running." Measured 2026-08-31 on the INV-1 gate: the delete failed, the
-// reprobe read `running` once and gave up, and the same VM reported `stopped`
-// moments later -- so the stop had in fact succeeded and the teardown leaked a
-// VM over a race with itself. A settling state has to be polled to a deadline;
-// one instantaneous read of it decides nothing.
-const DEFAULT_STOP_SETTLE_TIMEOUT_MS = 30_000;
-// The golden gets its own, longer settle budget. 30s was calibrated for
-// disposable clones, where overrunning it costs a `--kill` on a VM that was
-// going to be discarded anyway. The golden is not disposable and is never
-// killed, so overrunning it instead reports a healthy macOS guest -- which can
-// take well past 30s to reach `stopped` after ACPI shutdown -- as stuck.
-const DEFAULT_GOLDEN_STOP_SETTLE_TIMEOUT_MS = 120_000;
-const DEFAULT_STOP_SETTLE_POLL_MS = 1_000;
-const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const UUID =
-	/^\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?$/i;
-const SAFE_GUEST_PATH = /^\/[A-Za-z0-9._+@%+=:,\-/]*$/;
-const SAFE_USER = /^[A-Za-z_][A-Za-z0-9._-]*$/;
-
-/**
- * The Task 1.3 credential layout, relative to the provider account's home.
- *
- * Every path here was measured inside the guest on 2026-08-14, not inferred
- * from the CLI's shape: each file was moved aside and the provider's own auth
- * check re-run through the Aqua session, so a `yes` means that provider
- * actually authenticated from a copied file. Two results are worth keeping in
- * view because they invert the obvious guess. **copilot is file-backed** —
- * `login --help` advertises the system credential store, which on macOS is the
- * login Keychain, but the token lands in `~/.copilot/config.json` and a copy of
- * it works. **agy writes a `gemini` Keychain entry after authenticating** and
- * still fails without its token file, so Keychain presence is not evidence of
- * Keychain backing.
- *
- * `cursor-agent` is deliberately absent. It is the PM3-5 case: file-backed in
- * shape, machine-bound in behavior. With `.config/cursor/auth.json`,
- * `.cursor/cli-config.json`, and `.cursor/agent-cli-state.json` all provisioned
- * it still reported `Not logged in`. A routed VM task must fail here rather
- * than at exec inside a guest that holds a store the CLI refuses.
- */
-const VM_CREDENTIAL_LAYOUTS = Object.freeze({
-	claude: Object.freeze([".claude/.credentials.json", ".claude.json"]),
-	codex: Object.freeze([".codex/auth.json"]),
-	agy: Object.freeze([".gemini/antigravity-cli/antigravity-oauth-token"]),
-	copilot: Object.freeze([".copilot/config.json"]),
-	opencode: Object.freeze([".local/share/opencode/auth.json"]),
-});
-const DEFAULT_TRANSFER_HOST = "10.211.55.2";
-// Bind on the Parallels host-only interface. Binding all interfaces leaves
-// the listener reachable from unrelated host networks and was not reachable
-// from the guest on this substrate's shared bridge.
 const DEFAULT_TRANSFER_LISTEN_HOST = DEFAULT_TRANSFER_HOST;
-const MAX_TRANSFER_BYTES = 512 * 1024 * 1024;
-// Parallels 27.0.0 intermittently loses the result of a host-side SDK job and
-// reports it as one of these on exit 255 with no other output. Measured
-// 2026-09-01 against the golden image on an idle host, in a plain shell loop
-// with switchyard entirely absent: 5 of 150 serial `prlctl exec` calls
-// misfired, 14 of 100 under four concurrent callers, and every serial misfire
-// succeeded on the very next call. It is transient and per-call, so a bounded
-// retry is the correct response; without one, a run making ~20 exec calls has
-// roughly even odds of dying on a fault that costs milliseconds to absorb.
-const PRLCTL_JOB_MISFIRE =
-	/PrlJob_(?:GetRetCode|GetResult):\s*Invalid argument/i;
-// Deliberately NOT retried here. A guest still booting refuses the session with
-// this message (48 of the first 100 calls after `prlctl start`), and the
-// readiness pollers already own that wait on a timescale of minutes. Retrying
-// it inside `_call` would both distort those polls and mask an unbootable
-// guest as a slow one. It is classified only so the run record can tell the two
-// conditions apart.
-const PRLCTL_SESSION_NOT_READY =
-	/Unable to open new session in this virtual machine/i;
-// Four attempts absorbs the measured misfire rate with margin: at the observed
-// ~3.3% serial rate a single retry already clears it, and even at the 14%
-// concurrent rate four attempts leaves a ~4-in-10,000 residual per call.
-const DEFAULT_PRLCTL_RETRY_ATTEMPTS = 4;
-const DEFAULT_PRLCTL_RETRY_BACKOFF_MS = 250;
-// Queue admission needs proof that the host service can return a complete VM
-// inventory, not merely that the prlctl binary is installed. This is a small,
-// dedicated budget for that read-only check; it must not inherit _call's
-// retry policy, because clone/start/delete are not made retryable by probing.
-// Every prlctl call gets a deadline. Observed 2026-09-08: a `prlctl stop --kill`
-// issued while a guest was still booting hung for 3h32m and had to be killed by
-// hand, taking a VM and a test harness with it. No _call site is long-running --
-// the bulk transfer runs in its own helper process and never reaches here -- so
-// this is generous for clone/delete/start/stop rather than a tuned bound, and
-// every site that needs a tighter one already passes its own. The kill signal is
-// SIGKILL because the failure being bounded is a wedged client that a SIGTERM
-// may not reach; a killed mutation of unknown outcome is what the state probes
-// exist to resolve, and it is strictly better than blocking forever.
-const DEFAULT_PRLCTL_CALL_TIMEOUT_MS = 300_000;
-const DEFAULT_HOST_READINESS_ATTEMPTS = 2;
-const DEFAULT_HOST_READINESS_BACKOFF_MS = 100;
-const DEFAULT_HOST_READINESS_TIMEOUT_MS = 2_000;
-const HOST_READINESS_MAX_BUFFER = 1024 * 1024;
-const HOST_PERMISSION_DENIED_SIGNATURE =
-	/(?:^|\n)(?:\/usr\/local\/bin\/prlctl: line \d+: )?\/bin\/ps:\s*Operation not permitted(?:\n|$)/u;
-// This remains deliberately disabled until an attended, disposable-VM run has
-// observed both an already-satisfied postcondition and a lost SDK result for
-// each newly covered mutation.  The budget belongs to the read-only proof, not
-// to a second mutation attempt.
-const DEFAULT_LOST_MUTATION_RECONCILIATION_TIMEOUT_MS = 5_000;
-const DEFAULT_LOST_MUTATION_RECONCILIATION_POLL_MS = 250;
-// Only these may be persisted as the failing subcommand. Every value is a
-// literal this file passes to `_call`; allowlisting rather than echoing argv
-// keeps a guest-influenced string from reaching a run record.
-const PRLCTL_SUBCOMMANDS = Object.freeze(
-	new Set([
-		"--version",
-		"clone",
-		"delete",
-		"exec",
-		"list",
-		"set",
-		"snapshot-delete",
-		"snapshot-list",
-		"start",
-		"stop",
-	]),
-);
-const PERSISTABLE_PRLCTL_SIGNALS = Object.freeze(
-	new Set(["SIGABRT", "SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM"]),
-);
-
-function prlctlHostPermissionDenied(error) {
-	if (!(error instanceof PrlctlCallError)) return false;
-	const text = Buffer.isBuffer(error.stderr)
-		? error.stderr.toString("utf8")
-		: typeof error.stderr === "string"
-			? error.stderr
-			: "";
-	return HOST_PERMISSION_DENIED_SIGNATURE.test(text);
-}
-const PROVIDER_PID_MARKER_PREFIX = "/tmp/switchyard-provider-";
-const VM_OWNERSHIP_SCHEMA_VERSION = 1;
-const PROCESS_MARKER_SCHEMA_VERSION = 1;
-const PROVIDER_TERMINAL_EVIDENCE_SCHEMA_VERSION = 1;
-const PROVIDER_TERMINAL_EVIDENCE_MAX_BYTES = 1024;
-const PROVIDER_TERMINAL_EVIDENCE_KIND = "switchyard_provider_terminal";
-// The bulk-transfer URL is only known once the helper has bound its ephemeral
-// port, so it reaches the guest as a plaintext argv assignment that the helper
-// substitutes. The variable name deliberately does not contain the placeholder
-// token, or the substitution would rewrite the name along with the value.
-const XFER_URL_ASSIGNMENT = "SWITCHYARD_XFER_URL=TRANSFER_URL";
-const INDEX_LOCK_PATH = "/project/.git/index.lock";
-const CLEANUP_STARTED = "cleanup_started";
-const PID_OBSERVED = "pid_observed";
-const TREE_TERMINATED = "tree_terminated";
-const PID_MARKER_REMOVED = "pid_marker_removed";
-const INDEX_LOCK_REMOVED = "index_lock_removed";
-const KILL_GUEST_PROCESS_TREE = String.raw`
-set -eu
-root="$1"
-
-children() {
-  /bin/ps -axo pid=,ppid= | /usr/bin/awk -v parent="$1" '$2 == parent { print $1 }'
-}
-
-collect_descendants() {
-  for child in $(children "$1"); do
-    printf '%s\n' "$child"
-    collect_descendants "$child"
-  done
-}
-
-alive() {
-  /bin/ps -axo pid=,state= | /usr/bin/awk -v target="$1" '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit(found ? 0 : 1) }'
-}
-
-signal_tree() {
-  signal="$1"
-  pid="$2"
-  for child in $(collect_descendants "$pid"); do
-    /bin/kill "-$signal" "$child" 2>/dev/null || true
-  done
-  /bin/kill "-$signal" "$pid" 2>/dev/null || true
-}
-
-signal_tree TERM "$root"
-for _ in $(/usr/bin/seq 1 20); do
-  survivors=""
-  alive "$root" && survivors="$root"
-  descendants="$(collect_descendants "$root")"
-  if [ -n "$descendants" ]; then
-    if [ -n "$survivors" ]; then
-      survivors="$survivors $descendants"
-    else
-      survivors="$descendants"
-    fi
-  fi
-  [ -z "$survivors" ] && exit 0
-  /bin/sleep 0.05
-done
-
-signal_tree KILL "$root"
-/bin/sleep 0.05
-survivors=""
-alive "$root" && survivors="$root"
-descendants="$(collect_descendants "$root")"
-if [ -n "$descendants" ]; then
-  if [ -n "$survivors" ]; then
-    survivors="$survivors $descendants"
-  else
-    survivors="$descendants"
-  fi
-fi
-[ -z "$survivors" ]
-`;
-const BWS_SECRET_EXEC = "/Users/dave/Documents/Projects/bws/bws-secret-exec.py";
-const OPENCODE_BWS_CONSUMERS = Object.freeze({
-	"opencode-go/": "switchyard-opencode-go-dispatch",
-	"mistral/": "switchyard-opencode-mistral-dispatch",
-});
-
-// This helper runs in a separate Node process because the synchronous
-// lifecycle API blocks the caller's event loop while prlctl is running. The
-// helper owns only an HTTP listener and an async prlctl child; all payloads
-// remain in process memory and are framed back to the parent over stdout.
-export const BULK_TRANSFER_HELPER = String.raw`
-import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
-
-const input = readFileSync(0);
-const newline = input.indexOf(10);
-if (newline < 0) throw new Error("missing transfer header");
-const config = JSON.parse(input.subarray(0, newline).toString("utf8"));
-const payload = input.subarray(newline + 1);
-const token = randomUUID();
-const expectedPath = "/" + token;
-const maxBytes = config.maxBytes;
-let received = null;
-
-function run(args, stdin = null) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("prlctl", args, { stdio: ["pipe", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8").slice(0, 2000); });
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) return resolve();
-      reject(new Error("prlctl failed (" + (code ?? signal ?? "unknown") + "): " + stderr.trim()));
-    });
-    child.stdin.end(stdin);
-  });
-}
-
-// This process makes its own prlctl calls, so it needs its own copy of the
-// misfire tolerance the synchronous backend applies at its _call chokepoint.
-// Without it the bulk transfer was the one production path where a lost
-// host-side SDK job result killed a dispatch outright. The signature is
-// injected rather than restated here so the retry and the parent's
-// classification of the same text cannot drift apart.
-const misfire = new RegExp(config.misfireSource, "i");
-let attemptsMade = 0;
-
-// Safe to repeat: a misfire means prlctl could not read the RESULT of the
-// command, and every call here is idempotent -- loading a pf anchor, or a guest
-// fetch-and-extract (push) / tar-and-upload (pull) that lands on the same path
-// with the same bytes. Repeating one costs a transfer, not a side effect.
-async function runIdempotent(args, stdin = null) {
-  for (let attempt = 1; ; attempt += 1) {
-    attemptsMade = Math.max(attemptsMade, attempt);
-    try {
-      return await run(args, stdin);
-    } catch (error) {
-      const text = String((error && error.message) || "");
-      if (attempt >= config.retryAttempts || !misfire.test(text)) throw error;
-      await new Promise((resolve) => setTimeout(resolve, config.retryBackoffMs * attempt));
-    }
-  }
-}
-
-const server = createServer((request, response) => {
-  if (request.url !== expectedPath) {
-    response.writeHead(404).end();
-    return;
-  }
-  if (config.direction === "push" && request.method === "GET") {
-    response.writeHead(200, { "content-length": payload.length, "content-type": "application/octet-stream" });
-    response.end(payload);
-    return;
-  }
-  if (config.direction === "pull" && request.method === "PUT") {
-    const chunks = [];
-    let size = 0;
-    request.on("data", (chunk) => {
-      size += chunk.length;
-      if (size <= maxBytes) chunks.push(chunk);
-      else request.destroy(new Error("transfer exceeds configured limit"));
-    });
-    request.once("error", () => response.destroy());
-    request.once("end", () => {
-      received = Buffer.concat(chunks, size);
-      response.writeHead(204).end();
-    });
-    return;
-  }
-  response.writeHead(405).end();
-});
-
-try {
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, config.listenHost, resolve);
-  });
-  const address = server.address();
-  const url = "http://" + config.transferHost + ":" + address.port + "/" + token;
-  const rule = "pass out quick on en0 proto tcp from any to " + config.transferHost + " port " + address.port + "\n";
-  try {
-    await runIdempotent(config.pfArgs, Buffer.from(rule, "utf8"));
-    const guestArgs = config.guestArgs.map((value) => value.replaceAll("TRANSFER_URL", url));
-    await runIdempotent(guestArgs);
-    if (config.direction === "pull" && !received) throw new Error("guest did not upload a tar");
-  } finally {
-    try { await run(config.cleanupArgs); } catch { /* cleanup is best effort */ }
-  }
-  server.close();
-  const body = received ?? Buffer.alloc(0);
-  const digest = createHash("sha256").update(config.direction === "push" ? payload : body).digest("hex");
-  process.stdout.write(JSON.stringify({ bytes: config.direction === "push" ? payload.length : body.length, sha256: digest }) + "\n");
-  if (config.direction === "pull") process.stdout.write(body);
-} catch (error) {
-  try { server.close(); } catch { /* already closed */ }
-  process.stderr.write("bulk transfer failed after " + attemptsMade + " attempt(s): " + String(error?.message ?? "unknown") + "\n");
-  process.exitCode = 1;
-}
-`;
-
-function defaultSleep(milliseconds) {
-	if (milliseconds <= 0) return;
-	const atomics = new Int32Array(new SharedArrayBuffer(4));
-	Atomics.wait(atomics, 0, 0, milliseconds);
-}
-
-function defaultPidIsAlive(pid) {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return error?.code === "EPERM";
-	}
-}
-
-/**
- * Every place a thrown prlctl failure may carry its signature.
- *
- * `execFileSync` puts the child's stderr on `error.stderr`, but an injected
- * `prlctlFn` (tests, and the bulk-transfer helper) may raise a plain Error
- * whose message is the only evidence, so all three are searched.
- * @param {unknown} error
- * @returns {string}
- */
-function prlctlFailureText(error) {
-	const parts = [];
-	for (const field of ["stderr", "stdout", "message"]) {
-		const value = error?.[field];
-		if (typeof value === "string") parts.push(value);
-		else if (Buffer.isBuffer(value)) parts.push(value.toString("utf8"));
-	}
-	return parts.join("\n");
-}
-
-/**
- * Classify a thrown prlctl failure into a closed diagnostic code.
- *
- * Signature matching comes first so a misfire is still recognized when the
- * harness also killed the child, which is the ambiguous case the old code
- * could not distinguish at all.
- * @param {unknown} error
- * @returns {string} member of the prlctl diagnostic vocabulary
- */
-function classifyPrlctlFailure(error) {
-	const text = prlctlFailureText(error);
-	if (PRLCTL_JOB_MISFIRE.test(text)) return "prlctl_job_misfire";
-	if (PRLCTL_SESSION_NOT_READY.test(text)) return "prlctl_session_not_ready";
-	if (error?.killed === true || error?.code === "ETIMEDOUT") {
-		return "prlctl_call_timed_out";
-	}
-	return "prlctl_call_failed";
-}
-
-/**
- * Classify a failed bulk-transfer helper run.
- *
- * The helper is a separate process, so its prlctl failures never reach `_call`
- * and were the one production path that surfaced a bare Error: a misfire there
- * reached the run record as `worker_boot_exception`, naming the stage and not
- * the cause. Both numbers in its stderr line are formats this module defines
- * itself -- "prlctl failed (255):" from the helper's own `run`, and the attempt
- * count added alongside it -- so reading them back is a private protocol, not
- * prose matching. The helper process's own exit status is deliberately ignored:
- * it is 1 for every failure and is not prlctl's.
- * @param {string} detail Trimmed helper stderr.
- * @returns {PrlctlCallError}
- */
-export function describeBulkTransferFailure(detail, spawnError = null) {
-	const text = typeof detail === "string" ? detail : "";
-	const attemptMatch = /failed after (\d{1,3}) attempt/.exec(text);
-	const exitMatch = /prlctl failed \((\d{1,3})\)/.exec(text);
-	const exitCode = exitMatch ? Number(exitMatch[1]) : null;
-	// A spawn-level failure -- the helper killed on a timeout, or its output
-	// overrunning `maxBuffer` on a large tar -- never reaches the helper's own
-	// stderr, so `spawnError` carries the only cause there is. Forwarding its
-	// code and killed flag is what makes `prlctl_call_timed_out` reachable on
-	// this path at all: classifying a synthetic `{ message }` alone can only ever
-	// return the generic code, which puts the transfer back to failing with
-	// nothing recorded -- the exact defect this function was added to remove.
-	const reason = text || String(spawnError?.code ?? spawnError?.message ?? "");
-	return new PrlctlCallError({
-		diagnosticCode: classifyPrlctlFailure({
-			message: reason,
-			code: spawnError?.code,
-			killed: spawnError?.killed,
-		}),
-		subcommand: "exec",
-		attempts: attemptMatch ? Number(attemptMatch[1]) : 1,
-		exitCode: Number.isSafeInteger(exitCode) ? exitCode : null,
-		cause: new Error(
-			reason
-				? `Parallels bulk transfer failed: ${reason}`
-				: "Parallels bulk transfer failed",
-		),
-	});
-}
-
-/**
- * Wrap a thrown prlctl failure in the reviewed error type, preserving the
- * original as `cause` for local debugging while exposing only closed,
- * bounded fields for persistence.
- * @param {unknown} error
- * @param {{args: string[], attempts: number}} context
- * @returns {PrlctlCallError}
- */
-function describePrlctlFailure(error, { args, attempts }) {
-	const subcommand = PRLCTL_SUBCOMMANDS.has(args?.[0]) ? args[0] : null;
-	const status = error?.status;
-	const signal = error?.signal;
-	return new PrlctlCallError({
-		diagnosticCode: classifyPrlctlFailure(error),
-		subcommand,
-		attempts,
-		exitCode: Number.isSafeInteger(status) ? status : null,
-		signal: PERSISTABLE_PRLCTL_SIGNALS.has(signal) ? signal : null,
-		killed: error?.killed === true || error?.code === "ETIMEDOUT",
-		cause: error,
-	});
-}
-
-/**
- * Validate a retry-attempt count. One means "no retry", which is a legitimate
- * caller choice, so the floor is 1 rather than 2.
- * @param {unknown} value
- * @param {string} label
- * @returns {number}
- */
-function validateAttemptCount(value, label) {
-	if (!Number.isSafeInteger(value) || value < 1) {
-		throw new TypeError(`${label} must be an integer >= 1`);
-	}
-	return value;
-}
-
-function outputText(value) {
-	if (Buffer.isBuffer(value)) return value.toString("utf8");
-	if (typeof value === "string") return value;
-	if (value && typeof value.stdout !== "undefined") {
-		return outputText(value.stdout);
-	}
-	return "";
-}
-
-function shellQuote(value) {
-	return `'${String(value).replaceAll("'", "'\\''")}'`;
-}
-
-function providerPidMarkerPath(workspaceId, cleanupContext = {}) {
-	const identity = markerIdentity(workspaceId, cleanupContext);
-	if (!identity) return null;
-	return `${PROVIDER_PID_MARKER_PREFIX}${identity.operation}-${identity.token.slice(0, 32)}.pid`;
-}
-
-function providerTerminalEvidencePath(workspaceId, cleanupContext = {}) {
-	const identity = markerIdentity(workspaceId, cleanupContext);
-	if (identity?.operation !== "provider") return null;
-	return `${PROVIDER_PID_MARKER_PREFIX}${identity.operation}-${identity.token.slice(0, 32)}.terminal.json`;
-}
-
-function validateGuestPath(value, label) {
-	if (typeof value !== "string" || !SAFE_GUEST_PATH.test(value)) {
-		throw new Error(`${label} must be an absolute safe guest path`);
-	}
-	if (value.split("/").includes("..")) {
-		throw new Error(`${label} must not contain parent traversal`);
-	}
-	return value;
-}
-
-function validateUser(value) {
-	if (typeof value !== "string" || !SAFE_USER.test(value)) {
-		throw new Error("provider user must be a safe account name");
-	}
-	return value;
-}
-
-/**
- * The provider account's home directory. `prlctl exec` enters the guest with
- * `HOME=/`, and macOS sudoers preserves it across `sudo -u`, so `-H` does not
- * override it. Everything that has to agree on one home — credential
- * provisioning, the login shell's profile, and the provider's own cache and
- * config directories — resolves it here.
- * @param {string} providerUser
- * @returns {string}
- */
-function providerHomePath(providerUser) {
-	return `/Users/${validateUser(providerUser)}`;
-}
-
-function resolveWorkspacePath(value, providerUser) {
-	const user = validateUser(providerUser);
-	const physicalRoot = `${providerHomePath(user)}/.switchyard/project`;
-	if (value === "/project") return physicalRoot;
-	if (value.startsWith("/project/")) {
-		return `${physicalRoot}${value.slice("/project".length)}`;
-	}
-	return value;
-}
-
-/**
- * A `KEY=value` assignment that survives prlctl's join-and-reparse untouched:
- * printable ASCII only, and no character the guest's single parse would act on.
- * @param {string} value
- * @returns {string}
- */
-function validateEnvAssignment(value) {
-	if (
-		typeof value !== "string" ||
-		!/^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._+@%=:,/-]*$/.test(value)
-	) {
-		throw new Error("env assignment must be a safe KEY=value pair");
-	}
-	return value;
-}
-
-function validateUid(value) {
-	if (!/^\d+$/.test(String(value ?? "")) || Number(value) <= 0) {
-		throw new Error("aquaUid must be a positive numeric uid");
-	}
-	return String(value);
-}
-
-function validateTransferHost(value) {
-	if (
-		typeof value !== "string" ||
-		!/^[A-Za-z0-9][A-Za-z0-9.:-]*$/.test(value) ||
-		value.includes("..")
-	) {
-		throw new Error("transferHost must be a safe host address");
-	}
-	return value;
-}
-
-function validateTar(value) {
-	if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
-		throw new TypeError("tar must be an in-memory Buffer or Uint8Array");
-	}
-	if (value.byteLength > MAX_TRANSFER_BYTES) {
-		throw new Error("tar exceeds the configured in-memory transfer limit");
-	}
-	return Buffer.from(value);
-}
-
-function snapshotIdsFromOutput(output) {
-	const text = outputText(output);
-	const ids = new Set();
-	try {
-		const parsed = JSON.parse(text);
-		const visit = (value) => {
-			if (!value || typeof value !== "object") return;
-			if (Array.isArray(value)) {
-				for (const item of value) visit(item);
-				return;
-			}
-			for (const [key, item] of Object.entries(value)) {
-				if (
-					/^(?:id|snapshot[_-]?id)$/i.test(key) &&
-					typeof item === "string" &&
-					item.length > 0
-				) {
-					ids.add(item);
-				}
-				visit(item);
-			}
-		};
-		visit(parsed);
-	} catch {
-		for (const match of text.matchAll(
-			/\{?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}?/gi,
-		)) {
-			ids.add(match[0]);
-		}
-	}
-	return ids;
-}
-
-function normalizedUuid(value) {
-	if (!isUuid(value)) return null;
-	return String(value)
-		.replace(/^\{|\}$/g, "")
-		.toLowerCase();
-}
-
-/**
- * Read only the closed structured snapshot-list shape used by the
- * reconciliation path. The legacy parser intentionally remains permissive
- * for existing cleanup behavior; it cannot prove absence after a lost result.
- */
-function strictSnapshotIdsFromOutput(output) {
-	let parsed;
-	try {
-		parsed = JSON.parse(outputText(output));
-	} catch {
-		throw new Error("snapshot inventory is not a complete structured response");
-	}
-	const idsFromArray = (value) => {
-		if (!Array.isArray(value)) {
-			throw new Error("snapshot inventory has an unknown structure");
-		}
-		const ids = new Set();
-		for (const entry of value) {
-			if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-				throw new Error("snapshot inventory has an invalid entry");
-			}
-			const id = normalizedUuid(
-				entry.id ?? entry.snapshotId ?? entry.snapshot_id,
-			);
-			if (!id) throw new Error("snapshot inventory entry has no exact UUID");
-			ids.add(id);
-		}
-		return ids;
-	};
-	if (!parsed || typeof parsed !== "object") {
-		throw new Error("snapshot inventory has an unknown structure");
-	}
-	if (Object.keys(parsed).length === 1 && Object.hasOwn(parsed, "snapshots")) {
-		return idsFromArray(parsed.snapshots);
-	}
-	throw new Error("snapshot inventory has an unknown structure");
-}
-
-function snapshotDifference(after, before) {
-	return [...after].filter((id) => !before.has(id));
-}
-
-function measurePathBytes(path) {
-	const entry = lstatSync(path);
-	if (!entry.isDirectory()) return entry.size;
-	return readdirSync(path, { withFileTypes: true }).reduce((total, child) => {
-		const childPath = `${path}/${child.name}`;
-		return total + measurePathBytes(childPath);
-	}, 0);
-}
-
-function diskBytesFromInfo(info, diskUsageFn = null) {
-	const text = outputText(info);
-	const image = text.match(/\bimage=['"]([^'"]+)['"]/i)?.[1];
-	if (image) {
-		const bytes = diskUsageFn ? diskUsageFn(image) : measurePathBytes(image);
-		if (Number.isFinite(Number(bytes)) && Number(bytes) > 0) {
-			return Number(bytes);
-		}
-	}
-	const size = text.match(
-		/\b(?:size|capacity)\s*[=:]\s*(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)?\b/i,
-	);
-	if (size) {
-		const units = {
-			B: 1,
-			KB: 1024,
-			MB: 1024 ** 2,
-			GB: 1024 ** 3,
-			TB: 1024 ** 4,
-		};
-		const bytes =
-			Number(size[1]) * (units[String(size[2] ?? "B").toUpperCase()] ?? 1);
-		if (Number.isFinite(bytes) && bytes > 0) return bytes;
-	}
-	throw new Error(
-		"linked clone disk measurement was not present in prlctl output",
-	);
-}
-
-function validateRunId(runId) {
-	if (typeof runId !== "string" || !SAFE_RUN_ID.test(runId)) {
-		throw new Error("runId must be a non-empty safe identifier");
-	}
-	return runId;
-}
-
-function validatePid(pid) {
-	if (!Number.isSafeInteger(pid) || pid <= 0) {
-		throw new Error("creatorPid must be a positive integer");
-	}
-	return pid;
-}
-
-/**
- * Validate a millisecond knob at construction rather than at the wait itself.
- *
- * Every one of these values ends up as an argument to `sleepFn`, whose default
- * is a blocking `Atomics.wait`. A NaN or negative there is not a bad poll
- * interval, it is a hung teardown with no diagnostic, so an out-of-range value
- * has to be refused where the caller can still see which knob it named.
- * Timeouts accept 0 -- "do not wait" is a meaningful budget -- while a poll
- * interval of 0 is a busy loop and is refused.
- * @param {unknown} value
- * @param {string} name
- * @param {number} minimum
- * @returns {number}
- */
-function validateDurationMs(value, name, minimum) {
-	if (!Number.isSafeInteger(value) || value < minimum) {
-		throw new Error(`${name} must be an integer of at least ${minimum}ms`);
-	}
-	return value;
-}
-
-/**
- * Build the only VM name this backend may create or reclaim.
- * @param {string} runId
- * @param {number} creatorPid
- * @returns {string}
- */
-export function buildParallelsWorkingName(runId, creatorPid) {
-	return `${PARALLELS_WORKING_PREFIX}${validateRunId(runId)}-${validatePid(creatorPid)}`;
-}
-
-/**
- * Parse ownership from a VM name. The PID is the final hyphen-delimited
- * component, so run IDs may contain hyphens without weakening the proof.
- * @param {unknown} name
- * @returns {{name: string, runId: string, creatorPid: number}|null}
- */
-export function parseParallelsWorkingName(name) {
-	if (typeof name !== "string" || !name.startsWith(PARALLELS_WORKING_PREFIX)) {
-		return null;
-	}
-	const remainder = name.slice(PARALLELS_WORKING_PREFIX.length);
-	const separator = remainder.lastIndexOf("-");
-	if (separator <= 0) return null;
-	const runId = remainder.slice(0, separator);
-	const pidText = remainder.slice(separator + 1);
-	if (!SAFE_RUN_ID.test(runId) || !/^[1-9]\d*$/.test(pidText)) return null;
-	return { name, runId, creatorPid: Number(pidText) };
-}
-
-/**
- * Validate the evidence required before selecting a linked clone.
- *
- * Parallels creates a snapshot on the golden image for a linked clone and
- * does not protect that image from destructive operations. A positive disk
- * measurement and finite clone-to-boot duration are therefore a prerequisite
- * for using `--linked`; missing or malformed evidence fails closed.
- * @param {unknown} measurement
- * @returns {{diskBytes: number, cloneToBootMs: number}}
- */
-export function validateLinkedCloneMeasurement(measurement) {
-	if (!measurement || typeof measurement !== "object") {
-		throw new Error(
-			"refusing linked clone: positive disk and finite clone-to-boot measurements are required",
-		);
-	}
-	const diskBytes = Number(measurement.diskBytes ?? measurement.onDiskBytes);
-	const cloneToBootMs = Number(measurement.cloneToBootMs ?? measurement.bootMs);
-	if (
-		!Number.isFinite(diskBytes) ||
-		diskBytes <= 0 ||
-		!Number.isFinite(cloneToBootMs) ||
-		cloneToBootMs < 0
-	) {
-		throw new Error(
-			"refusing linked clone: positive disk and finite clone-to-boot measurements are required",
-		);
-	}
-	return { diskBytes, cloneToBootMs };
-}
-
-const HOST_READINESS_CODES = new Set([
-	"vm_host_inventory_permission_denied",
-	"vm_host_inventory_unavailable",
-	"vm_host_service_degraded",
-]);
-
-/** Closed, content-free host readiness failure for queue admission. */
-export class ParallelsHostReadinessError extends Error {
-	constructor(code, cause) {
-		if (!HOST_READINESS_CODES.has(code)) {
-			throw new TypeError("unrecognized Parallels host readiness code");
-		}
-		super(
-			code === "vm_host_inventory_permission_denied"
-				? "Parallels VM inventory permission is denied"
-				: code === "vm_host_inventory_unavailable"
-					? "Parallels VM inventory is unavailable"
-					: "Parallels host service is degraded",
-			{ cause },
-		);
-		this.name = "ParallelsHostReadinessError";
-		Object.defineProperty(this, "code", { value: code, enumerable: true });
-		if (code === "vm_host_inventory_permission_denied") {
-			Object.defineProperty(this, "boundary", {
-				value: "parallels_vm_inventory",
-				enumerable: true,
-			});
-		}
-	}
-}
-
-function parseVmList(output) {
-	return outputText(output)
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean)
-		.map((line) => {
-			const fields = line.includes("\t")
-				? line.split("\t").map((field) => field.trim())
-				: line.split(/\s+/);
-			if (fields.length < 3) return null;
-			const [uuid, status, ...nameParts] = fields;
-			const name = nameParts.join(" ").trim();
-			if (!uuid || !status || !name || name.toLowerCase() === "name")
-				return null;
-			return {
-				uuid,
-				status,
-				name,
-				ownership: parseParallelsWorkingName(name),
-			};
-		})
-		.filter(Boolean);
-}
-
-function parseReadinessInventory(output) {
-	const lines = outputText(output)
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean);
-	if (lines.length === 0) {
-		throw new Error("Parallels VM inventory is blank");
-	}
-	const rows = lines.map((line) =>
-		line.includes("\t")
-			? line.split("\t").map((field) => field.trim())
-			: line.split(/\s+/),
-	);
-	if (
-		rows[0].length === 3 &&
-		rows[0][0].toLowerCase() === "uuid" &&
-		rows[0][1].toLowerCase() === "status" &&
-		rows[0][2].toLowerCase() === "name"
-	) {
-		rows.shift();
-	}
-	for (const fields of rows) {
-		const [uuid, status, ...nameParts] = fields;
-		if (
-			fields.length < 3 ||
-			!UUID.test(uuid ?? "") ||
-			!/^[A-Za-z][A-Za-z0-9_-]*$/.test(status ?? "") ||
-			!nameParts.join(" ").trim()
-		) {
-			throw new Error("Parallels VM inventory contains an invalid row");
-		}
-	}
-	return rows;
-}
-
-function isUuid(value) {
-	return typeof value === "string" && UUID.test(value);
-}
-
-function isBoundedRecordText(value, maxLength = 1024) {
-	return (
-		typeof value === "string" &&
-		value.length > 0 &&
-		value.length <= maxLength &&
-		![...value].some((character) => {
-			const codePoint = character.codePointAt(0);
-			return codePoint <= 31 || codePoint === 127;
-		})
-	);
-}
-
-function markerIdentity(workspaceId, cleanupContext = {}) {
-	const required = [
-		"runId",
-		"taskId",
-		"attemptId",
-		"descriptorIdentity",
-		"workspaceId",
-	];
-	if (
-		!cleanupContext ||
-		!["provider", "helper"].includes(cleanupContext.operation) ||
-		cleanupContext.workspaceId !== String(workspaceId) ||
-		required.some(
-			(field) =>
-				typeof cleanupContext[field] !== "string" ||
-				cleanupContext[field].length === 0,
-		)
-	) {
-		return null;
-	}
-	const operation = cleanupContext.operation;
-	const payload = JSON.stringify({
-		v: PROCESS_MARKER_SCHEMA_VERSION,
-		operation,
-		workspaceId: String(workspaceId),
-		runId: cleanupContext.runId,
-		taskId: cleanupContext.taskId,
-		attemptId: cleanupContext.attemptId,
-		descriptorIdentity: cleanupContext.descriptorIdentity,
-		processStartIdentity:
-			typeof cleanupContext.processStartIdentity === "string" &&
-			cleanupContext.processStartIdentity
-				? cleanupContext.processStartIdentity
-				: null,
-	});
-	return {
-		operation,
-		payload,
-		// No qualified guest birth-identity probe exists in this source scope.
-		// The host supervisor identity still fences marker names, but it never
-		// upgrades a guest PID into signaling authority.
-		strongStart: false,
-		token: createHash("sha256").update(payload).digest("hex"),
-	};
-}
-
-function ownershipContextFor(options, backend) {
-	const source = options?.ownershipContext;
-	const required = [
-		"resourceRoot",
-		"runId",
-		"taskId",
-		"attemptId",
-		"projectRoot",
-	];
-	if (
-		!source ||
-		required.some(
-			(field) =>
-				typeof source[field] !== "string" || source[field].length === 0,
-		)
-	) {
-		throw new Error(
-			"VM allocation requires explicit durable ownership context",
-		);
-	}
-	if (!isAbsolute(source.resourceRoot) || !isAbsolute(source.projectRoot)) {
-		throw new Error(
-			"VM ownership context requires absolute resourceRoot and projectRoot",
-		);
-	}
-	const suppliedProcessIdentity =
-		source.processStartIdentity === null ||
-		source.processStartIdentity === undefined
-			? null
-			: parseHostProcessIdentity(source.processStartIdentity)?.identity;
-	if (
-		source.processStartIdentity !== null &&
-		source.processStartIdentity !== undefined &&
-		!suppliedProcessIdentity
-	) {
-		throw new Error(
-			"VM ownership context has malformed creator birth identity",
-		);
-	}
-	return Object.freeze({
-		schemaVersion: VM_OWNERSHIP_SCHEMA_VERSION,
-		resourceRoot: resolve(source.resourceRoot),
-		runId: validateRunId(source.runId),
-		taskId: String(source.taskId),
-		attemptId: String(source.attemptId),
-		projectRoot: resolve(source.projectRoot),
-		purpose:
-			typeof source.purpose === "string" && source.purpose
-				? source.purpose
-				: "dispatch",
-		creatorPid: validatePid(
-			source.creatorPid ?? options.creatorPid ?? backend.creatorPid,
-		),
-		processStartIdentity: suppliedProcessIdentity,
-	});
-}
 
 /**
  * Synchronous Parallels lifecycle implementation with injectable VM calls.

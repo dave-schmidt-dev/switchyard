@@ -171,6 +171,13 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 	},
 	{
 		path: "src/switchyard/adapter/provider-lifecycle.mjs",
+		members: [
+			"src/switchyard/adapter/provider-lifecycle-progress.mjs",
+			"src/switchyard/adapter/provider-lifecycle-completion.mjs",
+			"src/switchyard/adapter/provider-lifecycle-process.mjs",
+			"src/switchyard/adapter/provider-lifecycle-invocation.mjs",
+			"src/switchyard/adapter/provider-lifecycle-diff-capture.mjs",
+		],
 		lines: 55,
 		branches: 30,
 		functions: 55,

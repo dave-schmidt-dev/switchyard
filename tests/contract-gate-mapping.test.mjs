@@ -235,16 +235,25 @@ describe("source-boundary contract gate mapping", () => {
 				}),
 			/contract_gate_execution_invalid/,
 		);
+		const executedQuickCheckSuites = [
+			"tests/runner-quick-checks-cleanup.test.mjs",
+			"tests/runner-quick-checks-contract-recovery.test.mjs",
+			"tests/runner-quick-checks-queue-recovery.test.mjs",
+			"tests/runner-quick-checks-sandbox.test.mjs",
+		];
 		deepStrictEqual(
 			validateExecution({
 				manifest: extractedOnly,
 				execution: {
-					suites: {
-						"tests/runner-quick-checks.test.mjs": { status: "executed" },
-					},
+					suites: Object.fromEntries(
+						executedQuickCheckSuites.map((suite) => [
+							suite,
+							{ status: "executed" },
+						]),
+					),
 				},
 			}).requiredSuites,
-			["tests/runner-quick-checks.test.mjs"],
+			executedQuickCheckSuites,
 		);
 	});
 

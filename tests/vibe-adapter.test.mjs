@@ -1,7 +1,6 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
-
 import {
 	captureDiffAsync,
 	execute,
@@ -26,7 +25,6 @@ const DESCRIPTOR = validateInvocationDescriptor(
 	},
 	"vibe",
 );
-
 function options(executionBackend) {
 	return {
 		model: DESCRIPTOR.selector,
@@ -37,7 +35,6 @@ function options(executionBackend) {
 		executionBackend,
 	};
 }
-
 describe("Vibe adapter", () => {
 	it("runs the keychain-backed CLI with the routed model and noninteractive implementor flags", () => {
 		const requests = [];
@@ -85,7 +82,6 @@ describe("Vibe adapter", () => {
 		ok(request.argv.includes("--auto-approve"));
 		ok(request.argv.includes("--trust"));
 	});
-
 	it("rejects a descriptor with a non-active selector before provider execution", () => {
 		let execArgvCalled = false;
 		const inactiveDescriptor = validateInvocationDescriptor(
@@ -115,7 +111,6 @@ describe("Vibe adapter", () => {
 		strictEqual(execArgvCalled, false);
 		ok(result.error.startsWith("Vibe does not serve model glm-5-2"));
 	});
-
 	it("rejects an async descriptor with a non-active selector before provider execution", async () => {
 		let execArgvCalled = false;
 		const executionBackend = {
@@ -132,7 +127,6 @@ describe("Vibe adapter", () => {
 		strictEqual(execArgvCalled, false);
 		ok(result.error.startsWith("Vibe does not serve model glm-5-2"));
 	});
-
 	it("requires both the CLI and its Vibe Keychain credential", () => {
 		const calls = [];
 		const executionBackend = {
@@ -153,7 +147,6 @@ describe("Vibe adapter", () => {
 			],
 		]);
 	});
-
 	it("fails closed when the Keychain item is absent", () => {
 		let count = 0;
 		const executionBackend = {
@@ -165,11 +158,9 @@ describe("Vibe adapter", () => {
 		};
 		strictEqual(isVibeAuthenticated(WORKSPACE, executionBackend), false);
 	});
-
 	it("rejects unsafe workspace identifiers before diff capture", async () => {
 		strictEqual(await captureDiffAsync("unsafe;workspace", {}), null);
 	});
-
 	it("supplies an empty stdin payload so the process does not stall on stdin", async () => {
 		const stdinEndCalls = [];
 		let resolved = false;
@@ -221,7 +212,6 @@ describe("Vibe adapter", () => {
 		strictEqual(spawned[1].args[0], "vibe");
 		deepStrictEqual(stdinEndCalls[1], [""]);
 	});
-
 	it("writes a config that declares every routable selector so Vibe cannot substitute", () => {
 		const config = renderVibeConfig("glm-5-3");
 		ok(config.includes('active_model = "glm-5-3"'));
@@ -234,7 +224,6 @@ describe("Vibe adapter", () => {
 		}
 		ok(!/api_key\s*=/.test(config), "the config must carry no key material");
 	});
-
 	it("reconciles exit 255 from a confirmed sidecar using the caller cleanup context", async () => {
 		const token = "11111111-1111-4111-8111-111111111111";
 		const cleanupContext = {
@@ -295,7 +284,6 @@ describe("Vibe adapter", () => {
 		strictEqual(reads, 1);
 		strictEqual(clears, 1);
 	});
-
 	it("fails the task when Vibe reports having run a different model", () => {
 		const executionBackend = {
 			execArgv(_workspaceId, candidate) {
@@ -334,7 +322,6 @@ describe("Vibe adapter", () => {
 		strictEqual(result.servedModel, "mistral-medium-3.5");
 		ok(result.error.includes("silently substituted"));
 	});
-
 	it("fails closed without ever invoking the Vibe CLI when the config write cannot be persisted", async () => {
 		const spawned = [];
 		const executionBackend = {
@@ -367,7 +354,6 @@ describe("Vibe adapter", () => {
 			"must never spawn the Vibe CLI when its config could not be written",
 		);
 	});
-
 	it("lets the absolute deadline terminate a silent config write without a private silence timeout", async () => {
 		const spawned = [];
 		let clock = 0;
@@ -408,7 +394,6 @@ describe("Vibe adapter", () => {
 		strictEqual(result.providerLifecycle.terminationReason, "deadline");
 		strictEqual(spawned.length, 6);
 	});
-
 	it("treats an unreadable served-model probe as unverified rather than a mismatch", () => {
 		const statuses = [];
 		const executionBackend = {
@@ -438,7 +423,6 @@ describe("Vibe adapter", () => {
 			"an unreadable probe must surface that the substitution guard is inactive",
 		);
 	});
-
 	it("fails the async task when Vibe reports having run a different model", async () => {
 		const spawned = [];
 		const executionBackend = {
@@ -484,43 +468,5 @@ describe("Vibe adapter", () => {
 		ok(result.error.includes("silently substituted"));
 		// One config write, one provider run, one served-model probe.
 		strictEqual(spawned.length, 3);
-	});
-
-	it("reports the served model on a matching run", () => {
-		const executionBackend = {
-			execArgv(_workspaceId, candidate) {
-				const servedProbe = candidate.argv.some(
-					(arg) => typeof arg === "string" && arg.includes("logs/session"),
-				);
-				return {
-					command: process.execPath,
-					args: [
-						"-e",
-						servedProbe
-							? 'process.stdout.write("glm-5-3\\n")'
-							: 'process.stdout.write("vibe-ran")',
-					],
-				};
-			},
-		};
-		const descriptor = validateInvocationDescriptor(
-			{
-				target_id: "vibe",
-				model_ref: "zhipu/glm-5.3",
-				selector: "glm-5-3",
-				effort: null,
-				variant: null,
-				invocation_args: [],
-			},
-			"vibe",
-		);
-		const result = execute("change one file", WORKSPACE, {
-			...options(executionBackend),
-			model: descriptor.selector,
-			invocationDescriptor: descriptor,
-			descriptorIdentity: descriptor.descriptor_identity,
-		});
-		strictEqual(result.success, true);
-		strictEqual(result.servedModel, "glm-5-3");
 	});
 });

@@ -23,9 +23,9 @@ import { tempDir } from "./helpers/tempdir.mjs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
 const OPS = resolve(PKG_ROOT, "ops");
-const BACKEND = resolve(
+const PRIMITIVES = resolve(
 	PKG_ROOT,
-	"src/switchyard/lifecycle/parallels-execution-backend.mjs",
+	"src/switchyard/lifecycle/parallels-primitives.mjs",
 );
 const REAPER = resolve(OPS, "switchyard-reaper.sh");
 const SCRIPTS = [REAPER].concat(
@@ -94,12 +94,12 @@ describe("standalone reaper ops artifacts", () => {
 
 	it("keeps its managed VM-name prefix in sync with the lifecycle backend", () => {
 		const reaper = readFileSync(REAPER, "utf8");
-		const backend = readFileSync(BACKEND, "utf8");
+		const backend = readFileSync(PRIMITIVES, "utf8");
 		const sourcePrefix = /PARALLELS_WORKING_PREFIX\s*=\s*"([^"]+)"/.exec(
 			backend,
 		)?.[1];
 		const reaperPrefix = /WORKING_PREFIX="([^"]+)"/.exec(reaper)?.[1];
-		ok(sourcePrefix, "could not read PARALLELS_WORKING_PREFIX from backend");
+		ok(sourcePrefix, "could not read PARALLELS_WORKING_PREFIX from primitives");
 		ok(reaperPrefix, "could not read WORKING_PREFIX from reaper");
 		strictEqual(reaperPrefix, sourcePrefix);
 	});
