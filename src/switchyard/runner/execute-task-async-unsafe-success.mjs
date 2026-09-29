@@ -3,6 +3,7 @@ import {
 	safeSuccessfulRouteReason,
 } from "./ledger-reporting.mjs";
 import { quickCheckDecisionAsync } from "./quick-checks.mjs";
+import { acceptanceCheckDiagnostic } from "./reliability.mjs";
 import { integrationFailureMetadata } from "./retry-transitions.mjs";
 import {
 	captureDiffWithEvidenceAsync,
@@ -112,6 +113,9 @@ export async function completeExecuteTaskAsyncUnsafe(
 		};
 	}
 	const quickCheck = await quickCheckDecisionAsync(task, context, diff);
+	const providerReliability = quickCheck.passed
+		? execution.providerReliability
+		: acceptanceCheckDiagnostic(task, quickCheck.receipt).diagnostic;
 	const gateResult = !quickCheck.passed
 		? { success: false, message: "check_failed" }
 		: (dirtyOverlayIntegrationGate(context) ??
@@ -157,6 +161,7 @@ export async function completeExecuteTaskAsyncUnsafe(
 			: {}),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...(providerReliability ? { providerReliability } : {}),
 		...survivingProviderFields(execution),
 		...(success
 			? { reason: safeSuccessfulRouteReason(routeResult.reason) }
@@ -177,6 +182,7 @@ export async function completeExecuteTaskAsyncUnsafe(
 		...survivingProviderFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...(providerReliability ? { providerReliability } : {}),
 		...(!success && !gateResult?.credentialFlagged
 			? {
 					partialDiff: diff,

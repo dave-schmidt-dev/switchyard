@@ -80,6 +80,9 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
+			...(execution.providerReliability
+				? { providerReliability: execution.providerReliability }
+				: {}),
 			...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
 			...reviewFailureFields(task, execution),
 			...survivingProviderFields(execution),
@@ -103,6 +106,9 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
+			...(execution.providerReliability
+				? { providerReliability: execution.providerReliability }
+				: {}),
 			...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
 			...reviewFailureFields(task, execution),
 			...survivingProviderFields(execution),
@@ -205,6 +211,9 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 		diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 		diagnosticRef: execution.diagnosticRef,
 		cleanupStage: execution.cleanupStage,
+		...(execution.providerReliability
+			? { providerReliability: execution.providerReliability }
+			: {}),
 	});
 	return {
 		...descriptorReceiptFields(invocationDescriptor),
@@ -234,6 +243,9 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 		diagnosticRef: execution.diagnosticRef,
 		cleanupFailed,
 		cleanupStage: execution.cleanupStage,
+		...(execution.providerReliability
+			? { providerReliability: execution.providerReliability }
+			: {}),
 		...(captureStatus ? { captureStatus } : {}),
 		...reviewFailureFields(task, execution),
 		...survivingProviderFields(execution),

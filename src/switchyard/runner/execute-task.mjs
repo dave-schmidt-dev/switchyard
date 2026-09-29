@@ -25,6 +25,25 @@ import {
 	resolveTaskRequiredCapability,
 } from "./task-routing.mjs";
 
+const ROUTE_HEALTH_RESULT_FIELDS = Object.freeze([
+	"_routeHealthTrialStarted",
+	"routeHealthBinding",
+	"routeHealthAttempt",
+]);
+
+function projectTaskResult(result, extra = {}) {
+	const projected = { ...result, ...extra };
+	for (const field of ROUTE_HEALTH_RESULT_FIELDS) {
+		const descriptor = Object.getOwnPropertyDescriptor(result, field);
+		if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
+		Object.defineProperty(projected, field, {
+			value: descriptor.value,
+			enumerable: false,
+		});
+	}
+	return projected;
+}
+
 export function runCompletionCorrection(
 	task,
 	context,
@@ -101,10 +120,12 @@ export function runCompletionCorrection(
 }
 
 export function executeTask(task, context) {
+	context._activeRouteHealth = null;
+	context._activeProviderExecutionSucceeded = false;
+	context._activeCompletionLifecycleReceipt = null;
 	if (!context._completionPin) {
-		context._activeRouteHealth = null;
-		context._activeProviderExecutionSucceeded = false;
-		context._activeCompletionLifecycleReceipt = null;
+		if (!context._checkRepairPin && !context._completionPin)
+			context._baselineCheckReceipt = null;
 	}
 	const result = decorateDirtyOverlayResult(
 		attachRouteHealthTerminal(executeTaskUnsafe(task, context), context),
@@ -117,10 +138,16 @@ export function executeTask(task, context) {
 			.then(() => emitTaskStageOutcomes(context, task, result))
 			.catch(() => {});
 	}
-	return result;
+	return projectTaskResult(result, {
+		...(context._baselineCheckReceipt
+			? { baselineCheckReceipt: context._baselineCheckReceipt }
+			: {}),
+	});
 }
 
 export async function executeTaskAsync(task, context) {
+	if (!context._checkRepairPin && !context._completionPin)
+		context._baselineCheckReceipt = null;
 	clearAsyncTaskContext(context);
 	context._activeRouteHealth = null;
 	context._activeProviderExecutionSucceeded = false;
@@ -134,8 +161,13 @@ export async function executeTaskAsync(task, context) {
 			),
 			context,
 		);
-		await emitTaskStageOutcomes(context, task, result);
-		return result;
+		const withBaseline = projectTaskResult(result, {
+			...(context._baselineCheckReceipt
+				? { baselineCheckReceipt: context._baselineCheckReceipt }
+				: {}),
+		});
+		await emitTaskStageOutcomes(context, task, withBaseline);
+		return withBaseline;
 	} catch (error) {
 		const route = context._activeBrokerRoute;
 		const routed = context._activeTaskRoute;

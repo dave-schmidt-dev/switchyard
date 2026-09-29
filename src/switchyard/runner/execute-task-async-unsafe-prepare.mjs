@@ -1,12 +1,9 @@
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../adapter/constants.mjs";
-import { HOST_POWER_STATES, readHostPower } from "../dispatch/host-power.mjs";
+import { HOST_POWER_STATES } from "../dispatch/host-power.mjs";
 import {
 	getConfiguredInvocationDescriptor,
 	getInvocationDescriptor,
-	normalizeProviderName,
 	resolveRouteProvenance,
-	resolveTargetIdentity,
-	validateInvocationDescriptor,
 } from "../roster/index.mjs";
 import { brokerRequestForTask, createDispatchBroker } from "./broker.mjs";
 import {
@@ -22,6 +19,7 @@ import {
 	mergeBrokerRouteProvenance,
 	normalizeBrokerRoute,
 } from "./outcome-writer.mjs";
+import { taskRepairScopeIdentity } from "./reliability.mjs";
 import { taskPromptForAttempt } from "./retry-transitions.mjs";
 import {
 	policyDeferredTaskResult,
@@ -72,6 +70,51 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 			),
 		};
 	}
+	const repairPin = context._checkRepairPin ?? context._completionPin;
+	const pinnedNow = Date.now();
+	const pinnedRemainingMs = repairPin
+		? Date.parse(repairPin.deadline) - pinnedNow
+		: null;
+	const checkRepairBudgetValid =
+		!context._checkRepairPin ||
+		(Number.isSafeInteger(context._checkRepairBudget?.providerTimeoutMs) &&
+			context._checkRepairBudget.providerTimeoutMs >= 30_000);
+	if (
+		repairPin &&
+		(repairPin.taskId !== task.id ||
+			repairPin.workspaceId !== context.workingContainerName ||
+			repairPin.scopeIdentity !== taskRepairScopeIdentity(task) ||
+			typeof repairPin.provider !== "string" ||
+			repairPin.provider.length === 0 ||
+			typeof repairPin.resolvedTargetId !== "string" ||
+			repairPin.resolvedTargetId.length === 0 ||
+			typeof repairPin.selector !== "string" ||
+			repairPin.selector.length === 0 ||
+			typeof repairPin.descriptorIdentity !== "string" ||
+			repairPin.descriptorIdentity.length === 0 ||
+			!checkRepairBudgetValid ||
+			!Number.isFinite(pinnedRemainingMs) ||
+			pinnedRemainingMs <= 0)
+	) {
+		return {
+			terminal: {
+				taskId: task.id,
+				success: false,
+				provider: repairPin.provider ?? null,
+				model: repairPin.selector ?? null,
+				resolvedTargetId: repairPin.resolvedTargetId ?? null,
+				result:
+					Number.isFinite(pinnedRemainingMs) && pinnedRemainingMs <= 0
+						? "execution_timed_out"
+						: "check_repair_ineligible",
+				errorKind:
+					Number.isFinite(pinnedRemainingMs) && pinnedRemainingMs <= 0
+						? "execution_timeout"
+						: "unknown_failure",
+				timedOut: Number.isFinite(pinnedRemainingMs) && pinnedRemainingMs <= 0,
+			},
+		};
+	}
 	let broker = context.broker;
 	if (!broker) {
 		broker = createDispatchBroker(context, context.brokerDependencies);
@@ -81,15 +124,44 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 		task,
 		context._completionRequirements,
 	);
-	context._activeTaskTimeoutMs =
-		task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
+	context._activeTaskTimeoutMs = repairPin
+		? Math.floor(pinnedRemainingMs)
+		: (task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS);
 	// Only a review task has a verdict to derive. Deriving unconditionally would
 	// parse an implementation task's transcript and relay text sanitized out of it
 	// across the broker boundary, which is the one thing that boundary exists to
 	// prevent.
 	context._activeTaskIsReview = task.type === "review";
 	const brokerRequest = brokerRequestForTask(task, context, requiredCapability);
-	const selectedRoute = await broker.selectAndReserve(brokerRequest);
+	let selectedRoute;
+	const routeOnly = Array.isArray(context.only) ? context.only : null;
+	if (repairPin && routeOnly) {
+		if (
+			routeOnly.length > 0 &&
+			!routeOnly.includes(repairPin.resolvedTargetId) &&
+			!routeOnly.includes(repairPin.provider)
+		) {
+			return {
+				terminal: {
+					taskId: task.id,
+					success: false,
+					provider: null,
+					model: null,
+					result: "check_repair_ineligible",
+					errorKind: "unknown_failure",
+				},
+			};
+		}
+		const previousOnly = [...routeOnly];
+		routeOnly.splice(0, routeOnly.length, repairPin.resolvedTargetId);
+		try {
+			selectedRoute = await broker.selectAndReserve(brokerRequest);
+		} finally {
+			routeOnly.splice(0, routeOnly.length, ...previousOnly);
+		}
+	} else {
+		selectedRoute = await broker.selectAndReserve(brokerRequest);
+	}
 	context._activeBrokerRoute = selectedRoute;
 	context._activeDispatchOutcomeRecorded = false;
 	const releaseSelected = async (route) => {
@@ -139,6 +211,28 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 	Object.assign(routeResult, descriptorReceiptFields(invocationDescriptor));
 	context._activeInvocationDescriptor = invocationDescriptor;
 	const resolvedTargetId = routeResult.resolvedTargetId ?? null;
+	if (
+		repairPin &&
+		(routeResult.provider !== repairPin.provider ||
+			resolvedTargetId !== repairPin.resolvedTargetId ||
+			invocationDescriptor.descriptor_identity !==
+				repairPin.descriptorIdentity ||
+			invocationDescriptor.selector !== repairPin.selector)
+	) {
+		await releaseSelected(selectedRoute);
+		return {
+			terminal: {
+				...descriptorReceiptFields(repairPin.invocationDescriptor),
+				taskId: task.id,
+				success: false,
+				provider: repairPin.provider,
+				model: repairPin.selector,
+				resolvedTargetId: repairPin.resolvedTargetId,
+				result: "check_repair_ineligible",
+				errorKind: "unknown_failure",
+			},
+		};
+	}
 	const record = async (
 		dispatch,
 		{
@@ -211,8 +305,35 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 			},
 		};
 	}
-	const timeoutMs = task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS;
-	const routedDeadline = new Date(Date.now() + timeoutMs).toISOString();
+	const timeoutMs = Math.floor(
+		Math.min(
+			repairPin
+				? Date.parse(repairPin.deadline) - Date.now()
+				: context._activeTaskTimeoutMs,
+			context._checkRepairPin
+				? context._checkRepairBudget.providerTimeoutMs
+				: Number.POSITIVE_INFINITY,
+		),
+	);
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+		await releaseSelected(selectedRoute);
+		return {
+			terminal: {
+				taskId: task.id,
+				success: false,
+				provider: repairPin?.provider ?? routeResult.provider,
+				model: repairPin?.selector ?? invocationDescriptor.selector,
+				resolvedTargetId: repairPin?.resolvedTargetId ?? resolvedTargetId,
+				result: "execution_timed_out",
+				errorKind: "execution_timeout",
+				timedOut: true,
+			},
+		};
+	}
+	context._activeTaskTimeoutMs = timeoutMs;
+	const routedDeadline = repairPin
+		? repairPin.deadline
+		: new Date(Date.now() + timeoutMs).toISOString();
 	context._activeTaskDeadline = routedDeadline;
 	context.onStatus?.({
 		phase: "execution",

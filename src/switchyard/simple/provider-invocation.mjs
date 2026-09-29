@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import {
+	classifyProviderStreams,
+	providerDiagnosticCodeForKind,
+} from "../adapter/exec-error.mjs";
 import { runProviderProcess } from "../adapter/provider-lifecycle.mjs";
 import {
 	MAX_CAPTURE_BYTES,
@@ -247,16 +251,42 @@ export async function defaultExecuteProvider(context) {
 		signal: context.signal,
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
+	const diagnosticEvidence = !result.success
+		? classifyProviderStreams({
+				stdout: result.output,
+				stderr: result.stderr,
+				code: result.code,
+				provider: context.harness,
+				command: invocation.command,
+			})
+		: null;
+	const bridgeDiagnostic =
+		context.harness === "opencode"
+			? parseOpenCodeGoBridgeDiagnosticEvidence(result.output)
+			: null;
+	const bridgeDiagnosticCode =
+		providerCodeForOpenCodeGoBridgeEvidence(bridgeDiagnostic);
+	const diagnosticCode = bridgeDiagnosticCode
+		? bridgeDiagnosticCode
+		: providerDiagnosticCodeForKind(diagnosticEvidence?.diagnosticKind);
+	const classified = diagnosticCode
+		? {
+				...result,
+				diagnosticCode,
+				diagnosticOrigin: "adapter",
+				diagnosticEvidenceAvailable: true,
+			}
+		: result;
 	if (context.harness === "opencode" && !result.success) {
 		const providerVerdictCode = parseOpenCodeGoBridgeDiagnostic(result.output);
 		return {
-			...result,
+			...classified,
 			output: "",
 			stderr: "",
 			...(providerVerdictCode ? { providerVerdictCode } : {}),
 		};
 	}
-	if (context.harness !== "agy" || !result.success) return result;
+	if (context.harness !== "agy" || !result.success) return classified;
 	try {
 		return {
 			...result,
@@ -270,14 +300,33 @@ export async function defaultExecuteProvider(context) {
 	}
 }
 export function parseOpenCodeGoBridgeDiagnostic(output) {
+	const evidence = parseOpenCodeGoBridgeDiagnosticEvidence(output);
+	if (!evidence) return null;
+	return `opencode_go_diag_requests_${evidence.requests}_status_${evidence.upstreamStatus}_rejections_${evidence.proxyRejections}`;
+}
+
+export function parseOpenCodeGoBridgeDiagnosticEvidence(output) {
 	if (typeof output !== "string") return null;
 	const match =
 		/^SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=(0|[1-9]\d{0,5}) upstream_status=(0|[1-5]\d{2}) proxy_rejections=(0|[1-9]\d{0,5})\r?\n?$/u.exec(
 			output,
 		);
 	if (!match) return null;
-	const [, requests, upstreamStatus, proxyRejections] = match;
-	return `opencode_go_diag_requests_${requests}_status_${upstreamStatus}_rejections_${proxyRejections}`;
+	return {
+		requests: Number(match[1]),
+		upstreamStatus: Number(match[2]),
+		proxyRejections: Number(match[3]),
+	};
+}
+
+export function providerCodeForOpenCodeGoBridgeEvidence(evidence) {
+	return evidence &&
+		evidence.requests > 0 &&
+		evidence.requests <= 999_999 &&
+		evidence.upstreamStatus === 429 &&
+		evidence.proxyRejections === 0
+		? "quota_exhausted"
+		: null;
 }
 async function defaultRunCheck({
 	command,

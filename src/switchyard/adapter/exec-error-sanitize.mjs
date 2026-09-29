@@ -1,3 +1,4 @@
+import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import {
 	CHECKPOINT_REMEDIATION_MESSAGES,
 	checkpointDimensionsFromReason,
@@ -35,6 +36,7 @@ export function sanitizeFailureMetadata({
 	diagnosticRef,
 	checkpointCode,
 	checkpointDimensions,
+	providerReliability,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -48,6 +50,9 @@ export function sanitizeFailureMetadata({
 		reasonCode: metadata.reasonCode,
 		reason: metadata.reason,
 	};
+	if (isProviderReliabilityDiagnostic(providerReliability)) {
+		safe.providerReliability = providerReliability;
+	}
 	const normalizedCheckpointCode =
 		typeof checkpointCode === "string" &&
 		Object.hasOwn(CHECKPOINT_REMEDIATION_MESSAGES, checkpointCode)
@@ -161,6 +166,7 @@ export function isPersistentFailureMetadata(value) {
 		"diagnosticRef",
 		"checkpointCode",
 		"checkpointDimensions",
+		"providerReliability",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
 	const expected = sanitizeFailureMetadata({
@@ -227,6 +233,7 @@ export function isPersistentFailureMetadata(value) {
 		diagnosticRef: value.diagnosticRef,
 		checkpointCode: value.checkpointCode,
 		checkpointDimensions: value.checkpointDimensions,
+		providerReliability: value.providerReliability,
 	});
 	for (const field of [
 		"diagnosticCode",
@@ -241,6 +248,7 @@ export function isPersistentFailureMetadata(value) {
 		"diagnosticRef",
 		"checkpointCode",
 		"checkpointDimensions",
+		"providerReliability",
 	]) {
 		if (field === "checkpointDimensions") {
 			if (value[field] === undefined && safeDiagnostics?.[field] === undefined)

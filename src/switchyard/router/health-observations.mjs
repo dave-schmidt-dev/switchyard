@@ -1,11 +1,6 @@
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
-
-import {
-	getInvocationDescriptor,
-	getInvocationDescriptorIdentity,
-	resolveTargetIdentity,
-	validateInvocationDescriptor,
-} from "../roster/index.mjs";
+import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
+import { validateInvocationDescriptor } from "../roster/index.mjs";
 
 import { readAuthorizedRunEvidence } from "../run-store/index.mjs";
 
@@ -25,6 +20,7 @@ import {
 	initialObservations,
 	MAX_ATTEMPTS,
 	OBSERVATION_AUTHORITY,
+	PROVIDER_COOLDOWN_CODES,
 	RouteHealthSchemaError,
 	SUCCESS_CODE,
 	safeEpoch,
@@ -59,6 +55,12 @@ function recomputeGeneration(generation, now) {
 			continue;
 		}
 		if (HOLD_CODES.has(attempt.code)) continue;
+		if (PROVIDER_COOLDOWN_CODES.has(attempt.code)) {
+			cooldownStep = Math.min(cooldownStep + 1, COOLDOWN_MS.length);
+			cooldownUntil = attempt.at + COOLDOWN_MS[cooldownStep - 1];
+			state = "cooldown";
+			continue;
+		}
 		const incidents = new Set(
 			generation.attempts
 				.slice(0, index + 1)
@@ -90,7 +92,14 @@ async function recordAuthorizedObservation(input, authority) {
 		};
 	const claimant = claimIdentity(input);
 	const at = safeTime(input.at);
-	if (![...HOLD_CODES, ...TRANSIENT_CODES, SUCCESS_CODE].includes(input.code))
+	if (
+		![
+			...HOLD_CODES,
+			...TRANSIENT_CODES,
+			...PROVIDER_COOLDOWN_CODES,
+			SUCCESS_CODE,
+		].includes(input.code)
+	)
 		throw new RouteHealthSchemaError("route health code is invalid");
 	return updateScope(
 		input,
@@ -156,6 +165,49 @@ export async function recordRouteHealthObservation(input) {
 	return recordAuthorizedObservation(input, null);
 }
 
+function confirmedProviderCooldownCode(input) {
+	const diagnostic = input?.providerReliability;
+	if (
+		!isProviderReliabilityDiagnostic(diagnostic) ||
+		diagnostic.causeCategory !== "provider" ||
+		diagnostic.phase !== "provider" ||
+		!PROVIDER_COOLDOWN_CODES.has(diagnostic.causeCode) ||
+		input.diagnosticCode !== diagnostic.causeCode ||
+		input.diagnosticOrigin !== "adapter" ||
+		input.diagnosticEvidenceAvailable !== true ||
+		input.failurePhase !== "provider_execution" ||
+		!hasAuthoritativeDiagnosticProvenance(input)
+	)
+		return null;
+	return diagnostic.causeCode;
+}
+
+function providerLifecycleClosed(input) {
+	const lifecycle = input?.providerLifecycle;
+	const cleanupClosed =
+		(input.healthLane === "simple-direct" &&
+			lifecycle?.cleanupStage === null &&
+			["not_required", "succeeded"].includes(lifecycle?.cleanupStatus)) ||
+		(input.healthLane === "queue-vm" &&
+			lifecycle?.cleanupStage === "index_lock_removed" &&
+			lifecycle?.cleanupStatus === "succeeded");
+	if (
+		lifecycle?.schemaVersion !== 1 ||
+		lifecycle.terminalStatus !== "exited" ||
+		lifecycle.writerLifecycle !== "stopped" ||
+		!cleanupClosed
+	)
+		return false;
+	if (
+		Number.isSafeInteger(input.exitCode) &&
+		lifecycle.exitCode !== input.exitCode
+	)
+		return false;
+	if (input.signal !== undefined && input.signal !== lifecycle.signal)
+		return false;
+	return true;
+}
+
 function eventObservation(event, run) {
 	const binding = event.routeHealthBinding;
 	if (
@@ -165,7 +217,9 @@ function eventObservation(event, run) {
 		binding.runId !== run.runId ||
 		binding.runRevision > run.revision ||
 		event.phase !== "execution" ||
-		!["task_completed", "task_failed"].includes(event.event) ||
+		!["task_completed", "task_failed", "provider_attempt_terminal"].includes(
+			event.event,
+		) ||
 		!event.invocationDescriptor ||
 		event.invocationDescriptor.descriptor_identity !==
 			event.descriptorIdentity ||
@@ -184,14 +238,21 @@ function eventObservation(event, run) {
 		code = SUCCESS_CODE;
 	else if (
 		binding.transportVerified === false &&
-		event.event === "task_failed" &&
+		["task_failed", "provider_attempt_terminal"].includes(event.event) &&
 		hasAuthoritativeDiagnosticProvenance(event) &&
 		HOLD_CODES.has(event.diagnosticCode)
 	)
 		code = event.diagnosticCode;
 	else if (
 		binding.transportVerified === false &&
-		event.event === "task_failed" &&
+		["task_failed", "provider_attempt_terminal"].includes(event.event) &&
+		binding.lifecycleVerified === true &&
+		confirmedProviderCooldownCode(event) !== null
+	)
+		code = confirmedProviderCooldownCode(event);
+	else if (
+		binding.transportVerified === false &&
+		["task_failed", "provider_attempt_terminal"].includes(event.event) &&
 		hasAuthoritativeDiagnosticProvenance(event) &&
 		TRANSIENT_CODES.has(event.diagnosticCode)
 	)
@@ -249,13 +310,23 @@ export async function ingestRouteHealthEvents({
 } = {}) {
 	const observations = await collectAuthorized(authorisedRuns, onStatus);
 	const results = [];
-	for (const observation of observations)
-		results.push(
-			await recordAuthorizedObservation(
-				{ ...observation, healthStateRoot, onStatus, ownerAlive, now },
-				OBSERVATION_AUTHORITY,
-			),
+	for (const observation of observations) {
+		const result = await recordAuthorizedObservation(
+			{ ...observation, healthStateRoot, onStatus, ownerAlive, now },
+			OBSERVATION_AUTHORITY,
 		);
+		results.push({
+			...result,
+			runId: observation.runId,
+			taskId: observation.taskId,
+			attempt: observation.attempt,
+			targetId: observation.targetId,
+			descriptorIdentity: observation.descriptorIdentity,
+			publicConfigurationEpoch: observation.publicConfigurationEpoch,
+			repairEpoch: observation.repairEpoch,
+			code: observation.code,
+		});
+	}
 	return results;
 }
 
@@ -287,10 +358,12 @@ export function createRouteHealthTerminalBinding(input) {
 	)
 		return null;
 	const trial = input.claimRevision !== undefined;
-	const lifecycleVerified = lifecycleReceiptMatches(
-		input.lifecycleReceipt,
-		input,
-	);
+	const cooldownCode = confirmedProviderCooldownCode(input);
+	if (cooldownCode && !providerLifecycleClosed(input)) return null;
+	const lifecycleVerified =
+		lifecycleReceiptMatches(input.lifecycleReceipt, input) ||
+		(["simple-direct", "queue-vm"].includes(input.healthLane) &&
+			providerLifecycleClosed(input));
 	if (trial && !lifecycleVerified) return null;
 	let transportVerified = false;
 	if (
@@ -302,7 +375,8 @@ export function createRouteHealthTerminalBinding(input) {
 		input.providerExecutionSucceeded !== true &&
 		hasAuthoritativeDiagnosticProvenance(input) &&
 		(HOLD_CODES.has(input.diagnosticCode) ||
-			TRANSIENT_CODES.has(input.diagnosticCode))
+			TRANSIENT_CODES.has(input.diagnosticCode) ||
+			cooldownCode !== null)
 	) {
 		transportVerified = false;
 	} else {

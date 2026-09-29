@@ -2,15 +2,9 @@ import {
 	persistAsyncResultArtifacts,
 	reserveTaskAttempt,
 } from "./artifacts.mjs";
+import { runCheckRepairAsync } from "./check-repair.mjs";
 import { saveCheckpoint } from "./checkpoint-store.mjs";
-import {
-	enforceQuickCheckCompletion,
-	invalidCompletedQuickCheckTaskIds,
-	isPassingQuickCheckReceipt,
-	parseQuickChecks,
-	runQuickChecks,
-	runQuickChecksAsync,
-} from "./checks.mjs";
+import { enforceQuickCheckCompletion } from "./checks.mjs";
 import { DISPATCH_DESCRIPTOR_CONTRACT_VERSION } from "./constants.mjs";
 import { executeTaskAsync } from "./execute-task.mjs";
 import {
@@ -68,6 +62,7 @@ export async function runQueueAsyncLoop(scope, queueState) {
 		context,
 	} = scope;
 	let { processed, resumedRetryTaskId, policyDeferred } = queueState;
+	const executeProviderTask = dependencies.executeTaskAsync ?? executeTaskAsync;
 	while (processed < effectiveMaxTasks) {
 		context.exclude = mergeRetryExclusions(
 			effectiveExclude,
@@ -208,7 +203,7 @@ export async function runQueueAsyncLoop(scope, queueState) {
 					checkpoint.quarantinedTargetIds,
 				);
 				startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
-				result = await executeTaskAsync(task, context);
+				result = await executeProviderTask(task, context);
 				appendRetryAttempt(checkpoint, result, 2);
 				persistRetryTransition(checkpoint, checkpointPath, {
 					type: "finalized",
@@ -229,7 +224,18 @@ export async function runQueueAsyncLoop(scope, queueState) {
 				projectRetryState();
 			}
 		} else {
-			result = await executeTaskAsync(task, context);
+			result = await executeProviderTask(task, context);
+		}
+		if (!retryState && result?.result === "check_failed") {
+			result = await runCheckRepairAsync({
+				task,
+				result,
+				context,
+				checkpoint,
+				checkpointPath,
+				execute: executeProviderTask,
+				dependencies,
+			});
 		}
 		if (result?.result === "policy_deferred") {
 			policyDeferred = result.policyDeferred;
@@ -311,7 +317,7 @@ export async function runQueueAsyncLoop(scope, queueState) {
 					checkpoint.quarantinedTargetIds,
 				);
 				startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
-				result = await executeTaskAsync(task, context);
+				result = await executeProviderTask(task, context);
 				appendRetryAttempt(checkpoint, result, 2);
 				persistRetryTransition(checkpoint, checkpointPath, {
 					type: "finalized",
@@ -375,6 +381,15 @@ export async function runQueueAsyncLoop(scope, queueState) {
 			result: result.result,
 			...(result.quickCheckReceipt
 				? { quickCheckReceipt: result.quickCheckReceipt }
+				: {}),
+			...(result.baselineCheckReceipt
+				? { baselineCheckReceipt: result.baselineCheckReceipt }
+				: {}),
+			...(result.providerReliability
+				? { providerReliability: result.providerReliability }
+				: {}),
+			...(result.failurePhase === "baseline"
+				? { failurePhase: "baseline" }
 				: {}),
 			...(typeof result.servedModelVerified === "boolean"
 				? { servedModelVerified: result.servedModelVerified }

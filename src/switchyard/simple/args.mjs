@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { manifestReviewPaths } from "../integrate/index.mjs";
 import { validateRoutingRunId } from "./routing-state.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] --check <command> --deadline <RFC3339> [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--baseline-check <command>] [--repair-checks] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -12,6 +12,9 @@ Runs one bounded assignment in a disposable local checkout. Repeat --file and
 (package.json, lockfiles, Makefile, Dockerfile, *.sh/*.bash, CI configs) into
 editing; repeat it per path. Any other manifest still fails closed.
 --predecessor-receipt binds output of a previous run and requires --dirty-overlay.
+--baseline-check repeats commands run before the provider; baseline checks never
+replace acceptance checks. --repair-checks permits one scoped correction after
+an acceptance check fails, within the original deadline.
 Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
 SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
 for attended recovery. An integration already in progress finishes before the
@@ -237,6 +240,8 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				"predecessor-receipt": { type: "string" },
 				"only-provider": { type: "string", multiple: true },
 				check: { type: "string", multiple: true },
+				"baseline-check": { type: "string", multiple: true },
+				"repair-checks": { type: "boolean", default: false },
 				deadline: { type: "string" },
 				"routing-run-id": { type: "string" },
 				json: { type: "boolean", default: false },
@@ -365,6 +370,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		}
 	}
 	const checks = parsed.values.check ?? [];
+	const baselineChecks = parsed.values["baseline-check"] ?? [];
 	if (
 		checks.length === 0 ||
 		checks.length > MAX_CHECKS ||
@@ -376,6 +382,19 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		)
 	) {
 		throw new SimpleUsageError("at least one non-empty --check is required");
+	}
+	if (
+		baselineChecks.length > MAX_CHECKS ||
+		baselineChecks.some(
+			(check) =>
+				typeof check !== "string" ||
+				check.trim() === "" ||
+				check.length > MAX_CHECK_CHARS,
+		)
+	) {
+		throw new SimpleUsageError(
+			"--baseline-check commands must be non-empty and bounded",
+		);
 	}
 	const routingRunId =
 		parsed.values["routing-run-id"] ??
@@ -400,6 +419,8 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		dirtyOverlay,
 		predecessorReceiptPath,
 		checks: checks.map((check) => check.trim()),
+		baselineChecks: baselineChecks.map((check) => check.trim()),
+		repairChecks: parsed.values["repair-checks"] === true,
 		deadlineMs: parseDeadline(parsed.values.deadline, nowMs),
 		routingRunId,
 	};

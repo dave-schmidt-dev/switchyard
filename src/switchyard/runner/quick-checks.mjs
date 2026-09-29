@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import { failureTransition } from "../outcome/transitions.mjs";
 import {
 	normalizeProviderName,
@@ -13,7 +15,120 @@ import {
 import { DIAGNOSTIC_REF_RE } from "./constants.mjs";
 import { integrationOperation } from "./review-results.mjs";
 
-function quickCheckSnapshotPaths(context) {
+export function validateBaselineCheckResults(results, tasks) {
+	const taskById = new Map(tasks.map((task) => [task.id, task]));
+	for (const entry of results) {
+		if (
+			entry?.providerReliability !== undefined &&
+			!isProviderReliabilityDiagnostic(entry.providerReliability)
+		)
+			throw new Error(
+				"checkpoint contains invalid provider reliability metadata",
+			);
+		if (
+			entry?.failurePhase === "baseline" &&
+			!["baseline_check_failed", "baseline_mutation"].includes(entry.result)
+		)
+			throw new Error("checkpoint contains invalid baseline result");
+		if (
+			["baseline_check_failed", "baseline_mutation"].includes(entry?.result) &&
+			entry?.baselineCheckReceipt === undefined
+		)
+			throw new Error("checkpoint baseline failure is missing its receipt");
+		if (entry?.baselineCheckReceipt === undefined) continue;
+		const task = taskById.get(entry.taskId);
+		if (
+			!task?.quickChecks?.baselineChecks ||
+			!isBaselineCheckReceipt(entry.baselineCheckReceipt, {
+				taskId: entry.taskId,
+				attempt: entry.attempt,
+				checks: task.quickChecks.baselineChecks,
+			})
+		)
+			throw new Error("checkpoint contains invalid baseline receipt");
+	}
+}
+
+export function isBaselineCheckReceipt(receipt, { taskId, attempt, checks }) {
+	const fields = [
+		"version",
+		"taskId",
+		"attempt",
+		"baseTree",
+		"commandSetSha256",
+		"candidateTree",
+		"checks",
+		"status",
+		"cleanup",
+	];
+	const commandSetSha256 = createHash("sha256")
+		.update(JSON.stringify({ setup: null, checks }))
+		.digest("hex");
+	if (
+		!receipt ||
+		typeof receipt !== "object" ||
+		Array.isArray(receipt) ||
+		Object.keys(receipt).length !== fields.length ||
+		!fields.every((field) => Object.hasOwn(receipt, field)) ||
+		receipt.version !== 1 ||
+		receipt.taskId !== taskId ||
+		receipt.attempt !== attempt ||
+		!/^[a-f0-9]{40,64}$/u.test(receipt.baseTree ?? "") ||
+		receipt.commandSetSha256 !== commandSetSha256 ||
+		!/^[a-f0-9]{40,64}$/u.test(receipt.candidateTree ?? "") ||
+		!Array.isArray(checks) ||
+		checks.length < 1 ||
+		checks.length > 4 ||
+		!Array.isArray(receipt.checks) ||
+		receipt.checks.length > checks.length ||
+		!["passed", "failed", "unknown"].includes(receipt.status) ||
+		!["complete", "unknown"].includes(receipt.cleanup) ||
+		(receipt.status === "passed" && receipt.checks.length !== checks.length) ||
+		(receipt.cleanup === "unknown" && receipt.status !== "unknown")
+	)
+		return false;
+	return receipt.checks.every((check, index) => {
+		if (
+			!check ||
+			typeof check !== "object" ||
+			Array.isArray(check) ||
+			Object.keys(check).length !== 6 ||
+			check.index !== index ||
+			check.commandSha256 !==
+				createHash("sha256")
+					.update(JSON.stringify(checks[index]))
+					.digest("hex") ||
+			!(check.exitCode === null || Number.isSafeInteger(check.exitCode)) ||
+			!(check.signal === null || /^[A-Z0-9]{1,20}$/u.test(check.signal)) ||
+			typeof check.timedOut !== "boolean" ||
+			typeof check.writerStopped !== "boolean"
+		)
+			return false;
+		return (
+			receipt.status !== "passed" ||
+			(check.exitCode === 0 &&
+				check.signal === null &&
+				check.timedOut === false &&
+				check.writerStopped === true)
+		);
+	});
+}
+
+export function baselineReceiptMatchesPin(task, pin, receipt) {
+	const checks = task.quickChecks?.baselineChecks ?? [];
+	const attemptMatch = /^attempt-(\d+)$/u.exec(pin?.attemptId ?? "");
+	const attempt = Number(attemptMatch?.[1]);
+	return (
+		checks.length > 0 &&
+		Number.isSafeInteger(attempt) &&
+		receipt?.baseTree === pin.baseTree &&
+		receipt.status === "passed" &&
+		receipt.cleanup === "complete" &&
+		isBaselineCheckReceipt(receipt, { taskId: task.id, attempt, checks })
+	);
+}
+
+export function quickCheckSnapshotPaths(context) {
 	const trusted = new Set(
 		(context.dirtyOverlayReceipt?.paths ?? []).map((entry) => entry.path),
 	);
@@ -57,6 +172,9 @@ function quickCheckDecision(task, context, diff) {
 			snapshotPaths: quickCheckSnapshotPaths(context),
 			allowSensitiveManifests:
 				task.type === "implementation" && task.allowManifests === true,
+			...(context._checkRepairPin
+				? { deadline: context._checkRepairPin.deadline }
+				: {}),
 		});
 	} catch {
 		return { passed: false, receipt: null };
@@ -96,6 +214,9 @@ async function quickCheckDecisionAsync(task, context, diff) {
 			snapshotPaths: quickCheckSnapshotPaths(context),
 			allowSensitiveManifests:
 				task.type === "implementation" && task.allowManifests === true,
+			...(context._checkRepairPin
+				? { deadline: context._checkRepairPin.deadline }
+				: {}),
 		});
 	} catch {
 		return { passed: false, receipt: null };

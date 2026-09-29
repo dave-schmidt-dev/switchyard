@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 
-import { lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 
 import { dirname, resolve } from "node:path";
 
@@ -46,6 +46,10 @@ export const SUCCESS_CODE = "verified_transport_success";
 const QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES = Object.freeze([]);
 
 export const TRANSIENT_CODES = new Set(QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES);
+
+// Closed adapter evidence for quota exhaustion (including exact rate-limit
+// classifications). This finite cooldown is separate from generic retries.
+export const PROVIDER_COOLDOWN_CODES = new Set(["quota_exhausted"]);
 
 export const MAX_BYTES = 256 * 1024;
 
@@ -346,7 +350,12 @@ function validAttempt(value) {
 		(typeof value.attempt === "string" ||
 			Number.isSafeInteger(value.attempt)) &&
 		typeof value.incidentId === "string" &&
-		[...HOLD_CODES, ...TRANSIENT_CODES, SUCCESS_CODE].includes(value.code) &&
+		[
+			...HOLD_CODES,
+			...TRANSIENT_CODES,
+			...PROVIDER_COOLDOWN_CODES,
+			SUCCESS_CODE,
+		].includes(value.code) &&
 		Number.isFinite(value.at) &&
 		Number.isSafeInteger(value.sequence)
 	);

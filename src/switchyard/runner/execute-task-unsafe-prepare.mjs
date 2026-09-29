@@ -1,11 +1,8 @@
-import { HOST_POWER_STATES, readHostPower } from "../dispatch/host-power.mjs";
+import { HOST_POWER_STATES } from "../dispatch/host-power.mjs";
 import {
 	getConfiguredInvocationDescriptor,
 	getInvocationDescriptor,
-	normalizeProviderName,
 	resolveRouteProvenance,
-	resolveTargetIdentity,
-	validateInvocationDescriptor,
 } from "../roster/index.mjs";
 import {
 	DESCRIPTOR_RECEIPT_INVALID_REASON,
@@ -17,6 +14,7 @@ import {
 	safeSuccessfulRouteReason,
 	writeDispatchIntent,
 } from "./ledger-reporting.mjs";
+import { taskRepairScopeIdentity } from "./reliability.mjs";
 import {
 	initializeTaskExecutionBudget,
 	taskExecutionBudget,
@@ -47,9 +45,41 @@ export function prepareExecuteTaskUnsafe(task, context) {
 	const overlayFailure = dirtyOverlayResult(task, context, requiredCapability);
 	if (overlayFailure) return { terminal: overlayFailure };
 	// Primary and quota-fallback invocations each own their configured timeout.
-	// A completion continuation sets _completionPin and intentionally retains the
-	// primary invocation's already-running absolute deadline.
-	if (!context._completionPin) initializeTaskExecutionBudget(context, task);
+	// A pinned continuation must retain the original absolute deadline.
+	const providerPin = context._checkRepairPin ?? context._completionPin;
+	if (!providerPin) initializeTaskExecutionBudget(context, task);
+	else {
+		const budget = context._activeTaskBudget;
+		const remaining =
+			budget?.taskId === task.id
+				? taskExecutionBudget(context, task).remainingMs
+				: 0;
+		if (
+			providerPin.taskId !== task.id ||
+			providerPin.scopeIdentity !== taskRepairScopeIdentity(task) ||
+			providerPin.workspaceId !== context.workingContainerName ||
+			providerPin.deadline !== budget?.deadline ||
+			(context._checkRepairPin &&
+				(!Number.isSafeInteger(context._checkRepairBudget?.providerTimeoutMs) ||
+					context._checkRepairBudget.providerTimeoutMs < 30_000)) ||
+			!Number.isFinite(remaining) ||
+			remaining <= 0
+		) {
+			return {
+				terminal: {
+					taskId: task.id,
+					success: false,
+					provider: providerPin.provider ?? null,
+					model: providerPin.selector ?? null,
+					resolvedTargetId: providerPin.resolvedTargetId ?? null,
+					result:
+						remaining <= 0 ? "execution_timed_out" : "check_repair_ineligible",
+					errorKind: remaining <= 0 ? "execution_timeout" : "unknown_failure",
+					timedOut: remaining <= 0,
+				},
+			};
+		}
+	}
 	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
 	const ignoredPath = checkIgnored(
 		task.requiredPaths ?? task.files,
@@ -75,8 +105,8 @@ export function prepareExecuteTaskUnsafe(task, context) {
 			),
 		};
 	}
-	const routeResult = context._completionPin
-		? structuredClone(context._completionPin.route)
+	const routeResult = providerPin
+		? structuredClone(providerPin.route)
 		: context.route({
 				requiredCapability,
 				availableProviders: Object.keys(context.adapters ?? {}),
@@ -112,8 +142,8 @@ export function prepareExecuteTaskUnsafe(task, context) {
 	Object.assign(routeResult, { requiredCapability }, provenance);
 	let invocationDescriptor;
 	try {
-		invocationDescriptor = context._completionPin
-			? structuredClone(context._completionPin.invocationDescriptor)
+		invocationDescriptor = providerPin
+			? structuredClone(providerPin.invocationDescriptor)
 			: descriptorFromRoute(
 					routeResult,
 					requiredCapability,
@@ -155,6 +185,26 @@ export function prepareExecuteTaskUnsafe(task, context) {
 	}
 	Object.assign(routeResult, descriptorReceiptFields(invocationDescriptor));
 	context._activeInvocationDescriptor = invocationDescriptor;
+	if (
+		providerPin &&
+		(routeResult.provider !== providerPin.provider ||
+			routeResult.resolvedTargetId !== providerPin.resolvedTargetId ||
+			invocationDescriptor.descriptor_identity !==
+				providerPin.descriptorIdentity ||
+			invocationDescriptor.selector !== providerPin.selector)
+	) {
+		return {
+			terminal: {
+				taskId: task.id,
+				success: false,
+				provider: providerPin.provider ?? null,
+				model: providerPin.selector ?? null,
+				resolvedTargetId: providerPin.resolvedTargetId ?? null,
+				result: "check_repair_ineligible",
+				errorKind: "unknown_failure",
+			},
+		};
+	}
 	let projectionFailure = null;
 	const record = (dispatch) => {
 		try {
@@ -231,7 +281,14 @@ export function prepareExecuteTaskUnsafe(task, context) {
 	// overrides the global default for tasks known to legitimately need more
 	// (or less) than PROVIDER_EXECUTION_TIMEOUT_MS.
 	const executionBudget = taskExecutionBudget(context, task);
-	const timeoutMs = Math.floor(executionBudget.remainingMs);
+	const timeoutMs = Math.floor(
+		Math.min(
+			executionBudget.remainingMs,
+			context._checkRepairPin
+				? context._checkRepairBudget.providerTimeoutMs
+				: Number.POSITIVE_INFINITY,
+		),
+	);
 	if (timeoutMs <= 0) {
 		return {
 			terminal: {
@@ -311,7 +368,6 @@ export function prepareExecuteTaskUnsafe(task, context) {
 	}
 
 	const prompt = taskPromptForAttempt(task, context._completionRequirements);
-	const routedModel = invocationDescriptor?.selector ?? routeResult.model;
 	return {
 		terminal: null,
 		state: {

@@ -125,6 +125,8 @@ const PERSISTED_FAILURE_PHASES = new Set([
 	"prepare",
 	"diff",
 	"checks",
+	"baseline",
+	"repair",
 	"integrate",
 	"cleanup",
 ]);

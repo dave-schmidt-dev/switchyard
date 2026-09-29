@@ -118,7 +118,11 @@ export async function readAuthorizedRunEvidence(runRoot) {
 			(event.routeHealthBinding.runId !== run.runId ||
 				event.routeHealthBinding.runRevision > run.revision ||
 				event.phase !== "execution" ||
-				!["task_completed", "task_failed"].includes(event.event) ||
+				![
+					"task_completed",
+					"task_failed",
+					"provider_attempt_terminal",
+				].includes(event.event) ||
 				!run.orderedTaskIds.includes(event.taskId) ||
 				!event.invocationDescriptor ||
 				!isSafeDescriptorReceipt(

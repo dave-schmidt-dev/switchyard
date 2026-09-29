@@ -1,14 +1,16 @@
-import {
-	boundCompletionContinuationProof,
-	boundProviderLifecycleSnapshot,
-	createProgressSnapshot,
-	DEFAULT_SILENCE_TIMEOUT_MS,
-	verifyCompletionContinuationSync,
-} from "../adapter/provider-lifecycle.mjs";
+import { boundCompletionContinuationProof } from "../adapter/provider-lifecycle.mjs";
+import { runQuickChecks } from "./checks.mjs";
 import { handleExecuteTaskUnsafeFailure } from "./execute-task-unsafe-failure.mjs";
 import { prepareExecuteTaskUnsafe } from "./execute-task-unsafe-prepare.mjs";
 import { completeExecuteTaskUnsafe } from "./execute-task-unsafe-success.mjs";
 import { descriptorReceiptFields } from "./ledger-reporting.mjs";
+import { baselineReceiptMatchesPin } from "./quick-checks.mjs";
+import {
+	createTaskProviderPin,
+	providerRepairLifecycleSafe,
+	runTaskBaselineChecks,
+	taskRepairScopeIdentity,
+} from "./reliability.mjs";
 import {
 	integrationFailureMetadata,
 	taskExecutionBudget,
@@ -70,6 +72,76 @@ export function executeTaskUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
+	if (
+		context._checkRepairPin &&
+		(!providerRepairLifecycleSafe(task, context, context._checkRepairPin) ||
+			cleanupContext.attemptId !== context._checkRepairPin.attemptId)
+	) {
+		return taskBaseFailure(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
+	const baselinePin = context._checkRepairPin ?? context._completionPin;
+	if (
+		baselinePin &&
+		(task.quickChecks?.baselineChecks?.length ?? 0) > 0 &&
+		!baselineReceiptMatchesPin(task, baselinePin, context._baselineCheckReceipt)
+	) {
+		return taskBaseFailure(
+			task,
+			routeResult,
+			invocationDescriptor,
+			requiredCapability,
+		);
+	}
+	const baseline =
+		baselinePin && (task.quickChecks?.baselineChecks?.length ?? 0) === 0
+			? null
+			: baselinePin &&
+					baselineReceiptMatchesPin(
+						task,
+						baselinePin,
+						context._baselineCheckReceipt,
+					)
+				? null
+				: runTaskBaselineChecks(task, context, runQuickChecks);
+	if (baseline) {
+		context._baselineCheckReceipt = baseline.receipt;
+		if (!baseline.passed) {
+			const result = baseline.mutation
+				? "baseline_mutation"
+				: "baseline_check_failed";
+			record({
+				provider: routeResult.provider,
+				model: routeResult.model ?? "unknown",
+				taskId: task.id,
+				result,
+				errorKind: "check_failed",
+				reason: "baseline checks did not pass on the captured task base",
+				failurePhase: "baseline",
+				providerReliability: baseline.diagnostic,
+			});
+			return {
+				...descriptorReceiptFields(invocationDescriptor),
+				taskId: task.id,
+				success: false,
+				provider: routeResult.provider,
+				model: routeResult.model ?? null,
+				requiredCapability,
+				resolvedTargetId,
+				result,
+				errorKind: "check_failed",
+				reason: "baseline checks did not pass on the captured task base",
+				failurePhase: "baseline",
+				providerLifecycle: null,
+				providerReliability: baseline.diagnostic,
+				...(baseline.receipt ? { baselineCheckReceipt: baseline.receipt } : {}),
+			};
+		}
+	}
 	const healthPreparation = prepareRouteHealthTrial(
 		context,
 		task,
@@ -83,12 +155,19 @@ export function executeTaskUnsafe(task, context) {
 			invocationDescriptor,
 			requiredCapability,
 		);
-	if (context._completionPin) {
+	if (baselinePin) {
 		if (
-			context._completionPin.workspaceId !== context.workingContainerName ||
-			context._completionPin.baseTree !== context._activeTaskBase?.tree ||
-			context._completionPin.descriptorIdentity !==
-				invocationDescriptor.descriptor_identity
+			baselinePin.taskId !== task.id ||
+			baselinePin.workspaceId !== context.workingContainerName ||
+			baselinePin.baseTree !== context._activeTaskBase?.tree ||
+			baselinePin.attemptId !== cleanupContext.attemptId ||
+			baselinePin.deadline !== executionBudget.deadline ||
+			baselinePin.scopeIdentity !== taskRepairScopeIdentity(task) ||
+			baselinePin.provider !== routeResult.provider ||
+			baselinePin.resolvedTargetId !== resolvedTargetId ||
+			baselinePin.descriptorIdentity !==
+				invocationDescriptor.descriptor_identity ||
+			baselinePin.selector !== invocationDescriptor.selector
 		) {
 			return taskBaseFailure(
 				task,
@@ -98,23 +177,28 @@ export function executeTaskUnsafe(task, context) {
 			);
 		}
 	} else {
-		context._activeCompletionPin = {
-			taskId: task.id,
-			route: structuredClone(routeResult),
-			invocationDescriptor: structuredClone(invocationDescriptor),
-			descriptorIdentity: invocationDescriptor.descriptor_identity,
-			workspaceId: context.workingContainerName,
-			baseTree: context._activeTaskBase.tree,
-			attemptId: cleanupContext.attemptId,
-			deadline: executionBudget.deadline,
-		};
+		context._activeCompletionPin = createTaskProviderPin(
+			task,
+			context,
+			routeResult,
+			invocationDescriptor,
+			cleanupContext.attemptId,
+			executionBudget.deadline,
+		);
 	}
 	const captureExecutionBackend = bindAttemptHelperBackend(
 		context.executionBackend,
 		cleanupContext,
 	);
 	const launchBudget = taskExecutionBudget(context, task);
-	const launchTimeoutMs = Math.floor(launchBudget.remainingMs);
+	const launchTimeoutMs = Math.floor(
+		Math.min(
+			launchBudget.remainingMs,
+			context._checkRepairPin
+				? (context._checkRepairBudget?.providerTimeoutMs ?? 0)
+				: Number.POSITIVE_INFINITY,
+		),
+	);
 	if (launchTimeoutMs <= 0) {
 		return {
 			...descriptorReceiptFields(invocationDescriptor),

@@ -4,6 +4,10 @@ import {
 	boundProviderLifecycleSnapshot,
 	createProgressSnapshot,
 } from "../adapter/provider-lifecycle.mjs";
+import {
+	createProviderReliabilityDiagnostic,
+	isProviderReliabilityDiagnostic,
+} from "../diagnostics/provider-reliability.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
 import {
 	failureTransition,
@@ -74,6 +78,13 @@ function diagnosticRefOf(launcherResult) {
 function reviewResultOf(launcherResult) {
 	const relayed = launcherResult?.reviewResult;
 	return isReviewResult(relayed) ? relayed : null;
+}
+
+function providerReliabilityOf(launcherResult) {
+	const relayed = launcherResult?.providerReliability;
+	return isProviderReliabilityDiagnostic(relayed)
+		? Object.freeze(createProviderReliabilityDiagnostic(relayed))
+		: null;
 }
 
 function sameSnapshot(left, right) {
@@ -292,6 +303,7 @@ export async function executeBrokerRoute(options) {
 			outcome: decision.outcome,
 			reason: "cancelled before launch",
 			terminalEvidence,
+			providerReliability: null,
 			executionOutcome,
 			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});
@@ -366,6 +378,7 @@ export async function executeBrokerRoute(options) {
 				outcome: decision.outcome,
 				reason: "cancelled",
 				terminalEvidence,
+				providerReliability: providerReliabilityOf(launcherResult),
 				executionOutcome,
 				outcomePersistenceFailed: outcomePersistenceError !== null,
 			});
@@ -415,6 +428,7 @@ export async function executeBrokerRoute(options) {
 			providerLifecycle: boundedProviderLifecycle(
 				launcherResult?.providerLifecycle,
 			),
+			providerReliability: providerReliabilityOf(launcherResult),
 			executionOutcome,
 			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});
@@ -510,6 +524,7 @@ export async function executeBrokerRoute(options) {
 			providerLifecycle: boundedProviderLifecycle(
 				launcherResult?.providerLifecycle,
 			),
+			providerReliability: providerReliabilityOf(launcherResult),
 			executionOutcome,
 			outcomePersistenceFailed: outcomePersistenceError !== null,
 		});

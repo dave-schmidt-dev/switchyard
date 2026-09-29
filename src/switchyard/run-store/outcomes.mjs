@@ -381,7 +381,9 @@ export async function createRouteHealthEvent(runId, event, binding) {
 	validateRunId(runId);
 	if (
 		event?.phase !== "execution" ||
-		!["task_completed", "task_failed"].includes(event?.event) ||
+		!["task_completed", "task_failed", "provider_attempt_terminal"].includes(
+			event?.event,
+		) ||
 		typeof event?.taskId !== "string" ||
 		(!Number.isSafeInteger(event?.attempt) &&
 			typeof event?.attempt !== "string") ||

@@ -2,6 +2,7 @@ import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import { executeBrokerRoute } from "../src/switchyard/broker/executor.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
+import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { sanitizeReviewResult } from "../src/switchyard/diagnostics/review-result.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 import { sourceText } from "./helpers/source-text.mjs";
@@ -221,6 +222,10 @@ describe("broker async executor", () => {
 			failurePhase: "provider_cleanup",
 			failureKind: "provider",
 			servedModelVerified: true,
+			providerReliability: createProviderReliabilityDiagnostic({
+				causeCode: "auth_expired",
+				phase: "provider",
+			}),
 		};
 		const value = fixture();
 		const failed = await executeBrokerRoute({
@@ -241,6 +246,10 @@ describe("broker async executor", () => {
 		);
 		strictEqual(failed.cleanupStage, "tree_terminated");
 		strictEqual(failed.cleanupFailed, true);
+		deepStrictEqual(
+			failed.providerReliability,
+			launcherResult.providerReliability,
+		);
 
 		// A task can succeed while the kill of its provider process fails, so
 		// the cleanup facts have to survive the success shape too.
@@ -255,12 +264,40 @@ describe("broker async executor", () => {
 				cleanupFailed: true,
 				cleanupStage: "pid_marker_removed",
 				servedModelVerified: false,
+				providerReliability: launcherResult.providerReliability,
 			}),
 			terminal: async () => ({ changed: true }),
 		});
 		strictEqual(succeeded.cleanupFailed, true);
 		strictEqual(succeeded.cleanupStage, "pid_marker_removed");
 		strictEqual(succeeded.servedModelVerified, false);
+		deepStrictEqual(
+			succeeded.providerReliability,
+			launcherResult.providerReliability,
+		);
+	});
+
+	it("drops malformed provider reliability without relaying launcher data", async () => {
+		const value = fixture();
+		const result = await executeBrokerRoute({
+			request: value.request,
+			route: value.route,
+			invocationDescriptor: value.descriptor,
+			launcherIdentity: value.launcherIdentity,
+			launch: async () => ({
+				success: false,
+				providerReliability: {
+					...createProviderReliabilityDiagnostic({
+						causeCode: "auth_expired",
+						phase: "provider",
+					}),
+					privateOutput: "must not cross the broker boundary",
+				},
+			}),
+			terminal: async () => ({ changed: true }),
+		});
+		strictEqual(result.providerReliability, null);
+		strictEqual(JSON.stringify(result).includes("must not cross"), false);
 	});
 
 	it("refuses a cleanup stage outside the backend-owned vocabulary", async () => {

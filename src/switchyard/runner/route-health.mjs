@@ -14,15 +14,15 @@ function executionCleanupContext(
 	descriptorIdentity,
 	attemptId = null,
 ) {
+	const taskId = String(task.id);
 	return Object.freeze({
 		runId: context.runId,
-		taskId: String(task.id),
+		taskId,
 		// The lifecycle receipt is matched against the route-health binding by
-		// attempt id, so both must derive it from the same checkpoint state.
+		// the stable task attempt. Health can use a distinct per-invocation id
+		// when a correction reuses this exact task-base execution context.
 		attemptId:
-			attemptId ??
-			context.attemptId ??
-			routeHealthAttemptId(context, String(task.id)),
+			attemptId ?? context.attemptId ?? executionAttemptId(context, taskId),
 		descriptorIdentity,
 		workspaceId: context.workingContainerName,
 		processStartIdentity: context.processStartIdentity ?? null,
@@ -110,6 +110,9 @@ function bindAttemptHelperBackend(executionBackend, cleanupContext) {
 }
 function routeHealthAttemptId(context, taskId) {
 	if (context.healthAttempt !== undefined) return context.healthAttempt;
+	return executionAttemptId(context, taskId);
+}
+function executionAttemptId(context, taskId) {
 	const retryState = context.checkpoint?.retryState;
 	if (
 		retryState?.taskId === taskId &&
@@ -163,6 +166,7 @@ function routeHealthAttemptIdentity(context, task, routeResult, descriptor) {
 		provider: routeResult.provider,
 		model: descriptor.selector,
 		mode: decision.mode ?? "shadow",
+		healthLane: "queue-vm",
 		suppress: state.suppress === true,
 		trialAvailable: state.trialAvailable === true,
 		healthStateRoot: decision.healthStateRoot,
@@ -170,8 +174,11 @@ function routeHealthAttemptIdentity(context, task, routeResult, descriptor) {
 	};
 }
 function prepareRouteHealthTrial(context, task, routeResult, descriptor) {
-	if (context._completionPin && context._activeRouteHealth) {
-		return { allowed: true };
+	if (context._activeRouteHealth?.claimStarted === true) {
+		if (context._routeHealthTerminalSettled !== true)
+			return { allowed: false, reason: "route-health-claim-unsettled" };
+		context._activeRouteHealth = null;
+		context._routeHealthTerminalSettled = false;
 	}
 	const binding = routeHealthAttemptIdentity(
 		context,
@@ -215,6 +222,26 @@ function prepareRouteHealthTrial(context, task, routeResult, descriptor) {
 		claimRevision: claimed.lease.revision,
 	});
 	return { allowed: true };
+}
+function markRouteHealthObservationSettled(context, observation) {
+	const binding = context?._activeRouteHealth;
+	if (
+		!binding?.claimStarted ||
+		!(
+			observation?.accepted === true ||
+			observation?.reason === "duplicate-attempt"
+		) ||
+		observation.runId !== binding.runId ||
+		observation.taskId !== binding.taskId ||
+		observation.attempt !== binding.attempt ||
+		observation.targetId !== binding.targetId ||
+		observation.descriptorIdentity !== binding.descriptorIdentity ||
+		observation.publicConfigurationEpoch !== binding.publicConfigurationEpoch ||
+		observation.repairEpoch !== binding.repairEpoch
+	)
+		return false;
+	context._routeHealthTerminalSettled = true;
+	return true;
 }
 function startRouteHealthTrial(context) {
 	const binding = context._activeRouteHealth;
@@ -329,6 +356,19 @@ function reportRouteHealthDeferred(result, _onResult, emitStatus) {
 function attachRouteHealthTerminal(result, context) {
 	if (isRouteHealthDeferredResult(result)) return result;
 	const binding = context._activeRouteHealth;
+	// A baseline terminal proves the provider was never launched. Release only
+	// an unstarted lease with that explicit engine proof; baseline outcomes do
+	// not become provider observations and do not consume the transport trial.
+	if (
+		binding?.leaseToken &&
+		binding.claimStarted !== true &&
+		result?.providerReliability?.phase === "baseline" &&
+		result.providerLifecycle == null
+	) {
+		releaseHalfOpenClaimSync({ ...binding, provenNeverStarted: true });
+		context._activeRouteHealth = null;
+		return result;
+	}
 	if (binding?.claimStarted === true && result) {
 		Object.defineProperty(result, "_routeHealthTrialStarted", {
 			value: true,
@@ -366,6 +406,7 @@ export {
 	bindAttemptHelperBackend,
 	executionCleanupContext,
 	healthDeferredResult,
+	markRouteHealthObservationSettled,
 	mergeAttemptCleanupContext,
 	policyDeferredQueueResult,
 	policyDeferredTaskResult,

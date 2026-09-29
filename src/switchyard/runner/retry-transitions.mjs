@@ -177,7 +177,9 @@ export function allocateExtraProviderInvocation(
 		reason,
 		state: "allocated",
 		allocatedAt: new Date().toISOString(),
-		...(reason === "completion_correction" ? intent : {}),
+		...(["completion_correction", "check_repair"].includes(reason)
+			? intent
+			: {}),
 	};
 	allocations.push(allocation);
 	checkpoint.lastUpdatedAt = allocation.allocatedAt;

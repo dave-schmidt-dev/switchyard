@@ -4,6 +4,7 @@ import {
 	safeSuccessfulRouteReason,
 } from "./ledger-reporting.mjs";
 import { quickCheckDecision } from "./quick-checks.mjs";
+import { acceptanceCheckDiagnostic } from "./reliability.mjs";
 import { integrationFailureMetadata } from "./retry-transitions.mjs";
 import {
 	captureDiffWithEvidence,
@@ -115,6 +116,9 @@ export function completeExecuteTaskUnsafe(
 	}
 
 	const quickCheck = quickCheckDecision(task, context, diff);
+	const providerReliability = quickCheck.passed
+		? execution.providerReliability
+		: acceptanceCheckDiagnostic(task, quickCheck.receipt).diagnostic;
 	const gateResult = !quickCheck.passed
 		? { success: false, message: "check_failed" }
 		: (dirtyOverlayIntegrationGate(context) ??
@@ -196,6 +200,7 @@ export function completeExecuteTaskUnsafe(
 		result: terminalResult,
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...(providerReliability ? { providerReliability } : {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
 		...survivingProviderFields(execution),
 		...(success
@@ -221,6 +226,7 @@ export function completeExecuteTaskUnsafe(
 		...survivingProviderFields(execution),
 		...(alreadyApplied ? { alreadyApplied: true } : {}),
 		...(safeGateFailure ?? {}),
+		...(providerReliability ? { providerReliability } : {}),
 		...(gateArtifactRef ? { artifactRef: gateArtifactRef } : {}),
 		...(projectionFailure
 			? { legacyProjectionFailure: projectionFailure }

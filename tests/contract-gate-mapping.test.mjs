@@ -57,6 +57,10 @@ function createReceiptFixture({ stage = true } = {}) {
 		"scripts/check-contract-receipt.mjs",
 		"scripts/run-test-phases.mjs",
 		"scripts/run-validate-phases.mjs",
+		// Contract suites can import support modules outside the boundary they
+		// assert, so the fixture includes the local production dependency tree.
+		"src/switchyard",
+		"tests/helpers",
 		// An area may be declared as a directory glob, which is a pattern rather
 		// than a path: copy the directory it names, or the fixture cannot be built
 		// at all and every gate in the manifest goes unexercised.
@@ -109,11 +113,14 @@ function createValidationFixture() {
 		"roster:coherence": `${process.execPath} -e "process.exit(0)"`,
 	};
 	writeFileSync(packagePath, `${JSON.stringify(packageJson)}\n`);
-	writeFileSync(
-		join(fixture, "tests/diagnostics.test.mjs"),
-		'import { test } from "node:test";\ntest("mapped suite skipped", { skip: "fixture" }, () => {});\n',
-	);
-	execFileSync("git", ["add", "package.json", "tests/diagnostics.test.mjs"], {
+	const mappedSuites = Object.keys(statusReport({ root: fixture }).suites);
+	for (const suite of mappedSuites) {
+		writeFileSync(
+			join(fixture, suite),
+			'import { test } from "node:test";\ntest("mapped suite skipped", { skip: "fixture" }, () => {});\n',
+		);
+	}
+	execFileSync("git", ["add", "package.json", ...mappedSuites], {
 		cwd: fixture,
 	});
 	return fixture;
@@ -381,6 +388,8 @@ describe("source-boundary contract gate mapping", () => {
 			deepStrictEqual(status.owners, ["diagnostics"]);
 			deepStrictEqual(status.suites, {
 				"tests/diagnostics.test.mjs": "not-run",
+				"tests/provider-qualification.test.mjs": "not-run",
+				"tests/provider-reliability.test.mjs": "not-run",
 			});
 		} finally {
 			// Left to the tracked-tempdir exit handler. Removing a git fixture
@@ -474,7 +483,12 @@ describe("source-boundary contract gate mapping", () => {
 				join(fixture, ".logs/contract-gates/execution.json"),
 				JSON.stringify({
 					schemaVersion: 1,
-					suites: { "tests/diagnostics.test.mjs": { status: "skipped" } },
+					suites: Object.fromEntries(
+						Object.keys(statusReport({ root: fixture }).suites).map((suite) => [
+							suite,
+							{ status: "skipped" },
+						]),
+					),
 				}),
 			);
 			throws(

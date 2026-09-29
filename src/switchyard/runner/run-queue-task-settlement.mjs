@@ -228,6 +228,15 @@ export function settleRunQueueTask(scope, queueState) {
 			...(result.quickCheckReceipt
 				? { quickCheckReceipt: result.quickCheckReceipt }
 				: {}),
+			...(result.baselineCheckReceipt
+				? { baselineCheckReceipt: result.baselineCheckReceipt }
+				: {}),
+			...(result.providerReliability
+				? { providerReliability: result.providerReliability }
+				: {}),
+			...(result.failurePhase === "baseline"
+				? { failurePhase: "baseline" }
+				: {}),
 			...(typeof result.servedModelVerified === "boolean"
 				? { servedModelVerified: result.servedModelVerified }
 				: {}),

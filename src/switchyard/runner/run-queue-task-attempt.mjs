@@ -1,3 +1,4 @@
+import { runCheckRepairSync } from "./check-repair.mjs";
 import { executeTask, runCompletionCorrection } from "./execute-task.mjs";
 import { resetBeforeQuotaRetry } from "./halts.mjs";
 import { descriptorReceiptFields } from "./ledger-reporting.mjs";
@@ -72,6 +73,7 @@ export function attemptRunQueueTask(scope, queueState) {
 		effectiveExclude,
 		checkpoint.quarantinedTargetIds,
 	);
+	const executeProviderTask = scope.executeTask ?? executeTask;
 	let result;
 	let retryHaltResult = null;
 	let retryUsed = Boolean(retryState);
@@ -185,11 +187,11 @@ export function attemptRunQueueTask(scope, queueState) {
 					checkpoint.quarantinedTargetIds,
 				);
 				startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
-				result = executeTask(task, context);
+				result = executeProviderTask(task, context);
 			}
 		}
 	} else {
-		result = executeTask(task, context);
+		result = executeProviderTask(task, context);
 		if (context._activeInvocationDescriptor) {
 			Object.assign(
 				result,
@@ -203,6 +205,14 @@ export function attemptRunQueueTask(scope, queueState) {
 			checkpoint,
 			checkpointPath,
 		);
+		result = runCheckRepairSync({
+			task,
+			result,
+			context,
+			checkpoint,
+			checkpointPath,
+			execute: executeProviderTask,
+		});
 		if (
 			result._routeHealthTrialStarted !== true &&
 			result.extraProviderInvocationUsed !== true &&
@@ -291,7 +301,7 @@ export function attemptRunQueueTask(scope, queueState) {
 					checkpoint.quarantinedTargetIds,
 				);
 				startExtraProviderInvocation(checkpoint, checkpointPath, task.id);
-				result = executeTask(task, context);
+				result = executeProviderTask(task, context);
 			}
 		}
 	}

@@ -1,95 +1,42 @@
-import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { integrationGate } from "../integrate/index.mjs";
 import { settleSimpleWriterProcesses } from "../simple/process-teardown.mjs";
 import { MAX_CHECKS, parseCommand } from "./check-contract.mjs";
 import { trustedOfflineNpmEnv } from "./check-dependencies.mjs";
+import {
+	gateCandidate,
+	runCommand,
+	settleScopedChecksSync,
+} from "./reliability.mjs";
 
 export { parseQuickChecks } from "./check-contract.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const MAX_CHECK_MS = 10 * 60_000;
-function runCommand(cwd, env, argv, timeoutMs, { sandbox = true } = {}) {
-	if (process.platform !== "darwin")
-		return {
-			exitCode: null,
-			signal: null,
-			timedOut: false,
-			groupCleanup: "unknown",
-		};
-	const result = spawnSync(
-		process.execPath,
-		[
-			SELF,
-			"--quick-check-worker",
-			JSON.stringify({
-				cwd,
-				argv,
-				timeoutMs,
-				sandbox,
-				profile: sandbox ? quickCheckSandboxProfile(cwd, env.HOME) : null,
-			}),
-		],
-		{
-			cwd,
-			env,
-			encoding: "utf8",
-			timeout: timeoutMs + 10_000,
-			maxBuffer: 1024,
-			stdio: ["ignore", "pipe", "inherit"],
-		},
-	);
-	if (result.error || result.status !== 0)
-		return {
-			exitCode: null,
-			signal: null,
-			timedOut: true,
-			groupCleanup: "unknown",
-		};
-	try {
-		const parsed = JSON.parse(result.stdout);
-		if (Number.isInteger(parsed.exitCode) || typeof parsed.signal === "string")
-			return parsed;
-	} catch {
-		/* closed unknown receipt */
-	}
+const CHECK_REPAIR_MIN_COMMAND_MS = 30_000;
+
+function boundedDeadlineCommandMs(limitMs, deadline, pendingCommands) {
+	if (deadline === undefined) return limitMs;
+	const deadlineMs = Date.parse(deadline);
+	if (!Number.isFinite(deadlineMs)) return 0;
+	const futureReserve =
+		Math.max(0, pendingCommands) * CHECK_REPAIR_MIN_COMMAND_MS;
+	return Math.floor(Math.min(limitMs, deadlineMs - Date.now() - futureReserve));
+}
+
+function deadlineExpiredOutcome() {
 	return {
 		exitCode: null,
 		signal: null,
 		timedOut: true,
-		groupCleanup: "unknown",
+		groupCleanup: "complete",
 	};
 }
-function settleScopedChecksSync(root, launchedAt) {
-	const result = spawnSync(
-		process.execPath,
-		[SELF, "--quick-check-settle", JSON.stringify({ root, launchedAt })],
-		{
-			env: safeEnv(root),
-			encoding: "utf8",
-			timeout: 12_000,
-			maxBuffer: 64,
-			stdio: ["ignore", "pipe", "ignore"],
-		},
-	);
-	return result.status === 0 && result.stdout === "stopped";
-}
-function gateCandidate(cwd, env, diff, allowedPaths, allowSensitiveManifests) {
-	const result = spawnSync(process.execPath, [SELF, "--quick-check-gate"], {
-		cwd,
-		env,
-		input: JSON.stringify({ diff, allowedPaths, allowSensitiveManifests }),
-		encoding: "utf8",
-		timeout: 30_000,
-		maxBuffer: 1024,
-		stdio: ["pipe", "pipe", "ignore"],
-	});
-	return result.status === 0 && result.stdout === "passed";
-}
+
 export function runQuickChecks({
 	projectPath,
 	taskId,
@@ -105,6 +52,8 @@ export function runQuickChecks({
 	snapshotPaths = [],
 	ownedRoot = null,
 	onStatus,
+	baseline = false,
+	deadline,
 }) {
 	if (
 		!Number.isSafeInteger(checkTimeoutMs) ||
@@ -119,9 +68,13 @@ export function runQuickChecks({
 				JSON.stringify(parseCommand(argv.join(" "), taskId, false)) ===
 					JSON.stringify(argv),
 		) ||
+		(baseline && (diff !== null || setup !== null)) ||
+		(!baseline && typeof diff !== "string") ||
 		(setup &&
 			JSON.stringify(parseCommand(setup.join(" "), taskId, true)) !==
-				JSON.stringify(setup))
+				JSON.stringify(setup)) ||
+		(deadline !== undefined &&
+			(typeof deadline !== "string" || !Number.isFinite(Date.parse(deadline))))
 	)
 		throw new Error("invalid Quick checks input");
 	const root =
@@ -134,7 +87,13 @@ export function runQuickChecks({
 		taskId,
 		attempt,
 		baseTree,
-		diffSha256: sha(diff.endsWith("\n") ? diff : `${diff}\n`),
+		diffSha256: sha(
+			baseline
+				? `baseline:${baseTree}:${JSON.stringify(checks)}`
+				: diff.endsWith("\n")
+					? diff
+					: `${diff}\n`,
+		),
 		candidateTree: null,
 		commandSetSha256: sha(JSON.stringify({ setup, checks })),
 		setup: null,
@@ -160,11 +119,13 @@ export function runQuickChecks({
 			clone,
 		]);
 		prepareExactBase(clone, projectPath, env, baseTree, snapshotPaths);
-		const patch = diff.endsWith("\n") ? diff : `${diff}\n`;
-		if (
-			!gateCandidate(clone, env, patch, allowedPaths, allowSensitiveManifests)
-		)
-			throw new Error("gate_failed");
+		if (!baseline) {
+			const patch = diff.endsWith("\n") ? diff : `${diff}\n`;
+			if (
+				!gateCandidate(clone, env, patch, allowedPaths, allowSensitiveManifests)
+			)
+				throw new Error("gate_failed");
+		}
 		git(clone, env, ["add", "-A"]);
 		receipt.candidateTree = git(clone, env, ["write-tree"]);
 		if (setup) {
@@ -181,9 +142,17 @@ export function runQuickChecks({
 				hostNpmCache,
 			);
 			if (!setupEnv) throw new Error("setup_unavailable");
-			const outcome = runCommand(clone, setupEnv, setup, 5 * 60_000, {
-				sandbox: false,
-			});
+			const setupTimeoutMs = boundedDeadlineCommandMs(
+				5 * 60_000,
+				deadline,
+				checks.length,
+			);
+			const outcome =
+				setupTimeoutMs >= 100
+					? runCommand(clone, setupEnv, setup, setupTimeoutMs, {
+							sandbox: false,
+						})
+					: deadlineExpiredOutcome();
 			receipt.setup = { commandSha256: sha(JSON.stringify(setup)), ...outcome };
 			if (outcome.exitCode !== 0 || outcome.groupCleanup !== "complete")
 				throw new Error("setup_failed");
@@ -195,7 +164,15 @@ export function runQuickChecks({
 				status: `Task ${taskId} check ${index + 1}/${checks.length} running`,
 				taskId,
 			});
-			const outcome = runCommand(clone, env, argv, checkTimeoutMs);
+			const boundedTimeoutMs = boundedDeadlineCommandMs(
+				checkTimeoutMs,
+				deadline,
+				checks.length - index - 1,
+			);
+			const outcome =
+				boundedTimeoutMs >= 100
+					? runCommand(clone, env, argv, boundedTimeoutMs)
+					: deadlineExpiredOutcome();
 			receipt.checks.push({
 				index,
 				commandSha256: sha(JSON.stringify(argv)),
@@ -206,11 +183,13 @@ export function runQuickChecks({
 		}
 		git(clone, env, ["add", "-A"]);
 		if (git(clone, env, ["write-tree"]) !== receipt.candidateTree)
-			throw new Error("candidate_changed");
+			throw new Error(baseline ? "baseline_mutation" : "candidate_changed");
 		receipt.status = "passed";
 	} catch (error) {
 		receipt.status =
-			error.message === "check_failed" || error.message === "setup_failed"
+			error.message === "check_failed" ||
+			error.message === "setup_failed" ||
+			error.message === "baseline_mutation"
 				? "failed"
 				: "unknown";
 		receipt.failureCode = [
@@ -218,6 +197,7 @@ export function runQuickChecks({
 			"setup_failed",
 			"setup_unavailable",
 			"check_failed",
+			"baseline_mutation",
 		].includes(error.message)
 			? error.message
 			: "candidate_unavailable";
@@ -268,11 +248,21 @@ export function runQuickChecksAsync(input) {
 	return new Promise((resolve) => {
 		const root = mkdtempSync(join(tmpdir(), "switchyard-quick-check-"));
 		const launchedAt = Date.now();
-		const maxMs =
+		const configuredMaxMs =
 			(input.checks?.length ?? MAX_CHECKS) *
 				(input.checkTimeoutMs ?? MAX_CHECK_MS) +
 			(input.setup ? 5 * 60_000 : 0) +
 			90_000;
+		const deadlineRemainingMs =
+			input.deadline === undefined
+				? Number.POSITIVE_INFINITY
+				: Date.parse(input.deadline) - Date.now();
+		const maxMs = Math.min(
+			configuredMaxMs,
+			Number.isFinite(deadlineRemainingMs)
+				? Math.max(0, deadlineRemainingMs) + 15_000
+				: configuredMaxMs,
+		);
 		let child;
 		try {
 			child = spawn(process.execPath, [SELF, "--quick-check-runner"], {
@@ -486,13 +476,7 @@ if (process.argv[2] === "--quick-check-runner") {
 
 import "./checks-sandbox.mjs";
 import "./checks-receipts.mjs";
-import {
-	git,
-	prepareExactBase,
-	quickCheckSandboxProfile,
-	safeEnv,
-	sha,
-} from "./checks-sandbox.mjs";
+import { git, prepareExactBase, safeEnv, sha } from "./checks-sandbox.mjs";
 
 export {
 	enforceQuickCheckCompletion,

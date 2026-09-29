@@ -1,22 +1,14 @@
-import {
-	boundCompletionContinuationProof,
-	boundProviderLifecycleSnapshot,
-	createProgressSnapshot,
-	DEFAULT_SILENCE_TIMEOUT_MS,
-	verifyCompletionContinuationSync,
-} from "../adapter/provider-lifecycle.mjs";
+import { boundCompletionContinuationProof } from "../adapter/provider-lifecycle.mjs";
 import { registerBrokerExecutionPolicy } from "../broker/executor.mjs";
-import { HOST_POWER_STATES, readHostPower } from "../dispatch/host-power.mjs";
+import { HOST_POWER_STATES } from "../dispatch/host-power.mjs";
 import {
-	getConfiguredInvocationDescriptor,
 	getInvocationDescriptor,
-	normalizeProviderName,
 	resolveRouteProvenance,
-	resolveTargetIdentity,
-	validateInvocationDescriptor,
 } from "../roster/index.mjs";
+import { runQuickChecksAsync } from "./checks.mjs";
 import { handleExecuteTaskAsyncUnsafeFailure } from "./execute-task-async-unsafe-failure.mjs";
 import { prepareExecuteTaskAsyncUnsafe } from "./execute-task-async-unsafe-prepare.mjs";
+import { prepareAsyncProviderInvocation } from "./execute-task-async-unsafe-reliability.mjs";
 import { completeExecuteTaskAsyncUnsafe } from "./execute-task-async-unsafe-success.mjs";
 import {
 	descriptorFromRoute,
@@ -29,6 +21,7 @@ import {
 	mergeBrokerRouteProvenance,
 	normalizeBrokerRoute,
 } from "./outcome-writer.mjs";
+import { createTaskProviderPin } from "./reliability.mjs";
 import {
 	isStructuredReviewExecution,
 	reviewTaskResult,
@@ -62,7 +55,6 @@ export async function executeTaskAsyncUnsafe(task, context) {
 		routeResult,
 		invocationDescriptor,
 		resolvedTargetId,
-		routedModel,
 		record,
 	} = prepared.state;
 	context.queueBackend?.beforeRun?.(
@@ -92,31 +84,22 @@ export async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
-	const healthPreparation = prepareRouteHealthTrial(
-		context,
+	const reliability = await prepareAsyncProviderInvocation({
 		task,
+		context,
 		routeResult,
 		invocationDescriptor,
-	);
-	if (!healthPreparation.allowed) {
-		await releaseSelected(selectedRoute);
-		return healthDeferredResult(
-			task,
-			routeResult,
-			invocationDescriptor,
-			requiredCapability,
-		);
-	}
-	const healthStart = startRouteHealthTrial(context);
-	if (!healthStart.allowed) {
-		await releaseSelected(selectedRoute);
-		return healthDeferredResult(
-			task,
-			routeResult,
-			invocationDescriptor,
-			requiredCapability,
-		);
-	}
+		resolvedTargetId,
+		requiredCapability,
+		selectedRoute,
+		releaseSelected,
+		record,
+		attemptCleanupContext,
+		timeoutMs,
+		runQuickChecksAsync,
+	});
+	if (reliability.terminal !== null) return reliability.terminal;
+	timeoutMs = reliability.timeoutMs;
 	context._outcomeAttemptCursor = (context._outcomeAttemptCursor ?? 0) + 1;
 	context._activeOutcomeAttempt = context._outcomeAttemptCursor;
 	let clearExecutionPolicy = () => {};
@@ -162,6 +145,8 @@ export async function executeTaskAsyncUnsafe(task, context) {
 		if (
 			failureKind &&
 			fallbackCapability &&
+			!context._checkRepairPin &&
+			!context._completionPin &&
 			context._activeRouteHealth?.claimStarted !== true
 		) {
 			const fallbackPower = readQueueHostPower({
@@ -314,16 +299,32 @@ export async function executeTaskAsyncUnsafe(task, context) {
 					routeResult,
 					invocationDescriptor,
 				);
-				if (
-					!fallbackHealth.allowed ||
-					!startRouteHealthTrial(context).allowed
-				) {
+				if (!fallbackHealth.allowed) {
 					await releaseSelected(fallbackRoute);
 					return healthDeferredResult(
 						task,
 						routeResult,
 						invocationDescriptor,
 						requiredCapability,
+					);
+				}
+				if (!startRouteHealthTrial(context).allowed) {
+					await releaseSelected(fallbackRoute);
+					return healthDeferredResult(
+						task,
+						routeResult,
+						invocationDescriptor,
+						requiredCapability,
+					);
+				}
+				if (!context._checkRepairPin && !context._completionPin) {
+					context._activeCompletionPin = createTaskProviderPin(
+						task,
+						context,
+						routeResult,
+						invocationDescriptor,
+						attemptCleanupContext.attemptId,
+						context._activeTaskDeadline,
 					);
 				}
 				clearExecutionPolicy = () => {};
@@ -382,10 +383,8 @@ export async function executeTaskAsyncUnsafe(task, context) {
 		servedModelVerified: brokerExecution.servedModelVerified ?? null,
 		progress: brokerExecution.progress ?? null,
 		providerLifecycle: brokerExecution.providerLifecycle ?? null,
-		// The broker relays a sanitized verdict and never raw provider bytes, so
-		// there is no output to read back on this path; a route that produced no
-		// verdict relays null and the review result resolves to an explicit
-		// `missing` instead of inheriting a placeholder.
+		providerReliability: brokerExecution.providerReliability ?? null,
+		// A missing sanitized broker verdict stays explicit instead of inheriting a placeholder.
 		reviewResult: brokerExecution.reviewResult ?? null,
 		executionOutcome: brokerExecution.executionOutcome ?? null,
 		outcomePersistenceFailed: brokerExecution.outcomePersistenceFailed === true,

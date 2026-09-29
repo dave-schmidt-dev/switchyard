@@ -1,8 +1,6 @@
-import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	closeSync,
-	existsSync,
 	fsyncSync,
 	lstatSync,
 	mkdirSync,
@@ -13,17 +11,14 @@ import {
 	statSync,
 	writeSync,
 } from "node:fs";
-import { homedir, hostname, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { parseArgs } from "node:util";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
 	PERSISTED_SIGNALS,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
-import {
-	boundProviderLifecycleSnapshot,
-	runProviderProcess,
-} from "../adapter/provider-lifecycle.mjs";
+import { boundProviderLifecycleSnapshot } from "../adapter/provider-lifecycle.mjs";
+import { createProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import {
 	integrationGate,
 	manifestReviewPaths,
@@ -32,7 +27,6 @@ import {
 import {
 	captureDirtyOverlay,
 	materializeDirtyOverlay,
-	parsePredecessorReceipt,
 	validateDirtyOverlayReceipt,
 } from "../lifecycle/index.mjs";
 import {
@@ -40,16 +34,23 @@ import {
 	normalizeProviderName,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
-import { readSnapshotAtRoute, route } from "../router/index.mjs";
+import { route } from "../router/index.mjs";
 import {
 	acquireProjectLock,
 	createEvent,
 	initializeRun,
-	readRun,
+	isProjectLockOwnedBy,
 	releaseProjectLockIfOwnedBy,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
-import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
+import { isSafeDescriptorReceipt } from "../run-store/receipt-validation.mjs";
+import { runSimpleBaselineChecks } from "./baseline.mjs";
+import { createSimpleRouteHealthController } from "./health.mjs";
+import {
+	classifySimpleErrorKind,
+	createSimpleProviderReliabilityDiagnostic,
+} from "./reliability.mjs";
+import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
@@ -65,6 +66,20 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const signal = dependencies.signal;
 	let provider = null;
 	let targetId = null;
+	let invocationDescriptor = null;
+	let descriptorHarness = null;
+	let providerExecutionResult = null;
+	let baselineStatus = (options.baselineChecks ?? []).length
+		? "pending"
+		: "not_requested";
+	let failingCheckIndex = null;
+	let failingCheckIdentity = null;
+	let failureExitCode = null;
+	let failureSignal = null;
+	let failureTimedOut = null;
+	let repairCount = 0;
+	let repairStatus = options.repairChecks ? "not_started" : "not_requested";
+	let terminalProviderReliability = null;
 	let projectLocked = false;
 	let canonicalParent = null;
 	let candidateChild = null;
@@ -102,127 +117,28 @@ export async function runSimpleTask(options, dependencies = {}) {
 		dependencies.executeProvider ?? defaultExecuteProvider;
 	const runCheck = dependencies.runCheck ?? defaultRunCheck;
 	const routeProvider = dependencies.route ?? route;
+	const healthController = (
+		dependencies.createSimpleRouteHealthController ??
+		createSimpleRouteHealthController
+	)({
+		healthDecision: dependencies.healthDecision,
+		healthMode: dependencies.healthMode,
+		healthStateRoot: dependencies.healthStateRoot,
+		qualifiedProviders: dependencies.qualifiedProviders,
+		runId,
+		taskId,
+		attemptId,
+		now,
+		onStatus,
+		createRouteHealthEvent: dependencies.createRouteHealthEvent,
+		ingestRouteHealthEvents: dependencies.ingestRouteHealthEvents,
+	});
 	const descriptorFor =
 		dependencies.getInvocationDescriptor ?? getConfiguredInvocationDescriptor;
 	const resolveIdentity =
 		dependencies.resolveTargetIdentity ?? resolveTargetIdentity;
 
-	const classifyErrorKind = (failureReason, failurePhase, error = null) => {
-		const errno =
-			extractErrno(error) ??
-			(typeof failureReason === "string" && /^[A-Z0-9]+$/u.test(failureReason)
-				? failureReason
-				: null);
-		if (errno === "EPERM" || errno === "EACCES") {
-			return "permission_denied";
-		}
-		if (
-			[
-				"EROFS",
-				"ENOSPC",
-				"EMFILE",
-				"ENFILE",
-				"EIO",
-				"EDQUOT",
-				"ETIMEDOUT",
-				"ECONNREFUSED",
-				"ENETUNREACH",
-				"ENETDOWN",
-			].includes(errno)
-		) {
-			return "environment_failure";
-		}
-		if (failureReason === "run_store_write_failed") {
-			return "run_store_write_failed";
-		}
-		if (
-			failureReason === "paid_overage_not_allowed" ||
-			failureReason === "included_usage_unverified" ||
-			failureReason === "ambiguous_combined_rename_spelling"
-		) {
-			return "policy_violation";
-		}
-		if (failureReason === "manifest_review_required") {
-			return failurePhase === "input_validation"
-				? "validation_failed"
-				: "policy_violation";
-		}
-		if (failureReason === "empty_diff") {
-			return "empty_diff";
-		}
-		if (
-			failureReason === "invalid_invocation" ||
-			failureReason === "predecessor_receipt_invalid" ||
-			failureReason === "predecessor_receipt_missing" ||
-			failureReason === "predecessor_receipt_mismatch" ||
-			failureReason === "predecessor_receipt_unverified" ||
-			(failureReason?.startsWith("dirty_overlay_") &&
-				failureReason !== "dirty_overlay_drift")
-		) {
-			return "validation_failed";
-		}
-		if (
-			failureReason === "dirty_overlay_drift" ||
-			failureReason === "project_head_changed_concurrently" ||
-			failureReason === "declared_path_changed_concurrently" ||
-			failureReason === "read_only_input_changed" ||
-			failureReason === "undeclared_paths_changed" ||
-			failureReason === "unsafe_diff" ||
-			failureReason === "integration_failed"
-		) {
-			return "policy_violation";
-		}
-		if (
-			failurePhase === "checks" ||
-			failureReason === "check_failed" ||
-			failureReason === "check_deadline_exceeded" ||
-			failureReason === "check_silence_timeout"
-		) {
-			return "check_failed";
-		}
-		if (
-			failureReason === "provider_cleanup_failed" ||
-			failureReason === "worktree_cleanup_failed" ||
-			failureReason === "project_lock_release_unconfirmed" ||
-			failurePhase === "cleanup"
-		) {
-			return "cleanup_failed";
-		}
-		if (
-			failureReason === "provider_silence_timeout" ||
-			failureReason === "provider_deadline_exceeded" ||
-			failureReason === "provider_cancelled" ||
-			failureReason === "provider_signalled" ||
-			failureReason === "provider_adapter_error" ||
-			failureReason === "provider_result_inconsistent" ||
-			failureReason === "provider_exit_nonzero" ||
-			failureReason === "provider_launch_failed" ||
-			failurePhase === "execute"
-		) {
-			return "execution_failed";
-		}
-		if (failureReason === "deadline_expired") {
-			if (failurePhase === "preflight" || failurePhase === "input_validation")
-				return "validation_failed";
-			if (failurePhase === "execute") return "execution_failed";
-			if (failurePhase === "checks") return "check_failed";
-			if (failurePhase === "cleanup") return "cleanup_failed";
-			return "policy_violation";
-		}
-		if (
-			failureReason === "project_revision_unavailable" ||
-			failureReason === "workspace_clone_failed" ||
-			failureReason === "workspace_checkout_failed" ||
-			failureReason === "dirty_overlay_stage_failed" ||
-			failureReason === "dirty_overlay_baseline_failed"
-		) {
-			return "environment_failure";
-		}
-		if (failurePhase === "input_validation") {
-			return "validation_failed";
-		}
-		return "unclassified_failure";
-	};
+	const classifyErrorKind = classifySimpleErrorKind;
 	const milestone = (phase, name, details = {}) => {
 		const observedAt = now();
 		const elapsedSinceLastMilestoneMs = Math.max(
@@ -239,6 +155,22 @@ export async function runSimpleTask(options, dependencies = {}) {
 		lastMilestoneAt = observedAt;
 		if (runInitialized) {
 			try {
+				const descriptorReceipt =
+					details.invocationDescriptor &&
+					isSafeDescriptorReceipt(
+						details.invocationDescriptor,
+						details.descriptorHarness,
+					) &&
+					details.invocationDescriptor.descriptor_identity ===
+						details.descriptorIdentity &&
+					details.invocationDescriptor.target_id === details.resolvedTargetId
+						? {
+								invocationDescriptor: details.invocationDescriptor,
+								descriptorIdentity: details.descriptorIdentity,
+								descriptorHarness: details.descriptorHarness,
+								resolvedTargetId: details.resolvedTargetId,
+							}
+						: {};
 				const eventWrite = (dependencies.createEvent ?? createEvent)(runId, {
 					phase,
 					event: "milestone",
@@ -259,6 +191,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						? { exitCode: details.exitCode }
 						: {}),
 					...(details.signal !== undefined ? { signal: details.signal } : {}),
+					...descriptorReceipt,
 					firstChangeObserved,
 				}).catch(() => {});
 				pendingDurability.add(eventWrite);
@@ -357,6 +290,23 @@ export async function runSimpleTask(options, dependencies = {}) {
 			milestone(failurePhase, "salvage_retained");
 		}
 		milestone("terminal", "failed", { failurePhase });
+		const providerReliability = createSimpleProviderReliabilityDiagnostic({
+			failureReason,
+			failurePhase,
+			providerResult:
+				failurePhase === "baseline" || failurePhase === "checks"
+					? null
+					: providerExecutionResult,
+			exitCode: failureExitCode,
+			signal: failureSignal,
+			timedOut: failureTimedOut,
+			checkIndex: failingCheckIndex,
+			checkIdentity: failingCheckIdentity,
+			baselineStatus,
+			diffRejectionCount: changedFiles.length,
+			repairCount,
+			repairStatus,
+		});
 		finalResult = terminalResult(base, {
 			provider,
 			targetId,
@@ -371,6 +321,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 			providerVerdictCode,
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
+		finalResult.providerReliability = providerReliability;
+		if (invocationDescriptor) {
+			finalResult.invocationDescriptor = structuredClone(invocationDescriptor);
+			finalResult.descriptorIdentity = invocationDescriptor.descriptor_identity;
+			finalResult.descriptorHarness = descriptorHarness;
+		}
 		if (runInitialized) {
 			failureTerminalDurable = false;
 			try {
@@ -381,9 +337,27 @@ export async function runSimpleTask(options, dependencies = {}) {
 					finishedAt: new Date(now()).toISOString(),
 					lastFailure: sanitizeFailureMetadata({
 						taskId,
-						result: failureReason,
+						result: "execution_failed",
 						errorKind: computedErrorKind,
-						failurePhase,
+						failurePhase:
+							failurePhase === "execute" ? "provider_execution" : failurePhase,
+						providerReliability,
+						...(providerExecutionResult?.diagnosticCode &&
+						providerExecutionResult?.diagnosticEvidenceAvailable === true
+							? { diagnosticCode: providerExecutionResult.diagnosticCode }
+							: {}),
+						...(providerExecutionResult?.diagnosticOrigin
+							? { diagnosticOrigin: providerExecutionResult.diagnosticOrigin }
+							: {}),
+						...(providerExecutionResult?.diagnosticEvidenceAvailable === true
+							? { diagnosticEvidenceAvailable: true }
+							: {}),
+						...(Number.isSafeInteger(providerExecutionResult?.code)
+							? { exitCode: providerExecutionResult.code }
+							: {}),
+						...(PERSISTED_SIGNALS.has(providerExecutionResult?.signal)
+							? { signal: providerExecutionResult.signal }
+							: {}),
 					}),
 				}).then(
 					() => {
@@ -394,6 +368,51 @@ export async function runSimpleTask(options, dependencies = {}) {
 				pendingDurability.add(terminalWrite);
 				void terminalWrite.finally(() =>
 					pendingDurability.delete(terminalWrite),
+				);
+				const taskFailedEvent = (dependencies.createEvent ?? createEvent)(
+					runId,
+					{
+						phase: "execution",
+						event: "task_failed",
+						status: "failed",
+						taskId,
+						attempt: attemptId,
+						result: "execution_failed",
+						errorKind: computedErrorKind,
+						failurePhase:
+							failurePhase === "execute" ? "provider_execution" : failurePhase,
+						providerReliability,
+						reasonCode: providerReliability.causeCode,
+						...(provider ? { provider } : {}),
+						...(descriptorHarness ? { descriptorHarness } : {}),
+						...(targetId ? { resolvedTargetId: targetId } : {}),
+						...(invocationDescriptor
+							? {
+									invocationDescriptor: structuredClone(invocationDescriptor),
+									descriptorIdentity: invocationDescriptor.descriptor_identity,
+								}
+							: {}),
+						...(providerExecutionResult?.diagnosticCode &&
+						providerExecutionResult?.diagnosticEvidenceAvailable === true
+							? { diagnosticCode: providerExecutionResult.diagnosticCode }
+							: {}),
+						...(providerExecutionResult?.diagnosticOrigin
+							? { diagnosticOrigin: providerExecutionResult.diagnosticOrigin }
+							: {}),
+						...(providerExecutionResult?.diagnosticEvidenceAvailable === true
+							? { diagnosticEvidenceAvailable: true }
+							: {}),
+						...(Number.isSafeInteger(providerExecutionResult?.code)
+							? { exitCode: providerExecutionResult.code }
+							: {}),
+						...(PERSISTED_SIGNALS.has(providerExecutionResult?.signal)
+							? { signal: providerExecutionResult.signal }
+							: {}),
+					},
+				).catch(() => {});
+				pendingDurability.add(taskFailedEvent);
+				void taskFailedEvent.finally(() =>
+					pendingDurability.delete(taskFailedEvent),
 				);
 			} catch {}
 		}
@@ -578,41 +597,93 @@ export async function runSimpleTask(options, dependencies = {}) {
 				"route",
 			);
 		}
-		const routed = routeProvider({
-			requiredCapability: options.capability,
-			availableProviders: compatibleSimpleTargets,
-			platform: "direct",
-			nowMs: now(),
-			hasInvocationDescriptor: (name, capability) =>
-				Boolean(descriptorFor(name, capability)),
-			modelForCapability: (name, capability) =>
-				descriptorFor(name, capability)?.selector ?? null,
-			only: options.onlyProviders ?? [],
-		});
-		if (!routed?.provider)
-			return fail(routed?.reason ?? "no_eligible_provider", "route");
-		provider = routed.provider;
-		const identity = resolveIdentity(provider);
-		targetId = identity.targetId;
-		if (!targetId || !identity.harnessKey) {
-			return fail("target_identity_unavailable", "route");
-		}
-		const descriptor = descriptorFor(provider, options.capability);
-		if (!descriptor || descriptor.target_id !== targetId) {
-			return fail("invocation_descriptor_unavailable", "route");
-		}
-		const compatibility = simpleProviderCompatibility({
-			targetId,
-			harness: normalizeProviderName(identity.harnessKey),
-			descriptor,
-			capability: options.capability,
-		});
-		if (!compatibility.compatible) {
-			return fail(compatibility.reason, "route");
-		}
-		(dependencies.assertFundedRoute ?? assertFundedRoute)(targetId);
+		const excludedSimpleTargets = new Set();
+		const selectSimpleRoute = async () => {
+			while (excludedSimpleTargets.size < compatibleSimpleTargets.length) {
+				const availableProviders = compatibleSimpleTargets.filter(
+					(candidate) => !excludedSimpleTargets.has(candidate),
+				);
+				const routed = routeProvider({
+					requiredCapability: options.capability,
+					availableProviders,
+					platform: "direct",
+					nowMs: now(),
+					hasInvocationDescriptor: (name, capability) =>
+						Boolean(descriptorFor(name, capability)),
+					modelForCapability: (name, capability) =>
+						descriptorFor(name, capability)?.selector ?? null,
+					healthDecision: healthController.decision,
+					only: options.onlyProviders ?? [],
+				});
+				if (!routed?.provider)
+					return {
+						error: routed?.reason ?? "no_eligible_provider",
+					};
+				const candidateProvider = routed.provider;
+				const candidateIdentity = resolveIdentity(candidateProvider);
+				const candidateTargetId = candidateIdentity.targetId;
+				if (!candidateTargetId || !candidateIdentity.harnessKey)
+					return { error: "target_identity_unavailable" };
+				const candidateDescriptor = descriptorFor(
+					candidateProvider,
+					options.capability,
+				);
+				if (
+					!candidateDescriptor ||
+					candidateDescriptor.target_id !== candidateTargetId
+				)
+					return { error: "invocation_descriptor_unavailable" };
+				const candidateHarness = normalizeProviderName(
+					candidateIdentity.harnessKey,
+				);
+				const compatibility = simpleProviderCompatibility({
+					targetId: candidateTargetId,
+					harness: candidateHarness,
+					descriptor: candidateDescriptor,
+					capability: options.capability,
+				});
+				if (!compatibility.compatible) return { error: compatibility.reason };
+				(dependencies.assertFundedRoute ?? assertFundedRoute)(
+					candidateTargetId,
+				);
+				const prepared = await healthController.prepare({
+					provider: candidateProvider,
+					targetId: candidateTargetId,
+					capability: options.capability,
+					descriptor: candidateDescriptor,
+				});
+				if (!prepared.allowed || prepared.reroute) {
+					excludedSimpleTargets.add(candidateTargetId);
+					continue;
+				}
+				return {
+					provider: candidateProvider,
+					targetId: candidateTargetId,
+					descriptor: candidateDescriptor,
+					harness: candidateHarness,
+					compatibility,
+					prepared,
+				};
+			}
+			return { error: "route_health_blocked" };
+		};
+		let selectedRoute = await selectSimpleRoute();
+		if (selectedRoute.error) return fail(selectedRoute.error, "route");
+		provider = selectedRoute.provider;
+		targetId = selectedRoute.targetId;
+		let descriptor = selectedRoute.descriptor;
+		let harness = selectedRoute.harness;
+		invocationDescriptor = structuredClone(descriptor);
+		descriptorHarness = harness;
 
-		milestone("route", "route_selected", { provider, targetId });
+		milestone("route", "route_selected", {
+			provider,
+			targetId,
+			resolvedTargetId: targetId,
+			descriptorHarness,
+			descriptorIdentity: invocationDescriptor.descriptor_identity,
+			invocationDescriptor,
+		});
 		if (runInitialized) {
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
@@ -801,11 +872,68 @@ export async function runSimpleTask(options, dependencies = {}) {
 			).trim();
 		}
 
+		const baselineResult = await runSimpleBaselineChecks({
+			checks: options.baselineChecks ?? [],
+			taskId,
+			worktreePath,
+			deadlineMs: options.deadlineMs,
+			now,
+			signal,
+			runCheck,
+			git,
+			onStatus: (event) => {
+				if (event.checkIndex !== undefined) {
+					failingCheckIndex = event.checkIndex;
+					failingCheckIdentity = event.checkIdentity ?? null;
+				}
+				milestone("baseline", event.event, {
+					checkIndex: event.checkIndex,
+					checkIdentity: event.checkIdentity,
+					checkStatus: event.checkStatus,
+				});
+			},
+		});
+		baselineStatus = baselineResult.status;
+		if (baselineResult.checks.length > 0) {
+			const lifecycles = baselineResult.checks.map(
+				(check) => check.writerLifecycle,
+			);
+			writerLifecycle = lifecycles.reduce(
+				aggregateWriterLifecycle,
+				"never_started",
+			);
+		}
+		const baselineFailure = [...baselineResult.checks]
+			.reverse()
+			.find((check) => !check.success);
+		if (baselineFailure) {
+			failureExitCode = baselineFailure.exitCode;
+			failureSignal = baselineFailure.signal;
+			failureTimedOut = baselineFailure.timedOut;
+		}
+		if (baselineStatus === "unknown") {
+			writerLifecycle = "unavailable";
+			keepWorktree = true;
+			return fail(
+				"baseline_check_unavailable",
+				"baseline",
+				"environment_failure",
+			);
+		}
+		if (baselineStatus === "cancelled") return failForSignal("baseline");
+		if (baselineStatus === "mutation_detected") {
+			return fail("baseline_mutation", "baseline", "environment_failure");
+		}
+		if (baselineStatus === "failed") {
+			return fail("baseline_check_failed", "baseline", "environment_failure");
+		}
+		failingCheckIndex = null;
+		failingCheckIdentity = null;
+
 		const readOnlyNotice = (options.readOnlyInputs ?? []).length
 			? ` Read-only input paths (do not modify): ${(options.readOnlyInputs ?? []).join(", ")}.`
 			: "";
 		const guardedPrompt = `${readFileSync(options.promptPath, "utf8")}\n\nWork only in the current disposable checkout. Change only these writable files: ${options.files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
-		const harness = normalizeProviderName(identity.harnessKey);
 		currentPhase = "execute";
 		milestone("execute", "provider_started");
 		const executionBudget = remainingMs(options.deadlineMs, now);
@@ -813,6 +941,47 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail("deadline_expired", "execute");
 		}
 		if (signal?.aborted) return failForSignal("execute");
+		let providerHealthStart = await healthController.start();
+		while (!providerHealthStart.allowed && providerHealthStart.reroute) {
+			excludedSimpleTargets.add(targetId);
+			selectedRoute = await selectSimpleRoute();
+			if (selectedRoute.error) return fail("route_health_blocked", "route");
+			provider = selectedRoute.provider;
+			targetId = selectedRoute.targetId;
+			descriptor = selectedRoute.descriptor;
+			harness = selectedRoute.harness;
+			invocationDescriptor = structuredClone(descriptor);
+			descriptorHarness = harness;
+			(dependencies.assertFundedRoute ?? assertFundedRoute)(targetId);
+			milestone("route", "route_selected", {
+				provider,
+				targetId,
+				resolvedTargetId: targetId,
+				descriptorHarness,
+				descriptorIdentity: invocationDescriptor.descriptor_identity,
+				invocationDescriptor,
+			});
+			if (runInitialized) {
+				try {
+					await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+						resolvedTargetId: targetId,
+						activeTaskProvider: provider,
+						activeTaskModel: descriptor.selector ?? null,
+					});
+				} catch (error) {
+					return fail(
+						"run_store_write_failed",
+						"route",
+						classifyErrorKind("run_store_write_failed", "route", error),
+						error,
+					);
+				}
+			}
+			providerHealthStart = await healthController.start();
+		}
+		if (!providerHealthStart.allowed)
+			return fail("route_health_blocked", "route");
+		const providerHealthTracked = providerHealthStart.tracked === true;
 		writerLifecycle = "unavailable";
 		const providerResult = await executeProvider({
 			targetId,
@@ -847,6 +1016,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				heartbeat("execute", { processPhase: "provider_running" });
 			},
 		});
+		providerExecutionResult = providerResult;
 		providerLifecycle = boundProviderLifecycleSnapshot(
 			providerResult?.providerLifecycle,
 		);
@@ -855,6 +1025,32 @@ export async function runSimpleTask(options, dependencies = {}) {
 			"never_started",
 			providerResult?.writerLifecycle,
 		);
+		const providerAttemptReliability = providerResult?.success
+			? null
+			: createSimpleProviderReliabilityDiagnostic({
+					failureReason: classifyExecutionFailure(providerResult),
+					failurePhase: "execute",
+					providerResult,
+					baselineStatus,
+					repairCount,
+					repairStatus,
+				});
+		let providerHealthTerminal = { settled: !providerHealthTracked };
+		try {
+			providerHealthTerminal = await healthController.terminal({
+				providerResult,
+				providerReliability:
+					providerResult?.providerReliability ?? providerAttemptReliability,
+				providerLifecycle,
+			});
+		} catch {
+			providerHealthTerminal = {
+				settled: false,
+				reason: "provider-health-unavailable",
+			};
+		}
+		const providerAttemptSettled =
+			!providerHealthTracked || providerHealthTerminal.settled === true;
 
 		if (signal?.aborted) return failForSignal("execute");
 		if (
@@ -925,81 +1121,339 @@ export async function runSimpleTask(options, dependencies = {}) {
 			);
 		}
 
-		for (let index = 0; index < options.checks.length; index += 1) {
-			currentPhase = "checks";
-			if (signal?.aborted) return failForSignal("checks");
-			const remaining = remainingMs(options.deadlineMs, now);
-			if (remaining <= 0) {
-				keepWorktree = true;
-				return fail("deadline_expired", "checks");
-			}
-			const checkIdentity = createHash("sha256")
-				.update(options.checks[index])
-				.digest("hex");
-			milestone("checks", "check_started", {
-				checkIndex: index + 1,
-				checkIdentity,
-			});
-			const settledWriterLifecycle = writerLifecycle;
-			// A check may still be writing the checkout until it resolves.
-			writerLifecycle = "unavailable";
-			const check = await runCheck({
-				command: options.checks[index],
-				worktreePath,
-				timeoutMs: remaining,
-				signal,
-				onProgress: () =>
-					heartbeat("checks", {
-						processPhase: "check_running",
-						checkIndex: index + 1,
-						checkIdentity,
-					}),
-			});
-			writerLifecycle = aggregateWriterLifecycle(
-				settledWriterLifecycle,
-				check?.writerLifecycle,
-			);
-			if (signal?.aborted) return failForSignal("checks");
-			if (runCheck === defaultRunCheck && writerLifecycle === "unavailable") {
-				keepWorktree = true;
-				return fail("check_group_unconfirmed", "checks", "cleanup_failed");
-			}
-			const checkStatus = check?.success ? "passed" : "failed";
-			const checkExitCode =
-				Number.isSafeInteger(check?.code) &&
-				check.code >= 0 &&
-				check.code <= 255
-					? check.code
-					: null;
-			const checkSignal = PERSISTED_SIGNALS.has(check?.signal)
-				? check.signal
-				: null;
-			checks.push({
-				index: index + 1,
-				status: checkStatus,
-				...(checkStatus === "failed"
-					? { exitCode: checkExitCode, signal: checkSignal }
-					: {}),
-			});
-			milestone("checks", "check_finished", {
-				checkIndex: index + 1,
-				checkIdentity,
-				checkStatus,
-				...(checkStatus === "failed"
-					? { exitCode: checkExitCode, signal: checkSignal }
-					: {}),
-			});
-			if (!check?.success) {
-				keepWorktree = true;
-				return fail(
-					check?.silenceTimedOut
-						? "check_silence_timeout"
-						: check?.timedOut
-							? "check_deadline_exceeded"
-							: "check_failed",
-					"checks",
+		let capturedDiff = captured;
+		for (let pass = 0; pass < 2; pass += 1) {
+			let rerunAllChecks = false;
+			checks.length = 0;
+			for (let index = 0; index < options.checks.length; index += 1) {
+				currentPhase = "checks";
+				if (signal?.aborted) return failForSignal("checks");
+				const remaining = remainingMs(options.deadlineMs, now);
+				if (remaining <= 0) {
+					keepWorktree = true;
+					return fail("deadline_expired", "checks");
+				}
+				const checkIdentity = createHash("sha256")
+					.update(options.checks[index])
+					.digest("hex");
+				milestone("checks", "check_started", {
+					checkIndex: index + 1,
+					checkIdentity,
+				});
+				const settledWriterLifecycle = writerLifecycle;
+				writerLifecycle = "unavailable";
+				const check = await runCheck({
+					command: options.checks[index],
+					worktreePath,
+					timeoutMs: remaining,
+					signal,
+					onProgress: () =>
+						heartbeat("checks", {
+							processPhase: "check_running",
+							checkIndex: index + 1,
+							checkIdentity,
+						}),
+				});
+				writerLifecycle = aggregateWriterLifecycle(
+					settledWriterLifecycle,
+					check?.writerLifecycle,
 				);
+				if (signal?.aborted) return failForSignal("checks");
+				if (runCheck === defaultRunCheck && writerLifecycle === "unavailable") {
+					keepWorktree = true;
+					return fail("check_group_unconfirmed", "checks", "cleanup_failed");
+				}
+				const checkStatus = check?.success ? "passed" : "failed";
+				const checkExitCode =
+					Number.isSafeInteger(check?.code) &&
+					check.code >= 0 &&
+					check.code <= 255
+						? check.code
+						: null;
+				const checkSignal = PERSISTED_SIGNALS.has(check?.signal)
+					? check.signal
+					: null;
+				checks.push({
+					index: index + 1,
+					status: checkStatus,
+					...(checkStatus === "failed"
+						? { exitCode: checkExitCode, signal: checkSignal }
+						: {}),
+				});
+				milestone("checks", "check_finished", {
+					checkIndex: index + 1,
+					checkIdentity,
+					checkStatus,
+					...(checkStatus === "failed"
+						? { exitCode: checkExitCode, signal: checkSignal }
+						: {}),
+				});
+				if (check?.success) {
+					failingCheckIndex = null;
+					failingCheckIdentity = null;
+					continue;
+				}
+
+				failingCheckIndex = index + 1;
+				failingCheckIdentity = checkIdentity;
+				failureExitCode = checkExitCode;
+				failureSignal = checkSignal;
+				failureTimedOut = check?.timedOut === true;
+				const checkFailureReason = check?.silenceTimedOut
+					? "check_silence_timeout"
+					: check?.timedOut
+						? "check_deadline_exceeded"
+						: "check_failed";
+				if (!options.repairChecks || pass > 0) {
+					if (pass > 0) {
+						repairStatus = "failed";
+						return fail("check_repair_failed", "checks");
+					}
+					keepWorktree = true;
+					return fail(checkFailureReason, "checks");
+				}
+				if (
+					repairCount !== 0 ||
+					writerLifecycle !== "stopped" ||
+					!projectLocked ||
+					!providerAttemptSettled
+				) {
+					repairStatus = "ineligible";
+					keepWorktree = true;
+					return fail(checkFailureReason, "checks");
+				}
+
+				// A failing check can itself change the checkout. Re-capture and validate
+				// the exact base and declared scope before any correction is allowed.
+				capturedDiff = captureWorktreeDiff(
+					worktreePath,
+					worktreeBaseRevision,
+					options.deadlineMs,
+					now,
+				);
+				changedFiles = capturedDiff.changedFiles;
+				const repairUndeclared = changedFiles.filter(
+					(path) => !options.files.includes(path),
+				);
+				if (repairUndeclared.length > 0) {
+					keepWorktree = true;
+					repairStatus = "ineligible";
+					return fail(
+						(options.readOnlyInputs ?? []).some((path) =>
+							repairUndeclared.includes(path),
+						)
+							? "read_only_input_changed"
+							: "undeclared_paths_changed",
+						"diff",
+					);
+				}
+				const repairDiffValidation = validateDiff(
+					capturedDiff.diff,
+					options.projectPath,
+				);
+				if (
+					!repairDiffValidation.safe ||
+					(repairDiffValidation.requiresReview &&
+						!(repairDiffValidation.sensitivePaths ?? []).every((path) =>
+							(options.allowManifests ?? []).includes(path),
+						))
+				) {
+					keepWorktree = true;
+					repairStatus = "ineligible";
+					return fail(
+						repairDiffValidation.requiresReview
+							? "manifest_review_required"
+							: "unsafe_diff",
+						"diff",
+					);
+				}
+
+				const lockOwned = await (
+					dependencies.isProjectLockOwnedBy ?? isProjectLockOwnedBy
+				)(options.projectPath, runId).catch(() => false);
+				let budget = simpleRepairBudget(
+					remainingMs(options.deadlineMs, now),
+					options.checks.length,
+				);
+				if (!lockOwned || !budget || signal?.aborted) {
+					repairStatus = "ineligible";
+					keepWorktree = true;
+					if (signal?.aborted) return failForSignal("checks");
+					return fail(checkFailureReason, "checks");
+				}
+				repairCount = 1;
+				repairStatus = "attempted";
+				const repairPrompt = buildSimpleRepairPrompt({
+					originalTask: guardedPrompt,
+					checkIndex: index + 1,
+					causeCode:
+						check?.timedOut === true
+							? "acceptance_check_timeout"
+							: "acceptance_check_failed",
+				});
+				const repairPrepared = await healthController.prepare({
+					provider,
+					targetId,
+					capability: options.capability,
+					descriptor,
+				});
+				if (!repairPrepared.allowed || repairPrepared.reroute) {
+					repairStatus = "ineligible";
+					keepWorktree = true;
+					return fail(checkFailureReason, "checks");
+				}
+				budget = simpleRepairBudget(
+					remainingMs(options.deadlineMs, now),
+					options.checks.length,
+				);
+				const stillOwnedBeforeCorrection = await (
+					dependencies.isProjectLockOwnedBy ?? isProjectLockOwnedBy
+				)(options.projectPath, runId).catch(() => false);
+				if (!stillOwnedBeforeCorrection || !budget || signal?.aborted) {
+					repairStatus = "ineligible";
+					keepWorktree = true;
+					if (signal?.aborted) return failForSignal("checks");
+					return fail(checkFailureReason, "checks");
+				}
+				const repairHealthStart = await healthController.start();
+				if (!repairHealthStart.allowed) {
+					repairStatus = "ineligible";
+					keepWorktree = true;
+					return fail(checkFailureReason, "checks");
+				}
+				writerLifecycle = "unavailable";
+				const correction = await executeProvider({
+					targetId,
+					harness,
+					descriptor,
+					capability: options.capability,
+					prompt: repairPrompt,
+					worktreePath,
+					timeoutMs: budget.providerTimeoutMs,
+					signal,
+					onProgress: () =>
+						heartbeat("repair", { processPhase: "provider_running" }),
+				});
+				providerExecutionResult = correction;
+				providerLifecycle = boundProviderLifecycleSnapshot(
+					correction?.providerLifecycle,
+				);
+				writerLifecycle = aggregateWriterLifecycle(
+					"never_started",
+					correction?.writerLifecycle,
+				);
+				const correctionAttemptReliability = correction?.success
+					? null
+					: createSimpleProviderReliabilityDiagnostic({
+							failureReason: classifyExecutionFailure(correction),
+							failurePhase: "execute",
+							providerResult: correction,
+							baselineStatus,
+							repairCount,
+							repairStatus,
+						});
+				let correctionHealthTerminal = {
+					settled: repairHealthStart.tracked !== true,
+				};
+				try {
+					correctionHealthTerminal = await healthController.terminal({
+						providerResult: correction,
+						providerReliability:
+							correction?.providerReliability ?? correctionAttemptReliability,
+						providerLifecycle: providerLifecycle,
+					});
+				} catch {
+					correctionHealthTerminal = {
+						settled: false,
+						reason: "provider-health-unavailable",
+					};
+				}
+				if (signal?.aborted) return failForSignal("repair");
+				if (
+					writerLifecycle !== "stopped" ||
+					(repairHealthStart.tracked === true &&
+						correctionHealthTerminal.settled !== true)
+				) {
+					keepWorktree = true;
+					repairStatus = "unknown";
+					return fail("provider_group_unconfirmed", "repair", "cleanup_failed");
+				}
+				const stillOwned = await (
+					dependencies.isProjectLockOwnedBy ?? isProjectLockOwnedBy
+				)(options.projectPath, runId).catch(() => false);
+				if (!stillOwned) {
+					keepWorktree = true;
+					repairStatus = "unknown";
+					return fail(
+						"project_lock_release_unconfirmed",
+						"repair",
+						"cleanup_failed",
+					);
+				}
+				if (!correction?.success) {
+					keepWorktree = true;
+					repairStatus = "failed";
+					return fail(classifyExecutionFailure(correction), "execute");
+				}
+
+				capturedDiff = captureWorktreeDiff(
+					worktreePath,
+					worktreeBaseRevision,
+					options.deadlineMs,
+					now,
+				);
+				changedFiles = capturedDiff.changedFiles;
+				const correctedUndeclared = changedFiles.filter(
+					(path) => !options.files.includes(path),
+				);
+				if (correctedUndeclared.length > 0) {
+					keepWorktree = true;
+					repairStatus = "ineligible";
+					return fail(
+						(options.readOnlyInputs ?? []).some((path) =>
+							correctedUndeclared.includes(path),
+						)
+							? "read_only_input_changed"
+							: "undeclared_paths_changed",
+						"diff",
+					);
+				}
+				const correctedValidation = validateDiff(
+					capturedDiff.diff,
+					options.projectPath,
+				);
+				if (
+					!correctedValidation.safe ||
+					(correctedValidation.requiresReview &&
+						!(correctedValidation.sensitivePaths ?? []).every((path) =>
+							(options.allowManifests ?? []).includes(path),
+						))
+				) {
+					keepWorktree = true;
+					repairStatus = "ineligible";
+					return fail(
+						correctedValidation.requiresReview
+							? "manifest_review_required"
+							: "unsafe_diff",
+						"diff",
+					);
+				}
+				checks.length = 0;
+				rerunAllChecks = true;
+				break;
 			}
+			if (rerunAllChecks) continue;
+			break;
+		}
+		if (repairCount > 0) {
+			repairStatus = "passed";
+			terminalProviderReliability = createProviderReliabilityDiagnostic({
+				causeCode: "check_repair_succeeded",
+				phase: "check",
+				baselineStatus,
+				repairCount,
+				repairStatus,
+			});
 		}
 		if (signal?.aborted) return failForSignal("integrate");
 		if (
@@ -1061,13 +1515,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		milestone("integrate", "integration_started");
 		const integration = dependencies.integrate
 			? await dependencies.integrate({
-					diff: captured.diff,
+					diff: capturedDiff.diff,
 					projectPath: options.projectPath,
 					changedFiles,
 					allowedPaths: options.files,
 					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
 				})
-			: integrationGate(captured.diff, options.projectPath, {
+			: integrationGate(capturedDiff.diff, options.projectPath, {
 					allowedPaths: options.files,
 					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
 				});
@@ -1131,6 +1585,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...(terminalProviderReliability
+							? { providerReliability: terminalProviderReliability }
+							: {}),
 					},
 					...(candidateChild
 						? {
@@ -1259,6 +1716,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...(terminalProviderReliability
+							? { providerReliability: terminalProviderReliability }
+							: {}),
 					},
 					...(candidateChild
 						? {
@@ -1304,6 +1764,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 			baseRevision,
 			partialWorktree: keepWorktree ? (worktreePath ?? candidatePath) : null,
 		});
+		if (invocationDescriptor) {
+			finalResult.invocationDescriptor = structuredClone(invocationDescriptor);
+			finalResult.descriptorIdentity = invocationDescriptor.descriptor_identity;
+			finalResult.descriptorHarness = descriptorHarness;
+		}
+		if (terminalProviderReliability)
+			finalResult.providerReliability = terminalProviderReliability;
 		milestone("terminal", "succeeded");
 		return finalResult;
 	} catch (error) {
@@ -1445,7 +1912,6 @@ import {
 	declaredPathsAreClean,
 	dirtyOverlayFailure,
 	emitStatus,
-	extractErrno,
 	FIRST_CHANGE_PROBE_INTERVAL_MS,
 	fileFingerprint,
 	makeDirtyBaseline,

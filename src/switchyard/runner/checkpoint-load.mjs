@@ -30,7 +30,11 @@ import {
 	HISTORICAL_CHECKPOINT_VERSION,
 	stableStringify,
 } from "./constants.mjs";
-import { validateRetryDescriptorEvidence } from "./quick-checks.mjs";
+import {
+	validateBaselineCheckResults,
+	validateRetryDescriptorEvidence,
+} from "./quick-checks.mjs";
+import { parseTaskQueue } from "./task-queue.mjs";
 
 const CHECKPOINT_OPTION_DIMENSIONS = Object.freeze([
 	"taskIds",
@@ -118,9 +122,11 @@ function validateCheckpointV3(
 				(entry) =>
 					!entry ||
 					typeof entry.taskId !== "string" ||
-					!["quota_fallback", "completion_correction"].includes(entry.reason) ||
+					!["quota_fallback", "completion_correction", "check_repair"].includes(
+						entry.reason,
+					) ||
 					!["allocated", "running", "result_recorded"].includes(entry.state) ||
-					(entry.reason === "completion_correction" &&
+					(["completion_correction", "check_repair"].includes(entry.reason) &&
 						(typeof entry.deadline !== "string" ||
 							!Number.isFinite(Date.parse(entry.deadline)) ||
 							typeof entry.descriptorIdentity !== "string" ||
@@ -130,11 +136,28 @@ function validateCheckpointV3(
 							typeof entry.baseTree !== "string" ||
 							!/^[a-f0-9]{40,64}$/.test(entry.baseTree) ||
 							typeof entry.attemptId !== "string" ||
-							!entry.attemptId)),
+							!entry.attemptId ||
+							(entry.scopeIdentity !== undefined &&
+								!/^[a-f0-9]{64}$/u.test(entry.scopeIdentity)) ||
+							(entry.reason === "check_repair" &&
+								!/^[a-f0-9]{64}$/u.test(entry.scopeIdentity)))),
 			))
 	) {
 		throw new Error("checkpoint v3 has invalid provider attempt allocations");
 	}
+	if (
+		parsed.results.some(
+			(entry) =>
+				entry?.baselineCheckReceipt !== undefined ||
+				entry?.providerReliability !== undefined ||
+				entry?.failurePhase === "baseline" ||
+				["baseline_check_failed", "baseline_mutation"].includes(entry?.result),
+		)
+	)
+		validateBaselineCheckResults(
+			parsed.results,
+			parseTaskQueue(readFileSync(tasksFilePath, "utf8")),
+		);
 	if (parsed.tasksFilePath !== tasksFilePath) {
 		throw new CheckpointIdentityError(
 			CHECKPOINT_IDENTITY_CODES.TASK_FILE_MISMATCH,

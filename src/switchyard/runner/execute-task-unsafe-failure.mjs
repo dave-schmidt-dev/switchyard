@@ -99,6 +99,9 @@ export function handleExecuteTaskUnsafeFailure(
 			diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 			diagnosticRef: execution.diagnosticRef,
 			cleanupStage: execution.cleanupStage,
+			...(execution.providerReliability
+				? { providerReliability: execution.providerReliability }
+				: {}),
 		});
 		const error = cleanupFailed
 			? (execution.error ??
@@ -158,6 +161,9 @@ export function handleExecuteTaskUnsafeFailure(
 			diagnosticRef: execution.diagnosticRef,
 			cleanupFailed,
 			cleanupStage: execution.cleanupStage,
+			...(execution.providerReliability
+				? { providerReliability: execution.providerReliability }
+				: {}),
 			...(captureStatus ? { captureStatus } : {}),
 			...reviewFailureFields(task, execution),
 			...(partialDiff ? { partialDiff } : {}),
@@ -210,6 +216,9 @@ export function handleExecuteTaskUnsafeFailure(
 		diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 		diagnosticRef: execution.diagnosticRef,
 		cleanupStage: execution.cleanupStage,
+		...(execution.providerReliability
+			? { providerReliability: execution.providerReliability }
+			: {}),
 		...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
 		...reviewFailureFields(task, execution),
 	});
@@ -233,6 +242,9 @@ export function handleExecuteTaskUnsafeFailure(
 		diagnosticEvidenceAvailable: execution.diagnosticEvidenceAvailable,
 		diagnosticRef: execution.diagnosticRef,
 		cleanupStage: execution.cleanupStage,
+		...(execution.providerReliability
+			? { providerReliability: execution.providerReliability }
+			: {}),
 		...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
 		...reviewFailureFields(task, execution),
 		...(captureEvidence?.diff ? { partialDiff: captureEvidence.diff } : {}),

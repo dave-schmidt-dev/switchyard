@@ -14,6 +14,8 @@ export function parseQuickChecks(
 		lines.filter((line) => line.startsWith(`- **${name}:**`));
 	const declarations = field("Quick checks");
 	const setups = field("Quick check setup");
+	const baselineDeclarations = field("Baseline checks");
+	const repairDeclarations = field("Repair checks");
 	const suspicious = lines.some((line, index) => {
 		const quickLike =
 			/^\s*(?:[-*]\s*)?(?:\*\*)?(?:quick|quik|qick|quck)\b[^:\n]{0,60}:/i.test(
@@ -27,13 +29,29 @@ export function parseQuickChecks(
 			return true;
 		if (
 			(line.startsWith("- **Quick checks:**") ||
-				line.startsWith("- **Quick check setup:**")) &&
+				line.startsWith("- **Quick check setup:**") ||
+				line.startsWith("- **Baseline checks:**") ||
+				line.startsWith("- **Repair checks:**")) &&
 			/^\s{2,}[-*]\s/u.test(lines[index + 1] ?? "")
+		)
+			return true;
+		if (
+			/^\s*(?:[-*]\s*)?(?:\*\*)?(?:baseline|repair)\s+checks?\b[^:\n]{0,60}:/iu.test(
+				line,
+			) &&
+			!line.startsWith("- **Baseline checks:**") &&
+			!line.startsWith("- **Repair checks:**")
 		)
 			return true;
 		return false;
 	});
-	if (suspicious || declarations.length > 1 || setups.length > 1) {
+	if (
+		suspicious ||
+		declarations.length > 1 ||
+		setups.length > 1 ||
+		baselineDeclarations.length > 1 ||
+		repairDeclarations.length > 1
+	) {
 		throw new Error(
 			`Task ${taskId}: malformed or duplicate Quick checks declaration`,
 		);
@@ -47,7 +65,15 @@ export function parseQuickChecks(
 			throw new Error(
 				`Task ${taskId}: Quick check setup requires Quick checks`,
 			);
-		return { checks: [], setup: null, declared: false };
+		return reliabilityCheckFields(
+			{ checks: [], setup: null, declared: false },
+			block,
+			taskId,
+			type,
+			executor,
+			baselineDeclarations,
+			repairDeclarations,
+		);
 	}
 	const raw = declarations[0].slice("- **Quick checks:**".length).trim();
 	if (raw === "none") {
@@ -55,7 +81,15 @@ export function parseQuickChecks(
 			throw new Error(
 				`Task ${taskId}: Quick checks: none cannot declare setup`,
 			);
-		return { checks: [], setup: null, declared: true };
+		return reliabilityCheckFields(
+			{ checks: [], setup: null, declared: true },
+			block,
+			taskId,
+			type,
+			executor,
+			baselineDeclarations,
+			repairDeclarations,
+		);
 	}
 	if (type !== "implementation" || executor !== "switchyard")
 		throw new Error(
@@ -77,7 +111,71 @@ export function parseQuickChecks(
 				true,
 			)
 		: null;
-	return { checks, setup, declared: true };
+	return reliabilityCheckFields(
+		{ checks, setup, declared: true },
+		block,
+		taskId,
+		type,
+		executor,
+		baselineDeclarations,
+		repairDeclarations,
+	);
+}
+
+function reliabilityCheckFields(
+	quickChecks,
+	block,
+	taskId,
+	type,
+	executor,
+	baselineDeclarations,
+	repairDeclarations,
+) {
+	if (!baselineDeclarations.length && !repairDeclarations.length)
+		return quickChecks;
+	if (type !== "implementation" || executor !== "switchyard")
+		throw new Error(
+			`Task ${taskId}: Baseline checks and Repair checks require a switchyard implementation task`,
+		);
+	const parseList = (declaration, fieldName) => {
+		const raw = declaration.slice(`- **${fieldName}:**`.length).trim();
+		if (raw === "none")
+			throw new Error(`Task ${taskId}: invalid ${fieldName} declaration`);
+		const checks = raw
+			.split("; ")
+			.map((item) => parseCommand(item, taskId, false));
+		if (
+			!raw ||
+			checks.length > MAX_CHECKS ||
+			checks.some((item) => item === null)
+		)
+			throw new Error(`Task ${taskId}: invalid ${fieldName} declaration`);
+		return checks;
+	};
+	if (baselineDeclarations.length) {
+		quickChecks.baselineChecks = parseList(
+			baselineDeclarations[0],
+			"Baseline checks",
+		);
+	}
+	if (repairDeclarations.length) {
+		const repairChecks = parseList(repairDeclarations[0], "Repair checks");
+		if (
+			quickChecks.checks.length === 0 ||
+			repairChecks.some(
+				(repairCheck) =>
+					!quickChecks.checks.some(
+						(quickCheck) =>
+							JSON.stringify(quickCheck) === JSON.stringify(repairCheck),
+					),
+			)
+		)
+			throw new Error(
+				`Task ${taskId}: Repair checks must be a subset of Quick checks`,
+			);
+		quickChecks.repairChecks = repairChecks;
+	}
+	return quickChecks;
 }
 
 export function parseCommand(raw, taskId, setup) {

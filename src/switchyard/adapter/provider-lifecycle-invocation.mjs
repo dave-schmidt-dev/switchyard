@@ -1,3 +1,4 @@
+import { createProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import {
 	createMutationIntent,
 	executeMutation,
@@ -27,6 +28,45 @@ function truncateDiagnostic(value, maxChars = DEFAULT_DIAGNOSTIC_CHARS) {
 		? text
 		: `${text.slice(0, maxChars)}… (truncated)`;
 }
+function providerInvocationReliability(value, processResult) {
+	const cleanupFailed = value.cleanupFailed === true;
+	let causeCode = "unknown";
+	if (cleanupFailed) causeCode = "provider_cleanup_failed";
+	else if (value.cancelled === true) causeCode = "cancelled";
+	else if (value.timedOut === true) causeCode = "execution_timed_out";
+	else if (value.diagnosticCode === "execution_cancelled")
+		causeCode = "cancelled";
+	else if (
+		[
+			"auth_expired",
+			"quota_exhausted",
+			"model_unavailable",
+			"cli_usage_error",
+			"provider_signalled",
+			"execution_timed_out",
+		].includes(value.diagnosticCode) &&
+		["adapter", "launcher"].includes(value.diagnosticOrigin)
+	)
+		causeCode = value.diagnosticCode;
+	else if (value.diagnosticCode === "provider_exit_nonzero")
+		causeCode = "provider_exit_nonzero";
+	else if (value.diagnosticCode === "launch_failed")
+		causeCode = "provider_launch_failed";
+	else if (processResult.signal) causeCode = "provider_signalled";
+	else if (Number.isSafeInteger(processResult.code) && processResult.code !== 0)
+		causeCode = "provider_exit_nonzero";
+	return createProviderReliabilityDiagnostic({
+		causeCode,
+		phase: cleanupFailed ? "cleanup" : "provider",
+		exitCode: Number.isSafeInteger(value.exitCode)
+			? value.exitCode
+			: processResult.code,
+		signal: value.signal ?? processResult.signal,
+		timedOut: value.timedOut === true,
+		cancelled: value.cancelled === true,
+	});
+}
+
 export async function executeProviderInvocation(command, args, options = {}) {
 	const {
 		provider,
@@ -238,8 +278,13 @@ export async function executeProviderInvocation(command, args, options = {}) {
 				providerLifecycle: result.providerLifecycle,
 			});
 		}
+		const providerReliability =
+			value.success === true
+				? null
+				: providerInvocationReliability(value, result);
 		return {
 			...value,
+			...(providerReliability ? { providerReliability } : {}),
 			// Kept as an explicit false compatibility fact: silence is an
 			// observation, never a terminal outcome.
 			silenceTimedOut: false,

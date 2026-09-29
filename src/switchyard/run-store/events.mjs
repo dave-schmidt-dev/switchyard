@@ -7,6 +7,7 @@ import {
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
 import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
+import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import { sanitizeReviewResult } from "../diagnostics/review-result.mjs";
 import {
 	OUTCOME_EVENT_MAX_BYTES,
@@ -56,6 +57,14 @@ async function createEventInternal(
 		if (!routeHealthAuthorised)
 			throw new SchemaError("route health binding requires the host producer");
 		validateRouteHealthBinding(event.routeHealthBinding);
+	}
+	if (
+		event?.providerReliability !== undefined &&
+		!isProviderReliabilityDiagnostic(event.providerReliability)
+	) {
+		throw new SchemaError(
+			"event contains invalid provider reliability metadata",
+		);
 	}
 	if (
 		event?.invocationDescriptor !== undefined &&
@@ -177,6 +186,9 @@ async function createEventInternal(
 								diagnosticEvidenceAvailable,
 							}
 						: {}),
+					...(event.providerReliability !== undefined
+						? { providerReliability: event.providerReliability }
+						: {}),
 				}
 			: null;
 	const safeFailure = isFailureEvent
@@ -204,6 +216,7 @@ async function createEventInternal(
 					resolvedTargetId: event.resolvedTargetId,
 					descriptorIdentity: event.descriptorIdentity,
 					descriptorHarness: event.descriptorHarness,
+					providerReliability: event.providerReliability,
 				})
 		: null;
 	const projectedReviewResult =
