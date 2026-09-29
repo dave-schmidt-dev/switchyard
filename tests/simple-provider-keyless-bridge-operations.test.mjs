@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
 	formatOpenCodeGoBridgeDiagnostic,
-	MAX_CHAT_REQUESTS,
+	formatProxyRequestEvent,
 	parseBridgeArgs,
 	runBridge,
 	seatbeltProfile,
@@ -24,6 +24,28 @@ import {
 import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
 
 const SECRET = "synthetic-real-api-key-bridge-123456";
+test("proxy request event formatter emits only the bounded safe schema", () => {
+	const line = formatProxyRequestEvent({
+		sequence: 7,
+		elapsedMs: 23,
+		durationMs: 5,
+		outcome: "upstream_http_error",
+		httpStatus: 429,
+		upstreamStatus: 429,
+		model: "sensitive-model-name",
+		body: "sensitive-request-body",
+		nonce: "sensitive-nonce",
+	});
+	assert.equal(
+		line,
+		'SWITCHYARD_PROXY_REQUEST_V1 {"sequence":7,"elapsedMs":23,"durationMs":5,"outcome":"upstream_http_error","httpStatus":429,"upstreamStatus":429}\n',
+	);
+	assert.equal(line.includes("sensitive"), false);
+	assert.throws(
+		() => formatProxyRequestEvent({ sequence: 1, outcome: "untrusted" }),
+		/simple-provider-keyless-bridge: invalid proxy request event/u,
+	);
+});
 function setup() {
 	const root = join(
 		realpathSync(tmpdir()),
@@ -56,7 +78,35 @@ function post(port, path, nonce, model) {
 		body: JSON.stringify({ model }),
 	});
 }
+test("oversized request body has its own safe outcome", async () => {
+	const upstream = await localServer((request, response) => {
+		request.resume();
+		response.end("{}");
+	});
+	const events = [];
+	const proxy = await startProxy({
+		target: "opencode-go",
+		model: "opencode-go/deepseek-v4.1-flash",
+		secret: SECRET,
+		upstream: upstream.url,
+		onRequestEvent: (event) => events.push(event),
+	});
+	try {
+		await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${proxy.nonce}` },
+			body: "x".repeat(8 * 1024 * 1024 + 1),
+		}).catch(() => null);
+		assert.equal(events.length, 1);
+		assert.equal(events[0].outcome, "request_body_error");
+		assert.equal(events[0].upstreamStatus, null);
+	} finally {
+		await proxy.close();
+		await upstream.close();
+	}
+});
 test("proxy diagnostic counts chat requests, upstream statuses, and proxy rejections", async () => {
+	const events = [];
 	const upstream = await localServer((_request, response) => {
 		response.writeHead(429, { "content-type": "text/plain" });
 		response.end("synthetic-upstream-body-sentinel");
@@ -66,6 +116,7 @@ test("proxy diagnostic counts chat requests, upstream statuses, and proxy reject
 		model: "opencode-go/deepseek-v4.1-flash",
 		secret: SECRET,
 		upstream: upstream.url,
+		onRequestEvent: (event) => events.push(event),
 	});
 	try {
 		assert.equal(
@@ -87,6 +138,21 @@ test("proxy diagnostic counts chat requests, upstream statuses, and proxy reject
 			formatOpenCodeGoBridgeDiagnostic(proxy.getDiagnostic()),
 			"SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=1 upstream_status=0 proxy_rejections=1\n",
 		);
+		assert.equal(events.length, 1);
+		assert.deepEqual(
+			{
+				sequence: events[0].sequence,
+				outcome: events[0].outcome,
+				httpStatus: events[0].httpStatus,
+				upstreamStatus: events[0].upstreamStatus,
+			},
+			{
+				sequence: 1,
+				outcome: "request_auth_rejected",
+				httpStatus: 403,
+				upstreamStatus: null,
+			},
+		);
 		assert.equal(
 			(
 				await post(
@@ -102,6 +168,43 @@ test("proxy diagnostic counts chat requests, upstream statuses, and proxy reject
 			formatOpenCodeGoBridgeDiagnostic(proxy.getDiagnostic()),
 			"SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=2 upstream_status=429 proxy_rejections=1\n",
 		);
+		assert.equal(events.length, 2);
+		assert.deepEqual(
+			{
+				sequence: events[1].sequence,
+				outcome: events[1].outcome,
+				httpStatus: events[1].httpStatus,
+				upstreamStatus: events[1].upstreamStatus,
+			},
+			{
+				sequence: 2,
+				outcome: "upstream_http_error",
+				httpStatus: 429,
+				upstreamStatus: 429,
+			},
+		);
+		for (const event of events) {
+			assert.deepEqual(Object.keys(event).sort(), [
+				"durationMs",
+				"elapsedMs",
+				"httpStatus",
+				"outcome",
+				"sequence",
+				"upstreamStatus",
+			]);
+			assert.equal(Number.isInteger(event.elapsedMs), true);
+			assert.equal(Number.isInteger(event.durationMs), true);
+			assert.equal(JSON.stringify(event).includes(SECRET), false);
+			assert.equal(JSON.stringify(event).includes(proxy.nonce), false);
+			assert.equal(
+				JSON.stringify(event).includes("deepseek-v4.1-flash"),
+				false,
+			);
+			assert.equal(
+				JSON.stringify(event).includes("synthetic-upstream-body-sentinel"),
+				false,
+			);
+		}
 	} finally {
 		await proxy.close();
 		await upstream.close();
@@ -154,6 +257,7 @@ test("OpenCode Go failures expose numeric proxy diagnostics without CLI output",
 		},
 	]) {
 		const item = setup();
+		const bridgeStderr = [];
 		let upstreamCalls = 0;
 		const upstream = await localServer((_request, response) => {
 			upstreamCalls += 1;
@@ -187,22 +291,76 @@ process.exit(1);
 			{ mode: 0o755 },
 		);
 		try {
-			const result = await runBridge({
-				target: "opencode-go",
-				model: "opencode-go/deepseek-v4.1-flash",
-				variant: "low",
-				worktree: item.worktree,
-				prompt: "synthetic diagnostic prompt",
-				secret: SECRET,
-				cliPath: fake,
-				upstream: upstream.url,
-				timeoutMs: 5_000,
-			});
+			const originalStderrWrite = process.stderr.write;
+			process.stderr.write = (chunk, encoding, callback) => {
+				bridgeStderr.push(
+					Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk),
+				);
+				if (typeof encoding === "function") encoding();
+				else if (typeof callback === "function") callback();
+				return true;
+			};
+			let result;
+			try {
+				result = await runBridge({
+					target: "opencode-go",
+					model: "opencode-go/deepseek-v4.1-flash",
+					variant: "low",
+					worktree: item.worktree,
+					prompt: "synthetic diagnostic prompt",
+					secret: SECRET,
+					cliPath: fake,
+					upstream: upstream.url,
+					timeoutMs: 5_000,
+				});
+			} finally {
+				process.stderr.write = originalStderrWrite;
+			}
 			assert.equal(result.code, 1, scenario.name);
 			assert.equal(result.stdout, scenario.expected, scenario.name);
 			assert.equal(result.stderr, "", scenario.name);
 			assert.equal(result.stdout.includes("sentinel"), false, scenario.name);
 			assert.equal(result.stderr.includes("sentinel"), false, scenario.name);
+			const requestLines = bridgeStderr
+				.join("")
+				.split("\n")
+				.filter((line) => line.startsWith("SWITCHYARD_PROXY_REQUEST_V1 "));
+			assert.equal(
+				requestLines.length,
+				scenario.request ? 1 : 0,
+				scenario.name,
+			);
+			const endLines = bridgeStderr
+				.join("")
+				.split("\n")
+				.filter((line) => line.startsWith("SWITCHYARD_PROXY_END_V1 "));
+			assert.equal(endLines.length, 1, scenario.name);
+			assert.deepEqual(
+				JSON.parse(endLines[0].slice("SWITCHYARD_PROXY_END_V1 ".length)),
+				{ requests: scenario.request ? 1 : 0 },
+			);
+			if (requestLines.length === 1) {
+				const event = JSON.parse(
+					requestLines[0].slice("SWITCHYARD_PROXY_REQUEST_V1 ".length),
+				);
+				assert.equal(
+					event.outcome,
+					scenario.rejectRequest
+						? "request_auth_rejected"
+						: "upstream_http_error",
+				);
+				assert.equal(event.httpStatus, scenario.rejectRequest ? 403 : 429);
+				assert.equal(event.upstreamStatus, scenario.rejectRequest ? null : 429);
+				assert.equal(JSON.stringify(event).includes(SECRET), false);
+				assert.equal(
+					JSON.stringify(event).includes("deepseek-v4.1-flash"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(event).includes("synthetic-upstream-body-sentinel"),
+					false,
+				);
+			}
 			assert.equal(
 				upstreamCalls,
 				scenario.name === "upstream error" ? 1 : 0,

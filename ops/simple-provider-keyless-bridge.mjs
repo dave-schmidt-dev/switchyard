@@ -20,6 +20,7 @@ import {
 import http from "node:http";
 import https from "node:https";
 import { dirname, join, resolve, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 const SELF = fileURLToPath(import.meta.url);
@@ -33,7 +34,6 @@ const MAX_PROMPT = 256 * 1024;
 const MAX_BODY = 8 * 1024 * 1024;
 const MAX_OUTPUT = 8 * 1024 * 1024;
 const MAX_WAIT_MS = 30 * 60 * 1000;
-export const MAX_CHAT_REQUESTS = 64;
 const MODELS = Object.freeze({
 	"glm-5-3-medium": {
 		target: "vibe",
@@ -49,6 +49,24 @@ const UPSTREAM = Object.freeze({
 	vibe: "https://api.mistral.ai/v1/chat/completions",
 	"opencode-go": "https://opencode.ai/zen/go/v1/chat/completions",
 });
+const PROXY_REQUEST_OUTCOMES = new Set([
+	"request_method_rejected",
+	"request_route_rejected",
+	"request_auth_rejected",
+	"request_host_rejected",
+	"request_body_error",
+	"invalid_json",
+	"model_rejected",
+	"upstream_redirect_rejected",
+	"upstream_http_success",
+	"upstream_http_error",
+	"upstream_response_too_large",
+	"upstream_response_error",
+	"upstream_timeout",
+	"upstream_connection_error",
+	"client_disconnected",
+	"proxy_internal_error",
+]);
 // biome-ignore lint/complexity/useRegexLiterals: control-byte grammar is easier to audit as string data.
 const TERMINAL_ESCAPE_PATTERN = new RegExp(
 	String.raw`\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_][^\x1b]*(?:\x1b\\)|\[[0-?]*[ -/]*[@-~]|.)`,
@@ -182,13 +200,14 @@ function reject(response, code) {
 	response.writeHead(code, { "content-type": "text/plain" });
 	response.end("proxy request rejected\n");
 }
-function readBody(request) {
+function readBody(request, onLimit) {
 	return new Promise((resolveBody, rejectBody) => {
 		const chunks = [];
 		let size = 0;
 		request.on("data", (chunk) => {
 			size += chunk.length;
 			if (size > MAX_BODY) {
+				onLimit?.();
 				request.destroy();
 				rejectBody(new Error("body too large"));
 			} else chunks.push(chunk);
@@ -199,6 +218,34 @@ function readBody(request) {
 }
 function redactBuffer(buffer, secret) {
 	return Buffer.from(buffer.toString("utf8").split(secret).join("[redacted]"));
+}
+export function formatProxyRequestEvent(event) {
+	const validStatus = (status) =>
+		status === null ||
+		(Number.isInteger(status) && status >= 100 && status <= 599);
+	if (
+		!event ||
+		typeof event !== "object" ||
+		!Number.isSafeInteger(event.sequence) ||
+		event.sequence < 1 ||
+		!Number.isSafeInteger(event.elapsedMs) ||
+		event.elapsedMs < 0 ||
+		!Number.isSafeInteger(event.durationMs) ||
+		event.durationMs < 0 ||
+		!PROXY_REQUEST_OUTCOMES.has(event.outcome) ||
+		!validStatus(event.httpStatus) ||
+		!validStatus(event.upstreamStatus)
+	)
+		fail("invalid proxy request event");
+	const safeEvent = {
+		sequence: event.sequence,
+		elapsedMs: event.elapsedMs,
+		durationMs: event.durationMs,
+		outcome: event.outcome,
+		httpStatus: event.httpStatus,
+		upstreamStatus: event.upstreamStatus,
+	};
+	return `SWITCHYARD_PROXY_REQUEST_V1 ${JSON.stringify(safeEvent)}\n`;
 }
 export function formatOpenCodeGoBridgeDiagnostic({
 	chatRequestCount = 0,
@@ -220,9 +267,12 @@ export async function startProxy({
 	model,
 	secret,
 	upstream = UPSTREAM[target],
+	onRequestEvent,
 }) {
 	if (!UPSTREAM[target] || !MODELS[model] || MODELS[model].target !== target)
 		fail("invalid proxy target");
+	if (onRequestEvent !== undefined && typeof onRequestEvent !== "function")
+		fail("request event callback must be a function");
 	const nonce = randomBytes(32).toString("hex");
 	const upstreamUrl = new URL(upstream);
 	if (!["https:", "http:"].includes(upstreamUrl.protocol))
@@ -237,48 +287,100 @@ export async function startProxy({
 	)
 		fail("upstream URL contains unsupported components");
 	const inflight = new Set();
+	const proxyStartedAt = performance.now();
 	let chatRequestCount = 0;
-	let admittedChatRequests = 0;
+	let requestSequence = 0;
 	let lastUpstreamStatus = 0;
 	let proxyRejectionCount = 0;
 	const incrementDiagnosticCount = (current) => Math.min(current + 1, 999999);
 	const server = http.createServer(async (request, response) => {
+		const requestStartedAt = performance.now();
+		const sequence = ++requestSequence;
+		let upstreamStatus = null;
+		let finalized = false;
+		let outbound;
+		let oversizedUpstreamResponse = false;
+		let requestBodyTooLarge = false;
+		const finishRequest = (outcome) => {
+			if (finalized) return false;
+			finalized = true;
+			if (onRequestEvent) {
+				const endedAt = performance.now();
+				const httpStatus = response.headersSent ? response.statusCode : null;
+				const event = {
+					sequence,
+					elapsedMs: Math.max(0, Math.round(endedAt - proxyStartedAt)),
+					durationMs: Math.max(0, Math.round(endedAt - requestStartedAt)),
+					outcome,
+					httpStatus:
+						Number.isInteger(httpStatus) &&
+						httpStatus >= 100 &&
+						httpStatus <= 599
+							? httpStatus
+							: null,
+					upstreamStatus,
+				};
+				try {
+					onRequestEvent(event);
+				} catch {
+					// Observability callbacks must not change request handling.
+				}
+			}
+			return true;
+		};
+		const rejectRequest = (status, outcome) => {
+			if (finalized || response.destroyed) return false;
+			proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
+			reject(response, status);
+			return finishRequest(outcome);
+		};
+		response.once("close", () => {
+			if (!response.writableFinished) {
+				finishRequest(
+					requestBodyTooLarge ? "request_body_error" : "client_disconnected",
+				);
+				outbound?.destroy();
+			}
+		});
 		try {
 			if (request.url === "/v1/chat/completions") {
 				chatRequestCount = incrementDiagnosticCount(chatRequestCount);
 			}
-			if (
-				request.method !== "POST" ||
-				request.url !== "/v1/chat/completions" ||
-				!constantTimeEquals(request.headers.authorization, `Bearer ${nonce}`) ||
-				request.headers.host !== `127.0.0.1:${server.address().port}`
-			) {
-				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-				return reject(response, 403);
+			let rejectedRequestOutcome = null;
+			if (request.method !== "POST")
+				rejectedRequestOutcome = "request_method_rejected";
+			else if (request.url !== "/v1/chat/completions")
+				rejectedRequestOutcome = "request_route_rejected";
+			else if (
+				!constantTimeEquals(request.headers.authorization, `Bearer ${nonce}`)
+			)
+				rejectedRequestOutcome = "request_auth_rejected";
+			else if (request.headers.host !== `127.0.0.1:${server.address().port}`)
+				rejectedRequestOutcome = "request_host_rejected";
+			if (rejectedRequestOutcome) {
+				return rejectRequest(403, rejectedRequestOutcome);
 			}
-			const body = await readBody(request);
+			let body;
+			try {
+				body = await readBody(request, () => {
+					requestBodyTooLarge = true;
+				});
+			} catch {
+				return rejectRequest(400, "request_body_error");
+			}
 			let document;
 			try {
 				document = JSON.parse(body.toString("utf8"));
 			} catch {
-				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-				return reject(response, 400);
+				return rejectRequest(400, "invalid_json");
 			}
 			if (
 				!document ||
 				Array.isArray(document) ||
 				document.model !== MODELS[model].upstreamModel
 			) {
-				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-				return reject(response, 403);
+				return rejectRequest(403, "model_rejected");
 			}
-			// This check and increment run in one event-loop turn, so concurrent
-			// authenticated requests cannot cross the per-run funding bound.
-			if (admittedChatRequests >= MAX_CHAT_REQUESTS) {
-				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-				return reject(response, 429);
-			}
-			admittedChatRequests += 1;
 			const transport = upstreamUrl.protocol === "https:" ? https : http;
 			// Preserve only the two client identity fields required by OpenCode Go.
 			// Node has already parsed headers; bound values again before forwarding.
@@ -299,7 +401,8 @@ export async function startProxy({
 								: {}),
 						}
 					: {};
-			const outbound = transport.request(
+			let outboundTimedOut = false;
+			outbound = transport.request(
 				upstreamUrl,
 				{
 					method: "POST",
@@ -316,6 +419,16 @@ export async function startProxy({
 					timeout: 120_000,
 				},
 				(upstreamResponse) => {
+					if (finalized || response.destroyed) {
+						upstreamResponse.resume();
+						return;
+					}
+					upstreamStatus =
+						Number.isInteger(upstreamResponse.statusCode) &&
+						upstreamResponse.statusCode >= 100 &&
+						upstreamResponse.statusCode <= 599
+							? upstreamResponse.statusCode
+							: null;
 					lastUpstreamStatus =
 						Number.isInteger(upstreamResponse.statusCode) &&
 						upstreamResponse.statusCode >= 100 &&
@@ -328,8 +441,7 @@ export async function startProxy({
 						(upstreamResponse.statusCode ?? 500) < 400
 					) {
 						upstreamResponse.resume();
-						proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-						return reject(response, 502);
+						return rejectRequest(502, "upstream_redirect_rejected");
 					}
 					const headers = {
 						"content-type":
@@ -338,41 +450,68 @@ export async function startProxy({
 					const pieces = [];
 					let size = 0;
 					upstreamResponse.on("data", (chunk) => {
+						if (finalized || response.destroyed) {
+							upstreamResponse.destroy();
+							return;
+						}
 						size += chunk.length;
-						if (size > MAX_BODY)
+						if (size > MAX_BODY) {
+							oversizedUpstreamResponse = true;
 							upstreamResponse.destroy(new Error("response too large"));
-						else pieces.push(chunk);
+						} else pieces.push(chunk);
 					});
 					upstreamResponse.on("end", () => {
-						response.writeHead(upstreamResponse.statusCode ?? 502, headers);
+						if (finalized || response.destroyed) return;
+						const status = upstreamResponse.statusCode ?? 502;
+						response.writeHead(status, headers);
 						response.end(redactBuffer(Buffer.concat(pieces), secret));
+						finishRequest(
+							status >= 200 && status < 300
+								? "upstream_http_success"
+								: "upstream_http_error",
+						);
 					});
 					upstreamResponse.on("error", () => {
+						const outcome = oversizedUpstreamResponse
+							? "upstream_response_too_large"
+							: "upstream_response_error";
+						if (finalized || response.destroyed) return;
 						if (!response.headersSent) {
-							proxyRejectionCount =
-								incrementDiagnosticCount(proxyRejectionCount);
-							reject(response, 502);
-						} else response.destroy();
+							rejectRequest(502, outcome);
+						} else {
+							finishRequest(outcome);
+							response.destroy();
+						}
 					});
 				},
 			);
 			inflight.add(outbound);
 			outbound.once("close", () => inflight.delete(outbound));
-			outbound.on("timeout", () =>
-				outbound.destroy(new Error("upstream timeout")),
-			);
+			outbound.on("timeout", () => {
+				outboundTimedOut = true;
+				outbound.destroy(new Error("upstream timeout"));
+			});
 			outbound.on("error", () => {
+				if (finalized || response.destroyed) return;
+				const outcome = outboundTimedOut
+					? "upstream_timeout"
+					: "upstream_connection_error";
 				if (!response.headersSent) {
-					proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-					reject(response, 502);
-				} else response.destroy();
+					rejectRequest(502, outcome);
+				} else {
+					finishRequest(outcome);
+					response.destroy();
+				}
 			});
 			outbound.end(body);
 		} catch {
+			if (finalized || response.destroyed) return;
 			if (!response.headersSent) {
-				proxyRejectionCount = incrementDiagnosticCount(proxyRejectionCount);
-				reject(response, 400);
-			} else response.destroy();
+				rejectRequest(400, "proxy_internal_error");
+			} else {
+				finishRequest("proxy_internal_error");
+				response.destroy();
+			}
 		}
 	});
 	await new Promise((resolveListen, rejectListen) => {
@@ -388,6 +527,7 @@ export async function startProxy({
 			lastUpstreamStatus,
 			proxyRejectionCount,
 		}),
+		getRequestCount: () => requestSequence,
 		close: () => {
 			for (const request of inflight) request.destroy();
 			server.closeAllConnections();
@@ -524,7 +664,15 @@ export async function runBridge({
 	let child;
 	let interrupted = false;
 	try {
-		proxy = await startProxy({ target, model, secret, upstream });
+		proxy = await startProxy({
+			target,
+			model,
+			secret,
+			upstream,
+			onRequestEvent: (event) => {
+				process.stderr.write(formatProxyRequestEvent(event));
+			},
+		});
 		const profile = seatbeltProfile({
 			worktree,
 			runtime,
@@ -692,7 +840,12 @@ export async function runBridge({
 		};
 	} finally {
 		const stopped = await settleGroup(child);
-		if (proxy) await proxy.close();
+		if (proxy) {
+			await proxy.close();
+			process.stderr.write(
+				`SWITCHYARD_PROXY_END_V1 ${JSON.stringify({ requests: proxy.getRequestCount() })}\n`,
+			);
+		}
 		rmSync(runtime, { recursive: true, force: true });
 		if (!stopped) fail("provider process group did not stop");
 	}

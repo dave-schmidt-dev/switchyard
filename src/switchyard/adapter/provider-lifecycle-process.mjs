@@ -48,6 +48,7 @@ export function runProviderProcess(command, args, options = {}) {
 		cleanup,
 		signal,
 		onPoll,
+		onStderrChunk,
 		now = Date.now,
 		setTimeoutFn = setTimeout,
 		clearTimeoutFn = clearTimeout,
@@ -323,6 +324,11 @@ export function runProviderProcess(command, args, options = {}) {
 		});
 		child.stderr?.on?.("data", (chunk) => {
 			stderr = appendBounded(stderr, chunk, maxBuffer);
+			try {
+				onStderrChunk?.(chunk);
+			} catch {
+				// Diagnostic consumers must not alter provider execution.
+			}
 			emitProgress(true);
 		});
 		child.once?.("error", (error) => {

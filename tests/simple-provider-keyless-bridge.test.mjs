@@ -15,7 +15,6 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
 	formatOpenCodeGoBridgeDiagnostic,
-	MAX_CHAT_REQUESTS,
 	parseBridgeArgs,
 	runBridge,
 	seatbeltProfile,
@@ -65,8 +64,10 @@ test("Seatbelt grants no broad host preferences or etc read", () => {
 	assert.equal(profile.includes('(subpath "/private/etc")'), false);
 	assert.equal(profile.includes('(subpath "/Library/Preferences")'), false);
 });
-test("proxy admits at most the fixed request budget across concurrent calls", async () => {
+test("proxy admits concurrent calls beyond the former fixed request budget", async () => {
+	const requestCount = 72;
 	let upstreamCalls = 0;
+	const events = [];
 	const upstream = await localServer((request, response) => {
 		upstreamCalls += 1;
 		request.resume();
@@ -78,10 +79,11 @@ test("proxy admits at most the fixed request budget across concurrent calls", as
 		model: "opencode-go/deepseek-v4.1-flash",
 		secret: SECRET,
 		upstream: upstream.url,
+		onRequestEvent: (event) => events.push(event),
 	});
 	try {
 		const responses = await Promise.all(
-			Array.from({ length: MAX_CHAT_REQUESTS + 8 }, () =>
+			Array.from({ length: requestCount }, () =>
 				post(
 					proxy.port,
 					"/v1/chat/completions",
@@ -90,15 +92,30 @@ test("proxy admits at most the fixed request budget across concurrent calls", as
 				),
 			),
 		);
+		await Promise.all(responses.map((response) => response.arrayBuffer()));
 		assert.equal(
 			responses.filter((response) => response.status === 200).length,
-			MAX_CHAT_REQUESTS,
+			requestCount,
 		);
 		assert.equal(
 			responses.filter((response) => response.status === 429).length,
-			8,
+			0,
 		);
-		assert.equal(upstreamCalls, MAX_CHAT_REQUESTS);
+		assert.equal(upstreamCalls, requestCount);
+		assert.equal(events.length, requestCount);
+		assert.equal(
+			new Set(events.map((event) => event.sequence)).size,
+			requestCount,
+		);
+		assert.equal(
+			events.every(
+				(event) =>
+					event.outcome === "upstream_http_success" &&
+					event.httpStatus === 200 &&
+					event.upstreamStatus === 200,
+			),
+			true,
+		);
 	} finally {
 		await proxy.close();
 		await upstream.close();

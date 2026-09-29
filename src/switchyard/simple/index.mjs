@@ -38,6 +38,7 @@ import { route } from "../router/index.mjs";
 import {
 	acquireProjectLock,
 	createEvent,
+	getRunRoot,
 	initializeRun,
 	isProjectLockOwnedBy,
 	releaseProjectLockIfOwnedBy,
@@ -51,6 +52,7 @@ import {
 	createSimpleProviderReliabilityDiagnostic,
 } from "./reliability.mjs";
 import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
+import { createBridgeRequestRecorder } from "./request-evidence.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
@@ -983,39 +985,59 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail("route_health_blocked", "route");
 		const providerHealthTracked = providerHealthStart.tracked === true;
 		writerLifecycle = "unavailable";
-		const providerResult = await executeProvider({
-			targetId,
-			harness,
-			descriptor,
-			capability: options.capability,
-			prompt: guardedPrompt,
-			worktreePath,
-			timeoutMs: executionBudget,
-			signal,
-			onProgress: () => {
-				const progressObservedAt = now();
-				if (
-					!firstChangeObserved &&
-					progressObservedAt - lastFirstChangeProbeAt >=
-						FIRST_CHANGE_PROBE_INTERVAL_MS
-				) {
-					lastFirstChangeProbeAt = progressObservedAt;
-					const observed = git(worktreePath, [
-						"status",
-						"--porcelain=v1",
-						"--untracked-files=all",
-						"--",
-						...options.files,
-					]);
-					if (observed.status === 0 && observed.stdout.length > 0) {
-						firstChangeObserved = true;
-						milestone("execute", "first_change_observed");
-						return;
+		let requestRecorder = null;
+		if (
+			executeProvider === defaultExecuteProvider &&
+			(harness === "opencode" || harness === "vibe")
+		) {
+			try {
+				requestRecorder = createBridgeRequestRecorder(
+					join(getRunRoot(runId), "provider-requests.jsonl"),
+				);
+			} catch {
+				return fail("request_log_open_failed", "execute");
+			}
+		}
+		let providerResult;
+		let requestLogStatus;
+		try {
+			providerResult = await executeProvider({
+				targetId,
+				harness,
+				descriptor,
+				capability: options.capability,
+				prompt: guardedPrompt,
+				worktreePath,
+				timeoutMs: executionBudget,
+				signal,
+				onStderrChunk: requestRecorder?.accept,
+				onProgress: () => {
+					const progressObservedAt = now();
+					if (
+						!firstChangeObserved &&
+						progressObservedAt - lastFirstChangeProbeAt >=
+							FIRST_CHANGE_PROBE_INTERVAL_MS
+					) {
+						lastFirstChangeProbeAt = progressObservedAt;
+						const observed = git(worktreePath, [
+							"status",
+							"--porcelain=v1",
+							"--untracked-files=all",
+							"--",
+							...options.files,
+						]);
+						if (observed.status === 0 && observed.stdout.length > 0) {
+							firstChangeObserved = true;
+							milestone("execute", "first_change_observed");
+							return;
+						}
 					}
-				}
-				heartbeat("execute", { processPhase: "provider_running" });
-			},
-		});
+					heartbeat("execute", { processPhase: "provider_running" });
+				},
+			});
+		} finally {
+			requestLogStatus = requestRecorder?.close();
+		}
 		providerExecutionResult = providerResult;
 		providerLifecycle = boundProviderLifecycleSnapshot(
 			providerResult?.providerLifecycle,
@@ -1051,6 +1073,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		const providerAttemptSettled =
 			!providerHealthTracked || providerHealthTerminal.settled === true;
+		if (requestLogStatus?.error) return fail(requestLogStatus.error, "execute");
 
 		if (signal?.aborted) return failForSignal("execute");
 		if (

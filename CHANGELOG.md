@@ -13,6 +13,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- Removed the local Vibe and OpenCode Go bridge's 64-request ceiling and added durable, content-free outcome records for each proxy request.
+
 - Simple routing runs now retain failed-target exclusions across tasks in the same project/run, preventing repeated attempts against a failed target.
 
 ### Changed

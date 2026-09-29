@@ -15,7 +15,6 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
 	formatOpenCodeGoBridgeDiagnostic,
-	MAX_CHAT_REQUESTS,
 	parseBridgeArgs,
 	runBridge,
 	seatbeltProfile,

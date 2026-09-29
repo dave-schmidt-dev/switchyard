@@ -248,6 +248,7 @@ export async function defaultExecuteProvider(context) {
 		maxBuffer: MAX_CAPTURE_BYTES,
 		progressStage: "running",
 		onPoll: () => context.onProgress?.(),
+		onStderrChunk: context.onStderrChunk,
 		signal: context.signal,
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
