@@ -9,7 +9,6 @@ import {
 	VIBE_CMD,
 	VIBE_HELPER_ATTEMPTS,
 	VIBE_HOME_PATH,
-	VIBE_MAX_TURNS,
 	VIBE_MODELS,
 } from "./vibe-config.mjs";
 
@@ -42,8 +41,6 @@ function buildExecution(workspaceId, prompt, options) {
 				"--output",
 				"streaming",
 				"--trust",
-				"--max-turns",
-				VIBE_MAX_TURNS,
 			],
 			env: [`VIBE_HOME=${VIBE_HOME_PATH}`, `VIBE_ACTIVE_MODEL=${selector}`],
 		}),

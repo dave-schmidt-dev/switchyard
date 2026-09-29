@@ -723,8 +723,6 @@ export async function runBridge({
 				"--trust",
 				"--workdir",
 				worktree,
-				"--max-turns",
-				"12",
 				"--output",
 				"json",
 			];

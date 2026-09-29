@@ -71,14 +71,13 @@ describe("Vibe adapter", () => {
 		]);
 		deepStrictEqual(request.argv.slice(0, 2), ["vibe", "-p"]);
 		ok(request.argv[2].includes("change one file"));
-		deepStrictEqual(request.argv.slice(-6), [
+		deepStrictEqual(request.argv.slice(-4), [
 			"--auto-approve",
 			"--output",
 			"streaming",
 			"--trust",
-			"--max-turns",
-			"12",
 		]);
+		ok(!request.argv.includes("--max-turns"));
 		ok(request.argv.includes("--auto-approve"));
 		ok(request.argv.includes("--trust"));
 	});

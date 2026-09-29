@@ -33,7 +33,6 @@ export function renderVibeConfig(selector) {
 	}
 	return `${lines.join("\n")}\n`;
 }
-const VIBE_MAX_TURNS = "12";
 const SERVED_MODEL_TIMEOUT_MS = 60_000;
 function lifecycleClockOptions(options) {
 	return Object.fromEntries(
@@ -175,5 +174,4 @@ export {
 	servedModelFailure,
 	VIBE_CMD,
 	VIBE_HELPER_ATTEMPTS,
-	VIBE_MAX_TURNS,
 };

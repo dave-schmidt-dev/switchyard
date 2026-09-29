@@ -577,8 +577,6 @@ fi
 				"--trust",
 				"--workdir",
 				item.worktree,
-				"--max-turns",
-				"12",
 				"--output",
 				"json",
 			],
