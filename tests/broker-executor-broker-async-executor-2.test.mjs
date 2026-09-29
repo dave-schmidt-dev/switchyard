@@ -82,7 +82,39 @@ describe("broker async executor", () => {
 	});
 
 	it("forwards every broker field the runner reads off the result", async () => {
-		const runnerSource = sourceText("src/switchyard/runner/index.mjs");
+		const runnerSource = sourceText(
+			new URL("../src/switchyard/runner/index.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/constants.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/checkpoint-errors.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/runner/task-fields.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/task-queue.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/ledger-reporting.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/review-results.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/quick-checks.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/checkpoint-store.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/checkpoint-load.mjs", import.meta.url),
+			new URL(
+				"../src/switchyard/runner/reconciliation-intent.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/reconciliation-validate.mjs",
+				import.meta.url,
+			),
+			new URL(
+				"../src/switchyard/runner/external-completion.mjs",
+				import.meta.url,
+			),
+			new URL("../src/switchyard/runner/artifacts.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/queue-selection.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/caller-inputs.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/task-routing.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/route-health.mjs", import.meta.url),
+			new URL("../src/switchyard/runner/task-base.mjs", import.meta.url),
+		);
 		const readFields = new Set(
 			Array.from(
 				runnerSource.matchAll(/brokerExecution\.([A-Za-z_][A-Za-z0-9_]*)/g),
