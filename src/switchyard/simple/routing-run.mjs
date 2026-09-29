@@ -72,7 +72,7 @@ function lifecycle(result, pending, record, project, options) {
 		record.resolvedTargetId !== pending.targetId ||
 		record.state !== result.status ||
 		(result.status === "failed" &&
-			record.lastFailure?.result !== result.failureReason)
+			record.lastFailure?.errorKind !== result.errorKind)
 	)
 		return false;
 	if (cleanup.worktree.state === "not_created")

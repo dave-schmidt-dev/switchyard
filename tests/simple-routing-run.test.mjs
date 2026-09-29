@@ -113,7 +113,16 @@ function fixture(overrides = {}) {
 			resolvedTargetId: targetId,
 			state: status,
 			cleanupState: "complete",
-			lastFailure: { result: result.failureReason },
+			// Real run records persist sanitized metadata, never the raw result.
+			lastFailure:
+				status === "failed"
+					? {
+							errorKind: result.errorKind,
+							reasonCode: result.errorKind,
+							reason:
+								"Provider execution failed before a reviewed integration.",
+						}
+					: null,
 			worktree: { state: worktree, writerStopped: true },
 			...behavior.record,
 		});
