@@ -355,7 +355,10 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 });
 describe("retention sweep call sites (Task 6.5)", () => {
 	const CALL_SITES = [
-		["dispatch/index.mjs", DISPATCH_PATH],
+		[
+			"dispatch/run-dispatch.mjs",
+			resolve(dirname(DISPATCH_PATH), "run-dispatch.mjs"),
+		],
 		[
 			"dispatch/worker-bootstrap.mjs",
 			resolve(dirname(DISPATCH_PATH), "worker-bootstrap.mjs"),

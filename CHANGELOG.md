@@ -8,6 +8,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Split dispatch arguments, handlers, execution, launch, status/results, recovery, and collection into bounded modules while preserving the CLI API.
+
 - Split run persistence, receipts, events, locks, evidence, checkpoints, and retention into bounded modules while preserving the run-store API.
 
 - Split source modules around error classification, authentication, integration validation, routing, lifecycle overlays, roster descriptors, and orphan scanning while preserving public entrypoints.

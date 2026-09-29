@@ -1,9 +1,10 @@
 import { ok, strictEqual } from "node:assert";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
+	DISPATCH_PATH,
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
 } from "./helpers/dispatch-cli-fixtures.mjs";
@@ -47,6 +48,16 @@ afterEach(() => {
 	});
 });
 describe("CLI exit code contract", () => {
+	it("direct executable --version preserves the CLI entrypoint", () => {
+		const result = spawnSync(DISPATCH_PATH, ["--version"], {
+			encoding: "utf8",
+			timeout: 10_000,
+		});
+
+		strictEqual(result.status, 0);
+		ok(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\n?$/.test(result.stdout));
+	});
+
 	it("exit 0: launch success", () => {
 		const result = runDispatch(
 			["launch", tasksFile, "--project", projectDir],
