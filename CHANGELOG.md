@@ -4,9 +4,11 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ## [Unreleased]
 
-- Partition the remaining contract test families into bounded files while preserving registrations, scoped hooks, runtime leaf results and incident mutation coverage.
+## [0.2.2] - 2026-09-28
 
 ### Changed
+
+- Partition the remaining contract test families into bounded files while preserving registrations, scoped hooks, runtime leaf results and incident mutation coverage.
 
 - Partition the production runner into 44 ownership modules while retaining its public queue facade API.
 

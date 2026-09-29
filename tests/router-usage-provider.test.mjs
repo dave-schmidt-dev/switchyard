@@ -113,8 +113,8 @@ describe("target -> usage_provider mapping (INV-4, Task 1.5b)", () => {
 // design. Keeping it green by deleting only that guard would have left four
 // vacuous assertions that look like coverage.
 //
-// The behavioural lock survives and is the one that mattered: tests/router.test.mjs
-// ("keeps --only-provider codex on the incumbent target ...") drives the real
+// The behavioural lock survives and is the one that mattered: the split router suites
+// ("keeps --only-provider codex on the incumbent target ...") drive the real
 // providerMatches() through route({only}) against a fixture roster it builds
 // with both targets enabled. That is fixture-based, so it still guards the code
 // path if a second codex-harness target is ever added again.

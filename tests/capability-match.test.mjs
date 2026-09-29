@@ -12,7 +12,7 @@
 // ~/.agent/roster.json, and never a hardcoded production model id.
 //
 // Relationship to sibling test files (no accidental duplicate coverage):
-//   - tests/roster-loader.test.mjs (Task 1.5) exercises the LOADER itself:
+//   - the split roster-loader suites (Task 1.5) exercise the LOADER itself:
 //     fail-loud path resolution, malformed/missing roster, and that every
 //     preserved export is roster-backed rather than static.
 //   - tests/router-rightsizing.test.mjs (Task 1.6) exercises route() END TO

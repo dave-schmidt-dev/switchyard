@@ -712,7 +712,7 @@ The host-side runner parses markdown task queues and dispatches tasks serially t
 
 An exit 255 from the Parallels transport is not a provider result. Both synchronous and asynchronous legacy VM execution reconcile it only from a bounded five-field sidecar bound to the exact attempt by its derived path and a fresh UUID token. Confirmed code 0 or nonzero is returned without replaying the provider; missing, stale, malformed, oversized, or mismatched evidence remains explicitly uncertain. Sidecar removal is reported as removed or uncertain and never changes the recovered provider result.
 
-The current package release is `0.2.1`. Check the installed dispatcher version with `/Users/dave/.agent/bin/switchyard-dispatch --version` (or `node src/switchyard/dispatch/index.mjs --version`); it prints the semantic version and exits successfully without requiring a project or provider configuration. Automation uses the absolute installed launcher path so shell `PATH` configuration cannot turn a valid invocation into `command not found`; this path alone does not establish installed/source byte parity.
+The current package release is `0.2.2`. Check the installed dispatcher version with `/Users/dave/.agent/bin/switchyard-dispatch --version` (or `node src/switchyard/dispatch/index.mjs --version`); it prints the semantic version and exits successfully without requiring a project or provider configuration. Automation uses the absolute installed launcher path so shell `PATH` configuration cannot turn a valid invocation into `command not found`; this path alone does not establish installed/source byte parity.
 
 Validate caller-owned inputs before every synchronous or detached dispatch:
 

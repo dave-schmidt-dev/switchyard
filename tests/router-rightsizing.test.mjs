@@ -13,7 +13,7 @@
 //      headroom (so the capability filter, not the spread, decides eligibility).
 //
 // It reads the committed fixture (never the real ~/.agent/roster.json) and an
-// isolated per-process temp snapshot, mirroring tests/router.test.mjs.
+// isolated per-process temp snapshot, mirroring the split router suites.
 
 import { strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";

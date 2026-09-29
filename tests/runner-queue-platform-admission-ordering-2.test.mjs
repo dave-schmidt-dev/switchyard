@@ -308,7 +308,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 						// This used to be "claude" on the premise that the default
 						// allowlist excluded it; claude-code was verified on
 						// 2026-09-18 and the premise died. The allowlist gate itself
-						// is covered in tests/router.test.mjs by the case that
+						// is covered in the split router suites by the case that
 						// injects `goldenImageVerifiedProviders`.
 						adapters: { [UNVERIFIED_PROVIDER]: {} },
 						preflightReadSnapshot: () => ({

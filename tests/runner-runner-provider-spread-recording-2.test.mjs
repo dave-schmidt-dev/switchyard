@@ -97,8 +97,8 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 		const dispatches = [];
 		// Isolated per-test temp snapshot, not the real shared SNAPSHOT_PATH: this
 		// test intentionally exercises the real, unmocked route() (no
-		// dependencies.route override below), and tests/router.test.mjs also
-		// exercises the real loader concurrently in its own process. Both used to
+		// dependencies.route override below), and the split router suites also
+		// exercise the real loader concurrently in their own processes. Both used to
 		// read/write/rm the SAME on-disk SNAPSHOT_PATH (the host-side gradus
 		// snapshot), which raced under `node --test`'s concurrent-file execution.
 		// The env var is read dynamically by resolveSnapshotPath() in

@@ -344,8 +344,7 @@ await runQueueAsync({
     integrationGate: () => ({ success: true }),
     // No real routing snapshot exists in this child process's cwd; the
     // default macOS preflight gate is irrelevant to what this test proves,
-    // so bypass it the same way tests/runner.test.mjs's shared runQueue
-    // wrapper does for the rest of this file.
+    // so bypass it with this isolated test's injected preflight dependency.
     queuePreflight: () => ({ ok: true, eligible: true }),
     backendFactory: () => ({
       readiness: () => ({ inventoryCount: 0 }),
