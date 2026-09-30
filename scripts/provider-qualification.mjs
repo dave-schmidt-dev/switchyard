@@ -17,7 +17,7 @@ import {
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DISPATCH = join(ROOT, "src/switchyard/dispatch/index.mjs");
 const USAGE =
-	"Usage: node scripts/provider-qualification.mjs [--target ID --capability low|standard|high [--descriptor sha256:...]] [--execute] [--deadline RFC3339]";
+	"Usage: node scripts/provider-qualification.mjs [--target ID --capability low|standard|high [--descriptor sha256:...] [--lane simple|vm]] [--execute] [--deadline RFC3339]";
 export function parseQualificationArgs(argv) {
 	let parsed;
 	try {
@@ -29,6 +29,7 @@ export function parseQualificationArgs(argv) {
 				target: { type: "string" },
 				capability: { type: "string" },
 				descriptor: { type: "string" },
+				lane: { type: "string" },
 				execute: { type: "boolean", default: false },
 				deadline: { type: "string" },
 				help: { type: "boolean", default: false },
@@ -46,9 +47,13 @@ export function parseQualificationArgs(argv) {
 		!hasTarget &&
 		(parsed.values.execute ||
 			parsed.values.descriptor ||
-			parsed.values.deadline)
+			parsed.values.deadline ||
+			parsed.values.lane)
 	) {
 		throw new Error("target_and_capability_required");
+	}
+	if (parsed.values.lane && !["simple", "vm"].includes(parsed.values.lane)) {
+		throw new Error("invalid_lane");
 	}
 	if (
 		parsed.values.descriptor &&
@@ -78,6 +83,7 @@ export function parseQualificationArgs(argv) {
 		targetId: parsed.values.target ?? null,
 		capability: parsed.values.capability ?? null,
 		descriptorIdentity: parsed.values.descriptor ?? null,
+		lane: parsed.values.lane ?? null,
 		execute: parsed.values.execute === true,
 		deadlineMs,
 	};
@@ -451,6 +457,7 @@ async function main() {
 		targetId: options.targetId,
 		capability: options.capability,
 		descriptorIdentity: options.descriptorIdentity,
+		lane: options.lane,
 	});
 	if (!options.execute) {
 		console.log(JSON.stringify(plan));
@@ -463,6 +470,7 @@ async function main() {
 		targetId: options.targetId,
 		capability: options.capability,
 		descriptorIdentity: options.descriptorIdentity,
+		lane: options.lane,
 		deadlineAt,
 		dispatch: (context) => productionDispatch(context),
 		onProgress: (event) => {

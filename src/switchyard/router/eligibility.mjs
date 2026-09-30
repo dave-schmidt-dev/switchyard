@@ -157,6 +157,7 @@ export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"opencode-go",
 	"opencode-mistral",
 	"vibe",
+	"vibe-code",
 ]);
 
 function goldenImageProviderMatches(verified, snapshotName) {

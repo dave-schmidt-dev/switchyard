@@ -36,6 +36,7 @@ test("CLI parser requires an explicit bounded deadline and has no implicit execu
 		targetId: null,
 		capability: null,
 		descriptorIdentity: null,
+		lane: null,
 		execute: false,
 		deadlineMs: null,
 	});
@@ -73,6 +74,55 @@ test("CLI parser requires an explicit bounded deadline and has no implicit execu
 			deadlineAt,
 		]).execute,
 		true,
+	);
+});
+
+test("CLI parser binds an explicit lane to an explicit target and rejects other values", () => {
+	assert.deepEqual(
+		parseQualificationArgs([
+			"--target",
+			"vibe-code",
+			"--capability",
+			"low",
+			"--lane",
+			"vm",
+		]),
+		{
+			help: false,
+			targetId: "vibe-code",
+			capability: "low",
+			descriptorIdentity: null,
+			lane: "vm",
+			execute: false,
+			deadlineMs: null,
+		},
+	);
+	assert.equal(
+		parseQualificationArgs([
+			"--target",
+			"vibe-code",
+			"--capability",
+			"low",
+			"--lane",
+			"simple",
+		]).lane,
+		"simple",
+	);
+	assert.throws(
+		() =>
+			parseQualificationArgs([
+				"--target",
+				"vibe-code",
+				"--capability",
+				"low",
+				"--lane",
+				"bogus",
+			]),
+		/invalid_lane/u,
+	);
+	assert.throws(
+		() => parseQualificationArgs(["--lane", "vm"]),
+		/target_and_capability_required/u,
 	);
 });
 

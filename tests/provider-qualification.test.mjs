@@ -12,6 +12,7 @@ import {
 import { QUALIFICATION_FILES } from "../src/switchyard/diagnostics/provider-qualification-fixture.mjs";
 import { hasProvenWorkerCleanup } from "../src/switchyard/diagnostics/provider-qualification-verification.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/eligibility.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 function fixtureRoster() {
@@ -385,6 +386,74 @@ test("behavior failure and unconfirmed cleanup fail closed and retain owned scra
 		true,
 	);
 	assert.equal(noCleanup.verification.cleanupVerified, false);
+});
+
+test("explicit lane planning forces the VM lane for simple-compatible vibe-code", async () => {
+	const roster = fixtureRoster();
+	roster.targets["vibe-code"] = {
+		enabled: true,
+		harness: "vibe",
+		slots: { low: [], standard: [], high: [] },
+	};
+	roster.models["fixture/vibe-code/low"] = {
+		selector: "glm-5-3-medium",
+		base_model: "glm-5-3-medium",
+		model_provider: "fixture",
+		status: "active",
+	};
+	roster.targets["vibe-code"].slots.low.push({
+		model_ref: "fixture/vibe-code/low",
+		priority: 1,
+	});
+	const automatic = planRepresentativeQualification({
+		targetId: "vibe-code",
+		capability: "low",
+		rosterData: roster,
+	});
+	assert.equal(automatic.status, "ready");
+	assert.equal(automatic.lane, "simple");
+	const forced = planRepresentativeQualification({
+		targetId: "vibe-code",
+		capability: "low",
+		lane: "vm",
+		rosterData: roster,
+	});
+	assert.equal(forced.status, "ready");
+	assert.equal(forced.lane, "vm");
+	assert.equal(forced.laneReadiness, "vm_availability_checked_on_execute");
+	assert.equal(
+		planRepresentativeQualification({
+			targetId: "vibe-code",
+			capability: "low",
+			lane: "bogus",
+			rosterData: roster,
+		}).reason,
+		"invalid_lane",
+	);
+	const refused = await runRepresentativeQualification({
+		targetId: "claude-code",
+		capability: "high",
+		lane: "simple",
+		rosterData: roster,
+		dispatch: () => {
+			throw new Error("dispatch_must_not_run");
+		},
+		deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+	});
+	assert.equal(refused.status, "unavailable");
+	assert.equal(refused.reason, "simple_lane_unavailable");
+});
+
+test("golden image verified providers include vibe-code after vibe", () => {
+	assert.equal(GOLDEN_IMAGE_VERIFIED_PROVIDERS.includes("vibe-code"), true);
+	assert.equal(
+		GOLDEN_IMAGE_VERIFIED_PROVIDERS[GOLDEN_IMAGE_VERIFIED_PROVIDERS.length - 1],
+		"vibe-code",
+	);
+	assert.equal(
+		GOLDEN_IMAGE_VERIFIED_PROVIDERS[GOLDEN_IMAGE_VERIFIED_PROVIDERS.length - 2],
+		"vibe",
+	);
 });
 
 test("VM cleanup stage cannot override unknown or contradictory writer liveness", () => {

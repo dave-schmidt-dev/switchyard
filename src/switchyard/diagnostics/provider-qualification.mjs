@@ -107,6 +107,7 @@ export function planRepresentativeQualification({
 	targetId,
 	capability,
 	descriptorIdentity = null,
+	lane = undefined,
 	rosterData = loadRosterData(),
 }) {
 	if (
@@ -118,6 +119,13 @@ export function planRepresentativeQualification({
 			schemaVersion: 1,
 			status: "invalid_request",
 			reason: "target_and_capability_required",
+		};
+	}
+	if (lane !== undefined && lane !== null && !["simple", "vm"].includes(lane)) {
+		return {
+			schemaVersion: 1,
+			status: "invalid_request",
+			reason: "invalid_lane",
 		};
 	}
 	const inventory = enumerateQualificationTargets(rosterData);
@@ -149,6 +157,17 @@ export function planRepresentativeQualification({
 		};
 	}
 	const slot = matches[0];
+	if (lane === "simple" && slot.lane !== "simple") {
+		return {
+			schemaVersion: 1,
+			status: "unavailable",
+			reason: "simple_lane_unavailable",
+			targetId,
+			capability,
+			automaticPromotion: false,
+		};
+	}
+	const forcedVmLane = lane === "vm" && slot.descriptor;
 	return {
 		schemaVersion: 1,
 		status: slot.descriptor ? "ready" : "unavailable",
@@ -165,8 +184,10 @@ export function planRepresentativeQualification({
 		variant: slot.variant,
 		descriptorIdentity: slot.descriptorIdentity,
 		descriptor: slot.descriptor,
-		lane: slot.lane,
-		laneReadiness: slot.laneReadiness,
+		lane: forcedVmLane ? "vm" : slot.lane,
+		laneReadiness: forcedVmLane
+			? "vm_availability_checked_on_execute"
+			: slot.laneReadiness,
 		automaticPromotion: false,
 	};
 }
@@ -176,6 +197,7 @@ export async function runRepresentativeQualification({
 	targetId,
 	capability,
 	descriptorIdentity = null,
+	lane = undefined,
 	rosterData = loadRosterData(),
 	dispatch,
 	deadlineAt = new Date(Date.now() + 25 * 60_000).toISOString(),
@@ -188,6 +210,7 @@ export async function runRepresentativeQualification({
 		targetId,
 		capability,
 		descriptorIdentity,
+		lane,
 		rosterData,
 	});
 	if (plan.status !== "ready") {
