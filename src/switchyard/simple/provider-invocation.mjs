@@ -266,7 +266,10 @@ export async function defaultExecuteProvider(context) {
 			? parseOpenCodeGoBridgeDiagnosticEvidence(result.output)
 			: null;
 	const bridgeDiagnosticCode =
-		providerCodeForOpenCodeGoBridgeEvidence(bridgeDiagnostic);
+		providerCodeForOpenCodeGoBridgeEvidence(bridgeDiagnostic) ??
+		(context.harness === "vibe" && !result.success
+			? providerCodeForVibeBudgetEvidence(result.stderr)
+			: null);
 	const diagnosticCode = bridgeDiagnosticCode
 		? bridgeDiagnosticCode
 		: providerDiagnosticCodeForKind(diagnosticEvidence?.diagnosticKind);
@@ -326,6 +329,19 @@ export function providerCodeForOpenCodeGoBridgeEvidence(evidence) {
 		evidence.requests <= 999_999 &&
 		evidence.upstreamStatus === 429 &&
 		evidence.proxyRejections === 0
+		? "quota_exhausted"
+		: null;
+}
+/**
+ * Vibe prints its own upstream error block on stderr when Mistral answers 402
+ * for an exhausted allowance. Only that block counts; model output on stdout
+ * never does.
+ */
+export function providerCodeForVibeBudgetEvidence(stderr) {
+	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
+	return /^Error: API error from mistral\b/mu.test(stderr) &&
+		/^\s*status: 402 Payment Required$/mu.test(stderr) &&
+		/"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(stderr)
 		? "quota_exhausted"
 		: null;
 }
