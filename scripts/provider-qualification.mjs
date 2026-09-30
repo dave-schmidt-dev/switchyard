@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -9,6 +9,7 @@ import {
 	planRepresentativeQualification,
 	runRepresentativeQualification,
 } from "../src/switchyard/diagnostics/provider-qualification.mjs";
+import { vmRunCleanupProven } from "../src/switchyard/diagnostics/provider-qualification-vm-cleanup.mjs";
 import {
 	isProjectLockHeld,
 	readRun,
@@ -283,6 +284,24 @@ function taskResult(report) {
 	}
 	return report;
 }
+/**
+ * `dispatch run --json` prints a run-status envelope, not per-task results. The
+ * task's own result is durable in the run checkpoint, so read it from there and
+ * fall back to the report only when it carries `results` itself.
+ */
+export function vmTaskResult(report, checkpointPath) {
+	if (Array.isArray(report?.results)) return taskResult(report);
+	try {
+		const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+		const results = Array.isArray(checkpoint?.results)
+			? checkpoint.results
+			: [];
+		const entry = results.find((item) => item?.taskId === "1") ?? null;
+		return entry ? { ...entry, runId: report?.runId } : null;
+	} catch {
+		return null;
+	}
+}
 export async function productionDispatch({
 	plan,
 	fixture,
@@ -390,7 +409,7 @@ export async function productionDispatch({
 		"--json",
 	];
 	const report = await spawnCommand(args, { timeoutMs: remaining, onProgress });
-	const providerResult = taskResult(report);
+	const providerResult = vmTaskResult(report, fixture.checkpointPath);
 	let runRecord = null;
 	if (typeof report?.runId === "string") {
 		try {
@@ -405,17 +424,20 @@ export async function productionDispatch({
 	} catch {
 		projectLockReleased = false;
 	}
+	const durableVmClean = vmRunCleanupProven(report, fixture.projectPath);
 	const vmClean =
-		providerResult?.cleanupFailed === false &&
-		providerResult?.cleanupStage === "index_lock_removed" &&
-		providerResult?.providerLifecycle?.writerLifecycle === "stopped" &&
-		providerResult?.providerLifecycle?.terminalStatus === "exited" &&
-		providerResult?.providerLifecycle?.cleanupStatus === "succeeded" &&
-		providerResult?.providerLifecycle?.cleanupStage === "index_lock_removed";
+		durableVmClean ||
+		(providerResult?.cleanupFailed === false &&
+			providerResult?.cleanupStage === "index_lock_removed" &&
+			providerResult?.providerLifecycle?.writerLifecycle === "stopped" &&
+			providerResult?.providerLifecycle?.terminalStatus === "exited" &&
+			providerResult?.providerLifecycle?.cleanupStatus === "succeeded" &&
+			providerResult?.providerLifecycle?.cleanupStage === "index_lock_removed");
 	const queueWorkspaceRemoved =
-		report?.cleanupState === "complete" &&
-		runRecord?.cleanupState === "complete" &&
-		runRecord?.worktree?.state === "removed";
+		durableVmClean ||
+		(report?.cleanupState === "complete" &&
+			runRecord?.cleanupState === "complete" &&
+			runRecord?.worktree?.state === "removed");
 	return {
 		providerResult: { ...providerResult, projectLockReleased },
 		targetId: providerResult?.resolvedTargetId ?? null,

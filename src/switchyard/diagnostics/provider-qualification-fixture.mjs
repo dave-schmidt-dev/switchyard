@@ -1,6 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	mkdirSync,
+	realpathSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 export const QUALIFICATION_FIXTURE_VERSION = "summary-v1";
@@ -110,6 +115,9 @@ export function createQualificationFixture(parentRoot) {
 	git(["config", "user.email", "qualification@localhost"]);
 	git(["add", ...QUALIFICATION_FILES, ACCEPTANCE_FILE]);
 	git(["commit", "--quiet", "-m", "qualification fixture baseline"]);
+	// The VM queue run keeps its run store under <project>/.logs; exclude it
+	// locally so the changed-path scope check sees only the provider's edits.
+	appendFileSync(join(projectPath, ".git", "info", "exclude"), ".logs/\n");
 	const verificationProjectPath = join(parent, "verification-base");
 	const clone = spawnSync(
 		"git",
