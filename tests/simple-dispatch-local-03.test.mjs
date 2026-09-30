@@ -410,6 +410,11 @@ describe("simple local execution path", () => {
 				ambiguous: false,
 			},
 			vibe: { targetId: "vibe", harnessKey: "vibe", ambiguous: false },
+			"vibe-code": {
+				targetId: "vibe-code",
+				harnessKey: "vibe",
+				ambiguous: false,
+			},
 			"opencode-go": {
 				targetId: "opencode-go",
 				harnessKey: "opencode",

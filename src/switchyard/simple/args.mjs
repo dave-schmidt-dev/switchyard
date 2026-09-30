@@ -34,6 +34,7 @@ const SIMPLE_PROVIDERS = Object.freeze([
 	"cursor",
 	"opencode-go",
 	"vibe",
+	"vibe-code",
 	"copilot",
 	"copilot-student",
 ]);
@@ -69,6 +70,27 @@ const SIMPLE_TARGET_ADAPTERS = Object.freeze([
 		targetId: "vibe",
 		harness: "vibe",
 		kind: "bridge",
+		defaultEligible: true,
+		defaultCapabilities: Object.freeze(["low", "standard"]),
+		capabilities: Object.freeze(["low", "standard"]),
+		selectors: Object.freeze(["glm-5-3", "glm-5-3-medium"]),
+		validateInvocationArgs: (args) => Array.isArray(args) && args.length === 0,
+		expectedDescriptors: Object.freeze({
+			low: Object.freeze({
+				selector: "glm-5-3-medium",
+				invocationArgs: Object.freeze([]),
+			}),
+			standard: Object.freeze({
+				selector: "glm-5-3",
+				invocationArgs: Object.freeze([]),
+			}),
+		}),
+	}),
+	Object.freeze({
+		// Native headless Vibe on Vibe's own login: spends the Vibe Code allowance.
+		targetId: "vibe-code",
+		harness: "vibe",
+		kind: "native",
 		defaultEligible: true,
 		defaultCapabilities: Object.freeze(["low", "standard"]),
 		capabilities: Object.freeze(["low", "standard"]),

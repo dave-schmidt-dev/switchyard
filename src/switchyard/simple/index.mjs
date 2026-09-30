@@ -988,7 +988,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 		let requestRecorder = null;
 		if (
 			executeProvider === defaultExecuteProvider &&
-			(harness === "opencode" || harness === "vibe")
+			(harness === "opencode" ||
+				(harness === "vibe" && targetId !== "vibe-code"))
 		) {
 			try {
 				requestRecorder = createBridgeRequestRecorder(

@@ -28,6 +28,7 @@ const TARGETS = new Set([
 	"cursor",
 	"opencode-go",
 	"vibe",
+	"vibe-code",
 	"copilot",
 	"copilot-student",
 ]);

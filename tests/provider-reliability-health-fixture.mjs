@@ -47,6 +47,10 @@ export function setupHealthFixture() {
 		...structuredClone(roster.targets.antigravity),
 		snapshot_name: "Antigravity Claude fixture",
 	};
+	roster.targets["vibe-code"] = {
+		...structuredClone(roster.targets.vibe),
+		snapshot_name: "Vibe Code fixture",
+	};
 	writeFileSync(
 		ROSTER_PATH,
 		JSON.stringify(withDispatchQualifiedDescriptors(roster)),
@@ -67,13 +71,20 @@ export function cleanupHealthFixture() {
 }
 
 export function descriptorFor(targetId) {
-	if (targetId !== "vibe") {
+	if (targetId !== "vibe" && targetId !== "vibe-code") {
 		const descriptor = getInvocationDescriptor(targetId, "standard");
 		if (descriptor) return descriptor;
 	}
 	const target = resolveTargetIdentity(targetId);
 	const fixtures = {
 		vibe: ["vibe", "fixture/vibe-standard", "fixture-vibe-standard", null, []],
+		"vibe-code": [
+			"vibe",
+			"fixture/vibe-code-standard",
+			"fixture-vibe-code-standard",
+			null,
+			[],
+		],
 		"antigravity-claude": [
 			"agy",
 			"fixture/agy-standard",

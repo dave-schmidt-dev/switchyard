@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
 	classifyProviderStreams,
 	providerDiagnosticCodeForKind,
@@ -11,6 +12,10 @@ import {
 	SIMPLE_TARGET_ADAPTERS,
 } from "./args.mjs";
 import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
+
+const VIBE_CODE_LAUNCHER = fileURLToPath(
+	new URL("../../../ops/simple-vibe-code-launcher.mjs", import.meta.url),
+);
 
 function remainingMs(deadlineMs, now) {
 	return Math.max(0, deadlineMs - now());
@@ -96,6 +101,18 @@ export function buildSimpleProviderInvocation(
 				"30m",
 				"--print",
 				_prompt,
+			],
+		};
+	}
+	if (targetId === "vibe-code") {
+		return {
+			command: process.execPath,
+			args: [
+				VIBE_CODE_LAUNCHER,
+				"--model",
+				descriptor.selector,
+				"--worktree",
+				worktreePath,
 			],
 		};
 	}
