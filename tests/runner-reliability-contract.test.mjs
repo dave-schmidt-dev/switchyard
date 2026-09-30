@@ -68,8 +68,8 @@ function backend(base) {
 function descriptor() {
 	const core = {
 		target_id: "claude",
-		model_ref: "claude-sonnet-5",
-		selector: "claude-sonnet-5",
+		model_ref: "claude-sonnet-5-5",
+		selector: "claude-sonnet-5-5",
 		effort: null,
 		variant: null,
 		invocation_args: [],
@@ -214,7 +214,7 @@ describe("queue reliability contract", () => {
 				backendFactory: () => backend(base),
 				route: () => ({
 					provider: "claude",
-					model: "claude-sonnet-5",
+					model: "claude-sonnet-5-5",
 					reason: "fixture",
 				}),
 				recordDispatch: () => {},
@@ -267,7 +267,7 @@ describe("queue reliability contract", () => {
 				broker: {
 					selectAndReserve: async () => ({
 						provider: "claude",
-						model: "claude-sonnet-5",
+						model: "claude-sonnet-5-5",
 						resolvedTarget: "claude",
 						harness: "claude",
 						capability: "standard",

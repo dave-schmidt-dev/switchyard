@@ -86,6 +86,16 @@ function getCapabilityEntry(providerName) {
 		if (identity.targetId) {
 			const target = targets[identity.targetId];
 			if (!isAutomaticRoutingTarget(target, identity.targetId)) return null;
+			// An exact target id owns its own entry. The harness-keyed fallback
+			// below returns the first target of that harness, which is the wrong
+			// target (or none) when several targets share a harness.
+			if (identity.targetId === providerName) {
+				const models =
+					roster.models && typeof roster.models === "object"
+						? roster.models
+						: {};
+				return buildCapabilityEntry(target, models);
+			}
 		}
 	} catch {
 		// Preserve the existing roster-unavailable fallback behavior below.

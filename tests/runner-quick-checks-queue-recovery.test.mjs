@@ -106,7 +106,7 @@ describe("Task 51 quick-check regression", () => {
 			}),
 			route: () => ({
 				provider: "claude",
-				model: "claude-sonnet-5",
+				model: "claude-sonnet-5-5",
 				percentLeft: 80,
 				reason: "spread",
 			}),
@@ -177,8 +177,8 @@ describe("Task 51 quick-check regression", () => {
 		const asyncCheckpointPath = `${tasksPath}.async.checkpoint.json`;
 		const asyncDescriptorCore = {
 			target_id: "claude",
-			model_ref: "claude-sonnet-5",
-			selector: "claude-sonnet-5",
+			model_ref: "claude-sonnet-5-5",
+			selector: "claude-sonnet-5-5",
 			effort: null,
 			variant: null,
 			invocation_args: [],
@@ -196,7 +196,7 @@ describe("Task 51 quick-check regression", () => {
 						asyncSelectionReached = true;
 						return {
 							provider: "claude",
-							model: "claude-sonnet-5",
+							model: "claude-sonnet-5-5",
 							resolvedTarget: "claude",
 							harness: "claude",
 							capability: "standard",

@@ -192,14 +192,14 @@ describe("macOS golden-image ops artifacts", () => {
 			// run checks them against the committed manifest, so a manifest refresh
 			// must update this table in the same change.
 			const shapes = {
-				claude: "2.1.280 (Claude Code)",
-				codex: "codex-cli 0.155.1",
-				agy: "1.2.8",
-				"cursor-agent": "2026.09.18-9a7762b",
+				claude: "2.1.285 (Claude Code)",
+				codex: "codex-cli 0.159.2",
+				agy: "1.2.14",
+				"cursor-agent": "2026.09.28-64d2043",
 				copilot:
-					"GitHub Copilot CLI 1.0.87. Run 'copilot update' to check for updates.",
+					"GitHub Copilot CLI 1.0.89. Run 'copilot update' to check for updates.",
 				opencode: "1.18.30",
-				vibe: "vibe 2.24.5",
+				vibe: "vibe 2.25.0",
 			};
 			for (const [provider, output] of Object.entries(shapes)) {
 				makeCli(provider, output);
@@ -238,7 +238,7 @@ describe("macOS golden-image ops artifacts", () => {
 			const badManifest = join(dir, "bad-manifest.txt");
 			writeFileSync(
 				badManifest,
-				readFileSync(MANIFEST, "utf8").replaceAll("2.24.5", "2.24.4"),
+				readFileSync(MANIFEST, "utf8").replaceAll("2.25.0", "2.24.9"),
 			);
 			const runMismatch = spawnSync("/bin/bash", [harness, badManifest], {
 				encoding: "utf8",
@@ -251,16 +251,16 @@ describe("macOS golden-image ops artifacts", () => {
 			);
 			ok(
 				runMismatch.stderr.includes(
-					"[guest] ERROR: vibe reports version 2.24.5, manifest pins 2.24.4 (raw: vibe 2.24.5)",
+					"[guest] ERROR: vibe reports version 2.25.0, manifest pins 2.24.9 (raw: vibe 2.25.0)",
 				),
 				`unexpected stderr on mismatch: ${runMismatch.stderr}`,
 			);
 
-			// 2.1.28 vs 2.1.280 substring trap
+			// 2.1.28 vs 2.1.285 substring trap
 			const substringManifest = join(dir, "substring-manifest.txt");
 			writeFileSync(
 				substringManifest,
-				readFileSync(MANIFEST, "utf8").replace("2.1.280", "2.1.28"),
+				readFileSync(MANIFEST, "utf8").replace("2.1.285", "2.1.28"),
 			);
 			const runSubstring = spawnSync(
 				"/bin/bash",
@@ -277,7 +277,7 @@ describe("macOS golden-image ops artifacts", () => {
 			);
 			ok(
 				runSubstring.stderr.includes(
-					"[guest] ERROR: claude reports version 2.1.280, manifest pins 2.1.28",
+					"[guest] ERROR: claude reports version 2.1.285, manifest pins 2.1.28",
 				),
 				`unexpected stderr on substring trap: ${runSubstring.stderr}`,
 			);
@@ -337,7 +337,7 @@ describe("macOS golden-image ops artifacts", () => {
 			);
 			ok(
 				runUnparseable.stderr.includes(
-					"[guest] ERROR: agy reports no parseable version, manifest pins 1.2.8 (raw: error: unknown flag --version)",
+					"[guest] ERROR: agy reports no parseable version, manifest pins 1.2.14 (raw: error: unknown flag --version)",
 				),
 				`unexpected stderr on unparseable version: ${runUnparseable.stderr}`,
 			);
@@ -353,7 +353,7 @@ describe("macOS golden-image ops artifacts", () => {
 				env: isolatedEnv("drain-bin", {
 					scripts: {
 						claude:
-							"/bin/cat >/dev/null\nprintf '%s\\n' '2.1.280 (Claude Code)'",
+							"/bin/cat >/dev/null\nprintf '%s\\n' '2.1.285 (Claude Code)'",
 					},
 				}),
 			});
@@ -364,7 +364,7 @@ describe("macOS golden-image ops artifacts", () => {
 			);
 			ok(
 				runDrain.stderr.includes(
-					"[guest] ERROR: vibe reports version 2.24.5, manifest pins 2.24.4",
+					"[guest] ERROR: vibe reports version 2.25.0, manifest pins 2.24.9",
 				),
 				`unexpected stderr with a stdin-reading CLI: ${runDrain.stderr}`,
 			);

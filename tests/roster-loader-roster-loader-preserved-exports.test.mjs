@@ -1,5 +1,5 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -158,6 +158,20 @@ describe("roster loader — preserved exports, roster-backed (committed fixture)
 		strictEqual(getImplementorPriority("claude"), null);
 		strictEqual(getImplementorPriority("codex"), null);
 		strictEqual(getImplementorPriority("opencode"), null);
+	});
+
+	it("getImplementorPriority resolves an exact target id, even when it shares a harness with an earlier target", () => {
+		tmpDir = tempDir("switchyard-roster-loader-");
+		const rosterPath = join(tmpDir, "shared-harness.json");
+		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
+		roster.targets["antigravity-second"] = {
+			...roster.targets.antigravity,
+			implementor_priority: 2,
+		};
+		writeFileSync(rosterPath, JSON.stringify(roster));
+		setRosterPath(rosterPath);
+		strictEqual(getImplementorPriority("antigravity"), 1);
+		strictEqual(getImplementorPriority("antigravity-second"), 2);
 	});
 
 	it("getImplementorPriority returns null for a provider name absent from the roster", () => {
