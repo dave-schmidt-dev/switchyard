@@ -28,6 +28,8 @@
 		"auth": "node src/switchyard/auth/index.mjs",
 		"auth:check": "node src/switchyard/auth/index.mjs --check",
 		"auth:check:live": "node src/switchyard/auth/index.mjs --check --live",
+		"cli:check": "ops/macos-vm/sync-clis.sh --check",
+		"cli:sync": "ops/macos-vm/sync-clis.sh",
 		"dispatch": "node src/switchyard/dispatch/index.mjs"
 	},
 	"devDependencies": {

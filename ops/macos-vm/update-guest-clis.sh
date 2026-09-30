@@ -26,6 +26,7 @@ VM_NAME=""
 CLI_MANIFEST=""
 SNAPSHOT_NAME=""
 NO_SNAPSHOT=0
+CHECK_ONLY=0
 ONLY=()
 STARTED=0
 SUBSET_MANIFEST=""
@@ -43,11 +44,13 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   update-guest-clis.sh --vm NAME --cli-manifest PATH [--only PROVIDER]...
-                       [--snapshot-name NAME | --no-snapshot]
+                       [--snapshot-name NAME | --no-snapshot | --check]
 
 Updates the provider CLIs named by the manifest (all seven by default, or only
 the repeatable --only PROVIDERs) inside the stopped VM, then stops it again.
-A rollback snapshot is taken first unless --no-snapshot is given.
+A rollback snapshot is taken first unless --no-snapshot is given. --check
+only reports guest versus pin (exit 1 on any difference), changes nothing and
+takes no snapshot.
 PROVIDER is one of: claude codex agy cursor-agent copilot opencode vibe.
 EOF
 }
@@ -105,6 +108,11 @@ parse_args() {
         shift 2
         ;;
       --no-snapshot)
+        NO_SNAPSHOT=1
+        shift
+        ;;
+      --check)
+        CHECK_ONLY=1
         NO_SNAPSHOT=1
         shift
         ;;
@@ -269,6 +277,8 @@ set -Eeuo pipefail
 export NONINTERACTIVE=1
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 manifest_path="$1"
+check_only="${2:-}"
+drift=0
 tmp_dir="$(/usr/bin/mktemp -d "$HOME/.switchyard-cli.XXXXXX")"
 trap '/bin/rm -rf "$tmp_dir"' EXIT
 
@@ -385,6 +395,11 @@ while IFS='|' read -r provider kind ref detail expected version extra; do
     printf '[guest] %s %s already at the pinned version, skipping\n' "$provider" "$version" >&2
     continue
   fi
+  if [[ "$check_only" == check ]]; then
+    printf '[guest] DRIFT %s: installed %s, pinned %s\n' "$provider" "${current:-none}" "$version" >&2
+    drift=1
+    continue
+  fi
   printf '[guest] %s: installed %s, pinned %s; updating\n' "$provider" "${current:-none}" "$version" >&2
   case "$kind" in
     script) install_script_cli "$provider" "$ref" "$detail" "$expected" "$version" ;;
@@ -394,6 +409,7 @@ while IFS='|' read -r provider kind ref detail expected version extra; do
   esac
 done <"$manifest_path"
 
+[[ "$check_only" == check ]] && exit "$drift"
 verify_cli_versions "$manifest_path"
 INSTALL_SCRIPT
 }
@@ -445,6 +461,8 @@ done
 # separate calls, each well under that.
 readonly GUEST_MANIFEST='/tmp/switchyard-cli-manifest'
 readonly GUEST_PAYLOAD='/tmp/switchyard-cli-install.sh'
+GUEST_MODE=update
+((CHECK_ONLY == 0)) || GUEST_MODE=check
 
 guest_write_file() {
   local destination="$1"
@@ -459,6 +477,10 @@ guest_write_file "$GUEST_MANIFEST" <"$SUBSET_MANIFEST"
 
 log "updating $(wc -l <"$SUBSET_MANIFEST" | tr -d ' ') CLI(s) in the $PROVIDER_USER Aqua session"
 run_bounded "$UPDATE_EXEC_TIMEOUT_SECONDS" prlctl exec "$VM_NAME" /bin/bash -c \
-  "trap '/bin/rm -f $GUEST_MANIFEST $GUEST_PAYLOAD' EXIT; uid=\$(/usr/bin/id -u $PROVIDER_USER); /bin/launchctl asuser \$uid /usr/bin/sudo -iu $PROVIDER_USER /bin/bash $GUEST_PAYLOAD $GUEST_MANIFEST"
+  "trap '/bin/rm -f $GUEST_MANIFEST $GUEST_PAYLOAD' EXIT; uid=\$(/usr/bin/id -u $PROVIDER_USER); /bin/launchctl asuser \$uid /usr/bin/sudo -iu $PROVIDER_USER /bin/bash $GUEST_PAYLOAD $GUEST_MANIFEST $GUEST_MODE"
 
-log "guest CLI update completed and verified"
+if ((CHECK_ONLY == 1)); then
+  log "guest CLIs match the pinned manifest"
+else
+  log "guest CLI update completed and verified"
+fi
