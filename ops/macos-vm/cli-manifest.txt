@@ -20,10 +20,10 @@
 # without notice. The two npm refs are version-pinned and independently
 # checkable against the public registry.
 
-claude|script|https://claude.ai/install.sh|bash|3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944|2.1.280
-codex|script|https://chatgpt.com/codex/install.sh|bash|150e3cf675682efeaac115aa3747add3f27887896d04ce6d0b56478d8b428bf6|0.155.1
-agy|script|https://antigravity.google/cli/install.sh|bash|ee1ea43ce4e9e56356c4ab6dad907ef357ae4bdfcaadb682735909fb57c9c640|1.2.8
-cursor-agent|script|https://cursor.com/install|bash|69a0a9188f4798c71791b4610d77103dfdf3f1b17f78d8958d294ea43ce9830d|2026.09.18-9a7762b
-copilot|npm|@github/copilot|1.0.87|04f3cbc64789e88e2de2b1aff9c968c918192919b0025f74f367c51597fd9e7a|1.0.87
-opencode|npm|opencode-ai|1.18.30|3a97a99230d07fcbe6fd1ea2a001556297225d57f55d7880d3c9e6e29960ae90|1.18.30
-vibe|brew|mistral-vibe|2.24.5|2f5e315e6d50a0647200d9e9aa99c55342f9a3e4d12f02c0d277ce8bba4e153e|2.24.5
+claude|script|https://claude.ai/install.sh|bash|3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944|2.1.285
+codex|script|https://chatgpt.com/codex/install.sh|bash|150e3cf675682efeaac115aa3747add3f27887896d04ce6d0b56478d8b428bf6|0.159.2
+agy|script|https://antigravity.google/cli/install.sh|bash|ee1ea43ce4e9e56356c4ab6dad907ef357ae4bdfcaadb682735909fb57c9c640|1.2.14
+cursor-agent|script|https://cursor.com/install|bash|355ceed4ac821b5fed8faf286bd8ab4df4952423393e09b155052247e7c6ebb5|2026.09.28-64d2043
+copilot|npm|@github/copilot|1.0.89|afaff79c8dedafb2f99d304063ea567c34e96a8dbdf252296ccd3ab524181ea6|1.0.89
+opencode|npm|opencode-ai|1.18.33|6fed32445d04df1d9d56aef0f15ae200618663ef532f7ec4241432024f84097c|1.18.33
+vibe|brew|mistral-vibe|2.25.0|1d51d99904fc7dd82bbd0f06d76b14a47f4b54d045029a3c701b4fec2e92862c|2.25.0
