@@ -46,6 +46,7 @@ import {
 } from "../run-store/index.mjs";
 import { isSafeDescriptorReceipt } from "../run-store/receipt-validation.mjs";
 import { runSimpleBaselineChecks } from "./baseline.mjs";
+import { buildGuardedPrompt } from "./guarded-prompt.mjs";
 import { createSimpleRouteHealthController } from "./health.mjs";
 import {
 	classifySimpleErrorKind,
@@ -932,10 +933,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 		failingCheckIndex = null;
 		failingCheckIdentity = null;
 
-		const readOnlyNotice = (options.readOnlyInputs ?? []).length
-			? ` Read-only input paths (do not modify): ${(options.readOnlyInputs ?? []).join(", ")}.`
-			: "";
-		const guardedPrompt = `${readFileSync(options.promptPath, "utf8")}\n\nWork only in the current disposable checkout. Change only these writable files: ${options.files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
+		const guardedPrompt = buildGuardedPrompt({
+			promptText: readFileSync(options.promptPath, "utf8"),
+			files: options.files,
+			readOnlyInputs: options.readOnlyInputs ?? [],
+			checks: options.checks ?? [],
+		});
 		currentPhase = "execute";
 		milestone("execute", "provider_started");
 		const executionBudget = remainingMs(options.deadlineMs, now);
