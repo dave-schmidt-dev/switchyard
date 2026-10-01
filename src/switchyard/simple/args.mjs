@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { manifestReviewPaths } from "../integrate/index.mjs";
 import { validateRoutingRunId } from "./routing-state.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--baseline-check <command>] [--repair-checks] --check <command> --deadline <RFC3339> [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> --file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--baseline-check <command>] [--no-repair-checks] --check <command> --deadline <RFC3339> [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -13,8 +13,10 @@ Runs one bounded assignment in a disposable local checkout. Repeat --file and
 editing; repeat it per path. Any other manifest still fails closed.
 --predecessor-receipt binds output of a previous run and requires --dirty-overlay.
 --baseline-check repeats commands run before the provider; baseline checks never
-replace acceptance checks. --repair-checks permits one scoped correction after
-an acceptance check fails, within the original deadline.
+replace acceptance checks. Acceptance-check repair is on by default: after a
+failing acceptance check the provider gets one scoped correction within the
+original deadline. --no-repair-checks disables it; --repair-checks is accepted
+for compatibility.
 Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
 SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
 for attended recovery. An integration already in progress finishes before the
@@ -264,6 +266,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 				check: { type: "string", multiple: true },
 				"baseline-check": { type: "string", multiple: true },
 				"repair-checks": { type: "boolean", default: false },
+				"no-repair-checks": { type: "boolean", default: false },
 				deadline: { type: "string" },
 				"routing-run-id": { type: "string" },
 				json: { type: "boolean", default: false },
@@ -429,6 +432,14 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 			throw new SimpleUsageError("invalid routing run id");
 		}
 	}
+	if (
+		parsed.values["repair-checks"] === true &&
+		parsed.values["no-repair-checks"] === true
+	) {
+		throw new SimpleUsageError(
+			"--repair-checks and --no-repair-checks are mutually exclusive",
+		);
+	}
 	const nowMs = now();
 	return {
 		promptPath,
@@ -442,7 +453,7 @@ export function parseSimpleArgs(argv, { now = Date.now } = {}) {
 		predecessorReceiptPath,
 		checks: checks.map((check) => check.trim()),
 		baselineChecks: baselineChecks.map((check) => check.trim()),
-		repairChecks: parsed.values["repair-checks"] === true,
+		repairChecks: parsed.values["no-repair-checks"] !== true,
 		deadlineMs: parseDeadline(parsed.values.deadline, nowMs),
 		routingRunId,
 	};

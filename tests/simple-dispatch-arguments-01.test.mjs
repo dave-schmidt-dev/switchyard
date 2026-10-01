@@ -1,4 +1,4 @@
-import { deepStrictEqual, throws } from "node:assert";
+import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";
 import {
 	existsSync,
@@ -226,6 +226,40 @@ describe("simple dispatch argument boundary", () => {
 		deepStrictEqual(
 			parseSimpleArgs(base, { now: () => 1_000 }).allowManifests,
 			[],
+		);
+	});
+	it("repairs acceptance checks by default and rejects conflicting flags", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"standard",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+			"--deadline",
+			"1970-01-01T00:10:00Z",
+		];
+		strictEqual(parseSimpleArgs(base, { now: () => 1_000 }).repairChecks, true);
+		strictEqual(
+			parseSimpleArgs([...base, "--no-repair-checks"], { now: () => 1_000 })
+				.repairChecks,
+			false,
+		);
+		strictEqual(
+			parseSimpleArgs([...base, "--repair-checks"], { now: () => 1_000 })
+				.repairChecks,
+			true,
+		);
+		throws(
+			() =>
+				parseSimpleArgs([...base, "--repair-checks", "--no-repair-checks"], {
+					now: () => 1_000,
+				}),
+			/--repair-checks and --no-repair-checks are mutually exclusive/,
 		);
 	});
 });
