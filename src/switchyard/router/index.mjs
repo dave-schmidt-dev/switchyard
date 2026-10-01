@@ -141,7 +141,8 @@ export function route(options = {}) {
 	let ambiguousTargetSkips = 0;
 
 	// Implementor-priority routing partitions survivors by roster-declared tier.
-	// Tier 1 drains in roster order; tiers 2 and 3 spread within their own tier.
+	// Tier 1 picks the eligible target furthest ahead of pace (roster order
+	// breaks ties); tiers 2 and 3 spread within their own tier.
 	// Other numeric priorities remain in the legacy ranked pool so older roster
 	// entries retain their prior behavior.
 	//   - unrankedPool: every other funded provider (Claude, Codex,
@@ -409,12 +410,17 @@ export function route(options = {}) {
 		return best;
 	}
 
-	// Tier 1 is a simple sequential drain. It deliberately does not inspect
-	// headroom, pace, jitter, seed, or snapshot order once eligibility has been
-	// established. The roster target order is the policy's stable tie-break;
-	// target id/name keeps malformed or synthetic rosters deterministic.
+	// Tier 1 picks the eligible target furthest ahead of pace (highest
+	// minimum Gradus pace_delta across its windows). It deliberately does
+	// not inspect headroom, jitter, seed, or snapshot order once eligibility
+	// has been established. The roster target order is the policy's stable
+	// tie-break; target id/name keeps malformed or synthetic rosters
+	// deterministic.
 	function resolveTierOneWinner(pool) {
 		return pool.reduce((best, candidate) => {
+			if (candidate.pace !== best.pace) {
+				return candidate.pace > best.pace ? candidate : best;
+			}
 			const current = candidate.rosterOrder;
 			const incumbent = best.rosterOrder;
 			if (current.index !== incumbent.index) {

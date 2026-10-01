@@ -231,9 +231,10 @@ describe("router (implementor-priority waterfall routing)", () => {
 		);
 	});
 
-	it("tier 1 drains in roster order and stays sticky as quota falls", () => {
-		// The fixture declares antigravity-claude before antigravity. Snapshot
-		// order, headroom, pace, and seed must not change that tier-1 choice.
+	it("tier 1 picks the candidate furthest ahead of pace even when later in roster order", () => {
+		// The fixture declares antigravity-claude before antigravity. Tier 1
+		// follows pace, so the later roster target wins on a higher pace_delta
+		// regardless of headroom or seed.
 		const tiebreakFixturePath = resolve(
 			__dirname,
 			"fixtures",
@@ -260,39 +261,155 @@ describe("router (implementor-priority waterfall routing)", () => {
 				{
 					name: "Antigravity",
 					ok: true,
-					windows: [{ percent_left: 90, pace_delta: 1 }],
+					windows: [{ percent_left: 40, pace_delta: 999 }],
 				},
 				{
 					name: "Antigravity (Claude)",
 					ok: true,
-					windows: [{ percent_left: 40, pace_delta: 999 }],
+					windows: [{ percent_left: 90, pace_delta: 1 }],
+				},
+			]);
+
+			const result = route({ requiredCapability: "standard", seed: 1 });
+			strictEqual(
+				result.provider,
+				"Antigravity",
+				"tier 1 follows pace despite the other candidate being earlier in roster order with more headroom",
+			);
+			strictEqual(result.reason, "priority_fill");
+		} finally {
+			if (savedRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = savedRosterPath;
+			}
+			__resetRosterCacheForTests();
+			rmSync(qualifiedTiebreakFixturePath, { force: true });
+		}
+	});
+
+	it("tier 1 falls back to roster order when pace is equal", () => {
+		// The fixture declares antigravity-claude before antigravity, so an
+		// equal pace_delta must keep the roster-order tie-break.
+		const tiebreakFixturePath = resolve(
+			__dirname,
+			"fixtures",
+			"roster.priority-tiebreak.fixture.json",
+		);
+		const qualifiedTiebreakFixturePath = join(
+			tmpdir(),
+			`switchyard-router-priority-tiebreak-${process.pid}-${randomUUID()}.json`,
+		);
+		const savedRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		writeFileSync(
+			qualifiedTiebreakFixturePath,
+			JSON.stringify(
+				withDispatchQualifiedDescriptors(
+					JSON.parse(readFileSync(tiebreakFixturePath, "utf8")),
+				),
+			),
+			"utf8",
+		);
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedTiebreakFixturePath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "Antigravity",
+					ok: true,
+					windows: [{ percent_left: 90, pace_delta: 7 }],
+				},
+				{
+					name: "Antigravity (Claude)",
+					ok: true,
+					windows: [{ percent_left: 40, pace_delta: 7 }],
+				},
+			]);
+
+			const result = route({ requiredCapability: "standard", seed: 999 });
+			strictEqual(
+				result.provider,
+				"Antigravity (Claude)",
+				"an equal pace_delta must fall back to roster order (antigravity-claude first)",
+			);
+			strictEqual(result.reason, "priority_fill");
+		} finally {
+			if (savedRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = savedRosterPath;
+			}
+			__resetRosterCacheForTests();
+			rmSync(qualifiedTiebreakFixturePath, { force: true });
+		}
+	});
+
+	it("tier 1 winner changes when the pace values swap (no stickiness)", () => {
+		// The fixture declares antigravity-claude before antigravity. Whichever
+		// candidate has the higher pace_delta wins, so swapping the paces must
+		// swap the winner on the very next route call.
+		const tiebreakFixturePath = resolve(
+			__dirname,
+			"fixtures",
+			"roster.priority-tiebreak.fixture.json",
+		);
+		const qualifiedTiebreakFixturePath = join(
+			tmpdir(),
+			`switchyard-router-priority-tiebreak-${process.pid}-${randomUUID()}.json`,
+		);
+		const savedRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		writeFileSync(
+			qualifiedTiebreakFixturePath,
+			JSON.stringify(
+				withDispatchQualifiedDescriptors(
+					JSON.parse(readFileSync(tiebreakFixturePath, "utf8")),
+				),
+			),
+			"utf8",
+		);
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedTiebreakFixturePath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "Antigravity",
+					ok: true,
+					windows: [{ percent_left: 50, pace_delta: 10 }],
+				},
+				{
+					name: "Antigravity (Claude)",
+					ok: true,
+					windows: [{ percent_left: 50, pace_delta: 5 }],
 				},
 			]);
 
 			let result = route({ requiredCapability: "standard", seed: 1 });
 			strictEqual(
 				result.provider,
-				"Antigravity (Claude)",
-				"tier 1 follows roster order despite the other candidate having more headroom and a different pace",
+				"Antigravity",
+				"the candidate with the higher pace_delta wins",
 			);
 			strictEqual(result.reason, "priority_fill");
 
-			// The incumbent remains first while it has any usable quota, even
-			// when its headroom drops below the later roster candidate.
 			createTestSnapshot([
 				{
 					name: "Antigravity",
 					ok: true,
-					windows: [{ percent_left: 99, pace_delta: 1 }],
+					windows: [{ percent_left: 50, pace_delta: 5 }],
 				},
 				{
 					name: "Antigravity (Claude)",
 					ok: true,
-					windows: [{ percent_left: 1, pace_delta: 999 }],
+					windows: [{ percent_left: 50, pace_delta: 10 }],
 				},
 			]);
-			result = route({ requiredCapability: "standard", seed: 999 });
-			strictEqual(result.provider, "Antigravity (Claude)");
+			result = route({ requiredCapability: "standard", seed: 1 });
+			strictEqual(
+				result.provider,
+				"Antigravity (Claude)",
+				"swapping the pace values must swap the winner — tier 1 is not sticky",
+			);
+			strictEqual(result.reason, "priority_fill");
 		} finally {
 			if (savedRosterPath === undefined) {
 				delete process.env.SWITCHYARD_ROSTER_PATH;
