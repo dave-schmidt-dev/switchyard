@@ -6,6 +6,7 @@ import { after, describe, it } from "node:test";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { readEvents, readRun } from "../src/switchyard/run-store/index.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/simple/reliability.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const suiteRoot = tempDir("switchyard-provider-reliability-");
@@ -103,6 +104,27 @@ after(() => {
 });
 
 describe("simple provider reliability contract", () => {
+	it("falls back to the provider exit code when the failure exit code is null", () => {
+		strictEqual(
+			createSimpleProviderReliabilityDiagnostic({
+				failureReason: "provider_exit_nonzero",
+				failurePhase: "execute",
+				exitCode: null,
+				providerResult: { code: 1 },
+			}).exitCode,
+			1,
+		);
+		strictEqual(
+			createSimpleProviderReliabilityDiagnostic({
+				failureReason: "provider_exit_nonzero",
+				failurePhase: "execute",
+				exitCode: 2,
+				providerResult: { code: 1 },
+			}).exitCode,
+			2,
+		);
+	});
+
 	it("records unknown provider exits without claiming a cause and binds the descriptor", async () => {
 		const repo = makeRepo();
 		const result = await runSimpleTask(

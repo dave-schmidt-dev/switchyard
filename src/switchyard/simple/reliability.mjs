@@ -79,15 +79,9 @@ export function createSimpleProviderReliabilityDiagnostic(input = {}) {
 	return createProviderReliabilityDiagnostic({
 		causeCode: code,
 		phase: phaseForFailure(failurePhase),
-		exitCode: Object.hasOwn(input, "exitCode")
-			? input.exitCode
-			: input.providerResult?.code,
-		signal: Object.hasOwn(input, "signal")
-			? input.signal
-			: input.providerResult?.signal,
-		timedOut: Object.hasOwn(input, "timedOut")
-			? input.timedOut
-			: input.providerResult?.timedOut,
+		exitCode: input.exitCode ?? input.providerResult?.code,
+		signal: input.signal ?? input.providerResult?.signal,
+		timedOut: input.timedOut ?? input.providerResult?.timedOut,
 		cancelled:
 			input.cancelled ??
 			(input.providerResult?.cancelled === true ||

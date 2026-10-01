@@ -350,17 +350,23 @@ export function providerCodeForOpenCodeGoBridgeEvidence(evidence) {
 		: null;
 }
 /**
- * Vibe prints its own upstream error block on stderr when Mistral answers 402
- * for an exhausted allowance. Only that block counts; model output on stdout
- * never does.
+ * Vibe prints its own upstream error block on stderr when Mistral rejects a
+ * request. Only that block counts; model output on stdout never does. The
+ * upstream status decides the code: 402 with a billing budget-exhausted type
+ * is quota_exhausted, 401/403 are auth_expired, 404 is model_unavailable, and
+ * anything else (429, 5xx, ...) is not recognised.
  */
 export function providerCodeForVibeBudgetEvidence(stderr) {
 	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
-	return /^Error: API error from mistral\b/mu.test(stderr) &&
-		/^\s*status: 402 Payment Required$/mu.test(stderr) &&
-		/"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(stderr)
-		? "quota_exhausted"
-		: null;
+	if (!/^Error: API error from mistral\b/mu.test(stderr)) return null;
+	const status = /^\s*status: (\d{3}) /mu.exec(stderr)?.[1];
+	if (status === "402")
+		return /"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(stderr)
+			? "quota_exhausted"
+			: null;
+	if (status === "401" || status === "403") return "auth_expired";
+	if (status === "404") return "model_unavailable";
+	return null;
 }
 async function defaultRunCheck({
 	command,

@@ -21,6 +21,26 @@ test("Vibe 402 budget-exhausted block maps to quota_exhausted", () => {
 	);
 });
 
+test("Vibe 401, 403 and 404 blocks map to auth_expired and model_unavailable", () => {
+	const withStatus = (statusLine) =>
+		REAL_402.replace("402 Payment Required", statusLine).replace(
+			/"type":"billing_api_budget_exhausted"/u,
+			'"type":"other"',
+		);
+	assert.equal(
+		providerCodeForVibeBudgetEvidence(withStatus("401 Unauthorized")),
+		"auth_expired",
+	);
+	assert.equal(
+		providerCodeForVibeBudgetEvidence(withStatus("403 Forbidden")),
+		"auth_expired",
+	);
+	assert.equal(
+		providerCodeForVibeBudgetEvidence(withStatus("404 Not Found")),
+		"model_unavailable",
+	);
+});
+
 test("other Vibe failures and lookalike text are not budget evidence", () => {
 	const cases = [
 		undefined,
