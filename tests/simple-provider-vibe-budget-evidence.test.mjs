@@ -54,6 +54,8 @@ test("other Vibe failures and lookalike text are not budget evidence", () => {
 		// A model quoting the phrase is not Vibe's own error block.
 		'the model said status: 402 Payment Required "type":"billing_api_budget_exhausted"',
 		"x".repeat(1_000_001),
+		// A status line before Vibe's block must not decide the code.
+		"  status: 401 Unauthorized\nError: API error from mistral\n  status: 429 Too Many Requests\n",
 	];
 	for (const value of cases)
 		assert.equal(providerCodeForVibeBudgetEvidence(value), null);

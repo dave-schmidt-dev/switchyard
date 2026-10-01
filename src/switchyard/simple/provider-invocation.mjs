@@ -358,10 +358,13 @@ export function providerCodeForOpenCodeGoBridgeEvidence(evidence) {
  */
 export function providerCodeForVibeBudgetEvidence(stderr) {
 	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
-	if (!/^Error: API error from mistral\b/mu.test(stderr)) return null;
-	const status = /^\s*status: (\d{3}) /mu.exec(stderr)?.[1];
+	const start = /^Error: API error from mistral\b/mu.exec(stderr)?.index;
+	if (start === undefined) return null;
+	// Read status only from Vibe's own block, never from earlier output.
+	const block = stderr.slice(start);
+	const status = /^\s*status: (\d{3})\b/mu.exec(block)?.[1];
 	if (status === "402")
-		return /"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(stderr)
+		return /"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(block)
 			? "quota_exhausted"
 			: null;
 	if (status === "401" || status === "403") return "auth_expired";
