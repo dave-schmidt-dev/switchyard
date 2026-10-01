@@ -297,7 +297,10 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					pendingAttempt: pending,
 				});
 			const failed = result.status !== "succeeded";
-			const tried = result.recovery.cleanup.writer.state === "stopped";
+			// A baseline failure precedes the provider and is not evidence against the target.
+			const tried =
+				result.failurePhase !== "baseline" &&
+				result.recovery.cleanup.writer.state === "stopped";
 			const safeRetry =
 				failed &&
 				tried &&

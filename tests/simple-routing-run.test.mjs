@@ -61,23 +61,31 @@ function fixture(overrides = {}) {
 		strictEqual(pending.targetId, targetId);
 		const behavior = overrides[targetId] ?? {};
 		const status = behavior.status ?? "succeeded";
+		const failed = status === "failed";
 		const worktree = behavior.retained ? "retained" : "removed";
+		const failureReason =
+			behavior.result?.failureReason ??
+			(failed ? "provider_exit_nonzero" : null);
+		const failurePhase =
+			behavior.result?.failurePhase ?? (failed ? "execute" : null);
+		const errorKind =
+			behavior.result?.errorKind ?? (failed ? "execution_failed" : null);
 		const result = {
 			runId: context.runId,
 			taskId: context.taskId,
 			attemptId: context.attemptId,
 			targetId,
 			status,
-			failureReason: status === "failed" ? "provider_exit_nonzero" : null,
-			failurePhase: status === "failed" ? "execute" : null,
-			errorKind: status === "failed" ? "execution_failed" : null,
+			failureReason,
+			failurePhase,
+			errorKind,
 			partialWorktree: behavior.retained ? join(projectPath, "retained") : null,
 			recovery: {
 				schemaVersion: 1,
 				result: {
 					status,
-					failureReason: status === "failed" ? "provider_exit_nonzero" : null,
-					failurePhase: status === "failed" ? "execute" : null,
+					failureReason,
+					failurePhase,
 				},
 				identity: {
 					taskId: context.taskId,
@@ -264,6 +272,27 @@ test("failed pin is never reused and pre-route input failures do not invoke rout
 		}).failedTargetIds,
 		[],
 	);
+});
+test("baseline failure stops without marking the target failed for the run", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				failurePhase: "baseline",
+				failureReason: "baseline_check_failed",
+				errorKind: "environment_failure",
+			},
+		},
+	});
+	const outcome = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(outcome.direction, "stop");
+	deepStrictEqual(f.calls, ["antigravity-claude"]);
+	const state = readRoutingRunState(f.options.projectPath, "run-1", {
+		stateRoot: f.deps.stateRoot,
+	});
+	deepStrictEqual(state.failedTargetIds, []);
+	strictEqual(state.attempts.length, 1);
+	strictEqual(state.attempts[0].terminal, "skipped");
 });
 test("allocation and terminal durability failure stop before reroute", async () => {
 	for (const failAt of [1, 2]) {
