@@ -326,7 +326,9 @@ esac
 			name: "reports bounded row truncation without claiming completion",
 			options: { behavior: "many" },
 			expected: "managed VM inventory truncated (row limit=256",
-			maxElapsedMs: 5_000,
+			// Usually ~1.5s; a loaded host took 6.5s. A deadline timeout still
+			// fails on the log check, so the wall-clock bound only catches hangs.
+			maxElapsedMs: 10_000,
 			noCandidates: false,
 			expectedCalls: 1,
 		},
