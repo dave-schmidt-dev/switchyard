@@ -417,9 +417,20 @@ export function route(options = {}) {
 	// tie-break; target id/name keeps malformed or synthetic rosters
 	// deterministic.
 	function resolveTierOneWinner(pool) {
+		// Unknown pace ranks below any measured pace.
+		const paceKey = (candidate) =>
+			(candidate.accountingWindows ?? []).some(
+				(w) =>
+					typeof w.pace_delta === "number" && Number.isFinite(w.pace_delta),
+			)
+				? candidate.pace
+				: -Infinity;
+
 		return pool.reduce((best, candidate) => {
-			if (candidate.pace !== best.pace) {
-				return candidate.pace > best.pace ? candidate : best;
+			const candidateKey = paceKey(candidate);
+			const bestKey = paceKey(best);
+			if (candidateKey !== bestKey) {
+				return candidateKey > bestKey ? candidate : best;
 			}
 			const current = candidate.rosterOrder;
 			const incumbent = best.rosterOrder;

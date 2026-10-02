@@ -321,7 +321,7 @@ test("allocation and terminal durability failure stop before reroute", async () 
 		strictEqual(f.calls.length, failAt === 1 ? 0 : 1);
 	}
 });
-test("production router preserves tier1 roster order, tier2 headroom, quota and descriptor gates", async () => {
+test("production router uses tier1 roster order when pace is unknown, tier2 headroom, quota and descriptor gates", async () => {
 	const f = fixture({
 		"antigravity-claude": { status: "failed" },
 		codex: { status: "failed" },

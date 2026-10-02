@@ -421,6 +421,76 @@ describe("router (implementor-priority waterfall routing)", () => {
 		}
 	});
 
+	it("tier 1 ranks unknown pace below any measured pace and uses minimum pace across windows", () => {
+		const tiebreakFixturePath = resolve(
+			__dirname,
+			"fixtures",
+			"roster.priority-tiebreak.fixture.json",
+		);
+		const qualifiedTiebreakFixturePath = join(
+			tmpdir(),
+			`switchyard-router-priority-tiebreak-${process.pid}-${randomUUID()}.json`,
+		);
+		const savedRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
+		writeFileSync(
+			qualifiedTiebreakFixturePath,
+			JSON.stringify(
+				withDispatchQualifiedDescriptors(
+					JSON.parse(readFileSync(tiebreakFixturePath, "utf8")),
+				),
+			),
+			"utf8",
+		);
+		process.env.SWITCHYARD_ROSTER_PATH = qualifiedTiebreakFixturePath;
+		__resetRosterCacheForTests();
+		try {
+			createTestSnapshot([
+				{
+					name: "Antigravity (Claude)",
+					ok: true,
+					windows: [{ percent_left: 50 }],
+				},
+				{
+					name: "Antigravity",
+					ok: true,
+					windows: [{ percent_left: 50, pace_delta: -0.01 }],
+				},
+			]);
+
+			let result = route({ requiredCapability: "standard" });
+			strictEqual(result.provider, "Antigravity");
+			strictEqual(result.reason, "priority_fill");
+
+			createTestSnapshot([
+				{
+					name: "Antigravity (Claude)",
+					ok: true,
+					windows: [
+						{ percent_left: 50, pace_delta: 0.9 },
+						{ percent_left: 50, pace_delta: -0.5 },
+					],
+				},
+				{
+					name: "Antigravity",
+					ok: true,
+					windows: [{ percent_left: 50, pace_delta: 0.1 }],
+				},
+			]);
+
+			result = route({ requiredCapability: "standard" });
+			strictEqual(result.provider, "Antigravity");
+			strictEqual(result.reason, "priority_fill");
+		} finally {
+			if (savedRosterPath === undefined) {
+				delete process.env.SWITCHYARD_ROSTER_PATH;
+			} else {
+				process.env.SWITCHYARD_ROSTER_PATH = savedRosterPath;
+			}
+			__resetRosterCacheForTests();
+			rmSync(qualifiedTiebreakFixturePath, { force: true });
+		}
+	});
+
 	it("balances within tier 2 and does not enter tier 3 before tier 2 is unusable", () => {
 		const rosterPath = join(
 			tmpdir(),
