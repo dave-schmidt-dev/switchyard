@@ -24,11 +24,11 @@ describe("test phase aggregation runner", () => {
 			createHash("sha256")
 				.update(script.replace("--test-concurrency=2 ", ""))
 				.digest("hex"),
-			"b707ced80802b82d34a900100cf51e4c47586530c0e319427914d30e5d25b071",
+			"6c106041256d6913ecac261af4f2bc51dc55cd469e57a25ddf12fe82c40b2d91",
 		);
 		strictEqual(
 			createHash("sha256").update(pkg.scripts["test:serial"]).digest("hex"),
-			"27d5bf0b1872ec39f67b8a771060c4e802120094f9bf373bd0c7ff73b43be50b",
+			"312c49165012b2b0cccd87ff339e0524502701d3bb7acc5f4645c2428ac0ff36",
 		);
 		ok(
 			script.endsWith(
