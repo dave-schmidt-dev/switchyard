@@ -18,6 +18,7 @@ import {
 } from "./checkpoint-store.mjs";
 import {
 	CHECKPOINT_VERSION,
+	hashBytes,
 	VM_SLOT_WAIT_INTERVAL_MS,
 	VM_SLOT_WAIT_TIMEOUT_MS,
 } from "./constants.mjs";
@@ -38,7 +39,6 @@ import {
 	ensureRetryCheckpoint,
 	validateRetryDescriptorEvidence,
 } from "./quick-checks.mjs";
-import { hashBytes } from "./reconciliation-intent.mjs";
 import { ensureProviderAttemptAllocations } from "./retry-transitions.mjs";
 import { readQueueHostPower } from "./route-health.mjs";
 import { assertCheckpointRecoverySafe } from "./task-base.mjs";

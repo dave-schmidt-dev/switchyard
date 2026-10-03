@@ -92,7 +92,6 @@ import {
 	loadCheckpoint,
 	loadTaskQueue,
 	normalizeRunOptions,
-	reconcileExternalCompletion,
 	runQueueAsync,
 	sanitizeQueuePreflightDetail,
 	validateCallerInputs,
@@ -159,10 +158,6 @@ async function main(argv) {
 				await handleHealth(subArgs);
 				break;
 			}
-			case "reconcile-completion": {
-				await handleReconcileCompletion(subArgs);
-				break;
-			}
 			case "remediate-orphaned-locks": {
 				await handleOrphanLockRemediation(subArgs);
 				break;
@@ -214,7 +209,6 @@ export {
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
-	parseReconcileCompletionArgs,
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,
@@ -222,7 +216,6 @@ export {
 export {
 	handleHealth,
 	handleOrphanLockRemediation,
-	handleReconcileCompletion,
 	handleValidateInputs,
 	markLauncherReadyIfLaunching,
 } from "./cli-handlers.mjs";
@@ -267,7 +260,6 @@ import {
 	handleBackendHealth,
 	handleHealth,
 	handleOrphanLockRemediation,
-	handleReconcileCompletion,
 	handleValidateInputs,
 } from "./cli-handlers.mjs";
 import {

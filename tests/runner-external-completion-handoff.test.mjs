@@ -5,7 +5,6 @@ import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
 	createCliOrchestrator,
-	reconcileExternalCompletion,
 	resolveOrchestrator,
 	waitForJobCompletion,
 } from "../src/switchyard/runner/index.mjs";
@@ -37,13 +36,6 @@ afterEach(() => {
 	} catch {
 		// no-op
 	}
-});
-describe("external completion handoff", () => {
-	it("fails closed before reading or mutating any checkpoint for malformed input", async () => {
-		const result = await reconcileExternalCompletion({});
-		strictEqual(result.status, "refused");
-		strictEqual(result.reasonCode, "malformed_receipt");
-	});
 });
 describe("runner no-provider outcome uses a safe route reason code (Task D.3)", () => {
 	it("maps an untrusted route reason to a closed code in result and ledger", () => {

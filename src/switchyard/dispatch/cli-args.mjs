@@ -258,46 +258,6 @@ function parseHealthArgs(argv) {
 		throw new UsageError("health attest-repair --repair-kind is required");
 	return { action, ...base, repairKind: parsed.values["repair-kind"] };
 }
-function parseReconcileCompletionArgs(argv) {
-	let parsed;
-	try {
-		parsed = parseArgs({
-			args: argv,
-			allowPositionals: false,
-			options: {
-				receipt: { type: "string" },
-				"source-checkpoint": { type: "string" },
-				"successor-checkpoint": { type: "string" },
-				tasks: { type: "string" },
-				project: { type: "string" },
-				json: { type: "boolean", default: false },
-				help: { type: "boolean", default: false },
-			},
-		});
-	} catch (error) {
-		throw new UsageError(error.message);
-	}
-	if (parsed.values.help) return { help: true };
-	const required = [
-		"receipt",
-		"source-checkpoint",
-		"successor-checkpoint",
-		"tasks",
-		"project",
-	];
-	if (required.some((field) => !parsed.values[field]))
-		throw new UsageError(
-			"reconcile-completion requires --receipt, --source-checkpoint, --successor-checkpoint, --tasks, and --project",
-		);
-	return {
-		receiptPath: resolve(parsed.values.receipt),
-		sourceCheckpointPath: resolve(parsed.values["source-checkpoint"]),
-		successorCheckpointPath: resolve(parsed.values["successor-checkpoint"]),
-		tasksFilePath: resolve(parsed.values.tasks),
-		projectPath: resolve(parsed.values.project),
-		json: parsed.values.json,
-	};
-}
 function parseOrphanLockRemediationArgs(argv) {
 	let parsed;
 	try {
@@ -329,7 +289,6 @@ export {
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
-	parseReconcileCompletionArgs,
 	parseRecoverArgs,
 	parseResultArgs,
 	parseStatusArgs,

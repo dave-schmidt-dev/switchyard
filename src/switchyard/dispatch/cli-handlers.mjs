@@ -25,20 +25,17 @@ import {
 } from "../run-store/index.mjs";
 import {
 	CallerInputValidationError,
-	reconcileExternalCompletion,
 	validateCallerInputs,
 } from "../runner/index.mjs";
 import {
 	parseDispatchArgs,
 	parseHealthArgs,
 	parseOrphanLockRemediationArgs,
-	parseReconcileCompletionArgs,
 	withStateRoot,
 } from "./cli-args.mjs";
 import {
 	USAGE_BACKEND_HEALTH,
 	USAGE_HEALTH,
-	USAGE_RECONCILE_COMPLETION,
 	USAGE_VALIDATE_INPUTS,
 	UsageError,
 } from "./cli-usage.mjs";
@@ -276,24 +273,6 @@ export async function handleBackendHealth(argv, dependencies = {}) {
 		process.exitCode = 1;
 	}
 }
-async function handleReconcileCompletion(argv) {
-	const options = parseReconcileCompletionArgs(argv);
-	if (options.help) {
-		console.log(USAGE_RECONCILE_COMPLETION);
-		return;
-	}
-	// The runner owns every receipt trust check (lstat, bounds, owner, mode,
-	// nonsymlink, and only then JSON parsing).  Keeping the CLI path-only also
-	// prevents FIFOs and symlink targets from being opened before that gate.
-	const result = await reconcileExternalCompletion(options);
-	if (options.json) console.log(JSON.stringify(result));
-	else
-		console.log(
-			`${result.status}: ${result.result}${result.reasonCode ? ` (${result.reasonCode})` : ""}`,
-		);
-	if (["refused", "recovery-required"].includes(result.status))
-		process.exitCode = 1;
-}
 async function handleHealth(argv) {
 	const input = parseHealthArgs(argv);
 	if (input.help) {
@@ -332,7 +311,6 @@ export {
 	finalizeInitializedLaunchFailure,
 	handleHealth,
 	handleOrphanLockRemediation,
-	handleReconcileCompletion,
 	handleValidateInputs,
 	markLauncherReadyIfLaunching,
 	materializeValidatedDirtyOverlay,

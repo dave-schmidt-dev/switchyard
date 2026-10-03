@@ -97,18 +97,6 @@ describe("broker async executor", () => {
 			new URL("../src/switchyard/runner/quick-checks.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/checkpoint-store.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/checkpoint-load.mjs", import.meta.url),
-			new URL(
-				"../src/switchyard/runner/reconciliation-intent.mjs",
-				import.meta.url,
-			),
-			new URL(
-				"../src/switchyard/runner/reconciliation-validate.mjs",
-				import.meta.url,
-			),
-			new URL(
-				"../src/switchyard/runner/external-completion.mjs",
-				import.meta.url,
-			),
 			new URL("../src/switchyard/runner/artifacts.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/queue-selection.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/caller-inputs.mjs", import.meta.url),

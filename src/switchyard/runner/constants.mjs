@@ -141,31 +141,22 @@ export function createQueueIdentity({
 	};
 	return createHash("sha256").update(stableStringify(payload)).digest("hex");
 }
-const EXTERNAL_COMPLETION_VERSION = 1;
-const RECONCILIATION_INTENT_VERSION = 1;
-const RECONCILIATION_INTENT_STATES = Object.freeze([
-	"prepared",
-	"successor_recorded",
-	"ledger_recorded",
-	"completed",
-]);
-const EXTERNAL_COMPLETION_MAX_RECEIPT_BYTES = 1024 * 1024;
-const RECONCILIATION_INTENT_MAX_BYTES = 8 * 1024 * 1024;
+const CHECKPOINT_ARTIFACT_MAX_FILE_BYTES = 16 * 1024 * 1024;
+function hashBytes(value) {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 export {
 	BOUNDED_ERROR_KINDS,
+	CHECKPOINT_ARTIFACT_MAX_FILE_BYTES,
 	CHECKPOINT_VERSION,
 	checkpointOwners,
 	DIAGNOSTIC_REF_RE,
 	EXTERNAL_BLOCKER_ID_RE,
-	EXTERNAL_COMPLETION_MAX_RECEIPT_BYTES,
-	EXTERNAL_COMPLETION_VERSION,
 	HISTORICAL_CHECKPOINT_VERSION,
+	hashBytes,
 	KNOWN_TASK_STATUSES,
 	normalizeIds,
-	RECONCILIATION_INTENT_MAX_BYTES,
-	RECONCILIATION_INTENT_STATES,
-	RECONCILIATION_INTENT_VERSION,
 	RUNNABLE_TASK_STATUSES,
 	stableStringify,
 	TASK_ID_PATTERN,

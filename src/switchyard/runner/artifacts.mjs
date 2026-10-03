@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { saveCheckpoint } from "./checkpoint-store.mjs";
-import { CHECKPOINT_ARTIFACT_MAX_FILE_BYTES } from "./reconciliation-intent.mjs";
+import { CHECKPOINT_ARTIFACT_MAX_FILE_BYTES } from "./constants.mjs";
 
 function reserveTaskAttempt(checkpoint, checkpointPath, taskId) {
 	checkpoint.taskAttempts ??= {};

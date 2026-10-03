@@ -11,7 +11,6 @@ Subcommands:
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
-  reconcile-completion --receipt <path> ...       Record external completion
   remediate-orphaned-locks [--dry-run|--confirm] [--state-root <path>]
                                                 Interactively remediate orphaned project locks
 
@@ -94,15 +93,6 @@ const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest
   attest-repair: --descriptor <descriptor-identity> --public-configuration-epoch <epoch> --repair-kind <image_repaired|auth_repaired|configuration_repaired> [--health-state-root <path>]
   Run \`health identity\` first: it prints the descriptor identity and public configuration epoch the other two require.
   attest-repair records attended host control metadata only; it never reads credentials or repairs a service.`;
-const USAGE_RECONCILE_COMPLETION = `Usage: switchyard-dispatch reconcile-completion --receipt <path> --source-checkpoint <path> --successor-checkpoint <path> --tasks <path> --project <path>
-
-  --receipt <path>              Versioned bounded external-completion receipt
-  --source-checkpoint <path>    Existing checkpoint, never modified
-  --successor-checkpoint <path> Fresh checkpoint to create
-  --tasks <path>                Exact task file for successor identity
-  --project <path>              Repository containing the integrated commit
-  --json                        Emit JSON
-  --help                        Show this help`;
 const KNOWN_SUBCOMMANDS = new Set([
 	"simple",
 	"run",
@@ -113,7 +103,6 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"result",
 	"recover",
 	"health",
-	"reconcile-completion",
 	"remediate-orphaned-locks",
 	"routing-run",
 ]);
@@ -125,7 +114,6 @@ export {
 	USAGE_BACKEND_HEALTH,
 	USAGE_HEALTH,
 	USAGE_LAUNCH,
-	USAGE_RECONCILE_COMPLETION,
 	USAGE_RECOVER,
 	USAGE_RESULT,
 	USAGE_RUN,

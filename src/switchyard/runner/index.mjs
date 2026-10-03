@@ -101,7 +101,6 @@ export {
 	ORCHESTRATOR_PAYLOAD_VERSION,
 	QUEUE_PLATFORMS,
 } from "./constants.mjs";
-export { reconcileExternalCompletion } from "./external-completion.mjs";
 export {
 	createCliOrchestrator,
 	resolveOrchestrator,
