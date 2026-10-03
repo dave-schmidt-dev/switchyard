@@ -172,10 +172,6 @@ async function main(argv) {
 				await handleRoutingRun(subArgs);
 				break;
 			}
-			case "gc": {
-				await handleGc(subArgs);
-				break;
-			}
 			default:
 				throw new UsageError(`unknown subcommand: ${subcommand}`);
 		}
@@ -215,7 +211,6 @@ if (
 
 export {
 	parseDispatchArgs,
-	parseGcArgs,
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
@@ -233,7 +228,6 @@ export {
 } from "./cli-handlers.mjs";
 export {
 	USAGE,
-	USAGE_GC,
 	USAGE_LAUNCH,
 	USAGE_RECOVER,
 	USAGE_RESULT,
@@ -241,11 +235,6 @@ export {
 	USAGE_STATUS,
 	USAGE_VALIDATE_INPUTS,
 } from "./cli-usage.mjs";
-export {
-	collectGcInventory,
-	defaultMeasureApfsPrivateBytes,
-	handleGc,
-} from "./gc.mjs";
 export {
 	captureHostFingerprint,
 	renewDispatchReceipts,
@@ -273,7 +262,7 @@ import "./result.mjs";
 import "./recover-liveness.mjs";
 import "./recover-reclaim.mjs";
 import { guardRoutingLaunch } from "../simple/routing-cli.mjs";
-import { parseGcArgs, parseRecoverArgs, withStateRoot } from "./cli-args.mjs";
+import { parseRecoverArgs, withStateRoot } from "./cli-args.mjs";
 import {
 	handleBackendHealth,
 	handleHealth,
@@ -284,7 +273,6 @@ import {
 import {
 	KNOWN_SUBCOMMANDS,
 	USAGE,
-	USAGE_GC,
 	USAGE_RECOVER,
 	USAGE_RUN,
 	UsageError,
@@ -321,6 +309,4 @@ export { handleBackendHealth } from "./cli-handlers.mjs";
 
 import "./recover.mjs";
 import "./gc-roots.mjs";
-import "./gc.mjs";
-import { handleGc } from "./gc.mjs";
 import { handleRecover } from "./recover.mjs";

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
@@ -17,29 +16,6 @@ import {
 } from "../simple/worktree-cleanup.mjs";
 import { isTerminalState } from "./result.mjs";
 
-function isFixture(name, worktreeRecord, dirPath, exists = existsSync) {
-	if (typeof name === "string" && /fixture/i.test(name)) return true;
-	if (worktreeRecord) {
-		if (worktreeRecord.worktree?.reason === "fixture") return true;
-		if (
-			typeof worktreeRecord.runId === "string" &&
-			/fixture/i.test(worktreeRecord.runId)
-		) {
-			return true;
-		}
-	}
-	if (dirPath && exists(dirPath)) {
-		try {
-			if (
-				exists(join(dirPath, ".fixture")) ||
-				exists(join(dirPath, "fixture"))
-			) {
-				return true;
-			}
-		} catch {}
-	}
-	return false;
-}
 async function hasRecentWorktreeEntry(rootPath, cutoffMs, dependencies = {}) {
 	const readDirectory = dependencies.readdir ?? readdir;
 	const stat = dependencies.lstat ?? lstat;
@@ -234,4 +210,4 @@ async function applyRecordedSimpleCleanup(root, dependencies = {}) {
 	}
 }
 
-export { applyRecordedSimpleCleanup, assessGcRootBeforeOpenScan, isFixture };
+export { applyRecordedSimpleCleanup, assessGcRootBeforeOpenScan };

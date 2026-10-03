@@ -11,7 +11,6 @@ Subcommands:
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects
-  gc [--state-root <path>] [--json]               Dry-run JSON inventory of simple roots
   reconcile-completion --receipt <path> ...       Record external completion
   remediate-orphaned-locks [--dry-run|--confirm] [--state-root <path>]
                                                 Interactively remediate orphaned project locks
@@ -88,12 +87,6 @@ const USAGE_RECOVER = `Usage: switchyard-dispatch recover [--run <run-id>] [--st
 
   Simple candidates include runLiveness (worker PID state, not writer proof).
   Running simple targets skip global project-lock cleanup to protect possible child writers.`;
-const USAGE_GC = `Usage: switchyard-dispatch gc [--state-root <path>] [--json] [--apply]
-
-  --state-root <path>  Read run records from this durable state root
-  --json               Output as JSON (default behavior)
-  --apply              Remove only eligible recorded roots
-  --help               Show this help`;
 const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest-repair> --target <target-id> [options]
 
   identity:      --capability <low|standard|high>
@@ -119,7 +112,6 @@ const KNOWN_SUBCOMMANDS = new Set([
 	"status",
 	"result",
 	"recover",
-	"gc",
 	"health",
 	"reconcile-completion",
 	"remediate-orphaned-locks",
@@ -131,7 +123,6 @@ export {
 	KNOWN_SUBCOMMANDS,
 	USAGE,
 	USAGE_BACKEND_HEALTH,
-	USAGE_GC,
 	USAGE_HEALTH,
 	USAGE_LAUNCH,
 	USAGE_RECONCILE_COMPLETION,

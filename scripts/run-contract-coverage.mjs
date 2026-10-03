@@ -144,7 +144,6 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 			"src/switchyard/dispatch/recover-reclaim.mjs",
 			"src/switchyard/dispatch/recover.mjs",
 			"src/switchyard/dispatch/gc-roots.mjs",
-			"src/switchyard/dispatch/gc.mjs",
 		],
 		lines: 55,
 		branches: 30,

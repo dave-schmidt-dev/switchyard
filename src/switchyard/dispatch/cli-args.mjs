@@ -323,36 +323,9 @@ function parseOrphanLockRemediationArgs(argv) {
 		stateRoot: parsed.values["state-root"] ?? null,
 	};
 }
-function parseGcArgs(argv) {
-	let parsed;
-	try {
-		parsed = parseArgs({
-			args: argv,
-			allowPositionals: false,
-			options: {
-				"state-root": { type: "string" },
-				json: { type: "boolean", default: false },
-				help: { type: "boolean", default: false },
-				apply: { type: "boolean", default: false },
-			},
-		});
-	} catch (error) {
-		throw new UsageError(error.message);
-	}
-
-	return {
-		apply: parsed.values.apply,
-		help: parsed.values.help,
-		json: parsed.values.json,
-		stateRoot: parsed.values["state-root"]
-			? resolve(parsed.values["state-root"])
-			: null,
-	};
-}
 
 export {
 	parseDispatchArgs,
-	parseGcArgs,
 	parseHealthArgs,
 	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
