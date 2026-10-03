@@ -92,6 +92,8 @@ describe("contract coverage groups", () => {
 			"simple-failure-finalization",
 			"simple-failure-accountability",
 			"simple-launcher-preflight",
+			"integration-metadata-process",
+			"integration-metadata-refusal",
 		].map((name) => `tests/${name}.test.mjs`);
 		strictEqual(new Set(plan.suites).size, plan.suites.length);
 		for (const path of regressions)

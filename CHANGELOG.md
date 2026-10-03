@@ -4,6 +4,10 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ## [Unreleased]
 
+### Fixed
+
+- Integration now rejects incomplete Git metadata and stops stalled metadata checks after 30 seconds, preventing unsafe acceptance and indefinite waits.
+
 ## [0.3.0] - 2026-10-02
 
 ### Added

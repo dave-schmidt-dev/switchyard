@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { applyReviewedDiff, getScopedFingerprint } from "./apply.mjs";
 
 import {
-	classifyApplyFailure,
 	extractSummaryLines,
 	extractTouchedPaths,
+	metadataFailureRefusal,
 	normalizePatch,
 	parseRenamePaths,
 	validateDiff,
@@ -49,19 +49,27 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 			}
 		}
 
-		const { paths: touchedPaths, stderr: numstatStderr } = extractTouchedPaths(
-			patch,
-			projectPath,
-		);
-		if (touchedPaths === null) {
+		const { paths: touchedPaths, failure: numstatFailure } =
+			extractTouchedPaths(patch, projectPath);
+		if (numstatFailure !== null) {
+			const refusal = metadataFailureRefusal(numstatFailure);
 			return {
 				success: false,
-				message: "diff could not be parsed by git apply",
-				reasonKind: classifyApplyFailure(numstatStderr),
+				message: refusal.reason,
+				reasonKind: refusal.reasonKind,
 			};
 		}
 
-		const summaryLines = extractSummaryLines(patch, projectPath);
+		const { lines: summaryLines, failure: summaryFailure } =
+			extractSummaryLines(patch, projectPath);
+		if (summaryFailure !== null) {
+			const refusal = metadataFailureRefusal(summaryFailure);
+			return {
+				success: false,
+				message: refusal.reason,
+				reasonKind: refusal.reasonKind,
+			};
+		}
 		const renameSources = [];
 		for (const line of summaryLines) {
 			const paths = parseRenamePaths(line);
@@ -238,6 +246,7 @@ export {
 export {
 	APPLY_CHECK_MAX_BUFFER,
 	dequoteGitPath,
+	METADATA_COMMAND_TIMEOUT_MS,
 	manifestReviewPaths,
 	validateDiff,
 } from "./diff-validation.mjs";
