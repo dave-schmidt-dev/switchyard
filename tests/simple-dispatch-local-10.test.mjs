@@ -425,7 +425,12 @@ describe("simple local execution path", () => {
 			dependencies({
 				executeProvider: async () => {
 					calls += 1;
-					return { success: false, code: null, silenceTimedOut: true };
+					return {
+						success: false,
+						code: null,
+						silenceTimedOut: true,
+						writerLifecycle: "stopped",
+					};
 				},
 			}),
 		);

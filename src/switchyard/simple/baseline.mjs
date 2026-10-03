@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { materializeDirtyOverlay } from "../lifecycle/index.mjs";
+import { git, MAX_CAPTURE_BYTES, requireGit, SECRET_PATHS } from "./args.mjs";
 
 const BASELINE_STATUS_TIMEOUT_MS = 5_000;
 const SAFE_SIGNALS = new Set(["SIGINT", "SIGTERM", "SIGKILL", "SIGABRT"]);
@@ -130,4 +132,53 @@ export async function runSimpleBaselineChecks({
 		};
 	}
 	return { status: "passed", checks: results };
+}
+
+/** Replay the captured overlay and establish the exact provider/checker base. */
+export function prepareSimpleOverlayBaseline({
+	worktreePath,
+	dirtyOverlayReceipt,
+	baselinePaths,
+	deadlineMs,
+	now,
+}) {
+	materializeDirtyOverlay(worktreePath, dirtyOverlayReceipt, {
+		maxFileBytes: MAX_CAPTURE_BYTES,
+		secretPaths: SECRET_PATHS,
+	});
+	requireGit(
+		worktreePath,
+		["add", "-A", "--", ...baselinePaths],
+		"dirty_overlay_stage_failed",
+		{ timeout: Math.max(1, deadlineMs - now()) },
+	);
+	const overlayDiff = git(worktreePath, ["diff", "--cached", "--quiet"], {
+		timeout: Math.max(1, deadlineMs - now()),
+	});
+	if (overlayDiff.status === 1) {
+		requireGit(
+			worktreePath,
+			[
+				"-c",
+				"user.name=switchyard",
+				"-c",
+				"user.email=switchyard@localhost",
+				"commit",
+				"-qm",
+				"switchyard-dirty-overlay",
+			],
+			"dirty_overlay_baseline_failed",
+			{ timeout: Math.max(1, deadlineMs - now()) },
+		);
+	} else if (overlayDiff.status !== 0) {
+		throw Object.assign(new Error("dirty_overlay_baseline_failed"), {
+			code: "dirty_overlay_baseline_failed",
+		});
+	}
+	return requireGit(
+		worktreePath,
+		["rev-parse", "HEAD"],
+		"dirty_overlay_baseline_revision_unavailable",
+		{ timeout: Math.max(1, deadlineMs - now()) },
+	).trim();
 }

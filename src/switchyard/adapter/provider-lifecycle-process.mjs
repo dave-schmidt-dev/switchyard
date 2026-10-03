@@ -37,6 +37,7 @@ export function runProviderProcess(command, args, options = {}) {
 	const {
 		input,
 		cwd,
+		env,
 		timeoutMs = 30 * 60 * 1000,
 		maxBuffer = DEFAULT_MAX_BUFFER,
 		pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
@@ -305,9 +306,19 @@ export function runProviderProcess(command, args, options = {}) {
 
 		const abort = () => requestTermination("cancel");
 
+		if (signal?.aborted) {
+			cancelled = true;
+			writerLifecycle = "never_started";
+			terminalStatus = "terminated";
+			terminationReason = "cancelled";
+			void terminal();
+			return;
+		}
+
 		try {
 			child = spawnFn(command, args, {
 				cwd,
+				...(env ? { env } : {}),
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 		} catch (error) {

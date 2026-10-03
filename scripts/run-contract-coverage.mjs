@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,30 @@ import {
 
 /** Critical production modules and their minimum native Node coverage. */
 export const CRITICAL_MODULE_COVERAGE = Object.freeze([
+	{
+		path: "src/switchyard/simple/check-session.mjs",
+		lines: 70,
+		branches: 50,
+		functions: 70,
+	},
+	{
+		path: "src/switchyard/simple/failure-finalization.mjs",
+		lines: 70,
+		branches: 50,
+		functions: 70,
+	},
+	{
+		path: "src/switchyard/simple/failure-accountability.mjs",
+		lines: 70,
+		branches: 50,
+		functions: 70,
+	},
+	{
+		path: "src/switchyard/simple/launcher-preflight.mjs",
+		lines: 70,
+		branches: 50,
+		functions: 70,
+	},
 	{
 		path: "src/switchyard/outcome/schema.mjs",
 		lines: 80,
@@ -350,6 +374,7 @@ export function runContractCoverage({
 		join(tmpdir(), "switchyard-coverage-"),
 	);
 	const lcovPath = join(temporaryDirectory, "coverage.lcov");
+	const reportPath = join(temporaryDirectory, "coverage.txt");
 	const global = ["lines", "branches", "functions"].map((kind) =>
 		Math.min(...plan.modules.map((module) => module[kind])),
 	);
@@ -360,6 +385,7 @@ export function runContractCoverage({
 	];
 	try {
 		const args = [
+			"--test-concurrency=1",
 			"--experimental-test-coverage",
 			"--test-coverage-include-all",
 			`--test-coverage-lines=${global[0]}`,
@@ -368,6 +394,8 @@ export function runContractCoverage({
 			...includedPaths.map((path) => `--test-coverage-include=${path}`),
 			"--test-reporter=spec",
 			"--test-reporter-destination=stdout",
+			"--test-reporter=spec",
+			`--test-reporter-destination=${reportPath}`,
 			"--test-reporter=lcov",
 			`--test-reporter-destination=${lcovPath}`,
 			"--test",
@@ -376,10 +404,13 @@ export function runContractCoverage({
 		const result = run(process.execPath, args, {
 			cwd: root,
 			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
+			// Stream the real runner while the second spec reporter retains metrics.
+			stdio: ["ignore", "inherit", "inherit"],
 			env: { ...process.env },
 		});
-		const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		const output = existsSync(reportPath)
+			? readFileSync(reportPath, "utf8")
+			: `${result.stdout ?? ""}${result.stderr ?? ""}`;
 		process.stdout.write(result.stdout ?? "");
 		process.stderr.write(result.stderr ?? "");
 		const textMetrics = parseCoverageReport(output, plan.modules);

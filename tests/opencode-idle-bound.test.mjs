@@ -308,7 +308,7 @@ fi
 		writeExecutable(join(commandDir, "ps"), "#!/bin/sh\nexit 1\n");
 		writeExecutable(
 			join(commandDir, "opencode"),
-			"#!/bin/sh\necho unprobeable-output\nsleep 2\n",
+			"#!/bin/sh\necho unprobeable-output\nsleep 30\n",
 		);
 
 		const result = runSupervisor(commandDir);

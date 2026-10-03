@@ -473,7 +473,7 @@ describe("simple local execution path", () => {
 						"provider write\n",
 						"utf8",
 					);
-					return { success: true };
+					return { success: true, writerLifecycle: "stopped" };
 				},
 			}),
 		);

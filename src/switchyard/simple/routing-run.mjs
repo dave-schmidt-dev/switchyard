@@ -1,11 +1,13 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
 	getImplementorPriority,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
 import { readRun } from "../run-store/index.mjs";
+import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
 	canonicalRoutingProject,
@@ -44,8 +46,7 @@ function lifecycle(result, pending, record, project, options) {
 	const cleanup = result?.recovery?.cleanup;
 	const identity = result?.recovery?.identity;
 	if (
-		!result ||
-		result.recovery?.schemaVersion !== 1 ||
+		result?.recovery?.schemaVersion !== 1 ||
 		JSON.stringify(identity?.scope) !== JSON.stringify(scope) ||
 		result.recovery?.result?.status !== result.status ||
 		result.recovery?.result?.failureReason !== result.failureReason ||
@@ -138,6 +139,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const select = deps.route ?? route;
 	const funded = deps.assertFundedRoute ?? assertFundedRoute;
 	const localExcluded = new Set();
+	const logicalTaskId = deps.taskId ?? randomUUID();
 	let iteration = 0;
 	try {
 		if (handle.state.pendingAttempt)
@@ -168,7 +170,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					stopReason: "routing_attempt_history_cap_exceeded",
 				});
 			const allocation = {
-				taskId: deps.taskId ?? randomUUID(),
+				taskId: logicalTaskId,
 				attemptId:
 					iteration === 0 ? (deps.attemptId ?? randomUUID()) : randomUUID(),
 				runId:
@@ -267,6 +269,18 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					result,
 				});
 			if (!pending) {
+				if (result?.lockConflict && result?.disposition) {
+					const action = result.disposition.action;
+					return answer(
+						["defer", "recover"].includes(action) ? action : "stop",
+						{
+							status: action === "defer" ? "deferred" : "failed",
+							stopReason: result.disposition.reasonCode,
+							result,
+							disposition: result.disposition,
+						},
+					);
+				}
 				if (
 					routeCalled &&
 					noEligible &&
@@ -297,12 +311,26 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					pendingAttempt: pending,
 				});
 			const failed = result.status !== "succeeded";
+			const typed = result.providerReliability !== undefined;
+			const diagnosticMatches = isDeepStrictEqual(
+				result.providerReliability,
+				record.lastFailure?.providerReliability,
+			);
+			const accountability = deriveFailureAccountability({
+				providerReliability: diagnosticMatches
+					? record.lastFailure?.providerReliability
+					: undefined,
+				provenance: record.lastFailure,
+			});
+			if (typed) result.accountability = accountability;
+
 			// A baseline failure precedes the provider and is not evidence against the target.
 			const tried =
 				result.failurePhase !== "baseline" &&
 				result.recovery.cleanup.writer.state === "stopped";
 			const safeRetry =
 				failed &&
+				accountability.causeCategory !== "environment" &&
 				tried &&
 				RETRY.has(result.failureReason) &&
 				["execution_failed", "empty_diff"].includes(result.errorKind) &&
@@ -316,9 +344,13 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			try {
 				recordAttemptOutcome(handle.state, handle.commit, {
 					...pending,
-					terminal: failed ? (tried ? "failed" : "skipped") : "succeeded",
+					terminal: failed
+						? (typed ? accountability.providerMemoryEligible && tried : tried)
+							? "failed"
+							: "skipped"
+						: "succeeded",
 					reason: failed
-						? safeRetry
+						? safeRetry && (!typed || accountability.providerMemoryEligible)
 							? result.failureReason === "empty_diff"
 								? "empty_diff"
 								: "execution_failed"
@@ -335,11 +367,14 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				});
 			}
 			if (!failed) return answer("complete", { result });
+			localExcluded.add(pending.targetId);
 			if (!safeRetry || pinned || options.capability === "high")
 				return answer("stop", {
 					stopReason: result.partialWorktree
 						? "partial_work_retained"
-						: "unsafe_failure",
+						: accountability.causeCategory === "environment"
+							? "environment_failure"
+							: "unsafe_failure",
 					result,
 				});
 		}

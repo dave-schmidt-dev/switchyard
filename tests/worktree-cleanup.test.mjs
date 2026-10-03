@@ -1,5 +1,5 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	chmodSync,
@@ -29,6 +29,12 @@ const SCRIPT_PATH = fileURLToPath(
 	new URL("../scripts/safe-remove-worktree.py", import.meta.url),
 );
 const createdPaths = new Set();
+const PYTHON_HELPER_ENV = {
+	PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+	LANG: "C",
+	LC_ALL: "C",
+	NODE_V8_COVERAGE: "",
+};
 
 function newFixturePath(suffix = "") {
 	const path = join(TEST_PARENT, `${TEST_DIR_PREFIX}${randomUUID()}${suffix}`);
@@ -63,10 +69,11 @@ function helperInput(root, identity, runId, nonce) {
 }
 
 function runHelper(input) {
-	return spawnSync("/usr/bin/python3", [SCRIPT_PATH], {
+	return spawnSync("/usr/bin/python3", ["-I", "-S", SCRIPT_PATH], {
 		encoding: "utf8",
 		input,
 		maxBuffer: 1_000_000,
+		env: PYTHON_HELPER_ENV,
 	});
 }
 
@@ -104,6 +111,75 @@ describe("descriptor-anchored worktree removal", {
 		deepStrictEqual(result, { removed: true, path: quarantine, reason: null });
 		strictEqual(existsSync(root), false);
 		strictEqual(existsSync(quarantine), false);
+	});
+
+	it("isolates the production removal helper from Python startup modules", async () => {
+		const runId = `cleanup-python-isolation-${randomUUID()}`;
+		const nonce = randomUUID();
+		const root = newFixturePath();
+		const quarantine = simpleQuarantinePath(nonce);
+		createdPaths.add(quarantine);
+		const identity = createCandidate(root, runId, nonce);
+		const startupDir = newFixturePath("-python-startup");
+		mkdirSync(startupDir);
+		const siteMarker = join(startupDir, "site-ran");
+		const userMarker = join(startupDir, "user-ran");
+		writeFileSync(
+			join(startupDir, "sitecustomize.py"),
+			`from pathlib import Path\nPath(${JSON.stringify(siteMarker)}).write_text("site")\n`,
+		);
+		writeFileSync(
+			join(startupDir, "usercustomize.py"),
+			`from pathlib import Path\nPath(${JSON.stringify(userMarker)}).write_text("user")\n`,
+		);
+		const claim = {
+			canonicalParent: TEST_PARENT,
+			candidateChild: root.slice(TEST_PARENT.length + 1),
+			path: root,
+			device: identity.dev.toString(),
+			inode: identity.ino.toString(),
+			nonce,
+		};
+		const originalPythonPath = process.env.PYTHONPATH;
+		process.env.PYTHONPATH = startupDir;
+		let invocation;
+		let result;
+		try {
+			const positiveControl = spawnSync("/usr/bin/python3", ["-c", "pass"], {
+				encoding: "utf8",
+			});
+			strictEqual(positiveControl.status, 0, positiveControl.stderr);
+			ok(existsSync(siteMarker));
+			ok(existsSync(userMarker));
+			rmSync(siteMarker);
+			rmSync(userMarker);
+			result = await cleanupSimpleWorktree(
+				runId,
+				claim,
+				{ writerStopped: true },
+				{
+					spawnFn: (command, args, options) => {
+						if (command === "/usr/bin/python3")
+							invocation = { command, args, env: options.env };
+						return spawn(command, args, options);
+					},
+				},
+			);
+		} finally {
+			if (originalPythonPath === undefined) delete process.env.PYTHONPATH;
+			else process.env.PYTHONPATH = originalPythonPath;
+		}
+		deepStrictEqual(result, {
+			removed: true,
+			path: quarantine,
+			reason: null,
+		});
+		strictEqual(invocation.command, "/usr/bin/python3");
+		deepStrictEqual(invocation.args.slice(0, 2), ["-I", "-S"]);
+		strictEqual(invocation.args[2], SCRIPT_PATH);
+		deepStrictEqual(invocation.env, PYTHON_HELPER_ENV);
+		strictEqual(existsSync(siteMarker), false);
+		strictEqual(existsSync(userMarker), false);
 	});
 
 	it("retains an open quarantine and removes it after the handle closes", async () => {
@@ -313,10 +389,15 @@ with patch.object(os, 'rmdir', side_effect=fail_final):
         raise AssertionError('removal unexpectedly succeeded')
 print(len(final_rmdir_attempts), os.path.exists(marker))
 `;
-		const result = spawnSync("/usr/bin/python3", ["-c", python, SCRIPT_PATH], {
-			encoding: "utf8",
-			input: helperInput(root, identity, runId, nonce),
-		});
+		const result = spawnSync(
+			"/usr/bin/python3",
+			["-I", "-S", "-c", python, SCRIPT_PATH],
+			{
+				encoding: "utf8",
+				input: helperInput(root, identity, runId, nonce),
+				env: PYTHON_HELPER_ENV,
+			},
+		);
 		strictEqual(result.status, 0, result.stderr);
 		strictEqual(result.stdout.trim(), "1 True");
 		const retried = runHelper(helperInput(root, identity, runId, nonce));

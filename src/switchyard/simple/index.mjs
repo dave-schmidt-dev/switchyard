@@ -26,12 +26,10 @@ import {
 } from "../integrate/index.mjs";
 import {
 	captureDirtyOverlay,
-	materializeDirtyOverlay,
 	validateDirtyOverlayReceipt,
 } from "../lifecycle/index.mjs";
 import {
 	getConfiguredInvocationDescriptor,
-	normalizeProviderName,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
@@ -45,15 +43,27 @@ import {
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
 import { isSafeDescriptorReceipt } from "../run-store/receipt-validation.mjs";
-import { runSimpleBaselineChecks } from "./baseline.mjs";
+import {
+	prepareSimpleOverlayBaseline,
+	runSimpleBaselineChecks,
+} from "./baseline.mjs";
+import { createSimpleCheckSessions } from "./check-session.mjs";
+import { deriveFailureAccountability } from "./failure-accountability.mjs";
+import {
+	persistFailureDisposition,
+	publishFailedTerminal,
+} from "./failure-finalization.mjs";
 import { buildGuardedPrompt } from "./guarded-prompt.mjs";
 import { createSimpleRouteHealthController } from "./health.mjs";
+import { prepareSimpleProviderStart } from "./launcher-preflight.mjs";
+import { simpleLockDisposition } from "./lock-disposition.mjs";
 import {
 	classifySimpleErrorKind,
 	createSimpleProviderReliabilityDiagnostic,
 } from "./reliability.mjs";
 import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
-import { createBridgeRequestRecorder } from "./request-evidence.mjs";
+import { routeDiagnosticPatch } from "./route-evidence.mjs";
+import { createSimpleRouteSelection } from "./route-selection.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
@@ -72,6 +82,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let invocationDescriptor = null;
 	let descriptorHarness = null;
 	let providerExecutionResult = null;
+	let providerStarted = false;
 	let baselineStatus = (options.baselineChecks ?? []).length
 		? "pending"
 		: "not_requested";
@@ -118,7 +129,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 		dependencies.releaseProjectLock ?? releaseProjectLockIfOwnedBy;
 	const executeProvider =
 		dependencies.executeProvider ?? defaultExecuteProvider;
-	const runCheck = dependencies.runCheck ?? defaultRunCheck;
+	let runCheck = dependencies.runCheck ?? defaultRunCheck;
+	let checkSessions = null;
 	const routeProvider = dependencies.route ?? route;
 	const healthController = (
 		dependencies.createSimpleRouteHealthController ??
@@ -142,6 +154,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		dependencies.resolveTargetIdentity ?? resolveTargetIdentity;
 
 	const classifyErrorKind = classifySimpleErrorKind;
+	const cleanupMetadata = (input) => ({
+		...sanitizeFailureMetadata(input),
+		result: input.result,
+	});
 	const milestone = (phase, name, details = {}) => {
 		const observedAt = now();
 		const elapsedSinceLastMilestoneMs = Math.max(
@@ -294,6 +310,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		milestone("terminal", "failed", { failurePhase });
 		const providerReliability = createSimpleProviderReliabilityDiagnostic({
+			errorKind: computedErrorKind,
 			failureReason,
 			failurePhase,
 			providerResult:
@@ -325,6 +342,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
 		finalResult.providerReliability = providerReliability;
+		finalResult.providerStarted = providerStarted;
+		finalResult.accountability = deriveFailureAccountability({
+			providerReliability,
+			provenance: {
+				...providerExecutionResult,
+				failurePhase:
+					failurePhase === "execute" ? "provider_execution" : failurePhase,
+			},
+		});
 		if (invocationDescriptor) {
 			finalResult.invocationDescriptor = structuredClone(invocationDescriptor);
 			finalResult.descriptorIdentity = invocationDescriptor.descriptor_identity;
@@ -333,41 +359,42 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (runInitialized) {
 			failureTerminalDurable = false;
 			try {
-				const terminalWrite = (
-					dependencies.updateRunWithRetry ?? updateRunWithRetry
-				)(runId, {
-					state: "failed",
-					finishedAt: new Date(now()).toISOString(),
-					lastFailure: sanitizeFailureMetadata({
-						taskId,
-						result: "execution_failed",
-						errorKind: computedErrorKind,
-						failurePhase:
-							failurePhase === "execute" ? "provider_execution" : failurePhase,
-						providerReliability,
-						...(providerExecutionResult?.diagnosticCode &&
-						providerExecutionResult?.diagnosticEvidenceAvailable === true
-							? { diagnosticCode: providerExecutionResult.diagnosticCode }
-							: {}),
-						...(providerExecutionResult?.diagnosticOrigin
-							? { diagnosticOrigin: providerExecutionResult.diagnosticOrigin }
-							: {}),
-						...(providerExecutionResult?.diagnosticEvidenceAvailable === true
-							? { diagnosticEvidenceAvailable: true }
-							: {}),
-						...(Number.isSafeInteger(providerExecutionResult?.code)
-							? { exitCode: providerExecutionResult.code }
-							: {}),
-						...(PERSISTED_SIGNALS.has(providerExecutionResult?.signal)
-							? { signal: providerExecutionResult.signal }
-							: {}),
-					}),
-				}).then(
-					() => {
-						failureTerminalDurable = true;
+				const terminalWrite = publishFailedTerminal(
+					dependencies.updateRunWithRetry ?? updateRunWithRetry,
+					runId,
+					{
+						state: "failed",
+						finishedAt: new Date(now()).toISOString(),
+						lastFailure: sanitizeFailureMetadata({
+							taskId,
+							result: "execution_failed",
+							errorKind: computedErrorKind,
+							failurePhase:
+								failurePhase === "execute"
+									? "provider_execution"
+									: failurePhase,
+							providerReliability,
+							...(providerExecutionResult?.diagnosticCode &&
+							providerExecutionResult?.diagnosticEvidenceAvailable === true
+								? { diagnosticCode: providerExecutionResult.diagnosticCode }
+								: {}),
+							...(providerExecutionResult?.diagnosticOrigin
+								? { diagnosticOrigin: providerExecutionResult.diagnosticOrigin }
+								: {}),
+							...(providerExecutionResult?.diagnosticEvidenceAvailable === true
+								? { diagnosticEvidenceAvailable: true }
+								: {}),
+							...(Number.isSafeInteger(providerExecutionResult?.code)
+								? { exitCode: providerExecutionResult.code }
+								: {}),
+							...(PERSISTED_SIGNALS.has(providerExecutionResult?.signal)
+								? { signal: providerExecutionResult.signal }
+								: {}),
+						}),
 					},
-					() => {},
-				);
+				).then((durable) => {
+					failureTerminalDurable = durable;
+				});
 				pendingDurability.add(terminalWrite);
 				void terminalWrite.finally(() =>
 					pendingDurability.delete(terminalWrite),
@@ -485,7 +512,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			projectLocked = true;
 			projectLockState = "held";
 		} catch (error) {
-			return fail(
+			const result = fail(
 				error?.code ?? "project_lock_failed",
 				"preflight",
 				classifyErrorKind(
@@ -495,6 +522,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 				),
 				error,
 			);
+			Object.assign(
+				result,
+				await simpleLockDisposition(error, options.projectPath, dependencies),
+			);
+			return result;
 		}
 		if (signal?.aborted) return failForSignal("preflight");
 		baseRevision = requireGit(
@@ -560,116 +592,39 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 		currentPhase = "route";
 		emitStatus(onStatus, taskId, "route");
-		const requestedSimpleTargets = (options.onlyProviders ?? []).length
-			? options.onlyProviders
-			: SIMPLE_TARGET_ADAPTERS.filter(
-					(adapter) =>
-						adapter.defaultEligible !== false &&
-						(!adapter.defaultCapabilities ||
-							adapter.defaultCapabilities.includes(options.capability)),
-				).map((adapter) => adapter.targetId);
-		const compatibleSimpleTargets = [];
-		let pinnedIncompatibility = null;
-		for (const candidate of requestedSimpleTargets) {
-			const candidateIdentity = resolveIdentity(candidate);
-			const candidateTargetId = candidateIdentity.targetId;
-			const candidateHarness = candidateIdentity.harnessKey
-				? normalizeProviderName(candidateIdentity.harnessKey)
-				: null;
-			const candidateDescriptor = candidateTargetId
-				? descriptorFor(candidateTargetId, options.capability)
-				: null;
-			const compatibility = simpleProviderCompatibility({
-				targetId: candidateTargetId,
-				harness: candidateHarness,
-				descriptor: candidateDescriptor,
-				capability: options.capability,
+		const { excludedSimpleTargets, selectSimpleRoute } =
+			createSimpleRouteSelection({
+				options,
+				resolveIdentity,
+				descriptorFor,
+				routeProvider,
+				healthController,
+				now,
+				funded: dependencies.assertFundedRoute ?? assertFundedRoute,
+				onDecision: async (routed) => {
+					const diagnostics = routeDiagnosticPatch(routed);
+					if (!runInitialized || !Object.keys(diagnostics).length) return;
+					try {
+						await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(
+							runId,
+							{
+								...diagnostics,
+								resolvedTargetId: diagnostics.routeEvidence.selectedTargetId,
+								activeTaskProvider: routed.provider ?? null,
+								activeTaskModel: routed.model ?? null,
+							},
+						);
+					} catch (error) {
+						currentPhase = "route";
+						throw Object.assign(
+							new Error("run_store_write_failed", { cause: error }),
+							{
+								code: "run_store_write_failed",
+							},
+						);
+					}
+				},
 			});
-			if (compatibility.compatible) {
-				compatibleSimpleTargets.push(candidateTargetId);
-			} else if ((options.onlyProviders ?? []).length) {
-				pinnedIncompatibility = compatibility.reason;
-			}
-		}
-		if (
-			(options.onlyProviders ?? []).length &&
-			compatibleSimpleTargets.length === 0
-		) {
-			return fail(
-				pinnedIncompatibility ?? "local_adapter_unavailable",
-				"route",
-			);
-		}
-		const excludedSimpleTargets = new Set();
-		const selectSimpleRoute = async () => {
-			while (excludedSimpleTargets.size < compatibleSimpleTargets.length) {
-				const availableProviders = compatibleSimpleTargets.filter(
-					(candidate) => !excludedSimpleTargets.has(candidate),
-				);
-				const routed = routeProvider({
-					requiredCapability: options.capability,
-					availableProviders,
-					platform: "direct",
-					nowMs: now(),
-					hasInvocationDescriptor: (name, capability) =>
-						Boolean(descriptorFor(name, capability)),
-					modelForCapability: (name, capability) =>
-						descriptorFor(name, capability)?.selector ?? null,
-					healthDecision: healthController.decision,
-					only: options.onlyProviders ?? [],
-				});
-				if (!routed?.provider)
-					return {
-						error: routed?.reason ?? "no_eligible_provider",
-					};
-				const candidateProvider = routed.provider;
-				const candidateIdentity = resolveIdentity(candidateProvider);
-				const candidateTargetId = candidateIdentity.targetId;
-				if (!candidateTargetId || !candidateIdentity.harnessKey)
-					return { error: "target_identity_unavailable" };
-				const candidateDescriptor = descriptorFor(
-					candidateProvider,
-					options.capability,
-				);
-				if (
-					!candidateDescriptor ||
-					candidateDescriptor.target_id !== candidateTargetId
-				)
-					return { error: "invocation_descriptor_unavailable" };
-				const candidateHarness = normalizeProviderName(
-					candidateIdentity.harnessKey,
-				);
-				const compatibility = simpleProviderCompatibility({
-					targetId: candidateTargetId,
-					harness: candidateHarness,
-					descriptor: candidateDescriptor,
-					capability: options.capability,
-				});
-				if (!compatibility.compatible) return { error: compatibility.reason };
-				(dependencies.assertFundedRoute ?? assertFundedRoute)(
-					candidateTargetId,
-				);
-				const prepared = await healthController.prepare({
-					provider: candidateProvider,
-					targetId: candidateTargetId,
-					capability: options.capability,
-					descriptor: candidateDescriptor,
-				});
-				if (!prepared.allowed || prepared.reroute) {
-					excludedSimpleTargets.add(candidateTargetId);
-					continue;
-				}
-				return {
-					provider: candidateProvider,
-					targetId: candidateTargetId,
-					descriptor: candidateDescriptor,
-					harness: candidateHarness,
-					compatibility,
-					prepared,
-				};
-			}
-			return { error: "route_health_blocked" };
-		};
 		let selectedRoute = await selectSimpleRoute();
 		if (selectedRoute.error) return fail(selectedRoute.error, "route");
 		provider = selectedRoute.provider;
@@ -691,6 +646,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
 					resolvedTargetId: targetId,
+					...selectedRoute.diagnostics,
 					activeTaskProvider: provider,
 					activeTaskModel: descriptor?.selector ?? null,
 				});
@@ -834,51 +790,51 @@ export async function runSimpleTask(options, dependencies = {}) {
 		);
 		worktreeBaseRevision = baseRevision;
 		if (dirtyOverlayReceipt) {
-			materializeDirtyOverlay(worktreePath, dirtyOverlayReceipt, {
-				maxFileBytes: MAX_CAPTURE_BYTES,
-				secretPaths: SECRET_PATHS,
-			});
-			requireGit(
+			worktreeBaseRevision = prepareSimpleOverlayBaseline({
 				worktreePath,
-				["add", "-A", "--", ...baselinePaths],
-				"dirty_overlay_stage_failed",
-				{ timeout: deadlineTimeout(options.deadlineMs, now) },
-			);
-			const overlayDiff = git(worktreePath, ["diff", "--cached", "--quiet"], {
-				timeout: deadlineTimeout(options.deadlineMs, now),
+				dirtyOverlayReceipt,
+				baselinePaths,
+				deadlineMs: options.deadlineMs,
+				now,
 			});
-			if (overlayDiff.status === 1) {
-				requireGit(
+		}
+
+		let baselineCheckPath = worktreePath;
+		if (
+			!dependencies.runCheck &&
+			[...options.checks, ...(options.baselineChecks ?? [])].length
+		) {
+			checkSessions = createSimpleCheckSessions({
+				taskRoot: worktreeRoot,
+				projectPath: options.projectPath,
+				baseRevision,
+				baseTree: requireGit(
 					worktreePath,
-					[
-						"-c",
-						"user.name=switchyard",
-						"-c",
-						"user.email=switchyard@localhost",
-						"commit",
-						"-qm",
-						"switchyard-dirty-overlay",
-					],
-					"dirty_overlay_baseline_failed",
+					["rev-parse", "HEAD^{tree}"],
+					"check_session_base_unavailable",
 					{ timeout: deadlineTimeout(options.deadlineMs, now) },
-				);
-			} else if (overlayDiff.status !== 0) {
-				throw Object.assign(new Error("dirty_overlay_baseline_failed"), {
-					code: "dirty_overlay_baseline_failed",
-				});
-			}
-			worktreeBaseRevision = requireGit(
-				worktreePath,
-				["rev-parse", "HEAD"],
-				"dirty_overlay_baseline_revision_unavailable",
-				{ timeout: deadlineTimeout(options.deadlineMs, now) },
-			).trim();
+				).trim(),
+				dirtyOverlayReceipt,
+				files: options.files,
+				allowManifests: options.allowManifests,
+				commands: [...options.checks, ...(options.baselineChecks ?? [])],
+				taskId,
+				deadlineMs: options.deadlineMs,
+				cachePath: dependencies.checkCachePath,
+				now,
+				signal,
+				onProgress: () =>
+					heartbeat("baseline", { processPhase: "check_preparing" }),
+			});
+			currentPhase = "baseline";
+			baselineCheckPath = await checkSessions.prepare();
+			runCheck = checkSessions.run;
 		}
 
 		const baselineResult = await runSimpleBaselineChecks({
 			checks: options.baselineChecks ?? [],
 			taskId,
-			worktreePath,
+			worktreePath: baselineCheckPath,
 			deadlineMs: options.deadlineMs,
 			now,
 			signal,
@@ -897,6 +853,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			},
 		});
 		baselineStatus = baselineResult.status;
+		checkSessions?.remove();
 		if (baselineResult.checks.length > 0) {
 			const lifecycles = baselineResult.checks.map(
 				(check) => check.writerLifecycle,
@@ -939,14 +896,65 @@ export async function runSimpleTask(options, dependencies = {}) {
 			readOnlyInputs: options.readOnlyInputs ?? [],
 			checks: options.checks ?? [],
 		});
-		currentPhase = "execute";
-		milestone("execute", "provider_started");
-		const executionBudget = remainingMs(options.deadlineMs, now);
-		if (executionBudget <= 0) {
-			return fail("deadline_expired", "execute");
-		}
-		if (signal?.aborted) return failForSignal("execute");
-		let providerHealthStart = await healthController.start();
+		currentPhase = "preflight";
+		const admissionFor = (repair = false) =>
+			prepareSimpleProviderStart({
+				targetId,
+				deadlineMs: options.deadlineMs,
+				now,
+				signal,
+				onProgress: () =>
+					heartbeat("preflight", { processPhase: "launcher_probe" }),
+				probe: dependencies.probeSimpleLauncher,
+				runProbe: dependencies.runLauncherProbe,
+				healthController,
+				recorderPath:
+					(executeProvider === defaultExecuteProvider ||
+						dependencies.createBridgeRequestRecorder) &&
+					(harness === "opencode" ||
+						(harness === "vibe" && targetId !== "vibe-code"))
+						? join(
+								getRunRoot(runId),
+								repair
+									? "provider-requests-repair.jsonl"
+									: "provider-requests.jsonl",
+							)
+						: null,
+				createRecorder: dependencies.createBridgeRequestRecorder,
+			});
+		const failAdmission = (admission) => {
+			const providerWriterLifecycle = providerStarted
+				? (providerExecutionResult?.writerLifecycle ?? "unavailable")
+				: "never_started";
+			if (!providerStarted)
+				providerExecutionResult = {
+					success: false,
+					code: null,
+					writerLifecycle: "never_started",
+				};
+			writerLifecycle =
+				admission.probeWriterLifecycle === "unavailable" ||
+				admission.cleanupUnavailable
+					? "unavailable"
+					: providerWriterLifecycle;
+			if (writerLifecycle === "unavailable") keepWorktree = true;
+			const result = fail(
+				admission.failureReason,
+				"preflight",
+				[
+					"launcher_environment_unavailable",
+					"request_log_open_failed",
+				].includes(admission.failureReason)
+					? "environment_failure"
+					: null,
+			);
+			result.providerStarted = providerStarted;
+			result.writerLifecycle = providerWriterLifecycle;
+			return result;
+		};
+		let admission = await admissionFor();
+		if (!admission.success) return failAdmission(admission);
+		let providerHealthStart = admission.healthStart;
 		while (!providerHealthStart.allowed && providerHealthStart.reroute) {
 			excludedSimpleTargets.add(targetId);
 			selectedRoute = await selectSimpleRoute();
@@ -970,6 +978,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				try {
 					await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
 						resolvedTargetId: targetId,
+						...selectedRoute.diagnostics,
 						activeTaskProvider: provider,
 						activeTaskModel: descriptor.selector ?? null,
 					});
@@ -982,30 +991,36 @@ export async function runSimpleTask(options, dependencies = {}) {
 					);
 				}
 			}
-			providerHealthStart = await healthController.start();
+			admission = await admissionFor();
+			if (!admission.success) return failAdmission(admission);
+			providerHealthStart = admission.healthStart;
 		}
 		if (!providerHealthStart.allowed)
 			return fail("route_health_blocked", "route");
 		const providerHealthTracked = providerHealthStart.tracked === true;
-		writerLifecycle = "unavailable";
-		let requestRecorder = null;
-		if (
-			executeProvider === defaultExecuteProvider &&
-			(harness === "opencode" ||
-				(harness === "vibe" && targetId !== "vibe-code"))
-		) {
-			try {
-				requestRecorder = createBridgeRequestRecorder(
-					join(getRunRoot(runId), "provider-requests.jsonl"),
-				);
-			} catch {
-				return fail("request_log_open_failed", "execute");
-			}
-		}
+		const requestRecorder = admission.recorder;
+		const cancelAdmission = async (prepared, failureReason) =>
+			failAdmission({
+				...prepared,
+				failureReason,
+				cleanupUnavailable: !(await prepared.cancelUnstarted()),
+			});
+		milestone("execute", "provider_starting");
+		// Status callbacks can abort synchronously. The final fence follows them.
+		const executionBudget = remainingMs(options.deadlineMs, now);
+		if (signal?.aborted)
+			return await cancelAdmission(admission, "provider_cancelled");
+		if (executionBudget <= 0)
+			return await cancelAdmission(admission, "deadline_expired");
 		let providerResult;
 		let requestLogStatus;
 		try {
-			providerResult = await executeProvider({
+			if (!admission.startPrepared().allowed)
+				return await cancelAdmission(admission, "route_health_blocked");
+			currentPhase = "execute";
+			providerStarted = true;
+			writerLifecycle = "unavailable";
+			const execution = executeProvider({
 				targetId,
 				harness,
 				descriptor,
@@ -1039,6 +1054,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 					heartbeat("execute", { processPhase: "provider_running" });
 				},
 			});
+			milestone("execute", "provider_started");
+			providerResult = await execution;
 		} finally {
 			requestLogStatus = requestRecorder?.close();
 		}
@@ -1081,7 +1098,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 		if (signal?.aborted) return failForSignal("execute");
 		if (
-			executeProvider === defaultExecuteProvider &&
+			(!dependencies.runCheck || executeProvider === defaultExecuteProvider) &&
 			writerLifecycle === "unavailable"
 		) {
 			keepWorktree = true;
@@ -1150,6 +1167,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 		let capturedDiff = captured;
 		for (let pass = 0; pass < 2; pass += 1) {
+			if (checkSessions) {
+				if (writerLifecycle !== "stopped")
+					return fail("provider_group_unconfirmed", "checks", "cleanup_failed");
+				if (options.checks.length > 0) {
+					currentPhase = "checks";
+					await checkSessions.prepare(capturedDiff.diff);
+				}
+			}
 			let rerunAllChecks = false;
 			checks.length = 0;
 			for (let index = 0; index < options.checks.length; index += 1) {
@@ -1186,7 +1211,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					check?.writerLifecycle,
 				);
 				if (signal?.aborted) return failForSignal("checks");
-				if (runCheck === defaultRunCheck && writerLifecycle === "unavailable") {
+				if (!dependencies.runCheck && writerLifecycle === "unavailable") {
 					keepWorktree = true;
 					return fail("check_group_unconfirmed", "checks", "cleanup_failed");
 				}
@@ -1226,6 +1251,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 				failureExitCode = checkExitCode;
 				failureSignal = checkSignal;
 				failureTimedOut = check?.timedOut === true;
+				if (check?.diagnosticCode === "check_dependencies_unverified") {
+					keepWorktree = true;
+					repairStatus = options.repairChecks ? "ineligible" : "not_requested";
+					return fail(
+						"check_dependencies_unverified",
+						"checks",
+						"environment_failure",
+					);
+				}
 				const checkFailureReason = check?.silenceTimedOut
 					? "check_silence_timeout"
 					: check?.timedOut
@@ -1233,6 +1267,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						: "check_failed";
 				if (!options.repairChecks || pass > 0) {
 					if (pass > 0) {
+						keepWorktree = true;
 						repairStatus = "failed";
 						return fail("check_repair_failed", "checks");
 					}
@@ -1249,6 +1284,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 					keepWorktree = true;
 					return fail(checkFailureReason, "checks");
 				}
+
+				checkSessions?.remove();
 
 				// A failing check can itself change the checkout. Re-capture and validate
 				// the exact base and declared scope before any correction is allowed.
@@ -1342,25 +1379,57 @@ export async function runSimpleTask(options, dependencies = {}) {
 					if (signal?.aborted) return failForSignal("checks");
 					return fail(checkFailureReason, "checks");
 				}
-				const repairHealthStart = await healthController.start();
+				currentPhase = "preflight";
+				const repairAdmission = await admissionFor(true);
+				if (!repairAdmission.success) {
+					repairStatus = "ineligible";
+					keepWorktree = true;
+					return failAdmission(repairAdmission);
+				}
+				const repairHealthStart = repairAdmission.healthStart;
 				if (!repairHealthStart.allowed) {
 					repairStatus = "ineligible";
 					keepWorktree = true;
 					return fail(checkFailureReason, "checks");
 				}
-				writerLifecycle = "unavailable";
-				const correction = await executeProvider({
-					targetId,
-					harness,
-					descriptor,
-					capability: options.capability,
-					prompt: repairPrompt,
-					worktreePath,
-					timeoutMs: budget.providerTimeoutMs,
-					signal,
-					onProgress: () =>
-						heartbeat("repair", { processPhase: "provider_running" }),
-				});
+				milestone("repair", "provider_starting");
+				const correctionBudget = Math.min(
+					budget.providerTimeoutMs,
+					remainingMs(options.deadlineMs, now),
+				);
+				if (signal?.aborted)
+					return await cancelAdmission(repairAdmission, "provider_cancelled");
+				if (correctionBudget <= 0)
+					return await cancelAdmission(repairAdmission, "deadline_expired");
+				let correction;
+				let correctionLogStatus;
+				try {
+					if (!repairAdmission.startPrepared().allowed)
+						return await cancelAdmission(
+							repairAdmission,
+							"route_health_blocked",
+						);
+					currentPhase = "repair";
+					providerStarted = true;
+					writerLifecycle = "unavailable";
+					const execution = executeProvider({
+						targetId,
+						harness,
+						descriptor,
+						capability: options.capability,
+						prompt: repairPrompt,
+						worktreePath,
+						timeoutMs: correctionBudget,
+						onStderrChunk: repairAdmission.recorder?.accept,
+						signal,
+						onProgress: () =>
+							heartbeat("repair", { processPhase: "provider_running" }),
+					});
+					milestone("repair", "provider_started");
+					correction = await execution;
+				} finally {
+					correctionLogStatus = repairAdmission.recorder?.close();
+				}
 				providerExecutionResult = correction;
 				providerLifecycle = boundProviderLifecycleSnapshot(
 					correction?.providerLifecycle,
@@ -1395,6 +1464,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 						reason: "provider-health-unavailable",
 					};
 				}
+				if (correctionLogStatus?.error)
+					return fail(correctionLogStatus.error, "repair");
 				if (signal?.aborted) return failForSignal("repair");
 				if (
 					writerLifecycle !== "stopped" ||
@@ -1472,6 +1543,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			if (rerunAllChecks) continue;
 			break;
 		}
+		checkSessions?.remove();
 		if (repairCount > 0) {
 			repairStatus = "passed";
 			terminalProviderReliability = createProviderReliabilityDiagnostic({
@@ -1647,10 +1719,6 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		emitStatus(onStatus, taskId, "cleanup");
 		currentPhase = "cleanup";
-		const cleanupMetadata = (input) => ({
-			...sanitizeFailureMetadata(input),
-			result: input.result,
-		});
 		let cleanupFailure = null;
 		let cleanupState = "complete";
 		const cleanupBudget = remainingMs(options.deadlineMs, now);
@@ -1801,8 +1869,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 		milestone("terminal", "succeeded");
 		return finalResult;
 	} catch (error) {
+		if (checkSessions && changedFiles.length > 0) keepWorktree = true;
 		const failureReason =
 			typeof error?.code === "string" ? error.code : "simple_execution_failed";
+		const trustedFault =
+			(failureReason === "dirty_overlay_stage_failed" &&
+				currentPhase === "prepare") ||
+			(["check_group_unconfirmed", "check_session_cleanup_failed"].includes(
+				failureReason,
+			) &&
+				["baseline", "checks"].includes(currentPhase));
+		if (signal?.aborted && !trustedFault) return failForSignal(currentPhase);
 		return fail(
 			failureReason,
 			currentPhase,
@@ -1812,6 +1889,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 	} finally {
 		if (pendingDurability.size > 0) {
 			await Promise.allSettled([...pendingDurability]);
+		}
+		try {
+			if (failureTerminalDurable) checkSessions?.remove();
+		} catch {
+			keepWorktree = true;
+			writerLifecycle = "unavailable";
+			worktreeCleanupReason = "check_session_cleanup_failed";
+			if (finalResult) finalResult.partialWorktree = worktreePath;
 		}
 		if (!failureTerminalDurable && worktreePath) {
 			keepWorktree = true;
@@ -1872,51 +1957,30 @@ export async function runSimpleTask(options, dependencies = {}) {
 				},
 			});
 		}
-		if (
-			runInitialized &&
-			candidateChild &&
-			finalResult?.status !== "succeeded"
-		) {
-			const isRetained = Boolean(keepWorktree || worktreePath);
-			const cleanupFailed = cleanupAttempted && isRetained;
-			const terminalState = isRetained ? "retained" : "removed";
-			const reason = isRetained
-				? (worktreeCleanupReason ??
-					finalResult?.failureReason ??
-					"salvage_retained")
-				: null;
-			const retainedAt = isRetained ? new Date(now()).toISOString() : null;
-			try {
-				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
-					cleanupState: cleanupFailed
-						? "failed"
-						: isRetained
-							? "pending"
-							: "complete",
-					...(cleanupFailed
-						? {
-								cleanupFailure: cleanupMetadata({
-									taskId,
-									result: "worktree_cleanup_failed",
-									errorKind: "cleanup_failed",
-									failurePhase: "cleanup",
-								}),
-							}
-						: {}),
-					worktree: {
-						canonicalParent,
-						candidateChild,
-						path: candidatePath,
-						state: terminalState,
-						reason,
-						retainedAt,
-						writerStopped:
-							writerLifecycle === "stopped" ||
-							writerLifecycle === "never_started",
-						...(worktreeIdentity ?? {}),
-					},
-				});
-			} catch {}
+		const failureDisposition = await persistFailureDisposition({
+			runInitialized,
+			status: finalResult?.status,
+			terminalDurable: failureTerminalDurable,
+			runId,
+			taskId,
+			keepWorktree,
+			worktreePath,
+			cleanupAttempted,
+			worktreeCleanupReason,
+			failureReason: finalResult?.failureReason,
+			canonicalParent,
+			candidateChild,
+			candidatePath,
+			worktreeIdentity,
+			writerLifecycle,
+			projectLockState,
+			now,
+			updateRun: dependencies.updateRunWithRetry ?? updateRunWithRetry,
+		});
+		if (failureDisposition && finalResult) {
+			finalResult.cleanupState = failureDisposition.persisted
+				? failureDisposition.cleanupState
+				: "pending";
 		}
 	}
 }
@@ -1927,13 +1991,7 @@ import "./funding.mjs";
 import "./provider-invocation.mjs";
 import "./recovery.mjs";
 import "./overlay.mjs";
-import {
-	git,
-	MAX_CAPTURE_BYTES,
-	requireGit,
-	SECRET_PATHS,
-	SIMPLE_TARGET_ADAPTERS,
-} from "./args.mjs";
+import { git, MAX_CAPTURE_BYTES, requireGit, SECRET_PATHS } from "./args.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
 	declaredPathsAreClean,
@@ -1950,7 +2008,6 @@ import {
 	defaultExecuteProvider,
 	defaultRunCheck,
 	remainingMs,
-	simpleProviderCompatibility,
 } from "./provider-invocation.mjs";
 import {
 	aggregateWriterLifecycle,

@@ -4,7 +4,7 @@
 // environment. The sandboxed CLI receives only a per-run nonce.
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
 	createReadStream,
 	existsSync,
@@ -27,7 +27,9 @@ const SELF = fileURLToPath(import.meta.url);
 const SAFE_PATH =
 	"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const VIBE = "/Users/dave/.local/share/uv/tools/mistral-vibe/bin/vibe";
-const OPENCODE = "/opt/homebrew/Cellar/opencode/1.18.30_2/bin/opencode";
+const OPENCODE = resolve(dirname(SELF), "../.tools/opencode-v1.18.30/opencode");
+const OPENCODE_SHA256 =
+	"2d0c9c339bb91046c6ea951c97664bc2f8a8eaca707f31fbfbb7bc73c4eddc62";
 const VIBE_RUNTIME = "/Users/dave/.local/share/uv/tools/mistral-vibe";
 const UV_PYTHON = "/Users/dave/.local/share/uv/python";
 const MAX_PROMPT = 256 * 1024;
@@ -548,6 +550,17 @@ function renderOpenCodeConfig(port) {
 		plugin: [],
 		provider: {
 			"opencode-go": {
+				// V1's embedded catalog predates this approved model ID.
+				models: {
+					"deepseek-v4.1-flash": {
+						id: "deepseek-v4.1-flash",
+						reasoning: true,
+						variants: {
+							low: { reasoningEffort: "low" },
+							max: { reasoningEffort: "max" },
+						},
+					},
+				},
 				options: {
 					baseURL: `http://127.0.0.1:${port}/v1`,
 					apiKey: "{env:OPENCODE_API_KEY}",
@@ -572,6 +585,18 @@ function verifyVibeSession(runtime, model) {
 			return false;
 		}
 	});
+}
+/** Reject missing, redirected, or changed bytes before launching the fixed runtime. */
+export function verifyOpenCodeRuntime(path = OPENCODE) {
+	if (
+		!existsSync(path) ||
+		lstatSync(path).isSymbolicLink() ||
+		!lstatSync(path).isFile() ||
+		realpathSync(path) !== path ||
+		createHash("sha256").update(readFileSync(path)).digest("hex") !==
+			OPENCODE_SHA256
+	)
+		fail("fixed OpenCode runtime identity mismatch");
 }
 function cliReadPaths(target, cliPath) {
 	return target === "vibe"
@@ -658,6 +683,9 @@ export async function runBridge({
 	if (!MODELS[model] || MODELS[model].target !== target)
 		fail("target/model mismatch");
 	const actualCli = cliPath ?? (target === "vibe" ? VIBE : OPENCODE);
+	// Test fixtures may inject a CLI; production always verifies the fixed bytes.
+	if (target === "opencode-go" && cliPath === undefined)
+		verifyOpenCodeRuntime();
 	detachSharedClone(worktree);
 	const runtime = mkdtempSync(join(dirname(worktree), ".switchyard-keyless-"));
 	let proxy;

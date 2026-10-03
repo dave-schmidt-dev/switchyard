@@ -25,5 +25,5 @@ export function buildGuardedPrompt({
 	const scopeSentence = `${promptText}\n\nWork only in the current disposable checkout. Change only these writable files: ${files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
 	if (!checks.length) return scopeSentence;
 	const checkLines = checks.map((command) => `- \`${command}\``).join("\n");
-	return `${scopeSentence}\n\nAfter you finish, these acceptance checks run in this checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n${checkLines}`;
+	return `${scopeSentence}\n\nAfter you finish, these acceptance checks run against your candidate in an independent trusted checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n${checkLines}`;
 }

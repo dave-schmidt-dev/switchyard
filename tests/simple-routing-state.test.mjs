@@ -185,3 +185,40 @@ test("native acknowledgement is identity-bound, idempotent and monotonic", () =>
 		true,
 	);
 });
+
+test("new skipped outcomes roundtrip through the compatibility reader with exact v1 keys", async () => {
+	const compatibilityRoot = process.env.SWITCHYARD_COMPATIBILITY_ROOT;
+	const reader = compatibilityRoot
+		? await import(
+				`${compatibilityRoot}/src/switchyard/simple/routing-state.mjs`
+			)
+		: await import("../src/switchyard/simple/routing-state.mjs");
+	const { project, stateRoot } = fixture();
+	const h = openRoutingRun(project, "run-1", { stateRoot });
+	const pending = allocation();
+	h.commit({ pendingAttempt: pending });
+	recordAttemptOutcome(h.state, h.commit, {
+		...closed(pending, "skipped"),
+		reason: "unsafe_failure",
+	});
+	h.release();
+	const reloaded = reader.readRoutingRunState(project, "run-1", { stateRoot });
+	strictEqual(reloaded.schemaVersion, 1);
+	strictEqual(reloaded.attempts[0].terminal, "skipped");
+	deepStrictEqual(reloaded.failedTargetIds, []);
+	deepStrictEqual(
+		Object.keys(reloaded.attempts[0]).sort(),
+		[
+			"attemptId",
+			"taskId",
+			"runId",
+			"targetId",
+			"capability",
+			"startedAt",
+			"terminal",
+			"reason",
+			"closedAt",
+			"partialWorktree",
+		].sort(),
+	);
+});

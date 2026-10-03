@@ -1,7 +1,13 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { defaultMeasureApfsPrivateBytes } from "../src/switchyard/dispatch/index.mjs";
@@ -15,6 +21,12 @@ let dir;
 let tasksFile;
 let projectDir;
 let stateRoot;
+const PYTHON_HELPER_ENV = {
+	PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+	LANG: "C",
+	LC_ALL: "C",
+	NODE_V8_COVERAGE: "",
+};
 beforeEach(async () => {
 	dir = tempDir("switchyard-dispatch-cli-");
 	stateRoot = join(dir, "state-root");
@@ -74,12 +86,65 @@ describe("gc subcommand (T62)", () => {
 			);
 		}
 	});
+	it("isolates the production measurement helper from Python startup modules", async () => {
+		const startupDir = tempDir("gc-python-startup-");
+		const siteMarker = join(startupDir, "site-ran");
+		const userMarker = join(startupDir, "user-ran");
+		writeFileSync(
+			join(startupDir, "sitecustomize.py"),
+			`from pathlib import Path\nPath(${JSON.stringify(siteMarker)}).write_text("site")\n`,
+		);
+		writeFileSync(
+			join(startupDir, "usercustomize.py"),
+			`from pathlib import Path\nPath(${JSON.stringify(userMarker)}).write_text("user")\n`,
+		);
+		const root = join(startupDir, "switchyard-simple-python-isolation");
+		mkdirSync(root);
+		const originalPythonPath = process.env.PYTHONPATH;
+		process.env.PYTHONPATH = startupDir;
+		let invocation;
+		try {
+			const positiveControl = spawnSync("/usr/bin/python3", ["-c", "pass"], {
+				encoding: "utf8",
+			});
+			strictEqual(positiveControl.status, 0, positiveControl.stderr);
+			ok(existsSync(siteMarker));
+			ok(existsSync(userMarker));
+			rmSync(siteMarker);
+			rmSync(userMarker);
+			const result = await defaultMeasureApfsPrivateBytes(
+				[root],
+				{},
+				{
+					spawnFn: (command, args, options) => {
+						invocation = { command, args, env: options.env };
+						return spawn(command, args, options);
+					},
+					stderr: { write() {} },
+				},
+			);
+			ok(result.roots[root]);
+		} finally {
+			if (originalPythonPath === undefined) delete process.env.PYTHONPATH;
+			else process.env.PYTHONPATH = originalPythonPath;
+		}
+		strictEqual(invocation.command, "/usr/bin/python3");
+		deepStrictEqual(invocation.args.slice(0, 2), ["-I", "-S"]);
+		deepStrictEqual(invocation.env, PYTHON_HELPER_ENV);
+		strictEqual(existsSync(siteMarker), false);
+		strictEqual(existsSync(userMarker), false);
+	});
 	it("rejects malformed APFS helper stdin instead of reporting an empty success", () => {
 		const helper = resolve(__dirname, "..", "scripts", "apfs-private-bytes.py");
-		const result = spawnSync("/usr/bin/python3", [helper, "--stdin"], {
-			input: "{invalid",
-			encoding: "utf8",
-		});
+		const result = spawnSync(
+			"/usr/bin/python3",
+			["-I", "-S", helper, "--stdin"],
+			{
+				input: "{invalid",
+				encoding: "utf8",
+				env: PYTHON_HELPER_ENV,
+			},
+		);
 		strictEqual(result.status, 2);
 		ok(result.stderr.includes("Invalid root list on stdin"));
 		strictEqual(result.stdout, "");

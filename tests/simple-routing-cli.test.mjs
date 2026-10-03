@@ -317,3 +317,48 @@ test("CLI provenance preserves flag and ENV silence; generated standalone IDs em
 		else process.env.SWITCHYARD_ROUTING_RUN_ID = previous;
 	}
 });
+
+test("inspect reports unknown missing records without changing the durable routing state", async () => {
+	const { recordAttemptOutcome } = await import(
+		"../src/switchyard/simple/routing-state.mjs"
+	);
+	const f = fixture();
+	const h = openRoutingRun(f.project, "run-1", f.deps);
+	const pending = {
+		taskId: "task",
+		attemptId: "attempt",
+		runId: "simple-linked",
+		targetId: "codex",
+		capability: "standard",
+		startedAt: new Date().toISOString(),
+	};
+	h.commit({ pendingAttempt: pending });
+	recordAttemptOutcome(h.state, h.commit, {
+		...pending,
+		terminal: "succeeded",
+		reason: "succeeded",
+		closedAt: new Date().toISOString(),
+		partialWorktree: null,
+	});
+	h.release();
+	let output;
+	await handleRoutingRun(
+		["inspect", "--project", f.project, "--routing-run-id", "run-1"],
+		{
+			...f.deps,
+			readRun: async () => {
+				throw new Error("missing");
+			},
+			writeResult: (value) => {
+				output = JSON.parse(value);
+			},
+		},
+	);
+	strictEqual(output.state.attempts[0].terminal, "succeeded");
+	strictEqual(output.accountability.totals.succeededAttempts, 0);
+	strictEqual(output.accountability.totals.unknownAttempts, 1);
+	strictEqual(
+		output.accountability.attempts[0].accountability.owner,
+		"unknown",
+	);
+});

@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	mkdirSync,
@@ -7,6 +7,7 @@ import {
 	readFileSync,
 	realpathSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import http from "node:http";
@@ -14,13 +15,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-	formatOpenCodeGoBridgeDiagnostic,
-	parseBridgeArgs,
 	runBridge,
-	seatbeltProfile,
-	startProxy,
+	verifyOpenCodeRuntime,
 } from "../ops/simple-provider-keyless-bridge.mjs";
-import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
 
 const SECRET = "synthetic-real-api-key-bridge-123456";
 function setup() {
@@ -44,16 +41,6 @@ async function localServer(handler) {
 		url: `http://127.0.0.1:${server.address().port}/v1/chat/completions`,
 		close: () => new Promise((done) => server.close(done)),
 	};
-}
-function post(port, path, nonce, model) {
-	return fetch(`http://127.0.0.1:${port}${path}`, {
-		method: "POST",
-		headers: {
-			authorization: `Bearer ${nonce}`,
-			"content-type": "application/json",
-		},
-		body: JSON.stringify({ model }),
-	});
 }
 test("Vibe prompt EPIPE fails closed and removes its runtime", async (t) => {
 	const check = spawnSync(
@@ -166,7 +153,7 @@ for await (const chunk of process.stdin) chunks.push(chunk);
 const prompt = Buffer.concat(chunks).toString('utf8');
 const sentinel = ${JSON.stringify(sentinel)};
 const expected = ${JSON.stringify(prompt)};
-writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, sentinelInArgv: process.argv.some(value => value.includes(sentinel)), sentinelInEnvironment: Object.values(process.env).some(value => value.includes(sentinel)) }));
+writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, sentinelInArgv: process.argv.some(value => value.includes(sentinel)), sentinelInEnvironment: Object.values(process.env).some(value => value.includes(sentinel)), argv: process.argv.slice(2), realKeyInEnvironment: Object.values(process.env).includes('synthetic-real-api-key-bridge-123456') }));
 `,
 		{ mode: 0o755 },
 	);
@@ -174,7 +161,7 @@ writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, se
 		const result = await runBridge({
 			target: "opencode-go",
 			model: "opencode-go/deepseek-v4.1-flash",
-			variant: "low",
+			variant: "max",
 			worktree: item.worktree,
 			prompt,
 			secret: SECRET,
@@ -188,6 +175,18 @@ writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, se
 				exactStdin: true,
 				sentinelInArgv: false,
 				sentinelInEnvironment: false,
+				argv: [
+					"run",
+					"--pure",
+					"--agent",
+					"build",
+					"--auto",
+					"--variant",
+					"max",
+					"--model",
+					"opencode-go/deepseek-v4.1-flash",
+				],
+				realKeyInEnvironment: false,
 			},
 		);
 	} finally {
@@ -197,9 +196,10 @@ writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, se
 for (const [target, model, variant, expectedEffort] of [
 	["vibe", "glm-5-3-medium", undefined, "high"],
 	["vibe", "glm-5-3", undefined, "max"],
-	["opencode-go", "opencode-go/deepseek-v4.1-flash", "low", undefined],
+	["opencode-go", "opencode-go/deepseek-v4.1-flash", "low", "low"],
+	["opencode-go", "opencode-go/deepseek-v4.1-flash", "max", "max"],
 ])
-	test(`installed ${target} CLI ${model} reaches the synthetic endpoint`, async (t) => {
+	test(`installed ${target} CLI ${model} ${variant ?? "alias"} reaches the synthetic endpoint`, async (t) => {
 		const check = spawnSync(
 			"/usr/bin/sandbox-exec",
 			[
@@ -260,6 +260,8 @@ for (const [target, model, variant, expectedEffort] of [
 			assert.ok(calls > 0, "installed CLI did not reach synthetic upstream");
 			if (target === "opencode-go") {
 				assert.equal(result.code, 0, result.stderr);
+				assert.equal(observedBody?.model, "deepseek-v4.1-flash");
+				assert.equal(observedBody?.reasoning_effort, expectedEffort);
 				assert.equal(
 					observedPrompt,
 					true,
@@ -276,3 +278,27 @@ for (const [target, model, variant, expectedEffort] of [
 			item.cleanup();
 		}
 	});
+
+test("fixed OpenCode runtime rejects replacement bytes, missing bytes, and symlinks", () => {
+	const item = setup();
+	try {
+		const fake = join(item.worktree, "replaced-opencode");
+		writeFileSync(fake, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		assert.throws(
+			() => verifyOpenCodeRuntime(fake),
+			/runtime identity mismatch/,
+		);
+		const link = join(item.worktree, "linked-opencode");
+		symlinkSync(fake, link);
+		assert.throws(
+			() => verifyOpenCodeRuntime(link),
+			/runtime identity mismatch/,
+		);
+		assert.throws(
+			() => verifyOpenCodeRuntime(join(item.worktree, "missing")),
+			/runtime identity mismatch/,
+		);
+	} finally {
+		item.cleanup();
+	}
+});

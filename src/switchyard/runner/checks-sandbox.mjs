@@ -40,7 +40,7 @@ function safeEnv(home) {
 		GIT_ASKPASS: "/usr/bin/false",
 	};
 }
-export function quickCheckSandboxProfile(clone, runtime) {
+export function quickCheckSandboxProfile(clone, runtime, readOnlyPaths = []) {
 	clone = realpathSync(clone);
 	runtime = realpathSync(runtime);
 	const nodeRoot = dirname(dirname(realpathSync(process.execPath)));
@@ -60,6 +60,7 @@ export function quickCheckSandboxProfile(clone, runtime) {
 		"/opt/homebrew/bin/npm",
 		clone,
 		runtime,
+		...readOnlyPaths.map((path) => realpathSync(path)),
 	];
 	const ancestors = new Set(["/"]);
 	for (const path of reads) {

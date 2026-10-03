@@ -26,6 +26,12 @@ const GC_PRIVATE_BYTES_UNAVAILABLE = Object.freeze({
 	measurable: false,
 	unavailableReason: "private_bytes_unavailable",
 });
+// This stdlib-only helper uses the system interpreter with startup hooks disabled.
+const PYTHON_HELPER_ENV = Object.freeze({
+	PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+	LANG: "C",
+	LC_ALL: "C",
+});
 async function defaultMeasureApfsPrivateBytes(
 	paths,
 	options = {},
@@ -57,6 +63,8 @@ async function defaultMeasureApfsPrivateBytes(
 	return new Promise((resolveResult) => {
 		const useStdin = paths.length > 50;
 		const args = [
+			"-I",
+			"-S",
 			scriptPath,
 			"--max-files",
 			String(maxFiles),
@@ -67,6 +75,8 @@ async function defaultMeasureApfsPrivateBytes(
 		try {
 			child = spawnFn(pythonBin, args, {
 				stdio: ["pipe", "pipe", "pipe"],
+				// Spawn may mutate env for coverage; pass a mutable copy with propagation disabled.
+				env: { ...PYTHON_HELPER_ENV, NODE_V8_COVERAGE: "" },
 			});
 		} catch (err) {
 			return resolveResult({ status: "error", error: err.message, roots: {} });

@@ -11,6 +11,7 @@ import {
 	SECRET_PATHS,
 	SIMPLE_TARGET_ADAPTERS,
 } from "./args.mjs";
+import { resolveCheckExecution } from "./check-execution.mjs";
 import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
 
 const VIBE_CODE_LAUNCHER = fileURLToPath(
@@ -378,16 +379,42 @@ async function defaultRunCheck({
 	onProgress,
 	signal,
 }) {
+	if (signal?.aborted) {
+		onProgress?.();
+		return {
+			success: false,
+			code: null,
+			output: "",
+			stderr: "",
+			cancelled: true,
+			writerLifecycle: "never_started",
+		};
+	}
+	const execution = resolveCheckExecution(command, worktreePath);
+	if (execution.kind === "rejected") {
+		onProgress?.();
+		return {
+			success: false,
+			code: 1,
+			output: "",
+			stderr: "",
+			diagnosticCode: "check_dependencies_unverified",
+			writerLifecycle: "never_started",
+		};
+	}
 	return runSimpleWriter(
-		"/bin/sh",
-		[
-			"-lc",
-			'cd "$1" && exec /bin/sh -lc "$2"',
-			"switchyard-check",
-			worktreePath,
-			command,
-		],
+		execution.kind === "local" ? execution.command : "/bin/sh",
+		execution.kind === "local"
+			? execution.args
+			: [
+					"-lc",
+					'cd "$1" && exec /bin/sh -lc "$2"',
+					"switchyard-check",
+					worktreePath,
+					command,
+				],
 		{
+			...(execution.kind === "local" ? { cwd: worktreePath } : {}),
 			processScopePath: worktreePath,
 			timeoutMs,
 			silenceTimeoutMs: Math.min(60 * 1000, timeoutMs),

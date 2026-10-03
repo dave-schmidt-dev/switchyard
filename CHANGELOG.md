@@ -4,7 +4,11 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-02
+
 ### Added
+
+- Routing-run inspection now reports bounded failure ownership/actions and verified attempt versus unique-task success totals, with missing linked evidence and cleanup reported separately.
 
 - `vibe-code` now runs in the VM queue lane as well as the simple lane: it is a golden-image verified provider, both capability classes hold `dispatch_qualified` receipts from real VM canaries, and `provider-qualification.mjs` accepts `--lane simple|vm` to force the VM canary for a simple-compatible target.
 - Add a closed version-1 `providerReliability` diagnostic to simple terminal results, including cause, phase, bounded process/check evidence, baseline and diff outcomes, and one-repair status without provider output or prompt content.
@@ -18,6 +22,19 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- Mocked queue regression tests use deterministic availability rather than live provider quota.
+- Simple acceptance checks now run in fresh disposable checkers outside the provider workspace, with offline provisioning of unchanged locked Node dependencies and fail-closed refusal when required tools or cache entries are unavailable.
+- Guarded Vibe, Vibe Code, and OpenCode launchers refuse unavailable sandbox environments before provider or broker start.
+- Failed simple runs persist terminal failure and cleanup intent before destructive cleanup, including a final disposition when no clone was allocated. A stopped checkout with corrected changes is retained when the one allowed repair still fails acceptance.
+- New typed environment, contract, check, cancellation, cleanup and unknown failures no longer poison routing provider memory. Retries share a logical task identity and exclude failed targets immediately; environment failures stop without automatic replay.
+
+- Simple project-lock conflicts report live-holder deferral or a proven-dead holder’s exact recovery command; unknown ownership stops without launching a provider.
+- Isolate system Python cleanup helpers from caller paths, environment and startup hooks.
+- Persist failed cleanup and retained-worktree details when simple-run finalization fails.
+- Simple runs persist bounded route-time snapshot, candidate pace and exclusion evidence, refreshed when health admission requires rerouting.
+- Package acceptance checks use only matching lock-installed local tools; missing or ambiguous dependencies and unsupported npm forms fail closed instead of resolving cached or downloaded binaries.
+- Provider deadline kills retain the distinct `provider_deadline_exceeded` reliability cause and timeout/signal evidence.
+- Restore the OpenCode Go simple bridge with a hash-verified official 1.18.30 runtime isolated from host V2, preserving proxy-only containment and exact approved low/max model variants. Both existing BWS executable trust pins now match the tested bridge following owner approval; earlier live canaries predate this runtime restoration.
 - A baseline acceptance check that fails before the provider starts no longer marks the target failed for the simple routing run; the attempt is recorded `skipped`, so later tasks in that run can still use the target.
 - Simple dispatch now records a provider's real exit code, signal and timeout in `providerReliability` instead of `null` when the provider itself exits non-zero, and classifies Vibe's own upstream error block for 401/403 (`auth_expired`) and 404 (`model_unavailable`) as well as the 402 budget case, reading the status only from Vibe's own error block. 429 and 5xx stay unclassified.
 - VM provider qualification no longer fails a passing canary. `dispatch run --json` prints a run-status envelope, so the script now reads the task result from the run checkpoint, proves cleanup from durable run evidence (succeeded run, `cleanupState: complete`, allocated VM gone from Parallels) and keeps the run store out of the fixture repo's changed-path check.
@@ -30,6 +47,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Bound `test:other` to two file workers; contract coverage runs all selected suites in one serial aggregate with existing coverage thresholds preserved.
 - Tier-1 routing is now pace-aware: it picks the eligible tier-1 target furthest ahead of pace (Gradus `pace_delta`), with roster order only breaking ties and a target with no measured pace ranked below any measured one, instead of draining tier 1 in roster order.
 - Simple dispatch now runs its one-shot acceptance-check repair by default: after a failing check the provider gets one scoped correction within the original deadline. Pass `--no-repair-checks` to disable it; `--repair-checks` is still accepted.
 - Simple dispatch now tells the provider which acceptance checks will run against its result, so it can satisfy lint, formatting and type rules it previously never saw. Prompt construction moved to `src/switchyard/simple/guarded-prompt.mjs`.

@@ -10,6 +10,12 @@ const HELPER = resolve(
 	dirname(fileURLToPath(import.meta.url)),
 	"../../../scripts/safe-remove-worktree.py",
 );
+// This stdlib-only helper uses the system interpreter with startup hooks disabled.
+const PYTHON_HELPER_ENV = Object.freeze({
+	PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+	LANG: "C",
+	LC_ALL: "C",
+});
 
 export function simpleQuarantinePath(nonce) {
 	if (
@@ -78,12 +84,17 @@ function command(
 		maxBytes = MAX_LSOF_BYTES,
 		timeoutMs = 20_000,
 		onStatus = () => {},
+		env,
+		spawnFn = spawn,
 	} = {},
 ) {
 	return new Promise((resolveResult) => {
 		let child;
 		try {
-			child = spawn(commandName, args, { stdio: ["pipe", "pipe", "pipe"] });
+			child = spawnFn(commandName, args, {
+				stdio: ["pipe", "pipe", "pipe"],
+				...(env ? { env } : {}),
+			});
 		} catch (error) {
 			resolveResult({ ok: false, reason: error.code ?? "spawn_failed" });
 			return;
@@ -184,6 +195,7 @@ export async function cleanupSimpleWorktree(
 		onStatus = () => {},
 		postQuarantineCheck = null,
 	} = {},
+	dependencies = {},
 ) {
 	let path = claim?.path ?? null;
 	const retained = (reason) => ({ removed: false, path, reason });
@@ -234,7 +246,7 @@ export async function cleanupSimpleWorktree(
 		// Recheck the exact root and marker immediately before the bounded helper.
 		proveRoot(path, claim, runId);
 		onStatus("cleanup_remove_started");
-		const removal = await command("/usr/bin/python3", [HELPER], {
+		const removal = await command("/usr/bin/python3", ["-I", "-S", HELPER], {
 			input: JSON.stringify({
 				quarantinePath: path,
 				expectedDevice: claim.device,
@@ -245,6 +257,9 @@ export async function cleanupSimpleWorktree(
 			maxBytes: 1024 * 1024,
 			timeoutMs: 120_000,
 			onStatus,
+			// Spawn may mutate env for coverage; pass a mutable copy with propagation disabled.
+			env: { ...PYTHON_HELPER_ENV, NODE_V8_COVERAGE: "" },
+			spawnFn: dependencies.spawnFn ?? spawn,
 		});
 		if (!removal.ok) return retained("guarded_removal_failed");
 		const result = JSON.parse(removal.output);

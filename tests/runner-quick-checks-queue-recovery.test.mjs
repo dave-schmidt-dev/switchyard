@@ -31,6 +31,25 @@ function writeTasksFile(content) {
 function writeLegacyCheckpoint(path, checkpoint) {
 	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
 }
+function fixturePreflightReadSnapshot() {
+	// Keep the real queue preflight deterministic without reading host quota.
+	return {
+		snapshot: {
+			schema_version: 2,
+			updated_at: new Date().toISOString(),
+			providers: [
+				{
+					name: "claude",
+					ok: true,
+					windows: [{ percent_left: 80, pace_delta: 1 }],
+				},
+			],
+		},
+		snapshotStatus: "fresh",
+		snapshotMtime: 1,
+		snapshotAgeMsAtRoute: 0,
+	};
+}
 function runFixtureGit(projectPath, args) {
 	const result = spawnSync("git", args, { cwd: projectPath, encoding: "utf8" });
 	if (result.status !== 0)
@@ -121,6 +140,8 @@ describe("Task 51 quick-check regression", () => {
 					captureDiff: () => patch,
 				},
 			},
+			goldenImageVerifiedProviders: ["claude"],
+			preflightReadSnapshot: fixturePreflightReadSnapshot,
 		};
 		const options = {
 			tasksFilePath: tasksPath,

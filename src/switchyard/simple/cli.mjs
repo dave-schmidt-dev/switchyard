@@ -63,7 +63,7 @@ export async function handleSimple(argv, dependencies = {}) {
 					reportStatus(event);
 				},
 			});
-			const deferred = ["native_required", "native_latched"].includes(
+			const deferred = ["native_required", "native_latched", "defer"].includes(
 				routing.direction,
 			);
 			result = {
@@ -83,9 +83,10 @@ export async function handleSimple(argv, dependencies = {}) {
 					: routing.direction === "complete"
 						? "succeeded"
 						: "failed",
-				failureReason: deferred
-					? routing.direction
-					: (routing.result?.failureReason ?? routing.stopReason),
+				failureReason:
+					deferred && routing.direction !== "defer"
+						? routing.direction
+						: (routing.result?.failureReason ?? routing.stopReason),
 				routingRunId: routing.routingRunId,
 				routingRunIdSource: routing.routingRunIdSource,
 				direction: routing.direction,

@@ -306,7 +306,7 @@ describe("opencode adapter container execution", () => {
 			},
 		};
 		const controller = new AbortController();
-		controller.abort();
+		let spawnCount = 0;
 		const result = await executeOpencodeAsync("change one file", workspaceId, {
 			model: descriptor.selector,
 			resolvedTargetId: descriptor.target_id,
@@ -318,6 +318,7 @@ describe("opencode adapter container execution", () => {
 			signal: controller.signal,
 			termGraceMs: 1,
 			spawnFn: () => {
+				spawnCount += 1;
 				const child = new EventEmitter();
 				child.stdout = new EventEmitter();
 				child.stderr = new EventEmitter();
@@ -326,10 +327,12 @@ describe("opencode adapter container execution", () => {
 					queueMicrotask(() => child.emit("close", null, signal));
 					return true;
 				};
+				queueMicrotask(() => controller.abort());
 				return child;
 			},
 		});
 
+		strictEqual(spawnCount, 1);
 		strictEqual(result.cancelled, true);
 		deepStrictEqual(cleanupOptions, {
 			onStatus: undefined,

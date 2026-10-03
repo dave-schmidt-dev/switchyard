@@ -473,7 +473,7 @@ describe("simple local execution path", () => {
 						output = line;
 					},
 					onStatus: (event) => {
-						if (event.milestone === "provider_started") {
+						if (event.milestone === "provider_starting") {
 							signalProcess.emit("SIGINT");
 						}
 					},

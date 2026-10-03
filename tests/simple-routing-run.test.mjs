@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import { route } from "../src/switchyard/router/index.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
@@ -126,6 +127,9 @@ function fixture(overrides = {}) {
 				status === "failed"
 					? {
 							errorKind: result.errorKind,
+							...(result.providerReliability
+								? { providerReliability: result.providerReliability }
+								: {}),
 							reasonCode: result.errorKind,
 							reason:
 								"Provider execution failed before a reviewed integration.",
@@ -493,5 +497,192 @@ test("routing ID provenance exposes supplied and ENV identity; generated IDs war
 	} finally {
 		if (previous === undefined) delete process.env.SWITCHYARD_ROUTING_RUN_ID;
 		else process.env.SWITCHYARD_ROUTING_RUN_ID = previous;
+	}
+});
+
+for (const causeCode of [
+	"environment_failure",
+	"scope_rejected",
+	"input_rejected",
+	"acceptance_check_failed",
+	"cancelled",
+	"cleanup_failed",
+	"unknown",
+]) {
+	test(`typed ${causeCode} never poisons provider memory`, async () => {
+		const diagnostic = createProviderReliabilityDiagnostic({
+			causeCode,
+			phase: "provider",
+		});
+		const f = fixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: {
+					providerReliability: diagnostic,
+					failureReason: "check_failed",
+					failurePhase: "checks",
+					errorKind: "check_failed",
+				},
+			},
+		});
+		const result = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(result.direction, "stop");
+		strictEqual(
+			result.stopReason,
+			causeCode === "environment_failure"
+				? "environment_failure"
+				: "unsafe_failure",
+		);
+		deepStrictEqual(result.failedTargetIds, []);
+		strictEqual(result.attempts[0].terminal, "skipped");
+		strictEqual(result.attempts[0].reason, "unsafe_failure");
+	});
+}
+test("typed unknown retry excludes immediately, shares logical task and allows target in a later call", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "provider_exit_nonzero",
+					phase: "provider",
+				}),
+			},
+		},
+	});
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.direction, "complete");
+	deepStrictEqual(f.calls, ["antigravity-claude", "codex"]);
+	deepStrictEqual(first.failedTargetIds, []);
+	strictEqual(new Set(first.attempts.map((a) => a.taskId)).size, 1);
+	strictEqual(new Set(first.attempts.map((a) => a.attemptId)).size, 2);
+	await runSimpleRoutingTask(f.options, f.deps);
+	deepStrictEqual(f.calls, [
+		"antigravity-claude",
+		"codex",
+		"antigravity-claude",
+		"codex",
+	]);
+});
+test("typed provider blame requires identity-matched trusted durable provenance", async () => {
+	const providerReliability = createProviderReliabilityDiagnostic({
+		causeCode: "auth_expired",
+		phase: "provider",
+	});
+	for (const trusted of [true, false]) {
+		const f = fixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: { providerReliability },
+				record: {
+					lastFailure: {
+						errorKind: "execution_failed",
+						providerReliability,
+						diagnosticCode: "auth_expired",
+						diagnosticOrigin: trusted ? "adapter" : "provider",
+						diagnosticEvidenceAvailable: true,
+						failurePhase: "provider_execution",
+					},
+				},
+			},
+		});
+		const result = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(result.direction, "complete");
+		deepStrictEqual(
+			result.failedTargetIds,
+			trusted ? ["antigravity-claude"] : [],
+		);
+	}
+});
+
+test("trusted typed provider cause without a started writer never enters provider memory", async () => {
+	const providerReliability = createProviderReliabilityDiagnostic({
+		causeCode: "auth_expired",
+		phase: "provider",
+	});
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: { providerReliability },
+			record: {
+				lastFailure: {
+					errorKind: "execution_failed",
+					providerReliability,
+					diagnosticCode: "auth_expired",
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
+					failurePhase: "provider_execution",
+				},
+			},
+		},
+	});
+	const engine = f.deps.runSimpleTask;
+	f.deps.runSimpleTask = async (options, context) => {
+		const result = await engine(options, context);
+		result.recovery.cleanup.writer.state = "never_started";
+		result.recovery.cleanup.worktree = { state: "not_created", path: null };
+		f.records.get(context.runId).worktree = null;
+		return result;
+	};
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.direction, "stop");
+	strictEqual(result.result.accountability.providerMemoryEligible, true);
+	strictEqual(result.attempts[0].terminal, "skipped");
+	strictEqual(result.attempts[0].reason, "unsafe_failure");
+	deepStrictEqual(result.failedTargetIds, []);
+	deepStrictEqual(f.calls, ["antigravity-claude"]);
+	deepStrictEqual(
+		readRoutingRunState(f.options.projectPath, f.options.routingRunId, {
+			stateRoot: f.deps.stateRoot,
+		}).failedTargetIds,
+		[],
+	);
+});
+
+test("typed diagnostic identity ignores key order while preserving mismatched evidence refusal", async () => {
+	const durable = createProviderReliabilityDiagnostic({
+		causeCode: "auth_expired",
+		phase: "provider",
+	});
+	for (const mismatch of [false, true]) {
+		const evidence = Object.fromEntries(
+			Object.entries(
+				mismatch
+					? createProviderReliabilityDiagnostic({
+							causeCode: "quota_exhausted",
+							phase: "provider",
+						})
+					: durable,
+			).reverse(),
+		);
+		const f = fixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: { providerReliability: evidence },
+				record: {
+					lastFailure: {
+						errorKind: "execution_failed",
+						providerReliability: durable,
+						diagnosticCode: "auth_expired",
+						diagnosticOrigin: "adapter",
+						diagnosticEvidenceAvailable: true,
+						failurePhase: "provider_execution",
+					},
+				},
+			},
+		});
+		f.options.capability = "high";
+		const result = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(result.direction, "stop");
+		strictEqual(
+			result.result.accountability.owner,
+			mismatch ? "unknown" : "provider",
+		);
+		strictEqual(result.result.accountability.providerMemoryEligible, !mismatch);
+		strictEqual(result.attempts[0].terminal, mismatch ? "skipped" : "failed");
+		deepStrictEqual(
+			result.failedTargetIds,
+			mismatch ? [] : ["antigravity-claude"],
+		);
 	}
 });

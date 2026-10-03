@@ -80,6 +80,26 @@ function descriptor() {
 	};
 }
 
+function fixturePreflightReadSnapshot({ ok = true, percentLeft = 80 } = {}) {
+	// Keep the real queue preflight deterministic without reading host quota.
+	return () => ({
+		snapshot: {
+			schema_version: 2,
+			updated_at: new Date().toISOString(),
+			providers: [
+				{
+					name: "claude",
+					ok,
+					windows: [{ percent_left: percentLeft, pace_delta: 1 }],
+				},
+			],
+		},
+		snapshotStatus: "fresh",
+		snapshotMtime: 1,
+		snapshotAgeMsAtRoute: 0,
+	});
+}
+
 function commandFromScript(script, { timeout = 2_000, maxBuffer = 1024 } = {}) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	return runCommand(TEST_DIR, process.env, ["node", "--version"], 100, {
@@ -219,6 +239,8 @@ describe("queue reliability contract", () => {
 				}),
 				recordDispatch: () => {},
 				recordDispatchIntent: () => {},
+				goldenImageVerifiedProviders: ["claude"],
+				preflightReadSnapshot: fixturePreflightReadSnapshot(),
 				integrationGate,
 				adapters: {
 					claude: {
@@ -263,6 +285,8 @@ describe("queue reliability contract", () => {
 				integrationGate,
 				recordDispatch: () => {},
 				recordDispatchIntent: () => {},
+				goldenImageVerifiedProviders: ["claude"],
+				preflightReadSnapshot: fixturePreflightReadSnapshot(),
 				resolveDescriptor: descriptor,
 				broker: {
 					selectAndReserve: async () => ({
@@ -305,6 +329,69 @@ describe("queue reliability contract", () => {
 			asyncCheckpoint.results[0].baselineCheckReceipt.attempt,
 			asyncCheckpoint.results[0].attempt,
 		);
+	});
+
+	it("rejects exhausted and unavailable synthetic providers before launch", () => {
+		for (const scenario of [
+			{
+				name: "exhausted-quota",
+				snapshot: { percentLeft: 0 },
+				reason: "no_quota_headroom",
+			},
+			{
+				name: "unavailable-provider",
+				snapshot: { ok: false },
+				reason: "provider_unavailable",
+			},
+		]) {
+			const { project, base } = projectAt(scenario.name);
+			const tasksPath = join(TEST_DIR, `${scenario.name}.tasks.md`);
+			tasksFile(tasksPath, "node --check a.mjs");
+			let launches = 0;
+			throws(
+				() =>
+					runQueue({
+						tasksFilePath: tasksPath,
+						projectPath: project,
+						checkpointPath: `${tasksPath}.checkpoint.json`,
+						stopOnFailure: false,
+						dependencies: {
+							backendFactory: () => ({
+								...backend(base),
+								create: () => {
+									launches += 1;
+									return "fake";
+								},
+							}),
+							adapters: { claude: { execute: () => ({ success: true }) } },
+							goldenImageVerifiedProviders: ["claude"],
+							preflightReadSnapshot: fixturePreflightReadSnapshot(
+								scenario.snapshot,
+							),
+							hostPowerPolicyEnabled: false,
+							route: () => {
+								launches += 1;
+								return {
+									provider: "claude",
+									model: "claude-sonnet-5-5",
+								};
+							},
+							recordDispatch: () => {},
+							recordDispatchIntent: () => {},
+							integrationGate,
+						},
+					}),
+				(error) => {
+					strictEqual(error.name, "QueuePreflightError", error.message);
+					strictEqual(
+						error.preflightDetail.rejections[0].excludedReasons.claude,
+						scenario.reason,
+					);
+					return true;
+				},
+			);
+			strictEqual(launches, 0);
+		}
 	});
 
 	it("rejects a baseline check that mutates tracked candidate files", () => {

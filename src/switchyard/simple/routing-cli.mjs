@@ -9,6 +9,8 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { readRun } from "../run-store/index.mjs";
+import { inspectRoutingAccountability } from "./failure-accountability.mjs";
 import {
 	canonicalRoutingProject,
 	latchNativeRequired,
@@ -91,7 +93,17 @@ export async function handleRoutingRun(argv, deps = {}) {
 		const state = readRoutingRunState(project, runId, {
 			stateRoot: deps.stateRoot,
 		});
-		write(JSON.stringify({ ok: Boolean(state), routingRunId: runId, state }));
+		const accountability = state
+			? await inspectRoutingAccountability(state, deps.readRun ?? readRun)
+			: null;
+		write(
+			JSON.stringify({
+				ok: Boolean(state),
+				routingRunId: runId,
+				state,
+				accountability,
+			}),
+		);
 		return;
 	}
 	if (

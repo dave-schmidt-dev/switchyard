@@ -50,3 +50,6 @@ spikes/
 
 # personal opencode agent-permission config (not shared team config)
 opencode.jsonc
+
+# Fixed local OpenCode V1 runtime; integrity checked by keyless bridge.
+.tools/opencode-v1.18.30/

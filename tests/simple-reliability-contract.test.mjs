@@ -1,13 +1,31 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
-import { readEvents, readRun } from "../src/switchyard/run-store/index.mjs";
+import { inspectRouteHealth } from "../src/switchyard/router/health.mjs";
+import { COOLDOWN_MS } from "../src/switchyard/router/health-schema.mjs";
+import {
+	isProjectLockHeld,
+	readEvents,
+	readRun,
+} from "../src/switchyard/run-store/index.mjs";
+import { createSimpleRouteHealthController } from "../src/switchyard/simple/health.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/simple/reliability.mjs";
+import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
+import {
+	healthIdentity,
+	seedVmQuotaCooldown,
+} from "./provider-reliability-health-fixture.mjs";
 
 const suiteRoot = tempDir("switchyard-provider-reliability-");
 const suiteTmp = join(suiteRoot, "tmp");
@@ -84,6 +102,11 @@ function dependencies(_repo, overrides = {}) {
 			writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n", "utf8");
 			return { success: true, code: 0, writerLifecycle: "stopped" };
 		},
+		runCheck: async () => ({
+			success: true,
+			code: 0,
+			writerLifecycle: "stopped",
+		}),
 		integrate: async () => ({ success: true }),
 		...overrides,
 	};
@@ -170,6 +193,45 @@ describe("simple provider reliability contract", () => {
 		const terminal = events.find((event) => event.event === "task_failed");
 		ok(terminal, JSON.stringify(events));
 		strictEqual(terminal.providerReliability.causeCategory, "unknown");
+	});
+
+	it("preserves provider deadline cause and process evidence in durable diagnostics", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			taskOptions(repo),
+			dependencies(repo, {
+				runId: `simple-deadline-${Date.now()}`,
+				executeProvider: async () => ({
+					success: false,
+					code: null,
+					timedOut: true,
+					signal: "SIGKILL",
+					writerLifecycle: "stopped",
+				}),
+			}),
+		);
+		remember(result, repo.projectPath);
+		strictEqual(result.failureReason, "provider_deadline_exceeded");
+		const run = await readRun(result.runId);
+		const events = await readEvents(result.runId);
+		const terminal = events.find((event) => event.event === "task_failed");
+		for (const diagnostic of [
+			result.providerReliability,
+			run.lastFailure.providerReliability,
+			terminal.providerReliability,
+		]) {
+			strictEqual(diagnostic.causeCode, "provider_deadline_exceeded");
+			strictEqual(diagnostic.causeCategory, "provider");
+			strictEqual(diagnostic.timedOut, true);
+			strictEqual(diagnostic.signal, "SIGKILL");
+		}
+		const checkTimeout = createSimpleProviderReliabilityDiagnostic({
+			failureReason: "check_deadline_exceeded",
+			failurePhase: "checks",
+			timedOut: true,
+		});
+		strictEqual(checkTimeout.causeCode, "acceptance_check_timeout");
+		strictEqual(checkTimeout.causeCategory, "check");
 	});
 
 	it("fails a requested baseline before provider launch and preserves its exit code", async () => {
@@ -300,6 +362,45 @@ describe("simple provider reliability contract", () => {
 		strictEqual(run.terminalSummary.providerReliability.repairCount, 1);
 	});
 
+	it("retains dependency-unverified as an environment cause without spending repair budget", async () => {
+		const repo = makeRepo();
+		let providerCalls = 0;
+		const result = await runSimpleTask(
+			taskOptions(repo, { repairChecks: true }),
+			dependencies(repo, {
+				runId: `simple-dependencies-${Date.now()}`,
+				executeProvider: async ({ worktreePath }) => {
+					providerCalls += 1;
+					writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+					return { success: true, code: 0, writerLifecycle: "stopped" };
+				},
+				runCheck: async () => ({
+					success: false,
+					code: 1,
+					diagnosticCode: "check_dependencies_unverified",
+					writerLifecycle: "never_started",
+				}),
+			}),
+		);
+		remember(result, repo.projectPath);
+		strictEqual(providerCalls, 1);
+		strictEqual(result.failureReason, "check_dependencies_unverified");
+		strictEqual(result.errorKind, "environment_failure");
+		const run = await readRun(result.runId);
+		const events = await readEvents(result.runId);
+		const terminal = events.find((event) => event.event === "task_failed");
+		for (const diagnostic of [
+			result.providerReliability,
+			run.lastFailure.providerReliability,
+			terminal.providerReliability,
+		]) {
+			strictEqual(diagnostic.causeCode, "check_dependencies_unverified");
+			strictEqual(diagnostic.causeCategory, "environment");
+			strictEqual(diagnostic.repairCount, 0);
+			strictEqual(diagnostic.repairStatus, "ineligible");
+		}
+	});
+
 	it("refuses correction when provider writer lifecycle is unknown", async () => {
 		const repo = makeRepo();
 		let providerCalls = 0;
@@ -414,6 +515,41 @@ describe("simple provider reliability contract", () => {
 		strictEqual(result.providerReliability.repairStatus, "failed");
 		strictEqual(providerCalls, 2);
 		strictEqual(checkCalls, 2);
+		ok(result.partialWorktree);
+		ok(existsSync(result.partialWorktree));
+		strictEqual(
+			readFileSync(join(result.partialWorktree, "src/a.txt"), "utf8"),
+			"provider 2\n",
+		);
+		strictEqual(result.recovery.cleanup.worktree.state, "retained");
+		strictEqual(result.recovery.cleanup.projectLock.state, "released");
+		strictEqual(await isProjectLockHeld(repo.projectPath), false);
+		const run = await readRun(result.runId);
+		strictEqual(
+			run.lastFailure.providerReliability.causeCode,
+			"check_repair_failed",
+		);
+		strictEqual(run.worktree.state, "retained");
+		strictEqual(join(run.worktree.path, "worktree"), result.partialWorktree);
+		strictEqual(run.worktree.writerStopped, true);
+		strictEqual(run.cleanupState, "pending");
+		const continuation = await runSimpleRoutingTask(
+			{ projectPath: repo.projectPath, routingRunId: "repair-retained" },
+			{
+				openRoutingRun: () => ({
+					state: {
+						attempts: [{ partialWorktree: result.partialWorktree }],
+						failedTargetIds: [],
+					},
+					release: () => {},
+				}),
+				runSimpleTask: async () => {
+					throw Error("retained work must not dispatch");
+				},
+			},
+		);
+		strictEqual(continuation.direction, "stop");
+		strictEqual(continuation.stopReason, "partial_work_retained");
 	});
 
 	it("uses a fresh enforce-mode health invocation before correction", async () => {
@@ -478,4 +614,133 @@ describe("simple provider reliability contract", () => {
 		]);
 		strictEqual(providerCalls, 2);
 	});
+
+	for (const interruption of [
+		"deadline",
+		"abort",
+		"callback",
+		"start",
+		"prepare",
+	]) {
+		it(`fences a real half-open trial for ${interruption} admission`, async () => {
+			const repo = makeRepo();
+			const deps = dependencies(repo, {
+				runId: `simple-halfopen-${interruption}-${Date.now()}`,
+			});
+			const descriptor = deps.getInvocationDescriptor();
+			const healthStateRoot = join(suiteRoot, `half-open-${interruption}`);
+			const seed = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+			let clock = seed.at + COOLDOWN_MS[0] + 1_000;
+			const deadline = clock + 240_000;
+			const abort = new AbortController();
+			let calls = 0;
+			let reservedTrial = false;
+			let realController;
+			const decision = () => ({
+				available: true,
+				mode: "enforce",
+				state: "cooldown",
+				suppress: false,
+				repairEpoch: 0,
+				trialAvailable: true,
+			});
+			Object.defineProperties(decision, {
+				mode: { value: "enforce" },
+				publicConfigurationEpoch: { value: seed.epoch },
+				identityFor: {
+					value: () => ({
+						targetId: descriptor.target_id,
+						descriptorIdentity: descriptor.descriptor_identity,
+						publicConfigurationEpoch: seed.epoch,
+					}),
+				},
+			});
+			deps.now = () => clock;
+			deps.signal = abort.signal;
+			deps.healthDecision = decision;
+			deps.healthStateRoot = healthStateRoot;
+			deps.healthMode = "enforce";
+			deps.executeProvider = async () => {
+				calls += 1;
+				return { success: false, code: 1, writerLifecycle: "stopped" };
+			};
+			deps.createSimpleRouteHealthController = (options) => {
+				const controller = createSimpleRouteHealthController(options);
+				realController = controller;
+				return {
+					...controller,
+					start: async (input) => {
+						const result = await controller.start(input);
+						reservedTrial = result.allowed && result.trial;
+						if (interruption === "deadline") clock = deadline;
+						if (interruption === "abort") abort.abort();
+						if (interruption === "prepare")
+							await controller.prepare({
+								provider: "codex",
+								targetId: "codex",
+								capability: "standard",
+								descriptor: {},
+							});
+						return result;
+					},
+				};
+			};
+			deps.onStatus = (event) => {
+				if (
+					interruption === "callback" &&
+					event.milestone === "provider_starting"
+				)
+					abort.abort();
+			};
+			const result = await runSimpleTask(
+				taskOptions(repo, { checks: [], deadlineMs: deadline }),
+				deps,
+			);
+			remember(result, repo.projectPath);
+			strictEqual(reservedTrial, true, JSON.stringify(result));
+			const started = interruption === "start";
+			strictEqual(calls, started ? 1 : 0);
+			strictEqual(result.providerStarted, started);
+			strictEqual(
+				result.recovery.cleanup.writer.state,
+				started ? "stopped" : "never_started",
+			);
+			strictEqual(
+				result.failureReason,
+				started
+					? "provider_exit_nonzero"
+					: interruption === "deadline"
+						? "deadline_expired"
+						: interruption === "prepare"
+							? "route_health_blocked"
+							: "provider_cancelled",
+			);
+			strictEqual(realController.startPrepared().allowed, false);
+			strictEqual((await realController.cancelUnstarted()).released, !started);
+			strictEqual((await realController.cancelUnstarted()).released, !started);
+			if (!started && interruption !== "prepare") {
+				const terminal = await realController.terminal();
+				strictEqual(terminal.settled, true);
+				deepStrictEqual(await realController.terminal(), terminal);
+			}
+			const state = await inspectRouteHealth({
+				...healthIdentity(healthStateRoot, descriptor, seed.epoch),
+				nowMs: clock,
+			});
+			strictEqual(state.state, started ? "half-open" : "cooldown");
+			strictEqual(state.trialAvailable, !started);
+			if (interruption === "callback") {
+				strictEqual(result.partialWorktree, null);
+				const run = await readRun(result.runId);
+				strictEqual(run.state, "failed");
+				strictEqual(run.worktree.state, "removed");
+				strictEqual(run.cleanupState, "complete");
+			}
+			const events = await readEvents(result.runId);
+			strictEqual(
+				events.some((event) => event.event === "provider_attempt_terminal"),
+				false,
+			);
+		});
+	}
 });

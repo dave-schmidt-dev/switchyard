@@ -2,13 +2,8 @@ import { snapshotAdmissionFailure } from "../broker/snapshots.mjs";
 
 import {
 	CAPABILITY_CLASS,
-	describeDescriptorGap,
 	getImplementorPriority,
-	getRightSizedModel,
 	hasAutomaticInvocationDescriptor,
-	normalizeProviderName,
-	PROVIDER_CAPABILITIES,
-	passesCapabilityFilter,
 	resolveTargetId,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
@@ -320,6 +315,7 @@ export function routeBlind(
 			usageMode: "unknown",
 		});
 		if (!eligibility.eligible) {
+			options.evidenceCapture?.exclude(name, eligibility.reason);
 			if (eligibility.reason === "target_identity_unavailable") {
 				const identity = resolveTargetIdentity(name);
 				if (!identity.ambiguous) continue;
@@ -337,7 +333,11 @@ export function routeBlind(
 			requiredCapability,
 			usageMode: "unknown",
 		});
-		if (health) continue;
+		if (health) {
+			options.evidenceCapture?.exclude(name, "route_health_suppressed");
+			continue;
+		}
+		options.evidenceCapture?.candidate(name, [], getImplementorPriority(name));
 		survivors.push({
 			name,
 			priority: getImplementorPriority(name),

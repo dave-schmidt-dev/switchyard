@@ -33,7 +33,7 @@ test("checks add the acceptance check paragraph with both commands in order", ()
 		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.";
 	strictEqual(
 		prompt,
-		`${scopeSentence}\n\nAfter you finish, these acceptance checks run in this checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n- \`ruff check .\`\n- \`swiftlint --strict\``,
+		`${scopeSentence}\n\nAfter you finish, these acceptance checks run against your candidate in an independent trusted checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n- \`ruff check .\`\n- \`swiftlint --strict\``,
 	);
 	strictEqual(
 		prompt.indexOf("- `ruff check .`") <

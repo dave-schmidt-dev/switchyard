@@ -10,6 +10,7 @@ import {
 	ingestRouteHealthEvents,
 	releaseHalfOpenClaim,
 	startHalfOpenClaim,
+	startHalfOpenClaimSync,
 } from "../router/health.mjs";
 import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
 import { createRouteHealthEvent, getRunRoot } from "../run-store/index.mjs";
@@ -167,15 +168,21 @@ export function createSimpleRouteHealthController(options = {}) {
 	}
 
 	async function releaseUnstarted(previous) {
-		if (!previous?.lease || previous.started || previous.settled) return;
-		await releaseHalfOpenClaim({
-			...claimFields(previous.binding),
-			...previous.lease,
-			leaseToken: previous.lease.token,
-			leaseRevision: previous.lease.revision,
-			provenNeverStarted: true,
-		});
+		if (!previous || previous.settled) return true;
+		if (previous.started) return false;
+		if (previous.lease) {
+			const result = await releaseHalfOpenClaim({
+				...claimFields(previous.binding),
+				...previous.lease,
+				leaseToken: previous.lease.token,
+				leaseRevision: previous.lease.revision,
+				provenNeverStarted: true,
+			});
+			if (result.released !== true) return false;
+		}
+		previous.prepared = false;
 		previous.settled = true;
+		return true;
 	}
 
 	async function prepare(input) {
@@ -190,7 +197,12 @@ export function createSimpleRouteHealthController(options = {}) {
 				reroute: true,
 				reason: "provider-invocation-unsettled",
 			};
-		await releaseUnstarted(invocation);
+		if (!(await releaseUnstarted(invocation)))
+			return {
+				allowed: false,
+				reroute: true,
+				reason: "provider-invocation-unsettled",
+			};
 		sequence += 1;
 		const binding = resolveSelected(input);
 		invocation = binding
@@ -220,9 +232,9 @@ export function createSimpleRouteHealthController(options = {}) {
 		};
 	}
 
-	async function start() {
+	async function start({ deferProviderStart = false } = {}) {
 		if (!invocation?.binding) return { allowed: true, tracked: false };
-		if (invocation.started || invocation.settled)
+		if (invocation.started || invocation.prepared || invocation.settled)
 			return {
 				allowed: false,
 				reroute: true,
@@ -272,7 +284,9 @@ export function createSimpleRouteHealthController(options = {}) {
 				leaseToken: claimed.lease.token,
 				leaseRevision: claimed.lease.revision,
 			};
-			const result = await startHalfOpenClaim(claim);
+			const result = deferProviderStart
+				? { started: true }
+				: await startHalfOpenClaim(claim);
 			if (result.started !== true) {
 				await releaseUnstarted(invocation);
 				return {
@@ -283,12 +297,70 @@ export function createSimpleRouteHealthController(options = {}) {
 			}
 		}
 		// This call is the invocation fence, immediately before provider launch.
-		invocation.started = true;
+		invocation.prepared = deferProviderStart;
+		invocation.started = !deferProviderStart;
 		return {
 			allowed: true,
 			tracked: Number.isSafeInteger(binding.repairEpoch),
 			attempt: binding.attempt,
 			trial: Boolean(invocation.lease),
+		};
+	}
+
+	/** Commit a reserved invocation synchronously at the actual execute fence. */
+	function startPrepared(reservation = null) {
+		if (!invocation?.binding)
+			return {
+				allowed: reservation?.allowed === true && reservation.tracked === false,
+				tracked: false,
+			};
+		if (
+			!invocation.prepared ||
+			invocation.started ||
+			invocation.settled ||
+			(reservation && reservation.attempt !== invocation.binding.attempt)
+		)
+			return { allowed: false, reason: "provider-invocation-reused" };
+		invocation.prepared = false;
+		if (invocation.lease) {
+			let result;
+			try {
+				result = startHalfOpenClaimSync({
+					...claimFields(invocation.binding),
+					...invocation.lease,
+					leaseToken: invocation.lease.token,
+					leaseRevision: invocation.lease.revision,
+				});
+			} catch {
+				return { allowed: false, reason: "half-open-start-unavailable" };
+			}
+			if (result.started !== true)
+				return {
+					allowed: false,
+					reason: result.reason ?? "half-open-start-unavailable",
+				};
+		}
+		invocation.started = true;
+		return {
+			allowed: true,
+			tracked: Number.isSafeInteger(invocation.binding.repairEpoch),
+			trial: Boolean(invocation.lease),
+			attempt: invocation.binding.attempt,
+		};
+	}
+
+	/** Only the controller's exact lease can be released before provider execution. */
+	async function cancelUnstarted(reservation = null) {
+		if (
+			reservation?.tracked === true &&
+			invocation?.binding &&
+			reservation.attempt !== invocation.binding.attempt
+		)
+			return { released: false };
+		return {
+			released: invocation?.started
+				? false
+				: await releaseUnstarted(invocation),
 		};
 	}
 
@@ -312,9 +384,9 @@ export function createSimpleRouteHealthController(options = {}) {
 			return currentInvocation.terminalResult;
 		}
 		if (!currentInvocation.started) {
-			await releaseUnstarted(currentInvocation);
+			const released = await releaseUnstarted(currentInvocation);
 			currentInvocation.terminalResult = {
-				settled: !currentInvocation.lease,
+				settled: released,
 				reason: "provider-not-started",
 				binding: null,
 			};
@@ -407,5 +479,12 @@ export function createSimpleRouteHealthController(options = {}) {
 		return currentInvocation.terminalResult;
 	}
 
-	return Object.freeze({ decision, prepare, start, terminal });
+	return Object.freeze({
+		decision,
+		prepare,
+		start,
+		startPrepared,
+		cancelUnstarted,
+		terminal,
+	});
 }

@@ -454,6 +454,190 @@ describe("simple local execution path", () => {
 				strictEqual(existsSync(candidatePath), false);
 			});
 		}
+		it("persists final cleanup for an initialized route failure with no clone", async () => {
+			const repo = makeRepo();
+			const runId = `simple-no-clone-${Date.now()}`;
+			const patches = [];
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					route: () => {
+						throw new Error("synthetic route failure");
+					},
+					updateRunWithRetry: async (id, patch) => {
+						patches.push(structuredClone(patch));
+						return updateRunWithRetry(id, patch);
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.recovery.cleanup.worktree.state, "not_created");
+			const terminal = patches.find((patch) => patch.state === "failed");
+			strictEqual(terminal.cleanupState, "pending");
+			strictEqual(patches.at(-1).cleanupState, "complete");
+			const run = await readRun(runId);
+			strictEqual(run.state, "failed");
+			strictEqual(run.cleanupState, "complete");
+			strictEqual(run.worktree, null);
+		});
+		it("retains an allocated candidate when terminal persistence fails", async () => {
+			const repo = makeRepo();
+			const runId = `simple-terminal-write-failed-${Date.now()}`;
+			let removed = false;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.worktree?.state === "active" || patch.state === "failed")
+							throw new Error("synthetic persistence failure");
+						return updateRunWithRetry(id, patch);
+					},
+					rmSync: () => {
+						removed = true;
+					},
+				}),
+			);
+			retain(result, repo.projectPath);
+			strictEqual(result.status, "failed");
+			strictEqual(removed, false);
+			ok(existsSync(dirname(result.partialWorktree)));
+			const run = await readRun(runId);
+			strictEqual(run.cleanupState, "pending");
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(result.cleanupState, "pending");
+		});
+		it("waits for terminal cleanup intent before removing an allocated candidate", async () => {
+			const repo = makeRepo();
+			const runId = `simple-interrupted-terminal-${Date.now()}`;
+			let terminalResolve;
+			let terminalObserved;
+			const terminalStarted = new Promise((resolve) => {
+				terminalObserved = resolve;
+			});
+			let removed = false;
+			let observedCleanup;
+			const running = runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.worktree?.state === "active")
+							throw new Error("synthetic active-state failure");
+						if (patch.state === "failed") {
+							terminalObserved();
+							await new Promise((resolve) => {
+								terminalResolve = resolve;
+							});
+						}
+						return updateRunWithRetry(id, patch);
+					},
+					cleanupSimpleWorktree: async (_id, claim) => {
+						const run = await readRun(runId);
+						observedCleanup = {
+							state: run.state,
+							cleanupState: run.cleanupState,
+						};
+						removed = true;
+						rmSync(claim.path, { recursive: true, force: true });
+						return { removed: true, path: claim.path };
+					},
+				}),
+			);
+			await terminalStarted;
+			strictEqual(removed, false);
+			strictEqual((await readRun(runId)).worktree.state, "allocating");
+			terminalResolve();
+			const result = await running;
+			strictEqual(result.status, "failed");
+			strictEqual(removed, true);
+			deepStrictEqual(observedCleanup, {
+				state: "failed",
+				cleanupState: "pending",
+			});
+			strictEqual((await readRun(runId)).cleanupState, "complete");
+		});
+		it("leaves durable cleanup pending when final no-clone disposition cannot be written", async () => {
+			const repo = makeRepo();
+			const runId = `simple-cleanup-write-failed-${Date.now()}`;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					route: () => {
+						throw new Error("synthetic route failure");
+					},
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.cleanupState === "complete")
+							throw new Error("synthetic cleanup write failure");
+						return updateRunWithRetry(id, patch);
+					},
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.cleanupState, "pending");
+			strictEqual((await readRun(runId)).cleanupState, "pending");
+		});
+		it("preserves applied success and complete cleanup", async () => {
+			const repo = makeRepo();
+			const runId = `simple-success-finalization-${Date.now()}`;
+			const result = await runSimpleTask(
+				options(repo, { checks: [] }),
+				dependencies({ runId }),
+			);
+			strictEqual(result.status, "succeeded");
+			strictEqual(
+				readFileSync(join(repo.projectPath, "src/a.txt"), "utf8"),
+				"provider\n",
+			);
+			const run = await readRun(runId);
+			strictEqual(run.state, "succeeded");
+			strictEqual(run.cleanupState, "complete");
+			strictEqual(run.worktree.state, "removed");
+		});
+		it("keeps the failed checker intact when terminal persistence fails", async () => {
+			const repo = makeRepo();
+			const runId = `simple-checker-terminal-failed-${Date.now()}`;
+			const result = await runSimpleTask(
+				options(repo, { checks: ["false"] }),
+				dependencies({
+					runId,
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.state === "failed")
+							throw new Error("synthetic terminal write failure");
+						return updateRunWithRetry(id, patch);
+					},
+				}),
+			);
+			retain(result, repo.projectPath);
+			strictEqual(result.failureReason, "check_failed");
+			ok(result.partialWorktree);
+			const root = dirname(result.partialWorktree);
+			ok(
+				readdirSync(root).some((name) => name.startsWith("checker-")),
+				"failed terminal write must preserve the disposable checker",
+			);
+			strictEqual((await readRun(runId)).cleanupState, "pending");
+		});
+		it("reflects unreleased project lock independently on no-clone failure", async () => {
+			const repo = makeRepo();
+			const runId = `simple-no-clone-lock-${Date.now()}`;
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					route: () => {
+						throw new Error("synthetic route failure");
+					},
+					releaseProjectLock: async () => false,
+				}),
+			);
+			strictEqual(result.status, "failed");
+			strictEqual(result.recovery.cleanup.projectLock.state, "unavailable");
+			strictEqual(result.recovery.cleanup.worktree.state, "not_created");
+			strictEqual((await readRun(runId)).cleanupState, "failed");
+		});
 		it("retains salvage and records retained worktree state when checks fail", async () => {
 			const repo = makeRepo();
 			const taskId = `worktree-salvage-${Date.now()}`;
@@ -486,6 +670,55 @@ describe("simple local execution path", () => {
 			ok(typeof run.worktree.retainedAt === "string");
 			strictEqual(run.cleanupState, "pending");
 			strictEqual(join(run.worktree.path, "worktree"), result.partialWorktree);
+			strictEqual(existsSync(run.worktree.path), true);
+		});
+		it("persists bounded cleanup failure when finally retains a failed run worktree", async () => {
+			const repo = makeRepo();
+			const runId = `simple-finally-cleanup-failure-${Date.now()}`;
+			let cleanupPatch;
+
+			const result = await runSimpleTask(
+				options(repo),
+				dependencies({
+					runId,
+					updateRunWithRetry: async (id, patch) => {
+						if (patch.worktree?.state === "active")
+							throw new Error("synthetic active-state write failure");
+						if (patch.cleanupState === "failed")
+							cleanupPatch = structuredClone(patch);
+						return updateRunWithRetry(id, patch);
+					},
+					cleanupSimpleWorktree: async (_id, claim) => ({
+						removed: false,
+						reason: "synthetic_cleanup_rejection",
+						path: claim.path,
+					}),
+				}),
+			);
+			retain(result, repo.projectPath);
+
+			strictEqual(result.status, "failed");
+			strictEqual(result.failureReason, "run_store_write_failed");
+			ok(result.partialWorktree);
+			ok(cleanupPatch, "finally attempted the terminal cleanup write");
+
+			const run = await readRun(runId);
+			strictEqual(run.cleanupState, "failed");
+			strictEqual(run.cleanupFailure.errorKind, "cleanup_failed");
+			strictEqual(run.cleanupFailure.failurePhase, "cleanup");
+			strictEqual(run.cleanupFailure.result, "worktree_cleanup_failed");
+			deepStrictEqual(Object.keys(run.cleanupFailure).sort(), [
+				"errorKind",
+				"failurePhase",
+				"reason",
+				"reasonCode",
+				"result",
+			]);
+			ok(run.cleanupFailure.reason.length <= 256);
+			strictEqual(run.worktree.state, "retained");
+			strictEqual(run.worktree.reason, "synthetic_cleanup_rejection");
+			strictEqual(join(run.worktree.path, "worktree"), result.partialWorktree);
+			ok(typeof run.worktree.retainedAt === "string");
 			strictEqual(existsSync(run.worktree.path), true);
 		});
 	});

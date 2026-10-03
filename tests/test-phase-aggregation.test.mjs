@@ -1,5 +1,7 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { appendFileSync, readFileSync } from "node:fs";
+import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,6 +17,75 @@ const PKG_ROOT = resolve(__dirname, "..");
 const PACKAGE_JSON_PATH = resolve(PKG_ROOT, "package.json");
 
 describe("test phase aggregation runner", () => {
+	it("keeps the exact shell selection manifest and bounds only the other-phase Node workers", () => {
+		const pkg = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
+		const script = pkg.scripts["test:other"];
+		strictEqual(
+			createHash("sha256")
+				.update(script.replace("--test-concurrency=2 ", ""))
+				.digest("hex"),
+			"b707ced80802b82d34a900100cf51e4c47586530c0e319427914d30e5d25b071",
+		);
+		strictEqual(
+			createHash("sha256").update(pkg.scripts["test:serial"]).digest("hex"),
+			"27d5bf0b1872ec39f67b8a771060c4e802120094f9bf373bd0c7ff73b43be50b",
+		);
+		ok(
+			script.endsWith(
+				"node --test --test-concurrency=2 --test-reporter=tap $files",
+			),
+		);
+		const selection = script.replace(
+			"node --test --test-concurrency=2 --test-reporter=tap $files",
+			"printf '%s\\n' $files",
+		);
+		const selected = execFileSync("/bin/sh", ["-c", selection], {
+			cwd: PKG_ROOT,
+			encoding: "utf8",
+		})
+			.trim()
+			.split("\n");
+		const serial = pkg.scripts["test:serial"]
+			.split(" ")
+			.filter((arg) => arg.startsWith("tests/"));
+		const excluded = new Set([
+			...serial,
+			"tests/outcome-properties.test.mjs",
+			"tests/mutation-properties.test.mjs",
+			"tests/simple-dispatch.test.mjs",
+		]);
+		const expected = readdirSync(resolve(PKG_ROOT, "tests"))
+			.filter((name) => name.endsWith(".test.mjs"))
+			.map((name) => `tests/${name}`)
+			.filter((path) => !excluded.has(path))
+			.sort();
+		deepStrictEqual(selected, expected);
+		strictEqual(new Set(selected).size, selected.length);
+	});
+
+	it("cleans phase gate and isolated account directories after a process error", () => {
+		let gateDirectory;
+		let accountDirectory;
+		throws(
+			() =>
+				defaultRun("test:serial", {
+					env: {},
+					spawn(_command, _args, options) {
+						gateDirectory = dirname(
+							options.env.SWITCHYARD_VM_GATE_OUTCOME_FILE,
+						);
+						accountDirectory = options.env.SWITCHYARD_ACCOUNT_ROOT;
+						return { error: new Error("phase spawn failed") };
+					},
+				}),
+			/phase spawn failed/u,
+		);
+		ok(gateDirectory);
+		ok(accountDirectory);
+		strictEqual(existsSync(gateDirectory), false);
+		strictEqual(existsSync(accountDirectory), false);
+	});
+
 	function runSerialWithGateRecords(records, onSpawn = () => {}) {
 		return defaultRun("test:serial", {
 			spawn: (_command, _args, options) => {
@@ -132,6 +203,23 @@ describe("test phase aggregation runner", () => {
 		});
 		strictEqual(status, 0);
 		ok(logs[0].includes("test:serial/inv1 (unavailable-with-proof)"));
+	});
+
+	it("executes both phases and reports the failed phase for either failure order", () => {
+		for (const failedPhase of DEFAULT_PHASES) {
+			const executed = [];
+			const logs = [];
+			const status = runPhases({
+				run(phase) {
+					executed.push(phase);
+					return phase === failedPhase ? 9 : 0;
+				},
+				log: (message) => logs.push(message),
+			});
+			deepStrictEqual(executed, DEFAULT_PHASES);
+			strictEqual(status, 9);
+			ok(logs[0].includes(`${failedPhase} (exit 9)`));
+		}
 	});
 
 	it("proves the second phase still runs when the first phase exits non-zero", () => {

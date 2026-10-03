@@ -1,10 +1,12 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { createHash } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { describe, it } from "node:test";
 import {
 	CRITICAL_MODULE_COVERAGE,
 	coverageFailures,
+	criticalCoveragePlan,
 	parseCoverageReport,
 	parseLcovCoverageReport,
 	runContractCoverage,
@@ -51,6 +53,140 @@ function passingCoverageFixture() {
 }
 
 describe("contract coverage groups", () => {
+	it("preserves every existing critical module and adds the four 70/50/70 floors", () => {
+		const additions = [
+			"check-session",
+			"failure-finalization",
+			"failure-accountability",
+			"launcher-preflight",
+		].map((name) => `src/switchyard/simple/${name}.mjs`);
+		deepStrictEqual(
+			CRITICAL_MODULE_COVERAGE.filter(({ path }) => additions.includes(path)),
+			additions.map((path) => ({
+				path,
+				lines: 70,
+				branches: 50,
+				functions: 70,
+			})),
+		);
+		strictEqual(
+			createHash("sha256")
+				.update(
+					JSON.stringify(
+						CRITICAL_MODULE_COVERAGE.filter(
+							({ path }) => !additions.includes(path),
+						),
+					),
+				)
+				.digest("hex"),
+			"355aa85e8fa482f453e90cc840ec5f5b4f1deaa81d4c7dd813209694f13247a9",
+		);
+	});
+
+	it("runs the complete mapped suite set once, serially, with unchanged global floors and live output", () => {
+		const plan = criticalCoveragePlan(ROOT);
+		const regressions = [
+			"simple-check-session",
+			"simple-check-execution",
+			"simple-guarded-prompt",
+			"simple-failure-finalization",
+			"simple-failure-accountability",
+			"simple-launcher-preflight",
+		].map((name) => `tests/${name}.test.mjs`);
+		strictEqual(new Set(plan.suites).size, plan.suites.length);
+		for (const path of regressions)
+			ok(plan.suites.includes(path), `focused suite missing: ${path}`);
+		strictEqual(
+			createHash("sha256")
+				.update(
+					JSON.stringify(
+						plan.suites.filter((path) => !regressions.includes(path)),
+					),
+				)
+				.digest("hex"),
+			"c3422375b9b8a050cbf0b72ae1b7cd72275aa5abe51917984d666ca7bbbd1b58",
+		);
+		let calls = 0;
+		const result = runContractCoverage({
+			root: ROOT,
+			run(command, args, options) {
+				calls += 1;
+				strictEqual(command, process.execPath);
+				deepStrictEqual(args.slice(args.indexOf("--test") + 1), plan.suites);
+				deepStrictEqual(
+					args.filter((arg) => arg.startsWith("--test-concurrency=")),
+					["--test-concurrency=1"],
+				);
+				for (const floor of [
+					"--test-coverage-lines=10",
+					"--test-coverage-branches=30",
+					"--test-coverage-functions=3",
+				])
+					ok(args.includes(floor));
+				deepStrictEqual(options.stdio, ["ignore", "inherit", "inherit"]);
+				ok(args.includes("--test-coverage-include-all"));
+				deepStrictEqual(
+					args.filter((arg) => arg.startsWith("--test-coverage-include=")),
+					[
+						...new Set(
+							plan.modules.flatMap(({ path, members = [] }) => [
+								path,
+								...members,
+							]),
+						),
+					].map((path) => `--test-coverage-include=${path}`),
+				);
+				strictEqual(
+					args.some((arg) => arg.startsWith("--test-coverage-exclude=")),
+					false,
+				);
+				strictEqual(
+					args.filter((arg) => arg === "--test-reporter=lcov").length,
+					1,
+				);
+				const destinations = args
+					.filter((arg) => arg.startsWith("--test-reporter-destination="))
+					.map((arg) => arg.slice("--test-reporter-destination=".length));
+				writeFileSync(destinations.at(-1), passingCoverageFixture());
+				writeFileSync(
+					destinations[1],
+					CRITICAL_MODULE_COVERAGE.map(
+						({ path }) => `${path} | 100.00 | 100.00 | 100.00 |`,
+					).join("\n"),
+				);
+				return { status: 0 };
+			},
+		});
+		strictEqual(calls, 1);
+		deepStrictEqual(result.suites, plan.suites);
+		for (const { path } of plan.modules)
+			strictEqual(result.textMetrics[path].lines, 100);
+	});
+
+	it("rejects a failing or signalled coverage process and removes all report files", () => {
+		for (const status of [1, null]) {
+			let directory;
+			throws(
+				() =>
+					runContractCoverage({
+						root: ROOT,
+						run(_command, args) {
+							const destination = args
+								.filter((arg) => arg.startsWith("--test-reporter-destination="))
+								.at(-1)
+								.slice("--test-reporter-destination=".length);
+							directory = dirname(destination);
+							writeFileSync(destination, passingCoverageFixture());
+							return { status };
+						},
+					}),
+				/coverage_test_process_failed/u,
+			);
+			ok(directory);
+			strictEqual(existsSync(directory), false);
+		}
+	});
+
 	it("aggregates line, branch, and function counters across a façade and members", () => {
 		const module = makeModule({ members: ["src/part.mjs"] });
 		const metrics = parseLcovCoverageReport(

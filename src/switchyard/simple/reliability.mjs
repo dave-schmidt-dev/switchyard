@@ -16,12 +16,24 @@ function phaseForFailure(phase) {
 	return phase;
 }
 
-function failureCode(reason, phase, providerResult) {
+function failureCode(reason, phase, providerResult, errorKind) {
+	if (
+		["launcher_environment_unavailable", "request_log_open_failed"].includes(
+			reason,
+		)
+	)
+		return "environment_failure";
+	if (reason === "run_store_write_failed") return "run_store_write_failed";
+	if (reason === "check_dependencies_unverified") return reason;
 	if (phase === "baseline")
 		return reason === "baseline_mutation"
 			? "baseline_mutation"
 			: "baseline_check_failed";
+	if (["environment_failure", "permission_denied"].includes(errorKind))
+		return "environment_failure";
 	if (reason === "provider_cancelled") return "cancelled";
+	if (reason === "provider_deadline_exceeded")
+		return "provider_deadline_exceeded";
 	if (
 		phase === "execute" &&
 		VERIFIED_PROVIDER_CODES.has(providerResult?.diagnosticCode) &&
@@ -53,8 +65,9 @@ function failureCode(reason, phase, providerResult) {
 		return "scope_rejected";
 	if (reason === "provider_cleanup_failed" || phase === "cleanup")
 		return "cleanup_failed";
-	if (reason === "run_store_write_failed") return "run_store_write_failed";
-	if (phase === "input_validation") return "input_rejected";
+	if (errorKind === "policy_violation") return "scope_rejected";
+	if (phase === "input_validation" || errorKind === "validation_failed")
+		return "input_rejected";
 	if (phase === "execute") return "unknown";
 	return "unknown";
 }
@@ -74,7 +87,12 @@ function diffCategory(reason) {
 export function createSimpleProviderReliabilityDiagnostic(input = {}) {
 	const reason = input.failureReason ?? null;
 	const failurePhase = input.failurePhase ?? "unknown";
-	const code = failureCode(reason, failurePhase, input.providerResult);
+	const code = failureCode(
+		reason,
+		failurePhase,
+		input.providerResult,
+		input.errorKind,
+	);
 	const category = diffCategory(reason);
 	return createProviderReliabilityDiagnostic({
 		causeCode: code,
@@ -124,9 +142,17 @@ export function classifySimpleErrorKind(
 		].includes(errno)
 	)
 		return "environment_failure";
+	if (
+		["launcher_environment_unavailable", "request_log_open_failed"].includes(
+			failureReason,
+		)
+	)
+		return "environment_failure";
 	if (failureReason === "run_store_write_failed")
 		return "run_store_write_failed";
 	if (failurePhase === "baseline") return "environment_failure";
+	if (failureReason === "check_dependencies_unverified")
+		return "environment_failure";
 	if (
 		[
 			"paid_overage_not_allowed",

@@ -505,7 +505,7 @@ describe("simple local execution path", () => {
 						"utf8",
 					);
 					writeFileSync(join(worktreePath, "other.txt"), "extra\n", "utf8");
-					return { success: true };
+					return { success: true, writerLifecycle: "stopped" };
 				},
 			}),
 		);

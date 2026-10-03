@@ -64,6 +64,21 @@ describe("provider process lifecycle", () => {
 		strictEqual(spawnOptions.cwd, "/tmp/disposable-worktree");
 	});
 
+	it("forwards an explicit minimal environment without inheriting host variables", async () => {
+		const child = fakeChild();
+		const env = { PATH: "/usr/bin:/bin", HOME: "/trusted/runtime" };
+		let observed;
+		await runProviderProcess("fake", [], {
+			env,
+			spawnFn: (_command, _args, options) => {
+				observed = options.env;
+				queueMicrotask(() => child.emit("close", 0, null));
+				return child;
+			},
+		});
+		strictEqual(observed, env);
+	});
+
 	it("uses a closed progress envelope and does not treat polling as substantive progress", async () => {
 		const snapshot = createProgressSnapshot({
 			stage: "not-a-stage",
@@ -404,6 +419,35 @@ describe("provider process lifecycle", () => {
 		strictEqual(result.timedOut, true);
 		deepStrictEqual(child.signals, ["SIGTERM", "SIGKILL"]);
 		strictEqual(cleanups, 1);
+	});
+
+	it("never spawns for an already-aborted signal and returns bounded cancellation evidence", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		let spawnCalls = 0;
+		const result = await runProviderProcess("fake", [], {
+			signal: controller.signal,
+			now: () => 1000,
+			timeoutMs: 5000,
+			spawnFn: () => {
+				spawnCalls += 1;
+				return fakeChild();
+			},
+		});
+		strictEqual(spawnCalls, 0);
+		strictEqual(result.success, false);
+		strictEqual(result.cancelled, true);
+		strictEqual(result.writerLifecycle, "never_started");
+		strictEqual(result.code, null);
+		strictEqual(result.signal, null);
+		strictEqual(result.output, "");
+		strictEqual(result.stderr, "");
+		strictEqual(result.providerLifecycle.pid, null);
+		strictEqual(result.providerLifecycle.writerLifecycle, "never_started");
+		strictEqual(result.providerLifecycle.terminationReason, "cancelled");
+		strictEqual(result.providerLifecycle.cleanupStatus, "not_required");
+		strictEqual(result.progress.outcome, "cancelled");
+		strictEqual(result.progress.counters.polls, 0);
 	});
 
 	it("cancels through the same cleanup ordering", async () => {

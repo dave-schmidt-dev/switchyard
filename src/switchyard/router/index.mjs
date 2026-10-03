@@ -1,15 +1,13 @@
 import {
 	CAPABILITY_CLASS,
-	describeDescriptorGap,
 	getImplementorPriority,
 	getRightSizedModel,
-	hasAutomaticInvocationDescriptor,
 	normalizeProviderName,
 	PROVIDER_CAPABILITIES,
-	passesCapabilityFilter,
 	resolveTargetId,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
+import { createRouteEvidenceCapture } from "../simple/route-evidence.mjs";
 import {
 	DEFAULT_FLOOR,
 	evaluateCandidateEligibility,
@@ -60,8 +58,10 @@ export function route(options = {}) {
 		snapshotMtime,
 		snapshotAgeMsAtRoute,
 	};
+	const evidence = createRouteEvidenceCapture(snapshotDiagnostics);
+
 	if (platform !== "direct" && platform !== "macos") {
-		return {
+		return evidence.finish({
 			provider: null,
 			model: null,
 			percentLeft: null,
@@ -70,14 +70,14 @@ export function route(options = {}) {
 			reason: "invalid_platform",
 			log: [`invalid routing platform: ${platform}`],
 			...snapshotDiagnostics,
-		};
+		});
 	}
 
 	const ambiguousFilter = [...exclude, ...only].find(
 		(identifier) => resolveTargetIdentity(identifier).ambiguous,
 	);
 	if (ambiguousFilter) {
-		return {
+		return evidence.finish({
 			provider: null,
 			model: null,
 			percentLeft: null,
@@ -88,7 +88,7 @@ export function route(options = {}) {
 				`provider selector ${ambiguousFilter} is ambiguous; use an exact target id`,
 			],
 			...snapshotDiagnostics,
-		};
+		});
 	}
 
 	if (!snapshot) {
@@ -106,11 +106,12 @@ export function route(options = {}) {
 			hasInvocationDescriptor: options.hasInvocationDescriptor,
 			healthDecision: options.healthDecision,
 			onHealthDecision: options.onHealthDecision,
+			evidenceCapture: evidence,
 		});
 		const model = blind.provider
 			? modelForCapability(blind.provider, effectiveCapabilityClass)
 			: null;
-		return {
+		return evidence.finish({
 			...blind,
 			model,
 			percentLeft: null,
@@ -119,7 +120,7 @@ export function route(options = {}) {
 			reason: blind.reason,
 			log: [...log, `blind candidates: ${blindOrder.join(", ") || "none"}`],
 			...snapshotDiagnostics,
-		};
+		});
 	}
 
 	const providers = indexProviders(snapshot);
@@ -203,6 +204,7 @@ export function route(options = {}) {
 			hasInvocationDescriptor: options.hasInvocationDescriptor,
 		});
 		if (!eligibility.eligible) {
+			evidence.exclude(name, eligibility.reason);
 			if (eligibility.reason === "below_required_capability") {
 				ceilingSkips += 1;
 			} else if (eligibility.reason === "provider_unavailable") {
@@ -242,6 +244,7 @@ export function route(options = {}) {
 			usageMode: "observed",
 		});
 		if (health) {
+			evidence.exclude(name, "route_health_suppressed");
 			otherSkips += 1;
 			log.push(`provider ${name}: route health ${health.state}`);
 			continue;
@@ -253,6 +256,7 @@ export function route(options = {}) {
 		);
 
 		if (windows.length === 0) {
+			evidence.exclude(name, "no_valid_windows");
 			otherSkips += 1;
 			log.push(`provider ${name}: no valid windows`);
 			continue;
@@ -291,12 +295,14 @@ export function route(options = {}) {
 					);
 				} else {
 					otherSkips += 1;
+					evidence.exclude(name, "quota_exhausted", "ac");
 					log.push(
 						`provider ${name}: ac window drained (${acWindow.percent_left}% <= 0% floor)`,
 					);
 				}
 			} else {
 				otherSkips += 1;
+				evidence.exclude(name, "accounting_bucket_unavailable", "ac");
 				log.push(
 					`provider ${name}: no ac window (or no roster implementor_priority) for priority fill`,
 				);
@@ -315,12 +321,14 @@ export function route(options = {}) {
 					);
 				} else {
 					otherSkips += 1;
+					evidence.exclude(name, "quota_exhausted", "ap");
 					log.push(
 						`provider ${name}: ap exhausted (${apWindow.percent_left}% < ${DEFAULT_FLOOR}% floor)`,
 					);
 				}
 			} else {
 				otherSkips += 1;
+				evidence.exclude(name, "accounting_bucket_unavailable", "ap");
 				log.push(`provider ${name}: no ap window for last-resort fallback`);
 			}
 
@@ -354,6 +362,7 @@ export function route(options = {}) {
 				);
 			} else {
 				otherSkips += 1;
+				evidence.exclude(name, "quota_exhausted");
 				log.push(
 					`provider ${name}: ranked provider drained (${minPercentLeft}% <= 0% floor)`,
 				);
@@ -364,6 +373,7 @@ export function route(options = {}) {
 		// Unranked: exact pre-existing floor + spread semantics.
 		if (minPercentLeft < floor) {
 			otherSkips += 1;
+			evidence.exclude(name, "quota_exhausted");
 			log.push(
 				`provider ${name}: exhausted (${minPercentLeft}% < ${floor}% floor)`,
 			);
@@ -380,6 +390,21 @@ export function route(options = {}) {
 		log.push(
 			`provider ${name}: eligible (${minPercentLeft}% left, pace=${pace})`,
 		);
+	}
+
+	const candidatePools = [
+		...tierPools.values(),
+		legacyRankedPool,
+		unrankedPool,
+		lastResortPool,
+	];
+	for (const pool of candidatePools) {
+		for (const candidate of pool)
+			evidence.candidate(
+				candidate.name,
+				candidate.accountingWindows,
+				candidate.priority,
+			);
 	}
 
 	// Resolve a load-balanced pool by best metric (highest percentLeft),
@@ -515,7 +540,7 @@ export function route(options = {}) {
 		) {
 			noEligibleReason = "quarantine_unresolvable";
 		}
-		return {
+		return evidence.finish({
 			provider: null,
 			model: null,
 			percentLeft: null,
@@ -524,7 +549,7 @@ export function route(options = {}) {
 			reason: noEligibleReason,
 			log,
 			...snapshotDiagnostics,
-		};
+		});
 	}
 
 	// CR-2 regression
@@ -538,7 +563,7 @@ export function route(options = {}) {
 		);
 	}
 
-	return {
+	return evidence.finish({
 		provider: winner.name,
 		model,
 		percentLeft: winner.percentLeft,
@@ -552,7 +577,7 @@ export function route(options = {}) {
 		reason,
 		log,
 		...snapshotDiagnostics,
-	};
+	});
 }
 
 export {
