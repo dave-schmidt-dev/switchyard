@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { handleLaunch, handleRun } from "../src/switchyard/dispatch/index.mjs";
 import { parseSimpleArgs } from "../src/switchyard/simple/args.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
+import { appendFailureRecord } from "../src/switchyard/simple/failure-log.mjs";
 import {
 	guardRoutingLaunch,
 	handleRoutingRun,
@@ -361,4 +362,104 @@ test("inspect reports unknown missing records without changing the durable routi
 		output.accountability.attempts[0].accountability.owner,
 		"unknown",
 	);
+});
+
+test("routing-run failures summarizes the log without project or run identity", async () => {
+	const stateRoot = realpathSync(tempDir("routing-cli-failures-"));
+	const attempt = (runId) =>
+		appendFailureRecord(
+			{
+				recordType: "attempt",
+				project: "/review/project",
+				routingRunId: "run-1",
+				runId,
+				targetId: "codex",
+				capability: "standard",
+				severity: "soft",
+				reason: "check_failed",
+				causeCode: "acceptance_check_failed",
+				phase: "check",
+			},
+			{ stateRoot },
+		);
+	attempt("simple-1");
+	attempt("simple-2");
+	let json;
+	await handleRoutingRun(["failures", "--json"], {
+		stateRoot,
+		writeResult: (value) => {
+			json = JSON.parse(value);
+		},
+	});
+	strictEqual(json.groups.length, 1);
+	strictEqual(json.groups[0].count, 2);
+	strictEqual(json.groups[0].targetId, "codex");
+	strictEqual(json.groups[0].reason, "check_failed");
+	strictEqual(json.groups[0].causeCode, "acceptance_check_failed");
+	strictEqual(json.groups[0].phase, "check");
+	strictEqual(json.totals.byTargetId.codex, 2);
+	strictEqual(json.totals.byReason.check_failed, 2);
+	let text;
+	await handleRoutingRun(["failures"], {
+		stateRoot,
+		writeResult: (value) => {
+			text = value;
+		},
+	});
+	strictEqual(text.includes("count"), true);
+	strictEqual(text.includes("codex"), true);
+	strictEqual(text.includes("check_failed"), true);
+	strictEqual(text.includes("acceptance_check_failed"), true);
+	let filtered;
+	await handleRoutingRun(
+		["failures", "--json", "--since", "2999-01-01T00:00:00Z"],
+		{
+			stateRoot,
+			writeResult: (value) => {
+				filtered = JSON.parse(value);
+			},
+		},
+	);
+	strictEqual(filtered.groups.length, 0);
+	await rejects(
+		handleRoutingRun(["failures", "--since", "not-a-date"], {
+			stateRoot,
+			writeResult: () => {},
+		}),
+		{ name: "RoutingCliUsageError" },
+	);
+	let lowercase;
+	await handleRoutingRun(
+		["failures", "--json", "--since", "2999-01-01t00:00:00z"],
+		{
+			stateRoot,
+			writeResult: (value) => {
+				lowercase = JSON.parse(value);
+			},
+		},
+	);
+	strictEqual(lowercase.groups.length, 0);
+	await rejects(
+		handleRoutingRun(
+			[
+				"inspect",
+				"--project",
+				stateRoot,
+				"--routing-run-id",
+				"r",
+				"--since",
+				"x",
+			],
+			{ stateRoot, writeResult: () => {} },
+		),
+		{ name: "RoutingCliUsageError" },
+	);
+	let usage;
+	await handleRoutingRun(["inspect", "--help"], {
+		stateRoot,
+		writeResult: (value) => {
+			usage = value;
+		},
+	});
+	strictEqual(usage.includes("routing-run failures"), true);
 });

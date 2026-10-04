@@ -8,6 +8,7 @@ import {
 import { route } from "../router/index.mjs";
 import { readRun } from "../run-store/index.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
+import { appendFailureRecord } from "./failure-log.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
@@ -125,15 +126,52 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				reason,
 				partialWorktree,
 			}));
-	const answer = (direction, extra = {}) => ({
-		direction,
-		routingRunId,
-		routingRunIdSource,
-		attempts: handle.state.attempts,
-		failedTargetIds: handle.state.failedTargetIds,
-		retainedPartials: retainedPartials(),
-		...extra,
-	});
+	// Failure logging is best-effort: it must never change the routing outcome.
+	let failureLogWarned = false;
+	const appendFailureLog = (input) => {
+		try {
+			if (deps.failureLog) deps.failureLog.append(input);
+			else appendFailureRecord(input, { stateRoot: deps.stateRoot });
+		} catch (error) {
+			if (failureLogWarned) return;
+			failureLogWarned = true;
+			(deps.onRoutingWarning ?? console.error)(
+				`dispatch: failure log unavailable (${error?.code ?? "unknown"})`,
+			);
+		}
+	};
+	// Guard answers re-report state an earlier invocation already logged, so
+	// they pass { log: false }. Stop identity comes only from this
+	// invocation's own attempts, never from an earlier task's attempt.
+	const answer = (direction, extra = {}, { log = true } = {}) => {
+		if (direction !== "complete" && log) {
+			const own = (attempt) => attempt?.taskId === logicalTaskId;
+			const last = own(handle.state.pendingAttempt)
+				? handle.state.pendingAttempt
+				: (handle.state.attempts.findLast(own) ?? null);
+			appendFailureLog({
+				recordType: "stop",
+				project: projectPath,
+				routingRunId,
+				taskId: last?.taskId,
+				attemptId: last?.attemptId,
+				runId: last?.runId,
+				targetId: last?.targetId,
+				capability: last?.capability,
+				stopReason: extra.stopReason ?? direction,
+				exhaustionCause: extra.exhaustionCause,
+			});
+		}
+		return {
+			direction,
+			routingRunId,
+			routingRunIdSource,
+			attempts: handle.state.attempts,
+			failedTargetIds: handle.state.failedTargetIds,
+			retainedPartials: retainedPartials(),
+			...extra,
+		};
+	};
 	const pinned = (options.onlyProviders ?? []).length > 0;
 	// Explicit injected routers are a synthetic single-attempt compatibility seam.
 	// Production uses roster tiers and the production router.
@@ -150,23 +188,35 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	let iteration = 0;
 	try {
 		if (handle.state.pendingAttempt)
-			return answer("stop", {
-				stopReason: "pending_attempt_exists",
-				pendingAttempt: handle.state.pendingAttempt,
-			});
+			return answer(
+				"stop",
+				{
+					stopReason: "pending_attempt_exists",
+					pendingAttempt: handle.state.pendingAttempt,
+				},
+				{ log: false },
+			);
 		if (handle.state.nativeLatch)
-			return answer("native_latched", { status: "deferred" });
+			return answer("native_latched", { status: "deferred" }, { log: false });
 		if (
 			handle.state.attempts.some((attempt) => attempt.partialWorktree !== null)
 		)
-			return answer("stop", { stopReason: "partial_work_retained" });
+			return answer(
+				"stop",
+				{ stopReason: "partial_work_retained" },
+				{ log: false },
+			);
 		if (
 			pinned &&
 			options.onlyProviders.every((id) =>
 				handle.state.failedTargetIds.includes(resolveIdentity(id).targetId),
 			)
 		)
-			return answer("stop", { stopReason: "pinned_target_failed" });
+			return answer(
+				"stop",
+				{ stopReason: "pinned_target_failed" },
+				{ log: false },
+			);
 		for (;;) {
 			if (deps.signal?.aborted)
 				return answer("stop", { stopReason: "provider_cancelled" });
@@ -366,6 +416,31 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					stopReason: errorCode(error, "routing_state_write_failed"),
 					result,
 					pendingAttempt: pending,
+				});
+			}
+
+			if (failed) {
+				appendFailureLog({
+					recordType: "attempt",
+					project: projectPath,
+					routingRunId,
+					taskId: pending.taskId,
+					attemptId: pending.attemptId,
+					runId: pending.runId,
+					targetId: pending.targetId,
+					capability: pending.capability,
+					severity: classification.severity,
+					reason: classification.reason,
+					salvageable: classification.salvageable,
+					partialRetained: typeof result.partialWorktree === "string",
+					causeCategory:
+						result.providerReliability?.causeCategory ??
+						accountability.causeCategory,
+					causeCode:
+						result.providerReliability?.causeCode ?? accountability.causeCode,
+					phase: result.providerReliability?.phase,
+					failurePhase: result.failurePhase,
+					errorKind: result.errorKind,
 				});
 			}
 
