@@ -19,7 +19,6 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");
@@ -34,16 +33,6 @@ afterEach(() => {
 	}
 });
 describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
-	function writeTerminalQueue() {
-		return writeTasksFile(`## Phase 1
-
-### Task 1.1: Already complete
-- **Status:** done
-- **Type:** review
-- **Description:** no provider work
-- **Executor:** switchyard
-`);
-	}
 	it("formats a closed provider reason in the preflight failure", () => {
 		const events = [];
 		const rosterPath = join(

@@ -43,7 +43,6 @@ after(() => {
 	setHomeDir(previousHomeDir);
 	__resetRosterCacheForTests();
 });
-const REVIEW_OUTPUT = JSON.stringify({ verdict: "clean" });
 describe("roster_sha256 is stable across a simulated `roster smoke` write-back", () => {
 	it("flipping a qualification in the on-disk roster does not move the loader-computed sha", () => {
 		// Baseline sha from the committed fixture.

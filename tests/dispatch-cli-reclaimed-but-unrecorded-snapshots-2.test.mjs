@@ -42,18 +42,6 @@ afterEach(() => {
 	});
 });
 describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
-	const DEAD_VM = "switchyard-work-orphan-999999";
-	function reclaimWithResidue() {
-		return {
-			reclaimed: [{ uuid: "u-1", name: DEAD_VM, forced: true }],
-			reclaimedSnapshots: [],
-			skipped: [],
-			skippedSnapshots: [
-				{ name: DEAD_VM, uuid: "u-1", reason: "no-snapshot-sidecar" },
-			],
-			errors: [],
-		};
-	}
 	it("recover preserves a candidate that becomes live at backend mutation", async () => {
 		const { initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"

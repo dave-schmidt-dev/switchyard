@@ -48,16 +48,8 @@ export function settleRunQueueTask(scope, queueState) {
 		context,
 	} = scope;
 	let { processed, halted, policyDeferred } = queueState;
-	const {
-		task,
-		retryState,
-		priorExtraAllocation,
-		result,
-		retryHaltResult,
-		retryUsed,
-		retryTargetId,
-		retryEvidenceMissing,
-	} = queueState.attempt;
+	const { task, result, retryHaltResult, retryUsed, retryTargetId } =
+		queueState.attempt;
 	try {
 		if (retryHaltResult) {
 			recordHalt(

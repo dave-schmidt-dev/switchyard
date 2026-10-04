@@ -58,7 +58,6 @@ export function computeQualificationStatus(
 	}
 	return status;
 }
-const evaluateQualificationFreshness = computeQualificationStatus;
 function currentQualificationSignature(target, slot, model, descriptor) {
 	const contexts = [
 		slot?.qualification_signature,

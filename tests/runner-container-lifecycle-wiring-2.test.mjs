@@ -1,8 +1,7 @@
 import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import {
 	runnerTestDir,
 	runQueueWithOrchestrator,
@@ -10,13 +9,6 @@ import {
 } from "./helpers/runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");
@@ -31,31 +23,6 @@ afterEach(() => {
 	}
 });
 describe("container lifecycle wiring (Tasks 8+9)", () => {
-	function baseDependencies() {
-		return {
-			route: () => ({
-				provider: "claude",
-				model: "claude-sonnet-5",
-				percentLeft: 72,
-				reason: "spread",
-			}),
-			recordDispatch: () => {},
-			integrationGate: () => ({ success: true, message: "ok" }),
-			// No-op by default so an auto-create test doesn't invoke the real
-			// docker+git seedProject against TEST_DIR (not a git repo). The
-			// callOrder test below overrides this with a recording spy.
-			seedProject: () => {},
-			// No-op by default for the same reason — the real commitWorkingTree
-			// runs docker+git. The callOrder test overrides it with a spy.
-			commitWorkingTree: () => {},
-			adapters: {
-				claude: {
-					execute: () => ({ success: true, output: "ok" }),
-					captureDiff: () => "diff --git a/a b/a",
-				},
-			},
-		};
-	}
 	it("runQueueWithOrchestrator also skips container wiring when workingContainerName is supplied", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 

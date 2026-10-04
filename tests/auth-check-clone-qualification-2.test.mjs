@@ -12,41 +12,11 @@ import {
 	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
 
-const TEST_BOOT_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-function fixtureHostProbe(pid) {
-	const startTicks = String(pid * 10 + 1);
-	return {
-		state: "present",
-		pid,
-		bootSessionUuid: TEST_BOOT_UUID,
-		startTicks,
-		identity: `switchyard-host-process-v1:${TEST_BOOT_UUID}:${pid}:${startTicks}`,
-	};
-}
-
 const AUTH_TEST_RUN_STORE_ROOT = join(
 	tmpdir(),
 	`switchyard-auth-run-store-${process.pid}-${randomUUID()}`,
 );
 process.env.SWITCHYARD_RUN_STORE_ROOT = AUTH_TEST_RUN_STORE_ROOT;
-
-function fakeProvider(name, { authenticatedSequence }) {
-	let call = 0;
-	let runLoginCalls = 0;
-	return {
-		name,
-		isAuthenticated: () => {
-			const result =
-				authenticatedSequence[Math.min(call, authenticatedSequence.length - 1)];
-			call += 1;
-			return result;
-		},
-		runLogin: () => {
-			runLoginCalls += 1;
-		},
-		getRunLoginCalls: () => runLoginCalls,
-	};
-}
 
 function liveProvider(name, { authenticated, live, kind = null }) {
 	let runLoginCalls = 0;

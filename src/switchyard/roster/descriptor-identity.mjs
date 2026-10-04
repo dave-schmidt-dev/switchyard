@@ -221,9 +221,6 @@ export function canonicalizeInvocationDescriptor(descriptor, harness) {
 		}),
 	);
 }
-const descriptorIdentity = getInvocationDescriptorIdentity;
-const canonicalDescriptorIdentity = getInvocationDescriptorIdentity;
-const getDescriptorIdentity = getInvocationDescriptorIdentity;
 export function computeRosterSha(rosterData) {
 	const models =
 		rosterData?.models && typeof rosterData.models === "object"

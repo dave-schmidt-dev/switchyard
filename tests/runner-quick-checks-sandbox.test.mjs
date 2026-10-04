@@ -11,15 +11,6 @@ import {
 } from "../src/switchyard/runner/checks.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-quick-check-test");
-function writeTasksFile(content) {
-	mkdirSync(TEST_DIR, { recursive: true });
-	const tasksPath = join(TEST_DIR, "tasks.md");
-	writeFileSync(tasksPath, content, "utf8");
-	return tasksPath;
-}
-function writeLegacyCheckpoint(path, checkpoint) {
-	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
-}
 function runFixtureGit(projectPath, args) {
 	const result = spawnSync("git", args, { cwd: projectPath, encoding: "utf8" });
 	if (result.status !== 0)

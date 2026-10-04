@@ -9,11 +9,7 @@ import {
 
 import { tempDir } from "./helpers/tempdir.mjs";
 
-const GOLDEN_UUID = "{11111111-1111-4111-8111-111111111111}";
-
 const WORK_UUID = "{22222222-2222-4222-8222-222222222222}";
-
-const CLIPBOARD_LABEL = "gui/501/com.parallels.copypaste";
 
 const TEST_BOOT_UUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
@@ -32,16 +28,6 @@ function fixtureHostProbe(pid) {
 		bootSessionUuid: TEST_BOOT_UUID,
 		startTicks: String(pid * 10 + 1),
 		identity: fixtureBirth(pid),
-	};
-}
-
-function probeChild(value, overrides = {}) {
-	return {
-		status: 0,
-		signal: null,
-		stdout: JSON.stringify(value),
-		stderr: "ignored fixture stderr",
-		...overrides,
 	};
 }
 

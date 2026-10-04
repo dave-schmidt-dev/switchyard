@@ -204,7 +204,7 @@ export function acceptanceCheckDiagnostic(task, receipt, repairStatus = null) {
 	};
 }
 
-function baselineCheckOutcome(task, receipt) {
+function baselineCheckOutcome(_task, receipt) {
 	const failed = firstCheckFailure(receipt);
 	const mutation = receipt?.failureCode === "baseline_mutation";
 	const passed =
@@ -412,8 +412,7 @@ export function checkRepairCandidate(task, result) {
 	)
 		return null;
 	const decision = acceptanceCheckDiagnostic(task, result.quickCheckReceipt);
-	if (!decision.eligible || !decision.failed || !decision.failed.identity)
-		return null;
+	if (!decision.eligible || !decision.failed?.identity) return null;
 	return {
 		index: decision.failed.index,
 		identity: decision.failed.identity,

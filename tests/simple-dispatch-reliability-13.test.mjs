@@ -59,14 +59,6 @@ const SUITE_TMPDIR = realpathSync(tempDir("switchyard-suite-tmp-"));
 process.env.TMPDIR = SUITE_TMPDIR;
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(SUITE_TMPDIR, "run-store");
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
-const DISPATCH_PATH = resolve(
-	__dirname,
-	"..",
-	"src",
-	"switchyard",
-	"dispatch",
-	"index.mjs",
-);
 const retainedWorktrees = [];
 function makeRepo() {
 	const root = tempDir("switchyard-simple-test-");
@@ -91,31 +83,6 @@ function makeRepo() {
 	const promptPath = join(root, "prompt.txt");
 	writeFileSync(promptPath, "Change src/a.txt", "utf8");
 	return { root, projectPath, promptPath };
-}
-function options(repo, overrides = {}) {
-	return {
-		promptPath: repo.promptPath,
-		projectPath: repo.projectPath,
-		capability: "standard",
-		files: ["src/a.txt"],
-		checks: ["test -f src/a.txt"],
-		deadlineMs: 100_000,
-		...overrides,
-	};
-}
-function simpleCliArgs(repo, checks = ["test -f src/a.txt"]) {
-	return [
-		repo.promptPath,
-		"--project",
-		repo.projectPath,
-		"--capability",
-		"standard",
-		"--file",
-		"src/a.txt",
-		...checks.flatMap((command) => ["--check", command]),
-		"--deadline",
-		new Date(61_000).toISOString(),
-	];
 }
 function spawnSignalHarness(repo, runId, signal, mode = "provider") {
 	const moduleDirectory = resolve(__dirname, "..", "src", "switchyard");
@@ -253,40 +220,6 @@ process.stdout.write("META " + JSON.stringify({ terminalWrites, lockReleases, di
 			resolveResult({ code, exitSignal, signalSent, stdout, stderr });
 		});
 	});
-}
-function dependencies(overrides = {}) {
-	return {
-		now: () => 1_000,
-		taskId: "simple-test",
-		attemptId: "attempt-1",
-		acquireProjectLock: async () => {},
-		releaseProjectLock: async () => true,
-		route: () => ({ provider: "Codex (Spark)", reason: "priority_fill" }),
-		resolveTargetIdentity: () => ({
-			targetId: "codex",
-			harnessKey: "codex",
-			ambiguous: false,
-		}),
-		getInvocationDescriptor: () => ({
-			target_id: "codex",
-			selector: "gpt-5.3-codex-spark",
-			invocation_args: [],
-		}),
-		assertFundedRoute: () => {},
-		executeProvider: async ({ worktreePath }) => {
-			writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n", "utf8");
-			return { success: true, code: 0, writerLifecycle: "stopped" };
-		},
-		...overrides,
-	};
-}
-function retain(result, projectPath) {
-	if (result.partialWorktree) {
-		retainedWorktrees.push({
-			projectPath,
-			worktreePath: result.partialWorktree,
-		});
-	}
 }
 afterEach(() => {
 	for (const { worktreePath } of retainedWorktrees.splice(0)) {

@@ -113,7 +113,6 @@ function syntheticDescriptor({ targetId, model, harness }) {
 		harness,
 	);
 }
-const REVIEW_OUTPUT = JSON.stringify({ verdict: "clean" });
 const TASK = {
 	id: "T-1",
 	title: "trivial task",

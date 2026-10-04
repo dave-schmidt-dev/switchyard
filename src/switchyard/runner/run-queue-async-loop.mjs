@@ -55,8 +55,6 @@ export async function runQueueAsyncLoop(scope, queueState) {
 		ownsWorkingContainer,
 		results,
 		deferredTaskIds,
-		onResult,
-		emitStatus,
 		effectiveStopOnFailure,
 		projectRetryState,
 		context,

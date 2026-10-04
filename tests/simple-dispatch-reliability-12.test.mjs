@@ -62,14 +62,6 @@ const SUITE_TMPDIR = realpathSync(tempDir("switchyard-suite-tmp-"));
 process.env.TMPDIR = SUITE_TMPDIR;
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(SUITE_TMPDIR, "run-store");
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
-const DISPATCH_PATH = resolve(
-	__dirname,
-	"..",
-	"src",
-	"switchyard",
-	"dispatch",
-	"index.mjs",
-);
 const retainedWorktrees = [];
 function makeRepo() {
 	const root = tempDir("switchyard-simple-test-");
@@ -94,17 +86,6 @@ function makeRepo() {
 	const promptPath = join(root, "prompt.txt");
 	writeFileSync(promptPath, "Change src/a.txt", "utf8");
 	return { root, projectPath, promptPath };
-}
-function options(repo, overrides = {}) {
-	return {
-		promptPath: repo.promptPath,
-		projectPath: repo.projectPath,
-		capability: "standard",
-		files: ["src/a.txt"],
-		checks: ["test -f src/a.txt"],
-		deadlineMs: 100_000,
-		...overrides,
-	};
 }
 function simpleCliArgs(repo, checks = ["test -f src/a.txt"]) {
 	return [

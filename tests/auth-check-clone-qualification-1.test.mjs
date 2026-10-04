@@ -29,24 +29,6 @@ const AUTH_TEST_RUN_STORE_ROOT = join(
 );
 process.env.SWITCHYARD_RUN_STORE_ROOT = AUTH_TEST_RUN_STORE_ROOT;
 
-function fakeProvider(name, { authenticatedSequence }) {
-	let call = 0;
-	let runLoginCalls = 0;
-	return {
-		name,
-		isAuthenticated: () => {
-			const result =
-				authenticatedSequence[Math.min(call, authenticatedSequence.length - 1)];
-			call += 1;
-			return result;
-		},
-		runLogin: () => {
-			runLoginCalls += 1;
-		},
-		getRunLoginCalls: () => runLoginCalls,
-	};
-}
-
 function liveProvider(name, { authenticated, live, kind = null }) {
 	let runLoginCalls = 0;
 	let liveCalls = 0;

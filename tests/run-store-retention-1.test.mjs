@@ -11,15 +11,8 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
+import { applyCheckpointArtifactRetention } from "../src/switchyard/run-store/index.mjs";
 import {
-	advanceState,
-	applyCheckpointArtifactRetention,
-	getStateRoot,
-	initializeRun,
-	updateRun,
-} from "../src/switchyard/run-store/index.mjs";
-import {
-	makeOptions,
 	TEST_ROOT,
 	uniqueRunId,
 	VM_ADMISSION_ROOT,
@@ -368,24 +361,4 @@ describe("retention", () => {
 		strictEqual(readFileSync(artifactPath, "utf8"), "replacement candidate");
 		ok(result.reports.some((entry) => entry.reason === "entry_changed"));
 	});
-	async function createTerminalRun(idSuffix, overrides = {}) {
-		const opts = makeOptions({
-			runId: `retention-${idSuffix}-${uniqueRunId().slice(0, 8)}`,
-		});
-		await initializeRun(opts);
-
-		let run = await advanceState(opts.runId, "succeeded");
-		run = await updateRun(
-			opts.runId,
-			{ cleanupState: "complete", ...overrides },
-			run.revision,
-		);
-		return run;
-	}
-	function writeMalformedRun(runId, rawContent) {
-		const runDir = join(getStateRoot(), "runs", runId);
-		mkdirSync(runDir, { recursive: true });
-		writeFileSync(join(runDir, "run.json"), rawContent, "utf8");
-		return runDir;
-	}
 });

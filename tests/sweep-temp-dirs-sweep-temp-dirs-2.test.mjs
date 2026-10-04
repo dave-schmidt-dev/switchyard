@@ -27,40 +27,6 @@ const NOW = Date.parse("2026-09-04T17:00:00Z");
 
 const silent = () => {};
 
-/**
- * A directory whose own mtime and whose content's mtime are set independently,
- * so "old directory holding recent content" is expressible.
- */
-function makeEntry(parent, name, ageDays, innerAgeDays = ageDays) {
-	const dir = join(parent, name);
-	mkdirSync(dir, { recursive: true });
-	const inner = join(dir, "payload.txt");
-	writeFileSync(inner, "x".repeat(64));
-	const innerAt = new Date(NOW - innerAgeDays * DAY);
-	utimesSync(inner, innerAt, innerAt);
-	// After the write, or the write would bump the directory back to now.
-	const dirAt = new Date(NOW - ageDays * DAY);
-	utimesSync(dir, dirAt, dirAt);
-	return dir;
-}
-
-/** A populated fake `$TMPDIR` covering every disposition the sweep can reach. */
-function makeFixture() {
-	const root = tempDir("switchyard-sweep-fixture-");
-	const entries = {
-		stale: makeEntry(root, "switchyard-stale-abc", 10),
-		freshTop: makeEntry(root, "switchyard-fresh-top-abc", 1, 10),
-		freshInner: makeEntry(root, "switchyard-fresh-inner-abc", 10, 1),
-		held: makeEntry(root, "switchyard-held-abc", 10),
-		foreign: makeEntry(root, "other-project-ancient", 400),
-	};
-	// Never created by the suite, so a `switchyard-*` symlink is not ours to
-	// resolve - and following one would put its target in scope.
-	entries.link = join(root, "switchyard-link-abc");
-	symlinkSync(entries.foreign, entries.link);
-	return { root, entries };
-}
-
 const noneHeld = () => [];
 
 const makeRunStore = (parent) => {

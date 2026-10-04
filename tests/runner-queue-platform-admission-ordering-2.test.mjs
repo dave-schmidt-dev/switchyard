@@ -1,8 +1,7 @@
 import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import {
 	CHECKPOINT_IDENTITY_CODES,
 	CheckpointIdentityError,
@@ -18,13 +17,6 @@ import {
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 const UNVERIFIED_PROVIDER = "unverified-provider-fixture";
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");

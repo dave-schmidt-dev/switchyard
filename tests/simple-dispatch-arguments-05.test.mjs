@@ -9,7 +9,6 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import { simpleProviderCompatibility } from "../src/switchyard/simple/index.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -51,15 +50,6 @@ const initialRealTmpSimpleRoots =
 const SUITE_TMPDIR = realpathSync(tempDir("switchyard-suite-tmp-"));
 process.env.TMPDIR = SUITE_TMPDIR;
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(SUITE_TMPDIR, "run-store");
-const __dirname = resolve(fileURLToPath(import.meta.url), "..");
-const DISPATCH_PATH = resolve(
-	__dirname,
-	"..",
-	"src",
-	"switchyard",
-	"dispatch",
-	"index.mjs",
-);
 const retainedWorktrees = [];
 afterEach(() => {
 	for (const { worktreePath } of retainedWorktrees.splice(0)) {

@@ -21,8 +21,6 @@ import {
 } from "../src/switchyard/run-store/index.mjs";
 import { executeTask as executeTaskImpl } from "../src/switchyard/runner/index.mjs";
 import {
-	authExpiredExecution,
-	codexHealthRoute,
 	executeTask,
 	runnerTestDir,
 	runQueue,
@@ -37,7 +35,6 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeDispatchQualifiedRosterFixture() {
 	const roster = JSON.parse(readFileSync(ROSTER_FIXTURE_PATH, "utf8"));
 	const testedAt = new Date().toISOString();
@@ -343,138 +340,4 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			__resetRosterCacheForTests();
 		}
 	});
-	function ownedCodexQueueDependencies(outcomes) {
-		const executeCalls = [];
-		const queue = [...outcomes];
-		const execute = () => {
-			executeCalls.push("codex");
-			return queue.shift() ?? { success: true, output: "ok" };
-		};
-		return {
-			executeCalls,
-			dependencies: {
-				route: codexHealthRoute,
-				recordDispatch: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
-				ensureAgentContainer: () => {},
-				createWorkingContainer: () => "owned-health-container",
-				provisionCredentials: () => {},
-				seedProject: () => {},
-				commitWorkingTree: () => {},
-				resetWorkingTree: () => {},
-				captureTaskBase: () => TASK_BASE,
-				validateTaskBase: (_workspaceId, base) => base,
-				releaseTaskBase: () => {},
-				wipeWorkingContainer: () => {},
-				persistDiagnosticArtifact: async (evidence) => {
-					strictEqual(evidence?.diagnosticKind, "usage_exhausted");
-					return VALID_DIAGNOSTIC_REF;
-				},
-				adapters: {
-					codex: {
-						execute,
-						executeAsync: async () => execute(),
-						captureDiff: () => "diff --git a/a b/a\n+change",
-						captureDiffAsync: async () => "diff --git a/a b/a\n+change",
-					},
-				},
-			},
-		};
-	}
-	function quotaExhaustedExecution() {
-		return {
-			success: false,
-			output: "",
-			error: "provider quota unavailable",
-			errorKind: "quota_exhausted",
-			diagnosticCode: "quota_exhausted",
-			diagnosticOrigin: "adapter",
-			diagnosticEvidenceAvailable: true,
-			diagnosticRef: VALID_DIAGNOSTIC_REF,
-			diagnosticEvidence: {
-				stdout: "",
-				stderr: "usage exhausted",
-				diagnosticKind: "usage_exhausted",
-			},
-			failurePhase: "provider_execution",
-		};
-	}
-	async function holdCodexRoute({ healthDecision, healthStateRoot, runId }) {
-		const result = executeTaskImpl(
-			{ id: "1.1", title: "task", description: "op" },
-			{
-				route: codexHealthRoute,
-				healthDecision,
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: false }),
-				adapters: {
-					codex: { execute: authExpiredExecution, captureDiff: () => null },
-				},
-				queueBackend: { captureTaskBase: () => TASK_BASE },
-				projectPath: TEST_DIR,
-				workingContainerName: "hold-workspace",
-				runId,
-			},
-		);
-		ok(result.routeHealthBinding, "hold evidence needs a terminal binding");
-		await initializeRun({
-			runId,
-			tasksFilePath: join(TEST_DIR, "tasks.md"),
-			projectPath: TEST_DIR,
-			orderedTaskIds: ["1.1"],
-			initialHostFingerprint: { fixture: true },
-		});
-		await createRouteHealthEvent(
-			runId,
-			{
-				phase: "execution",
-				event: "task_failed",
-				status: "failed",
-				taskId: "1.1",
-				attempt: result.routeHealthAttempt,
-				resolvedTargetId: result.resolvedTargetId,
-				invocationDescriptor: result.invocationDescriptor,
-				descriptorIdentity: result.descriptorIdentity,
-				descriptorHarness: result.descriptorHarness,
-				diagnosticCode: result.diagnosticCode,
-				diagnosticOrigin: result.diagnosticOrigin,
-				diagnosticEvidenceAvailable: true,
-				failurePhase: result.failurePhase,
-			},
-			result.routeHealthBinding,
-		);
-		await ingestRouteHealthEvents({
-			authorisedRuns: [{ runId, runRoot: getRunRoot(runId) }],
-			healthStateRoot,
-		});
-		const identity = healthDecision.identityFor({
-			provider: "codex",
-			requiredCapability: "standard",
-		});
-		strictEqual(
-			(await inspectRouteHealth({ ...identity, healthStateRoot })).state,
-			"repair-hold",
-		);
-		return identity;
-	}
-	function withQualifiedRoster(fn) {
-		return async () => {
-			const oldRoster = process.env.SWITCHYARD_ROSTER_PATH;
-			const oldRuns = process.env.SWITCHYARD_RUN_STORE_ROOT;
-			process.env.SWITCHYARD_ROSTER_PATH =
-				writeDispatchQualifiedRosterFixture();
-			process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_DIR, "health-runs");
-			__resetRosterCacheForTests();
-			try {
-				await fn();
-			} finally {
-				if (oldRoster === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
-				else process.env.SWITCHYARD_ROSTER_PATH = oldRoster;
-				if (oldRuns === undefined) delete process.env.SWITCHYARD_RUN_STORE_ROOT;
-				else process.env.SWITCHYARD_RUN_STORE_ROOT = oldRuns;
-				__resetRosterCacheForTests();
-			}
-		};
-	}
 });

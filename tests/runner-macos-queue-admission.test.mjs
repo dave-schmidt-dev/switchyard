@@ -1,8 +1,7 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	createQueueBackend,
@@ -19,13 +18,6 @@ import {
 } from "./helpers/runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 const HOST_BOOT_UUID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 function hostBirth(pid) {
 	return `switchyard-host-process-v1:${HOST_BOOT_UUID}:${pid}:${pid * 10 + 1}`;
@@ -376,12 +368,6 @@ describe("typed non-provider stage facts", () => {
 		);
 	});
 });
-function writeTasksFile(content) {
-	mkdirSync(TEST_DIR, { recursive: true });
-	const tasksPath = join(TEST_DIR, "tasks.md");
-	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
-	return tasksPath;
-}
 afterEach(() => {
 	try {
 		rmSync(TEST_DIR, { recursive: true, force: true });

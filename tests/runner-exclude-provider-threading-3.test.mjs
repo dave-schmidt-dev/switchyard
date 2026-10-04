@@ -136,24 +136,6 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			},
 		};
 	}
-	function quotaExhaustedExecution() {
-		return {
-			success: false,
-			output: "",
-			error: "provider quota unavailable",
-			errorKind: "quota_exhausted",
-			diagnosticCode: "quota_exhausted",
-			diagnosticOrigin: "adapter",
-			diagnosticEvidenceAvailable: true,
-			diagnosticRef: VALID_DIAGNOSTIC_REF,
-			diagnosticEvidence: {
-				stdout: "",
-				stderr: "usage exhausted",
-				diagnosticKind: "usage_exhausted",
-			},
-			failurePhase: "provider_execution",
-		};
-	}
 	async function holdCodexRoute({ healthDecision, healthStateRoot, runId }) {
 		const result = executeTaskImpl(
 			{ id: "1.1", title: "task", description: "op" },

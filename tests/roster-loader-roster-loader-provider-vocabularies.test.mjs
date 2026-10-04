@@ -1,6 +1,6 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
@@ -17,7 +17,6 @@ import {
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const FIXTURE_PATH = resolve(__dirname, "fixtures", "roster.fixture.json");
 let tmpDir;
 const previousEnv = {};
 function setRosterPath(value) {

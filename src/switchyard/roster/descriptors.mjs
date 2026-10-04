@@ -310,9 +310,6 @@ export function hasAutomaticInvocationDescriptor(
 ) {
 	return getInvocationDescriptor(providerName, capabilityClass) !== null;
 }
-const getAutomaticInvocationDescriptor = getInvocationDescriptor;
-const getRightSizedDescriptor = getInvocationDescriptor;
-const getInvocationDescriptorForCapability = getInvocationDescriptor;
 export function passesCapabilityFilter(providerName, requiredCapability) {
 	const providerClass = getCapabilityClass(providerName);
 	if (!Object.hasOwn(CAPABILITY_CLASS_ORDER, requiredCapability)) {

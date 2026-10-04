@@ -1,32 +1,17 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import { loadCheckpoint } from "../src/switchyard/runner/index.mjs";
 import {
 	descriptorForRoute,
 	runnerTestDir,
 	runQueue,
 	runQueueAsync,
-	withExplicitSwitchyardExecutor,
 } from "./helpers/runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
-function writeTasksFile(content) {
-	mkdirSync(TEST_DIR, { recursive: true });
-	const tasksPath = join(TEST_DIR, "tasks.md");
-	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
-	return tasksPath;
-}
 afterEach(() => {
 	try {
 		rmSync(TEST_DIR, { recursive: true, force: true });
@@ -35,56 +20,6 @@ afterEach(() => {
 	}
 });
 describe("async runner provider lifecycle", () => {
-	async function runAsyncRedactionCase({ execution, integrationGate }) {
-		const root = join(
-			TEST_DIR,
-			`async-redaction-${Date.now()}-${Math.random()}`,
-		);
-		mkdirSync(root, { recursive: true });
-		const tasksPath = join(root, "TASKS.md");
-		const checkpointPath = join(root, "checkpoint.json");
-		writeFileSync(
-			tasksPath,
-			"### Task 4.2: Async redaction\n- **Status:** pending\n- **Type:** review\n- **Description:** exercise redaction\n- **Executor:** switchyard\n",
-		);
-		const descriptor = descriptorForRoute({
-			provider: "opencode",
-			resolved_harness: "opencode",
-			resolvedTargetId: "async-target",
-			model: "fake-model",
-		});
-		let observed;
-		const result = await runQueueAsync({
-			tasksFilePath: tasksPath,
-			projectPath: root,
-			workingContainerName: "async-worker",
-			checkpointPath,
-			dependencies: {
-				route: () => ({
-					provider: "opencode",
-					resolved_harness: "opencode",
-					resolvedTargetId: "async-target",
-					model: "fake-model",
-					invocationDescriptor: descriptor,
-				}),
-				resolveDescriptor: () => descriptor,
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate,
-				onResult: (value) => {
-					observed = value;
-				},
-				adapters: {
-					opencode: {
-						executeAsync: async () => execution,
-						captureDiffAsync: async () => "SECRET_RAW_DIFF",
-					},
-				},
-			},
-		});
-		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
-		return { result, observed, checkpoint };
-	}
 	it("awaits executeAsync before returning a terminal task result", async () => {
 		const root = join(TEST_DIR, "async-lifecycle");
 		mkdirSync(root, { recursive: true });

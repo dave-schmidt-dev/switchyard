@@ -38,12 +38,6 @@ function writeLegacyCheckpoint(path, checkpoint) {
 	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
 }
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");

@@ -17,7 +17,7 @@ import {
 import { join, resolve } from "node:path";
 import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import {
 	acquireCheckpointLease,
 	createEmptyCheckpoint,
@@ -40,13 +40,6 @@ const TEST_DIR = runnerTestDir(import.meta.url);
 function writeLegacyCheckpoint(path, checkpoint) {
 	writeFileSync(path, JSON.stringify(checkpoint, null, 2), "utf8");
 }
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");

@@ -1,8 +1,6 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { rmSync } from "node:fs";
 import { afterEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
 import {
 	captureDiffDetailed as captureAgyDiffDetailed,
 	captureDiffDetailedAsync as captureAgyDiffDetailedAsync,
@@ -34,23 +32,9 @@ import {
 	executeTaskAsync,
 	runnerTestDir,
 	testDescriptor,
-	withExplicitSwitchyardExecutor,
 } from "./helpers/runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROSTER_FIXTURE_PATH = resolve(
-	__dirname,
-	"fixtures",
-	"roster.fixture.json",
-);
-const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
-function writeTasksFile(content) {
-	mkdirSync(TEST_DIR, { recursive: true });
-	const tasksPath = join(TEST_DIR, "tasks.md");
-	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
-	return tasksPath;
-}
 afterEach(() => {
 	try {
 		rmSync(TEST_DIR, { recursive: true, force: true });

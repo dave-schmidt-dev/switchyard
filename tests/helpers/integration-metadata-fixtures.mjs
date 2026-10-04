@@ -112,7 +112,7 @@ function buildRunner(scenario) {
 	return `#!/usr/bin/env node
 import { readFileSync } from "node:fs";
 
-process.env.PATH = ${JSON.stringify(scenario.binDir)} + ${JSON.stringify(scenario.fakeGitSpawnFailure ? "" : ":" + process.env.PATH)};
+process.env.PATH = ${JSON.stringify(scenario.binDir + (scenario.fakeGitSpawnFailure ? "" : `:${process.env.PATH}`))};
 process.env.SWITCHYARD_FAKE_GIT_DIR = ${JSON.stringify(scenario.markerDir)};
 process.env.SWITCHYARD_FAKE_GIT_NUMSTAT = ${JSON.stringify(scenario.numstatMode)};
 process.env.SWITCHYARD_FAKE_GIT_SUMMARY = ${JSON.stringify(scenario.summaryMode)};
@@ -132,7 +132,7 @@ if (${JSON.stringify(scenario.call)} === "integrationGate") {
 } else {
 	result = integrate.validateDiff(patch, ${JSON.stringify(scenario.projectPath)});
 }
-process.stdout.write("\\n${RESULT_MARKER}\\n" + JSON.stringify(result) + "\\n");
+process.stdout.write(\`\\n${RESULT_MARKER}\\n\${JSON.stringify(result)}\\n\`);
 `;
 }
 

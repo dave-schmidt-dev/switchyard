@@ -11,7 +11,6 @@ const PKG_ROOT = resolve(__dirname, "..");
 const VM_OPS = resolve(PKG_ROOT, "ops/macos-vm");
 const BUILD = resolve(VM_OPS, "build-golden-image.sh");
 const GENERATOR = resolve(VM_OPS, "generate-cli-manifest.sh");
-const PROBE = resolve(VM_OPS, "probe-guest-credentials.sh");
 const MANIFEST = resolve(VM_OPS, "cli-manifest.txt");
 const IS_DARWIN = process.platform === "darwin";
 const notDarwin = { skip: IS_DARWIN ? false : "macOS-only ops lane" };
@@ -51,75 +50,6 @@ const extractShellFunction = (body, name) => {
 	return body.slice(start, end + 3);
 };
 const scratch = () => tempDir("switchyard-vm-ops-");
-const renderBuildGuestScripts = (dir) => {
-	const lines = readFileSync(BUILD, "utf8").split("\n");
-	const preamble = [];
-	for (const line of lines) {
-		if (/^[a-z_]+\(\) \{/.test(line)) break;
-		if (/^(readonly )?[A-Z][A-Z0-9_]*=/.test(line)) preamble.push(line);
-	}
-	ok(preamble.length > 0, "build script lost its top-level assignments");
-
-	const rendered = [];
-	for (let i = 0; i < lines.length; i += 1) {
-		if (!/guest_exec_script <<EOF$/.test(lines[i])) continue;
-		const end = lines.indexOf("EOF", i + 1);
-		ok(end !== -1, `unterminated guest heredoc opened at line ${i + 1}`);
-		const harness = join(dir, `render-guest-${rendered.length}.sh`);
-		writeFileSync(
-			harness,
-			[...preamble, "cat <<EOF", ...lines.slice(i + 1, end), "EOF", ""].join(
-				"\n",
-			),
-		);
-		const run = spawnSync("/bin/bash", [harness], { encoding: "utf8" });
-		strictEqual(
-			run.status,
-			0,
-			`rendering the guest block at line ${i + 1} failed: ${run.stderr}`,
-		);
-		rendered.push({ line: i + 1, body: run.stdout });
-		i = end;
-	}
-	ok(
-		rendered.length >= 3,
-		`expected several guest blocks, got ${rendered.length}`,
-	);
-	return rendered;
-};
-const extractProbeScript = (rendered) => {
-	const block = rendered.find((entry) =>
-		entry.body.includes("<<'PROBE_SCRIPT'"),
-	);
-	ok(block, "no guest block carries the XcodeGen probe heredoc");
-	const start = block.body.indexOf("<<'PROBE_SCRIPT'");
-	const bodyStart = block.body.indexOf("\n", start) + 1;
-	const end = block.body.indexOf("\nPROBE_SCRIPT\n", bodyStart);
-	ok(end !== -1, "unterminated XcodeGen probe heredoc");
-	return { block, script: block.body.slice(bodyStart, end + 1) };
-};
-const renderGuestScript = (dir) => {
-	const rendered = readFileSync(PROBE, "utf8")
-		.replace('  prlctl exec "$VM_NAME" /bin/bash -s <<EOF', "  cat <<EOF")
-		.replace(/^ {2}require_host_tools$/m, "  true");
-	ok(rendered.includes("cat <<EOF"), "probe's prlctl exec call moved");
-	// Prose mentions prlctl exec repeatedly; only a command position matters.
-	ok(
-		!/^\s*prlctl exec\b/m.test(rendered),
-		"probe has a second prlctl exec call",
-	);
-	const harness = join(dir, "render.sh");
-	writeFileSync(harness, rendered);
-	const run = spawnSync(
-		"/bin/bash",
-		[harness, "--vm", "probe-vm", "--phase", "baseline"],
-		{
-			encoding: "utf8",
-		},
-	);
-	strictEqual(run.status, 0, `render failed: ${run.stderr}`);
-	return run.stdout;
-};
 describe("the pinned CLI manifest", () => {
 	it("passes build-golden-image.sh's own validator", notDarwin, () => {
 		const body = readFileSync(BUILD, "utf8");
@@ -329,8 +259,7 @@ describe("the pinned CLI manifest", () => {
 		const oneFile = join(dir, "one.sh");
 		writeFileSync(
 			oneFile,
-			"curl -s https://downloads.cursor.com/lab/2026.09.18-9a7762b/darwin-arm64\n" +
-				"curl -s https://downloads.cursor.com/lab/2026.09.18-9a7762b/darwin-x64\n",
+			`curl -s https://downloads.cursor.com/lab/2026.09.18-9a7762b/darwin-arm64\ncurl -s https://downloads.cursor.com/lab/2026.09.18-9a7762b/darwin-x64\n`,
 		);
 		const rOne = spawnSync("/bin/bash", [harness, oneFile], {
 			encoding: "utf8",
@@ -352,8 +281,7 @@ describe("the pinned CLI manifest", () => {
 		const twoFile = join(dir, "two.sh");
 		writeFileSync(
 			twoFile,
-			"curl -s https://downloads.cursor.com/lab/1.0.0/darwin-arm64\n" +
-				"curl -s https://downloads.cursor.com/lab/2.0.0/darwin-arm64\n",
+			`curl -s https://downloads.cursor.com/lab/1.0.0/darwin-arm64\ncurl -s https://downloads.cursor.com/lab/2.0.0/darwin-arm64\n`,
 		);
 		const rTwo = spawnSync("/bin/bash", [harness, twoFile], {
 			encoding: "utf8",

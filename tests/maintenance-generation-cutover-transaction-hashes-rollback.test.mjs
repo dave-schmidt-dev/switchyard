@@ -15,13 +15,6 @@ import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const productionCutoverCli = join(projectRoot, "ops", "switchyard-cutover.mjs");
-const workerBootstrap = join(
-	projectRoot,
-	"src",
-	"switchyard",
-	"dispatch",
-	"worker-bootstrap.mjs",
-);
 const tempDirs = [];
 function tempDir() {
 	const path = trackedTempDir("switchyard-generation-test-");

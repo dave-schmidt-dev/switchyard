@@ -10,39 +10,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
 const VM_OPS = resolve(PKG_ROOT, "ops/macos-vm");
 const BUILD = resolve(VM_OPS, "build-golden-image.sh");
-const GENERATOR = resolve(VM_OPS, "generate-cli-manifest.sh");
-const PROBE = resolve(VM_OPS, "probe-guest-credentials.sh");
-const MANIFEST = resolve(VM_OPS, "cli-manifest.txt");
-const IS_DARWIN = process.platform === "darwin";
-const notDarwin = { skip: IS_DARWIN ? false : "macOS-only ops lane" };
-const REQUIRED_PROVIDERS = [
-	"claude",
-	"codex",
-	"agy",
-	"cursor-agent",
-	"copilot",
-	"opencode",
-	"vibe",
-];
-const EXPECTED_REFS = {
-	claude: "https://claude.ai/install.sh",
-	codex: "https://chatgpt.com/codex/install.sh",
-	agy: "https://antigravity.google/cli/install.sh",
-	"cursor-agent": "https://cursor.com/install",
-	copilot: "@github/copilot",
-	opencode: "opencode-ai",
-	vibe: "mistral-vibe",
-};
-const readManifestRows = () =>
-	readFileSync(MANIFEST, "utf8")
-		.split("\n")
-		.map((line) => line.trim())
-		.filter((line) => line.length > 0 && !line.startsWith("#"))
-		.map((line) => {
-			const [provider, kind, ref, detail, hash, version, ...rest] =
-				line.split("|");
-			return { provider, kind, ref, detail, hash, version, rest, line };
-		});
 const extractShellFunction = (body, name) => {
 	const start = body.indexOf(`${name}() {`);
 	ok(start !== -1, `no ${name}() in script`);
@@ -86,39 +53,6 @@ const renderBuildGuestScripts = (dir) => {
 		`expected several guest blocks, got ${rendered.length}`,
 	);
 	return rendered;
-};
-const extractProbeScript = (rendered) => {
-	const block = rendered.find((entry) =>
-		entry.body.includes("<<'PROBE_SCRIPT'"),
-	);
-	ok(block, "no guest block carries the XcodeGen probe heredoc");
-	const start = block.body.indexOf("<<'PROBE_SCRIPT'");
-	const bodyStart = block.body.indexOf("\n", start) + 1;
-	const end = block.body.indexOf("\nPROBE_SCRIPT\n", bodyStart);
-	ok(end !== -1, "unterminated XcodeGen probe heredoc");
-	return { block, script: block.body.slice(bodyStart, end + 1) };
-};
-const renderGuestScript = (dir) => {
-	const rendered = readFileSync(PROBE, "utf8")
-		.replace('  prlctl exec "$VM_NAME" /bin/bash -s <<EOF', "  cat <<EOF")
-		.replace(/^ {2}require_host_tools$/m, "  true");
-	ok(rendered.includes("cat <<EOF"), "probe's prlctl exec call moved");
-	// Prose mentions prlctl exec repeatedly; only a command position matters.
-	ok(
-		!/^\s*prlctl exec\b/m.test(rendered),
-		"probe has a second prlctl exec call",
-	);
-	const harness = join(dir, "render.sh");
-	writeFileSync(harness, rendered);
-	const run = spawnSync(
-		"/bin/bash",
-		[harness, "--vm", "probe-vm", "--phase", "baseline"],
-		{
-			encoding: "utf8",
-		},
-	);
-	strictEqual(run.status, 0, `render failed: ${run.stderr}`);
-	return run.stdout;
 };
 describe("clipboard isolation posture", () => {
 	const buildBody = () => readFileSync(BUILD, "utf8");

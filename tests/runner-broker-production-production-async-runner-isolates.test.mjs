@@ -14,7 +14,6 @@ import {
 } from "./helpers/runner-broker-production-fixtures.mjs";
 import { tempDirAsync } from "./helpers/tempdir.mjs";
 
-const QUOTA_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 let qualifiedRosterPath = null;
 before(() => {
 	qualifiedRosterPath = writeDispatchQualifiedRosterFixture();

@@ -35,7 +35,7 @@ import {
 } from "./task-base.mjs";
 import { decorateDirtyOverlayResult } from "./task-routing.mjs";
 
-export async function runQueueWithOrchestratorCore(options, scope) {
+export async function runQueueWithOrchestratorCore(_options, scope) {
 	const {
 		_safeError,
 		checkpoint,

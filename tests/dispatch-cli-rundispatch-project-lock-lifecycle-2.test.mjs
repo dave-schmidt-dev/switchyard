@@ -105,16 +105,6 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 			],
 		};
 	}
-	async function dispatchWithStub(runQueueFn, extraDependencies = {}) {
-		const opts = parseDispatchArgs([tasksFile, "--project", projectDir]);
-		const savedExitCode = process.exitCode;
-		try {
-			await dispatchRun(opts, { runQueue: runQueueFn, ...extraDependencies });
-			return process.exitCode;
-		} finally {
-			process.exitCode = savedExitCode;
-		}
-	}
 	async function onlyRunRecord() {
 		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
 		const runDirs = readdirSync(join(stateRoot, "runs"));
@@ -124,29 +114,6 @@ describe("runDispatch project lock lifecycle (INV-6)", () => {
 			`expected exactly one run record, got ${runDirs.length}`,
 		);
 		return readRun(runDirs[0]);
-	}
-	async function dispatchThrownFailure(error) {
-		const { readRun } = await import("../src/switchyard/run-store/index.mjs");
-		const runsRoot = join(stateRoot, "runs");
-		const before = new Set(existsSync(runsRoot) ? readdirSync(runsRoot) : []);
-		const savedExitCode = process.exitCode;
-		try {
-			await rejects(
-				dispatchRun(parseDispatchArgs([tasksFile, "--project", projectDir]), {
-					runQueue: () => {
-						throw error;
-					},
-				}),
-				error,
-			);
-		} finally {
-			process.exitCode = savedExitCode;
-		}
-		const runId = readdirSync(runsRoot).find(
-			(candidate) => !before.has(candidate),
-		);
-		ok(runId, "typed synchronous failure must leave a new durable run");
-		return readRun(runId);
 	}
 	it("run --json fails closed and reports failed envelope on callback event persistence error", async () => {
 		const { isProjectLockHeld, createEvent } = await import(

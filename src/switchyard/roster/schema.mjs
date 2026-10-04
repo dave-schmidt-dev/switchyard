@@ -78,7 +78,6 @@ export const PROVIDER_INVOCATION_VOCABULARY = Object.freeze({
 		argv: Object.freeze({}),
 	}),
 });
-const ADAPTER_ARGV_MAPPING = PROVIDER_INVOCATION_VOCABULARY;
 export const QUALIFICATION_STATUS = Object.freeze({
 	PROBE_QUALIFIED: "probe_qualified",
 	DISPATCH_QUALIFIED: "dispatch_qualified",

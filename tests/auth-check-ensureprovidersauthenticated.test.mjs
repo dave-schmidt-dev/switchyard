@@ -12,18 +12,6 @@ import {
 	reportProviderStatus,
 } from "../src/switchyard/auth/index.mjs";
 
-const TEST_BOOT_UUID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-function fixtureHostProbe(pid) {
-	const startTicks = String(pid * 10 + 1);
-	return {
-		state: "present",
-		pid,
-		bootSessionUuid: TEST_BOOT_UUID,
-		startTicks,
-		identity: `switchyard-host-process-v1:${TEST_BOOT_UUID}:${pid}:${startTicks}`,
-	};
-}
-
 const AUTH_TEST_RUN_STORE_ROOT = join(
 	tmpdir(),
 	`switchyard-auth-run-store-${process.pid}-${randomUUID()}`,
