@@ -9,9 +9,7 @@ import {
 	commandAvailable,
 	PARALLELS_AQUA_UID,
 	PARALLELS_GOLDEN_IMAGE,
-	pollStatus,
 	ROSTER_FIXTURE_PATH,
-	runDispatch,
 	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 } from "./helpers/detached-dispatch-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";

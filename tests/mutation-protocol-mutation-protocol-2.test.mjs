@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -12,14 +12,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { killOrphanedProcesses } from "../src/switchyard/adapter/orphan-kill.mjs";
 import { executeProviderInvocation } from "../src/switchyard/adapter/provider-lifecycle.mjs";
-import {
-	createMutationIntent,
-	createMutationPolicy,
-	executeMutation,
-	executeMutationSync,
-	mutationBackoffDelay,
-	validateMutationRecord,
-} from "../src/switchyard/lifecycle/mutation-protocol.mjs";
+import { createMutationIntent } from "../src/switchyard/lifecycle/mutation-protocol.mjs";
 import { initializeRun, readRun } from "../src/switchyard/run-store/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 

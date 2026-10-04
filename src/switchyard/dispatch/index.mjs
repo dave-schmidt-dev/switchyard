@@ -1,112 +1,8 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import {
-	closeSync,
-	existsSync,
-	lstatSync,
-	openSync,
-	readFileSync,
-	realpathSync,
-	statSync,
-} from "node:fs";
-import { lstat, readdir } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import {
-	basename,
-	dirname,
-	isAbsolute,
-	join,
-	relative,
-	resolve,
-	sep,
-} from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { parseArgs } from "node:util";
-import {
-	CHECKPOINT_REMEDIATION_MESSAGES,
-	checkpointRemediation,
-	classifyPreProviderFailure,
-	isPersistentFailureMetadata,
-	sanitizeFailureMetadata,
-} from "../adapter/exec-error.mjs";
-import {
-	createExecutionBackend,
-	hostBackendDefaults,
-} from "../lifecycle/backend-selection.mjs";
-import {
-	captureDirtyOverlay,
-	ignoredPath,
-	readDirtyOverlayReceipt,
-	validateDirtyOverlayReceipt,
-	writeDirtyOverlayReceipt,
-} from "../lifecycle/index.mjs";
-import { assertGenerationAllowed } from "../maintenance/index.mjs";
-import {
-	applyOutcomeProjection,
-	projectOutcomeReader,
-} from "../outcome/projection.mjs";
-import {
-	attestRouteRepair,
-	createDefaultRouteHealthDecision,
-	ingestRouteHealthEvents,
-	inspectRouteHealth,
-} from "../router/health.mjs";
-import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
-import {
-	acquireProjectLock,
-	acquireRunLock,
-	activateOutcomeWriter,
-	advanceState,
-	applyRetention,
-	assertProjectLockOwnership,
-	createEvent,
-	createRouteHealthEvent,
-	getRunRoot,
-	getStateRoot,
-	getVmAdmissionRoot,
-	initializeRun,
-	isProjectLockHeld,
-	isProjectLockOwnedBy,
-	LockError,
-	persistDiagnosticArtifact,
-	RevisionError,
-	readEvents,
-	readRun,
-	reconcileProjectLockClaims,
-	releaseOrphanedProjectLocks,
-	releaseProjectLockIfOwnedBy,
-	SchemaError,
-	updateRun,
-	updateRunWithRetry,
-	VALID_WORKTREE_STATES,
-} from "../run-store/index.mjs";
-import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
-import {
-	CallerInputValidationError,
-	computeQueueIdentityFromFile,
-	deriveQueueDiagnostics,
-	getCheckpointPath,
-	getProjectRevision,
-	invalidCompletedQuickCheckTaskIds,
-	loadCheckpoint,
-	loadTaskQueue,
-	normalizeRunOptions,
-	runQueueAsync,
-	sanitizeQueuePreflightDetail,
-	validateCallerInputs,
-	validateProjectFileEntries,
-} from "../runner/index.mjs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { CallerInputValidationError } from "../runner/index.mjs";
 import { handleSimple, SIMPLE_USAGE } from "../simple/index.mjs";
-import {
-	cleanupSimpleWorktree,
-	scanSimpleWorktreeOpenHandles,
-	simpleQuarantinePath,
-	verifySimpleWorktreeClaim,
-} from "../simple/worktree-cleanup.mjs";
-import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
-import { run as runOrphanLockRemediation } from "./remediate-orphaned-locks.mjs";
-import { finalizeRun } from "./run-finalization.mjs";
 
 async function main(argv) {
 	if (argv.length === 1 && argv[0] === "--version") {
@@ -255,7 +151,6 @@ import "./result.mjs";
 import "./recover-liveness.mjs";
 import "./recover-reclaim.mjs";
 import { guardRoutingLaunch } from "../simple/routing-cli.mjs";
-import { parseRecoverArgs, withStateRoot } from "./cli-args.mjs";
 import {
 	handleBackendHealth,
 	handleHealth,
@@ -265,7 +160,6 @@ import {
 import {
 	KNOWN_SUBCOMMANDS,
 	USAGE,
-	USAGE_RECOVER,
 	USAGE_RUN,
 	UsageError,
 } from "./cli-usage.mjs";
@@ -283,19 +177,7 @@ async function handleLaunch(argv, deps = {}) {
 	if (!guarded.blocked) return launchDetached(guarded.argv, deps);
 }
 
-import {
-	inspectSimpleWorktreeRecovery,
-	recoveryLiveness,
-	releaseStaleProjectLocks,
-} from "./recover-liveness.mjs";
-import {
-	auditKnownAllocationIntents,
-	canonicalRecoveryProject,
-	emptyReclaimResult,
-	reclaimManagedEntries,
-	recoveryExecutionBackend,
-} from "./recover-reclaim.mjs";
-import { handleResult, handleStatus, isTerminalState } from "./result.mjs";
+import { handleResult, handleStatus } from "./result.mjs";
 
 export { handleBackendHealth } from "./cli-handlers.mjs";
 

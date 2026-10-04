@@ -1,14 +1,7 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";

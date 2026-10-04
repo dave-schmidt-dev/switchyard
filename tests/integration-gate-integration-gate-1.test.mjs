@@ -2,23 +2,14 @@
 // Tests: agent output reaches host files ONLY via the reviewed apply, and
 // the gate's own validation — not just git's — rejects unsafe diffs.
 
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { INTEGRATION_REFUSAL_KINDS } from "../src/switchyard/adapter/exec-error.mjs";
 import {
 	APPLY_CHECK_MAX_BUFFER,
-	dequoteGitPath,
 	integrationGate,
 	validateDiff,
 } from "../src/switchyard/integrate/index.mjs";
@@ -193,7 +184,6 @@ index 0000000..abcdef1
 		const source = sourceText(
 			"src/switchyard/integrate/index.mjs",
 			"src/switchyard/integrate/diff-validation.mjs",
-			"src/switchyard/integrate/commit-validation.mjs",
 			"src/switchyard/integrate/apply.mjs",
 		);
 		// Anchor the wiring to the probe implementation itself rather than

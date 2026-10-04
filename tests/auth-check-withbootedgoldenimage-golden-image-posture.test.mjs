@@ -1,35 +1,15 @@
 import { deepStrictEqual, match, ok, strictEqual, throws } from "node:assert";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import {
-	existsSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-	AGY_LOGIN_UNAVAILABLE,
-	authWalkthroughExitCode,
-	CLAUDE_LOGIN_HINT,
-	CLONE_QUALIFICATION_RECEIPT_SCHEMA_VERSION,
-	COPILOT_LOGIN_COMMAND,
 	ensureProvidersAuthenticated,
-	formatCloneReceipt,
 	PROVIDERS,
-	parseCloneArgs,
-	qualifyCloneAuth,
-	reportProviderStatus,
-	runCheck,
-	runCloneCheck,
 	withBootedGoldenImage,
-	withDisposableClone,
-	writeCloneReceipt,
 } from "../src/switchyard/auth/index.mjs";
-import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { sourceText } from "./helpers/source-text.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 

@@ -1,20 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
-import {
-	closeSync,
-	fsyncSync,
-	lstatSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { lstatSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 
-import { lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, writeFile } from "node:fs/promises";
 
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 
 import {
 	assertOwned,

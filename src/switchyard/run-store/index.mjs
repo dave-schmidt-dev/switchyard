@@ -1,58 +1,3 @@
-import { createHash, randomUUID } from "node:crypto";
-import {
-	appendFileSync,
-	existsSync,
-	linkSync,
-	lstatSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	renameSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import {
-	appendFile,
-	link,
-	lstat,
-	mkdir,
-	open,
-	readdir,
-	readFile,
-	rename,
-	rm,
-	rmdir,
-	unlink,
-	writeFile,
-} from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-	isPersistentFailureMetadata,
-	sanitizeFailureMetadata,
-} from "../adapter/exec-error.mjs";
-import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
-import {
-	validateIdentifier,
-	validateInvocationArgs,
-	validateModelArg,
-} from "../adapter/shell-safety.mjs";
-import {
-	isReviewResult,
-	sanitizeReviewResult,
-} from "../diagnostics/review-result.mjs";
-import {
-	createMutationIntent,
-	executeMutation,
-} from "../lifecycle/mutation-protocol.mjs";
-import { projectOutcomeReader } from "../outcome/projection.mjs";
-import {
-	mergeOutcomeShadow,
-	projectOutcomeShadow,
-	validateShadowEnvelope,
-} from "../outcome/shadow.mjs";
-
 export {
 	projectCheckpointOutcome,
 	projectOutcomeReader,
@@ -62,24 +7,6 @@ export {
 	projectOutcomeShadow,
 	validateShadowEnvelope,
 } from "../outcome/shadow.mjs";
-
-import {
-	createOversizeRejectionFact,
-	isOutcomeEvent,
-	OUTCOME_EVENT_MAX_BYTES,
-	OUTCOME_FILE_MAX_BYTES,
-	OUTCOME_FILE_MAX_LINES,
-	OUTCOME_STAGES,
-	SUPPORTED_OUTCOME_READER_VERSION,
-	validateOutcomeEvent,
-} from "../outcome/schema.mjs";
-import {
-	getInvocationDescriptorIdentity,
-	normalizeProviderName,
-	resolveTargetIdentity,
-	validateInvocationDescriptor,
-} from "../roster/index.mjs";
-import { classifyRunLiveness } from "./run-liveness.mjs";
 
 export {
 	LockError,
@@ -100,76 +27,16 @@ import "./run-records.mjs";
 import "./vm-slots.mjs";
 import "./project-lock-files.mjs";
 import "./run-updates.mjs";
-import {
-	APPROVED_EVENT_KEYS,
-	CHECKPOINT_ARTIFACT_MAX_BYTES,
-	CHECKPOINT_ARTIFACT_MAX_ENTRIES,
-	CHECKPOINT_ARTIFACT_MAX_FILE_BYTES,
-	DEFAULT_LEASE_AGE_MS,
-	EVENT_RESERVE_BYTES,
-	locksRoot,
-	MAX_DIAGNOSTIC_ARTIFACT_BYTES,
-	quarantineRoot,
-	ROUTE_HEALTH_DEFERRED_RESULT,
-	runsRoot,
-	SUCCESS_RESULTS,
-	VALID_WORKTREE_STATES,
-} from "./constants.mjs";
+import { VALID_WORKTREE_STATES } from "./constants.mjs";
 import {
 	LockError,
 	RevisionError,
-	RUN_ID_RE,
 	SchemaError,
 	VmAdmissionPermissionDeniedError,
 	VmAdmissionStorageError,
 	VmAdmissionUnavailableError,
 	VmSlotUnavailableError,
-	validateRunId,
 } from "./errors.mjs";
-import {
-	cwdDerivedProjectLockPath,
-	lockFilePath,
-	moveProjectLockPathToClaim,
-	parseLegacyProjectLockBody,
-	parseOwnedProjectLockBody,
-	parseProjectLockArtifact,
-	parseProjectLockBody,
-	parseRecoveryReservation,
-	projectLockArtifacts,
-	projectLockClaimPath,
-	projectLockPath,
-	readTextIfPresent,
-	recoveryProofMetadata,
-	resolveCanonicalProjectPath,
-	unlinkBodyMatched,
-} from "./project-lock-files.mjs";
-import {
-	DESCRIPTOR_IDENTITY_RE,
-	isSafeDescriptorReceipt,
-	ownerOnlyDirectoryStat,
-	ownerOnlyRegularFileStat,
-	validateRouteHealthBinding,
-} from "./receipt-validation.mjs";
-import {
-	ensureDir,
-	getRunRoot,
-	readRun,
-	resolveDiagnosticArtifact,
-	sanitizeForDisplay,
-} from "./run-records.mjs";
-import {
-	enqueueRunMutation,
-	inspectEventLog,
-	performUpdate,
-	readMutationOperation,
-	reconcileEventCeilingLocked,
-	recordMutationOperation,
-	updateRun,
-	updateRunWithRetry,
-	withEventAppendLock,
-} from "./run-updates.mjs";
-import { validateRun } from "./validate-run.mjs";
-import { vmOwnerIsLive } from "./vm-slots.mjs";
 
 export { sanitizeVmAdmissionError } from "./errors.mjs";
 export {

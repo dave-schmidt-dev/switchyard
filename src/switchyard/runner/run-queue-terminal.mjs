@@ -1,11 +1,4 @@
-import {
-	artifactTransition,
-	failureTransition,
-	integrationTransition,
-	retryTransition,
-	reviewTransition,
-	terminalTransition,
-} from "../outcome/transitions.mjs";
+import { terminalTransition } from "../outcome/transitions.mjs";
 import { releaseCheckpointOwnership } from "./checkpoint-store.mjs";
 import { CHECKPOINT_VERSION } from "./constants.mjs";
 import { reportOutcomeProjectionFailure } from "./ledger-reporting.mjs";

@@ -1,9 +1,6 @@
-import { spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { classifyRunLiveness } from "../src/switchyard/run-store/run-liveness.mjs";
+import { basename, dirname, join, resolve } from "node:path";
 import { cleanupSimpleWorktree } from "../src/switchyard/simple/worktree-cleanup.mjs";
 
 function simplePathHeld(path, heldPaths) {

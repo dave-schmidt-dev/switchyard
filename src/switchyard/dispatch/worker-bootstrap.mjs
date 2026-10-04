@@ -1,15 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstatSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, unlinkSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	CLEANUP_STAGES,
-	classifyPreProviderFailure,
 	isPersistentFailureMetadata,
 	PERSISTED_SIGNALS,
-	prlctlFailureMetadata,
-	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
 import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";

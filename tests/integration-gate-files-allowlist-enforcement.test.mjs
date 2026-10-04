@@ -4,31 +4,17 @@
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { INTEGRATION_REFUSAL_KINDS } from "../src/switchyard/adapter/exec-error.mjs";
-import {
-	APPLY_CHECK_MAX_BUFFER,
-	dequoteGitPath,
-	integrationGate,
-	validateDiff,
-} from "../src/switchyard/integrate/index.mjs";
+import { integrationGate } from "../src/switchyard/integrate/index.mjs";
 import {
 	buildDiff,
 	buildStagedDiff,
 	commitFile,
 	initRepo,
 } from "./helpers/integration-gate-fixtures.mjs";
-import { sourceText } from "./helpers/source-text.mjs";
 
 let projectPath;
 

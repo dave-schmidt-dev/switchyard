@@ -5,7 +5,6 @@ import {
 	lstatSync,
 	lutimesSync,
 	mkdirSync,
-	readdirSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -15,16 +14,10 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { describe, it } from "node:test";
-import { listHeldPathsViaLsof } from "../scripts/simple-orphan-collector.mjs";
 import {
-	DEFAULT_MAX_AGE_DAYS,
-	inspectTree,
-	isSweepAuthorized,
-	parseLsofResult,
 	parseSweepArgs,
 	SIMPLE_ORPHAN_TTL_MS,
 	sweepSimpleOrphans,
-	sweepTempDirs,
 } from "../scripts/sweep-temp-dirs.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 

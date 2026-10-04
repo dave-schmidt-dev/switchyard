@@ -1,7 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { PROVIDER_EXECUTION_TIMEOUT_MS } from "./constants.mjs";
 import { describeExecError } from "./exec-error.mjs";
-import { validateAdapterInvocation } from "./invocation.mjs";
 import {
 	killOrphanedProcesses,
 	killOrphanedProcessesAsync,
@@ -14,11 +13,10 @@ import {
 	captureProviderDiffDetailedAsync,
 	completeSynchronousProviderExit,
 	executeProviderInvocation,
-	getWorkspaceExecution,
 	reconcileSynchronousProviderExit,
 	runProviderProcess,
 } from "./provider-lifecycle.mjs";
-import { validateIdentifier, validateModelArg } from "./shell-safety.mjs";
+import { validateIdentifier } from "./shell-safety.mjs";
 export function execute(prompt, workingContainerName, options = {}) {
 	const guardedPrompt = addProviderPromptGuardrail(prompt);
 	let execution;

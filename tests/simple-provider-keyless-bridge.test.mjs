@@ -3,7 +3,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	mkdirSync,
-	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -14,9 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-	formatOpenCodeGoBridgeDiagnostic,
 	parseBridgeArgs,
-	runBridge,
 	seatbeltProfile,
 	startProxy,
 } from "../ops/simple-provider-keyless-bridge.mjs";

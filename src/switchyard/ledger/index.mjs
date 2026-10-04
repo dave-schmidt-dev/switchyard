@@ -3,18 +3,14 @@ import {
 	closeSync,
 	mkdirSync,
 	openSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	statSync,
 	unlinkSync,
 } from "node:fs";
 
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 

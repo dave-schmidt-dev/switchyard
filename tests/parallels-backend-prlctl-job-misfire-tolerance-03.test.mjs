@@ -1,51 +1,17 @@
-import {
-	deepStrictEqual,
-	equal,
-	match,
-	notStrictEqual,
-	ok,
-	strictEqual,
-	throws,
-} from "node:assert/strict";
-
-import { execFileSync, spawnSync } from "node:child_process";
-
-import { createHash, randomUUID } from "node:crypto";
-
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { ok, strictEqual, throws } from "node:assert/strict";
 
 import { join } from "node:path";
 
 import { describe, it } from "node:test";
 
 import {
-	describeExecError,
 	PrlctlCallError,
 	prlctlFailureMetadata,
-	WorkerBootStageError,
-	workerBootStageDiagnosticCode,
 } from "../src/switchyard/adapter/exec-error.mjs";
 
-import { seedProjectWithBackend } from "../src/switchyard/lifecycle/index.mjs";
-
 import {
-	BULK_TRANSFER_HELPER,
-	buildParallelsWorkingName,
-	describeBulkTransferFailure,
-	MAX_AQUA_EXEC_ARGV_BYTES,
-	PARALLELS_WORKING_PREFIX,
-	ParallelsHostReadinessError,
 	parseParallelsWorkingName,
-	probeHostProcessIdentity,
 	ParallelsExecutionBackend as RealParallelsExecutionBackend,
-	validateLinkedCloneMeasurement,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 
 import { tempDir } from "./helpers/tempdir.mjs";

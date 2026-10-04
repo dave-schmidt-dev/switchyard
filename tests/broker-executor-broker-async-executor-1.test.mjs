@@ -1,10 +1,8 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import { executeBrokerRoute } from "../src/switchyard/broker/executor.mjs";
 import { BROKER_CONTRACT_VERSION } from "../src/switchyard/broker/schema.mjs";
-import { sanitizeReviewResult } from "../src/switchyard/diagnostics/review-result.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
-import { sourceText } from "./helpers/source-text.mjs";
 
 function fixture() {
 	const core = {

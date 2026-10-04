@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 
 import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 
-import { resolve, sep } from "node:path";
+import { resolve } from "node:path";
 
 import {
 	APPLY_CHECK_MAX_BUFFER,

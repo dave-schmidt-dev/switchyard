@@ -1,20 +1,3 @@
-import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { isAgyAuthenticated } from "../adapter/agy.mjs";
-import { isClaudeAuthenticated } from "../adapter/claude.mjs";
-import { isCodexAuthenticated } from "../adapter/codex.mjs";
-import { isCopilotAuthenticated } from "../adapter/copilot.mjs";
-import { isCursorAuthenticated } from "../adapter/cursor.mjs";
-import { isVibeAuthenticated } from "../adapter/vibe.mjs";
-import {
-	createExecutionBackend as createResolvedExecutionBackend,
-	hostBackendDefaults,
-} from "../lifecycle/backend-selection.mjs";
-import { probeLiveness } from "./liveness.mjs";
-
 function main(argv = process.argv.slice(2)) {
 	const executionBackend = createExecutionBackend();
 

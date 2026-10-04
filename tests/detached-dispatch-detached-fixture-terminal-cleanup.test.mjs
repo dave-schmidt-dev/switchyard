@@ -1,15 +1,6 @@
-import { deepStrictEqual, match, ok, rejects, strictEqual } from "node:assert";
+import { ok, rejects, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
@@ -22,7 +13,6 @@ import {
 	PARALLELS_GOLDEN_IMAGE,
 	pollStatus,
 	ROSTER_FIXTURE_PATH,
-	runDispatch,
 	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 } from "./helpers/detached-dispatch-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";

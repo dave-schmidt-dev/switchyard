@@ -1,18 +1,4 @@
-import {
-	acquireVmSlot,
-	activateOutcomeWriter,
-	appendOutcomeEvent,
-	createFencingIdentity,
-	createStageOutcome,
-	getStateRoot,
-	getVmAdmissionRoot,
-	isProjectLockOwnedBy,
-	readEvents,
-	readRun,
-	recoverExecutionOutcome,
-	releaseVmSlot,
-	VmSlotUnavailableError,
-} from "../run-store/index.mjs";
+import { readEvents, readRun } from "../run-store/index.mjs";
 import { releaseCheckpointOwnership } from "./checkpoint-store.mjs";
 import { CHECKPOINT_VERSION } from "./constants.mjs";
 

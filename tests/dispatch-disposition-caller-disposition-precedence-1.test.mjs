@@ -1,10 +1,7 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import {
-	projectDisposition,
-	projectTerminalOutcome,
-} from "../src/switchyard/dispatch/disposition.mjs";
+import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { run } from "./helpers/dispatch-disposition-fixtures.mjs";
 
 function failure(overrides = {}) {

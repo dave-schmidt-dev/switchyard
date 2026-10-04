@@ -1,10 +1,9 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { checkpointRemediation } from "../src/switchyard/adapter/exec-error.mjs";
 import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {

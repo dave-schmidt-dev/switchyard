@@ -1,4 +1,4 @@
-import { deepStrictEqual, match, ok, rejects, strictEqual } from "node:assert";
+import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {

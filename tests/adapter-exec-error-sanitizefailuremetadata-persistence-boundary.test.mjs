@@ -1,18 +1,12 @@
-import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
-	classifyPreProviderFailure,
 	classifyProviderDiagnostic,
 	cleanupDiagnosticCodeFor,
-	describeExecError,
 	INTEGRATION_REFUSAL_KINDS,
 	isPersistentFailureMetadata,
 	PERSISTED_DIAGNOSTIC_CODES,
 	PERSISTED_ERROR_KINDS,
-	PRE_PROVIDER_FAILURE_TRIPLES,
-	PrlctlCallError,
-	prlctlTrustedCauseCode,
-	reauthHintFor,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 

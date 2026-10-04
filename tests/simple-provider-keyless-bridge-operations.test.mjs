@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	mkdirSync,
@@ -16,12 +16,9 @@ import { test } from "node:test";
 import {
 	formatOpenCodeGoBridgeDiagnostic,
 	formatProxyRequestEvent,
-	parseBridgeArgs,
 	runBridge,
-	seatbeltProfile,
 	startProxy,
 } from "../ops/simple-provider-keyless-bridge.mjs";
-import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
 
 const SECRET = "synthetic-real-api-key-bridge-123456";
 test("proxy request event formatter emits only the bounded safe schema", () => {

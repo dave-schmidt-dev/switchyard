@@ -1,17 +1,8 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
-import { createHash, randomUUID } from "node:crypto";
-import { EventEmitter } from "node:events";
-import {
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { describe, it } from "node:test";
 import { killOrphanedProcesses } from "../src/switchyard/adapter/orphan-kill.mjs";
-import { executeProviderInvocation } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import {
 	createMutationIntent,
 	createMutationPolicy,
@@ -20,7 +11,6 @@ import {
 	mutationBackoffDelay,
 	validateMutationRecord,
 } from "../src/switchyard/lifecycle/mutation-protocol.mjs";
-import { initializeRun, readRun } from "../src/switchyard/run-store/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("mutation protocol", () => {

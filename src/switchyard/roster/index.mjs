@@ -1,13 +1,3 @@
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import {
-	validateIdentifier,
-	validateInvocationArgs,
-	validateModelArg,
-} from "../adapter/shell-safety.mjs";
-
 if (process.argv.includes("--coherence")) {
 	try {
 		const report = evaluateRealRosterCoherence();

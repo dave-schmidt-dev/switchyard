@@ -2,14 +2,11 @@ import { createHash } from "node:crypto";
 
 import {
 	appendFileSync,
-	closeSync,
 	mkdirSync,
-	openSync,
 	readFileSync,
 	renameSync,
 	rmSync,
 	statSync,
-	unlinkSync,
 } from "node:fs";
 
 import { homedir, hostname } from "node:os";

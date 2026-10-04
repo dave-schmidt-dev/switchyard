@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import {
 	closeSync,
@@ -12,13 +12,12 @@ import {
 	writeFileSync,
 } from "node:fs";
 
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 
 import {
 	getInvocationDescriptor,
 	getInvocationDescriptorIdentity,
 	resolveTargetIdentity,
-	validateInvocationDescriptor,
 } from "../roster/index.mjs";
 
 import {

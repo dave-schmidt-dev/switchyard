@@ -237,13 +237,6 @@ export function integrationGate(diff, projectPath, options = {}) {
 }
 
 export {
-	validateExactPathSet,
-	validateIntegratedCommitAncestry,
-	validateIntegratedCommitPaths,
-	validateNoTrackedPathOverlap,
-} from "./commit-validation.mjs";
-
-export {
 	APPLY_CHECK_MAX_BUFFER,
 	dequoteGitPath,
 	METADATA_COMMAND_TIMEOUT_MS,

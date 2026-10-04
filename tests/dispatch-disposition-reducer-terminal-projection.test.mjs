@@ -1,5 +1,4 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { readFileSync } from "node:fs";
+import { deepStrictEqual, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {
 	projectDisposition,

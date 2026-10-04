@@ -1,11 +1,8 @@
-import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import {
-	getStateRoot,
 	readRun,
 	reconcileProjectLockClaims,
 	releaseCwdDerivedProjectLockIfOwnedBy,

@@ -1,8 +1,7 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -12,7 +11,6 @@ import {
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
-import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__dirname,

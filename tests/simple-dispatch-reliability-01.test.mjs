@@ -1,43 +1,21 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { EventEmitter } from "node:events";
+import { execFileSync, spawn } from "node:child_process";
 import {
-	chmodSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
-	statSync,
 	writeFileSync,
 } from "node:fs";
-import { open, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import {
-	getRunRoot,
-	isProjectLockHeld,
-	readEvents,
-	readRun,
-	runStoreTesting,
-	updateRunWithRetry,
-} from "../src/switchyard/run-store/index.mjs";
-import {
-	assessSimpleRecoveryEvidence,
-	defaultExecuteProvider,
-	handleSimple,
-	parseOpenCodeGoBridgeDiagnostic,
-	runSimpleTask,
-	runSimpleWriter,
-} from "../src/switchyard/simple/index.mjs";
-import {
-	cleanupSimpleWorktree,
-	simpleQuarantinePath,
-} from "../src/switchyard/simple/worktree-cleanup.mjs";
+import { readRun } from "../src/switchyard/run-store/index.mjs";
+import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalTmpdirEnv = process.env.TMPDIR;
