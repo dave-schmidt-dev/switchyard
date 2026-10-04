@@ -89,6 +89,24 @@ const SIMPLE_TARGET_ADAPTERS = Object.freeze([
 		}),
 	}),
 	Object.freeze({
+		// Claude Code is subscription-backed and must be explicitly pinned.
+		targetId: "claude-code",
+		harness: "claude",
+		kind: "native",
+		defaultEligible: false,
+		capabilities: Object.freeze(["low", "standard", "high"]),
+		selectors: Object.freeze([
+			"claude-haiku-4-5-20251001",
+			"claude-sonnet-5-5",
+			"claude-opus-5-5",
+		]),
+		validateInvocationArgs: (args) =>
+			Array.isArray(args) &&
+			args.length === 2 &&
+			args[0] === "--effort" &&
+			["low", "medium", "high", "xhigh", "max"].includes(args[1]),
+	}),
+	Object.freeze({
 		// Native headless Vibe on Vibe's own login: spends the Vibe Code allowance.
 		targetId: "vibe-code",
 		harness: "vibe",

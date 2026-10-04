@@ -430,8 +430,9 @@ test("explicit lane planning forces the VM lane for simple-compatible vibe-code"
 		}).reason,
 		"invalid_lane",
 	);
+	// Cursor still has no simple adapter, so a simple-lane request is refused.
 	const refused = await runRepresentativeQualification({
-		targetId: "claude-code",
+		targetId: "cursor-pro",
 		capability: "high",
 		lane: "simple",
 		rosterData: roster,

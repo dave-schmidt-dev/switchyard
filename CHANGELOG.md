@@ -6,6 +6,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- Simple dispatch can run Claude Code (`--only-provider claude-code`, Haiku 4.5, Sonnet 5.5 or Opus 5.5 with an explicit effort) in a native Seatbelt sandbox on its own subscription login. It is never chosen automatically, and auth, missing-model and usage-limit failures are classified for routing.
 - Simple routing logs every failed attempt and every non-complete stop to `<stateRoot>/failure-log/failures.jsonl` (allowlisted fields only, rotated, best-effort), and `switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]` groups them by fingerprint for periodic routing and provider tuning.
 
 ### Removed

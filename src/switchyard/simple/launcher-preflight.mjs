@@ -2,7 +2,12 @@ import { lstatSync, unlinkSync } from "node:fs";
 import { runProviderProcess } from "../adapter/provider-lifecycle.mjs";
 import { createBridgeRequestRecorder } from "./request-evidence.mjs";
 
-const GUARDED_TARGETS = new Set(["vibe", "vibe-code", "opencode-go"]);
+const GUARDED_TARGETS = new Set([
+	"vibe",
+	"vibe-code",
+	"opencode-go",
+	"claude-code",
+]);
 
 function interruptionReason(signal, deadlineMs, now, result) {
 	return signal?.aborted || result?.cancelled

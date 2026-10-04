@@ -17,6 +17,9 @@ import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
 const VIBE_CODE_LAUNCHER = fileURLToPath(
 	new URL("../../../ops/simple-vibe-code-launcher.mjs", import.meta.url),
 );
+const CLAUDE_CODE_LAUNCHER = fileURLToPath(
+	new URL("../../../ops/simple-claude-code-launcher.mjs", import.meta.url),
+);
 
 function remainingMs(deadlineMs, now) {
 	return Math.max(0, deadlineMs - now());
@@ -112,6 +115,20 @@ export function buildSimpleProviderInvocation(
 				VIBE_CODE_LAUNCHER,
 				"--model",
 				descriptor.selector,
+				"--worktree",
+				worktreePath,
+			],
+		};
+	}
+	if (targetId === "claude-code") {
+		return {
+			command: process.execPath,
+			args: [
+				CLAUDE_CODE_LAUNCHER,
+				"--model",
+				descriptor.selector,
+				"--effort",
+				descriptor.invocation_args[1],
 				"--worktree",
 				worktreePath,
 			],
@@ -285,6 +302,9 @@ export async function defaultExecuteProvider(context) {
 			: null;
 	const bridgeDiagnosticCode =
 		providerCodeForOpenCodeGoBridgeEvidence(bridgeDiagnostic) ??
+		(context.harness === "claude" && !result.success
+			? providerCodeForClaudeCodeDiagnostic(result.stderr)
+			: null) ??
 		(context.harness === "vibe" && !result.success
 			? providerCodeForVibeBudgetEvidence(result.stderr)
 			: null);
@@ -320,6 +340,20 @@ export async function defaultExecuteProvider(context) {
 	} catch {
 		return { ...result, providerVerdictCode: "agy_unparseable" };
 	}
+}
+export function providerCodeForClaudeCodeDiagnostic(stderr) {
+	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
+	for (const line of stderr.split(/\r?\n/u)) {
+		const match =
+			/^SWITCHYARD_CLAUDE_CODE_DIAG_V1 subtype=([a-z_]{1,40}|unknown) api_status=(\d{3}|none) limit=([01])$/u.exec(
+				line,
+			);
+		if (!match) continue;
+		if (match[3] === "1") return "quota_exhausted";
+		if (match[2] === "401" || match[2] === "403") return "auth_expired";
+		if (match[2] === "404") return "model_unavailable";
+	}
+	return null;
 }
 export function parseOpenCodeGoBridgeDiagnostic(output) {
 	const evidence = parseOpenCodeGoBridgeDiagnosticEvidence(output);
