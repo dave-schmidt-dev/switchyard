@@ -1,15 +1,15 @@
 import { strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../src/switchyard/runner/checks-sandbox.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const root = mkdtempSync(join(realpathSync(tmpdir()), "sy-check-proc-"));
+const root = tempDir("sy-check-proc-");
 after(() => rmSync(root, { recursive: true, force: true }));
 
 // Runs a node script under the real quick-check profile with the checker's own
