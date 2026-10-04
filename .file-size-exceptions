@@ -1,6 +1,6 @@
 # Final plan section 7 exceptions; every path remains over 800 lines.
 tests/helpers/outcome-shadow-historical-snapshot.mjs: data literal: historical outcome snapshot, one value
-ops/macos-vm/build-golden-image.sh: Task 60 owns it; validating a change needs a live golden-image rebuild.
+ops/macos-vm/build-golden-image.sh: validating a change needs a live golden-image rebuild.
 src/switchyard/lifecycle/parallels-execution-backend.mjs: ParallelsExecutionBackend class body remains whole.
 src/switchyard/simple/index.mjs: runSimpleTask remains a whole function.
 ops/simple-provider-keyless-bridge.mjs: The BWS broker pins this single executable by SHA-256; splitting proxy logic into an unpinned import would weaken that credential boundary until transitive pins are supported.
