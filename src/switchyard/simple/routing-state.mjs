@@ -38,6 +38,10 @@ const REASONS = new Set([
 	"empty_diff",
 	"unsafe_failure",
 	"lifecycle_unconfirmed",
+	"check_failed",
+	"environment_failure",
+	"policy_rejected",
+	"baseline_failed",
 ]);
 const fail = (code) => {
 	throw Object.assign(new Error(code), { code });

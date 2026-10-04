@@ -8,6 +8,7 @@ import {
 import { route } from "../router/index.mjs";
 import { readRun } from "../run-store/index.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
+import { classifyAttemptFailure } from "./failure-severity.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
 	canonicalRoutingProject,
@@ -16,14 +17,8 @@ import {
 	recordAttemptOutcome,
 } from "./routing-state.mjs";
 
-const RETRY = new Set([
-	"provider_exit_nonzero",
-	"provider_silence_timeout",
-	"provider_adapter_error",
-	"provider_result_inconsistent",
-	"provider_launch_failed",
-	"empty_diff",
-]);
+export const MAX_SOFT_ATTEMPTS_PER_TASK = 4;
+
 const FUNDING_UNAVAILABLE = new Set([
 	"paid_overage_not_allowed",
 	"included_usage_unverified",
@@ -121,12 +116,22 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 		routingRunId,
 		{ stateRoot: deps.stateRoot, now },
 	);
+	const retainedPartials = () =>
+		handle.state.attempts
+			.filter((a) => a.partialWorktree !== null)
+			.map(({ attemptId, targetId, reason, partialWorktree }) => ({
+				attemptId,
+				targetId,
+				reason,
+				partialWorktree,
+			}));
 	const answer = (direction, extra = {}) => ({
 		direction,
 		routingRunId,
 		routingRunIdSource,
 		attempts: handle.state.attempts,
 		failedTargetIds: handle.state.failedTargetIds,
+		retainedPartials: retainedPartials(),
 		...extra,
 	});
 	const pinned = (options.onlyProviders ?? []).length > 0;
@@ -140,6 +145,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const funded = deps.assertFundedRoute ?? assertFundedRoute;
 	const localExcluded = new Set();
 	const logicalTaskId = deps.taskId ?? randomUUID();
+	let softAttempts = 0;
+	let anyFailed = false;
 	let iteration = 0;
 	try {
 		if (handle.state.pendingAttempt)
@@ -290,6 +297,11 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					return answer(pinned ? "stop" : "native_required", {
 						status: pinned ? "failed" : "deferred",
 						stopReason: pinned ? "pinned_target_unavailable" : undefined,
+						exhaustionCause: !pinned
+							? anyFailed
+								? "task_failures"
+								: "capacity"
+							: undefined,
 						result,
 					});
 				return answer("stop", { stopReason: "preflight_failed", result });
@@ -328,34 +340,24 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			const tried =
 				result.failurePhase !== "baseline" &&
 				result.recovery.cleanup.writer.state === "stopped";
-			const safeRetry =
-				failed &&
-				accountability.causeCategory !== "environment" &&
-				tried &&
-				RETRY.has(result.failureReason) &&
-				["execution_failed", "empty_diff"].includes(result.errorKind) &&
-				["execute", "diff"].includes(result.failurePhase) &&
-				!result.partialWorktree &&
-				["removed", "not_created"].includes(
-					result.recovery.cleanup.worktree.state,
-				) &&
-				!deps.signal?.aborted &&
-				options.deadlineMs > now();
+
+			const terminal = failed
+				? (typed ? accountability.providerMemoryEligible && tried : tried)
+					? "failed"
+					: "skipped"
+				: "succeeded";
+
+			// lifecycle() already proved the writer stopped or never started.
+			const classification = failed
+				? classifyAttemptFailure({ result, accountability })
+				: null;
+			const reason = failed ? classification.reason : "succeeded";
+
 			try {
 				recordAttemptOutcome(handle.state, handle.commit, {
 					...pending,
-					terminal: failed
-						? (typed ? accountability.providerMemoryEligible && tried : tried)
-							? "failed"
-							: "skipped"
-						: "succeeded",
-					reason: failed
-						? safeRetry && (!typed || accountability.providerMemoryEligible)
-							? result.failureReason === "empty_diff"
-								? "empty_diff"
-								: "execution_failed"
-							: "unsafe_failure"
-						: "succeeded",
+					terminal,
+					reason,
 					closedAt: new Date(now()).toISOString(),
 					partialWorktree: result.partialWorktree ?? null,
 				});
@@ -366,17 +368,54 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					pendingAttempt: pending,
 				});
 			}
+
 			if (!failed) return answer("complete", { result });
+
+			// Always exclude from this invocation's local set regardless of severity.
 			localExcluded.add(pending.targetId);
-			if (!safeRetry || pinned || options.capability === "high")
+			anyFailed = true;
+
+			if (classification.severity === "hard") {
 				return answer("stop", {
-					stopReason: result.partialWorktree
-						? "partial_work_retained"
-						: accountability.causeCategory === "environment"
-							? "environment_failure"
-							: "unsafe_failure",
+					stopReason: "unsafe_failure",
 					result,
+					classification,
 				});
+			}
+			if (classification.severity === "baseline") {
+				return answer("stop", {
+					stopReason: "baseline_failed",
+					result,
+					classification,
+				});
+			}
+			// severity === "soft" from here
+			if (pinned || options.capability === "high") {
+				return answer("stop", {
+					stopReason: classification.reason,
+					result,
+					classification,
+				});
+			}
+			softAttempts += 1;
+			if (softAttempts >= MAX_SOFT_ATTEMPTS_PER_TASK) {
+				return answer("stop", {
+					stopReason: "soft_retry_budget_exhausted",
+					result,
+					classification,
+				});
+			}
+			// A cancelled or expired invocation keeps this attempt's own outcome.
+			if (
+				deps.signal?.aborted ||
+				(Number.isFinite(options.deadlineMs) && options.deadlineMs <= now())
+			)
+				return answer("stop", {
+					stopReason: classification.reason,
+					result,
+					classification,
+				});
+			// Continue to the next eligible target (retained clone is independent).
 		}
 	} finally {
 		handle.release();

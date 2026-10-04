@@ -1,6 +1,5 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
@@ -13,135 +12,8 @@ import {
 	readRoutingRunState,
 } from "../src/switchyard/simple/routing-state.mjs";
 import { withDispatchQualifiedDescriptors } from "./helpers/router-fixtures.mjs";
-import { tempDir } from "./helpers/tempdir.mjs";
+import { fixture } from "./helpers/simple-routing-fixture.mjs";
 
-function fixture(overrides = {}) {
-	const projectPath = realpathSync(tempDir("routing-project-"));
-	const stateRoot = realpathSync(tempDir("routing-state-"));
-	const calls = [];
-	const records = new Map();
-	const options = {
-		projectPath,
-		routingRunId: "run-1",
-		capability: "standard",
-		deadlineMs: Date.now() + 60_000,
-		dirtyOverlay: true,
-		files: ["a.txt"],
-		checks: ["true"],
-	};
-	const deps = {
-		stateRoot,
-		getImplementorPriority: () => 1,
-		assertFundedRoute: () => {},
-		route: ({ availableProviders }) => ({
-			provider: availableProviders[0] ?? null,
-			reason: "no_eligible",
-		}),
-		readRun: async (id) => records.get(id),
-	};
-	deps.runSimpleTask = async (opts, context) => {
-		const selected = context.route({
-			availableProviders: overrides.__targets ?? [
-				"antigravity-claude",
-				"codex",
-				"vibe",
-			],
-			only: opts.onlyProviders ?? [],
-		});
-		if (!selected.provider)
-			return {
-				status: "failed",
-				failurePhase: "route",
-				failureReason: "no_eligible_provider",
-			};
-		const targetId = selected.resolvedTargetId ?? selected.provider;
-		calls.push(targetId);
-		const pending = readRoutingRunState(projectPath, options.routingRunId, {
-			stateRoot,
-		}).pendingAttempt;
-		strictEqual(pending.targetId, targetId);
-		const behavior = overrides[targetId] ?? {};
-		const status = behavior.status ?? "succeeded";
-		const failed = status === "failed";
-		const worktree = behavior.retained ? "retained" : "removed";
-		const failureReason =
-			behavior.result?.failureReason ??
-			(failed ? "provider_exit_nonzero" : null);
-		const failurePhase =
-			behavior.result?.failurePhase ?? (failed ? "execute" : null);
-		const errorKind =
-			behavior.result?.errorKind ?? (failed ? "execution_failed" : null);
-		const result = {
-			runId: context.runId,
-			taskId: context.taskId,
-			attemptId: context.attemptId,
-			targetId,
-			status,
-			failureReason,
-			failurePhase,
-			errorKind,
-			partialWorktree: behavior.retained ? join(projectPath, "retained") : null,
-			recovery: {
-				schemaVersion: 1,
-				result: {
-					status,
-					failureReason,
-					failurePhase,
-				},
-				identity: {
-					taskId: context.taskId,
-					attemptId: context.attemptId,
-					scope: (() => {
-						const hash = (value) =>
-							`sha256:${createHash("sha256").update(value).digest("hex")}`;
-						const scope = {
-							files: opts.files,
-							checks: opts.checks.map((command, index) => ({
-								index: index + 1,
-								digest: hash(command),
-							})),
-						};
-						return { ...scope, digest: hash(JSON.stringify(scope)) };
-					})(),
-				},
-				cleanup: {
-					writer: { state: "stopped" },
-					projectLock: { state: "released" },
-					worktree: {
-						state: worktree,
-						path: behavior.retained ? join(projectPath, "retained") : null,
-					},
-				},
-			},
-			...behavior.result,
-		};
-		records.set(context.runId, {
-			runId: context.runId,
-			projectPath,
-			orderedTaskIds: [context.taskId],
-			resolvedTargetId: targetId,
-			state: status,
-			cleanupState: "complete",
-			// Real run records persist sanitized metadata, never the raw result.
-			lastFailure:
-				status === "failed"
-					? {
-							errorKind: result.errorKind,
-							...(result.providerReliability
-								? { providerReliability: result.providerReliability }
-								: {}),
-							reasonCode: result.errorKind,
-							reason:
-								"Provider execution failed before a reviewed integration.",
-						}
-					: null,
-			worktree: { state: worktree, writerStopped: true },
-			...behavior.record,
-		});
-		return result;
-	};
-	return { options, deps, calls, records };
-}
 test("waterfall excludes failed targets across calls while success is reusable", async () => {
 	const f = fixture({
 		"antigravity-claude": { status: "failed" },
@@ -189,19 +61,10 @@ test("exhaustion never latches; actual acknowledgement makes subsequent call zer
 		"native_latched",
 	);
 });
-test("unknown lifecycle, mismatched durable result, retained partials, permissions and checks stop", async () => {
+test("unknown lifecycle and mismatched durable result stop; a retained partial continues then blocks the next call", async () => {
 	for (const behavior of [
 		{ result: { recovery: null } },
 		{ record: { projectPath: "/wrong" } },
-		{ retained: true },
-		{ result: { errorKind: "permission_denied" } },
-		{
-			result: {
-				failureReason: "check_failed",
-				failurePhase: "checks",
-				errorKind: "check_failed",
-			},
-		},
 	]) {
 		const f = fixture({
 			"antigravity-claude": { status: "failed", ...behavior },
@@ -210,6 +73,26 @@ test("unknown lifecycle, mismatched durable result, retained partials, permissio
 		strictEqual(result.direction, "stop");
 		strictEqual(f.calls.length, 1);
 	}
+	const retained = fixture({
+		"antigravity-claude": { status: "failed", retained: true },
+	});
+	const continued = await runSimpleRoutingTask(retained.options, retained.deps);
+	strictEqual(continued.direction, "complete");
+	strictEqual(retained.calls.length, 2);
+	strictEqual(continued.retainedPartials.length, 1);
+	const blocked = await runSimpleRoutingTask(retained.options, retained.deps);
+	strictEqual(blocked.stopReason, "partial_work_retained");
+	strictEqual(retained.calls.length, 2);
+	// permission_denied is unrecognized → soft/execution_failed → continues to next target
+	const f2 = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: { errorKind: "permission_denied" },
+		},
+	});
+	const r2 = await runSimpleRoutingTask(f2.options, f2.deps);
+	strictEqual(r2.direction, "complete");
+	strictEqual(f2.calls.length, 2);
 });
 test("pending crash stops before any engine and signals/deadline cannot renew", async () => {
 	const f = fixture();
@@ -290,6 +173,7 @@ test("baseline failure stops without marking the target failed for the run", asy
 	});
 	const outcome = await runSimpleRoutingTask(f.options, f.deps);
 	strictEqual(outcome.direction, "stop");
+	strictEqual(outcome.stopReason, "baseline_failed");
 	deepStrictEqual(f.calls, ["antigravity-claude"]);
 	const state = readRoutingRunState(f.options.projectPath, "run-1", {
 		stateRoot: f.deps.stateRoot,
@@ -297,6 +181,7 @@ test("baseline failure stops without marking the target failed for the run", asy
 	deepStrictEqual(state.failedTargetIds, []);
 	strictEqual(state.attempts.length, 1);
 	strictEqual(state.attempts[0].terminal, "skipped");
+	strictEqual(state.attempts[0].reason, "baseline_failed");
 });
 test("allocation and terminal durability failure stop before reroute", async () => {
 	for (const failAt of [1, 2]) {
@@ -526,16 +411,26 @@ for (const causeCode of [
 			},
 		});
 		const result = await runSimpleRoutingTask(f.options, f.deps);
-		strictEqual(result.direction, "stop");
-		strictEqual(
-			result.stopReason,
-			causeCode === "environment_failure"
-				? "environment_failure"
-				: "unsafe_failure",
-		);
+		// Provider memory must never be poisoned: failedTargetIds stays [] and terminal stays "skipped".
+		// Directions and stop reasons follow the new classification rules.
 		deepStrictEqual(result.failedTargetIds, []);
 		strictEqual(result.attempts[0].terminal, "skipped");
-		strictEqual(result.attempts[0].reason, "unsafe_failure");
+		// The fixture encodes errorKind:"check_failed" on all variants, so rule 3a (check)
+		// fires before category-specific soft rules. Hard categories still stop.
+		const attempt = result.attempts[0];
+		if (
+			causeCode === "cancelled" ||
+			causeCode === "cleanup_failed" ||
+			causeCode === "input_rejected"
+		) {
+			// hard: causeCategory cleanup/cancellation/input wins before rule 3a
+			strictEqual(result.direction, "stop");
+			strictEqual(attempt.reason, "unsafe_failure");
+		} else {
+			// soft: errorKind=check_failed (rule 3a) → check_failed reason, continues to next target
+			strictEqual(result.direction, "complete");
+			strictEqual(attempt.reason, "check_failed");
+		}
 	});
 }
 test("typed unknown retry excludes immediately, shares logical task and allows target in a later call", async () => {
@@ -625,12 +520,13 @@ test("trusted typed provider cause without a started writer never enters provide
 		return result;
 	};
 	const result = await runSimpleRoutingTask(f.options, f.deps);
-	strictEqual(result.direction, "stop");
-	strictEqual(result.result.accountability.providerMemoryEligible, true);
+	// A writer that never started is a soft failure: the waterfall moves on.
+	strictEqual(result.direction, "complete");
 	strictEqual(result.attempts[0].terminal, "skipped");
-	strictEqual(result.attempts[0].reason, "unsafe_failure");
+	strictEqual(result.attempts[0].reason, "execution_failed");
 	deepStrictEqual(result.failedTargetIds, []);
-	deepStrictEqual(f.calls, ["antigravity-claude"]);
+	strictEqual(f.calls[0], "antigravity-claude");
+	strictEqual(f.calls.length, 2);
 	deepStrictEqual(
 		readRoutingRunState(f.options.projectPath, f.options.routingRunId, {
 			stateRoot: f.deps.stateRoot,
