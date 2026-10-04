@@ -20,6 +20,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- Dispatch checks no longer hang or fail on process-group cleanup, `/bin/sh` scripts or temp-path resolution: the quick-check sandbox now lets a check signal processes in its own sandbox, read the `/private/var/select` shell link, and read metadata on the `/var`, `/tmp` and `/etc` links.
 - Integration now rejects incomplete Git metadata and stops stalled metadata checks after 30 seconds, preventing unsafe acceptance and indefinite waits.
 
 ## [0.3.0] - 2026-10-02

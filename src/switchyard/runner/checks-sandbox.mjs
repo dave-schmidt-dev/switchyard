@@ -58,11 +58,15 @@ export function quickCheckSandboxProfile(clone, runtime, readOnlyPaths = []) {
 		npmRoot,
 		"/opt/homebrew/bin/node",
 		"/opt/homebrew/bin/npm",
+		// /bin/sh reads its target shell through this symlink.
+		"/private/var/select",
 		clone,
 		runtime,
 		...readOnlyPaths.map((path) => realpathSync(path)),
 	];
-	const ancestors = new Set(["/"]);
+	// The top-level symlinks need metadata access so realpath() of TMPDIR and
+	// similar paths resolves; their targets stay governed by the read list.
+	const ancestors = new Set(["/", "/var", "/tmp", "/etc"]);
 	for (const path of reads) {
 		let current = dirname(path);
 		while (current !== "/") {
@@ -79,6 +83,8 @@ export function quickCheckSandboxProfile(clone, runtime, readOnlyPaths = []) {
 		"(deny default)",
 		"(allow process-exec)",
 		"(allow process-fork)",
+		// Checks may signal and probe their own process groups, never host processes.
+		"(allow signal (target same-sandbox))",
 		"(allow sysctl-read)",
 		'(allow file-read* (literal "/"))',
 		`(allow file-read-metadata ${literals})`,
