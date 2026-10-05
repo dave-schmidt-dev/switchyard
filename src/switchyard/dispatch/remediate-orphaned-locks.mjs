@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import {
+	isProjectLockOwnedBy,
 	readRun,
 	reconcileProjectLockClaims,
 	releaseCwdDerivedProjectLockIfOwnedBy,
@@ -53,6 +54,7 @@ export async function run(argv, dependencies = {}) {
 	const reconcileFn =
 		dependencies.reconcileProjectLockClaims ?? reconcileProjectLockClaims;
 	const confirmFn = dependencies.confirmFn ?? defaultConfirm;
+	const isOwnedFn = dependencies.isProjectLockOwnedBy ?? isProjectLockOwnedBy;
 
 	let opts;
 	try {
@@ -235,16 +237,47 @@ export async function run(argv, dependencies = {}) {
 		// resolution and this call, that read returns a different runId and
 		// the delete is a safe no-op.
 		let didRelease = false;
+		let releaseUncertain = false;
 		try {
 			didRelease =
 				c.remediationKind === "cwd-derived-project-lock"
 					? await releaseCwdDerivedFn(c.projectPath, c.runId, {
 							onRemoved: (path) =>
 								recordRemovedPath(path, ` (runId=${c.runId})`),
+							...(dependencies.probePid
+								? { probePid: dependencies.probePid }
+								: {}),
+							...(dependencies.now !== undefined
+								? { now: dependencies.now }
+								: {}),
+							onStatus: (event) => {
+								if (
+									event?.event === "mutation_postcondition_uncertain" ||
+									event?.status === "uncertain" ||
+									event?.state === "uncertain"
+								) {
+									releaseUncertain = true;
+								}
+							},
 						})
 					: await releaseFn(c.projectPath, c.runId, {
 							onRemoved: (path) =>
 								recordRemovedPath(path, ` (runId=${c.runId})`),
+							...(dependencies.probePid
+								? { probePid: dependencies.probePid }
+								: {}),
+							...(dependencies.now !== undefined
+								? { now: dependencies.now }
+								: {}),
+							onStatus: (event) => {
+								if (
+									event?.event === "mutation_postcondition_uncertain" ||
+									event?.status === "uncertain" ||
+									event?.state === "uncertain"
+								) {
+									releaseUncertain = true;
+								}
+							},
 						});
 		} catch (e) {
 			log(`remediate-orphaned-locks: error releasing ${c.name}: ${e.message}`);
@@ -255,9 +288,16 @@ export async function run(argv, dependencies = {}) {
 			recordRemovedPath(c.path, ` (runId=${c.runId})`);
 		}
 		if (!removedNames.has(c.name)) {
-			log(
-				`remediate-orphaned-locks: skipped ${c.name} — no longer owned by ${c.runId} (reassigned since resolution, or already released)`,
-			);
+			const stillOwned =
+				releaseUncertain ||
+				(await isOwnedFn(c.projectPath, c.runId).catch(() => false));
+			if (stillOwned) {
+				log(`remediate-orphaned-locks: skipped ${c.name} — release_uncertain`);
+			} else {
+				log(
+					`remediate-orphaned-locks: skipped ${c.name} — no longer owned by ${c.runId} (reassigned since resolution, or already released)`,
+				);
+			}
 		}
 	}
 

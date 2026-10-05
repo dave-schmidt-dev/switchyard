@@ -22,7 +22,8 @@ import {
 	resolveCanonicalProjectPath,
 	unlinkBodyMatched,
 } from "./project-lock-files.mjs";
-import { ensureDir } from "./run-records.mjs";
+import { classifyRunLiveness } from "./run-liveness.mjs";
+import { ensureDir, readRun } from "./run-records.mjs";
 import {
 	readMutationOperation,
 	recordMutationOperation,
@@ -127,6 +128,140 @@ export async function releaseProjectLockIfOwnedBy(
 			} catch (error) {
 				if (error?.code !== "ENOENT") throw error;
 			}
+		}
+		const isIdempotent =
+			(protocol.policy?.idempotency ??
+				policy?.idempotency ??
+				resume?.idempotency) === "idempotent";
+		if (resume && resume.state === "uncertain" && isIdempotent) {
+			const projectPath = resolveCanonicalProjectPath(canonicalProjectPath);
+			const observeIsOwned = async () => {
+				if (typeof protocol.observe === "function") {
+					const result = await protocol.observe();
+					return result?.status !== "confirmed";
+				}
+				return isProjectLockOwnedBy(projectPath, expectedRunId);
+			};
+
+			const owned = await observeIsOwned();
+			const persistFn =
+				protocol.persist ??
+				(async (record) => {
+					try {
+						await recordMutationOperation(expectedRunId, record);
+					} catch (error) {
+						if (error?.code !== "ENOENT") throw error;
+					}
+				});
+			const onStatus = protocol.onStatus ?? options.onStatus;
+
+			if (!owned) {
+				const completedRecord = Object.freeze({
+					...resume,
+					state: "completed",
+					outcome: "confirmed",
+					attempt: (resume.attempt ?? 1) + 1,
+					reconciled: true,
+					recordedAt: new Date().toISOString(),
+				});
+				await persistFn(completedRecord);
+				onStatus?.({
+					phase: "mutation",
+					event: "mutation_completed",
+					operationId: completedRecord.operationId,
+					attempt: completedRecord.attempt,
+				});
+				return true;
+			}
+
+			const artifacts = await projectLockArtifacts(projectPath);
+			const ownedArtifacts = artifacts.filter(
+				(artifact) => artifact.body?.runId === expectedRunId,
+			);
+
+			let holderPid = null;
+			for (const artifact of ownedArtifacts) {
+				if (artifact.body?.holderPid != null) {
+					holderPid = artifact.body.holderPid;
+					break;
+				}
+				const fileName = artifact.claimPath
+					? artifact.claimPath.split("/").pop()
+					: artifact.path
+						? artifact.path.split("/").pop()
+						: "";
+				const proof = recoveryProofMetadata(fileName);
+				if (proof?.ownerPid != null) {
+					holderPid = proof.ownerPid;
+					break;
+				}
+			}
+			if (holderPid == null) {
+				try {
+					const run = await readRun(expectedRunId);
+					holderPid = run?.workerPid ?? null;
+				} catch {
+					// ignore
+				}
+			}
+
+			const isCurrentProcess = holderPid === process.pid;
+			const isDead =
+				Number.isInteger(holderPid) &&
+				holderPid > 0 &&
+				classifyRunLiveness({ workerPid: holderPid }, options) === "dead";
+
+			if (isCurrentProcess || isDead) {
+				await releaseProjectLockIfOwnedBy(canonicalProjectPath, expectedRunId, {
+					...options,
+					_mutationRaw: true,
+				});
+				const stillOwned = await observeIsOwned();
+				if (!stillOwned) {
+					const completedRecord = Object.freeze({
+						...resume,
+						state: "completed",
+						outcome: "confirmed",
+						attempt: (resume.attempt ?? 1) + 1,
+						reconciled: true,
+						recordedAt: new Date().toISOString(),
+					});
+					await persistFn(completedRecord);
+					onStatus?.({
+						phase: "mutation",
+						event: "mutation_completed",
+						operationId: completedRecord.operationId,
+						attempt: completedRecord.attempt,
+					});
+					return true;
+				}
+				const uncertainRecord = Object.freeze({
+					...resume,
+					state: "uncertain",
+					outcome: "ambiguous",
+					attempt: (resume.attempt ?? 1) + 1,
+					recordedAt: new Date().toISOString(),
+				});
+				await persistFn(uncertainRecord);
+				onStatus?.({
+					phase: "mutation",
+					event: "mutation_postcondition_uncertain",
+					operationId: uncertainRecord.operationId,
+					attempt: uncertainRecord.attempt,
+					status: "uncertain",
+				});
+				return false;
+			}
+
+			// Never release a lock whose holder pid is alive and is not the caller.
+			onStatus?.({
+				phase: "mutation",
+				event: "mutation_postcondition_uncertain",
+				operationId: resume.operationId,
+				attempt: resume.attempt,
+				status: "uncertain",
+			});
+			return false;
 		}
 		let releasedValue = false;
 		const mutation = await executeMutation({
