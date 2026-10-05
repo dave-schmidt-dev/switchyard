@@ -324,6 +324,7 @@ test("runSandboxedNative terminates and fails on timeout", async () => {
 	writeFileSync(
 		fakeCli,
 		`#!${process.execPath}
+process.stderr.write("PROVIDER_TIMEOUT_STDERR_MARKER\\n");
 setInterval(() => {}, 1000);
 `,
 		{ mode: 0o755 },
@@ -338,7 +339,14 @@ setInterval(() => {}, 1000);
 				sandboxExec: item.shimPath,
 				timeoutMs: 150,
 			}),
-			/provider terminated before a verified completion/,
+			(error) => {
+				assert.match(
+					error.message,
+					/provider terminated before a verified completion/,
+				);
+				assert.doesNotMatch(error.message, /PROVIDER_TIMEOUT_STDERR_MARKER/u);
+				return true;
+			},
 		);
 	} finally {
 		item.cleanup();

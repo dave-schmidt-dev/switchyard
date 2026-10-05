@@ -329,7 +329,7 @@ export async function runSandboxedNative({
 			errorSize > MAX_OUTPUT
 		)
 			fail(
-				`provider terminated before a verified completion (code ${status.code ?? "none"}, signal ${status.signal ?? "none"}, error ${status.error?.code ?? "none"}; ${boundedText(Buffer.concat(errors)).slice(0, 300)})`,
+				`provider terminated before a verified completion (code ${status.code ?? "none"}, signal ${status.signal ?? "none"}, error ${status.error?.code ?? "none"})`,
 			);
 		const result = {
 			code: status.code,
