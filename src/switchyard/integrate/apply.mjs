@@ -11,16 +11,46 @@ import {
 	classifyApplyFailure,
 } from "./diff-validation.mjs";
 
+export const APPLY_COMMAND_TIMEOUT_MS = 60000;
+
+// Trusted test-only seam: shortens the apply command timeout so tests can
+// exercise the SIGKILL path without waiting 60 seconds. Only values strictly
+// shorter than the production bound are accepted, so the seam can never relax
+// the bound; the production value is never read from the environment or from
+// provider input.
+let applyCommandTimeoutForTests = null;
+
+export function setApplyCommandTimeoutForTests(timeoutMs) {
+	if (timeoutMs === null) {
+		applyCommandTimeoutForTests = null;
+		return;
+	}
+	if (
+		typeof timeoutMs !== "number" ||
+		!Number.isFinite(timeoutMs) ||
+		timeoutMs <= 0 ||
+		timeoutMs >= APPLY_COMMAND_TIMEOUT_MS
+	) {
+		throw new Error(
+			"apply command timeout seam accepts only timeouts shorter than the production bound",
+		);
+	}
+	applyCommandTimeoutForTests = timeoutMs;
+}
+
 function applyCheckPasses(args, diff, projectPath) {
 	const result = spawnSync("git", ["apply", ...args], {
 		cwd: projectPath,
 		input: diff,
 		encoding: "utf8",
 		maxBuffer: APPLY_CHECK_MAX_BUFFER,
+		timeout: applyCommandTimeoutForTests ?? APPLY_COMMAND_TIMEOUT_MS,
+		killSignal: "SIGKILL",
 	});
 	return {
 		ok: result.status === 0,
 		stderr: typeof result.stderr === "string" ? result.stderr : "",
+		timedOut: result.error?.code === "ETIMEDOUT",
 	};
 }
 
@@ -115,6 +145,8 @@ export function applyReviewedDiff(diff, projectPath, intent, touchedPaths) {
 				input: diff,
 				encoding: "utf8",
 				stdio: ["pipe", "pipe", "pipe"],
+				timeout: applyCommandTimeoutForTests ?? APPLY_COMMAND_TIMEOUT_MS,
+				killSignal: "SIGKILL",
 			});
 			if (result.status === 0) {
 				if (intent) {
@@ -136,6 +168,16 @@ export function applyReviewedDiff(diff, projectPath, intent, touchedPaths) {
 					}
 				}
 				return finish(true);
+			}
+			if (
+				result.error?.code === "ETIMEDOUT" ||
+				(result.status === null && result.signal === "SIGKILL")
+			) {
+				return finish({
+					applied: false,
+					reason: "git apply timed out",
+					reasonKind: "integration_state_unknown",
+				});
 			}
 			const stderr =
 				typeof result.stderr === "string" ? result.stderr.trim() : "";
@@ -162,8 +204,13 @@ export function applyReviewedDiff(diff, projectPath, intent, touchedPaths) {
 		// "Diff apply failed".
 		return finish({
 			applied: false,
-			reason: forward.stderr.trim() || "git apply --check rejected the diff",
-			reasonKind: classifyApplyFailure(forward.stderr),
+			reason:
+				(forward.timedOut
+					? "git apply --check timed out"
+					: forward.stderr.trim()) || "git apply --check rejected the diff",
+			reasonKind: forward.timedOut
+				? "conflict"
+				: classifyApplyFailure(forward.stderr),
 		});
 	} catch (error) {
 		return finish({
