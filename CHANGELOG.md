@@ -4,6 +4,16 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ## [Unreleased]
 
+### Added
+
+- `npm run cli:contract` (`scripts/check-cli-flag-contract.mjs`) checks every flag our tooling passes to a provider CLI against the installed CLI's own `--help`. The call sites are captured from the production argv builders: VM adapters across every roster invocation template, auth and liveness probes, the simple lane, and both BWS bridges. Other tools such as agent-headless can add theirs with `--contract FILE`. Flags missing from `--help` are probed against the CLI's parser, and a parser that rejects unknown flags can vouch for hidden ones. A failure names the CLI, version, flag and call sites. `--canary` adds one live request per CLI. This guards against a repeat of the 2026-10-02 incident, when Homebrew's opencode 2.0.20 dropped `opencode run --variant`/`--dir` and nothing noticed.
+- Provider-CLI cadence (`ops/cli-cadence/`, `npm run cli:cadence`, daily LaunchAgent template and installer). Each run reads every CLI's stable channel (claude's npm `stable` tag, not `latest`), reports host drift and host contract failures, and stages newer stable releases in scratch. It promotes only the releases whose strict flag contract and canary pass: the host is updated and re-checked, and the pins are committed on a local `cli-cadence/…` branch. Held bumps are never written or committed, and roster slots are never touched. pi (agent-headless only) is tracked too.
+- `generate-cli-manifest.sh --vibe-version` takes the release's source URL from the Homebrew formula the guest installs, falling back to its PyPI sdist.
+
+### Changed
+
+- `sync-host-clis.sh` installs the host's opencode as the exact pinned `opencode-ai` from npm, the same package as the golden image, instead of `brew upgrade opencode`. It refuses while Homebrew's unpinnable formula is installed. agent-headless now runs the pinned opencode, and Homebrew can no longer move it unattended.
+
 ### Removed
 
 - The `gc` and `reconcile-completion` operator subcommands, with their helpers (`apfs-private-bytes.py`, the external-completion reconciliation modules) and tests. `recover` keeps the shared root-cleanup logic. `backend-health`, `remediate-orphaned-locks` and `health attest-repair` stay: each has a live caller or contract.

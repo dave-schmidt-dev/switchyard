@@ -411,10 +411,12 @@ export function guestJobPaths(workspaceId) {
 	};
 }
 
-export function guestArgs(request, guestEnv) {
-	const paths = guestJobPaths(request.workspaceId);
-	const runtimeConfig = runtimeConfigFor(request.model, guestEnv);
-	const provider = [
+/**
+ * The supervised guest `opencode run` argv. Exported so the CLI flag contract
+ * (src/switchyard/cli-contract) checks exactly what this bridge runs.
+ */
+export function guestProviderArgv(request) {
+	return [
 		"sh",
 		"-c",
 		OPENCODE_SUPERVISOR,
@@ -430,6 +432,12 @@ export function guestArgs(request, guestEnv) {
 		request.model,
 		request.prompt,
 	];
+}
+
+export function guestArgs(request, guestEnv) {
+	const paths = guestJobPaths(request.workspaceId);
+	const runtimeConfig = runtimeConfigFor(request.model, guestEnv);
+	const provider = guestProviderArgv(request);
 	const detachedJob = [
 		"/usr/bin/nohup",
 		"/bin/bash",

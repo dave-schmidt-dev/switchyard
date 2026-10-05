@@ -31,14 +31,17 @@ readonly CURSOR_URL="https://cursor.com/install"
 readonly COPILOT_PACKAGE="@github/copilot"
 readonly OPENCODE_PACKAGE="opencode-ai"
 readonly VIBE_FORMULA="mistral-vibe"
-readonly VIBE_VERSION="2.25.0"
-readonly VIBE_SOURCE_URL="https://files.pythonhosted.org/packages/8d/aa/958dcc0bb2260d40c844283ebb90c95eca5ed54ec9cefcfbaab450f17d7c/mistral_vibe-2.25.0.tar.gz"
+# Default vibe pin. --vibe-version resolves another release's sdist from PyPI.
+readonly DEFAULT_VIBE_VERSION="2.25.0"
+readonly DEFAULT_VIBE_SOURCE_URL="https://files.pythonhosted.org/packages/8d/aa/958dcc0bb2260d40c844283ebb90c95eca5ed54ec9cefcfbaab450f17d7c/mistral_vibe-2.25.0.tar.gz"
 
 OUT_PATH="${SCRIPT_DIR}/cli-manifest.txt"
 CLAUDE_VERSION=""
 CODEX_VERSION=""
 COPILOT_VERSION=""
 OPENCODE_VERSION=""
+VIBE_VERSION="$DEFAULT_VIBE_VERSION"
+VIBE_SOURCE_URL="$DEFAULT_VIBE_SOURCE_URL"
 WORK_DIR=""
 
 log() {
@@ -62,11 +65,14 @@ Usage: generate-cli-manifest.sh --claude-version VERSION
                                 [--out PATH]
                                 [--copilot-version VERSION]
                                 [--opencode-version VERSION]
+                                [--vibe-version VERSION]
 
 Writes the seven-row CLI manifest. claude and codex versions are required.
 npm versions default to whatever the registry currently publishes as `latest`;
-pin them explicitly to reproduce an older manifest. Use --out - to write to
-stdout instead of a file.
+pin them explicitly to reproduce an older manifest. vibe defaults to the
+release pinned in this script; --vibe-version takes that release's source from
+the Homebrew formula (or, failing that, its PyPI sdist). Use --out - to write
+to stdout instead of a file.
 USAGE
 }
 
@@ -98,6 +104,12 @@ parse_args() {
         OPENCODE_VERSION="$2"
         shift 2
         ;;
+      --vibe-version)
+        [[ $# -ge 2 ]] || fail "--vibe-version requires a value"
+        VIBE_VERSION="$2"
+        VIBE_SOURCE_URL=""
+        shift 2
+        ;;
       -h | --help)
         usage
         exit 0
@@ -119,6 +131,37 @@ parse_args() {
     fail "invalid copilot version: $COPILOT_VERSION"
   [[ -z "$OPENCODE_VERSION" || "$OPENCODE_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
     fail "invalid opencode version: $OPENCODE_VERSION"
+  [[ "$VIBE_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]] ||
+    fail "invalid vibe version: $VIBE_VERSION"
+}
+
+# The source archive the guest will hash for a mistral-vibe release. The guest
+# installs the Homebrew formula and verifies the formula's own stable source, so
+# that URL is authoritative while the formula is at the requested version; a
+# PyPI sdist is the fallback for an older pin (2.25.8 ships wheels only, so the
+# formula is the only source for it).
+resolve_vibe_source_url() {
+  local url="" metadata="${WORK_DIR}/vibe-pypi.json"
+  if command -v brew >/dev/null 2>&1; then
+    url="$(brew info --json=v2 "$VIBE_FORMULA" 2>/dev/null | python3 -c '
+import json, sys
+f = json.load(sys.stdin)["formulae"][0]
+print(f["urls"]["stable"]["url"] if f["versions"]["stable"] == sys.argv[1] else "")
+' "$VIBE_VERSION" 2>/dev/null || true)"
+  fi
+  if [[ -z "$url" ]]; then
+    fetch_installer "https://pypi.org/pypi/${VIBE_FORMULA}/${VIBE_VERSION}/json" "$metadata"
+    url="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    urls = json.load(f).get("urls", [])
+sdists = [u["url"] for u in urls if u.get("packagetype") == "sdist"]
+print(sdists[0] if len(sdists) == 1 else "")
+' "$metadata" 2>/dev/null || true)"
+  fi
+  [[ "$url" == https://* ]] ||
+    fail "no source archive for ${VIBE_FORMULA} ${VIBE_VERSION}: Homebrew's formula is not at that version and PyPI publishes no sdist for it"
+  printf '%s\n' "$url"
 }
 
 require_host_tools() {
@@ -314,6 +357,7 @@ main() {
   parse_args "$@"
   require_host_tools
   WORK_DIR="$(mktemp -d)"
+  [[ -n "$VIBE_SOURCE_URL" ]] || VIBE_SOURCE_URL="$(resolve_vibe_source_url)"
 
   local rendered="${WORK_DIR}/manifest.txt"
   emit_manifest >"$rendered"

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Switchyard provider-CLI cadence (LaunchAgent).
+
+  TEMPLATE: ops/cli-cadence/install-cli-cadence.sh copies cli-cadence.sh out of
+  the project, substitutes the double-underscore placeholders and writes the rendered plist to
+  the launchd directory. Do not load this template directly.
+
+  Daily: read each CLI's stable channel, check host drift and the flag
+  contract, stage newer stable releases in scratch, and promote only the ones
+  whose flag contract and canary pass (pins land on a local git branch, never
+  pushed). The owner is told through the configured notifier (or a macOS notification).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.zerodelta.switchyard.cli-cadence</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__CADENCE_SH__</string>
+	</array>
+
+	<!-- Daily at 06:41 local, before the working day; a missed run (asleep)
+	     fires at next wake. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>6</integer>
+		<key>Minute</key>
+		<integer>41</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SWITCHYARD_CLI_CADENCE_MODE</key>
+		<string>__MODE__</string>
+		<key>SWITCHYARD_CLI_CADENCE_NOTIFY</key>
+		<string>__NOTIFY__</string>
+	</dict>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+
+	<key>StandardOutPath</key>
+	<string>__CADENCE_OUT__</string>
+	<key>StandardErrorPath</key>
+	<string>__CADENCE_ERR__</string>
+</dict>
+</plist>

@@ -145,9 +145,18 @@ run_bounded() {
   wait "$pid"
 }
 
-# The documented updater for each host install. Homebrew casks and formulae
-# cannot pin, so they move to whatever brew publishes; the caller verifies the
-# result against the pin. uv can pin, so vibe is installed at exactly the pin.
+# opencode is pinned on the host like everywhere else, from the same npm package
+# the guest installs. Homebrew's formula tracks its own (2.x) line and cannot
+# pin; an unattended `brew upgrade` moving it to 2.0.20 is what broke
+# agent-headless on 2026-10-02. A Homebrew opencode would also own the same
+# /opt/homebrew/bin/opencode link, so it must be removed first, by the owner.
+opencode_brew_conflict() {
+  brew list --formula opencode >/dev/null 2>&1
+}
+
+# The documented updater for each host install. Homebrew casks cannot pin, so
+# they move to whatever brew publishes; the caller verifies the result against
+# the pin. npm and uv can pin, so opencode and vibe land on exactly the pin.
 host_update() {
   local provider="$1" version="$2"
   case "$provider" in
@@ -156,14 +165,20 @@ host_update() {
     copilot) run_bounded "$UPDATE_TIMEOUT_SECONDS" copilot update ;;
     cursor-agent) run_bounded "$UPDATE_TIMEOUT_SECONDS" cursor-agent update ;;
     agy) run_bounded "$UPDATE_TIMEOUT_SECONDS" agy update ;;
-    opencode) run_bounded "$UPDATE_TIMEOUT_SECONDS" brew upgrade opencode ;;
+    opencode)
+      if opencode_brew_conflict; then
+        log "ERROR: Homebrew's opencode formula is installed; it cannot hold the pin. Run: brew uninstall opencode"
+        return 1
+      fi
+      run_bounded "$UPDATE_TIMEOUT_SECONDS" npm install --global "opencode-ai@$version"
+      ;;
     vibe) run_bounded "$UPDATE_TIMEOUT_SECONDS" uv tool install --force "mistral-vibe==$version" ;;
     *) fail "no host updater for $provider" ;;
   esac
 }
 
 parse_args "$@"
-for tool in brew uv; do
+for tool in brew npm uv; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing host tool: $tool"
 done
 

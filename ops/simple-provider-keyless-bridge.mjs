@@ -27,7 +27,13 @@ const SELF = fileURLToPath(import.meta.url);
 const SAFE_PATH =
 	"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const VIBE = "/Users/dave/.local/share/uv/tools/mistral-vibe/bin/vibe";
-const OPENCODE = resolve(dirname(SELF), "../.tools/opencode-v1.18.30/opencode");
+/** Version of the vendored OpenCode runtime; the flag contract checks its argv. */
+export const KEYLESS_OPENCODE_VERSION = "1.18.30";
+export const KEYLESS_OPENCODE_PATH = resolve(
+	dirname(SELF),
+	`../.tools/opencode-v${KEYLESS_OPENCODE_VERSION}/opencode`,
+);
+const OPENCODE = KEYLESS_OPENCODE_PATH;
 const OPENCODE_SHA256 =
 	"2d0c9c339bb91046c6ea951c97664bc2f8a8eaca707f31fbfbb7bc73c4eddc62";
 const VIBE_RUNTIME = "/Users/dave/.local/share/uv/tools/mistral-vibe";
@@ -569,6 +575,35 @@ function renderOpenCodeConfig(port) {
 		},
 	});
 }
+/**
+ * The fixed CLI argv for each keyless target. Exported so the CLI flag contract
+ * (src/switchyard/cli-contract) checks exactly what this bridge spawns.
+ */
+export function keylessCliArgs(target, { worktree, variant, model }) {
+	if (target === "vibe")
+		return [
+			"-p",
+			"--agent",
+			"accept-edits",
+			"--auto-approve",
+			"--trust",
+			"--workdir",
+			worktree,
+			"--output",
+			"json",
+		];
+	return [
+		"run",
+		"--pure",
+		"--agent",
+		"build",
+		"--auto",
+		"--variant",
+		variant,
+		"--model",
+		model,
+	];
+}
 function verifyVibeSession(runtime, model) {
 	const sessions = join(runtime, "vibe", "logs", "session");
 	if (!existsSync(sessions)) return false;
@@ -727,7 +762,6 @@ export async function runBridge({
 			OPENCODE_DISABLE_TELEMETRY: "1",
 			VIBE_DISABLE_TELEMETRY: "1",
 		};
-		let args;
 		if (target === "vibe") {
 			env.VIBE_HOME = join(runtime, "vibe");
 			env.MISTRAL_API_KEY = proxy.nonce;
@@ -743,32 +777,11 @@ export async function runBridge({
 				join(runtime, "vibe-config.toml"),
 				join(env.VIBE_HOME, "config.toml"),
 			);
-			args = [
-				"-p",
-				"--agent",
-				"accept-edits",
-				"--auto-approve",
-				"--trust",
-				"--workdir",
-				worktree,
-				"--output",
-				"json",
-			];
 		} else {
 			env.OPENCODE_API_KEY = proxy.nonce;
 			env.OPENCODE_CONFIG_CONTENT = renderOpenCodeConfig(proxy.port);
-			args = [
-				"run",
-				"--pure",
-				"--agent",
-				"build",
-				"--auto",
-				"--variant",
-				variant,
-				"--model",
-				model,
-			];
 		}
+		const args = keylessCliArgs(target, { worktree, variant, model });
 		const sandbox = "/usr/bin/sandbox-exec";
 		child = spawn(sandbox, ["-p", profile, actualCli, ...args], {
 			cwd: worktree,
