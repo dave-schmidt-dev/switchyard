@@ -33,6 +33,11 @@ export async function handleSimple(argv, dependencies = {}) {
 	const onSigterm = () => onInterrupt("SIGTERM");
 	signalProcess.on("SIGINT", onSigint);
 	signalProcess.on("SIGTERM", onSigterm);
+	const writeStderr =
+		dependencies.writeStderr ??
+		(dependencies.stderr?.write
+			? (text) => dependencies.stderr.write(text)
+			: (text) => process.stderr.write(text));
 	let result;
 	try {
 		try {
@@ -94,6 +99,35 @@ export async function handleSimple(argv, dependencies = {}) {
 				failedTargetIds: routing.failedTargetIds,
 			};
 		} catch (error) {
+			const isUsage = error instanceof SimpleUsageError;
+			let usageError;
+			let preflightCode;
+			if (isUsage) {
+				usageError = String(error?.message ?? "")
+					.replace(/[\p{Cc}]/gu, "")
+					.slice(0, 300);
+				writeStderr(`switchyard simple: ${usageError}\n`);
+			} else {
+				const safeCode =
+					typeof error?.code === "string" &&
+					/^[A-Za-z_]{1,64}$/.test(error.code)
+						? error.code
+						: null;
+				if (safeCode !== null) {
+					preflightCode = safeCode;
+					writeStderr(`switchyard simple: preflight failed (${safeCode})\n`);
+				} else {
+					preflightCode = "uncoded";
+					const rawName = error?.constructor?.name;
+					const constructorName =
+						typeof rawName === "string" && /^[A-Za-z]{1,40}$/.test(rawName)
+							? rawName
+							: "uncoded";
+					writeStderr(
+						`switchyard simple: preflight failed (${constructorName})\n`,
+					);
+				}
+			}
 			result = {
 				schemaVersion: 1,
 				taskId: null,
@@ -103,15 +137,10 @@ export async function handleSimple(argv, dependencies = {}) {
 				elapsedMs: Math.max(0, now() - startedAt),
 				changedFiles: [],
 				checks: [],
-				failureReason:
-					error instanceof SimpleUsageError
-						? "invalid_invocation"
-						: "preflight_failed",
+				failureReason: isUsage ? "invalid_invocation" : "preflight_failed",
 				failurePhase: "preflight",
-				errorKind:
-					error instanceof SimpleUsageError
-						? "validation_failed"
-						: "unclassified_failure",
+				errorKind: isUsage ? "validation_failed" : "unclassified_failure",
+				...(isUsage ? { usageError } : { preflightCode }),
 				partialWorktree: null,
 				recovery: recoveryUnavailable(),
 			};

@@ -88,6 +88,40 @@ function declaredFilesChanged(worktreePath, files, baseline) {
 		);
 	});
 }
+const DEADLINE_CHANGED_FILES_TIMEOUT_MS = 5000;
+
+export function captureDeadlineChangedFiles({
+	worktreePath,
+	worktreeBaseRevision,
+	worktreeGitControl,
+	writerLifecycle,
+}) {
+	if (
+		(writerLifecycle !== "stopped" && writerLifecycle !== "never_started") ||
+		!worktreePath ||
+		!worktreeBaseRevision ||
+		!worktreeGitControl
+	) {
+		return [];
+	}
+	try {
+		const guarded = (args, code) => {
+			verifyGitControl(worktreePath, worktreeGitControl);
+			return requireWorktreeGit(worktreePath, args, code, {
+				timeout: DEADLINE_CHANGED_FILES_TIMEOUT_MS,
+			});
+		};
+		guarded(["add", "-A", "--", "."], "diff_stage_failed");
+		const changed = guarded(
+			["diff", "--cached", "--name-only", "-z", worktreeBaseRevision],
+			"diff_names_failed",
+		);
+		return changed.split("\0").filter(Boolean);
+	} catch (error) {
+		if (error?.code === "git_control_tampered") throw error;
+		return [];
+	}
+}
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
 	const taskId = dependencies.taskId ?? randomUUID();
@@ -1178,11 +1212,23 @@ export async function runSimpleTask(options, dependencies = {}) {
 				keepWorktree = changedFiles.length > 0;
 			} else {
 				keepWorktree = true;
+				changedFiles = captureDeadlineChangedFiles({
+					worktreePath,
+					worktreeBaseRevision,
+					worktreeGitControl,
+					writerLifecycle,
+				});
 			}
 			return fail(classifyExecutionFailure(providerResult), "execute");
 		}
 		if (remainingMs(options.deadlineMs, now) <= 0) {
 			keepWorktree = true;
+			changedFiles = captureDeadlineChangedFiles({
+				worktreePath,
+				worktreeBaseRevision,
+				worktreeGitControl,
+				writerLifecycle,
+			});
 			return fail("deadline_expired", "checks");
 		}
 		currentPhase = "diff";
