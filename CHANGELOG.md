@@ -7,6 +7,9 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 ### Added
 
 - Simple dispatch can run Claude Code (`--only-provider claude-code`, Haiku 4.5, Sonnet 5.5 or Opus 5.5 with an explicit effort) in a native Seatbelt sandbox on its own subscription login. It is never chosen automatically, and auth, missing-model and usage-limit failures are classified for routing.
+- `switchyard-dispatch routing-run release-partial --task-id <id> [--discard]` frees a retained partial worktree after the captain salvages it, so the routing run can continue without losing its failure memory. It verifies the worktree claim and refuses symlinks, a held project lock or ambiguous cleanup.
+- A failed simple check now keeps its last 16 KiB of output and stderr under the run's owner-only `check-evidence/` directory (`<attempt>-<check position>.log`, attempt 0 is the baseline), and the result carries only that path. Diff rejections report a closed reason kind and up to five bounded, control-character-free paths.
+- Simple run records now move to `running` with `startedAt` when the provider starts and record a throttled heartbeat, instead of staying `created` until integration.
 - Simple routing logs every failed attempt and every non-complete stop to `<stateRoot>/failure-log/failures.jsonl` (allowlisted fields only, rotated, best-effort), and `switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]` groups them by fingerprint for periodic routing and provider tuning.
 
 ### Removed
@@ -15,12 +18,24 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The seam-move and module-split refactor tooling (`check:seams`, `split:module`, their scripts and tests, and the direct `oxc-parser` devDependency).
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
 
+### Security
+
+- Host git calls on a provider-writable disposable clone pin `core.fsmonitor`, `core.hooksPath`, `diff.external`, `core.attributesFile` and `core.commitGraph`, and the clone's `.git` control state is snapshotted before the provider runs and verified, case-insensitively, before every host git read. Tampered, unreadable or redirected control state (hooks, config, alternates, http-alternates, replace refs) fails closed as `unsafe_diff` with diagnostic `git_control_tampered` and a closed-enum `gitControlTamper {kind, area}`; a trusted shared-clone detach is accepted.
+
 ### Changed
 
+- Biome now fails on unused imports, variables and function parameters; existing unused imports and exports were removed.
 - Simple routing now separates hard and soft failures. Failed checks, empty diffs, provider errors, provider-phase environment failures and scope rejections move on to the next eligible tier 1 or tier 2 target (up to four attempts per task) instead of stopping the run; baseline, cleanup, cancellation, input, lock and run-store failures still stop. `native_required` reports whether capacity or task failures exhausted the targets, and every answer lists retained partial worktrees.
 
 ### Fixed
 
+- Integration `git apply` check and apply subprocesses stop after 60 seconds (SIGKILL). A timed-out check reports `conflict`; a timed-out mutating apply reports `integration_state_unknown`.
+- A simple run that hits its deadline now reports the files the provider changed so far.
+- `simple --json` failures carry a sanitized `usageError` or `preflightCode` instead of a bare failure.
+- An uncertain idempotent project-lock release is retried once when the holder is provably dead or is the current process. `remediate-orphaned-locks` reports `release_uncertain` truthfully and refuses when ownership cannot be confirmed; a live foreign holder is never released.
+- Native launcher failure messages no longer include provider stderr excerpts.
+- The bulk-transfer helper tolerates a `prlctl` child that exits before reading its stdin (EPIPE/ECONNRESET) and leaves the outcome to the bounded retry.
+- Broker, provider-lifecycle and quick-check fixtures wait on observable events instead of wall-clock sleeps, so they hold under parallel host load.
 - Dispatch checks no longer hang or fail on process-group cleanup, `/bin/sh` scripts or temp-path resolution: the quick-check sandbox now lets a check signal processes in its own sandbox, read the `/private/var/select` shell link, and read metadata on the `/var`, `/tmp` and `/etc` links.
 - Integration now rejects incomplete Git metadata and stops stalled metadata checks after 30 seconds, preventing unsafe acceptance and indefinite waits.
 
