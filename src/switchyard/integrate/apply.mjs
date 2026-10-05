@@ -50,7 +50,9 @@ function applyCheckPasses(args, diff, projectPath) {
 	return {
 		ok: result.status === 0,
 		stderr: typeof result.stderr === "string" ? result.stderr : "",
-		timedOut: result.error?.code === "ETIMEDOUT",
+		timedOut:
+			result.error?.code === "ETIMEDOUT" ||
+			(result.status === null && result.signal === "SIGKILL"),
 	};
 }
 

@@ -274,28 +274,42 @@ function gitControlEntry(stats) {
 		mtimeMs: stats.mtimeMs,
 	};
 }
+// An entry that vanished mid-walk is reported by the comparison; any other
+// inspection error (for example a provider chmod 000) is tampering, so it can
+// never surface as an ordinary failure that retains the checkout.
+function inspectGitControl(path, inspect) {
+	try {
+		return inspect();
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw gitControlTampered(`cannot inspect .git/${path}`);
+	}
+}
 function collectGitControlEntries(gitDir) {
 	const entries = new Map();
 	const pending = [["", gitDir]];
 	while (pending.length > 0) {
 		const [relative, absolute] = pending.pop();
-		for (const dirent of readdirSync(absolute, { withFileTypes: true })) {
+		const dirents =
+			inspectGitControl(relative, () =>
+				readdirSync(absolute, { withFileTypes: true }),
+			) ?? [];
+		for (const dirent of dirents) {
 			const childRelative = relative
 				? `${relative}/${dirent.name}`
 				: dirent.name;
 			const childAbsolute = join(absolute, dirent.name);
-			let stats;
-			try {
-				stats = lstatSync(childAbsolute);
-			} catch (error) {
-				if (error?.code === "ENOENT") continue;
-				throw error;
-			}
+			const stats = inspectGitControl(childRelative, () =>
+				lstatSync(childAbsolute),
+			);
+			if (stats === null) continue;
 			const entry = gitControlEntry(stats);
 			if (entry.type === "file") {
-				entry.sha256 = createHash("sha256")
-					.update(readFileSync(childAbsolute))
-					.digest("hex");
+				const bytes = inspectGitControl(childRelative, () =>
+					readFileSync(childAbsolute),
+				);
+				if (bytes === null) continue;
+				entry.sha256 = createHash("sha256").update(bytes).digest("hex");
 			}
 			entries.set(childRelative, entry);
 			if (entry.type === "directory")
@@ -321,6 +335,11 @@ function snapshotGitControl(worktreePath) {
 		entries: collectGitControlEntries(gitDir),
 	};
 }
+const ALTERNATES_PATH = "objects/info/alternates";
+const OBJECT_LOOKUP_REDIRECTS = new Set([
+	ALTERNATES_PATH,
+	"objects/info/http-alternates",
+]);
 function providerWritableGitPath(path) {
 	if (
 		[
@@ -330,11 +349,17 @@ function providerWritableGitPath(path) {
 			"FETCH_HEAD",
 			"COMMIT_EDITMSG",
 			"packed-refs",
+			// Dumb-transport ref list written by update-server-info (run by
+			// repack); local git never reads it.
+			"info/refs",
 		].includes(path)
 	)
 		return true;
+	// objects/info/alternates and http-alternates redirect object lookup
+	// outside the clone; the rest of objects/info (packs, commit-graph) is data
+	// that a trusted shared-clone detach (`repack -a -d`) or git itself writes.
 	if (path === "objects" || path.startsWith("objects/"))
-		return !(path === "objects/info" || path.startsWith("objects/info/"));
+		return !OBJECT_LOOKUP_REDIRECTS.has(path);
 	if (path === "refs" || path.startsWith("refs/"))
 		return !(path === "refs/replace" || path.startsWith("refs/replace/"));
 	return path === "logs" || path.startsWith("logs/");
@@ -359,7 +384,11 @@ function packedRefsFileNamesReplaceRef(gitDir) {
 		return true;
 	}
 }
+// A directory's own size and mtime move whenever a child is added or removed;
+// those children are judged individually, so directories compare by identity.
 function gitControlEntryChanged(before, current) {
+	if (before.type === "directory" && current.type === "directory")
+		return before.dev !== current.dev || before.ino !== current.ino;
 	return (
 		before.type !== current.type ||
 		before.dev !== current.dev ||
@@ -417,8 +446,14 @@ function verifyGitControl(worktreePath, snapshot) {
 		)
 			throw gitControlTampered("packed-refs names refs/replace/");
 	}
+	// Removing alternates only narrows object lookup to the clone itself; the
+	// native launcher does exactly this when it detaches a shared clone.
 	for (const path of snapshot.entries.keys()) {
-		if (!current.has(path) && !providerWritableGitPath(path))
+		if (
+			!current.has(path) &&
+			path !== ALTERNATES_PATH &&
+			!providerWritableGitPath(path)
+		)
 			throw gitControlTampered(`removed .git/${path}`);
 	}
 }

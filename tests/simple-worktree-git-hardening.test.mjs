@@ -2,6 +2,7 @@ import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";
 import {
 	appendFileSync,
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
@@ -13,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
+import { detachSharedClone } from "../ops/simple-native-launcher-core.mjs";
 import {
 	snapshotGitControl,
 	verifyGitControl,
@@ -333,6 +335,42 @@ describe("git control verification", () => {
 		throws(() => verifyGitControl(clonePath, snapshot), {
 			code: "git_control_tampered",
 		});
+	});
+
+	it("accepts a shared-clone detach that repacks and removes alternates", () => {
+		const { clonePath } = makeClone();
+		ok(existsSync(join(clonePath, ".git", "objects", "info", "alternates")));
+		const snapshot = snapshotGitControl(clonePath);
+		detachSharedClone(clonePath);
+		ok(!existsSync(join(clonePath, ".git", "objects", "info", "alternates")));
+		verifyGitControl(clonePath, snapshot);
+	});
+
+	it("rejects a written .git/objects/info/http-alternates", () => {
+		const { clonePath } = makeClone();
+		const snapshot = snapshotGitControl(clonePath);
+		writeFileSync(
+			join(clonePath, ".git", "objects", "info", "http-alternates"),
+			"https://example.invalid/objects\n",
+		);
+		throws(() => verifyGitControl(clonePath, snapshot), {
+			code: "git_control_tampered",
+		});
+	});
+
+	it("rejects an unreadable .git entry as tampering", (t) => {
+		if (process.getuid?.() === 0) return t.skip("root bypasses file modes");
+		const { clonePath } = makeClone();
+		const snapshot = snapshotGitControl(clonePath);
+		const config = join(clonePath, ".git", "config");
+		chmodSync(config, 0o000);
+		try {
+			throws(() => verifyGitControl(clonePath, snapshot), {
+				code: "git_control_tampered",
+			});
+		} finally {
+			chmodSync(config, 0o644);
+		}
 	});
 
 	it("rejects a gitfile replacing .git", () => {
