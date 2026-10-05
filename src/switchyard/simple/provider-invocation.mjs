@@ -7,9 +7,10 @@ import {
 import { runProviderProcess } from "../adapter/provider-lifecycle.mjs";
 import {
 	MAX_CAPTURE_BYTES,
-	requireGit,
+	requireWorktreeGit,
 	SECRET_PATHS,
 	SIMPLE_TARGET_ADAPTERS,
+	verifyGitControl,
 } from "./args.mjs";
 import { resolveCheckExecution } from "./check-execution.mjs";
 import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
@@ -459,19 +460,27 @@ async function defaultRunCheck({
 		},
 	);
 }
-function captureWorktreeDiff(worktreePath, baseRevision, deadlineMs, now) {
-	requireGit(worktreePath, ["add", "-A", "--", "."], "diff_stage_failed", {
+function captureWorktreeDiff(
+	worktreePath,
+	baseRevision,
+	deadlineMs,
+	now,
+	gitControlSnapshot,
+) {
+	const guarded = (args, code, options) => {
+		verifyGitControl(worktreePath, gitControlSnapshot);
+		return requireWorktreeGit(worktreePath, args, code, options);
+	};
+	guarded(["add", "-A", "--", "."], "diff_stage_failed", {
 		timeout: deadlineTimeout(deadlineMs, now),
 	});
-	const changed = requireGit(
-		worktreePath,
+	const changed = guarded(
 		["diff", "--cached", "--name-only", "-z", baseRevision],
 		"diff_names_failed",
 		{ timeout: deadlineTimeout(deadlineMs, now) },
 	);
 	const changedFiles = changed.split("\0").filter(Boolean);
-	const diff = requireGit(
-		worktreePath,
+	const diff = guarded(
 		["diff", "--cached", "--binary", "--full-index", baseRevision],
 		"diff_capture_failed",
 		{

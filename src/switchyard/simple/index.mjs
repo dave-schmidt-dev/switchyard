@@ -65,6 +65,29 @@ import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
 import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { createSimpleRouteSelection } from "./route-selection.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
+
+function declaredFileStat(worktreePath, path) {
+	try {
+		const stats = lstatSync(join(worktreePath, path));
+		return { size: stats.size, mtimeMs: stats.mtimeMs, ino: stats.ino };
+	} catch {
+		return null;
+	}
+}
+/** First-change probe: lstat only, so no host git runs while the provider is live. */
+function declaredFilesChanged(worktreePath, files, baseline) {
+	return files.some((path) => {
+		const current = declaredFileStat(worktreePath, path);
+		const before = baseline.get(path) ?? null;
+		if ((before === null) !== (current === null)) return true;
+		return (
+			current !== null &&
+			(before.size !== current.size ||
+				before.mtimeMs !== current.mtimeMs ||
+				before.ino !== current.ino)
+		);
+	});
+}
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
 	const taskId = dependencies.taskId ?? randomUUID();
@@ -115,6 +138,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
 	let worktreeIdentity = null;
+	let worktreeGitControl = null;
+	let gitControlTampered = false;
 	let worktreeCleanupReason = null;
 	let executionFailureCaptureComplete = false;
 	let lastMilestoneAt = startedAt;
@@ -299,6 +324,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (
 			worktreePath &&
 			!signal?.aborted &&
+			!gitControlTampered &&
 			!(currentPhase === "execute" && executionFailureCaptureComplete) &&
 			(remainingMs(options.deadlineMs, now) <= 0 ||
 				(currentPhase === "execute" && !keepWorktree))
@@ -448,6 +474,21 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		return finalResult;
 	};
+	const failGitControlTampered = (failurePhase) => {
+		// A checkout whose git control was tampered with has no salvage value:
+		// it is never retained, and no further host git runs against it.
+		gitControlTampered = true;
+		keepWorktree = false;
+		providerExecutionResult = {
+			...(providerExecutionResult ?? { success: false, code: null }),
+			diagnosticCode: "git_control_tampered",
+			diagnosticOrigin: "harness",
+			diagnosticEvidenceAvailable: true,
+		};
+		const result = fail("unsafe_diff", failurePhase, "policy_violation");
+		result.diagnosticCode = "git_control_tampered";
+		return result;
+	};
 	const failForSignal = (failurePhase = currentPhase) => {
 		if (!signal?.aborted) return null;
 		if (worktreePath) {
@@ -459,12 +500,20 @@ export async function runSimpleTask(options, dependencies = {}) {
 			} else if (changedFiles.length > 0) {
 				keepWorktree = true;
 			} else {
-				const status = git(worktreePath, [
-					"status",
-					"--porcelain=v1",
-					"--untracked-files=all",
-				]);
-				keepWorktree = status.status !== 0 || status.stdout.length > 0;
+				try {
+					if (worktreeGitControl)
+						verifyGitControl(worktreePath, worktreeGitControl);
+					const status = worktreeGit(worktreePath, [
+						"status",
+						"--porcelain=v1",
+						"--untracked-files=all",
+					]);
+					keepWorktree = status.status !== 0 || status.stdout.length > 0;
+				} catch (error) {
+					if (error?.code === "git_control_tampered")
+						return failGitControlTampered(failurePhase);
+					keepWorktree = true;
+				}
 			}
 		}
 		return fail("provider_cancelled", failurePhase, "execution_failed");
@@ -798,17 +847,21 @@ export async function runSimpleTask(options, dependencies = {}) {
 				now,
 			});
 		}
+		// Snapshot git control before any untrusted code (baseline checks or
+		// provider) can touch the clone; every later host git call verifies it.
+		worktreeGitControl = snapshotGitControl(worktreePath);
 
 		let baselineCheckPath = worktreePath;
 		if (
 			!dependencies.runCheck &&
 			[...options.checks, ...(options.baselineChecks ?? [])].length
 		) {
+			verifyGitControl(worktreePath, worktreeGitControl);
 			checkSessions = createSimpleCheckSessions({
 				taskRoot: worktreeRoot,
 				projectPath: options.projectPath,
 				baseRevision,
-				baseTree: requireGit(
+				baseTree: requireWorktreeGit(
 					worktreePath,
 					["rev-parse", "HEAD^{tree}"],
 					"check_session_base_unavailable",
@@ -839,7 +892,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 			now,
 			signal,
 			runCheck,
-			git,
+			gitControlSnapshot: checkSessions
+				? checkSessions.gitControlSnapshot
+				: worktreeGitControl,
 			onStatus: (event) => {
 				if (event.checkIndex !== undefined) {
 					failingCheckIndex = event.checkIndex;
@@ -1020,6 +1075,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 			currentPhase = "execute";
 			providerStarted = true;
 			writerLifecycle = "unavailable";
+			const declaredFileBaseline = new Map(
+				options.files.map((path) => [
+					path,
+					declaredFileStat(worktreePath, path),
+				]),
+			);
 			const execution = executeProvider({
 				targetId,
 				harness,
@@ -1038,14 +1099,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 							FIRST_CHANGE_PROBE_INTERVAL_MS
 					) {
 						lastFirstChangeProbeAt = progressObservedAt;
-						const observed = git(worktreePath, [
-							"status",
-							"--porcelain=v1",
-							"--untracked-files=all",
-							"--",
-							...options.files,
-						]);
-						if (observed.status === 0 && observed.stdout.length > 0) {
+						if (
+							declaredFilesChanged(
+								worktreePath,
+								options.files,
+								declaredFileBaseline,
+							)
+						) {
 							firstChangeObserved = true;
 							milestone("execute", "first_change_observed");
 							return;
@@ -1111,6 +1171,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
+					worktreeGitControl,
 				);
 				changedFiles = captured.changedFiles;
 				executionFailureCaptureComplete = true;
@@ -1131,6 +1192,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			worktreeBaseRevision,
 			options.deadlineMs,
 			now,
+			worktreeGitControl,
 		);
 		changedFiles = captured.changedFiles;
 		if (changedFiles.length > 0 && !firstChangeObserved) {
@@ -1294,6 +1356,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
+					worktreeGitControl,
 				);
 				changedFiles = capturedDiff.changedFiles;
 				const repairUndeclared = changedFiles.filter(
@@ -1499,6 +1562,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
+					worktreeGitControl,
 				);
 				changedFiles = capturedDiff.changedFiles;
 				const correctedUndeclared = changedFiles.filter(
@@ -1869,6 +1933,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 		milestone("terminal", "succeeded");
 		return finalResult;
 	} catch (error) {
+		if (error?.code === "git_control_tampered")
+			return failGitControlTampered(currentPhase);
 		if (checkSessions && changedFiles.length > 0) keepWorktree = true;
 		const failureReason =
 			typeof error?.code === "string" ? error.code : "simple_execution_failed";
@@ -1991,7 +2057,15 @@ import "./funding.mjs";
 import "./provider-invocation.mjs";
 import "./recovery.mjs";
 import "./overlay.mjs";
-import { git, MAX_CAPTURE_BYTES, requireGit, SECRET_PATHS } from "./args.mjs";
+import {
+	MAX_CAPTURE_BYTES,
+	requireGit,
+	requireWorktreeGit,
+	SECRET_PATHS,
+	snapshotGitControl,
+	verifyGitControl,
+	worktreeGit,
+} from "./args.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
 	declaredPathsAreClean,

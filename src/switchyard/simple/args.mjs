@@ -1,6 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	lstatSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { manifestReviewPaths } from "../integrate/index.mjs";
 import { validateRoutingRunId } from "./routing-state.mjs";
@@ -189,6 +196,231 @@ function requireGit(projectPath, args, code, options = {}) {
 		throw error;
 	}
 	return result.stdout;
+}
+const WORKTREE_GIT_CONFIG = [
+	"-c",
+	"core.fsmonitor=false",
+	"-c",
+	"core.hooksPath=/dev/null",
+	"-c",
+	"core.untrackedCache=false",
+	"-c",
+	"diff.external=",
+	"-c",
+	"core.attributesFile=/dev/null",
+];
+function gitControlTampered(reason) {
+	return Object.assign(new Error(`git_control_tampered: ${reason}`), {
+		code: "git_control_tampered",
+	});
+}
+/**
+ * Host git against a provider-writable clone. The git-dir and work-tree are
+ * pinned, system and global config are dropped, hooks, fsmonitor, the
+ * untracked cache, attribute files and external diff drivers are disabled,
+ * and replace refs are ignored.
+ */
+function worktreeGit(worktreePath, args, options = {}) {
+	const hardenedArgs =
+		args[0] === "diff"
+			? ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1)]
+			: args;
+	return spawnSync(
+		"git",
+		[
+			"--git-dir",
+			join(worktreePath, ".git"),
+			"--work-tree",
+			worktreePath,
+			...WORKTREE_GIT_CONFIG,
+			...hardenedArgs,
+		],
+		{
+			cwd: worktreePath,
+			encoding: options.encoding ?? "utf8",
+			env: {
+				PATH: process.env.PATH,
+				HOME: process.env.HOME,
+				LANG: "C",
+				GIT_CONFIG_NOSYSTEM: "1",
+				GIT_CONFIG_GLOBAL: "/dev/null",
+				GIT_CEILING_DIRECTORIES: dirname(worktreePath),
+				GIT_NO_REPLACE_OBJECTS: "1",
+			},
+			input: options.input,
+			maxBuffer: options.maxBuffer ?? MAX_CAPTURE_BYTES,
+			timeout: options.timeout,
+			stdio: ["pipe", "pipe", "pipe"],
+		},
+	);
+}
+function requireWorktreeGit(worktreePath, args, code, options = {}) {
+	const result = worktreeGit(worktreePath, args, options);
+	if (result.status !== 0) {
+		const failureCode =
+			result.error?.code === "ETIMEDOUT" ? "deadline_expired" : code;
+		const error = new Error(failureCode);
+		error.code = failureCode;
+		throw error;
+	}
+	return result.stdout;
+}
+function gitControlEntry(stats) {
+	return {
+		type: stats.isDirectory() ? "directory" : stats.isFile() ? "file" : "other",
+		dev: stats.dev,
+		ino: stats.ino,
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+	};
+}
+function collectGitControlEntries(gitDir) {
+	const entries = new Map();
+	const pending = [["", gitDir]];
+	while (pending.length > 0) {
+		const [relative, absolute] = pending.pop();
+		for (const dirent of readdirSync(absolute, { withFileTypes: true })) {
+			const childRelative = relative
+				? `${relative}/${dirent.name}`
+				: dirent.name;
+			const childAbsolute = join(absolute, dirent.name);
+			let stats;
+			try {
+				stats = lstatSync(childAbsolute);
+			} catch (error) {
+				if (error?.code === "ENOENT") continue;
+				throw error;
+			}
+			const entry = gitControlEntry(stats);
+			if (entry.type === "file") {
+				entry.sha256 = createHash("sha256")
+					.update(readFileSync(childAbsolute))
+					.digest("hex");
+			}
+			entries.set(childRelative, entry);
+			if (entry.type === "directory")
+				pending.push([childRelative, childAbsolute]);
+		}
+	}
+	return entries;
+}
+/** Record every path under the clone's `.git` before untrusted code runs. */
+function snapshotGitControl(worktreePath) {
+	const gitDir = join(worktreePath, ".git");
+	let stats;
+	try {
+		stats = lstatSync(gitDir);
+	} catch (error) {
+		if (error?.code === "ENOENT") throw gitControlTampered("missing .git");
+		throw error;
+	}
+	if (!stats.isDirectory()) throw gitControlTampered(".git is not a directory");
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		entries: collectGitControlEntries(gitDir),
+	};
+}
+function providerWritableGitPath(path) {
+	if (
+		[
+			"index",
+			"HEAD",
+			"ORIG_HEAD",
+			"FETCH_HEAD",
+			"COMMIT_EDITMSG",
+			"packed-refs",
+		].includes(path)
+	)
+		return true;
+	if (path === "objects" || path.startsWith("objects/"))
+		return !(path === "objects/info" || path.startsWith("objects/info/"));
+	if (path === "refs" || path.startsWith("refs/"))
+		return !(path === "refs/replace" || path.startsWith("refs/replace/"));
+	return path === "logs" || path.startsWith("logs/");
+}
+function packedRefsNamesReplaceRef(content) {
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith("^"))
+			continue;
+		const name = trimmed.split(/\s+/u)[1];
+		if (typeof name === "string" && name.startsWith("refs/replace/"))
+			return true;
+	}
+	return false;
+}
+function packedRefsFileNamesReplaceRef(gitDir) {
+	try {
+		return packedRefsNamesReplaceRef(
+			readFileSync(join(gitDir, "packed-refs"), "utf8"),
+		);
+	} catch {
+		return true;
+	}
+}
+function gitControlEntryChanged(before, current) {
+	return (
+		before.type !== current.type ||
+		before.dev !== current.dev ||
+		before.ino !== current.ino ||
+		before.size !== current.size ||
+		before.mtimeMs !== current.mtimeMs ||
+		before.sha256 !== current.sha256
+	);
+}
+/**
+ * Fail closed before any host git call on a provider-writable clone: only the
+ * object database, refs (never replace refs), the index, logs and a few HEAD
+ * scratch files may differ from the pre-provider snapshot, and nothing under
+ * `.git` may be a symlink, FIFO, socket or device.
+ */
+function verifyGitControl(worktreePath, snapshot) {
+	if (!snapshot) throw gitControlTampered("missing snapshot");
+	const gitDir = join(worktreePath, ".git");
+	let rootStats;
+	try {
+		rootStats = lstatSync(gitDir);
+	} catch (error) {
+		if (error?.code === "ENOENT") throw gitControlTampered("missing .git");
+		throw error;
+	}
+	if (
+		!rootStats.isDirectory() ||
+		rootStats.dev !== snapshot.dev ||
+		rootStats.ino !== snapshot.ino
+	)
+		throw gitControlTampered(".git replaced");
+	const current = collectGitControlEntries(gitDir);
+	for (const [path, entry] of current) {
+		if (entry.type === "other")
+			throw gitControlTampered(`non-regular .git entry: ${path}`);
+		const before = snapshot.entries.get(path);
+		if (before === undefined) {
+			if (!providerWritableGitPath(path))
+				throw gitControlTampered(`added .git/${path}`);
+			if (path === "packed-refs" && packedRefsFileNamesReplaceRef(gitDir))
+				throw gitControlTampered("packed-refs names refs/replace/");
+			continue;
+		}
+		if (before.type !== entry.type)
+			throw gitControlTampered(`retyped .git/${path}`);
+		if (!providerWritableGitPath(path)) {
+			if (gitControlEntryChanged(before, entry))
+				throw gitControlTampered(`changed .git/${path}`);
+			continue;
+		}
+		if (
+			path === "packed-refs" &&
+			gitControlEntryChanged(before, entry) &&
+			packedRefsFileNamesReplaceRef(gitDir)
+		)
+			throw gitControlTampered("packed-refs names refs/replace/");
+	}
+	for (const path of snapshot.entries.keys()) {
+		if (!current.has(path) && !providerWritableGitPath(path))
+			throw gitControlTampered(`removed .git/${path}`);
+	}
 }
 function normalizeDeclaredPath(projectPath, value, flagName = "--file") {
 	if (typeof value !== "string" || value.trim() === "") {
@@ -480,7 +712,11 @@ export {
 	git,
 	MAX_CAPTURE_BYTES,
 	requireGit,
+	requireWorktreeGit,
 	SECRET_PATHS,
 	SIMPLE_TARGET_ADAPTERS,
 	SimpleUsageError,
+	snapshotGitControl,
+	verifyGitControl,
+	worktreeGit,
 };

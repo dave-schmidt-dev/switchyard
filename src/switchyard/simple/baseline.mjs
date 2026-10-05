@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { materializeDirtyOverlay } from "../lifecycle/index.mjs";
-import { git, MAX_CAPTURE_BYTES, requireGit, SECRET_PATHS } from "./args.mjs";
+import {
+	git,
+	MAX_CAPTURE_BYTES,
+	requireGit,
+	SECRET_PATHS,
+	verifyGitControl,
+	worktreeGit,
+} from "./args.mjs";
 
 const BASELINE_STATUS_TIMEOUT_MS = 5_000;
 const SAFE_SIGNALS = new Set(["SIGINT", "SIGTERM", "SIGKILL", "SIGABRT"]);
@@ -9,8 +16,9 @@ function remainingMs(deadlineMs, now) {
 	return Math.max(0, deadlineMs - now());
 }
 
-function workingStatus(git, worktreePath, timeoutMs) {
-	const result = git(
+function workingStatus(worktreePath, timeoutMs, gitControlSnapshot) {
+	verifyGitControl(worktreePath, gitControlSnapshot);
+	const result = worktreeGit(
 		worktreePath,
 		["status", "--porcelain=v1", "-z", "--untracked-files=all"],
 		{ timeout: Math.max(100, Math.min(BASELINE_STATUS_TIMEOUT_MS, timeoutMs)) },
@@ -28,11 +36,15 @@ export async function runSimpleBaselineChecks({
 	now = Date.now,
 	signal,
 	runCheck,
-	git,
+	gitControlSnapshot,
 	onStatus,
 }) {
 	if (!checks.length) return { status: "not_requested", checks: [] };
-	const before = workingStatus(git, worktreePath, remainingMs(deadlineMs, now));
+	const before = workingStatus(
+		worktreePath,
+		remainingMs(deadlineMs, now),
+		gitControlSnapshot,
+	);
 	if (before === null) return { status: "unknown", checks: [] };
 	if (before.length > 0)
 		return { status: "mutation_detected", checks: [], mutationCount: 1 };
@@ -106,9 +118,9 @@ export async function runSimpleBaselineChecks({
 		)
 			return { status: "unknown", checks: results };
 		const afterCheck = workingStatus(
-			git,
 			worktreePath,
 			remainingMs(deadlineMs, now),
+			gitControlSnapshot,
 		);
 		if (afterCheck === null) return { status: "unknown", checks: results };
 		if (before !== afterCheck) {
@@ -121,7 +133,11 @@ export async function runSimpleBaselineChecks({
 		}
 		if (!item.success) return { status: "failed", checks: results };
 	}
-	const after = workingStatus(git, worktreePath, remainingMs(deadlineMs, now));
+	const after = workingStatus(
+		worktreePath,
+		remainingMs(deadlineMs, now),
+		gitControlSnapshot,
+	);
 	if (after === null) return { status: "unknown", checks: results };
 	if (before !== after) {
 		const entries = after.split("\0").filter(Boolean);

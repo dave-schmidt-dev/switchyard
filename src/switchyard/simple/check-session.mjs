@@ -15,7 +15,14 @@ import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../runner/checks-sandbox.mjs";
-import { MAX_CAPTURE_BYTES, requireGit, SECRET_PATHS } from "./args.mjs";
+import {
+	MAX_CAPTURE_BYTES,
+	requireGit,
+	requireWorktreeGit,
+	SECRET_PATHS,
+	snapshotGitControl,
+	verifyGitControl,
+} from "./args.mjs";
 import { commandWords, resolveCheckExecution } from "./check-execution.mjs";
 import { runSimpleWriter } from "./provider-invocation.mjs";
 
@@ -83,12 +90,11 @@ export function createSimpleCheckSessions({
 		return remaining;
 	}
 	function git(path, args) {
-		return requireGit(
-			path,
-			["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args],
-			"check_session_base_unavailable",
-			{ timeout: timeout() },
-		).trim();
+		const control = active?.gitControl;
+		if (control) verifyGitControl(path, control);
+		return requireWorktreeGit(path, args, "check_session_base_unavailable", {
+			timeout: timeout(),
+		}).trim();
 	}
 	async function confined(
 		command,
@@ -140,15 +146,22 @@ export function createSimpleCheckSessions({
 		};
 		lifecycle = "never_started";
 		mkdirSync(active.runtime, { mode: 0o700 });
-		git(root, [
-			"clone",
-			"--shared",
-			"--no-checkout",
-			"--quiet",
-			"--",
-			projectPath,
-			active.path,
-		]);
+		// The checker clone is created from the trusted project before any check
+		// code runs; the hardened helper presupposes an existing checkout.
+		requireGit(
+			root,
+			[
+				"clone",
+				"--shared",
+				"--no-checkout",
+				"--quiet",
+				"--",
+				projectPath,
+				active.path,
+			],
+			"check_session_base_unavailable",
+			{ timeout: timeout() },
+		);
 		git(active.path, ["checkout", "--detach", "--quiet", baseRevision]);
 		if (dirtyOverlayReceipt)
 			materializeDirtyOverlay(active.path, dirtyOverlayReceipt, {
@@ -172,6 +185,7 @@ export function createSimpleCheckSessions({
 			join(active.path, ".git", "info", "exclude"),
 			"\n/node_modules/\n",
 		);
+		active.gitControl = snapshotGitControl(active.path);
 		const env = safeEnv(active.runtime);
 		const probe = await confined("/usr/bin/true", [], env);
 		if (!probe.success || lifecycle !== "stopped")
@@ -197,6 +211,7 @@ export function createSimpleCheckSessions({
 				: null,
 		}));
 		if (diff) {
+			verifyGitControl(active.path, active.gitControl);
 			const result = integrationGate(diff, active.path, {
 				allowedPaths: files,
 				allowSensitiveManifests: allowManifests.length > 0,
@@ -270,6 +285,9 @@ export function createSimpleCheckSessions({
 		run,
 		get path() {
 			return active?.path;
+		},
+		get gitControlSnapshot() {
+			return active?.gitControl ?? null;
 		},
 		get writerLifecycle() {
 			return lifecycle;
