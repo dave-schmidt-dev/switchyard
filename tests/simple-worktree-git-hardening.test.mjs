@@ -122,6 +122,15 @@ function dependencies(overrides = {}) {
 	};
 }
 
+function throwsTamper(fn, kind, area) {
+	throws(fn, (error) => {
+		strictEqual(error.code, "git_control_tampered");
+		strictEqual(error.tamperKind, kind);
+		strictEqual(error.tamperArea, area);
+		return true;
+	});
+}
+
 function leakedSimpleRoots() {
 	return readdirSync(SUITE_TMPDIR).filter((name) =>
 		name.startsWith("switchyard-simple-"),
@@ -206,6 +215,7 @@ describe("hardened host git", () => {
 				"core.fsmonitor=false",
 				"core.hooksPath=/dev/null",
 				"core.untrackedCache=false",
+				"core.commitGraph=false",
 				"diff.external=",
 				"core.attributesFile=/dev/null",
 			]) {
@@ -261,9 +271,11 @@ describe("git control verification", () => {
 		const { clonePath } = makeClone();
 		const snapshot = snapshotGitControl(clonePath);
 		appendFileSync(join(clonePath, ".git", "config"), "\n[tamper]\n");
-		throws(() => verifyGitControl(clonePath, snapshot), {
-			code: "git_control_tampered",
-		});
+		throwsTamper(
+			() => verifyGitControl(clonePath, snapshot),
+			"changed",
+			"config",
+		);
 	});
 
 	it("rejects a written .git/commondir", () => {
@@ -284,6 +296,50 @@ describe("git control verification", () => {
 		appendFileSync(
 			join(clonePath, ".git", "objects", "info", "alternates"),
 			`${join(projectPath, ".git", "objects")}\n`,
+		);
+		throwsTamper(
+			() => verifyGitControl(clonePath, snapshot),
+			"changed",
+			"objects",
+		);
+	});
+
+	it("rejects case-variant objects/info/Alternates after alternates is removed", () => {
+		const { clonePath, projectPath } = makeClone();
+		const snapshot = snapshotGitControl(clonePath);
+		rmSync(join(clonePath, ".git", "objects", "info", "alternates"));
+		writeFileSync(
+			join(clonePath, ".git", "objects", "info", "Alternates"),
+			`${join(projectPath, ".git", "objects")}\n`,
+		);
+		throwsTamper(
+			() => verifyGitControl(clonePath, snapshot),
+			"added",
+			"objects",
+		);
+	});
+
+	it("rejects case-variant objects/INFO/http-alternates", () => {
+		const { clonePath } = makeClone();
+		const snapshot = snapshotGitControl(clonePath);
+		mkdirSync(join(clonePath, ".git", "objects", "INFO"), { recursive: true });
+		writeFileSync(
+			join(clonePath, ".git", "objects", "INFO", "http-alternates"),
+			"https://example.invalid/objects\n",
+		);
+		throwsTamper(
+			() => verifyGitControl(clonePath, snapshot),
+			"added",
+			"objects",
+		);
+	});
+
+	it("rejects a written .git/objects/info/commit-graph", () => {
+		const { clonePath } = makeClone();
+		const snapshot = snapshotGitControl(clonePath);
+		writeFileSync(
+			join(clonePath, ".git", "objects", "info", "commit-graph"),
+			"CGPH forged\n",
 		);
 		throws(() => verifyGitControl(clonePath, snapshot), {
 			code: "git_control_tampered",
@@ -311,6 +367,15 @@ describe("git control verification", () => {
 		});
 	});
 
+	it("rejects a written case-variant .git/refs/REPLACE/<sha>", () => {
+		const { clonePath } = makeClone();
+		const snapshot = snapshotGitControl(clonePath);
+		const sha = "0123456789012345678901234567890123456789";
+		mkdirSync(join(clonePath, ".git", "refs", "REPLACE"), { recursive: true });
+		writeFileSync(join(clonePath, ".git", "refs", "REPLACE", sha), `${sha}\n`);
+		throwsTamper(() => verifyGitControl(clonePath, snapshot), "added", "refs");
+	});
+
 	it("rejects a packed-refs line naming refs/replace/", () => {
 		const { clonePath } = makeClone();
 		const snapshot = snapshotGitControl(clonePath);
@@ -332,9 +397,11 @@ describe("git control verification", () => {
 			join(projectPath, "src", "a.txt"),
 			join(clonePath, ".git", "objects", "tampered-link"),
 		);
-		throws(() => verifyGitControl(clonePath, snapshot), {
-			code: "git_control_tampered",
-		});
+		throwsTamper(
+			() => verifyGitControl(clonePath, snapshot),
+			"non_regular",
+			"objects",
+		);
 	});
 
 	it("accepts a shared-clone detach that repacks and removes alternates", () => {
@@ -435,6 +502,10 @@ describe("simple dispatch git hardening", () => {
 		strictEqual(result.status, "failed");
 		strictEqual(result.failureReason, "unsafe_diff");
 		strictEqual(result.diagnosticCode, "git_control_tampered");
+		deepStrictEqual(result.gitControlTamper, {
+			kind: "changed",
+			area: "config",
+		});
 		strictEqual(result.partialWorktree, null);
 		strictEqual(existsSync(sentinelPath), false);
 		strictEqual(
@@ -466,6 +537,10 @@ describe("simple dispatch git hardening", () => {
 		strictEqual(result.status, "failed");
 		strictEqual(result.failureReason, "unsafe_diff");
 		strictEqual(result.diagnosticCode, "git_control_tampered");
+		deepStrictEqual(result.gitControlTamper, {
+			kind: "replaced",
+			area: "root",
+		});
 		strictEqual(result.partialWorktree, null);
 		strictEqual(
 			readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
@@ -493,6 +568,10 @@ describe("simple dispatch git hardening", () => {
 		strictEqual(result.status, "failed");
 		strictEqual(result.failureReason, "unsafe_diff");
 		strictEqual(result.diagnosticCode, "git_control_tampered");
+		deepStrictEqual(result.gitControlTamper, {
+			kind: "changed",
+			area: "config",
+		});
 		strictEqual(providerStarted, false);
 		strictEqual(result.providerStarted, false);
 		strictEqual(result.partialWorktree, null);

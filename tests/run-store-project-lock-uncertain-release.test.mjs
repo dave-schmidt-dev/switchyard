@@ -253,6 +253,162 @@ describe("uncertain idempotent project lock release", () => {
 		}
 	});
 
+	it("retains the lock when the liveness probe is unknown", async () => {
+		const projectPath = uniquePath("unknown-liveness");
+		const runId = uniqueRunId();
+		await initializeRun({
+			runId,
+			tasksFilePath: uniquePath("tasks"),
+			projectPath,
+			orderedTaskIds: ["task-1"],
+			initialHostFingerprint: "test-host",
+		});
+
+		const lockPath = projectLockFilePath(projectPath);
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				runId,
+				projectPath,
+				createdAt: new Date().toISOString(),
+				holderPid: process.pid + 1,
+			}),
+		);
+		strictEqual(isProjectLockHeld(projectPath), true);
+
+		const intent = makeReleaseOperation(projectPath, runId);
+		await recordMutationOperation(runId, {
+			...intent,
+			state: "uncertain",
+			outcome: "ambiguous",
+			code: "observation_timed_out",
+			attempt: 1,
+		});
+
+		let removals = 0;
+		const released = await releaseProjectLockIfOwnedBy(projectPath, runId, {
+			probePid: () => "unknown",
+			onRemoved: () => {
+				removals += 1;
+			},
+		});
+		strictEqual(released, false);
+		strictEqual(removals, 0);
+		strictEqual(isProjectLockHeld(projectPath), true);
+		strictEqual(await isProjectLockOwnedBy(projectPath, runId), true);
+		strictEqual(existsSync(lockPath), true);
+
+		const recorded = await readMutationOperation(runId, intent.operationId);
+		strictEqual(recorded.state, "uncertain");
+	});
+
+	it("retains the lock when holder pid is missing but the run worker pid is live", async () => {
+		const projectPath = uniquePath("missing-holder-live-worker");
+		const liveHelper = spawnBoundedHelper();
+		try {
+			const runId = uniqueRunId();
+			await initializeRun({
+				runId,
+				tasksFilePath: uniquePath("tasks"),
+				projectPath,
+				orderedTaskIds: ["task-1"],
+				initialHostFingerprint: "test-host",
+				workerPid: liveHelper.pid,
+			});
+
+			const lockPath = projectLockFilePath(projectPath);
+			mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+			writeFileSync(
+				lockPath,
+				JSON.stringify({
+					runId,
+					projectPath,
+					createdAt: new Date().toISOString(),
+				}),
+			);
+			strictEqual(isProjectLockHeld(projectPath), true);
+
+			const intent = makeReleaseOperation(projectPath, runId);
+			await recordMutationOperation(runId, {
+				...intent,
+				state: "uncertain",
+				outcome: "ambiguous",
+				code: "observation_timed_out",
+				attempt: 1,
+			});
+
+			let removals = 0;
+			const released = await releaseProjectLockIfOwnedBy(projectPath, runId, {
+				onRemoved: () => {
+					removals += 1;
+				},
+			});
+			strictEqual(released, false);
+			strictEqual(removals, 0);
+			strictEqual(isProjectLockHeld(projectPath), true);
+			strictEqual(await isProjectLockOwnedBy(projectPath, runId), true);
+			strictEqual(existsSync(lockPath), true);
+
+			const recorded = await readMutationOperation(runId, intent.operationId);
+			strictEqual(recorded.state, "uncertain");
+		} finally {
+			await terminateHelper(liveHelper);
+		}
+	});
+
+	it("retains the lock when holder pid is a non-integer or string value", async () => {
+		const projectPath = uniquePath("invalid-holder-pid");
+		const runId = uniqueRunId();
+		await initializeRun({
+			runId,
+			tasksFilePath: uniquePath("tasks"),
+			projectPath,
+			orderedTaskIds: ["task-1"],
+			initialHostFingerprint: "test-host",
+		});
+
+		const lockPath = projectLockFilePath(projectPath);
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+
+		const intent = makeReleaseOperation(projectPath, runId);
+		await recordMutationOperation(runId, {
+			...intent,
+			state: "uncertain",
+			outcome: "ambiguous",
+			code: "observation_timed_out",
+			attempt: 1,
+		});
+
+		for (const holderPid of [1.5, "1234"]) {
+			writeFileSync(
+				lockPath,
+				JSON.stringify({
+					runId,
+					projectPath,
+					createdAt: new Date().toISOString(),
+					holderPid,
+				}),
+			);
+			strictEqual(isProjectLockHeld(projectPath), true);
+
+			let removals = 0;
+			const released = await releaseProjectLockIfOwnedBy(projectPath, runId, {
+				onRemoved: () => {
+					removals += 1;
+				},
+			});
+			strictEqual(released, false);
+			strictEqual(removals, 0);
+			strictEqual(isProjectLockHeld(projectPath), true);
+			strictEqual(await isProjectLockOwnedBy(projectPath, runId), true);
+			strictEqual(existsSync(lockPath), true);
+		}
+
+		const recorded = await readMutationOperation(runId, intent.operationId);
+		strictEqual(recorded.state, "uncertain");
+	});
+
 	it("remediation output contains release_uncertain when lock release remains uncertain", async () => {
 		const projectPath = uniquePath("remediate-uncertain");
 		const runId = uniqueRunId();
@@ -308,6 +464,58 @@ describe("uncertain idempotent project lock release", () => {
 		} finally {
 			await terminateHelper(liveHelper);
 		}
+	});
+
+	it("logs release_uncertain when the ownership check rejects", async () => {
+		const projectPath = uniquePath("remediate-ownership-error");
+		const runId = uniqueRunId();
+		await initializeRun({
+			runId,
+			tasksFilePath: uniquePath("tasks"),
+			projectPath,
+			orderedTaskIds: ["task-1"],
+			initialHostFingerprint: "test-host",
+		});
+		await advanceState(runId, "failed");
+
+		const lockPath = projectLockFilePath(projectPath);
+		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				runId,
+				projectPath,
+				createdAt: new Date().toISOString(),
+				holderPid: 999999,
+			}),
+		);
+		strictEqual(isProjectLockHeld(projectPath), true);
+
+		const logs = [];
+		const result = await remediateOrphanedLocks(["--confirm"], {
+			log: (msg) => logs.push(msg),
+			releaseProjectLockIfOwnedBy: async () => false,
+			isProjectLockOwnedBy: async () => {
+				throw new Error("ownership probe failed");
+			},
+		});
+
+		strictEqual(result.exitCode, 0);
+		strictEqual(result.removed.length, 0);
+		strictEqual(isProjectLockHeld(projectPath), true);
+		strictEqual(existsSync(lockPath), true);
+
+		const uncertainLogged = logs.some((msg) =>
+			msg.includes("release_uncertain"),
+		);
+		ok(
+			uncertainLogged,
+			`Expected logs to contain release_uncertain. Logs:\n${logs.join("\n")}`,
+		);
+		strictEqual(
+			logs.some((msg) => msg.includes("no longer owned")),
+			false,
+		);
 	});
 
 	it("releases lock when holder pid is current process", async () => {

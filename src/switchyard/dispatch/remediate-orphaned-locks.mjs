@@ -288,15 +288,28 @@ export async function run(argv, dependencies = {}) {
 			recordRemovedPath(c.path, ` (runId=${c.runId})`);
 		}
 		if (!removedNames.has(c.name)) {
-			const stillOwned =
-				releaseUncertain ||
-				(await isOwnedFn(c.projectPath, c.runId).catch(() => false));
-			if (stillOwned) {
+			if (releaseUncertain) {
 				log(`remediate-orphaned-locks: skipped ${c.name} — release_uncertain`);
 			} else {
-				log(
-					`remediate-orphaned-locks: skipped ${c.name} — no longer owned by ${c.runId} (reassigned since resolution, or already released)`,
-				);
+				let stillOwned;
+				try {
+					stillOwned = await isOwnedFn(c.projectPath, c.runId);
+				} catch {
+					stillOwned = "unknown";
+				}
+				if (stillOwned === "unknown") {
+					log(
+						`remediate-orphaned-locks: skipped ${c.name} — release_uncertain (ownership could not be confirmed)`,
+					);
+				} else if (stillOwned) {
+					log(
+						`remediate-orphaned-locks: skipped ${c.name} — release_uncertain`,
+					);
+				} else {
+					log(
+						`remediate-orphaned-locks: skipped ${c.name} — no longer owned by ${c.runId} (reassigned since resolution, or already released)`,
+					);
+				}
 			}
 		}
 	}

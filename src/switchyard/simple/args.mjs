@@ -205,14 +205,36 @@ const WORKTREE_GIT_CONFIG = [
 	"-c",
 	"core.untrackedCache=false",
 	"-c",
+	"core.commitGraph=false",
+	"-c",
 	"diff.external=",
 	"-c",
 	"core.attributesFile=/dev/null",
 ];
-function gitControlTampered(reason) {
-	return Object.assign(new Error(`git_control_tampered: ${reason}`), {
-		code: "git_control_tampered",
-	});
+const TAMPER_AREAS = new Set([
+	"config",
+	"hooks",
+	"info",
+	"objects",
+	"refs",
+	"logs",
+	"index",
+	"packed-refs",
+]);
+function tamperArea(path) {
+	if (path === "") return "root";
+	const component = path.split("/")[0].toLowerCase();
+	if (component === "head") return "HEAD";
+	return TAMPER_AREAS.has(component) ? component : "other";
+}
+// The kind and area are closed enums and the only tamper evidence a caller
+// may surface; the message and the provider-controlled path stay diagnostics.
+function gitControlTampered(tamperKind, path, message) {
+	const error = new Error(`git_control_tampered: ${message}`);
+	error.code = "git_control_tampered";
+	error.tamperKind = tamperKind;
+	error.tamperArea = tamperArea(path);
+	return error;
 }
 /**
  * Host git against a provider-writable clone. The git-dir and work-tree are
@@ -282,7 +304,11 @@ function inspectGitControl(path, inspect) {
 		return inspect();
 	} catch (error) {
 		if (error?.code === "ENOENT") return null;
-		throw gitControlTampered(`cannot inspect .git/${path}`);
+		throw gitControlTampered(
+			"uninspectable",
+			path,
+			`cannot inspect .git/${path}`,
+		);
 	}
 }
 function collectGitControlEntries(gitDir) {
@@ -325,10 +351,12 @@ function snapshotGitControl(worktreePath) {
 	try {
 		stats = lstatSync(gitDir);
 	} catch (error) {
-		if (error?.code === "ENOENT") throw gitControlTampered("missing .git");
+		if (error?.code === "ENOENT")
+			throw gitControlTampered("missing", "", "missing .git");
 		throw error;
 	}
-	if (!stats.isDirectory()) throw gitControlTampered(".git is not a directory");
+	if (!stats.isDirectory())
+		throw gitControlTampered("replaced", "", ".git is not a directory");
 	return {
 		dev: stats.dev,
 		ino: stats.ino,
@@ -336,33 +364,38 @@ function snapshotGitControl(worktreePath) {
 	};
 }
 const ALTERNATES_PATH = "objects/info/alternates";
-const OBJECT_LOOKUP_REDIRECTS = new Set([
-	ALTERNATES_PATH,
-	"objects/info/http-alternates",
+const OBJECTS_INFO_PATH = "objects/info";
+// Dumb-transport ref list written by update-server-info (run by repack); local
+// git never reads it.
+const WRITABLE_GIT_PATHS = new Set([
+	"index",
+	"head",
+	"orig_head",
+	"fetch_head",
+	"commit_editmsg",
+	"packed-refs",
+	"info/refs",
 ]);
 function providerWritableGitPath(path) {
-	if (
-		[
-			"index",
-			"HEAD",
-			"ORIG_HEAD",
-			"FETCH_HEAD",
-			"COMMIT_EDITMSG",
-			"packed-refs",
-			// Dumb-transport ref list written by update-server-info (run by
-			// repack); local git never reads it.
-			"info/refs",
-		].includes(path)
-	)
-		return true;
-	// objects/info/alternates and http-alternates redirect object lookup
-	// outside the clone; the rest of objects/info (packs, commit-graph) is data
-	// that a trusted shared-clone detach (`repack -a -d`) or git itself writes.
-	if (path === "objects" || path.startsWith("objects/"))
-		return !OBJECT_LOOKUP_REDIRECTS.has(path);
-	if (path === "refs" || path.startsWith("refs/"))
-		return !(path === "refs/replace" || path.startsWith("refs/replace/"));
-	return path === "logs" || path.startsWith("logs/");
+	// Git resolves paths case-insensitively on the default macOS filesystem,
+	// so every protection decision is case-folded too.
+	const folded = path.toLowerCase();
+	if (WRITABLE_GIT_PATHS.has(folded)) return true;
+	// Under objects/info the only writable entries are that directory itself
+	// and exactly packs (written by update-server-info during the trusted
+	// shared-clone detach `repack -a -d`). Alternates and http-alternates
+	// redirect object lookup outside the clone, and host git trusts a
+	// commit-graph cache without verifying it, so a forged one would silently
+	// rewrite the captured diff.
+	if (folded === "objects" || folded.startsWith("objects/")) {
+		return (
+			!folded.startsWith(`${OBJECTS_INFO_PATH}/`) ||
+			folded === "objects/info/packs"
+		);
+	}
+	if (folded === "refs" || folded.startsWith("refs/"))
+		return !(folded === "refs/replace" || folded.startsWith("refs/replace/"));
+	return folded === "logs" || folded.startsWith("logs/");
 }
 function packedRefsNamesReplaceRef(content) {
 	for (const line of content.split("\n")) {
@@ -370,8 +403,8 @@ function packedRefsNamesReplaceRef(content) {
 		if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith("^"))
 			continue;
 		const name = trimmed.split(/\s+/u)[1];
-		if (typeof name === "string" && name.startsWith("refs/replace/"))
-			return true;
+		if (typeof name !== "string") continue;
+		if (name.toLowerCase().startsWith("refs/replace/")) return true;
 	}
 	return false;
 }
@@ -405,13 +438,15 @@ function gitControlEntryChanged(before, current) {
  * `.git` may be a symlink, FIFO, socket or device.
  */
 function verifyGitControl(worktreePath, snapshot) {
-	if (!snapshot) throw gitControlTampered("missing snapshot");
+	if (!snapshot)
+		throw gitControlTampered("missing_snapshot", "", "missing snapshot");
 	const gitDir = join(worktreePath, ".git");
 	let rootStats;
 	try {
 		rootStats = lstatSync(gitDir);
 	} catch (error) {
-		if (error?.code === "ENOENT") throw gitControlTampered("missing .git");
+		if (error?.code === "ENOENT")
+			throw gitControlTampered("missing", "", "missing .git");
 		throw error;
 	}
 	if (
@@ -419,42 +454,47 @@ function verifyGitControl(worktreePath, snapshot) {
 		rootStats.dev !== snapshot.dev ||
 		rootStats.ino !== snapshot.ino
 	)
-		throw gitControlTampered(".git replaced");
+		throw gitControlTampered("replaced", "", ".git replaced");
 	const current = collectGitControlEntries(gitDir);
 	for (const [path, entry] of current) {
 		if (entry.type === "other")
-			throw gitControlTampered(`non-regular .git entry: ${path}`);
+			throw gitControlTampered(
+				"non_regular",
+				path,
+				`non-regular .git entry: ${path}`,
+			);
 		const before = snapshot.entries.get(path);
 		if (before === undefined) {
 			if (!providerWritableGitPath(path))
-				throw gitControlTampered(`added .git/${path}`);
-			if (path === "packed-refs" && packedRefsFileNamesReplaceRef(gitDir))
-				throw gitControlTampered("packed-refs names refs/replace/");
-			continue;
-		}
-		if (before.type !== entry.type)
-			throw gitControlTampered(`retyped .git/${path}`);
-		if (!providerWritableGitPath(path)) {
-			if (gitControlEntryChanged(before, entry))
-				throw gitControlTampered(`changed .git/${path}`);
-			continue;
+				throw gitControlTampered("added", path, `added .git/${path}`);
+		} else if (before.type !== entry.type) {
+			throw gitControlTampered("retyped", path, `retyped .git/${path}`);
+		} else if (
+			!providerWritableGitPath(path) &&
+			gitControlEntryChanged(before, entry)
+		) {
+			throw gitControlTampered("changed", path, `changed .git/${path}`);
 		}
 		if (
-			path === "packed-refs" &&
-			gitControlEntryChanged(before, entry) &&
+			path.toLowerCase() === "packed-refs" &&
+			(before === undefined || gitControlEntryChanged(before, entry)) &&
 			packedRefsFileNamesReplaceRef(gitDir)
 		)
-			throw gitControlTampered("packed-refs names refs/replace/");
+			throw gitControlTampered(
+				"replace_ref",
+				"packed-refs",
+				"packed-refs names refs/replace/",
+			);
 	}
 	// Removing alternates only narrows object lookup to the clone itself; the
 	// native launcher does exactly this when it detaches a shared clone.
 	for (const path of snapshot.entries.keys()) {
 		if (
 			!current.has(path) &&
-			path !== ALTERNATES_PATH &&
+			path.toLowerCase() !== ALTERNATES_PATH &&
 			!providerWritableGitPath(path)
 		)
-			throw gitControlTampered(`removed .git/${path}`);
+			throw gitControlTampered("removed", path, `removed .git/${path}`);
 	}
 }
 function normalizeDeclaredPath(projectPath, value, flagName = "--file") {

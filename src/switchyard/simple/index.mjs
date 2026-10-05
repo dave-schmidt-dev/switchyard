@@ -89,6 +89,38 @@ function declaredFilesChanged(worktreePath, files, baseline) {
 	});
 }
 const DEADLINE_CHANGED_FILES_TIMEOUT_MS = 5000;
+const DIFF_REJECTION_PATH_LIMIT = 5;
+const DIFF_REJECTION_PATH_MAX_CHARS = 200;
+const DIFF_REJECTION_REASON_RULES = new Set([
+	"empty_diff",
+	"path_escapes_project_root",
+	"git_internals_touched",
+	"credential_path_touched",
+	"symlink_creation_refused",
+	"executable_file_refused",
+	"integration_state_unknown",
+	"corrupt_patch",
+	"conflict",
+]);
+
+function boundedRejectionPaths(paths) {
+	const bounded = [];
+	for (const path of paths ?? []) {
+		if (typeof path !== "string") continue;
+		// Provider-chosen names must not inject terminal control sequences.
+		bounded.push(
+			path.replace(/\p{Cc}/gu, "?").slice(0, DIFF_REJECTION_PATH_MAX_CHARS),
+		);
+		if (bounded.length === DIFF_REJECTION_PATH_LIMIT) break;
+	}
+	return bounded;
+}
+
+function validateDiffRejectionRule(validated) {
+	return DIFF_REJECTION_REASON_RULES.has(validated?.reasonKind)
+		? validated.reasonKind
+		: "unsafe_diff";
+}
 
 export function captureDeadlineChangedFiles({
 	worktreePath,
@@ -508,7 +540,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		return finalResult;
 	};
-	const failGitControlTampered = (failurePhase) => {
+	const failGitControlTampered = (failurePhase, error) => {
 		// A checkout whose git control was tampered with has no salvage value:
 		// it is never retained, and no further host git runs against it.
 		gitControlTampered = true;
@@ -521,6 +553,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 		};
 		const result = fail("unsafe_diff", failurePhase, "policy_violation");
 		result.diagnosticCode = "git_control_tampered";
+		// Only the closed-enum tamper fields cross into the result; the raw
+		// message and provider-controlled path stay diagnostics.
+		const tamperKind = error?.tamperKind;
+		const tamperArea = error?.tamperArea;
+		if (typeof tamperKind === "string" && typeof tamperArea === "string")
+			result.gitControlTamper = { kind: tamperKind, area: tamperArea };
 		return result;
 	};
 	const failForSignal = (failurePhase = currentPhase) => {
@@ -545,7 +583,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					keepWorktree = status.status !== 0 || status.stdout.length > 0;
 				} catch (error) {
 					if (error?.code === "git_control_tampered")
-						return failGitControlTampered(failurePhase);
+						return failGitControlTampered(failurePhase, error);
 					keepWorktree = true;
 				}
 			}
@@ -908,13 +946,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 				taskId,
 				deadlineMs: options.deadlineMs,
 				cachePath: dependencies.checkCachePath,
+				evidenceDir: join(getRunRoot(runId), "check-evidence"),
 				now,
 				signal,
 				onProgress: () =>
 					heartbeat("baseline", { processPhase: "check_preparing" }),
 			});
 			currentPhase = "baseline";
-			baselineCheckPath = await checkSessions.prepare();
+			baselineCheckPath = await checkSessions.prepare(null, 0);
 			runCheck = checkSessions.run;
 		}
 
@@ -1251,12 +1290,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 		);
 		if (undeclared.length > 0) {
 			keepWorktree = true;
-			return fail(
-				(options.readOnlyInputs ?? []).some((path) => undeclared.includes(path))
-					? "read_only_input_changed"
-					: "undeclared_paths_changed",
-				"diff",
-			);
+			const rejectionRule = (options.readOnlyInputs ?? []).some((path) =>
+				undeclared.includes(path),
+			)
+				? "read_only_input_changed"
+				: "undeclared_paths_changed";
+			const result = fail(rejectionRule, "diff");
+			result.diffRejection = {
+				rule: rejectionRule,
+				paths: boundedRejectionPaths(undeclared),
+			};
+			return result;
 		}
 		const validated = validateDiff(captured.diff, options.projectPath);
 		if (
@@ -1267,10 +1311,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 				))
 		) {
 			keepWorktree = true;
-			return fail(
+			const result = fail(
 				validated.requiresReview ? "manifest_review_required" : "unsafe_diff",
 				"diff",
 			);
+			result.diffRejection = validated.requiresReview
+				? {
+						rule: "manifest_review_required",
+						paths: boundedRejectionPaths(validated.sensitivePaths),
+					}
+				: { rule: validateDiffRejectionRule(validated), paths: [] };
+			return result;
 		}
 
 		let capturedDiff = captured;
@@ -1280,7 +1331,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					return fail("provider_group_unconfirmed", "checks", "cleanup_failed");
 				if (options.checks.length > 0) {
 					currentPhase = "checks";
-					await checkSessions.prepare(capturedDiff.diff);
+					await checkSessions.prepare(capturedDiff.diff, pass + 1);
 				}
 			}
 			let rerunAllChecks = false;
@@ -1337,7 +1388,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 					index: index + 1,
 					status: checkStatus,
 					...(checkStatus === "failed"
-						? { exitCode: checkExitCode, signal: checkSignal }
+						? {
+								exitCode: checkExitCode,
+								signal: checkSignal,
+								...(check?.outputPath ? { outputPath: check.outputPath } : {}),
+							}
 						: {}),
 				});
 				milestone("checks", "check_finished", {
@@ -1980,7 +2035,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		return finalResult;
 	} catch (error) {
 		if (error?.code === "git_control_tampered")
-			return failGitControlTampered(currentPhase);
+			return failGitControlTampered(currentPhase, error);
 		if (checkSessions && changedFiles.length > 0) keepWorktree = true;
 		const failureReason =
 			typeof error?.code === "string" ? error.code : "simple_execution_failed";

@@ -5,6 +5,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
 import { integrationGate } from "../integrate/index.mjs";
@@ -28,6 +29,33 @@ import { runSimpleWriter } from "./provider-invocation.mjs";
 
 function refused(code) {
 	return Object.assign(new Error(code), { code });
+}
+
+const EVIDENCE_TAIL_BYTES = 16 * 1024;
+
+function evidenceTail(value, maxBytes) {
+	const bytes = Buffer.isBuffer(value)
+		? value
+		: Buffer.from(typeof value === "string" ? value : "", "utf8");
+	return bytes.length <= maxBytes
+		? bytes
+		: bytes.subarray(bytes.length - maxBytes);
+}
+
+// Failed-check tails stay host-side diagnostics: the result carries this path
+// and never the bytes themselves.
+function writeCheckEvidence(directory, attempt, index, check) {
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const path = join(directory, `${attempt}-${index}.log`);
+	writeFileSync(
+		path,
+		Buffer.concat([
+			evidenceTail(check?.output, EVIDENCE_TAIL_BYTES),
+			evidenceTail(check?.stderr, EVIDENCE_TAIL_BYTES),
+		]),
+		{ mode: 0o600 },
+	);
+	return path;
 }
 
 function checksNeedNodePackages(commands, checkout) {
@@ -80,9 +108,12 @@ export function createSimpleCheckSessions({
 	signal,
 	onProgress,
 	cachePath,
+	evidenceDir = null,
 }) {
 	let active = null;
 	let lifecycle = "never_started";
+	let evidenceAttempt = 1;
+	let evidenceIndex = 0;
 	function timeout() {
 		if (signal?.aborted) throw refused("cancelled");
 		const remaining = deadlineMs - now();
@@ -134,10 +165,12 @@ export function createSimpleCheckSessions({
 		if (existsSync(active.root)) throw refused("check_session_cleanup_failed");
 		active = null;
 	}
-	async function prepare(diff = null) {
+	async function prepare(diff = null, attempt = 1) {
 		remove();
 		timeout();
 		onProgress?.();
+		evidenceAttempt = attempt;
+		evidenceIndex = 0;
 		const root = mkdtempSync(join(taskRoot, "checker-"));
 		active = {
 			root,
@@ -271,13 +304,31 @@ export function createSimpleCheckSessions({
 		const execution = resolveCheckExecution(command, active.path);
 		if (execution.kind === "rejected")
 			throw refused("check_dependencies_unverified");
-		return confined(
+		const result = await confined(
 			execution.kind === "local" ? execution.command : "/bin/sh",
 			execution.kind === "local" ? execution.args : ["-c", command],
 			safeEnv(active.runtime),
 			[],
 			progress,
 		);
+		// Evidence files are named <attempt>-<check position>; attempt 0 is the
+		// baseline run.
+		evidenceIndex += 1;
+		if (result?.success || !evidenceDir) return result;
+		try {
+			return {
+				...result,
+				outputPath: writeCheckEvidence(
+					evidenceDir,
+					evidenceAttempt,
+					evidenceIndex,
+					result,
+				),
+			};
+		} catch {
+			// Evidence retention must never change the check's gate result.
+			return result;
+		}
 	}
 	return {
 		prepare,

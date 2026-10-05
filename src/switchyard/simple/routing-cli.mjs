@@ -12,6 +12,7 @@ import { parseArgs } from "node:util";
 import { readRun } from "../run-store/index.mjs";
 import { inspectRoutingAccountability } from "./failure-accountability.mjs";
 import { readFailureRecords, summarizeFailures } from "./failure-log.mjs";
+import { releaseRetainedPartial } from "./routing-run.mjs";
 import {
 	canonicalRoutingProject,
 	latchNativeRequired,
@@ -29,6 +30,7 @@ class RoutingCliUsageError extends Error {
 	}
 }
 const ROUTING_RUN_USAGE = `Usage: switchyard-dispatch routing-run inspect --project <path> --routing-run-id <id>
+       switchyard-dispatch routing-run release-partial --project <path> --routing-run-id <id> --task-id <id> [--discard]
        switchyard-dispatch routing-run native-start --project <path> --routing-run-id <id> --authorization <manifest> --actual-start <receipt> --task-id <id> --invocation-id <id>
        switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]
 Native acknowledgement requires existing idle state, exact task authorization and an actual-start receipt. The latch gives direction only; future task authority remains caller-owned.`;
@@ -73,6 +75,7 @@ export async function handleRoutingRun(argv, deps = {}) {
 				"task-id": { type: "string" },
 				"invocation-id": { type: "string" },
 				since: { type: "string" },
+				discard: { type: "boolean" },
 				json: { type: "boolean" },
 				help: { type: "boolean" },
 			},
@@ -86,10 +89,16 @@ export async function handleRoutingRun(argv, deps = {}) {
 		write(ROUTING_RUN_USAGE);
 		return;
 	}
-	if (!["inspect", "native-start", "failures"].includes(command))
+	if (
+		!["inspect", "native-start", "failures", "release-partial"].includes(
+			command,
+		)
+	)
 		throw new RoutingCliUsageError("invalid routing-run subcommand");
 	if (command !== "failures" && values.since !== undefined)
 		throw new RoutingCliUsageError("--since applies only to failures");
+	if (command !== "release-partial" && values.discard !== undefined)
+		throw new RoutingCliUsageError("--discard applies only to release-partial");
 	if (command === "failures") {
 		let since;
 		if (values.since !== undefined) {
@@ -149,6 +158,22 @@ export async function handleRoutingRun(argv, deps = {}) {
 				accountability,
 			}),
 		);
+		return;
+	}
+	if (command === "release-partial") {
+		if (!values["task-id"])
+			throw new RoutingCliUsageError("release-partial requires --task-id");
+		const release = deps.releaseRetainedPartial ?? releaseRetainedPartial;
+		const result = await release(
+			{
+				projectPath: project,
+				routingRunId: runId,
+				taskId: values["task-id"],
+				discard: values.discard === true,
+			},
+			deps,
+		);
+		write(JSON.stringify(result));
 		return;
 	}
 	if (

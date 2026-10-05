@@ -1,12 +1,13 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
 import { createHash, randomUUID } from "node:crypto";
+import { lstatSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import {
 	getImplementorPriority,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
-import { readRun } from "../run-store/index.mjs";
+import { isProjectLockHeld, readRun } from "../run-store/index.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
@@ -17,6 +18,10 @@ import {
 	openRoutingRun,
 	recordAttemptOutcome,
 } from "./routing-state.mjs";
+import {
+	cleanupSimpleWorktree,
+	simpleQuarantinePath,
+} from "./worktree-cleanup.mjs";
 
 export const MAX_SOFT_ATTEMPTS_PER_TASK = 4;
 
@@ -492,6 +497,91 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				});
 			// Continue to the next eligible target (retained clone is independent).
 		}
+	} finally {
+		handle.release();
+	}
+}
+const rejectRelease = (code) => {
+	throw Object.assign(new Error(code), { code });
+};
+function statPartial(path) {
+	try {
+		return lstatSync(path);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		rejectRelease("partial_worktree_unavailable");
+	}
+}
+// routing-state's commit contract accepts only monotonic attempt history, so
+// adopt the current attempts array by reference and clear the released field
+// in place before persisting it.
+function clearPartialWorktree(handle, attemptId) {
+	const attempts = [...handle.state.attempts];
+	handle.commit({ attempts });
+	const attempt = attempts.find((item) => item.attemptId === attemptId);
+	if (!attempt) rejectRelease("routing_state_write_failed");
+	attempt.partialWorktree = null;
+	handle.commit({});
+}
+/**
+ * Release a recorded retained partial once its root is already absent or its
+ * exact claim is discarded. The release clears the routing attempt's
+ * partialWorktree so the partial_work_retained guard passes again.
+ */
+export async function releaseRetainedPartial(options, deps = {}) {
+	const projectPath = canonicalRoutingProject(options.projectPath);
+	const handle = (deps.openRoutingRun ?? openRoutingRun)(
+		projectPath,
+		options.routingRunId,
+		{ stateRoot: deps.stateRoot, create: false },
+	);
+	try {
+		const taskId = options.taskId;
+		const attempt = handle.state.attempts.find(
+			(item) => item.taskId === taskId && item.partialWorktree !== null,
+		);
+		if (!attempt) rejectRelease("partial_worktree_not_recorded");
+		const readRunRecord = deps.readRun ?? readRun;
+		const record = await readRunRecord(attempt.runId).catch(() => null);
+		const claim = record?.worktree;
+		if (
+			!claim ||
+			claim.path !== attempt.partialWorktree ||
+			typeof claim.nonce !== "string" ||
+			!/^\d+$/.test(claim.device ?? "") ||
+			!/^\d+$/.test(claim.inode ?? "")
+		)
+			rejectRelease("partial_worktree_claim_mismatch");
+		const root = statPartial(attempt.partialWorktree);
+		const quarantine = simpleQuarantinePath(claim.nonce);
+		const quarantined = statPartial(quarantine);
+		if (root?.isSymbolicLink() || quarantined?.isSymbolicLink())
+			rejectRelease("partial_worktree_symlink");
+		if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
+			rejectRelease("project_lock_held");
+		if (root && quarantined) rejectRelease("cleanup_state_ambiguous");
+		let discarded = false;
+		if (root || quarantined) {
+			if (!options.discard) rejectRelease("discard_required");
+			const cleanupWorktree =
+				deps.cleanupSimpleWorktree ?? cleanupSimpleWorktree;
+			const cleanup = await cleanupWorktree(attempt.runId, claim, {
+				writerStopped: claim.writerStopped === true,
+				onStatus: deps.onStatus,
+			});
+			if (!cleanup.removed) rejectRelease("cleanup_retained");
+			discarded = true;
+		}
+		clearPartialWorktree(handle, attempt.attemptId);
+		return {
+			ok: true,
+			released: true,
+			routingRunId: options.routingRunId,
+			taskId: attempt.taskId,
+			attemptId: attempt.attemptId,
+			path: attempt.partialWorktree,
+			discarded,
+		};
 	} finally {
 		handle.release();
 	}
