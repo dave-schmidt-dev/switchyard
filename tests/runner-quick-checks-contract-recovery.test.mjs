@@ -7,7 +7,7 @@ import { afterEach, describe, it } from "node:test";
 import { runQuickChecks } from "../src/switchyard/runner/checks.mjs";
 import { parseTaskQueue } from "../src/switchyard/runner/index.mjs";
 
-const TEST_DIR = join(cwd(), ".switchyard-quick-check-test");
+const TEST_DIR = join(cwd(), ".switchyard-quick-check-test-recovery");
 function runFixtureGit(projectPath, args) {
 	const result = spawnSync("git", args, { cwd: projectPath, encoding: "utf8" });
 	if (result.status !== 0)

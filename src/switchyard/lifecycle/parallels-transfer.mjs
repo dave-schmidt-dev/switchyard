@@ -37,11 +37,20 @@ function run(args, stdin = null) {
   return new Promise((resolve, reject) => {
     const child = spawn("prlctl", args, { stdio: ["pipe", "ignore", "pipe"] });
     let stderr = "";
+    let stdinError = null;
     child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8").slice(0, 2000); });
+    // prlctl can exit before it drains a large stdin payload (the pf ruleset).
+    // A write to the abandoned pipe is EPIPE/ECONNRESET, not a command result,
+    // so swallow that error here and keep only its code -- never the bytes --
+    // while the close handler below remains the sole decider of the outcome.
+    child.stdin.on("error", (error) => {
+      if (error && (error.code === "EPIPE" || error.code === "ECONNRESET")) stdinError = error;
+    });
     child.once("error", reject);
     child.once("close", (code, signal) => {
       if (code === 0) return resolve();
-      reject(new Error("prlctl failed (" + (code ?? signal ?? "unknown") + "): " + stderr.trim()));
+      const detail = stderr.trim() || (stdinError ? "stdin " + stdinError.code : "");
+      reject(new Error("prlctl failed (" + (code ?? signal ?? "unknown") + "): " + detail));
     });
     child.stdin.end(stdin);
   });
@@ -153,7 +162,7 @@ export function defaultPidIsAlive(pid) {
  * @param {unknown} error
  * @returns {string}
  */
-export function prlctlFailureText(error) {
+function prlctlFailureText(error) {
 	const parts = [];
 	for (const field of ["stderr", "stdout", "message"]) {
 		const value = error?.[field];
@@ -172,7 +181,7 @@ export function prlctlFailureText(error) {
  * @param {unknown} error
  * @returns {string} member of the prlctl diagnostic vocabulary
  */
-export function classifyPrlctlFailure(error) {
+function classifyPrlctlFailure(error) {
 	const text = prlctlFailureText(error);
 	if (PRLCTL_JOB_MISFIRE.test(text)) return "prlctl_job_misfire";
 	if (PRLCTL_SESSION_NOT_READY.test(text)) return "prlctl_session_not_ready";

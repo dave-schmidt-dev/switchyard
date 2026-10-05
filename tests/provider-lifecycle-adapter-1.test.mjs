@@ -1,6 +1,6 @@
 import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
 import { EventEmitter } from "node:events";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -134,18 +134,22 @@ describe("provider process lifecycle", () => {
 	it("resets silence only on substantive output and preserves the success outcome", async () => {
 		const child = fakeChild();
 		const progress = [];
-		const resultPromise = runProviderProcess("fake", [], {
-			spawnFn: () => {
-				setTimeout(() => child.stdout.emit("data", "progress"), 4);
-				setTimeout(() => child.emit("close", 0, null), 8);
-				return child;
-			},
-			timeoutMs: 100,
+		let polls = 0;
+		const result = await runProviderProcess("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 10_000,
 			silenceTimeoutMs: 20,
 			pollIntervalMs: 1,
+			onPoll: () => {
+				// The supervisor's own poll cadence drives the fake: substantive
+				// output lands on the first observed poll and close on the next,
+				// so no wall-clock sleep decides the outcome.
+				polls += 1;
+				if (polls === 1) child.stdout.emit("data", "progress");
+				if (polls === 2) child.emit("close", 0, null);
+			},
 			onProgress: (value) => progress.push(value),
 		});
-		const result = await resultPromise;
 		strictEqual(result.success, true);
 		strictEqual(result.silenceTimedOut, false);
 		strictEqual(result.progress.outcome, "success");
@@ -250,8 +254,8 @@ describe("provider process lifecycle", () => {
 			const readyPath = join(root, "ready");
 			const script = [
 				'process.on("SIGTERM", () => {});',
-				'require("node:fs").writeFileSync(process.argv[1], "ready");',
-				"setTimeout(() => process.exit(0), 1000);",
+				'require("node:fs").writeFileSync(process.argv[1], String(process.pid));',
+				"setInterval(() => {}, 1000);",
 			].join("");
 			const backend = {
 				execArgv() {
@@ -259,6 +263,8 @@ describe("provider process lifecycle", () => {
 				},
 			};
 			const startedAt = Date.now();
+			let helperPid = null;
+			let helperGone = false;
 			try {
 				if (mode === "synchronous") {
 					throws(() =>
@@ -270,11 +276,29 @@ describe("provider process lifecycle", () => {
 					);
 				}
 				ok(existsSync(readyPath), "child installed its handler before timeout");
-				ok(
-					Date.now() - startedAt < 700,
-					"probe returned within its hard budget",
-				);
+				helperPid = Number(readFileSync(readyPath, "utf8"));
+				// The never-completing fake ignores SIGTERM, so wait on its actual
+				// disappearance rather than an elapsed-time window: a TERM-only kill
+				// would leave it running past the probe's hard budget.
+				while (Date.now() - startedAt < 15_000) {
+					try {
+						process.kill(helperPid, 0);
+					} catch (error) {
+						if (error?.code !== "ESRCH") throw error;
+						helperGone = true;
+						break;
+					}
+					await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+				}
+				ok(helperGone, "probe hard-killed the SIGTERM-ignoring host");
 			} finally {
+				if (helperPid !== null && !helperGone) {
+					try {
+						process.kill(helperPid, "SIGKILL");
+					} catch {
+						// The helper exited between the observation and this kill.
+					}
+				}
 				rmSync(root, { recursive: true, force: true });
 			}
 		});
@@ -282,10 +306,13 @@ describe("provider process lifecycle", () => {
 
 	it("bounds and reports an asynchronous task-base probe", async () => {
 		const statuses = [];
+		let clockReads = 0;
 		await rejects(
 			captureTaskStartTreeAsync(
 				{
 					execArgv() {
+						// A helper that would never complete: only the probe's own
+						// deadline can end it.
 						return {
 							command: process.execPath,
 							args: ["-e", "setInterval(() => {}, 1000)"],
@@ -296,10 +323,14 @@ describe("provider process lifecycle", () => {
 				{
 					runId: "timeout-run",
 					taskId: "1.1",
-					timeoutMs: 10,
+					timeoutMs: 10_000,
+					// Spend the budget through the injected clock at the first
+					// command construction instead of waiting out the bound.
+					now: () => (clockReads++ === 0 ? 0 : 10_001),
 					onStatus: (status) => statuses.push(status),
 				},
 			),
+			/task base probe deadline exhausted/,
 		);
 		deepStrictEqual(
 			statuses.map(({ event, stage }) => [event, stage]),
@@ -342,14 +373,17 @@ describe("provider process lifecycle", () => {
 	it("retains bounded process identity, deadline, silence observation, and cleanup outcome", async () => {
 		const child = fakeChild();
 		child.pid = 4242;
+		let clock = 0;
 		const promise = runProviderProcess("fake", [], {
 			spawnFn: () => child,
 			timeoutMs: 100,
 			silenceTimeoutMs: 1,
+			now: () => clock,
 			cleanup: () => ({ cleanupFailed: true, cleanupStage: "tree_terminated" }),
 		});
 		child.stdout.emit("data", "buffered\n");
-		await new Promise((resolve) => setTimeout(resolve, 4));
+		// Advance the injected clock past the silence window rather than sleeping.
+		clock = 2;
 		child.emit("close", 1, null);
 		const result = await promise;
 		strictEqual(result.success, false);

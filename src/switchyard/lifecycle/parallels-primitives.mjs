@@ -3,18 +3,18 @@ import { PrlctlCallError } from "../adapter/exec-error.mjs";
 
 export const PARALLELS_WORKING_PREFIX = "switchyard-work-";
 export const MAX_AQUA_EXEC_ARGV_BYTES = 600000;
-export const HOST_PROCESS_IDENTITY_VERSION = "switchyard-host-process-v1";
+const HOST_PROCESS_IDENTITY_VERSION = "switchyard-host-process-v1";
 export const ALLOCATION_INTENT_PREFIX = "parallels-allocation-";
 export const ALLOCATION_INTENT_SUFFIX = ".intent.json";
-export const HOST_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
-export const HOST_PROCESS_IDENTITY_MAX_BUFFER = 4_096;
-export const CANONICAL_UUID =
+const HOST_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
+const HOST_PROCESS_IDENTITY_MAX_BUFFER = 4_096;
+const CANONICAL_UUID =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-export const HOST_PROCESS_IDENTITY = new RegExp(
+const HOST_PROCESS_IDENTITY = new RegExp(
 	`^${HOST_PROCESS_IDENTITY_VERSION}:([0-9a-f-]{36}):([1-9]\\d*):([1-9]\\d*)$`,
 	"iu",
 );
-export const HOST_PROCESS_PROBE_SOURCE = `
+const HOST_PROCESS_PROBE_SOURCE = `
 import ctypes, errno, json, sys, uuid
 VERSION = "switchyard-host-process-v1"
 LIBPROC = "/usr/lib/libproc.dylib"
@@ -58,7 +58,7 @@ else:
 sys.stdout.write(json.dumps(result, separators=(",", ":")))
 `;
 
-export function parseHostProcessProbe(value, expectedPid) {
+function parseHostProcessProbe(value, expectedPid) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const fields = ["version", "state", "pid", "bootSessionUuid", "startTicks"];
 	if (
@@ -300,7 +300,7 @@ export const DEFAULT_HOST_READINESS_ATTEMPTS = 2;
 export const DEFAULT_HOST_READINESS_BACKOFF_MS = 100;
 export const DEFAULT_HOST_READINESS_TIMEOUT_MS = 2_000;
 export const HOST_READINESS_MAX_BUFFER = 1024 * 1024;
-export const HOST_PERMISSION_DENIED_SIGNATURE =
+const HOST_PERMISSION_DENIED_SIGNATURE =
 	/(?:^|\n)(?:\/usr\/local\/bin\/prlctl: line \d+: )?\/bin\/ps:\s*Operation not permitted(?:\n|$)/u;
 // This remains deliberately disabled until an attended, disposable-VM run has
 // observed both an already-satisfied postcondition and a lost SDK result for

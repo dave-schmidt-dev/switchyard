@@ -1,5 +1,5 @@
 import { deepStrictEqual, rejects, strictEqual } from "node:assert";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createBroker } from "../src/switchyard/broker/index.mjs";
@@ -100,6 +100,17 @@ async function fixture(options = {}) {
 		...options,
 	});
 }
+async function waitFor(read, timeoutMs = 15_000, intervalMs = 5) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const value = await read();
+		if (value) return value;
+		if (Date.now() >= deadline) {
+			throw new Error(`condition was not observed within ${timeoutMs}ms`);
+		}
+		await new Promise((resolveWait) => setTimeout(resolveWait, intervalMs));
+	}
+}
 describe("broker reservations", () => {
 	it("reads the ledger while a live writer holds the lock", async () => {
 		// Task 40. Reads used to take the write lock, so a reader competed with
@@ -141,18 +152,24 @@ describe("broker reservations", () => {
 		const ledger = await fixture({ leaseMs: 1_000 });
 		let observed = null;
 		let executorError = null;
+		let before = null;
 		const broker = createBroker({
 			...dependencies(ledger, 4),
 			getInvocationDescriptor: () => codexDescriptor(),
 			reservationRenewIntervalMs: 5,
 			executor: async () => {
-				await new Promise((done) => setTimeout(done, 60));
-				// Capture rather than let the broker swallow it: anything thrown
-				// here used to surface as "the lease did not advance", which named
-				// the wrong defect for two separate real failures.
+				// The renewal loop is fast but not synchronous, so wait for the
+				// lease to observably advance instead of betting a fixed sleep
+				// against a tick. Capture rather than let the broker swallow it:
+				// anything thrown here used to surface as "the lease did not
+				// advance", which named the wrong defect for two separate real
+				// failures.
 				try {
-					observed =
-						(await ledger.inspect()).reservations[0]?.expiresAt ?? null;
+					observed = await waitFor(async () => {
+						const current =
+							(await ledger.inspect()).reservations[0]?.expiresAt ?? null;
+						return current !== null && current > before ? current : null;
+					});
 				} catch (error) {
 					executorError = error;
 				}
@@ -160,7 +177,7 @@ describe("broker reservations", () => {
 			},
 		});
 		const result = await broker.selectAndReserve(request("TASK-001"));
-		const before = (await ledger.inspect()).reservations[0].expiresAt;
+		before = (await ledger.inspect()).reservations[0].expiresAt;
 		try {
 			await broker.execute(request("TASK-001"), result, {
 				launcherIdentity: broker.launcherIdentity(result),
@@ -185,13 +202,24 @@ describe("broker reservations", () => {
 		const renewGate = new Promise((resolve) => {
 			releaseRenew = resolve;
 		});
+		let markRenewEntered = () => {};
+		const renewEntered = new Promise((resolve) => {
+			markRenewEntered = resolve;
+		});
+		let markRenewFinished = () => {};
+		const renewFinished = new Promise((resolve) => {
+			markRenewFinished = resolve;
+		});
 		// Park the in-flight tick until after the terminal write so the renewal
 		// resolves against a record the broker has already reconciled.
 		const parked = {
 			...ledger,
 			renew: async (input) => {
+				markRenewEntered();
 				await renewGate;
-				return await ledger.renew(input);
+				const outcome = await ledger.renew(input);
+				markRenewFinished();
+				return outcome;
 			},
 		};
 		const events = [];
@@ -200,7 +228,10 @@ describe("broker reservations", () => {
 			getInvocationDescriptor: () => codexDescriptor(),
 			reservationRenewIntervalMs: 5,
 			executor: async () => {
-				await new Promise((done) => setTimeout(done, 40));
+				// A parked renewal is the observable event that replaces the old
+				// fixed sleep: the executor only finishes once a tick is genuinely
+				// in flight against the lease.
+				await renewEntered;
 				return { success: true };
 			},
 		});
@@ -211,7 +242,10 @@ describe("broker reservations", () => {
 		});
 		strictEqual(execution.success, true);
 		releaseRenew();
-		await new Promise((done) => setTimeout(done, 20));
+		await renewFinished;
+		// A macrotask boundary lets every continuation of the released renewal
+		// settle before the absence of a loss event is asserted.
+		await new Promise((resolveTurn) => setImmediate(resolveTurn));
 		deepStrictEqual(
 			events.filter((event) => event.event === "reservation_renewal_lost"),
 			[],
@@ -221,19 +255,25 @@ describe("broker reservations", () => {
 		const root = await tempDirAsync(
 			"switchyard-reservations-ownerless-deadline-",
 		);
-		await mkdir(join(root, "reservations.lock"));
+		const lockPath = join(root, "reservations.lock");
+		await mkdir(lockPath);
 		// No ownerlessLockStaleMs: the default must leave this acquirer a real
-		// recovery window. At a threshold equal to lockTimeoutMs the reclaim still
-		// happens, but only on the tick that also satisfies the deadline check one
-		// line later — correct by evaluation order alone. Asserting the elapsed
-		// time is what distinguishes a real window from that knife edge.
-		const lockTimeoutMs = 400;
+		// recovery window. The lock's mtime is the epoch and the injected clock
+		// advances 300ms per observation, so the first stale check lands at
+		// 300ms — past the default ownerless bound (half the 400ms acquisition
+		// timeout) but short of the timeout itself. The bound therefore decides
+		// the reclaim rather than machine load; a bound equal to the timeout
+		// would not look stale at 300ms and would exhaust the deadline on the
+		// following check instead.
+		await utimes(lockPath, 0, 0);
+		let clock = -300;
+		const now = () => (clock += 300);
 		const ledger = createReservationLedger({
 			root,
-			lockTimeoutMs,
+			lockTimeoutMs: 400,
 			lockRetryMs: 20,
+			now,
 		});
-		const startedAt = Date.now();
 		const reservation = await ledger.reserve({
 			provider: "Codex",
 			window: "window-1",
@@ -245,12 +285,7 @@ describe("broker reservations", () => {
 			capacity: 1,
 		});
 		strictEqual(reservation.taskId, "TASK-001");
-		const elapsed = Date.now() - startedAt;
-		strictEqual(
-			elapsed < lockTimeoutMs * 0.75,
-			true,
-			`expected the reclaim well inside the acquisition window, took ${elapsed}ms of ${lockTimeoutMs}ms`,
-		);
+		strictEqual((await ledger.inspect()).reservations.length, 1);
 	});
 	it("skips a provider whose in-flight reservations already fill the window", async () => {
 		const ledger = await fixture();

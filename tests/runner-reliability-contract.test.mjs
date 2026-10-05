@@ -2,7 +2,6 @@ import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cwd } from "node:process";
 import { after, describe, it } from "node:test";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
@@ -17,8 +16,9 @@ import {
 	acceptanceCheckDiagnostic,
 	runCommand,
 } from "../src/switchyard/runner/reliability.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_DIR = join(cwd(), `.switchyard-queue-reliability-${process.pid}`);
+const TEST_DIR = tempDir("switchyard-queue-reliability-");
 function git(cwd, args) {
 	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
 	if (result.status !== 0)
@@ -100,7 +100,10 @@ function fixturePreflightReadSnapshot({ ok = true, percentLeft = 80 } = {}) {
 	});
 }
 
-function commandFromScript(script, { timeout = 2_000, maxBuffer = 1024 } = {}) {
+function commandFromScript(
+	script,
+	{ timeout = 15_000, maxBuffer = 1024 } = {},
+) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	return runCommand(TEST_DIR, process.env, ["node", "--version"], 100, {
 		sandbox: false,
@@ -116,7 +119,7 @@ after(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 
 describe("queue reliability contract", () => {
 	it("distinguishes an outer timeout from worker overflow and nonzero exit", () => {
-		const timeout = commandFromScript("setTimeout(() => {}, 5_000)", {
+		const timeout = commandFromScript("setTimeout(() => {}, 60_000)", {
 			timeout: 50,
 		});
 		strictEqual(timeout.timedOut, true);

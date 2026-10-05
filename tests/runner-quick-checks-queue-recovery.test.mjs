@@ -8,7 +8,6 @@ import {
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
@@ -20,8 +19,9 @@ import {
 	runQueueAsync,
 	runQueueWithOrchestrator,
 } from "../src/switchyard/runner/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_DIR = join(cwd(), ".switchyard-quick-check-test");
+const TEST_DIR = tempDir("switchyard-quick-checks-queue-");
 function writeTasksFile(content) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	const tasksPath = join(TEST_DIR, "tasks.md");
@@ -256,7 +256,6 @@ describe("Task 51 quick-check regression", () => {
 		strictEqual(asyncResult.result, "check_failed");
 		const failedOrchestrator = await runQueueWithOrchestrator({
 			...options,
-			pollIntervalMs: 1,
 			dependencies: {
 				...dependencies,
 				adapters: { claude: { captureDiffAsync: async () => patch } },

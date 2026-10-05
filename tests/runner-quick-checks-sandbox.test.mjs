@@ -10,7 +10,7 @@ import {
 	runQuickChecks,
 } from "../src/switchyard/runner/checks.mjs";
 
-const TEST_DIR = join(cwd(), ".switchyard-quick-check-test");
+const TEST_DIR = join(cwd(), ".switchyard-quick-check-test-sandbox");
 function runFixtureGit(projectPath, args) {
 	const result = spawnSync("git", args, { cwd: projectPath, encoding: "utf8" });
 	if (result.status !== 0)

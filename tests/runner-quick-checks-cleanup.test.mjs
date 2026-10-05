@@ -8,20 +8,28 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import {
 	runQuickChecks,
 	runQuickChecksAsync,
 } from "../src/switchyard/runner/checks.mjs";
 import { parseTaskQueue } from "../src/switchyard/runner/index.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
-const TEST_DIR = join(cwd(), ".switchyard-quick-check-test");
+const TEST_DIR = tempDir("switchyard-quick-checks-cleanup-");
+const READY_TIMEOUT_MS = 30_000;
+const CHECK_TIMEOUT_MS = 15_000;
 function runFixtureGit(projectPath, args) {
 	const result = spawnSync("git", args, { cwd: projectPath, encoding: "utf8" });
 	if (result.status !== 0)
 		throw new Error(result.stderr || `git ${args.join(" ")} failed`);
 	return result.stdout.trim();
+}
+async function waitFor(check, timeoutMs = READY_TIMEOUT_MS) {
+	const deadline = Date.now() + timeoutMs;
+	while (!check() && Date.now() < deadline)
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	return check();
 }
 afterEach(() => {
 	rmSync(TEST_DIR, { recursive: true, force: true });
@@ -32,13 +40,25 @@ describe("Task 51 quick-check regression", () => {
 			const project = join(TEST_DIR, `task-check-child-${mode}`);
 			mkdirSync(project, { recursive: true });
 			let marker = null;
-			const ending =
-				mode === "normal"
-					? "await new Promise((resolve) => setTimeout(resolve, 200));"
-					: mode === "failed"
-						? "process.exit(3);"
-						: "setInterval(() => {}, 1000);";
-			const script = `import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: process.cwd(), detached: true, stdio: "ignore" });\nwriteFileSync(join(process.env.HOME, "check-helper.pid"), String(child.pid));\nchild.unref();\n${ending}\n`;
+			let release = null;
+			const handshakes = mode === "normal" || mode === "failed";
+			const ending = handshakes
+				? `await waitForRelease();${mode === "failed" ? "\nprocess.exit(3);" : ""}`
+				: "setInterval(() => {}, 1000);";
+			const script = `import { spawn } from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: process.cwd(), detached: true, stdio: "ignore" });
+writeFileSync(join(process.env.HOME, "check-helper.pid"), String(child.pid));
+child.unref();
+const waitForRelease = async () => {
+	const releasePath = join(process.env.HOME, "check-release.flag");
+	const deadline = Date.now() + ${READY_TIMEOUT_MS};
+	while (!existsSync(releasePath) && Date.now() < deadline)
+		await new Promise((resolve) => setTimeout(resolve, 20));
+};
+${ending}
+`;
 			writeFileSync(join(project, "check.mjs"), script);
 			writeFileSync(join(project, "a.mjs"), "export const a = 1;\n");
 			runFixtureGit(project, ["init", "-q"]);
@@ -66,17 +86,26 @@ describe("Task 51 quick-check regression", () => {
 					baseTree,
 					diff,
 					checks: [["node", "--test", "check.mjs"]],
-					checkTimeoutMs: mode === "timeout" ? 1_000 : undefined,
+					checkTimeoutMs: mode === "timeout" ? CHECK_TIMEOUT_MS : undefined,
 					allowedPaths: ["a.mjs"],
 					onRunnerStarted: (value, root) => {
 						runnerPid = value;
 						marker = join(root, "check-helper.pid");
+						release = join(root, "check-release.flag");
 					},
 				});
-				for (let i = 0; i < 100 && !existsSync(marker); i += 1)
-					await new Promise((resolve) => setTimeout(resolve, 20));
-				ok(existsSync(marker), "check helper must start before cleanup");
-				pid = Number(readFileSync(marker, "utf8"));
+				const startedPid = await waitFor(() => {
+					if (!marker) return 0;
+					try {
+						const value = Number(readFileSync(marker, "utf8"));
+						return Number.isSafeInteger(value) && value > 0 ? value : 0;
+					} catch {
+						return 0;
+					}
+				});
+				ok(startedPid > 0, "check helper must start before cleanup");
+				pid = startedPid;
+				if (release && handshakes) writeFileSync(release, "release");
 				if (mode === "abrupt") {
 					process.kill(runnerPid, "SIGKILL");
 				}

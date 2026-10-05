@@ -147,19 +147,19 @@ describe("VM ownership metadata", () => {
 		const productionSources = [
 			[
 				"../src/switchyard/lifecycle/parallels-execution-backend.mjs",
-				"63d9f0b9b9e50b57f7a24be1589cb4b72793b7a26f73b2ff3f9fce4418dd48d6",
+				"ddcc5c7553e3834469ec0a30facbb8738a10232cd0ab4a09723ac8af0cc445ee",
 			],
 			[
 				"../src/switchyard/lifecycle/parallels-primitives.mjs",
-				"650ebabc4ec649c307a603b7bb6b245e400203275c2df5eb07ca9c1ee453019c",
+				"24125da3a5453e316f89a557dfdd73ac13bf6d20215e9386c3ea54c886c66fac",
 			],
 			[
 				"../src/switchyard/lifecycle/parallels-transfer.mjs",
-				"090b2a6f8f118dadf035b5429a17cd8559decb7d869fe11088e53f7e7ca65e1e",
+				"8d472c7f4ba7fc641c1ef99613fe15f54f28dc4ac711c0a105e11569f86cf9a1",
 			],
 			[
 				"../src/switchyard/lifecycle/parallels-validation.mjs",
-				"40728f2f79adb98a7f43d447b77d8e595062eaff94a6ffa56bc5462d1cb13d81",
+				"130aa9af914da785cb2fe225470bad883fca4a1b96813a8b7f496cb48e99db19",
 			],
 		];
 		for (const [relativePath, expectedHash] of productionSources) {

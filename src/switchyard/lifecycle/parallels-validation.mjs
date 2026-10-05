@@ -194,7 +194,7 @@ export function snapshotDifference(after, before) {
 	return [...after].filter((id) => !before.has(id));
 }
 
-export function measurePathBytes(path) {
+function measurePathBytes(path) {
 	const entry = lstatSync(path);
 	if (!entry.isDirectory()) return entry.size;
 	return readdirSync(path, { withFileTypes: true }).reduce((total, child) => {
@@ -232,7 +232,7 @@ export function diskBytesFromInfo(info, diskUsageFn = null) {
 	);
 }
 
-export function validateRunId(runId) {
+function validateRunId(runId) {
 	if (typeof runId !== "string" || !SAFE_RUN_ID.test(runId)) {
 		throw new Error("runId must be a non-empty safe identifier");
 	}
@@ -306,7 +306,7 @@ export function validateLinkedCloneMeasurement(measurement) {
 	return { diskBytes, cloneToBootMs };
 }
 
-export const HOST_READINESS_CODES = new Set([
+const HOST_READINESS_CODES = new Set([
 	"vm_host_inventory_permission_denied",
 	"vm_host_inventory_unavailable",
 	"vm_host_service_degraded",

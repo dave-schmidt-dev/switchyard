@@ -102,6 +102,100 @@ describe("bulk-transfer helper misfire tolerance", () => {
 		}
 	}
 
+	function runEarlyCloseHelper(retryAttempts) {
+		const root = tempDir("switchyard-bulk-helper-early-close-");
+		try {
+			const binDir = join(root, "bin");
+			const counterPath = join(root, "invocations");
+			mkdirSync(binDir, { recursive: true });
+			writeFileSync(counterPath, "0");
+			// This prlctl never reads its stdin: it reports the misfire and
+			// exits at once, abandoning the pipe while the helper is writing.
+			writeFileSync(
+				join(binDir, "prlctl"),
+				[
+					"#!/bin/sh",
+					'n=$(cat "$STUB_COUNTER")',
+					"n=$((n+1))",
+					'printf %s "$n" > "$STUB_COUNTER"',
+					`echo "${MISFIRE_LINE}" >&2`,
+					"exit 255",
+					"",
+				].join("\n"),
+				{ mode: 0o755 },
+			);
+			// A ruleset past the pipe buffer prlctl can never drain, tagged with a
+			// marker that must never appear in the helper's logs.
+			const canary = "BULK-TRANSFER-STDIN-CANARY";
+			const transferHost = `${canary}-`.repeat(8192);
+			const payload = Buffer.from("payload-bytes");
+			const config = {
+				direction: "push",
+				transferHost,
+				listenHost: "127.0.0.1",
+				maxBytes: 1024 * 1024,
+				misfireSource: "PrlJob_(?:GetRetCode|GetResult):\\s*Invalid argument",
+				retryAttempts,
+				retryBackoffMs: 1,
+				guestArgs: ["exec", "vm-1", "/usr/bin/curl", "TRANSFER_URL"],
+				pfArgs: ["exec", "vm-1", "/sbin/pfctl", "-a", "anchor", "-f", "-"],
+				cleanupArgs: [
+					"exec",
+					"vm-1",
+					"/sbin/pfctl",
+					"-a",
+					"anchor",
+					"-F",
+					"all",
+				],
+			};
+			const result = spawnSync(
+				process.execPath,
+				["--input-type=module", "-e", BULK_TRANSFER_HELPER],
+				{
+					input: Buffer.concat([
+						Buffer.from(`${JSON.stringify(config)}\n`, "utf8"),
+						payload,
+					]),
+					encoding: null,
+					env: {
+						...process.env,
+						PATH: `${binDir}:${process.env.PATH}`,
+						STUB_COUNTER: counterPath,
+					},
+				},
+			);
+			return {
+				status: result.status,
+				stderr: (result.stderr ?? Buffer.alloc(0)).toString("utf8"),
+				invocations: Number(readFileSync(counterPath, "utf8")),
+				canary,
+			};
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	it("absorbs an early stdin close and still honors the retry bound", () => {
+		// prlctl exits before draining the ruleset, so the helper's write fails
+		// with EPIPE. That must not crash the helper: the close handler still
+		// classifies the failure and the loop still stops at the bound.
+		const run = runEarlyCloseHelper(3);
+
+		strictEqual(run.status, 1, run.stderr);
+		ok(
+			/bulk transfer failed after 3 attempt\(s\)/.test(run.stderr),
+			`attempt count was not reported: ${run.stderr}`,
+		);
+		ok(
+			!/EPIPE|ECONNRESET|Unhandled|Uncaught/.test(run.stderr),
+			`stdin close was not absorbed: ${run.stderr}`,
+		);
+		ok(!run.stderr.includes(run.canary), "helper logged stdin payload bytes");
+		// Three pf attempts plus the best-effort cleanup, which is not retried.
+		strictEqual(run.invocations, 4);
+	});
+
 	it("absorbs a misfire and completes the transfer", () => {
 		// Two misfires, then the pf load lands on the third try; the guest call
 		// and the anchor flush then succeed. Five invocations for three commands

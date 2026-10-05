@@ -89,6 +89,7 @@ function declaredFilesChanged(worktreePath, files, baseline) {
 	});
 }
 const DEADLINE_CHANGED_FILES_TIMEOUT_MS = 5000;
+const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
 const DIFF_REJECTION_PATH_LIMIT = 5;
 const DIFF_REJECTION_PATH_MAX_CHARS = 200;
 const DIFF_REJECTION_REASON_RULES = new Set([
@@ -211,6 +212,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let lastMilestoneAt = startedAt;
 	let firstChangeObserved = false;
 	let lastFirstChangeProbeAt = Number.NEGATIVE_INFINITY;
+	let lastHeartbeatPersistedAt = Number.NEGATIVE_INFINITY;
+	let runTerminalReached = false;
 	let runInitialized = false;
 	let failureTerminalDurable = true;
 	const pendingDurability = new Set();
@@ -317,6 +320,34 @@ export async function runSimpleTask(options, dependencies = {}) {
 			firstChangeObserved,
 			...details,
 		});
+		// Durable liveness only, and only while a provider run is actually live.
+		// Nothing derived (elapsed, progress) is persisted: the record carries the
+		// timestamp this process observed, no more.
+		if (!runInitialized || !providerStarted || runTerminalReached) return;
+		if (observedAt - lastHeartbeatPersistedAt < HEARTBEAT_PERSIST_INTERVAL_MS)
+			return;
+		lastHeartbeatPersistedAt = observedAt;
+		const heartbeatWrite = (
+			dependencies.updateRunWithRetry ?? updateRunWithRetry
+		)(runId, {
+			activeTaskHeartbeatAt: observedAt,
+		}).catch(() => {});
+		pendingDurability.add(heartbeatWrite);
+		void heartbeatWrite.finally(() => pendingDurability.delete(heartbeatWrite));
+	};
+	const persistProviderStarted = async () => {
+		if (!runInitialized) return null;
+		const observedAt = now();
+		try {
+			await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+				state: "running",
+				startedAt: new Date(observedAt).toISOString(),
+				activeTaskStartedAt: observedAt,
+			});
+			return null;
+		} catch (error) {
+			return error;
+		}
 	};
 	let cleanupAttempted = false;
 	const removeNonSalvageWorktree = async () => {
@@ -385,6 +416,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		errorKind = null,
 		error = null,
 	) => {
+		runTerminalReached = true;
 		const computedErrorKind =
 			errorKind ?? classifyErrorKind(failureReason, failurePhase, error);
 		if (
@@ -1142,6 +1174,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return await cancelAdmission(admission, "deadline_expired");
 		let providerResult;
 		let requestLogStatus;
+		let providerStartedWriteFailure = null;
 		try {
 			if (!admission.startPrepared().allowed)
 				return await cancelAdmission(admission, "route_health_blocked");
@@ -1188,10 +1221,29 @@ export async function runSimpleTask(options, dependencies = {}) {
 				},
 			});
 			milestone("execute", "provider_started");
-			providerResult = await execution;
+			// Await both together so a provider rejection during the run-store
+			// write is always handled.
+			const startedWrite = persistProviderStarted();
+			pendingDurability.add(startedWrite);
+			void startedWrite.finally(() => pendingDurability.delete(startedWrite));
+			[providerStartedWriteFailure, providerResult] = await Promise.all([
+				startedWrite,
+				execution,
+			]);
 		} finally {
 			requestLogStatus = requestRecorder?.close();
 		}
+		if (providerStartedWriteFailure)
+			return fail(
+				"run_store_write_failed",
+				"execute",
+				classifyErrorKind(
+					"run_store_write_failed",
+					"execute",
+					providerStartedWriteFailure,
+				),
+				providerStartedWriteFailure,
+			);
 		providerExecutionResult = providerResult;
 		providerLifecycle = boundProviderLifecycleSnapshot(
 			providerResult?.providerLifecycle,
@@ -1882,6 +1934,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				);
 			}
 		}
+		runTerminalReached = true;
 		emitStatus(onStatus, taskId, "cleanup");
 		currentPhase = "cleanup";
 		let cleanupFailure = null;
