@@ -1,13 +1,18 @@
 import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
 } from "./helpers/dispatch-cli-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
+
+const DISPATCH_ENTRY = fileURLToPath(
+	new URL("../src/switchyard/dispatch/index.mjs", import.meta.url),
+);
 
 let dir;
 let tasksFile;
@@ -82,9 +87,14 @@ describe("launch integration", () => {
 		const envelope = JSON.parse(launched.stdout.trim());
 		strictEqual(envelope.stateRoot, quotedStateRoot);
 
+		// Put this checkout's own entry point on PATH, as the installed
+		// symlink does, so the poll never depends on the host ~/.agent/bin.
+		const binDir = join(dir, "bin");
+		mkdirSync(binDir, { recursive: true });
+		symlinkSync(DISPATCH_ENTRY, join(binDir, "switchyard-dispatch"));
 		const freshEnv = {
 			...process.env,
-			PATH: `${join(process.env.HOME ?? "/", ".agent", "bin")}:${process.env.PATH ?? ""}`,
+			PATH: `${binDir}:${process.env.PATH ?? ""}`,
 			SWITCHYARD_ROSTER_PATH: ROSTER_FIXTURE_PATH,
 			SWITCHYARD_LEDGER_PATH: join(dir, "fresh-poller-ledger.jsonl"),
 		};

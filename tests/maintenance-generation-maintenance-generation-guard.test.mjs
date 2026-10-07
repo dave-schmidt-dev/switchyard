@@ -8,6 +8,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -26,6 +27,20 @@ import {
 } from "../src/switchyard/maintenance/index.mjs";
 import { runQueue } from "../src/switchyard/runner/index.mjs";
 import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
+
+// The producers are host tools under ~/.agent; skip, never fail, where they
+// are absent (the check sandbox and CI run under an isolated HOME).
+const HOST_METRICS = join(homedir(), ".agent", "bin", "metrics");
+const HOST_EXPAND = join(
+	homedir(),
+	".agent",
+	"prompts",
+	"_shared",
+	"expand.sh",
+);
+const HOST_PRODUCERS_SKIP =
+	!(existsSync(HOST_METRICS) && existsSync(HOST_EXPAND)) &&
+	"host ~/.agent producers absent";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workerBootstrap = join(
@@ -305,18 +320,15 @@ describe("maintenance generation guard", () => {
 		);
 	});
 
-	it("guards the external metrics and plan/implement producers", () => {
+	it("guards the external metrics and plan/implement producers", {
+		skip: HOST_PRODUCERS_SKIP,
+	}, () => {
 		const path = markerPath();
 		activeMarker(path);
 		const env = { ...process.env, SWITCHYARD_GENERATION_MARKER: path };
 		const metrics = spawnSync(
 			"python3",
-			[
-				"/Users/dave/.agent/bin/metrics",
-				"append",
-				"--file",
-				join(tempDir(), "metrics.jsonl"),
-			],
+			[HOST_METRICS, "append", "--file", join(tempDir(), "metrics.jsonl")],
 			{
 				encoding: "utf8",
 				input: "{}",
@@ -325,28 +337,20 @@ describe("maintenance generation guard", () => {
 			},
 		);
 		assert.equal(metrics.status, 1);
-		const producer = spawnSync(
-			"bash",
-			["/Users/dave/.agent/prompts/_shared/expand.sh", "implement"],
-			{
-				encoding: "utf8",
-				env,
-				stdio: ["ignore", "ignore", "ignore"],
-			},
-		);
+		const producer = spawnSync("bash", [HOST_EXPAND, "implement"], {
+			encoding: "utf8",
+			env,
+			stdio: ["ignore", "ignore", "ignore"],
+		});
 		assert.equal(producer.status, 1);
-		const ordinary = spawnSync(
-			"bash",
-			["/Users/dave/.agent/prompts/_shared/expand.sh", "implement"],
-			{
-				encoding: "utf8",
-				env: {
-					...process.env,
-					SWITCHYARD_GENERATION_MARKER: join(tempDir(), "absent.json"),
-				},
-				stdio: ["ignore", "ignore", "ignore"],
+		const ordinary = spawnSync("bash", [HOST_EXPAND, "implement"], {
+			encoding: "utf8",
+			env: {
+				...process.env,
+				SWITCHYARD_GENERATION_MARKER: join(tempDir(), "absent.json"),
 			},
-		);
+			stdio: ["ignore", "ignore", "ignore"],
+		});
 		assert.equal(ordinary.status, 0);
 	});
 });

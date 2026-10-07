@@ -30,6 +30,13 @@ export function fixture(overrides = {}) {
 	const deps = {
 		stateRoot,
 		getImplementorPriority: () => 1,
+		// Target ids are their own identities, so routing never reads the host
+		// roster (the check sandbox runs tests under an isolated HOME).
+		resolveTargetIdentity: (provider) => ({
+			targetId: provider,
+			harnessKey: provider,
+			ambiguous: false,
+		}),
 		assertFundedRoute: () => {},
 		route: ({ availableProviders }) => ({
 			provider: availableProviders[0] ?? null,

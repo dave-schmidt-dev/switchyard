@@ -237,6 +237,8 @@ test("production router uses tier1 roster order when pace is unknown, tier2 head
 			implementor_priority: 2,
 		},
 	};
+	// Exercise production target resolution against this test's roster.
+	delete f.deps.resolveTargetIdentity;
 	const path = join(f.deps.stateRoot, "roster.json");
 	writeFileSync(path, JSON.stringify(roster));
 	const previous = process.env.SWITCHYARD_ROSTER_PATH;

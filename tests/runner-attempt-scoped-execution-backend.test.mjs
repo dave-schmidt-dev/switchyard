@@ -12,20 +12,79 @@ import { afterEach, describe, it } from "node:test";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
 import { captureDirtyOverlay } from "../src/switchyard/lifecycle/index.mjs";
 import {
+	createBrokerAdapterLauncher,
 	createQueueIdentity,
+	executeTaskAsync,
 	normalizeRunOptions,
 	parseTaskQueue,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	descriptorForRoute,
-	executeTask,
-	executeTaskAsync,
 	runnerTestDir,
-} from "./helpers/runner-fixtures.mjs";
+	TASK_BASE,
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
+const FIXTURE_ROUTE = { provider: "claude", model: "fixture-model" };
+// executeTaskAsync is a bare execute path: it has no queue bootstrap, so the
+// immutable task base, provider execution, and diff capture all have to come
+// from stub async seams.
+function asyncBroker(route, adapters) {
+	return {
+		selectAndReserve: async (request) => {
+			const routed = route(request) ?? FIXTURE_ROUTE;
+			return {
+				provider: routed.provider,
+				model: routed.model,
+				resolvedTarget: routed.resolvedTargetId ?? routed.provider,
+				harness: routed.resolved_harness ?? routed.provider,
+				capability: request.capability,
+				effort: null,
+				reason: routed.reason ?? "fixture",
+				reservation: { id: "fixture-reservation" },
+				snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+			};
+		},
+		launcherIdentity: () => ({}),
+		execute: async () =>
+			adapters.claude.executeAsync("fixture", "overlay-worker", {}),
+		release: async () => {},
+	};
+}
+function asyncTaskContext(overrides = {}) {
+	const route = overrides.route ?? (() => FIXTURE_ROUTE);
+	const taskBases = overrides.taskBases ?? {};
+	const adapters = overrides.adapters ?? {
+		claude: {
+			executeAsync: async () => ({ success: true, output: "ok" }),
+			captureDiffAsync: async () => "",
+		},
+	};
+	return {
+		projectPath: TEST_DIR,
+		workingContainerName: "overlay-worker",
+		taskBases,
+		persistTaskBase: (taskId, base) => {
+			taskBases[taskId] = base;
+		},
+		resolveDescriptor: () => descriptorForRoute(route()),
+		recordDispatch: () => {},
+		recordDispatchIntent: () => {},
+		integrationGate: () => ({ success: true }),
+		queueBackend: {
+			beforeRun: () => {},
+			afterRun: () => {},
+			captureTaskBaseAsync: async () => TASK_BASE,
+			validateTaskBaseAsync: async (_workspaceId, base) => base,
+			releaseTaskBaseAsync: async () => {},
+		},
+		broker: asyncBroker(route, adapters),
+		adapters,
+		...overrides,
+	};
+}
 describe("attempt-scoped execution backend", () => {
-	it("returns one dirty-overlay receipt identity across sync, async, and orchestrator paths", async () => {
+	it("returns one dirty-overlay receipt identity across repeated async executions", async () => {
 		const project = join(TEST_DIR, "dirty-overlay-paths");
 		mkdirSync(join(project, "src"), { recursive: true });
 		writeFileSync(
@@ -50,28 +109,20 @@ describe("attempt-scoped execution backend", () => {
 			requiredPaths: ["src/changed.mjs"],
 			files: ["src/changed.mjs"],
 		});
-		const base = {
+		const base = asyncTaskContext({
 			projectPath: project,
 			workingContainerName: "overlay-worker",
 			dirtyOverlayReceipt: receipt,
-			route: () => ({ provider: "claude", model: "fixture-model" }),
-			resolveDescriptor: () =>
-				descriptorForRoute({ provider: "claude", model: "fixture-model" }),
-			recordDispatch: () => {},
-			recordDispatchIntent: () => {},
-			integrationGate: () => ({ success: true }),
 			adapters: {
 				claude: {
-					execute: () => ({ success: true, output: "ok" }),
-					captureDiff: () => "diff --git a/src/changed.mjs b/src/changed.mjs\n",
 					executeAsync: async () => ({ success: true, output: "ok" }),
 					captureDiffAsync: async () =>
 						"diff --git a/src/changed.mjs b/src/changed.mjs\n",
 				},
 			},
-		};
+		});
 		const results = [
-			executeTask(task("1.1"), base),
+			await executeTaskAsync(task("1.1"), base),
 			await executeTaskAsync(task("1.2"), base),
 		];
 		deepStrictEqual(
@@ -80,22 +131,26 @@ describe("attempt-scoped execution backend", () => {
 		);
 		let routeCalls = 0;
 		let providerCalls = 0;
-		const rejected = executeTask(task("1.4"), {
-			...base,
-			route: () => {
-				routeCalls += 1;
-				return { provider: "claude", model: "fixture-model" };
-			},
-			dirtyOverlayReceipt: { ...receipt, receiptHash: "f".repeat(64) },
-			adapters: {
-				claude: {
-					execute: () => {
-						providerCalls += 1;
-						return { success: true, output: "ok" };
+		const rejected = await executeTaskAsync(
+			task("1.4"),
+			asyncTaskContext({
+				projectPath: project,
+				workingContainerName: "overlay-worker",
+				route: () => {
+					routeCalls += 1;
+					return FIXTURE_ROUTE;
+				},
+				dirtyOverlayReceipt: { ...receipt, receiptHash: "f".repeat(64) },
+				adapters: {
+					claude: {
+						executeAsync: async () => {
+							providerCalls += 1;
+							return { success: true, output: "ok" };
+						},
 					},
 				},
-			},
-		});
+			}),
+		);
 		strictEqual(rejected.result, "dirty_overlay_rejected");
 		strictEqual(routeCalls, 0);
 		strictEqual(providerCalls, 0);
@@ -104,23 +159,25 @@ describe("attempt-scoped execution backend", () => {
 		// explicit non-empty check it would reach provider allocation inside a
 		// workspace seeded with overlay bytes it never scoped — the review path,
 		// where `Files:` is otherwise optional, is exactly where that happens.
-		const undeclared = executeTask(
+		const undeclared = await executeTaskAsync(
 			{ ...task("1.5"), type: "review", requiredPaths: null, files: [] },
-			{
-				...base,
+			asyncTaskContext({
+				projectPath: project,
+				workingContainerName: "overlay-worker",
 				route: () => {
 					routeCalls += 1;
-					return { provider: "claude", model: "fixture-model" };
+					return FIXTURE_ROUTE;
 				},
+				dirtyOverlayReceipt: receipt,
 				adapters: {
 					claude: {
-						execute: () => {
+						executeAsync: async () => {
 							providerCalls += 1;
 							return { success: true, output: "ok" };
 						},
 					},
 				},
-			},
+			}),
 		);
 		strictEqual(undeclared.result, "dirty_overlay_rejected");
 		strictEqual(undeclared.reasonCode, "dirty_overlay_scope_mismatch");
@@ -128,7 +185,7 @@ describe("attempt-scoped execution backend", () => {
 		strictEqual(routeCalls, 0);
 		strictEqual(providerCalls, 0);
 	});
-	it("integrates one overlay task and then refuses the drift that integration created", () => {
+	it("integrates one overlay task and then refuses the drift that integration created", async () => {
 		const project = join(TEST_DIR, "dirty-overlay-one-integration");
 		mkdirSync(join(project, "src"), { recursive: true });
 		const target = join(project, "src", "changed.mjs");
@@ -151,26 +208,21 @@ describe("attempt-scoped execution backend", () => {
 		writeFileSync(target, overlay);
 
 		let providerCalls = 0;
-		const base = {
+		const base = asyncTaskContext({
 			projectPath: project,
 			workingContainerName: "overlay-worker",
 			dirtyOverlayReceipt: receipt,
-			route: () => ({ provider: "claude", model: "fixture-model" }),
-			resolveDescriptor: () =>
-				descriptorForRoute({ provider: "claude", model: "fixture-model" }),
-			recordDispatch: () => {},
-			recordDispatchIntent: () => {},
 			integrationGate,
 			adapters: {
 				claude: {
-					execute: () => {
+					executeAsync: async () => {
 						providerCalls += 1;
 						return { success: true, output: "ok" };
 					},
-					captureDiff: () => diff,
+					captureDiffAsync: async () => diff,
 				},
 			},
-		};
+		});
 		const overlayTask = (id) => ({
 			id,
 			title: "overlay",
@@ -181,7 +233,7 @@ describe("attempt-scoped execution backend", () => {
 		});
 		const bytes = receipt.paths[0].bytes;
 
-		const first = executeTask(overlayTask("1.1"), base);
+		const first = await executeTaskAsync(overlayTask("1.1"), base);
 		strictEqual(first.result, "success");
 		strictEqual(readFileSync(target, "utf8"), applied);
 		strictEqual(providerCalls, 1);
@@ -189,7 +241,7 @@ describe("attempt-scoped execution backend", () => {
 		// Raw overlay bytes never reach a result projection.
 		strictEqual(JSON.stringify(first).includes(bytes), false);
 
-		const second = executeTask(overlayTask("1.2"), base);
+		const second = await executeTaskAsync(overlayTask("1.2"), base);
 		strictEqual(second.result, "dirty_overlay_rejected");
 		strictEqual(second.reasonCode, "dirty_overlay_file_drift");
 		strictEqual(providerCalls, 1);
@@ -263,7 +315,7 @@ describe("attempt-scoped execution backend", () => {
 		strictEqual(identityFor(off), identityFor({ ...off }));
 		notStrictEqual(identityFor(off), identityFor(on));
 	});
-	it("binds immutable sync context, preserves receivers, and rejects contradiction", () => {
+	it("binds immutable sync context, preserves receivers, and rejects contradiction", async () => {
 		const seen = [];
 		const backend = {
 			label: "receiver",
@@ -273,50 +325,104 @@ describe("attempt-scoped execution backend", () => {
 				return { command: "true", args: [] };
 			},
 		};
+		const descriptor = descriptorForRoute({
+			provider: "claude",
+			model: "claude-sonnet-5",
+		});
+		const selectedRoute = {
+			provider: "claude",
+			model: descriptor.selector,
+			resolvedTarget: "claude",
+			harness: "claude",
+			capability: "standard",
+			effort: null,
+			reason: "fixture",
+			reservation: { id: "fixture-reservation" },
+			snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+		};
 		let adapterOptions;
-		executeTask(
+		const adapter = {
+			executeAsync: async (_prompt, _workspace, options) => {
+				adapterOptions = options;
+				options.executionBackend.execArgv("vm", {});
+				options.executionBackend.execArgv("vm", {
+					cleanupContext: {
+						...options.cleanupContext,
+						operation: "helper",
+					},
+				});
+				throws(
+					() =>
+						options.executionBackend.execArgv("vm", {
+							cleanupContext: {
+								...options.cleanupContext,
+								attemptId: "other",
+							},
+						}),
+					/contradictory cleanup context attemptId/,
+				);
+				return { success: false, output: "" };
+			},
+			captureDiffAsync: async (_workspace, options) => {
+				options.executionBackend.execArgv("vm", {});
+				return "";
+			},
+		};
+		// The production broker executor binds the provider attempt through
+		// createBrokerAdapterLauncher; the stub broker invokes that same real
+		// launcher so the provider-side binding is exercised end to end.
+		const launch = createBrokerAdapterLauncher({
+			adapter,
+			executionBackend: backend,
+			workingContainerName: "vm",
+			prompt: "fixture",
+			cleanupContext: {
+				runId: "run-a",
+				taskId: "1.4",
+				attemptId: "attempt-a",
+				descriptorIdentity: descriptor.descriptor_identity,
+				workspaceId: "vm",
+				processStartIdentity: null,
+				operation: "provider",
+			},
+		});
+		const launcherIdentity = {
+			provider: selectedRoute.provider,
+			resolvedTarget: selectedRoute.resolvedTarget,
+			harness: selectedRoute.harness,
+			model: selectedRoute.model,
+			effort: selectedRoute.effort,
+			descriptorIdentity: descriptor.descriptor_identity,
+			reservationId: selectedRoute.reservation.id,
+		};
+		await executeTaskAsync(
 			{ id: "1.4", title: "marker", description: "marker" },
-			{
+			asyncTaskContext({
 				runId: "run-a",
 				attemptId: "attempt-a",
 				processStartIdentity: null,
 				executionBackend: backend,
-				route: () => ({ provider: "claude", model: "claude-sonnet-5" }),
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
-				adapters: {
-					claude: {
-						execute: (_prompt, _workspace, options) => {
-							adapterOptions = options;
-							options.executionBackend.execArgv("vm", {});
-							options.executionBackend.execArgv("vm", {
-								cleanupContext: {
-									...options.cleanupContext,
-									operation: "helper",
-								},
-							});
-							throws(
-								() =>
-									options.executionBackend.execArgv("vm", {
-										cleanupContext: {
-											...options.cleanupContext,
-											attemptId: "other",
-										},
-									}),
-								/contradictory cleanup context attemptId/,
-							);
-							return { success: false, output: "" };
-						},
-						captureDiff: (_workspace, options) => {
-							options.executionBackend.execArgv("vm", {});
-							return "";
-						},
-					},
-				},
-				projectPath: TEST_DIR,
 				workingContainerName: "vm",
-			},
+				resolveDescriptor: () => descriptor,
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: { claude: adapter },
+				broker: {
+					selectAndReserve: async () => selectedRoute,
+					launcherIdentity: () => launcherIdentity,
+					execute: async (request, route, options) =>
+						launch({
+							request,
+							route,
+							invocationDescriptor: descriptor,
+							launcherIdentity: options.launcherIdentity,
+							signal: options.signal,
+							onAdapterStatus: options.onAdapterStatus,
+							onPoll: options.onPoll,
+							onProgress: options.onProgress,
+						}),
+					release: async () => {},
+				},
+			}),
 		);
 		ok(Object.isFrozen(adapterOptions.cleanupContext));
 		strictEqual(seen[0].operation, "provider");
@@ -330,7 +436,7 @@ describe("attempt-scoped execution backend", () => {
 		);
 		strictEqual(seen.length, beforeWrongWorkspace);
 	});
-	it("binds helper context to a successful synchronous capture", () => {
+	it("binds helper context to a successful synchronous capture", async () => {
 		let observed;
 		let captureFacade;
 		let backendCalls = 0;
@@ -341,29 +447,24 @@ describe("attempt-scoped execution backend", () => {
 				return { command: "true", args: [] };
 			},
 		};
-		const result = executeTask(
+		const result = await executeTaskAsync(
 			{ id: "1.4-success", title: "marker", description: "marker" },
-			{
+			asyncTaskContext({
 				runId: "run-sync-success",
 				attemptId: "attempt-sync-success",
 				executionBackend: backend,
-				route: () => ({ provider: "claude", model: "claude-sonnet-5" }),
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true }),
+				workingContainerName: "vm",
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: (_workspace, options) => {
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async (_workspace, options) => {
 							captureFacade = options.executionBackend;
 							options.executionBackend.execArgv("vm", {});
 							return "";
 						},
 					},
 				},
-				projectPath: TEST_DIR,
-				workingContainerName: "vm",
-			},
+			}),
 		);
 		strictEqual(result.success, true);
 		strictEqual(observed.operation, "helper");

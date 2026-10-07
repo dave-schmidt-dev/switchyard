@@ -45,6 +45,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- The test suite passes under an isolated HOME: routing and reliability fixtures no longer resolve targets or route-health identity through the host roster, and the host-ground-truth suites skip when `~/.agent` is absent.
 - `routing-run release-partial` matched a retained partial's worktree claim only by exact path, so a claim recorded as `<path>/worktree` could not be released.
 - Runner tests pin the fixture roster, so a check sandbox with an isolated HOME never reads the host roster.
 - Integration `git apply` check and apply subprocesses stop after 60 seconds (SIGKILL). A timed-out check reports `conflict`; a timed-out mutating apply reports `integration_state_unknown`.

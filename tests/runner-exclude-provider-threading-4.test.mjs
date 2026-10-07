@@ -3,12 +3,14 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { createDefaultRouteHealthDecision } from "../src/switchyard/router/health.mjs";
+import { executeTaskAsync } from "../src/switchyard/runner/index.mjs";
 import {
-	executeTask,
+	descriptorForRoute,
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
+	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -16,6 +18,28 @@ function writeTasksFile(content) {
 	const tasksPath = join(TEST_DIR, "tasks.md");
 	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
 	return tasksPath;
+}
+// In-memory reservation ledger for the direct executeTaskAsync path: the real
+// broker seam is kept (so context.only/exclude/platform/goldenImageVerifiedProviders
+// are threaded by createDispatchBroker), but no project ledger files are written.
+function stubBrokerReservations() {
+	const reservations = new Map();
+	let counter = 0;
+	return {
+		reserveWithSelection: async (select) => {
+			const candidate = select([], []);
+			if (!candidate) return null;
+			counter += 1;
+			const reservation = { id: `test-reservation-${counter}` };
+			reservations.set(reservation.id, { candidate, state: "reserved" });
+			return reservation;
+		},
+		terminal: async ({ reservationId }) => {
+			const record = reservations.get(reservationId);
+			if (record) record.state = "released";
+			return { reservationId, state: record?.state ?? "released" };
+		},
+	};
 }
 afterEach(() => {
 	try {
@@ -39,7 +63,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			second.publicConfigurationEpoch,
 		);
 	});
-	it("runQueue forwards options.only onto context.only, reaching route() via executeTask (Task C.9)", () => {
+	it("runQueue forwards options.only onto context.only, reaching route() via executeTask (Task C.9)", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -50,7 +74,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const routeCalls = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -67,11 +91,12 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					};
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					codex: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a\n+change",
 					},
 				},
 			},
@@ -81,7 +106,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		strictEqual(routeCalls.length, 1);
 		deepStrictEqual(routeCalls[0].only, ["codex"]);
 	});
-	it("runQueue defaults context.only to [] when options.only is omitted (Task C.9)", () => {
+	it("runQueue defaults context.only to [] when options.only is omitted (Task C.9)", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -92,7 +117,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const routeCalls = [];
 
-		runQueue({
+		await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -108,11 +133,12 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					};
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a\n+change",
 					},
 				},
 			},
@@ -120,28 +146,44 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 
 		deepStrictEqual(routeCalls[0].only, []);
 	});
-	it("executeTask passes context.only through to route(), alongside exclude and availableProviders (Task C.9)", () => {
+	it("executeTask passes context.only through to route(), alongside exclude and availableProviders (Task C.9)", async () => {
 		const routeCalls = [];
+		const routeResult = {
+			provider: "codex",
+			model: "gpt-5.6-terra",
+			percentLeft: 50,
+			reason: "spread",
+		};
 
-		executeTask(
+		await executeTaskAsync(
 			{ id: "1.1", title: "task", description: "op" },
 			{
 				route: (opts) => {
 					routeCalls.push(opts);
-					return {
-						provider: "codex",
-						model: "gpt-5.6-terra",
-						percentLeft: 50,
-						reason: "spread",
-					};
+					return routeResult;
+				},
+				resolveDescriptor: () => descriptorForRoute(routeResult),
+				brokerDependencies: {
+					resolveTargetIdentity: () => ({
+						targetId: "codex",
+						harnessKey: "codex",
+						ambiguous: false,
+					}),
+					brokerReservations: stubBrokerReservations(),
 				},
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					codex: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a\n+change",
 					},
+				},
+				queueBackend: {
+					captureTaskBase: () => TASK_BASE,
+					validateTaskBase: (_workspaceId, base) => base,
+					releaseTaskBase: () => {},
 				},
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",

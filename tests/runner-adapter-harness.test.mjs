@@ -5,9 +5,10 @@
 // is a snapshot display name ("OpenCode Go"). The old
 // `providerName.toLowerCase()` produced "opencode go", which never matched the
 // "opencode" adapter key, so EVERY opencode-target dispatch collapsed to
-// `unsupported_provider` before it could run. This test drives executeTask with
-// a mocked route returning the display name and asserts the opencode adapter is
-// actually invoked and the dispatch is NOT recorded as unsupported_provider.
+// `unsupported_provider` before it could run. This test drives executeTaskAsync
+// against a stub broker returning the display name and asserts the opencode
+// adapter is actually invoked and the dispatch is NOT recorded as
+// unsupported_provider.
 
 import { strictEqual } from "node:assert";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -19,7 +20,7 @@ import {
 	getInvocationDescriptorIdentity,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import { executeTask } from "../src/switchyard/runner/index.mjs";
+import { executeTaskAsync } from "../src/switchyard/runner/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -48,8 +49,11 @@ after(() => {
 	rmSync(crossHarnessRoot, { recursive: true, force: true });
 });
 
-// Build a context whose route() returns a fixed result and whose adapters are
-// keyed by harness (exactly as runQueue wires them). Records every dispatch.
+// Build an async context whose stub broker returns a fixed result and whose
+// adapters are keyed by harness (exactly as the async queue wires them). The
+// stub broker's execute mirrors the adapter-launcher boundary: it runs the
+// adapter resolved for the routed harness and records the model it received.
+// Records every dispatch.
 function makeContext({
 	provider,
 	model,
@@ -60,37 +64,52 @@ function makeContext({
 	const dispatchIntents = [];
 	const calls = { execute: 0, lastModel: null };
 	const descriptor = syntheticDescriptor({ targetId, model, harness });
+	const adapters = {
+		opencode: {
+			executeAsync: async (_prompt, _container, opts) => {
+				calls.execute += 1;
+				calls.lastModel = opts?.model ?? null;
+				return { success: true };
+			},
+			captureDiffAsync: async () => "", // empty -> success_no_diff path
+		},
+	};
 	return {
 		context: {
+			broker: {
+				selectAndReserve: async (request) => ({
+					provider,
+					model,
+					resolvedTarget: targetId,
+					harness,
+					capability: request.capability,
+					reason: "spread",
+					reservation: { id: "test-reservation" },
+					snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+				}),
+				launcherIdentity: () => ({}),
+				execute: async (_request, route) => {
+					const adapter = adapters[route.harness];
+					const execution = await adapter.executeAsync(
+						"do the thing",
+						"test-container",
+						{ model: route.model },
+					);
+					return { success: execution.success === true };
+				},
+				release: async () => {},
+			},
+			taskBases: {},
+			resolveDescriptor: () => descriptor,
+			recordDispatchIntent: (intent) => dispatchIntents.push(intent),
+			adapters,
+			recordDispatch: (d) => dispatches.push(d),
+			integrationGate: () => ({ success: true }),
 			queueBackend: {
 				captureTaskBase: () => TASK_BASE,
 				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: () => {},
 			},
-			taskBases: {},
-			route: () => ({
-				provider,
-				model,
-				resolvedTargetId: targetId,
-				resolved_harness: harness,
-				invocationDescriptor: descriptor,
-				percentLeft: 50,
-				reason: "spread",
-				log: [],
-			}),
-			resolveDescriptor: () => descriptor,
-			recordDispatchIntent: (intent) => dispatchIntents.push(intent),
-			adapters: {
-				opencode: {
-					execute: (_prompt, _container, opts) => {
-						calls.execute += 1;
-						calls.lastModel = opts?.model ?? null;
-						return { success: true };
-					},
-					captureDiff: () => "", // empty -> success_no_diff path
-				},
-			},
-			recordDispatch: (d) => dispatches.push(d),
-			integrationGate: () => ({ success: true }),
 			projectPath: "/tmp/does-not-matter",
 			workingContainerName: "test-container",
 			exclude: [],
@@ -128,13 +147,13 @@ const TASK = {
 };
 
 describe("runner M1b — adapter selected by resolved harness", () => {
-	it("dispatches an 'OpenCode Go' route through the opencode adapter (not unsupported_provider)", () => {
+	it("dispatches an 'OpenCode Go' route through the opencode adapter (not unsupported_provider)", async () => {
 		const { context, dispatches, dispatchIntents, calls } = makeContext({
 			provider: "OpenCode Go",
 			model: "fixture/opencode-low",
 		});
 
-		const result = executeTask(TASK, context);
+		const result = await executeTaskAsync(TASK, context);
 
 		// The opencode adapter actually ran — the route survived to dispatch.
 		strictEqual(calls.execute, 1, "opencode adapter.execute must be invoked");
@@ -152,7 +171,7 @@ describe("runner M1b — adapter selected by resolved harness", () => {
 		strictEqual(dispatchIntents[0].taskId, TASK.id);
 	});
 
-	it("keeps a Vibe accounting target while executing its Mistral GLM selector through OpenCode", () => {
+	it("keeps a Vibe accounting target while executing its Mistral GLM selector through OpenCode", async () => {
 		const roster = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
 		roster.targets.vibe.harness = "opencode";
 		roster.targets.vibe.snapshot_name = "Vibe";
@@ -167,7 +186,7 @@ describe("runner M1b — adapter selected by resolved harness", () => {
 				model: "mistral/zai-glm-5-2",
 			});
 
-			const result = executeTask(TASK, context);
+			const result = await executeTaskAsync(TASK, context);
 
 			strictEqual(calls.execute, 1, "the resolved OpenCode adapter must run");
 			strictEqual(calls.lastModel, "mistral/zai-glm-5-2");
@@ -181,7 +200,7 @@ describe("runner M1b — adapter selected by resolved harness", () => {
 		}
 	});
 
-	it("still records unsupported_provider when no adapter exists for the resolved harness", () => {
+	it("still records unsupported_provider when no adapter exists for the resolved harness", async () => {
 		// A provider whose harness has no registered adapter must still fail
 		// closed — the fix routes by harness, it does not invent adapters.
 		const { context, dispatches, calls } = makeContext({
@@ -189,7 +208,7 @@ describe("runner M1b — adapter selected by resolved harness", () => {
 			model: "fixture-claude-high",
 		});
 
-		const result = executeTask(TASK, context);
+		const result = await executeTaskAsync(TASK, context);
 
 		strictEqual(calls.execute, 0, "no adapter should run");
 		strictEqual(result.result, "unsupported_provider");

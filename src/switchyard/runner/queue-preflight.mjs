@@ -134,9 +134,16 @@ export function createDefaultQueuePreflight({
 			...(dependencies.onHealthDecision
 				? { onHealthDecision: dependencies.onHealthDecision }
 				: {}),
+			// Dispatch receipts are host state, so fixtures that exercise the
+			// later quota gates inject the descriptor predicate as well.
 			...(dependencies.qualificationAttempt === true
 				? { hasInvocationDescriptor: getConfiguredInvocationDescriptor }
-				: {}),
+				: dependencies.preflightHasInvocationDescriptor
+					? {
+							hasInvocationDescriptor:
+								dependencies.preflightHasInvocationDescriptor,
+						}
+					: {}),
 		});
 		if (!result.ok)
 			throw new QueuePreflightError(

@@ -8,7 +8,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { inspectRouteHealth } from "../src/switchyard/router/health.mjs";
 import { COOLDOWN_MS } from "../src/switchyard/router/health-schema.mjs";
@@ -23,8 +23,10 @@ import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/sim
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 import {
+	cleanupHealthFixture,
 	healthIdentity,
 	seedVmQuotaCooldown,
+	setupHealthFixture,
 } from "./provider-reliability-health-fixture.mjs";
 
 const suiteRoot = tempDir("switchyard-provider-reliability-");
@@ -108,9 +110,17 @@ function dependencies(_repo, overrides = {}) {
 			writerLifecycle: "stopped",
 		}),
 		integrate: async () => ({ success: true }),
+		// Route health is untracked unless a test injects its own decision;
+		// the route-health trials below do.
+		healthDecision: UNTRACKED_HEALTH,
 		...overrides,
 	};
 }
+
+const UNTRACKED_HEALTH = Object.assign(
+	() => ({ available: false, mode: "enforce", suppress: false }),
+	{ mode: "enforce" },
+);
 
 function remember(result, projectPath) {
 	if (result.partialWorktree) retained.push({ result, projectPath });
@@ -127,6 +137,10 @@ after(() => {
 });
 
 describe("simple provider reliability contract", () => {
+	// Route health resolves identities through the roster; use the qualified
+	// fixture roster, never the host one (checks run under an isolated HOME).
+	before(setupHealthFixture);
+	after(cleanupHealthFixture);
 	it("falls back to the provider exit code when the failure exit code is null", () => {
 		strictEqual(
 			createSimpleProviderReliabilityDiagnostic({

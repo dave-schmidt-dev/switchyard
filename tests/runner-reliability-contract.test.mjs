@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,14 +8,16 @@ import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.
 import { parseQuickChecks } from "../src/switchyard/runner/check-contract.mjs";
 import { runQuickChecks } from "../src/switchyard/runner/checks.mjs";
 import {
+	computeQueueIdentityFromFile,
+	getProjectRevision,
 	loadCheckpoint,
-	runQueue,
 	runQueueAsync,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	acceptanceCheckDiagnostic,
 	runCommand,
 } from "../src/switchyard/runner/reliability.mjs";
+import { runQueueAsync as runQueueAsyncStub } from "./helpers/async-runner-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_DIR = tempDir("switchyard-queue-reliability-");
@@ -227,7 +229,7 @@ describe("queue reliability contract", () => {
 		const tasksPath = join(TEST_DIR, "tasks.md");
 		tasksFile(tasksPath, "node --check broken.mjs");
 		let syncStarts = 0;
-		const sync = runQueue({
+		const sync = await runQueueAsyncStub({
 			tasksFilePath: tasksPath,
 			projectPath: project,
 			workingContainerName: "fake",
@@ -247,11 +249,11 @@ describe("queue reliability contract", () => {
 				integrationGate,
 				adapters: {
 					claude: {
-						execute: () => {
+						executeAsync: async () => {
 							syncStarts += 1;
 							return { success: true, output: "done" };
 						},
-						captureDiff: () => null,
+						captureDiffAsync: async () => null,
 					},
 				},
 			},
@@ -277,12 +279,22 @@ describe("queue reliability contract", () => {
 
 		let asyncStarts = 0;
 		const asyncPath = `${tasksPath}.async.checkpoint.json`;
+		const asyncRunOptions = { qualificationAttempt: true };
+		const asyncProjectRevision = getProjectRevision(project);
+		const asyncQueueIdentity = computeQueueIdentityFromFile(
+			tasksPath,
+			asyncProjectRevision,
+			asyncRunOptions,
+		).queueIdentity;
 		const asyncResult = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: project,
 			workingContainerName: "fake",
 			checkpointPath: asyncPath,
 			stopOnFailure: false,
+			runOptions: asyncRunOptions,
+			queueIdentity: asyncQueueIdentity,
+			projectRevision: asyncProjectRevision,
 			dependencies: {
 				backendFactory: () => backend(base),
 				integrationGate,
@@ -334,7 +346,7 @@ describe("queue reliability contract", () => {
 		);
 	});
 
-	it("rejects exhausted and unavailable synthetic providers before launch", () => {
+	it("rejects exhausted and unavailable synthetic providers before launch", async () => {
 		for (const scenario of [
 			{
 				name: "exhausted-quota",
@@ -351,39 +363,39 @@ describe("queue reliability contract", () => {
 			const tasksPath = join(TEST_DIR, `${scenario.name}.tasks.md`);
 			tasksFile(tasksPath, "node --check a.mjs");
 			let launches = 0;
-			throws(
-				() =>
-					runQueue({
-						tasksFilePath: tasksPath,
-						projectPath: project,
-						checkpointPath: `${tasksPath}.checkpoint.json`,
-						stopOnFailure: false,
-						dependencies: {
-							backendFactory: () => ({
-								...backend(base),
-								create: () => {
-									launches += 1;
-									return "fake";
-								},
-							}),
-							adapters: { claude: { execute: () => ({ success: true }) } },
-							goldenImageVerifiedProviders: ["claude"],
-							preflightReadSnapshot: fixturePreflightReadSnapshot(
-								scenario.snapshot,
-							),
-							hostPowerPolicyEnabled: false,
-							route: () => {
+			await rejects(
+				runQueueAsync({
+					tasksFilePath: tasksPath,
+					projectPath: project,
+					checkpointPath: `${tasksPath}.checkpoint.json`,
+					stopOnFailure: false,
+					dependencies: {
+						backendFactory: () => ({
+							...backend(base),
+							create: () => {
 								launches += 1;
-								return {
-									provider: "claude",
-									model: "claude-sonnet-5-5",
-								};
+								return "fake";
 							},
-							recordDispatch: () => {},
-							recordDispatchIntent: () => {},
-							integrationGate,
+						}),
+						adapters: { claude: { execute: () => ({ success: true }) } },
+						goldenImageVerifiedProviders: ["claude"],
+						preflightReadSnapshot: fixturePreflightReadSnapshot(
+							scenario.snapshot,
+						),
+						preflightHasInvocationDescriptor: () => true,
+						hostPowerPolicyEnabled: false,
+						route: () => {
+							launches += 1;
+							return {
+								provider: "claude",
+								model: "claude-sonnet-5-5",
+							};
 						},
-					}),
+						recordDispatch: () => {},
+						recordDispatchIntent: () => {},
+						integrationGate,
+					},
+				}),
 				(error) => {
 					strictEqual(error.name, "QueuePreflightError", error.message);
 					strictEqual(

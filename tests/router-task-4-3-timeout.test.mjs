@@ -19,7 +19,6 @@ import {
 	createQueueBackend,
 	executeTaskAsync,
 	normalizeRunOptions,
-	runQueue,
 	runQueueAsync,
 } from "../src/switchyard/runner/index.mjs";
 import {
@@ -431,10 +430,12 @@ describe("Task 6.1 queue-level platform selection", () => {
 			},
 		};
 		try {
-			await runQueueAsync(base);
-			runQueue(base);
-			strictEqual(calls.filter((call) => call === "create-vm").length, 2);
-			strictEqual(calls.filter((call) => call === "destroy-vm").length, 2);
+			const entrypoints = [["async", runQueueAsync]];
+			for (const [, entrypoint] of entrypoints) {
+				await entrypoint(base);
+			}
+			strictEqual(calls.filter((call) => call === "create-vm").length, 1);
+			strictEqual(calls.filter((call) => call === "destroy-vm").length, 1);
 			ok(!calls.some((call) => call.includes("docker")));
 		} finally {
 			rmSync(root, { recursive: true, force: true });

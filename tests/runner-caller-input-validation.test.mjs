@@ -18,20 +18,20 @@ import {
 } from "../src/switchyard/dispatch/host-power.mjs";
 import { writeDirtyOverlayReceipt } from "../src/switchyard/lifecycle/index.mjs";
 import {
+	executeTaskAsync,
 	getRunnableTasks,
 	loadCheckpoint,
 	loadTaskQueue,
-	runQueueAsync as runQueueAsyncImpl,
 	saveCheckpoint,
 	validateCallerInputs,
 } from "../src/switchyard/runner/index.mjs";
 import {
-	executeTask,
+	descriptorForRoute,
 	runnerTestDir,
-	runQueue,
 	runQueueAsync,
+	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -260,7 +260,7 @@ describe("host power queue policy", () => {
 		let backendCreated = 0;
 		let preflightCalled = 0;
 		let providerSelected = 0;
-		const result = await runQueueAsyncImpl({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			platform: "macos",
@@ -304,10 +304,17 @@ describe("host power queue policy", () => {
 		);
 	});
 
-	it("emits fixed unknown-power status while preserving provider routing", () => {
+	it("emits fixed unknown-power status while preserving provider routing", async () => {
 		const statuses = [];
 		const routeCalls = [];
-		const result = executeTask(
+		const routed = {
+			provider: "codex",
+			model: "gpt-5.6-terra",
+			percentLeft: 50,
+			reason: "spread",
+		};
+		const descriptor = descriptorForRoute(routed);
+		const result = await executeTaskAsync(
 			{ id: "1.1", title: "task", description: "op" },
 			{
 				hostPowerPolicyEnabled: true,
@@ -316,22 +323,36 @@ describe("host power queue policy", () => {
 					diagnosticCode: "untrusted-host-text-must-not-leak",
 				}),
 				onStatus: (event) => statuses.push(event),
-				route: (options) => {
-					routeCalls.push(options);
-					return {
-						provider: "codex",
-						model: "gpt-5.6-terra",
-						percentLeft: 50,
-						reason: "spread",
-					};
+				broker: {
+					selectAndReserve: async (request) => {
+						routeCalls.push(request);
+						return {
+							...routed,
+							resolvedTarget: routed.provider,
+							harness: "codex",
+							capability: request.capability,
+							reservation: { id: "fixture-reservation" },
+							snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+						};
+					},
+					launcherIdentity: () => ({}),
+					execute: async () => ({ success: true, output: "ok" }),
+					release: async () => {},
 				},
+				resolveDescriptor: () => descriptor,
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					codex: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "",
 					},
+				},
+				queueBackend: {
+					captureTaskBase: () => TASK_BASE,
+					validateTaskBase: (_workspaceId, base) => base,
+					releaseTaskBase: () => {},
 				},
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",
@@ -373,11 +394,8 @@ describe("host power queue policy", () => {
 		strictEqual(result.diagnosticCode, "host_power_unknown");
 	});
 
-	it("binds the task-file digest when sync, async, or orchestrated queues transition to battery", async () => {
-		const entrypoints = [
-			["sync", runQueue],
-			["async", runQueueAsync],
-		];
+	it("binds the task-file digest when the async queue transitions to battery", async () => {
+		const entrypoints = [["async", runQueueAsync]];
 		for (const [name, entrypoint] of entrypoints) {
 			const tasksPath = writeTasksFile(`### Task 2.1: Battery transition ${name}
 - **Status:** pending
