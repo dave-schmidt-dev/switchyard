@@ -1,14 +1,14 @@
-import { strictEqual, throws } from "node:assert";
+import { rejects, strictEqual } from "node:assert";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
 	descriptorForRoute,
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeLegacyCheckpoint(path, checkpoint) {
@@ -171,7 +171,7 @@ describe("runner quota retry coordination", () => {
 			only,
 		};
 	}
-	it("does not resume a possibly applied legacy quarantined task", () => {
+	it("does not resume a possibly applied legacy quarantined task", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Resume quota retry
@@ -242,21 +242,20 @@ describe("runner quota retry coordination", () => {
 		};
 
 		const before = readFileSync(checkpointPath, "utf8");
-		throws(
-			() =>
-				runQueue({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					checkpointPath,
-					dependencies: fixture.dependencies,
-				}),
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: fixture.dependencies,
+			}),
 			/invalid quota diagnostic provenance/,
 		);
 		strictEqual(fixture.executeCalls.length, 0);
 		strictEqual(resetCalls, 0);
 		strictEqual(readFileSync(checkpointPath, "utf8"), before);
 	});
-	it("does not reconstruct a possibly applied legacy attempt", () => {
+	it("does not reconstruct a possibly applied legacy attempt", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Resume before quarantine
@@ -322,20 +321,19 @@ describe("runner quota retry coordination", () => {
 		});
 
 		const before = readFileSync(checkpointPath, "utf8");
-		throws(
-			() =>
-				runQueue({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					checkpointPath,
-					dependencies: fixture.dependencies,
-				}),
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: fixture.dependencies,
+			}),
 			/invalid quota diagnostic provenance/,
 		);
 		strictEqual(fixture.executeCalls.length, 0);
 		strictEqual(readFileSync(checkpointPath, "utf8"), before);
 	});
-	it("fails closed on historical model-only retry state without launching", () => {
+	it("fails closed on historical model-only retry state without launching", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reject insufficient retry evidence
@@ -368,14 +366,13 @@ describe("runner quota retry coordination", () => {
 			],
 			executionOutcomes: { agy: [{ success: true, output: "must not run" }] },
 		});
-		throws(
-			() =>
-				runQueue({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					checkpointPath,
-					dependencies: fixture.dependencies,
-				}),
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: fixture.dependencies,
+			}),
 			/explicit reconciliation/,
 		);
 		strictEqual(fixture.executeCalls.length, 0);

@@ -20,7 +20,6 @@ import {
 	descriptorForRoute,
 	executeTask,
 	executeTaskAsync,
-	executeTaskWithOrchestrator,
 	runnerTestDir,
 } from "./helpers/runner-fixtures.mjs";
 
@@ -74,18 +73,10 @@ describe("attempt-scoped execution backend", () => {
 		const results = [
 			executeTask(task("1.1"), base),
 			await executeTaskAsync(task("1.2"), base),
-			await executeTaskWithOrchestrator(task("1.3"), {
-				...base,
-				orchestrator: {
-					launch: async () => "overlay-job",
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: null }),
-				},
-			}),
 		];
 		deepStrictEqual(
 			results.map((result) => result.dirtyOverlayReceiptHash),
-			[receipt.receiptHash, receipt.receiptHash, receipt.receiptHash],
+			[receipt.receiptHash, receipt.receiptHash],
 		);
 		let routeCalls = 0;
 		let providerCalls = 0;

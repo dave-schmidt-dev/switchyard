@@ -3,6 +3,9 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, sep } from "node:path";
 
 const PROBE_TIMEOUT_MS = 1_500;
+// A host-wide lsof walks every process; on a busy host it takes several
+// seconds, and a killed probe must not read as an unconfirmed writer group.
+const LSOF_TIMEOUT_MS = 15_000;
 const MAX_SCOPE_PROCESSES = 64;
 
 function processGroupPresent(pgid) {
@@ -72,7 +75,7 @@ function listWorktreeHolders(worktreePath, pid = null) {
 		result = spawnSync("lsof", args, {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
-			timeout: PROBE_TIMEOUT_MS,
+			timeout: LSOF_TIMEOUT_MS,
 			killSignal: "SIGKILL",
 			maxBuffer: 4 * 1024 * 1024,
 			env: {

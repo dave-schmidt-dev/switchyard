@@ -7,6 +7,8 @@ import {
 	DEFAULT_TERM_GRACE_MS,
 } from "./provider-lifecycle-progress.mjs";
 
+const DEADLINE_ATTRIBUTION_TOLERANCE_MS = 5_000;
+
 function markerContext(cleanupContext, operation) {
 	if (!cleanupContext || typeof cleanupContext !== "object")
 		return cleanupContext;
@@ -39,6 +41,8 @@ export function runProviderProcess(command, args, options = {}) {
 		cwd,
 		env,
 		timeoutMs = 30 * 60 * 1000,
+		deadlineMs = null,
+		deadlineToleranceMs = DEADLINE_ATTRIBUTION_TOLERANCE_MS,
 		maxBuffer = DEFAULT_MAX_BUFFER,
 		pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
 		silenceTimeoutMs = null,
@@ -50,6 +54,7 @@ export function runProviderProcess(command, args, options = {}) {
 		signal,
 		onPoll,
 		onStderrChunk,
+		detectRateLimit,
 		now = Date.now,
 		setTimeoutFn = setTimeout,
 		clearTimeoutFn = clearTimeout,
@@ -58,6 +63,20 @@ export function runProviderProcess(command, args, options = {}) {
 	} = options;
 	return new Promise((resolve) => {
 		const startedAt = now();
+		const providerDeadlineAt = Number.isFinite(timeoutMs)
+			? startedAt + Math.max(0, timeoutMs)
+			: null;
+		// The external (caller or routing-run) deadline may be enforced by a
+		// terminator that acts slightly before our clock reaches it, so it gets
+		// a tolerance; the provider's own timer is exact.
+		const externalDeadlineAt = Number.isFinite(deadlineMs) ? deadlineMs : null;
+		const deadlineAttributionToleranceMs = Number.isFinite(deadlineToleranceMs)
+			? Math.max(0, deadlineToleranceMs)
+			: 0;
+		const reachedDeadline = (at) =>
+			(externalDeadlineAt !== null &&
+				at >= externalDeadlineAt - deadlineAttributionToleranceMs) ||
+			(providerDeadlineAt !== null && at >= providerDeadlineAt);
 		let child;
 		let stdout = "";
 		let stderr = "";
@@ -68,6 +87,7 @@ export function runProviderProcess(command, args, options = {}) {
 		let cleanupResult = null;
 		let timedOut = false;
 		let cancelled = false;
+		let rateLimited = false;
 		let pollCount = 0;
 		let progressCount = 0;
 		// This is intentionally tri-state. A normal close proves that the child
@@ -131,9 +151,7 @@ export function runProviderProcess(command, args, options = {}) {
 			const lifecycle = createProviderLifecycleSnapshot({
 				pid: child?.pid,
 				startedAt,
-				deadlineAt: Number.isFinite(timeoutMs)
-					? startedAt + Math.max(0, timeoutMs)
-					: null,
+				deadlineAt: providerDeadlineAt,
 				lastOutputAt,
 				silenceObserved,
 				silenceTimeoutMs,
@@ -159,6 +177,7 @@ export function runProviderProcess(command, args, options = {}) {
 				code,
 				signal: exitSignal,
 				timedOut,
+				rateLimited,
 				// Legacy projection only; silence never independently terminates.
 				silenceTimedOut: false,
 				cancelled,
@@ -192,7 +211,9 @@ export function runProviderProcess(command, args, options = {}) {
 				deadlineAt: lifecycle.deadlineAt,
 				lastOutputAt: lifecycle.lastOutputAt,
 				silenceObserved: lifecycle.silenceObserved,
-				terminationReason: lifecycle.terminationReason,
+				terminationReason: rateLimited
+					? "rate_limited"
+					: lifecycle.terminationReason,
 				terminalStatus: lifecycle.terminalStatus,
 				cleanupStatus: lifecycle.cleanupStatus,
 			});
@@ -203,7 +224,11 @@ export function runProviderProcess(command, args, options = {}) {
 			cleanupPromise = Promise.resolve()
 				.then(async () => {
 					cleanupResult =
-						typeof cleanup === "function" ? await cleanup() : undefined;
+						typeof cleanup === "function"
+							? await cleanup({
+									reason: timedOut ? "timeout" : cancelled ? "cancel" : null,
+								})
+							: undefined;
 					cleanupStatus =
 						typeof cleanup !== "function"
 							? "not_required"
@@ -268,7 +293,12 @@ export function runProviderProcess(command, args, options = {}) {
 			terminationRequested = true;
 			timedOut = reason === "timeout";
 			cancelled = reason === "cancel";
-			terminationReason = timedOut ? "deadline" : "cancelled";
+			rateLimited = reason === "rate_limited";
+			terminationReason = timedOut
+				? "deadline"
+				: cancelled
+					? "cancelled"
+					: "rate_limited";
 			if (
 				timedOut &&
 				Number.isFinite(silenceTimeoutMs) &&
@@ -296,12 +326,25 @@ export function runProviderProcess(command, args, options = {}) {
 						signal: "SIGKILL",
 						error: timedOut
 							? new Error("provider execution timed out")
-							: new Error("provider execution cancelled"),
+							: cancelled
+								? new Error("provider execution cancelled")
+								: new Error("provider execution rate limited"),
 					});
 				},
 				termGraceMs,
 				setTimeoutFn,
 			);
+		};
+
+		const observeRateLimit = (stream, chunk) => {
+			if (terminationRequested || settled) return;
+			let matched = false;
+			try {
+				matched = detectRateLimit?.(stream, chunk) === true;
+			} catch {
+				matched = false;
+			}
+			if (matched) requestTermination("rate_limited");
 		};
 
 		const abort = () => requestTermination("cancel");
@@ -331,6 +374,7 @@ export function runProviderProcess(command, args, options = {}) {
 
 		child.stdout?.on?.("data", (chunk) => {
 			stdout = appendBounded(stdout, chunk, maxBuffer);
+			observeRateLimit("stdout", chunk);
 			emitProgress(true);
 		});
 		child.stderr?.on?.("data", (chunk) => {
@@ -340,6 +384,7 @@ export function runProviderProcess(command, args, options = {}) {
 			} catch {
 				// Diagnostic consumers must not alter provider execution.
 			}
+			observeRateLimit("stderr", chunk);
 			emitProgress(true);
 		});
 		child.once?.("error", (error) => {
@@ -357,7 +402,15 @@ export function runProviderProcess(command, args, options = {}) {
 				return;
 			}
 			terminalStatus = "exited";
-			terminationReason = "completed";
+			// A provider that dies at the effective deadline was ended by the
+			// deadline (often by an external terminator acting just before our
+			// timer); a clean exit there is still a completion.
+			if ((code !== 0 || exitSignal) && reachedDeadline(now())) {
+				timedOut = true;
+				terminationReason = "deadline";
+			} else {
+				terminationReason = "completed";
+			}
 			void terminal({ code, signal: exitSignal });
 		});
 

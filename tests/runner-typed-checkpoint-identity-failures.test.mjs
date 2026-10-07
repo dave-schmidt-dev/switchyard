@@ -13,9 +13,9 @@ import {
 } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -325,7 +325,7 @@ describe("typed checkpoint identity failures (Task 1.3)", () => {
 		]);
 	});
 
-	it("the run-options mismatch regression emits checkpoint_run_options_mismatch in runQueue", () => {
+	it("the run-options mismatch regression emits checkpoint_run_options_mismatch in runQueue", async () => {
 		const tasksPath = writeTasksFile(
 			"### Task 1.1: T\n- **Status:** pending\n- **Files:** src/a.mjs\n- **Description:** T\n",
 		);
@@ -355,7 +355,7 @@ describe("typed checkpoint identity failures (Task 1.3)", () => {
 
 		let thrown = null;
 		try {
-			runQueue({
+			await runQueueAsync({
 				tasksFilePath: tasksPath,
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",

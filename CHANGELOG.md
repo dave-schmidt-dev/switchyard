@@ -6,6 +6,14 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- `simple --report <path>` runs a read-only report task: the one declared report path is the only allowed change, a missing or empty report stops with `report_missing`, and success returns `resultKind: "report"` with the path, bytes and sha256.
+- `simple --format <command>` runs one bounded formatter in the check sandbox after the provider and before acceptance checks. A nonzero exit is advisory (`formatStatus`), and formatter edits are revalidated against the declared scope, so an edit to an undeclared ineligible path fails closed.
+- `simple cancel --project <path> --run-id <id> [--timeout-seconds <n>]` signals only a live worker whose pid and start token match the run record, then waits for the project lock release and a terminal status.
+- After a soft failure, the next provider continues from the previous attempt's in-scope partial when the writer is proven stopped and the capture is verified; manifest, input and out-of-scope changes are never carried.
+- Simple checks run once against the base tree before the provider starts; an environment-broken check stops the attempt with its own evidence and is remembered for the rest of the routing run.
+- Simple routing skips targets whose observed p80 duration cannot finish inside the deadline (never under `--only-provider`; an all-slow pool is kept and flagged).
+- A check setup failure records the failing prepare step, a bounded error code, syscall and executable in `failureDetails` (never the error message), and an environment-broken dry-run check names the executable it resolved in the sandbox and on the host.
+- A closed failure-reason registry, with golden parity against the previous classifiers, now owns cause, category and severity; run records persist the failure reason, scope-rejection detail and invocation failures, and still read with the previous release.
 - Simple dispatch can run Claude Code (`--only-provider claude-code`, Haiku 4.5, Sonnet 5.5 or Opus 5.5 with an explicit effort) in a native Seatbelt sandbox on its own subscription login. It is never chosen automatically, and auth, missing-model and usage-limit failures are classified for routing.
 - `switchyard-dispatch routing-run release-partial --task-id <id> [--discard]` frees a retained partial worktree after the captain salvages it, so the routing run can continue without losing its failure memory. It verifies the worktree claim and refuses symlinks, a held project lock or ambiguous cleanup.
 - A failed simple check now keeps its last 16 KiB of output and stderr under the run's owner-only `check-evidence/` directory (`<attempt>-<check position>.log`, attempt 0 is the baseline), and the result carries only that path. Diff rejections report a closed reason kind and up to five bounded, control-character-free paths.
@@ -14,6 +22,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Removed
 
+- The orchestrator queue mode and its tests; runner tests now drive the async runner.
 - The `gc` and `reconcile-completion` operator subcommands, with their helpers (`apfs-private-bytes.py`, the external-completion reconciliation modules) and tests. `recover` keeps the shared root-cleanup logic. `backend-health`, `remediate-orphaned-locks` and `health attest-repair` stay: each has a live caller or contract.
 - The seam-move and module-split refactor tooling (`check:seams`, `split:module`, their scripts and tests, and the direct `oxc-parser` devDependency).
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
@@ -24,11 +33,20 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Simple dispatch enforces route health by default on lifecycle-backed provider failures (three in six hours suppresses the target on a 5/15/60-minute ladder); check, scope, sandbox and environment failures never count. Stranded health claims are reclaimed. The queue stays in shadow mode.
+- A `quota_exhausted` attempt marks that target ineligible for an hour across the routing run, and a provider that reports a rate limit on stderr is stopped at once and classified `quota_exhausted`.
+- A provider that exits nonzero or by signal at the caller's deadline is coded `provider_deadline_exceeded` instead of a nonzero exit.
+- Sandboxed checks may run git, python3, make, swiftc, `swift build`, `xcodebuild build` and the project venv, and read declared path dependencies outside the project. Checks that use shell expansion, denied host tools or absolute paths outside the clone are rejected at argument parse.
+- Eligible undeclared edits are kept and flagged for the captain instead of failing the run, and the project HEAD may advance on unrelated commits during a run.
+- The project lock is released before slow cleanup, and a provably dead holder's lock on a terminal run is reclaimed (`project_lock_reclaimed`).
+- A VM-lane provider timeout or cancel no longer proves the provider process died, so cleanup is deferred to the workspace destroy (`destroy_pending`, no guest exec) and the guest workspace is retired: the runner skips the partial-diff capture and helper cleanup replay, records `timeoutDiff: "unavailable_destroy_only"` on the `execution_timed_out` result, and halts the queue with `halted_after_provider_timeout` / errorKind `provider_timeout_clone_retired` (distinct from `provider_cleanup_failed`) before any commit or reset guest write, so the existing teardown destroys the clone and no later task reuses it. Docker-lane capture after a confirmed kill is unchanged.
 - Biome now fails on unused imports, variables and function parameters; existing unused imports and exports were removed.
 - Simple routing now separates hard and soft failures. Failed checks, empty diffs, provider errors, provider-phase environment failures and scope rejections move on to the next eligible tier 1 or tier 2 target (up to four attempts per task) instead of stopping the run; baseline, cleanup, cancellation, input, lock and run-store failures still stop. `native_required` reports whether capacity or task failures exhausted the targets, and every answer lists retained partial worktrees.
 
 ### Fixed
 
+- `routing-run release-partial` matched a retained partial's worktree claim only by exact path, so a claim recorded as `<path>/worktree` could not be released.
+- Runner tests pin the fixture roster, so a check sandbox with an isolated HOME never reads the host roster.
 - Integration `git apply` check and apply subprocesses stop after 60 seconds (SIGKILL). A timed-out check reports `conflict`; a timed-out mutating apply reports `integration_state_unknown`.
 - A simple run that hits its deadline now reports the files the provider changed so far.
 - `simple --json` failures carry a sanitized `usageError` or `preflightCode` instead of a bare failure.

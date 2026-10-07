@@ -1,9 +1,11 @@
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
+import { captureProviderDiffDetailedAsync } from "../src/switchyard/adapter/provider-lifecycle-diff-capture.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	__resetRosterCacheForTests,
@@ -19,7 +21,6 @@ import {
 	normalizeRunOptions,
 	runQueue,
 	runQueueAsync,
-	runQueueWithOrchestrator,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	FIXTURE_PATH,
@@ -154,69 +155,234 @@ describe("Task 4.3 timeout boundaries", () => {
 		);
 	});
 
-	it("refuses guest cleanup when exact identity lacks qualified birth evidence", () => {
+	it("makes no guest exec on a timeout cleanup and leaves the clone for destroy", () => {
 		const calls = [];
-		const statuses = [];
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
 			prlctlFn: (args) => {
 				calls.push(args);
-				if (guestText(args).includes("/bin/cat")) return "4321\n";
 				return "ok";
 			},
 		});
-
-		throws(
-			() =>
-				backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"], {
-					onStatus: (event) => statuses.push(event.event),
-					workspaceId: "vm-timeout",
-					runId: "run-timeout",
-					taskId: "task-timeout",
-					attemptId: "attempt-timeout",
-					descriptorIdentity: "descriptor-timeout",
-					processStartIdentity: null,
-					operation: "provider",
-				}),
-			/guest PID marker process-start identity is unknown/,
+		const result = backend.cleanupProviderProcess(
+			"prlctl",
+			["exec", "vm-timeout"],
+			{
+				workspaceId: "vm-timeout",
+				runId: "run-timeout",
+				taskId: "task-timeout",
+				attemptId: "attempt-timeout",
+				descriptorIdentity: "descriptor-timeout",
+				processStartIdentity: null,
+				operation: "provider",
+				reason: "timeout",
+			},
 		);
+		deepStrictEqual(result, {
+			cleanupStage: "destroy_pending",
+			workspaceId: "vm-timeout",
+		});
 		strictEqual(calls.length, 0);
-		strictEqual(statuses.at(-1), "provider_cleanup_failed");
 	});
 
-	it("does not clear index.lock when guest tree cleanup is unconfirmed", () => {
+	it("removes index.lock without PID authority when the provider exited", () => {
 		const calls = [];
 		const backend = new ParallelsExecutionBackend({
 			aquaUid: 501,
 			prlctlFn: (args) => {
 				calls.push(args);
-				if (guestText(args).includes("/bin/cat")) return "4321\n";
-				if (guestText(args).includes("switchyard-kill-tree")) {
-					throw new Error("guest provider survived cleanup");
-				}
 				return "ok";
 			},
 		});
+		const result = backend.cleanupProviderProcess(
+			"prlctl",
+			["exec", "vm-timeout"],
+			{
+				workspaceId: "vm-timeout",
+				runId: "run-timeout",
+				taskId: "task-timeout",
+				attemptId: "attempt-timeout",
+				descriptorIdentity: "descriptor-timeout",
+				processStartIdentity: null,
+				operation: "provider",
+			},
+		);
+		strictEqual(result.cleanupStage, "index_lock_removed");
+		strictEqual(calls.length, 1);
+		ok(guestText(calls[0]).includes("index.lock"));
+		ok(!calls.some((args) => /\/bin\/cat|kill-tree/.test(guestText(args))));
+	});
 
-		throws(
-			() =>
-				backend.cleanupProviderProcess("prlctl", ["exec", "vm-timeout"], {
-					workspaceId: "vm-timeout",
-					runId: "run-timeout",
-					taskId: "task-timeout",
-					attemptId: "attempt-timeout",
-					descriptorIdentity: "descriptor-timeout",
-					processStartIdentity: null,
-					operation: "provider",
-				}),
-			/guest PID marker process-start identity is unknown/,
+	it("defers helper cleanup to the VM destroy when a capture probe times out", async () => {
+		const guestExecArgv = [];
+		const cleanupReasons = [];
+		const executionBackend = {
+			execArgv: (workspaceId, options) => {
+				guestExecArgv.push(options.argv);
+				return { command: "prlctl", args: ["exec", workspaceId] };
+			},
+			cleanupProviderProcess: (_command, _args, options = {}) => {
+				cleanupReasons.push(options.reason ?? null);
+				return {
+					cleanupStage: "destroy_pending",
+					workspaceId: options.workspaceId,
+				};
+			},
+		};
+		const child = new EventEmitter();
+		child.pid = 4242;
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		child.kill = () => true;
+		const result = await captureProviderDiffDetailedAsync("vm-timeout-worker", {
+			executionBackend,
+			spawnFn: () => child,
+			timeoutMs: 40,
+			termGraceMs: 20,
+			cleanupContext: {
+				runId: "run-timeout",
+				taskId: "task-timeout",
+				attemptId: "attempt-timeout",
+				descriptorIdentity: "descriptor-timeout",
+				operation: "helper",
+			},
+		});
+		strictEqual(result.status, "timed_out");
+		strictEqual(result.diff, null);
+		deepStrictEqual(cleanupReasons, ["timeout"]);
+		strictEqual(guestExecArgv.length, 1);
+	});
+
+	it("retires the VM clone after a provider timeout without a cleanup-failure halt", async () => {
+		const root = join(
+			tmpdir(),
+			`switchyard-vm-timeout-${process.pid}-${randomUUID()}`,
 		);
-		strictEqual(calls.length, 0);
-		ok(
-			!calls.some((args) =>
-				guestText(args).includes("/project/.git/index.lock"),
-			),
+		const tasksFilePath = join(root, "tasks.md");
+		const checkpointPath = join(root, "checkpoint.json");
+		const guestExecArgv = [];
+		const cleanupReasons = [];
+		const destroyCalls = [];
+		const adapterContainers = [];
+		const captureCalls = [];
+		const dispatches = [];
+		const executionBackend = {
+			execArgv: (workspaceId, options) => {
+				guestExecArgv.push(options.argv);
+				return { command: "prlctl", args: ["exec", workspaceId] };
+			},
+			cleanupProviderProcess: (_command, _args, options = {}) => {
+				cleanupReasons.push(options.reason ?? null);
+				return {
+					cleanupStage: "destroy_pending",
+					workspaceId: options.workspaceId,
+				};
+			},
+		};
+		const descriptor = {
+			target_id: "claude-code",
+			model_ref: "fixture/claude-standard",
+			selector: "fixture/claude-standard",
+			invocation_args: [],
+		};
+		mkdirSync(root, { recursive: true });
+		writeFileSync(
+			tasksFilePath,
+			"### Task 4.4: VM timeout\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Quick checks:** none\n- **Description:** fixture\n\n### Task 4.5: Never reached\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/b.mjs\n- **Quick checks:** none\n- **Description:** fixture\n",
+			"utf8",
 		);
+		try {
+			const result = await runQueueAsync({
+				tasksFilePath,
+				projectPath: root,
+				checkpointPath,
+				stopOnFailure: false,
+				dependencies: {
+					hostPowerProbe: () => ({ state: "ac" }),
+					queuePreflight: () => ({ ok: true, eligible: true }),
+					recordDispatch: (entry) => dispatches.push(entry),
+					recordDispatchIntent: () => {},
+					route: () => ({
+						provider: "claude",
+						resolved_harness: "claude",
+						resolvedTargetId: "claude-code",
+						model: descriptor.selector,
+						invocationDescriptor: descriptor,
+					}),
+					resolveDescriptor: () => descriptor,
+					resolveTargetIdentity: () => ({
+						targetId: "claude-code",
+						harnessKey: "claude",
+						ambiguous: false,
+					}),
+					adapters: {
+						claude: {
+							executeAsync: async (_prompt, container, options) => {
+								adapterContainers.push(container);
+								await options.executionBackend.cleanupProviderProcess(
+									"prlctl",
+									["exec", container],
+									{ reason: "timeout" },
+								);
+								return {
+									success: false,
+									timedOut: true,
+									error: "provider execution timed out (ETIMEDOUT)",
+									diagnosticCode: "execution_timed_out",
+									failurePhase: "provider_execution",
+								};
+							},
+							captureDiffAsync: async () => {
+								captureCalls.push("capture");
+								return null;
+							},
+						},
+					},
+					backendFactory: () => ({
+						executionBackend,
+						readiness: () => ({ inventoryCount: 0 }),
+						create: () => "vm-timeout-worker",
+						provision: () => {},
+						seed: () => {},
+						commit: () => {},
+						reset: () => {},
+						destroy: () => destroyCalls.push("destroy"),
+						captureTaskBaseAsync: async () => ({
+							ref: "refs/switchyard/task-base/router-timeout/4.4",
+							tree: "4".repeat(40),
+						}),
+						validateTaskBaseAsync: async (_workspaceId, base) => base,
+						releaseTaskBaseAsync: async () => {},
+					}),
+				},
+			});
+			strictEqual(result.results.length, 2);
+			strictEqual(result.results[0].result, "execution_timed_out");
+			strictEqual(result.results[0].timeoutDiff, "unavailable_destroy_only");
+			strictEqual(result.results[0].partialDiff, undefined);
+			strictEqual(result.results[0].cleanupFailed, false);
+			strictEqual(
+				result.results.at(-1).result,
+				"halted_after_provider_timeout",
+			);
+			strictEqual(
+				result.results.at(-1).errorKind,
+				"provider_timeout_clone_retired",
+			);
+			ok(
+				!result.results.some(
+					(entry) => entry.result === "halted_after_provider_cleanup_failure",
+				),
+			);
+			strictEqual(adapterContainers.length, 1);
+			strictEqual(captureCalls.length, 0);
+			strictEqual(guestExecArgv.length, 0);
+			deepStrictEqual(cleanupReasons, ["timeout"]);
+			strictEqual(destroyCalls.length, 1);
+			strictEqual(dispatches[0].timeoutDiff, "unavailable_destroy_only");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -262,15 +428,13 @@ describe("Task 6.1 queue-level platform selection", () => {
 			platform: "macos",
 			dependencies: {
 				backendFactory,
-				orchestrator: { launch: async () => ({ jobId: "unused" }) },
 			},
 		};
 		try {
 			await runQueueAsync(base);
 			runQueue(base);
-			await runQueueWithOrchestrator(base);
-			strictEqual(calls.filter((call) => call === "create-vm").length, 3);
-			strictEqual(calls.filter((call) => call === "destroy-vm").length, 3);
+			strictEqual(calls.filter((call) => call === "create-vm").length, 2);
+			strictEqual(calls.filter((call) => call === "destroy-vm").length, 2);
 			ok(!calls.some((call) => call.includes("docker")));
 		} finally {
 			rmSync(root, { recursive: true, force: true });

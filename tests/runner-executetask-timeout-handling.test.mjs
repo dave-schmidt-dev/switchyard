@@ -1,5 +1,6 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
 	captureDiffDetailed as captureAgyDiffDetailed,
@@ -26,15 +27,63 @@ import {
 	captureDiffDetailed as captureOpencodeDiffDetailed,
 	captureDiffDetailedAsync as captureOpencodeDiffDetailedAsync,
 } from "../src/switchyard/adapter/opencode.mjs";
-import { DEFAULT_ADAPTERS } from "../src/switchyard/runner/index.mjs";
 import {
-	executeTask,
+	DEFAULT_ADAPTERS,
 	executeTaskAsync,
+} from "../src/switchyard/runner/index.mjs";
+import {
+	descriptorForRoute,
 	runnerTestDir,
-	testDescriptor,
-} from "./helpers/runner-fixtures.mjs";
+	runQueueAsync,
+	TASK_BASE,
+	withExplicitSwitchyardExecutor,
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
+function writeTasksFile(content) {
+	mkdirSync(TEST_DIR, { recursive: true });
+	const tasksPath = join(TEST_DIR, "tasks.md");
+	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
+	return tasksPath;
+}
+function claudeDescriptor() {
+	return descriptorForRoute({ provider: "claude", model: "claude-sonnet-5" });
+}
+// executeTaskAsync is a bare execute path: it has no queue bootstrap, so the
+// immutable task base must be supplied by a stub async queue backend.
+function executeContext(overrides = {}) {
+	return {
+		queueBackend: {
+			captureTaskBaseAsync: async () => TASK_BASE,
+			validateTaskBaseAsync: async (_workspaceId, base) => base,
+			releaseTaskBaseAsync: async () => {},
+		},
+		taskBases: {},
+		persistTaskBase: () => {},
+		resolveDescriptor: () => claudeDescriptor(),
+		recordDispatch: () => {},
+		recordDispatchIntent: () => {},
+		projectPath: TEST_DIR,
+		workingContainerName: "fake-container",
+		...overrides,
+	};
+}
+function stubBroker(execution) {
+	return {
+		selectAndReserve: async () => ({
+			provider: "claude",
+			model: "claude-sonnet-5",
+			resolvedTarget: "claude",
+			harness: "claude",
+			capability: "standard",
+			reason: "spread",
+			snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+		}),
+		launcherIdentity: () => ({}),
+		execute: async () => execution,
+		release: async () => {},
+	};
+}
 afterEach(() => {
 	try {
 		rmSync(TEST_DIR, { recursive: true, force: true });
@@ -43,7 +92,7 @@ afterEach(() => {
 	}
 });
 describe("executeTask timeout handling", () => {
-	it("retains every detailed diff-capture status after a timed-out execution", () => {
+	it("retains every detailed diff-capture status after a timed-out execution", async () => {
 		const statuses = [
 			"captured",
 			"empty",
@@ -54,34 +103,30 @@ describe("executeTask timeout handling", () => {
 		];
 
 		for (const status of statuses) {
-			const result = executeTask(
+			const result = await executeTaskAsync(
 				{ id: "1.1", title: "task", description: "failed task" },
-				{
-					route: () => ({
-						provider: "claude",
-						model: "claude-sonnet-5",
-						percentLeft: 50,
-						reason: "spread",
+				executeContext({
+					broker: stubBroker({
+						success: false,
+						error: "provider timed out",
+						timedOut: true,
 					}),
-					recordDispatch: () => {},
-					recordDispatchIntent: () => {},
 					integrationGate: () => ({ success: true, message: "ok" }),
 					adapters: {
 						claude: {
-							execute: () => ({
+							executeAsync: async () => ({
 								success: false,
 								error: "provider timed out",
 								timedOut: true,
 							}),
-							captureDiffDetailed: () => ({
+							captureDiffAsync: async () => null,
+							captureDiffDetailedAsync: async () => ({
 								status,
 								diff: status === "captured" ? "diff --git a/a b/a" : null,
 							}),
 						},
 					},
-					projectPath: TEST_DIR,
-					workingContainerName: "fake-container",
-				},
+				}),
 			);
 
 			strictEqual(result.captureStatus, status);
@@ -102,27 +147,12 @@ describe("executeTask timeout handling", () => {
 		let legacyCaptureCalled = false;
 		const result = await executeTaskAsync(
 			{ id: "1.1", title: "task", description: "timed out task" },
-			{
-				broker: {
-					selectAndReserve: async () => ({
-						provider: "claude",
-						model: "claude-sonnet-5",
-						resolvedTarget: "claude",
-						harness: "claude",
-						capability: "standard",
-						reason: "spread",
-						snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
-					}),
-					launcherIdentity: () => ({}),
-					execute: async () => ({
-						success: false,
-						timedOut: true,
-						reason: "provider timed out",
-					}),
-				},
-				resolveDescriptor: () => testDescriptor(),
-				recordDispatch: async () => {},
-				recordDispatchIntent: async () => {},
+			executeContext({
+				broker: stubBroker({
+					success: false,
+					timedOut: true,
+					reason: "provider timed out",
+				}),
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
@@ -137,9 +167,7 @@ describe("executeTask timeout handling", () => {
 						}),
 					},
 				},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-			},
+			}),
 		);
 
 		strictEqual(result.result, "execution_timed_out_capture_failed");
@@ -185,48 +213,45 @@ describe("executeTask timeout handling", () => {
 		}
 	});
 
-	it("captures a partial diff and returns execution_timed_out without calling integrationGate when the adapter reports timedOut", () => {
+	it("captures a partial diff and returns execution_timed_out without calling integrationGate when the adapter reports timedOut", async () => {
 		const gateCalls = [];
 		const captureDiffCalls = [];
 		const dispatches = [];
 
-		const result = executeTask(
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "task",
 				description: "a task that overran its timeout",
 				requiredPaths: null,
 			},
-			{
-				route: () => ({
-					provider: "claude",
-					model: "claude-sonnet-5",
-					percentLeft: 50,
-					reason: "spread",
+			executeContext({
+				broker: stubBroker({
+					success: false,
+					output: "partial output before kill",
+					error: "spawnSync docker ETIMEDOUT",
+					timedOut: true,
 				}),
 				recordDispatch: (entry) => dispatches.push(entry),
-				recordDispatchIntent: () => {},
 				integrationGate: (diff, projectPath, options) => {
 					gateCalls.push({ diff, projectPath, options });
 					return { success: true, message: "ok" };
 				},
 				adapters: {
 					claude: {
-						execute: () => ({
+						executeAsync: async () => ({
 							success: false,
 							output: "partial output before kill",
 							error: "spawnSync docker ETIMEDOUT",
 							timedOut: true,
 						}),
-						captureDiff: (containerName) => {
+						captureDiffAsync: async (containerName) => {
 							captureDiffCalls.push(containerName);
 							return "diff --git a/wip.mjs b/wip.mjs\n+work in progress";
 						},
 					},
 				},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-			},
+			}),
 		);
 
 		strictEqual(result.success, false);
@@ -246,50 +271,27 @@ describe("executeTask timeout handling", () => {
 		strictEqual(dispatches[0].result, "execution_timed_out");
 	});
 
-	it("passes task.timeoutMs through to adapter.execute, falling back to the provider default when absent", () => {
+	it("passes task.timeoutMs through to adapter.execute, falling back to the provider default when absent", async () => {
+		const tasksPath = writeTasksFile(`## Phase 1
+
+### Task 1.1: custom
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Timeout:** 90s
+- **Description:** x
+
+### Task 1.2: default
+- **Status:** pending
+- **Files:** src/a.mjs
+- **Description:** x
+`);
 		const executeCalls = [];
-		const context = () => ({
-			route: () => ({
-				provider: "claude",
-				model: "claude-sonnet-5",
-				percentLeft: 50,
-				reason: "spread",
-			}),
-			recordDispatch: () => {},
-			recordDispatchIntent: () => {},
-			integrationGate: () => ({ success: true, message: "ok" }),
-			adapters: {
-				claude: {
-					execute: (_prompt, _containerName, options) => {
-						executeCalls.push(options.timeoutMs);
-						return { success: true, output: "ok" };
-					},
-					captureDiff: () => null,
-				},
-			},
+
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
-			workingContainerName: "fake-container",
-			now: () => 1_000,
-			monotonicNow: () => 0,
-		});
-
-		executeTask(
-			{ id: "1.1", title: "custom", description: "x", timeoutMs: 90_000 },
-			context(),
-		);
-		executeTask({ id: "1.2", title: "default", description: "x" }, context());
-
-		strictEqual(executeCalls[0], 90_000);
-		strictEqual(executeCalls[1], PROVIDER_EXECUTION_TIMEOUT_MS);
-	});
-
-	it("captures but never integrates a diff from a non-timeout execution failure", () => {
-		const captureDiffCalls = [];
-		const gateCalls = [];
-
-		const result = executeTask(
-			{ id: "1.1", title: "task", description: "a normal failure" },
-			{
+			checkpointPath: `${tasksPath}.checkpoint.json`,
+			dependencies: {
 				route: () => ({
 					provider: "claude",
 					model: "claude-sonnet-5",
@@ -297,27 +299,55 @@ describe("executeTask timeout handling", () => {
 					reason: "spread",
 				}),
 				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
+				integrationGate: () => ({ success: true, message: "ok" }),
+				adapters: {
+					claude: {
+						executeAsync: async (_prompt, _containerName, options) => {
+							executeCalls.push(options.timeoutMs);
+							return { success: true, output: "ok" };
+						},
+						captureDiffAsync: async () =>
+							"diff --git a/src/a.mjs b/src/a.mjs\n+ok",
+					},
+				},
+			},
+		});
+
+		strictEqual(result.processedTasks, 2);
+		strictEqual(executeCalls[0], 90_000);
+		strictEqual(executeCalls[1], PROVIDER_EXECUTION_TIMEOUT_MS);
+	});
+
+	it("captures but never integrates a diff from a non-timeout execution failure", async () => {
+		const captureDiffCalls = [];
+		const gateCalls = [];
+
+		const result = await executeTaskAsync(
+			{ id: "1.1", title: "task", description: "a normal failure" },
+			executeContext({
+				broker: stubBroker({
+					success: false,
+					output: "",
+					error: "provider crashed",
+				}),
 				integrationGate: (...args) => {
 					gateCalls.push(args);
 					return { success: true, message: "ok" };
 				},
 				adapters: {
 					claude: {
-						execute: () => ({
+						executeAsync: async () => ({
 							success: false,
 							output: "",
 							error: "provider crashed",
 						}),
-						captureDiff: (containerName) => {
+						captureDiffAsync: async (containerName) => {
 							captureDiffCalls.push(containerName);
 							return "diff --git a/wip.mjs b/wip.mjs\n+recoverable work";
 						},
 					},
 				},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-			},
+			}),
 		);
 
 		strictEqual(result.result, "execution_failed");

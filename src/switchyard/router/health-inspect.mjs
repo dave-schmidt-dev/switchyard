@@ -12,13 +12,16 @@ import {
 	writeFileSync,
 } from "node:fs";
 
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
 	getInvocationDescriptor,
 	getInvocationDescriptorIdentity,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
+
+import { getRunRoot } from "../run-store/index.mjs";
+import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 
 import {
 	lockRecord,
@@ -199,9 +202,47 @@ export function generationFor(observations, input) {
 	};
 }
 
+// A claim does not record its task deadline, so a stranded one is bounded by
+// age. Simple deadlines are capped at 30 minutes; 2 h covers that plus grace.
+export const STRANDED_CLAIM_MS = 2 * 60 * 60 * 1000;
+// A claim whose run's worker is still alive may be a long queue task (task
+// timeouts are capped at 24 h), so it is only reclaimed past that cap plus grace.
+export const LIVE_CLAIM_MS = 26 * 60 * 60 * 1000;
+const MAX_RUN_RECORD_BYTES = 1024 * 1024;
+
+function claimRunLiveness(runId, now) {
+	try {
+		const raw = readFileSync(join(getRunRoot(runId), "run.json"));
+		if (raw.length > MAX_RUN_RECORD_BYTES) return "unknown";
+		const run = JSON.parse(raw.toString("utf8"));
+		return run?.runId === runId ? classifyRunLiveness(run, { now }) : "unknown";
+	} catch {
+		return "unknown";
+	}
+}
+
+/**
+ * Whether a half-open claim is stranded and may be dropped. A claim is
+ * reclaimed when its run is terminal and cleaned up in the run store (the
+ * trial can no longer report), or when it is older than STRANDED_CLAIM_MS
+ * (LIVE_CLAIM_MS while the run's worker is still alive). A dead worker alone is
+ * not enough: its provider group may have outlived it.
+ *
+ * @param {object|null} claim persisted claim
+ * @param {number} now epoch milliseconds
+ * @returns {boolean}
+ */
+export function claimReclaimable(claim, now) {
+	if (!claim) return false;
+	const liveness = claimRunLiveness(claim.runId, now);
+	if (liveness === "terminal_clean") return true;
+	const age = now - claim.acquiredAt;
+	return age >= (liveness === "live" ? LIVE_CLAIM_MS : STRANDED_CLAIM_MS);
+}
+
 export function effective(control, observations, input, now) {
 	const { key, value } = generationFor(observations, input);
-	if (control.claim)
+	if (control.claim && !claimReclaimable(control.claim, now))
 		return { key, value, state: "half-open", claim: control.claim };
 	if (control.holds.length) return { key, value, state: "repair-hold" };
 	if (value.state === "cooldown")

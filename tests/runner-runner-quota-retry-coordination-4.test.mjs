@@ -5,11 +5,10 @@ import { afterEach, describe, it } from "node:test";
 import { loadCheckpoint } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
 	runQueueAsync,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
@@ -287,7 +286,7 @@ describe("runner quota retry coordination", () => {
 			),
 		);
 	});
-	it("does not retry a caller-supplied container or escape an explicit target allowlist", () => {
+	it("does not retry a caller-supplied container or escape an explicit target allowlist", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Quota fallback
@@ -304,7 +303,7 @@ describe("runner quota retry coordination", () => {
 			],
 			executionOutcomes: {},
 		});
-		fixture.dependencies.adapters.agy.execute = () => {
+		fixture.dependencies.adapters.agy.executeAsync = async () => {
 			executeCalls.push("agy");
 			return {
 				success: false,
@@ -314,7 +313,7 @@ describe("runner quota retry coordination", () => {
 			};
 		};
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "caller-owned",
@@ -331,10 +330,7 @@ describe("runner quota retry coordination", () => {
 		strictEqual(checkpoint.retryAttempts.length, 0);
 	});
 	it("does not reset, quarantine, or reroute text-only quota labels in sync and async queues", async () => {
-		for (const [name, entrypoint] of [
-			["sync", runQueue],
-			["async", runQueueAsync],
-		]) {
+		for (const [name, entrypoint] of [["async", runQueueAsync]]) {
 			const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reject ${name} text-only quota

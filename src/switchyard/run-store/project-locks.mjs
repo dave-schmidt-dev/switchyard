@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { hostname } from "node:os";
+import { basename, resolve } from "node:path";
+import { informationalEvent } from "../diagnostics/failure-registry.mjs";
+import { classifyBoundProjectLock } from "../dispatch/remediate-orphaned-locks-candidates.mjs";
+import { isPidProvenDead } from "../dispatch/remediate-orphaned-locks-support.mjs";
 import {
 	createMutationIntent,
 	executeMutation,
@@ -13,6 +17,7 @@ import {
 	moveProjectLockPathToClaim,
 	parseOwnedProjectLockBody,
 	parseProjectLockArtifact,
+	parseProjectLockBody,
 	parseRecoveryReservation,
 	projectLockArtifacts,
 	projectLockClaimPath,
@@ -29,7 +34,23 @@ import {
 	recordMutationOperation,
 	updateRunWithRetry,
 } from "./run-updates.mjs";
-export async function acquireProjectLock(canonicalProjectPath, runId) {
+/**
+ * Take the project lock for `runId`, reclaiming it first when its holder is
+ * provably dead (see `reclaimDeadHolderLock`). Every other held or recovery
+ * state still throws `PROJECT_LOCK_HELD` or
+ * `PROJECT_LOCK_RECOVERY_IN_PROGRESS`.
+ *
+ * @param {string} canonicalProjectPath
+ * @param {string} runId
+ * @param {object} [options]
+ * @param {(event: object) => void} [options.onEvent] receives the registered
+ *   `project_lock_reclaimed` informational event after a reclaim
+ */
+export async function acquireProjectLock(
+	canonicalProjectPath,
+	runId,
+	options = {},
+) {
 	canonicalProjectPath = resolveCanonicalProjectPath(canonicalProjectPath);
 	await ensureDir(locksRoot(), 0o700);
 	const lockPath = projectLockPath(canonicalProjectPath);
@@ -41,6 +62,7 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
 		createdAt: new Date().toISOString(),
 		projectPath: canonicalProjectPath,
 		holderPid: process.pid,
+		holderHost: hostname(),
 	});
 	if (
 		existsSync(claimPath) ||
@@ -55,23 +77,24 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
 			{ code: "PROJECT_LOCK_RECOVERY_IN_PROGRESS" },
 		);
 	}
+	let reclaimedRunId = null;
 	try {
 		await writeFile(lockPath, content, { flag: "wx", mode: 0o600 });
 	} catch (e) {
-		if (e.code === "EEXIST") {
-			let holder = "unknown";
-			try {
-				const raw = await readFile(lockPath, "utf8");
-				holder = JSON.parse(raw).runId;
-			} catch {
-				// ignore
-			}
-			throw new LockError(
-				`Project lock already held for ${canonicalProjectPath} by ${holder}`,
-				{ code: "PROJECT_LOCK_HELD", holderRunId: holder },
-			);
+		if (e.code !== "EEXIST") throw e;
+		reclaimedRunId = await reclaimDeadHolderLock(
+			lockPath,
+			canonicalProjectPath,
+		);
+		if (reclaimedRunId === null)
+			throw await projectLockHeldError(lockPath, canonicalProjectPath);
+		// Exactly one retry: a concurrent acquirer that won the freed path keeps it.
+		try {
+			await writeFile(lockPath, content, { flag: "wx", mode: 0o600 });
+		} catch (retryError) {
+			if (retryError.code !== "EEXIST") throw retryError;
+			throw await projectLockHeldError(lockPath, canonicalProjectPath);
 		}
-		throw e;
 	}
 	if (
 		existsSync(claimPath) ||
@@ -87,6 +110,86 @@ export async function acquireProjectLock(canonicalProjectPath, runId) {
 			{ code: "PROJECT_LOCK_RECOVERY_IN_PROGRESS" },
 		);
 	}
+	if (reclaimedRunId !== null && typeof options.onEvent === "function") {
+		try {
+			options.onEvent(
+				informationalEvent("project_lock_reclaimed", { reclaimedRunId }),
+			);
+		} catch {
+			// Observers never affect lock ownership.
+		}
+	}
+}
+async function projectLockHeldError(lockPath, canonicalProjectPath) {
+	let holder = "unknown";
+	try {
+		const raw = await readFile(lockPath, "utf8");
+		holder = JSON.parse(raw).runId;
+	} catch {
+		// ignore
+	}
+	return new LockError(
+		`Project lock already held for ${canonicalProjectPath} by ${holder}`,
+		{ code: "PROJECT_LOCK_HELD", holderRunId: holder },
+	);
+}
+/**
+ * Remove the canonical project lock only when its holder is provably dead.
+ *
+ * Fails closed: returns `null` (the caller keeps `PROJECT_LOCK_HELD`) unless
+ * the body parses with a matching `projectPath`, names this host in
+ * `holderHost` and a positive `holderPid` other than this process, run.json
+ * exists, the shared remediation classifier reports `project-lock-stale` for
+ * the canonical lock file, and both the holder pid and any distinct run
+ * worker pid are proven absent (ESRCH only; EPERM counts as live). The
+ * removal is a body-matched atomic take (`unlinkBodyMatched`), so a lock
+ * replaced after the read is never deleted.
+ *
+ * @param {string} lockPath canonical project lock path
+ * @param {string} projectPath canonical project path
+ * @returns {Promise<string|null>} the reclaimed run id, or null
+ */
+async function reclaimDeadHolderLock(lockPath, projectPath) {
+	const raw = await readTextIfPresent(lockPath);
+	if (raw === null) return null;
+	const body = parseProjectLockBody(raw, projectPath);
+	if (
+		!body ||
+		body.holderHost !== hostname() ||
+		!Number.isSafeInteger(body.holderPid) ||
+		body.holderPid <= 0 ||
+		body.holderPid === process.pid
+	) {
+		return null;
+	}
+	let run;
+	try {
+		run = await readRun(body.runId);
+	} catch {
+		return null;
+	}
+	const descriptor = classifyBoundProjectLock({
+		name: basename(lockPath),
+		path: lockPath,
+		body,
+		run,
+		livenessOptions: { now: Date.now() },
+	});
+	if (
+		descriptor.category !== "project-lock-stale" ||
+		descriptor.remediationKind !== "project-lock" ||
+		!isPidProvenDead(body.holderPid)
+	) {
+		return null;
+	}
+	if (
+		run.workerPid != null &&
+		run.workerPid !== body.holderPid &&
+		!isPidProvenDead(run.workerPid)
+	) {
+		return null;
+	}
+	return (await unlinkBodyMatched(lockPath, raw)) ? body.runId : null;
 }
 export async function releaseProjectLock(canonicalProjectPath, expectedRunId) {
 	if (typeof expectedRunId !== "string" || expectedRunId.length === 0) {

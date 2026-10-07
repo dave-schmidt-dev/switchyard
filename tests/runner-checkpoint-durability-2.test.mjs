@@ -27,11 +27,9 @@ import {
 } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
 	runQueueAsync,
-	runQueueWithOrchestrator,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeLegacyCheckpoint(path, checkpoint) {
@@ -53,11 +51,7 @@ afterEach(() => {
 });
 describe("checkpoint durability", () => {
 	it("durably releases checkpoint ownership in all three queue loops", async () => {
-		for (const [name, entrypoint] of [
-			["sync", runQueue],
-			["async", runQueueAsync],
-			["orchestrator", runQueueWithOrchestrator],
-		]) {
+		for (const [name, entrypoint] of [["async", runQueueAsync]]) {
 			const tasksPath = writeTasksFile(
 				`### Task 1.1: Completed ${name}\n- **Status:** done\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** already complete\n`,
 			);
@@ -71,11 +65,6 @@ describe("checkpoint durability", () => {
 					queuePreflight: () => ({ ok: true, eligible: true }),
 					acquireVmSlot: () => null,
 					releaseVmSlot: () => {},
-					orchestrator: {
-						launch: () => "unused",
-						status: () => ({ state: "done" }),
-						result: () => ({ success: true }),
-					},
 				},
 			});
 			strictEqual(
@@ -117,11 +106,7 @@ describe("checkpoint durability", () => {
 		const previousStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
 		const projections = [];
 		try {
-			for (const [name, entrypoint] of [
-				["sync", runQueue],
-				["async", runQueueAsync],
-				["orchestrator", runQueueWithOrchestrator],
-			]) {
+			for (const [name, entrypoint] of [["async", runQueueAsync]]) {
 				const storeRoot = join(
 					TEST_DIR,
 					`shadow-cross-path-${name}-${randomUUID()}`,
@@ -187,11 +172,6 @@ describe("checkpoint durability", () => {
 					releaseVmSlot: () => {},
 					runStore,
 					enableTypedOutcomes: false,
-					orchestrator: {
-						launch: () => "unused",
-						status: () => ({ state: "done" }),
-						result: () => ({ success: true }),
-					},
 				};
 				const result = await entrypoint({
 					tasksFilePath: tasksPath,
@@ -342,7 +322,7 @@ describe("checkpoint durability", () => {
 		);
 		deepStrictEqual(checkpoint.completedTaskIds, []);
 	});
-	it("runQueue fails closed instead of silently succeeding when the tasks file parses to zero tasks", () => {
+	it("runQueue fails closed instead of silently succeeding when the tasks file parses to zero tasks", async () => {
 		// Regression: a tasks file with 0 "### Task <id>: <title>" headings
 		// (wrong heading level, empty file, corrupted markdown) parsed to an
 		// empty array and runQueue returned totalTasks:0/runnableTasks:0 as a
@@ -351,15 +331,14 @@ describe("checkpoint durability", () => {
 		const tasksPath = writeTasksFile("## Phase 1\nNo task headings here.\n");
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 
-		throws(
-			() =>
-				runQueue({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					workingContainerName: "fake-container",
-					checkpointPath,
-					dependencies: {},
-				}),
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				workingContainerName: "fake-container",
+				checkpointPath,
+				dependencies: {},
+			}),
 			/no tasks parsed from .*0 headings/,
 		);
 
@@ -370,24 +349,7 @@ describe("checkpoint durability", () => {
 		strictEqual(raw.parseError.detectedHeadings, 0);
 		strictEqual(raw.parseError.tasksFilePath, tasksPath);
 	});
-	it("runQueueWithOrchestrator also fails closed on a zero-task parse", async () => {
-		const tasksPath = writeTasksFile("## Phase 1\nNo task headings here.\n");
-		const checkpointPath = `${tasksPath}.checkpoint.json`;
-
-		await rejects(
-			() =>
-				runQueueWithOrchestrator({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					workingContainerName: "fake-container",
-					checkpointPath,
-					dependencies: {},
-				}),
-			/no tasks parsed from .*0 headings/,
-		);
-		strictEqual(existsSync(checkpointPath), true);
-	});
-	it("runQueue always leaves a checkpoint file behind on a normal completion, even with zero runnable tasks", () => {
+	it("runQueue always leaves a checkpoint file behind on a normal completion, even with zero runnable tasks", async () => {
 		// Regression: saveCheckpoint was only called inside the per-task loop,
 		// so a run whose queue was already fully completed by a prior
 		// checkpoint (runnable.length === 0, totalTasks > 0) returned a
@@ -410,7 +372,7 @@ describe("checkpoint durability", () => {
 			results: [{ taskId: "1.1", success: true }],
 		});
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",

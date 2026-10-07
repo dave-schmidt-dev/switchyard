@@ -10,10 +10,7 @@ import {
 	resolveTargetProvenance,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import {
-	executeTask,
-	executeTaskWithOrchestrator,
-} from "../src/switchyard/runner/index.mjs";
+import { executeTaskAsync } from "../src/switchyard/runner/index.mjs";
 import {
 	FIXTURE_PATH,
 	PROVENANCE_KEYS,
@@ -61,6 +58,41 @@ function taskBaseContext() {
 		taskBases: {},
 	};
 }
+function stubBroker({ route, descriptor, adapters }) {
+	const selectedRoute = {
+		...route,
+		effort: null,
+		reason: "spread",
+		snapshotIdentity: {
+			source: "fixture",
+			status: "fresh",
+			mtime: null,
+			ageMs: 0,
+		},
+		reservation: null,
+	};
+	return {
+		selectAndReserve: async (request) => ({
+			...selectedRoute,
+			capability: request.capability,
+		}),
+		launcherIdentity: (selected) => ({
+			provider: selected.provider,
+			resolvedTarget: selected.resolvedTarget,
+			harness: selected.harness,
+			model: selected.model,
+			effort: selected.effort,
+			descriptorIdentity: descriptor.descriptor_identity,
+			reservationId: null,
+		}),
+		execute: async (_request, selected) => {
+			const adapter = adapters[selected.harness];
+			const execution = await adapter.executeAsync("prompt", "vm", {});
+			return { success: execution?.success === true };
+		},
+		release: async () => {},
+	};
+}
 function makeContext({ provider, model, adapters }) {
 	const dispatches = [];
 	const targetId =
@@ -71,21 +103,22 @@ function makeContext({ provider, model, adapters }) {
 				: provider;
 	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
 	const descriptor = syntheticDescriptor({ targetId, model, harness });
+	const resolvedAdapters = adapters ?? {};
 	return {
 		context: {
 			...taskBaseContext(),
-			route: () => ({
-				provider,
-				model,
-				resolvedTargetId: targetId,
-				resolved_harness: harness,
-				invocationDescriptor: descriptor,
-				percentLeft: 50,
-				reason: "spread",
-				log: [],
+			broker: stubBroker({
+				route: {
+					provider,
+					model,
+					resolvedTarget: targetId,
+					harness,
+				},
+				descriptor,
+				adapters: resolvedAdapters,
 			}),
 			resolveDescriptor: () => descriptor,
-			adapters: adapters ?? {},
+			adapters: resolvedAdapters,
 			recordDispatch: (d) => dispatches.push(d),
 			recordDispatchIntent: () => {},
 			integrationGate: () => ({ success: true }),
@@ -279,23 +312,23 @@ describe("resolveTargetProvenance / resolveRouteProvenance — target resolution
 	});
 });
 describe("executeTask — every dispatch record carries all six provenance fields", () => {
-	it("carries provenance on the SUCCESS path (opencode-go via its adapter)", () => {
+	it("carries provenance on the SUCCESS path (opencode-go via its adapter)", async () => {
 		let executed = 0;
 		const { context, dispatches } = makeContext({
 			provider: "OpenCode Go",
 			model: "fixture/opencode-low",
 			adapters: {
 				opencode: {
-					execute: () => {
+					executeAsync: async () => {
 						executed += 1;
 						return { success: true };
 					},
-					captureDiff: () => "",
+					captureDiffAsync: async () => "",
 				},
 			},
 		});
 
-		const result = executeTask(TASK, context);
+		const result = await executeTaskAsync(TASK, context);
 		strictEqual(executed, 1);
 		strictEqual(result.result, "success_no_diff");
 
@@ -313,7 +346,7 @@ describe("executeTask — every dispatch record carries all six provenance field
 		strictEqual(rec.resolved_credential_profile, "go");
 	});
 
-	it("carries provenance on the UNSUPPORTED_PROVIDER path too (no record can omit it)", () => {
+	it("carries provenance on the UNSUPPORTED_PROVIDER path too (no record can omit it)", async () => {
 		// Claude normalizes to harness "claude" but no adapter is registered ->
 		// unsupported_provider. The record must still carry provenance.
 		const { context, dispatches } = makeContext({
@@ -322,7 +355,7 @@ describe("executeTask — every dispatch record carries all six provenance field
 			adapters: {},
 		});
 
-		const result = executeTask(TASK, context);
+		const result = await executeTaskAsync(TASK, context);
 		strictEqual(result.result, "unsupported_provider");
 
 		const rec = dispatches[0];
@@ -338,153 +371,29 @@ describe("executeTask — every dispatch record carries all six provenance field
 		);
 	});
 
-	it("attaches the six fields onto routeResult itself", () => {
-		// Hold a reference to the exact object route() returns; executeTask does
-		// Object.assign(routeResult, provenance) on it, so after the call the
-		// provenance must be visible on this same object.
-		const routeResultObj = {
+	it("attaches the six fields onto routeResult itself", async () => {
+		// The async queue selects through the broker, which normalizes the
+		// routed result before executeTaskAsync merges provenance, so the route
+		// result carrying the six fields is the one the runner retains for its
+		// completion path — not the raw object a sync route() callback returned.
+		const { context } = makeContext({
 			provider: "OpenCode Go",
 			model: "fixture/opencode-low",
-			resolvedTargetId: "opencode-go",
-			resolved_harness: "opencode",
-			invocationDescriptor: syntheticDescriptor({
-				targetId: "opencode-go",
-				model: "fixture/opencode-low",
-				harness: "opencode",
-			}),
-			percentLeft: 50,
-			reason: "spread",
-			log: [],
-		};
-		const context = {
-			...taskBaseContext(),
-			route: () => routeResultObj,
 			adapters: {
 				opencode: {
-					execute: () => ({ success: true }),
-					captureDiff: () => "",
+					executeAsync: async () => ({ success: true }),
+					captureDiffAsync: async () => "",
 				},
 			},
-			recordDispatch: () => {},
-			integrationGate: () => ({ success: true }),
-			projectPath: "/tmp/x",
-			workingContainerName: "c",
-			exclude: [],
-		};
-		context.resolveDescriptor = () => routeResultObj.invocationDescriptor;
-		executeTask(TASK, context);
+		});
+		await executeTaskAsync(TASK, context);
+		const routeResult = context._activeCompletionRoute;
 		for (const key of PROVENANCE_KEYS) {
-			ok(key in routeResultObj, `routeResult missing ${key}`);
+			ok(key in routeResult, `routeResult missing ${key}`);
 		}
-		strictEqual(routeResultObj.resolved_target, "opencode-go");
-		strictEqual(routeResultObj.resolved_harness, "opencode");
-		strictEqual(routeResultObj.resolved_credential_profile, "go");
-		strictEqual(routeResultObj.requiredCapability, "low");
-	});
-});
-function makeOrchestratorContext({
-	provider,
-	model,
-	orchestratorOverrides = {},
-}) {
-	const dispatches = [];
-	const targetId =
-		provider === "OpenCode Go"
-			? "opencode-go"
-			: provider === "Claude"
-				? "claude-code"
-				: provider;
-	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
-	const descriptor = syntheticDescriptor({ targetId, model, harness });
-	return {
-		context: {
-			...taskBaseContext(),
-			route: () => ({
-				provider,
-				model,
-				resolvedTargetId: targetId,
-				resolved_harness: harness,
-				invocationDescriptor: descriptor,
-				percentLeft: 50,
-				reason: "spread",
-				log: [],
-			}),
-			resolveDescriptor: () => descriptor,
-			recordDispatch: (d) => dispatches.push(d),
-			recordDispatchIntent: () => {},
-			integrationGate: () => ({ success: true }),
-			projectPath: "/tmp/does-not-matter",
-			workingContainerName: "test-container",
-			exclude: [],
-			adapters: {
-				[harness]: { captureDiffAsync: async () => "" },
-			},
-			orchestrator: {
-				launch: async () => "job-1",
-				status: async () => ({ state: "done" }),
-				result: async () => ({ success: true, diff: "" }),
-				...orchestratorOverrides,
-			},
-		},
-		dispatches,
-	};
-}
-describe("executeTaskWithOrchestrator — every dispatch record carries all six provenance fields", () => {
-	it("carries provenance on the SUCCESS path (opencode-go via the orchestrator)", async () => {
-		const { context, dispatches } = makeOrchestratorContext({
-			provider: "OpenCode Go",
-			model: "fixture/opencode-low",
-		});
-
-		const result = await executeTaskWithOrchestrator(TASK, context);
-		strictEqual(result.result, "success_no_diff");
-		strictEqual(result.requiredCapability, "low");
-
-		strictEqual(dispatches.length, 1);
-		const rec = dispatches[0];
-		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
-		strictEqual(rec.requiredCapability, "low");
-		strictEqual(rec.roster_schema_version, 1);
-		ok(/^[0-9a-f]{64}$/.test(rec.roster_sha256));
-		strictEqual(rec.resolved_target, "opencode-go");
-		strictEqual(rec.resolved_harness, "opencode");
-		strictEqual(rec.resolved_credential_profile, "go");
-	});
-
-	it("carries provenance on the launch_failed path (an early record() call site)", async () => {
-		// The orchestrator path has record() call sites the adapter path doesn't
-		// (launch/poll/result failures). This is the earliest one — proves
-		// provenance is resolved and attached BEFORE the launch is even attempted,
-		// not bolted on only at the success tail.
-		const { context, dispatches } = makeOrchestratorContext({
-			provider: "Claude",
-			model: "fixture-claude-high",
-			orchestratorOverrides: {
-				launch: async () => {
-					throw new Error("orchestrator unreachable");
-				},
-			},
-		});
-
-		const result = await executeTaskWithOrchestrator(TASK, context);
-		strictEqual(result.result, "launch_failed");
-		strictEqual(result.requiredCapability, "low");
-
-		strictEqual(dispatches.length, 1);
-		const rec = dispatches[0];
-		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
-		strictEqual(rec.requiredCapability, "low");
-		strictEqual(rec.resolved_target, "claude-code");
-		strictEqual(rec.resolved_harness, "claude");
-		ok(
-			typeof rec.resolved_selector === "string" &&
-				rec.resolved_selector.startsWith("fixture-claude-"),
-			`expected a claude selector, got ${rec.resolved_selector}`,
-		);
-		ok(
-			typeof rec.resolved_credential_profile === "string" &&
-				rec.resolved_credential_profile.length > 0,
-			`expected a credential profile, got ${rec.resolved_credential_profile}`,
-		);
+		strictEqual(routeResult.resolved_target, "opencode-go");
+		strictEqual(routeResult.resolved_harness, "opencode");
+		strictEqual(routeResult.resolved_credential_profile, "go");
+		strictEqual(routeResult.requiredCapability, "low");
 	});
 });

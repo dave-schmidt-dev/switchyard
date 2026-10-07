@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import {
 	getInvocationDescriptorIdentity,
 	resolveTargetIdentity,
@@ -13,13 +14,19 @@ import {
 	startHalfOpenClaimSync,
 } from "../router/health.mjs";
 import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
-import { createRouteHealthEvent, getRunRoot } from "../run-store/index.mjs";
+import {
+	createRouteHealthEvent,
+	getRunRoot,
+	getStateRoot,
+} from "../run-store/index.mjs";
 
 const SIMPLE_ROUTE_HEALTH_LANE = "simple-direct";
 export const SIMPLE_ROUTE_HEALTH_EPOCH = "switchyard-simple-direct-v1";
 
+// Simple dispatch enforces unless the value is exactly "shadow"; the queue
+// still enforces only on the exact value "enforce".
 function configuredMode(value) {
-	return value === "enforce" ? "enforce" : "shadow";
+	return value === "shadow" ? "shadow" : "enforce";
 }
 
 function envValue(value, name) {
@@ -83,10 +90,10 @@ export function createSimpleRouteHealthController(options = {}) {
 	const mode = configuredMode(
 		envValue(options.healthMode, "SWITCHYARD_ROUTE_HEALTH_MODE"),
 	);
-	const healthStateRoot = envValue(
-		options.healthStateRoot,
-		"SWITCHYARD_ROUTE_HEALTH_STATE_ROOT",
-	);
+	// Beside the run-store state, so a relocated run-store root moves health too.
+	const healthStateRoot =
+		envValue(options.healthStateRoot, "SWITCHYARD_ROUTE_HEALTH_STATE_ROOT") ??
+		join(getStateRoot(), "route-health");
 	const decision =
 		options.healthDecision ??
 		createDefaultRouteHealthDecision({
@@ -398,6 +405,8 @@ export function createSimpleRouteHealthController(options = {}) {
 			descriptorHarness: binding.descriptorHarness,
 			providerReliability,
 			providerLifecycle,
+			// Group-settled writer lifecycle (the whole process group is gone).
+			providerWriterLifecycle: providerResult?.writerLifecycle,
 			healthLane: SIMPLE_ROUTE_HEALTH_LANE,
 			providerExecutionSucceeded: providerResult?.success === true,
 			servedModelVerified: providerResult?.servedModelVerified === true,

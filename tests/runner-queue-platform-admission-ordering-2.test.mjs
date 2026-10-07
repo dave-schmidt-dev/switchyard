@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -7,13 +7,11 @@ import {
 	CheckpointIdentityError,
 	QueueCleanupError,
 	runQueueAsync as runQueueAsyncImpl,
-	runQueue as runQueueImpl,
 } from "../src/switchyard/runner/index.mjs";
 import {
-	macosBackend,
 	runnerTestDir,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 const UNVERIFIED_PROVIDER = "unverified-provider-fixture";
@@ -22,6 +20,42 @@ function writeTasksFile(content) {
 	const tasksPath = join(TEST_DIR, "tasks.md");
 	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
 	return tasksPath;
+}
+// Stub macOS queue backend for the async admission suites, kept inline so this
+// file depends only on async-runner-fixtures.mjs.
+function macosBackend(
+	events,
+	{ failCreate = false, failDestroy = false } = {},
+) {
+	return {
+		platform: "macos",
+		preflight: () => events.push("preflight"),
+		readiness: () => {
+			events.push("readiness");
+			return { inventoryCount: 0 };
+		},
+		acquireSlot: () => {
+			events.push("acquire");
+			return { token: "test-slot" };
+		},
+		releaseSlot: () => events.push("release"),
+		ensureAgentContainer: () => events.push("ensure"),
+		create: () => {
+			events.push("create");
+			if (failCreate) throw new Error("create failed");
+			return "test-vm";
+		},
+		provision: () => events.push("provision"),
+		seed: () => events.push("seed"),
+		commit: () => {},
+		reset: () => {},
+		destroy: () => {
+			events.push("destroy");
+			if (failDestroy) {
+				throw new Error("SECRET_CANARY synthetic backend teardown failure");
+			}
+		},
+	};
 }
 afterEach(() => {
 	try {
@@ -221,19 +255,18 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		ok(events.indexOf("destroy") >= 0);
 		ok(events.indexOf("release") > events.indexOf("destroy"));
 	});
-	it("releases a slot when workspace creation fails", () => {
+	it("releases a slot when workspace creation fails", async () => {
 		const events = [];
 		const tasksPath = writeTerminalQueue();
-		throws(
-			() =>
-				runQueueImpl({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					platform: "macos",
-					dependencies: {
-						backendFactory: () => macosBackend(events, { failCreate: true }),
-					},
-				}),
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				dependencies: {
+					backendFactory: () => macosBackend(events, { failCreate: true }),
+				},
+			}),
 			/create failed/,
 		);
 		deepStrictEqual(events, [
@@ -245,27 +278,26 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			"release",
 		]);
 	});
-	it("rejects an invalid platform before backend selection or admission", () => {
+	it("rejects an invalid platform before backend selection or admission", async () => {
 		const events = [];
 		const tasksPath = writeTerminalQueue();
-		throws(
-			() =>
-				runQueueImpl({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					platform: "windows",
-					dependencies: {
-						backendFactory: () => {
-							events.push("factory");
-							return macosBackend(events);
-						},
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "windows",
+				dependencies: {
+					backendFactory: () => {
+						events.push("factory");
+						return macosBackend(events);
 					},
-				}),
+				},
+			}),
 			/runOptions\.platform must be one of macos/,
 		);
 		deepStrictEqual(events, []);
 	});
-	it("rejects the default macOS preflight before slot acquisition or VM creation", () => {
+	it("rejects the default macOS preflight before slot acquisition or VM creation", async () => {
 		const events = [];
 		const tasksPath = writeTasksFile(`## Phase 1
 
@@ -277,50 +309,49 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 - **RequiredCapabilityJustification:** test gate
 - **Description:** fixture
 `);
-		throws(
-			() =>
-				runQueueImpl({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					platform: "macos",
-					dependencies: {
-						backendFactory: () => ({
-							create: () => {
-								events.push("create");
-								return "vm";
-							},
-							seed: () => {},
-							commit: () => {},
-							reset: () => {},
-							destroy: () => {},
-							acquireSlot: () => events.push("acquire"),
-						}),
-						// A name no roster resolves, so only the default preflight
-						// can reject it, and it must do so before any backend work.
-						// This used to be "claude" on the premise that the default
-						// allowlist excluded it; claude-code was verified on
-						// 2026-09-18 and the premise died. The allowlist gate itself
-						// is covered in the split router suites by the case that
-						// injects `goldenImageVerifiedProviders`.
-						adapters: { [UNVERIFIED_PROVIDER]: {} },
-						preflightReadSnapshot: () => ({
-							snapshot: {
-								schema_version: 2,
-								updated_at: new Date().toISOString(),
-								providers: [
-									{
-										name: UNVERIFIED_PROVIDER,
-										ok: true,
-										windows: [{ percent_left: 80, pace_delta: 1 }],
-									},
-								],
-							},
-							snapshotStatus: "fresh",
-							snapshotMtime: 1,
-							snapshotAgeMsAtRoute: 0,
-						}),
-					},
-				}),
+		await rejects(
+			runQueueAsyncImpl({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				platform: "macos",
+				dependencies: {
+					backendFactory: () => ({
+						create: () => {
+							events.push("create");
+							return "vm";
+						},
+						seed: () => {},
+						commit: () => {},
+						reset: () => {},
+						destroy: () => {},
+						acquireSlot: () => events.push("acquire"),
+					}),
+					// A name no roster resolves, so only the default preflight
+					// can reject it, and it must do so before any backend work.
+					// This used to be "claude" on the premise that the default
+					// allowlist excluded it; claude-code was verified on
+					// 2026-09-18 and the premise died. The allowlist gate itself
+					// is covered in the split router suites by the case that
+					// injects `goldenImageVerifiedProviders`.
+					adapters: { [UNVERIFIED_PROVIDER]: {} },
+					preflightReadSnapshot: () => ({
+						snapshot: {
+							schema_version: 2,
+							updated_at: new Date().toISOString(),
+							providers: [
+								{
+									name: UNVERIFIED_PROVIDER,
+									ok: true,
+									windows: [{ percent_left: 80, pace_delta: 1 }],
+								},
+							],
+						},
+						snapshotStatus: "fresh",
+						snapshotMtime: 1,
+						snapshotAgeMsAtRoute: 0,
+					}),
+				},
+			}),
 			new RegExp(
 				`high: no_golden_image_verified_provider_with_quota_headroom.*${UNVERIFIED_PROVIDER}: target_identity_unavailable`,
 			),

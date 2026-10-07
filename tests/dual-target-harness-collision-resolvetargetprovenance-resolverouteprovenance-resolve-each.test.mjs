@@ -12,10 +12,7 @@ import {
 	resolveTargetProvenance,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import {
-	executeTask,
-	executeTaskWithOrchestrator,
-} from "../src/switchyard/runner/index.mjs";
+import { executeTask } from "../src/switchyard/runner/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(
@@ -146,7 +143,7 @@ describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's
 		strictEqual(geminiProv.resolved_target, "antigravity");
 	});
 });
-describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selector per target (C.7 proof)", () => {
+describe("executeTask dispatches the CORRECT selector per target (C.7 proof)", () => {
 	const taskBase = {
 		ref: "refs/switchyard/task-base/dual-target/T-dual-agy",
 		tree: "2".repeat(40),
@@ -232,74 +229,6 @@ describe("executeTask / executeTaskWithOrchestrator dispatch the CORRECT selecto
 		strictEqual(result.result, "success_no_diff");
 		strictEqual(executeCalls.length, 1);
 		strictEqual(executeCalls[0].model, "fixture-agy-gemini-standard");
-	});
-
-	function makeOrchestratorContext({ provider, model, targetId }) {
-		const launchCalls = [];
-		const descriptor = syntheticDescriptor({
-			targetId,
-			model,
-			harness: "agy",
-		});
-		return {
-			context: {
-				...taskBaseContext,
-				taskBases: {},
-				route: () => ({
-					provider,
-					model,
-					resolvedTargetId: targetId,
-					resolved_harness: "agy",
-					invocationDescriptor: descriptor,
-					percentLeft: 50,
-					reason: "spread",
-					log: [],
-				}),
-				resolveDescriptor: () => descriptor,
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true }),
-				projectPath: "/tmp/does-not-matter",
-				workingContainerName: "test-container",
-				exclude: [],
-				adapters: {
-					agy: { captureDiffAsync: async () => "" },
-				},
-				orchestrator: {
-					launch: async (payload) => {
-						launchCalls.push(payload);
-						return "job-1";
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: "" }),
-				},
-			},
-			launchCalls,
-		};
-	}
-
-	it("executeTaskWithOrchestrator forwards the Claude bucket's model into orchestrator.launch", async () => {
-		const { context, launchCalls } = makeOrchestratorContext({
-			provider: ANTIGRAVITY_CLAUDE,
-			model: "fixture-agy-claude-standard",
-			targetId: "antigravity-claude",
-		});
-		await executeTaskWithOrchestrator(TASK, context);
-		strictEqual(launchCalls.length, 1);
-		strictEqual(launchCalls[0].provider, ANTIGRAVITY_CLAUDE);
-		strictEqual(launchCalls[0].model, "fixture-agy-claude-standard");
-	});
-
-	it("executeTaskWithOrchestrator forwards the Gemini bucket's model into orchestrator.launch", async () => {
-		const { context, launchCalls } = makeOrchestratorContext({
-			provider: ANTIGRAVITY,
-			model: "fixture-agy-gemini-standard",
-			targetId: "antigravity",
-		});
-		await executeTaskWithOrchestrator(TASK, context);
-		strictEqual(launchCalls.length, 1);
-		strictEqual(launchCalls[0].provider, ANTIGRAVITY);
-		strictEqual(launchCalls[0].model, "fixture-agy-gemini-standard");
 	});
 
 	it("review tasks use the normal high-capability route without a reviewer role flag", () => {

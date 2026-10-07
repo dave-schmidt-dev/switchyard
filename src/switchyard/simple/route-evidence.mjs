@@ -28,6 +28,8 @@ const REASONS = new Set([
 	"provider_unavailable",
 	"no_quota_headroom",
 	"route_health_suppressed",
+	"deadline_fit_excluded",
+	"deadline_fit_overridden",
 	"no_valid_windows",
 	"quota_exhausted",
 	"accounting_bucket_unavailable",

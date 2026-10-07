@@ -89,7 +89,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 	// adapter's `cleanup` (killOrphanedProcessesAsync, Docker-only) would be a
 	// guaranteed-to-fail no-op against a VM workspace id, so it only runs as a
 	// fallback: when no such backend method exists, or when it throws.
-	const cleanupWithBackend = async () => {
+	const cleanupWithBackend = async (termination = {}) => {
 		let backendError = null;
 		let backendHandled = false;
 		if (typeof executionBackend?.cleanupProviderProcess === "function") {
@@ -100,6 +100,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 					{
 						onStatus,
 						...markerContext(cleanupContext, "provider"),
+						...(termination?.reason ? { reason: termination.reason } : {}),
 					},
 				);
 				backendHandled = true;
@@ -148,7 +149,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 	const operationId =
 		cleanupPolicy.operationId ??
 		createMutationIntent({ operation, resource, policy }).operationId;
-	const cleanupWithProtocol = async () => {
+	const cleanupWithProtocol = async (termination = {}) => {
 		let cleanupStore = null;
 		let resume = cleanupPolicy.resume ?? null;
 		if (cleanupContext?.runId) {
@@ -171,13 +172,19 @@ export async function executeProviderInvocation(command, args, options = {}) {
 			operationId,
 			policy,
 			resume,
-			command: cleanupMutation?.command ?? (() => cleanupWithBackend()),
+			command:
+				cleanupMutation?.command ?? (() => cleanupWithBackend(termination)),
 			observe:
 				cleanupMutation?.observe ??
-				((result) =>
-					result?.postcondition === true || result?.cleanupFailed === false
-						? { status: "confirmed", ownership: "confirmed" }
-						: { status: "ambiguous", ownership: "unknown" }),
+				((result, context) =>
+					// A backend cleanup that returns without cleanupFailed is the
+					// confirmation; a throw (commandError) and a resumed observation
+					// without a fresh result stay uncertain.
+					context?.commandError ||
+					context?.resumed ||
+					result?.cleanupFailed === true
+						? { status: "ambiguous", ownership: "unknown" }
+						: { status: "confirmed", ownership: "confirmed" }),
 			persist:
 				cleanupMutation?.persist ??
 				(cleanupStore

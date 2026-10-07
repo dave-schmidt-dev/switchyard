@@ -727,8 +727,10 @@ describe("simple provider reliability contract", () => {
 				...healthIdentity(healthStateRoot, descriptor, seed.epoch),
 				nowMs: clock,
 			});
-			strictEqual(state.state, started ? "half-open" : "cooldown");
-			strictEqual(state.trialAvailable, !started);
+			// The run is terminal and cleaned up, so a started trial's claim is
+			// reclaimed and the next dispatch may take a fresh trial.
+			strictEqual(state.state, "cooldown");
+			strictEqual(state.trialAvailable, true);
 			if (interruption === "callback") {
 				strictEqual(result.partialWorktree, null);
 				const run = await readRun(result.runId);

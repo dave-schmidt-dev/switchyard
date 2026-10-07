@@ -2,9 +2,7 @@ import { strictEqual } from "node:assert";
 import { rmSync } from "node:fs";
 import { afterEach, describe, it } from "node:test";
 import {
-	descriptorForRoute,
 	executeTask,
-	executeTaskWithOrchestrator,
 	runnerTestDir,
 	TASK_BASE,
 } from "./helpers/runner-fixtures.mjs";
@@ -102,117 +100,4 @@ describe("dispatch descriptor receipt contract", () => {
 			strictEqual(executions, 0);
 		});
 	}
-	it("uses host-captured orchestrator bytes and rejects a contradictory base receipt", async () => {
-		let gatedDiff = null;
-		let captureCleanupContext = null;
-		let captureError = null;
-		const context = {
-			runId: "orchestrator-capture-run",
-			attemptId: "orchestrator-capture-attempt",
-			route: () => ({ provider: "claude", model: "test-model" }),
-			recordDispatch: () => {},
-			recordDispatchIntent: () => {},
-			workingContainerName: "worker",
-			projectPath: TEST_DIR,
-			pollIntervalMs: 1,
-			maxPolls: 1,
-			sleepFn: async () => {},
-			adapters: {
-				claude: {
-					captureDiffAsync: async (_workspace, options) => {
-						try {
-							options.executionBackend.execArgv("worker", {});
-						} catch (error) {
-							captureError = error;
-							throw error;
-						}
-						return "authoritative-host-diff";
-					},
-				},
-			},
-			executionBackend: {
-				execArgv(_workspace, options) {
-					captureCleanupContext = options.cleanupContext;
-					return { command: "true", args: [] };
-				},
-			},
-			integrationGate: (diff) => {
-				gatedDiff = diff;
-				return { success: true };
-			},
-			orchestrator: {
-				launch: async () => "job",
-				status: async () => ({ state: "done" }),
-				result: async () => ({
-					success: true,
-					diff: "untrusted-returned-diff",
-				}),
-			},
-		};
-		const accepted = await executeTaskWithOrchestrator(
-			{ id: "1.7", title: "task", description: "work" },
-			context,
-		);
-		strictEqual(
-			accepted.success,
-			true,
-			`${JSON.stringify(accepted)} capture=${captureError?.message}`,
-		);
-		strictEqual(gatedDiff, "authoritative-host-diff");
-		strictEqual(captureCleanupContext.operation, "helper");
-		strictEqual(captureCleanupContext.workspaceId, "worker");
-
-		const rejected = await executeTaskWithOrchestrator(
-			{ id: "1.8", title: "task", description: "work" },
-			{
-				...context,
-				orchestrator: {
-					...context.orchestrator,
-					result: async () => ({
-						success: true,
-						taskBase: { ...TASK_BASE, tree: "9".repeat(40) },
-					}),
-				},
-			},
-		);
-		strictEqual(rejected.result, "task_base_capture_failed");
-
-		const opencodeDescriptor = descriptorForRoute({
-			provider: "OpenCode Go",
-			resolved_harness: "opencode",
-			resolvedTargetId: "opencode-go",
-			model: "fixture/opencode-low",
-		});
-		for (const hostDiff of ["authoritative-opencode-diff", ""]) {
-			let captures = 0;
-			const result = await executeTaskWithOrchestrator(
-				{
-					id: `1.openc-${hostDiff.length}`,
-					title: "task",
-					description: "work",
-				},
-				{
-					...context,
-					route: () => ({
-						provider: "OpenCode Go",
-						model: "fixture/opencode-low",
-						resolvedTargetId: "opencode-go",
-						resolved_harness: "opencode",
-						invocationDescriptor: opencodeDescriptor,
-					}),
-					resolveDescriptor: () => opencodeDescriptor,
-					adapters: {
-						opencode: {
-							captureDiffAsync: async () => {
-								captures += 1;
-								return hostDiff;
-							},
-						},
-					},
-				},
-			);
-			strictEqual(result.success, true);
-			strictEqual(captures, 1);
-		}
-	});
 });

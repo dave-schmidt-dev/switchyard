@@ -101,6 +101,58 @@ describe("provider process lifecycle", () => {
 		strictEqual(Object.hasOwn(result.diagnosticEvidence, "stdout"), false);
 	});
 
+	it("confirms cleanup when the backend returns without cleanupFailed", async () => {
+		const child = fakeChild();
+		let backendCleanups = 0;
+		const executionBackend = {
+			cleanupProviderProcess: () => {
+				backendCleanups += 1;
+				return { cleanupStage: "index_lock_removed", workspaceId: "vm-4-1" };
+			},
+		};
+		const result = await executeProviderInvocation("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			executionBackend,
+		});
+		strictEqual(backendCleanups, 1);
+		strictEqual(result.timedOut, true);
+		strictEqual(
+			result.cleanupFailed,
+			false,
+			"a non-throwing backend cleanup without cleanupFailed is confirmed",
+		);
+		strictEqual(result.cleanupStatus, "succeeded");
+		strictEqual(result.diagnosticCode, "execution_timed_out");
+		strictEqual(result.failurePhase, "provider_execution");
+	});
+
+	it("stays uncertain when the backend's lock-removal cleanup throws", async () => {
+		const child = fakeChild();
+		const executionBackend = {
+			cleanupProviderProcess: () => {
+				throw Object.assign(new Error("guest index lock removal failed"), {
+					cleanupStage: "cleanup_started",
+				});
+			},
+		};
+		const result = await executeProviderInvocation("fake", [], {
+			spawnFn: () => child,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			executionBackend,
+		});
+		strictEqual(result.timedOut, true);
+		strictEqual(result.cleanupFailed, true);
+		strictEqual(result.cleanupStage, "cleanup_started");
+		strictEqual(
+			result.diagnosticCode,
+			"provider_cleanup_after_cleanup_started",
+		);
+		strictEqual(result.failurePhase, "provider_cleanup");
+	});
+
 	it("runs the adapter's cleanup when no backend cleanupProviderProcess is available", async () => {
 		const child = fakeChild();
 		let adapterCleanups = 0;

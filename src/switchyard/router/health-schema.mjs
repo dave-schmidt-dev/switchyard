@@ -43,7 +43,19 @@ export const HOLD_CODES = new Set([
 
 export const SUCCESS_CODE = "verified_transport_success";
 
-const QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES = Object.freeze([]);
+// A started half-open trial whose provider process is proven stopped, but whose
+// outcome says nothing about the provider (cancelled, cleanup failed, spawn
+// refused). It releases the claim; recomputeGeneration otherwise ignores it.
+export const TRIAL_INCONCLUSIVE_CODE = "trial_inconclusive";
+
+// Provider-caused failures that drive the cooldown ladder. They are minted only
+// from lifecycle-backed evidence on the simple-direct lane (health-observations
+// .mjs); the queue-vm lane never produces them.
+const QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES = Object.freeze([
+	"provider_exit_nonzero",
+	"provider_deadline_exceeded",
+	"provider_signalled",
+]);
 
 export const TRANSIENT_CODES = new Set(QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES);
 
@@ -55,7 +67,10 @@ export const MAX_BYTES = 256 * 1024;
 
 export const MAX_ATTEMPTS = 512;
 
-export const WINDOW_MS = 10 * 60 * 1000;
+// The window only filters TRANSIENT_CODES, which only the simple-direct lane
+// mints, so this is effectively the simple window. Local agent crashes arrive
+// hours apart, so a ten-minute window never saw two of them.
+export const WINDOW_MS = 6 * 60 * 60 * 1000;
 
 export const COOLDOWN_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000];
 
@@ -355,6 +370,7 @@ function validAttempt(value) {
 			...TRANSIENT_CODES,
 			...PROVIDER_COOLDOWN_CODES,
 			SUCCESS_CODE,
+			TRIAL_INCONCLUSIVE_CODE,
 		].includes(value.code) &&
 		Number.isFinite(value.at) &&
 		Number.isSafeInteger(value.sequence)

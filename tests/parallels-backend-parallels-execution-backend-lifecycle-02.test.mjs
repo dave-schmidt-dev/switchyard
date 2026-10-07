@@ -187,8 +187,9 @@ describe("Parallels execution backend lifecycle", () => {
 		);
 	});
 
-	it("separates helper markers and refuses signaling without guest birth proof", () => {
+	it("removes the stale Git index lock without guest PID authority", () => {
 		const calls = [];
+		const events = [];
 		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
 		backend.execGuest = (...args) => calls.push(args);
 		const provider = markerContext("provider");
@@ -204,82 +205,53 @@ describe("Parallels execution backend lifecycle", () => {
 				attemptId: "attempt-2",
 			}),
 		);
-		throws(
-			() =>
-				backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], provider),
-			/process-start identity is unknown/,
+		deepStrictEqual(
+			backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], {
+				...provider,
+				onStatus: (event) => events.push(event),
+			}),
+			{ cleanupStage: "index_lock_removed", workspaceId: WORK_UUID },
 		);
 		deepStrictEqual(
 			calls,
-			[],
-			"unknown guest birth identity must produce no probe or signal",
+			[
+				[
+					WORK_UUID,
+					"/bin/rm",
+					["-f", "--", "/project/.git/index.lock"],
+					{ cwd: "/" },
+				],
+			],
+			"cleanup must make exactly one PID-independent lock removal",
 		);
-	});
-
-	it("emits completed VM cleanup stages and preserves the last stage on failure", () => {
-		const events = [];
-		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
-		backend.getGuestPid = () => 4242;
-		backend.execGuest = () => {};
-		const cleaned = backend.cleanupProviderProcess(
-			"prlctl",
-			["exec", WORK_UUID],
-			{ ...markerContext(), onStatus: (event) => events.push(event) },
-		);
-		strictEqual(cleaned.cleanupStage, "index_lock_removed");
 		deepStrictEqual(
 			events.map((event) => event.event),
 			[
 				"provider_cleanup_started",
-				"provider_pid_observed",
-				"provider_tree_gone",
-				"provider_pid_marker_removed",
 				"provider_index_lock_removed",
 				"provider_cleanup_complete",
 			],
 		);
-
-		backend.execGuest = (_workspaceId, command, args) => {
-			if (
-				command === "/bin/rm" &&
-				args.includes(backend.providerPidPath(WORK_UUID, markerContext()))
-			) {
-				throw new Error("marker removal failed");
-			}
-		};
-		throws(
-			() =>
-				backend.cleanupProviderProcess(
-					"prlctl",
-					["exec", WORK_UUID],
-					markerContext(),
-				),
-			(error) => error.cleanupStage === "tree_terminated",
-		);
 	});
 
-	it("carries the stage and exit status on provider_cleanup_failed (Task 6.3)", () => {
-		// The recorded Antigravity failure emitted provider_cleanup_started and
-		// provider_pid_observed, then provider_cleanup_failed with nothing but
-		// a fixed status string. Two causes produce that ordering and need
-		// different fixes — the guest kill script ran and found survivors, or
-		// the guest exec never ran — so the event has to name which.
+	it("annotates a lock-removal failure with the reached cleanup stage", () => {
 		const events = [];
 		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
-		backend.getGuestPid = () => 4242;
 		backend.execGuest = () => {
-			// What execFileSync throws when the kill script completes and its
-			// closing `[ -z "$survivors" ]` fails.
-			throw Object.assign(new Error("survivors after SIGKILL"), {
+			// What execFileSync throws when the guest rm ran and exited
+			// non-zero, as opposed to a transport failure with no status.
+			throw Object.assign(new Error("index lock removal failed"), {
 				status: 1,
 				signal: null,
 			});
 		};
-		throws(() =>
-			backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], {
-				...markerContext(),
-				onStatus: (event) => events.push(event),
-			}),
+		throws(
+			() =>
+				backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], {
+					...markerContext(),
+					onStatus: (event) => events.push(event),
+				}),
+			(error) => error.cleanupStage === "cleanup_started",
 		);
 		const failure = events.find(
 			(event) => event.event === "provider_cleanup_failed",
@@ -287,13 +259,81 @@ describe("Parallels execution backend lifecycle", () => {
 		ok(failure, "provider_cleanup_failed must still be emitted");
 		strictEqual(
 			failure.cleanupStage,
-			"pid_observed",
+			"cleanup_started",
 			"the last stage reached is the whole fault localization",
 		);
 		strictEqual(failure.exitCode, 1);
 		ok(
 			!("stderr" in failure) && !("output" in failure),
 			"INV-2: no provider text may ride out on the cleanup event",
+		);
+	});
+
+	it("makes no guest exec when a timeout or cancel defers to the VM destroy", () => {
+		const calls = [];
+		const events = [];
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		backend.execGuest = (...args) => calls.push(args);
+		for (const reason of ["timeout", "cancel"]) {
+			events.length = 0;
+			deepStrictEqual(
+				backend.cleanupProviderProcess("prlctl", ["exec", WORK_UUID], {
+					...markerContext(),
+					reason,
+					onStatus: (event) => events.push(event),
+				}),
+				{ cleanupStage: "destroy_pending", workspaceId: WORK_UUID },
+			);
+			deepStrictEqual(
+				events.map((event) => event.event),
+				["provider_cleanup_started", "provider_cleanup_complete"],
+			);
+		}
+		deepStrictEqual(
+			calls,
+			[],
+			"a surviving provider may still hold the lock, so no guest exec may be made",
+		);
+	});
+
+	it("returns null for a command outside the VM execution lane", () => {
+		const backend = new ParallelsExecutionBackend({ aquaUid: 501 });
+		backend.execGuest = () => {
+			throw new Error("no guest exec may be made");
+		};
+		strictEqual(
+			backend.cleanupProviderProcess(
+				"docker",
+				["exec", WORK_UUID],
+				markerContext(),
+			),
+			null,
+		);
+	});
+
+	it("clears the lock through the production exec route with no override", () => {
+		const calls = [];
+		const backend = workspaceBackend((args) => {
+			calls.push(args);
+			return "ok";
+		});
+		deepStrictEqual(
+			backend.cleanupProviderProcess(
+				"prlctl",
+				["exec", WORK_UUID],
+				markerContext(),
+			),
+			{ cleanupStage: "index_lock_removed", workspaceId: WORK_UUID },
+		);
+		strictEqual(
+			calls.length,
+			1,
+			"exactly one prlctl exec may reach the transport",
+		);
+		const script = decodeGuestScript(calls[0]);
+		ok(
+			script.includes("/bin/rm") && script.includes("/project/.git/index.lock"),
+			"the one guest exec must be the PID-independent index lock removal",
 		);
 	});
 

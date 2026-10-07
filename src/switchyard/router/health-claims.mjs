@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+	claimReclaimable,
 	effective,
 	repairTrialAvailable,
 	updateScopeSync,
@@ -32,19 +33,21 @@ export async function attestRouteRepair(input) {
 	return updateScope(
 		input,
 		async ({ control }) => {
-			if (control.claim)
+			const now = safeTime(input.nowMs ?? Date.now());
+			if (control.claim && !claimReclaimable(control.claim, now))
 				return {
 					write: false,
 					repairEpoch: control.repairEpoch,
 					reason: "claim-active",
 				};
+			control.claim = null;
 			control.repairEpoch += 1;
 			control.attestations.push({
 				publicConfigurationEpoch: input.publicConfigurationEpoch,
 				repairEpoch: control.repairEpoch,
 				repairKind: input.repairKind,
 				adapterContractId,
-				at: safeTime(input.nowMs ?? Date.now()),
+				at: now,
 			});
 			return { repairEpoch: control.repairEpoch, state: "repair-hold" };
 		},
@@ -68,7 +71,7 @@ export async function acquireHalfOpenClaim(input) {
 	return updateScope(input, async ({ control, observations }) => {
 		if (control.repairEpoch !== input.repairEpoch)
 			return { write: false, claimed: false, reason: "stale-repair-epoch" };
-		if (control.claim)
+		if (control.claim && !claimReclaimable(control.claim, now))
 			return { write: false, claimed: false, reason: "claim-active" };
 		const state = effective(control, observations, input, now);
 		const attested = control.attestations.some(
@@ -107,7 +110,7 @@ export function acquireHalfOpenClaimSync(input) {
 	return updateScopeSync(input, ({ control, observations }) => {
 		if (control.repairEpoch !== input.repairEpoch)
 			return { write: false, claimed: false, reason: "stale-repair-epoch" };
-		if (control.claim)
+		if (control.claim && !claimReclaimable(control.claim, now))
 			return { write: false, claimed: false, reason: "claim-active" };
 		const state = effective(control, observations, input, now);
 		const eligibleRepair =

@@ -1,4 +1,4 @@
-import { deepStrictEqual, strictEqual } from "node:assert";
+import { strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,7 +12,6 @@ import {
 import { runQueue as runQueueImpl } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueueWithOrchestrator,
 	withExplicitSwitchyardExecutor,
 } from "./helpers/runner-fixtures.mjs";
 
@@ -162,77 +161,5 @@ describe("runner provider spread recording", { concurrency: false }, () => {
 			rmSync(snapshotPath, { force: true });
 			rmSync(qualifiedRosterPath, { force: true });
 		}
-	});
-	it("records split dispatches across claude and codex", async () => {
-		const tasksPath = writeTasksFile(`## Phase 1
-
-### Task 1.1: First task
-- **Status:** pending
-- **Type:** implementation
-- **Files:** src/switchyard/runner/index.mjs
-- **Description:** First operation
-
-### Task 1.2: Second task
-- **Status:** pending
-- **Type:** implementation
-- **Files:** src/switchyard/runner/index.mjs
-- **Description:** Second operation
-`);
-		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const dispatches = [];
-		let routeIndex = 0;
-		const routes = [
-			{
-				provider: "claude",
-				model: "claude-sonnet-5",
-				percentLeft: 70,
-				reason: "spread",
-			},
-			{
-				provider: "codex",
-				model: "gpt-5.6-terra",
-				percentLeft: 68,
-				reason: "spread",
-			},
-		];
-		let launchIndex = 0;
-
-		await runQueueWithOrchestrator({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			workingContainerName: "fake-container",
-			checkpointPath,
-			dependencies: {
-				route: () => {
-					const selected = routes[Math.min(routeIndex, routes.length - 1)];
-					routeIndex += 1;
-					return selected;
-				},
-				recordDispatch: (entry) => dispatches.push(entry),
-				integrationGate: () => ({ success: true, message: "ok" }),
-				sleepFn: async () => {},
-				orchestrator: {
-					launch: async () => {
-						launchIndex += 1;
-						return `job-${launchIndex}`;
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: "" }),
-				},
-			},
-		});
-
-		deepStrictEqual(
-			dispatches.map((entry) => entry.provider),
-			["claude", "codex"],
-		);
-		deepStrictEqual(
-			dispatches.map((entry) => entry.model),
-			["claude-sonnet-5", "gpt-5.6-terra"],
-		);
-		deepStrictEqual(
-			dispatches.map((entry) => entry.result),
-			["success", "success"],
-		);
 	});
 });

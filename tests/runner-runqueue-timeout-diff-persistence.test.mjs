@@ -16,9 +16,9 @@ import { applyCheckpointArtifactRetention } from "../src/switchyard/run-store/in
 import { loadCheckpoint } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -35,7 +35,7 @@ afterEach(() => {
 	}
 });
 describe("runQueue timeout diff persistence", () => {
-	it("persists a timed-out task's partial diff to disk and records partialDiffPath + timedOut in checkpoint.json without embedding the raw diff text", () => {
+	it("persists a timed-out task's partial diff to disk and records partialDiffPath + timedOut in checkpoint.json without embedding the raw diff text", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Long-running task
@@ -49,8 +49,9 @@ describe("runQueue timeout diff persistence", () => {
 		chmodSync(artifactsDir, 0o755);
 		const diffText =
 			"diff --git a/wip.mjs b/wip.mjs\n+SECRET_CANARY_wip_marker";
+		const diagnosticRef = `diagnostic:${"a".repeat(32)}`;
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -72,7 +73,7 @@ describe("runQueue timeout diff persistence", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({
+						executeAsync: async () => ({
 							success: false,
 							output: "",
 							error: "spawnSync docker ETIMEDOUT",
@@ -80,8 +81,12 @@ describe("runQueue timeout diff persistence", () => {
 							cleanupFailed: true,
 							cleanupStage: "pid_marker_removed",
 							failurePhase: "provider_cleanup",
+							diagnosticCode: "provider_cleanup_after_pid_marker_removed",
+							diagnosticOrigin: "adapter",
+							diagnosticEvidenceAvailable: true,
+							diagnosticRef,
 						}),
-						captureDiff: () => diffText,
+						captureDiffAsync: async () => diffText,
 					},
 				},
 			},
@@ -135,7 +140,7 @@ describe("runQueue timeout diff persistence", () => {
 			"checkpoint.json must not persist the host artifact path",
 		);
 	});
-	it("refuses a pre-existing symlink partial-diffs directory", () => {
+	it("refuses a pre-existing symlink partial-diffs directory", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Symlinked artifact directory
@@ -148,7 +153,7 @@ describe("runQueue timeout diff persistence", () => {
 		const outsideDir = `${checkpointPath}.outside`;
 		mkdirSync(outsideDir, { recursive: true, mode: 0o700 });
 		symlinkSync(outsideDir, artifactsDir);
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -170,22 +175,22 @@ describe("runQueue timeout diff persistence", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({
+						executeAsync: async () => ({
 							success: false,
 							output: "",
 							error: "spawnSync docker ETIMEDOUT",
 							timedOut: true,
 						}),
-						captureDiff: () => "untrusted symlink output",
+						captureDiffAsync: async () => "untrusted symlink output",
 					},
 				},
 			},
 		});
 		strictEqual(result.processedTasks, 1);
-		strictEqual(result.results[0].partialDiffPath, undefined);
+		strictEqual(result.results[0].partialDiffPath, null);
 		strictEqual(readdirSync(outsideDir).length, 0);
 	});
-	it("refuses a pre-existing symlink artifact without changing its target", () => {
+	it("refuses a pre-existing symlink artifact without changing its target", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Symlinked artifact file
@@ -199,7 +204,7 @@ describe("runQueue timeout diff persistence", () => {
 		mkdirSync(artifactsDir, { recursive: true, mode: 0o700 });
 		writeFileSync(outsidePath, "outside stays unchanged", { mode: 0o600 });
 		symlinkSync(outsidePath, join(artifactsDir, "1.1.attempt-1.diff"));
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -215,19 +220,19 @@ describe("runQueue timeout diff persistence", () => {
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
-						execute: () => ({
+						executeAsync: async () => ({
 							success: false,
 							output: "",
 							error: "spawnSync docker ETIMEDOUT",
 							timedOut: true,
 						}),
-						captureDiff: () => "must not escape",
+						captureDiffAsync: async () => "must not escape",
 					},
 				},
 			},
 		});
 		strictEqual(result.processedTasks, 1);
-		strictEqual(result.results[0].partialDiffPath, undefined);
+		strictEqual(result.results[0].partialDiffPath, null);
 		strictEqual(readFileSync(outsidePath, "utf8"), "outside stays unchanged");
 	});
 	it("retires runner-written retry evidence after the task later succeeds", async () => {
@@ -251,7 +256,7 @@ describe("runQueue timeout diff persistence", () => {
 			integrationGate: () => ({ success: true, message: "ok" }),
 			adapters: {
 				claude: {
-					execute: () =>
+					executeAsync: async () =>
 						shouldSucceed
 							? { success: true, output: "ok" }
 							: {
@@ -260,12 +265,12 @@ describe("runQueue timeout diff persistence", () => {
 									error: "spawnSync docker ETIMEDOUT",
 									timedOut: true,
 								},
-					captureDiff: () =>
+					captureDiffAsync: async () =>
 						shouldSucceed ? "" : "diff --git a/retry.mjs b/retry.mjs\n+pending",
 				},
 			},
 		};
-		const first = runQueue({
+		const first = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -278,7 +283,7 @@ describe("runQueue timeout diff persistence", () => {
 		ok(existsSync(artifactPath));
 
 		shouldSucceed = true;
-		const second = runQueue({
+		const second = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -300,7 +305,7 @@ describe("runQueue timeout diff persistence", () => {
 		strictEqual(retention.deletedCount, 1);
 		strictEqual(existsSync(artifactPath), false);
 	});
-	it("records an integrated result against the gate-reserved attempt", () => {
+	it("records an integrated result against the gate-reserved attempt", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Integrated task
@@ -309,7 +314,7 @@ describe("runQueue timeout diff persistence", () => {
 - **Description:** preserve integration attempt identity
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -342,8 +347,8 @@ describe("runQueue timeout diff persistence", () => {
 				},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () =>
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () =>
 							"diff --git a/src/a.mjs b/src/a.mjs\n+integrated change",
 					},
 				},
@@ -356,7 +361,7 @@ describe("runQueue timeout diff persistence", () => {
 		strictEqual(checkpoint.results[0].attempt, 1);
 		strictEqual(checkpoint.integrationIntents["1.1"].operation.attempt, 1);
 	});
-	it("does not bind a stale artifact to the next result after a crash window", () => {
+	it("does not bind a stale artifact to the next result after a crash window", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Crash-safe artifact attempt
@@ -377,17 +382,17 @@ describe("runQueue timeout diff persistence", () => {
 			integrationGate: () => ({ success: true, message: "ok" }),
 			adapters: {
 				claude: {
-					execute: () => ({
+					executeAsync: async () => ({
 						success: false,
 						output: "",
 						error: "spawnSync docker ETIMEDOUT",
 						timedOut: true,
 					}),
-					captureDiff: () => diffText,
+					captureDiffAsync: async () => diffText,
 				},
 			},
 		};
-		const first = runQueue({
+		const first = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -405,7 +410,7 @@ describe("runQueue timeout diff persistence", () => {
 		});
 
 		diffText = "second attempt evidence";
-		const second = runQueue({
+		const second = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,

@@ -12,10 +12,7 @@ import {
 	getInvocationDescriptorIdentity,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import {
-	runQueue,
-	runQueueWithOrchestrator,
-} from "../src/switchyard/runner/index.mjs";
+import { runQueue } from "../src/switchyard/runner/index.mjs";
 import {
 	FIXTURE_PATH,
 	PROVENANCE_KEYS,
@@ -155,27 +152,6 @@ function defaultSyncDependencies(overrides = {}) {
 		...overrides,
 	};
 }
-function defaultOrchestratorDependencies(overrides = {}) {
-	return {
-		...taskBaseDependencies(),
-		route: defaultRoute,
-		resolveDescriptor: () =>
-			syntheticDescriptor({
-				targetId: "opencode-go",
-				model: "fixture/opencode-low",
-				harness: "opencode",
-			}),
-		adapters: { opencode: { captureDiffAsync: async () => "" } },
-		orchestrator: {
-			launch: async () => "job-default-ledger",
-			status: async () => ({ state: "done" }),
-			result: async () => ({ success: true, diff: "", output: REVIEW_OUTPUT }),
-		},
-		recordDispatchIntent: () => {},
-		queuePreflight: NOOP_QUEUE_PREFLIGHT,
-		...overrides,
-	};
-}
 async function waitFor(check, timeoutMs = 5000) {
 	const deadline = Date.now() + timeoutMs;
 	let value = await check();
@@ -235,26 +211,6 @@ describe("default runner ledger wiring", () => {
 				const last = readLedger().at(-1);
 				return last?.taskId === fixture.taskId ? last : undefined;
 			});
-			assertMatchingLedgerRecords(legacyRecord, storeRecord);
-		} finally {
-			restoreLedgerPaths();
-		}
-	});
-	it("dual-writes matching records from the orchestrator runner", async () => {
-		const fixture = makeDefaultWiringFixture("orchestrator-default-ledger");
-		try {
-			const result = await runQueueWithOrchestrator({
-				tasksFilePath: fixture.tasksFilePath,
-				projectPath: tmpDir,
-				workingContainerName: "test-container",
-				platform: "macos",
-				checkpointPath: fixture.checkpointPath,
-				dependencies: defaultOrchestratorDependencies(),
-			});
-			strictEqual(result.results[0].result, "review_completed");
-
-			const legacyRecord = readLedger().at(-1);
-			const storeRecord = (await readLedgerFromStore(fixture.storeRoot)).at(-1);
 			assertMatchingLedgerRecords(legacyRecord, storeRecord);
 		} finally {
 			restoreLedgerPaths();

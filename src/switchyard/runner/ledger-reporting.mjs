@@ -2,28 +2,8 @@ import {
 	normalizeProviderName,
 	validateInvocationDescriptor,
 } from "../roster/index.mjs";
-import { parseJsonPayload, runCliCommand } from "./checkpoint-errors.mjs";
 import { DISPATCH_DESCRIPTOR_CONTRACT_VERSION } from "./constants.mjs";
 
-function parseArgsJson(rawArgsJson) {
-	if (!rawArgsJson) return [];
-	let parsed;
-	try {
-		parsed = JSON.parse(rawArgsJson);
-	} catch {
-		throw new Error("SWITCHYARD_ORCHESTRATOR_ARGS_JSON must be valid JSON");
-	}
-
-	if (
-		!Array.isArray(parsed) ||
-		!parsed.every((arg) => typeof arg === "string")
-	) {
-		throw new Error(
-			"SWITCHYARD_ORCHESTRATOR_ARGS_JSON must be a JSON string array",
-		);
-	}
-	return parsed;
-}
 function descriptorFromRoute(
 	routeResult,
 	requiredCapability,
@@ -261,63 +241,6 @@ export async function writeDispatchIntentAsync(context, payload) {
 		const metadata = safeLedgerFailure(error, "authoritative_intent");
 		return classifiedIntentFailure(context, payload, metadata);
 	}
-}
-export function createCliOrchestrator(options) {
-	const { command, baseArgs = [], execFn = runCliCommand } = options;
-	if (!command || typeof command !== "string") {
-		throw new Error("createCliOrchestrator requires a command");
-	}
-
-	return {
-		async launch(payload) {
-			const raw = execFn(command, [
-				...baseArgs,
-				"launch",
-				"--json",
-				JSON.stringify(payload),
-			]);
-			const parsed = parseJsonPayload(raw);
-			if (typeof parsed === "string") return parsed;
-			if (parsed?.job_id) return parsed.job_id;
-			if (parsed?.jobId) return parsed.jobId;
-			if (parsed?.id) return parsed.id;
-			if (raw) return raw;
-			throw new Error("orchestrator launch returned no job id");
-		},
-
-		async status(jobId) {
-			const raw = execFn(command, [...baseArgs, "status", String(jobId)]);
-			const parsed = parseJsonPayload(raw);
-			if (!parsed || typeof parsed !== "object") {
-				throw new Error("orchestrator status returned non-JSON payload");
-			}
-			return parsed;
-		},
-
-		async result(jobId) {
-			const raw = execFn(command, [...baseArgs, "result", String(jobId)]);
-			const parsed = parseJsonPayload(raw);
-			if (!parsed || typeof parsed !== "object") {
-				throw new Error("orchestrator result returned non-JSON payload");
-			}
-			return parsed;
-		},
-	};
-}
-export function resolveOrchestrator(dependencies = {}) {
-	if (dependencies.orchestrator) {
-		return dependencies.orchestrator;
-	}
-
-	const command = process.env.SWITCHYARD_ORCHESTRATOR_CMD;
-	if (!command) {
-		throw new Error(
-			"runQueueWithOrchestrator requires dependencies.orchestrator or SWITCHYARD_ORCHESTRATOR_CMD",
-		);
-	}
-
-	const baseArgs = parseArgsJson(process.env.SWITCHYARD_ORCHESTRATOR_ARGS_JSON);
-	return createCliOrchestrator({ command, baseArgs });
 }
 export {
 	DESCRIPTOR_RECEIPT_INVALID_REASON,

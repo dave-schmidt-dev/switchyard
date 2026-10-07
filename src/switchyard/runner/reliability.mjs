@@ -59,7 +59,7 @@ export function runCommand(
 	env,
 	argv,
 	timeoutMs,
-	{ sandbox = true, spawnSync: runSpawnSync = spawnSync } = {},
+	{ sandbox = true, spawnSync: runSpawnSync = spawnSync, command } = {},
 ) {
 	if (process.platform !== "darwin" && runSpawnSync === spawnSync)
 		return unknownCommandResult();
@@ -75,7 +75,10 @@ export function runCommand(
 					argv,
 					timeoutMs,
 					sandbox,
-					profile: sandbox ? quickCheckSandboxProfile(cwd, env.HOME) : null,
+					// `command` is the owner check's argv; setup never passes one.
+					profile: sandbox
+						? quickCheckSandboxProfile(cwd, env.HOME, [], { command })
+						: null,
 				}),
 			],
 			{

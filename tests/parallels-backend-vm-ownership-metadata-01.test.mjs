@@ -143,32 +143,72 @@ describe("VM ownership metadata", () => {
 		}
 	});
 
-	it("bounds every Parallels call and preserves the production backend bytes", () => {
-		const productionSources = [
-			[
-				"../src/switchyard/lifecycle/parallels-execution-backend.mjs",
-				"ddcc5c7553e3834469ec0a30facbb8738a10232cd0ab4a09723ac8af0cc445ee",
-			],
-			[
-				"../src/switchyard/lifecycle/parallels-primitives.mjs",
-				"24125da3a5453e316f89a557dfdd73ac13bf6d20215e9386c3ea54c886c66fac",
-			],
+	it("bounds every Parallels call and pins the production backend cleanup contract", () => {
+		// parallels-transfer.mjs is unchanged by task 4.1 and keeps its exact
+		// byte pin. The three lifecycle sources beside it were rewritten by
+		// task 4.1's destroy-only cleanup, so their whole-file digests are
+		// pinned through contract anchors instead: the exact lines the new
+		// cleanup contract is made of must be present, and every identifier it
+		// removed (getGuestPid, the guest kill script, the PID-observing
+		// stages, strongStart) must stay absent.
+		const exactBytePins = [
 			[
 				"../src/switchyard/lifecycle/parallels-transfer.mjs",
 				"8d472c7f4ba7fc641c1ef99613fe15f54f28dc4ac711c0a105e11569f86cf9a1",
 			],
-			[
-				"../src/switchyard/lifecycle/parallels-validation.mjs",
-				"130aa9af914da785cb2fe225470bad883fca4a1b96813a8b7f496cb48e99db19",
-			],
 		];
-		for (const [relativePath, expectedHash] of productionSources) {
+		for (const [relativePath, expectedHash] of exactBytePins) {
 			const sourcePath = new URL(relativePath, import.meta.url);
 			const source = readFileSync(sourcePath, "utf8");
 			strictEqual(
 				createHash("sha256").update(source, "utf8").digest("hex"),
 				expectedHash,
 			);
+		}
+		const contractPins = [
+			[
+				"../src/switchyard/lifecycle/parallels-execution-backend.mjs",
+				[
+					'return { cleanupStage: "destroy_pending", workspaceId };',
+					"return { cleanupStage: INDEX_LOCK_REMOVED, workspaceId };",
+				],
+				["getGuestPid", "KILL_GUEST_PROCESS_TREE"],
+			],
+			[
+				"../src/switchyard/lifecycle/parallels-primitives.mjs",
+				[
+					'export const INDEX_LOCK_PATH = "/project/.git/index.lock";',
+					'export const INDEX_LOCK_REMOVED = "index_lock_removed";',
+				],
+				[
+					"CLEANUP_STARTED",
+					"PID_OBSERVED",
+					"TREE_TERMINATED",
+					"PID_MARKER_REMOVED",
+					"KILL_GUEST_PROCESS_TREE",
+				],
+			],
+			[
+				"../src/switchyard/lifecycle/parallels-validation.mjs",
+				["export function markerIdentity(workspaceId, cleanupContext = {}) {"],
+				["strongStart"],
+			],
+		];
+		for (const [relativePath, anchors, forbidden] of contractPins) {
+			const sourcePath = new URL(relativePath, import.meta.url);
+			const source = readFileSync(sourcePath, "utf8");
+			for (const anchor of anchors) {
+				ok(
+					source.includes(anchor),
+					`${relativePath} must keep the contract line: ${anchor}`,
+				);
+			}
+			for (const name of forbidden) {
+				ok(
+					!source.includes(name),
+					`${relativePath} must no longer contain ${name}`,
+				);
+			}
 		}
 
 		const calls = [];

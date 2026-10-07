@@ -9,15 +9,18 @@ import {
 	realpathSync,
 	rmSync,
 	statSync,
+	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
 	PERSISTED_SIGNALS,
+	sanitizeFailureDetails,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
 import { boundProviderLifecycleSnapshot } from "../adapter/provider-lifecycle.mjs";
+import { resolveFailure } from "../diagnostics/failure-registry.mjs";
 import { createProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import {
 	integrationGate,
@@ -47,16 +50,27 @@ import {
 	prepareSimpleOverlayBaseline,
 	runSimpleBaselineChecks,
 } from "./baseline.mjs";
+import { dryRunAcceptanceChecks } from "./check-dry-run.mjs";
+import { classifyFailedCheck } from "./check-environment.mjs";
 import { createSimpleCheckSessions } from "./check-session.mjs";
+import {
+	boundedRejectionPaths,
+	captureDeadlineChangedFiles,
+	declaredFileStat,
+	declaredFilesChanged,
+	validateDiffRejectionRule,
+} from "./declared-diff.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import {
 	persistFailureDisposition,
 	publishFailedTerminal,
 } from "./failure-finalization.mjs";
 import { buildGuardedPrompt } from "./guarded-prompt.mjs";
+import { headAdvanceSafe } from "./head-advance.mjs";
 import { createSimpleRouteHealthController } from "./health.mjs";
 import { prepareSimpleProviderStart } from "./launcher-preflight.mjs";
 import { simpleLockDisposition } from "./lock-disposition.mjs";
+import { seedContinuation } from "./partial-continuation.mjs";
 import {
 	classifySimpleErrorKind,
 	createSimpleProviderReliabilityDiagnostic,
@@ -66,95 +80,14 @@ import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { createSimpleRouteSelection } from "./route-selection.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
-function declaredFileStat(worktreePath, path) {
-	try {
-		const stats = lstatSync(join(worktreePath, path));
-		return { size: stats.size, mtimeMs: stats.mtimeMs, ino: stats.ino };
-	} catch {
-		return null;
-	}
-}
-/** First-change probe: lstat only, so no host git runs while the provider is live. */
-function declaredFilesChanged(worktreePath, files, baseline) {
-	return files.some((path) => {
-		const current = declaredFileStat(worktreePath, path);
-		const before = baseline.get(path) ?? null;
-		if ((before === null) !== (current === null)) return true;
-		return (
-			current !== null &&
-			(before.size !== current.size ||
-				before.mtimeMs !== current.mtimeMs ||
-				before.ino !== current.ino)
-		);
-	});
-}
-const DEADLINE_CHANGED_FILES_TIMEOUT_MS = 5000;
 const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
-const DIFF_REJECTION_PATH_LIMIT = 5;
-const DIFF_REJECTION_PATH_MAX_CHARS = 200;
-const DIFF_REJECTION_REASON_RULES = new Set([
-	"empty_diff",
-	"path_escapes_project_root",
-	"git_internals_touched",
-	"credential_path_touched",
-	"symlink_creation_refused",
-	"executable_file_refused",
-	"integration_state_unknown",
-	"corrupt_patch",
-	"conflict",
+// Check-session refusals that already carry their own closed cause code; every
+// other failure while preparing the session classifies as check_setup_failed.
+const OWN_CODED_CHECK_SETUP_REASONS = new Set([
+	"check_dependencies_unverified",
+	"check_venv_outside_project",
 ]);
 
-function boundedRejectionPaths(paths) {
-	const bounded = [];
-	for (const path of paths ?? []) {
-		if (typeof path !== "string") continue;
-		// Provider-chosen names must not inject terminal control sequences.
-		bounded.push(
-			path.replace(/\p{Cc}/gu, "?").slice(0, DIFF_REJECTION_PATH_MAX_CHARS),
-		);
-		if (bounded.length === DIFF_REJECTION_PATH_LIMIT) break;
-	}
-	return bounded;
-}
-
-function validateDiffRejectionRule(validated) {
-	return DIFF_REJECTION_REASON_RULES.has(validated?.reasonKind)
-		? validated.reasonKind
-		: "unsafe_diff";
-}
-
-export function captureDeadlineChangedFiles({
-	worktreePath,
-	worktreeBaseRevision,
-	worktreeGitControl,
-	writerLifecycle,
-}) {
-	if (
-		(writerLifecycle !== "stopped" && writerLifecycle !== "never_started") ||
-		!worktreePath ||
-		!worktreeBaseRevision ||
-		!worktreeGitControl
-	) {
-		return [];
-	}
-	try {
-		const guarded = (args, code) => {
-			verifyGitControl(worktreePath, worktreeGitControl);
-			return requireWorktreeGit(worktreePath, args, code, {
-				timeout: DEADLINE_CHANGED_FILES_TIMEOUT_MS,
-			});
-		};
-		guarded(["add", "-A", "--", "."], "diff_stage_failed");
-		const changed = guarded(
-			["diff", "--cached", "--name-only", "-z", worktreeBaseRevision],
-			"diff_names_failed",
-		);
-		return changed.split("\0").filter(Boolean);
-	} catch (error) {
-		if (error?.code === "git_control_tampered") throw error;
-		return [];
-	}
-}
 export async function runSimpleTask(options, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
 	const taskId = dependencies.taskId ?? randomUUID();
@@ -167,6 +100,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const base = { taskId, attemptId, runId, startedAt, now };
 	const onStatus = dependencies.onStatus;
 	const signal = dependencies.signal;
+	const reportMode = options.reportMode === true;
+	const reportPath = reportMode ? (options.files?.[0] ?? null) : null;
 	let provider = null;
 	let targetId = null;
 	let invocationDescriptor = null;
@@ -181,8 +116,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let failureExitCode = null;
 	let failureSignal = null;
 	let failureTimedOut = null;
+	let failingCheckEnvironmentSignature = null;
+	let failingCheckOutputPath = null;
+	let failingCheckExecutable = null;
+	let failingCheckHostExecutable = null;
 	let repairCount = 0;
 	let repairStatus = options.repairChecks ? "not_started" : "not_requested";
+	let formatStatus = options.format ? "not_run" : "not_requested";
 	let terminalProviderReliability = null;
 	let projectLocked = false;
 	let canonicalParent = null;
@@ -192,6 +132,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let worktreePath = null;
 	let keepWorktree = false;
 	let changedFiles = [];
+	let changedFilesUnavailable = false;
+	let reportOutput = null;
 	let finalResult = null;
 	let currentPhase = "preflight";
 	let baseRevision = null;
@@ -225,6 +167,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 		dependencies.executeProvider ?? defaultExecuteProvider;
 	let runCheck = dependencies.runCheck ?? defaultRunCheck;
 	let checkSessions = null;
+	let checkSetupInFlight = false;
+	let checkSetupReason = null;
 	const routeProvider = dependencies.route ?? route;
 	const healthController = (
 		dependencies.createSimpleRouteHealthController ??
@@ -247,6 +191,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const resolveIdentity =
 		dependencies.resolveTargetIdentity ?? resolveTargetIdentity;
 
+	// Task 3.11: hand each capture taken under verified git control to the
+	// routing waterfall in memory; it is never persisted.
+	const captureVerifiedDiff = (path, base, ...rest) => {
+		const captured = captureWorktreeDiff(path, base, ...rest);
+		dependencies.onVerifiedDiff?.({ ...captured, baseRevision: base });
+		return captured;
+	};
 	const classifyErrorKind = classifySimpleErrorKind;
 	const cleanupMetadata = (input) => ({
 		...sanitizeFailureMetadata(input),
@@ -349,6 +300,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return error;
 		}
 	};
+	const releaseHeldProjectLock = async () => {
+		if (!projectLocked) return;
+		try {
+			const released = await releaseLock(options.projectPath, runId);
+			projectLockState = released === true ? "released" : "unavailable";
+			if (released === true) projectLocked = false;
+		} catch {
+			projectLockState = "unavailable";
+			// The terminal result stays bounded; existing lock recovery owns repair.
+		}
+	};
 	let cleanupAttempted = false;
 	const removeNonSalvageWorktree = async () => {
 		if (cleanupAttempted || !worktreeRoot) return !worktreeRoot;
@@ -415,10 +377,84 @@ export async function runSimpleTask(options, dependencies = {}) {
 		failurePhase,
 		errorKind = null,
 		error = null,
+		diffRejection = null,
 	) => {
 		runTerminalReached = true;
-		const computedErrorKind =
-			errorKind ?? classifyErrorKind(failureReason, failurePhase, error);
+		const dependencyCheck =
+			typeof error?.dependencyCheck === "string" ? error.dependencyCheck : null;
+		// Task 2.7: a candidate diff that changed the dependency manifest is a
+		// check fact, not an environment fault; the record keeps the thrown
+		// refusal reason and classifies under the closed manifest cause.
+		const manifestChangedByDiff =
+			failureReason === "check_dependencies_unverified" &&
+			dependencyCheck === "manifest_changed_by_diff";
+		// A check-setup failure keeps the thrown reason in the record and
+		// classifies under the closed setup cause.
+		const classifiedReason =
+			checkSetupReason ??
+			(manifestChangedByDiff
+				? "check_manifest_changed_by_diff"
+				: failureReason);
+		const computedErrorKind = manifestChangedByDiff
+			? "check_failed"
+			: (errorKind ?? classifyErrorKind(classifiedReason, failurePhase, error));
+		// Task 2.8: a check-setup refusal keeps the closed prepare step the
+		// session tagged and, when the step threw a system error, its bounded
+		// code, syscall name and executable basename. Message text never travels.
+		const setupErrorCode = typeof error?.code === "string" ? error.code : null;
+		const setupSyscall =
+			typeof error?.syscall === "string"
+				? error.syscall.trim().split(/\s+/u)[0] || null
+				: null;
+		const setupExecutable =
+			typeof error?.path === "string" ? basename(error.path) : null;
+		const setupStep =
+			typeof error?.checkSetupStep === "string" ? error.checkSetupStep : null;
+		// The registry row's detail fields decide what this failure persists in
+		// run.json, so a detail registered later reaches the record without
+		// editing this call site or the sanitizer boundary.
+		const resolution = resolveFailure({
+			reason: classifiedReason,
+			phase: failurePhase,
+			errorKind: computedErrorKind,
+			providerResult: providerExecutionResult,
+			// resolveFailure ORs this with the provider result's own timedOut.
+			timedOut: failureTimedOut === true,
+			checkExecutable: failingCheckExecutable,
+			hostExecutable: failingCheckHostExecutable,
+		});
+		const detailValues = {
+			failureReason,
+			timedOut: failureTimedOut ?? providerExecutionResult?.timedOut ?? null,
+			cancelled: providerExecutionResult?.cancelled ?? null,
+			providerSignature: providerExecutionResult?.providerSignature,
+			stderrBytes: providerExecutionResult?.stderrBytes,
+			stdoutBytes: providerExecutionResult?.stdoutBytes,
+			checkIndex: failingCheckIndex ?? error?.checkIndex ?? null,
+			checkIdentity: failingCheckIdentity,
+			checkEnvironmentSignature: failingCheckEnvironmentSignature,
+			outputPath: failingCheckOutputPath,
+			dependencyCheck,
+			manifestName:
+				typeof error?.manifestName === "string" ? error.manifestName : null,
+			checkSetupStep: setupStep,
+			checkSetupErrorCode: setupErrorCode,
+			checkSetupSyscall: setupSyscall,
+			checkSetupExecutable: setupExecutable,
+			checkExecutable: failingCheckExecutable,
+			hostExecutable: failingCheckHostExecutable,
+			changedFilesUnavailable:
+				changedFilesUnavailable === true ? true : undefined,
+			diffRejectionCategory: resolution.diffCategory,
+			diffRejectionCount: changedFiles.length,
+			diffRejectionRule: diffRejection?.rule,
+			diffRejectionPaths: diffRejection?.paths,
+		};
+		const failureDetails = {};
+		for (const field of resolution.detailFields) {
+			const value = detailValues[field];
+			if (value !== undefined && value !== null) failureDetails[field] = value;
+		}
 		if (
 			worktreePath &&
 			!signal?.aborted &&
@@ -435,7 +471,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		milestone("terminal", "failed", { failurePhase });
 		const providerReliability = createSimpleProviderReliabilityDiagnostic({
 			errorKind: computedErrorKind,
-			failureReason,
+			failureReason: classifiedReason,
 			failurePhase,
 			providerResult:
 				failurePhase === "baseline" || failurePhase === "checks"
@@ -465,8 +501,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 			providerVerdictCode,
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
+		if (reportMode) finalResult.resultKind = "report";
 		finalResult.providerReliability = providerReliability;
 		finalResult.providerStarted = providerStarted;
+		finalResult.formatStatus = formatStatus;
+		if (diffRejection) finalResult.diffRejection = diffRejection;
 		finalResult.accountability = deriveFailureAccountability({
 			providerReliability,
 			provenance: {
@@ -514,7 +553,16 @@ export async function runSimpleTask(options, dependencies = {}) {
 							...(PERSISTED_SIGNALS.has(providerExecutionResult?.signal)
 								? { signal: providerExecutionResult.signal }
 								: {}),
+							// Task 2.8: the dry run's two resolved paths join the
+							// failure message only when both are a bounded pair.
+							...(failingCheckExecutable && failingCheckHostExecutable
+								? {
+										checkExecutable: failingCheckExecutable,
+										hostExecutable: failingCheckHostExecutable,
+									}
+								: {}),
 						}),
+						failureDetails: sanitizeFailureDetails(failureDetails),
 					},
 				).then((durable) => {
 					failureTerminalDurable = durable;
@@ -645,15 +693,19 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		if (signal?.aborted) return failForSignal("preflight");
 
-		if (
-			manifestReviewPaths(options.files).some(
-				(path) => !(options.allowManifests ?? []).includes(path),
-			)
-		) {
+		const unreviewedManifests = manifestReviewPaths(options.files).filter(
+			(path) => !(options.allowManifests ?? []).includes(path),
+		);
+		if (unreviewedManifests.length > 0) {
 			return fail(
 				"manifest_review_required",
 				"input_validation",
 				"validation_failed",
+				null,
+				{
+					rule: "manifest_review_required",
+					paths: boundedRejectionPaths(unreviewedManifests),
+				},
 			);
 		}
 		if (remainingMs(options.deadlineMs, now) <= 0) {
@@ -661,7 +713,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		emitStatus(onStatus, taskId, "lock");
 		try {
-			await acquireLock(options.projectPath, runId);
+			await acquireLock(options.projectPath, runId, {
+				onEvent: ({ event, reclaimedRunId }) =>
+					milestone("preflight", event, { reclaimedRunId }),
+			});
 			projectLocked = true;
 			projectLockState = "held";
 		} catch (error) {
@@ -742,6 +797,37 @@ export async function runSimpleTask(options, dependencies = {}) {
 			options.projectPath,
 			options.dirtyOverlay ? baselinePaths : options.files,
 		);
+		// Declared files plus any eligible undeclared edits kept for captain
+		// review. Check sessions read this array at prepare time.
+		const scopeFiles = [...options.files];
+		let undeclaredKept = [];
+		let undeclaredPatch = "";
+		// `keptOnly` refuses any undeclared path not already kept from the
+		// provider's own diff: a failing check must not widen the scope.
+		const undeclaredGate = (diff, keptOnly = false) => {
+			const scope = evaluateUndeclaredScope({
+				changedFiles,
+				files: options.files,
+				diff,
+				projectPath: options.projectPath,
+				readOnlyInputs: options.readOnlyInputs ?? [],
+				baseRevision,
+				enabled: !reportMode,
+			});
+			if (
+				scope.ok &&
+				keptOnly &&
+				scope.eligible.some((path) => !undeclaredKept.includes(path))
+			)
+				return { ...scope, ok: false, rule: "undeclared_paths_changed" };
+			if (scope.ok) {
+				scopeFiles.splice(0, scopeFiles.length, ...options.files);
+				scopeFiles.push(...scope.eligible);
+				undeclaredKept = scope.eligible;
+				undeclaredPatch = scope.patch;
+			}
+			return scope;
+		};
 
 		currentPhase = "route";
 		emitStatus(onStatus, taskId, "route");
@@ -972,9 +1058,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 					{ timeout: deadlineTimeout(options.deadlineMs, now) },
 				).trim(),
 				dirtyOverlayReceipt,
-				files: options.files,
+				files: scopeFiles,
 				allowManifests: options.allowManifests,
-				commands: [...options.checks, ...(options.baselineChecks ?? [])],
+				commands: [
+					...options.checks,
+					...(options.baselineChecks ?? []),
+					...(options.format ? [options.format] : []),
+				],
 				taskId,
 				deadlineMs: options.deadlineMs,
 				cachePath: dependencies.checkCachePath,
@@ -984,8 +1074,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 				onProgress: () =>
 					heartbeat("baseline", { processPhase: "check_preparing" }),
 			});
-			currentPhase = "baseline";
+			// No baseline check has run yet, so a setup failure stays in "prepare".
+			checkSetupInFlight = true;
 			baselineCheckPath = await checkSessions.prepare(null, 0);
+			checkSetupInFlight = false;
+			currentPhase = "baseline";
 			runCheck = checkSessions.run;
 		}
 
@@ -1013,6 +1106,27 @@ export async function runSimpleTask(options, dependencies = {}) {
 			},
 		});
 		baselineStatus = baselineResult.status;
+		// Task 2.4: with a clean (or absent) baseline, run the acceptance checks
+		// once on the base tree so an environment that cannot run them fails here,
+		// before a provider starts. The session is removed on every path after it.
+		const dryRun =
+			checkSessions &&
+			options.checks.length > 0 &&
+			["passed", "not_requested"].includes(baselineStatus)
+				? await dryRunAcceptanceChecks({
+						checks: options.checks,
+						runCheck,
+						resolveCheckExecutables: checkSessions.resolveCheckExecutables,
+						deadlineMs: options.deadlineMs,
+						now,
+						signal,
+						capMs: dependencies.dryRunCheckCapMs,
+						onProgress: ({ event, ...details }) =>
+							event.endsWith("_progress")
+								? heartbeat("baseline", { processPhase: "dry_run_check" })
+								: milestone("baseline", event, details),
+					})
+				: null;
 		checkSessions?.remove();
 		if (baselineResult.checks.length > 0) {
 			const lifecycles = baselineResult.checks.map(
@@ -1049,12 +1163,59 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		failingCheckIndex = null;
 		failingCheckIdentity = null;
+		if (dryRun) {
+			writerLifecycle = aggregateWriterLifecycle(
+				writerLifecycle,
+				dryRun.writerLifecycle,
+			);
+			// Phase "checks": the baseline phase would classify a cancel as
+			// baseline_check_failed, though the baseline passed.
+			if (dryRun.status === "cancelled") return failForSignal("checks");
+			if (dryRun.status === "environment_failed") {
+				failingCheckIndex = dryRun.checkIndex;
+				failingCheckIdentity = dryRun.checkIdentity;
+				failingCheckEnvironmentSignature = dryRun.signature;
+				failingCheckOutputPath = dryRun.outputPath;
+				failingCheckExecutable =
+					typeof dryRun.checkExecutable === "string"
+						? dryRun.checkExecutable
+						: null;
+				failingCheckHostExecutable =
+					typeof dryRun.hostExecutable === "string"
+						? dryRun.hostExecutable
+						: null;
+				failureExitCode = dryRun.exitCode;
+				failureSignal = dryRun.signal;
+				return fail(
+					"check_environment_failed",
+					"baseline",
+					"environment_failure",
+				);
+			}
+		}
 
+		// Task 3.11: seed a planned continuation after the base was judged and
+		// before the provider starts; the index changed, so re-snapshot.
+		const continuation = dependencies.continuation
+			? seedContinuation({
+					plan: dependencies.continuation,
+					worktreePath,
+					baseRevision,
+					worktreeBaseRevision,
+					gitControl: worktreeGitControl,
+					timeout: deadlineTimeout(options.deadlineMs, now),
+				})
+			: null;
+		if (continuation?.carried)
+			worktreeGitControl = snapshotGitControl(worktreePath);
+		if (continuation) dependencies.onContinuation?.(continuation);
 		const guardedPrompt = buildGuardedPrompt({
 			promptText: readFileSync(options.promptPath, "utf8"),
 			files: options.files,
 			readOnlyInputs: options.readOnlyInputs ?? [],
 			checks: options.checks ?? [],
+			carriedFiles: continuation?.carried ? continuation.files : [],
+			reportMode,
 		});
 		currentPhase = "preflight";
 		const admissionFor = (repair = false) =>
@@ -1195,6 +1356,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				prompt: guardedPrompt,
 				worktreePath,
 				timeoutMs: executionBudget,
+				deadlineMs: options.deadlineMs,
 				signal,
 				onStderrChunk: requestRecorder?.accept,
 				onProgress: () => {
@@ -1279,7 +1441,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		const providerAttemptSettled =
 			!providerHealthTracked || providerHealthTerminal.settled === true;
-		if (requestLogStatus?.error) return fail(requestLogStatus.error, "execute");
+		// A failed provider is classified by its own result below; the ledger
+		// error only fails an attempt the provider reported as successful.
+		if (providerResult?.success && requestLogStatus?.error)
+			return fail(requestLogStatus.error, "execute");
 
 		if (signal?.aborted) return failForSignal("execute");
 		if (
@@ -1291,68 +1456,70 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		if (!providerResult?.success) {
 			if (remainingMs(options.deadlineMs, now) > 0) {
-				const captured = captureWorktreeDiff(
+				const captured = captureVerifiedDiff(
 					worktreePath,
 					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
 					worktreeGitControl,
+					reportPath,
 				);
 				changedFiles = captured.changedFiles;
 				executionFailureCaptureComplete = true;
 				keepWorktree = changedFiles.length > 0;
 			} else {
 				keepWorktree = true;
-				changedFiles = captureDeadlineChangedFiles({
+				const deadlineCapture = captureDeadlineChangedFiles({
 					worktreePath,
 					worktreeBaseRevision,
 					worktreeGitControl,
 					writerLifecycle,
 				});
+				changedFiles = deadlineCapture.files;
+				changedFilesUnavailable = deadlineCapture.available !== true;
 			}
 			return fail(classifyExecutionFailure(providerResult), "execute");
 		}
 		if (remainingMs(options.deadlineMs, now) <= 0) {
 			keepWorktree = true;
-			changedFiles = captureDeadlineChangedFiles({
+			const deadlineCapture = captureDeadlineChangedFiles({
 				worktreePath,
 				worktreeBaseRevision,
 				worktreeGitControl,
 				writerLifecycle,
 			});
+			changedFiles = deadlineCapture.files;
+			changedFilesUnavailable = deadlineCapture.available !== true;
 			return fail("deadline_expired", "checks");
 		}
 		currentPhase = "diff";
 		milestone("diff", "capture_started");
-		const captured = captureWorktreeDiff(
+		const captured = captureVerifiedDiff(
 			worktreePath,
 			worktreeBaseRevision,
 			options.deadlineMs,
 			now,
 			worktreeGitControl,
+			reportPath,
 		);
 		changedFiles = captured.changedFiles;
 		if (changedFiles.length > 0 && !firstChangeObserved) {
 			firstChangeObserved = true;
 			milestone("diff", "first_change_observed");
 		}
-		if (changedFiles.length === 0) return fail("empty_diff", "diff");
-		const undeclared = changedFiles.filter(
-			(path) => !options.files.includes(path),
-		);
-		if (undeclared.length > 0) {
+		if (reportMode) {
+			if (!changedFiles.includes(reportPath))
+				return fail("report_missing", "diff");
+		} else if (changedFiles.length === 0) {
+			return fail("empty_diff", "diff");
+		}
+		const undeclaredScope = undeclaredGate(captured.diff);
+		if (!undeclaredScope.ok) {
 			keepWorktree = true;
-			const rejectionRule = (options.readOnlyInputs ?? []).some((path) =>
-				undeclared.includes(path),
-			)
-				? "read_only_input_changed"
-				: "undeclared_paths_changed";
-			const result = fail(rejectionRule, "diff");
-			result.diffRejection = {
-				rule: rejectionRule,
-				paths: boundedRejectionPaths(undeclared),
-			};
-			return result;
+			return fail(undeclaredScope.rule, "diff", null, null, {
+				rule: undeclaredScope.rule,
+				paths: boundedRejectionPaths(undeclaredScope.undeclared),
+			});
 		}
 		const validated = validateDiff(captured.diff, options.projectPath);
 		if (
@@ -1363,17 +1530,32 @@ export async function runSimpleTask(options, dependencies = {}) {
 				))
 		) {
 			keepWorktree = true;
-			const result = fail(
+			return fail(
 				validated.requiresReview ? "manifest_review_required" : "unsafe_diff",
 				"diff",
+				null,
+				null,
+				validated.requiresReview
+					? {
+							rule: "manifest_review_required",
+							paths: boundedRejectionPaths(validated.sensitivePaths),
+						}
+					: { rule: validateDiffRejectionRule(validated), paths: [] },
 			);
-			result.diffRejection = validated.requiresReview
-				? {
-						rule: "manifest_review_required",
-						paths: boundedRejectionPaths(validated.sensitivePaths),
-					}
-				: { rule: validateDiffRejectionRule(validated), paths: [] };
-			return result;
+		}
+		if (reportMode) {
+			let reportBytes;
+			try {
+				reportBytes = readFileSync(join(worktreePath, reportPath));
+			} catch {
+				return fail("report_missing", "diff");
+			}
+			if (reportBytes.length === 0) return fail("report_missing", "diff");
+			reportOutput = {
+				path: reportPath,
+				bytes: reportBytes.length,
+				sha256: createHash("sha256").update(reportBytes).digest("hex"),
+			};
 		}
 
 		let capturedDiff = captured;
@@ -1384,6 +1566,99 @@ export async function runSimpleTask(options, dependencies = {}) {
 				if (options.checks.length > 0) {
 					currentPhase = "checks";
 					await checkSessions.prepare(capturedDiff.diff, pass + 1);
+					if (options.format) {
+						const formatResult = await checkSessions.format({
+							command: options.format,
+							timeoutMs: remainingMs(options.deadlineMs, now),
+							onProgress: () =>
+								heartbeat("checks", { processPhase: "format_running" }),
+						});
+						writerLifecycle = aggregateWriterLifecycle(
+							writerLifecycle,
+							formatResult?.writerLifecycle,
+						);
+						// A nonzero format exit is advisory: the acceptance checks,
+						// not the formatter's status, decide the candidate.
+						formatStatus = formatResult?.success === true ? "passed" : "failed";
+						if (signal?.aborted) return failForSignal("checks");
+						if (!dependencies.runCheck && writerLifecycle === "unavailable") {
+							keepWorktree = true;
+							return fail(
+								"check_group_unconfirmed",
+								"checks",
+								"cleanup_failed",
+							);
+						}
+						// Replace the provider worktree's changes with the checker
+						// clone's formatted base-relative diff, then re-apply the
+						// same scope and safety gates the candidate already faced.
+						verifyGitControl(worktreePath, worktreeGitControl);
+						requireWorktreeGit(
+							worktreePath,
+							["checkout", "-f", "HEAD"],
+							"integration_failed",
+							{ timeout: deadlineTimeout(options.deadlineMs, now) },
+						);
+						if (formatResult.diff.trim() !== "")
+							requireWorktreeGit(
+								worktreePath,
+								["apply", "--binary", "--whitespace=nowarn", "-"],
+								"integration_failed",
+								{
+									input: formatResult.diff,
+									timeout: deadlineTimeout(options.deadlineMs, now),
+								},
+							);
+						capturedDiff = captureWorktreeDiff(
+							worktreePath,
+							worktreeBaseRevision,
+							options.deadlineMs,
+							now,
+							worktreeGitControl,
+						);
+						changedFiles = capturedDiff.changedFiles;
+						if (changedFiles.length === 0) return fail("empty_diff", "diff");
+						const formattedScope = undeclaredGate(capturedDiff.diff, true);
+						if (!formattedScope.ok) {
+							keepWorktree = true;
+							return fail(formattedScope.rule, "diff", null, null, {
+								rule: formattedScope.rule,
+								paths: boundedRejectionPaths(formattedScope.undeclared),
+							});
+						}
+						const formattedValidation = validateDiff(
+							capturedDiff.diff,
+							options.projectPath,
+						);
+						if (
+							!formattedValidation.safe ||
+							(formattedValidation.requiresReview &&
+								!(formattedValidation.sensitivePaths ?? []).every((path) =>
+									(options.allowManifests ?? []).includes(path),
+								))
+						) {
+							keepWorktree = true;
+							return fail(
+								formattedValidation.requiresReview
+									? "manifest_review_required"
+									: "unsafe_diff",
+								"diff",
+								null,
+								null,
+								formattedValidation.requiresReview
+									? {
+											rule: "manifest_review_required",
+											paths: boundedRejectionPaths(
+												formattedValidation.sensitivePaths,
+											),
+										}
+									: {
+											rule: validateDiffRejectionRule(formattedValidation),
+											paths: [],
+										},
+							);
+						}
+					}
 				}
 			}
 			let rerunAllChecks = false;
@@ -1475,6 +1750,23 @@ export async function runSimpleTask(options, dependencies = {}) {
 						"environment_failure",
 					);
 				}
+				// Task 2.4: a check that cannot run here is the environment's fault, not
+				// a regression, so it never reaches repair or the next provider.
+				const environmentSignature = classifyFailedCheck(check, {
+					preProvider: false,
+				});
+				if (environmentSignature) {
+					keepWorktree = true;
+					repairStatus = options.repairChecks ? "ineligible" : "not_requested";
+					failingCheckEnvironmentSignature = environmentSignature;
+					failingCheckOutputPath =
+						typeof check.outputPath === "string" ? check.outputPath : null;
+					return fail(
+						"check_environment_failed",
+						"checks",
+						"environment_failure",
+					);
+				}
 				const checkFailureReason = check?.silenceTimedOut
 					? "check_silence_timeout"
 					: check?.timedOut
@@ -1504,28 +1796,23 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 				// A failing check can itself change the checkout. Re-capture and validate
 				// the exact base and declared scope before any correction is allowed.
-				capturedDiff = captureWorktreeDiff(
+				capturedDiff = captureVerifiedDiff(
 					worktreePath,
 					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
 					worktreeGitControl,
+					reportPath,
 				);
 				changedFiles = capturedDiff.changedFiles;
-				const repairUndeclared = changedFiles.filter(
-					(path) => !options.files.includes(path),
-				);
-				if (repairUndeclared.length > 0) {
+				const repairScope = undeclaredGate(capturedDiff.diff, true);
+				if (!repairScope.ok) {
 					keepWorktree = true;
 					repairStatus = "ineligible";
-					return fail(
-						(options.readOnlyInputs ?? []).some((path) =>
-							repairUndeclared.includes(path),
-						)
-							? "read_only_input_changed"
-							: "undeclared_paths_changed",
-						"diff",
-					);
+					return fail(repairScope.rule, "diff", null, null, {
+						rule: repairScope.rule,
+						paths: boundedRejectionPaths(repairScope.undeclared),
+					});
 				}
 				const repairDiffValidation = validateDiff(
 					capturedDiff.diff,
@@ -1540,11 +1827,25 @@ export async function runSimpleTask(options, dependencies = {}) {
 				) {
 					keepWorktree = true;
 					repairStatus = "ineligible";
+					const repairRejection = repairDiffValidation.requiresReview
+						? {
+								rule: "manifest_review_required",
+								paths: boundedRejectionPaths(
+									repairDiffValidation.sensitivePaths,
+								),
+							}
+						: {
+								rule: validateDiffRejectionRule(repairDiffValidation),
+								paths: [],
+							};
 					return fail(
 						repairDiffValidation.requiresReview
 							? "manifest_review_required"
 							: "unsafe_diff",
 						"diff",
+						null,
+						null,
+						repairRejection,
 					);
 				}
 
@@ -1636,6 +1937,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						prompt: repairPrompt,
 						worktreePath,
 						timeoutMs: correctionBudget,
+						deadlineMs: options.deadlineMs,
 						onStderrChunk: repairAdmission.recorder?.accept,
 						signal,
 						onProgress: () =>
@@ -1680,7 +1982,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						reason: "provider-health-unavailable",
 					};
 				}
-				if (correctionLogStatus?.error)
+				if (correction?.success && correctionLogStatus?.error)
 					return fail(correctionLogStatus.error, "repair");
 				if (signal?.aborted) return failForSignal("repair");
 				if (
@@ -1710,28 +2012,20 @@ export async function runSimpleTask(options, dependencies = {}) {
 					return fail(classifyExecutionFailure(correction), "execute");
 				}
 
-				capturedDiff = captureWorktreeDiff(
+				capturedDiff = captureVerifiedDiff(
 					worktreePath,
 					worktreeBaseRevision,
 					options.deadlineMs,
 					now,
 					worktreeGitControl,
+					reportPath,
 				);
 				changedFiles = capturedDiff.changedFiles;
-				const correctedUndeclared = changedFiles.filter(
-					(path) => !options.files.includes(path),
-				);
-				if (correctedUndeclared.length > 0) {
+				const correctedScope = undeclaredGate(capturedDiff.diff);
+				if (!correctedScope.ok) {
 					keepWorktree = true;
 					repairStatus = "ineligible";
-					return fail(
-						(options.readOnlyInputs ?? []).some((path) =>
-							correctedUndeclared.includes(path),
-						)
-							? "read_only_input_changed"
-							: "undeclared_paths_changed",
-						"diff",
-					);
+					return fail(correctedScope.rule, "diff");
 				}
 				const correctedValidation = validateDiff(
 					capturedDiff.diff,
@@ -1787,16 +2081,46 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail("deadline_expired", "integrate");
 		}
 		currentPhase = "integrate";
-		if (
-			requireGit(
+		const currentHead = requireGit(
+			options.projectPath,
+			["rev-parse", "HEAD"],
+			"project_revision_unavailable",
+			{ timeout: deadlineTimeout(options.deadlineMs, now) },
+		).trim();
+		let headAdvanced = false;
+		if (currentHead !== baseRevision) {
+			const protectedPaths = [...scopeFiles, ...(options.readOnlyInputs ?? [])];
+			if (
+				!headAdvanceSafe({
+					projectPath: options.projectPath,
+					base: baseRevision,
+					head: currentHead,
+					paths: protectedPaths,
+				})
+			) {
+				keepWorktree = true;
+				return fail("host_concurrency", "integrate");
+			}
+			// Peer history may only be unrelated. A manifest, lockfile or other
+			// execution input changing under the run can change what the
+			// acceptance checks mean, so any peer change there refuses.
+			const peerDiff = requireGit(
 				options.projectPath,
-				["rev-parse", "HEAD"],
+				["diff", "--binary", "--full-index", baseRevision, currentHead],
 				"project_revision_unavailable",
-				{ timeout: deadlineTimeout(options.deadlineMs, now) },
-			).trim() !== baseRevision
-		) {
-			keepWorktree = true;
-			return fail("project_head_changed_concurrently", "integrate");
+				{
+					maxBuffer: MAX_CAPTURE_BYTES,
+					timeout: deadlineTimeout(options.deadlineMs, now),
+				},
+			);
+			if (peerDiff.trim()) {
+				const peerValidation = validateDiff(peerDiff, options.projectPath);
+				if (!peerValidation.safe || peerValidation.requiresReview) {
+					keepWorktree = true;
+					return fail("host_concurrency", "integrate");
+				}
+			}
+			headAdvanced = true;
 		}
 		if (dirtyOverlayReceipt) {
 			const checked = validateDirtyOverlayReceipt(
@@ -1805,6 +2129,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				baselinePaths,
 				{
 					allowUnrelated: true,
+					allowHeadAdvance: true,
 					maxFileBytes: MAX_CAPTURE_BYTES,
 					enforceTarPathLimit: false,
 					secretPaths: SECRET_PATHS,
@@ -1827,6 +2152,115 @@ export async function runSimpleTask(options, dependencies = {}) {
 			keepWorktree = true;
 			return fail("declared_path_changed_concurrently", "integrate");
 		}
+		if (
+			undeclaredKept.length > 0 &&
+			!declaredPathsAreClean(options.projectPath, undeclaredKept)
+		) {
+			keepWorktree = true;
+			return fail("declared_path_changed_concurrently", "integrate");
+		}
+		// The provider's checks ran against the original base. When unrelated
+		// peer commits moved HEAD, verify the same patch still passes the same
+		// acceptance checks at the advanced HEAD before any host mutation.
+		if (headAdvanced && options.checks.length > 0) {
+			const headAdvanceSession = checkSessions
+				? createSimpleCheckSessions({
+						taskRoot: worktreeRoot,
+						projectPath: options.projectPath,
+						baseRevision: currentHead,
+						// An overlay rebased onto moved history has no
+						// precomputable base tree; the checkout plus the trusted
+						// receipt are the baseline.
+						baseTree: dirtyOverlayReceipt
+							? null
+							: requireGit(
+									options.projectPath,
+									["rev-parse", `${currentHead}^{tree}`],
+									"project_revision_unavailable",
+									{ timeout: deadlineTimeout(options.deadlineMs, now) },
+								).trim(),
+						dirtyOverlayReceipt,
+						files: scopeFiles,
+						allowManifests: options.allowManifests,
+						commands: options.checks,
+						taskId,
+						deadlineMs: options.deadlineMs,
+						cachePath: dependencies.checkCachePath,
+						evidenceDir: join(getRunRoot(runId), "check-evidence"),
+						now,
+						signal,
+						onProgress: () =>
+							heartbeat("integrate", {
+								processPhase: "head_advance_recheck_preparing",
+							}),
+					})
+				: null;
+			try {
+				if (headAdvanceSession)
+					await headAdvanceSession.prepare(capturedDiff.diff, 3);
+				for (let index = 0; index < options.checks.length; index += 1) {
+					if (signal?.aborted) return failForSignal("integrate");
+					const remaining = remainingMs(options.deadlineMs, now);
+					if (remaining <= 0) {
+						keepWorktree = true;
+						return fail("deadline_expired", "integrate");
+					}
+					const onProgress = () =>
+						heartbeat("integrate", {
+							processPhase: "head_advance_recheck_running",
+							checkIndex: index + 1,
+						});
+					const recheck = headAdvanceSession
+						? await headAdvanceSession.run({
+								command: options.checks[index],
+								onProgress,
+							})
+						: await runCheck({
+								command: options.checks[index],
+								worktreePath,
+								timeoutMs: remaining,
+								signal,
+								onProgress,
+							});
+					if (!recheck?.success) {
+						keepWorktree = true;
+						return fail("host_concurrency", "integrate");
+					}
+				}
+			} catch (error) {
+				if (signal?.aborted) return failForSignal("integrate");
+				if (error?.code === "deadline_expired") {
+					keepWorktree = true;
+					return fail("deadline_expired", "integrate");
+				}
+				keepWorktree = true;
+				return fail("host_concurrency", "integrate");
+			} finally {
+				try {
+					headAdvanceSession?.remove();
+				} catch {}
+			}
+		}
+		let undeclaredPatchPath = null;
+		if (undeclaredKept.length > 0) {
+			undeclaredPatchPath = join(getRunRoot(runId), "undeclared.patch");
+			try {
+				mkdirSync(getRunRoot(runId), { recursive: true, mode: 0o700 });
+				writeFileSync(undeclaredPatchPath, undeclaredPatch, { mode: 0o600 });
+			} catch (error) {
+				keepWorktree = true;
+				return fail(
+					"run_store_write_failed",
+					"integrate",
+					classifyErrorKind("run_store_write_failed", "integrate", error),
+					error,
+				);
+			}
+		}
+		const undeclaredSummary =
+			undeclaredKept.length > 0
+				? { undeclaredPaths: [...undeclaredKept], undeclaredPatchPath }
+				: {};
 		emitStatus(onStatus, taskId, "integrate");
 		milestone("integrate", "integration_started");
 		const integration = dependencies.integrate
@@ -1834,15 +2268,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 					diff: capturedDiff.diff,
 					projectPath: options.projectPath,
 					changedFiles,
-					allowedPaths: options.files,
+					allowedPaths: scopeFiles,
 					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
 				})
 			: integrationGate(capturedDiff.diff, options.projectPath, {
-					allowedPaths: options.files,
+					allowedPaths: scopeFiles,
 					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
 				});
 		if (!integration?.success) {
 			keepWorktree = true;
+			if (headAdvanced && integration?.message === "Diff apply failed")
+				return fail("host_concurrency", "integrate");
 			return fail(
 				integration?.message === "ambiguous_combined_rename_spelling"
 					? "ambiguous_combined_rename_spelling"
@@ -1901,6 +2337,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
 							: {}),
@@ -2029,6 +2466,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
 							: {}),
@@ -2077,6 +2515,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 			baseRevision,
 			partialWorktree: keepWorktree ? (worktreePath ?? candidatePath) : null,
 		});
+		if (reportMode) finalResult.resultKind = "report";
+		if (reportMode && reportOutput) finalResult.report = reportOutput;
+		finalResult.formatStatus = formatStatus;
 		if (invocationDescriptor) {
 			finalResult.invocationDescriptor = structuredClone(invocationDescriptor);
 			finalResult.descriptorIdentity = invocationDescriptor.descriptor_identity;
@@ -2084,6 +2525,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		if (terminalProviderReliability)
 			finalResult.providerReliability = terminalProviderReliability;
+		if (undeclaredKept.length > 0) {
+			Object.assign(finalResult, undeclaredSummary);
+			try {
+				(dependencies.onRoutingWarning ?? console.error)(
+					undeclaredWarning(undeclaredKept, undeclaredPatchPath),
+				);
+			} catch {}
+		}
 		milestone("terminal", "succeeded");
 		return finalResult;
 	} catch (error) {
@@ -2100,6 +2549,16 @@ export async function runSimpleTask(options, dependencies = {}) {
 			) &&
 				["baseline", "checks"].includes(currentPhase));
 		if (signal?.aborted && !trustedFault) return failForSignal(currentPhase);
+		if (checkSetupInFlight) {
+			if (!OWN_CODED_CHECK_SETUP_REASONS.has(failureReason))
+				checkSetupReason = "check_setup_failed";
+			return fail(
+				failureReason,
+				"prepare",
+				classifyErrorKind(checkSetupReason ?? failureReason, "prepare", error),
+				error,
+			);
+		}
 		return fail(
 			failureReason,
 			currentPhase,
@@ -2110,6 +2569,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (pendingDurability.size > 0) {
 			await Promise.allSettled([...pendingDurability]);
 		}
+		// Task 3.9: once the terminal result is durable and the writer is final,
+		// integration can no longer run, so release before slow cleanup.
+		if (
+			failureTerminalDurable &&
+			(writerLifecycle === "stopped" || writerLifecycle === "never_started")
+		)
+			await releaseHeldProjectLock();
 		try {
 			if (failureTerminalDurable) checkSessions?.remove();
 		} catch {
@@ -2130,20 +2596,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				finalResult.partialWorktree = worktreePath;
 			}
 		}
-		if (projectLocked) {
-			try {
-				const released = await releaseLock(options.projectPath, runId);
-				if (released === true) {
-					projectLockState = "released";
-					projectLocked = false;
-				} else {
-					projectLockState = "unavailable";
-				}
-			} catch {
-				projectLockState = "unavailable";
-				// The terminal result stays bounded; existing lock recovery owns repair.
-			}
-		}
+		await releaseHeldProjectLock();
 		if (finalResult) {
 			finalResult.elapsedMs = Math.max(0, now() - startedAt);
 			const worktreeState = finalResult.partialWorktree
@@ -2244,8 +2697,13 @@ import {
 	resolvePredecessorReceipt,
 	terminalResult,
 } from "./recovery.mjs";
+import {
+	evaluateUndeclaredScope,
+	undeclaredWarning,
+} from "./undeclared-scope.mjs";
 
 export { parseSimpleArgs, SIMPLE_USAGE } from "./args.mjs";
+export { captureDeadlineChangedFiles } from "./declared-diff.mjs";
 export { simpleRouteFundingFailure, simpleRouteIsFunded } from "./funding.mjs";
 export {
 	buildSimpleProviderInvocation,

@@ -171,7 +171,7 @@ export function runQuickChecks({
 			);
 			const outcome =
 				boundedTimeoutMs >= 100
-					? runCommand(clone, env, argv, boundedTimeoutMs)
+					? runCommand(clone, env, argv, boundedTimeoutMs, { command: argv })
 					: deadlineExpiredOutcome();
 			receipt.checks.push({
 				index,

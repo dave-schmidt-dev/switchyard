@@ -1,4 +1,5 @@
 import { PERSISTED_SIGNALS } from "../adapter/exec-error-kinds.mjs";
+import { CODE_CATEGORIES, causeCategoryFor } from "./failure-registry.mjs";
 
 const PROVIDER_RELIABILITY_VERSION = 1;
 
@@ -42,37 +43,6 @@ const REPAIR_STATES = new Set([
 	"ineligible",
 	"unknown",
 ]);
-const CODE_CATEGORY = new Map([
-	["auth_expired", "provider"],
-	["quota_exhausted", "provider"],
-	["model_unavailable", "provider"],
-	["cli_usage_error", "provider"],
-	["execution_timed_out", "provider"],
-	["provider_deadline_exceeded", "provider"],
-	["provider_signalled", "provider"],
-	["provider_exit_nonzero", "unknown"],
-	["provider_launch_failed", "unknown"],
-	["launch_failed", "unknown"],
-	["provider_verdict_rejected", "unknown"],
-	["check_repair_succeeded", "check"],
-	["check_repair_failed", "check"],
-	["baseline_check_failed", "environment"],
-	["baseline_mutation", "environment"],
-	["environment_failure", "environment"],
-	["check_dependencies_unverified", "environment"],
-	["run_store_write_failed", "environment"],
-	["project_lock_failed", "environment"],
-	["acceptance_check_failed", "check"],
-	["acceptance_check_timeout", "check"],
-	["diff_rejected", "policy"],
-	["scope_rejected", "policy"],
-	["input_rejected", "input"],
-	["provider_cleanup_failed", "cleanup"],
-	["cleanup_failed", "cleanup"],
-	["cancelled", "cancellation"],
-	["unknown", "unknown"],
-]);
-
 function nullableSafeInteger(
 	value,
 	minimum = 0,
@@ -85,10 +55,10 @@ function nullableSafeInteger(
 
 export function createProviderReliabilityDiagnostic(input = {}) {
 	const requestedCode =
-		typeof input.causeCode === "string" && CODE_CATEGORY.has(input.causeCode)
+		typeof input.causeCode === "string" && CODE_CATEGORIES.has(input.causeCode)
 			? input.causeCode
 			: "unknown";
-	const category = CODE_CATEGORY.get(requestedCode) ?? "unknown";
+	const category = causeCategoryFor(requestedCode);
 	const phase = PHASES.has(input.phase) ? input.phase : "unknown";
 	const baselineStatus = BASELINE_STATES.has(input.baselineStatus)
 		? input.baselineStatus

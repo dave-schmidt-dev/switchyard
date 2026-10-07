@@ -10,6 +10,8 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
+import { readRun } from "../src/switchyard/run-store/index.mjs";
+import { snapshotGitControl } from "../src/switchyard/simple/args.mjs";
 import {
 	captureDeadlineChangedFiles,
 	runSimpleTask,
@@ -347,7 +349,20 @@ describe("deadline retained worktree changed files", () => {
 		deepStrictEqual(result.changedFiles, []);
 	});
 
-	it("leaves changedFiles empty when writer lifecycle is not stopped", () => {
+	it("reports changed files as available when the writer is stopped", () => {
+		const repo = makeRepo();
+		const control = snapshotGitControl(repo.projectPath);
+		writeFileSync(join(repo.projectPath, "src", "a.txt"), "captured\n", "utf8");
+		const changed = captureDeadlineChangedFiles({
+			worktreePath: repo.projectPath,
+			worktreeBaseRevision: "HEAD",
+			worktreeGitControl: control,
+			writerLifecycle: "stopped",
+		});
+		deepStrictEqual(changed, { files: ["src/a.txt"], available: true });
+	});
+
+	it("marks the capture unavailable when writer lifecycle is not stopped", () => {
 		const repo = makeRepo();
 		const changed = captureDeadlineChangedFiles({
 			worktreePath: repo.projectPath,
@@ -355,10 +370,10 @@ describe("deadline retained worktree changed files", () => {
 			worktreeGitControl: {},
 			writerLifecycle: "unavailable",
 		});
-		deepStrictEqual(changed, []);
+		deepStrictEqual(changed, { files: [], available: false });
 	});
 
-	it("leaves changedFiles empty when capture fails", () => {
+	it("marks the capture unavailable when capture fails", () => {
 		const repo = makeRepo();
 		const changed = captureDeadlineChangedFiles({
 			worktreePath: repo.projectPath,
@@ -366,6 +381,34 @@ describe("deadline retained worktree changed files", () => {
 			worktreeGitControl: null,
 			writerLifecycle: "stopped",
 		});
-		deepStrictEqual(changed, []);
+		deepStrictEqual(changed, { files: [], available: false });
+	});
+
+	it("persists changedFilesUnavailable when the deadline capture is skipped", async () => {
+		const repo = makeRepo();
+		let currentTime = 1_000;
+		const runId = "simple-deadline-changed-files-unavailable";
+		const result = await runSimpleTask(
+			options(repo, { deadlineMs: 10_000 }),
+			dependencies({
+				now: () => currentTime,
+				runId,
+				executeProvider: async () => {
+					currentTime = 12_000;
+					return {
+						success: true,
+						code: 0,
+						writerLifecycle: "unavailable",
+					};
+				},
+				runCheck: async () => ({ success: true }),
+			}),
+		);
+		retain(result, repo.projectPath);
+		strictEqual(result.status, "failed");
+		strictEqual(result.failureReason, "deadline_expired");
+		deepStrictEqual(result.changedFiles, []);
+		const record = await readRun(runId);
+		strictEqual(record.failureDetails?.changedFilesUnavailable, true);
 	});
 });

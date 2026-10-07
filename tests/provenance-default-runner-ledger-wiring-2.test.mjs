@@ -11,10 +11,7 @@ import {
 	getInvocationDescriptorIdentity,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import {
-	runQueue,
-	runQueueWithOrchestrator,
-} from "../src/switchyard/runner/index.mjs";
+import { runQueue } from "../src/switchyard/runner/index.mjs";
 import {
 	FIXTURE_PATH,
 	previousHomeDir,
@@ -153,27 +150,6 @@ function defaultSyncDependencies(overrides = {}) {
 		...overrides,
 	};
 }
-function defaultOrchestratorDependencies(overrides = {}) {
-	return {
-		...taskBaseDependencies(),
-		route: defaultRoute,
-		resolveDescriptor: () =>
-			syntheticDescriptor({
-				targetId: "opencode-go",
-				model: "fixture/opencode-low",
-				harness: "opencode",
-			}),
-		adapters: { opencode: { captureDiffAsync: async () => "" } },
-		orchestrator: {
-			launch: async () => "job-default-ledger",
-			status: async () => ({ state: "done" }),
-			result: async () => ({ success: true, diff: "", output: REVIEW_OUTPUT }),
-		},
-		recordDispatchIntent: () => {},
-		queuePreflight: NOOP_QUEUE_PREFLIGHT,
-		...overrides,
-	};
-}
 describe("default runner ledger wiring", () => {
 	it("reports a failed outcome projection as a structured status event, not a console warning", async () => {
 		const fixture = makeDefaultWiringFixture("sync-outcome-failure");
@@ -270,50 +246,6 @@ describe("default runner ledger wiring", () => {
 			restoreLedgerPaths();
 		}
 	});
-	it("reports a failed outcome projection on the orchestrator path too", async () => {
-		const fixture = makeDefaultWiringFixture("orchestrator-outcome-failure");
-		const statuses = [];
-		const projectionFailures = [];
-
-		try {
-			const result = await runQueueWithOrchestrator({
-				tasksFilePath: fixture.tasksFilePath,
-				projectPath: tmpDir,
-				workingContainerName: "test-container",
-				platform: "macos",
-				checkpointPath: fixture.checkpointPath,
-				dependencies: defaultOrchestratorDependencies({
-					recordDispatchToStore: async () => {
-						throw Object.assign(new Error("read-only"), { code: "EROFS" });
-					},
-					onStatus: (event) => statuses.push(event),
-					onLedgerProjectionFailure: (metadata) =>
-						projectionFailures.push(metadata),
-				}),
-			});
-			strictEqual(result.results[0].result, "review_completed");
-
-			const reported = statuses.find(
-				(event) => event.event === "outcome_projection_failed",
-			);
-			ok(
-				reported,
-				`expected an outcome_projection_failed status, got ${JSON.stringify(
-					statuses.map((event) => event.event),
-				)}`,
-			);
-			strictEqual(reported.ledgerFailureCode, "EROFS");
-			deepStrictEqual(projectionFailures, [
-				{
-					ledgerFailure: true,
-					ledgerFailurePhase: "outcome_projection",
-					ledgerFailureCode: "EROFS",
-				},
-			]);
-		} finally {
-			restoreLedgerPaths();
-		}
-	});
 	it("lets an injected recorder replace both default writers", async () => {
 		const fixture = makeDefaultWiringFixture("override-sync-ledger");
 		const overrides = [];
@@ -330,29 +262,7 @@ describe("default runner ledger wiring", () => {
 				},
 			});
 
-			const orchestratorTaskId = "override-orchestrator-ledger";
-			const orchestratorTasksFilePath = join(
-				tmpDir,
-				`${orchestratorTaskId}.md`,
-			);
-			writeFileSync(
-				orchestratorTasksFilePath,
-				"### Task 1.1: Override ledger wiring\n- **Status:** pending\n- **Type:** review\n- **Executor:** switchyard\n- **RequiredCapability:** low\n- **RequiredCapabilityJustification:** The review is a bounded mechanical check.\n- **Description:** use the injected recorder\n",
-				"utf8",
-			);
-			await runQueueWithOrchestrator({
-				tasksFilePath: orchestratorTasksFilePath,
-				projectPath: tmpDir,
-				workingContainerName: "test-container",
-				platform: "macos",
-				checkpointPath: join(tmpDir, `${orchestratorTaskId}.checkpoint.json`),
-				dependencies: {
-					...defaultOrchestratorDependencies(),
-					recordDispatch: (record) => overrides.push(record),
-				},
-			});
-
-			strictEqual(overrides.length, 2);
+			strictEqual(overrides.length, 1);
 			strictEqual(readLedger().length, 0);
 			deepStrictEqual(await readLedgerFromStore(fixture.storeRoot), []);
 		} finally {

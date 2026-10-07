@@ -1,5 +1,8 @@
 import { isAbsolute, resolve } from "node:path";
-import { isPersistentFailureMetadata } from "../adapter/exec-error.mjs";
+import {
+	isPersistentFailureDetails,
+	isPersistentFailureMetadata,
+} from "../adapter/exec-error.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { SUPPORTED_OUTCOME_READER_VERSION } from "../outcome/schema.mjs";
 import { validateShadowEnvelope } from "../outcome/shadow.mjs";
@@ -562,6 +565,15 @@ function validateRun(data) {
 		!isPersistentFailureMetadata(data.lastFailure)
 	) {
 		throw new SchemaError("lastFailure contains invalid persistent metadata");
+	}
+	if (
+		data.failureDetails !== undefined &&
+		data.failureDetails !== null &&
+		!isPersistentFailureDetails(data.failureDetails)
+	) {
+		throw new SchemaError(
+			"failureDetails contains invalid persistent metadata",
+		);
 	}
 	if (
 		data.cleanupFailure !== undefined &&

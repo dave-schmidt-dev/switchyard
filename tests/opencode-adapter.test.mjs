@@ -337,6 +337,90 @@ describe("opencode adapter container execution", () => {
 		deepStrictEqual(cleanupOptions, {
 			onStatus: undefined,
 			...cleanupContext,
+			reason: "cancel",
+		});
+	});
+
+	it("resolves confirmed cleanup and reads no marker on bridge-descriptor timeout", async () => {
+		const workspaceId = "66666666-6666-4666-8666-666666666666";
+		const descriptor = validateInvocationDescriptor(
+			{
+				target_id: "opencode-go",
+				model_ref: "opencode-go/mimo-v2.5",
+				selector: "opencode-go/mimo-v2.5",
+				effort: null,
+				variant: null,
+				invocation_args: [],
+			},
+			"opencode",
+		);
+		const cleanupContext = {
+			taskId: "R6",
+			attemptId: "opencode-attempt-3",
+			descriptorIdentity: descriptor.descriptor_identity,
+			workspaceId,
+			operation: "provider",
+		};
+		let cleanupOptions = null;
+		let markerReads = 0;
+		const executionBackend = {
+			ephemeralOpenCodeKeyExecution() {
+				return {
+					command: "fixed-bridge",
+					args: ["opencode-go", "--"],
+					input: "non-secret test input",
+					cleanupContext: { workspaceId },
+				};
+			},
+			cleanupProviderProcess(_command, _args, options) {
+				cleanupOptions = options;
+				return { cleanupStage: "destroy_pending", workspaceId };
+			},
+			readProviderTerminalEvidence() {
+				markerReads += 1;
+				return { status: "confirmed", exitCode: 0 };
+			},
+			getGuestPid() {
+				markerReads += 1;
+				return 1234;
+			},
+		};
+		let spawnCount = 0;
+		const result = await executeOpencodeAsync("change one file", workspaceId, {
+			model: descriptor.selector,
+			resolvedTargetId: descriptor.target_id,
+			descriptorHarness: "opencode",
+			invocationDescriptor: descriptor,
+			descriptorIdentity: descriptor.descriptor_identity,
+			executionBackend,
+			cleanupContext,
+			timeoutMs: 1,
+			termGraceMs: 1,
+			spawnFn: () => {
+				spawnCount += 1;
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.stdin = { end() {} };
+				child.kill = (signal) => {
+					queueMicrotask(() => child.emit("close", null, signal));
+					return true;
+				};
+				return child;
+			},
+		});
+
+		strictEqual(spawnCount, 1);
+		strictEqual(result.timedOut, true);
+		strictEqual(result.cleanupFailed, false);
+		strictEqual(result.cleanupStatus, "succeeded");
+		strictEqual(result.diagnosticCode, "execution_timed_out");
+		strictEqual(result.failurePhase, "provider_execution");
+		strictEqual(markerReads, 0);
+		deepStrictEqual(cleanupOptions, {
+			onStatus: undefined,
+			...cleanupContext,
+			reason: "timeout",
 		});
 	});
 

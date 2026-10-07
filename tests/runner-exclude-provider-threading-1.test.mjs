@@ -19,14 +19,14 @@ import {
 	getRunRoot,
 	initializeRun,
 } from "../src/switchyard/run-store/index.mjs";
-import { executeTask as executeTaskImpl } from "../src/switchyard/runner/index.mjs";
+import { executeTaskAsync as executeTaskAsyncImpl } from "../src/switchyard/runner/index.mjs";
 import {
-	executeTask,
+	descriptorForRoute,
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -35,6 +35,7 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"fixtures",
 	"roster.fixture.json",
 );
+const VALID_DIAGNOSTIC_REF = `diagnostic:${"a".repeat(32)}`;
 function writeDispatchQualifiedRosterFixture() {
 	const roster = JSON.parse(readFileSync(ROSTER_FIXTURE_PATH, "utf8"));
 	const testedAt = new Date().toISOString();
@@ -89,7 +90,7 @@ afterEach(() => {
 	}
 });
 describe("--exclude-provider threading (context.exclude -> route)", () => {
-	it("runQueue forwards options.exclude onto context.exclude, reaching route() via executeTask", () => {
+	it("runQueue forwards options.exclude onto context.exclude, reaching route() via executeTask", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -100,7 +101,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const routeCalls = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -123,6 +124,8 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					codex: {
 						execute: () => ({ success: true, output: "ok" }),
 						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "",
 					},
 				},
 			},
@@ -132,7 +135,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		strictEqual(routeCalls.length, 1);
 		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
 	});
-	it("runQueue defaults context.exclude to [] when options.exclude is omitted", () => {
+	it("runQueue defaults context.exclude to [] when options.exclude is omitted", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -143,7 +146,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const routeCalls = [];
 
-		runQueue({
+		await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -165,6 +168,8 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 					claude: {
 						execute: () => ({ success: true, output: "ok" }),
 						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "",
 					},
 				},
 			},
@@ -172,28 +177,40 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 
 		deepStrictEqual(routeCalls[0].exclude, []);
 	});
-	it("executeTask passes context.exclude through to route(), alongside availableProviders", () => {
+	it("executeTask passes context.exclude through to route(), alongside availableProviders", async () => {
 		const routeCalls = [];
+		let routed = null;
 
-		executeTask(
+		await executeTaskAsyncImpl(
 			{ id: "1.1", title: "task", description: "op" },
 			{
 				route: (opts) => {
 					routeCalls.push(opts);
-					return {
+					routed = {
 						provider: "codex",
 						model: "gpt-5.6-terra",
 						percentLeft: 50,
 						reason: "spread",
 					};
+					return routed;
 				},
+				resolveDescriptor: () => descriptorForRoute(routed),
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					codex: {
 						execute: () => ({ success: true, output: "ok" }),
 						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "",
 					},
+				},
+				queueBackend: {
+					captureTaskBase: () => TASK_BASE,
+					captureTaskBaseAsync: async () => TASK_BASE,
+					validateTaskBase: (_workspaceId, base) => base,
+					releaseTaskBase: () => {},
 				},
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",
@@ -205,33 +222,45 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
 	});
-	it("executeTask carries the shared health gate into its synchronous route seam", () => {
+	it("executeTask carries the shared health gate into its synchronous route seam", async () => {
 		const routeCalls = [];
+		let routed = null;
 		const healthDecision = () => ({
 			available: false,
 			state: "health-unavailable",
 			suppress: false,
 		});
-		executeTask(
+		await executeTaskAsyncImpl(
 			{ id: "1.1", title: "task", description: "op" },
 			{
 				route: (opts) => {
 					routeCalls.push(opts);
-					return {
+					routed = {
 						provider: "codex",
 						model: "gpt-5.6-terra",
 						percentLeft: 50,
 						reason: "spread",
 					};
+					return routed;
 				},
+				resolveDescriptor: () => descriptorForRoute(routed),
 				healthDecision,
 				recordDispatch: () => {},
+				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					codex: {
 						execute: () => ({ success: true, output: "ok" }),
 						captureDiff: () => null,
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "",
 					},
+				},
+				queueBackend: {
+					captureTaskBase: () => TASK_BASE,
+					captureTaskBaseAsync: async () => TASK_BASE,
+					validateTaskBase: (_workspaceId, base) => base,
+					releaseTaskBase: () => {},
 				},
 				projectPath: TEST_DIR,
 				workingContainerName: "fake-container",
@@ -256,7 +285,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			// Production path on purpose: the test wrapper's synthetic descriptor
 			// differs from the roster-derived health identity, and the binding must
 			// only attach when the real descriptor receipt matches that identity.
-			const result = executeTaskImpl(
+			const result = await executeTaskAsyncImpl(
 				{ id: "1.1", title: "task", description: "op" },
 				{
 					route: () => ({
@@ -283,9 +312,28 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 								failurePhase: "provider_execution",
 							}),
 							captureDiff: () => "",
+							executeAsync: async () => ({
+								success: false,
+								errorKind: "auth_expired",
+								diagnosticCode: "auth_expired",
+								diagnosticOrigin: "adapter",
+								diagnosticEvidenceAvailable: true,
+								failurePhase: "provider_execution",
+								diagnosticEvidence: {
+									stdout: "",
+									stderr: "auth expired",
+								},
+							}),
+							captureDiffAsync: async () => "",
 						},
 					},
-					queueBackend: { captureTaskBase: () => TASK_BASE },
+					persistDiagnosticArtifact: async () => VALID_DIAGNOSTIC_REF,
+					queueBackend: {
+						captureTaskBase: () => TASK_BASE,
+						captureTaskBaseAsync: async () => TASK_BASE,
+						validateTaskBase: (_workspaceId, base) => base,
+						releaseTaskBase: () => {},
+					},
 					projectPath: TEST_DIR,
 					workingContainerName: "health-workspace",
 					runId: "health-run",

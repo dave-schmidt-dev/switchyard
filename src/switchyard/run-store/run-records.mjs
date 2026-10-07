@@ -9,6 +9,10 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import {
+	projectRunFailureForDisk,
+	upgradeRunFailureFromDisk,
+} from "../adapter/exec-error-sanitize.mjs";
 import { SUPPORTED_OUTCOME_READER_VERSION } from "../outcome/schema.mjs";
 import {
 	CURRENT_SCHEMA_VERSION,
@@ -36,11 +40,16 @@ async function writeRunAtomically(
 ) {
 	// Publish only synced bytes, then sync the directory entry before callers
 	// may act on the record (in particular, before allocating a simple root).
+	// Every run.json write goes through here, so this is where the in-memory
+	// record takes its frozen-reader-compatible on-disk form. Project-lock
+	// files share this writer; they carry no lastFailure and pass unchanged.
+	const persisted = projectRunFailureForDisk(data);
+	if (persisted !== data) validateRun(persisted);
 	const tmpPath = `${runJsonPath}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		const file = await io.open(tmpPath, "wx", 0o600);
 		try {
-			await file.writeFile(JSON.stringify(data));
+			await file.writeFile(JSON.stringify(persisted));
 			await file.sync();
 		} finally {
 			await file.close();
@@ -349,6 +358,9 @@ export async function readRun(runId) {
 		throw new SchemaError("run.json is not a valid object");
 	}
 
+	// In memory only: legacy detail keys leave lastFailure and a frozen
+	// stand-in cause code regains its precise value. The file is never rewritten.
+	upgradeRunFailureFromDisk(data);
 	validateRun(data);
 	return data;
 }

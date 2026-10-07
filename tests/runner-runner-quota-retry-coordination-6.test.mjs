@@ -1,4 +1,4 @@
-import { deepStrictEqual, rejects, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -10,11 +10,10 @@ import {
 import {
 	descriptorForRoute,
 	runnerTestDir,
-	runQueue,
 	runQueueAsync,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeLegacyCheckpoint(path, checkpoint) {
@@ -184,10 +183,7 @@ describe("runner quota retry coordination", () => {
 		};
 	}
 	it("does not resume descriptor-only legacy retry state in sync or async queues", async () => {
-		for (const [name, entrypoint] of [
-			["sync", runQueue],
-			["async", runQueueAsync],
-		]) {
+		for (const [name, entrypoint] of [["async", runQueueAsync]]) {
 			const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reject ${name} legacy retry
@@ -239,13 +235,12 @@ describe("runner quota retry coordination", () => {
 					checkpointPath,
 					dependencies: fixture.dependencies,
 				});
-			if (name === "sync") throws(invoke, /explicit reconciliation/);
-			else await rejects(invoke, /explicit reconciliation/);
+			await rejects(invoke, /explicit reconciliation/);
 			strictEqual(fixture.executeCalls.length, 0, name);
 			strictEqual(resetCalls, 0, name);
 		}
 	});
-	it("rejects a forged Claude descriptor for antigravity before reset, reroute, or execution", () => {
+	it("rejects a forged Claude descriptor for antigravity before reset, reroute, or execution", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reject forged retry evidence
@@ -308,14 +303,13 @@ describe("runner quota retry coordination", () => {
 		process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
 		__resetRosterCacheForTests();
 		try {
-			throws(
-				() =>
-					runQueue({
-						tasksFilePath: tasksPath,
-						projectPath: TEST_DIR,
-						checkpointPath,
-						dependencies: fixture.dependencies,
-					}),
+			await rejects(
+				runQueueAsync({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
 				/descriptor harness does not match target/,
 			);
 		} finally {
@@ -332,7 +326,7 @@ describe("runner quota retry coordination", () => {
 		strictEqual(fixture.executeCalls.length, 0);
 	});
 	for (const corruptField of ["retryAttempts", "retryTransitions"]) {
-		it(`rejects forged descriptor evidence in ${corruptField} before routing`, () => {
+		it(`rejects forged descriptor evidence in ${corruptField} before routing`, async () => {
 			const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reject corrupt retry evidence
@@ -407,14 +401,13 @@ describe("runner quota retry coordination", () => {
 			process.env.SWITCHYARD_ROSTER_PATH = ROSTER_FIXTURE_PATH;
 			__resetRosterCacheForTests();
 			try {
-				throws(
-					() =>
-						runQueue({
-							tasksFilePath: tasksPath,
-							projectPath: TEST_DIR,
-							checkpointPath,
-							dependencies: fixture.dependencies,
-						}),
+				await rejects(
+					runQueueAsync({
+						tasksFilePath: tasksPath,
+						projectPath: TEST_DIR,
+						checkpointPath,
+						dependencies: fixture.dependencies,
+					}),
 					/descriptor harness does not match target/,
 				);
 			} finally {

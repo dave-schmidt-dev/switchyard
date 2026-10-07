@@ -1,5 +1,5 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -13,11 +13,30 @@ import { appendFailureRecord } from "./failure-log.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
+	claimCovers,
+	continuationFields,
+	planContinuation,
+	sourceSuperseded,
+} from "./partial-continuation.mjs";
+import { recordRouteExhaustion } from "./route-exhaustion.mjs";
+import {
+	knownBrokenCheck,
+	rememberBrokenCheck,
+} from "./routing-check-memory.mjs";
+import {
 	canonicalRoutingProject,
 	MAX_ATTEMPT_HISTORY,
 	openRoutingRun,
 	recordAttemptOutcome,
+	releasePartialAttempt,
 } from "./routing-state.mjs";
+import {
+	failureAttemptRecord,
+	lifecycleFailure,
+	stopRecord,
+	unroutedAttempt,
+	unroutedAttemptRecord,
+} from "./routing-stop-record.mjs";
 import {
 	cleanupSimpleWorktree,
 	simpleQuarantinePath,
@@ -33,65 +52,6 @@ const errorCode = (error, fallback) =>
 	typeof error?.code === "string" && /^routing_[a-z_]+$/u.test(error.code)
 		? error.code
 		: fallback;
-function lifecycle(result, pending, record, project, options) {
-	const hash = (value) =>
-		`sha256:${createHash("sha256").update(value).digest("hex")}`;
-	const scope = {
-		files: options.files,
-		checks: (options.checks ?? []).map((command, index) => ({
-			index: index + 1,
-			digest: hash(command),
-		})),
-	};
-	scope.digest = hash(JSON.stringify(scope));
-	const cleanup = result?.recovery?.cleanup;
-	const identity = result?.recovery?.identity;
-	if (
-		result?.recovery?.schemaVersion !== 1 ||
-		JSON.stringify(identity?.scope) !== JSON.stringify(scope) ||
-		result.recovery?.result?.status !== result.status ||
-		result.recovery?.result?.failureReason !== result.failureReason ||
-		result.recovery?.result?.failurePhase !== result.failurePhase ||
-		result.runId !== pending.runId ||
-		result.taskId !== pending.taskId ||
-		result.attemptId !== pending.attemptId ||
-		result.targetId !== pending.targetId ||
-		!identity ||
-		identity.taskId !== pending.taskId ||
-		identity.attemptId !== pending.attemptId ||
-		!["succeeded", "failed"].includes(result.status) ||
-		!["stopped", "never_started"].includes(cleanup?.writer?.state) ||
-		!["released", "not_acquired"].includes(cleanup?.projectLock?.state) ||
-		!["removed", "not_created", "retained"].includes(cleanup?.worktree?.state)
-	)
-		return false;
-	if (
-		!record ||
-		record.runId !== pending.runId ||
-		record.projectPath !== project ||
-		JSON.stringify(record.orderedTaskIds) !==
-			JSON.stringify([pending.taskId]) ||
-		record.resolvedTargetId !== pending.targetId ||
-		record.state !== result.status ||
-		(result.status === "failed" &&
-			record.lastFailure?.errorKind !== result.errorKind)
-	)
-		return false;
-	if (cleanup.worktree.state === "not_created")
-		return (
-			record.worktree == null &&
-			cleanup.writer.state === "never_started" &&
-			!result.partialWorktree
-		);
-	return (
-		record.worktree?.state === cleanup.worktree.state &&
-		record.worktree.writerStopped === true &&
-		(cleanup.worktree.state === "retained"
-			? typeof result.partialWorktree === "string" &&
-				result.partialWorktree === cleanup.worktree.path
-			: record.cleanupState === "complete" && !result.partialWorktree)
-	);
-}
 /** Selected allocations are durable before route() returns control to the engine. */
 export async function runSimpleRoutingTask(options, deps = {}) {
 	const now = deps.now ?? Date.now;
@@ -147,25 +107,25 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	};
 	// Guard answers re-report state an earlier invocation already logged, so
 	// they pass { log: false }. Stop identity comes only from this
-	// invocation's own attempts, never from an earlier task's attempt.
-	const answer = (direction, extra = {}, { log = true } = {}) => {
+	// invocation's own attempts, never from an earlier task's attempt; an
+	// unrouted failure names itself through { attempt }.
+	const answer = (direction, extra = {}, { log = true, attempt } = {}) => {
 		if (direction !== "complete" && log) {
-			const own = (attempt) => attempt?.taskId === logicalTaskId;
-			const last = own(handle.state.pendingAttempt)
-				? handle.state.pendingAttempt
-				: (handle.state.attempts.findLast(own) ?? null);
-			appendFailureLog({
-				recordType: "stop",
-				project: projectPath,
-				routingRunId,
-				taskId: last?.taskId,
-				attemptId: last?.attemptId,
-				runId: last?.runId,
-				targetId: last?.targetId,
-				capability: last?.capability,
-				stopReason: extra.stopReason ?? direction,
-				exhaustionCause: extra.exhaustionCause,
-			});
+			const own = (item) => item?.taskId === logicalTaskId;
+			const last =
+				attempt ??
+				(own(handle.state.pendingAttempt)
+					? handle.state.pendingAttempt
+					: (handle.state.attempts.findLast(own) ?? null));
+			appendFailureLog(
+				stopRecord({
+					project: projectPath,
+					routingRunId,
+					attempt: last,
+					direction,
+					extra,
+				}),
+			);
 		}
 		return {
 			direction,
@@ -174,6 +134,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			attempts: handle.state.attempts,
 			failedTargetIds: handle.state.failedTargetIds,
 			retainedPartials: retainedPartials(),
+			...(releasedPartials.length > 0 ? { releasedPartials } : {}),
 			...extra,
 		};
 	};
@@ -188,6 +149,10 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const funded = deps.assertFundedRoute ?? assertFundedRoute;
 	const localExcluded = new Set();
 	const logicalTaskId = deps.taskId ?? randomUUID();
+	// Task 3.11: the newest retained partial this invocation may carry, and
+	// the sources released once their continuation superseded them.
+	let carrySource = null;
+	const releasedPartials = [];
 	let softAttempts = 0;
 	let anyFailed = false;
 	let iteration = 0;
@@ -220,6 +185,15 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			return answer(
 				"stop",
 				{ stopReason: "pinned_target_failed" },
+				{ log: false },
+			);
+		// A check this run already found environment-broken fails every target
+		// the same way: answer with the stored evidence, allocate nothing.
+		const brokenCheck = knownBrokenCheck(handle.state, options.checks);
+		if (brokenCheck)
+			return answer(
+				"stop",
+				{ stopReason: "check_known_broken", brokenCheck },
 				{ log: false },
 			);
 		for (;;) {
@@ -311,11 +285,28 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					return routed;
 				}
 			};
+			const plan = carrySource
+				? planContinuation({ source: carrySource, options, projectPath })
+				: null;
+			let seeded = null;
+			let verifiedDiff = null;
 			let result;
 			try {
 				result = await engine(
 					{ ...options, projectPath },
-					{ ...deps, ...allocation, now, route: routeAttempt },
+					{
+						...deps,
+						...allocation,
+						now,
+						route: routeAttempt,
+						continuation: plan && !plan.skipped ? plan : undefined,
+						onContinuation: (outcome) => {
+							seeded = outcome;
+						},
+						onVerifiedDiff: (captured) => {
+							verifiedDiff = captured;
+						},
+					},
 				);
 			} catch {
 				return answer("stop", {
@@ -331,6 +322,18 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					result,
 				});
 			if (!pending) {
+				// A failed engine call with no target has no attempt of its own yet;
+				// log it so its run and cause are never lost to the stop record.
+				const attempt = unroutedAttempt(result, allocation, options.capability);
+				if (attempt)
+					appendFailureLog(
+						unroutedAttemptRecord({
+							project: projectPath,
+							routingRunId,
+							attempt,
+							result,
+						}),
+					);
 				if (result?.lockConflict && result?.disposition) {
 					const action = result.disposition.action;
 					return answer(
@@ -341,6 +344,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 							result,
 							disposition: result.disposition,
 						},
+						{ attempt },
 					);
 				}
 				if (
@@ -349,17 +353,25 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					result?.failurePhase === "route" &&
 					!deps.signal?.aborted
 				)
-					return answer(pinned ? "stop" : "native_required", {
-						status: pinned ? "failed" : "deferred",
-						stopReason: pinned ? "pinned_target_unavailable" : undefined,
-						exhaustionCause: !pinned
-							? anyFailed
-								? "task_failures"
-								: "capacity"
-							: undefined,
-						result,
-					});
-				return answer("stop", { stopReason: "preflight_failed", result });
+					return answer(
+						pinned ? "stop" : "native_required",
+						{
+							status: pinned ? "failed" : "deferred",
+							stopReason: pinned ? "pinned_target_unavailable" : undefined,
+							exhaustionCause: !pinned
+								? anyFailed
+									? "task_failures"
+									: "capacity"
+								: undefined,
+							result,
+						},
+						{ attempt },
+					);
+				return answer(
+					"stop",
+					{ stopReason: "preflight_failed", result },
+					{ attempt },
+				);
 			}
 			let record;
 			try {
@@ -367,13 +379,22 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			} catch {
 				return answer("stop", {
 					stopReason: "lifecycle_unconfirmed",
+					lifecycleCheck: "run_record_unreadable",
 					result,
 					pendingAttempt: pending,
 				});
 			}
-			if (!lifecycle(result, pending, record, projectPath, options))
+			const lifecycleCheck = lifecycleFailure(
+				result,
+				pending,
+				record,
+				projectPath,
+				options,
+			);
+			if (lifecycleCheck)
 				return answer("stop", {
 					stopReason: "lifecycle_unconfirmed",
+					lifecycleCheck,
 					result,
 					pendingAttempt: pending,
 				});
@@ -403,11 +424,20 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				: "succeeded";
 
 			// lifecycle() already proved the writer stopped or never started.
+			// Task 2.7: a post-provider dependency refusal stops on its own cause.
+			const refusalCode =
+				result.providerReliability?.causeCode ?? result.failureReason;
+			const postProviderDependencyRefusal =
+				failed &&
+				result.failurePhase === "checks" &&
+				(refusalCode === "check_dependencies_unverified" ||
+					refusalCode === "check_manifest_changed_by_diff");
 			const classification = failed
 				? classifyAttemptFailure({ result, accountability })
 				: null;
 			const reason = failed ? classification.reason : "succeeded";
 
+			const continued = continuationFields(plan, seeded);
 			try {
 				recordAttemptOutcome(handle.state, handle.commit, {
 					...pending,
@@ -415,6 +445,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					reason,
 					closedAt: new Date(now()).toISOString(),
 					partialWorktree: result.partialWorktree ?? null,
+					...continued,
 				});
 			} catch (error) {
 				return answer("stop", {
@@ -423,30 +454,67 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					pendingAttempt: pending,
 				});
 			}
+			// The source partial is released only now that its continuation is
+			// terminal, and only when the continuation holds the carried work.
+			// It is discarded from disk through the run claim; a failed discard keeps
+			// it recorded and only warns, the outcome stands.
+			if (sourceSuperseded(continued, result)) {
+				try {
+					await discardAndReleasePartial(
+						handle,
+						handle.state.attempts.find(
+							(item) => item.attemptId === plan.sourceAttemptId,
+						),
+						{ projectPath, discard: true, deps },
+					);
+					releasedPartials.push({
+						attemptId: plan.sourceAttemptId,
+						partialWorktree: carrySource.partialWorktree,
+					});
+				} catch (error) {
+					(deps.onRoutingWarning ?? console.error)(
+						`dispatch: continuation source partial kept (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "release_failed"})`,
+					);
+				}
+			}
+			if (typeof result.partialWorktree === "string")
+				carrySource = {
+					attemptId: pending.attemptId,
+					partialWorktree: result.partialWorktree,
+					result,
+					record,
+					captured: verifiedDiff,
+				};
 
 			if (failed) {
-				appendFailureLog({
-					recordType: "attempt",
-					project: projectPath,
-					routingRunId,
-					taskId: pending.taskId,
-					attemptId: pending.attemptId,
-					runId: pending.runId,
-					targetId: pending.targetId,
-					capability: pending.capability,
-					severity: classification.severity,
-					reason: classification.reason,
-					salvageable: classification.salvageable,
-					partialRetained: typeof result.partialWorktree === "string",
-					causeCategory:
-						result.providerReliability?.causeCategory ??
-						accountability.causeCategory,
-					causeCode:
-						result.providerReliability?.causeCode ?? accountability.causeCode,
-					phase: result.providerReliability?.phase,
-					failurePhase: result.failurePhase,
-					errorKind: result.errorKind,
-				});
+				appendFailureLog(
+					failureAttemptRecord({
+						project: projectPath,
+						routingRunId,
+						attempt: pending,
+						result,
+						accountability,
+						classification,
+					}),
+				);
+			}
+
+			// A live quota error exhausts the target's route eligibility for
+			// an hour; the durable marker outlives this run's Gradus snapshot.
+			if (
+				failed &&
+				result.providerReliability?.causeCode === "quota_exhausted"
+			) {
+				try {
+					recordRouteExhaustion(pending.targetId, {
+						stateRoot: deps.stateRoot,
+						now,
+					});
+				} catch (error) {
+					(deps.onRoutingWarning ?? console.error)(
+						`dispatch: route exhaustion record unavailable (${error?.code ?? "unknown"})`,
+					);
+				}
 			}
 
 			if (!failed) return answer("complete", { result });
@@ -457,7 +525,34 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 
 			if (classification.severity === "hard") {
 				return answer("stop", {
-					stopReason: "unsafe_failure",
+					stopReason: postProviderDependencyRefusal
+						? refusalCode
+						: "unsafe_failure",
+					result,
+					classification,
+				});
+			}
+			// A check that cannot run here is the environment's fault, not the
+			// target's: remember it (only the pre-provider dry run writes
+			// memory) and stop without blaming anyone.
+			if (
+				result.providerReliability?.causeCode === "check_environment_failed"
+			) {
+				try {
+					rememberBrokenCheck(handle.state, handle.commit, {
+						result,
+						record,
+						now,
+					});
+				} catch (error) {
+					return answer("stop", {
+						stopReason: errorCode(error, "routing_state_write_failed"),
+						result,
+						classification,
+					});
+				}
+				return answer("stop", {
+					stopReason: "check_environment_failed",
 					result,
 					classification,
 				});
@@ -512,16 +607,50 @@ function statPartial(path) {
 		rejectRelease("partial_worktree_unavailable");
 	}
 }
-// routing-state's commit contract accepts only monotonic attempt history, so
-// adopt the current attempts array by reference and clear the released field
-// in place before persisting it.
-function clearPartialWorktree(handle, attemptId) {
-	const attempts = [...handle.state.attempts];
-	handle.commit({ attempts });
-	const attempt = attempts.find((item) => item.attemptId === attemptId);
-	if (!attempt) rejectRelease("routing_state_write_failed");
-	attempt.partialWorktree = null;
-	handle.commit({});
+/**
+ * Discard one recorded partial through its exact run claim, then clear it with
+ * the release_partial transition. The claim names the attempt root; the
+ * recorded partial is that root or its `worktree` child. The root is what is
+ * stat-checked and what cleanup removes. Throws a closed code and leaves
+ * routing state unchanged when anything does not hold.
+ *
+ * @returns {Promise<boolean>} Whether anything was discarded from disk.
+ */
+async function discardAndReleasePartial(handle, attempt, options) {
+	const { projectPath, discard, deps } = options;
+	const record = await (deps.readRun ?? readRun)(attempt.runId).catch(
+		() => null,
+	);
+	const claim = record?.worktree;
+	if (
+		!claim ||
+		!claimCovers(claim.path, attempt.partialWorktree) ||
+		typeof claim.nonce !== "string" ||
+		!/^\d+$/.test(claim.device ?? "") ||
+		!/^\d+$/.test(claim.inode ?? "")
+	)
+		rejectRelease("partial_worktree_claim_mismatch");
+	const root = statPartial(claim.path);
+	const quarantine = simpleQuarantinePath(claim.nonce);
+	const quarantined = statPartial(quarantine);
+	if (root?.isSymbolicLink() || quarantined?.isSymbolicLink())
+		rejectRelease("partial_worktree_symlink");
+	if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
+		rejectRelease("project_lock_held");
+	if (root && quarantined) rejectRelease("cleanup_state_ambiguous");
+	let discarded = false;
+	if (root || quarantined) {
+		if (!discard) rejectRelease("discard_required");
+		const cleanupWorktree = deps.cleanupSimpleWorktree ?? cleanupSimpleWorktree;
+		const cleanup = await cleanupWorktree(attempt.runId, claim, {
+			writerStopped: claim.writerStopped === true,
+			onStatus: deps.onStatus,
+		});
+		if (!cleanup.removed) rejectRelease("cleanup_retained");
+		discarded = true;
+	}
+	releasePartialAttempt(handle.state, handle.commit, attempt.attemptId);
+	return discarded;
 }
 /**
  * Release a recorded retained partial once its root is already absent or its
@@ -541,38 +670,11 @@ export async function releaseRetainedPartial(options, deps = {}) {
 			(item) => item.taskId === taskId && item.partialWorktree !== null,
 		);
 		if (!attempt) rejectRelease("partial_worktree_not_recorded");
-		const readRunRecord = deps.readRun ?? readRun;
-		const record = await readRunRecord(attempt.runId).catch(() => null);
-		const claim = record?.worktree;
-		if (
-			!claim ||
-			claim.path !== attempt.partialWorktree ||
-			typeof claim.nonce !== "string" ||
-			!/^\d+$/.test(claim.device ?? "") ||
-			!/^\d+$/.test(claim.inode ?? "")
-		)
-			rejectRelease("partial_worktree_claim_mismatch");
-		const root = statPartial(attempt.partialWorktree);
-		const quarantine = simpleQuarantinePath(claim.nonce);
-		const quarantined = statPartial(quarantine);
-		if (root?.isSymbolicLink() || quarantined?.isSymbolicLink())
-			rejectRelease("partial_worktree_symlink");
-		if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
-			rejectRelease("project_lock_held");
-		if (root && quarantined) rejectRelease("cleanup_state_ambiguous");
-		let discarded = false;
-		if (root || quarantined) {
-			if (!options.discard) rejectRelease("discard_required");
-			const cleanupWorktree =
-				deps.cleanupSimpleWorktree ?? cleanupSimpleWorktree;
-			const cleanup = await cleanupWorktree(attempt.runId, claim, {
-				writerStopped: claim.writerStopped === true,
-				onStatus: deps.onStatus,
-			});
-			if (!cleanup.removed) rejectRelease("cleanup_retained");
-			discarded = true;
-		}
-		clearPartialWorktree(handle, attempt.attemptId);
+		const discarded = await discardAndReleasePartial(handle, attempt, {
+			projectPath,
+			discard: options.discard === true,
+			deps,
+		});
 		return {
 			ok: true,
 			released: true,
@@ -581,6 +683,77 @@ export async function releaseRetainedPartial(options, deps = {}) {
 			attemptId: attempt.attemptId,
 			path: attempt.partialWorktree,
 			discarded,
+		};
+	} finally {
+		handle.release();
+	}
+}
+
+const RUN_TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
+// Writer quiescence follows the lifecycle rule: the run's writer is stopped
+// or never started. A worktree claim that does not record writerStopped
+// proves nothing, and a worker process that answers a liveness probe blocks
+// recovery -- a probe that fails with EPERM counts as live.
+function writerQuiescent(record, deps) {
+	if (record.worktree !== null && record.worktree?.writerStopped !== true)
+		return false;
+	const pid = record.workerPid;
+	if (pid === null || pid === undefined) return true;
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		(deps.probePid ?? process.kill)(pid, 0);
+		return false;
+	} catch (error) {
+		return error?.code === "ESRCH";
+	}
+}
+/**
+ * Recover a dangling pending attempt after an unconfirmed lifecycle left it
+ * behind; every later invocation would otherwise answer
+ * `pending_attempt_exists`. Recovery requires durable proof the attempt is
+ * over -- a terminal run record, a quiescent writer, no live project lock and
+ * no retained-unclaimed worktree -- and records the attempt as terminal
+ * `skipped` with reason `lifecycle_recovered`.
+ */
+export async function closePendingAttempt(options, deps = {}) {
+	const projectPath = canonicalRoutingProject(options.projectPath);
+	const handle = (deps.openRoutingRun ?? openRoutingRun)(
+		projectPath,
+		options.routingRunId,
+		{ stateRoot: deps.stateRoot, create: false },
+	);
+	try {
+		const pending = handle.state.pendingAttempt;
+		if (!pending) rejectRelease("pending_attempt_missing");
+		if (options.taskId !== undefined && pending.taskId !== options.taskId)
+			rejectRelease("routing_pending_identity_mismatch");
+		const record = await (deps.readRun ?? readRun)(pending.runId).catch(
+			() => null,
+		);
+		if (!record || record.runId !== pending.runId)
+			rejectRelease("lifecycle_unconfirmed");
+		if (!RUN_TERMINAL_STATES.has(record.state))
+			rejectRelease("run_state_not_terminal");
+		if (!writerQuiescent(record, deps)) rejectRelease("worker_not_stopped");
+		if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
+			rejectRelease("project_lock_held");
+		if (record.worktree?.state === "retained")
+			rejectRelease("partial_work_retained");
+		recordAttemptOutcome(handle.state, handle.commit, {
+			...pending,
+			terminal: "skipped",
+			reason: "lifecycle_recovered",
+			closedAt: new Date((deps.now ?? Date.now)()).toISOString(),
+			partialWorktree: null,
+		});
+		return {
+			ok: true,
+			recovered: true,
+			routingRunId: options.routingRunId,
+			taskId: pending.taskId,
+			attemptId: pending.attemptId,
+			runId: pending.runId,
+			reason: "lifecycle_recovered",
 		};
 	} finally {
 		handle.release();

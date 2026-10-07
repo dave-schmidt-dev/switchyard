@@ -5,7 +5,6 @@ import { afterEach, describe, it } from "node:test";
 import { createDefaultRouteHealthDecision } from "../src/switchyard/router/health.mjs";
 import {
 	executeTask,
-	executeTaskWithOrchestrator,
 	runnerTestDir,
 	runQueue,
 	withExplicitSwitchyardExecutor,
@@ -153,57 +152,6 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		);
 
 		strictEqual(routeCalls.length, 1);
-		deepStrictEqual(routeCalls[0].only, ["codex"]);
-		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
-		strictEqual(routeCalls[0].platform, "macos");
-		deepStrictEqual(routeCalls[0].goldenImageVerifiedProviders, ["codex"]);
-	});
-	it("executeTaskWithOrchestrator passes both provider filters and availableProviders through to route() (Task E.1)", async () => {
-		// Task E.1 closed the "intentionally-unfiltered orchestrator route" gap
-		// (Task 16): executeTaskWithOrchestrator now mirrors executeTask and
-		// passes availableProviders derived from context.adapters, alongside
-		// the pre-existing exclude forwarding.
-		const routeCalls = [];
-
-		const result = await executeTaskWithOrchestrator(
-			{ id: "1.1", title: "task", description: "op" },
-			{
-				route: (opts) => {
-					routeCalls.push(opts);
-					return {
-						provider: "codex",
-						model: "gpt-5.6-terra",
-						percentLeft: 50,
-						reason: "spread",
-					};
-				},
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
-				orchestrator: {
-					launch: async () => "job-1",
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: "" }),
-				},
-				sleepFn: async () => {},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-				adapters: {
-					codex: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => null,
-					},
-				},
-				exclude: ["claude"],
-				only: ["codex"],
-				platform: "macos",
-				goldenImageVerifiedProviders: ["codex"],
-			},
-		);
-
-		strictEqual(result.success, true);
-		strictEqual(routeCalls.length, 1);
-		deepStrictEqual(routeCalls[0].exclude, ["claude"]);
 		deepStrictEqual(routeCalls[0].only, ["codex"]);
 		deepStrictEqual(routeCalls[0].availableProviders, ["codex"]);
 		strictEqual(routeCalls[0].platform, "macos");

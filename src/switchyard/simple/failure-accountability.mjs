@@ -1,4 +1,5 @@
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error-metadata.mjs";
+import { FAILURE_REGISTRY } from "../diagnostics/failure-registry.mjs";
 import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 
 const RESPONSIBILITY = Object.freeze({
@@ -11,13 +12,80 @@ const RESPONSIBILITY = Object.freeze({
 	unknown: ["unknown", "investigate_unknown"],
 });
 
-/** Project existing closed diagnostics without extending any durable schema. */
+function closedLifecycleReceipt(lifecycle) {
+	return (
+		lifecycle?.schemaVersion === 1 &&
+		lifecycle.writerLifecycle === "stopped" &&
+		lifecycle.cleanupStage === null &&
+		["not_required", "succeeded"].includes(lifecycle.cleanupStatus)
+	);
+}
+
+/**
+ * True when Switchyard's own process supervisor observed this provider-phase
+ * failure and its lifecycle receipt is closed: the direct child and the whole
+ * writer group are stopped and cleanup is settled. The receipt's exit status
+ * (or deadline termination) must match the diagnostic. The supervisor, not
+ * provider output, is the authority here, so no adapter diagnostic is needed.
+ */
+export function lifecycleBackedProviderFailure(
+	providerReliability,
+	providerLifecycle,
+	providerWriterLifecycle,
+) {
+	if (
+		!isProviderReliabilityDiagnostic(providerReliability) ||
+		providerReliability.phase !== "provider" ||
+		providerReliability.cancelled === true ||
+		providerWriterLifecycle !== "stopped" ||
+		!closedLifecycleReceipt(providerLifecycle)
+	)
+		return false;
+	switch (providerReliability.causeCode) {
+		case "provider_exit_nonzero":
+			return (
+				providerLifecycle.terminalStatus === "exited" &&
+				Number.isSafeInteger(providerLifecycle.exitCode) &&
+				providerLifecycle.exitCode !== 0 &&
+				providerReliability.exitCode === providerLifecycle.exitCode
+			);
+		case "provider_signalled":
+			return (
+				providerLifecycle.terminalStatus === "exited" &&
+				typeof providerLifecycle.signal === "string" &&
+				providerReliability.signal === providerLifecycle.signal
+			);
+		case "provider_deadline_exceeded":
+			return (
+				providerLifecycle.terminalStatus === "terminated" &&
+				providerLifecycle.terminationReason === "deadline" &&
+				providerReliability.timedOut === true
+			);
+		default:
+			return false;
+	}
+}
+
+/**
+ * Project existing closed diagnostics without extending any durable schema.
+ * `provenance` may also carry `providerLifecycle` and `providerWriterLifecycle`
+ * from the supervisor; callers that omit them (routing memory) keep the
+ * adapter-diagnostic and deadline trust rules only.
+ */
 export function deriveFailureAccountability({
 	providerReliability,
 	provenance = {},
 } = {}) {
 	const valid = isProviderReliabilityDiagnostic(providerReliability);
 	let category = valid ? providerReliability.causeCategory : "unknown";
+	// A provider-caused row whose persisted category stays "unknown" for reader
+	// compatibility is attributed to the provider only under the same trust rule.
+	if (
+		valid &&
+		category === "unknown" &&
+		FAILURE_REGISTRY.get(providerReliability.causeCode)?.providerCaused === true
+	)
+		category = "provider";
 	if (category === "provider") {
 		const diagnosticTrusted =
 			provenance.diagnosticCode === providerReliability.causeCode &&
@@ -26,7 +94,13 @@ export function deriveFailureAccountability({
 			providerReliability.causeCode === "provider_deadline_exceeded" &&
 			providerReliability.phase === "provider" &&
 			providerReliability.timedOut === true;
-		if (!diagnosticTrusted && !deadlineTrusted) category = "unknown";
+		const lifecycleTrusted = lifecycleBackedProviderFailure(
+			providerReliability,
+			provenance.providerLifecycle,
+			provenance.providerWriterLifecycle,
+		);
+		if (!diagnosticTrusted && !deadlineTrusted && !lifecycleTrusted)
+			category = "unknown";
 	}
 	const [owner, action] =
 		category === "provider"

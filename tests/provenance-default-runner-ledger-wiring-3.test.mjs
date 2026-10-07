@@ -2,16 +2,12 @@ import { ok, strictEqual } from "node:assert";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
-import { readLedger } from "../src/switchyard/ledger/index.mjs";
 import {
 	__resetRosterCacheForTests,
 	getInvocationDescriptorIdentity,
 	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import {
-	runQueue,
-	runQueueWithOrchestrator,
-} from "../src/switchyard/runner/index.mjs";
+import { runQueue } from "../src/switchyard/runner/index.mjs";
 import {
 	FIXTURE_PATH,
 	previousHomeDir,
@@ -150,27 +146,6 @@ function defaultSyncDependencies(overrides = {}) {
 		...overrides,
 	};
 }
-function defaultOrchestratorDependencies(overrides = {}) {
-	return {
-		...taskBaseDependencies(),
-		route: defaultRoute,
-		resolveDescriptor: () =>
-			syntheticDescriptor({
-				targetId: "opencode-go",
-				model: "fixture/opencode-low",
-				harness: "opencode",
-			}),
-		adapters: { opencode: { captureDiffAsync: async () => "" } },
-		orchestrator: {
-			launch: async () => "job-default-ledger",
-			status: async () => ({ state: "done" }),
-			result: async () => ({ success: true, diff: "", output: REVIEW_OUTPUT }),
-		},
-		recordDispatchIntent: () => {},
-		queuePreflight: NOOP_QUEUE_PREFLIGHT,
-		...overrides,
-	};
-}
 async function waitFor(check, timeoutMs = 5000) {
 	const deadline = Date.now() + timeoutMs;
 	let value = await check();
@@ -261,30 +236,6 @@ describe("default runner ledger wiring", () => {
 			ok(!warnings[0].includes("status surface exploded"));
 		} finally {
 			console.warn = originalWarn;
-			restoreLedgerPaths();
-		}
-	});
-	it("contains an orchestrator store-write failure after the legacy record", async () => {
-		const fixture = makeDefaultWiringFixture(
-			"orchestrator-store-write-failure",
-		);
-		writeFileSync(fixture.storeRoot, "not a directory", "utf8");
-		try {
-			const result = await runQueueWithOrchestrator({
-				tasksFilePath: fixture.tasksFilePath,
-				projectPath: tmpDir,
-				workingContainerName: "test-container",
-				platform: "macos",
-				checkpointPath: fixture.checkpointPath,
-				dependencies: defaultOrchestratorDependencies(),
-			});
-			strictEqual(result.results[0].result, "review_completed");
-			strictEqual(
-				readLedger().filter((record) => record.taskId === fixture.taskId)
-					.length,
-				1,
-			);
-		} finally {
 			restoreLedgerPaths();
 		}
 	});

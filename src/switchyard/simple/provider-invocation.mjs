@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	classifyProviderStreams,
@@ -14,6 +16,10 @@ import {
 } from "./args.mjs";
 import { resolveCheckExecution } from "./check-execution.mjs";
 import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
+import {
+	classifyProviderOutput,
+	createRateLimitMatcher,
+} from "./provider-signature.mjs";
 
 const VIBE_CODE_LAUNCHER = fileURLToPath(
 	new URL("../../../ops/simple-vibe-code-launcher.mjs", import.meta.url),
@@ -33,6 +39,24 @@ function deadlineTimeout(deadlineMs, now) {
 		});
 	}
 	return value;
+}
+/**
+ * Map an AbortSignal's reason onto the closed cancel-source enum. The CLI
+ * aborts with the OS signal name, so a caller deadline and a captain kill
+ * both arrive as SIGTERM and stay `signal_sigterm`; an internal deadline
+ * error maps to `internal_deadline`; anything else is `unspecified`.
+ */
+export function cancelSourceForAbortSignal(signal) {
+	const reason = signal?.reason;
+	if (reason === "SIGTERM") return "signal_sigterm";
+	if (reason === "SIGINT") return "signal_sigint";
+	if (reason instanceof Error && reason.code === "deadline_expired")
+		return "internal_deadline";
+	return "unspecified";
+}
+function withCancelSource(result, signal) {
+	if (result?.cancelled !== true) return result;
+	return { ...result, cancelSource: cancelSourceForAbortSignal(signal) };
 }
 export function buildSimpleProviderInvocation(
 	harness,
@@ -241,14 +265,30 @@ export function simpleProviderCompatibility({
 	}
 	return { compatible: true, reason: null };
 }
+function withRateLimitDetection(options) {
+	const matcher = createRateLimitMatcher({ prompt: options.input });
+	return {
+		...options,
+		detectRateLimit:
+			options.detectRateLimit ??
+			((stream, chunk) => matcher.push(stream, chunk)),
+	};
+}
 export async function runSimpleWriter(command, args, options = {}) {
+	// A provider receives its guarded prompt on stdin; watch its live streams so
+	// a rate-limit report stops it before the routing budget is burned.
+	const streamOptions =
+		typeof options.input === "string" && options.input.length > 0
+			? withRateLimitDetection(options)
+			: options;
 	// Test-injected spawns retain their own lifecycle contract. Production spawns
 	// create a session and settle both its group and any escaped worktree holder.
-	if (options.spawnFn) return runProviderProcess(command, args, options);
+	if (streamOptions.spawnFn)
+		return runProviderProcess(command, args, streamOptions);
 	let pgid = null;
 	const launchedAt = Date.now();
 	const result = await runProviderProcess(command, args, {
-		...options,
+		...streamOptions,
 		spawnFn: (cmd, argv, spawnOptions) => {
 			const child = spawn(cmd, argv, { ...spawnOptions, detached: true });
 			pgid = child.pid;
@@ -275,11 +315,12 @@ export async function defaultExecuteProvider(context) {
 		context.targetId,
 		context.capability,
 	);
-	const result = await runSimpleWriter(invocation.command, invocation.args, {
+	const raw = await runSimpleWriter(invocation.command, invocation.args, {
 		input: context.prompt,
 		cwd: context.worktreePath,
 		processScopePath: context.worktreePath,
 		timeoutMs: context.timeoutMs,
+		deadlineMs: context.deadlineMs,
 		silenceTimeoutMs: Math.min(5 * 60 * 1000, context.timeoutMs),
 		maxBuffer: MAX_CAPTURE_BYTES,
 		progressStage: "running",
@@ -288,6 +329,16 @@ export async function defaultExecuteProvider(context) {
 		signal: context.signal,
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
+	const result = withCancelSource(raw, context.signal);
+	const earlyRateLimited = !result.success && result.rateLimited === true;
+	const signatureInfo = !result.success
+		? classifyProviderOutput({
+				stderr: result.stderr,
+				stdout: result.output,
+				exitCode: result.code,
+				signal: result.signal,
+			})
+		: null;
 	const diagnosticEvidence = !result.success
 		? classifyProviderStreams({
 				stdout: result.output,
@@ -309,9 +360,11 @@ export async function defaultExecuteProvider(context) {
 		(context.harness === "vibe" && !result.success
 			? providerCodeForVibeBudgetEvidence(result.stderr)
 			: null);
-	const diagnosticCode = bridgeDiagnosticCode
-		? bridgeDiagnosticCode
-		: providerDiagnosticCodeForKind(diagnosticEvidence?.diagnosticKind);
+	const diagnosticCode = earlyRateLimited
+		? "quota_exhausted"
+		: bridgeDiagnosticCode
+			? bridgeDiagnosticCode
+			: providerDiagnosticCodeForKind(diagnosticEvidence?.diagnosticKind);
 	const classified = diagnosticCode
 		? {
 				...result,
@@ -320,16 +373,27 @@ export async function defaultExecuteProvider(context) {
 				diagnosticEvidenceAvailable: true,
 			}
 		: result;
-	if (context.harness === "opencode" && !result.success) {
-		const providerVerdictCode = parseOpenCodeGoBridgeDiagnostic(result.output);
+	if (!result.success) {
+		const providerVerdictCode =
+			context.harness === "opencode"
+				? parseOpenCodeGoBridgeDiagnostic(result.output)
+				: null;
 		return {
 			...classified,
+			terminationReason: earlyRateLimited
+				? "rate_limited"
+				: result.terminationReason,
+			providerSignature: earlyRateLimited
+				? "rate_limited"
+				: signatureInfo.providerSignature,
+			stderrBytes: signatureInfo.stderrBytes,
+			stdoutBytes: signatureInfo.stdoutBytes,
 			output: "",
 			stderr: "",
 			...(providerVerdictCode ? { providerVerdictCode } : {}),
 		};
 	}
-	if (context.harness !== "agy" || !result.success) return classified;
+	if (context.harness !== "agy") return classified;
 	try {
 		return {
 			...result,
@@ -422,6 +486,7 @@ async function defaultRunCheck({
 			output: "",
 			stderr: "",
 			cancelled: true,
+			cancelSource: cancelSourceForAbortSignal(signal),
 			writerLifecycle: "never_started",
 		};
 	}
@@ -437,7 +502,7 @@ async function defaultRunCheck({
 			writerLifecycle: "never_started",
 		};
 	}
-	return runSimpleWriter(
+	const writerResult = await runSimpleWriter(
 		execution.kind === "local" ? execution.command : "/bin/sh",
 		execution.kind === "local"
 			? execution.args
@@ -459,6 +524,7 @@ async function defaultRunCheck({
 			signal,
 		},
 	);
+	return withCancelSource(writerResult, signal);
 }
 function captureWorktreeDiff(
 	worktreePath,
@@ -466,6 +532,7 @@ function captureWorktreeDiff(
 	deadlineMs,
 	now,
 	gitControlSnapshot,
+	reportPath = null,
 ) {
 	const guarded = (args, code, options) => {
 		verifyGitControl(worktreePath, gitControlSnapshot);
@@ -474,6 +541,11 @@ function captureWorktreeDiff(
 	guarded(["add", "-A", "--", "."], "diff_stage_failed", {
 		timeout: deadlineTimeout(deadlineMs, now),
 	});
+	if (reportPath && existsSync(join(worktreePath, reportPath))) {
+		guarded(["add", "-f", "--", reportPath], "diff_stage_failed", {
+			timeout: deadlineTimeout(deadlineMs, now),
+		});
+	}
 	const changed = guarded(
 		["diff", "--cached", "--name-only", "-z", baseRevision],
 		"diff_names_failed",

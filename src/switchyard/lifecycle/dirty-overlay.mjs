@@ -8,6 +8,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { headAdvanceSafe } from "../simple/head-advance.mjs";
 import {
 	assertOverlayPathSafe,
 	DIRTY_OVERLAY_MAX_FILE_BYTES,
@@ -155,6 +156,7 @@ export function validateDirtyOverlayReceipt(
 	expectedPaths = null,
 	{
 		allowUnrelated = false,
+		allowHeadAdvance = false,
 		maxFileBytes = DIRTY_OVERLAY_MAX_FILE_BYTES,
 		enforceTarPathLimit = true,
 		secretPaths = DIRTY_OVERLAY_SECRET_PATHS,
@@ -199,8 +201,18 @@ export function validateDirtyOverlayReceipt(
 	)
 		return { ok: false, reason: "dirty_overlay_scope_mismatch" };
 	try {
+		const currentHead = gitRead(projectPath, ["rev-parse", "HEAD"]).trim();
 		if (
-			gitRead(projectPath, ["rev-parse", "HEAD"]).trim() !== receipt.sourceHead
+			currentHead !== receipt.sourceHead &&
+			!(
+				allowHeadAdvance &&
+				headAdvanceSafe({
+					projectPath,
+					base: receipt.sourceHead,
+					head: currentHead,
+					paths: receipt.paths.map((entry) => entry.path),
+				})
+			)
 		)
 			return { ok: false, reason: "dirty_overlay_source_head_drift" };
 		const currentStatus = statusPaths(projectPath);

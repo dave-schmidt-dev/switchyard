@@ -28,7 +28,6 @@ import { executeMutationSync } from "./mutation-protocol.mjs";
 import {
 	ALLOCATION_INTENT_PREFIX,
 	ALLOCATION_INTENT_SUFFIX,
-	CLEANUP_STARTED,
 	CLIPBOARD_AGENT_LABEL,
 	CLIPBOARD_AGENT_PROCESS,
 	DEFAULT_AQUA_POLL_MS,
@@ -52,11 +51,8 @@ import {
 	HOST_READINESS_MAX_BUFFER,
 	INDEX_LOCK_PATH,
 	INDEX_LOCK_REMOVED,
-	KILL_GUEST_PROCESS_TREE,
 	MAX_AQUA_EXEC_ARGV_BYTES,
 	MAX_TRANSFER_BYTES,
-	PID_MARKER_REMOVED,
-	PID_OBSERVED,
 	PRLCTL_JOB_MISFIRE,
 	PROVIDER_TERMINAL_EVIDENCE_KIND,
 	PROVIDER_TERMINAL_EVIDENCE_MAX_BYTES,
@@ -64,7 +60,6 @@ import {
 	parseHostProcessIdentity,
 	prlctlHostPermissionDenied,
 	probeHostProcessIdentity,
-	TREE_TERMINATED,
 	UUID,
 	VM_CREDENTIAL_LAYOUTS,
 	VM_OWNERSHIP_SCHEMA_VERSION,
@@ -1346,31 +1341,6 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 		);
 	}
 
-	/**
-	 * Read a PID marker written by a future launch wrapper. Task 4.2 has no
-	 * caller that needs a supervisor; this helper keeps the guest PID handoff
-	 * explicit for the timeout task without adding one.
-	 */
-	getGuestPid(workspaceId, pidPath, cleanupContext = {}) {
-		validateGuestPath(pidPath, "pidPath");
-		const identity = markerIdentity(workspaceId, cleanupContext);
-		if (!identity?.strongStart)
-			throw new Error("guest PID marker process-start identity is unknown");
-		const output = outputText(
-			this.execGuest(workspaceId, "/bin/cat", [pidPath], { cwd: "/" }),
-		).trim();
-		const [pidText, markerToken, ...extra] = output.split(/\r?\n/);
-		if (
-			!/^\d+$/.test(pidText) ||
-			Number(pidText) <= 0 ||
-			markerToken !== identity.token ||
-			extra.length > 0
-		) {
-			throw new Error("guest PID marker was missing or invalid");
-		}
-		return Number(pidText);
-	}
-
 	_runBulkTransfer({ direction, workspaceId, payload, guestArgs }) {
 		const tar = direction === "push" ? validateTar(payload) : Buffer.alloc(0);
 		// pf anchor names are bounded by the kernel's fixed buffer. The golden
@@ -1621,17 +1591,30 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 	}
 
 	/**
-	 * Kill the recorded provider tree in a VM, then clear its stale Git lock.
-	 * This is called through provider-lifecycle's existing cleanup parameter;
-	 * it never destroys the VM.
+	 * Clear a VM workspace's stale Git index lock. This is called through
+	 * provider-lifecycle's existing cleanup parameter; it never destroys the
+	 * VM and never signals a guest process: no qualified guest birth-identity
+	 * probe exists, so a guest PID carries no signaling authority, and the
+	 * workspace's own destroy is the only authority that can remove a
+	 * surviving provider.
 	 * @param {string} command
 	 * @param {string[]} args
-	 * @returns {{workspaceId: string, pid: number}}
+	 * @param {object} [options]
+	 * @param {"timeout"|"cancel"} [options.reason] Termination cause. A
+	 *   provider terminated from the host may still be running inside the
+	 *   guest, so no guest exec is made at all and the lock's removal is
+	 *   deferred to the VM's destroy.
+	 * @returns {{cleanupStage: string, workspaceId: string}|null}
 	 */
 	cleanupProviderProcess(
 		command,
 		args,
-		{ onStatus, workspaceId: requestedWorkspaceId, ...cleanupContext } = {},
+		{
+			onStatus,
+			reason,
+			workspaceId: requestedWorkspaceId,
+			...cleanupContext
+		} = {},
 	) {
 		const bridgeInvocation =
 			command === BWS_SECRET_EXEC &&
@@ -1657,46 +1640,23 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				"refusing process cleanup without matching attempt identity",
 			);
 		}
-		const pidPath = this.providerPidPath(workspaceId, ownerContext);
-		let cleanupStage = CLEANUP_STARTED;
 		onStatus?.({
 			phase: "execution",
 			event: "provider_cleanup_started",
 			status: "Guest provider cleanup started",
 		});
+		if (reason === "timeout" || reason === "cancel") {
+			onStatus?.({
+				phase: "execution",
+				event: "provider_cleanup_complete",
+				status: "Guest provider cleanup deferred to VM destroy",
+			});
+			return { cleanupStage: "destroy_pending", workspaceId };
+		}
 		try {
-			const pid = this.getGuestPid(workspaceId, pidPath, ownerContext);
-			cleanupStage = PID_OBSERVED;
-			onStatus?.({
-				phase: "execution",
-				event: "provider_pid_observed",
-				status: "Guest provider PID observed",
-			});
-			this.execGuest(
-				workspaceId,
-				"/bin/bash",
-				["-lc", KILL_GUEST_PROCESS_TREE, "switchyard-kill-tree", String(pid)],
-				{ cwd: "/" },
-			);
-			cleanupStage = TREE_TERMINATED;
-			onStatus?.({
-				phase: "execution",
-				event: "provider_tree_gone",
-				status: "Guest provider tree confirmed gone",
-			});
-			this.execGuest(workspaceId, "/bin/rm", ["-f", "--", pidPath], {
-				cwd: "/",
-			});
-			cleanupStage = PID_MARKER_REMOVED;
-			onStatus?.({
-				phase: "execution",
-				event: "provider_pid_marker_removed",
-				status: "Guest provider PID marker removed",
-			});
 			this.execGuest(workspaceId, "/bin/rm", ["-f", "--", INDEX_LOCK_PATH], {
 				cwd: "/",
 			});
-			cleanupStage = INDEX_LOCK_REMOVED;
 			onStatus?.({
 				phase: "execution",
 				event: "provider_index_lock_removed",
@@ -1707,12 +1667,13 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 				event: "provider_cleanup_complete",
 				status: "Guest provider cleanup complete; VM retained",
 			});
-			return { cleanupStage, workspaceId, pid };
+			return { cleanupStage: INDEX_LOCK_REMOVED, workspaceId };
 		} catch (error) {
-			if (error && typeof error === "object") error.cleanupStage = cleanupStage;
+			if (error && typeof error === "object")
+				error.cleanupStage = "cleanup_started";
 			// Two causes reach here and the bare event could not tell them
-			// apart: the kill script ran and reported survivors (execFileSync
-			// sets `status`), or the guest exec never ran at all (a transport
+			// apart: the guest rm ran and exited non-zero (execFileSync sets
+			// `status`), or the guest exec never ran at all (a transport
 			// failure sets `code`/`signal` and no status). Carrying the stage
 			// and the exit status makes one event self-describing instead of
 			// requiring the reader to infer the stage from which later events
@@ -1723,8 +1684,8 @@ export class ParallelsExecutionBackend extends ExecutionBackend {
 			onStatus?.({
 				phase: "execution",
 				event: "provider_cleanup_failed",
-				status: "Guest provider cleanup could not confirm process exit",
-				cleanupStage,
+				status: "Guest provider cleanup could not confirm index lock removal",
+				cleanupStage: "cleanup_started",
 				...(Number.isSafeInteger(status) ? { exitCode: status } : {}),
 				...(typeof signal === "string" ? { signal } : {}),
 			});

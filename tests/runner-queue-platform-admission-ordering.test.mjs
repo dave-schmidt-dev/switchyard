@@ -1,13 +1,11 @@
-import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { VmSlotUnavailableError } from "../src/switchyard/run-store/index.mjs";
 import {
 	QueuePreflightError,
-	runQueueAsync as runQueueAsyncImpl,
-	runQueue as runQueueImpl,
-	runQueueWithOrchestrator as runQueueWithOrchestratorImpl,
+	runQueueAsync,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	macosBackend,
@@ -40,8 +38,8 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 - **Executor:** switchyard
 `);
 	}
-	it("runs preflight and admission before create, then releases after teardown on all three entrypoints", async () => {
-		for (const entrypoint of ["sync", "async", "orchestrator"]) {
+	it("runs preflight and admission before create, then releases after teardown on sync and async entrypoints", async () => {
+		for (const [entrypoint, invoke] of [["async", runQueueAsync]]) {
 			const events = [];
 			const tasksPath = writeTerminalQueue();
 			const options = {
@@ -51,17 +49,9 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 				checkpointPath: `${tasksPath}.${entrypoint}.checkpoint.json`,
 				dependencies: {
 					backendFactory: () => macosBackend(events),
-					orchestrator: {
-						launch: async () => "job",
-						status: async () => ({ state: "done" }),
-						result: async () => ({ success: true, diff: "" }),
-					},
 				},
 			};
-			if (entrypoint === "sync") runQueueImpl(options);
-			if (entrypoint === "async") await runQueueAsyncImpl(options);
-			if (entrypoint === "orchestrator")
-				await runQueueWithOrchestratorImpl(options);
+			await invoke(options);
 			strictEqual(events[0], "preflight");
 			strictEqual(events[1], "readiness");
 			ok(events.indexOf("readiness") < events.indexOf("acquire"));
@@ -70,7 +60,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		}
 	});
 	it("stops at a synthetic preflight rejection before slot, VM, container, provider, or adapter calls", async () => {
-		for (const entrypoint of ["sync", "async", "orchestrator"]) {
+		for (const [entrypoint, invoke] of [["async", runQueueAsync]]) {
 			const events = [];
 			const tasksPath = writeTasksFile(`## Phase 1
 
@@ -95,19 +85,9 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 				checkpointPath: `${tasksPath}.${entrypoint}.checkpoint.json`,
 				dependencies: {
 					backendFactory: () => backend,
-					orchestrator: {
-						launch: async () => {
-							events.push("provider");
-							return "job";
-						},
-					},
 				},
 			};
-			if (entrypoint === "sync") throws(() => runQueueImpl(options));
-			if (entrypoint === "async")
-				await rejects(() => runQueueAsyncImpl(options));
-			if (entrypoint === "orchestrator")
-				await rejects(() => runQueueWithOrchestratorImpl(options));
+			await rejects(invoke(options));
 			deepStrictEqual(events, ["preflight"]);
 		}
 	});
@@ -117,7 +97,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			["vm_host_inventory_unavailable", "inventory unavailable"],
 			["vm_host_service_degraded", "service degraded"],
 		]) {
-			for (const entrypoint of ["sync", "async", "orchestrator"]) {
+			for (const [entrypoint, invoke] of [["async", runQueueAsync]]) {
 				const events = [];
 				const tasksPath = writeTasksFile(`## Phase 1
 
@@ -145,23 +125,9 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 							providerLaunches += 1;
 							throw new Error("provider launch must not occur");
 						},
-						orchestrator: {
-							launch: async () => "job",
-							status: async () => ({ state: "done" }),
-							result: async () => ({ success: true, diff: "" }),
-						},
 					},
 				};
-				const invoke =
-					entrypoint === "sync"
-						? () => runQueueImpl(options)
-						: entrypoint === "async"
-							? () => runQueueAsyncImpl(options)
-							: () => runQueueWithOrchestratorImpl(options);
-				await rejects(
-					Promise.resolve().then(invoke),
-					(error) => error === failure,
-				);
+				await rejects(invoke(options), (error) => error === failure);
 				deepStrictEqual(events, ["preflight", "readiness"]);
 				strictEqual(providerLaunches, 0);
 			}
@@ -187,7 +153,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			return { token: "test-slot" };
 		};
 
-		const queue = runQueueAsyncImpl({
+		const queue = runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			platform: "macos",
@@ -239,7 +205,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			return { token: "test-slot" };
 		};
 
-		await runQueueAsyncImpl({
+		await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			platform: "macos",
@@ -279,7 +245,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		};
 
 		await rejects(
-			runQueueAsyncImpl({
+			runQueueAsync({
 				tasksFilePath: tasksPath,
 				projectPath: TEST_DIR,
 				platform: "macos",
@@ -324,7 +290,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		Date.now = () => 0;
 		try {
 			await rejects(
-				runQueueAsyncImpl({
+				runQueueAsync({
 					tasksFilePath: tasksPath,
 					projectPath: TEST_DIR,
 					platform: "macos",

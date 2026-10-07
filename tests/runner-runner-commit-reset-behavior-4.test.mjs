@@ -5,9 +5,9 @@ import { afterEach, describe, it } from "node:test";
 import { loadCheckpoint } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -24,7 +24,7 @@ afterEach(() => {
 	}
 });
 describe("runner commit/reset behavior (Task 3.2)", () => {
-	it("persists the halt outcome to the checkpoint before queue_halted and terminal events (INV-6)", () => {
+	it("persists the halt outcome to the checkpoint before queue_halted and terminal events (INV-6)", async () => {
 		// The halt entry must be on disk the moment the queue_halted observer
 		// event fires — not merely after the run's final save — so any
 		// observer reading the checkpoint at that point (e.g. an operator
@@ -42,7 +42,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		const events = [];
 		let haltOnDiskWhenEventFired = null;
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -56,6 +56,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 						);
 					}
 				},
+				onCheckpointSaved: () => events.push("checkpoint_saved"),
 				route: () => ({
 					provider: "claude",
 					model: "claude-sonnet-5",
@@ -75,8 +76,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -93,19 +94,18 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			"halted_after_commit_failure",
 		);
 		strictEqual(haltOnDiskWhenEventFired.results[1].action, "commit");
-		// The task's own durable entry precedes the halt, and the halt
-		// precedes the terminal event.
+		// The task's own durable entry precedes the halt; the async queue
+		// surfaces the save through the onCheckpointSaved seam.
 		const saved = events.indexOf("checkpoint_saved");
 		const halted = events.indexOf("queue_halted");
-		const terminal = events.indexOf("terminal");
 		ok(saved !== -1 && saved < halted, "task entry saved before queue_halted");
-		ok(
-			halted !== -1 && halted < terminal,
-			"queue_halted fires before the terminal event",
-		);
+		// BLOCKED (Task 5.4): the async queue emits no "terminal" onStatus
+		// event (terminalization is owned by the worker bootstrap through the
+		// run store), so the queue_halted-before-terminal assertion cannot
+		// be ported.
 		strictEqual(result.results[1].result, "halted_after_commit_failure");
 	});
-	it("formats a non-Error commit seam failure safely and halts without crashing (regression)", () => {
+	it("formats a non-Error commit seam failure safely and halts without crashing (regression)", async () => {
 		// Injected dependency seams may throw any value, not just an Error. A
 		// thrown plain object must not crash the halt formatting (no unguarded
 		// `error.message` dereference) and must not leak its arbitrary
@@ -120,7 +120,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const events = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -145,8 +145,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -180,12 +180,11 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			events.find((e) => e.event === "queue_halted"),
 			"queue_halted still emitted after a non-Error commit failure",
 		);
-		ok(
-			events.find((e) => e.event === "terminal"),
-			"terminal event still emitted after a non-Error commit failure",
-		);
+		// BLOCKED (Task 5.4): the async queue emits no "terminal" onStatus
+		// event (terminalization is owned by the worker bootstrap through the
+		// run store), so the terminal-event assertion cannot be ported.
 	});
-	it("formats a null reset seam failure safely (no unguarded message dereference)", () => {
+	it("formats a null reset seam failure safely (no unguarded message dereference)", async () => {
 		// A seam that throws literally `null` is the sharpest non-Error case:
 		// any unguarded `error.message` in the reset halt path would throw a
 		// TypeError instead of producing the halt outcome.
@@ -198,7 +197,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -223,8 +222,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},

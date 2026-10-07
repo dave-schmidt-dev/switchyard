@@ -350,69 +350,7 @@ export const PROVIDER_TERMINAL_EVIDENCE_KIND = "switchyard_provider_terminal";
 // token, or the substitution would rewrite the name along with the value.
 export const XFER_URL_ASSIGNMENT = "SWITCHYARD_XFER_URL=TRANSFER_URL";
 export const INDEX_LOCK_PATH = "/project/.git/index.lock";
-export const CLEANUP_STARTED = "cleanup_started";
-export const PID_OBSERVED = "pid_observed";
-export const TREE_TERMINATED = "tree_terminated";
-export const PID_MARKER_REMOVED = "pid_marker_removed";
 export const INDEX_LOCK_REMOVED = "index_lock_removed";
-export const KILL_GUEST_PROCESS_TREE = String.raw`
-set -eu
-root="$1"
-
-children() {
-  /bin/ps -axo pid=,ppid= | /usr/bin/awk -v parent="$1" '$2 == parent { print $1 }'
-}
-
-collect_descendants() {
-  for child in $(children "$1"); do
-    printf '%s\n' "$child"
-    collect_descendants "$child"
-  done
-}
-
-alive() {
-  /bin/ps -axo pid=,state= | /usr/bin/awk -v target="$1" '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit(found ? 0 : 1) }'
-}
-
-signal_tree() {
-  signal="$1"
-  pid="$2"
-  for child in $(collect_descendants "$pid"); do
-    /bin/kill "-$signal" "$child" 2>/dev/null || true
-  done
-  /bin/kill "-$signal" "$pid" 2>/dev/null || true
-}
-
-signal_tree TERM "$root"
-for _ in $(/usr/bin/seq 1 20); do
-  survivors=""
-  alive "$root" && survivors="$root"
-  descendants="$(collect_descendants "$root")"
-  if [ -n "$descendants" ]; then
-    if [ -n "$survivors" ]; then
-      survivors="$survivors $descendants"
-    else
-      survivors="$descendants"
-    fi
-  fi
-  [ -z "$survivors" ] && exit 0
-  /bin/sleep 0.05
-done
-
-signal_tree KILL "$root"
-/bin/sleep 0.05
-survivors=""
-alive "$root" && survivors="$root"
-descendants="$(collect_descendants "$root")"
-if [ -n "$descendants" ]; then
-  if [ -n "$survivors" ]; then
-    survivors="$survivors $descendants"
-  else
-    survivors="$descendants"
-  fi
-fi
-[ -z "$survivors" ]
-`;
 
 export function validatePid(pid) {
 	if (!Number.isSafeInteger(pid) || pid <= 0) {

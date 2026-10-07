@@ -4,69 +4,11 @@ import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { validateDirtyOverlayReceipt } from "../lifecycle/index.mjs";
 import { isValidCapabilityClass } from "../roster/classifier.mjs";
 import { normalizeProviderName } from "../roster/index.mjs";
-import { sleep } from "./checkpoint-errors.mjs";
-import { TERMINAL_JOB_STATES } from "./constants.mjs";
 
 function selectAdapter(harnessOrProvider, adapters) {
 	const harness = normalizeProviderName(harnessOrProvider);
 	if (!harness) return null;
 	return adapters?.[harness] ?? null;
-}
-export function parseExpectedBy(status) {
-	const raw = status?.expected_by ?? status?.expectedBy ?? null;
-	if (!raw || typeof raw !== "string") return null;
-	const epochMs = Date.parse(raw);
-	return Number.isFinite(epochMs) ? epochMs : null;
-}
-export async function waitForJobCompletion(options) {
-	const {
-		jobId,
-		orchestrator,
-		pollIntervalMs = 10_000,
-		maxPolls = 1_000,
-		now = Date.now,
-		sleepFn = sleep,
-		onPoll = null,
-	} = options;
-
-	let polls = 0;
-	let lastStatus = { state: "missing" };
-
-	while (polls < maxPolls) {
-		let status;
-		try {
-			// eslint-disable-next-line no-await-in-loop
-			status = await orchestrator.status(jobId);
-		} catch (error) {
-			return {
-				state: "status_error",
-				status: { error: error?.message ?? "orchestrator status failed" },
-				timedOut: false,
-				polls: polls + 1,
-			};
-		}
-		const state = String(status?.state ?? "missing");
-		lastStatus = status ?? { state: "missing" };
-		polls += 1;
-
-		if (typeof onPoll === "function") {
-			onPoll({ jobId, status: lastStatus, state, polls });
-		}
-
-		if (TERMINAL_JOB_STATES.has(state)) {
-			return { state, status: lastStatus, timedOut: false, polls };
-		}
-
-		const expectedByMs = parseExpectedBy(status);
-		if (expectedByMs !== null && now() > expectedByMs) {
-			return { state: "timed_out", status: lastStatus, timedOut: true, polls };
-		}
-
-		// eslint-disable-next-line no-await-in-loop
-		await sleepFn(pollIntervalMs);
-	}
-
-	return { state: "poll_limit", status: lastStatus, timedOut: true, polls };
 }
 function resolveTaskExecutor(task) {
 	if (!Object.hasOwn(task, "executor")) return "switchyard";

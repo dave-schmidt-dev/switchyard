@@ -1,5 +1,5 @@
-import { basename, join } from "node:path";
-import { cwd } from "node:process";
+import { basename, dirname, join } from "node:path";
+import { cwd, env } from "node:process";
 import { fileURLToPath } from "node:url";
 import {
 	getInvocationDescriptorIdentity,
@@ -9,12 +9,20 @@ import { route as realRoute } from "../../src/switchyard/router/index.mjs";
 import {
 	executeTaskAsync as executeTaskAsyncImpl,
 	executeTask as executeTaskImpl,
-	executeTaskWithOrchestrator as executeTaskWithOrchestratorImpl,
 	parseTaskQueue,
 	runQueueAsync as runQueueAsyncImpl,
 	runQueue as runQueueImpl,
-	runQueueWithOrchestrator as runQueueWithOrchestratorImpl,
 } from "../../src/switchyard/runner/index.mjs";
+
+// Runner tests must not read the host roster: the check sandbox runs them
+// under an isolated HOME with no ~/.agent/roster.json. The roster loads
+// lazily, so pinning the env here (before any runner call) is sufficient.
+env.SWITCHYARD_ROSTER_PATH ??= join(
+	dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"fixtures",
+	"roster.fixture.json",
+);
 
 export function runnerTestDir(url) {
 	return join(cwd(), ".switchyard-runner-test", basename(fileURLToPath(url)));
@@ -98,67 +106,30 @@ export function descriptorForRoute(routeResult) {
 
 export function withTestDescriptorContext(context) {
 	let latest = null;
-	let launchedTaskBase = null;
-	let orchestratorDiff = "";
 	const originalRoute = context.route;
 	const originalResolveDescriptor = context.resolveDescriptor;
 	const route = (options) => {
 		const routed = originalRoute(options);
+		// Routed providers without a fixture adapter get an empty diff capture.
 		if (routed?.provider && !adapters[routed.provider]) {
-			adapters[routed.provider] = {
-				captureDiffAsync: async () => orchestratorDiff,
-			};
+			adapters[routed.provider] = { captureDiffAsync: async () => "" };
 		}
 		latest = descriptorForRoute(routed);
 		return latest && routed && !Object.hasOwn(routed, "invocationDescriptor")
 			? { ...routed, invocationDescriptor: latest }
 			: routed;
 	};
-	const orchestrator = context.orchestrator
-		? {
-				...context.orchestrator,
-				launch: async (payload) => {
-					launchedTaskBase = payload.taskBase;
-					return context.orchestrator.launch(payload);
-				},
-				result: async (jobId) => {
-					const result = await context.orchestrator.result(jobId);
-					orchestratorDiff =
-						typeof result?.diff === "string" ? result.diff : "";
-					return context.requireExplicitTaskBaseResult
-						? result
-						: { ...result, taskBase: result?.taskBase ?? launchedTaskBase };
-				},
-			}
-		: undefined;
-	const fixtureAdapters =
-		context.adapters ??
-		(context.orchestrator
-			? Object.fromEntries(
-					[
-						"claude",
-						"codex",
-						"agy",
-						"cursor",
-						"copilot",
-						"opencode",
-						"vibe",
-					].map((name) => [name, {}]),
-				)
-			: {});
 	const adapters = Object.fromEntries(
-		Object.entries(fixtureAdapters).map(([name, adapter]) => [
+		Object.entries(context.adapters ?? {}).map(([name, adapter]) => [
 			name,
 			{
 				...adapter,
-				captureDiffAsync:
-					adapter.captureDiffAsync ?? (async () => orchestratorDiff),
+				captureDiffAsync: adapter.captureDiffAsync ?? (async () => ""),
 			},
 		]),
 	);
 	return {
 		...context,
-		...(orchestrator ? { orchestrator } : {}),
 		adapters,
 		queueBackend: context.queueBackend ?? {
 			beforeRun: () => {},
@@ -177,13 +148,6 @@ export function withTestDescriptorContext(context) {
 
 export function executeTask(task, context) {
 	return executeTaskImpl(task, withTestDescriptorContext(context));
-}
-
-export async function executeTaskWithOrchestrator(task, context) {
-	return executeTaskWithOrchestratorImpl(
-		task,
-		withTestDescriptorContext(context),
-	);
 }
 
 export async function executeTaskAsync(task, context) {
@@ -254,7 +218,6 @@ export function withTestDescriptorOptions(options) {
 			route: context.route,
 			resolveDescriptor: context.resolveDescriptor,
 			adapters: context.adapters,
-			...(context.orchestrator ? { orchestrator: context.orchestrator } : {}),
 			// macOS/Parallels is the sole execution backend now, so every
 			// runQueue* call through this helper runs the real provider
 			// preflight gate unless a test overrides it. The overwhelming
@@ -283,10 +246,6 @@ export function runQueue(options) {
 
 export async function runQueueAsync(options) {
 	return runQueueAsyncImpl(withTestDescriptorOptions(options));
-}
-
-export async function runQueueWithOrchestrator(options) {
-	return runQueueWithOrchestratorImpl(withTestDescriptorOptions(options));
 }
 
 export function completionReceipt(options, overrides = {}) {

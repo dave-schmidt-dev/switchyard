@@ -229,6 +229,8 @@ export {
 	hasAuthoritativeDiagnosticProvenance,
 } from "./exec-error-metadata.mjs";
 export {
+	isPersistentFailureDetails,
 	isPersistentFailureMetadata,
+	sanitizeFailureDetails,
 	sanitizeFailureMetadata,
 } from "./exec-error-sanitize.mjs";

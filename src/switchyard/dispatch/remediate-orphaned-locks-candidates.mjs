@@ -275,94 +275,15 @@ export async function resolveCandidates(dependencies = {}) {
 			} catch {
 				run = null;
 			}
-			if (
-				run !== null &&
-				(typeof run.projectPath !== "string" ||
-					resolve(run.projectPath) !== resolve(body.projectPath))
-			) {
-				descriptors.push(
-					baseDescriptor(entry, lockPath, {
-						ageMs,
-						createdAt,
-						runId: body.runId,
-						projectPath: body.projectPath,
-						category: "project-owner-mismatch",
-						reason:
-							"lock projectPath does not match its run record — manual evidence only, never touched",
-					}),
-				);
-				continue;
-			}
-			const canonicalName = projectLockFileName(body.projectPath);
-			const cwdDerivedName = cwdDerivedProjectLockFileName(body.projectPath);
-			if (run == null) {
-				descriptors.push(
-					baseDescriptor(entry, lockPath, {
-						ageMs,
-						createdAt,
-						runId: body.runId,
-						projectPath: body.projectPath,
-						category: "run-missing",
-						isCandidate: true,
-						remediationKind:
-							cwdDerivedName === entry.name
-								? "cwd-derived-project-lock"
-								: canonicalName === entry.name
-									? "project-lock"
-									: "historical-project-lock",
-						requiresInteractiveConfirmation: true,
-						reason:
-							"projectPath known from lock body; run.json no longer exists — cannot verify liveness independently, human judgment required",
-					}),
-				);
-				continue;
-			}
-
-			const cleanupFailed = run.cleanupState === "failed";
-			const cwdDerived = cwdDerivedName === entry.name;
-			const historical = canonicalName !== entry.name && !cwdDerived;
-			const stale = cleanupFailed
-				? isCleanupFailedDeadWorker(run, {
-						now,
-						...(dependencies.probePid
-							? { probePid: dependencies.probePid }
-							: {}),
-					})
-				: isRunStale(run, livenessOptions);
 			descriptors.push(
-				baseDescriptor(entry, lockPath, {
+				classifyBoundProjectLock({
+					name: entry.name,
+					path: lockPath,
+					body,
+					run,
 					ageMs,
 					createdAt,
-					runId: body.runId,
-					projectPath: body.projectPath,
-					category: cleanupFailed
-						? stale
-							? "project-lock-cleanup-failed-dead"
-							: "project-lock-cleanup-failed-retained"
-						: stale
-							? "project-lock-stale"
-							: "project-lock-live",
-					isCandidate: stale,
-					remediationKind: cwdDerived
-						? "cwd-derived-project-lock"
-						: historical
-							? "historical-project-lock"
-							: "project-lock",
-					requiresInteractiveConfirmation: cleanupFailed && stale,
-					requiresDeadWorkerRecheck: cleanupFailed && stale,
-					requiresLivenessRecheck:
-						!cleanupFailed &&
-						stale &&
-						run.state !== "succeeded" &&
-						run.state !== "failed" &&
-						run.state !== "deferred",
-					reason: stale
-						? cleanupFailed
-							? `cleanup failed, but the ${cwdDerived ? "cwd-derived" : "canonical"} project lock has a proven dead worker — interactive ownership-safe remediation may remove it`
-							: "run is stale (terminal or worker gone) — re-verified fresh at resolution time"
-						: cleanupFailed
-							? "cleanup failed but worker liveness is live, startup-grace, or indeterminate — retain the canonical lock"
-							: "run is live — must not be removed",
+					livenessOptions,
 				}),
 			);
 			continue;
@@ -455,4 +376,109 @@ export async function resolveCandidates(dependencies = {}) {
 	}
 
 	return descriptors;
+}
+
+/**
+ * Classify one post-F.1 project lock (its body names `projectPath`) against
+ * its run record. Pure: no I/O; the caller reads the run (or passes `null`
+ * when run.json is missing). Shared by the remediation scan and the
+ * acquire-time dead-holder reclaim so both apply one rule set.
+ *
+ * @param {object} input
+ * @param {string} input.name lock file name
+ * @param {string} input.path lock file path
+ * @param {{runId: string, projectPath: string}} input.body parsed lock body
+ * @param {object|null} input.run run record, or null when run.json is missing
+ * @param {number|null} [input.ageMs]
+ * @param {string|null} [input.createdAt]
+ * @param {object} [input.livenessOptions] `{ now, probePid }` for liveness
+ * @returns {object} remediation descriptor
+ */
+export function classifyBoundProjectLock({
+	name,
+	path,
+	body,
+	run,
+	ageMs = null,
+	createdAt = null,
+	livenessOptions = {},
+}) {
+	const entry = { name };
+	if (
+		run !== null &&
+		(typeof run.projectPath !== "string" ||
+			resolve(run.projectPath) !== resolve(body.projectPath))
+	) {
+		return baseDescriptor(entry, path, {
+			ageMs,
+			createdAt,
+			runId: body.runId,
+			projectPath: body.projectPath,
+			category: "project-owner-mismatch",
+			reason:
+				"lock projectPath does not match its run record — manual evidence only, never touched",
+		});
+	}
+	const canonicalName = projectLockFileName(body.projectPath);
+	const cwdDerivedName = cwdDerivedProjectLockFileName(body.projectPath);
+	if (run == null) {
+		return baseDescriptor(entry, path, {
+			ageMs,
+			createdAt,
+			runId: body.runId,
+			projectPath: body.projectPath,
+			category: "run-missing",
+			isCandidate: true,
+			remediationKind:
+				cwdDerivedName === entry.name
+					? "cwd-derived-project-lock"
+					: canonicalName === entry.name
+						? "project-lock"
+						: "historical-project-lock",
+			requiresInteractiveConfirmation: true,
+			reason:
+				"projectPath known from lock body; run.json no longer exists — cannot verify liveness independently, human judgment required",
+		});
+	}
+
+	const cleanupFailed = run.cleanupState === "failed";
+	const cwdDerived = cwdDerivedName === entry.name;
+	const historical = canonicalName !== entry.name && !cwdDerived;
+	const stale = cleanupFailed
+		? isCleanupFailedDeadWorker(run, livenessOptions)
+		: isRunStale(run, livenessOptions);
+	return baseDescriptor(entry, path, {
+		ageMs,
+		createdAt,
+		runId: body.runId,
+		projectPath: body.projectPath,
+		category: cleanupFailed
+			? stale
+				? "project-lock-cleanup-failed-dead"
+				: "project-lock-cleanup-failed-retained"
+			: stale
+				? "project-lock-stale"
+				: "project-lock-live",
+		isCandidate: stale,
+		remediationKind: cwdDerived
+			? "cwd-derived-project-lock"
+			: historical
+				? "historical-project-lock"
+				: "project-lock",
+		requiresInteractiveConfirmation: cleanupFailed && stale,
+		requiresDeadWorkerRecheck: cleanupFailed && stale,
+		requiresLivenessRecheck:
+			!cleanupFailed &&
+			stale &&
+			run.state !== "succeeded" &&
+			run.state !== "failed" &&
+			run.state !== "deferred",
+		reason: stale
+			? cleanupFailed
+				? `cleanup failed, but the ${cwdDerived ? "cwd-derived" : "canonical"} project lock has a proven dead worker — interactive ownership-safe remediation may remove it`
+				: "run is stale (terminal or worker gone) — re-verified fresh at resolution time"
+			: cleanupFailed
+				? "cleanup failed but worker liveness is live, startup-grace, or indeterminate — retain the canonical lock"
+				: "run is live — must not be removed",
+	});
 }

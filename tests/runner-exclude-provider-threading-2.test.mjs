@@ -21,19 +21,15 @@ import {
 	initializeRun,
 } from "../src/switchyard/run-store/index.mjs";
 import {
-	executeTask as executeTaskImpl,
+	executeTaskAsync as executeTaskAsyncImpl,
 	loadCheckpoint,
-	runQueueAsync as runQueueAsyncImpl,
-	runQueue as runQueueImpl,
+	runQueueAsync,
 } from "../src/switchyard/runner/index.mjs";
 import {
-	authExpiredExecution,
-	codexHealthRoute,
-	productionQueueOptions,
 	runnerTestDir,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -88,6 +84,67 @@ function writeTasksFile(content) {
 	const tasksPath = join(TEST_DIR, "tasks.md");
 	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
 	return tasksPath;
+}
+function codexHealthRoute() {
+	return {
+		provider: "codex",
+		model: "fixture-codex-standard",
+		resolvedTargetId: "codex",
+		resolved_harness: "codex",
+		requiredCapability: "standard",
+		percentLeft: 50,
+		reason: "fixture",
+	};
+}
+function authExpiredExecution() {
+	return {
+		success: false,
+		errorKind: "auth_expired",
+		diagnosticCode: "auth_expired",
+		diagnosticOrigin: "adapter",
+		diagnosticEvidenceAvailable: true,
+		failurePhase: "provider_execution",
+	};
+}
+// Async-only twin of runner-fixtures' legacyBackendFactory: the broker queue
+// honors only a backendFactory returning a full lifecycle object, so
+// synthesize one from the flat per-method stubs and pin the macOS slot here
+// instead of waiting on host admission.
+function asyncQueueBackendFactory(dependencies) {
+	return () => ({
+		readiness: () => ({ inventoryCount: 0 }),
+		ensureAgentContainer: dependencies.ensureAgentContainer ?? (() => {}),
+		create: dependencies.createWorkingContainer ?? (() => "test-container"),
+		provision: dependencies.provisionCredentials ?? (() => null),
+		seed: dependencies.seedProject ?? (() => {}),
+		commit: dependencies.commitWorkingTree ?? (() => {}),
+		reset: dependencies.resetWorkingTree ?? (() => {}),
+		captureTaskBase: dependencies.captureTaskBase ?? (() => TASK_BASE),
+		validateTaskBase:
+			dependencies.validateTaskBase ?? ((_workspaceId, base) => base),
+		releaseTaskBase: dependencies.releaseTaskBase ?? (() => {}),
+		destroy: dependencies.wipeWorkingContainer ?? (() => {}),
+		acquireSlot: () => null,
+		releaseSlot: () => {},
+		preflight:
+			dependencies.queuePreflight ?? (() => ({ ok: true, eligible: true })),
+	});
+}
+// Production descriptor resolution on purpose: health identity, roster and
+// route must agree, so no synthetic resolveDescriptor is injected here.
+function productionQueueOptions(options) {
+	const dependencies = options.dependencies ?? {};
+	return {
+		...options,
+		platform: options.platform ?? "macos",
+		dependencies: {
+			...dependencies,
+			queuePreflight:
+				dependencies.queuePreflight ?? (() => ({ ok: true, eligible: true })),
+			backendFactory:
+				dependencies.backendFactory ?? asyncQueueBackendFactory(dependencies),
+		},
+	};
 }
 afterEach(() => {
 	try {
@@ -154,7 +211,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 		};
 	}
 	async function holdCodexRoute({ healthDecision, healthStateRoot, runId }) {
-		const result = executeTaskImpl(
+		const result = await executeTaskAsyncImpl(
 			{ id: "1.1", title: "task", description: "op" },
 			{
 				route: codexHealthRoute,
@@ -163,9 +220,23 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 				recordDispatchIntent: () => {},
 				integrationGate: () => ({ success: false }),
 				adapters: {
-					codex: { execute: authExpiredExecution, captureDiff: () => null },
+					codex: {
+						execute: authExpiredExecution,
+						captureDiff: () => null,
+						executeAsync: async () => ({
+							...authExpiredExecution(),
+							diagnosticEvidence: { stdout: "", stderr: "auth expired" },
+						}),
+						captureDiffAsync: async () => null,
+					},
 				},
-				queueBackend: { captureTaskBase: () => TASK_BASE },
+				persistDiagnosticArtifact: async () => VALID_DIAGNOSTIC_REF,
+				queueBackend: {
+					captureTaskBase: () => TASK_BASE,
+					captureTaskBaseAsync: async () => TASK_BASE,
+					validateTaskBase: (_workspaceId, base) => base,
+					releaseTaskBase: () => {},
+				},
 				projectPath: TEST_DIR,
 				workingContainerName: "hold-workspace",
 				runId,
@@ -234,160 +305,149 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 	it(
 		"keeps a started enforce-mode trial fenced and skips quota fallback without lifecycle proof",
 		withQualifiedRoster(async () => {
-			for (const mode of ["sync", "async"]) {
-				const healthStateRoot = join(TEST_DIR, `trial-health-${mode}`);
-				const healthDecision = createDefaultRouteHealthDecision({
-					healthStateRoot,
-					mode: "enforce",
-					qualifiedProviders: ["codex"],
-					goldenImageReference: "golden-a",
-				});
-				const identity = await holdCodexRoute({
-					healthDecision,
-					healthStateRoot,
-					runId: `hold-run-${mode}`,
-				});
-				await attestRouteRepair({
-					...identity,
-					healthStateRoot,
-					repairKind: "auth_repaired",
-					nowMs: Date.now() + 1_000,
-				});
-				strictEqual(
-					healthDecision({ provider: "codex", requiredCapability: "standard" })
-						.trialAvailable,
-					true,
-					mode,
-				);
-				const tasksPath = writeTasksFile(`### Task 1.1: Trial without proof
+			const mode = "async";
+			const healthStateRoot = join(TEST_DIR, `trial-health-${mode}`);
+			const healthDecision = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				mode: "enforce",
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			const identity = await holdCodexRoute({
+				healthDecision,
+				healthStateRoot,
+				runId: `hold-run-${mode}`,
+			});
+			await attestRouteRepair({
+				...identity,
+				healthStateRoot,
+				repairKind: "auth_repaired",
+				nowMs: Date.now() + 1_000,
+			});
+			strictEqual(
+				healthDecision({ provider: "codex", requiredCapability: "standard" })
+					.trialAvailable,
+				true,
+				mode,
+			);
+			const tasksPath = writeTasksFile(`### Task 1.1: Trial without proof
 - **Status:** pending
 - **Executor:** switchyard
 - **Files:** src/a.mjs
 - **Description:** run the attested trial
 `);
-				const checkpointPath = `${tasksPath}.checkpoint.json`;
-				const fixture = ownedCodexQueueDependencies([
-					quotaExhaustedExecution(),
-					{ success: true, output: "ok" },
-				]);
-				fixture.dependencies.healthDecision = healthDecision;
-				const options = productionQueueOptions({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					checkpointPath,
-					runId: `trial-run-${mode}`,
-					dependencies: fixture.dependencies,
-				});
-				const result =
-					mode === "sync"
-						? runQueueImpl(options)
-						: await runQueueAsyncImpl(options);
-				strictEqual(result.results[0].success, false, mode);
-				strictEqual(result.results[0].result, "execution_failed", mode);
-				strictEqual(
-					fixture.executeCalls.length,
-					1,
-					`${mode}: a started trial never spends the quota fallback launch`,
-				);
-				deepStrictEqual(
-					loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations,
-					[],
-					mode,
-				);
-				const health = await inspectRouteHealth({
-					...identity,
-					healthStateRoot,
-				});
-				strictEqual(health.state, "half-open", mode);
-				strictEqual(
-					health.claimStatus,
-					"started",
-					`${mode}: without lifecycle proof the claim stays fenced`,
-				);
-			}
+			const checkpointPath = `${tasksPath}.checkpoint.json`;
+			const fixture = ownedCodexQueueDependencies([
+				quotaExhaustedExecution(),
+				{ success: true, output: "ok" },
+			]);
+			fixture.dependencies.healthDecision = healthDecision;
+			const options = productionQueueOptions({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				runId: `trial-run-${mode}`,
+				dependencies: fixture.dependencies,
+			});
+			const result = await runQueueAsync(options);
+			strictEqual(result.results[0].success, false, mode);
+			strictEqual(result.results[0].result, "execution_failed", mode);
+			strictEqual(
+				fixture.executeCalls.length,
+				1,
+				`${mode}: a started trial never spends the quota fallback launch`,
+			);
+			deepStrictEqual(
+				loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations,
+				[],
+				mode,
+			);
+			const health = await inspectRouteHealth({
+				...identity,
+				healthStateRoot,
+			});
+			strictEqual(health.state, "half-open", mode);
+			strictEqual(
+				health.claimStatus,
+				"started",
+				`${mode}: without lifecycle proof the claim stays fenced`,
+			);
 		}),
 	);
 	it(
 		"never claims a trial in shadow mode and leaves quota fallback untouched",
 		withQualifiedRoster(async () => {
-			for (const mode of ["sync", "async"]) {
-				const healthStateRoot = join(TEST_DIR, `shadow-trial-health-${mode}`);
-				const healthDecision = createDefaultRouteHealthDecision({
-					healthStateRoot,
-					qualifiedProviders: ["codex"],
-					goldenImageReference: "golden-a",
-				});
-				strictEqual(healthDecision.mode, "shadow", mode);
-				const identity = await holdCodexRoute({
-					healthDecision,
-					healthStateRoot,
-					runId: `shadow-hold-run-${mode}`,
-				});
-				await attestRouteRepair({
-					...identity,
-					healthStateRoot,
-					repairKind: "auth_repaired",
-					nowMs: Date.now() + 1_000,
-				});
-				strictEqual(
-					healthDecision({ provider: "codex", requiredCapability: "standard" })
-						.trialAvailable,
-					true,
-					mode,
-				);
-				const tasksPath = writeTasksFile(`### Task 1.1: Shadow trial
+			const mode = "async";
+			const healthStateRoot = join(TEST_DIR, `shadow-trial-health-${mode}`);
+			const healthDecision = createDefaultRouteHealthDecision({
+				healthStateRoot,
+				qualifiedProviders: ["codex"],
+				goldenImageReference: "golden-a",
+			});
+			strictEqual(healthDecision.mode, "shadow", mode);
+			const identity = await holdCodexRoute({
+				healthDecision,
+				healthStateRoot,
+				runId: `shadow-hold-run-${mode}`,
+			});
+			await attestRouteRepair({
+				...identity,
+				healthStateRoot,
+				repairKind: "auth_repaired",
+				nowMs: Date.now() + 1_000,
+			});
+			strictEqual(
+				healthDecision({ provider: "codex", requiredCapability: "standard" })
+					.trialAvailable,
+				true,
+				mode,
+			);
+			const tasksPath = writeTasksFile(`### Task 1.1: Shadow trial
 - **Status:** pending
 - **Executor:** switchyard
 - **Files:** src/a.mjs
 - **Description:** shadow mode must not claim the attested trial
 `);
-				// One checkpoint per mode: a shared one would hand the async run a
-				// checkpoint whose task the sync run already completed.
-				const checkpointPath = `${tasksPath}.shadow-${mode}.checkpoint.json`;
-				const fixture = ownedCodexQueueDependencies([
-					quotaExhaustedExecution(),
-					{ success: true, output: "ok" },
-				]);
-				fixture.dependencies.healthDecision = healthDecision;
-				const statusEvents = [];
-				fixture.dependencies.onStatus = (event) => statusEvents.push(event);
-				const options = productionQueueOptions({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					checkpointPath,
-					runId: `shadow-trial-run-${mode}`,
-					dependencies: fixture.dependencies,
-				});
-				const result =
-					mode === "sync"
-						? runQueueImpl(options)
-						: await runQueueAsyncImpl(options);
-				const fallbackAuthorized = mode === "async";
-				strictEqual(
-					fixture.executeCalls.length,
-					fallbackAuthorized ? 2 : 1,
-					`${mode}: shadow mode only spends a launch when durable evidence authorizes fallback`,
-				);
-				strictEqual(result.results[0].success, fallbackAuthorized, mode);
-				strictEqual(
-					loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations
-						.length,
-					fallbackAuthorized ? 1 : 0,
-					mode,
-				);
-				ok(
-					statusEvents.some(
-						(event) => event?.event === "half_open_trial_shadowed",
-					),
-					`${mode}: shadow mode reports the trial it would have claimed`,
-				);
-				const health = await inspectRouteHealth({
-					...identity,
-					healthStateRoot,
-				});
-				strictEqual(health.state, "repair-hold", mode);
-				strictEqual(health.claimStatus, null, `${mode}: no claim was written`);
-			}
+			const checkpointPath = `${tasksPath}.shadow-${mode}.checkpoint.json`;
+			const fixture = ownedCodexQueueDependencies([
+				quotaExhaustedExecution(),
+				{ success: true, output: "ok" },
+			]);
+			fixture.dependencies.healthDecision = healthDecision;
+			const statusEvents = [];
+			fixture.dependencies.onStatus = (event) => statusEvents.push(event);
+			const options = productionQueueOptions({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				runId: `shadow-trial-run-${mode}`,
+				dependencies: fixture.dependencies,
+			});
+			const result = await runQueueAsync(options);
+			strictEqual(
+				fixture.executeCalls.length,
+				2,
+				`${mode}: shadow mode only spends a launch when durable evidence authorizes fallback`,
+			);
+			strictEqual(result.results[0].success, true, mode);
+			strictEqual(
+				loadCheckpoint(checkpointPath, tasksPath).providerAttemptAllocations
+					.length,
+				1,
+				mode,
+			);
+			ok(
+				statusEvents.some(
+					(event) => event?.event === "half_open_trial_shadowed",
+				),
+				`${mode}: shadow mode reports the trial it would have claimed`,
+			);
+			const health = await inspectRouteHealth({
+				...identity,
+				healthStateRoot,
+			});
+			strictEqual(health.state, "repair-hold", mode);
+			strictEqual(health.claimStatus, null, `${mode}: no claim was written`);
 		}),
 	);
 	it(
@@ -413,7 +473,7 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			const executeCalls = [];
 			// Before the run-identity guard this threw a health schema error out
 			// of the claim path instead of returning the provider outcome.
-			const result = executeTaskImpl(
+			const result = await executeTaskAsyncImpl(
 				{ id: "1.1", title: "task", description: "op" },
 				{
 					route: codexHealthRoute,
@@ -427,10 +487,21 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 								executeCalls.push("codex");
 								return quotaExhaustedExecution();
 							},
+							executeAsync: async () => {
+								executeCalls.push("codex");
+								return quotaExhaustedExecution();
+							},
 							captureDiff: () => null,
+							captureDiffAsync: async () => null,
 						},
 					},
-					queueBackend: { captureTaskBase: () => TASK_BASE },
+					persistDiagnosticArtifact: async () => VALID_DIAGNOSTIC_REF,
+					queueBackend: {
+						captureTaskBase: () => TASK_BASE,
+						captureTaskBaseAsync: async () => TASK_BASE,
+						validateTaskBase: (_workspaceId, base) => base,
+						releaseTaskBase: () => {},
+					},
 					projectPath: TEST_DIR,
 					workingContainerName: "anonymous-workspace",
 				},

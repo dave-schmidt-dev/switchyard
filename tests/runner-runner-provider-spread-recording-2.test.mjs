@@ -1,4 +1,4 @@
-import { deepStrictEqual, notStrictEqual, strictEqual } from "node:assert";
+import { notStrictEqual, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,7 +13,6 @@ import {
 	executeTask,
 	runnerTestDir,
 	runQueue,
-	runQueueWithOrchestrator,
 	withExplicitSwitchyardExecutor,
 } from "./helpers/runner-fixtures.mjs";
 
@@ -78,130 +77,6 @@ afterEach(() => {
 	}
 });
 describe("runner provider spread recording", { concurrency: false }, () => {
-	it("uses headroom routing to split providers across tasks", async () => {
-		const tasksPath = writeTasksFile(`## Phase 1
-
-### Task 1.1: First task
-- **Status:** pending
-- **Type:** implementation
-- **Files:** src/switchyard/runner/index.mjs
-- **Description:** integration task one
-
-### Task 1.2: Second task
-- **Status:** pending
-- **Type:** implementation
-- **Files:** src/switchyard/runner/index.mjs
-- **Description:** integration task two
-`);
-		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const dispatches = [];
-		// Isolated per-test temp snapshot, not the real shared SNAPSHOT_PATH: this
-		// test intentionally exercises the real, unmocked route() (no
-		// dependencies.route override below), and the split router suites also
-		// exercise the real loader concurrently in their own processes. Both used to
-		// read/write/rm the SAME on-disk SNAPSHOT_PATH (the host-side gradus
-		// snapshot), which raced under `node --test`'s concurrent-file execution.
-		// The env var is read dynamically by resolveSnapshotPath() in
-		// src/switchyard/router/index.mjs, so pointing it at a unique file here
-		// redirects the real readSnapshot() without touching production callers.
-		const snapshotPath = join(
-			tmpdir(),
-			`switchyard-runner-test-headroom-${process.pid}-${randomUUID()}.json`,
-		);
-		let launchIndex = 0;
-
-		const writeSnapshot = (claudePercentLeft, codexPercentLeft) => {
-			writeFileSync(
-				snapshotPath,
-				JSON.stringify({
-					schema_version: 2,
-					providers: [
-						{
-							name: "claude",
-							ok: true,
-							windows: [{ percent_left: claudePercentLeft, pace_delta: 100 }],
-						},
-						{
-							name: "codex",
-							ok: true,
-							windows: [{ percent_left: codexPercentLeft, pace_delta: 100 }],
-						},
-					],
-				}),
-				"utf8",
-			);
-		};
-
-		const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
-		process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = snapshotPath;
-		const previousRosterPath = process.env.SWITCHYARD_ROSTER_PATH;
-		const qualifiedRosterPath = writeDispatchQualifiedRosterFixture();
-		process.env.SWITCHYARD_ROSTER_PATH = qualifiedRosterPath;
-		__resetRosterCacheForTests();
-
-		try {
-			writeSnapshot(72, 60);
-
-			await runQueueWithOrchestrator({
-				tasksFilePath: tasksPath,
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-				checkpointPath,
-				dependencies: {
-					goldenImageVerifiedProviders: ["claude", "codex"],
-					recordDispatch: (entry) => {
-						dispatches.push(entry);
-						if (dispatches.length === 1) {
-							writeSnapshot(4, 68);
-						}
-					},
-					integrationGate: () => ({ success: true, message: "ok" }),
-					sleepFn: async () => {},
-					orchestrator: {
-						launch: async () => {
-							launchIndex += 1;
-							return `job-${launchIndex}`;
-						},
-						status: async () => ({ state: "done" }),
-						result: async () => ({ success: true, diff: "" }),
-					},
-				},
-			});
-
-			deepStrictEqual(
-				dispatches.map((entry) => entry.provider),
-				["claude", "codex"],
-			);
-			// Assert the mechanism, not just the outcome sequence: the first
-			// dispatch picks claude specifically because it has more headroom
-			// (72 > 60) via spread selection, and the second picks codex
-			// specifically because claude's headroom then dropped to 4% —
-			// below DEFAULT_FLOOR (5.0) — excluding it, not because provider
-			// selection happened to differ for some unrelated reason.
-			strictEqual(dispatches[0].reason, "spread");
-			strictEqual(dispatches[0].percentLeft, 72);
-			strictEqual(dispatches[1].reason, "spread");
-			strictEqual(dispatches[1].percentLeft, 68);
-		} finally {
-			if (previousOverride === undefined) {
-				delete process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
-			} else {
-				process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE = previousOverride;
-			}
-			if (previousRosterPath === undefined) {
-				delete process.env.SWITCHYARD_ROSTER_PATH;
-			} else {
-				process.env.SWITCHYARD_ROSTER_PATH = previousRosterPath;
-			}
-			__resetRosterCacheForTests();
-			try {
-				rmSync(snapshotPath, { force: true });
-				rmSync(qualifiedRosterPath, { force: true });
-			} catch {
-				// ignore cleanup errors
-			}
-		}
-	});
 	it("never dispatches to a roster provider with no adapter, even with the most headroom", async () => {
 		// Regression: vibe/agy/cursor/copilot are in the roster but only
 		// claude/codex have adapters wired here. Before the availableProviders

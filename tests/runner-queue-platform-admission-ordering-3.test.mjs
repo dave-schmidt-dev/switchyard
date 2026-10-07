@@ -1,4 +1,4 @@
-import { deepStrictEqual, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,11 +6,11 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
-import { runQueue as runQueueImpl } from "../src/switchyard/runner/index.mjs";
+import { runQueueAsync as runQueueAsyncImpl } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -33,7 +33,7 @@ afterEach(() => {
 	}
 });
 describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
-	it("formats a closed provider reason in the preflight failure", () => {
+	it("formats a closed provider reason in the preflight failure", async () => {
 		const events = [];
 		const rosterPath = join(
 			tmpdir(),
@@ -58,44 +58,43 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			);
 			process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
 			__resetRosterCacheForTests();
-			throws(
-				() =>
-					runQueueImpl({
-						tasksFilePath: tasksPath,
-						projectPath: TEST_DIR,
-						platform: "macos",
-						dependencies: {
-							backendFactory: () => ({
-								create: () => {
-									events.push("create");
-									return "vm";
-								},
-								seed: () => {},
-								commit: () => {},
-								reset: () => {},
-								destroy: () => {},
-								acquireSlot: () => events.push("acquire"),
-							}),
-							adapters: { claude: {} },
-							goldenImageVerifiedProviders: ["claude"],
-							preflightReadSnapshot: () => ({
-								snapshot: {
-									schema_version: 2,
-									updated_at: new Date().toISOString(),
-									providers: [
-										{
-											name: "claude",
-											ok: true,
-											windows: [{ percent_left: 80, pace_delta: 1 }],
-										},
-									],
-								},
-								snapshotStatus: "fresh",
-								snapshotMtime: 1,
-								snapshotAgeMsAtRoute: 0,
-							}),
-						},
-					}),
+			await rejects(
+				runQueueAsyncImpl({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "macos",
+					dependencies: {
+						backendFactory: () => ({
+							create: () => {
+								events.push("create");
+								return "vm";
+							},
+							seed: () => {},
+							commit: () => {},
+							reset: () => {},
+							destroy: () => {},
+							acquireSlot: () => events.push("acquire"),
+						}),
+						adapters: { claude: {} },
+						goldenImageVerifiedProviders: ["claude"],
+						preflightReadSnapshot: () => ({
+							snapshot: {
+								schema_version: 2,
+								updated_at: new Date().toISOString(),
+								providers: [
+									{
+										name: "claude",
+										ok: true,
+										windows: [{ percent_left: 80, pace_delta: 1 }],
+									},
+								],
+							},
+							snapshotStatus: "fresh",
+							snapshotMtime: 1,
+							snapshotAgeMsAtRoute: 0,
+						}),
+					},
+				}),
 				(error) => {
 					strictEqual(error.name, "QueuePreflightError");
 					strictEqual(
@@ -116,7 +115,7 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 		}
 		deepStrictEqual(events, []);
 	});
-	it("keeps provider exclusion and reason lists in sorted order", () => {
+	it("keeps provider exclusion and reason lists in sorted order", async () => {
 		const events = [];
 		const rosterPath = join(
 			tmpdir(),
@@ -141,51 +140,50 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			);
 			process.env.SWITCHYARD_ROSTER_PATH = rosterPath;
 			__resetRosterCacheForTests();
-			throws(
-				() =>
-					runQueueImpl({
-						tasksFilePath: tasksPath,
-						projectPath: TEST_DIR,
-						platform: "macos",
-						dependencies: {
-							backendFactory: () => ({
-								create: () => {
-									events.push("create");
-									return "vm";
-								},
-								seed: () => {},
-								commit: () => {},
-								reset: () => {},
-								destroy: () => {},
-								acquireSlot: () => events.push("acquire"),
-							}),
-							adapters: { claude: {}, codex: {} },
-							goldenImageVerifiedProviders: ["claude", "codex"],
-							preflightReadSnapshot: () => ({
-								snapshot: {
-									schema_version: 2,
-									updated_at: new Date().toISOString(),
-									// Deliberately reverse alphabetical order. Both lists must
-									// use the stable sorted presentation order.
-									providers: [
-										{
-											name: "codex",
-											ok: true,
-											windows: [{ percent_left: 80, pace_delta: 1 }],
-										},
-										{
-											name: "claude",
-											ok: true,
-											windows: [{ percent_left: 80, pace_delta: 1 }],
-										},
-									],
-								},
-								snapshotStatus: "fresh",
-								snapshotMtime: 1,
-								snapshotAgeMsAtRoute: 0,
-							}),
-						},
-					}),
+			await rejects(
+				runQueueAsyncImpl({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					platform: "macos",
+					dependencies: {
+						backendFactory: () => ({
+							create: () => {
+								events.push("create");
+								return "vm";
+							},
+							seed: () => {},
+							commit: () => {},
+							reset: () => {},
+							destroy: () => {},
+							acquireSlot: () => events.push("acquire"),
+						}),
+						adapters: { claude: {}, codex: {} },
+						goldenImageVerifiedProviders: ["claude", "codex"],
+						preflightReadSnapshot: () => ({
+							snapshot: {
+								schema_version: 2,
+								updated_at: new Date().toISOString(),
+								// Deliberately reverse alphabetical order. Both lists must
+								// use the stable sorted presentation order.
+								providers: [
+									{
+										name: "codex",
+										ok: true,
+										windows: [{ percent_left: 80, pace_delta: 1 }],
+									},
+									{
+										name: "claude",
+										ok: true,
+										windows: [{ percent_left: 80, pace_delta: 1 }],
+									},
+								],
+							},
+							snapshotStatus: "fresh",
+							snapshotMtime: 1,
+							snapshotAgeMsAtRoute: 0,
+						}),
+					},
+				}),
 				(error) => {
 					strictEqual(error.name, "QueuePreflightError");
 					strictEqual(

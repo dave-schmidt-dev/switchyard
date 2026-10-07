@@ -143,10 +143,6 @@ describe("broker async executor", () => {
 				import.meta.url,
 			),
 			new URL("../src/switchyard/runner/execute-task.mjs", import.meta.url),
-			new URL(
-				"../src/switchyard/runner/execute-orchestrator-unsafe.mjs",
-				import.meta.url,
-			),
 			new URL("../src/switchyard/runner/queue-preflight.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/queue-backend.mjs", import.meta.url),
 			new URL("../src/switchyard/runner/queue-launch.mjs", import.meta.url),
@@ -173,14 +169,6 @@ describe("broker async executor", () => {
 			),
 			new URL(
 				"../src/switchyard/runner/run-queue-terminal.mjs",
-				import.meta.url,
-			),
-			new URL(
-				"../src/switchyard/runner/run-queue-orchestrator-impl.mjs",
-				import.meta.url,
-			),
-			new URL(
-				"../src/switchyard/runner/run-queue-orchestrator-core.mjs",
 				import.meta.url,
 			),
 		);

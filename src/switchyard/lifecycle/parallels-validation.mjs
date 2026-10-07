@@ -450,10 +450,6 @@ export function markerIdentity(workspaceId, cleanupContext = {}) {
 	return {
 		operation,
 		payload,
-		// No qualified guest birth-identity probe exists in this source scope.
-		// The host supervisor identity still fences marker names, but it never
-		// upgrades a guest PID into signaling authority.
-		strongStart: false,
 		token: createHash("sha256").update(payload).digest("hex"),
 	};
 }

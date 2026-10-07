@@ -40,6 +40,19 @@ import {
 } from "./task-base.mjs";
 import { decorateDirtyOverlayResult } from "./task-routing.mjs";
 
+function providerTimeoutCloneRetiredHalt(result) {
+	return {
+		taskId: result.taskId,
+		success: false,
+		provider: result.provider ?? null,
+		model: result.model ?? null,
+		result: "halted_after_provider_timeout",
+		errorKind: "provider_timeout_clone_retired",
+		reason: "provider timeout retired the VM clone; recovery required",
+		cleanupStage: result.cleanupStage ?? null,
+	};
+}
+
 export async function runQueueAsyncLoop(scope, queueState) {
 	const {
 		checkpoint,
@@ -421,6 +434,11 @@ export async function runQueueAsyncLoop(scope, queueState) {
 		dependencies.onCheckpointSaved?.(checkpoint);
 		let haltResult =
 			result.cleanupFailed === true ? providerCleanupHalt(result) : null;
+		// A VM-lane timeout or cancel with confirmed cleanup still leaves the
+		// provider potentially running in the guest: the clone is retired and
+		// no later task may reuse it, so halt before any guest write.
+		if (!haltResult && result.timeoutDiff === "unavailable_destroy_only")
+			haltResult = providerTimeoutCloneRetiredHalt(result);
 		if (!haltResult)
 			haltResult = commitOrResetWorkingContainer(result, {
 				ownsWorkingContainer,

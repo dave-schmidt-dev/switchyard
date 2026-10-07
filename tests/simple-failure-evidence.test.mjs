@@ -151,7 +151,8 @@ test("scope rejection reports the offending undeclared paths", async () => {
 		{},
 		async ({ worktreePath }) => {
 			writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
-			writeFileSync(join(worktreePath, "extra.txt"), "extra\n");
+			// Task 3.5: a plain undeclared source edit is now kept; a .sh manifest stays refused.
+			writeFileSync(join(worktreePath, "extra.sh"), "extra\n");
 			return { success: true, writerLifecycle: "stopped" };
 		},
 		{ runCheck: stubbedCheck },
@@ -159,7 +160,7 @@ test("scope rejection reports the offending undeclared paths", async () => {
 	strictEqual(result.status, "failed");
 	strictEqual(result.failureReason, "undeclared_paths_changed");
 	strictEqual(result.diffRejection.rule, "undeclared_paths_changed");
-	ok(result.diffRejection.paths.includes("extra.txt"));
+	ok(result.diffRejection.paths.includes("extra.sh"));
 	ok(result.diffRejection.paths.length <= 5);
 });
 

@@ -386,6 +386,10 @@ test("integrated failed probe consumes no trial, recorder or provider and persis
 	const frozenSanitizer = await import(
 		pathToFileURL(join(frozenRoot, "src/switchyard/adapter/exec-error.mjs"))
 	);
+	strictEqual(
+		run.failureDetails.failureReason,
+		"launcher_environment_unavailable",
+	);
 	deepStrictEqual(
 		frozenSanitizer.sanitizeFailureMetadata({
 			result: "execution_failed",

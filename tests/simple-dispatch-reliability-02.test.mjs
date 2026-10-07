@@ -232,8 +232,9 @@ describe("simple local execution path", () => {
 							"provider a\n",
 							"utf8",
 						);
+						// Task 3.5: a plain undeclared source edit is now kept; a .sh manifest stays refused.
 						writeFileSync(
-							join(worktreePath, "src", "b.txt"),
+							join(worktreePath, "src", "b.sh"),
 							"provider b\n",
 							"utf8",
 						);

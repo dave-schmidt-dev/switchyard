@@ -1,24 +1,11 @@
 /** Pure classifier: maps an attempt result to a severity bucket. No I/O. */
 
-const BASELINE_CODES = new Set([
-	"baseline_check_failed",
-	"baseline_mutation",
-	"check_dependencies_unverified",
-]);
-const HARD_CODES = new Set(["run_store_write_failed", "project_lock_failed"]);
-// Untyped results carry these in failureReason/errorKind instead of a diagnostic.
-const HARD_UNTYPED = new Set([
-	...HARD_CODES,
-	"cleanup_failed",
-	"provider_cleanup_failed",
-	"provider_cancelled",
-	"cancelled",
-]);
-const CHECK_CODES = new Set([
-	"acceptance_check_failed",
-	"acceptance_check_timeout",
-	"check_repair_failed",
-]);
+import {
+	BASELINE_CODES,
+	CHECK_CODES,
+	HARD_CODES,
+	HARD_UNTYPED,
+} from "../diagnostics/failure-registry.mjs";
 
 /**
  * Classify a single attempt failure into a severity bucket.
@@ -40,6 +27,23 @@ export function classifyAttemptFailure({ result, accountability }) {
 	const failurePhase = result?.failurePhase;
 	const errorKind = result?.errorKind;
 	const failureReason = result?.failureReason;
+
+	// Rule 0 — Task 2.7: a dependency refusal after the provider is a hard
+	// check fact, never a host baseline fault.
+	if (
+		failurePhase === "checks" &&
+		[causeCode, failureReason].some(
+			(code) =>
+				code === "check_dependencies_unverified" ||
+				code === "check_manifest_changed_by_diff",
+		)
+	) {
+		return Object.freeze({
+			severity: "hard",
+			reason: "unsafe_failure",
+			salvageable: false,
+		});
+	}
 
 	// Rule 1 — baseline: not evidence against the target provider
 	if (

@@ -25,7 +25,6 @@ import {
 	executeTask as executeTaskImpl,
 	loadCheckpoint,
 	runQueue as runQueueImpl,
-	runQueueWithOrchestrator as runQueueWithOrchestratorImpl,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	authExpiredExecution,
@@ -415,60 +414,6 @@ describe("--exclude-provider threading (context.exclude -> route)", () => {
 			]);
 			strictEqual(syncTerminal.terminalSummary.failedCount, 0);
 			strictEqual(syncTerminal.lastFailure, undefined);
-
-			const orchestratorTasksPath =
-				writeTasksFile(`### Task 2.1: Deferred orchestrator
-- **Status:** pending
-- **Executor:** switchyard
-- **Files:** src/a.mjs
-- **Description:** deferred orchestrator task
-`);
-			const orchestratorCheckpointPath = `${orchestratorTasksPath}.orchestrator.checkpoint.json`;
-			const orchestratorRunStoreCalls = [];
-			const orchestratorLaunches = [];
-			const orchestratorFixture = ownedCodexQueueDependencies([]);
-			orchestratorFixture.dependencies.healthDecision = healthDecision;
-			orchestratorFixture.dependencies.runStore = {
-				updateRun: (partial) => {
-					orchestratorRunStoreCalls.push({ ...partial });
-					return Promise.resolve({ revision: 0 });
-				},
-			};
-			orchestratorFixture.dependencies.orchestrator = {
-				launch: async () => {
-					orchestratorLaunches.push(true);
-					return "must-not-launch";
-				},
-				status: async () => ({ state: "done" }),
-				result: async () => ({ success: true, diff: "" }),
-			};
-			const orchestratorResult = await runQueueWithOrchestratorImpl(
-				productionQueueOptions({
-					tasksFilePath: orchestratorTasksPath,
-					projectPath: TEST_DIR,
-					workingContainerName: "claim-contention-orchestrator",
-					checkpointPath: orchestratorCheckpointPath,
-					runId: "claim-contention-orchestrator-run",
-					dependencies: orchestratorFixture.dependencies,
-				}),
-			);
-			deepStrictEqual(orchestratorLaunches, []);
-			deepStrictEqual(orchestratorResult.results, []);
-			deepStrictEqual(orchestratorResult.completedTaskIds, []);
-			deepStrictEqual(orchestratorResult.deferredTaskIds, ["2.1"]);
-			const orchestratorTerminal = orchestratorRunStoreCalls.find(
-				(call) => call.state !== undefined,
-			);
-			strictEqual(orchestratorTerminal.state, "deferred");
-			deepStrictEqual(
-				orchestratorTerminal.terminalSummary.completedTaskIds,
-				[],
-			);
-			deepStrictEqual(orchestratorTerminal.terminalSummary.deferredTaskIds, [
-				"2.1",
-			]);
-			strictEqual(orchestratorTerminal.terminalSummary.failedCount, 0);
-			strictEqual(orchestratorTerminal.lastFailure, undefined);
 		}),
 	);
 });

@@ -328,7 +328,8 @@ describe("simple local execution path", () => {
 						"provider\n",
 						"utf8",
 					);
-					writeFileSync(join(worktreePath, "other.txt"), "extra\n", "utf8");
+					// Task 3.5: a plain undeclared source edit is now kept; a .sh manifest stays refused.
+					writeFileSync(join(worktreePath, "other.sh"), "extra\n", "utf8");
 					return { success: true, writerLifecycle: "stopped" };
 				},
 			}),
@@ -339,6 +340,6 @@ describe("simple local execution path", () => {
 			readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
 			"base\n",
 		);
-		ok(!existsSync(join(repo.projectPath, "other.txt")));
+		ok(!existsSync(join(repo.projectPath, "other.sh")));
 	});
 });

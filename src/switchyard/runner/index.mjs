@@ -3,7 +3,6 @@ import { reportCheckpointReleaseFailure } from "./checkpoint-load.mjs";
 import { CHECKPOINT_VERSION } from "./constants.mjs";
 import { runQueueAsyncImpl } from "./run-queue-async-impl.mjs";
 import { runQueueImpl } from "./run-queue-impl.mjs";
-import { runQueueWithOrchestratorImpl } from "./run-queue-orchestrator-impl.mjs";
 
 export { createBrokerAdapterLauncher } from "./broker.mjs";
 export { invalidCompletedQuickCheckTaskIds } from "./checks.mjs";
@@ -16,7 +15,6 @@ export {
 	sanitizeQueuePreflightDetail,
 } from "./queue-preflight.mjs";
 export { integrationFailureMetadata } from "./retry-transitions.mjs";
-export { executeTaskWithOrchestrator } from "./run-queue-orchestrator-impl.mjs";
 
 export async function runQueueAsync(options) {
 	let failed = true;
@@ -33,17 +31,6 @@ export function runQueue(options) {
 	let failed = true;
 	try {
 		const result = runQueueImpl(options);
-		failed = false;
-		return result;
-	} finally {
-		if (failed) reportCheckpointReleaseFailure(options);
-	}
-}
-
-export async function runQueueWithOrchestrator(options) {
-	let failed = true;
-	try {
-		const result = await runQueueWithOrchestratorImpl(options);
 		failed = false;
 		return result;
 	} finally {
@@ -102,8 +89,6 @@ export {
 	QUEUE_PLATFORMS,
 } from "./constants.mjs";
 export {
-	createCliOrchestrator,
-	resolveOrchestrator,
 	writeDispatchIntent,
 	writeDispatchIntentAsync,
 } from "./ledger-reporting.mjs";
@@ -122,9 +107,5 @@ export {
 	parseTaskQueue,
 	validateTaskGraph,
 } from "./task-queue.mjs";
-export {
-	findIgnoredDeclaredPath,
-	parseExpectedBy,
-	waitForJobCompletion,
-} from "./task-routing.mjs";
+export { findIgnoredDeclaredPath } from "./task-routing.mjs";
 export { CHECKPOINT_VERSION };

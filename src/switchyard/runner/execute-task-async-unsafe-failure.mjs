@@ -23,9 +23,18 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 		resolvedTargetId,
 		routeResult,
 	} = scope;
+	// A backend that owns provider-process cleanup (the VM lane) no longer
+	// proves the provider died on a timeout or cancel: guest cleanup is
+	// deferred to the workspace destroy, so nothing may read the guest
+	// workspace afterwards and the partial diff is unavailable by
+	// construction rather than by probe.
+	const vmCloneRetired =
+		typeof context.executionBackend?.cleanupProviderProcess === "function" &&
+		(execution.timedOut === true ||
+			execution.diagnosticCode === "execution_cancelled");
 	if (!execution.timedOut) {
 		let captureEvidence = null;
-		if (retainsFailureDiff(task)) {
+		if (retainsFailureDiff(task) && !vmCloneRetired) {
 			context.onStatus?.({
 				phase: "execution",
 				event: "diff_capture_started",
@@ -76,6 +85,7 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 				? { providerReliability: execution.providerReliability }
 				: {}),
 			...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
+			...(vmCloneRetired ? { timeoutDiff: "unavailable_destroy_only" } : {}),
 			...reviewFailureFields(task, execution),
 			...survivingProviderFields(execution),
 		});
@@ -102,6 +112,7 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 				? { providerReliability: execution.providerReliability }
 				: {}),
 			...(captureEvidence ? { captureStatus: captureEvidence.status } : {}),
+			...(vmCloneRetired ? { timeoutDiff: "unavailable_destroy_only" } : {}),
 			...reviewFailureFields(task, execution),
 			...survivingProviderFields(execution),
 			...(captureEvidence?.diff ? { partialDiff: captureEvidence.diff } : {}),
@@ -109,7 +120,7 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 	}
 
 	let captureEvidence = null;
-	if (retainsFailureDiff(task)) {
+	if (retainsFailureDiff(task) && !vmCloneRetired) {
 		context.onStatus?.({
 			phase: "execution",
 			event: "diff_capture_started",
@@ -193,6 +204,7 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 			: {}),
 		reason: error ?? routeResult.reason,
 		...(captureStatus ? { captureStatus } : {}),
+		...(vmCloneRetired ? { timeoutDiff: "unavailable_destroy_only" } : {}),
 		...reviewFailureFields(task, execution),
 		diagnosticCode:
 			safeTimeoutFailure?.diagnosticCode ?? execution.diagnosticCode,
@@ -239,6 +251,7 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 			? { providerReliability: execution.providerReliability }
 			: {}),
 		...(captureStatus ? { captureStatus } : {}),
+		...(vmCloneRetired ? { timeoutDiff: "unavailable_destroy_only" } : {}),
 		...reviewFailureFields(task, execution),
 		...survivingProviderFields(execution),
 		...(partialDiff ? { partialDiff } : {}),

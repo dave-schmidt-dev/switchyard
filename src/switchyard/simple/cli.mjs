@@ -1,6 +1,8 @@
 import { parseSimpleArgs, SIMPLE_USAGE, SimpleUsageError } from "./args.mjs";
+import { appendFailureRecord } from "./failure-log.mjs";
 import { runSimpleTask } from "./index.mjs";
 import { recoveryUnavailable } from "./recovery.mjs";
+import { handleSimpleCancel } from "./routing-cli.mjs";
 import { runSimpleRoutingTask } from "./routing-run.mjs";
 export async function handleSimple(argv, dependencies = {}) {
 	const now = dependencies.now ?? Date.now;
@@ -41,6 +43,10 @@ export async function handleSimple(argv, dependencies = {}) {
 	let result;
 	try {
 		try {
+			if (argv[0] === "cancel") {
+				await handleSimpleCancel(argv.slice(1), dependencies);
+				return;
+			}
 			const options = parseSimpleArgs(argv, { now });
 			if (options.help) {
 				console.log(SIMPLE_USAGE);
@@ -107,6 +113,11 @@ export async function handleSimple(argv, dependencies = {}) {
 					.replace(/[\p{Cc}]/gu, "")
 					.slice(0, 300);
 				writeStderr(`switchyard simple: ${usageError}\n`);
+				if (
+					typeof error?.code === "string" &&
+					/^[A-Za-z_]{1,64}$/.test(error.code)
+				)
+					preflightCode = error.code;
 			} else {
 				const safeCode =
 					typeof error?.code === "string" &&
@@ -140,10 +151,28 @@ export async function handleSimple(argv, dependencies = {}) {
 				failureReason: isUsage ? "invalid_invocation" : "preflight_failed",
 				failurePhase: "preflight",
 				errorKind: isUsage ? "validation_failed" : "unclassified_failure",
-				...(isUsage ? { usageError } : { preflightCode }),
+				...(isUsage ? { usageError } : {}),
+				...(preflightCode ? { preflightCode } : {}),
 				partialWorktree: null,
 				recovery: recoveryUnavailable(),
 			};
+			// The invocation never reached the engine, so the failure log is the
+			// only durable trace. Best effort: an unavailable log must never
+			// change the invocation outcome.
+			try {
+				appendFailureRecord(
+					{
+						recordType: "invocation",
+						reason: isUsage ? "invalid_invocation" : "preflight_failed",
+						failurePhase: "preflight",
+						errorKind: isUsage ? "validation_failed" : "unclassified_failure",
+						preflightCode:
+							preflightCode ?? (isUsage ? "invalid_invocation" : null),
+						...(usageError ? { usageError: usageError.slice(0, 256) } : {}),
+					},
+					{ stateRoot: dependencies.stateRoot },
+				);
+			} catch {}
 		}
 		(dependencies.writeResult ?? console.log)(JSON.stringify(result));
 		if (

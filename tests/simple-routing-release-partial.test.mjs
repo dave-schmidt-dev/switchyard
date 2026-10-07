@@ -82,7 +82,7 @@ function recordPartial(stateRoot, project, pending, partialWorktree) {
 	handle.release();
 }
 
-function fixture({ writerStopped = true } = {}) {
+function fixture({ writerStopped = true, worktreeChild = false } = {}) {
 	const project = realpathSync(tempDir("release-partial-project-"));
 	const stateRoot = realpathSync(tempDir("release-partial-state-"));
 	const parent = realpathSync(tempDir("release-partial-parent-"));
@@ -100,7 +100,11 @@ function fixture({ writerStopped = true } = {}) {
 		capability: "standard",
 		startedAt: new Date().toISOString(),
 	};
-	recordPartial(stateRoot, project, pending, root);
+	// Production records the claim root while routing state records the
+	// clone at `<root>/worktree`.
+	const partial = worktreeChild ? join(root, "worktree") : root;
+	if (worktreeChild) mkdirSync(partial, { mode: 0o700 });
+	recordPartial(stateRoot, project, pending, partial);
 	return {
 		project,
 		stateRoot,
@@ -315,6 +319,42 @@ test("a release lets the next invocation pass the partial_work_retained guard", 
 	const resumed = await runSimpleRoutingTask(options, deps);
 	strictEqual(resumed.stopReason !== "partial_work_retained", true);
 	strictEqual(engineCalls, 1);
+});
+
+test("a root claim releases its <root>/worktree partial (production shape)", async () => {
+	const f = fixture({ worktreeChild: true });
+	const quarantine = simpleQuarantinePath(f.claim.nonce);
+	quarantines.add(quarantine);
+	let output;
+	await handleRoutingRun([...f.argv, "--discard"], {
+		...f.deps,
+		writeResult: (value) => {
+			output = JSON.parse(value);
+		},
+	});
+	strictEqual(output.released, true);
+	strictEqual(output.discarded, true);
+	strictEqual(output.path, join(f.root, "worktree"));
+	strictEqual(existsSync(f.root), false);
+	strictEqual(existsSync(quarantine), false);
+	strictEqual(readState(f).attempts[0].partialWorktree, null);
+});
+
+test("a claim whose root is not the partial or its worktree parent is refused", async () => {
+	const f = fixture({ worktreeChild: true });
+	const before = readState(f);
+	await rejects(
+		handleRoutingRun([...f.argv, "--discard"], {
+			...f.deps,
+			readRun: async () => ({
+				...f.record,
+				worktree: { ...f.claim, path: join(f.root, "worktree", "worktree") },
+			}),
+		}),
+		{ code: "partial_worktree_claim_mismatch" },
+	);
+	strictEqual(existsSync(f.root), true);
+	deepStrictEqual(readState(f), before);
 });
 
 test("a claim mismatch is refused without changing routing state", async () => {

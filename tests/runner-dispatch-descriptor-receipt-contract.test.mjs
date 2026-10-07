@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -8,7 +8,6 @@ import {
 } from "../src/switchyard/runner/index.mjs";
 import {
 	executeTask,
-	executeTaskWithOrchestrator,
 	runnerTestDir,
 	runQueue,
 	testDescriptor,
@@ -271,97 +270,5 @@ describe("dispatch descriptor receipt contract", () => {
 		});
 		strictEqual(result.results[0].result, "intent_receipt_failed");
 		strictEqual(executions, 0);
-	});
-	it("writes the orchestrator intent before launch and blocks launch on failure", async () => {
-		const descriptor = testDescriptor();
-		const events = [];
-		const base = {
-			route: () => ({
-				provider: "claude",
-				model: "claude-sonnet-5",
-				resolvedTargetId: "claude",
-				resolved_harness: "claude",
-			}),
-			resolveDescriptor: () => descriptor,
-			recordDispatch: () => {},
-			workingContainerName: "fake-container",
-			projectPath: TEST_DIR,
-			pollIntervalMs: 1,
-			maxPolls: 1,
-			sleepFn: async () => {},
-			integrationGate: () => ({ success: true }),
-			adapters: { claude: {} },
-		};
-		const success = await executeTaskWithOrchestrator(
-			{ id: "1.4", title: "task", description: "work" },
-			{
-				...base,
-				recordDispatchIntent: () => events.push("intent"),
-				orchestrator: {
-					launch: async () => {
-						events.push("launch");
-						return "job-1";
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: null }),
-				},
-			},
-		);
-		strictEqual(success.success, true);
-		deepStrictEqual(events, ["intent", "launch"]);
-
-		let launched = false;
-		const blocked = await executeTaskWithOrchestrator(
-			{ id: "1.5", title: "task", description: "work" },
-			{
-				...base,
-				recordDispatchIntent: () => {
-					const error = new Error("EPERM: /private/host/path");
-					error.code = "EPERM";
-					throw error;
-				},
-				orchestrator: {
-					launch: async () => {
-						launched = true;
-						return "job-2";
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: null }),
-				},
-			},
-		);
-		strictEqual(blocked.result, "intent_receipt_failed");
-		strictEqual(launched, false);
-	});
-	it("fails before orchestrator launch when the task-base probe exhausts its budget", async () => {
-		let launches = 0;
-		const statuses = [];
-		const result = await executeTaskWithOrchestrator(
-			{ id: "1.6", title: "task", description: "work" },
-			{
-				route: () => ({ provider: "claude", model: "test-model" }),
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				workingContainerName: "worker",
-				projectPath: TEST_DIR,
-				adapters: { claude: {} },
-				queueBackend: {
-					beforeRun: () => {},
-					captureTaskBaseAsync: async () => {
-						throw new Error("task base probe deadline exhausted");
-					},
-				},
-				onStatus: (status) => statuses.push(status),
-				orchestrator: {
-					launch: async () => {
-						launches += 1;
-						return "job";
-					},
-				},
-			},
-		);
-		strictEqual(result.result, "task_base_capture_failed");
-		strictEqual(launches, 0);
-		ok(statuses.some(({ event }) => event === "task_base_failed"));
 	});
 });

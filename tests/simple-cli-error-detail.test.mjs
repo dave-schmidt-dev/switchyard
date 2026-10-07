@@ -8,6 +8,10 @@ import { SimpleUsageError } from "../src/switchyard/simple/args.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
+// handleSimple writes invocation failure records; keep them out of the real
+// state root.
+process.env.SWITCHYARD_RUN_STORE_ROOT ??= tempDir("simple-cli-state-");
+
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 

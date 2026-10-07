@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
 import {
 	mkdirSync,
 	readFileSync,
@@ -11,11 +11,18 @@ import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import {
 	getRunnableTasks,
-	runQueue as runQueueImpl,
+	parseTaskQueue,
+	runQueueAsync,
 } from "../src/switchyard/runner/index.mjs";
-import { parseFixture, runnerTestDir } from "./helpers/runner-fixtures.mjs";
+import {
+	runnerTestDir,
+	withExplicitSwitchyardExecutor,
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
+function parseFixture(markdown) {
+	return parseTaskQueue(withExplicitSwitchyardExecutor(markdown));
+}
 afterEach(() => {
 	try {
 		rmSync(TEST_DIR, { recursive: true, force: true });
@@ -339,7 +346,7 @@ describe("runner queue parsing", () => {
 			}
 		}
 	});
-	it("validates Files entries against the project before backend preflight", () => {
+	it("validates Files entries against the project before backend preflight", async () => {
 		const root = join(TEST_DIR, "files-contract");
 		mkdirSync(join(root, "existing-dir"), { recursive: true });
 		mkdirSync(join(root, "outside"), { recursive: true });
@@ -361,7 +368,7 @@ describe("runner queue parsing", () => {
 			);
 			let preflightCalls = 0;
 			const invoke = () =>
-				runQueueImpl({
+				runQueueAsync({
 					tasksFilePath: tasksPath,
 					projectPath: root,
 					platform: "macos",
@@ -378,8 +385,8 @@ describe("runner queue parsing", () => {
 						}),
 					},
 				});
-			if (expected) throws(invoke, expected);
-			else throws(invoke);
+			if (expected) await rejects(invoke(), expected);
+			else await rejects(invoke());
 			strictEqual(preflightCalls, expected ? 0 : 1);
 		}
 	});

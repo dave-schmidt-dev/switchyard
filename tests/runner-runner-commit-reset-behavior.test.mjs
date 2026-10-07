@@ -4,10 +4,9 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
 	runnerTestDir,
-	runQueue,
-	runQueueWithOrchestrator,
+	runQueueAsync,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -24,7 +23,7 @@ afterEach(() => {
 	}
 });
 describe("runner commit/reset behavior (Task 3.2)", () => {
-	it("commits only after successful tasks, not after failed ones", () => {
+	it("commits only after successful tasks, not after failed ones", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: First
@@ -49,7 +48,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		let routeCalls = 0;
 		let executeCalls = 0;
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -81,11 +80,11 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => {
+						executeAsync: async () => {
 							executeCalls += 1;
 							return { success: true, output: "ok" };
 						},
-						captureDiff: () => "diff --git a/a b/a",
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -109,7 +108,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			"integration rejection must not re-execute the task",
 		);
 	});
-	it("resets rejected state before continuing when stopOnFailure is false", () => {
+	it("resets rejected state before continuing when stopOnFailure is false", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Failing
@@ -126,7 +125,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		const commits = [];
 		const resets = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -149,8 +148,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -160,7 +159,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		strictEqual(commits.length, 0, "commit never called for failed tasks");
 		strictEqual(resets.length, 2, "reset called after each failed task");
 	});
-	it("does not reset when stopOnFailure is true", () => {
+	it("does not reset when stopOnFailure is true", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Failing
@@ -177,7 +176,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		const commits = [];
 		const resets = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -200,8 +199,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				wipeWorkingContainer: () => {},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -215,7 +214,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			"reset not called when stopOnFailure is true",
 		);
 	});
-	it("does not reset when working container is caller-supplied", () => {
+	it("does not reset when working container is caller-supplied", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Failing
@@ -227,7 +226,7 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 		const commits = [];
 		const resets = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "caller-supplied",
@@ -244,8 +243,8 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 				integrationGate: () => ({ success: false, message: "rejected" }),
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 				commitWorkingTree: () => commits.push(true),
@@ -259,153 +258,6 @@ describe("runner commit/reset behavior (Task 3.2)", () => {
 			resets.length,
 			0,
 			"reset not called when container is caller-supplied",
-		);
-	});
-	it("orchestrator path: commits only after success, resets on failure with continuation", async () => {
-		const tasksPath = writeTasksFile(`## Phase 1
-
-### Task 1.1: First
-- **Status:** pending
-- **Files:** src/a.mjs
-- **Description:** first task
-
-### Task 1.2: Failing
-- **Status:** pending
-- **Files:** src/a.mjs
-- **Description:** second task
-
-### Task 1.3: Third
-- **Status:** pending
-- **Files:** src/a.mjs
-- **Description:** third task
-`);
-		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const commits = [];
-		const resets = [];
-		let launchIndex = 0;
-		let gateCalls = 0;
-
-		const result = await runQueueWithOrchestrator({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			checkpointPath,
-			stopOnFailure: false,
-			dependencies: {
-				route: () => ({
-					provider: "claude",
-					model: "claude-sonnet-5",
-					percentLeft: 65,
-					reason: "spread",
-				}),
-				recordDispatch: () => {},
-				integrationGate: () => {
-					gateCalls += 1;
-					if (gateCalls === 2) {
-						return { success: false, message: "rejected" };
-					}
-					return { success: true, message: "ok" };
-				},
-				ensureAgentContainer: () => {},
-				createWorkingContainer: () => "generated-orch-container",
-				provisionCredentials: () => {},
-				seedProject: () => {},
-				commitWorkingTree: () => commits.push(true),
-				resetWorkingTree: () => resets.push(true),
-				wipeWorkingContainer: () => {},
-				sleepFn: async () => {},
-				orchestrator: {
-					launch: async () => {
-						launchIndex += 1;
-						return `job-${launchIndex}`;
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({
-						success: true,
-						diff: "diff --git a/a b/a",
-					}),
-				},
-			},
-		});
-
-		strictEqual(result.processedTasks, 3);
-		deepStrictEqual(
-			result.results.map((r) => r.result),
-			["success", "integration_failed", "success"],
-		);
-		strictEqual(
-			commits.length,
-			2,
-			"orchestrator: commit called after tasks 1 and 3 only",
-		);
-		strictEqual(
-			resets.length,
-			1,
-			"orchestrator: reset called after failed task 2",
-		);
-		strictEqual(
-			launchIndex,
-			3,
-			"integration rejection must not relaunch a task",
-		);
-	});
-	it("orchestrator path: does not reset when stopOnFailure is true", async () => {
-		const tasksPath = writeTasksFile(`## Phase 1
-
-### Task 1.1: Failing
-- **Status:** pending
-- **Files:** src/a.mjs
-- **Description:** first task
-
-### Task 1.2: Second
-- **Status:** pending
-- **Files:** src/a.mjs
-- **Description:** second task
-`);
-		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const resets = [];
-		let launchIndex = 0;
-
-		const result = await runQueueWithOrchestrator({
-			tasksFilePath: tasksPath,
-			projectPath: TEST_DIR,
-			checkpointPath,
-			stopOnFailure: true,
-			dependencies: {
-				route: () => ({
-					provider: "claude",
-					model: "claude-sonnet-5",
-					percentLeft: 65,
-					reason: "spread",
-				}),
-				recordDispatch: () => {},
-				integrationGate: () => ({ success: false, message: "rejected" }),
-				ensureAgentContainer: () => {},
-				createWorkingContainer: () => "generated-orch-container",
-				provisionCredentials: () => {},
-				seedProject: () => {},
-				commitWorkingTree: () => {},
-				resetWorkingTree: () => resets.push(true),
-				wipeWorkingContainer: () => {},
-				sleepFn: async () => {},
-				orchestrator: {
-					launch: async () => {
-						launchIndex += 1;
-						return `job-${launchIndex}`;
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({
-						success: true,
-						diff: "diff --git a/a b/a",
-					}),
-				},
-			},
-		});
-
-		strictEqual(result.processedTasks, 1, "stopped after first failure");
-		strictEqual(
-			resets.length,
-			0,
-			"orchestrator: reset not called when stopOnFailure is true",
 		);
 	});
 });

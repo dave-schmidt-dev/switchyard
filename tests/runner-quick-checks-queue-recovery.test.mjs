@@ -2,8 +2,8 @@ import {
 	deepStrictEqual,
 	notStrictEqual,
 	ok,
+	rejects,
 	strictEqual,
-	throws,
 } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -15,10 +15,9 @@ import { invalidCompletedQuickCheckTaskIds } from "../src/switchyard/runner/chec
 import {
 	loadCheckpoint,
 	parseTaskQueue,
-	runQueue,
 	runQueueAsync,
-	runQueueWithOrchestrator,
 } from "../src/switchyard/runner/index.mjs";
+import { runQueueAsync as runFixtureQueueAsync } from "./helpers/async-runner-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_DIR = tempDir("switchyard-quick-checks-queue-");
@@ -137,7 +136,9 @@ describe("Task 51 quick-check regression", () => {
 			adapters: {
 				claude: {
 					execute: () => ({ success: true, output: "done" }),
+					executeAsync: async () => ({ success: true, output: "done" }),
 					captureDiff: () => patch,
+					captureDiffAsync: async () => patch,
 				},
 			},
 			goldenImageVerifiedProviders: ["claude"],
@@ -151,7 +152,7 @@ describe("Task 51 quick-check regression", () => {
 			stopOnFailure: false,
 			dependencies,
 		};
-		const failed = runQueue(options);
+		const failed = await runFixtureQueueAsync(options);
 		deepStrictEqual(failed.completedTaskIds, []);
 		strictEqual(dispatchCount, 1);
 		const first = loadCheckpoint(checkpointPath, tasksPath);
@@ -212,6 +213,9 @@ describe("Task 51 quick-check regression", () => {
 			checkpointPath: asyncCheckpointPath,
 			dependencies: {
 				...dependencies,
+				// The fixture roster carries no host qualification receipts, so the
+				// real preflight is stubbed exactly as the async fixture wrapper does.
+				queuePreflight: () => ({ ok: true, eligible: true }),
 				broker: {
 					selectAndReserve: async () => {
 						asyncSelectionReached = true;
@@ -254,26 +258,9 @@ describe("Task 51 quick-check regression", () => {
 			tasksPath,
 		).results.at(-1);
 		strictEqual(asyncResult.result, "check_failed");
-		const failedOrchestrator = await runQueueWithOrchestrator({
-			...options,
-			dependencies: {
-				...dependencies,
-				adapters: { claude: { captureDiffAsync: async () => patch } },
-				orchestrator: {
-					launch: async () => "job-51",
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true }),
-				},
-			},
-		});
-		deepStrictEqual(failedOrchestrator.completedTaskIds, []);
-		strictEqual(
-			loadCheckpoint(checkpointPath, tasksPath).results.at(-1).result,
-			"check_failed",
-		);
 
 		patch = null;
-		const captureFailed = runQueue(options);
+		const captureFailed = await runFixtureQueueAsync(options);
 		deepStrictEqual(captureFailed.completedTaskIds, []);
 		strictEqual(
 			loadCheckpoint(checkpointPath, tasksPath).results.at(-1).result,
@@ -281,7 +268,7 @@ describe("Task 51 quick-check regression", () => {
 		);
 
 		patch = "";
-		const empty = runQueue(options);
+		const empty = await runFixtureQueueAsync(options);
 		deepStrictEqual(empty.completedTaskIds, []);
 		strictEqual(
 			loadCheckpoint(checkpointPath, tasksPath).results.at(-1).result,
@@ -289,7 +276,7 @@ describe("Task 51 quick-check regression", () => {
 		);
 
 		patch = patchFor("export const answer = 2;\n");
-		const passed = runQueue(options);
+		const passed = await runFixtureQueueAsync(options);
 		ok(passed.completedTaskIds.includes("51"));
 		const second = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(second.results[0].quickCheckReceipt.status, "failed");
@@ -297,7 +284,7 @@ describe("Task 51 quick-check regression", () => {
 			(item) => item.taskId === "51" && item.success,
 		).quickCheckReceipt;
 		strictEqual(passingReceipt.status, "passed");
-		strictEqual(passingReceipt.attempt, 5);
+		strictEqual(passingReceipt.attempt, 4);
 		notStrictEqual(
 			passingReceipt.diffSha256,
 			second.results[0].quickCheckReceipt.diffSha256,
@@ -312,7 +299,7 @@ describe("Task 51 quick-check regression", () => {
 			["51"],
 		);
 		writeLegacyCheckpoint(checkpointPath, pendingIntent);
-		throws(() => runQueue(options));
+		await rejects(runFixtureQueueAsync(options));
 		const wrongAttempt = structuredClone(second);
 		wrongAttempt.results.find(
 			(item) => item.taskId === "51" && item.success,
@@ -325,12 +312,15 @@ describe("Task 51 quick-check regression", () => {
 			["51"],
 		);
 		writeLegacyCheckpoint(checkpointPath, wrongAttempt);
-		throws(() => runQueue(options));
+		await rejects(runFixtureQueueAsync(options));
 		const beforeReceipts = structuredClone(second);
 		delete beforeReceipts.results.find(
 			(item) => item.taskId === "51" && item.success,
 		).quickCheckReceipt;
 		writeLegacyCheckpoint(checkpointPath, beforeReceipts);
-		throws(() => runQueue(options), /exact passing Quick check receipt/);
+		await rejects(
+			runFixtureQueueAsync(options),
+			/exact passing Quick check receipt/,
+		);
 	});
 });

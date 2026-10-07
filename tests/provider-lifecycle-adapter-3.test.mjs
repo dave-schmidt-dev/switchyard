@@ -477,6 +477,7 @@ describe("provider process lifecycle", () => {
 		deepStrictEqual(cleanupOptions, {
 			onStatus: undefined,
 			workspaceId: "{bridge-workspace}",
+			reason: "timeout",
 		});
 	});
 });

@@ -24,17 +24,13 @@ import {
 	loadCheckpoint,
 	releaseCheckpointOwnership,
 	runQueueAsync as runQueueAsyncImpl,
-	runQueue as runQueueImpl,
-	runQueueWithOrchestrator as runQueueWithOrchestratorImpl,
 	saveCheckpoint,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
 	runQueueAsync,
-	runQueueWithOrchestrator,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeLegacyCheckpoint(path, checkpoint) {
@@ -56,11 +52,7 @@ afterEach(() => {
 describe("checkpoint durability", () => {
 	it("reads completed legacy history unchanged across all queue loops", async () => {
 		for (const version of [1, 2]) {
-			for (const [mode, entrypoint] of [
-				["sync", runQueue],
-				["async", runQueueAsync],
-				["orchestrator", runQueueWithOrchestrator],
-			]) {
+			for (const [mode, entrypoint] of [["async", runQueueAsync]]) {
 				const tasksPath = writeTasksFile(`### Task 1.1: Legacy completion
 - **Status:** pending
 - **Executor:** switchyard
@@ -97,14 +89,6 @@ describe("checkpoint durability", () => {
 								return { success: true };
 							},
 						},
-					},
-					orchestrator: {
-						launch: () => {
-							providerLaunches += 1;
-							return "unexpected";
-						},
-						status: () => ({ state: "done" }),
-						result: () => ({ success: true }),
 					},
 				};
 				const result = await entrypoint({
@@ -203,7 +187,7 @@ describe("checkpoint durability", () => {
 			[
 				"--input-type=module",
 				"-e",
-				`import { runQueue } from ${JSON.stringify(runnerUrl)}; const [tasks,checkpointPath,projectPath]=process.argv.slice(1); const backendFactory=()=>({readiness:()=>({inventoryCount:0}),ensureAgentContainer:()=>{},create:()=>"unused",provision:()=>{},seed:()=>{},commit:()=>{},reset:()=>{},destroy:()=>{},captureTaskBase:()=>({ref:"unused",tree:"1".repeat(40)}),validateTaskBase:(_id,base)=>base,releaseTaskBase:()=>{}}); const result=runQueue({tasksFilePath:tasks,checkpointPath,projectPath,workingContainerName:"fake-container",dependencies:{queuePreflight:()=>({ok:true,eligible:true}),backendFactory,acquireVmSlot:()=>null,releaseVmSlot:()=>{}}}); if(result.processedTasks!==0) throw new Error("unexpected execution");`,
+				`import { runQueueAsync } from ${JSON.stringify(runnerUrl)}; const [tasks,checkpointPath,projectPath]=process.argv.slice(1); const backendFactory=()=>({readiness:()=>({inventoryCount:0}),ensureAgentContainer:()=>{},create:()=>"unused",provision:()=>{},seed:()=>{},commit:()=>{},reset:()=>{},destroy:()=>{},captureTaskBase:()=>({ref:"unused",tree:"1".repeat(40)}),validateTaskBase:(_id,base)=>base,releaseTaskBase:()=>{}}); const result=await runQueueAsync({tasksFilePath:tasks,checkpointPath,projectPath,workingContainerName:"fake-container",dependencies:{queuePreflight:()=>({ok:true,eligible:true}),backendFactory,acquireVmSlot:()=>null,releaseVmSlot:()=>{}}}); if(result.processedTasks!==0) throw new Error("unexpected execution");`,
 				tasksPath,
 				checkpointPath,
 				TEST_DIR,
@@ -216,7 +200,7 @@ describe("checkpoint durability", () => {
 			true,
 		);
 	});
-	it("uses a new fenced owner when a later run claims a released checkpoint", () => {
+	it("uses a new fenced owner when a later run claims a released checkpoint", async () => {
 		const tasksPath = writeTasksFile(`### Task 1.1: Completed task
 - **Status:** done
 - **Executor:** switchyard
@@ -235,12 +219,12 @@ describe("checkpoint durability", () => {
 				releaseVmSlot: () => {},
 			},
 		};
-		runQueue({ ...common, runId: "same-process-run-a" });
+		await runQueueAsync({ ...common, runId: "same-process-run-a" });
 		const afterA = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(afterA.ownershipReleased, true);
 		strictEqual(afterA.owner.runId, "same-process-run-a");
 
-		runQueue({ ...common, runId: "same-process-run-b" });
+		await runQueueAsync({ ...common, runId: "same-process-run-b" });
 		const afterB = loadCheckpoint(checkpointPath, tasksPath);
 		strictEqual(afterB.ownershipReleased, true);
 		strictEqual(afterB.owner.runId, "same-process-run-b");
@@ -250,11 +234,7 @@ describe("checkpoint durability", () => {
 		strictEqual(readFileSync(checkpointPath, "utf8"), beforeStaleSave);
 	});
 	it("releases a claimed checkpoint after preflight errors in all queue entrypoints", async () => {
-		for (const [name, entrypoint] of [
-			["sync", runQueueImpl],
-			["async", runQueueAsyncImpl],
-			["orchestrator", runQueueWithOrchestratorImpl],
-		]) {
+		for (const [name, entrypoint] of [["async", runQueueAsyncImpl]]) {
 			const tasksPath = writeTasksFile(`### Task 1.1: Completed ${name}
 - **Status:** done
 - **Executor:** switchyard

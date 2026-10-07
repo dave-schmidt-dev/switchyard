@@ -109,24 +109,30 @@ export async function captureProviderDiffDetailedAsync(
 			// Telemetry cannot alter capture.
 		}
 	};
-	const captureCleanup = (command, args) => async () => {
-		let backendError = null;
-		let backendHandled = false;
-		if (typeof executionBackend?.cleanupProviderProcess === "function") {
-			try {
-				await executionBackend.cleanupProviderProcess(command, args, {
-					onStatus,
-					workspaceId: workingContainerName,
-					...markerContext(cleanupContext, "helper"),
-				});
-				backendHandled = true;
-			} catch (error) {
-				backendError = error;
+	const captureCleanup =
+		(command, args) =>
+		async ({ reason } = {}) => {
+			let backendError = null;
+			let backendHandled = false;
+			if (typeof executionBackend?.cleanupProviderProcess === "function") {
+				try {
+					await executionBackend.cleanupProviderProcess(command, args, {
+						onStatus,
+						// A helper terminated from the host may leave the provider
+						// running in the guest, so the backend defers guest cleanup to
+						// the workspace destroy instead of replaying a guest exec.
+						...(reason ? { reason } : {}),
+						workspaceId: workingContainerName,
+						...markerContext(cleanupContext, "helper"),
+					});
+					backendHandled = true;
+				} catch (error) {
+					backendError = error;
+				}
 			}
-		}
-		if (!backendHandled && typeof cleanup === "function") await cleanup();
-		if (backendError) throw backendError;
-	};
+			if (!backendHandled && typeof cleanup === "function") await cleanup();
+			if (backendError) throw backendError;
+		};
 	const lifecycle = {
 		...lifecycleOptions,
 		spawnFn,

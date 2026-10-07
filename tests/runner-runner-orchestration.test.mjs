@@ -5,10 +5,10 @@ import { afterEach, describe, it } from "node:test";
 import { loadCheckpoint } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -25,7 +25,7 @@ afterEach(() => {
 	}
 });
 describe("runner orchestration", () => {
-	it("re-evaluates dependencies after each successful task", () => {
+	it("re-evaluates dependencies after each successful task", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Root task
@@ -43,7 +43,7 @@ describe("runner orchestration", () => {
 - **Description:** Dependent operation
 `);
 		const dispatches = [];
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -59,8 +59,8 @@ describe("runner orchestration", () => {
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -74,7 +74,7 @@ describe("runner orchestration", () => {
 		);
 	});
 
-	it("executes tasks serially and checkpoints completion", () => {
+	it("executes tasks serially and checkpoints completion", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: First task
@@ -102,20 +102,20 @@ describe("runner orchestration", () => {
 			integrationGate: () => ({ success: true, message: "ok" }),
 			adapters: {
 				claude: {
-					execute: (prompt) => {
+					executeAsync: async (prompt) => {
 						prompts.push(prompt);
 						return { success: true, output: "ok" };
 					},
-					captureDiff: () => "diff --git a/a b/a",
+					captureDiffAsync: async () => "diff --git a/a b/a",
 				},
 				codex: {
-					execute: () => ({ success: true, output: "ok" }),
-					captureDiff: () => "diff --git a/b b/b",
+					executeAsync: async () => ({ success: true, output: "ok" }),
+					captureDiffAsync: async () => "diff --git a/b b/b",
 				},
 			},
 		};
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -135,7 +135,7 @@ describe("runner orchestration", () => {
 		deepStrictEqual(checkpoint.completedTaskIds, ["1.1", "1.2"]);
 	});
 
-	it("resumes from checkpoint and only runs remaining work", () => {
+	it("resumes from checkpoint and only runs remaining work", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: First task
@@ -162,20 +162,20 @@ describe("runner orchestration", () => {
 			integrationGate: () => ({ success: true, message: "ok" }),
 			adapters: {
 				claude: {
-					execute: (prompt) => {
+					executeAsync: async (prompt) => {
 						prompts.push(prompt);
 						return { success: true, output: "ok" };
 					},
-					captureDiff: () => "diff --git a/a b/a",
+					captureDiffAsync: async () => "diff --git a/a b/a",
 				},
 				codex: {
-					execute: () => ({ success: true, output: "ok" }),
-					captureDiff: () => "diff --git a/b b/b",
+					executeAsync: async () => ({ success: true, output: "ok" }),
+					captureDiffAsync: async () => "diff --git a/b b/b",
 				},
 			},
 		};
 
-		runQueue({
+		await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -184,7 +184,7 @@ describe("runner orchestration", () => {
 			maxTasks: 1,
 		});
 
-		runQueue({
+		await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -198,7 +198,7 @@ describe("runner orchestration", () => {
 		]);
 	});
 
-	it("treats an exactly selected completed task as already_complete without routing", () => {
+	it("treats an exactly selected completed task as already_complete without routing", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Already complete
@@ -222,7 +222,7 @@ describe("runner orchestration", () => {
 
 		// Seed an identity-bound checkpoint through the normal queue path so the
 		// exact selection has durable successful-completion evidence to reconcile.
-		runQueue({
+		await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -234,14 +234,14 @@ describe("runner orchestration", () => {
 				integrationGate: () => ({ success: true }),
 				adapters: {
 					claude: {
-						execute: () => ({ success: true }),
-						captureDiff: () => "diff --git a/a b/a",
+						executeAsync: async () => ({ success: true }),
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
 		});
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -262,7 +262,7 @@ describe("runner orchestration", () => {
 			"already_complete",
 		);
 	});
-	it("captures and releases a fresh immutable base for each terminal task", () => {
+	it("captures and releases a fresh immutable base for each terminal task", async () => {
 		const tasksPath = writeTasksFile(`
 ### Task 1.1: First
 - **Status:** pending
@@ -278,7 +278,7 @@ describe("runner orchestration", () => {
 		const captured = [];
 		const released = [];
 		const persistedBeforeExecute = [];
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "worker",
@@ -298,7 +298,7 @@ describe("runner orchestration", () => {
 				releaseTaskBase: (_workspaceId, base) => released.push(base.ref),
 				adapters: {
 					claude: {
-						execute: () => {
+						executeAsync: async () => {
 							const taskId = captured.at(-1);
 							persistedBeforeExecute.push(
 								Boolean(
@@ -309,7 +309,7 @@ describe("runner orchestration", () => {
 							);
 							return { success: true };
 						},
-						captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+						captureDiffAsync: async () => "diff --git a/src/a.mjs b/src/a.mjs",
 					},
 				},
 				integrationGate: () => ({ success: true }),
@@ -328,7 +328,7 @@ describe("runner orchestration", () => {
 		);
 	});
 
-	it("persists task-base release uncertainty and prevents reuse", () => {
+	it("persists task-base release uncertainty and prevents reuse", async () => {
 		const tasksPath = writeTasksFile(`
 ### Task 1.1: First
 - **Status:** pending
@@ -336,7 +336,7 @@ describe("runner orchestration", () => {
 - **Description:** first
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "worker",
@@ -352,8 +352,8 @@ describe("runner orchestration", () => {
 				},
 				adapters: {
 					claude: {
-						execute: () => ({ success: true }),
-						captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+						executeAsync: async () => ({ success: true }),
+						captureDiffAsync: async () => "diff --git a/src/a.mjs b/src/a.mjs",
 					},
 				},
 				integrationGate: () => ({ success: true }),
@@ -370,7 +370,7 @@ describe("runner orchestration", () => {
 		strictEqual(checkpoint.taskBaseReleaseUncertain.taskId, "1.1");
 	});
 
-	it("captures a new base when a terminal failure is retried in a fresh workspace", () => {
+	it("captures a new base when a terminal failure is retried in a fresh workspace", async () => {
 		const tasksPath = writeTasksFile(`
 ### Task 1.1: Retryable in a new run
 - **Status:** pending
@@ -394,13 +394,13 @@ describe("runner orchestration", () => {
 			releaseTaskBase: () => {},
 			adapters: {
 				claude: {
-					execute: () => ({ success }),
-					captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+					executeAsync: async () => ({ success }),
+					captureDiffAsync: async () => "diff --git a/src/a.mjs b/src/a.mjs",
 				},
 			},
 			integrationGate: () => ({ success: true }),
 		});
-		const failed = runQueue({
+		const failed = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "worker-one",
@@ -412,7 +412,7 @@ describe("runner orchestration", () => {
 			JSON.parse(readFileSync(checkpointPath, "utf8")).taskBases,
 			{},
 		);
-		const retried = runQueue({
+		const retried = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "worker-two",

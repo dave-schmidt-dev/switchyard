@@ -3,18 +3,17 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import {
+	executeTaskAsync,
 	findIgnoredDeclaredPath,
 	loadCheckpoint,
 } from "../src/switchyard/runner/index.mjs";
 import {
 	descriptorForRoute,
-	executeTask,
-	executeTaskAsync,
-	executeTaskWithOrchestrator,
 	runnerTestDir,
-	runQueue,
+	runQueueAsync,
+	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeTasksFile(content) {
@@ -22,6 +21,63 @@ function writeTasksFile(content) {
 	const tasksPath = join(TEST_DIR, "tasks.md");
 	writeFileSync(tasksPath, withExplicitSwitchyardExecutor(content), "utf8");
 	return tasksPath;
+}
+const DEFAULT_ROUTE = () => ({
+	provider: "claude",
+	model: "claude-sonnet-5",
+	percentLeft: 80,
+	reason: "spread",
+});
+// Async-only task context: the broker seam is stubbed and the descriptor is
+// derived from the routed provider/model so executeTaskAsync can run without
+// the synchronous router.
+function asyncTaskContext({
+	route = DEFAULT_ROUTE,
+	execute = async () => ({ success: true, output: "ok" }),
+	captureDiff = async () => "diff --git a/a b/a",
+	integrationGate = () => ({ success: true, message: "ok" }),
+	recordDispatch = () => {},
+}) {
+	let latestDescriptor = null;
+	return {
+		broker: {
+			selectAndReserve: async (request) => {
+				const routed = route({ requiredCapability: request.capability });
+				if (!routed) return null;
+				latestDescriptor = descriptorForRoute(routed);
+				return {
+					provider: routed.provider,
+					model: routed.model,
+					resolvedTarget: routed.resolvedTargetId ?? routed.provider,
+					harness: routed.resolved_harness ?? routed.provider,
+					capability: request.capability,
+					reason: routed.reason,
+					reservation: { id: "test-reservation" },
+					snapshotIdentity: { status: "fresh", mtime: null, ageMs: 0 },
+				};
+			},
+			launcherIdentity: () => ({}),
+			execute,
+			release: async () => {},
+		},
+		resolveDescriptor: () => latestDescriptor,
+		recordDispatch,
+		recordDispatchIntent: () => {},
+		integrationGate,
+		adapters: {
+			claude: {
+				executeAsync: execute,
+				captureDiffAsync: captureDiff,
+			},
+		},
+		queueBackend: {
+			captureTaskBase: () => TASK_BASE,
+			validateTaskBase: (_workspaceId, base) => base,
+			releaseTaskBase: () => {},
+		},
+		projectPath: TEST_DIR,
+		workingContainerName: "fake-container",
+	};
 }
 afterEach(() => {
 	try {
@@ -55,16 +111,16 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		);
 	});
 
-	it("executeTask rejects an ignored declared path before provider routing with declared_path_not_seeded", () => {
+	it("executeTask rejects an ignored declared path before provider routing with declared_path_not_seeded", async () => {
 		const routeCalls = [];
-		const result = executeTask(
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "edit history",
 				description: "record update",
 				requiredPaths: ["HISTORY.md"],
 			},
-			{
+			asyncTaskContext({
 				route: (opts) => {
 					routeCalls.push(opts);
 					return {
@@ -74,17 +130,7 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 						reason: "spread",
 					};
 				},
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
-				adapters: {
-					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff",
-					},
-				},
-				projectPath: TEST_DIR,
-			},
+			}),
 		);
 
 		strictEqual(routeCalls.length, 0, "must not route to any provider");
@@ -101,10 +147,10 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		ok(!result.reason.includes("HISTORY.md"));
 	});
 
-	it("executeTask preserves current behavior for tracked paths and unignored new files", () => {
+	it("executeTask preserves current behavior for tracked paths and unignored new files", async () => {
 		const routeCalls = [];
 		const gateCalls = [];
-		const result = executeTask(
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "valid work",
@@ -114,7 +160,7 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 					"src/switchyard/new_untracked_test_file.mjs",
 				],
 			},
-			{
+			asyncTaskContext({
 				route: (opts) => {
 					routeCalls.push(opts);
 					return {
@@ -124,21 +170,11 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 						reason: "spread",
 					};
 				},
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
 				integrationGate: (diff, projectPath, options) => {
 					gateCalls.push({ diff, projectPath, options });
 					return { success: true, message: "ok" };
 				},
-				adapters: {
-					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff --git a/a b/a",
-					},
-				},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-			},
+			}),
 		);
 
 		strictEqual(routeCalls.length, 1);
@@ -146,16 +182,16 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		strictEqual(gateCalls.length, 1);
 	});
 
-	it("executeTask preserves current behavior when requiredPaths is null", () => {
+	it("executeTask preserves current behavior when requiredPaths is null", async () => {
 		const routeCalls = [];
-		const result = executeTask(
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "review task",
 				description: "no required paths",
 				requiredPaths: null,
 			},
-			{
+			asyncTaskContext({
 				route: (opts) => {
 					routeCalls.push(opts);
 					return {
@@ -165,27 +201,18 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 						reason: "spread",
 					};
 				},
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
-				adapters: {
-					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "",
-					},
-				},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-			},
+				captureDiff: async () => "",
+			}),
 		);
 
 		strictEqual(routeCalls.length, 1);
 		strictEqual(result.success, true);
 	});
 
-	it("review tasks never integrate provider diffs and report zero source mutations", () => {
+	it("review tasks never integrate provider diffs and report zero source mutations", async () => {
 		let gateCalls = 0;
-		const result = executeTask(
+		let captureCalls = 0;
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "review task",
@@ -193,40 +220,41 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 				description: "inspect changes",
 				requiredPaths: null,
 			},
-			{
-				route: () => ({
-					provider: "claude",
-					model: "claude-sonnet-5",
-					percentLeft: 80,
-					reason: "spread",
+			asyncTaskContext({
+				execute: async () => ({
+					success: true,
+					output: JSON.stringify({
+						verdict: "clean",
+						findings: [],
+					}),
+					reviewResult: {
+						schemaVersion: 1,
+						status: "available",
+						verdict: "clean",
+						summary: "clean",
+						findings: [],
+						comments: [],
+						findingCount: 0,
+						commentCount: 0,
+						sourceMutationCount: 0,
+					},
 				}),
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
 				integrationGate: () => {
 					gateCalls += 1;
 					return { success: true, message: "must not run" };
 				},
-				adapters: {
-					claude: {
-						execute: () => ({
-							success: true,
-							output: JSON.stringify({
-								verdict: "clean",
-								findings: [],
-							}),
-						}),
-						captureDiff: () => "diff --git a/secret b/secret",
-					},
+				captureDiff: async () => {
+					captureCalls += 1;
+					throw new Error("x");
 				},
-				projectPath: TEST_DIR,
-				workingContainerName: "fake-container",
-			},
+			}),
 		);
 
 		strictEqual(result.success, true);
 		strictEqual(result.result, "review_completed");
 		strictEqual(result.reviewResult.sourceMutationCount, 0);
 		strictEqual(gateCalls, 0);
+		strictEqual(captureCalls, 0);
 	});
 
 	it("malformed review output stays unavailable across sync, broker, and orchestrator paths", async () => {
@@ -237,37 +265,10 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 			description: "inspect changes",
 			requiredPaths: null,
 		};
-		let syncGateCalls = 0;
-		let syncCaptureCalls = 0;
-		const syncResult = executeTask(task, {
-			route: () => ({ provider: "claude", model: "claude-sonnet-5" }),
-			recordDispatch: () => {},
-			recordDispatchIntent: () => {},
-			integrationGate: () => {
-				syncGateCalls += 1;
-				throw new Error("review must not integrate");
-			},
-			adapters: {
-				claude: {
-					execute: () => ({
-						success: true,
-						output: "PROVIDER_SECRET_CANARY plain output",
-					}),
-					captureDiff: () => {
-						syncCaptureCalls += 1;
-						throw new Error("review must not capture");
-					},
-				},
-			},
-			projectPath: TEST_DIR,
-			workingContainerName: "fake-container",
-		});
-		strictEqual(syncResult.result, "review_unavailable");
-		strictEqual(syncResult.reviewResult.sourceMutationCount, 0);
-		strictEqual(syncGateCalls, 0);
-		strictEqual(syncCaptureCalls, 0);
-		ok(!JSON.stringify(syncResult).includes("PROVIDER_SECRET_CANARY"));
-
+		// BLOCKED (Task 5.5): the synchronous executeTask path is deleted by
+		// Task 5.13, so the syncResult half of this test cannot be ported to
+		// the async runner. The broker path below asserts the same closed
+		// malformed-review behavior without integration or diff capture.
 		const descriptor = descriptorForRoute({
 			provider: "claude",
 			resolved_harness: "claude",
@@ -313,6 +314,11 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 					},
 				},
 			},
+			queueBackend: {
+				captureTaskBase: () => TASK_BASE,
+				validateTaskBase: (_workspaceId, base) => base,
+				releaseTaskBase: () => {},
+			},
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
 		});
@@ -321,103 +327,6 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		strictEqual(asyncGateCalls, 0);
 		strictEqual(asyncCaptureCalls, 0);
 		ok(!JSON.stringify(asyncResult).includes("PROVIDER_SECRET_CANARY"));
-
-		let orchestratorGateCalls = 0;
-		let orchestratorCaptureCalls = 0;
-		const orchestratorResult = await executeTaskWithOrchestrator(task, {
-			route: () => ({
-				provider: "claude",
-				model: "claude-sonnet-5",
-				resolved_harness: "claude",
-				resolvedTargetId: "claude-target",
-			}),
-			resolveDescriptor: () => descriptor,
-			recordDispatch: () => {},
-			recordDispatchIntent: () => {},
-			integrationGate: () => {
-				orchestratorGateCalls += 1;
-				throw new Error("review must not integrate");
-			},
-			orchestrator: {
-				launch: async () => "review-job",
-				status: async () => ({ state: "done" }),
-				result: async () => ({
-					success: true,
-					output: "PROVIDER_SECRET_CANARY plain orchestrator output",
-					diff: "diff --git a/secret b/secret",
-				}),
-			},
-			adapters: {
-				claude: {
-					captureDiff: () => {
-						orchestratorCaptureCalls += 1;
-						throw new Error("review must not capture");
-					},
-				},
-			},
-			projectPath: TEST_DIR,
-			workingContainerName: "fake-container",
-		});
-		strictEqual(orchestratorResult.result, "review_unavailable");
-		strictEqual(orchestratorResult.reviewResult.sourceMutationCount, 0);
-		strictEqual(orchestratorGateCalls, 0);
-		strictEqual(orchestratorCaptureCalls, 0);
-		ok(!JSON.stringify(orchestratorResult).includes("PROVIDER_SECRET_CANARY"));
-	});
-
-	it("executeTaskWithOrchestrator rejects an ignored declared path before provider routing or launch", async () => {
-		const routeCalls = [];
-		let launches = 0;
-		const result = await executeTaskWithOrchestrator(
-			{
-				id: "1.1",
-				title: "edit tasks record",
-				description: "update tasks",
-				requiredPaths: ["TASKS.md"],
-			},
-			{
-				route: (opts) => {
-					routeCalls.push(opts);
-					return {
-						provider: "claude",
-						model: "claude-sonnet-5",
-						percentLeft: 80,
-						reason: "spread",
-					};
-				},
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true, message: "ok" }),
-				orchestrator: {
-					launch: async () => {
-						launches += 1;
-						return "job-1";
-					},
-					status: async () => ({ state: "done" }),
-					result: async () => ({ success: true, diff: "" }),
-				},
-				adapters: {
-					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "",
-					},
-				},
-				projectPath: TEST_DIR,
-			},
-		);
-
-		strictEqual(routeCalls.length, 0);
-		strictEqual(launches, 0);
-		strictEqual(result.success, false);
-		strictEqual(result.provider, null);
-		strictEqual(result.result, "declared_path_not_seeded");
-		strictEqual(result.errorKind, "declared_path_not_seeded");
-		strictEqual(result.reasonCode, "declared_path_not_seeded");
-		strictEqual(
-			result.reason,
-			"The task declared a Git-ignored path that cannot be seeded or captured.",
-		);
-		ok(!result.reason.includes("TASKS.md"));
 	});
 
 	it("executeTaskAsync rejects an ignored declared path before broker reservation or routing", async () => {
@@ -446,7 +355,7 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 		strictEqual(result.result, "declared_path_not_seeded");
 	});
 
-	it("the ignored-record regression rejects before dispatch with declared_path_not_seeded in runQueue", () => {
+	it("the ignored-record regression rejects before dispatch with declared_path_not_seeded in runQueue", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Edit ignored local record
@@ -457,7 +366,7 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 `);
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const dispatches = [];
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -477,8 +386,8 @@ describe("reject declared paths that cannot be seeded (Task 1.1)", () => {
 				integrationGate: () => ({ success: true, message: "ok" }),
 				adapters: {
 					claude: {
-						execute: () => ({ success: true, output: "ok" }),
-						captureDiff: () => "diff",
+						executeAsync: async () => ({ success: true, output: "ok" }),
+						captureDiffAsync: async () => "diff",
 					},
 				},
 			},

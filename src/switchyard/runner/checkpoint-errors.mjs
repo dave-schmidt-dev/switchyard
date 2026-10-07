@@ -284,38 +284,11 @@ export class QueueCleanupError extends Error {
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
-function runCliCommand(command, args) {
-	const result = spawnSync(command, args, {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-	});
-
-	if (result.error) {
-		throw result.error;
-	}
-	if (result.status !== 0) {
-		throw new Error(
-			`orchestrator command failed: ${command} ${args.join(" ")}\n${result.stderr ?? ""}`,
-		);
-	}
-
-	return result.stdout?.trim() ?? "";
-}
-function parseJsonPayload(raw) {
-	if (!raw) return null;
-	try {
-		return JSON.parse(raw);
-	} catch {
-		return null;
-	}
-}
 
 export {
 	assertCommittedDeclaredFiles,
 	CallerInputValidationUnavailableError,
-	parseJsonPayload,
 	relativeProjectPath,
 	resolveQueueIdentity,
-	runCliCommand,
 	sleep,
 };

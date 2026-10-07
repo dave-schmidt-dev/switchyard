@@ -24,10 +24,7 @@ import {
 	GenerationGuardError,
 	MaintenanceGenerationError,
 } from "../src/switchyard/maintenance/index.mjs";
-import {
-	runQueue,
-	runQueueWithOrchestrator,
-} from "../src/switchyard/runner/index.mjs";
+import { runQueue } from "../src/switchyard/runner/index.mjs";
 import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -64,21 +61,12 @@ describe("maintenance generation guard", () => {
 		);
 	});
 
-	it("rejects new synchronous and detached queue work in progress", async () => {
+	it("rejects new synchronous and detached queue work in progress", () => {
 		const path = markerPath();
 		activeMarker(path);
 		assert.throws(
 			() =>
 				runQueue({
-					tasksFilePath: "unused",
-					projectPath: projectRoot,
-					dependencies: { generationMarkerPath: path },
-				}),
-			(error) => error instanceof MaintenanceGenerationError,
-		);
-		await assert.rejects(
-			() =>
-				runQueueWithOrchestrator({
 					tasksFilePath: "unused",
 					projectPath: projectRoot,
 					dependencies: { generationMarkerPath: path },

@@ -1,7 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readlinkSync,
+	realpathSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 
 const GIT_ARGS = [
 	"-c",
@@ -19,17 +26,125 @@ const GIT_ARGS = [
 	"-c",
 	"filter.lfs.required=false",
 ];
+const HOMEBREW_BIN = "/opt/homebrew/bin";
+const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
+// The real xcrun needs xcode-select, the license check and a writable xcrun_db;
+// the sandbox denies all three, so checks get a shim that answers xcrun's query
+// flags from DEVELOPER_DIR and delegates every tool invocation to PATH.
+const XCRUN_SHIM = `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-sdk|--sdk|--toolchain)
+		shift
+		[ "$#" -gt 0 ] && shift
+		;;
+	-r|--run)
+		shift
+		;;
+	--find)
+		shift
+		tool="$1"
+		[ "$#" -gt 0 ] && shift
+		for candidate in "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/$tool" "$DEVELOPER_DIR/usr/bin/$tool"; do
+			if [ -x "$candidate" ]; then
+				printf '%s\\n' "$candidate"
+				exit 0
+			fi
+		done
+		command -v "$tool"
+		exit $?
+		;;
+	--show-sdk-path)
+		if [ -n "$SDKROOT" ]; then
+			printf '%s\\n' "$SDKROOT"
+		elif [ -n "$DEVELOPER_DIR" ]; then
+			printf '%s\\n' "$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+		else
+			exit 1
+		fi
+		exit 0
+		;;
+	*)
+		exec "$@"
+		;;
+	esac
+done
+exit 1
+`;
 function sha(value) {
 	return createHash("sha256").update(value).digest("hex");
 }
+function developerDir() {
+	try {
+		const target = readlinkSync(XCODE_SELECT_LINK);
+		return realpathSync(
+			isAbsolute(target) ? target : join(dirname(XCODE_SELECT_LINK), target),
+		);
+	} catch {
+		return null;
+	}
+}
+// The selected developer directory is read through its enclosing Xcode.app
+// bundle; a Command Line Tools selection is its own developer root.
+function xcodeAppRoot(developer) {
+	let current = developer;
+	while (current !== "/" && current !== dirname(current)) {
+		if (current.endsWith(".app")) return current;
+		current = dirname(current);
+	}
+	return developer;
+}
+// Only these Homebrew bin links become readable. Every other Homebrew tool
+// stays unreadable, so invoking it fails with the shell's exit 126.
+function homebrewLinkReads() {
+	const links = ["git", "python3"];
+	try {
+		const target = realpathSync(join(HOMEBREW_BIN, "python3"));
+		const match = /python@?\/?(\d+)\.(\d+)/u.exec(target);
+		if (match && existsSync(join(HOMEBREW_BIN, `python3.${match[2]}`)))
+			links.push(`python3.${match[2]}`);
+	} catch {
+		// A host without Homebrew python keeps the git link alone.
+	}
+	return links.map((name) => join(HOMEBREW_BIN, name));
+}
 function safeEnv(home) {
 	home = realpathSync(home);
+	const developer = developerDir();
+	const runtimeBin = join(home, "bin");
+	mkdirSync(runtimeBin, { recursive: true, mode: 0o700 });
+	writeFileSync(join(runtimeBin, "xcrun"), XCRUN_SHIM, { mode: 0o700 });
+	// Tools such as SwiftPM call /usr/bin/xcrun by absolute path; an explicit
+	// SDKROOT keeps that shim from probing the Xcode license, which the
+	// sandbox cannot read.
+	const sdkPath = developer
+		? join(developer, "Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+		: undefined;
+	const sdk = sdkPath && existsSync(sdkPath) ? sdkPath : undefined;
+	const path = developer
+		? [
+				runtimeBin,
+				HOMEBREW_BIN,
+				join(developer, "usr/bin"),
+				join(developer, "Toolchains/XcodeDefault.xctoolchain/usr/bin"),
+				"/usr/bin",
+				"/bin",
+			]
+		: [runtimeBin, "/usr/bin", "/bin", HOMEBREW_BIN, "/usr/local/bin"];
 	return {
-		PATH: "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+		PATH: path.join(":"),
 		HOME: home,
 		TMPDIR: home,
 		XDG_CONFIG_HOME: home,
 		CI: "true",
+		...(developer ? { DEVELOPER_DIR: developer } : {}),
+		...(sdk ? { SDKROOT: sdk } : {}),
+		// xcodebuild and SwiftPM resolve per-user caches from the passwd home, not
+		// HOME; this keeps them inside the runtime directory.
+		CFFIXED_USER_HOME: home,
+		// SwiftPM's manifest compile otherwise writes the shared clang module
+		// cache under the per-user cache dir.
+		SWIFTPM_MODULECACHE_OVERRIDE: join(home, "clang-modules"),
 		GIT_CONFIG_NOSYSTEM: "1",
 		GIT_CONFIG_GLOBAL: "/dev/null",
 		GIT_CONFIG_SYSTEM: "/dev/null",
@@ -40,9 +155,194 @@ function safeEnv(home) {
 		GIT_ASKPASS: "/usr/bin/false",
 	};
 }
-export function quickCheckSandboxProfile(clone, runtime, readOnlyPaths = []) {
+// xcodebuild flags that take no value; every other `-flag` (without `=`)
+// consumes the next word, so a flag value is never read as an action and an
+// unknown flag fails closed.
+const XCODEBUILD_BOOLEAN_FLAGS = new Set([
+	"-quiet",
+	"-verbose",
+	"-json",
+	"-version",
+	"-list",
+	"-showsdks",
+	"-showBuildSettings",
+	"-showdestinations",
+	"-showTestPlans",
+	"-alltargets",
+	"-parallelizeTargets",
+	"-hideShellScriptEnvironment",
+	"-allowProvisioningUpdates",
+	"-allowProvisioningDeviceRegistration",
+	"-skipUnavailableActions",
+	"-skipPackagePluginValidation",
+	"-skipMacroValidation",
+	"-skipPackageUpdates",
+	"-disableAutomaticPackageResolution",
+	"-onlyUsePackageVersionsFromResolvedFile",
+	"-disablePackageRepositoryCache",
+	"-usePackageSupportBuiltinSCM",
+	"-dry-run",
+	"-n",
+]);
+// Split one shell command into words with quotes removed. Null when it holds
+// shell grammar beyond a single simple command (separators, redirections,
+// substitutions, an unbalanced quote) or an unquoted expansion or glob that
+// could split into extra words.
+function shellWords(command) {
+	if (/[`\\]|\$\(/u.test(command)) return null;
+	const words = [];
+	let word = null;
+	let quote = null;
+	for (const char of command) {
+		if (quote) {
+			if (char === quote) quote = null;
+			else word += char;
+		} else if (char === "'" || char === '"') {
+			quote = char;
+			word ??= "";
+		} else if (/\s/u.test(char)) {
+			if (word !== null) words.push(word);
+			word = null;
+		} else if (/[;&|(){}<>$*?[~]/u.test(char)) {
+			return null;
+		} else {
+			word = (word ?? "") + char;
+		}
+	}
+	if (quote) return null;
+	if (word !== null) words.push(word);
+	return words;
+}
+/**
+ * The action words of one `xcodebuild` invocation, or null when the words are
+ * not a bare `xcodebuild` call whose actions can be read. `words` is either a
+ * shell command string or an argv array (no shell, so no expansion).
+ */
+export function xcodebuildActions(words) {
+	if (typeof words === "string") words = shellWords(words);
+	if (!Array.isArray(words) || words[0] !== "xcodebuild") return null;
+	const actions = [];
+	for (let index = 1; index < words.length; index += 1) {
+		const word = words[index];
+		if (typeof word !== "string" || !word) return null;
+		if (word.startsWith("-")) {
+			if (word.includes("$")) return null;
+			if (!word.includes("=") && !XCODEBUILD_BOOLEAN_FLAGS.has(word)) {
+				if (index + 1 >= words.length) return null;
+				index += 1;
+			}
+		} else if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])*=/u.test(word)) {
+			// A build setting assignment, never an action.
+		} else if (/^[a-z][a-z-]*$/u.test(word)) actions.push(word);
+		else return null;
+	}
+	return actions;
+}
+/**
+ * True when a check is a single `xcodebuild` invocation whose action list is
+ * exactly `build`. Env-assignment prefixes, other or extra actions, chains,
+ * pipes, redirections and every other tool never earn the xcodebuild grants.
+ */
+export function isXcodebuildBuild(command) {
+	const actions = xcodebuildActions(command);
+	return actions?.length === 1 && actions[0] === "build";
+}
+function regexEscape(text) {
+	return text.replace(/[.^$*+?()[\]{}|\\]/gu, "\\$&");
+}
+// The per-user temp dir (confstr DARWIN_USER_TEMP_DIR) resolved on the host.
+// Anything that is not a /private/var/folders/<x>/<y>/T directory yields null,
+// which leaves the xcodebuild profile without temp grants (it then fails closed).
+function userTempDir() {
+	const result = spawnSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], {
+		encoding: "utf8",
+		timeout: 5000,
+	});
+	if (result.status !== 0 || !result.stdout.trim()) return null;
+	try {
+		const resolved = realpathSync(result.stdout.trim());
+		return /^\/private\/var\/folders\/[A-Za-z0-9_]+\/[A-Za-z0-9_]+\/T$/u.test(
+			resolved,
+		)
+			? resolved
+			: null;
+	} catch {
+		return null;
+	}
+}
+// Grants for one `xcodebuild build` check, appended to the base profile only
+// when isXcodebuildBuild() holds. Rules marked "required" were each admitted
+// from a recorded failure: with the fixture package of
+// tests/runner-quick-checks-xcode-sandbox.test.mjs, removing any one of them
+// fails the build. Rules marked "listed" come from the owner-approved Task 6.1
+// list (verified on a larger project); the fixture builds without them, so they
+// are not backed by a failure recorded here.
+//
+// Not granted, because no failure needed them: the per-user cache dir (C/), the
+// xcrun_db, swbuild.tmp.*, ResultBundle_*, /private/var/db, and every
+// com.apple.* or org.swift.swiftpm shared-cache namespace. The runtime shim
+// answers xcrun, CFFIXED_USER_HOME and SWIFTPM_MODULECACHE_OVERRIDE (safeEnv)
+// keep the remaining caches in the runtime directory.
+function xcodebuildRules(clone, runtime) {
+	const rules = [
+		// required: xcodebuild exits 69 without the Xcode license preference.
+		'(allow file-read* (literal "/Library/Preferences/com.apple.dt.Xcode.plist"))',
+		// required: MobileDevice and friends; /System/Library/PrivateFrameworks is a
+		// symlink into /Library/Apple on this macOS, so both prefixes are read.
+		'(allow file-read* (subpath "/Library/Developer/PrivateFrameworks"))',
+		'(allow file-read* (subpath "/Library/Apple/System/Library/PrivateFrameworks"))',
+		// listed. user-preference-read is deliberately absent: with the cfprefsd
+		// lookup below it would expose every user defaults domain to the check.
+		"(allow ipc-posix-shm*)",
+		"(allow iokit-open)",
+		'(allow mach-lookup (global-name-prefix "com.apple.cfprefsd."))',
+		// required (libinfo user lookup)
+		'(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))',
+		// listed
+		'(allow mach-lookup (global-name "com.apple.FSEvents"))',
+		'(allow mach-lookup (global-name "com.apple.coreservices.launchservicesd"))',
+		// required (launch services map database)
+		'(allow mach-lookup (global-name "com.apple.lsd.mapdb"))',
+		// listed
+		'(allow mach-lookup (global-name "com.apple.trustd"))',
+		'(allow mach-lookup (global-name "com.apple.logd"))',
+		'(allow mach-lookup (global-name "com.apple.diagnosticd"))',
+		'(allow mach-lookup (global-name "com.apple.system.notification_center"))',
+		'(allow mach-lookup (global-name "com.apple.distributed_notifications@1v3"))',
+		// required, and not in the listed set: confstr(_CS_DARWIN_USER_DIR) in the
+		// SwiftPM manifest-compile subprocess asks dirhelper; without it the
+		// subprocess falls back to /tmp and fails with couldNotFindTmpDir.
+		'(allow mach-lookup (global-name "com.apple.bsd.dirhelper"))',
+	];
+	const temp = userTempDir();
+	if (!temp) return rules;
+	const base = regexEscape(temp);
+	// required: SwiftPM creates a unique TemporaryDirectory.<random> per
+	// invocation here for the manifest compile. The random name cannot be known
+	// in advance, so the prefix also matches another SwiftPM run's directory.
+	rules.push(
+		`(allow file-read* file-write* (regex #"^${base}/TemporaryDirectory\\.[A-Za-z0-9]+(/|$)"))`,
+	);
+	// required: SwiftPM lock files are named after the locked path with "/"
+	// flattened to "_", so only this clone's and runtime's own locks match.
+	for (const root of [clone, runtime]) {
+		const flat = root.replaceAll("/", "_");
+		if (/["\n\r]/u.test(flat)) continue;
+		rules.push(
+			`(allow file-read* file-write* (regex #"^${base}/${regexEscape(flat)}(_[^/]*)?\\.lock$"))`,
+		);
+	}
+	return rules;
+}
+export function quickCheckSandboxProfile(
+	clone,
+	runtime,
+	readOnlyPaths = [],
+	{ command } = {},
+) {
 	clone = realpathSync(clone);
 	runtime = realpathSync(runtime);
+	const developer = developerDir();
 	const nodeRoot = dirname(dirname(realpathSync(process.execPath)));
 	const npmRoot = dirname(dirname(realpathSync("/opt/homebrew/bin/npm")));
 	const reads = [
@@ -64,20 +364,33 @@ export function quickCheckSandboxProfile(clone, runtime, readOnlyPaths = []) {
 		runtime,
 		...readOnlyPaths.map((path) => realpathSync(path)),
 	];
+	if (developer) reads.push(xcodeAppRoot(developer));
+	// A read-only input reached through a symlink (uv's `cpython-3.x` alias of
+	// its versioned interpreter dir) needs the link itself readable to resolve.
+	const readLiterals = [
+		...homebrewLinkReads(),
+		...readOnlyPaths.filter(
+			(path) => isAbsolute(path) && lstatSync(path).isSymbolicLink(),
+		),
+	];
 	// The top-level symlinks need metadata access so realpath() of TMPDIR and
 	// similar paths resolves; their targets stay governed by the read list.
 	const ancestors = new Set(["/", "/var", "/tmp", "/etc"]);
-	for (const path of reads) {
+	for (const path of [...reads, ...readLiterals]) {
 		let current = dirname(path);
 		while (current !== "/") {
 			ancestors.add(current);
 			current = dirname(current);
 		}
 	}
-	const literals = [...ancestors]
+	const metadata = [...ancestors]
 		.filter((path) => path !== "/")
 		.map((path) => `(literal ${JSON.stringify(path)})`)
 		.join(" ");
+	const readRules = [
+		...reads.map((path) => `(subpath ${JSON.stringify(path)})`),
+		...readLiterals.map((path) => `(literal ${JSON.stringify(path)})`),
+	].join(" ");
 	return [
 		"(version 1)",
 		"(deny default)",
@@ -87,9 +400,10 @@ export function quickCheckSandboxProfile(clone, runtime, readOnlyPaths = []) {
 		"(allow signal (target same-sandbox))",
 		"(allow sysctl-read)",
 		'(allow file-read* (literal "/"))',
-		`(allow file-read-metadata ${literals})`,
-		`(allow file-read* ${reads.map((path) => `(subpath ${JSON.stringify(path)})`).join(" ")})`,
+		`(allow file-read-metadata ${metadata})`,
+		`(allow file-read* ${readRules})`,
 		`(allow file-write* (subpath ${JSON.stringify(clone)}) (subpath ${JSON.stringify(runtime)}) (literal "/dev/null"))`,
+		...(isXcodebuildBuild(command) ? xcodebuildRules(clone, runtime) : []),
 	].join("\n");
 }
 function git(cwd, env, args, input) {

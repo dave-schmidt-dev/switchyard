@@ -79,7 +79,7 @@ describe("contract coverage groups", () => {
 					),
 				)
 				.digest("hex"),
-			"d9cb54ca8f9a7c8b958a3ad1ebf21cc66ef8d4d0d5a44335e33e03857691c157",
+			"3cdc7af676aa8a91afa95e67cc34d85215411a697ea211deaf641d6d1925a0e6",
 		);
 	});
 
@@ -106,7 +106,7 @@ describe("contract coverage groups", () => {
 					),
 				)
 				.digest("hex"),
-			"ed88dbdaa4ebeedd29a2e0d26e0a7074469102d084ce40e9709d67f85ef7ab31",
+			"3cc72b1272dd44da6432d65c8f9f0f3ef7c0db81ec2e41510c4650b5bbf57b7e",
 		);
 		let calls = 0;
 		const result = runContractCoverage({

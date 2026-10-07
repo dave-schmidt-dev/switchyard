@@ -8,12 +8,15 @@ import {
 	readFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { DETAIL_FIELD_TYPES } from "../diagnostics/failure-registry.mjs";
 import {
 	retainedSegmentPaths,
 	rotateLedgerIfNeeded,
 } from "../ledger/sanitize.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
+import { LIFECYCLE_CHECKS } from "./routing-stop-record.mjs";
 
+const RECORD_TYPES = new Set(["attempt", "stop", "invocation"]);
 const STRING_FIELDS = [
 	"project",
 	"routingRunId",
@@ -33,6 +36,17 @@ const STRING_FIELDS = [
 	"errorKind",
 ];
 const BOOLEAN_FIELDS = ["salvageable", "partialRetained"];
+// Optional fields are copied only when the caller supplies them, each through
+// the sanitizer of its declared type: a registered detail field can never be
+// dropped or coerced to another type.
+const OPTIONAL_FIELD_TYPES = Object.freeze({
+	preflightCode: "string",
+	usageError: "string",
+	lifecycleCheck: "string",
+	...DETAIL_FIELD_TYPES,
+});
+const STRING_ARRAY_LIMIT = 5;
+const STRING_ARRAY_MAX_CHARS = 200;
 const hasControls = (value) =>
 	[...value].some(
 		(char) => char.codePointAt(0) < 32 || char.codePointAt(0) === 127,
@@ -41,6 +55,26 @@ const sanitizeString = (value) =>
 	typeof value === "string" && value.length <= 256 && !hasControls(value)
 		? value
 		: null;
+const sanitizeStringArray = (value) => {
+	if (!Array.isArray(value)) return null;
+	const bounded = [];
+	for (const item of value) {
+		if (typeof item !== "string") continue;
+		bounded.push(
+			item.replace(/\p{Cc}/gu, "?").slice(0, STRING_ARRAY_MAX_CHARS),
+		);
+		if (bounded.length === STRING_ARRAY_LIMIT) break;
+	}
+	return bounded;
+};
+const sanitizeIntegerField = (value) =>
+	Number.isSafeInteger(value) && value >= 0 && value <= 4096 ? value : null;
+function sanitizeOptionalField(type, value) {
+	if (type === "boolean") return typeof value === "boolean" ? value : null;
+	if (type === "integer") return sanitizeIntegerField(value);
+	if (type === "stringArray") return sanitizeStringArray(value);
+	return sanitizeString(value);
+}
 
 function logPath({ stateRoot } = {}, create) {
 	const dir = join(stateRoot ?? getStateRoot(), "failure-log");
@@ -92,16 +126,19 @@ function fingerprintOf(record) {
  * dropped, missing values become null, and strings longer than 256 characters
  * or containing control characters become null. Prompts, provider output,
  * argv, environment, check commands and file contents are never recorded.
+ * Registered detail fields (and the invocation fields `preflightCode` and
+ * `usageError`) are copied only when supplied, each sanitized by its declared
+ * type. `lifecycleCheck` is copied only when it names a closed lifecycle check.
  *
- * @param {object} input - Raw record fields; `recordType` must be "attempt" or
- *   "stop".
+ * @param {object} input - Raw record fields; `recordType` must be "attempt",
+ *   "stop" or "invocation".
  * @param {object} [options]
  * @param {string} [options.stateRoot] - State root override.
  * @returns {object} The record exactly as it was appended.
  */
 export function appendFailureRecord(input, { stateRoot } = {}) {
 	const recordType = input?.recordType;
-	if (recordType !== "attempt" && recordType !== "stop") {
+	if (!RECORD_TYPES.has(recordType)) {
 		throw Object.assign(new Error("failure_log_record_type_invalid"), {
 			code: "failure_log_record_type_invalid",
 		});
@@ -114,6 +151,16 @@ export function appendFailureRecord(input, { stateRoot } = {}) {
 	for (const key of STRING_FIELDS) record[key] = sanitizeString(input?.[key]);
 	for (const key of BOOLEAN_FIELDS)
 		record[key] = typeof input?.[key] === "boolean" ? input[key] : null;
+	for (const [key, type] of Object.entries(OPTIONAL_FIELD_TYPES)) {
+		if (input?.[key] === undefined) continue;
+		record[key] = sanitizeOptionalField(type, input[key]);
+	}
+	// lifecycleCheck is a closed enum: anything else is not a check name.
+	if (
+		record.lifecycleCheck !== undefined &&
+		!LIFECYCLE_CHECKS.includes(record.lifecycleCheck)
+	)
+		record.lifecycleCheck = null;
 	record.fingerprint = fingerprintOf(record);
 	const path = failureLogPath({ stateRoot });
 	rotateLedgerIfNeeded(path);

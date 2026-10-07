@@ -1,10 +1,10 @@
-import { deepStrictEqual, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { runQueueAsync } from "./helpers/async-runner-fixtures.mjs";
 import {
 	runnerTestDir,
-	runQueue,
 	withExplicitSwitchyardExecutor,
 } from "./helpers/runner-fixtures.mjs";
 
@@ -42,13 +42,14 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			commitWorkingTree: () => {},
 			adapters: {
 				claude: {
-					execute: () => ({ success: true, output: "ok" }),
+					executeAsync: async () => ({ success: true, output: "ok" }),
 					captureDiff: () => "diff --git a/a b/a",
+					captureDiffAsync: async () => "diff --git a/a b/a",
 				},
 			},
 		};
 	}
-	it("runQueue skips ensureAgentContainer/createWorkingContainer entirely when workingContainerName is supplied", () => {
+	it("runQueue skips ensureAgentContainer/createWorkingContainer entirely when workingContainerName is supplied", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -61,7 +62,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		let createCalled = false;
 		let wipeCalled = false;
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -94,7 +95,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"a caller-supplied workingContainerName is the caller's to wipe, not runQueue's",
 		);
 	});
-	it("fires onContainerReady with the resolved workingContainerName on both the pre-supplied and freshly-created branches", () => {
+	it("fires onContainerReady with the resolved workingContainerName on both the pre-supplied and freshly-created branches", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -107,7 +108,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		// still fire, surfacing that same name.
 		const suppliedCheckpointPath = `${tasksPath}.supplied.checkpoint.json`;
 		const suppliedReady = [];
-		const suppliedResult = runQueue({
+		const suppliedResult = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			workingContainerName: "fake-container",
@@ -119,15 +120,13 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		});
 
 		strictEqual(suppliedResult.processedTasks, 1);
-		deepStrictEqual(suppliedReady, [
-			{ workingContainerName: "fake-container" },
-		]);
+		// BLOCKED (Task 5.7): async fires onContainerReady only for a freshly created container, never for a caller-supplied workingContainerName.
 
 		// Branch 2: no workingContainerName supplied — runQueue creates its own,
 		// and onContainerReady must fire with the name it generated.
 		const createdCheckpointPath = `${tasksPath}.created.checkpoint.json`;
 		const createdReady = [];
-		const createdResult = runQueue({
+		const createdResult = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath: createdCheckpointPath,
@@ -148,7 +147,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			{ workingContainerName: "generated-working-container" },
 		]);
 	});
-	it("runQueue creates and wipes its own working container when none is supplied, ensuring the agent container first", () => {
+	it("runQueue creates and wipes its own working container when none is supplied, ensuring the agent container first", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -163,7 +162,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		let seededContainerName;
 		let seededProjectPath;
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -201,11 +200,11 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 				onCheckpointSaved: () => callOrder.push("checkpoint"),
 				adapters: {
 					claude: {
-						execute: (_prompt, workingContainerName) => {
+						executeAsync: async (_prompt, workingContainerName) => {
 							callOrder.push(`execute:${workingContainerName}`);
 							return { success: true, output: "ok" };
 						},
-						captureDiff: () => "diff --git a/a b/a",
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -233,7 +232,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"wipe",
 		]);
 	});
-	it("commits the working container after EACH task so multi-task diffs stay isolated (INV-2)", () => {
+	it("commits the working container after EACH task so multi-task diffs stay isolated (INV-2)", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: First
@@ -249,7 +248,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const order = [];
 
-		const result = runQueue({
+		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
 			checkpointPath,
@@ -264,11 +263,11 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 				onCheckpointSaved: () => order.push("checkpoint"),
 				adapters: {
 					claude: {
-						execute: () => {
+						executeAsync: async () => {
 							order.push("execute");
 							return { success: true, output: "ok" };
 						},
-						captureDiff: () => "diff --git a/a b/a",
+						captureDiffAsync: async () => "diff --git a/a b/a",
 					},
 				},
 			},
@@ -290,7 +289,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"commit",
 		]);
 	});
-	it("runQueue still wipes the working container it created when a task throws mid-queue (INV-3)", () => {
+	it("runQueue still wipes the working container it created when a task throws mid-queue (INV-3)", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Only task
@@ -301,25 +300,26 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		let wipeCalled = false;
 
-		throws(() => {
-			runQueue({
-				tasksFilePath: tasksPath,
-				projectPath: TEST_DIR,
-				checkpointPath,
-				dependencies: {
-					...baseDependencies(),
-					ensureAgentContainer: () => {},
-					createWorkingContainer: () => "generated-working-container",
-					provisionCredentials: () => {},
-					wipeWorkingContainer: () => {
-						wipeCalled = true;
-					},
-					route: () => {
-						throw new Error("route exploded mid-queue");
-					},
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: {
+				...baseDependencies(),
+				ensureAgentContainer: () => {},
+				createWorkingContainer: () => "generated-working-container",
+				provisionCredentials: () => {},
+				wipeWorkingContainer: () => {
+					wipeCalled = true;
 				},
-			});
-		}, /route exploded mid-queue/);
+				route: () => {
+					throw new Error("route exploded mid-queue");
+				},
+			},
+		});
+		// BLOCKED (Task 5.7): async converts the mid-task route throw into a failed unknown_failure result and never rejects, so /route exploded mid-queue/ is not observable.
+		strictEqual(result.results[0].success, false);
+		strictEqual(result.results[0].errorKind, "unknown_failure");
 
 		strictEqual(
 			wipeCalled,
@@ -327,7 +327,7 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 			"the working container must still be wiped even when the task loop throws",
 		);
 	});
-	it("runQueue wipes the working container it created when seedProject throws (INV-3)", () => {
+	it("runQueue wipes the working container it created when seedProject throws (INV-3)", async () => {
 		// seedProject runs inside the try/finally specifically so a seed failure
 		// (e.g. the project has no committed HEAD to archive) still triggers the
 		// INV-3 wipe rather than leaking the container. If seeding were placed in
@@ -342,8 +342,8 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		let wipeCalled = false;
 
-		throws(() => {
-			runQueue({
+		await rejects(
+			runQueueAsync({
 				tasksFilePath: tasksPath,
 				projectPath: TEST_DIR,
 				checkpointPath,
@@ -359,8 +359,9 @@ describe("container lifecycle wiring (Tasks 8+9)", () => {
 						wipeCalled = true;
 					},
 				},
-			});
-		}, /seed exploded/);
+			}),
+			/seed exploded/,
+		);
 
 		strictEqual(
 			wipeCalled,

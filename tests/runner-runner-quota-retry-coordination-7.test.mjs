@@ -1,4 +1,4 @@
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -8,11 +8,10 @@ import { pathToFileURL } from "node:url";
 import { loadCheckpoint } from "../src/switchyard/runner/index.mjs";
 import {
 	runnerTestDir,
-	runQueue,
 	runQueueAsync,
 	TASK_BASE,
 	withExplicitSwitchyardExecutor,
-} from "./helpers/runner-fixtures.mjs";
+} from "./helpers/async-runner-fixtures.mjs";
 
 const TEST_DIR = runnerTestDir(import.meta.url);
 function writeLegacyCheckpoint(path, checkpoint) {
@@ -175,7 +174,7 @@ describe("runner quota retry coordination", () => {
 			only,
 		};
 	}
-	it("does not erase present non-array retry collections before validation", () => {
+	it("does not erase present non-array retry collections before validation", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Reject non-array retry evidence
@@ -199,14 +198,13 @@ describe("runner quota retry coordination", () => {
 					{ provider: "agy", model: "fixture-gemini", target: "antigravity" },
 				],
 			});
-			throws(
-				() =>
-					runQueue({
-						tasksFilePath: tasksPath,
-						projectPath: TEST_DIR,
-						checkpointPath,
-						dependencies: fixture.dependencies,
-					}),
+			await rejects(
+				runQueueAsync({
+					tasksFilePath: tasksPath,
+					projectPath: TEST_DIR,
+					checkpointPath,
+					dependencies: fixture.dependencies,
+				}),
 				new RegExp(`${corruptField} is invalid`),
 			);
 			deepStrictEqual(fixture.routeCalls, []);
@@ -265,7 +263,7 @@ describe("runner quota retry coordination", () => {
 			),
 		);
 	});
-	it("does not infer dead ownership after a real child-process crash", () => {
+	it("does not infer dead ownership after a real child-process crash", async () => {
 		const tasksPath = writeTasksFile(`## Phase 1
 
 ### Task 1.1: Child crash recovery
@@ -417,14 +415,13 @@ await runQueueAsync({
 			executionOutcomes: { agy: [{ success: true, output: "ok" }] },
 		});
 		const before = readFileSync(checkpointPath, "utf8");
-		throws(
-			() =>
-				runQueue({
-					tasksFilePath: tasksPath,
-					projectPath: TEST_DIR,
-					checkpointPath,
-					dependencies: fixture.dependencies,
-				}),
+		await rejects(
+			runQueueAsync({
+				tasksFilePath: tasksPath,
+				projectPath: TEST_DIR,
+				checkpointPath,
+				dependencies: fixture.dependencies,
+			}),
 			/checkpoint owner displaced/,
 		);
 		strictEqual(fixture.executeCalls.length, 0);

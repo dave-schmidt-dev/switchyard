@@ -221,7 +221,11 @@ describe("provider process lifecycle", () => {
 		deepStrictEqual(cleanupCalls[0], {
 			command: "fake",
 			args: ["git", "add", "-A"],
-			context: { onStatus: undefined, workspaceId: "worker" },
+			context: {
+				onStatus: undefined,
+				reason: "timeout",
+				workspaceId: "worker",
+			},
 		});
 	});
 

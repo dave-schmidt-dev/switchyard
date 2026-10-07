@@ -18,7 +18,6 @@ import {
 } from "../src/switchyard/dispatch/host-power.mjs";
 import { writeDirtyOverlayReceipt } from "../src/switchyard/lifecycle/index.mjs";
 import {
-	executeTask as executeTaskImpl,
 	getRunnableTasks,
 	loadCheckpoint,
 	loadTaskQueue,
@@ -27,10 +26,10 @@ import {
 	validateCallerInputs,
 } from "../src/switchyard/runner/index.mjs";
 import {
+	executeTask,
 	runnerTestDir,
 	runQueue,
 	runQueueAsync,
-	runQueueWithOrchestrator,
 	withExplicitSwitchyardExecutor,
 } from "./helpers/runner-fixtures.mjs";
 
@@ -308,7 +307,7 @@ describe("host power queue policy", () => {
 	it("emits fixed unknown-power status while preserving provider routing", () => {
 		const statuses = [];
 		const routeCalls = [];
-		const result = executeTaskImpl(
+		const result = executeTask(
 			{ id: "1.1", title: "task", description: "op" },
 			{
 				hostPowerPolicyEnabled: true,
@@ -378,7 +377,6 @@ describe("host power queue policy", () => {
 		const entrypoints = [
 			["sync", runQueue],
 			["async", runQueueAsync],
-			["orchestrator", runQueueWithOrchestrator],
 		];
 		for (const [name, entrypoint] of entrypoints) {
 			const tasksPath = writeTasksFile(`### Task 2.1: Battery transition ${name}

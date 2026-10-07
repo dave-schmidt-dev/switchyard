@@ -6,13 +6,11 @@ import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels
 import {
 	createQueueBackend,
 	emitStageOutcome,
-	executeTask as executeTaskImpl,
+	executeTaskAsync,
 } from "../src/switchyard/runner/index.mjs";
+import { runQueueAsync } from "./helpers/async-runner-fixtures.mjs";
 import {
 	runnerTestDir,
-	runQueue,
-	runQueueAsync,
-	runQueueWithOrchestrator,
 	withExplicitSwitchyardExecutor,
 	withTestDescriptorContext,
 } from "./helpers/runner-fixtures.mjs";
@@ -29,6 +27,60 @@ function presentHostProbe(pid) {
 		bootSessionUuid: HOST_BOOT_UUID,
 		startTicks: String(pid * 10 + 1),
 		identity: hostBirth(pid),
+	};
+}
+function routedBroker(context) {
+	const selectedRoute = () => ({
+		reservation: { id: "fixture-reservation" },
+		...context.route({
+			requiredCapability: "standard",
+			availableProviders: ["claude"],
+		}),
+		capability: "standard",
+		effort: null,
+		percentLeft: 70,
+		reason: "spread",
+		snapshotIdentity: {
+			status: "fresh",
+			mtime: new Date().toISOString(),
+			ageMs: 0,
+		},
+	});
+	return {
+		selectAndReserve: async () => selectedRoute(),
+		launcherIdentity: () => ({
+			provider: "claude",
+			resolvedTarget: "claude",
+			harness: "claude",
+			model: "fixture-model",
+			effort: null,
+			descriptorIdentity: null,
+			reservationId: "fixture-reservation",
+		}),
+		execute: async () => ({ success: true, output: "ok" }),
+		release: async () => {},
+	};
+}
+function descriptorFailureBroker() {
+	return {
+		selectAndReserve: async () => ({
+			reservation: { id: "fixture-reservation" },
+			provider: "claude",
+			model: "fixture-model",
+			resolvedTarget: "claude",
+			harness: "claude",
+			capability: "standard",
+			effort: null,
+			reason: "spread",
+			snapshotIdentity: {
+				status: "fresh",
+				mtime: new Date().toISOString(),
+				ageMs: 0,
+			},
+		}),
+		launcherIdentity: () => ({}),
+		execute: async () => ({ success: true, output: "ok" }),
+		release: async () => {},
 	};
 }
 describe("macOS queue admission", () => {
@@ -157,11 +209,7 @@ describe("macOS queue admission", () => {
 	});
 
 	it("surfaces Aqua wait and ready status for every queue create path", async () => {
-		const entrypoints = [
-			["sync", runQueue],
-			["async", runQueueAsync],
-			["orchestrator", runQueueWithOrchestrator],
-		];
+		const entrypoints = [["async", runQueueAsync]];
 
 		for (const [name, entrypoint] of entrypoints) {
 			const root = join(TEST_DIR, `aqua-status-${name}`);
@@ -205,11 +253,6 @@ describe("macOS queue admission", () => {
 				dependencies: {
 					backendFactory,
 					onStatus: (event) => events.push(event),
-					orchestrator: {
-						launch: async () => "job",
-						status: async () => ({ state: "done" }),
-						result: async () => ({ success: true, diff: null }),
-					},
 				},
 			});
 			await result;
@@ -294,14 +337,15 @@ describe("typed non-provider stage facts", () => {
 			integrationGate: () => ({ success: true }),
 			adapters: {
 				claude: {
-					execute: () => ({ success: true, output: "ok" }),
-					captureDiff: () => "diff --git a/src/a.mjs b/src/a.mjs",
+					executeAsync: async () => ({ success: true, output: "ok" }),
+					captureDiffAsync: async () => "diff --git a/src/a.mjs b/src/a.mjs",
 				},
 			},
 			projectPath: TEST_DIR,
 			workingContainerName: "typed-task-worker",
 		});
-		const result = executeTaskImpl(
+		context.broker = routedBroker(context);
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "typed task",
@@ -311,7 +355,6 @@ describe("typed non-provider stage facts", () => {
 			},
 			context,
 		);
-		await context._outcomeWriteChain;
 		strictEqual(result.success, true);
 		deepStrictEqual(
 			recorded.map(({ stage, status }) => [stage, status]),
@@ -344,8 +387,9 @@ describe("typed non-provider stage facts", () => {
 			adapters: {},
 			projectPath: TEST_DIR,
 			workingContainerName: "typed-task-worker",
+			broker: descriptorFailureBroker(),
 		};
-		const result = executeTaskImpl(
+		const result = await executeTaskAsync(
 			{
 				id: "1.1",
 				title: "typed unavailable task",
@@ -355,7 +399,6 @@ describe("typed non-provider stage facts", () => {
 			},
 			context,
 		);
-		await context._outcomeWriteChain;
 		strictEqual(result.success, false);
 		deepStrictEqual(
 			recorded
