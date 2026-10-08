@@ -62,14 +62,14 @@ test("Claude launcher validates its fixed arguments", () => {
 		assert.deepEqual(
 			parseLauncherArgs([
 				"--model",
-				"claude-haiku-4-5-20251001",
+				"claude-haiku-5-5",
 				"--effort",
 				"high",
 				"--worktree",
 				item.worktree,
 			]),
 			{
-				model: "claude-haiku-4-5-20251001",
+				model: "claude-haiku-5-5",
 				effort: "high",
 				worktree: item.worktree,
 			},
@@ -140,6 +140,8 @@ test("Claude arguments, environment, and profile are restricted", () => {
 		false,
 	);
 	assert.equal(env.HOME, "/r/home");
+	// Regression: without this the CLI opens /tmp/claude-<uid>, which Seatbelt denies.
+	assert.equal(env.CLAUDE_CODE_TMPDIR, "/r");
 	const profile = claudeCodeSeatbeltProfile({
 		worktree: "/w",
 		runtime: "/r",

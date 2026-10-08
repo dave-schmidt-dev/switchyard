@@ -30,7 +30,7 @@ const SELF = fileURLToPath(import.meta.url);
 const CLAUDE = "/opt/homebrew/bin/claude";
 const CLAUDE_ROOT = "/opt/homebrew/Caskroom/claude-code@latest";
 const MODELS = Object.freeze([
-	"claude-haiku-4-5-20251001",
+	"claude-haiku-5-5",
 	"claude-sonnet-5-5",
 	"claude-opus-5-5",
 ]);
@@ -86,6 +86,8 @@ export function claudeCodeEnvironment(runtime) {
 		TMPDIR: runtime,
 		TMP: runtime,
 		TEMP: runtime,
+		// The CLI ignores TMPDIR for its own scratch and defaults to /tmp.
+		CLAUDE_CODE_TMPDIR: runtime,
 		USER: "dave",
 		LOGNAME: "dave",
 		LANG: "en_US.UTF-8",
