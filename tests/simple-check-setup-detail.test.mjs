@@ -163,6 +163,122 @@ test("a prepare step that throws ENOENT records the step, code, syscall and exec
 	ok(isPersistentFailureMetadata(run.lastFailure));
 });
 
+test("the terminal result carries the same durable failureDetails as run.json", async () => {
+	const { result, run } = await runSetupFailure({ code: "ENOENT" });
+	strictEqual(result.status, "failed");
+	ok(result.failureDetails, "terminal result carries failureDetails");
+	deepStrictEqual(result.failureDetails, run.failureDetails);
+	strictEqual(result.failureDetails.checkSetupStep, "clone_checkout");
+	ok(isPersistentFailureDetails(result.failureDetails));
+	ok(
+		!JSON.stringify(result.failureDetails).includes(SETUP_ERROR_MESSAGE_CANARY),
+		"terminal failureDetails never carries the thrown message",
+	);
+});
+
+test("a cancelled provider result persists its resolved cancel source", async () => {
+	const repo = repoFixture();
+	let providerCalls = 0;
+	const result = await runSimpleTask(
+		{
+			...repo,
+			capability: "standard",
+			files: ["a.txt"],
+			checks: [],
+			deadlineMs: Date.now() + 180_000,
+		},
+		{
+			...taskDependencies(repo, () => {
+				providerCalls += 1;
+			}),
+			executeProvider: async () => {
+				providerCalls += 1;
+				return {
+					success: false,
+					code: null,
+					signal: "SIGTERM",
+					timedOut: false,
+					cancelled: true,
+					cancelSource: "signal_sigterm",
+					writerLifecycle: "stopped",
+				};
+			},
+		},
+	);
+	strictEqual(providerCalls, 1);
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "provider_cancelled");
+	strictEqual(result.providerReliability.causeCode, "cancelled");
+	const run = await readRun(result.runId);
+	strictEqual(run.failureDetails.cancelSource, "signal_sigterm");
+	strictEqual(run.failureDetails.cancelled, true);
+	deepStrictEqual(result.failureDetails, run.failureDetails);
+});
+
+test("a credential-shaped provider cancel source never reaches run.json", async () => {
+	const repo = repoFixture();
+	const canary = "sk-live-5f2c9d-credential";
+	const result = await runSimpleTask(
+		{
+			...repo,
+			capability: "standard",
+			files: ["a.txt"],
+			checks: [],
+			deadlineMs: Date.now() + 180_000,
+		},
+		{
+			...taskDependencies(repo),
+			executeProvider: async () => ({
+				success: false,
+				code: null,
+				signal: null,
+				timedOut: false,
+				cancelled: true,
+				cancelSource: canary,
+				writerLifecycle: "stopped",
+			}),
+		},
+	);
+	strictEqual(result.status, "failed");
+	const run = await readRun(result.runId);
+	strictEqual(run.failureDetails.cancelSource, "unspecified");
+	ok(!JSON.stringify(run.failureDetails).includes(canary));
+	deepStrictEqual(result.failureDetails, run.failureDetails);
+});
+
+test("a readiness refusal names the second failing command without its argv", {
+	skip: sandboxSkip,
+}, async () => {
+	const repo = repoFixture();
+	const argvCanary = "--switchyard-argv-canary";
+	let providerCalls = 0;
+	const result = await runSimpleTask(
+		{
+			...repo,
+			capability: "standard",
+			files: ["a.txt"],
+			checks: ["test -f a.txt", `switchyard_missing_check_tool ${argvCanary}`],
+			deadlineMs: Date.now() + 180_000,
+		},
+		taskDependencies(repo, () => {
+			providerCalls += 1;
+		}),
+	);
+	strictEqual(providerCalls, 0, "no provider ran before the refusal");
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "check_environment_unavailable");
+	strictEqual(result.failurePhase, "prepare");
+	strictEqual(result.providerReliability.causeCode, "check_setup_failed");
+	const run = await readRun(result.runId);
+	const details = run.failureDetails;
+	ok(details, "run.json carries failureDetails");
+	strictEqual(details.checkSetupStep, "validate_commands");
+	strictEqual(details.checkIndex, 2);
+	strictEqual(details.checkSetupExecutable, "switchyard_missing_check_tool");
+	ok(!JSON.stringify(details).includes(argvCanary));
+	deepStrictEqual(result.failureDetails, run.failureDetails);
+});
+
 test("a setup error code outside the bound is dropped, not persisted", async () => {
 	const { result, run } = await runSetupFailure({ code: "ENOENT/../escape" });
 	strictEqual(result.providerReliability.causeCode, "check_setup_failed");

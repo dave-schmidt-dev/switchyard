@@ -1,6 +1,11 @@
-import { notStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
 import { test } from "node:test";
 import {
+	isPersistentFailureDetails,
+	sanitizeFailureDetails,
+} from "../src/switchyard/adapter/exec-error.mjs";
+import {
+	DETAIL_FIELD_TYPES,
 	FAILURE_REGISTRY,
 	resolveFailure,
 } from "../src/switchyard/diagnostics/failure-registry.mjs";
@@ -181,6 +186,88 @@ test("a cancelled resolution validates cancelSource against the closed enum", ()
 	);
 });
 
+test("a cancelled resolution registers cancelSource for persistence, no other outcome does", () => {
+	const cancelled = resolveFailure({
+		reason: "provider_signalled",
+		phase: "execute",
+		providerResult: cancelledBySigterm,
+	});
+	ok(
+		cancelled.detailFields.includes("cancelSource"),
+		"cancelled outcomes persist their closed origin",
+	);
+	strictEqual(DETAIL_FIELD_TYPES.cancelSource, "string");
+	// The frozen registry rows themselves stay unchanged: the field is added
+	// only to the resolution that is actually cancelled.
+	strictEqual(
+		FAILURE_REGISTRY.get("provider_signalled").detailFields.includes(
+			"cancelSource",
+		),
+		false,
+	);
+	const plain = resolveFailure({
+		reason: "provider_exit_nonzero",
+		phase: "execute",
+		providerResult: vibeExit76Plain,
+	});
+	strictEqual(plain.cancelSource, null);
+	strictEqual(plain.detailFields.includes("cancelSource"), false);
+});
+
+test("resolveFailure maps unknown provider cancel sources onto unspecified", () => {
+	const resolved = resolveFailure({
+		reason: "provider_cancelled",
+		phase: "execute",
+		providerResult: {
+			success: false,
+			cancelled: true,
+			cancelSource: "sk-live-5f2c9d-credential",
+		},
+	});
+	strictEqual(resolved.causeCode, "cancelled");
+	strictEqual(resolved.cancelSource, "unspecified");
+});
+
+test("the failure-details sanitizer accepts only the closed cancel-source enum", () => {
+	for (const source of [
+		"signal_sigterm",
+		"signal_sigint",
+		"internal_deadline",
+		"unspecified",
+	]) {
+		deepStrictEqual(
+			sanitizeFailureDetails({ cancelSource: source }),
+			{ cancelSource: source },
+			source,
+		);
+		ok(isPersistentFailureDetails({ cancelSource: source }), source);
+	}
+	for (const source of [
+		"not_a_cancel_source",
+		"SIGTERM",
+		"",
+		"sk-live-5f2c9d",
+		"Bearer sk-ant-api03-credential",
+		"signal_sigterm sk-ant-api03-credential",
+	]) {
+		strictEqual(sanitizeFailureDetails({ cancelSource: source }), null, source);
+		strictEqual(
+			isPersistentFailureDetails({ cancelSource: source }),
+			false,
+			source,
+		);
+	}
+	// A rejected origin is dropped while the registered details survive.
+	deepStrictEqual(
+		sanitizeFailureDetails({
+			failureReason: "provider_cancelled",
+			cancelled: true,
+			cancelSource: "sk-live-5f2c9d",
+		}),
+		{ failureReason: "provider_cancelled", cancelled: true },
+	);
+});
+
 // ── Deadline fingerprints: one fingerprint, one code ────────────────────────
 
 test("run simple-a6fd1a19: vibe exit 76 with timedOut and no signal resolves to provider_deadline_exceeded from every entry point", () => {
@@ -290,6 +377,49 @@ test("run simple-6969459f: a timed-out check resolves to acceptance_check_timeou
 		resolveFailure({ reason: "check_failed", phase: "checks" }).causeCode,
 		"acceptance_check_failed",
 	);
+});
+
+test("simple reliability projects positive timeout evidence over stale false input", () => {
+	const conflicting = createSimpleProviderReliabilityDiagnostic({
+		failureReason: "provider_exit_nonzero",
+		failurePhase: "execute",
+		timedOut: false,
+		providerResult: vibeExit76TimedOut,
+	});
+	strictEqual(conflicting.causeCode, "provider_deadline_exceeded");
+	strictEqual(conflicting.timedOut, true);
+
+	const explicitFalse = createSimpleProviderReliabilityDiagnostic({
+		failureReason: "provider_exit_nonzero",
+		failurePhase: "execute",
+		providerResult: vibeExit76Plain,
+	});
+	strictEqual(explicitFalse.causeCode, "provider_exit_nonzero");
+	strictEqual(explicitFalse.timedOut, false);
+
+	const unknown = createSimpleProviderReliabilityDiagnostic({
+		failureReason: "provider_exit_nonzero",
+		failurePhase: "execute",
+	});
+	strictEqual(unknown.timedOut, null);
+
+	const cancelled = createSimpleProviderReliabilityDiagnostic({
+		failureReason: "provider_exit_nonzero",
+		failurePhase: "execute",
+		timedOut: false,
+		providerResult: cancelledAndTimedOut,
+	});
+	strictEqual(cancelled.causeCode, "cancelled");
+	strictEqual(cancelled.timedOut, true);
+
+	const timedOutCheck = createSimpleProviderReliabilityDiagnostic({
+		failureReason: "check_failed",
+		failurePhase: "checks",
+		timedOut: false,
+		providerResult: vibeExit76TimedOut,
+	});
+	strictEqual(timedOutCheck.causeCode, "acceptance_check_timeout");
+	strictEqual(timedOutCheck.timedOut, true);
 });
 
 // ── Closed codes for every reason that previously fell to unknown ────────────

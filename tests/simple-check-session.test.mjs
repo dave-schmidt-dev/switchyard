@@ -6,20 +6,36 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { quickCheckSandboxProfile } from "../src/switchyard/runner/checks-sandbox.mjs";
-import { createSimpleCheckSessions } from "../src/switchyard/simple/check-session.mjs";
+import { EVIDENCE_TAIL_BYTES } from "../src/switchyard/simple/check-environment.mjs";
+import {
+	createSimpleCheckSessions,
+	writeCheckEvidence,
+} from "../src/switchyard/simple/check-session.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
+
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 
 const suite = tempDir("switchyard-check-session-tests-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(suite, "runs");
 function git(path, args) {
-	return execFileSync("git", args, { cwd: path, encoding: "utf8" }).trim();
+	return execFileSync("git", args, {
+		cwd: path,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_SYSTEM: "/dev/null",
+		},
+	}).trim();
 }
 function commit(path) {
 	git(path, ["add", "."]);
@@ -641,6 +657,33 @@ for (const failure of ["deadline", "profile"]) {
 		}
 	});
 }
+
+test("failed-check evidence redacts credential shapes before truncation", () => {
+	const directory = join(tempDir("switchyard-check-evidence-"), "evidence");
+	const sk = "sk-live-ABCDEFGHIJKLMNOPQRSTUVWX";
+	const ghp = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+	const bws = "bws_0123456789abcdefghijklmnopqrstuv";
+	// The trailing padding places the token across the stdout tail boundary, so
+	// truncating before redacting would retain an unmatched token suffix.
+	const output = `${"x".repeat(EVIDENCE_TAIL_BYTES - 15)}\n${sk}${"y".repeat(16370)}`;
+	const stderr = `ordinary diagnostic: build failed\n${ghp}\n${bws}\n`;
+	const path = writeCheckEvidence(directory, 2, 3, { output, stderr });
+	const bytes = readFileSync(path);
+	const text = bytes.toString("utf8");
+	strictEqual(basename(path), "2-3.log");
+	strictEqual(statSync(directory).mode & 0o777, 0o700);
+	strictEqual(statSync(path).mode & 0o777, 0o600);
+	ok(bytes.length <= 2 * EVIDENCE_TAIL_BYTES, "per-stream tail cap retained");
+	ok(!text.includes(sk), "sk-shaped token never persisted");
+	ok(!text.includes(sk.slice(18)), "truncation never exposes a token suffix");
+	ok(!text.includes(ghp), "ghp-shaped token never persisted");
+	ok(!text.includes(bws), "bws-shaped token never persisted");
+	ok(
+		text.includes("ordinary diagnostic: build failed"),
+		"useful diagnostics are retained",
+	);
+	ok(text.includes("[REDACTED]"), "credential shapes are replaced");
+});
 
 test("changed manifests refuse acceptance without installing them", async () => {
 	const { repo, cache } = await lockedFixture();

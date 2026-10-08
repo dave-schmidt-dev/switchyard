@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { SimpleUsageError } from "../src/switchyard/simple/args.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
+import { fixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 // handleSimple writes invocation failure records; keep them out of the real
@@ -15,10 +16,7 @@ process.env.SWITCHYARD_RUN_STORE_ROOT ??= tempDir("simple-cli-state-");
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 
-function createProjectFixture() {
-	const root = realpathSync(tempDir("simple-cli-error-detail-"));
-	const project = join(root, "project");
-	mkdirSync(project);
+function initProject(project) {
 	strictEqual(
 		spawnSync("git", ["init", "-q", project], {
 			env: {
@@ -34,10 +32,79 @@ function createProjectFixture() {
 		"RequiredCapability: standard\nPerform task",
 	);
 	writeFileSync(join(project, "a.txt"), "content");
+	return project;
+}
+
+function createProjectFixture() {
+	const root = realpathSync(tempDir("simple-cli-error-detail-"));
+	const project = join(root, "project");
+	mkdirSync(project);
+	initProject(project);
 	return { root, project };
 }
 
+async function runRoutingFixture(overrides) {
+	const f = fixture(overrides);
+	// The routing fixture's engine reads its state from the project path it was
+	// built with, so the CLI must run against that same Git project.
+	const project = initProject(f.options.projectPath);
+	let resultJson = null;
+	const signalProcess = new EventEmitter();
+	signalProcess.exitCode = 0;
+	await handleSimple(
+		[
+			join(project, "prompt.txt"),
+			"--project",
+			project,
+			"--capability",
+			"standard",
+			"--file",
+			"a.txt",
+			"--check",
+			"true",
+			"--deadline",
+			new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+			"--routing-run-id",
+			"run-1",
+			"--json",
+		],
+		{
+			...f.deps,
+			signalProcess,
+			writeResult: (value) => {
+				resultJson = JSON.parse(value);
+			},
+		},
+	);
+	ok(resultJson !== null);
+	return resultJson;
+}
+
 describe("simple CLI usage and preflight error detail", () => {
+	it("projects routing exhaustion causes without inventing one for success", async () => {
+		const capacity = await runRoutingFixture({ __targets: [] });
+		strictEqual(capacity.status, "deferred");
+		strictEqual(capacity.direction, "native_required");
+		strictEqual(capacity.failureReason, "native_required");
+		strictEqual(capacity.exhaustionCause, "capacity");
+
+		const taskFailures = await runRoutingFixture({
+			"antigravity-claude": { status: "failed" },
+			codex: { status: "failed" },
+			vibe: { status: "failed" },
+		});
+		strictEqual(taskFailures.status, "deferred");
+		strictEqual(taskFailures.direction, "native_required");
+		strictEqual(taskFailures.failureReason, "native_required");
+		strictEqual(taskFailures.exhaustionCause, "task_failures");
+
+		const success = await runRoutingFixture();
+		strictEqual(success.status, "succeeded");
+		strictEqual(success.direction, "complete");
+		strictEqual(success.failureReason, undefined);
+		strictEqual(success.exhaustionCause, undefined);
+	});
+
 	it("returns usageError naming the deadline rule and writes stderr when deadline is more than 30 minutes ahead with --json", async () => {
 		const { project } = createProjectFixture();
 		const now = 1_700_000_000_000;

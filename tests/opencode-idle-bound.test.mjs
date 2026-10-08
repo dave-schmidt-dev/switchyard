@@ -287,9 +287,15 @@ else
 fi
 `,
 			);
+			// Non-zombie states must outlive a late first poll and the following
+			// interval; the zombie case keeps its short natural-exit wait.
+			const childLifetimeSeconds = state.startsWith("Z") ? 2 : 30;
 			writeExecutable(
 				join(commandDir, "opencode"),
-				"#!/bin/sh\necho mac-state-output\nsleep 2\n",
+				`#!/bin/sh
+echo mac-state-output
+sleep ${childLifetimeSeconds}
+`,
 			);
 
 			const result = runSupervisor(commandDir);

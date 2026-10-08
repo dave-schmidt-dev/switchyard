@@ -1,9 +1,11 @@
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
+import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
 	linkSync,
 	readFileSync,
 	realpathSync,
+	rmSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
@@ -221,4 +223,70 @@ test("new skipped outcomes roundtrip through the compatibility reader with exact
 			"partialWorktree",
 		].sort(),
 	);
+});
+
+test("dead run lock holder is automatically reclaimed while live, malformed, and replaced locks fail closed", () => {
+	const { project, stateRoot } = fixture();
+	const h = openRoutingRun(project, "run-1", { stateRoot });
+	const lockPath = join(h.runDir, ".lock");
+	h.release();
+
+	const res = spawnSync(process.execPath, ["-e", "process.exit(0)"], {
+		env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+	});
+	writeFileSync(lockPath, `${res.pid}\n`, { mode: 0o600 });
+	const reclaimed = openRoutingRun(project, "run-1", { stateRoot });
+	strictEqual(reclaimed.state.routingRunId, "run-1");
+
+	throws(() => openRoutingRun(project, "run-1", { stateRoot }), {
+		code: "routing_run_lock_contention",
+	});
+
+	rmSync(lockPath);
+	writeFileSync(lockPath, "replaced\n", { mode: 0o600 });
+	throws(() => reclaimed.release(), {
+		code: "routing_lock_identity_changed",
+	});
+	strictEqual(readFileSync(lockPath, "utf8"), "replaced\n");
+
+	for (const bad of ["bad\n", "-10\n", "0\n", ""]) {
+		writeFileSync(lockPath, bad, { mode: 0o600 });
+		throws(() => openRoutingRun(project, "run-1", { stateRoot }), {
+			code: "routing_run_lock_contention",
+		});
+	}
+
+	chmodSync(lockPath, 0o644);
+	throws(() => openRoutingRun(project, "run-1", { stateRoot }), {
+		code: "routing_unsafe_file",
+	});
+	rmSync(lockPath);
+});
+
+test("persisted routing timestamps reject impossible dates without widening the canonical UTC grammar", () => {
+	const { project, stateRoot } = fixture();
+	const h = openRoutingRun(project, "run-1", { stateRoot });
+	const path = join(h.runDir, "state.json");
+	const state = JSON.parse(readFileSync(path, "utf8"));
+	h.release();
+	strictEqual(
+		readRoutingRunState(project, "run-1", { stateRoot }).createdAt,
+		state.createdAt,
+	);
+
+	for (const field of ["createdAt", "updatedAt"]) {
+		for (const value of [
+			"2025-02-29T00:00:00.000Z",
+			"2026-10-08T24:00:00.000Z",
+			"2024-02-29T00:00:00Z",
+			"2024-02-29T00:00:00.000+00:00",
+		]) {
+			const next = structuredClone(state);
+			next[field] = value;
+			writeFileSync(path, JSON.stringify(next));
+			throws(() => readRoutingRunState(project, "run-1", { stateRoot }), {
+				code: "routing_state_malformed",
+			});
+		}
+	}
 });

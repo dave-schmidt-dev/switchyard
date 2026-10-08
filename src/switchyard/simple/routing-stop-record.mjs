@@ -1,5 +1,6 @@
 /** Closed lifecycle verdicts and failure-log record shapes for the routing waterfall. */
 import { createHash } from "node:crypto";
+import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
 
@@ -155,6 +156,23 @@ function causeFields(result, accountability = result?.accountability) {
 	};
 }
 
+function loggedFailureReason(result, accountability, classification) {
+	const reliability = result?.providerReliability;
+	const confirmedProviderDeadline =
+		result?.status === "failed" &&
+		result.failurePhase === "execute" &&
+		classification.reason === "execution_failed" &&
+		isProviderReliabilityDiagnostic(reliability) &&
+		reliability.causeCode === "provider_deadline_exceeded" &&
+		reliability.phase === "provider" &&
+		reliability.timedOut === true &&
+		accountability?.owner === "provider" &&
+		accountability.causeCode === reliability.causeCode;
+	return confirmedProviderDeadline
+		? "provider_deadline_exceeded"
+		: classification.reason;
+}
+
 /** Failure-log attempt record for one failed engine result. */
 export function failureAttemptRecord({
 	project,
@@ -174,7 +192,7 @@ export function failureAttemptRecord({
 		targetId: attempt.targetId,
 		capability: attempt.capability,
 		severity: classification.severity,
-		reason: classification.reason,
+		reason: loggedFailureReason(result, accountability, classification),
 		salvageable: classification.salvageable,
 		partialRetained: typeof result.partialWorktree === "string",
 		...causeFields(result, accountability),
@@ -240,5 +258,35 @@ export function stopRecord({
 		exhaustionCause: extra.exhaustionCause,
 		lifecycleCheck: extra.lifecycleCheck,
 		...causeFields(extra.result),
+	};
+}
+
+/** Keep only finite routing error codes in persisted stop evidence. */
+export function routingErrorCode(error, fallback) {
+	return typeof error?.code === "string" &&
+		/^routing_[a-z_]+$/u.test(error.code)
+		? error.code
+		: fallback;
+}
+
+/** Create best-effort failure logging without allowing it to change routing. */
+export function createFailureLogAppender({
+	origin,
+	deps,
+	appendFailureRecord,
+}) {
+	let failureLogWarned = false;
+	return (input) => {
+		try {
+			const record = { origin, ...input };
+			if (deps.failureLog) deps.failureLog.append(record);
+			else appendFailureRecord(record, { stateRoot: deps.stateRoot });
+		} catch (error) {
+			if (failureLogWarned) return;
+			failureLogWarned = true;
+			(deps.onRoutingWarning ?? console.error)(
+				`dispatch: failure log unavailable (${error?.code ?? "unknown"})`,
+			);
+		}
 	};
 }

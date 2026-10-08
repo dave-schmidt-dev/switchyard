@@ -1,5 +1,6 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { existsSync } from "node:fs";
+import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { readFailureRecords } from "../src/switchyard/simple/failure-log.mjs";
@@ -7,6 +8,74 @@ import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 
 const readLog = (stateRoot) => readFailureRecords({ stateRoot });
+
+test("failure-log lower bounds require a valid explicit RFC3339 timestamp", () => {
+	const f = fixture();
+	for (const since of [
+		"2999-01-01T00:00:00.123456789123Z",
+		"2999-01-01t01:00:00.123456789123+01:00",
+		"2999-01-01T01:00:00.123456789123+01:00",
+	]) {
+		deepStrictEqual(
+			readFailureRecords({ stateRoot: f.deps.stateRoot, since }),
+			[],
+		);
+	}
+	for (const since of [
+		"2025-02-29T00:00:00Z",
+		"2025-04-31T00:00:00Z",
+		"1970-01-01T24:00:00Z",
+		"2025-01-01",
+		"2025-01-01T00:00:00",
+	]) {
+		throws(() => readFailureRecords({ stateRoot: f.deps.stateRoot, since }), {
+			code: "failure_log_since_invalid",
+		});
+	}
+});
+
+test("fractional lower bounds exclude the preceding stored millisecond", () => {
+	const f = fixture();
+	const failureLogDirectory = join(f.deps.stateRoot, "failure-log");
+	mkdirSync(failureLogDirectory, { recursive: true });
+	const records = [
+		{
+			recordType: "attempt",
+			runId: "preceding-millisecond",
+			recordedAt: "1970-01-01T00:00:00.000Z",
+			origin: "work",
+		},
+		{
+			recordType: "attempt",
+			runId: "next-millisecond",
+			recordedAt: "1970-01-01T00:00:00.001Z",
+			origin: "work",
+		},
+	];
+	writeFileSync(
+		join(failureLogDirectory, "failures.jsonl"),
+		`${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+		"utf8",
+	);
+	const readRunIds = (since) =>
+		readFailureRecords({ stateRoot: f.deps.stateRoot, since }).map(
+			(record) => record.runId,
+		);
+	deepStrictEqual(readRunIds("1970-01-01T00:00:00.000Z"), [
+		"preceding-millisecond",
+		"next-millisecond",
+	]);
+	deepStrictEqual(readRunIds("1970-01-01T00:00:00.000000Z"), [
+		"preceding-millisecond",
+		"next-millisecond",
+	]);
+	deepStrictEqual(readRunIds("1970-01-01T00:00:00.000001Z"), [
+		"next-millisecond",
+	]);
+	deepStrictEqual(readRunIds("1970-01-01T01:00:00.000001+01:00"), [
+		"next-millisecond",
+	]);
+});
 
 test("a soft failure followed by success writes exactly one attempt record", async () => {
 	const f = fixture({

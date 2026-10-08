@@ -22,7 +22,9 @@ function executionCleanupContext(
 		// the stable task attempt. Health can use a distinct per-invocation id
 		// when a correction reuses this exact task-base execution context.
 		attemptId:
-			attemptId ?? context.attemptId ?? executionAttemptId(context, taskId),
+			attemptId ??
+			context.attemptId ??
+			executionAttemptId(context, taskId, descriptorIdentity),
 		descriptorIdentity,
 		workspaceId: context.workingContainerName,
 		processStartIdentity: context.processStartIdentity ?? null,
@@ -112,7 +114,7 @@ function routeHealthAttemptId(context, taskId) {
 	if (context.healthAttempt !== undefined) return context.healthAttempt;
 	return executionAttemptId(context, taskId);
 }
-function executionAttemptId(context, taskId) {
+function executionAttemptId(context, taskId, descriptorIdentity = null) {
 	const retryState = context.checkpoint?.retryState;
 	if (
 		retryState?.taskId === taskId &&
@@ -120,15 +122,41 @@ function executionAttemptId(context, taskId) {
 		retryState.attempt > 0
 	)
 		return `attempt-${retryState.attempt}`;
+	const allocations = context.checkpoint?.providerAttemptAllocations;
+	const repairAllocation = Array.isArray(allocations)
+		? allocations.find(
+				(entry) =>
+					entry?.taskId === taskId &&
+					entry.reason === "check_repair" &&
+					["allocated", "running"].includes(entry.state),
+			)
+		: null;
+	const repairPin = context._checkRepairPin;
+	if (
+		repairPin?.taskId === taskId &&
+		typeof repairPin.attemptId === "string" &&
+		repairPin.attemptId.length > 0 &&
+		repairPin.attemptId === repairAllocation?.attemptId &&
+		repairPin.workspaceId === context.workingContainerName &&
+		repairPin.workspaceId === repairAllocation?.workspaceId &&
+		repairPin.baseTree === context._activeTaskBase?.tree &&
+		repairPin.baseTree === repairAllocation?.baseTree &&
+		repairPin.descriptorIdentity === descriptorIdentity &&
+		repairPin.descriptorIdentity === repairAllocation?.descriptorIdentity &&
+		repairPin.scopeIdentity === repairAllocation?.scopeIdentity
+	)
+		return repairPin.attemptId;
 	// A completion correction is the same attempt continuing, not a second
 	// one: its allocation must not move the binding or the cleanup context
 	// to attempt-2, or the continuation's lifecycle receipt can never match.
-	const allocation = context.checkpoint?.providerAttemptAllocations?.find(
-		(entry) =>
-			entry?.taskId === taskId &&
-			entry.reason !== "completion_correction" &&
-			["allocated", "running"].includes(entry.state),
-	);
+	const allocation = Array.isArray(allocations)
+		? allocations.find(
+				(entry) =>
+					entry?.taskId === taskId &&
+					entry.reason !== "completion_correction" &&
+					["allocated", "running"].includes(entry.state),
+			)
+		: null;
 	return allocation ? "attempt-2" : "attempt-1";
 }
 function routeHealthAttemptIdentity(context, task, routeResult, descriptor) {

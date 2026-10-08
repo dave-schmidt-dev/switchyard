@@ -6,45 +6,57 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- `simple --origin work|qualification` labels qualification canaries separately; ordinary work remains the default, and provider eligibility and lifecycle gates still apply.
+- Simple CLI tasks now bind exact task identity across renamed routing runs; unsafe, failed, pending, retained-partial, or native-latched retries link back to the original run before provider allocation. Use `--task-id` when revised prompt text should keep the same identity.
+- Unrecognized failed-provider exits retain a redacted 4 KiB stderr tail in a new owner-only run artifact; JSON contains only its path, and storage refusal preserves the provider failure.
+- Local checks can run installed Homebrew tools and offline Cargo checks through fixed tool-tree reads, with an exact read of `/private/etc/ssl/openssl.cnf` for TLS initialization; Cargo/Rustup state stays in the disposable runtime and host Cargo/Rustup configuration and credentials remain unreadable.
 - `simple --report <path>` runs a read-only report task: the one declared report path is the only allowed change, a missing or empty report stops with `report_missing`, and success returns `resultKind: "report"` with the path, bytes and sha256.
 - `simple --format <command>` runs one bounded formatter in the check sandbox after the provider and before acceptance checks. A nonzero exit is advisory (`formatStatus`), and formatter edits are revalidated against the declared scope, so an edit to an undeclared ineligible path fails closed.
 - `simple cancel --project <path> --run-id <id> [--timeout-seconds <n>]` signals only a live worker whose pid and start token match the run record, then waits for the project lock release and a terminal status.
 - After a soft failure, the next provider continues from the previous attempt's in-scope partial when the writer is proven stopped and the capture is verified; manifest, input and out-of-scope changes are never carried.
-- Simple checks run once against the base tree before the provider starts; an environment-broken check stops the attempt with its own evidence and is remembered for the rest of the routing run.
+- Simple checks run once against the base tree before the provider starts; only a pre-provider environment-broken dry run records its check identity and evidence. It stops as `check_environment_failed`, and a later matching command in the same run stops as `check_known_broken` before an attempt is allocated. Post-provider acceptance failures never enter this memory.
 - Simple routing skips targets whose observed p80 duration cannot finish inside the deadline (never under `--only-provider`; an all-slow pool is kept and flagged).
 - A check setup failure records the failing prepare step, a bounded error code, syscall and executable in `failureDetails` (never the error message), and an environment-broken dry-run check names the executable it resolved in the sandbox and on the host.
-- A closed failure-reason registry, with golden parity against the previous classifiers, now owns cause, category and severity; run records persist the failure reason, scope-rejection detail and invocation failures, and still read with the previous release.
+- A closed failure-reason registry, with golden parity against the previous classifiers, now owns cause, category and severity; run records persist the failure reason, scope-rejection detail and invocation failures, and still read with the previous release. Failure-log fingerprints include the reason, so recoding an older reason changes its fingerprint.
 - Simple dispatch can run Claude Code (`--only-provider claude-code`, Haiku 5.5, Sonnet 5.5 or Opus 5.5 with an explicit effort) in a native Seatbelt sandbox on its own subscription login. It is never chosen automatically, and auth, missing-model and usage-limit failures are classified for routing.
 - `switchyard-dispatch routing-run release-partial --task-id <id> [--discard]` frees a retained partial worktree after the captain salvages it, so the routing run can continue without losing its failure memory. It verifies the worktree claim and refuses symlinks, a held project lock or ambiguous cleanup.
-- A failed simple check now keeps its last 16 KiB of output and stderr under the run's owner-only `check-evidence/` directory (`<attempt>-<check position>.log`, attempt 0 is the baseline), and the result carries only that path. Diff rejections report a closed reason kind and up to five bounded, control-character-free paths.
+- `switchyard-dispatch routing-run close-pending --project <path> --routing-run-id <id> --task-id <id>` recovers a dangling pending attempt only after the matching run is terminal, its writer is quiescent, no project lock is held, and no retained worktree remains; it records the attempt as skipped with reason `lifecycle_recovered`.
+- A failed simple check redacts credential-shaped tokens before tail truncation (16 KiB per stdout/stderr, kept in owner-only local files under `check-evidence/` as `<attempt>-<check position>.log`, attempt 0 is the baseline) and never returns raw evidence in JSON; the result carries only that path. Diff rejections report a closed reason kind and up to five bounded, control-character-free paths.
 - Simple run records now move to `running` with `startedAt` when the provider starts and record a throttled heartbeat, instead of staying `created` until integration.
 - Simple routing logs every failed attempt and every non-complete stop to `<stateRoot>/failure-log/failures.jsonl` (allowlisted fields only, rotated, best-effort), and `switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]` groups them by fingerprint for periodic routing and provider tuning.
 
 ### Removed
-
 - The orchestrator queue mode and its tests; runner tests now drive the async runner.
 - The `gc` and `reconcile-completion` operator subcommands, with their helpers (`apfs-private-bytes.py`, the external-completion reconciliation modules) and tests. `recover` keeps the shared root-cleanup logic. `backend-health`, `remediate-orphaned-locks` and `health attest-repair` stay: each has a live caller or contract.
 - The seam-move and module-split refactor tooling (`check:seams`, `split:module`, their scripts and tests, and the direct `oxc-parser` devDependency).
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
 
 ### Security
-
 - Host git calls on a provider-writable disposable clone pin `core.fsmonitor`, `core.hooksPath`, `diff.external`, `core.attributesFile` and `core.commitGraph`, and the clone's `.git` control state is snapshotted before the provider runs and verified, case-insensitively, before every host git read. Tampered, unreadable or redirected control state (hooks, config, alternates, http-alternates, replace refs) fails closed as `unsafe_diff` with diagnostic `git_control_tampered` and a closed-enum `gitControlTamper {kind, area}`; a trusted shared-clone detach is accepted.
 
 ### Changed
 
+- Simple status exposes active task identity, deadline, validated descriptor and observed phase.
+- The simple target/descriptor table, retained-partial and pending-attempt recovery, and best-effort stop logger now live in focused modules; parser and routing-run public exports and runtime behavior are unchanged.
+
+- Cancellation carries closed `cancelSource` values `signal_sigterm`, `signal_sigint`, `internal_deadline` or `unspecified` only on cancelled failures, while normal exit 76 remains an ordinary exit.
+- The CLI routing envelope exposes `exhaustionCause` (`capacity` vs `task_failures`) for fallback authority.
 - Simple dispatch enforces route health by default on lifecycle-backed provider failures (three in six hours suppresses the target on a 5/15/60-minute ladder); check, scope, sandbox and environment failures never count. Stranded health claims are reclaimed. The queue stays in shadow mode.
 - A `quota_exhausted` attempt marks that target ineligible for an hour across the routing run, and a provider that reports a rate limit on stderr is stopped at once and classified `quota_exhausted`.
 - A provider that exits nonzero or by signal at the caller's deadline is coded `provider_deadline_exceeded` instead of a nonzero exit.
-- Sandboxed checks may run git, python3, make, swiftc, `swift build`, `xcodebuild build` and the project venv, and read declared path dependencies outside the project. Checks that use shell expansion, denied host tools or absolute paths outside the clone are rejected at argument parse.
-- Eligible undeclared edits are kept and flagged for the captain instead of failing the run, and the project HEAD may advance on unrelated commits during a run.
+- Sandboxed checks may run git, python3, make, swiftc, `swift build`, `xcodebuild build`, approved Homebrew tools, offline Cargo checks against the configured default installed Rust toolchain, and the project venv; they read fixed tool trees, declared path dependencies, and the exact `/private/etc/ssl/openssl.cnf` literal for TLS initialization. A PATH-scoped `xcrun` shim answers SDK queries from `DEVELOPER_DIR` and delegates tool invocations through the checker PATH; `SDKROOT` avoids host Xcode-selection and license probes. Swift package checks must use `swift build --build-system native --disable-sandbox`. Checks that use shell expansion, denied host tools or absolute paths outside the clone are rejected at argument parse.
+- Eligible undeclared edits are kept, returned in `undeclaredPaths`, and flagged for the captain instead of failing the run, and the project HEAD may advance on unrelated commits during a run.
 - The project lock is released before slow cleanup, and a provably dead holder's lock on a terminal run is reclaimed (`project_lock_reclaimed`).
 - A VM-lane provider timeout or cancel no longer proves the provider process died, so cleanup is deferred to the workspace destroy (`destroy_pending`, no guest exec) and the guest workspace is retired: the runner skips the partial-diff capture and helper cleanup replay, records `timeoutDiff: "unavailable_destroy_only"` on the `execution_timed_out` result, and halts the queue with `halted_after_provider_timeout` / errorKind `provider_timeout_clone_retired` (distinct from `provider_cleanup_failed`) before any commit or reset guest write, so the existing teardown destroys the clone and no later task reuses it. Docker-lane capture after a confirmed kill is unchanged.
 - Biome now fails on unused imports, variables and function parameters; existing unused imports and exports were removed.
 - Simple routing now separates hard and soft failures. Failed checks, empty diffs, provider errors, provider-phase environment failures and scope rejections move on to the next eligible tier 1 or tier 2 target (up to four attempts per task) instead of stopping the run; baseline, cleanup, cancellation, input, lock and run-store failures still stop. `native_required` reports whether capacity or task failures exhausted the targets, and every answer lists retained partial worktrees.
 
 ### Fixed
-
+- Routing-run and task-binding locks reclaim only owners proven dead in the local PID namespace; live, unknown, malformed, unsafe, or replaced ownership remains fail-closed. If both lock releases fail during cleanup, the earlier pending exception is preserved.
+- Simple deadlines accept one or more fractional-second digits with truncation to milliseconds, reject invalid Gregorian dates and out-of-range clock/offset fields, and retain the 30-minute cap when discarded sub-millisecond digits are nonzero.
+- Shared RFC3339 validation rejects invalid Gregorian dates and out-of-range clock components in deadlines, failure-summary `--since` filters, failure-log lower bounds, outcome events, persisted routing-state timestamps, and retained-worktree `retainedAt` values in historical and current run schemas while preserving each caller’s accepted timezone and fractional-second profile. For `--since`, a nonzero fractional remainder beyond milliseconds excludes events in the truncated millisecond.
+- Failed baseline and acceptance checks retain their redacted evidence links through repair; a timed-out repair preserves positive timeout evidence.
+- Provider qualification attempts carry a separate origin and no longer affect work route health or default failure statistics; legacy records remain work.
 - The test suite passes under an isolated HOME: routing and reliability fixtures no longer resolve targets or route-health identity through the host roster, and the host-ground-truth suites skip when `~/.agent` is absent.
 - `routing-run release-partial` matched a retained partial's worktree claim only by exact path, so a claim recorded as `<path>/worktree` could not be released.
 - Runner tests pin the fixture roster, so a check sandbox with an isolated HOME never reads the host roster.
@@ -57,6 +69,11 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - Broker, provider-lifecycle and quick-check fixtures wait on observable events instead of wall-clock sleeps, so they hold under parallel host load.
 - Dispatch checks no longer hang or fail on process-group cleanup, `/bin/sh` scripts or temp-path resolution: the quick-check sandbox now lets a check signal processes in its own sandbox, read the `/private/var/select` shell link, and read metadata on the `/var`, `/tmp` and `/etc` links.
 - Integration now rejects incomplete Git metadata and stops stalled metadata checks after 30 seconds, preventing unsafe acceptance and indefinite waits.
+- Terminal simple JSON exposes the same sanitized closed `failureDetails` object as `run.json`.
+- Failure diagnostics count rejected paths before bounding displayed path evidence, and report zero rejected paths for ordinary check failures.
+- Check readiness failure names the one-based `checkIndex` and bounded executable basename, with the `validate_commands` setup step.
+- Lease-free route health terminal paths settle internal invocation state consistently only after writer-stop proof; active trial or unconfirmed writers remain fenced.
+- Async queue execution shares one deadline across task-base capture, provider launch and scoped check repair, reports timeouts consistently, and preserves the original repair cleanup identity while health records each invocation separately.
 
 ## [0.3.0] - 2026-10-02
 

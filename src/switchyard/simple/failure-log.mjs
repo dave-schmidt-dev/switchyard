@@ -13,9 +13,12 @@ import {
 	retainedSegmentPaths,
 	rotateLedgerIfNeeded,
 } from "../ledger/sanitize.mjs";
+import { parseRfc3339 } from "../rfc3339.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
 import { LIFECYCLE_CHECKS } from "./routing-stop-record.mjs";
 
+const VALID_ORIGINS = Object.freeze(["work", "qualification"]);
+const VALID_ORIGIN_SET = new Set(VALID_ORIGINS);
 const RECORD_TYPES = new Set(["attempt", "stop", "invocation"]);
 const STRING_FIELDS = [
 	"project",
@@ -162,6 +165,15 @@ export function appendFailureRecord(input, { stateRoot } = {}) {
 	)
 		record.lifecycleCheck = null;
 	record.fingerprint = fingerprintOf(record);
+	let origin = input?.origin;
+	if (origin === undefined || origin === null) {
+		origin = "work";
+	} else if (typeof origin !== "string" || !VALID_ORIGIN_SET.has(origin)) {
+		throw Object.assign(new Error("failure_log_origin_invalid"), {
+			code: "failure_log_origin_invalid",
+		});
+	}
+	record.origin = origin;
 	const path = failureLogPath({ stateRoot });
 	rotateLedgerIfNeeded(path);
 	appendFileSync(path, `${JSON.stringify(record)}\n`, {
@@ -181,13 +193,16 @@ export function appendFailureRecord(input, { stateRoot } = {}) {
  */
 export function readFailureRecords({ stateRoot, since } = {}) {
 	let sinceMs = null;
+	let sinceHasSubMillisecondRemainder = false;
 	if (since !== undefined) {
-		sinceMs = Date.parse(since);
-		if (Number.isNaN(sinceMs)) {
+		const parsedSince = parseRfc3339(since);
+		if (!parsedSince) {
 			throw Object.assign(new Error("failure_log_since_invalid"), {
 				code: "failure_log_since_invalid",
 			});
 		}
+		sinceMs = parsedSince.epochMs;
+		sinceHasSubMillisecondRemainder = parsedSince.hasSubMillisecondRemainder;
 	}
 	const path = logPath({ stateRoot }, false);
 	const records = [];
@@ -204,7 +219,17 @@ export function readFailureRecords({ stateRoot, since } = {}) {
 			try {
 				const record = JSON.parse(line);
 				const recordedAtMs = Date.parse(record?.recordedAt);
-				if (sinceMs !== null && !(recordedAtMs >= sinceMs)) continue;
+				if (sinceMs !== null) {
+					const recordedAtIsAfterSince =
+						recordedAtMs > sinceMs ||
+						(recordedAtMs === sinceMs && !sinceHasSubMillisecondRemainder);
+					if (!recordedAtIsAfterSince) continue;
+				}
+				if (record && typeof record === "object" && !Array.isArray(record)) {
+					if (record.origin != null && !VALID_ORIGIN_SET.has(record.origin))
+						continue;
+					record.origin ??= "work";
+				}
 				records.push(record);
 			} catch {
 				// A malformed line must never block a periodic review.
@@ -220,15 +245,31 @@ const asString = (value) => (typeof value === "string" ? value : null);
  * Aggregate failure records for review.
  *
  * @param {object[]} records - Records as produced by appendFailureRecord.
+ * @param {object} [options]
+ * @param {string} [options.origin="work"] - Origin filter ("work", "qualification", or "all").
  * @returns {{ groups: object[], totals: { byTargetId: object, byReason: object } }}
  *   Groups keyed by fingerprint, sorted by count descending then lastSeen
  *   descending. Totals count records per targetId and per reason (stop
  *   records contribute their stopReason).
  */
-export function summarizeFailures(records) {
+export function summarizeFailures(records, options = {}) {
+	const originFilter = options?.origin ?? "work";
+	if (
+		originFilter !== "work" &&
+		originFilter !== "qualification" &&
+		originFilter !== "all"
+	) {
+		throw Object.assign(new Error("failure_log_origin_invalid"), {
+			code: "failure_log_origin_invalid",
+		});
+	}
 	const groups = new Map();
 	const totals = { byTargetId: {}, byReason: {} };
 	for (const record of Array.isArray(records) ? records : []) {
+		if (record?.origin != null && !VALID_ORIGIN_SET.has(record.origin))
+			continue;
+		const recordOrigin = record?.origin ?? "work";
+		if (originFilter !== "all" && recordOrigin !== originFilter) continue;
 		const reason = record?.reason ?? record?.stopReason ?? null;
 		const targetId = asString(record?.targetId);
 		const targetKey = targetId ?? "null";

@@ -30,7 +30,7 @@ import {
 } from "./failure-classifiers.mjs";
 
 /** Closed cancel-source enum, threaded from the AbortSignal reason. */
-const CANCEL_SOURCES = new Set([
+export const CANCEL_SOURCES = Object.freeze([
 	"signal_sigterm",
 	"signal_sigint",
 	"internal_deadline",
@@ -68,6 +68,7 @@ const CHECK_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
 	"checkIndex",
 	"checkIdentity",
+	"outputPath",
 ]);
 const CHECK_ENVIRONMENT_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
@@ -87,6 +88,7 @@ const CHECK_ENVIRONMENT_EXECUTABLE_DETAIL_FIELDS = Object.freeze([
 // threw a system error, its bounded code, syscall and executable basename.
 const CHECK_SETUP_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
+	"checkIndex",
 	"checkSetupStep",
 	"checkSetupErrorCode",
 	"checkSetupSyscall",
@@ -117,6 +119,7 @@ const PROVIDER_DETAIL_FIELDS = Object.freeze([
 	"stderrBytes",
 	"stdoutBytes",
 	"changedFilesUnavailable",
+	"outputPath",
 ]);
 const DIFF_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
@@ -137,6 +140,9 @@ export const DETAIL_FIELD_TYPES = Object.freeze({
 	signal: "string",
 	timedOut: "boolean",
 	cancelled: "boolean",
+	// Task 3.12: the closed cancellation origin, registered only for a
+	// cancelled outcome and validated against CANCEL_SOURCES at the boundary.
+	cancelSource: "string",
 	checkIndex: "integer",
 	checkIdentity: "string",
 	checkEnvironmentSignature: "string",
@@ -273,6 +279,7 @@ function providerCausedFor(reason) {
 }
 
 function detailFieldsFor(reason, causeCode) {
+	if (reason === "baseline_check_failed") return CHECK_DETAIL_FIELDS;
 	if (
 		reason === "check_environment_failed" ||
 		causeCode === "check_environment_failed"
@@ -411,6 +418,7 @@ const FAILURE_REASONS = Object.freeze([
 	"invalid_invocation",
 	"invalid_routing_project",
 	"invalid_routing_run_id",
+	"invalid_task_id",
 	"invocation_descriptor_unavailable",
 	"launcher_environment_unavailable",
 	// Task 3.1: recovering a dangling pending attempt, and the closed checks
@@ -476,8 +484,11 @@ const FAILURE_REASONS = Object.freeze([
 	"route_health_blocked",
 	"routing_attempt_history_cap_exceeded",
 	"routing_engine_required",
+	"routing_lock_claim_recovery_failed",
 	"routing_lock_identity_changed",
+	"routing_lock_malformed",
 	"routing_pending_identity_mismatch",
+	"routing_run_lock_contention",
 	"routing_run_already_released",
 	"routing_run_not_found",
 	"routing_selection_invalid",
@@ -485,6 +496,14 @@ const FAILURE_REASONS = Object.freeze([
 	"routing_state_missing",
 	"routing_state_nonmonotonic",
 	"routing_state_write_failed",
+	"routing_task_binding_malformed",
+	"routing_task_binding_missing",
+	"routing_task_binding_source_mismatch",
+	"routing_task_binding_source_unavailable",
+	"routing_task_binding_write_failed",
+	"routing_task_identity_lock_changed",
+	"routing_task_identity_lock_contention",
+	"routing_task_identity_source_unavailable",
 	"routing_unsafe_directory",
 	"routing_unsafe_file",
 	"run_state_not_terminal",
@@ -492,6 +511,13 @@ const FAILURE_REASONS = Object.freeze([
 	"simple_execution_failed",
 	"soft_retry_budget_exhausted",
 	"target_identity_unavailable",
+	"task_identity_invalid",
+	"task_identity_lock_contention",
+	"task_identity_state_invalid",
+	"task_identity_state_release_failed",
+	"task_identity_state_unavailable",
+	"task_identity_state_write_failed",
+	"task_retry_linked_to_previous_run",
 	"undeclared_paths_changed",
 	"unsafe_diff",
 	"unsafe_failure",
@@ -536,7 +562,7 @@ function resolveSeverity(reason, phase, causeCode, causeCategory, errorKind) {
 
 function cancelSourceFor(input, providerResult) {
 	const raw = input.cancelSource ?? providerResult?.cancelSource;
-	return typeof raw === "string" && CANCEL_SOURCES.has(raw)
+	return typeof raw === "string" && CANCEL_SOURCES.includes(raw)
 		? raw
 		: "unspecified";
 }
@@ -601,6 +627,15 @@ export function resolveFailure(input = {}) {
 			reason === "check_environment_failed") &&
 		(typeof input.checkExecutable === "string" ||
 			typeof input.hostExecutable === "string");
+	const rowDetailFields = executableDetailsRequested
+		? CHECK_ENVIRONMENT_EXECUTABLE_DETAIL_FIELDS
+		: row.detailFields;
+	// A cancelled outcome adds its closed origin. Every other resolution keeps
+	// the frozen row shape, so a non-cancelled failure never registers the field.
+	const detailFields =
+		causeCode === "cancelled" && !rowDetailFields.includes("cancelSource")
+			? Object.freeze([...rowDetailFields, "cancelSource"])
+			: rowDetailFields;
 	return Object.freeze({
 		reason,
 		phase,
@@ -617,9 +652,7 @@ export function resolveFailure(input = {}) {
 		),
 		diffCategory: row.diffCategory,
 		providerCaused: row.providerCaused,
-		detailFields: executableDetailsRequested
-			? CHECK_ENVIRONMENT_EXECUTABLE_DETAIL_FIELDS
-			: row.detailFields,
+		detailFields,
 		timedOut,
 		cancelled,
 		cancelSource:

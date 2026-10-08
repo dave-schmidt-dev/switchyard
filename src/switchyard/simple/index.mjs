@@ -19,6 +19,7 @@ import {
 	sanitizeFailureDetails,
 	sanitizeFailureMetadata,
 } from "../adapter/exec-error.mjs";
+import { projectRunFailureForDisk } from "../adapter/exec-error-sanitize.mjs";
 import { boundProviderLifecycleSnapshot } from "../adapter/provider-lifecycle.mjs";
 import { resolveFailure } from "../diagnostics/failure-registry.mjs";
 import { createProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
@@ -81,6 +82,21 @@ import { createSimpleRouteSelection } from "./route-selection.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
 const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
+const SIMPLE_PROCESS_PHASES = new Set([
+	"check_preparing",
+	"dry_run_check",
+	"launcher_probe",
+	"provider_running",
+	"format_running",
+	"check_running",
+	"head_advance_recheck_preparing",
+	"head_advance_recheck_running",
+	"cleanup_scan_running",
+	"cleanup_helper_progress",
+	"cleanup_scan_started",
+	"cleanup_quarantine_started",
+	"cleanup_remove_started",
+]);
 // Check-session refusals that already carry their own closed cause code; every
 // other failure while preparing the session classifies as check_setup_failed.
 const OWN_CODED_CHECK_SETUP_REASONS = new Set([
@@ -89,6 +105,10 @@ const OWN_CODED_CHECK_SETUP_REASONS = new Set([
 ]);
 
 export async function runSimpleTask(options, dependencies = {}) {
+	const origin = options.origin ?? "work";
+	if (origin !== "work" && origin !== "qualification") {
+		throw new TypeError("origin must be work or qualification");
+	}
 	const now = dependencies.now ?? Date.now;
 	const taskId = dependencies.taskId ?? randomUUID();
 	const attemptId = dependencies.attemptId ?? randomUUID();
@@ -108,6 +128,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let descriptorHarness = null;
 	let providerExecutionResult = null;
 	let providerStarted = false;
+	let activeTaskProcessPhase = null;
 	let baselineStatus = (options.baselineChecks ?? []).length
 		? "pending"
 		: "not_requested";
@@ -178,6 +199,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		healthMode: dependencies.healthMode,
 		healthStateRoot: dependencies.healthStateRoot,
 		qualifiedProviders: dependencies.qualifiedProviders,
+		origin,
 		runId,
 		taskId,
 		attemptId,
@@ -265,6 +287,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 	};
 	const heartbeat = (phase, details = {}) => {
 		const observedAt = now();
+		if (
+			providerStarted &&
+			typeof details.processPhase === "string" &&
+			SIMPLE_PROCESS_PHASES.has(details.processPhase)
+		) {
+			activeTaskProcessPhase = details.processPhase;
+		}
 		emitStatus(onStatus, taskId, phase, {
 			elapsedMs: Math.max(0, observedAt - startedAt),
 			elapsedSinceLastMilestoneMs: Math.max(0, observedAt - lastMilestoneAt),
@@ -278,22 +307,44 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (observedAt - lastHeartbeatPersistedAt < HEARTBEAT_PERSIST_INTERVAL_MS)
 			return;
 		lastHeartbeatPersistedAt = observedAt;
+		const heartbeatPatch = { activeTaskHeartbeatAt: observedAt };
+		if (activeTaskProcessPhase !== null) {
+			heartbeatPatch.activeTaskProcessPhase = activeTaskProcessPhase;
+		}
 		const heartbeatWrite = (
 			dependencies.updateRunWithRetry ?? updateRunWithRetry
-		)(runId, {
-			activeTaskHeartbeatAt: observedAt,
-		}).catch(() => {});
+		)(runId, heartbeatPatch).catch(() => {});
 		pendingDurability.add(heartbeatWrite);
 		void heartbeatWrite.finally(() => pendingDurability.delete(heartbeatWrite));
 	};
 	const persistProviderStarted = async () => {
 		if (!runInitialized) return null;
 		const observedAt = now();
+		const activeDescriptorReceipt =
+			invocationDescriptor &&
+			isSafeDescriptorReceipt(invocationDescriptor, descriptorHarness) &&
+			invocationDescriptor.target_id === targetId
+				? invocationDescriptor
+				: null;
 		try {
 			await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
 				state: "running",
 				startedAt: new Date(observedAt).toISOString(),
+				activeTaskId: taskId,
+				activeTaskProvider: provider,
+				activeTaskModel: invocationDescriptor?.selector ?? null,
+				activeTaskDeadline:
+					typeof options.deadlineMs === "number" &&
+					Number.isFinite(options.deadlineMs)
+						? new Date(options.deadlineMs).toISOString()
+						: null,
 				activeTaskStartedAt: observedAt,
+				activeTaskProcessPhase,
+				activeTaskInvocationDescriptor: activeDescriptorReceipt,
+				activeTaskDescriptorIdentity:
+					activeDescriptorReceipt?.descriptor_identity ?? null,
+				activeTaskDescriptorHarness:
+					activeDescriptorReceipt === null ? null : descriptorHarness,
 			});
 			return null;
 		} catch (error) {
@@ -407,7 +458,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 				? error.syscall.trim().split(/\s+/u)[0] || null
 				: null;
 		const setupExecutable =
-			typeof error?.path === "string" ? basename(error.path) : null;
+			typeof error?.checkSetupExecutable === "string"
+				? basename(error.checkSetupExecutable)
+				: typeof error?.path === "string"
+					? basename(error.path)
+					: null;
 		const setupStep =
 			typeof error?.checkSetupStep === "string" ? error.checkSetupStep : null;
 		// The registry row's detail fields decide what this failure persists in
@@ -423,17 +478,33 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checkExecutable: failingCheckExecutable,
 			hostExecutable: failingCheckHostExecutable,
 		});
+		const timedOut =
+			resolution.timedOut === true
+				? true
+				: (failureTimedOut ?? providerExecutionResult?.timedOut ?? null);
+		const diffRejectionCount = Array.isArray(diffRejection?.paths)
+			? diffRejection.paths.length
+			: 0;
+		if (diffRejection) {
+			diffRejection = {
+				rule: diffRejection.rule,
+				paths: boundedRejectionPaths(diffRejection.paths),
+			};
+		}
 		const detailValues = {
 			failureReason,
-			timedOut: failureTimedOut ?? providerExecutionResult?.timedOut ?? null,
+			timedOut,
 			cancelled: providerExecutionResult?.cancelled ?? null,
+			cancelSource: resolution.cancelSource,
 			providerSignature: providerExecutionResult?.providerSignature,
 			stderrBytes: providerExecutionResult?.stderrBytes,
 			stdoutBytes: providerExecutionResult?.stdoutBytes,
 			checkIndex: failingCheckIndex ?? error?.checkIndex ?? null,
 			checkIdentity: failingCheckIdentity,
 			checkEnvironmentSignature: failingCheckEnvironmentSignature,
-			outputPath: failingCheckOutputPath,
+			outputPath: ["baseline", "checks"].includes(failurePhase)
+				? failingCheckOutputPath
+				: (providerExecutionResult?.outputPath ?? null),
 			dependencyCheck,
 			manifestName:
 				typeof error?.manifestName === "string" ? error.manifestName : null,
@@ -446,7 +517,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			changedFilesUnavailable:
 				changedFilesUnavailable === true ? true : undefined,
 			diffRejectionCategory: resolution.diffCategory,
-			diffRejectionCount: changedFiles.length,
+			diffRejectionCount,
 			diffRejectionRule: diffRejection?.rule,
 			diffRejectionPaths: diffRejection?.paths,
 		};
@@ -455,6 +526,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			const value = detailValues[field];
 			if (value !== undefined && value !== null) failureDetails[field] = value;
 		}
+		const sanitizedFailureDetails = sanitizeFailureDetails(failureDetails);
 		if (
 			worktreePath &&
 			!signal?.aborted &&
@@ -483,10 +555,19 @@ export async function runSimpleTask(options, dependencies = {}) {
 			checkIndex: failingCheckIndex,
 			checkIdentity: failingCheckIdentity,
 			baselineStatus,
-			diffRejectionCount: changedFiles.length,
+			diffRejectionCount,
 			repairCount,
 			repairStatus,
 		});
+		// The run store persists `failureDetails` through
+		// projectRunFailureForDisk, so the terminal result carries that same
+		// projected record: a caller never needs to read run.json, and the two
+		// views always agree.
+		const persistentFailureDetails =
+			projectRunFailureForDisk({
+				lastFailure: { providerReliability },
+				failureDetails: sanitizedFailureDetails,
+			}).failureDetails ?? null;
 		finalResult = terminalResult(base, {
 			provider,
 			targetId,
@@ -502,7 +583,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
 		if (reportMode) finalResult.resultKind = "report";
+		finalResult.origin = origin;
 		finalResult.providerReliability = providerReliability;
+		finalResult.failureDetails = persistentFailureDetails;
 		finalResult.providerStarted = providerStarted;
 		finalResult.formatStatus = formatStatus;
 		if (diffRejection) finalResult.diffRejection = diffRejection;
@@ -562,7 +645,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 									}
 								: {}),
 						}),
-						failureDetails: sanitizeFailureDetails(failureDetails),
+						failureDetails: persistentFailureDetails,
 					},
 				).then((durable) => {
 					failureTerminalDurable = durable;
@@ -683,6 +766,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 				workerNonce: randomUUID(),
 			});
 			runInitialized = true;
+			await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
+				origin,
+			});
 		} catch (error) {
 			return fail(
 				"run_store_write_failed",
@@ -704,7 +790,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				null,
 				{
 					rule: "manifest_review_required",
-					paths: boundedRejectionPaths(unreviewedManifests),
+					paths: unreviewedManifests,
 				},
 			);
 		}
@@ -1089,7 +1175,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 			deadlineMs: options.deadlineMs,
 			now,
 			signal,
-			runCheck,
+			runCheck: async (request) => {
+				const result = await runCheck(request);
+				if (
+					checkSessions &&
+					result?.success !== true &&
+					typeof result?.outputPath === "string"
+				) {
+					failingCheckOutputPath = result.outputPath;
+				}
+				return result;
+			},
 			gitControlSnapshot: checkSessions
 				? checkSessions.gitControlSnapshot
 				: worktreeGitControl,
@@ -1349,6 +1445,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				]),
 			);
 			const execution = executeProvider({
+				runId,
 				targetId,
 				harness,
 				descriptor,
@@ -1518,7 +1615,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			keepWorktree = true;
 			return fail(undeclaredScope.rule, "diff", null, null, {
 				rule: undeclaredScope.rule,
-				paths: boundedRejectionPaths(undeclaredScope.undeclared),
+				paths: undeclaredScope.undeclared,
 			});
 		}
 		const validated = validateDiff(captured.diff, options.projectPath);
@@ -1538,7 +1635,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				validated.requiresReview
 					? {
 							rule: "manifest_review_required",
-							paths: boundedRejectionPaths(validated.sensitivePaths),
+							paths: validated.sensitivePaths,
 						}
 					: { rule: validateDiffRejectionRule(validated), paths: [] },
 			);
@@ -1623,7 +1720,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 							keepWorktree = true;
 							return fail(formattedScope.rule, "diff", null, null, {
 								rule: formattedScope.rule,
-								paths: boundedRejectionPaths(formattedScope.undeclared),
+								paths: formattedScope.undeclared,
 							});
 						}
 						const formattedValidation = validateDiff(
@@ -1648,9 +1745,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 								formattedValidation.requiresReview
 									? {
 											rule: "manifest_review_required",
-											paths: boundedRejectionPaths(
-												formattedValidation.sensitivePaths,
-											),
+											paths: formattedValidation.sensitivePaths,
 										}
 									: {
 											rule: validateDiffRejectionRule(formattedValidation),
@@ -1733,11 +1828,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 				if (check?.success) {
 					failingCheckIndex = null;
 					failingCheckIdentity = null;
+					failingCheckOutputPath = null;
 					continue;
 				}
 
 				failingCheckIndex = index + 1;
 				failingCheckIdentity = checkIdentity;
+				failingCheckOutputPath =
+					typeof check?.outputPath === "string" ? check.outputPath : null;
 				failureExitCode = checkExitCode;
 				failureSignal = checkSignal;
 				failureTimedOut = check?.timedOut === true;
@@ -1759,8 +1857,6 @@ export async function runSimpleTask(options, dependencies = {}) {
 					keepWorktree = true;
 					repairStatus = options.repairChecks ? "ineligible" : "not_requested";
 					failingCheckEnvironmentSignature = environmentSignature;
-					failingCheckOutputPath =
-						typeof check.outputPath === "string" ? check.outputPath : null;
 					return fail(
 						"check_environment_failed",
 						"checks",
@@ -1811,7 +1907,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					repairStatus = "ineligible";
 					return fail(repairScope.rule, "diff", null, null, {
 						rule: repairScope.rule,
-						paths: boundedRejectionPaths(repairScope.undeclared),
+						paths: repairScope.undeclared,
 					});
 				}
 				const repairDiffValidation = validateDiff(
@@ -1830,9 +1926,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					const repairRejection = repairDiffValidation.requiresReview
 						? {
 								rule: "manifest_review_required",
-								paths: boundedRejectionPaths(
-									repairDiffValidation.sensitivePaths,
-								),
+								paths: repairDiffValidation.sensitivePaths,
 							}
 						: {
 								rule: validateDiffRejectionRule(repairDiffValidation),
@@ -1877,6 +1971,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					targetId,
 					capability: options.capability,
 					descriptor,
+					origin,
 				});
 				if (!repairPrepared.allowed || repairPrepared.reroute) {
 					repairStatus = "ineligible";
@@ -1930,6 +2025,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					providerStarted = true;
 					writerLifecycle = "unavailable";
 					const execution = executeProvider({
+						runId,
 						targetId,
 						harness,
 						descriptor,
@@ -2025,7 +2121,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 				if (!correctedScope.ok) {
 					keepWorktree = true;
 					repairStatus = "ineligible";
-					return fail(correctedScope.rule, "diff");
+					return fail(correctedScope.rule, "diff", null, null, {
+						rule: correctedScope.rule,
+						paths: correctedScope.undeclared,
+					});
 				}
 				const correctedValidation = validateDiff(
 					capturedDiff.diff,
@@ -2045,6 +2144,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 							? "manifest_review_required"
 							: "unsafe_diff",
 						"diff",
+						null,
+						null,
+						correctedValidation.requiresReview
+							? {
+									rule: "manifest_review_required",
+									paths: correctedValidation.sensitivePaths,
+								}
+							: {
+									rule: validateDiffRejectionRule(correctedValidation),
+									paths: [],
+								},
 					);
 				}
 				checks.length = 0;
@@ -2517,6 +2627,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		});
 		if (reportMode) finalResult.resultKind = "report";
 		if (reportMode && reportOutput) finalResult.report = reportOutput;
+		finalResult.origin = origin;
 		finalResult.formatStatus = formatStatus;
 		if (invocationDescriptor) {
 			finalResult.invocationDescriptor = structuredClone(invocationDescriptor);

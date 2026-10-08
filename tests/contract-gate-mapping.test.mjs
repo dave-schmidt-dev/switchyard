@@ -246,7 +246,10 @@ describe("source-boundary contract gate mapping", () => {
 			"tests/runner-quick-checks-cleanup.test.mjs",
 			"tests/runner-quick-checks-contract-recovery.test.mjs",
 			"tests/runner-quick-checks-queue-recovery.test.mjs",
+			"tests/runner-quick-checks-sandbox-process.test.mjs",
 			"tests/runner-quick-checks-sandbox.test.mjs",
+			"tests/runner-quick-checks-toolchain-sandbox.test.mjs",
+			"tests/runner-quick-checks-xcode-sandbox.test.mjs",
 		];
 		deepStrictEqual(
 			validateExecution({

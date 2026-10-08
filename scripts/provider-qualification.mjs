@@ -336,6 +336,8 @@ export async function productionDispatch({
 			plan.targetId,
 			"--check",
 			"node --test tests/acceptance.test.mjs",
+			"--origin",
+			"qualification",
 			"--deadline",
 			deadlineAt,
 			"--json",

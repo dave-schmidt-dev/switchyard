@@ -1,4 +1,3 @@
-import { PROVIDER_EXECUTION_TIMEOUT_MS } from "../adapter/constants.mjs";
 import { HOST_POWER_STATES } from "../dispatch/host-power.mjs";
 import {
 	getConfiguredInvocationDescriptor,
@@ -20,7 +19,11 @@ import {
 	normalizeBrokerRoute,
 } from "./outcome-writer.mjs";
 import { taskRepairScopeIdentity } from "./reliability.mjs";
-import { taskPromptForAttempt } from "./retry-transitions.mjs";
+import {
+	initializeTaskExecutionBudget,
+	taskExecutionBudget,
+	taskPromptForAttempt,
+} from "./retry-transitions.mjs";
 import {
 	policyDeferredTaskResult,
 	readQueueHostPower,
@@ -43,6 +46,29 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 			terminal: nonSwitchyardExecutorResult(task, executor, requiredCapability),
 		};
 	}
+	const repairPin = context._checkRepairPin ?? context._completionPin;
+	const taskBudget = repairPin
+		? context._activeTaskBudget?.taskId === task.id
+			? taskExecutionBudget(context, task)
+			: null
+		: initializeTaskExecutionBudget(context, task);
+	if (
+		repairPin &&
+		(!taskBudget || taskBudget.deadline !== repairPin.deadline)
+	) {
+		return {
+			terminal: {
+				taskId: task.id,
+				success: false,
+				provider: repairPin.provider ?? null,
+				model: repairPin.selector ?? null,
+				resolvedTargetId: repairPin.resolvedTargetId ?? null,
+				result: "check_repair_ineligible",
+				errorKind: "unknown_failure",
+			},
+		};
+	}
+	context._activeTaskDeadline = taskBudget.deadline;
 	const overlayFailure = dirtyOverlayResult(task, context, requiredCapability);
 	if (overlayFailure) return { terminal: overlayFailure };
 	const checkIgnored = context.checkIgnoredPath ?? findIgnoredDeclaredPath;
@@ -70,11 +96,7 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 			),
 		};
 	}
-	const repairPin = context._checkRepairPin ?? context._completionPin;
-	const pinnedNow = Date.now();
-	const pinnedRemainingMs = repairPin
-		? Date.parse(repairPin.deadline) - pinnedNow
-		: null;
+	const pinnedRemainingMs = repairPin ? taskBudget.remainingMs : null;
 	const checkRepairBudgetValid =
 		!context._checkRepairPin ||
 		(Number.isSafeInteger(context._checkRepairBudget?.providerTimeoutMs) &&
@@ -109,7 +131,7 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 						: "check_repair_ineligible",
 				errorKind:
 					Number.isFinite(pinnedRemainingMs) && pinnedRemainingMs <= 0
-						? "execution_timeout"
+						? "execution_timed_out"
 						: "unknown_failure",
 				timedOut: Number.isFinite(pinnedRemainingMs) && pinnedRemainingMs <= 0,
 			},
@@ -124,9 +146,7 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 		task,
 		context._completionRequirements,
 	);
-	context._activeTaskTimeoutMs = repairPin
-		? Math.floor(pinnedRemainingMs)
-		: (task.timeoutMs ?? PROVIDER_EXECUTION_TIMEOUT_MS);
+	context._activeTaskTimeoutMs = Math.floor(taskBudget.remainingMs);
 	// Only a review task has a verdict to derive. Deriving unconditionally would
 	// parse an implementation task's transcript and relay text sanitized out of it
 	// across the broker boundary, which is the one thing that boundary exists to
@@ -305,11 +325,10 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 			},
 		};
 	}
+	const currentTaskBudget = taskExecutionBudget(context, task);
 	const timeoutMs = Math.floor(
 		Math.min(
-			repairPin
-				? Date.parse(repairPin.deadline) - Date.now()
-				: context._activeTaskTimeoutMs,
+			currentTaskBudget.remainingMs,
 			context._checkRepairPin
 				? context._checkRepairBudget.providerTimeoutMs
 				: Number.POSITIVE_INFINITY,
@@ -325,15 +344,13 @@ export async function prepareExecuteTaskAsyncUnsafe(task, context) {
 				model: repairPin?.selector ?? invocationDescriptor.selector,
 				resolvedTargetId: repairPin?.resolvedTargetId ?? resolvedTargetId,
 				result: "execution_timed_out",
-				errorKind: "execution_timeout",
+				errorKind: "execution_timed_out",
 				timedOut: true,
 			},
 		};
 	}
 	context._activeTaskTimeoutMs = timeoutMs;
-	const routedDeadline = repairPin
-		? repairPin.deadline
-		: new Date(Date.now() + timeoutMs).toISOString();
+	const routedDeadline = currentTaskBudget.deadline;
 	context._activeTaskDeadline = routedDeadline;
 	context.onStatus?.({
 		phase: "execution",

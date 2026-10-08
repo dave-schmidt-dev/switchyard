@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,7 +38,7 @@ function track(path) {
  * @returns {string}
  */
 export function tempDir(prefix) {
-	return track(mkdtempSync(join(tmpdir(), prefix)));
+	return track(mkdtempSync(join(realpathSync(tmpdir()), prefix)));
 }
 
 /**
@@ -47,7 +47,7 @@ export function tempDir(prefix) {
  * @returns {Promise<string>}
  */
 export async function tempDirAsync(prefix) {
-	return track(await mkdtemp(join(tmpdir(), prefix)));
+	return track(await mkdtemp(join(realpathSync(tmpdir()), prefix)));
 }
 
 /**

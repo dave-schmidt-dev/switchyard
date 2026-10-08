@@ -23,6 +23,10 @@ import {
 } from "./outcome-writer.mjs";
 import { createTaskProviderPin } from "./reliability.mjs";
 import {
+	initializeTaskExecutionBudget,
+	taskExecutionBudget,
+} from "./retry-transitions.mjs";
+import {
 	isStructuredReviewExecution,
 	reviewTaskResult,
 	survivingProviderFields,
@@ -57,6 +61,34 @@ export async function executeTaskAsyncUnsafe(task, context) {
 		resolvedTargetId,
 		record,
 	} = prepared.state;
+	let clearExecutionPolicy = () => {};
+	const timeoutBeforeLaunch = async (reason) => {
+		await record({
+			provider: routeResult.provider,
+			model: routeResult.model ?? "unknown",
+			taskId: task.id,
+			result: "execution_timed_out",
+			errorKind: "execution_timed_out",
+			reason,
+			timedOut: true,
+		});
+		clearExecutionPolicy();
+		clearExecutionPolicy = () => {};
+		await releaseSelected(selectedRoute);
+		return {
+			...descriptorReceiptFields(invocationDescriptor),
+			taskId: task.id,
+			success: false,
+			provider: routeResult.provider,
+			model: routeResult.model ?? null,
+			requiredCapability,
+			resolvedTargetId,
+			result: "execution_timed_out",
+			errorKind: "execution_timed_out",
+			reason,
+			timedOut: true,
+		};
+	};
 	context.queueBackend?.beforeRun?.(
 		context.workingContainerName,
 		context.projectPath,
@@ -84,6 +116,15 @@ export async function executeTaskAsyncUnsafe(task, context) {
 			requiredCapability,
 		);
 	}
+	const captureBudget = taskExecutionBudget(context, task);
+	const captureRemainingMs = Math.floor(captureBudget.remainingMs);
+	if (!Number.isFinite(captureRemainingMs) || captureRemainingMs <= 0) {
+		return timeoutBeforeLaunch(
+			"task execution budget exhausted during task-base capture",
+		);
+	}
+	timeoutMs = Math.floor(Math.min(timeoutMs, captureRemainingMs));
+	context._activeTaskTimeoutMs = timeoutMs;
 	const reliability = await prepareAsyncProviderInvocation({
 		task,
 		context,
@@ -99,10 +140,26 @@ export async function executeTaskAsyncUnsafe(task, context) {
 		runQuickChecksAsync,
 	});
 	if (reliability.terminal !== null) return reliability.terminal;
-	timeoutMs = reliability.timeoutMs;
+	const launchBudget = taskExecutionBudget(context, task);
+	timeoutMs = Math.floor(
+		Math.min(
+			timeoutMs,
+			reliability.timeoutMs,
+			launchBudget.remainingMs,
+			context._checkRepairPin
+				? (context._checkRepairBudget?.providerTimeoutMs ??
+						Number.POSITIVE_INFINITY)
+				: Number.POSITIVE_INFINITY,
+		),
+	);
+	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+		return timeoutBeforeLaunch(
+			"task execution budget exhausted before provider launch",
+		);
+	}
+	context._activeTaskTimeoutMs = timeoutMs;
 	context._outcomeAttemptCursor = (context._outcomeAttemptCursor ?? 0) + 1;
 	context._activeOutcomeAttempt = context._outcomeAttemptCursor;
-	let clearExecutionPolicy = () => {};
 	if (selectedRoute.reservation?.id) {
 		clearExecutionPolicy = registerBrokerExecutionPolicy(
 			selectedRoute.reservation.id,
@@ -165,6 +222,15 @@ export async function executeTaskAsyncUnsafe(task, context) {
 					context.taskFileSha256,
 				);
 			}
+			const fallbackBudget = initializeTaskExecutionBudget(context, task);
+			context._activeTaskDeadline = fallbackBudget.deadline;
+			timeoutMs = Math.floor(fallbackBudget.remainingMs);
+			if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+				return timeoutBeforeLaunch(
+					"task execution budget exhausted before fallback routing",
+				);
+			}
+			context._activeTaskTimeoutMs = timeoutMs;
 			context._activeBrokerRoute = selectedRoute;
 			const fallbackRoute = await broker.fallbackAndReserve(
 				brokerRequest,
@@ -245,9 +311,7 @@ export async function executeTaskAsyncUnsafe(task, context) {
 					provider: routeResult.provider,
 					model: routeResult.model,
 				});
-				context._activeTaskDeadline = new Date(
-					Date.now() + timeoutMs,
-				).toISOString();
+				context._activeTaskDeadline = fallbackBudget.deadline;
 				context.onTaskRouted?.({
 					taskId: task.id,
 					provider: routeResult.provider,
@@ -342,6 +406,16 @@ export async function executeTaskAsyncUnsafe(task, context) {
 						},
 					);
 				}
+				const fallbackRemainingMs = Math.floor(
+					taskExecutionBudget(context, task).remainingMs,
+				);
+				timeoutMs = Math.floor(Math.min(timeoutMs, fallbackRemainingMs));
+				if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+					return timeoutBeforeLaunch(
+						"task execution budget exhausted before fallback provider launch",
+					);
+				}
+				context._activeTaskTimeoutMs = timeoutMs;
 				try {
 					brokerExecution = await broker.execute(brokerRequest, fallbackRoute, {
 						launcherIdentity: broker.launcherIdentity(fallbackRoute),

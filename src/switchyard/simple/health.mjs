@@ -86,7 +86,34 @@ function diagnosticFields(providerResult) {
 	};
 }
 
+// A terminal receipt and the in-memory fence must agree. Without a terminal
+// binding, a started invocation can settle only when its writer group stopped.
+function settleTerminalReceipt(
+	currentInvocation,
+	reason,
+	binding,
+	providerResult = null,
+) {
+	const lifecycleVerified =
+		binding !== null ||
+		!currentInvocation.started ||
+		providerResult?.writerLifecycle === "stopped";
+	currentInvocation.settled = !currentInvocation.lease && lifecycleVerified;
+	currentInvocation.terminalResult = {
+		settled: currentInvocation.settled,
+		reason,
+		binding,
+	};
+	return currentInvocation.terminalResult;
+}
+
 export function createSimpleRouteHealthController(options = {}) {
+	const defaultOrigin = options.origin ?? "work";
+	if (defaultOrigin !== "work" && defaultOrigin !== "qualification") {
+		throw Object.assign(new Error("health_origin_invalid"), {
+			code: "health_origin_invalid",
+		});
+	}
 	const mode = configuredMode(
 		envValue(options.healthMode, "SWITCHYARD_ROUTE_HEALTH_MODE"),
 	);
@@ -116,7 +143,13 @@ export function createSimpleRouteHealthController(options = {}) {
 		}
 	}
 
-	function resolveSelected({ provider, targetId, capability, descriptor }) {
+	function resolveSelected({
+		provider,
+		targetId,
+		capability,
+		descriptor,
+		origin: inputOrigin,
+	}) {
 		if (
 			typeof decision?.identityFor !== "function" ||
 			typeof provider !== "string" ||
@@ -127,6 +160,8 @@ export function createSimpleRouteHealthController(options = {}) {
 			typeof options.taskId !== "string"
 		)
 			return null;
+		const origin = inputOrigin ?? defaultOrigin;
+		if (origin !== "work" && origin !== "qualification") return null;
 		const identity = decision.identityFor({
 			provider: targetId,
 			requiredCapability: capability,
@@ -164,6 +199,7 @@ export function createSimpleRouteHealthController(options = {}) {
 			...identity,
 			provider,
 			capability,
+			origin,
 			descriptor: structuredClone(verifiedDescriptor),
 			descriptorHarness,
 			runId: options.runId,
@@ -229,7 +265,11 @@ export function createSimpleRouteHealthController(options = {}) {
 				reason: "health-state-unavailable",
 			};
 		}
-		if ((state.mode ?? binding.mode) === "enforce" && state.suppress === true)
+		if (
+			binding.origin !== "qualification" &&
+			(state.mode ?? binding.mode) === "enforce" &&
+			state.suppress === true
+		)
 			return { allowed: false, reroute: true, reason: "route-health-blocked" };
 		return {
 			allowed: true,
@@ -254,7 +294,11 @@ export function createSimpleRouteHealthController(options = {}) {
 		});
 		const repairEpoch = validatedRepairEpoch(state);
 		binding.repairEpoch = repairEpoch;
-		if ((state.mode ?? binding.mode) === "enforce" && state.suppress === true)
+		if (
+			binding.origin !== "qualification" &&
+			(state.mode ?? binding.mode) === "enforce" &&
+			state.suppress === true
+		)
 			return { allowed: false, reroute: true, reason: "route-health-changed" };
 		if (repairEpoch === null) {
 			invocation = null;
@@ -271,7 +315,11 @@ export function createSimpleRouteHealthController(options = {}) {
 				reason: "health-state-unavailable",
 			};
 		}
-		if (binding.mode === "enforce" && state.trialAvailable === true) {
+		if (
+			binding.origin !== "qualification" &&
+			binding.mode === "enforce" &&
+			state.trialAvailable === true
+		) {
 			const claimInput = {
 				...claimFields(binding),
 				repairEpoch,
@@ -382,14 +430,13 @@ export function createSimpleRouteHealthController(options = {}) {
 		if (currentInvocation.terminalResult)
 			return currentInvocation.terminalResult;
 		const binding = currentInvocation.binding;
-		if (!Number.isSafeInteger(binding.repairEpoch)) {
-			currentInvocation.terminalResult = {
-				settled: !currentInvocation.lease,
-				reason: "health-state-unavailable",
-				binding: null,
-			};
-			return currentInvocation.terminalResult;
-		}
+		if (!Number.isSafeInteger(binding.repairEpoch))
+			return settleTerminalReceipt(
+				currentInvocation,
+				"health-state-unavailable",
+				null,
+				providerResult,
+			);
 		if (!currentInvocation.started) {
 			const released = await releaseUnstarted(currentInvocation);
 			currentInvocation.terminalResult = {
@@ -418,11 +465,19 @@ export function createSimpleRouteHealthController(options = {}) {
 					}
 				: {}),
 		});
-		if (!terminalBinding) {
+		if (!terminalBinding)
+			return settleTerminalReceipt(
+				currentInvocation,
+				"provider-terminal-unverified",
+				null,
+				providerResult,
+			);
+		if (binding.origin === "qualification") {
+			currentInvocation.settled = true;
 			currentInvocation.terminalResult = {
-				settled: !currentInvocation.lease,
-				reason: "provider-terminal-unverified",
-				binding: null,
+				settled: true,
+				reason: null,
+				binding: terminalBinding,
 			};
 			return currentInvocation.terminalResult;
 		}
@@ -479,11 +534,12 @@ export function createSimpleRouteHealthController(options = {}) {
 				binding: terminalBinding,
 			};
 		} catch {
-			currentInvocation.terminalResult = {
-				settled: !currentInvocation.lease,
-				reason: "provider-health-observation-unavailable",
-				binding: terminalBinding,
-			};
+			return settleTerminalReceipt(
+				currentInvocation,
+				"provider-health-observation-unavailable",
+				terminalBinding,
+				providerResult,
+			);
 		}
 		return currentInvocation.terminalResult;
 	}

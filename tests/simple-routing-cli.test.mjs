@@ -439,6 +439,33 @@ test("routing-run failures summarizes the log without project or run identity", 
 		},
 	);
 	strictEqual(lowercase.groups.length, 0);
+	for (const since of [
+		"2999-01-01T01:00:00.123456789123+01:00",
+		"2999-01-01t00:00:00.123456789z",
+	]) {
+		let parsed;
+		await handleRoutingRun(["failures", "--json", "--since", since], {
+			stateRoot,
+			writeResult: (value) => {
+				parsed = JSON.parse(value);
+			},
+		});
+		strictEqual(parsed.groups.length, 0);
+	}
+	for (const since of [
+		"2025-02-29T00:00:00Z",
+		"2025-04-31T00:00:00Z",
+		"1970-01-01T24:00:00Z",
+		"2025-01-01",
+	]) {
+		await rejects(
+			handleRoutingRun(["failures", "--since", since], {
+				stateRoot,
+				writeResult: () => {},
+			}),
+			{ name: "RoutingCliUsageError" },
+		);
+	}
 	await rejects(
 		handleRoutingRun(
 			[

@@ -28,7 +28,11 @@ import {
 	snapshotGitControl,
 	verifyGitControl,
 } from "./args.mjs";
-import { EVIDENCE_TAIL_BYTES, evidenceTail } from "./check-environment.mjs";
+import {
+	EVIDENCE_TAIL_BYTES,
+	evidenceTail,
+	redactCredentialTokens,
+} from "./check-environment.mjs";
 import { commandWords, resolveCheckExecution } from "./check-execution.mjs";
 import {
 	declaredPathDependencies,
@@ -44,6 +48,7 @@ function refused(code, details = null) {
 /** Longest a sandbox executable-resolution probe may run. */
 const RESOLVE_EXECUTABLE_PROBE_CAP_MS = 30_000;
 const MAX_EXECUTABLE_PATH_CHARS = 256;
+const CHECK_SETUP_EXECUTABLE_MAX_CHARS = 64;
 
 /** One `command -v` answer, only when it is a bounded absolute path. */
 function absoluteExecutablePath(value) {
@@ -57,16 +62,28 @@ function absoluteExecutablePath(value) {
 		: null;
 }
 
+// The readiness command's bounded basename is persisted without its argv.
+function readinessExecutableBasename(word) {
+	if (typeof word !== "string") return null;
+	const name = basename(word);
+	return name.length > 0 &&
+		name.length <= CHECK_SETUP_EXECUTABLE_MAX_CHARS &&
+		!/[/\\]/u.test(name) &&
+		!/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(name)
+		? name
+		: null;
+}
+
 // Failed-check tails stay host-side diagnostics: the result carries this path
 // and never the bytes themselves.
-function writeCheckEvidence(directory, attempt, index, check) {
+export function writeCheckEvidence(directory, attempt, index, check) {
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
 	const path = join(directory, `${attempt}-${index}.log`);
 	writeFileSync(
 		path,
 		Buffer.concat([
-			evidenceTail(check?.output, EVIDENCE_TAIL_BYTES),
-			evidenceTail(check?.stderr, EVIDENCE_TAIL_BYTES),
+			evidenceTail(redactCredentialTokens(check?.output), EVIDENCE_TAIL_BYTES),
+			evidenceTail(redactCredentialTokens(check?.stderr), EVIDENCE_TAIL_BYTES),
 		]),
 		{ mode: 0o600 },
 	);
@@ -469,7 +486,10 @@ export function createSimpleCheckSessions({
 					env,
 				);
 				if (!ready.success || lifecycle !== "stopped")
-					throw refused("check_environment_unavailable");
+					throw refused("check_environment_unavailable", {
+						checkIndex: index + 1,
+						checkSetupExecutable: readinessExecutableBasename(word),
+					});
 			}
 		}
 		return active.path;

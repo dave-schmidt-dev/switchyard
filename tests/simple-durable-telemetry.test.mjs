@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, it } from "node:test";
+import { buildStatusEnvelope } from "../src/switchyard/dispatch/status-envelope.mjs";
+import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { readRun } from "../src/switchyard/run-store/index.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -81,11 +83,16 @@ function dependencies(overrides = {}) {
 			harnessKey: "codex",
 			ambiguous: false,
 		}),
-		getInvocationDescriptor: () => ({
-			target_id: "codex",
-			selector: "gpt-5.3-codex-spark",
-			invocation_args: [],
-		}),
+		getInvocationDescriptor: () =>
+			validateInvocationDescriptor(
+				{
+					target_id: "codex",
+					model_ref: "openai/gpt-5.3-codex-spark",
+					selector: "gpt-5.3-codex-spark",
+					invocation_args: [],
+				},
+				"codex",
+			),
 		assertFundedRoute: () => {},
 		...overrides,
 	};
@@ -145,6 +152,35 @@ it("persists running state, start timestamps and an observed heartbeat while the
 	strictEqual(live.activeTaskElapsedMs, null);
 	strictEqual(typeof live.startedAt, "string");
 	ok(Number.isFinite(Date.parse(live.startedAt)));
+	strictEqual(live.activeTaskId, "durable-telemetry-task");
+	strictEqual(live.activeTaskProvider, "Codex (Spark)");
+	strictEqual(live.activeTaskModel, "gpt-5.3-codex-spark");
+	strictEqual(live.activeTaskDeadline, new Date(clock + 120_000).toISOString());
+	strictEqual(live.activeTaskProcessPhase, "provider_running");
+	strictEqual(live.activeTaskInvocationDescriptor.target_id, "codex");
+	strictEqual(
+		live.activeTaskInvocationDescriptor.selector,
+		"gpt-5.3-codex-spark",
+	);
+	strictEqual(
+		live.activeTaskDescriptorIdentity,
+		live.activeTaskInvocationDescriptor.descriptor_identity,
+	);
+	ok(live.activeTaskDescriptorHarness);
+	const liveStatus = await buildStatusEnvelope(runId, live);
+	strictEqual(liveStatus.activeTaskId, "durable-telemetry-task");
+	strictEqual(liveStatus.activeTaskProvider, "Codex (Spark)");
+	strictEqual(liveStatus.activeTaskModel, "gpt-5.3-codex-spark");
+	strictEqual(liveStatus.activeTaskDeadline, live.activeTaskDeadline);
+	strictEqual(liveStatus.activeTaskProcessPhase, "provider_running");
+	strictEqual(
+		liveStatus.activeTaskDescriptorIdentity,
+		live.activeTaskDescriptorIdentity,
+	);
+	strictEqual(
+		liveStatus.activeTaskInvocationDescriptor.selector,
+		"gpt-5.3-codex-spark",
+	);
 
 	provider.release();
 	const result = await pending;
@@ -155,6 +191,22 @@ it("persists running state, start timestamps and an observed heartbeat while the
 	strictEqual(final.activeTaskHeartbeatAt, clock);
 	strictEqual(final.activeTaskElapsedMs, null);
 	strictEqual(Object.hasOwn(final, "lastCompletionAt"), false);
+	const terminalStatus = await buildStatusEnvelope(runId, final);
+	strictEqual(terminalStatus.state, "succeeded");
+	for (const field of [
+		"activeTaskId",
+		"activeTaskProvider",
+		"activeTaskModel",
+		"activeTaskDeadline",
+		"activeTaskHeartbeatAt",
+		"activeTaskProcessPhase",
+		"activeTaskInvocationDescriptor",
+		"activeTaskDescriptorIdentity",
+		"activeTaskDescriptorHarness",
+		"activeTaskElapsedMs",
+	]) {
+		strictEqual(terminalStatus[field], null, `${field} is terminally gated`);
+	}
 });
 
 it("throttles durable heartbeats to at most one per 30 seconds", async () => {

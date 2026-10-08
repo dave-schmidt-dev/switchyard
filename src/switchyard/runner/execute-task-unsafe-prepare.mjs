@@ -74,7 +74,7 @@ export function prepareExecuteTaskUnsafe(task, context) {
 					resolvedTargetId: providerPin.resolvedTargetId ?? null,
 					result:
 						remaining <= 0 ? "execution_timed_out" : "check_repair_ineligible",
-					errorKind: remaining <= 0 ? "execution_timeout" : "unknown_failure",
+					errorKind: remaining <= 0 ? "execution_timed_out" : "unknown_failure",
 					timedOut: remaining <= 0,
 				},
 			};
@@ -300,7 +300,7 @@ export function prepareExecuteTaskUnsafe(task, context) {
 				requiredCapability,
 				resolvedTargetId,
 				result: "execution_timed_out",
-				errorKind: "execution_timeout",
+				errorKind: "execution_timed_out",
 				timedOut: true,
 			},
 		};

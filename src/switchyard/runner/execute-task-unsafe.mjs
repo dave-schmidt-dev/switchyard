@@ -209,7 +209,7 @@ export function executeTaskUnsafe(task, context) {
 			requiredCapability,
 			resolvedTargetId,
 			result: "execution_timed_out",
-			errorKind: "execution_timeout",
+			errorKind: "execution_timed_out",
 			timedOut: true,
 		};
 	}

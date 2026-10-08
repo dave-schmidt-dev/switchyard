@@ -166,11 +166,16 @@ export async function handleExecuteTaskAsyncUnsafeFailure(
 		: captureFailed
 			? "execution_timed_out_capture_failed"
 			: "execution_timed_out";
+	const providerErrorKind =
+		execution.errorKind === "execution_failed" ||
+		execution.errorKind === "execution_timed_out"
+			? "execution_timed_out"
+			: execution.errorKind;
 	const errorKind =
 		(cleanupFailed && "provider_cleanup_failed") ||
 		(captureFailed && "diff_capture_failed") ||
-		execution.errorKind ||
-		null;
+		providerErrorKind ||
+		"execution_timed_out";
 	const safeTimeoutFailure = sanitizeFailureMetadata({
 		taskId: task.id,
 		result: resultName,

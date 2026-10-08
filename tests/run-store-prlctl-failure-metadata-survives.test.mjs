@@ -9,6 +9,7 @@ import {
 } from "../src/switchyard/adapter/exec-error.mjs";
 import {
 	createEvent,
+	getRunRoot,
 	initializeRun,
 	readEvents,
 	readRun,
@@ -474,6 +475,84 @@ describe("prlctl failure metadata survives the persistence boundary", () => {
 			for (const badWorktree of invalidShapes) {
 				const opts = makeOptions({ worktree: badWorktree });
 				await rejects(initializeRun(opts), SchemaError);
+			}
+		});
+
+		it("validates persisted retainedAt timestamps across historical and current schemas", async () => {
+			const schemaCases = [
+				{ version: 1, options: {} },
+				{
+					version: 2,
+					options: {
+						projectRevision: "test-revision",
+						queueIdentity: "a".repeat(64),
+						runOptions: {
+							version: 1,
+							maxTasks: null,
+							stopOnFailure: false,
+							checkpointPath: null,
+							onlyProviders: [],
+							excludeProviders: [],
+							taskIds: [],
+						},
+					},
+				},
+			];
+			const validDates = [
+				"2024-02-29T12:34:56.123456Z",
+				"2024-02-29t12:34:56.123456z",
+				"2024-02-29T12:34:56+05:30",
+			];
+			const invalidDates = [
+				"2025-02-29T00:00:00.000Z",
+				"2026-10-08T24:00:00.000Z",
+			];
+			const worktree = (retainedAt) => ({
+				canonicalParent: resolve("/tmp"),
+				candidateChild: "switchyard-simple-test",
+				path: resolve("/tmp", "switchyard-simple-test"),
+				state: "retained",
+				reason: "salvage_retained",
+				...(retainedAt !== undefined ? { retainedAt } : {}),
+			});
+
+			for (const schema of schemaCases) {
+				for (const retainedAt of validDates) {
+					const opts = makeOptions({
+						...schema.options,
+						worktree: worktree(retainedAt),
+					});
+					const snapshot = await initializeRun(opts);
+					strictEqual(snapshot.schemaVersion, schema.version);
+					strictEqual(
+						(await readRun(opts.runId)).worktree.retainedAt,
+						retainedAt,
+					);
+				}
+
+				for (const retainedAt of [null, undefined]) {
+					const opts = makeOptions({
+						...schema.options,
+						worktree: worktree(retainedAt),
+					});
+					await initializeRun(opts);
+					const persisted = (await readRun(opts.runId)).worktree;
+					if (retainedAt === null) strictEqual(persisted.retainedAt, null);
+					else strictEqual(Object.hasOwn(persisted, "retainedAt"), false);
+				}
+
+				const opts = makeOptions({
+					...schema.options,
+					worktree: worktree(validDates[0]),
+				});
+				await initializeRun(opts);
+				const path = join(getRunRoot(opts.runId), "run.json");
+				const persisted = JSON.parse(readFileSync(path, "utf8"));
+				for (const retainedAt of invalidDates) {
+					persisted.worktree.retainedAt = retainedAt;
+					writeFileSync(path, JSON.stringify(persisted));
+					await rejects(readRun(opts.runId), SchemaError);
+				}
 			}
 		});
 

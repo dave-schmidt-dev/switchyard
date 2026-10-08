@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import {
+	CANCEL_SOURCES,
 	CHECK_SETUP_STEPS,
 	CODE_CATEGORIES,
 	causeCategoryFor,
@@ -44,6 +45,7 @@ const CHECK_EXECUTABLE_LINE_PREFIX = "check command resolves to ";
 const CHECK_EXECUTABLE_LINE_MIDDLE = " in the check sandbox but ";
 const CHECK_EXECUTABLE_LINE_SUFFIX = " on the host.";
 const CLOSED_CHECK_SETUP_STEPS = new Set(CHECK_SETUP_STEPS);
+const CLOSED_CANCEL_SOURCES = new Set(CANCEL_SOURCES);
 // `git_control_tampered` is minted by the harness's own git-control
 // verification, never derived from provider output, so harness provenance
 // with evidence is authoritative for it even though it is neither an
@@ -112,6 +114,10 @@ function sanitizeDetailValue(field, value) {
 		}
 		return bounded;
 	}
+	if (field === "cancelSource")
+		return typeof value === "string" && CLOSED_CANCEL_SOURCES.has(value)
+			? value
+			: undefined;
 	if (field === "checkSetupStep")
 		return typeof value === "string" && CLOSED_CHECK_SETUP_STEPS.has(value)
 			? value

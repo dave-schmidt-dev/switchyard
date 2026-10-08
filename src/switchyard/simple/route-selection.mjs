@@ -193,7 +193,9 @@ export function createSimpleRouteSelection({
 					Boolean(descriptorFor(name, capability)),
 				modelForCapability: (name, capability) =>
 					descriptorFor(name, capability)?.selector ?? null,
-				healthDecision: healthController.decision,
+				...(options.origin === "qualification"
+					? {}
+					: { healthDecision: healthController.decision }),
 				only: options.onlyProviders ?? [],
 				exclude: [...excludedSimpleTargets],
 			});

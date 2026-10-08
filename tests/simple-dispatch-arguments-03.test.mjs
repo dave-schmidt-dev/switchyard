@@ -193,6 +193,172 @@ describe("simple dispatch argument boundary", () => {
 		);
 		strictEqual(parsed.deadlineMs, 600_000);
 	});
+	it("accepts RFC3339 fractions with UTC and numeric offsets at millisecond precision", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"low",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+		];
+		const parseAt = (deadline, nowMs = 0) =>
+			parseSimpleArgs([...base, "--deadline", deadline], {
+				now: () => nowMs,
+				onWarning: () => {},
+			}).deadlineMs;
+		for (const [fraction, expectedMillis] of [
+			["1", 100],
+			["12", 120],
+			["123", 123],
+			["123456", 123],
+			["123456789", 123],
+		]) {
+			const expected = 600_000 + expectedMillis;
+			strictEqual(parseAt(`1970-01-01T00:10:00.${fraction}Z`), expected);
+			strictEqual(parseAt(`1970-01-01T01:10:00.${fraction}+01:00`), expected);
+		}
+		const leapDay = "2024-02-29T00:05:00.000Z";
+		strictEqual(
+			parseAt(leapDay, Date.parse("2024-02-28T23:50:00.000Z")),
+			Date.parse(leapDay),
+		);
+		const centuryLeapDay = "2000-02-29T00:05:00.000Z";
+		strictEqual(
+			parseAt(centuryLeapDay, Date.parse("2000-02-28T23:50:00.000Z")),
+			Date.parse(centuryLeapDay),
+		);
+		const earlyYearLeapDay = "0096-02-29T00:05:00.000Z";
+		strictEqual(
+			parseAt(earlyYearLeapDay, Date.parse("0096-02-28T23:50:00.000Z")),
+			Date.parse(earlyYearLeapDay),
+		);
+	});
+	it("rejects malformed RFC3339 fractions and separators", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"low",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+		];
+		const parseAt = (deadline, nowMs = 0) =>
+			parseSimpleArgs([...base, "--deadline", deadline], {
+				now: () => nowMs,
+				onWarning: () => {},
+			}).deadlineMs;
+		for (const deadline of [
+			"1970-01-01T00:10:00.Z",
+			"1970-01-01T00:10:00.12xZ",
+			"1970-01-01T00:10:00.123",
+			"1970-01-01t00:10:00Z",
+			"1970-01-01T00:10:00z",
+			"1970-01-01T00:00:60Z",
+		]) {
+			throws(
+				() => parseAt(deadline),
+				/--deadline must be an RFC3339 timestamp/u,
+			);
+		}
+	});
+	it("rejects invalid Gregorian dates before Date.parse normalization", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"low",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+		];
+		const parseAt = (deadline, nowMs) =>
+			parseSimpleArgs([...base, "--deadline", deadline], {
+				now: () => nowMs,
+				onWarning: () => {},
+			}).deadlineMs;
+		for (const [deadline, nowMs] of [
+			["2025-02-29T00:00:00Z", Date.parse("2025-02-28T23:50:00Z")],
+			["1900-02-29T00:00:00Z", Date.parse("1900-02-28T23:50:00Z")],
+			["2025-04-31T00:00:00Z", Date.parse("2025-04-30T23:50:00Z")],
+		]) {
+			throws(
+				() => parseAt(deadline, nowMs),
+				/--deadline must be an RFC3339 timestamp/u,
+			);
+		}
+	});
+	it("rejects out-of-range clock and offset components", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"low",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+		];
+		const parseAt = (deadline, nowMs) =>
+			parseSimpleArgs([...base, "--deadline", deadline], {
+				now: () => nowMs,
+				onWarning: () => {},
+			}).deadlineMs;
+		for (const [deadline, nowMs] of [
+			["1970-01-01T24:00:00Z", Date.parse("1970-01-01T23:50:00Z")],
+			["1970-01-01T00:60:00Z", Date.parse("1970-01-01T00:50:00Z")],
+			["1970-01-01T00:10:00+24:00", Date.parse("1969-12-30T23:50:00Z")],
+			["1970-01-01T00:10:00+00:60", Date.parse("1969-12-31T23:50:00Z")],
+		]) {
+			throws(
+				() => parseAt(deadline, nowMs),
+				/--deadline must be an RFC3339 timestamp/u,
+			);
+		}
+	});
+	it("enforces future and 30-minute bounds without admitting sub-millisecond excess", () => {
+		const repo = makeRepo();
+		const base = [
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"low",
+			"--file",
+			"src/a.txt",
+			"--check",
+			"true",
+		];
+		const parseAt = (deadline, nowMs = 0) =>
+			parseSimpleArgs([...base, "--deadline", deadline], {
+				now: () => nowMs,
+				onWarning: () => {},
+			}).deadlineMs;
+		strictEqual(parseAt("1970-01-01T00:30:00.000Z"), 1_800_000);
+		for (const deadline of [
+			"1970-01-01T00:30:00.001Z",
+			"1970-01-01T00:30:00.000001Z",
+		]) {
+			throws(() => parseAt(deadline));
+		}
+		strictEqual(parseAt("1970-01-01T00:00:00.001Z"), 1);
+		throws(() => parseAt("1970-01-01T00:00:00.000001Z"));
+		throws(() => parseAt("1970-01-01T00:00:00Z"));
+		throws(() => parseAt("1969-12-31T23:59:59.999Z"));
+	});
 	it("accepts one supported provider pin and rejects ambiguous or unsupported pins", () => {
 		const repo = makeRepo();
 		const base = [

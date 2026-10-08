@@ -9,12 +9,16 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { deriveFailureAccountability } from "../src/switchyard/simple/failure-accountability.mjs";
 import {
 	appendFailureRecord,
 	failureLogPath,
 	readFailureRecords,
 	summarizeFailures,
 } from "../src/switchyard/simple/failure-log.mjs";
+import { classifyAttemptFailure } from "../src/switchyard/simple/failure-severity.mjs";
+import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/simple/reliability.mjs";
+import { failureAttemptRecord } from "../src/switchyard/simple/routing-stop-record.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const root = () => realpathSync(tempDir("failure-log-"));
@@ -61,6 +65,7 @@ test("appendFailureRecord keeps only allowlisted fields and nulls unsafe values"
 		"exhaustionCause",
 		"failurePhase",
 		"fingerprint",
+		"origin",
 		"partialRetained",
 		"phase",
 		"project",
@@ -78,6 +83,7 @@ test("appendFailureRecord keeps only allowlisted fields and nulls unsafe values"
 	]);
 	strictEqual(record.schemaVersion, 1);
 	strictEqual(record.recordType, "attempt");
+	strictEqual(record.origin, "work");
 	strictEqual(record.taskId, null);
 	strictEqual(record.errorKind, null);
 	strictEqual(record.salvageable, null);
@@ -353,4 +359,175 @@ test("summary ordering breaks ties by lastSeen and caps sampleRunIds at three", 
 	strictEqual(summary.totals.byReason.check_failed, 2);
 	strictEqual(summary.totals.byTargetId.vibe, 6);
 	strictEqual(summary.totals.byTargetId.codex, 2);
+});
+
+test("appendFailureRecord validates closed origins and defaults to work", () => {
+	const stateRoot = root();
+	const workRec = appendFailureRecord(attempt({ origin: "work" }), {
+		stateRoot,
+	});
+	strictEqual(workRec.origin, "work");
+
+	const qualRec = appendFailureRecord(
+		attempt({ origin: "qualification", runId: "qual-1" }),
+		{ stateRoot },
+	);
+	strictEqual(qualRec.origin, "qualification");
+
+	throws(
+		() =>
+			appendFailureRecord(attempt({ origin: "unrecognized" }), { stateRoot }),
+		{ code: "failure_log_origin_invalid" },
+	);
+});
+
+test("readFailureRecords defaults missing origin to work for legacy records", () => {
+	const stateRoot = root();
+	const path = failureLogPath({ stateRoot });
+	appendFileSync(
+		path,
+		`${JSON.stringify({
+			...attempt(),
+			recordedAt: "2026-10-01T00:00:00.000Z",
+			fingerprint: "legacy-fingerprint",
+		})}\n`,
+	);
+	const records = readFailureRecords({ stateRoot });
+	strictEqual(records.length, 1);
+	strictEqual(records[0].origin, "work");
+});
+
+test("summarizeFailures separates work versus qualification failure statistics", () => {
+	const stateRoot = root();
+	appendFailureRecord(
+		attempt({
+			targetId: "codex",
+			runId: "work-1",
+			origin: "work",
+			reason: "check_failed",
+		}),
+		{ stateRoot },
+	);
+	appendFailureRecord(
+		attempt({
+			targetId: "codex",
+			runId: "work-2",
+			origin: "work",
+			reason: "check_failed",
+		}),
+		{ stateRoot },
+	);
+	appendFailureRecord(
+		attempt({
+			targetId: "codex",
+			runId: "qual-1",
+			origin: "qualification",
+			reason: "check_failed",
+		}),
+		{ stateRoot },
+	);
+
+	const records = readFailureRecords({ stateRoot });
+
+	// Default summary: work origin only, excluding qualification
+	const defaultSummary = summarizeFailures(records);
+	strictEqual(defaultSummary.groups.length, 1);
+	strictEqual(defaultSummary.groups[0].count, 2);
+	strictEqual(defaultSummary.totals.byTargetId.codex, 2);
+	deepStrictEqual(defaultSummary.groups[0].sampleRunIds, ["work-1", "work-2"]);
+
+	// Explicit qualification summary
+	const qualSummary = summarizeFailures(records, { origin: "qualification" });
+	strictEqual(qualSummary.groups.length, 1);
+	strictEqual(qualSummary.groups[0].count, 1);
+	strictEqual(qualSummary.totals.byTargetId.codex, 1);
+	deepStrictEqual(qualSummary.groups[0].sampleRunIds, ["qual-1"]);
+
+	// All origins summary
+	const allSummary = summarizeFailures(records, { origin: "all" });
+	strictEqual(allSummary.groups.length, 1);
+	strictEqual(allSummary.groups[0].count, 3);
+	strictEqual(allSummary.totals.byTargetId.codex, 3);
+
+	// Invalid origin filter throws
+	throws(() => summarizeFailures(records, { origin: "invalid" }), {
+		code: "failure_log_origin_invalid",
+	});
+});
+
+test("invalid persisted origins are excluded while legacy work remains counted", () => {
+	const stateRoot = root();
+	const valid = appendFailureRecord(attempt(), { stateRoot });
+	const invalid = { ...valid, origin: "unrecognized", runId: "invalid-origin" };
+	appendFileSync(failureLogPath({ stateRoot }), `${JSON.stringify(invalid)}\n`);
+	strictEqual(readFailureRecords({ stateRoot }).length, 1);
+	const legacy = { ...valid, runId: "legacy-origin" };
+	delete legacy.origin;
+	const summary = summarizeFailures([valid, invalid, legacy]);
+	strictEqual(summary.totals.byTargetId.codex, 2);
+});
+
+test("failure log uses only matching timed-out provider evidence for deadline reason", () => {
+	const stateRoot = root();
+	const result = (timedOut) => ({
+		status: "failed",
+		failureReason: "provider_exit_nonzero",
+		failurePhase: "execute",
+		errorKind: "execution_failed",
+		partialWorktree: null,
+		providerReliability: createSimpleProviderReliabilityDiagnostic({
+			failureReason: "provider_exit_nonzero",
+			failurePhase: "execute",
+			errorKind: "execution_failed",
+			providerResult: { code: 76, timedOut },
+		}),
+	});
+	const appendAttempt = (failure, accountability) => {
+		const classification = classifyAttemptFailure({
+			result: failure,
+			accountability,
+		});
+		strictEqual(classification.reason, "execution_failed");
+		return appendFailureRecord(
+			failureAttemptRecord({
+				project: "/review/project",
+				routingRunId: "run-1",
+				attempt: attempt(),
+				result: failure,
+				accountability,
+				classification,
+			}),
+			{ stateRoot },
+		);
+	};
+	const timedOut = result(true);
+	const deadlineAccountability = deriveFailureAccountability({
+		providerReliability: timedOut.providerReliability,
+	});
+	appendAttempt(timedOut, deadlineAccountability);
+	const ordinary = result(false);
+	const ordinaryAccountability = deriveFailureAccountability({
+		providerReliability: ordinary.providerReliability,
+	});
+	appendAttempt(ordinary, ordinaryAccountability);
+	appendAttempt(
+		{ ...ordinary, providerReliability: undefined },
+		deriveFailureAccountability({}),
+	);
+	appendAttempt(timedOut, ordinaryAccountability);
+	deepStrictEqual(
+		readFailureRecords({ stateRoot }).map(({ reason, causeCode }) => ({
+			reason,
+			causeCode,
+		})),
+		[
+			{
+				reason: "provider_deadline_exceeded",
+				causeCode: "provider_deadline_exceeded",
+			},
+			{ reason: "execution_failed", causeCode: "provider_exit_nonzero" },
+			{ reason: "execution_failed", causeCode: "unknown" },
+			{ reason: "execution_failed", causeCode: "provider_deadline_exceeded" },
+		],
+	);
 });

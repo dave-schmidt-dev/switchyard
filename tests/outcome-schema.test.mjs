@@ -89,6 +89,36 @@ describe("closed outcome schema", () => {
 		);
 	});
 
+	it("validates Gregorian recordedAt values without widening the UTC profile", () => {
+		for (const recordedAt of [
+			"0096-02-29T12:00:00.123456789Z",
+			"2000-02-29T12:00:00Z",
+		]) {
+			strictEqual(
+				validateOutcomeEvent(outcome({ recordedAt })).recordedAt,
+				recordedAt,
+			);
+		}
+		for (const recordedAt of [
+			"2025-02-29T00:00:00Z",
+			"1900-02-29T00:00:00Z",
+			"2025-04-31T00:00:00Z",
+			"1970-01-01T24:00:00Z",
+			"1970-01-01T00:00:60Z",
+			"2025-01-01",
+			"2025-01-01T00:00:00",
+			"2025-01-01T00:00:00+00:00",
+			"2025-01-01t00:00:00Z",
+			"2025-01-01T00:00:00z",
+			"2025-01-01T00:00:00.1234567890Z",
+		]) {
+			throws(
+				() => validateOutcomeEvent(outcome({ recordedAt })),
+				/recordedAt is invalid/u,
+			);
+		}
+	});
+
 	it("enforces scope, dispatch linkage, closure, and durable-data safety", () => {
 		throws(() => validateOutcomeEvent(outcome({ scope: "run" })), /run scope/);
 		validateOutcomeEvent(

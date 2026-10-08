@@ -23,7 +23,7 @@ import {
 	sweepSimpleOrphans,
 	sweepTempDirs,
 } from "../scripts/sweep-temp-dirs.mjs";
-import { tempDir } from "./helpers/tempdir.mjs";
+import { tempDir, tempDirIn } from "./helpers/tempdir.mjs";
 
 const DAY = 86_400_000;
 /** Fixed so age is measured against an injected clock, never the real one. */
@@ -220,20 +220,17 @@ describe("sweep-temp-dirs", () => {
 	});
 	it("matches held paths reported in canonical form", () => {
 		// One entry, so the counters below cannot be satisfied by another.
-		const root = tempDir("switchyard-sweep-canonical-");
-		const stale = makeEntry(root, "switchyard-canonical-abc", 10);
-		// macOS lsof reports `/private/var/...` for a `$TMPDIR` of `/var/...`.
-		// The original sweep compared against the uncanonicalized value, so its
-		// open-handle check matched nothing and reported a truthful zero that
-		// proved nothing. `root` here is the raw path; the held path is not.
-		const canonicalRoot = realpathSync(root);
-		if (process.platform === "darwin") {
-			ok(
-				canonicalRoot !== root,
-				"this test is only meaningful where the two forms differ",
-			);
-		}
-		const heldCanonical = join(canonicalRoot, "switchyard-canonical-abc");
+		const parent = tempDir("switchyard-sweep-canonical-parent-");
+		const canonicalRoot = tempDirIn(parent, "actual-");
+		const root = join(parent, "alias");
+		symlinkSync(canonicalRoot, root);
+		const stale = makeEntry(canonicalRoot, "switchyard-canonical-abc", 10);
+		// The explicit symlink keeps the two path forms distinct on every host.
+		// lsof reports canonical paths, so the held path must name the target.
+		const canonicalAlias = realpathSync(root);
+		ok(canonicalAlias !== root, "the fixture must exercise an alias");
+		strictEqual(canonicalAlias, canonicalRoot);
+		const heldCanonical = join(canonicalAlias, "switchyard-canonical-abc");
 
 		const { summary } = sweepTempDirs({
 			tmpDir: root,

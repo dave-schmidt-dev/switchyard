@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { parseRfc3339 } from "../rfc3339.mjs";
 
 const OUTCOME_SCHEMA_VERSION = 1;
 export const SUPPORTED_OUTCOME_READER_VERSION = 1;
@@ -248,7 +249,7 @@ export function validateOutcomeEvent(value, options = {}) {
 		fail("closed outcome vocabulary is invalid");
 	if (
 		!RFC3339_RE.test(value.recordedAt ?? "") ||
-		Number.isNaN(Date.parse(value.recordedAt))
+		!parseRfc3339(value.recordedAt)
 	)
 		fail("recordedAt is invalid");
 	if (!Number.isSafeInteger(value.attempt) || value.attempt < 0)

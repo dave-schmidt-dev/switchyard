@@ -407,7 +407,7 @@ export function checkRepairCandidate(task, result) {
 		!["exited", "terminated"].includes(
 			result.providerLifecycle?.terminalStatus,
 		) ||
-		!["complete", "not_required"].includes(
+		!["succeeded", "not_required"].includes(
 			result.providerLifecycle?.cleanupStatus,
 		) ||
 		!Array.isArray(task.quickChecks?.repairChecks) ||

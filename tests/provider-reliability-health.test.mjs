@@ -445,7 +445,7 @@ describe("provider reliability health", () => {
 			exitCode: 1,
 		});
 		const shadowTerminal = await shadow.terminal({
-			providerResult: { success: false, code: 1 },
+			providerResult: { success: false, code: 1, writerLifecycle: "stopped" },
 			providerReliability: genericExit,
 			providerLifecycle: localLifecycle(1),
 		});

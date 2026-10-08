@@ -9,13 +9,17 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { parseRfc3339 } from "../rfc3339.mjs";
 import { isProjectLockOwnedBy, readRun } from "../run-store/index.mjs";
 import { projectLockArtifacts } from "../run-store/project-lock-files.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 import { SimpleUsageError } from "./args.mjs";
 import { inspectRoutingAccountability } from "./failure-accountability.mjs";
 import { readFailureRecords, summarizeFailures } from "./failure-log.mjs";
-import { closePendingAttempt, releaseRetainedPartial } from "./routing-run.mjs";
+import {
+	closePendingAttempt,
+	releaseRetainedPartial,
+} from "./routing-recovery.mjs";
 import {
 	canonicalRoutingProject,
 	latchNativeRequired,
@@ -110,10 +114,7 @@ export async function handleRoutingRun(argv, deps = {}) {
 	if (command === "failures") {
 		let since;
 		if (values.since !== undefined) {
-			if (
-				!RFC3339.test(values.since) ||
-				!Number.isFinite(Date.parse(values.since))
-			)
+			if (!RFC3339.test(values.since) || !parseRfc3339(values.since))
 				throw new RoutingCliUsageError("invalid --since value");
 			since = values.since;
 		}

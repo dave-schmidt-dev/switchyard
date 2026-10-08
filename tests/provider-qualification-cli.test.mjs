@@ -179,6 +179,7 @@ test("simple CLI production arguments bind one selected provider and preserve on
 		args[args.indexOf("--check") + 1],
 		"node --test tests/acceptance.test.mjs",
 	);
+	assert.equal(args[args.indexOf("--origin") + 1], "qualification");
 	assert.equal(receipt.targetId, "codex");
 	assert.equal(receipt.routeModel, "gpt-5.6-terra");
 	assert.deepEqual(receipt.invocationDescriptor, descriptor);

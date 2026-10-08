@@ -19,6 +19,12 @@ import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
 import {
 	classifyProviderOutput,
 	createRateLimitMatcher,
+	parseOpenCodeGoBridgeDiagnostic,
+	parseOpenCodeGoBridgeDiagnosticEvidence,
+	providerCodeForClaudeCodeDiagnostic,
+	providerCodeForOpenCodeGoBridgeEvidence,
+	providerCodeForVibeBudgetEvidence,
+	writeProviderStderrArtifact,
 } from "./provider-signature.mjs";
 
 const VIBE_CODE_LAUNCHER = fileURLToPath(
@@ -374,6 +380,20 @@ export async function defaultExecuteProvider(context) {
 			}
 		: result;
 	if (!result.success) {
+		let outputPath = null;
+		if (
+			!earlyRateLimited &&
+			!result.timedOut &&
+			!result.cancelled &&
+			!result.silenceTimedOut &&
+			signatureInfo?.providerSignature === "unrecognized" &&
+			!diagnosticCode
+		) {
+			outputPath = writeProviderStderrArtifact({
+				runId: context.runId,
+				stderr: result.stderr,
+			});
+		}
 		const providerVerdictCode =
 			context.harness === "opencode"
 				? parseOpenCodeGoBridgeDiagnostic(result.output)
@@ -391,6 +411,7 @@ export async function defaultExecuteProvider(context) {
 			output: "",
 			stderr: "",
 			...(providerVerdictCode ? { providerVerdictCode } : {}),
+			...(outputPath ? { outputPath } : {}),
 		};
 	}
 	if (context.harness !== "agy") return classified;
@@ -406,71 +427,15 @@ export async function defaultExecuteProvider(context) {
 		return { ...result, providerVerdictCode: "agy_unparseable" };
 	}
 }
-export function providerCodeForClaudeCodeDiagnostic(stderr) {
-	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
-	for (const line of stderr.split(/\r?\n/u)) {
-		const match =
-			/^SWITCHYARD_CLAUDE_CODE_DIAG_V1 subtype=([a-z_]{1,40}|unknown) api_status=(\d{3}|none) limit=([01])$/u.exec(
-				line,
-			);
-		if (!match) continue;
-		if (match[3] === "1") return "quota_exhausted";
-		if (match[2] === "401" || match[2] === "403") return "auth_expired";
-		if (match[2] === "404") return "model_unavailable";
-	}
-	return null;
-}
-export function parseOpenCodeGoBridgeDiagnostic(output) {
-	const evidence = parseOpenCodeGoBridgeDiagnosticEvidence(output);
-	if (!evidence) return null;
-	return `opencode_go_diag_requests_${evidence.requests}_status_${evidence.upstreamStatus}_rejections_${evidence.proxyRejections}`;
-}
 
-export function parseOpenCodeGoBridgeDiagnosticEvidence(output) {
-	if (typeof output !== "string") return null;
-	const match =
-		/^SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=(0|[1-9]\d{0,5}) upstream_status=(0|[1-5]\d{2}) proxy_rejections=(0|[1-9]\d{0,5})\r?\n?$/u.exec(
-			output,
-		);
-	if (!match) return null;
-	return {
-		requests: Number(match[1]),
-		upstreamStatus: Number(match[2]),
-		proxyRejections: Number(match[3]),
-	};
-}
+export {
+	parseOpenCodeGoBridgeDiagnostic,
+	parseOpenCodeGoBridgeDiagnosticEvidence,
+	providerCodeForClaudeCodeDiagnostic,
+	providerCodeForOpenCodeGoBridgeEvidence,
+	providerCodeForVibeBudgetEvidence,
+};
 
-export function providerCodeForOpenCodeGoBridgeEvidence(evidence) {
-	return evidence &&
-		evidence.requests > 0 &&
-		evidence.requests <= 999_999 &&
-		evidence.upstreamStatus === 429 &&
-		evidence.proxyRejections === 0
-		? "quota_exhausted"
-		: null;
-}
-/**
- * Vibe prints its own upstream error block on stderr when Mistral rejects a
- * request. Only that block counts; model output on stdout never does. The
- * upstream status decides the code: 402 with a billing budget-exhausted type
- * is quota_exhausted, 401/403 are auth_expired, 404 is model_unavailable, and
- * anything else (429, 5xx, ...) is not recognised.
- */
-export function providerCodeForVibeBudgetEvidence(stderr) {
-	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
-	const start = /^Error: API error from mistral\b/mu.exec(stderr)?.index;
-	if (start === undefined) return null;
-	// Read status only from Vibe's own block, never from earlier output.
-	const block = stderr.slice(start);
-	const status = /^\s*status: (\d{3})\b/mu.exec(block)?.[1];
-	if (status === "402")
-		return /"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(block)
-			? "quota_exhausted"
-			: null;
-	if (status === "401" || status === "403") return "auth_expired";
-	if (status === "404") return "model_unavailable";
-	return null;
-}
 async function defaultRunCheck({
 	command,
 	worktreePath,

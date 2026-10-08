@@ -91,9 +91,19 @@ describe("contract coverage groups", () => {
 			"simple-guarded-prompt",
 			"simple-failure-finalization",
 			"simple-failure-accountability",
+			"simple-failure-log",
 			"simple-launcher-preflight",
+			"simple-lock-release-before-cleanup",
 			"integration-metadata-process",
 			"integration-metadata-refusal",
+			"runner-check-repair-async",
+			"simple-routing-task-memory",
+			"simple-routing-task-state",
+			"simple-routing-cli",
+			"simple-routing-failure-log",
+			"simple-routing-pending-recovery",
+			"simple-routing-release-transition",
+			"simple-routing-state",
 		].map((name) => `tests/${name}.test.mjs`);
 		strictEqual(new Set(plan.suites).size, plan.suites.length);
 		for (const path of regressions)

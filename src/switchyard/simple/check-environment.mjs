@@ -14,6 +14,48 @@
 /** Bytes of each stream kept in the evidence file and fed to the classifier. */
 export const EVIDENCE_TAIL_BYTES = 16 * 1024;
 
+/** Bound on retained unrecognized failed-provider stderr artifact tail. */
+export const PROVIDER_EVIDENCE_TAIL_BYTES = 4 * 1024;
+
+/** Credential-shaped tokens replaced on the full stream before tail truncation. */
+const CREDENTIAL_TOKEN_RE =
+	/\b(?:sk-[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{8,}|ghp_[A-Za-z0-9]{8,}|bws_[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16})/gu;
+const BEARER_TOKEN_RE = /\bBearer\s+[^\s\r\n'"]{8,}/giu;
+const JWT_TOKEN_RE =
+	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/gu;
+const BASIC_AUTH_RE =
+	/\b((?:Proxy-)?Authorization\s*:\s*Basic\s+)[A-Za-z0-9+/]{4,}={0,2}/giu;
+const TOKEN_KEY_VALUE_RE =
+	/\b((?:token|api[_-]?key|access[_-]?token)\s*[:=]\s*['"]?)[^\s\r\n'"]{8,}(['"]?)/giu;
+const SENSITIVE_ASSIGNMENT_RE =
+	/\b((?:password|secret|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key)\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s\r\n,;]+)/giu;
+const TOKEN_SCHEME_RE = /\b(token\s+)[^\s\r\n'"]{8,}/giu;
+
+/**
+ * Replace credential-shaped tokens and Bearer headers on a stream.
+ * Must run on full stream BEFORE byte truncation to prevent exposing
+ * token suffixes across tail boundaries.
+ *
+ * @param {string|Buffer|null} value
+ * @returns {Buffer}
+ */
+export function redactCredentialTokens(value) {
+	let text =
+		typeof value === "string"
+			? value
+			: Buffer.isBuffer(value)
+				? value.toString("utf8")
+				: "";
+	text = text.replace(CREDENTIAL_TOKEN_RE, "[REDACTED]");
+	text = text.replace(BEARER_TOKEN_RE, "Bearer [REDACTED]");
+	text = text.replace(JWT_TOKEN_RE, "[REDACTED]");
+	text = text.replace(BASIC_AUTH_RE, "$1[REDACTED]");
+	text = text.replace(TOKEN_KEY_VALUE_RE, "$1[REDACTED]$2");
+	text = text.replace(SENSITIVE_ASSIGNMENT_RE, "$1[REDACTED]");
+	text = text.replace(TOKEN_SCHEME_RE, "$1[REDACTED]");
+	return Buffer.from(text, "utf8");
+}
+
 /** Closed set of environment signatures the classifier can return. */
 export const CHECK_ENVIRONMENT_SIGNATURES = Object.freeze([
 	"exec_denied",

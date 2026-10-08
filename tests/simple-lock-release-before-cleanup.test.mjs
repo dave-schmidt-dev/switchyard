@@ -108,6 +108,62 @@ function runWithThrowingCleanup(repo, runId, { failTerminal, onStatus }) {
 	return { running, observed };
 }
 
+function waitForCleanupReady(child, timeoutMs) {
+	return new Promise((resolveReady, rejectReady) => {
+		let output = "";
+		const finish = (error, value) => {
+			clearTimeout(timer);
+			child.stdout.off("data", onData);
+			child.off("exit", onExit);
+			child.off("error", onError);
+			if (error) rejectReady(error);
+			else resolveReady(value);
+		};
+		const onData = (chunk) => {
+			output += chunk.toString("utf8");
+			const newline = output.indexOf("\n");
+			if (newline < 0) return;
+			try {
+				finish(null, JSON.parse(output.slice(0, newline)));
+			} catch {
+				finish(new Error("cleanup_ready_marker_invalid"));
+			}
+		};
+		const onExit = () =>
+			finish(new Error("child_exited_before_cleanup_marker"));
+		const onError = () => finish(new Error("child_start_failed"));
+		const timer = setTimeout(
+			() => finish(new Error("cleanup_ready_marker_timeout")),
+			timeoutMs,
+		);
+		child.stdout.on("data", onData);
+		child.once("exit", onExit);
+		child.once("error", onError);
+	});
+}
+
+function waitForChildExit(child, timeoutMs) {
+	if (child.exitCode !== null || child.signalCode !== null)
+		return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+	return new Promise((resolveExit, rejectExit) => {
+		const finish = (error, value) => {
+			clearTimeout(timer);
+			child.off("exit", onExit);
+			child.off("error", onError);
+			if (error) rejectExit(error);
+			else resolveExit(value);
+		};
+		const onExit = (code, signal) => finish(null, { code, signal });
+		const onError = () => finish(new Error("child_wait_failed"));
+		const timer = setTimeout(
+			() => finish(new Error("child_exit_timeout")),
+			timeoutMs,
+		);
+		child.once("exit", onExit);
+		child.once("error", onError);
+	});
+}
+
 describe("simple run releases the project lock before slow cleanup", () => {
 	it("releases before cleanup on a failed run whose cleanup throws", async () => {
 		const repo = makeRepo();
@@ -147,6 +203,115 @@ describe("simple run releases the project lock before slow cleanup", () => {
 			await releaseProjectLockIfOwnedBy(repo.projectPath, `${runId}-next`),
 			true,
 		);
+	});
+
+	it("releases the real project lock before its cleanup child is SIGKILLed", async () => {
+		const repo = makeRepo();
+		const runId = `simple-lock-release-killed-${randomUUID()}`;
+		const nextRunId = `${runId}-next`;
+		const simpleUrl = new URL(
+			"../src/switchyard/simple/index.mjs",
+			import.meta.url,
+		).href;
+		const runStoreUrl = new URL(
+			"../src/switchyard/run-store/index.mjs",
+			import.meta.url,
+		).href;
+		const childScript = `
+			import { runSimpleTask } from ${JSON.stringify(simpleUrl)};
+			import { acquireProjectLock, releaseProjectLockIfOwnedBy } from ${JSON.stringify(runStoreUrl)};
+			import { rmSync, writeFileSync } from "node:fs";
+			import { join } from "node:path";
+			const watchdog = setTimeout(() => process.exit(73), 12_000);
+			const projectPath = ${JSON.stringify(repo.projectPath)};
+			const promptPath = ${JSON.stringify(repo.promptPath)};
+			const runId = ${JSON.stringify(runId)};
+		try {
+			await runSimpleTask(
+			{
+				promptPath,
+				projectPath,
+				capability: "standard",
+				files: ["src/a.txt"],
+				checks: ["test -f src/a.txt"],
+				deadlineMs: 100_000,
+			},
+			{
+				now: () => 1_000,
+				runId,
+				taskId: "simple-lock-release-killed",
+				attemptId: "attempt-1",
+				acquireProjectLock,
+				releaseProjectLock: releaseProjectLockIfOwnedBy,
+				route: () => ({ provider: "Codex (Spark)", reason: "priority_fill" }),
+				resolveTargetIdentity: () => ({
+					targetId: "codex",
+					harnessKey: "codex",
+					ambiguous: false,
+				}),
+				getInvocationDescriptor: () => ({
+					target_id: "codex",
+					selector: "gpt-5.3-codex-spark",
+					invocation_args: [],
+				}),
+				assertFundedRoute: () => {},
+				executeProvider: async ({ worktreePath }) => {
+					writeFileSync(join(worktreePath, "src", "a.txt"), "provider");
+					return { success: true, code: 0, writerLifecycle: "stopped" };
+				},
+				cleanupSimpleWorktree: async (_id, claim) => {
+					process.stdout.write(JSON.stringify({ ready: true, path: claim.path }) + "\\n");
+					await new Promise((resolve) => setTimeout(resolve, 6_000));
+					rmSync(claim.path, { recursive: true, force: true });
+					return { removed: true, path: claim.path };
+				},
+			},
+			);
+		} finally {
+			clearTimeout(watchdog);
+		}
+		`;
+		const child = spawn(
+			process.execPath,
+			["--input-type=module", "-e", childScript],
+			{
+				cwd: process.cwd(),
+				env: { ...process.env, TMPDIR: SUITE_TMPDIR },
+				stdio: ["ignore", "pipe", "ignore"],
+			},
+		);
+		let cleanupPath;
+		let exited = false;
+		try {
+			const ready = await waitForCleanupReady(child, 5_000);
+			strictEqual(ready.ready, true);
+			cleanupPath = resolve(ready.path);
+			strictEqual(cleanupPath.startsWith(`${SUITE_TMPDIR}/`), true);
+			strictEqual(cleanupPath === repo.projectPath, false);
+			strictEqual(child.exitCode, null);
+			strictEqual(child.signalCode, null);
+			strictEqual(isProjectLockHeld(repo.projectPath), false);
+			strictEqual(child.kill("SIGKILL"), true);
+			const exit = await waitForChildExit(child, 3_000);
+			strictEqual(exit.code, null);
+			strictEqual(exit.signal, "SIGKILL");
+			exited = true;
+			await acquireProjectLock(repo.projectPath, nextRunId);
+			strictEqual(
+				await releaseProjectLockIfOwnedBy(repo.projectPath, nextRunId),
+				true,
+			);
+		} finally {
+			if (!exited && child.exitCode === null && child.signalCode === null) {
+				child.kill("SIGKILL");
+				await waitForChildExit(child, 3_000).catch(() => {});
+			}
+			if (
+				cleanupPath?.startsWith(`${SUITE_TMPDIR}/`) &&
+				cleanupPath !== repo.projectPath
+			)
+				rmSync(cleanupPath, { recursive: true, force: true });
+		}
 	});
 
 	it("surfaces project_lock_reclaimed when a run reclaims a dead holder's lock", async () => {

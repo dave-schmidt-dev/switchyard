@@ -6,6 +6,7 @@ import {
 import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { SUPPORTED_OUTCOME_READER_VERSION } from "../outcome/schema.mjs";
 import { validateShadowEnvelope } from "../outcome/shadow.mjs";
+import { parseRfc3339 } from "../rfc3339.mjs";
 import { normalizeProviderName } from "../roster/index.mjs";
 import {
 	CURRENT_SCHEMA_VERSION,
@@ -103,7 +104,7 @@ function validateWorktreeRecord(worktree) {
 	if (worktree.retainedAt !== undefined && worktree.retainedAt !== null) {
 		if (
 			typeof worktree.retainedAt !== "string" ||
-			Number.isNaN(Date.parse(worktree.retainedAt))
+			parseRfc3339(worktree.retainedAt) === null
 		) {
 			throw new SchemaError(
 				"worktree.retainedAt must be a valid ISO timestamp or null",
@@ -597,6 +598,14 @@ function validateRun(data) {
 		data.terminalizedBy !== "dead_worker_recovery"
 	) {
 		throw new SchemaError("terminalizedBy must be a known terminal writer");
+	}
+	if (
+		data.origin !== undefined &&
+		data.origin !== null &&
+		data.origin !== "work" &&
+		data.origin !== "qualification"
+	) {
+		throw new SchemaError("origin must be work or qualification");
 	}
 	if (data.worktree !== undefined && data.worktree !== null) {
 		validateWorktreeRecord(data.worktree);

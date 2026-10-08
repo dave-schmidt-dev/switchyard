@@ -19,12 +19,16 @@ export function createSimpleProviderReliabilityDiagnostic(input = {}) {
 		timedOut: input.timedOut,
 		cancelled: input.cancelled,
 	});
+	const timedOut =
+		resolution.timedOut === true
+			? true
+			: (input.timedOut ?? input.providerResult?.timedOut);
 	return createProviderReliabilityDiagnostic({
 		causeCode: resolution.causeCode,
 		phase: phaseForFailure(failurePhase),
 		exitCode: input.exitCode ?? input.providerResult?.code,
 		signal: input.signal ?? input.providerResult?.signal,
-		timedOut: input.timedOut ?? input.providerResult?.timedOut,
+		timedOut,
 		cancelled:
 			input.cancelled ??
 			(input.providerResult?.cancelled === true ||

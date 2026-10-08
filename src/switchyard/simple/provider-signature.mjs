@@ -1,3 +1,15 @@
+import { randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { validateRunId } from "../run-store/errors.mjs";
+import { getRunRoot } from "../run-store/index.mjs";
+import { ownerOnlyDirectoryStat } from "../run-store/receipt-validation.mjs";
+import {
+	evidenceTail,
+	PROVIDER_EVIDENCE_TAIL_BYTES,
+	redactCredentialTokens,
+} from "./check-environment.mjs";
+
 /**
  * Closed provider failure signature classifier.
  *
@@ -234,4 +246,134 @@ export function classifyProviderOutput({
 		stderrBytes,
 		stdoutBytes,
 	});
+}
+
+export function providerCodeForClaudeCodeDiagnostic(stderr) {
+	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
+	for (const line of stderr.split(/\r?\n/u)) {
+		const match =
+			/^SWITCHYARD_CLAUDE_CODE_DIAG_V1 subtype=([a-z_]{1,40}|unknown) api_status=(\d{3}|none) limit=([01])$/u.exec(
+				line,
+			);
+		if (!match) continue;
+		if (match[3] === "1") return "quota_exhausted";
+		if (match[2] === "401" || match[2] === "403") return "auth_expired";
+		if (match[2] === "404") return "model_unavailable";
+	}
+	return null;
+}
+
+export function parseOpenCodeGoBridgeDiagnostic(output) {
+	const evidence = parseOpenCodeGoBridgeDiagnosticEvidence(output);
+	if (!evidence) return null;
+	return `opencode_go_diag_requests_${evidence.requests}_status_${evidence.upstreamStatus}_rejections_${evidence.proxyRejections}`;
+}
+
+export function parseOpenCodeGoBridgeDiagnosticEvidence(output) {
+	if (typeof output !== "string") return null;
+	const match =
+		/^SWITCHYARD_OPENCODE_GO_DIAG_V1 requests=(0|[1-9]\d{0,5}) upstream_status=(0|[1-5]\d{2}) proxy_rejections=(0|[1-9]\d{0,5})\r?\n?$/u.exec(
+			output,
+		);
+	if (!match) return null;
+	return {
+		requests: Number(match[1]),
+		upstreamStatus: Number(match[2]),
+		proxyRejections: Number(match[3]),
+	};
+}
+
+export function providerCodeForOpenCodeGoBridgeEvidence(evidence) {
+	return evidence &&
+		evidence.requests > 0 &&
+		evidence.requests <= 999_999 &&
+		evidence.upstreamStatus === 429 &&
+		evidence.proxyRejections === 0
+		? "quota_exhausted"
+		: null;
+}
+
+export function providerCodeForVibeBudgetEvidence(stderr) {
+	if (typeof stderr !== "string" || stderr.length > 1_000_000) return null;
+	const start = /^Error: API error from mistral\b/mu.exec(stderr)?.index;
+	if (start === undefined) return null;
+	const block = stderr.slice(start);
+	const status = /^\s*status: (\d{3})\b/mu.exec(block)?.[1];
+	if (status === "402")
+		return /"type":\s*"billing_[a-z_]*budget_exhausted"/u.test(block)
+			? "quota_exhausted"
+			: null;
+	if (status === "401" || status === "403") return "auth_expired";
+	if (status === "404") return "model_unavailable";
+	return null;
+}
+
+const PROVIDER_ARTIFACT_DIR = "artifacts";
+const PROVIDER_ARTIFACT_PATH_MAX_CHARS = 256;
+
+/**
+ * Accept only an owner-only, non-symlink directory, creating a missing one with
+ * `0o700` and never chmod'ing an existing one: broad ownership is a refusal,
+ * not a problem to fix in place.
+ */
+function ensureOwnerOnlyDirectory(directory) {
+	try {
+		return ownerOnlyDirectoryStat(lstatSync(directory));
+	} catch (error) {
+		if (error?.code !== "ENOENT") return false;
+	}
+	try {
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		return ownerOnlyDirectoryStat(lstatSync(directory));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Persist only the redacted, 4 KiB tail of an unrecognized failed-provider
+ * stderr stream to a new unpredictable artifact under the run's owner-only
+ * `artifacts` directory.
+ *
+ * The target is always derived from a validated `runId`, so a caller cannot
+ * name a directory: symlinked or broad-permission paths are refused and
+ * existing directories are never chmod'd to force acceptance. The full stream
+ * is redacted before truncation, and a write failure returns null, so the
+ * artifact can never mask the primary provider failure or expose raw bytes.
+ *
+ * @param {object} options
+ * @param {string} options.runId
+ * @param {string|Buffer} [options.stderr]
+ * @returns {string|null} Bounded artifact path, or null on refusal/failure.
+ */
+export function writeProviderStderrArtifact({ runId, stderr = "" } = {}) {
+	try {
+		validateRunId(runId);
+		const runRoot = getRunRoot(runId);
+		const runsRoot = dirname(runRoot);
+		// Validate configured storage ancestors before recursive creation can follow them.
+		for (const directory of [dirname(runsRoot), runsRoot, runRoot]) {
+			if (!ensureOwnerOnlyDirectory(directory)) return null;
+		}
+		const artifactDir = join(runRoot, PROVIDER_ARTIFACT_DIR);
+		if (!ensureOwnerOnlyDirectory(artifactDir)) return null;
+		// An owner-only lstat walk cannot follow a symlink; this canonical
+		// check refuses any remaining escape from the run root.
+		const realRoot = realpathSync(runRoot);
+		const realDir = realpathSync(artifactDir);
+		if (realDir !== realRoot && !realDir.startsWith(`${realRoot}/`)) {
+			return null;
+		}
+		const artifactPath = join(artifactDir, `${randomUUID()}.log`);
+		if (artifactPath.length > PROVIDER_ARTIFACT_PATH_MAX_CHARS) return null;
+		const redacted = redactCredentialTokens(stderr);
+		writeFileSync(
+			artifactPath,
+			evidenceTail(redacted, PROVIDER_EVIDENCE_TAIL_BYTES),
+			{ mode: 0o600, flag: "wx" },
+		);
+		return artifactPath;
+	} catch {
+		return null;
+	}
 }

@@ -8,6 +8,7 @@ import {
 	realpathSync,
 	writeFileSync,
 } from "node:fs";
+import { userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
 const GIT_ARGS = [
@@ -27,6 +28,11 @@ const GIT_ARGS = [
 	"filter.lfs.required=false",
 ];
 const HOMEBREW_BIN = "/opt/homebrew/bin";
+const OPENSSL_SYSTEM_CONFIG = "/private/etc/ssl/openssl.cnf";
+const HOST_HOME = realpathSync(userInfo().homedir);
+const HOST_CARGO_BIN = join(HOST_HOME, ".cargo/bin");
+const HOST_RUSTUP_HOME = join(HOST_HOME, ".rustup");
+const HOST_RUSTUP_TOOLCHAINS = join(HOST_RUSTUP_HOME, "toolchains");
 const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
 // The real xcrun needs xcode-select, the license check and a writable xcrun_db;
 // the sandbox denies all three, so checks get a shim that answers xcrun's query
@@ -94,26 +100,104 @@ function xcodeAppRoot(developer) {
 	}
 	return developer;
 }
-// Only these Homebrew bin links become readable. Every other Homebrew tool
-// stays unreadable, so invoking it fails with the shell's exit 126.
-function homebrewLinkReads() {
-	const links = ["git", "python3"];
-	try {
-		const target = realpathSync(join(HOMEBREW_BIN, "python3"));
-		const match = /python@?\/?(\d+)\.(\d+)/u.exec(target);
-		if (match && existsSync(join(HOMEBREW_BIN, `python3.${match[2]}`)))
-			links.push(`python3.${match[2]}`);
-	} catch {
-		// A host without Homebrew python keeps the git link alone.
+// Rustup is queried only on the host with a sanitized environment, a short
+// timeout and auto-install disabled. The returned toolchain must resolve inside
+// the fixed rustup tree; sandboxed checks receive no host rustup settings.
+let selectedRustToolchain;
+function rustToolchainPath() {
+	if (selectedRustToolchain !== undefined) return selectedRustToolchain;
+	selectedRustToolchain = null;
+	let selectionResult = null;
+	for (const candidate of [
+		join(HOST_CARGO_BIN, "rustup"),
+		join(HOMEBREW_BIN, "rustup"),
+	]) {
+		let executable;
+		try {
+			executable = realpathSync(candidate);
+		} catch {
+			continue;
+		}
+		if (
+			![
+				HOST_CARGO_BIN,
+				HOMEBREW_BIN,
+				"/opt/homebrew/Cellar",
+				"/usr/bin",
+				"/bin",
+			].some((root) => executable.startsWith(`${root}/`))
+		)
+			continue;
+		const result = spawnSync(executable, ["show", "active-toolchain"], {
+			cwd: HOST_HOME,
+			env: {
+				HOME: HOST_HOME,
+				PATH: [HOST_CARGO_BIN, HOMEBREW_BIN, "/usr/bin", "/bin"].join(":"),
+				RUSTUP_HOME: HOST_RUSTUP_HOME,
+				RUSTUP_AUTO_INSTALL: "0",
+			},
+			encoding: "utf8",
+			timeout: 5000,
+			maxBuffer: 8192,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (result.error?.code === "ENOENT") continue;
+		if (
+			result.error ||
+			result.status !== 0 ||
+			typeof result.stdout !== "string"
+		)
+			return null;
+		selectionResult = result;
+		break;
 	}
-	return links.map((name) => join(HOMEBREW_BIN, name));
+	if (!selectionResult) return null;
+	const selector = selectionResult.stdout.trim().split(/\s+/u)[0];
+	if (!selector || !/^[A-Za-z0-9_.+-]{1,128}$/u.test(selector)) return null;
+	try {
+		const toolchains = realpathSync(HOST_RUSTUP_TOOLCHAINS);
+		const selected = realpathSync(join(toolchains, selector));
+		if (!selected.startsWith(`${toolchains}/`)) return null;
+		for (const binary of ["cargo", "rustc"]) {
+			const resolved = realpathSync(join(selected, "bin", binary));
+			if (!resolved.startsWith(`${selected}/`)) return null;
+		}
+		selectedRustToolchain = selected;
+		return selected;
+	} catch {
+		return null;
+	}
+}
+// Keep grants at the four fixed roots; never resolve Homebrew or Rust tool
+// symlinks into additional host paths.
+function fixedToolTrees() {
+	return [
+		HOMEBREW_BIN,
+		"/opt/homebrew/Cellar",
+		HOST_CARGO_BIN,
+		HOST_RUSTUP_TOOLCHAINS,
+	].filter((path) => {
+		try {
+			return lstatSync(path).isDirectory();
+		} catch {
+			return false;
+		}
+	});
 }
 function safeEnv(home) {
 	home = realpathSync(home);
 	const developer = developerDir();
 	const runtimeBin = join(home, "bin");
+	const cargoHome = join(home, "cargo-home");
+	const rustupHome = join(home, "rustup-home");
+	const cargoTarget = join(home, "cargo-target");
 	mkdirSync(runtimeBin, { recursive: true, mode: 0o700 });
+	mkdirSync(cargoHome, { recursive: true, mode: 0o700 });
+	mkdirSync(rustupHome, { recursive: true, mode: 0o700 });
+	mkdirSync(cargoTarget, { recursive: true, mode: 0o700 });
 	writeFileSync(join(runtimeBin, "xcrun"), XCRUN_SHIM, { mode: 0o700 });
+	const rustToolchain = rustToolchainPath();
+	const rustBin = rustToolchain ? join(rustToolchain, "bin") : null;
 	// Tools such as SwiftPM call /usr/bin/xcrun by absolute path; an explicit
 	// SDKROOT keeps that shim from probing the Xcode license, which the
 	// sandbox cannot read.
@@ -124,13 +208,23 @@ function safeEnv(home) {
 	const path = developer
 		? [
 				runtimeBin,
+				...(rustBin ? [rustBin] : []),
+				HOST_CARGO_BIN,
 				HOMEBREW_BIN,
 				join(developer, "usr/bin"),
 				join(developer, "Toolchains/XcodeDefault.xctoolchain/usr/bin"),
 				"/usr/bin",
 				"/bin",
 			]
-		: [runtimeBin, "/usr/bin", "/bin", HOMEBREW_BIN, "/usr/local/bin"];
+		: [
+				runtimeBin,
+				...(rustBin ? [rustBin] : []),
+				HOST_CARGO_BIN,
+				HOMEBREW_BIN,
+				"/usr/bin",
+				"/bin",
+				"/usr/local/bin",
+			];
 	return {
 		PATH: path.join(":"),
 		HOME: home,
@@ -145,6 +239,12 @@ function safeEnv(home) {
 		// SwiftPM's manifest compile otherwise writes the shared clang module
 		// cache under the per-user cache dir.
 		SWIFTPM_MODULECACHE_OVERRIDE: join(home, "clang-modules"),
+		CARGO_HOME: cargoHome,
+		CARGO_TARGET_DIR: cargoTarget,
+		CARGO_NET_OFFLINE: "true",
+		RUSTUP_HOME: rustupHome,
+		RUSTUP_AUTO_INSTALL: "0",
+		...(rustToolchain ? { RUSTUP_TOOLCHAIN: rustToolchain } : {}),
 		GIT_CONFIG_NOSYSTEM: "1",
 		GIT_CONFIG_GLOBAL: "/dev/null",
 		GIT_CONFIG_SYSTEM: "/dev/null",
@@ -356,8 +456,7 @@ export function quickCheckSandboxProfile(
 		"/opt/homebrew/etc/openssl@3/openssl.cnf",
 		nodeRoot,
 		npmRoot,
-		"/opt/homebrew/bin/node",
-		"/opt/homebrew/bin/npm",
+		...fixedToolTrees(),
 		// /bin/sh reads its target shell through this symlink.
 		"/private/var/select",
 		clone,
@@ -368,7 +467,7 @@ export function quickCheckSandboxProfile(
 	// A read-only input reached through a symlink (uv's `cpython-3.x` alias of
 	// its versioned interpreter dir) needs the link itself readable to resolve.
 	const readLiterals = [
-		...homebrewLinkReads(),
+		OPENSSL_SYSTEM_CONFIG,
 		...readOnlyPaths.filter(
 			(path) => isAbsolute(path) && lstatSync(path).isSymbolicLink(),
 		),

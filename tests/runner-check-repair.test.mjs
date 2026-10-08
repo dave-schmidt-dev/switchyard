@@ -8,8 +8,13 @@ import {
 	checkRepairPlan,
 	runCheckRepairSync,
 } from "../src/switchyard/runner/check-repair.mjs";
+import { executeTaskUnsafe } from "../src/switchyard/runner/execute-task-unsafe.mjs";
+import { prepareExecuteTaskUnsafe } from "../src/switchyard/runner/execute-task-unsafe-prepare.mjs";
 import { taskRepairScopeIdentity } from "../src/switchyard/runner/reliability.mjs";
-import { markRouteHealthObservationSettled } from "../src/switchyard/runner/route-health.mjs";
+import {
+	executionCleanupContext,
+	markRouteHealthObservationSettled,
+} from "../src/switchyard/runner/route-health.mjs";
 import { runQueueAsyncLoop } from "../src/switchyard/runner/run-queue-async-loop.mjs";
 import { attemptRunQueueTask } from "../src/switchyard/runner/run-queue-task-attempt.mjs";
 import { tempDir, tempDirAsync } from "./helpers/tempdir.mjs";
@@ -60,6 +65,25 @@ const pin = {
 	deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
 	scopeIdentity: taskRepairScopeIdentity(task),
 };
+function syncPinnedContext(nowValues) {
+	const { context } = fixture();
+	let nowIndex = 0;
+	context._completionPin = pin;
+	context.attemptId = pin.attemptId;
+	context.checkIgnoredPath = () => null;
+	context.projectPath = process.cwd();
+	context.adapters = {
+		codex: { execute: () => assert.fail("provider must not launch") },
+	};
+	context.queueBackend = {
+		beforeRun: () => {},
+		captureTaskBase: () => ({ tree }),
+	};
+	context.recordDispatch = () => {};
+	context.recordDispatchIntent = () => null;
+	context.now = () => nowValues[Math.min(nowIndex++, nowValues.length - 1)];
+	return context;
+}
 function assertQuotaRepairDiagnostic(result) {
 	const diagnostic = result.providerReliability;
 	assert.equal(diagnostic.causeCode, "quota_exhausted");
@@ -119,7 +143,8 @@ function fixture() {
 		providerLifecycle: {
 			writerLifecycle: "stopped",
 			terminalStatus: "exited",
-			cleanupStatus: "complete",
+			cleanupStatus: "succeeded",
+			cleanupStage: "index_lock_removed",
 		},
 		quickCheckReceipt: {
 			status: "failed",
@@ -138,6 +163,39 @@ function fixture() {
 	};
 	return { context, result };
 }
+
+test("sync expired pinned execution reports the canonical timeout kind at each prelaunch fence", () => {
+	const deadline = Date.parse(pin.deadline);
+	const expiredRepair = syncPinnedContext([deadline + 1]);
+	expiredRepair._checkRepairPin = pin;
+	expiredRepair._checkRepairBudget = { providerTimeoutMs: 30_000 };
+	const repairTimeout = prepareExecuteTaskUnsafe(task, expiredRepair).terminal;
+	assert.equal(repairTimeout.result, "execution_timed_out");
+	assert.equal(repairTimeout.errorKind, "execution_timed_out");
+	assert.equal(repairTimeout.timedOut, true);
+
+	const expiredPreparation = syncPinnedContext([
+		deadline - 1_000,
+		deadline + 1,
+	]);
+	const preparationTimeout = prepareExecuteTaskUnsafe(
+		task,
+		expiredPreparation,
+	).terminal;
+	assert.equal(preparationTimeout.result, "execution_timed_out");
+	assert.equal(preparationTimeout.errorKind, "execution_timed_out");
+	assert.equal(preparationTimeout.timedOut, true);
+
+	const expiredLaunch = syncPinnedContext([
+		deadline - 1_000,
+		deadline - 1_000,
+		deadline + 1,
+	]);
+	const launchTimeout = executeTaskUnsafe(task, expiredLaunch);
+	assert.equal(launchTimeout.result, "execution_timed_out");
+	assert.equal(launchTimeout.errorKind, "execution_timed_out");
+	assert.equal(launchTimeout.timedOut, true);
+});
 
 test("sync repair throw keeps its allocation consumed and clears transient context", () => {
 	const { context, result } = fixture();
@@ -520,10 +578,92 @@ test("async queue loop settles health before one pinned repair failure", () =>
 test("async queue loop rechecks positive original deadline after health settlement", () =>
 	exerciseAsyncLoop(true, true, true));
 
+test("cleanup identity keeps scoped repair pins distinct from retries and fallbacks", () => {
+	const allocation = {
+		taskId: task.id,
+		reason: "check_repair",
+		state: "running",
+		attemptId: pin.attemptId,
+		workspaceId: pin.workspaceId,
+		baseTree: pin.baseTree,
+		descriptorIdentity: pin.descriptorIdentity,
+		scopeIdentity: pin.scopeIdentity,
+	};
+	const context = {
+		runId: "run-1",
+		workingContainerName: pin.workspaceId,
+		_activeTaskBase: { tree: pin.baseTree },
+		_activeInvocationDescriptor: descriptor,
+		_checkRepairPin: pin,
+		checkpoint: { providerAttemptAllocations: [allocation] },
+	};
+	assert.equal(
+		executionCleanupContext(context, task, descriptor.descriptor_identity)
+			.attemptId,
+		pin.attemptId,
+	);
+	assert.equal(
+		executionCleanupContext(
+			{ ...context, healthAttempt: "provider-2" },
+			task,
+			descriptor.descriptor_identity,
+		).attemptId,
+		pin.attemptId,
+	);
+	assert.equal(
+		executionCleanupContext(
+			{
+				...context,
+				checkpoint: {
+					...context.checkpoint,
+					retryState: { taskId: task.id, attempt: 3 },
+				},
+			},
+			task,
+			descriptor.descriptor_identity,
+		).attemptId,
+		"attempt-3",
+	);
+	assert.equal(
+		executionCleanupContext(
+			{
+				...context,
+				_checkRepairPin: { ...pin, taskId: "1.2", attemptId: "attempt-9" },
+			},
+			task,
+			descriptor.descriptor_identity,
+		).attemptId,
+		"attempt-2",
+	);
+	assert.equal(
+		executionCleanupContext(
+			{
+				...context,
+				checkpoint: {
+					providerAttemptAllocations: [
+						{ ...allocation, reason: "quota_fallback" },
+					],
+				},
+			},
+			task,
+			descriptor.descriptor_identity,
+		).attemptId,
+		"attempt-2",
+	);
+});
+
 test("check repair refuses unknown lifecycle, integration, drift, expired deadline, and sync half-open claim", () => {
 	const cases = [
 		({ context, result }) => {
 			result.providerLifecycle.writerLifecycle = "unknown";
+			return [task, result, context];
+		},
+		({ context, result }) => {
+			result.providerLifecycle.cleanupStatus = "failed";
+			return [task, result, context];
+		},
+		({ context, result }) => {
+			result.providerLifecycle.cleanupStatus = "uncertain";
 			return [task, result, context];
 		},
 		({ context, result }) => {

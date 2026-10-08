@@ -1,19 +1,17 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
 import { randomUUID } from "node:crypto";
-import { lstatSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import {
 	getImplementorPriority,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
-import { isProjectLockHeld, readRun } from "../run-store/index.mjs";
+import { readRun } from "../run-store/index.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
-	claimCovers,
 	continuationFields,
 	planContinuation,
 	sourceSuperseded,
@@ -23,24 +21,27 @@ import {
 	knownBrokenCheck,
 	rememberBrokenCheck,
 } from "./routing-check-memory.mjs";
+import { discardAndReleasePartial } from "./routing-recovery.mjs";
 import {
 	canonicalRoutingProject,
 	MAX_ATTEMPT_HISTORY,
 	openRoutingRun,
 	recordAttemptOutcome,
-	releasePartialAttempt,
 } from "./routing-state.mjs";
 import {
+	createFailureLogAppender,
 	failureAttemptRecord,
 	lifecycleFailure,
+	routingErrorCode,
 	stopRecord,
 	unroutedAttempt,
 	unroutedAttemptRecord,
 } from "./routing-stop-record.mjs";
 import {
-	cleanupSimpleWorktree,
-	simpleQuarantinePath,
-} from "./worktree-cleanup.mjs";
+	finishTaskBinding,
+	openRoutingTaskRun,
+	releaseTaskRunResources,
+} from "./routing-task-state.mjs";
 
 export const MAX_SOFT_ATTEMPTS_PER_TASK = 4;
 
@@ -48,12 +49,14 @@ const FUNDING_UNAVAILABLE = new Set([
 	"paid_overage_not_allowed",
 	"included_usage_unverified",
 ]);
-const errorCode = (error, fallback) =>
-	typeof error?.code === "string" && /^routing_[a-z_]+$/u.test(error.code)
-		? error.code
-		: fallback;
 /** Selected allocations are durable before route() returns control to the engine. */
 export async function runSimpleRoutingTask(options, deps = {}) {
+	const origin = options.origin ?? "work";
+	if (origin !== "work" && origin !== "qualification") {
+		throw Object.assign(new Error("simple_origin_invalid"), {
+			code: "simple_origin_invalid",
+		});
+	}
 	const now = deps.now ?? Date.now;
 	const suppliedId = options.routingRunId;
 	const environmentId = process.env.SWITCHYARD_ROUTING_RUN_ID;
@@ -77,11 +80,18 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 		throw Object.assign(new Error("routing_engine_required"), {
 			code: "routing_engine_required",
 		});
-	const handle = (deps.openRoutingRun ?? openRoutingRun)(
-		projectPath,
+	const prepared = openRoutingTaskRun({
+		options,
+		project: projectPath,
+		origin,
 		routingRunId,
-		{ stateRoot: deps.stateRoot, now },
-	);
+		routingRunIdSource,
+		stateRoot: deps.stateRoot,
+		now,
+		openRun: deps.openRoutingRun ?? openRoutingRun,
+	});
+	if (prepared.stop) return prepared.stop;
+	const { handle, binding: taskBinding } = prepared;
 	const retainedPartials = () =>
 		handle.state.attempts
 			.filter((a) => a.partialWorktree !== null)
@@ -91,24 +101,16 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				reason,
 				partialWorktree,
 			}));
-	// Failure logging is best-effort: it must never change the routing outcome.
-	let failureLogWarned = false;
-	const appendFailureLog = (input) => {
-		try {
-			if (deps.failureLog) deps.failureLog.append(input);
-			else appendFailureRecord(input, { stateRoot: deps.stateRoot });
-		} catch (error) {
-			if (failureLogWarned) return;
-			failureLogWarned = true;
-			(deps.onRoutingWarning ?? console.error)(
-				`dispatch: failure log unavailable (${error?.code ?? "unknown"})`,
-			);
-		}
-	};
+	const appendFailureLog = createFailureLogAppender({
+		origin,
+		deps,
+		appendFailureRecord,
+	});
 	// Guard answers re-report state an earlier invocation already logged, so
 	// they pass { log: false }. Stop identity comes only from this
 	// invocation's own attempts, never from an earlier task's attempt; an
 	// unrouted failure names itself through { attempt }.
+	let settledAnswer = null;
 	const answer = (direction, extra = {}, { log = true, attempt } = {}) => {
 		if (direction !== "complete" && log) {
 			const own = (item) => item?.taskId === logicalTaskId;
@@ -127,16 +129,26 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				}),
 			);
 		}
-		return {
+		const { resultDirection, resultExtra } = finishTaskBinding(
+			taskBinding,
+			handle,
+			logicalTaskId,
 			direction,
+			extra,
+		);
+		const out = {
+			direction: resultDirection,
+			origin,
 			routingRunId,
 			routingRunIdSource,
 			attempts: handle.state.attempts,
 			failedTargetIds: handle.state.failedTargetIds,
 			retainedPartials: retainedPartials(),
 			...(releasedPartials.length > 0 ? { releasedPartials } : {}),
-			...extra,
+			...resultExtra,
 		};
+		settledAnswer = out;
+		return out;
 	};
 	const pinned = (options.onlyProviders ?? []).length > 0;
 	// Explicit injected routers are a synthetic single-attempt compatibility seam.
@@ -148,7 +160,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const select = deps.route ?? route;
 	const funded = deps.assertFundedRoute ?? assertFundedRoute;
 	const localExcluded = new Set();
-	const logicalTaskId = deps.taskId ?? randomUUID();
+	const logicalTaskId = taskBinding?.taskId ?? deps.taskId ?? randomUUID();
 	// Task 3.11: the newest retained partial this invocation may carry, and
 	// the sources released once their continuation superseded them.
 	let carrySource = null;
@@ -156,6 +168,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	let softAttempts = 0;
 	let anyFailed = false;
 	let iteration = 0;
+	let pendingError = null;
 	try {
 		if (handle.state.pendingAttempt)
 			return answer(
@@ -293,7 +306,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			let result;
 			try {
 				result = await engine(
-					{ ...options, projectPath },
+					{ ...options, projectPath, origin },
 					{
 						...deps,
 						...allocation,
@@ -411,12 +424,10 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				provenance: record.lastFailure,
 			});
 			if (typed) result.accountability = accountability;
-
 			// A baseline failure precedes the provider and is not evidence against the target.
 			const tried =
 				result.failurePhase !== "baseline" &&
 				result.recovery.cleanup.writer.state === "stopped";
-
 			const terminal = failed
 				? (typed ? accountability.providerMemoryEligible && tried : tried)
 					? "failed"
@@ -449,7 +460,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				});
 			} catch (error) {
 				return answer("stop", {
-					stopReason: errorCode(error, "routing_state_write_failed"),
+					stopReason: routingErrorCode(error, "routing_state_write_failed"),
 					result,
 					pendingAttempt: pending,
 				});
@@ -485,7 +496,6 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					record,
 					captured: verifiedDiff,
 				};
-
 			if (failed) {
 				appendFailureLog(
 					failureAttemptRecord({
@@ -498,7 +508,6 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					}),
 				);
 			}
-
 			// A live quota error exhausts the target's route eligibility for
 			// an hour; the durable marker outlives this run's Gradus snapshot.
 			if (
@@ -546,7 +555,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					});
 				} catch (error) {
 					return answer("stop", {
-						stopReason: errorCode(error, "routing_state_write_failed"),
+						stopReason: routingErrorCode(error, "routing_state_write_failed"),
 						result,
 						classification,
 					});
@@ -592,170 +601,20 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				});
 			// Continue to the next eligible target (retained clone is independent).
 		}
-	} finally {
-		handle.release();
-	}
-}
-const rejectRelease = (code) => {
-	throw Object.assign(new Error(code), { code });
-};
-function statPartial(path) {
-	try {
-		return lstatSync(path);
 	} catch (error) {
-		if (error?.code === "ENOENT") return null;
-		rejectRelease("partial_worktree_unavailable");
-	}
-}
-/**
- * Discard one recorded partial through its exact run claim, then clear it with
- * the release_partial transition. The claim names the attempt root; the
- * recorded partial is that root or its `worktree` child. The root is what is
- * stat-checked and what cleanup removes. Throws a closed code and leaves
- * routing state unchanged when anything does not hold.
- *
- * @returns {Promise<boolean>} Whether anything was discarded from disk.
- */
-async function discardAndReleasePartial(handle, attempt, options) {
-	const { projectPath, discard, deps } = options;
-	const record = await (deps.readRun ?? readRun)(attempt.runId).catch(
-		() => null,
-	);
-	const claim = record?.worktree;
-	if (
-		!claim ||
-		!claimCovers(claim.path, attempt.partialWorktree) ||
-		typeof claim.nonce !== "string" ||
-		!/^\d+$/.test(claim.device ?? "") ||
-		!/^\d+$/.test(claim.inode ?? "")
-	)
-		rejectRelease("partial_worktree_claim_mismatch");
-	const root = statPartial(claim.path);
-	const quarantine = simpleQuarantinePath(claim.nonce);
-	const quarantined = statPartial(quarantine);
-	if (root?.isSymbolicLink() || quarantined?.isSymbolicLink())
-		rejectRelease("partial_worktree_symlink");
-	if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
-		rejectRelease("project_lock_held");
-	if (root && quarantined) rejectRelease("cleanup_state_ambiguous");
-	let discarded = false;
-	if (root || quarantined) {
-		if (!discard) rejectRelease("discard_required");
-		const cleanupWorktree = deps.cleanupSimpleWorktree ?? cleanupSimpleWorktree;
-		const cleanup = await cleanupWorktree(attempt.runId, claim, {
-			writerStopped: claim.writerStopped === true,
-			onStatus: deps.onStatus,
-		});
-		if (!cleanup.removed) rejectRelease("cleanup_retained");
-		discarded = true;
-	}
-	releasePartialAttempt(handle.state, handle.commit, attempt.attemptId);
-	return discarded;
-}
-/**
- * Release a recorded retained partial once its root is already absent or its
- * exact claim is discarded. The release clears the routing attempt's
- * partialWorktree so the partial_work_retained guard passes again.
- */
-export async function releaseRetainedPartial(options, deps = {}) {
-	const projectPath = canonicalRoutingProject(options.projectPath);
-	const handle = (deps.openRoutingRun ?? openRoutingRun)(
-		projectPath,
-		options.routingRunId,
-		{ stateRoot: deps.stateRoot, create: false },
-	);
-	try {
-		const taskId = options.taskId;
-		const attempt = handle.state.attempts.find(
-			(item) => item.taskId === taskId && item.partialWorktree !== null,
-		);
-		if (!attempt) rejectRelease("partial_worktree_not_recorded");
-		const discarded = await discardAndReleasePartial(handle, attempt, {
-			projectPath,
-			discard: options.discard === true,
-			deps,
-		});
-		return {
-			ok: true,
-			released: true,
-			routingRunId: options.routingRunId,
-			taskId: attempt.taskId,
-			attemptId: attempt.attemptId,
-			path: attempt.partialWorktree,
-			discarded,
-		};
+		pendingError = { error };
 	} finally {
-		handle.release();
-	}
-}
-
-const RUN_TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
-// Writer quiescence follows the lifecycle rule: the run's writer is stopped
-// or never started. A worktree claim that does not record writerStopped
-// proves nothing, and a worker process that answers a liveness probe blocks
-// recovery -- a probe that fails with EPERM counts as live.
-function writerQuiescent(record, deps) {
-	if (record.worktree !== null && record.worktree?.writerStopped !== true)
-		return false;
-	const pid = record.workerPid;
-	if (pid === null || pid === undefined) return true;
-	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-	try {
-		(deps.probePid ?? process.kill)(pid, 0);
-		return false;
-	} catch (error) {
-		return error?.code === "ESRCH";
-	}
-}
-/**
- * Recover a dangling pending attempt after an unconfirmed lifecycle left it
- * behind; every later invocation would otherwise answer
- * `pending_attempt_exists`. Recovery requires durable proof the attempt is
- * over -- a terminal run record, a quiescent writer, no live project lock and
- * no retained-unclaimed worktree -- and records the attempt as terminal
- * `skipped` with reason `lifecycle_recovered`.
- */
-export async function closePendingAttempt(options, deps = {}) {
-	const projectPath = canonicalRoutingProject(options.projectPath);
-	const handle = (deps.openRoutingRun ?? openRoutingRun)(
-		projectPath,
-		options.routingRunId,
-		{ stateRoot: deps.stateRoot, create: false },
-	);
-	try {
-		const pending = handle.state.pendingAttempt;
-		if (!pending) rejectRelease("pending_attempt_missing");
-		if (options.taskId !== undefined && pending.taskId !== options.taskId)
-			rejectRelease("routing_pending_identity_mismatch");
-		const record = await (deps.readRun ?? readRun)(pending.runId).catch(
-			() => null,
-		);
-		if (!record || record.runId !== pending.runId)
-			rejectRelease("lifecycle_unconfirmed");
-		if (!RUN_TERMINAL_STATES.has(record.state))
-			rejectRelease("run_state_not_terminal");
-		if (!writerQuiescent(record, deps)) rejectRelease("worker_not_stopped");
-		if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
-			rejectRelease("project_lock_held");
-		if (record.worktree?.state === "retained")
-			rejectRelease("partial_work_retained");
-		recordAttemptOutcome(handle.state, handle.commit, {
-			...pending,
-			terminal: "skipped",
-			reason: "lifecycle_recovered",
-			closedAt: new Date((deps.now ?? Date.now)()).toISOString(),
-			partialWorktree: null,
+		const override = releaseTaskRunResources(handle, {
+			taskBinding,
+			settledAnswer,
+			pendingError,
 		});
-		return {
-			ok: true,
-			recovered: true,
-			routingRunId: options.routingRunId,
-			taskId: pending.taskId,
-			attemptId: pending.attemptId,
-			runId: pending.runId,
-			reason: "lifecycle_recovered",
-		};
-	} finally {
-		handle.release();
+		// biome-ignore lint/correctness/noUnsafeFinally: intentional override on binding-only release refusal
+		if (override) return override;
 	}
 }
+/** @public Preserve the historical recovery import path for callers. */
+export {
+	closePendingAttempt,
+	releaseRetainedPartial,
+} from "./routing-recovery.mjs";

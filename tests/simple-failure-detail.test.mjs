@@ -1,8 +1,8 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import {
 	isPersistentFailureDetails,
@@ -11,7 +11,7 @@ import {
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 import { resolveFailure } from "../src/switchyard/diagnostics/failure-registry.mjs";
-import { readRun } from "../src/switchyard/run-store/index.mjs";
+import { getRunRoot, readRun } from "../src/switchyard/run-store/index.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import {
 	appendFailureRecord,
@@ -108,18 +108,301 @@ test("scope rejection persists the rule and bounded paths into run.json failureD
 	strictEqual(result.failureReason, "undeclared_paths_changed");
 	strictEqual(result.diffRejection.rule, "undeclared_paths_changed");
 	ok(result.diffRejection.paths.includes("extra.sh"));
+	strictEqual(result.providerReliability.diffRejectionCount, 1);
+	strictEqual(result.failureDetails.diffRejectionCount, 1);
 	const record = await readRun(result.runId);
 	const details = record.failureDetails;
 	ok(details, "run.json carries failureDetails");
 	strictEqual(details.failureReason, "undeclared_paths_changed");
 	strictEqual(details.diffRejectionRule, "undeclared_paths_changed");
 	strictEqual(details.diffRejectionCategory, "undeclared");
-	strictEqual(details.diffRejectionCount, 2);
+	strictEqual(details.diffRejectionCount, 1);
 	ok(details.diffRejectionPaths.includes("extra.sh"));
 	ok(details.diffRejectionPaths.length <= 5);
+	strictEqual(record.lastFailure.providerReliability.diffRejectionCount, 1);
+	strictEqual(
+		record.lastFailure.providerReliability.diffRejectionCategory,
+		"undeclared",
+	);
 	ok(isPersistentFailureDetails(details));
 	strictEqual("failureReason" in record.lastFailure, false);
 	ok(isPersistentFailureMetadata(record.lastFailure));
+});
+
+test("edited-worktree acceptance check failure reports no diff rejection", async () => {
+	const repo = fixture();
+	const result = await run(
+		repo,
+		{},
+		async ({ worktreePath }) => {
+			writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
+			return { success: true, writerLifecycle: "stopped" };
+		},
+		{
+			runCheck: async () => ({
+				success: false,
+				exitCode: 1,
+				writerLifecycle: "stopped",
+			}),
+		},
+	);
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "check_failed");
+	strictEqual(result.providerReliability.diffRejectionCategory, null);
+	strictEqual(result.providerReliability.diffRejectionCount, 0);
+	strictEqual(result.failureDetails.diffRejectionCount, undefined);
+	strictEqual(result.failureDetails.outputPath, undefined);
+	const record = await readRun(result.runId);
+	strictEqual(record.failureDetails.diffRejectionCount, undefined);
+	strictEqual(record.failureDetails.outputPath, undefined);
+	strictEqual(record.lastFailure.providerReliability.diffRejectionCount, 0);
+	strictEqual(
+		record.lastFailure.providerReliability.diffRejectionCategory,
+		null,
+	);
+});
+
+test("baseline failure links terminal and durable details to redacted check evidence", async () => {
+	const repo = fixture();
+	const token = "sk-fixture-baseline-token-000000";
+	const rawOutput = `BASELINE_FAILURE_TAIL Bearer ${token}`;
+	const command =
+		"node -e 'process.stdout.write(" +
+		JSON.stringify(rawOutput) +
+		");process.exit(2)'";
+	const result = await run(repo, { baselineChecks: [command] });
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "baseline_check_failed");
+	strictEqual(result.providerStarted, false);
+	const record = await readRun(result.runId);
+	const evidencePath = join(
+		getRunRoot(result.runId),
+		"check-evidence",
+		"0-1.log",
+	);
+	strictEqual(result.failureDetails.outputPath, evidencePath);
+	strictEqual(record.failureDetails.outputPath, evidencePath);
+	strictEqual(result.failureDetails.checkIndex, 1);
+	strictEqual(
+		record.failureDetails.checkIdentity,
+		result.failureDetails.checkIdentity,
+	);
+	const evidence = readFileSync(evidencePath, "utf8");
+	ok(evidence.includes("BASELINE_FAILURE_TAIL"));
+	ok(evidence.includes("Bearer [REDACTED]"));
+	ok(!evidence.includes(token));
+	const serialized = JSON.stringify({ result, record });
+	ok(!serialized.includes(rawOutput));
+	ok(!serialized.includes(token));
+});
+
+test("timed-out check repair preserves provider timeout evidence in terminal and run.json", async () => {
+	const repo = fixture();
+	let providerCalls = 0;
+	let checkCalls = 0;
+	const result = await run(
+		repo,
+		{ repairChecks: true },
+		async ({ worktreePath }) => {
+			providerCalls += 1;
+			writeFileSync(join(worktreePath, "a.txt"), `provider ${providerCalls}\n`);
+			return providerCalls === 1
+				? { success: true, code: 0, writerLifecycle: "stopped" }
+				: {
+						success: false,
+						code: 76,
+						timedOut: true,
+						writerLifecycle: "stopped",
+					};
+		},
+		{
+			runCheck: async () => {
+				checkCalls += 1;
+				return {
+					success: false,
+					code: 1,
+					timedOut: false,
+					writerLifecycle: "stopped",
+				};
+			},
+			healthDecision: Object.assign(
+				() => ({ available: false, mode: "enforce", suppress: false }),
+				{ mode: "enforce" },
+			),
+		},
+	);
+	strictEqual(providerCalls, 2);
+	strictEqual(checkCalls, 1);
+	strictEqual(result.status, "failed");
+	strictEqual(result.failurePhase, "execute");
+	strictEqual(result.failureReason, "provider_deadline_exceeded");
+	strictEqual(
+		result.providerReliability.causeCode,
+		"provider_deadline_exceeded",
+	);
+	strictEqual(result.providerReliability.timedOut, true);
+	strictEqual(result.failureDetails.timedOut, true);
+
+	const record = await readRun(result.runId);
+	strictEqual(
+		record.lastFailure.providerReliability.causeCode,
+		result.providerReliability.causeCode,
+	);
+	strictEqual(
+		record.lastFailure.providerReliability.timedOut,
+		result.providerReliability.timedOut,
+	);
+	strictEqual(record.failureDetails.timedOut, result.failureDetails.timedOut);
+});
+
+test("ordinary real checker failure persists its owner-side evidence path", async () => {
+	const repo = fixture();
+	const events = [];
+	let providerCalls = 0;
+	const result = await run(
+		repo,
+		{
+			checks: [
+				`node -e 'if(require("fs").readFileSync("a.txt","utf8").trim()!=="base")process.exit(1)'`,
+			],
+		},
+		async ({ worktreePath }) => {
+			providerCalls += 1;
+			writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
+			return { success: true, writerLifecycle: "stopped" };
+		},
+		{ onStatus: (event) => events.push(event) },
+	);
+	strictEqual(providerCalls, 1);
+	ok(
+		events.some(
+			(event) =>
+				event.phase === "baseline" &&
+				event.milestone === "dry_run_check_finished" &&
+				event.checkStatus === "passed",
+		),
+		"pre-provider check passes on the base tree",
+	);
+	strictEqual(result.failureReason, "check_failed");
+	const outputPath = result.failureDetails.outputPath;
+	ok(typeof outputPath === "string" && existsSync(outputPath));
+	strictEqual(result.checks[0].outputPath, outputPath);
+	const record = await readRun(result.runId);
+	strictEqual(record.failureDetails.outputPath, outputPath);
+	ok(
+		events.some(
+			(event) =>
+				event.phase === "checks" &&
+				event.milestone === "check_finished" &&
+				event.checkStatus === "failed",
+		),
+		"candidate check fails after the provider runs",
+	);
+	strictEqual("output" in record.failureDetails, false);
+});
+
+test("failed repair persists the latest real checker evidence path", async () => {
+	const repo = fixture();
+	const events = [];
+	let providerCalls = 0;
+	const result = await run(
+		repo,
+		{
+			repairChecks: true,
+			checks: [
+				`node -e 'if(require("fs").readFileSync("a.txt","utf8").trim()!=="base")process.exit(1)'`,
+			],
+		},
+		async ({ worktreePath }) => {
+			providerCalls += 1;
+			writeFileSync(
+				join(worktreePath, "a.txt"),
+				`candidate-${providerCalls}\n`,
+			);
+			return { success: true, writerLifecycle: "stopped" };
+		},
+		{ onStatus: (event) => events.push(event) },
+	);
+	strictEqual(providerCalls, 2);
+	strictEqual(result.failureReason, "check_repair_failed");
+	const outputPath = result.failureDetails.outputPath;
+	ok(typeof outputPath === "string" && existsSync(outputPath));
+	strictEqual(basename(outputPath), "2-1.log");
+	const firstFailurePath = join(dirname(outputPath), "1-1.log");
+	ok(existsSync(firstFailurePath));
+	ok(firstFailurePath !== outputPath);
+	strictEqual(result.checks[0].outputPath, outputPath);
+	const record = await readRun(result.runId);
+	strictEqual(record.failureDetails.outputPath, outputPath);
+	strictEqual("output" in record.failureDetails, false);
+	ok(
+		events.some(
+			(event) =>
+				event.phase === "baseline" &&
+				event.milestone === "dry_run_check_finished" &&
+				event.checkStatus === "passed",
+		),
+		"pre-provider check passes on the base tree",
+	);
+});
+
+test("failed repair provider evidence does not reuse the prior check artifact", async () => {
+	const repo = fixture();
+	const providerOutputPath = join(repo.root, "provider-failure.log");
+	let providerCalls = 0;
+	const result = await run(
+		repo,
+		{
+			repairChecks: true,
+			checks: [
+				`node -e 'if(require("fs").readFileSync("a.txt","utf8").trim()!=="base")process.exit(1)'`,
+			],
+		},
+		async ({ worktreePath }) => {
+			providerCalls += 1;
+			if (providerCalls === 1) {
+				writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
+				return { success: true, writerLifecycle: "stopped" };
+			}
+			writeFileSync(providerOutputPath, "provider diagnostic\n");
+			return {
+				success: false,
+				code: 76,
+				writerLifecycle: "stopped",
+				outputPath: providerOutputPath,
+			};
+		},
+	);
+	strictEqual(providerCalls, 2);
+	strictEqual(result.failurePhase, "execute");
+	ok(existsSync(providerOutputPath));
+	ok(existsSync(result.checks[0].outputPath));
+	strictEqual(result.failureDetails.outputPath, providerOutputPath);
+	const record = await readRun(result.runId);
+	strictEqual(record.failureDetails.outputPath, providerOutputPath);
+});
+
+test("rejection totals exceed the bounded displayed path list", async () => {
+	const repo = fixture();
+	const result = await run(
+		repo,
+		{},
+		async ({ worktreePath }) => {
+			writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
+			for (let i = 0; i < 7; i++)
+				writeFileSync(join(worktreePath, `extra-${i}.sh`), "extra\n");
+			return { success: true, writerLifecycle: "stopped" };
+		},
+		{ runCheck: stubbedCheck },
+	);
+	strictEqual(result.failureReason, "undeclared_paths_changed");
+	strictEqual(result.diffRejection.paths.length, 5);
+	strictEqual(result.providerReliability.diffRejectionCount, 7);
+	strictEqual(result.failureDetails.diffRejectionCount, 7);
+	const record = await readRun(result.runId);
+	strictEqual(record.failureDetails.diffRejectionPaths.length, 5);
+	strictEqual(record.failureDetails.diffRejectionCount, 7);
+	strictEqual(record.lastFailure.providerReliability.diffRejectionCount, 7);
 });
 
 test("scope-rejection details round-trip through the failure-log record", async () => {

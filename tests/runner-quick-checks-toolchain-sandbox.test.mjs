@@ -10,6 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
+import { userInfo } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createSimpleCheckSessions } from "../src/switchyard/simple/check-session.mjs";
@@ -17,16 +18,26 @@ import { tempDir } from "./helpers/tempdir.mjs";
 
 const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
 const HOMEBREW_BIN = "/opt/homebrew/bin";
+const OPENSSL_SYSTEM_CONFIG = "/private/etc/ssl/openssl.cnf";
+const HOST_HOME = userInfo().homedir;
 
-/** Name of an installed Homebrew executable the sandbox must not reach. */
-function otherHomebrewTool() {
-	try {
-		return readdirSync(HOMEBREW_BIN)
-			.sort()
-			.find((name) => name !== "git" && !/^python3(\.\d+)?$/.test(name));
-	} catch {
-		return undefined;
-	}
+function hostReadTargets() {
+	const config = [
+		join(HOST_HOME, ".cargo/config.toml"),
+		join(HOST_HOME, ".rustup/settings.toml"),
+	].find(existsSync);
+	const credential = [
+		join(HOST_HOME, ".cargo/credentials.toml"),
+		join(HOST_HOME, ".cargo/credentials"),
+		join(HOST_HOME, ".aws/credentials"),
+		join(HOST_HOME, ".config/gh/hosts.yml"),
+		join(HOST_HOME, ".ssh/id_ed25519"),
+		join(HOST_HOME, ".ssh/id_rsa"),
+	].find(existsSync);
+	return [
+		...(config ? [["config", config]] : []),
+		...(credential ? [["credential", credential]] : []),
+	];
 }
 
 function xcodeSelected() {
@@ -56,6 +67,20 @@ function fixture() {
 	writeFileSync(join(project, "a.txt"), "base\n");
 	writeFileSync(join(project, "Makefile"), "all:\n\t@true\n");
 	writeFileSync(join(project, "check.swift"), "let value = 1\n");
+	mkdirSync(join(project, "src"));
+	writeFileSync(
+		join(project, "Cargo.toml"),
+		'[package]\nname = "sandbox-fixture"\nversion = "0.1.0"\nedition = "2021"\n',
+	);
+	writeFileSync(
+		join(project, "Cargo.lock"),
+		'version = 3\n\n[[package]]\nname = "sandbox-fixture"\nversion = "0.1.0"\n',
+	);
+	writeFileSync(join(project, "src/main.rs"), "fn main() {}\n");
+	writeFileSync(
+		join(project, "check.sh"),
+		"#!/bin/sh\nprintf '%s\\n' fixture\n",
+	);
 	writeFileSync(join(project, ".gitignore"), ".venv\n");
 	git(project, ["init", "-q"]);
 	git(project, ["add", "."]);
@@ -87,7 +112,7 @@ function checkSession(repo, commands) {
 // Prefer a uv-managed base interpreter: its prefix sits outside every path the
 // sandbox already reads, which is the shape real project venvs have.
 function baseInterpreter() {
-	const uvRoot = join(process.env.HOME ?? "", ".local/share/uv/python");
+	const uvRoot = join(HOST_HOME, ".local/share/uv/python");
 	try {
 		for (const name of readdirSync(uvRoot).sort()) {
 			const candidate = join(uvRoot, name, "bin", "python3");
@@ -138,21 +163,24 @@ describe("quick-check toolchain sandbox", { skip: xcodeSkip }, () => {
 		}
 	});
 
-	it("keeps other Homebrew tools unreadable", async (t) => {
-		const other = otherHomebrewTool();
-		if (!other) {
-			t.skip("no Homebrew tool outside the allowlist is installed");
-			return;
-		}
+	it("reads only the approved system OpenSSL config and runs installed ShellCheck and offline Cargo", async () => {
+		ok(existsSync(join(HOMEBREW_BIN, "shellcheck")));
 		const repo = fixture();
-		const checks = checkSession(repo, []);
+		const opensslRead = `node -e 'const fs = require("node:fs"); process.stdout.write(String(fs.readFileSync("${OPENSSL_SYSTEM_CONFIG}").length > 0));'`;
+		const commands = [
+			opensslRead,
+			"shellcheck -S warning check.sh",
+			"cargo check --offline --locked",
+		];
+		const checks = checkSession(repo, commands);
 		try {
 			await checks.prepare();
-			const result = await checks.run({
-				command: `${HOMEBREW_BIN}/${other} --version`,
-			});
-			strictEqual(result.success, false);
-			strictEqual(result.code, 126);
+			for (const command of commands) {
+				const result = await checks.run({ command });
+				strictEqual(result.success, true, `${command} failed`);
+				strictEqual(result.code, 0, `${command} failed`);
+				if (command === opensslRead) strictEqual(result.output, "true");
+			}
 		} finally {
 			checks.remove();
 		}
@@ -193,6 +221,49 @@ describe("quick-check toolchain sandbox", { skip: xcodeSkip }, () => {
 			}
 		} finally {
 			listener.close();
+		}
+	});
+
+	it("cannot read host Cargo/Rustup configuration or credentials", async (t) => {
+		const targets = hostReadTargets();
+		if (!targets.some(([kind]) => kind === "config")) {
+			t.skip("no installed host Rust configuration file");
+			return;
+		}
+		if (!targets.some(([kind]) => kind === "credential")) {
+			t.skip("no installed host credential file");
+			return;
+		}
+		const repo = fixture();
+		const attempts = targets.map(
+			([kind, path]) =>
+				"try { fs.readFileSync(" +
+				JSON.stringify(path) +
+				"); report." +
+				kind +
+				'Read = "allowed"; } catch (error) { report.' +
+				kind +
+				"Read = error.code; }",
+		);
+		const probe = [
+			'const fs = require("node:fs");',
+			'const report = { configRead: "unknown", credentialRead: "unknown" };',
+			...attempts,
+			"process.stdout.write(JSON.stringify(report));",
+		].join(" ");
+		const checks = checkSession(repo, []);
+		try {
+			await checks.prepare();
+			const result = await checks.run({ command: `node -e '${probe}'` });
+			strictEqual(result.success, true, "sandbox read probe failed");
+			const report = JSON.parse(result.output);
+			for (const [kind] of targets)
+				ok(
+					["EPERM", "EACCES"].includes(report[`${kind}Read`]),
+					`${kind} read was not denied`,
+				);
+		} finally {
+			checks.remove();
 		}
 	});
 

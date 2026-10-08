@@ -103,6 +103,9 @@ export async function handleSimple(argv, dependencies = {}) {
 				direction: routing.direction,
 				attempts: routing.attempts,
 				failedTargetIds: routing.failedTargetIds,
+				...(routing.exhaustionCause
+					? { exhaustionCause: routing.exhaustionCause }
+					: {}),
 			};
 		} catch (error) {
 			const isUsage = error instanceof SimpleUsageError;

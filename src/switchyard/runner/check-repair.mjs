@@ -38,9 +38,13 @@ function exactPinResult(task, result, pin) {
 }
 
 function repairBudget(context, task, pin) {
-	const budget = taskExecutionBudget(context, task);
+	const budget =
+		context._activeTaskBudget?.taskId === task.id
+			? taskExecutionBudget(context, task)
+			: null;
 	const checks = task.quickChecks?.checks;
 	if (
+		!budget ||
 		!Number.isFinite(Date.parse(pin?.deadline ?? "")) ||
 		budget.deadline !== pin.deadline ||
 		!Array.isArray(checks) ||
@@ -187,9 +191,10 @@ function matchingObservation(observations, binding, result, attempt) {
 }
 
 async function settleCheckRepairHealth(result, context, dependencies = {}) {
-	const binding = result?.routeHealthBinding;
+	const hostBinding = result?.routeHealthBinding;
+	const binding = context._activeRouteHealth;
 	const attempt = result?.routeHealthAttempt;
-	if (!binding || !attempt || !context.runId) return false;
+	if (!hostBinding || !binding || !attempt || !context.runId) return false;
 	const append = dependencies.createRouteHealthEvent ?? createRouteHealthEvent;
 	const ingest =
 		dependencies.ingestRouteHealthEvents ?? ingestRouteHealthEvents;
@@ -226,7 +231,7 @@ async function settleCheckRepairHealth(result, context, dependencies = {}) {
 			: {}),
 		...(typeof result.signal === "string" ? { signal: result.signal } : {}),
 	};
-	await append(context.runId, event, binding);
+	await append(context.runId, event, hostBinding);
 	const observations = await ingest({
 		authorisedRuns: [{ runId: context.runId, runRoot: runRoot(context.runId) }],
 		healthStateRoot: context.healthDecision?.healthStateRoot,

@@ -607,6 +607,113 @@ describe("simple route-health enforcement", () => {
 		strictEqual(decisionFor(root).suppress, true);
 	});
 
+	it("settles a started lease-free invocation whose terminal receipt cannot be bound", async () => {
+		const root = rootFor("unbound-success");
+		const run = await initializeHealthRun(`task-${nextId()}`);
+		const controller = createSimpleRouteHealthController({
+			healthStateRoot: root,
+			runId: run.runId,
+			taskId: run.taskId,
+		});
+		strictEqual((await controller.prepare(simpleInput(codex()))).allowed, true);
+		const started = await controller.start();
+		strictEqual(started.allowed, true);
+		strictEqual(started.trial, false);
+		const terminal = await controller.terminal({
+			providerResult: { success: true, code: 0, writerLifecycle: "stopped" },
+		});
+		strictEqual(terminal.settled, true);
+		strictEqual(terminal.reason, "provider-terminal-unverified");
+		strictEqual(terminal.binding, null);
+		const next = await controller.prepare(simpleInput(codex()));
+		strictEqual(next.allowed, true);
+		strictEqual(next.reason, undefined);
+	});
+
+	it("settles a lease-free invocation when terminal observation throws", async () => {
+		const root = rootFor("observation-failure");
+		const run = await initializeHealthRun(`task-${nextId()}`);
+		const controller = createSimpleRouteHealthController({
+			healthStateRoot: root,
+			runId: run.runId,
+			taskId: run.taskId,
+			createRouteHealthEvent: async () => {
+				throw new Error("fixture observation failure");
+			},
+		});
+		strictEqual((await controller.prepare(simpleInput(codex()))).allowed, true);
+		strictEqual((await controller.start()).allowed, true);
+		const terminal = await controller.terminal(OUTCOMES.exit());
+		strictEqual(terminal.settled, true);
+		strictEqual(terminal.reason, "provider-health-observation-unavailable");
+		strictEqual(terminal.binding?.lifecycleVerified, true);
+		const next = await controller.prepare(simpleInput(codex()));
+		strictEqual(next.allowed, true);
+		strictEqual(next.reason, undefined);
+	});
+
+	it("settles a started invocation whose success receipt is verified", async () => {
+		const root = rootFor("verified-success");
+		const dispatched = await dispatch(root, OUTCOMES.success());
+		strictEqual(dispatched.terminal.settled, true);
+		strictEqual(dispatched.terminal.binding?.transportVerified, true);
+		const next = await dispatched.controller.prepare(simpleInput(codex()));
+		strictEqual(next.allowed, true);
+		strictEqual(next.reason, undefined);
+	});
+
+	it("keeps an active trial lease fail-closed when its terminal receipt is unbound", async () => {
+		const root = rootFor("trial-unbound");
+		await fail(root, "exit", 0);
+		await fail(root, "exit", SECOND);
+		clock(ledger(root).generation.cooldownUntil - base);
+		const trial = await dispatch(root, {
+			providerResult: { success: true, code: 0, writerLifecycle: "stopped" },
+		});
+		strictEqual(trial.started.trial, true);
+		strictEqual(trial.terminal.settled, false);
+		strictEqual(trial.terminal.reason, "provider-terminal-unverified");
+		const refused = await trial.controller.prepare(simpleInput(codex()));
+		strictEqual(refused.allowed, false);
+		strictEqual(refused.reason, "provider-invocation-unsettled");
+		strictEqual((await inspect(root)).state, "half-open");
+	});
+
+	it("keeps an active trial lease fail-closed when terminal observation throws", async () => {
+		const root = rootFor("trial-observation-failure");
+		await fail(root, "exit", 0);
+		await fail(root, "exit", SECOND);
+		clock(ledger(root).generation.cooldownUntil - base);
+		const trial = await dispatch(root, "exit", {
+			createRouteHealthEvent: async () => {
+				throw new Error("fixture observation failure");
+			},
+		});
+		strictEqual(trial.started.trial, true);
+		strictEqual(trial.terminal.settled, false);
+		strictEqual(
+			trial.terminal.reason,
+			"provider-health-observation-unavailable",
+		);
+		const refused = await trial.controller.prepare(simpleInput(codex()));
+		strictEqual(refused.allowed, false);
+		strictEqual(refused.reason, "provider-invocation-unsettled");
+		strictEqual((await inspect(root)).state, "half-open");
+	});
+
+	it("keeps an unconfirmed trial writer fenced against a second prepare", async () => {
+		const root = rootFor("trial-unconfirmed");
+		await fail(root, "exit", 0);
+		await fail(root, "exit", SECOND);
+		clock(ledger(root).generation.cooldownUntil - base);
+		const trial = await dispatch(root, "unconfirmed");
+		strictEqual(trial.started.trial, true);
+		strictEqual(trial.terminal.settled, false);
+		const refused = await trial.controller.prepare(simpleInput(codex()));
+		strictEqual(refused.allowed, false);
+		strictEqual(refused.reason, "provider-invocation-unsettled");
+	});
+
 	it("compacts the attempt ledger so a long success streak cannot refuse later observations", async () => {
 		const root = rootFor("capacity");
 		await fail(root, "success", 0);

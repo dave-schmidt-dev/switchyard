@@ -438,13 +438,15 @@ export async function executeBrokerRoute(options) {
 			const outcomeDecision = failureTransition({ cancelled });
 			await reconcileOnce(outcomeDecision.outcome, null);
 		}
+		const timedOut = launcherResult?.timedOut === true;
 		const failureDecision = failureTransition({
 			cancelled,
-			result: "execution_failed",
+			result:
+				timedOut && !cancelled ? "execution_timed_out" : "execution_failed",
 			provider: route.provider,
 			model: route.model,
 			errorKind: launcherResult?.errorKind,
-			timedOut: launcherResult?.timedOut === true,
+			timedOut,
 			diagnosticCode: launcherResult?.diagnosticCode,
 			exitCode: launcherResult?.exitCode,
 			signal: launcherResult?.signal,
@@ -463,7 +465,11 @@ export async function executeBrokerRoute(options) {
 		const executionOutcome = await persistExecutionOutcome({ cancelled });
 		emit(
 			options.onStatus,
-			cancelled ? "execution_cancelled" : "execution_failed",
+			cancelled
+				? "execution_cancelled"
+				: timedOut
+					? "execution_timed_out"
+					: "execution_failed",
 			route,
 			failure ?? {},
 		);
@@ -472,6 +478,7 @@ export async function executeBrokerRoute(options) {
 			taskId: route.taskId,
 			provider: route.provider,
 			model: route.model,
+			result: failureDecision.result,
 			success: failureDecision.success,
 			reason: cancelled
 				? "cancelled"

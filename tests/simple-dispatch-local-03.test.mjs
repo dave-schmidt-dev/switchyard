@@ -263,7 +263,12 @@ describe("simple local execution path", () => {
 					routedOptions = routeOptions;
 					return { provider: null, reason: "test_stop" };
 				},
-				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
+				resolveTargetIdentity: (name) =>
+					identities[name] ?? {
+						targetId: name,
+						harnessKey: null,
+						ambiguous: true,
+					},
 				getInvocationDescriptor: (name) => descriptors[name] ?? null,
 			}),
 		);
@@ -284,7 +289,12 @@ describe("simple local execution path", () => {
 					pinnedOptions = routeOptions;
 					return { provider: null, reason: "test_stop" };
 				},
-				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
+				resolveTargetIdentity: (name) =>
+					identities[name] ?? {
+						targetId: name,
+						harnessKey: null,
+						ambiguous: true,
+					},
 				getInvocationDescriptor: (name) => descriptors[name] ?? null,
 			}),
 		);
@@ -299,7 +309,12 @@ describe("simple local execution path", () => {
 					routedOptions = routeOptions;
 					return { provider: null, reason: "test_stop" };
 				},
-				resolveTargetIdentity: (name) => identities[name] ?? identities.codex,
+				resolveTargetIdentity: (name) =>
+					identities[name] ?? {
+						targetId: name,
+						harnessKey: null,
+						ambiguous: true,
+					},
 				getInvocationDescriptor: (name) => {
 					if (name === "vibe")
 						return { ...descriptors.vibe, selector: "glm-5-3" };

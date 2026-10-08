@@ -302,24 +302,85 @@ describe("runner quota retry coordination", () => {
 - **Description:** preparation consumes the budget
 `);
 		let monotonic = 0;
+		const dispatches = [];
 		const fixture = makeQuotaRetryDependencies({
 			routePlan: [
 				{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
 			],
+			recordDispatch: (entry) => dispatches.push(entry),
 		});
 		fixture.dependencies.monotonicNow = () => monotonic;
 		fixture.dependencies.captureTaskBase = () => {
 			monotonic = 1_799_999.5;
 			return TASK_BASE;
 		};
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
 		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
 			projectPath: TEST_DIR,
-			checkpointPath: `${tasksPath}.checkpoint.json`,
+			checkpointPath,
 			dependencies: fixture.dependencies,
 		});
-		// BLOCKED (Task 5.6): async execution does not enforce the monotonicNow task budget after captureTaskBase, so it still launches and succeeds (no execution_timed_out result, executeCalls.length !== 0).
-		strictEqual(result.results.length, 1);
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		const timeoutDispatch = dispatches.find(
+			(entry) => entry.result === "execution_timed_out",
+		);
+		strictEqual(
+			result.results[0].result,
+			"execution_timed_out",
+			JSON.stringify({
+				result: result.results[0],
+				dispatches,
+				routes: fixture.routeCalls,
+				executions: fixture.executeCalls,
+			}),
+		);
+		strictEqual(result.results[0].timedOut, true);
+		strictEqual(checkpoint.results[0].result, "execution_timed_out");
+		strictEqual(timeoutDispatch?.result, "execution_timed_out");
+		strictEqual(fixture.executeCalls.length, 0);
+	});
+	it("projects a provider timeout consistently through result, checkpoint, and dispatch metadata", async () => {
+		const tasksPath = writeTasksFile(`### Task 1.1: Timed out provider
+- **Status:** pending
+- **Executor:** switchyard
+- **Files:** src/a.mjs
+- **Description:** preserve timeout classification
+`);
+		const dispatches = [];
+		const fixture = makeQuotaRetryDependencies({
+			routePlan: [
+				{ provider: "agy", model: "fixture-model", target: "agy-fixture" },
+			],
+			executionOutcomes: {
+				agy: [
+					{
+						success: false,
+						timedOut: true,
+						errorKind: "execution_failed",
+						error: "provider timed out",
+					},
+				],
+			},
+			recordDispatch: (entry) => dispatches.push(entry),
+		});
+		const checkpointPath = `${tasksPath}.checkpoint.json`;
+		const result = await runQueueAsync({
+			tasksFilePath: tasksPath,
+			projectPath: TEST_DIR,
+			checkpointPath,
+			dependencies: fixture.dependencies,
+		});
+		const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
+		const timeoutDispatch = dispatches.find(
+			(entry) => entry.result === "execution_timed_out",
+		);
+		strictEqual(result.results[0].result, "execution_timed_out");
+		strictEqual(checkpoint.results[0].result, "execution_timed_out");
+		strictEqual(timeoutDispatch?.result, "execution_timed_out");
+		strictEqual(result.results[0].errorKind, "execution_timed_out");
+		strictEqual(checkpoint.results[0].errorKind, "execution_timed_out");
+		strictEqual(timeoutDispatch?.errorKind, "execution_timed_out");
 	});
 	it("gives a late quota fallback its own fresh provider timeout", async () => {
 		const tasksPath = writeTasksFile(`### Task 1.1: Retry quota

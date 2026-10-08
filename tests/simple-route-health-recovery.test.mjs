@@ -101,13 +101,14 @@ function ledger(root) {
 }
 
 // Prepare and start an invocation; the caller decides whether it terminates.
-async function begin(root) {
+async function begin(root, origin = "work") {
 	serial += 1;
 	const run = await initializeHealthRun(`task-${serial}`);
 	const controller = createSimpleRouteHealthController({
 		healthStateRoot: root,
 		runId: run.runId,
 		taskId: run.taskId,
+		origin,
 	});
 	const prepared = await controller.prepare(simpleInput(codex()));
 	if (!prepared.allowed) return { run, prepared };
@@ -115,9 +116,9 @@ async function begin(root) {
 	return { run, controller, prepared, started };
 }
 
-async function dispatch(root, kind, offsetMs) {
+async function dispatch(root, kind, offsetMs, origin = "work") {
 	if (offsetMs !== undefined) clock(offsetMs);
-	const begun = await begin(root);
+	const begun = await begin(root, origin);
 	if (!begun.started?.allowed) return begun;
 	const terminal = await begun.controller.terminal(OUTCOMES[kind]());
 	return { ...begun, terminal };
@@ -332,5 +333,63 @@ describe("simple route-health claim recovery", () => {
 		strictEqual(ledger(root).failures, 0);
 		strictEqual(ledger(root).seen, seen);
 		strictEqual((await inspect(root)).state, "healthy");
+	});
+});
+
+describe("qualification route-health isolation", () => {
+	it("failed qualification creates no work health observation", async () => {
+		const root = rootFor("qual-fail");
+		await dispatch(root, "success", 0, "work");
+		strictEqual(ledger(root).failures, 0);
+		strictEqual((await inspect(root)).state, "healthy");
+
+		const failed = await dispatch(root, "exit", SECOND, "qualification");
+		strictEqual(failed.prepared.allowed, true);
+		strictEqual(failed.started.allowed, true);
+		strictEqual(failed.terminal.settled, true);
+		strictEqual(ledger(root).failures, 0);
+		strictEqual((await inspect(root)).state, "healthy");
+	});
+
+	it("successful qualification is not mistaken for a successful work sample", async () => {
+		const root = rootFor("qual-success");
+		await coolDown(root);
+		strictEqual((await inspect(root)).state, "cooldown");
+		const qual = await dispatch(root, "success", 2 * SECOND, "qualification");
+		strictEqual(qual.prepared.allowed, true);
+		strictEqual(qual.started.allowed, true);
+		strictEqual(qual.terminal.settled, true);
+		strictEqual((await inspect(root)).state, "cooldown");
+	});
+
+	it("qualification is exempt from suppression during cooldown", async () => {
+		const root = rootFor("qual-cooldown");
+		await coolDown(root);
+		strictEqual((await inspect(root)).state, "cooldown");
+		const work = await begin(root, "work");
+		strictEqual(work.prepared.allowed, false);
+		const qual = await begin(root, "qualification");
+		strictEqual(qual.prepared.allowed, true);
+		strictEqual(qual.started.allowed, true);
+	});
+
+	it("active writer fences reject unconfirmed qualification terminal", async () => {
+		const root = rootFor("qual-writer-fence");
+		const qual = await begin(root, "qualification");
+		strictEqual(qual.prepared.allowed, true);
+		strictEqual(qual.started.allowed, true);
+		const unconfirmed = await qual.controller.terminal({
+			providerResult: {
+				success: true,
+				code: 0,
+				writerLifecycle: "unavailable",
+			},
+			providerLifecycle: localLifecycle(0),
+		});
+		strictEqual(unconfirmed.reason, "provider-terminal-unverified");
+		strictEqual(unconfirmed.binding, null);
+		const refused = await qual.controller.prepare(simpleInput(codex()));
+		strictEqual(refused.allowed, false);
+		strictEqual(refused.reason, "provider-invocation-unsettled");
 	});
 });

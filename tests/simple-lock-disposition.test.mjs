@@ -98,6 +98,8 @@ test("simple CLI reports lock holder disposition without provider calls or autom
 					new Date(now + 60_000).toISOString(),
 					"--routing-run-id",
 					`lock-${item.name}`,
+					"--task-id",
+					`lock-disposition-${item.name}`,
 				],
 				{
 					stateRoot,

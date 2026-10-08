@@ -3,6 +3,7 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { manifestReviewPaths } from "../integrate/index.mjs";
+import { parseRfc3339 } from "../rfc3339.mjs";
 import { validateCheckCommand } from "./check-validation.mjs";
 import {
 	MAX_CAPTURE_BYTES,
@@ -12,7 +13,12 @@ import {
 	worktreeGit,
 } from "./git-control.mjs";
 import { validateRoutingRunId } from "./routing-state.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) --deadline <RFC3339> [--json]
+import { validateTaskIdentityId } from "./routing-task-identity.mjs";
+import {
+	SIMPLE_PROVIDERS,
+	SIMPLE_TARGET_ADAPTERS,
+} from "./target-adapters.mjs";
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) --deadline <RFC3339> [--origin <work|qualification>] [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -33,6 +39,7 @@ for compatibility.
 --format runs one bounded command in the check sandbox after the provider
 succeeds and before acceptance checks; a nonzero exit is advisory, recorded as
 formatStatus, and any edits it makes are revalidated against the declared scope.
+--origin marks the closed dispatch origin as work (default) or qualification.
 Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
 SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
 for attended recovery. An integration already in progress finishes before the
@@ -44,129 +51,6 @@ const MAX_DECLARED_FILES = 64;
 const MAX_CHECKS = 16;
 const MAX_PATH_CHARS = 1024;
 const MAX_CHECK_CHARS = 8192;
-const SIMPLE_PROVIDERS = Object.freeze([
-	"claude-code",
-	"codex",
-	"antigravity",
-	"antigravity-claude",
-	"cursor",
-	"opencode-go",
-	"vibe",
-	"vibe-code",
-	"copilot",
-	"copilot-student",
-]);
-const SIMPLE_TARGET_ADAPTERS = Object.freeze([
-	Object.freeze({
-		targetId: "codex",
-		harness: "codex",
-		kind: "codex",
-		selectors: null,
-	}),
-	Object.freeze({
-		targetId: "antigravity",
-		harness: "agy",
-		kind: "agy",
-		selectors: Object.freeze([
-			"gemini-3.8-flash-medium",
-			"gemini-3.8-flash-high",
-		]),
-	}),
-	Object.freeze({
-		targetId: "antigravity-claude",
-		harness: "agy",
-		kind: "agy",
-		selectors: Object.freeze(["claude-sonnet-4-6"]),
-	}),
-	Object.freeze({
-		targetId: "copilot-student",
-		harness: "copilot",
-		kind: "copilot",
-		selectors: Object.freeze(["auto"]),
-	}),
-	Object.freeze({
-		targetId: "vibe",
-		harness: "vibe",
-		kind: "bridge",
-		defaultEligible: true,
-		defaultCapabilities: Object.freeze(["low", "standard"]),
-		capabilities: Object.freeze(["low", "standard"]),
-		selectors: Object.freeze(["glm-5-3", "glm-5-3-medium"]),
-		validateInvocationArgs: (args) => Array.isArray(args) && args.length === 0,
-		expectedDescriptors: Object.freeze({
-			low: Object.freeze({
-				selector: "glm-5-3-medium",
-				invocationArgs: Object.freeze([]),
-			}),
-			standard: Object.freeze({
-				selector: "glm-5-3",
-				invocationArgs: Object.freeze([]),
-			}),
-		}),
-	}),
-	Object.freeze({
-		// Claude Code is subscription-backed and must be explicitly pinned.
-		targetId: "claude-code",
-		harness: "claude",
-		kind: "native",
-		defaultEligible: false,
-		capabilities: Object.freeze(["low", "standard", "high"]),
-		selectors: Object.freeze([
-			"claude-haiku-5-5",
-			"claude-sonnet-5-5",
-			"claude-opus-5-5",
-		]),
-		validateInvocationArgs: (args) =>
-			Array.isArray(args) &&
-			args.length === 2 &&
-			args[0] === "--effort" &&
-			["low", "medium", "high", "xhigh", "max"].includes(args[1]),
-	}),
-	Object.freeze({
-		// Native headless Vibe on Vibe's own login: spends the Vibe Code allowance.
-		targetId: "vibe-code",
-		harness: "vibe",
-		kind: "native",
-		defaultEligible: true,
-		defaultCapabilities: Object.freeze(["low", "standard"]),
-		capabilities: Object.freeze(["low", "standard"]),
-		selectors: Object.freeze(["glm-5-3", "glm-5-3-medium"]),
-		validateInvocationArgs: (args) => Array.isArray(args) && args.length === 0,
-		expectedDescriptors: Object.freeze({
-			low: Object.freeze({
-				selector: "glm-5-3-medium",
-				invocationArgs: Object.freeze([]),
-			}),
-			standard: Object.freeze({
-				selector: "glm-5-3",
-				invocationArgs: Object.freeze([]),
-			}),
-		}),
-	}),
-	Object.freeze({
-		targetId: "opencode-go",
-		harness: "opencode",
-		kind: "bridge",
-		defaultEligible: true,
-		capabilities: Object.freeze(["low", "standard"]),
-		selectors: Object.freeze(["opencode-go/deepseek-v4.1-flash"]),
-		validateInvocationArgs: (args) =>
-			Array.isArray(args) &&
-			args.length === 2 &&
-			args[0] === "--variant" &&
-			["low", "max"].includes(args[1]),
-		expectedDescriptors: Object.freeze({
-			low: Object.freeze({
-				selector: "opencode-go/deepseek-v4.1-flash",
-				invocationArgs: Object.freeze(["--variant", "low"]),
-			}),
-			standard: Object.freeze({
-				selector: "opencode-go/deepseek-v4.1-flash",
-				invocationArgs: Object.freeze(["--variant", "max"]),
-			}),
-		}),
-	}),
-]);
 const CAPABILITIES = new Set(["low", "standard", "high"]);
 const SECRET_PATHS = [
 	/(^|\/)\.env(?:\.|$)/iu,
@@ -267,21 +151,30 @@ function parseDeadline(value, nowMs) {
 		throw new SimpleUsageError("--deadline <RFC3339> is required");
 	}
 	if (
-		!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/u.test(
+		!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$/u.test(
 			value,
 		)
 	) {
 		throw new SimpleUsageError("--deadline must be an RFC3339 timestamp");
 	}
-	const deadlineMs = Date.parse(value);
-	if (!Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
+	const parsed = parseRfc3339(value);
+	if (!parsed) {
+		throw new SimpleUsageError("--deadline must be an RFC3339 timestamp");
+	}
+	const { epochMs: deadlineMs, hasSubMillisecondRemainder } = parsed;
+	if (deadlineMs <= nowMs) {
 		throw new SimpleUsageError("--deadline must be in the future");
 	}
-	if (deadlineMs - nowMs > MAX_DEADLINE_MS) {
+	const durationMs = deadlineMs - nowMs;
+	if (
+		durationMs > MAX_DEADLINE_MS ||
+		(durationMs === MAX_DEADLINE_MS && hasSubMillisecondRemainder)
+	) {
 		throw new SimpleUsageError("--deadline may be at most 30 minutes ahead");
 	}
 	return deadlineMs;
 }
+
 export function parseSimpleArgs(
 	argv,
 	{ now = Date.now, onWarning = null } = {},
@@ -307,7 +200,9 @@ export function parseSimpleArgs(
 				"repair-checks": { type: "boolean", default: false },
 				"no-repair-checks": { type: "boolean", default: false },
 				deadline: { type: "string" },
+				origin: { type: "string" },
 				"routing-run-id": { type: "string" },
+				"task-id": { type: "string" },
 				json: { type: "boolean", default: false },
 				help: { type: "boolean", default: false },
 			},
@@ -527,6 +422,14 @@ export function parseSimpleArgs(
 			throw new SimpleUsageError("invalid routing run id");
 		}
 	}
+	const taskId = parsed.values["task-id"] ?? null;
+	if (taskId !== null) {
+		try {
+			validateTaskIdentityId(taskId);
+		} catch {
+			throw new SimpleUsageError("invalid task id");
+		}
+	}
 	if (
 		parsed.values["repair-checks"] === true &&
 		parsed.values["no-repair-checks"] === true
@@ -536,6 +439,12 @@ export function parseSimpleArgs(
 		);
 	}
 	const nowMs = now();
+	const rawOrigin = parsed.values.origin;
+	const origin =
+		rawOrigin !== undefined ? String(rawOrigin).toLowerCase() : "work";
+	if (origin !== "work" && origin !== "qualification") {
+		throw new SimpleUsageError("--origin must be work or qualification");
+	}
 	const deadlineMs = parseDeadline(parsed.values.deadline, nowMs);
 	if (deadlineMs - nowMs < MIN_DEADLINE_FIT_MS) {
 		(onWarning ?? console.error)(
@@ -547,6 +456,7 @@ export function parseSimpleArgs(
 		projectPath: canonicalProjectPath,
 		capability,
 		onlyProviders,
+		origin,
 		files,
 		reportMode,
 		allowManifests,
@@ -559,6 +469,7 @@ export function parseSimpleArgs(
 		repairChecks: parsed.values["no-repair-checks"] !== true,
 		deadlineMs,
 		routingRunId,
+		taskId,
 	};
 }
 export {

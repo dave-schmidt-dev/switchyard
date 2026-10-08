@@ -27,10 +27,12 @@ import {
 	captureDiffDetailed as captureOpencodeDiffDetailed,
 	captureDiffDetailedAsync as captureOpencodeDiffDetailedAsync,
 } from "../src/switchyard/adapter/opencode.mjs";
+import { prepareAsyncProviderInvocation } from "../src/switchyard/runner/execute-task-async-unsafe-reliability.mjs";
 import {
 	DEFAULT_ADAPTERS,
 	executeTaskAsync,
 } from "../src/switchyard/runner/index.mjs";
+import { taskRepairScopeIdentity } from "../src/switchyard/runner/reliability.mjs";
 import {
 	descriptorForRoute,
 	runnerTestDir,
@@ -92,6 +94,56 @@ afterEach(() => {
 	}
 });
 describe("executeTask timeout handling", () => {
+	it("reports the canonical timeout kind for an expired async baseline pin", async () => {
+		const task = { id: "1.1", title: "repair", description: "repair" };
+		const descriptor = claudeDescriptor();
+		const routeResult = {
+			provider: "claude",
+			model: descriptor.selector,
+			resolvedTargetId: "claude",
+			resolved_harness: "claude",
+		};
+		const pin = {
+			taskId: task.id,
+			workspaceId: "fake-container",
+			baseTree: TASK_BASE.tree,
+			attemptId: "expired-attempt",
+			descriptorIdentity: descriptor.descriptor_identity,
+			scopeIdentity: taskRepairScopeIdentity(task),
+			provider: routeResult.provider,
+			resolvedTargetId: routeResult.resolvedTargetId,
+			selector: descriptor.selector,
+			deadline: "2000-01-01T00:00:00.000Z",
+		};
+		let releases = 0;
+		const result = await prepareAsyncProviderInvocation({
+			task,
+			context: {
+				_completionPin: pin,
+				_activeTaskBase: { tree: TASK_BASE.tree },
+				workingContainerName: "fake-container",
+			},
+			routeResult,
+			invocationDescriptor: descriptor,
+			resolvedTargetId: routeResult.resolvedTargetId,
+			requiredCapability: "standard",
+			selectedRoute: {},
+			releaseSelected: async () => {
+				releases += 1;
+			},
+			record: () => {},
+			attemptCleanupContext: { attemptId: pin.attemptId },
+			timeoutMs: 30_000,
+			runQuickChecksAsync: async () => {
+				throw new Error("expired baseline pin must skip checks");
+			},
+		});
+
+		strictEqual(result.terminal.result, "execution_timed_out");
+		strictEqual(result.terminal.errorKind, "execution_timed_out");
+		strictEqual(result.terminal.timedOut, true);
+		strictEqual(releases, 1);
+	});
 	it("retains every detailed diff-capture status after a timed-out execution", async () => {
 		const statuses = [
 			"captured",
@@ -286,6 +338,9 @@ describe("executeTask timeout handling", () => {
 - **Description:** x
 `);
 		const executeCalls = [];
+		const preparationElapsedMs = 1_234;
+		const initialWallTime = Date.UTC(2026, 9, 7);
+		let elapsedMs = 0;
 
 		const result = await runQueueAsync({
 			tasksFilePath: tasksPath,
@@ -300,6 +355,11 @@ describe("executeTask timeout handling", () => {
 				}),
 				recordDispatch: () => {},
 				integrationGate: () => ({ success: true, message: "ok" }),
+				now: () => initialWallTime + elapsedMs,
+				monotonicNow: () => elapsedMs,
+				onTaskRouted: () => {
+					elapsedMs += preparationElapsedMs;
+				},
 				adapters: {
 					claude: {
 						executeAsync: async (_prompt, _containerName, options) => {
@@ -314,8 +374,15 @@ describe("executeTask timeout handling", () => {
 		});
 
 		strictEqual(result.processedTasks, 2);
-		strictEqual(executeCalls[0], 90_000);
-		strictEqual(executeCalls[1], PROVIDER_EXECUTION_TIMEOUT_MS);
+		const initialTimeouts = [90_000, PROVIDER_EXECUTION_TIMEOUT_MS];
+		deepStrictEqual(
+			executeCalls,
+			initialTimeouts.map((timeoutMs) => timeoutMs - preparationElapsedMs),
+		);
+		for (const [index, remainingMs] of executeCalls.entries()) {
+			strictEqual(remainingMs > 0, true);
+			strictEqual(remainingMs < initialTimeouts[index], true);
+		}
 	});
 
 	it("captures but never integrates a diff from a non-timeout execution failure", async () => {

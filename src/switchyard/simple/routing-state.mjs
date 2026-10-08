@@ -1,23 +1,16 @@
 /** Durable run-scoped routing state. Unknown or in-flight state fails closed. */
-import { createHash, randomUUID } from "node:crypto";
-import {
-	closeSync,
-	constants,
-	existsSync,
-	fstatSync,
-	fsyncSync,
-	lstatSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	realpathSync,
-	renameSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { isAbsolute, join, parse, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { parseRfc3339 } from "../rfc3339.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
 import { CHECK_ENVIRONMENT_SIGNATURES } from "./check-environment.mjs";
+import {
+	acquireRoutingFileLock,
+	ensureSafeRoutingDirectories,
+	readRoutingJsonFile,
+	writeRoutingJsonAtomic,
+} from "./routing-state-storage.mjs";
 
 export const MAX_ATTEMPT_HISTORY = 256;
 export const MAX_BROKEN_CHECKS = 32;
@@ -97,7 +90,7 @@ function getRoutingStateRoot() {
 const iso = (value) =>
 	typeof value === "string" &&
 	/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/u.test(value) &&
-	Number.isFinite(Date.parse(value));
+	parseRfc3339(value) !== null;
 function exact(value, keys) {
 	return (
 		value &&
@@ -279,92 +272,15 @@ function validateState(state, project, runId) {
 	)
 		fail("routing_state_malformed");
 }
-function safeDirectories(path, create) {
-	const absolute = resolve(path);
-	let current = parse(absolute).root;
-	for (const part of absolute
-		.slice(current.length)
-		.split("/")
-		.filter(Boolean)) {
-		current = join(current, part);
-		if (!existsSync(current)) {
-			if (!create) return false;
-			mkdirSync(current, { mode: 0o700 });
-		}
-		const st = lstatSync(current);
-		if (
-			st.isSymbolicLink() ||
-			!st.isDirectory() ||
-			(st.mode & 0o022 && !(st.mode & 0o1000))
-		)
-			fail("routing_unsafe_directory");
-	}
-	return true;
-}
-function safeFile(path) {
-	const st = lstatSync(path);
-	if (
-		!st.isFile() ||
-		st.isSymbolicLink() ||
-		st.nlink !== 1 ||
-		st.size > 512 * 1024 ||
-		st.mode & 0o077 ||
-		(process.getuid && st.uid !== process.getuid())
-	)
-		fail("routing_unsafe_file");
-	return st;
-}
-function syncDirectory(path) {
-	const fd = openSync(path, "r");
-	try {
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
+function readState(dir, project, runId) {
+	return readRoutingJsonFile(join(dir, "state.json"), {
+		missingCode: "routing_state_missing",
+		malformedCode: "routing_state_malformed",
+		validate: (state) => validateState(state, project, runId),
+	});
 }
 function writeAtomic(dir, state) {
-	const target = join(dir, "state.json");
-	if (existsSync(target)) safeFile(target);
-	const tmp = join(dir, `.state-${randomUUID()}`);
-	let fd;
-	try {
-		fd = openSync(tmp, "wx", 0o600);
-		writeFileSync(fd, JSON.stringify(state));
-		fsyncSync(fd);
-		closeSync(fd);
-		fd = undefined;
-		renameSync(tmp, target);
-		syncDirectory(dir);
-	} catch {
-		fail("routing_state_write_failed");
-	} finally {
-		if (fd !== undefined) closeSync(fd);
-		if (existsSync(tmp)) unlinkSync(tmp);
-	}
-}
-function readState(dir, project, runId) {
-	const target = join(dir, "state.json");
-	if (!existsSync(target)) fail("routing_state_missing");
-	let fd;
-	try {
-		const before = safeFile(target);
-		fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW);
-		const actual = fstatSync(fd);
-		if (
-			before.dev !== actual.dev ||
-			before.ino !== actual.ino ||
-			actual.nlink !== 1
-		)
-			fail("routing_unsafe_file");
-		const state = JSON.parse(readFileSync(fd, "utf8"));
-		validateState(state, project, runId);
-		return state;
-	} catch (error) {
-		if (error?.code?.startsWith("routing_")) throw error;
-		fail("routing_state_malformed");
-	} finally {
-		if (fd !== undefined) closeSync(fd);
-	}
+	writeRoutingJsonAtomic(dir, "state.json", state);
 }
 function runPath(project, runId, stateRoot) {
 	return join(
@@ -416,35 +332,15 @@ export function openRoutingRun(
 	const dir = runPath(project, runId, stateRoot);
 	const existed = existsSync(dir);
 	if (!existed && !create) fail("routing_run_not_found");
-	safeDirectories(dir, create);
-	const lock = join(dir, ".lock");
-	let lockFd;
-	try {
-		lockFd = openSync(lock, "wx", 0o600);
-		writeFileSync(lockFd, `${process.pid}\n`);
-		fsyncSync(lockFd);
-		syncDirectory(dir);
-	} catch (error) {
-		if (lockFd !== undefined) closeSync(lockFd);
-		fail(
-			error.code === "EEXIST"
-				? "routing_run_lock_contention"
-				: "routing_state_write_failed",
-		);
-	}
-	const lockStat = fstatSync(lockFd);
-	closeSync(lockFd);
+	ensureSafeRoutingDirectories(dir, create);
+	const releaseLock = acquireRoutingFileLock(dir);
 	let released = false;
-	let state;
 	const release = () => {
 		if (released) return;
 		released = true;
-		const st = lstatSync(lock);
-		if (st.dev !== lockStat.dev || st.ino !== lockStat.ino || st.nlink !== 1)
-			fail("routing_lock_identity_changed");
-		unlinkSync(lock);
-		syncDirectory(dir);
+		releaseLock();
 	};
+	let state;
 	try {
 		if (existed) state = readState(dir, project, runId);
 		else {
@@ -510,7 +406,7 @@ export function openRoutingRun(
 				)
 			)
 				fail("routing_state_nonmonotonic");
-			safeDirectories(dir, false);
+			ensureSafeRoutingDirectories(dir, false);
 			writeAtomic(dir, next);
 			state = next;
 		},
@@ -520,7 +416,7 @@ export function readRoutingRunState(project, runId, { stateRoot } = {}) {
 	project = canonicalRoutingProject(project);
 	validateRoutingRunId(runId);
 	const dir = runPath(project, runId, stateRoot);
-	if (!safeDirectories(dir, false)) return null;
+	if (!ensureSafeRoutingDirectories(dir, false)) return null;
 	return readState(dir, project, runId);
 }
 export function recordAttemptOutcome(state, commit, record) {
