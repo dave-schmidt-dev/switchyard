@@ -50,6 +50,20 @@ describe("tracked git hooks", () => {
 		);
 	});
 
+	it("pre-push clears Git repository variables before validation", () => {
+		const prePush = readFileSync(join(ROOT, ".githooks/pre-push"), "utf8");
+		const preCommit = readFileSync(join(ROOT, ".githooks/pre-commit"), "utf8");
+		const unsetLine = "unset $(git rev-parse --local-env-vars)";
+		const validateLine = "npm run validate";
+
+		strictEqual(prePush.split("\n").includes(unsetLine), true);
+		strictEqual(
+			prePush.indexOf(unsetLine) < prePush.indexOf(validateLine),
+			true,
+		);
+		strictEqual(preCommit.includes("--local-env-vars"), false);
+	});
+
 	it("husky is gone from the dependencies and the tracked tree", () => {
 		const packageJson = JSON.parse(
 			readFileSync(join(ROOT, "package.json"), "utf8"),
