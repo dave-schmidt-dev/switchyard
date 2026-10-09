@@ -7,7 +7,7 @@ import { join, sep } from "node:path";
  * Resolves the temp base a simple run allocates under: an injected
  * `dependencies.tmpdir` (function or path) or the process temp directory.
  */
-export function simpleTempBase(dependencies = {}) {
+function simpleTempBase(dependencies = {}) {
 	return typeof dependencies.tmpdir === "function"
 		? dependencies.tmpdir()
 		: (dependencies.tmpdir ?? tmpdir());
@@ -27,7 +27,7 @@ export const OWNER_MARKER = ".switchyard-cleanup-owner.json";
 export const SIMPLE_ROOTS_DIRNAME = "switchyard-simple-roots";
 
 /** Matches one disposable root's directory name. */
-export const SIMPLE_ROOT_NAME_RE =
+const SIMPLE_ROOT_NAME_RE =
 	/^switchyard-simple-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /**
