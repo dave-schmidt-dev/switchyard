@@ -652,6 +652,19 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					classification,
 				});
 			}
+			// The work passed its checks and only integration was refused, so the
+			// captain applies the retained partial onto the new HEAD; another target
+			// would redo it against the same moved HEAD.
+			if (
+				result.failurePhase === "integrate" &&
+				refusalCode === "host_concurrency" &&
+				typeof result.partialWorktree === "string"
+			)
+				return answer("stop", {
+					stopReason: "host_concurrency",
+					result,
+					classification,
+				});
 			if (classification.severity === "baseline") {
 				return answer("stop", {
 					stopReason: "baseline_failed",

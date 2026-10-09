@@ -241,3 +241,53 @@ test("retainedPartials accumulates multiple retained clones across soft iteratio
 		ok(typeof rp.partialWorktree === "string");
 	}
 });
+
+// host_concurrency integration refusal with a retained partial stops instead of
+// rerouting: the passed work is applied to the moved HEAD, not redone.
+test("host_concurrency integration refusal with retained partial stops without rerouting", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			retained: true,
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "host_concurrency",
+					phase: "integrate",
+				}),
+				failureReason: "host_concurrency",
+				failurePhase: "integrate",
+				errorKind: "environment_failure",
+			},
+		},
+		codex: { status: "succeeded" },
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(f.calls.length, 1);
+	strictEqual(result.direction, "stop");
+	strictEqual(result.stopReason, "host_concurrency");
+	strictEqual(result.retainedPartials.length, 1);
+	strictEqual(result.retainedPartials[0].targetId, "antigravity-claude");
+	ok(typeof result.retainedPartials[0].partialWorktree === "string");
+});
+
+// The same integration refusal without retained work keeps the soft-retry reroute.
+test("host_concurrency integration refusal without retained partial reroutes", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "host_concurrency",
+					phase: "integrate",
+				}),
+				failureReason: "host_concurrency",
+				failurePhase: "integrate",
+				errorKind: "environment_failure",
+			},
+		},
+		codex: { status: "succeeded" },
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	deepStrictEqual(f.calls, ["antigravity-claude", "codex"]);
+	strictEqual(result.direction, "complete");
+});

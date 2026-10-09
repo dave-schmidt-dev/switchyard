@@ -57,6 +57,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- Simple routing stops with `host_concurrency` and keeps the retained partial when an attempt's checks passed but integration was refused because a peer moved HEAD over protected paths; it previously rerouted, so another provider redid the passing work against the same moved HEAD. The attempt still does not charge its target.
 - Git hooks now come from the tracked `.githooks/` directory, so linked worktrees run pre-commit and pre-push instead of silently skipping them; husky is removed.
 - `pre-push` clears Git's repository-local environment before running `validate`, so a push from a linked worktree no longer lets the suite's own Git fixtures write to the real repository (they had set `core.bare` and a placeholder `user` in the shared config).
 - Simple routing no longer starts another provider after a failed or timed-out attempt when less than two minutes of the task deadline remain (or a tenth of the task's initial budget, if that is smaller). It stops with that attempt's outcome, so a provider launched with seconds left no longer fails at once and counts against route health. The first attempt always starts.
