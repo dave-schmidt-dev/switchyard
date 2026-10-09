@@ -15,6 +15,7 @@ import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../src/switchyard/runner/checks-sandbox.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const root = tempDir("sy-check-proc-");
@@ -48,7 +49,9 @@ function runConfined(script, readOnlyPaths = []) {
 }
 
 describe("quick-check sandbox process and path access", () => {
-	it("imports the sandbox module where the passwd lookup is denied", () => {
+	it("imports the sandbox module where the passwd lookup is denied", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		// Switchyard's own tests import this module inside the check sandbox, where
 		// userInfo() fails; the host account paths must resolve on first use.
 		const modulePath = realpathSync(
@@ -72,7 +75,9 @@ import(${JSON.stringify(pathToFileURL(modulePath).href)}).then(
 		strictEqual(report.imported, "function");
 	});
 
-	it("lets checks signal their own process group but not host processes", () => {
+	it("lets checks signal their own process group but not host processes", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const report = runConfined(`
 const { spawn } = require("node:child_process");
 const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { detached: true, stdio: "ignore" });
@@ -89,7 +94,9 @@ setTimeout(() => {
 		strictEqual(report.host, "EPERM");
 	});
 
-	it("runs /bin/sh cleanly and resolves TMPDIR through the /var symlink", () => {
+	it("runs /bin/sh cleanly and resolves TMPDIR through the /var symlink", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const report = runConfined(`
 const { spawnSync } = require("node:child_process");
 const { lstatSync, realpathSync } = require("node:fs");
@@ -125,7 +132,9 @@ process.stdout.write(JSON.stringify({ stdout: shell.stdout, stderr: shell.stderr
 		deepStrictEqual(homebrewOpenSslConfigs(join(root, "no-such-etc")), []);
 	});
 
-	it("grants each installed OpenSSL config as a literal file and denies its private dir", (t) => {
+	it("grants each installed OpenSSL config as a literal file and denies its private dir", {
+		skip: nestedSandboxSkip,
+	}, (t) => {
 		const configs = homebrewOpenSslConfigs();
 		if (!configs.length) {
 			t.skip("no Homebrew OpenSSL config on this host");

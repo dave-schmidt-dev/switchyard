@@ -11,6 +11,7 @@ import { readFailureRecords } from "../src/switchyard/simple/failure-log.mjs";
 import { classifyAttemptFailure } from "../src/switchyard/simple/failure-severity.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -90,7 +91,7 @@ async function run(repo, options = {}, provider = null) {
 }
 
 test("a candidate-changed manifest refuses as a hard check cause, never a baseline one", {
-	skip: sandboxSkip,
+	skip: nestedSandboxSkip || sandboxSkip,
 }, async () => {
 	const repo = fixtureRepo({
 		packageManifest: JSON.stringify({ name: "fixture", version: "1.0.0" }),
@@ -146,7 +147,7 @@ test("a candidate-changed manifest refuses as a hard check cause, never a baseli
 });
 
 test("an unparseable check records its command sub-cause and position", {
-	skip: sandboxSkip,
+	skip: nestedSandboxSkip || sandboxSkip,
 }, async () => {
 	const repo = fixtureRepo();
 	const { result, providerCalls } = await run(repo, {

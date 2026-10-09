@@ -14,6 +14,7 @@ import {
 	runQuickChecksAsync,
 } from "../src/switchyard/runner/checks.mjs";
 import { parseTaskQueue } from "../src/switchyard/runner/index.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_DIR = tempDir("switchyard-quick-checks-cleanup-");
@@ -34,7 +35,9 @@ async function waitFor(check, timeoutMs = READY_TIMEOUT_MS) {
 afterEach(() => {
 	rmSync(TEST_DIR, { recursive: true, force: true });
 });
-describe("Task 51 quick-check regression", () => {
+describe("Task 51 quick-check regression", {
+	skip: nestedSandboxSkip,
+}, () => {
 	it("kills escaped check helpers after normal, failed, timed out, and abrupt runs", async () => {
 		for (const mode of ["normal", "failed", "timeout", "abrupt"]) {
 			const project = join(TEST_DIR, `task-check-child-${mode}`);

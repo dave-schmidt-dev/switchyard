@@ -18,6 +18,7 @@ import {
 	runCommand,
 } from "../src/switchyard/runner/reliability.mjs";
 import { runQueueAsync as runQueueAsyncStub } from "./helpers/async-runner-fixtures.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_DIR = tempDir("switchyard-queue-reliability-");
@@ -224,7 +225,9 @@ describe("queue reliability contract", () => {
 		);
 	});
 
-	it("fails a baseline before sync or production async provider invocation and binds its receipt", async () => {
+	it("fails a baseline before sync or production async provider invocation and binds its receipt", {
+		skip: nestedSandboxSkip,
+	}, async () => {
 		const { project, base } = projectAt("baseline-failure");
 		const tasksPath = join(TEST_DIR, "tasks.md");
 		tasksFile(tasksPath, "node --check broken.mjs");
@@ -409,7 +412,9 @@ describe("queue reliability contract", () => {
 		}
 	});
 
-	it("rejects a baseline check that mutates tracked candidate files", () => {
+	it("rejects a baseline check that mutates tracked candidate files", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const { project, base } = projectAt("baseline-mutation");
 		writeFileSync(
 			join(project, "package.json"),

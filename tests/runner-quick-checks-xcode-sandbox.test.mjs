@@ -20,6 +20,7 @@ import {
 	safeEnv,
 } from "../src/switchyard/runner/checks-sandbox.mjs";
 import { validateCheckCommand } from "../src/switchyard/simple/check-validation.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
@@ -265,6 +266,7 @@ describe("xcodebuild build preflight", () => {
 
 describe("xcodebuild build in the sandbox", { skip: xcodeSkip }, () => {
 	it("passes xcodebuild build with every cache and output in the clone", {
+		skip: nestedSandboxSkip,
 		timeout: 600_000,
 	}, () => {
 		const repo = fixture();
@@ -281,6 +283,7 @@ describe("xcodebuild build in the sandbox", { skip: xcodeSkip }, () => {
 	});
 
 	it("passes the flagged swift build in the sandbox", {
+		skip: nestedSandboxSkip,
 		timeout: 600_000,
 	}, () => {
 		const repo = fixture();
@@ -340,7 +343,9 @@ describe("xcodebuild build in the sandbox", { skip: xcodeSkip }, () => {
 		}
 	});
 
-	it("allows only unique SwiftPM temp dirs and this clone's lock files in the temp dir", () => {
+	it("allows only unique SwiftPM temp dirs and this clone's lock files in the temp dir", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const repo = fixture();
 		const temp = userDir("DARWIN_USER_TEMP_DIR");
 		const directory = track(join(temp, unique("TemporaryDirectory.")));
@@ -371,7 +376,9 @@ describe("xcodebuild build in the sandbox", { skip: xcodeSkip }, () => {
 		ok(!existsSync(plain));
 	});
 
-	it("allows the listed mach services and refuses others", () => {
+	it("allows the listed mach services and refuses others", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const repo = fixture();
 		const names = [
 			"com.apple.trustd",

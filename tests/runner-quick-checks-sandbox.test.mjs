@@ -9,6 +9,7 @@ import {
 	quickCheckSandboxProfile,
 	runQuickChecks,
 } from "../src/switchyard/runner/checks.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-quick-check-test-sandbox");
 function runFixtureGit(projectPath, args) {
@@ -20,7 +21,9 @@ function runFixtureGit(projectPath, args) {
 afterEach(() => {
 	rmSync(TEST_DIR, { recursive: true, force: true });
 });
-describe("Task 51 quick-check regression", () => {
+describe("Task 51 quick-check regression", {
+	skip: nestedSandboxSkip,
+}, () => {
 	it("confines provider-edited checks to the candidate and runtime", async () => {
 		const project = join(TEST_DIR, "task-check-sandbox");
 		mkdirSync(project, { recursive: true });
