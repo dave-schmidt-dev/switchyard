@@ -6,6 +6,7 @@ import { cwd } from "node:process";
 import { afterEach, describe, it } from "node:test";
 import { runQuickChecks } from "../src/switchyard/runner/checks.mjs";
 import { parseTaskQueue } from "../src/switchyard/runner/index.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-quick-check-test-recovery");
 function runFixtureGit(projectPath, args) {
@@ -51,7 +52,9 @@ ${declaration}
 			[],
 		);
 	});
-	it("reconstructs a prior accepted tree without copying an unrelated untracked file", () => {
+	it("reconstructs a prior accepted tree without copying an unrelated untracked file", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const project = join(TEST_DIR, "task-check-base");
 		mkdirSync(project, { recursive: true });
 		writeFileSync(join(project, "a.mjs"), "export const a = 1;\n");

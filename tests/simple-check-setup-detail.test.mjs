@@ -14,6 +14,7 @@ import { resolveFailure } from "../src/switchyard/diagnostics/failure-registry.m
 import { readRun } from "../src/switchyard/run-store/index.mjs";
 import { dryRunAcceptanceChecks } from "../src/switchyard/simple/check-dry-run.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const suite = tempDir("switchyard-check-setup-detail-");
@@ -247,7 +248,7 @@ test("a credential-shaped provider cancel source never reaches run.json", async 
 });
 
 test("a readiness refusal names the second failing command without its argv", {
-	skip: sandboxSkip,
+	skip: nestedSandboxSkip || sandboxSkip,
 }, async () => {
 	const repo = repoFixture();
 	const argvCanary = "--switchyard-argv-canary";
@@ -398,7 +399,7 @@ test("both executables join the environment-failure details and message", () => 
 });
 
 test("a dry-run check whose tool resolves differently records both paths", {
-	skip: sandboxSkip,
+	skip: nestedSandboxSkip || sandboxSkip,
 }, async () => {
 	const repo = repoFixture();
 	let providerCalls = 0;

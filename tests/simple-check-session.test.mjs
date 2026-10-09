@@ -19,6 +19,7 @@ import {
 	writeCheckEvidence,
 } from "../src/switchyard/simple/check-session.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -113,7 +114,9 @@ async function run(repo, options = {}, provider = null, extra = {}) {
 	return { result, called, providerRoot };
 }
 
-test("full dispatch checks the actual safe candidate and exact dirty overlay", async () => {
+test("full dispatch checks the actual safe candidate and exact dirty overlay", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = fixture();
 	writeFileSync(join(repo.projectPath, "a.txt"), "overlay\n");
 	const observed = await run(
@@ -148,7 +151,9 @@ test("full dispatch checks the actual safe candidate and exact dirty overlay", a
 	strictEqual(existsSync(observed.providerRoot), false);
 });
 
-test("actual checker denies host paths and inherited environment", async () => {
+test("actual checker denies host paths and inherited environment", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = fixture();
 	const outside = join(repo.root, "host-marker");
 	writeFileSync(outside, "owner");
@@ -167,7 +172,9 @@ test("actual checker denies host paths and inherited environment", async () => {
 	}
 });
 
-test("full dispatch rebuilds repair candidate and discards checker side effects", async () => {
+test("full dispatch rebuilds repair candidate and discards checker side effects", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = fixture();
 	const observed = await run(
 		repo,
@@ -194,7 +201,9 @@ test("full dispatch rebuilds repair candidate and discards checker side effects"
 	strictEqual(existsSync(join(repo.projectPath, "side-effect")), false);
 });
 
-test("unavailable provider writer refuses checker rebuild", async () => {
+test("unavailable provider writer refuses checker rebuild", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = fixture();
 	const observed = await run(repo, {}, async ({ worktreePath }) => {
 		writeFileSync(join(worktreePath, "a.txt"), "candidate\n");
@@ -232,7 +241,9 @@ test("cancelled preparation never launches provider and cleans owned root", asyn
 	);
 });
 
-test("baseline-only dispatch checks its base once without preparing a candidate checker", async () => {
+test("baseline-only dispatch checks its base once without preparing a candidate checker", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = fixture();
 	writeFileSync(join(repo.projectPath, "package.json"), '{"name":"base"}\n');
 	commit(repo.projectPath);
@@ -279,7 +290,9 @@ test("baseline-only dispatch checks its base once without preparing a candidate 
 	}
 });
 
-test("baseline-only dispatch still requires stopped-writer proof", async () => {
+test("baseline-only dispatch still requires stopped-writer proof", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const observed = await run(
 		fixture(),
 		{ checks: [], baselineChecks: ["test -f a.txt"] },
@@ -330,7 +343,9 @@ for (const code of [
 	"check_group_unconfirmed",
 	"check_session_cleanup_failed",
 ]) {
-	test(`trusted checker ${code} survives concurrent cancellation`, async () => {
+	test(`trusted checker ${code} survives concurrent cancellation`, {
+		skip: nestedSandboxSkip,
+	}, async () => {
 		const repo = fixture();
 		const controller = new AbortController();
 		const fs = createRequire(import.meta.url)("node:fs");
@@ -364,7 +379,9 @@ for (const code of [
 	});
 }
 
-test("a provider callback cannot override cancellation with a trusted checker error code", async () => {
+test("a provider callback cannot override cancellation with a trusted checker error code", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const controller = new AbortController();
 	const observed = await run(
 		fixture(),
@@ -443,7 +460,9 @@ async function lockedFixture() {
 	return { repo, cache };
 }
 
-test("actual seeded offline cache isolates binary tampering and disables lifecycle scripts", async () => {
+test("actual seeded offline cache isolates binary tampering and disables lifecycle scripts", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo, cache } = await lockedFixture();
 	const observed = await run(
 		repo,
@@ -469,7 +488,9 @@ test("actual seeded offline cache isolates binary tampering and disables lifecyc
 	strictEqual(existsSync(join(repo.projectPath, "sentinel")), false);
 });
 
-test("plain Node imports receive the complete locked tree", async () => {
+test("plain Node imports receive the complete locked tree", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo, cache } = await lockedFixture();
 	const observed = await run(
 		repo,
@@ -484,7 +505,9 @@ test("plain Node imports receive the complete locked tree", async () => {
 	);
 });
 
-test("generic non-Node checks with manifest dependencies need no cache installation", async () => {
+test("generic non-Node checks with manifest dependencies need no cache installation", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo } = await lockedFixture();
 	const cache = join(repo.root, "cold-generic");
 	mkdirSync(cache);
@@ -510,7 +533,9 @@ test("generic non-Node checks with manifest dependencies need no cache installat
 	strictEqual(existsSync(join(cache, "_cacache")), false);
 });
 
-test("plain Node imported dependencies with cold cache refuse before provider", async () => {
+test("plain Node imported dependencies with cold cache refuse before provider", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo } = await lockedFixture();
 	const cache = join(repo.root, "cold-node");
 	mkdirSync(cache);
@@ -526,7 +551,9 @@ test("plain Node imported dependencies with cold cache refuse before provider", 
 	strictEqual(observed.result.failureReason, "check_dependencies_unverified");
 });
 
-test("declared locked binary heads trigger trusted provisioning", async () => {
+test("declared locked binary heads trigger trusted provisioning", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo, cache } = await lockedFixture();
 	const observed = await run(repo, { checks: ["fixture-check"] }, null, {
 		checkCachePath: cache,
@@ -538,7 +565,9 @@ test("declared locked binary heads trigger trusted provisioning", async () => {
 	);
 });
 
-test("cold offline cache refuses before provider", async () => {
+test("cold offline cache refuses before provider", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo } = await lockedFixture();
 	const cache = join(repo.root, "cold");
 	mkdirSync(cache);
@@ -549,7 +578,9 @@ test("cold offline cache refuses before provider", async () => {
 	strictEqual(observed.result.failureReason, "check_dependencies_unverified");
 });
 
-test("scoped generic manifest edits need no unchanged dependency tree", async () => {
+test("scoped generic manifest edits need no unchanged dependency tree", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo } = await lockedFixture();
 	const cache = join(repo.root, "cold-manifest");
 	mkdirSync(cache);
@@ -581,7 +612,9 @@ test("scoped generic manifest edits need no unchanged dependency tree", async ()
 	strictEqual(existsSync(join(cache, "_cacache")), false);
 });
 
-test("plain Node checks reject changed dependencies before any candidate installation", async () => {
+test("plain Node checks reject changed dependencies before any candidate installation", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo, cache } = await lockedFixture();
 	const observed = await run(
 		repo,
@@ -685,7 +718,9 @@ test("failed-check evidence redacts credential shapes before truncation", () => 
 	ok(text.includes("[REDACTED]"), "credential shapes are replaced");
 });
 
-test("changed manifests refuse acceptance without installing them", async () => {
+test("changed manifests refuse acceptance without installing them", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const { repo, cache } = await lockedFixture();
 	const observed = await run(
 		repo,
@@ -708,7 +743,9 @@ test("changed manifests refuse acceptance without installing them", async () => 
 	strictEqual(observed.result.failureReason, "check_dependencies_unverified");
 });
 
-test("host probe succeeds while nested sandbox refuses full dispatch before provider", () => {
+test("host probe succeeds while nested sandbox refuses full dispatch before provider", {
+	skip: nestedSandboxSkip,
+}, () => {
 	const repo = fixture();
 	const profile = quickCheckSandboxProfile(repo.root, repo.root);
 	const host = spawnSync("/usr/bin/sandbox-exec", [

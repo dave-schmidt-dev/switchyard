@@ -19,6 +19,7 @@ import {
 	uvPathSources,
 	venvPathEntries,
 } from "../src/switchyard/simple/path-dependencies.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const REFUSED = { code: "check_dependencies_unverified" };
@@ -290,7 +291,9 @@ describe("venvPathEntries", () => {
 });
 
 describe("sandboxed path dependencies", { skip: sandboxSkip }, () => {
-	it("imports the sibling read-only through the project venv", async (t) => {
+	it("imports the sibling read-only through the project venv", {
+		skip: nestedSandboxSkip,
+	}, async (t) => {
 		if (!python) {
 			t.skip("python3 is unavailable on this host");
 			return;
@@ -348,7 +351,9 @@ describe("sandboxed path dependencies", { skip: sandboxSkip }, () => {
 		checks.remove();
 	});
 
-	it("refuses a check once an accepted dependency is swapped for a symlink", async () => {
+	it("refuses a check once an accepted dependency is swapped for a symlink", {
+		skip: nestedSandboxSkip,
+	}, async () => {
 		const repo = fixture();
 		const outside = tempDir("switchyard-path-deps-outside-");
 		const checks = checkSession(repo);
