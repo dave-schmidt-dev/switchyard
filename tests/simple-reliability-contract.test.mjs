@@ -4,6 +4,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -246,6 +247,42 @@ describe("simple provider reliability contract", () => {
 		});
 		strictEqual(checkTimeout.causeCode, "acceptance_check_timeout");
 		strictEqual(checkTimeout.causeCategory, "check");
+	});
+
+	it("records a routed wall-clock deadline as a task-scoped skip", async () => {
+		const repo = makeRepo();
+		const stateRoot = realpathSync(tempDir("simple-routing-deadline-state-"));
+		const answer = await runSimpleRoutingTask(
+			taskOptions(repo, { routingRunId: `deadline-scope-${Date.now()}` }),
+			{
+				...dependencies(repo, {
+					executeProvider: async () => ({
+						success: false,
+						code: null,
+						timedOut: true,
+						signal: "SIGKILL",
+						writerLifecycle: "stopped",
+					}),
+					route: ({ availableProviders }) =>
+						availableProviders.length > 0
+							? { provider: availableProviders[0], reason: "priority_fill" }
+							: { provider: null, reason: "no_eligible" },
+				}),
+				runSimpleTask,
+				stateRoot,
+				getImplementorPriority: () => 1,
+			},
+		);
+		const attempt = answer.attempts.find((item) => item.targetId === "codex");
+		ok(attempt, JSON.stringify(answer));
+		strictEqual(attempt.terminal, "skipped");
+		strictEqual(attempt.reason, "execution_failed");
+		deepStrictEqual(answer.failedTargetIds, []);
+		const run = await readRun(attempt.runId);
+		strictEqual(
+			run.lastFailure.providerReliability.causeCode,
+			"provider_deadline_exceeded",
+		);
 	});
 
 	it("fails a requested baseline before provider launch and preserves its exit code", async () => {

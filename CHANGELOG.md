@@ -58,6 +58,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 ### Fixed
 
 - The test-only direct root removal in simple dispatch now deletes only the exact marked UUID root it allocated; it previously accepted any path under the temp directory. Production never reached it.
+- A provider deadline timeout in simple routing now excludes its target only for the task that timed out: the attempt records `skipped`, not `failed`, so later tasks in the same routing run can still use the target. Baseline, environment and lifecycle-recovery attempts never exclude a target from its own task, and a pinned run whose only target already timed out for this task stops as `pinned_target_failed`.
 - Switchyard's own tests can run as dispatch checks: `checks-sandbox.mjs` resolves the host account home on first use instead of at import (the sandbox denies the passwd lookup), and the two tests that start the real check engine skip only when `sandbox-exec` cannot nest.
 - Sandboxed checks grant exact reads of every installed Homebrew OpenSSL config (`openssl@<N>/openssl.cnf`) instead of only `openssl@3`, so Node linked against OpenSSL 4 starts inside the check sandbox again; Node checks had failed at startup, which simple dispatch reported as `npm_ci_failed`.
 - Routing-run and task-binding locks reclaim only owners proven dead in the local PID namespace; live, unknown, malformed, unsafe, or replaced ownership remains fail-closed. If both lock releases fail during cleanup, the earlier pending exception is preserved.

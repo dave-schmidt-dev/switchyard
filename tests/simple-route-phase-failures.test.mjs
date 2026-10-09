@@ -486,6 +486,40 @@ test("the real engine's second-call route failure is logged and the stop matches
 	);
 });
 
+test("a persisted task-local timeout alone reports exhaustionCause task_failures", async () => {
+	const f = routingFixture({
+		__targets: ["antigravity-claude"],
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "provider_deadline_exceeded",
+					phase: "provider",
+					timedOut: true,
+				}),
+			},
+		},
+	});
+	f.options.taskId = "exhausted-timeout";
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.direction, "native_required");
+	strictEqual(first.exhaustionCause, "task_failures");
+	deepStrictEqual(first.failedTargetIds, []);
+	// The replay has no failure of its own; only the persisted task-local
+	// timeout justifies task_failures instead of capacity.
+	const replay = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(replay.direction, "native_required");
+	strictEqual(replay.exhaustionCause, "task_failures");
+	deepStrictEqual(replay.failedTargetIds, []);
+	strictEqual(f.calls.length, 1);
+
+	const empty = routingFixture({ __targets: [] });
+	empty.options.taskId = "empty-capacity";
+	const capacity = await runSimpleRoutingTask(empty.options, empty.deps);
+	strictEqual(capacity.direction, "native_required");
+	strictEqual(capacity.exhaustionCause, "capacity");
+});
+
 // -- lifecycle_unconfirmed names the failing check -----------------------------
 
 test("lifecycle_unconfirmed stops carry a closed lifecycleCheck", async () => {

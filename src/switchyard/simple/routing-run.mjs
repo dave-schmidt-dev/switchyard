@@ -49,6 +49,51 @@ const FUNDING_UNAVAILABLE = new Set([
 	"paid_overage_not_allowed",
 	"included_usage_unverified",
 ]);
+/** Attempt reasons that blame the environment, not the target, for this task. */
+const TASK_EXCLUSION_EXEMPT_REASONS = new Set([
+	"baseline_failed",
+	"environment_failure",
+	"lifecycle_recovered",
+]);
+/**
+ * Terminal recorded for one failed attempt.
+ *
+ * Wall-clock provider timeouts are task-scoped, never run-scoped: a slow or
+ * oversized task must not latch its target into the run-wide failed set, where
+ * every later task in the routing run would lose it. A deadline timeout
+ * therefore records "skipped" even when accountability is provider-memory
+ * eligible. Cross-task evidence stays route health's job: its lifecycle-backed
+ * deadline trust cools hung providers down across tasks.
+ */
+function failureTerminal(result, providerMemoryEligible) {
+	if (
+		(result.providerReliability?.causeCode ?? result.failureReason) ===
+		"provider_deadline_exceeded"
+	)
+		return "skipped";
+	return providerMemoryEligible ? "failed" : "skipped";
+}
+
+/**
+ * Targets this logical task already tried and did not succeed on. Unlike the
+ * run-wide failedTargetIds, this set is rebuilt from persisted attempts and
+ * scoped to one task, so a task-local failure never removes a healthy target
+ * from other tasks in the same routing run. Baseline, environment and
+ * lifecycle-recovery attempts blame the environment, not the target, so they
+ * keep the target eligible for the task.
+ */
+function taskExcludedTargets(attempts, logicalTaskId) {
+	const excluded = new Set();
+	for (const attempt of attempts) {
+		const failedForTask =
+			attempt.taskId === logicalTaskId &&
+			(attempt.terminal === "failed" || attempt.terminal === "skipped") &&
+			!TASK_EXCLUSION_EXEMPT_REASONS.has(attempt.reason);
+		if (failedForTask) excluded.add(attempt.targetId);
+	}
+	return excluded;
+}
+
 /** Selected allocations are durable before route() returns control to the engine. */
 export async function runSimpleRoutingTask(options, deps = {}) {
 	const origin = options.origin ?? "work";
@@ -189,17 +234,23 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				{ stopReason: "partial_work_retained" },
 				{ log: false },
 			);
-		if (
-			pinned &&
-			options.onlyProviders.every((id) =>
-				handle.state.failedTargetIds.includes(resolveIdentity(id).targetId),
+		if (pinned) {
+			const state = handle.state;
+			const pinnedExcluded = new Set([
+				...state.failedTargetIds,
+				...taskExcludedTargets(state.attempts, logicalTaskId),
+			]);
+			if (
+				options.onlyProviders.every((id) =>
+					pinnedExcluded.has(resolveIdentity(id).targetId),
+				)
 			)
-		)
-			return answer(
-				"stop",
-				{ stopReason: "pinned_target_failed" },
-				{ log: false },
-			);
+				return answer(
+					"stop",
+					{ stopReason: "pinned_target_failed" },
+					{ log: false },
+				);
+		}
 		// A check this run already found environment-broken fails every target
 		// the same way: answer with the stored evidence, allocate nothing.
 		const brokenCheck = knownBrokenCheck(handle.state, options.checks);
@@ -234,9 +285,11 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			let noEligible = false;
 			const routeAttempt = (input) => {
 				routeCalled = true;
+				const state = handle.state;
 				const excluded = new Set([
-					...handle.state.failedTargetIds,
+					...state.failedTargetIds,
 					...localExcluded,
+					...taskExcludedTargets(state.attempts, logicalTaskId),
 				]);
 				const availableProviders = (input.availableProviders ?? []).filter(
 					(id) => {
@@ -360,6 +413,9 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						{ attempt },
 					);
 				}
+				const exhausted =
+					anyFailed ||
+					taskExcludedTargets(handle.state.attempts, logicalTaskId).size > 0;
 				if (
 					routeCalled &&
 					noEligible &&
@@ -372,7 +428,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 							status: pinned ? "failed" : "deferred",
 							stopReason: pinned ? "pinned_target_unavailable" : undefined,
 							exhaustionCause: !pinned
-								? anyFailed
+								? exhausted
 									? "task_failures"
 									: "capacity"
 								: undefined,
@@ -429,9 +485,10 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				result.failurePhase !== "baseline" &&
 				result.recovery.cleanup.writer.state === "stopped";
 			const terminal = failed
-				? (typed ? accountability.providerMemoryEligible && tried : tried)
-					? "failed"
-					: "skipped"
+				? failureTerminal(
+						result,
+						typed ? accountability.providerMemoryEligible && tried : tried,
+					)
 				: "succeeded";
 
 			// lifecycle() already proved the writer stopped or never started.

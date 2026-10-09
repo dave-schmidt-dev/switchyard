@@ -12,11 +12,13 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { parseSimpleArgs } from "../src/switchyard/simple/args.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import {
 	latchNativeRequired,
 	openRoutingRun,
+	readRoutingRunState,
 	recordAttemptOutcome,
 } from "../src/switchyard/simple/routing-state.mjs";
 import { routingTaskIdentityHash } from "../src/switchyard/simple/routing-task-identity.mjs";
@@ -107,6 +109,63 @@ test("task-local failures stay sticky after fallback success without poisoning a
 		"complete",
 	);
 	strictEqual(shared.calls[3], "codex");
+});
+
+test("baseline and environment failures keep the target eligible for the same task", async () => {
+	const environmentFailure = {
+		status: "failed",
+		result: {
+			providerReliability: createProviderReliabilityDiagnostic({
+				causeCode: "environment_failure",
+				phase: "provider",
+			}),
+		},
+	};
+	const environment = fixture({
+		__targets: ["codex", "vibe"],
+		codex: environmentFailure,
+	});
+	environment.options.taskId = "environment-task";
+	const firstEnvironment = await runSimpleRoutingTask(
+		environment.options,
+		environment.deps,
+	);
+	strictEqual(firstEnvironment.direction, "complete");
+	// The task-local skip is exempt, so the replay still routes codex first.
+	const replayEnvironment = await runSimpleRoutingTask(
+		environment.options,
+		environment.deps,
+	);
+	strictEqual(replayEnvironment.direction, "complete");
+	deepStrictEqual(environment.calls, ["codex", "vibe", "codex", "vibe"]);
+	const environmentAttempt = readRoutingRunState(
+		environment.options.projectPath,
+		"run-1",
+		{ stateRoot: environment.deps.stateRoot },
+	).attempts[0];
+	strictEqual(environmentAttempt.terminal, "skipped");
+	strictEqual(environmentAttempt.reason, "environment_failure");
+
+	const baseline = fixture({
+		__targets: ["codex", "vibe"],
+		codex: {
+			status: "failed",
+			result: {
+				failurePhase: "baseline",
+				failureReason: "baseline_check_failed",
+				errorKind: "environment_failure",
+			},
+		},
+	});
+	baseline.options.taskId = "baseline-task";
+	const first = await runSimpleRoutingTask(baseline.options, baseline.deps);
+	strictEqual(first.stopReason, "baseline_failed");
+	strictEqual(first.attempts[0].terminal, "skipped");
+	strictEqual(first.attempts[0].reason, "baseline_failed");
+	deepStrictEqual(first.failedTargetIds, []);
+	const replay = await runSimpleRoutingTask(baseline.options, baseline.deps);
+	strictEqual(replay.stopReason, "baseline_failed");
+	deepStrictEqual(baseline.calls, ["codex", "codex"]);
 });
 
 test("prompt filename, deadline, provider pin and declared-set order do not bypass task binding", async () => {

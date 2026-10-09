@@ -537,6 +537,127 @@ test("trusted typed provider cause without a started writer never enters provide
 	);
 });
 
+test("provider deadline timeout records skipped and stays excluded only for its own task", async () => {
+	const timeout = {
+		status: "failed",
+		result: {
+			providerReliability: createProviderReliabilityDiagnostic({
+				causeCode: "provider_deadline_exceeded",
+				phase: "provider",
+				timedOut: true,
+			}),
+		},
+	};
+	const f = fixture({
+		"antigravity-claude": timeout,
+		codex: { status: "succeeded" },
+	});
+	f.options.taskId = "timeout-task";
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.direction, "complete");
+	deepStrictEqual(f.calls, ["antigravity-claude", "codex"]);
+	const timedOut = first.attempts.find(
+		(attempt) => attempt.targetId === "antigravity-claude",
+	);
+	strictEqual(timedOut.terminal, "skipped");
+	strictEqual(timedOut.reason, "execution_failed");
+	deepStrictEqual(first.failedTargetIds, []);
+
+	// The same logical task must not route to the timed-out target again.
+	const replay = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(replay.direction, "complete");
+	deepStrictEqual(f.calls, ["antigravity-claude", "codex", "codex"]);
+
+	// A different task in the same routing run may still route to it.
+	f.options.taskId = "other-task";
+	const other = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(other.direction, "complete");
+	strictEqual(f.calls[3], "antigravity-claude");
+	deepStrictEqual(f.calls.slice(4), ["codex"]);
+});
+
+test("untyped deadline failureReason also records skipped", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				failureReason: "provider_deadline_exceeded",
+				failurePhase: "execute",
+				errorKind: "execution_failed",
+			},
+		},
+		codex: { status: "succeeded" },
+	});
+	f.options.taskId = "untyped-timeout";
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.direction, "complete");
+	strictEqual(result.attempts[0].terminal, "skipped");
+	deepStrictEqual(result.failedTargetIds, []);
+	deepStrictEqual(f.calls, ["antigravity-claude", "codex"]);
+});
+
+test("memory-eligible provider exit stays failed and excluded run-wide", async () => {
+	const providerReliability = createProviderReliabilityDiagnostic({
+		causeCode: "provider_exit_nonzero",
+		phase: "provider",
+		exitCode: 76,
+	});
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: { providerReliability },
+			record: {
+				lastFailure: {
+					errorKind: "execution_failed",
+					providerReliability,
+					diagnosticCode: "provider_exit_nonzero",
+					diagnosticOrigin: "adapter",
+					diagnosticEvidenceAvailable: true,
+					failurePhase: "provider_execution",
+				},
+			},
+		},
+		codex: { status: "succeeded" },
+	});
+	f.options.taskId = "exit-task";
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.direction, "complete");
+	const failed = first.attempts.find(
+		(attempt) => attempt.targetId === "antigravity-claude",
+	);
+	strictEqual(failed.terminal, "failed");
+	deepStrictEqual(first.failedTargetIds, ["antigravity-claude"]);
+	const replay = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(replay.direction, "complete");
+	deepStrictEqual(replay.failedTargetIds, ["antigravity-claude"]);
+	deepStrictEqual(f.calls, ["antigravity-claude", "codex", "codex"]);
+});
+
+test("pinned target timed out for this task stops as pinned_target_failed", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "provider_deadline_exceeded",
+					phase: "provider",
+					timedOut: true,
+				}),
+			},
+		},
+	});
+	f.options.taskId = "pinned-timeout";
+	f.options.onlyProviders = ["antigravity-claude"];
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.direction, "stop");
+	strictEqual(first.attempts[0].terminal, "skipped");
+	deepStrictEqual(first.failedTargetIds, []);
+	const replay = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(replay.direction, "stop");
+	strictEqual(replay.stopReason, "pinned_target_failed");
+	strictEqual(f.calls.length, 1);
+});
+
 test("typed diagnostic identity ignores key order while preserving mismatched evidence refusal", async () => {
 	const durable = createProviderReliabilityDiagnostic({
 		causeCode: "auth_expired",
