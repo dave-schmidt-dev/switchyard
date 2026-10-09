@@ -193,7 +193,7 @@ describe("source-boundary contract gate mapping", () => {
 
 	it("pins the local Node major and enforces local validation gates", () => {
 		strictEqual(readFileIfPresent(join(ROOT, ".node-version")), "26\n");
-		const prePush = readFileIfPresent(join(ROOT, ".husky/pre-push"));
+		const prePush = readFileIfPresent(join(ROOT, ".githooks/pre-push"));
 		ok(prePush?.includes("npm run validate"));
 		const packageJson = JSON.parse(requireText(join(ROOT, "package.json")));
 		ok(

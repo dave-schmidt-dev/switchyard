@@ -1,3 +1,6 @@
+#!/bin/sh
+set -e
+export PATH="node_modules/.bin:$PATH"
 lint_status=0
 npm run lint || lint_status=$?
 deadcode_status=0

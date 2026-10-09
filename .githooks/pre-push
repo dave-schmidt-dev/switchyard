@@ -1,3 +1,6 @@
+#!/bin/sh
+set -e
+export PATH="node_modules/.bin:$PATH"
 # `validate` is lint + deadcode + the full test suite + roster:coherence.
 # Hooking the named script rather than restating its steps means the hook
 # cannot drift from the gate — which is the failure this hook exists to stop:

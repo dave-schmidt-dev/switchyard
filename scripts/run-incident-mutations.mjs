@@ -18,7 +18,7 @@ const FIXTURE = "tests/fixtures/incident-mutations.json";
 const SAFE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.?\/?)[A-Za-z0-9._/-]+$/u;
 const COPY_ALLOWLIST = Object.freeze([
 	".node-version",
-	".husky/pre-push",
+	".githooks/pre-push",
 	"INVARIANTS.md",
 	"biome.json",
 	"knip.json",
