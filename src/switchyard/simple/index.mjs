@@ -6,14 +6,11 @@ import {
 	mkdirSync,
 	openSync,
 	readFileSync,
-	realpathSync,
-	rmSync,
 	statSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
 	PERSISTED_SIGNALS,
 	sanitizeFailureDetails,
@@ -79,6 +76,7 @@ import {
 import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
 import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { createSimpleRouteSelection } from "./route-selection.mjs";
+import { allocateSimpleRoot, removeInjectedTestRoot } from "./simple-root.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
 const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
@@ -375,15 +373,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					dependencies.executeProvider ||
 					dependencies.runCheck)
 			) {
-				const safeParent =
-					canonicalParent ??
-					realpathSync(dependencies.tmpdir ? dependencies.tmpdir() : tmpdir());
-				if (!worktreeRoot.startsWith(`${safeParent}${sep}`))
-					throw new Error("unsafe workspace root");
-				(dependencies.rmSync ?? rmSync)(worktreeRoot, {
-					recursive: true,
-					force: true,
-				});
+				removeInjectedTestRoot(worktreeRoot, canonicalParent, dependencies);
 			} else {
 				const outcome = await (
 					dependencies.cleanupSimpleWorktree ?? cleanupSimpleWorktree
@@ -987,13 +977,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 
 		currentPhase = "prepare";
 		emitStatus(onStatus, taskId, "prepare");
-		const tempBase =
-			typeof dependencies.tmpdir === "function"
-				? dependencies.tmpdir()
-				: (dependencies.tmpdir ?? tmpdir());
-		canonicalParent = realpathSync(tempBase);
-		candidateChild = `switchyard-simple-${randomUUID()}`;
-		candidatePath = join(canonicalParent, candidateChild);
+		({ canonicalParent, candidateChild, candidatePath } =
+			allocateSimpleRoot(dependencies));
 
 		if (runInitialized) {
 			try {
