@@ -1,8 +1,15 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	homebrewOpenSslConfigs,
 	quickCheckSandboxProfile,
@@ -15,7 +22,7 @@ after(() => rmSync(root, { recursive: true, force: true }));
 
 // Runs a node script under the real quick-check profile with the checker's own
 // environment and returns its parsed JSON report.
-function runConfined(script) {
+function runConfined(script, readOnlyPaths = []) {
 	const clone = join(root, "clone");
 	const runtime = join(root, "runtime");
 	mkdirSync(clone, { recursive: true });
@@ -24,7 +31,7 @@ function runConfined(script) {
 		"/usr/bin/sandbox-exec",
 		[
 			"-p",
-			quickCheckSandboxProfile(clone, runtime),
+			quickCheckSandboxProfile(clone, runtime, readOnlyPaths),
 			process.execPath,
 			"-e",
 			script,
@@ -41,6 +48,30 @@ function runConfined(script) {
 }
 
 describe("quick-check sandbox process and path access", () => {
+	it("imports the sandbox module where the passwd lookup is denied", () => {
+		// Switchyard's own tests import this module inside the check sandbox, where
+		// userInfo() fails; the host account paths must resolve on first use.
+		const modulePath = realpathSync(
+			fileURLToPath(
+				new URL("../src/switchyard/runner/checks-sandbox.mjs", import.meta.url),
+			),
+		);
+		const report = runConfined(
+			`
+let passwd = "ok";
+try { require("node:os").userInfo(); } catch (error) { passwd = error.code; }
+const done = (imported) => process.stdout.write(JSON.stringify({ passwd, imported }));
+import(${JSON.stringify(pathToFileURL(modulePath).href)}).then(
+	(loaded) => done(typeof loaded.quickCheckSandboxProfile),
+	(error) => done(error.code ?? error.message),
+);
+`,
+			[modulePath],
+		);
+		strictEqual(report.passwd, "ERR_SYSTEM_ERROR");
+		strictEqual(report.imported, "function");
+	});
+
 	it("lets checks signal their own process group but not host processes", () => {
 		const report = runConfined(`
 const { spawn } = require("node:child_process");

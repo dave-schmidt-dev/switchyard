@@ -17,6 +17,7 @@ import { classifyExecutionFailure } from "../src/switchyard/simple/provider-invo
 import { createBridgeRequestRecorder } from "../src/switchyard/simple/request-evidence.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { LIFECYCLE_CHECKS } from "../src/switchyard/simple/routing-stop-record.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { fixture as routingFixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -206,7 +207,9 @@ test("severity: setup stops the waterfall, route and ledger failures do not", ()
 
 // -- S7: check-session setup before any baseline check ------------------------
 
-test("a check-session setup throw with no baseline checks is check_setup_failed", async () => {
+test("a check-session setup throw with no baseline checks is check_setup_failed", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = repoFixture();
 	let providerCalls = 0;
 	const result = await runSimpleTask(
@@ -434,7 +437,9 @@ test("a failed result that is not this iteration's own is neither logged nor use
 	strictEqual(records[3].runId, records[2].runId);
 });
 
-test("the real engine's second-call route failure is logged and the stop matches its run", async () => {
+test("the real engine's second-call route failure is logged and the stop matches its run", {
+	skip: nestedSandboxSkip,
+}, async () => {
 	const repo = repoFixture();
 	const stateRoot = realpathSync(
 		tempDir("switchyard-route-phase-failures-state-"),

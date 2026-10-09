@@ -31,10 +31,6 @@ const GIT_ARGS = [
 const HOMEBREW_BIN = "/opt/homebrew/bin";
 const HOMEBREW_ETC = "/opt/homebrew/etc";
 const OPENSSL_SYSTEM_CONFIG = "/private/etc/ssl/openssl.cnf";
-const HOST_HOME = realpathSync(userInfo().homedir);
-const HOST_CARGO_BIN = join(HOST_HOME, ".cargo/bin");
-const HOST_RUSTUP_HOME = join(HOST_HOME, ".rustup");
-const HOST_RUSTUP_TOOLCHAINS = join(HOST_RUSTUP_HOME, "toolchains");
 const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
 // The real xcrun needs xcode-select, the license check and a writable xcrun_db;
 // the sandbox denies all three, so checks get a shim that answers xcrun's query
@@ -79,6 +75,23 @@ while [ "$#" -gt 0 ]; do
 done
 exit 1
 `;
+// The real account home comes from the passwd database and is deliberately
+// independent of $HOME, which callers and checks can point anywhere. It is
+// resolved on first use, never at import: the check sandbox denies the passwd
+// lookup, and Switchyard's own tests import this module inside it.
+let cachedHostPaths;
+function hostPaths() {
+	if (cachedHostPaths) return cachedHostPaths;
+	const home = realpathSync(userInfo().homedir);
+	const rustupHome = join(home, ".rustup");
+	cachedHostPaths = {
+		home,
+		cargoBin: join(home, ".cargo/bin"),
+		rustupHome,
+		rustupToolchains: join(rustupHome, "toolchains"),
+	};
+	return cachedHostPaths;
+}
 function sha(value) {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -108,10 +121,11 @@ function xcodeAppRoot(developer) {
 let selectedRustToolchain;
 function rustToolchainPath() {
 	if (selectedRustToolchain !== undefined) return selectedRustToolchain;
+	const host = hostPaths();
 	selectedRustToolchain = null;
 	let selectionResult = null;
 	for (const candidate of [
-		join(HOST_CARGO_BIN, "rustup"),
+		join(host.cargoBin, "rustup"),
 		join(HOMEBREW_BIN, "rustup"),
 	]) {
 		let executable;
@@ -122,7 +136,7 @@ function rustToolchainPath() {
 		}
 		if (
 			![
-				HOST_CARGO_BIN,
+				host.cargoBin,
 				HOMEBREW_BIN,
 				"/opt/homebrew/Cellar",
 				"/usr/bin",
@@ -131,11 +145,11 @@ function rustToolchainPath() {
 		)
 			continue;
 		const result = spawnSync(executable, ["show", "active-toolchain"], {
-			cwd: HOST_HOME,
+			cwd: host.home,
 			env: {
-				HOME: HOST_HOME,
-				PATH: [HOST_CARGO_BIN, HOMEBREW_BIN, "/usr/bin", "/bin"].join(":"),
-				RUSTUP_HOME: HOST_RUSTUP_HOME,
+				HOME: host.home,
+				PATH: [host.cargoBin, HOMEBREW_BIN, "/usr/bin", "/bin"].join(":"),
+				RUSTUP_HOME: host.rustupHome,
 				RUSTUP_AUTO_INSTALL: "0",
 			},
 			encoding: "utf8",
@@ -157,7 +171,7 @@ function rustToolchainPath() {
 	const selector = selectionResult.stdout.trim().split(/\s+/u)[0];
 	if (!selector || !/^[A-Za-z0-9_.+-]{1,128}$/u.test(selector)) return null;
 	try {
-		const toolchains = realpathSync(HOST_RUSTUP_TOOLCHAINS);
+		const toolchains = realpathSync(host.rustupToolchains);
 		const selected = realpathSync(join(toolchains, selector));
 		if (!selected.startsWith(`${toolchains}/`)) return null;
 		for (const binary of ["cargo", "rustc"]) {
@@ -173,11 +187,12 @@ function rustToolchainPath() {
 // Keep grants at the four fixed roots; never resolve Homebrew or Rust tool
 // symlinks into additional host paths.
 function fixedToolTrees() {
+	const { cargoBin, rustupToolchains } = hostPaths();
 	return [
 		HOMEBREW_BIN,
 		"/opt/homebrew/Cellar",
-		HOST_CARGO_BIN,
-		HOST_RUSTUP_TOOLCHAINS,
+		cargoBin,
+		rustupToolchains,
 	].filter((path) => {
 		try {
 			return lstatSync(path).isDirectory();
@@ -218,6 +233,7 @@ export function homebrewOpenSslConfigs(etcRoot = HOMEBREW_ETC) {
 }
 function safeEnv(home) {
 	home = realpathSync(home);
+	const { cargoBin } = hostPaths();
 	const developer = developerDir();
 	const runtimeBin = join(home, "bin");
 	const cargoHome = join(home, "cargo-home");
@@ -241,7 +257,7 @@ function safeEnv(home) {
 		? [
 				runtimeBin,
 				...(rustBin ? [rustBin] : []),
-				HOST_CARGO_BIN,
+				cargoBin,
 				HOMEBREW_BIN,
 				join(developer, "usr/bin"),
 				join(developer, "Toolchains/XcodeDefault.xctoolchain/usr/bin"),
@@ -251,7 +267,7 @@ function safeEnv(home) {
 		: [
 				runtimeBin,
 				...(rustBin ? [rustBin] : []),
-				HOST_CARGO_BIN,
+				cargoBin,
 				HOMEBREW_BIN,
 				"/usr/bin",
 				"/bin",
