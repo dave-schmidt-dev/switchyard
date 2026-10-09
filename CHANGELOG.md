@@ -6,6 +6,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- `worktree_missing` failure reason: a simple checkout deleted from outside mid-run (for example by a broad `$TMPDIR` delete) now fails with this environment code before provider-health classification, instead of `provider_group_unconfirmed`, and stops the routing run.
+
 - `simple --origin work|qualification` labels qualification canaries separately; ordinary work remains the default, and provider eligibility and lifecycle gates still apply.
 - Simple CLI tasks now bind exact task identity across renamed routing runs; unsafe, failed, pending, retained-partial, or native-latched retries link back to the original run before provider allocation. Use `--task-id` when revised prompt text should keep the same identity.
 - Unrecognized failed-provider exits retain a redacted 4 KiB stderr tail in a new owner-only run artifact; JSON contains only its path, and storage refusal preserves the provider failure.
@@ -36,6 +38,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Simple roots now live in an owner-only `$TMPDIR/switchyard-simple-roots/` parent instead of directly in the shared temp directory; the orphan collector scans both locations, and the broad temp sweep never selects the parent.
+
 - Simple status exposes active task identity, deadline, validated descriptor and observed phase.
 - The simple target/descriptor table, retained-partial and pending-attempt recovery, and best-effort stop logger now live in focused modules; parser and routing-run public exports and runtime behavior are unchanged.
 
@@ -52,6 +56,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - Simple routing now separates hard and soft failures. Failed checks, empty diffs, provider errors, provider-phase environment failures and scope rejections move on to the next eligible tier 1 or tier 2 target (up to four attempts per task) instead of stopping the run; baseline, cleanup, cancellation, input, lock and run-store failures still stop. `native_required` reports whether capacity or task failures exhausted the targets, and every answer lists retained partial worktrees.
 
 ### Fixed
+
+- The test-only direct root removal in simple dispatch now deletes only the exact marked UUID root it allocated; it previously accepted any path under the temp directory. Production never reached it.
 - Switchyard's own tests can run as dispatch checks: `checks-sandbox.mjs` resolves the host account home on first use instead of at import (the sandbox denies the passwd lookup), and the two tests that start the real check engine skip only when `sandbox-exec` cannot nest.
 - Sandboxed checks grant exact reads of every installed Homebrew OpenSSL config (`openssl@<N>/openssl.cnf`) instead of only `openssl@3`, so Node linked against OpenSSL 4 starts inside the check sandbox again; Node checks had failed at startup, which simple dispatch reported as `npm_ci_failed`.
 - Routing-run and task-binding locks reclaim only owners proven dead in the local PID namespace; live, unknown, malformed, unsafe, or replaced ownership remains fail-closed. If both lock releases fail during cleanup, the earlier pending exception is preserved.

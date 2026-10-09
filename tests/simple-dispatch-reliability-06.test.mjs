@@ -26,6 +26,7 @@ import { tempDir } from "./helpers/tempdir.mjs";
 const originalTmpdirEnv = process.env.TMPDIR;
 const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
 const ORIGINAL_REAL_TMPDIR = realpathSync(tmpdir());
+const REAL_SIMPLE_ROOTS = join(ORIGINAL_REAL_TMPDIR, "switchyard-simple-roots");
 function listRealTmpSimpleDirectoryNames(
 	dir = ORIGINAL_REAL_TMPDIR,
 	prefix = "switchyard-simple-",
@@ -156,7 +157,8 @@ after(() => {
 			const recordedPath = record.worktree?.path;
 			if (
 				typeof recordedPath === "string" &&
-				dirname(recordedPath) === ORIGINAL_REAL_TMPDIR &&
+				dirname(recordedPath) ===
+					join(ORIGINAL_REAL_TMPDIR, "switchyard-simple-roots") &&
 				existsSync(recordedPath)
 			)
 				ownRealTmpRoots.push(recordedPath);
@@ -222,7 +224,7 @@ describe("simple local execution path", () => {
 						updateRunWithRetry: async (id, patch) => {
 							if (
 								patch.worktree?.path &&
-								dirname(patch.worktree.path) === ORIGINAL_REAL_TMPDIR
+								dirname(patch.worktree.path) === REAL_SIMPLE_ROOTS
 							)
 								ownedPath = patch.worktree.path;
 							if (patch.worktree?.nonce) ownedNonce = patch.worktree.nonce;
@@ -234,7 +236,7 @@ describe("simple local execution path", () => {
 				const run = await readRun(runId);
 				strictEqual(run.cleanupState, "complete");
 				strictEqual(run.worktree.state, "removed");
-				strictEqual(dirname(ownedPath), ORIGINAL_REAL_TMPDIR);
+				strictEqual(dirname(ownedPath), REAL_SIMPLE_ROOTS);
 				strictEqual(existsSync(ownedPath), false);
 				strictEqual(existsSync(run.worktree.path), false);
 				ok(
@@ -253,7 +255,7 @@ describe("simple local execution path", () => {
 				// A failing assertion must not leave this test's real TMPDIR root behind.
 				if (
 					ownedPath &&
-					dirname(ownedPath) === ORIGINAL_REAL_TMPDIR &&
+					dirname(ownedPath) === REAL_SIMPLE_ROOTS &&
 					/^switchyard-simple-[0-9a-f-]{36}$/u.test(basename(ownedPath))
 				)
 					rmSync(ownedPath, { recursive: true, force: true });

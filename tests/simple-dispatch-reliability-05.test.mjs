@@ -57,6 +57,7 @@ function assertNoLeakedSimpleRoots(initialSnapshot, currentEntries, prefix) {
 const initialRealTmpSimpleRoots =
 	listRealTmpSimpleDirectoryNames(ORIGINAL_REAL_TMPDIR);
 const SUITE_TMPDIR = realpathSync(tempDir("switchyard-suite-tmp-"));
+const SUITE_SIMPLE_ROOTS = join(SUITE_TMPDIR, "switchyard-simple-roots");
 process.env.TMPDIR = SUITE_TMPDIR;
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(SUITE_TMPDIR, "run-store");
 
@@ -165,7 +166,8 @@ after(() => {
 			const recordedPath = record.worktree?.path;
 			if (
 				typeof recordedPath === "string" &&
-				dirname(recordedPath) === ORIGINAL_REAL_TMPDIR &&
+				dirname(recordedPath) ===
+					join(ORIGINAL_REAL_TMPDIR, "switchyard-simple-roots") &&
 				existsSync(recordedPath)
 			)
 				ownRealTmpRoots.push(recordedPath);
@@ -308,8 +310,11 @@ describe("simple local execution path", () => {
 						}
 						if (patch.worktree) {
 							const root = written.worktree;
-							strictEqual(root.canonicalParent, SUITE_TMPDIR);
-							strictEqual(root.path, join(SUITE_TMPDIR, root.candidateChild));
+							strictEqual(root.canonicalParent, SUITE_SIMPLE_ROOTS);
+							strictEqual(
+								root.path,
+								join(SUITE_SIMPLE_ROOTS, root.candidateChild),
+							);
 							strictEqual(existsSync(root.path), root.state === "active");
 							order.push(root.state);
 						}
@@ -350,7 +355,7 @@ describe("simple local execution path", () => {
 			);
 			strictEqual(result.status, "succeeded");
 			const run = await readRun(runId);
-			strictEqual(run.worktree.canonicalParent, SUITE_TMPDIR);
+			strictEqual(run.worktree.canonicalParent, SUITE_SIMPLE_ROOTS);
 			strictEqual(run.worktree.state, "removed");
 			strictEqual(existsSync(run.worktree.path), false);
 		});

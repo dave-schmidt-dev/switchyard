@@ -1,6 +1,7 @@
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { SIMPLE_ROOTS_DIRNAME } from "../src/switchyard/simple/simple-root.mjs";
 import { cleanupSimpleWorktree } from "../src/switchyard/simple/worktree-cleanup.mjs";
 
 function simplePathHeld(path, heldPaths) {
@@ -59,17 +60,38 @@ export async function sweepSimpleOrphans({
 		return { status: 1, summary };
 	}
 
+	// Current roots live in the owned parent; older runs left theirs directly
+	// in the temp directory. Both levels are scanned, never the parent itself.
+	const parents = [canonicalTmp];
+	const ownedParent = join(canonicalTmp, SIMPLE_ROOTS_DIRNAME);
+	try {
+		const ownedStat = lstatSync(ownedParent);
+		if (
+			ownedStat.isDirectory() &&
+			!ownedStat.isSymbolicLink() &&
+			realpathSync(ownedParent) === ownedParent
+		)
+			parents.push(ownedParent);
+	} catch {}
+	const canonicalRoots = [];
 	let names;
 	try {
 		names = readdirSync(canonicalTmp);
+		for (const parent of parents) {
+			const entries = parent === canonicalTmp ? names : readdirSync(parent);
+			for (const name of entries)
+				if (SIMPLE_ROOT_RE.test(name)) canonicalRoots.push({ parent, name });
+		}
 	} catch {
 		log("simple-orphans: cannot read temp directory; refusing collection");
 		return { status: 1, summary };
 	}
-	const canonicalRoots = names.filter((name) => SIMPLE_ROOT_RE.test(name));
 	summary.candidates = canonicalRoots.length;
 	summary.legacyInventory = names.filter(
-		(name) => name.startsWith(SIMPLE_PREFIX) && !SIMPLE_ROOT_RE.test(name),
+		(name) =>
+			name.startsWith(SIMPLE_PREFIX) &&
+			name !== SIMPLE_ROOTS_DIRNAME &&
+			!SIMPLE_ROOT_RE.test(name),
 	).length;
 	const cutoffMs = now - SIMPLE_ORPHAN_TTL_MS;
 	progress(`simple-orphans: scanning uuid roots=${canonicalRoots.length}`);
@@ -80,8 +102,8 @@ export async function sweepSimpleOrphans({
 				`simple-orphans: progress rootsChecked=${index}/${canonicalRoots.length}`,
 			);
 		}
-		const name = canonicalRoots[index];
-		const path = join(canonicalTmp, name);
+		const { parent, name } = canonicalRoots[index];
+		const path = join(parent, name);
 		let rootStat;
 		let owner;
 		let canonicalPath;
@@ -102,7 +124,7 @@ export async function sweepSimpleOrphans({
 			canonicalPath = realpathSync(path);
 			if (
 				canonicalPath !== path ||
-				dirname(canonicalPath) !== canonicalTmp ||
+				dirname(canonicalPath) !== parent ||
 				basename(canonicalPath) !== name
 			) {
 				summary.refused += 1;
@@ -218,7 +240,7 @@ export async function sweepSimpleOrphans({
 				continue;
 			}
 			const claim = {
-				canonicalParent: canonicalTmp,
+				canonicalParent: parent,
 				candidateChild: name,
 				path: canonicalPath,
 				device: String(rootStat.dev),

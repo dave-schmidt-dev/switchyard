@@ -164,7 +164,8 @@ after(() => {
 			const recordedPath = record.worktree?.path;
 			if (
 				typeof recordedPath === "string" &&
-				dirname(recordedPath) === ORIGINAL_REAL_TMPDIR &&
+				dirname(recordedPath) ===
+					join(ORIGINAL_REAL_TMPDIR, "switchyard-simple-roots") &&
 				existsSync(recordedPath)
 			)
 				ownRealTmpRoots.push(recordedPath);

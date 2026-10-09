@@ -180,6 +180,7 @@ const ORACLE_CLOSED_CAUSE_CODES = new Map([
 	["project_lock_owner_dead", "project_lock_owner_dead"],
 	["declared_path_has_owner_edits", "declared_path_has_owner_edits"],
 	["worktree_allocation_failed", "worktree_allocation_failed"],
+	["worktree_missing", "worktree_missing"],
 	["worktree_ownership_failed", "worktree_ownership_failed"],
 	["git_control_tampered", "git_control_tampered"],
 	["target_identity_unavailable", "target_identity_unavailable"],
@@ -306,6 +307,8 @@ const ORACLE_HARD_CODES = new Set([
 	"project_lock_failed",
 	// Task 2.7: a candidate-changed dependency manifest stops the run.
 	"check_manifest_changed_by_diff",
+	// A vanished disposable checkout stops the run without blaming the provider.
+	"worktree_missing",
 ]);
 const ORACLE_HARD_UNTYPED = new Set([
 	...ORACLE_HARD_CODES,
@@ -394,6 +397,7 @@ const ORACLE_CODE_CATEGORY = new Map([
 	["input_rejected", "input"],
 	["declared_path_has_owner_edits", "input"],
 	["worktree_allocation_failed", "environment"],
+	["worktree_missing", "environment"],
 	["worktree_ownership_failed", "cleanup"],
 	["git_control_tampered", "environment"],
 	["target_identity_unavailable", "environment"],

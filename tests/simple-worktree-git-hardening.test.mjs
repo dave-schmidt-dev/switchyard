@@ -132,9 +132,17 @@ function throwsTamper(fn, kind, area) {
 }
 
 function leakedSimpleRoots() {
-	return readdirSync(SUITE_TMPDIR).filter((name) =>
-		name.startsWith("switchyard-simple-"),
-	);
+	const owned = join(SUITE_TMPDIR, "switchyard-simple-roots");
+	return [
+		...readdirSync(SUITE_TMPDIR).filter(
+			(name) =>
+				name.startsWith("switchyard-simple-") &&
+				name !== "switchyard-simple-roots",
+		),
+		...(existsSync(owned)
+			? readdirSync(owned).map((name) => join("switchyard-simple-roots", name))
+			: []),
+	];
 }
 
 afterEach(() => {

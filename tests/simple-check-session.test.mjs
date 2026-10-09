@@ -225,7 +225,7 @@ test("cancelled preparation never launches provider and cleans owned root", asyn
 	strictEqual(observed.result.status, "failed");
 	strictEqual(observed.result.failureReason, "provider_cancelled");
 	strictEqual(
-		readdirSync(repo.root).some((name) =>
+		readdirSync(join(repo.root, "switchyard-simple-roots")).some((name) =>
 			name.startsWith("switchyard-simple-"),
 		),
 		false,

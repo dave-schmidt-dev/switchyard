@@ -143,6 +143,10 @@ export const SNAPSHOT_HARD_CODES = new Set([
 	// Task 2.7: a candidate changed the dependency manifest the checks run
 	// against, so the run stops instead of blaming the host baseline.
 	"check_manifest_changed_by_diff",
+	// The disposable checkout vanished under a live run (2026-10-09: a shared
+	// $TMPDIR wipe). An outside deletion is not the provider's fault, and a
+	// retry would race the same deletion, so the routing run stops.
+	"worktree_missing",
 ]);
 export const SNAPSHOT_HARD_UNTYPED = new Set([
 	...SNAPSHOT_HARD_CODES,
@@ -184,6 +188,7 @@ const CLOSED_CAUSE_CODES = new Map([
 	["project_lock_owner_dead", "project_lock_owner_dead"],
 	["declared_path_has_owner_edits", "declared_path_has_owner_edits"],
 	["worktree_allocation_failed", "worktree_allocation_failed"],
+	["worktree_missing", "worktree_missing"],
 	["worktree_ownership_failed", "worktree_ownership_failed"],
 	["git_control_tampered", "git_control_tampered"],
 	["target_identity_unavailable", "target_identity_unavailable"],

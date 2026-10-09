@@ -76,7 +76,11 @@ import {
 import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
 import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { createSimpleRouteSelection } from "./route-selection.mjs";
-import { allocateSimpleRoot, removeInjectedTestRoot } from "./simple-root.mjs";
+import {
+	allocateSimpleRoot,
+	removeInjectedTestRoot,
+	simpleRootMissing,
+} from "./simple-root.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
 const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
@@ -163,6 +167,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let providerLifecycle = null;
 	let providerVerdictCode = null;
 	let writerLifecycle = "never_started";
+	// Set once the disposable root is gone while the run still owns it.
+	let worktreeVanished = false;
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
 	let worktreeIdentity = null;
@@ -363,6 +369,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let cleanupAttempted = false;
 	const removeNonSalvageWorktree = async () => {
 		if (cleanupAttempted || !worktreeRoot) return !worktreeRoot;
+		if (worktreeVanished && simpleRootMissing(worktreeRoot)) {
+			// Nothing remains to remove or retain; an outside deletion owns it.
+			worktreePath = null;
+			worktreeRoot = null;
+			return true;
+		}
 		cleanupAttempted = true;
 		try {
 			// Injected provider/check tests normally use the direct cleanup seam;
@@ -373,7 +385,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 					dependencies.executeProvider ||
 					dependencies.runCheck)
 			) {
-				removeInjectedTestRoot(worktreeRoot, canonicalParent, dependencies);
+				removeInjectedTestRoot(
+					worktreeRoot,
+					canonicalParent,
+					candidateChild,
+					dependencies,
+				);
 			} else {
 				const outcome = await (
 					dependencies.cleanupSimpleWorktree ?? cleanupSimpleWorktree
@@ -527,6 +544,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 		) {
 			keepWorktree = true;
 		}
+		// A root deleted from outside has nothing left to salvage or retain.
+		if (worktreeVanished && simpleRootMissing(worktreeRoot))
+			keepWorktree = false;
 		if (keepWorktree && worktreePath) {
 			milestone(failurePhase, "salvage_retained");
 		}
@@ -1414,6 +1434,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return await cancelAdmission(admission, "provider_cancelled");
 		if (executionBudget <= 0)
 			return await cancelAdmission(admission, "deadline_expired");
+		if (simpleRootMissing(candidatePath)) {
+			worktreeVanished = true;
+			return await cancelAdmission(admission, "worktree_missing");
+		}
 		let providerResult;
 		let requestLogStatus;
 		let providerStartedWriteFailure = null;
@@ -1497,10 +1521,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 			"never_started",
 			providerResult?.writerLifecycle,
 		);
+		// A root deleted from outside makes every later probe fail; classify it
+		// before route health so the provider is not charged for it.
+		worktreeVanished = simpleRootMissing(candidatePath);
 		const providerAttemptReliability = providerResult?.success
 			? null
 			: createSimpleProviderReliabilityDiagnostic({
-					failureReason: classifyExecutionFailure(providerResult),
+					failureReason: worktreeVanished
+						? "worktree_missing"
+						: classifyExecutionFailure(providerResult),
 					failurePhase: "execute",
 					providerResult,
 					baselineStatus,
@@ -1529,6 +1558,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return fail(requestLogStatus.error, "execute");
 
 		if (signal?.aborted) return failForSignal("execute");
+		if (worktreeVanished) return fail("worktree_missing", "execute");
 		if (
 			(!dependencies.runCheck || executeProvider === defaultExecuteProvider) &&
 			writerLifecycle === "unavailable"
@@ -1643,6 +1673,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		let capturedDiff = captured;
 		for (let pass = 0; pass < 2; pass += 1) {
 			if (checkSessions) {
+				if (simpleRootMissing(candidatePath)) {
+					worktreeVanished = true;
+					return fail("worktree_missing", "checks");
+				}
 				if (writerLifecycle !== "stopped")
 					return fail("provider_group_unconfirmed", "checks", "cleanup_failed");
 				if (options.checks.length > 0) {
@@ -2037,10 +2071,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 					"never_started",
 					correction?.writerLifecycle,
 				);
+				worktreeVanished = simpleRootMissing(candidatePath);
 				const correctionAttemptReliability = correction?.success
 					? null
 					: createSimpleProviderReliabilityDiagnostic({
-							failureReason: classifyExecutionFailure(correction),
+							failureReason: worktreeVanished
+								? "worktree_missing"
+								: classifyExecutionFailure(correction),
 							failurePhase: "execute",
 							providerResult: correction,
 							baselineStatus,
@@ -2066,6 +2103,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				if (correction?.success && correctionLogStatus?.error)
 					return fail(correctionLogStatus.error, "repair");
 				if (signal?.aborted) return failForSignal("repair");
+				if (worktreeVanished) return fail("worktree_missing", "repair");
 				if (
 					writerLifecycle !== "stopped" ||
 					(repairHealthStart.tracked === true &&
