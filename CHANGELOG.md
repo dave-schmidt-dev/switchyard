@@ -57,6 +57,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- Simple routing no longer starts another provider after a failed or timed-out attempt when less than two minutes of the task deadline remain (or a tenth of the task's initial budget, if that is smaller). It stops with that attempt's outcome, so a provider launched with seconds left no longer fails at once and counts against route health. The first attempt always starts.
 - The test-only direct root removal in simple dispatch now deletes only the exact marked UUID root it allocated; it previously accepted any path under the temp directory. Production never reached it.
 - A provider deadline timeout in simple routing now excludes its target only for the task that timed out: the attempt records `skipped`, not `failed`, so later tasks in the same routing run can still use the target. Baseline, environment and lifecycle-recovery attempts never exclude a target from its own task, and a pinned run whose only target already timed out for this task stops as `pinned_target_failed`.
 - Switchyard's own tests can run as dispatch checks: `checks-sandbox.mjs` resolves the host account home on first use instead of at import (the sandbox denies the passwd lookup), and the tests that start `sandbox-exec`, directly or through the real check engine, skip only when it cannot nest.

@@ -45,6 +45,32 @@ import {
 
 export const MAX_SOFT_ATTEMPTS_PER_TASK = 4;
 
+/**
+ * Floor below which a failed or skipped attempt must not reroute. Starting a
+ * fresh provider with only seconds of task budget left burns a baseline and a
+ * provider start to fail immediately, so the loop stops with the attempt's own
+ * outcome instead. The floor is capped at a tenth of the task's initial budget
+ * so short tasks keep their fallbacks.
+ */
+const MIN_REROUTE_BUDGET_MS = 120_000;
+
+/**
+ * True when a failed or skipped attempt must not reroute to another target:
+ * the deadline has passed, or the remaining budget is below the reroute floor
+ * derived from the budget captured when the task started. A non-finite deadline
+ * has no finite budget to protect and never trips the floor.
+ */
+function rerouteBudgetExhausted(options, initialBudgetMs, now) {
+	if (!Number.isFinite(options.deadlineMs)) return false;
+	const remainingMs = options.deadlineMs - now();
+	if (remainingMs <= 0) return true;
+	const rerouteFloorMs = Math.min(
+		MIN_REROUTE_BUDGET_MS,
+		Math.ceil(0.1 * initialBudgetMs),
+	);
+	return remainingMs < rerouteFloorMs;
+}
+
 const FUNDING_UNAVAILABLE = new Set([
 	"paid_overage_not_allowed",
 	"included_usage_unverified",
@@ -103,6 +129,9 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 		});
 	}
 	const now = deps.now ?? Date.now;
+	// Captured once before any target starts so the reroute floor reflects the
+	// budget the task was given, not the time left by the first failure.
+	const initialBudgetMs = options.deadlineMs - now();
 	const suppliedId = options.routingRunId;
 	const environmentId = process.env.SWITCHYARD_ROUTING_RUN_ID;
 	const routingRunId = suppliedId ?? environmentId ?? randomUUID();
@@ -646,10 +675,11 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					classification,
 				});
 			}
-			// A cancelled or expired invocation keeps this attempt's own outcome.
+			// A cancelled invocation, an expired deadline, or too little budget
+			// left to start another provider keeps this attempt's own outcome.
 			if (
 				deps.signal?.aborted ||
-				(Number.isFinite(options.deadlineMs) && options.deadlineMs <= now())
+				rerouteBudgetExhausted(options, initialBudgetMs, now)
 			)
 				return answer("stop", {
 					stopReason: classification.reason,
