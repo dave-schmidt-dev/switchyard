@@ -4,6 +4,7 @@ import {
 	existsSync,
 	lstatSync,
 	mkdirSync,
+	readdirSync,
 	readlinkSync,
 	realpathSync,
 	writeFileSync,
@@ -28,6 +29,7 @@ const GIT_ARGS = [
 	"filter.lfs.required=false",
 ];
 const HOMEBREW_BIN = "/opt/homebrew/bin";
+const HOMEBREW_ETC = "/opt/homebrew/etc";
 const OPENSSL_SYSTEM_CONFIG = "/private/etc/ssl/openssl.cnf";
 const HOST_HOME = realpathSync(userInfo().homedir);
 const HOST_CARGO_BIN = join(HOST_HOME, ".cargo/bin");
@@ -183,6 +185,36 @@ function fixedToolTrees() {
 			return false;
 		}
 	});
+}
+/**
+ * Every installed Homebrew OpenSSL config (`<etc>/openssl/openssl.cnf` and
+ * `<etc>/openssl@<version>/openssl.cnf`) that is a regular file, sorted.
+ *
+ * Homebrew's Node links whichever OpenSSL major its formula pins (openssl@3,
+ * then openssl@4) and aborts at startup when it cannot read that config, so the
+ * list is enumerated rather than hard-coded. Callers grant each path as a
+ * literal file, never its directory, so `private/` and `certs/` stay denied.
+ * @param {string} [etcRoot]
+ * @returns {string[]}
+ */
+export function homebrewOpenSslConfigs(etcRoot = HOMEBREW_ETC) {
+	let names;
+	try {
+		names = readdirSync(etcRoot);
+	} catch {
+		return [];
+	}
+	return names
+		.filter((name) => /^openssl(@\d+(\.\d+)*)?$/u.test(name))
+		.sort()
+		.map((name) => join(etcRoot, name, "openssl.cnf"))
+		.filter((path) => {
+			try {
+				return lstatSync(path).isFile();
+			} catch {
+				return false;
+			}
+		});
 }
 function safeEnv(home) {
 	home = realpathSync(home);
@@ -453,7 +485,6 @@ export function quickCheckSandboxProfile(
 		"/dev",
 		"/opt/homebrew/Cellar",
 		"/opt/homebrew/opt",
-		"/opt/homebrew/etc/openssl@3/openssl.cnf",
 		nodeRoot,
 		npmRoot,
 		...fixedToolTrees(),
@@ -468,6 +499,7 @@ export function quickCheckSandboxProfile(
 	// its versioned interpreter dir) needs the link itself readable to resolve.
 	const readLiterals = [
 		OPENSSL_SYSTEM_CONFIG,
+		...homebrewOpenSslConfigs(),
 		...readOnlyPaths.filter(
 			(path) => isAbsolute(path) && lstatSync(path).isSymbolicLink(),
 		),

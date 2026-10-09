@@ -1,9 +1,10 @@
-import { strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
+	homebrewOpenSslConfigs,
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../src/switchyard/runner/checks-sandbox.mjs";
@@ -73,5 +74,65 @@ process.stdout.write(JSON.stringify({ stdout: shell.stdout, stderr: shell.stderr
 		strictEqual(report.stderr, "");
 		strictEqual(report.resolved, true);
 		strictEqual(report.varLink, "symlink");
+	});
+
+	it("enumerates Homebrew OpenSSL configs as files, for any major", () => {
+		const etc = join(root, "homebrew-etc");
+		for (const file of [
+			"openssl@3/openssl.cnf",
+			"openssl@4/openssl.cnf",
+			"openssl@4/private/key.pem",
+			"opensslx/openssl.cnf",
+		]) {
+			mkdirSync(dirname(join(etc, file)), { recursive: true });
+			writeFileSync(join(etc, file), "fixture\n");
+		}
+		deepStrictEqual(homebrewOpenSslConfigs(etc), [
+			join(etc, "openssl@3/openssl.cnf"),
+			join(etc, "openssl@4/openssl.cnf"),
+		]);
+		deepStrictEqual(homebrewOpenSslConfigs(join(root, "no-such-etc")), []);
+	});
+
+	it("grants each installed OpenSSL config as a literal file and denies its private dir", (t) => {
+		const configs = homebrewOpenSslConfigs();
+		if (!configs.length) {
+			t.skip("no Homebrew OpenSSL config on this host");
+			return;
+		}
+		const profile = quickCheckSandboxProfile(
+			join(root, "clone"),
+			join(root, "runtime"),
+		);
+		const subpaths = [
+			...profile.matchAll(/\(subpath ("(?:[^"\\]|\\.)*")\)/gu),
+		].map((match) => JSON.parse(match[1]));
+		for (const config of configs) {
+			ok(profile.includes(`(literal ${JSON.stringify(config)})`), config);
+			const denied = join(dirname(config), "private");
+			const covering = subpaths.filter(
+				(path) =>
+					path === denied ||
+					denied.startsWith(path.endsWith("/") ? path : `${path}/`),
+			);
+			deepStrictEqual(covering, [], `${denied} is readable`);
+		}
+		const privateDirs = configs
+			.map((config) => join(dirname(config), "private"))
+			.filter((path) => existsSync(path));
+		const report = runConfined(`
+const fs = require("node:fs");
+const attempt = (read) => { try { read(); return "ok"; } catch (error) { return error.code; } };
+process.stdout.write(JSON.stringify({
+	configs: ${JSON.stringify(configs)}.map((path) => attempt(() => fs.readFileSync(path))),
+	privateDirs: ${JSON.stringify(privateDirs)}.map((path) => attempt(() => fs.readdirSync(path))),
+}));
+`);
+		deepStrictEqual(
+			report.configs,
+			configs.map(() => "ok"),
+		);
+		for (const code of report.privateDirs)
+			ok(["EPERM", "EACCES"].includes(code), code);
 	});
 });
