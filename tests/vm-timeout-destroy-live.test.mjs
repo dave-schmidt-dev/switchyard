@@ -27,6 +27,32 @@ const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 
+// The test reporter drops cause, so include the chain in a diagnostic.
+function describeCauseChain(error) {
+	const levels = [];
+	let current = error;
+	for (let level = 0; level < 4; level += 1) {
+		if (current instanceof Error) {
+			const name =
+				typeof current.name === "string" && current.name
+					? current.name
+					: "Error";
+			const code = typeof current.code === "string" ? ` ${current.code}` : "";
+			const message =
+				typeof current.message === "string"
+					? current.message.split(/\r?\n/u, 1)[0].slice(0, 300)
+					: "";
+			levels.push(`${name}${code}: ${message}`);
+		} else {
+			levels.push(String(current).slice(0, 300));
+		}
+		if (current === null || current === undefined) break;
+		current = current.cause;
+		if (current === undefined) break;
+	}
+	return levels.join(" <- ");
+}
+
 function commandAvailable(command) {
 	try {
 		execFileSync("/usr/bin/which", [command], {
@@ -241,59 +267,65 @@ describe("VM timeout and clone destroy (live)", () => {
 				"claude",
 			);
 
-			const queueResult = await runQueueAsync({
-				tasksFilePath,
-				projectPath: projectDir,
-				checkpointPath,
-				stopOnFailure: false,
-				platform: "macos",
-				runId,
-				dependencies: {
-					executionBackend: backend,
-					acquireSlot: () => slotLease,
-					releaseSlot: () => {
-						if (typeof slotLease?.release === "function") slotLease.release();
-						else slotPrimitive.release(slotLease);
-						slotLease = null;
-					},
-					queuePreflight: () => ({ ok: true, eligible: true }),
-					hostPowerProbe: () => ({ state: "ac" }),
-					route: () => ({
-						provider: "claude",
-						resolved_harness: "claude",
-						resolvedTargetId: "claude-code",
-						model: descriptor.selector,
-						invocationDescriptor: descriptor,
-					}),
-					resolveDescriptor: () => descriptor,
-					resolveTargetIdentity: () => ({
-						targetId: "claude-code",
-						harnessKey: "claude",
-						ambiguous: false,
-					}),
-					adapters: {
-						claude: {
-							executeAsync: async (_prompt, container, options) => {
-								cloneHandle = container;
-								const { command, args } = getWorkspaceExecution(container, {
-									...options,
-									argv: ["/bin/sleep", "30"],
-									recordPid: true,
-								});
-								return await executeProviderInvocation(command, args, {
-									...options,
-									provider: "claude",
-									timeoutMs: 1500,
-								});
+			let queueResult;
+			try {
+				queueResult = await runQueueAsync({
+					tasksFilePath,
+					projectPath: projectDir,
+					checkpointPath,
+					stopOnFailure: false,
+					platform: "macos",
+					runId,
+					dependencies: {
+						executionBackend: backend,
+						acquireSlot: () => slotLease,
+						releaseSlot: () => {
+							if (typeof slotLease?.release === "function") slotLease.release();
+							else slotPrimitive.release(slotLease);
+							slotLease = null;
+						},
+						queuePreflight: () => ({ ok: true, eligible: true }),
+						hostPowerProbe: () => ({ state: "ac" }),
+						route: () => ({
+							provider: "claude",
+							resolved_harness: "claude",
+							resolvedTargetId: "claude-code",
+							model: descriptor.selector,
+							invocationDescriptor: descriptor,
+						}),
+						resolveDescriptor: () => descriptor,
+						resolveTargetIdentity: () => ({
+							targetId: "claude-code",
+							harnessKey: "claude",
+							ambiguous: false,
+						}),
+						adapters: {
+							claude: {
+								executeAsync: async (_prompt, container, options) => {
+									cloneHandle = container;
+									const { command, args } = getWorkspaceExecution(container, {
+										...options,
+										argv: ["/bin/sleep", "30"],
+										recordPid: true,
+									});
+									return await executeProviderInvocation(command, args, {
+										...options,
+										provider: "claude",
+										timeoutMs: 1500,
+									});
+								},
+								captureDiffAsync: async () => null,
 							},
-							captureDiffAsync: async () => null,
+						},
+						onContainerReady: ({ workingContainerName }) => {
+							cloneHandle = workingContainerName;
 						},
 					},
-					onContainerReady: ({ workingContainerName }) => {
-						cloneHandle = workingContainerName;
-					},
-				},
-			});
+				});
+			} catch (error) {
+				testContext.diagnostic(`cause chain: ${describeCauseChain(error)}`);
+				throw error;
+			}
 
 			ok(queueResult, "the queue must end");
 			strictEqual(
