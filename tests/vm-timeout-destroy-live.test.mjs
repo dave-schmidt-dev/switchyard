@@ -21,13 +21,14 @@ import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { initializeRun } from "../src/switchyard/run-store/index.mjs";
 import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
+import { redactCredentialTokens } from "../src/switchyard/simple/check-environment.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 
-// The test reporter drops cause, so include the chain in a diagnostic.
+// The test reporter drops cause, so include the redacted chain in a diagnostic.
 function describeCauseChain(error) {
 	const levels = [];
 	let current = error;
@@ -40,11 +41,16 @@ function describeCauseChain(error) {
 			const code = typeof current.code === "string" ? ` ${current.code}` : "";
 			const message =
 				typeof current.message === "string"
-					? current.message.split(/\r?\n/u, 1)[0].slice(0, 300)
+					? redactCredentialTokens(current.message)
+							.toString("utf8")
+							.split(/\r?\n/u, 1)[0]
+							.slice(0, 300)
 					: "";
 			levels.push(`${name}${code}: ${message}`);
 		} else {
-			levels.push(String(current).slice(0, 300));
+			levels.push(
+				redactCredentialTokens(String(current)).toString("utf8").slice(0, 300),
+			);
 		}
 		if (current === null || current === undefined) break;
 		current = current.cause;
