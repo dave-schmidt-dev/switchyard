@@ -36,6 +36,7 @@ import {
 	hostToGuestProbeScript,
 	mintSentinel,
 } from "./helpers/clipboard-probe.mjs";
+import { runOnInterrupt } from "./helpers/interrupt-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
@@ -249,6 +250,7 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 		let vmName;
 		let originalClipboard;
 		let manifest;
+		let disposeInterruptCleanup;
 		const resourceRoot = tempDir("switchyard-inv1-ownership-");
 
 		try {
@@ -301,6 +303,10 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 			backend.assertGoldenImageAvailable(GOLDEN_IMAGE);
 			const runId = `inv1-${process.pid}-${randomUUID()}`;
 			vmName = buildParallelsWorkingName(runId, process.pid);
+			// finally does not run when the runner signals this process.
+			disposeInterruptCleanup = runOnInterrupt(() => {
+				if (backend && vmUuid && vmName) backend.rollback(vmName, vmUuid);
+			});
 			progress("creating and booting a full-copy working VM");
 			vmUuid = backend.create(GOLDEN_IMAGE, {
 				runId,
@@ -522,6 +528,7 @@ describe("no host rights — Parallels VM (INV-1)", () => {
 					backend.rollback(vmName, vmUuid);
 				}
 			} finally {
+				disposeInterruptCleanup?.();
 				if (slotLease !== undefined && slotLease !== null) {
 					if (typeof slotLease.release === "function")
 						await slotLease.release();
