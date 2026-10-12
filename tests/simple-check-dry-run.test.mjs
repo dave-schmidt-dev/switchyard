@@ -253,6 +253,22 @@ test("each environment signature fails the attempt with its own evidence", async
 	}
 });
 
+test("an unchanged Git alternate failure stops before provider execution", async () => {
+	const repo = repoFixture();
+	const command =
+		'sh -c "echo error: unable to normalize alternate object path: /host/project/.git/objects; echo fatal: unable to read 0123456789abcdef0123456789abcdef01234567; exit 128"';
+	const { result, providerCalls } = await runTask(repo, { checks: [command] });
+	strictEqual(providerCalls, 0);
+	strictEqual(result.failureReason, "check_environment_failed");
+	strictEqual(result.failurePhase, "baseline");
+	strictEqual(result.providerStarted, false);
+	strictEqual(
+		(await readRun(result.runId)).failureDetails.checkEnvironmentSignature,
+		"sandbox_denial",
+	);
+	deepStrictEqual(checkerDirectories(repo.root), []);
+});
+
 test("a check that fails on the base tree for an ordinary reason proceeds to the provider", async () => {
 	const repo = repoFixture();
 	const { result, providerCalls } = await runTask(repo);

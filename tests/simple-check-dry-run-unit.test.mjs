@@ -71,6 +71,24 @@ test("the exit-69 licence rule applies in the dry run", () => {
 	);
 });
 
+test("an inaccessible Git alternate is a pre-provider sandbox failure only", () => {
+	const output =
+		"error: unable to normalize alternate object path: /host/project/.git/objects\n" +
+		"fatal: unable to read 0123456789abcdef0123456789abcdef01234567";
+	strictEqual(
+		classifyCheckEnvironmentFailure({ exitCode: 128, output }),
+		"sandbox_denial",
+	);
+	strictEqual(
+		classifyCheckEnvironmentFailure({
+			exitCode: 128,
+			output,
+			preProvider: false,
+		}),
+		null,
+	);
+});
+
 test("a failed check classifies from the evidence tail, never on pass or timeout", () => {
 	const failed = { success: false, code: 1 };
 	strictEqual(classifyFailedCheck({ success: true, code: 127 }), null);

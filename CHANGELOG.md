@@ -106,6 +106,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- Simple check-session clones dissociate from the host Git object store before sandboxed checks; an unchanged inaccessible-alternate failure is classified before provider launch instead of entering content repair.
 - Mocked queue regression tests use deterministic availability rather than live provider quota.
 - Simple acceptance checks now run in fresh disposable checkers outside the provider workspace, with offline provisioning of unchanged locked Node dependencies and fail-closed refusal when required tools or cache entries are unavailable.
 - Guarded Vibe, Vibe Code, and OpenCode launchers refuse unavailable sandbox environments before provider or broker start.

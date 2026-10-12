@@ -213,6 +213,66 @@ describe("quick-check runner profile command", { skip: darwinSkip }, () => {
 });
 
 describe("check session profile command", { skip: darwinSkip }, () => {
+	it("dissociates the checker object store before confined Git checks", async () => {
+		const repo = project();
+		const linkedPath = join(repo.root, "linked-project");
+		git(repo.path, [
+			"clone",
+			"--shared",
+			"--quiet",
+			"--",
+			repo.path,
+			linkedPath,
+		]);
+		ok(existsSync(join(linkedPath, ".git/objects/info/alternates")));
+		const baselinePath = join(repo.root, "baseline-checker");
+		git(linkedPath, [
+			"clone",
+			"--shared",
+			"--quiet",
+			"--",
+			linkedPath,
+			baselinePath,
+		]);
+		git(baselinePath, ["checkout", "--detach", "--quiet", "HEAD"]);
+		writeFileSync(
+			join(baselinePath, "Sources/Fix/Fix.swift"),
+			"public func fix() -> Int { 2 }\n",
+		);
+		const baselineRuntime = join(repo.root, "baseline-runtime");
+		mkdirSync(baselineRuntime);
+		const baseline = spawnSync(
+			"/usr/bin/sandbox-exec",
+			[
+				"-p",
+				quickCheckSandboxProfile(baselinePath, baselineRuntime),
+				"git",
+				"diff",
+				"--check",
+			],
+			{ cwd: baselinePath, env: safeEnv(baselineRuntime), encoding: "utf8" },
+		);
+		ok(baseline.status !== 0, "baseline shared clone unexpectedly passed");
+		ok(
+			/alternate object path|unable to read/iu.test(baseline.stderr),
+			baseline.stderr,
+		);
+		const checks = session({ ...repo, path: linkedPath }, ["git diff --check"]);
+		try {
+			const clone = await checks.prepare();
+			const alternates = join(clone, ".git/objects/info/alternates");
+			strictEqual(existsSync(alternates), false);
+			writeFileSync(
+				join(clone, "Sources/Fix/Fix.swift"),
+				"public func fix() -> Int { 2 }\n",
+			);
+			const result = await checks.run({ command: "git diff --check" });
+			strictEqual(result.success, true, result.stderr);
+		} finally {
+			checks.remove();
+		}
+	});
+
 	it("gives xcodebuild build, and only it, the grants in run()", async () => {
 		const repo = project();
 		const checks = session(repo, ["xcodebuild build"]);

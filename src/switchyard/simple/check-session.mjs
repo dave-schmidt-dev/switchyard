@@ -334,6 +334,7 @@ export function createSimpleCheckSessions({
 			[
 				"clone",
 				"--shared",
+				"--dissociate",
 				"--no-checkout",
 				"--quiet",
 				"--",

@@ -81,6 +81,10 @@ const XCODE_LICENSE_MARKERS = [
 const XCODE_LICENSE_EXIT_CODE = 69;
 // A Seatbelt trace line: `deny(1) file-write-create /path`.
 const SANDBOX_DENY_LINE = /\bdeny\(\d+\)\s+[a-z][a-z0-9*-]*/iu;
+// Git cannot read an alternate object store hidden from a confined checker.
+// Require the paired missing-object line so ordinary Git errors remain ordinary.
+const GIT_ALTERNATE_OBJECT_FAILURE =
+	/\bunable to normalize alternate object path:[^\r\n]*\r?\nfatal: unable to read [0-9a-f]{40,64}\b/iu;
 
 /** Last `maxBytes` of a stream, as a Buffer. */
 export function evidenceTail(value, maxBytes = EVIDENCE_TAIL_BYTES) {
@@ -127,6 +131,7 @@ export function classifyCheckEnvironmentFailure({
 				: "";
 	if (!preProvider)
 		return SANDBOX_DENY_LINE.test(text) ? "sandbox_denial" : null;
+	if (GIT_ALTERNATE_OBJECT_FAILURE.test(text)) return "sandbox_denial";
 	if (
 		code === XCODE_LICENSE_EXIT_CODE &&
 		XCODE_LICENSE_MARKERS.some((marker) => text.includes(marker))
