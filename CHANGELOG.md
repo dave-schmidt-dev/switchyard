@@ -6,6 +6,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- `simple --timeout <minutes>` provides a relative 1–30 minute alternative to `--deadline`.
 - `worktree_missing` failure reason: a simple checkout deleted from outside mid-run (for example by a broad `$TMPDIR` delete) now fails with this environment code before provider-health classification, instead of `provider_group_unconfirmed`, and stops the routing run.
 
 - `simple --origin work|qualification` labels qualification canaries separately; ordinary work remains the default, and provider eligibility and lifecycle gates still apply.

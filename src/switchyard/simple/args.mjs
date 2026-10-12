@@ -18,7 +18,7 @@ import {
 	SIMPLE_PROVIDERS,
 	SIMPLE_TARGET_ADAPTERS,
 } from "./target-adapters.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) --deadline <RFC3339> [--origin <work|qualification>] [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) (--deadline <RFC3339> | --timeout <minutes>) [--origin <work|qualification>] [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -148,7 +148,9 @@ function assertDeclaredPathBoundary(projectPath, path) {
 }
 function parseDeadline(value, nowMs) {
 	if (typeof value !== "string" || value.trim() === "") {
-		throw new SimpleUsageError("--deadline <RFC3339> is required");
+		throw new SimpleUsageError(
+			"--deadline <RFC3339> or --timeout <minutes> is required",
+		);
 	}
 	if (
 		!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$/u.test(
@@ -173,6 +175,21 @@ function parseDeadline(value, nowMs) {
 		throw new SimpleUsageError("--deadline may be at most 30 minutes ahead");
 	}
 	return deadlineMs;
+}
+function parseTimeout(value, nowMs) {
+	const minutes = Number(value);
+	if (
+		typeof value !== "string" ||
+		!/^[1-9][0-9]*$/u.test(value) ||
+		!Number.isInteger(minutes) ||
+		minutes < 1 ||
+		minutes > 30
+	) {
+		throw new SimpleUsageError(
+			"--timeout must be a whole number of minutes from 1 to 30",
+		);
+	}
+	return nowMs + minutes * 60_000;
 }
 
 export function parseSimpleArgs(
@@ -200,6 +217,7 @@ export function parseSimpleArgs(
 				"repair-checks": { type: "boolean", default: false },
 				"no-repair-checks": { type: "boolean", default: false },
 				deadline: { type: "string" },
+				timeout: { type: "string" },
 				origin: { type: "string" },
 				"routing-run-id": { type: "string" },
 				"task-id": { type: "string" },
@@ -445,7 +463,18 @@ export function parseSimpleArgs(
 	if (origin !== "work" && origin !== "qualification") {
 		throw new SimpleUsageError("--origin must be work or qualification");
 	}
-	const deadlineMs = parseDeadline(parsed.values.deadline, nowMs);
+	if (
+		parsed.values.deadline !== undefined &&
+		parsed.values.timeout !== undefined
+	) {
+		throw new SimpleUsageError(
+			"--deadline and --timeout are mutually exclusive",
+		);
+	}
+	const deadlineMs =
+		parsed.values.timeout !== undefined
+			? parseTimeout(parsed.values.timeout, nowMs)
+			: parseDeadline(parsed.values.deadline, nowMs);
 	if (deadlineMs - nowMs < MIN_DEADLINE_FIT_MS) {
 		(onWarning ?? console.error)(
 			"warning: --deadline is under 90 seconds; targets that cannot finish inside the deadline may still be routed",

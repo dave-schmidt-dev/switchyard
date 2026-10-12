@@ -4,7 +4,10 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { SimpleUsageError } from "../src/switchyard/simple/args.mjs";
+import {
+	parseSimpleArgs,
+	SimpleUsageError,
+} from "../src/switchyard/simple/args.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -41,6 +44,21 @@ function createProjectFixture() {
 	mkdirSync(project);
 	initProject(project);
 	return { root, project };
+}
+
+function simpleArgs(project, deadlineArgs) {
+	return [
+		join(project, "prompt.txt"),
+		"--project",
+		project,
+		"--capability",
+		"standard",
+		"--file",
+		"a.txt",
+		"--check",
+		"true",
+		...deadlineArgs,
+	];
 }
 
 async function runRoutingFixture(overrides) {
@@ -153,6 +171,72 @@ describe("simple CLI usage and preflight error detail", () => {
 		deepStrictEqual(stderrLines, [
 			"switchyard simple: --deadline may be at most 30 minutes ahead\n",
 		]);
+	});
+
+	it("accepts timeout and computes the deadline from the injected now", () => {
+		const { project } = createProjectFixture();
+		const now = 1_700_000_000_000;
+		strictEqual(
+			parseSimpleArgs(simpleArgs(project, ["--timeout", "20"]), {
+				now: () => now,
+			}).deadlineMs,
+			now + 20 * 60_000,
+		);
+		strictEqual(
+			parseSimpleArgs(simpleArgs(project, ["--timeout", "30"]), {
+				now: () => now,
+			}).deadlineMs,
+			now + 30 * 60_000,
+		);
+	});
+
+	it("rejects invalid timeout values with the timeout rule", () => {
+		const { project } = createProjectFixture();
+		const message = "--timeout must be a whole number of minutes from 1 to 30";
+		for (const value of ["31", "0", "-1", "1.5", "abc"]) {
+			try {
+				// The inline form keeps parseArgs from reading "-1" as an option.
+				parseSimpleArgs(simpleArgs(project, [`--timeout=${value}`]), {
+					now: () => 1_700_000_000_000,
+				});
+				throw new Error(`expected --timeout ${value} to fail`);
+			} catch (error) {
+				strictEqual(error.message, message);
+			}
+		}
+	});
+
+	it("rejects timeout together with deadline", () => {
+		const { project } = createProjectFixture();
+		const now = 1_700_000_000_000;
+		const deadline = new Date(now + 10 * 60 * 1000).toISOString();
+		try {
+			parseSimpleArgs(
+				simpleArgs(project, ["--deadline", deadline, "--timeout", "10"]),
+				{ now: () => now },
+			);
+			throw new Error("expected mutually exclusive deadlines to fail");
+		} catch (error) {
+			strictEqual(
+				error.message,
+				"--deadline and --timeout are mutually exclusive",
+			);
+		}
+	});
+
+	it("requires either deadline or timeout", () => {
+		const { project } = createProjectFixture();
+		try {
+			parseSimpleArgs(simpleArgs(project, []), {
+				now: () => 1_700_000_000_000,
+			});
+			throw new Error("expected missing deadline to fail");
+		} catch (error) {
+			strictEqual(
+				error.message,
+				"--deadline <RFC3339> or --timeout <minutes> is required",
+			);
+		}
 	});
 
 	it("returns preflightCode and writes stderr line when injected dependency throws with safe code routing_state_locked", async () => {
