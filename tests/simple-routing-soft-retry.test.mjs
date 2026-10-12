@@ -1,11 +1,22 @@
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { test } from "node:test";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
+import {
+	NON_BLAMING_CAUSES,
+	nonBlamingCause,
+	TASK_EXCLUSION_EXEMPT_REASONS,
+} from "../src/switchyard/simple/attempt-blame.mjs";
 import {
 	MAX_SOFT_ATTEMPTS_PER_TASK,
 	runSimpleRoutingTask,
 } from "../src/switchyard/simple/routing-run.mjs";
+import {
+	openRoutingRun,
+	readRoutingRunState,
+	recordAttemptOutcome,
+} from "../src/switchyard/simple/routing-state.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 // (a) check_failed with retained partial on A continues to B, which succeeds.
 test("(a) check_failed with retained partial continues to next target and succeeds", async () => {
@@ -290,4 +301,190 @@ test("host_concurrency integration refusal without retained partial reroutes", a
 	const result = await runSimpleRoutingTask(f.options, f.deps);
 	deepStrictEqual(f.calls, ["antigravity-claude", "codex"]);
 	strictEqual(result.direction, "complete");
+});
+
+// Only a caller SIGTERM/SIGINT cancellation and a live quota error are
+// non-blaming; internal-deadline and unspecified cancels keep their blame.
+test("attempt-blame marks only caller cancellations and live quota non-blaming", () => {
+	deepStrictEqual(NON_BLAMING_CAUSES, ["caller_cancelled", "quota_exhausted"]);
+	ok(TASK_EXCLUSION_EXEMPT_REASONS.has("environment_failure"));
+	const cancelled = (cancelSource) => ({
+		providerReliability: { causeCode: "cancelled", cancelSource },
+	});
+	for (const source of ["signal_sigterm", "signal_sigint"]) {
+		strictEqual(nonBlamingCause(cancelled(source)), "caller_cancelled");
+	}
+	for (const source of ["internal_deadline", "unspecified"]) {
+		strictEqual(nonBlamingCause(cancelled(source)), null);
+	}
+	strictEqual(
+		nonBlamingCause({
+			providerReliability: { causeCode: "quota_exhausted" },
+		}),
+		"quota_exhausted",
+	);
+	strictEqual(nonBlamingCause({}), null);
+});
+
+// (h) A SIGTERM cancellation blames the caller, so a later invocation for the
+// same task and routing run tries the same target again.
+test("(h) caller cancellation keeps the target eligible for a task retry", async () => {
+	const f = fixture({
+		__targets: ["codex", "vibe"],
+		codex: {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "cancelled",
+					phase: "provider",
+					cancelled: true,
+				}),
+				cancelSource: "signal_sigterm",
+				failureReason: "cancelled",
+				failurePhase: "execute",
+				errorKind: "cancelled",
+			},
+		},
+	});
+	f.options.taskId = "cancel-retry";
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.direction, "stop");
+	strictEqual(first.stopReason, "unsafe_failure");
+	deepStrictEqual(f.calls, ["codex"]);
+	const retry = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(retry.direction, "stop");
+	strictEqual(retry.stopReason, "unsafe_failure");
+	deepStrictEqual(f.calls, ["codex", "codex"]);
+	const attempt = readRoutingRunState(f.options.projectPath, "run-1", {
+		stateRoot: f.deps.stateRoot,
+	}).attempts[0];
+	strictEqual(attempt.terminal, "skipped");
+	strictEqual(attempt.reason, "unsafe_failure");
+	strictEqual(attempt.nonBlamingCause, "caller_cancelled");
+});
+
+// (i) An internal-deadline cancellation keeps its blame, so the target stays
+// excluded from the rest of the task.
+test("(i) internal-deadline cancellation still excludes the target for the task", async () => {
+	const f = fixture({
+		__targets: ["codex", "vibe"],
+		codex: {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "cancelled",
+					phase: "provider",
+					cancelled: true,
+				}),
+				cancelSource: "internal_deadline",
+				failureReason: "cancelled",
+				failurePhase: "execute",
+				errorKind: "cancelled",
+			},
+		},
+	});
+	f.options.taskId = "internal-deadline-retry";
+	const first = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(first.stopReason, "unsafe_failure");
+	deepStrictEqual(f.calls, ["codex"]);
+	const retry = await runSimpleRoutingTask(f.options, f.deps);
+	deepStrictEqual(f.calls, ["codex", "vibe"]);
+	strictEqual(
+		retry.attempts.find((attempt) => attempt.targetId === "codex")
+			.nonBlamingCause,
+		undefined,
+	);
+});
+
+// (j) Quota failures exhaust capacity, not the task: no target failed it.
+test("(j) quota-only exhaustion reports capacity, not task failures", async () => {
+	const quotaFailure = {
+		status: "failed",
+		result: {
+			providerReliability: createProviderReliabilityDiagnostic({
+				causeCode: "quota_exhausted",
+				phase: "provider",
+			}),
+		},
+	};
+	const f = fixture({
+		__targets: ["antigravity-claude", "codex", "vibe"],
+		"antigravity-claude": quotaFailure,
+		codex: quotaFailure,
+		vibe: quotaFailure,
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.direction, "native_required");
+	strictEqual(result.exhaustionCause, "capacity");
+	deepStrictEqual(result.failedTargetIds, []);
+	strictEqual(
+		result.attempts.every(
+			(attempt) => attempt.nonBlamingCause === "quota_exhausted",
+		),
+		true,
+	);
+});
+
+// (k) One ordinary soft failure still makes the exhaustion a task failure.
+test("(k) a quota failure mixed with an ordinary failure reports task_failures", async () => {
+	const f = fixture({
+		__targets: ["antigravity-claude", "codex"],
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "quota_exhausted",
+					phase: "provider",
+				}),
+			},
+		},
+		codex: { status: "failed" },
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.direction, "native_required");
+	strictEqual(result.exhaustionCause, "task_failures");
+});
+
+// Legacy attempts without a non-blaming cause keep their exact key set, while
+// an out-of-enum value is rejected like an invalid continuation.
+test("legacy attempts load and an out-of-enum nonBlamingCause is rejected", () => {
+	const projectPath = tempDir("routing-blame-project-");
+	const stateRoot = tempDir("routing-blame-state-");
+	const handle = openRoutingRun(projectPath, "run-blame", {
+		stateRoot,
+		now: Date.now,
+	});
+	const allocation = {
+		attemptId: "attempt-1",
+		taskId: "task-1",
+		runId: "run-1",
+		targetId: "codex",
+		capability: "standard",
+		startedAt: new Date().toISOString(),
+	};
+	handle.commit({ pendingAttempt: allocation });
+	recordAttemptOutcome(handle.state, handle.commit, {
+		...allocation,
+		terminal: "skipped",
+		reason: "unsafe_failure",
+		closedAt: new Date().toISOString(),
+		partialWorktree: null,
+	});
+	const legacy = readRoutingRunState(projectPath, "run-blame", { stateRoot });
+	ok(!Object.hasOwn(legacy.attempts[0], "nonBlamingCause"));
+	const second = { ...allocation, attemptId: "attempt-2", runId: "run-2" };
+	handle.commit({ pendingAttempt: second });
+	throws(
+		() =>
+			recordAttemptOutcome(handle.state, handle.commit, {
+				...second,
+				terminal: "skipped",
+				reason: "unsafe_failure",
+				closedAt: new Date().toISOString(),
+				partialWorktree: null,
+				nonBlamingCause: "internal_deadline",
+			}),
+		{ code: "routing_state_malformed" },
+	);
+	handle.release();
 });

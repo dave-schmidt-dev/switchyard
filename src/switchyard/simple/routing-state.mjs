@@ -4,6 +4,7 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { parseRfc3339 } from "../rfc3339.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
+import { NON_BLAMING_CAUSES } from "./attempt-blame.mjs";
 import { CHECK_ENVIRONMENT_SIGNATURES } from "./check-environment.mjs";
 import {
 	acquireRoutingFileLock,
@@ -114,9 +115,13 @@ const ATTEMPT_KEYS = [
 	"closedAt",
 	"partialWorktree",
 ];
-// Optional continuation fields are omitted when absent, so attempts recorded
-// before Task 3.11 keep their exact key set.
-const OPTIONAL_ATTEMPT_KEYS = ["continuedFromAttemptId", "continuationSkipped"];
+// Optional continuation and blame fields are omitted when absent, so legacy
+// attempts keep their exact key set.
+const OPTIONAL_ATTEMPT_KEYS = [
+	"continuedFromAttemptId",
+	"continuationSkipped",
+	"nonBlamingCause",
+];
 function attemptKeysFor(item) {
 	return item && typeof item === "object" && !Array.isArray(item)
 		? [
@@ -132,6 +137,13 @@ function continuationValid(item, earlier) {
 	if (from !== undefined && skipped !== undefined) return false;
 	if (from !== undefined && !(idValid(from) && earlier.has(from))) return false;
 	return skipped === undefined || CONTINUATION_SKIP_REASONS.includes(skipped);
+}
+// A recorded non-blaming cause must stay inside the closed cause enum.
+function nonBlamingCauseValid(item) {
+	return (
+		item.nonBlamingCause === undefined ||
+		NON_BLAMING_CAUSES.includes(item.nonBlamingCause)
+	);
 }
 
 function allocation(value) {
@@ -234,6 +246,7 @@ function validateState(state, project, runId) {
 			!exact(item, attemptKeysFor(item)) ||
 			!allocation(allocated) ||
 			!continuationValid(item, seen) ||
+			!nonBlamingCauseValid(item) ||
 			seen.has(item.attemptId) ||
 			!["succeeded", "failed", "skipped"].includes(item.terminal) ||
 			!REASONS.has(item.reason) ||

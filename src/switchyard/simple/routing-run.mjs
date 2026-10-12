@@ -7,6 +7,7 @@ import {
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
 import { readRun } from "../run-store/index.mjs";
+import { nonBlamingCause, taskExcludedTargets } from "./attempt-blame.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
@@ -75,12 +76,6 @@ const FUNDING_UNAVAILABLE = new Set([
 	"paid_overage_not_allowed",
 	"included_usage_unverified",
 ]);
-/** Attempt reasons that blame the environment, not the target, for this task. */
-const TASK_EXCLUSION_EXEMPT_REASONS = new Set([
-	"baseline_failed",
-	"environment_failure",
-	"lifecycle_recovered",
-]);
 /**
  * Terminal recorded for one failed attempt.
  *
@@ -98,26 +93,6 @@ function failureTerminal(result, providerMemoryEligible) {
 	)
 		return "skipped";
 	return providerMemoryEligible ? "failed" : "skipped";
-}
-
-/**
- * Targets this logical task already tried and did not succeed on. Unlike the
- * run-wide failedTargetIds, this set is rebuilt from persisted attempts and
- * scoped to one task, so a task-local failure never removes a healthy target
- * from other tasks in the same routing run. Baseline, environment and
- * lifecycle-recovery attempts blame the environment, not the target, so they
- * keep the target eligible for the task.
- */
-function taskExcludedTargets(attempts, logicalTaskId) {
-	const excluded = new Set();
-	for (const attempt of attempts) {
-		const failedForTask =
-			attempt.taskId === logicalTaskId &&
-			(attempt.terminal === "failed" || attempt.terminal === "skipped") &&
-			!TASK_EXCLUSION_EXEMPT_REASONS.has(attempt.reason);
-		if (failedForTask) excluded.add(attempt.targetId);
-	}
-	return excluded;
 }
 
 /** Selected allocations are durable before route() returns control to the engine. */
@@ -533,6 +508,9 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				? classifyAttemptFailure({ result, accountability })
 				: null;
 			const reason = failed ? classification.reason : "succeeded";
+			// A caller cancellation or live quota error is not the target's fault;
+			// recording it keeps the target eligible for later attempts at this task.
+			const nonBlaming = failed ? nonBlamingCause(result) : null;
 
 			const continued = continuationFields(plan, seeded);
 			try {
@@ -542,6 +520,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					reason,
 					closedAt: new Date(now()).toISOString(),
 					partialWorktree: result.partialWorktree ?? null,
+					...(nonBlaming ? { nonBlamingCause: nonBlaming } : {}),
 					...continued,
 				});
 			} catch (error) {
@@ -616,7 +595,9 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 
 			// Always exclude from this invocation's local set regardless of severity.
 			localExcluded.add(pending.targetId);
-			anyFailed = true;
+			// Capacity and caller cancellations are not task failures, so they must
+			// not turn a later no-eligible stop into task_failures.
+			if (nonBlaming === null) anyFailed = true;
 
 			if (classification.severity === "hard") {
 				return answer("stop", {
