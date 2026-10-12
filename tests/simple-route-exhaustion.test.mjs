@@ -13,6 +13,11 @@ import {
 } from "../src/switchyard/simple/route-exhaustion.mjs";
 import { createSimpleRouteSelection } from "../src/switchyard/simple/route-selection.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
+import {
+	openRoutingRun,
+	readRoutingRunState,
+	recordAttemptOutcome,
+} from "../src/switchyard/simple/routing-state.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -269,4 +274,54 @@ test("selection accepts the target again once the entry expires", async () => {
 	} finally {
 		restore();
 	}
+});
+
+// Close one failed codex attempt in a fresh routing run; return the state.
+function recordFailedAttempt(extra, patch) {
+	const project = tempDir("switchyard-route-exhaustion-project-");
+	const stateRoot = tempDir("switchyard-route-exhaustion-state-");
+	const handle = openRoutingRun(project, "run-quota", { stateRoot });
+	const pending = {
+		taskId: "task-1",
+		attemptId: "attempt-1",
+		runId: "run-1",
+		targetId: "codex",
+		capability: "standard",
+		startedAt: new Date(NOW).toISOString(),
+	};
+	const record = {
+		...pending,
+		terminal: "failed",
+		reason: "unsafe_failure",
+		closedAt: new Date(NOW).toISOString(),
+		partialWorktree: null,
+		...extra,
+	};
+	try {
+		handle.commit({ pendingAttempt: pending });
+		if (patch) handle.commit({ ...patch(record), pendingAttempt: null });
+		else recordAttemptOutcome(handle.state, handle.commit, record);
+	} finally {
+		handle.release();
+	}
+	return readRoutingRunState(project, "run-quota", { stateRoot });
+}
+
+test("a quota_exhausted failure does not latch its target for the routing run", () => {
+	const state = recordFailedAttempt({ nonBlamingCause: "quota_exhausted" });
+	deepStrictEqual(state.failedTargetIds, []);
+	strictEqual(state.attempts[0].nonBlamingCause, "quota_exhausted");
+});
+
+test("a blaming failure still latches its target for the routing run", () => {
+	const state = recordFailedAttempt({});
+	deepStrictEqual(state.failedTargetIds, ["codex"]);
+});
+
+test("a run that latched a quota failure before the fix stays readable", () => {
+	const state = recordFailedAttempt(
+		{ nonBlamingCause: "quota_exhausted" },
+		(record) => ({ attempts: [record], failedTargetIds: ["codex"] }),
+	);
+	deepStrictEqual(state.failedTargetIds, ["codex"]);
 });

@@ -237,7 +237,10 @@ function validateState(state, project, runId) {
 	)
 		fail("routing_state_malformed");
 	const seen = new Set();
+	// Blaming failures must be in failedTargetIds; a non-blaming failure may be,
+	// since state written before that rule latched quota attempts run-wide.
 	const failures = new Set();
+	const failedAny = new Set();
 	for (const item of state.attempts) {
 		const allocated = Object.fromEntries(
 			allocationKeys.map((key) => [key, item?.[key]]),
@@ -261,7 +264,9 @@ function validateState(state, project, runId) {
 		)
 			fail("routing_state_malformed");
 		seen.add(item.attemptId);
-		if (item.terminal === "failed") failures.add(item.targetId);
+		if (item.terminal !== "failed") continue;
+		failedAny.add(item.targetId);
+		if (item.nonBlamingCause === undefined) failures.add(item.targetId);
 	}
 	if (
 		state.brokenChecks !== undefined &&
@@ -273,8 +278,8 @@ function validateState(state, project, runId) {
 	if (
 		state.failedTargetIds.some((id) => !TARGETS.has(id)) ||
 		new Set(state.failedTargetIds).size !== state.failedTargetIds.length ||
-		JSON.stringify([...failures].sort()) !==
-			JSON.stringify([...state.failedTargetIds].sort()) ||
+		[...failures].some((id) => !state.failedTargetIds.includes(id)) ||
+		state.failedTargetIds.some((id) => !failedAny.has(id)) ||
 		(state.pendingAttempt !== null &&
 			(!allocation(state.pendingAttempt) ||
 				seen.has(state.pendingAttempt.attemptId))) ||
@@ -432,6 +437,15 @@ export function readRoutingRunState(project, runId, { stateRoot } = {}) {
 	if (!ensureSafeRoutingDirectories(dir, false)) return null;
 	return readState(dir, project, runId);
 }
+/**
+ * Close the pending attempt with its terminal record.
+ *
+ * Only a failed attempt without a nonBlamingCause enters the run-wide
+ * failedTargetIds. A caller cancellation or a live quota error is not evidence
+ * against the target, and the quota cooldown is owned by the hour-long route
+ * exhaustion record, so latching it for the whole routing run would exclude a
+ * healthy target from every later task.
+ */
 export function recordAttemptOutcome(state, commit, record) {
 	if (state.attempts.length >= MAX_ATTEMPT_HISTORY)
 		fail("routing_attempt_history_cap_exceeded");
@@ -441,7 +455,8 @@ export function recordAttemptOutcome(state, commit, record) {
 	)
 		fail("routing_pending_identity_mismatch");
 	const failures = new Set(state.failedTargetIds);
-	if (record.terminal === "failed") failures.add(record.targetId);
+	if (record.terminal === "failed" && record.nonBlamingCause === undefined)
+		failures.add(record.targetId);
 	commit({
 		attempts: [...state.attempts, record],
 		failedTargetIds: [...failures],
