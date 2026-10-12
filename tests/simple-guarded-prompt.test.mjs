@@ -48,3 +48,35 @@ test("an empty checks array adds nothing", () => {
 		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.",
 	);
 });
+
+const RED_PARAGRAPH =
+	"These acceptance checks already fail on the unmodified checkout, before your change:\n- `ruff check .`\n- `swiftlint --strict`\nMake the failures your task is responsible for pass. Do not weaken, skip, or delete unrelated tests to turn a check green; if a pre-existing failure is outside your task and your declared files, leave it and finish the task.";
+
+test("an empty red-at-baseline list leaves the checks prompt byte-identical", () => {
+	const options = { ...BASE_OPTIONS, checks: ["ruff check ."] };
+	strictEqual(
+		buildGuardedPrompt({ ...options, redAtBaselineChecks: [] }),
+		buildGuardedPrompt(options),
+	);
+});
+
+test("red-at-baseline checks append one paragraph naming the commands in order", () => {
+	const checks = ["ruff check .", "swiftlint --strict", "make test"];
+	const base = buildGuardedPrompt({ ...BASE_OPTIONS, checks });
+	const prompt = buildGuardedPrompt({
+		...BASE_OPTIONS,
+		checks,
+		redAtBaselineChecks: ["ruff check .", "swiftlint --strict"],
+	});
+	strictEqual(prompt, `${base}\n\n${RED_PARAGRAPH}`);
+});
+
+test("red-at-baseline names without declared checks add nothing", () => {
+	strictEqual(
+		buildGuardedPrompt({
+			...BASE_OPTIONS,
+			redAtBaselineChecks: ["ruff check ."],
+		}),
+		buildGuardedPrompt({ ...BASE_OPTIONS }),
+	);
+});

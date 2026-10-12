@@ -39,6 +39,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- The pre-provider dry run records which acceptance checks already fail plainly on the unmodified tree (`redAtBaseline`); the provider prompt and the repair prompt name them so the provider stops chasing failures that predate the task. Acceptance is unchanged: every check must still pass.
 - Simple roots now live in an owner-only `$TMPDIR/switchyard-simple-roots/` parent instead of directly in the shared temp directory; the orphan collector scans both locations, and the broad temp sweep never selects the parent.
 
 - Simple status exposes active task identity, deadline, validated descriptor and observed phase.

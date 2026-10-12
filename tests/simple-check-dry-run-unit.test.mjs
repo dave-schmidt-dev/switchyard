@@ -256,6 +256,8 @@ test("ordinary failures and timeouts proceed; the first environment failure stop
 	});
 	const ok3 = await proceed.done;
 	strictEqual(ok3.status, "passed");
+	// Only the plain failure is red at baseline; the timeouts never completed.
+	deepStrictEqual(ok3.redAtBaseline, [1]);
 	deepStrictEqual(seen, ["a", "b", "c"]);
 
 	const ran = [];
@@ -279,6 +281,22 @@ test("ordinary failures and timeouts proceed; the first environment failure stop
 	strictEqual(result.exitCode, 126);
 	strictEqual(result.signal, "SIGKILL");
 	strictEqual(result.writerLifecycle, "stopped");
+});
+
+test("passed carries the ascending indices of plainly failing checks as redAtBaseline", async () => {
+	const mixed = await dryRun(["a", "b", "c"], async ({ command }) =>
+		command === "b" ? settled : failing({ output: "assertion failed" }),
+	).done;
+	strictEqual(mixed.status, "passed");
+	deepStrictEqual(mixed.redAtBaseline, [1, 3]);
+	const clean = await dryRun(["a", "b"], async () => settled).done;
+	strictEqual(clean.status, "passed");
+	deepStrictEqual(clean.redAtBaseline, []);
+	const stopped = await dryRun(["a", "b"], async ({ command }) =>
+		command === "b" ? failing({ code: 126 }) : failing({ output: "red" }),
+	).done;
+	strictEqual(stopped.status, "environment_failed");
+	strictEqual("redAtBaseline" in stopped, false);
 });
 
 test("cancellation, deadline and unconfirmed process groups stop the dry run", async () => {

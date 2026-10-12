@@ -1310,11 +1310,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (continuation?.carried)
 			worktreeGitControl = snapshotGitControl(worktreePath);
 		if (continuation) dependencies.onContinuation?.(continuation);
+		const redAtBaseline = dryRun?.redAtBaseline ?? [];
 		const guardedPrompt = buildGuardedPrompt({
 			promptText: readFileSync(options.promptPath, "utf8"),
 			files: options.files,
 			readOnlyInputs: options.readOnlyInputs ?? [],
 			checks: options.checks ?? [],
+			redAtBaselineChecks: redAtBaseline.map((i) => options.checks[i - 1]),
 			carriedFiles: continuation?.carried ? continuation.files : [],
 			reportMode,
 		});
@@ -1984,6 +1986,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						check?.timedOut === true
 							? "acceptance_check_timeout"
 							: "acceptance_check_failed",
+					redAtBaseline: redAtBaseline.includes(index + 1),
 				});
 				const repairPrepared = await healthController.prepare({
 					provider,

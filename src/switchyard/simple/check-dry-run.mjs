@@ -21,8 +21,10 @@ const checkIdentityOf = (command) =>
  * on an unmodified tree and the run proceeds. This is not a baseline run: it
  * does not require a clean tree and never decides acceptance.
  *
- * Statuses: `passed` (all ran), `environment_failed` (first classified check,
- * with `checkIndex`, `checkIdentity`, `signature`, `outputPath`, `exitCode`,
+ * Statuses: `passed` (all ran; `redAtBaseline` lists, ascending, the 1-based
+ * index of every check that ran to completion and failed plainly on the
+ * unmodified tree, so a timeout is not recorded; empty when all passed),
+ * `environment_failed` (first classified check, with `checkIndex`, `checkIdentity`, `signature`, `outputPath`, `exitCode`,
  * `signal`, and — when the caller resolved them — `checkExecutable` and
  * `hostExecutable`), `cancelled`, `deadline_expired` (stopped early; the
  * engine's own deadline fences fail the run in their phase), `unconfirmed` (a
@@ -55,6 +57,7 @@ export async function dryRunAcceptanceChecks({
 	const cap =
 		Number.isFinite(capMs) && capMs > 0 ? capMs : DRY_RUN_CHECK_CAP_MS;
 	let writerLifecycle = "never_started";
+	const redAtBaseline = [];
 	const finish = (status, extra = {}) => ({
 		status,
 		writerLifecycle,
@@ -127,6 +130,10 @@ export async function dryRunAcceptanceChecks({
 					: {}),
 			});
 		}
+		// A timed-out check was killed, not run to completion: a slow green check
+		// at the dry-run cap must not be reported as already failing.
+		if (result?.success !== true && result?.timedOut !== true)
+			redAtBaseline.push(checkIndex);
 	}
-	return finish("passed");
+	return finish("passed", { redAtBaseline });
 }
