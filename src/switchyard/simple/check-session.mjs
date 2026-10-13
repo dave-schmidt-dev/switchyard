@@ -9,7 +9,6 @@ import {
 	realpathSync,
 	rmSync,
 	symlinkSync,
-	writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { integrationGate } from "../integrate/index.mjs";
@@ -28,18 +27,19 @@ import {
 	snapshotGitControl,
 	verifyGitControl,
 } from "./args.mjs";
-import {
-	EVIDENCE_TAIL_BYTES,
-	evidenceTail,
-	redactCredentialTokens,
-} from "./check-environment.mjs";
 import { commandWords, resolveCheckExecution } from "./check-execution.mjs";
+import {
+	npmCiFailureDetails,
+	writeCheckEvidence,
+} from "./check-setup-evidence.mjs";
 import {
 	declaredPathDependencies,
 	pathDependenciesUnchanged,
 	venvPathEntries,
 } from "./path-dependencies.mjs";
 import { runSimpleWriter } from "./provider-invocation.mjs";
+
+export { writeCheckEvidence };
 
 function refused(code, details = null) {
 	return Object.assign(new Error(code), { code }, details);
@@ -72,22 +72,6 @@ function readinessExecutableBasename(word) {
 		!/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(name)
 		? name
 		: null;
-}
-
-// Failed-check tails stay host-side diagnostics: the result carries this path
-// and never the bytes themselves.
-export function writeCheckEvidence(directory, attempt, index, check) {
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	const path = join(directory, `${attempt}-${index}.log`);
-	writeFileSync(
-		path,
-		Buffer.concat([
-			evidenceTail(redactCredentialTokens(check?.output), EVIDENCE_TAIL_BYTES),
-			evidenceTail(redactCredentialTokens(check?.stderr), EVIDENCE_TAIL_BYTES),
-		]),
-		{ mode: 0o600 },
-	);
-	return path;
 }
 
 function checksNeedNodePackages(commands, checkout) {
@@ -210,8 +194,13 @@ export function createSimpleCheckSessions({
 			Number.isFinite(timeoutMsOverride) && timeoutMsOverride > 0
 				? Math.min(timeoutMsOverride, remaining)
 				: remaining;
+		// Reached from prepare() (probe_environment, provision_dependencies and
+		// validate_commands attach their checkSetupStep there) and from run() and
+		// format(), which run after setup and carry no step.
 		if (!pathDependenciesUnchanged(active.pathDependencies, active.pathEntries))
-			throw refused("check_dependencies_unverified");
+			throw refused("check_dependencies_unverified", {
+				dependencyCheck: "path_dependency_changed",
+			});
 		// Only an owner check's own command can earn command-specific grants
 		// (xcodebuild build); probes, readiness and setup never pass one.
 		const profile = quickCheckSandboxProfile(
@@ -459,9 +448,10 @@ export function createSimpleCheckSessions({
 				[setupEnv.npm_config_cache],
 			);
 			if (!setup.success || lifecycle !== "stopped")
-				throw refused("check_dependencies_unverified", {
-					dependencyCheck: "npm_ci_failed",
-				});
+				throw refused(
+					"check_dependencies_unverified",
+					npmCiFailureDetails(setup, evidenceDir),
+				);
 		}
 		markStep("validate_commands");
 		for (const [index, command] of commands.entries()) {

@@ -49,7 +49,10 @@ import {
 	runSimpleBaselineChecks,
 } from "./baseline.mjs";
 import { dryRunAcceptanceChecks } from "./check-dry-run.mjs";
-import { classifyFailedCheck } from "./check-environment.mjs";
+import {
+	CHECK_ENVIRONMENT_SIGNATURES,
+	classifyFailedCheck,
+} from "./check-environment.mjs";
 import { createSimpleCheckSessions } from "./check-session.mjs";
 import {
 	boundedRejectionPaths,
@@ -472,6 +475,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 					: null;
 		const setupStep =
 			typeof error?.checkSetupStep === "string" ? error.checkSetupStep : null;
+		// A failed sandboxed `npm ci` setup ran no check, so the refusal itself
+		// names its redacted evidence tail and any classified environment cause.
+		const npmCiFailed = dependencyCheck === "npm_ci_failed";
+		const setupOutputPath =
+			npmCiFailed && typeof error?.outputPath === "string"
+				? error.outputPath
+				: null;
+		const setupEnvironmentSignature =
+			npmCiFailed &&
+			CHECK_ENVIRONMENT_SIGNATURES.includes(error?.checkEnvironmentSignature)
+				? error.checkEnvironmentSignature
+				: null;
 		// The registry row's detail fields decide what this failure persists in
 		// run.json, so a detail registered later reaches the record without
 		// editing this call site or the sanitizer boundary.
@@ -508,10 +523,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 			stdoutBytes: providerExecutionResult?.stdoutBytes,
 			checkIndex: failingCheckIndex ?? error?.checkIndex ?? null,
 			checkIdentity: failingCheckIdentity,
-			checkEnvironmentSignature: failingCheckEnvironmentSignature,
-			outputPath: ["baseline", "checks"].includes(failurePhase)
-				? failingCheckOutputPath
-				: (providerExecutionResult?.outputPath ?? null),
+			checkEnvironmentSignature:
+				failingCheckEnvironmentSignature ?? setupEnvironmentSignature,
+			outputPath:
+				setupOutputPath ??
+				(["baseline", "checks"].includes(failurePhase)
+					? failingCheckOutputPath
+					: (providerExecutionResult?.outputPath ?? null)),
 			dependencyCheck,
 			manifestName:
 				typeof error?.manifestName === "string" ? error.manifestName : null,

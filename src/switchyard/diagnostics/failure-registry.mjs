@@ -101,13 +101,18 @@ const DEADLINE_DETAIL_FIELDS = Object.freeze([
 	"changedFilesUnavailable",
 ]);
 // Task 2.7: every dependency refusal carries its closed sub-cause; a manifest
-// refusal also names the bounded file, a command refusal its position.
+// refusal also names the bounded file, a command refusal its position. A
+// setup-time refusal names the prepare step it failed in, and a failed `npm ci`
+// setup adds its redacted evidence path and classified environment signature.
 const CHECK_DEPENDENCY_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
 	"checkIndex",
 	"checkIdentity",
 	"dependencyCheck",
 	"manifestName",
+	"checkSetupStep",
+	"checkEnvironmentSignature",
+	"outputPath",
 ]);
 const PROVIDER_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
