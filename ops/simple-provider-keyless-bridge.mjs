@@ -96,14 +96,16 @@ function fail(reason) {
 	throw new BridgeFailure(`simple-provider-keyless-bridge: ${reason}`);
 }
 const KEY_WINDOW = 12;
-const MAX_WINDOWED_KEY = 256;
-function redactKey(text, secret) {
-	const exact = text.split(secret).join("[redacted]");
-	if (secret.length < KEY_WINDOW || secret.length > MAX_WINDOWED_KEY)
-		return exact;
+/** Every 12-character window of the key, or none for a shorter key. */
+function keyWindows(secret) {
 	const windows = new Set();
 	for (let i = 0; i + KEY_WINDOW <= secret.length; i += 1)
 		windows.add(secret.slice(i, i + KEY_WINDOW));
+	return windows;
+}
+function redactKey(text, secret, windows) {
+	const exact = text.split(secret).join("[redacted]");
+	if (windows.size === 0) return exact;
 	let result = "";
 	let copied = 0;
 	let start = -1;
@@ -126,19 +128,20 @@ function redactKey(text, secret) {
 }
 /**
  * Redact the credential, strip terminal escapes and control bytes, then redact
- * again. Redaction replaces the exact key and, for keys of 12 to 256
+ * again. Redaction replaces the exact key and, for a key of 12 or more
  * characters, every 12-character window of it, so a key split by a newline or
  * a character-consuming escape loses each half of 12 or more characters.
- * Residual: fragments of up to 11 characters survive, and a key longer than
- * 256 characters gets exact-match redaction only. Failure messages carry no
- * provider text, so nothing depends on this for them.
+ * Residual: fragments of up to 11 characters survive. Failure messages carry
+ * no provider text, so nothing depends on this for them.
  */
 function boundedText(bytes, secret) {
+	const windows = keyWindows(secret);
 	return redactKey(
-		redactKey(bytes.toString("utf8"), secret)
+		redactKey(bytes.toString("utf8"), secret, windows)
 			.replace(TERMINAL_ESCAPE_PATTERN, "")
 			.replace(UNSAFE_CONTROL_PATTERN, ""),
 		secret,
+		windows,
 	);
 }
 // Lines the bridge writes itself start with one of these prefixes.

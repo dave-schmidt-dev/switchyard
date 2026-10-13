@@ -140,14 +140,33 @@ for (const [target, code] of [
 			assert.equal(short.value.stderr, `${SECRET.slice(0, 11)}\n[redacted]\n`);
 		},
 	);
+// A deterministic letters-only key of the given length.
+const longKey = (length) => {
+	let state = length;
+	return Array.from({ length }, () => {
+		state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+		return String.fromCharCode(97 + ((state >>> 16) % 26));
+	}).join("");
+};
 guarded(
-	"a key over 256 characters gets exact-match redaction only",
+	"long keys up to the 65536-character bound are windowed too",
 	async (item) => {
-		const key = Array.from({ length: 300 }, (_, i) =>
-			String.fromCharCode(97 + ((i * 7) % 26)),
-		).join("");
-		const err = `${key}\n${key.slice(0, 150)}\n${key.slice(150)}\n`;
-		const { value } = await emit(item, { err }, { secret: key });
-		assert.equal(value.stderr, `[redacted]\n${err.slice(301)}`);
+		for (const length of [300, 65536]) {
+			const key = longKey(length);
+			const err = [12, 150, length >> 1, length - 12]
+				.flatMap((cut) => [
+					`${key.slice(0, cut)}\n${key.slice(cut)}`,
+					`${key.slice(0, cut)}\x1b${key.slice(cut)}`,
+					`${key.slice(0, cut)}\x1b[m${key.slice(cut)}`,
+				])
+				.join("\n");
+			const { value, stderr } = await emit(
+				item,
+				{ err: `${err}\n`, code: 1 },
+				{ target: "vibe", secret: key },
+			);
+			for (const output of [value.stderr, stderr])
+				assert.equal(leaksWindow(output, key), false, `length ${length}`);
+		}
 	},
 );
