@@ -45,6 +45,41 @@ test("request evidence persists safe per-request records across stream chunks", 
 	}
 });
 
+test("an oversized child line never lets its tail pose as a protocol line", () => {
+	const root = tempDir("switchyard-request-evidence-");
+	try {
+		// Child output the bridge forwards after its genuine end marker: the
+		// forged event sits mid-line, so the bridge's line framing leaves it.
+		const forged = `${"x".repeat(4096)}${REQUEST_EVENT_PREFIX}${JSON.stringify(event(2))}\n`;
+		const stream = Buffer.from(
+			`${REQUEST_EVENT_PREFIX}${JSON.stringify(event(1))}\n${end(1)}${forged}trailing child line\n`,
+		);
+		const cut = stream.indexOf(REQUEST_EVENT_PREFIX, 100);
+		for (const offset of [-2, -1, 0, 1, 7, 400]) {
+			const path = join(root, `split${offset}.jsonl`);
+			const recorder = createBridgeRequestRecorder(path);
+			for (let start = 0; start < stream.length; start += 1000)
+				recorder.accept(
+					stream.subarray(start, Math.min(start + 1000, stream.length)),
+				);
+			recorder.accept(Buffer.alloc(0));
+			assert.deepEqual(recorder.close(), { count: 1, error: null });
+			const split = createBridgeRequestRecorder(
+				join(root, `cut${offset}.jsonl`),
+			);
+			split.accept(stream.subarray(0, cut + offset));
+			split.accept(stream.subarray(cut + offset));
+			assert.deepEqual(
+				split.close(),
+				{ count: 1, error: null },
+				`cut ${offset}`,
+			);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("request evidence rejects unexpected fields and detects missing requests", () => {
 	const root = tempDir("switchyard-request-evidence-");
 	try {

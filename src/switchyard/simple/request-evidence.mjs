@@ -75,18 +75,29 @@ export function createBridgeRequestRecorder(path) {
 	let sawEnd = false;
 	let error = null;
 	let closed = false;
+	// An oversized non-protocol line is dropped through its newline, however the
+	// pipe chunks it, so child text after the cut never reads as a line start.
+	let discarding = false;
 	const accept = (chunk) => {
 		if (closed || error) return;
 		const segments = chunk.toString("utf8").split("\n");
 		for (let index = 0; index < segments.length; index += 1) {
+			const last = index === segments.length - 1;
+			if (discarding) {
+				if (last) break;
+				discarding = false;
+				continue;
+			}
 			pending += segments[index];
 			if (Buffer.byteLength(pending) > MAX_PENDING_LINE_BYTES) {
 				if (pending.startsWith(REQUEST_EVENT_PREFIX))
 					error = "request_event_line_too_long";
 				pending = "";
 				if (error) return;
+				if (last) discarding = true;
+				continue;
 			}
-			if (index === segments.length - 1) break;
+			if (last) break;
 			const line = pending;
 			pending = "";
 			if (line.startsWith(REQUEST_END_PREFIX)) {

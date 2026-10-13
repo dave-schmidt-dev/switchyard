@@ -59,6 +59,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Fixed
 
+- The keyless-bridge request recorder drops an oversized non-protocol line through its newline, so child output split across pipe chunks can no longer make a mid-line `SWITCHYARD_PROXY_REQUEST_V1` read as a protocol event after the bridge's end marker.
 - Check-session setup refusals keep their evidence. A path dependency that changed under the sandbox now refuses with `dependencyCheck: "path_dependency_changed"`, a `check_dependencies_unverified` run record names its `checkSetupStep`, and a failed sandboxed `npm ci` setup retains a redacted `setup-0.log` evidence tail whose `outputPath` and classified `checkEnvironmentSignature` (when one matches) reach `run.json`; the refusal code and routing behavior are unchanged.
 - Simple routing stops with `host_concurrency` and keeps the retained partial when an attempt's checks passed but integration was refused because a peer moved HEAD over protected paths; it previously rerouted, so another provider redid the passing work against the same moved HEAD. The attempt still does not charge its target.
 - A caller SIGTERM/SIGINT cancellation or a live `quota_exhausted` provider error no longer blames its target: the attempt records `nonBlamingCause`, the target stays eligible for later attempts at the same task, and an exhaustion whose only failures were quota errors reports `capacity` instead of `task_failures`.
