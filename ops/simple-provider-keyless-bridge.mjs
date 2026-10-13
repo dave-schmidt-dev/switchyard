@@ -80,16 +80,88 @@ const UNSAFE_CONTROL_PATTERN = new RegExp(
 	"gu",
 );
 
-function fail(reason) {
-	throw new Error(`simple-provider-keyless-bridge: ${reason}`);
+/**
+ * Marks an error raised by `fail()`. Its message is a fixed reason plus trusted
+ * status fields only; it never carries provider output.
+ */
+class BridgeFailure extends Error {}
+/** A status field printed as-is only when it is an upper-case token. */
+function statusToken(value) {
+	if (value === undefined || value === null) return "none";
+	return /^[A-Z][A-Z0-9_]{0,31}$/u.test(String(value))
+		? String(value)
+		: "unknown";
 }
+function fail(reason) {
+	throw new BridgeFailure(`simple-provider-keyless-bridge: ${reason}`);
+}
+const KEY_WINDOW = 12;
+const MAX_WINDOWED_KEY = 256;
+function redactKey(text, secret) {
+	const exact = text.split(secret).join("[redacted]");
+	if (secret.length < KEY_WINDOW || secret.length > MAX_WINDOWED_KEY)
+		return exact;
+	const windows = new Set();
+	for (let i = 0; i + KEY_WINDOW <= secret.length; i += 1)
+		windows.add(secret.slice(i, i + KEY_WINDOW));
+	let result = "";
+	let copied = 0;
+	let start = -1;
+	let end = -1;
+	const flush = () => {
+		if (start < 0) return;
+		result += `${exact.slice(copied, start)}[redacted]`;
+		copied = end;
+	};
+	for (let i = 0; i + KEY_WINDOW <= exact.length; i += 1) {
+		if (!windows.has(exact.slice(i, i + KEY_WINDOW))) continue;
+		if (start < 0 || i > end) {
+			flush();
+			start = i;
+		}
+		end = i + KEY_WINDOW;
+	}
+	flush();
+	return result + exact.slice(copied);
+}
+/**
+ * Redact the credential, strip terminal escapes and control bytes, then redact
+ * again. Redaction replaces the exact key and, for keys of 12 to 256
+ * characters, every 12-character window of it, so a key split by a newline or
+ * a character-consuming escape loses each half of 12 or more characters.
+ * Residual: fragments of up to 11 characters survive, and a key longer than
+ * 256 characters gets exact-match redaction only. Failure messages carry no
+ * provider text, so nothing depends on this for them.
+ */
 function boundedText(bytes, secret) {
-	return bytes
-		.toString("utf8")
-		.split(secret)
-		.join("[redacted]")
-		.replace(TERMINAL_ESCAPE_PATTERN, "")
-		.replace(UNSAFE_CONTROL_PATTERN, "");
+	return redactKey(
+		redactKey(bytes.toString("utf8"), secret)
+			.replace(TERMINAL_ESCAPE_PATTERN, "")
+			.replace(UNSAFE_CONTROL_PATTERN, ""),
+		secret,
+	);
+}
+// Lines the bridge writes itself start with one of these prefixes.
+const RESERVED_LINE_PATTERN =
+	/(^|[\n\r\u2028\u2029])([^\S\n\r\u2028\u2029]*(?:SWITCHYARD_|simple-provider-keyless-bridge:|switchyard:))/gu;
+/** Child output, redacted and stripped, with look-alike bridge lines marked. */
+function childOutput(bytes, secret) {
+	return boundedText(bytes, secret).replace(
+		RESERVED_LINE_PATTERN,
+		"$1child: $2",
+	);
+}
+/**
+ * The one stderr line for a failed bridge run. A `fail()` message is a fixed
+ * reason plus trusted status fields, so it is kept (as one printable-ASCII
+ * line). Any other error stays generic because its message may hold paths or
+ * secrets.
+ */
+export function formatBridgeFailure(error) {
+	if (!(error instanceof BridgeFailure))
+		return "simple-provider-keyless-bridge: failed closed\n";
+	const line = error.message.replace(/[^\x20-\x7e]+/gu, " ").trim();
+	return `${line.slice(0, 400)}\n`;
 }
 function safePath(path) {
 	if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0"))
@@ -690,7 +762,8 @@ export async function runBridge({
 	const runtime = mkdtempSync(join(dirname(worktree), ".switchyard-keyless-"));
 	let proxy;
 	let child;
-	let interrupted = false;
+	let inFlight;
+	let interrupted = null;
 	try {
 		proxy = await startProxy({
 			target,
@@ -801,18 +874,16 @@ export async function runBridge({
 				process.stderr.write("switchyard: keyless provider still running\n"),
 			15_000,
 		);
-		const timer = setTimeout(() => {
-			interrupted = true;
-			killGroup(child, "SIGTERM");
-			setTimeout(() => killGroup(child, "SIGKILL"), 1_000).unref();
-		}, timeoutMs);
-		const onTerm = () => {
-			interrupted = true;
+		const interrupt = (reason) => {
+			interrupted ??= reason;
 			killGroup(child, "SIGTERM");
 			setTimeout(() => killGroup(child, "SIGKILL"), 1_000).unref();
 		};
+		const timer = setTimeout(() => interrupt("duration-limit"), timeoutMs);
+		const onTerm = () => interrupt("SIGTERM");
+		const onInt = () => interrupt("SIGINT");
 		process.once("SIGTERM", onTerm);
-		process.once("SIGINT", onTerm);
+		process.once("SIGINT", onInt);
 		let status;
 		try {
 			status = await new Promise((done) => {
@@ -823,21 +894,21 @@ export async function runBridge({
 			clearInterval(heartbeat);
 			clearTimeout(timer);
 			process.removeListener("SIGTERM", onTerm);
-			process.removeListener("SIGINT", onTerm);
+			process.removeListener("SIGINT", onInt);
 		}
 		if (stdinError)
 			fail(
-				`${target === "vibe" ? "Vibe" : "OpenCode"} prompt pipe failed (${stdinError.code ?? "unknown"})`,
+				`${target === "vibe" ? "Vibe" : "OpenCode"} prompt pipe failed (${statusToken(stdinError.code)})`,
 			);
 		if (
-			interrupted ||
+			interrupted !== null ||
 			status.error ||
 			status.signal ||
 			outputSize > MAX_OUTPUT ||
 			errorSize > MAX_OUTPUT
 		)
 			fail(
-				`provider terminated before a verified completion (code ${status.code ?? "none"}, signal ${status.signal ?? "none"}, error ${status.error?.code ?? "none"}; ${boundedText(Buffer.concat(errors), secret).slice(0, 300)})`,
+				`provider terminated before a verified completion (code ${Number.isSafeInteger(status.code) ? status.code : "none"}, signal ${statusToken(status.signal)}, error ${statusToken(status.error?.code)}, interrupt ${interrupted ?? "none"})`,
 			);
 		if (status.code !== 0 && target === "opencode-go") {
 			return {
@@ -849,8 +920,8 @@ export async function runBridge({
 		if (status.code !== 0) {
 			return {
 				code: status.code || 76,
-				stdout: boundedText(Buffer.concat(output), secret),
-				stderr: boundedText(Buffer.concat(errors), secret),
+				stdout: childOutput(Buffer.concat(output), secret),
+				stderr: childOutput(Buffer.concat(errors), secret),
 			};
 		}
 		if (
@@ -861,19 +932,41 @@ export async function runBridge({
 			fail("Vibe session does not prove the requested model alias");
 		return {
 			code: 0,
-			stdout: boundedText(Buffer.concat(output), secret),
-			stderr: boundedText(Buffer.concat(errors), secret),
+			stdout: childOutput(Buffer.concat(output), secret),
+			stderr: childOutput(Buffer.concat(errors), secret),
 		};
+	} catch (error) {
+		inFlight = error;
+		throw error;
 	} finally {
-		const stopped = await settleGroup(child);
-		if (proxy) {
-			await proxy.close();
-			process.stderr.write(
-				`SWITCHYARD_PROXY_END_V1 ${JSON.stringify({ requests: proxy.getRequestCount() })}\n`,
-			);
+		// Cleanup never replaces the first error; with none in flight it still
+		// fails closed.
+		let stopped = false;
+		let cleanupFailed = false;
+		try {
+			stopped = await settleGroup(child);
+		} catch {
+			cleanupFailed = true;
 		}
-		rmSync(runtime, { recursive: true, force: true });
-		if (!stopped) fail("provider process group did not stop");
+		try {
+			if (proxy) {
+				await proxy.close();
+				process.stderr.write(
+					`SWITCHYARD_PROXY_END_V1 ${JSON.stringify({ requests: proxy.getRequestCount() })}\n`,
+				);
+			}
+		} catch {
+			cleanupFailed = true;
+		}
+		try {
+			rmSync(runtime, { recursive: true, force: true });
+		} catch {
+			cleanupFailed = true;
+		}
+		if (inFlight === undefined) {
+			if (!stopped) fail("provider process group did not stop");
+			if (cleanupFailed) fail("runtime cleanup failed");
+		}
 	}
 }
 
@@ -923,7 +1016,7 @@ async function main() {
 	process.exitCode = result.code;
 }
 if (process.argv[1] && resolve(process.argv[1]) === SELF)
-	main().catch(() => {
-		process.stderr.write("simple-provider-keyless-bridge: failed closed\n");
+	main().catch((error) => {
+		process.stderr.write(formatBridgeFailure(error));
 		process.exitCode = 76;
 	});
