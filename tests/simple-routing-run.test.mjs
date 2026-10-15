@@ -705,3 +705,80 @@ test("typed diagnostic identity ignores key order while preserving mismatched ev
 		);
 	}
 });
+
+test("funding exhaustion is distinct from capacity and task failures and never latches", async () => {
+	for (const mode of ["funding", "capacity", "task_failures"]) {
+		const f = fixture(
+			mode === "task_failures"
+				? { codex: { status: "failed" }, __targets: ["codex", "vibe"] }
+				: { __targets: ["codex", "vibe"] },
+		);
+		f.deps.assertFundedRoute = (id) => {
+			if (mode !== "capacity" && !(mode === "task_failures" && id === "codex"))
+				throw Object.assign(new Error("private detail"), {
+					code: "included_usage_unverified",
+				});
+		};
+		if (mode === "capacity")
+			f.deps.route = () => ({
+				provider: null,
+				reason: "no_eligible",
+				routeEvidence: {
+					schemaVersion: 1,
+					excluded: [{ targetId: "codex", reason: "no_quota_headroom" }],
+				},
+			});
+		const result = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(result.exhaustionCause, mode);
+		strictEqual(
+			result.direction,
+			mode === "funding" ? "stop" : "native_required",
+		);
+		strictEqual(
+			readRoutingRunState(f.options.projectPath, "run-1", {
+				stateRoot: f.deps.stateRoot,
+			}).nativeLatch,
+			false,
+		);
+		if (mode === "funding") {
+			deepStrictEqual(f.calls, []);
+			deepStrictEqual(result.failedTargetIds, []);
+			strictEqual(
+				result.routeEvidence.excluded.filter(
+					(entry) => entry.reason === "included_usage_unverified",
+				).length,
+				2,
+			);
+		}
+	}
+});
+
+test("funding followed by upstream unavailability retains native fallback and closed history", async () => {
+	const f = fixture({ __targets: ["codex", "vibe"] });
+	f.deps.assertFundedRoute = () => {
+		throw Object.assign(new Error("private"), {
+			code: "included_usage_unverified",
+		});
+	};
+	f.deps.route = ({ availableProviders }) =>
+		availableProviders.includes("codex")
+			? { provider: "codex", reason: "spread" }
+			: {
+					provider: null,
+					reason: "no_eligible_upstream_unavailable:private",
+					routeEvidence: {
+						schemaVersion: 1,
+						excluded: [{ targetId: "vibe", reason: "provider_unavailable" }],
+					},
+				};
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.direction, "native_required");
+	strictEqual(result.exhaustionCause, "capacity");
+	deepStrictEqual(f.calls, []);
+	deepStrictEqual(result.failedTargetIds, []);
+	for (const reason of ["included_usage_unverified", "provider_unavailable"])
+		strictEqual(
+			result.routeEvidence.excluded.some((entry) => entry.reason === reason),
+			true,
+		);
+});

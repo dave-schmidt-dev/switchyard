@@ -230,6 +230,8 @@ export function route(options = {}) {
 				qualification_superseded: `provider ${name}: dispatch receipts exist but none for today's ${effectiveCapabilityClass} descriptor; the slot moved — re-canary the new one`,
 				qualification_expired: `provider ${name}: ${effectiveCapabilityClass} dispatch receipt no longer describes this environment (aged out, or CLI/wrapper/credential drift); re-run the canary and promote the refreshed receipt`,
 				qualification_invalid: `provider ${name}: ${effectiveCapabilityClass} dispatch receipt cannot authorize dispatch (missing promotion receipt or untransmittable evidence)`,
+				budget_pace_unavailable: `provider ${name}: cursor pacing unavailable (exact ac/ap windows with finite non-negative pace_delta required)`,
+				budget_pace_exceeded: `provider ${name}: cursor pace behind budget (finite negative pace_delta)`,
 				provider_unavailable: `provider ${name}: unavailable (ok=false)`,
 			};
 			log.push(

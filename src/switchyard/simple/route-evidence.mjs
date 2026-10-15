@@ -3,6 +3,7 @@ import { resolveTargetId } from "../roster/index.mjs";
 const LIMIT = 64;
 const REASONS = new Set([
 	"invalid_platform",
+	"invalid_usage_mode",
 	"ambiguous_target",
 	"quarantine_unresolvable",
 	"priority_fill",
@@ -27,6 +28,8 @@ const REASONS = new Set([
 	"not_golden_image_verified",
 	"provider_unavailable",
 	"no_quota_headroom",
+	"budget_pace_unavailable",
+	"budget_pace_exceeded",
 	"route_health_suppressed",
 	"deadline_fit_excluded",
 	"deadline_fit_overridden",
@@ -38,6 +41,11 @@ const REASONS = new Set([
 	"local_descriptor_args_unsafe",
 	"invocation_descriptor_unavailable",
 	"no_compatible_adapter",
+	"paid_overage_not_allowed",
+	"included_usage_unverified",
+	"funding_unavailable",
+	"funding_exhausted",
+	"tier_excluded",
 	"unknown",
 ]);
 const STATUSES = new Set([
@@ -49,7 +57,7 @@ const STATUSES = new Set([
 	"not_checked",
 ]);
 const finite = (value) => (Number.isFinite(value) ? value : null);
-const closedReason = (value) =>
+export const closedReason = (value) =>
 	typeof value === "string" &&
 	value.startsWith("no_eligible_upstream_unavailable:")
 		? "no_eligible_upstream_unavailable"
@@ -67,6 +75,7 @@ const target = (name) => {
 export function createRouteEvidenceCapture(snapshot = {}) {
 	const candidates = [];
 	const excluded = [];
+	const seenExcluded = new Set();
 	return {
 		candidate(name, windows = [], priority = null) {
 			const targetId = target(name);
@@ -88,12 +97,16 @@ export function createRouteEvidenceCapture(snapshot = {}) {
 		},
 		exclude(name, reason, bucket = null) {
 			const targetId = target(name);
-			if (targetId && excluded.length < LIMIT)
+			const validBucket = bucket === "ac" || bucket === "ap" ? bucket : null;
+			const key = `${targetId}:${validBucket ?? ""}:${closedReason(reason)}`;
+			if (targetId && excluded.length < LIMIT && !seenExcluded.has(key)) {
+				seenExcluded.add(key);
 				excluded.push({
 					targetId,
 					reason: closedReason(reason),
 					...(bucket === "ac" || bucket === "ap" ? { bucket } : {}),
 				});
+			}
 		},
 		finish(result) {
 			return {

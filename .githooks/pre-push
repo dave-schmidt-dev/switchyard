@@ -5,8 +5,8 @@ export PATH="node_modules/.bin:$PATH"
 # worktree they leak into the suite's own `git init` fixtures; the hook runs
 # at the worktree root, so ordinary discovery finds the same repository.
 unset $(git rev-parse --local-env-vars)
-# `validate` is lint + deadcode + the full test suite + roster:coherence.
+# `validate:host` is validate + host sandbox canary gate.
 # Hooking the named script rather than restating its steps means the hook
 # cannot drift from the gate — which is the failure this hook exists to stop:
 # knip went red at a4138a5 and three commits landed on top of it unnoticed.
-npm run validate
+npm run validate:host

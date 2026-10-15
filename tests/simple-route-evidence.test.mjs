@@ -1,5 +1,6 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -12,8 +13,10 @@ import {
 	readRun,
 	updateRunWithRetry,
 } from "../src/switchyard/run-store/index.mjs";
+import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { routeDiagnosticPatch } from "../src/switchyard/simple/route-evidence.mjs";
+import { createRefusalAccumulator } from "../src/switchyard/simple/routing-refusals.mjs";
 import {
 	FIXTURE_PATH,
 	withDispatchQualifiedDescriptors,
@@ -162,17 +165,93 @@ test("diagnostic persistence bounds injected evidence and keeps old injected rou
 			paceKey: Infinity,
 			raw: "DO_NOT_PERSIST",
 		})),
-		excluded: Array.from({ length: 100 }, () => ({
+		excluded: Array.from({ length: 100 }, (_, index) => ({
 			targetId: "codex",
+			bucket: `invalid-${index}`,
 			reason: "DO_NOT_PERSIST",
 		})),
 	};
 	const patch = routeDiagnosticPatch({ routeEvidence: evidence });
 	strictEqual(patch.routeEvidence.candidates.length, 64);
-	strictEqual(patch.routeEvidence.excluded.length, 64);
+	strictEqual(patch.routeEvidence.excluded.length, 1);
 	strictEqual(patch.routeEvidence.candidates[0].paceStatus, "unknown");
 	strictEqual(patch.snapshotMtime, null);
 	ok(!JSON.stringify(patch).includes("DO_NOT_PERSIST"));
+});
+
+test("distinct closed refusals retain the 64-entry cap independently of deduplication", () => {
+	// Closed refusals can accumulate across passes; avoid inventing Cursor
+	// accounting buckets on targets that have no such buckets.
+	const reasons = [
+		"provider_unavailable",
+		"no_quota_headroom",
+		"quota_exhausted",
+		"explicitly_excluded",
+		"not_in_only_allowlist",
+		"below_required_capability",
+		"no_invocation_descriptor",
+		"not_configured",
+		"qualification_missing",
+		"qualification_superseded",
+		"qualification_expired",
+		"qualification_invalid",
+		"not_golden_image_verified",
+		"route_health_suppressed",
+		"deadline_fit_excluded",
+		"paid_overage_not_allowed",
+		"included_usage_unverified",
+		"adapter_unavailable",
+	];
+	const excluded = [
+		"codex",
+		"antigravity",
+		"cursor-pro",
+		"copilot-student",
+	].flatMap((targetId) => reasons.map((reason) => ({ targetId, reason })));
+	strictEqual(excluded.length, 72);
+	const bounded = routeDiagnosticPatch({
+		routeEvidence: { schemaVersion: 1, excluded },
+	}).routeEvidence.excluded;
+	strictEqual(bounded.length, 64);
+	strictEqual(new Set(bounded.map((entry) => JSON.stringify(entry))).size, 64);
+});
+
+test("funding-only classification requires positive funding evidence and retains mixed history", () => {
+	const funding = { targetId: "codex", reason: "included_usage_unverified" };
+	for (const reason of [
+		"provider_unavailable",
+		"invalid_platform",
+		"no_compatible_adapter",
+		"local_descriptor_model_unavailable",
+		"unknown",
+		"route_health_suppressed",
+		"quota_exhausted",
+	]) {
+		const capture = createRefusalAccumulator([
+			funding,
+			{ targetId: "antigravity", reason },
+		]);
+		strictEqual(capture.isFundingOnly(), false, reason);
+		strictEqual(capture.classifyExhaustion(), "capacity", reason);
+		capture.add("codex", "included_usage_unverified");
+		strictEqual(capture.isFundingOnly(), false, `historical ${reason}`);
+		strictEqual(capture.entries().length, 2);
+	}
+	for (const reason of [
+		"tier_excluded",
+		"explicitly_excluded",
+		"not_in_only_allowlist",
+		"below_required_capability",
+		"deadline_fit_overridden",
+	]) {
+		const capture = createRefusalAccumulator([
+			funding,
+			{ targetId: "antigravity", reason },
+		]);
+		strictEqual(capture.isFundingOnly(), true, reason);
+		strictEqual(capture.classifyExhaustion(true), "task_failures");
+	}
+	strictEqual(createRefusalAccumulator().isFundingOnly(), false);
 });
 
 function localFixture() {
@@ -193,7 +272,14 @@ function localFixture() {
 			"base",
 		],
 	])
-		execFileSync("git", args, { cwd: projectPath });
+		execFileSync("git", args, {
+			cwd: projectPath,
+			env: {
+				...process.env,
+				GIT_CONFIG_GLOBAL: "/dev/null",
+				GIT_CONFIG_NOSYSTEM: "1",
+			},
+		});
 	const promptPath = join(dir, "prompt.txt");
 	writeFileSync(promptPath, "Change a.txt");
 	const options = {
@@ -348,8 +434,8 @@ test("drained providers remain excluded and Cursor bucket skips retain their buc
 					name: "cursor-pro",
 					ok: true,
 					windows: [
-						{ id: "ac", percent_left: bucket === "ac" ? 0 : 80 },
-						{ id: "ap", percent_left: bucket === "ap" ? 0 : 80 },
+						{ id: "ac", percent_left: bucket === "ac" ? 0 : 80, pace_delta: 0 },
+						{ id: "ap", percent_left: bucket === "ap" ? 0 : 80, pace_delta: 0 },
 					],
 				},
 			]),
@@ -434,4 +520,98 @@ test("route evidence durability failure is classified and stops before provider 
 		strictEqual(record.state, "failed");
 		strictEqual(record.lastFailure.errorKind, result.errorKind);
 	}
+});
+
+test("mixed adapter and funding CLI exhaustion returns durable evidence without suppressing fallback", async () => {
+	const f = localFixture();
+	f.options.routingRunId = "funding-only-real";
+	let launched = false;
+	f.deps.executeProvider = async () => {
+		launched = true;
+		throw new Error("must not launch");
+	};
+	f.deps.stateRoot = join(root, "routing-state");
+	f.deps.route = (input) =>
+		select(
+			snapshotRead([provider("codex", 1), provider("antigravity", 2)]),
+			input,
+		);
+	f.deps.assertFundedRoute = (id) => {
+		throw Object.assign(new Error("DO_NOT_PERSIST"), {
+			code:
+				id === "codex"
+					? "paid_overage_not_allowed"
+					: "included_usage_unverified",
+		});
+	};
+	let output;
+	await handleSimple(
+		[
+			f.options.promptPath,
+			"--project",
+			f.options.projectPath,
+			"--file",
+			"a.txt",
+			"--check",
+			"true",
+			"--capability",
+			"standard",
+			"--routing-run-id",
+			f.options.routingRunId,
+			"--timeout",
+			"1",
+		],
+		{
+			...f.deps,
+			signalProcess: new EventEmitter(),
+			onStatus: () => {},
+			writeResult: (value) => {
+				output = JSON.parse(value);
+			},
+		},
+	);
+	strictEqual(launched, false);
+	strictEqual(output.direction, "native_required", JSON.stringify(output));
+	strictEqual(output.exhaustionCause, "capacity");
+	strictEqual(output.status, "deferred");
+	const record = await readRun(output.runId);
+	deepStrictEqual(output.routeEvidence, record.routeEvidence);
+	for (const [targetId, reason] of [
+		["codex", "paid_overage_not_allowed"],
+		["antigravity", "included_usage_unverified"],
+	])
+		ok(
+			output.routeEvidence.excluded.some(
+				(entry) => entry.targetId === targetId && entry.reason === reason,
+			),
+		);
+	ok(!JSON.stringify(output.routeEvidence).includes("DO_NOT_PERSIST"));
+	deepStrictEqual(output.failedTargetIds, []);
+});
+
+test("standalone funding refusal preserves its exception code and durable caller diagnostics", async () => {
+	const f = localFixture();
+	f.deps.route = (input) => select(snapshotRead([provider("codex", 1)]), input);
+	f.deps.assertFundedRoute = () => {
+		throw Object.assign(new Error("private detail"), {
+			code: "included_usage_unverified",
+		});
+	};
+	const result = await runSimpleTask(f.options, f.deps);
+	strictEqual(result.failureReason, "included_usage_unverified");
+	strictEqual(
+		result.routeEvidence.selectionReason,
+		"included_usage_unverified",
+	);
+	deepStrictEqual(
+		result.routeEvidence,
+		(await readRun(result.runId)).routeEvidence,
+	);
+	ok(
+		result.routeEvidence.excluded.some(
+			(entry) =>
+				entry.targetId === "codex" &&
+				entry.reason === "included_usage_unverified",
+		),
+	);
 });

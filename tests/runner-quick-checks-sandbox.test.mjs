@@ -13,7 +13,15 @@ import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 
 const TEST_DIR = join(cwd(), ".switchyard-quick-check-test-sandbox");
 function runFixtureGit(projectPath, args) {
-	const result = spawnSync("git", args, { cwd: projectPath, encoding: "utf8" });
+	const result = spawnSync("git", args, {
+		cwd: projectPath,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_SYSTEM: "/dev/null",
+		},
+	});
 	if (result.status !== 0)
 		throw new Error(result.stderr || `git ${args.join(" ")} failed`);
 	return result.stdout.trim();

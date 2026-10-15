@@ -243,6 +243,8 @@ describe("source-boundary contract gate mapping", () => {
 			/contract_gate_execution_invalid/,
 		);
 		const executedQuickCheckSuites = [
+			"tests/runner-python-quick-checks-host.test.mjs",
+			"tests/runner-python-quick-checks-unit.test.mjs",
 			"tests/runner-quick-checks-cleanup.test.mjs",
 			"tests/runner-quick-checks-contract-recovery.test.mjs",
 			"tests/runner-quick-checks-queue-recovery.test.mjs",
@@ -250,6 +252,8 @@ describe("source-boundary contract gate mapping", () => {
 			"tests/runner-quick-checks-sandbox.test.mjs",
 			"tests/runner-quick-checks-toolchain-sandbox.test.mjs",
 			"tests/runner-quick-checks-xcode-sandbox.test.mjs",
+			"tests/sandbox-canary-install.test.mjs",
+			"tests/sandbox-canary.test.mjs",
 		];
 		deepStrictEqual(
 			validateExecution({

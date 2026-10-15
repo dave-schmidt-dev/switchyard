@@ -169,6 +169,33 @@ function goldenImageProviderMatches(verified, snapshotName) {
 	);
 }
 
+// Joint pacing gate for Cursor. Its ac (priority-fill) and ap (last-resort)
+// candidates are mutually exclusive accounting buckets, so neither may be
+// offered unless the snapshot carries a trustworthy pace for BOTH: the exact
+// `ac` and `ap` windows must be present with a finite, non-negative
+// `pace_delta`. A missing/non-finite pace is budget_pace_unavailable (we
+// cannot prove the budget is being respected); a finite negative pace is
+// budget_pace_exceeded (the provider is behind its pace). The raw
+// `provider.windows` array is inspected deliberately: the generic
+// percent_left filter below would silently drop a malformed entry, making a
+// present-but-unpaced bucket look absent and hide the real rejection.
+function cursorPacingRejection(name, provider) {
+	if (normalizeProviderName(name) !== "cursor") return null;
+	const windows = Array.isArray(provider?.windows) ? provider.windows : [];
+	const acWindow = windows.find((window) => window?.id === "ac");
+	const apWindow = windows.find((window) => window?.id === "ap");
+	if (!acWindow || !apWindow) return "budget_pace_unavailable";
+	const paceOf = (window) =>
+		typeof window?.pace_delta === "number" && Number.isFinite(window.pace_delta)
+			? window.pace_delta
+			: null;
+	const acPace = paceOf(acWindow);
+	const apPace = paceOf(apWindow);
+	if (acPace === null || apPace === null) return "budget_pace_unavailable";
+	if (acPace < 0 || apPace < 0) return "budget_pace_exceeded";
+	return null;
+}
+
 function hasQuotaHeadroom(name, windows, floor) {
 	const priority = getImplementorPriority(name);
 	const minPercentLeft = windows.reduce(
@@ -256,6 +283,17 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 		)
 	) {
 		return { eligible: false, reason: "not_golden_image_verified" };
+	}
+	// Preserve observed provider failures ahead of Cursor pacing diagnostics.
+	if (provider?.ok === false) {
+		return { eligible: false, reason: "provider_unavailable" };
+	}
+	// Cursor's joint ac/ap pacing gate runs before the unknown-usage short
+	// circuit so blind and preflight rejections match the observed path, and
+	// before the percent_left filter whose omission would hide a raw entry.
+	const pacingRejection = cursorPacingRejection(name, provider);
+	if (pacingRejection) {
+		return { eligible: false, reason: pacingRejection };
 	}
 	// Unknown usage is the blind-fallback case: the absence of a snapshot is
 	// not evidence of quota exhaustion. Every non-usage gate above still holds.

@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
 import { parseRfc3339 } from "../rfc3339.mjs";
 import { getStateRoot } from "../run-store/index.mjs";
 import { NON_BLAMING_CAUSES } from "./attempt-blame.mjs";
@@ -121,6 +122,7 @@ const OPTIONAL_ATTEMPT_KEYS = [
 	"continuedFromAttemptId",
 	"continuationSkipped",
 	"nonBlamingCause",
+	"gitControlTamper",
 ];
 function attemptKeysFor(item) {
 	return item && typeof item === "object" && !Array.isArray(item)
@@ -143,6 +145,12 @@ function nonBlamingCauseValid(item) {
 	return (
 		item.nonBlamingCause === undefined ||
 		NON_BLAMING_CAUSES.includes(item.nonBlamingCause)
+	);
+}
+function gitControlTamperValid(item) {
+	return (
+		item.gitControlTamper === undefined ||
+		sanitizeGitControlTamper(item.gitControlTamper) !== null
 	);
 }
 
@@ -250,6 +258,7 @@ function validateState(state, project, runId) {
 			!allocation(allocated) ||
 			!continuationValid(item, seen) ||
 			!nonBlamingCauseValid(item) ||
+			!gitControlTamperValid(item) ||
 			seen.has(item.attemptId) ||
 			!["succeeded", "failed", "skipped"].includes(item.terminal) ||
 			!REASONS.has(item.reason) ||

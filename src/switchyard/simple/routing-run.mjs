@@ -1,6 +1,7 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
 import {
 	getImplementorPriority,
 	resolveTargetIdentity,
@@ -17,12 +18,17 @@ import {
 	planContinuation,
 	sourceSuperseded,
 } from "./partial-continuation.mjs";
+import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { recordRouteExhaustion } from "./route-exhaustion.mjs";
 import {
 	knownBrokenCheck,
 	rememberBrokenCheck,
 } from "./routing-check-memory.mjs";
 import { discardAndReleasePartial } from "./routing-recovery.mjs";
+import {
+	createRefusalAccumulator,
+	withRefusalEvidence,
+} from "./routing-refusals.mjs";
 import {
 	canonicalRoutingProject,
 	MAX_ATTEMPT_HISTORY,
@@ -194,6 +200,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			failedTargetIds: handle.state.failedTargetIds,
 			retainedPartials: retainedPartials(),
 			...(releasedPartials.length > 0 ? { releasedPartials } : {}),
+			...routingDiagnostics,
+			...routeDiagnosticPatch(resultExtra.result),
 			...resultExtra,
 		};
 		settledAnswer = out;
@@ -209,6 +217,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const select = deps.route ?? route;
 	const funded = deps.assertFundedRoute ?? assertFundedRoute;
 	const localExcluded = new Set();
+	const refusals = createRefusalAccumulator();
+	let routingDiagnostics = {};
 	const logicalTaskId = taskBinding?.taskId ?? deps.taskId ?? randomUUID();
 	// Task 3.11: the newest retained partial this invocation may carry, and
 	// the sources released once their continuation superseded them.
@@ -298,14 +308,15 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				const availableProviders = (input.availableProviders ?? []).filter(
 					(id) => {
 						const targetId = resolveIdentity(id).targetId;
-						return (
-							!excluded.has(targetId) &&
-							(pinned || [1, 2].includes(priority(targetId)))
-						);
+						const tierAllowed = pinned || [1, 2].includes(priority(targetId));
+						if (excluded.has(targetId))
+							refusals.add(targetId, "explicitly_excluded");
+						else if (!tierAllowed) refusals.add(targetId, "tier_excluded");
+						return !excluded.has(targetId) && tierAllowed;
 					},
 				);
 				for (;;) {
-					const routed = select({
+					let routed = select({
 						...input,
 						availableProviders: availableProviders.filter(
 							(id) => !localExcluded.has(resolveIdentity(id).targetId),
@@ -313,6 +324,11 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						exclude: [...(input.exclude ?? []), ...excluded, ...localExcluded],
 						runId: routingRunId,
 					});
+					for (const entry of routeDiagnosticPatch(routed).routeEvidence
+						?.excluded ?? [])
+						refusals.add(entry.targetId, entry.reason, entry.bucket);
+					routed = withRefusalEvidence(routed, refusals.entries());
+					routingDiagnostics = routeDiagnosticPatch(routed);
 					if (!routed?.provider) {
 						noEligible =
 							typeof routed?.reason === "string" &&
@@ -337,6 +353,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						funded(targetId);
 					} catch (error) {
 						if (!FUNDING_UNAVAILABLE.has(error?.code)) throw error;
+						refusals.add(targetId, error.code);
 						localExcluded.add(targetId);
 						continue;
 					}
@@ -420,6 +437,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				const exhausted =
 					anyFailed ||
 					taskExcludedTargets(handle.state.attempts, logicalTaskId).size > 0;
+				const fundingOnly = refusals.isFundingOnly(exhausted);
 				if (
 					routeCalled &&
 					noEligible &&
@@ -427,14 +445,16 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					!deps.signal?.aborted
 				)
 					return answer(
-						pinned ? "stop" : "native_required",
+						pinned || fundingOnly ? "stop" : "native_required",
 						{
-							status: pinned ? "failed" : "deferred",
-							stopReason: pinned ? "pinned_target_unavailable" : undefined,
+							status: pinned || fundingOnly ? "failed" : "deferred",
+							stopReason: fundingOnly
+								? "funding_exhausted"
+								: pinned
+									? "pinned_target_unavailable"
+									: undefined,
 							exhaustionCause: !pinned
-								? exhausted
-									? "task_failures"
-									: "capacity"
+								? refusals.classifyExhaustion(exhausted)
 								: undefined,
 							result,
 						},
@@ -513,6 +533,9 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			const nonBlaming = failed ? nonBlamingCause(result) : null;
 
 			const continued = continuationFields(plan, seeded);
+			const gitControlTamper = sanitizeGitControlTamper(
+				result?.gitControlTamper,
+			);
 			try {
 				recordAttemptOutcome(handle.state, handle.commit, {
 					...pending,
@@ -521,6 +544,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					closedAt: new Date(now()).toISOString(),
 					partialWorktree: result.partialWorktree ?? null,
 					...(nonBlaming ? { nonBlamingCause: nonBlaming } : {}),
+					...(gitControlTamper ? { gitControlTamper } : {}),
 					...continued,
 				});
 			} catch (error) {

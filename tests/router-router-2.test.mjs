@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import {
+	evaluateCandidateEligibility,
 	preflightMacosQueue,
 	route,
 	routeBlind,
@@ -282,7 +283,7 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 				name: "cursor",
 				ok: true,
 				windows: [
-					{ id: "ac", percent_left: 4.66, pace_delta: -0.4 },
+					{ id: "ac", percent_left: 4.66, pace_delta: 0.1 },
 					{ id: "ap", percent_left: 81.82, pace_delta: 0.2 },
 				],
 			},
@@ -369,5 +370,233 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			"oversized windows must route, not crash the router",
 		);
 		strictEqual(result.percentLeft, 50, "min headroom computed via reduce");
+	});
+});
+
+describe("router (Cursor joint ac/ap pacing gate)", () => {
+	const cursorExclusion = (result) =>
+		result.routeEvidence.excluded.find(
+			(entry) => entry.targetId === "cursor-pro",
+		);
+
+	it("reports provider_unavailable before Cursor pacing when observed provider ok is false", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: false,
+				windows: [
+					{ id: "ac", percent_left: 80 },
+					{ id: "ap", percent_left: 80 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "provider_unavailable");
+	});
+
+	it("excludes Cursor with budget_pace_exceeded when the ac pace is finite negative", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 80, pace_delta: -0.5 },
+					{ id: "ap", percent_left: 80, pace_delta: 0.5 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "budget_pace_exceeded");
+	});
+
+	it("excludes Cursor with budget_pace_exceeded when the ap pace is finite negative", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 80, pace_delta: 0.5 },
+					{ id: "ap", percent_left: 80, pace_delta: -0.5 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "budget_pace_exceeded");
+	});
+
+	it("excludes Cursor with budget_pace_unavailable when the ap window is missing", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [{ id: "ac", percent_left: 80, pace_delta: 0.5 }],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "budget_pace_unavailable");
+	});
+
+	it("excludes Cursor with budget_pace_unavailable when the ac window is missing", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [{ id: "ap", percent_left: 80, pace_delta: 0.5 }],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "budget_pace_unavailable");
+	});
+
+	it("excludes Cursor with budget_pace_unavailable when a pace_delta is missing", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 80, pace_delta: 0.5 },
+					{ id: "ap", percent_left: 80 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "budget_pace_unavailable");
+	});
+
+	it("excludes Cursor with budget_pace_unavailable when a pace_delta is non-finite", () => {
+		// JSON.stringify(Infinity) === "null", so the non-finite pace is written
+		// as raw JSON ("1e999" parses to Infinity) to reach the gate intact.
+		writeFileSync(
+			SNAPSHOT_PATH,
+			'{"schema_version":2,"updated_at":"' +
+				new Date().toISOString() +
+				'","providers":[' +
+				'{"name":"cursor","ok":true,"windows":[' +
+				'{"id":"ac","percent_left":80,"pace_delta":0.5},' +
+				'{"id":"ap","percent_left":80,"pace_delta":1e999}]},' +
+				'{"name":"claude","ok":true,"windows":[{"percent_left":50,"pace_delta":10}]}' +
+				"]}",
+			"utf8",
+		);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "claude");
+		strictEqual(cursorExclusion(result)?.reason, "budget_pace_unavailable");
+	});
+
+	it("allows Cursor when both ac and ap paces are zero or positive", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [
+					{ id: "ac", percent_left: 40, pace_delta: 0 },
+					{ id: "ap", percent_left: 90, pace_delta: 5 },
+				],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 99, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "cursor");
+		strictEqual(result.percentLeft, 40);
+		strictEqual(result.reason, "priority_fill");
+	});
+
+	it("leaves non-Cursor eligibility on finite negative pace unchanged", () => {
+		createTestSnapshot([
+			{
+				name: "antigravity",
+				ok: true,
+				windows: [{ percent_left: 20, pace_delta: -5 }],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 90, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard" });
+		strictEqual(result.provider, "antigravity");
+		strictEqual(result.reason, "priority_fill");
+	});
+
+	it("does not let a pinned --only-provider cursor bypass the pacing gate", () => {
+		createTestSnapshot([
+			{
+				name: "cursor",
+				ok: true,
+				windows: [{ id: "ac", percent_left: 80, pace_delta: 0.5 }],
+			},
+			{
+				name: "claude",
+				ok: true,
+				windows: [{ percent_left: 50, pace_delta: 10 }],
+			},
+		]);
+
+		const result = route({ requiredCapability: "standard", only: ["cursor"] });
+		strictEqual(result.provider, null);
+		strictEqual(result.reason, "no_eligible");
+	});
+
+	it("rejects Cursor under unknown usage so the blind fallback matches observed", () => {
+		const classification = evaluateCandidateEligibility("cursor", null, {
+			requiredCapability: "standard",
+			usageMode: "unknown",
+		});
+		strictEqual(classification.eligible, false);
+		strictEqual(classification.reason, "budget_pace_unavailable");
+
+		const blind = routeBlind(["cursor"], [], "standard");
+		strictEqual(blind.provider, null);
+		strictEqual(blind.reason, "no_eligible_blind");
 	});
 });

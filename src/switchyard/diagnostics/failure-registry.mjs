@@ -29,6 +29,53 @@ import {
 	snapshotSeverity,
 } from "./failure-classifiers.mjs";
 
+export { DETAIL_FIELD_TYPES } from "./failure-detail-types.mjs";
+
+/** Closed evidence values for host-detected Git control tampering. */
+const GIT_CONTROL_TAMPER_KINDS = Object.freeze([
+	"added",
+	"changed",
+	"missing",
+	"missing_snapshot",
+	"non_regular",
+	"removed",
+	"replace_ref",
+	"replaced",
+	"retyped",
+	"uninspectable",
+]);
+const GIT_CONTROL_TAMPER_AREAS = Object.freeze([
+	"HEAD",
+	"config",
+	"hooks",
+	"index",
+	"info",
+	"logs",
+	"objects",
+	"other",
+	"packed-refs",
+	"refs",
+	"root",
+]);
+const GIT_CONTROL_TAMPER_KIND_SET = new Set(GIT_CONTROL_TAMPER_KINDS);
+const GIT_CONTROL_TAMPER_AREA_SET = new Set(GIT_CONTROL_TAMPER_AREAS);
+
+/** Return only the exact closed `{kind, area}` tuple, or null. */
+export function sanitizeGitControlTamper(value) {
+	if (
+		value === null ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		Object.keys(value).length !== 2 ||
+		!Object.hasOwn(value, "kind") ||
+		!Object.hasOwn(value, "area") ||
+		!GIT_CONTROL_TAMPER_KIND_SET.has(value.kind) ||
+		!GIT_CONTROL_TAMPER_AREA_SET.has(value.area)
+	)
+		return null;
+	return { kind: value.kind, area: value.area };
+}
+
 /** Closed cancel-source enum, threaded from the AbortSignal reason. */
 export const CANCEL_SOURCES = Object.freeze([
 	"signal_sigterm",
@@ -134,46 +181,6 @@ const DIFF_DETAIL_FIELDS = Object.freeze([
 	"diffRejectionPaths",
 ]);
 
-/**
- * Typed map of every registered detail field. The run.json failure sanitizer
- * and the failure-log record derive their allowlists from this map, so a
- * detail registered here is persisted without editing those boundaries.
- */
-export const DETAIL_FIELD_TYPES = Object.freeze({
-	failureReason: "string",
-	exitCode: "integer",
-	signal: "string",
-	timedOut: "boolean",
-	cancelled: "boolean",
-	// Task 3.12: the closed cancellation origin, registered only for a
-	// cancelled outcome and validated against CANCEL_SOURCES at the boundary.
-	cancelSource: "string",
-	checkIndex: "integer",
-	checkIdentity: "string",
-	checkEnvironmentSignature: "string",
-	outputPath: "string",
-	dependencyCheck: "string",
-	manifestName: "string",
-	// Task 2.8: check-setup and dry-run executable provenance.
-	checkSetupStep: "string",
-	checkSetupErrorCode: "string",
-	checkSetupSyscall: "string",
-	checkSetupExecutable: "string",
-	checkExecutable: "string",
-	hostExecutable: "string",
-	diffRejectionCategory: "string",
-	diffRejectionCount: "integer",
-	diffRejectionRule: "string",
-	diffRejectionPaths: "stringArray",
-	providerSignature: "string",
-	stderrBytes: "integer",
-	stdoutBytes: "integer",
-	// Precise providerReliability cause code when run.json stores a frozen
-	// stand-in in `lastFailure` (see projectRunFailureForDisk).
-	causeCode: "string",
-	changedFilesUnavailable: "boolean",
-});
-
 const REGISTRY_PHASES = Object.freeze([
 	"preflight",
 	"route",
@@ -239,6 +246,7 @@ export const CODE_CATEGORIES = new Map([
 	["acceptance_check_timeout", "check"],
 	["diff_rejected", "policy"],
 	["scope_rejected", "policy"],
+	["task_estimate_exceeds_budget", "input"],
 	["input_rejected", "input"],
 	["declared_path_has_owner_edits", "input"],
 	["worktree_allocation_failed", "environment"],
@@ -365,8 +373,32 @@ const CHECK_VENV_ROW = Object.freeze({
 	detailFields: CHECK_DETAIL_FIELDS,
 });
 
+const DEADLINE_FIT_ROW = Object.freeze({
+	reason: "task_estimate_exceeds_budget",
+	causeCode: "task_estimate_exceeds_budget",
+	causeCategory: "input",
+	errorKind: "validation_failed",
+	severity: "hard",
+	diffCategory: null,
+	providerCaused: false,
+	detailFields: Object.freeze([
+		"failureReason",
+		"deadlineFitEncoding",
+		"deadlineFitSource",
+		"deadlineFitDeadlineMs",
+		"deadlineFitEstimateMs",
+		"deadlineFitRemainingMs",
+		"deadlineFitCheckReserveMs",
+		"deadlineFitMarginMs",
+		"deadlineFitBudgetMs",
+		"deadlineFitUnverified",
+		"deadlineFitSplitRecommended",
+	]),
+});
+
 /** Every reason the simple engine can hand to the failure classifiers. */
 const FAILURE_REASONS = Object.freeze([
+	"task_estimate_exceeds_budget",
 	"baseline_check_failed",
 	"baseline_check_unavailable",
 	"baseline_failed",
@@ -415,6 +447,7 @@ const FAILURE_REASONS = Object.freeze([
 	"discard_required",
 	"empty_diff",
 	"engine_threw",
+	"funding_exhausted",
 	"ambiguous_combined_rename_spelling",
 	"execution_timed_out",
 	"git_control_tampered",
@@ -538,7 +571,11 @@ const FAILURE_REASONS = Object.freeze([
 
 export const FAILURE_ROWS = Object.freeze(
 	FAILURE_REASONS.map((reason) =>
-		reason === CHECK_VENV_ROW.reason ? CHECK_VENV_ROW : buildRow(reason),
+		reason === DEADLINE_FIT_ROW.reason
+			? DEADLINE_FIT_ROW
+			: reason === CHECK_VENV_ROW.reason
+				? CHECK_VENV_ROW
+				: buildRow(reason),
 	),
 );
 
@@ -606,6 +643,15 @@ export function resolveFailure(input = {}) {
 	const cancelled =
 		input.cancelled === true || providerResult?.cancelled === true;
 	const timedOut = input.timedOut === true || providerResult?.timedOut === true;
+	if (reason === "task_estimate_exceeds_budget" && !cancelled && !timedOut)
+		return Object.freeze({
+			...DEADLINE_FIT_ROW,
+			phase,
+			errno,
+			timedOut: false,
+			cancelled: false,
+			cancelSource: null,
+		});
 	const isCheckVenv = reason === "check_venv_outside_project";
 	const classificationReason = isCheckVenv
 		? "check_dependencies_unverified"

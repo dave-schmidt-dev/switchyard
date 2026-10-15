@@ -7,6 +7,10 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 ### Added
 
 - `simple --timeout <minutes>` provides a relative 1–30 minute alternative to `--deadline`.
+- Add optional `simple --estimate-minutes` admission before provider work, with deadline-fit diagnostics and a split recommendation for estimates of 20 minutes or more. Existing deadline caps and funding safeguards remain unchanged.
+- Support bounded Python Quick checks through an existing project virtual environment, with candidate imports, confined caches, and matching planning-side validation.
+- Add a strict host sandbox validation gate and a provider-free daily canary with local failure/recovery notifications.
+- Add rollback-safe canary installation from an explicitly accepted immutable Git revision, plus an idempotent uninstaller.
 - `worktree_missing` failure reason: a simple checkout deleted from outside mid-run (for example by a broad `$TMPDIR` delete) now fails with this environment code before provider-health classification, instead of `provider_group_unconfirmed`, and stops the routing run.
 
 - `simple --origin work|qualification` labels qualification canaries separately; ordinary work remains the default, and provider eligibility and lifecycle gates still apply.
@@ -35,9 +39,14 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
 
 ### Security
+- Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
 - Host git calls on a provider-writable disposable clone pin `core.fsmonitor`, `core.hooksPath`, `diff.external`, `core.attributesFile` and `core.commitGraph`, and the clone's `.git` control state is snapshotted before the provider runs and verified, case-insensitively, before every host git read. Tampered, unreadable or redirected control state (hooks, config, alternates, http-alternates, replace refs) fails closed as `unsafe_diff` with diagnostic `git_control_tampered` and a closed-enum `gitControlTamper {kind, area}`; a trusted shared-clone detach is accepted.
 
 ### Changed
+
+- Persist closed, deduplicated route-refusal reasons in caller and durable evidence, distinguishing funding exhaustion from capacity exhaustion.
+
+- Cursor routing requires finite, nonnegative pace data for both `ac` and `ap`; missing data excludes with `budget_pace_unavailable`, negative pace with `budget_pace_exceeded`, including blind and pinned routes. This eligibility gate does not impose a hard spend cap across simultaneous jobs using one snapshot.
 
 - The pre-provider dry run records which acceptance checks already fail plainly on the unmodified tree (`redAtBaseline`); the provider prompt and the repair prompt name them so the provider stops chasing failures that predate the task. Acceptance is unchanged: every check must still pass.
 - Simple roots now live in an owner-only `$TMPDIR/switchyard-simple-roots/` parent instead of directly in the shared temp directory; the orphan collector scans both locations, and the broad temp sweep never selects the parent.

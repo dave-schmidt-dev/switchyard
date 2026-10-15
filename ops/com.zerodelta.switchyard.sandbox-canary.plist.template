@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Switchyard standalone sandbox canary (LaunchAgent).
+
+  TEMPLATE: ops/install-sandbox-canary.sh copies an immutable, pinned
+  `git archive` snapshot of the accepted revision into a non-TCC location
+  under ~/Library/Application Support/switchyard and substitutes
+  __NODE_BIN__, __CANARY_SCRIPT__, __CANARY_OUT__, and __CANARY_ERR__ with
+  absolute paths. Runs with NO Full Disk Access grant, NO root privileges,
+  and NO provider calls. Do not load this template directly.
+
+  SWITCHYARD_CANARY_DAILY=1 selects the scheduled daily mode: at most one run
+  per UTC day with deduplicated local failure/recovery notifications. The
+  script and its child-process supervisor enforce the runtime deadline.
+  PATH is a fixed set so the notifier is discoverable without
+  widening any privilege.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.zerodelta.switchyard.sandbox-canary</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__NODE_BIN__</string>
+		<string>__CANARY_SCRIPT__</string>
+	</array>
+
+	<!-- Run once at load/login, then once per day. Daily state deduplicates
+	     an extra RunAtLoad run that lands on the same UTC day. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>86400</integer>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SWITCHYARD_CANARY_DAILY</key>
+		<string>1</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+
+	<!-- Never contend with foreground work. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+
+	<key>StandardOutPath</key>
+	<string>__CANARY_OUT__</string>
+	<key>StandardErrorPath</key>
+	<string>__CANARY_ERR__</string>
+</dict>
+</plist>

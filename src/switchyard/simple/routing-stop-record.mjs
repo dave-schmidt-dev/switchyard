@@ -1,5 +1,6 @@
 /** Closed lifecycle verdicts and failure-log record shapes for the routing waterfall. */
 import { createHash } from "node:crypto";
+import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
 import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
@@ -147,12 +148,14 @@ export function lifecycleFailure(result, pending, record, project, options) {
 /** Cause fields every attempt and stop record copies from its triggering result. */
 function causeFields(result, accountability = result?.accountability) {
 	const reliability = result?.providerReliability;
+	const gitControlTamper = sanitizeGitControlTamper(result?.gitControlTamper);
 	return {
 		causeCategory: reliability?.causeCategory ?? accountability?.causeCategory,
 		causeCode: reliability?.causeCode ?? accountability?.causeCode,
 		phase: reliability?.phase,
 		failurePhase: result?.failurePhase,
 		errorKind: result?.errorKind,
+		...(gitControlTamper ? { gitControlTamper } : {}),
 	};
 }
 

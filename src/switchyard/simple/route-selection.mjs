@@ -8,13 +8,17 @@ import {
 	routeDiagnosticPatch,
 } from "./route-evidence.mjs";
 import { liveRouteExhaustion } from "./route-exhaustion.mjs";
+import {
+	createRefusalAccumulator,
+	withRefusalEvidence,
+} from "./routing-refusals.mjs";
+import { deadlineFitBudgetMs, evaluateDeadlineFit } from "./task-sizing.mjs";
 
-// Deadline-fit policy: a target whose observed p80 cannot finish inside the
-// remaining budget (minus the acceptance-check reserve and a fixed margin)
-// is excluded; if that would empty the pool the filter is overridden.
-const DEADLINE_FIT_MARGIN_MS = 90_000;
-const DEADLINE_FIT_CHECK_RESERVE_BASE_MS = 60_000;
-const DEADLINE_FIT_CHECK_RESERVE_PER_CHECK_MS = 30_000;
+// Deadline-fit policy (shared with the pre-provider task-sizing refusal): a
+// target whose observed p80 cannot finish inside the remaining budget (minus
+// the acceptance-check reserve and a fixed margin) is excluded; if that would
+// empty the pool the filter is overridden. A caller estimate is decisive and
+// so is evaluated before any route call.
 
 // The router's no_eligible* decline reasons (capability ceiling, upstream
 // detail) stay in the route evidence; the failure itself carries the one closed
@@ -44,8 +48,23 @@ export function createSimpleRouteSelection({
 					(!adapter.defaultCapabilities ||
 						adapter.defaultCapabilities.includes(options.capability)),
 			).map((adapter) => adapter.targetId);
+	const checks = options.checks ?? [];
+	// Decision 4: a caller estimate is target-independent, so an estimate that
+	// cannot fit refuses before any route call — no target is selected, no
+	// provider work starts and no routing attempt is counted.
+	const explicitFitRefusal = () => {
+		const evidence = evaluateDeadlineFit({
+			estimateMinutes: options.estimateMinutes ?? null,
+			p80Ms: null,
+			deadlineMs: options.deadlineMs,
+			nowMs: now(),
+			checkCount: checks.length,
+		});
+		return evidence.fits === false ? evidence : null;
+	};
 	const compatibleSimpleTargets = [];
 	const adapterEvidence = createRouteEvidenceCapture();
+	const refusals = createRefusalAccumulator();
 	let pinnedIncompatibility = null;
 	for (const candidate of requestedSimpleTargets) {
 		const candidateIdentity = resolveIdentity(candidate);
@@ -66,6 +85,7 @@ export function createSimpleRouteSelection({
 			compatibleSimpleTargets.push(candidateTargetId);
 		} else {
 			adapterEvidence.exclude(candidateTargetId, compatibility.reason);
+			refusals.add(candidateTargetId, compatibility.reason);
 			if ((options.onlyProviders ?? []).length)
 				pinnedIncompatibility = compatibility.reason;
 		}
@@ -77,6 +97,12 @@ export function createSimpleRouteSelection({
 		return {
 			excludedSimpleTargets: new Set(),
 			selectSimpleRoute: async () => {
+				const refused = explicitFitRefusal();
+				if (refused)
+					return {
+						error: "task_estimate_exceeds_budget",
+						deadlineFit: refused,
+					};
 				await onDecision(
 					adapterEvidence.finish({
 						provider: null,
@@ -94,14 +120,12 @@ export function createSimpleRouteSelection({
 		deadlineFitApplied = true;
 		// A pinned --only-provider request is an explicit operator override.
 		if ((options.onlyProviders ?? []).length) return;
-		if (!Number.isFinite(options.deadlineMs)) return;
-		const remainingMs = Math.max(0, options.deadlineMs - now());
-		const checkReserveMs = Math.max(
-			DEADLINE_FIT_CHECK_RESERVE_BASE_MS,
-			DEADLINE_FIT_CHECK_RESERVE_PER_CHECK_MS *
-				Math.max(0, options.checks?.length ?? 0),
-		);
-		const budgetMs = remainingMs - checkReserveMs - DEADLINE_FIT_MARGIN_MS;
+		const budgetMs = deadlineFitBudgetMs({
+			deadlineMs: options.deadlineMs,
+			nowMs: now(),
+			checkCount: checks.length,
+		});
+		if (budgetMs === null) return;
 		const slowTargets = [];
 		try {
 			for (const candidate of compatibleSimpleTargets) {
@@ -161,23 +185,18 @@ export function createSimpleRouteSelection({
 		...quotaExhaustionEvidence,
 		...deadlineFitEvidence,
 	];
-	const withSelectionEvidence = (routed) =>
-		selectionEvidence().length === 0 ||
-		routed?.routeEvidence?.schemaVersion !== 1
-			? routed
-			: {
-					...routed,
-					routeEvidence: {
-						...routed.routeEvidence,
-						excluded: [
-							...selectionEvidence(),
-							...(Array.isArray(routed.routeEvidence.excluded)
-								? routed.routeEvidence.excluded
-								: []),
-						],
-					},
-				};
+	const withSelectionEvidence = (routed) => {
+		for (const entry of selectionEvidence())
+			refusals.add(entry.targetId, entry.reason, entry.bucket);
+		for (const entry of routeDiagnosticPatch(routed).routeEvidence?.excluded ??
+			[])
+			refusals.add(entry.targetId, entry.reason, entry.bucket);
+		return withRefusalEvidence(routed, refusals.entries());
+	};
 	const selectSimpleRoute = async () => {
+		const refused = explicitFitRefusal();
+		if (refused)
+			return { error: "task_estimate_exceeds_budget", deadlineFit: refused };
 		if (!quotaExhaustionApplied) applyQuotaExhaustion();
 		if (!deadlineFitApplied) await applyDeadlineFit();
 		while (excludedSimpleTargets.size < compatibleSimpleTargets.length) {
@@ -213,10 +232,17 @@ export function createSimpleRouteSelection({
 				return { error: healthBlocked ? "route_health_blocked" : error };
 			}
 			const candidateProvider = routed.provider;
+			const reject = async (error) => {
+				refusals.add(candidateProvider, error);
+				await onDecision(
+					withSelectionEvidence({ ...routed, provider: null, reason: error }),
+				);
+				return { error };
+			};
 			const candidateIdentity = resolveIdentity(candidateProvider);
 			const candidateTargetId = candidateIdentity.targetId;
 			if (!candidateTargetId || !candidateIdentity.harnessKey)
-				return { error: "target_identity_unavailable" };
+				return reject("target_identity_unavailable");
 			const candidateDescriptor = descriptorFor(
 				candidateProvider,
 				options.capability,
@@ -225,7 +251,7 @@ export function createSimpleRouteSelection({
 				!candidateDescriptor ||
 				candidateDescriptor.target_id !== candidateTargetId
 			)
-				return { error: "invocation_descriptor_unavailable" };
+				return reject("invocation_descriptor_unavailable");
 			const candidateHarness = normalizeProviderName(
 				candidateIdentity.harnessKey,
 			);
@@ -235,8 +261,26 @@ export function createSimpleRouteSelection({
 				descriptor: candidateDescriptor,
 				capability: options.capability,
 			});
-			if (!compatibility.compatible) return { error: compatibility.reason };
-			funded(candidateTargetId);
+			if (!compatibility.compatible) return reject(compatibility.reason);
+			try {
+				funded(candidateTargetId);
+			} catch (error) {
+				if (
+					["paid_overage_not_allowed", "included_usage_unverified"].includes(
+						error?.code,
+					)
+				) {
+					refusals.add(candidateTargetId, error.code);
+					await onDecision(
+						withSelectionEvidence({
+							...routed,
+							provider: null,
+							reason: error.code,
+						}),
+					);
+				}
+				throw error;
+			}
 			const prepared = await healthController.prepare({
 				provider: candidateProvider,
 				targetId: candidateTargetId,
@@ -244,10 +288,38 @@ export function createSimpleRouteSelection({
 				descriptor: candidateDescriptor,
 			});
 			if (!prepared.allowed || prepared.reroute) {
+				refusals.add(candidateTargetId, "route_health_suppressed");
 				excludedSimpleTargets.add(candidateTargetId);
+				await onDecision(
+					withSelectionEvidence({
+						...routed,
+						provider: null,
+						reason: "route_health_suppressed",
+					}),
+				);
 				continue;
 			}
+			// Diagnostic provenance belongs to the selected cell only. History
+			// remains advisory and preserves the existing routing policy.
+			let p80Ms = null;
+			if (options.estimateMinutes == null) {
+				try {
+					p80Ms = await observedP80(candidateTargetId, options.projectPath, {
+						runsRoot: runsRoot(),
+					});
+				} catch {
+					/* An unavailable history is unknown. */
+				}
+			}
+			const deadlineFit = evaluateDeadlineFit({
+				estimateMinutes: options.estimateMinutes,
+				p80Ms,
+				deadlineMs: options.deadlineMs,
+				nowMs: now(),
+				checkCount: checks.length,
+			});
 			return {
+				deadlineFit,
 				provider: candidateProvider,
 				diagnostics: routeDiagnosticPatch(routed),
 				targetId: candidateTargetId,
@@ -257,6 +329,9 @@ export function createSimpleRouteSelection({
 				prepared,
 			};
 		}
+		await onDecision(
+			withSelectionEvidence({ provider: null, reason: "no_eligible" }),
+		);
 		return { error: "route_health_blocked" };
 	};
 	return { excludedSimpleTargets, selectSimpleRoute };

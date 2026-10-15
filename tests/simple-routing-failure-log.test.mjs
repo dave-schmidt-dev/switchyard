@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { readFailureRecords } from "../src/switchyard/simple/failure-log.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
+import { readRoutingRunState } from "../src/switchyard/simple/routing-state.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 
 const readLog = (stateRoot) => readFailureRecords({ stateRoot });
@@ -151,6 +152,35 @@ test("a hard failure writes one attempt record and one stop record", async () =>
 	strictEqual(records[1].reason, null);
 	strictEqual(records[1].severity, null);
 	strictEqual(records[1].exhaustionCause, null);
+});
+
+test("malformed git-control evidence is omitted from routing state and failure log", async () => {
+	for (const gitControlTamper of [
+		{ kind: "changed", area: "config", path: "/private/provider-path" },
+		{ kind: "provider_value", area: "config" },
+		{ kind: "added", area: "provider_path" },
+	]) {
+		const f = fixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: {
+					failureReason: "unsafe_diff",
+					failurePhase: "diff",
+					errorKind: "policy_violation",
+					gitControlTamper,
+				},
+			},
+		});
+		await runSimpleRoutingTask(f.options, f.deps);
+		const state = readRoutingRunState(f.options.projectPath, "run-1", {
+			stateRoot: f.deps.stateRoot,
+		});
+		strictEqual(Object.hasOwn(state.attempts[0], "gitControlTamper"), false);
+		const record = readLog(f.deps.stateRoot).find(
+			(item) => item.recordType === "attempt",
+		);
+		strictEqual(Object.hasOwn(record, "gitControlTamper"), false);
+	}
 });
 
 test("a full success writes no failure records", async () => {

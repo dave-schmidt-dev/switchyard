@@ -68,6 +68,8 @@ contract_gates:
   outcome-schema-reducer: {gate_test_status: not-run}
   production-runner: {gate_test_status: not-run}
   quick-checks: {gate_test_status: not-run}
+  # Python Quick gates: runner-python-quick-checks-unit.test.mjs (portable) and
+  # runner-python-quick-checks-host.test.mjs (serial host confinement; fresh run required).
   worker-bootstrap: {gate_test_status: not-run}
   dispatch-cli-counters: {gate_test_status: not-run}
   run-store: {gate_test_status: not-run}

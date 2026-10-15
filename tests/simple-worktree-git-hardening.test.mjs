@@ -15,13 +15,17 @@ import {
 import { dirname, join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { detachSharedClone } from "../ops/simple-native-launcher-core.mjs";
+import { readRun } from "../src/switchyard/run-store/index.mjs";
 import {
 	snapshotGitControl,
 	verifyGitControl,
 	worktreeGit,
 } from "../src/switchyard/simple/args.mjs";
+import { readFailureRecords } from "../src/switchyard/simple/failure-log.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { captureWorktreeDiff } from "../src/switchyard/simple/provider-invocation.mjs";
+import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
+import { readRoutingRunState } from "../src/switchyard/simple/routing-state.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
@@ -519,6 +523,56 @@ describe("simple dispatch git hardening", () => {
 		strictEqual(
 			readFileSync(join(repo.projectPath, "src", "a.txt"), "utf8"),
 			"base\n",
+		);
+		deepStrictEqual(leakedSimpleRoots(), []);
+	});
+
+	it("preserves closed git tamper evidence through routing and durable records", async () => {
+		const repo = makeRepo();
+		const routingRunId = "git-control-tamper-test";
+		const stateRoot = join(SUITE_TMPDIR, "routing-state");
+		const evidence = { kind: "changed", area: "config" };
+		const routed = await runSimpleRoutingTask(
+			options(repo, { routingRunId, onlyProviders: ["codex"] }),
+			{
+				...dependencies({
+					executeProvider: async ({ worktreePath }) => {
+						appendFileSync(
+							join(worktreePath, ".git", "config"),
+							"\n[core]\n\tfsmonitor = true\n",
+							"utf8",
+						);
+						return {
+							success: true,
+							code: 0,
+							writerLifecycle: "stopped",
+						};
+					},
+				}),
+				runSimpleTask,
+				stateRoot,
+			},
+		);
+		strictEqual(routed.direction, "stop");
+		strictEqual(routed.result.status, "failed");
+		deepStrictEqual(routed.result.gitControlTamper, evidence);
+
+		const state = readRoutingRunState(repo.projectPath, routingRunId, {
+			stateRoot,
+		});
+		deepStrictEqual(state.attempts[0].gitControlTamper, evidence);
+		const run = await readRun(routed.result.runId);
+		deepStrictEqual(run.lastFailure.gitControlTamper, evidence);
+		const failures = readFailureRecords({ stateRoot });
+		deepStrictEqual(
+			failures.find((failure) => failure.recordType === "attempt")
+				.gitControlTamper,
+			evidence,
+		);
+		deepStrictEqual(
+			failures.find((failure) => failure.recordType === "stop")
+				.gitControlTamper,
+			evidence,
 		);
 		deepStrictEqual(leakedSimpleRoots(), []);
 	});

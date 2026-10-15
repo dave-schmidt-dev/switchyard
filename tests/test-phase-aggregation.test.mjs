@@ -20,14 +20,36 @@ describe("test phase aggregation runner", () => {
 	it("keeps the exact shell selection manifest and bounds only the other-phase Node workers", () => {
 		const pkg = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
 		const script = pkg.scripts["test:other"];
+		const additions = [
+			"tests/sandbox-canary.test.mjs",
+			"tests/sandbox-canary-install.test.mjs",
+			"tests/runner-python-quick-checks-host.test.mjs",
+		];
+		const serialArguments = pkg.scripts["test:serial"].split(" ");
+		deepStrictEqual(
+			serialArguments.filter((arg) => additions.includes(arg)),
+			additions,
+		);
+		let historicalOther = script.replace("--test-concurrency=2 ", "");
+		for (const path of additions) {
+			const exactCaseEntry = `|${path}`;
+			strictEqual(
+				historicalOther.split(exactCaseEntry).length - 1,
+				1,
+				`one exclusion required: ${path}`,
+			);
+			historicalOther = historicalOther.replace(exactCaseEntry, "");
+		}
+		const historicalSerial = serialArguments
+			.filter((arg) => !additions.includes(arg))
+			.join(" ");
+
 		strictEqual(
-			createHash("sha256")
-				.update(script.replace("--test-concurrency=2 ", ""))
-				.digest("hex"),
+			createHash("sha256").update(historicalOther).digest("hex"),
 			"9ac067d7c6224797a684f49eb3ca539fad2e180b9b69141b378a3fa8eb17347a",
 		);
 		strictEqual(
-			createHash("sha256").update(pkg.scripts["test:serial"]).digest("hex"),
+			createHash("sha256").update(historicalSerial).digest("hex"),
 			"ef10de5076ecf90f79b70868759033b55375fee4a76bb206f60ebe08e705dbc4",
 		);
 		ok(

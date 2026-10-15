@@ -105,6 +105,13 @@ describe("contract coverage groups", () => {
 			"simple-routing-release-transition",
 			"simple-routing-state",
 		].map((name) => `tests/${name}.test.mjs`);
+		// The charter adds this exact venv-proof suite; the historical suite
+		// hash below still guards every original entry and ordering.
+		const charterAdditions = ["tests/python-venv-proof.test.mjs"];
+		deepStrictEqual(
+			plan.suites.filter((path) => charterAdditions.includes(path)),
+			charterAdditions,
+		);
 		strictEqual(new Set(plan.suites).size, plan.suites.length);
 		for (const path of regressions)
 			ok(plan.suites.includes(path), `focused suite missing: ${path}`);
@@ -112,7 +119,10 @@ describe("contract coverage groups", () => {
 			createHash("sha256")
 				.update(
 					JSON.stringify(
-						plan.suites.filter((path) => !regressions.includes(path)),
+						plan.suites.filter(
+							(path) =>
+								!regressions.includes(path) && !charterAdditions.includes(path),
+						),
 					),
 				)
 				.digest("hex"),

@@ -16,7 +16,7 @@ export async function handleSimple(argv, dependencies = {}) {
 		dependencies.onStatus ??
 		((event) =>
 			console.error(
-				`dispatch: simple task=${event.taskId} phase=${event.phase}${event.milestone ? ` milestone=${event.milestone}` : ""}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
+				`dispatch: simple task=${event.taskId} phase=${event.phase}${event.milestone ? ` milestone=${event.milestone}` : ""}${event.checkIndex ? ` check=${event.checkIndex}` : ""}${event.deadlineFitSource ? ` deadline_fit=${event.deadlineFitSource} unverified=${event.deadlineFitUnverified} estimate_ms=${event.deadlineFitEstimateMs} budget_ms=${event.deadlineFitBudgetMs}${event.deadlineFitSplitRecommended ? " recommendation=split_task_at_20_minutes" : ""}` : ""}`,
 			));
 	const onInterrupt = (signal) => {
 		if (receivedSignal !== null) return;
@@ -102,6 +102,14 @@ export async function handleSimple(argv, dependencies = {}) {
 				routingRunIdSource: routing.routingRunIdSource,
 				direction: routing.direction,
 				attempts: routing.attempts,
+				...(routing.routeEvidence
+					? {
+							routeEvidence: routing.routeEvidence,
+							snapshotStatus: routing.snapshotStatus,
+							snapshotMtime: routing.snapshotMtime,
+							snapshotAgeMsAtRoute: routing.snapshotAgeMsAtRoute,
+						}
+					: {}),
 				failedTargetIds: routing.failedTargetIds,
 				...(routing.exhaustionCause
 					? { exhaustionCause: routing.exhaustionCause }

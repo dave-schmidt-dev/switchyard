@@ -8,7 +8,10 @@ import {
 	readFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { DETAIL_FIELD_TYPES } from "../diagnostics/failure-registry.mjs";
+import {
+	DETAIL_FIELD_TYPES,
+	sanitizeGitControlTamper,
+} from "../diagnostics/failure-registry.mjs";
 import {
 	retainedSegmentPaths,
 	rotateLedgerIfNeeded,
@@ -46,6 +49,7 @@ const OPTIONAL_FIELD_TYPES = Object.freeze({
 	preflightCode: "string",
 	usageError: "string",
 	lifecycleCheck: "string",
+	gitControlTamper: "gitControlTamper",
 	...DETAIL_FIELD_TYPES,
 });
 const STRING_ARRAY_LIMIT = 5;
@@ -73,6 +77,8 @@ const sanitizeStringArray = (value) => {
 const sanitizeIntegerField = (value) =>
 	Number.isSafeInteger(value) && value >= 0 && value <= 4096 ? value : null;
 function sanitizeOptionalField(type, value) {
+	if (type === "gitControlTamper")
+		return sanitizeGitControlTamper(value) ?? undefined;
 	if (type === "boolean") return typeof value === "boolean" ? value : null;
 	if (type === "integer") return sanitizeIntegerField(value);
 	if (type === "stringArray") return sanitizeStringArray(value);
@@ -156,7 +162,8 @@ export function appendFailureRecord(input, { stateRoot } = {}) {
 		record[key] = typeof input?.[key] === "boolean" ? input[key] : null;
 	for (const [key, type] of Object.entries(OPTIONAL_FIELD_TYPES)) {
 		if (input?.[key] === undefined) continue;
-		record[key] = sanitizeOptionalField(type, input[key]);
+		const safe = sanitizeOptionalField(type, input[key]);
+		if (safe !== undefined) record[key] = safe;
 	}
 	// lifecycleCheck is a closed enum: anything else is not a check name.
 	if (

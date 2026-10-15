@@ -5,6 +5,7 @@ import {
 	CODE_CATEGORIES,
 	causeCategoryFor,
 	DETAIL_FIELD_TYPES,
+	sanitizeGitControlTamper,
 } from "../diagnostics/failure-registry.mjs";
 import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import {
@@ -164,6 +165,7 @@ export function sanitizeFailureMetadata({
 	providerReliability,
 	checkExecutable,
 	hostExecutable,
+	gitControlTamper,
 } = {}) {
 	if (!result || SUCCESS_RESULTS.has(result)) return null;
 	const requestedKind = normalizePersistentErrorKind(errorKind);
@@ -177,6 +179,8 @@ export function sanitizeFailureMetadata({
 		reasonCode: metadata.reasonCode,
 		reason: metadata.reason,
 	};
+	const safeGitControlTamper = sanitizeGitControlTamper(gitControlTamper);
+	if (safeGitControlTamper) safe.gitControlTamper = safeGitControlTamper;
 	if (isProviderReliabilityDiagnostic(providerReliability)) {
 		safe.providerReliability = providerReliability;
 	}
@@ -352,6 +356,7 @@ export function isPersistentFailureMetadata(value) {
 		"checkpointCode",
 		"checkpointDimensions",
 		"providerReliability",
+		"gitControlTamper",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return false;
 	const expected = sanitizeFailureMetadata({
@@ -421,6 +426,7 @@ export function isPersistentFailureMetadata(value) {
 		checkpointCode: value.checkpointCode,
 		checkpointDimensions: value.checkpointDimensions,
 		providerReliability: value.providerReliability,
+		gitControlTamper: value.gitControlTamper,
 	});
 	for (const field of [
 		"diagnosticCode",
@@ -436,6 +442,7 @@ export function isPersistentFailureMetadata(value) {
 		"checkpointCode",
 		"checkpointDimensions",
 		"providerReliability",
+		"gitControlTamper",
 	]) {
 		if (field === "checkpointDimensions") {
 			if (value[field] === undefined && safeDiagnostics?.[field] === undefined)
@@ -447,6 +454,19 @@ export function isPersistentFailureMetadata(value) {
 				value[field].some(
 					(dimension, index) => dimension !== safeDiagnostics[field][index],
 				)
+			)
+				return false;
+			continue;
+		}
+		if (field === "gitControlTamper") {
+			const tamper = value[field];
+			const safeTamper = safeDiagnostics?.[field];
+			if (tamper === undefined && safeTamper === undefined) continue;
+			if (
+				!safeTamper ||
+				tamper?.kind !== safeTamper.kind ||
+				tamper?.area !== safeTamper.area ||
+				Object.keys(tamper ?? {}).length !== 2
 			)
 				return false;
 			continue;

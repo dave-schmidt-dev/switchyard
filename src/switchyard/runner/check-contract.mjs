@@ -1,6 +1,8 @@
+import { isPythonCheck } from "./python-checks.mjs";
+
 const MAX_CHECKS = 4;
 
-export { MAX_CHECKS };
+export { isPythonCheck, MAX_CHECKS };
 
 /** Accept only bounded, direct-exec command forms in a captain task contract. */
 export function parseQuickChecks(
@@ -208,7 +210,8 @@ export function parseCommand(raw, taskId, setup) {
 						!path.startsWith("/") &&
 						!path.split("/").includes(".."),
 				)
-		)
+		) &&
+		!isPythonCheck(args)
 	) {
 		throw new Error(`Task ${taskId}: unsupported Quick check command`);
 	}

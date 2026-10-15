@@ -8,12 +8,18 @@ import { settleSimpleWriterProcesses } from "../simple/process-teardown.mjs";
 import { MAX_CHECKS, parseCommand } from "./check-contract.mjs";
 import { trustedOfflineNpmEnv } from "./check-dependencies.mjs";
 import {
+	isPythonCheck,
+	preparePythonChecks,
+	pythonCheckEnv,
+	verifyPythonCheckLink,
+} from "./python-checks.mjs";
+import {
 	gateCandidate,
 	runCommand,
 	settleScopedChecksSync,
 } from "./reliability.mjs";
 
-export { parseQuickChecks } from "./check-contract.mjs";
+export { isPythonCheck, parseQuickChecks } from "./check-contract.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const MAX_CHECK_MS = 10 * 60_000;
@@ -126,6 +132,11 @@ export function runQuickChecks({
 			)
 				throw new Error("gate_failed");
 		}
+		const hasPython = checks.some((argv) => isPythonCheck(argv));
+		let pythonReadOnlyPaths = [];
+		if (hasPython) {
+			pythonReadOnlyPaths = preparePythonChecks(projectPath, clone);
+		}
 		git(clone, env, ["add", "-A"]);
 		receipt.candidateTree = git(clone, env, ["write-tree"]);
 		if (setup) {
@@ -169,9 +180,14 @@ export function runQuickChecks({
 				deadline,
 				checks.length - index - 1,
 			);
+			const isPython = isPythonCheck(argv);
+			const checkEnv = isPython ? pythonCheckEnv(clone, env, root) : env;
 			const outcome =
 				boundedTimeoutMs >= 100
-					? runCommand(clone, env, argv, boundedTimeoutMs, { command: argv })
+					? runCommand(clone, checkEnv, argv, boundedTimeoutMs, {
+							command: argv,
+							readOnlyPaths: isPython ? pythonReadOnlyPaths : [],
+						})
 					: deadlineExpiredOutcome();
 			receipt.checks.push({
 				index,
@@ -181,15 +197,18 @@ export function runQuickChecks({
 			if (outcome.exitCode !== 0 || outcome.groupCleanup !== "complete")
 				throw new Error("check_failed");
 		}
+		if (hasPython && !verifyPythonCheckLink(projectPath, clone))
+			throw new Error("setup_unavailable");
 		git(clone, env, ["add", "-A"]);
 		if (git(clone, env, ["write-tree"]) !== receipt.candidateTree)
 			throw new Error(baseline ? "baseline_mutation" : "candidate_changed");
 		receipt.status = "passed";
 	} catch (error) {
+		const code = error.code ?? error.message;
 		receipt.status =
-			error.message === "check_failed" ||
-			error.message === "setup_failed" ||
-			error.message === "baseline_mutation"
+			code === "check_failed" ||
+			code === "setup_failed" ||
+			code === "baseline_mutation"
 				? "failed"
 				: "unknown";
 		receipt.failureCode = [
@@ -198,8 +217,9 @@ export function runQuickChecks({
 			"setup_unavailable",
 			"check_failed",
 			"baseline_mutation",
-		].includes(error.message)
-			? error.message
+			"check_venv_outside_project",
+		].includes(code)
+			? code
 			: "candidate_unavailable";
 	} finally {
 		onStatus?.({

@@ -23,7 +23,15 @@ import { tempDir } from "./helpers/tempdir.mjs";
 
 const TEST_DIR = tempDir("switchyard-queue-reliability-");
 function git(cwd, args) {
-	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+	const result = spawnSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_SYSTEM: "/dev/null",
+		},
+	});
 	if (result.status !== 0)
 		throw new Error(result.stderr || `git ${args.join(" ")} failed`);
 	return result.stdout.trim();
@@ -451,7 +459,9 @@ describe("queue reliability contract", () => {
 		strictEqual(receipt.cleanup.status, "complete");
 	});
 
-	it("bounds repair acceptance checks to the pinned absolute deadline", () => {
+	it("bounds repair acceptance checks to the pinned absolute deadline", {
+		skip: nestedSandboxSkip,
+	}, () => {
 		const { project, base } = projectAt("repair-deadline");
 		writeFileSync(join(project, "a.mjs"), "export const a = 2;\n");
 		const diff = git(project, ["diff", "--", "a.mjs"]);

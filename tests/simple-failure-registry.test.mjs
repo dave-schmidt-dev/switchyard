@@ -456,7 +456,13 @@ const ROW_FIELDS = [
 
 test("golden parity: registry reproduces the frozen classifiers over every reason and phase", () => {
 	for (const row of FAILURE_ROWS) {
-		if (row.reason === "check_venv_outside_project") continue;
+		// These later closed rows have explicit tests below; the legacy
+		// classifier oracle remains frozen for every original reason.
+		if (
+			row.reason === "check_venv_outside_project" ||
+			row.reason === "task_estimate_exceeds_budget"
+		)
+			continue;
 		for (const phase of MATRIX_PHASES) {
 			const expectedKind = oracleErrorKind(row.reason, phase, null);
 			const expectedCode = oracleCauseCode(
@@ -680,10 +686,11 @@ test("registry severity sets reproduce the frozen tables", () => {
 	strictEqual(causeCategoryFor("check_venv_outside_project"), "environment");
 });
 
-test("registry code categories reproduce the frozen table plus the venv code", () => {
+test("registry code categories reproduce the frozen table plus explicit later codes", () => {
 	const expected = new Map([
 		...ORACLE_CODE_CATEGORY,
 		["check_venv_outside_project", "environment"],
+		["task_estimate_exceeds_budget", "input"],
 	]);
 	deepStrictEqual(CODE_CATEGORIES, expected);
 	strictEqual(causeCategoryFor("not_a_registered_code"), "unknown");

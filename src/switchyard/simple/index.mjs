@@ -18,7 +18,10 @@ import {
 } from "../adapter/exec-error.mjs";
 import { projectRunFailureForDisk } from "../adapter/exec-error-sanitize.mjs";
 import { boundProviderLifecycleSnapshot } from "../adapter/provider-lifecycle.mjs";
-import { resolveFailure } from "../diagnostics/failure-registry.mjs";
+import {
+	resolveFailure,
+	sanitizeGitControlTamper,
+} from "../diagnostics/failure-registry.mjs";
 import { createProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import {
 	integrationGate,
@@ -84,6 +87,7 @@ import {
 	removeInjectedTestRoot,
 	simpleRootMissing,
 } from "./simple-root.mjs";
+import { deadlineFitDetails, evaluateDeadlineFit } from "./task-sizing.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
 const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
@@ -433,6 +437,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 			return false;
 		}
 	};
+	let routingDiagnostics = {};
+	let selectedSizing = null;
 	const fail = (
 		failureReason,
 		failurePhase,
@@ -441,6 +447,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		diffRejection = null,
 	) => {
 		runTerminalReached = true;
+		const gitControlTamper =
+			failureReason === "unsafe_diff" && error?.code === "git_control_tampered"
+				? sanitizeGitControlTamper({
+						kind: error.tamperKind,
+						area: error.tamperArea,
+					})
+				: null;
 		const dependencyCheck =
 			typeof error?.dependencyCheck === "string" ? error.dependencyCheck : null;
 		// Task 2.7: a candidate diff that changed the dependency manifest is a
@@ -514,6 +527,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			};
 		}
 		const detailValues = {
+			...deadlineFitDetails(error?.deadlineFit, { persisted: true }),
 			failureReason,
 			timedOut,
 			cancelled: providerExecutionResult?.cancelled ?? null,
@@ -568,7 +582,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (keepWorktree && worktreePath) {
 			milestone(failurePhase, "salvage_retained");
 		}
-		milestone("terminal", "failed", { failurePhase });
+		milestone("terminal", "failed", {
+			failurePhase,
+			...deadlineFitDetails(error?.deadlineFit),
+		});
 		const providerReliability = createSimpleProviderReliabilityDiagnostic({
 			errorKind: computedErrorKind,
 			failureReason: classifiedReason,
@@ -614,6 +631,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 		finalResult.origin = origin;
 		finalResult.providerReliability = providerReliability;
 		finalResult.failureDetails = persistentFailureDetails;
+		if (error?.deadlineFit ?? selectedSizing)
+			finalResult.deadlineFit = error?.deadlineFit ?? selectedSizing;
+		if (gitControlTamper) {
+			finalResult.diagnosticCode = "git_control_tampered";
+			finalResult.gitControlTamper = gitControlTamper;
+		}
 		finalResult.providerStarted = providerStarted;
 		finalResult.formatStatus = formatStatus;
 		if (diffRejection) finalResult.diffRejection = diffRejection;
@@ -638,6 +661,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 					runId,
 					{
 						state: "failed",
+						terminalSummary: {
+							status: "failed",
+							deadlineFit: deadlineFitDetails(
+								error?.deadlineFit ?? selectedSizing,
+								{ persisted: true },
+							),
+						},
 						finishedAt: new Date(now()).toISOString(),
 						lastFailure: sanitizeFailureMetadata({
 							taskId,
@@ -658,6 +688,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 							...(providerExecutionResult?.diagnosticEvidenceAvailable === true
 								? { diagnosticEvidenceAvailable: true }
 								: {}),
+							...(gitControlTamper ? { gitControlTamper } : {}),
 							...(Number.isSafeInteger(providerExecutionResult?.code)
 								? { exitCode: providerExecutionResult.code }
 								: {}),
@@ -742,15 +773,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			diagnosticOrigin: "harness",
 			diagnosticEvidenceAvailable: true,
 		};
-		const result = fail("unsafe_diff", failurePhase, "policy_violation");
-		result.diagnosticCode = "git_control_tampered";
-		// Only the closed-enum tamper fields cross into the result; the raw
-		// message and provider-controlled path stay diagnostics.
-		const tamperKind = error?.tamperKind;
-		const tamperArea = error?.tamperArea;
-		if (typeof tamperKind === "string" && typeof tamperArea === "string")
-			result.gitControlTamper = { kind: tamperKind, area: tamperArea };
-		return result;
+		return fail("unsafe_diff", failurePhase, "policy_violation", error);
 	};
 	const failForSignal = (failurePhase = currentPhase) => {
 		if (!signal?.aborted) return null;
@@ -956,6 +979,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				funded: dependencies.assertFundedRoute ?? assertFundedRoute,
 				onDecision: async (routed) => {
 					const diagnostics = routeDiagnosticPatch(routed);
+					routingDiagnostics = diagnostics;
 					if (!runInitialized || !Object.keys(diagnostics).length) return;
 					try {
 						await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(
@@ -979,7 +1003,16 @@ export async function runSimpleTask(options, dependencies = {}) {
 				},
 			});
 		let selectedRoute = await selectSimpleRoute();
-		if (selectedRoute.error) return fail(selectedRoute.error, "route");
+		if (selectedRoute.error)
+			return fail(selectedRoute.error, "route", null, selectedRoute);
+		selectedSizing = selectedRoute.deadlineFit;
+		milestone("route", "task_sizing", deadlineFitDetails(selectedSizing));
+		if (selectedRoute.deadlineFit?.splitRecommended)
+			milestone(
+				"route",
+				"task_split_recommended",
+				deadlineFitDetails(selectedRoute.deadlineFit),
+			);
 		provider = selectedRoute.provider;
 		targetId = selectedRoute.targetId;
 		let descriptor = selectedRoute.descriptor;
@@ -1389,6 +1422,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				].includes(admission.failureReason)
 					? "environment_failure"
 					: null,
+				admission,
 			);
 			result.providerStarted = providerStarted;
 			result.writerLifecycle = providerWriterLifecycle;
@@ -1400,7 +1434,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 		while (!providerHealthStart.allowed && providerHealthStart.reroute) {
 			excludedSimpleTargets.add(targetId);
 			selectedRoute = await selectSimpleRoute();
-			if (selectedRoute.error) return fail("route_health_blocked", "route");
+			if (selectedRoute.error)
+				return fail(selectedRoute.error, "route", null, selectedRoute);
+			selectedSizing = selectedRoute.deadlineFit;
+			milestone("route", "task_sizing", deadlineFitDetails(selectedSizing));
 			provider = selectedRoute.provider;
 			targetId = selectedRoute.targetId;
 			descriptor = selectedRoute.descriptor;
@@ -1457,6 +1494,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (simpleRootMissing(candidatePath)) {
 			worktreeVanished = true;
 			return await cancelAdmission(admission, "worktree_missing");
+		}
+		const startFit = evaluateDeadlineFit({
+			estimateMinutes: options.estimateMinutes,
+			deadlineMs: options.deadlineMs,
+			nowMs: now(),
+			checkCount: options.checks?.length ?? 0,
+		});
+		if (options.estimateMinutes != null && startFit.fits === false) {
+			return await cancelAdmission(
+				{ ...admission, deadlineFit: startFit },
+				"task_estimate_exceeds_budget",
+			);
 		}
 		let providerResult;
 		let requestLogStatus;
@@ -2488,6 +2537,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 					finishedAt: new Date(now()).toISOString(),
 					terminalSummary: {
 						status: "succeeded",
+						deadlineFit: deadlineFitDetails(selectedSizing, {
+							persisted: true,
+						}),
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
@@ -2617,6 +2669,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 					finishedAt: new Date(now()).toISOString(),
 					terminalSummary: {
 						status: "succeeded",
+						deadlineFit: deadlineFitDetails(selectedSizing, {
+							persisted: true,
+						}),
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
@@ -2673,6 +2728,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (reportMode && reportOutput) finalResult.report = reportOutput;
 		finalResult.origin = origin;
 		finalResult.formatStatus = formatStatus;
+		if (selectedSizing) finalResult.deadlineFit = selectedSizing;
 		if (invocationDescriptor) {
 			finalResult.invocationDescriptor = structuredClone(invocationDescriptor);
 			finalResult.descriptorIdentity = invocationDescriptor.descriptor_identity;
@@ -2753,6 +2809,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		await releaseHeldProjectLock();
 		if (finalResult) {
+			Object.assign(finalResult, routingDiagnostics);
 			finalResult.elapsedMs = Math.max(0, now() - startedAt);
 			const worktreeState = finalResult.partialWorktree
 				? "retained"

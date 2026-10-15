@@ -125,6 +125,32 @@ test("appendFailureRecord rejects unknown record types and nulls booleans", () =
 	strictEqual(kept.partialRetained, false);
 });
 
+test("git-control tamper evidence is closed and legacy records omit it", () => {
+	const stateRoot = root();
+	const valid = appendFailureRecord(
+		attempt({ gitControlTamper: { kind: "changed", area: "config" } }),
+		{ stateRoot },
+	);
+	deepStrictEqual(valid.gitControlTamper, {
+		kind: "changed",
+		area: "config",
+	});
+	for (const gitControlTamper of [
+		{ kind: "changed", area: "config", path: "/private/provider-path" },
+		{ kind: "provider_value", area: "config" },
+		{ kind: "added", area: "provider_path" },
+		{ kind: 1, area: "config" },
+	]) {
+		const record = appendFailureRecord(attempt({ gitControlTamper }), {
+			stateRoot,
+		});
+		strictEqual(Object.hasOwn(record, "gitControlTamper"), false);
+	}
+	const legacy = appendFailureRecord(attempt(), { stateRoot });
+	strictEqual(Object.hasOwn(legacy, "gitControlTamper"), false);
+	strictEqual(readFailureRecords({ stateRoot }).length, 6);
+});
+
 test("failure log directory and file are created with restrictive modes", () => {
 	const stateRoot = root();
 	const path = failureLogPath({ stateRoot });
