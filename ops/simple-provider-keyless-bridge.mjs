@@ -4,7 +4,7 @@
 // environment. The sandboxed CLI receives only a per-run nonce.
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
 	createReadStream,
 	existsSync,
@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
 import { dirname, join, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
@@ -27,15 +28,18 @@ const SELF = fileURLToPath(import.meta.url);
 const SAFE_PATH =
 	"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const VIBE = "/Users/dave/.local/share/uv/tools/mistral-vibe/bin/vibe";
-const OPENCODE = resolve(dirname(SELF), "../.tools/opencode-v1.18.30/opencode");
-const OPENCODE_SHA256 =
-	"2d0c9c339bb91046c6ea951c97664bc2f8a8eaca707f31fbfbb7bc73c4eddc62";
+// Homebrew's OpenCode 2.x; the CLI contract canary checks its flags before
+// each run (src/switchyard/cli-contract/canary.mjs).
+const OPENCODE = "/opt/homebrew/bin/opencode";
 const VIBE_RUNTIME = "/Users/dave/.local/share/uv/tools/mistral-vibe";
 const UV_PYTHON = "/Users/dave/.local/share/uv/python";
 const MAX_PROMPT = 256 * 1024;
 const MAX_BODY = 8 * 1024 * 1024;
 const MAX_OUTPUT = 8 * 1024 * 1024;
 const MAX_WAIT_MS = 30 * 60 * 1000;
+// A warm OpenCode 2.x server listens in about 0.2 s; a cold launch on a loaded
+// host has stalled for 10 s (audit section 6.5).
+const SERVER_READY_MS = 60_000;
 const MODELS = Object.freeze({
 	"glm-5-3-medium": {
 		target: "vibe",
@@ -224,14 +228,21 @@ export function parseBridgeArgs(argv) {
 function schemePath(path) {
 	return JSON.stringify(path);
 }
+const validPort = (port) =>
+	Number.isInteger(port) && port >= 1 && port <= 65535;
 export function seatbeltProfile({
 	worktree,
 	runtime,
 	proxyPort,
+	serverPort = null,
 	cliReads = [],
 }) {
-	if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535)
-		fail("invalid proxy port");
+	if (!validPort(proxyPort)) fail("invalid proxy port");
+	if (
+		serverPort !== null &&
+		(!validPort(serverPort) || serverPort === proxyPort)
+	)
+		fail("invalid server port");
 	const reads = [
 		"/System",
 		"/usr",
@@ -265,6 +276,15 @@ export function seatbeltProfile({
 		`(allow file-read* ${reads.map((p) => `(subpath ${schemePath(p)})`).join(" ")})`,
 		`(allow file-write* (subpath ${schemePath(worktree)}) (subpath ${schemePath(runtime)}) (literal "/dev/null"))`,
 		`(allow network-outbound (remote tcp "localhost:${proxyPort}"))`,
+		// OpenCode 2.x splits into a loopback server and a client; both stay on
+		// this one bridge-chosen port, and the server demands a per-run password.
+		...(serverPort === null
+			? []
+			: [
+					`(allow network-bind (local tcp "localhost:${serverPort}"))`,
+					`(allow network-inbound (local tcp "localhost:${serverPort}"))`,
+					`(allow network-outbound (remote tcp "localhost:${serverPort}"))`,
+				]),
 	].join("\n");
 }
 
@@ -617,28 +637,26 @@ function renderVibeConfig(model, port, runtime) {
 	// The simple medium alias follows Vibe's UI mapping to API reasoning_effort=high.
 	return `active_model = ${JSON.stringify(model)}\nenable_telemetry = false\nenable_otel = false\nenable_update_checks = false\nenable_auto_update = false\n\n[session_logging]\nsave_dir = ${JSON.stringify(join(runtime, "vibe", "logs", "session"))}\n\n[[providers]]\nname = "mistral"\napi_base = "http://127.0.0.1:${port}/v1"\napi_key_env_var = "MISTRAL_API_KEY"\n\n[[models]]\nname = "zai-glm-5-3"\nprovider = "mistral"\nalias = "glm-5-3-medium"\nthinking = "high"\n\n[[models]]\nname = "zai-glm-5-3"\nprovider = "mistral"\nalias = "glm-5-3"\nthinking = "max"\n`;
 }
-function renderOpenCodeConfig(port) {
+function renderOpenCodeConfig(port, upstreamModel) {
+	// A V2 catalog model carries its own endpoint, which outranks the
+	// provider's, so the proxy endpoint is set on the model too.
+	const settings = {
+		baseURL: `http://127.0.0.1:${port}/v1`,
+		apiKey: "{env:OPENCODE_API_KEY}",
+	};
 	return JSON.stringify({
 		$schema: "https://opencode.ai/config.json",
-		share: "disabled",
-		autoupdate: false,
-		plugin: [],
-		provider: {
+		providers: {
 			"opencode-go": {
-				// V1's embedded catalog predates this approved model ID.
+				settings,
 				models: {
-					"deepseek-v4.1-flash": {
-						id: "deepseek-v4.1-flash",
-						reasoning: true,
-						variants: {
-							low: { reasoningEffort: "low" },
-							max: { reasoningEffort: "max" },
-						},
+					[upstreamModel]: {
+						settings,
+						variants: [
+							{ id: "low", settings: { reasoningEffort: "low" } },
+							{ id: "max", settings: { reasoningEffort: "max" } },
+						],
 					},
-				},
-				options: {
-					baseURL: `http://127.0.0.1:${port}/v1`,
-					apiKey: "{env:OPENCODE_API_KEY}",
 				},
 			},
 		},
@@ -660,18 +678,6 @@ function verifyVibeSession(runtime, model) {
 			return false;
 		}
 	});
-}
-/** Reject missing, redirected, or changed bytes before launching the fixed runtime. */
-export function verifyOpenCodeRuntime(path = OPENCODE) {
-	if (
-		!existsSync(path) ||
-		lstatSync(path).isSymbolicLink() ||
-		!lstatSync(path).isFile() ||
-		realpathSync(path) !== path ||
-		createHash("sha256").update(readFileSync(path)).digest("hex") !==
-			OPENCODE_SHA256
-	)
-		fail("fixed OpenCode runtime identity mismatch");
 }
 function cliReadPaths(target, cliPath) {
 	return target === "vibe"
@@ -735,6 +741,46 @@ async function settleGroup(child) {
 		await new Promise((done) => setTimeout(done, 100));
 	return !groupPresent(child);
 }
+/** A loopback port free at this moment; the server's own bind is the proof. */
+function freeLoopbackPort() {
+	return new Promise((done, reject) => {
+		const probe = net.createServer();
+		probe.once("error", reject);
+		probe.listen(0, "127.0.0.1", () => {
+			const { port } = probe.address();
+			probe.close(() => done(port));
+		});
+	});
+}
+/**
+ * Resolve true once this server child, and no other process, reports that it
+ * listens on `port`; false when it exits or `timeoutMs` passes first.
+ */
+function serverListening(server, port, timeoutMs) {
+	const ready = `server listening on http://127.0.0.1:${port}`;
+	return new Promise((done) => {
+		let text = "";
+		const finish = (value) => {
+			clearTimeout(timer);
+			server.stdout.removeListener("data", onData);
+			server.removeListener("close", onClose);
+			server.removeListener("error", onClose);
+			// Keep draining so a chatty server never blocks on a full pipe.
+			server.stdout.resume();
+			done(value);
+		};
+		const onData = (chunk) => {
+			text = (text + chunk.toString("utf8")).slice(-4096);
+			if (text.split(/\r?\n/u).some((line) => line.trim() === ready))
+				finish(true);
+		};
+		const onClose = () => finish(false);
+		const timer = setTimeout(() => finish(false), timeoutMs);
+		server.stdout.on("data", onData);
+		server.once("close", onClose);
+		server.once("error", onClose);
+	});
+}
 export async function runBridge({
 	target,
 	model,
@@ -758,15 +804,14 @@ export async function runBridge({
 	if (!MODELS[model] || MODELS[model].target !== target)
 		fail("target/model mismatch");
 	const actualCli = cliPath ?? (target === "vibe" ? VIBE : OPENCODE);
-	// Test fixtures may inject a CLI; production always verifies the fixed bytes.
-	if (target === "opencode-go" && cliPath === undefined)
-		verifyOpenCodeRuntime();
 	detachSharedClone(worktree);
 	const runtime = mkdtempSync(join(dirname(worktree), ".switchyard-keyless-"));
 	let proxy;
+	let server;
 	let child;
 	let inFlight;
 	let interrupted = null;
+	let stopWatching = () => {};
 	try {
 		proxy = await startProxy({
 			target,
@@ -777,10 +822,13 @@ export async function runBridge({
 				process.stderr.write(formatProxyRequestEvent(event));
 			},
 		});
+		const serverPort =
+			target === "opencode-go" ? await freeLoopbackPort() : null;
 		const profile = seatbeltProfile({
 			worktree,
 			runtime,
 			proxyPort: proxy.port,
+			serverPort,
 			cliReads: cliReadPaths(target, actualCli),
 		});
 		const env = {
@@ -799,8 +847,6 @@ export async function runBridge({
 			XDG_DATA_HOME: join(runtime, "data"),
 			XDG_CACHE_HOME: join(runtime, "cache"),
 			OPENCODE_DISABLE_AUTOUPDATE: "1",
-			OPENCODE_DISABLE_SHARE: "1",
-			OPENCODE_DISABLE_TELEMETRY: "1",
 			VIBE_DISABLE_TELEMETRY: "1",
 		};
 		let args;
@@ -832,20 +878,84 @@ export async function runBridge({
 			];
 		} else {
 			env.OPENCODE_API_KEY = proxy.nonce;
-			env.OPENCODE_CONFIG_CONTENT = renderOpenCodeConfig(proxy.port);
+			// Gates the loopback server; client and server share this env.
+			env.OPENCODE_PASSWORD = randomBytes(24).toString("hex");
+			env.OPENCODE_DISABLE_PROJECT_CONFIG = "1";
+			env.OPENCODE_DISABLE_CLAUDE_CODE = "1";
+			env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = "1";
+			env.OPENCODE_DISABLE_MODELS_FETCH = "1";
+			env.OPENCODE_DISABLE_FILEWATCHER = "1";
+			env.OPENCODE_CONFIG_CONTENT = renderOpenCodeConfig(
+				proxy.port,
+				MODELS[model].upstreamModel,
+			);
 			args = [
 				"run",
-				"--pure",
+				"--server",
+				`http://127.0.0.1:${serverPort}`,
 				"--agent",
 				"build",
 				"--auto",
-				"--variant",
-				variant,
+				// A fixed title skips the extra title-generation model request.
+				"--title",
+				"switchyard",
 				"--model",
-				model,
+				`${model}#${variant}`,
 			];
 		}
 		const sandbox = "/usr/bin/sandbox-exec";
+		const heartbeat = setInterval(
+			() =>
+				process.stderr.write("switchyard: keyless provider still running\n"),
+			15_000,
+		);
+		const interrupt = (reason) => {
+			interrupted ??= reason;
+			for (const group of [child, server]) {
+				if (!group) continue;
+				killGroup(group, "SIGTERM");
+				setTimeout(() => killGroup(group, "SIGKILL"), 1_000).unref();
+			}
+		};
+		const timer = setTimeout(() => interrupt("duration-limit"), timeoutMs);
+		const onTerm = () => interrupt("SIGTERM");
+		const onInt = () => interrupt("SIGINT");
+		process.once("SIGTERM", onTerm);
+		process.once("SIGINT", onInt);
+		stopWatching = () => {
+			clearInterval(heartbeat);
+			clearTimeout(timer);
+			process.removeListener("SIGTERM", onTerm);
+			process.removeListener("SIGINT", onInt);
+		};
+		if (serverPort !== null) {
+			server = spawn(
+				sandbox,
+				[
+					"-p",
+					profile,
+					actualCli,
+					"serve",
+					"--hostname",
+					"127.0.0.1",
+					"--port",
+					String(serverPort),
+				],
+				{
+					cwd: worktree,
+					env,
+					detached: true,
+					stdio: ["ignore", "pipe", "ignore"],
+				},
+			);
+			// The client gets the password only after this server proves the port.
+			if (!(await serverListening(server, serverPort, SERVER_READY_MS)))
+				fail(
+					interrupted === null
+						? "OpenCode server did not start"
+						: `provider terminated before a verified completion (code none, signal none, error none, interrupt ${interrupted})`,
+				);
+		}
 		child = spawn(sandbox, ["-p", profile, actualCli, ...args], {
 			cwd: worktree,
 			env,
@@ -872,33 +982,11 @@ export async function runBridge({
 			if (errorSize <= MAX_OUTPUT) errors.push(chunk);
 			else killGroup(child, "SIGTERM");
 		});
-		const heartbeat = setInterval(
-			() =>
-				process.stderr.write("switchyard: keyless provider still running\n"),
-			15_000,
-		);
-		const interrupt = (reason) => {
-			interrupted ??= reason;
-			killGroup(child, "SIGTERM");
-			setTimeout(() => killGroup(child, "SIGKILL"), 1_000).unref();
-		};
-		const timer = setTimeout(() => interrupt("duration-limit"), timeoutMs);
-		const onTerm = () => interrupt("SIGTERM");
-		const onInt = () => interrupt("SIGINT");
-		process.once("SIGTERM", onTerm);
-		process.once("SIGINT", onInt);
-		let status;
-		try {
-			status = await new Promise((done) => {
-				child.once("error", (error) => done({ error }));
-				child.once("close", (code, signal) => done({ code, signal }));
-			});
-		} finally {
-			clearInterval(heartbeat);
-			clearTimeout(timer);
-			process.removeListener("SIGTERM", onTerm);
-			process.removeListener("SIGINT", onInt);
-		}
+		const status = await new Promise((done) => {
+			child.once("error", (error) => done({ error }));
+			child.once("close", (code, signal) => done({ code, signal }));
+		});
+		stopWatching();
 		if (stdinError)
 			fail(
 				`${target === "vibe" ? "Vibe" : "OpenCode"} prompt pipe failed (${statusToken(stdinError.code)})`,
@@ -944,10 +1032,15 @@ export async function runBridge({
 	} finally {
 		// Cleanup never replaces the first error; with none in flight it still
 		// fails closed.
+		stopWatching();
 		let stopped = false;
 		let cleanupFailed = false;
 		try {
-			stopped = await settleGroup(child);
+			const settled = await Promise.all([
+				settleGroup(child),
+				settleGroup(server),
+			]);
+			stopped = settled.every(Boolean);
 		} catch {
 			cleanupFailed = true;
 		}

@@ -21,11 +21,18 @@ import {
 const PROMPT = "a prompt with spaces";
 const WORKTREE = "/tmp/worktree";
 
-/** Every flag `argv` passes must be one the CLI's contract row requires. */
-function assertCovered(cli, argv) {
+/**
+ * Every flag `argv` passes must be one the CLI's contract row requires, for
+ * the row's own scope or, given `scope`, the matching extra subcommand.
+ */
+function assertCovered(cli, argv, scope = null) {
 	const row = CLI_CONTRACTS.find((candidate) => candidate.cli === cli);
 	ok(row, `${cli} has no contract row`);
-	const required = new Set([...row.flags, ...row.hiddenFlags]);
+	const sub = row.subcommands?.find((item) => item.scope.join(" ") === scope);
+	ok(scope === null || sub, `${cli} row does not check ${scope}`);
+	const required = new Set(
+		sub ? sub.flags : [...row.flags, ...row.hiddenFlags],
+	);
 	const uncovered = argvFlags(argv).filter((flag) => !required.has(flag));
 	deepStrictEqual(uncovered, [], `${cli} passes flags its canary never checks`);
 }
@@ -108,13 +115,20 @@ for (const [target, cli] of [
 			return;
 		}
 		const item = setup();
-		try {
-			await runFake(item, `printf '%s\\n' "$@" > argv.txt`, { target });
-			const argv = readFileSync(join(item.worktree, "argv.txt"), "utf8")
+		const lines = (file) =>
+			readFileSync(join(item.worktree, file), "utf8")
 				.split("\n")
 				.filter((line) => line !== "");
+		try {
+			await runFake(item, `printf '%s\\n' "$@" > argv.txt`, { target });
+			const argv = lines("argv.txt");
 			ok(argv.length > 0, `${target} bridge passed no argv`);
 			assertCovered(cli, argv);
+			if (target === "opencode-go") {
+				const serve = lines("serve-argv.txt");
+				deepStrictEqual(serve[0], "serve");
+				assertCovered(cli, serve, "serve");
+			}
 		} finally {
 			item.cleanup();
 		}

@@ -7,7 +7,6 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
-	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import http from "node:http";
@@ -17,7 +16,6 @@ import { fileURLToPath } from "node:url";
 import {
 	formatBridgeFailure,
 	runBridge,
-	verifyOpenCodeRuntime,
 } from "../ops/simple-provider-keyless-bridge.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import {
@@ -26,6 +24,7 @@ import {
 	SECRET,
 	seatbeltBlocked,
 	setup,
+	withOpenCodeServer,
 } from "./helpers/keyless-bridge-fixtures.mjs";
 
 async function localServer(handler) {
@@ -105,7 +104,7 @@ test("OpenCode duration limit terminates its process group without success", asy
 				worktree: item.worktree,
 				prompt: "synthetic task",
 				secret: SECRET,
-				cliPath: fake,
+				cliPath: withOpenCodeServer(fake),
 				timeoutMs: 200,
 			}),
 			/terminated before a verified completion/,
@@ -147,7 +146,8 @@ for await (const chunk of process.stdin) chunks.push(chunk);
 const prompt = Buffer.concat(chunks).toString('utf8');
 const sentinel = ${JSON.stringify(sentinel)};
 const expected = ${JSON.stringify(prompt)};
-writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, sentinelInArgv: process.argv.some(value => value.includes(sentinel)), sentinelInEnvironment: Object.values(process.env).some(value => value.includes(sentinel)), argv: process.argv.slice(2), realKeyInEnvironment: Object.values(process.env).includes('synthetic-real-api-key-bridge-123456') }));
+const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT).providers['opencode-go'];
+writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, sentinelInArgv: process.argv.some(value => value.includes(sentinel)), sentinelInEnvironment: Object.values(process.env).some(value => value.includes(sentinel)), argv: process.argv.slice(2), realKeyInEnvironment: Object.values(process.env).includes('synthetic-real-api-key-bridge-123456'), serverPassword: /^[0-9a-f]{48}$/.test(process.env.OPENCODE_PASSWORD ?? ''), modelEndpoint: config.models['deepseek-v4.1-flash'].settings.baseURL === config.settings.baseURL && /^http:[/][/]127[.]0[.]0[.]1:[0-9]+[/]v1$/.test(config.settings.baseURL) }));
 `,
 		{ mode: 0o755 },
 	);
@@ -159,30 +159,35 @@ writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, se
 			worktree: item.worktree,
 			prompt,
 			secret: SECRET,
-			cliPath: fake,
+			cliPath: withOpenCodeServer(fake),
 			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(result.code, 0, result.stderr);
-		assert.deepEqual(
-			JSON.parse(readFileSync(join(item.worktree, "probe.json"), "utf8")),
-			{
-				exactStdin: true,
-				sentinelInArgv: false,
-				sentinelInEnvironment: false,
-				argv: [
-					"run",
-					"--pure",
-					"--agent",
-					"build",
-					"--auto",
-					"--variant",
-					"max",
-					"--model",
-					"opencode-go/deepseek-v4.1-flash",
-				],
-				realKeyInEnvironment: false,
-			},
+		const probe = JSON.parse(
+			readFileSync(join(item.worktree, "probe.json"), "utf8"),
 		);
+		const server = probe.argv[2];
+		assert.match(server, /^http:\/\/127\.0\.0\.1:[0-9]+$/u);
+		assert.deepEqual(probe, {
+			exactStdin: true,
+			sentinelInArgv: false,
+			sentinelInEnvironment: false,
+			argv: [
+				"run",
+				"--server",
+				server,
+				"--agent",
+				"build",
+				"--auto",
+				"--title",
+				"switchyard",
+				"--model",
+				"opencode-go/deepseek-v4.1-flash#max",
+			],
+			realKeyInEnvironment: false,
+			serverPassword: true,
+			modelEndpoint: true,
+		});
 	} finally {
 		item.cleanup();
 	}
@@ -254,6 +259,8 @@ for (const [target, model, variant, expectedEffort] of [
 			assert.ok(calls > 0, "installed CLI did not reach synthetic upstream");
 			if (target === "opencode-go") {
 				assert.equal(result.code, 0, result.stderr);
+				// The fixed --title leaves no separate title-generation request.
+				assert.equal(calls, 1, "OpenCode should send one completion request");
 				assert.equal(observedBody?.model, "deepseek-v4.1-flash");
 				assert.equal(observedBody?.reasoning_effort, expectedEffort);
 				assert.equal(
@@ -272,30 +279,6 @@ for (const [target, model, variant, expectedEffort] of [
 			item.cleanup();
 		}
 	});
-
-test("fixed OpenCode runtime rejects replacement bytes, missing bytes, and symlinks", () => {
-	const item = setup();
-	try {
-		const fake = join(item.worktree, "replaced-opencode");
-		writeFileSync(fake, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-		assert.throws(
-			() => verifyOpenCodeRuntime(fake),
-			/runtime identity mismatch/,
-		);
-		const link = join(item.worktree, "linked-opencode");
-		symlinkSync(fake, link);
-		assert.throws(
-			() => verifyOpenCodeRuntime(link),
-			/runtime identity mismatch/,
-		);
-		assert.throws(
-			() => verifyOpenCodeRuntime(join(item.worktree, "missing")),
-			/runtime identity mismatch/,
-		);
-	} finally {
-		item.cleanup();
-	}
-});
 
 const BRIDGE = fileURLToPath(
 	new URL("../ops/simple-provider-keyless-bridge.mjs", import.meta.url),

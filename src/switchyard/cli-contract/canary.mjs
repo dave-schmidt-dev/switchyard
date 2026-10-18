@@ -32,10 +32,8 @@ export const CLI_CONTRACT_STATUSES = Object.freeze([
 export const CLI_CONTRACT_FAILURE_REASON = "provider_cli_contract_failed";
 
 const VIBE = "/Users/dave/.local/share/uv/tools/mistral-vibe/bin/vibe";
-// The keyless bridge execs this fixed runtime from its own pinned checkout
-// (ops/simple-provider-keyless-bridge.mjs), whichever checkout runs dispatch.
-const BRIDGE_OPENCODE =
-	"/Users/dave/Documents/Projects/switchyard/.tools/opencode-v1.18.30/opencode";
+// The keyless bridge (ops/simple-provider-keyless-bridge.mjs) execs this.
+const BRIDGE_OPENCODE = "/opt/homebrew/bin/opencode";
 
 /**
  * One row per CLI binary a simple lane execs. `flags` must each appear on an
@@ -43,6 +41,7 @@ const BRIDGE_OPENCODE =
  * required flags the CLI accepts but does not list; each is verified by a
  * parse probe against a parser shown to reject an unknown flag. Every flag a
  * lane's argv builder emits is covered (tests/cli-contract-coverage.test.mjs).
+ * `subcommands` lists any further `{scope, flags}` the lane also execs.
  */
 export const CLI_CONTRACTS = Object.freeze([
 	Object.freeze({
@@ -146,13 +145,20 @@ export const CLI_CONTRACTS = Object.freeze([
 		binary: BRIDGE_OPENCODE,
 		scope: Object.freeze(["run"]),
 		flags: Object.freeze([
-			"--pure",
+			"--server",
 			"--agent",
 			"--auto",
-			"--variant",
+			"--title",
 			"--model",
 		]),
 		hiddenFlags: Object.freeze([]),
+		// The bridge starts its own loopback server for `run --server`.
+		subcommands: Object.freeze([
+			Object.freeze({
+				scope: Object.freeze(["serve"]),
+				flags: Object.freeze(["--hostname", "--port"]),
+			}),
+		]),
 	}),
 ]);
 
@@ -368,6 +374,22 @@ export async function checkCliContract(row, options = {}) {
 				detail: `exit_${helpRun.status ?? "signal"}`,
 			});
 		const missing = row.flags.filter((flag) => !listed.has(flag));
+		for (const sub of row.subcommands ?? []) {
+			const subRun = await step([...sub.scope, "--help"]);
+			const subStop = inconclusive(subRun, version);
+			if (subStop) return subStop;
+			const subListed = parseHelpFlags(subRun.text);
+			if (subListed.size === 0)
+				return outcome(row, {
+					resolvedPath,
+					version,
+					status: "help_unreadable",
+					detail: `exit_${subRun.status ?? "signal"}`,
+				});
+			for (const flag of sub.flags)
+				if (!subListed.has(flag))
+					missing.push(`${sub.scope.join(" ")} ${flag}`);
+		}
 		if (row.hiddenFlags.length > 0) {
 			// Silence about a flag proves acceptance only from a strict parser.
 			const calibration = await step([...row.scope, BOGUS_FLAG, "--help"]);

@@ -170,6 +170,46 @@ test("a dropped flag fails typed with the flags it no longer lists", async () =>
 	ok(detail.remedy.includes("npm run cli:canary"));
 });
 
+test("a lane's extra subcommand is checked too, its drift named by scope", async () => {
+	const row = Object.freeze({
+		...ROW,
+		subcommands: Object.freeze([
+			Object.freeze({ scope: ["serve"], flags: ["--hostname", "--port"] }),
+		]),
+	});
+	const answers = (serveHelp) =>
+		fakeRun({
+			"--version": { text: "fake 2.0.0", status: 0, error: null },
+			"run --help": { text: HELP, status: 0, error: null },
+			"serve --help": { text: serveHelp, status: 0, error: null },
+		});
+	const passing = answers("  --hostname string  Host\n  --port number  Port\n");
+	const passed = await checkCliContract(row, {
+		run: passing.run,
+		resolve: resolveTo(row.binary),
+	});
+	strictEqual(passed.status, "ok");
+	deepStrictEqual(
+		passing.calls.map((call) => call.args),
+		[["--version"], ["run", "--help"], ["serve", "--help"]],
+	);
+	const dropped = await checkCliContract(row, {
+		run: answers("  --hostname string  Host\n  --stdio  Pipe\n").run,
+		resolve: resolveTo(row.binary),
+	});
+	strictEqual(dropped.status, "flags_missing");
+	deepStrictEqual(dropped.missingFlags, ["serve --port"]);
+	strictEqual(
+		cliContractPreflightDetail(dropped).condition,
+		"fake 2.0.0 no longer accepts serve --port",
+	);
+	const helpless = await checkCliContract(row, {
+		run: answers("no flags here\n").run,
+		resolve: resolveTo(row.binary),
+	});
+	strictEqual(helpless.status, "help_unreadable");
+});
+
 test("absent, versionless and helpless CLIs each fail with their own status", async () => {
 	const missing = await checkCliContract(ROW, { resolve: () => null });
 	strictEqual(missing.status, "not_installed");
