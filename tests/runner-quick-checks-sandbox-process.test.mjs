@@ -69,7 +69,7 @@ import(${JSON.stringify(pathToFileURL(modulePath).href)}).then(
 	(error) => done(error.code ?? error.message),
 );
 `,
-			[modulePath],
+			[modulePath, join(dirname(dirname(modulePath)), "node-runtime.mjs")],
 		);
 		strictEqual(report.passwd, "ERR_SYSTEM_ERROR");
 		strictEqual(report.imported, "function");

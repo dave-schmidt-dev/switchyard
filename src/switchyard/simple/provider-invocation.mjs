@@ -7,6 +7,7 @@ import {
 	providerDiagnosticCodeForKind,
 } from "../adapter/exec-error.mjs";
 import { runProviderProcess } from "../adapter/provider-lifecycle.mjs";
+import { currentNodeExecutable } from "../node-runtime.mjs";
 import {
 	MAX_CAPTURE_BYTES,
 	requireWorktreeGit,
@@ -141,7 +142,7 @@ export function buildSimpleProviderInvocation(
 	}
 	if (targetId === "vibe-code") {
 		return {
-			command: process.execPath,
+			command: currentNodeExecutable(),
 			args: [
 				VIBE_CODE_LAUNCHER,
 				"--model",
@@ -153,7 +154,7 @@ export function buildSimpleProviderInvocation(
 	}
 	if (targetId === "claude-code") {
 		return {
-			command: process.execPath,
+			command: currentNodeExecutable(),
 			args: [
 				CLAUDE_CODE_LAUNCHER,
 				"--model",

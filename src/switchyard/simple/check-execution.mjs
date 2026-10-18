@@ -9,6 +9,7 @@ import {
 	realpathSync,
 } from "node:fs";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { currentNodeExecutable } from "../node-runtime.mjs";
 
 const PACKAGE_MANAGERS = new Set([
 	"npx",
@@ -140,7 +141,7 @@ function localBinary(worktreePath, name, lock) {
 	}
 	const shebang = header.toString("utf8").split("\n")[0];
 	return /^#!.*\bnode(?:\s|$)/u.test(shebang)
-		? { command: process.execPath, args: [resolved] }
+		? { command: currentNodeExecutable(), args: [resolved] }
 		: { command: resolved, args: [] };
 }
 

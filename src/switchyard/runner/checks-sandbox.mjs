@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { currentNodeExecutable } from "../node-runtime.mjs";
 
 const GIT_ARGS = [
 	"-c",
@@ -491,7 +492,7 @@ export function quickCheckSandboxProfile(
 	clone = realpathSync(clone);
 	runtime = realpathSync(runtime);
 	const developer = developerDir();
-	const nodeRoot = dirname(dirname(realpathSync(process.execPath)));
+	const nodeRoot = dirname(dirname(realpathSync(currentNodeExecutable())));
 	const npmRoot = dirname(dirname(realpathSync("/opt/homebrew/bin/npm")));
 	const reads = [
 		"/System",

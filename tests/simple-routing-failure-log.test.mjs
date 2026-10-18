@@ -154,6 +154,46 @@ test("a hard failure writes one attempt record and one stop record", async () =>
 	strictEqual(records[1].exhaustionCause, null);
 });
 
+// Regression (2026-10-14): every check-setup cause logged only the coarse
+// `baseline_failed`, so the deleted-node stop was indistinguishable from a
+// missing `uv` without reading run.json.
+test("a check-setup stop logs the engine reason and setup evidence", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "check_setup_failed",
+					phase: "baseline",
+				}),
+				errorKind: "check_failed",
+				failureReason: "ENOENT",
+				failurePhase: "prepare",
+				failureDetails: {
+					checkSetupStep: "probe_environment",
+					checkSetupErrorCode: "ENOENT",
+					checkSetupExecutable: "node",
+				},
+			},
+		},
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.stopReason, "baseline_failed");
+	const records = readLog(f.deps.stateRoot);
+	deepStrictEqual(
+		records.map((record) => record.recordType),
+		["attempt", "stop"],
+	);
+	for (const record of records) {
+		strictEqual(record.causeCode, "check_setup_failed");
+		strictEqual(record.failureReason, "ENOENT");
+		strictEqual(record.checkSetupStep, "probe_environment");
+		strictEqual(record.checkSetupErrorCode, "ENOENT");
+		strictEqual(record.checkSetupExecutable, "node");
+	}
+	strictEqual(records[0].reason, "baseline_failed");
+});
+
 test("malformed git-control evidence is omitted from routing state and failure log", async () => {
 	for (const gitControlTamper of [
 		{ kind: "changed", area: "config", path: "/private/provider-path" },

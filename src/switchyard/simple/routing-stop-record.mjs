@@ -149,6 +149,9 @@ export function lifecycleFailure(result, pending, record, project, options) {
 function causeFields(result, accountability = result?.accountability) {
 	const reliability = result?.providerReliability;
 	const gitControlTamper = sanitizeGitControlTamper(result?.gitControlTamper);
+	// The engine's specific reason and setup evidence survive alongside the
+	// coarse routing `reason` (`baseline_failed` covers every setup cause).
+	const details = result?.failureDetails;
 	return {
 		causeCategory: reliability?.causeCategory ?? accountability?.causeCategory,
 		causeCode: reliability?.causeCode ?? accountability?.causeCode,
@@ -156,6 +159,10 @@ function causeFields(result, accountability = result?.accountability) {
 		failurePhase: result?.failurePhase,
 		errorKind: result?.errorKind,
 		...(gitControlTamper ? { gitControlTamper } : {}),
+		failureReason: result?.failureReason ?? undefined,
+		checkSetupStep: details?.checkSetupStep ?? undefined,
+		checkSetupErrorCode: details?.checkSetupErrorCode ?? undefined,
+		checkSetupExecutable: details?.checkSetupExecutable ?? undefined,
 	};
 }
 

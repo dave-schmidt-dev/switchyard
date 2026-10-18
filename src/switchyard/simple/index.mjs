@@ -480,10 +480,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 			typeof error?.syscall === "string"
 				? error.syscall.trim().split(/\s+/u)[0] || null
 				: null;
+		// Only a spawn error's `path` is the executable; an fs error's `path`
+		// is whatever file it touched (a deleted Cellar directory named
+		// `26.11.1`, for one), so it never names the executable.
 		const setupExecutable =
 			typeof error?.checkSetupExecutable === "string"
 				? basename(error.checkSetupExecutable)
-				: typeof error?.path === "string"
+				: typeof error?.path === "string" && setupSyscall?.startsWith("spawn")
 					? basename(error.path)
 					: null;
 		const setupStep =

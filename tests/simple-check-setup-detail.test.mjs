@@ -164,6 +164,19 @@ test("a prepare step that throws ENOENT records the step, code, syscall and exec
 	ok(isPersistentFailureMetadata(run.lastFailure));
 });
 
+// Regression (2026-10-14): an lstat of the deleted Cellar directory was
+// recorded as the executable `26.11.1`.
+test("an fs error's path never names the setup executable", async () => {
+	const { result, run } = await runSetupFailure({
+		code: "ENOENT",
+		syscall: "lstat",
+		path: "/opt/homebrew/Cellar/node/26.11.1",
+	});
+	strictEqual(result.providerReliability.causeCode, "check_setup_failed");
+	strictEqual(run.failureDetails.checkSetupSyscall, "lstat");
+	strictEqual("checkSetupExecutable" in run.failureDetails, false);
+});
+
 test("the terminal result carries the same durable failureDetails as run.json", async () => {
 	const { result, run } = await runSetupFailure({ code: "ENOENT" });
 	strictEqual(result.status, "failed");

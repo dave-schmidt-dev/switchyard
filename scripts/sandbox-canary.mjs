@@ -230,7 +230,12 @@ export function runSandboxCanary({
 			root,
 			"src/switchyard/runner/checks-sandbox.mjs",
 		);
-		const profile = profileFactory(clone, runtime, [checksSandboxPath]);
+		// The module and its one relative import are the self-host read set.
+		const nodeRuntimePath = resolve(root, "src/switchyard/node-runtime.mjs");
+		const profile = profileFactory(clone, runtime, [
+			checksSandboxPath,
+			nodeRuntimePath,
+		]);
 		const safeEnvironment = environmentFactory(runtime);
 		const results = [];
 		const confinedProbe = ({ name, timeoutMs, run }) => {

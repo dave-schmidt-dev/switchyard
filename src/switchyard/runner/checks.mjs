@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { integrationGate } from "../integrate/index.mjs";
+import { currentNodeExecutable } from "../node-runtime.mjs";
 import { settleSimpleWriterProcesses } from "../simple/process-teardown.mjs";
 import { MAX_CHECKS, parseCommand } from "./check-contract.mjs";
 import { trustedOfflineNpmEnv } from "./check-dependencies.mjs";
@@ -285,7 +286,7 @@ export function runQuickChecksAsync(input) {
 		);
 		let child;
 		try {
-			child = spawn(process.execPath, [SELF, "--quick-check-runner"], {
+			child = spawn(currentNodeExecutable(), [SELF, "--quick-check-runner"], {
 				env: safeEnv(root),
 				stdio: ["pipe", "pipe", "ignore"],
 				detached: true,
