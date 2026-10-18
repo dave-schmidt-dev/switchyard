@@ -8,6 +8,7 @@ import {
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
 } from "./helpers/dispatch-cli-fixtures.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let dir;
@@ -51,7 +52,7 @@ describe("CLI exit code contract", () => {
 	it("direct executable --version preserves the CLI entrypoint", () => {
 		const result = spawnSync(DISPATCH_PATH, ["--version"], {
 			encoding: "utf8",
-			timeout: 10_000,
+			timeout: HANG_GUARD_MS,
 		});
 
 		strictEqual(result.status, 0);

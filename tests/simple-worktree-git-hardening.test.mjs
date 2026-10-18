@@ -26,6 +26,7 @@ import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { captureWorktreeDiff } from "../src/switchyard/simple/provider-invocation.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { readRoutingRunState } from "../src/switchyard/simple/routing-state.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
@@ -196,13 +197,13 @@ describe("hardened host git", () => {
 		try {
 			strictEqual(
 				worktreeGit(worktreePath, ["diff", "--cached", "HEAD"], {
-					timeout: 10_000,
+					timeout: HANG_GUARD_MS,
 				}).status,
 				0,
 			);
 			strictEqual(
 				worktreeGit(worktreePath, ["status", "--porcelain=v1"], {
-					timeout: 10_000,
+					timeout: HANG_GUARD_MS,
 				}).status,
 				0,
 			);

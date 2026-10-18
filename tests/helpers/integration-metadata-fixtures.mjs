@@ -22,6 +22,7 @@ import {
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { HANG_GUARD_MS } from "./hang-guard.mjs";
 import { tempDir } from "./tempdir.mjs";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -177,9 +178,7 @@ export async function runMetadataScenario({
 	timeoutMs = 5000,
 	call = "validateDiff",
 	gateOptions = {},
-	// A hang guard only, far above the injected command timeout. It was 20 s
-	// until a loaded host (2026-10-18, load average 25) let it expire first.
-	watchdogMs = 60_000,
+	watchdogMs = HANG_GUARD_MS,
 	fakeGitSpawnFailure = false,
 }) {
 	const dir = tempDir("switchyard-metadata-");

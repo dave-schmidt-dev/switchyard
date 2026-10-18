@@ -11,6 +11,7 @@ import {
 	BOOTSTRAP_PATH,
 	ROSTER_FIXTURE_PATH,
 } from "./helpers/detached-dispatch-fixtures.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let dir;
@@ -127,7 +128,7 @@ export async function resolve(specifier, context, nextResolve) {
 			{
 				encoding: "utf8",
 				stdio: ["ignore", "pipe", "pipe"],
-				timeout: 10_000,
+				timeout: HANG_GUARD_MS,
 				env: {
 					...process.env,
 					...makeStateRootEnv(),
@@ -261,7 +262,7 @@ export async function resolve(specifier, context, nextResolve) {
 				{
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "pipe"],
-					timeout: 10_000,
+					timeout: HANG_GUARD_MS,
 					env: {
 						...process.env,
 						...makeStateRootEnv(),

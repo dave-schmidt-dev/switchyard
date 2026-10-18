@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { it } from "node:test";
 import { pathToFileURL } from "node:url";
-
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const HELPER_URL = pathToFileURL(
@@ -97,7 +97,7 @@ async function runSignalScenario({
 
 for (const interrupt of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 	it(`runs cleanup then dies by ${interrupt}`, {
-		timeout: 10_000,
+		timeout: HANG_GUARD_MS,
 	}, async () => {
 		const result = await runSignalScenario({ dispose: false, interrupt });
 		strictEqual(result.signal, interrupt);
@@ -106,7 +106,7 @@ for (const interrupt of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 }
 
 it("cleanup throwing still dies by the signal", {
-	timeout: 10_000,
+	timeout: HANG_GUARD_MS,
 }, async () => {
 	const result = await runSignalScenario({ dispose: false, throwing: true });
 	strictEqual(result.signal, "SIGTERM");
@@ -114,14 +114,14 @@ it("cleanup throwing still dies by the signal", {
 });
 
 it("a second signal cannot interrupt synchronous cleanup", {
-	timeout: 10_000,
+	timeout: HANG_GUARD_MS,
 }, async () => {
 	const result = await runSignalScenario({ dispose: false, repeated: true });
 	strictEqual(result.signal, "SIGTERM");
 	ok(result.markerExists, "cleanup must finish despite the second signal");
 });
 
-it("dispose skips cleanup", { timeout: 10_000 }, async () => {
+it("dispose skips cleanup", { timeout: HANG_GUARD_MS }, async () => {
 	const result = await runSignalScenario({ dispose: true });
 	strictEqual(result.signal, "SIGTERM");
 	ok(!result.markerExists, "cleanup marker must not exist");

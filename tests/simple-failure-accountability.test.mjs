@@ -7,6 +7,7 @@ import {
 	linkedRoutingRecordMatches,
 } from "../src/switchyard/simple/failure-accountability.mjs";
 import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/simple/reliability.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const diagnostic = (causeCode, more = {}) =>
 	createProviderReliabilityDiagnostic({
@@ -262,12 +263,12 @@ test("candidate typed failures roundtrip through reachable committed readers by 
 				{
 					cwd: new URL("..", import.meta.url),
 					maxBuffer: 32 * 1024 * 1024,
-					timeout: 10000,
+					timeout: HANG_GUARD_MS,
 				},
 			);
 			execFileSync("tar", ["-xf", "-", "-C", archiveRoot], {
 				input: archive,
-				timeout: 10000,
+				timeout: HANG_GUARD_MS,
 			});
 		}
 		const oldAdapter = await import(

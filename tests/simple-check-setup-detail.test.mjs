@@ -14,6 +14,7 @@ import { resolveFailure } from "../src/switchyard/diagnostics/failure-registry.m
 import { readRun } from "../src/switchyard/run-store/index.mjs";
 import { dryRunAcceptanceChecks } from "../src/switchyard/simple/check-dry-run.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -29,7 +30,7 @@ const sandboxProbe =
 		? spawnSync(
 				SANDBOX_EXEC,
 				["-p", "(version 1)(allow default)", "/usr/bin/true"],
-				{ timeout: 10_000 },
+				{ timeout: HANG_GUARD_MS },
 			)
 		: null;
 const sandboxSkip =

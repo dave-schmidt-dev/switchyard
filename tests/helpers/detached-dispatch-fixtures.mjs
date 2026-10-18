@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { HANG_GUARD_MS } from "./hang-guard.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..", "..");
 const DISPATCH_PATH = resolve(
@@ -37,7 +38,7 @@ function runDispatch(args, env = {}) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
-		timeout: 10_000,
+		timeout: HANG_GUARD_MS,
 		env: { ...process.env, ...env },
 	});
 }
@@ -68,16 +69,11 @@ function commandAvailable(command) {
 	}
 }
 
-// A hang guard only: a healthy bootstrap exits in well under a second. It was
-// 10 s until a loaded host (2026-10-18 pre-push) slowed every spawn about 35x
-// and the guard killed workers that were still on their way to exit 1.
-const BOOTSTRAP_HANG_GUARD_MS = 60_000;
-
 function runBootstrap(args, env = {}) {
 	return spawnSync(process.execPath, [BOOTSTRAP_PATH, ...args], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
-		timeout: BOOTSTRAP_HANG_GUARD_MS,
+		timeout: HANG_GUARD_MS,
 		env: { ...process.env, ...env },
 	});
 }
