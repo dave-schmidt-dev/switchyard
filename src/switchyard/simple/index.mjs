@@ -69,6 +69,7 @@ import {
 	persistFailureDisposition,
 	publishFailedTerminal,
 } from "./failure-finalization.mjs";
+import { createFinalizationWatch } from "./finalization-watch.mjs";
 import { buildGuardedPrompt } from "./guarded-prompt.mjs";
 import { headAdvanceSafe } from "./head-advance.mjs";
 import { createSimpleRouteHealthController } from "./health.mjs";
@@ -2780,9 +2781,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 			error,
 		);
 	} finally {
+		const finalization = createFinalizationWatch({
+			warn: dependencies.onRoutingWarning ?? console.error,
+			...dependencies.finalizationWatch,
+		});
+		finalization.step("pending_durability");
 		if (pendingDurability.size > 0) {
 			await Promise.allSettled([...pendingDurability]);
 		}
+		finalization.step("project_lock_release");
 		// Task 3.9: once the terminal result is durable and the writer is final,
 		// integration can no longer run, so release before slow cleanup.
 		if (
@@ -2790,6 +2797,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			(writerLifecycle === "stopped" || writerLifecycle === "never_started")
 		)
 			await releaseHeldProjectLock();
+		finalization.step("check_session_remove");
 		try {
 			if (failureTerminalDurable) checkSessions?.remove();
 		} catch {
@@ -2803,6 +2811,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			if (finalResult?.status === "failed")
 				finalResult.partialWorktree = worktreePath;
 		}
+		finalization.step("worktree_remove");
 		if (worktreePath && !keepWorktree) {
 			await removeNonSalvageWorktree();
 			if (worktreePath && finalResult?.status === "failed") {
@@ -2810,7 +2819,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 				finalResult.partialWorktree = worktreePath;
 			}
 		}
+		finalization.step("project_lock_release");
 		await releaseHeldProjectLock();
+		finalization.step("failure_disposition");
 		if (finalResult) {
 			Object.assign(finalResult, routingDiagnostics);
 			finalResult.elapsedMs = Math.max(0, now() - startedAt);
@@ -2870,6 +2881,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				? failureDisposition.cleanupState
 				: "pending";
 		}
+		finalization.stop();
 	}
 }
 export { handleSimple } from "./cli.mjs";
