@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, readdir } from "node:fs/promises";
 import {
 	createOversizeRejectionFact,

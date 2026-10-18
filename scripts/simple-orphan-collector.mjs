@@ -307,7 +307,9 @@ export async function sweepSimpleOrphans({
 import "./simple-orphan-collector-scan.mjs";
 import {
 	classifySimpleRun,
+	DEFAULT_RUN_STORE_ROOT,
 	inspectSimpleTree,
+	listHeldPathsViaLsof,
 	readSimpleMarker,
 	readSimpleRunStore,
 	SIMPLE_ORPHAN_TTL_MS,

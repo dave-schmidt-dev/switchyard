@@ -241,7 +241,6 @@ describe("VM ownership metadata", () => {
 						{ ...entry, status: "running" },
 						{ uuid: otherUuid, status: "stopped", name: entry.name },
 					]);
-				if (args[0] === "delete") deleted = true;
 				return "";
 			},
 		});
