@@ -32,6 +32,7 @@ function manualWatch(options = {}) {
 		tickMs: 1_000,
 		waitReportMs: 5_000,
 		blockedReportMs: 3_000,
+		fsProbe: null,
 		timers: {
 			setInterval: (fn) => {
 				tick = fn;
@@ -66,6 +67,40 @@ describe("finalization watch", () => {
 			kind: "waiting",
 			durationMs: 10_000,
 		});
+	});
+
+	it("flags a filesystem probe that has not returned while a step waits", async () => {
+		let probes = 0;
+		let settleProbe = null;
+		const { watch, lines, advance, fire } = manualWatch({
+			fsProbe: () => {
+				probes += 1;
+				return new Promise((resolve) => {
+					settleProbe = resolve;
+				});
+			},
+		});
+		watch.step("project_lock_release");
+		for (let i = 0; i < 5; i++) {
+			advance(1_000);
+			fire();
+		}
+		strictEqual(probes, 1);
+		deepStrictEqual(lines, [
+			"dispatch: simple finalization step=project_lock_release waiting_ms=5000 fs_probe_pending_ms=4000",
+		]);
+		settleProbe();
+		await new Promise((resolve) => setImmediate(resolve));
+		for (let i = 0; i < 5; i++) {
+			advance(1_000);
+			fire();
+		}
+		strictEqual(probes, 2);
+		strictEqual(
+			lines[1],
+			"dispatch: simple finalization step=project_lock_release waiting_ms=10000 fs_probe_pending_ms=4000",
+		);
+		watch.stop();
 	});
 
 	it("names the step in flight when a late tick shows a blocked loop", () => {
