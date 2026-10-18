@@ -273,5 +273,6 @@ export {
 	loadRosterData,
 	qualificationVariantKey,
 	ROSTER_CAPABILITY_CLASSES,
+	resolveRosterPath,
 	VARIANT_VALUES,
 };

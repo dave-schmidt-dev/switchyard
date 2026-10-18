@@ -88,10 +88,7 @@ export {
 	USAGE_STATUS,
 	USAGE_VALIDATE_INPUTS,
 } from "./cli-usage.mjs";
-export {
-	captureHostFingerprint,
-	renewDispatchReceipts,
-} from "./launch-support.mjs";
+export { captureHostFingerprint } from "./launch-support.mjs";
 export { handleRecover } from "./recover.mjs";
 export { resolveIsRunDead } from "./recover-liveness.mjs";
 export {

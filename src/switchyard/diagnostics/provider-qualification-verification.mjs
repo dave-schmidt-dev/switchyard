@@ -58,37 +58,20 @@ function diffAndBase(projectPath) {
 function providerResultOf(receipt) {
 	return receipt?.providerResult ?? receipt?.result ?? null;
 }
-function exactProviderChecks(plan, receipt, candidate) {
+function exactProviderChecks(plan, receipt) {
+	if (plan.lane !== "simple") return false;
 	const result = providerResultOf(receipt);
-	if (plan.lane === "simple") {
-		const checks = result?.checks ?? receipt?.checks;
-		return (
-			Array.isArray(checks) &&
-			checks.length === 1 &&
-			Object.keys(checks[0] ?? {})
-				.sort()
-				.join(",") === "index,status" &&
-			checks[0].index === 1 &&
-			checks[0].status === "passed" &&
-			receipt?.checkCommands?.length === 1 &&
-			receipt.checkCommands[0] === "node --test tests/acceptance.test.mjs"
-		);
-	}
-	const checkReceipt = result?.quickCheckReceipt ?? receipt?.quickCheckReceipt;
-	if (!checkReceipt) return false;
-	const expectedChecks = [["node", "--test", "tests/acceptance.test.mjs"]];
-	return Boolean(
-		candidate &&
-			checkReceipt.taskId === "1" &&
-			checkReceipt.baseTree === candidate.baseTree &&
-			isPassingQuickCheckReceipt(checkReceipt, {
-				taskId: "1",
-				attempt: checkReceipt.attempt,
-				baseTree: candidate.baseTree,
-				diff: candidate.diff,
-				checks: expectedChecks,
-				setup: null,
-			}),
+	const checks = result?.checks ?? receipt?.checks;
+	return (
+		Array.isArray(checks) &&
+		checks.length === 1 &&
+		Object.keys(checks[0] ?? {})
+			.sort()
+			.join(",") === "index,status" &&
+		checks[0].index === 1 &&
+		checks[0].status === "passed" &&
+		receipt?.checkCommands?.length === 1 &&
+		receipt.checkCommands[0] === "node --test tests/acceptance.test.mjs"
 	);
 }
 export function hasProvenWorkerCleanup(receipt) {
@@ -224,7 +207,7 @@ export function verifyRepresentativeReceipt(plan, receipt, fixture) {
 	) {
 		failures.push("verification_base_unavailable");
 	}
-	if (!exactProviderChecks(plan, receipt, candidate))
+	if (!exactProviderChecks(plan, receipt))
 		failures.push("provider_checks_missing_or_invalid");
 
 	const outputDigests = {};

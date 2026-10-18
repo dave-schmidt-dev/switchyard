@@ -43,7 +43,6 @@ import {
 	captureHostFingerprint,
 	prepareDispatchDirtyOverlay,
 	prepareRunIdentity,
-	renewDispatchReceipts,
 } from "./launch-support.mjs";
 import { sweepManagedOrphans } from "./recover-reclaim.mjs";
 import { buildResultEnvelope, isTerminalState } from "./result.mjs";
@@ -745,7 +744,6 @@ async function runDispatch(opts, dependencies = {}) {
 				`${result.completedTaskIds.length} completed, ${failed.length} failed, ${deferredCount} deferred`,
 		);
 		report(`dispatch: checkpoint ${result.checkpointPath}`);
-		renewDispatchReceipts(result.checkpointPath, report);
 	}
 	process.exitCode =
 		failed.length > 0 || firstCallbackFailure ? 1 : deferredCount > 0 ? 6 : 0;

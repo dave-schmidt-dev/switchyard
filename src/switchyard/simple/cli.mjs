@@ -1,6 +1,7 @@
 import { parseSimpleArgs, SIMPLE_USAGE, SimpleUsageError } from "./args.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";
 import { runSimpleTask } from "./index.mjs";
+import { renewDispatchReceipts } from "./receipt-renewal.mjs";
 import { recoveryUnavailable } from "./recovery.mjs";
 import { handleSimpleCancel } from "./routing-cli.mjs";
 import { runSimpleRoutingTask } from "./routing-run.mjs";
@@ -60,7 +61,9 @@ export async function handleSimple(argv, dependencies = {}) {
 				: options.routingRunId !== null
 					? "environment"
 					: "generated";
-			const routing = await runSimpleRoutingTask(options, {
+			const routing = await (
+				dependencies.runSimpleRoutingTask ?? runSimpleRoutingTask
+			)(options, {
 				...dependencies,
 				onRoutingWarning: dependencies.writeWarning ?? console.error,
 				now,
@@ -196,6 +199,14 @@ export async function handleSimple(argv, dependencies = {}) {
 		} else if (result.status !== "succeeded") {
 			signalProcess.exitCode =
 				result.failureReason === "invalid_invocation" ? 2 : 1;
+		}
+		// The result is already written; renewal is bookkeeping and never
+		// changes the outcome or exit status of the run.
+		if (result.status === "succeeded" && receivedSignal === null) {
+			await (dependencies.renewDispatchReceipts ?? renewDispatchReceipts)(
+				result.runId,
+				(line) => writeStderr(`${line}\n`),
+			);
 		}
 	} finally {
 		signalProcess.removeListener("SIGINT", onSigint);
