@@ -55,6 +55,8 @@ const ENVIRONMENT_ERRNOS = [
 const LAUNCHER_ENVIRONMENT_REASONS = [
 	"launcher_environment_unavailable",
 	"request_log_open_failed",
+	// S7: the target's CLI no longer honors its lane contract.
+	"provider_cli_contract_failed",
 ];
 
 const POLICY_REASONS = [

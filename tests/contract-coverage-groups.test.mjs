@@ -110,13 +110,16 @@ describe("contract coverage groups", () => {
 			"simple-routing-release-transition",
 			"simple-routing-state",
 		].map((name) => `tests/${name}.test.mjs`);
-		// The charter and the 2026-10-18 stability audit add these exact suites;
-		// the historical suite hash below still guards every original entry and
-		// ordering.
+		// The charter and the 2026-10-18 stability audit (SC7, S11, S7) add these
+		// exact suites; the historical suite hash below still guards every
+		// original entry and ordering.
 		const charterAdditions = [
+			"tests/cli-contract-canary.test.mjs",
+			"tests/cli-contract-coverage.test.mjs",
 			"tests/dispatch-simple-import-boundary.test.mjs",
 			"tests/project-lock-name-single-source.test.mjs",
 			"tests/python-venv-proof.test.mjs",
+			"tests/simple-cli-contract-admission.test.mjs",
 		];
 		deepStrictEqual(
 			plan.suites.filter((path) => charterAdditions.includes(path)),

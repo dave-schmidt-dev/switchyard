@@ -497,6 +497,7 @@ const FAILURE_REASONS = Object.freeze([
 	"provider_adapter_error",
 	"provider_cancelled",
 	"provider_cleanup_failed",
+	"provider_cli_contract_failed",
 	"provider_deadline_exceeded",
 	"provider_exit_nonzero",
 	"provider_group_unconfirmed",
