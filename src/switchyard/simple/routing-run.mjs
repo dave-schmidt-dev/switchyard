@@ -671,8 +671,15 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					classification,
 				});
 			if (classification.severity === "baseline") {
+				// A check environment that could not be set up is not a red check
+				// (O5, 2026-10-18): its own stop label tells the caller to repair the
+				// host, not the check. The attempt keeps `baseline_failed`, so the
+				// target stays unblamed and routing state stays version 1.
+				const checkSetup =
+					(result.providerReliability?.causeCode ??
+						accountability?.causeCode) === "check_setup_failed";
 				return answer("stop", {
-					stopReason: "baseline_failed",
+					stopReason: checkSetup ? "check_setup_failed" : "baseline_failed",
 					result,
 					classification,
 				});

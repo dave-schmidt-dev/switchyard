@@ -156,7 +156,9 @@ test("a hard failure writes one attempt record and one stop record", async () =>
 
 // Regression (2026-10-14): every check-setup cause logged only the coarse
 // `baseline_failed`, so the deleted-node stop was indistinguishable from a
-// missing `uv` without reading run.json.
+// missing `uv` without reading run.json. Since O5 (2026-10-18) the stop itself
+// is labelled `check_setup_failed`; the attempt keeps `baseline_failed`, so the
+// routing state stays version 1 and the target is still not blamed.
 test("a check-setup stop logs the engine reason and setup evidence", async () => {
 	const f = fixture({
 		"antigravity-claude": {
@@ -178,12 +180,18 @@ test("a check-setup stop logs the engine reason and setup evidence", async () =>
 		},
 	});
 	const result = await runSimpleRoutingTask(f.options, f.deps);
-	strictEqual(result.stopReason, "baseline_failed");
+	strictEqual(result.direction, "stop");
+	strictEqual(result.stopReason, "check_setup_failed");
+	strictEqual(result.classification.severity, "baseline");
+	strictEqual(result.attempts[0].reason, "baseline_failed");
+	strictEqual(result.attempts[0].terminal, "skipped");
+	deepStrictEqual(result.failedTargetIds, []);
 	const records = readLog(f.deps.stateRoot);
 	deepStrictEqual(
 		records.map((record) => record.recordType),
 		["attempt", "stop"],
 	);
+	strictEqual(records[1].stopReason, "check_setup_failed");
 	for (const record of records) {
 		strictEqual(record.causeCode, "check_setup_failed");
 		strictEqual(record.failureReason, "ENOENT");

@@ -48,6 +48,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- A codex HTTP 401 (`failed to connect to websocket: HTTP error: 401 Unauthorized`, or `unexpected status 401 Unauthorized`) on its own line now classifies as `auth_expired`, not `provider_exit_nonzero`. The forms apply only to the codex binary. A codex 401 therefore no longer counts toward simple route-health suppression, and it reads as a re-login cause.
+- A simple stop caused by a check environment that could not be set up is labelled `check_setup_failed` instead of `baseline_failed`, so it is not read as a red check or a provider failure. The attempt keeps `baseline_failed`, the target stays unblamed, and routing state stays version 1. The `simple` JSON result now carries `stopReason` for every `stop` direction; `failureReason` is still the engine's own reason.
 - The stabilization freeze is lifted. README and INVARIANTS now record the 2026-09 observation window as closed (39 ledger rows, last kept 2026-09-13); routing-policy, provider-enablement and quota changes still need the owner's go.
 - Live-VM tests are opt-in. They run only with `SWITCHYARD_LIVE_VM_TESTS=1` (at milestones and before VM-lane releases), so `npm test` and the pre-push gate no longer boot a Parallels VM whenever a golden image is configured. `SWITCHYARD_SKIP_LIVE_VM_TESTS` is retired.
 - Orphaned-lock remediation takes project lock names from the run store instead of keeping its own copy of the hash, so the two can no longer drift apart and leave a stuck lock unfindable.

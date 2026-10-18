@@ -101,6 +101,12 @@ export async function handleSimple(argv, dependencies = {}) {
 				routingRunId: routing.routingRunId,
 				routingRunIdSource: routing.routingRunIdSource,
 				direction: routing.direction,
+				// `failureReason` is the engine's own reason; the stop label is
+				// what tells the caller which way to act (O5, 2026-10-18).
+				...(routing.direction === "stop" &&
+				typeof routing.stopReason === "string"
+					? { stopReason: routing.stopReason }
+					: {}),
 				attempts: routing.attempts,
 				...(routing.routeEvidence
 					? {

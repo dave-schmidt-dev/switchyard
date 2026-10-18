@@ -17,6 +17,20 @@ const STRICT_PROVIDER_LINES = Object.freeze({
 	network_unreachable:
 		/^(?:Error:\s*)?(?:Network unreachable|Connection refused|Connection error|ENOTFOUND)$/iu,
 });
+// Whole-line forms one provider prints for itself, applied only to that
+// provider's approved binary. Codex's HTTP 401 is an auth failure (FAIL-6,
+// owner decision O5, 2026-10-18); without it a bare 401 reached the record as
+// `provider_exit_nonzero` and took the transient-exit path. The websocket line
+// is the one codex's logger emitted in the guest on 2026-09-12; the
+// `unexpected status` line is codex's non-websocket form of the same 401.
+const PROVIDER_SCOPED_LINES = Object.freeze({
+	codex: Object.freeze({
+		auth_required: [
+			/^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+ERROR\s+codex_api::[a-z_:]+:\s+)?failed to connect to websocket: HTTP error: 401 Unauthorized$/u,
+			/^(?:ERROR:\s*)?unexpected status 401 Unauthorized(?::\s.*)?$/u,
+		],
+	}),
+});
 const PROVIDER_DIAGNOSTIC_KIND_TO_RUNTIME_CODE = Object.freeze({
 	auth_required: "auth_expired",
 	usage_exhausted: "quota_exhausted",
@@ -91,10 +105,15 @@ export function classifyProviderStreams({
 		// nothing at all. Two different recognized kinds still refuse to
 		// classify, because that is genuine disagreement rather than noise.
 		let matchedKind = null;
+		const scoped = Object.entries(PROVIDER_SCOPED_LINES[providerKey] ?? {});
 		for (const line of all) {
-			const lineKind = Object.entries(STRICT_PROVIDER_LINES).find(
-				([, pattern]) => pattern.test(line),
-			)?.[0];
+			const lineKind =
+				Object.entries(STRICT_PROVIDER_LINES).find(([, pattern]) =>
+					pattern.test(line),
+				)?.[0] ??
+				scoped.find(([, patterns]) =>
+					patterns.some((pattern) => pattern.test(line)),
+				)?.[0];
 			if (!lineKind) continue;
 			if (matchedKind !== null && lineKind !== matchedKind) return result;
 			matchedKind = lineKind;

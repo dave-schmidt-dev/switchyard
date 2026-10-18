@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import {
 	parseSimpleArgs,
 	SimpleUsageError,
@@ -121,6 +122,49 @@ describe("simple CLI usage and preflight error detail", () => {
 		strictEqual(success.direction, "complete");
 		strictEqual(success.failureReason, undefined);
 		strictEqual(success.exhaustionCause, undefined);
+	});
+
+	// O5 (2026-10-18): a check-setup stop carried only the engine reason (for
+	// example `ENOENT`), which reads like a provider launch failure, and the
+	// stop label never reached the caller at all.
+	it("names the stop label, so a check-setup stop is not read as a provider failure", async () => {
+		const checkSetup = await runRoutingFixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: {
+					providerReliability: createProviderReliabilityDiagnostic({
+						causeCode: "check_setup_failed",
+						phase: "baseline",
+					}),
+					errorKind: "check_failed",
+					failureReason: "ENOENT",
+					failurePhase: "prepare",
+				},
+			},
+		});
+		strictEqual(checkSetup.status, "failed");
+		strictEqual(checkSetup.direction, "stop");
+		strictEqual(checkSetup.stopReason, "check_setup_failed");
+		strictEqual(checkSetup.failureReason, "ENOENT");
+		strictEqual(checkSetup.attempts.at(-1).reason, "baseline_failed");
+
+		const redBaseline = await runRoutingFixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: {
+					failurePhase: "baseline",
+					failureReason: "baseline_check_failed",
+					errorKind: "environment_failure",
+				},
+			},
+		});
+		strictEqual(redBaseline.direction, "stop");
+		strictEqual(redBaseline.stopReason, "baseline_failed");
+
+		const success = await runRoutingFixture();
+		strictEqual(success.stopReason, undefined);
+		const deferred = await runRoutingFixture({ __targets: [] });
+		strictEqual(deferred.stopReason, undefined);
 	});
 
 	it("returns usageError naming the deadline rule and writes stderr when deadline is more than 30 minutes ahead with --json", async () => {
