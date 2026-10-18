@@ -1,3 +1,4 @@
+// @test-phase: other
 // Regression coverage for worker-bootstrap.mjs's production fatal metadata
 // composition.
 

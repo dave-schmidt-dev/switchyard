@@ -1,3 +1,4 @@
+// @test-phase: other
 import { ok, rejects, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";

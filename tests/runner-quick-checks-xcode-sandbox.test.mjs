@@ -1,3 +1,4 @@
+// @test-phase: other
 import { doesNotMatch, match, ok, strictEqual, throws } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, rejects, strictEqual, throws } from "node:assert";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, rmSync } from "node:fs";

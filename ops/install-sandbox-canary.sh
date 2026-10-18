@@ -31,8 +31,8 @@ PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
 LABEL="com.zerodelta.switchyard.sandbox-canary"
 TEMPLATE="$SCRIPT_DIR/$LABEL.plist.template"
-SNAPSHOT_PATHS="package.json scripts/sandbox-canary.mjs scripts/sandbox-canary-daily.mjs src tests"
-REQUIRED_SNAPSHOT_FILES="scripts/sandbox-canary.mjs scripts/sandbox-canary-daily.mjs src/switchyard/runner/checks-sandbox.mjs tests/runner-quick-checks-toolchain-sandbox.test.mjs"
+SNAPSHOT_PATHS="package.json scripts/sandbox-canary.mjs scripts/sandbox-canary-daily.mjs scripts/hermetic-test-env.mjs src tests"
+REQUIRED_SNAPSHOT_FILES="scripts/sandbox-canary.mjs scripts/sandbox-canary-daily.mjs scripts/hermetic-test-env.mjs src/switchyard/runner/checks-sandbox.mjs tests/runner-quick-checks-toolchain-sandbox.test.mjs"
 
 INSTALL_BASE="$HOME/Library/Application Support/switchyard"
 INSTALL_DIR="$INSTALL_BASE/sandbox-canary"
@@ -259,7 +259,7 @@ for required in $REQUIRED_SNAPSHOT_FILES; do
 	fi
 done
 chmod +x "$STAGE_DIR/scripts/sandbox-canary.mjs"
-for script in sandbox-canary.mjs sandbox-canary-daily.mjs; do
+for script in sandbox-canary.mjs sandbox-canary-daily.mjs hermetic-test-env.mjs; do
  if ! bounded "$BOUND_SECONDS" "$NODE_BIN" --check "$STAGE_DIR/scripts/$script"; then
   fail "accepted snapshot $script failed node syntax validation"
  fi

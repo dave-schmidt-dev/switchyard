@@ -1,7 +1,21 @@
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
-import { execFileSync } from "node:child_process";
+// @test-phase: other
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	strictEqual,
+	throws,
+} from "node:assert";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -11,79 +25,133 @@ import {
 	defaultRun,
 	runPhases,
 } from "../scripts/run-test-phases.mjs";
+import {
+	readTestManifest,
+	runLane,
+	TEST_PHASES,
+} from "../scripts/test-manifest.mjs";
+import { tempDir } from "./helpers/tempdir.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
 const PACKAGE_JSON_PATH = resolve(PKG_ROOT, "package.json");
 
 describe("test phase aggregation runner", () => {
-	it("keeps the exact shell selection manifest and bounds only the other-phase Node workers", () => {
-		const pkg = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
-		const script = pkg.scripts["test:other"];
-		const additions = [
+	it("derives every lane from one pragma per file and pins the serial and property sets", () => {
+		const manifest = readTestManifest(PKG_ROOT);
+		deepStrictEqual(manifest.errors, []);
+		const all = readdirSync(resolve(PKG_ROOT, "tests"))
+			.filter((name) => name.endsWith(".test.mjs"))
+			.map((name) => `tests/${name}`)
+			.sort();
+		deepStrictEqual(manifest.files, all);
+		const lanes = TEST_PHASES.flatMap((phase) => manifest.phases[phase]);
+		strictEqual(new Set(lanes).size, lanes.length, "lanes must be disjoint");
+		deepStrictEqual([...lanes].sort(), all);
+		deepStrictEqual(manifest.phases.properties, [
+			"tests/mutation-properties.test.mjs",
+			"tests/outcome-properties.test.mjs",
+		]);
+		for (const path of [
 			"tests/sandbox-canary.test.mjs",
 			"tests/sandbox-canary-install.test.mjs",
 			"tests/runner-python-quick-checks-host.test.mjs",
-		];
-		const serialArguments = pkg.scripts["test:serial"].split(" ");
-		deepStrictEqual(
-			serialArguments.filter((arg) => additions.includes(arg)),
-			additions,
+		])
+			ok(manifest.phases.serial.includes(path), `serial lane: ${path}`);
+		strictEqual(
+			createHash("sha256")
+				.update(
+					JSON.stringify({
+						serial: manifest.phases.serial,
+						properties: manifest.phases.properties,
+					}),
+				)
+				.digest("hex"),
+			// 2026-10-18 (S9): the 82 serial and 2 property files moved from the
+			// package.json lists to per-file pragmas; the sets were diffed equal.
+			// test:other is every remaining file, so a new file needs no re-pin.
+			"17f312b6cef353efc2b540d478f5374424bfda2dbc902ea43aedef0fd37e7cc0",
 		);
-		let historicalOther = script.replace("--test-concurrency=2 ", "");
-		for (const path of additions) {
-			const exactCaseEntry = `|${path}`;
-			strictEqual(
-				historicalOther.split(exactCaseEntry).length - 1,
-				1,
-				`one exclusion required: ${path}`,
-			);
-			historicalOther = historicalOther.replace(exactCaseEntry, "");
-		}
-		const historicalSerial = serialArguments
-			.filter((arg) => !additions.includes(arg))
-			.join(" ");
+	});
 
+	it("runs each lane as one bounded node --test child under a hermetic env", () => {
+		for (const [lane, concurrency] of [
+			["serial", "--test-concurrency=1"],
+			["other", "--test-concurrency=2"],
+		]) {
+			let call;
+			const status = runLane(lane, {
+				root: PKG_ROOT,
+				extraArgs: ["--test-name-pattern=x"],
+				env: { PATH: process.env.PATH, HOME: "/nonexistent-owner-home" },
+				spawn(command, args, options) {
+					call = { command, args, options };
+					ok(existsSync(options.env.HOME));
+					ok(existsSync(options.env.TMPDIR));
+					return { status: 0 };
+				},
+			});
+			strictEqual(status, 0);
+			strictEqual(call.command, process.execPath);
+			const files = readTestManifest(PKG_ROOT).phases[lane];
+			deepStrictEqual(call.args, [
+				"--test",
+				concurrency,
+				"--test-reporter=tap",
+				"--test-name-pattern=x",
+				...files,
+			]);
+			strictEqual(call.options.stdio, "inherit");
+			notStrictEqual(call.options.env.HOME, "/nonexistent-owner-home");
+			strictEqual(existsSync(call.options.env.HOME), false, "env removed");
+		}
+	});
+
+	it("refuses a lane before spawning when a test file lacks its pragma", () => {
+		const root = tempDir("switchyard-manifest-");
+		try {
+			mkdirSync(resolve(root, "tests"));
+			writeFileSync(
+				resolve(root, "tests/a.test.mjs"),
+				"// @test-phase: serial\n",
+			);
+			writeFileSync(resolve(root, "tests/b.test.mjs"), "import 'x';\n");
+			writeFileSync(
+				resolve(root, "tests/c.test.mjs"),
+				"// @test-phase: fast\n",
+			);
+			const logs = [];
+			let spawned = false;
+			const status = runLane("other", {
+				root,
+				log: (line) => logs.push(line),
+				spawn() {
+					spawned = true;
+					return { status: 0 };
+				},
+			});
+			strictEqual(status, 1);
+			strictEqual(spawned, false);
+			deepStrictEqual(
+				logs.map((line) => line.split(":")[1].trim()),
+				["tests/b.test.mjs", "tests/c.test.mjs"],
+			);
+			strictEqual(runLane("properties", { root, log: () => {} }), 2);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps package.json lane scripts on the generated manifest", () => {
+		const pkg = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
 		strictEqual(
-			createHash("sha256").update(historicalOther).digest("hex"),
-			// 2026-10-18: the test-free tests/simple-dispatch.test.mjs and its
-			// exclusion were deleted; nothing else in the manifest changed.
-			"62194c342e07648fdd76835597911140d45e404d164bab1d4cb41e73b6639bba",
+			pkg.scripts["test:serial"],
+			"node scripts/test-manifest.mjs --run serial",
 		);
 		strictEqual(
-			createHash("sha256").update(historicalSerial).digest("hex"),
-			"ef10de5076ecf90f79b70868759033b55375fee4a76bb206f60ebe08e705dbc4",
+			pkg.scripts["test:other"],
+			"node scripts/test-manifest.mjs --run other",
 		);
-		ok(
-			script.endsWith(
-				"node --test --test-concurrency=2 --test-reporter=tap $files",
-			),
-		);
-		const selection = script.replace(
-			"node --test --test-concurrency=2 --test-reporter=tap $files",
-			"printf '%s\\n' $files",
-		);
-		const selected = execFileSync("/bin/sh", ["-c", selection], {
-			cwd: PKG_ROOT,
-			encoding: "utf8",
-		})
-			.trim()
-			.split("\n");
-		const serial = pkg.scripts["test:serial"]
-			.split(" ")
-			.filter((arg) => arg.startsWith("tests/"));
-		const excluded = new Set([
-			...serial,
-			"tests/outcome-properties.test.mjs",
-			"tests/mutation-properties.test.mjs",
-		]);
-		const expected = readdirSync(resolve(PKG_ROOT, "tests"))
-			.filter((name) => name.endsWith(".test.mjs"))
-			.map((name) => `tests/${name}`)
-			.filter((path) => !excluded.has(path))
-			.sort();
-		deepStrictEqual(selected, expected);
-		strictEqual(new Set(selected).size, selected.length);
 	});
 
 	it("cleans phase gate and isolated account directories after a process error", () => {

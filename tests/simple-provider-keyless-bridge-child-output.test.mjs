@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strict as assert } from "node:assert";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";

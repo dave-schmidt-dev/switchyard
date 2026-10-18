@@ -1,3 +1,4 @@
+// @test-phase: serial
 // Live timeout and VM destroy test for the Parallels backend.
 //
 // Gated on Parallels, golden image, Aqua identity, and the shared VM slot.

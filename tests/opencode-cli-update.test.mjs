@@ -1,3 +1,4 @@
+// @test-phase: other
 // Behavior tests for the noninteractive OpenCode golden-VM updater.
 //
 // The fake prlctl records every host mutation and captures the guest stdin

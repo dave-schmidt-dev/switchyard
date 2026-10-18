@@ -1,3 +1,4 @@
+// @test-phase: other
 // Increment 6 (F3.2 shared account authority) gate test: two projects, one
 // subscription.
 //

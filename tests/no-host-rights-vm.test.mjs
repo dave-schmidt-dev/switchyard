@@ -1,3 +1,4 @@
+// @test-phase: serial
 // INV-1 gate test for the Parallels macOS backend.
 //
 // The host-side Parallels inspection is the direct filesystem proof: host

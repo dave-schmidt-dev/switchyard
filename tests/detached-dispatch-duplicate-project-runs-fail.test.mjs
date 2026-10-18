@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { ok, rejects, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";

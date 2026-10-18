@@ -1,3 +1,4 @@
+// @test-phase: other
 // INV-5 gate test: capability filter + model right-sizing.
 // Property: a high-tier task never yields an under-capable target; the model
 // returned is always right-sized to the requested tier; low-capability

@@ -1,3 +1,4 @@
+// @test-phase: other
 // INV-2 gate test: bounded git apply subprocesses (Task 2.2).
 // Verifies that git apply check and mutating subprocesses are bounded by
 // APPLY_COMMAND_TIMEOUT_MS (60s) with SIGKILL on expiry, and that the

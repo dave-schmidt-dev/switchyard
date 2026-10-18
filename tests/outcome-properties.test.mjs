@@ -1,3 +1,4 @@
+// @test-phase: properties
 import { strictEqual } from "node:assert";
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";

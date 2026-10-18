@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";

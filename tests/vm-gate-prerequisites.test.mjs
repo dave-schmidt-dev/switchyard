@@ -1,3 +1,4 @@
+// @test-phase: other
 // Guards the VM gates' prerequisite ladders against the
 // env-var-unset-means-silent-green shape.
 //

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strictEqual } from "node:assert";
 import { EventEmitter } from "node:events";
 import { mock, test } from "node:test";

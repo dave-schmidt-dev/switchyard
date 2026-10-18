@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
 import { EventEmitter } from "node:events";

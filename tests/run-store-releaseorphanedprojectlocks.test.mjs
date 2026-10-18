@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { createHash } from "node:crypto";
 import {

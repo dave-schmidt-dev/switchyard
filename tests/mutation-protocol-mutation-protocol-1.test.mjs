@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";

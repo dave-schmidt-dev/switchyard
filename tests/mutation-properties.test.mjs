@@ -1,3 +1,4 @@
+// @test-phase: properties
 import { ok, strictEqual } from "node:assert";
 import { writeFileSync } from "node:fs";
 import { describe, it } from "node:test";

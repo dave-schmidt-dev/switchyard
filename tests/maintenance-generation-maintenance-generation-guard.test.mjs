@@ -1,3 +1,4 @@
+// @test-phase: other
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
@@ -8,7 +9,6 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,13 +23,14 @@ import {
 	MaintenanceGenerationError,
 } from "../src/switchyard/maintenance/index.mjs";
 import { runQueue } from "../src/switchyard/runner/index.mjs";
+import { HOST_HOME } from "./helpers/host-home.mjs";
 import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
 // The producers are host tools under ~/.agent; skip, never fail, where they
 // are absent (the check sandbox and CI run under an isolated HOME).
-const HOST_METRICS = join(homedir(), ".agent", "bin", "metrics");
+const HOST_METRICS = join(HOST_HOME, ".agent", "bin", "metrics");
 const HOST_EXPAND = join(
-	homedir(),
+	HOST_HOME,
 	".agent",
 	"prompts",
 	"_shared",
@@ -322,7 +323,12 @@ describe("maintenance generation guard", () => {
 	}, () => {
 		const path = markerPath();
 		activeMarker(path);
-		const env = { ...process.env, SWITCHYARD_GENERATION_MARKER: path };
+		// Host tools resolve their own files from the owner's HOME.
+		const env = {
+			...process.env,
+			HOME: HOST_HOME,
+			SWITCHYARD_GENERATION_MARKER: path,
+		};
 		const metrics = spawnSync(
 			"python3",
 			[HOST_METRICS, "append", "--file", join(tempDir(), "metrics.jsonl")],
@@ -344,6 +350,7 @@ describe("maintenance generation guard", () => {
 			encoding: "utf8",
 			env: {
 				...process.env,
+				HOME: HOST_HOME,
 				SWITCHYARD_GENERATION_MARKER: join(tempDir(), "absent.json"),
 			},
 			stdio: ["ignore", "ignore", "ignore"],

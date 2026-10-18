@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";

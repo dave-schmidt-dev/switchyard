@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";

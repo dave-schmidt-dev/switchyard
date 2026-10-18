@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, match, strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import { VIBE_ACTIVE_MODEL } from "../src/switchyard/adapter/vibe.mjs";

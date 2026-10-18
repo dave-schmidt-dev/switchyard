@@ -1,3 +1,4 @@
+// @test-phase: other
 // INV-2 gate test: incomplete git-apply metadata is refused, sanitized, at
 // BOTH catch points — direct validateDiff calls and the integrationGate
 // declaration precheck — and never mutates the host: no apply, stage, or

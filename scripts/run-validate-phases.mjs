@@ -21,6 +21,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runContractSuites } from "./check-contract-gates.mjs";
+import { holdRunScratchRoot } from "./hermetic-test-env.mjs";
 import { runPhases } from "./run-test-phases.mjs";
 
 /** Ordered so the cheap static checks report before the expensive suites. */
@@ -43,6 +44,7 @@ if (
 		(existsSync(process.argv[1]) &&
 			import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href))
 ) {
+	holdRunScratchRoot();
 	const status = runValidatePhases();
 	if (status !== 0) process.exit(status);
 	try {

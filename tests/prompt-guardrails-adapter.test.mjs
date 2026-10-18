@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strictEqual } from "node:assert";
 import { describe, it } from "node:test";
 import {

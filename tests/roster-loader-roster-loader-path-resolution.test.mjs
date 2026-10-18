@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strictEqual, throws } from "node:assert";
 import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";

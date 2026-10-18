@@ -1,3 +1,4 @@
+// @test-phase: other
 // Task 1.6 (roster-unification plan): router INV-5 right-sizing property test.
 //
 // The router's source needed no change in Task 1.6 — Task 1.5 replaced the

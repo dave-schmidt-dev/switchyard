@@ -12,6 +12,7 @@ import {
 	suitesForOwners,
 	validateContractGateMapping,
 } from "./check-contract-gates.mjs";
+import { withHermeticTestEnv } from "./hermetic-test-env.mjs";
 
 /** Critical production modules and their minimum native Node coverage. */
 export const CRITICAL_MODULE_COVERAGE = Object.freeze([
@@ -396,13 +397,15 @@ export function runContractCoverage({
 			"--test",
 			...plan.suites,
 		];
-		const result = run(process.execPath, args, {
-			cwd: root,
-			encoding: "utf8",
-			// Stream the real runner while the second spec reporter retains metrics.
-			stdio: ["ignore", "inherit", "inherit"],
-			env: { ...process.env },
-		});
+		const result = withHermeticTestEnv(process.env, (env) =>
+			run(process.execPath, args, {
+				cwd: root,
+				encoding: "utf8",
+				// Stream the real runner while the second spec reporter retains metrics.
+				stdio: ["ignore", "inherit", "inherit"],
+				env,
+			}),
+		);
 		const output = existsSync(reportPath)
 			? readFileSync(reportPath, "utf8")
 			: `${result.stdout ?? ""}${result.stderr ?? ""}`;

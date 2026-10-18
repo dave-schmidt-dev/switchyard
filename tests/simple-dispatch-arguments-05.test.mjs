@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, throws } from "node:assert";
 import {
 	existsSync,

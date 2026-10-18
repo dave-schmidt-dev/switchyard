@@ -1,3 +1,4 @@
+// @test-phase: serial
 import {
 	deepStrictEqual,
 	notStrictEqual,

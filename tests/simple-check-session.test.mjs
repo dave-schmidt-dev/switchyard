@@ -1,3 +1,4 @@
+// @test-phase: other
 import { ok, rejects, strictEqual } from "node:assert";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";

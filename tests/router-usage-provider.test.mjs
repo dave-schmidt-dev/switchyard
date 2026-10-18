@@ -1,3 +1,4 @@
+// @test-phase: other
 // Task 1.5b (INV-4): target -> usage_provider mapping.
 //
 // Corrected premise (PM-8, design brief `roster-design-brief-2026-07-30.md`
@@ -18,12 +19,12 @@
 
 import { ok, strictEqual } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { normalizeProviderName } from "../src/switchyard/roster/index.mjs";
+import { HOST_HOME } from "./helpers/host-home.mjs";
 
-const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
+const ROSTER_PATH = join(HOST_HOME, ".agent", "roster.json");
 
 // Gradus provider display names -- verified live (M12) against
 // ~/Library/Application Support/Gradus/Installed/snapshot-v2.json, first on 2026-07-30

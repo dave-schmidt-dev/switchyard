@@ -1,3 +1,4 @@
+// @test-phase: other
 // INV-2 gate test: the git-apply metadata seam is one checked, bounded
 // command execution path. Real subprocess regressions for BOTH metadata
 // commands: a SIGTERM-ignoring stalled child is SIGKILLed and reaped within

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strict as assert } from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";

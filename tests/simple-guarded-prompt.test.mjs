@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strictEqual } from "node:assert/strict";
 import { test } from "node:test";
 import { buildGuardedPrompt } from "../src/switchyard/simple/guarded-prompt.mjs";

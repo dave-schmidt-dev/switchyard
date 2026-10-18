@@ -1,3 +1,4 @@
+// @test-phase: other
 import { ok, strictEqual } from "node:assert/strict";
 
 import { spawnSync } from "node:child_process";

@@ -1,3 +1,4 @@
+// @test-phase: other
 import {
 	deepStrictEqual,
 	equal,

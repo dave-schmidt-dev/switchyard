@@ -1,9 +1,11 @@
+// @test-phase: other
 import { ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { buildStatusEnvelope } from "../src/switchyard/dispatch/status-envelope.mjs";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { readRun } from "../src/switchyard/run-store/index.mjs";
@@ -11,6 +13,12 @@ import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
+const originalRosterEnv = process.env.SWITCHYARD_ROSTER_PATH;
+// Route selection reads the roster: use the committed fixture, never the
+// owner's live ~/.agent/roster.json.
+process.env.SWITCHYARD_ROSTER_PATH = fileURLToPath(
+	new URL("./fixtures/roster.fixture.json", import.meta.url),
+);
 const SUITE_ROOT = tempDir("switchyard-durable-telemetry-");
 const WORK_ROOT = join(SUITE_ROOT, "work");
 mkdirSync(WORK_ROOT, { recursive: true });
@@ -20,6 +28,9 @@ after(() => {
 	if (originalRunStoreEnv === undefined)
 		delete process.env.SWITCHYARD_RUN_STORE_ROOT;
 	else process.env.SWITCHYARD_RUN_STORE_ROOT = originalRunStoreEnv;
+	if (originalRosterEnv === undefined)
+		delete process.env.SWITCHYARD_ROSTER_PATH;
+	else process.env.SWITCHYARD_ROSTER_PATH = originalRosterEnv;
 	rmSync(SUITE_ROOT, { recursive: true, force: true });
 });
 
@@ -98,6 +109,22 @@ function dependencies(overrides = {}) {
 	};
 }
 
+// Fail fast when the run settles before the provider starts, instead of
+// waiting forever on a gate nothing will open.
+async function untilEntered(provider, pending) {
+	const early = await Promise.race([
+		provider.entered.then(() => null),
+		pending.then(
+			(result) => ({ result }),
+			(error) => ({ error }),
+		),
+	]);
+	if (early)
+		throw new Error(
+			`simple run settled before the provider started: ${early.result?.failureReason ?? early.error}`,
+		);
+}
+
 function blockedProvider() {
 	let enteredResolve;
 	const entered = new Promise((resolve) => {
@@ -137,7 +164,7 @@ it("persists running state, start timestamps and an observed heartbeat while the
 			runCheck: async () => ({ success: true }),
 		}),
 	);
-	await provider.entered;
+	await untilEntered(provider, pending);
 	ok(typeof emitProgress === "function");
 	const live = await waitFor(async () => {
 		const record = await readRun(runId).catch(() => null);
@@ -236,7 +263,7 @@ it("throttles durable heartbeats to at most one per 30 seconds", async () => {
 			runCheck: async () => ({ success: true }),
 		}),
 	);
-	await provider.entered;
+	await untilEntered(provider, pending);
 	ok(typeof emitProgress === "function");
 	const firstAt = clock;
 	emitProgress();

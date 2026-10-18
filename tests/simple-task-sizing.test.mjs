@@ -1,3 +1,4 @@
+// @test-phase: other
 import assert, { ok, strictEqual } from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";

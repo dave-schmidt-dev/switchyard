@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";

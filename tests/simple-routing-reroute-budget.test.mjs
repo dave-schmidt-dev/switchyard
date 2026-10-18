@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { test } from "node:test";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";

@@ -1,3 +1,4 @@
+// @test-phase: other
 // Increment 6 (F3.2 shared account authority) gate test: account identity.
 //
 // The accounting unit is one independently metered target, not one login and

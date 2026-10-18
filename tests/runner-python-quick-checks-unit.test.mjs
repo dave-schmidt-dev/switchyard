@@ -1,3 +1,4 @@
+// @test-phase: other
 import assert from "node:assert/strict";
 import {
 	lstatSync,

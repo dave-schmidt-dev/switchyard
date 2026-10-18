@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
