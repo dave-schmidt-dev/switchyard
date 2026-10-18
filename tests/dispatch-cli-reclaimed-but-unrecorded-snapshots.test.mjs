@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	handleRecover,
 	sweepManagedOrphans,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 import { ROSTER_FIXTURE_PATH } from "./helpers/dispatch-cli-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 

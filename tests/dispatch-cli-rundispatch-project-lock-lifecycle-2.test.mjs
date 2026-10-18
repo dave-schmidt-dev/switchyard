@@ -15,7 +15,7 @@ import {
 	runDispatch as dispatchRun,
 	handleRun,
 	parseDispatchArgs,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 import {
 	DISPATCH_PATH,
 	ROSTER_FIXTURE_PATH,

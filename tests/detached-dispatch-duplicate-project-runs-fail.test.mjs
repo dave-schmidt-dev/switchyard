@@ -48,7 +48,7 @@ afterEach(() => {
 describe("project-lock reconciliation without managed VMs", () => {
 	it("recover without --state-root binds the backend to the run-store default", async () => {
 		const { handleRecover } = await import(
-			"../src/switchyard/dispatch/index.mjs"
+			"../src/switchyard/dispatch/cli.mjs"
 		);
 		const { getStateRoot } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -90,7 +90,7 @@ describe("project-lock reconciliation without managed VMs", () => {
 
 	it("recover --run reclaims terminal-clean and dead-running VMs from durable ownership", async () => {
 		const { handleRecover } = await import(
-			"../src/switchyard/dispatch/index.mjs"
+			"../src/switchyard/dispatch/cli.mjs"
 		);
 		const { advanceState, initializeRun, readRun, updateRun } = await import(
 			"../src/switchyard/run-store/index.mjs"
@@ -200,7 +200,7 @@ describe("project-lock reconciliation without managed VMs", () => {
 			updateRun,
 		} = await import("../src/switchyard/run-store/index.mjs");
 		const { handleRecover } = await import(
-			"../src/switchyard/dispatch/index.mjs"
+			"../src/switchyard/dispatch/cli.mjs"
 		);
 		const runId = randomUUID();
 		await initializeRun({
@@ -256,7 +256,7 @@ describe("project-lock reconciliation without managed VMs", () => {
 
 	it("never enters the queue when ownership reassertion fails", async () => {
 		const { runDispatch: runDispatchInProcess } = await import(
-			"../src/switchyard/dispatch/index.mjs"
+			"../src/switchyard/dispatch/cli.mjs"
 		);
 		let queueEntries = 0;
 		await rejects(

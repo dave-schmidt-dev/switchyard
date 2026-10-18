@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { handleLaunch, handleRun } from "../src/switchyard/dispatch/index.mjs";
+import { handleLaunch, handleRun } from "../src/switchyard/dispatch/cli.mjs";
 import { parseSimpleArgs } from "../src/switchyard/simple/args.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import { appendFailureRecord } from "../src/switchyard/simple/failure-log.mjs";

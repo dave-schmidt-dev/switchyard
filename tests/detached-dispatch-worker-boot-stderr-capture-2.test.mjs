@@ -19,6 +19,8 @@ import {
 } from "./helpers/detached-dispatch-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
+const DISPATCH_CLI_PATH = resolve(DISPATCH_PATH, "..", "cli.mjs");
+
 let dir;
 let tasksFile;
 let projectDir;
@@ -148,7 +150,7 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 		// failure the worker can reach itself would unlink the log on the way past.
 		const launchCode = `
 		process.env.NODE_OPTIONS = "--this-flag-does-not-exist";
-		const { handleLaunch } = await import(${JSON.stringify(DISPATCH_PATH)});
+		const { handleLaunch } = await import(${JSON.stringify(DISPATCH_CLI_PATH)});
 		await handleLaunch([${JSON.stringify(tasksFile)}, "--project", ${JSON.stringify(projectDir)}]);
 		`;
 
@@ -218,7 +220,7 @@ describe("worker boot stderr capture and retention (Task 1.1)", () => {
 			return realOpenSync.call(this, path, ...rest);
 		};
 		syncBuiltinESMExports();
-		const { handleLaunch } = await import(${JSON.stringify(DISPATCH_PATH)});
+		const { handleLaunch } = await import(${JSON.stringify(DISPATCH_CLI_PATH)});
 		await handleLaunch([${JSON.stringify(tasksFile)}, "--project", ${JSON.stringify(projectDir)}]);
 		`;
 

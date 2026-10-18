@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { probeProviderProcess } from "../src/switchyard/dispatch/index.mjs";
+import { probeProviderProcess } from "../src/switchyard/dispatch/cli.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import {
 	ROSTER_FIXTURE_PATH,

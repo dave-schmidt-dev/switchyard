@@ -41,8 +41,8 @@ import {
 	prepareRunIdentity,
 	resolveBootstrapPath,
 } from "./launch-support.mjs";
+import { recoveryCommandFor } from "./recovery-command.mjs";
 import { runDispatch } from "./run-dispatch.mjs";
-import { recoveryCommandFor } from "./status-envelope.mjs";
 
 async function handleRun(argv, dependencies = {}, usage = USAGE_RUN) {
 	const jsonRequested = argv.includes("--json");

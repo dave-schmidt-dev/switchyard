@@ -126,6 +126,8 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 	{
 		path: "src/switchyard/dispatch/index.mjs",
 		members: [
+			"src/switchyard/dispatch/cli.mjs",
+			"src/switchyard/dispatch/recovery-command.mjs",
 			"src/switchyard/dispatch/cli-usage.mjs",
 			"src/switchyard/dispatch/cli-args.mjs",
 			"src/switchyard/dispatch/cli-handlers.mjs",

@@ -21,7 +21,7 @@ import {
 	USAGE_RUN,
 	USAGE_STATUS,
 	USAGE_VALIDATE_INPUTS,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 import {
 	acquireProjectLock,
 	advanceState,

@@ -8,11 +8,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import {
 	runDispatch as dispatchRun,
 	parseDispatchArgs,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
+import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import { LockError } from "../src/switchyard/run-store/index.mjs";
 import {
 	CheckpointIdentityError,

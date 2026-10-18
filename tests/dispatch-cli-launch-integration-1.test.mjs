@@ -18,7 +18,7 @@ import {
 	handleLaunch,
 	markLauncherReadyIfLaunching,
 	parseDispatchArgs,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 import { releaseProjectLockIfOwnedBy } from "../src/switchyard/run-store/index.mjs";
 import {
 	ROSTER_FIXTURE_PATH,

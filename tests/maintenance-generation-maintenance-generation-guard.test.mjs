@@ -12,10 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import {
-	handleLaunch,
-	runDispatch,
-} from "../src/switchyard/dispatch/index.mjs";
+import { handleLaunch, runDispatch } from "../src/switchyard/dispatch/cli.mjs";
 import { recordDispatch } from "../src/switchyard/ledger/index.mjs";
 import {
 	assertGenerationAllowed,

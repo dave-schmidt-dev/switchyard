@@ -26,7 +26,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { renewDispatchReceipts } from "../src/switchyard/dispatch/index.mjs";
+import { renewDispatchReceipts } from "../src/switchyard/dispatch/cli.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("renewDispatchReceipts", () => {

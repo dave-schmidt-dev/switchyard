@@ -13,6 +13,10 @@ import {
 import { USAGE_RESULT, USAGE_STATUS, UsageError } from "./cli-usage.mjs";
 import { projectDisposition, projectTerminalOutcome } from "./disposition.mjs";
 import {
+	recoveryCommandFor,
+	remediationCommandFor,
+} from "./recovery-command.mjs";
+import {
 	buildStatusEnvelope,
 	countCompletedAndFailed,
 	deriveRetryProjection,
@@ -25,8 +29,6 @@ import {
 	readEventsSafe,
 	readQueueDiagnosticsForRun,
 	reconcileFailureArtifactRef,
-	recoveryCommandFor,
-	remediationCommandFor,
 	sanitizedExecutionFailureEvents,
 	shadowEnvelope,
 } from "./status-envelope.mjs";

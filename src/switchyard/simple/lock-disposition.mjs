@@ -1,5 +1,5 @@
 import { projectDisposition } from "../dispatch/disposition.mjs";
-import { recoveryCommandFor } from "../dispatch/status-envelope.mjs";
+import { recoveryCommandFor } from "../dispatch/recovery-command.mjs";
 import { RUN_ID_RE } from "../run-store/errors.mjs";
 import { readRun } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";

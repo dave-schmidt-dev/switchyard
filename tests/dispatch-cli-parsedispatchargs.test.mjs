@@ -2,7 +2,7 @@ import { deepStrictEqual, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { parseDispatchArgs } from "../src/switchyard/dispatch/index.mjs";
+import { parseDispatchArgs } from "../src/switchyard/dispatch/cli.mjs";
 import { ROSTER_FIXTURE_PATH } from "./helpers/dispatch-cli-fixtures.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 

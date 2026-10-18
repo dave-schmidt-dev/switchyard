@@ -32,7 +32,7 @@ import { projectDisposition } from "./disposition.mjs";
 import {
 	recoveryCommandFor,
 	remediationCommandFor,
-} from "./status-envelope.mjs";
+} from "./recovery-command.mjs";
 
 const RENEWAL_TIMEOUT_MS = 30_000;
 function renewDispatchReceipts(checkpointPath, report) {

@@ -1,11 +1,11 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	handleRecover,
 	sweepManagedOrphans,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 import {
 	DISPATCH_PATH,
 	ROSTER_FIXTURE_PATH,
@@ -178,7 +178,12 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 		// It read `containersReclaimed`/`volumesReclaimed` after the
 		// Docker-to-Parallels rename, so `undefined > 0` made the branch
 		// unreachable and every pre-run reclamation went unreported.
-		const source = readFileSync(DISPATCH_PATH, "utf8");
+		// The sweep report lives in run-dispatch.mjs. Reading the entry point
+		// instead matched nothing, so this check passed without checking.
+		const source = readFileSync(
+			join(dirname(DISPATCH_PATH), "run-dispatch.mjs"),
+			"utf8",
+		);
 		const swept = await sweepManagedOrphans({
 			listManaged: () => [],
 			reclaim: () => ({
@@ -192,7 +197,9 @@ describe("reclaimed-but-unrecorded snapshots reach the operator", () => {
 				throw new Error("no such run");
 			},
 		});
-		for (const match of source.matchAll(/swept\.([A-Za-z]+)/g)) {
+		const reads = [...source.matchAll(/swept\.([A-Za-z]+)/g)];
+		ok(reads.length > 0, "run-dispatch.mjs no longer reads the sweep report");
+		for (const match of reads) {
 			ok(
 				Object.hasOwn(swept, match[1]),
 				`pre-run sweep reads swept.${match[1]}, which sweepManagedOrphans does not return`,

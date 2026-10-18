@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import {
 	assessRecoveryEntry,
 	resolveIsRunDead,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 
 // Liveness rule that decides whether `recover` may reap a managed container.
 // This is the data-loss-critical branch: a false "dead" reaps a live

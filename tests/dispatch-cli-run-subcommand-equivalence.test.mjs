@@ -8,12 +8,12 @@ import {
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
 import {
-	formatRunAbort,
 	handleRun,
 	parseDispatchArgs,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
+import { projectDisposition } from "../src/switchyard/dispatch/disposition.mjs";
+import { formatRunAbort } from "../src/switchyard/dispatch/index.mjs";
 import { createDefaultRouteHealthDecision } from "../src/switchyard/router/health.mjs";
 import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
 import { TaskSelectionError } from "../src/switchyard/runner/index.mjs";

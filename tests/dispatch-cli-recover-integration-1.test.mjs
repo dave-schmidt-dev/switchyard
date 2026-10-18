@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	handleRecover,
 	parseRecoverArgs,
-} from "../src/switchyard/dispatch/index.mjs";
+} from "../src/switchyard/dispatch/cli.mjs";
 import {
 	acquireProjectLock,
 	advanceState,

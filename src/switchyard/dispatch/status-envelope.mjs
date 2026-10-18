@@ -16,7 +16,6 @@ import {
 } from "../outcome/projection.mjs";
 import {
 	getRunRoot,
-	getStateRoot,
 	getVmAdmissionRoot,
 	readEvents,
 } from "../run-store/index.mjs";
@@ -29,8 +28,11 @@ import {
 	loadTaskQueue,
 	sanitizeQueuePreflightDetail,
 } from "../runner/index.mjs";
-import { shellQuote } from "./cli-args.mjs";
 import { projectDisposition } from "./disposition.mjs";
+import {
+	recoveryCommandFor,
+	remediationCommandFor,
+} from "./recovery-command.mjs";
 
 async function readEventsSafe(runId) {
 	try {
@@ -43,12 +45,6 @@ async function readEventsSafe(runId) {
 		Object.defineProperty(events, "evidenceValid", { value: false });
 		return events;
 	}
-}
-function recoveryCommandFor(runId) {
-	return `switchyard-dispatch recover --run ${runId} --state-root ${shellQuote(getStateRoot())}`;
-}
-function remediationCommandFor() {
-	return `switchyard-dispatch remediate-orphaned-locks --state-root ${shellQuote(getStateRoot())}`;
 }
 function countCompletedAndFailed(events) {
 	let completedCount = 0;
@@ -431,8 +427,6 @@ export {
 	readEventsSafe,
 	readQueueDiagnosticsForRun,
 	reconcileFailureArtifactRef,
-	recoveryCommandFor,
-	remediationCommandFor,
 	sanitizedExecutionFailureEvents,
 	shadowEnvelope,
 };
