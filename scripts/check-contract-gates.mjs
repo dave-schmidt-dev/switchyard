@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gatePrerequisiteProblems } from "./pytest-venv.mjs";
 
 export const CONTRACT_GATE_STATUSES = Object.freeze([
 	"not-run",
@@ -578,6 +579,11 @@ export async function runContractSuites({
 	const snapshot = computeContractSnapshot(root);
 	const owners = ownersForPaths(manifest, snapshot.paths);
 	const requiredSuites = suitesForOwners(owners.length > 0 ? owners : manifest);
+	const missing = gatePrerequisiteProblems(requiredSuites, { root });
+	if (missing.length > 0) {
+		for (const line of missing) log(`contract gates: ${line}`);
+		fail("contract_gate_prerequisite_missing");
+	}
 	const suites = {};
 	for (const suite of requiredSuites) {
 		suites[suite] = await runSuiteWithTap(root, suite);

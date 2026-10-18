@@ -55,6 +55,7 @@ function createReceiptFixture({ stage = true } = {}) {
 		"package.json",
 		"scripts/check-contract-gates.mjs",
 		"scripts/check-contract-receipt.mjs",
+		"scripts/pytest-venv.mjs",
 		"scripts/run-test-phases.mjs",
 		"scripts/run-validate-phases.mjs",
 		// Contract suites can import support modules outside the boundary they

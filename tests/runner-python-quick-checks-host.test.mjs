@@ -2,9 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
 	cpSync,
-	existsSync,
 	mkdirSync,
-	readdirSync,
 	readFileSync,
 	rmSync,
 	symlinkSync,
@@ -13,53 +11,16 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { findPytestVenv, PYTEST_VENV_REMEDY } from "../scripts/pytest-venv.mjs";
 import { runQuickChecks } from "../src/switchyard/runner/checks.mjs";
 import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
-// Test input only: never install packages or search the caller's Python path.
-function hasInstalledPytest(path) {
-	try {
-		return (
-			existsSync(join(path, "pyvenv.cfg")) &&
-			existsSync(join(path, "bin", "python")) &&
-			readdirSync(join(path, "lib")).some(
-				(version) =>
-					/^python[0-9.]+$/u.test(version) &&
-					existsSync(
-						join(
-							path,
-							"lib",
-							version,
-							"site-packages",
-							"pytest",
-							"__init__.py",
-						),
-					) &&
-					existsSync(
-						join(
-							path,
-							"lib",
-							version,
-							"site-packages",
-							"_pytest",
-							"__init__.py",
-						),
-					),
-			)
-		);
-	} catch {
-		return false;
-	}
-}
 const testDirectory = dirname(fileURLToPath(import.meta.url));
-const candidates = process.env.SWITCHYARD_TEST_PYTEST_VENV
-	? [resolve(process.env.SWITCHYARD_TEST_PYTEST_VENV)]
-	: [resolve(testDirectory, "../.venv"), resolve(testDirectory, "../../.venv")];
-const installedVenv = candidates.find(hasInstalledPytest);
+const installedVenv = findPytestVenv({ root: resolve(testDirectory, "..") });
 const fixtureUnavailable = installedVenv
 	? false
-	: "Python host fixture unavailable: set SWITCHYARD_TEST_PYTEST_VENV to an existing venv with installed pytest (no packages are installed by this suite)";
+	: `Python host fixture unavailable: ${PYTEST_VENV_REMEDY}`;
 
 function git(cwd, args) {
 	return execFileSync("git", args, {

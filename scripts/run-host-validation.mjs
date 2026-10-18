@@ -11,6 +11,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gatePrerequisiteProblems, PYTHON_HOST_SUITE } from "./pytest-venv.mjs";
 import { defaultRun, runPhases } from "./run-test-phases.mjs";
 import { supervisedSpawn } from "./sandbox-canary-daily.mjs";
 
@@ -19,7 +20,6 @@ export const HOST_VALIDATE_PHASES = [
 	"canary:sandbox",
 	"python:host",
 ];
-const PYTHON_HOST_SUITE = "tests/runner-python-quick-checks-host.test.mjs";
 const PYTHON_HOST_TIMEOUT_MS = 240_000;
 const PYTHON_HOST_MAX_BYTES = 1024 * 1024;
 
@@ -104,6 +104,15 @@ if (
 		(existsSync(process.argv[1]) &&
 			import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href))
 ) {
+	// Every host phase needs the pytest fixture, so refuse in the first
+	// second rather than after a full validate run.
+	const missing = gatePrerequisiteProblems([PYTHON_HOST_SUITE], {
+		root: process.cwd(),
+	});
+	if (missing.length > 0) {
+		for (const line of missing) console.error(`validate:host: ${line}`);
+		process.exit(1);
+	}
 	const status = runHostValidation();
 	process.exit(status);
 }
