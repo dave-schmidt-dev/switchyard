@@ -118,7 +118,10 @@ test("a stderr rate-limit report stops the provider early and resolves quota_exh
 			}),
 		);
 		const elapsedMs = Date.now() - startedAt;
-		ok(elapsedMs < 2_000, `provider stopped after ${elapsedMs}ms`);
+		// Under the 30 s provider timeout and child lifetime, so a provider that
+		// was not stopped early fails, but above a loaded host's 6 to 10 s
+		// process-launch stalls.
+		ok(elapsedMs < 20_000, `provider stopped after ${elapsedMs}ms`);
 
 		strictEqual(result.success, false);
 		strictEqual(result.rateLimited, true);

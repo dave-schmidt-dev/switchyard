@@ -14,6 +14,7 @@ import {
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
 import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
 import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TASK_BASE = {
@@ -457,7 +458,8 @@ describe("provider process lifecycle", () => {
 					command: process.execPath,
 					args: [
 						"-e",
-						'process.on("SIGTERM", () => {}); setTimeout(() => {}, 1000)',
+						// Outlives the bound below by far, so only a hard kill passes.
+						'process.on("SIGTERM", () => {}); setTimeout(() => {}, 120_000)',
 					],
 				};
 			},
@@ -471,7 +473,12 @@ describe("provider process lifecycle", () => {
 			}),
 			{ status: "timed_out", diff: null },
 		);
-		ok(Date.now() - startedAt < 500, "capture returned within its hard budget");
+		// Generous on purpose: a loaded host stalls process launches for 6 to
+		// 10 s, and the child would hold an unbounded capture for 120 s.
+		ok(
+			Date.now() - startedAt < HANG_GUARD_MS,
+			"capture returned within its hard budget",
+		);
 	});
 
 	it("preserves timed_out when synchronous task-base validation exhausts the budget", () => {
