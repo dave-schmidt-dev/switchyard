@@ -27,8 +27,16 @@ describe("sweep-temp-dirs --simple-orphans", () => {
 			env: { ...process.env, TMPDIR: tmp, SWITCHYARD_RUN_STORE_ROOT: store },
 			timeout: HANG_GUARD_MS,
 		});
-		strictEqual(result.status, 0, result.stderr);
 		ok(!result.stderr.includes("ReferenceError"), result.stderr);
+		// Reaching the open-handle check is the regression proof. A host-wide
+		// lsof that outlives the collector's bound fails closed instead, which
+		// the host decides, not this code: on 2026-10-18 four processes each
+		// stalled lsof for 5 to 10 s, so the scan took about 30.5 s.
+		if (result.stdout.includes("simple-orphans: lsof unavailable")) {
+			strictEqual(result.status, 1, result.stdout);
+			return;
+		}
+		strictEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
 		ok(
 			result.stdout.includes("simple-orphans dry-run: uuidRoots=0"),
 			result.stdout,
