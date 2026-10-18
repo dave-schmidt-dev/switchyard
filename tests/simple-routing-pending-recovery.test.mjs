@@ -1,13 +1,23 @@
 import { deepStrictEqual, rejects, strictEqual } from "node:assert";
-import { realpathSync } from "node:fs";
-import { test } from "node:test";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, test } from "node:test";
 import { handleRoutingRun } from "../src/switchyard/simple/routing-cli.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import {
 	openRoutingRun,
 	readRoutingRunState,
 } from "../src/switchyard/simple/routing-state.mjs";
+import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
+
+const quarantines = new Set();
+afterEach(() => {
+	for (const path of quarantines)
+		rmSync(path, { recursive: true, force: true });
+	quarantines.clear();
+});
 
 // A pending attempt left dangling by an unconfirmed lifecycle: the run
 // record is the durable evidence close-pending must prove before closing it.
@@ -215,6 +225,93 @@ test("a retained-unclaimed worktree is refused", async () => {
 		code: "partial_work_retained",
 	});
 	deepStrictEqual(readState(f), before);
+});
+
+// Regression (OPS-2): a retained claim whose directory was deleted from
+// outside left the pending attempt unrecoverable -- close-pending refused
+// partial_work_retained and release-partial cannot see a pending attempt.
+function vanishedClaim(overrides = {}) {
+	return {
+		state: "retained",
+		writerStopped: true,
+		path: join(realpathSync(tempDir("pending-recovery-gone-")), "attempt"),
+		nonce: randomUUID(),
+		device: "16777234",
+		inode: "4242",
+		...overrides,
+	};
+}
+
+test("a retained claim whose root and quarantine are gone closes as lifecycle_recovered", async () => {
+	const f = fixture({
+		record: { cleanupState: "failed", worktree: vanishedClaim() },
+	});
+	let output;
+	await handleRoutingRun(f.argv, {
+		...f.deps,
+		writeResult: (value) => {
+			output = JSON.parse(value);
+		},
+	});
+	strictEqual(output.reason, "lifecycle_recovered");
+	const state = readState(f);
+	strictEqual(state.pendingAttempt, null);
+	strictEqual(state.attempts[0].reason, "lifecycle_recovered");
+	strictEqual(state.attempts[0].partialWorktree, null);
+});
+
+test("a vanished retained claim still needs every other recovery proof", async () => {
+	const present = vanishedClaim();
+	mkdirSync(present.path);
+	const quarantined = vanishedClaim();
+	const quarantine = simpleQuarantinePath(quarantined.nonce);
+	quarantines.add(quarantine);
+	mkdirSync(quarantine);
+	const cases = [
+		[{ worktree: present }, {}, "partial_work_retained"],
+		[{ worktree: quarantined }, {}, "partial_work_retained"],
+		[
+			{ worktree: vanishedClaim({ nonce: "not-a-uuid" }) },
+			{},
+			"partial_work_retained",
+		],
+		[
+			{ worktree: vanishedClaim({ inode: undefined }) },
+			{},
+			"partial_work_retained",
+		],
+		[
+			{ worktree: vanishedClaim({ path: "relative/attempt" }) },
+			{},
+			"partial_work_retained",
+		],
+		[
+			{ worktree: vanishedClaim({ writerStopped: false }) },
+			{},
+			"worker_not_stopped",
+		],
+		[
+			{ worktree: vanishedClaim(), workerPid: process.pid },
+			{},
+			"worker_not_stopped",
+		],
+		[
+			{ worktree: vanishedClaim() },
+			{ isProjectLockHeld: () => true },
+			"project_lock_held",
+		],
+		[
+			{ worktree: vanishedClaim(), state: "executing" },
+			{},
+			"run_state_not_terminal",
+		],
+	];
+	for (const [record, deps, code] of cases) {
+		const f = fixture({ record: { cleanupState: "failed", ...record } });
+		const before = readState(f);
+		await rejects(handleRoutingRun(f.argv, { ...f.deps, ...deps }), { code });
+		deepStrictEqual(readState(f), before);
+	}
 });
 
 test("a task-id mismatch and a missing pending attempt are refused", async () => {

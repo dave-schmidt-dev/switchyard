@@ -107,6 +107,33 @@ export async function releaseRetainedPartial(options, deps = {}) {
 }
 
 const RUN_TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+function pathAbsent(path) {
+	try {
+		lstatSync(path);
+		return false;
+	} catch (error) {
+		return error?.code === "ENOENT";
+	}
+}
+// A retained claim whose directory was deleted from outside has nothing left
+// to salvage, and release-partial cannot see a still-pending attempt. Only a
+// well-formed exact claim whose root and quarantine are both ENOENT counts;
+// any other lstat answer, or a malformed claim, keeps the refusal.
+function retainedClaimGone(claim) {
+	if (
+		typeof claim?.path !== "string" ||
+		!claim.path.startsWith("/") ||
+		typeof claim.nonce !== "string" ||
+		!UUID.test(claim.nonce) ||
+		!/^\d+$/.test(claim.device ?? "") ||
+		!/^\d+$/.test(claim.inode ?? "")
+	)
+		return false;
+	return (
+		pathAbsent(claim.path) && pathAbsent(simpleQuarantinePath(claim.nonce))
+	);
+}
 // Writer quiescence follows the lifecycle rule: the run's writer is stopped
 // or never started. A worktree claim that does not record writerStopped
 // proves nothing, and a worker process that answers a liveness probe blocks
@@ -129,8 +156,9 @@ function writerQuiescent(record, deps) {
  * behind; every later invocation would otherwise answer
  * `pending_attempt_exists`. Recovery requires durable proof the attempt is
  * over -- a terminal run record, a quiescent writer, no live project lock and
- * no retained-unclaimed worktree -- and records the attempt as terminal
- * `skipped` with reason `lifecycle_recovered`.
+ * no retained-unclaimed worktree still on disk -- and records the attempt as
+ * terminal `skipped` with reason `lifecycle_recovered`. The whole check and
+ * transition run under the routing-run lock.
  */
 export async function closePendingAttempt(options, deps = {}) {
 	const projectPath = canonicalRoutingProject(options.projectPath);
@@ -154,7 +182,10 @@ export async function closePendingAttempt(options, deps = {}) {
 		if (!writerQuiescent(record, deps)) rejectRelease("worker_not_stopped");
 		if ((deps.isProjectLockHeld ?? isProjectLockHeld)(projectPath))
 			rejectRelease("project_lock_held");
-		if (record.worktree?.state === "retained")
+		if (
+			record.worktree?.state === "retained" &&
+			!retainedClaimGone(record.worktree)
+		)
 			rejectRelease("partial_work_retained");
 		recordAttemptOutcome(handle.state, handle.commit, {
 			...pending,
