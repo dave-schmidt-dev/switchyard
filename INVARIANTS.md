@@ -59,7 +59,7 @@ gate_test: tests/dispatch-cli-parsedispatchargs.test.mjs, tests/dispatch-cli-val
 ### Contract gate: run-store
 
 area: ["src/switchyard/run-store/index.mjs", "src/switchyard/run-store/errors.mjs", "src/switchyard/run-store/constants.mjs", "src/switchyard/run-store/receipt-validation.mjs", "src/switchyard/run-store/validate-run.mjs", "src/switchyard/run-store/run-records.mjs", "src/switchyard/run-store/vm-slots.mjs", "src/switchyard/run-store/project-lock-files.mjs", "src/switchyard/run-store/run-updates.mjs", "src/switchyard/run-store/events.mjs", "src/switchyard/run-store/project-locks.mjs", "src/switchyard/run-store/project-lock-claims.mjs", "src/switchyard/run-store/run-locks.mjs", "src/switchyard/run-store/evidence.mjs", "src/switchyard/run-store/outcomes.mjs", "src/switchyard/run-store/checkpoint-artifacts.mjs", "src/switchyard/run-store/checkpoint-retention.mjs", "src/switchyard/run-store/retention.mjs"]
-gate_test: tests/run-store-shadow-reducer-projection.test.mjs, tests/run-store-provider-diagnostic-artifact-boundary.test.mjs, tests/run-store-initializerun.test.mjs, tests/run-store-event-ordering.test.mjs, tests/run-store-corruption.test.mjs, tests/run-store-retention-1.test.mjs, tests/run-store-retention-2.test.mjs, tests/run-store-retention-3.test.mjs, tests/run-store-project-lock.test.mjs, tests/run-store-project-lock-recovery-claims.test.mjs, tests/run-store-project-lock-recovery-claims-2.test.mjs, tests/run-store-global-vm-admission-slots.test.mjs, tests/run-store-releaseorphanedprojectlocks.test.mjs, tests/run-store-initialhostfingerprint-validation.test.mjs, tests/run-store-lock-file-path-resolution.test.mjs, tests/run-store-prlctl-failure-metadata-survives.test.mjs, tests/runner-check-repair-async.test.mjs, tests/runner-check-repair.test.mjs
+gate_test: tests/run-store-shadow-reducer-projection.test.mjs, tests/run-store-provider-diagnostic-artifact-boundary.test.mjs, tests/run-store-initializerun.test.mjs, tests/run-store-event-ordering.test.mjs, tests/run-store-corruption.test.mjs, tests/run-store-retention-1.test.mjs, tests/run-store-retention-2.test.mjs, tests/run-store-retention-3.test.mjs, tests/run-store-project-lock.test.mjs, tests/run-store-project-lock-recovery-claims.test.mjs, tests/run-store-project-lock-recovery-claims-2.test.mjs, tests/run-store-global-vm-admission-slots.test.mjs, tests/run-store-releaseorphanedprojectlocks.test.mjs, tests/run-store-initialhostfingerprint-validation.test.mjs, tests/run-store-lock-file-path-resolution.test.mjs, tests/run-store-prlctl-failure-metadata-survives.test.mjs, tests/runner-check-repair-async.test.mjs, tests/runner-check-repair.test.mjs, tests/project-lock-name-single-source.test.mjs
 
 ### Contract gate: finalization
 
@@ -68,8 +68,8 @@ gate_test: tests/run-finalization.test.mjs
 
 ### Contract gate: diagnostics
 
-area: ["src/switchyard/diagnostics/index.mjs", "src/switchyard/diagnostics/provider-reliability.mjs", "src/switchyard/diagnostics/provider-qualification.mjs", "src/switchyard/diagnostics/provider-qualification-fixture.mjs", "src/switchyard/diagnostics/provider-qualification-verification.mjs"]
-gate_test: tests/diagnostics.test.mjs, tests/provider-reliability.test.mjs, tests/provider-qualification.test.mjs
+area: ["src/switchyard/diagnostics/provider-reliability.mjs", "src/switchyard/diagnostics/provider-qualification.mjs", "src/switchyard/diagnostics/provider-qualification-fixture.mjs", "src/switchyard/diagnostics/provider-qualification-verification.mjs"]
+gate_test: tests/provider-reliability.test.mjs, tests/provider-qualification.test.mjs
 
 ### Contract gate: mutation-protocol
 

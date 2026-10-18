@@ -80,9 +80,10 @@ describe("contract coverage groups", () => {
 				)
 				.digest("hex"),
 			// 2026-10-18 (SC7): dispatch/cli.mjs and dispatch/recovery-command.mjs
-			// joined the dispatch/index.mjs group when the bin was split. No floor
-			// changed and no module left.
-			"3f278c07c5be84a232ab6492a14ae6c2229d448291aed8fa5bd67fd52874a0d8",
+			// joined the dispatch/index.mjs group when the bin was split. (S11): the
+			// diagnostics entry moved from the deleted, unused index.mjs to
+			// provider-reliability.mjs at the same floors. No floor changed.
+			"d613f6d47b82ac809d40a43196b1a604d17aa89b750e6d3c700af20165db0598",
 		);
 	});
 
@@ -113,6 +114,7 @@ describe("contract coverage groups", () => {
 		// ordering.
 		const charterAdditions = [
 			"tests/dispatch-simple-import-boundary.test.mjs",
+			"tests/project-lock-name-single-source.test.mjs",
 			"tests/python-venv-proof.test.mjs",
 		];
 		deepStrictEqual(
@@ -133,7 +135,9 @@ describe("contract coverage groups", () => {
 					),
 				)
 				.digest("hex"),
-			"3cc72b1272dd44da6432d65c8f9f0f3ef7c0db81ec2e41510c4650b5bbf57b7e",
+			// 2026-10-18 (S11): tests/diagnostics.test.mjs left with the deleted
+			// module; every other entry and its order is unchanged.
+			"f8c00d84180cd7bee87940fb7481365bbb60a95a9530988e17494916838073e2",
 		);
 		let calls = 0;
 		const result = runContractCoverage({

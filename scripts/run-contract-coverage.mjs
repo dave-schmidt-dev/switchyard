@@ -177,7 +177,7 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 		functions: 60,
 	},
 	{
-		path: "src/switchyard/diagnostics/index.mjs",
+		path: "src/switchyard/diagnostics/provider-reliability.mjs",
 		lines: 80,
 		branches: 55,
 		functions: 80,

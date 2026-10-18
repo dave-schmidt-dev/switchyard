@@ -86,14 +86,21 @@ function createReceiptFixture({ stage = true } = {}) {
 	execFileSync("git", ["add", "."], { cwd: fixture });
 	execFileSync("git", ["commit", "-qm", "fixture"], { cwd: fixture });
 	if (stage) {
-		const diagnostics = join(fixture, "src/switchyard/diagnostics/index.mjs");
+		const diagnostics = join(
+			fixture,
+			"src/switchyard/diagnostics/provider-reliability.mjs",
+		);
 		writeFileSync(
 			diagnostics,
 			`${requireText(diagnostics)}\n// staged boundary edit\n`,
 		);
-		execFileSync("git", ["add", "src/switchyard/diagnostics/index.mjs"], {
-			cwd: fixture,
-		});
+		execFileSync(
+			"git",
+			["add", "src/switchyard/diagnostics/provider-reliability.mjs"],
+			{
+				cwd: fixture,
+			},
+		);
 	}
 	return fixture;
 }
@@ -391,11 +398,10 @@ describe("source-boundary contract gate mapping", () => {
 		try {
 			const status = statusReport({ root: fixture });
 			deepStrictEqual(status.changedPaths, [
-				"src/switchyard/diagnostics/index.mjs",
+				"src/switchyard/diagnostics/provider-reliability.mjs",
 			]);
 			deepStrictEqual(status.owners, ["diagnostics"]);
 			deepStrictEqual(status.suites, {
-				"tests/diagnostics.test.mjs": "not-run",
 				"tests/provider-qualification.test.mjs": "not-run",
 				"tests/provider-reliability.test.mjs": "not-run",
 			});
@@ -442,14 +448,21 @@ describe("source-boundary contract gate mapping", () => {
 				{ cwd: fixture, encoding: "utf8" },
 			);
 			ok(valid.includes("valid for 1 mapped owner"));
-			const diagnostics = join(fixture, "src/switchyard/diagnostics/index.mjs");
+			const diagnostics = join(
+				fixture,
+				"src/switchyard/diagnostics/provider-reliability.mjs",
+			);
 			writeFileSync(
 				diagnostics,
 				`${requireText(diagnostics)}\n// post-gate edit\n`,
 			);
-			execFileSync("git", ["add", "src/switchyard/diagnostics/index.mjs"], {
-				cwd: fixture,
-			});
+			execFileSync(
+				"git",
+				["add", "src/switchyard/diagnostics/provider-reliability.mjs"],
+				{
+					cwd: fixture,
+				},
+			);
 			throws(
 				() =>
 					execFileSync(

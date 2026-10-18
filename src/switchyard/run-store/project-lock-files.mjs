@@ -218,12 +218,20 @@ async function moveProjectLockPathToClaim(
 		throw error;
 	}
 }
-function cwdDerivedProjectLockPath(canonicalProjectPath) {
+function cwdDerivedProjectLockFileName(canonicalProjectPath) {
+	// The name a lock got before its identity stopped depending on the cwd.
+	// Release and remediation still have to recognize locks written under it.
 	const historicalKeyPath = resolve(
 		canonicalProjectPath,
 		`project:${canonicalProjectPath}`,
 	);
-	return lockFilePath(historicalKeyPath);
+	return `${createHash("sha256").update(historicalKeyPath).digest("hex")}.lock`;
+}
+function cwdDerivedProjectLockPath(canonicalProjectPath) {
+	return resolve(
+		locksRoot(),
+		cwdDerivedProjectLockFileName(canonicalProjectPath),
+	);
 }
 function parseProjectLockArtifact(raw, projectPath, isOwnedPath) {
 	return isOwnedPath
@@ -311,6 +319,7 @@ function parseRecoveryReservation(raw) {
 }
 
 export {
+	cwdDerivedProjectLockFileName,
 	cwdDerivedProjectLockPath,
 	lockFilePath,
 	moveProjectLockPathToClaim,

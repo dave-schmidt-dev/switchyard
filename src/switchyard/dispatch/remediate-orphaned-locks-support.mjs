@@ -1,6 +1,9 @@
-import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { getStateRoot } from "../run-store/index.mjs";
+import {
+	cwdDerivedProjectLockFileName,
+	projectLockFileName,
+} from "../run-store/project-lock-files.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 
 const USAGE = `Usage: node remediate-orphaned-locks.mjs [--dry-run] [--confirm] [--help]
@@ -43,17 +46,6 @@ function parseArgs(argv) {
 }
 function locksDir() {
 	return resolve(getStateRoot(), "locks");
-}
-function projectLockFileName(canonicalProjectPath) {
-	const identity = `project:${resolve(canonicalProjectPath)}`;
-	return `${createHash("sha256").update(identity).digest("hex")}.lock`;
-}
-function cwdDerivedProjectLockFileName(canonicalProjectPath) {
-	const historicalKeyPath = resolve(
-		canonicalProjectPath,
-		`project:${canonicalProjectPath}`,
-	);
-	return `${createHash("sha256").update(historicalKeyPath).digest("hex")}.lock`;
 }
 function isPidProvenDead(pid, probePid) {
 	if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -163,14 +155,12 @@ function isTerminalOrDead(run, options = {}) {
 export {
 	baseDescriptor,
 	bindLegacyRecoveryOwner,
-	cwdDerivedProjectLockFileName,
 	isCleanupFailedDeadWorker,
 	isPidProvenDead,
 	isRunStale,
 	isTerminalOrDead,
 	locksDir,
 	parseArgs,
-	projectLockFileName,
 	recoveryClaimDescriptor,
 	recoveryClaimLockName,
 	recoveryProofMetadata,
