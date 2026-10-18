@@ -260,7 +260,12 @@ describe("mutation protocol", () => {
 			command: () => new Promise(() => {}),
 			observe: () => new Promise(() => {}),
 		});
-		ok(Date.now() - started < 150, "bounded calls must not hang the protocol");
+		// Well under the 5 s default bounds, so the injected 10 ms bounds were
+		// used, and loose enough that a loaded host's timer delay cannot fail it.
+		ok(
+			Date.now() - started < 4_000,
+			"bounded calls must not hang the protocol",
+		);
 		strictEqual(result.state, "uncertain");
 	});
 

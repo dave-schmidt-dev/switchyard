@@ -298,10 +298,12 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 					dependencies: {
 						backendFactory: () => backend,
 						onStatus: (event) => statuses.push(event),
-						vmSlotWaitTimeoutMs: 2,
+						// Real monotonic time is the point here. A 2 ms deadline let any
+						// event-loop delay before the first wait end the test early.
+						vmSlotWaitTimeoutMs: 500,
 						vmSlotWaitIntervalMs: 1,
 						sleepFn: async () =>
-							new Promise((resolve) => setTimeout(resolve, 10)),
+							new Promise((resolve) => setTimeout(resolve, 600)),
 					},
 				}),
 				(error) => error === unavailable,
@@ -315,8 +317,8 @@ describe("queue platform admission ordering (Tasks 6.1-6.2)", () => {
 			.filter((event) => event.event === "vm_slot_wait")
 			.map((event) => event.elapsedMs);
 		strictEqual(elapsed.length, 2);
-		ok(elapsed[0] >= 0 && elapsed[0] < 2);
-		strictEqual(elapsed[1], 2);
+		ok(elapsed[0] >= 0 && elapsed[0] < 500);
+		strictEqual(elapsed[1], 500);
 		strictEqual(events.includes("create"), false);
 	});
 });

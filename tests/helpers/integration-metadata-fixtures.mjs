@@ -177,7 +177,9 @@ export async function runMetadataScenario({
 	timeoutMs = 5000,
 	call = "validateDiff",
 	gateOptions = {},
-	watchdogMs = 20000,
+	// A hang guard only, far above the injected command timeout. It was 20 s
+	// until a loaded host (2026-10-18, load average 25) let it expire first.
+	watchdogMs = 60_000,
 	fakeGitSpawnFailure = false,
 }) {
 	const dir = tempDir("switchyard-metadata-");

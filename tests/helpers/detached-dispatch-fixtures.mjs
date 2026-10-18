@@ -68,11 +68,16 @@ function commandAvailable(command) {
 	}
 }
 
+// A hang guard only: a healthy bootstrap exits in well under a second. It was
+// 10 s until a loaded host (2026-10-18 pre-push) slowed every spawn about 35x
+// and the guard killed workers that were still on their way to exit 1.
+const BOOTSTRAP_HANG_GUARD_MS = 60_000;
+
 function runBootstrap(args, env = {}) {
 	return spawnSync(process.execPath, [BOOTSTRAP_PATH, ...args], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
-		timeout: 10_000,
+		timeout: BOOTSTRAP_HANG_GUARD_MS,
 		env: { ...process.env, ...env },
 	});
 }

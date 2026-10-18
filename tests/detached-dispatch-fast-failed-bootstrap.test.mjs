@@ -151,7 +151,9 @@ import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"
 		const result = spawnSync(process.execPath, [brokenBootstrapPath], {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
-			timeout: 10_000,
+			// Any finite bound proves the old hang is gone; 10 s took 6 s of
+			// headroom on a loaded host (2026-10-18 pre-push).
+			timeout: 60_000,
 			env: { ...process.env, SWITCHYARD_RUN_STORE_ROOT: stateRoot },
 		});
 		const elapsed = Date.now() - start;
@@ -161,7 +163,7 @@ import("${resolve(__dirname, "..", "src", "switchyard", "run-store", "index.mjs"
 			1,
 			`expected exit 1, got ${result.status}: ${result.stderr}`,
 		);
-		ok(elapsed < 10_000, `broken bootstrap hung: ${elapsed}ms`);
+		ok(elapsed < 60_000, `broken bootstrap hung: ${elapsed}ms`);
 
 		const events = await readEvents(runId);
 		const bootFailed = events.find((e) => e.event === "worker_boot_failed");
