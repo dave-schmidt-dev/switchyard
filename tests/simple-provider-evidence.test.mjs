@@ -30,6 +30,7 @@ import {
 	PROVIDER_SIGNATURES,
 	writeProviderStderrArtifact,
 } from "../src/switchyard/simple/provider-signature.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -558,7 +559,7 @@ test("spawned exit 76 with unrecognized stderr is suppressed without a run", asy
 		capability: "standard",
 		prompt: "test",
 		worktreePath: repo.projectPath,
-		timeoutMs: 10_000,
+		timeoutMs: HANG_GUARD_MS,
 		spawnFn: () => spawnUnrecognizedExit76(plantedProviderStderr()),
 	});
 	strictEqual(result.success, false);

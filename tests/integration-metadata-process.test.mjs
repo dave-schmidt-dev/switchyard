@@ -180,7 +180,6 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "nonzero",
 			numstatOutput: `1\t1\ttest.txt\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -199,7 +198,6 @@ describe("metadata command process bounds", () => {
 			numstatMode: "ok",
 			summaryMode: "nonzero",
 			summaryOutput: ` create mode 100644 src/new.txt\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -214,7 +212,6 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "signal",
 			numstatOutput: `1\t1\ttest.txt\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -230,7 +227,6 @@ describe("metadata command process bounds", () => {
 			numstatMode: "ok",
 			summaryMode: "signal",
 			summaryOutput: ` create mode 100644 new.txt\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -243,7 +239,6 @@ describe("metadata command process bounds", () => {
 			patch: plainDiff(),
 			projectPath,
 			numstatMode: "overflow-stdout",
-			timeoutMs: 10000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -255,7 +250,6 @@ describe("metadata command process bounds", () => {
 			patch: plainDiff(),
 			projectPath,
 			numstatMode: "overflow-stderr",
-			timeoutMs: 10000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -268,7 +262,6 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "ok",
 			summaryMode: "overflow-stdout",
-			timeoutMs: 10000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -281,7 +274,6 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "ok",
 			summaryMode: "overflow-stderr",
-			timeoutMs: 10000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -293,7 +285,6 @@ describe("metadata command process bounds", () => {
 			patch: plainDiff(),
 			projectPath,
 			numstatMode: "ok",
-			timeoutMs: 5000,
 			fakeGitSpawnFailure: true,
 		});
 		assertRunnerHealthy(scenario);
@@ -306,7 +297,6 @@ describe("metadata command process bounds", () => {
 			patch: plainDiff(),
 			projectPath,
 			numstatMode: "nonzero-corrupt",
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -322,7 +312,6 @@ describe("metadata command process bounds", () => {
 			patch: plainDiff(),
 			projectPath,
 			numstatMode: "nonzero-conflict",
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -341,7 +330,6 @@ describe("metadata command process bounds", () => {
 			summaryMode: "ok",
 			numstatOutput: "1\t1\ttest.txt\n",
 			summaryOutput: "",
-			timeoutMs: 5000,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, true);

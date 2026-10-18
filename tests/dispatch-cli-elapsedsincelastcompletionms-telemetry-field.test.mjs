@@ -9,6 +9,7 @@ import {
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
 } from "./helpers/dispatch-cli-fixtures.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 function writeLegacyCheckpoint(path, checkpoint) {
@@ -106,9 +107,11 @@ describe("elapsedSinceLastCompletionMs telemetry field (B.4)", () => {
 		strictEqual(envelope.lastCompletionAt, lastCompletionAt);
 		// Should track ~60s since lastCompletionAt, not the (much smaller)
 		// queueStartedAt-derived elapsedMs for a run created moments ago in
-		// this same test.
+		// this same test. A launch stall before `status` only adds to the
+		// reading, so the upper bound allows a full hang guard.
 		ok(
-			Math.abs(envelope.elapsedSinceLastCompletionMs - 60_000) < 5_000,
+			envelope.elapsedSinceLastCompletionMs > 55_000 &&
+				envelope.elapsedSinceLastCompletionMs < 60_000 + HANG_GUARD_MS,
 			`expected ~60000ms since lastCompletionAt, got ${envelope.elapsedSinceLastCompletionMs}`,
 		);
 		ok(

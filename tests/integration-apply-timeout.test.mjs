@@ -148,7 +148,7 @@ exec "$real_git" "$@"
 	it("applies cleanly when execution finishes within the timeout bound", () => {
 		const diff = createModifiedDiff();
 		process.env.PATH = `${binDir}:${originalPath}`;
-		setApplyCommandTimeoutForTests(5000);
+		setApplyCommandTimeoutForTests(APPLY_COMMAND_TIMEOUT_MS - 1);
 
 		const result = integrationGate(diff, projectPath);
 		strictEqual(result.success, true);

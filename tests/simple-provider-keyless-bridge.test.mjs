@@ -18,6 +18,7 @@ import {
 	startProxy,
 } from "../ops/simple-provider-keyless-bridge.mjs";
 import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const SECRET = "synthetic-real-api-key-bridge-123456";
 function setup() {
@@ -152,7 +153,7 @@ test("Switchyard teardown stops a detached CLI after bridge SIGKILL", async (t) 
 	);
 	let cliPid = null;
 	try {
-		const deadline = Date.now() + 10_000;
+		const deadline = Date.now() + HANG_GUARD_MS;
 		while (Date.now() < deadline) {
 			try {
 				cliPid = Number(readFileSync(join(item.worktree, "cli.pid"), "utf8"));

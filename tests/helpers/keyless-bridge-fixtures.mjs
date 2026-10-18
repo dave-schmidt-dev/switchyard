@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runBridge } from "../../ops/simple-provider-keyless-bridge.mjs";
+import { HANG_GUARD_MS } from "./hang-guard.mjs";
 
 export const SECRET = "synthetic-real-api-key-bridge-123456";
 export function setup() {
@@ -70,7 +71,7 @@ export function runFake(
 			prompt: "synthetic task",
 			secret: SECRET,
 			cliPath,
-			timeoutMs: 5_000,
+			timeoutMs: HANG_GUARD_MS,
 			verifySession: false,
 			...extra,
 		}),

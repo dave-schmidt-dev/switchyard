@@ -17,6 +17,7 @@ import {
 	validateTaskStartTree,
 	validateTaskStartTreeAsync,
 } from "../src/switchyard/lifecycle/index.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const TASK_BASE = {
@@ -280,7 +281,7 @@ describe("provider process lifecycle", () => {
 				// The never-completing fake ignores SIGTERM, so wait on its actual
 				// disappearance rather than an elapsed-time window: a TERM-only kill
 				// would leave it running past the probe's hard budget.
-				while (Date.now() - startedAt < 15_000) {
+				while (Date.now() - startedAt < HANG_GUARD_MS) {
 					try {
 						process.kill(helperPid, 0);
 					} catch (error) {

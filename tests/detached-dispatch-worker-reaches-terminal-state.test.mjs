@@ -13,6 +13,7 @@ import {
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
 } from "./helpers/detached-dispatch-fixtures.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let dir;
@@ -185,7 +186,7 @@ export async function resolve(specifier, context, nextResolve) {
 		let terminalReached = false;
 		let terminalStatus = null;
 		const start = Date.now();
-		const maxWait = 15_000;
+		const maxWait = HANG_GUARD_MS;
 
 		while (Date.now() - start < maxWait) {
 			const statusResult = pollStatus(runId, makeStateRootEnv());

@@ -17,6 +17,7 @@ import {
 	runSimpleWriter,
 } from "../src/switchyard/simple/index.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalTmpdirEnv = process.env.TMPDIR;
@@ -194,7 +195,7 @@ describe("simple local execution path", () => {
 		const result = await runSimpleWriter(
 			"/bin/sh",
 			["-c", "sleep 0.2 </dev/null >/dev/null 2>&1 & exit 0"],
-			{ timeoutMs: 5_000, termGraceMs: 100 },
+			{ timeoutMs: HANG_GUARD_MS, termGraceMs: 100 },
 		);
 		strictEqual(result.success, true);
 		strictEqual(result.writerLifecycle, "stopped");
@@ -237,7 +238,7 @@ helper.unref();
 				{
 					cwd: worktreePath,
 					processScopePath: worktreePath,
-					timeoutMs: 5_000,
+					timeoutMs: HANG_GUARD_MS,
 					termGraceMs: 100,
 				},
 			);

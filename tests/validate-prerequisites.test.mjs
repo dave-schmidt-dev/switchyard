@@ -8,6 +8,7 @@ import {
 	gatePrerequisiteProblems,
 	PYTHON_HOST_SUITE,
 } from "../scripts/pytest-venv.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO = join(import.meta.dirname, "..");
@@ -72,12 +73,12 @@ test("validate:host refuses in its first second without the pytest fixture", () 
 		{
 			cwd: root,
 			encoding: "utf8",
-			timeout: 30_000,
+			timeout: HANG_GUARD_MS,
 			env: { PATH: process.env.PATH, HOME: process.env.HOME },
 		},
 	);
 	strictEqual(result.status, 1, result.stderr);
 	match(result.stderr, /validate:host: Python host fixture unavailable/u);
 	strictEqual(result.stdout.includes("phase"), false);
-	strictEqual(Date.now() - started < 10_000, true);
+	strictEqual(Date.now() - started < HANG_GUARD_MS, true);
 });

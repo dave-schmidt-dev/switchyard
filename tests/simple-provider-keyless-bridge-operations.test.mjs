@@ -19,6 +19,7 @@ import {
 	runBridge,
 	startProxy,
 } from "../ops/simple-provider-keyless-bridge.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const SECRET = "synthetic-real-api-key-bridge-123456";
 test("proxy request event formatter emits only the bounded safe schema", () => {
@@ -308,7 +309,7 @@ process.exit(1);
 					secret: SECRET,
 					cliPath: fake,
 					upstream: upstream.url,
-					timeoutMs: 5_000,
+					timeoutMs: HANG_GUARD_MS,
 				});
 			} finally {
 				process.stderr.write = originalStderrWrite;
@@ -423,7 +424,7 @@ process.stdout.write(await response.text());
 			secret: SECRET,
 			cliPath: fake,
 			upstream: upstream.url,
-			timeoutMs: 20_000,
+			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(result.code, 0, result.stderr);
 		const probe = JSON.parse(
@@ -492,7 +493,7 @@ test("Vibe completion fails closed when persisted served alias differs", async (
 				prompt: "synthetic task",
 				secret: SECRET,
 				cliPath: fake,
-				timeoutMs: 5_000,
+				timeoutMs: HANG_GUARD_MS,
 			}),
 			/does not prove the requested model alias/,
 		);
@@ -555,7 +556,7 @@ fi
 			prompt: "Use bash to create approval-edit.txt.",
 			secret: SECRET,
 			cliPath: fake,
-			timeoutMs: 5_000,
+			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(vibe.code, 0, vibe.stderr);
 		assert.equal(
@@ -587,7 +588,7 @@ fi
 			prompt: "synthetic task",
 			secret: SECRET,
 			cliPath: fake,
-			timeoutMs: 5_000,
+			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(opencode.code, 0, opencode.stderr);
 		assert.deepEqual(

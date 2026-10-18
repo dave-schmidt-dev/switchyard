@@ -20,6 +20,7 @@ import {
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
 } from "./helpers/detached-dispatch-fixtures.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let dir;
@@ -391,7 +392,7 @@ describe("launch returns before completion", () => {
 			const quarantineRoot = join(stateRoot, ".quarantine");
 			let sweepCompleted = false;
 			const start = Date.now();
-			while (Date.now() - start < 10_000) {
+			while (Date.now() - start < HANG_GUARD_MS) {
 				try {
 					const quarantined = readdirSync(quarantineRoot);
 					if (quarantined.some((entry) => entry.startsWith(malformedRunId))) {

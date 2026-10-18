@@ -22,6 +22,7 @@ import {
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { METADATA_COMMAND_TIMEOUT_MS } from "../../src/switchyard/integrate/diff-validation.mjs";
 import { HANG_GUARD_MS } from "./hang-guard.mjs";
 import { tempDir } from "./tempdir.mjs";
 
@@ -175,7 +176,9 @@ export async function runMetadataScenario({
 	summaryMode = "ok",
 	numstatOutput = "1\t1\ttest.txt\n",
 	summaryOutput = "",
-	timeoutMs = 5000,
+	// Scenarios that expect a non-timeout outcome must never be decided by a
+	// launch stall, so they get the largest value the seam accepts.
+	timeoutMs = METADATA_COMMAND_TIMEOUT_MS - 1,
 	call = "validateDiff",
 	gateOptions = {},
 	watchdogMs = HANG_GUARD_MS,

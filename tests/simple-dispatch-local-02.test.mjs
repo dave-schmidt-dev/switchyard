@@ -19,6 +19,7 @@ import {
 	runSimpleWriter,
 } from "../src/switchyard/simple/index.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalTmpdirEnv = process.env.TMPDIR;
@@ -217,7 +218,7 @@ describe("simple local execution path", () => {
 		try {
 			const result = await runSimpleWriter("/bin/sleep", ["30"], {
 				signal: controller.signal,
-				timeoutMs: 5_000,
+				timeoutMs: HANG_GUARD_MS,
 				termGraceMs: 100,
 			});
 			strictEqual(result.cancelled, true);

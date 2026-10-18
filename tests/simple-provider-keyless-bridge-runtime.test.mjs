@@ -18,6 +18,7 @@ import {
 	runBridge,
 	verifyOpenCodeRuntime,
 } from "../ops/simple-provider-keyless-bridge.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import {
 	leftovers,
 	runFake,
@@ -60,7 +61,7 @@ test("Vibe prompt EPIPE fails closed and removes its runtime", async (t) => {
 				prompt: "x".repeat(256 * 1024),
 				secret: SECRET,
 				cliPath: fake,
-				timeoutMs: 5_000,
+				timeoutMs: HANG_GUARD_MS,
 				verifySession: false,
 			}),
 			/Vibe prompt pipe failed \(EPIPE\)/,
@@ -158,7 +159,7 @@ writeFileSync('probe.json', JSON.stringify({ exactStdin: prompt === expected, se
 			prompt,
 			secret: SECRET,
 			cliPath: fake,
-			timeoutMs: 5_000,
+			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(result.code, 0, result.stderr);
 		assert.deepEqual(
@@ -247,7 +248,7 @@ for (const [target, model, variant, expectedEffort] of [
 				prompt,
 				secret: SECRET,
 				upstream: upstream.url,
-				timeoutMs: 15_000,
+				timeoutMs: HANG_GUARD_MS,
 			});
 			assert.ok(calls > 0, "installed CLI did not reach synthetic upstream");
 			if (target === "opencode-go") {

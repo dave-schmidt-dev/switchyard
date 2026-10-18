@@ -14,6 +14,7 @@ import {
 	runDispatch,
 	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 } from "./helpers/detached-dispatch-fixtures.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let parallelsConfigurationFault = null;
@@ -144,7 +145,7 @@ describe("terminal run releases the project lock", () => {
 		const runId = await launchAndGetRunId();
 
 		const start = Date.now();
-		const maxWait = 20_000;
+		const maxWait = HANG_GUARD_MS;
 
 		let terminalReached = false;
 		while (Date.now() - start < maxWait) {

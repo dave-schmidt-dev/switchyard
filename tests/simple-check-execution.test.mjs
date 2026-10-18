@@ -11,6 +11,7 @@ import {
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { defaultRunCheck } from "../src/switchyard/simple/provider-invocation.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 function fixture({
@@ -67,7 +68,7 @@ function check(root, command, extra = {}) {
 	return defaultRunCheck({
 		command,
 		worktreePath: root,
-		timeoutMs: 10_000,
+		timeoutMs: HANG_GUARD_MS,
 		...extra,
 	});
 }

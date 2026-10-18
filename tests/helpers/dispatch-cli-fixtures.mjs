@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { HANG_GUARD_MS } from "./hang-guard.mjs";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..", "..");
 const DISPATCH_PATH = resolve(
@@ -25,7 +26,7 @@ const ROSTER_FIXTURE_PATH = resolve(
 	"roster.fixture.json",
 );
 
-function runDispatch(args, env = {}, timeout = 10_000) {
+function runDispatch(args, env = {}, timeout = HANG_GUARD_MS) {
 	return spawnSync(process.execPath, [DISPATCH_PATH, ...args], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],

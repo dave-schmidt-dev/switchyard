@@ -9,6 +9,7 @@ import {
 	taskMarkdown,
 } from "../scripts/provider-qualification.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const deadlineAt = new Date(Date.now() + 60_000).toISOString();
@@ -135,8 +136,10 @@ test("bounded CLI child rejects timeout and output overflow after process-group 
 		(error) => error.code === "deadline_expired",
 	);
 	await assert.rejects(
+		// The deadline only has to outlast a loaded host's launch stalls; the
+		// overflow, not the clock, must decide this case.
 		spawnBounded(["-e", "process.stdout.write('x'.repeat(2_100_000));"], {
-			timeoutMs: 10_000,
+			timeoutMs: HANG_GUARD_MS,
 		}),
 		(error) => error.code === "dispatch_output_invalid",
 	);

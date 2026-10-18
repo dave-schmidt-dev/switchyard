@@ -9,6 +9,7 @@ import {
 	REQUEST_END_PREFIX,
 	REQUEST_EVENT_PREFIX,
 } from "../src/switchyard/simple/request-evidence.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const event = (sequence, outcome = "upstream_http_success") => ({
@@ -160,7 +161,7 @@ test("provider process streams bridge evidence into the durable recorder", async
 		const result = await runProviderProcess(
 			process.execPath,
 			["-e", `process.stderr.write(${JSON.stringify(line + end(1))})`],
-			{ onStderrChunk: recorder.accept, timeoutMs: 5000 },
+			{ onStderrChunk: recorder.accept, timeoutMs: HANG_GUARD_MS },
 		);
 		assert.equal(result.success, true);
 		assert.deepEqual(recorder.close(), { count: 1, error: null });

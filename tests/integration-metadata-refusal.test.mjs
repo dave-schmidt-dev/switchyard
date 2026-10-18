@@ -91,7 +91,6 @@ describe("metadata refusal at both catch points", () => {
 			projectPath,
 			numstatMode: "nonzero",
 			numstatOutput: `1\t1\ttest.txt\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRefusalSanitized(scenario, sentinel);
 		strictEqual(scenario.result.safe, false);
@@ -115,7 +114,6 @@ describe("metadata refusal at both catch points", () => {
 			numstatOutput: "0\t0\tsrc/new.mjs\n",
 			summaryMode: "nonzero",
 			summaryOutput: ` rename src/old.mjs => src/new.mjs (100%)\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRefusalSanitized(scenario, sentinel);
 		strictEqual(scenario.result.safe, false);
@@ -134,7 +132,6 @@ describe("metadata refusal at both catch points", () => {
 			numstatOutput: "0\t0\tevil-link\n",
 			summaryMode: "nonzero",
 			summaryOutput: ` create mode 120000 evil-link\n${sentinel}\n`,
-			timeoutMs: 5000,
 		});
 		assertRefusalSanitized(scenario, sentinel);
 		strictEqual(scenario.result.safe, false);
@@ -176,7 +173,6 @@ describe("metadata refusal at both catch points", () => {
 			projectPath,
 			numstatMode: "nonzero",
 			numstatOutput: `1\t1\ttest.txt\n${sentinel}\n`,
-			timeoutMs: 5000,
 			call: "integrationGate",
 			gateOptions: {},
 		});
@@ -197,7 +193,6 @@ describe("metadata refusal at both catch points", () => {
 			patch,
 			projectPath,
 			numstatMode: "nonzero",
-			timeoutMs: 5000,
 			call: "integrationGate",
 			gateOptions: { requiredPaths: ["test.txt"] },
 		});
@@ -226,7 +221,6 @@ describe("metadata refusal at both catch points", () => {
 			numstatOutput: "0\t0\tsrc/new.mjs\n",
 			summaryMode: "nonzero",
 			summaryOutput: ` rename src/old.mjs => src/new.mjs (100%)\n${sentinel}\n`,
-			timeoutMs: 5000,
 			call: "integrationGate",
 			gateOptions: { requiredPaths: ["src/old.mjs", "src/new.mjs"] },
 		});
@@ -255,7 +249,6 @@ describe("metadata refusal at both catch points", () => {
 			numstatOutput: "0\t0\tevil-link\n",
 			summaryMode: "nonzero",
 			summaryOutput: ` create mode 120000 evil-link\n${sentinel}\n`,
-			timeoutMs: 5000,
 			call: "integrationGate",
 			gateOptions: { requiredPaths: ["evil-link"] },
 		});
@@ -284,7 +277,6 @@ describe("metadata refusal at both catch points", () => {
 				projectPath,
 				numstatMode: "nonzero",
 				numstatOutput: `1\t1\ttest.txt\n${sentinel}\n`,
-				timeoutMs: 5000,
 			});
 		const first = await run("SWITCHYARD-GARBAGE-ONE-1111");
 		const second = await run("SWITCHYARD-GARBAGE-TWO-2222");

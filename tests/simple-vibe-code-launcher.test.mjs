@@ -21,6 +21,7 @@ import {
 	vibeCodeEnvironment,
 	vibeCodeSeatbeltProfile,
 } from "../ops/simple-vibe-code-launcher.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 function setup() {
 	const root = join(
@@ -163,7 +164,7 @@ printf 'done'
 			prompt: "synthetic task",
 			cliPath: fake,
 			keychains: item.keychains,
-			timeoutMs: 10_000,
+			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(result.code, 0, result.stderr);
 		assert.equal(result.stdout, "done");
@@ -212,7 +213,7 @@ printf '{"config":{"active_model":"other"}}' > "$VIBE_HOME/logs/session/s/meta.j
 				prompt: "synthetic task",
 				cliPath: fake,
 				keychains: item.keychains,
-				timeoutMs: 10_000,
+				timeoutMs: HANG_GUARD_MS,
 			}),
 			/does not prove the requested model alias/,
 		);
@@ -241,7 +242,7 @@ test("runVibeCode passes a nonzero exit and stderr through for classification", 
 			prompt: "synthetic task",
 			cliPath: fake,
 			keychains: item.keychains,
-			timeoutMs: 10_000,
+			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(result.code, 1);
 		assert.match(result.stderr, /API error from mistral/u);

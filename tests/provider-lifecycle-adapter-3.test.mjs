@@ -6,6 +6,7 @@ import {
 	captureProviderDiffDetailedAsync,
 	executeProviderInvocation,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const TASK_BASE = {
 	ref: "refs/switchyard/task-base/test-run/1.1",
@@ -78,7 +79,7 @@ describe("provider process lifecycle", () => {
 			captureProviderDiffDetailed("worker", {
 				executionBackend,
 				taskBase: TASK_BASE,
-				timeoutMs: 30_000,
+				timeoutMs: HANG_GUARD_MS,
 			}),
 			{ status: "diff_failed", diff: null, reasonCode: "task_base_invalid" },
 		);
