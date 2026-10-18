@@ -33,6 +33,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - Simple routing logs every failed attempt and every non-complete stop to `<stateRoot>/failure-log/failures.jsonl` (allowlisted fields only, rotated, best-effort), and `switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]` groups them by fingerprint for periodic routing and provider tuning.
 
 ### Removed
+- `tests/simple-dispatch.test.mjs`, which held only setup hooks and no tests and was excluded from both test phases.
 - The unused `Diagnostics` event channel (`src/switchyard/diagnostics/index.mjs`) and its test. Nothing in production imported it; the run store's event sanitizers do that job, and the README no longer describes it as the safe event channel. Its contract coverage floor now applies to `diagnostics/provider-reliability.mjs`.
 - The orchestrator queue mode and its tests; runner tests now drive the async runner.
 - The `gc` and `reconcile-completion` operator subcommands, with their helpers (`apfs-private-bytes.py`, the external-completion reconciliation modules) and tests. `recover` keeps the shared root-cleanup logic. `backend-health`, `remediate-orphaned-locks` and `health attest-repair` stay: each has a live caller or contract.

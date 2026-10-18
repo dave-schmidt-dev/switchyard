@@ -46,7 +46,9 @@ describe("test phase aggregation runner", () => {
 
 		strictEqual(
 			createHash("sha256").update(historicalOther).digest("hex"),
-			"9ac067d7c6224797a684f49eb3ca539fad2e180b9b69141b378a3fa8eb17347a",
+			// 2026-10-18: the test-free tests/simple-dispatch.test.mjs and its
+			// exclusion were deleted; nothing else in the manifest changed.
+			"62194c342e07648fdd76835597911140d45e404d164bab1d4cb41e73b6639bba",
 		);
 		strictEqual(
 			createHash("sha256").update(historicalSerial).digest("hex"),
@@ -74,7 +76,6 @@ describe("test phase aggregation runner", () => {
 			...serial,
 			"tests/outcome-properties.test.mjs",
 			"tests/mutation-properties.test.mjs",
-			"tests/simple-dispatch.test.mjs",
 		]);
 		const expected = readdirSync(resolve(PKG_ROOT, "tests"))
 			.filter((name) => name.endsWith(".test.mjs"))
