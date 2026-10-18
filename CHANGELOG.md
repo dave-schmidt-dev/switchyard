@@ -33,6 +33,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - Simple routing logs every failed attempt and every non-complete stop to `<stateRoot>/failure-log/failures.jsonl` (allowlisted fields only, rotated, best-effort), and `switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]` groups them by fingerprint for periodic routing and provider tuning.
 
 ### Removed
+
+- `scripts/check-stabilization-ledger.mjs` and its test, which read the gitignored `STABILIZATION.md` and so failed in any fresh checkout or worktree. The ledger is a closed historical record.
 - `tests/simple-dispatch.test.mjs`, which held only setup hooks and no tests and was excluded from both test phases.
 - The unused `Diagnostics` event channel (`src/switchyard/diagnostics/index.mjs`) and its test. Nothing in production imported it; the run store's event sanitizers do that job, and the README no longer describes it as the safe event channel. Its contract coverage floor now applies to `diagnostics/provider-reliability.mjs`.
 - The orchestrator queue mode and its tests; runner tests now drive the async runner.
@@ -46,6 +48,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- The stabilization freeze is lifted. README and INVARIANTS now record the 2026-09 observation window as closed (39 ledger rows, last kept 2026-09-13); routing-policy, provider-enablement and quota changes still need the owner's go.
 - Live-VM tests are opt-in. They run only with `SWITCHYARD_LIVE_VM_TESTS=1` (at milestones and before VM-lane releases), so `npm test` and the pre-push gate no longer boot a Parallels VM whenever a golden image is configured. `SWITCHYARD_SKIP_LIVE_VM_TESTS` is retired.
 - Orphaned-lock remediation takes project lock names from the run store instead of keeping its own copy of the hash, so the two can no longer drift apart and leave a stuck lock unfindable.
 - Persist closed, deduplicated route-refusal reasons in caller and durable evidence, distinguishing funding exhaustion from capacity exhaustion.

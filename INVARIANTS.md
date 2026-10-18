@@ -8,11 +8,11 @@
 > usage from the `gradus` project) and runs each in a disposable sandbox with no
 > rights to the Mac host. Threat model: **accident-containment, not adversary defense.**
 
-## Stabilization policy
+## Stabilization policy (closed 2026-10-18)
 
-Task 0.1 begins a 20 reviewed integrated-change observation window. Until it closes, new routing policies, recovery automation, and compatibility branches are frozen. The only exceptions are security fixes and data-integrity-threatening defects; owner-authorized authentication renewal is separate authority, not an exception. An escaped defect is a defect introduced by an integrated qualifying change that escapes that change's required mapped automated gates. Parent-candidate reproduction is pre-existing: record it, but do not charge it to the candidate.
+Task 0.1 (`326bc7b`) opened a 20 reviewed integrated-change observation window that froze new routing policies, recovery automation, and compatibility branches, with exceptions only for security fixes and data-integrity-threatening defects. The local ledger (`STABILIZATION.md`, gitignored) recorded 39 integrated changes and was last kept on 2026-09-13. The owner lifted the freeze on 2026-10-18 after the stability audit (`.logs/2026-10-18-stability-audit.md`); the ledger is a historical record and gains no new rows.
 
-If the ledger schema, receipt semantics, or gate mapping changes, revalidate or exclude earlier rows. Exit requires zero recurrence of contract-loss, causal-overwrite, duplicate-terminal-count, missing-production-gate, or unobserved-postcondition defects; all relevant mapped gates run; no unexplained shadow mismatch; historical-defect mutations are killed; operational failures remain separately classified; and `recovery_required` items are empty or explicitly owner-disposed without consuming an execution slot. Provider success percentage is not the criterion; only the owner may unfreeze features. Worker-boot replay coverage is current, route-health enforcement remains disabled on the rollback VM path, and live Parallels activation gates remain separate. Local source/fixture work does not authorize credentialed provider calls, live VM mutation, roster change, external issue creation, push/publication, deployment, or irreversible legacy deletion.
+Changes to routing policy, provider enablement, or quota rules still need the owner's go, as does retiring a dispatch path. These rules from the window stay in force: provider success percentage is not a correctness criterion; route-health enforcement remains disabled on the rollback VM path; live Parallels activation gates remain separate, and live-VM tests run only with `SWITCHYARD_LIVE_VM_TESTS=1`. Local source/fixture work does not authorize credentialed provider calls, live VM mutation, roster change, external issue creation, push/publication, deployment, or irreversible legacy deletion.
 
 ## Contract gate declarations
 
