@@ -79,7 +79,10 @@ describe("contract coverage groups", () => {
 					),
 				)
 				.digest("hex"),
-			"3cdc7af676aa8a91afa95e67cc34d85215411a697ea211deaf641d6d1925a0e6",
+			// 2026-10-18 (SC7): dispatch/cli.mjs and dispatch/recovery-command.mjs
+			// joined the dispatch/index.mjs group when the bin was split. No floor
+			// changed and no module left.
+			"3f278c07c5be84a232ab6492a14ae6c2229d448291aed8fa5bd67fd52874a0d8",
 		);
 	});
 
@@ -105,9 +108,13 @@ describe("contract coverage groups", () => {
 			"simple-routing-release-transition",
 			"simple-routing-state",
 		].map((name) => `tests/${name}.test.mjs`);
-		// The charter adds this exact venv-proof suite; the historical suite
-		// hash below still guards every original entry and ordering.
-		const charterAdditions = ["tests/python-venv-proof.test.mjs"];
+		// The charter and the 2026-10-18 stability audit add these exact suites;
+		// the historical suite hash below still guards every original entry and
+		// ordering.
+		const charterAdditions = [
+			"tests/dispatch-simple-import-boundary.test.mjs",
+			"tests/python-venv-proof.test.mjs",
+		];
 		deepStrictEqual(
 			plan.suites.filter((path) => charterAdditions.includes(path)),
 			charterAdditions,
