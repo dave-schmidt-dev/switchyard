@@ -181,7 +181,8 @@ function runMutationSuite(root, mutation, run) {
 			cwd: root,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, SWITCHYARD_SKIP_LIVE_VM_TESTS: "1" },
+			// Mutation runs never boot a VM, even when the caller opted in.
+			env: { ...process.env, SWITCHYARD_LIVE_VM_TESTS: "0" },
 		},
 	);
 	const output = `${child.stdout ?? ""}${child.stderr ?? ""}`;

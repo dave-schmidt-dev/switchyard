@@ -15,8 +15,11 @@ import {
 	pollStatus,
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
-	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 } from "./helpers/detached-dispatch-fixtures.mjs";
+import {
+	LIVE_VM_OPT_OUT_REASON,
+	liveVmOptOutReason,
+} from "./helpers/live-vm-opt-in.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const PARALLELS_PROVIDER_USER =
@@ -87,9 +90,8 @@ function parallelsGoldenImagePrerequisiteReason() {
 	}
 	return null;
 }
-const PARALLELS_PREREQUISITE_REASON = SWITCHYARD_SKIP_LIVE_VM_TESTS
-	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
-	: parallelsGoldenImagePrerequisiteReason();
+const PARALLELS_PREREQUISITE_REASON =
+	liveVmOptOutReason() ?? parallelsGoldenImagePrerequisiteReason();
 function parallelsBackendEnv() {
 	// Only export what is actually set. Handing the worker an empty
 	// SWITCHYARD_PARALLELS_GOLDEN_IMAGE would recreate the fallback this file
@@ -310,18 +312,10 @@ async function finishDetachedRun(runId, env, bodyError, cleanupOptions = {}) {
 	if (cleanupError) throw cleanupError;
 }
 describe("--only-provider on the detached worker path", () => {
-	it("fixture-only skips detached provider routes", () => {
-		if (SWITCHYARD_SKIP_LIVE_VM_TESTS) {
-			strictEqual(
-				PARALLELS_PREREQUISITE_REASON,
-				"fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1",
-			);
-		} else {
-			ok(
-				PARALLELS_PREREQUISITE_REASON !==
-					"fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1",
-			);
-		}
+	it("skips detached provider routes unless live VM tests are opted in", () => {
+		const optOut = liveVmOptOutReason();
+		if (optOut) strictEqual(PARALLELS_PREREQUISITE_REASON, optOut);
+		else ok(PARALLELS_PREREQUISITE_REASON !== LIVE_VM_OPT_OUT_REASON);
 	});
 
 	it("restricts routing to the given provider end-to-end via `launch` (not just the foreground path) (Task C.9)", {

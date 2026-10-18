@@ -16,11 +16,11 @@ import {
 	ParallelsExecutionBackend,
 } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
 import { publishVmGateOutcome } from "../src/switchyard/run-store/index.mjs";
+import { liveVmOptOutReason } from "./helpers/live-vm-opt-in.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
-const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 const TEST_BOOT_UUID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 function fixtureBirth(pid) {
@@ -147,9 +147,8 @@ function listed(entries) {
 	].join("\n");
 }
 
-const prerequisiteReason = SKIP_LIVE_VM_TESTS
-	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
-	: await inspectPrerequisites();
+const prerequisiteReason =
+	liveVmOptOutReason() ?? (await inspectPrerequisites());
 
 if (prerequisiteReason) {
 	publishVmGateOutcome("inv3", {

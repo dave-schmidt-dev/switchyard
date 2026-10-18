@@ -37,13 +37,13 @@ import {
 	mintSentinel,
 } from "./helpers/clipboard-probe.mjs";
 import { runOnInterrupt } from "./helpers/interrupt-cleanup.mjs";
+import { liveVmOptOutReason } from "./helpers/live-vm-opt-in.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const PROVIDER_USER =
 	process.env.SWITCHYARD_PARALLELS_PROVIDER_USER || "switchyard";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
-const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 
 function commandAvailable(command) {
 	try {
@@ -191,9 +191,8 @@ async function inspectPrerequisites() {
 	return null;
 }
 
-const prerequisiteReason = SKIP_LIVE_VM_TESTS
-	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
-	: await inspectPrerequisites();
+const prerequisiteReason =
+	liveVmOptOutReason() ?? (await inspectPrerequisites());
 
 if (prerequisiteReason) {
 	publishVmGateOutcome("inv1", {

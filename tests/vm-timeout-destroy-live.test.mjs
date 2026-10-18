@@ -22,11 +22,11 @@ import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs
 import { initializeRun } from "../src/switchyard/run-store/index.mjs";
 import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
 import { redactCredentialTokens } from "../src/switchyard/simple/check-environment.mjs";
+import { liveVmOptOutReason } from "./helpers/live-vm-opt-in.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const GOLDEN_IMAGE = process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
 const AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
-const SKIP_LIVE_VM_TESTS = process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 
 // The test reporter drops cause, so include the redacted chain in a diagnostic.
 function describeCauseChain(error) {
@@ -151,9 +151,8 @@ async function inspectPrerequisites() {
 	return null;
 }
 
-const prerequisiteReason = SKIP_LIVE_VM_TESTS
-	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
-	: await inspectPrerequisites();
+const prerequisiteReason =
+	liveVmOptOutReason() ?? (await inspectPrerequisites());
 
 describe("VM timeout and clone destroy (live)", () => {
 	it("retires and destroys the real clone on provider timeout", {

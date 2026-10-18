@@ -14,11 +14,18 @@
 
 import { deepStrictEqual, match, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const { acquireVmSlotForTest, projectVmGateOutcome } = await import(
@@ -150,7 +157,8 @@ esac
 		const env = { ...process.env };
 		env.PATH = `${binDir}:${env.PATH || ""}`;
 		env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE = golden;
-		delete env.SWITCHYARD_SKIP_LIVE_VM_TESTS;
+		// The ladder runs only when live VM tests are opted in.
+		env.SWITCHYARD_LIVE_VM_TESTS = "1";
 		// Unset, not empty: an empty string is a different rung.
 		delete env.SWITCHYARD_PARALLELS_AQUA_UID;
 		// node:test marks child processes it spawns via NODE_TEST_CONTEXT, which
@@ -176,6 +184,62 @@ esac
 		ok(
 			!/# skipped 1/.test(output) || /# fail [1-9]/.test(output),
 			"the gate must report a failure, not a skip",
+		);
+	});
+
+	// Regression (stability audit O9, 2026-10-18): every pre-push booted a real
+	// VM whenever Parallels and a golden image were configured. Live VM tests
+	// now run only with SWITCHYARD_LIVE_VM_TESTS=1.
+	it("routes every live-VM gate through the opt-in", () => {
+		for (const gate of [...GATES, "tests/vm-timeout-destroy-live.test.mjs"]) {
+			const source = readFileSync(join(PKG_ROOT, gate), "utf8");
+			ok(
+				/liveVmOptOutReason\(\)\s*\?\?/.test(source),
+				`${gate} must skip before probing Parallels unless opted in`,
+			);
+			ok(
+				!source.includes("SKIP_LIVE_VM_TESTS"),
+				`${gate} still reads the retired skip flag`,
+			);
+		}
+	});
+
+	it("skips without touching prlctl when live VM tests are not opted in", (testContext) => {
+		const golden = "switchyard-vm-gate-opt-in-test";
+		const binDir = tempDir("switchyard-prlctl-");
+		const marker = join(binDir, "prlctl-called");
+		const prlctl = join(binDir, "prlctl");
+		writeFileSync(
+			prlctl,
+			`#!/bin/sh
+echo "$@" >> ${JSON.stringify(marker)}
+case "$1" in
+  --version) exit 0 ;;
+  list) printf 'test-uuid stopped ${golden}\\n' ;;
+esac
+`,
+		);
+		chmodSync(prlctl, 0o755);
+		testContext.after(() => rmSync(binDir, { force: true, recursive: true }));
+
+		const env = { ...process.env };
+		env.PATH = `${binDir}:${env.PATH || ""}`;
+		env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE = golden;
+		env.SWITCHYARD_PARALLELS_AQUA_UID = "501";
+		delete env.SWITCHYARD_LIVE_VM_TESTS;
+		delete env.NODE_TEST_CONTEXT;
+
+		const result = spawnSync(
+			process.execPath,
+			["--test", "tests/no-host-rights-vm.test.mjs"],
+			{ cwd: PKG_ROOT, env, encoding: "utf8", timeout: HANG_GUARD_MS },
+		);
+		const output = `${result.stdout || ""}${result.stderr || ""}`;
+		strictEqual(result.status, 0, output);
+		match(output, /live VM tests are opt-in: set SWITCHYARD_LIVE_VM_TESTS=1/);
+		ok(
+			!existsSync(marker),
+			`prlctl ran without the opt-in: ${existsSync(marker) ? readFileSync(marker, "utf8") : ""}`,
 		);
 	});
 });

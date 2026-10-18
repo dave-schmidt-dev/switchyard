@@ -12,9 +12,9 @@ import {
 	pollStatus,
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
-	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 } from "./helpers/detached-dispatch-fixtures.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
+import { liveVmOptOutReason } from "./helpers/live-vm-opt-in.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let parallelsConfigurationFault = null;
@@ -83,9 +83,8 @@ function parallelsGoldenImagePrerequisiteReason() {
 	}
 	return null;
 }
-const PARALLELS_PREREQUISITE_REASON = SWITCHYARD_SKIP_LIVE_VM_TESTS
-	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
-	: parallelsGoldenImagePrerequisiteReason();
+const PARALLELS_PREREQUISITE_REASON =
+	liveVmOptOutReason() ?? parallelsGoldenImagePrerequisiteReason();
 let dir;
 let tasksFile;
 let projectDir;

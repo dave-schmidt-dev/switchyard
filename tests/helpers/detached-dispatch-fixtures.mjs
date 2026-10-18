@@ -56,8 +56,6 @@ function runDispatch(args, env = {}) {
 // double check.
 const PARALLELS_GOLDEN_IMAGE =
 	process.env.SWITCHYARD_PARALLELS_GOLDEN_IMAGE || "";
-const SWITCHYARD_SKIP_LIVE_VM_TESTS =
-	process.env.SWITCHYARD_SKIP_LIVE_VM_TESTS === "1";
 const PARALLELS_AQUA_UID = process.env.SWITCHYARD_PARALLELS_AQUA_UID || "";
 
 function commandAvailable(command) {
@@ -129,5 +127,4 @@ export {
 	ROSTER_FIXTURE_PATH,
 	runBootstrap,
 	runDispatch,
-	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 };

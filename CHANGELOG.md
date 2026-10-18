@@ -46,6 +46,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Live-VM tests are opt-in. They run only with `SWITCHYARD_LIVE_VM_TESTS=1` (at milestones and before VM-lane releases), so `npm test` and the pre-push gate no longer boot a Parallels VM whenever a golden image is configured. `SWITCHYARD_SKIP_LIVE_VM_TESTS` is retired.
 - Orphaned-lock remediation takes project lock names from the run store instead of keeping its own copy of the hash, so the two can no longer drift apart and leave a stuck lock unfindable.
 - Persist closed, deduplicated route-refusal reasons in caller and durable evidence, distinguishing funding exhaustion from capacity exhaustion.
 

@@ -16,8 +16,8 @@ import {
 	pollStatus,
 	ROSTER_FIXTURE_PATH,
 	runDispatch,
-	SWITCHYARD_SKIP_LIVE_VM_TESTS,
 } from "./helpers/detached-dispatch-fixtures.mjs";
+import { liveVmOptOutReason } from "./helpers/live-vm-opt-in.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const PARALLELS_PROVIDER_USER =
@@ -88,9 +88,8 @@ function parallelsGoldenImagePrerequisiteReason() {
 	}
 	return null;
 }
-const PARALLELS_PREREQUISITE_REASON = SWITCHYARD_SKIP_LIVE_VM_TESTS
-	? "fixture-only: SWITCHYARD_SKIP_LIVE_VM_TESTS=1"
-	: parallelsGoldenImagePrerequisiteReason();
+const PARALLELS_PREREQUISITE_REASON =
+	liveVmOptOutReason() ?? parallelsGoldenImagePrerequisiteReason();
 function parallelsBackendEnv() {
 	// Only export what is actually set. Handing the worker an empty
 	// SWITCHYARD_PARALLELS_GOLDEN_IMAGE would recreate the fallback this file
