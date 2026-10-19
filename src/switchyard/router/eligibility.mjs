@@ -136,15 +136,6 @@ export function readRosterTargetOrder() {
 	}
 }
 
-export const TERMINAL_PREFLIGHT_STATUSES = new Set([
-	"done",
-	"succeeded",
-	"failed",
-	"cancelled",
-	"canceled",
-	"skipped",
-]);
-
 export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"codex",
 	"antigravity",
@@ -157,17 +148,6 @@ export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
 	"vibe",
 	"vibe-code",
 ]);
-
-function goldenImageProviderMatches(verified, snapshotName) {
-	const verifiedIdentity = resolveTargetIdentity(verified);
-	const snapshotIdentity = resolveTargetIdentity(snapshotName);
-	if (verifiedIdentity.targetId && snapshotIdentity.targetId) {
-		return verifiedIdentity.targetId === snapshotIdentity.targetId;
-	}
-	return (
-		normalizeProviderName(verified) === normalizeProviderName(snapshotName)
-	);
-}
 
 // Joint pacing gate for Cursor. Its ac (priority-fill) and ap (last-resort)
 // candidates are mutually exclusive accounting buckets, so neither may be
@@ -221,10 +201,9 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 		floor = DEFAULT_FLOOR,
 		platform = "direct",
 		usageMode = "observed",
-		goldenImageVerifiedProviders = GOLDEN_IMAGE_VERIFIED_PROVIDERS,
 		hasInvocationDescriptor = hasAutomaticInvocationDescriptor,
 	} = options;
-	if (!new Set(["direct", "macos"]).has(platform)) {
+	if (platform !== "direct") {
 		return { eligible: false, reason: "invalid_platform" };
 	}
 	if (!new Set(["observed", "unknown"]).has(usageMode)) {
@@ -275,14 +254,6 @@ export function evaluateCandidateEligibility(name, provider, options = {}) {
 				? describeDescriptorGap(name, requiredCapability)
 				: null;
 		return { eligible: false, reason: gap ?? "no_invocation_descriptor" };
-	}
-	if (
-		platform === "macos" &&
-		!goldenImageVerifiedProviders.some((verified) =>
-			goldenImageProviderMatches(verified, name),
-		)
-	) {
-		return { eligible: false, reason: "not_golden_image_verified" };
 	}
 	// Preserve observed provider failures ahead of Cursor pacing diagnostics.
 	if (provider?.ok === false) {

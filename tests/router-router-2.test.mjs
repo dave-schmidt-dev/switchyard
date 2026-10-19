@@ -8,7 +8,6 @@ import { after, before, describe, it } from "node:test";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import {
 	evaluateCandidateEligibility,
-	preflightMacosQueue,
 	route,
 	routeBlind,
 } from "../src/switchyard/router/index.mjs";
@@ -91,46 +90,9 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 				},
 			];
 			createTestSnapshot(providers);
-			const snapshotRead = {
-				snapshot: {
-					schema_version: 2,
-					updated_at: new Date().toISOString(),
-					providers,
-				},
-				snapshotStatus: "fresh",
-				snapshotMtime: 1,
-				snapshotAgeMsAtRoute: 0,
-			};
-			const sparkQualificationPolicy = {
-				requiredCapability: "low",
-				only: ["codex"],
-				platform: "macos",
-				goldenImageVerifiedProviders: ["codex-spark"],
-			};
 			return {
 				onlyCodex: route({ requiredCapability: "low", only: ["codex"] }),
 				unfiltered: route({ requiredCapability: "low" }),
-				codexWithOwnQualification: route({
-					requiredCapability: "low",
-					only: ["codex"],
-					platform: "macos",
-					goldenImageVerifiedProviders: ["codex"],
-				}),
-				codexWithSparkQualification: route({
-					...sparkQualificationPolicy,
-					snapshotRead,
-				}),
-				blindCodexWithSparkQualification: routeBlind(
-					["Codex"],
-					[],
-					"low",
-					sparkQualificationPolicy,
-				),
-				preflightCodexWithSparkQualification: preflightMacosQueue({
-					...sparkQualificationPolicy,
-					tasks: [{ status: "pending", requiredCapability: "low" }],
-					readSnapshot: () => snapshotRead,
-				}),
 			};
 		};
 		try {
@@ -143,17 +105,6 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			// capability filtered out), proving nothing about disambiguation.
 			strictEqual(withSnapshotName.unfiltered.provider, "Codex (Spark)");
 			strictEqual(withSnapshotName.onlyCodex.provider, "Codex");
-			strictEqual(withSnapshotName.codexWithOwnQualification.provider, "Codex");
-			strictEqual(withSnapshotName.codexWithSparkQualification.provider, null);
-			strictEqual(
-				withSnapshotName.blindCodexWithSparkQualification.provider,
-				null,
-			);
-			strictEqual(
-				withSnapshotName.preflightCodexWithSparkQualification
-					.capabilityResults[0].excludedReasons.Codex,
-				"not_golden_image_verified",
-			);
 			strictEqual(
 				routeOnlyCodex(buildDualCodexRoster({ incumbentSnapshotName: null }))
 					.onlyCodex.provider,

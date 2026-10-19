@@ -30,7 +30,6 @@ import {
 	releaseHalfOpenClaim,
 	startHalfOpenClaim,
 } from "../src/switchyard/router/health.mjs";
-import { preflightMacosQueue } from "../src/switchyard/router/index.mjs";
 import {
 	createRouteHealthEvent,
 	getRunRoot,
@@ -722,29 +721,5 @@ describe("fenced route-health projection", () => {
 			healthStateRoot: HEALTH_ROOT,
 		});
 		strictEqual(rebuilt[0].observationCount, 1);
-	});
-
-	it("preflights only the bounded potential-attempt task set", () => {
-		const snapshot = {
-			snapshot: {
-				schema_version: 2,
-				updated_at: new Date().toISOString(),
-				providers: [],
-			},
-			snapshotStatus: "fresh",
-			snapshotMtime: 1,
-			snapshotAgeMsAtRoute: 0,
-		};
-		const result = preflightMacosQueue({
-			tasks: [
-				{ id: "standard", status: "pending", requiredCapability: "standard" },
-				{ id: "unrelated-high", status: "pending", requiredCapability: "high" },
-			],
-			potentialAttemptTasks: [
-				{ id: "standard", status: "pending", requiredCapability: "standard" },
-			],
-			readSnapshot: () => snapshot,
-		});
-		strictEqual(result.checkedCapabilities.includes("high"), false);
 	});
 });

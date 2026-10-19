@@ -25,7 +25,6 @@ const REASONS = new Set([
 	"qualification_superseded",
 	"qualification_expired",
 	"qualification_invalid",
-	"not_golden_image_verified",
 	"provider_unavailable",
 	"no_quota_headroom",
 	"budget_pace_unavailable",

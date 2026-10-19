@@ -58,6 +58,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The test environment's `SWITCHYARD_ACCOUNT_ROOT` and `DOCKER_CONFIG` settings, and the phase runner's per-phase account directory. Nothing outside the retired VM lane read either.
 - The `SWITCHYARD_VM_ADMISSION_ROOT` setup that 14 run-store tests and their shared fixture still carried after the VM lane left.
 - `runQuickChecksAsync` and its `--quick-check-runner` child entry point in `runner/checks.mjs`. Only the retired queue lane ran quick checks in a detached child; `simple` calls `runQuickChecks` directly.
+- **Breaking (library):** `preflightMacosQueue`, the `macos` routing platform and the `goldenImageVerifiedProviders` option on `route`, `routeBlind` and `evaluateCandidateEligibility`, with the `not_golden_image_verified` reason. Only the retired VM queue routed on `macos`; `route` now accepts only `platform: "direct"` and refuses anything else as `invalid_platform`. `broker/snapshots.mjs`, which only that preflight used, is gone too.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.

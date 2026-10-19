@@ -10,7 +10,6 @@ import {
 } from "../src/switchyard/roster/index.mjs";
 import {
 	evaluateCandidateEligibility,
-	preflightMacosQueue,
 	route,
 	routeBlind,
 } from "../src/switchyard/router/index.mjs";
@@ -108,7 +107,7 @@ describe("route-health selection gate", () => {
 		);
 	});
 
-	it("subtracts a held route identically from preflight, ranked, and blind selection", () => {
+	it("subtracts a held route identically from ranked and blind selection", () => {
 		const healthDecision = () => ({
 			available: true,
 			state: "repair-hold",
@@ -126,17 +125,6 @@ describe("route-health selection gate", () => {
 		strictEqual(
 			routeBlind(["codex"], [], "standard", { healthDecision }).provider,
 			null,
-		);
-		const result = preflightMacosQueue({
-			tasks: [{ id: "4.2", status: "pending", requiredCapability: "standard" }],
-			goldenImageVerifiedProviders: ["codex"],
-			readSnapshot: snapshotRead,
-			healthDecision,
-		});
-		strictEqual(result.ok, false);
-		strictEqual(
-			result.capabilityResults[0].excludedReasons.codex,
-			"route_health_suppressed",
 		);
 	});
 
@@ -159,15 +147,12 @@ describe("route-health selection gate", () => {
 });
 
 describe("Task 2.1 shared candidate eligibility", () => {
-	it("applies one policy table across preflight, observed routing, and blind routing", () => {
+	it("applies one policy table across observed routing and blind routing", () => {
 		const cases = [
 			{
-				label: "qualified exact codex target",
+				label: "exact codex target",
 				name: "codex",
-				policy: {
-					platform: "macos",
-					goldenImageVerifiedProviders: ["codex"],
-				},
+				policy: {},
 				observed: "eligible",
 				unknown: "eligible",
 			},
@@ -175,46 +160,36 @@ describe("Task 2.1 shared candidate eligibility", () => {
 				label: "below required capability",
 				name: "OpenCode Go",
 				availableProviders: ["opencode"],
-				policy: {
-					platform: "macos",
-					requiredCapability: "high",
-					goldenImageVerifiedProviders: ["opencode-go"],
-				},
+				policy: { requiredCapability: "high" },
 				observed: "below_required_capability",
 				unknown: "below_required_capability",
 			},
 			{
 				label: "explicit exclusion",
 				name: "codex",
-				policy: { platform: "macos", exclude: ["codex"] },
+				policy: { exclude: ["codex"] },
 				observed: "explicitly_excluded",
 				unknown: "explicitly_excluded",
 			},
 			{
 				label: "only allowlist",
 				name: "codex",
-				policy: { platform: "macos", only: ["claude"] },
+				policy: { only: ["claude"] },
 				observed: "not_in_only_allowlist",
 				unknown: "not_in_only_allowlist",
 			},
 			{
-				label: "direct routing does not inherit the macOS gate",
+				label: "the retired macOS platform is refused",
 				name: "claude",
-				policy: {
-					platform: "direct",
-					goldenImageVerifiedProviders: [],
-				},
-				observed: "eligible",
-				unknown: "eligible",
+				policy: { platform: "macos" },
+				observed: "invalid_platform",
+				unknown: "invalid_platform",
 			},
 			{
 				label: "unknown usage does not invent quota exhaustion",
 				name: "codex",
 				percentLeft: 0,
-				policy: {
-					platform: "macos",
-					goldenImageVerifiedProviders: ["codex"],
-				},
+				policy: {},
 				observed: "no_quota_headroom",
 				unknown: "eligible",
 			},
@@ -270,83 +245,13 @@ describe("Task 2.1 shared candidate eligibility", () => {
 				unknown.eligible,
 				`${fixture.label}: blind`,
 			);
-			if (policy.platform === "macos") {
-				const preflight = preflightMacosQueue({
-					...policy,
-					tasks: [
-						{
-							status: "pending",
-							requiredCapability: policy.requiredCapability,
-						},
-					],
-					readSnapshot: () => snapshotRead,
-				});
-				strictEqual(
-					preflight.capabilityResults[0].eligible,
-					observed.eligible,
-					`${fixture.label}: preflight verdict`,
-				);
-				if (!observed.eligible) {
-					strictEqual(
-						preflight.capabilityResults[0].excludedReasons[fixture.name],
-						observed.reason,
-						`${fixture.label}: preflight reason`,
-					);
-				}
-			}
 		}
-	});
-
-	it("keeps macOS preflight, observed routing, and blind routing inside the same qualified set", () => {
-		const claude = {
-			name: "claude",
-			ok: true,
-			windows: [{ percent_left: 80, pace_delta: 1 }],
-		};
-		const policy = {
-			requiredCapability: "standard",
-			platform: "macos",
-			availableProviders: ["claude"],
-			goldenImageVerifiedProviders: ["codex"],
-		};
-		const snapshotRead = {
-			snapshot: {
-				schema_version: 2,
-				updated_at: new Date().toISOString(),
-				providers: [claude],
-			},
-			snapshotStatus: "fresh",
-			snapshotMtime: 1,
-			snapshotAgeMsAtRoute: 0,
-		};
-		strictEqual(
-			evaluateCandidateEligibility(claude.name, claude, policy).reason,
-			"not_golden_image_verified",
-		);
-		const preflight = preflightMacosQueue({
-			tasks: [{ status: "pending", requiredCapability: "standard" }],
-			availableProviders: ["claude"],
-			goldenImageVerifiedProviders: ["codex"],
-			readSnapshot: () => snapshotRead,
-		});
-		strictEqual(
-			preflight.capabilityResults[0].excludedReasons.claude,
-			"not_golden_image_verified",
-		);
-		const observed = route({
-			...policy,
-			snapshotRead,
-		});
-		strictEqual(observed.provider, null);
-		strictEqual(routeBlind(["claude"], [], "standard", policy).provider, null);
 	});
 
 	it("does not treat missing usage evidence as quota exhaustion in blind mode", () => {
 		const policy = {
 			requiredCapability: "standard",
-			platform: "macos",
 			availableProviders: ["codex"],
-			goldenImageVerifiedProviders: ["codex"],
 		};
 		strictEqual(
 			evaluateCandidateEligibility("codex", null, {

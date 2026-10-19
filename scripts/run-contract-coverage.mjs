@@ -56,7 +56,6 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 			"src/switchyard/router/preflight.mjs",
 			"src/switchyard/router/health.mjs",
 			"src/switchyard/router/health-inspect.mjs",
-			"src/switchyard/broker/snapshots.mjs",
 		],
 		lines: 75,
 		branches: 60,

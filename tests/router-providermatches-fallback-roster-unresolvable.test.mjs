@@ -9,7 +9,10 @@ import {
 	__resetRosterCacheForTests,
 	resolveTargetIdentity,
 } from "../src/switchyard/roster/index.mjs";
-import { preflightMacosQueue, route } from "../src/switchyard/router/index.mjs";
+import {
+	evaluateCandidateEligibility,
+	route,
+} from "../src/switchyard/router/index.mjs";
 import {
 	buildDualCodexRoster,
 	createTestSnapshot,
@@ -113,25 +116,15 @@ describe("providerMatches fallback for roster-unresolvable identifiers", () => {
 		strictEqual(resolveTargetIdentity("vibe").targetId, "vibe");
 		strictEqual(resolveTargetIdentity("Vibe").targetId, null);
 
-		const snapshot = {
-			schema_version: 2,
-			updated_at: new Date().toISOString(),
-			providers: [{ name: "vibe", ok: true, windows: [{ percent_left: 80 }] }],
+		const provider = {
+			name: "vibe",
+			ok: true,
+			windows: [{ percent_left: 80 }],
 		};
 		const reasonFor = (exclude) =>
-			preflightMacosQueue({
-				tasks: [{ id: "t", status: "pending", requiredCapability: "standard" }],
-				tarProvisionManifest: { verified: true, providers: ["vibe"] },
-				readSnapshot: () => ({
-					snapshot,
-					snapshotStatus: "fresh",
-					snapshotMtime: 1,
-					snapshotAgeMsAtRoute: 0,
-				}),
-				exclude,
-			}).capabilityResults[0].excludedReasons.vibe;
+			evaluateCandidateEligibility("vibe", provider, { exclude }).reason;
 
-		// Control: unexcluded, `vibe` drops out later in classifyPreflightProvider
+		// Control: unexcluded, `vibe` drops out later in the eligibility gate
 		// for an unrelated reason. That baseline is what makes the flip to
 		// "explicitly_excluded" evidence that the exclusion matched, rather
 		// than a reason string this provider would have carried anyway.

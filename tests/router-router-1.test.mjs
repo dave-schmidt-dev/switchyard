@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import {
-	preflightMacosQueue,
+	evaluateCandidateEligibility,
 	route,
 	routeBlind,
 } from "../src/switchyard/router/index.mjs";
@@ -125,27 +125,12 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			const policy = {
 				requiredCapability: "low",
 				availableProviders: ["opencode"],
-				platform: "macos",
-				goldenImageVerifiedProviders: ["vibe"],
 			};
-			strictEqual(route({ ...policy }).provider, null);
 			strictEqual(routeBlind(["Vibe"], [], "low", policy).provider, null);
-			const preflight = preflightMacosQueue({
-				...policy,
-				tasks: [{ status: "pending", requiredCapability: "low" }],
-				readSnapshot: () => ({
-					snapshot: {
-						schema_version: 2,
-						updated_at: new Date().toISOString(),
-						providers: [provider],
-					},
-					snapshotStatus: "fresh",
-				}),
-			});
 			// This fixture's target carries no dispatch receipt at all, which is
 			// the "never canaried" gap rather than a receipt that aged out.
 			strictEqual(
-				preflight.capabilityResults[0].excludedReasons.Vibe,
+				evaluateCandidateEligibility("Vibe", provider, policy).reason,
 				"qualification_missing",
 			);
 		} finally {
@@ -317,33 +302,17 @@ describe("router (INV-4: dispatch only to a snapshot-available funded provider)"
 			"fixture-disabled Vibe must never be selected, even at " +
 				"the lowest required capability and with the most headroom",
 		);
+		strictEqual(routeBlind(["vibe"], [], "low").provider, null);
 		strictEqual(
-			routeBlind(["vibe"], [], "low", {
-				platform: "macos",
-				goldenImageVerifiedProviders: ["vibe"],
-			}).provider,
-			null,
-		);
-		const disabledPreflight = preflightMacosQueue({
-			tasks: [{ status: "pending", requiredCapability: "low" }],
-			goldenImageVerifiedProviders: ["vibe"],
-			readSnapshot: () => ({
-				snapshot: {
-					schema_version: 2,
-					updated_at: new Date().toISOString(),
-					providers: [
-						{
-							name: "vibe",
-							ok: true,
-							windows: [{ percent_left: 90, pace_delta: 50 }],
-						},
-					],
+			evaluateCandidateEligibility(
+				"vibe",
+				{
+					name: "vibe",
+					ok: true,
+					windows: [{ percent_left: 90, pace_delta: 50 }],
 				},
-				snapshotStatus: "fresh",
-			}),
-		});
-		strictEqual(
-			disabledPreflight.capabilityResults[0].excludedReasons.vibe,
+				{ requiredCapability: "low" },
+			).reason,
 			"below_required_capability",
 		);
 	});

@@ -196,7 +196,7 @@ test("distinct closed refusals retain the 64-entry cap independently of deduplic
 		"qualification_superseded",
 		"qualification_expired",
 		"qualification_invalid",
-		"not_golden_image_verified",
+		"budget_pace_unavailable",
 		"route_health_suppressed",
 		"deadline_fit_excluded",
 		"paid_overage_not_allowed",

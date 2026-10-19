@@ -29,7 +29,6 @@ export function route(options = {}) {
 		requiredCapability,
 		availableProviders,
 		platform = "direct",
-		goldenImageVerifiedProviders,
 		nowMs = Date.now(),
 		snapshotRead: suppliedSnapshotRead,
 	} = options;
@@ -60,7 +59,7 @@ export function route(options = {}) {
 	};
 	const evidence = createRouteEvidenceCapture(snapshotDiagnostics);
 
-	if (platform !== "direct" && platform !== "macos") {
+	if (platform !== "direct") {
 		return evidence.finish({
 			provider: null,
 			model: null,
@@ -102,7 +101,6 @@ export function route(options = {}) {
 			only,
 			availableProviders,
 			platform,
-			goldenImageVerifiedProviders,
 			hasInvocationDescriptor: options.hasInvocationDescriptor,
 			healthDecision: options.healthDecision,
 			onHealthDecision: options.onHealthDecision,
@@ -200,7 +198,6 @@ export function route(options = {}) {
 			floor,
 			platform,
 			usageMode: "observed",
-			goldenImageVerifiedProviders,
 			hasInvocationDescriptor: options.hasInvocationDescriptor,
 		});
 		if (!eligibility.eligible) {
@@ -590,4 +587,4 @@ export {
 	SNAPSHOT_PATH,
 } from "./eligibility.mjs";
 
-export { preflightMacosQueue, routeBlind } from "./preflight.mjs";
+export { routeBlind } from "./preflight.mjs";

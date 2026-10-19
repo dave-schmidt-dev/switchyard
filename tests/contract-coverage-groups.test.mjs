@@ -92,8 +92,9 @@ describe("contract coverage groups", () => {
 			// selection suites the runner group used to pull in. (O4 follow-up): the
 			// outcome/reducer.mjs entry left with the deleted reducer. 2026-10-19
 			// (O1 leftovers): run-store/index.mjs lost the deleted run-locks,
-			// retention and checkpoint modules. No surviving floor changed.
-			"00abe90bc0fada6ac1c9fbe8d12f2090cd3e5a61101c8c3c62d463fa06850cc6",
+			// retention and checkpoint modules, and router/index.mjs lost the
+			// deleted broker/snapshots.mjs member. No surviving floor changed.
+			"da943f534fac834575e8748d25474a3a73812d85d0723b220bdad856557c2641",
 		);
 	});
 
@@ -160,8 +161,9 @@ describe("contract coverage groups", () => {
 			// run-store-prlctl-failure-metadata-survives was renamed
 			// run-store-durable-evidence, which moves its sorted position, and
 			// run-store-retention-1, -2 and -3 left with the deleted retention
-			// modules. Every other surviving entry and its order is unchanged.
-			"df03729ad8f7a685e4d25f575b7ad817190fce2520683fd446ef2b2861b44169",
+			// modules, and router-task-6-3-macos left with preflightMacosQueue.
+			// Every other surviving entry and its order is unchanged.
+			"671fca6e870881e71f151e85769bb68fe6e00c0a913c7705b9a933171e73c3dc",
 		);
 		let calls = 0;
 		const result = runContractCoverage({
