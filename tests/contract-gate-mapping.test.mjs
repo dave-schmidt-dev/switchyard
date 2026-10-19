@@ -256,6 +256,7 @@ describe("source-boundary contract gate mapping", () => {
 			"tests/runner-python-quick-checks-host.test.mjs",
 			"tests/runner-python-quick-checks-unit.test.mjs",
 			"tests/runner-quick-checks-cleanup.test.mjs",
+			"tests/runner-quick-checks-sandbox-procargs.test.mjs",
 			"tests/runner-quick-checks-sandbox-process.test.mjs",
 			"tests/runner-quick-checks-sandbox.test.mjs",
 			"tests/runner-quick-checks-toolchain-sandbox.test.mjs",
