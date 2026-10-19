@@ -50,6 +50,7 @@ import {
 	openRoutingTaskRun,
 	releaseTaskRunResources,
 } from "./routing-task-state.mjs";
+import { deadlineFitDetails, evaluateDeadlineFit } from "./task-sizing.mjs";
 
 export const MAX_SOFT_ATTEMPTS_PER_TASK = 4;
 
@@ -77,6 +78,29 @@ function rerouteBudgetExhausted(options, initialBudgetMs, now) {
 		Math.ceil(0.1 * initialBudgetMs),
 	);
 	return remainingMs < rerouteFloorMs;
+}
+
+const DEADLINE_FIT_REFUSAL = "task_estimate_exceeds_budget";
+
+/**
+ * Typed `retrySkipped` evidence when the caller's estimate cannot fit the time
+ * left, or null. Uses the same fit as route selection, so the loop stops with
+ * the failed attempt's outcome instead of making a call the engine will refuse.
+ */
+function unfittableRetry(options, initialBudgetMs, nowMs) {
+	const fit = evaluateDeadlineFit({
+		estimateMinutes: options.estimateMinutes ?? null,
+		p80Ms: null,
+		deadlineMs: options.deadlineMs,
+		nowMs,
+		checkCount: (options.checks ?? []).length,
+	});
+	if (fit.fits !== false) return null;
+	return {
+		reason: DEADLINE_FIT_REFUSAL,
+		deadlineFit: deadlineFitDetails(fit),
+		deadlineConsumedMs: initialBudgetMs - (options.deadlineMs - nowMs),
+	};
 }
 
 const FUNDING_UNAVAILABLE = new Set([
@@ -477,7 +501,13 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					);
 				return answer(
 					"stop",
-					{ stopReason: "preflight_failed", result },
+					{
+						stopReason:
+							result?.failureReason === DEADLINE_FIT_REFUSAL
+								? DEADLINE_FIT_REFUSAL
+								: "preflight_failed",
+						result,
+					},
 					{ attempt },
 				);
 			}
@@ -640,9 +670,11 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 
 			if (classification.severity === "hard") {
 				return answer("stop", {
-					stopReason: postProviderDependencyRefusal
-						? refusalCode
-						: "unsafe_failure",
+					stopReason:
+						postProviderDependencyRefusal ||
+						refusalCode === DEADLINE_FIT_REFUSAL
+							? refusalCode
+							: "unsafe_failure",
 					result,
 					classification,
 				});
@@ -725,6 +757,16 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					stopReason: classification.reason,
 					result,
 					classification,
+				});
+			// An estimate that cannot fit the time left would be refused before any
+			// attempt is allocated, so the doomed call must not become the terminal.
+			const retrySkipped = unfittableRetry(options, initialBudgetMs, now());
+			if (retrySkipped)
+				return answer("stop", {
+					stopReason: classification.reason,
+					result,
+					classification,
+					retrySkipped,
 				});
 			// Continue to the next eligible target (retained clone is independent).
 		}

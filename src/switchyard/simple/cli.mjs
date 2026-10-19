@@ -132,6 +132,10 @@ export async function handleSimple(argv, dependencies = {}) {
 				...(routing.exhaustionCause
 					? { exhaustionCause: routing.exhaustionCause }
 					: {}),
+				...(routing.retrySkipped ? { retrySkipped: routing.retrySkipped } : {}),
+				...(routing.retainedPartials?.length > 0
+					? { retainedPartials: routing.retainedPartials }
+					: {}),
 			};
 		} catch (error) {
 			const isUsage = error instanceof SimpleUsageError;
