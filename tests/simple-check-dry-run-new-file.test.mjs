@@ -180,6 +180,7 @@ test("commands that do not plainly run a declared relative script keep the stop"
 		"PATH=tests/nonexistent-bin bash tests/existing.sh",
 		`PATH=tests/nonexistent-bin ./${NEW_SCRIPT}`,
 		`FOO=tests/new-test.sh bash ${NEW_SCRIPT}`,
+		"FOO+=tests/new-test.sh missing-tool",
 	]) {
 		const result = await dryRun([command], {
 			declaredPaths: [
@@ -188,6 +189,7 @@ test("commands that do not plainly run a declared relative script keep the stop"
 				"tests/../tests/new-test.sh",
 				"PATH=tests/nonexistent-bin",
 				"FOO=tests/new-test.sh",
+				"FOO+=tests/new-test.sh",
 			],
 			pathExistsAtBase: absentAtBase,
 		}).done;

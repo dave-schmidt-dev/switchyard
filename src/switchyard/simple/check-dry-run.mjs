@@ -27,8 +27,6 @@ const PROJECT_PYTHON = /^(?:\.\/)?\.venv\/bin\/python3?$/u;
 // A plain command: words of path-safe characters only, so no quoting, expansion,
 // redirection, or command separator can hide what actually ran.
 const PLAIN_COMMAND = /^[A-Za-z0-9._/@:+=,%\- ]+$/u;
-// A leading `NAME=value` word sets the environment; the command comes after it.
-const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 
 /** Repo-relative form of `path` (leading `./` dropped), or null if it is not one. */
 function relativeForm(path) {
@@ -51,7 +49,9 @@ function relativeForm(path) {
 function scriptRunBy(command) {
 	if (!PLAIN_COMMAND.test(command)) return null;
 	const [head, next] = command.trim().split(/ +/u);
-	if (SHELL_ASSIGNMENT.test(head)) return null;
+	// A first word with `=` may be an environment assignment (`NAME=v`,
+	// `NAME+=v`), so the command that runs comes after it.
+	if (head.includes("=")) return null;
 	if (SCRIPT_INTERPRETERS.has(head) || PROJECT_PYTHON.test(head))
 		return next === undefined ? null : relativeForm(next);
 	return head.includes("/") ? relativeForm(head) : null;
