@@ -5,8 +5,6 @@ import { tempDir } from "./tempdir.mjs";
 
 export const TEST_ROOT = tempDir("switchyard-run-store-");
 
-export const VM_ADMISSION_ROOT = join(TEST_ROOT, "vm-admission");
-
 export function uniqueRunId() {
 	return randomUUID();
 }

@@ -35,11 +35,9 @@ import {
 	TEST_ROOT,
 	uniquePath,
 	uniqueRunId,
-	VM_ADMISSION_ROOT,
 } from "./helpers/run-store-fixtures.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
-process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
 process.env.SWITCHYARD_ROSTER_PATH = resolve(
 	"tests/fixtures/roster.fixture.json",
 );
@@ -53,7 +51,6 @@ after(() => {
 afterEach(() => {
 	try {
 		rmSync(join(TEST_ROOT, "store"), { recursive: true, force: true });
-		rmSync(VM_ADMISSION_ROOT, { recursive: true, force: true });
 	} catch {
 		// no-op
 	}

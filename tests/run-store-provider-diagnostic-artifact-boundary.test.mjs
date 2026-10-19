@@ -22,10 +22,9 @@ import {
 	updateRun,
 	updateRunWithRetry,
 } from "../src/switchyard/run-store/index.mjs";
-import { TEST_ROOT, VM_ADMISSION_ROOT } from "./helpers/run-store-fixtures.mjs";
+import { TEST_ROOT } from "./helpers/run-store-fixtures.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
-process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
 
 const DIGESTS = {
 	stdoutDigest: `sha256:${"a".repeat(64)}`,
@@ -332,7 +331,6 @@ after(() => {
 afterEach(() => {
 	try {
 		rmSync(join(TEST_ROOT, "store"), { recursive: true, force: true });
-		rmSync(VM_ADMISSION_ROOT, { recursive: true, force: true });
 	} catch {
 		// no-op
 	}
