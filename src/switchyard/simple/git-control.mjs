@@ -47,12 +47,20 @@ function gitControlTampered(tamperKind, path, message) {
  * Host git against a provider-writable clone. The git-dir and work-tree are
  * pinned, system and global config are dropped, hooks, fsmonitor, the
  * untracked cache, attribute files and external diff drivers are disabled,
- * and replace refs are ignored.
+ * and replace refs are ignored. Diffs never detect renames or copies: a
+ * pure rename patch states no mode, so a renamed executable would keep its
+ * bit unseen, while a delete plus create states both modes explicitly.
  */
 export function worktreeGit(worktreePath, args, options = {}) {
 	const hardenedArgs =
 		args[0] === "diff"
-			? ["diff", "--no-ext-diff", "--no-textconv", ...args.slice(1)]
+			? [
+					"diff",
+					"--no-ext-diff",
+					"--no-textconv",
+					"--no-renames",
+					...args.slice(1),
+				]
 			: args;
 	return spawnSync(
 		"git",

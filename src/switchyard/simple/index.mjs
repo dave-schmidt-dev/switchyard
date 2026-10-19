@@ -2347,10 +2347,19 @@ export async function runSimpleTask(options, dependencies = {}) {
 			}
 			// Peer history may only be unrelated. A manifest, lockfile or other
 			// execution input changing under the run can change what the
-			// acceptance checks mean, so any peer change there refuses.
+			// acceptance checks mean, so any peer change there refuses. Renames
+			// and copies are never detected, whatever the host config says, so
+			// a renamed or copied executable shows as `create mode 100755`.
 			const peerDiff = requireGit(
 				options.projectPath,
-				["diff", "--binary", "--full-index", baseRevision, currentHead],
+				[
+					"diff",
+					"--no-renames",
+					"--binary",
+					"--full-index",
+					baseRevision,
+					currentHead,
+				],
 				"project_revision_unavailable",
 				{
 					maxBuffer: MAX_CAPTURE_BYTES,

@@ -322,10 +322,20 @@ export function extractSummaryLines(diff, projectPath) {
 
 // The only two `git apply --summary` forms an executable opt-in can grant:
 // creating the exact path as 100755, or changing it from 100644 to 100755.
-// A rename or copy that also changes mode prints its `mode change` line with
-// no path, so it never matches and stays refused.
+// A rename or copy is refused before this is consulted, so the pathless
+// `mode change` line that can follow one is never granted.
 const EXECUTABLE_GRANT_PATTERN =
 	/^ (?:create mode 100755|mode change 100644 => 100755) (.+)$/;
+
+// Every extended-header line `git apply` reads as a rename or copy, including
+// the legacy `rename old`/`rename new` spelling. Headers C-quote a name that
+// holds a newline, so unlike `--summary` output a filename cannot forge one.
+// Hunk lines start with a space, `+`, `-` or `\`, so only headers (or text
+// git ignores) can match, and a match always refuses. It is tested per `\n`
+// line, as git reads them, because `/m` would also break hunk content at a
+// CR, U+2028 or U+2029.
+const RENAME_OR_COPY_HEADER_PATTERN =
+	/^(?:rename (?:from|to|old|new)|copy (?:from|to)) /;
 
 /**
  * Whether one executable summary line is granted by the caller's opt-in. The
@@ -357,6 +367,9 @@ function executableGranted(line, summaryLines, touchedPaths, allowExecutables) {
  * @param {{allowExecutables?: string[]}} [options] `allowExecutables` lists
  *   declared repo-relative paths that may be created as, or changed to, a
  *   regular executable file (100755). Every other executable bit is refused.
+ *   Every rename or copy is refused too: a pure rename patch states no mode,
+ *   so the destination silently keeps an executable source's bit. Switchyard's
+ *   own captures use `--no-renames`, which spells it as a delete plus create.
  */
 export function validateDiff(diff, projectPath, options = {}) {
 	const allowExecutables = options.allowExecutables ?? [];
@@ -403,6 +416,16 @@ export function validateDiff(diff, projectPath, options = {}) {
 	);
 	if (summaryFailure !== null) {
 		return { safe: false, ...metadataFailureRefusal(summaryFailure) };
+	}
+	const renameOrCopy = diff
+		.split("\n")
+		.find((line) => RENAME_OR_COPY_HEADER_PATTERN.test(line));
+	if (renameOrCopy !== undefined) {
+		return {
+			safe: false,
+			reason: `diff renames or copies a file, so an executable bit could carry over unseen: ${renameOrCopy.trim()}`,
+			reasonKind: "executable_file_refused",
+		};
 	}
 	for (const line of summaryLines) {
 		if (/create mode 120000|rename.*120000/.test(line)) {

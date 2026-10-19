@@ -337,13 +337,34 @@ describe("exact allowlist enforcement", () => {
 		deepStrictEqual(result.extraPaths, ["src/renamed.txt"]);
 	});
 
-	it("succeeds when both rename endpoints are declared in allowedPaths", () => {
+	it("refuses a rename spelling even when both endpoints are declared", () => {
 		const diff = buildStagedDiff(projectDir, (dir) => {
 			execSync("git mv src/b.txt src/renamed.txt", {
 				cwd: dir,
 				stdio: "pipe",
 			});
 		});
+		execSync("git reset --hard HEAD -q", { cwd: projectDir, stdio: "pipe" });
+		ok(diff.includes("rename to src/renamed.txt"));
+
+		const result = integrationGate(diff, projectDir, {
+			allowedPaths: ["src/a.txt", "src/b.txt", "src/renamed.txt"],
+		});
+		strictEqual(result.success, false);
+		strictEqual(result.reasonKind, "executable_file_refused");
+	});
+
+	it("succeeds for a rename-free move when both endpoints are declared", () => {
+		const diff = buildStagedDiff(
+			projectDir,
+			(dir) => {
+				execSync("git mv src/b.txt src/renamed.txt", {
+					cwd: dir,
+					stdio: "pipe",
+				});
+			},
+			{ renames: false },
+		);
 		execSync("git reset --hard HEAD -q", { cwd: projectDir, stdio: "pipe" });
 
 		const result = integrationGate(diff, projectDir, {

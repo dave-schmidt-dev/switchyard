@@ -247,9 +247,13 @@ index 0000000..abcdef1
 
 	it("does not infer a rename application from a matching after-state", () => {
 		commitFile(projectPath, "src/old.mjs", "original\n");
-		const diff = buildStagedDiff(projectPath, (dir) => {
-			execSync("git mv src/old.mjs src/new.mjs", { cwd: dir });
-		});
+		const diff = buildStagedDiff(
+			projectPath,
+			(dir) => {
+				execSync("git mv src/old.mjs src/new.mjs", { cwd: dir });
+			},
+			{ renames: false },
+		);
 		execSync("git reset -q HEAD -- src/", {
 			cwd: projectPath,
 			stdio: "pipe",

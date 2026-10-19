@@ -27,10 +27,13 @@ function buildDiff(dir, mutate) {
 	return execSync("git diff --no-color", { cwd: dir, encoding: "utf8" });
 }
 
-function buildStagedDiff(dir, mutate) {
+// `renames: false` spells a rename as a delete plus create, the way
+// Switchyard's own captures do.
+function buildStagedDiff(dir, mutate, { renames = true } = {}) {
 	mutate(dir);
 	execSync("git add -A", { cwd: dir, stdio: "pipe" });
-	return execSync("git diff --cached --no-color", {
+	const renameFlag = renames ? "" : " --no-renames";
+	return execSync(`git diff --cached --no-color${renameFlag}`, {
 		cwd: dir,
 		encoding: "utf8",
 	});

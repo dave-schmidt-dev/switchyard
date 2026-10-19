@@ -117,7 +117,7 @@ describe("Files allowlist enforcement", () => {
 		strictEqual(result.message, "empty_required_diff");
 	});
 
-	it("rename: Files declaring the destination passes (both rename paths counted for declaration)", () => {
+	it("rename: a rename spelling is refused even when Files declares the destination", () => {
 		commitFile(projectPath, "src/old.mjs", "original\n");
 		const diff = buildStagedDiff(projectPath, (dir) => {
 			execSync("git mv src/old.mjs src/new.mjs", { cwd: dir });
@@ -137,7 +137,8 @@ describe("Files allowlist enforcement", () => {
 		const result = integrationGate(diff, projectPath, {
 			requiredPaths: ["src/new.mjs"],
 		});
-		strictEqual(result.success, true);
+		strictEqual(result.success, false);
+		strictEqual(result.reasonKind, "executable_file_refused");
 	});
 
 	it("rename: Files declaring the destination fails when only the source is declared", () => {
