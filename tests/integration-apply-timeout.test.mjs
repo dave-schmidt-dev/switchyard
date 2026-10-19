@@ -5,12 +5,10 @@
 // trusted test seam setApplyCommandTimeoutForTests enables testing timeout
 // handling within shortened bounds.
 // - Timed-out check returns not-ok with existing non-mutating reasonKind (conflict).
-// - Timed-out mutating apply returns applied: false with reasonKind: "integration_state_unknown"
-//   and does not complete the intent.
+// - Timed-out mutating apply returns applied: false with reasonKind: "integration_state_unknown".
 
 import { ok, strictEqual, throws } from "node:assert";
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
 	accessSync,
 	constants,
@@ -26,7 +24,6 @@ import {
 	applyReviewedDiff,
 	setApplyCommandTimeoutForTests,
 } from "../src/switchyard/integrate/apply.mjs";
-import { normalizePatch } from "../src/switchyard/integrate/diff-validation.mjs";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import {
@@ -191,7 +188,7 @@ exec "$real_git" "$@"
 		setApplyCommandTimeoutForTests(200);
 
 		const startTime = Date.now();
-		const result = applyReviewedDiff(diff, projectPath, null, ["test.txt"]);
+		const result = applyReviewedDiff(diff, projectPath);
 		const elapsed = Date.now() - startTime;
 
 		ok(
@@ -207,39 +204,15 @@ exec "$real_git" "$@"
 		);
 	});
 
-	it("mutating apply returns integration_state_unknown and preserves pre-apply intent status via integrationGate", () => {
+	it("mutating apply returns integration_state_unknown via integrationGate", () => {
 		const diff = createModifiedDiff();
-		const normalized = normalizePatch(diff);
 		process.env.PATH = `${binDir}:${originalPath}`;
 		process.env.SWITCHYARD_TEST_SLEEP_APPLY_MUTATING = "1";
 		setApplyCommandTimeoutForTests(200);
 
-		let stored = null;
-		let completeCalled = false;
-		const operation = {
-			patchHash: createHash("sha256").update(normalized, "utf8").digest("hex"),
-			paths: ["test.txt"],
-		};
-		const intent = {
-			operation,
-			acquire: () => ({ token: "lease-mutating" }),
-			release: () => {},
-			persist: (proof) => {
-				stored = structuredClone(proof);
-				return proof;
-			},
-			complete: (proof) => {
-				completeCalled = true;
-				stored = structuredClone(proof);
-				return proof;
-			},
-			read: () => (stored ? structuredClone(stored) : null),
-		};
-
 		const startTime = Date.now();
 		const result = integrationGate(diff, projectPath, {
 			requiredPaths: ["test.txt"],
-			integrationIntent: intent,
 		});
 		const elapsed = Date.now() - startTime;
 
@@ -250,75 +223,21 @@ exec "$real_git" "$@"
 		strictEqual(result.success, false);
 		strictEqual(result.reasonKind, "integration_state_unknown");
 		strictEqual(result.reason, "git apply timed out");
-		strictEqual(
-			completeCalled,
-			false,
-			"intent.complete must not be called when mutating apply times out",
-		);
-		strictEqual(
-			stored?.status,
-			"pending",
-			"intent status must equal its pre-apply value (pending)",
-		);
-		strictEqual(intent.read()?.status, "pending");
 	});
 
-	it("mutating apply returns integration_state_unknown on direct applyReviewedDiff without intent", () => {
+	it("mutating apply returns integration_state_unknown on direct applyReviewedDiff", () => {
 		const diff = createModifiedDiff();
 		process.env.PATH = `${binDir}:${originalPath}`;
 		process.env.SWITCHYARD_TEST_SLEEP_APPLY_MUTATING = "1";
 		setApplyCommandTimeoutForTests(200);
 
 		const startTime = Date.now();
-		const result = applyReviewedDiff(diff, projectPath, null, ["test.txt"]);
+		const result = applyReviewedDiff(diff, projectPath);
 		const elapsed = Date.now() - startTime;
 
 		ok(elapsed < HANG_GUARD_MS);
 		strictEqual(result.applied, false);
 		strictEqual(result.reasonKind, "integration_state_unknown");
 		strictEqual(result.reason, "git apply timed out");
-	});
-
-	it("mutating apply preserves intent status on direct applyReviewedDiff with intent", () => {
-		const diff = createModifiedDiff();
-		const normalized = normalizePatch(diff);
-		process.env.PATH = `${binDir}:${originalPath}`;
-		process.env.SWITCHYARD_TEST_SLEEP_APPLY_MUTATING = "1";
-		setApplyCommandTimeoutForTests(200);
-
-		let stored = null;
-		let completeCalled = false;
-		const operation = {
-			patchHash: createHash("sha256").update(normalized, "utf8").digest("hex"),
-			paths: ["test.txt"],
-		};
-		const intent = {
-			operation,
-			acquire: () => ({ token: "lease-direct" }),
-			release: () => {},
-			persist: (proof) => {
-				stored = structuredClone(proof);
-				return proof;
-			},
-			complete: (proof) => {
-				completeCalled = true;
-				stored = structuredClone(proof);
-				return proof;
-			},
-			read: () => (stored ? structuredClone(stored) : null),
-		};
-
-		const startTime = Date.now();
-		const result = applyReviewedDiff(normalized, projectPath, intent, [
-			"test.txt",
-		]);
-		const elapsed = Date.now() - startTime;
-
-		ok(elapsed < HANG_GUARD_MS);
-		strictEqual(result.applied, false);
-		strictEqual(result.reasonKind, "integration_state_unknown");
-		strictEqual(result.reason, "git apply timed out");
-		strictEqual(completeCalled, false);
-		strictEqual(stored?.status, "pending");
 	});
 });

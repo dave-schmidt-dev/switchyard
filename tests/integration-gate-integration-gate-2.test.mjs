@@ -5,7 +5,6 @@
 
 import { ok, strictEqual } from "node:assert";
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -152,11 +151,10 @@ index 0000000..abcdef1
 	});
 
 	it("does not infer prior application from a matching after-state", () => {
-		// Idempotent dispatch: a task whose diff was already applied must not
-		// be reported as a failure (or re-mutate the host). The forward
-		// `git apply --check` fails because the before-state no longer
-		// matches; the reverse check succeeds because the change is already
-		// present, so the gate returns a successful alreadyApplied no-op.
+		// A matching after-state cannot prove this operation applied: unrelated
+		// edits can produce the same bytes. The forward `git apply --check`
+		// fails because the before-state no longer matches, so a re-run fails
+		// closed and never re-mutates the host.
 		const diff = buildDiff(projectPath, (dir) => {
 			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
 		});
@@ -179,92 +177,6 @@ index 0000000..abcdef1
 		);
 	});
 
-	it("accepts an idempotent retry only with exact durable intent proof", () => {
-		const diff = buildDiff(projectPath, (dir) => {
-			writeFileSync(join(dir, "test.txt"), "proved content\n", "utf8");
-		});
-		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
-		let stored = null;
-		const operation = {
-			runId: "run-1",
-			taskId: "1.1",
-			attempt: 1,
-			baseTree: execSync("git rev-parse HEAD^{tree}", {
-				cwd: projectPath,
-				encoding: "utf8",
-			}).trim(),
-			patchHash: createHash("sha256").update(diff, "utf8").digest("hex"),
-			paths: [],
-		};
-		const intent = {
-			operation,
-			acquire: () => ({ token: "exclusive" }),
-			release: () => {},
-			persist: (candidate) => {
-				stored = structuredClone(candidate);
-				return structuredClone(stored);
-			},
-			complete: (candidate) => {
-				stored = structuredClone(candidate);
-				return structuredClone(stored);
-			},
-			read: () => (stored ? structuredClone(stored) : null),
-		};
-
-		strictEqual(
-			integrationGate(diff, projectPath, { integrationIntent: intent }).success,
-			true,
-		);
-		const retry = integrationGate(diff, projectPath, {
-			integrationIntent: intent,
-		});
-		strictEqual(retry.success, true, retry.message);
-		strictEqual(retry.alreadyApplied, true);
-	});
-
-	it("retains pending proof after an after-apply publication crash and never reapplies", () => {
-		const diff = buildDiff(projectPath, (dir) => {
-			writeFileSync(join(dir, "test.txt"), "crash-boundary content\n", "utf8");
-		});
-		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
-		let stored = null;
-		const operation = {
-			runId: "run-crash",
-			taskId: "1.1",
-			attempt: 1,
-			baseTree: execSync("git rev-parse HEAD^{tree}", {
-				cwd: projectPath,
-				encoding: "utf8",
-			}).trim(),
-			patchHash: createHash("sha256").update(diff, "utf8").digest("hex"),
-			paths: [],
-		};
-		const intent = {
-			operation,
-			acquire: () => ({ token: "exclusive" }),
-			release: () => {},
-			persist: (proof) => (stored = structuredClone(proof)),
-			complete: () => null,
-			read: () => (stored ? structuredClone(stored) : null),
-		};
-		const first = integrationGate(diff, projectPath, {
-			integrationIntent: intent,
-		});
-		strictEqual(first.success, false);
-		strictEqual(first.reasonKind, "integration_state_unknown");
-		strictEqual(stored.status, "pending");
-		strictEqual(
-			readFileSync(join(projectPath, "test.txt"), "utf8"),
-			"crash-boundary content\n",
-		);
-		const retry = integrationGate(diff, projectPath, {
-			integrationIntent: intent,
-		});
-		strictEqual(retry.success, false);
-		strictEqual(retry.reasonKind, "integration_state_unknown");
-		strictEqual(stored.status, "pending");
-	});
-
 	it("applies sequential task baselines while host HEAD remains unchanged", () => {
 		const headBefore = execSync("git rev-parse HEAD", {
 			cwd: projectPath,
@@ -274,31 +186,7 @@ index 0000000..abcdef1
 			writeFileSync(join(dir, "test.txt"), "first accepted task\n", "utf8");
 		});
 		execSync("git checkout -- test.txt", { cwd: projectPath, stdio: "pipe" });
-		const makeIntent = (index, diff) => {
-			let proof = null;
-			const operation = {
-				runId: "sequential-run",
-				taskId: `1.${index}`,
-				attempt: 1,
-				baseTree: String(index).repeat(40),
-				patchHash: createHash("sha256").update(diff, "utf8").digest("hex"),
-				paths: [],
-			};
-			return {
-				operation,
-				acquire: () => ({ token: index }),
-				release: () => {},
-				persist: (value) => (proof = structuredClone(value)),
-				complete: (value) => (proof = structuredClone(value)),
-				read: () => (proof ? structuredClone(proof) : null),
-			};
-		};
-		strictEqual(
-			integrationGate(firstDiff, projectPath, {
-				integrationIntent: makeIntent(1, firstDiff),
-			}).success,
-			true,
-		);
+		strictEqual(integrationGate(firstDiff, projectPath).success, true);
 		execSync("git add test.txt", { cwd: projectPath, stdio: "pipe" });
 		writeFileSync(
 			join(projectPath, "test.txt"),
@@ -315,12 +203,7 @@ index 0000000..abcdef1
 			"first accepted task\n",
 			"utf8",
 		);
-		strictEqual(
-			integrationGate(secondDiff, projectPath, {
-				integrationIntent: makeIntent(2, secondDiff),
-			}).success,
-			true,
-		);
+		strictEqual(integrationGate(secondDiff, projectPath).success, true);
 		strictEqual(
 			readFileSync(join(projectPath, "test.txt"), "utf8"),
 			"second accepted task\n",
