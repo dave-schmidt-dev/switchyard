@@ -265,7 +265,8 @@ const METADATA_UNAVAILABLE_REASON = "diff metadata could not be confirmed";
  * Sanitized refusal fields for a checked-command failure. `corrupt_patch` and
  * `conflict` survive only where git's own invalid-patch diagnostics established
  * them; every other failure is incomplete metadata and reports the existing
- * `integration_state_unknown` kind.
+ * `integration_state_unknown` kind, plus the closed metadata step (`numstat`
+ * or `summary`) and failure category that left the state unknown.
  */
 export function metadataFailureRefusal(failure) {
 	if (
@@ -280,6 +281,8 @@ export function metadataFailureRefusal(failure) {
 	return {
 		reason: METADATA_UNAVAILABLE_REASON,
 		reasonKind: "integration_state_unknown",
+		metadataStep: failure.phase,
+		metadataCause: failure.category,
 	};
 }
 

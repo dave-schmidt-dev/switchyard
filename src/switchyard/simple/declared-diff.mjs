@@ -1,5 +1,9 @@
 import { lstatSync } from "node:fs";
 import { join } from "node:path";
+import {
+	INTEGRATION_UNKNOWN_CAUSES,
+	INTEGRATION_UNKNOWN_STEPS,
+} from "../diagnostics/failure-registry.mjs";
 import { requireWorktreeGit, verifyGitControl } from "./args.mjs";
 
 function declaredFileStat(worktreePath, path) {
@@ -52,10 +56,30 @@ function boundedRejectionPaths(paths) {
 	return bounded;
 }
 
-function validateDiffRejectionRule(validated) {
-	return DIFF_REJECTION_REASON_RULES.has(validated?.reasonKind)
+/**
+ * Rejection record for a refused `validateDiff` result: the manifest review
+ * paths, or the closed rule with no paths. An `integration_state_unknown`
+ * refusal also names the closed `git apply` metadata step that was unknown
+ * and how it failed, since it has no path to point at.
+ */
+function diffRejectionFor(validated) {
+	if (validated?.requiresReview) {
+		return {
+			rule: "manifest_review_required",
+			paths: validated.sensitivePaths,
+		};
+	}
+	const rule = DIFF_REJECTION_REASON_RULES.has(validated?.reasonKind)
 		? validated.reasonKind
 		: "unsafe_diff";
+	const rejection = { rule, paths: [] };
+	if (rule === "integration_state_unknown") {
+		if (INTEGRATION_UNKNOWN_STEPS.includes(validated.metadataStep))
+			rejection.unknownStep = validated.metadataStep;
+		if (INTEGRATION_UNKNOWN_CAUSES.includes(validated.metadataCause))
+			rejection.unknownCause = validated.metadataCause;
+	}
+	return rejection;
 }
 
 export function captureDeadlineChangedFiles({
@@ -95,5 +119,5 @@ export {
 	boundedRejectionPaths,
 	declaredFileStat,
 	declaredFilesChanged,
-	validateDiffRejectionRule,
+	diffRejectionFor,
 };

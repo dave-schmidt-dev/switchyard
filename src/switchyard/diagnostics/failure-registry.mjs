@@ -110,6 +110,19 @@ export const CHECK_SETUP_STEPS = Object.freeze([
 	"validate_commands",
 ]);
 
+/**
+ * Closed `git apply` metadata steps, and the closed ways each can fail, that
+ * leave a diff refused as `integration_state_unknown` with no path to name.
+ */
+export const INTEGRATION_UNKNOWN_STEPS = Object.freeze(["numstat", "summary"]);
+export const INTEGRATION_UNKNOWN_CAUSES = Object.freeze([
+	"spawn_error",
+	"timeout",
+	"output_overflow",
+	"signal",
+	"exit_nonzero",
+]);
+
 const BASE_DETAIL_FIELDS = Object.freeze(["failureReason"]);
 const CHECK_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
@@ -179,6 +192,8 @@ const DIFF_DETAIL_FIELDS = Object.freeze([
 	"diffRejectionCount",
 	"diffRejectionRule",
 	"diffRejectionPaths",
+	"diffRejectionUnknownStep",
+	"diffRejectionUnknownCause",
 ]);
 
 const REGISTRY_PHASES = Object.freeze([

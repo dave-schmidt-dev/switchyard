@@ -105,6 +105,8 @@ describe("metadata command process bounds", () => {
 		strictEqual(scenario.result.safe, false);
 		strictEqual(scenario.result.reasonKind, "integration_state_unknown");
 		strictEqual(scenario.result.reason, "diff metadata could not be confirmed");
+		strictEqual(scenario.result.metadataStep, "numstat");
+		strictEqual(scenario.result.metadataCause, "timeout");
 		ok(
 			scenario.readyPids.numstat,
 			"the stalled child must confirm its SIGTERM handler before the timeout",
@@ -137,6 +139,8 @@ describe("metadata command process bounds", () => {
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
 		strictEqual(scenario.result.reasonKind, "integration_state_unknown");
+		strictEqual(scenario.result.metadataStep, "summary");
+		strictEqual(scenario.result.metadataCause, "timeout");
 		ok(
 			scenario.readyPids.numstat && !scenario.readyPids.numstat.alive,
 			"the successful numstat child must have exited on its own",
@@ -186,6 +190,8 @@ describe("metadata command process bounds", () => {
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
 		strictEqual(scenario.result.reasonKind, "integration_state_unknown");
+		strictEqual(scenario.result.metadataStep, "numstat");
+		strictEqual(scenario.result.metadataCause, "exit_nonzero");
 		ok(
 			!JSON.stringify(scenario.result).includes(sentinel),
 			"partial stdout must never reach the refusal",
@@ -218,6 +224,8 @@ describe("metadata command process bounds", () => {
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
 		strictEqual(scenario.result.reasonKind, "integration_state_unknown");
+		strictEqual(scenario.result.metadataStep, "numstat");
+		strictEqual(scenario.result.metadataCause, "signal");
 		ok(!JSON.stringify(scenario.result).includes(sentinel));
 	});
 

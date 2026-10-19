@@ -66,7 +66,7 @@ import {
 	captureDeadlineChangedFiles,
 	declaredFileStat,
 	declaredFilesChanged,
-	validateDiffRejectionRule,
+	diffRejectionFor,
 } from "./declared-diff.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import {
@@ -536,7 +536,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			: 0;
 		if (diffRejection) {
 			diffRejection = {
-				rule: diffRejection.rule,
+				...diffRejection,
 				paths: boundedRejectionPaths(diffRejection.paths),
 			};
 		}
@@ -573,6 +573,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 			diffRejectionCount,
 			diffRejectionRule: diffRejection?.rule,
 			diffRejectionPaths: diffRejection?.paths,
+			diffRejectionUnknownStep: diffRejection?.unknownStep,
+			diffRejectionUnknownCause: diffRejection?.unknownCause,
 		};
 		const failureDetails = {};
 		for (const field of resolution.detailFields) {
@@ -1768,12 +1770,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				"diff",
 				null,
 				null,
-				validated.requiresReview
-					? {
-							rule: "manifest_review_required",
-							paths: validated.sensitivePaths,
-						}
-					: { rule: validateDiffRejectionRule(validated), paths: [] },
+				diffRejectionFor(validated),
 			);
 		}
 		if (reportMode) {
@@ -1883,15 +1880,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 								"diff",
 								null,
 								null,
-								formattedValidation.requiresReview
-									? {
-											rule: "manifest_review_required",
-											paths: formattedValidation.sensitivePaths,
-										}
-									: {
-											rule: validateDiffRejectionRule(formattedValidation),
-											paths: [],
-										},
+								diffRejectionFor(formattedValidation),
 							);
 						}
 					}
@@ -2065,15 +2054,6 @@ export async function runSimpleTask(options, dependencies = {}) {
 				) {
 					keepWorktree = true;
 					repairStatus = "ineligible";
-					const repairRejection = repairDiffValidation.requiresReview
-						? {
-								rule: "manifest_review_required",
-								paths: repairDiffValidation.sensitivePaths,
-							}
-						: {
-								rule: validateDiffRejectionRule(repairDiffValidation),
-								paths: [],
-							};
 					return fail(
 						repairDiffValidation.requiresReview
 							? "manifest_review_required"
@@ -2081,7 +2061,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						"diff",
 						null,
 						null,
-						repairRejection,
+						diffRejectionFor(repairDiffValidation),
 					);
 				}
 
@@ -2294,15 +2274,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						"diff",
 						null,
 						null,
-						correctedValidation.requiresReview
-							? {
-									rule: "manifest_review_required",
-									paths: correctedValidation.sensitivePaths,
-								}
-							: {
-									rule: validateDiffRejectionRule(correctedValidation),
-									paths: [],
-								},
+						diffRejectionFor(correctedValidation),
 					);
 				}
 				checks.length = 0;

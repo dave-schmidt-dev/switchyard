@@ -41,6 +41,9 @@ export const DETAIL_FIELD_TYPES = Object.freeze({
 	diffRejectionCount: "integer",
 	diffRejectionRule: "string",
 	diffRejectionPaths: "stringArray",
+	// The closed `git apply` step and cause behind `integration_state_unknown`.
+	diffRejectionUnknownStep: "string",
+	diffRejectionUnknownCause: "string",
 	providerSignature: "string",
 	stderrBytes: "integer",
 	stdoutBytes: "integer",
