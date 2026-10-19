@@ -175,9 +175,20 @@ test("commands that do not plainly run a declared relative script keep the stop"
 		`env bash ${NEW_SCRIPT}`,
 		`timeout 5 bash ${NEW_SCRIPT}`,
 		`npm run ${NEW_SCRIPT}`,
+		// A leading assignment is environment, not the script, and can hide the
+		// interpreter (PATH=...) so the shell itself exits 127.
+		"PATH=tests/nonexistent-bin bash tests/existing.sh",
+		`PATH=tests/nonexistent-bin ./${NEW_SCRIPT}`,
+		`FOO=tests/new-test.sh bash ${NEW_SCRIPT}`,
 	]) {
 		const result = await dryRun([command], {
-			declaredPaths: [NEW_SCRIPT, "new-test.sh", "tests/../tests/new-test.sh"],
+			declaredPaths: [
+				NEW_SCRIPT,
+				"new-test.sh",
+				"tests/../tests/new-test.sh",
+				"PATH=tests/nonexistent-bin",
+				"FOO=tests/new-test.sh",
+			],
 			pathExistsAtBase: absentAtBase,
 		}).done;
 		strictEqual(result.status, "environment_failed", JSON.stringify(command));
