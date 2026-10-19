@@ -14,16 +14,10 @@ const SETTLED_LIFECYCLES = new Set(["stopped", "never_started"]);
 const checkIdentityOf = (command) =>
 	createHash("sha256").update(command).digest("hex");
 
-// Bare interpreter names whose first non-flag argument is the script they run.
-const SCRIPT_INTERPRETERS = new Set([
-	"sh",
-	"bash",
-	"zsh",
-	"node",
-	"python",
-	"python3",
-]);
-const PROJECT_PYTHON = /^(?:\.\/)?\.venv\/bin\/python3?$/u;
+// Shells whose first argument is the script they run. A shell exits 127 for a
+// missing script file; node and python exit 1 and 2, so a 127 from them means
+// the interpreter itself is missing and is never exempted.
+const SCRIPT_SHELLS = new Set(["sh", "bash", "zsh"]);
 // A plain command: words of path-safe characters only, so no quoting, expansion,
 // redirection, or command separator can hide what actually ran.
 const PLAIN_COMMAND = /^[A-Za-z0-9._/@:+=,%\- ]+$/u;
@@ -42,8 +36,8 @@ function relativeForm(path) {
 
 /**
  * The repo-relative script a plain check command runs: argv[0] when it is a
- * relative path (`./x.sh`, `tests/x.sh`), or argv[1] when argv[0] is a shell or
- * interpreter (`bash x.sh`, `.venv/bin/python x.py`). Null for anything else,
+ * relative path (`./x.sh`, `tests/x.sh`), or argv[1] when argv[0] is a shell
+ * (`bash x.sh`). Null for anything else,
  * including a command with shell syntax or a leading environment assignment.
  */
 function scriptRunBy(command) {
@@ -52,7 +46,7 @@ function scriptRunBy(command) {
 	// A first word with `=` may be an environment assignment (`NAME=v`,
 	// `NAME+=v`), so the command that runs comes after it.
 	if (head.includes("=")) return null;
-	if (SCRIPT_INTERPRETERS.has(head) || PROJECT_PYTHON.test(head))
+	if (SCRIPT_SHELLS.has(head))
 		return next === undefined ? null : relativeForm(next);
 	return head.includes("/") ? relativeForm(head) : null;
 }

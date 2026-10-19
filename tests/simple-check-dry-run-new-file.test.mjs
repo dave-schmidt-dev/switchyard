@@ -64,10 +64,6 @@ test("each way of running a declared new script is recognized", async () => {
 		`bash ${NEW_SCRIPT} --verbose one two`,
 		`./${NEW_SCRIPT}`,
 		NEW_SCRIPT,
-		"node tests/new-test.sh",
-		"python3 tests/new-test.sh",
-		".venv/bin/python tests/new-test.sh",
-		"./.venv/bin/python3 tests/new-test.sh",
 	]) {
 		const result = await dryRun([command], {
 			declaredPaths: [NEW_SCRIPT],
@@ -175,6 +171,12 @@ test("commands that do not plainly run a declared relative script keep the stop"
 		`env bash ${NEW_SCRIPT}`,
 		`timeout 5 bash ${NEW_SCRIPT}`,
 		`npm run ${NEW_SCRIPT}`,
+		// node and python exit 1 or 2 for a missing script, so their 127 means the
+		// interpreter itself (say, an absent .venv) is missing.
+		`node ${NEW_SCRIPT}`,
+		`python3 ${NEW_SCRIPT}`,
+		`.venv/bin/python ${NEW_SCRIPT}`,
+		`./.venv/bin/python3 ${NEW_SCRIPT}`,
 		// A leading assignment is environment, not the script, and can hide the
 		// interpreter (PATH=...) so the shell itself exits 127.
 		"PATH=tests/nonexistent-bin bash tests/existing.sh",
