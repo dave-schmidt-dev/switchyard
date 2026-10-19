@@ -72,6 +72,7 @@ import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import {
 	persistFailureDisposition,
 	publishFailedTerminal,
+	retainedWorktreeLoss,
 } from "./failure-finalization.mjs";
 import { createFinalizationWatch } from "./finalization-watch.mjs";
 import { buildGuardedPrompt } from "./guarded-prompt.mjs";
@@ -184,6 +185,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let writerLifecycle = "never_started";
 	// Set once the disposable root is gone while the run still owns it.
 	let worktreeVanished = false;
+	// Closed reason a checkout the run would retain was gone at terminal time.
+	let worktreeLoss = null;
 	let projectLockState = "not_acquired";
 	let worktreeCreated = false;
 	let worktreeIdentity = null;
@@ -587,11 +590,21 @@ export async function runSimpleTask(options, dependencies = {}) {
 		) {
 			keepWorktree = true;
 		}
-		// A root deleted from outside has nothing left to salvage or retain.
-		if (worktreeVanished && simpleRootMissing(worktreeRoot))
+		// A retained claim needs the checkout to exist when the terminal record
+		// is written; one deleted from outside has nothing left to salvage.
+		if (keepWorktree)
+			worktreeLoss ??= retainedWorktreeLoss({
+				path: worktreePath,
+				root: worktreeRoot,
+				materialized: worktreeGitControl !== null,
+			});
+		if (worktreeLoss) worktreeVanished = true;
+		if (worktreeLoss || (worktreeVanished && simpleRootMissing(worktreeRoot)))
 			keepWorktree = false;
 		if (keepWorktree && worktreePath) {
 			milestone(failurePhase, "salvage_retained");
+		} else if (worktreeLoss) {
+			milestone(failurePhase, "salvage_lost", { reason: worktreeLoss });
 		}
 		milestone("terminal", "failed", {
 			failurePhase,
@@ -638,6 +651,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			providerVerdictCode,
 			partialWorktree: keepWorktree ? worktreePath : null,
 		});
+		if (worktreeLoss) finalResult.partialWorktreeLoss = worktreeLoss;
 		if (reportMode) finalResult.resultKind = "report";
 		finalResult.origin = origin;
 		finalResult.providerReliability = providerReliability;
@@ -2871,6 +2885,23 @@ export async function runSimpleTask(options, dependencies = {}) {
 		finalization.step("project_lock_release");
 		await releaseHeldProjectLock();
 		finalization.step("failure_disposition");
+		// The failed result never advertises a checkout that is already gone,
+		// whichever step above retained it; a leftover root is still removed.
+		if (finalResult?.status === "failed") {
+			const loss = retainedWorktreeLoss({
+				path: finalResult.partialWorktree,
+				root: worktreeRoot,
+				materialized: worktreeGitControl !== null,
+			});
+			if (loss) {
+				worktreeLoss = loss;
+				worktreeVanished = true;
+				keepWorktree = false;
+				finalResult.partialWorktree = null;
+				await removeNonSalvageWorktree();
+			}
+			if (worktreeLoss) finalResult.partialWorktreeLoss = worktreeLoss;
+		}
 		if (finalResult) {
 			Object.assign(finalResult, routingDiagnostics);
 			finalResult.elapsedMs = Math.max(0, now() - startedAt);
@@ -2915,6 +2946,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			worktreePath,
 			cleanupAttempted,
 			worktreeCleanupReason,
+			worktreeLoss,
 			failureReason: finalResult?.failureReason,
 			canonicalParent,
 			candidateChild,

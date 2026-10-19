@@ -1,4 +1,19 @@
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import { simpleRootMissing } from "./simple-root.mjs";
+
+/**
+ * Closed reason a retained checkout cannot be reported: `worktree_missing`
+ * when its root is proven gone, or when the checkout was materialized and its
+ * worktree is proven gone; else null. Before the clone, the allocated root
+ * alone is the retained claim. An uninspectable path (EPERM) stays retained,
+ * so a checkout that may still hold work is never dropped.
+ */
+export function retainedWorktreeLoss({ path, root, materialized }) {
+	if (typeof path !== "string" || path === "") return null;
+	return simpleRootMissing(root) || (materialized && simpleRootMissing(path))
+		? "worktree_missing"
+		: null;
+}
 
 /** Publish terminal failure and cleanup intent atomically before removing artifacts. */
 export async function publishFailedTerminal(updateRun, runId, terminalPatch) {
@@ -21,6 +36,7 @@ export async function persistFailureDisposition({
 	worktreePath,
 	cleanupAttempted,
 	worktreeCleanupReason,
+	worktreeLoss = null,
 	failureReason,
 	canonicalParent,
 	candidateChild,
@@ -70,9 +86,12 @@ export async function persistFailureDisposition({
 						candidateChild,
 						path: candidatePath,
 						state: retained ? "retained" : "removed",
-						reason: retained
-							? (worktreeCleanupReason ?? failureReason ?? "salvage_retained")
-							: null,
+						// A lost checkout keeps its closed loss reason in either state.
+						reason:
+							worktreeLoss ??
+							(retained
+								? (worktreeCleanupReason ?? failureReason ?? "salvage_retained")
+								: null),
 						retainedAt: retained ? new Date(now()).toISOString() : null,
 						writerStopped,
 						...(worktreeIdentity ?? {}),
