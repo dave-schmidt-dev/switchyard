@@ -25,9 +25,6 @@ function runsRoot() {
 function locksRoot() {
 	return resolve(resolveStateRoot(), "locks");
 }
-function quarantineRoot() {
-	return resolve(resolveStateRoot(), ".quarantine");
-}
 const VALID_STATES = new Set([
 	"created",
 	"launching",
@@ -65,7 +62,6 @@ const WORKTREE_RECORD_KEYS = new Set([
 const PROCESS_INSTANCE_ID = randomUUID();
 const HISTORICAL_SCHEMA_VERSION = 1;
 const CURRENT_SCHEMA_VERSION = 2;
-const DEFAULT_LEASE_AGE_MS = 60_000;
 const TELEMETRY_WRITE_FAILURE_LABELS = new Set([
 	"revision_conflict",
 	"schema_invalid",
@@ -256,18 +252,11 @@ const DIAGNOSTIC_ARTIFACT_KINDS = new Set([
 	"network_unreachable",
 	"cli_usage_error",
 ]);
-const CHECKPOINT_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024;
-const CHECKPOINT_ARTIFACT_MAX_ENTRIES = 128;
-const CHECKPOINT_ARTIFACT_MAX_FILE_BYTES = 16 * 1024 * 1024;
 
 export {
 	__dirname,
 	APPROVED_EVENT_KEYS,
-	CHECKPOINT_ARTIFACT_MAX_BYTES,
-	CHECKPOINT_ARTIFACT_MAX_ENTRIES,
-	CHECKPOINT_ARTIFACT_MAX_FILE_BYTES,
 	CURRENT_SCHEMA_VERSION,
-	DEFAULT_LEASE_AGE_MS,
 	DIAGNOSTIC_ARTIFACT_KINDS,
 	DIAGNOSTIC_DIGEST_RE,
 	DIAGNOSTIC_REF_RE,
@@ -284,7 +273,6 @@ export {
 	MUTATION_OPERATION_STATES,
 	MUTATION_RESOURCE_RE,
 	PROCESS_INSTANCE_ID,
-	quarantineRoot,
 	ROUTE_HEALTH_BINDING_KEYS,
 	ROUTE_HEALTH_DEFERRED_RESULT,
 	ROUTE_HEALTH_EPOCH_RE,

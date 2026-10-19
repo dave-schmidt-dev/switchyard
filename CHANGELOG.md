@@ -54,6 +54,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
 - The OpenCode Go bridge's fixed-runtime SHA-256 check (`verifyOpenCodeRuntime`), its test, and the matching OpenCode runtime part of `doctor`'s `bridge-pins` check.
 - The maintenance generation guard (`src/switchyard/maintenance/index.mjs`) and its test. Only the retired queue paths checked or wrote the cutover marker. `~/.agent/bin/metrics` and `prompts/_shared/expand.sh` still read `.plans/.cutovers/generation-in-progress.json` on their own, but nothing in Switchyard writes it any more, and the test that checked those readers is gone too.
+- The run store's queue-era exports, none of which production called: run leases and launch locks (`run-locks.mjs`), run and checkpoint-artifact retention (`retention.mjs`, `checkpoint-retention.mjs`, `checkpoint-artifacts.mjs`), the provider diagnostic writer `persistDiagnosticArtifact`, and the typed outcome writer activation and recovery helpers that took a run lease. `resolveDiagnosticArtifact` still reads diagnostics that older runs left behind, and lock recovery still leaves a legacy launch lock alone.
 - The test environment's `SWITCHYARD_ACCOUNT_ROOT` and `DOCKER_CONFIG` settings, and the phase runner's per-phase account directory. Nothing outside the retired VM lane read either.
 
 ### Security

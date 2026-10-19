@@ -1,23 +1,19 @@
 // @test-phase: other
-import { ok, rejects, strictEqual } from "node:assert";
+import { rejects, strictEqual } from "node:assert";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
-	acquireLaunchLock,
 	createEvent,
 	getRunRoot,
 	initializeRun,
-	LockError,
 	readRun,
-	releaseLaunchLock,
 	SchemaError,
 } from "../src/switchyard/run-store/index.mjs";
 import {
 	makeOptions,
 	TEST_ROOT,
-	uniquePath,
 	uniqueRunId,
 	VM_ADMISSION_ROOT,
 } from "./helpers/run-store-fixtures.mjs";
@@ -117,42 +113,5 @@ describe("permissions", () => {
 
 		strictEqual(runPerm, 0o600, "run.json should be 0600");
 		strictEqual(eventsPerm, 0o600, "events.jsonl should be 0600");
-	});
-});
-describe("launch lock", () => {
-	it("two acquires on different paths succeed for different runIds", async () => {
-		const path1 = uniquePath("tasks-a");
-		const path2 = uniquePath("tasks-b");
-		const runId1 = uniqueRunId();
-		const runId2 = uniqueRunId();
-
-		await acquireLaunchLock(path1, runId1);
-		await acquireLaunchLock(path2, runId2);
-
-		ok(true);
-	});
-
-	it("two acquires on the same path fails", async () => {
-		const path = uniquePath("tasks");
-		const runId1 = uniqueRunId();
-		const runId2 = uniqueRunId();
-
-		await acquireLaunchLock(path, runId1);
-		await rejects(acquireLaunchLock(path, runId2), LockError);
-	});
-
-	it("release then re-acquire with a different runId succeeds", async () => {
-		const path = uniquePath("tasks");
-		const runId1 = uniqueRunId();
-
-		await acquireLaunchLock(path, runId1);
-		await releaseLaunchLock(path);
-		await acquireLaunchLock(path, uniqueRunId());
-		ok(true);
-	});
-
-	it("release on non-existent lock does not throw", async () => {
-		await releaseLaunchLock(uniquePath("nonexistent"));
-		ok(true);
 	});
 });

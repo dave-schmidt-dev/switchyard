@@ -10,7 +10,6 @@ import {
 	run,
 } from "../src/switchyard/dispatch/remediate-orphaned-locks.mjs";
 import {
-	acquireLaunchLock,
 	acquireProjectLock,
 	advanceState,
 	getStateRoot,
@@ -26,6 +25,7 @@ import {
 	TEST_ROOT,
 	uniquePath,
 	uniqueRunId,
+	writeLegacyLaunchLock,
 } from "./helpers/remediate-orphaned-locks-fixtures.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
@@ -405,7 +405,10 @@ describe("run() — confirmation gating", () => {
 		});
 
 		const launchRun = await makeStaleRun();
-		await acquireLaunchLock(launchRun.tasksFilePath, launchRun.runId);
+		const launchLock = writeLegacyLaunchLock(
+			launchRun.tasksFilePath,
+			launchRun.runId,
+		);
 
 		const result = await run(["--confirm"], { log: () => {} });
 
@@ -421,14 +424,6 @@ describe("run() — confirmation gating", () => {
 			true,
 			"the live run's lock must survive",
 		);
-		// The launch lock is untouched: still collides on a second acquire.
-		const { LockError } = await import("../src/switchyard/run-store/index.mjs");
-		let threw = false;
-		try {
-			await acquireLaunchLock(launchRun.tasksFilePath, uniqueRunId());
-		} catch (e) {
-			threw = e instanceof LockError;
-		}
-		ok(threw, "the launch lock must still be held");
+		ok(existsSync(launchLock), "the launch lock must be left on disk");
 	});
 });

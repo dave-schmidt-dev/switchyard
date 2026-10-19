@@ -22,11 +22,6 @@ import { writeRunAtomically } from "./run-records.mjs";
 export function getStateRoot() {
 	return resolveStateRoot();
 }
-function lockFilePath(canonicalPath) {
-	const resolvedPath = resolve(canonicalPath);
-	const hash = createHash("sha256").update(resolvedPath).digest("hex");
-	return resolve(locksRoot(), `${hash}.lock`);
-}
 function resolveCanonicalProjectPath(projectPath) {
 	return resolve(projectPath);
 }
@@ -314,7 +309,6 @@ function parseRecoveryReservation(raw) {
 export {
 	cwdDerivedProjectLockFileName,
 	cwdDerivedProjectLockPath,
-	lockFilePath,
 	moveProjectLockPathToClaim,
 	parseLegacyProjectLockBody,
 	parseOwnedProjectLockBody,

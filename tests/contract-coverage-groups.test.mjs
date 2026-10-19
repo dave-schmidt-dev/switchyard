@@ -90,9 +90,10 @@ describe("contract coverage groups", () => {
 			// modules, dispatch/index.mjs and run-store/index.mjs lost their deleted
 			// members, and a router/index.mjs group (75/60/75) took over the route
 			// selection suites the runner group used to pull in. (O4 follow-up): the
-			// outcome/reducer.mjs entry left with the deleted reducer. No surviving
-			// floor changed.
-			"559299f8338754d8483df4a90eb91d25708c2dcd04a58068a20886d56a346bba",
+			// outcome/reducer.mjs entry left with the deleted reducer. 2026-10-19
+			// (O1 leftovers): run-store/index.mjs lost the deleted run-locks,
+			// retention and checkpoint modules. No surviving floor changed.
+			"00abe90bc0fada6ac1c9fbe8d12f2090cd3e5a61101c8c3c62d463fa06850cc6",
 		);
 	});
 
@@ -157,9 +158,10 @@ describe("contract coverage groups", () => {
 			// run-store-shadow-reducer-projection was renamed
 			// run-store-legacy-outcome-projection. 2026-10-19 (O1 leftovers):
 			// run-store-prlctl-failure-metadata-survives was renamed
-			// run-store-durable-evidence, which moves its sorted position. Every
-			// other surviving entry and its order is unchanged.
-			"c173772d1b9064bcd7c6164da2b0472d3700e5d376f380a657c7600dac74365d",
+			// run-store-durable-evidence, which moves its sorted position, and
+			// run-store-retention-1, -2 and -3 left with the deleted retention
+			// modules. Every other surviving entry and its order is unchanged.
+			"df03729ad8f7a685e4d25f575b7ad817190fce2520683fd446ef2b2861b44169",
 		);
 		let calls = 0;
 		const result = runContractCoverage({

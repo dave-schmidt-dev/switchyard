@@ -1,13 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-	lstat,
-	mkdir,
-	open,
-	readFile,
-	rename,
-	unlink,
-	writeFile,
-} from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
 	projectRunFailureForDisk,
@@ -86,11 +78,6 @@ async function ensureDir(dirPath, mode) {
 			path = dirname(path);
 		}
 	}
-}
-const CONTROL_CHAR_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
-function sanitizeForDisplay(text) {
-	if (typeof text !== "string") return "";
-	return text.replace(CONTROL_CHAR_RE, "?");
 }
 export async function initializeRun(options) {
 	const {
@@ -207,74 +194,6 @@ export async function initializeRun(options) {
 	await writeRunAtomically(runJsonPath, snapshot);
 	return snapshot;
 }
-export async function persistDiagnosticArtifact(runId, evidence) {
-	validateRunId(runId);
-	if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
-		return null;
-	}
-	const evidenceKeys = new Set([
-		"stdoutBytes",
-		"stderrBytes",
-		"stdoutDigest",
-		"stderrDigest",
-		"diagnosticKind",
-	]);
-	if (Object.keys(evidence).some((key) => !evidenceKeys.has(key))) return null;
-	const runRoot = getRunRoot(runId);
-	const resources = resolve(runRoot, "resources");
-	for (const existing of [runRoot, resources]) {
-		try {
-			const stat = await lstat(existing);
-			if (!ownerOnlyDirectoryStat(stat)) return null;
-		} catch (error) {
-			if (error.code !== "ENOENT") return null;
-		}
-	}
-	await ensureDir(runRoot, 0o700);
-	await ensureDir(resources, 0o700);
-	const runRootStat = await lstat(runRoot);
-	if (!ownerOnlyDirectoryStat(runRootStat)) return null;
-	const resourceStat = await lstat(resources);
-	if (!ownerOnlyDirectoryStat(resourceStat)) return null;
-	const stdoutBytes = evidence.stdoutBytes;
-	const stderrBytes = evidence.stderrBytes;
-	if (
-		!Number.isSafeInteger(stdoutBytes) ||
-		!Number.isSafeInteger(stderrBytes) ||
-		stdoutBytes < 0 ||
-		stderrBytes < 0 ||
-		stdoutBytes > MAX_DIAGNOSTIC_STREAM_BYTES ||
-		stderrBytes > MAX_DIAGNOSTIC_STREAM_BYTES ||
-		!DIAGNOSTIC_DIGEST_RE.test(evidence.stdoutDigest ?? "") ||
-		!DIAGNOSTIC_DIGEST_RE.test(evidence.stderrDigest ?? "") ||
-		(evidence.diagnosticKind !== undefined &&
-			!DIAGNOSTIC_ARTIFACT_KINDS.has(evidence.diagnosticKind))
-	) {
-		return null;
-	}
-	const bounded = {
-		schemaVersion: 1,
-		kind: "provider_diagnostic",
-		...(DIAGNOSTIC_ARTIFACT_KINDS.has(evidence.diagnosticKind)
-			? { diagnosticKind: evidence.diagnosticKind }
-			: {}),
-		stdoutBytes,
-		stderrBytes,
-		stdoutDigest: evidence.stdoutDigest,
-		stderrDigest: evidence.stderrDigest,
-	};
-	const raw = JSON.stringify(bounded);
-	if (Buffer.byteLength(raw) > MAX_DIAGNOSTIC_ARTIFACT_BYTES) return null;
-	const token = randomUUID().replaceAll("-", "");
-	const filename = `provider-diagnostic-${token}.json`;
-	const destination = resolve(resources, filename);
-	await writeFile(destination, `${raw}\n`, {
-		encoding: "utf8",
-		mode: 0o600,
-		flag: "wx",
-	});
-	return `diagnostic:${token}`;
-}
 export async function resolveDiagnosticArtifact(runId, diagnosticRef) {
 	if (!DIAGNOSTIC_REF_RE.test(diagnosticRef ?? "")) return null;
 	validateRunId(runId);
@@ -335,8 +254,7 @@ export async function readRun(runId) {
 	} catch (e) {
 		if (e.code === "ENOENT") {
 			// Tag the not-found signal with ENOENT so callers can tell a
-			// transient missing run.json apart from corruption (see
-			// applyRetention's conservative skip in its quarantine loop).
+			// transient missing run.json apart from corruption.
 			const notFound = new Error(`Run not found: ${runId}`);
 			notFound.code = "ENOENT";
 			throw notFound;
@@ -363,4 +281,4 @@ export async function readRun(runId) {
 	validateRun(data);
 	return data;
 }
-export { CONTROL_CHAR_RE, ensureDir, sanitizeForDisplay, writeRunAtomically };
+export { ensureDir, writeRunAtomically };

@@ -23,7 +23,6 @@ export {
 export {
 	getRunRoot,
 	initializeRun,
-	persistDiagnosticArtifact,
 	readRun,
 	resolveDiagnosticArtifact,
 } from "./run-records.mjs";
@@ -39,27 +38,16 @@ export {
 import "./events.mjs";
 import "./project-locks.mjs";
 import "./project-lock-claims.mjs";
-import "./run-locks.mjs";
 import "./evidence.mjs";
 import "./outcomes.mjs";
-import "./checkpoint-artifacts.mjs";
-import "./checkpoint-retention.mjs";
-import "./retention.mjs";
 
-export { applyCheckpointArtifactRetention } from "./checkpoint-retention.mjs";
 export { createEvent, createStageOutcome } from "./events.mjs";
 export {
 	readAuthorizedRunEvents,
 	readAuthorizedRunEvidence,
 	readEvents,
 } from "./evidence.mjs";
-export {
-	activateOutcomeWriter,
-	appendOutcomeEvent,
-	assertOutcomeWriter,
-	createRouteHealthEvent,
-	recoverMissingExecutionOutcome,
-} from "./outcomes.mjs";
+export { appendOutcomeEvent, createRouteHealthEvent } from "./outcomes.mjs";
 export {
 	assertProjectLockOwnership,
 	reconcileProjectLockClaims,
@@ -73,12 +61,3 @@ export {
 	releaseProjectLock,
 	releaseProjectLockIfOwnedBy,
 } from "./project-locks.mjs";
-export { applyRetention } from "./retention.mjs";
-export {
-	acquireLaunchLock,
-	acquireRunLock,
-	isRunLockExpired,
-	releaseLaunchLock,
-	releaseRunLock,
-	renewRunLock,
-} from "./run-locks.mjs";

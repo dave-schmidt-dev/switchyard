@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { resolveCandidates } from "../src/switchyard/dispatch/remediate-orphaned-locks.mjs";
 import {
-	acquireLaunchLock,
 	acquireProjectLock,
 	advanceState,
 	getStateRoot,
@@ -21,6 +20,7 @@ import {
 	TEST_ROOT,
 	uniquePath,
 	uniqueRunId,
+	writeLegacyLaunchLock,
 } from "./helpers/remediate-orphaned-locks-fixtures.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
@@ -82,7 +82,7 @@ describe("resolveCandidates", () => {
 		// shape as a pre-F.1 project lock. The scan must disambiguate by
 		// filename hash, not just body shape.
 		const opts = await makeStaleRun();
-		await acquireLaunchLock(opts.tasksFilePath, opts.runId);
+		writeLegacyLaunchLock(opts.tasksFilePath, opts.runId);
 
 		const [d] = await resolveCandidates();
 		strictEqual(d.category, "not-a-project-lock");
@@ -105,7 +105,7 @@ describe("resolveCandidates", () => {
 		});
 
 		const launchRun = await makeStaleRun();
-		await acquireLaunchLock(launchRun.tasksFilePath, launchRun.runId);
+		writeLegacyLaunchLock(launchRun.tasksFilePath, launchRun.runId);
 
 		mkdirSync(join(getStateRoot(), "locks"), { recursive: true });
 		writeFileSync(join(getStateRoot(), "locks", "garbage.lock"), "{{{not json");

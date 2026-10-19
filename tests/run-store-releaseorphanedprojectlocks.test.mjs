@@ -11,22 +11,17 @@ import {
 import { join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
-	acquireLaunchLock,
 	acquireProjectLock,
-	acquireRunLock,
 	advanceState,
 	getStateRoot,
 	initializeRun,
 	isProjectLockHeld,
-	isRunLockExpired,
-	LockError,
 	readRun,
 	releaseOrphanedProjectLocks,
-	releaseRunLock,
-	renewRunLock,
 	SchemaError,
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
+import { writeLegacyLaunchLock } from "./helpers/remediate-orphaned-locks-fixtures.mjs";
 import {
 	makeOptions,
 	TEST_ROOT,
@@ -147,16 +142,15 @@ describe("releaseOrphanedProjectLocks", () => {
 		// A launch lock predates F.1's projectPath addition: {runId,
 		// createdAt} only. This is the permanent, correct shape for launch
 		// locks — not a migration gap — so the scan must leave it alone.
-		const tasksPath = uniquePath("tasks");
-		const launchRunId = uniqueRunId();
-		await acquireLaunchLock(tasksPath, launchRunId);
+		const launchLock = writeLegacyLaunchLock(
+			uniquePath("tasks"),
+			uniqueRunId(),
+		);
 
 		const reclaimed = await releaseOrphanedProjectLocks();
 
 		strictEqual(reclaimed.length, 0);
-		// Black-box check that the launch lock file is still present: a
-		// second acquire on the same tasks path must still collide.
-		await rejects(acquireLaunchLock(tasksPath, uniqueRunId()), LockError);
+		ok(existsSync(launchLock), "the launch lock must be left on disk");
 	});
 
 	it("never reclaims a lock whose runId has no run.json at all", async () => {
@@ -239,131 +233,6 @@ describe("releaseOrphanedProjectLocks", () => {
 			true,
 			"the active run's lock must survive even though a stale run once used the same project path",
 		);
-	});
-});
-describe("lease", () => {
-	it("acquire -> renew -> release round-trip", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		const pid = 12345;
-		const token = "start-token-abc";
-		const nonce = "nonce-xyz";
-
-		const acquired = await acquireRunLock(opts.runId, pid, token, nonce);
-		strictEqual(acquired.workerPid, pid);
-		strictEqual(acquired.workerStartToken, token);
-		strictEqual(acquired.workerNonce, nonce);
-
-		const renewed = await renewRunLock(opts.runId, pid, token);
-		ok(
-			new Date(renewed.lastLeaseHeartbeat).getTime() >=
-				new Date(acquired.lastLeaseHeartbeat).getTime(),
-		);
-
-		const released = await releaseRunLock(opts.runId);
-		strictEqual(released.workerPid, null);
-		strictEqual(released.workerStartToken, null);
-		strictEqual(released.workerNonce, "");
-	});
-
-	it("stale lease is recognized as expired", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		await acquireRunLock(opts.runId, 34567, "token-1", "nonce-1");
-
-		const expired = await isRunLockExpired(opts.runId, {
-			maxAgeMs: 0,
-			now: new Date(Date.now() + 120_000).toISOString(),
-		});
-		strictEqual(expired, true);
-	});
-
-	it("wrong identity fails renew", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		await acquireRunLock(opts.runId, 12345, "token-a", "nonce");
-		await rejects(renewRunLock(opts.runId, 99999, "token-a"), LockError);
-		await rejects(renewRunLock(opts.runId, 12345, "token-b"), LockError);
-	});
-
-	it("wrong identity fails acquire when lease is active", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		await acquireRunLock(opts.runId, 12345, "token-a", "nonce-a");
-		await rejects(
-			acquireRunLock(opts.runId, 99999, "token-b", "nonce-b"),
-			LockError,
-		);
-	});
-
-	it("acquire with allowRecovery succeeds on expired lease", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		await acquireRunLock(opts.runId, 12345, "token-a", "nonce-a");
-
-		const acquired = await acquireRunLock(
-			opts.runId,
-			99999,
-			"token-b",
-			"nonce-b",
-			{
-				allowRecovery: true,
-				maxAgeMs: 0,
-				now: new Date(Date.now() + 120_000).toISOString(),
-			},
-		);
-
-		strictEqual(acquired.workerPid, 99999);
-		strictEqual(acquired.workerStartToken, "token-b");
-	});
-
-	it("acquire with allowRecovery fails on non-expired lease", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		await acquireRunLock(opts.runId, 12345, "token-a", "nonce-a");
-
-		await rejects(
-			acquireRunLock(opts.runId, 99999, "token-b", "nonce-b", {
-				allowRecovery: true,
-			}),
-			LockError,
-		);
-	});
-
-	it("isRunLockExpired returns true when no lease is held", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-		const expired = await isRunLockExpired(opts.runId);
-		strictEqual(expired, true);
-	});
-});
-describe("nonce handshake", () => {
-	it("lease acquire includes nonce and readRun shows it", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		const nonce = "handshake-nonce-42";
-		await acquireRunLock(opts.runId, 12345, "token", nonce);
-
-		const run = await readRun(opts.runId);
-		strictEqual(run.workerNonce, nonce);
-	});
-
-	it("release clears nonce", async () => {
-		const opts = makeOptions();
-		await initializeRun(opts);
-
-		await acquireRunLock(opts.runId, 12345, "token", "nonce-1");
-		await releaseRunLock(opts.runId);
-
-		const run = await readRun(opts.runId);
-		strictEqual(run.workerNonce, "");
 	});
 });
 describe("runId validation", () => {

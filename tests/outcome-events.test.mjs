@@ -10,7 +10,6 @@ import {
 } from "../src/switchyard/outcome/schema.mjs";
 import {
 	appendOutcomeEvent,
-	applyRetention,
 	getRunRoot,
 	initializeRun,
 	readEvents,
@@ -69,18 +68,8 @@ describe("reader-first outcome event floor", () => {
 				"../src/switchyard/run-store/project-lock-claims.mjs",
 				import.meta.url,
 			),
-			new URL("../src/switchyard/run-store/run-locks.mjs", import.meta.url),
 			new URL("../src/switchyard/run-store/evidence.mjs", import.meta.url),
 			new URL("../src/switchyard/run-store/outcomes.mjs", import.meta.url),
-			new URL(
-				"../src/switchyard/run-store/checkpoint-artifacts.mjs",
-				import.meta.url,
-			),
-			new URL(
-				"../src/switchyard/run-store/checkpoint-retention.mjs",
-				import.meta.url,
-			),
-			new URL("../src/switchyard/run-store/retention.mjs", import.meta.url),
 		);
 		strictEqual(production.match(/appendOutcomeEvent\s*\(/gu)?.length, 1);
 		strictEqual(production.includes('stage: "provider"'), false);
@@ -101,7 +90,7 @@ describe("reader-first outcome event floor", () => {
 		strictEqual(OUTCOME_EVENT_MAX_BYTES, 32 * 1024);
 	});
 
-	it("reads and retains a typed-outcome-only fixture without activating production writes", async () => {
+	it("reads a typed-outcome-only fixture without activating production writes", async () => {
 		const root = tempDir("switchyard-outcome-reader-");
 		process.env.SWITCHYARD_RUN_STORE_ROOT = root;
 		const runId = "typed-only-run";
@@ -144,7 +133,6 @@ describe("reader-first outcome event floor", () => {
 			);
 			await updateRun(runId, { lastEventSequence: 1 }, run.revision);
 			strictEqual((await readEvents(runId))[0].outcomeId, "outcome-1");
-			strictEqual((await applyRetention({ maxRuns: 0 })).deletedCount, 0);
 			strictEqual(existsSync(join(getRunRoot(runId), "events.jsonl")), true);
 		} finally {
 			rmSync(root, { recursive: true, force: true });

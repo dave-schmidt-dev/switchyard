@@ -1,27 +1,21 @@
-import { createHash, randomUUID } from "node:crypto";
-import { appendFile, readdir } from "node:fs/promises";
+import { appendFile } from "node:fs/promises";
 import {
 	createOversizeRejectionFact,
-	isOutcomeEvent,
 	OUTCOME_EVENT_MAX_BYTES,
 	OUTCOME_FILE_MAX_BYTES,
 	OUTCOME_FILE_MAX_LINES,
 	SUPPORTED_OUTCOME_READER_VERSION,
 	validateOutcomeEvent,
 } from "../outcome/schema.mjs";
-import { EVENT_RESERVE_BYTES, runsRoot } from "./constants.mjs";
+import { EVENT_RESERVE_BYTES } from "./constants.mjs";
 import { LockError, SchemaError, validateRunId } from "./errors.mjs";
 import { createEventInternal } from "./events.mjs";
-import { readEvents } from "./evidence.mjs";
 import { validateRouteHealthBinding } from "./receipt-validation.mjs";
-import { ownerPidIsLive } from "./run-liveness.mjs";
-import { acquireRunLock } from "./run-locks.mjs";
 import { readRun, resolveDiagnosticArtifact } from "./run-records.mjs";
 import {
 	enqueueRunMutation,
 	performUpdate,
 	reconcileEventCeilingLocked,
-	updateRun,
 	withEventAppendLock,
 } from "./run-updates.mjs";
 export async function appendOutcomeEvent(
@@ -174,97 +168,7 @@ export async function appendOutcomeEvent(
 		}),
 	);
 }
-const appendTypedOutcome = appendOutcomeEvent;
-export async function activateOutcomeWriter(
-	runId,
-	{
-		pid = process.pid,
-		startToken,
-		nonce,
-		writerEpoch = `epoch-${randomUUID()}`,
-		minimumReaderVersion = SUPPORTED_OUTCOME_READER_VERSION,
-		allowRecovery = false,
-		maxAgeMs,
-	} = {},
-) {
-	validateRunId(runId);
-	if (!Number.isSafeInteger(pid) || pid < 1)
-		throw new SchemaError("outcome writer pid is invalid");
-	if (!Number.isSafeInteger(minimumReaderVersion) || minimumReaderVersion < 1)
-		throw new SchemaError("outcome writer reader version is invalid");
-	if (minimumReaderVersion > SUPPORTED_OUTCOME_READER_VERSION)
-		throw new SchemaError("outcome writer reader version is unsupported");
-	if (
-		typeof writerEpoch !== "string" ||
-		!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(writerEpoch)
-	)
-		throw new SchemaError("outcome writer epoch is invalid");
-	const existing = await readRun(runId);
-	startToken ??= existing.workerStartToken;
-	nonce ??= existing.workerNonce;
-	if (typeof startToken !== "string" || startToken.length === 0)
-		throw new SchemaError("outcome writer start token is required");
-	if (typeof nonce !== "string" || nonce.length === 0)
-		throw new SchemaError("outcome writer nonce is required");
-	if (
-		existing.workerPid === pid &&
-		existing.workerStartToken === startToken &&
-		existing.workerNonce !== nonce
-	) {
-		throw new LockError("outcome writer nonce is stale", {
-			code: "OUTCOME_WRITER_LEASE_STALE",
-			holderRunId: runId,
-		});
-	}
-	const sameLease =
-		existing.workerPid === pid &&
-		existing.workerStartToken === startToken &&
-		existing.workerNonce === nonce;
-	// A recovery caller that has already fenced the dead run with its own lease
-	// may publish to that run while a newer sibling is live. Normal activation
-	// remains blocked by any live sibling during the compatibility migration.
-	if (!(allowRecovery && sameLease)) {
-		const siblingEntries = await readdir(runsRoot(), {
-			withFileTypes: true,
-		}).catch((error) => {
-			if (error.code === "ENOENT") return [];
-			throw error;
-		});
-		for (const entry of siblingEntries) {
-			if (!entry.isDirectory() || entry.name === runId) continue;
-			const sibling = await readRun(entry.name).catch(() => null);
-			if (
-				sibling?.projectPath === existing.projectPath &&
-				Number.isSafeInteger(sibling.workerPid) &&
-				sibling.workerPid > 0 &&
-				ownerPidIsLive(sibling.workerPid)
-			) {
-				throw new LockError(
-					"another live project worker blocks writer activation",
-					{
-						code: "OUTCOME_WRITER_COMPATIBILITY_BLOCKED",
-						holderRunId: sibling.runId,
-					},
-				);
-			}
-		}
-	}
-	const leased = sameLease
-		? existing
-		: await acquireRunLock(runId, pid, startToken, nonce, {
-				allowRecovery,
-				...(maxAgeMs === undefined ? {} : { maxAgeMs }),
-			});
-	return updateRun(
-		runId,
-		{
-			minimumOutcomeReaderVersion: minimumReaderVersion,
-			outcomeWriterEpoch: writerEpoch,
-		},
-		leased.revision,
-	);
-}
-export async function assertOutcomeWriter(
+async function assertOutcomeWriter(
 	runId,
 	{
 		pid = process.pid,
@@ -296,75 +200,6 @@ export async function assertOutcomeWriter(
 	)
 		throw new SchemaError("typed outcome reader capability is stale");
 	return run;
-}
-export async function recoverMissingExecutionOutcome(
-	runId,
-	{
-		writerEpoch,
-		owner = null,
-		minimumReaderVersion = SUPPORTED_OUTCOME_READER_VERSION,
-	} = {},
-) {
-	validateRunId(runId);
-	const events = await readEvents(runId);
-	const processFacts = events.filter(
-		(event) =>
-			isOutcomeEvent(event) &&
-			event.stage === "provider" &&
-			event.detail?.code === "process_completed",
-	);
-	for (const processFact of processFacts) {
-		const hasExecution = events.some(
-			(event) =>
-				isOutcomeEvent(event) &&
-				event.taskId === processFact.taskId &&
-				event.attemptId === processFact.attemptId &&
-				((event.stage === "provider" &&
-					event.detail?.code?.startsWith("execution_")) ||
-					(event.stage === "recovery" &&
-						event.detail?.code === "execution_outcome_unavailable" &&
-						event.causedBy === processFact.outcomeId)),
-		);
-		if (hasExecution) continue;
-		const digest = `sha256:${createHash("sha256")
-			.update(`${runId}:${processFact.outcomeId}:execution-unavailable`, "utf8")
-			.digest("hex")}`;
-		const recovery = {
-			schemaVersion: 1,
-			minimumReaderVersion,
-			writerEpoch,
-			outcomeId: `execution-unavailable-${digest.slice(7, 39)}`,
-			sequence: 1,
-			runId,
-			scope: "task",
-			taskId: processFact.taskId,
-			attemptId: processFact.attemptId,
-			resumesOutcomeId: processFact.outcomeId,
-			stage: "recovery",
-			legacyPhase: null,
-			legacyEvent: null,
-			dispatchCausality: processFact.dispatchCausality,
-			attempt: processFact.attempt,
-			recordedAt: new Date().toISOString(),
-			producer: "recovery",
-			causedBy: processFact.outcomeId,
-			operationId: `${processFact.operationId ?? processFact.outcomeId}-recovery`,
-			status: "uncertain",
-			detail: {
-				code: "execution_outcome_unavailable",
-				reasonCode: "execution_outcome_missing_after_process_fact",
-				originalStage: "provider",
-				operatorCommand: "switchyard-dispatch recover",
-			},
-		};
-		validateOutcomeEvent(recovery);
-		return appendTypedOutcome(runId, recovery, {
-			writerEpoch,
-			owner,
-			minimumReaderVersion,
-		});
-	}
-	return null;
 }
 export async function createRouteHealthEvent(runId, event, binding) {
 	validateRunId(runId);
@@ -408,4 +243,3 @@ export async function createRouteHealthEvent(runId, event, binding) {
 		),
 	);
 }
-export { appendTypedOutcome };

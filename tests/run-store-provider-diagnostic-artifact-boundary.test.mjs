@@ -8,7 +8,6 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { stat } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
@@ -16,7 +15,6 @@ import {
 	getRunRoot,
 	getStateRoot,
 	initializeRun,
-	persistDiagnosticArtifact,
 	readEvents,
 	readRun,
 	resolveDiagnosticArtifact,
@@ -28,8 +26,30 @@ import { TEST_ROOT, VM_ADMISSION_ROOT } from "./helpers/run-store-fixtures.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
+
+const DIGESTS = {
+	stdoutDigest: `sha256:${"a".repeat(64)}`,
+	stderrDigest: `sha256:${"b".repeat(64)}`,
+};
+
+// Nothing writes provider diagnostics any more (the retired queue path did),
+// but older run roots still hold them, so the reader is checked against files
+// written in the shape the retired writer produced.
+function writeDiagnosticArtifact(runId, body) {
+	const resources = join(getRunRoot(runId), "resources");
+	mkdirSync(resources, { recursive: true, mode: 0o700 });
+	chmodSync(resources, 0o700);
+	const token = randomUUID().replaceAll("-", "");
+	writeFileSync(
+		join(resources, `provider-diagnostic-${token}.json`),
+		`${JSON.stringify({ schemaVersion: 1, kind: "provider_diagnostic", ...body })}\n`,
+		{ mode: 0o600, flag: "wx" },
+	);
+	return `diagnostic:${token}`;
+}
+
 describe("provider diagnostic artifact boundary", () => {
-	it("stores bounded digest/count metadata and resolves only opaque refs", async () => {
+	it("resolves only closed-shape, owner-only diagnostics by opaque ref", async () => {
 		const runId = `diagnostic-${randomUUID()}`;
 		await initializeRun({
 			runId,
@@ -40,16 +60,13 @@ describe("provider diagnostic artifact boundary", () => {
 			workerNonce: randomUUID(),
 			launchArgs: [],
 		});
-		const ref = await persistDiagnosticArtifact(runId, {
+		const ref = writeDiagnosticArtifact(runId, {
+			diagnosticKind: "auth_required",
 			stdoutBytes: 12,
 			stderrBytes: 4,
-			stdoutDigest: `sha256:${"a".repeat(64)}`,
-			stderrDigest: `sha256:${"b".repeat(64)}`,
-			diagnosticKind: "auth_required",
+			...DIGESTS,
 		});
-		strictEqual(ref, `diagnostic:${ref.slice("diagnostic:".length)}`);
 		const resources = join(getRunRoot(runId), "resources");
-		strictEqual((await stat(resources)).mode & 0o777, 0o700);
 		const artifact = await resolveDiagnosticArtifact(runId, ref);
 		strictEqual(artifact.kind, "provider_diagnostic");
 		strictEqual(artifact.diagnosticKind, "auth_required");
@@ -63,12 +80,11 @@ describe("provider diagnostic artifact boundary", () => {
 			"network_unreachable",
 			"cli_usage_error",
 		]) {
-			const kindRef = await persistDiagnosticArtifact(runId, {
+			const kindRef = writeDiagnosticArtifact(runId, {
+				diagnosticKind,
 				stdoutBytes: 1,
 				stderrBytes: 1,
-				stdoutDigest: `sha256:${"a".repeat(64)}`,
-				stderrDigest: `sha256:${"b".repeat(64)}`,
-				diagnosticKind,
+				...DIGESTS,
 			});
 			const kindArtifact = await resolveDiagnosticArtifact(runId, kindRef);
 			strictEqual(kindArtifact.diagnosticKind, diagnosticKind);
@@ -99,46 +115,18 @@ describe("provider diagnostic artifact boundary", () => {
 		strictEqual(await resolveDiagnosticArtifact(runId, ref), null);
 		chmodSync(resources, 0o700);
 		strictEqual(await resolveDiagnosticArtifact(runId, "diagnostic:bad"), null);
-		strictEqual(
-			await persistDiagnosticArtifact(runId, {
-				stdoutBytes: 1,
-				stderrBytes: 1,
-				stdoutDigest: "bad",
-				stderrDigest: `sha256:${"b".repeat(64)}`,
-			}),
-			null,
-		);
-		strictEqual(
-			await persistDiagnosticArtifact(runId, {
-				stdoutBytes: 1,
-				stderrBytes: 1,
-				stdoutDigest: `sha256:${"a".repeat(64)}`,
-				stderrDigest: `sha256:${"b".repeat(64)}`,
-				extra: "rejected",
-			}),
-			null,
-		);
-		strictEqual(
-			await persistDiagnosticArtifact(runId, {
-				stdoutBytes: 1,
-				stderrBytes: 1,
-				stdoutDigest: `sha256:${"a".repeat(64)}`,
-				stderrDigest: `sha256:${"b".repeat(64)}`,
-				diagnosticCode: "auth_required",
-			}),
-			null,
-		);
-		strictEqual(
-			await persistDiagnosticArtifact(runId, {
-				stdoutBytes: 1,
-				stderrBytes: 1,
-				stdoutDigest: `sha256:${"a".repeat(64)}`,
-				stderrDigest: `sha256:${"b".repeat(64)}`,
-				diagnosticKind: "auth_required",
-				diagnosticCode: "cli_usage_error",
-			}),
-			null,
-		);
+		for (const body of [
+			{ stdoutBytes: 1, stderrBytes: 1, ...DIGESTS, stdoutDigest: "bad" },
+			{ stdoutBytes: 1, stderrBytes: 1, ...DIGESTS, extra: "rejected" },
+			{ stdoutBytes: -1, stderrBytes: 1, ...DIGESTS },
+		])
+			strictEqual(
+				await resolveDiagnosticArtifact(
+					runId,
+					writeDiagnosticArtifact(runId, body),
+				),
+				null,
+			);
 		const token = "d".repeat(32);
 		const destination = join(resources, `provider-diagnostic-${token}.json`);
 		writeFileSync(

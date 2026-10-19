@@ -1,15 +1,13 @@
 // @test-phase: other
-import { ok, rejects, strictEqual } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { rmSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import { isPersistentFailureMetadata } from "../src/switchyard/adapter/exec-error.mjs";
 import {
-	acquireLaunchLock,
 	advanceState,
 	createEvent,
 	initializeRun,
-	LockError,
 	RevisionError,
 	readRun,
 	updateRun,
@@ -18,8 +16,6 @@ import {
 import {
 	makeOptions,
 	TEST_ROOT,
-	uniquePath,
-	uniqueRunId,
 	VM_ADMISSION_ROOT,
 } from "./helpers/run-store-fixtures.mjs";
 
@@ -42,16 +38,6 @@ afterEach(() => {
 	} catch {
 		// no-op
 	}
-});
-describe("lock file path resolution", () => {
-	it("acquireLaunchLock resolves relative paths to the same lock", async () => {
-		const path1 = uniquePath("tasks");
-		const runId = uniqueRunId();
-		await acquireLaunchLock(path1, runId);
-
-		const relPath = relative(process.cwd(), path1);
-		await rejects(acquireLaunchLock(relPath, uniqueRunId()), LockError);
-	});
 });
 describe("concurrent atomic writes", () => {
 	it("concurrent updateRun/createEvent never throw ENOENT and leave a valid run.json", async () => {
