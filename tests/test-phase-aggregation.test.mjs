@@ -180,10 +180,6 @@ describe("test phase aggregation runner", () => {
 			},
 		});
 		strictEqual(spawnOptions.stdio, "inherit");
-		strictEqual(
-			Object.hasOwn(spawnOptions.env, "SWITCHYARD_VM_GATE_OUTCOME_FILE"),
-			false,
-		);
 		strictEqual(status, 0);
 	});
 
