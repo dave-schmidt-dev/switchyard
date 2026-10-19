@@ -64,7 +64,7 @@ describe("test phase aggregation runner", () => {
 			// test:other is every remaining file, so a new file needs no re-pin.
 			// (O1 steps 5-7): 38 serial files left with the deleted detached,
 			// queue and VM modules; none moved lanes, leaving 44 serial files.
-			"3e55cce5b3b9f2965d9b32f237d76952b2ee5d1429852d4c14defacf32097664",
+			"fc011cb9ee569eece37529143c7b7ba1235944ce436d2357f2a0f8ff20020920",
 		);
 	});
 

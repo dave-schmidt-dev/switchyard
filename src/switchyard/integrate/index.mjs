@@ -12,6 +12,11 @@ import {
 function integrationGateUnsafe(diff, projectPath, options = {}) {
 	const { allowedPaths = null, requiredPaths = null } = options;
 	const declaredPaths = allowedPaths ?? requiredPaths;
+	// An executable opt-in is honoured only on a declared-path integration,
+	// where the exact allowlist below already requires every touched path
+	// to be declared.
+	const allowExecutables =
+		declaredPaths === null ? [] : (options.allowExecutables ?? []);
 
 	// Required-paths: empty diff check runs BEFORE patch normalization so we
 	// don't accidentally re-terminate an empty string into "\n" and treat it
@@ -88,7 +93,7 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 				: touchedPaths.filter((p) => !declaredSet.has(p));
 
 		if (missingPaths.length > 0) {
-			const validation = validateDiff(patch, projectPath);
+			const validation = validateDiff(patch, projectPath, { allowExecutables });
 			const result = {
 				success: false,
 				message: "required_paths_missing",
@@ -101,7 +106,7 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		}
 
 		if (extraPaths.length > 0) {
-			const validation = validateDiff(patch, projectPath);
+			const validation = validateDiff(patch, projectPath, { allowExecutables });
 			const result = {
 				success: false,
 				message: "undeclared_paths_touched",
@@ -116,7 +121,7 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		// Exact match — fall through to structural validation.
 	}
 
-	const validation = validateDiff(patch, projectPath);
+	const validation = validateDiff(patch, projectPath, { allowExecutables });
 	if (!validation.safe) {
 		const result = {
 			success: false,

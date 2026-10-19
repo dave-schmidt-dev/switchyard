@@ -115,6 +115,7 @@ export function createSimpleCheckSessions({
 	dirtyOverlayReceipt,
 	files,
 	allowManifests = [],
+	allowExecutables = [],
 	commands,
 	taskId,
 	deadlineMs,
@@ -373,6 +374,7 @@ export function createSimpleCheckSessions({
 			const result = integrationGate(diff, active.path, {
 				allowedPaths: files,
 				allowSensitiveManifests: allowManifests.length > 0,
+				allowExecutables,
 			});
 			if (!result.success) throw refused("check_candidate_rejected");
 			for (const { name, bytes } of needsNodePackages ? manifests : []) {

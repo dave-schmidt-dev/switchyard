@@ -6,6 +6,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- `simple --allow-executable <path>` lets one declared `--file` be created as, or changed from 100644 to, a regular executable file (100755), so a task can deliver a new test script without a manual chmod after integration. Every other new executable bit, a rename or copy that also sets it, and a symlink turned into an executable still fail with `executable_file_refused`; a diff with any touched name that is not valid UTF-8 or contains a newline receives no grant; a new `*.sh` script also needs `--allow-manifest`.
 - `switchyard-dispatch doctor [--quick] [--json]` gives a read-only host diagnosis: sandbox toolchain, provider CLI versions, bridge content pins, qualification expiry within 9 days, repair holds, stranded pending attempts, the canary LaunchAgent and any leftover retired VM reaper. Each check prints one line and its fix commands. Exit status is 0 when nothing failed, 1 on a failure and 2 on a usage error. `simple` prints a one-line quick-subset warning at start when a check finds a problem.
 - `simple --timeout <minutes>` provides a relative 1–30 minute alternative to `--deadline`.
 - Add optional `simple --estimate-minutes` admission before provider work, with deadline-fit diagnostics and a split recommendation for estimates of 20 minutes or more. Existing deadline caps and funding safeguards remain unchanged.

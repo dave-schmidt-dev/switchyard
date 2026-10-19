@@ -19,15 +19,20 @@ import {
 	SIMPLE_TARGET_ADAPTERS,
 } from "./target-adapters.mjs";
 import { MAX_ESTIMATE_MINUTES } from "./task-sizing.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) (--deadline <RFC3339> | --timeout <minutes>) [--estimate-minutes <minutes>] [--origin <work|qualification>] [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--allow-executable <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) (--deadline <RFC3339> | --timeout <minutes>) [--estimate-minutes <minutes>] [--origin <work|qualification>] [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
 --allow-manifest opts one declared --file that is a build/execution manifest
 (package.json, lockfiles, Makefile, Dockerfile, *.sh/*.bash, CI configs) into
 editing; repeat it per path. Any other manifest still fails closed.
+--allow-executable lets one declared --file be created as, or changed from
+100644 to, a regular executable file (100755); repeat it per path. It never
+admits a symlink, and every other new executable bit still fails closed. It is
+independent of --allow-manifest: a new *.sh script needs both.
 --report declares one repo-relative report path that must not already exist and
-is mutually exclusive with --file, --allow-manifest, --check and --dirty-overlay.
+is mutually exclusive with --file, --allow-manifest, --allow-executable, --check
+and --dirty-overlay.
 Report mode keeps only that path in the diff: any other changed path fails
 closed, a missing or empty report stops with report_missing, and success returns
 resultKind "report" with the report path, bytes and sha256.
@@ -133,7 +138,7 @@ function normalizeDeclaredPath(projectPath, value, flagName = "--file") {
 	}
 	return path;
 }
-function assertDeclaredPathBoundary(projectPath, path) {
+function assertDeclaredPathBoundary(projectPath, path, flagName = "--file") {
 	let current = projectPath;
 	const components = path.split("/");
 	for (let index = 0; index < components.length; index += 1) {
@@ -150,7 +155,7 @@ function assertDeclaredPathBoundary(projectPath, path) {
 			stats.isSymbolicLink() ||
 			(isFinal ? !stats.isFile() : !stats.isDirectory())
 		) {
-			throw new SimpleUsageError(`unsafe --file boundary: ${path}`);
+			throw new SimpleUsageError(`unsafe ${flagName} boundary: ${path}`);
 		}
 	}
 }
@@ -229,6 +234,7 @@ export function parseSimpleArgs(
 				capability: { type: "string" },
 				file: { type: "string", multiple: true },
 				"allow-manifest": { type: "string", multiple: true },
+				"allow-executable": { type: "string", multiple: true },
 				input: { type: "string", multiple: true },
 				report: { type: "string" },
 				"dirty-overlay": { type: "boolean", default: false },
@@ -308,6 +314,10 @@ export function parseSimpleArgs(
 			throw new SimpleUsageError(
 				"--report is mutually exclusive with --allow-manifest",
 			);
+		if ((parsed.values["allow-executable"] ?? []).length > 0)
+			throw new SimpleUsageError(
+				"--report is mutually exclusive with --allow-executable",
+			);
 		if ((parsed.values.check ?? []).length > 0)
 			throw new SimpleUsageError("--report is mutually exclusive with --check");
 		if (parsed.values["dirty-overlay"] === true)
@@ -360,6 +370,27 @@ export function parseSimpleArgs(
 				`--allow-manifest path is not a build/execution manifest: ${path}`,
 			);
 		}
+	}
+	const allowExecutables = (parsed.values["allow-executable"] ?? []).map(
+		(path) =>
+			normalizeDeclaredPath(canonicalProjectPath, path, "--allow-executable"),
+	);
+	if (new Set(allowExecutables).size !== allowExecutables.length) {
+		throw new SimpleUsageError("--allow-executable paths must be unique");
+	}
+	for (const path of allowExecutables) {
+		if (!files.includes(path)) {
+			throw new SimpleUsageError(
+				`--allow-executable path must also be declared with --file: ${path}`,
+			);
+		}
+		// Checked in every mode, --dirty-overlay included: an existing
+		// symlink or non-regular entry never becomes an executable grant.
+		assertDeclaredPathBoundary(
+			canonicalProjectPath,
+			path,
+			"--allow-executable",
+		);
 	}
 	const dirtyOverlay = parsed.values["dirty-overlay"] === true;
 	if (!dirtyOverlay) {
@@ -517,6 +548,7 @@ export function parseSimpleArgs(
 		files,
 		reportMode,
 		allowManifests,
+		allowExecutables,
 		readOnlyInputs: inputs,
 		dirtyOverlay,
 		predecessorReceiptPath,

@@ -136,6 +136,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 	const signal = dependencies.signal;
 	const reportMode = options.reportMode === true;
 	const reportPath = reportMode ? (options.files?.[0] ?? null) : null;
+	// Declared paths opted into a 100755 grant; only the provider's own
+	// declared diff receives it, never peer history or undeclared edits.
+	const allowExecutables = options.allowExecutables ?? [];
 	let provider = null;
 	let targetId = null;
 	let invocationDescriptor = null;
@@ -1210,6 +1213,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				dirtyOverlayReceipt,
 				files: scopeFiles,
 				allowManifests: options.allowManifests,
+				allowExecutables,
 				commands: [
 					...options.checks,
 					...(options.baselineChecks ?? []),
@@ -1734,7 +1738,9 @@ export async function runSimpleTask(options, dependencies = {}) {
 				paths: undeclaredScope.undeclared,
 			});
 		}
-		const validated = validateDiff(captured.diff, options.projectPath);
+		const validated = validateDiff(captured.diff, options.projectPath, {
+			allowExecutables,
+		});
 		if (
 			!validated.safe ||
 			(validated.requiresReview &&
@@ -1846,6 +1852,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						const formattedValidation = validateDiff(
 							capturedDiff.diff,
 							options.projectPath,
+							{ allowExecutables },
 						);
 						if (
 							!formattedValidation.safe ||
@@ -2033,6 +2040,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				const repairDiffValidation = validateDiff(
 					capturedDiff.diff,
 					options.projectPath,
+					{ allowExecutables },
 				);
 				if (
 					!repairDiffValidation.safe ||
@@ -2254,6 +2262,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				const correctedValidation = validateDiff(
 					capturedDiff.diff,
 					options.projectPath,
+					{ allowExecutables },
 				);
 				if (
 					!correctedValidation.safe ||
@@ -2417,6 +2426,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						dirtyOverlayReceipt,
 						files: scopeFiles,
 						allowManifests: options.allowManifests,
+						allowExecutables,
 						commands: options.checks,
 						taskId,
 						deadlineMs: options.deadlineMs,
@@ -2505,10 +2515,12 @@ export async function runSimpleTask(options, dependencies = {}) {
 					changedFiles,
 					allowedPaths: scopeFiles,
 					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
+					allowExecutables,
 				})
 			: integrationGate(capturedDiff.diff, options.projectPath, {
 					allowedPaths: scopeFiles,
 					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
+					allowExecutables,
 				});
 		if (!integration?.success) {
 			keepWorktree = true;

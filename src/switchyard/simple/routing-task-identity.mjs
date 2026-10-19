@@ -58,6 +58,11 @@ function stableScope(options) {
 		capability: options.capability ?? null,
 		files: sorted(options.files ?? []),
 		allowManifests: sorted(options.allowManifests ?? []),
+		// Present only when used, so identities recorded before the
+		// executable opt-in existed keep their hashes.
+		...((options.allowExecutables ?? []).length > 0
+			? { allowExecutables: sorted(options.allowExecutables) }
+			: {}),
 		readOnlyInputs: sorted(options.readOnlyInputs ?? []),
 		dirtyOverlay: options.dirtyOverlay === true,
 		reportMode: options.reportMode ?? null,

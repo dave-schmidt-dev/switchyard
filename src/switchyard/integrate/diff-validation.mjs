@@ -320,7 +320,46 @@ export function extractSummaryLines(diff, projectPath) {
 	};
 }
 
-export function validateDiff(diff, projectPath) {
+// The only two `git apply --summary` forms an executable opt-in can grant:
+// creating the exact path as 100755, or changing it from 100644 to 100755.
+// A rename or copy that also changes mode prints its `mode change` line with
+// no path, so it never matches and stays refused.
+const EXECUTABLE_GRANT_PATTERN =
+	/^ (?:create mode 100755|mode change 100644 => 100755) (.+)$/;
+
+/**
+ * Whether one executable summary line is granted by the caller's opt-in. The
+ * summary path is compared raw (never dequoted) against the opted-in paths.
+ * `--summary` prints names unquoted, so a newline inside any touched name could
+ * forge a summary line, and a name that is not valid UTF-8 decodes lossily to
+ * U+FFFD and could equal a different opted-in name; either grants nothing. Any
+ * 120000 summary entry that names the same path (a symlink turned into an
+ * executable) withholds the grant.
+ */
+function executableGranted(line, summaryLines, touchedPaths, allowExecutables) {
+	const match = EXECUTABLE_GRANT_PATTERN.exec(line);
+	if (
+		match === null ||
+		!allowExecutables.includes(match[1]) ||
+		touchedPaths.some((path) => /[\n\uFFFD]/u.test(path))
+	)
+		return false;
+	return !summaryLines.some(
+		(other) => other.includes("120000") && other.endsWith(` ${match[1]}`),
+	);
+}
+
+/**
+ * Structural safety validation of one patch.
+ *
+ * @param {string} diff Patch text.
+ * @param {string} projectPath Project root the patch targets.
+ * @param {{allowExecutables?: string[]}} [options] `allowExecutables` lists
+ *   declared repo-relative paths that may be created as, or changed to, a
+ *   regular executable file (100755). Every other executable bit is refused.
+ */
+export function validateDiff(diff, projectPath, options = {}) {
+	const allowExecutables = options.allowExecutables ?? [];
 	if (!diff || typeof diff !== "string" || !diff.trim()) {
 		return { safe: false, reason: "empty diff", reasonKind: "empty_diff" };
 	}
@@ -373,7 +412,10 @@ export function validateDiff(diff, projectPath) {
 				reasonKind: "symlink_creation_refused",
 			};
 		}
-		if (/mode 100755|=> 100755/.test(line)) {
+		if (
+			/mode 100755|=> 100755/.test(line) &&
+			!executableGranted(line, summaryLines, touchedPaths, allowExecutables)
+		) {
 			return {
 				safe: false,
 				reason: `diff introduces an executable file: ${line.trim()}`,
