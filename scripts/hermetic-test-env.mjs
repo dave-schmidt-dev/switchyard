@@ -33,14 +33,45 @@ export const SCRATCH_ROOT_ENV = "SWITCHYARD_TEST_SCRATCH_ROOT";
 /** The owner's real home, for host-ground-truth tests only. */
 const HOST_HOME_ENV = "SWITCHYARD_HOST_HOME";
 
+/**
+ * The repository-local Git variables, as `git rev-parse --local-env-vars`
+ * lists them. Git exports them to hooks, so a runner launched from one would
+ * hand its repository to every `git init` fixture below it.
+ */
+export const GIT_LOCAL_ENV_VARS = Object.freeze([
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_CONFIG",
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_COUNT",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_IMPLICIT_WORK_TREE",
+	"GIT_GRAFT_FILE",
+	"GIT_INDEX_FILE",
+	"GIT_NO_REPLACE_OBJECTS",
+	"GIT_REPLACE_REF_BASE",
+	"GIT_PREFIX",
+	"GIT_SHALLOW_FILE",
+	"GIT_COMMON_DIR",
+]);
+
 /** Removed so a child cannot reach the owner's config through an override. */
 const STRIPPED = Object.freeze([
 	"NODE_TEST_CONTEXT",
 	"GIT_CONFIG_SYSTEM",
-	"GIT_DIR",
-	"GIT_WORK_TREE",
-	"GIT_INDEX_FILE",
+	...GIT_LOCAL_ENV_VARS,
 ]);
+
+/**
+ * Drop the inherited repository-local Git variables from `env` itself, so the
+ * runner's own `git` calls and every child it spawns discover the repository
+ * from the working directory instead of from a hook's environment.
+ * @param {NodeJS.ProcessEnv} [env] Mutated in place.
+ */
+export function scrubInheritedGitEnv(env = process.env) {
+	for (const key of GIT_LOCAL_ENV_VARS) delete env[key];
+}
 
 const TEST_GITCONFIG = `[user]
 	name = Switchyard Test
@@ -138,9 +169,12 @@ export function ensureRunScratchRoot(env = process.env) {
 /**
  * Hold a per-run scratch root for this process's lifetime: create or inherit
  * it, and remove a root this process created on exit or on a fatal signal.
+ * Every runner entry calls this first, so it also drops inherited
+ * repository-local Git variables (see {@link scrubInheritedGitEnv}).
  * @returns {() => void} The cleanup, also registered for exit.
  */
 export function holdRunScratchRoot(env = process.env) {
+	scrubInheritedGitEnv(env);
 	const cleanup = ensureRunScratchRoot(env);
 	process.once("exit", cleanup);
 	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
