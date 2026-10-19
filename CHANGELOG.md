@@ -53,6 +53,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The seam-move and module-split refactor tooling (`check:seams`, `split:module`, their scripts and tests, and the direct `oxc-parser` devDependency).
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
 - The OpenCode Go bridge's fixed-runtime SHA-256 check (`verifyOpenCodeRuntime`), its test, and the matching OpenCode runtime part of `doctor`'s `bridge-pins` check.
+- The maintenance generation guard (`src/switchyard/maintenance/index.mjs`) and its test. Only the retired queue paths checked or wrote the cutover marker. `~/.agent/bin/metrics` and `prompts/_shared/expand.sh` still read `.plans/.cutovers/generation-in-progress.json` on their own, but nothing in Switchyard writes it any more, and the test that checked those readers is gone too.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
