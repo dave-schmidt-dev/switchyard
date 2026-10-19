@@ -187,13 +187,19 @@ export async function readBoundedStdin(
 export const schemePath = (path) => JSON.stringify(path);
 
 // Seatbelt regex literals do not honour backslash escapes, so each printable
-// non-alphanumeric byte becomes a one-character bracket class. Bytes that
-// cannot be bracketed safely, or that a byte-wise regex would split, refuse.
-function seatbeltRegexPath(path, fail) {
-	if (/[^\x20-\x7e]|[\]\\^"]/u.test(path))
-		fail("worktree path cannot be expressed in a seatbelt regex");
-	return path.replace(/[^A-Za-z0-9/]/gu, (byte) => `[${byte}]`);
-}
+// punctuation byte becomes a one-character bracket class and non-ASCII stays
+// raw. A byte no bracket can hold (] \ ^ " or a control) becomes ".", which
+// could match a sibling path; gitControlWriteRules bounds every regex with an
+// exact subpath, so the looser match never leaves this clone's .git.
+const seatbeltRegexPath = (path) =>
+	[...path]
+		.map((char) => {
+			if (/[A-Za-z0-9/]/u.test(char) || char.codePointAt(0) > 0x7f) return char;
+			return /[\x20-\x7e]/u.test(char) && !/[\]\\^"]/u.test(char)
+				? `[${char}]`
+				: ".";
+		})
+		.join("");
 
 // Git and the default macOS filesystem resolve .git names case-insensitively.
 const anyCase = (name) =>
@@ -206,19 +212,18 @@ const anyCase = (name) =>
  * removal), config (and its lock and worktree variants), hooks, info,
  * objects/info and refs/replace, then re-allow info/refs and
  * objects/info/packs (and the temp files update-server-info renames over
- * them). The index, objects, refs and logs stay writable. These rules are
- * early failure only: verifyGitControl stays the trust boundary.
+ * them). The index, objects, refs and logs stay writable. Every regex sits
+ * under an exact subpath of the clone's .git, so any worktree path works.
+ * These rules are early failure only: verifyGitControl stays the trust
+ * boundary.
  * @param {string} worktree Canonical worktree path.
- * @param {(reason: string) => never} [fail] Fail callback.
  * @returns {string[]} Profile lines; they must follow every write allow.
  */
-export function gitControlWriteRules(
-	worktree,
-	fail = createFail("simple-native-launcher-core"),
-) {
+export function gitControlWriteRules(worktree) {
 	const gitDir = join(worktree, ".git");
-	const prefix = `^${seatbeltRegexPath(gitDir, fail)}/`;
-	const regex = (tail) => `(regex #"${prefix}${tail}")`;
+	const within = `(subpath ${schemePath(gitDir)})`;
+	const prefix = `^${seatbeltRegexPath(gitDir)}/`;
+	const regex = (tail) => `(require-all ${within} (regex #"${prefix}${tail}"))`;
 	const denied = [
 		`(literal ${schemePath(gitDir)})`,
 		regex(anyCase("config")),

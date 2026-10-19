@@ -55,11 +55,8 @@ const hostEnv = (runtime) => ({
 	GIT_CONFIG_GLOBAL: "/dev/null",
 });
 
-function setup() {
-	const root = join(
-		realpathSync(tmpdir()),
-		`switchyard-simple-${randomUUID()}`,
-	);
+function setup(name = "switchyard-simple") {
+	const root = join(realpathSync(tmpdir()), `${name}-${randomUUID()}`);
 	const worktree = join(root, "worktree");
 	const runtime = join(root, ".runtime");
 	mkdirSync(worktree, { recursive: true });
@@ -126,7 +123,7 @@ const DENIED = [
 	"rename-git",
 ];
 
-async function runFixture(item, gitWorktree) {
+async function runFixture(item, gitWorktree, extraWrites = []) {
 	const cliPath = join(item.runtime, "fixture-provider.sh");
 	writeFileSync(cliPath, FIXTURE_PROVIDER, { mode: 0o755 });
 	const result = await runSandboxedNative({
@@ -136,7 +133,7 @@ async function runFixture(item, gitWorktree) {
 		env: hostEnv(item.runtime),
 		profile: baseSeatbeltRules({
 			reads: ["/"],
-			writes: [item.worktree, item.runtime],
+			writes: [item.worktree, item.runtime, ...extraWrites],
 			gitWorktree,
 		}),
 	});
@@ -252,20 +249,83 @@ test("both native launcher profiles end their write grants with the git-control 
 	}
 });
 
-test("git-control rules bracket-escape the path and refuse bytes a regex cannot hold", () => {
+test("git-control rules bracket-escape the path and bound every regex with the clone's .git", () => {
 	const [deny, allow] = gitControlWriteRules("/tmp/a.b-c_d/worktree");
+	const within = '(subpath "/tmp/a.b-c_d/worktree/.git")';
 	assert.ok(
 		deny.startsWith(
-			'(deny file-write* (literal "/tmp/a.b-c_d/worktree/.git") (regex #"^/tmp/a[.]b[-]c[_]d/worktree/[.]git/[cC][oO][nN][fF][iI][gG]")',
+			`(deny file-write* (literal "/tmp/a.b-c_d/worktree/.git") (require-all ${within} (regex #"^/tmp/a[.]b[-]c[_]d/worktree/[.]git/[cC][oO][nN][fF][iI][gG]"))`,
 		),
 	);
 	assert.match(
 		allow,
-		/\[pP\]\[aA\]\[cC\]\[kK\]\[sS\]\(_\[\^\/\]\*\)\?\$"\)\)$/u,
+		/\[pP\]\[aA\]\[cC\]\[kK\]\[sS\]\(_\[\^\/\]\*\)\?\$"\)\)\)$/u,
 	);
-	for (const bad of ['/tmp/q"uote', "/tmp/br]acket", "/tmp/caret^", "/tmp/é"])
-		assert.throws(
-			() => gitControlWriteRules(bad),
-			/cannot be expressed in a seatbelt regex/u,
+	for (const line of [deny, allow])
+		for (const rule of line.matchAll(/\(regex /gu))
+			assert.equal(
+				line.slice(rule.index - within.length - 1, rule.index - 1),
+				within,
+			);
+	// Bytes no bracket can hold become ".", non-ASCII stays raw, and nothing
+	// throws: a custom TMPDIR may hold any of these.
+	const [odd] = gitControlWriteRules('/w/q"u]o^t\\e\u0001é[$/worktree');
+	assert.ok(
+		odd.includes('(regex #"^/w/q.u.o.t.e.é[[][$]/worktree/[.]git/'),
+		odd,
+	);
+	for (const worktree of ["/w/é]^", '/w/q"\\'])
+		assert.ok(
+			claudeCodeSeatbeltProfile({
+				worktree,
+				runtime: "/r",
+				keychains: "/k",
+				cliRoot: "/cli",
+			}).includes(gitControlWriteRules(worktree)[0]),
 		);
+});
+
+test("the rules deny control writes under a worktree path no regex can spell exactly, and stop at that clone", async (t) => {
+	if (!seatbeltAvailable())
+		return t.skip("host Seatbelt unavailable under outer sandbox");
+	const item = setup('switchyard-odd é]^"\\[$');
+	// "]" and "^" both escape to ".", so this sibling's .git matches the
+	// clone's loosened regex; only the subpath bound keeps it writable.
+	const sibling = item.root.replace("é]", () => "é^");
+	const siblingConfig = join(sibling, "worktree", ".git", "config");
+	try {
+		mkdirSync(join(sibling, "worktree", ".git"), { recursive: true });
+		writeFileSync(siblingConfig, "[core]\n");
+		const config = join(item.worktree, ".git", "config");
+		const before = readFileSync(config);
+		const snapshot = snapshotGitControl(item.worktree);
+		assert.deepEqual(await runFixture(item, item.worktree, [sibling]), [
+			...ALLOWED.map((step) => `ok ${step}`),
+			...DENIED.map((step) => `denied ${step}`),
+		]);
+		assert.deepEqual(readFileSync(config), before);
+		verifyGitControl(item.worktree, snapshot);
+		const cliPath = join(item.runtime, "sibling-config.sh");
+		writeFileSync(
+			cliPath,
+			'#!/bin/sh\necho "[user]" >> "$SIBLING_CONFIG" && echo "ok sibling"\n',
+			{ mode: 0o755 },
+		);
+		const result = await runSandboxedNative({
+			worktree: item.worktree,
+			prompt: "fixture",
+			cliPath,
+			env: { ...hostEnv(item.runtime), SIBLING_CONFIG: siblingConfig },
+			profile: baseSeatbeltRules({
+				reads: ["/"],
+				writes: [item.worktree, item.runtime, sibling],
+				gitWorktree: item.worktree,
+			}),
+		});
+		assert.equal(result.stdout.trim(), "ok sibling", result.stderr);
+		assert.equal(readFileSync(siblingConfig, "utf8"), "[core]\n[user]\n");
+	} finally {
+		item.cleanup();
+		rmSync(sibling, { recursive: true, force: true });
+	}
 });
