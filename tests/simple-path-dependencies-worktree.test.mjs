@@ -144,4 +144,40 @@ describe("declaredPathDependencies from a linked worktree", () => {
 			refusal("path_dependency_outside_project_parent"),
 		);
 	});
+
+	// A subpackage's relative dependency on its own checkout resolves inside
+	// the worktree, not the main checkout, and stays granted as before.
+	it("keeps a subpackage's relative dependency on its own checkout", () => {
+		const repo = fixture("");
+		mkdirSync(join(repo.project, "pkg"));
+		mkdirSync(join(repo.project, "shared"));
+		writeFileSync(join(repo.project, "shared", "README"), "shared\n");
+		const relativeShared = `[tool.uv.sources]\ndep = { path = "../shared" }\n`;
+		writeFileSync(join(repo.project, "pkg", "pyproject.toml"), relativeShared);
+		commitAll(repo.project);
+		const outer = tempDir("switchyard-path-deps-outer-");
+		const worktree = join(outer, "wt");
+		git(repo.project, ["worktree", "add", "-q", "--detach", worktree]);
+		const pkg = join(worktree, "pkg");
+		deepStrictEqual(declaredPathDependencies(pkg), [
+			realpathSync(join(worktree, "shared")),
+		]);
+		// Unverified (the main checkout's pkg/ lacks this manifest): the read
+		// stays inside the worktree's own checkout, so it is still granted.
+		unlinkSync(join(pkg, "pyproject.toml"));
+		writeFileSync(
+			join(pkg, "package.json"),
+			'{"dependencies":{"dep":"file:../shared"}}\n',
+		);
+		deepStrictEqual(declaredPathDependencies(pkg), [
+			realpathSync(join(worktree, "shared")),
+		]);
+		// Under .claude/worktrees the resolved path holds a dot-directory, which
+		// refuses exactly as it did before worktrees were mapped.
+		const pkgInDot = join(linkedWorktree(repo), "pkg");
+		throws(
+			() => declaredPathDependencies(pkgInDot),
+			refusal("path_dependency_dot_directory"),
+		);
+	});
 });

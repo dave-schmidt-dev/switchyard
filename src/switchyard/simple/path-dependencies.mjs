@@ -16,9 +16,10 @@
  *
  * For a linked git worktree, "the project's parent" is the parent its main
  * checkout has, so a worktree gets exactly its main checkout's grant; one whose
- * main checkout cannot be verified gets no out-of-project grant (stability
- * follow-up, 2026-10-19). A relative declared path still resolves against the
- * worktree itself.
+ * main checkout cannot be verified gets no grant outside its own checkout
+ * (stability follow-up, 2026-10-19). A relative declared path still resolves
+ * against the worktree itself, and a subdirectory project keeps its own parent
+ * for reads inside the worktree.
  */
 import { spawnSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -72,14 +73,15 @@ function realOrNull(path) {
 }
 
 /**
- * The folder holding the repository and its siblings, or null for a linked
- * worktree whose main checkout cannot be verified, which gets no out-of-project
- * grant. A directory git does not recognise, or one that is its own main
- * checkout (including a submodule or a separate git dir), keeps
- * `dirname(project)`. A linked worktree gets the parent the same directory
- * has in its main checkout, and only when the common dir is `<repo>/.git`,
- * `<repo>` is a non-bare checkout whose matching directory holds one of the
- * project's `manifests`, and `<repo>` lists the worktree as a linked one.
+ * The folders a declared path may sit strictly inside, and whether a refusal
+ * is for an unverified linked worktree. A directory git does not recognise, or
+ * one that is its own main checkout (including a submodule or a separate git
+ * dir), gets `dirname(project)`. A linked worktree gets the parent the same
+ * directory has in its main checkout, and only when the common dir is
+ * `<repo>/.git`, `<repo>` is a non-bare checkout whose matching directory holds
+ * one of the project's `manifests`, and `<repo>` lists the worktree as a
+ * linked one. A worktree project below the worktree root also keeps
+ * `dirname(project)`, which lies inside its own checkout, verified or not.
  *
  * Residual: git cannot tell a separate git dir named `.git` from an ordinary
  * checkout, so a directory holding such a git dir and the manifest passes for
@@ -87,7 +89,8 @@ function realOrNull(path) {
  * check clone, which could just as well move the checkout itself; the
  * owner-approved rule is location-based either way.
  */
-function projectParent(project, manifests) {
+function grantRoots(project, manifests) {
+	const unverified = (roots = []) => ({ roots, unverified: true });
 	const dirs = gitOutput(project, [
 		"rev-parse",
 		"--path-format=absolute",
@@ -95,16 +98,18 @@ function projectParent(project, manifests) {
 		"--git-common-dir",
 		"--show-toplevel",
 	]);
-	if (dirs === null) return dirname(project);
+	const own = { roots: [dirname(project)], unverified: false };
+	if (dirs === null) return own;
 	const lines = dirs.replace(/\n$/u, "").split("\n");
-	if (lines.length !== 3) return null;
+	if (lines.length !== 3) return unverified();
 	const [gitDir, commonDir, topLevel] = lines.map(realOrNull);
-	if (!gitDir || !commonDir || !topLevel) return null;
-	if (gitDir === commonDir) return dirname(project);
-	if (basename(commonDir) !== ".git") return null;
-	const repoRoot = dirname(commonDir);
+	if (!gitDir || !commonDir || !topLevel) return unverified();
+	if (gitDir === commonDir) return own;
 	const inTree = relative(topLevel, project);
-	if (inTree.startsWith("..") || isAbsolute(inTree)) return null;
+	if (inTree.startsWith("..") || isAbsolute(inTree)) return unverified();
+	const inCheckout = inTree ? [dirname(project)] : [];
+	if (basename(commonDir) !== ".git") return unverified(inCheckout);
+	const repoRoot = dirname(commonDir);
 	const mainProject = join(repoRoot, inTree);
 	const listing = gitOutput(repoRoot, [
 		"worktree",
@@ -112,7 +117,7 @@ function projectParent(project, manifests) {
 		"--porcelain",
 		"-z",
 	]);
-	if (!listing) return null;
+	if (!listing) return unverified(inCheckout);
 	const records = listing
 		.split("\0\0")
 		.map((record) => record.split("\0"))
@@ -130,8 +135,8 @@ function projectParent(project, manifests) {
 		!manifests.some((name) => isFile(join(mainProject, name))) ||
 		!listed.slice(1).includes(topLevel)
 	)
-		return null;
-	return dirname(mainProject);
+		return unverified(inCheckout);
+	return { roots: [dirname(mainProject), ...inCheckout], unverified: false };
 }
 
 function isFile(path) {
@@ -281,7 +286,7 @@ function credentialFile(name) {
 }
 
 /** Return the realpath to grant, null when no grant is needed, or throw. */
-function acceptedPath(project, { name, path }, parentOf) {
+function acceptedPath(project, { name, path }, rootsOf) {
 	if (!path || path.includes("\0"))
 		throw refused(name, "path_dependency_invalid");
 	const declared = resolve(project, path);
@@ -298,11 +303,14 @@ function acceptedPath(project, { name, path }, parentOf) {
 		directory = lstatSync(real).isDirectory();
 	} catch {}
 	if (!directory) throw refused(name, "path_dependency_not_directory");
-	const parent = parentOf();
-	if (parent === null)
-		throw refused(name, "path_dependency_worktree_unverified");
-	if (!real.startsWith(`${parent}${sep}`))
-		throw refused(name, "path_dependency_outside_project_parent");
+	const { roots, unverified } = rootsOf();
+	if (!roots.some((root) => real.startsWith(`${root}${sep}`)))
+		throw refused(
+			name,
+			unverified
+				? "path_dependency_worktree_unverified"
+				: "path_dependency_outside_project_parent",
+		);
 	if (hasDotDirectory(path) || hasDotDirectory(real))
 		throw refused(name, "path_dependency_dot_directory");
 	let entries;
@@ -333,20 +341,18 @@ export function declaredPathDependencies(projectPath) {
 		...(pyproject ? uvPathSources(pyproject) : []),
 		...(npm ? npmFileSources(npm) : []),
 	];
-	// Git runs once, and only when a declared path needs the parent rule; null
-	// (an unverified worktree) is a cached answer too.
-	let parent;
-	const parentOf = () => {
-		if (parent === undefined)
-			parent = projectParent(
-				project,
-				[pyproject && "pyproject.toml", npm && "package.json"].filter(Boolean),
-			);
-		return parent;
+	// Git runs once, and only when a declared path needs the parent rule.
+	let grant;
+	const rootsOf = () => {
+		grant ??= grantRoots(
+			project,
+			[pyproject && "pyproject.toml", npm && "package.json"].filter(Boolean),
+		);
+		return grant;
 	};
 	const accepted = new Set();
 	for (const source of sources) {
-		const real = acceptedPath(project, source, parentOf);
+		const real = acceptedPath(project, source, rootsOf);
 		if (real) accepted.add(real);
 	}
 	return [...accepted];
