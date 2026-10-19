@@ -175,15 +175,12 @@ function tapSummary(output, exitCode) {
 }
 
 function runMutationSuite(root, mutation, run) {
-	const child = withHermeticTestEnv(
-		// Mutation runs never boot a VM, even when the caller opted in.
-		{ ...process.env, SWITCHYARD_LIVE_VM_TESTS: "0" },
-		(env) =>
-			run(
-				process.execPath,
-				["--test", "--test-reporter=tap", ...mutation.tests],
-				{ cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env },
-			),
+	const child = withHermeticTestEnv(process.env, (env) =>
+		run(
+			process.execPath,
+			["--test", "--test-reporter=tap", ...mutation.tests],
+			{ cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env },
+		),
 	);
 	const output = `${child.stdout ?? ""}${child.stderr ?? ""}`;
 	return { output, summary: tapSummary(output, child.status ?? 1) };

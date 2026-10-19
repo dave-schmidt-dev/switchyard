@@ -6,15 +6,11 @@ import { after, afterEach, before, describe, it } from "node:test";
 import {
 	__resetRosterCacheForTests,
 	computeRosterSha,
-	getInvocationDescriptorIdentity,
 	resolveRouteProvenance,
 	resolveTargetProvenance,
-	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import { executeTaskAsync } from "../src/switchyard/runner/index.mjs";
 import {
 	FIXTURE_PATH,
-	PROVENANCE_KEYS,
 	previousHomeDir,
 	previousRosterPath,
 	setHomeDir,
@@ -41,121 +37,6 @@ after(() => {
 	setHomeDir(previousHomeDir);
 	__resetRosterCacheForTests();
 });
-function fixtureTaskBase(taskId = "1.1") {
-	return {
-		ref: `refs/switchyard/task-base/provenance/${taskId}`,
-		tree: "5".repeat(40),
-	};
-}
-function taskBaseContext() {
-	return {
-		queueBackend: {
-			captureTaskBase: (_workspaceId, { taskId }) => fixtureTaskBase(taskId),
-			captureTaskBaseAsync: async (_workspaceId, { taskId }) =>
-				fixtureTaskBase(taskId),
-			validateTaskBase: (_workspaceId, base) => base,
-			validateTaskBaseAsync: async (_workspaceId, base) => base,
-		},
-		taskBases: {},
-	};
-}
-function stubBroker({ route, descriptor, adapters }) {
-	const selectedRoute = {
-		...route,
-		effort: null,
-		reason: "spread",
-		snapshotIdentity: {
-			source: "fixture",
-			status: "fresh",
-			mtime: null,
-			ageMs: 0,
-		},
-		reservation: null,
-	};
-	return {
-		selectAndReserve: async (request) => ({
-			...selectedRoute,
-			capability: request.capability,
-		}),
-		launcherIdentity: (selected) => ({
-			provider: selected.provider,
-			resolvedTarget: selected.resolvedTarget,
-			harness: selected.harness,
-			model: selected.model,
-			effort: selected.effort,
-			descriptorIdentity: descriptor.descriptor_identity,
-			reservationId: null,
-		}),
-		execute: async (_request, selected) => {
-			const adapter = adapters[selected.harness];
-			const execution = await adapter.executeAsync("prompt", "vm", {});
-			return { success: execution?.success === true };
-		},
-		release: async () => {},
-	};
-}
-function makeContext({ provider, model, adapters }) {
-	const dispatches = [];
-	const targetId =
-		provider === "OpenCode Go"
-			? "opencode-go"
-			: provider === "Claude"
-				? "claude-code"
-				: provider;
-	const harness = provider === "OpenCode Go" ? "opencode" : "claude";
-	const descriptor = syntheticDescriptor({ targetId, model, harness });
-	const resolvedAdapters = adapters ?? {};
-	return {
-		context: {
-			...taskBaseContext(),
-			broker: stubBroker({
-				route: {
-					provider,
-					model,
-					resolvedTarget: targetId,
-					harness,
-				},
-				descriptor,
-				adapters: resolvedAdapters,
-			}),
-			resolveDescriptor: () => descriptor,
-			adapters: resolvedAdapters,
-			recordDispatch: (d) => dispatches.push(d),
-			recordDispatchIntent: () => {},
-			integrationGate: () => ({ success: true }),
-			projectPath: "/tmp/does-not-matter",
-			workingContainerName: "test-container",
-			exclude: [],
-		},
-		dispatches,
-	};
-}
-function syntheticDescriptor({ targetId, model, harness }) {
-	const core = {
-		target_id: targetId,
-		model_ref: model,
-		selector: model,
-		effort: null,
-		variant: null,
-		invocation_args: [],
-	};
-	return validateInvocationDescriptor(
-		{
-			...core,
-			descriptor_identity: getInvocationDescriptorIdentity(core, harness),
-		},
-		harness,
-	);
-}
-const TASK = {
-	id: "T-1",
-	title: "trivial task",
-	description: "trivial task",
-	prompt: "do the thing",
-	requiredCapability: "low",
-	requiredCapabilityJustification: "The task is a bounded mechanical change.",
-	requiredPaths: null,
-};
 describe("computeRosterSha — pure, excludes qualifications (PM-12/SR-4)", () => {
 	// Two rosters identical except for the mutable qualifications block.
 	const base = {
@@ -310,91 +191,5 @@ describe("resolveTargetProvenance / resolveRouteProvenance — target resolution
 			resolved_selector: null,
 			resolved_credential_profile: null,
 		});
-	});
-});
-describe("executeTask — every dispatch record carries all six provenance fields", () => {
-	it("carries provenance on the SUCCESS path (opencode-go via its adapter)", async () => {
-		let executed = 0;
-		const { context, dispatches } = makeContext({
-			provider: "OpenCode Go",
-			model: "fixture/opencode-low",
-			adapters: {
-				opencode: {
-					executeAsync: async () => {
-						executed += 1;
-						return { success: true };
-					},
-					captureDiffAsync: async () => "",
-				},
-			},
-		});
-
-		const result = await executeTaskAsync(TASK, context);
-		strictEqual(executed, 1);
-		strictEqual(result.result, "success_no_diff");
-
-		strictEqual(dispatches.length, 1);
-		const rec = dispatches[0];
-		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
-		strictEqual(rec.requiredCapability, "low");
-		strictEqual(result.requiredCapability, "low");
-		strictEqual(rec.roster_schema_version, 1);
-		ok(/^[0-9a-f]{64}$/.test(rec.roster_sha256));
-		strictEqual(rec.resolved_target, "opencode-go");
-		strictEqual(rec.resolved_harness, "opencode");
-		// credential_profile metadata (M1b) is recorded on the dispatch, not
-		// passed to the adapter.
-		strictEqual(rec.resolved_credential_profile, "go");
-	});
-
-	it("carries provenance on the UNSUPPORTED_PROVIDER path too (no record can omit it)", async () => {
-		// Claude normalizes to harness "claude" but no adapter is registered ->
-		// unsupported_provider. The record must still carry provenance.
-		const { context, dispatches } = makeContext({
-			provider: "Claude",
-			model: "fixture-claude-high",
-			adapters: {},
-		});
-
-		const result = await executeTaskAsync(TASK, context);
-		strictEqual(result.result, "unsupported_provider");
-
-		const rec = dispatches[0];
-		for (const key of PROVENANCE_KEYS) ok(key in rec, `record missing ${key}`);
-		strictEqual(rec.resolved_target, "claude-code");
-		strictEqual(rec.resolved_harness, "claude");
-		// claude-code is qualified at every tier, so the selector is a real claude
-		// selector regardless of the classified tier.
-		ok(
-			typeof rec.resolved_selector === "string" &&
-				rec.resolved_selector.startsWith("fixture-claude-"),
-			`expected a claude selector, got ${rec.resolved_selector}`,
-		);
-	});
-
-	it("attaches the six fields onto routeResult itself", async () => {
-		// The async queue selects through the broker, which normalizes the
-		// routed result before executeTaskAsync merges provenance, so the route
-		// result carrying the six fields is the one the runner retains for its
-		// completion path — not the raw object a sync route() callback returned.
-		const { context } = makeContext({
-			provider: "OpenCode Go",
-			model: "fixture/opencode-low",
-			adapters: {
-				opencode: {
-					executeAsync: async () => ({ success: true }),
-					captureDiffAsync: async () => "",
-				},
-			},
-		});
-		await executeTaskAsync(TASK, context);
-		const routeResult = context._activeCompletionRoute;
-		for (const key of PROVENANCE_KEYS) {
-			ok(key in routeResult, `routeResult missing ${key}`);
-		}
-		strictEqual(routeResult.resolved_target, "opencode-go");
-		strictEqual(routeResult.resolved_harness, "opencode");
-		strictEqual(routeResult.resolved_credential_profile, "go");
-		strictEqual(routeResult.requiredCapability, "low");
 	});
 });

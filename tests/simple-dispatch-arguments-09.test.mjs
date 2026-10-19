@@ -240,7 +240,7 @@ describe("simple dispatch argument boundary", () => {
 			strictEqual(threw, true, path);
 		}
 	});
-	it("keeps legacy run help available while adding simple help", () => {
+	it("serves simple help and rejects the retired run subcommand", () => {
 		const simple = spawnSync(
 			process.execPath,
 			[DISPATCH_PATH, "simple", "--help"],
@@ -250,14 +250,14 @@ describe("simple dispatch argument boundary", () => {
 		);
 		strictEqual(simple.status, 0);
 		ok(simple.stdout.includes("switchyard-dispatch simple"));
-		const legacy = spawnSync(
+		const retired = spawnSync(
 			process.execPath,
 			[DISPATCH_PATH, "run", "--help"],
 			{
 				encoding: "utf8",
 			},
 		);
-		strictEqual(legacy.status, 0);
-		ok(legacy.stdout.includes("switchyard-dispatch run"));
+		strictEqual(retired.status, 2);
+		ok(retired.stderr.includes("unknown subcommand: run"));
 	});
 });

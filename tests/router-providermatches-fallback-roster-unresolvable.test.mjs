@@ -155,11 +155,10 @@ describe("providerMatches fallback for roster-unresolvable identifiers", () => {
 		// guard were deleted, because the fallback above would then quietly
 		// match "CODEX" to the "Codex" snapshot name instead.
 		//
-		// The mixed case itself is a PRECONDITION, not a bug to fix here: the
-		// CLI lowercases every provider filter in normalizeProviders()
-		// (src/switchyard/runner/index.mjs:171), so only a programmatic
-		// runQueue caller bypassing normalizeRunOptions can hand the router a
-		// mixed-case identifier. If case-insensitive target-id resolution is
+		// The mixed case itself is a PRECONDITION, not a bug to fix here:
+		// roster target ids are lowercase, so only a programmatic caller can
+		// hand the router a mixed-case identifier. If case-insensitive
+		// target-id resolution is
 		// ever added to resolveTargetIdentityFromTargets, revisit this.
 		const rosterPath = join(
 			tmpdir(),

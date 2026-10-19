@@ -2,14 +2,14 @@
 /**
  * `switchyard-dispatch` entry point.
  *
- * `simple`, the default lane, runs without loading the legacy queue, VM and
- * detached modules: every other subcommand imports them from `./cli.mjs` only
- * when it runs, so an import-time defect there cannot stop a simple dispatch.
+ * `simple`, the default lane, runs without loading the recovery and
+ * route-health modules: every other subcommand imports them from `./cli.mjs`
+ * only when it runs, so an import-time defect there cannot stop a simple
+ * dispatch.
  * `doctor` loads only its own read-only probes.
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { CallerInputValidationError } from "../runner/checkpoint-errors.mjs";
 import { handleSimple } from "../simple/index.mjs";
 import { USAGE, UsageError } from "./cli-usage.mjs";
 
@@ -47,11 +47,7 @@ if (
 	try {
 		await main(process.argv.slice(2));
 	} catch (error) {
-		if (
-			error instanceof UsageError ||
-			error instanceof CallerInputValidationError ||
-			error?.name === "CheckpointIdentityError"
-		) {
+		if (error instanceof UsageError) {
 			console.error(`dispatch: ${error.message}\n`);
 			console.error(USAGE);
 			process.exitCode = 2;

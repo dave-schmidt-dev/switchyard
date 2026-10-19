@@ -12,8 +12,3 @@ import { shellQuote } from "./cli-args.mjs";
 export function recoveryCommandFor(runId) {
 	return `switchyard-dispatch recover --run ${runId} --state-root ${shellQuote(getStateRoot())}`;
 }
-
-/** @returns {string} The orphaned-lock remediation command for this state root. */
-export function remediationCommandFor() {
-	return `switchyard-dispatch remediate-orphaned-locks --state-root ${shellQuote(getStateRoot())}`;
-}

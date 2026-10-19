@@ -200,7 +200,7 @@ async function loaded(label) {
 	return !answer.error;
 }
 
-/** Plist presence, launchctl load state, canary state and reaper script drift. */
+/** Plist presence, launchctl load state and canary state; reaper presence only. */
 export async function probeLaunchAgents({
 	home = homedir(),
 	env = process.env,
@@ -215,11 +215,9 @@ export async function probeLaunchAgents({
 			readFileSync(join(stateDir, "canary-state.json"), "utf8"),
 		);
 	} catch {}
-	const [canaryLoaded, reaperLoaded, installed, source] = await Promise.all([
+	const [canaryLoaded, reaperLoaded] = await Promise.all([
 		loaded(CANARY_LABEL),
 		loaded(REAPER_LABEL),
-		sha256File(join(support, "switchyard-reaper.sh")),
-		sha256File(join(REPO_ROOT, "ops/switchyard-reaper.sh")),
 	]);
 	return {
 		canary: {
@@ -230,7 +228,6 @@ export async function probeLaunchAgents({
 		reaper: {
 			plist: existsSync(join(agents, `${REAPER_LABEL}.plist`)),
 			loaded: reaperLoaded,
-			scriptCurrent: installed === null ? null : installed === source,
 		},
 	};
 }

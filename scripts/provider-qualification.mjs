@@ -8,7 +8,7 @@ import {
 	planRepresentativeQualification,
 	runRepresentativeQualification,
 } from "../src/switchyard/diagnostics/provider-qualification.mjs";
-import { readRun } from "../src/switchyard/run-store/index.mjs";
+import { readRun } from "../src/switchyard/run-store/run-records.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DISPATCH = join(ROOT, "src/switchyard/dispatch/index.mjs");

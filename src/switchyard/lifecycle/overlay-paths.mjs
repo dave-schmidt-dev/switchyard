@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { hostname } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 
 const TASK_BASE_REF_PREFIX = "refs/switchyard/task-base";
 const ZERO_OBJECT_ID = "0".repeat(40);
@@ -128,25 +128,9 @@ function overlayFingerprint(projectPath) {
 		.update(stableJson([hostname(), realpathSync(projectPath), gitDir]), "utf8")
 		.digest("hex")}`;
 }
-function assertReceiptParentSafe(receiptPath) {
-	const parent = dirname(resolve(receiptPath));
-	const stats = lstatSync(parent);
-	const ownerUid =
-		typeof process.getuid === "function" ? process.getuid() : null;
-	if (
-		!stats.isDirectory() ||
-		stats.isSymbolicLink() ||
-		(ownerUid !== null && stats.uid !== ownerUid) ||
-		(stats.mode & 0o022) !== 0
-	)
-		throw new Error(
-			"dirty overlay receipt parent is not a private regular directory",
-		);
-}
 
 export {
 	assertOverlayPathSafe,
-	assertReceiptParentSafe,
 	DIRTY_OVERLAY_MAX_FILE_BYTES,
 	DIRTY_OVERLAY_SECRET_PATHS,
 	DIRTY_OVERLAY_VERSION,

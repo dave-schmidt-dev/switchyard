@@ -10,11 +10,8 @@ import { tempDir } from "./helpers/tempdir.mjs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
 const VM_OPS = resolve(PKG_ROOT, "ops/macos-vm");
-const BUILD = resolve(VM_OPS, "build-golden-image.sh");
 const GENERATOR = resolve(VM_OPS, "generate-cli-manifest.sh");
 const MANIFEST = resolve(VM_OPS, "cli-manifest.txt");
-const IS_DARWIN = process.platform === "darwin";
-const notDarwin = { skip: IS_DARWIN ? false : "macOS-only ops lane" };
 const REQUIRED_PROVIDERS = [
 	"claude",
 	"codex",
@@ -52,32 +49,7 @@ const extractShellFunction = (body, name) => {
 };
 const scratch = () => tempDir("switchyard-vm-ops-");
 describe("the pinned CLI manifest", () => {
-	it("passes build-golden-image.sh's own validator", notDarwin, () => {
-		const body = readFileSync(BUILD, "utf8");
-		const dir = scratch();
-		const harness = join(dir, "validate.sh");
-		// log() and fail() are what the validator reports through; take them
-		// from the same file rather than restating them.
-		writeFileSync(
-			harness,
-			[
-				"#!/bin/bash",
-				"set -Eeuo pipefail",
-				'readonly SCRIPT_NAME="validator-harness"',
-				extractShellFunction(body, "log"),
-				extractShellFunction(body, "fail"),
-				extractShellFunction(body, "validate_cli_manifest"),
-				`CLI_MANIFEST=${JSON.stringify(MANIFEST)}`,
-				"validate_cli_manifest",
-				'printf "MANIFEST OK\\n"',
-			].join("\n"),
-		);
-		const r = spawnSync("bash", [harness], { encoding: "utf8" });
-		strictEqual(r.status, 0, `validator rejected the manifest: ${r.stderr}`);
-		ok(r.stdout.includes("MANIFEST OK"));
-	});
-
-	it("covers exactly the providers the build asserts on PATH", () => {
+	it("covers exactly the provider CLIs the host sync pins", () => {
 		const rows = readManifestRows();
 		strictEqual(rows.length, REQUIRED_PROVIDERS.length);
 		const providers = rows.map((row) => row.provider).sort();
@@ -125,60 +97,6 @@ describe("the pinned CLI manifest", () => {
 			}
 		}
 	});
-
-	it(
-		"validator rejects a five-field row and an npm version mismatch",
-		notDarwin,
-		() => {
-			const body = readFileSync(BUILD, "utf8");
-			const validate = (manifestContent) => {
-				const dir = scratch();
-				const manifestPath = join(dir, "cli-manifest.txt");
-				writeFileSync(manifestPath, manifestContent);
-				const harness = join(dir, "validate.sh");
-				writeFileSync(
-					harness,
-					[
-						"#!/bin/bash",
-						"set -Eeuo pipefail",
-						'readonly SCRIPT_NAME="validator-harness"',
-						extractShellFunction(body, "log"),
-						extractShellFunction(body, "fail"),
-						extractShellFunction(body, "validate_cli_manifest"),
-						`CLI_MANIFEST=${JSON.stringify(manifestPath)}`,
-						"validate_cli_manifest",
-					].join("\n"),
-				);
-				return spawnSync("bash", [harness], { encoding: "utf8" });
-			};
-
-			const goodManifest = readFileSync(MANIFEST, "utf8");
-
-			// Five-field row (missing sixth column)
-			const fiveField = goodManifest.replace(
-				/^(claude\|script\|[^|]+\|[^|]+\|[^|]+)\|.*$/m,
-				"$1",
-			);
-			const rFive = validate(fiveField);
-			strictEqual(
-				rFive.status,
-				1,
-				`validator accepted 5-field row: ${rFive.stdout}`,
-			);
-
-			// npm row whose version differs from detail
-			const npmMismatch = goodManifest.replace(
-				/^(opencode\|npm\|opencode-ai\|[0-9.]+)\|([0-9a-f]{64})\|([0-9.]+)$/m,
-				"$1|$2|999.999.999",
-			);
-			const rMismatch = validate(npmMismatch);
-			strictEqual(
-				rMismatch.status,
-				1,
-				`validator accepted npm version mismatch: ${rMismatch.stdout}`,
-			);
-		},
-	);
 
 	it("is generated, and says so, so no one hand-edits a hash", () => {
 		const header = readFileSync(MANIFEST, "utf8");

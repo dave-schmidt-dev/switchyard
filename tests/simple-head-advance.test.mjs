@@ -11,7 +11,7 @@ import {
 import {
 	captureDirtyOverlay,
 	validateDirtyOverlayReceipt,
-} from "../src/switchyard/lifecycle/index.mjs";
+} from "../src/switchyard/lifecycle/dirty-overlay.mjs";
 import { headAdvanceSafe } from "../src/switchyard/simple/head-advance.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";

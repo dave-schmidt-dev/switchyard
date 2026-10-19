@@ -20,6 +20,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const QUALIFICATION_WARN_DAYS = 9;
 /** The canary runs daily; a state older than this means it stopped. */
 const CANARY_STALE_MS = 2 * DAY_MS;
+const REAPER_LABEL = "com.zerodelta.switchyard.reaper";
+const REAPER_UNINSTALL = `launchctl bootout gui/$(id -u)/${REAPER_LABEL}; rm -f ~/Library/LaunchAgents/${REAPER_LABEL}.plist ~/Library/Application\\ Support/switchyard/switchyard-reaper.sh`;
 export const SANDBOX_TOOLS = Object.freeze(["node", "npm", "uv"]);
 const TOOL_FORMULA = { node: "node", npm: "node", uv: "uv" };
 const DISPATCH = "switchyard-dispatch";
@@ -196,6 +198,10 @@ export function checkBridgePins(probe) {
 		fixes.push(
 			`owner: re-pin the changed bridge in ${probe.registryPath} after review (bws-secret-exec refuses it until then)`,
 		);
+	if (failures.some((line) => line.endsWith(": executable missing")))
+		fixes.push(
+			`owner: remove retired consumers from ${probe.registryPath}, or restore their executables`,
+		);
 	if (probe.runtime && !probe.runtime.ok)
 		fixes.push(
 			`restore the pinned OpenCode 1.18.30 binary at ${probe.runtime.path}`,
@@ -353,9 +359,10 @@ export function checkStrandedPending(probe) {
 }
 
 /**
- * Sandbox-canary and reaper LaunchAgent install state.
+ * Sandbox-canary LaunchAgent install state, plus the retired VM reaper, which
+ * must be gone: its copied script outlives the repo files it came from.
  * @param {{canary: {plist: boolean, loaded: boolean, state?: object|null},
- *   reaper: {plist: boolean, loaded: boolean, scriptCurrent: boolean|null}}} probe
+ *   reaper: {plist: boolean, loaded: boolean}}} probe
  * @param {number} nowMs
  */
 export function checkLaunchAgents(probe, nowMs) {
@@ -380,23 +387,11 @@ export function checkLaunchAgents(probe, nowMs) {
 				"read ~/Library/Logs/switchyard-sandbox-canary.launchd.err.log",
 			);
 	}
-	if (!reaper.plist || !reaper.loaded || reaper.scriptCurrent !== true) {
-		problems.push(
-			!reaper.plist
-				? "reaper not installed"
-				: !reaper.loaded
-					? "reaper not loaded"
-					: reaper.scriptCurrent === null
-						? "installed reaper script missing"
-						: "installed reaper script differs from ops/switchyard-reaper.sh",
-		);
-		fixes.push("ops/install-reaper.sh");
+	if (reaper.plist || reaper.loaded) {
+		problems.push("retired VM reaper LaunchAgent still installed");
+		fixes.push(REAPER_UNINSTALL);
 	}
 	if (problems.length === 0)
-		return result(
-			id,
-			STATUS.OK,
-			"canary and reaper installed, loaded and current",
-		);
+		return result(id, STATUS.OK, "canary installed, loaded and current");
 	return result(id, STATUS.WARN, problems.join("; "), fixes);
 }

@@ -166,7 +166,7 @@ describe("doctor host checks", () => {
 		strictEqual(checkBridgePins({ ...base, hashes: {} }).status, "fail");
 	});
 
-	it("reports canary and reaper install state", () => {
+	it("reports canary install state and a leftover retired reaper", () => {
 		const good = {
 			canary: {
 				plist: true,
@@ -176,7 +176,7 @@ describe("doctor host checks", () => {
 					lastStatus: "passed",
 				},
 			},
-			reaper: { plist: true, loaded: true, scriptCurrent: true },
+			reaper: { plist: false, loaded: false },
 		};
 		strictEqual(checkLaunchAgents(good, NOW).status, "ok");
 		const stale = checkLaunchAgents(
@@ -194,17 +194,21 @@ describe("doctor host checks", () => {
 		);
 		strictEqual(stale.status, "warn");
 		match(stale.summary, /canary has not run in 2 days/u);
-		const drift = checkLaunchAgents(
-			{ ...good, reaper: { ...good.reaper, scriptCurrent: false } },
+		const leftover = checkLaunchAgents(
+			{ ...good, reaper: { plist: true, loaded: false } },
 			NOW,
 		);
-		match(drift.summary, /installed reaper script differs/u);
-		deepStrictEqual(drift.fixes, ["ops/install-reaper.sh"]);
+		strictEqual(leftover.status, "warn");
+		match(leftover.summary, /retired VM reaper LaunchAgent still installed/u);
+		match(
+			leftover.fixes[0],
+			/^launchctl bootout gui\/\$\(id -u\)\/com\.zerodelta\.switchyard\.reaper;/u,
+		);
 		const absent = checkLaunchAgents(
 			{ canary: { plist: false }, reaper: { plist: false } },
 			NOW,
 		);
-		match(absent.summary, /canary not installed; reaper not installed/u);
+		strictEqual(absent.summary, "canary not installed");
 		match(absent.fixes[0], /npm run canary:install$/u);
 	});
 });
@@ -375,7 +379,7 @@ describe("doctor report and exit status", () => {
 				loaded: true,
 				state: { lastRunAt: new Date(NOW).toISOString(), lastStatus: "passed" },
 			},
-			reaper: { plist: true, loaded: true, scriptCurrent: true },
+			reaper: { plist: false, loaded: false },
 		}),
 	};
 	const capture = () => {

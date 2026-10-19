@@ -4,23 +4,14 @@ import { releaseProjectLockIfOwnedBy } from "../run-store/project-locks.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 import { readRun } from "../run-store/run-records.mjs";
 
-async function resolveIsRunDead(runId, dependencies) {
-	const readRunFn = dependencies.readRun ?? readRun;
-	let run;
-	try {
-		run = await readRunFn(runId);
-	} catch {
-		// run record not found => demonstrably dead (its container is an orphan).
-		return true;
-	}
-
+function recoveryLiveness(run, dependencies) {
 	const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
 	const options = dependencies.isWorkerLive
 		? { probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead") }
 		: undefined;
-	const liveness = classifier(run, options);
-	return liveness === "terminal_clean" || liveness === "dead";
+	return classifier(run, options);
 }
+
 async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 	const readRunFn = dependencies.readRun ?? readRun;
 	const releaseFn =
@@ -35,29 +26,19 @@ async function releaseStaleProjectLocks(candidateIds, dependencies = {}) {
 			continue;
 		}
 		if (run.cleanupState === "failed") continue;
-		const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
-		const options = dependencies.isWorkerLive
-			? { probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead") }
-			: undefined;
-		const liveness = classifier(run, options);
+		const liveness = recoveryLiveness(run, dependencies);
 		if (liveness === "terminal_clean" || liveness === "dead") {
 			try {
 				const didRelease = await releaseFn(run.projectPath, rid);
 				if (didRelease) released.push(rid);
 			} catch {
-				// unlink failure is non-fatal; the run's VM recovery still ran
+				// unlink failure is non-fatal; orphan reconciliation retries later
 			}
 		}
 	}
 	return released;
 }
-function recoveryLiveness(run, dependencies) {
-	const classifier = dependencies.classifyRunLiveness ?? classifyRunLiveness;
-	const options = dependencies.isWorkerLive
-		? { probePid: () => (dependencies.isWorkerLive(run) ? "live" : "dead") }
-		: undefined;
-	return classifier(run, options);
-}
+
 function inspectSimpleWorktreeRecovery(run, dependencies = {}) {
 	const claim = run.worktree;
 	const lstatPath = dependencies.lstatSimpleWorktreePath ?? lstatSync;
@@ -154,9 +135,4 @@ function inspectSimpleWorktreeRecovery(run, dependencies = {}) {
 	};
 }
 
-export {
-	inspectSimpleWorktreeRecovery,
-	recoveryLiveness,
-	releaseStaleProjectLocks,
-	resolveIsRunDead,
-};
+export { inspectSimpleWorktreeRecovery, releaseStaleProjectLocks };

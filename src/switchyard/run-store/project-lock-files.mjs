@@ -17,14 +17,10 @@ import {
 	EVENT_RESERVE_BYTES,
 	locksRoot,
 	resolveStateRoot,
-	resolveVmAdmissionRoot,
 } from "./constants.mjs";
 import { writeRunAtomically } from "./run-records.mjs";
 export function getStateRoot() {
 	return resolveStateRoot();
-}
-export function getVmAdmissionRoot() {
-	return resolveVmAdmissionRoot();
 }
 function lockFilePath(canonicalPath) {
 	const resolvedPath = resolve(canonicalPath);

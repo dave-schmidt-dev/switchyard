@@ -4,13 +4,10 @@
 		{
 			"id": "field-drop-served-model",
 			"defectClass": "field-drop",
-			"source": "src/switchyard/broker/executor.mjs",
-			"needle": "\t\t\t// A bounded boolean from the launcher, not the guest-supplied model\n\t\t\t// name. Without it here the frozen allowlist silently dropped the\n\t\t\t// adapter's served-model read-back before it could reach a result.\n\t\t\tservedModelVerified:\n\t\t\t\ttypeof launcherResult?.servedModelVerified === \"boolean\"\n\t\t\t\t\t? launcherResult.servedModelVerified\n\t\t\t\t\t: null,",
-			"replacement": "\t\t\t// historical field-drop mutation\n\t\t\tservedModelVerified: null,",
-			"tests": [
-				"tests/broker-executor-broker-async-executor-1.test.mjs",
-				"tests/broker-executor-broker-async-executor-2.test.mjs"
-			]
+			"source": "src/switchyard/simple/health.mjs",
+			"needle": "\t\t\tproviderExecutionSucceeded: providerResult?.success === true,\n\t\t\tservedModelVerified: providerResult?.servedModelVerified === true,",
+			"replacement": "\t\t\tproviderExecutionSucceeded: providerResult?.success === true,\n\t\t\t// historical field-drop mutation\n\t\t\tservedModelVerified: false,",
+			"tests": ["tests/provider-reliability-health.test.mjs"]
 		},
 		{
 			"id": "vacuous-consumer-guard",
@@ -52,8 +49,7 @@
 			"replacement": "if (observed.status !== \"failed\") {\n\t\t\tconst completed = Object.freeze({",
 			"tests": [
 				"tests/mutation-protocol-mutation-protocol-1.test.mjs",
-				"tests/mutation-protocol-mutation-protocol-2.test.mjs",
-				"tests/mutation-protocol-mutation-protocol-3.test.mjs"
+				"tests/mutation-protocol-mutation-protocol-2.test.mjs"
 			]
 		},
 		{
@@ -64,8 +60,7 @@
 			"replacement": "true &&",
 			"tests": [
 				"tests/mutation-protocol-mutation-protocol-1.test.mjs",
-				"tests/mutation-protocol-mutation-protocol-2.test.mjs",
-				"tests/mutation-protocol-mutation-protocol-3.test.mjs"
+				"tests/mutation-protocol-mutation-protocol-2.test.mjs"
 			]
 		}
 	]

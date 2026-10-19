@@ -479,38 +479,3 @@ export async function handleSimpleCancel(argv, deps = {}) {
 		await sleep(Math.min(SIMPLE_CANCEL_POLL_MS, remaining));
 	}
 }
-/** Legacy queue entry points honor the stable routing session before container creation. */
-export function guardRoutingLaunch(argv, deps = {}) {
-	let runId = process.env.SWITCHYARD_ROUTING_RUN_ID;
-	const args = [...argv];
-	const index = args.indexOf("--routing-run-id");
-	if (index >= 0) {
-		runId = args[index + 1];
-		validateRoutingRunId(runId);
-		if (args.indexOf("--routing-run-id", index + 1) >= 0)
-			throw new RoutingCliUsageError("duplicate routing-run-id");
-		args.splice(index, 2);
-	}
-	if (!runId) return { argv: args, blocked: false };
-	validateRoutingRunId(runId);
-	const projectIndex = args.indexOf("--project");
-	if (projectIndex < 0)
-		throw new RoutingCliUsageError("routing session requires --project");
-	const project = canonicalRoutingProject(
-		resolve(args[projectIndex + 1] ?? ""),
-	);
-	const state = readRoutingRunState(project, runId, {
-		stateRoot: deps.stateRoot,
-	});
-	if (state?.pendingAttempt) reject("pending_attempt_exists");
-	if (!state?.nativeLatch) return { argv: args, blocked: false };
-	(deps.writeResult ?? console.log)(
-		JSON.stringify({
-			status: "deferred",
-			direction: "native_latched",
-			routingRunId: runId,
-		}),
-	);
-	(deps.signalProcess ?? process).exitCode = 6;
-	return { argv: args, blocked: true };
-}

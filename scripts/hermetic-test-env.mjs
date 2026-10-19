@@ -1,8 +1,8 @@
 /**
  * Hermetic environment for every `node --test` child that validation spawns.
  *
- * Production defaults resolve state from HOME (`~/.switchyard/admission`,
- * `~/.switchyard/accounts`, the Gradus snapshot) and from the checkout
+ * Production defaults resolve state from HOME (`~/.switchyard/accounts`, the
+ * Gradus snapshot) and from the checkout
  * (`<repo>/.logs/switchyard`), so a test that forgot to redirect one wrote
  * live dispatcher state or read owner files (audit TEST-9). Each spawn now gets
  * its own HOME, TMPDIR, XDG roots, git global config and Switchyard state
@@ -17,7 +17,6 @@
  * context through `~/.docker`, so DOCKER_CONFIG keeps pointing there. Tests
  * that check host ground truth (the live roster, the ~/.agent producers) read
  * the owner's home from SWITCHYARD_HOST_HOME; production code never does.
- * With SWITCHYARD_LIVE_VM_TESTS=1 the VM admission root stays host-global.
  */
 
 import {
@@ -77,13 +76,6 @@ export function createHermeticTestEnv(base = process.env) {
 	writeFileSync(gitconfig, TEST_GITCONFIG, { mode: 0o600 });
 	const hostHome = base[HOST_HOME_ENV] || base.HOME || homedir();
 	const hostDocker = join(hostHome, ".docker");
-	// Opt-in live-VM runs boot real guests, so they take the host-global VM
-	// slots production queues hold instead of a private pool.
-	const vmAdmission =
-		base.SWITCHYARD_LIVE_VM_TESTS === "1"
-			? base.SWITCHYARD_VM_ADMISSION_ROOT ||
-				join(hostHome, ".switchyard", "admission")
-			: join(state, "vm-admission");
 	const env = Object.fromEntries(
 		Object.entries(base).filter(([key]) => !STRIPPED.includes(key)),
 	);
@@ -97,7 +89,6 @@ export function createHermeticTestEnv(base = process.env) {
 		GIT_CONFIG_GLOBAL: gitconfig,
 		GIT_CONFIG_NOSYSTEM: "1",
 		SWITCHYARD_RUN_STORE_ROOT: join(state, "run-store"),
-		SWITCHYARD_VM_ADMISSION_ROOT: vmAdmission,
 		SWITCHYARD_ACCOUNT_ROOT: join(state, "accounts"),
 		SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: join(state, "gradus-snapshot.json"),
 		[HOST_HOME_ENV]: hostHome,

@@ -16,7 +16,7 @@ import {
 	captureTaskStartTreeAsync,
 	validateTaskStartTree,
 	validateTaskStartTreeAsync,
-} from "../src/switchyard/lifecycle/index.mjs";
+} from "../src/switchyard/lifecycle/task-base.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SchemaError } from "./errors.mjs";
@@ -13,7 +12,6 @@ const defaultStateRoot = resolve(
 	".logs",
 	"switchyard",
 );
-const defaultVmAdmissionRoot = resolve(homedir(), ".switchyard", "admission");
 function resolveStateRoot() {
 	const envOverride = process.env.SWITCHYARD_RUN_STORE_ROOT;
 	if (envOverride) {
@@ -29,14 +27,6 @@ function locksRoot() {
 }
 function quarantineRoot() {
 	return resolve(resolveStateRoot(), ".quarantine");
-}
-function resolveVmAdmissionRoot() {
-	const envOverride = process.env.SWITCHYARD_VM_ADMISSION_ROOT;
-	if (envOverride) return resolve(envOverride);
-	return defaultVmAdmissionRoot;
-}
-function vmSlotPath(slotIndex) {
-	return resolve(resolveVmAdmissionRoot(), `vm-slot-${slotIndex}.lock`);
 }
 const VALID_STATES = new Set([
 	"created",
@@ -282,7 +272,6 @@ export {
 	DIAGNOSTIC_DIGEST_RE,
 	DIAGNOSTIC_REF_RE,
 	defaultStateRoot,
-	defaultVmAdmissionRoot,
 	EVENT_LOCK_WAIT_MS,
 	EVENT_RESERVE_BYTES,
 	HISTORICAL_SCHEMA_VERSION,
@@ -300,7 +289,6 @@ export {
 	ROUTE_HEALTH_DEFERRED_RESULT,
 	ROUTE_HEALTH_EPOCH_RE,
 	resolveStateRoot,
-	resolveVmAdmissionRoot,
 	runsRoot,
 	SUCCESS_RESULTS,
 	TELEMETRY_WRITE_FAILURE_LABELS,
@@ -308,6 +296,5 @@ export {
 	VALID_STATES,
 	VALID_WORKTREE_STATES,
 	validateMutationOperations,
-	vmSlotPath,
 	WORKTREE_RECORD_KEYS,
 };

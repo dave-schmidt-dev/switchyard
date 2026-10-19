@@ -13,7 +13,7 @@ import {
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
-import { captureDirtyOverlay } from "../src/switchyard/lifecycle/index.mjs";
+import { captureDirtyOverlay } from "../src/switchyard/lifecycle/dirty-overlay.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const fixtures = [];

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { extractCliVersion } from "../src/switchyard/cli-contract/help-flags.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
-const VM_OPS = fileURLToPath(new URL("../ops/macos-vm/", import.meta.url));
+const CLI_OPS = fileURLToPath(new URL("../ops/macos-vm/", import.meta.url));
 // Real --version text from each installed CLI, plus the edges of the rule.
 const SAMPLES = [
 	"opencode v2.0.32",
@@ -59,33 +59,16 @@ function shellVersions(fn) {
 		.map((line) => line.slice(1, -1));
 }
 
-test("every shell copy of extract_cli_version agrees with the canary's parser", () => {
+test("the host CLI sync's extract_cli_version agrees with the canary's parser", () => {
 	const expected = SAMPLES.map((sample) => extractCliVersion(sample) ?? "");
 	deepStrictEqual(expected.slice(0, 3), ["2.0.32", "1.18.30", "0.163.0"]);
-	for (const script of ["sync-host-clis.sh", "update-guest-clis.sh"])
-		deepStrictEqual(
-			shellVersions(
-				shellFunction(
-					readFileSync(join(VM_OPS, script), "utf8"),
-					"extract_cli_version",
-				),
-			),
-			expected,
-			script,
-		);
-	// The golden-image copy lives in an unquoted guest heredoc; render it the
-	// way the guest receives it before running it.
-	const escaped = shellFunction(
-		readFileSync(join(VM_OPS, "build-golden-image.sh"), "utf8"),
-		"extract_cli_version",
-	);
-	const render = spawnSync("/bin/bash", ["-c", `cat <<EOF\n${escaped}EOF\n`], {
-		encoding: "utf8",
-	});
-	strictEqual(render.status, 0, render.stderr);
 	deepStrictEqual(
-		shellVersions(render.stdout),
+		shellVersions(
+			shellFunction(
+				readFileSync(join(CLI_OPS, "sync-host-clis.sh"), "utf8"),
+				"extract_cli_version",
+			),
+		),
 		expected,
-		"build-golden-image.sh",
 	);
 });

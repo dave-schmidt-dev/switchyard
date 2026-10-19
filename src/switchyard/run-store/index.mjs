@@ -1,39 +1,19 @@
 export { projectOutcomeReader } from "../outcome/projection.mjs";
 
-export {
-	LockError,
-	RevisionError,
-	SchemaError,
-	VALID_WORKTREE_STATES,
-	VmAdmissionPermissionDeniedError,
-	VmAdmissionStorageError,
-	VmAdmissionUnavailableError,
-	VmSlotUnavailableError,
-};
+export { LockError, RevisionError, SchemaError, VALID_WORKTREE_STATES };
 
 import "./errors.mjs";
 import "./constants.mjs";
 import "./receipt-validation.mjs";
 import "./validate-run.mjs";
 import "./run-records.mjs";
-import "./vm-slots.mjs";
 import "./project-lock-files.mjs";
 import "./run-updates.mjs";
 import { VALID_WORKTREE_STATES } from "./constants.mjs";
-import {
-	LockError,
-	RevisionError,
-	SchemaError,
-	VmAdmissionPermissionDeniedError,
-	VmAdmissionStorageError,
-	VmAdmissionUnavailableError,
-	VmSlotUnavailableError,
-} from "./errors.mjs";
+import { LockError, RevisionError, SchemaError } from "./errors.mjs";
 
-export { sanitizeVmAdmissionError } from "./errors.mjs";
 export {
 	getStateRoot,
-	getVmAdmissionRoot,
 	runStoreTesting,
 } from "./project-lock-files.mjs";
 export {
@@ -55,15 +35,6 @@ export {
 	updateRun,
 	updateRunWithRetry,
 } from "./run-updates.mjs";
-export {
-	acquireVmSlot,
-	acquireVmSlotForTest,
-	projectVmGateOutcome,
-	publishVmGateOutcome,
-	releaseVmSlot,
-	TEST_VM_SLOT_WAIT_INTERVAL_MS,
-	TEST_VM_SLOT_WAIT_TIMEOUT_MS,
-} from "./vm-slots.mjs";
 
 import "./events.mjs";
 import "./project-locks.mjs";

@@ -43,13 +43,12 @@ afterEach(() => {
 	});
 });
 describe("recover integration", () => {
-	it("finalizes a dead old run while preserving a newer live project-lock owner", async () => {
+	it("leaves a newer live project-lock owner alone when recovering a dead old run", async () => {
 		const {
 			acquireProjectLock,
 			advanceState,
 			initializeRun,
 			isProjectLockOwnedBy,
-			readEvents,
 			readRun,
 			updateRun,
 		} = await import("../src/switchyard/run-store/index.mjs");
@@ -81,43 +80,12 @@ describe("recover integration", () => {
 		current = await readRun(activeRunId);
 		await updateRun(activeRunId, { workerPid: process.pid }, current.revision);
 		await acquireProjectLock(projectDir, activeRunId);
-		const target = {
-			uuid: "dead-worker-vm",
-			name: `switchyard-work-${staleRunId}-fixture`,
-			runId: staleRunId,
-			creatorPid: 999999,
-			status: "stopped",
-		};
-
 		const output = [];
 		const originalLog = console.log;
 		const originalExitCode = process.exitCode;
 		console.log = (line) => output.push(String(line));
 		try {
-			await handleRecover(["--run", staleRunId], {
-				listManaged: () => [target],
-				reclaim: ({ eligibility, ownershipContext }) => {
-					const candidate = {
-						...target,
-						ownership: {
-							...ownershipContext,
-							vmUuid: target.uuid,
-							vmName: target.name,
-						},
-					};
-					strictEqual(eligibility(candidate), true);
-					strictEqual(
-						eligibility({ ...candidate, recoveryPhase: "pre_mutation" }),
-						true,
-					);
-					return {
-						reclaimed: [target],
-						skipped: [],
-						skippedSnapshots: [],
-						errors: [],
-					};
-				},
-			});
+			await handleRecover(["--run", staleRunId]);
 		} finally {
 			console.log = originalLog;
 			process.exitCode = originalExitCode;
@@ -125,22 +93,9 @@ describe("recover integration", () => {
 
 		const envelope = JSON.parse(output[0]);
 		deepStrictEqual(envelope.errors, []);
-		strictEqual(envelope.vmsReclaimed, 1);
+		ok(!Object.hasOwn(envelope, "vmsReclaimed"));
 		strictEqual(envelope.projectLocksReleased, 0);
 		strictEqual(await isProjectLockOwnedBy(projectDir, activeRunId), true);
-		const staleRun = await readRun(staleRunId);
-		strictEqual(staleRun.state, "failed");
-		strictEqual(staleRun.cleanupState, "complete");
-		strictEqual(staleRun.terminalizedBy, "dead_worker_recovery");
-		const typedStages = (await readEvents(staleRunId))
-			.filter((event) => typeof event.stage === "string")
-			.map((event) => event.stage);
-		deepStrictEqual(typedStages, [
-			"cleanup",
-			"cleanup",
-			"run",
-			"postcondition",
-		]);
 	});
 	it("counts a project lock successfully released by dead-run finalization", async () => {
 		const {
@@ -171,7 +126,7 @@ describe("recover integration", () => {
 		const originalExitCode = process.exitCode;
 		console.log = (line) => output.push(String(line));
 		try {
-			await handleRecover(["--run", runId], { listManaged: () => [] });
+			await handleRecover(["--run", runId]);
 		} finally {
 			console.log = originalLog;
 			process.exitCode = originalExitCode;
@@ -181,60 +136,5 @@ describe("recover integration", () => {
 		deepStrictEqual(envelope.errors, []);
 		strictEqual(envelope.projectLocksReleased, 1);
 		strictEqual(isProjectLockHeld(projectDir), false);
-	});
-	it("keeps finalizer cleanup incomplete when fresh VM proof becomes live", async () => {
-		const { initializeRun, advanceState, readRun, updateRun } = await import(
-			"../src/switchyard/run-store/index.mjs"
-		);
-		const runId = randomUUID();
-		await initializeRun({
-			runId,
-			tasksFilePath: tasksFile,
-			projectPath: projectDir,
-			orderedTaskIds: ["1.1"],
-			initialHostFingerprint: "test-fingerprint",
-			workerNonce: randomUUID(),
-			launchArgs: [],
-		});
-		await advanceState(runId, "running");
-		let current = await readRun(runId);
-		await updateRun(runId, { workerPid: 999999 }, current.revision);
-		const target = {
-			uuid: "race-uuid",
-			name: `switchyard-work-${runId}-999999`,
-			runId,
-			creatorPid: 999999,
-			status: "stopped",
-		};
-		let proofReads = 0;
-		let destroys = 0;
-		const output = [];
-		const originalLog = console.log;
-		const previousExitCode = process.exitCode;
-		console.log = (line) => output.push(String(line));
-		try {
-			await handleRecover(["--run", runId], {
-				listManaged: () => [target],
-				readRun: async () => ({
-					...(await readRun(runId)),
-					liveness: proofReads++ === 0 ? "dead" : "live",
-				}),
-				classifyRunLiveness: (run) => run.liveness,
-				destroy: () => {
-					destroys += 1;
-				},
-				reconcileProjectLockClaims: async () => [],
-				releaseProjectLockIfOwnedBy: async () => false,
-				isProjectLockOwnedBy: async () => false,
-				releaseOrphanedProjectLocks: async () => [],
-			});
-		} finally {
-			console.log = originalLog;
-			process.exitCode = previousExitCode;
-		}
-		strictEqual(destroys, 0);
-		current = await readRun(runId);
-		strictEqual(current.cleanupState, "failed");
-		ok(JSON.parse(output[0]).errors.includes("recovery_incomplete"));
 	});
 });

@@ -1,26 +1,16 @@
 // @test-phase: serial
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
-	captureHostFingerprint,
-	parseDispatchArgs,
 	parseHealthArgs,
-	parseLaunchArgs,
 	parseOrphanLockRemediationArgs,
 	parseRecoverArgs,
-	parseResultArgs,
-	parseStatusArgs,
 	USAGE,
-	USAGE_LAUNCH,
 	USAGE_RECOVER,
-	USAGE_RESULT,
-	USAGE_RUN,
-	USAGE_STATUS,
-	USAGE_VALIDATE_INPUTS,
 } from "../src/switchyard/dispatch/cli.mjs";
 import {
 	acquireProjectLock,
@@ -36,7 +26,6 @@ import {
 import { tempDir } from "./helpers/tempdir.mjs";
 
 let dir;
-let tasksFile;
 let projectDir;
 let stateRoot;
 function makeStateRootEnv() {
@@ -45,12 +34,6 @@ function makeStateRootEnv() {
 beforeEach(async () => {
 	dir = tempDir("switchyard-dispatch-cli-");
 	stateRoot = join(dir, "state-root");
-	tasksFile = join(dir, "tasks.md");
-	writeFileSync(
-		tasksFile,
-		"### Task 1.1: Test task\n- **Status:** pending\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** A test\n",
-		"utf8",
-	);
 	projectDir = join(dir, "project");
 	mkdirSync(join(projectDir, ".git"), { recursive: true });
 
@@ -73,22 +56,6 @@ afterEach(() => {
 	});
 });
 describe("health control CLI", () => {
-	it("defaults queue routing to shadow and makes enforcement explicit", () => {
-		strictEqual(
-			parseDispatchArgs([tasksFile, "--project", projectDir]).healthMode,
-			"shadow",
-		);
-		strictEqual(
-			parseDispatchArgs([
-				tasksFile,
-				"--project",
-				projectDir,
-				"--health-enforce",
-			]).healthMode,
-			"enforce",
-		);
-	});
-
 	it("accepts only bounded inspection and attended attestation fields", () => {
 		const hash = `sha256:${"a".repeat(64)}`;
 		deepStrictEqual(
@@ -121,60 +88,7 @@ describe("health control CLI", () => {
 		);
 	});
 });
-describe("captureHostFingerprint", () => {
-	it("ignores the project-local durable run store while detecting source edits", () => {
-		mkdirSync(projectDir, { recursive: true });
-		writeFileSync(join(projectDir, "README.md"), "canary\n", "utf8");
-		execSync(
-			"git init -q && git add README.md && git -c user.name=Test -c user.email=test@example.invalid commit -qm seed",
-			{
-				cwd: projectDir,
-			},
-		);
-		mkdirSync(join(stateRoot, "runs", "live"), { recursive: true });
-		writeFileSync(join(stateRoot, "runs", "live", "run.json"), "{}\n", "utf8");
-
-		ok(captureHostFingerprint(projectDir).endsWith(":clean"));
-		writeFileSync(join(projectDir, "README.md"), "changed\n", "utf8");
-		ok(captureHostFingerprint(projectDir).endsWith(":dirty"));
-	});
-});
 describe("subcommand parsing", () => {
-	it("parseLaunchArgs works same as parseDispatchArgs", () => {
-		const opts = parseLaunchArgs([tasksFile, "--project", projectDir]);
-		strictEqual(opts.tasksFilePath, tasksFile);
-		strictEqual(opts.projectPath, projectDir);
-	});
-
-	it("parseLaunchArgs returns help:true for --help", () => {
-		deepStrictEqual(parseLaunchArgs(["--help"]), { help: true });
-	});
-
-	it("parseStatusArgs extracts runId", () => {
-		const parsed = parseStatusArgs(["my-run-id"]);
-		strictEqual(parsed.runId, "my-run-id");
-		strictEqual(parsed.json, false);
-		strictEqual(parsed.help, false);
-	});
-
-	it("parseStatusArgs accepts --json flag", () => {
-		const parsed = parseStatusArgs(["my-run-id", "--json"]);
-		strictEqual(parsed.runId, "my-run-id");
-		strictEqual(parsed.json, true);
-	});
-
-	it("parseStatusArgs with --help", () => {
-		const parsed = parseStatusArgs(["--help"]);
-		strictEqual(parsed.help, true);
-		strictEqual(parsed.runId, null);
-	});
-
-	it("parseResultArgs accepts --json flag", () => {
-		const parsed = parseResultArgs(["my-run-id", "--json"]);
-		strictEqual(parsed.runId, "my-run-id");
-		strictEqual(parsed.json, true);
-	});
-
 	it("parseRecoverArgs without --run", () => {
 		const parsed = parseRecoverArgs([]);
 		strictEqual(parsed.runId, null);
@@ -206,51 +120,33 @@ describe("subcommand parsing", () => {
 	});
 });
 describe("usage output", () => {
-	it("USAGE contains subcommand listing", () => {
+	it("USAGE lists only the surviving subcommands", () => {
 		ok(USAGE.includes("--version"));
-		ok(USAGE.includes("run"));
-		ok(USAGE.includes("launch"));
-		ok(USAGE.includes("status"));
-		ok(USAGE.includes("result"));
-		ok(USAGE.includes("recover"));
-	});
-
-	it("USAGE_RUN describes run options", () => {
-		ok(USAGE_RUN.includes("--project"));
-		ok(USAGE_RUN.includes("--max-tasks"));
-	});
-
-	it("USAGE_VALIDATE_INPUTS names the validation command and JSON behavior", () => {
-		ok(USAGE_VALIDATE_INPUTS.includes("validate-inputs <tasks.md>"));
-		ok(USAGE_VALIDATE_INPUTS.includes("--dirty-overlay"));
-		ok(USAGE_VALIDATE_INPUTS.includes("output is always one JSON object"));
-	});
-
-	it("USAGE_LAUNCH describes launch options", () => {
-		ok(USAGE_LAUNCH.includes("--project"));
-	});
-
-	it("USAGE_RUN and USAGE_LAUNCH describe --exclude-provider", () => {
-		ok(USAGE_RUN.includes("--exclude-provider"));
-		ok(USAGE_LAUNCH.includes("--exclude-provider"));
-	});
-
-	it("USAGE_RUN and USAGE_LAUNCH describe --only-provider", () => {
-		ok(USAGE_RUN.includes("--only-provider"));
-		ok(USAGE_LAUNCH.includes("--only-provider"));
-	});
-
-	it("USAGE_STATUS describes status usage", () => {
-		ok(USAGE_STATUS.includes("<run-id>"));
-	});
-
-	it("USAGE_RESULT describes result usage", () => {
-		ok(USAGE_RESULT.includes("<run-id>"));
+		for (const name of [
+			"simple",
+			"routing-run",
+			"recover",
+			"health",
+			"doctor",
+			"remediate-orphaned-locks",
+		])
+			ok(USAGE.includes(`  ${name} `), `USAGE must list ${name}`);
+		for (const retired of [
+			"run",
+			"launch",
+			"validate-inputs",
+			"backend-health",
+			"status",
+			"result",
+		])
+			ok(
+				!USAGE.includes(`  ${retired} `),
+				`USAGE must not list retired ${retired}`,
+			);
 	});
 
 	it("USAGE_RECOVER describes recover usage", () => {
 		ok(USAGE_RECOVER.includes("--run"));
-		ok(USAGE_RECOVER.includes("report-only"));
 		ok(USAGE_RECOVER.includes("runLiveness"));
 		ok(USAGE_RECOVER.includes("global project-lock cleanup"));
 	});
@@ -277,47 +173,36 @@ describe("CLI exit codes via process spawn", () => {
 		ok(result.stdout.includes("Usage"), "stdout should contain usage text");
 	});
 
-	it("launch --help prints usage and exits 0", () => {
-		const result = runDispatch(["launch", "--help"]);
-		strictEqual(result.status, 0);
-		ok(result.stdout.includes(USAGE_LAUNCH.trim().split("\n")[0]));
-	});
-
-	it("launch with missing --project exits 2", () => {
-		const result = runDispatch(["launch", tasksFile]);
-		strictEqual(result.status, 2);
-		ok(result.stderr.includes("--project <path> is required"));
-	});
-
-	it("launch with missing tasks file exits 2", () => {
-		const result = runDispatch([
-			"launch",
-			join(dir, "nonexistent.md"),
-			"--project",
-			projectDir,
-		]);
-		strictEqual(result.status, 2);
-	});
-
-	it("status with nonexistent runId exits 3", () => {
-		const result = runDispatch(
-			["status", "nonexistent-123"],
-			makeStateRootEnv(),
-		);
-		strictEqual(result.status, 3);
-	});
-
-	it("result with nonexistent runId exits 3", () => {
-		const result = runDispatch(
-			["result", "nonexistent-456"],
-			makeStateRootEnv(),
-		);
-		strictEqual(result.status, 3);
-	});
-
-	it("status with invalid subcommand name exits 2 (usage error)", () => {
+	it("an unknown subcommand exits 2 (usage error)", () => {
 		const result = runDispatch(["nonexistent-subcommand"]);
 		strictEqual(result.status, 2);
+	});
+
+	it("each retired subcommand exits 2 as unknown", () => {
+		for (const retired of [
+			"run",
+			"launch",
+			"validate-inputs",
+			"backend-health",
+			"status",
+			"result",
+		]) {
+			const result = runDispatch([retired, "--help"], makeStateRootEnv());
+			strictEqual(result.status, 2, `${retired} must be refused`);
+			ok(
+				result.stderr.includes(`unknown subcommand: ${retired}`),
+				result.stderr,
+			);
+		}
+	});
+
+	it("a bare tasks-file positional exits 2 instead of starting a queue", () => {
+		const result = runDispatch(
+			[join(dir, "tasks.md"), "--project", projectDir],
+			makeStateRootEnv(),
+		);
+		strictEqual(result.status, 2);
+		ok(result.stderr.includes("unknown subcommand"), result.stderr);
 	});
 
 	it("orphan-lock remediation help exits 0 without changing state", () => {
@@ -330,7 +215,7 @@ describe("CLI exit codes via process spawn", () => {
 		const runId = randomUUID();
 		await initializeRun({
 			runId,
-			tasksFilePath: tasksFile,
+			tasksFilePath: join(dir, "tasks.md"),
 			projectPath: projectDir,
 			orderedTaskIds: ["task-1"],
 			initialHostFingerprint: { git: "abc123", worktree: "clean" },

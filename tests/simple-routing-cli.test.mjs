@@ -5,14 +5,10 @@ import { EventEmitter } from "node:events";
 import { realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { handleLaunch, handleRun } from "../src/switchyard/dispatch/cli.mjs";
 import { parseSimpleArgs } from "../src/switchyard/simple/args.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import { appendFailureRecord } from "../src/switchyard/simple/failure-log.mjs";
-import {
-	guardRoutingLaunch,
-	handleRoutingRun,
-} from "../src/switchyard/simple/routing-cli.mjs";
+import { handleRoutingRun } from "../src/switchyard/simple/routing-cli.mjs";
 import {
 	openRoutingRun,
 	readRoutingRunState,
@@ -217,40 +213,6 @@ test("real simple parser supports flag/ENV IDs; CLI latch yields exit6 without e
 	strictEqual(signalProcess.exitCode, 6);
 	strictEqual(signalProcess.listenerCount("SIGINT"), 0);
 });
-test("legacy run/launch exported entry points honor existing latch before handler/container work", async () => {
-	const f = fixture();
-	const h = openRoutingRun(f.project, "run-1", f.deps);
-	h.release();
-	await handleRoutingRun(f.argv, f.deps);
-	for (const handler of [handleRun, handleLaunch]) {
-		const signalProcess = {};
-		let output;
-		await handler(
-			[
-				"does-not-exist.md",
-				"--project",
-				f.project,
-				"--routing-run-id",
-				"run-1",
-			],
-			{
-				...f.deps,
-				signalProcess,
-				writeResult: (value) => {
-					output = JSON.parse(value);
-				},
-			},
-		);
-		strictEqual(output.direction, "native_latched");
-		strictEqual(signalProcess.exitCode, 6);
-	}
-	await rejects(
-		async () =>
-			guardRoutingLaunch(["--project", f.project, "--routing-run-id"], f.deps),
-		{ code: "invalid_routing_run_id" },
-	);
-});
-
 test("CLI provenance preserves flag and ENV silence; generated standalone IDs emit one stderr warning", async () => {
 	const f = fixture();
 	const previous = process.env.SWITCHYARD_ROUTING_RUN_ID;

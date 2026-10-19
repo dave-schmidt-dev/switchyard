@@ -225,7 +225,6 @@ import {
 } from "./exec-error-kinds.mjs";
 
 export {
-	CHECKPOINT_REMEDIATION_MESSAGES,
 	checkpointRemediation,
 	classifyPreProviderFailure,
 	INTEGRATION_REFUSAL_KINDS,
@@ -238,10 +237,7 @@ export {
 	PERSISTED_ERROR_KINDS,
 	PERSISTED_SIGNALS,
 	PrlctlCallError,
-	prlctlFailureMetadata,
 	prlctlTrustedCauseCode,
-	WorkerBootStageError,
-	workerBootStageDiagnosticCode,
 } from "./exec-error-kinds.mjs";
 export {
 	classifyProviderDiagnostic,

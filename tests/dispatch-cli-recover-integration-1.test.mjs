@@ -211,7 +211,7 @@ describe("recover integration", () => {
 		const parsed = parseRecoverArgs(["--run", "test-run"]);
 		strictEqual(parsed.runId, "test-run");
 	});
-	it("recover --run reports simple worktree dispositions without VM inventory", async () => {
+	it("recover --run reports simple worktree dispositions", async () => {
 		const retained = await createSimpleWorktreeRun();
 		const removed = await createSimpleWorktreeRun({
 			worktreeState: "removed",
@@ -345,28 +345,20 @@ describe("recover integration", () => {
 			true,
 		);
 	});
-	it("targeted simple recovery skips VM inventory, allocation audit, and lock cleanup", async () => {
+	it("targeted recovery of a running simple run skips lock cleanup", async () => {
 		const fixture = await createSimpleWorktreeRun({
 			runState: "running",
 			worktreeState: "active",
 			workerPid: 999999,
 		});
 		await acquireProjectLock(projectDir, fixture.runId);
-		const calls = { inventory: 0, audit: 0, lockCleanup: 0 };
+		const calls = { lockCleanup: 0 };
 		const output = [];
 		const originalLog = console.log;
 		const previousExitCode = process.exitCode;
 		console.log = (line) => output.push(String(line));
 		try {
 			await handleRecover(["--run", fixture.runId, "--state-root", stateRoot], {
-				listManaged: () => {
-					calls.inventory += 1;
-					return [];
-				},
-				auditAllocationIntents: () => {
-					calls.audit += 1;
-					return [];
-				},
 				releaseProjectLockIfOwnedBy: async () => {
 					calls.lockCleanup += 1;
 					return false;
@@ -384,7 +376,7 @@ describe("recover integration", () => {
 			console.log = originalLog;
 			process.exitCode = previousExitCode;
 		}
-		deepStrictEqual(calls, { inventory: 0, audit: 0, lockCleanup: 0 });
+		deepStrictEqual(calls, { lockCleanup: 0 });
 		strictEqual(
 			JSON.parse(output[0]).candidates[0].reason,
 			"writer_stop_unconfirmed",
@@ -392,28 +384,20 @@ describe("recover integration", () => {
 		strictEqual((await readRun(fixture.runId)).state, "running");
 		strictEqual(await isProjectLockOwnedBy(projectDir, fixture.runId), true);
 	});
-	it("simple records without a worktree return no candidate when VM inventory is unavailable", async () => {
+	it("simple records without a worktree return no candidate", async () => {
 		const fixture = await createSimpleWorktreeRun({
 			runState: "running",
 			worktreeState: null,
 			rootKind: "none",
 			workerPid: 999999,
 		});
-		const calls = { inventory: 0, audit: 0, lockCleanup: 0 };
+		const calls = { lockCleanup: 0 };
 		const output = [];
 		const originalLog = console.log;
 		const previousExitCode = process.exitCode;
 		console.log = (line) => output.push(String(line));
 		try {
 			await handleRecover(["--run", fixture.runId, "--state-root", stateRoot], {
-				listManaged: () => {
-					calls.inventory += 1;
-					throw new Error("VM inventory unavailable");
-				},
-				auditAllocationIntents: () => {
-					calls.audit += 1;
-					throw new Error("VM allocation audit unavailable");
-				},
 				releaseProjectLockIfOwnedBy: async () => {
 					calls.lockCleanup += 1;
 					return false;
@@ -434,21 +418,21 @@ describe("recover integration", () => {
 		const envelope = JSON.parse(output[0]);
 		strictEqual(envelope.disposition, "no_candidates");
 		deepStrictEqual(envelope.candidates, []);
-		deepStrictEqual(envelope.allocationIntents, []);
 		deepStrictEqual(envelope.errors, []);
-		deepStrictEqual(calls, { inventory: 0, audit: 0, lockCleanup: 0 });
+		deepStrictEqual(calls, { lockCleanup: 0 });
 		const current = await readRun(fixture.runId);
 		strictEqual(current.state, "running");
 		strictEqual(current.worktree, null);
 	});
-	it("recover without --help runs and exits (Parallels may not be available)", () => {
+	it("recover without --run reconciles project locks and exits", () => {
 		const result = runDispatch(["recover"]);
 		ok(
 			result.status === 0 || result.status === 1,
 			`unexpected exit code: ${result.status}`,
 		);
 		const output = JSON.parse(result.stdout.trim());
-		ok(typeof output.vmsReclaimed === "number");
+		ok(typeof output.projectLocksReleased === "number");
+		ok(!Object.hasOwn(output, "vmsReclaimed"));
 		ok(Array.isArray(output.errors));
 		ok(Array.isArray(output.candidates) || output.candidates === null);
 	});

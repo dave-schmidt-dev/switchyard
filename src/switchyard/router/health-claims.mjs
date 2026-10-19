@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import {
 	claimReclaimable,
 	effective,
-	repairTrialAvailable,
 	updateScopeSync,
 } from "./health-inspect.mjs";
 
@@ -102,35 +101,6 @@ export async function acquireHalfOpenClaim(input) {
 	});
 }
 
-export function acquireHalfOpenClaimSync(input) {
-	const claimant = claimIdentity(input);
-	safeHash(input.publicConfigurationEpoch, "public configuration epoch");
-	safeEpoch(input.repairEpoch);
-	const now = safeTime(input.nowMs ?? Date.now());
-	return updateScopeSync(input, ({ control, observations }) => {
-		if (control.repairEpoch !== input.repairEpoch)
-			return { write: false, claimed: false, reason: "stale-repair-epoch" };
-		if (control.claim && !claimReclaimable(control.claim, now))
-			return { write: false, claimed: false, reason: "claim-active" };
-		const state = effective(control, observations, input, now);
-		const eligibleRepair =
-			state.state === "repair-hold" && repairTrialAvailable(control, input);
-		const eligibleCooldown =
-			state.state === "cooldown" && state.trialAvailable === true;
-		if (!eligibleRepair && !eligibleCooldown)
-			return { write: false, claimed: false, state: state.state };
-		control.claim = {
-			token: randomUUID(),
-			healthKey: state.key,
-			revision: control.revision + 1,
-			...claimant,
-			started: false,
-			acquiredAt: now,
-		};
-		return { claimed: true, state: "half-open", lease: { ...control.claim } };
-	});
-}
-
 export function exactClaim(claim, input) {
 	return (
 		claim &&
@@ -172,24 +142,6 @@ export async function releaseHalfOpenClaim(input) {
 	if (!UUID_RE.test(input.leaseToken ?? ""))
 		throw new RouteHealthSchemaError("half-open lease token is invalid");
 	return updateScope(input, async ({ control }) => {
-		if (!exactClaim(control.claim, input))
-			return { write: false, released: false, reason: "stale-claim" };
-		if (control.claim.started || input.provenNeverStarted !== true)
-			return {
-				write: false,
-				released: false,
-				reason: "claim-liveness-unknown",
-			};
-		control.claim = null;
-		return { released: true };
-	});
-}
-
-export function releaseHalfOpenClaimSync(input) {
-	claimIdentity(input);
-	if (!UUID_RE.test(input.leaseToken ?? ""))
-		throw new RouteHealthSchemaError("half-open lease token is invalid");
-	return updateScopeSync(input, ({ control }) => {
 		if (!exactClaim(control.claim, input))
 			return { write: false, released: false, reason: "stale-claim" };
 		if (control.claim.started || input.provenNeverStarted !== true)

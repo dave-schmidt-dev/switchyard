@@ -21,5 +21,4 @@ export { runProviderProcess } from "./provider-lifecycle-process.mjs";
 export {
 	boundProviderLifecycleSnapshot,
 	createProgressSnapshot,
-	DEFAULT_SILENCE_TIMEOUT_MS,
 } from "./provider-lifecycle-progress.mjs";

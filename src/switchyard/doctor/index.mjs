@@ -32,7 +32,7 @@ const DOCTOR_USAGE = `Usage: switchyard-dispatch doctor [--quick] [--json]
 
 Read-only host diagnosis: sandbox toolchain, provider CLI versions, bridge
 content pins, qualification expiry, repair holds, stranded pending attempts
-and the canary/reaper LaunchAgents. --quick runs only the state-file checks.
+the canary LaunchAgent and any leftover retired VM reaper. --quick runs only the state-file checks.
 Exit status: 0 no failures (warnings allowed), 1 a check failed, 2 usage.`;
 
 const QUICK_PROBES = Object.freeze({

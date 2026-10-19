@@ -1,39 +1,20 @@
 // @test-phase: other
-// Regressions for the partial-diff artifact channel (Task 6.5, Part A).
+// Regression for the partial-diff artifact channel (Task 6.5, Part A).
 //
-// worker-bootstrap.mjs used to copy a timed-out task's partial diff into
-// <runRoot>/artifacts/<taskId>.diff. Nothing ever read those bytes back:
-// listArtifactRefs hashes the file NAME into an opaque `artifact:<hash>` ref
-// and never opens the file, and opaqueArtifactRef rejects any reference that
-// is not exactly that opaque form. So raw provider output was persisted in
-// the run store purely so a count would appear in `switchyard result`'s
-// artifactRefs — the situation INV-2 exists to prevent.
-//
-// The replacement keeps the fact and drops the content: the runner already
-// emits a `partial_diff_captured` status event carrying the task id and the
-// diff's size in bytes, and worker-bootstrap's onStatus handler now forwards
-// both instead of discarding them.
-//
-// The onStatus regression extracts the shipped handler body and executes it
-// against a fake run store because this test needs to inject partial-diff
-// events directly. It remains bound to the production callback source, while
-// the separately exported worker-bootstrap helpers are covered by direct
-// imports.
+// The retired queue runner used to copy a timed-out task's partial diff into
+// <runRoot>/artifacts/<taskId>.diff, persisting raw provider output only so a
+// count would appear in an opaque artifact ref: the situation INV-2 exists to
+// prevent. The replacement keeps the fact and drops the content: a
+// `partial_diff_captured` event carries the task id and the diff's size in
+// bytes, and the run store must keep both without provisioning an artifacts
+// directory.
 
-import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { ok, strictEqual } from "node:assert";
 import { rmSync } from "node:fs";
 
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import {
-	BOOTSTRAP_SOURCE,
-	makeOnStatus,
-} from "./helpers/bootstrap-handler.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
-
-const { persistAsyncResultArtifacts } = await import(
-	"../src/switchyard/runner/index.mjs"
-);
 
 const TEST_ROOT = tempDir("switchyard-partial-diff-");
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
@@ -51,162 +32,6 @@ after(() => {
 });
 
 describe("partial diffs are recorded, not copied (Task 6.5)", () => {
-	it("fails closed and emits a bounded event when a partial diff cannot be saved", () => {
-		const events = [];
-		const result = {
-			taskId: "1.1",
-			success: false,
-			result: "integration_failed",
-			partialDiff: "diff bytes that must not escape",
-		};
-		persistAsyncResultArtifacts({
-			result,
-			checkpointPath: "/unused/checkpoint.json",
-			resultAttempt: 1,
-			onStatus: (event) => events.push(event),
-			savePartialDiffFn: () => {
-				throw new Error("synthetic save failure");
-			},
-		});
-		strictEqual(result.success, false);
-		strictEqual(result.result, "diff_capture_failed");
-		strictEqual(result.errorKind, "diff_capture_failed");
-		strictEqual(result.partialDiffPath, null);
-		strictEqual(result.partialDiff, undefined);
-		deepStrictEqual(events, [
-			{
-				phase: "artifact",
-				event: "partial_diff_persistence_failed",
-				status: "Task 1.1 partial diff could not be saved",
-				taskId: "1.1",
-			},
-		]);
-		ok(!JSON.stringify(events).includes("diff bytes"));
-	});
-
-	it("fails closed when gate evidence cannot be saved", () => {
-		const events = [];
-		const result = {
-			taskId: "1.2",
-			success: false,
-			result: "integration_failed",
-			gateEvidence: "provider output that must not escape",
-		};
-		persistAsyncResultArtifacts({
-			result,
-			checkpointPath: "/unused/checkpoint.json",
-			resultAttempt: 1,
-			onStatus: (event) => events.push(event),
-			saveGateEvidenceFn: () => {
-				throw new Error("synthetic save failure");
-			},
-		});
-		strictEqual(result.result, "diff_capture_failed");
-		strictEqual(result.gateEvidencePath, null);
-		strictEqual(result.gateEvidence, undefined);
-		strictEqual(events[0].event, "gate_evidence_persistence_failed");
-		ok(!JSON.stringify(events).includes("provider output"));
-	});
-
-	it("keeps checkpoint evidence references opaque", () => {
-		ok(!/raw provider transcripts/i.test(BOOTSTRAP_SOURCE));
-	});
-
-	it("proves the failure path no longer copies a partial diff into artifacts/", () => {
-		ok(
-			!/copyFile/.test(BOOTSTRAP_SOURCE),
-			"worker-bootstrap must not import or call copyFile: the only caller was the partial-diff copy",
-		);
-		ok(
-			!/\.diff`/.test(BOOTSTRAP_SOURCE) && !/\.diff"/.test(BOOTSTRAP_SOURCE),
-			"worker-bootstrap must not construct a .diff filename in the run store",
-		);
-		// The plan's own acceptance grep. `partialDiffPath` may still be named
-		// in a comment explaining why it is not copied, but it must not be
-		// consumed by any expression.
-		for (const line of BOOTSTRAP_SOURCE.split("\n")) {
-			const code = line.replace(/^\s*\/\/.*$/, "");
-			ok(
-				!/partialDiffPath/.test(code),
-				`worker-bootstrap must not read partialDiffPath outside a comment: ${line.trim()}`,
-			);
-		}
-	});
-
-	it("proves onStatus forwards the task id and the partial diff's size in bytes", () => {
-		const { onStatus, emitted } = makeOnStatus();
-		onStatus({
-			phase: "execution",
-			event: "partial_diff_captured",
-			status: "Task 1.1 timed out; partial diff saved for review (not applied)",
-			taskId: "1.1",
-			byteCount: 4096,
-		});
-		strictEqual(emitted.length, 1);
-		strictEqual(emitted[0].event, "partial_diff_captured");
-		strictEqual(
-			emitted[0].taskId,
-			"1.1",
-			"the task id must survive onStatus: without it the event says a diff happened to some task",
-		);
-		strictEqual(
-			emitted[0].byteCount,
-			4096,
-			"the byte count must survive onStatus: it is the whole remaining diagnostic",
-		);
-	});
-
-	it("proves onStatus forwards nothing beyond the approved scalars", () => {
-		const { onStatus, emitted } = makeOnStatus();
-		onStatus({
-			phase: "execution",
-			event: "partial_diff_captured",
-			status: "Task 1.1 timed out",
-			taskId: "1.1",
-			byteCount: 12,
-			// Every one of these is raw provider output or a host path. None
-			// may reach events.jsonl.
-			partialDiffPath: "/tmp/tasks.md.checkpoint.json.partial-diffs/1.1.diff",
-			partialDiff: "diff --git a/secret.txt b/secret.txt",
-			output: "provider stdout",
-			error: "provider stderr",
-		});
-		deepStrictEqual(
-			Object.keys(emitted[0]).sort(),
-			["byteCount", "event", "phase", "status", "taskId"],
-			"onStatus must forward by explicit name, never by spread",
-		);
-	});
-
-	it("drops a byteCount that is not a non-negative safe integer", () => {
-		const { onStatus, emitted } = makeOnStatus();
-		for (const byteCount of [-1, 1.5, Number.NaN, "4096", null, {}]) {
-			onStatus({
-				phase: "execution",
-				event: "partial_diff_captured",
-				status: "s",
-				byteCount,
-			});
-		}
-		for (const event of emitted) {
-			ok(
-				!Object.hasOwn(event, "byteCount"),
-				`a byteCount of ${String(event.byteCount)} must not be forwarded`,
-			);
-		}
-	});
-
-	it("truncates a forwarded task id to the same bound as the other scalars", () => {
-		const { onStatus, emitted } = makeOnStatus();
-		onStatus({
-			phase: "execution",
-			event: "partial_diff_captured",
-			status: "s",
-			taskId: "x".repeat(500),
-		});
-		strictEqual(emitted[0].taskId.length, 64);
-	});
-
 	it("persists the task id and byte count through createEvent to events.jsonl", async () => {
 		const runId = "3f2b0c1e-9a44-4d7e-8c21-5b6d0a4e7f10";
 		await initializeRun({

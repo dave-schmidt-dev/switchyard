@@ -58,7 +58,6 @@ describe("reader-first outcome event floor", () => {
 			),
 			new URL("../src/switchyard/run-store/validate-run.mjs", import.meta.url),
 			new URL("../src/switchyard/run-store/run-records.mjs", import.meta.url),
-			new URL("../src/switchyard/run-store/vm-slots.mjs", import.meta.url),
 			new URL(
 				"../src/switchyard/run-store/project-lock-files.mjs",
 				import.meta.url,

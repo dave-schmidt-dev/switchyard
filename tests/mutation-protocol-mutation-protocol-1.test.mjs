@@ -1,9 +1,6 @@
 // @test-phase: other
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
-import { randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
 import { describe, it } from "node:test";
-import { killOrphanedProcesses } from "../src/switchyard/adapter/orphan-kill.mjs";
 import {
 	createMutationIntent,
 	createMutationPolicy,
@@ -12,7 +9,6 @@ import {
 	mutationBackoffDelay,
 	validateMutationRecord,
 } from "../src/switchyard/lifecycle/mutation-protocol.mjs";
-import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("mutation protocol", () => {
 	it("creates stable intent identities and rejects unbounded policies", () => {
@@ -319,62 +315,5 @@ describe("mutation protocol", () => {
 			(error) => error?.code === "mutation_identity_mismatch",
 		);
 		strictEqual(commandCalls, 0);
-	});
-
-	it("routes orphan termination through the same durable protocol", async () => {
-		const events = [];
-		const result = await killOrphanedProcesses("unsafe;name", {
-			executionBackend: { cleanupProviderProcess() {} },
-			command: "prlctl",
-			args: ["exec", "guest"],
-			mutationProtocol: {
-				operationId: "operation-orphan-termination",
-				resource: "container-unsafe",
-				policy: {
-					maxAttempts: 1,
-					commandTimeoutMs: 100,
-					observationTimeoutMs: 100,
-				},
-				persist: async (record) => events.push(record.state),
-			},
-		});
-		strictEqual(result.state, "completed");
-		strictEqual(result.operationId, "operation-orphan-termination");
-		ok(events.includes("intent"));
-		ok(events.includes("completed"));
-	});
-
-	it("routes the default orphan adapter path through mutation progress", () => {
-		const storeRoot = tempDir("switchyard-orphan-");
-		const previousRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
-		process.env.SWITCHYARD_RUN_STORE_ROOT = storeRoot;
-		const events = [];
-		let backendCalls = 0;
-		try {
-			const result = killOrphanedProcesses(
-				`container-default-${randomUUID()}`,
-				{
-					cleanupContext: {
-						runId: `run-default-${randomUUID()}`,
-						attemptId: "attempt-default-orphan",
-					},
-					executionBackend: {
-						cleanupProviderProcess() {
-							backendCalls += 1;
-						},
-					},
-					onStatus: (event) => events.push(event.event),
-				},
-			);
-			strictEqual(backendCalls, 1);
-			strictEqual(result.cleanupFailed, false);
-			ok(events.includes("mutation_intent_durable"));
-			ok(events.includes("mutation_completed"));
-		} finally {
-			if (previousRoot === undefined)
-				delete process.env.SWITCHYARD_RUN_STORE_ROOT;
-			else process.env.SWITCHYARD_RUN_STORE_ROOT = previousRoot;
-			rmSync(storeRoot, { recursive: true, force: true });
-		}
 	});
 });

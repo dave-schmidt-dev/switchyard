@@ -37,7 +37,6 @@ describe("hermetic test environment", () => {
 				"XDG_STATE_HOME",
 				"GIT_CONFIG_GLOBAL",
 				"SWITCHYARD_RUN_STORE_ROOT",
-				"SWITCHYARD_VM_ADMISSION_ROOT",
 				"SWITCHYARD_ACCOUNT_ROOT",
 				"SWITCHYARD_SNAPSHOT_PATH_OVERRIDE",
 			])
@@ -81,31 +80,6 @@ describe("hermetic test environment", () => {
 		strictEqual(existsSync(second.dir), false);
 		strictEqual(existsSync(root), false);
 		strictEqual(Object.hasOwn(env, SCRATCH_ROOT_ENV), false);
-	});
-
-	it("keeps the host-global VM slots only for an opt-in live-VM run", () => {
-		const ownerHome = realpathSync(tempDir("sy-hermetic-owner-"));
-		const base = { PATH: process.env.PATH, HOME: ownerHome };
-		const ordinary = createHermeticTestEnv(base);
-		const live = createHermeticTestEnv({
-			...base,
-			SWITCHYARD_LIVE_VM_TESTS: "1",
-		});
-		const pinned = createHermeticTestEnv({
-			...base,
-			SWITCHYARD_LIVE_VM_TESTS: "1",
-			SWITCHYARD_VM_ADMISSION_ROOT: "/x/admission",
-		});
-		try {
-			ok(ordinary.env.SWITCHYARD_VM_ADMISSION_ROOT.startsWith(ordinary.dir));
-			strictEqual(
-				live.env.SWITCHYARD_VM_ADMISSION_ROOT,
-				join(ownerHome, ".switchyard", "admission"),
-			);
-			strictEqual(pinned.env.SWITCHYARD_VM_ADMISSION_ROOT, "/x/admission");
-		} finally {
-			for (const item of [ordinary, live, pinned]) item.cleanup();
-		}
 	});
 
 	it("gives a real child its own home, temp dir and a non-signing git identity", () => {

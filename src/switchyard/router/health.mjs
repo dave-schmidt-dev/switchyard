@@ -1,9 +1,7 @@
 export {
 	acquireHalfOpenClaim,
-	acquireHalfOpenClaimSync,
 	attestRouteRepair,
 	releaseHalfOpenClaim,
-	releaseHalfOpenClaimSync,
 	startHalfOpenClaim,
 	startHalfOpenClaimSync,
 } from "./health-claims.mjs";

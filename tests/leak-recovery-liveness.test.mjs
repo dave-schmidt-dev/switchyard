@@ -1,205 +1,115 @@
 // @test-phase: other
-import { strictEqual } from "node:assert";
+import { deepStrictEqual } from "node:assert";
 import { describe, it } from "node:test";
-import {
-	assessRecoveryEntry,
-	resolveIsRunDead,
-} from "../src/switchyard/dispatch/cli.mjs";
+import { releaseStaleProjectLocks } from "../src/switchyard/dispatch/recover-liveness.mjs";
 
-// Liveness rule that decides whether `recover` may reap a managed container.
-// This is the data-loss-critical branch: a false "dead" reaps a live
-// dispatch's container. Fully injectable (readRun + isWorkerLive), so these
-// run without Docker or a real run store.
+// Liveness rule that decides whether `recover --run` may release a run's
+// project lock. This is the data-loss-critical branch: a false "dead" frees a
+// live dispatch's lock and lets a second writer into its project. Fully
+// injectable (readRun + isWorkerLive + release), so these run without a real
+// run store.
 
 const GRACE_MS = 5 * 60_000;
-
-function deps({ run, live }) {
-	return {
-		readRun: async () => {
-			if (run === undefined) throw new Error("run not found");
-			return run;
-		},
-		isWorkerLive: () => live,
-	};
-}
 
 function runRec(overrides = {}) {
 	return {
 		state: "running",
 		cleanupState: "not_started",
 		workerPid: 4242,
+		projectPath: "/private/tmp/recovery-project",
 		createdAt: new Date().toISOString(),
 		...overrides,
 	};
 }
 
-describe("resolveIsRunDead — liveness gating", () => {
-	it("missing run record => dead (orphaned container)", async () => {
-		strictEqual(await resolveIsRunDead("r", deps({ run: undefined })), true);
+/** Run the release for one run id and return the ids whose lock was freed. */
+async function released({ run, live, classifyRunLiveness }) {
+	const calls = [];
+	const result = await releaseStaleProjectLocks(["r"], {
+		readRun: async () => {
+			if (run === undefined) throw new Error("run not found");
+			return run;
+		},
+		isWorkerLive: () => live,
+		...(classifyRunLiveness ? { classifyRunLiveness } : {}),
+		releaseProjectLockIfOwnedBy: async (projectPath, runId) => {
+			calls.push([projectPath, runId]);
+			return true;
+		},
+	});
+	deepStrictEqual(
+		calls.map(([, runId]) => runId),
+		result,
+		"every reported release must come from an actual release call",
+	);
+	return result;
+}
+
+describe("releaseStaleProjectLocks — liveness gating", () => {
+	it("missing run record => no release (no project path to key on)", async () => {
+		deepStrictEqual(await released({ run: undefined }), []);
 	});
 
-	it("terminal clean state => dead/reclaimable (succeeded)", async () => {
-		const d = deps({
-			run: runRec({ state: "succeeded", cleanupState: "complete" }),
-			live: true,
-		});
-		strictEqual(await resolveIsRunDead("r", d), true);
+	it("terminal clean state => released (succeeded)", async () => {
+		const run = runRec({ state: "succeeded", cleanupState: "complete" });
+		deepStrictEqual(await released({ run, live: true }), ["r"]);
 	});
 
-	it("terminal clean state => dead/reclaimable (failed)", async () => {
-		const d = deps({
-			run: runRec({ state: "failed", cleanupState: "complete" }),
-			live: true,
-		});
-		strictEqual(await resolveIsRunDead("r", d), true);
+	it("terminal clean state => released (failed)", async () => {
+		const run = runRec({ state: "failed", cleanupState: "complete" });
+		deepStrictEqual(await released({ run, live: true }), ["r"]);
 	});
 
-	it("live worker PID => alive (protects a long-running task)", async () => {
-		const d = deps({ run: runRec({ state: "running" }), live: true });
-		strictEqual(await resolveIsRunDead("r", d), false);
+	it("live worker PID => held (protects a long-running task)", async () => {
+		deepStrictEqual(await released({ run: runRec(), live: true }), []);
 	});
 
-	it("workerPid set but not signalable => dead (crashed worker)", async () => {
-		const d = deps({ run: runRec({ state: "running" }), live: false });
-		strictEqual(await resolveIsRunDead("r", d), true);
+	it("workerPid set but not signalable => released (crashed worker)", async () => {
+		deepStrictEqual(await released({ run: runRec(), live: false }), ["r"]);
 	});
 
-	it("workerPid null + fresh createdAt => alive (startup grace protects launch)", async () => {
-		const d = deps({
-			run: runRec({ state: "created", workerPid: null }),
-			live: false,
-		});
-		strictEqual(await resolveIsRunDead("r", d), false);
+	it("workerPid null + fresh createdAt => held (startup grace protects launch)", async () => {
+		const run = runRec({ state: "created", workerPid: null });
+		deepStrictEqual(await released({ run, live: false }), []);
 	});
 
-	it("workerPid null + createdAt past the grace => dead (stuck/abandoned launch)", async () => {
+	it("workerPid null + createdAt past the grace => released (abandoned launch)", async () => {
 		const old = new Date(Date.now() - GRACE_MS - 60_000).toISOString();
-		const d = deps({
-			run: runRec({ state: "launching", workerPid: null, createdAt: old }),
-			live: false,
-		});
-		strictEqual(await resolveIsRunDead("r", d), true);
+		const run = runRec({ state: "launching", workerPid: null, createdAt: old });
+		deepStrictEqual(await released({ run, live: false }), ["r"]);
 	});
 
 	it("workerPid null + unparseable createdAt => held (cannot prove staleness)", async () => {
-		const d = deps({
-			run: runRec({ state: "created", workerPid: null, createdAt: "nonsense" }),
-			live: false,
+		const run = runRec({
+			state: "created",
+			workerPid: null,
+			createdAt: "nonsense",
 		});
-		strictEqual(await resolveIsRunDead("r", d), false);
+		deepStrictEqual(await released({ run, live: false }), []);
 	});
 
-	it("terminal finalizer with incomplete cleanup remains live", async () => {
-		const d = deps({
-			run: runRec({ state: "failed", cleanupState: "pending" }),
-			live: true,
-		});
-		strictEqual(await resolveIsRunDead("r", d), false);
+	it("terminal finalizer with incomplete cleanup => held", async () => {
+		const run = runRec({ state: "failed", cleanupState: "pending" });
+		deepStrictEqual(await released({ run, live: true }), []);
 	});
 
-	it("malformed and PID-ambiguous owners remain non-reclaimable", async () => {
-		strictEqual(
-			await resolveIsRunDead(
-				"r",
-				deps({ run: runRec({ workerPid: "4242" }), live: false }),
-			),
-			false,
+	it("failed cleanup => held for attended recovery", async () => {
+		const run = runRec({ state: "failed", cleanupState: "failed" });
+		deepStrictEqual(await released({ run, live: false }), []);
+	});
+
+	it("malformed and PID-ambiguous owners => held", async () => {
+		deepStrictEqual(
+			await released({ run: runRec({ workerPid: "4242" }), live: false }),
+			[],
 		);
-		const ambiguous = deps({ run: runRec(), live: false });
-		ambiguous.classifyRunLiveness = () => "unknown";
-		strictEqual(await resolveIsRunDead("r", ambiguous), false);
-	});
-});
-
-describe("recovery candidate proof", () => {
-	const entry = {
-		uuid: "fixture-uuid",
-		name: "switchyard-work-run-4242",
-		runId: "run",
-		creatorPid: 4242,
-		status: "stopped",
-	};
-	const projectPath = "/private/tmp/recovery-project";
-
-	it("authorizes only exact dead or terminal-clean run evidence", async () => {
-		for (const liveness of ["dead", "terminal_clean"]) {
-			const result = await assessRecoveryEntry(
-				entry,
-				{
-					readRun: async () => ({
-						runId: "run",
-						projectPath,
-						cleanupState: "pending",
-					}),
-					classifyRunLiveness: () => liveness,
-				},
-				projectPath,
-			);
-			strictEqual(result.eligible, true, liveness);
-			strictEqual(result.reason, "stale_owned_resource", liveness);
-		}
-	});
-
-	it("preserves live, mismatched, missing, malformed, and unknown evidence", async () => {
-		const cases = [
-			{
-				label: "live",
-				dependencies: {
-					readRun: async () => ({
-						runId: "run",
-						projectPath,
-						cleanupState: "pending",
-					}),
-					classifyRunLiveness: () => "live",
-				},
-				reason: "live_run",
-			},
-			{
-				label: "mismatched",
-				dependencies: {
-					readRun: async () => ({
-						runId: "other",
-						projectPath,
-						cleanupState: "complete",
-					}),
-				},
-				reason: "run_identity_mismatch",
-			},
-			{
-				label: "missing",
-				dependencies: {
-					readRun: async () => Promise.reject(new Error("missing")),
-				},
-				reason: "run_missing",
-			},
-			{
-				label: "unknown",
-				dependencies: {
-					readRun: async () => ({
-						runId: "run",
-						projectPath,
-						cleanupState: "pending",
-					}),
-					classifyRunLiveness: () => "unknown",
-				},
-				reason: "liveness_unknown",
-			},
-		];
-		for (const testCase of cases) {
-			const result = await assessRecoveryEntry(
-				entry,
-				testCase.dependencies,
-				projectPath,
-			);
-			strictEqual(result.eligible, false, testCase.label);
-			strictEqual(result.reason, testCase.reason, testCase.label);
-		}
-		const malformed = await assessRecoveryEntry(
-			{ ...entry, creatorPid: "4242" },
-			{},
-			projectPath,
+		deepStrictEqual(
+			await released({
+				run: runRec(),
+				live: false,
+				classifyRunLiveness: () => "unknown",
+			}),
+			[],
 		);
-		strictEqual(malformed.eligible, false);
-		strictEqual(malformed.reason, "identity_malformed");
 	});
 });

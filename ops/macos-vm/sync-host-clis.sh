@@ -1,13 +1,12 @@
 #!/bin/bash
-# Bring the host's provider CLIs to the versions pinned in the CLI manifest, the
-# same pins update-guest-clis.sh applies inside the golden VM, so the host and
-# the guest run one release of each CLI.
+# Bring the host's provider CLIs to the versions pinned in the CLI manifest, so
+# every simple dispatch runs one known release of each CLI.
 #
 # Each CLI is updated with its own documented updater (see host_update below);
 # the manifest stays the single pin. A CLI whose package manager cannot reach the
 # pin (for example a Homebrew formula that lags the vendor) is reported and the
 # script exits non-zero, never silently left behind. Lower the pin with
-# generate-cli-manifest.sh in that case so both lanes can install it.
+# generate-cli-manifest.sh in that case so the host can install it.
 #
 #   sync-host-clis.sh --cli-manifest PATH            update what differs, verify
 #   sync-host-clis.sh --cli-manifest PATH --check    report only, change nothing
@@ -95,7 +94,7 @@ selected() {
   return 1
 }
 
-# Same version-token rule the guest scripts use, so host and guest compare alike.
+# Extract the first version token a CLI prints, so it compares against the pin.
 extract_cli_version() {
   printf '%s\n' "$1" | awk '
     {

@@ -7,26 +7,17 @@ import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnosti
 import { getInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import {
 	acquireHalfOpenClaim,
-	createDefaultRouteHealthDecision,
 	createRouteHealthTerminalBinding,
 	ingestRouteHealthEvents,
 	inspectRouteHealth,
 } from "../src/switchyard/router/health.mjs";
 import { COOLDOWN_MS } from "../src/switchyard/router/health-schema.mjs";
-import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
 import {
 	createEvent,
 	readAuthorizedRunEvents,
 } from "../src/switchyard/run-store/index.mjs";
-import {
-	attachRouteHealthTerminal,
-	prepareRouteHealthTrial,
-} from "../src/switchyard/runner/route-health.mjs";
 import { SIMPLE_TARGET_ADAPTERS } from "../src/switchyard/simple/args.mjs";
-import {
-	createSimpleRouteHealthController,
-	SIMPLE_ROUTE_HEALTH_EPOCH,
-} from "../src/switchyard/simple/health.mjs";
+import { createSimpleRouteHealthController } from "../src/switchyard/simple/health.mjs";
 import {
 	cleanupHealthFixture,
 	defaultHealthDecision,
@@ -41,7 +32,6 @@ import {
 	setupHealthFixture,
 	simpleInput,
 	vmLifecycle,
-	withSystemClock,
 } from "./provider-reliability-health-fixture.mjs";
 
 before(setupHealthFixture);
@@ -419,7 +409,7 @@ describe("provider reliability health", () => {
 		strictEqual((await inspectRouteHealth(identity)).state, "healthy");
 	});
 
-	it("keeps default shadow failures runnable and releases a baseline-only claim", async () => {
+	it("keeps default shadow failures runnable", async () => {
 		const descriptor = getInvocationDescriptor("codex", "standard");
 		const healthStateRoot = join(HEALTH_ROOT, "shadow-and-baseline");
 		const seeded = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
@@ -459,88 +449,6 @@ describe("provider reliability health", () => {
 			).state,
 			"cooldown",
 		);
-
-		const baselineRun = await initializeHealthRun("task-baseline");
-		const enforceDecision = createDefaultRouteHealthDecision({
-			healthStateRoot,
-			mode: "enforce",
-			qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
-			goldenImageReference: SIMPLE_ROUTE_HEALTH_EPOCH,
-			now: () => seeded.at + COOLDOWN_MS[0] + 1_000,
-		});
-		const context = {
-			healthDecision: enforceDecision,
-			runId: baselineRun.runId,
-			healthAttempt: "attempt-baseline",
-			workingContainerName: "fixture-vm",
-		};
-		const routeResult = {
-			provider: "codex",
-			resolved_harness: "codex",
-			requiredCapability: "standard",
-		};
-		const allocated = withSystemClock(seeded.at + COOLDOWN_MS[0] + 1_000, () =>
-			prepareRouteHealthTrial(
-				context,
-				{ id: baselineRun.taskId },
-				routeResult,
-				descriptor,
-			),
-		);
-		strictEqual(
-			allocated.allowed,
-			true,
-			JSON.stringify({
-				allocated,
-				decision: enforceDecision({
-					provider: "codex",
-					requiredCapability: "standard",
-				}),
-			}),
-		);
-		strictEqual(
-			(
-				await inspectRouteHealth(
-					healthIdentity(healthStateRoot, descriptor, seeded.epoch),
-				)
-			).claimStatus,
-			"allocated",
-		);
-		const baselineFailure = createProviderReliabilityDiagnostic({
-			causeCode: "baseline_check_failed",
-			phase: "baseline",
-			baselineStatus: "failed",
-			exitCode: 7,
-		});
-		attachRouteHealthTerminal(
-			{ providerReliability: baselineFailure, providerLifecycle: null },
-			context,
-		);
-		strictEqual(context._activeRouteHealth, null);
-		await createEvent(baselineRun.runId, {
-			phase: "execution",
-			event: "task_failed",
-			status: "failed",
-			taskId: baselineRun.taskId,
-			attempt: "attempt-baseline",
-			result: baselineFailure.causeCode,
-			providerReliability: baselineFailure,
-		});
-		const baselineResults = await ingestRouteHealthEvents({
-			authorisedRuns: [
-				{ runId: baselineRun.runId, runRoot: baselineRun.runRoot },
-			],
-			healthStateRoot,
-		});
-		deepStrictEqual(baselineResults, []);
-		const released = await inspectRouteHealth(
-			healthIdentity(healthStateRoot, descriptor, seeded.epoch, {
-				nowMs: seeded.at + COOLDOWN_MS[0] + 1_000,
-			}),
-		);
-		strictEqual(released.state, "cooldown");
-		strictEqual(released.trialAvailable, true);
-		strictEqual(released.claimStatus, null);
 	});
 
 	it("keeps an enforce lease fenced after unknown provider cleanup", async () => {

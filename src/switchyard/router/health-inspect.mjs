@@ -254,7 +254,7 @@ export function effective(control, observations, input, now) {
 	return { key, value, state: value.state };
 }
 
-export function repairTrialAvailable(control, input) {
+function repairTrialAvailable(control, input) {
 	if (control.holds.length === 0) return false;
 	const newestHold = Math.max(...control.holds.map((hold) => hold.at));
 	return control.attestations.some(

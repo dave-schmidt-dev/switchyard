@@ -1,18 +1,11 @@
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
-import { activateOutcomeWriter } from "../run-store/outcomes.mjs";
 import {
 	reconcileProjectLockClaims,
 	releaseOrphanedProjectLocks,
 } from "../run-store/project-lock-claims.mjs";
 import { getStateRoot } from "../run-store/project-lock-files.mjs";
-import {
-	isProjectLockOwnedBy,
-	releaseProjectLockIfOwnedBy,
-} from "../run-store/project-locks.mjs";
+import { releaseProjectLockIfOwnedBy } from "../run-store/project-locks.mjs";
 import { isTerminalState } from "../run-store/run-liveness.mjs";
-import { acquireRunLock } from "../run-store/run-locks.mjs";
 import { readRun } from "../run-store/run-records.mjs";
 import {
 	scanSimpleWorktreeOpenHandles,
@@ -26,18 +19,17 @@ import {
 } from "./gc-roots.mjs";
 import {
 	inspectSimpleWorktreeRecovery,
-	recoveryLiveness,
 	releaseStaleProjectLocks,
 } from "./recover-liveness.mjs";
-import {
-	auditKnownAllocationIntents,
-	canonicalRecoveryProject,
-	emptyReclaimResult,
-	reclaimManagedEntries,
-	recoveryExecutionBackend,
-} from "./recover-reclaim.mjs";
-import { finalizeRun } from "./run-finalization.mjs";
 
+/**
+ * Release stale project locks and recover a terminal simple run's worktree.
+ *
+ * Without `--run`, every orphaned or unclaimed project lock is reconciled.
+ * With `--run`, the named run's own lock is released once its worker is dead
+ * or terminal, and a terminal simple run's retained worktree is removed when
+ * no process holds it open. A running simple run is left untouched.
+ */
 async function handleRecover(argv, dependencies = {}) {
 	const { help, runId, stateRoot } = parseRecoverArgs(argv);
 
@@ -48,228 +40,31 @@ async function handleRecover(argv, dependencies = {}) {
 
 	const effectiveStateRoot = stateRoot ?? getStateRoot();
 	return withStateRoot(effectiveStateRoot, async () => {
-		let executionBackend = dependencies.executionBackend ?? null;
-		const getExecutionBackend = () =>
-			(executionBackend ??= recoveryExecutionBackend(dependencies));
-		const listManaged =
-			dependencies.listManaged ?? (() => getExecutionBackend().listManaged());
-		let managed = [];
-		let inventoryErrors = [];
 		let recoveryRun = null;
 		if (runId) {
 			try {
 				recoveryRun = await (dependencies.readRun ?? readRun)(runId);
 			} catch {
-				// Missing run evidence never authorizes VM destruction.
+				// A missing run record leaves nothing run-scoped to recover.
 			}
 		}
 		const simpleRun =
 			recoveryRun?.runId === runId &&
 			recoveryRun.initialHostFingerprint === "simple";
-		// Simple runs own local worktree claims, not managed VMs. Avoid asking
-		// the VM backend to inventory resources for any targeted simple run.
-		if (!simpleRun) {
-			try {
-				managed = listManaged();
-			} catch {
-				inventoryErrors = ["managed_inventory_unavailable"];
-			}
-		}
-		const candidateIds = managed.map((entry) => entry.runId).filter(Boolean);
-
-		let reclaimedCount = 0;
-		const errors = [...inventoryErrors];
-		let unreclaimedSnapshots = [];
-		let candidateResults = [];
+		const errors = [];
 		let simpleWorktreeCandidate = null;
-		let runningSimpleRun = false;
-		let recoveredByFinalizer = false;
-		let projectLockReleasedByFinalizer = false;
-		if (runId && simpleRun) {
-			if (recoveryRun.worktree) {
-				simpleWorktreeCandidate = inspectSimpleWorktreeRecovery(
-					recoveryRun,
-					dependencies,
-				);
-			}
-			runningSimpleRun = recoveryRun.state === "running";
-		} else if (runId) {
-			const target = managed.find((entry) => entry.runId === runId);
-			const recoveryRunMatchesTarget =
-				recoveryRun?.runId === runId &&
-				typeof recoveryRun.projectPath === "string";
-			const liveness = recoveryRunMatchesTarget
-				? recoveryLiveness(recoveryRun, dependencies)
-				: "unknown";
-			const reclaimTarget = async () => {
-				if (!target || !recoveryRunMatchesTarget) return false;
-				const targetDependencies =
-					typeof dependencies.destroy === "function" &&
-					typeof dependencies.reclaim !== "function"
-						? {
-								...dependencies,
-								reclaim: ({ eligibility }) => {
-									if (!eligibility(target)) return emptyReclaimResult();
-									dependencies.destroy(target);
-									return {
-										...emptyReclaimResult(),
-										reclaimed: [target],
-									};
-								},
-							}
-						: dependencies;
-				const { result, candidates } = await reclaimManagedEntries({
-					managed: [target],
-					dependencies: targetDependencies,
-					projectPath: recoveryRun.projectPath,
-				});
-				candidateResults = candidates;
-				const reclaimed = result.reclaimed.some(
-					(entry) => entry.uuid === target.uuid && entry.name === target.name,
-				);
-				if (reclaimed) reclaimedCount = 1;
-				unreclaimedSnapshots.push(...(result.skippedSnapshots ?? []));
-				errors.push(
-					...(result.errors ?? []).map(
-						(error) => `${error.name}: ${error.reason}`,
-					),
-				);
-				return reclaimed;
-			};
-			if (
-				recoveryRunMatchesTarget &&
-				liveness === "dead" &&
-				!isTerminalState(recoveryRun.state)
-			) {
-				// Preserve the dead-worker proof through the destructive boundary.
-				// Claiming the recovery writer lease first would make the run appear
-				// live and correctly disqualify its managed VM from reclamation.
-				let destroyFailed = false;
-				if (target) {
-					try {
-						if (!(await reclaimTarget())) destroyFailed = true;
-					} catch {
-						destroyFailed = true;
-						errors.push("managed_reclaim_failed");
-					}
-				}
-				const recoveryStartToken = randomUUID();
-				const recoveryNonce = randomUUID();
-				await acquireRunLock(
-					runId,
-					process.pid,
-					recoveryStartToken,
-					recoveryNonce,
-					{
-						allowRecovery: true,
-						maxAgeMs: 0,
-						now: new Date(Date.now() + 1).toISOString(),
-					},
-				);
-				await activateOutcomeWriter(runId, {
-					pid: process.pid,
-					startToken: recoveryStartToken,
-					nonce: recoveryNonce,
-					writerEpoch: `epoch-recovery-${randomUUID()}`,
-					allowRecovery: true,
-				});
-				const failure = sanitizeFailureMetadata({
-					result: "unknown_failure",
-					errorKind: "unknown_failure",
-					failurePhase: "terminal_reconciliation",
-				});
-				const finalized = await finalizeRun({
-					runId,
-					state: "failed",
-					terminalizedBy: "dead_worker_recovery",
-					failure,
-					terminalSummary: {
-						totalTasks: Array.isArray(recoveryRun.orderedTaskIds)
-							? recoveryRun.orderedTaskIds.length
-							: null,
-						runnableTasks: null,
-						processedTasks: null,
-						completedTaskIds: null,
-						failedCount: null,
-					},
-					cleanup: async () => {
-						await (
-							dependencies.reconcileProjectLockClaims ??
-							reconcileProjectLockClaims
-						)();
-						projectLockReleasedByFinalizer = await (
-							dependencies.releaseProjectLockIfOwnedBy ??
-							releaseProjectLockIfOwnedBy
-						)(recoveryRun.projectPath, runId);
-						if (
-							await (dependencies.isProjectLockOwnedBy ?? isProjectLockOwnedBy)(
-								recoveryRun.projectPath,
-								runId,
-							)
-						) {
-							throw new Error("recovery ownership cleanup incomplete");
-						}
-						if (destroyFailed) throw new Error("managed reclaim failed");
-					},
-				});
-				recoveredByFinalizer = finalized.terminal;
-				if (!finalized.cleanupComplete) errors.push("recovery_incomplete");
-			} else if (
-				target &&
-				(liveness === "terminal_clean" || liveness === "dead")
-			) {
-				try {
-					await reclaimTarget();
-				} catch {
-					errors.push("managed_reclaim_failed");
-				}
-			}
-			if (candidateResults.length === 0) {
-				candidateResults = target
-					? [
-							{
-								entry: target,
-								disposition: "preserved",
-								reason: recoveryRunMatchesTarget
-									? liveness === "live"
-										? "live_run"
-										: liveness === "startup_grace"
-											? "startup_grace"
-											: "liveness_unknown"
-									: recoveryRun
-										? "run_identity_mismatch"
-										: "run_missing",
-							},
-						]
-					: [];
-			}
-		} else {
-			const projectPath = await canonicalRecoveryProject(managed, dependencies);
-			try {
-				const { result, candidates } = await reclaimManagedEntries({
-					managed,
-					dependencies,
-					projectPath,
-				});
-				candidateResults = candidates;
-				reclaimedCount = result.reclaimed.length;
-				errors.push(...result.errors.map((e) => `${e.name}: ${e.reason}`));
-				unreclaimedSnapshots = result.skippedSnapshots ?? [];
-			} catch {
-				errors.push("managed_reclaim_unavailable");
-			}
+		if (simpleRun && recoveryRun.worktree) {
+			simpleWorktreeCandidate = inspectSimpleWorktreeRecovery(
+				recoveryRun,
+				dependencies,
+			);
 		}
+		const runningSimpleRun = simpleRun && recoveryRun.state === "running";
 
-		const targeted = runningSimpleRun
-			? []
-			: recoveredByFinalizer
-				? projectLockReleasedByFinalizer
-					? [runId]
-					: []
-				: await releaseStaleProjectLocks(
-						runId ? [runId] : candidateIds,
-						dependencies,
-					);
+		const targeted =
+			runningSimpleRun || !runId
+				? []
+				: await releaseStaleProjectLocks([runId], dependencies);
 		const direct = runningSimpleRun
 			? []
 			: await (
@@ -350,35 +145,20 @@ async function handleRecover(argv, dependencies = {}) {
 				errors.push("simple_worktree_recovery_unavailable");
 			}
 		}
-		const allocationIntents = simpleRun
-			? []
-			: await auditKnownAllocationIntents({
-					stateRoot: effectiveStateRoot,
-					runId,
-					managed,
-					dependencies,
-					executionBackend: getExecutionBackend(),
-				});
 
 		const output = {
 			disposition:
 				errors.length > 0
 					? "partial_failure"
-					: reclaimedCount > 0 || simpleWorktreesReclaimed > 0
+					: simpleWorktreesReclaimed > 0
 						? "reclaimed"
-						: simpleWorktreeCandidate
-							? ["removed", "missing"].includes(
+						: simpleWorktreeCandidate &&
+								!["removed", "missing"].includes(
 									simpleWorktreeCandidate.disposition,
 								)
-								? "no_candidates"
-								: "preserved"
-							: managed.length === 0
-								? "no_candidates"
-								: "preserved",
-			vmsReclaimed: reclaimedCount,
+							? "preserved"
+							: "no_candidates",
 			worktreesReclaimed: simpleWorktreesReclaimed,
-			unreclaimedSnapshots,
-			allocationIntents,
 			errors,
 			projectLocksReleased: releasedIds.length,
 			runId: runId ?? null,
@@ -387,23 +167,15 @@ async function handleRecover(argv, dependencies = {}) {
 					? []
 					: simpleWorktreeCandidate
 						? [simpleWorktreeCandidate]
-						: candidateResults.length > 0
-							? candidateResults.map(({ entry, disposition, reason }) => ({
-									name: entry.name,
-									runId: entry.runId,
-									status: entry.status,
-									disposition,
-									reason,
-								}))
-							: runId
-								? [
-										{
-											runId,
-											disposition: "preserved",
-											reason: "resource_missing",
-										},
-									]
-								: [],
+						: runId
+							? [
+									{
+										runId,
+										disposition: "preserved",
+										reason: "resource_missing",
+									},
+								]
+							: [],
 		};
 
 		console.log(JSON.stringify(output));

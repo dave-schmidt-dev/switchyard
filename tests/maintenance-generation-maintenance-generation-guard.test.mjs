@@ -12,8 +12,6 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { handleLaunch, runDispatch } from "../src/switchyard/dispatch/cli.mjs";
-import { recordDispatch } from "../src/switchyard/ledger/index.mjs";
 import {
 	assertGenerationAllowed,
 	beginGeneration,
@@ -22,7 +20,6 @@ import {
 	GenerationGuardError,
 	MaintenanceGenerationError,
 } from "../src/switchyard/maintenance/index.mjs";
-import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
 import { HOST_HOME } from "./helpers/host-home.mjs";
 import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
@@ -41,13 +38,6 @@ const HOST_PRODUCERS_SKIP =
 	"host ~/.agent producers absent";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const workerBootstrap = join(
-	projectRoot,
-	"src",
-	"switchyard",
-	"dispatch",
-	"worker-bootstrap.mjs",
-);
 const tempDirs = [];
 function tempDir() {
 	const path = trackedTempDir("switchyard-generation-test-");
@@ -71,90 +61,6 @@ describe("maintenance generation guard", () => {
 		assert.equal(
 			assertGenerationAllowed({ markerPath: markerPath() }).active,
 			false,
-		);
-	});
-
-	it("rejects new queue work in progress", async () => {
-		const path = markerPath();
-		activeMarker(path);
-		await assert.rejects(
-			() =>
-				runQueueAsync({
-					tasksFilePath: "unused",
-					projectPath: projectRoot,
-					dependencies: { generationMarkerPath: path },
-				}),
-			(error) => error instanceof MaintenanceGenerationError,
-		);
-	});
-
-	it("rejects dispatch and ledger entry points before side effects", async () => {
-		const path = markerPath();
-		activeMarker(path);
-		const opts = {
-			tasksFilePath: "unused",
-			projectPath: projectRoot,
-			maxTasks: 1,
-		};
-		await assert.rejects(
-			() =>
-				runDispatch(opts, {
-					assertGenerationAllowed: () =>
-						assertGenerationAllowed({ markerPath: path }),
-				}),
-			(error) => error instanceof MaintenanceGenerationError,
-		);
-		process.env.SWITCHYARD_GENERATION_MARKER = path;
-		const tasksFilePath = join(tempDir(), "TASKS.md");
-		writeFileSync(
-			tasksFilePath,
-			"### Task 1.1: Guarded\n- **Status:** pending\n- **Executor:** switchyard\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
-		);
-		await assert.rejects(
-			() => handleLaunch([tasksFilePath, "--project", projectRoot]),
-			(error) => error instanceof MaintenanceGenerationError,
-		);
-		assert.throws(
-			() =>
-				recordDispatch({
-					provider: "test",
-					model: "test",
-					taskId: "test",
-					result: "test",
-				}),
-			(error) => error instanceof MaintenanceGenerationError,
-		);
-	});
-
-	it("rejects detached workers before run-store retention side effects", () => {
-		const path = markerPath();
-		activeMarker(path);
-		const stateRoot = join(tempDir(), "state-root");
-		const result = spawnSync(
-			process.execPath,
-			[
-				workerBootstrap,
-				"--state-root",
-				stateRoot,
-				"--run-id",
-				"guarded-worker",
-				"--nonce",
-				"guarded-nonce",
-			],
-			{
-				encoding: "utf8",
-				env: {
-					...process.env,
-					SWITCHYARD_GENERATION_MARKER: path,
-				},
-			},
-		);
-		assert.equal(result.status, 1);
-		assert.match(result.stderr, /generation guard refused/);
-		assert.equal(
-			existsSync(join(stateRoot, "runs")),
-			false,
-			"guarded worker must not initialize run-store retention state",
 		);
 	});
 

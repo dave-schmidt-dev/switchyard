@@ -41,62 +41,6 @@ class LockError extends Error {
 		}
 	}
 }
-class VmSlotUnavailableError extends LockError {
-	constructor(holderRuns) {
-		const holders = holderRuns.length > 0 ? holderRuns.join(", ") : "unknown";
-		super(
-			`VM_SLOT_UNAVAILABLE: VM admission capacity is unavailable (held by run ${holders})`,
-			{ code: "VM_SLOT_UNAVAILABLE" },
-		);
-		this.name = "VmSlotUnavailableError";
-	}
-}
-class VmAdmissionUnavailableError extends Error {
-	constructor(cause) {
-		super("VM admission storage is unavailable", { cause });
-		this.name = "VmAdmissionUnavailableError";
-		this.code = "VM_ADMISSION_UNAVAILABLE";
-	}
-}
-class VmAdmissionPermissionDeniedError extends Error {
-	constructor(cause) {
-		super("VM admission storage permission is denied", { cause });
-		this.name = "VmAdmissionPermissionDeniedError";
-		this.code = "VM_ADMISSION_PERMISSION_DENIED";
-	}
-}
-class VmAdmissionStorageError extends Error {
-	constructor(cause) {
-		super("VM admission storage I/O failed", { cause });
-		this.name = "VmAdmissionStorageError";
-		this.code = "VM_ADMISSION_STORAGE_FAILED";
-	}
-}
-const VM_ADMISSION_PERMISSION_CODES = new Set(["EACCES", "EPERM"]);
-const VM_ADMISSION_STORAGE_CODES = new Set([
-	"EIO",
-	"ENOSPC",
-	"EDQUOT",
-	"EMFILE",
-	"ENFILE",
-	"EROFS",
-]);
-export function sanitizeVmAdmissionError(cause) {
-	if (
-		cause instanceof VmAdmissionUnavailableError ||
-		cause instanceof VmAdmissionPermissionDeniedError ||
-		cause instanceof VmAdmissionStorageError
-	) {
-		return cause;
-	}
-	if (VM_ADMISSION_PERMISSION_CODES.has(cause?.code)) {
-		return new VmAdmissionPermissionDeniedError(cause);
-	}
-	if (VM_ADMISSION_STORAGE_CODES.has(cause?.code)) {
-		return new VmAdmissionStorageError(cause);
-	}
-	return new VmAdmissionUnavailableError(cause);
-}
 class SchemaError extends Error {
 	constructor(message) {
 		super(message);
@@ -110,11 +54,5 @@ export {
 	RevisionError,
 	RUN_ID_RE,
 	SchemaError,
-	VM_ADMISSION_PERMISSION_CODES,
-	VM_ADMISSION_STORAGE_CODES,
-	VmAdmissionPermissionDeniedError,
-	VmAdmissionStorageError,
-	VmAdmissionUnavailableError,
-	VmSlotUnavailableError,
 	validateRunId,
 };

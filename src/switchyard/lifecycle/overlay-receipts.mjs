@@ -1,22 +1,6 @@
-import { randomUUID } from "node:crypto";
-import {
-	chmodSync,
-	closeSync,
-	fsyncSync,
-	linkSync,
-	lstatSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { dirname, isAbsolute, resolve, sep } from "node:path";
-import {
-	assertReceiptParentSafe,
-	DIRTY_OVERLAY_MAX_FILE_BYTES,
-	DIRTY_OVERLAY_SECRET_PATHS,
-} from "./overlay-paths.mjs";
+import { lstatSync, readFileSync } from "node:fs";
+import { isAbsolute, resolve, sep } from "node:path";
+import { DIRTY_OVERLAY_SECRET_PATHS } from "./overlay-paths.mjs";
 export function parsePredecessorReceipt(input, { projectPath = null } = {}) {
 	let data = input;
 	if (typeof input === "string") {
@@ -167,49 +151,4 @@ export function parsePredecessorReceipt(input, { projectPath = null } = {}) {
 		baseRevision,
 		outputs: normalizedOutputs,
 	};
-}
-export function writeDirtyOverlayReceipt(receiptPath, receipt) {
-	if (typeof receiptPath !== "string" || !receiptPath)
-		throw new TypeError("dirty overlay receipt path is required");
-	mkdirSync(dirname(receiptPath), { recursive: true, mode: 0o700 });
-	assertReceiptParentSafe(receiptPath);
-	const temporary = `${receiptPath}.${process.pid}.${randomUUID()}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(receipt)}\n`, {
-		encoding: "utf8",
-		mode: 0o600,
-	});
-	chmodSync(temporary, 0o600);
-	const fd = openSync(temporary, "r");
-	try {
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-	// A hard-link publish is atomic and create-only; never replace a receipt that
-	// a detached worker may already have consumed.
-	try {
-		linkSync(temporary, receiptPath);
-	} finally {
-		try {
-			unlinkSync(temporary);
-		} catch {}
-	}
-	return receiptPath;
-}
-export function readDirtyOverlayReceipt(receiptPath) {
-	assertReceiptParentSafe(receiptPath);
-	const stats = lstatSync(receiptPath);
-	const ownerUid =
-		typeof process.getuid === "function" ? process.getuid() : null;
-	if (
-		!stats.isFile() ||
-		stats.isSymbolicLink() ||
-		stats.nlink !== 1 ||
-		(ownerUid !== null && stats.uid !== ownerUid) ||
-		(stats.mode & 0o777) !== 0o600
-	)
-		throw new Error("dirty overlay receipt is not an owner-only regular file");
-	if (stats.size > DIRTY_OVERLAY_MAX_FILE_BYTES * 2)
-		throw new Error("dirty overlay receipt is too large");
-	return JSON.parse(readFileSync(receiptPath, "utf8"));
 }

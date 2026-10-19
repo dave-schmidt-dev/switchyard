@@ -79,7 +79,7 @@ const WORKER_BOOT_STAGE_DIAGNOSTIC_CODES = new Set([
 	"clone_hardening_failed",
 	"workspace_prepare_failed",
 ]);
-export class WorkerBootStageError extends Error {
+class WorkerBootStageError extends Error {
 	constructor(diagnosticCode, cause) {
 		if (!WORKER_BOOT_STAGE_DIAGNOSTIC_CODES.has(diagnosticCode)) {
 			throw new TypeError("unrecognized worker boot stage diagnostic code");

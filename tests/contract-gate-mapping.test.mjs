@@ -226,7 +226,7 @@ describe("source-boundary contract gate mapping", () => {
 	it("maps each declared production boundary to existing suites", () => {
 		const manifest = loadContractGateManifest(ROOT);
 		const ledger = loadLedgerGateMapping(ROOT);
-		strictEqual(manifest.length, 15);
+		strictEqual(manifest.length, 9);
 		strictEqual(
 			validateContractGateMapping({ manifest, ledger, root: ROOT }),
 			true,
@@ -254,11 +254,10 @@ describe("source-boundary contract gate mapping", () => {
 			/contract_gate_execution_invalid/,
 		);
 		const executedQuickCheckSuites = [
+			"tests/runner-check-command-receipts.test.mjs",
 			"tests/runner-python-quick-checks-host.test.mjs",
 			"tests/runner-python-quick-checks-unit.test.mjs",
 			"tests/runner-quick-checks-cleanup.test.mjs",
-			"tests/runner-quick-checks-contract-recovery.test.mjs",
-			"tests/runner-quick-checks-queue-recovery.test.mjs",
 			"tests/runner-quick-checks-sandbox-process.test.mjs",
 			"tests/runner-quick-checks-sandbox.test.mjs",
 			"tests/runner-quick-checks-toolchain-sandbox.test.mjs",
@@ -417,9 +416,9 @@ describe("source-boundary contract gate mapping", () => {
 		deepStrictEqual(
 			ownersForPaths(loadContractGateManifest(ROOT), [
 				"src/switchyard/run-store/index.mjs",
-				"src/switchyard/runner/index.mjs",
+				"src/switchyard/runner/reliability.mjs",
 			]).map((owner) => owner.id),
-			["production-runner", "run-store"],
+			["quick-checks", "run-store"],
 		);
 	});
 

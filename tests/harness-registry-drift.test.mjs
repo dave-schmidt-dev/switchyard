@@ -3,20 +3,17 @@
 // drift test.
 //
 // The Task 1.2 validator (`~/.agent/rosterlib/validate.py`) checks every
-// roster.json target names a "registered harness adapter", but until now it
-// did so against a hand-maintained, cross-repo-independent constant
-// (`KNOWN_HARNESSES`) with no automated check that the constant actually
-// matches reality. This file supplies that check from the switchyard side,
-// where the real source of truth lives: one adapter module per live,
-// dispatchable harness under `src/switchyard/adapter/*.mjs`, and the
-// `context.adapters` map `runQueue` builds from them by default
-// (`src/switchyard/runner/index.mjs` ~1190-1215: keys `claude`, `codex`,
-// `agy`, `cursor`, `copilot`, `opencode` -- one entry per adapter file that
-// implements dispatch, i.e. exports both an `execute*` function and a
-// `captureDiff` function). `constants.mjs`, `orphan-kill.mjs`, and
-// `shell-safety.mjs` live in the same directory but are shared helpers, not
-// adapters -- they export neither shape, so the structural filter below
-// naturally excludes them without a hardcoded filename list.
+// roster.json target names a "registered harness adapter", but against a
+// hand-maintained, cross-repo-independent constant (`KNOWN_HARNESSES`). This
+// file supplies the check from the switchyard side, where the real source of
+// truth lives: `SIMPLE_TARGET_ADAPTERS` in
+// `src/switchyard/simple/target-adapters.mjs`, the adapter table of the only
+// dispatch lane. A target with no entry there cannot dispatch at all.
+//
+// `cursor-pro` is the one enabled target without a simple adapter. It is
+// named in `KNOWN_UNADAPTED_TARGETS` rather than filtered silently, and a
+// guard below fails as soon as it gains an adapter, so the exception cannot
+// outlive its reason.
 //
 // Scope (locked, PM-3/PM-11 -- do not widen): iterate ONLY *enabled*
 // switchyard-dispatch targets from ~/.agent/roster.json.
@@ -32,55 +29,29 @@
 // fixture: the whole point is checking the real file, not a copy.
 
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
-import {
-	existsSync,
-	readdirSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { pathToFileURL } from "node:url";
 import { getInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { SIMPLE_TARGET_ADAPTERS } from "../src/switchyard/simple/target-adapters.mjs";
 import { HOST_HOME } from "./helpers/host-home.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
-const ADAPTER_DIR = join(REPO_ROOT, "src", "switchyard", "adapter");
 const README_PATH = join(REPO_ROOT, "README.md");
 const ROSTER_PATH = join(HOST_HOME, ".agent", "roster.json");
 
 /**
- * Discover the live, dispatchable harness ids from the switchyard adapter
- * directory: one id per `.mjs` file that exports both a `captureDiff`
- * function and an `execute*`-named function (the shape
- * `src/switchyard/runner/index.mjs`'s default `context.adapters` map is
- * built from -- see the file header). The harness id is the filename minus
- * `.mjs`, which is also exactly the key `context.adapters` and
- * roster.json's `harness` field use (verified against
- * runner/index.mjs's default adapters object: `claude`, `codex`, `agy`,
- * `cursor`, `copilot`, `opencode`).
- *
- * This is a structural (export-shape) filter, not a hardcoded filename
- * list, so it stays correct as adapters are added/removed -- exactly the
- * "define the authoritative source" gap this task closes.
+ * Enabled targets that have no simple adapter yet. Simple fails closed for
+ * them with `simple_lane_unavailable`; each entry records why it is allowed.
  */
-async function discoverLiveAdapterHarnesses(adapterDir) {
-	const files = readdirSync(adapterDir).filter((name) => name.endsWith(".mjs"));
-	const harnesses = new Set();
-	for (const file of files) {
-		const mod = await import(pathToFileURL(join(adapterDir, file)).href);
-		const exportNames = Object.keys(mod);
-		const hasCaptureDiff = typeof mod.captureDiff === "function";
-		const hasExecute = exportNames.some(
-			(name) => name === "execute" || name.startsWith("execute"),
-		);
-		if (hasCaptureDiff && hasExecute) {
-			harnesses.add(file.slice(0, -".mjs".length));
-		}
-	}
-	return harnesses;
+const KNOWN_UNADAPTED_TARGETS = Object.freeze({
+	"cursor-pro": "no simple adapter yet; dispatch fails closed",
+});
+
+/** Harness ids that have a live simple adapter. */
+function liveSimpleHarnesses(adapters) {
+	return new Set(adapters.map((adapter) => adapter.harness));
 }
 
 /**
@@ -93,6 +64,7 @@ function findHarnessDriftViolations(targets, liveAdapterHarnesses) {
 	const violations = [];
 	for (const [targetId, target] of Object.entries(targets)) {
 		if (target?.enabled !== true) continue;
+		if (Object.hasOwn(KNOWN_UNADAPTED_TARGETS, targetId)) continue;
 		const harness = target.harness;
 		if (typeof harness !== "string" || !liveAdapterHarnesses.has(harness)) {
 			violations.push(
@@ -104,7 +76,7 @@ function findHarnessDriftViolations(targets, liveAdapterHarnesses) {
 	return violations;
 }
 
-const liveAdapterHarnesses = await discoverLiveAdapterHarnesses(ADAPTER_DIR);
+const liveAdapterHarnesses = liveSimpleHarnesses(SIMPLE_TARGET_ADAPTERS);
 // Host ground truth: skip, never fail, where ~/.agent is absent (the check
 // sandbox and CI run under an isolated HOME).
 const HOST_ROSTER_SKIP =
@@ -122,11 +94,22 @@ const enabledTargetIds = Object.keys(targets).filter(
 describe("harness registry drift (Task 1.6b)", {
 	skip: HOST_ROSTER_SKIP,
 }, () => {
-	it("discovered at least one live adapter from the adapter directory", () => {
+	it("found at least one live simple adapter", () => {
 		ok(
 			liveAdapterHarnesses.size > 0,
-			`expected at least one live adapter under ${ADAPTER_DIR}`,
+			"expected at least one entry in SIMPLE_TARGET_ADAPTERS",
 		);
+	});
+
+	it("every known unadapted target still lacks a simple adapter", () => {
+		for (const targetId of Object.keys(KNOWN_UNADAPTED_TARGETS)) {
+			ok(
+				!SIMPLE_TARGET_ADAPTERS.some(
+					(adapter) => adapter.targetId === targetId,
+				),
+				`${targetId} now has a simple adapter; drop it from KNOWN_UNADAPTED_TARGETS`,
+			);
+		}
 	});
 
 	it("roster.json has at least one enabled target to check", () => {
@@ -137,6 +120,7 @@ describe("harness registry drift (Task 1.6b)", {
 	});
 
 	for (const targetId of enabledTargetIds) {
+		if (Object.hasOwn(KNOWN_UNADAPTED_TARGETS, targetId)) continue;
 		it(`${targetId}: harness resolves to a live adapter entry`, () => {
 			const harness = targets[targetId].harness;
 			ok(
@@ -433,7 +417,9 @@ describe("harness registry drift (Task 1.6b)", {
 			const tmpDir = tempDir("harness-drift-mutation-");
 			try {
 				const corrupted = JSON.parse(JSON.stringify(roster));
-				const firstEnabledId = enabledTargetIds[0];
+				const firstEnabledId = enabledTargetIds.find(
+					(id) => !Object.hasOwn(KNOWN_UNADAPTED_TARGETS, id),
+				);
 				corrupted.targets[firstEnabledId].harness = "totally-bogus-harness-xyz";
 				const corruptedPath = join(tmpDir, "roster.corrupted.json");
 				writeFileSync(corruptedPath, JSON.stringify(corrupted));

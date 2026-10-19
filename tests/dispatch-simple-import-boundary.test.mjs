@@ -9,20 +9,12 @@ import { tempDir } from "./helpers/tempdir.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const ENTRY = join(ROOT, "src/switchyard/dispatch/index.mjs");
-const LEGACY_CHAIN = [
+// Control-plane modules `simple` must not load: the recovery and health CLI,
+// and the run-store barrel. Simple reaches the run store through its defining
+// modules.
+const CONTROL_CHAIN = [
 	"src/switchyard/dispatch/cli.mjs",
-	"src/switchyard/dispatch/status-envelope.mjs",
-	"src/switchyard/lifecycle/backend-selection.mjs",
-	"src/switchyard/runner/broker.mjs",
-	"src/switchyard/runner/index.mjs",
-];
-// O1 step 4: simple reaches the run store and lifecycle through their
-// defining modules, never through the barrels that carry the VM lane.
-const VM_CHAIN = [
-	"src/switchyard/lifecycle/index.mjs",
-	"src/switchyard/lifecycle/parallels-execution-backend.mjs",
 	"src/switchyard/run-store/index.mjs",
-	"src/switchyard/run-store/vm-slots.mjs",
 ];
 
 const dir = tempDir("switchyard-import-boundary-");
@@ -66,31 +58,25 @@ function runBin(name, args) {
 // Regression (stability audit 2026-10-18, SC7): `switchyard-dispatch simple`
 // statically loaded the legacy queue, broker and backend selection, through
 // the bin's own imports and through the lock disposition's recover command,
-// so an import-time defect in that code could stop the default lane.
+// so an import-time defect in that code could stop the default lane. The
+// queue and VM lane are retired (O1); the boundary still keeps simple off the
+// control-plane modules.
 describe("switchyard-dispatch simple import boundary", () => {
-	it("routes simple without loading the legacy chain", () => {
+	it("routes simple without loading the control-plane modules", () => {
 		const { result, loaded } = runBin("simple", ["simple", "--help"]);
 		strictEqual(result.status, 0, result.stderr);
 		ok(result.stdout.startsWith("Usage: switchyard-dispatch simple"));
 		ok(loaded.has("src/switchyard/simple/index.mjs"));
 		ok(loaded.has("src/switchyard/simple/lock-disposition.mjs"));
 		deepStrictEqual(
-			LEGACY_CHAIN.filter((path) => loaded.has(path)),
-			[],
-		);
-		deepStrictEqual(
-			VM_CHAIN.filter((path) => loaded.has(path)),
+			CONTROL_CHAIN.filter((path) => loaded.has(path)),
 			[],
 		);
 	});
 
-	it("still loads the legacy chain for a legacy subcommand", () => {
-		const { result, loaded } = runBin("status", ["status"]);
-		strictEqual(result.status, 2, result.stderr);
-		ok(result.stderr.startsWith("dispatch: missing <run-id>"));
-		deepStrictEqual(
-			LEGACY_CHAIN.filter((path) => !loaded.has(path)),
-			[],
-		);
+	it("loads the control-plane CLI lazily for a control subcommand", () => {
+		const { result, loaded } = runBin("recover", ["recover", "--help"]);
+		strictEqual(result.status, 0, result.stderr);
+		ok(loaded.has("src/switchyard/dispatch/cli.mjs"));
 	});
 });

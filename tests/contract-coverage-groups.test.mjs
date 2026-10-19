@@ -85,12 +85,17 @@ describe("contract coverage groups", () => {
 			// diagnostics entry moved from the deleted, unused index.mjs to
 			// provider-reliability.mjs at the same floors. (O1 step 2): the
 			// runner/index.mjs group lost the eight deleted synchronous queue
-			// members. No floor changed.
-			"c7b5dcdeeba1b082a33543ac7789cf80cb7e40998231390641af254971879cc2",
+			// members. (O1 steps 5-7): the broker executor/schema, runner,
+			// worker-bootstrap and run-finalization entries left with their deleted
+			// modules, dispatch/index.mjs and run-store/index.mjs lost their deleted
+			// members, and a router/index.mjs group (75/60/75) took over the route
+			// selection suites the runner group used to pull in. No surviving floor
+			// changed.
+			"a2acefd42133fd6f0a92ecbe502c3ea3959c65332efbca60ba7554d83ac2285c",
 		);
 	});
 
-	it("runs the complete mapped suite set once, serially, with unchanged global floors and live output", () => {
+	it("runs the complete mapped suite set once, serially, with the lowest module floors and live output", () => {
 		const plan = criticalCoveragePlan(ROOT);
 		const regressions = [
 			"simple-check-session",
@@ -103,7 +108,6 @@ describe("contract coverage groups", () => {
 			"simple-lock-release-before-cleanup",
 			"integration-metadata-process",
 			"integration-metadata-refusal",
-			"runner-check-repair-async",
 			"simple-routing-task-memory",
 			"simple-routing-task-state",
 			"simple-routing-cli",
@@ -145,8 +149,11 @@ describe("contract coverage groups", () => {
 			// module. (O1 step 2): the four synchronous-queue descriptor-receipt
 			// and provider-spread suites left with the sync runner, and
 			// tests/runner-adapter-harness.test.mjs joined the production-runner
-			// gate. Every other entry and its order is unchanged.
-			"525b995f9c0b0d34ed90b02a2554f0e51a8e244690f544d887a9dbc33d05f835",
+			// gate. (O1 steps 5-7): every suite of the deleted detached, queue
+			// and VM modules left with them; tests/runner-check-repair-async left
+			// the focused list for the same reason. Every surviving entry and its
+			// order is unchanged.
+			"b8ec0d08cd46e830c58cf61f97637cd9d4ae347e76c94cbe03ae997dfbb12859",
 		);
 		let calls = 0;
 		const result = runContractCoverage({
@@ -159,10 +166,12 @@ describe("contract coverage groups", () => {
 					args.filter((arg) => arg.startsWith("--test-concurrency=")),
 					["--test-concurrency=1"],
 				);
+				// The 10/3 line and function floors left with the deleted runner
+				// group (O1 steps 5-7); every surviving module already clears 55.
 				for (const floor of [
-					"--test-coverage-lines=10",
+					"--test-coverage-lines=55",
 					"--test-coverage-branches=30",
-					"--test-coverage-functions=3",
+					"--test-coverage-functions=55",
 				])
 					ok(args.includes(floor));
 				deepStrictEqual(options.stdio, ["ignore", "inherit", "inherit"]);

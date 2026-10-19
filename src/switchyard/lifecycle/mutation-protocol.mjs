@@ -38,7 +38,7 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const RESOURCE_RE = /^[A-Za-z0-9._:/-]{1,256}$/u;
 const SAFE_CODE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 
-export class MutationProtocolError extends Error {
+class MutationProtocolError extends Error {
 	constructor(code, message = code, record = null) {
 		super(message);
 		this.name = "MutationProtocolError";

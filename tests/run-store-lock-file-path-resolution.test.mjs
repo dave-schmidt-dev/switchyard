@@ -1,5 +1,5 @@
 // @test-phase: other
-import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
+import { ok, rejects, strictEqual } from "node:assert";
 import { rmSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
@@ -259,97 +259,6 @@ describe("lastCompletionAt (worker-bootstrap onResult conditional field)", () =>
 			111222,
 			"a failed task must not overwrite or null out the prior completion timestamp",
 		);
-	});
-});
-describe("shared run finalization", () => {
-	it("orders event, pending cleanup, ownership cleanup, terminal patch, and run-lock release", async () => {
-		const { finalizeRun } = await import(
-			"../src/switchyard/dispatch/run-finalization.mjs"
-		);
-		const calls = [];
-		await finalizeRun(
-			{
-				runId: "finalizer-order",
-				state: "succeeded",
-				terminalSummary: { processedTasks: 0, failedCount: 0 },
-				cleanup: async () => calls.push("ownership-cleanup"),
-			},
-			{
-				createEvent: async () => calls.push("event"),
-				updateRunWithRetry: async (_runId, patch) => {
-					calls.push(
-						patch.cleanupState === "pending"
-							? "pending-cleanup"
-							: "terminal-patch",
-					);
-					return patch;
-				},
-				releaseRunLock: async () => calls.push("run-lock-release"),
-			},
-		);
-		deepStrictEqual(calls, [
-			"event",
-			"pending-cleanup",
-			"ownership-cleanup",
-			"terminal-patch",
-			"run-lock-release",
-		]);
-	});
-
-	it("records cleanup failure as recovery_required without a terminal discriminator", async () => {
-		const { finalizeRun } = await import(
-			"../src/switchyard/dispatch/run-finalization.mjs"
-		);
-		const patches = [];
-		const result = await finalizeRun(
-			{
-				runId: "finalizer-cleanup-failure",
-				state: "failed",
-				terminalSummary: { processedTasks: null, failedCount: null },
-				cleanup: async () => {
-					throw new Error("raw cleanup detail");
-				},
-			},
-			{
-				createEvent: async () => {},
-				updateRunWithRetry: async (_runId, patch) => {
-					patches.push(patch);
-					return patch;
-				},
-				releaseRunLock: async () => {},
-			},
-		);
-		strictEqual(result.terminal, false);
-		strictEqual(patches.at(-1).state, "recovery_required");
-		strictEqual(patches.at(-1).cleanupState, "failed");
-		strictEqual(patches.at(-1).terminalizedBy, undefined);
-		strictEqual(
-			patches.at(-1).lastFailure.diagnosticCode,
-			"recovery_incomplete",
-		);
-		ok(!JSON.stringify(patches).includes("raw cleanup detail"));
-	});
-
-	it("persists worker terminalization while historical omission remains valid", async () => {
-		const { finalizeRun } = await import(
-			"../src/switchyard/dispatch/run-finalization.mjs"
-		);
-		const opts = makeOptions();
-		await initializeRun(opts);
-		await finalizeRun({
-			runId: opts.runId,
-			state: "succeeded",
-			terminalSummary: { processedTasks: 0, failedCount: 0 },
-		});
-		const terminal = await readRun(opts.runId);
-		strictEqual(terminal.terminalizedBy, "worker");
-		strictEqual(terminal.startedAt, null);
-		ok(typeof terminal.finishedAt === "string");
-		ok(Date.parse(terminal.finishedAt) >= Date.parse(terminal.createdAt));
-
-		const historical = makeOptions();
-		await initializeRun(historical);
-		strictEqual((await readRun(historical.runId)).terminalizedBy, undefined);
 	});
 });
 describe("terminal failure metadata invariants (Task 1.1)", () => {

@@ -325,7 +325,3 @@ export function reviewResultFromExecution(execution) {
 		return unavailable("malformed");
 	}
 }
-
-export function unavailableReviewResult(reason = "unavailable") {
-	return unavailable(reason);
-}

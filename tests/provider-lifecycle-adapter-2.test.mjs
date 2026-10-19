@@ -13,8 +13,7 @@ import {
 	executeProviderInvocation,
 	getWorkspaceExecution,
 } from "../src/switchyard/adapter/provider-lifecycle.mjs";
-import { captureTaskStartTree } from "../src/switchyard/lifecycle/index.mjs";
-import { ParallelsExecutionBackend } from "../src/switchyard/lifecycle/parallels-execution-backend.mjs";
+import { captureTaskStartTree } from "../src/switchyard/lifecycle/task-base.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -256,7 +255,6 @@ describe("provider process lifecycle", () => {
 	});
 
 	it("validates a persisted base through the current authorized helper identity", () => {
-		const argumentBuilder = new ParallelsExecutionBackend({ aquaUid: 501 });
 		const seen = [];
 		const baseCleanupContext = {
 			runId: "base-run",
@@ -273,8 +271,7 @@ describe("provider process lifecycle", () => {
 			descriptorIdentity: "retry-descriptor",
 		};
 		const executionBackend = {
-			execArgv(workspaceId, options) {
-				argumentBuilder.execArgv(workspaceId, options);
+			execArgv(_workspaceId, options) {
 				seen.push({
 					argv: options.argv,
 					cleanupContext: options.cleanupContext,
