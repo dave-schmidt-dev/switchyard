@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { parseLsofResult as parseOrphanLsof } from "../scripts/simple-orphan-collector-scan.mjs";
 import { parseLsofResult as parseSweepLsof } from "../scripts/sweep-temp-dirs.mjs";
-import { lsofListingComplete } from "../src/switchyard/util/lsof-warnings.mjs";
+import {
+	lsofListingComplete,
+	unsignedDevice,
+} from "../src/switchyard/util/lsof-warnings.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 // Verbatim stderr of `lsof -nP -F pfn -d cwd` on 2026-10-19 while a Time
@@ -99,6 +102,15 @@ describe("lsofListingComplete", () => {
 			Buffer.from(TIME_MACHINE),
 		])
 			strictEqual(complete(stderr, [TEMP]), false, String(stderr));
+	});
+
+	it("reads a negative device exactly as lsof prints it", () => {
+		// st_dev -2147483647 is 80000001; as a 64-bit widened Number it rounded to
+		// 80000000 and a warning about that very volume was accepted.
+		strictEqual(unsignedDevice(-2147483647n), 0x80000001);
+		strictEqual(unsignedDevice(18446744071562067969n), 0x80000001);
+		strictEqual(unsignedDevice(0x100000en), LOCAL_DEV);
+		strictEqual(Number(18446744071562067969n) >>> 0, 0x80000000);
 	});
 
 	it("never accepts a warning without a scope", () => {

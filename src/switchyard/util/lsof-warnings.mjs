@@ -36,10 +36,20 @@ function unstattableMounts(stderr) {
 const within = (path, root) =>
 	path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
 
+/**
+ * A device number as the unsigned 32-bit value lsof prints. libuv widens a
+ * negative `st_dev` to 64 bits, which a Number cannot hold exactly, so this
+ * takes the bigint form.
+ *
+ * @param {bigint} dev
+ * @returns {number}
+ */
+export const unsignedDevice = (dev) => Number(BigInt.asUintN(32, dev));
+
 /** Device number of `path` as an unsigned 32-bit value, or null. */
 function deviceOfPath(path) {
 	try {
-		return statSync(path).dev >>> 0;
+		return unsignedDevice(statSync(path, { bigint: true }).dev);
 	} catch {
 		return null;
 	}
