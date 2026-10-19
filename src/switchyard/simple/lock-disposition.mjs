@@ -1,8 +1,8 @@
 import { projectDisposition } from "../dispatch/disposition.mjs";
 import { recoveryCommandFor } from "../dispatch/recovery-command.mjs";
 import { RUN_ID_RE } from "../run-store/errors.mjs";
-import { readRun } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 
 /** Read caller-only holder facts; never persist them or mutate the conflicting lock. */
 export async function simpleLockDisposition(

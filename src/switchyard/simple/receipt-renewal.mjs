@@ -12,7 +12,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { resolveRosterPath } from "../roster/schema.mjs";
-import { getRunRoot } from "../run-store/index.mjs";
+import { getRunRoot } from "../run-store/run-records.mjs";
 
 const RENEWAL_TIMEOUT_MS = 30_000;
 const RENEWAL_PROGRESS_MS = 5_000;

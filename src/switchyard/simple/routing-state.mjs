@@ -4,7 +4,7 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
 import { parseRfc3339 } from "../rfc3339.mjs";
-import { getStateRoot } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import { NON_BLAMING_CAUSES } from "./attempt-blame.mjs";
 import { CHECK_ENVIRONMENT_SIGNATURES } from "./check-environment.mjs";
 import {

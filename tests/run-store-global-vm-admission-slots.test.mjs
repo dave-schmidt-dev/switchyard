@@ -19,13 +19,16 @@ import {
 	getStateRoot,
 	getVmAdmissionRoot,
 	releaseVmSlot,
-	runStoreTesting,
 	sanitizeVmAdmissionError,
 	VmAdmissionPermissionDeniedError,
 	VmAdmissionStorageError,
 	VmAdmissionUnavailableError,
 	VmSlotUnavailableError,
 } from "../src/switchyard/run-store/index.mjs";
+import {
+	acquireVmSlotWithDependencies,
+	readVmSlotBody,
+} from "../src/switchyard/run-store/vm-slots.mjs";
 import {
 	RUN_STORE_MODULE_URL,
 	TEST_ROOT,
@@ -224,7 +227,7 @@ describe("global VM admission slots", () => {
 			const cause = Object.assign(new Error("slot read failed"), { code });
 			let observed;
 			try {
-				runStoreTesting.readVmSlotBody("occupied-slot", () => {
+				readVmSlotBody("occupied-slot", () => {
 					throw cause;
 				});
 			} catch (error) {
@@ -300,7 +303,7 @@ describe("global VM admission slots", () => {
 	it("retries a slot that disappears between failed publication and owner read", () => {
 		let publishCalls = 0;
 		let readCalls = 0;
-		const lease = runStoreTesting.acquireVmSlotWithDependencies(
+		const lease = acquireVmSlotWithDependencies(
 			{ runId: "slot-release-race" },
 			{
 				publishVmSlot: () => {

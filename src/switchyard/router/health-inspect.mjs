@@ -19,9 +19,8 @@ import {
 	getInvocationDescriptorIdentity,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
-
-import { getRunRoot } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
+import { getRunRoot } from "../run-store/run-records.mjs";
 
 import {
 	lockRecord,

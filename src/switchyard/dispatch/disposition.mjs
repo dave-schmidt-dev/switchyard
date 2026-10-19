@@ -1,5 +1,5 @@
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
-import { isSafeTargetId } from "../run-store/index.mjs";
+import { isSafeTargetId } from "../run-store/receipt-validation.mjs";
 
 const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 const LIVE_STATES = new Set(["live", "startup_grace"]);

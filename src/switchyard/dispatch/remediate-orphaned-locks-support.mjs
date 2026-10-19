@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
-import { getStateRoot } from "../run-store/index.mjs";
 import {
 	cwdDerivedProjectLockFileName,
+	getStateRoot,
 	projectLockFileName,
 } from "../run-store/project-lock-files.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";

@@ -153,7 +153,7 @@ export async function executeProviderInvocation(command, args, options = {}) {
 		let cleanupStore = null;
 		let resume = cleanupPolicy.resume ?? null;
 		if (cleanupContext?.runId) {
-			cleanupStore = await import("../run-store/index.mjs");
+			cleanupStore = await import("../run-store/run-updates.mjs");
 			if (!resume) {
 				try {
 					resume = await cleanupStore.readMutationOperation(

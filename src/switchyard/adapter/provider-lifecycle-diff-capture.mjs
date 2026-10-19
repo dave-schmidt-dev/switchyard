@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import {
 	validateTaskStartTree,
 	validateTaskStartTreeAsync,
-} from "../lifecycle/index.mjs";
+} from "../lifecycle/task-base.mjs";
 import { getWorkspaceExecution } from "./provider-lifecycle-completion.mjs";
 import {
 	markerContext,

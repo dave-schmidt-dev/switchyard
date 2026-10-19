@@ -1,6 +1,9 @@
 import { projectOutcomeReader } from "../outcome/projection.mjs";
 import { readRun, SchemaError } from "../run-store/index.mjs";
-import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
+import {
+	classifyRunLiveness,
+	isTerminalState,
+} from "../run-store/run-liveness.mjs";
 import { sanitizeQueuePreflightDetail } from "../runner/index.mjs";
 import {
 	parseResultArgs,
@@ -148,9 +151,6 @@ async function buildResultEnvelope(runId, run) {
 		...telemetry,
 	};
 }
-function isTerminalState(state) {
-	return state === "succeeded" || state === "failed" || state === "deferred";
-}
 function isCleanupComplete(cleanupState) {
 	return cleanupState === "complete";
 }
@@ -250,4 +250,4 @@ async function handleResult(argv) {
 	});
 }
 
-export { buildResultEnvelope, handleResult, handleStatus, isTerminalState };
+export { buildResultEnvelope, handleResult, handleStatus };

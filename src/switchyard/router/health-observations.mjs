@@ -3,7 +3,7 @@ import { FAILURE_REGISTRY } from "../diagnostics/failure-registry.mjs";
 import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 
-import { readAuthorizedRunEvidence } from "../run-store/index.mjs";
+import { readAuthorizedRunEvidence } from "../run-store/evidence.mjs";
 import {
 	deriveFailureAccountability,
 	lifecycleBackedProviderFailure,

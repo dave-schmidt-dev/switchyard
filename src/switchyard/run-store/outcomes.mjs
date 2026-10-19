@@ -14,6 +14,7 @@ import { LockError, SchemaError, validateRunId } from "./errors.mjs";
 import { createEventInternal } from "./events.mjs";
 import { readEvents } from "./evidence.mjs";
 import { validateRouteHealthBinding } from "./receipt-validation.mjs";
+import { ownerPidIsLive } from "./run-liveness.mjs";
 import { acquireRunLock } from "./run-locks.mjs";
 import { readRun, resolveDiagnosticArtifact } from "./run-records.mjs";
 import {
@@ -23,7 +24,6 @@ import {
 	updateRun,
 	withEventAppendLock,
 } from "./run-updates.mjs";
-import { vmOwnerIsLive } from "./vm-slots.mjs";
 export async function appendOutcomeEvent(
 	runId,
 	outcome,
@@ -237,7 +237,7 @@ export async function activateOutcomeWriter(
 				sibling?.projectPath === existing.projectPath &&
 				Number.isSafeInteger(sibling.workerPid) &&
 				sibling.workerPid > 0 &&
-				vmOwnerIsLive(sibling.workerPid)
+				ownerPidIsLive(sibling.workerPid)
 			) {
 				throw new LockError(
 					"another live project worker blocks writer activation",

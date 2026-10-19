@@ -17,7 +17,7 @@ import {
 	rotateLedgerIfNeeded,
 } from "../ledger/sanitize.mjs";
 import { parseRfc3339 } from "../rfc3339.mjs";
-import { getStateRoot } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import { LIFECYCLE_CHECKS } from "./routing-stop-record.mjs";
 
 const VALID_ORIGINS = Object.freeze(["work", "qualification"]);

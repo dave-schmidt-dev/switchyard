@@ -1,7 +1,8 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { readRun, releaseProjectLockIfOwnedBy } from "../run-store/index.mjs";
+import { releaseProjectLockIfOwnedBy } from "../run-store/project-locks.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 
 async function resolveIsRunDead(runId, dependencies) {
 	const readRunFn = dependencies.readRun ?? readRun;

@@ -4,17 +4,17 @@ import { basename, dirname, join } from "node:path";
 import {
 	acquireProjectLock,
 	isProjectLockHeld,
-	readRun,
 	releaseProjectLockIfOwnedBy,
-	updateRunWithRetry,
-} from "../run-store/index.mjs";
+} from "../run-store/project-locks.mjs";
+import { isTerminalState } from "../run-store/run-liveness.mjs";
+import { readRun } from "../run-store/run-records.mjs";
+import { updateRunWithRetry } from "../run-store/run-updates.mjs";
 import {
 	cleanupSimpleWorktree,
 	scanSimpleWorktreeOpenHandles,
 	simpleQuarantinePath,
 	verifySimpleWorktreeClaim,
 } from "../simple/worktree-cleanup.mjs";
-import { isTerminalState } from "./result.mjs";
 
 async function hasRecentWorktreeEntry(rootPath, cutoffMs, dependencies = {}) {
 	const readDirectory = dependencies.readdir ?? readdir;

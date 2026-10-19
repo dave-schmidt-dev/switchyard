@@ -1,16 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
+import { activateOutcomeWriter } from "../run-store/outcomes.mjs";
 import {
-	acquireRunLock,
-	activateOutcomeWriter,
-	getStateRoot,
-	isProjectLockOwnedBy,
-	readRun,
 	reconcileProjectLockClaims,
 	releaseOrphanedProjectLocks,
+} from "../run-store/project-lock-claims.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
+import {
+	isProjectLockOwnedBy,
 	releaseProjectLockIfOwnedBy,
-} from "../run-store/index.mjs";
+} from "../run-store/project-locks.mjs";
+import { isTerminalState } from "../run-store/run-liveness.mjs";
+import { acquireRunLock } from "../run-store/run-locks.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 import {
 	scanSimpleWorktreeOpenHandles,
 	simpleQuarantinePath,
@@ -33,7 +36,6 @@ import {
 	reclaimManagedEntries,
 	recoveryExecutionBackend,
 } from "./recover-reclaim.mjs";
-import { isTerminalState } from "./result.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
 
 async function handleRecover(argv, dependencies = {}) {

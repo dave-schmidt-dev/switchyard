@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 import { integrationGate } from "../integrate/index.mjs";
-import { materializeDirtyOverlay } from "../lifecycle/index.mjs";
+import { materializeDirtyOverlay } from "../lifecycle/dirty-overlay.mjs";
 import { parseCommand } from "../runner/check-contract.mjs";
 import { trustedOfflineNpmEnv } from "../runner/check-dependencies.mjs";
 import {

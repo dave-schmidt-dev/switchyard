@@ -7,7 +7,7 @@ import {
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
-import { readRun } from "../run-store/index.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 import { nonBlamingCause, taskExcludedTargets } from "./attempt-blame.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";

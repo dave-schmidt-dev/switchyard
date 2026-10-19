@@ -5,7 +5,7 @@
  * command, and taking it from the status envelope loaded the legacy queue,
  * broker and backend selection into every simple run.
  */
-import { getStateRoot } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import { shellQuote } from "./cli-args.mjs";
 
 /** @param {string} runId @returns {string} The `recover` command for one run. */

@@ -2,14 +2,14 @@ import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
+import { reconcileProjectLockClaims } from "../run-store/project-lock-claims.mjs";
 import {
 	isProjectLockOwnedBy,
-	readRun,
-	reconcileProjectLockClaims,
 	releaseCwdDerivedProjectLockIfOwnedBy,
 	releaseProjectLockIfOwnedBy,
-} from "../run-store/index.mjs";
+} from "../run-store/project-locks.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 
 function formatAge(ageMs) {
 	if (ageMs == null) return "unknown";

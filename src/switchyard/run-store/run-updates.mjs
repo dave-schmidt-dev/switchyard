@@ -23,6 +23,7 @@ import {
 	SchemaError,
 	validateRunId,
 } from "./errors.mjs";
+import { ownerPidIsLive } from "./run-liveness.mjs";
 import {
 	getRunRoot,
 	readRun,
@@ -30,7 +31,6 @@ import {
 	writeRunAtomically,
 } from "./run-records.mjs";
 import { validateRun } from "./validate-run.mjs";
-import { vmOwnerIsLive } from "./vm-slots.mjs";
 
 const updateQueues = new Map();
 function enqueueRunMutation(runId, operation) {
@@ -197,7 +197,7 @@ async function withEventAppendLock(runId, operation) {
 				if (
 					staleOwner?.runId === runId &&
 					Number.isSafeInteger(staleOwner.pid) &&
-					!vmOwnerIsLive(staleOwner.pid)
+					!ownerPidIsLive(staleOwner.pid)
 				) {
 					const currentRaw = await readFile(path, "utf8").catch(() => null);
 					if (currentRaw === staleRaw) await unlink(path).catch(() => {});

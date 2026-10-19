@@ -1,6 +1,7 @@
 /** Ownership-safe recovery for retained partial and pending routing attempts. */
 import { lstatSync } from "node:fs";
-import { isProjectLockHeld, readRun } from "../run-store/index.mjs";
+import { isProjectLockHeld } from "../run-store/project-locks.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 import { claimCovers } from "./partial-continuation.mjs";
 import {
 	canonicalRoutingProject,

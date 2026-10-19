@@ -16,6 +16,14 @@ const LEGACY_CHAIN = [
 	"src/switchyard/runner/broker.mjs",
 	"src/switchyard/runner/index.mjs",
 ];
+// O1 step 4: simple reaches the run store and lifecycle through their
+// defining modules, never through the barrels that carry the VM lane.
+const VM_CHAIN = [
+	"src/switchyard/lifecycle/index.mjs",
+	"src/switchyard/lifecycle/parallels-execution-backend.mjs",
+	"src/switchyard/run-store/index.mjs",
+	"src/switchyard/run-store/vm-slots.mjs",
+];
 
 const dir = tempDir("switchyard-import-boundary-");
 const hook = join(dir, "record-loads.mjs");
@@ -68,6 +76,10 @@ describe("switchyard-dispatch simple import boundary", () => {
 		ok(loaded.has("src/switchyard/simple/lock-disposition.mjs"));
 		deepStrictEqual(
 			LEGACY_CHAIN.filter((path) => loaded.has(path)),
+			[],
+		);
+		deepStrictEqual(
+			VM_CHAIN.filter((path) => loaded.has(path)),
 			[],
 		);
 	});

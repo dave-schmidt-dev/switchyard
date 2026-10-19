@@ -95,12 +95,10 @@ import "./task-base.mjs";
 
 export {
 	captureDirtyOverlay,
-	materializeDirtyOverlay,
 	validateDirtyOverlayReceipt,
 } from "./dirty-overlay.mjs";
 export { ignoredPath } from "./overlay-paths.mjs";
 export {
-	parsePredecessorReceipt,
 	readDirtyOverlayReceipt,
 	writeDirtyOverlayReceipt,
 } from "./overlay-receipts.mjs";

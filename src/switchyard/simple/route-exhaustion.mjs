@@ -13,7 +13,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { getStateRoot } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
 
 export const ROUTE_EXHAUSTION_TTL_MS = 60 * 60 * 1000;
 

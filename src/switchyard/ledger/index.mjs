@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
 
-import { getStateRoot } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
 
 import {
 	retainedSegmentPaths,

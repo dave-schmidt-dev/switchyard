@@ -31,7 +31,7 @@ import {
 	executeMutationSync,
 	validateMutationRecord,
 } from "../lifecycle/mutation-protocol.mjs";
-import { getRunRoot } from "../run-store/index.mjs";
+import { getRunRoot } from "../run-store/run-records.mjs";
 import { validateIdentifier } from "./shell-safety.mjs";
 
 const ORPHAN_MUTATION_LIMIT = 64;

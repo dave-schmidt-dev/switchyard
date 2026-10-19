@@ -3,11 +3,10 @@ import { readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
-	getRunRoot,
-	readRun,
 	reconcileProjectLockClaims,
 	releaseOrphanedProjectLocks,
-} from "../run-store/index.mjs";
+} from "../run-store/project-lock-claims.mjs";
+import { getRunRoot, readRun } from "../run-store/run-records.mjs";
 import {
 	recoveryLiveness,
 	releaseStaleProjectLocks,

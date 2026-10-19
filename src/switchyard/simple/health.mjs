@@ -14,11 +14,9 @@ import {
 	startHalfOpenClaimSync,
 } from "../router/health.mjs";
 import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
-import {
-	createRouteHealthEvent,
-	getRunRoot,
-	getStateRoot,
-} from "../run-store/index.mjs";
+import { createRouteHealthEvent } from "../run-store/outcomes.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
+import { getRunRoot } from "../run-store/run-records.mjs";
 
 const SIMPLE_ROUTE_HEALTH_LANE = "simple-direct";
 export const SIMPLE_ROUTE_HEALTH_EPOCH = "switchyard-simple-direct-v1";

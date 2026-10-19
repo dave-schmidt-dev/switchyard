@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { parsePredecessorReceipt } from "../lifecycle/index.mjs";
-import { readRun } from "../run-store/index.mjs";
+import { parsePredecessorReceipt } from "../lifecycle/overlay-receipts.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 import { safeChangedFiles } from "./provider-invocation.mjs";
 
 const SIMPLE_RECOVERY_SCHEMA_VERSION = 1;

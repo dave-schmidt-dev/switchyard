@@ -29,6 +29,7 @@ import {
 	releaseProjectLockIfOwnedBy,
 	updateRunWithRetry,
 } from "../run-store/index.mjs";
+import { isTerminalState } from "../run-store/run-liveness.mjs";
 import {
 	getCheckpointPath,
 	loadTaskQueue,
@@ -45,7 +46,7 @@ import {
 	prepareRunIdentity,
 } from "./launch-support.mjs";
 import { sweepManagedOrphans } from "./recover-reclaim.mjs";
-import { buildResultEnvelope, isTerminalState } from "./result.mjs";
+import { buildResultEnvelope } from "./result.mjs";
 import { finalizeRun } from "./run-finalization.mjs";
 
 async function runDispatch(opts, dependencies = {}) {

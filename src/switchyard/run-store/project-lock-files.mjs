@@ -20,7 +20,6 @@ import {
 	resolveVmAdmissionRoot,
 } from "./constants.mjs";
 import { writeRunAtomically } from "./run-records.mjs";
-import { acquireVmSlotWithDependencies, readVmSlotBody } from "./vm-slots.mjs";
 export function getStateRoot() {
 	return resolveStateRoot();
 }
@@ -156,7 +155,6 @@ async function restoreClaimWithoutClobber(claimPath, lockPath, raw) {
 	return true;
 }
 export const runStoreTesting = Object.freeze({
-	acquireVmSlotWithDependencies,
 	eventLimits: Object.freeze({
 		fileBytes: OUTCOME_FILE_MAX_BYTES,
 		lines: OUTCOME_FILE_MAX_LINES,
@@ -164,7 +162,6 @@ export const runStoreTesting = Object.freeze({
 		reserveBytes: EVENT_RESERVE_BYTES,
 	}),
 	projectLockArtifacts,
-	readVmSlotBody,
 	unlinkBodyMatched,
 	writeRunAtomically,
 });

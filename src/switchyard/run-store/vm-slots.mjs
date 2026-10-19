@@ -16,6 +16,7 @@ import {
 	VmAdmissionStorageError,
 	VmSlotUnavailableError,
 } from "./errors.mjs";
+import { ownerPidIsLive } from "./run-liveness.mjs";
 import { sanitizeForDisplay } from "./run-records.mjs";
 
 const VM_SLOT_COUNT = 2;
@@ -80,23 +81,6 @@ function removeVmTempFile(tmpPath) {
 		unlinkSync(tmpPath);
 	} catch (error) {
 		if (error.code !== "ENOENT") throw error;
-	}
-}
-function vmOwnerIsLive(ownerPid, probePid) {
-	if (probePid) {
-		try {
-			return probePid(ownerPid) !== "dead";
-		} catch {
-			return true;
-		}
-	}
-	try {
-		process.kill(ownerPid, 0);
-		return true;
-	} catch (error) {
-		// Only ESRCH proves that the owner is gone. EPERM, EINVAL, and all
-		// other probe failures are conservatively treated as live/unknown.
-		return error.code !== "ESRCH";
 	}
 }
 function publishVmSlot(slotPath, body) {
@@ -169,7 +153,7 @@ function acquireVmSlotWithDependencies(options = {}, dependencies = {}) {
 					if (error?.code === "ENOENT") continue;
 					throw error;
 				}
-				if (owner && !vmOwnerIsLive(owner.ownerPid)) {
+				if (owner && !ownerPidIsLive(owner.ownerPid)) {
 					const reclaimPath = `${slotPath}.${process.pid}.${randomUUID()}.reclaim`;
 					try {
 						renameSync(slotPath, reclaimPath);
@@ -390,7 +374,6 @@ export {
 	safeVmRunId,
 	testVmReadinessUnavailable,
 	VM_SLOT_COUNT,
-	vmOwnerIsLive,
 	vmSlotBody,
 	vmSlotIndex,
 };

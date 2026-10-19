@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { materializeDirtyOverlay } from "../lifecycle/index.mjs";
+import { materializeDirtyOverlay } from "../lifecycle/dirty-overlay.mjs";
 import {
 	git,
 	MAX_CAPTURE_BYTES,

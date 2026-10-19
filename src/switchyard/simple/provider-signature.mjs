@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { validateRunId } from "../run-store/errors.mjs";
-import { getRunRoot } from "../run-store/index.mjs";
 import { ownerOnlyDirectoryStat } from "../run-store/receipt-validation.mjs";
+import { getRunRoot } from "../run-store/run-records.mjs";
 import {
 	evidenceTail,
 	PROVIDER_EVIDENCE_TAIL_BYTES,

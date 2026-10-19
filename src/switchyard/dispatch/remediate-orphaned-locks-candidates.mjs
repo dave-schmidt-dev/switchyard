@@ -1,10 +1,10 @@
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { readRun } from "../run-store/index.mjs";
 import {
 	cwdDerivedProjectLockFileName,
 	projectLockFileName,
 } from "../run-store/project-lock-files.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 import {
 	baseDescriptor,
 	bindLegacyRecoveryOwner,

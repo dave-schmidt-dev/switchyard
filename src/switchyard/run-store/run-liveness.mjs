@@ -2,6 +2,11 @@ export const RUN_STARTUP_GRACE_MS = 5 * 60_000;
 
 const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 
+/** Report whether a run state is terminal (succeeded, failed or deferred). */
+export function isTerminalState(state) {
+	return TERMINAL_STATES.has(state);
+}
+
 function probeWorker(pid) {
 	try {
 		process.kill(pid, 0);
@@ -10,6 +15,31 @@ function probeWorker(pid) {
 		if (error?.code === "EPERM") return "live";
 		if (error?.code === "ESRCH") return "dead";
 		return "unknown";
+	}
+}
+
+/**
+ * Report whether a lock or slot owner process may still be alive.
+ *
+ * @param {number} ownerPid
+ * @param {(pid:number) => "live"|"dead"|"unknown"} [probePid]
+ * @returns {boolean} false only when the owner is proven gone
+ */
+export function ownerPidIsLive(ownerPid, probePid) {
+	if (probePid) {
+		try {
+			return probePid(ownerPid) !== "dead";
+		} catch {
+			return true;
+		}
+	}
+	try {
+		process.kill(ownerPid, 0);
+		return true;
+	} catch (error) {
+		// Only ESRCH proves that the owner is gone. EPERM, EINVAL, and all
+		// other probe failures are conservatively treated as live/unknown.
+		return error.code !== "ESRCH";
 	}
 }
 

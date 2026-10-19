@@ -20,9 +20,8 @@ import {
 	markClaimCleanupFailure,
 	releaseProjectLockIfOwnedBy,
 } from "./project-locks.mjs";
-import { classifyRunLiveness } from "./run-liveness.mjs";
+import { classifyRunLiveness, ownerPidIsLive } from "./run-liveness.mjs";
 import { readRun } from "./run-records.mjs";
-import { vmOwnerIsLive } from "./vm-slots.mjs";
 export async function assertProjectLockOwnership(
 	canonicalProjectPath,
 	runId,
@@ -161,7 +160,7 @@ export async function reconcileProjectLockClaims(options = {}) {
 			continue;
 		}
 		const proof = recoveryProofMetadata(entry.name);
-		if (proof !== null && vmOwnerIsLive(proof.ownerPid, options.probePid))
+		if (proof !== null && ownerPidIsLive(proof.ownerPid, options.probePid))
 			continue;
 		const claimPath = resolve(locksRoot(), entry.name);
 		const originalPath = proof

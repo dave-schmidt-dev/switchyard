@@ -1,6 +1,6 @@
 /** Exact-key task bindings that prevent renamed retries from forgetting run memory. */
 import { join } from "node:path";
-import { getStateRoot } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import {
 	canonicalRoutingProject,
 	openRoutingRun,

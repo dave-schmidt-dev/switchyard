@@ -36,22 +36,21 @@ import {
 import {
 	captureDirtyOverlay,
 	validateDirtyOverlayReceipt,
-} from "../lifecycle/index.mjs";
+} from "../lifecycle/dirty-overlay.mjs";
 import {
 	getConfiguredInvocationDescriptor,
 	resolveTargetIdentity,
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
+import { createEvent } from "../run-store/events.mjs";
 import {
 	acquireProjectLock,
-	createEvent,
-	getRunRoot,
-	initializeRun,
 	isProjectLockOwnedBy,
 	releaseProjectLockIfOwnedBy,
-	updateRunWithRetry,
-} from "../run-store/index.mjs";
+} from "../run-store/project-locks.mjs";
 import { isSafeDescriptorReceipt } from "../run-store/receipt-validation.mjs";
+import { getRunRoot, initializeRun } from "../run-store/run-records.mjs";
+import { updateRunWithRetry } from "../run-store/run-updates.mjs";
 import {
 	prepareSimpleOverlayBaseline,
 	runSimpleBaselineChecks,
