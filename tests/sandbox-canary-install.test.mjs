@@ -397,7 +397,7 @@ it("kills a real hung notification subprocess under its runtime deadline", () =>
 	try {
 		writeFileSync(
 			join(f.root, "bin/terminal-notifier"),
-			"#!/bin/sh\nexec /bin/sleep 30\n",
+			"#!/bin/sh\nexec /bin/sleep 300\n",
 			{ mode: 0o755 },
 		);
 		const start = Date.now();
@@ -408,7 +408,7 @@ it("kills a real hung notification subprocess under its runtime deadline", () =>
 		});
 		strictEqual(result.sent, false);
 		strictEqual(result.error, "ETIMEDOUT");
-		ok(Date.now() - start < 3000);
+		ok(Date.now() - start < HANG_GUARD_MS);
 	} finally {
 		f.clean();
 	}

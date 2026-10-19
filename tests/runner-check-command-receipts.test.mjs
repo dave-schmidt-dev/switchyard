@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { after, describe, it } from "node:test";
 import { runCommand } from "../src/switchyard/runner/reliability.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 // The quick-check worker receipt `runCommand` returns to provider
@@ -14,7 +15,7 @@ const TEST_DIR = tempDir("switchyard-check-receipts-");
 
 function commandFromScript(
 	script,
-	{ timeout = 15_000, maxBuffer = 1024 } = {},
+	{ timeout = HANG_GUARD_MS, maxBuffer = 1024 } = {},
 ) {
 	mkdirSync(TEST_DIR, { recursive: true });
 	return runCommand(TEST_DIR, process.env, ["node", "--version"], 100, {

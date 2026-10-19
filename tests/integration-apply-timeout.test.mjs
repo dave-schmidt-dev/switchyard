@@ -28,6 +28,7 @@ import {
 } from "../src/switchyard/integrate/apply.mjs";
 import { normalizePatch } from "../src/switchyard/integrate/diff-validation.mjs";
 import { integrationGate } from "../src/switchyard/integrate/index.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import {
 	buildDiff,
 	commitFile,
@@ -117,12 +118,12 @@ done
 
 if [ "$is_apply" = "1" ] && [ "$is_check" = "1" ] && [ "$SWITCHYARD_TEST_SLEEP_APPLY_CHECK" = "1" ]; then
 	trap '' TERM
-	exec sleep 30
+	exec sleep 300
 fi
 
 if [ "$is_apply" = "1" ] && [ "$is_check" = "0" ] && [ "$is_meta" = "0" ] && [ "$SWITCHYARD_TEST_SLEEP_APPLY_MUTATING" = "1" ]; then
 	trap '' TERM
-	exec sleep 30
+	exec sleep 300
 fi
 
 exec "$real_git" "$@"
@@ -170,7 +171,7 @@ exec "$real_git" "$@"
 		const elapsed = Date.now() - startTime;
 
 		ok(
-			elapsed < 10000,
+			elapsed < HANG_GUARD_MS,
 			`check timeout must fire promptly within shortened bound, took ${elapsed}ms`,
 		);
 		strictEqual(result.success, false);
@@ -194,7 +195,7 @@ exec "$real_git" "$@"
 		const elapsed = Date.now() - startTime;
 
 		ok(
-			elapsed < 10000,
+			elapsed < HANG_GUARD_MS,
 			`direct check timeout must fire promptly, took ${elapsed}ms`,
 		);
 		strictEqual(result.applied, false);
@@ -243,7 +244,7 @@ exec "$real_git" "$@"
 		const elapsed = Date.now() - startTime;
 
 		ok(
-			elapsed < 10000,
+			elapsed < HANG_GUARD_MS,
 			`mutating apply timeout must fire promptly within shortened bound, took ${elapsed}ms`,
 		);
 		strictEqual(result.success, false);
@@ -272,7 +273,7 @@ exec "$real_git" "$@"
 		const result = applyReviewedDiff(diff, projectPath, null, ["test.txt"]);
 		const elapsed = Date.now() - startTime;
 
-		ok(elapsed < 10000);
+		ok(elapsed < HANG_GUARD_MS);
 		strictEqual(result.applied, false);
 		strictEqual(result.reasonKind, "integration_state_unknown");
 		strictEqual(result.reason, "git apply timed out");
@@ -313,7 +314,7 @@ exec "$real_git" "$@"
 		]);
 		const elapsed = Date.now() - startTime;
 
-		ok(elapsed < 10000);
+		ok(elapsed < HANG_GUARD_MS);
 		strictEqual(result.applied, false);
 		strictEqual(result.reasonKind, "integration_state_unknown");
 		strictEqual(result.reason, "git apply timed out");

@@ -17,6 +17,7 @@ import {
 } from "../src/switchyard/simple/check-environment.mjs";
 import { createSimpleCheckSessions } from "../src/switchyard/simple/check-session.mjs";
 import { git, repoFixture, sha } from "./helpers/check-dry-run-repo.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 // Built so the tempdir-hygiene scan does not read these fixture strings as calls.
@@ -342,15 +343,18 @@ test("a session check honours a shorter per-call timeout", async () => {
 		baseRevision: git(repo.projectPath, ["rev-parse", "HEAD"]),
 		baseTree: git(repo.projectPath, ["rev-parse", "HEAD^{tree}"]),
 		files: ["a.txt"],
-		commands: ["sleep 30"],
+		commands: ["sleep 300"],
 		taskId: "dry-run-cap",
 		deadlineMs: Date.now() + 120_000,
 	});
 	try {
 		await session.prepare(null, 0);
 		const startedAt = Date.now();
-		const result = await session.run({ command: "sleep 30", timeoutMs: 400 });
-		ok(Date.now() - startedAt < 20_000, "the 400 ms cap ended the check");
+		const result = await session.run({ command: "sleep 300", timeoutMs: 400 });
+		ok(
+			Date.now() - startedAt < HANG_GUARD_MS,
+			"the 400 ms cap ended the check",
+		);
 		strictEqual(result.success, false);
 		strictEqual(result.timedOut, true);
 	} finally {

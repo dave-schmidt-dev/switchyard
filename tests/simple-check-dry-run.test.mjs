@@ -19,6 +19,7 @@ import {
 import { classifyAttemptFailure } from "../src/switchyard/simple/failure-severity.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { repoFixture, sha } from "./helpers/check-dry-run-repo.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 // Built so the tempdir-hygiene scan does not read these fixture strings as calls.
@@ -383,7 +384,7 @@ test("a post-provider check that only prints a sandbox message is an ordinary fa
 test("a dry-run check that outlives its cap times out alone and the task proceeds", async () => {
 	const repo = repoFixture();
 	const stamps = {};
-	const command = `sh -c "grep -q candidate a.txt || sleep 60"`;
+	const command = `sh -c "grep -q candidate a.txt || sleep 300"`;
 	const startedAt = Date.now();
 	const { result, providerCalls } = await runTask(
 		repo,
@@ -397,10 +398,16 @@ test("a dry-run check that outlives its cap times out alone and the task proceed
 			},
 		},
 	);
-	ok(Date.now() - startedAt < 30_000, "the 60 s sleep was cut by the cap");
+	// The whole task launches several real processes, so it gets twice the hang
+	// guard; the hung check alone gets one. Both stay well under the sleep.
 	ok(
-		stamps.dry_run_check_finished - stamps.dry_run_check_started < 20_000,
-		"the dry-run check ended on its own cap, long before the 60 s sleep",
+		Date.now() - startedAt < 2 * HANG_GUARD_MS,
+		"the 300 s sleep was cut by the cap",
+	);
+	ok(
+		stamps.dry_run_check_finished - stamps.dry_run_check_started <
+			HANG_GUARD_MS,
+		"the dry-run check ended on its own cap, long before the 300 s sleep",
 	);
 	strictEqual(providerCalls, 1);
 	strictEqual(result.status, "succeeded");

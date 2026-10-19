@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
 import { renewDispatchReceipts } from "../src/switchyard/simple/receipt-renewal.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 describe("renewDispatchReceipts", () => {
@@ -170,14 +171,16 @@ describe("renewDispatchReceipts", () => {
 	});
 
 	it("reports a slow roster CLI while it runs and bounds it", async () => {
-		installRoster("sleep 5");
+		// The CLI outlives the hang guard, so finishing under it proves the 400 ms
+		// bound fired; the guard itself only absorbs launch stalls on a loaded host.
+		installRoster("exec /bin/sleep 300");
 		const started = Date.now();
 		await renewDispatchReceipts("simple-h", report, {
 			...recordRun("simple-h"),
 			progressMs: 50,
 			timeoutMs: 400,
 		});
-		ok(Date.now() - started < 4_000, "renewal was not bounded");
+		ok(Date.now() - started < HANG_GUARD_MS, "renewal was not bounded");
 		ok(reported.includes("dispatch: receipt renewal still running"));
 		strictEqual(
 			reported.at(-1),
