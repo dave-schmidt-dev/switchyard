@@ -228,19 +228,19 @@ function oracleCauseCode(reason, phase, providerResult, errorKind) {
 	if (reason === "host_concurrency") return reason;
 	// Task 2.7: a candidate-changed dependency manifest has its own check cause.
 	if (reason === "check_manifest_changed_by_diff") return reason;
-	// A diff-capture git failure has one closed environment cause.
-	if (
-		["diff_stage_failed", "diff_names_failed", "diff_capture_failed"].includes(
-			reason,
-		)
-	)
-		return "diff_capture_failed";
 	if (phase === "baseline") {
 		if (reason === "baseline_mutation") return "baseline_mutation";
 		if (reason === "baseline_check_unavailable")
 			return "baseline_check_unavailable";
 		return "baseline_check_failed";
 	}
+	// Outside the baseline, a diff-capture git failure has one closed cause.
+	if (
+		["diff_stage_failed", "diff_names_failed", "diff_capture_failed"].includes(
+			reason,
+		)
+	)
+		return "diff_capture_failed";
 	if (["environment_failure", "permission_denied"].includes(errorKind))
 		return "environment_failure";
 	if (reason === "provider_cancelled") return "cancelled";

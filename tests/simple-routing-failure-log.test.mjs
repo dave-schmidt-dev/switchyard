@@ -315,3 +315,69 @@ test("a guard answer on a later dispatch logs nothing new", async () => {
 	strictEqual(again.stopReason, "partial_work_retained");
 	strictEqual(readLog(f.deps.stateRoot).length, 1);
 });
+
+// A diff-capture git failure reaches the routing log with its closed cause
+// instead of an unclassified `execution_failed` / `unknown` pair.
+test("a diff-capture failure logs the closed diff_capture_failed cause", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "diff_capture_failed",
+					phase: "diff",
+				}),
+				errorKind: "environment_failure",
+				failureReason: "diff_stage_failed",
+				failurePhase: "diff",
+			},
+		},
+		codex: { status: "succeeded" },
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	// Soft environment failure: the next target runs and is not blamed.
+	strictEqual(result.direction, "complete");
+	strictEqual(result.attempts[0].reason, "environment_failure");
+	strictEqual(result.attempts[0].terminal, "skipped");
+	const records = readLog(f.deps.stateRoot);
+	strictEqual(records.length, 1);
+	strictEqual(records[0].recordType, "attempt");
+	strictEqual(records[0].reason, "environment_failure");
+	strictEqual(records[0].causeCode, "diff_capture_failed");
+	strictEqual(records[0].causeCategory, "environment");
+	strictEqual(records[0].failureReason, "diff_stage_failed");
+});
+
+// An `integration_state_unknown` refusal names the unknown metadata step in
+// the routing log, not only in run.json.
+test("an integration_state_unknown refusal logs the unknown metadata step", async () => {
+	const f = fixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "scope_rejected",
+					phase: "diff",
+				}),
+				errorKind: "policy_violation",
+				failureReason: "unsafe_diff",
+				failurePhase: "diff",
+				failureDetails: {
+					failureReason: "unsafe_diff",
+					diffRejectionRule: "integration_state_unknown",
+					diffRejectionUnknownStep: "summary",
+					diffRejectionUnknownCause: "exit_nonzero",
+				},
+			},
+		},
+		codex: { status: "succeeded" },
+	});
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(result.direction, "complete");
+	const records = readLog(f.deps.stateRoot);
+	strictEqual(records.length, 1);
+	strictEqual(records[0].reason, "policy_rejected");
+	strictEqual(records[0].diffRejectionRule, "integration_state_unknown");
+	strictEqual(records[0].diffRejectionUnknownStep, "summary");
+	strictEqual(records[0].diffRejectionUnknownCause, "exit_nonzero");
+});

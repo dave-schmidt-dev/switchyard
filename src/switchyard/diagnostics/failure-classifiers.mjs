@@ -311,14 +311,15 @@ export function snapshotCauseCode(
 	if (reason === "check_environment_failed") return reason;
 	// Task 2.7: a candidate-changed dependency manifest has its own check cause.
 	if (reason === "check_manifest_changed_by_diff") return reason;
-	// Every diff-capture git failure shares one closed environment cause.
-	if (DIFF_CAPTURE_REASONS.includes(reason)) return "diff_capture_failed";
 	if (phase === "baseline") {
 		if (reason === "baseline_mutation") return "baseline_mutation";
 		if (reason === "baseline_check_unavailable")
 			return "baseline_check_unavailable";
 		return "baseline_check_failed";
 	}
+	// Outside the baseline, every diff-capture git failure shares one closed
+	// environment cause.
+	if (DIFF_CAPTURE_REASONS.includes(reason)) return "diff_capture_failed";
 	if (["environment_failure", "permission_denied"].includes(errorKind))
 		return "environment_failure";
 	if (reason === "provider_cancelled") return "cancelled";
