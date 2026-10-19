@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { rmSync } from "node:fs";
 import { afterEach, describe, it } from "node:test";

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";

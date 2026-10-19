@@ -1,3 +1,4 @@
+// @test-phase: other
 // Regression test for worker-bootstrap.mjs's writeChain fix.
 //
 // worker-bootstrap.mjs's dependency callbacks (onTaskStart, onTaskRouted,

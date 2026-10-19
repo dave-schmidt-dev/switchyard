@@ -8,6 +8,7 @@ Subcommands:
   launch <tasks.md> --project <path> [options]    Launch detached run
   validate-inputs <tasks.md> --project <path> [options]  Validate caller inputs
   backend-health [--json]                             Probe execution backend readiness
+  doctor [--quick] [--json]                           Read-only host diagnosis with fixes
   status <run-id> [--json]                        Show run status
   result <run-id> [--json]                        Show run result
   recover [--run <run-id>] [--state-root <path>]  Recover managed objects

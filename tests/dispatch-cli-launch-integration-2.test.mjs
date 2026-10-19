@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";

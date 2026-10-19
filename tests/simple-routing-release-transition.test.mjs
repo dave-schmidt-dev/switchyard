@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { rejects, strictEqual } from "node:assert";
 import { rmSync } from "node:fs";
 import { writeFile } from "node:fs/promises";

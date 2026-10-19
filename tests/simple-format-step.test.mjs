@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";

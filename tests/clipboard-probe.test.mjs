@@ -1,3 +1,4 @@
+// @test-phase: other
 // Unit coverage for the INV-1 clipboard probe's classifier and scripts.
 //
 // The live gate in tests/no-host-rights-vm.test.mjs needs a booted VM, so the

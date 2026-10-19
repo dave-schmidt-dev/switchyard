@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, rejects, strictEqual, throws } from "node:assert";
 import { rm } from "node:fs/promises";
 import { describe, it } from "node:test";

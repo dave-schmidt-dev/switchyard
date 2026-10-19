@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";

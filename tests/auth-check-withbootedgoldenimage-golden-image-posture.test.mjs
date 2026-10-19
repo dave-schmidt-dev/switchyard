@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, match, ok, strictEqual, throws } from "node:assert";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";

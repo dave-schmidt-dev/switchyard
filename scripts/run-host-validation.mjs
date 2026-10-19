@@ -11,6 +11,10 @@
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	createHermeticTestEnv,
+	holdRunScratchRoot,
+} from "./hermetic-test-env.mjs";
 import { gatePrerequisiteProblems, PYTHON_HOST_SUITE } from "./pytest-venv.mjs";
 import { defaultRun, runPhases } from "./run-test-phases.mjs";
 import { supervisedSpawn } from "./sandbox-canary-daily.mjs";
@@ -56,17 +60,15 @@ export function runPythonHostChecks({
 	log = console.error,
 } = {}) {
 	log("host validation: requiring six executed Python host cases");
+	let hermetic;
 	try {
+		hermetic = createHermeticTestEnv(process.env);
 		const result = spawn(
 			process.execPath,
 			["--test", "--test-reporter=tap", PYTHON_HOST_SUITE],
 			{
 				cwd: resolve(fileURLToPath(new URL("..", import.meta.url))),
-				env: Object.fromEntries(
-					Object.entries(process.env).filter(
-						([key]) => key !== "NODE_TEST_CONTEXT",
-					),
-				),
+				env: hermetic.env,
 				timeout: PYTHON_HOST_TIMEOUT_MS,
 				maxBuffer: PYTHON_HOST_MAX_BYTES,
 				forwardOutput: true,
@@ -81,6 +83,8 @@ export function runPythonHostChecks({
 			: 1;
 	} catch {
 		return 1;
+	} finally {
+		hermetic?.cleanup();
 	}
 }
 
@@ -104,6 +108,7 @@ if (
 		(existsSync(process.argv[1]) &&
 			import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href))
 ) {
+	holdRunScratchRoot();
 	// Every host phase needs the pytest fixture, so refuse in the first
 	// second rather than after a full validate run.
 	const missing = gatePrerequisiteProblems([PYTHON_HOST_SUITE], {

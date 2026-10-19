@@ -1,3 +1,4 @@
+// @test-phase: other
 // INV-2 gate test: code returns to Mac only through explicit reviewed gate
 // Tests: agent output reaches host files ONLY via the reviewed apply, and
 // the gate's own validation — not just git's — rejects unsafe diffs.

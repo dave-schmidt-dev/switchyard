@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { ok, strictEqual } from "node:assert";
 import { execFileSync, execSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";

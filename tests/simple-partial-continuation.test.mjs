@@ -1,3 +1,4 @@
+// @test-phase: other
 /** Task 3.11: the next waterfall attempt continues from a retained partial. */
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";

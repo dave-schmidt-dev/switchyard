@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, rejects, strictEqual } from "node:assert";
 import { mkdir, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";

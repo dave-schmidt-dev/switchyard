@@ -1,3 +1,4 @@
+// @test-phase: other
 import { notStrictEqual, ok, strictEqual } from "node:assert";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";

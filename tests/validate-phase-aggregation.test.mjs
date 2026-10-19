@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";

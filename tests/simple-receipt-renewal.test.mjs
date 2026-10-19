@@ -1,3 +1,4 @@
+// @test-phase: other
 // The dispatch-side half of automatic receipt renewal, run by `simple`.
 //
 // A `dispatch_qualified` receipt expires after 30 days, and until 2026-09-18 the

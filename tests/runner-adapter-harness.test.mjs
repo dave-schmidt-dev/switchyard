@@ -1,3 +1,4 @@
+// @test-phase: other
 // Task 1.6 (roster-unification plan), M1b: selectAdapter must key on the
 // resolved HARNESS, not the snapshot provider/display name.
 //

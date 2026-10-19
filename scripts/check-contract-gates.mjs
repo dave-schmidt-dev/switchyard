@@ -2,16 +2,15 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	holdRunScratchRoot,
+	withHermeticTestEnvAsync,
+} from "./hermetic-test-env.mjs";
 import { gatePrerequisiteProblems } from "./pytest-venv.mjs";
+import { readTestManifest } from "./test-manifest.mjs";
 
 export const CONTRACT_GATE_STATUSES = Object.freeze([
 	"not-run",
@@ -113,35 +112,14 @@ export function loadLedgerGateMapping(root = process.cwd()) {
 	);
 }
 
+/**
+ * Files each runnable lane executes, from the per-file phase pragmas.
+ * Property files and untagged files are covered by neither lane.
+ */
 export function testRunnerCoverage(root = process.cwd()) {
-	const packageJson = JSON.parse(
-		readFileSync(resolve(root, "package.json"), "utf8"),
-	);
-	const serialScript = packageJson.scripts?.["test:serial"] ?? "";
-	const otherScript = packageJson.scripts?.["test:other"] ?? "";
-	const serial = new Set(
-		[...serialScript.matchAll(/tests\/[A-Za-z0-9._/-]+\.test\.mjs/gu)].map(
-			(match) => match[0],
-		),
-	);
-	const excludedFromOther = new Set(
-		[...otherScript.matchAll(/\|tests\/([A-Za-z0-9._/-]+\.test\.mjs)/gu)].map(
-			(match) => `tests/${match[1]}`,
-		),
-	);
-	const dynamicOther = otherScript.includes("tests/*.test.mjs");
-	const covered = new Set(serial);
-	if (dynamicOther) {
-		for (const entry of readdirSync(resolve(root, "tests"), {
-			withFileTypes: true,
-		})) {
-			if (entry.isFile() && entry.name.endsWith(".test.mjs")) {
-				const path = `tests/${entry.name}`;
-				if (!excludedFromOther.has(path)) covered.add(path);
-			}
-		}
-	}
-	return { serial, covered };
+	const { phases } = readTestManifest(root);
+	const serial = new Set(phases.serial);
+	return { serial, covered: new Set([...phases.serial, ...phases.other]) };
 }
 
 function pathMatches(pattern, candidate) {
@@ -425,20 +403,11 @@ export function validateReceipt({
 }
 
 export function discoverTestFiles(root = process.cwd()) {
-	const packageJson = JSON.parse(
-		readFileSync(resolve(root, "package.json"), "utf8"),
-	);
-	const serial = [
-		...(packageJson.scripts?.["test:serial"] ?? "").matchAll(
-			/tests\/[A-Za-z0-9._/-]+\.test\.mjs/gu,
-		),
-	].map((match) => match[0]);
-	const all = readdirSync(resolve(root, "tests"), { withFileTypes: true })
-		.filter((entry) => entry.isFile() && entry.name.endsWith(".test.mjs"))
-		.map((entry) => `tests/${entry.name}`);
+	const { files, phases } = readTestManifest(root);
+	const serial = new Set(phases.serial);
 	return {
-		serial: [...new Set(serial)],
-		other: all.filter((path) => !serial.includes(path)),
+		serial: phases.serial,
+		other: files.filter((path) => !serial.has(path)),
 	};
 }
 
@@ -539,19 +508,17 @@ export function parseTapOutcome(output, exitCode) {
 }
 
 function runSuiteWithTap(root, suite) {
+	return withHermeticTestEnvAsync(process.env, (env) =>
+		runSuiteChild(root, suite, env),
+	);
+}
+
+function runSuiteChild(root, suite, env) {
 	return new Promise((resolveResult) => {
 		const child = spawn(
 			process.execPath,
 			["--test", "--test-reporter=tap", suite],
-			{
-				cwd: root,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: Object.fromEntries(
-					Object.entries(process.env).filter(
-						([key]) => key !== "NODE_TEST_CONTEXT",
-					),
-				),
-			},
+			{ cwd: root, stdio: ["ignore", "pipe", "pipe"], env },
 		);
 		let output = "";
 		const forward = (chunk, stream) => {
@@ -625,6 +592,7 @@ if (
 	resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
 ) {
 	const root = process.cwd();
+	holdRunScratchRoot();
 	const mode = process.argv.includes("--status")
 		? "status"
 		: process.argv.includes("--run")

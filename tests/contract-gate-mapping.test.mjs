@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";
 import {
@@ -55,9 +56,11 @@ function createReceiptFixture({ stage = true } = {}) {
 		"package.json",
 		"scripts/check-contract-gates.mjs",
 		"scripts/check-contract-receipt.mjs",
+		"scripts/hermetic-test-env.mjs",
 		"scripts/pytest-venv.mjs",
 		"scripts/run-test-phases.mjs",
 		"scripts/run-validate-phases.mjs",
+		"scripts/test-manifest.mjs",
 		// Contract suites can import support modules outside the boundary they
 		// assert, so the fixture includes the local production dependency tree.
 		"src/switchyard",
@@ -125,7 +128,7 @@ function createValidationFixture() {
 	for (const suite of mappedSuites) {
 		writeFileSync(
 			join(fixture, suite),
-			'import { test } from "node:test";\ntest("mapped suite skipped", { skip: "fixture" }, () => {});\n',
+			'// @test-phase: other\nimport { test } from "node:test";\ntest("mapped suite skipped", { skip: "fixture" }, () => {});\n',
 		);
 	}
 	execFileSync("git", ["add", "package.json", ...mappedSuites], {

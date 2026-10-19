@@ -15,6 +15,7 @@ import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../src/switchyard/runner/checks-sandbox.mjs";
+import { withHermeticTestEnv } from "./hermetic-test-env.mjs";
 import {
 	CANARY_DEADLINE_ENV,
 	CANARY_SANDBOX_EXEC_ENV,
@@ -369,20 +370,23 @@ process.stdout.write(JSON.stringify({ writeDenied }));
 			log(
 				`Running probe: toolchain-sandbox (invoking ${resolvedToolchainTest})...`,
 			);
-			const toolchainEnv = { ...process.env, CI: "true" };
-			// A fresh node:test runner must not inherit its parent's test-child marker.
-			delete toolchainEnv.NODE_TEST_CONTEXT;
-			const toolchainRes = spawn(
-				process.execPath,
-				["--test", "--test-reporter=tap", resolvedToolchainTest],
-				{
-					cwd: root,
-					env: toolchainEnv,
-					encoding: "utf8",
-					timeout,
-					killSignal: "SIGKILL",
-					maxBuffer: 262144,
-				},
+			// A hermetic env also drops the parent's test-child marker, which a
+			// fresh node:test runner must not inherit.
+			const toolchainRes = withHermeticTestEnv(
+				{ ...process.env, CI: "true" },
+				(toolchainEnv) =>
+					spawn(
+						process.execPath,
+						["--test", "--test-reporter=tap", resolvedToolchainTest],
+						{
+							cwd: root,
+							env: toolchainEnv,
+							encoding: "utf8",
+							timeout,
+							killSignal: "SIGKILL",
+							maxBuffer: 262144,
+						},
+					),
 			);
 			const tapReport = parseTapResults(toolchainRes.stdout || "");
 			const timedOut = Boolean(

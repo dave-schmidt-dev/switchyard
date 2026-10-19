@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { providerCodeForVibeBudgetEvidence } from "../src/switchyard/simple/provider-invocation.mjs";

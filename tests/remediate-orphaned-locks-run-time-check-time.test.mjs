@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";

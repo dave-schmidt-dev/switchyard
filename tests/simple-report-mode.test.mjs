@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";

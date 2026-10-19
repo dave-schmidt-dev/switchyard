@@ -1,3 +1,4 @@
+// @test-phase: other
 // Regressions for the partial-diff artifact channel (Task 6.5, Part A).
 //
 // worker-bootstrap.mjs used to copy a timed-out task's partial diff into

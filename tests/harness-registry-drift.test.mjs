@@ -1,3 +1,4 @@
+// @test-phase: other
 // Task 1.6b (roster-unification plan): harness-registry source-of-truth +
 // drift test.
 //
@@ -38,17 +39,17 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import { getInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
+import { HOST_HOME } from "./helpers/host-home.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const ADAPTER_DIR = join(REPO_ROOT, "src", "switchyard", "adapter");
 const README_PATH = join(REPO_ROOT, "README.md");
-const ROSTER_PATH = join(homedir(), ".agent", "roster.json");
+const ROSTER_PATH = join(HOST_HOME, ".agent", "roster.json");
 
 /**
  * Discover the live, dispatchable harness ids from the switchyard adapter
@@ -108,6 +109,8 @@ const liveAdapterHarnesses = await discoverLiveAdapterHarnesses(ADAPTER_DIR);
 // sandbox and CI run under an isolated HOME).
 const HOST_ROSTER_SKIP =
 	!existsSync(ROSTER_PATH) && `host roster absent at ${ROSTER_PATH}`;
+// The production descriptor helpers below read the same host roster.
+if (!HOST_ROSTER_SKIP) process.env.SWITCHYARD_ROSTER_PATH ??= ROSTER_PATH;
 const roster = HOST_ROSTER_SKIP
 	? {}
 	: JSON.parse(readFileSync(ROSTER_PATH, "utf8"));

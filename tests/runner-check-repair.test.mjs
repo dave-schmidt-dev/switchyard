@@ -1,3 +1,4 @@
+// @test-phase: other
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";

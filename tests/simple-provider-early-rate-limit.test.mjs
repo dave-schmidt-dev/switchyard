@@ -1,3 +1,4 @@
+// @test-phase: other
 import { ok, strictEqual } from "node:assert";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";

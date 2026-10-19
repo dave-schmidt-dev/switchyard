@@ -1,3 +1,4 @@
+// @test-phase: serial
 // INV-3 gate test for the Parallels backend.
 //
 // The reclamation matrix is hermetic: it exercises the backend's exact-name

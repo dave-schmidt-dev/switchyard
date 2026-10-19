@@ -106,7 +106,7 @@ export async function releaseRetainedPartial(options, deps = {}) {
 	}
 }
 
-const RUN_TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
+export const RUN_TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 function pathAbsent(path) {
 	try {
@@ -137,8 +137,9 @@ function retainedClaimGone(claim) {
 // Writer quiescence follows the lifecycle rule: the run's writer is stopped
 // or never started. A worktree claim that does not record writerStopped
 // proves nothing, and a worker process that answers a liveness probe blocks
-// recovery -- a probe that fails with EPERM counts as live.
-function writerQuiescent(record, deps) {
+// recovery -- a probe that fails with EPERM counts as live. `doctor` applies
+// the same rule to report which stranded attempts close-pending can close.
+export function writerQuiescent(record, deps = {}) {
 	if (record.worktree !== null && record.worktree?.writerStopped !== true)
 		return false;
 	const pid = record.workerPid;

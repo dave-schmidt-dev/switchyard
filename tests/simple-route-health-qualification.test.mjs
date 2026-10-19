@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { join } from "node:path";
 import { after, afterEach, before, beforeEach, it, mock } from "node:test";

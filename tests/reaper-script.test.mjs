@@ -1,3 +1,4 @@
+// @test-phase: other
 // Standalone launchd reaper contract tests. The copied script must be able to
 // inventory managed VM names without project access, while making no resource
 // changes from hourly execution.

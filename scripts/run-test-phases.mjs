@@ -20,6 +20,10 @@ import {
 	computeContractSnapshot,
 	writeExecutionRecord,
 } from "./check-contract-gates.mjs";
+import {
+	holdRunScratchRoot,
+	withHermeticTestEnv,
+} from "./hermetic-test-env.mjs";
 
 export const DEFAULT_PHASES = ["test:serial", "test:other"];
 export const VM_GATE_OUTCOMES = Object.freeze([
@@ -228,25 +232,25 @@ function replayParent({ root, seed, testArgs }) {
 			SWITCHYARD_PARENT_PROPERTY_STATUS: _parentStatus,
 			...parentEnvironment
 		} = process.env;
-		const result = spawnSync(
-			process.execPath,
-			[
-				"--test",
-				"tests/outcome-properties.test.mjs",
-				"tests/mutation-properties.test.mjs",
-				...testArgs,
-			],
+		const result = withHermeticTestEnv(
 			{
-				cwd: materialized.root,
-				stdio: "inherit",
-				env: {
-					...parentEnvironment,
-					SWITCHYARD_PROPERTY_SEED: String(seed),
-					SWITCHYARD_CANDIDATE_DIGEST: digest,
-					SWITCHYARD_PROPERTY_DIAGNOSTIC_FILE: diagnostic,
-					SWITCHYARD_PARENT_REPLAY: "1",
-				},
+				...parentEnvironment,
+				SWITCHYARD_PROPERTY_SEED: String(seed),
+				SWITCHYARD_CANDIDATE_DIGEST: digest,
+				SWITCHYARD_PROPERTY_DIAGNOSTIC_FILE: diagnostic,
+				SWITCHYARD_PARENT_REPLAY: "1",
 			},
+			(env) =>
+				spawnSync(
+					process.execPath,
+					[
+						"--test",
+						"tests/outcome-properties.test.mjs",
+						"tests/mutation-properties.test.mjs",
+						...testArgs,
+					],
+					{ cwd: materialized.root, stdio: "inherit", env },
+				),
 		);
 		return {
 			status: result.error ? 1 : (result.status ?? 1),
@@ -270,27 +274,27 @@ function runHistoricalMutation({ root, mutation, seed, testArgs, diagnostic }) {
 	let materialized;
 	try {
 		materialized = materializeSources(root, null, { mutation });
-		const result = spawnSync(
-			process.execPath,
-			[
-				"--test",
-				"tests/outcome-properties.test.mjs",
-				"tests/mutation-properties.test.mjs",
-				...testArgs,
-			],
+		const result = withHermeticTestEnv(
 			{
-				cwd: materialized.root,
-				stdio: "inherit",
-				env: {
-					...Object.fromEntries(
-						Object.entries(process.env).filter(
-							([key]) => key !== "SWITCHYARD_PROPERTY_MUTATION",
-						),
+				...Object.fromEntries(
+					Object.entries(process.env).filter(
+						([key]) => key !== "SWITCHYARD_PROPERTY_MUTATION",
 					),
-					SWITCHYARD_PROPERTY_SEED: String(seed),
-					SWITCHYARD_PROPERTY_DIAGNOSTIC_FILE: diagnostic,
-				},
+				),
+				SWITCHYARD_PROPERTY_SEED: String(seed),
+				SWITCHYARD_PROPERTY_DIAGNOSTIC_FILE: diagnostic,
 			},
+			(env) =>
+				spawnSync(
+					process.execPath,
+					[
+						"--test",
+						"tests/outcome-properties.test.mjs",
+						"tests/mutation-properties.test.mjs",
+						...testArgs,
+					],
+					{ cwd: materialized.root, stdio: "inherit", env },
+				),
 		);
 		return { status: result.error ? 1 : (result.status ?? 1), error: null };
 	} catch (error) {
@@ -336,23 +340,24 @@ function runPropertyTests({ root = process.cwd(), spawn = spawnSync } = {}) {
 		});
 		mutationError = result.error;
 	} else {
-		result = spawn(
-			process.execPath,
-			[
-				"--test",
-				"tests/outcome-properties.test.mjs",
-				"tests/mutation-properties.test.mjs",
-				...testArgs,
-			],
+		result = withHermeticTestEnv(
 			{
-				stdio: "inherit",
-				env: {
-					...process.env,
-					SWITCHYARD_PROPERTY_SEED: String(seed),
-					SWITCHYARD_CANDIDATE_DIGEST: candidateDigest,
-					SWITCHYARD_PROPERTY_DIAGNOSTIC_FILE: diagnosticPath,
-				},
+				...process.env,
+				SWITCHYARD_PROPERTY_SEED: String(seed),
+				SWITCHYARD_CANDIDATE_DIGEST: candidateDigest,
+				SWITCHYARD_PROPERTY_DIAGNOSTIC_FILE: diagnosticPath,
 			},
+			(env) =>
+				spawn(
+					process.execPath,
+					[
+						"--test",
+						"tests/outcome-properties.test.mjs",
+						"tests/mutation-properties.test.mjs",
+						...testArgs,
+					],
+					{ stdio: "inherit", env },
+				),
 		);
 	}
 	const status = mutationError ? 1 : result.error ? 1 : (result.status ?? 1);
@@ -588,6 +593,7 @@ if (
 		(existsSync(process.argv[1]) &&
 			import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href))
 ) {
+	holdRunScratchRoot();
 	if (process.argv[2] === "--properties") process.exit(runPropertyTests());
 	const snapshot = computeContractSnapshot(process.cwd());
 	const normalStatus = runPhases();

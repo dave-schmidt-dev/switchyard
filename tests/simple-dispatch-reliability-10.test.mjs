@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, strictEqual, throws } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";

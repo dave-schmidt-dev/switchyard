@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strictEqual, throws } from "node:assert/strict";
 import { test } from "node:test";
 import { buildSimpleRepairPrompt } from "../src/switchyard/simple/repair.mjs";

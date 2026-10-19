@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { withHermeticTestEnv } from "./hermetic-test-env.mjs";
 
 const FIXTURE = "tests/fixtures/incident-mutations.json";
 const SAFE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.?\/?)[A-Za-z0-9._/-]+$/u;
@@ -174,16 +175,15 @@ function tapSummary(output, exitCode) {
 }
 
 function runMutationSuite(root, mutation, run) {
-	const child = run(
-		process.execPath,
-		["--test", "--test-reporter=tap", ...mutation.tests],
-		{
-			cwd: root,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
-			// Mutation runs never boot a VM, even when the caller opted in.
-			env: { ...process.env, SWITCHYARD_LIVE_VM_TESTS: "0" },
-		},
+	const child = withHermeticTestEnv(
+		// Mutation runs never boot a VM, even when the caller opted in.
+		{ ...process.env, SWITCHYARD_LIVE_VM_TESTS: "0" },
+		(env) =>
+			run(
+				process.execPath,
+				["--test", "--test-reporter=tap", ...mutation.tests],
+				{ cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env },
+			),
 	);
 	const output = `${child.stdout ?? ""}${child.stderr ?? ""}`;
 	return { output, summary: tapSummary(output, child.status ?? 1) };

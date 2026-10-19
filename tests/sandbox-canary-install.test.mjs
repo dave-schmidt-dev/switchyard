@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -32,7 +33,11 @@ function setup() {
 	])
 		mkdirSync(directory, { recursive: true });
 	writeFileSync(join(source, "package.json"), "{}");
-	for (const script of ["sandbox-canary.mjs", "sandbox-canary-daily.mjs"]) {
+	for (const script of [
+		"sandbox-canary.mjs",
+		"sandbox-canary-daily.mjs",
+		"hermetic-test-env.mjs",
+	]) {
 		writeFileSync(
 			join(source, "scripts", script),
 			readFileSync(resolve(OPS, "../scripts", script)),

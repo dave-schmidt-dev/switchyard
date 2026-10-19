@@ -1,7 +1,9 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import { route } from "../src/switchyard/router/index.mjs";
@@ -13,6 +15,13 @@ import {
 } from "../src/switchyard/simple/routing-state.mjs";
 import { withDispatchQualifiedDescriptors } from "./helpers/router-fixtures.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
+
+// Refusals resolve target IDs through the roster; pin the committed fixture
+// so the outcome never depends on the owner's live roster.
+process.env.SWITCHYARD_ROSTER_PATH = fileURLToPath(
+	new URL("./fixtures/roster.fixture.json", import.meta.url),
+);
+__resetRosterCacheForTests();
 
 test("waterfall excludes failed targets across calls while success is reusable", async () => {
 	const f = fixture({

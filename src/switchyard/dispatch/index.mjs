@@ -5,6 +5,7 @@
  * `simple`, the default lane, runs without loading the legacy queue, VM and
  * detached modules: every other subcommand imports them from `./cli.mjs` only
  * when it runs, so an import-time defect there cannot stop a simple dispatch.
+ * `doctor` loads only its own read-only probes.
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -22,6 +23,11 @@ async function main(argv) {
 
 	if (argv[0] === "simple") {
 		await handleSimple(argv.slice(1));
+		return;
+	}
+	if (argv[0] === "doctor") {
+		const { handleDoctor } = await import("../doctor/index.mjs");
+		process.exitCode = await handleDoctor(argv.slice(1));
 		return;
 	}
 	const { runDispatchCommand } = await import("./cli.mjs");

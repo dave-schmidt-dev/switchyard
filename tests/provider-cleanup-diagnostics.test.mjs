@@ -1,3 +1,4 @@
+// @test-phase: other
 // Regressions for the Antigravity timeout cleanup failure (Task 6.3).
 //
 // Run c98c0c27-eb6b-46e9-8cba-5e8f1acc50f4 timed out after 30 minutes,

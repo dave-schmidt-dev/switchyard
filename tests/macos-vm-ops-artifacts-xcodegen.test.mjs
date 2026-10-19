@@ -1,3 +1,4 @@
+// @test-phase: other
 import { ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { chmodSync, readdirSync, readFileSync, writeFileSync } from "node:fs";

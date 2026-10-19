@@ -1,3 +1,4 @@
+// @test-phase: other
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, utimesSync, writeFileSync } from "node:fs";

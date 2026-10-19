@@ -1,3 +1,4 @@
+// @test-phase: serial
 import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
