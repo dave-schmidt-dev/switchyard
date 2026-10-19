@@ -13,6 +13,7 @@ import {
 	RATE_LIMIT_TAIL_BYTES,
 } from "../src/switchyard/simple/provider-signature.mjs";
 import { createSimpleProviderReliabilityDiagnostic } from "../src/switchyard/simple/reliability.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const CODEX_DESCRIPTOR = Object.freeze({
 	target_id: "codex",
@@ -112,17 +113,18 @@ test("a stderr rate-limit report stops the provider early and resolves quota_exh
 		const startedAt = Date.now();
 		const result = await defaultExecuteProvider(
 			providerContext({
+				timeoutMs: 2 * HANG_GUARD_MS,
 				spawnFn: nodeProvider(
-					'process.stderr.write("429 Too Many Requests: rate limit exceeded\\n");\nsetTimeout(() => process.exit(0), 30_000);\n',
+					'process.stderr.write("429 Too Many Requests: rate limit exceeded\\n");\nsetTimeout(() => process.exit(0), 300_000);\n',
 					children,
 				),
 			}),
 		);
 		const elapsedMs = Date.now() - startedAt;
-		// Under the 30 s provider timeout and child lifetime, so a provider that
-		// was not stopped early fails, but above a loaded host's 6 to 10 s
-		// process-launch stalls.
-		ok(elapsedMs < 20_000, `provider stopped after ${elapsedMs}ms`);
+		// Under the provider timeout and child lifetime, so a provider that was
+		// not stopped early fails, but at the hang guard so a loaded host's
+		// process-launch stalls cannot.
+		ok(elapsedMs < HANG_GUARD_MS, `provider stopped after ${elapsedMs}ms`);
 
 		strictEqual(result.success, false);
 		strictEqual(result.rateLimited, true);
