@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
 import { readRun } from "../src/switchyard/run-store/index.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalRunStoreEnv = process.env.SWITCHYARD_RUN_STORE_ROOT;
@@ -33,7 +34,7 @@ after(() => {
 	rmSync(SUITE_ROOT, { recursive: true, force: true });
 });
 
-async function waitFor(predicate, timeoutMs = 5_000) {
+async function waitFor(predicate, timeoutMs = HANG_GUARD_MS) {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const value = await predicate();

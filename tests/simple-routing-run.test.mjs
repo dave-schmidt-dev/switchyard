@@ -13,6 +13,7 @@ import {
 	openRoutingRun,
 	readRoutingRunState,
 } from "../src/switchyard/simple/routing-state.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { withDispatchQualifiedDescriptors } from "./helpers/router-fixtures.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 
@@ -130,7 +131,7 @@ test("pending crash stops before any engine and signals/deadline cannot renew", 
 		(await runSimpleRoutingTask(fresh.options, fresh.deps)).stopReason,
 		"deadline_expired",
 	);
-	fresh.options.deadlineMs = Date.now() + 1000;
+	fresh.options.deadlineMs = Date.now() + HANG_GUARD_MS;
 	fresh.deps.signal = AbortSignal.abort();
 	strictEqual(
 		(await runSimpleRoutingTask(fresh.options, fresh.deps)).stopReason,

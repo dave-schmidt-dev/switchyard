@@ -18,6 +18,7 @@ import {
 	updateRunWithRetry,
 } from "../src/switchyard/run-store/index.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const originalTmpdir = process.env.TMPDIR;
@@ -223,7 +224,7 @@ describe("simple run releases the project lock before slow cleanup", () => {
 			import { acquireProjectLock, releaseProjectLockIfOwnedBy } from ${JSON.stringify(runStoreUrl)};
 			import { rmSync, writeFileSync } from "node:fs";
 			import { join } from "node:path";
-			const watchdog = setTimeout(() => process.exit(73), 12_000);
+			const watchdog = setTimeout(() => process.exit(73), ${2 * HANG_GUARD_MS});
 			const projectPath = ${JSON.stringify(repo.projectPath)};
 			const promptPath = ${JSON.stringify(repo.promptPath)};
 			const runId = ${JSON.stringify(runId)};
@@ -262,7 +263,7 @@ describe("simple run releases the project lock before slow cleanup", () => {
 				},
 				cleanupSimpleWorktree: async (_id, claim) => {
 					process.stdout.write(JSON.stringify({ ready: true, path: claim.path }) + "\\n");
-					await new Promise((resolve) => setTimeout(resolve, 6_000));
+					await new Promise((resolve) => setTimeout(resolve, ${HANG_GUARD_MS}));
 					rmSync(claim.path, { recursive: true, force: true });
 					return { removed: true, path: claim.path };
 				},
@@ -284,7 +285,7 @@ describe("simple run releases the project lock before slow cleanup", () => {
 		let cleanupPath;
 		let exited = false;
 		try {
-			const ready = await waitForCleanupReady(child, 5_000);
+			const ready = await waitForCleanupReady(child, HANG_GUARD_MS);
 			strictEqual(ready.ready, true);
 			cleanupPath = resolve(ready.path);
 			strictEqual(cleanupPath.startsWith(`${SUITE_TMPDIR}/`), true);
@@ -293,7 +294,7 @@ describe("simple run releases the project lock before slow cleanup", () => {
 			strictEqual(child.signalCode, null);
 			strictEqual(isProjectLockHeld(repo.projectPath), false);
 			strictEqual(child.kill("SIGKILL"), true);
-			const exit = await waitForChildExit(child, 3_000);
+			const exit = await waitForChildExit(child, HANG_GUARD_MS);
 			strictEqual(exit.code, null);
 			strictEqual(exit.signal, "SIGKILL");
 			exited = true;
@@ -305,7 +306,7 @@ describe("simple run releases the project lock before slow cleanup", () => {
 		} finally {
 			if (!exited && child.exitCode === null && child.signalCode === null) {
 				child.kill("SIGKILL");
-				await waitForChildExit(child, 3_000).catch(() => {});
+				await waitForChildExit(child, HANG_GUARD_MS).catch(() => {});
 			}
 			if (
 				cleanupPath?.startsWith(`${SUITE_TMPDIR}/`) &&

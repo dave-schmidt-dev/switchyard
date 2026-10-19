@@ -21,6 +21,7 @@ import {
 	updateRunWithRetry,
 } from "../src/switchyard/run-store/index.mjs";
 import { handleSimple } from "../src/switchyard/simple/cli.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -63,7 +64,7 @@ async function stopWorker(child) {
 	if (child.exitCode === null && child.signalCode === null) child.unref();
 }
 
-async function waitForPath(path, timeoutMs = 10_000) {
+async function waitForPath(path, timeoutMs = HANG_GUARD_MS) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (existsSync(path)) return;
@@ -120,7 +121,7 @@ const watch = setInterval(() => {
 	}
 }, 25);
 writeFileSync(readyPath, "ready");
-setTimeout(() => process.exit(0), 3_000);
+setTimeout(() => process.exit(0), ${HANG_GUARD_MS});
 `;
 
 const MARKER_WORKER_SOURCE = `
@@ -131,7 +132,7 @@ process.on("SIGTERM", () => {
 	process.exit(0);
 });
 writeFileSync(readyPath, "ready");
-setTimeout(() => process.exit(0), 3_000);
+setTimeout(() => process.exit(0), ${HANG_GUARD_MS});
 `;
 
 function writeRunLock(project, runId, holderPid, holderStartToken) {
@@ -184,7 +185,7 @@ describe("simple cancel command", () => {
 				"--run-id",
 				runId,
 				"--timeout-seconds",
-				"10",
+				String(HANG_GUARD_MS / 1000),
 			],
 			{
 				writeResult: (line) => {
