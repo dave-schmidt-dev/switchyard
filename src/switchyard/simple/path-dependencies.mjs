@@ -11,24 +11,90 @@
  * only when it is a directory strictly inside the project's parent, no
  * component of the declared or resolved path is a dot-directory, and its top
  * level holds no credential file (`.env`, `.env.*`, `.netrc`, `id_*`). Every
- * other declared path refuses the checks with `check_dependencies_unverified`.
+ * other declared path refuses the checks with `check_dependencies_unverified`
+ * and a closed `dependencyCheck` naming the rule it failed.
+ *
+ * For a linked git worktree, "the project's parent" is the main working
+ * tree's parent, so a worktree gets exactly its main checkout's grant (stability
+ * follow-up, 2026-10-19). A relative declared path still resolves against the
+ * worktree itself.
  */
+import { spawnSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_PTH_BYTES = 64 * 1024;
+const GIT_TIMEOUT_MS = 30_000;
 const PRINTABLE_NAME = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]{1,128}$/u;
 
 /** The error message names the dependency, never its path or contents. */
-function refused(name) {
+function refused(name, dependencyCheck) {
 	const label = PRINTABLE_NAME.test(name) ? name : "(unprintable name)";
 	return Object.assign(
 		new Error(
 			`check_dependencies_unverified: path dependency ${label} refused`,
 		),
-		{ code: "check_dependencies_unverified" },
+		{ code: "check_dependencies_unverified", dependencyCheck },
 	);
+}
+
+/** Run git with no inherited `GIT_*` override; null on any failure. */
+function gitOutput(cwd, args) {
+	const env = Object.fromEntries(
+		Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+	);
+	const result = spawnSync("git", ["-C", cwd, ...args], {
+		encoding: "utf8",
+		env: { ...env, GIT_CONFIG_NOSYSTEM: "1" },
+		maxBuffer: MAX_MANIFEST_BYTES,
+		stdio: ["ignore", "pipe", "ignore"],
+		timeout: GIT_TIMEOUT_MS,
+	});
+	return result.status === 0 ? result.stdout : null;
+}
+
+function realOrNull(path) {
+	try {
+		return realpathSync(path);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The folder holding the repository and its siblings. A linked worktree of a
+ * repository whose common dir is `<repo>/.git` maps to `dirname(<repo>)`, but
+ * only when `<repo>` itself lists the worktree; anything else (main checkout,
+ * bare repo, submodule, separate git dir, no git) keeps `dirname(project)`.
+ */
+function projectParent(project) {
+	const fallback = dirname(project);
+	const common = gitOutput(project, [
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	]);
+	const commonDir = common && realOrNull(common.trim());
+	if (!commonDir || basename(commonDir) !== ".git") return fallback;
+	const repoRoot = dirname(commonDir);
+	if (repoRoot === project) return fallback;
+	const listing = gitOutput(repoRoot, [
+		"worktree",
+		"list",
+		"--porcelain",
+		"-z",
+	]);
+	if (!listing) return fallback;
+	const listed = listing
+		.split("\0")
+		.filter((field) => field.startsWith("worktree "))
+		.map((field) => realOrNull(field.slice("worktree ".length)));
+	// The first entry is always the main working tree; the project must be a
+	// linked one.
+	if (listed[0] !== repoRoot || !listed.slice(1).includes(project))
+		return fallback;
+	return dirname(repoRoot);
 }
 
 function within(root, path) {
@@ -170,30 +236,35 @@ function credentialFile(name) {
 }
 
 /** Return the realpath to grant, null when no grant is needed, or throw. */
-function acceptedPath(project, { name, path }) {
-	if (!path || path.includes("\0")) throw refused(name);
+function acceptedPath(project, { name, path }, parentOf) {
+	if (!path || path.includes("\0"))
+		throw refused(name, "path_dependency_invalid");
 	const declared = resolve(project, path);
-	let real;
-	try {
-		real = realpathSync(declared);
-	} catch {
+	const real = realOrNull(declared);
+	if (real === null) {
 		if (within(project, declared)) return null;
-		throw refused(name);
+		throw refused(name, "path_dependency_unresolved");
 	}
 	if (within(project, real)) return null;
-	const parent = dirname(project);
 	// Checks that need no read of the target run first; the top-level listing
 	// runs last, so a refused path such as ~/.ssh is never listed.
+	let directory = false;
+	try {
+		directory = lstatSync(real).isDirectory();
+	} catch {}
+	if (!directory) throw refused(name, "path_dependency_not_directory");
+	if (!real.startsWith(`${parentOf()}${sep}`))
+		throw refused(name, "path_dependency_outside_project_parent");
+	if (hasDotDirectory(path) || hasDotDirectory(real))
+		throw refused(name, "path_dependency_dot_directory");
 	let entries;
 	try {
-		if (!lstatSync(real).isDirectory()) throw refused(name);
-		if (!real.startsWith(`${parent}${sep}`)) throw refused(name);
-		if (hasDotDirectory(path) || hasDotDirectory(real)) throw refused(name);
 		entries = readdirSync(real);
 	} catch {
-		throw refused(name);
+		throw refused(name, "path_dependency_unreadable");
 	}
-	if (entries.some(credentialFile)) throw refused(name);
+	if (entries.some(credentialFile))
+		throw refused(name, "path_dependency_credential_file");
 	return real;
 }
 
@@ -214,9 +285,15 @@ export function declaredPathDependencies(projectPath) {
 		...(pyproject ? uvPathSources(pyproject) : []),
 		...(npm ? npmFileSources(npm) : []),
 	];
+	// Git runs only when a declared path actually needs the parent rule.
+	let parent;
+	const parentOf = () => {
+		parent ??= projectParent(project);
+		return parent;
+	};
 	const accepted = new Set();
 	for (const source of sources) {
-		const real = acceptedPath(project, source);
+		const real = acceptedPath(project, source, parentOf);
 		if (real) accepted.add(real);
 	}
 	return [...accepted];

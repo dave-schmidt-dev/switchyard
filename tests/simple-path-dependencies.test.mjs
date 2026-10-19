@@ -24,6 +24,7 @@ import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const REFUSED = { code: "check_dependencies_unverified" };
+const refusal = (dependencyCheck) => ({ ...REFUSED, dependencyCheck });
 
 // Wilted's Producer/Runtime manifest, verbatim in shape (2026-10-06 field case).
 const WILTED_SOURCES = `[tool.uv]
@@ -46,9 +47,13 @@ function git(cwd, args) {
 	return result.stdout.trim();
 }
 
-/** A project beside a sibling path dependency, both under one parent. */
+/**
+ * A project beside a sibling path dependency, both under one parent. `sources`
+ * may be a function of the fixture paths; `gitDir` names a separate git dir.
+ */
 function fixture(
 	sources = 'sibling = { path = "../sibling", editable = true }',
+	{ gitDir = null } = {},
 ) {
 	const root = tempDir("switchyard-path-deps-");
 	const project = join(root, "project");
@@ -59,12 +64,18 @@ function fixture(
 		join(sibling, "src", "sibling", "__init__.py"),
 		'VALUE = "sibling"\n',
 	);
+	const declared =
+		typeof sources === "function" ? sources({ root, sibling }) : sources;
 	writeFileSync(
 		join(project, "pyproject.toml"),
-		`[project]\nname = "fixture"\n\n[tool.uv.sources]\n${sources}\n`,
+		`[project]\nname = "fixture"\n\n[tool.uv.sources]\n${declared}\n`,
 	);
 	writeFileSync(join(project, ".gitignore"), ".venv\n");
-	git(project, ["init", "-q"]);
+	git(project, [
+		"init",
+		"-q",
+		...(gitDir ? [`--separate-git-dir=${join(root, gitDir)}`] : []),
+	]);
 	git(project, ["add", "."]);
 	git(project, [
 		"-c",
@@ -77,6 +88,16 @@ function fixture(
 	]);
 	return { root, project, sibling };
 }
+
+/** A linked worktree nested inside the project, as Claude Code places one. */
+function linkedWorktree(repo, name = "wt") {
+	const worktree = join(repo.project, ".claude", "worktrees", name);
+	git(repo.project, ["worktree", "add", "-q", "--detach", worktree]);
+	return worktree;
+}
+
+const absoluteSibling = ({ sibling }) =>
+	`sibling = { path = ${JSON.stringify(sibling)}, editable = true }`;
 
 function checkSession(repo) {
 	return createSimpleCheckSessions({
@@ -200,6 +221,7 @@ describe("declaredPathDependencies", () => {
 			() => declaredPathDependencies(repo.project),
 			(error) =>
 				error.code === REFUSED.code &&
+				error.dependencyCheck === "path_dependency_outside_project_parent" &&
 				error.message.includes("keys") &&
 				!error.message.includes(ssh),
 		);
@@ -208,14 +230,28 @@ describe("declaredPathDependencies", () => {
 	it("refuses a directory outside the project's parent", () => {
 		const outside = tempDir("switchyard-path-deps-outside-");
 		const repo = fixture(`far = { path = ${JSON.stringify(outside)} }`);
-		throws(() => declaredPathDependencies(repo.project), REFUSED);
+		throws(
+			() => declaredPathDependencies(repo.project),
+			refusal("path_dependency_outside_project_parent"),
+		);
 	});
 
 	it("refuses a symlink in the parent that resolves outside it", () => {
 		const outside = tempDir("switchyard-path-deps-outside-");
 		const repo = fixture('link = { path = "../link" }');
 		symlinkSync(outside, join(repo.root, "link"));
-		throws(() => declaredPathDependencies(repo.project), REFUSED);
+		throws(
+			() => declaredPathDependencies(repo.project),
+			refusal("path_dependency_outside_project_parent"),
+		);
+	});
+
+	it("refuses an empty declared path", () => {
+		const repo = fixture('empty = { path = "" }');
+		throws(
+			() => declaredPathDependencies(repo.project),
+			refusal("path_dependency_invalid"),
+		);
 	});
 
 	for (const name of [".env", ".env.local", ".netrc", "id_ed25519"]) {
@@ -226,6 +262,7 @@ describe("declaredPathDependencies", () => {
 				() => declaredPathDependencies(repo.project),
 				(error) =>
 					error.code === REFUSED.code &&
+					error.dependencyCheck === "path_dependency_credential_file" &&
 					error.message.includes("sibling") &&
 					!error.message.includes(name),
 			);
@@ -241,26 +278,84 @@ describe("declaredPathDependencies", () => {
 		]);
 	});
 
-	for (const [label, path, setup] of [
+	for (const [label, path, setup, cause] of [
 		[
 			"a dot-directory",
 			"../.hidden",
 			(root) => mkdirSync(join(root, ".hidden")),
+			"path_dependency_dot_directory",
 		],
-		["the parent itself", "..", () => {}],
-		["a missing path", "../missing", () => {}],
+		[
+			"the parent itself",
+			"..",
+			() => {},
+			"path_dependency_outside_project_parent",
+		],
+		["a missing path", "../missing", () => {}, "path_dependency_unresolved"],
 		[
 			"a file",
 			"../wheel.whl",
 			(root) => writeFileSync(join(root, "wheel.whl"), ""),
+			"path_dependency_not_directory",
 		],
 	]) {
 		it(`refuses ${label}`, () => {
 			const repo = fixture(`dep = { path = ${JSON.stringify(path)} }`);
 			setup(repo.root);
-			throws(() => declaredPathDependencies(repo.project), REFUSED);
+			throws(() => declaredPathDependencies(repo.project), refusal(cause));
 		});
 	}
+});
+
+describe("declaredPathDependencies from a linked worktree", () => {
+	it("grants a worktree exactly its main checkout's sibling", () => {
+		const repo = fixture(absoluteSibling);
+		const worktree = linkedWorktree(repo);
+		const sibling = [realpathSync(repo.sibling)];
+		deepStrictEqual(declaredPathDependencies(worktree), sibling);
+		deepStrictEqual(declaredPathDependencies(repo.project), sibling);
+	});
+
+	it("still refuses a dependency outside the main checkout's parent", () => {
+		const outside = tempDir("switchyard-path-deps-outside-");
+		const repo = fixture(`far = { path = ${JSON.stringify(outside)} }`);
+		throws(
+			() => declaredPathDependencies(linkedWorktree(repo)),
+			refusal("path_dependency_outside_project_parent"),
+		);
+	});
+
+	it("keeps the worktree's own parent when the common dir is not .git", () => {
+		const repo = fixture(absoluteSibling, { gitDir: "store.git" });
+		deepStrictEqual(declaredPathDependencies(repo.project), [
+			realpathSync(repo.sibling),
+		]);
+		throws(
+			() => declaredPathDependencies(linkedWorktree(repo)),
+			refusal("path_dependency_outside_project_parent"),
+		);
+	});
+
+	it("ignores a .git file that borrows a registered worktree's admin dir", () => {
+		const repo = fixture(absoluteSibling);
+		const registered = linkedWorktree(repo);
+		const forged = join(repo.project, ".claude", "worktrees", "forged");
+		mkdirSync(forged);
+		writeFileSync(
+			join(forged, "pyproject.toml"),
+			readFileSync(join(registered, "pyproject.toml")),
+		);
+		const admin = git(registered, [
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-dir",
+		]);
+		writeFileSync(join(forged, ".git"), `gitdir: ${admin}\n`);
+		throws(
+			() => declaredPathDependencies(forged),
+			refusal("path_dependency_outside_project_parent"),
+		);
+	});
 });
 
 describe("venvPathEntries", () => {

@@ -178,6 +178,29 @@ test("an unparseable check records its command sub-cause and position", {
 	ok(isPersistentFailureDetails(details));
 });
 
+test("a refused path dependency records the rule it failed and its setup step", {
+	skip: nestedSandboxSkip || sandboxSkip,
+}, async () => {
+	const repo = fixtureRepo();
+	const outside = tempDir("switchyard-check-dependency-detail-outside-");
+	writeFileSync(
+		join(repo.projectPath, "pyproject.toml"),
+		`[tool.uv.sources]\nfar = { path = ${JSON.stringify(outside)} }\n`,
+	);
+	commit(repo.projectPath);
+	const { result, providerCalls } = await run(repo);
+	strictEqual(providerCalls, 0);
+	strictEqual(result.failureReason, "check_dependencies_unverified");
+	const details = (await readRun(result.runId)).failureDetails;
+	ok(details, "run.json carries failureDetails");
+	strictEqual(
+		details.dependencyCheck,
+		"path_dependency_outside_project_parent",
+	);
+	strictEqual(details.checkSetupStep, "resolve_path_dependencies");
+	ok(isPersistentFailureDetails(details));
+});
+
 test("dependency refusal severity is baseline before the provider and hard after", () => {
 	for (const phase of ["preflight", "route", "prepare", "baseline"]) {
 		const resolved = resolveFailure({
