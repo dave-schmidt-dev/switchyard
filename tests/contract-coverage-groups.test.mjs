@@ -155,9 +155,11 @@ describe("contract coverage groups", () => {
 			// the focused list for the same reason. (O4 follow-up): the reducer and
 			// replay suites left with the deleted reducer, and
 			// run-store-shadow-reducer-projection was renamed
-			// run-store-legacy-outcome-projection. Every surviving entry and its
-			// order is unchanged.
-			"3fe4af673a4b7a112133f11a5c7637536a39e134a8a3ad901dbc1242631b9e54",
+			// run-store-legacy-outcome-projection. 2026-10-19 (O1 leftovers):
+			// run-store-prlctl-failure-metadata-survives was renamed
+			// run-store-durable-evidence, which moves its sorted position. Every
+			// other surviving entry and its order is unchanged.
+			"c173772d1b9064bcd7c6164da2b0472d3700e5d376f380a657c7600dac74365d",
 		);
 		let calls = 0;
 		const result = runContractCoverage({

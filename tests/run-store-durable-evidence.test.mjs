@@ -47,7 +47,7 @@ afterEach(() => {
 		// no-op
 	}
 });
-describe("prlctl failure metadata survives the persistence boundary", () => {
+describe("failure metadata survives the persistence boundary", () => {
 	it("rejects a persisted diagnostic whose origin cannot mint its code", async () => {
 		for (const provenance of [
 			{
@@ -87,12 +87,12 @@ describe("prlctl failure metadata survives the persistence boundary", () => {
 		}
 	});
 
-	// The whole point of classifying a prlctl misfire is that a reader of the
-	// FILE, not just the in-process object, can tell it apart from an ordinary
-	// provisioning failure. A wrapper that built the right object in memory but
-	// lost exitCode/signal on the way through validateRun's allowlist would
-	// still read as "no metadata recorded" to anyone who only reads run.json.
-	it("round-trips a prlctl_job_misfire lastFailure with its exit code through disk", async () => {
+	// The retired Parallels lane persisted prlctl worker-boot failures, and
+	// run.json files from that era still carry them. A reader of the FILE, not
+	// just the in-process object, must still tell one apart from an ordinary
+	// provisioning failure: losing exitCode/signal on the way through
+	// validateRun's allowlist would read as "no metadata recorded".
+	it("round-trips a historical prlctl_job_misfire lastFailure with its exit code through disk", async () => {
 		const opts = makeOptions();
 		const snapshot = await initializeRun(opts);
 		const misfireFailure = sanitizeFailureMetadata({
@@ -122,7 +122,7 @@ describe("prlctl failure metadata survives the persistence boundary", () => {
 		ok(isPersistentFailureMetadata(onDisk.lastFailure));
 	});
 
-	it("round-trips a prlctl_call_timed_out lastFailure with its signal through disk", async () => {
+	it("round-trips a historical prlctl_call_timed_out lastFailure with its signal through disk", async () => {
 		const opts = makeOptions();
 		const snapshot = await initializeRun(opts);
 		const timeoutFailure = sanitizeFailureMetadata({
