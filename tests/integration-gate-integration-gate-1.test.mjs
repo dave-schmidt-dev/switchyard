@@ -166,8 +166,8 @@ index 0000000..abcdef1
 	});
 
 	it("pins the bounded apply-check buffer (regression: the --check probes must stay memory-bounded)", () => {
-		// The forward/reverse `git apply --check` probes (applyCheckPasses)
-		// pipe the diff to git and capture its output; maxBuffer bounds that
+		// The `git apply --check` probe (applyCheckPasses) pipes the diff to
+		// git and captures its output; maxBuffer bounds that
 		// capture so a pathological patch cannot buffer unbounded stderr.
 		// The module has no injectable spawn seam, and `git apply --check`
 		// output does not scale with patch size (verified empirically: errors

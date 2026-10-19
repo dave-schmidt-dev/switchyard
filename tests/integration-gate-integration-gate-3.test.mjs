@@ -66,11 +66,10 @@ describe("integration gate", () => {
 		ok(!existsSync(join(projectPath, "src", "gone.mjs")));
 	});
 
-	it("still fails on a genuinely conflicting diff (forward and reverse checks both fail)", () => {
+	it("still fails on a genuinely conflicting diff", () => {
 		// A third-party edit moves the tree to a state matching neither the
-		// diff's before-state (forward `--check` fails) nor its after-state
-		// (reverse `--check` fails) — a real conflict, not an already-applied
-		// no-op. It must remain a failure and leave the host untouched.
+		// diff's before-state (so `--check` fails) nor its after-state: a real
+		// conflict. It must remain a failure and leave the host untouched.
 		commitFile(projectPath, "conflict.txt", "line a\nline b\nline c\n");
 		const diff = buildDiff(projectPath, (dir) => {
 			writeFileSync(
@@ -120,7 +119,7 @@ describe("integration gate", () => {
 		// Regression for a live incident (2026-08-03): a container-generated
 		// diff arrived with its final hunk cut short — the hunk header claimed
 		// more lines than were actually present, and the file had no trailing
-		// newline. git's `--check` (forward and reverse) both report
+		// newline. git's `--check` reports
 		// "corrupt patch" for this, distinct from "patch does not apply" for a
 		// real conflict — the two must not be reported identically, since a
 		// truncated diff calls for a retry/re-generation while a real conflict
@@ -156,16 +155,12 @@ describe("integration gate", () => {
 		);
 	});
 
-	it("rejects a matching after-state without durable intent proof under Files enforcement", () => {
-		// runner/index.mjs always calls integrationGate with
-		// `{requiredPaths: task.requiredPaths}` (the task's declared `Files:`
-		// field), never bare — so the realistic idempotent-retry path (a killed
-		// dispatch's checkpoint retry regenerating the same diff, INV-6/Task
-		// 1.4's whole motivation) always goes through the requiredPaths branch,
-		// not the bare-call shape the other alreadyApplied tests use. The
-		// requiredPaths checks parse the diff text itself (extractTouchedPaths/
-		// extractSummaryLines), independent of tree state, so they must not be
-		// disturbed by a second, already-applied call.
+	it("rejects a matching after-state under Files enforcement", () => {
+		// A re-run of the same diff under declared paths goes through the
+		// path-declaration branch, not the bare call the other matching-after-
+		// state tests use. Those checks parse the diff text itself
+		// (extractTouchedPaths/extractSummaryLines), independent of tree state,
+		// so the second call must still fail closed without touching the host.
 		const diff = buildDiff(projectPath, (dir) => {
 			writeFileSync(join(dir, "test.txt"), "modified content\n", "utf8");
 		});
@@ -188,17 +183,15 @@ describe("integration gate", () => {
 		);
 	});
 
-	it("a multi-file diff with one already-applied file and one genuinely conflicting file fails closed, not a false alreadyApplied (mixed-state regression)", () => {
-		// Task 1.4 explicitly does not attempt to distinguish a "mixed"
-		// (partially-already-applied, partially-conflicting) patch from a
-		// plain conflict, because a whole-patch forward/reverse check cannot
-		// observe that distinction. This proves the conservative direction
-		// actually holds in code: when one file in a multi-file diff already
-		// matches the diff's after-state but another file has been
-		// independently changed to a THIRD state (matching neither the diff's
-		// before- nor after-state), the whole patch must fail — it must never
-		// be silently swallowed as alreadyApplied, which would abandon the
-		// conflicting file's real conflict undetected.
+	it("a multi-file diff with one already-applied file and one genuinely conflicting file fails closed (mixed-state regression)", () => {
+		// The gate does not try to tell a "mixed" (partially already applied,
+		// partially conflicting) patch from a plain conflict: a whole-patch
+		// check cannot observe that distinction. This proves the conservative
+		// direction holds: when one file in a multi-file diff already matches
+		// the diff's after-state but another has been independently changed to
+		// a THIRD state (matching neither the diff's before- nor after-state),
+		// the whole patch must fail, so the conflicting file's real conflict is
+		// never swallowed.
 		commitFile(projectPath, "a.txt", "original A\n");
 		commitFile(projectPath, "b.txt", "line a\nline b\nline c\n");
 		const diff = buildDiff(projectPath, (dir) => {

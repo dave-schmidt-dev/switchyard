@@ -218,9 +218,8 @@ index 0000000..abcdef1
 	});
 
 	it("does not infer a new-file application from a matching after-state", () => {
-		// New-file shape: a reverse apply of a new-file diff deletes the
-		// already-created file, so `--reverse --check` succeeds and the gate
-		// reports alreadyApplied without touching the host.
+		// New-file shape: on a re-run the file already exists, so the forward
+		// `--check` fails and the gate fails closed without touching the host.
 		const diff = buildStagedDiff(projectPath, (dir) => {
 			mkdirSync(join(dir, "src"), { recursive: true });
 			writeFileSync(
