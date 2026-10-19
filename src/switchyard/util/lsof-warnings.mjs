@@ -1,35 +1,34 @@
+import { statSync } from "node:fs";
 import { sep } from "node:path";
 
 // macOS lsof stats every mounted filesystem before it lists anything. A network
 // mount it cannot stat (the Time Machine SMB share while a backup runs, for
-// example) prints exactly this three-line block. Listings on every other
-// filesystem stay complete: a process whose cwd is a local scratch dir is still
-// reported while the warning prints (measured 2026-10-19 during a backup).
+// example) prints exactly this three-line block, takes the device number from
+// the mount table and continues; cwd paths come from each process directly. A
+// process whose cwd is a local scratch dir is still reported while the warning
+// prints (measured 2026-10-19 during a backup).
 const UNSTATTABLE_MOUNT =
 	/^lsof: WARNING: can't stat\(\) [A-Za-z0-9_-]+ file system (\/.*)$/u;
 const INCOMPLETE = "      Output information may be incomplete.";
-const ASSUMED_DEV = /^ {6}assuming "dev=[0-9a-f]+" from mount table$/u;
+const ASSUMED_DEV = /^ {6}assuming "dev=([0-9a-f]{1,8})" from mount table$/u;
 
 /**
- * Mount points named by lsof's "can't stat() file system" warnings, or null
- * when stderr holds any other text.
+ * Mounts named by lsof's "can't stat() file system" warnings, with the device
+ * number lsof assumed for each, or null when stderr holds any other text.
  *
  * @param {string} stderr
- * @returns {string[] | null}
+ * @returns {{path: string, dev: number}[] | null}
  */
 function unstattableMounts(stderr) {
 	const lines = stderr.split("\n");
 	if (lines.at(-1) === "") lines.pop();
 	const mounts = [];
 	for (let index = 0; index < lines.length; index += 3) {
-		const mount = UNSTATTABLE_MOUNT.exec(lines[index])?.[1];
-		if (
-			mount === undefined ||
-			lines[index + 1] !== INCOMPLETE ||
-			!ASSUMED_DEV.test(lines[index + 2] ?? "")
-		)
-			return null;
-		mounts.push(mount);
+		const path = UNSTATTABLE_MOUNT.exec(lines[index])?.[1];
+		const dev = ASSUMED_DEV.exec(lines[index + 2] ?? "")?.[1];
+		if (path === undefined || dev === undefined) return null;
+		if (lines[index + 1] !== INCOMPLETE) return null;
+		mounts.push({ path, dev: Number.parseInt(dev, 16) });
 	}
 	return mounts;
 }
@@ -37,23 +36,43 @@ function unstattableMounts(stderr) {
 const within = (path, root) =>
 	path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
 
+/** Device number of `path` as an unsigned 32-bit value, or null. */
+function deviceOfPath(path) {
+	try {
+		return statSync(path).dev >>> 0;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Whether lsof's listing is complete for every path under `scopeRoots`
  * (realpaths). True for empty stderr. Otherwise stderr must hold only
  * unstattable-mount blocks whose mount is neither a scope root, an ancestor of
- * one, nor inside one. Any other warning, or no scope at all, reads as
- * incomplete.
+ * one, nor inside one, and whose device is not a scope root's device (a
+ * firmlink gives one volume two spellings, such as `/System/Volumes/Data` and
+ * `/private/var`). Any other warning, a scope root that cannot be stat'ed, or
+ * no scope at all reads as incomplete.
  *
  * @param {unknown} stderr
  * @param {readonly string[]} scopeRoots
+ * @param {{deviceOf?: (path: string) => number | null}} [options]
  * @returns {boolean}
  */
-export function lsofListingComplete(stderr, scopeRoots) {
+export function lsofListingComplete(
+	stderr,
+	scopeRoots,
+	{ deviceOf = deviceOfPath } = {},
+) {
 	if (stderr === undefined || stderr === null || stderr === "") return true;
 	if (typeof stderr !== "string") return false;
 	const mounts = unstattableMounts(stderr);
 	if (mounts === null || scopeRoots.length === 0) return false;
-	return mounts.every((mount) =>
-		scopeRoots.every((root) => !within(mount, root) && !within(root, mount)),
+	const scopeDevices = scopeRoots.map((root) => deviceOf(root));
+	if (scopeDevices.some((dev) => !Number.isInteger(dev))) return false;
+	return mounts.every(
+		({ path, dev }) =>
+			!scopeDevices.includes(dev) &&
+			scopeRoots.every((root) => !within(path, root) && !within(root, path)),
 	);
 }
