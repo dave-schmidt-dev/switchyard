@@ -3,25 +3,6 @@ import { closedReason, createRouteEvidenceCapture } from "./route-evidence.mjs";
 
 const LIMIT = 64;
 
-// Static operator/capability filters and an overridden advisory are not
-// operational refusals. Every other closed reason must positively be funding.
-const NEUTRAL_REASONS = new Set([
-	"explicitly_excluded",
-	"not_in_only_allowlist",
-	"below_required_capability",
-	"tier_excluded",
-	"deadline_fit_overridden",
-]);
-
-const FUNDING_REASONS = Object.freeze(
-	new Set([
-		"paid_overage_not_allowed",
-		"included_usage_unverified",
-		"funding_unavailable",
-		"funding_exhausted",
-	]),
-);
-
 /**
  * Deduplicate and bound exclusion entries while preserving precedence.
  * Each closed (targetId, bucket, reason) is retained once.
@@ -50,35 +31,6 @@ function deduplicateRefusals(entries = [], limit = LIMIT) {
 }
 
 /**
- * Check if the exclusions represent funding-only exhaustion.
- * True when taskFailures is false, at least one target was excluded by funding,
- * and every other relevant refusal is also funding.
- */
-function isFundingOnlyExhaustion(excludedEntries = [], taskFailures = false) {
-	if (taskFailures) return false;
-	const entries = Array.isArray(excludedEntries) ? excludedEntries : [];
-	let hasFunding = false;
-	for (const entry of entries) {
-		const reason = closedReason(entry?.reason);
-		if (FUNDING_REASONS.has(reason)) hasFunding = true;
-		else if (!NEUTRAL_REASONS.has(reason)) return false;
-	}
-	return hasFunding;
-}
-
-/**
- * Classify exhaustion cause into 'task_failures', 'funding', or 'capacity'.
- */
-function classifyExhaustionCause({
-	excludedEntries = [],
-	taskFailures = false,
-} = {}) {
-	if (taskFailures) return "task_failures";
-	if (isFundingOnlyExhaustion(excludedEntries, taskFailures)) return "funding";
-	return "capacity";
-}
-
-/**
  * Accumulator for route evaluation refusals across pipeline stages.
  */
 export function createRefusalAccumulator(initial = []) {
@@ -103,16 +55,27 @@ export function createRefusalAccumulator(initial = []) {
 		entries(limit = LIMIT) {
 			return Array.from(map.values()).slice(0, limit);
 		},
-		isFundingOnly(taskFailures = false) {
-			return isFundingOnlyExhaustion(Array.from(map.values()), taskFailures);
-		},
-		classifyExhaustion(taskFailures = false) {
-			return classifyExhaustionCause({
-				excludedEntries: Array.from(map.values()),
-				taskFailures,
-			});
-		},
 	};
+}
+
+/**
+ * Drop the selector's `adapter_unavailable` entries for targets the caller
+ * removed from `availableProviders` itself. Those targets already carry their
+ * own refusal, so the extra entry was false evidence (stability audit O10,
+ * 2026-10-18).
+ */
+export function withoutRemovalArtifacts(routed, removedByCaller) {
+	const evidence = routed?.routeEvidence;
+	if (!Array.isArray(evidence?.excluded)) return routed;
+	const excluded = evidence.excluded.filter(
+		(entry) =>
+			!(
+				closedReason(entry?.reason) === "adapter_unavailable" &&
+				removedByCaller(entry?.targetId)
+			),
+	);
+	if (excluded.length === evidence.excluded.length) return routed;
+	return { ...routed, routeEvidence: { ...evidence, excluded } };
 }
 
 /** Merge refusals into sanitized route evidence without affecting selection. */
