@@ -2,9 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { integrationGate } from "../integrate/index.mjs";
-import { currentNodeExecutable } from "../node-runtime.mjs";
 import { settleSimpleWriterProcesses } from "../simple/process-teardown.mjs";
 import { MAX_CHECKS, parseCommand } from "./check-contract.mjs";
 import { trustedOfflineNpmEnv } from "./check-dependencies.mjs";
@@ -22,7 +20,6 @@ import {
 
 export { isPythonCheck, parseQuickChecks } from "./check-contract.mjs";
 
-const SELF = fileURLToPath(import.meta.url);
 const MAX_CHECK_MS = 10 * 60_000;
 const CHECK_REPAIR_MIN_COMMAND_MS = 30_000;
 
@@ -265,125 +262,6 @@ if (process.argv[2] === "--quick-check-settle") {
 	});
 	process.stdout.write(state);
 }
-export function runQuickChecksAsync(input) {
-	return new Promise((resolve) => {
-		const root = mkdtempSync(join(tmpdir(), "switchyard-quick-check-"));
-		const launchedAt = Date.now();
-		const configuredMaxMs =
-			(input.checks?.length ?? MAX_CHECKS) *
-				(input.checkTimeoutMs ?? MAX_CHECK_MS) +
-			(input.setup ? 5 * 60_000 : 0) +
-			90_000;
-		const deadlineRemainingMs =
-			input.deadline === undefined
-				? Number.POSITIVE_INFINITY
-				: Date.parse(input.deadline) - Date.now();
-		const maxMs = Math.min(
-			configuredMaxMs,
-			Number.isFinite(deadlineRemainingMs)
-				? Math.max(0, deadlineRemainingMs) + 15_000
-				: configuredMaxMs,
-		);
-		let child;
-		try {
-			child = spawn(currentNodeExecutable(), [SELF, "--quick-check-runner"], {
-				env: safeEnv(root),
-				stdio: ["pipe", "pipe", "ignore"],
-				detached: true,
-				shell: false,
-			});
-		} catch {
-			rmSync(root, { recursive: true, force: true });
-			resolve(null);
-			return;
-		}
-		input.onRunnerStarted?.(child.pid, root);
-		let output = "";
-		let settled = false;
-		const finish = async (receipt = null) => {
-			if (settled) return;
-			settled = true;
-			clearInterval(progress);
-			clearTimeout(timeout);
-			const stopped = Number.isSafeInteger(child.pid)
-				? (await settleSimpleWriterProcesses({
-						processGroupId: child.pid,
-						processScopePath: root,
-						launchedAt,
-						onProgress: () =>
-							input.onStatus?.({
-								phase: "checks",
-								event: "check_cleanup_progress",
-								status: `Task ${input.taskId} isolated check cleanup running`,
-								taskId: input.taskId,
-							}),
-					})) === "stopped"
-				: true;
-			let removed = false;
-			if (stopped) {
-				try {
-					rmSync(root, { recursive: true, force: true });
-					removed = true;
-				} catch {
-					/* retain for diagnosis */
-				}
-			}
-			if (
-				receipt &&
-				stopped &&
-				removed &&
-				receipt.cleanup?.status === "pending"
-			) {
-				receipt.cleanup.status = "complete";
-				resolve(receipt);
-			} else resolve(null);
-		};
-		const progress = setInterval(
-			() =>
-				input.onStatus?.({
-					phase: "checks",
-					event: "check_progress",
-					status: `Task ${input.taskId} isolated checks still running`,
-					taskId: input.taskId,
-				}),
-			5_000,
-		);
-		const timeout = setTimeout(() => {
-			void finish();
-		}, maxMs);
-		child.stdout.setEncoding("utf8");
-		child.stdout.on("data", (chunk) => {
-			output += chunk;
-			if (output.length > 16_384) void finish();
-		});
-		child.on("error", () => {
-			void finish();
-		});
-		child.stdin.on("error", () => {
-			void finish();
-		});
-		child.on("exit", (code) => {
-			if (code !== 0) {
-				void finish();
-				return;
-			}
-			try {
-				void finish(JSON.parse(output));
-			} catch {
-				void finish();
-			}
-		});
-		child.stdin.end(
-			JSON.stringify({
-				...input,
-				ownedRoot: root,
-				hostNpmCache: join(homedir(), ".npm"),
-				onStatus: undefined,
-				onRunnerStarted: undefined,
-			}),
-		);
-	});
-}
 if (process.argv[2] === "--quick-check-worker") {
 	let payload;
 	try {
@@ -475,22 +353,6 @@ if (process.argv[2] === "--quick-check-gate") {
 			process.stdout.write(result.success === true ? "passed" : "rejected");
 		} catch {
 			process.stdout.write("rejected");
-		}
-	});
-}
-if (process.argv[2] === "--quick-check-runner") {
-	let raw = "";
-	process.stdin.setEncoding("utf8");
-	process.stdin.on("data", (chunk) => {
-		raw += chunk;
-		if (raw.length > 8 * 1024 * 1024) process.exit(2);
-	});
-	process.stdin.on("end", () => {
-		try {
-			const receipt = runQuickChecks(JSON.parse(raw));
-			process.stdout.write(JSON.stringify(receipt));
-		} catch {
-			process.exitCode = 2;
 		}
 	});
 }

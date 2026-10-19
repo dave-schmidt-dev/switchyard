@@ -57,6 +57,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The run store's queue-era exports, none of which production called: run leases and launch locks (`run-locks.mjs`), run and checkpoint-artifact retention (`retention.mjs`, `checkpoint-retention.mjs`, `checkpoint-artifacts.mjs`), the provider diagnostic writer `persistDiagnosticArtifact`, and the typed outcome writer activation and recovery helpers that took a run lease. `resolveDiagnosticArtifact` still reads diagnostics that older runs left behind, and lock recovery still leaves a legacy launch lock alone.
 - The test environment's `SWITCHYARD_ACCOUNT_ROOT` and `DOCKER_CONFIG` settings, and the phase runner's per-phase account directory. Nothing outside the retired VM lane read either.
 - The `SWITCHYARD_VM_ADMISSION_ROOT` setup that 14 run-store tests and their shared fixture still carried after the VM lane left.
+- `runQuickChecksAsync` and its `--quick-check-runner` child entry point in `runner/checks.mjs`. Only the retired queue lane ran quick checks in a detached child; `simple` calls `runQuickChecks` directly.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
