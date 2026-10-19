@@ -165,8 +165,32 @@ describe("simple check validation", () => {
 			"make lint",
 			"xcrun swiftc -parse check.swift",
 			"xcodebuild -version",
+			"xcodebuild -list -project App.xcodeproj",
+			"xcodebuild -scheme App build",
+			"xcodebuild -showBuildTimingSummary -scheme App build",
 		]) {
 			validateCheckCommand(command, PROJECT_PATH);
+		}
+	});
+
+	it("refuses xcodebuild that would build without the sandbox grants", () => {
+		for (const command of [
+			// The Wilted shape: build-for-testing never earned the grants and died on
+			// the Xcode license read, reported as a host toolchain fault.
+			"xcodebuild build-for-testing -scheme App -destination platform=macOS",
+			"xcodebuild -scheme App archive",
+			"xcodebuild clean build",
+			"xcodebuild -scheme App",
+			"CI=1 xcodebuild -scheme App build",
+			"cd App && xcodebuild build",
+			"xcodegen generate && xcodebuild build",
+			"xcodebuild build | cat",
+			"xcodebuild -someNewFlag build",
+		]) {
+			const error = rejection(command);
+			ok(error, command);
+			strictEqual(error.code, "check_tool_denied", command);
+			ok(error.message.includes("xcodebuild [flags] build"), command);
 		}
 	});
 

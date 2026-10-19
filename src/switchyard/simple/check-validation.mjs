@@ -1,5 +1,8 @@
 import { isAbsolute, join, resolve, sep } from "node:path";
-import { xcodebuildActions } from "../runner/checks-sandbox.mjs";
+import {
+	isXcodebuildBuild,
+	xcodebuildActions,
+} from "../runner/checks-sandbox.mjs";
 import { SimpleUsageError } from "./args.mjs";
 import { commandWords } from "./check-execution.mjs";
 
@@ -34,6 +37,17 @@ const ABSOLUTE_SYSTEM_TOOLS = new Set([
 	"/usr/bin/xcrun",
 ]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
+// xcodebuild flags that print information and exit without building.
+const XCODEBUILD_INFO_FLAGS = new Set([
+	"-version",
+	"-list",
+	"-showsdks",
+	"-showBuildSettings",
+	"-showdestinations",
+	"-showTestPlans",
+]);
+const XCODEBUILD_BUILD_HINT =
+	"--check may build with xcodebuild only as one plain `xcodebuild [flags] build` command (no env prefix, chain, or other action such as build-for-testing, archive or clean); other xcodebuild work runs natively";
 
 function toolName(word) {
 	const separator = word.lastIndexOf("/");
@@ -126,6 +140,21 @@ function xcodebuildTest(words) {
 		: words.slice(1).some((word) => word === "test");
 }
 
+// Only the check the sandbox grants xcodebuild access to may build, and that
+// grant reads the whole command (isXcodebuildBuild). Any other invocation that
+// would build (another action, no action, an env prefix, a chain, or a flag
+// the parser cannot read) runs without the grants and dies on the Xcode
+// license read, which looks like a host fault, so it is refused here.
+function xcodebuildUngranted(command, words) {
+	if (toolName(words[0] ?? "") !== "xcodebuild") return false;
+	if (isXcodebuildBuild(command)) return false;
+	const actions = xcodebuildActions(["xcodebuild", ...words.slice(1)]);
+	return !(
+		actions?.length === 0 &&
+		words.some((word) => XCODEBUILD_INFO_FLAGS.has(word))
+	);
+}
+
 function insideDependency(projectPath, path) {
 	return [".venv", "node_modules"].some((name) => {
 		const root = join(projectPath, name);
@@ -180,6 +209,11 @@ export function validateCheckCommand(command, projectPath) {
 			throw refused(
 				"check_tool_denied",
 				"--check uses a denied host tool: xcodebuild test",
+			);
+		if (xcodebuildUngranted(command, words))
+			throw refused(
+				"check_tool_denied",
+				`${XCODEBUILD_BUILD_HINT}: ${command.slice(0, 80)}`,
 			);
 		for (const [tool, subcommand] of DENIED_SEQUENCES) {
 			if (

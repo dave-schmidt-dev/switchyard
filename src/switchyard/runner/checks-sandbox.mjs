@@ -320,6 +320,7 @@ const XCODEBUILD_BOOLEAN_FLAGS = new Set([
 	"-alltargets",
 	"-parallelizeTargets",
 	"-hideShellScriptEnvironment",
+	"-showBuildTimingSummary",
 	"-allowProvisioningUpdates",
 	"-allowProvisioningDeviceRegistration",
 	"-skipUnavailableActions",

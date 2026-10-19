@@ -180,7 +180,9 @@ describe("xcodebuild action parsing", () => {
 			}
 		};
 		strictEqual(denied("xcodebuild -scheme test build"), false);
-		strictEqual(denied("xcodebuild -scheme build archive"), false);
+		strictEqual(denied("xcodebuild -scheme archive build"), false);
+		// archive is the action here, and only build earns the sandbox grants.
+		strictEqual(denied("xcodebuild -scheme build archive"), true);
 		strictEqual(denied("xcodebuild -scheme Fix test"), true);
 		strictEqual(denied("xcodebuild build test"), true);
 		strictEqual(denied("CI=1 xcodebuild test"), true);
