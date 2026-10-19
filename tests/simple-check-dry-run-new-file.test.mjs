@@ -258,13 +258,16 @@ test("a task whose check runs a script the task creates reaches the provider and
 		(event) => event.milestone === "dry_run_check_finished",
 	);
 	strictEqual(finished.checkStatus, "failed", "the dry run ran the check");
-	// Acceptance is unchanged: a provider that never creates the script fails.
-	const idle = await runTask(repoFixture(), {}, async () => ({
-		success: true,
-		writerLifecycle: "stopped",
-	}));
-	ok(idle.providerCalls >= 1, "the provider still started");
-	ok(idle.result.status !== "succeeded", "a missing script does not pass");
+	// Acceptance is unchanged: the script was absent for the dry run, but a
+	// provider that creates it broken still fails the check afterwards.
+	const broken = await runTask(repoFixture(), {}, async (context) => {
+		await newScriptProvider(context);
+		writeFileSync(join(context.worktreePath, NEW_SCRIPT), "exit 1\n");
+		return { success: true, writerLifecycle: "stopped" };
+	});
+	ok(broken.providerCalls >= 1, "the provider still started");
+	strictEqual(broken.result.status, "failed");
+	strictEqual(broken.result.failureReason, "check_failed");
 });
 
 test("an undeclared missing script or a present broken one stops before the provider", {
