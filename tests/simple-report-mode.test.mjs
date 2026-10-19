@@ -170,7 +170,7 @@ describe("simple report mode prompt", () => {
 		});
 		strictEqual(
 			prompt,
-			"Write the report\n\nWork only in the current disposable checkout. Change only these writable files: .logs/r.md. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.\n\nThis is a report-mode run: produce exactly one output file, the report at .logs/r.md, and change no other path.",
+			"Write the report\n\nWork only in the current disposable checkout. Change only these writable files: .logs/r.md. Do not delegate, plan recursively, commit, push, access credentials, or change any other path. Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.\n\nThis is a report-mode run: produce exactly one output file, the report at .logs/r.md, and change no other path.",
 		);
 	});
 });

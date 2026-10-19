@@ -122,7 +122,11 @@ export function claudeCodeSeatbeltProfile({
 		keychains,
 		cliRoot,
 	];
-	return baseSeatbeltRules({ reads, writes: [worktree, runtime] });
+	return baseSeatbeltRules({
+		reads,
+		writes: [worktree, runtime],
+		gitWorktree: worktree,
+	});
 }
 
 export function claudeCodeDiagnostic(parsed) {

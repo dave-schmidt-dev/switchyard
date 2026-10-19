@@ -11,7 +11,7 @@ const BASE_OPTIONS = {
 test("no checks and no read-only inputs gives the original guarded prompt", () => {
 	strictEqual(
 		buildGuardedPrompt({ ...BASE_OPTIONS }),
-		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.",
+		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path. Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.",
 	);
 });
 
@@ -21,7 +21,7 @@ test("read-only inputs add the read-only notice", () => {
 			...BASE_OPTIONS,
 			readOnlyInputs: ["docs/input.md"],
 		}),
-		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Read-only input paths (do not modify): docs/input.md. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.",
+		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Read-only input paths (do not modify): docs/input.md. Do not delegate, plan recursively, commit, push, access credentials, or change any other path. Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.",
 	);
 });
 
@@ -31,7 +31,7 @@ test("checks add the acceptance check paragraph with both commands in order", ()
 		checks: ["ruff check .", "swiftlint --strict"],
 	});
 	const scopeSentence =
-		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.";
+		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path. Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.";
 	strictEqual(
 		prompt,
 		`${scopeSentence}\n\nAfter you finish, these acceptance checks run against your candidate in an independent trusted checkout and must all pass. Write code that satisfies them, including formatting, import order, lint rules and types:\n- \`ruff check .\`\n- \`swiftlint --strict\``,
@@ -46,7 +46,7 @@ test("checks add the acceptance check paragraph with both commands in order", ()
 test("an empty checks array adds nothing", () => {
 	strictEqual(
 		buildGuardedPrompt({ ...BASE_OPTIONS, checks: [] }),
-		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path.",
+		"Fix the bug.\n\nWork only in the current disposable checkout. Change only these writable files: src/a.mjs, src/b.mjs. Do not delegate, plan recursively, commit, push, access credentials, or change any other path. Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.",
 	);
 });
 
@@ -80,4 +80,19 @@ test("red-at-baseline names without declared checks add nothing", () => {
 		}),
 		buildGuardedPrompt({ ...BASE_OPTIONS }),
 	);
+});
+
+test("the guardrail forbids git writes and edits under .git in every prompt shape", () => {
+	const guardrail =
+		"Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.";
+	for (const options of [
+		{},
+		{ readOnlyInputs: ["docs/input.md"] },
+		{ checks: ["make test"], redAtBaselineChecks: ["make test"] },
+		{ carriedFiles: ["src/a.mjs"] },
+		{ reportMode: true },
+	]) {
+		const prompt = buildGuardedPrompt({ ...BASE_OPTIONS, ...options });
+		strictEqual(prompt.split(guardrail).length, 2);
+	}
 });

@@ -1,6 +1,11 @@
 /** Upper bound on carried file names listed in the prompt note. */
 const MAX_CARRIED_FILE_NAMES = 16;
 
+// Any change under .git fails verifyGitControl after the run and discards the
+// whole checkout, so the provider hears the rule before it acts.
+const GIT_GUARDRAIL =
+	" Do not run git commands that write to the repository (such as add, commit, stash, checkout, reset, gc, init or config), and do not create, edit or delete anything under .git; read-only git commands such as status, diff and log are fine.";
+
 // Only declared-file names enter the note: never diff text or anything else
 // the earlier provider wrote.
 function carriedNote(files) {
@@ -43,7 +48,7 @@ export function buildGuardedPrompt({
 	const readOnlyNotice = readOnlyInputs.length
 		? ` Read-only input paths (do not modify): ${readOnlyInputs.join(", ")}.`
 		: "";
-	const scopeSentence = `${promptText}\n\nWork only in the current disposable checkout. Change only these writable files: ${files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.`;
+	const scopeSentence = `${promptText}\n\nWork only in the current disposable checkout. Change only these writable files: ${files.join(", ")}.${readOnlyNotice} Do not delegate, plan recursively, commit, push, access credentials, or change any other path.${GIT_GUARDRAIL}`;
 	const carried = carriedNote(carriedFiles);
 	const reportSentence = reportMode
 		? `\n\nThis is a report-mode run: produce exactly one output file, the report at ${files[0]}, and change no other path.`

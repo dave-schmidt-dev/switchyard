@@ -122,7 +122,11 @@ export function vibeCodeSeatbeltProfile({ worktree, runtime, keychains }) {
 		UV_PYTHON,
 		keychains,
 	];
-	return baseSeatbeltRules({ reads, writes: [worktree, runtime] });
+	return baseSeatbeltRules({
+		reads,
+		writes: [worktree, runtime],
+		gitWorktree: worktree,
+	});
 }
 
 function verifyVibeSession(runtime, model) {

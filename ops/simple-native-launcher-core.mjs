@@ -186,14 +186,70 @@ export async function readBoundedStdin(
  */
 export const schemePath = (path) => JSON.stringify(path);
 
+// Seatbelt regex literals do not honour backslash escapes, so each printable
+// non-alphanumeric byte becomes a one-character bracket class. Bytes that
+// cannot be bracketed safely, or that a byte-wise regex would split, refuse.
+function seatbeltRegexPath(path, fail) {
+	if (/[^\x20-\x7e]|[\]\\^"]/u.test(path))
+		fail("worktree path cannot be expressed in a seatbelt regex");
+	return path.replace(/[^A-Za-z0-9/]/gu, (byte) => `[${byte}]`);
+}
+
+// Git and the default macOS filesystem resolve .git names case-insensitively.
+const anyCase = (name) =>
+	name.replace(/[a-z]/gu, (letter) => `[${letter}${letter.toUpperCase()}]`);
+
+/**
+ * Seatbelt rules that keep a clone's git control files unwritable, so a stray
+ * `git config`, hook or `git gc` fails inside the provider run instead of
+ * failing verifyGitControl after it. They deny `.git` itself (rename or
+ * removal), config (and its lock and worktree variants), hooks, info,
+ * objects/info and refs/replace, then re-allow info/refs and
+ * objects/info/packs (and the temp files update-server-info renames over
+ * them). The index, objects, refs and logs stay writable. These rules are
+ * early failure only: verifyGitControl stays the trust boundary.
+ * @param {string} worktree Canonical worktree path.
+ * @param {(reason: string) => never} [fail] Fail callback.
+ * @returns {string[]} Profile lines; they must follow every write allow.
+ */
+export function gitControlWriteRules(
+	worktree,
+	fail = createFail("simple-native-launcher-core"),
+) {
+	const gitDir = join(worktree, ".git");
+	const prefix = `^${seatbeltRegexPath(gitDir, fail)}/`;
+	const regex = (tail) => `(regex #"${prefix}${tail}")`;
+	const denied = [
+		`(literal ${schemePath(gitDir)})`,
+		regex(anyCase("config")),
+		regex(`${anyCase("hooks")}(/|$)`),
+		regex(`${anyCase("info")}(/|$)`),
+		regex(`${anyCase("objects/info")}/`),
+		regex(`${anyCase("refs/replace")}(/|$)`),
+	];
+	const reallowed = [
+		regex(`${anyCase("info/refs")}(_[^/]*)?$`),
+		regex(`${anyCase("objects/info/packs")}(_[^/]*)?$`),
+	];
+	return [
+		`(deny file-write* ${denied.join(" ")})`,
+		`(allow file-write* ${reallowed.join(" ")})`,
+	];
+}
+
 /**
  * Generates shared Seatbelt profile rules for sandboxed native execution.
  * @param {object} [options] Profile options.
  * @param {string[]} [options.reads] Paths allowed for subpath reading.
  * @param {string[]} [options.writes] Paths allowed for subpath writing.
+ * @param {string} [options.gitWorktree] Clone whose git control files stay unwritable (gitControlWriteRules).
  * @returns {string} Seatbelt profile rule text.
  */
-export function baseSeatbeltRules({ reads = [], writes = [] } = {}) {
+export function baseSeatbeltRules({
+	reads = [],
+	writes = [],
+	gitWorktree,
+} = {}) {
 	const readRules =
 		reads.length > 0
 			? [
@@ -214,6 +270,8 @@ export function baseSeatbeltRules({ reads = [], writes = [] } = {}) {
 		...readRules,
 		"(allow file-read-metadata)",
 		`(allow file-write* ${writeEntries.join(" ")})`,
+		// Seatbelt applies the last matching rule, so these follow the allow.
+		...(gitWorktree === undefined ? [] : gitControlWriteRules(gitWorktree)),
 		"(allow mach-lookup)",
 		"(allow ipc-posix-shm)",
 		'(allow network-outbound (remote tcp "*:443") (literal "/private/var/run/mDNSResponder") (remote udp "*:53"))',
