@@ -160,12 +160,16 @@ describe("declaredPathDependencies", () => {
 
 	it("refuses $HOME/.ssh without naming the path", () => {
 		const ssh = join(homedir(), ".ssh");
+		// The hermetic test HOME has no .ssh, which refuses one rule earlier.
+		const cause = existsSync(ssh)
+			? "path_dependency_outside_project_parent"
+			: "path_dependency_unresolved";
 		const repo = fixture(`keys = { path = ${JSON.stringify(ssh)} }`);
 		throws(
 			() => declaredPathDependencies(repo.project),
 			(error) =>
 				error.code === REFUSED.code &&
-				error.dependencyCheck === "path_dependency_outside_project_parent" &&
+				error.dependencyCheck === cause &&
 				error.message.includes("keys") &&
 				!error.message.includes(ssh),
 		);
