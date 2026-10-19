@@ -11,10 +11,6 @@ import {
 	validateOutcomeEvent,
 } from "../outcome/schema.mjs";
 import {
-	mergeOutcomeShadow,
-	projectOutcomeShadow,
-} from "../outcome/shadow.mjs";
-import {
 	EVENT_LOCK_WAIT_MS,
 	MUTATION_ID_RE,
 	MUTATION_OPERATION_LIMIT,
@@ -101,17 +97,9 @@ async function performUpdate(runId, partial, expectedRevision) {
 		});
 	}
 	// Recompute against the post-update run state so a terminal transition does
-	// not leave the shadow parity record describing the prior live state. This
-	// remains additive; callers continue reading the legacy fields above.
+	// not leave the projection describing the prior live state.
 	const eventLog = await inspectEventLog(runId).catch(() => null);
 	if (eventLog) {
-		const refreshedShadow = projectOutcomeShadow(eventLog.events, {
-			run: merged,
-		});
-		merged.outcomeShadow = mergeOutcomeShadow(
-			current.outcomeShadow,
-			refreshedShadow,
-		);
 		merged.outcomeProjection = projectOutcomeReader({
 			run: merged,
 			events: eventLog.events,

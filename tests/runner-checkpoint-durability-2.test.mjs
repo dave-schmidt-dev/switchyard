@@ -74,7 +74,9 @@ describe("checkpoint durability", () => {
 			);
 		}
 	});
-	it("persists terminal shadow evidence before releasing all three checkpoint shapes", async () => {
+	// Owner decision O4 (2026-10-18) retired the shadow: the terminal checkpoint
+	// is still saved before release, but carries no outcome evidence.
+	it("saves the terminal checkpoint without shadow evidence before releasing it", async () => {
 		const replayFixture = JSON.parse(
 			readFileSync(
 				resolve(__dirname, "fixtures", "outcome-replay.json"),
@@ -104,7 +106,6 @@ describe("checkpoint durability", () => {
 			);
 		const runId = "terminal-shadow-fixture";
 		const previousStoreRoot = process.env.SWITCHYARD_RUN_STORE_ROOT;
-		const projections = [];
 		try {
 			for (const [name, entrypoint] of [["async", runQueueAsync]]) {
 				const storeRoot = join(
@@ -184,19 +185,16 @@ describe("checkpoint durability", () => {
 				await result.ledgerWritesSettled;
 				const checkpoint = loadCheckpoint(checkpointPath, tasksPath);
 				const persistedRun = await readRun(runId);
-				strictEqual(checkpoint.outcomeShadow.parity.evidence, "shadow", name);
-				strictEqual(checkpoint.outcomeShadow.parity.cutoverBlocked, true, name);
+				strictEqual(Object.hasOwn(checkpoint, "outcomeShadow"), false, name);
 				strictEqual(
-					JSON.stringify(checkpoint.outcomeShadow.projection),
-					JSON.stringify(persistedRun.outcomeShadow.projection),
+					Object.hasOwn(checkpoint, "outcomeProjection"),
+					false,
 					name,
 				);
-				strictEqual(checkpoint.outcomeProjection, null, name);
-				projections.push(checkpoint.outcomeShadow.projection);
+				strictEqual(Object.hasOwn(persistedRun, "outcomeShadow"), false, name);
+				strictEqual(typeof checkpoint.lastUpdatedAt, "string", name);
 				strictEqual(checkpoint.ownershipReleased, true, name);
 			}
-			for (const projection of projections.slice(1))
-				strictEqual(JSON.stringify(projection), JSON.stringify(projections[0]));
 		} finally {
 			if (previousStoreRoot === undefined)
 				delete process.env.SWITCHYARD_RUN_STORE_ROOT;

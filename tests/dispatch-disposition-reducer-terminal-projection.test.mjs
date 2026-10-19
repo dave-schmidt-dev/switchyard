@@ -34,16 +34,15 @@ function exactFailure(targetId, taskId = "2.1") {
 	};
 }
 
-describe("reducer terminal projection", () => {
+describe("terminal outcome projection", () => {
 	it("does not report completed work before lifecycle cleanup is terminal", () => {
 		strictEqual(
 			projectTerminalOutcome(
-				run({ state: "running", cleanupState: "not_started" }),
-				{
-					reader: "reducer",
-					finalStatus: "succeeded",
-					taskCounters: { completed: 1 },
-				},
+				run({
+					state: "running",
+					cleanupState: "not_started",
+					terminalSummary: { processedTasks: 1 },
+				}),
 			),
 			"unknown_failure",
 		);

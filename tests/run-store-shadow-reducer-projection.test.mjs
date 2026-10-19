@@ -1,16 +1,20 @@
-import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	strictEqual,
+	throws,
+} from "node:assert";
 import { randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
 	appendOutcomeEvent,
 	createStageOutcome,
+	getRunRoot,
 	initializeRun,
-	mergeOutcomeShadow,
-	projectCheckpointOutcome,
 	projectOutcomeReader,
-	projectOutcomeShadow,
 	readEvents,
 	readRun,
 	updateRun,
@@ -19,326 +23,151 @@ import { TEST_ROOT, VM_ADMISSION_ROOT } from "./helpers/run-store-fixtures.mjs";
 
 process.env.SWITCHYARD_RUN_STORE_ROOT = join(TEST_ROOT, "store");
 process.env.SWITCHYARD_VM_ADMISSION_ROOT = VM_ADMISSION_ROOT;
-describe("shadow reducer projection", () => {
-	it("keeps legacy status authoritative and exposes sanitized parity", () => {
-		const provider = createStageOutcome({
-			runId: "shadow-projection",
-			taskId: "1.1",
-			attemptId: "attempt-1",
-			stage: "artifact",
-			status: "failed",
-			producer: "runner",
-			code: "execution_failed",
-			detail: { artifactKind: "diff", captured: false },
-		});
-		const shadow = projectOutcomeShadow([provider], {
-			run: {
-				runId: "shadow-projection",
-				state: "failed",
-				cleanupState: "complete",
-			},
-		});
-		strictEqual(shadow.version, 1);
-		strictEqual(shadow.projection.finalStatus, "failed");
-		strictEqual(shadow.parity.status, "match");
-		strictEqual(shadow.parity.evidence, "shadow");
-		strictEqual(shadow.recoveryQueue.length, 0);
-		ok(!Object.hasOwn(shadow.parity, "detail"));
-	});
 
-	it("queues orphan attempts for operator recovery without retry or slot use", () => {
-		const orphan = createStageOutcome({
-			runId: "shadow-orphan",
-			taskId: "1.1",
-			attemptId: "attempt-1",
-			stage: "recovery",
-			status: "failed",
-			producer: "recovery",
-			code: "orphan_attempt",
-			detail: {
-				reasonCode: "orphan_attempt",
-				operatorCommand: "switchyard-dispatch recover",
-			},
-		});
-		const shadow = projectOutcomeShadow([orphan], {
-			run: { runId: "shadow-orphan", state: "recovery_required" },
-		});
-		strictEqual(shadow.projection.finalStatus, "recovery_required");
-		strictEqual(shadow.recoveryQueue.length, 1);
-		strictEqual(shadow.recoveryQueue[0].automaticRetry, false);
-		strictEqual(shadow.recoveryQueue[0].executionSlotConsumed, false);
-		strictEqual(
-			shadow.recoveryQueue[0].operatorCommand,
-			"switchyard-dispatch recover",
-		);
-	});
+// Owner decision O4 (2026-10-18): the reducer shadow and its reader cutover
+// are retired; the legacy projection is the only outcome reader. The fixture
+// is a complete matching shadow written by the retired writer, which used to
+// switch a run with typed events to the reducer reader.
+const HISTORICAL_MATCHED_SHADOW = JSON.parse(
+	readFileSync(
+		resolve("tests/fixtures/historical-outcome-shadow-match.json"),
+		"utf8",
+	),
+);
+const LEGACY_KEYS = [
+	"projectionVersion",
+	"reader",
+	"historical",
+	"runId",
+	"finalStatus",
+	"legacyState",
+	"typedEventCount",
+	"primaryFailure",
+	"terminalSummary",
+	"legacyEventCount",
+];
 
-	it("latches a mismatch across later matching observations", () => {
-		const mismatch = projectOutcomeShadow(
-			[
-				createStageOutcome({
-					runId: "shadow-latch",
-					taskId: "1.1",
-					stage: "recovery",
-					status: "failed",
-					producer: "recovery",
-					code: "orphan_attempt",
-					detail: { reasonCode: "orphan_attempt" },
-				}),
-			],
-			{ run: { runId: "shadow-latch", state: "failed" } },
-		);
-		const matching = projectOutcomeShadow(
-			[
-				createStageOutcome({
-					runId: "shadow-latch",
-					taskId: "1.1",
-					stage: "artifact",
-					status: "failed",
-					producer: "runner",
-					code: "artifact_capture",
-					detail: { artifactKind: "diff", captured: false },
-				}),
-			],
-			{ run: { runId: "shadow-latch", state: "failed" } },
-		);
-		const latched = mergeOutcomeShadow(mismatch, matching);
-		strictEqual(mismatch.parity.status, "mismatch");
-		strictEqual(matching.parity.status, "match");
-		strictEqual(latched.parity.status, "mismatch");
-		strictEqual(latched.parity.cutoverBlocked, true);
+function failedArtifact(runId, writerEpoch) {
+	return createStageOutcome({
+		runId,
+		taskId: "1.1",
+		attemptId: "attempt-1",
+		stage: "artifact",
+		status: "failed",
+		producer: "runner",
+		code: "artifact_capture",
+		detail: { artifactKind: "diff", captured: false },
+		...(writerEpoch ? { writerEpoch } : {}),
 	});
+}
 
-	it("refreshes parity after a terminal run-state transition", async () => {
-		const runId = `shadow-terminal-${randomUUID()}`;
-		const initial = await initializeRun({
-			runId,
-			tasksFilePath: "/tmp/tasks.md",
-			projectPath: "/tmp/project",
-			orderedTaskIds: ["1.1"],
-			initialHostFingerprint: "fixture",
-			workerNonce: randomUUID(),
-		});
+function newRun(runId) {
+	return initializeRun({
+		runId,
+		tasksFilePath: "/tmp/tasks.md",
+		projectPath: "/tmp/project",
+		orderedTaskIds: ["1.1"],
+		initialHostFingerprint: "fixture",
+		workerNonce: randomUUID(),
+	});
+}
+
+describe("legacy outcome projection", () => {
+	it("persists no shadow on a new run, an outcome append, or a terminal update", async () => {
+		const runId = `legacy-only-${randomUUID()}`;
+		const initial = await newRun(runId);
+		strictEqual(Object.hasOwn(initial, "outcomeShadow"), false);
 		const active = await updateRun(
 			runId,
-			{ outcomeWriterEpoch: "epoch-shadow-terminal" },
+			{ outcomeWriterEpoch: "epoch-legacy-only" },
 			initial.revision,
 		);
 		await appendOutcomeEvent(
 			runId,
-			createStageOutcome({
-				runId,
-				taskId: "1.1",
-				stage: "artifact",
-				status: "failed",
-				producer: "runner",
-				code: "artifact_capture",
-				detail: { artifactKind: "diff", captured: false },
-				writerEpoch: active.outcomeWriterEpoch,
-			}),
+			failedArtifact(runId, active.outcomeWriterEpoch),
 			{ writerEpoch: active.outcomeWriterEpoch },
 		);
-		const before = await readRun(runId);
-		strictEqual(before.outcomeShadow.parity.legacyStatus, "unknown");
-		const terminal = await updateRun(
+		const appended = await readRun(runId);
+		strictEqual(Object.hasOwn(appended, "outcomeShadow"), false);
+		await updateRun(
 			runId,
 			{
 				state: "failed",
 				cleanupState: "complete",
 				terminalSummary: { processedTasks: 1 },
 			},
-			before.revision,
+			appended.revision,
 		);
-		strictEqual(terminal.outcomeShadow.parity.legacyStatus, "failed");
-		strictEqual(terminal.outcomeShadow.projection.finalStatus, "failed");
-	});
-});
-describe("outcome reader cutover", () => {
-	function failedArtifact(runId) {
-		return createStageOutcome({
+		const terminal = await readRun(runId);
+		strictEqual(Object.hasOwn(terminal, "outcomeShadow"), false);
+		deepStrictEqual(Object.keys(terminal.outcomeProjection), LEGACY_KEYS);
+		deepStrictEqual(terminal.outcomeProjection, {
+			projectionVersion: 0,
+			reader: "legacy",
+			historical: true,
 			runId,
-			taskId: "1.1",
-			attemptId: "attempt-1",
-			stage: "artifact",
-			status: "failed",
-			producer: "runner",
-			code: "artifact_capture",
-			detail: { artifactKind: "diff", captured: false },
+			finalStatus: "failed",
+			legacyState: "failed",
+			typedEventCount: 0,
+			primaryFailure: terminal.lastFailure,
+			terminalSummary: { processedTasks: 1 },
+			legacyEventCount: 1,
 		});
-	}
+	});
 
-	it("uses the reducer only after matching shadow evidence", () => {
-		const runId = "reader-cutover";
-		const event = failedArtifact(runId);
+	it("never lets a historical matching shadow select the reducer", () => {
+		const runId = HISTORICAL_MATCHED_SHADOW.projection.runId;
 		const run = {
 			runId,
 			state: "failed",
 			cleanupState: "complete",
+			lastFailure: { errorKind: "artifact_capture" },
+			terminalSummary: { processedTasks: 1 },
+			outcomeShadow: structuredClone(HISTORICAL_MATCHED_SHADOW),
 		};
-		run.outcomeShadow = projectOutcomeShadow([event], { run });
-		const projection = projectOutcomeReader({ run, events: [event] });
-		strictEqual(projection.reader, "reducer");
-		strictEqual(projection.finalStatus, "failed");
-		strictEqual(projection.taskCounters.failed, 1);
-	});
-
-	it("reduces the exact mixed event set approved by parity", () => {
-		const runId = "reader-mixed-events";
-		const typed = createStageOutcome({
-			runId,
-			taskId: "1.1",
-			attemptId: "attempt-1",
-			stage: "run",
-			status: "succeeded",
-			producer: "runner",
-			code: "task_completed",
+		const projection = projectOutcomeReader({
+			run,
+			events: [failedArtifact(runId)],
 		});
-		const legacyFailure = {
-			runId,
-			sequence: 2,
-			event: "task_failed",
-			phase: "execution",
-			status: "failed",
-			taskId: "1.1",
-		};
-		const events = [typed, legacyFailure];
-		const run = { runId, state: "failed", cleanupState: "complete" };
-		run.outcomeShadow = projectOutcomeShadow(events, { run });
-		strictEqual(run.outcomeShadow.parity.status, "match");
-		const projection = projectOutcomeReader({ run, events });
-		strictEqual(projection.reader, "reducer");
-		strictEqual(projection.finalStatus, "failed");
-	});
-
-	it("binds persisted approval to the current event snapshot", () => {
-		const runId = "reader-current-snapshot";
-		const success = createStageOutcome({
-			runId,
-			taskId: "1.1",
-			attemptId: "attempt-1",
-			stage: "run",
-			status: "succeeded",
-			producer: "runner",
-			code: "task_completed",
-		});
-		const run = { runId, state: "succeeded", cleanupState: "complete" };
-		run.outcomeShadow = projectOutcomeShadow([success], { run });
-		const newerFailure = {
-			runId,
-			sequence: 2,
-			event: "task_failed",
-			phase: "execution",
-			status: "failed",
-			taskId: "1.1",
-		};
-		strictEqual(
-			projectOutcomeReader({ run, events: [success, newerFailure] }).reader,
-			"legacy",
-		);
-	});
-
-	it("falls back conservatively for history, mismatch, and the test rollback", () => {
-		const runId = "reader-fallback";
-		const event = failedArtifact(runId);
-		const historical = projectOutcomeReader({
-			run: { runId, state: "succeeded" },
-			events: [],
-		});
-		strictEqual(historical.reader, "legacy");
-		strictEqual(Object.hasOwn(historical, "taskCounters"), false);
-
-		const mismatchRun = {
-			runId,
-			state: "succeeded",
-			cleanupState: "complete",
-		};
-		mismatchRun.outcomeShadow = projectOutcomeShadow([event], {
-			run: mismatchRun,
-		});
-		strictEqual(mismatchRun.outcomeShadow.parity.status, "mismatch");
-		strictEqual(
-			projectOutcomeReader({ run: mismatchRun, events: [event] }).reader,
-			"legacy",
-		);
-
-		const matchedRun = {
-			runId,
-			state: "failed",
-			cleanupState: "complete",
-		};
-		matchedRun.outcomeShadow = projectOutcomeShadow([event], {
-			run: matchedRun,
-		});
-		const shadowSnapshot = structuredClone(matchedRun.outcomeShadow);
-		strictEqual(
-			projectOutcomeReader({
-				run: matchedRun,
-				events: [event],
+		ok(Object.isFrozen(projection));
+		deepStrictEqual(Object.keys(projection), LEGACY_KEYS);
+		deepStrictEqual(
+			{ ...projection },
+			{
+				projectionVersion: 0,
 				reader: "legacy",
-			}).reader,
-			"legacy",
+				historical: true,
+				runId,
+				finalStatus: "failed",
+				legacyState: "failed",
+				typedEventCount: 0,
+				primaryFailure: { errorKind: "artifact_capture" },
+				terminalSummary: { processedTasks: 1 },
+				legacyEventCount: 1,
+			},
 		);
-		deepStrictEqual(matchedRun.outcomeShadow, shadowSnapshot);
-		strictEqual(
-			projectOutcomeReader({
-				run: { ...matchedRun, outcomeShadow: { invalid: true } },
-				events: [event],
-			}).reader,
-			"legacy",
-		);
+		deepStrictEqual(run.outcomeShadow, HISTORICAL_MATCHED_SHADOW);
+		throws(() => projectOutcomeReader({ run, events: null }), TypeError);
 	});
 
-	it("reads reducer evidence retained by current checkpoints", () => {
-		const run = {
-			runId: "checkpoint-reader",
-			state: "failed",
-			cleanupState: "complete",
-		};
-		const event = failedArtifact(run.runId);
-		const outcomeShadow = projectOutcomeShadow([event], { run });
-		const captured = projectOutcomeReader({
-			run: { ...run, outcomeShadow },
-			events: [event],
-		});
-		const projection = projectCheckpointOutcome({
-			outcomeShadow,
-			outcomeProjection: captured,
-		});
-		strictEqual(projection.reader, "reducer");
-		strictEqual(projection.finalStatus, "failed");
-		strictEqual(
-			projectCheckpointOutcome({
-				outcomeProjection: { reader: "reducer", finalStatus: "succeeded" },
-			}),
-			null,
+	it("reads and updates a historical run.json that still carries a shadow", async () => {
+		const runId = `historical-shadow-${randomUUID()}`;
+		await newRun(runId);
+		const runJsonPath = join(getRunRoot(runId), "run.json");
+		const stored = JSON.parse(readFileSync(runJsonPath, "utf8"));
+		stored.outcomeShadow = structuredClone(HISTORICAL_MATCHED_SHADOW);
+		writeFileSync(runJsonPath, `${JSON.stringify(stored)}\n`);
+		const historical = await readRun(runId);
+		deepStrictEqual(historical.outcomeShadow, HISTORICAL_MATCHED_SHADOW);
+		const terminal = await updateRun(
+			runId,
+			{ state: "succeeded", cleanupState: "complete" },
+			historical.revision,
 		);
-		strictEqual(
-			projectCheckpointOutcome({
-				outcomeShadow: projectOutcomeShadow([], {
-					run: { runId: "legacy-checkpoint", state: "created" },
-				}),
-				outcomeProjection: {
-					reader: "reducer",
-					historical: false,
-					projectionVersion: 1,
-					typedEventCount: 0,
-				},
-			}),
-			null,
-		);
-		strictEqual(
-			projectCheckpointOutcome({
-				outcomeShadow: {
-					version: 1,
-					projection: {},
-					parity: { version: 1, status: "match" },
-					recoveryQueue: [],
-				},
-				outcomeProjection: captured,
-			}),
-			null,
-		);
-		strictEqual(projectCheckpointOutcome({ version: 2 }), null);
+		// Carried as inert history: nothing recomputes or reads it any more.
+		deepStrictEqual(terminal.outcomeShadow, HISTORICAL_MATCHED_SHADOW);
+		strictEqual(terminal.outcomeProjection.reader, "legacy");
+		strictEqual(terminal.outcomeProjection.finalStatus, "succeeded");
 	});
 });
 describe("typed stage append boundary", () => {
@@ -417,10 +246,7 @@ describe("typed stage append boundary", () => {
 		const [persisted] = await readEvents(runId);
 		strictEqual(persisted.stage, "provider");
 		strictEqual(persisted.detail.code, "process_completed");
-		const shadowRun = await readRun(runId);
-		strictEqual(shadowRun.outcomeShadow.version, 1);
-		strictEqual(shadowRun.outcomeShadow.parity.evidence, "shadow");
-		strictEqual(shadowRun.outcomeShadow.projection.finalStatus, "unknown");
+		strictEqual(Object.hasOwn(await readRun(runId), "outcomeShadow"), false);
 	});
 
 	it("assigns one sequenced typed fact per stage and preserves causality", async () => {

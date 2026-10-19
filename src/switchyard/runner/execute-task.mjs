@@ -1,7 +1,5 @@
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
 import { verifyCompletionContinuationSync } from "../adapter/provider-lifecycle.mjs";
-import { projectOutcomeReader } from "../outcome/projection.mjs";
-import { validateShadowEnvelope } from "../outcome/shadow.mjs";
 import {
 	artifactTransition,
 	integrationTransition,
@@ -306,6 +304,12 @@ export function clearAsyncTaskContext(context) {
 	context._activeTaskIsReview = false;
 }
 
+/**
+ * Stamp and save the terminal checkpoint once the run record is readable.
+ * It no longer copies outcome evidence: the shadow it used to carry was
+ * retired by owner decision O4 (2026-10-18). The name stays until the queue
+ * path that calls it is retired.
+ */
 export async function persistCheckpointOutcomeShadow(
 	checkpointPath,
 	checkpoint,
@@ -320,23 +324,6 @@ export async function persistCheckpointOutcomeShadow(
 		return false;
 	const run = await runStore.readRun(runId).catch(() => null);
 	if (!run) return false;
-	const events =
-		typeof runStore.readEvents === "function"
-			? await runStore.readEvents(runId).catch(() => [])
-			: [];
-	const outcomeProjection = projectOutcomeReader({ run, events });
-	checkpoint.outcomeProjection = null;
-	if (outcomeProjection.reader === "reducer")
-		checkpoint.outcomeProjection = structuredClone(outcomeProjection);
-	checkpoint.outcomeShadow = null;
-	if (run.outcomeShadow) {
-		try {
-			validateShadowEnvelope(run.outcomeShadow);
-			checkpoint.outcomeShadow = structuredClone(run.outcomeShadow);
-		} catch {
-			// Invalid shadow evidence cannot authorize a checkpoint cutover.
-		}
-	}
 	checkpoint.lastUpdatedAt = new Date().toISOString();
 	saveCheckpoint(checkpointPath, checkpoint);
 	return true;

@@ -49,16 +49,15 @@ describe("run finalization", () => {
 		strictEqual(outcome.terminal, true);
 		const persisted = await readRun(runId);
 		const events = await readEvents(runId);
-		const shadow = persisted.outcomeShadow;
-		ok(shadow, "finalization persists a run-store shadow");
+		strictEqual(Object.hasOwn(persisted, "outcomeShadow"), false);
 		deepStrictEqual(
 			events
 				.filter((event) => typeof event.stage === "string")
 				.map((event) => event.stage),
 			["cleanup", "cleanup", "run", "postcondition"],
 		);
-		strictEqual(shadow.parity.legacyStatus, "succeeded");
-		strictEqual(shadow.parity.evidence, "shadow");
+		strictEqual(persisted.outcomeProjection.reader, "legacy");
+		strictEqual(persisted.outcomeProjection.finalStatus, "succeeded");
 	});
 
 	it("records deferred as terminal without failure metadata", async () => {

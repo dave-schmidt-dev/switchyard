@@ -483,21 +483,20 @@ describe("terminal outcome projection", () => {
 	}
 });
 
-describe("shadow disposition parity", () => {
-	it("carries reducer evidence without changing the legacy action", () => {
-		const outcomeShadow = {
-			version: 1,
-			projection: { finalStatus: "failed" },
-			parity: { version: 1, status: "match", evidence: "shadow" },
-			recoveryQueue: [],
-		};
+describe("retired shadow disposition", () => {
+	it("ignores a shadow option and keeps the legacy action", () => {
 		const result = projectDisposition({
 			run: run({ state: "running" }),
 			liveness: "live",
-			outcomeShadow,
+			outcomeShadow: {
+				version: 1,
+				projection: { finalStatus: "failed" },
+				parity: { version: 1, status: "match", evidence: "shadow" },
+				recoveryQueue: [],
+			},
 		});
 		strictEqual(result.action, "monitor");
 		strictEqual(result.direction, "wait");
-		deepStrictEqual(result.outcomeShadow, outcomeShadow);
+		strictEqual(Object.hasOwn(result, "outcomeShadow"), false);
 	});
 });

@@ -1,0 +1,90 @@
+{
+	"version": 1,
+	"projection": {
+		"projectionVersion": 1,
+		"runId": "historical-shadow-match",
+		"finalStatus": "failed",
+		"primaryFailure": {
+			"stage": "artifact",
+			"status": "failed",
+			"code": "artifact_capture",
+			"reasonCode": "artifact_capture",
+			"sequence": 1,
+			"outcomeId": "outcome-bc7d9abf4b5bd1c7700927ee0356dcfc",
+			"taskId": "1.1",
+			"attemptId": "attempt-1",
+			"attempt": 1,
+			"operationId": "operation-bc7d9abf4b5bd1c7700927ee0356dcfc",
+			"causedBy": null,
+			"evidence": "unknown"
+		},
+		"secondaryFailures": [],
+		"diagnosticEvidence": {
+			"status": "unknown",
+			"available": false,
+			"diagnosticRefs": [],
+			"origins": []
+		},
+		"artifactOutcome": {
+			"stage": "artifact",
+			"status": "failed",
+			"code": "artifact_capture",
+			"reasonCode": "artifact_capture",
+			"sequence": 1,
+			"outcomeId": "outcome-bc7d9abf4b5bd1c7700927ee0356dcfc",
+			"taskId": "1.1",
+			"attemptId": "attempt-1",
+			"attempt": 1,
+			"operationId": "operation-bc7d9abf4b5bd1c7700927ee0356dcfc",
+			"causedBy": null,
+			"evidence": "unknown"
+		},
+		"integrationOutcome": null,
+		"cleanupOutcome": null,
+		"recoveryOutcome": null,
+		"postconditionOutcome": null,
+		"taskCounters": {
+			"total": 1,
+			"started": 0,
+			"succeeded": 0,
+			"failed": 1,
+			"uncertain": 0,
+			"skipped": 0,
+			"completed": 1,
+			"terminal": 1,
+			"pending": 0
+		},
+		"reviewProof": {
+			"status": "unknown",
+			"reviewResult": null
+		},
+		"modelProof": {
+			"status": "unknown",
+			"servedModelVerified": null,
+			"completionContinuationProof": null,
+			"targetId": null
+		},
+		"attempts": ["attempt-1"],
+		"causalIntegrity": {
+			"status": "valid",
+			"invalidLinks": []
+		},
+		"identityConflicts": [],
+		"duplicateOutcomes": []
+	},
+	"parity": {
+		"version": 1,
+		"status": "match",
+		"legacyStatus": "failed",
+		"reducerStatus": "failed",
+		"legacyDigest": "sha256:38da3ca77125ba73edab08b7e8b3192125fe22de01f9d87fd3008e77267d2c0a",
+		"reducerDigest": "sha256:d366762ce8c3abb55b85e0f41c1705f5995734359e0045aa874a6a4a311e1af6",
+		"mismatchFields": [],
+		"expectedHistoricalDifferences": [],
+		"cutoverBlocked": false,
+		"mismatchCount": 0,
+		"mismatchDigest": null,
+		"evidence": "shadow"
+	},
+	"recoveryQueue": []
+}

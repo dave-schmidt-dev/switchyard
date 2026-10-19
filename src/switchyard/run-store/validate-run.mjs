@@ -5,7 +5,6 @@ import {
 } from "../adapter/exec-error.mjs";
 import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { SUPPORTED_OUTCOME_READER_VERSION } from "../outcome/schema.mjs";
-import { validateShadowEnvelope } from "../outcome/shadow.mjs";
 import { parseRfc3339 } from "../rfc3339.mjs";
 import { normalizeProviderName } from "../roster/index.mjs";
 import {
@@ -235,13 +234,6 @@ function validateRun(data) {
 			recovery.operatorCommand !== "switchyard-dispatch recover"
 		) {
 			throw new SchemaError("outcomeRecovery is invalid");
-		}
-	}
-	if (data.outcomeShadow !== undefined && data.outcomeShadow !== null) {
-		try {
-			validateShadowEnvelope(data.outcomeShadow);
-		} catch {
-			throw new SchemaError("outcomeShadow is invalid");
 		}
 	}
 	validateMutationOperations(data.mutationOperations);

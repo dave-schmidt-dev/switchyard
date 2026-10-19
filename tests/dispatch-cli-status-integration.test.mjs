@@ -7,7 +7,6 @@ import {
 	appendOutcomeEvent,
 	createStageOutcome,
 	initializeRun,
-	projectOutcomeShadow,
 	readRun,
 	updateRun,
 } from "../src/switchyard/run-store/index.mjs";
@@ -225,7 +224,9 @@ describe("status integration", () => {
 		ok(!serialized.includes("provider task description"));
 	});
 
-	it("detached status/result preserve the fixture-reduced shadow and legacy disposition", async () => {
+	// Owner decision O4 (2026-10-18): typed outcomes no longer switch status or
+	// result to the reducer reader, and neither envelope carries a shadow.
+	it("detached status/result read typed-outcome runs through the legacy projection", async () => {
 		const runId = `typed-shadow-envelope-${randomUUID()}`;
 		const replayFixture = JSON.parse(
 			readFileSync(
@@ -281,8 +282,7 @@ describe("status integration", () => {
 			},
 			current.revision,
 		);
-		const expectedShadow = projectOutcomeShadow([typed], { run: current });
-		deepStrictEqual(current.outcomeShadow, expectedShadow);
+		strictEqual(Object.hasOwn(current, "outcomeShadow"), false);
 
 		const status = JSON.parse(
 			runDispatch(["status", runId], makeStateRootEnv()).stdout.trim(),
@@ -290,15 +290,15 @@ describe("status integration", () => {
 		const result = JSON.parse(
 			runDispatch(["result", runId], makeStateRootEnv()).stdout.trim(),
 		);
-		deepStrictEqual(status.outcomeShadow, expectedShadow);
-		deepStrictEqual(result.outcomeShadow, expectedShadow);
-		strictEqual(status.outcomeProjection.reader, "reducer");
-		strictEqual(result.outcomeProjection.reader, "reducer");
-		strictEqual(status.outcomeProjection.finalStatus, "failed");
+		for (const envelope of [status, result]) {
+			strictEqual(Object.hasOwn(envelope, "outcomeShadow"), false);
+			strictEqual(Object.hasOwn(envelope.disposition, "outcomeShadow"), false);
+			strictEqual(envelope.outcomeProjection.reader, "legacy");
+			strictEqual(envelope.outcomeProjection.finalStatus, "failed");
+			strictEqual(envelope.outcomeProjection.typedEventCount, 0);
+		}
 		deepStrictEqual(status.outcomeProjection, result.outcomeProjection);
 		strictEqual(status.disposition.action, result.disposition.action);
-		strictEqual(status.disposition.outcomeShadow.parity.evidence, "shadow");
-		strictEqual(result.disposition.outcomeShadow.parity.evidence, "shadow");
 	});
 });
 describe("result integration", () => {

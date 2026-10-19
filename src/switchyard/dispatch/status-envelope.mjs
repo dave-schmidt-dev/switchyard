@@ -10,10 +10,7 @@ import {
 	createExecutionBackend,
 	hostBackendDefaults,
 } from "../lifecycle/backend-selection.mjs";
-import {
-	applyOutcomeProjection,
-	projectOutcomeReader,
-} from "../outcome/projection.mjs";
+import { projectOutcomeReader } from "../outcome/projection.mjs";
 import {
 	getRunRoot,
 	getVmAdmissionRoot,
@@ -58,18 +55,6 @@ function countCompletedAndFailed(events) {
 		}
 	}
 	return { completedCount, failedCount };
-}
-function shadowEnvelope(run) {
-	const shadow = run?.outcomeShadow;
-	if (!shadow || typeof shadow !== "object") return null;
-	return {
-		version: shadow.version ?? 1,
-		projection: shadow.projection ?? null,
-		parity: shadow.parity ?? null,
-		recoveryQueue: Array.isArray(shadow.recoveryQueue)
-			? shadow.recoveryQueue
-			: [],
-	};
 }
 function sanitizedExecutionFailureEvents(events) {
 	const failureFields = [
@@ -254,7 +239,7 @@ function probeProviderProcess(run, { executionBackend, execFn } = {}) {
 async function buildStatusEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const outcomeProjection = projectOutcomeReader({ run, events });
-	let projectedRun = applyOutcomeProjection(run, outcomeProjection);
+	let projectedRun = run;
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const quickCheckInvalid =
@@ -275,8 +260,6 @@ async function buildStatusEnvelope(runId, run) {
 		optionalEvidenceValid:
 			events.evidenceValid !== false && checkpointState !== null,
 	});
-	const outcomeShadow = shadowEnvelope(run);
-	if (outcomeShadow) disposition.outcomeShadow = outcomeShadow;
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
@@ -344,14 +327,8 @@ async function buildStatusEnvelope(runId, run) {
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount: quickCheckInvalid
 			? checkpointState.completedTaskIds.length
-			: outcomeProjection.reader === "reducer"
-				? (outcomeProjection.taskCounters?.completed ?? completedCount)
-				: completedCount,
-		failedCount: quickCheckInvalid
-			? Math.max(1, failedCount)
-			: outcomeProjection.reader === "reducer"
-				? (outcomeProjection.taskCounters?.failed ?? failedCount)
-				: failedCount,
+			: completedCount,
+		failedCount: quickCheckInvalid ? Math.max(1, failedCount) : failedCount,
 		// Reconciled against the same artifacts channel `result` reports, so the
 		// two envelopes cannot disagree about whether a failure has an artifact.
 		lastFailure: reconcileFailureArtifactRef(
@@ -367,7 +344,6 @@ async function buildStatusEnvelope(runId, run) {
 		finishedAt: run.finishedAt ?? null,
 		updatedAt: run.updatedAt,
 		disposition,
-		outcomeShadow,
 		outcomeProjection,
 		...telemetry,
 	};
@@ -428,5 +404,4 @@ export {
 	readQueueDiagnosticsForRun,
 	reconcileFailureArtifactRef,
 	sanitizedExecutionFailureEvents,
-	shadowEnvelope,
 };

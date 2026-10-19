@@ -18,10 +18,6 @@ import {
 	validateOutcomeEvent,
 } from "../outcome/schema.mjs";
 import {
-	mergeOutcomeShadow,
-	projectOutcomeShadow,
-} from "../outcome/shadow.mjs";
-import {
 	APPROVED_EVENT_KEYS,
 	EVENT_RESERVE_BYTES,
 	MAX_DIAGNOSTIC_ARTIFACT_BYTES,
@@ -321,13 +317,10 @@ async function createEventInternal(
 	await appendFile(eventsPath, serialized, {
 		mode: 0o600,
 	});
-	const shadow = projectOutcomeShadow([...log.events, entry], { run: current });
-
 	await performUpdate(
 		runId,
 		{
 			lastEventSequence: nextSeq,
-			outcomeShadow: mergeOutcomeShadow(current.outcomeShadow, shadow),
 			...(safeFailure ? { lastFailure: safeFailure } : {}),
 			...(projectedReviewResult !== undefined
 				? { lastReviewResult: projectedReviewResult }

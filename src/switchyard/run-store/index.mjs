@@ -1,12 +1,4 @@
-export {
-	projectCheckpointOutcome,
-	projectOutcomeReader,
-} from "../outcome/projection.mjs";
-export {
-	mergeOutcomeShadow,
-	projectOutcomeShadow,
-	validateShadowEnvelope,
-} from "../outcome/shadow.mjs";
+export { projectOutcomeReader } from "../outcome/projection.mjs";
 
 export {
 	LockError,

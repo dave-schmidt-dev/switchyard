@@ -9,10 +9,6 @@ import {
 	SUPPORTED_OUTCOME_READER_VERSION,
 	validateOutcomeEvent,
 } from "../outcome/schema.mjs";
-import {
-	mergeOutcomeShadow,
-	projectOutcomeShadow,
-} from "../outcome/shadow.mjs";
 import { EVENT_RESERVE_BYTES, runsRoot } from "./constants.mjs";
 import { LockError, SchemaError, validateRunId } from "./errors.mjs";
 import { createEventInternal } from "./events.mjs";
@@ -97,15 +93,9 @@ export async function appendOutcomeEvent(
 				)
 					throw new SchemaError("event reserve cannot be proven intact");
 				await appendFile(log.path, candidateRaw, { mode: 0o600 });
-				const shadow = projectOutcomeShadow([...log.events, candidate], {
-					run,
-				});
 				await performUpdate(
 					runId,
-					{
-						lastEventSequence: sequence,
-						outcomeShadow: mergeOutcomeShadow(run.outcomeShadow, shadow),
-					},
+					{ lastEventSequence: sequence },
 					run.revision,
 				);
 				return sequence;

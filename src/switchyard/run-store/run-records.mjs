@@ -189,7 +189,6 @@ export async function initializeRun(options) {
 		minimumOutcomeReaderVersion: SUPPORTED_OUTCOME_READER_VERSION,
 		outcomeWriterEpoch: null,
 		outcomeRecovery: null,
-		outcomeShadow: null,
 		mutationOperations: [],
 		lastFailure: null,
 		lastReviewResult: null,

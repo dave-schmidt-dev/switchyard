@@ -31,10 +31,6 @@ export function createEmptyCheckpoint(tasksFilePath, identity = {}) {
 		taskBases: {},
 		taskAttempts: {},
 		integrationIntents: {},
-		// Additive reducer evidence; legacy checkpoint readers ignore this field.
-		outcomeShadow: null,
-		// Reader-owned projection captured at checkpoint/resume boundaries.
-		outcomeProjection: null,
 	};
 	if (identity.queueIdentity) {
 		checkpoint.queueIdentity = identity.queueIdentity;

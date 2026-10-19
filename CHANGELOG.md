@@ -34,6 +34,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Removed
 
+- The outcome reducer shadow (`outcome/shadow.mjs`) and its reader cutover. New run records, outcome appends, run updates and checkpoints no longer write `outcomeShadow`; `status` and `result` no longer emit `outcomeShadow` at the top level or in `disposition`, and typed outcomes never switch them to a reducer projection. `outcomeProjection` is always the legacy projection, byte-identical to before over all 2,792 recorded runs. Older records that still carry `outcomeShadow` read unchanged and are not validated.
 - `scripts/check-stabilization-ledger.mjs` and its test, which read the gitignored `STABILIZATION.md` and so failed in any fresh checkout or worktree. The ledger is a closed historical record.
 - `tests/simple-dispatch.test.mjs`, which held only setup hooks and no tests and was excluded from both test phases.
 - The unused `Diagnostics` event channel (`src/switchyard/diagnostics/index.mjs`) and its test. Nothing in production imported it; the run store's event sanitizers do that job, and the README no longer describes it as the safe event channel. Its contract coverage floor now applies to `diagnostics/provider-reliability.mjs`.

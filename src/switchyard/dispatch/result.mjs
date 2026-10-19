@@ -1,7 +1,4 @@
-import {
-	applyOutcomeProjection,
-	projectOutcomeReader,
-} from "../outcome/projection.mjs";
+import { projectOutcomeReader } from "../outcome/projection.mjs";
 import { readRun, SchemaError } from "../run-store/index.mjs";
 import { classifyRunLiveness } from "../run-store/run-liveness.mjs";
 import { sanitizeQueuePreflightDetail } from "../runner/index.mjs";
@@ -30,13 +27,12 @@ import {
 	readQueueDiagnosticsForRun,
 	reconcileFailureArtifactRef,
 	sanitizedExecutionFailureEvents,
-	shadowEnvelope,
 } from "./status-envelope.mjs";
 
 async function buildResultEnvelope(runId, run) {
 	const events = await readEventsSafe(runId);
 	const outcomeProjection = projectOutcomeReader({ run, events });
-	let projectedRun = applyOutcomeProjection(run, outcomeProjection);
+	let projectedRun = run;
 	const { completedCount, failedCount } = countCompletedAndFailed(events);
 	const checkpointState = readCheckpointStateForRun(run);
 	const quickCheckInvalid =
@@ -58,8 +54,6 @@ async function buildResultEnvelope(runId, run) {
 		optionalEvidenceValid:
 			events.evidenceValid !== false && checkpointState !== null,
 	});
-	const outcomeShadow = shadowEnvelope(run);
-	if (outcomeShadow) disposition.outcomeShadow = outcomeShadow;
 	return {
 		schemaVersion: run.schemaVersion ?? 1,
 		runId: run.runId,
@@ -120,14 +114,8 @@ async function buildResultEnvelope(runId, run) {
 		snapshotAgeMsAtRoute: run.snapshotAgeMsAtRoute ?? null,
 		completedCount: quickCheckInvalid
 			? checkpointState.completedTaskIds.length
-			: outcomeProjection.reader === "reducer"
-				? (outcomeProjection.taskCounters?.completed ?? completedCount)
-				: completedCount,
-		failedCount: quickCheckInvalid
-			? Math.max(1, failedCount)
-			: outcomeProjection.reader === "reducer"
-				? (outcomeProjection.taskCounters?.failed ?? failedCount)
-				: failedCount,
+			: completedCount,
+		failedCount: quickCheckInvalid ? Math.max(1, failedCount) : failedCount,
 		lastFailure: projectFailureRemedy(
 			reconcileFailureArtifactRef(
 				quickCheckInvalid
@@ -152,11 +140,10 @@ async function buildResultEnvelope(runId, run) {
 				: {}),
 			outcome: quickCheckInvalid
 				? "failed_work"
-				: projectTerminalOutcome(projectedRun, outcomeProjection),
+				: projectTerminalOutcome(projectedRun),
 		},
 		artifactRefs,
 		disposition,
-		outcomeShadow,
 		outcomeProjection,
 		...telemetry,
 	};

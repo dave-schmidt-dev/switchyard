@@ -10,7 +10,6 @@ import {
 } from "../adapter/exec-error.mjs";
 import { createProgressSnapshot } from "../adapter/provider-lifecycle.mjs";
 import { assertGenerationAllowed } from "../maintenance/index.mjs";
-import { validateShadowEnvelope } from "../outcome/shadow.mjs";
 import {
 	failureTransition,
 	successTransition,
@@ -97,15 +96,6 @@ export async function runWorkerBootstrap(argv = process.argv) {
 		}
 
 		const run = await runStore.readRun(runId);
-		// Shadow evidence is additive during this migration. A malformed envelope
-		// is unavailable evidence, never a reason to alter the legacy run path.
-		if (run.outcomeShadow) {
-			try {
-				validateShadowEnvelope(run.outcomeShadow);
-			} catch {
-				console.error("worker-bootstrap: shadow evidence unavailable");
-			}
-		}
 
 		if (run.workerNonce !== nonce) {
 			await fatalHelpers.exitAfterDirectFailure(

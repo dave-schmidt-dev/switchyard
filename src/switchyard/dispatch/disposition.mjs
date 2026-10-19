@@ -488,53 +488,19 @@ function projectLegacyDisposition({
 }
 
 /**
- * Project the legacy caller action and, when supplied, carry reducer parity as
- * additive shadow evidence. The action and routing hint remain computed solely
- * from legacy durable fields until the reader cutover gate passes.
+ * Project the caller action from legacy durable fields and, when supplied,
+ * carry the legacy outcome projection alongside it.
  */
 export function projectDisposition(options = {}) {
-	const projectedRun = options.outcomeProjection
-		? projectRunWithOutcome(options.run, options.outcomeProjection)
-		: options.run;
-	const result = projectLegacyDisposition({ ...options, run: projectedRun });
-	if (options.outcomeShadow !== undefined) {
-		result.outcomeShadow = options.outcomeShadow;
-	}
+	const result = projectLegacyDisposition(options);
 	if (options.outcomeProjection !== undefined) {
 		result.outcomeProjection = options.outcomeProjection;
 	}
 	return result;
 }
 
-function projectRunWithOutcome(run, projection) {
-	if (!run || projection?.reader !== "reducer") return run;
-	const lifecycleTerminal = [
-		"succeeded",
-		"failed",
-		"deferred",
-		"recovery_required",
-	].includes(run.state);
-	if (!lifecycleTerminal && projection.finalStatus !== "recovery_required")
-		return run;
-	const state =
-		projection.finalStatus === "recovery_required"
-			? "recovery_required"
-			: projection.finalStatus === "succeeded"
-				? "succeeded"
-				: projection.finalStatus === "failed"
-					? "failed"
-					: projection.finalStatus === "skipped"
-						? "deferred"
-						: projection.finalStatus === "uncertain"
-							? "recovery_required"
-							: run.state;
-	if (state === run.state) return run;
-	return { ...run, state };
-}
-
 /** Derive an additive closed terminal outcome without mutating history. */
-export function projectTerminalOutcome(run, projection = null) {
-	const projected = projectRunWithOutcome(run, projection);
+export function projectTerminalOutcome(projected) {
 	if (
 		projected?.cleanupState !== "complete" ||
 		!["succeeded", "failed", "deferred", "recovery_required"].includes(
@@ -542,19 +508,6 @@ export function projectTerminalOutcome(run, projection = null) {
 		)
 	)
 		return "unknown_failure";
-	if (projection?.reader === "reducer") {
-		if (projection.finalStatus === "succeeded") {
-			const completed = projection.taskCounters?.completed;
-			return completed > 0 ? "completed_work" : "no_runnable_work";
-		}
-		if (projection.finalStatus === "skipped") return "deferred_work";
-		if (
-			["failed", "uncertain", "recovery_required"].includes(
-				projection.finalStatus,
-			)
-		)
-			return "unknown_failure";
-	}
 	if (
 		projected?.state === "failed" &&
 		projected?.cleanupState === "complete" &&

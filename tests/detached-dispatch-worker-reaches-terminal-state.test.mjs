@@ -210,19 +210,14 @@ export async function resolve(specifier, context, nextResolve) {
 		strictEqual(resultResult.status, 1, "result exits 1 for failed run");
 
 		const result = JSON.parse(resultResult.stdout.trim());
-		ok(
-			terminalStatus?.outcomeShadow,
-			"detached status carries shadow evidence",
-		);
+		for (const envelope of [terminalStatus, result]) {
+			ok(!Object.hasOwn(envelope, "outcomeShadow"), "no shadow (O4)");
+			ok(!Object.hasOwn(envelope.disposition, "outcomeShadow"), "no shadow");
+		}
 		deepStrictEqual(
-			terminalStatus.outcomeShadow,
-			result.outcomeShadow,
-			"detached status/result shadow parity",
-		);
-		deepStrictEqual(
-			terminalStatus.disposition.outcomeShadow,
-			result.disposition.outcomeShadow,
-			"detached disposition carries the same shadow evidence",
+			terminalStatus.outcomeProjection,
+			result.outcomeProjection,
+			"detached status/result read the same legacy projection",
 		);
 		ok(result.terminalSummary !== null, "terminalSummary present");
 		ok(Array.isArray(result.artifactRefs), "artifactRefs is an array");
