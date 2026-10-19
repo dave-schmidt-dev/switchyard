@@ -1,5 +1,10 @@
 // @test-phase: other
-import { deepStrictEqual, rejects, strictEqual } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	rejects,
+	strictEqual,
+} from "node:assert";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -25,6 +30,7 @@ import {
 	readRoutingRunState,
 	recordAttemptOutcome,
 } from "../src/switchyard/simple/routing-state.mjs";
+import { routingTaskIdentityHash } from "../src/switchyard/simple/routing-task-identity.mjs";
 import { simpleQuarantinePath } from "../src/switchyard/simple/worktree-cleanup.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -83,11 +89,20 @@ function recordPartial(stateRoot, project, pending, partialWorktree) {
 	handle.release();
 }
 
-function fixture({ writerStopped = true, worktreeChild = false } = {}) {
+// callerTaskId: the --task-id a caller passed to simple. Routing state then
+// persists the identity hash simple bound for it, never the caller's value.
+function fixture({
+	writerStopped = true,
+	worktreeChild = false,
+	callerTaskId = null,
+	origin = "work",
+} = {}) {
 	const project = realpathSync(tempDir("release-partial-project-"));
 	const stateRoot = realpathSync(tempDir("release-partial-state-"));
 	const parent = realpathSync(tempDir("release-partial-parent-"));
-	const taskId = "task-1";
+	const taskId = callerTaskId
+		? routingTaskIdentityHash({ taskId: callerTaskId }, project, origin)
+		: "task-1";
 	const runId = `simple-${randomUUID()}`;
 	const nonce = randomUUID();
 	const { root, identity } = createClaimRoot(parent, runId, nonce);
@@ -121,7 +136,7 @@ function fixture({ writerStopped = true, worktreeChild = false } = {}) {
 			"--routing-run-id",
 			"run-1",
 			"--task-id",
-			taskId,
+			callerTaskId ?? taskId,
 		],
 		deps: {
 			stateRoot,
@@ -409,6 +424,53 @@ test("a task with no recorded partial is refused", async () => {
 	await rejects(handleRoutingRun(f.argv, f.deps), {
 		code: "partial_worktree_not_recorded",
 	});
+	deepStrictEqual(readState(f), before);
+});
+
+for (const origin of ["work", "qualification"]) {
+	test(`release-partial accepts the --task-id given to simple (${origin} origin)`, async () => {
+		const f = fixture({ callerTaskId: "caller-task.1", origin });
+		strictEqual(f.argv.at(-1), "caller-task.1");
+		notStrictEqual(readState(f).attempts[0].taskId, "caller-task.1");
+		let output;
+		await handleRoutingRun(f.argv.concat("--discard"), {
+			...f.deps,
+			cleanupSimpleWorktree: async () => ({ removed: true }),
+			writeResult: (value) => {
+				output = JSON.parse(value);
+			},
+		});
+		strictEqual(output.released, true);
+		strictEqual(output.discarded, true);
+		strictEqual(output.taskId, readState(f).attempts[0].taskId);
+		strictEqual(readState(f).attempts[0].partialWorktree, null);
+	});
+}
+
+test("release-partial still accepts the persisted task hash", async () => {
+	const f = fixture({ callerTaskId: "caller-task.1" });
+	const persisted = readState(f).attempts[0].taskId;
+	rmSync(f.root, { recursive: true, force: true });
+	const argv = [...f.argv.slice(0, -1), persisted];
+	let output;
+	await handleRoutingRun(argv, {
+		...f.deps,
+		writeResult: (value) => {
+			output = JSON.parse(value);
+		},
+	});
+	strictEqual(output.released, true);
+	strictEqual(output.taskId, persisted);
+});
+
+test("a caller task id bound to another project or never recorded is refused", async () => {
+	const f = fixture({ callerTaskId: "caller-task.1" });
+	const before = readState(f);
+	for (const taskId of ["other-caller-task", "bad id with spaces"]) {
+		await rejects(handleRoutingRun([...f.argv.slice(0, -1), taskId], f.deps), {
+			code: "partial_worktree_not_recorded",
+		});
+	}
 	deepStrictEqual(readState(f), before);
 });
 

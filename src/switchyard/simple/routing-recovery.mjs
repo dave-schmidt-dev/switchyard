@@ -9,6 +9,7 @@ import {
 	recordAttemptOutcome,
 	releasePartialAttempt,
 } from "./routing-state.mjs";
+import { routingTaskIdentityHash } from "./routing-task-identity.mjs";
 import {
 	cleanupSimpleWorktree,
 	simpleQuarantinePath,
@@ -71,9 +72,26 @@ export async function discardAndReleasePartial(handle, attempt, options) {
 	return discarded;
 }
 /**
+ * The task ids a `--task-id` value can name: itself (the persisted identity
+ * hash) and the identity `simple --task-id <value>` bound for this project
+ * under either origin. A value that is not a valid caller id names only itself.
+ */
+function taskIdCandidates(projectPath, taskId) {
+	const candidates = [taskId];
+	for (const origin of ["work", "qualification"]) {
+		try {
+			candidates.push(routingTaskIdentityHash({ taskId }, projectPath, origin));
+		} catch {
+			// Not a caller task id: only the exact persisted id can match.
+		}
+	}
+	return candidates;
+}
+/**
  * Release a recorded retained partial once its root is already absent or its
  * exact claim is discarded. The release clears the routing attempt's
- * partialWorktree so the partial_work_retained guard passes again.
+ * partialWorktree so the partial_work_retained guard passes again. The task is
+ * named by its persisted identity hash or by the `--task-id` given to `simple`.
  */
 export async function releaseRetainedPartial(options, deps = {}) {
 	const projectPath = canonicalRoutingProject(options.projectPath);
@@ -83,10 +101,13 @@ export async function releaseRetainedPartial(options, deps = {}) {
 		{ stateRoot: deps.stateRoot, create: false },
 	);
 	try {
-		const taskId = options.taskId;
-		const attempt = handle.state.attempts.find(
-			(item) => item.taskId === taskId && item.partialWorktree !== null,
-		);
+		const attempt = taskIdCandidates(projectPath, options.taskId)
+			.map((taskId) =>
+				handle.state.attempts.find(
+					(item) => item.taskId === taskId && item.partialWorktree !== null,
+				),
+			)
+			.find(Boolean);
 		if (!attempt) rejectRelease("partial_worktree_not_recorded");
 		const discarded = await discardAndReleasePartial(handle, attempt, {
 			projectPath,
