@@ -143,9 +143,10 @@ describe("contract coverage groups", () => {
 				.digest("hex"),
 			// 2026-10-18 (S11): tests/diagnostics.test.mjs left with the deleted
 			// module. (O1 step 2): the four synchronous-queue descriptor-receipt
-			// and provider-spread suites left with the sync runner. Every other
-			// entry and its order is unchanged.
-			"b65fe40cc427982702339bf0295711ff2aee1bc7492a99dc4183124f2256233b",
+			// and provider-spread suites left with the sync runner, and
+			// tests/runner-adapter-harness.test.mjs joined the production-runner
+			// gate. Every other entry and its order is unchanged.
+			"525b995f9c0b0d34ed90b02a2554f0e51a8e244690f544d887a9dbc33d05f835",
 		);
 		let calls = 0;
 		const result = runContractCoverage({
