@@ -92,6 +92,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 - Simple status exposes active task identity, deadline, validated descriptor and observed phase.
 - The simple target/descriptor table, retained-partial and pending-attempt recovery, and best-effort stop logger now live in focused modules; parser and routing-run public exports and runtime behavior are unchanged.
+- The simple routing waterfall's route callback, attempt evaluation and stop decisions, and reroute policy now live in focused modules beside `routing-run.mjs`; its public exports and runtime behavior are unchanged.
 
 - Cancellation carries closed `cancelSource` values `signal_sigterm`, `signal_sigint`, `internal_deadline` or `unspecified` only on cancelled failures, while normal exit 76 remains an ordinary exit.
 - The CLI routing envelope exposes `exhaustionCause` (`capacity` vs `task_failures`) for fallback authority.

@@ -1,6 +1,5 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
 import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
 import {
 	getImplementorPriority,
@@ -8,10 +7,7 @@ import {
 } from "../roster/index.mjs";
 import { route } from "../router/index.mjs";
 import { readRun } from "../run-store/run-records.mjs";
-import { nonBlamingCause, taskExcludedTargets } from "./attempt-blame.mjs";
-import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";
-import { classifyAttemptFailure } from "./failure-severity.mjs";
 import { assertFundedRoute } from "./funding.mjs";
 import {
 	continuationFields,
@@ -21,15 +17,14 @@ import {
 import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { recordRouteExhaustion } from "./route-exhaustion.mjs";
 import {
-	knownBrokenCheck,
-	rememberBrokenCheck,
-} from "./routing-check-memory.mjs";
+	evaluateAttempt,
+	failedAttemptStop,
+	preflightStop,
+	unroutedStop,
+} from "./routing-attempt-outcome.mjs";
 import { discardAndReleasePartial } from "./routing-recovery.mjs";
-import {
-	createRefusalAccumulator,
-	withoutRemovalArtifacts,
-	withRefusalEvidence,
-} from "./routing-refusals.mjs";
+import { createRefusalAccumulator } from "./routing-refusals.mjs";
+import { createRouteAttempt } from "./routing-route-attempt.mjs";
 import {
 	canonicalRoutingProject,
 	MAX_ATTEMPT_HISTORY,
@@ -39,7 +34,6 @@ import {
 import {
 	createFailureLogAppender,
 	failureAttemptRecord,
-	lifecycleFailure,
 	routingErrorCode,
 	stopRecord,
 	unroutedAttempt,
@@ -50,81 +44,9 @@ import {
 	openRoutingTaskRun,
 	releaseTaskRunResources,
 } from "./routing-task-state.mjs";
-import { deadlineFitDetails, evaluateDeadlineFit } from "./task-sizing.mjs";
 
-export const MAX_SOFT_ATTEMPTS_PER_TASK = 4;
-
-/**
- * Floor below which a failed or skipped attempt must not reroute. Starting a
- * fresh provider with only seconds of task budget left burns a baseline and a
- * provider start to fail immediately, so the loop stops with the attempt's own
- * outcome instead. The floor is capped at a tenth of the task's initial budget
- * so short tasks keep their fallbacks.
- */
-const MIN_REROUTE_BUDGET_MS = 120_000;
-
-/**
- * True when a failed or skipped attempt must not reroute to another target:
- * the deadline has passed, or the remaining budget is below the reroute floor
- * derived from the budget captured when the task started. A non-finite deadline
- * has no finite budget to protect and never trips the floor.
- */
-function rerouteBudgetExhausted(options, initialBudgetMs, now) {
-	if (!Number.isFinite(options.deadlineMs)) return false;
-	const remainingMs = options.deadlineMs - now();
-	if (remainingMs <= 0) return true;
-	const rerouteFloorMs = Math.min(
-		MIN_REROUTE_BUDGET_MS,
-		Math.ceil(0.1 * initialBudgetMs),
-	);
-	return remainingMs < rerouteFloorMs;
-}
-
-const DEADLINE_FIT_REFUSAL = "task_estimate_exceeds_budget";
-
-/**
- * Typed `retrySkipped` evidence when the caller's estimate cannot fit the time
- * left, or null. Uses the same fit as route selection, so the loop stops with
- * the failed attempt's outcome instead of making a call the engine will refuse.
- */
-function unfittableRetry(options, initialBudgetMs, nowMs) {
-	const fit = evaluateDeadlineFit({
-		estimateMinutes: options.estimateMinutes ?? null,
-		p80Ms: null,
-		deadlineMs: options.deadlineMs,
-		nowMs,
-		checkCount: (options.checks ?? []).length,
-	});
-	if (fit.fits !== false) return null;
-	return {
-		reason: DEADLINE_FIT_REFUSAL,
-		deadlineFit: deadlineFitDetails(fit),
-		deadlineConsumedMs: initialBudgetMs - (options.deadlineMs - nowMs),
-	};
-}
-
-const FUNDING_UNAVAILABLE = new Set([
-	"paid_overage_not_allowed",
-	"included_usage_unverified",
-]);
-/**
- * Terminal recorded for one failed attempt.
- *
- * Wall-clock provider timeouts are task-scoped, never run-scoped: a slow or
- * oversized task must not latch its target into the run-wide failed set, where
- * every later task in the routing run would lose it. A deadline timeout
- * therefore records "skipped" even when accountability is provider-memory
- * eligible. Cross-task evidence stays route health's job: its lifecycle-backed
- * deadline trust cools hung providers down across tasks.
- */
-function failureTerminal(result, providerMemoryEligible) {
-	if (
-		(result.providerReliability?.causeCode ?? result.failureReason) ===
-		"provider_deadline_exceeded"
-	)
-		return "skipped";
-	return providerMemoryEligible ? "failed" : "skipped";
-}
+/** @public Preserve the historical limit import path for callers. */
+export { MAX_SOFT_ATTEMPTS_PER_TASK } from "./routing-reroute-policy.mjs";
 
 /** Selected allocations are durable before route() returns control to the engine. */
 export async function runSimpleRoutingTask(options, deps = {}) {
@@ -254,51 +176,14 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	let iteration = 0;
 	let pendingError = null;
 	try {
-		if (handle.state.pendingAttempt)
-			return answer(
-				"stop",
-				{
-					stopReason: "pending_attempt_exists",
-					pendingAttempt: handle.state.pendingAttempt,
-				},
-				{ log: false },
-			);
-		if (handle.state.nativeLatch)
-			return answer("native_latched", { status: "deferred" }, { log: false });
-		if (
-			handle.state.attempts.some((attempt) => attempt.partialWorktree !== null)
-		)
-			return answer(
-				"stop",
-				{ stopReason: "partial_work_retained" },
-				{ log: false },
-			);
-		if (pinned) {
-			const state = handle.state;
-			const pinnedExcluded = new Set([
-				...state.failedTargetIds,
-				...taskExcludedTargets(state.attempts, logicalTaskId),
-			]);
-			if (
-				options.onlyProviders.every((id) =>
-					pinnedExcluded.has(resolveIdentity(id).targetId),
-				)
-			)
-				return answer(
-					"stop",
-					{ stopReason: "pinned_target_failed" },
-					{ log: false },
-				);
-		}
-		// A check this run already found environment-broken fails every target
-		// the same way: answer with the stored evidence, allocate nothing.
-		const brokenCheck = knownBrokenCheck(handle.state, options.checks);
-		if (brokenCheck)
-			return answer(
-				"stop",
-				{ stopReason: "check_known_broken", brokenCheck },
-				{ log: false },
-			);
+		const early = preflightStop({
+			handle,
+			options,
+			pinned,
+			resolveIdentity,
+			logicalTaskId,
+		});
+		if (early) return answer(early.direction, early.extra, { log: false });
 		for (;;) {
 			if (deps.signal?.aborted)
 				return answer("stop", { stopReason: "provider_cancelled" });
@@ -318,99 +203,24 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						: `simple-${randomUUID()}`,
 			};
 			iteration += 1;
-			let pending = null;
-			let routeCalled = false;
-			let allocationFailed = false;
-			let noEligible = false;
-			const routeAttempt = (input) => {
-				routeCalled = true;
-				const state = handle.state;
-				const excluded = new Set([
-					...state.failedTargetIds,
-					...localExcluded,
-					...taskExcludedTargets(state.attempts, logicalTaskId),
-				]);
-				const removedHere = new Set();
-				const availableProviders = (input.availableProviders ?? []).filter(
-					(id) => {
-						const targetId = resolveIdentity(id).targetId;
-						const tierAllowed = pinned || [1, 2].includes(priority(targetId));
-						if (excluded.has(targetId))
-							refusals.add(targetId, "explicitly_excluded");
-						else if (!tierAllowed) refusals.add(targetId, "tier_excluded");
-						const kept = !excluded.has(targetId) && tierAllowed;
-						if (!kept) removedHere.add(targetId);
-						return kept;
-					},
-				);
-				const removedByThisRun = (id) => {
-					const targetId = resolveIdentity(id).targetId;
-					return removedHere.has(targetId) || localExcluded.has(targetId);
-				};
-				for (;;) {
-					let routed = withoutRemovalArtifacts(
-						select({
-							...input,
-							availableProviders: availableProviders.filter(
-								(id) => !localExcluded.has(resolveIdentity(id).targetId),
-							),
-							exclude: [
-								...(input.exclude ?? []),
-								...excluded,
-								...localExcluded,
-							],
-							runId: routingRunId,
-						}),
-						removedByThisRun,
-					);
-					for (const entry of routeDiagnosticPatch(routed).routeEvidence
-						?.excluded ?? [])
-						refusals.add(entry.targetId, entry.reason, entry.bucket);
-					routed = withRefusalEvidence(routed, refusals.entries());
-					routingDiagnostics = routeDiagnosticPatch(routed);
-					if (!routed?.provider) {
-						noEligible =
-							typeof routed?.reason === "string" &&
-							/^no_eligible(?:_|$)/u.test(routed.reason);
-						if (!noEligible)
-							throw Object.assign(new Error("routing_selection_invalid"), {
-								code: "routing_selection_invalid",
-							});
-						return { ...routed, reason: "no_eligible_provider" };
-					}
-					const targetId = resolveIdentity(routed.provider).targetId;
-					if (
-						!targetId ||
-						!availableProviders.includes(targetId) ||
-						excluded.has(targetId) ||
-						localExcluded.has(targetId)
-					)
-						throw Object.assign(new Error("routing_selection_invalid"), {
-							code: "routing_selection_invalid",
-						});
-					try {
-						funded(targetId);
-					} catch (error) {
-						if (!FUNDING_UNAVAILABLE.has(error?.code)) throw error;
-						refusals.add(targetId, error.code);
-						localExcluded.add(targetId);
-						continue;
-					}
-					pending = {
-						...allocation,
-						targetId,
-						capability: options.capability,
-						startedAt: new Date(now()).toISOString(),
-					};
-					try {
-						handle.commit({ pendingAttempt: pending });
-					} catch (error) {
-						allocationFailed = true;
-						throw error;
-					}
-					return routed;
-				}
-			};
+			const { routeAttempt, state: routeState } = createRouteAttempt({
+				handle,
+				options,
+				allocation,
+				routingRunId,
+				logicalTaskId,
+				pinned,
+				priority,
+				resolveIdentity,
+				select,
+				funded,
+				localExcluded,
+				refusals,
+				now,
+				setDiagnostics: (patch) => {
+					routingDiagnostics = patch;
+				},
+			});
 			const plan = carrySource
 				? planContinuation({ source: carrySource, options, projectPath })
 				: null;
@@ -436,17 +246,18 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				);
 			} catch {
 				return answer("stop", {
-					stopReason: allocationFailed
+					stopReason: routeState.allocationFailed
 						? "routing_state_write_failed"
 						: "engine_threw",
 					pendingAttempt: handle.state.pendingAttempt,
 				});
 			}
-			if (allocationFailed)
+			if (routeState.allocationFailed)
 				return answer("stop", {
 					stopReason: "routing_state_write_failed",
 					result,
 				});
+			const { pending } = routeState;
 			if (!pending) {
 				// A failed engine call with no target has no attempt of its own yet;
 				// log it so its run and cause are never lost to the stop record.
@@ -460,122 +271,37 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 							result,
 						}),
 					);
-				if (result?.lockConflict && result?.disposition) {
-					const action = result.disposition.action;
-					return answer(
-						["defer", "recover"].includes(action) ? action : "stop",
-						{
-							status: action === "defer" ? "deferred" : "failed",
-							stopReason: result.disposition.reasonCode,
-							result,
-							disposition: result.disposition,
-						},
-						{ attempt },
-					);
-				}
-				const exhausted =
-					anyFailed ||
-					taskExcludedTargets(handle.state.attempts, logicalTaskId).size > 0;
-				// Funding refusals count as capacity, so native fallback still
-				// applies when every eligible target is refused for funding
-				// (stability audit O10, 2026-10-18).
-				if (
-					routeCalled &&
-					noEligible &&
-					result?.failurePhase === "route" &&
-					!deps.signal?.aborted
-				)
-					return answer(
-						pinned ? "stop" : "native_required",
-						{
-							status: pinned ? "failed" : "deferred",
-							stopReason: pinned ? "pinned_target_unavailable" : undefined,
-							exhaustionCause: pinned
-								? undefined
-								: exhausted
-									? "task_failures"
-									: "capacity",
-							result,
-						},
-						{ attempt },
-					);
-				return answer(
-					"stop",
-					{
-						stopReason:
-							result?.failureReason === DEADLINE_FIT_REFUSAL
-								? DEADLINE_FIT_REFUSAL
-								: "preflight_failed",
-						result,
-					},
-					{ attempt },
-				);
-			}
-			let record;
-			try {
-				record = await (deps.readRun ?? readRun)(pending.runId);
-			} catch {
-				return answer("stop", {
-					stopReason: "lifecycle_unconfirmed",
-					lifecycleCheck: "run_record_unreadable",
+				const stop = unroutedStop({
 					result,
-					pendingAttempt: pending,
+					attempts: handle.state.attempts,
+					logicalTaskId,
+					anyFailed,
+					routeCalled: routeState.routeCalled,
+					noEligible: routeState.noEligible,
+					pinned,
+					signal: deps.signal,
 				});
+				return answer(stop.direction, stop.extra, { attempt });
 			}
-			const lifecycleCheck = lifecycleFailure(
+			const evaluated = await evaluateAttempt({
 				result,
 				pending,
-				record,
 				projectPath,
 				options,
-			);
-			if (lifecycleCheck)
-				return answer("stop", {
-					stopReason: "lifecycle_unconfirmed",
-					lifecycleCheck,
-					result,
-					pendingAttempt: pending,
-				});
-			const failed = result.status !== "succeeded";
-			const typed = result.providerReliability !== undefined;
-			const diagnosticMatches = isDeepStrictEqual(
-				result.providerReliability,
-				record.lastFailure?.providerReliability,
-			);
-			const accountability = deriveFailureAccountability({
-				providerReliability: diagnosticMatches
-					? record.lastFailure?.providerReliability
-					: undefined,
-				provenance: record.lastFailure,
+				readRunRecord: deps.readRun ?? readRun,
 			});
-			if (typed) result.accountability = accountability;
-			// A baseline failure precedes the provider and is not evidence against the target.
-			const tried =
-				result.failurePhase !== "baseline" &&
-				result.recovery.cleanup.writer.state === "stopped";
-			const terminal = failed
-				? failureTerminal(
-						result,
-						typed ? accountability.providerMemoryEligible && tried : tried,
-					)
-				: "succeeded";
-
-			// lifecycle() already proved the writer stopped or never started.
-			// Task 2.7: a post-provider dependency refusal stops on its own cause.
-			const refusalCode =
-				result.providerReliability?.causeCode ?? result.failureReason;
-			const postProviderDependencyRefusal =
-				failed &&
-				result.failurePhase === "checks" &&
-				(refusalCode === "check_dependencies_unverified" ||
-					refusalCode === "check_manifest_changed_by_diff");
-			const classification = failed
-				? classifyAttemptFailure({ result, accountability })
-				: null;
-			const reason = failed ? classification.reason : "succeeded";
-			// A caller cancellation or live quota error is not the target's fault;
-			// recording it keeps the target eligible for later attempts at this task.
-			const nonBlaming = failed ? nonBlamingCause(result) : null;
+			if (evaluated.stop) return answer("stop", evaluated.stop);
+			const {
+				record,
+				failed,
+				accountability,
+				terminal,
+				refusalCode,
+				postProviderDependencyRefusal,
+				classification,
+				reason,
+				nonBlaming,
+			} = evaluated;
 
 			const continued = continuationFields(plan, seeded);
 			const gitControlTamper = sanitizeGitControlTamper(
@@ -668,107 +394,23 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			// not turn a later no-eligible stop into task_failures.
 			if (nonBlaming === null) anyFailed = true;
 
-			if (classification.severity === "hard") {
-				return answer("stop", {
-					stopReason:
-						postProviderDependencyRefusal ||
-						refusalCode === DEADLINE_FIT_REFUSAL
-							? refusalCode
-							: "unsafe_failure",
-					result,
-					classification,
-				});
-			}
-			// A check that cannot run here is the environment's fault, not the
-			// target's: remember it (only the pre-provider dry run writes
-			// memory) and stop without blaming anyone.
-			if (
-				result.providerReliability?.causeCode === "check_environment_failed"
-			) {
-				try {
-					rememberBrokenCheck(handle.state, handle.commit, {
-						result,
-						record,
-						now,
-					});
-				} catch (error) {
-					return answer("stop", {
-						stopReason: routingErrorCode(error, "routing_state_write_failed"),
-						result,
-						classification,
-					});
-				}
-				return answer("stop", {
-					stopReason: "check_environment_failed",
-					result,
-					classification,
-				});
-			}
-			// The work passed its checks and only integration was refused, so the
-			// captain applies the retained partial onto the new HEAD; another target
-			// would redo it against the same moved HEAD.
-			if (
-				result.failurePhase === "integrate" &&
-				refusalCode === "host_concurrency" &&
-				typeof result.partialWorktree === "string"
-			)
-				return answer("stop", {
-					stopReason: "host_concurrency",
-					result,
-					classification,
-				});
-			if (classification.severity === "baseline") {
-				// A check environment that could not be set up is not a red check
-				// (O5, 2026-10-18): its own stop label tells the caller to repair the
-				// host, not the check. The attempt keeps `baseline_failed`, so the
-				// target stays unblamed and routing state stays version 1.
-				const checkSetup =
-					(result.providerReliability?.causeCode ??
-						accountability?.causeCode) === "check_setup_failed";
-				return answer("stop", {
-					stopReason: checkSetup ? "check_setup_failed" : "baseline_failed",
-					result,
-					classification,
-				});
-			}
-			// severity === "soft" from here
-			if (pinned || options.capability === "high") {
-				return answer("stop", {
-					stopReason: classification.reason,
-					result,
-					classification,
-				});
-			}
+			const stop = failedAttemptStop({
+				result,
+				record,
+				classification,
+				accountability,
+				refusalCode,
+				postProviderDependencyRefusal,
+				handle,
+				options,
+				pinned,
+				signal: deps.signal,
+				initialBudgetMs,
+				softAttemptCount: softAttempts + 1,
+				now,
+			});
+			if (stop) return answer("stop", stop);
 			softAttempts += 1;
-			if (softAttempts >= MAX_SOFT_ATTEMPTS_PER_TASK) {
-				return answer("stop", {
-					stopReason: "soft_retry_budget_exhausted",
-					result,
-					classification,
-				});
-			}
-			// A cancelled invocation, an expired deadline, or too little budget
-			// left to start another provider keeps this attempt's own outcome.
-			if (
-				deps.signal?.aborted ||
-				rerouteBudgetExhausted(options, initialBudgetMs, now)
-			)
-				return answer("stop", {
-					stopReason: classification.reason,
-					result,
-					classification,
-				});
-			// An estimate that cannot fit the time left would be refused before any
-			// attempt is allocated, so the doomed call must not become the terminal.
-			const retrySkipped = unfittableRetry(options, initialBudgetMs, now());
-			if (retrySkipped)
-				return answer("stop", {
-					stopReason: classification.reason,
-					result,
-					classification,
-					retrySkipped,
-				});
-			// Continue to the next eligible target (retained clone is independent).
 		}
 	} catch (error) {
 		pendingError = { error };
