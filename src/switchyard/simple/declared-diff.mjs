@@ -82,6 +82,23 @@ function diffRejectionFor(validated) {
 	return rejection;
 }
 
+const SHELL_SAFE_PATH = /^[\w./@%+=:,-]+$/u;
+
+/**
+ * Human-facing next step for a manifest review refusal: the exact
+ * `--allow-manifest` flag for each listed path, shell-quoted when needed,
+ * plus a count of paths beyond the bounded list. The machine codes
+ * (`manifest_review_required`) are unchanged.
+ */
+function manifestReviewHint(paths, unlisted = 0) {
+	const flags = paths.map(
+		(path) =>
+			`--allow-manifest ${SHELL_SAFE_PATH.test(path) ? path : `'${path.replaceAll("'", "'\\''")}'`}`,
+	);
+	const more = unlisted > 0 ? ` and ${unlisted} more` : "";
+	return `review the change to ${paths.join(", ")}${more}, then rerun with ${flags.join(" ")} to allow it`;
+}
+
 export function captureDeadlineChangedFiles({
 	worktreePath,
 	worktreeBaseRevision,
@@ -120,4 +137,5 @@ export {
 	declaredFileStat,
 	declaredFilesChanged,
 	diffRejectionFor,
+	manifestReviewHint,
 };

@@ -67,6 +67,7 @@ import {
 	declaredFileStat,
 	declaredFilesChanged,
 	diffRejectionFor,
+	manifestReviewHint,
 } from "./declared-diff.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import {
@@ -667,6 +668,21 @@ export async function runSimpleTask(options, dependencies = {}) {
 		finalResult.providerStarted = providerStarted;
 		finalResult.formatStatus = formatStatus;
 		if (diffRejection) finalResult.diffRejection = diffRejection;
+		if (
+			diffRejection?.rule === "manifest_review_required" &&
+			diffRejection.paths.length > 0
+		) {
+			const unreviewed = diffRejection.paths.filter(
+				(path) => !(options.allowManifests ?? []).includes(path),
+			);
+			finalResult.hint = manifestReviewHint(
+				unreviewed.length > 0 ? unreviewed : diffRejection.paths,
+				diffRejectionCount - diffRejection.paths.length,
+			);
+			(dependencies.onRoutingWarning ?? console.error)(
+				`dispatch: manifest review required: ${finalResult.hint}`,
+			);
+		}
 		finalResult.accountability = deriveFailureAccountability({
 			providerReliability,
 			provenance: {
