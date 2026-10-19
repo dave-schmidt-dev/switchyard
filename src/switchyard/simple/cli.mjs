@@ -1,3 +1,4 @@
+import { quickDoctorLine } from "../doctor/quick.mjs";
 import { parseSimpleArgs, SIMPLE_USAGE, SimpleUsageError } from "./args.mjs";
 import { appendFailureRecord } from "./failure-log.mjs";
 import { runSimpleTask } from "./index.mjs";
@@ -61,6 +62,14 @@ export async function handleSimple(argv, dependencies = {}) {
 				: options.routingRunId !== null
 					? "environment"
 					: "generated";
+			const doctorLine = await (dependencies.quickDoctor ?? quickDoctorLine)({
+				projectPath: options.projectPath,
+				routingRunId: options.routingRunId,
+				routingRunIdSource: options.routingRunIdSource,
+				now,
+			});
+			if (doctorLine)
+				(dependencies.writeDoctorLine ?? console.error)(doctorLine);
 			const routing = await (
 				dependencies.runSimpleRoutingTask ?? runSimpleRoutingTask
 			)(options, {
