@@ -29,11 +29,14 @@ const HASH_RE = /^sha256:[a-f0-9]{64}$/;
 export const UUID_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+// Repair kinds an operator may attest. `image_repaired` named the retired VM
+// golden image: no new attestation may use it, but control records written
+// before the VM lane left still carry it and must keep reading.
 export const REPAIR_KINDS = new Set([
-	"image_repaired",
 	"auth_repaired",
 	"configuration_repaired",
 ]);
+const PERSISTED_REPAIR_KINDS = new Set([...REPAIR_KINDS, "image_repaired"]);
 
 export const HOLD_CODES = new Set([
 	"auth_expired",
@@ -264,7 +267,7 @@ function validAttestation(value) {
 		HASH_RE.test(value.publicConfigurationEpoch) &&
 		Number.isSafeInteger(value.repairEpoch) &&
 		value.repairEpoch > 0 &&
-		REPAIR_KINDS.has(value.repairKind) &&
+		PERSISTED_REPAIR_KINDS.has(value.repairKind) &&
 		typeof value.adapterContractId === "string" &&
 		value.adapterContractId.length <= 128 &&
 		Number.isFinite(value.at)

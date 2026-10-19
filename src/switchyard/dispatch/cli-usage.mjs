@@ -24,7 +24,7 @@ const USAGE_HEALTH = `Usage: switchyard-dispatch health <identity|inspect|attest
 
   identity:      --capability <low|standard|high>
   inspect:       --descriptor <descriptor-identity> --public-configuration-epoch <epoch> --repair-epoch <n> [--health-state-root <path>]
-  attest-repair: --descriptor <descriptor-identity> --public-configuration-epoch <epoch> --repair-kind <image_repaired|auth_repaired|configuration_repaired> [--health-state-root <path>]
+  attest-repair: --descriptor <descriptor-identity> --public-configuration-epoch <epoch> --repair-kind <auth_repaired|configuration_repaired> [--health-state-root <path>]
   Run \`health identity\` first: it prints the descriptor identity and public configuration epoch the other two require.
   attest-repair records attended host control metadata only; it never reads credentials or repairs a service.`;
 const KNOWN_SUBCOMMANDS = new Set([

@@ -1,5 +1,5 @@
 // @test-phase: other
-import { strictEqual } from "node:assert";
+import { rejects, strictEqual } from "node:assert";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -210,8 +210,19 @@ describe("simple route-health claim recovery", () => {
 		};
 		strictEqual((await attestRouteRepair(input)).reason, "claim-active");
 		clock(expiry + STRANDED_CLAIM_MS);
+		// The retired VM image repair kind is refused for new attestations.
+		await rejects(
+			attestRouteRepair({ ...input, repairKind: "image_repaired" }),
+			/repair kind is invalid/,
+		);
 		const attested = await attestRouteRepair(input);
 		strictEqual(attested.repairEpoch, 1);
+		strictEqual((await inspect(root)).claimStatus, null);
+		// A control record written before the VM lane left still reads.
+		const legacy = await updateScope(scope(root), async ({ control }) => {
+			control.attestations.at(-1).repairKind = "image_repaired";
+		});
+		strictEqual(legacy.available, true);
 		strictEqual((await inspect(root)).claimStatus, null);
 	});
 

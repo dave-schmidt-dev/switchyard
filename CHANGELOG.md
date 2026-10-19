@@ -61,6 +61,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - **Breaking (library):** `preflightMacosQueue`, the `macos` routing platform and the `goldenImageVerifiedProviders` option on `route`, `routeBlind` and `evaluateCandidateEligibility`, with the `not_golden_image_verified` reason. Only the retired VM queue routed on `macos`; `route` now accepts only `platform: "direct"` and refuses anything else as `invalid_platform`. `broker/snapshots.mjs`, which only that preflight used, is gone too.
 - **Breaking (library):** the `integrationIntent` option of `integrationGate` and the matching `applyReviewedDiff` parameters, with the `alreadyApplied` result. Only the retired queue lane supplied a durable apply-intent record; every remaining caller applies without one, so a diff that no longer applies now always fails closed.
 - The `queue-vm` route-health lane. A terminal binding now accepts only the simple-direct lifecycle, the one lane that still dispatches; no producer had written `queue-vm` since the VM lane left.
+- **Breaking:** the `image_repaired` kind for `switchyard-dispatch health attest-repair --repair-kind`. It named the retired VM golden image; new attestations accept only `auth_repaired` and `configuration_repaired`, while route-health control records that already carry `image_repaired` still read.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
