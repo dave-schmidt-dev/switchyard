@@ -706,7 +706,9 @@ test("typed diagnostic identity ignores key order while preserving mismatched ev
 	}
 });
 
-test("funding exhaustion is distinct from capacity and task failures and never latches", async () => {
+// Funding exhaustion reports capacity so native fallback still applies
+// (stability audit O10, 2026-10-18).
+test("funding exhaustion falls back to native as capacity, apart from task failures, and never latches", async () => {
 	for (const mode of ["funding", "capacity", "task_failures"]) {
 		const f = fixture(
 			mode === "task_failures"
@@ -729,11 +731,12 @@ test("funding exhaustion is distinct from capacity and task failures and never l
 				},
 			});
 		const result = await runSimpleRoutingTask(f.options, f.deps);
-		strictEqual(result.exhaustionCause, mode);
 		strictEqual(
-			result.direction,
-			mode === "funding" ? "stop" : "native_required",
+			result.exhaustionCause,
+			mode === "task_failures" ? "task_failures" : "capacity",
 		);
+		strictEqual(result.direction, "native_required");
+		strictEqual(result.stopReason, undefined);
 		strictEqual(
 			readRoutingRunState(f.options.projectPath, "run-1", {
 				stateRoot: f.deps.stateRoot,

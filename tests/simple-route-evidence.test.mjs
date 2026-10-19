@@ -216,42 +216,26 @@ test("distinct closed refusals retain the 64-entry cap independently of deduplic
 	strictEqual(new Set(bounded.map((entry) => JSON.stringify(entry))).size, 64);
 });
 
-test("funding-only classification requires positive funding evidence and retains mixed history", () => {
+test("the refusal accumulator keeps mixed history once per target and closed reason", () => {
 	const funding = { targetId: "codex", reason: "included_usage_unverified" };
 	for (const reason of [
 		"provider_unavailable",
-		"invalid_platform",
-		"no_compatible_adapter",
-		"local_descriptor_model_unavailable",
-		"unknown",
 		"route_health_suppressed",
 		"quota_exhausted",
-	]) {
-		const capture = createRefusalAccumulator([
-			funding,
-			{ targetId: "antigravity", reason },
-		]);
-		strictEqual(capture.isFundingOnly(), false, reason);
-		strictEqual(capture.classifyExhaustion(), "capacity", reason);
-		capture.add("codex", "included_usage_unverified");
-		strictEqual(capture.isFundingOnly(), false, `historical ${reason}`);
-		strictEqual(capture.entries().length, 2);
-	}
-	for (const reason of [
 		"tier_excluded",
-		"explicitly_excluded",
-		"not_in_only_allowlist",
-		"below_required_capability",
 		"deadline_fit_overridden",
 	]) {
 		const capture = createRefusalAccumulator([
 			funding,
 			{ targetId: "antigravity", reason },
 		]);
-		strictEqual(capture.isFundingOnly(), true, reason);
-		strictEqual(capture.classifyExhaustion(true), "task_failures");
+		capture.add("codex", "included_usage_unverified");
+		deepStrictEqual(
+			capture.entries().map((entry) => entry.reason),
+			["included_usage_unverified", reason],
+		);
 	}
-	strictEqual(createRefusalAccumulator().isFundingOnly(), false);
+	deepStrictEqual(createRefusalAccumulator().entries(), []);
 });
 
 function localFixture() {

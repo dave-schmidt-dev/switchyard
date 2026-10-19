@@ -27,6 +27,7 @@ import {
 import { discardAndReleasePartial } from "./routing-recovery.mjs";
 import {
 	createRefusalAccumulator,
+	withoutRemovalArtifacts,
 	withRefusalEvidence,
 } from "./routing-refusals.mjs";
 import {
@@ -305,6 +306,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					...localExcluded,
 					...taskExcludedTargets(state.attempts, logicalTaskId),
 				]);
+				const removedHere = new Set();
 				const availableProviders = (input.availableProviders ?? []).filter(
 					(id) => {
 						const targetId = resolveIdentity(id).targetId;
@@ -312,18 +314,31 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						if (excluded.has(targetId))
 							refusals.add(targetId, "explicitly_excluded");
 						else if (!tierAllowed) refusals.add(targetId, "tier_excluded");
-						return !excluded.has(targetId) && tierAllowed;
+						const kept = !excluded.has(targetId) && tierAllowed;
+						if (!kept) removedHere.add(targetId);
+						return kept;
 					},
 				);
+				const removedByThisRun = (id) => {
+					const targetId = resolveIdentity(id).targetId;
+					return removedHere.has(targetId) || localExcluded.has(targetId);
+				};
 				for (;;) {
-					let routed = select({
-						...input,
-						availableProviders: availableProviders.filter(
-							(id) => !localExcluded.has(resolveIdentity(id).targetId),
-						),
-						exclude: [...(input.exclude ?? []), ...excluded, ...localExcluded],
-						runId: routingRunId,
-					});
+					let routed = withoutRemovalArtifacts(
+						select({
+							...input,
+							availableProviders: availableProviders.filter(
+								(id) => !localExcluded.has(resolveIdentity(id).targetId),
+							),
+							exclude: [
+								...(input.exclude ?? []),
+								...excluded,
+								...localExcluded,
+							],
+							runId: routingRunId,
+						}),
+						removedByThisRun,
+					);
 					for (const entry of routeDiagnosticPatch(routed).routeEvidence
 						?.excluded ?? [])
 						refusals.add(entry.targetId, entry.reason, entry.bucket);
@@ -437,7 +452,9 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				const exhausted =
 					anyFailed ||
 					taskExcludedTargets(handle.state.attempts, logicalTaskId).size > 0;
-				const fundingOnly = refusals.isFundingOnly(exhausted);
+				// Funding refusals count as capacity, so native fallback still
+				// applies when every eligible target is refused for funding
+				// (stability audit O10, 2026-10-18).
 				if (
 					routeCalled &&
 					noEligible &&
@@ -445,17 +462,15 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					!deps.signal?.aborted
 				)
 					return answer(
-						pinned || fundingOnly ? "stop" : "native_required",
+						pinned ? "stop" : "native_required",
 						{
-							status: pinned || fundingOnly ? "failed" : "deferred",
-							stopReason: fundingOnly
-								? "funding_exhausted"
-								: pinned
-									? "pinned_target_unavailable"
-									: undefined,
-							exhaustionCause: !pinned
-								? refusals.classifyExhaustion(exhausted)
-								: undefined,
+							status: pinned ? "failed" : "deferred",
+							stopReason: pinned ? "pinned_target_unavailable" : undefined,
+							exhaustionCause: pinned
+								? undefined
+								: exhausted
+									? "task_failures"
+									: "capacity",
 							result,
 						},
 						{ attempt },
