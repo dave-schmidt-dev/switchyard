@@ -27,13 +27,17 @@ function providerMatches(identifier, name) {
 	return normalizeProviderName(identifier) === normalizeProviderName(name);
 }
 
-export const SNAPSHOT_PATH = join(
-	homedir(),
-	"Library/Application Support/Gradus/Installed/snapshot-v2.json",
-);
+// Resolved on use: homedir() throws when HOME is unset and the account has no
+// passwd entry, which must not break importing the router.
+function defaultSnapshotPath() {
+	return join(
+		homedir(),
+		"Library/Application Support/Gradus/Installed/snapshot-v2.json",
+	);
+}
 
 export function resolveSnapshotPath() {
-	return process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE || SNAPSHOT_PATH;
+	return process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE || defaultSnapshotPath();
 }
 
 const EXPECTED_SCHEMA_VERSION = 2;

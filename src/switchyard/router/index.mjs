@@ -584,7 +584,6 @@ export {
 	QUALIFIED_PROVIDERS,
 	readSnapshotAtRoute,
 	resolveSnapshotPath,
-	SNAPSHOT_PATH,
 } from "./eligibility.mjs";
 
 export { routeBlind } from "./preflight.mjs";

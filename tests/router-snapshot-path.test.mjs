@@ -3,10 +3,7 @@ import { strictEqual } from "node:assert";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import {
-	resolveSnapshotPath,
-	SNAPSHOT_PATH,
-} from "../src/switchyard/router/index.mjs";
+import { resolveSnapshotPath } from "../src/switchyard/router/index.mjs";
 
 const previousOverride = process.env.SWITCHYARD_SNAPSHOT_PATH_OVERRIDE;
 
@@ -26,7 +23,6 @@ describe("production Gradus snapshot path", () => {
 			"Library/Application Support/Gradus/Installed/snapshot-v2.json",
 		);
 
-		strictEqual(SNAPSHOT_PATH, installedPath);
 		strictEqual(resolveSnapshotPath(), installedPath);
 	});
 
