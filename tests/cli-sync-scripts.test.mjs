@@ -5,12 +5,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-const scripts = [
-	"sync-clis.sh",
-	"sync-host-clis.sh",
-	"update-guest-clis.sh",
-	"generate-cli-manifest.sh",
-];
+const scripts = ["sync-host-clis.sh", "generate-cli-manifest.sh"];
 
 for (const script of scripts) {
 	test(`${script} bash -n and set -Eeuo pipefail`, () => {

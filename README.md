@@ -41,6 +41,8 @@ Provider reliability diagnostics use a closed version-1 record: cause category/c
 
 **Admission:** automatic admission is descriptor-bound. Read the current eligibility from `npm run roster:coherence` rather than from a dated list in this file.
 
+**Qualification history (not current eligibility):** **Historical context (2026-09-01):** a Vibe canary qualified `mistral-medium-3.5` at `standard` after the GLM-5.2 label it carried was replaced locally; Vibe resolves a model name against its locally configured models and substitutes the first one for an unknown name. On 2026-09-21 dispatch canaries promoted Vibe GLM 5.3 low `zhipu/glm-5.3-medium` / `glm-5-3-medium` and Vibe standard `zhipu/glm-5.3` / `glm-5-3`, and on 2026-09-25 both Vibe simple descriptors passed one-file live canaries. **OpenCode Mistral GLM-5.2 status (2026-09-11):** both `mistral/zai-glm-5-2` default and `--variant max` failed on the first coding tool call, because the model streamed a malformed partial tool call without an ID (OpenCode [issue #43199](https://github.com/anomalyco/opencode/issues/43199)); neither route has a dispatch receipt or roster slot.
+
 ## Priorities (in order)
 
 1. **Containment & isolation (security).** The sandbox boundary *is* the product. A misbehaving provider process must never reach the owner's checkout, host credentials, or another provider's environment.
@@ -249,6 +251,24 @@ A succeeded run then renews its receipt through the roster CLI (`src/switchyard/
 **Host cleanup helpers:** APFS accounting and quarantine removal use the fixed system `/usr/bin/python3` for standard-library-only code, with `-I -S` and a minimal fixed environment so caller Python paths and startup hooks cannot run. Fresh child-environment copies explicitly disable Node coverage propagation, preserving that boundary during instrumented validation. Failed retained-worktree cleanup persists bounded failure details and retention metadata even when normal finalization fails.
 
 **Project-lock conflicts:** The immediate simple caller receipt classifies the matched holder using shared run liveness: a live holder or startup grace returns `defer` (exit 6), a proven-dead holder returns `recover` with the exact state-root-bound command, and unknown evidence stops. This fresh classification remains ephemeral; terminal run records retain generic lock failure without stale holder advice. No provider attempt, route exclusion or automatic lock recovery occurs.
+
+**Caller disposition:** the lock-conflict receipt carries a bounded, closed `disposition` object projected by `dispatch/disposition.mjs`:
+
+```json
+{"disposition":{"version":1,"action":"monitor|defer|policy_deferred|recover|repair_contract|target_failed|complete|stop","direction":"repair_input|advance_authorized_fallback|recover_and_retry|retry_launch|wait|complete|stop","reasonCode":"closed_code","diagnosticCode":null,"taskId":null,"blockingRunId":null,"recoveryCommand":null,"failedTargetIds":[],"failedTargetIdsTruncated":false}}
+```
+
+`direction` is a pure total function of `(action, reasonCode, diagnosticCode)` in `baseDisposition`; an unenumerated tuple returns `stop`. It is run-local evidence only and never authorizes, selects or invokes a route.
+
+| Closed direction | Exact mapping |
+|---|---|
+| `repair_input` | Contract repair, or a target failure classified as required/undeclared/no-op/seed/manifest/patch/conflict input evidence. |
+| `advance_authorized_fallback` | A target failure classified as provider execution, exhaustion, cleanup, diff-capture failure, or an empty provider result, or a battery-policy deferral carrying the exact next task ID. It does not claim capacity exhaustion or authorize, select or invoke a fallback. |
+| `recover_and_retry` | `recover` with a state-root-bound recovery command; after recovery the caller re-enters normal preflight. |
+| `retry_launch` | A terminal lock diagnostic without fresh holder classification; rerun normal preflight without acting on a stored holder identity. |
+| `wait` | `monitor`, or a holder-aware pre-initialization `defer`. |
+| `complete` | Terminal `complete`. |
+| `stop` | Authentication, containment refusal, recovery/cleanup failure, insufficient evidence, or any unknown tuple. |
 
 **Route decision evidence:** Durable `run.json` diagnostics carry version-1 `routeEvidence` from the actual selection pass: snapshot status, mtime and age at routing; closed selection reason and selected target ID; candidate priorities and measured/unknown pace keys; and exclusions with closed reasons. Each refused target appears once with a closed reason and its source stage: capacity (`no_quota_headroom`, `quota_exhausted`, `budget_pace_exceeded`, `budget_pace_unavailable`, `no_valid_windows`, `accounting_bucket_unavailable`), funding (`paid_overage_not_allowed`, `included_usage_unverified`, `funding_unavailable`, `funding_exhausted`), route policy (`tier_excluded`, `route_health_suppressed`) or no adapter/descriptor. Refusals deduplicate preserving precedence and are bounded to 64. A target the routing run removed itself keeps only its own refusal, never an extra `adapter_unavailable`. A funding-only exhaustion reports `exhaustionCause: "capacity"`, so native fallback still applies; only task failures are classified separately. Candidate and exclusion arrays are capped at 64, nonfinite numbers become `null`, and accounting buckets remain distinct. A health start denial reroutes through the shared `simple/route-selection.mjs` seam and refreshes this evidence before provider execution. The evidence is diagnostic and never gates selection. No raw snapshot, provider output or free-form reason is retained; injected legacy routers without evidence remain compatible.
 
