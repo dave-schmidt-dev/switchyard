@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { isAbsolute, sep } from "node:path";
+import { systemClock } from "../util/clock.mjs";
 
 const PROBE_TIMEOUT_MS = 1_500;
 // A host-wide lsof walks every process; on a busy host it takes several
@@ -19,22 +20,22 @@ function processGroupPresent(pgid) {
 	}
 }
 
-async function waitForProcessGroupExit(pgid, timeoutMs, onProgress) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
+async function waitForProcessGroupExit(pgid, timeoutMs, onProgress, clock) {
+	const deadline = clock.now() + timeoutMs;
+	while (clock.now() < deadline) {
 		const present = processGroupPresent(pgid);
 		if (present === false) return true;
 		onProgress?.();
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		await clock.sleep(50);
 	}
 	return processGroupPresent(pgid) === false;
 }
 
-async function settleProcessGroup(pgid, onProgress) {
+async function settleProcessGroup(pgid, onProgress, clock) {
 	const present = processGroupPresent(pgid);
 	if (present === false) return "stopped";
 	if (present === null) {
-		return (await waitForProcessGroupExit(pgid, 5_000, onProgress))
+		return (await waitForProcessGroupExit(pgid, 5_000, onProgress, clock))
 			? "stopped"
 			: "unavailable";
 	}
@@ -42,20 +43,21 @@ async function settleProcessGroup(pgid, onProgress) {
 		process.kill(-pgid, "SIGTERM");
 	} catch (error) {
 		if (error?.code === "ESRCH") return "stopped";
-		return (await waitForProcessGroupExit(pgid, 5_000, onProgress))
+		return (await waitForProcessGroupExit(pgid, 5_000, onProgress, clock))
 			? "stopped"
 			: "unavailable";
 	}
-	if (await waitForProcessGroupExit(pgid, 1_000, onProgress)) return "stopped";
+	if (await waitForProcessGroupExit(pgid, 1_000, onProgress, clock))
+		return "stopped";
 	try {
 		process.kill(-pgid, "SIGKILL");
 	} catch (error) {
 		if (error?.code === "ESRCH") return "stopped";
-		return (await waitForProcessGroupExit(pgid, 4_000, onProgress))
+		return (await waitForProcessGroupExit(pgid, 4_000, onProgress, clock))
 			? "stopped"
 			: "unavailable";
 	}
-	return (await waitForProcessGroupExit(pgid, 4_000, onProgress))
+	return (await waitForProcessGroupExit(pgid, 4_000, onProgress, clock))
 		? "stopped"
 		: "unavailable";
 }
@@ -170,9 +172,10 @@ async function waitForScopedProcessesExit(
 	launchedAt,
 	timeoutMs,
 	onProgress,
+	clock,
 ) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
+	const deadline = clock.now() + timeoutMs;
+	while (clock.now() < deadline) {
 		let remaining = false;
 		for (const { pid, stamp } of processes) {
 			const same = sameProcess(pid, stamp, launchedAt);
@@ -188,12 +191,17 @@ async function waitForScopedProcessesExit(
 		}
 		if (!remaining) return true;
 		onProgress?.();
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		await clock.sleep(50);
 	}
 	return false;
 }
 
-async function settleScopedProcesses(worktreePath, launchedAt, onProgress) {
+async function settleScopedProcesses(
+	worktreePath,
+	launchedAt,
+	onProgress,
+	clock,
+) {
 	if (
 		typeof worktreePath !== "string" ||
 		!Number.isFinite(launchedAt) ||
@@ -238,6 +246,7 @@ async function settleScopedProcesses(worktreePath, launchedAt, onProgress) {
 		launchedAt,
 		300,
 		onProgress,
+		clock,
 	);
 	if (termResult === null) return "unavailable";
 	if (termResult) return "stopped";
@@ -260,25 +269,37 @@ async function settleScopedProcesses(worktreePath, launchedAt, onProgress) {
 		launchedAt,
 		1_500,
 		onProgress,
+		clock,
 	);
 	return killResult === true ? "stopped" : "unavailable";
 }
 
-/** Settle both the writer process group and new processes still in its worktree. */
+/**
+ * Settle both the writer process group and new processes still in its worktree.
+ *
+ * `clock` times only the waits between signals and polls (see
+ * `util/clock.mjs`); process identity checks stay on the wall clock.
+ */
 export async function settleSimpleWriterProcesses({
 	processGroupId,
 	processScopePath,
 	launchedAt,
 	onProgress,
+	clock = systemClock,
 }) {
 	// A synchronous caller can hand this helper only a scoped root after its
 	// direct child has exited; the identity-checked cwd sweep still applies.
 	const groupState =
 		processGroupId == null
 			? "stopped"
-			: await settleProcessGroup(processGroupId, onProgress);
+			: await settleProcessGroup(processGroupId, onProgress, clock);
 	const scopeState = processScopePath
-		? await settleScopedProcesses(processScopePath, launchedAt, onProgress)
+		? await settleScopedProcesses(
+				processScopePath,
+				launchedAt,
+				onProgress,
+				clock,
+			)
 		: "stopped";
 	return groupState === "stopped" && scopeState === "stopped"
 		? "stopped"
