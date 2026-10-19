@@ -55,7 +55,7 @@ import {
 	prepareSimpleOverlayBaseline,
 	runSimpleBaselineChecks,
 } from "./baseline.mjs";
-import { dryRunAcceptanceChecks } from "./check-dry-run.mjs";
+import { dryRunAcceptanceChecks, existsInCheckout } from "./check-dry-run.mjs";
 import {
 	CHECK_ENVIRONMENT_SIGNATURES,
 	classifyFailedCheck,
@@ -1276,6 +1276,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 				? await dryRunAcceptanceChecks({
 						checks: options.checks,
 						runCheck,
+						declaredPaths: options.files,
+						pathExistsAtBase: existsInCheckout(baselineCheckPath),
 						resolveCheckExecutables: checkSessions.resolveCheckExecutables,
 						deadlineMs: options.deadlineMs,
 						now,

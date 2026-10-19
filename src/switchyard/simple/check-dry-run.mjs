@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { lstatSync } from "node:fs";
+import { join } from "node:path";
 import { PERSISTED_SIGNALS } from "../adapter/exec-error-kinds.mjs";
 import { classifyFailedCheck } from "./check-environment.mjs";
 import { aggregateWriterLifecycle } from "./recovery.mjs";
@@ -12,14 +14,88 @@ const SETTLED_LIFECYCLES = new Set(["stopped", "never_started"]);
 const checkIdentityOf = (command) =>
 	createHash("sha256").update(command).digest("hex");
 
+// Bare interpreter names whose first non-flag argument is the script they run.
+const SCRIPT_INTERPRETERS = new Set([
+	"sh",
+	"bash",
+	"zsh",
+	"node",
+	"python",
+	"python3",
+]);
+const PROJECT_PYTHON = /^(?:\.\/)?\.venv\/bin\/python3?$/u;
+// A plain command: words of path-safe characters only, so no quoting, expansion,
+// redirection, or command separator can hide what actually ran.
+const PLAIN_COMMAND = /^[A-Za-z0-9._/@:+=,%\- ]+$/u;
+
+/** Repo-relative form of `path` (leading `./` dropped), or null if it is not one. */
+function relativeForm(path) {
+	let relative = path;
+	while (relative.startsWith("./")) relative = relative.slice(2);
+	return !relative ||
+		relative.startsWith("-") ||
+		relative.startsWith("/") ||
+		relative.split("/").some((segment) => segment === ".." || !segment)
+		? null
+		: relative;
+}
+
+/**
+ * The repo-relative script a plain check command runs: argv[0] when it is a
+ * relative path (`./x.sh`, `tests/x.sh`), or argv[1] when argv[0] is a shell or
+ * interpreter (`bash x.sh`, `.venv/bin/python x.py`). Null for anything else,
+ * including a command with shell syntax.
+ */
+function scriptRunBy(command) {
+	if (!PLAIN_COMMAND.test(command)) return null;
+	const [head, next] = command.trim().split(/ +/u);
+	if (SCRIPT_INTERPRETERS.has(head) || PROJECT_PYTHON.test(head))
+		return next === undefined ? null : relativeForm(next);
+	return head.includes("/") ? relativeForm(head) : null;
+}
+
+/**
+ * A `tool_missing` failure is expected, not an environment fault, when the
+ * check runs a script the task itself declares and that script does not exist
+ * in the base tree yet.
+ */
+function runsNewDeclaredScript(command, declaredPaths, pathExistsAtBase) {
+	const script = scriptRunBy(command);
+	return (
+		script !== null &&
+		declaredPaths.some((declared) => relativeForm(declared) === script) &&
+		!pathExistsAtBase(script)
+	);
+}
+
+/**
+ * Whether a repo-relative path exists in the checkout at `root`. Only a
+ * definite absence (ENOENT or ENOTDIR) reports false, so an unreadable path
+ * keeps the stop.
+ *
+ * @param {string} root
+ * @returns {(path: string) => boolean}
+ */
+export const existsInCheckout = (root) => (path) => {
+	try {
+		lstatSync(join(root, path));
+		return true;
+	} catch (error) {
+		return !["ENOENT", "ENOTDIR"].includes(error?.code);
+	}
+};
+
 /**
  * Run the acceptance checks once against the base tree, before any provider
  * starts, to catch a check that cannot run here at all.
  *
  * Only a classified environment failure (see `classifyFailedCheck`) stops the
  * attempt. A check that fails for any other reason, or times out, is expected
- * on an unmodified tree and the run proceeds. This is not a baseline run: it
- * does not require a clean tree and never decides acceptance.
+ * on an unmodified tree and the run proceeds. A `tool_missing` failure of a
+ * plain command that runs a declared output path absent from the base tree
+ * (`bash tests/new-test.sh` before the task creates it) is such a plain
+ * failure too. This is not a baseline run: it does not require a clean tree
+ * and never decides acceptance.
  *
  * Statuses: `passed` (all ran; `redAtBaseline` lists, ascending, the 1-based
  * index of every check that ran to completion and failed plainly on the
@@ -34,6 +110,10 @@ const checkIdentityOf = (command) =>
  * @param {object} options
  * @param {string[]} options.checks Acceptance check commands, in order.
  * @param {Function} options.runCheck Session `runCheck` (writes check evidence on failure).
+ * @param {string[]} [options.declaredPaths] The task's declared output paths.
+ * @param {(path: string) => boolean} [options.pathExistsAtBase] Whether a
+ *   repo-relative path exists in the base tree; the default reports every path
+ *   present, so no failure is exempted.
  * @param {Function} [options.resolveCheckExecutables] Resolves a check command
  *   to its sandbox and host executables; null/omitted skips the comparison.
  * @param {number} options.deadlineMs Absolute deadline, ms since epoch.
@@ -47,6 +127,8 @@ const checkIdentityOf = (command) =>
 export async function dryRunAcceptanceChecks({
 	checks = [],
 	runCheck,
+	declaredPaths = [],
+	pathExistsAtBase = () => true,
 	resolveCheckExecutables = null,
 	deadlineMs,
 	now = Date.now,
@@ -96,7 +178,12 @@ export async function dryRunAcceptanceChecks({
 		if (signal?.aborted) return finish("cancelled");
 		if (!SETTLED_LIFECYCLES.has(result?.writerLifecycle))
 			return finish("unconfirmed");
-		const signature = classifyFailedCheck(result, { preProvider: true });
+		const classified = classifyFailedCheck(result, { preProvider: true });
+		const signature =
+			classified === "tool_missing" &&
+			runsNewDeclaredScript(command, declaredPaths, pathExistsAtBase)
+				? null
+				: classified;
 		if (signature) {
 			// Task 2.8: when the failing check's command resolves differently in
 			// the check sandbox and on the host, both paths travel with the
