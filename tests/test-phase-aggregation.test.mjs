@@ -1,11 +1,5 @@
 // @test-phase: other
-import {
-	deepStrictEqual,
-	notStrictEqual,
-	ok,
-	strictEqual,
-	throws,
-} from "node:assert";
+import { deepStrictEqual, notStrictEqual, ok, strictEqual } from "node:assert";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -152,23 +146,6 @@ describe("test phase aggregation runner", () => {
 			pkg.scripts["test:other"],
 			"node scripts/test-manifest.mjs --run other",
 		);
-	});
-
-	it("cleans the isolated account directory after a process error", () => {
-		let accountDirectory;
-		throws(
-			() =>
-				defaultRun("test:serial", {
-					env: {},
-					spawn(_command, _args, options) {
-						accountDirectory = options.env.SWITCHYARD_ACCOUNT_ROOT;
-						return { error: new Error("phase spawn failed") };
-					},
-				}),
-			/phase spawn failed/u,
-		);
-		ok(accountDirectory);
-		strictEqual(existsSync(accountDirectory), false);
 	});
 
 	it("keeps live serial phase stdio inherited and returns the phase status", () => {

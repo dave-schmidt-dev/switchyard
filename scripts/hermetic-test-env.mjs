@@ -1,9 +1,9 @@
 /**
  * Hermetic environment for every `node --test` child that validation spawns.
  *
- * Production defaults resolve state from HOME (`~/.switchyard/accounts`, the
- * Gradus snapshot) and from the checkout
- * (`<repo>/.logs/switchyard`), so a test that forgot to redirect one wrote
+ * Production defaults resolve state from HOME (the Gradus snapshot) and from
+ * the checkout (`<repo>/.logs/switchyard`), so a test that forgot to redirect
+ * one wrote
  * live dispatcher state or read owner files (audit TEST-9). Each spawn now gets
  * its own HOME, TMPDIR, XDG roots, git global config and Switchyard state
  * roots in one scratch directory, deleted when the child exits.
@@ -13,10 +13,9 @@
  * directly under the inherited TMPDIR. Names stay short because the path
  * becomes the child's TMPDIR prefix.
  *
- * Deliberate host references remain. The Docker CLI finds the OrbStack
- * context through `~/.docker`, so DOCKER_CONFIG keeps pointing there. Tests
- * that check host ground truth (the live roster, the ~/.agent producers) read
- * the owner's home from SWITCHYARD_HOST_HOME; production code never does.
+ * One deliberate host reference remains: tests that check host ground truth
+ * (the live roster, the ~/.agent producers) read the owner's home from
+ * SWITCHYARD_HOST_HOME; production code never does.
  */
 
 import {
@@ -75,7 +74,6 @@ export function createHermeticTestEnv(base = process.env) {
 	const gitconfig = join(home, ".gitconfig");
 	writeFileSync(gitconfig, TEST_GITCONFIG, { mode: 0o600 });
 	const hostHome = base[HOST_HOME_ENV] || base.HOME || homedir();
-	const hostDocker = join(hostHome, ".docker");
 	const env = Object.fromEntries(
 		Object.entries(base).filter(([key]) => !STRIPPED.includes(key)),
 	);
@@ -89,12 +87,9 @@ export function createHermeticTestEnv(base = process.env) {
 		GIT_CONFIG_GLOBAL: gitconfig,
 		GIT_CONFIG_NOSYSTEM: "1",
 		SWITCHYARD_RUN_STORE_ROOT: join(state, "run-store"),
-		SWITCHYARD_ACCOUNT_ROOT: join(state, "accounts"),
 		SWITCHYARD_SNAPSHOT_PATH_OVERRIDE: join(state, "gradus-snapshot.json"),
 		[HOST_HOME_ENV]: hostHome,
 	});
-	if (!base.DOCKER_CONFIG && existsSync(hostDocker))
-		env.DOCKER_CONFIG = hostDocker;
 	return {
 		env,
 		dir,

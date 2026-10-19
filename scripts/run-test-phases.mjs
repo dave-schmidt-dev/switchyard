@@ -377,45 +377,14 @@ function runPropertyTests({ root = process.cwd(), spawn = spawnSync } = {}) {
 	return status;
 }
 
-/**
- * Redirect the shared account root away from the host's real one for a test
- * phase. Shared account coordination is on by default, so any test that reaches
- * the runner's default resolver would otherwise mint a host key under
- * `~/.switchyard/accounts` and number the owner's real subscriptions from a
- * suite run. An explicit override from the caller always wins.
- * @param {NodeJS.ProcessEnv} env
- * @returns {NodeJS.ProcessEnv}
- */
-export function withIsolatedAccountRoot(env) {
-	if (env.SWITCHYARD_ACCOUNT_ROOT) return env;
-	return {
-		...env,
-		SWITCHYARD_ACCOUNT_ROOT: mkdtempSync(
-			join(tmpdir(), "switchyard-test-accounts-"),
-		),
-	};
-}
-
 export function defaultRun(
 	phase,
 	{ spawn = spawnSync, env = process.env } = {},
 ) {
 	const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-	const phaseEnv = withIsolatedAccountRoot(env);
-	const accountRoot =
-		phaseEnv.SWITCHYARD_ACCOUNT_ROOT === env.SWITCHYARD_ACCOUNT_ROOT
-			? null
-			: phaseEnv.SWITCHYARD_ACCOUNT_ROOT;
-	try {
-		const result = spawn(npmCmd, ["run", phase], {
-			stdio: "inherit",
-			env: phaseEnv,
-		});
-		if (result.error) throw result.error;
-		return result.status ?? 1;
-	} finally {
-		if (accountRoot) rmSync(accountRoot, { force: true, recursive: true });
-	}
+	const result = spawn(npmCmd, ["run", phase], { stdio: "inherit", env });
+	if (result.error) throw result.error;
+	return result.status ?? 1;
 }
 
 export function runPhases({

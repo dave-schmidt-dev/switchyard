@@ -1,7 +1,7 @@
 // @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -15,7 +15,6 @@ import { tempDir } from "./helpers/tempdir.mjs";
 describe("hermetic test environment", () => {
 	it("moves HOME, TMPDIR, XDG, git config and every state root into one scratch dir", () => {
 		const ownerHome = tempDir("sy-hermetic-owner-");
-		mkdirSync(join(ownerHome, ".docker"));
 		const hermetic = createHermeticTestEnv({
 			PATH: "/usr/bin:/bin",
 			HOME: ownerHome,
@@ -37,7 +36,6 @@ describe("hermetic test environment", () => {
 				"XDG_STATE_HOME",
 				"GIT_CONFIG_GLOBAL",
 				"SWITCHYARD_RUN_STORE_ROOT",
-				"SWITCHYARD_ACCOUNT_ROOT",
 				"SWITCHYARD_SNAPSHOT_PATH_OVERRIDE",
 			])
 				ok(env[key].startsWith(`${dir}/`), `${key}=${env[key]}`);
@@ -48,7 +46,6 @@ describe("hermetic test environment", () => {
 			);
 			strictEqual(realpathSync(dir), dir, "no symlinked ancestor such as /var");
 			strictEqual(env.GIT_CONFIG_NOSYSTEM, "1");
-			strictEqual(env.DOCKER_CONFIG, join(ownerHome, ".docker"));
 			strictEqual(env.SWITCHYARD_HOST_HOME, ownerHome);
 			const nested = createHermeticTestEnv(env);
 			try {
