@@ -1,14 +1,7 @@
 // @test-phase: other
 import { strict as assert } from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import {
-	mkdirSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,22 +13,14 @@ import {
 } from "../ops/simple-provider-keyless-bridge.mjs";
 import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
+import {
+	pidAlive,
+	SECRET,
+	setup,
+	stubServerPids,
+	withOpenCodeServer,
+} from "./helpers/keyless-bridge-fixtures.mjs";
 
-const SECRET = "synthetic-real-api-key-bridge-123456";
-function setup() {
-	const root = join(
-		realpathSync(tmpdir()),
-		`switchyard-simple-${randomUUID()}`,
-	);
-	const worktree = join(root, "worktree");
-	mkdirSync(join(worktree, ".git"), { recursive: true });
-	writeFileSync(join(root, ".switchyard-cleanup-owner.json"), "{}\n");
-	return {
-		root,
-		worktree,
-		cleanup: () => rmSync(root, { recursive: true, force: true }),
-	};
-}
 async function localServer(handler) {
 	const server = http.createServer(handler);
 	await new Promise((done) => server.listen(0, "127.0.0.1", done));
@@ -62,6 +47,30 @@ test("Seatbelt grants no broad host preferences or etc read", () => {
 	});
 	assert.equal(profile.includes('(subpath "/private/etc")'), false);
 	assert.equal(profile.includes('(subpath "/Library/Preferences")'), false);
+});
+test("Seatbelt opens only the named server port, and only when asked", () => {
+	const base = {
+		worktree: "/private/tmp/switchyard-simple-test/worktree",
+		runtime: "/private/tmp/switchyard-simple-test/runtime",
+		proxyPort: 12345,
+	};
+	const network = (profile) =>
+		profile.split("\n").filter((line) => line.includes("(allow network"));
+	assert.deepEqual(network(seatbeltProfile(base)), [
+		'(allow network-outbound (remote tcp "localhost:12345"))',
+	]);
+	assert.deepEqual(network(seatbeltProfile({ ...base, serverPort: 23456 })), [
+		'(allow network-outbound (remote tcp "localhost:12345"))',
+		'(allow network-bind (local tcp "localhost:23456"))',
+		'(allow network-inbound (local tcp "localhost:23456"))',
+		'(allow network-outbound (remote tcp "localhost:23456"))',
+	]);
+	for (const serverPort of [12345, 0, 65536, 1.5, "23456"])
+		assert.throws(
+			() => seatbeltProfile({ ...base, serverPort }),
+			/invalid server port/u,
+			String(serverPort),
+		);
 });
 test("proxy admits concurrent calls beyond the former fixed request budget", async () => {
 	const requestCount = 72;
@@ -141,8 +150,9 @@ test("Switchyard teardown stops a detached CLI after bridge SIGKILL", async (t) 
 		"#!/bin/sh\nprintf '%s' \"$$\" > cli.pid\nexec sleep 30\n",
 		{ mode: 0o755 },
 	);
+	const cli = withOpenCodeServer(fake);
 	const launchedAt = Date.now();
-	const script = `import { runBridge } from ${JSON.stringify(new URL("../ops/simple-provider-keyless-bridge.mjs", import.meta.url).href)}; await runBridge({ target: "opencode-go", model: "opencode-go/deepseek-v4.1-flash", variant: "low", worktree: ${JSON.stringify(item.worktree)}, prompt: "synthetic", secret: ${JSON.stringify(SECRET)}, cliPath: ${JSON.stringify(fake)}, timeoutMs: 30000 });`;
+	const script = `import { runBridge } from ${JSON.stringify(new URL("../ops/simple-provider-keyless-bridge.mjs", import.meta.url).href)}; await runBridge({ target: "opencode-go", model: "opencode-go/deepseek-v4.1-flash", variant: "low", worktree: ${JSON.stringify(item.worktree)}, prompt: "synthetic", secret: ${JSON.stringify(SECRET)}, cliPath: ${JSON.stringify(cli)}, timeoutMs: 30000 });`;
 	const bridge = spawn(
 		process.execPath,
 		["--input-type=module", "-e", script],
@@ -178,6 +188,14 @@ test("Switchyard teardown stops a detached CLI after bridge SIGKILL", async (t) 
 		assert.ok(
 			probe.status !== 0 || /^Z/u.test(probe.stdout.trim()),
 			"detached CLI survived teardown",
+		);
+		// The OpenCode server is its own detached group; it shares the clone cwd.
+		const [serverPid] = stubServerPids(item.worktree);
+		assert.ok(serverPid, "OpenCode server did not start");
+		assert.equal(
+			pidAlive(serverPid),
+			false,
+			"OpenCode server survived teardown",
 		);
 	} finally {
 		if (bridge.pid) {
@@ -300,7 +318,7 @@ test("proxy gates nonce, exact path and model, strips credentials, redacts respo
 				headers: {
 					authorization: `Bearer ${proxy.nonce}`,
 					"content-type": "application/json",
-					"user-agent": "opencode/1.18.30",
+					"user-agent": "opencode/latest/2.0.32/cli",
 					"x-opencode-session": "session-123",
 					"x-opencode-project": "private-project",
 				},
@@ -314,7 +332,7 @@ test("proxy gates nonce, exact path and model, strips credentials, redacts respo
 		assert.equal(observed.path, "/v1/chat/completions");
 		assert.equal(observed.auth, `Bearer ${SECRET}`);
 		assert.equal(observed.host, `127.0.0.1:${new URL(upstream.url).port}`);
-		assert.equal(observed.userAgent, "opencode/1.18.30");
+		assert.equal(observed.userAgent, "opencode/latest/2.0.32/cli");
 		assert.equal(observed.session, "session-123");
 		assert.equal(observed.project, undefined);
 	} finally {

@@ -3,7 +3,6 @@ import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
@@ -21,8 +20,13 @@ import {
 	startProxy,
 } from "../ops/simple-provider-keyless-bridge.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
+import {
+	SECRET,
+	setup,
+	withOpenCodeServer,
+} from "./helpers/keyless-bridge-fixtures.mjs";
 
-const SECRET = "synthetic-real-api-key-bridge-123456";
+const SERVER_URL = /^http:\/\/127\.0\.0\.1:[0-9]+$/u;
 test("proxy request event formatter emits only the bounded safe schema", () => {
 	const line = formatProxyRequestEvent({
 		sequence: 7,
@@ -45,20 +49,6 @@ test("proxy request event formatter emits only the bounded safe schema", () => {
 		/simple-provider-keyless-bridge: invalid proxy request event/u,
 	);
 });
-function setup() {
-	const root = join(
-		realpathSync(tmpdir()),
-		`switchyard-simple-${randomUUID()}`,
-	);
-	const worktree = join(root, "worktree");
-	mkdirSync(join(worktree, ".git"), { recursive: true });
-	writeFileSync(join(root, ".switchyard-cleanup-owner.json"), "{}\n");
-	return {
-		root,
-		worktree,
-		cleanup: () => rmSync(root, { recursive: true, force: true }),
-	};
-}
 async function localServer(handler) {
 	const server = http.createServer(handler);
 	await new Promise((done) => server.listen(0, "127.0.0.1", done));
@@ -268,7 +258,7 @@ test("OpenCode Go failures expose numeric proxy diagnostics without CLI output",
 			fake,
 			`#!/usr/bin/env node
 const cfg = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
-const url = cfg.provider['opencode-go'].options.baseURL + '/chat/completions';
+const url = cfg.providers['opencode-go'].models['deepseek-v4.1-flash'].settings.baseURL + '/chat/completions';
 const request = ${JSON.stringify(scenario.request)};
 const rejectRequest = ${JSON.stringify(scenario.rejectRequest)};
 let responseText = '';
@@ -308,7 +298,7 @@ process.exit(1);
 					worktree: item.worktree,
 					prompt: "synthetic diagnostic prompt",
 					secret: SECRET,
-					cliPath: fake,
+					cliPath: withOpenCodeServer(fake),
 					upstream: upstream.url,
 					timeoutMs: HANG_GUARD_MS,
 				});
@@ -402,7 +392,7 @@ test("Seatbelt child gets nonce and proxy only; host file and alternate network 
 		`#!/usr/bin/env node
 import { writeFileSync, readFileSync, readdirSync } from 'node:fs';
 const cfg = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
-const url = cfg.provider['opencode-go'].options.baseURL + '/chat/completions';
+const url = cfg.providers['opencode-go'].models['deepseek-v4.1-flash'].settings.baseURL + '/chat/completions';
 let readDenied = false; let writeDenied = false; let outsideDenied = false; let homeListDenied = false; let tempListDenied = false;
 try { readFileSync(${JSON.stringify(forbidden)}); } catch { readDenied = true; }
 try { writeFileSync(${JSON.stringify(forbidden)}, 'escape'); } catch { writeDenied = true; }
@@ -423,7 +413,7 @@ process.stdout.write(await response.text());
 			worktree: item.worktree,
 			prompt: "synthetic task",
 			secret: SECRET,
-			cliPath: fake,
+			cliPath: withOpenCodeServer(fake),
 			upstream: upstream.url,
 			timeoutMs: HANG_GUARD_MS,
 		});
@@ -588,25 +578,32 @@ fi
 			worktree: item.worktree,
 			prompt: "synthetic task",
 			secret: SECRET,
-			cliPath: fake,
+			cliPath: withOpenCodeServer(fake),
 			timeoutMs: HANG_GUARD_MS,
 		});
 		assert.equal(opencode.code, 0, opencode.stderr);
+		const argv = readFileSync(join(item.worktree, "provider-argv.txt"), "utf8")
+			.trimEnd()
+			.split("\n");
+		assert.match(argv[2], SERVER_URL);
+		const port = argv[2].split(":").at(-1);
+		assert.deepEqual(argv, [
+			"run",
+			"--server",
+			`http://127.0.0.1:${port}`,
+			"--agent",
+			"build",
+			"--auto",
+			"--title",
+			"switchyard",
+			"--model",
+			"opencode-go/deepseek-v4.1-flash#low",
+		]);
 		assert.deepEqual(
-			readFileSync(join(item.worktree, "provider-argv.txt"), "utf8")
+			readFileSync(join(item.worktree, "serve-argv.txt"), "utf8")
 				.trimEnd()
 				.split("\n"),
-			[
-				"run",
-				"--pure",
-				"--agent",
-				"build",
-				"--auto",
-				"--variant",
-				"low",
-				"--model",
-				"opencode-go/deepseek-v4.1-flash",
-			],
+			["serve", "--hostname", "127.0.0.1", "--port", port],
 		);
 	} finally {
 		item.cleanup();

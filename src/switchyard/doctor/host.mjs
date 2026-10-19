@@ -24,7 +24,6 @@ import {
 import { homedir, tmpdir, userInfo } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { verifyOpenCodeRuntime } from "../../../ops/simple-provider-keyless-bridge.mjs";
 import {
 	quickCheckSandboxProfile,
 	safeEnv,
@@ -39,8 +38,6 @@ const PROBE_TIMEOUT_MS = 15_000;
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 /** The broker the simple lane launches (provider-invocation.mjs). */
 const BWS_BROKER = "/Users/dave/.agent/bin/bws-secret-exec";
-const KEYLESS_BRIDGE_CONSUMER = "switchyard-simple-opencode-go-dispatch";
-const OPENCODE_RUNTIME = "../.tools/opencode-v1.18.30/opencode";
 const CANARY_LABEL = "com.zerodelta.switchyard.sandbox-canary";
 const REAPER_LABEL = "com.zerodelta.switchyard.reaper";
 
@@ -156,7 +153,7 @@ export async function probeProviderClis({
 
 /**
  * Hash each Switchyard broker consumer's executable against its registry
- * pin, and verify the fixed OpenCode runtime beside the keyless bridge.
+ * pin.
  */
 export async function probeBridgePins({ broker = BWS_BROKER } = {}) {
 	if (!existsSync(broker)) return { brokerPresent: false };
@@ -176,20 +173,7 @@ export async function probeBridgePins({ broker = BWS_BROKER } = {}) {
 			executables.map(async (path) => [path, await sha256File(path)]),
 		),
 	);
-	const keyless = consumers.find(
-		(entry) => entry.consumer === KEYLESS_BRIDGE_CONSUMER,
-	);
-	let runtime = null;
-	if (keyless) {
-		const path = resolve(dirname(keyless.executable), OPENCODE_RUNTIME);
-		try {
-			verifyOpenCodeRuntime(path);
-			runtime = { path, ok: true };
-		} catch {
-			runtime = { path, ok: false, reason: "missing or identity mismatch" };
-		}
-	}
-	return { brokerPresent: true, registryPath, consumers, hashes, runtime };
+	return { brokerPresent: true, registryPath, consumers, hashes };
 }
 
 async function loaded(label) {

@@ -160,12 +160,10 @@ export function parseBrokerConsumers(text) {
 }
 
 /**
- * Bridge bytes against the broker's content pins, plus the fixed OpenCode
- * runtime the keyless bridge verifies before launch.
+ * Bridge bytes against the broker's content pins.
  * @param {{brokerPresent: boolean, registryPath?: string|null,
  *   consumers?: {consumer: string, executable: string, sha256: string|null}[],
- *   hashes?: Record<string, string|null>,
- *   runtime?: {path: string, ok: boolean, reason?: string}|null}} probe
+ *   hashes?: Record<string, string|null>}} probe
  */
 export function checkBridgePins(probe) {
 	const id = "bridge-pins";
@@ -189,10 +187,6 @@ export function checkBridgePins(probe) {
 				`${entry.consumer}: live ${live.slice(0, 12)} != pin ${entry.sha256.slice(0, 12)}`,
 			);
 	}
-	if (probe.runtime && !probe.runtime.ok)
-		failures.push(
-			`OpenCode runtime ${probe.runtime.reason ?? "identity mismatch"}`,
-		);
 	const fixes = [];
 	if (failures.some((line) => line.includes("!= pin")))
 		fixes.push(
@@ -201,10 +195,6 @@ export function checkBridgePins(probe) {
 	if (failures.some((line) => line.endsWith(": executable missing")))
 		fixes.push(
 			`owner: remove retired consumers from ${probe.registryPath}, or restore their executables`,
-		);
-	if (probe.runtime && !probe.runtime.ok)
-		fixes.push(
-			`restore the pinned OpenCode 1.18.30 binary at ${probe.runtime.path}`,
 		);
 	if (failures.length > 0)
 		return result(id, STATUS.FAIL, failures.join("; "), fixes);
@@ -217,7 +207,7 @@ export function checkBridgePins(probe) {
 	return result(
 		id,
 		STATUS.OK,
-		`${consumers.length} consumers match their pins${probe.runtime ? "; OpenCode runtime verified" : ""}`,
+		`${consumers.length} consumers match their pins`,
 	);
 }
 

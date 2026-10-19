@@ -52,6 +52,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The `gc` and `reconcile-completion` operator subcommands, with their helpers (`apfs-private-bytes.py`, the external-completion reconciliation modules) and tests. `recover` keeps the shared root-cleanup logic. `remediate-orphaned-locks` and `health attest-repair` stay: each has a live caller or contract.
 - The seam-move and module-split refactor tooling (`check:seams`, `split:module`, their scripts and tests, and the direct `oxc-parser` devDependency).
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
+- The OpenCode Go bridge's fixed-runtime SHA-256 check (`verifyOpenCodeRuntime`), its test, and the matching OpenCode runtime part of `doctor`'s `bridge-pins` check.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
@@ -65,6 +66,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - Receipt renewal moved from the queue to `simple`: after every succeeded `simple` run (work or qualification origin) Switchyard calls `~/.agent/bin/roster renew <run.json> --file <roster>` against the roster it routed from, bounded to 30 seconds with progress on stderr. A renewal failure never changes the run's result or exit status.
 - Test lanes come from a `// @test-phase:` pragma on each test file instead of hand-kept lists in `package.json`, and an untagged file fails both lanes. The serial lane now runs in lexical order.
 - Every `node --test` that the test, validate, contract-gate, coverage, mutation and canary scripts spawn runs under a hermetic environment: `HOME`, `TMPDIR` and the Switchyard state roots point into one per-run scratch directory, so tests no longer read or write the owner's roster or state.
+- The OpenCode Go simple bridge runs Homebrew's OpenCode 2.x (`/opt/homebrew/bin/opencode`) instead of a fixed 1.18.30 copy, so Homebrew upgrades no longer need a bridge change; the CLI contract canary now checks `run` and `serve` flags first. OpenCode 2.x has no in-process run mode, so the bridge starts a password-gated `opencode serve` on one loopback port, waits for that server's own listening line, then runs `opencode run --server`; the Seatbelt profile opens only that port beside the proxy. The approved model's endpoint override now sits on the catalog model, and a fixed `--title` drops the extra title request.
 - Orphaned-lock remediation takes project lock names from the run store instead of keeping its own copy of the hash, so the two can no longer drift apart and leave a stuck lock unfindable.
 - Persist closed, deduplicated route-refusal reasons in caller and durable evidence, distinguishing funding exhaustion from capacity exhaustion.
 
