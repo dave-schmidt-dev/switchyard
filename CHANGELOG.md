@@ -107,6 +107,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The project lock is released before slow cleanup, and a provably dead holder's lock on a terminal run is reclaimed (`project_lock_reclaimed`).
 - Biome now fails on unused imports, variables and function parameters; existing unused imports and exports were removed.
 - Simple routing now separates hard and soft failures. Failed checks, empty diffs, provider errors, provider-phase environment failures and scope rejections move on to the next eligible tier 1 or tier 2 target (up to four attempts per task) instead of stopping the run; baseline, cleanup, cancellation, input, lock and run-store failures still stop. `native_required` reports whether capacity or task failures exhausted the targets, and every answer lists retained partial worktrees.
+- `switchyard-dispatch simple --help` and the README now state that `--deadline` is capped at 30 minutes ahead, that tasks in one project serialize on the project lock (`PROJECT_LOCK_HELD`, even across routing-run IDs), and that `--check` runs through `/bin/sh -lc` except package-tool launches, which run as plain argv.
 
 ### Fixed
 

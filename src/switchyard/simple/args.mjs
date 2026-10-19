@@ -53,6 +53,15 @@ remaining deadline after the acceptance-check reserve and the fixed fit margin.
 Existing p80 routing remains advisory, including the explicit-provider override.
 Caller estimates are unverified; split tasks estimated at 20 minutes or more.
 --origin marks the closed dispatch origin as work (default) or qualification.
+--deadline may be at most 30 minutes ahead (--timeout takes 1 to 30 minutes).
+Tasks in one project run one at a time: the project lock is keyed by the
+canonical project path, not the routing run, so a second simple in that project
+fails at once with PROJECT_LOCK_HELD, even under a different --routing-run-id.
+--check runs through /bin/sh -lc, so shell syntax such as && and pipes works. A
+check that launches a package tool (npx, npm exec --, node_modules/.bin/<tool>,
+a lockfile-declared bin, or any npm/pnpm/yarn/bun command) instead runs as plain
+argv with no shell, from the locked local install; it accepts only letters,
+digits and . _ / @ : + = - and is otherwise refused as check_dependencies_unverified.
 Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
 SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
 for attended recovery. An integration already in progress finishes before the

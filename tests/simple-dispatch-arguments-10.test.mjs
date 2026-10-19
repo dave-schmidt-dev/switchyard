@@ -185,6 +185,22 @@ describe("simple dispatch argument boundary", () => {
 			console.log = originalLog;
 		}
 		ok(printed.includes("switchyard-dispatch simple"));
+		ok(printed.includes("--deadline may be at most 30 minutes ahead"));
+		ok(
+			/PROJECT_LOCK_HELD, even under a different --routing-run-id/u.test(
+				printed.replace(/\s+/gu, " "),
+			),
+		);
+		ok(
+			printed
+				.replace(/\s+/gu, " ")
+				.includes("--check runs through /bin/sh -lc"),
+		);
+		ok(
+			printed
+				.replace(/\s+/gu, " ")
+				.includes("runs as plain argv with no shell"),
+		);
 		strictEqual(resultWrites, 0);
 	});
 	it("runs Codex ephemerally with the workspace-write sandbox", () => {
