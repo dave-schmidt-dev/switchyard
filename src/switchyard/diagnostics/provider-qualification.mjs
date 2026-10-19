@@ -59,11 +59,11 @@ function sanitizeSlot(targetId, target, slot, capability, models) {
 		variant: slot.variant ?? null,
 		descriptor: descriptor ?? null,
 		descriptorIdentity: descriptor?.descriptor_identity ?? null,
-		lane: compatibility.compatible ? "simple" : "vm",
+		lane: compatibility.compatible ? "simple" : null,
 		laneReadiness: compatibility.compatible
 			? "configured_exact_local_adapter"
 			: descriptor
-				? "vm_availability_checked_on_execute"
+				? "simple_adapter_unavailable"
 				: "descriptor_unavailable",
 		adapterReason: compatibility.compatible ? null : compatibility.reason,
 	};
@@ -121,7 +121,7 @@ export function planRepresentativeQualification({
 			reason: "target_and_capability_required",
 		};
 	}
-	if (lane !== undefined && lane !== null && !["simple", "vm"].includes(lane)) {
+	if (lane !== undefined && lane !== null && lane !== "simple") {
 		return {
 			schemaVersion: 1,
 			status: "invalid_request",
@@ -157,17 +157,19 @@ export function planRepresentativeQualification({
 		};
 	}
 	const slot = matches[0];
-	if (lane === "simple" && slot.lane !== "simple") {
+	// The simple lane is the only execution lane; a descriptor without a
+	// local adapter fails closed instead of falling back to another backend.
+	if (slot.descriptor && slot.lane !== "simple") {
 		return {
 			schemaVersion: 1,
 			status: "unavailable",
 			reason: "simple_lane_unavailable",
 			targetId,
 			capability,
+			adapterReason: slot.adapterReason,
 			automaticPromotion: false,
 		};
 	}
-	const forcedVmLane = lane === "vm" && slot.descriptor;
 	return {
 		schemaVersion: 1,
 		status: slot.descriptor ? "ready" : "unavailable",
@@ -184,10 +186,8 @@ export function planRepresentativeQualification({
 		variant: slot.variant,
 		descriptorIdentity: slot.descriptorIdentity,
 		descriptor: slot.descriptor,
-		lane: forcedVmLane ? "vm" : slot.lane,
-		laneReadiness: forcedVmLane
-			? "vm_availability_checked_on_execute"
-			: slot.laneReadiness,
+		lane: slot.lane,
+		laneReadiness: slot.laneReadiness,
 		automaticPromotion: false,
 	};
 }
@@ -303,7 +303,6 @@ export async function runRepresentativeQualification({
 		const reasons = new Set([
 			"fixture_git_setup_failed",
 			"provider_lane_unavailable",
-			"vm_lane_unavailable",
 			"dispatch_failed",
 			"dispatch_cleanup_unconfirmed",
 			"dispatch_output_invalid",

@@ -1,6 +1,5 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
 import {
 	basename,
 	dirname,
@@ -34,30 +33,6 @@ import {
 	remediationCommandFor,
 } from "./recovery-command.mjs";
 
-const RENEWAL_TIMEOUT_MS = 30_000;
-function renewDispatchReceipts(checkpointPath, report) {
-	if (!checkpointPath) return;
-	const cli = resolve(homedir(), ".agent", "bin", "roster");
-	if (!existsSync(cli)) return;
-	const renewal = spawnSync(cli, ["renew", checkpointPath], {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-		timeout: RENEWAL_TIMEOUT_MS,
-	});
-	if (renewal.status !== 0) {
-		const detail = (renewal.stderr || renewal.stdout || "")
-			.trim()
-			.split("\n")
-			.pop();
-		report(
-			`dispatch: receipt renewal skipped (${detail || "roster renew failed"})`,
-		);
-		return;
-	}
-	for (const line of (renewal.stdout || "").trim().split("\n")) {
-		if (line.startsWith("renewed")) report(`dispatch: ${line}`);
-	}
-}
 function captureHostFingerprint(projectPath) {
 	let head = "";
 	let dirty = "unknown";
@@ -253,6 +228,5 @@ export {
 	prepareDispatchDirtyOverlay,
 	prepareRunIdentity,
 	relativeWithin,
-	renewDispatchReceipts,
 	resolveBootstrapPath,
 };

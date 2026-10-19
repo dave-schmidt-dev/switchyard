@@ -115,8 +115,8 @@ export function createQualificationFixture(parentRoot) {
 	git(["config", "user.email", "qualification@localhost"]);
 	git(["add", ...QUALIFICATION_FILES, ACCEPTANCE_FILE]);
 	git(["commit", "--quiet", "-m", "qualification fixture baseline"]);
-	// The VM queue run keeps its run store under <project>/.logs; exclude it
-	// locally so the changed-path scope check sees only the provider's edits.
+	// Exclude <project>/.logs locally so run logs never count as provider
+	// edits in the changed-path scope check.
 	appendFileSync(join(projectPath, ".git", "info", "exclude"), ".logs/\n");
 	const verificationProjectPath = join(parent, "verification-base");
 	const clone = spawnSync(
@@ -144,8 +144,6 @@ export function createQualificationFixture(parentRoot) {
 		baseCommit: git(["rev-parse", "HEAD"]).trim(),
 		baseTree: git(["rev-parse", "HEAD^{tree}"]).trim(),
 		promptPath: join(parent, "task.prompt"),
-		taskPath: join(parent, "TASKS.md"),
-		checkpointPath: join(parent, "checkpoint.json"),
 		acceptancePath: join(projectPath, ACCEPTANCE_FILE),
 		acceptanceSha256: `sha256:${sha(ACCEPTANCE_SOURCE)}`,
 	};

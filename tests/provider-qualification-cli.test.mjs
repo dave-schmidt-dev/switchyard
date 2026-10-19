@@ -1,14 +1,11 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
 	parseQualificationArgs,
 	productionDispatch,
 	spawnBounded,
-	taskMarkdown,
 } from "../scripts/provider-qualification.mjs";
-import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -78,26 +75,7 @@ test("CLI parser requires an explicit bounded deadline and has no implicit execu
 	);
 });
 
-test("CLI parser binds an explicit lane to an explicit target and rejects other values", () => {
-	assert.deepEqual(
-		parseQualificationArgs([
-			"--target",
-			"vibe-code",
-			"--capability",
-			"low",
-			"--lane",
-			"vm",
-		]),
-		{
-			help: false,
-			targetId: "vibe-code",
-			capability: "low",
-			descriptorIdentity: null,
-			lane: "vm",
-			execute: false,
-			deadlineMs: null,
-		},
-	);
+test("CLI parser accepts only the simple lane, bound to an explicit target", () => {
 	assert.equal(
 		parseQualificationArgs([
 			"--target",
@@ -121,8 +99,21 @@ test("CLI parser binds an explicit lane to an explicit target and rejects other 
 			]),
 		/invalid_lane/u,
 	);
+	// The retired VM lane is now just another unknown value.
 	assert.throws(
-		() => parseQualificationArgs(["--lane", "vm"]),
+		() =>
+			parseQualificationArgs([
+				"--target",
+				"vibe-code",
+				"--capability",
+				"low",
+				"--lane",
+				"vm",
+			]),
+		/invalid_lane/u,
+	);
+	assert.throws(
+		() => parseQualificationArgs(["--lane", "simple"]),
 		/target_and_capability_required/u,
 	);
 });
@@ -203,102 +194,26 @@ test("simple CLI production arguments bind one selected provider and preserve on
 	assert.equal(noDescriptor.descriptorIdentity, null);
 });
 
-test("VM CLI dispatch checks lane readiness and binds one synthetic task to its check receipt", async () => {
-	const root = tempDir("provider-qualification-cli-vm-");
-	const fixture = {
-		projectPath: join(root, "project"),
-		taskPath: join(root, "TASKS.md"),
-		checkpointPath: join(root, "checkpoint.json"),
-	};
-	const vmDescriptor = {
-		target_id: "claude-code",
-		model_ref: "fixture/claude/high",
-		selector: "claude-opus-5-5",
-		effort: "high",
-		variant: null,
-		invocation_args: ["--effort", "high"],
-	};
-	vmDescriptor.descriptor_identity = getInvocationDescriptorIdentity(
-		vmDescriptor,
-		"claude",
-	);
-	const vmPlan = {
-		...plan,
-		lane: "vm",
-		targetId: "claude-code",
-		capability: "high",
-		harness: "claude",
-		selector: "claude-opus-5-5",
-		descriptorIdentity: vmDescriptor.descriptor_identity,
-	};
-	const providerResult = {
-		taskId: "1",
-		success: true,
-		result: "success",
-		resolvedTargetId: vmPlan.targetId,
-		descriptorIdentity: vmPlan.descriptorIdentity,
-		invocationDescriptor: vmDescriptor,
-		quickCheckReceipt: { status: "passed", taskId: "1" },
-		cleanupFailed: false,
-		cleanupStage: "index_lock_removed",
-		providerLifecycle: {
-			writerLifecycle: "stopped",
-			terminalStatus: "exited",
-			cleanupStatus: "succeeded",
-			cleanupStage: "index_lock_removed",
-		},
-	};
+test("CLI dispatch fails closed before spawning for a slot without the simple lane", async () => {
 	const calls = [];
-	const receipt = await productionDispatch({
-		plan: vmPlan,
-		fixture,
-		allowedFiles: ["src/summary.mjs", "tests/summary.test.mjs"],
-		deadlineAt,
-		spawnCommand: async (args) => {
-			calls.push(args);
-			return calls.length === 1
-				? { ready: true }
-				: {
-						runId: "vm-run-1",
-						cleanupState: "complete",
-						results: [providerResult],
-					};
-		},
-		readRunRecord: async () => ({
-			cleanupState: "complete",
-			worktree: { state: "removed" },
-		}),
-		projectLockHeld: async () => false,
-	});
-	assert.equal(calls.length, 2);
-	assert.deepEqual(calls[0].slice(1), ["backend-health", "--json"]);
-	const args = calls[1];
-	assert.equal(args[1], "run");
-	assert.equal(args[args.indexOf("--only-provider") + 1], "claude-code");
-	assert.equal(args[args.indexOf("--max-tasks") + 1], "1");
-	assert.ok(args.includes("--qualification-attempt"));
-	assert.equal(receipt.targetId, "claude-code");
-	assert.deepEqual(receipt.invocationDescriptor, vmDescriptor);
-	assert.deepEqual(receipt.quickCheckReceipt, providerResult.quickCheckReceipt);
-	assert.equal(receipt.cleanup.writer.state, "stopped");
-	assert.equal(receipt.cleanup.worktree.state, "removed");
-	assert.equal(receipt.cleanup.projectLock.state, "released");
-	const task = readFileSync(fixture.taskPath, "utf8");
-	assert.match(task, /RequiredCapability:\*\*\s*high/u);
-	assert.match(
-		task,
-		/Quick checks:\*\*\s*node --test tests\/acceptance\.test\.mjs/u,
-	);
-	assert.match(taskMarkdown(vmPlan), /Do not touch any other path/u);
-
 	await assert.rejects(
 		productionDispatch({
-			plan: vmPlan,
-			fixture,
+			plan: {
+				...plan,
+				lane: null,
+				laneReadiness: "simple_adapter_unavailable",
+			},
+			fixture: { projectPath: "/unused", promptPath: "/unused/task.prompt" },
 			allowedFiles: ["src/summary.mjs", "tests/summary.test.mjs"],
 			deadlineAt,
-			spawnCommand: async () => ({ ready: false }),
+			spawnCommand: async (args) => {
+				calls.push(args);
+				return {};
+			},
 		}),
-		(error) => error.code === "vm_lane_unavailable",
+		(error) =>
+			error.code === "provider_lane_unavailable" &&
+			error.providerNeverStarted === true,
 	);
+	assert.deepEqual(calls, []);
 });

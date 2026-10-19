@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -177,16 +176,10 @@ function writeAcceptedOutputs(projectPath, wrong = false) {
 	);
 }
 
-function hash(value) {
-	return createHash("sha256").update(value).digest("hex");
-}
-
 function mockDispatcher(roster, { wrong = false, cleanup = true } = {}) {
 	return async ({ plan, fixture }) => {
 		writeAcceptedOutputs(fixture.projectPath, wrong);
-		const diff = git(fixture.projectPath, "diff", "HEAD", "--binary");
 		git(fixture.projectPath, "add", "-A");
-		const candidateTree = git(fixture.projectPath, "write-tree").trim();
 		const cleanupReceipt = cleanup
 			? {
 					writer: { state: "stopped" },
@@ -200,61 +193,19 @@ function mockDispatcher(roster, { wrong = false, cleanup = true } = {}) {
 				};
 		const descriptor = observedDescriptor(plan, roster);
 		const changedFiles = [...QUALIFICATION_FILES].sort();
-		if (plan.lane === "simple") {
-			return {
-				providerResult: {
-					status: "succeeded",
-					targetId: plan.targetId,
-					descriptorIdentity: descriptor.descriptor_identity,
-					invocationDescriptor: descriptor,
-					checks: [{ index: 1, status: "passed" }],
-					changedFiles,
-				},
+		return {
+			providerResult: {
+				status: "succeeded",
 				targetId: plan.targetId,
 				descriptorIdentity: descriptor.descriptor_identity,
 				invocationDescriptor: descriptor,
-				checkCommands: ["node --test tests/acceptance.test.mjs"],
+				checks: [{ index: 1, status: "passed" }],
 				changedFiles,
-				cleanup: cleanupReceipt,
-			};
-		}
-		git(fixture.projectPath, "add", "-A");
-		const fixedChecks = [["node", "--test", "tests/acceptance.test.mjs"]];
-		const quickCheckReceipt = {
-			version: 1,
-			taskId: "1",
-			attempt: 1,
-			baseTree: git(fixture.projectPath, "rev-parse", "HEAD^{tree}").trim(),
-			diffSha256: hash(diff.endsWith("\n") ? diff : `${diff}\n`),
-			candidateTree,
-			commandSetSha256: hash(
-				JSON.stringify({ setup: null, checks: fixedChecks }),
-			),
-			setup: null,
-			checks: fixedChecks.map((argv, index) => ({
-				index,
-				commandSha256: hash(JSON.stringify(argv)),
-				exitCode: 0,
-				signal: null,
-				timedOut: false,
-				groupCleanup: "complete",
-			})),
-			status: "passed",
-			cleanup: { status: "complete" },
-		};
-		return {
-			providerResult: {
-				success: true,
-				result: "success",
-				resolvedTargetId: plan.targetId,
-				descriptorIdentity: descriptor.descriptor_identity,
-				invocationDescriptor: descriptor,
-				quickCheckReceipt,
 			},
 			targetId: plan.targetId,
 			descriptorIdentity: descriptor.descriptor_identity,
 			invocationDescriptor: descriptor,
-			quickCheckReceipt,
+			checkCommands: ["node --test tests/acceptance.test.mjs"],
 			changedFiles,
 			cleanup: cleanupReceipt,
 		};
@@ -287,12 +238,18 @@ test("offline inventory preserves all seven harnesses, eight targets, and 17 slo
 	);
 	assert.ok(
 		inventory.slots.some(
-			(item) => item.targetId === "claude-code" && item.lane === "vm",
+			(item) =>
+				item.targetId === "claude-code" &&
+				item.lane === null &&
+				item.laneReadiness === "simple_adapter_unavailable",
 		),
 	);
 	assert.ok(
 		inventory.slots.some(
-			(item) => item.targetId === "cursor-pro" && item.lane === "vm",
+			(item) =>
+				item.targetId === "cursor-pro" &&
+				item.lane === null &&
+				item.adapterReason === "local_adapter_unavailable",
 		),
 	);
 });
@@ -300,12 +257,22 @@ test("offline inventory preserves all seven harnesses, eight targets, and 17 slo
 test("synthetic qualification verifies the exact descriptor and contained behavior across every slot", async () => {
 	const roster = fixtureRoster();
 	const inventory = enumerateQualificationTargets(roster);
+	let qualified = 0;
 	for (const slot of inventory.slots) {
 		const plan = planRepresentativeQualification({
 			targetId: slot.targetId,
 			capability: slot.capability,
 			rosterData: roster,
 		});
+		// The simple lane is the only lane; a slot without a local adapter
+		// fails closed at planning instead of reaching a dispatcher.
+		if (slot.lane !== "simple") {
+			assert.equal(plan.status, "unavailable");
+			assert.equal(plan.reason, "simple_lane_unavailable");
+			assert.equal(plan.adapterReason, slot.adapterReason);
+			continue;
+		}
+		qualified += 1;
 		assert.equal(plan.status, "ready", `${slot.targetId}/${slot.capability}`);
 		const result = await runRepresentativeQualification({
 			targetId: slot.targetId,
@@ -326,6 +293,7 @@ test("synthetic qualification verifies the exact descriptor and contained behavi
 		assert.equal(result.verification.cleanupVerified, true);
 		assert.equal(result.promotion, "none");
 	}
+	assert.equal(qualified, 12);
 });
 
 test("behavior failure and unconfirmed cleanup fail closed and retain owned scratch", async () => {
@@ -388,7 +356,7 @@ test("behavior failure and unconfirmed cleanup fail closed and retain owned scra
 	assert.equal(noCleanup.verification.cleanupVerified, false);
 });
 
-test("explicit lane planning forces the VM lane for simple-compatible vibe-code", async () => {
+test("explicit lane planning accepts only the simple lane for simple-compatible vibe-code", async () => {
 	const roster = fixtureRoster();
 	roster.targets["vibe-code"] = {
 		enabled: true,
@@ -412,29 +380,29 @@ test("explicit lane planning forces the VM lane for simple-compatible vibe-code"
 	});
 	assert.equal(automatic.status, "ready");
 	assert.equal(automatic.lane, "simple");
-	const forced = planRepresentativeQualification({
+	const explicit = planRepresentativeQualification({
 		targetId: "vibe-code",
 		capability: "low",
-		lane: "vm",
+		lane: "simple",
 		rosterData: roster,
 	});
-	assert.equal(forced.status, "ready");
-	assert.equal(forced.lane, "vm");
-	assert.equal(forced.laneReadiness, "vm_availability_checked_on_execute");
-	assert.equal(
-		planRepresentativeQualification({
-			targetId: "vibe-code",
-			capability: "low",
-			lane: "bogus",
-			rosterData: roster,
-		}).reason,
-		"invalid_lane",
-	);
-	// Cursor still has no simple adapter, so a simple-lane request is refused.
+	assert.equal(explicit.status, "ready");
+	assert.equal(explicit.lane, "simple");
+	for (const lane of ["vm", "bogus"]) {
+		assert.equal(
+			planRepresentativeQualification({
+				targetId: "vibe-code",
+				capability: "low",
+				lane,
+				rosterData: roster,
+			}).reason,
+			"invalid_lane",
+		);
+	}
+	// Cursor has no simple adapter, so it fails closed with or without a lane.
 	const refused = await runRepresentativeQualification({
 		targetId: "cursor-pro",
 		capability: "high",
-		lane: "simple",
 		rosterData: roster,
 		dispatch: () => {
 			throw new Error("dispatch_must_not_run");
@@ -443,6 +411,7 @@ test("explicit lane planning forces the VM lane for simple-compatible vibe-code"
 	});
 	assert.equal(refused.status, "unavailable");
 	assert.equal(refused.reason, "simple_lane_unavailable");
+	assert.equal(refused.plan.adapterReason, "local_adapter_unavailable");
 });
 
 test("golden image verified providers include vibe-code after vibe", () => {

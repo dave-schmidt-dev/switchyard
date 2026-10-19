@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -9,16 +8,12 @@ import {
 	planRepresentativeQualification,
 	runRepresentativeQualification,
 } from "../src/switchyard/diagnostics/provider-qualification.mjs";
-import { vmRunCleanupProven } from "../src/switchyard/diagnostics/provider-qualification-vm-cleanup.mjs";
-import {
-	isProjectLockHeld,
-	readRun,
-} from "../src/switchyard/run-store/index.mjs";
+import { readRun } from "../src/switchyard/run-store/index.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DISPATCH = join(ROOT, "src/switchyard/dispatch/index.mjs");
 const USAGE =
-	"Usage: node scripts/provider-qualification.mjs [--target ID --capability low|standard|high [--descriptor sha256:...] [--lane simple|vm]] [--execute] [--deadline RFC3339]";
+	"Usage: node scripts/provider-qualification.mjs [--target ID --capability low|standard|high [--descriptor sha256:...] [--lane simple]] [--execute] [--deadline RFC3339]";
 export function parseQualificationArgs(argv) {
 	let parsed;
 	try {
@@ -53,7 +48,7 @@ export function parseQualificationArgs(argv) {
 	) {
 		throw new Error("target_and_capability_required");
 	}
-	if (parsed.values.lane && !["simple", "vm"].includes(parsed.values.lane)) {
+	if (parsed.values.lane && parsed.values.lane !== "simple") {
 		throw new Error("invalid_lane");
 	}
 	if (
@@ -183,7 +178,7 @@ export function spawnBounded(args, { timeoutMs, onProgress = () => {} }) {
 				}),
 			);
 		});
-		child.once("close", async (code, signal) => {
+		child.once("close", async (code) => {
 			closed = true;
 			clearInterval(progress);
 			clearTimeout(timer);
@@ -225,12 +220,9 @@ export function spawnBounded(args, { timeoutMs, onProgress = () => {} }) {
 			}
 			if (code !== 0 && !stdout.trim()) {
 				rejectPromise(
-					Object.assign(
-						new Error(signal ? "dispatch_failed" : "vm_lane_unavailable"),
-						{
-							code: signal ? "dispatch_failed" : "vm_lane_unavailable",
-						},
-					),
+					Object.assign(new Error("dispatch_failed"), {
+						code: "dispatch_failed",
+					}),
 				);
 				return;
 			}
@@ -246,62 +238,6 @@ export function spawnBounded(args, { timeoutMs, onProgress = () => {} }) {
 		});
 	});
 }
-export function taskMarkdown(plan) {
-	const justification =
-		plan.capability === "standard"
-			? ""
-			: "\n- **RequiredCapabilityJustification:** This synthetic one-file behavior change is used to verify the exact configured " +
-				plan.capability +
-				" descriptor in an isolated disposable project.";
-	return [
-		"# Provider qualification fixture",
-		"",
-		"## Pending",
-		"",
-		"### Task 1: Implement the series summary fixture",
-		"- **Status:** pending",
-		"- **Type:** implementation",
-		"- **Executor:** switchyard",
-		"- **Files:** src/summary.mjs, tests/summary.test.mjs",
-		`- **RequiredCapability:** ${plan.capability}`,
-		"- **Quick checks:** node --test tests/acceptance.test.mjs",
-		"- **Description:** " +
-			"Implement summarize(values) in src/summary.mjs and replace the placeholder tests in tests/summary.test.mjs. " +
-			"Both files must be edited with file tools. Count and sum finite numeric values; average is total/count or null when empty. " +
-			"Reject non-array input with TypeError and ignore non-number, NaN, and infinite values. Do not touch any other path. " +
-			"The independent acceptance test covers normal, empty, filtered, and invalid input cases.",
-		justification,
-		"",
-	].join("\n");
-}
-function taskResult(report) {
-	if (Array.isArray(report?.results)) {
-		return (
-			report.results.find((item) => item?.taskId === "1") ??
-			report.results[0] ??
-			null
-		);
-	}
-	return report;
-}
-/**
- * `dispatch run --json` prints a run-status envelope, not per-task results. The
- * task's own result is durable in the run checkpoint, so read it from there and
- * fall back to the report only when it carries `results` itself.
- */
-export function vmTaskResult(report, checkpointPath) {
-	if (Array.isArray(report?.results)) return taskResult(report);
-	try {
-		const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
-		const results = Array.isArray(checkpoint?.results)
-			? checkpoint.results
-			: [];
-		const entry = results.find((item) => item?.taskId === "1") ?? null;
-		return entry ? { ...entry, runId: report?.runId } : null;
-	} catch {
-		return null;
-	}
-}
 export async function productionDispatch({
 	plan,
 	fixture,
@@ -310,7 +246,6 @@ export async function productionDispatch({
 	onProgress,
 	spawnCommand = spawnBounded,
 	readRunRecord = readRun,
-	projectLockHeld = isProjectLockHeld,
 }) {
 	const remaining = Date.parse(deadlineAt) - Date.now();
 	if (!Number.isFinite(remaining) || remaining <= 0) {
@@ -319,138 +254,63 @@ export async function productionDispatch({
 			providerNeverStarted: true,
 		});
 	}
-	if (plan.lane === "simple") {
-		const args = [
-			DISPATCH,
-			"simple",
-			fixture.promptPath,
-			"--project",
-			fixture.projectPath,
-			"--capability",
-			plan.capability,
-			"--file",
-			allowedFiles[0],
-			"--file",
-			allowedFiles[1],
-			"--only-provider",
-			plan.targetId,
-			"--check",
-			"node --test tests/acceptance.test.mjs",
-			"--origin",
-			"qualification",
-			"--deadline",
-			deadlineAt,
-			"--json",
-		];
-		const providerResult = await spawnCommand(args, {
-			timeoutMs: remaining,
-			onProgress,
-		});
-		let runRecord = null;
-		try {
-			runRecord = await readRunRecord(providerResult.runId);
-		} catch {
-			// Missing route or cleanup state fails closed below.
-		}
-		const routeTarget = runRecord?.resolvedTargetId ?? null;
-		const routeModel = runRecord?.activeTaskModel ?? null;
-		return {
-			providerResult,
-			targetId: routeTarget,
-			routeModel,
-			descriptorIdentity:
-				providerResult.descriptorIdentity ??
-				runRecord?.descriptorIdentity ??
-				null,
-			invocationDescriptor:
-				providerResult.invocationDescriptor ??
-				providerResult.invocation_descriptor ??
-				runRecord?.invocationDescriptor ??
-				null,
-			checkCommands: ["node --test tests/acceptance.test.mjs"],
-			checks: providerResult.checks,
-			changedFiles: providerResult.changedFiles,
-			cleanup: providerResult.recovery?.cleanup,
-		};
-	}
-	if (plan.lane !== "vm") {
+	if (plan.lane !== "simple") {
 		throw Object.assign(new Error("provider_lane_unavailable"), {
 			code: "provider_lane_unavailable",
 			providerNeverStarted: true,
 		});
 	}
-	const health = await spawnCommand([DISPATCH, "backend-health", "--json"], {
-		timeoutMs: Math.min(30_000, remaining),
-		onProgress,
-	});
-	if (health?.ready !== true) {
-		throw Object.assign(new Error("vm_lane_unavailable"), {
-			code: "vm_lane_unavailable",
-			providerNeverStarted: true,
-		});
-	}
-	writeFileSync(fixture.taskPath, taskMarkdown(plan), {
-		mode: 0o600,
-		flag: "wx",
-	});
 	const args = [
 		DISPATCH,
-		"run",
-		fixture.taskPath,
+		"simple",
+		fixture.promptPath,
 		"--project",
 		fixture.projectPath,
-		"--max-tasks",
-		"1",
-		"--checkpoint",
-		fixture.checkpointPath,
+		"--capability",
+		plan.capability,
+		"--file",
+		allowedFiles[0],
+		"--file",
+		allowedFiles[1],
 		"--only-provider",
 		plan.targetId,
-		"--task-id",
-		"1",
-		"--qualification-attempt",
+		"--check",
+		"node --test tests/acceptance.test.mjs",
+		"--origin",
+		"qualification",
+		"--deadline",
+		deadlineAt,
 		"--json",
 	];
-	const report = await spawnCommand(args, { timeoutMs: remaining, onProgress });
-	const providerResult = vmTaskResult(report, fixture.checkpointPath);
+	const providerResult = await spawnCommand(args, {
+		timeoutMs: remaining,
+		onProgress,
+	});
 	let runRecord = null;
-	if (typeof report?.runId === "string") {
-		try {
-			runRecord = await readRunRecord(report.runId);
-		} catch {
-			// Workspace removal is unverified when its durable run record is absent.
-		}
-	}
-	let projectLockReleased = false;
 	try {
-		projectLockReleased = !(await projectLockHeld(fixture.projectPath));
+		runRecord = await readRunRecord(providerResult.runId);
 	} catch {
-		projectLockReleased = false;
+		// Missing route or cleanup state fails closed below.
 	}
-	const durableVmClean = vmRunCleanupProven(report, fixture.projectPath);
-	const vmClean =
-		durableVmClean ||
-		(providerResult?.cleanupFailed === false &&
-			providerResult?.cleanupStage === "index_lock_removed" &&
-			providerResult?.providerLifecycle?.writerLifecycle === "stopped" &&
-			providerResult?.providerLifecycle?.terminalStatus === "exited" &&
-			providerResult?.providerLifecycle?.cleanupStatus === "succeeded" &&
-			providerResult?.providerLifecycle?.cleanupStage === "index_lock_removed");
-	const queueWorkspaceRemoved =
-		durableVmClean ||
-		(report?.cleanupState === "complete" &&
-			runRecord?.cleanupState === "complete" &&
-			runRecord?.worktree?.state === "removed");
+	const routeTarget = runRecord?.resolvedTargetId ?? null;
+	const routeModel = runRecord?.activeTaskModel ?? null;
 	return {
-		providerResult: { ...providerResult, projectLockReleased },
-		targetId: providerResult?.resolvedTargetId ?? null,
-		descriptorIdentity: providerResult?.descriptorIdentity ?? null,
-		invocationDescriptor: providerResult?.invocationDescriptor ?? null,
-		quickCheckReceipt: providerResult?.quickCheckReceipt ?? null,
-		cleanup: {
-			writer: { state: vmClean ? "stopped" : "unavailable" },
-			worktree: { state: queueWorkspaceRemoved ? "removed" : "unavailable" },
-			projectLock: { state: projectLockReleased ? "released" : "unavailable" },
-		},
+		providerResult,
+		targetId: routeTarget,
+		routeModel,
+		descriptorIdentity:
+			providerResult.descriptorIdentity ??
+			runRecord?.descriptorIdentity ??
+			null,
+		invocationDescriptor:
+			providerResult.invocationDescriptor ??
+			providerResult.invocation_descriptor ??
+			runRecord?.invocationDescriptor ??
+			null,
+		checkCommands: ["node --test tests/acceptance.test.mjs"],
+		checks: providerResult.checks,
+		changedFiles: providerResult.changedFiles,
+		cleanup: providerResult.recovery?.cleanup,
 	};
 }
 async function main() {
