@@ -16,6 +16,7 @@ import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../src/switchyard/runner/checks-sandbox.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
@@ -42,7 +43,7 @@ function runConfined(script, readOnlyPaths = []) {
 			cwd: clone,
 			env: safeEnv(runtime),
 			encoding: "utf8",
-			timeout: 20_000,
+			timeout: HANG_GUARD_MS,
 		},
 	);
 	strictEqual(result.status, 0, result.stderr);
@@ -81,7 +82,7 @@ import(${JSON.stringify(pathToFileURL(modulePath).href)}).then(
 	}, () => {
 		const report = runConfined(`
 const { spawn } = require("node:child_process");
-const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { detached: true, stdio: "ignore" });
+const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, ${HANG_GUARD_MS})"], { detached: true, stdio: "ignore" });
 const attempt = (pid, signal) => { try { process.kill(pid, signal); return "ok"; } catch (error) { return error.code; } };
 setTimeout(() => {
 	const probe = attempt(-child.pid, 0);

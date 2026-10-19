@@ -12,6 +12,7 @@ import {
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { notifyLocal, runCanaryCli } from "../scripts/sandbox-canary-daily.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const OPS = resolve(import.meta.dirname, "../ops");
@@ -19,6 +20,11 @@ const INSTALLER = join(OPS, "install-sandbox-canary.sh");
 const UNINSTALLER = join(OPS, "uninstall-sandbox-canary.sh");
 const LABEL = "com.zerodelta.switchyard.sandbox-canary";
 const SHA = "a".repeat(40);
+// Healthy commands get the installer's largest accepted per-command bound;
+// cases that expect a timeout pass "1" explicitly. The outer guard stays above
+// it so the installer, not the test, reports a hung command.
+const COMMAND_BOUND_SECONDS = String(HANG_GUARD_MS / 1000);
+const OUTER_GUARD_MS = 2 * HANG_GUARD_MS;
 function setup() {
 	const root = tempDir("sy-canary-install-");
 	const home = join(root, "home");
@@ -68,7 +74,7 @@ case "$1" in
 	script(
 		"launchctl",
 		`printf '%s\\n' "$*" >> "$CALLS"
-if [ "$1" = "\${HANG_COMMAND:-never}" ]; then printf ready > "$READY"; exec /bin/sleep 30; fi
+if [ "$1" = "\${HANG_COMMAND:-never}" ]; then printf ready > "$READY"; exec /bin/sleep 300; fi
 if [ "$1" = "\${FAIL_COMMAND:-never}" ]; then exit 1; fi
 if [ "$1" = print ]; then
  case "\${PRINT_STATE:-loaded}" in
@@ -91,7 +97,7 @@ exit 0`,
 		PATH: `${bin}:/usr/bin:/bin`,
 		NODE_BIN: process.execPath,
 		SWITCHYARD_CANARY_REV: SHA,
-		SWITCHYARD_CANARY_INSTALL_TIMEOUT_SECONDS: "2",
+		SWITCHYARD_CANARY_INSTALL_TIMEOUT_SECONDS: COMMAND_BOUND_SECONDS,
 		CALLS: calls,
 		ACCEPTED_SHA: SHA,
 		ACCEPTED_SOURCE: source,
@@ -101,7 +107,7 @@ exit 0`,
 		spawnSync("/bin/sh", [script], {
 			env: { ...env, ...extra },
 			encoding: "utf8",
-			timeout: 20000,
+			timeout: OUTER_GUARD_MS,
 		});
 	const clean = () => rmSync(root, { recursive: true, force: true });
 	const leftovers = () =>
@@ -207,7 +213,7 @@ describe("sandbox canary synthetic installation", () => {
 				SWITCHYARD_CANARY_INSTALL_TIMEOUT_SECONDS: "1",
 			});
 			strictEqual(result.status, 1, result.stderr);
-			ok(Date.now() - start < 10000);
+			ok(Date.now() - start < HANG_GUARD_MS);
 			ok(existsSync(join(f.install, "previous-marker")));
 			deepStrictEqual(f.leftovers(), []);
 		} finally {
@@ -228,7 +234,7 @@ describe("sandbox canary synthetic installation", () => {
 			const ended = new Promise((resolve) =>
 				child.on("exit", (code, signal) => resolve({ code, signal })),
 			);
-			const deadline = Date.now() + 10000;
+			const deadline = Date.now() + HANG_GUARD_MS;
 			while (!existsSync(f.env.READY) && Date.now() < deadline)
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			ok(existsSync(f.env.READY));
@@ -506,11 +512,11 @@ it("keeps default supervisor output captured without forwarding", () => {
 	).href;
 	const childCode =
 		"process.stdout.write('captured-out');process.stderr.write('captured-err')";
-	const driver = `import {supervisedSpawn} from ${JSON.stringify(moduleUrl)};process.stdout.write(JSON.stringify(supervisedSpawn(process.execPath,["-e",${JSON.stringify(childCode)}],{timeout:1000})))`;
+	const driver = `import {supervisedSpawn} from ${JSON.stringify(moduleUrl)};process.stdout.write(JSON.stringify(supervisedSpawn(process.execPath,["-e",${JSON.stringify(childCode)}],{timeout:${HANG_GUARD_MS}})))`;
 	const result = spawnSync(
 		process.execPath,
 		["--input-type=module", "-e", driver],
-		{ encoding: "utf8", timeout: 4000 },
+		{ encoding: "utf8", timeout: OUTER_GUARD_MS },
 	);
 	strictEqual(result.status, 0, result.stderr);
 	strictEqual(result.stderr, "");
@@ -527,9 +533,9 @@ it("forwards supervisor output live and emits fixed progress while retaining cap
 	).href;
 	const childCode =
 		"process.stdout.write('live-out');process.stderr.write('live-err');setTimeout(()=>{},5200)";
-	const driver = `import {supervisedSpawn} from ${JSON.stringify(moduleUrl)};process.stdout.write(JSON.stringify(supervisedSpawn(process.execPath,["-e",${JSON.stringify(childCode)}],{timeout:8000,forwardOutput:true,progressLabel:"strict gate running"})))`;
+	const driver = `import {supervisedSpawn} from ${JSON.stringify(moduleUrl)};process.stdout.write(JSON.stringify(supervisedSpawn(process.execPath,["-e",${JSON.stringify(childCode)}],{timeout:${HANG_GUARD_MS},forwardOutput:true,progressLabel:"strict gate running"})))`;
 	const child = spawn(process.execPath, ["--input-type=module", "-e", driver], {
-		timeout: 12000,
+		timeout: OUTER_GUARD_MS,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	let stdout = "",

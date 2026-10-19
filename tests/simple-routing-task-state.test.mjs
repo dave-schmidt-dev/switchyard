@@ -23,6 +23,7 @@ import {
 } from "../src/switchyard/simple/routing-state.mjs";
 import { acquireRoutingFileLock } from "../src/switchyard/simple/routing-state-storage.mjs";
 import { beginRoutingTaskBinding } from "../src/switchyard/simple/routing-task-state.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const setup = () => ({
@@ -83,7 +84,7 @@ function routingLockReplacementProbe(scenario) {
 			const contender = spawnSync(
 				process.execPath,
 				["--input-type=module", "-e", contenderScript],
-				{ cwd: process.cwd(), encoding: "utf8", timeout: 3_000 },
+				{ cwd: process.cwd(), encoding: "utf8", timeout: ${HANG_GUARD_MS} },
 			);
 			contenderCode = contender.stdout.trim();
 		};
@@ -175,7 +176,7 @@ function routingLockReplacementProbe(scenario) {
 		const child = spawnSync(
 			process.execPath,
 			["--input-type=module", "-e", script],
-			{ cwd: process.cwd(), encoding: "utf8", timeout: 5_000 },
+			{ cwd: process.cwd(), encoding: "utf8", timeout: 2 * HANG_GUARD_MS },
 		);
 		if (child.error) throw child.error;
 		strictEqual(child.status, 0, child.stderr);
