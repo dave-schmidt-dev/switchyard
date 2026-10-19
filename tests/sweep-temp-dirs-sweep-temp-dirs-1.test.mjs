@@ -18,12 +18,14 @@ import {
 	DEFAULT_MAX_AGE_DAYS,
 	inspectTree,
 	isSweepAuthorized,
+	listHeldPathsViaLsof as listSweepHeldPaths,
 	parseLsofResult,
 	parseSweepArgs,
 	SIMPLE_ORPHAN_TTL_MS,
 	sweepSimpleOrphans,
 	sweepTempDirs,
 } from "../scripts/sweep-temp-dirs.mjs";
+import { fakeSpawnSyncLsof } from "./helpers/fake-lsof.mjs";
 import { tempDir, tempDirIn } from "./helpers/tempdir.mjs";
 
 const DAY = 86_400_000;
@@ -349,7 +351,7 @@ describe("sweep-temp-dirs", () => {
 		});
 		deepStrictEqual(result, ["/private/tmp/held"]);
 		strictEqual(invocation.command, "/usr/sbin/lsof");
-		deepStrictEqual(invocation.args, ["-Fn"]);
+		deepStrictEqual(invocation.args, ["-nP", "-Fn"]);
 		strictEqual(invocation.options.timeout, 30_000);
 		strictEqual(invocation.options.killSignal, "SIGKILL");
 		strictEqual(Number.isFinite(invocation.options.maxBuffer), true);
@@ -362,6 +364,14 @@ describe("sweep-temp-dirs", () => {
 			listHeldPathsViaLsof(() => ({ error: { code: "ETIMEDOUT" } })),
 			null,
 		);
+	});
+	it("keeps the broad sweep's lsof out of name resolution", () => {
+		const calls = [];
+		const held = listSweepHeldPaths(
+			fakeSpawnSyncLsof("p1\nn/private/tmp/held\n", calls),
+		);
+		deepStrictEqual(held, ["/private/tmp/held"]);
+		deepStrictEqual(calls[0].args, ["-nP", "-Fn"]);
 	});
 	it("authorizes only prefixed direct children of the swept directory", () => {
 		// The last check before `rm -rf`, and redundant with the filter applied

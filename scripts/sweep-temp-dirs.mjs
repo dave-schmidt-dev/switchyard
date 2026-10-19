@@ -98,13 +98,15 @@ export function parseLsofResult(result) {
 /**
  * Every absolute path some live process currently holds open, or `null` when
  * that cannot be established completely.
+ * @param {typeof spawnSync} [run]
  * @returns {string[] | null}
  */
-export function listHeldPathsViaLsof() {
+export function listHeldPathsViaLsof(run = spawnSync) {
 	// Deliberately no `-w`: suppressing lsof's warnings would suppress the
-	// evidence that its listing is incomplete.
+	// evidence that its listing is incomplete. `-nP` skips reverse DNS and port
+	// lookups, which alone took a 0.2 s scan to 30.5 s on 2026-10-18.
 	return parseLsofResult(
-		spawnSync("lsof", ["-Fn"], {
+		run("lsof", ["-nP", "-Fn"], {
 			encoding: "utf8",
 			maxBuffer: 512 * 1024 * 1024,
 		}),

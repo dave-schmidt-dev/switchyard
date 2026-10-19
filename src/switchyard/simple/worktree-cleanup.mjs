@@ -157,12 +157,28 @@ function command(
 	});
 }
 
+/**
+ * Host-wide open-handle scan for exact recorded roots; incomplete fails closed.
+ *
+ * `-n` and `-P` keep the scan independent of name services: without `-n`,
+ * lsof reverse-resolves every socket, and on 2026-10-18 that alone stretched
+ * a 0.2 s host-wide scan to 30.5 s, past every bound that consumes it.
+ * @param {string[]} paths
+ * @param {(phase: string) => void} [onStatus]
+ * @param {{spawnFn?: typeof spawn, timeoutMs?: number}} [options]
+ * @returns {Promise<{complete: boolean, openPaths: string[]}>}
+ */
 export async function scanSimpleWorktreeOpenHandles(
 	paths,
 	onStatus = () => {},
+	{ spawnFn = spawn, timeoutMs = 20_000 } = {},
 ) {
 	onStatus("cleanup_scan_started");
-	const scan = await command("/usr/sbin/lsof", ["-nP", "-Fn"], { onStatus });
+	const scan = await command("/usr/sbin/lsof", ["-nP", "-Fn"], {
+		onStatus,
+		spawnFn,
+		timeoutMs,
+	});
 	if (!scan.ok) return { complete: false, openPaths: [] };
 	const openPaths = new Set();
 	for (const line of scan.output.split("\n")) {
@@ -181,8 +197,12 @@ export async function scanSimpleWorktreeOpenHandles(
 	return { complete: true, openPaths: [...openPaths] };
 }
 
-async function noOpenHandles(path, onStatus) {
-	const scan = await scanSimpleWorktreeOpenHandles([path], onStatus);
+async function noOpenHandles(path, onStatus, scanOptions) {
+	const scan = await scanSimpleWorktreeOpenHandles(
+		[path],
+		onStatus,
+		scanOptions,
+	);
 	return scan.complete && scan.openPaths.length === 0;
 }
 
@@ -239,7 +259,12 @@ export async function cleanupSimpleWorktree(
 			throw new Error("recorded root missing");
 		}
 		proveRoot(path, claim, runId);
-		if (!(await noOpenHandles(path, onStatus)))
+		// Undefined seams fall back to the scan's own defaults.
+		const scanOptions = {
+			spawnFn: dependencies.spawnFn,
+			timeoutMs: dependencies.scanTimeoutMs,
+		};
+		if (!(await noOpenHandles(path, onStatus, scanOptions)))
 			return retained("open_handles_or_scan_unavailable");
 		if (postQuarantineCheck && !(await postQuarantineCheck(path)))
 			return retained("recently_modified_or_unavailable");

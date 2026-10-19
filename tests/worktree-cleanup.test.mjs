@@ -20,8 +20,15 @@ import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
 	cleanupSimpleWorktree,
+	scanSimpleWorktreeOpenHandles,
 	simpleQuarantinePath,
 } from "../src/switchyard/simple/worktree-cleanup.mjs";
+import {
+	fakeSpawnLsof,
+	lsofResolvesNames,
+	NAME_RESOLUTION_STALL_MS,
+} from "./helpers/fake-lsof.mjs";
+import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 
 const TEST_PARENT = "/private/tmp";
 const MARKER_NAME = ".switchyard-cleanup-owner.json";
@@ -404,5 +411,91 @@ print(len(final_rmdir_attempts), os.path.exists(marker))
 		const retried = runHelper(helperInput(root, identity, runId, nonce));
 		strictEqual(retried.status, 0, retried.stderr);
 		strictEqual(existsSync(root), false);
+	});
+});
+
+// Regression (S12, 2026-10-18): host-wide lsof without `-n` took 30.5 s on
+// reverse DNS. The fake stalls the same way, so a scan that drops `-n` is
+// killed at its bound and retains the worktree instead of removing it.
+describe("open-handle scan under a stalled name service", {
+	skip: process.platform !== "darwin",
+}, () => {
+	it("keeps the host-wide scan out of name resolution", async () => {
+		// The model has to tell the old argv from the fixed one, or this test
+		// could not fail: `-Fn` selects the name field and does not set `-n`.
+		strictEqual(lsofResolvesNames(["-Fn"]), true);
+		strictEqual(lsofResolvesNames(["-nP", "-Fn"]), false);
+		const calls = [];
+		const stdout = "p1\nn/private/tmp/held-root/file\nn*:443\n";
+		const scan = await scanSimpleWorktreeOpenHandles(
+			["/private/tmp/held-root", "/private/tmp/free-root"],
+			() => {},
+			{ spawnFn: fakeSpawnLsof({ stdout, calls }), timeoutMs: HANG_GUARD_MS },
+		);
+		deepStrictEqual(scan, {
+			complete: true,
+			openPaths: ["/private/tmp/held-root"],
+		});
+		deepStrictEqual(calls[0]?.args, ["-nP", "-Fn"]);
+	});
+
+	it("fails closed when the scan outlives its bound", async () => {
+		// Positive control: the same fake, stalled whatever the flags, is killed
+		// at the bound and reads as unavailable, never as no holders.
+		const started = Date.now();
+		const scan = await scanSimpleWorktreeOpenHandles(
+			["/private/tmp/any-root"],
+			() => {},
+			{ spawnFn: fakeSpawnLsof({ stallAlways: true }), timeoutMs: 250 },
+		);
+		deepStrictEqual(scan, { complete: false, openPaths: [] });
+		ok(Date.now() - started < NAME_RESOLUTION_STALL_MS);
+	});
+
+	it("removes a stopped root while names stall, and still honors a holder", async () => {
+		const runId = `cleanup-stalled-dns-${randomUUID()}`;
+		const nonce = randomUUID();
+		const root = newFixturePath();
+		const quarantine = simpleQuarantinePath(nonce);
+		createdPaths.add(quarantine);
+		const identity = createCandidate(root, runId, nonce);
+		writeFileSync(join(root, "artifact.txt"), "owned", { mode: 0o600 });
+		const claim = {
+			canonicalParent: TEST_PARENT,
+			candidateChild: root.slice(TEST_PARENT.length + 1),
+			path: root,
+			device: identity.dev.toString(),
+			inode: identity.ino.toString(),
+			nonce,
+		};
+		// Wiring control: a holder the fake reports retains the quarantine.
+		const holder = `p1\nn${quarantine}/artifact.txt\n`;
+		const held = await cleanupSimpleWorktree(
+			runId,
+			claim,
+			{ writerStopped: true },
+			{
+				spawnFn: fakeSpawnLsof({ stdout: holder }),
+				scanTimeoutMs: HANG_GUARD_MS,
+			},
+		);
+		deepStrictEqual(held, {
+			removed: false,
+			path: quarantine,
+			reason: "open_handles_or_scan_unavailable",
+		});
+		const calls = [];
+		const removed = await cleanupSimpleWorktree(
+			runId,
+			{ ...claim, candidateChild: basename(quarantine), path: quarantine },
+			{ writerStopped: true },
+			{
+				spawnFn: fakeSpawnLsof({ stdout: "p1\nn*:443\n", calls }),
+				scanTimeoutMs: HANG_GUARD_MS,
+			},
+		);
+		deepStrictEqual(removed, { removed: true, path: quarantine, reason: null });
+		strictEqual(existsSync(quarantine), false);
+		deepStrictEqual(calls[0]?.args, ["-nP", "-Fn"]);
 	});
 });

@@ -67,8 +67,10 @@ function parseLsofResult(result) {
 	return held;
 }
 export function listHeldPathsViaLsof(run = spawnSync) {
+	// `-nP` skips reverse DNS and port lookups. Without it, a 0.2 s host-wide
+	// scan took 30.5 s on 2026-10-18 and this bound refused every collection.
 	return parseLsofResult(
-		run("/usr/sbin/lsof", ["-Fn"], {
+		run("/usr/sbin/lsof", ["-nP", "-Fn"], {
 			encoding: "utf8",
 			timeout: LSOF_TIMEOUT_MS,
 			killSignal: "SIGKILL",

@@ -15,11 +15,15 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { describe, it } from "node:test";
+import { listHeldPathsViaLsof } from "../scripts/simple-orphan-collector.mjs";
+import { LSOF_TIMEOUT_MS } from "../scripts/simple-orphan-collector-scan.mjs";
 import {
+	parseLsofResult,
 	parseSweepArgs,
 	SIMPLE_ORPHAN_TTL_MS,
 	sweepSimpleOrphans,
 } from "../scripts/sweep-temp-dirs.mjs";
+import { fakeSpawnSyncLsof } from "./helpers/fake-lsof.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const DAY = 86_400_000;
@@ -285,6 +289,39 @@ describe("sweep-temp-dirs", () => {
 			[1, 1, 0],
 		);
 		ok(existsSync(fresh.root) && existsSync(held.root));
+	});
+	// Regression (S12, 2026-10-18): the collector's lsof lacked `-n`, so
+	// reverse DNS stretched it to 30.5 s, past its 30 s bound, and every
+	// collection was refused. The fake stalls the same way.
+	it("collects while host name resolution stalls past the lsof bound", async () => {
+		const parent = tempDir("switchyard-simple-orphan-stalled-dns-");
+		const stateRoot = makeRunStore(parent);
+		const held = makeSimpleRoot(parent, "66666666-7777-4888-8999-aaaaaaaaaaaa");
+		makeSimpleRoot(parent, "77777777-8888-4999-8aaa-bbbbbbbbbbbb");
+		const stdout = `p1\nn${realpathSync(held.root)}/payload.txt\nn*:443\n`;
+		const calls = [];
+		const { status, summary } = await collectSimple(parent, stateRoot, {
+			listHeldPaths: () =>
+				listHeldPathsViaLsof(fakeSpawnSyncLsof(stdout, calls)),
+		});
+		deepStrictEqual(
+			[status, summary.skippedHeld, summary.wouldRemove],
+			[0, 1, 1],
+		);
+		deepStrictEqual(calls[0].args, ["-nP", "-Fn"]);
+		// Positive control: the pre-fix argv under the same bound is killed, and
+		// the collector refuses rather than treating the root as unheld.
+		const stalled = fakeSpawnSyncLsof(stdout)("/usr/sbin/lsof", ["-Fn"], {
+			timeout: LSOF_TIMEOUT_MS,
+			killSignal: "SIGKILL",
+		});
+		const messages = [];
+		const refused = await collectSimple(parent, stateRoot, {
+			listHeldPaths: () => parseLsofResult(stalled),
+			log: (message) => messages.push(message),
+		});
+		strictEqual(refused.status, 1);
+		ok(messages.some((message) => message.includes("lsof unavailable")));
 	});
 	it("fails closed for corrupt relevant records and skips malformed markers", async () => {
 		const parent = tempDir("switchyard-simple-orphan-evidence-");
