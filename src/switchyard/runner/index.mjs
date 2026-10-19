@@ -1,12 +1,10 @@
-import { join } from "node:path";
 import { reportCheckpointReleaseFailure } from "./checkpoint-load.mjs";
 import { CHECKPOINT_VERSION } from "./constants.mjs";
 import { runQueueAsyncImpl } from "./run-queue-async-impl.mjs";
-import { runQueueImpl } from "./run-queue-impl.mjs";
 
 export { createBrokerAdapterLauncher } from "./broker.mjs";
 export { invalidCompletedQuickCheckTaskIds } from "./checks.mjs";
-export { executeTask, executeTaskAsync } from "./execute-task.mjs";
+export { executeTaskAsync } from "./execute-task.mjs";
 export { DEFAULT_ADAPTERS } from "./halts.mjs";
 export { emitStageOutcome, prepareOutcomeWriter } from "./outcome-writer.mjs";
 export { createQueueBackend } from "./queue-backend.mjs";
@@ -25,29 +23,6 @@ export async function runQueueAsync(options) {
 	} finally {
 		if (failed) reportCheckpointReleaseFailure(options);
 	}
-}
-
-export function runQueue(options) {
-	let failed = true;
-	try {
-		const result = runQueueImpl(options);
-		failed = false;
-		return result;
-	} finally {
-		if (failed) reportCheckpointReleaseFailure(options);
-	}
-}
-
-export function runProjectQueue(
-	projectRoot,
-	tasksFileName,
-	workingContainerName,
-) {
-	return runQueue({
-		tasksFilePath: join(projectRoot, tasksFileName),
-		projectPath: projectRoot,
-		workingContainerName,
-	});
 }
 
 export { persistAsyncResultArtifacts } from "./artifacts.mjs";

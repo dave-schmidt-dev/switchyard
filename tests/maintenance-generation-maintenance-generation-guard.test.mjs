@@ -22,7 +22,7 @@ import {
 	GenerationGuardError,
 	MaintenanceGenerationError,
 } from "../src/switchyard/maintenance/index.mjs";
-import { runQueue } from "../src/switchyard/runner/index.mjs";
+import { runQueueAsync } from "../src/switchyard/runner/index.mjs";
 import { HOST_HOME } from "./helpers/host-home.mjs";
 import { tempDir as trackedTempDir } from "./helpers/tempdir.mjs";
 
@@ -74,12 +74,12 @@ describe("maintenance generation guard", () => {
 		);
 	});
 
-	it("rejects new synchronous and detached queue work in progress", () => {
+	it("rejects new queue work in progress", async () => {
 		const path = markerPath();
 		activeMarker(path);
-		assert.throws(
+		await assert.rejects(
 			() =>
-				runQueue({
+				runQueueAsync({
 					tasksFilePath: "unused",
 					projectPath: projectRoot,
 					dependencies: { generationMarkerPath: path },

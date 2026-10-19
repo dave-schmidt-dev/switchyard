@@ -13,7 +13,6 @@ import {
 	hasTrustedQuotaRetryEvidence,
 	normalizeRetryTargetId,
 } from "./quick-checks.mjs";
-import { executionCleanupContext } from "./route-health.mjs";
 
 export function mergeRetryExclusions(base, quarantinedTargetIds) {
 	return [
@@ -143,11 +142,6 @@ export function isQuotaRetryCandidate(result, ownsWorkingContainer) {
 	return true;
 }
 
-export const COMPLETION_CONTINUATION_FAILURES = new Set([
-	"empty_required_diff",
-	"required_paths_missing",
-]);
-
 export function ensureProviderAttemptAllocations(checkpoint) {
 	if (checkpoint.providerAttemptAllocations === undefined) {
 		checkpoint.providerAttemptAllocations = [];
@@ -235,23 +229,6 @@ export function startExtraProviderInvocation(
 	}
 }
 
-export function completionContinuationCandidate(result, enabled) {
-	return (
-		enabled === true &&
-		result?.success === false &&
-		result.result === "integration_failed" &&
-		["captured", "empty"].includes(result.captureStatus) &&
-		COMPLETION_CONTINUATION_FAILURES.has(result.diagnosticCode)
-	);
-}
-
-export function machineMissingRequirements(task, result) {
-	if (result.diagnosticCode !== "required_paths_missing") return [];
-	return (result.missingPaths ?? task.requiredPaths ?? []).filter(
-		(path) => typeof path === "string",
-	);
-}
-
 export function taskPromptForAttempt(task, requirements) {
 	const prompt = task.prompt || task.description || task.title;
 	if (!Array.isArray(requirements) || requirements.length === 0) return prompt;
@@ -286,29 +263,6 @@ export function taskExecutionBudget(context, task) {
 		};
 	}
 	return initializeTaskExecutionBudget(context, task);
-}
-
-export function completionLifecycleContext(context, task) {
-	const cleanupContext =
-		context._activeTaskHelperContext ??
-		executionCleanupContext(
-			context,
-			task,
-			context._activeInvocationDescriptor?.descriptor_identity,
-		);
-	const budget = taskExecutionBudget(context, task);
-	return {
-		taskId: task.id,
-		attemptId: cleanupContext.attemptId,
-		descriptorIdentity: cleanupContext.descriptorIdentity,
-		workingContainerName: context.workingContainerName,
-		executionBackend: context.executionBackend,
-		cleanupContext,
-		deadline: budget.deadline,
-		timeoutMs: budget.remainingMs,
-		onStatus: context.onStatus,
-		lifecycleReceipt: context._activeCompletionLifecycleReceipt,
-	};
 }
 
 export const ALLOWED_INTEGRATION_MESSAGES = Object.freeze(

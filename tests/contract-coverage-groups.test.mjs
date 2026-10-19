@@ -83,8 +83,10 @@ describe("contract coverage groups", () => {
 			// 2026-10-18 (SC7): dispatch/cli.mjs and dispatch/recovery-command.mjs
 			// joined the dispatch/index.mjs group when the bin was split. (S11): the
 			// diagnostics entry moved from the deleted, unused index.mjs to
-			// provider-reliability.mjs at the same floors. No floor changed.
-			"d613f6d47b82ac809d40a43196b1a604d17aa89b750e6d3c700af20165db0598",
+			// provider-reliability.mjs at the same floors. (O1 step 2): the
+			// runner/index.mjs group lost the eight deleted synchronous queue
+			// members. No floor changed.
+			"c7b5dcdeeba1b082a33543ac7789cf80cb7e40998231390641af254971879cc2",
 		);
 	});
 
@@ -140,8 +142,10 @@ describe("contract coverage groups", () => {
 				)
 				.digest("hex"),
 			// 2026-10-18 (S11): tests/diagnostics.test.mjs left with the deleted
-			// module; every other entry and its order is unchanged.
-			"f8c00d84180cd7bee87940fb7481365bbb60a95a9530988e17494916838073e2",
+			// module. (O1 step 2): the four synchronous-queue descriptor-receipt
+			// and provider-spread suites left with the sync runner. Every other
+			// entry and its order is unchanged.
+			"b65fe40cc427982702339bf0295711ff2aee1bc7492a99dc4183124f2256233b",
 		);
 		let calls = 0;
 		const result = runContractCoverage({

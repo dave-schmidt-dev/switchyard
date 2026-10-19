@@ -9,7 +9,6 @@ export {
 	completeSynchronousProviderExit,
 	getWorkspaceExecution,
 	reconcileSynchronousProviderExit,
-	verifyCompletionContinuationSync,
 } from "./provider-lifecycle-completion.mjs";
 export {
 	captureProviderDiff,

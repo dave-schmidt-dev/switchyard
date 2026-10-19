@@ -138,42 +138,6 @@ function annotateRepairResult(
 	return result;
 }
 
-export function runCheckRepairSync({
-	task,
-	result,
-	context,
-	checkpoint,
-	checkpointPath,
-	execute,
-	dependencies = {},
-}) {
-	const plan = checkRepairPlan(task, result, context);
-	if (
-		!plan ||
-		!allocateRepair(task, plan, checkpoint, checkpointPath, dependencies)
-	)
-		return result;
-	context._checkRepairPin = plan.pin;
-	context._checkRepairFeedback = plan.feedback;
-	context._checkRepairBudget = plan.budget;
-	context.healthAttempt = "provider-2";
-	try {
-		return annotateRepairResult(
-			execute(plan.repairTask, context),
-			plan.feedback,
-			checkpoint,
-			checkpointPath,
-			task.id,
-			dependencies,
-		);
-	} finally {
-		context._checkRepairPin = null;
-		context._checkRepairFeedback = null;
-		context._checkRepairBudget = null;
-		context.healthAttempt = undefined;
-	}
-}
-
 function matchingObservation(observations, binding, result, attempt) {
 	return observations.find(
 		(observation) =>

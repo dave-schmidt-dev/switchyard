@@ -7,7 +7,6 @@ import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	captureHostFingerprint,
-	runDispatch as dispatchRun,
 	parseDispatchArgs,
 	parseHealthArgs,
 	parseLaunchArgs,
@@ -28,7 +27,6 @@ import {
 	advanceState,
 	initializeRun,
 } from "../src/switchyard/run-store/index.mjs";
-import { runQueue } from "../src/switchyard/runner/index.mjs";
 import {
 	__dirname,
 	DISPATCH_PATH,
@@ -121,62 +119,6 @@ describe("health control CLI", () => {
 			]).repairKind,
 			"auth_repaired",
 		);
-	});
-});
-describe("CLI queue-level platform selection", () => {
-	it("runs the macOS queue path through a VM helper without Docker workspace calls", async () => {
-		writeFileSync(
-			tasksFile,
-			"### Task 1.1: Already complete\n- **Status:** done\n- **Executor:** switchyard\n- **Quick checks:** none\n- **Files:** src/a.mjs\n- **Description:** fixture\n",
-			"utf8",
-		);
-		const calls = [];
-		const opts = parseDispatchArgs([
-			tasksFile,
-			"--project",
-			projectDir,
-			"--platform",
-			"macos",
-		]);
-		await dispatchRun(opts, {
-			runQueue: (queueOptions) =>
-				runQueue({
-					...queueOptions,
-					dependencies: {
-						...queueOptions.dependencies,
-						backendFactory: ({ platform }) => {
-							strictEqual(platform, "macos");
-							return {
-								readiness: () => ({ inventoryCount: 0 }),
-								create: () => {
-									calls.push("create-vm");
-									return "vm-handle";
-								},
-								seed: () => calls.push("seed-vm"),
-								commit: () => calls.push("commit-vm"),
-								reset: () => calls.push("reset-vm"),
-								destroy: () => calls.push("destroy-vm"),
-							};
-						},
-					},
-				}),
-			// Keep the queue-level platform test hermetic: the pre-dispatch
-			// hygiene sweep must not query or mutate host Parallels inventory.
-			listManaged: () => [],
-			reclaim: () => ({
-				reclaimed: [],
-				reclaimedSnapshots: [],
-				skippedSnapshots: [],
-				errors: [],
-			}),
-		});
-		strictEqual(calls.includes("create-vm"), true);
-		strictEqual(calls.includes("destroy-vm"), true);
-		strictEqual(
-			calls.some((call) => call.includes("docker")),
-			false,
-		);
-		process.exitCode = 0;
 	});
 });
 describe("captureHostFingerprint", () => {

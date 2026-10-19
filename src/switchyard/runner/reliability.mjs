@@ -325,28 +325,6 @@ function baselineInput(task, context) {
 	};
 }
 
-export function runTaskBaselineChecks(task, context, runChecks) {
-	const input = baselineInput(task, context);
-	if (!input) return null;
-	let receipt = null;
-	try {
-		receipt = runChecks(input);
-	} catch {
-		// The closed unknown result prevents provider invocation.
-	}
-	const outcome = baselineCheckOutcome(task, receipt);
-	return {
-		...outcome,
-		receipt: baselineCheckReceipt(
-			receipt,
-			input.checks,
-			input.baseTree,
-			task.id,
-			input.attempt,
-		),
-	};
-}
-
 export async function runTaskBaselineChecksAsync(task, context, runChecks) {
 	const input = baselineInput(task, context);
 	if (!input) return null;

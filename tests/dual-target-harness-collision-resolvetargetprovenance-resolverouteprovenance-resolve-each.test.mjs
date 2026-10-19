@@ -11,9 +11,7 @@ import {
 	getInvocationDescriptorIdentity,
 	resolveRouteProvenance,
 	resolveTargetProvenance,
-	validateInvocationDescriptor,
 } from "../src/switchyard/roster/index.mjs";
-import { executeTask } from "../src/switchyard/runner/index.mjs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURE_PATH = resolve(
@@ -95,23 +93,6 @@ after(() => {
 		// ignore
 	}
 });
-function syntheticDescriptor({ targetId, model, harness }) {
-	const core = {
-		target_id: targetId,
-		model_ref: model,
-		selector: model,
-		effort: null,
-		variant: null,
-		invocation_args: [],
-	};
-	return validateInvocationDescriptor(
-		{
-			...core,
-			descriptor_identity: getInvocationDescriptorIdentity(core, harness),
-		},
-		harness,
-	);
-}
 describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's OWN identity (C.8)", () => {
 	it("resolves the Claude bucket's target id, selector, and credential_profile", () => {
 		deepStrictEqual(resolveTargetProvenance(ANTIGRAVITY_CLAUDE, "standard"), {
@@ -142,123 +123,5 @@ describe("resolveTargetProvenance / resolveRouteProvenance resolve each target's
 		);
 		strictEqual(claudeProv.resolved_target, "antigravity-claude");
 		strictEqual(geminiProv.resolved_target, "antigravity");
-	});
-});
-describe("executeTask dispatches the CORRECT selector per target (C.7 proof)", () => {
-	const taskBase = {
-		ref: "refs/switchyard/task-base/dual-target/T-dual-agy",
-		tree: "2".repeat(40),
-	};
-	const taskBaseContext = {
-		queueBackend: {
-			captureTaskBase: () => taskBase,
-			captureTaskBaseAsync: async () => taskBase,
-			validateTaskBase: (_workspaceId, base) => base,
-			validateTaskBaseAsync: async (_workspaceId, base) => base,
-		},
-		taskBases: {},
-	};
-	function makeAdapterContext({ provider, model, targetId }) {
-		const executeCalls = [];
-		const descriptor = syntheticDescriptor({
-			targetId,
-			model,
-			harness: "agy",
-		});
-		return {
-			context: {
-				...taskBaseContext,
-				taskBases: {},
-				route: () => ({
-					provider,
-					model,
-					resolvedTargetId: targetId,
-					resolved_harness: "agy",
-					invocationDescriptor: descriptor,
-					percentLeft: 50,
-					reason: "spread",
-					log: [],
-				}),
-				resolveDescriptor: () => descriptor,
-				adapters: {
-					agy: {
-						execute: (_prompt, _containerName, opts) => {
-							executeCalls.push(opts);
-							return { success: true };
-						},
-						captureDiff: () => "",
-					},
-				},
-				recordDispatch: () => {},
-				recordDispatchIntent: () => {},
-				integrationGate: () => ({ success: true }),
-				projectPath: "/tmp/does-not-matter",
-				workingContainerName: "test-container",
-				exclude: [],
-			},
-			executeCalls,
-		};
-	}
-
-	const TASK = {
-		id: "T-dual-agy",
-		title: "trivial task",
-		description: "trivial task",
-		prompt: "do the thing",
-		requiredPaths: null,
-	};
-
-	it("executeTask passes the Claude bucket's model to the SAME 'agy' adapter", () => {
-		const { context, executeCalls } = makeAdapterContext({
-			provider: ANTIGRAVITY_CLAUDE,
-			model: "fixture-agy-claude-standard",
-			targetId: "antigravity-claude",
-		});
-		const result = executeTask(TASK, context);
-		strictEqual(result.result, "success_no_diff");
-		strictEqual(executeCalls.length, 1);
-		strictEqual(executeCalls[0].model, "fixture-agy-claude-standard");
-	});
-
-	it("executeTask passes the Gemini bucket's model to the SAME 'agy' adapter", () => {
-		const { context, executeCalls } = makeAdapterContext({
-			provider: ANTIGRAVITY,
-			model: "fixture-agy-gemini-standard",
-			targetId: "antigravity",
-		});
-		const result = executeTask(TASK, context);
-		strictEqual(result.result, "success_no_diff");
-		strictEqual(executeCalls.length, 1);
-		strictEqual(executeCalls[0].model, "fixture-agy-gemini-standard");
-	});
-
-	it("review tasks use the normal high-capability route without a reviewer role flag", () => {
-		const routeCalls = [];
-		const { context } = makeAdapterContext({
-			provider: ANTIGRAVITY_CLAUDE,
-			model: "fixture-agy-claude-standard",
-			targetId: "antigravity-claude",
-		});
-		context.route = (options) => {
-			routeCalls.push(options);
-			return {
-				provider: ANTIGRAVITY_CLAUDE,
-				model: "fixture-agy-claude-standard",
-				percentLeft: 50,
-				reason: "spread",
-			};
-		};
-		executeTask(
-			{
-				...TASK,
-				type: "review",
-				requiredCapability: "high",
-				requiredCapabilityJustification:
-					"The review spans provider boundaries.",
-			},
-			context,
-		);
-		strictEqual(routeCalls[0].requiredCapability, "high");
-		strictEqual(Object.hasOwn(routeCalls[0], "reviewerRole"), false);
 	});
 });

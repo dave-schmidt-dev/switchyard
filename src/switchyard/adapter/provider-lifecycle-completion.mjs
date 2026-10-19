@@ -141,44 +141,6 @@ export function boundCompletionContinuationProof(proof) {
 		workspaceId: proof.workspaceId,
 	});
 }
-function completionProofMatches(proof, expected) {
-	return (
-		proof?.version === 1 &&
-		proof?.kind === "completion_continuation_lifecycle" &&
-		proof.providerExited === true &&
-		proof.childrenExited === true &&
-		proof.cleanupSucceeded === true &&
-		proof.taskId === expected.taskId &&
-		proof.attemptId === expected.attemptId &&
-		proof.descriptorIdentity === expected.descriptorIdentity &&
-		proof.workspaceId === expected.workingContainerName
-	);
-}
-export function verifyCompletionContinuationSync(adapter, context) {
-	if (adapter?.supportsCompletionContinuation !== true) {
-		return false;
-	}
-	try {
-		context.onStatus?.({
-			phase: "lifecycle",
-			event: "completion_continuation_proof_started",
-			status: `Task ${context.taskId} continuation lifecycle proof started`,
-			taskId: context.taskId,
-		});
-		const proof = context.lifecycleReceipt;
-		const accepted = completionProofMatches(proof, context);
-		context.onStatus?.({
-			phase: "lifecycle",
-			event: "completion_continuation_proof_completed",
-			status: `Task ${context.taskId} continuation lifecycle proof ${accepted ? "accepted" : "declined"}`,
-			taskId: context.taskId,
-			accepted,
-		});
-		return accepted;
-	} catch {
-		return false;
-	}
-}
 export function getWorkspaceExecution(
 	workspaceId,
 	{

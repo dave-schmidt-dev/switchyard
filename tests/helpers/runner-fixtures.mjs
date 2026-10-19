@@ -8,10 +8,8 @@ import {
 import { route as realRoute } from "../../src/switchyard/router/index.mjs";
 import {
 	executeTaskAsync as executeTaskAsyncImpl,
-	executeTask as executeTaskImpl,
 	parseTaskQueue,
 	runQueueAsync as runQueueAsyncImpl,
-	runQueue as runQueueImpl,
 } from "../../src/switchyard/runner/index.mjs";
 
 // Runner tests must not read the host roster: the check sandbox runs them
@@ -146,10 +144,6 @@ export function withTestDescriptorContext(context) {
 	};
 }
 
-export function executeTask(task, context) {
-	return executeTaskImpl(task, withTestDescriptorContext(context));
-}
-
 export async function executeTaskAsync(task, context) {
 	return executeTaskAsyncImpl(task, withTestDescriptorContext(context));
 }
@@ -223,10 +217,8 @@ export function withTestDescriptorOptions(options) {
 			// preflight gate unless a test overrides it. The overwhelming
 			// majority of these tests exercise dispatch/retry/ledger/
 			// orchestration logic downstream of admission, not the gate
-			// itself (that's covered directly in the "Task 6.1"/"Task 6.3"
-			// describe blocks below, which call runQueueImpl or
-			// preflightMacosQueue directly and so never pass through this
-			// helper) -- so default preflight to a no-op here and let a
+			// itself (that's covered directly by tests that call
+			// preflightMacosQueue and so never pass through this helper) -- so default preflight to a no-op here and let a
 			// test that actually wants real gate behavior override
 			// dependencies.queuePreflight explicitly.
 			queuePreflight:
@@ -238,10 +230,6 @@ export function withTestDescriptorOptions(options) {
 				: {}),
 		},
 	};
-}
-
-export function runQueue(options) {
-	return runQueueImpl(withTestDescriptorOptions(options));
 }
 
 export async function runQueueAsync(options) {

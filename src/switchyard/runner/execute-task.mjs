@@ -1,5 +1,4 @@
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
-import { verifyCompletionContinuationSync } from "../adapter/provider-lifecycle.mjs";
 import {
 	artifactTransition,
 	integrationTransition,
@@ -7,16 +6,7 @@ import {
 import { saveCheckpoint } from "./checkpoint-store.mjs";
 import { BOUNDED_ERROR_KINDS } from "./constants.mjs";
 import { executeTaskAsyncUnsafe } from "./execute-task-async-unsafe.mjs";
-import { executeTaskUnsafe } from "./execute-task-unsafe.mjs";
 import { emitStageOutcome } from "./outcome-writer.mjs";
-import {
-	allocateExtraProviderInvocation,
-	completionContinuationCandidate,
-	completionLifecycleContext,
-	machineMissingRequirements,
-	recordExtraProviderInvocation,
-	taskExecutionBudget,
-} from "./retry-transitions.mjs";
 import { attachRouteHealthTerminal } from "./route-health.mjs";
 import {
 	decorateDirtyOverlayResult,
@@ -40,107 +30,6 @@ function projectTaskResult(result, extra = {}) {
 		});
 	}
 	return projected;
-}
-
-export function runCompletionCorrection(
-	task,
-	context,
-	result,
-	checkpoint,
-	checkpointPath,
-) {
-	if (
-		context.ownsWorkingContainer !== true ||
-		context.completionContinuationMode !== "sync" ||
-		!completionContinuationCandidate(
-			result,
-			context.completionContinuation?.enabled,
-		)
-	)
-		return result;
-	const budget = taskExecutionBudget(context, task);
-	const pin = context._activeCompletionPin;
-	if (!pin || budget.remainingMs <= 0) return result;
-	const requirements = machineMissingRequirements(task, result);
-	if (
-		!verifyCompletionContinuationSync(
-			context._activeCompletionAdapter,
-			completionLifecycleContext(context, task),
-		)
-	) {
-		return result;
-	}
-	if (taskExecutionBudget(context, task).remainingMs <= 0) return result;
-	const allocation = allocateExtraProviderInvocation(
-		checkpoint,
-		checkpointPath,
-		task.id,
-		"completion_correction",
-		{
-			deadline: pin.deadline,
-			descriptorIdentity: pin.descriptorIdentity,
-			workspaceId: pin.workspaceId,
-			baseTree: pin.baseTree,
-			attemptId: pin.attemptId,
-		},
-	);
-	if (!allocation) return result;
-	context.onStatus?.({
-		phase: "execution",
-		event: "completion_correction_allocated",
-		status: `Task ${task.id} completion correction allocated`,
-		taskId: task.id,
-		missingRequirements: requirements,
-	});
-	recordExtraProviderInvocation(
-		checkpoint,
-		checkpointPath,
-		allocation,
-		"running",
-	);
-	const originalRequirements = context._completionRequirements;
-	context._completionPin = pin;
-	context._completionRequirements = requirements;
-	try {
-		const correction = executeTask(task, context);
-		correction.extraProviderInvocationUsed = true;
-		recordExtraProviderInvocation(
-			checkpoint,
-			checkpointPath,
-			allocation,
-			"result_recorded",
-		);
-		return correction;
-	} finally {
-		context._completionPin = null;
-		context._completionRequirements = originalRequirements;
-	}
-}
-
-export function executeTask(task, context) {
-	context._activeRouteHealth = null;
-	context._activeProviderExecutionSucceeded = false;
-	context._activeCompletionLifecycleReceipt = null;
-	if (!context._completionPin) {
-		if (!context._checkRepairPin && !context._completionPin)
-			context._baselineCheckReceipt = null;
-	}
-	const result = decorateDirtyOverlayResult(
-		attachRouteHealthTerminal(executeTaskUnsafe(task, context), context),
-		context,
-	);
-	if (context.recordOutcomeEvent) {
-		context._outcomeWriteChain = (
-			context._outcomeWriteChain ?? Promise.resolve()
-		)
-			.then(() => emitTaskStageOutcomes(context, task, result))
-			.catch(() => {});
-	}
-	return projectTaskResult(result, {
-		...(context._baselineCheckReceipt
-			? { baselineCheckReceipt: context._baselineCheckReceipt }
-			: {}),
-	});
 }
 
 export async function executeTaskAsync(task, context) {
