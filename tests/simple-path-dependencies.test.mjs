@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { createSimpleCheckSessions } from "../src/switchyard/simple/check-session.mjs";
 import {
@@ -71,6 +71,7 @@ function fixture(
 		`[project]\nname = "fixture"\n\n[tool.uv.sources]\n${declared}\n`,
 	);
 	writeFileSync(join(project, ".gitignore"), ".venv\n");
+	if (gitDir) mkdirSync(dirname(join(root, gitDir)), { recursive: true });
 	git(project, [
 		"init",
 		"-q",
@@ -332,6 +333,30 @@ describe("declaredPathDependencies from a linked worktree", () => {
 		]);
 		throws(
 			() => declaredPathDependencies(linkedWorktree(repo)),
+			refusal("path_dependency_outside_project_parent"),
+		);
+	});
+
+	// Git names the main working tree by stripping `/.git` from the common dir,
+	// so `storage` below would pass for the main checkout without the manifest
+	// check (stability follow-up review, 2026-10-19).
+	it("ignores a separate git dir named .git outside the checkout", () => {
+		const repo = fixture(absoluteSibling, { gitDir: "storage/.git" });
+		throws(
+			() => declaredPathDependencies(linkedWorktree(repo)),
+			refusal("path_dependency_outside_project_parent"),
+		);
+	});
+
+	it("ignores a bare repository named .git", () => {
+		const repo = fixture(absoluteSibling);
+		const bare = join(repo.root, "hold", ".git");
+		git(repo.root, ["clone", "-q", "--bare", repo.project, bare]);
+		writeFileSync(join(repo.root, "hold", "pyproject.toml"), "");
+		const worktree = join(repo.root, "worktrees", "wt");
+		git(bare, ["worktree", "add", "-q", "--detach", worktree]);
+		throws(
+			() => declaredPathDependencies(worktree),
 			refusal("path_dependency_outside_project_parent"),
 		);
 	});

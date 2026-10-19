@@ -65,17 +65,19 @@ function realOrNull(path) {
 /**
  * The folder holding the repository and its siblings. A linked worktree of a
  * repository whose common dir is `<repo>/.git` maps to `dirname(<repo>)`, but
- * only when `<repo>` itself lists the worktree; anything else (main checkout,
- * bare repo, submodule, separate git dir, no git) keeps `dirname(project)`.
+ * only when `<repo>` is a non-bare checkout holding one of the project's
+ * `manifests` and lists the project as a linked worktree; anything else (main
+ * checkout, bare repo, submodule, separate git dir, no git) keeps
+ * `dirname(project)`.
  */
-function projectParent(project) {
+function projectParent(project, manifests) {
 	const fallback = dirname(project);
 	const common = gitOutput(project, [
 		"rev-parse",
 		"--path-format=absolute",
 		"--git-common-dir",
 	]);
-	const commonDir = common && realOrNull(common.trim());
+	const commonDir = common && realOrNull(common.replace(/\n$/u, ""));
 	if (!commonDir || basename(commonDir) !== ".git") return fallback;
 	const repoRoot = dirname(commonDir);
 	if (repoRoot === project) return fallback;
@@ -86,15 +88,33 @@ function projectParent(project) {
 		"-z",
 	]);
 	if (!listing) return fallback;
-	const listed = listing
-		.split("\0")
-		.filter((field) => field.startsWith("worktree "))
-		.map((field) => realOrNull(field.slice("worktree ".length)));
-	// The first entry is always the main working tree; the project must be a
-	// linked one.
-	if (listed[0] !== repoRoot || !listed.slice(1).includes(project))
+	const records = listing
+		.split("\0\0")
+		.map((record) => record.split("\0"))
+		.filter((fields) => fields[0]?.startsWith("worktree "));
+	const listed = records.map((fields) =>
+		realOrNull(fields[0].slice("worktree ".length)),
+	);
+	// Git always lists the main working tree first, deriving its path from the
+	// common dir, so a bare repository or a separate git dir named `.git` would
+	// pass for one. It must be non-bare and hold one of the project's own
+	// manifests, and the project must be one of its linked worktrees.
+	if (
+		listed[0] !== repoRoot ||
+		records[0].includes("bare") ||
+		!manifests.some((name) => isFile(join(repoRoot, name))) ||
+		!listed.slice(1).includes(project)
+	)
 		return fallback;
 	return dirname(repoRoot);
+}
+
+function isFile(path) {
+	try {
+		return lstatSync(path).isFile();
+	} catch {
+		return false;
+	}
 }
 
 function within(root, path) {
@@ -288,7 +308,10 @@ export function declaredPathDependencies(projectPath) {
 	// Git runs only when a declared path actually needs the parent rule.
 	let parent;
 	const parentOf = () => {
-		parent ??= projectParent(project);
+		parent ??= projectParent(
+			project,
+			[pyproject && "pyproject.toml", npm && "package.json"].filter(Boolean),
+		);
 		return parent;
 	};
 	const accepted = new Set();
