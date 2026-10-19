@@ -14,14 +14,23 @@
  * other declared path refuses the checks with `check_dependencies_unverified`
  * and a closed `dependencyCheck` naming the rule it failed.
  *
- * For a linked git worktree, "the project's parent" is the main working
- * tree's parent, so a worktree gets exactly its main checkout's grant (stability
+ * For a linked git worktree, "the project's parent" is the parent its main
+ * checkout has, so a worktree gets exactly its main checkout's grant; one whose
+ * main checkout cannot be verified gets no out-of-project grant (stability
  * follow-up, 2026-10-19). A relative declared path still resolves against the
  * worktree itself.
  */
 import { spawnSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_PTH_BYTES = 64 * 1024;
@@ -63,31 +72,47 @@ function realOrNull(path) {
 }
 
 /**
- * The folder holding the repository and its siblings. A linked worktree of a
- * repository whose common dir is `<repo>/.git` maps to `dirname(<repo>)`, but
- * only when `<repo>` is a non-bare checkout holding one of the project's
- * `manifests` and lists the project as a linked worktree; anything else (main
- * checkout, bare repo, submodule, separate git dir, no git) keeps
- * `dirname(project)`.
+ * The folder holding the repository and its siblings, or null for a linked
+ * worktree whose main checkout cannot be verified, which gets no out-of-project
+ * grant. A directory git does not recognise, or one that is its own main
+ * checkout (including a submodule or a separate git dir), keeps
+ * `dirname(project)`. A linked worktree gets the parent the same directory
+ * has in its main checkout, and only when the common dir is `<repo>/.git`,
+ * `<repo>` is a non-bare checkout whose matching directory holds one of the
+ * project's `manifests`, and `<repo>` lists the worktree as a linked one.
+ *
+ * Residual: git cannot tell a separate git dir named `.git` from an ordinary
+ * checkout, so a directory holding such a git dir and the manifest passes for
+ * the main checkout. Building that layout needs host write access outside any
+ * check clone, which could just as well move the checkout itself; the
+ * owner-approved rule is location-based either way.
  */
 function projectParent(project, manifests) {
-	const fallback = dirname(project);
-	const common = gitOutput(project, [
+	const dirs = gitOutput(project, [
 		"rev-parse",
 		"--path-format=absolute",
+		"--git-dir",
 		"--git-common-dir",
+		"--show-toplevel",
 	]);
-	const commonDir = common && realOrNull(common.replace(/\n$/u, ""));
-	if (!commonDir || basename(commonDir) !== ".git") return fallback;
+	if (dirs === null) return dirname(project);
+	const lines = dirs.replace(/\n$/u, "").split("\n");
+	if (lines.length !== 3) return null;
+	const [gitDir, commonDir, topLevel] = lines.map(realOrNull);
+	if (!gitDir || !commonDir || !topLevel) return null;
+	if (gitDir === commonDir) return dirname(project);
+	if (basename(commonDir) !== ".git") return null;
 	const repoRoot = dirname(commonDir);
-	if (repoRoot === project) return fallback;
+	const inTree = relative(topLevel, project);
+	if (inTree.startsWith("..") || isAbsolute(inTree)) return null;
+	const mainProject = join(repoRoot, inTree);
 	const listing = gitOutput(repoRoot, [
 		"worktree",
 		"list",
 		"--porcelain",
 		"-z",
 	]);
-	if (!listing) return fallback;
+	if (!listing) return null;
 	const records = listing
 		.split("\0\0")
 		.map((record) => record.split("\0"))
@@ -98,15 +123,15 @@ function projectParent(project, manifests) {
 	// Git always lists the main working tree first, deriving its path from the
 	// common dir, so a bare repository or a separate git dir named `.git` would
 	// pass for one. It must be non-bare and hold one of the project's own
-	// manifests, and the project must be one of its linked worktrees.
+	// manifests, and the worktree must be one of its linked entries.
 	if (
 		listed[0] !== repoRoot ||
 		records[0].includes("bare") ||
-		!manifests.some((name) => isFile(join(repoRoot, name))) ||
-		!listed.slice(1).includes(project)
+		!manifests.some((name) => isFile(join(mainProject, name))) ||
+		!listed.slice(1).includes(topLevel)
 	)
-		return fallback;
-	return dirname(repoRoot);
+		return null;
+	return dirname(mainProject);
 }
 
 function isFile(path) {
@@ -273,7 +298,10 @@ function acceptedPath(project, { name, path }, parentOf) {
 		directory = lstatSync(real).isDirectory();
 	} catch {}
 	if (!directory) throw refused(name, "path_dependency_not_directory");
-	if (!real.startsWith(`${parentOf()}${sep}`))
+	const parent = parentOf();
+	if (parent === null)
+		throw refused(name, "path_dependency_worktree_unverified");
+	if (!real.startsWith(`${parent}${sep}`))
 		throw refused(name, "path_dependency_outside_project_parent");
 	if (hasDotDirectory(path) || hasDotDirectory(real))
 		throw refused(name, "path_dependency_dot_directory");
@@ -305,13 +333,15 @@ export function declaredPathDependencies(projectPath) {
 		...(pyproject ? uvPathSources(pyproject) : []),
 		...(npm ? npmFileSources(npm) : []),
 	];
-	// Git runs only when a declared path actually needs the parent rule.
+	// Git runs once, and only when a declared path needs the parent rule; null
+	// (an unverified worktree) is a cached answer too.
 	let parent;
 	const parentOf = () => {
-		parent ??= projectParent(
-			project,
-			[pyproject && "pyproject.toml", npm && "package.json"].filter(Boolean),
-		);
+		if (parent === undefined)
+			parent = projectParent(
+				project,
+				[pyproject && "pyproject.toml", npm && "package.json"].filter(Boolean),
+			);
 		return parent;
 	};
 	const accepted = new Set();
