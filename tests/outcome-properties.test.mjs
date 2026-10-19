@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import fc from "fast-check";
-import { reduceOutcomeEvents } from "../src/switchyard/outcome/reducer.mjs";
 import { isOutcomeEvent } from "../src/switchyard/outcome/schema.mjs";
 
 const RUN_ID = "property-run";
@@ -186,103 +185,6 @@ describe("outcome contract properties", () => {
 				};
 				strictEqual(isOutcomeEvent(invalid), false);
 			}),
-		);
-	});
-
-	it("reducer determinism property (1000 cases)", () => {
-		assertProperty(
-			"reducer-determinism",
-			fc.property(
-				fc.array(eventArbitrary, { minLength: 1, maxLength: 8 }),
-				(events) => {
-					const forward = JSON.stringify(reduceOutcomeEvents(events));
-					const reverse = JSON.stringify(
-						reduceOutcomeEvents([...events].reverse()),
-					);
-					strictEqual(forward, reverse);
-				},
-			),
-		);
-	});
-
-	it("primary failure preservation property (1000 cases)", () => {
-		assertProperty(
-			"primary-failure-preservation",
-			fc.property(
-				fc.array(fc.constantFrom("artifact", "cleanup", "recovery"), {
-					minLength: 0,
-					maxLength: 6,
-				}),
-				(maskingStages) => {
-					const provider = event({
-						id: "provider-failure",
-						sequence: 1,
-						stage: "provider",
-						status: "failed",
-						detail: {
-							code: "execution_failed",
-							reasonCode: "execution_failed",
-							evidenceAvailable: true,
-							diagnosticRef: DIAGNOSTIC,
-							diagnosticOrigin: "adapter",
-						},
-					});
-					const masking = maskingStages.map((selectedStage, index) =>
-						event({
-							id: `${selectedStage}-${index}`,
-							sequence: index + 2,
-							stage: selectedStage,
-							status: "failed",
-							detail:
-								selectedStage === "artifact"
-									? { code: "diff_capture_failed", captured: false }
-									: selectedStage === "cleanup"
-										? {
-												code: "cleanup_failed",
-												mutationState: "uncertain",
-												mutationOutcome: "ambiguous",
-												ownership: "unknown",
-												postcondition: false,
-												reconciled: false,
-												idempotency: "conditional",
-											}
-										: {
-												code: "recovery_required",
-												reasonCode: "orphan_attempt",
-											},
-						}),
-					);
-					const projection = reduceOutcomeEvents([provider, ...masking]);
-					strictEqual(projection.primaryFailure.stage, "provider");
-					strictEqual(projection.primaryFailure.reasonCode, "execution_failed");
-				},
-			),
-		);
-	});
-
-	it("exactly-once logical counting property (1000 cases)", () => {
-		assertProperty(
-			"exactly-once-logical-counting",
-			fc.property(
-				fc.array(fc.constant(null), { minLength: 0, maxLength: 20 }),
-				(copies) => {
-					const completion = event({
-						id: "terminal-completion",
-						sequence: 1,
-						stage: "run",
-						status: "succeeded",
-						detail: { code: "complete" },
-					});
-					const projection = reduceOutcomeEvents([
-						completion,
-						...copies.map(() => structuredClone(completion)),
-					]);
-					strictEqual(projection.taskCounters.total, 1);
-					strictEqual(projection.taskCounters.completed, 1);
-					strictEqual(projection.taskCounters.terminal, 1);
-					strictEqual(projection.taskCounters.succeeded, 1);
-				},
-			),
 		);
 	});
 });

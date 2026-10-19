@@ -33,27 +33,9 @@ const PROPERTY_FILES = Object.freeze([
 	"tests/outcome-properties.test.mjs",
 	"tests/mutation-properties.test.mjs",
 	"src/switchyard/outcome/schema.mjs",
-	"src/switchyard/outcome/reducer.mjs",
 	"src/switchyard/lifecycle/mutation-protocol.mjs",
 ]);
 const HISTORICAL_MUTATIONS = Object.freeze({
-	"primary-overwrite": Object.freeze({
-		property: "primary-failure-preservation",
-		source: "src/switchyard/outcome/reducer.mjs",
-		needle: `failures.find(
-			(event) =>
-				stageOf(event) !== "artifact" &&
-				stageOf(event) !== "cleanup" &&
-				stageOf(event) !== "recovery",
-		) ??`,
-		replacement: 'failures.find((event) => stageOf(event) === "artifact") ??',
-	}),
-	"duplicate-count": Object.freeze({
-		property: "exactly-once-logical-counting",
-		source: "src/switchyard/outcome/reducer.mjs",
-		needle: "counters.total = byTask.size;",
-		replacement: "counters.total = byTask.size + 1;",
-	}),
 	"retry-budget": Object.freeze({
 		property: "retry-budgets",
 		source: "src/switchyard/lifecycle/mutation-protocol.mjs",
@@ -152,7 +134,6 @@ function materializeSources(root, revision, { mutation = null } = {}) {
 	const tempRoot = mkdtempSync(join(tmpdir(), "switchyard-parent-properties-"));
 	const sourceFiles = [
 		"src/switchyard/outcome/schema.mjs",
-		"src/switchyard/outcome/reducer.mjs",
 		"src/switchyard/lifecycle/mutation-protocol.mjs",
 	];
 	try {
@@ -200,7 +181,6 @@ function parentDigest(root) {
 	const digest = createHash("sha256");
 	for (const relative of [
 		"src/switchyard/outcome/schema.mjs",
-		"src/switchyard/outcome/reducer.mjs",
 		"src/switchyard/lifecycle/mutation-protocol.mjs",
 		"tests/outcome-properties.test.mjs",
 		"tests/mutation-properties.test.mjs",

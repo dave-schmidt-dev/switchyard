@@ -12,7 +12,6 @@
 		"test": "node scripts/run-test-phases.mjs",
 		"test:serial": "node scripts/test-manifest.mjs --run serial",
 		"test:other": "node scripts/test-manifest.mjs --run other",
-		"test:stabilization": "node --test tests/outcome-replay.test.mjs",
 		"test:properties": "node scripts/run-test-phases.mjs --properties",
 		"test:contracts": "node scripts/check-contract-gates.mjs --run && node scripts/run-contract-coverage.mjs",
 		"test:coverage": "node scripts/run-contract-coverage.mjs",

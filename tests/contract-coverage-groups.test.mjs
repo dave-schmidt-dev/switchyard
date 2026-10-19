@@ -89,9 +89,10 @@ describe("contract coverage groups", () => {
 			// worker-bootstrap and run-finalization entries left with their deleted
 			// modules, dispatch/index.mjs and run-store/index.mjs lost their deleted
 			// members, and a router/index.mjs group (75/60/75) took over the route
-			// selection suites the runner group used to pull in. No surviving floor
-			// changed.
-			"a2acefd42133fd6f0a92ecbe502c3ea3959c65332efbca60ba7554d83ac2285c",
+			// selection suites the runner group used to pull in. (O4 follow-up): the
+			// outcome/reducer.mjs entry left with the deleted reducer. No surviving
+			// floor changed.
+			"559299f8338754d8483df4a90eb91d25708c2dcd04a58068a20886d56a346bba",
 		);
 	});
 
@@ -151,9 +152,12 @@ describe("contract coverage groups", () => {
 			// tests/runner-adapter-harness.test.mjs joined the production-runner
 			// gate. (O1 steps 5-7): every suite of the deleted detached, queue
 			// and VM modules left with them; tests/runner-check-repair-async left
-			// the focused list for the same reason. Every surviving entry and its
+			// the focused list for the same reason. (O4 follow-up): the reducer and
+			// replay suites left with the deleted reducer, and
+			// run-store-shadow-reducer-projection was renamed
+			// run-store-legacy-outcome-projection. Every surviving entry and its
 			// order is unchanged.
-			"b8ec0d08cd46e830c58cf61f97637cd9d4ae347e76c94cbe03ae997dfbb12859",
+			"3fe4af673a4b7a112133f11a5c7637536a39e134a8a3ad901dbc1242631b9e54",
 		);
 		let calls = 0;
 		const result = runContractCoverage({

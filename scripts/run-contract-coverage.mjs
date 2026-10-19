@@ -46,12 +46,6 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 		branches: 60,
 		functions: 80,
 	},
-	{
-		path: "src/switchyard/outcome/reducer.mjs",
-		lines: 80,
-		branches: 60,
-		functions: 80,
-	},
 	// Route selection used to reach this plan through the queue runner's
 	// route-health seam; the router façade now carries its suites directly.
 	{

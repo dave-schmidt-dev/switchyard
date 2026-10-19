@@ -179,15 +179,13 @@ describe("source-boundary contract gate mapping", () => {
 
 	it("keeps every historical incident mutation explicit and disposable", () => {
 		const mutations = loadIncidentMutations(ROOT);
-		strictEqual(mutations.length, 7);
-		strictEqual(new Set(mutations.map((mutation) => mutation.id)).size, 7);
+		strictEqual(mutations.length, 5);
+		strictEqual(new Set(mutations.map((mutation) => mutation.id)).size, 5);
 		deepStrictEqual(
 			new Set(mutations.map((mutation) => mutation.defectClass)),
 			new Set([
 				"field-drop",
 				"vacuous-consumer-guard",
-				"failure-overwrite",
-				"duplicate-terminal-count",
 				"omitted-boundary-suite",
 				"false-command-success",
 				"unsafe-retry",
@@ -232,10 +230,10 @@ describe("source-boundary contract gate mapping", () => {
 			true,
 		);
 		deepStrictEqual(
-			ownersForPaths(manifest, ["src/switchyard/outcome/reducer.mjs"]).map(
+			ownersForPaths(manifest, ["src/switchyard/outcome/schema.mjs"]).map(
 				(owner) => owner.id,
 			),
-			["outcome-schema-reducer"],
+			["outcome-schema"],
 		);
 		const extractedOnly = ownersForPaths(manifest, [
 			"src/switchyard/runner/checks.mjs",

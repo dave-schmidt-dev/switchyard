@@ -116,7 +116,7 @@ describe("legacy outcome projection", () => {
 		});
 	});
 
-	it("never lets a historical matching shadow select the reducer", () => {
+	it("ignores a historical matching shadow in the legacy projection", () => {
 		const runId = HISTORICAL_MATCHED_SHADOW.projection.runId;
 		const run = {
 			runId,

@@ -18,22 +18,6 @@
 			"tests": ["tests/contract-gate-mapping.test.mjs"]
 		},
 		{
-			"id": "primary-failure-overwrite",
-			"defectClass": "failure-overwrite",
-			"source": "src/switchyard/outcome/reducer.mjs",
-			"needle": "failures.find(\n\t\t\t(event) =>\n\t\t\t\tstageOf(event) !== \"artifact\" &&\n\t\t\t\tstageOf(event) !== \"cleanup\" &&\n\t\t\t\tstageOf(event) !== \"recovery\",\n\t\t) ??",
-			"replacement": "failures.find((event) => stageOf(event) === \"artifact\") ??",
-			"tests": ["tests/outcome-reducer.test.mjs"]
-		},
-		{
-			"id": "duplicate-terminal-count",
-			"defectClass": "duplicate-terminal-count",
-			"source": "src/switchyard/outcome/reducer.mjs",
-			"needle": "counters.total = byTask.size;",
-			"replacement": "counters.total = byTask.size + 1;",
-			"tests": ["tests/outcome-reducer.test.mjs"]
-		},
-		{
 			"id": "omitted-boundary-suite",
 			"defectClass": "omitted-boundary-suite",
 			"source": "scripts/check-contract-gates.mjs",

@@ -42,7 +42,7 @@ export function loadIncidentMutations(root = process.cwd()) {
 	if (
 		fixture?.schemaVersion !== 1 ||
 		!Array.isArray(fixture.mutations) ||
-		fixture.mutations.length !== 7
+		fixture.mutations.length !== 5
 	)
 		fail("incident_mutation_fixture_invalid");
 	const ids = new Set();
@@ -73,8 +73,6 @@ export function loadIncidentMutations(root = process.cwd()) {
 	for (const expected of [
 		"field-drop",
 		"vacuous-consumer-guard",
-		"failure-overwrite",
-		"duplicate-terminal-count",
 		"omitted-boundary-suite",
 		"false-command-success",
 		"unsafe-retry",
