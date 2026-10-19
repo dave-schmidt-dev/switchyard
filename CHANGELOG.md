@@ -62,6 +62,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - **Breaking (library):** the `integrationIntent` option of `integrationGate` and the matching `applyReviewedDiff` parameters, with the `alreadyApplied` result. Only the retired queue lane supplied a durable apply-intent record; every remaining caller applies without one, so a diff that no longer applies now always fails closed.
 - The `queue-vm` route-health lane. A terminal binding now accepts only the simple-direct lifecycle, the one lane that still dispatches; no producer had written `queue-vm` since the VM lane left.
 - **Breaking:** the `image_repaired` kind for `switchyard-dispatch health attest-repair --repair-kind`. It named the retired VM golden image; new attestations accept only `auth_repaired` and `configuration_repaired`, while route-health control records that already carry `image_repaired` still read.
+- The run store's `route_health_deferred` exception. No producer has emitted that event since the queue lane left, so an event whose `result` falls outside the success set now always records a failure. The outcome projection still reads the name from older runs.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.

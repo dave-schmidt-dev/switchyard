@@ -133,11 +133,12 @@ const APPROVED_EVENT_KEYS = new Set([
 	// Boolean only: whether the adapter affirmatively read back the model the
 	// provider served. Absent when the adapter cannot report one.
 	"servedModelVerified",
-	// Bounded route-health decision and deferral telemetry. These fields are
-	// accepted only from closed host events; they are observational and never
-	// participate in health authority. `result` is used only for the closed
-	// route_health_deferred execution status.
+	// Closed execution status; any value outside SUCCESS_RESULTS records a
+	// failure.
 	"result",
+	// Bounded route-health decision telemetry. These fields are accepted only
+	// from closed host events; they are observational and never participate
+	// in health authority.
 	"mode",
 	"state",
 	"available",
@@ -239,7 +240,6 @@ const ROUTE_HEALTH_BINDING_KEYS = new Set([
 	"lifecycleVerified",
 ]);
 const ROUTE_HEALTH_EPOCH_RE = /^sha256:[a-f0-9]{64}$/;
-const ROUTE_HEALTH_DEFERRED_RESULT = "route_health_deferred";
 const DIAGNOSTIC_REF_RE = /^diagnostic:[a-f0-9]{32}$/u;
 const MAX_DIAGNOSTIC_ARTIFACT_BYTES = 4096;
 const DIAGNOSTIC_DIGEST_RE = /^sha256:[a-f0-9]{64}$/u;
@@ -274,7 +274,6 @@ export {
 	MUTATION_RESOURCE_RE,
 	PROCESS_INSTANCE_ID,
 	ROUTE_HEALTH_BINDING_KEYS,
-	ROUTE_HEALTH_DEFERRED_RESULT,
 	ROUTE_HEALTH_EPOCH_RE,
 	resolveStateRoot,
 	runsRoot,

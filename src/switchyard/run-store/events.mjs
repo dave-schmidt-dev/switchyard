@@ -21,7 +21,6 @@ import {
 	APPROVED_EVENT_KEYS,
 	EVENT_RESERVE_BYTES,
 	MAX_DIAGNOSTIC_ARTIFACT_BYTES,
-	ROUTE_HEALTH_DEFERRED_RESULT,
 	SUCCESS_RESULTS,
 } from "./constants.mjs";
 import { RUN_ID_RE, SchemaError, validateRunId } from "./errors.mjs";
@@ -146,16 +145,12 @@ async function createEventInternal(
 		throw new SchemaError("route health binding does not match run projection");
 	}
 	const nextSeq = current.lastEventSequence + 1;
-	const isDeferredEvent =
-		event?.event === ROUTE_HEALTH_DEFERRED_RESULT ||
-		event?.result === ROUTE_HEALTH_DEFERRED_RESULT;
 	const isFailureEvent =
-		!isDeferredEvent &&
-		(event?.event === "task_failed" ||
-			event?.event === "queue_halted" ||
-			event?.event === "worker_boot_failed" ||
-			event?.errorKind !== undefined ||
-			(event?.result !== undefined && !SUCCESS_RESULTS.has(event.result)));
+		event?.event === "task_failed" ||
+		event?.event === "queue_halted" ||
+		event?.event === "worker_boot_failed" ||
+		event?.errorKind !== undefined ||
+		(event?.result !== undefined && !SUCCESS_RESULTS.has(event.result));
 	const suppliedFailure =
 		isFailureEvent && event?.errorKind
 			? {
