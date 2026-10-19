@@ -1,9 +1,19 @@
+// @test-phase: other
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { __resetRosterCacheForTests } from "../src/switchyard/roster/index.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
 import { fixture } from "./helpers/simple-routing-fixture.mjs";
 
-const TARGETS = ["antigravity-claude", "codex"];
+// Refusals resolve target IDs through the roster; pin the committed fixture
+// so the outcome never depends on the owner's live roster.
+process.env.SWITCHYARD_ROSTER_PATH = fileURLToPath(
+	new URL("./fixtures/roster.fixture.json", import.meta.url),
+);
+__resetRosterCacheForTests();
+
+const TARGETS = ["antigravity", "codex"];
 
 // Like the real selector (router/eligibility.mjs), report every target that
 // is missing from availableProviders as adapter_unavailable.
@@ -55,13 +65,13 @@ test("a funding-only exhaustion records only the funding refusals and falls back
 });
 
 test("a target the caller never offered keeps its adapter_unavailable entry", async () => {
-	const f = fixture({ __targets: ["antigravity-claude"] });
+	const f = fixture({ __targets: ["antigravity"] });
 	f.deps.route = selectorWithEvidence;
 	f.deps.assertFundedRoute = fundingRefused;
 	const result = await runSimpleRoutingTask(f.options, f.deps);
 	strictEqual(result.direction, "native_required");
 	strictEqual(result.exhaustionCause, "capacity");
-	deepStrictEqual(reasonsFor(result, "antigravity-claude"), [
+	deepStrictEqual(reasonsFor(result, "antigravity"), [
 		"paid_overage_not_allowed",
 	]);
 	deepStrictEqual(reasonsFor(result, "codex"), ["adapter_unavailable"]);
