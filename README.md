@@ -150,7 +150,7 @@ switchyard-dispatch doctor --json   # {schemaVersion: 1, status, checks}
 
 1. `sandbox-toolchain`: `node`, `npm` and `uv` resolve inside the real check sandbox profile.
 2. `provider-clis`: each provider CLI's `--version` against `ops/macos-vm/cli-manifest.txt`.
-3. `bridge-pins`: each `switchyard-*` broker consumer's executable SHA-256 against its pin in the bws broker registry (read as text), plus the pinned OpenCode runtime.
+3. `bridge-pins`: each `switchyard-*` broker consumer's executable SHA-256 against its pin in the bws broker registry (read as text).
 4. `qualification-expiry`: active roster slots whose newest `dispatch_qualified` receipt has expired or expires within 9 days.
 5. `repair-holds`: route-health repair holds, each with its `health attest-repair` command.
 6. `stranded-pending`: stranded pending routing attempts, with `routing-run close-pending` when it would accept them, else `routing-run inspect`.

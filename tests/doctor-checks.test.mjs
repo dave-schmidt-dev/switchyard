@@ -131,7 +131,7 @@ describe("doctor host checks", () => {
 		ok(!text.includes(SECRET_REF) && !text.includes("MISTRAL_API_KEY"));
 	});
 
-	it("fails a changed bridge or runtime and warns on a disabled pin", () => {
+	it("fails a changed bridge and warns on a disabled pin", () => {
 		const base = {
 			brokerPresent: true,
 			registryPath: "/b/registry.py",
@@ -139,7 +139,6 @@ describe("doctor host checks", () => {
 				{ consumer: "switchyard-x", executable: "/r/x.mjs", sha256: SHA_A },
 			],
 			hashes: { "/r/x.mjs": SHA_A },
-			runtime: { path: "/r/.tools/opencode", ok: true },
 		};
 		strictEqual(checkBridgePins(base).status, "ok");
 		const changed = checkBridgePins({ ...base, hashes: { "/r/x.mjs": SHA_B } });
@@ -149,12 +148,6 @@ describe("doctor host checks", () => {
 			/switchyard-x: live bbbbbbbbbbbb != pin aaaaaaaaaaaa/u,
 		);
 		match(changed.fixes[0], /^owner: re-pin .* \/b\/registry\.py/u);
-		const runtime = checkBridgePins({
-			...base,
-			runtime: { path: "/r/.tools/opencode", ok: false },
-		});
-		strictEqual(runtime.status, "fail");
-		match(runtime.fixes[0], /\/r\/\.tools\/opencode$/u);
 		strictEqual(
 			checkBridgePins({
 				...base,
@@ -364,7 +357,6 @@ describe("doctor report and exit status", () => {
 				{ consumer: "switchyard-x", executable: "/x", sha256: SHA_A },
 			],
 			hashes: { "/x": SHA_A },
-			runtime: null,
 		}),
 		qualification: () => ({
 			slots: [

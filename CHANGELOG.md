@@ -51,7 +51,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The `gc` and `reconcile-completion` operator subcommands, with their helpers (`apfs-private-bytes.py`, the external-completion reconciliation modules) and tests. `recover` keeps the shared root-cleanup logic. `remediate-orphaned-locks` and `health attest-repair` stay: each has a live caller or contract.
 - The seam-move and module-split refactor tooling (`check:seams`, `split:module`, their scripts and tests, and the direct `oxc-parser` devDependency).
 - The orphaned Docker-era `ops/set-opencode-mistral-key.sh`.
-- The OpenCode Go bridge's fixed-runtime SHA-256 check (`verifyOpenCodeRuntime`) and its test.
+- The OpenCode Go bridge's fixed-runtime SHA-256 check (`verifyOpenCodeRuntime`), its test, and the matching OpenCode runtime part of `doctor`'s `bridge-pins` check.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
