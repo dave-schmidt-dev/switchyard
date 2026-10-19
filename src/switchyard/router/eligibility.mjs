@@ -136,7 +136,7 @@ export function readRosterTargetOrder() {
 	}
 }
 
-export const GOLDEN_IMAGE_VERIFIED_PROVIDERS = Object.freeze([
+export const QUALIFIED_PROVIDERS = Object.freeze([
 	"codex",
 	"antigravity",
 	"antigravity-claude",

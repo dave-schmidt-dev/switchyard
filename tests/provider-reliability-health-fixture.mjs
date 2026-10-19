@@ -15,7 +15,7 @@ import {
 	derivePublicConfigurationEpoch,
 	ingestRouteHealthEvents,
 } from "../src/switchyard/router/health.mjs";
-import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
+import { QUALIFIED_PROVIDERS } from "../src/switchyard/router/index.mjs";
 import {
 	createRouteHealthEvent,
 	getRunRoot,
@@ -153,7 +153,7 @@ export function fakeHealthDecision(
 }
 
 export function routeHealthEpoch() {
-	const qualified = GOLDEN_IMAGE_VERIFIED_PROVIDERS;
+	const qualified = QUALIFIED_PROVIDERS;
 	return derivePublicConfigurationEpoch({
 		approvedConfiguration: {
 			rosterSchemaVersion: 1,
@@ -171,7 +171,7 @@ export function routeHealthEpoch() {
 export function defaultHealthDecision(healthStateRoot, now) {
 	return createDefaultRouteHealthDecision({
 		healthStateRoot,
-		qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+		qualifiedProviders: QUALIFIED_PROVIDERS,
 		goldenImageReference: SIMPLE_ROUTE_HEALTH_EPOCH,
 		...(now ? { now } : {}),
 	});

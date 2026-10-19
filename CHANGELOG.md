@@ -67,6 +67,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- **Breaking (library):** `GOLDEN_IMAGE_VERIFIED_PROVIDERS` is now `QUALIFIED_PROVIDERS` (same providers, same order). The list now only scopes simple-dispatch route health and `switchyard-dispatch health identity`; the VM golden image it was named for is gone.
 - A codex HTTP 401 (`failed to connect to websocket: HTTP error: 401 Unauthorized`, or `unexpected status 401 Unauthorized`) on its own line now classifies as `auth_expired`, not `provider_exit_nonzero`. The forms apply only to the codex binary. A codex 401 therefore no longer counts toward simple route-health suppression, and it reads as a re-login cause.
 - A simple stop caused by a check environment that could not be set up is labelled `check_setup_failed` instead of `baseline_failed`, so it is not read as a red check or a provider failure. The attempt keeps `baseline_failed`, the target stays unblamed, and routing state stays version 1. The `simple` JSON result now carries `stopReason` for every `stop` direction; `failureReason` is still the engine's own reason.
 - The stabilization freeze is lifted. README and INVARIANTS now record the 2026-09 observation window as closed (39 ledger rows, last kept 2026-09-13); routing-policy, provider-enablement and quota changes still need the owner's go.

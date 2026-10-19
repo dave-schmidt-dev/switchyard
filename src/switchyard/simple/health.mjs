@@ -13,7 +13,7 @@ import {
 	startHalfOpenClaim,
 	startHalfOpenClaimSync,
 } from "../router/health.mjs";
-import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
+import { QUALIFIED_PROVIDERS } from "../router/index.mjs";
 import { createRouteHealthEvent } from "../run-store/outcomes.mjs";
 import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import { getRunRoot } from "../run-store/run-records.mjs";
@@ -124,8 +124,7 @@ export function createSimpleRouteHealthController(options = {}) {
 		createDefaultRouteHealthDecision({
 			healthStateRoot,
 			mode,
-			qualifiedProviders:
-				options.qualifiedProviders ?? GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+			qualifiedProviders: options.qualifiedProviders ?? QUALIFIED_PROVIDERS,
 			// Keep local observations in a distinct public configuration epoch.
 			goldenImageReference: SIMPLE_ROUTE_HEALTH_EPOCH,
 			...(typeof options.now === "function" ? { now: options.now } : {}),

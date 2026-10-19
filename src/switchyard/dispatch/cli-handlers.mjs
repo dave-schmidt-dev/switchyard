@@ -3,7 +3,7 @@ import {
 	createDefaultRouteHealthDecision,
 	inspectRouteHealth,
 } from "../router/health.mjs";
-import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../router/index.mjs";
+import { QUALIFIED_PROVIDERS } from "../router/index.mjs";
 import {
 	parseHealthArgs,
 	parseOrphanLockRemediationArgs,
@@ -22,7 +22,7 @@ async function handleHealth(argv) {
 		console.error(`dispatch: route health ${event}`);
 	if (input.action === "identity") {
 		const decision = createDefaultRouteHealthDecision({
-			qualifiedProviders: GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+			qualifiedProviders: QUALIFIED_PROVIDERS,
 		});
 		const identity = decision.identityFor(input);
 		if (!identity) process.exitCode = 1;

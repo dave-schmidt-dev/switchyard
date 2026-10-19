@@ -581,7 +581,7 @@ export function route(options = {}) {
 
 export {
 	evaluateCandidateEligibility,
-	GOLDEN_IMAGE_VERIFIED_PROVIDERS,
+	QUALIFIED_PROVIDERS,
 	readSnapshotAtRoute,
 	resolveSnapshotPath,
 	SNAPSHOT_PATH,

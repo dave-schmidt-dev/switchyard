@@ -12,7 +12,7 @@ import {
 import { QUALIFICATION_FILES } from "../src/switchyard/diagnostics/provider-qualification-fixture.mjs";
 import { hasProvenWorkerCleanup } from "../src/switchyard/diagnostics/provider-qualification-verification.mjs";
 import { getInvocationDescriptorIdentity } from "../src/switchyard/roster/index.mjs";
-import { GOLDEN_IMAGE_VERIFIED_PROVIDERS } from "../src/switchyard/router/eligibility.mjs";
+import { QUALIFIED_PROVIDERS } from "../src/switchyard/router/eligibility.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 function fixtureRoster() {
@@ -415,16 +415,13 @@ test("explicit lane planning accepts only the simple lane for simple-compatible 
 	assert.equal(refused.plan.adapterReason, "local_adapter_unavailable");
 });
 
-test("golden image verified providers include vibe-code after vibe", () => {
-	assert.equal(GOLDEN_IMAGE_VERIFIED_PROVIDERS.includes("vibe-code"), true);
+test("qualified providers include vibe-code after vibe", () => {
+	assert.equal(QUALIFIED_PROVIDERS.includes("vibe-code"), true);
 	assert.equal(
-		GOLDEN_IMAGE_VERIFIED_PROVIDERS[GOLDEN_IMAGE_VERIFIED_PROVIDERS.length - 1],
+		QUALIFIED_PROVIDERS[QUALIFIED_PROVIDERS.length - 1],
 		"vibe-code",
 	);
-	assert.equal(
-		GOLDEN_IMAGE_VERIFIED_PROVIDERS[GOLDEN_IMAGE_VERIFIED_PROVIDERS.length - 2],
-		"vibe",
-	);
+	assert.equal(QUALIFIED_PROVIDERS[QUALIFIED_PROVIDERS.length - 2], "vibe");
 });
 
 test("VM cleanup stage cannot override unknown or contradictory writer liveness", () => {
