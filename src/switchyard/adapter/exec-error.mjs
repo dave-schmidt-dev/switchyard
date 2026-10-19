@@ -236,8 +236,6 @@ export {
 	cleanupDiagnosticCodeFor,
 	PERSISTED_ERROR_KINDS,
 	PERSISTED_SIGNALS,
-	PrlctlCallError,
-	prlctlTrustedCauseCode,
 } from "./exec-error-kinds.mjs";
 export {
 	classifyProviderDiagnostic,

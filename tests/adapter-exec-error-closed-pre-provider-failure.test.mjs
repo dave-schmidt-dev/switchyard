@@ -6,8 +6,6 @@ import {
 	describeExecError,
 	isPersistentFailureMetadata,
 	PRE_PROVIDER_FAILURE_TRIPLES,
-	PrlctlCallError,
-	prlctlTrustedCauseCode,
 	sanitizeFailureMetadata,
 } from "../src/switchyard/adapter/exec-error.mjs";
 
@@ -25,14 +23,15 @@ describe("closed pre-provider failure triples", () => {
 		}
 	});
 
-	it("classifies fixed categories without retaining task ids, blockers, paths, or messages", () => {
-		const dynamic = new Error("dependency-blocked:9.9 /private/secret prompt");
-		dynamic.name = "TaskSelectionError";
-		dynamic.code = "dependency-blocked:9.9";
+	it("classifies fixed categories without retaining lock owners, paths, or messages", () => {
+		const dynamic = Object.assign(
+			new Error("project lock held by pid 4242 at /private/secret prompt"),
+			{ name: "LockError", code: "PROJECT_LOCK_HELD" },
+		);
 		deepStrictEqual(classifyPreProviderFailure(dynamic), {
-			diagnosticCode: "task_selection_failed",
-			errorKind: "task_selection_failed",
-			failurePhase: "task_selection",
+			diagnosticCode: "project_lock_held",
+			errorKind: "project_lock_failed",
+			failurePhase: "project_lock",
 		});
 		const persisted = JSON.stringify(
 			sanitizeFailureMetadata({
@@ -40,7 +39,7 @@ describe("closed pre-provider failure triples", () => {
 				...classifyPreProviderFailure(dynamic),
 			}),
 		);
-		ok(!persisted.includes("9.9"));
+		ok(!persisted.includes("4242"));
 		ok(!persisted.includes("/private/secret"));
 		ok(!persisted.includes("prompt"));
 
@@ -49,101 +48,12 @@ describe("closed pre-provider failure triples", () => {
 			code: "checkpoint_arbitrary_canary",
 		});
 		strictEqual(classifyPreProviderFailure(arbitrary), null);
-	});
-
-	it("classifies only the typed unknown-integration checkpoint failure", () => {
-		const typed = Object.assign(new Error("arbitrary hidden detail"), {
-			name: "IntegrationStateUnknownError",
-			code: "INTEGRATION_STATE_UNKNOWN",
+		// Error types retired with the VM and queue lanes no longer classify.
+		const retired = Object.assign(new Error("dependency-blocked:9.9"), {
+			name: "TaskSelectionError",
+			code: "dependency-blocked:9.9",
 		});
-		deepStrictEqual(classifyPreProviderFailure(typed), {
-			diagnosticCode: "integration_state_unknown",
-			errorKind: "integration_failed",
-			failurePhase: "checkpoint_validation",
-		});
-		strictEqual(
-			classifyPreProviderFailure(new Error("integration_state_unknown")),
-			null,
-		);
-	});
-
-	it("keeps admission denials, storage failures, and generic failures distinct", () => {
-		for (const [name, code, diagnosticCode] of [
-			[
-				"VmAdmissionPermissionDeniedError",
-				"VM_ADMISSION_PERMISSION_DENIED",
-				"vm_admission_permission_denied",
-			],
-			[
-				"VmAdmissionStorageError",
-				"VM_ADMISSION_STORAGE_FAILED",
-				"vm_admission_storage_failed",
-			],
-			[
-				"VmAdmissionUnavailableError",
-				"VM_ADMISSION_UNAVAILABLE",
-				"vm_admission_unavailable",
-			],
-		]) {
-			const error = Object.assign(new Error("/private/admission canary"), {
-				name,
-				code,
-			});
-			const classified = classifyPreProviderFailure(error);
-			deepStrictEqual(classified, {
-				diagnosticCode,
-				errorKind: "environment_incomplete",
-				failurePhase: "queue_preflight",
-			});
-			const persisted = JSON.stringify(
-				sanitizeFailureMetadata({ result: "launch_failed", ...classified }),
-			);
-			ok(!persisted.includes("/private/admission"));
-			ok(!persisted.includes("canary"));
-		}
-	});
-
-	it("classifies only exact host-readiness error names and closed codes", () => {
-		for (const diagnosticCode of [
-			"vm_host_inventory_permission_denied",
-			"vm_host_inventory_unavailable",
-			"vm_host_service_degraded",
-		]) {
-			const error = Object.assign(new Error("untrusted host prose"), {
-				name: "ParallelsHostReadinessError",
-				code: diagnosticCode,
-			});
-			deepStrictEqual(classifyPreProviderFailure(error), {
-				diagnosticCode,
-				errorKind: "environment_incomplete",
-				failurePhase: "queue_preflight",
-			});
-		}
-		strictEqual(
-			classifyPreProviderFailure(
-				Object.assign(new Error("vm_host_service_degraded"), {
-					name: "Error",
-					code: "vm_host_service_degraded",
-				}),
-			),
-			null,
-		);
-	});
-
-	it("reads permission denial only from the reviewed prlctl cause", () => {
-		const cause = Object.assign(new Error("denied"), { code: "EPERM" });
-		const failure = new PrlctlCallError({
-			diagnosticCode: "prlctl_call_failed",
-			subcommand: "list",
-			cause,
-		});
-		strictEqual(prlctlTrustedCauseCode(failure), "EPERM");
-		strictEqual(
-			prlctlTrustedCauseCode(
-				Object.assign(new Error("forged"), { code: "EPERM" }),
-			),
-			null,
-		);
+		strictEqual(classifyPreProviderFailure(retired), null);
 	});
 });
 

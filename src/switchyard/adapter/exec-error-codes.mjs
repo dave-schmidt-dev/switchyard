@@ -1,8 +1,4 @@
-import {
-	CLEANUP_STAGE_DIAGNOSTIC_CODES,
-	prlctlFailureMetadata,
-	workerBootStageDiagnosticCode,
-} from "./exec-error-kinds.mjs";
+import { CLEANUP_STAGE_DIAGNOSTIC_CODES } from "./exec-error-kinds.mjs";
 export const INTEGRATION_REFUSAL_KINDS = Object.freeze([
 	"empty_diff",
 	"path_escapes_project_root",
@@ -232,58 +228,19 @@ export const PRE_PROVIDER_FAILURE_TRIPLES = Object.freeze([
 const PRE_PROVIDER_TRIPLE_BY_CODE = new Map(
 	PRE_PROVIDER_FAILURE_TRIPLES.map((triple) => [triple.diagnosticCode, triple]),
 );
+// The VM, queue, task-selection and checkpoint-integration failures this used to
+// classify left with O1. Their codes stay in PRE_PROVIDER_FAILURE_TRIPLES and
+// PERSISTED_DIAGNOSTIC_CODES because historical run records still carry them.
 export function classifyPreProviderFailure(error) {
 	if (!error || typeof error !== "object") return null;
 	let diagnosticCode = null;
-	if (error.name === "TaskSelectionError") {
-		diagnosticCode = "task_selection_failed";
-	} else if (
-		error.name === "IntegrationStateUnknownError" &&
-		error.code === "INTEGRATION_STATE_UNKNOWN"
-	) {
-		diagnosticCode = "integration_state_unknown";
-	} else if (error.name === "QueuePreflightError") {
-		diagnosticCode = "environment_incomplete";
-	} else if (CHECKPOINT_DIAGNOSTIC_CODES.has(error.code)) {
+	if (CHECKPOINT_DIAGNOSTIC_CODES.has(error.code)) {
 		diagnosticCode = error.code;
 	} else if (
 		error.name === "LockError" &&
 		Object.hasOwn(LOCK_DIAGNOSTIC_CODES, error.code)
 	) {
 		diagnosticCode = LOCK_DIAGNOSTIC_CODES[error.code];
-	} else if (
-		error.name === "VmAdmissionPermissionDeniedError" &&
-		error.code === "VM_ADMISSION_PERMISSION_DENIED"
-	) {
-		diagnosticCode = "vm_admission_permission_denied";
-	} else if (
-		error.name === "VmAdmissionStorageError" &&
-		error.code === "VM_ADMISSION_STORAGE_FAILED"
-	) {
-		diagnosticCode = "vm_admission_storage_failed";
-	} else if (
-		error.name === "VmAdmissionUnavailableError" &&
-		error.code === "VM_ADMISSION_UNAVAILABLE"
-	) {
-		diagnosticCode = "vm_admission_unavailable";
-	} else if (
-		error.name === "VmSlotUnavailableError" &&
-		error.code === "VM_SLOT_UNAVAILABLE"
-	) {
-		diagnosticCode = "vm_slot_unavailable";
-	} else if (
-		error.name === "ParallelsHostReadinessError" &&
-		[
-			"vm_host_inventory_permission_denied",
-			"vm_host_inventory_unavailable",
-			"vm_host_service_degraded",
-		].includes(error.code)
-	) {
-		diagnosticCode = error.code;
-	} else {
-		const prlctl = prlctlFailureMetadata(error);
-		diagnosticCode =
-			prlctl?.diagnosticCode ?? workerBootStageDiagnosticCode(error) ?? null;
 	}
 	return PRE_PROVIDER_TRIPLE_BY_CODE.get(diagnosticCode) ?? null;
 }

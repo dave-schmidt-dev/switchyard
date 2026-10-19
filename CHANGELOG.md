@@ -63,6 +63,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The `queue-vm` route-health lane. A terminal binding now accepts only the simple-direct lifecycle, the one lane that still dispatches; no producer had written `queue-vm` since the VM lane left.
 - **Breaking:** the `image_repaired` kind for `switchyard-dispatch health attest-repair --repair-kind`. It named the retired VM golden image; new attestations accept only `auth_repaired` and `configuration_repaired`, while route-health control records that already carry `image_repaired` still read.
 - The run store's `route_health_deferred` exception. No producer has emitted that event since the queue lane left, so an event whose `result` falls outside the success set now always records a failure. The outcome projection still reads the name from older runs.
+- **Breaking (library):** `PrlctlCallError` and `prlctlTrustedCauseCode`, and the VM admission, VM slot, Parallels host-readiness, queue-preflight, task-selection, integration-state and prlctl/worker-boot branches of `classifyPreProviderFailure`. It now classifies only checkpoint and project-lock failures; the retired codes stay in the persisted vocabulary so older run records still read.
 
 ### Security
 - Host-detected Git control tampering now retains only closed `{kind, area}` evidence in the result, run record, routing attempt and failure log; provider-controlled paths and messages remain excluded.
