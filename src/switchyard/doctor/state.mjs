@@ -17,7 +17,8 @@ import {
 	ROSTER_CAPABILITY_CLASSES,
 	STALE_MAX_AGE_SECONDS,
 } from "../roster/schema.mjs";
-import { getStateRoot, readRun } from "../run-store/index.mjs";
+import { getStateRoot } from "../run-store/project-lock-files.mjs";
+import { readRun } from "../run-store/run-records.mjs";
 import {
 	RUN_TERMINAL_STATES,
 	writerQuiescent,
