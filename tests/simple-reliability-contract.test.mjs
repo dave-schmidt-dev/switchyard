@@ -27,7 +27,7 @@ import { tempDir } from "./helpers/tempdir.mjs";
 import {
 	cleanupHealthFixture,
 	healthIdentity,
-	seedVmQuotaCooldown,
+	seedQuotaCooldown,
 	setupHealthFixture,
 } from "./provider-reliability-health-fixture.mjs";
 
@@ -681,7 +681,7 @@ describe("simple provider reliability contract", () => {
 			});
 			const descriptor = deps.getInvocationDescriptor();
 			const healthStateRoot = join(suiteRoot, `half-open-${interruption}`);
-			const seed = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+			const seed = await seedQuotaCooldown({ healthStateRoot, descriptor });
 			let clock = seed.at + COOLDOWN_MS[0] + 1_000;
 			const deadline = clock + 240_000;
 			const abort = new AbortController();

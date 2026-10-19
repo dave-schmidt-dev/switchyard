@@ -199,18 +199,6 @@ export function localLifecycle(exitCode = 0) {
 	};
 }
 
-export function vmLifecycle(exitCode = 1) {
-	return {
-		schemaVersion: 1,
-		terminalStatus: "exited",
-		writerLifecycle: "stopped",
-		cleanupStatus: "succeeded",
-		cleanupStage: "index_lock_removed",
-		exitCode,
-		signal: null,
-	};
-}
-
 export async function initializeHealthRun(taskIds = ["task-health"]) {
 	const orderedTaskIds = Array.isArray(taskIds) ? taskIds : [taskIds];
 	const runId = `health-${randomUUID()}`;
@@ -229,7 +217,7 @@ export async function initializeHealthRun(taskIds = ["task-health"]) {
 	};
 }
 
-export async function seedVmQuotaCooldown({ healthStateRoot, descriptor }) {
+export async function seedQuotaCooldown({ healthStateRoot, descriptor }) {
 	const run = await initializeHealthRun();
 	const epoch = routeHealthEpoch();
 	const diagnostic = createProviderReliabilityDiagnostic({
@@ -247,9 +235,9 @@ export async function seedVmQuotaCooldown({ healthStateRoot, descriptor }) {
 		runId: run.runId,
 		taskId: run.taskId,
 		attempt: "provider-seed",
-		healthLane: "queue-vm",
+		healthLane: "simple-direct",
 		providerReliability: diagnostic,
-		providerLifecycle: vmLifecycle(1),
+		providerLifecycle: localLifecycle(1),
 		providerExecutionSucceeded: false,
 		diagnosticCode: "quota_exhausted",
 		diagnosticOrigin: "adapter",
@@ -258,7 +246,7 @@ export async function seedVmQuotaCooldown({ healthStateRoot, descriptor }) {
 		exitCode: 1,
 		signal: null,
 	});
-	if (!binding) throw new Error("VM quota binding was not accepted");
+	if (!binding) throw new Error("quota binding was not accepted");
 	await createRouteHealthEvent(
 		run.runId,
 		{

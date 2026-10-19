@@ -49,8 +49,8 @@ export const SUCCESS_CODE = "verified_transport_success";
 export const TRIAL_INCONCLUSIVE_CODE = "trial_inconclusive";
 
 // Provider-caused failures that drive the cooldown ladder. They are minted only
-// from lifecycle-backed evidence on the simple-direct lane (health-observations
-// .mjs); the queue-vm lane never produces them.
+// from lifecycle-backed evidence on the simple-direct lane
+// (health-observations.mjs).
 const QUALIFIED_TRANSIENT_ROUTE_HEALTH_CODES = Object.freeze([
 	"provider_exit_nonzero",
 	"provider_deadline_exceeded",

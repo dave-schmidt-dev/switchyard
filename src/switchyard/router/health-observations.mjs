@@ -292,12 +292,9 @@ function confirmedProviderCooldownCode(input) {
 function providerLifecycleClosed(input) {
 	const lifecycle = input?.providerLifecycle;
 	const cleanupClosed =
-		(input.healthLane === "simple-direct" &&
-			lifecycle?.cleanupStage === null &&
-			["not_required", "succeeded"].includes(lifecycle?.cleanupStatus)) ||
-		(input.healthLane === "queue-vm" &&
-			lifecycle?.cleanupStage === "index_lock_removed" &&
-			lifecycle?.cleanupStatus === "succeeded");
+		input.healthLane === "simple-direct" &&
+		lifecycle?.cleanupStage === null &&
+		["not_required", "succeeded"].includes(lifecycle?.cleanupStatus);
 	if (
 		lifecycle?.schemaVersion !== 1 ||
 		lifecycle.terminalStatus !== "exited" ||
@@ -577,8 +574,7 @@ export function createRouteHealthTerminalBinding(input) {
 		providerStopped(input);
 	const lifecycleVerified =
 		lifecycleReceiptMatches(input.lifecycleReceipt, input) ||
-		(["simple-direct", "queue-vm"].includes(input.healthLane) &&
-			providerLifecycleClosed(input)) ||
+		providerLifecycleClosed(input) ||
 		failureCode !== null ||
 		inconclusiveTrial;
 	if (trial && !lifecycleVerified) return null;

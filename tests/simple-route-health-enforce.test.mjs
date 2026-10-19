@@ -53,7 +53,6 @@ import {
 	routeHealthEpoch,
 	setupHealthFixture,
 	simpleInput,
-	vmLifecycle,
 } from "./provider-reliability-health-fixture.mjs";
 
 const MIN = 60_000;
@@ -391,12 +390,13 @@ describe("simple route-health enforcement", () => {
 			bindingFor(failed(exit.providerReliability, 3))?.lifecycleVerified,
 			true,
 		);
-		// The VM queue never mints a transient failure from a bare exit.
+		// A lane other than simple-direct (here the retired queue-vm lane)
+		// never mints a transient failure, even from a closed lifecycle.
 		strictEqual(
 			bindingFor({
 				...failed(provider("provider_exit_nonzero", { exitCode: 1 }), 1),
 				healthLane: "queue-vm",
-				providerLifecycle: vmLifecycle(1),
+				providerLifecycle: localLifecycle(1),
 			}),
 			null,
 		);

@@ -28,10 +28,9 @@ import {
 	healthIdentity,
 	initializeHealthRun,
 	localLifecycle,
-	seedVmQuotaCooldown,
+	seedQuotaCooldown,
 	setupHealthFixture,
 	simpleInput,
-	vmLifecycle,
 } from "./provider-reliability-health-fixture.mjs";
 
 before(setupHealthFixture);
@@ -125,7 +124,7 @@ describe("provider reliability health", () => {
 	it("ingests exact VM quota evidence into a finite cooldown and fences unresolved half-open replay", async () => {
 		const descriptor = getInvocationDescriptor("codex", "standard");
 		const healthStateRoot = join(HEALTH_ROOT, "vm-cooldown");
-		const seeded = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+		const seeded = await seedQuotaCooldown({ healthStateRoot, descriptor });
 		strictEqual(seeded.results[0].accepted, true);
 		strictEqual(seeded.results[0].attempt, "provider-seed");
 		strictEqual(seeded.event.routeHealthBinding.transportVerified, false);
@@ -205,7 +204,7 @@ describe("provider reliability health", () => {
 		strictEqual(retry.allowed, false);
 		strictEqual(retry.reason, "provider-invocation-unsettled");
 
-		// The VM terminal shape is accepted only at its approved cleanup stage.
+		// A quota cooldown is accepted only from a lifecycle whose cleanup closed.
 		const quotaDiagnostic = createProviderReliabilityDiagnostic({
 			causeCode: "quota_exhausted",
 			phase: "provider",
@@ -221,11 +220,11 @@ describe("provider reliability health", () => {
 				repairEpoch: 0,
 				runId: seeded.run.runId,
 				taskId: seeded.run.taskId,
-				attempt: "bad-vm-cleanup",
-				healthLane: "queue-vm",
+				attempt: "bad-cleanup",
+				healthLane: "simple-direct",
 				providerReliability: quotaDiagnostic,
 				providerLifecycle: {
-					...vmLifecycle(1),
+					...localLifecycle(1),
 					cleanupStage: "cleanup_started",
 				},
 				providerExecutionSucceeded: false,
@@ -242,7 +241,7 @@ describe("provider reliability health", () => {
 	it("refuses half-open start when the validated repair epoch disappears", async () => {
 		const descriptor = getInvocationDescriptor("codex", "standard");
 		const healthStateRoot = join(HEALTH_ROOT, "missing-start-epoch");
-		const seeded = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+		const seeded = await seedQuotaCooldown({ healthStateRoot, descriptor });
 		const clockNow = seeded.at + COOLDOWN_MS[0] + 1_000;
 		const run = await initializeHealthRun("task-missing-start-epoch");
 		const decision = fakeHealthDecision([descriptor], {
@@ -293,7 +292,7 @@ describe("provider reliability health", () => {
 	it("settles verified transport before later checks and starts a fresh trial", async () => {
 		const descriptor = getInvocationDescriptor("codex", "standard");
 		const healthStateRoot = join(HEALTH_ROOT, "settled-transport");
-		const seeded = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+		const seeded = await seedQuotaCooldown({ healthStateRoot, descriptor });
 		const clockNow = seeded.at + COOLDOWN_MS[0] + 1_000;
 		const run = await initializeHealthRun("task-transport");
 		const controller = enforcingController({
@@ -412,7 +411,7 @@ describe("provider reliability health", () => {
 	it("keeps default shadow failures runnable", async () => {
 		const descriptor = getInvocationDescriptor("codex", "standard");
 		const healthStateRoot = join(HEALTH_ROOT, "shadow-and-baseline");
-		const seeded = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+		const seeded = await seedQuotaCooldown({ healthStateRoot, descriptor });
 		const clockNow = seeded.at + 1_000;
 		const shadowDecision = defaultHealthDecision(
 			healthStateRoot,
@@ -454,7 +453,7 @@ describe("provider reliability health", () => {
 	it("keeps an enforce lease fenced after unknown provider cleanup", async () => {
 		const descriptor = getInvocationDescriptor("codex", "standard");
 		const healthStateRoot = join(HEALTH_ROOT, "unknown-cleanup");
-		const seeded = await seedVmQuotaCooldown({ healthStateRoot, descriptor });
+		const seeded = await seedQuotaCooldown({ healthStateRoot, descriptor });
 		const run = await initializeHealthRun("task-unknown-cleanup");
 		const controller = enforcingController({
 			healthStateRoot,
