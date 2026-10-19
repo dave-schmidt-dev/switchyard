@@ -27,6 +27,7 @@ import {
 import {
 	hostState,
 	runMetadataScenario,
+	STALL_TIMEOUT_MS,
 } from "./helpers/integration-metadata-fixtures.mjs";
 import { sourceText } from "./helpers/source-text.mjs";
 
@@ -98,7 +99,7 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "stall",
 			summaryMode: "ok",
-			timeoutMs: 1500,
+			timeoutMs: STALL_TIMEOUT_MS,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -131,7 +132,7 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "ok",
 			summaryMode: "stall",
-			timeoutMs: 1500,
+			timeoutMs: STALL_TIMEOUT_MS,
 		});
 		assertRunnerHealthy(scenario);
 		strictEqual(scenario.result.safe, false);
@@ -156,7 +157,7 @@ describe("metadata command process bounds", () => {
 			projectPath,
 			numstatMode: "stall",
 			summaryMode: "ok",
-			timeoutMs: 1500,
+			timeoutMs: STALL_TIMEOUT_MS,
 			call: "integrationGate",
 			gateOptions: { requiredPaths: ["test.txt"] },
 		});

@@ -169,6 +169,13 @@ function readReadyPids(markerDir) {
  * whether the watchdog fired, the fake git children's ready/reaped state,
  * and whether the fake git ever received a SIGTERM.
  */
+// Stall scenarios expect the metadata timeout to fire, but only after the fake
+// git has confirmed its SIGTERM handler. That window is one a healthy child
+// must beat, so it clears the 6 to 10 s launch stalls of a loaded host, and
+// two of them in sequence (numstat, then a stalled summary) stay under the
+// scenario watchdog.
+export const STALL_TIMEOUT_MS = 20_000;
+
 export async function runMetadataScenario({
 	patch,
 	projectPath,
