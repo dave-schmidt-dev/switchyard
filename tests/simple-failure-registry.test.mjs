@@ -153,6 +153,9 @@ function oracleErrorKind(failureReason, failurePhase, errno) {
 			"workspace_checkout_failed",
 			"dirty_overlay_stage_failed",
 			"dirty_overlay_baseline_failed",
+			"diff_stage_failed",
+			"diff_names_failed",
+			"diff_capture_failed",
 		].includes(failureReason)
 	)
 		return "environment_failure";
@@ -225,6 +228,13 @@ function oracleCauseCode(reason, phase, providerResult, errorKind) {
 	if (reason === "host_concurrency") return reason;
 	// Task 2.7: a candidate-changed dependency manifest has its own check cause.
 	if (reason === "check_manifest_changed_by_diff") return reason;
+	// A diff-capture git failure has one closed environment cause.
+	if (
+		["diff_stage_failed", "diff_names_failed", "diff_capture_failed"].includes(
+			reason,
+		)
+	)
+		return "diff_capture_failed";
 	if (phase === "baseline") {
 		if (reason === "baseline_mutation") return "baseline_mutation";
 		if (reason === "baseline_check_unavailable")
@@ -403,6 +413,7 @@ const ORACLE_CODE_CATEGORY = new Map([
 	["declared_path_has_owner_edits", "input"],
 	["worktree_allocation_failed", "environment"],
 	["worktree_missing", "environment"],
+	["diff_capture_failed", "environment"],
 	["worktree_ownership_failed", "cleanup"],
 	["git_control_tampered", "environment"],
 	["target_identity_unavailable", "environment"],

@@ -266,6 +266,7 @@ export const CODE_CATEGORIES = new Map([
 	["declared_path_has_owner_edits", "input"],
 	["worktree_allocation_failed", "environment"],
 	["worktree_missing", "environment"],
+	["diff_capture_failed", "environment"],
 	["worktree_ownership_failed", "cleanup"],
 	["git_control_tampered", "environment"],
 	["target_identity_unavailable", "environment"],

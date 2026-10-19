@@ -108,12 +108,21 @@ const PROVIDER_EXECUTION_REASONS = [
 	"provider_launch_failed",
 ];
 
+// Host git could not stage, list or read the candidate's changes, so no
+// reason about the diff itself can be given.
+const DIFF_CAPTURE_REASONS = [
+	"diff_stage_failed",
+	"diff_names_failed",
+	"diff_capture_failed",
+];
+
 const ENVIRONMENT_REASONS = [
 	"project_revision_unavailable",
 	"workspace_clone_failed",
 	"workspace_checkout_failed",
 	"dirty_overlay_stage_failed",
 	"dirty_overlay_baseline_failed",
+	...DIFF_CAPTURE_REASONS,
 ];
 
 export const DIFF_CAUSE_REASONS = [
@@ -302,6 +311,8 @@ export function snapshotCauseCode(
 	if (reason === "check_environment_failed") return reason;
 	// Task 2.7: a candidate-changed dependency manifest has its own check cause.
 	if (reason === "check_manifest_changed_by_diff") return reason;
+	// Every diff-capture git failure shares one closed environment cause.
+	if (DIFF_CAPTURE_REASONS.includes(reason)) return "diff_capture_failed";
 	if (phase === "baseline") {
 		if (reason === "baseline_mutation") return "baseline_mutation";
 		if (reason === "baseline_check_unavailable")
