@@ -19,7 +19,7 @@ import {
 	appendOutcomeEvent,
 	initializeRun,
 	readEvents,
-	recoverExecutionOutcome,
+	recoverMissingExecutionOutcome,
 	releaseRunLock,
 } from "../src/switchyard/run-store/index.mjs";
 import { prepareOutcomeWriter } from "../src/switchyard/runner/index.mjs";
@@ -299,7 +299,7 @@ describe("broker contract", () => {
 				outcomeWriterEpoch: "epoch-2",
 			});
 			strictEqual(
-				await recoverExecutionOutcome(runId, {
+				await recoverMissingExecutionOutcome(runId, {
 					writerEpoch: resumed.writerEpoch,
 					owner: resumed.owner,
 				}),

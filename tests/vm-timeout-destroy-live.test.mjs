@@ -103,8 +103,8 @@ async function loadSlotPrimitive() {
 	} catch {
 		return null;
 	}
-	const acquire = module.acquireVmSlot ?? module.acquireMacosVmSlot;
-	const release = module.releaseVmSlot ?? module.releaseMacosVmSlot;
+	const acquire = module.acquireVmSlot;
+	const release = module.releaseVmSlot;
 	const wait = module.acquireVmSlotForTest;
 	return typeof acquire === "function" &&
 		typeof release === "function" &&

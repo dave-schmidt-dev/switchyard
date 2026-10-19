@@ -56,12 +56,10 @@ export {
 	updateRunWithRetry,
 } from "./run-updates.mjs";
 export {
-	acquireMacosVmSlot,
 	acquireVmSlot,
 	acquireVmSlotForTest,
 	projectVmGateOutcome,
 	publishVmGateOutcome,
-	releaseMacosVmSlot,
 	releaseVmSlot,
 	TEST_VM_SLOT_WAIT_INTERVAL_MS,
 	TEST_VM_SLOT_WAIT_TIMEOUT_MS,
@@ -89,7 +87,6 @@ export {
 	appendOutcomeEvent,
 	assertOutcomeWriter,
 	createRouteHealthEvent,
-	recoverExecutionOutcome,
 	recoverMissingExecutionOutcome,
 } from "./outcomes.mjs";
 export {

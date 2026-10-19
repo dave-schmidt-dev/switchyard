@@ -382,8 +382,6 @@ export function releaseVmSlot(leaseOrSlot, token, runId) {
 		throw error;
 	}
 }
-export const acquireMacosVmSlot = acquireVmSlot;
-export const releaseMacosVmSlot = releaseVmSlot;
 export {
 	acquireVmSlotWithDependencies,
 	publishVmSlot,

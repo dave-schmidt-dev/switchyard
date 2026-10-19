@@ -357,7 +357,7 @@ describe("global VM admission slots", () => {
 		);
 		const primitive = source.slice(
 			source.indexOf("export function acquireVmSlot"),
-			source.indexOf("export const acquireMacosVmSlot"),
+			source.indexOf("export {\n\tacquireVmSlotWithDependencies,"),
 		);
 		ok(primitive.includes("linkSync"));
 		ok(!primitive.includes("releaseOrphanedProjectLocks"));

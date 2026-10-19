@@ -3,7 +3,7 @@ import {
 	appendOutcomeEvent,
 	createStageOutcome,
 	readRun,
-	recoverExecutionOutcome,
+	recoverMissingExecutionOutcome,
 } from "../run-store/index.mjs";
 
 export function normalizeBrokerRoute(result) {
@@ -58,7 +58,7 @@ export async function prepareOutcomeWriter(runId, dependencies) {
 		nonce: activated.workerNonce,
 	};
 	while (
-		(await recoverExecutionOutcome(runId, {
+		(await recoverMissingExecutionOutcome(runId, {
 			writerEpoch: activated.outcomeWriterEpoch,
 			owner,
 			minimumReaderVersion: activated.minimumOutcomeReaderVersion ?? 1,

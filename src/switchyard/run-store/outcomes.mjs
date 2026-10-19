@@ -366,7 +366,6 @@ export async function recoverMissingExecutionOutcome(
 	}
 	return null;
 }
-export const recoverExecutionOutcome = recoverMissingExecutionOutcome;
 export async function createRouteHealthEvent(runId, event, binding) {
 	validateRunId(runId);
 	if (
