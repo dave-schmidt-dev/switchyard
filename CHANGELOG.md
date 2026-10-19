@@ -160,6 +160,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - Check readiness failure names the one-based `checkIndex` and bounded executable basename, with the `validate_commands` setup step.
 - Lease-free route health terminal paths settle internal invocation state consistently only after writer-stop proof; active trial or unconfirmed writers remain fenced.
 - Async queue execution shares one deadline across task-base capture, provider launch and scoped check repair, reports timeouts consistently, and preserves the original repair cleanup identity while health records each invocation separately.
+- `npm run test:mutation:contracts` runs again: its disposable baseline checkout now copies every path a contract gate owns (derived from the `INVARIANTS.md` gate manifest, which added the three `ops/` sandbox-canary files), so the baseline no longer fails as `incident_mutation_baseline_invalid:vacuous-consumer-guard`, and the `omitted-boundary-suite` mutation targets the current pragma-based lane coverage instead of the removed `dynamicOther` branch. The `false-command-success` mutation had survived since the VM-family retirement removed its killing test, so a deterministic test now pins that an unconfirmed synchronous mutation never completes, and the contract-gate mapping suite fails when a mutation needle goes stale.
 
 ## [0.3.0] - 2026-10-02
 

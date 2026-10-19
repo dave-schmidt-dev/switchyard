@@ -28,7 +28,10 @@ import {
 	coverageFailures,
 	parseCoverageReport,
 } from "../scripts/run-contract-coverage.mjs";
-import { loadIncidentMutations } from "../scripts/run-incident-mutations.mjs";
+import {
+	incidentCopyPaths,
+	loadIncidentMutations,
+} from "../scripts/run-incident-mutations.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const ROOT = join(process.cwd());
@@ -198,6 +201,34 @@ describe("source-boundary contract gate mapping", () => {
 			);
 			ok(mutation.tests.every((suite) => suite.startsWith("tests/")));
 		}
+	});
+
+	it("keeps every incident mutation needle unique in its current source", () => {
+		for (const mutation of loadIncidentMutations(ROOT)) {
+			const source = readFileSync(join(ROOT, mutation.source), "utf8");
+			strictEqual(
+				source.split(mutation.needle).length,
+				2,
+				`needle is stale or ambiguous: ${mutation.id}`,
+			);
+		}
+	});
+
+	it("copies every gate-owned path into the mutation baseline checkout", () => {
+		const copied = incidentCopyPaths(ROOT);
+		const covered = (path) =>
+			copied.some((entry) => path === entry || path.startsWith(`${entry}/`));
+		const areas = loadContractGateManifest(ROOT).flatMap((gate) =>
+			gate.areas.map((area) => area.replace(/\/\*\*$/u, "")),
+		);
+		ok(areas.length > 0);
+		for (const area of areas) ok(covered(area), `not copied: ${area}`);
+		for (const owned of [
+			"ops/com.zerodelta.switchyard.sandbox-canary.plist.template",
+			"ops/install-sandbox-canary.sh",
+			"ops/uninstall-sandbox-canary.sh",
+		])
+			ok(copied.includes(owned), `not copied: ${owned}`);
 	});
 
 	it("pins the local Node major and enforces local validation gates", () => {

@@ -1,5 +1,11 @@
 // @test-phase: other
-import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
+import {
+	deepStrictEqual,
+	notStrictEqual,
+	ok,
+	strictEqual,
+	throws,
+} from "node:assert";
 import { describe, it } from "node:test";
 import {
 	createMutationIntent,
@@ -282,6 +288,25 @@ describe("mutation protocol", () => {
 		strictEqual(records.at(-1).state, "completed");
 		strictEqual(records.at(-1).operationId, result.operationId);
 		strictEqual(Object.hasOwn(records.at(-1), "commandResult"), false);
+	});
+
+	it("never completes a synchronous mutation whose postcondition is unconfirmed", () => {
+		for (const [observation, state] of [
+			[{ status: "failed", ownership: "confirmed" }, "failed"],
+			[{ status: "ambiguous", ownership: "unknown" }, "uncertain"],
+			[{ status: "unknown", ownership: "unknown" }, "uncertain"],
+			[false, "uncertain"],
+		]) {
+			const result = executeMutationSync({
+				operation: "lock_release",
+				resource: "unconfirmed-sync",
+				policy: { maxAttempts: 1, backoffBaseMs: 0, backoffMaxMs: 0 },
+				command: () => ({ acknowledged: true }),
+				observe: () => observation,
+			});
+			strictEqual(result.state, state, JSON.stringify(observation));
+			notStrictEqual(result.outcome, "confirmed");
+		}
 	});
 
 	it("binds synchronous resume to operation identity before replay", () => {

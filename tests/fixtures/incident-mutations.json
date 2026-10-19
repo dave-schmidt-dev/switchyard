@@ -21,8 +21,8 @@
 			"id": "omitted-boundary-suite",
 			"defectClass": "omitted-boundary-suite",
 			"source": "scripts/check-contract-gates.mjs",
-			"needle": "if (dynamicOther) {",
-			"replacement": "if (dynamicOther && false) {",
+			"needle": "return { serial, covered: new Set([...phases.serial, ...phases.other]) };",
+			"replacement": "return { serial, covered: new Set([...phases.serial]) };",
 			"tests": ["tests/contract-gate-mapping.test.mjs"]
 		},
 		{

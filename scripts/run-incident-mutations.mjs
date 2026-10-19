@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadContractGateManifest } from "./check-contract-gates.mjs";
 import { withHermeticTestEnv } from "./hermetic-test-env.mjs";
 
 const FIXTURE = "tests/fixtures/incident-mutations.json";
@@ -30,6 +31,32 @@ const COPY_ALLOWLIST = Object.freeze([
 	"src",
 	"tests",
 ]);
+
+/**
+ * Paths the contract gates own that the fixed allowlist does not already copy.
+ * The baseline runs the gate mapping suite, which reads every gate-owned path,
+ * so the copy is derived from the INVARIANTS.md manifest rather than listed twice.
+ */
+function gateOwnedCopyPaths(root) {
+	const covered = (path) =>
+		COPY_ALLOWLIST.some(
+			(entry) => path === entry || path.startsWith(`${entry}/`),
+		);
+	const owned = new Set();
+	for (const gate of loadContractGateManifest(root))
+		for (const area of gate.areas) {
+			const path = area.endsWith("/**") ? area.slice(0, -3) : area;
+			if (path.includes("*") || !SAFE_PATH.test(path))
+				fail(`incident_gate_area_invalid:${gate.id}`);
+			if (!covered(path)) owned.add(path);
+		}
+	return [...owned].sort();
+}
+
+/** Every repo-relative path copied into the disposable baseline checkout. */
+export function incidentCopyPaths(root = process.cwd()) {
+	return [...COPY_ALLOWLIST, ...gateOwnedCopyPaths(root)];
+}
 
 function fail(message) {
 	const error = new Error(message);
@@ -134,7 +161,7 @@ function materialize(root) {
 	);
 	try {
 		mkdirSync(destination, { recursive: true, mode: 0o700 });
-		for (const relative of COPY_ALLOWLIST) {
+		for (const relative of incidentCopyPaths(root)) {
 			const source = join(root, relative);
 			copyAllowed(source, join(destination, relative), relative);
 		}
