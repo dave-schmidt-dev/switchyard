@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { isAbsolute, sep } from "node:path";
 import { systemClock } from "../util/clock.mjs";
+import { lsofListingComplete } from "../util/lsof-warnings.mjs";
 
 const PROBE_TIMEOUT_MS = 1_500;
 // A host-wide lsof walks every process; on a busy host it takes several
@@ -93,7 +94,7 @@ function listWorktreeHolders(worktreePath, pid = null) {
 		result.error ||
 		result.signal ||
 		typeof result.stdout !== "string" ||
-		/incomplete|warning/iu.test(result.stderr ?? "")
+		!lsofListingComplete(result.stderr, [scopePath])
 	)
 		return null;
 	if (result.status === 1 && result.stdout.trim() === "") return [];

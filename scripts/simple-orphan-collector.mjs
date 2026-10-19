@@ -46,7 +46,7 @@ export async function sweepSimpleOrphans({
 		canonicalTmp = realpathSync(tmpDir);
 		runIndex = readSimpleRunStore(resolve(stateRoot));
 		log("simple-orphans: checking open handles");
-		held = listHeldPaths();
+		held = listHeldPaths([canonicalTmp]);
 	} catch {
 		log(
 			"simple-orphans: temp directory or run store unavailable; refusing collection",
@@ -180,7 +180,7 @@ export async function sweepSimpleOrphans({
 			try {
 				currentRunIndex = readSimpleRunStore(resolve(stateRoot));
 				log("simple-orphans: rechecking run-store and open handles");
-				currentHeld = listHeldPaths();
+				currentHeld = listHeldPaths([canonicalTmp]);
 			} catch {
 				summary.failed += 1;
 				break;

@@ -3,6 +3,7 @@ import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { classifyRunLiveness } from "../src/switchyard/run-store/run-liveness.mjs";
+import { lsofListingComplete } from "../src/switchyard/util/lsof-warnings.mjs";
 
 const SIMPLE_PREFIX = "switchyard-simple-";
 export const SIMPLE_ORPHAN_TTL_MS = 86_400_000;
@@ -47,7 +48,7 @@ const DEFAULT_RUN_STORE_ROOT = resolve(
 	".logs",
 	"switchyard",
 );
-function parseLsofResult(result) {
+function parseLsofResult(result, scopeRoots = []) {
 	if (
 		result.error ||
 		typeof result.stdout !== "string" ||
@@ -55,18 +56,13 @@ function parseLsofResult(result) {
 		result.status !== 0
 	)
 		return null;
-	if (
-		/incomplete|WARNING/i.test(
-			typeof result.stderr === "string" ? result.stderr : "",
-		)
-	)
-		return null;
+	if (!lsofListingComplete(result.stderr, scopeRoots)) return null;
 	const held = [];
 	for (const line of result.stdout.split("\n"))
 		if (line.startsWith("n/")) held.push(line.slice(1));
 	return held;
 }
-export function listHeldPathsViaLsof(run = spawnSync) {
+export function listHeldPathsViaLsof(scopeRoots = [], run = spawnSync) {
 	// `-nP` skips reverse DNS and port lookups. Without it, a 0.2 s host-wide
 	// scan took 30.5 s on 2026-10-18 and this bound refused every collection.
 	return parseLsofResult(
@@ -77,6 +73,7 @@ export function listHeldPathsViaLsof(run = spawnSync) {
 			maxBuffer: LSOF_MAX_BUFFER_BYTES,
 			env: { ...LSOF_ENV },
 		}),
+		scopeRoots,
 	);
 }
 function inspectSimpleTree(root, onProgress = () => {}) {

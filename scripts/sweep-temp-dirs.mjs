@@ -40,6 +40,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { lsofListingComplete } from "../src/switchyard/util/lsof-warnings.mjs";
 import {
 	SIMPLE_ORPHAN_TTL_MS,
 	sweepSimpleOrphans,
@@ -67,21 +68,22 @@ const MS_PER_DAY = 86_400_000;
  * original sweep's guard vacuous. A *partial* listing is the same defect one
  * step further in: `lsof` exits non-zero and warns on stderr when it could not
  * inspect every process, and accepting that output as complete would let the
- * sweep delete a directory an uninspected process still holds. Measured on
- * this host, an unprivileged `lsof -Fn` exits 0 with empty stderr, so the
- * strict reading costs nothing here and fails closed where it would not.
+ * sweep delete a directory an uninspected process still holds. The one
+ * warning tolerated is an unstattable mount outside `scopeRoots`, which a Time
+ * Machine backup to a network share prints for its whole run
+ * (`lsofListingComplete`).
  * @param {{error?: unknown, status?: number|null, stdout?: unknown, stderr?: unknown}} result
+ * @param {readonly string[]} [scopeRoots] Realpaths the caller will act under.
  * @returns {string[] | null}
  */
-export function parseLsofResult(result) {
+export function parseLsofResult(result, scopeRoots = []) {
 	if (result.error || typeof result.stdout !== "string" || !result.stdout) {
 		return null;
 	}
 	if (result.status !== 0) {
 		return null;
 	}
-	const stderr = typeof result.stderr === "string" ? result.stderr : "";
-	if (/incomplete|WARNING/i.test(stderr)) {
+	if (!lsofListingComplete(result.stderr, scopeRoots)) {
 		return null;
 	}
 	const held = [];
@@ -101,7 +103,7 @@ export function parseLsofResult(result) {
  * @param {typeof spawnSync} [run]
  * @returns {string[] | null}
  */
-export function listHeldPathsViaLsof(run = spawnSync) {
+export function listHeldPathsViaLsof(scopeRoots = [], run = spawnSync) {
 	// Deliberately no `-w`: suppressing lsof's warnings would suppress the
 	// evidence that its listing is incomplete. `-nP` skips reverse DNS and port
 	// lookups, which alone took a 0.2 s scan to 30.5 s on 2026-10-18.
@@ -110,6 +112,7 @@ export function listHeldPathsViaLsof(run = spawnSync) {
 			encoding: "utf8",
 			maxBuffer: 512 * 1024 * 1024,
 		}),
+		scopeRoots,
 	);
 }
 
@@ -183,7 +186,8 @@ export function isSweepAuthorized(canonicalPath, canonicalTmpDir) {
  * @param {boolean} [options.apply] Remove rather than report. Defaults to false.
  * @param {number} [options.maxAgeDays] Retain anything touched more recently.
  * @param {number} [options.now] Epoch ms to measure age against.
- * @param {() => (string[] | null)} [options.listHeldPaths] Open-handle source.
+ * @param {(scopeRoots: string[]) => (string[] | null)} [options.listHeldPaths]
+ *   Open-handle source, complete for paths under `scopeRoots`.
  * @param {(message: string) => void} [options.log]
  * @returns {{status: number, summary: object}}
  */
@@ -218,7 +222,7 @@ export function sweepTempDirs({
 		return { status: 1, summary };
 	}
 
-	const held = listHeldPaths();
+	const held = listHeldPaths([canonicalTmp]);
 	if (held === null) {
 		// Deleting without the open-handle check is exactly the failure this
 		// script exists to not repeat.

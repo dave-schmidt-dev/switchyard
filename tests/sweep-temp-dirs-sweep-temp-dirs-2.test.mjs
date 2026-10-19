@@ -302,7 +302,7 @@ describe("sweep-temp-dirs", () => {
 		const calls = [];
 		const { status, summary } = await collectSimple(parent, stateRoot, {
 			listHeldPaths: () =>
-				listHeldPathsViaLsof(fakeSpawnSyncLsof(stdout, calls)),
+				listHeldPathsViaLsof([], fakeSpawnSyncLsof(stdout, calls)),
 		});
 		deepStrictEqual(
 			[status, summary.skippedHeld, summary.wouldRemove],

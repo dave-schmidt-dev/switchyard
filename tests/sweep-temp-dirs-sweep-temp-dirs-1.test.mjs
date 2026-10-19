@@ -345,7 +345,7 @@ describe("sweep-temp-dirs", () => {
 	});
 	it("uses a bounded lsof invocation with a sanitized environment", () => {
 		let invocation;
-		const result = listHeldPathsViaLsof((command, args, options) => {
+		const result = listHeldPathsViaLsof([], (command, args, options) => {
 			invocation = { command, args, options };
 			return { status: 0, stdout: "p1\nn/private/tmp/held\n", stderr: "" };
 		});
@@ -361,13 +361,14 @@ describe("sweep-temp-dirs", () => {
 			"PATH",
 		]);
 		strictEqual(
-			listHeldPathsViaLsof(() => ({ error: { code: "ETIMEDOUT" } })),
+			listHeldPathsViaLsof([], () => ({ error: { code: "ETIMEDOUT" } })),
 			null,
 		);
 	});
 	it("keeps the broad sweep's lsof out of name resolution", () => {
 		const calls = [];
 		const held = listSweepHeldPaths(
+			[],
 			fakeSpawnSyncLsof("p1\nn/private/tmp/held\n", calls),
 		);
 		deepStrictEqual(held, ["/private/tmp/held"]);
