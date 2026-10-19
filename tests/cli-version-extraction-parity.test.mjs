@@ -1,3 +1,4 @@
+// @test-phase: other
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
