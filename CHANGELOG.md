@@ -6,6 +6,7 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Added
 
+- `switchyard-dispatch doctor [--quick] [--json]` gives a read-only host diagnosis: sandbox toolchain, provider CLI versions, bridge content pins, qualification expiry within 9 days, repair holds, stranded pending attempts and the canary and reaper LaunchAgents. Each check prints one line and its fix commands. Exit status is 0 when nothing failed, 1 on a failure and 2 on a usage error. `simple` prints a one-line quick-subset warning at start when a check finds a problem.
 - `simple --timeout <minutes>` provides a relative 1–30 minute alternative to `--deadline`.
 - Add optional `simple --estimate-minutes` admission before provider work, with deadline-fit diagnostics and a split recommendation for estimates of 20 minutes or more. Existing deadline caps and funding safeguards remain unchanged.
 - Support bounded Python Quick checks through an existing project virtual environment, with candidate imports, confined caches, and matching planning-side validation.
@@ -53,6 +54,8 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - The stabilization freeze is lifted. README and INVARIANTS now record the 2026-09 observation window as closed (39 ledger rows, last kept 2026-09-13); routing-policy, provider-enablement and quota changes still need the owner's go.
 - Live-VM tests are opt-in. They run only with `SWITCHYARD_LIVE_VM_TESTS=1` (at milestones and before VM-lane releases), so `npm test` and the pre-push gate no longer boot a Parallels VM whenever a golden image is configured. `SWITCHYARD_SKIP_LIVE_VM_TESTS` is retired.
 - Receipt renewal moved from the queue to `simple`: after every succeeded `simple` run (work or qualification origin) Switchyard calls `~/.agent/bin/roster renew <run.json> --file <roster>` against the roster it routed from, bounded to 30 seconds with progress on stderr. A renewal failure never changes the run's result or exit status. The queue no longer renews.
+- Test lanes come from a `// @test-phase:` pragma on each test file instead of hand-kept lists in `package.json`, and an untagged file fails both lanes. The serial lane now runs in lexical order.
+- Every `node --test` that the test, validate, contract-gate, coverage, mutation and canary scripts spawn runs under a hermetic environment: `HOME`, `TMPDIR` and the Switchyard state roots point into one per-run scratch directory, so tests no longer read or write the owner's roster or state.
 - Orphaned-lock remediation takes project lock names from the run store instead of keeping its own copy of the hash, so the two can no longer drift apart and leave a stuck lock unfindable.
 - Persist closed, deduplicated route-refusal reasons in caller and durable evidence, distinguishing funding exhaustion from capacity exhaustion.
 
