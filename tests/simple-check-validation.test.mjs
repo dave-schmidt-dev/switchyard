@@ -143,6 +143,10 @@ describe("simple check validation", () => {
 			["xcrun simctl boot 1234", "xcrun simctl"],
 			["codesign -s identity App.app", "codesign"],
 			["security find-identity -v", "security"],
+			// A newline outside quotes ends a command, as a semicolon does.
+			["true\nsimctl list devices", "simctl"],
+			["true\nxcodebuild test", "xcodebuild test"],
+			["xcrun xcodebuild test -scheme App", "xcodebuild test"],
 		]) {
 			const error = rejection(command);
 			strictEqual(error.code, "check_tool_denied", command);
@@ -168,6 +172,9 @@ describe("simple check validation", () => {
 			"xcodebuild -list -project App.xcodeproj",
 			"xcodebuild -scheme App build",
 			"xcodebuild -showBuildTimingSummary -scheme App build",
+			"xcrun xcodebuild -version",
+			"xcodebuild -scheme App build\n",
+			'python3 -c "import sys\nprint(sys.argv)"',
 		]) {
 			validateCheckCommand(command, PROJECT_PATH);
 		}
@@ -186,6 +193,13 @@ describe("simple check validation", () => {
 			"xcodegen generate && xcodebuild build",
 			"xcodebuild build | cat",
 			"xcodebuild -someNewFlag build",
+			"env CI=1 xcodebuild -scheme App archive",
+			"xcrun xcodebuild -scheme App build",
+			// An info flag counts only as an xcodebuild argument, not a wrapper's.
+			"xcrun -showsdks xcodebuild -scheme App",
+			"command xcodebuild build",
+			"true\nxcodebuild archive",
+			"xcodebuild build\nxcodebuild archive",
 		]) {
 			const error = rejection(command);
 			ok(error, command);

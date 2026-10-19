@@ -46,6 +46,17 @@ const XCODEBUILD_INFO_FLAGS = new Set([
 	"-showdestinations",
 	"-showTestPlans",
 ]);
+// Heads that run the command after them, so `env CI=1 xcodebuild archive` and
+// `xcrun xcodebuild test` are xcodebuild invocations too.
+const COMMAND_WRAPPERS = new Set([
+	"env",
+	"xcrun",
+	"command",
+	"exec",
+	"nice",
+	"nohup",
+	"time",
+]);
 const XCODEBUILD_BUILD_HINT =
 	"--check may build with xcodebuild only as one plain `xcodebuild [flags] build` command (no env prefix, chain, or other action such as build-for-testing, archive or clean); other xcodebuild work runs natively";
 
@@ -74,6 +85,8 @@ function commandSegments(command) {
 			else word += char;
 		} else if (char === "'" || char === '"') {
 			quote = char;
+		} else if (char === "\n") {
+			endSegment();
 		} else if (/\s/u.test(char)) {
 			endWord();
 		} else if (/[;&|(){}]/u.test(char)) {
@@ -128,30 +141,46 @@ function plainSwiftBuild(words) {
 	);
 }
 
+// The xcodebuild arguments of an invocation run directly or through a command
+// wrapper, or null when the segment does not run xcodebuild.
+function xcodebuildArguments(words) {
+	const head = toolName(words[0] ?? "");
+	const index =
+		head === "xcodebuild"
+			? 0
+			: COMMAND_WRAPPERS.has(head)
+				? words.findIndex((word) => toolName(word) === "xcodebuild")
+				: -1;
+	return index === -1 ? null : words.slice(index + 1);
+}
+
 // xcodebuild's test action boots simulators. Actions are read with the same
 // parser that gates the sandbox's xcodebuild grants, so a flag value such as
 // `-scheme test` is not an action; an unreadable invocation is refused when
 // any word is `test`.
 function xcodebuildTest(words) {
-	if (toolName(words[0] ?? "") !== "xcodebuild") return false;
-	const actions = xcodebuildActions(["xcodebuild", ...words.slice(1)]);
+	const args = xcodebuildArguments(words);
+	if (args === null) return false;
+	const actions = xcodebuildActions(["xcodebuild", ...args]);
 	return actions
 		? actions.includes("test")
-		: words.slice(1).some((word) => word === "test");
+		: args.some((word) => word === "test");
 }
 
 // Only the check the sandbox grants xcodebuild access to may build, and that
 // grant reads the whole command (isXcodebuildBuild). Any other invocation that
-// would build (another action, no action, an env prefix, a chain, or a flag
+// would build (another action, no action, an env prefix or wrapper, a chain or
+// a second line, or a flag
 // the parser cannot read) runs without the grants and dies on the Xcode
 // license read, which looks like a host fault, so it is refused here.
 function xcodebuildUngranted(command, words) {
-	if (toolName(words[0] ?? "") !== "xcodebuild") return false;
+	const args = xcodebuildArguments(words);
+	if (args === null) return false;
 	if (isXcodebuildBuild(command)) return false;
-	const actions = xcodebuildActions(["xcodebuild", ...words.slice(1)]);
+	const actions = xcodebuildActions(["xcodebuild", ...args]);
 	return !(
 		actions?.length === 0 &&
-		words.some((word) => XCODEBUILD_INFO_FLAGS.has(word))
+		args.some((word) => XCODEBUILD_INFO_FLAGS.has(word))
 	);
 }
 
