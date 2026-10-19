@@ -102,6 +102,7 @@ extract_cli_version() {
       for (i = 1; i <= NF; i++) {
         w = $i
         sub(/[^0-9A-Za-z]+$/, "", w)
+        if (w ~ /^[vV][0-9]/) w = substr(w, 2)
         if (ver == "" && w ~ /^[0-9][0-9A-Za-z.+_-]*$/) {
           ver = w
         }

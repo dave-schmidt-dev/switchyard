@@ -19,6 +19,11 @@ import {
 import { projectRunFailureForDisk } from "../adapter/exec-error-sanitize.mjs";
 import { boundProviderLifecycleSnapshot } from "../adapter/provider-lifecycle.mjs";
 import {
+	CLI_CONTRACT_FAILURE_REASON,
+	checkTargetCliContract,
+	cliContractPreflightDetail,
+} from "../cli-contract/canary.mjs";
+import {
 	resolveFailure,
 	sanitizeGitControlTamper,
 } from "../diagnostics/failure-registry.mjs";
@@ -1376,8 +1381,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 			reportMode,
 		});
 		currentPhase = "preflight";
-		const admissionFor = (repair = false) =>
-			prepareSimpleProviderStart({
+		// The CLI contract canary runs against the real CLIs only on the real
+		// provider path; an injected provider brings its own contract seam.
+		const checkCliContract =
+			dependencies.checkProviderCliContract ??
+			(executeProvider === defaultExecuteProvider
+				? ({ targetId: id, ...rest }) => checkTargetCliContract(id, rest)
+				: null);
+		const admissionFor = async (repair = false) => {
+			const admission = await prepareSimpleProviderStart({
 				targetId,
 				deadlineMs: options.deadlineMs,
 				now,
@@ -1386,6 +1398,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					heartbeat("preflight", { processPhase: "launcher_probe" }),
 				probe: dependencies.probeSimpleLauncher,
 				runProbe: dependencies.runLauncherProbe,
+				checkCliContract,
 				healthController,
 				recorderPath:
 					(executeProvider === defaultExecuteProvider ||
@@ -1401,6 +1414,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 						: null,
 				createRecorder: dependencies.createBridgeRequestRecorder,
 			});
+			// An inconclusive canary admits; the milestone keeps that visible.
+			if (admission.cliContract?.status === "unavailable")
+				milestone("preflight", "cli_contract_unverified", {
+					cli: admission.cliContract.cli,
+					cliContractDetail: admission.cliContract.detail,
+				});
+			return admission;
+		};
 		const failAdmission = (admission) => {
 			const providerWriterLifecycle = providerStarted
 				? (providerExecutionResult?.writerLifecycle ?? "unavailable")
@@ -1417,12 +1438,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 					? "unavailable"
 					: providerWriterLifecycle;
 			if (writerLifecycle === "unavailable") keepWorktree = true;
+			if (
+				admission.failureReason === CLI_CONTRACT_FAILURE_REASON &&
+				admission.cliContract
+			)
+				preflightDetail = cliContractPreflightDetail(admission.cliContract);
 			const result = fail(
 				admission.failureReason,
 				"preflight",
 				[
 					"launcher_environment_unavailable",
 					"request_log_open_failed",
+					CLI_CONTRACT_FAILURE_REASON,
 				].includes(admission.failureReason)
 					? "environment_failure"
 					: null,

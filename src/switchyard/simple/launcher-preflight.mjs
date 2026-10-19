@@ -1,5 +1,6 @@
 import { lstatSync, unlinkSync } from "node:fs";
 import { runProviderProcess } from "../adapter/provider-lifecycle.mjs";
+import { CLI_CONTRACT_FAILURE_REASON } from "../cli-contract/canary.mjs";
 import { createBridgeRequestRecorder } from "./request-evidence.mjs";
 
 const GUARDED_TARGETS = new Set([
@@ -90,7 +91,12 @@ export async function probeSimpleLauncher({
 			);
 }
 
-/** Admission order is probe, recorder readiness, then the health start fence. */
+/**
+ * Admission order is the CLI contract canary, the launcher probe, recorder
+ * readiness, then the health start fence. A CLI that no longer honors its
+ * lane's contract fails typed before any probe child, recorder or half-open
+ * trial; an inconclusive canary (timeout, spawn error) admits and is reported.
+ */
 export async function prepareSimpleProviderStart({
 	targetId,
 	deadlineMs,
@@ -99,10 +105,25 @@ export async function prepareSimpleProviderStart({
 	onProgress,
 	probe = probeSimpleLauncher,
 	runProbe,
+	checkCliContract = null,
 	healthController,
 	recorderPath = null,
 	createRecorder = createBridgeRequestRecorder,
 }) {
+	const cliContract = checkCliContract
+		? await checkCliContract({
+				targetId,
+				deadlineMs,
+				now: now ?? Date.now,
+				signal,
+				onProgress,
+			})
+		: null;
+	if (cliContract && !["ok", "unavailable"].includes(cliContract.status))
+		return {
+			...unavailable("never_started", CLI_CONTRACT_FAILURE_REASON),
+			cliContract,
+		};
 	const admission = await probe({
 		targetId,
 		deadlineMs,
@@ -205,6 +226,7 @@ export async function prepareSimpleProviderStart({
 	return {
 		success: true,
 		probeWriterLifecycle: admission.probeWriterLifecycle,
+		cliContract,
 		healthStart,
 		recorder,
 		cancelUnstarted,

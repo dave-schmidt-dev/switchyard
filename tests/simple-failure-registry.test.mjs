@@ -46,9 +46,11 @@ function oracleErrorKind(failureReason, failurePhase, errno) {
 	)
 		return "environment_failure";
 	if (
-		["launcher_environment_unavailable", "request_log_open_failed"].includes(
-			failureReason,
-		)
+		[
+			"launcher_environment_unavailable",
+			"request_log_open_failed",
+			"provider_cli_contract_failed",
+		].includes(failureReason)
 	)
 		return "environment_failure";
 	if (failureReason === "run_store_write_failed")
@@ -206,9 +208,11 @@ const ORACLE_CLOSED_CAUSE_CODES = new Map([
 
 function oracleCauseCode(reason, phase, providerResult, errorKind) {
 	if (
-		["launcher_environment_unavailable", "request_log_open_failed"].includes(
-			reason,
-		)
+		[
+			"launcher_environment_unavailable",
+			"request_log_open_failed",
+			"provider_cli_contract_failed",
+		].includes(reason)
 	)
 		return "environment_failure";
 	if (reason === "run_store_write_failed") return "run_store_write_failed";
