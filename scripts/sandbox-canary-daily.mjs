@@ -227,6 +227,7 @@ export function notifyLocal({
 			killSignal: "SIGKILL",
 			encoding: "utf8",
 			stdio: "ignore",
+			progressLabel: "Sandbox canary: local notification still pending",
 		});
 		if (result?.error) {
 			return { sent: false, tool, error: result.error.code ?? "notify_failed" };
@@ -345,7 +346,7 @@ export function runCanaryCli({
 			error(
 				`warning: ${notification.kind} notification not sent (${
 					result?.error ?? "unknown"
-				})`,
+				}; tool=${result?.tool ?? "unknown"})`,
 			);
 		}
 	}

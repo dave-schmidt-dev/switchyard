@@ -4,7 +4,9 @@
  * The same rule as the simple integrate step: when peer commits advanced HEAD,
  * the patch must pass the same acceptance checks at the new HEAD before any
  * host mutation. The checker runs in a disposable root the apply run owns and
- * records, so an interrupted apply leaves a claim recovery can find.
+ * records, so an interrupted apply leaves a claim recovery can find. A check
+ * the held run accepted differentially is judged against the base-tree
+ * baselines its receipt carries, as the run's own HEAD-advance recheck is.
  */
 import { randomUUID } from "node:crypto";
 import {
@@ -43,8 +45,11 @@ function writeOwnerMarker(root, runId, nonce) {
  * Run every held acceptance check against `head` with `patch` applied in a
  * sandboxed checker. Resolves `{ ok: true }` only when every check passed and
  * the checker was proven stopped and removed; otherwise `{ ok: false, detail,
- * checkIndex?, checker }`, where `checker: "retained"` means its root is left
- * for recovery. It never touches the project tree.
+ * checkIndex?, differentialReason?, checker }`, where `differentialReason`
+ * is the closed reason a differential judgement refused the check and
+ * `checker: "retained"` means its root is left for recovery.
+ * `differentialBaselines` (null for a receipt without them) seeds the
+ * session. It never touches the project tree.
  */
 export async function runHeldRechecks(
 	{
@@ -53,6 +58,7 @@ export async function runHeldRechecks(
 		head,
 		patch,
 		receipt,
+		differentialBaselines = null,
 		deadlineMs,
 		now = Date.now,
 		signal,
@@ -107,6 +113,7 @@ export async function runHeldRechecks(
 			deadlineMs,
 			cachePath: deps.checkCachePath,
 			evidenceDir: join(getRunRoot(applyRunId), "check-evidence"),
+			differentialBaselines,
 			now,
 			signal,
 			onProgress: () => onProgress({ processPhase: "held_recheck_preparing" }),
@@ -122,7 +129,15 @@ export async function runHeldRechecks(
 					}),
 			});
 			if (!result?.success) {
-				verdict = { ok: false, detail: "check_failed", checkIndex: index + 1 };
+				const differentialReason = result?.differential?.reason;
+				verdict = {
+					ok: false,
+					detail: "check_failed",
+					checkIndex: index + 1,
+					...(typeof differentialReason === "string"
+						? { differentialReason }
+						: {}),
+				};
 				break;
 			}
 		}

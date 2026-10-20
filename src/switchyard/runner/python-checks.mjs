@@ -1,12 +1,11 @@
-import {
-	appendFileSync,
-	lstatSync,
-	readFileSync,
-	realpathSync,
-	statSync,
-} from "node:fs";
+import { appendFileSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { join, sep } from "node:path";
-import { linkPythonVenv, venvBaseInterpreterPrefix } from "./python-venv.mjs";
+import {
+	linkPythonVenv,
+	sharedVenvRoot,
+	verifiedPythonVenv,
+	verifySharedVenvRoot,
+} from "./python-venv.mjs";
 
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 const PYTHON_MANIFESTS = [
@@ -37,7 +36,7 @@ export function isPythonCheck(args) {
 		!Array.isArray(args) ||
 		args.some((arg) => typeof arg !== "string") ||
 		args.join(" ").length > 300 ||
-		args[0] !== ".venv/bin/python" ||
+		(args[0] !== ".venv/bin/python" && !sharedVenvRoot(args[0])) ||
 		args[1] !== "-m" ||
 		args[2] !== "pytest"
 	)
@@ -99,38 +98,17 @@ function ownerVenv(projectPath) {
 		throw refused();
 	}
 	if (!inside(venv, project)) throw refused("check_venv_outside_project");
-	try {
-		if (
-			!statSync(venv).isDirectory() ||
-			!lstatSync(join(venv, "pyvenv.cfg")).isFile()
-		)
-			throw refused();
-		const prefixes = venvBaseInterpreterPrefix(venv);
-		if (prefixes.length === 0) throw refused();
-		const python = realpathSync(join(venv, "bin", "python"));
-		const executable = statSync(python);
-		if (
-			!executable.isFile() ||
-			!(executable.mode & 0o111) ||
-			![venv, ...prefixes.map((path) => realpathSync(path))].some((root) =>
-				inside(python, root),
-			)
-		)
-			throw refused();
-		return venv;
-	} catch (error) {
-		if (error.code === "check_venv_outside_project") throw error;
-		throw refused();
-	}
+	return verifiedPythonVenv(venv);
 }
 
 /** The one ignored dependency entry must remain the exact trusted owner link. */
-export function verifyPythonCheckLink(projectPath, clone) {
+export function verifyPythonCheckLink(projectPath, clone, sharedVenv = null) {
 	try {
 		const linked = join(clone, ".venv");
 		return (
 			lstatSync(linked).isSymbolicLink() &&
-			realpathSync(linked) === ownerVenv(projectPath)
+			realpathSync(linked) ===
+				(sharedVenv ? verifySharedVenvRoot(sharedVenv) : ownerVenv(projectPath))
 		);
 	} catch {
 		return false;
@@ -138,12 +116,13 @@ export function verifyPythonCheckLink(projectPath, clone) {
 }
 
 /** Reject candidate-provided venv entries, then reuse P0 without broader grants. */
-export function preparePythonChecks(projectPath, clone) {
+export function preparePythonChecks(projectPath, clone, sharedVenv = null) {
 	if (!verifyPythonManifests(projectPath, clone) || entry(join(clone, ".venv")))
 		throw refused();
-	ownerVenv(projectPath);
-	const readOnlyPaths = linkPythonVenv(projectPath, clone);
-	if (!verifyPythonCheckLink(projectPath, clone)) throw refused();
+	if (sharedVenv) verifySharedVenvRoot(sharedVenv);
+	else ownerVenv(projectPath);
+	const readOnlyPaths = linkPythonVenv(projectPath, clone, sharedVenv);
+	if (!verifyPythonCheckLink(projectPath, clone, sharedVenv)) throw refused();
 	appendFileSync(join(clone, ".git", "info", "exclude"), "\n/.venv\n");
 	return readOnlyPaths;
 }
@@ -159,4 +138,23 @@ export function pythonCheckEnv(clone, env, runtime) {
 		PYTEST_ADDOPTS: `-o cache_dir=${JSON.stringify(join(runtime, "pytest-cache"))} --basetemp=${JSON.stringify(join(runtime, "pytest-tmp"))}`,
 		XDG_CACHE_HOME: join(runtime, "cache"),
 	};
+}
+
+/** A bounded command is its declaration; one check set may read one shared venv. */
+export function declaredSharedVenv(checks) {
+	const roots = new Set(
+		checks
+			.filter(isPythonCheck)
+			.map((args) => sharedVenvRoot(args[0]))
+			.filter(Boolean),
+	);
+	if (
+		roots.size > 1 ||
+		(roots.size &&
+			checks.some(
+				(args) => isPythonCheck(args) && args[0] === ".venv/bin/python",
+			))
+	)
+		throw refused();
+	return [...roots][0] ?? null;
 }

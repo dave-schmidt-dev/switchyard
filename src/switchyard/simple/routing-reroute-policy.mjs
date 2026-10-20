@@ -57,21 +57,4 @@ export const FUNDING_UNAVAILABLE = new Set([
 	"included_usage_unverified",
 ]);
 
-/**
- * Terminal recorded for one failed attempt.
- *
- * Wall-clock provider timeouts are task-scoped, never run-scoped: a slow or
- * oversized task must not latch its target into the run-wide failed set, where
- * every later task in the routing run would lose it. A deadline timeout
- * therefore records "skipped" even when accountability is provider-memory
- * eligible. Cross-task evidence stays route health's job: its lifecycle-backed
- * deadline trust cools hung providers down across tasks.
- */
-export function failureTerminal(result, providerMemoryEligible) {
-	if (
-		(result.providerReliability?.causeCode ?? result.failureReason) ===
-		"provider_deadline_exceeded"
-	)
-		return "skipped";
-	return providerMemoryEligible ? "failed" : "skipped";
-}
+export { failureTerminal } from "../diagnostics/failure-semantics.mjs";

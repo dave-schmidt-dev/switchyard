@@ -49,12 +49,25 @@ export function probeSandboxExecUsable({
 			["-p", "(version 1)(allow default)", "/usr/bin/true"],
 			{ stdio: "ignore", timeout: timeoutMs, killSignal: "SIGKILL" },
 		);
-		if (result.status === 0) {
+		if (result.status === 0 && !result.error && !result.signal) {
 			return { usable: true, reason: null };
 		}
 		return {
 			usable: false,
-			reason: "sandbox_exec_failed_nested_or_restricted",
+			reason:
+				result.error?.code === "ETIMEDOUT"
+					? "sandbox_exec_probe_timed_out"
+					: result.error
+						? "sandbox_exec_spawn_error"
+						: result.signal
+							? "sandbox_exec_probe_signalled"
+							: "sandbox_exec_failed_nested_or_restricted",
+			evidence: {
+				exitCode: result.status ?? null,
+				signal: result.signal ?? null,
+				errorCode: result.error?.code ?? null,
+				timeoutMs,
+			},
 		};
 	} catch (err) {
 		return {
@@ -151,7 +164,8 @@ export function runSandboxCanary({
 	probes,
 	platform = process.platform,
 	toolchainTestPath,
-	toolchainTimeoutMs = 120_000,
+	// Toolchain work shares the overall deadline; do not add a tighter 120s race.
+	toolchainTimeoutMs = DEFAULT_CANARY_DEADLINE_MS,
 	deadlineMs = DEFAULT_CANARY_DEADLINE_MS,
 	clock = Date.now,
 	profileFactory = quickCheckSandboxProfile,
@@ -209,10 +223,11 @@ export function runSandboxCanary({
 				name: "sandbox-exec-availability",
 				status: "unavailable",
 				reason: probeState.reason,
+				evidence: probeState.evidence,
 			},
 		]);
 		error(
-			`Sandbox canary unavailable: ${probeState.reason} (ALL-skipped/unavailable is never a successful host canary)`,
+			`Sandbox canary unavailable: ${probeState.reason} ${JSON.stringify(probeState.evidence ?? {})} (ALL-skipped/unavailable is never a successful host canary)`,
 		);
 		return evaluation;
 	}
@@ -268,6 +283,8 @@ export function runSandboxCanary({
 							timeout,
 							killSignal: "SIGKILL",
 							maxBuffer: 262144,
+							forwardOutput: true,
+							progressLabel: `Sandbox canary: ${name} still running`,
 						},
 					);
 					const outcome = parse(result);
@@ -385,6 +402,8 @@ process.stdout.write(JSON.stringify({ writeDenied }));
 							timeout,
 							killSignal: "SIGKILL",
 							maxBuffer: 262144,
+							forwardOutput: true,
+							progressLabel: "Sandbox canary: toolchain probes still running",
 						},
 					),
 			);

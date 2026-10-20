@@ -1,11 +1,14 @@
 import {
 	existsSync,
+	lstatSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	statSync,
 	symlinkSync,
 } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { userInfo } from "node:os";
+import { dirname, isAbsolute, join, sep } from "node:path";
 
 /** Refusals carry only the closed code the check session persists. */
 function refused(code) {
@@ -18,11 +21,12 @@ function refused(code) {
  * leaves the project is refused rather than exposed to the sandbox. Returns
  * the read-only roots the sandbox may observe, the resolved venv first.
  */
-export function linkPythonVenv(projectPath, clonePath) {
-	const venv = join(projectPath, ".venv");
+export function linkPythonVenv(projectPath, clonePath, sharedVenv = null) {
+	const venv = sharedVenv ?? join(projectPath, ".venv");
+	if (sharedVenv) verifySharedVenvRoot(sharedVenv);
 	if (!existsSync(venv)) return [];
 	const resolved = realpathSync(venv);
-	if (!resolved.startsWith(`${realpathSync(projectPath)}/`))
+	if (!sharedVenv && !resolved.startsWith(`${realpathSync(projectPath)}/`))
 		throw refused("check_venv_outside_project");
 	const linked = join(clonePath, ".venv");
 	if (!existsSync(linked)) symlinkSync(resolved, linked);
@@ -53,4 +57,97 @@ export function venvBaseInterpreterPrefix(venv) {
 	if (prefix === "/" || prefix === "/usr") return [];
 	const alias = dirname(declared);
 	return alias === prefix ? [prefix] : [prefix, alias];
+}
+
+/** Syntactic declaration only: portable parsing never queries the host account. */
+export function sharedVenvRoot(executable) {
+	if (typeof executable !== "string" || !isAbsolute(executable)) return null;
+	const parts = executable.split("/");
+	if (
+		parts
+			.slice(1)
+			.some(
+				(part) =>
+					!/^[A-Za-z0-9_@+-][A-Za-z0-9._@+-]*$/u.test(part) &&
+					part !== ".venvs",
+			)
+	)
+		return null;
+	if (
+		parts.at(-4) !== ".venvs" ||
+		parts.at(-2) !== "bin" ||
+		parts.at(-1) !== "python" ||
+		parts.length < 6
+	)
+		return null;
+	return dirname(dirname(executable));
+}
+
+/** Bind the declared root to this account, without following a shared-root alias. */
+export function verifySharedVenvRoot(venv, home = userInfo().homedir) {
+	try {
+		const parent = join(realpathSync(home), ".venvs");
+		if (
+			dirname(venv) !== parent ||
+			!lstatSync(parent).isDirectory() ||
+			!lstatSync(venv).isDirectory() ||
+			realpathSync(venv) !== venv
+		)
+			throw refused("setup_unavailable");
+		return verifiedPythonVenv(venv);
+	} catch {
+		throw refused("setup_unavailable");
+	}
+}
+
+/** Existing project-venv executable/base-prefix proof, shared by both forms. */
+export function verifiedPythonVenv(venv) {
+	try {
+		if (
+			!statSync(venv).isDirectory() ||
+			!lstatSync(join(venv, "pyvenv.cfg")).isFile()
+		)
+			throw refused("setup_unavailable");
+		const prefixes = venvBaseInterpreterPrefix(venv);
+		if (prefixes.length === 0) throw refused("setup_unavailable");
+		const python = realpathSync(join(venv, "bin", "python"));
+		const executable = statSync(python);
+		if (
+			!executable.isFile() ||
+			!(executable.mode & 0o111) ||
+			![venv, ...prefixes.map((path) => realpathSync(path))].some((root) =>
+				python.startsWith(`${root}${sep}`),
+			)
+		)
+			throw refused("setup_unavailable");
+		return venv;
+	} catch {
+		throw refused("setup_unavailable");
+	}
+}
+
+/** Recheck identity and interpreter proof before and after a shared check. */
+export function sharedVenvReadProof(venv, home = userInfo().homedir) {
+	const snapshot = () => {
+		verifySharedVenvRoot(venv, home);
+		return JSON.stringify([
+			...[
+				venv,
+				join(venv, "pyvenv.cfg"),
+				realpathSync(join(venv, "bin", "python")),
+				...venvBaseInterpreterPrefix(venv),
+			].map((path) => {
+				const stat = statSync(path);
+				return [path, stat.dev, stat.ino];
+			}),
+			readFileSync(join(venv, "pyvenv.cfg"), "utf8"),
+		]);
+	};
+	const initial = snapshot();
+	return {
+		readOnlyPaths: [venv, ...venvBaseInterpreterPrefix(venv)],
+		verify() {
+			if (snapshot() !== initial) throw refused("setup_unavailable");
+		},
+	};
 }

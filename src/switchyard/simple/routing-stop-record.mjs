@@ -1,7 +1,7 @@
 /** Closed lifecycle verdicts and failure-log record shapes for the routing waterfall. */
 import { createHash } from "node:crypto";
 import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
-import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
+import { loggedFailureReason } from "../diagnostics/failure-semantics.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
 
@@ -170,23 +170,6 @@ function causeFields(result, accountability = result?.accountability) {
 		checkAcceptance: result?.checkAcceptance ?? undefined,
 		toleratedBaselineFailures: result?.toleratedBaselineFailures ?? undefined,
 	};
-}
-
-function loggedFailureReason(result, accountability, classification) {
-	const reliability = result?.providerReliability;
-	const confirmedProviderDeadline =
-		result?.status === "failed" &&
-		result.failurePhase === "execute" &&
-		classification.reason === "execution_failed" &&
-		isProviderReliabilityDiagnostic(reliability) &&
-		reliability.causeCode === "provider_deadline_exceeded" &&
-		reliability.phase === "provider" &&
-		reliability.timedOut === true &&
-		accountability?.owner === "provider" &&
-		accountability.causeCode === reliability.causeCode;
-	return confirmedProviderDeadline
-		? "provider_deadline_exceeded"
-		: classification.reason;
 }
 
 /** Failure-log attempt record for one failed engine result. */

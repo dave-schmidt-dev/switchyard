@@ -62,14 +62,14 @@ const qualified = (at) => ({
 	tested_at: new Date(at).toISOString(),
 });
 
-function writeHold(root, targetId) {
+function writeHold(root, targetId, descriptorIdentity = "sha256:aa11") {
 	mkdirSync(join(root, "control"), { recursive: true });
 	writeFileSync(
 		join(root, "control", `${targetId}.json`),
 		JSON.stringify({
 			schemaVersion: 1,
 			targetId,
-			descriptorIdentity: "sha256:aa11",
+			descriptorIdentity,
 			repairEpoch: 0,
 			attestations: [],
 			holds: [
@@ -147,10 +147,55 @@ describe("doctor state readers", () => {
 		const root = tempDir("doctor-health-");
 		deepStrictEqual(readRepairHolds({ root }), { root, controls: [] });
 		writeHold(root, "codex");
-		const { controls } = readRepairHolds({ root });
+		const roster = codexRoster({ low: qualified(NOW) });
+		const {
+			controls,
+			activeDescriptorIdentities,
+			currentPublicConfigurationEpoch,
+		} = readRepairHolds({
+			root,
+			roster,
+			publicConfigurationEpoch: "sha256:current",
+		});
 		strictEqual(controls[0].targetId, "codex");
+		strictEqual(currentPublicConfigurationEpoch, "sha256:current");
+		ok(
+			activeDescriptorIdentities.includes(
+				Object.keys(roster.targets.codex.qualifications)[0],
+			),
+		);
+		roster.targets.codex.enabled = false;
+		const disabled = readRepairHolds({
+			root,
+			roster,
+			publicConfigurationEpoch: "sha256:current",
+		});
+		deepStrictEqual(disabled.activeDescriptorIdentities, []);
 		writeFileSync(join(root, "control", "broken.json"), "{");
 		ok(readRepairHolds({ root }).error);
+	});
+
+	it("keeps readable controls when roster scope is unavailable", () => {
+		const root = tempDir("doctor-health-scope-");
+		writeHold(root, "codex");
+		const previous = process.env.SWITCHYARD_ROSTER_PATH;
+		process.env.SWITCHYARD_ROSTER_PATH = join(
+			tempDir("doctor-roster-"),
+			"absent.json",
+		);
+		try {
+			const result = readRepairHolds({ root });
+			strictEqual(result.error, undefined);
+			strictEqual(result.controls[0]?.holds[0]?.code, "auth_expired");
+			strictEqual(
+				Object.hasOwn(result, "currentPublicConfigurationEpoch"),
+				false,
+			);
+			strictEqual(Object.hasOwn(result, "activeDescriptorIdentities"), false);
+		} finally {
+			if (previous === undefined) delete process.env.SWITCHYARD_ROSTER_PATH;
+			else process.env.SWITCHYARD_ROSTER_PATH = previous;
+		}
 	});
 
 	it("classifies pending attempts from their run records and scopes to one project", async () => {
@@ -397,19 +442,19 @@ describe("switchyard-dispatch doctor CLI", () => {
 		const store = realpathSync(tempDir("doctor-cli-store-"));
 		const health = join(store, "health");
 		const project = realpathSync(tempDir("doctor-cli-project-"));
-		writeHold(health, "codex");
+		const roster = codexRoster({
+			low: qualified(Date.now()),
+			standard: qualified(Date.now()),
+			high: qualified(Date.now()),
+		});
+		writeHold(
+			health,
+			"codex",
+			Object.keys(roster.targets.codex.qualifications)[0],
+		);
 		writePending(join(store, "routing-runs"), project, "stuck", "no-such-run");
 		const rosterPath = join(store, "roster.json");
-		writeFileSync(
-			rosterPath,
-			JSON.stringify(
-				codexRoster({
-					low: qualified(Date.now()),
-					standard: qualified(Date.now()),
-					high: qualified(Date.now()),
-				}),
-			),
-		);
+		writeFileSync(rosterPath, JSON.stringify(roster));
 		const env = {
 			SWITCHYARD_RUN_STORE_ROOT: store,
 			SWITCHYARD_ROUTE_HEALTH_STATE_ROOT: health,
@@ -437,7 +482,7 @@ describe("switchyard-dispatch doctor CLI", () => {
 		strictEqual(failed.status, 1, failed.stderr);
 		match(
 			failed.stdout,
-			/^switchyard doctor: fail \(3 checks: 1 fail, 2 warn\)\nfail {2}qualification-expiry {2}roster unreadable/u,
+			/^switchyard doctor: fail \(3 checks: 1 fail, 2 warn\)\nfail {2}qualification-expiry {2}roster unreadable[^\n]*\nwarn {2}repair-holds\s+1 held: codex [a-f0-9]{8} auth_expired \(current routing scope unavailable\)/u,
 		);
 		strictEqual(runCli(["--bogus"], env).status, 2);
 	});

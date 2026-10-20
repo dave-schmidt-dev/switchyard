@@ -220,16 +220,23 @@ describe("simple local execution path", () => {
 import { writeFileSync } from "node:fs";
 process.on("SIGTERM", () => writeFileSync(${JSON.stringify(termPath)}, "term"));
 setInterval(() => {}, 1_000);
-setTimeout(() => process.exit(0), 3_000).unref();
+// Self-limit only as a hang guard; teardown must deliver SIGTERM first.
+setTimeout(() => process.exit(1), ${HANG_GUARD_MS * 2}).unref();
+process.send("ready");
 `;
 		const providerProgram = `
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 const helper = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(helperProgram)}], {
-  cwd: process.argv[1], detached: true, stdio: "ignore"
+  cwd: process.argv[1], detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"]
 });
 writeFileSync(process.argv[2], String(helper.pid));
-helper.unref();
+// Do not let teardown race Node startup and SIGTERM handler installation.
+helper.once("message", (message) => {
+  if (message !== "ready") process.exit(1);
+  // Reproduce a busy host taking longer than the old 3-second lifetime.
+  setTimeout(() => { helper.disconnect(); helper.unref(); }, 3_500);
+});
 `;
 		let helperPid = null;
 		try {

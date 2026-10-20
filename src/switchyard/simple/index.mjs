@@ -48,7 +48,6 @@ import {
 	isProjectLockOwnedBy,
 	releaseProjectLockIfOwnedBy,
 } from "../run-store/project-locks.mjs";
-import { isSafeDescriptorReceipt } from "../run-store/receipt-validation.mjs";
 import { getRunRoot, initializeRun } from "../run-store/run-records.mjs";
 import { updateRunWithRetry } from "../run-store/run-updates.mjs";
 import {
@@ -83,11 +82,13 @@ import { createSimpleRouteHealthController } from "./health.mjs";
 import { prepareSimpleProviderStart } from "./launcher-preflight.mjs";
 import { simpleLockDisposition } from "./lock-disposition.mjs";
 import { seedContinuation } from "./partial-continuation.mjs";
+import { createSimpleProgress } from "./progress.mjs";
 import {
 	classifySimpleErrorKind,
 	createSimpleProviderReliabilityDiagnostic,
 } from "./reliability.mjs";
 import { buildSimpleRepairPrompt, simpleRepairBudget } from "./repair.mjs";
+import { checkReportCitations } from "./report-citations.mjs";
 import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { createSimpleRouteSelection } from "./route-selection.mjs";
 import {
@@ -98,22 +99,6 @@ import {
 import { deadlineFitDetails, evaluateDeadlineFit } from "./task-sizing.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
-const HEARTBEAT_PERSIST_INTERVAL_MS = 30_000;
-const SIMPLE_PROCESS_PHASES = new Set([
-	"check_preparing",
-	"dry_run_check",
-	"launcher_probe",
-	"provider_running",
-	"format_running",
-	"check_running",
-	"head_advance_recheck_preparing",
-	"head_advance_recheck_running",
-	"cleanup_scan_running",
-	"cleanup_helper_progress",
-	"cleanup_scan_started",
-	"cleanup_quarantine_started",
-	"cleanup_remove_started",
-]);
 // Check-session refusals that already carry their own closed cause code; every
 // other failure while preparing the session classifies as check_setup_failed.
 const OWN_CODED_CHECK_SETUP_REASONS = new Set([
@@ -155,7 +140,6 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let descriptorHarness = null;
 	let providerExecutionResult = null;
 	let providerStarted = false;
-	let activeTaskProcessPhase = null;
 	let baselineStatus = (options.baselineChecks ?? []).length
 		? "pending"
 		: "not_requested";
@@ -204,10 +188,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let gitControlTampered = false;
 	let worktreeCleanupReason = null;
 	let executionFailureCaptureComplete = false;
-	let lastMilestoneAt = startedAt;
 	let firstChangeObserved = false;
 	let lastFirstChangeProbeAt = Number.NEGATIVE_INFINITY;
-	let lastHeartbeatPersistedAt = Number.NEGATIVE_INFINITY;
 	let runTerminalReached = false;
 	let runInitialized = false;
 	let failureTerminalDurable = true;
@@ -257,131 +239,41 @@ export async function runSimpleTask(options, dependencies = {}) {
 		...sanitizeFailureMetadata(input),
 		result: input.result,
 	});
-	const milestone = (phase, name, details = {}) => {
-		const observedAt = now();
-		const elapsedSinceLastMilestoneMs = Math.max(
-			0,
-			observedAt - lastMilestoneAt,
-		);
-		emitStatus(onStatus, taskId, phase, {
-			milestone: name,
-			elapsedMs: Math.max(0, observedAt - startedAt),
-			elapsedSinceLastMilestoneMs,
+	const progress = createSimpleProgress({
+		now,
+		startedAt,
+		taskId,
+		runId,
+		onStatus,
+		createEvent: dependencies.createEvent ?? createEvent,
+		updateRun: dependencies.updateRunWithRetry ?? updateRunWithRetry,
+		pendingDurability,
+	});
+	const milestone = (phase, name, details = {}) =>
+		progress.milestone(phase, name, details, {
+			runInitialized,
 			firstChangeObserved,
-			...details,
 		});
-		lastMilestoneAt = observedAt;
-		if (runInitialized) {
-			try {
-				const descriptorReceipt =
-					details.invocationDescriptor &&
-					isSafeDescriptorReceipt(
-						details.invocationDescriptor,
-						details.descriptorHarness,
-					) &&
-					details.invocationDescriptor.descriptor_identity ===
-						details.descriptorIdentity &&
-					details.invocationDescriptor.target_id === details.resolvedTargetId
-						? {
-								invocationDescriptor: details.invocationDescriptor,
-								descriptorIdentity: details.descriptorIdentity,
-								descriptorHarness: details.descriptorHarness,
-								resolvedTargetId: details.resolvedTargetId,
-							}
-						: {};
-				const eventWrite = (dependencies.createEvent ?? createEvent)(runId, {
-					phase,
-					event: "milestone",
-					milestone: name,
-					status: details.status ?? "in_progress",
-					elapsedMs: Math.max(0, observedAt - startedAt),
-					elapsedSinceLastMilestoneMs,
-					...(details.checkIndex !== undefined
-						? { checkIndex: details.checkIndex }
-						: {}),
-					...(details.checkIdentity !== undefined
-						? { checkIdentity: details.checkIdentity }
-						: {}),
-					...(details.checkStatus !== undefined
-						? { checkStatus: details.checkStatus }
-						: {}),
-					...(details.exitCode !== undefined
-						? { exitCode: details.exitCode }
-						: {}),
-					...(details.signal !== undefined ? { signal: details.signal } : {}),
-					...descriptorReceipt,
-					firstChangeObserved,
-				}).catch(() => {});
-				pendingDurability.add(eventWrite);
-				void eventWrite.finally(() => pendingDurability.delete(eventWrite));
-			} catch {}
-		}
-	};
-	const heartbeat = (phase, details = {}) => {
-		const observedAt = now();
-		if (
-			providerStarted &&
-			typeof details.processPhase === "string" &&
-			SIMPLE_PROCESS_PHASES.has(details.processPhase)
-		) {
-			activeTaskProcessPhase = details.processPhase;
-		}
-		emitStatus(onStatus, taskId, phase, {
-			elapsedMs: Math.max(0, observedAt - startedAt),
-			elapsedSinceLastMilestoneMs: Math.max(0, observedAt - lastMilestoneAt),
+	const heartbeat = (phase, details = {}) =>
+		progress.heartbeat(phase, details, {
+			runInitialized,
+			providerStarted,
+			runTerminalReached,
 			firstChangeObserved,
-			...details,
 		});
-		// Durable liveness only, and only while a provider run is actually live.
-		// Nothing derived (elapsed, progress) is persisted: the record carries the
-		// timestamp this process observed, no more.
-		if (!runInitialized || !providerStarted || runTerminalReached) return;
-		if (observedAt - lastHeartbeatPersistedAt < HEARTBEAT_PERSIST_INTERVAL_MS)
-			return;
-		lastHeartbeatPersistedAt = observedAt;
-		const heartbeatPatch = { activeTaskHeartbeatAt: observedAt };
-		if (activeTaskProcessPhase !== null) {
-			heartbeatPatch.activeTaskProcessPhase = activeTaskProcessPhase;
-		}
-		const heartbeatWrite = (
-			dependencies.updateRunWithRetry ?? updateRunWithRetry
-		)(runId, heartbeatPatch).catch(() => {});
-		pendingDurability.add(heartbeatWrite);
-		void heartbeatWrite.finally(() => pendingDurability.delete(heartbeatWrite));
-	};
-	const persistProviderStarted = async () => {
-		if (!runInitialized) return null;
-		const observedAt = now();
-		const activeDescriptorReceipt =
-			invocationDescriptor &&
-			isSafeDescriptorReceipt(invocationDescriptor, descriptorHarness) &&
-			invocationDescriptor.target_id === targetId
-				? invocationDescriptor
-				: null;
+	const persistProviderStarted = () =>
+		progress.persistProviderStarted({
+			runInitialized,
+			provider,
+			targetId,
+			invocationDescriptor,
+			descriptorHarness,
+			deadlineMs: options.deadlineMs,
+		});
+	const warn = (line) => {
 		try {
-			await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
-				state: "running",
-				startedAt: new Date(observedAt).toISOString(),
-				activeTaskId: taskId,
-				activeTaskProvider: provider,
-				activeTaskModel: invocationDescriptor?.selector ?? null,
-				activeTaskDeadline:
-					typeof options.deadlineMs === "number" &&
-					Number.isFinite(options.deadlineMs)
-						? new Date(options.deadlineMs).toISOString()
-						: null,
-				activeTaskStartedAt: observedAt,
-				activeTaskProcessPhase,
-				activeTaskInvocationDescriptor: activeDescriptorReceipt,
-				activeTaskDescriptorIdentity:
-					activeDescriptorReceipt?.descriptor_identity ?? null,
-				activeTaskDescriptorHarness:
-					activeDescriptorReceipt === null ? null : descriptorHarness,
-			});
-			return null;
-		} catch (error) {
-			return error;
-		}
+			(dependencies.onRoutingWarning ?? console.error)(line);
+		} catch {}
 	};
 	const releaseHeldProjectLock = async () => {
 		if (!projectLocked) return;
@@ -700,9 +592,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			finalResult.hint = manifestReviewHint(
 				unreviewed.length > 0 ? unreviewed : rejectedPaths,
 			);
-			(dependencies.onRoutingWarning ?? console.error)(
-				`dispatch: manifest review required: ${finalResult.hint}`,
-			);
+			warn(`dispatch: manifest review required: ${finalResult.hint}`);
 		}
 		finalResult.accountability = deriveFailureAccountability({
 			providerReliability,
@@ -732,6 +622,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 								{ persisted: true },
 							),
 							...checkAcceptanceOf(checks, base.checkCount),
+							...checkLimitationsOf(checks),
 						},
 						finishedAt: new Date(now()).toISOString(),
 						lastFailure: sanitizeFailureMetadata({
@@ -1836,6 +1727,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 				path: reportPath,
 				bytes: reportBytes.length,
 				sha256: createHash("sha256").update(reportBytes).digest("hex"),
+				citationCheck: checkReportCitations(reportBytes, worktreePath),
 			};
 		}
 
@@ -2622,6 +2514,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 						undeclaredPaths: undeclaredKept,
 						declaredFingerprint: initialFingerprint,
 						expectedOutputs,
+						// Base-tree test results, so a held apply's HEAD-advance
+						// recheck judges a differential check as this run did.
+						differentialBaselines:
+							checkSessions?.differentialBaselines() ?? null,
 					},
 					{ now },
 				);
@@ -2716,6 +2612,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						outputs: terminalOutputs,
 						...heldTerminal,
 						...checkAcceptanceOf(checks, base.checkCount),
+						...checkLimitationsOf(checks),
 						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
@@ -2850,6 +2747,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 						outputs: terminalOutputs,
 						...heldTerminal,
 						...checkAcceptanceOf(checks, base.checkCount),
+						...checkLimitationsOf(checks),
 						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
@@ -2914,11 +2812,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 			finalResult.providerReliability = terminalProviderReliability;
 		if (undeclaredKept.length > 0) {
 			Object.assign(finalResult, undeclaredSummary);
-			try {
-				(dependencies.onRoutingWarning ?? console.error)(
-					undeclaredWarning(undeclaredKept, undeclaredPatchPath),
-				);
-			} catch {}
+			warn(undeclaredWarning(undeclaredKept, undeclaredPatchPath));
 		}
 		milestone("terminal", "succeeded");
 		return finalResult;
@@ -2954,7 +2848,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		);
 	} finally {
 		const finalization = createFinalizationWatch({
-			warn: dependencies.onRoutingWarning ?? console.error,
+			warn,
 			...dependencies.finalizationWatch,
 		});
 		finalization.step("pending_durability");
@@ -3110,6 +3004,7 @@ import {
 } from "./provider-invocation.mjs";
 import {
 	aggregateWriterLifecycle,
+	checkLimitationsOf,
 	createRecoveryEvidence,
 	recoveryContract,
 	resolvePredecessorReceipt,

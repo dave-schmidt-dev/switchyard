@@ -252,7 +252,9 @@ describe("check session seam", () => {
 	it("consumes the extracted seam instead of keeping a local copy", () => {
 		const session = sourceText("src/switchyard/simple/check-session.mjs");
 		ok(session.includes('from "../runner/python-venv.mjs"'));
-		ok(session.includes("linkPythonVenv(projectPath, active.path)"));
+		ok(
+			session.includes("linkPythonVenv(projectPath, active.path, sharedVenv)"),
+		);
 		strictEqual(/function\s+linkPythonVenv\b/u.test(session), false);
 		strictEqual(/function\s+venvBaseInterpreterPrefix\b/u.test(session), false);
 	});

@@ -178,7 +178,7 @@ function makeRepo() {
 	return { projectPath, promptPath };
 }
 
-async function failedRun(releaseProjectLock) {
+async function failedRun(releaseProjectLock, throwWarning = false) {
 	const repo = makeRepo();
 	const warnings = [];
 	const result = await runSimpleTask(
@@ -213,7 +213,10 @@ async function failedRun(releaseProjectLock) {
 				code: 1,
 				writerLifecycle: "stopped",
 			}),
-			onRoutingWarning: (line) => warnings.push(line),
+			onRoutingWarning: (line) => {
+				warnings.push(line);
+				if (throwWarning) throw new Error("stderr closed");
+			},
 			finalizationWatch: {
 				tickMs: 20,
 				waitReportMs: 150,
@@ -261,4 +264,15 @@ describe("engine finalization stalls are never silent", () => {
 			`no waiting line in ${JSON.stringify(warnings)}`,
 		);
 	});
+});
+
+it("a throwing engine finalization warning preserves the failure and releases the lock", async () => {
+	const { result, warnings } = await failedRun(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		return true;
+	}, true);
+	ok(warnings.length > 0, "the engine warning sink was exercised");
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "provider_exit_nonzero");
+	strictEqual(result.recovery.cleanup.projectLock.state, "released");
 });

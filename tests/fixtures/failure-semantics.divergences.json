@@ -1,0 +1,133 @@
+{
+	"base": "0a71c51cf946a4608795a8ab662cdd6c94bd162f",
+	"quota": [
+		{
+			"id": "quota-absent-false",
+			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"origin": null,
+			"evidenceAvailable": false,
+			"expected": {
+				"marker": true,
+				"nonBlamingCause": "quota_exhausted",
+				"owner": "unknown",
+				"cooldown": null,
+				"invocationCause": "provider_exit_nonzero"
+			}
+		},
+		{
+			"id": "quota-adapter-false",
+			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"origin": "adapter",
+			"evidenceAvailable": false,
+			"expected": {
+				"marker": true,
+				"nonBlamingCause": "quota_exhausted",
+				"owner": "unknown",
+				"cooldown": null,
+				"invocationCause": "quota_exhausted"
+			}
+		},
+		{
+			"id": "quota-launcher-false",
+			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"origin": "launcher",
+			"evidenceAvailable": false,
+			"expected": {
+				"marker": true,
+				"nonBlamingCause": "quota_exhausted",
+				"owner": "unknown",
+				"cooldown": null,
+				"invocationCause": "quota_exhausted"
+			}
+		},
+		{
+			"id": "quota-launcher-true",
+			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"origin": "launcher",
+			"evidenceAvailable": true,
+			"expected": {
+				"marker": true,
+				"nonBlamingCause": "quota_exhausted",
+				"owner": "unknown",
+				"cooldown": null,
+				"invocationCause": "quota_exhausted"
+			}
+		},
+		{
+			"id": "quota-adapter-true",
+			"ownerDecision": "pending FAIL-2: common evidence gate and TTL",
+			"origin": "adapter",
+			"evidenceAvailable": true,
+			"expected": {
+				"marker": true,
+				"nonBlamingCause": "quota_exhausted",
+				"owner": "provider",
+				"cooldown": "quota_exhausted",
+				"invocationCause": "quota_exhausted"
+			}
+		}
+	],
+	"blame": [
+		{
+			"causeCode": "acceptance_check_failed",
+			"ownerDecision": "pending FAIL-3: one blame policy",
+			"expected": {
+				"reason": "check_failed",
+				"owner": "check_system",
+				"taskExcluded": true,
+				"terminal": "skipped"
+			}
+		},
+		{
+			"causeCode": "scope_rejected",
+			"ownerDecision": "pending FAIL-3: one blame policy",
+			"expected": {
+				"reason": "policy_rejected",
+				"owner": "contract",
+				"taskExcluded": true,
+				"terminal": "skipped"
+			}
+		},
+		{
+			"causeCode": "environment_failure",
+			"ownerDecision": "pending FAIL-3: one blame policy",
+			"expected": {
+				"reason": "environment_failure",
+				"owner": "environment",
+				"taskExcluded": false,
+				"terminal": "skipped"
+			}
+		},
+		{
+			"causeCode": "provider_deadline_exceeded",
+			"ownerDecision": "pending FAIL-3: one blame policy",
+			"expected": {
+				"reason": "execution_failed",
+				"owner": "provider",
+				"taskExcluded": true,
+				"terminal": "skipped"
+			}
+		},
+		{
+			"causeCode": "provider_exit_nonzero",
+			"ownerDecision": "pending FAIL-3: one blame policy",
+			"expected": {
+				"reason": "execution_failed",
+				"owner": "unknown",
+				"taskExcluded": true,
+				"terminal": "skipped"
+			}
+		}
+	],
+	"canary": {
+		"runId": "simple-95269d84-c792-4e10-be7d-e98f55381ccd",
+		"ownerDecision": "compatibility preserved; no policy change requested",
+		"failureReason": "check_environment_unavailable",
+		"failurePhase": "prepare",
+		"checkSetupStep": "probe_environment",
+		"preciseCause": "check_setup_failed",
+		"diskCause": "unknown",
+		"attemptReason": "baseline_failed",
+		"stopReason": "check_setup_failed"
+	}
+}

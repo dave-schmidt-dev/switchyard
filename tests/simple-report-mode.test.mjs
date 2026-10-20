@@ -190,11 +190,42 @@ describe("simple report mode dispatch", () => {
 			path: ".logs/r.md",
 			bytes: Buffer.byteLength(content),
 			sha256: createHash("sha256").update(content).digest("hex"),
+			citationCheck: {
+				advisory: true,
+				status: "unverifiable",
+				citations: 0,
+				matched: 0,
+				mismatched: 0,
+				unverifiable: 0,
+				truncated: false,
+				diagnostics: [{ reportLine: null, reason: "no_citations" }],
+			},
 		});
 		strictEqual(
 			readFileSync(join(repo.projectPath, ".logs", "r.md"), "utf8"),
 			content,
 		);
+	});
+
+	it("reports source-backed citation issues without changing report success", async () => {
+		const repo = makeRepo();
+		const result = await runSimpleTask(
+			options(repo),
+			dependencies(repo, (worktreePath) =>
+				writeReport(
+					worktreePath,
+					"`base` at `src/a.txt:1`.\n`invented` at `src/a.txt:1`.\n`base` at `src/missing.txt:1`.\n",
+				),
+			),
+		);
+		strictEqual(result.status, "succeeded", JSON.stringify(result));
+		strictEqual(result.report.citationCheck.status, "issues");
+		strictEqual(result.report.citationCheck.matched, 1);
+		strictEqual(result.report.citationCheck.mismatched, 2);
+		deepStrictEqual(result.report.citationCheck.diagnostics, [
+			{ reportLine: 2, reason: "identifier_not_found" },
+			{ reportLine: 3, reason: "missing_file" },
+		]);
 	});
 
 	it("fails closed when another path changes", async () => {

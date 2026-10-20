@@ -24,7 +24,7 @@ function firstCommandLine(script) {
 // is the only thing that sets it. The live config is deliberately not asserted:
 // checker clones install with `--ignore-scripts`, so `prepare` never runs there.
 // What this pins is the tracked state that makes the hooks run in every checkout
-// and linked worktree: executable and `set -e`, with no generated wrapper layer.
+// and linked worktree: executable and fail-closed, with no generated wrapper layer.
 describe("tracked git hooks", () => {
 	for (const hook of HOOKS) {
 		const path = `.githooks/${hook}`;
@@ -34,10 +34,27 @@ describe("tracked git hooks", () => {
 			strictEqual(entry.split(" ")[0], "100755");
 		});
 
-		it(`${hook} is a standalone sh script that stops on the first failure`, () => {
+		it(`${hook} is a standalone sh script that preserves gate failures`, () => {
 			const script = readFileSync(join(ROOT, path), "utf8");
 			strictEqual(script.split("\n")[0], "#!/bin/sh");
-			strictEqual(firstCommandLine(script), "set -e");
+			if (hook === "pre-commit") {
+				strictEqual(firstCommandLine(script), "set -e");
+			} else {
+				const lines = script.split("\n").map((line) => line.trim());
+				const initialStatus = 'echo "1" > "$STATUS_FILE"';
+				const runGate = 'eval "$GATE" </dev/null || status=$?';
+				for (const line of [
+					"GATE='npm run validate:host'",
+					initialStatus,
+					`trap 'status=$?; echo "$status" > "$STATUS_FILE"' EXIT`,
+					runGate,
+					'EXIT_CODE="$(cat "$STATUS_FILE")"',
+					'if [ "$EXIT_CODE" -eq 0 ]; then',
+					'exit "$EXIT_CODE"',
+				])
+					ok(lines.includes(line), `pre-push must preserve ${line}`);
+				ok(lines.indexOf(initialStatus) < lines.indexOf(runGate));
+			}
 		});
 	}
 

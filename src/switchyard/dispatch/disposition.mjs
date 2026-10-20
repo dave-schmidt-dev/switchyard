@@ -1,4 +1,9 @@
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
+import {
+	ADVANCE_FALLBACK_FAILURE_CODES,
+	isTargetFailure,
+	TARGET_FAILURE_KINDS,
+} from "../diagnostics/failure-semantics.mjs";
 import { isSafeTargetId } from "../run-store/receipt-validation.mjs";
 
 const TERMINAL_STATES = new Set(["succeeded", "failed", "deferred"]);
@@ -46,36 +51,6 @@ const CONTRACT_FAILURE_KINDS = new Set([
 	"no_provider",
 	"unsupported_provider",
 	"executor_not_switchyard",
-]);
-const TARGET_FAILURE_KINDS = new Set([
-	"auth_expired",
-	"quota_exhausted",
-	"model_unavailable",
-	"execution_failed",
-	"execution_timed_out",
-	"provider_cleanup_failed",
-	"diff_capture_failed",
-	"integration_failed",
-	"required_paths_missing",
-	"undeclared_paths_touched",
-	"empty_required_diff",
-	"no_op_diff",
-	"manifest_review_required",
-	"corrupt_patch",
-	"conflict",
-	"empty_diff",
-	"path_escapes_project_root",
-	"git_internals_touched",
-	"credential_path_touched",
-	"symlink_creation_refused",
-	"executable_file_refused",
-]);
-const ADVANCE_FALLBACK_FAILURE_CODES = new Set([
-	"quota_exhausted",
-	"provider_exit_nonzero",
-	"provider_signalled",
-	"empty_diff",
-	"empty_required_diff",
 ]);
 const EMPTY_TARGET_OUTPUT_CODES = new Set([
 	"empty_diff",
@@ -244,21 +219,6 @@ function hasAuthoritativeRoutingFailure(failure) {
 			(failure.failurePhase === "provider_execution" ||
 				(failure.failurePhase === "adapter_validation" &&
 					EMPTY_TARGET_OUTPUT_CODES.has(projectedDiagnosticCode(failure)))),
-	);
-}
-
-function isTargetFailure(entry, source) {
-	const isFailedEvidence =
-		source === "event"
-			? entry?.phase === "execution" && entry?.event === "task_failed"
-			: entry?.success === false;
-	return Boolean(
-		entry &&
-			isFailedEvidence &&
-			(TARGET_FAILURE_KINDS.has(entry.errorKind) ||
-				["provider_execution", "provider_cleanup"].includes(
-					entry.failurePhase,
-				)),
 	);
 }
 

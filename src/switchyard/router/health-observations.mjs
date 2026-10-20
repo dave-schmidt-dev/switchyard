@@ -1,5 +1,10 @@
 import { hasAuthoritativeDiagnosticProvenance } from "../adapter/exec-error.mjs";
 import { FAILURE_REGISTRY } from "../diagnostics/failure-registry.mjs";
+import {
+	confirmedProviderCooldownCode,
+	lifecycleBackedEventCode,
+	providerLifecycleClosed,
+} from "../diagnostics/failure-semantics.mjs";
 import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
 import { validateInvocationDescriptor } from "../roster/index.mjs";
 
@@ -270,75 +275,6 @@ async function recordAuthorizedObservation(input, authority) {
 
 export async function recordRouteHealthObservation(input) {
 	return recordAuthorizedObservation(input, null);
-}
-
-function confirmedProviderCooldownCode(input) {
-	const diagnostic = input?.providerReliability;
-	if (
-		!isProviderReliabilityDiagnostic(diagnostic) ||
-		diagnostic.causeCategory !== "provider" ||
-		diagnostic.phase !== "provider" ||
-		!PROVIDER_COOLDOWN_CODES.has(diagnostic.causeCode) ||
-		input.diagnosticCode !== diagnostic.causeCode ||
-		input.diagnosticOrigin !== "adapter" ||
-		input.diagnosticEvidenceAvailable !== true ||
-		input.failurePhase !== "provider_execution" ||
-		!hasAuthoritativeDiagnosticProvenance(input)
-	)
-		return null;
-	return diagnostic.causeCode;
-}
-
-function providerLifecycleClosed(input) {
-	const lifecycle = input?.providerLifecycle;
-	const cleanupClosed =
-		input.healthLane === "simple-direct" &&
-		lifecycle?.cleanupStage === null &&
-		["not_required", "succeeded"].includes(lifecycle?.cleanupStatus);
-	if (
-		lifecycle?.schemaVersion !== 1 ||
-		lifecycle.terminalStatus !== "exited" ||
-		lifecycle.writerLifecycle !== "stopped" ||
-		!cleanupClosed
-	)
-		return false;
-	if (
-		Number.isSafeInteger(input.exitCode) &&
-		lifecycle.exitCode !== input.exitCode
-	)
-		return false;
-	if (input.signal !== undefined && input.signal !== lifecycle.signal)
-		return false;
-	return true;
-}
-
-// The persisted event carries the sanitized diagnostic and exit evidence; the
-// closed lifecycle itself was verified by the producer and is attested by the
-// binding's `lifecycleVerified`. Re-check that the two agree.
-function lifecycleBackedEventCode(event) {
-	const diagnostic = event.providerReliability;
-	if (
-		!isProviderReliabilityDiagnostic(diagnostic) ||
-		diagnostic.phase !== "provider" ||
-		diagnostic.cancelled === true ||
-		!TRANSIENT_CODES.has(diagnostic.causeCode) ||
-		FAILURE_REGISTRY.get(diagnostic.causeCode)?.providerCaused !== true
-	)
-		return null;
-	switch (diagnostic.causeCode) {
-		case "provider_exit_nonzero":
-			return diagnostic.exitCode !== 0 && event.exitCode === diagnostic.exitCode
-				? diagnostic.causeCode
-				: null;
-		case "provider_signalled":
-			return diagnostic.signal !== null && event.signal === diagnostic.signal
-				? diagnostic.causeCode
-				: null;
-		case "provider_deadline_exceeded":
-			return diagnostic.timedOut === true ? diagnostic.causeCode : null;
-		default:
-			return null;
-	}
 }
 
 function eventObservation(event, run) {

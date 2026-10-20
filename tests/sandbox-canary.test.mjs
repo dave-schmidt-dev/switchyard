@@ -488,7 +488,7 @@ describe("real host profile probe (captain gate)", {
 }, () => {
 	it("executes real host sandbox canary probes outside confinement", () => {
 		const outcome = runSandboxCanary();
-		strictEqual(outcome.status, "passed");
+		strictEqual(outcome.status, "passed", JSON.stringify(outcome));
 		strictEqual(outcome.exitCode, 0);
 		ok(outcome.passedCount >= 4);
 	});

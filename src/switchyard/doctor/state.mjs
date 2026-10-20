@@ -10,6 +10,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { enumerateQualificationTargets } from "../diagnostics/provider-qualification.mjs";
 import { resolveConfiguredDispatchDescriptor } from "../roster/qualification.mjs";
 import {
 	loadRosterData,
@@ -17,8 +18,11 @@ import {
 	ROSTER_CAPABILITY_CLASSES,
 	STALE_MAX_AGE_SECONDS,
 } from "../roster/schema.mjs";
+import { createDefaultRouteHealthDecision } from "../router/health.mjs";
+import { QUALIFIED_PROVIDERS } from "../router/index.mjs";
 import { getStateRoot } from "../run-store/project-lock-files.mjs";
 import { readRun } from "../run-store/run-records.mjs";
+import { SIMPLE_ROUTE_HEALTH_EPOCH } from "../simple/health.mjs";
 import {
 	RUN_TERMINAL_STATES,
 	writerQuiescent,
@@ -102,21 +106,49 @@ function routeHealthRoot(env = process.env) {
 
 /**
  * Route-health control records, one per target descriptor.
- * @param {{root?: string}} [options]
- * @returns {{root: string, controls: object[]}|{root: string, error: string}}
+ * Current simple routing scope is projected for reporting only; no health
+ * claims, attestations, or observations are written.
+ * @param {{root?: string, roster?: object, publicConfigurationEpoch?: string}} [options]
+ * @returns {{root: string, controls: object[], currentPublicConfigurationEpoch?: string,
+ *   activeDescriptorIdentities?: string[]}|{root: string, error: string}}
  */
-export function readRepairHolds({ root = routeHealthRoot() } = {}) {
+export function readRepairHolds({
+	root = routeHealthRoot(),
+	roster,
+	publicConfigurationEpoch,
+} = {}) {
 	const dir = join(root, "control");
 	if (!existsSync(dir)) return { root, controls: [] };
+	let controls;
 	try {
-		const controls = readdirSync(dir)
+		controls = readdirSync(dir)
 			.filter((name) => name.endsWith(".json"))
 			.sort()
 			.map((name) => readJson(join(dir, name)));
-		return { root, controls };
 	} catch (error) {
 		return { root, error: errorCode(error) };
 	}
+
+	let currentScope = {};
+	try {
+		const activeDescriptorIdentities = enumerateQualificationTargets(
+			roster ?? loadRosterData(),
+		).slots.map((slot) => slot.descriptorIdentity);
+		const currentPublicConfigurationEpoch =
+			publicConfigurationEpoch ??
+			createDefaultRouteHealthDecision({
+				qualifiedProviders: QUALIFIED_PROVIDERS,
+				goldenImageReference: SIMPLE_ROUTE_HEALTH_EPOCH,
+			}).publicConfigurationEpoch;
+		currentScope = {
+			activeDescriptorIdentities,
+			currentPublicConfigurationEpoch,
+		};
+	} catch {
+		// A failed scope projection does not invalidate readable hold records.
+	}
+
+	return { root, controls, ...currentScope };
 }
 
 /**

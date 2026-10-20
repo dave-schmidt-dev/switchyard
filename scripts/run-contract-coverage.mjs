@@ -30,6 +30,7 @@ export const CRITICAL_MODULE_COVERAGE = Object.freeze([
 	},
 	{
 		path: "src/switchyard/simple/failure-accountability.mjs",
+		members: ["src/switchyard/diagnostics/failure-semantics.mjs"],
 		lines: 70,
 		branches: 50,
 		functions: 70,

@@ -90,16 +90,21 @@ export function compareTestRuns({ baseline, after, declaredFiles }) {
 const EMBEDDED_CREDENTIAL_RE =
 	/(?:(?<![A-Za-z])sk-[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{8,}|ghp_[A-Za-z0-9]{8,}|bws_[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16})/gu;
 
-/** A test id safe to persist: control characters stripped, redacted, bounded. */
-function recordedId(id) {
+/**
+ * A test id safe to persist: control characters stripped, redacted, and cut
+ * to `maxChars`.
+ */
+export function persistableId(id, maxChars) {
 	const visible = id.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ");
 	const redacted = redactCredentialTokens(visible)
 		.toString("utf8")
 		.replace(EMBEDDED_CREDENTIAL_RE, "[REDACTED]");
-	return redacted.length > RECORDED_ID_CHARS
-		? `${redacted.slice(0, RECORDED_ID_CHARS - 1)}…`
+	return redacted.length > maxChars
+		? `${redacted.slice(0, maxChars - 1)}…`
 		: redacted;
 }
+
+const recordedId = (id) => persistableId(id, RECORDED_ID_CHARS);
 
 function failedIds(tests) {
 	return [...tests]

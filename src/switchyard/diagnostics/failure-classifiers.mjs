@@ -1,13 +1,6 @@
-/**
- * Frozen pre-registry failure classifiers.
- *
- * The reason groups and classifier chains below reproduce the classifiers
- * that predate the failure registry, plus the closed-code rules, so
- * failure-registry.mjs can build its rows from them and the golden parity
- * test can pin every row. Pure functions; no I/O, no mutation.
- */
+/** Frozen historical vocabulary for the consolidated failure decisions. */
 
-const VERIFIED_PROVIDER_CODES = new Set([
+export const VERIFIED_PROVIDER_CODES = new Set([
 	"auth_expired",
 	"quota_exhausted",
 	"model_unavailable",
@@ -39,7 +32,7 @@ export const PROVIDER_CAUSED_REASONS = new Set([
 	"provider_verdict_rejected",
 ]);
 
-const ENVIRONMENT_ERRNOS = [
+export const ENVIRONMENT_ERRNOS = [
 	"EROFS",
 	"ENOSPC",
 	"EMFILE",
@@ -52,20 +45,20 @@ const ENVIRONMENT_ERRNOS = [
 	"ENETDOWN",
 ];
 
-const LAUNCHER_ENVIRONMENT_REASONS = [
+export const LAUNCHER_ENVIRONMENT_REASONS = [
 	"launcher_environment_unavailable",
 	"request_log_open_failed",
 	// S7: the target's CLI no longer honors its lane contract.
 	"provider_cli_contract_failed",
 ];
 
-const POLICY_REASONS = [
+export const POLICY_REASONS = [
 	"paid_overage_not_allowed",
 	"included_usage_unverified",
 	"ambiguous_combined_rename_spelling",
 ];
 
-const VALIDATION_REASONS = [
+export const VALIDATION_REASONS = [
 	"invalid_invocation",
 	"check_out_of_clone_exec",
 	"check_tool_denied",
@@ -75,7 +68,7 @@ const VALIDATION_REASONS = [
 	"predecessor_receipt_unverified",
 ];
 
-const SCOPE_REASONS = [
+export const SCOPE_REASONS = [
 	"dirty_overlay_drift",
 	"project_head_changed_concurrently",
 	"declared_path_changed_concurrently",
@@ -85,19 +78,19 @@ const SCOPE_REASONS = [
 	"integration_failed",
 ];
 
-const CHECK_REASONS = [
+export const CHECK_REASONS = [
 	"check_failed",
 	"check_deadline_exceeded",
 	"check_silence_timeout",
 ];
 
-const CLEANUP_REASONS = [
+export const CLEANUP_REASONS = [
 	"provider_cleanup_failed",
 	"worktree_cleanup_failed",
 	"project_lock_release_unconfirmed",
 ];
 
-const PROVIDER_EXECUTION_REASONS = [
+export const PROVIDER_EXECUTION_REASONS = [
 	"provider_silence_timeout",
 	"provider_deadline_exceeded",
 	"provider_cancelled",
@@ -110,14 +103,14 @@ const PROVIDER_EXECUTION_REASONS = [
 
 // Host git could not stage, list or read the candidate's changes, so no
 // reason about the diff itself can be given.
-const DIFF_CAPTURE_REASONS = [
+export const DIFF_CAPTURE_REASONS = [
 	"diff_stage_failed",
 	"diff_names_failed",
 	"diff_capture_failed",
 ];
 
 // Phases whose deadline already resolves to a phase-specific cause.
-const DEADLINE_CAUSE_PHASES = [
+export const DEADLINE_CAUSE_PHASES = [
 	"preflight",
 	"input_validation",
 	"execute",
@@ -126,7 +119,7 @@ const DEADLINE_CAUSE_PHASES = [
 	"cleanup",
 ];
 
-const ENVIRONMENT_REASONS = [
+export const ENVIRONMENT_REASONS = [
 	"project_revision_unavailable",
 	"workspace_clone_failed",
 	"workspace_checkout_failed",
@@ -188,7 +181,7 @@ export const SNAPSHOT_CHECK_CODES = new Set([
  * cleanup, validation) still win; the closed code only replaces the
  * would-be-unknown fallthrough.
  */
-const CLOSED_CAUSE_CODES = new Map([
+export const CLOSED_CAUSE_CODES = new Map([
 	["provider_silence_timeout", "provider_silence_timeout"],
 	["provider_signalled", "provider_signalled"],
 	["provider_adapter_error", "provider_adapter_error"],
@@ -232,196 +225,3 @@ const CLOSED_CAUSE_CODES = new Map([
 	["request_event_write_failed", "request_evidence_invalid"],
 	["request_event_close_failed", "request_evidence_invalid"],
 ]);
-
-/**
- * Pre-change error-kind classifier, copied verbatim from reliability.mjs.
- * The registry snapshot must reproduce these outputs exactly.
- */
-export function snapshotErrorKind(failureReason, failurePhase, errno) {
-	if (errno === "EPERM" || errno === "EACCES") return "permission_denied";
-	if (ENVIRONMENT_ERRNOS.includes(errno)) return "environment_failure";
-	if (LAUNCHER_ENVIRONMENT_REASONS.includes(failureReason))
-		return "environment_failure";
-	if (failureReason === "run_store_write_failed")
-		return "run_store_write_failed";
-	if (failurePhase === "baseline") return "environment_failure";
-	if (failureReason === "check_dependencies_unverified")
-		return "environment_failure";
-	// Task 2.3: a failure while preparing the check session is environmental.
-	if (failureReason === "check_setup_failed") return "environment_failure";
-	// Task 2.4: a check that cannot run in this environment.
-	if (failureReason === "check_environment_failed")
-		return "environment_failure";
-	// Task 3.2: the host moved under the run; that is the environment's fault.
-	if (failureReason === "host_concurrency") return "environment_failure";
-	// Task 2.7: a dependency manifest changed by the candidate's own diff is a
-	// check fact, not an environment fault.
-	if (failureReason === "check_manifest_changed_by_diff") return "check_failed";
-	if (POLICY_REASONS.includes(failureReason)) return "policy_violation";
-	if (failureReason === "manifest_review_required")
-		return failurePhase === "input_validation"
-			? "validation_failed"
-			: "policy_violation";
-	if (failureReason === "empty_diff") return "empty_diff";
-	if (
-		VALIDATION_REASONS.includes(failureReason) ||
-		(failureReason?.startsWith("dirty_overlay_") &&
-			failureReason !== "dirty_overlay_drift")
-	)
-		return "validation_failed";
-	if (SCOPE_REASONS.includes(failureReason)) return "policy_violation";
-	if (failurePhase === "checks" || CHECK_REASONS.includes(failureReason))
-		return "check_failed";
-	if (CLEANUP_REASONS.includes(failureReason) || failurePhase === "cleanup")
-		return "cleanup_failed";
-	if (
-		PROVIDER_EXECUTION_REASONS.includes(failureReason) ||
-		failurePhase === "execute"
-	)
-		return "execution_failed";
-	if (failureReason === "deadline_expired") {
-		if (["preflight", "input_validation"].includes(failurePhase))
-			return "validation_failed";
-		if (failurePhase === "execute") return "execution_failed";
-		if (["checks", "check"].includes(failurePhase)) return "check_failed";
-		if (failurePhase === "cleanup") return "cleanup_failed";
-		// The run's deadline ran out in a Switchyard step (route, prepare,
-		// diff capture, repair or integration), not in the candidate's scope.
-		return "environment_failure";
-	}
-	if (ENVIRONMENT_REASONS.includes(failureReason)) return "environment_failure";
-	if (failurePhase === "input_validation") return "validation_failed";
-	return "unclassified_failure";
-}
-
-/**
- * Cause-code classifier: the frozen pre-registry chain plus the closed-code
- * rules. A cancelled provider result resolves to `cancelled` for any reason;
- * a timed-out provider result resolves to `provider_deadline_exceeded` (a
- * timed-out check to `acceptance_check_timeout`) when no more specific rule
- * matched; and the closed-code table replaces the would-be-unknown
- * fallthrough for every reason that used to land there.
- */
-export function snapshotCauseCode(
-	reason,
-	phase,
-	providerResult,
-	errorKind,
-	cancelled = false,
-	timedOut = false,
-) {
-	if (cancelled) return "cancelled";
-	// Task 3.2: a genuine host-concurrency conflict is an environment stop,
-	// never a scope/policy rejection by the provider.
-	if (reason === "host_concurrency") return "host_concurrency";
-	if (LAUNCHER_ENVIRONMENT_REASONS.includes(reason))
-		return "environment_failure";
-	if (reason === "run_store_write_failed") return "run_store_write_failed";
-	if (reason === "check_dependencies_unverified") return reason;
-	// Task 2.3: wins over the generic environment_failure rule below.
-	if (reason === "check_setup_failed") return reason;
-	if (reason === "check_environment_failed") return reason;
-	// Task 2.7: a candidate-changed dependency manifest has its own check cause.
-	if (reason === "check_manifest_changed_by_diff") return reason;
-	if (phase === "baseline") {
-		if (reason === "baseline_mutation") return "baseline_mutation";
-		if (reason === "baseline_check_unavailable")
-			return "baseline_check_unavailable";
-		return "baseline_check_failed";
-	}
-	// Outside the baseline, every diff-capture git failure shares one closed
-	// environment cause.
-	if (DIFF_CAPTURE_REASONS.includes(reason)) return "diff_capture_failed";
-	// A deadline outside the provider, check, caller-input and cleanup phases
-	// has its own closed environment cause, never scope_rejected.
-	if (reason === "deadline_expired" && !DEADLINE_CAUSE_PHASES.includes(phase))
-		return "deadline_expired";
-	if (["environment_failure", "permission_denied"].includes(errorKind))
-		return "environment_failure";
-	if (reason === "provider_cancelled") return "cancelled";
-	if (reason === "provider_deadline_exceeded")
-		return "provider_deadline_exceeded";
-	if (timedOut) {
-		if (
-			phase === "checks" ||
-			phase === "check" ||
-			CHECK_REASONS.includes(reason)
-		)
-			return "acceptance_check_timeout";
-		return "provider_deadline_exceeded";
-	}
-	if (
-		phase === "execute" &&
-		VERIFIED_PROVIDER_CODES.has(providerResult?.diagnosticCode) &&
-		["adapter", "launcher"].includes(providerResult?.diagnosticOrigin) &&
-		providerResult?.diagnosticEvidenceAvailable === true
-	)
-		return providerResult.diagnosticCode;
-	if (reason === "provider_exit_nonzero") return "provider_exit_nonzero";
-	if (reason === "check_failed") return "acceptance_check_failed";
-	if (
-		reason === "check_deadline_exceeded" ||
-		reason === "check_silence_timeout"
-	)
-		return "acceptance_check_timeout";
-	if (reason === "check_repair_succeeded") return "check_repair_succeeded";
-	if (reason === "check_repair_failed") return "check_repair_failed";
-	if (reason === "empty_diff") return "diff_rejected";
-	if (DIFF_CAUSE_REASONS.includes(reason)) return "scope_rejected";
-	if (reason === "provider_cleanup_failed" || phase === "cleanup")
-		return "cleanup_failed";
-	if (errorKind === "policy_violation") return "scope_rejected";
-	if (phase === "input_validation" || errorKind === "validation_failed")
-		return "input_rejected";
-	if (reason === "deadline_expired") {
-		if (phase === "execute") return "provider_deadline_exceeded";
-		if (phase === "checks" || phase === "check")
-			return "acceptance_check_timeout";
-	}
-	return CLOSED_CAUSE_CODES.get(reason) ?? "unknown";
-}
-
-/** Pre-change diff category classifier, copied verbatim from reliability.mjs. */
-export function snapshotDiffCategory(reason) {
-	if (reason === "empty_diff") return "empty";
-	if (reason === "undeclared_paths_changed") return "undeclared";
-	if (reason === "read_only_input_changed") return "read_only_input";
-	if (reason === "manifest_review_required") return "manifest_review";
-	if (reason === "unsafe_diff") return "unsafe";
-	if (reason === "declared_path_changed_concurrently")
-		return "concurrent_change";
-	// Integrate-phase scope rejections keep a category instead of falling
-	// through to null, so a drift or concurrent-head stop is tunable.
-	if (reason === "dirty_overlay_drift") return "concurrent_change";
-	if (reason === "project_head_changed_concurrently")
-		return "concurrent_change";
-	if (reason === "host_concurrency") return "concurrent_change";
-	if (reason === "ambiguous_combined_rename_spelling") return "integration";
-	if (reason === "integration_failed") return "integration";
-	return null;
-}
-
-/** Pre-change attempt severity bucket (first-match-wins), from failure-severity. */
-export function snapshotSeverity(
-	reason,
-	phase,
-	causeCode,
-	causeCategory,
-	errorKind,
-) {
-	if (
-		phase === "baseline" ||
-		SNAPSHOT_BASELINE_CODES.has(causeCode) ||
-		SNAPSHOT_BASELINE_CODES.has(reason)
-	)
-		return "baseline";
-	if (
-		["cleanup", "cancellation", "input"].includes(causeCategory) ||
-		SNAPSHOT_HARD_CODES.has(causeCode) ||
-		SNAPSHOT_HARD_UNTYPED.has(errorKind) ||
-		SNAPSHOT_HARD_UNTYPED.has(reason) ||
-		phase === "cleanup"
-	)
-		return "hard";
-	return "soft";
-}

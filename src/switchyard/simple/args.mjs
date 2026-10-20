@@ -36,6 +36,11 @@ and --dirty-overlay.
 Report mode keeps only that path in the diff: any other changed path fails
 closed, a missing or empty report stops with report_missing, and success returns
 resultKind "report" with the report path, bytes and sha256.
+report.citationCheck adds bounded advisory path:line[-end] diagnostics against
+the disposable checkout. One backticked identifier before a citation in its
+sentence is compared with that exact source range. Unsupported/ambiguous forms
+are unverifiable; a match establishes text presence, never semantic truth, and
+these diagnostics do not change report success.
 --predecessor-receipt binds output of a previous run and requires --dirty-overlay.
 --baseline-check repeats commands run before the provider; baseline checks never
 replace acceptance checks. Acceptance-check repair is on by default: after a
@@ -70,6 +75,11 @@ check that launches a package tool (npx, npm exec --, node_modules/.bin/<tool>,
 a lockfile-declared bin, or any npm/pnpm/yarn/bun command) instead runs as plain
 argv with no shell, from the locked local install; it accepts only letters,
 digits and . _ / @ : + = - and is otherwise refused as check_dependencies_unverified.
+A plain pytest, python -m pytest or node --test check already red at baseline
+may pass differentially when its complete per-test reports prove the task tests
+pass with no new failures, missing tests or newly skipped tests; every other
+check still requires exit 0. Results expose checkAcceptance and
+toleratedBaselineFailures, with a bounded differential record per check.
 Output is one JSON result; progress is written to stderr. SIGINT exits 130 and
 SIGTERM exits 143. If a checkout is retained, its path is in partialWorktree
 for attended recovery. An integration already in progress finishes before the

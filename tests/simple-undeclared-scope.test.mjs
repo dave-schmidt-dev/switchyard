@@ -554,3 +554,32 @@ describe("partitionUndeclared", () => {
 		deepStrictEqual(atCap.ineligible, []);
 	});
 });
+
+it("a throwing undeclared-edit warning preserves success and its recovery receipt", async () => {
+	const repo = makeRepo();
+	let warned = 0;
+	const result = await runSimpleTask(
+		options(repo),
+		dependencies(
+			repo,
+			(worktreePath) =>
+				writeFileSync(join(worktreePath, "src", "other.txt"), "extra\n"),
+			{
+				onRoutingWarning: () => {
+					warned++;
+					throw new Error("stderr closed");
+				},
+			},
+		),
+	);
+	strictEqual(warned, 1);
+	strictEqual(
+		JSON.parse(
+			readFileSync(join(SUITE_STATE_ROOT, "runs", result.runId, "run.json")),
+		).state,
+		"succeeded",
+	);
+	strictEqual(result.status, "succeeded");
+	deepStrictEqual(result.undeclaredPaths, ["src/other.txt"]);
+	strictEqual(result.recovery.cleanup.projectLock.state, "released");
+});

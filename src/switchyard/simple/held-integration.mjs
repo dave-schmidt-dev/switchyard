@@ -6,7 +6,8 @@
  *
  * The run record is the authority. Its terminal summary names both files and
  * their SHA-256 digests, so an edited receipt or patch is refused rather than
- * applied.
+ * applied. A schema-2 receipt also carries the run's qualifying differential
+ * baselines (see held-baselines.mjs), which that same digest binds.
  */
 import { createHash } from "node:crypto";
 import {
@@ -24,12 +25,13 @@ import { dirname, join } from "node:path";
 import { integrationGate } from "../integrate/index.mjs";
 import { getRunRoot } from "../run-store/run-records.mjs";
 import { MAX_CAPTURE_BYTES } from "./git-control.mjs";
+import { persistedBaselines, receiptBaselines } from "./held-baselines.mjs";
 
 const HELD_DIRNAME = "held-integration";
 const PATCH_NAME = "held.patch";
 const RECEIPT_NAME = "receipt.json";
 const RECEIPT_KIND = "switchyard.held-integration";
-const MAX_RECEIPT_BYTES = 256 * 1024;
+const MAX_RECEIPT_BYTES = 2 * 1024 * 1024;
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
@@ -129,7 +131,7 @@ export function holdVerifiedIntegration(
 	const patch = Buffer.from(input.diff, "utf8");
 	const heldAt = new Date(now()).toISOString();
 	const receipt = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		kind: RECEIPT_KIND,
 		runId: input.runId,
 		taskId: input.taskId,
@@ -143,6 +145,10 @@ export function holdVerifiedIntegration(
 		allowManifests: [...input.allowManifests],
 		allowExecutables: [...input.allowExecutables],
 		checks: [...input.checks],
+		differentialBaselines: persistedBaselines(
+			input.differentialBaselines,
+			input.checks,
+		),
 		changedFiles: [...input.changedFiles],
 		undeclaredPaths: [...input.undeclaredPaths],
 		declaredFingerprint: input.declaredFingerprint,
@@ -151,7 +157,13 @@ export function holdVerifiedIntegration(
 		patchBytes: patch.length,
 		heldAt,
 	};
-	const receiptBytes = Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8");
+	let receiptBytes = Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8");
+	// A receipt apply could not read back would hold a patch nothing can apply;
+	// without its baselines it still applies, rechecking strictly.
+	if (receiptBytes.length > MAX_RECEIPT_BYTES) {
+		receipt.differentialBaselines = [];
+		receiptBytes = Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8");
+	}
 	const identity = createHeldDirectory(directory);
 	beforeWrite(directory);
 	writeSynced(patchPath, patch, identity);
@@ -228,7 +240,9 @@ export function heldIntegrationOf(record) {
  * Load and verify the held patch a run record names. Throws an error coded
  * `held_receipt_invalid` unless both files sit at the run's own fixed paths,
  * match the digests in the record, and describe this run (`runId`, the one
- * the caller asked for) and project.
+ * the caller asked for) and project, and any differential baselines the
+ * receipt carries are valid. `differentialBaselines` is null for a schema-1
+ * receipt, whose recheck stays strict.
  */
 export function readHeldIntegration(record, projectPath, runId) {
 	const integration = heldIntegrationOf(record);
@@ -250,7 +264,7 @@ export function readHeldIntegration(record, projectPath, runId) {
 		throw invalid("receipt_unparseable");
 	}
 	if (
-		receipt?.schemaVersion !== 1 ||
+		![1, 2].includes(receipt?.schemaVersion) ||
 		receipt.kind !== RECEIPT_KIND ||
 		receipt.runId !== record.runId ||
 		receipt.projectPath !== projectPath ||
@@ -258,13 +272,19 @@ export function readHeldIntegration(record, projectPath, runId) {
 		receipt.verifiedHead !== integration.verifiedHead
 	)
 		throw invalid("receipt_identity_mismatch");
+	const differentialBaselines = receiptBaselines(receipt);
 	const patch = readOwnedFile(expected.patchPath, MAX_CAPTURE_BYTES);
 	if (
 		patch.length !== receipt.patchBytes ||
 		sha256(patch) !== receipt.patchSha256
 	)
 		throw invalid("patch_digest_mismatch");
-	return { integration, receipt, patch: patch.toString("utf8") };
+	return {
+		integration,
+		receipt,
+		patch: patch.toString("utf8"),
+		differentialBaselines,
+	};
 }
 
 /** Held integrations named by a routing run's attempts, for inspect. */

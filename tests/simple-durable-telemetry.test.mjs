@@ -7,7 +7,10 @@ import { join } from "node:path";
 import { after, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { validateInvocationDescriptor } from "../src/switchyard/roster/index.mjs";
-import { readRun } from "../src/switchyard/run-store/index.mjs";
+import {
+	readRun,
+	updateRunWithRetry,
+} from "../src/switchyard/run-store/index.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { HANG_GUARD_MS } from "./helpers/hang-guard.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
@@ -284,4 +287,132 @@ it("keeps a terminal failure transition valid without writing lastCompletionAt",
 	strictEqual(typeof record.activeTaskStartedAt, "number");
 	ok(record.lastFailure);
 	strictEqual(Object.hasOwn(record, "lastCompletionAt"), false);
+});
+
+// These deliberately held writes characterize the coordinator's final drain,
+// rather than relying on filesystem scheduling to make telemetry overlap.
+for (const rejectWrites of [false, true]) {
+	it(`drains deferred telemetry before failure cleanup (${rejectWrites ? "rejected" : "resolved"})`, {
+		timeout: HANG_GUARD_MS,
+	}, async () => {
+		const repo = makeRepo();
+		const event = blockedProvider();
+		const heartbeat = blockedProvider();
+		let clock = Date.now();
+		let emitProgress;
+		let released = false;
+		let cleaned = false;
+		let settled = false;
+		let terminalSeen = false;
+		const writes = [];
+		const pending = runSimpleTask(
+			options(repo),
+			dependencies({
+				runCheck: async () => ({ success: true }),
+				now: () => clock,
+				createEvent: async (_id, entry) => {
+					if (entry.milestone === "provider_started") {
+						event.onEntered();
+						await event.gate;
+						if (rejectWrites) throw new Error("synthetic event rejection");
+					}
+				},
+				updateRunWithRetry: async (id, patch) => {
+					if (patch.activeTaskHeartbeatAt !== undefined) {
+						writes.push(patch);
+						heartbeat.onEntered();
+						await heartbeat.gate;
+						if (rejectWrites) throw new Error("synthetic heartbeat rejection");
+					}
+					return updateRunWithRetry(id, patch);
+				},
+				probeSimpleLauncher: async ({ onProgress }) => {
+					onProgress();
+					strictEqual(
+						writes.length,
+						0,
+						"pre-start heartbeat must stay transient",
+					);
+					return { success: true, probeWriterLifecycle: "never_started" };
+				},
+				executeProvider: async ({ onProgress }) => {
+					emitProgress = onProgress;
+					onProgress();
+					return { success: false, code: 1, writerLifecycle: "stopped" };
+				},
+				onStatus: (status) => {
+					if (status.phase === "terminal") terminalSeen = true;
+				},
+				releaseProjectLock: async () => {
+					released = true;
+					return true;
+				},
+				cleanupSimpleWorktree: async (_id, claim) => {
+					cleaned = true;
+					rmSync(claim.path, { recursive: true, force: true });
+					return { removed: true, path: claim.path };
+				},
+			}),
+		);
+		const markSettled = () => {
+			settled = true;
+		};
+		void pending.then(markSettled, markSettled);
+		try {
+			await untilEntered(event, pending);
+			await untilEntered(heartbeat, pending);
+			ok(await waitFor(() => terminalSeen), "failure terminal was not reached");
+			strictEqual(released, false);
+			strictEqual(cleaned, false);
+			strictEqual(settled, false);
+			clock += 30_000;
+			emitProgress();
+			strictEqual(
+				writes.length,
+				1,
+				"post-terminal heartbeat must stay transient",
+			);
+			event.release();
+			await new Promise((resolve) => setImmediate(resolve));
+			strictEqual(
+				cleaned,
+				false,
+				"heartbeat remains in the drain after event settles",
+			);
+		} finally {
+			event.release();
+			heartbeat.release();
+		}
+		const result = await pending;
+		strictEqual(result.status, "failed");
+		strictEqual(result.failureReason, "provider_exit_nonzero");
+		strictEqual(released, true);
+		strictEqual(cleaned, true);
+	});
+}
+
+it("a rejected provider-start write fails closed after the provider settles", async () => {
+	const repo = makeRepo();
+	let executed = false;
+	const result = await runSimpleTask(
+		options(repo),
+		dependencies({
+			runCheck: async () => ({ success: true }),
+			updateRunWithRetry: async (id, patch) => {
+				if (patch.state === "running")
+					throw new Error("synthetic start write rejection");
+				return updateRunWithRetry(id, patch);
+			},
+			executeProvider: async ({ worktreePath }) => {
+				executed = true;
+				writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+				return { success: true, code: 0, writerLifecycle: "stopped" };
+			},
+		}),
+	);
+	strictEqual(executed, true);
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "run_store_write_failed");
+	strictEqual((await readRun(result.runId)).state, "failed");
+	strictEqual(result.recovery.cleanup.projectLock.state, "released");
 });

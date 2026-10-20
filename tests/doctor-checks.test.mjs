@@ -328,6 +328,12 @@ describe("doctor state checks", () => {
 		});
 		const report = checkRepairHolds({
 			root: "/h/route-health",
+			currentPublicConfigurationEpoch: "sha256:e1",
+			activeDescriptorIdentities: [
+				"sha256:95b1e5f2aa",
+				"sha256:c0ffee00aa",
+				"sha256:abcdef00aa",
+			],
 			controls: [
 				{
 					targetId: "free",
@@ -364,7 +370,7 @@ describe("doctor state checks", () => {
 		strictEqual(report.status, "warn");
 		strictEqual(
 			report.summary,
-			"3 held: codex 95b1e5f2 auth_expired, vibe c0ffee00 image_stale (attested, awaiting trial), agy abcdef00 configuration_invalid",
+			"3 held: codex 95b1e5f2 auth_expired (current repair attestation required), vibe c0ffee00 image_stale (attested, awaiting trial), agy abcdef00 configuration_invalid (current repair attestation required)",
 		);
 		deepStrictEqual(report.fixes, [
 			"after repairing auth_expired: switchyard-dispatch health attest-repair --target codex --descriptor sha256:95b1e5f2aa --public-configuration-epoch sha256:e1 --repair-kind auth_repaired --health-state-root /h/route-health",
@@ -375,6 +381,74 @@ describe("doctor state checks", () => {
 			checkRepairHolds({ root: "/h", error: "EACCES" }).status,
 			"fail",
 		);
+	});
+
+	it("uses the current simple epoch and refuses to call historical attestations trial-ready", () => {
+		const control = {
+			targetId: "codex",
+			descriptorIdentity: "sha256:active",
+			repairEpoch: 1,
+			holds: [
+				{ code: "auth_expired", publicConfigurationEpoch: "sha256:old", at: 1 },
+			],
+			attestations: [
+				{ publicConfigurationEpoch: "sha256:old", repairEpoch: 1, at: 2 },
+			],
+		};
+		const probe = {
+			root: "/h",
+			controls: [control],
+			currentPublicConfigurationEpoch: "sha256:current",
+			activeDescriptorIdentities: ["sha256:active"],
+		};
+		const report = checkRepairHolds(probe);
+		ok(!report.summary.includes("awaiting trial"));
+		strictEqual(report.fixes.length, 1);
+		match(report.fixes[0], /--public-configuration-epoch sha256:current /u);
+		ok(!report.fixes[0].includes("sha256:old"));
+		control.attestations.push({
+			publicConfigurationEpoch: "sha256:current",
+			repairEpoch: 1,
+			at: 3,
+		});
+		const current = checkRepairHolds(probe);
+		match(current.summary, /attested, awaiting trial/u);
+		deepStrictEqual(current.fixes, []);
+		control.attestations[1].repairEpoch = 0;
+		ok(!checkRepairHolds(probe).summary.includes("awaiting trial"));
+		control.attestations[1].repairEpoch = 1;
+		control.attestations[1].at = 1;
+		ok(!checkRepairHolds(probe).summary.includes("awaiting trial"));
+	});
+
+	it("reports inactive and unknown descriptors without suggesting a historical repair", () => {
+		const control = {
+			targetId: "codex",
+			descriptorIdentity: "sha256:retired",
+			repairEpoch: 1,
+			holds: [
+				{
+					code: "auth_expired",
+					publicConfigurationEpoch: "sha256:current",
+					at: 1,
+				},
+			],
+			attestations: [
+				{ publicConfigurationEpoch: "sha256:current", repairEpoch: 1, at: 2 },
+			],
+		};
+		const inactive = checkRepairHolds({
+			root: "/h",
+			controls: [control],
+			currentPublicConfigurationEpoch: "sha256:current",
+			activeDescriptorIdentities: [],
+		});
+		match(inactive.summary, /inactive descriptor/u);
+		ok(!inactive.summary.includes("awaiting trial"));
+		deepStrictEqual(inactive.fixes, []);
+		const unknown = checkRepairHolds({ root: "/h", controls: [control] });
+		ok(!unknown.summary.includes("awaiting trial"));
+		deepStrictEqual(unknown.fixes, []);
 	});
 
 	it("separates closable, unconfirmed, live and inert pending attempts", () => {

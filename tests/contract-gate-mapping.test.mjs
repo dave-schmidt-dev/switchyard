@@ -294,6 +294,8 @@ describe("source-boundary contract gate mapping", () => {
 			"tests/runner-quick-checks-xcode-sandbox.test.mjs",
 			"tests/sandbox-canary-install.test.mjs",
 			"tests/sandbox-canary.test.mjs",
+			"tests/shared-python-venv-host.test.mjs",
+			"tests/shared-python-venv.test.mjs",
 		];
 		deepStrictEqual(
 			validateExecution({

@@ -1,4 +1,4 @@
-import { isPythonCheck } from "./python-checks.mjs";
+import { declaredSharedVenv, isPythonCheck } from "./python-checks.mjs";
 
 const MAX_CHECKS = 4;
 
@@ -133,8 +133,10 @@ function reliabilityCheckFields(
 	baselineDeclarations,
 	repairDeclarations,
 ) {
-	if (!baselineDeclarations.length && !repairDeclarations.length)
+	if (!baselineDeclarations.length && !repairDeclarations.length) {
+		declaredSharedVenv(quickChecks.checks);
 		return quickChecks;
+	}
 	if (type !== "implementation" || executor !== "switchyard")
 		throw new Error(
 			`Task ${taskId}: Baseline checks and Repair checks require a switchyard implementation task`,
@@ -177,6 +179,11 @@ function reliabilityCheckFields(
 			);
 		quickChecks.repairChecks = repairChecks;
 	}
+	declaredSharedVenv([
+		...quickChecks.checks,
+		...(quickChecks.baselineChecks ?? []),
+		...(quickChecks.repairChecks ?? []),
+	]);
 	return quickChecks;
 }
 

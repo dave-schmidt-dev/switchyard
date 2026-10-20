@@ -4,7 +4,15 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ## [Unreleased]
 
+### Changed
+
+- Pure failure classification, ownership, health trust, routing blame and failure-log decisions share one module, preserving prior behavior with a base-derived golden table.
+
 ### Added
+
+- Python checks may declare one existing shared `~/.venvs/<name>/bin/python` interpreter through its exact absolute bounded pytest command. Interpreter and base prefix stay read-only; grants apply only to declared Python checks. Changed roots, symlink escapes and mixed or multiple interpreter sets refuse; `uv` remains unsupported.
+- Executed acceptance checks disclose that app-target compilation remains unverified, in terminal results and durable summaries.
+- Report results add bounded advisory `report.citationCheck` diagnostics for exact file/line/identifier matches, missing files, wrong ranges and unverifiable forms. Text matches do not establish semantic truth; report success and existing report metadata keep their meaning. `simple --help` now describes these diagnostics and differential test acceptance.
 
 - `simple --integrate hold` lets a caller hold integration instead of cancelling a run: it runs every check and the integration gate but writes nothing to the project, stores the verified patch and a digest-bound receipt in the run store, releases the project lock and reports `integration.state: "held"`. `routing-run apply --run-id <id>` later integrates exactly that patch against the current HEAD after re-running the gate (and the acceptance checks when HEAD moved), or refuses with one closed reason such as `held_receipt_stale` or `held_patch_conflict`; an apply whose outcome is unknown blocks later applies rather than writing the patch twice. A held run counts as a succeeded attempt, and `routing-run inspect` lists it under `heldIntegrations`.
 - A `pytest`, `python -m pytest` or `node --test` acceptance check that is already red on the base tree no longer dooms the dispatch: its per-test baseline is captured in the dry run, and a failing run after the provider is accepted when no new test fails, no baseline test disappears or becomes skipped, and the task's own tests pass. The check result records a bounded, redacted `differential` verdict. Any other check, an unusable baseline, or a report that cannot be read keeps the exit-0 rule.
@@ -114,6 +122,12 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 - `switchyard-dispatch simple --help` and the README now state that `--deadline` is capped at 30 minutes ahead, that tasks in one project serialize on the project lock (`PROJECT_LOCK_HELD`, even across routing-run IDs), and that `--check` runs through `/bin/sh -lc` except package-tool launches, which run as plain argv.
 
 ### Fixed
+
+- Held apply keeps bounded original differential baselines in schema-2 receipts, so an unrelated peer commit can still pass while a new failure refuses. Invalid stored baselines refuse; older receipts and aggregate test-count/byte overflow recheck strictly.
+- Environment-failure exhaustion remains `task_failures` when the same logical task resumes in another invocation, without provider exclusion or native latching.
+- Detached-helper test fixtures wait for signal-handler readiness and retain a bounded lifetime past delayed teardown; sandbox toolchain probes use the remaining overall canary budget. Pre-push logs the full gate, preserves its exit status and prints failures/load; canary diagnostics distinguish timeout, signal, spawn failure and sandbox denial.
+- A throwing manifest warning sink no longer replaces the original refusal. Milestone, heartbeat and provider-start reporting is extracted while the coordinator retains execution and cleanup ordering.
+- Doctor repair-hold commands now use the current simple configuration epoch. An attestation for an old epoch no longer appears ready for a current trial, and inactive descriptor holds remain visible without a misleading repair command. Route health and attestation policy are unchanged.
 
 - A routing warning sink (`onRoutingWarning`) that throws no longer changes a `simple` route. The generated-routing-ID, continuation-partial, route-exhaustion and failure-log warnings now share the containment the route-refusal warning already had; before, a throw there rejected the task or replaced its answer.
 - A `simple` run whose deadline runs out during diff capture, routing, workspace preparation, repair or integration (`deadline_expired`) is no longer coded as a scope rejection. It used to resolve to `errorKind: policy_violation` and cause `scope_rejected` (routing reason `policy_rejected`). It now resolves to `errorKind: environment_failure` and the closed cause `deadline_expired` (category `environment`, routing reason `environment_failure`) in the result, `run.json` `lastFailure` and the failure-log attempt record. A deadline in a singular `check` phase is now `acceptance_check_timeout` like the `checks` phase. Provider, checks, baseline, caller-input and cleanup deadlines are unchanged.

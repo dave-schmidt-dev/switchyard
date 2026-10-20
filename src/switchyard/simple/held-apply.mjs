@@ -350,7 +350,11 @@ async function applyUnderLock(input, deps, state) {
 			detail: "interrupted_apply",
 			earlierApplyRunId: held.applyRunId,
 		});
-	const { receipt, patch } = readHeldIntegration(record, projectPath, runId);
+	const { receipt, patch, differentialBaselines } = readHeldIntegration(
+		record,
+		projectPath,
+		runId,
+	);
 	state.record = record;
 
 	progress({ phase: "verify" });
@@ -376,6 +380,7 @@ async function applyUnderLock(input, deps, state) {
 				head,
 				patch,
 				receipt,
+				differentialBaselines,
 				deadlineMs: input.deadlineMs,
 				now,
 				signal: input.signal,
@@ -387,6 +392,9 @@ async function applyUnderLock(input, deps, state) {
 			return refusal("held_recheck_failed", {
 				detail: checked?.detail ?? "check_failed",
 				...(checked?.checkIndex ? { checkIndex: checked.checkIndex } : {}),
+				...(typeof checked?.differentialReason === "string"
+					? { differentialReason: checked.differentialReason }
+					: {}),
 				...(checked?.checker === "retained" ? { checker: "retained" } : {}),
 				head,
 			});

@@ -281,7 +281,8 @@ const REPAIR_KIND = { auth_expired: "auth_repaired" };
 /**
  * Active route-health repair holds, each with the attestation command that
  * releases it after the owner repairs the cause.
- * @param {{error?: string, root: string, controls?: object[]}} probe
+ * @param {{error?: string, root: string, controls?: object[],
+ *   currentPublicConfigurationEpoch?: string, activeDescriptorIdentities?: string[]}} probe
  */
 export function checkRepairHolds(probe) {
 	const id = "repair-holds";
@@ -299,24 +300,30 @@ export function checkRepairHolds(probe) {
 	const labels = [];
 	for (const control of held) {
 		const newest = control.holds.reduce((a, b) => (b.at > a.at ? b : a));
-		const attested = (control.attestations ?? []).some(
-			(attestation) =>
-				attestation.publicConfigurationEpoch ===
-					newest.publicConfigurationEpoch &&
-				attestation.repairEpoch === control.repairEpoch &&
-				attestation.at > newest.at,
+		const active = probe.activeDescriptorIdentities?.includes(
+			control.descriptorIdentity,
 		);
+		const currentEpoch = probe.currentPublicConfigurationEpoch;
+		const currentScope = active === true && typeof currentEpoch === "string";
+		const attested =
+			currentScope &&
+			(control.attestations ?? []).some(
+				(attestation) =>
+					attestation.publicConfigurationEpoch === currentEpoch &&
+					attestation.repairEpoch === control.repairEpoch &&
+					attestation.at > newest.at,
+			);
 		labels.push(
 			`${control.targetId} ${String(control.descriptorIdentity)
 				.replace(/^sha256:/u, "")
 				.slice(
 					0,
 					8,
-				)} ${newest.code}${attested ? " (attested, awaiting trial)" : ""}`,
+				)} ${newest.code}${active === false ? " (inactive descriptor)" : !currentScope ? " (current routing scope unavailable)" : attested ? " (attested, awaiting trial)" : " (current repair attestation required)"}`,
 		);
-		if (!attested)
+		if (currentScope && !attested)
 			fixes.push(
-				`after repairing ${newest.code}: ${DISPATCH} health attest-repair --target ${control.targetId} --descriptor ${control.descriptorIdentity} --public-configuration-epoch ${newest.publicConfigurationEpoch} --repair-kind ${REPAIR_KIND[newest.code] ?? "configuration_repaired"} --health-state-root ${probe.root}`,
+				`after repairing ${newest.code}: ${DISPATCH} health attest-repair --target ${control.targetId} --descriptor ${control.descriptorIdentity} --public-configuration-epoch ${currentEpoch} --repair-kind ${REPAIR_KIND[newest.code] ?? "configuration_repaired"} --health-state-root ${probe.root}`,
 			);
 	}
 	return result(

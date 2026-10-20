@@ -65,6 +65,9 @@ describe("contract coverage groups", () => {
 			CRITICAL_MODULE_COVERAGE.filter(({ path }) => additions.includes(path)),
 			additions.map((path) => ({
 				path,
+				...(path.endsWith("/failure-accountability.mjs")
+					? { members: ["src/switchyard/diagnostics/failure-semantics.mjs"] }
+					: {}),
 				lines: 70,
 				branches: 50,
 				functions: 70,
@@ -101,6 +104,9 @@ describe("contract coverage groups", () => {
 	it("runs the complete mapped suite set once, serially, with the lowest module floors and live output", () => {
 		const plan = criticalCoveragePlan(ROOT);
 		const regressions = [
+			"failure-semantics-golden",
+			"failure-semantics-divergences",
+			"simple-routing-environment-exhaustion",
 			"simple-check-session",
 			"simple-check-execution",
 			"simple-guarded-prompt",
@@ -120,7 +126,8 @@ describe("contract coverage groups", () => {
 			"simple-routing-state",
 		].map((name) => `tests/${name}.test.mjs`);
 		// The charter and the 2026-10-18 stability audit (SC7, S11, S7) add these
-		// exact suites; the historical suite hash below still guards every
+		// exact suites; progress extraction adds the telemetry and warning suites.
+		// The historical suite hash below still guards every
 		// original entry and ordering.
 		const charterAdditions = [
 			"tests/cli-contract-canary.test.mjs",
@@ -128,7 +135,21 @@ describe("contract coverage groups", () => {
 			"tests/dispatch-simple-import-boundary.test.mjs",
 			"tests/project-lock-name-single-source.test.mjs",
 			"tests/python-venv-proof.test.mjs",
+			"tests/simple-app-compilation-disclosure.test.mjs",
+			"tests/simple-check-differential-judge.test.mjs",
 			"tests/simple-cli-contract-admission.test.mjs",
+			"tests/simple-durable-telemetry.test.mjs",
+			"tests/simple-finalization-watch.test.mjs",
+			"tests/simple-held-apply-cli.test.mjs",
+			"tests/simple-held-apply-safety.test.mjs",
+			"tests/simple-held-baselines.test.mjs",
+			"tests/simple-held-differential.test.mjs",
+			"tests/simple-held-integration.test.mjs",
+			"tests/simple-manifest-review-hint.test.mjs",
+			"tests/simple-progress.test.mjs",
+			"tests/simple-report-citations.test.mjs",
+			"tests/simple-report-mode.test.mjs",
+			"tests/simple-undeclared-scope.test.mjs",
 		];
 		deepStrictEqual(
 			plan.suites.filter((path) => charterAdditions.includes(path)),

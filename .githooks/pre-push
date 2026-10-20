@@ -1,12 +1,42 @@
 #!/bin/sh
-set -e
+# Pre-push gate: full test suite and heavy checks with logged output.
+# Installed with: git config core.hooksPath .githooks
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
 export PATH="node_modules/.bin:$PATH"
-# Git exports repository variables such as GIT_DIR to hooks. From a linked
-# worktree they leak into the suite's own `git init` fixtures; the hook runs
-# at the worktree root, so ordinary discovery finds the same repository.
+# Drop repository-local hook variables before fixture repositories run.
 unset $(git rev-parse --local-env-vars)
-# `validate:host` is validate + host sandbox canary gate.
-# Hooking the named script rather than restating its steps means the hook
-# cannot drift from the gate — which is the failure this hook exists to stop:
-# knip went red at a4138a5 and three commits landed on top of it unnoticed.
-npm run validate:host
+GATE='npm run validate:host'
+
+mkdir -p .logs
+LOG=".logs/pre-push-$(git rev-parse --short HEAD).log"
+
+TMP_DIR="$(mktemp -d)" || exit 1
+trap 'rm -rf "$TMP_DIR"' EXIT
+trap 'exit 130' INT TERM HUP
+
+STATUS_FILE="$TMP_DIR/status"
+echo "1" > "$STATUS_FILE"
+
+(
+  trap 'status=$?; echo "$status" > "$STATUS_FILE"' EXIT
+  status=0
+  eval "$GATE" </dev/null || status=$?
+  exit "$status"
+) 2>&1 | tee "$LOG"
+
+EXIT_CODE="$(cat "$STATUS_FILE")"
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+  echo "pre-push: gate passed (log: $LOG)"
+  exit 0
+else
+  echo "pre-push: gate failed (exit $EXIT_CODE)"
+  grep -E 'not ok|FAILED|^FAIL' "$LOG" | head -n 20 || true
+  if LOAD="$(sysctl -n vm.loadavg 2>/dev/null)" && [ -n "$LOAD" ]; then
+    echo "pre-push: load $LOAD"
+  fi
+  echo "pre-push: full log $LOG"
+  exit "$EXIT_CODE"
+fi

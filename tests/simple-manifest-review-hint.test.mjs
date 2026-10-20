@@ -8,6 +8,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
+import { readRun } from "../src/switchyard/run-store/index.mjs";
 import { parseSimpleArgs } from "../src/switchyard/simple/args.mjs";
 import { manifestReviewHint } from "../src/switchyard/simple/declared-diff.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
@@ -44,7 +45,7 @@ function fixture() {
 	return { root, projectPath, promptPath };
 }
 
-async function refuseManifest(manifest) {
+async function refuseManifest(manifest, throwWarning = false) {
 	const repo = fixture();
 	const warnings = [];
 	let executions = 0;
@@ -58,7 +59,10 @@ async function refuseManifest(manifest) {
 		},
 		{
 			tmpdir: repo.root,
-			onRoutingWarning: (line) => warnings.push(line),
+			onRoutingWarning: (line) => {
+				warnings.push(line);
+				if (throwWarning) throw new Error("stderr closed");
+			},
 			executeProvider: async () => {
 				executions += 1;
 				return { success: true, writerLifecycle: "stopped" };
@@ -177,4 +181,13 @@ test("the routing answer the CLI prints keeps the engine hint", async () => {
 	strictEqual(routing.direction, "stop");
 	strictEqual(routing.result.failureReason, "manifest_review_required");
 	strictEqual(routing.result.hint, hint);
+});
+
+test("a throwing manifest warning preserves refusal and terminal durability", async () => {
+	const { result, warnings } = await refuseManifest("package.json", true);
+	strictEqual(result.status, "failed");
+	strictEqual(result.failureReason, "manifest_review_required");
+	strictEqual(result.recovery.cleanup.projectLock.state, "not_acquired");
+	strictEqual((await readRun(result.runId)).state, "failed");
+	strictEqual(warnings.length, 1);
 });

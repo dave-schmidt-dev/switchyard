@@ -16,7 +16,13 @@ import {
 	quickCheckSandboxProfile,
 	safeEnv,
 } from "../runner/checks-sandbox.mjs";
-import { linkPythonVenv } from "../runner/python-venv.mjs";
+import {
+	declaredSharedVenv,
+	isPythonCheck,
+	pythonCheckEnv,
+	verifyPythonManifests,
+} from "../runner/python-checks.mjs";
+import { linkPythonVenv, sharedVenvReadProof } from "../runner/python-venv.mjs";
 import {
 	MAX_CAPTURE_BYTES,
 	requireGit,
@@ -129,6 +135,19 @@ export function createSimpleCheckSessions({
 	evidenceDir = null,
 	differentialBaselines = null,
 }) {
+	const sharedVenv = declaredSharedVenv(
+		commands.map((command) => command.split(" ")),
+	);
+	function sharedReads(command) {
+		if (
+			!sharedVenv ||
+			!commands.includes(command) ||
+			!isPythonCheck(command.split(" "))
+		)
+			return [];
+		active.sharedProof.verify();
+		return active.sharedProof.readOnlyPaths;
+	}
 	let active = null;
 	let lifecycle = "never_started";
 	let evidenceAttempt = 1;
@@ -179,7 +198,7 @@ export function createSimpleCheckSessions({
 		const profile = quickCheckSandboxProfile(
 			active.path,
 			active.runtime,
-			[...reads, ...active.readOnlyPaths],
+			[...reads, ...active.readOnlyPaths, ...sharedReads(ownerCommand)],
 			{ command: ownerCommand },
 		);
 		lifecycle = "unavailable";
@@ -197,6 +216,7 @@ export function createSimpleCheckSessions({
 			},
 		);
 		lifecycle = result.writerLifecycle;
+		if (ownerCommand) sharedReads(ownerCommand);
 		return result;
 	}
 	// The pre-provider dry run compares where the first word of a failed check
@@ -215,7 +235,7 @@ export function createSimpleCheckSessions({
 			const profile = quickCheckSandboxProfile(
 				active.path,
 				active.runtime,
-				[...active.readOnlyPaths],
+				[...active.readOnlyPaths, ...sharedReads(command)],
 				{},
 			);
 			const result = await runSimpleWriter(
@@ -341,7 +361,9 @@ export function createSimpleCheckSessions({
 			"\n/node_modules/\n/.venv\n",
 		);
 		markStep("link_python_venv");
-		active.readOnlyPaths.push(...linkPythonVenv(projectPath, active.path));
+		const pythonReads = linkPythonVenv(projectPath, active.path, sharedVenv);
+		if (sharedVenv) active.sharedProof = sharedVenvReadProof(sharedVenv);
+		else active.readOnlyPaths.push(...pythonReads);
 		// Path dependencies come from the trusted project's manifests, never the
 		// candidate's, so a diff cannot widen what the sandbox may read.
 		markStep("resolve_path_dependencies");
@@ -399,6 +421,10 @@ export function createSimpleCheckSessions({
 					});
 			}
 		}
+		if (sharedVenv && !verifyPythonManifests(projectPath, active.path))
+			throw refused("check_dependencies_unverified", {
+				dependencyCheck: "manifest_changed_by_diff",
+			});
 		if (provision) {
 			markStep("provision_dependencies");
 			const setupEnv = trustedOfflineNpmEnv(
@@ -450,6 +476,7 @@ export function createSimpleCheckSessions({
 					"/bin/sh",
 					["-c", 'command -v "$1" >/dev/null', "check-readiness", word],
 					env,
+					sharedReads(command),
 				);
 				if (!ready.success || lifecycle !== "stopped")
 					throw refused("check_environment_unavailable", {
@@ -509,7 +536,9 @@ export function createSimpleCheckSessions({
 			execution.kind === "local"
 				? execution.args
 				: ["-c", plan?.shellCommand ?? command],
-			safeEnv(active.runtime),
+			isPythonCheck(command.split(" "))
+				? pythonCheckEnv(active.path, safeEnv(active.runtime), active.runtime)
+				: safeEnv(active.runtime),
 			[],
 			progress,
 			timeoutMs,

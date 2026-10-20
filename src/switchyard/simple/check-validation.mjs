@@ -3,6 +3,8 @@ import {
 	isXcodebuildBuild,
 	xcodebuildActions,
 } from "../runner/checks-sandbox.mjs";
+import { isPythonCheck } from "../runner/python-checks.mjs";
+import { sharedVenvRoot } from "../runner/python-venv.mjs";
 import { SimpleUsageError } from "./args.mjs";
 import { commandWords } from "./check-execution.mjs";
 
@@ -210,6 +212,11 @@ export function validateCheckCommand(command, projectPath) {
 			`--check uses unsupported shell grammar ($(...), backticks, unbalanced quote or $/backslash in command position): ${command.slice(0, 80)}`,
 		);
 	const segments = commandSegments(command);
+	if (
+		isPythonCheck(command.split(" ")) &&
+		sharedVenvRoot(command.split(" ")[0])
+	)
+		return;
 	for (const segment of segments) {
 		for (const word of segment) {
 			if (!isAbsolute(word)) continue;

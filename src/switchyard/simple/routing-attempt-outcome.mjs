@@ -1,5 +1,6 @@
 /** What a routing attempt's outcome means and whether the waterfall stops. */
 import { isDeepStrictEqual } from "node:util";
+import { hasTaskFailureEvidence } from "../diagnostics/failure-semantics.mjs";
 import { nonBlamingCause, taskExcludedTargets } from "./attempt-blame.mjs";
 import { deriveFailureAccountability } from "./failure-accountability.mjs";
 import { classifyAttemptFailure } from "./failure-severity.mjs";
@@ -98,7 +99,7 @@ export function unroutedStop({
 		};
 	}
 	const exhausted =
-		anyFailed || taskExcludedTargets(attempts, logicalTaskId).size > 0;
+		anyFailed || hasTaskFailureEvidence(attempts, logicalTaskId);
 	if (
 		routeCalled &&
 		noEligible &&

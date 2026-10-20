@@ -1,6 +1,7 @@
 /** Waterfall through the production router; the single-attempt engine remains unchanged. */
 import { randomUUID } from "node:crypto";
 import { sanitizeGitControlTamper } from "../diagnostics/failure-registry.mjs";
+import { shouldRecordRouteExhaustion } from "../diagnostics/failure-semantics.mjs";
 import {
 	getImplementorPriority,
 	resolveTargetIdentity,
@@ -404,10 +405,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			}
 			// A live quota error exhausts the target's route eligibility for
 			// an hour; the durable marker outlives this run's Gradus snapshot.
-			if (
-				failed &&
-				result.providerReliability?.causeCode === "quota_exhausted"
-			) {
+			if (shouldRecordRouteExhaustion(result)) {
 				try {
 					recordRouteExhaustion(pending.targetId, {
 						stateRoot: deps.stateRoot,

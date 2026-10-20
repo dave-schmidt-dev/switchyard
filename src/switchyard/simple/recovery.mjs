@@ -210,6 +210,18 @@ function createRecoveryEvidence({
 	evidence.continuation = assessment;
 	return evidence;
 }
+/** Describe the compilation boundary of executed acceptance checks. */
+function checkLimitationsOf(checks) {
+	if (!Array.isArray(checks) || checks.length === 0) return {};
+	// This is a checker capability limit, not project or build-output detection.
+	// Even a green package build does not prove an app target was compiled.
+	return {
+		checkLimitations: [
+			"App-target compilation is unverified: passing checks (including package builds) do not establish that app targets were compiled. Verify with a native app-target build.",
+		],
+	};
+}
+
 function terminalResult(base, overrides = {}) {
 	const status = overrides.status ?? "failed";
 	return {
@@ -228,6 +240,7 @@ function terminalResult(base, overrides = {}) {
 		// Whether the checks passed strictly or under the differential rule,
 		// without opening run.json or each check's record.
 		...checkAcceptanceOf(overrides.checks, base.checkCount),
+		...checkLimitationsOf(overrides.checks),
 		failureReason: overrides.failureReason ?? null,
 		failurePhase: overrides.failurePhase ?? null,
 		errorKind:
@@ -284,6 +297,7 @@ async function resolvePredecessorReceipt(input, projectPath, dependencies) {
 
 export {
 	aggregateWriterLifecycle,
+	checkLimitationsOf,
 	createRecoveryEvidence,
 	recoveryContract,
 	recoveryUnavailable,

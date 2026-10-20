@@ -7,11 +7,13 @@ import { settleSimpleWriterProcesses } from "../simple/process-teardown.mjs";
 import { MAX_CHECKS, parseCommand } from "./check-contract.mjs";
 import { trustedOfflineNpmEnv } from "./check-dependencies.mjs";
 import {
+	declaredSharedVenv,
 	isPythonCheck,
 	preparePythonChecks,
 	pythonCheckEnv,
 	verifyPythonCheckLink,
 } from "./python-checks.mjs";
+import { sharedVenvReadProof } from "./python-venv.mjs";
 import {
 	gateCandidate,
 	runCommand,
@@ -81,6 +83,7 @@ export function runQuickChecks({
 			(typeof deadline !== "string" || !Number.isFinite(Date.parse(deadline))))
 	)
 		throw new Error("invalid Quick checks input");
+	const sharedVenv = declaredSharedVenv(checks);
 	const root =
 		ownedRoot ?? mkdtempSync(join(tmpdir(), "switchyard-quick-check-"));
 	const launchedAt = Date.now();
@@ -133,8 +136,9 @@ export function runQuickChecks({
 		const hasPython = checks.some((argv) => isPythonCheck(argv));
 		let pythonReadOnlyPaths = [];
 		if (hasPython) {
-			pythonReadOnlyPaths = preparePythonChecks(projectPath, clone);
+			pythonReadOnlyPaths = preparePythonChecks(projectPath, clone, sharedVenv);
 		}
+		const sharedProof = sharedVenv ? sharedVenvReadProof(sharedVenv) : null;
 		git(clone, env, ["add", "-A"]);
 		receipt.candidateTree = git(clone, env, ["write-tree"]);
 		if (setup) {
@@ -179,6 +183,7 @@ export function runQuickChecks({
 				checks.length - index - 1,
 			);
 			const isPython = isPythonCheck(argv);
+			if (isPython) sharedProof?.verify();
 			const checkEnv = isPython ? pythonCheckEnv(clone, env, root) : env;
 			const outcome =
 				boundedTimeoutMs >= 100
@@ -187,6 +192,7 @@ export function runQuickChecks({
 							readOnlyPaths: isPython ? pythonReadOnlyPaths : [],
 						})
 					: deadlineExpiredOutcome();
+			if (isPython) sharedProof?.verify();
 			receipt.checks.push({
 				index,
 				commandSha256: sha(JSON.stringify(argv)),
@@ -195,7 +201,7 @@ export function runQuickChecks({
 			if (outcome.exitCode !== 0 || outcome.groupCleanup !== "complete")
 				throw new Error("check_failed");
 		}
-		if (hasPython && !verifyPythonCheckLink(projectPath, clone))
+		if (hasPython && !verifyPythonCheckLink(projectPath, clone, sharedVenv))
 			throw new Error("setup_unavailable");
 		git(clone, env, ["add", "-A"]);
 		if (git(clone, env, ["write-tree"]) !== receipt.candidateTree)
