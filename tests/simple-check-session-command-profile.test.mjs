@@ -22,6 +22,7 @@ import {
 import { runCommand } from "../src/switchyard/runner/reliability.mjs";
 import { createSimpleCheckSessions } from "../src/switchyard/simple/check-session.mjs";
 import { validateCheckCommand } from "../src/switchyard/simple/check-validation.mjs";
+import { nestedSandboxSkip } from "./helpers/nested-sandbox.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const XCODE_SELECT_LINK = "/var/db/xcode_select_link";
@@ -48,6 +49,10 @@ function xcodeSelected() {
 }
 const darwinSkip =
 	process.platform === "darwin" ? false : "requires macOS sandbox-exec";
+// Nested in the check sandbox, sandbox-exec cannot start and the profile
+// builder cannot resolve the passwd home, so every suite below the parser
+// tests runs only in the host suite.
+const sandboxSkip = darwinSkip || nestedSandboxSkip;
 const xcodeSkip = xcodeSelected()
 	? false
 	: "requires a selected Xcode developer directory";
@@ -191,7 +196,7 @@ describe("xcodebuild action parsing", () => {
 	});
 });
 
-describe("quick-check runner profile command", { skip: darwinSkip }, () => {
+describe("quick-check runner profile command", { skip: sandboxSkip }, () => {
 	function profileFor(argv, options) {
 		const root = realpathSync(tempDir("switchyard-runner-profile-"));
 		let payload;
@@ -215,7 +220,7 @@ describe("quick-check runner profile command", { skip: darwinSkip }, () => {
 	});
 });
 
-describe("check session profile command", { skip: darwinSkip }, () => {
+describe("check session profile command", { skip: sandboxSkip }, () => {
 	it("dissociates the checker object store before confined Git checks", async () => {
 		const repo = project();
 		const linkedPath = join(repo.root, "linked-project");
@@ -335,7 +340,7 @@ describe("check session profile command", { skip: darwinSkip }, () => {
 	});
 });
 
-describe("xcodebuild profile preference reads", { skip: darwinSkip }, () => {
+describe("xcodebuild profile preference reads", { skip: sandboxSkip }, () => {
 	it("does not expose other user defaults domains", (t) => {
 		const host = spawnSync("/usr/bin/defaults", ["read", "com.apple.dock"], {
 			encoding: "utf8",
