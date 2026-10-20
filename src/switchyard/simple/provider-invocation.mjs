@@ -34,6 +34,9 @@ const VIBE_CODE_LAUNCHER = fileURLToPath(
 const CLAUDE_CODE_LAUNCHER = fileURLToPath(
 	new URL("../../../ops/simple-claude-code-launcher.mjs", import.meta.url),
 );
+// The BWS broker execs the keyless bridge for every Vibe and opencode-go
+// attempt, so the bridge's own exit status and last line reach the runner.
+const KEYLESS_BRIDGE_BROKER = "/Users/dave/.agent/bin/bws-secret-exec";
 
 function remainingMs(deadlineMs, now) {
 	return Math.max(0, deadlineMs - now());
@@ -168,7 +171,7 @@ export function buildSimpleProviderInvocation(
 	}
 	if (harness === "vibe") {
 		return {
-			command: "/Users/dave/.agent/bin/bws-secret-exec",
+			command: KEYLESS_BRIDGE_BROKER,
 			args: [
 				"switchyard-simple-vibe-dispatch",
 				"--",
@@ -183,7 +186,7 @@ export function buildSimpleProviderInvocation(
 	}
 	if (harness === "opencode") {
 		return {
-			command: "/Users/dave/.agent/bin/bws-secret-exec",
+			command: KEYLESS_BRIDGE_BROKER,
 			args: [
 				"switchyard-simple-opencode-go-dispatch",
 				"--",
@@ -344,6 +347,8 @@ export async function defaultExecuteProvider(context) {
 				stdout: result.output,
 				exitCode: result.code,
 				signal: result.signal,
+				keylessBridge: invocation.command === KEYLESS_BRIDGE_BROKER,
+				timedOut: result.timedOut === true,
 			})
 		: null;
 	const diagnosticEvidence = !result.success

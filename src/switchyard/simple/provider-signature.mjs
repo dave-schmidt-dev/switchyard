@@ -25,8 +25,38 @@ export const PROVIDER_SIGNATURES = Object.freeze([
 	"model_unavailable",
 	"tool_error",
 	"context_overflow",
+	"provider_killed",
+	"provider_deadline_exceeded",
 	"unrecognized",
 ]);
+
+// The keyless bridge (ops/simple-provider-keyless-bridge.mjs) exits 76 with
+// this fixed last line whenever its provider stopped before a verified
+// completion. Every field is a trusted status token, and the bridge frames any
+// child line that starts with its prefix, so the line cannot be forged.
+const KEYLESS_BRIDGE_FAILURE_EXIT = 76;
+const KEYLESS_BRIDGE_TERMINATION =
+	/^simple-provider-keyless-bridge: provider terminated before a verified completion \(code (?:none|\d{1,10}), signal ([A-Z][A-Z0-9_]{0,31}|none|unknown), error (?:[A-Z][A-Z0-9_]{0,31}|none|unknown), interrupt (duration-limit|SIGTERM|SIGINT|none)\)$/u;
+
+/**
+ * Closed signature for a keyless bridge exit whose provider was stopped by a
+ * signal or an interrupt, or null for any other output. A deadline drove the
+ * kill only when the bridge's own duration limit fired or the runner timed the
+ * attempt out; every other signal or interrupt is a plain kill. A spawn error
+ * with neither field set is not a kill.
+ */
+function keylessBridgeSignature(text, exitCode, timedOut) {
+	if (exitCode !== KEYLESS_BRIDGE_FAILURE_EXIT) return null;
+	const match = KEYLESS_BRIDGE_TERMINATION.exec(
+		text.trimEnd().split(/\r?\n/u).at(-1),
+	);
+	if (!match) return null;
+	const [, signal, interrupt] = match;
+	if (signal === "none" && interrupt === "none") return null;
+	return interrupt === "duration-limit" || timedOut === true
+		? "provider_deadline_exceeded"
+		: "provider_killed";
+}
 
 const APPROVAL_DENIED_PATTERNS = [
 	/approval[_\s-]+denied/i,
@@ -178,6 +208,9 @@ export function createRateLimitMatcher({ prompt = "" } = {}) {
  * @param {string|Buffer} [input.stdout]
  * @param {number|null} [input.exitCode]
  * @param {string|null} [input.signal]
+ * @param {boolean} [input.keylessBridge] the process is the keyless bridge,
+ *   so an otherwise unrecognized exit may carry its termination line
+ * @param {boolean} [input.timedOut] the runner's deadline stopped the process
  * @returns {{ providerSignature: string, stderrBytes: number, stdoutBytes: number }}
  */
 export function classifyProviderOutput({
@@ -185,6 +218,8 @@ export function classifyProviderOutput({
 	stdout = "",
 	exitCode = null,
 	signal = null,
+	keylessBridge = false,
+	timedOut = false,
 } = {}) {
 	const errText =
 		typeof stderr === "string"
@@ -239,6 +274,9 @@ export function classifyProviderOutput({
 		exitCode === 504
 	) {
 		providerSignature = "network_error";
+	} else if (keylessBridge) {
+		providerSignature =
+			keylessBridgeSignature(errText, exitCode, timedOut) ?? "unrecognized";
 	}
 
 	return Object.freeze({

@@ -142,6 +142,24 @@ test("classifyProviderOutput correctly classifies one fixture per enum value", (
 			},
 		},
 		{
+			signature: "provider_killed",
+			input: {
+				stderr:
+					"simple-provider-keyless-bridge: provider terminated before a verified completion (code none, signal SIGKILL, error none, interrupt none)\n",
+				exitCode: 76,
+				keylessBridge: true,
+			},
+		},
+		{
+			signature: "provider_deadline_exceeded",
+			input: {
+				stderr:
+					"simple-provider-keyless-bridge: provider terminated before a verified completion (code none, signal SIGTERM, error none, interrupt duration-limit)\n",
+				exitCode: 76,
+				keylessBridge: true,
+			},
+		},
+		{
 			signature: "unrecognized",
 			input: {
 				stderr: "Something completely unexpected occurred on line 123",
@@ -150,7 +168,7 @@ test("classifyProviderOutput correctly classifies one fixture per enum value", (
 		},
 	];
 
-	// Verify that all 8 enum values are represented
+	// Verify that every enum value is represented
 	deepStrictEqual(
 		fixtures.map((f) => f.signature).sort(),
 		[...PROVIDER_SIGNATURES].sort(),
