@@ -37,6 +37,9 @@ export const DETAIL_FIELD_TYPES = Object.freeze({
 	checkSetupExecutable: "string",
 	checkExecutable: "string",
 	hostExecutable: "string",
+	// The path a failed check's own output names as denied (Seatbelt trace or
+	// an "Operation not permitted"/EPERM line), bounded like the paths above.
+	sandboxDeniedPath: "string",
 	diffRejectionCategory: "string",
 	diffRejectionCount: "integer",
 	diffRejectionRule: "string",

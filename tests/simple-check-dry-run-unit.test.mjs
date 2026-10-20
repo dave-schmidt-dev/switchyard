@@ -141,6 +141,7 @@ test("registry: check_environment_failed is a baseline-severity environment row"
 			"checkIdentity",
 			"checkEnvironmentSignature",
 			"outputPath",
+			"sandboxDeniedPath",
 		],
 	);
 	for (const phase of ["baseline", "checks"]) {

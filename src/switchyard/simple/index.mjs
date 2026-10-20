@@ -158,6 +158,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let failureTimedOut = null;
 	let failingCheckEnvironmentSignature = null;
 	let failingCheckOutputPath = null;
+	let failingCheckSandboxDeniedPath = null;
 	let failingCheckExecutable = null;
 	let failingCheckHostExecutable = null;
 	let repairCount = 0;
@@ -512,6 +513,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 			npmCiFailed && typeof error?.outputPath === "string"
 				? error.outputPath
 				: null;
+		const setupSandboxDeniedPath =
+			npmCiFailed && typeof error?.sandboxDeniedPath === "string"
+				? error.sandboxDeniedPath
+				: null;
 		const setupEnvironmentSignature =
 			npmCiFailed &&
 			CHECK_ENVIRONMENT_SIGNATURES.includes(error?.checkEnvironmentSignature)
@@ -563,6 +568,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 				(["baseline", "checks"].includes(failurePhase)
 					? failingCheckOutputPath
 					: (providerExecutionResult?.outputPath ?? null)),
+			sandboxDeniedPath:
+				setupSandboxDeniedPath ??
+				(["baseline", "checks"].includes(failurePhase)
+					? failingCheckSandboxDeniedPath
+					: null),
 			dependencyCheck,
 			manifestName:
 				typeof error?.manifestName === "string" ? error.manifestName : null,
@@ -1280,12 +1290,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 			signal,
 			runCheck: async (request) => {
 				const result = await runCheck(request);
-				if (
-					checkSessions &&
-					result?.success !== true &&
-					typeof result?.outputPath === "string"
-				) {
-					failingCheckOutputPath = result.outputPath;
+				if (checkSessions && result?.success !== true) {
+					if (typeof result?.outputPath === "string")
+						failingCheckOutputPath = result.outputPath;
+					if (typeof result?.sandboxDeniedPath === "string")
+						failingCheckSandboxDeniedPath = result.sandboxDeniedPath;
 				}
 				return result;
 			},
@@ -1377,6 +1386,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 				failingCheckIdentity = dryRun.checkIdentity;
 				failingCheckEnvironmentSignature = dryRun.signature;
 				failingCheckOutputPath = dryRun.outputPath;
+				failingCheckSandboxDeniedPath =
+					typeof dryRun.sandboxDeniedPath === "string"
+						? dryRun.sandboxDeniedPath
+						: null;
 				failingCheckExecutable =
 					typeof dryRun.checkExecutable === "string"
 						? dryRun.checkExecutable
@@ -1978,6 +1991,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 					failingCheckIndex = null;
 					failingCheckIdentity = null;
 					failingCheckOutputPath = null;
+					failingCheckSandboxDeniedPath = null;
 					continue;
 				}
 
@@ -1985,6 +1999,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 				failingCheckIdentity = checkIdentity;
 				failingCheckOutputPath =
 					typeof check?.outputPath === "string" ? check.outputPath : null;
+				failingCheckSandboxDeniedPath =
+					typeof check?.sandboxDeniedPath === "string"
+						? check.sandboxDeniedPath
+						: null;
 				failureExitCode = checkExitCode;
 				failureSignal = checkSignal;
 				failureTimedOut = check?.timedOut === true;

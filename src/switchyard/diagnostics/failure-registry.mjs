@@ -129,6 +129,7 @@ const CHECK_DETAIL_FIELDS = Object.freeze([
 	"checkIndex",
 	"checkIdentity",
 	"outputPath",
+	"sandboxDeniedPath",
 ]);
 const CHECK_ENVIRONMENT_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
@@ -136,6 +137,7 @@ const CHECK_ENVIRONMENT_DETAIL_FIELDS = Object.freeze([
 	"checkIdentity",
 	"checkEnvironmentSignature",
 	"outputPath",
+	"sandboxDeniedPath",
 ]);
 // Task 2.8: when the pre-provider dry run can name where the check command's
 // first word resolves in the sandbox and on the host, both paths join the row.
@@ -173,6 +175,7 @@ const CHECK_DEPENDENCY_DETAIL_FIELDS = Object.freeze([
 	"checkSetupStep",
 	"checkEnvironmentSignature",
 	"outputPath",
+	"sandboxDeniedPath",
 ]);
 const PROVIDER_DETAIL_FIELDS = Object.freeze([
 	"failureReason",
