@@ -41,8 +41,10 @@ function writeOwnerMarker(root, runId, nonce) {
 
 /**
  * Run every held acceptance check against `head` with `patch` applied in a
- * sandboxed checker. Resolves `{ ok: true }` or `{ ok: false, detail,
- * checkIndex? }`; it never touches the project tree.
+ * sandboxed checker. Resolves `{ ok: true }` only when every check passed and
+ * the checker was proven stopped and removed; otherwise `{ ok: false, detail,
+ * checkIndex?, checker }`, where `checker: "retained"` means its root is left
+ * for recovery. It never touches the project tree.
  */
 export async function runHeldRechecks(
 	{
@@ -85,8 +87,9 @@ export async function runHeldRechecks(
 	});
 	let session = null;
 	let writerStopped = true;
+	let verdict;
 	try {
-		session = createSimpleCheckSessions({
+		session = (deps.createSimpleCheckSessions ?? createSimpleCheckSessions)({
 			taskRoot: candidatePath,
 			projectPath,
 			baseRevision: head,
@@ -118,48 +121,61 @@ export async function runHeldRechecks(
 						checkIndex: index + 1,
 					}),
 			});
-			if (!result?.success)
-				return { ok: false, detail: "check_failed", checkIndex: index + 1 };
+			if (!result?.success) {
+				verdict = { ok: false, detail: "check_failed", checkIndex: index + 1 };
+				break;
+			}
 		}
-		return { ok: true };
+		verdict ??= { ok: true };
 	} catch (error) {
-		return {
+		verdict = {
 			ok: false,
 			detail:
 				error?.code === "deadline_expired"
 					? "deadline_expired"
 					: "check_setup_failed",
 		};
-	} finally {
-		try {
-			session?.remove();
-		} catch {
-			writerStopped = false;
-		}
-		let outcome;
-		try {
-			outcome = await (deps.cleanupSimpleWorktree ?? cleanupSimpleWorktree)(
-				applyRunId,
-				{ ...claim, ...identity },
-				{ writerStopped },
-			);
-		} catch {
-			outcome = { removed: false, path: candidatePath };
-		}
-		const path = outcome.path ?? candidatePath;
-		await updateRun(applyRunId, {
-			worktree: {
-				canonicalParent: dirname(path),
-				candidateChild: basename(path),
-				path,
-				state: outcome.removed ? "removed" : "retained",
-				reason: outcome.removed
-					? null
-					: (outcome.reason ?? "worktree_cleanup_failed"),
-				retainedAt: outcome.removed ? null : new Date(now()).toISOString(),
-				writerStopped,
-				...identity,
-			},
-		}).catch(() => {});
 	}
+	try {
+		session?.remove();
+	} catch {
+		writerStopped = false;
+	}
+	let outcome;
+	try {
+		outcome = await (deps.cleanupSimpleWorktree ?? cleanupSimpleWorktree)(
+			applyRunId,
+			{ ...claim, ...identity },
+			{ writerStopped },
+		);
+	} catch {
+		outcome = { removed: false, path: candidatePath };
+	}
+	const path = outcome.path ?? candidatePath;
+	await updateRun(applyRunId, {
+		worktree: {
+			canonicalParent: dirname(path),
+			candidateChild: basename(path),
+			path,
+			state: outcome.removed ? "removed" : "retained",
+			reason: outcome.removed
+				? null
+				: (outcome.reason ?? "worktree_cleanup_failed"),
+			retainedAt: outcome.removed ? null : new Date(now()).toISOString(),
+			writerStopped,
+			...identity,
+		},
+	}).catch(() => {});
+	// A pass is acceptance only when no checker process can still be writing.
+	if (writerStopped && outcome.removed === true) return verdict;
+	return {
+		...verdict,
+		ok: false,
+		detail: verdict.ok
+			? writerStopped
+				? "checker_cleanup_failed"
+				: "checker_not_stopped"
+			: verdict.detail,
+		checker: "retained",
+	};
 }

@@ -8,8 +8,11 @@
  * alone and change no manifest, the declared files must still match what was
  * verified, the acceptance checks re-run when HEAD moved, and the gate's own
  * scope, manifest and `git apply --check` refusals apply before any write.
- * Every refusal is one closed reason and leaves the project tree untouched,
- * except `held_apply_state_unknown`, which says so.
+ * Before the gate may write, the held record is claimed as `applying`, so an
+ * apply that dies or cannot record its outcome blocks every later apply
+ * instead of letting one write the same patch twice. Every refusal is one
+ * closed reason and leaves the project tree untouched, except
+ * `held_apply_state_unknown`, which says so.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
@@ -57,6 +60,21 @@ function sameProject(recorded, projectPath) {
 		return false;
 	}
 }
+
+// The record must be the requested run's own: a record copied into another
+// run's directory would otherwise name that other run's patch.
+function heldFor(record, runId, projectPath) {
+	const held = heldIntegrationOf(record);
+	return held &&
+		record.runId === runId &&
+		sameProject(record.projectPath, projectPath)
+		? held
+		: null;
+}
+
+// `git apply --check` refusals: nothing was written. Any other apply failure
+// may have come from the mutating `git apply` and is reported as unknown.
+const FORWARD_CHECK_KINDS = new Set(["conflict", "corrupt_patch"]);
 
 function outputsAt(root, paths) {
 	return paths.map((path) => {
@@ -119,9 +137,9 @@ function staleDetail(receipt, head, projectPath) {
 
 function gateRefusal(gate) {
 	if (gate?.message !== "Diff apply failed") return "held_scope_refused";
-	return gate.reasonKind === "integration_state_unknown"
-		? "held_apply_state_unknown"
-		: "held_patch_conflict";
+	return FORWARD_CHECK_KINDS.has(gate.reasonKind)
+		? "held_patch_conflict"
+		: "held_apply_state_unknown";
 }
 
 /**
@@ -158,8 +176,8 @@ export async function applyHeldIntegration(
 	} catch {
 		return refusal("held_run_not_found");
 	}
-	const held = heldIntegrationOf(record);
-	if (!held || !sameProject(record.projectPath, projectPath))
+	const held = heldFor(record, runId, projectPath);
+	if (!held)
 		return refusal("held_receipt_invalid", { detail: "not_a_held_run" });
 	if (held.state === "applied") return consumed(held);
 
@@ -200,7 +218,8 @@ export async function applyHeldIntegration(
 						}
 					: {
 							state: "failed",
-							cleanupState: "complete",
+							cleanupState:
+								result.checker === "retained" ? "failed" : "complete",
 							finishedAt,
 							lastFailure: sanitizeFailureMetadata({
 								result: result.reason,
@@ -236,7 +255,7 @@ export async function applyHeldIntegration(
 		);
 	}
 
-	const state = { mutationStarted: false, record: null };
+	const state = { mutationStarted: false, record: null, claimed: null };
 	let result;
 	try {
 		result = await applyUnderLock(
@@ -255,8 +274,13 @@ export async function applyHeldIntegration(
 		);
 	}
 	// Annotate the held record while the lock still excludes other appliers.
+	// An unknown outcome keeps the `applying` claim; any other refusal after
+	// the claim proves the tree untouched and returns the receipt to `held`.
 	if (!result.ok && !UNRECORDED_REFUSALS.has(result.reason) && state.record) {
-		const integration = heldIntegrationOf(state.record);
+		const integration =
+			result.reason === "held_apply_state_unknown" && state.claimed
+				? state.claimed
+				: heldIntegrationOf(state.record);
 		try {
 			await updateRun(runId, {
 				terminalSummary: {
@@ -272,7 +296,9 @@ export async function applyHeldIntegration(
 					},
 				},
 			});
-		} catch {}
+		} catch {
+			if (state.claimed) result.heldRecord = "unconfirmed";
+		}
 	}
 	let released = false;
 	try {
@@ -292,11 +318,18 @@ async function applyUnderLock(input, deps, state) {
 	// Re-read under the lock: a concurrent apply that won it first has
 	// already marked the receipt applied.
 	const record = await read(runId);
-	const held = heldIntegrationOf(record);
-	if (!held || !sameProject(record.projectPath, projectPath))
+	const held = heldFor(record, runId, projectPath);
+	if (!held)
 		return refusal("held_receipt_invalid", { detail: "not_a_held_run" });
 	if (held.state === "applied") return consumed(held);
-	const { receipt, patch } = readHeldIntegration(record, projectPath);
+	// A claim left by an earlier apply that ended without an outcome: that
+	// apply may have written the patch, so only the owner can resolve it.
+	if (held.state === "applying")
+		return refusal("held_apply_state_unknown", {
+			detail: "interrupted_apply",
+			earlierApplyRunId: held.applyRunId,
+		});
+	const { receipt, patch } = readHeldIntegration(record, projectPath, runId);
 	state.record = record;
 
 	progress({ phase: "verify" });
@@ -333,6 +366,7 @@ async function applyUnderLock(input, deps, state) {
 			return refusal("held_recheck_failed", {
 				detail: checked?.detail ?? "check_failed",
 				...(checked?.checkIndex ? { checkIndex: checked.checkIndex } : {}),
+				...(checked?.checker === "retained" ? { checker: "retained" } : {}),
 				head,
 			});
 		recheck = "passed";
@@ -349,6 +383,22 @@ async function applyUnderLock(input, deps, state) {
 	}
 
 	progress({ phase: "integrate" });
+	const claimed = {
+		...held,
+		state: "applying",
+		applyRunId,
+		applyingAt: new Date(now()).toISOString(),
+	};
+	try {
+		await updateRun(runId, {
+			terminalSummary: { ...record.terminalSummary, integration: claimed },
+		});
+	} catch {
+		return refusal("run_store_write_failed", {
+			detail: "apply_claim_unrecorded",
+		});
+	}
+	state.claimed = claimed;
 	state.mutationStarted = true;
 	const gate = (deps.integrationGate ?? integrationGate)(patch, projectPath, {
 		allowedPaths: receipt.scopeFiles,

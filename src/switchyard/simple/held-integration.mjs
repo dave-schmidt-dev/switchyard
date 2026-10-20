@@ -20,7 +20,7 @@ import {
 	readFileSync,
 	writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { integrationGate } from "../integrate/index.mjs";
 import { getRunRoot } from "../run-store/run-records.mjs";
 import { MAX_CAPTURE_BYTES } from "./git-control.mjs";
@@ -59,6 +59,28 @@ function syncDirectory(path) {
 	} finally {
 		closeSync(fd);
 	}
+}
+
+function ownedDirectory(path) {
+	const stats = lstatSync(path);
+	if (
+		!stats.isDirectory() ||
+		stats.isSymbolicLink() ||
+		stats.uid !== process.getuid()
+	)
+		throw Object.assign(new Error("held directory is not owner-only"), {
+			code: "held_directory_unsafe",
+		});
+}
+
+// The held directory is created once, by this run, inside its own run root.
+// A pre-existing entry (a symlink planted into the project, say) is refused
+// rather than followed, and the files are created exclusively, so nothing is
+// ever written outside the run store.
+function createHeldDirectory(directory) {
+	ownedDirectory(dirname(directory));
+	mkdirSync(directory, { mode: 0o700 });
+	ownedDirectory(directory);
 }
 
 /**
@@ -101,7 +123,7 @@ export function holdVerifiedIntegration(input, { now = Date.now } = {}) {
 		heldAt,
 	};
 	const receiptBytes = Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8");
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	createHeldDirectory(directory);
 	writeSynced(patchPath, patch);
 	writeSynced(receiptPath, receiptBytes);
 	syncDirectory(directory);
@@ -154,14 +176,18 @@ function readOwnedFile(path, maxBytes) {
 	}
 }
 
-/** The record's held integration summary, or null when it is not a hold. */
+/**
+ * The record's held integration summary, or null when it is not a hold.
+ * `applying` is the claim an apply writes before it mutates the project; one
+ * left behind means that apply ended without recording its outcome.
+ */
 export function heldIntegrationOf(record) {
 	const integration = record?.terminalSummary?.integration;
 	if (
 		record?.state !== "succeeded" ||
 		record.terminalSummary.status !== "held" ||
 		integration?.mode !== "hold" ||
-		!["held", "applied"].includes(integration.state)
+		!["held", "applying", "applied"].includes(integration.state)
 	)
 		return null;
 	return integration;
@@ -170,11 +196,13 @@ export function heldIntegrationOf(record) {
 /**
  * Load and verify the held patch a run record names. Throws an error coded
  * `held_receipt_invalid` unless both files sit at the run's own fixed paths,
- * match the digests in the record, and describe this run and project.
+ * match the digests in the record, and describe this run (`runId`, the one
+ * the caller asked for) and project.
  */
-export function readHeldIntegration(record, projectPath) {
+export function readHeldIntegration(record, projectPath, runId) {
 	const integration = heldIntegrationOf(record);
 	if (!integration) throw invalid("not_a_held_run");
+	if (record.runId !== runId) throw invalid("run_id_mismatch");
 	const expected = heldPaths(record.runId);
 	if (
 		integration.receiptPath !== expected.receiptPath ||
@@ -234,6 +262,12 @@ export async function inspectHeldIntegrations(state, readRun) {
 				? {
 						appliedAt: integration.appliedAt,
 						appliedHead: integration.appliedHead,
+						applyRunId: integration.applyRunId,
+					}
+				: {}),
+			...(integration.state === "applying"
+				? {
+						applyingAt: integration.applyingAt,
 						applyRunId: integration.applyRunId,
 					}
 				: {}),
