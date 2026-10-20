@@ -5,9 +5,10 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
+import { parseSimpleArgs } from "../src/switchyard/simple/args.mjs";
 import { manifestReviewHint } from "../src/switchyard/simple/declared-diff.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
@@ -43,7 +44,7 @@ function fixture() {
 	return { root, projectPath, promptPath };
 }
 
-test("an unreviewed declared manifest names --allow-manifest in the hint and on stderr", async () => {
+async function refuseManifest(manifest) {
 	const repo = fixture();
 	const warnings = [];
 	let executions = 0;
@@ -51,7 +52,7 @@ test("an unreviewed declared manifest names --allow-manifest in the hint and on 
 		{
 			...repo,
 			capability: "standard",
-			files: ["a.txt", "package.json"],
+			files: ["a.txt", manifest],
 			checks: ["test -f a.txt"],
 			deadlineMs: Date.now() + 120_000,
 		},
@@ -65,6 +66,11 @@ test("an unreviewed declared manifest names --allow-manifest in the hint and on 
 		},
 	);
 	strictEqual(executions, 0);
+	return { result, warnings };
+}
+
+test("an unreviewed declared manifest names --allow-manifest in the hint and on stderr", async () => {
+	const { result, warnings } = await refuseManifest("package.json");
 	strictEqual(result.status, "failed");
 	strictEqual(result.failureReason, "manifest_review_required");
 	strictEqual(result.failurePhase, "input_validation");
@@ -73,7 +79,7 @@ test("an unreviewed declared manifest names --allow-manifest in the hint and on 
 	deepStrictEqual(result.diffRejection.paths, ["package.json"]);
 	strictEqual(
 		result.hint,
-		"review the change to package.json, then rerun with --allow-manifest package.json to allow it",
+		"review the change to package.json, then rerun with --allow-manifest=package.json to allow it",
 	);
 	deepStrictEqual(
 		warnings.filter((line) => line.includes("manifest review")),
@@ -81,12 +87,69 @@ test("an unreviewed declared manifest names --allow-manifest in the hint and on 
 	);
 });
 
-test("the hint shell-quotes unsafe paths and counts paths beyond the bounded list", () => {
+test("the hint names a manifest path past the persisted bound exactly", async () => {
+	const manifest = `${"d/".repeat(103)}package.json`;
+	const { result } = await refuseManifest(manifest);
+	strictEqual(result.failureReason, "manifest_review_required");
+	strictEqual(result.diffRejection.paths[0].length, 200);
+	ok(result.hint.includes(` --allow-manifest=${manifest} `));
+});
+
+test("the hint names exact paths, shell-quoted, and counts the ones it cannot name", () => {
 	strictEqual(
-		manifestReviewHint(["Makefile", "pkg dir/package.json", "it's/go.mod"], 2),
-		"review the change to Makefile, pkg dir/package.json, it's/go.mod and 2 more, then rerun with --allow-manifest Makefile --allow-manifest 'pkg dir/package.json' --allow-manifest 'it'\\''s/go.mod' to allow it",
+		manifestReviewHint(["Makefile", "pkg dir/package.json", "it's/go.mod"]),
+		"review the change to Makefile, pkg dir/package.json, it's/go.mod, then rerun with --allow-manifest=Makefile --allow-manifest='pkg dir/package.json' --allow-manifest='it'\\''s/go.mod' to allow it",
+	);
+	// Past the persisted 200-character bound, the flag still names the path.
+	const long = `${"d/".repeat(103)}go.mod`;
+	strictEqual(long.length, 212);
+	ok(manifestReviewHint([long]).includes(`--allow-manifest=${long} `));
+	// A control character is never printed; that path is only counted.
+	strictEqual(
+		manifestReviewHint([
+			"a.sh",
+			"b\u001b[2Jc.sh",
+			"c.sh",
+			"d.sh",
+			"e.sh",
+			"f.sh",
+			"g.sh",
+		]),
+		"review the change to a.sh, c.sh, d.sh, e.sh, f.sh and 2 more, then rerun with --allow-manifest=a.sh --allow-manifest=c.sh --allow-manifest=d.sh --allow-manifest=e.sh --allow-manifest=f.sh to allow it",
 	);
 	ok(!manifestReviewHint(["package.json"]).includes("more"));
+	strictEqual(
+		manifestReviewHint(["\u202e.sh"]),
+		"review each changed manifest, then rerun with --allow-manifest=<path> for each one to allow it",
+	);
+});
+
+test("the suggested flag parses back to the exact declared path", () => {
+	const repo = fixture();
+	for (const path of ["-task.sh", "pkg dir/package.json"]) {
+		mkdirSync(join(repo.projectPath, dirname(path)), { recursive: true });
+		writeFileSync(join(repo.projectPath, path), "x\n");
+		const flag = manifestReviewHint([path]).match(
+			/--allow-manifest=('(?:[^']|'\\'')*'|\S+)/u,
+		)[1];
+		const value = flag.startsWith("'")
+			? flag.slice(1, -1).replaceAll("'\\''", "'")
+			: flag;
+		const parsed = parseSimpleArgs([
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"standard",
+			`--file=${path}`,
+			`--allow-manifest=${value}`,
+			"--check",
+			"true",
+			"--timeout",
+			"30",
+		]);
+		deepStrictEqual(parsed.allowManifests, [path]);
+	}
 });
 
 test("the routing answer the CLI prints keeps the engine hint", async () => {

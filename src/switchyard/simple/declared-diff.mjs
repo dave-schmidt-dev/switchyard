@@ -83,20 +83,39 @@ function diffRejectionFor(validated) {
 }
 
 const SHELL_SAFE_PATH = /^[\w./@%+=:,-]+$/u;
+// A flag argument must be the exact declared path, so a path the hint cannot
+// print verbatim and safely is counted instead of named.
+const HINT_UNPRINTABLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const HINT_PATH_MAX_CHARS = 1024;
 
 /**
  * Human-facing next step for a manifest review refusal: the exact
- * `--allow-manifest` flag for each listed path, shell-quoted when needed,
- * plus a count of paths beyond the bounded list. The machine codes
+ * `--allow-manifest=<path>` flag for each of the first five printable paths,
+ * shell-quoted when needed, plus a count of the paths it does not name. The
+ * `=` form keeps a path that starts with `-` an argument. The machine codes
  * (`manifest_review_required`) are unchanged.
  */
-function manifestReviewHint(paths, unlisted = 0) {
-	const flags = paths.map(
+function manifestReviewHint(paths) {
+	const listed = [];
+	for (const path of paths) {
+		if (listed.length === DIFF_REJECTION_PATH_LIMIT) break;
+		if (
+			typeof path === "string" &&
+			path.length > 0 &&
+			path.length <= HINT_PATH_MAX_CHARS &&
+			!HINT_UNPRINTABLE.test(path)
+		)
+			listed.push(path);
+	}
+	if (listed.length === 0)
+		return "review each changed manifest, then rerun with --allow-manifest=<path> for each one to allow it";
+	const flags = listed.map(
 		(path) =>
-			`--allow-manifest ${SHELL_SAFE_PATH.test(path) ? path : `'${path.replaceAll("'", "'\\''")}'`}`,
+			`--allow-manifest=${SHELL_SAFE_PATH.test(path) ? path : `'${path.replaceAll("'", "'\\''")}'`}`,
 	);
+	const unlisted = paths.length - listed.length;
 	const more = unlisted > 0 ? ` and ${unlisted} more` : "";
-	return `review the change to ${paths.join(", ")}${more}, then rerun with ${flags.join(" ")} to allow it`;
+	return `review the change to ${listed.join(", ")}${more}, then rerun with ${flags.join(" ")} to allow it`;
 }
 
 export function captureDeadlineChangedFiles({

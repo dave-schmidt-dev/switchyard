@@ -534,9 +534,11 @@ export async function runSimpleTask(options, dependencies = {}) {
 			resolution.timedOut === true
 				? true
 				: (failureTimedOut ?? providerExecutionResult?.timedOut ?? null);
-		const diffRejectionCount = Array.isArray(diffRejection?.paths)
-			? diffRejection.paths.length
-			: 0;
+		// The hint names exact paths; the persisted record keeps bounded ones.
+		const rejectedPaths = Array.isArray(diffRejection?.paths)
+			? diffRejection.paths
+			: [];
+		const diffRejectionCount = rejectedPaths.length;
 		if (diffRejection) {
 			diffRejection = {
 				...diffRejection,
@@ -672,14 +674,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 		if (diffRejection) finalResult.diffRejection = diffRejection;
 		if (
 			diffRejection?.rule === "manifest_review_required" &&
-			diffRejection.paths.length > 0
+			rejectedPaths.length > 0
 		) {
-			const unreviewed = diffRejection.paths.filter(
+			const unreviewed = rejectedPaths.filter(
 				(path) => !(options.allowManifests ?? []).includes(path),
 			);
 			finalResult.hint = manifestReviewHint(
-				unreviewed.length > 0 ? unreviewed : diffRejection.paths,
-				diffRejectionCount - diffRejection.paths.length,
+				unreviewed.length > 0 ? unreviewed : rejectedPaths,
 			);
 			(dependencies.onRoutingWarning ?? console.error)(
 				`dispatch: manifest review required: ${finalResult.hint}`,
