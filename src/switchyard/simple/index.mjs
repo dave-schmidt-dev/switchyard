@@ -83,6 +83,7 @@ import { prepareSimpleProviderStart } from "./launcher-preflight.mjs";
 import { simpleLockDisposition } from "./lock-disposition.mjs";
 import { seedContinuation } from "./partial-continuation.mjs";
 import { createSimpleProgress } from "./progress.mjs";
+import { createProviderLaunchEvidence } from "./provider-launch-evidence.mjs";
 import {
 	classifySimpleErrorKind,
 	createSimpleProviderReliabilityDiagnostic,
@@ -194,6 +195,13 @@ export async function runSimpleTask(options, dependencies = {}) {
 	let runInitialized = false;
 	let failureTerminalDurable = true;
 	const pendingDurability = new Set();
+	const launchEvidence = createProviderLaunchEvidence({
+		runId,
+		taskId,
+		attemptId,
+		now,
+		updateRun: dependencies.updateRunWithRetry ?? updateRunWithRetry,
+	});
 	const checks = [];
 	const acquireLock = dependencies.acquireProjectLock ?? acquireProjectLock;
 	const releaseLock =
@@ -270,6 +278,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 			descriptorHarness,
 			deadlineMs: options.deadlineMs,
 		});
+	let providerStartPublished = false;
+	const observeProviderLaunch = (publish, phase) => async (facts) => {
+		await publish(facts);
+		if (!providerStartPublished) {
+			const startError = await persistProviderStarted();
+			if (startError)
+				throw Object.assign(startError, { code: "run_store_write_failed" });
+			providerStartPublished = true;
+		}
+		milestone(phase, "provider_started");
+	};
 	const warn = (line) => {
 		try {
 			(dependencies.onRoutingWarning ?? console.error)(line);
@@ -1501,8 +1520,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		let providerResult;
 		let requestLogStatus;
-		let providerStartedWriteFailure = null;
 		try {
+			const onProviderLaunch = observeProviderLaunch(
+				await launchEvidence.begin("execute", {
+					descriptorIdentity: invocationDescriptor?.descriptor_identity ?? null,
+					worktreeNonce: worktreeIdentity.nonce,
+				}),
+				"execute",
+			);
+			if (signal?.aborted)
+				return await cancelAdmission(admission, "provider_cancelled");
+			if (remainingMs(options.deadlineMs, now) <= 0)
+				return await cancelAdmission(admission, "deadline_expired");
 			if (!admission.startPrepared().allowed)
 				return await cancelAdmission(admission, "route_health_blocked");
 			currentPhase = "execute";
@@ -1522,10 +1551,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 				capability: options.capability,
 				prompt: guardedPrompt,
 				worktreePath,
-				timeoutMs: executionBudget,
+				timeoutMs: Math.min(
+					executionBudget,
+					remainingMs(options.deadlineMs, now),
+				),
 				deadlineMs: options.deadlineMs,
 				signal,
 				onStderrChunk: requestRecorder?.accept,
+				onProviderLaunch,
 				onProgress: () => {
 					const progressObservedAt = now();
 					if (
@@ -1549,30 +1582,10 @@ export async function runSimpleTask(options, dependencies = {}) {
 					heartbeat("execute", { processPhase: "provider_running" });
 				},
 			});
-			milestone("execute", "provider_started");
-			// Await both together so a provider rejection during the run-store
-			// write is always handled.
-			const startedWrite = persistProviderStarted();
-			pendingDurability.add(startedWrite);
-			void startedWrite.finally(() => pendingDurability.delete(startedWrite));
-			[providerStartedWriteFailure, providerResult] = await Promise.all([
-				startedWrite,
-				execution,
-			]);
+			providerResult = await execution;
 		} finally {
 			requestLogStatus = requestRecorder?.close();
 		}
-		if (providerStartedWriteFailure)
-			return fail(
-				"run_store_write_failed",
-				"execute",
-				classifyErrorKind(
-					"run_store_write_failed",
-					"execute",
-					providerStartedWriteFailure,
-				),
-				providerStartedWriteFailure,
-			);
 		providerExecutionResult = providerResult;
 		providerLifecycle = boundProviderLifecycleSnapshot(
 			providerResult?.providerLifecycle,
@@ -1585,24 +1598,34 @@ export async function runSimpleTask(options, dependencies = {}) {
 		// A root deleted from outside makes every later probe fail; classify it
 		// before route health so the provider is not charged for it.
 		worktreeVanished = simpleRootMissing(candidatePath);
-		const providerAttemptReliability = providerResult?.success
-			? null
-			: createSimpleProviderReliabilityDiagnostic({
-					failureReason: worktreeVanished
-						? "worktree_missing"
-						: classifyExecutionFailure(providerResult),
+		const providerAttemptReliability = providerResult?.launchEvidenceFailed
+			? createSimpleProviderReliabilityDiagnostic({
+					failureReason: "run_store_write_failed",
 					failurePhase: "execute",
-					providerResult,
 					baselineStatus,
 					repairCount,
 					repairStatus,
-				});
+				})
+			: providerResult?.success
+				? null
+				: createSimpleProviderReliabilityDiagnostic({
+						failureReason: worktreeVanished
+							? "worktree_missing"
+							: classifyExecutionFailure(providerResult),
+						failurePhase: "execute",
+						providerResult,
+						baselineStatus,
+						repairCount,
+						repairStatus,
+					});
+		const providerHealthReliability = providerResult?.launchEvidenceFailed
+			? providerAttemptReliability
+			: (providerResult?.providerReliability ?? providerAttemptReliability);
 		let providerHealthTerminal = { settled: !providerHealthTracked };
 		try {
 			providerHealthTerminal = await healthController.terminal({
 				providerResult,
-				providerReliability:
-					providerResult?.providerReliability ?? providerAttemptReliability,
+				providerReliability: providerHealthReliability,
 				providerLifecycle,
 			});
 		} catch {
@@ -1613,6 +1636,15 @@ export async function runSimpleTask(options, dependencies = {}) {
 		}
 		const providerAttemptSettled =
 			!providerHealthTracked || providerHealthTerminal.settled === true;
+		if (providerResult?.launchEvidenceFailed) {
+			if (writerLifecycle !== "stopped" || !providerAttemptSettled)
+				keepWorktree = true;
+			return fail(
+				"run_store_write_failed",
+				"execute",
+				classifyErrorKind("run_store_write_failed", "execute"),
+			);
+		}
 		// A failed provider is classified by its own result below; the ledger
 		// error only fails an attempt the provider reported as successful.
 		if (providerResult?.success && requestLogStatus?.error)
@@ -2090,6 +2122,18 @@ export async function runSimpleTask(options, dependencies = {}) {
 				let correction;
 				let correctionLogStatus;
 				try {
+					const onProviderLaunch = observeProviderLaunch(
+						await launchEvidence.begin("repair", {
+							descriptorIdentity:
+								invocationDescriptor?.descriptor_identity ?? null,
+							worktreeNonce: worktreeIdentity.nonce,
+						}),
+						"repair",
+					);
+					if (signal?.aborted)
+						return await cancelAdmission(repairAdmission, "provider_cancelled");
+					if (remainingMs(options.deadlineMs, now) <= 0)
+						return await cancelAdmission(repairAdmission, "deadline_expired");
 					if (!repairAdmission.startPrepared().allowed)
 						return await cancelAdmission(
 							repairAdmission,
@@ -2106,14 +2150,17 @@ export async function runSimpleTask(options, dependencies = {}) {
 						capability: options.capability,
 						prompt: repairPrompt,
 						worktreePath,
-						timeoutMs: correctionBudget,
+						timeoutMs: Math.min(
+							correctionBudget,
+							remainingMs(options.deadlineMs, now),
+						),
 						deadlineMs: options.deadlineMs,
 						onStderrChunk: repairAdmission.recorder?.accept,
+						onProviderLaunch,
 						signal,
 						onProgress: () =>
 							heartbeat("repair", { processPhase: "provider_running" }),
 					});
-					milestone("repair", "provider_started");
 					correction = await execution;
 				} finally {
 					correctionLogStatus = repairAdmission.recorder?.close();
@@ -2127,26 +2174,36 @@ export async function runSimpleTask(options, dependencies = {}) {
 					correction?.writerLifecycle,
 				);
 				worktreeVanished = simpleRootMissing(candidatePath);
-				const correctionAttemptReliability = correction?.success
-					? null
-					: createSimpleProviderReliabilityDiagnostic({
-							failureReason: worktreeVanished
-								? "worktree_missing"
-								: classifyExecutionFailure(correction),
+				const correctionAttemptReliability = correction?.launchEvidenceFailed
+					? createSimpleProviderReliabilityDiagnostic({
+							failureReason: "run_store_write_failed",
 							failurePhase: "execute",
-							providerResult: correction,
 							baselineStatus,
 							repairCount,
 							repairStatus,
-						});
+						})
+					: correction?.success
+						? null
+						: createSimpleProviderReliabilityDiagnostic({
+								failureReason: worktreeVanished
+									? "worktree_missing"
+									: classifyExecutionFailure(correction),
+								failurePhase: "execute",
+								providerResult: correction,
+								baselineStatus,
+								repairCount,
+								repairStatus,
+							});
+				const correctionHealthReliability = correction?.launchEvidenceFailed
+					? correctionAttemptReliability
+					: (correction?.providerReliability ?? correctionAttemptReliability);
 				let correctionHealthTerminal = {
 					settled: repairHealthStart.tracked !== true,
 				};
 				try {
 					correctionHealthTerminal = await healthController.terminal({
 						providerResult: correction,
-						providerReliability:
-							correction?.providerReliability ?? correctionAttemptReliability,
+						providerReliability: correctionHealthReliability,
 						providerLifecycle: providerLifecycle,
 					});
 				} catch {
@@ -2154,6 +2211,19 @@ export async function runSimpleTask(options, dependencies = {}) {
 						settled: false,
 						reason: "provider-health-unavailable",
 					};
+				}
+				if (correction?.launchEvidenceFailed) {
+					if (
+						writerLifecycle !== "stopped" ||
+						(repairHealthStart.tracked === true &&
+							correctionHealthTerminal.settled !== true)
+					)
+						keepWorktree = true;
+					return fail(
+						"run_store_write_failed",
+						"execute",
+						classifyErrorKind("run_store_write_failed", "execute"),
+					);
 				}
 				if (correction?.success && correctionLogStatus?.error)
 					return fail(correctionLogStatus.error, "repair");
@@ -2514,6 +2584,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 						undeclaredPaths: undeclaredKept,
 						declaredFingerprint: initialFingerprint,
 						expectedOutputs,
+						dirtyOverlayReceipt,
+						report: reportOutput,
 						// Base-tree test results, so a held apply's HEAD-advance
 						// recheck judges a differential check as this run did.
 						differentialBaselines:
@@ -2567,8 +2639,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 		);
 		const { expectedOutputs, ...heldSummary } = heldIntegration ?? {};
 		const terminalOutputs = expectedOutputs ?? outputsAt(options.projectPath);
-		// A held run is an accepted provider result whose project output is not
-		// in the tree yet, so it never serves as a predecessor receipt.
+		// An unapplied hold has no project output yet. Applied holds acquire
+		// predecessor authority only through their durable exact apply projection.
 		const terminalStatus = heldIntegration ? "held" : "succeeded";
 		const heldTerminal = heldIntegration ? { integration: heldSummary } : {};
 		if (runInitialized) {

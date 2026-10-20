@@ -7,6 +7,7 @@ import { isReviewResult } from "../diagnostics/review-result.mjs";
 import { SUPPORTED_OUTCOME_READER_VERSION } from "../outcome/schema.mjs";
 import { parseRfc3339 } from "../rfc3339.mjs";
 import { normalizeProviderName } from "../roster/index.mjs";
+import { isProviderLaunches } from "../simple/provider-launch-evidence.mjs";
 import {
 	CURRENT_SCHEMA_VERSION,
 	DIAGNOSTIC_DIGEST_RE,
@@ -126,6 +127,13 @@ function isCleanupFailureMetadata(value) {
 	);
 }
 function validateRun(data) {
+	if (
+		data.providerLaunches !== undefined &&
+		!isProviderLaunches(data.providerLaunches, data)
+	) {
+		throw new SchemaError("providerLaunches contains invalid launch evidence");
+	}
+
 	if (
 		data.schemaVersion !== HISTORICAL_SCHEMA_VERSION &&
 		data.schemaVersion !== CURRENT_SCHEMA_VERSION

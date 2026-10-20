@@ -4,6 +4,7 @@ import { isAbsolute } from "node:path";
 import { parsePredecessorReceipt } from "../lifecycle/overlay-receipts.mjs";
 import { readRun } from "../run-store/run-records.mjs";
 import { checkAcceptanceOf } from "./check-differential.mjs";
+import { appliedHeldPredecessor } from "./held-predecessor.mjs";
 import { safeChangedFiles } from "./provider-invocation.mjs";
 
 const SIMPLE_RECOVERY_SCHEMA_VERSION = 1;
@@ -267,10 +268,11 @@ async function resolvePredecessorReceipt(input, projectPath, dependencies) {
 		throw error;
 	}
 	if (
+		predecessor.runId !== supplied.runId ||
 		predecessor.state !== "succeeded" ||
 		predecessor.cleanupState !== "complete" ||
 		realpathSync(predecessor.projectPath) !== realpathSync(projectPath) ||
-		predecessor.terminalSummary?.status !== "succeeded"
+		!["succeeded", "held"].includes(predecessor.terminalSummary?.status)
 	) {
 		const error = new Error(
 			"predecessor run is not an accepted project result",
@@ -278,10 +280,15 @@ async function resolvePredecessorReceipt(input, projectPath, dependencies) {
 		error.code = "predecessor_receipt_unverified";
 		throw error;
 	}
-	const durable = parsePredecessorReceipt(
-		{ runId: predecessor.runId, ...predecessor.terminalSummary },
-		{ projectPath },
-	);
+	const projection =
+		predecessor.terminalSummary.status === "held"
+			? await appliedHeldPredecessor(
+					predecessor,
+					realpathSync(projectPath),
+					dependencies.readRun ?? readRun,
+				)
+			: { runId: predecessor.runId, ...predecessor.terminalSummary };
+	const durable = parsePredecessorReceipt(projection, { projectPath });
 	if (
 		supplied.baseRevision !== durable.baseRevision ||
 		JSON.stringify(supplied.outputs) !== JSON.stringify(durable.outputs)

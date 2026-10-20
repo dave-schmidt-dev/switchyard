@@ -35,6 +35,11 @@ function safeTimer(fn, delay, setTimeoutFn) {
 		return null;
 	}
 }
+/**
+ * Supervise one child. Optional onSpawned is required evidence, awaited before
+ * stdin delivery; argv routes may already be working. Rejection terminates the
+ * child and remains distinct from observational progress or provider failure.
+ */
 export function runProviderProcess(command, args, options = {}) {
 	const {
 		input,
@@ -48,6 +53,7 @@ export function runProviderProcess(command, args, options = {}) {
 		silenceTimeoutMs = null,
 		progressStage = "running",
 		onProgress,
+		onSpawned,
 		termGraceMs = DEFAULT_TERM_GRACE_MS,
 		spawnFn = nodeSpawn,
 		cleanup,
@@ -103,6 +109,11 @@ export function runProviderProcess(command, args, options = {}) {
 		let timeoutTimer = null;
 		let escalationTimer = null;
 		let pollTimer = null;
+		let publication = Promise.resolve();
+		let launchEvidenceError = null;
+		let inputError = null;
+		let childClosed = false;
+		let publicationStarted = false;
 
 		const clearTimers = () => {
 			if (timeoutTimer !== null) clearTimeoutFn(timeoutTimer);
@@ -118,6 +129,19 @@ export function runProviderProcess(command, args, options = {}) {
 			signal: exitSignal = null,
 			error,
 		} = {}) => {
+			// Publication is required evidence, unlike observational progress.
+			if (typeof onSpawned === "function") await publication;
+			if (settled) return;
+			if (
+				typeof onSpawned === "function" &&
+				childClosed &&
+				!publicationStarted &&
+				!error
+			)
+				launchEvidenceError = new Error("provider launch evidence unavailable");
+			if (launchEvidenceError || inputError)
+				error = launchEvidenceError ?? inputError;
+			if (launchEvidenceError) await runCleanup();
 			if (settled) return;
 			settled = true;
 			clearTimers();
@@ -206,6 +230,7 @@ export function runProviderProcess(command, args, options = {}) {
 					cleanupError?.cleanupStage ?? cleanupResult?.cleanupStage ?? null,
 				writerLifecycle,
 				providerLifecycle: lifecycle,
+				...(launchEvidenceError ? { launchEvidenceFailed: true } : {}),
 				pid: lifecycle.pid,
 				startedAt: lifecycle.startedAt,
 				deadlineAt: lifecycle.deadlineAt,
@@ -298,7 +323,9 @@ export function runProviderProcess(command, args, options = {}) {
 				? "deadline"
 				: cancelled
 					? "cancelled"
-					: "rate_limited";
+					: reason === "rate_limited"
+						? "rate_limited"
+						: "unobserved";
 			if (
 				timedOut &&
 				Number.isFinite(silenceTimeoutMs) &&
@@ -308,14 +335,14 @@ export function runProviderProcess(command, args, options = {}) {
 				silenceObserved = true;
 			}
 			try {
-				child?.kill?.("SIGTERM");
+				if (!childClosed) child?.kill?.("SIGTERM");
 			} catch {
 				// Escalation below still attempts SIGKILL.
 			}
 			escalationTimer = safeTimer(
 				() => {
 					try {
-						child?.kill?.("SIGKILL");
+						if (!childClosed) child?.kill?.("SIGKILL");
 					} catch {
 						// The child may have exited between TERM and KILL.
 					}
@@ -388,12 +415,13 @@ export function runProviderProcess(command, args, options = {}) {
 			emitProgress(true);
 		});
 		child.once?.("error", (error) => {
-			if (terminationRequested) return;
+			if (terminationRequested || childClosed || settled) return;
 			terminalStatus = "spawn_failed";
 			terminationReason = "admission";
 			void terminal({ error });
 		});
 		child.once?.("close", (code, exitSignal) => {
+			childClosed = true;
 			if (settled) return;
 			writerLifecycle = "stopped";
 			if (terminationRequested) {
@@ -414,9 +442,44 @@ export function runProviderProcess(command, args, options = {}) {
 			void terminal({ code, signal: exitSignal });
 		});
 
-		if (input !== undefined && child.stdin) {
-			child.stdin.end(input);
+		child.stdin?.on?.("error", () => {});
+		const deliverInput = () => {
+			if (
+				!settled &&
+				!terminationRequested &&
+				!childClosed &&
+				input !== undefined &&
+				child.stdin
+			)
+				try {
+					child.stdin.end(input);
+				} catch (error) {
+					inputError = error;
+					requestTermination("input_failed");
+				}
+		};
+		if (typeof onSpawned === "function") {
+			child.once?.("spawn", () => {
+				if (settled) return;
+				publicationStarted = true;
+				publication = Promise.resolve()
+					.then(() =>
+						onSpawned({
+							pid: child.pid ?? null,
+							supervisorStartedAt: startedAt,
+							deadlineAt: providerDeadlineAt,
+						}),
+					)
+					.then(deliverInput, (error) => {
+						launchEvidenceError =
+							error instanceof Error
+								? error
+								: new Error("provider launch evidence unavailable");
+						requestTermination("launch_evidence_failed");
+					});
+			});
 		}
+
 		if (typeof signal?.addEventListener === "function") {
 			if (signal.aborted) abort();
 			else signal.addEventListener("abort", abort, { once: true });
@@ -426,6 +489,7 @@ export function runProviderProcess(command, args, options = {}) {
 			timeoutMs,
 			setTimeoutFn,
 		);
+		if (typeof onSpawned !== "function") deliverInput();
 		if (typeof onPoll === "function" && pollIntervalMs > 0) {
 			pollTimer = setIntervalFn(() => {
 				if (settled) return;

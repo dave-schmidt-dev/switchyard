@@ -116,12 +116,17 @@ function listWorktreeHolders(worktreePath, pid = null) {
 	return [...holders];
 }
 
-function processIdentity(pid) {
+/** Observe weak, seconds-precision OS identity; never a stored signalling capability. */
+export function observeSimpleProcessIdentity(
+	pid,
+	{ spawnSyncFn = spawnSync } = {},
+) {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return null;
 	let result;
 	try {
-		result = spawnSync(
+		result = spawnSyncFn(
 			"ps",
-			["-o", "lstart=", "-o", "stat=", "-p", String(pid)],
+			["-o", "lstart=", "-o", "stat=", "-o", "pgid=", "-p", String(pid)],
 			{
 				encoding: "utf8",
 				stdio: ["ignore", "pipe", "ignore"],
@@ -143,11 +148,13 @@ function processIdentity(pid) {
 	if (result.status === 1 && result.stdout.trim() === "") return false;
 	if (result.status !== 0) return null;
 	const fields = result.stdout.trim().split(/\s+/u);
-	if (fields.length < 6) return null;
+	if (fields.length !== 7) return null;
 	const startText = fields.slice(0, 5).join(" ");
 	const startedAt = Date.parse(startText);
 	if (!Number.isFinite(startedAt)) return null;
-	return { startedAt, stamp: startText, state: fields[5] };
+	const processGroupId = Number(fields[6]);
+	if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return null;
+	return { startedAt, stamp: startText, state: fields[5], processGroupId };
 }
 
 function isScopeMember(pid, worktreePath) {
@@ -157,7 +164,7 @@ function isScopeMember(pid, worktreePath) {
 }
 
 function sameProcess(pid, stamp, launchedAt) {
-	const current = processIdentity(pid);
+	const current = observeSimpleProcessIdentity(pid);
 	if (current === false) return false;
 	if (current === null) return null;
 	return (
@@ -185,7 +192,7 @@ async function waitForScopedProcessesExit(
 			const member = isScopeMember(pid, worktreePath);
 			if (member === null) return null;
 			if (!member) continue;
-			const current = processIdentity(pid);
+			const current = observeSimpleProcessIdentity(pid);
 			if (current === null) return null;
 			if (current && current.stamp === stamp && !/^Z/u.test(current.state))
 				remaining = true;
@@ -215,7 +222,7 @@ async function settleScopedProcesses(
 	const candidates = [];
 	for (const pid of pids) {
 		if (pid <= 1 || pid === process.pid) continue;
-		const identity = processIdentity(pid);
+		const identity = observeSimpleProcessIdentity(pid);
 		if (identity === null) return "unavailable";
 		if (identity === false || /^Z/u.test(identity.state)) continue;
 		if (

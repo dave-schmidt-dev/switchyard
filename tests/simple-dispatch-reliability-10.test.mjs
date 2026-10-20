@@ -122,7 +122,8 @@ function dependencies(overrides = {}) {
 			invocation_args: [],
 		}),
 		assertFundedRoute: () => {},
-		executeProvider: async ({ worktreePath }) => {
+		executeProvider: async ({ worktreePath, onProviderLaunch }) => {
+			await onProviderLaunch?.({});
 			writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n", "utf8");
 			return { success: true, code: 0, writerLifecycle: "stopped" };
 		},
@@ -267,8 +268,12 @@ describe("simple local execution path", () => {
 					executeProvider: (context) =>
 						defaultExecuteProvider({
 							...context,
-							spawnFn: () => {
+							onProviderLaunch: async (facts) => {
+								await context.onProviderLaunch?.(facts);
 								providerStartedResolve();
+							},
+							spawnFn: () => {
+								queueMicrotask(() => child.emit("spawn"));
 								return child;
 							},
 						}),

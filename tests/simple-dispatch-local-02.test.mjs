@@ -238,9 +238,11 @@ describe("simple local execution path", () => {
 	]) {
 		it(`runs diff capture and checks after agy exit 0 with ${label} output`, async () => {
 			const repo = makeRepo();
+			const events = [];
 			const result = await runSimpleTask(
 				options(repo),
 				dependencies({
+					onStatus: (event) => events.push(event),
 					route: () => ({ provider: "Antigravity", reason: "priority_fill" }),
 					resolveTargetIdentity: () => ({
 						targetId: "antigravity",
@@ -256,17 +258,23 @@ describe("simple local execution path", () => {
 						defaultExecuteProvider({
 							...context,
 							spawnFn: () => {
-								writeFileSync(
-									join(context.worktreePath, "src", "a.txt"),
-									"provider\n",
-								);
 								const child = new EventEmitter();
 								child.stdout = new EventEmitter();
 								child.stderr = new EventEmitter();
-								child.stdin = { end() {} };
+								child.stdin = {
+									end() {
+										writeFileSync(
+											join(context.worktreePath, "src", "a.txt"),
+											"provider\n",
+										);
+										queueMicrotask(() => {
+											child.stdout.emit("data", Buffer.from(output));
+											child.emit("close", 0, null);
+										});
+									},
+								};
 								queueMicrotask(() => {
-									child.stdout.emit("data", Buffer.from(output));
-									child.emit("close", 0, null);
+									child.emit("spawn");
 								});
 								return child;
 							},
@@ -274,6 +282,11 @@ describe("simple local execution path", () => {
 				}),
 			);
 			retain(result, repo.projectPath);
+			const milestones = events.map((event) => event.milestone).filter(Boolean);
+			const providerStartedIndex = milestones.indexOf("provider_started");
+			const firstChangeIndex = milestones.indexOf("first_change_observed");
+			ok(providerStartedIndex >= 0);
+			ok(firstChangeIndex > providerStartedIndex);
 			strictEqual(result.status, expectedStatus);
 			strictEqual(result.providerLifecycle?.exitCode, 0);
 			strictEqual(result.providerVerdictCode, verdict);

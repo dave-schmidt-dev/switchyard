@@ -525,3 +525,185 @@ describe("provider process lifecycle", () => {
 		);
 	});
 });
+
+// Required launch publication is deliberately separate from progress callbacks.
+function launchChild() {
+	const child = fakeChild();
+	child.pid = 123;
+	child.input = [];
+	child.stdin.end = (value) => child.input.push(value);
+	return child;
+}
+function deferred() {
+	let resolve, reject;
+	const promise = new Promise((a, b) => {
+		resolve = a;
+		reject = b;
+	});
+	return { promise, resolve, reject };
+}
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+function runFake(child, options = {}) {
+	return runProviderProcess("fake", [], {
+		input: "prompt",
+		timeoutMs: 1000,
+		termGraceMs: 5,
+		spawnFn: () => child,
+		...options,
+	});
+}
+it("required publication gates stdin while observational progress remains best effort", async () => {
+	const child = launchChild(),
+		gate = deferred();
+	let called = 0;
+	const running = runFake(child, {
+		onSpawned: async ({ pid }) => {
+			strictEqual(pid, 123);
+			called++;
+			await gate.promise;
+		},
+		onPoll: () => {
+			throw Error("telemetry");
+		},
+		pollIntervalMs: 1,
+	});
+	child.emit("spawn");
+	await turn();
+	strictEqual(called, 1);
+	deepStrictEqual(child.input, []);
+	gate.resolve();
+	await turn();
+	deepStrictEqual(child.input, ["prompt"]);
+	child.emit("close", 0, null);
+	strictEqual((await running).success, true);
+});
+
+for (const fails of [true, false])
+	it(`fast child close awaits publication ${fails ? "failure" : "ack"} and never receives input`, async () => {
+		const child = launchChild(),
+			gate = deferred();
+		const running = runFake(child, { onSpawned: () => gate.promise });
+		child.emit("spawn");
+		child.emit("close", 0, null);
+		await turn();
+		let done = false;
+		void running.then(() => {
+			done = true;
+		});
+		await turn();
+		strictEqual(done, false);
+		if (fails) gate.reject(Error("disk"));
+		else gate.resolve();
+		const result = await running;
+		strictEqual(result.success, !fails);
+		deepStrictEqual(child.input, []);
+		deepStrictEqual(child.signals, []);
+	});
+
+for (const reason of ["cancel", "deadline"])
+	it(`pending publication keeps ${reason} supervision active and late ack cannot feed stdin`, async () => {
+		const child = launchChild(),
+			gate = deferred(),
+			controller = new AbortController();
+		const running = runFake(child, {
+			onSpawned: () => gate.promise,
+			timeoutMs: reason === "deadline" ? 5 : 1000,
+			signal: controller.signal,
+		});
+		child.emit("spawn");
+		await turn();
+		if (reason === "cancel") controller.abort();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		deepStrictEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+		gate.resolve();
+		const result = await running;
+		strictEqual(result.success, false);
+		strictEqual(result.cancelled, reason === "cancel");
+		strictEqual(result.timedOut, reason === "deadline");
+		deepStrictEqual(child.input, []);
+	});
+
+it("late rejection after cancellation is handled and cannot become provider success", async () => {
+	const child = launchChild(),
+		gate = deferred(),
+		controller = new AbortController();
+	const running = runFake(child, {
+		onSpawned: () => gate.promise,
+		signal: controller.signal,
+	});
+	child.emit("spawn");
+	await turn();
+	controller.abort();
+	gate.reject(Error("disk"));
+	const result = await running;
+	strictEqual(result.launchEvidenceFailed, true);
+	strictEqual(result.success, false);
+	deepStrictEqual(child.input, []);
+});
+
+it("argv prompt is visible at spawn even while required stdin publication is blocked", async () => {
+	const child = launchChild(),
+		gate = deferred();
+	let argsAtSpawn;
+	const running = runProviderProcess("fake", ["--print", "argv prompt"], {
+		input: "stdin prompt",
+		timeoutMs: 1000,
+		termGraceMs: 1,
+		spawnFn: (_command, args) => {
+			argsAtSpawn = [...args];
+			return child;
+		},
+		onSpawned: () => gate.promise,
+	});
+	deepStrictEqual(argsAtSpawn, ["--print", "argv prompt"]);
+	child.emit("spawn");
+	await turn();
+	deepStrictEqual(child.input, []);
+	gate.reject(Error("disk"));
+	const result = await running;
+	strictEqual(result.launchEvidenceFailed, true);
+	deepStrictEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+	// Post-spawn publication failure cannot prove zero upstream work/cost.
+});
+
+it("a required launch hook cannot be silently skipped on a purported successful close", async () => {
+	const child = launchChild();
+	const running = runFake(child, { onSpawned: async () => {} });
+	child.emit("close", 0, null);
+	const result = await running;
+	strictEqual(result.success, false);
+	strictEqual(result.launchEvidenceFailed, true);
+	deepStrictEqual(child.input, []);
+});
+
+it("fast close followed by publication rejection still awaits cleanup exactly once", async () => {
+	const child = launchChild(),
+		publication = deferred(),
+		cleanup = deferred();
+	let cleanupCalls = 0;
+	const running = runFake(child, {
+		onSpawned: () => publication.promise,
+		cleanup: async () => {
+			cleanupCalls++;
+			await cleanup.promise;
+		},
+	});
+	child.emit("spawn");
+	child.emit("close", 0, null);
+	await turn();
+	publication.reject(Error("disk"));
+	await turn();
+	strictEqual(cleanupCalls, 1);
+	let done = false;
+	void running.then(() => {
+		done = true;
+	});
+	await turn();
+	strictEqual(done, false);
+	cleanup.resolve();
+	const result = await running;
+	strictEqual(result.success, false);
+	strictEqual(result.launchEvidenceFailed, true);
+	strictEqual(cleanupCalls, 1);
+	deepStrictEqual(child.signals, []);
+});

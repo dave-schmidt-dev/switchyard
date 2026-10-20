@@ -134,8 +134,12 @@ const executeProvider = (context) => {
   if (process.env.SWITCHYARD_MODE === "provider") {
     return simpleModule.defaultExecuteProvider({
       ...context,
-      spawnFn: () => {
+      onProviderLaunch: async (facts) => {
+        await context.onProviderLaunch?.(facts);
         process.stdout.write("READY\\n");
+      },
+      spawnFn: () => {
+        queueMicrotask(() => providerChild.emit("spawn"));
         return providerChild;
       },
     });
@@ -258,7 +262,8 @@ function dependencies(overrides = {}) {
 			invocation_args: [],
 		}),
 		assertFundedRoute: () => {},
-		executeProvider: async ({ worktreePath }) => {
+		executeProvider: async ({ worktreePath, onProviderLaunch }) => {
+			await onProviderLaunch?.({});
 			writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n", "utf8");
 			return { success: true, code: 0, writerLifecycle: "stopped" };
 		},
@@ -387,7 +392,8 @@ describe("simple local execution path", () => {
 						}
 						return updateRunWithRetry(id, patch);
 					},
-					executeProvider: async ({ worktreePath }) => {
+					executeProvider: async ({ worktreePath, onProviderLaunch }) => {
+						await onProviderLaunch?.({});
 						writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
 						return { success: true, writerLifecycle: "stopped" };
 					},

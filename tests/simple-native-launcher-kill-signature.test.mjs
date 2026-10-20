@@ -235,9 +235,14 @@ function fakeChild() {
 
 function exitingChild(stderr, code = 76) {
 	const child = fakeChild();
+	child.stdin.end = () => {
+		queueMicrotask(() => {
+			child.stderr.emit("data", Buffer.from(stderr));
+			child.emit("close", code, null);
+		});
+	};
 	queueMicrotask(() => {
-		child.stderr.emit("data", Buffer.from(stderr));
-		child.emit("close", code, null);
+		child.emit("spawn");
 	});
 	return child;
 }
@@ -307,6 +312,7 @@ test("a native launcher stopped at the runner's deadline carries provider_deadli
 		deadlineMs: start + 60_000,
 		spawnFn: () => child,
 	});
+	child.emit("spawn");
 	mock.timers.setTime(start + 60_000);
 	child.stderr.emit(
 		"data",

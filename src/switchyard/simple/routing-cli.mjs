@@ -42,8 +42,10 @@ const ROUTING_RUN_USAGE = `Usage: switchyard-dispatch routing-run inspect --proj
        switchyard-dispatch routing-run close-pending --project <path> --routing-run-id <id> --task-id <id>
        switchyard-dispatch routing-run native-start --project <path> --routing-run-id <id> --authorization <manifest> --actual-start <receipt> --task-id <id> --invocation-id <id>
        switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]
+       switchyard-dispatch routing-run reconcile-held --project <path> --run-id <simple-run-id> [--timeout <minutes>]
        switchyard-dispatch routing-run apply --project <path> --run-id <simple-run-id> [--timeout <minutes>]
 release-partial and close-pending --task-id take the --task-id given to simple or the persisted task hash.
+reconcile-held retries only lost metadata for a clean, conclusively non-mutating refused apply; unknown or consumed mutation stays refused.
 apply integrates the patch a simple --integrate hold run verified, re-running the integration gate against the current HEAD (acceptance checks re-run when HEAD moved, within --timeout, default 10 minutes, at most 30). It never applies any other diff and refuses with one closed reason, exiting 1.
 Native acknowledgement requires existing idle state, exact task authorization and an actual-start receipt. The latch gives direction only; future task authority remains caller-owned.`;
 const RFC3339 =
@@ -111,6 +113,7 @@ export async function handleRoutingRun(argv, deps = {}) {
 			"release-partial",
 			"close-pending",
 			"apply",
+			"reconcile-held",
 		].includes(command)
 	)
 		throw new RoutingCliUsageError("invalid routing-run subcommand");
@@ -119,11 +122,11 @@ export async function handleRoutingRun(argv, deps = {}) {
 	if (command !== "release-partial" && values.discard !== undefined)
 		throw new RoutingCliUsageError("--discard applies only to release-partial");
 	if (
-		command !== "apply" &&
+		!["apply", "reconcile-held"].includes(command) &&
 		(values["run-id"] !== undefined || values.timeout !== undefined)
 	)
 		throw new RoutingCliUsageError(
-			"--run-id and --timeout apply only to apply",
+			"--run-id and --timeout apply only to apply or reconcile-held",
 		);
 	if (command === "failures") {
 		let since;
@@ -163,16 +166,17 @@ export async function handleRoutingRun(argv, deps = {}) {
 	const project = canonicalRoutingProject(
 		values.project ? resolve(values.project) : null,
 	);
-	if (command === "apply") {
+	if (command === "apply" || command === "reconcile-held") {
 		const timeout = values.timeout ?? "10";
 		if (!values["run-id"] || !/^[1-9][0-9]?$/u.test(timeout) || +timeout > 30)
 			throw new RoutingCliUsageError(
-				"apply requires --run-id and a --timeout of 1 to 30 minutes",
+				`${command} requires --run-id and a --timeout of 1 to 30 minutes`,
 			);
 		const now = deps.now ?? Date.now;
 		const result = await (deps.applyHeldIntegration ?? applyHeldIntegration)(
 			{
 				projectPath: project,
+				reconcileOnly: command === "reconcile-held",
 				runId: values["run-id"],
 				deadlineMs: now() + Number(timeout) * 60_000,
 			},
@@ -180,7 +184,7 @@ export async function handleRoutingRun(argv, deps = {}) {
 				...deps,
 				onProgress: (event) =>
 					(deps.writeProgress ?? console.error)(
-						`dispatch: routing-run apply run=${values["run-id"]} phase=${event.phase}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
+						`dispatch: routing-run ${command} run=${values["run-id"]} phase=${event.phase}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
 					),
 			},
 		);

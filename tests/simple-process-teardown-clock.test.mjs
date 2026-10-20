@@ -2,7 +2,10 @@
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
-import { settleSimpleWriterProcesses } from "../src/switchyard/simple/process-teardown.mjs";
+import {
+	observeSimpleProcessIdentity,
+	settleSimpleWriterProcesses,
+} from "../src/switchyard/simple/process-teardown.mjs";
 import { fakeClock } from "./helpers/fake-clock.mjs";
 
 // A process group this user may not signal: its presence probe answers
@@ -59,4 +62,38 @@ test("a writer group that is already gone settles without a clock wait", async (
 	strictEqual(state, "stopped");
 	deepStrictEqual(clock.sleeps, []);
 	strictEqual(clock.now(), 0);
+});
+
+test("bounded identity observation exposes actual group and honestly weak start precision", () => {
+	let args;
+	const observed = observeSimpleProcessIdentity(123, {
+		spawnSyncFn: (_command, argv) => {
+			args = argv;
+			return { status: 0, stdout: "Tue Oct 20 12:00:00 2026 S 123\n" };
+		},
+	});
+	strictEqual(observed.processGroupId, 123);
+	strictEqual(observed.stamp, "Tue Oct 20 12:00:00 2026");
+	deepStrictEqual(args, [
+		"-o",
+		"lstart=",
+		"-o",
+		"stat=",
+		"-o",
+		"pgid=",
+		"-p",
+		"123",
+	]);
+	for (const result of [
+		{ status: 1, stdout: "" },
+		{ error: { code: "EPERM" } },
+		{ status: 0, stdout: "malformed" },
+		{ status: 0, stdout: "Tue Oct 20 12:00:00 2026 S NaN" },
+	]) {
+		strictEqual(
+			observeSimpleProcessIdentity(123, { spawnSyncFn: () => result }),
+			result.status === 1 ? false : null,
+		);
+	}
+	strictEqual(observeSimpleProcessIdentity(null), null);
 });

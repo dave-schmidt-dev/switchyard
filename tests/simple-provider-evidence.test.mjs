@@ -251,10 +251,16 @@ test("failed provider run with sk-test-123 in stderr writes run record and failu
 						const child = new EventEmitter();
 						child.stdout = new EventEmitter();
 						child.stderr = new EventEmitter();
-						child.stdin = { end() {} };
+						child.stdin = {
+							end() {
+								queueMicrotask(() => {
+									child.stderr.emit("data", Buffer.from(secretText));
+									child.emit("close", 1, null);
+								});
+							},
+						};
 						queueMicrotask(() => {
-							child.stderr.emit("data", Buffer.from(secretText));
-							child.emit("close", 1, null);
+							child.emit("spawn");
 						});
 						return child;
 					},
@@ -354,10 +360,16 @@ test("defaultExecuteProvider suppresses provider output and attaches signature o
 			const child = new EventEmitter();
 			child.stdout = new EventEmitter();
 			child.stderr = new EventEmitter();
-			child.stdin = { end() {} };
+			child.stdin = {
+				end() {
+					queueMicrotask(() => {
+						child.stderr.emit("data", Buffer.from(secretText));
+						child.emit("close", 1, null);
+					});
+				},
+			};
 			queueMicrotask(() => {
-				child.stderr.emit("data", Buffer.from(secretText));
-				child.emit("close", 1, null);
+				child.emit("spawn");
 			});
 			return child;
 		},

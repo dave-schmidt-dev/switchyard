@@ -26,6 +26,7 @@ import { integrationGate } from "../integrate/index.mjs";
 import { getRunRoot } from "../run-store/run-records.mjs";
 import { MAX_CAPTURE_BYTES } from "./git-control.mjs";
 import { persistedBaselines, receiptBaselines } from "./held-baselines.mjs";
+import { persistHeldOverlay } from "./held-overlay.mjs";
 
 const HELD_DIRNAME = "held-integration";
 const PATCH_NAME = "held.patch";
@@ -131,7 +132,7 @@ export function holdVerifiedIntegration(
 	const patch = Buffer.from(input.diff, "utf8");
 	const heldAt = new Date(now()).toISOString();
 	const receipt = {
-		schemaVersion: 2,
+		schemaVersion: input.dirtyOverlayReceipt || input.report ? 3 : 2,
 		kind: RECEIPT_KIND,
 		runId: input.runId,
 		taskId: input.taskId,
@@ -153,6 +154,10 @@ export function holdVerifiedIntegration(
 		undeclaredPaths: [...input.undeclaredPaths],
 		declaredFingerprint: input.declaredFingerprint,
 		expectedOutputs: input.expectedOutputs,
+		...(input.dirtyOverlayReceipt
+			? { dirtyOverlay: persistHeldOverlay(input.dirtyOverlayReceipt) }
+			: {}),
+		...(input.report ? { report: input.report } : {}),
 		patchSha256: sha256(patch),
 		patchBytes: patch.length,
 		heldAt,
@@ -164,6 +169,8 @@ export function holdVerifiedIntegration(
 		receipt.differentialBaselines = [];
 		receiptBytes = Buffer.from(`${JSON.stringify(receipt)}\n`, "utf8");
 	}
+	if (receiptBytes.length > MAX_RECEIPT_BYTES)
+		throw invalid("receipt_oversized");
 	const identity = createHeldDirectory(directory);
 	beforeWrite(directory);
 	writeSynced(patchPath, patch, identity);
@@ -264,7 +271,7 @@ export function readHeldIntegration(record, projectPath, runId) {
 		throw invalid("receipt_unparseable");
 	}
 	if (
-		![1, 2].includes(receipt?.schemaVersion) ||
+		![1, 2, 3].includes(receipt?.schemaVersion) ||
 		receipt.kind !== RECEIPT_KIND ||
 		receipt.runId !== record.runId ||
 		receipt.projectPath !== projectPath ||

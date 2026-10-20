@@ -22,6 +22,7 @@ import { getRunRoot } from "../run-store/run-records.mjs";
 import { updateRunWithRetry } from "../run-store/run-updates.mjs";
 import { requireGit } from "./args.mjs";
 import { createSimpleCheckSessions } from "./check-session.mjs";
+import { restoreHeldOverlay } from "./held-overlay.mjs";
 import { allocateSimpleRoot, OWNER_MARKER } from "./simple-root.mjs";
 import { cleanupSimpleWorktree } from "./worktree-cleanup.mjs";
 
@@ -95,16 +96,19 @@ export async function runHeldRechecks(
 	let writerStopped = true;
 	let verdict;
 	try {
+		const dirtyOverlayReceipt = restoreHeldOverlay(projectPath, receipt);
 		session = (deps.createSimpleCheckSessions ?? createSimpleCheckSessions)({
 			taskRoot: candidatePath,
 			projectPath,
 			baseRevision: head,
-			baseTree: requireGit(
-				projectPath,
-				["rev-parse", `${head}^{tree}`],
-				"project_revision_unavailable",
-			).trim(),
-			dirtyOverlayReceipt: null,
+			baseTree: dirtyOverlayReceipt
+				? null
+				: requireGit(
+						projectPath,
+						["rev-parse", `${head}^{tree}`],
+						"project_revision_unavailable",
+					).trim(),
+			dirtyOverlayReceipt,
 			files: receipt.scopeFiles,
 			allowManifests: receipt.allowManifests,
 			allowExecutables: receipt.allowExecutables,

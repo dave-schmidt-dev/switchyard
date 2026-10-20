@@ -7,12 +7,17 @@ import { test } from "node:test";
 import { isPersistentFailureMetadata } from "../src/switchyard/adapter/exec-error.mjs";
 import { resolveFailure } from "../src/switchyard/diagnostics/failure-registry.mjs";
 import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
-import { readRun } from "../src/switchyard/run-store/index.mjs";
+import {
+	createEvent,
+	readRun,
+	updateRunWithRetry,
+} from "../src/switchyard/run-store/index.mjs";
 import {
 	appendFailureRecord,
 	readFailureRecords,
 } from "../src/switchyard/simple/failure-log.mjs";
 import { classifyAttemptFailure } from "../src/switchyard/simple/failure-severity.mjs";
+import { createSimpleRouteHealthController } from "../src/switchyard/simple/health.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
 import { classifyExecutionFailure } from "../src/switchyard/simple/provider-invocation.mjs";
 import { createBridgeRequestRecorder } from "../src/switchyard/simple/request-evidence.mjs";
@@ -569,3 +574,163 @@ test("the failure log keeps lifecycleCheck closed and absent unless supplied", (
 		["run_id", null, null],
 	);
 });
+
+for (const publication of ["starting", "observed", "running"])
+	test(`launch ${publication} persistence failure is host-owned and retains actual teardown lifecycle`, async () => {
+		const repo = repoFixture();
+		let calls = 0;
+		const answer = await runSimpleTask(taskOptions(repo), {
+			...codexDeps(repo, async ({ onProviderLaunch }) => {
+				calls++;
+				try {
+					await onProviderLaunch({ pid: 123 });
+				} catch {
+					return {
+						success: false,
+						code: null,
+						launchEvidenceFailed: true,
+						writerLifecycle: "stopped",
+					};
+				}
+				throw Error("observation failure should be injected");
+			}),
+			runCheck: async () => ({ success: true, writerLifecycle: "stopped" }),
+			updateRunWithRetry: async (id, patch) => {
+				if (
+					(publication === "running" && patch.state === "running") ||
+					(publication !== "running" &&
+						patch.providerLaunches?.at(-1).publication ===
+							(publication === "observed"
+								? "identity_unavailable"
+								: "starting"))
+				)
+					throw Object.assign(Error("disk"), { code: "EIO" });
+				return updateRunWithRetry(id, patch);
+			},
+		});
+		strictEqual(
+			answer.failureReason,
+			"run_store_write_failed",
+			JSON.stringify(answer),
+		);
+		strictEqual(calls, publication === "starting" ? 0 : 1);
+		const record = await readRun(answer.runId);
+		strictEqual(record.worktree.writerStopped, true);
+		strictEqual(
+			record.lastFailure.providerReliability.causeCategory,
+			"environment",
+		);
+	});
+
+test("primary and corrective execution receive distinct durable launch bindings", async () => {
+	const repo = repoFixture();
+	let calls = 0,
+		checks = 0;
+	const phases = [];
+	let firstObservedStart;
+	const answer = await runSimpleTask(
+		taskOptions(repo, { repairChecks: true }),
+		{
+			...codexDeps(repo, async ({ runId, worktreePath, onProviderLaunch }) => {
+				calls++;
+				const before = await readRun(runId);
+				phases.push(before.providerLaunches.at(-1).phase);
+				strictEqual(before.providerLaunches.at(-1).publication, "starting");
+				if (calls === 1) {
+					strictEqual(before.startedAt, null);
+					strictEqual(before.activeTaskId, null);
+				}
+				await onProviderLaunch({ pid: 100 + calls });
+				const after = await readRun(runId);
+				strictEqual(after.state, "running");
+				if (calls === 1) firstObservedStart = after.startedAt;
+				else strictEqual(after.startedAt, firstObservedStart);
+				writeFileSync(
+					join(worktreePath, "a.txt"),
+					calls === 1 ? "needs repair\n" : "fixed\n",
+				);
+				return { success: true, code: 0, writerLifecycle: "stopped" };
+			}),
+			runCheck: async () => ({
+				success: ++checks > 1,
+				code: checks > 1 ? 0 : 1,
+				writerLifecycle: "stopped",
+			}),
+		},
+	);
+	strictEqual(answer.status, "succeeded", JSON.stringify(answer));
+	deepStrictEqual(phases, ["execute", "repair"]);
+	const record = await readRun(answer.runId);
+	strictEqual(record.providerLaunches.length, 2);
+	strictEqual(record.providerLaunches[0].publication, "identity_unavailable");
+	strictEqual(record.providerLaunches[1].pid, 102);
+});
+
+for (const interruption of ["cancel", "deadline", "admission"])
+	test(`interruption during launch intent (${interruption}) invokes nobody and publishes no provider-start facts`, async () => {
+		const repo = repoFixture(),
+			controller = new AbortController();
+		let clock = Date.now(),
+			calls = 0,
+			denied = false,
+			intentSeen = false;
+		const patches = [],
+			events = [];
+		const answer = await runSimpleTask(
+			taskOptions(repo, { deadlineMs: clock + 180000 }),
+			{
+				...codexDeps(repo, async () => {
+					calls++;
+					return { success: true, writerLifecycle: "stopped" };
+				}),
+				signal: controller.signal,
+				now: () => clock,
+				runCheck: async () => ({ success: true, writerLifecycle: "stopped" }),
+				createSimpleRouteHealthController: (options) => {
+					const health = createSimpleRouteHealthController(options);
+					return {
+						...health,
+						startPrepared: (reservation) =>
+							denied ? { allowed: false } : health.startPrepared(reservation),
+					};
+				},
+				createEvent: async (id, event) => {
+					events.push(event);
+					return createEvent(id, event);
+				},
+				updateRunWithRetry: async (id, patch) => {
+					patches.push(patch);
+					const result = await updateRunWithRetry(id, patch);
+					if (patch.providerLaunches?.at(-1).publication === "starting") {
+						intentSeen = true;
+						if (interruption === "cancel") controller.abort("SIGTERM");
+						if (interruption === "deadline") clock += 200000;
+						if (interruption === "admission") denied = true;
+					}
+					return result;
+				},
+			},
+		);
+		strictEqual(intentSeen, true);
+		strictEqual(calls, 0);
+		strictEqual(answer.providerStarted, false);
+		strictEqual(
+			patches.some(
+				(patch) =>
+					patch.state === "running" || patch.activeTaskStartedAt !== undefined,
+			),
+			false,
+		);
+		strictEqual(
+			events.some((event) => event.milestone === "provider_started"),
+			false,
+		);
+		const record = await readRun(answer.runId);
+		strictEqual(record.startedAt, null);
+		strictEqual(record.activeTaskId, null);
+		strictEqual(record.activeTaskStartedAt, undefined);
+		strictEqual(record.activeTaskDeadline, null);
+		strictEqual(record.activeTaskInvocationDescriptor, null);
+		strictEqual(record.activeTaskDescriptorIdentity, null);
+		strictEqual(record.providerLaunches[0].publication, "starting");
+	});

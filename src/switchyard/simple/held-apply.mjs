@@ -18,18 +18,19 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { sanitizeFailureMetadata } from "../adapter/exec-error.mjs";
-import { integrationGate, validateDiff } from "../integrate/index.mjs";
+import { integrationGate } from "../integrate/index.mjs";
 import {
 	acquireProjectLock,
 	releaseProjectLockIfOwnedBy,
 } from "../run-store/project-locks.mjs";
 import { initializeRun, readRun } from "../run-store/run-records.mjs";
 import { updateRunWithRetry } from "../run-store/run-updates.mjs";
-import { git, MAX_CAPTURE_BYTES, requireGit } from "./args.mjs";
-import { headAdvanceSafe } from "./head-advance.mjs";
+import { requireGit } from "./args.mjs";
 import { heldIntegrationOf, readHeldIntegration } from "./held-integration.mjs";
+import { heldInputStaleDetail } from "./held-overlay.mjs";
+import { heldApplyBinding } from "./held-predecessor.mjs";
 import { runHeldRechecks } from "./held-recheck.mjs";
-import { declaredPathsAreClean, fileFingerprint } from "./overlay.mjs";
+import { reconcileHeldUnderLock } from "./held-reconcile.mjs";
 
 export const HELD_APPLY_REFUSALS = Object.freeze([
 	"held_run_not_found",
@@ -95,46 +96,6 @@ function outputsAt(root, paths) {
 	});
 }
 
-/** Why the held receipt no longer describes this tree, or null. */
-function staleDetail(receipt, head, projectPath) {
-	const { verifiedHead } = receipt;
-	if (head !== verifiedHead) {
-		if (
-			git(projectPath, ["merge-base", "--is-ancestor", verifiedHead, head])
-				.status !== 0
-		)
-			return "head_not_descendant";
-		if (
-			!headAdvanceSafe({
-				projectPath,
-				base: verifiedHead,
-				head,
-				paths: [...receipt.scopeFiles, ...receipt.readOnlyInputs],
-			})
-		)
-			return "declared_path_committed";
-		// Renames and copies are never detected, so a renamed or copied
-		// executable shows as `create mode 100755` and refuses.
-		const peerDiff = requireGit(
-			projectPath,
-			["diff", "--no-renames", "--binary", "--full-index", verifiedHead, head],
-			"project_revision_unavailable",
-			{ maxBuffer: MAX_CAPTURE_BYTES },
-		);
-		if (peerDiff.trim()) {
-			const peer = validateDiff(peerDiff, projectPath);
-			if (!peer.safe || peer.requiresReview) return "peer_history_unsafe";
-		}
-	}
-	if (!declaredPathsAreClean(projectPath, receipt.scopeFiles))
-		return "declared_path_dirty";
-	if (
-		fileFingerprint(projectPath, receipt.files) !== receipt.declaredFingerprint
-	)
-		return "declared_path_changed";
-	return null;
-}
-
 function gateRefusal(gate) {
 	if (gate?.message !== "Diff apply failed") return "held_scope_refused";
 	return FORWARD_CHECK_KINDS.has(gate.reasonKind)
@@ -149,7 +110,7 @@ function gateRefusal(gate) {
  * HELD_APPLY_REFUSALS.
  */
 export async function applyHeldIntegration(
-	{ projectPath, runId, deadlineMs, signal },
+	{ projectPath, runId, deadlineMs, signal, reconcileOnly = false },
 	deps = {},
 ) {
 	const now = deps.now ?? Date.now;
@@ -199,6 +160,12 @@ export async function applyHeldIntegration(
 	} catch {
 		return refusal("run_store_write_failed");
 	}
+	const state = {
+		mutationStarted: false,
+		record: null,
+		claimed: null,
+		binding: null,
+	};
 	const finish = async (result) => {
 		const finishedAt = new Date(now()).toISOString();
 		// As in the simple run's own cleanup: a lock this apply took but could
@@ -232,7 +199,16 @@ export async function applyHeldIntegration(
 							...cleanup,
 							finishedAt,
 							terminalSummary: {
-								status: "held_applied",
+								status: reconcileOnly ? "held_reconciled" : "held_applied",
+								heldBinding: state.binding,
+								baseRevision: result.appliedHead,
+								outputs: result.outputs,
+								reconciliation: result.reconciledAt
+									? {
+											earlierApplyRunId: result.earlierApplyRunId,
+											at: result.reconciledAt,
+										}
+									: undefined,
 								heldRunId: runId,
 								appliedHead: result.appliedHead,
 								changedFiles: result.changedFiles,
@@ -249,12 +225,21 @@ export async function applyHeldIntegration(
 							}),
 							terminalSummary: {
 								status: "held_apply_refused",
+								heldBinding: state.binding,
 								heldRunId: runId,
 								reason: result.reason,
 							},
 						},
 			);
 		} catch {
+			if (reconcileOnly)
+				return {
+					...refusal("run_store_write_failed", {
+						detail: "reconciliation_run_unrecorded",
+					}),
+					applyRecord: "unconfirmed",
+					applyRunId,
+				};
 			result.applyRecord = "unconfirmed";
 		}
 		return { ...result, applyRunId };
@@ -276,10 +261,9 @@ export async function applyHeldIntegration(
 		);
 	}
 
-	const state = { mutationStarted: false, record: null, claimed: null };
 	let result;
 	try {
-		result = await applyUnderLock(
+		result = await (reconcileOnly ? reconcileHeldUnderLock : applyUnderLock)(
 			{ projectPath, runId, applyRunId, deadlineMs, signal, now },
 			{ ...deps, read, updateRun, progress, refusal, consumed },
 			state,
@@ -356,6 +340,7 @@ async function applyUnderLock(input, deps, state) {
 		runId,
 	);
 	state.record = record;
+	state.binding = heldApplyBinding(held, receipt);
 
 	progress({ phase: "verify" });
 	const head = requireGit(
@@ -363,7 +348,7 @@ async function applyUnderLock(input, deps, state) {
 		["rev-parse", "HEAD"],
 		"project_revision_unavailable",
 	).trim();
-	const stale = staleDetail(receipt, head, projectPath);
+	const stale = heldInputStaleDetail(receipt, head, projectPath);
 	if (stale)
 		return refusal("held_receipt_stale", {
 			detail: stale,
@@ -406,7 +391,7 @@ async function applyUnderLock(input, deps, state) {
 			"project_revision_unavailable",
 		).trim();
 		const moved = after !== head ? "head_moved_during_recheck" : null;
-		const restale = moved ?? staleDetail(receipt, head, projectPath);
+		const restale = moved ?? heldInputStaleDetail(receipt, head, projectPath);
 		if (restale)
 			return refusal("held_receipt_stale", { detail: restale, head: after });
 	}
@@ -464,6 +449,8 @@ async function applyUnderLock(input, deps, state) {
 		state: "applied",
 		runId,
 		verifiedHead: receipt.verifiedHead,
+		baseRevision: head,
+		...(receipt.report ? { report: receipt.report } : {}),
 		appliedHead: head,
 		appliedAt,
 		recheck,

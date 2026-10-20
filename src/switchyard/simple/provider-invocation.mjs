@@ -16,7 +16,10 @@ import {
 	verifyGitControl,
 } from "./args.mjs";
 import { resolveCheckExecution } from "./check-execution.mjs";
-import { settleSimpleWriterProcesses } from "./process-teardown.mjs";
+import {
+	observeSimpleProcessIdentity,
+	settleSimpleWriterProcesses,
+} from "./process-teardown.mjs";
 import {
 	classifyProviderOutput,
 	createRateLimitMatcher,
@@ -289,35 +292,89 @@ function withRateLimitDetection(options) {
 	};
 }
 export async function runSimpleWriter(command, args, options = {}) {
-	// A provider receives its guarded prompt on stdin; watch its live streams so
-	// a rate-limit report stops it before the routing budget is burned.
+	// Watch live streams for rate limits. The launch barrier delays stdin only;
+	// harnesses with argv prompts may start work as soon as they spawn.
 	const streamOptions =
 		typeof options.input === "string" && options.input.length > 0
 			? withRateLimitDetection(options)
 			: options;
 	// Test-injected spawns retain their own lifecycle contract. Production spawns
 	// create a session and settle both its group and any escaped worktree holder.
-	if (streamOptions.spawnFn)
-		return runProviderProcess(command, args, streamOptions);
+	if (streamOptions.spawnFn && !options.settleWriterProcesses)
+		return runProviderProcess(command, args, {
+			...streamOptions,
+			onSpawned: options.onProviderLaunch
+				? ({ pid }) =>
+						options.onProviderLaunch({
+							pid,
+							processGroupId: null,
+							processStart: null,
+						})
+				: options.onSpawned,
+		});
 	let pgid = null;
+	let result;
+	let writerLifecycle = "unavailable";
 	const launchedAt = Date.now();
-	const result = await runProviderProcess(command, args, {
-		...streamOptions,
-		spawnFn: (cmd, argv, spawnOptions) => {
-			const child = spawn(cmd, argv, { ...spawnOptions, detached: true });
-			pgid = child.pid;
-			return child;
-		},
-	});
-	const writerLifecycle =
-		result.writerLifecycle === "never_started"
-			? "never_started"
-			: await settleSimpleWriterProcesses({
+	try {
+		result = await runProviderProcess(command, args, {
+			...streamOptions,
+			spawnFn: (cmd, argv, spawnOptions) => {
+				const child = (streamOptions.spawnFn ?? spawn)(cmd, argv, {
+					...spawnOptions,
+					detached: true,
+				});
+				pgid = child.pid;
+				return child;
+			},
+			onSpawned:
+				typeof options.onProviderLaunch === "function"
+					? async ({ pid }) => {
+							let identity = null;
+							try {
+								identity = (
+									options.observeProcessIdentity ?? observeSimpleProcessIdentity
+								)(pid);
+							} catch {}
+
+							const matches =
+								identity &&
+								identity.processGroupId === pgid &&
+								identity.startedAt >= launchedAt - 1000 &&
+								identity.startedAt <= Date.now() + 1000 &&
+								!/^Z/u.test(identity.state);
+							await options.onProviderLaunch({
+								pid,
+								processGroupId: matches ? pgid : null,
+								processStart: matches
+									? {
+											source: "ps_lstart",
+											stamp: identity.stamp,
+											precision: "seconds",
+										}
+									: null,
+							});
+						}
+					: options.onSpawned,
+		});
+	} finally {
+		if (result?.writerLifecycle === "never_started")
+			writerLifecycle = "never_started";
+		else {
+			try {
+				writerLifecycle = await (
+					options.settleWriterProcesses ?? settleSimpleWriterProcesses
+				)({
 					processGroupId: pgid,
 					processScopePath: options.processScopePath,
 					launchedAt,
 					onProgress: options.onPoll,
 				});
+			} catch {
+				writerLifecycle = "unavailable";
+			}
+		}
+	}
 	return { ...result, writerLifecycle, processGroupId: pgid };
 }
 export async function defaultExecuteProvider(context) {
@@ -340,10 +397,12 @@ export async function defaultExecuteProvider(context) {
 		progressStage: "running",
 		onPoll: () => context.onProgress?.(),
 		onStderrChunk: context.onStderrChunk,
+		onProviderLaunch: context.onProviderLaunch,
 		signal: context.signal,
 		...(context.spawnFn ? { spawnFn: context.spawnFn } : {}),
 	});
 	const result = withCancelSource(raw, context.signal);
+	if (result.launchEvidenceFailed) return result;
 	const earlyRateLimited = !result.success && result.rateLimited === true;
 	const signatureInfo = !result.success
 		? classifyProviderOutput({

@@ -293,8 +293,13 @@ function fixture(targets = ["vibe"]) {
 			},
 			terminal: async () => ({ settled: true }),
 		}),
-		executeProvider: async ({ worktreePath, onStderrChunk }) => {
+		executeProvider: async ({
+			worktreePath,
+			onStderrChunk,
+			onProviderLaunch,
+		}) => {
 			order.push("execute");
+			await onProviderLaunch?.({});
 			writeFileSync(join(worktreePath, "src", "a.txt"), "candidate\n");
 			onStderrChunk?.(Buffer.from(end));
 			return { success: true, code: 0, writerLifecycle: "stopped" };

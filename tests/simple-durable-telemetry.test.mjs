@@ -156,7 +156,12 @@ it("persists running state, start timestamps and an observed heartbeat while the
 		dependencies({
 			runId,
 			now: () => clock,
-			executeProvider: async ({ worktreePath, onProgress }) => {
+			executeProvider: async ({
+				worktreePath,
+				onProgress,
+				onProviderLaunch,
+			}) => {
+				await onProviderLaunch({}); // Synthetic executor start; OS identity stays unavailable.
 				provider.onEntered();
 				emitProgress = onProgress;
 				onProgress();
@@ -222,6 +227,7 @@ it("throttles durable heartbeats to at most one per 30 seconds", async () => {
 			runId,
 			now: () => clock,
 			executeProvider: async (context) => {
+				await context.onProviderLaunch({});
 				provider.onEntered();
 				emitProgress = context.onProgress;
 				observedWorktree = context.worktreePath;
@@ -272,11 +278,10 @@ it("keeps a terminal failure transition valid without writing lastCompletionAt",
 		options(repo),
 		dependencies({
 			runId,
-			executeProvider: async () => ({
-				success: false,
-				code: 1,
-				writerLifecycle: "stopped",
-			}),
+			executeProvider: async ({ onProviderLaunch }) => {
+				await onProviderLaunch({});
+				return { success: false, code: 1, writerLifecycle: "stopped" };
+			},
 			runCheck: async () => ({ success: true }),
 		}),
 	);
@@ -335,7 +340,8 @@ for (const rejectWrites of [false, true]) {
 					);
 					return { success: true, probeWriterLifecycle: "never_started" };
 				},
-				executeProvider: async ({ onProgress }) => {
+				executeProvider: async ({ onProgress, onProviderLaunch }) => {
+					await onProviderLaunch({});
 					emitProgress = onProgress;
 					onProgress();
 					return { success: false, code: 1, writerLifecycle: "stopped" };
@@ -391,7 +397,7 @@ for (const rejectWrites of [false, true]) {
 	});
 }
 
-it("a rejected provider-start write fails closed after the provider settles", async () => {
+it("a rejected post-spawn start write fails closed with synthetic stopped-writer evidence", async () => {
 	const repo = makeRepo();
 	let executed = false;
 	const result = await runSimpleTask(
@@ -403,10 +409,19 @@ it("a rejected provider-start write fails closed after the provider settles", as
 					throw new Error("synthetic start write rejection");
 				return updateRunWithRetry(id, patch);
 			},
-			executeProvider: async ({ worktreePath }) => {
+			executeProvider: async ({ onProviderLaunch }) => {
 				executed = true;
-				writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
-				return { success: true, code: 0, writerLifecycle: "stopped" };
+				try {
+					await onProviderLaunch({});
+				} catch {
+					return {
+						success: false,
+						code: null,
+						launchEvidenceFailed: true,
+						writerLifecycle: "stopped",
+					};
+				}
+				throw new Error("required start write should reject");
 			},
 		}),
 	);
@@ -415,4 +430,24 @@ it("a rejected provider-start write fails closed after the provider settles", as
 	strictEqual(result.failureReason, "run_store_write_failed");
 	strictEqual((await readRun(result.runId)).state, "failed");
 	strictEqual(result.recovery.cleanup.projectLock.state, "released");
+});
+
+it("a legacy silent injected executor can finish without inventing observed start metadata", async () => {
+	const repo = makeRepo();
+	const result = await runSimpleTask(
+		options(repo),
+		dependencies({
+			executeProvider: async ({ worktreePath }) => {
+				writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n");
+				return { success: true, code: 0, writerLifecycle: "stopped" };
+			},
+			runCheck: async () => ({ success: true }),
+		}),
+	);
+	strictEqual(result.status, "succeeded");
+	const record = await readRun(result.runId);
+	strictEqual(record.startedAt, null);
+	strictEqual(record.activeTaskStartedAt, undefined);
+	strictEqual(record.activeTaskId, null);
+	strictEqual(record.providerLaunches[0].publication, "starting");
 });

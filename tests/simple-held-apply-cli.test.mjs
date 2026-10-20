@@ -56,26 +56,26 @@ test("--integrate parses hold and apply and refuses other values and modes", () 
 		() => parseSimpleArgs(argv(repo, "--integrate", "later")),
 		/--integrate must be apply or hold/,
 	);
-	throws(
-		() => parseSimpleArgs(argv(repo, "--integrate", "hold", "--dirty-overlay")),
-		/mutually exclusive with --dirty-overlay/,
+	strictEqual(
+		parseSimpleArgs(argv(repo, "--integrate", "hold", "--dirty-overlay"))
+			.integrateMode,
+		"hold",
 	);
-	throws(
-		() =>
-			parseSimpleArgs([
-				repo.promptPath,
-				"--project",
-				repo.projectPath,
-				"--capability",
-				"standard",
-				"--report",
-				"r.md",
-				"--integrate",
-				"hold",
-				"--timeout",
-				"5",
-			]),
-		/mutually exclusive with --report/,
+	strictEqual(
+		parseSimpleArgs([
+			repo.promptPath,
+			"--project",
+			repo.projectPath,
+			"--capability",
+			"standard",
+			"--report",
+			"r.md",
+			"--integrate",
+			"hold",
+			"--timeout",
+			"5",
+		]).integrateMode,
+		"hold",
 	);
 	ok(SIMPLE_USAGE.includes("--integrate <apply|hold>"));
 	ok(SIMPLE_USAGE.includes("routing-run apply --run-id"));

@@ -57,7 +57,7 @@ and the project lock is released at the end of the run. Apply it later with
 routing-run apply --run-id <runId>, which re-runs the gate against the
 then-current HEAD and refuses with a closed reason on conflict or a stale
 receipt. A held run counts as a succeeded attempt for routing. --integrate hold
-cannot be combined with --report or --dirty-overlay. The default is apply.
+supports reports and captured dirty overlays. The default is apply.
 --estimate-minutes supplies one caller-estimated provider duration (whole
 minutes, 1 to 1440); it is an estimate, not a proven duration. Before any
 provider work, simple refuses task_estimate_exceeds_budget when the caller estimate
@@ -509,10 +509,6 @@ export function parseSimpleArgs(
 	const integrateMode = parsed.values.integrate ?? "apply";
 	if (integrateMode !== "apply" && integrateMode !== "hold")
 		throw new SimpleUsageError("--integrate must be apply or hold");
-	if (integrateMode === "hold" && (reportMode || dirtyOverlay))
-		throw new SimpleUsageError(
-			`--integrate hold is mutually exclusive with ${reportMode ? "--report" : "--dirty-overlay"}`,
-		);
 	for (const check of [
 		...checks,
 		...baselineChecks,

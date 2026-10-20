@@ -6,10 +6,13 @@ Noteworthy changes follow [Keep a Changelog 1.1.0](https://keepachangelog.com/en
 
 ### Changed
 
+- Held integration supports reports, captured dirty overlays and durable applied-output predecessor receipts.
 - Pure failure classification, ownership, health trust, routing blame and failure-log decisions share one module, preserving prior behavior with a base-derived golden table.
 
 ### Added
 
+- `routing-run reconcile-held` retries lost held metadata only after an exactly bound, proven pre-mutation refusal; unknown or consumed mutation stays refused.
+- Bounded early launch provenance for primary and corrective execution, with explicit weak/missing identity and crash-window limits. Required publication gates stdin and stops the supervised writer on persistence failure; argv-based providers may already have started.
 - Python checks may declare one existing shared `~/.venvs/<name>/bin/python` interpreter through its exact absolute bounded pytest command. Interpreter and base prefix stay read-only; grants apply only to declared Python checks. Changed roots, symlink escapes and mixed or multiple interpreter sets refuse; `uv` remains unsupported.
 - Executed acceptance checks disclose that app-target compilation remains unverified, in terminal results and durable summaries.
 - Report results add bounded advisory `report.citationCheck` diagnostics for exact file/line/identifier matches, missing files, wrong ranges and unverifiable forms. Text matches do not establish semantic truth; report success and existing report metadata keep their meaning. `simple --help` now describes these diagnostics and differential test acceptance.

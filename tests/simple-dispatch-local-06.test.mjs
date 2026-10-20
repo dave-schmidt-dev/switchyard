@@ -109,7 +109,8 @@ function dependencies(overrides = {}) {
 			invocation_args: [],
 		}),
 		assertFundedRoute: () => {},
-		executeProvider: async ({ worktreePath }) => {
+		executeProvider: async ({ worktreePath, onProviderLaunch }) => {
+			await onProviderLaunch?.({});
 			writeFileSync(join(worktreePath, "src", "a.txt"), "provider\n", "utf8");
 			return { success: true, code: 0, writerLifecycle: "stopped" };
 		},
@@ -212,7 +213,12 @@ describe("simple local execution path", () => {
 					);
 					return { provider: "Codex (Spark)", reason: "priority_fill" };
 				},
-				executeProvider: async ({ worktreePath, descriptor }) => {
+				executeProvider: async ({
+					worktreePath,
+					descriptor,
+					onProviderLaunch,
+				}) => {
+					await onProviderLaunch?.({});
 					seen.executions += 1;
 					strictEqual(descriptor.target_id, "codex");
 					execFileSync("git", ["branch", "provider-local"], {
@@ -267,6 +273,10 @@ describe("simple local execution path", () => {
 		ok(milestones.includes("first_change_observed"));
 		ok(milestones.includes("check_started"));
 		ok(milestones.includes("check_finished"));
+		ok(
+			milestones.indexOf("provider_started") <
+				milestones.indexOf("first_change_observed"),
+		);
 		const check = events.find((event) => event.milestone === "check_started");
 		strictEqual(check.checkIndex, 1);
 		strictEqual(check.checkIdentity.length, 64);
@@ -281,7 +291,12 @@ describe("simple local execution path", () => {
 			dependencies({
 				now: () => clock,
 				onStatus: (event) => events.push(event),
-				executeProvider: async ({ worktreePath, onProgress }) => {
+				executeProvider: async ({
+					worktreePath,
+					onProgress,
+					onProviderLaunch,
+				}) => {
+					await onProviderLaunch?.({});
 					onProgress();
 					writeFileSync(
 						join(worktreePath, "src", "a.txt"),

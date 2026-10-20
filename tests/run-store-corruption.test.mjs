@@ -10,6 +10,7 @@ import {
 	initializeRun,
 	readRun,
 	SchemaError,
+	updateRunWithRetry,
 } from "../src/switchyard/run-store/index.mjs";
 import {
 	makeOptions,
@@ -111,4 +112,22 @@ describe("permissions", () => {
 		strictEqual(runPerm, 0o600, "run.json should be 0600");
 		strictEqual(eventsPerm, 0o600, "events.jsonl should be 0600");
 	});
+});
+
+it("old records remain valid and malformed launch evidence cannot enter a run", async () => {
+	const opts = makeOptions();
+	await initializeRun(opts);
+	strictEqual((await readRun(opts.runId)).providerLaunches, undefined);
+	for (const providerLaunches of [
+		null,
+		[],
+		[{ phase: "execute" }],
+		[1, 2, 3],
+	]) {
+		await rejects(
+			updateRunWithRetry(opts.runId, { providerLaunches }),
+			SchemaError,
+		);
+	}
+	strictEqual((await readRun(opts.runId)).providerLaunches, undefined);
 });
