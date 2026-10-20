@@ -142,9 +142,10 @@ function oracleErrorKind(failureReason, failurePhase, errno) {
 		if (["preflight", "input_validation"].includes(failurePhase))
 			return "validation_failed";
 		if (failurePhase === "execute") return "execution_failed";
-		if (failurePhase === "checks") return "check_failed";
+		if (["checks", "check"].includes(failurePhase)) return "check_failed";
 		if (failurePhase === "cleanup") return "cleanup_failed";
-		return "policy_violation";
+		// A deadline in a Switchyard step is environmental, not a scope fact.
+		return "environment_failure";
 	}
 	if (
 		[
@@ -241,6 +242,19 @@ function oracleCauseCode(reason, phase, providerResult, errorKind) {
 		)
 	)
 		return "diff_capture_failed";
+	// A deadline outside provider, check, input and cleanup phases.
+	if (
+		reason === "deadline_expired" &&
+		![
+			"preflight",
+			"input_validation",
+			"execute",
+			"checks",
+			"check",
+			"cleanup",
+		].includes(phase)
+	)
+		return "deadline_expired";
 	if (["environment_failure", "permission_denied"].includes(errorKind))
 		return "environment_failure";
 	if (reason === "provider_cancelled") return "cancelled";
@@ -414,6 +428,7 @@ const ORACLE_CODE_CATEGORY = new Map([
 	["worktree_allocation_failed", "environment"],
 	["worktree_missing", "environment"],
 	["diff_capture_failed", "environment"],
+	["deadline_expired", "environment"],
 	["worktree_ownership_failed", "cleanup"],
 	["git_control_tampered", "environment"],
 	["target_identity_unavailable", "environment"],

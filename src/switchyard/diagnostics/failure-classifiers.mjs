@@ -116,6 +116,16 @@ const DIFF_CAPTURE_REASONS = [
 	"diff_capture_failed",
 ];
 
+// Phases whose deadline already resolves to a phase-specific cause.
+const DEADLINE_CAUSE_PHASES = [
+	"preflight",
+	"input_validation",
+	"execute",
+	"checks",
+	"check",
+	"cleanup",
+];
+
 const ENVIRONMENT_REASONS = [
 	"project_revision_unavailable",
 	"workspace_clone_failed",
@@ -273,9 +283,11 @@ export function snapshotErrorKind(failureReason, failurePhase, errno) {
 		if (["preflight", "input_validation"].includes(failurePhase))
 			return "validation_failed";
 		if (failurePhase === "execute") return "execution_failed";
-		if (failurePhase === "checks") return "check_failed";
+		if (["checks", "check"].includes(failurePhase)) return "check_failed";
 		if (failurePhase === "cleanup") return "cleanup_failed";
-		return "policy_violation";
+		// The run's deadline ran out in a Switchyard step (route, prepare,
+		// diff capture, repair or integration), not in the candidate's scope.
+		return "environment_failure";
 	}
 	if (ENVIRONMENT_REASONS.includes(failureReason)) return "environment_failure";
 	if (failurePhase === "input_validation") return "validation_failed";
@@ -320,6 +332,10 @@ export function snapshotCauseCode(
 	// Outside the baseline, every diff-capture git failure shares one closed
 	// environment cause.
 	if (DIFF_CAPTURE_REASONS.includes(reason)) return "diff_capture_failed";
+	// A deadline outside the provider, check, caller-input and cleanup phases
+	// has its own closed environment cause, never scope_rejected.
+	if (reason === "deadline_expired" && !DEADLINE_CAUSE_PHASES.includes(phase))
+		return "deadline_expired";
 	if (["environment_failure", "permission_denied"].includes(errorKind))
 		return "environment_failure";
 	if (reason === "provider_cancelled") return "cancelled";

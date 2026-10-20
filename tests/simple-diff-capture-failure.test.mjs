@@ -2,7 +2,8 @@
 // A simple attempt whose diff capture fails in host git ends with the closed
 // cause `diff_capture_failed` (category environment) in the result,
 // run.json's lastFailure and the failure-log attempt record, instead of an
-// unclassified `unknown` cause.
+// unclassified `unknown` cause. A capture stopped by the run's deadline ends
+// with the closed environment cause `deadline_expired`, not `scope_rejected`.
 import { strictEqual } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -48,9 +49,17 @@ function fixture() {
 	return { root, projectPath, promptPath };
 }
 
+const BROKEN_GIT = {
+	status: 128,
+	signal: null,
+	stdout: "",
+	stderr: "fatal: fixture\n",
+};
+
 // After the provider has run, the first worktree `git add -A` is the diff
-// capture's staging step; it exits nonzero as a broken host git would.
-async function runWithFailingCapture() {
+// capture's staging step; it returns `stagingResult`, by default exiting
+// nonzero as a broken host git would.
+async function runWithFailingCapture(stagingResult = BROKEN_GIT) {
 	const repo = fixture();
 	const cp = createRequire(import.meta.url)("node:child_process");
 	const original = cp.spawnSync;
@@ -61,7 +70,7 @@ async function runWithFailingCapture() {
 		args?.includes("--work-tree") &&
 		args.includes("add") &&
 		args.includes("-A")
-			? { status: 128, signal: null, stdout: "", stderr: "fatal: fixture\n" }
+			? stagingResult
 			: original(command, args, options);
 	syncBuiltinESMExports();
 	try {
@@ -160,4 +169,94 @@ test("a diff-capture git failure carries diff_capture_failed in the result, last
 	strictEqual(record.causeCode, "diff_capture_failed");
 	strictEqual(record.causeCategory, "environment");
 	strictEqual(record.failureReason, "diff_stage_failed");
+});
+
+test("a deadline outside the provider, check, input and cleanup phases resolves to deadline_expired", () => {
+	for (const phase of [
+		"route",
+		"prepare",
+		"diff",
+		"repair",
+		"integrate",
+		"provider",
+		"unknown",
+		null,
+	]) {
+		const resolved = resolveFailure({ reason: "deadline_expired", phase });
+		strictEqual(resolved.causeCode, "deadline_expired", `${phase}`);
+		strictEqual(resolved.causeCategory, "environment", `${phase}`);
+		strictEqual(resolved.errorKind, "environment_failure", `${phase}`);
+	}
+	// Phase-specific deadline causes are unchanged, and a singular check phase
+	// is a check timeout like the checks phase.
+	for (const [phase, causeCode, errorKind] of [
+		["execute", "provider_deadline_exceeded", "execution_failed"],
+		["checks", "acceptance_check_timeout", "check_failed"],
+		["check", "acceptance_check_timeout", "check_failed"],
+		["baseline", "baseline_check_failed", "environment_failure"],
+		["preflight", "input_rejected", "validation_failed"],
+		["input_validation", "input_rejected", "validation_failed"],
+		["cleanup", "cleanup_failed", "cleanup_failed"],
+	]) {
+		const resolved = resolveFailure({ reason: "deadline_expired", phase });
+		strictEqual(resolved.causeCode, causeCode, phase);
+		strictEqual(resolved.errorKind, errorKind, phase);
+	}
+});
+
+test("a diff capture stopped by the run deadline carries deadline_expired in the result, lastFailure and failure log", async () => {
+	const result = await runWithFailingCapture({
+		status: null,
+		signal: "SIGTERM",
+		stdout: "",
+		stderr: "",
+		error: Object.assign(new Error("spawnSync git ETIMEDOUT"), {
+			code: "ETIMEDOUT",
+		}),
+	});
+	strictEqual(result.status, "failed");
+	strictEqual(result.failurePhase, "diff");
+	strictEqual(result.failureReason, "deadline_expired");
+	strictEqual(result.errorKind, "environment_failure");
+	strictEqual(result.providerReliability.causeCode, "deadline_expired");
+	strictEqual(result.providerReliability.causeCategory, "environment");
+
+	const run = await readRun(result.runId);
+	strictEqual(run.failureDetails.failureReason, "deadline_expired");
+	strictEqual(run.lastFailure.errorKind, "environment_failure");
+	strictEqual(run.lastFailure.reasonCode, "environment_failure");
+	strictEqual(
+		run.lastFailure.providerReliability.causeCode,
+		"deadline_expired",
+	);
+	strictEqual(run.lastFailure.providerReliability.causeCategory, "environment");
+
+	const stateRoot = tempDir("switchyard-diff-capture-deadline-log-");
+	const classification = classifyAttemptFailure({
+		result,
+		accountability: result.accountability,
+	});
+	strictEqual(classification.reason, "environment_failure");
+	appendFailureRecord(
+		failureAttemptRecord({
+			project: "/review/project",
+			routingRunId: "routing-2",
+			attempt: {
+				taskId: result.taskId,
+				attemptId: result.attemptId,
+				runId: result.runId,
+				targetId: "codex",
+				capability: "standard",
+			},
+			result,
+			accountability: result.accountability,
+			classification,
+		}),
+		{ stateRoot },
+	);
+	const [record] = readFailureRecords({ stateRoot });
+	strictEqual(record.reason, "environment_failure");
+	strictEqual(record.causeCode, "deadline_expired");
+	strictEqual(record.causeCategory, "environment");
+	strictEqual(record.failureReason, "deadline_expired");
 });
