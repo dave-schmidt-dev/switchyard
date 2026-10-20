@@ -19,7 +19,7 @@ import {
 	SIMPLE_TARGET_ADAPTERS,
 } from "./target-adapters.mjs";
 import { MAX_ESTIMATE_MINUTES } from "./task-sizing.mjs";
-export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--allow-executable <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] --check <command> | --report <path>) (--deadline <RFC3339> | --timeout <minutes>) [--estimate-minutes <minutes>] [--origin <work|qualification>] [--json]
+export const SIMPLE_USAGE = `Usage: switchyard-dispatch simple <prompt-file> --project <path> --capability <low|standard|high> (--file <path> [--allow-manifest <path>] [--allow-executable <path>] [--input <path>] [--dirty-overlay] [--predecessor-receipt <path>] [--only-provider <provider>] [--routing-run-id <id>] [--task-id <id>] [--baseline-check <command>] [--no-repair-checks] [--format <command>] [--integrate <apply|hold>] --check <command> | --report <path>) (--deadline <RFC3339> | --timeout <minutes>) [--estimate-minutes <minutes>] [--origin <work|qualification>] [--json]
 
 Runs one bounded assignment in a disposable local checkout. Repeat --file and
 --input and --check as needed. --input is read-only and requires --dirty-overlay.
@@ -45,6 +45,14 @@ for compatibility.
 --format runs one bounded command in the check sandbox after the provider
 succeeds and before acceptance checks; a nonzero exit is advisory, recorded as
 formatStatus, and any edits it makes are revalidated against the declared scope.
+--integrate hold runs every check and the integration gate but writes nothing
+to the project: the verified patch and a receipt go to the run store, the
+result carries integration {mode "hold", state "held", receiptPath, patchPath},
+and the project lock is released at the end of the run. Apply it later with
+routing-run apply --run-id <runId>, which re-runs the gate against the
+then-current HEAD and refuses with a closed reason on conflict or a stale
+receipt. A held run counts as a succeeded attempt for routing. --integrate hold
+cannot be combined with --report or --dirty-overlay. The default is apply.
 --estimate-minutes supplies one caller-estimated provider duration (whole
 minutes, 1 to 1440); it is an estimate, not a proven duration. Before any
 provider work, simple refuses task_estimate_exceeds_budget when the caller estimate
@@ -252,6 +260,7 @@ export function parseSimpleArgs(
 				check: { type: "string", multiple: true },
 				"baseline-check": { type: "string", multiple: true },
 				format: { type: "string", multiple: true },
+				integrate: { type: "string" },
 				"repair-checks": { type: "boolean", default: false },
 				"no-repair-checks": { type: "boolean", default: false },
 				deadline: { type: "string" },
@@ -487,6 +496,13 @@ export function parseSimpleArgs(
 	}
 	const formatCommand =
 		formatCommands.length === 1 ? formatCommands[0].trim() : null;
+	const integrateMode = parsed.values.integrate ?? "apply";
+	if (integrateMode !== "apply" && integrateMode !== "hold")
+		throw new SimpleUsageError("--integrate must be apply or hold");
+	if (integrateMode === "hold" && (reportMode || dirtyOverlay))
+		throw new SimpleUsageError(
+			`--integrate hold is mutually exclusive with ${reportMode ? "--report" : "--dirty-overlay"}`,
+		);
 	for (const check of [
 		...checks,
 		...baselineChecks,
@@ -564,6 +580,7 @@ export function parseSimpleArgs(
 		checks: checks.map((check) => check.trim()),
 		baselineChecks: baselineChecks.map((check) => check.trim()),
 		format: formatCommand,
+		integrateMode,
 		repairChecks: parsed.values["no-repair-checks"] !== true,
 		deadlineMs,
 		estimateMinutes,

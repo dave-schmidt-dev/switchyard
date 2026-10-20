@@ -1,4 +1,8 @@
-import { applyReviewedDiff, getScopedFingerprint } from "./apply.mjs";
+import {
+	applyReviewedDiff,
+	checkReviewedDiff,
+	getScopedFingerprint,
+} from "./apply.mjs";
 
 import {
 	extractSummaryLines,
@@ -153,6 +157,15 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		};
 	}
 
+	// A held integration stops at git's own forward check: every refusal above
+	// still applies, but nothing is written to the project tree.
+	if (options.checkOnly === true) {
+		const checked = checkReviewedDiff(patch, projectPath);
+		if (checked === true)
+			return { success: true, message: "Diff verified", checkOnly: true };
+		return applyFailure(checked);
+	}
+
 	// No-op detection: only for the common path (requiredPaths === null),
 	// where touchedPaths isn't computed independently elsewhere in this
 	// function. Scoped to touched-path content/state so pre-existing unrelated
@@ -185,6 +198,10 @@ function integrationGateUnsafe(diff, projectPath, options = {}) {
 		return { success: true, message: "Diff applied successfully" };
 	}
 
+	return applyFailure(applyResult);
+}
+
+function applyFailure(applyResult) {
 	const result = { success: false, message: "Diff apply failed" };
 	if (applyResult && typeof applyResult.reason === "string") {
 		result.reason = applyResult.reason;

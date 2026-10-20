@@ -17,6 +17,8 @@ import { readRun } from "../run-store/run-records.mjs";
 import { SimpleUsageError } from "./args.mjs";
 import { inspectRoutingAccountability } from "./failure-accountability.mjs";
 import { readFailureRecords, summarizeFailures } from "./failure-log.mjs";
+import { applyHeldIntegration } from "./held-apply.mjs";
+import { inspectHeldIntegrations } from "./held-integration.mjs";
 import {
 	closePendingAttempt,
 	releaseRetainedPartial,
@@ -42,7 +44,9 @@ const ROUTING_RUN_USAGE = `Usage: switchyard-dispatch routing-run inspect --proj
        switchyard-dispatch routing-run close-pending --project <path> --routing-run-id <id> --task-id <id>
        switchyard-dispatch routing-run native-start --project <path> --routing-run-id <id> --authorization <manifest> --actual-start <receipt> --task-id <id> --invocation-id <id>
        switchyard-dispatch routing-run failures [--since <RFC3339>] [--json]
+       switchyard-dispatch routing-run apply --project <path> --run-id <simple-run-id> [--timeout <minutes>]
 release-partial and close-pending --task-id take the --task-id given to simple or the persisted task hash.
+apply integrates the patch a simple --integrate hold run verified, re-running the integration gate against the current HEAD (acceptance checks re-run when HEAD moved, within --timeout, default 10 minutes, at most 30). It never applies any other diff and refuses with one closed reason, exiting 1.
 Native acknowledgement requires existing idle state, exact task authorization and an actual-start receipt. The latch gives direction only; future task authority remains caller-owned.`;
 const RFC3339 =
 	/^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/u;
@@ -84,6 +88,8 @@ export async function handleRoutingRun(argv, deps = {}) {
 				"actual-start": { type: "string" },
 				"task-id": { type: "string" },
 				"invocation-id": { type: "string" },
+				"run-id": { type: "string" },
+				timeout: { type: "string" },
 				since: { type: "string" },
 				discard: { type: "boolean" },
 				json: { type: "boolean" },
@@ -106,6 +112,7 @@ export async function handleRoutingRun(argv, deps = {}) {
 			"failures",
 			"release-partial",
 			"close-pending",
+			"apply",
 		].includes(command)
 	)
 		throw new RoutingCliUsageError("invalid routing-run subcommand");
@@ -113,6 +120,13 @@ export async function handleRoutingRun(argv, deps = {}) {
 		throw new RoutingCliUsageError("--since applies only to failures");
 	if (command !== "release-partial" && values.discard !== undefined)
 		throw new RoutingCliUsageError("--discard applies only to release-partial");
+	if (
+		command !== "apply" &&
+		(values["run-id"] !== undefined || values.timeout !== undefined)
+	)
+		throw new RoutingCliUsageError(
+			"--run-id and --timeout apply only to apply",
+		);
 	if (command === "failures") {
 		let since;
 		if (values.since !== undefined) {
@@ -151,6 +165,31 @@ export async function handleRoutingRun(argv, deps = {}) {
 	const project = canonicalRoutingProject(
 		values.project ? resolve(values.project) : null,
 	);
+	if (command === "apply") {
+		const timeout = values.timeout ?? "10";
+		if (!values["run-id"] || !/^[1-9][0-9]?$/u.test(timeout) || +timeout > 30)
+			throw new RoutingCliUsageError(
+				"apply requires --run-id and a --timeout of 1 to 30 minutes",
+			);
+		const now = deps.now ?? Date.now;
+		const result = await (deps.applyHeldIntegration ?? applyHeldIntegration)(
+			{
+				projectPath: project,
+				runId: values["run-id"],
+				deadlineMs: now() + Number(timeout) * 60_000,
+			},
+			{
+				...deps,
+				onProgress: (event) =>
+					(deps.writeProgress ?? console.error)(
+						`dispatch: routing-run apply run=${values["run-id"]} phase=${event.phase}${event.checkIndex ? ` check=${event.checkIndex}` : ""}`,
+					),
+			},
+		);
+		write(JSON.stringify(result));
+		if (!result.ok) (deps.signalProcess ?? process).exitCode = 1;
+		return;
+	}
 	const runId =
 		values["routing-run-id"] ?? process.env.SWITCHYARD_ROUTING_RUN_ID;
 	validateRoutingRunId(runId);
@@ -161,12 +200,17 @@ export async function handleRoutingRun(argv, deps = {}) {
 		const accountability = state
 			? await inspectRoutingAccountability(state, deps.readRun ?? readRun)
 			: null;
+		// A held run is a succeeded attempt whose patch is not in the tree yet.
+		const heldIntegrations = state
+			? await inspectHeldIntegrations(state, deps.readRun ?? readRun)
+			: [];
 		write(
 			JSON.stringify({
 				ok: Boolean(state),
 				routingRunId: runId,
 				state,
 				accountability,
+				heldIntegrations,
 			}),
 		);
 		return;

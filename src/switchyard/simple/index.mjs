@@ -2543,21 +2543,87 @@ export async function runSimpleTask(options, dependencies = {}) {
 				? { undeclaredPaths: [...undeclaredKept], undeclaredPatchPath }
 				: {};
 		emitStatus(onStatus, taskId, "integrate");
-		milestone("integrate", "integration_started");
-		const integration = dependencies.integrate
-			? await dependencies.integrate({
-					diff: capturedDiff.diff,
-					projectPath: options.projectPath,
-					changedFiles,
-					allowedPaths: scopeFiles,
-					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
-					allowExecutables,
-				})
-			: integrationGate(capturedDiff.diff, options.projectPath, {
-					allowedPaths: scopeFiles,
-					allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
-					allowExecutables,
-				});
+		const outputsAt = (root) =>
+			changedFiles.map((path) => {
+				const absolute = resolve(root, path);
+				try {
+					const stats = lstatSync(absolute);
+					const bytes = stats.isFile()
+						? readFileSync(absolute)
+						: Buffer.alloc(0);
+					return {
+						path,
+						size: bytes.length,
+						sha256: createHash("sha256").update(bytes).digest("hex"),
+						mode: stats.mode & 0o777,
+					};
+				} catch {
+					return { path, size: 0, sha256: null, mode: 0 };
+				}
+			});
+		// A held integration passes the same gate without writing the project
+		// tree: the verified patch and its receipt go to the run store, and the
+		// outputs are the ones the patch produces in the checked worktree.
+		const holdIntegration = options.integrateMode === "hold";
+		let heldIntegration = null;
+		let integration;
+		milestone(
+			"integrate",
+			holdIntegration ? "integration_hold_started" : "integration_started",
+		);
+		if (holdIntegration) {
+			const expectedOutputs = outputsAt(worktreePath);
+			let held;
+			try {
+				held = (dependencies.holdIntegration ?? holdVerifiedIntegration)(
+					{
+						runId,
+						taskId,
+						attemptId,
+						projectPath: options.projectPath,
+						diff: capturedDiff.diff,
+						baseRevision,
+						verifiedHead: currentHead,
+						files: options.files,
+						scopeFiles,
+						readOnlyInputs: options.readOnlyInputs ?? [],
+						allowManifests: options.allowManifests ?? [],
+						allowExecutables,
+						checks: options.checks,
+						changedFiles,
+						undeclaredPaths: undeclaredKept,
+						declaredFingerprint: initialFingerprint,
+						expectedOutputs,
+					},
+					{ now },
+				);
+			} catch (error) {
+				keepWorktree = true;
+				return fail(
+					"run_store_write_failed",
+					"integrate",
+					classifyErrorKind("run_store_write_failed", "integrate", error),
+					error,
+				);
+			}
+			integration = held?.ok ? { success: true } : held?.gate;
+			if (held?.ok) heldIntegration = { ...held.summary, expectedOutputs };
+		} else {
+			integration = dependencies.integrate
+				? await dependencies.integrate({
+						diff: capturedDiff.diff,
+						projectPath: options.projectPath,
+						changedFiles,
+						allowedPaths: scopeFiles,
+						allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
+						allowExecutables,
+					})
+				: integrationGate(capturedDiff.diff, options.projectPath, {
+						allowedPaths: scopeFiles,
+						allowSensitiveManifests: (options.allowManifests ?? []).length > 0,
+						allowExecutables,
+					});
+		}
 		if (!integration?.success) {
 			keepWorktree = true;
 			if (headAdvanced && integration?.message === "Diff apply failed")
@@ -2571,32 +2637,29 @@ export async function runSimpleTask(options, dependencies = {}) {
 				"integrate",
 			);
 		}
-		milestone("integrate", "integration_completed");
-		const terminalOutputs = changedFiles.map((path) => {
-			const absolute = resolve(options.projectPath, path);
-			try {
-				const stats = lstatSync(absolute);
-				const bytes = stats.isFile() ? readFileSync(absolute) : Buffer.alloc(0);
-				return {
-					path,
-					size: bytes.length,
-					sha256: createHash("sha256").update(bytes).digest("hex"),
-					mode: stats.mode & 0o777,
-				};
-			} catch {
-				return { path, size: 0, sha256: null, mode: 0 };
-			}
-		});
+		milestone(
+			"integrate",
+			heldIntegration ? "integration_held" : "integration_completed",
+		);
+		const { expectedOutputs, ...heldSummary } = heldIntegration ?? {};
+		const terminalOutputs = expectedOutputs ?? outputsAt(options.projectPath);
+		// A held run is an accepted provider result whose project output is not
+		// in the tree yet, so it never serves as a predecessor receipt.
+		const terminalStatus = heldIntegration ? "held" : "succeeded";
+		const heldTerminal = heldIntegration ? { integration: heldSummary } : {};
 		if (runInitialized) {
 			try {
 				await (dependencies.updateRunWithRetry ?? updateRunWithRetry)(runId, {
 					state: "running",
 					cleanupState: "pending",
 					terminalSummary: {
-						status: "integration_applied",
+						status: heldIntegration
+							? "integration_held"
+							: "integration_applied",
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...heldTerminal,
 					},
 				});
 			} catch (error) {
@@ -2616,13 +2679,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 					cleanupState: "pending",
 					finishedAt: new Date(now()).toISOString(),
 					terminalSummary: {
-						status: "succeeded",
+						status: terminalStatus,
 						deadlineFit: deadlineFitDetails(selectedSizing, {
 							persisted: true,
 						}),
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...heldTerminal,
 						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
@@ -2748,13 +2812,14 @@ export async function runSimpleTask(options, dependencies = {}) {
 					...(cleanupFailure ? { cleanupFailure } : {}),
 					finishedAt: new Date(now()).toISOString(),
 					terminalSummary: {
-						status: "succeeded",
+						status: terminalStatus,
 						deadlineFit: deadlineFitDetails(selectedSizing, {
 							persisted: true,
 						}),
 						baseRevision,
 						changedFiles,
 						outputs: terminalOutputs,
+						...heldTerminal,
 						...undeclaredSummary,
 						...(terminalProviderReliability
 							? { providerReliability: terminalProviderReliability }
@@ -2806,6 +2871,7 @@ export async function runSimpleTask(options, dependencies = {}) {
 		});
 		if (reportMode) finalResult.resultKind = "report";
 		if (reportMode && reportOutput) finalResult.report = reportOutput;
+		if (heldIntegration) finalResult.integration = heldSummary;
 		finalResult.origin = origin;
 		finalResult.formatStatus = formatStatus;
 		if (selectedSizing) finalResult.deadlineFit = selectedSizing;
@@ -2995,6 +3061,7 @@ import {
 	worktreeGit,
 } from "./args.mjs";
 import { assertFundedRoute } from "./funding.mjs";
+import { holdVerifiedIntegration } from "./held-integration.mjs";
 import {
 	declaredPathsAreClean,
 	dirtyOverlayFailure,

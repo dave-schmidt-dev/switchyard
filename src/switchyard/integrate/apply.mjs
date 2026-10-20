@@ -56,6 +56,40 @@ function applyCheckPasses(args, diff, projectPath) {
 	};
 }
 
+// A failed forward check usually means a genuine conflict, but git also
+// reports a truncated or malformed diff through this path. Surface which one
+// it was: classifyApplyFailure() only ever reports "corrupt_patch" on git's own
+// "corrupt patch"/"unrecognized input" diagnostic text, not on any other
+// failure. Surface git's own `--check` diagnostic (e.g. "error: ... patch does
+// not apply") as `reason` so the caller gets actionable text, not just a bare
+// "Diff apply failed".
+function forwardCheckRefusal(forward) {
+	return {
+		applied: false,
+		reason:
+			(forward.timedOut
+				? "git apply --check timed out"
+				: forward.stderr.trim()) || "git apply --check rejected the diff",
+		reasonKind: forward.timedOut
+			? "conflict"
+			: classifyApplyFailure(forward.stderr),
+	};
+}
+
+/**
+ * Run only the non-mutating forward check a reviewed diff must pass before
+ * `applyReviewedDiff` touches the host. A held integration uses it to prove the
+ * diff applies to the current tree without writing anything.
+ */
+export function checkReviewedDiff(diff, projectPath) {
+	try {
+		const forward = applyCheckPasses(["--check"], diff, projectPath);
+		return forward.ok ? true : forwardCheckRefusal(forward);
+	} catch (error) {
+		return { applied: false, reason: error.message };
+	}
+}
+
 export function applyReviewedDiff(diff, projectPath) {
 	try {
 		// Non-mutating forward check: nothing touches the host until git
@@ -100,24 +134,7 @@ export function applyReviewedDiff(diff, projectPath) {
 		// A matching after-state cannot prove this operation applied: unrelated
 		// edits can produce the same bytes, so a failed forward check is never
 		// read as an earlier success.
-		// A failed forward check usually means a genuine conflict, but git also
-		// reports a truncated or malformed diff through this path. Surface which
-		// one it was: classifyApplyFailure() only ever reports
-		// "corrupt_patch" on git's own "corrupt patch"/"unrecognized input"
-		// diagnostic text, not on any other failure. Surface git's own
-		// `--check` diagnostic (e.g. "error: ... patch does not apply") as
-		// `reason` so the caller gets actionable text, not just a bare
-		// "Diff apply failed".
-		return {
-			applied: false,
-			reason:
-				(forward.timedOut
-					? "git apply --check timed out"
-					: forward.stderr.trim()) || "git apply --check rejected the diff",
-			reasonKind: forward.timedOut
-				? "conflict"
-				: classifyApplyFailure(forward.stderr),
-		};
+		return forwardCheckRefusal(forward);
 	} catch (error) {
 		return { applied: false, reason: error.message };
 	}
