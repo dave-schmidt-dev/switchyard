@@ -28,6 +28,7 @@ import {
 import { commandWords, resolveCheckExecution } from "./check-execution.mjs";
 import {
 	npmCiFailureDetails,
+	sandboxDeniedPath,
 	writeCheckEvidence,
 } from "./check-setup-evidence.mjs";
 import {
@@ -491,10 +492,17 @@ export function createSimpleCheckSessions({
 		// Evidence files are named <attempt>-<check position>; attempt 0 is the
 		// baseline run.
 		evidenceIndex += 1;
-		if (result?.success || !evidenceDir) return result;
+		if (result?.success) return result;
+		// A failed check names the path its own output reports as denied, so a
+		// sandbox denial explains itself without opening the evidence file.
+		const deniedPath = sandboxDeniedPath(result);
+		const failed = deniedPath
+			? { ...result, sandboxDeniedPath: deniedPath }
+			: result;
+		if (!evidenceDir) return failed;
 		try {
 			return {
-				...result,
+				...failed,
 				outputPath: writeCheckEvidence(
 					evidenceDir,
 					evidenceAttempt,
@@ -504,7 +512,7 @@ export function createSimpleCheckSessions({
 			};
 		} catch {
 			// Evidence retention must never change the check's gate result.
-			return result;
+			return failed;
 		}
 	}
 	// Opt-in formatter: run inside the same sandbox that will run the checks so

@@ -98,8 +98,8 @@ export const existsInCheckout = (root) => (path) => {
  * index of every check that ran to completion and failed plainly on the
  * unmodified tree, so a timeout is not recorded; empty when all passed),
  * `environment_failed` (first classified check, with `checkIndex`, `checkIdentity`, `signature`, `outputPath`, `exitCode`,
- * `signal`, and — when the caller resolved them — `checkExecutable` and
- * `hostExecutable`), `cancelled`, `deadline_expired` (stopped early; the
+ * `signal`, any `sandboxDeniedPath` the failed check named, and — when the
+ * caller resolved them — `checkExecutable` and `hostExecutable`), `cancelled`, `deadline_expired` (stopped early; the
  * engine's own deadline fences fail the run in their phase), `unconfirmed` (a
  * check left its process group unsettled; the caller's session removal rejects
  * it).
@@ -206,6 +206,9 @@ export async function dryRunAcceptanceChecks({
 						? result.code
 						: null,
 				signal: PERSISTED_SIGNALS.has(result.signal) ? result.signal : null,
+				...(typeof result.sandboxDeniedPath === "string"
+					? { sandboxDeniedPath: result.sandboxDeniedPath }
+					: {}),
 				...(executableDetails?.checkExecutable
 					? { checkExecutable: executableDetails.checkExecutable }
 					: {}),

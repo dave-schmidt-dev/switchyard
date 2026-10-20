@@ -163,6 +163,7 @@ function causeFields(result, accountability = result?.accountability) {
 		checkSetupStep: details?.checkSetupStep ?? undefined,
 		checkSetupErrorCode: details?.checkSetupErrorCode ?? undefined,
 		checkSetupExecutable: details?.checkSetupExecutable ?? undefined,
+		sandboxDeniedPath: details?.sandboxDeniedPath ?? undefined,
 		diffRejectionRule: details?.diffRejectionRule ?? undefined,
 		diffRejectionUnknownStep: details?.diffRejectionUnknownStep ?? undefined,
 		diffRejectionUnknownCause: details?.diffRejectionUnknownCause ?? undefined,

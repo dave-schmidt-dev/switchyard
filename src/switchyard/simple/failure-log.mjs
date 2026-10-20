@@ -62,6 +62,15 @@ const CLOSED_OPTIONAL_VALUES = Object.freeze({
 });
 const STRING_ARRAY_LIMIT = 5;
 const STRING_ARRAY_MAX_CHARS = 200;
+// Path references keep the run record's bound (macOS PATH_MAX), not the
+// generic string cap, so a deep owned root does not drop them.
+const PATH_REFERENCE_FIELDS = new Set([
+	"outputPath",
+	"checkExecutable",
+	"hostExecutable",
+	"sandboxDeniedPath",
+]);
+const PATH_REFERENCE_MAX_CHARS = 1024;
 const hasControls = (value) =>
 	[...value].some(
 		(char) => char.codePointAt(0) < 32 || char.codePointAt(0) === 127,
@@ -82,6 +91,12 @@ const sanitizeStringArray = (value) => {
 	}
 	return bounded;
 };
+const sanitizePathReference = (value) =>
+	typeof value === "string" &&
+	value.length <= PATH_REFERENCE_MAX_CHARS &&
+	!hasControls(value)
+		? value
+		: null;
 const sanitizeIntegerField = (value) =>
 	Number.isSafeInteger(value) && value >= 0 && value <= 4096 ? value : null;
 function sanitizeOptionalField(type, value) {
@@ -171,7 +186,9 @@ export function appendFailureRecord(input, { stateRoot } = {}) {
 		record[key] = typeof input?.[key] === "boolean" ? input[key] : null;
 	for (const [key, type] of Object.entries(OPTIONAL_FIELD_TYPES)) {
 		if (input?.[key] === undefined) continue;
-		const safe = sanitizeOptionalField(type, input[key]);
+		const safe = PATH_REFERENCE_FIELDS.has(key)
+			? sanitizePathReference(input[key])
+			: sanitizeOptionalField(type, input[key]);
 		if (safe !== undefined) record[key] = safe;
 	}
 	for (const [key, values] of Object.entries(CLOSED_OPTIONAL_VALUES)) {

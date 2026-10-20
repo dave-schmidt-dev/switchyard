@@ -151,7 +151,11 @@ function sanitizeDetailValue(field, value) {
 			!hasControlChars(value)
 			? value
 			: undefined;
-	if (field === "checkExecutable" || field === "hostExecutable")
+	if (
+		field === "checkExecutable" ||
+		field === "hostExecutable" ||
+		field === "sandboxDeniedPath"
+	)
 		return sanitizeAbsoluteDetailPath(value);
 	// Earlier releases persisted any bounded string here, so only the bound
 	// differs from the generic rule.
