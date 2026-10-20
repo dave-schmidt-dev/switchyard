@@ -7,8 +7,11 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { createProviderReliabilityDiagnostic } from "../src/switchyard/diagnostics/provider-reliability.mjs";
 import { manifestReviewHint } from "../src/switchyard/simple/declared-diff.mjs";
 import { runSimpleTask } from "../src/switchyard/simple/index.mjs";
+import { runSimpleRoutingTask } from "../src/switchyard/simple/routing-run.mjs";
+import { fixture as routingFixture } from "./helpers/simple-routing-fixture.mjs";
 import { tempDir } from "./helpers/tempdir.mjs";
 
 const suite = tempDir("switchyard-manifest-review-hint-");
@@ -84,4 +87,27 @@ test("the hint shell-quotes unsafe paths and counts paths beyond the bounded lis
 		"review the change to Makefile, pkg dir/package.json, it's/go.mod and 2 more, then rerun with --allow-manifest Makefile --allow-manifest 'pkg dir/package.json' --allow-manifest 'it'\\''s/go.mod' to allow it",
 	);
 	ok(!manifestReviewHint(["package.json"]).includes("more"));
+});
+
+test("the routing answer the CLI prints keeps the engine hint", async () => {
+	const hint = manifestReviewHint(["package.json"]);
+	const f = routingFixture({
+		"antigravity-claude": {
+			status: "failed",
+			result: {
+				providerReliability: createProviderReliabilityDiagnostic({
+					causeCode: "input_rejected",
+					phase: "input_validation",
+				}),
+				failureReason: "manifest_review_required",
+				failurePhase: "input_validation",
+				errorKind: "validation_failed",
+				hint,
+			},
+		},
+	});
+	const routing = await runSimpleRoutingTask(f.options, f.deps);
+	strictEqual(routing.direction, "stop");
+	strictEqual(routing.result.failureReason, "manifest_review_required");
+	strictEqual(routing.result.hint, hint);
 });
