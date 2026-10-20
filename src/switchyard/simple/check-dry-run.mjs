@@ -106,7 +106,9 @@ export const existsInCheckout = (root) => (path) => {
  *
  * @param {object} options
  * @param {string[]} options.checks Acceptance check commands, in order.
- * @param {Function} options.runCheck Session `runCheck` (writes check evidence on failure).
+ * @param {Function} options.runCheck Session `runCheck` (writes check evidence on
+ *   failure). Called with `testBaseline: true`, so a red test-runner check's
+ *   per-test results become its differential acceptance baseline.
  * @param {string[]} [options.declaredPaths] The task's declared output paths.
  * @param {(path: string) => boolean} [options.pathExistsAtBase] Whether a
  *   repo-relative path exists in the base tree; the default reports every path
@@ -158,6 +160,7 @@ export async function dryRunAcceptanceChecks({
 				timeoutMs: Math.min(remaining, cap),
 				signal,
 				onProgress: () => emit("dry_run_check_progress"),
+				testBaseline: true,
 			});
 		} catch (error) {
 			if (signal?.aborted || error?.code === "cancelled")

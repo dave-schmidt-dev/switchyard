@@ -1980,6 +1980,8 @@ export async function runSimpleTask(options, dependencies = {}) {
 								...(check?.outputPath ? { outputPath: check.outputPath } : {}),
 							}
 						: {}),
+					// A red-at-baseline test-runner check's differential verdict.
+					...(check?.differential ? { differential: check.differential } : {}),
 				});
 				milestone("checks", "check_finished", {
 					checkIndex: index + 1,

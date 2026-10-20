@@ -25,6 +25,7 @@ import {
 	snapshotGitControl,
 	verifyGitControl,
 } from "./args.mjs";
+import { createDifferentialChecks } from "./check-differential.mjs";
 import { commandWords, resolveCheckExecution } from "./check-execution.mjs";
 import {
 	npmCiFailureDetails,
@@ -131,6 +132,8 @@ export function createSimpleCheckSessions({
 	let lifecycle = "never_started";
 	let evidenceAttempt = 1;
 	let evidenceIndex = 0;
+	// Baselines captured on the base tree (attempt 0) judge later candidates.
+	const differential = createDifferentialChecks({ declaredFiles: files ?? [] });
 	function timeout() {
 		if (signal?.aborted) throw refused("cancelled");
 		const remaining = deadlineMs - now();
@@ -272,6 +275,7 @@ export function createSimpleCheckSessions({
 		const root = mkdtempSync(join(taskRoot, "checker-"));
 		active = {
 			root,
+			baseRun: attempt === 0,
 			path: join(root, "checkout"),
 			runtime: join(root, "runtime"),
 			readOnlyPaths: [],
@@ -473,43 +477,66 @@ export function createSimpleCheckSessions({
 			throw error;
 		}
 	}
-	async function run({ command, onProgress: progress, timeoutMs = null }) {
+	// `testBaseline` (the pre-provider dry run) captures a test-runner check's
+	// per-test baseline; a later candidate run of that check is judged against it.
+	async function run({
+		command,
+		onProgress: progress,
+		timeoutMs = null,
+		testBaseline = false,
+	}) {
 		if (!active) throw refused("check_session_unavailable");
 		const execution = resolveCheckExecution(command, active.path);
 		if (execution.kind === "rejected")
 			throw refused("check_dependencies_unverified", {
 				dependencyCheck: "command_rejected",
 			});
-		const result = await confined(
+		const plan = differential.plan({
+			command,
+			execution,
+			baseRun: active.baseRun,
+			testBaseline,
+			runtime: active.runtime,
+			checkout: active.path,
+		});
+		const ran = await confined(
 			execution.kind === "local" ? execution.command : "/bin/sh",
-			execution.kind === "local" ? execution.args : ["-c", command],
+			execution.kind === "local"
+				? execution.args
+				: ["-c", plan?.shellCommand ?? command],
 			safeEnv(active.runtime),
 			[],
 			progress,
 			timeoutMs,
 			command,
 		);
+		const result = plan ? differential.judge(plan, command, ran) : ran;
 		// Evidence files are named <attempt>-<check position>; attempt 0 is the
 		// baseline run.
 		evidenceIndex += 1;
-		if (result?.success) return result;
+		if (result?.success && ran?.success) return result;
 		// A failed check names the path its own output reports as denied, so a
 		// sandbox denial explains itself without opening the evidence file.
-		const deniedPath = sandboxDeniedPath(result);
+		const deniedPath = result?.success ? null : sandboxDeniedPath(result);
 		const failed = deniedPath
 			? { ...result, sandboxDeniedPath: deniedPath }
 			: result;
 		if (!evidenceDir) return failed;
 		try {
-			return {
-				...failed,
-				outputPath: writeCheckEvidence(
-					evidenceDir,
-					evidenceAttempt,
-					evidenceIndex,
-					result,
-				),
-			};
+			const outputPath = writeCheckEvidence(
+				evidenceDir,
+				evidenceAttempt,
+				evidenceIndex,
+				ran,
+			);
+			// A differentially accepted run still exited nonzero; its evidence
+			// travels inside the record, since a passed check carries no outputPath.
+			return failed.success
+				? {
+						...failed,
+						differential: { ...failed.differential, evidencePath: outputPath },
+					}
+				: { ...failed, outputPath };
 		} catch {
 			// Evidence retention must never change the check's gate result.
 			return failed;
