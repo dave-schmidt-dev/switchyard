@@ -325,3 +325,42 @@ export function failedAttemptStop({
 	// Continue to the next eligible target (retained clone is independent).
 	return null;
 }
+
+const closedCode = (value) =>
+	typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(value)
+		? value
+		: null;
+
+/** The engine's own closed failure codes for one closed attempt. */
+export function closedAttemptCodes(result) {
+	return {
+		failureReason: closedCode(result?.failureReason),
+		causeCode: closedCode(result?.providerReliability?.causeCode),
+	};
+}
+
+/**
+ * Summaries of this invocation's closed attempts other than the one the
+ * answer's top-level result describes, oldest first. `partialWorktree` is
+ * read from routing state, so a partial released since is null.
+ *
+ * @param {object[]} attempts Routing state's attempt history.
+ * @param {Map<string, {failureReason: string|null, causeCode: string|null}>} own
+ *   This invocation's closed attempts, by attempt ID.
+ * @param {string|null} reportedAttemptId
+ */
+export function priorAttemptSummaries(attempts, own, reportedAttemptId) {
+	return attempts
+		.filter(
+			(attempt) =>
+				own.has(attempt.attemptId) && attempt.attemptId !== reportedAttemptId,
+		)
+		.map((attempt) => ({
+			attemptId: attempt.attemptId,
+			targetId: attempt.targetId,
+			terminal: attempt.terminal,
+			reason: attempt.reason,
+			...own.get(attempt.attemptId),
+			partialWorktree: attempt.partialWorktree,
+		}));
+}

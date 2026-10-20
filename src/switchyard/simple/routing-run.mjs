@@ -17,9 +17,11 @@ import {
 import { routeDiagnosticPatch } from "./route-evidence.mjs";
 import { recordRouteExhaustion } from "./route-exhaustion.mjs";
 import {
+	closedAttemptCodes,
 	evaluateAttempt,
 	failedAttemptStop,
 	preflightStop,
+	priorAttemptSummaries,
 	unroutedStop,
 } from "./routing-attempt-outcome.mjs";
 import { discardAndReleasePartial } from "./routing-recovery.mjs";
@@ -114,6 +116,10 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	// invocation's own attempts, never from an earlier task's attempt; an
 	// unrouted failure names itself through { attempt }.
 	let settledAnswer = null;
+	// This invocation's closed attempts and the last one closed, so an answer
+	// can summarize the attempts its top-level result does not describe.
+	const ownClosed = new Map();
+	let lastClosed = null;
 	const answer = (direction, extra = {}, { log = true, attempt } = {}) => {
 		if (direction !== "complete" && log) {
 			const own = (item) => item?.taskId === logicalTaskId;
@@ -139,6 +145,13 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			direction,
 			extra,
 		);
+		const priorAttempts = priorAttemptSummaries(
+			handle.state.attempts,
+			ownClosed,
+			lastClosed && extra.result === lastClosed.result
+				? lastClosed.attemptId
+				: null,
+		);
 		const out = {
 			direction: resultDirection,
 			origin,
@@ -148,6 +161,7 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 			failedTargetIds: handle.state.failedTargetIds,
 			retainedPartials: retainedPartials(),
 			...(releasedPartials.length > 0 ? { releasedPartials } : {}),
+			...(priorAttempts.length > 0 ? { priorAttempts } : {}),
 			...routingDiagnostics,
 			...routeDiagnosticPatch(resultExtra.result),
 			...resultExtra,
@@ -339,6 +353,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 					pendingAttempt: pending,
 				});
 			}
+			ownClosed.set(pending.attemptId, closedAttemptCodes(result));
+			lastClosed = { attemptId: pending.attemptId, result };
 			// The source partial is released only now that its continuation is
 			// terminal, and only when the continuation holds the carried work.
 			// It is discarded from disk through the run claim; a failed discard keeps

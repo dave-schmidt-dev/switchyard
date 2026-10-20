@@ -136,6 +136,11 @@ export async function handleSimple(argv, dependencies = {}) {
 				...(routing.retainedPartials?.length > 0
 					? { retainedPartials: routing.retainedPartials }
 					: {}),
+				// The attempts before the one this result describes, so a retry's
+				// result still names the earlier target, failure and partial.
+				...(routing.priorAttempts?.length > 0
+					? { priorAttempts: routing.priorAttempts }
+					: {}),
 			};
 		} catch (error) {
 			const isUsage = error instanceof SimpleUsageError;
