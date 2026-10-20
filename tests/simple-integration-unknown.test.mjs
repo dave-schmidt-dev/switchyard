@@ -8,6 +8,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { test } from "node:test";
+import { sanitizeFailureDetails } from "../src/switchyard/adapter/exec-error.mjs";
 import { readRun } from "../src/switchyard/run-store/index.mjs";
 import {
 	appendFailureRecord,
@@ -138,4 +139,32 @@ test("integration_state_unknown names the unknown metadata step in the result, r
 	strictEqual(record.diffRejectionRule, "integration_state_unknown");
 	strictEqual(record.diffRejectionUnknownStep, "summary");
 	strictEqual(record.diffRejectionUnknownCause, "exit_nonzero");
+});
+
+test("an unknown step or cause outside the closed sets is dropped at both boundaries", () => {
+	const valid = {
+		diffRejectionUnknownStep: "numstat",
+		diffRejectionUnknownCause: "timeout",
+	};
+	const invalid = {
+		diffRejectionUnknownStep: "not_a_step",
+		diffRejectionUnknownCause: "not_a_cause",
+	};
+	strictEqual(
+		JSON.stringify(sanitizeFailureDetails({ failureReason: "x", ...valid })),
+		JSON.stringify({ failureReason: "x", ...valid }),
+	);
+	strictEqual(
+		JSON.stringify(sanitizeFailureDetails({ failureReason: "x", ...invalid })),
+		JSON.stringify({ failureReason: "x" }),
+	);
+
+	const stateRoot = tempDir("switchyard-integration-unknown-closed-");
+	for (const fields of [valid, invalid])
+		appendFailureRecord({ recordType: "attempt", ...fields }, { stateRoot });
+	const [kept, dropped] = readFailureRecords({ stateRoot });
+	strictEqual(kept.diffRejectionUnknownStep, "numstat");
+	strictEqual(kept.diffRejectionUnknownCause, "timeout");
+	strictEqual(dropped.diffRejectionUnknownStep, null);
+	strictEqual(dropped.diffRejectionUnknownCause, null);
 });

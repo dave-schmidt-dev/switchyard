@@ -10,6 +10,8 @@ import {
 import { join } from "node:path";
 import {
 	DETAIL_FIELD_TYPES,
+	INTEGRATION_UNKNOWN_CAUSES,
+	INTEGRATION_UNKNOWN_STEPS,
 	sanitizeGitControlTamper,
 } from "../diagnostics/failure-registry.mjs";
 import {
@@ -51,6 +53,12 @@ const OPTIONAL_FIELD_TYPES = Object.freeze({
 	lifecycleCheck: "string",
 	gitControlTamper: "gitControlTamper",
 	...DETAIL_FIELD_TYPES,
+});
+// Closed enums: a supplied value outside its set is recorded as null.
+const CLOSED_OPTIONAL_VALUES = Object.freeze({
+	lifecycleCheck: LIFECYCLE_CHECKS,
+	diffRejectionUnknownStep: INTEGRATION_UNKNOWN_STEPS,
+	diffRejectionUnknownCause: INTEGRATION_UNKNOWN_CAUSES,
 });
 const STRING_ARRAY_LIMIT = 5;
 const STRING_ARRAY_MAX_CHARS = 200;
@@ -137,7 +145,8 @@ function fingerprintOf(record) {
  * argv, environment, check commands and file contents are never recorded.
  * Registered detail fields (and the invocation fields `preflightCode` and
  * `usageError`) are copied only when supplied, each sanitized by its declared
- * type. `lifecycleCheck` is copied only when it names a closed lifecycle check.
+ * type. `lifecycleCheck` and the `integration_state_unknown` step and cause
+ * are copied only when they name a value of their closed set.
  *
  * @param {object} input - Raw record fields; `recordType` must be "attempt",
  *   "stop" or "invocation".
@@ -165,12 +174,10 @@ export function appendFailureRecord(input, { stateRoot } = {}) {
 		const safe = sanitizeOptionalField(type, input[key]);
 		if (safe !== undefined) record[key] = safe;
 	}
-	// lifecycleCheck is a closed enum: anything else is not a check name.
-	if (
-		record.lifecycleCheck !== undefined &&
-		!LIFECYCLE_CHECKS.includes(record.lifecycleCheck)
-	)
-		record.lifecycleCheck = null;
+	for (const [key, values] of Object.entries(CLOSED_OPTIONAL_VALUES)) {
+		if (record[key] !== undefined && !values.includes(record[key]))
+			record[key] = null;
+	}
 	record.fingerprint = fingerprintOf(record);
 	let origin = input?.origin;
 	if (origin === undefined || origin === null) {

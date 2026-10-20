@@ -5,6 +5,8 @@ import {
 	CODE_CATEGORIES,
 	causeCategoryFor,
 	DETAIL_FIELD_TYPES,
+	INTEGRATION_UNKNOWN_CAUSES,
+	INTEGRATION_UNKNOWN_STEPS,
 	sanitizeGitControlTamper,
 } from "../diagnostics/failure-registry.mjs";
 import { isProviderReliabilityDiagnostic } from "../diagnostics/provider-reliability.mjs";
@@ -47,6 +49,11 @@ const CHECK_EXECUTABLE_LINE_MIDDLE = " in the check sandbox but ";
 const CHECK_EXECUTABLE_LINE_SUFFIX = " on the host.";
 const CLOSED_CHECK_SETUP_STEPS = new Set(CHECK_SETUP_STEPS);
 const CLOSED_CANCEL_SOURCES = new Set(CANCEL_SOURCES);
+// The `git apply` metadata step and cause behind `integration_state_unknown`.
+const CLOSED_INTEGRATION_UNKNOWN = Object.freeze({
+	diffRejectionUnknownStep: new Set(INTEGRATION_UNKNOWN_STEPS),
+	diffRejectionUnknownCause: new Set(INTEGRATION_UNKNOWN_CAUSES),
+});
 // `git_control_tampered` is minted by the harness's own git-control
 // verification, never derived from provider output, so harness provenance
 // with evidence is authoritative for it even though it is neither an
@@ -121,6 +128,11 @@ function sanitizeDetailValue(field, value) {
 			: undefined;
 	if (field === "checkSetupStep")
 		return typeof value === "string" && CLOSED_CHECK_SETUP_STEPS.has(value)
+			? value
+			: undefined;
+	if (Object.hasOwn(CLOSED_INTEGRATION_UNKNOWN, field))
+		return typeof value === "string" &&
+			CLOSED_INTEGRATION_UNKNOWN[field].has(value)
 			? value
 			: undefined;
 	if (field === "checkSetupErrorCode" || field === "checkSetupSyscall")
