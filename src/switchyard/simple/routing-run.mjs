@@ -182,14 +182,16 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const localExcluded = new Map();
 	const refusals = createRefusalAccumulator();
 	// Refusal records are diagnostic: a failed write warns and never changes
-	// the route.
+	// the route, even when the warning sink itself fails.
 	const recordRefusals = (record) => {
 		try {
 			appendRouteRefusals(handle.runDir, record);
 		} catch (error) {
-			(deps.onRoutingWarning ?? console.error)(
-				`dispatch: route refusal record unavailable (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "unknown"})`,
-			);
+			try {
+				(deps.onRoutingWarning ?? console.error)(
+					`dispatch: route refusal record unavailable (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "unknown"})`,
+				);
+			} catch {}
 		}
 	};
 	let routingDiagnostics = {};

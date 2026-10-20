@@ -325,7 +325,10 @@ const decision = (f, result) => ({
 	attempts: result.attempts.map((a) => [a.targetId, a.terminal, a.reason]),
 });
 
-async function withRefusalFile(prepare) {
+async function withRefusalFile(
+	prepare,
+	{ throwOnRefusalWarning = false } = {},
+) {
 	const baseline = stubFixture({ antigravity: { status: "failed" } });
 	const expected = decision(
 		baseline,
@@ -333,7 +336,11 @@ async function withRefusalFile(prepare) {
 	);
 	const f = stubFixture({ antigravity: { status: "failed" } });
 	const warnings = [];
-	f.deps.onRoutingWarning = (line) => warnings.push(line);
+	f.deps.onRoutingWarning = (line) => {
+		warnings.push(line);
+		if (throwOnRefusalWarning && line.includes("route refusal record"))
+			throw new Error("warning sink unavailable");
+	};
 	const handle = openRoutingRun(f.options.projectPath, "run-1", {
 		stateRoot: f.deps.stateRoot,
 	});
@@ -351,6 +358,17 @@ test("a refusal record that cannot be written warns and leaves the routing answe
 		[...new Set(warnings)],
 		["dispatch: route refusal record unavailable (routing_unsafe_file)"],
 	);
+});
+
+// Codex review (2026-10-19): a throwing warning sink must not carry the
+// write failure into the route, which may already have committed its
+// pending attempt.
+test("a refusal record failure with a failing warning sink leaves the routing answer unchanged", async () => {
+	const { f, warnings } = await withRefusalFile((path) => mkdirSync(path), {
+		throwOnRefusalWarning: true,
+	});
+	deepStrictEqual(refusalsOf(f), []);
+	ok(warnings.some((line) => line.includes("route refusal record")));
 });
 
 test("an unreadable refusal record file leaves the routing answer unchanged and is replaced", async () => {
