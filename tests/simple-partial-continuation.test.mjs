@@ -514,6 +514,52 @@ describe("routing waterfall continuation", () => {
 		ok(warnings.some((w) => w.includes("cleanup_retained")));
 	});
 
+	// A warning sink is diagnostic: one that throws must not change the route.
+	it("keeps the source and the outcome when the warning sink throws", async () => {
+		const run = async (sinkThrows) => {
+			const { f, warnings } = waterfall({
+				removes: false,
+				second: {
+					status: "succeeded",
+					onSecond: (context) =>
+						context.onContinuation({
+							sourceAttemptId: context.continuation.sourceAttemptId,
+							carried: true,
+							files: ["src/a.txt"],
+						}),
+				},
+			});
+			f.deps.onRoutingWarning = (message) => {
+				warnings.push(message);
+				if (sinkThrows && message.includes("continuation source partial kept"))
+					throw new Error("warning sink unavailable");
+			};
+			const result = await runSimpleRoutingTask(f.options, f.deps);
+			return {
+				warnings,
+				decision: {
+					direction: result.direction,
+					stopReason: result.stopReason,
+					attempts: result.attempts.map((a) => [
+						a.terminal,
+						a.reason,
+						typeof a.partialWorktree,
+					]),
+					releasedPartials: result.releasedPartials,
+				},
+			};
+		};
+		const expected = await run(false);
+		const thrown = await run(true);
+		deepStrictEqual(thrown.decision, expected.decision);
+		strictEqual(expected.decision.direction, "complete");
+		ok(
+			thrown.warnings.some((w) =>
+				w.includes("continuation source partial kept (cleanup_retained)"),
+			),
+		);
+	});
+
 	it("keeps the source when the continuation fails without its own partial", async () => {
 		const { f } = waterfall({
 			second: {

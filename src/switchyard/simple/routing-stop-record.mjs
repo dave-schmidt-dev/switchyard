@@ -283,6 +283,16 @@ export function routingErrorCode(error, fallback) {
 		: fallback;
 }
 
+/**
+ * Send one routing warning. Warnings are diagnostic: a sink that throws is
+ * contained here so it can never change a route outcome.
+ */
+export function warnRouting(deps, line) {
+	try {
+		(deps.onRoutingWarning ?? console.error)(line);
+	} catch {}
+}
+
 /** Create best-effort failure logging without allowing it to change routing. */
 export function createFailureLogAppender({
 	origin,
@@ -298,7 +308,8 @@ export function createFailureLogAppender({
 		} catch (error) {
 			if (failureLogWarned) return;
 			failureLogWarned = true;
-			(deps.onRoutingWarning ?? console.error)(
+			warnRouting(
+				deps,
 				`dispatch: failure log unavailable (${error?.code ?? "unknown"})`,
 			);
 		}

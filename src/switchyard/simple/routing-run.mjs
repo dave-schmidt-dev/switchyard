@@ -41,6 +41,7 @@ import {
 	stopRecord,
 	unroutedAttempt,
 	unroutedAttemptRecord,
+	warnRouting,
 } from "./routing-stop-record.mjs";
 import {
 	finishTaskBinding,
@@ -75,7 +76,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 				? "environment"
 				: "generated";
 	if (routingRunIdSource === "generated") {
-		(deps.onRoutingWarning ?? console.error)(
+		warnRouting(
+			deps,
 			"dispatch: simple generated a standalone routing ID; use --routing-run-id or SWITCHYARD_ROUTING_RUN_ID to share failure memory across tasks",
 		);
 	}
@@ -182,16 +184,15 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 	const localExcluded = new Map();
 	const refusals = createRefusalAccumulator();
 	// Refusal records are diagnostic: a failed write warns and never changes
-	// the route, even when the warning sink itself fails.
+	// the route.
 	const recordRefusals = (record) => {
 		try {
 			appendRouteRefusals(handle.runDir, record);
 		} catch (error) {
-			try {
-				(deps.onRoutingWarning ?? console.error)(
-					`dispatch: route refusal record unavailable (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "unknown"})`,
-				);
-			} catch {}
+			warnRouting(
+				deps,
+				`dispatch: route refusal record unavailable (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "unknown"})`,
+			);
 		}
 	};
 	let routingDiagnostics = {};
@@ -375,7 +376,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						partialWorktree: carrySource.partialWorktree,
 					});
 				} catch (error) {
-					(deps.onRoutingWarning ?? console.error)(
+					warnRouting(
+						deps,
 						`dispatch: continuation source partial kept (${typeof error?.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code : "release_failed"})`,
 					);
 				}
@@ -412,7 +414,8 @@ export async function runSimpleRoutingTask(options, deps = {}) {
 						now,
 					});
 				} catch (error) {
-					(deps.onRoutingWarning ?? console.error)(
+					warnRouting(
+						deps,
 						`dispatch: route exhaustion record unavailable (${error?.code ?? "unknown"})`,
 					);
 				}

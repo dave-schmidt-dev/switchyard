@@ -260,37 +260,82 @@ test("exhaustion writes one stop record carrying the exhaustion cause", async ()
 	strictEqual(stop.attemptId, records[2].attemptId);
 });
 
-test("a throwing failure log leaves the answer unchanged and warns once", async () => {
-	const overrides = {
-		"antigravity-claude": {
-			status: "failed",
-			result: {
-				errorKind: "cleanup_failed",
-				failureReason: "cleanup_failed",
-				failurePhase: "cleanup",
+for (const [name, sinkThrows] of [
+	["a throwing failure log leaves the answer unchanged and warns once", false],
+	[
+		"a throwing failure log with a throwing warning sink leaves the answer unchanged",
+		true,
+	],
+])
+	test(name, async () => {
+		const overrides = {
+			"antigravity-claude": {
+				status: "failed",
+				result: {
+					errorKind: "cleanup_failed",
+					failureReason: "cleanup_failed",
+					failurePhase: "cleanup",
+				},
 			},
-		},
-	};
-	const clean = fixture(overrides);
-	const expected = await runSimpleRoutingTask(clean.options, clean.deps);
-	const f = fixture(overrides);
-	const warnings = [];
-	f.deps.onRoutingWarning = (message) => warnings.push(message);
-	f.deps.failureLog = {
-		append: () => {
-			throw Object.assign(new Error("log unavailable"), { code: "EACCES" });
-		},
-	};
-	const result = await runSimpleRoutingTask(f.options, f.deps);
-	strictEqual(result.direction, expected.direction);
-	strictEqual(result.stopReason, expected.stopReason);
-	strictEqual(result.routingRunId, expected.routingRunId);
-	strictEqual(result.attempts.length, expected.attempts.length);
-	strictEqual(result.attempts[0].terminal, expected.attempts[0].terminal);
-	strictEqual(result.attempts[0].reason, expected.attempts[0].reason);
-	strictEqual(result.attempts[0].targetId, expected.attempts[0].targetId);
-	deepStrictEqual(result.failedTargetIds, expected.failedTargetIds);
-	deepStrictEqual(warnings, ["dispatch: failure log unavailable (EACCES)"]);
+		};
+		const clean = fixture(overrides);
+		const expected = await runSimpleRoutingTask(clean.options, clean.deps);
+		const f = fixture(overrides);
+		const warnings = [];
+		f.deps.onRoutingWarning = (message) => {
+			warnings.push(message);
+			if (sinkThrows) throw new Error("warning sink unavailable");
+		};
+		f.deps.failureLog = {
+			append: () => {
+				throw Object.assign(new Error("log unavailable"), { code: "EACCES" });
+			},
+		};
+		const result = await runSimpleRoutingTask(f.options, f.deps);
+		strictEqual(result.direction, expected.direction);
+		strictEqual(result.stopReason, expected.stopReason);
+		strictEqual(result.routingRunId, expected.routingRunId);
+		strictEqual(result.attempts.length, expected.attempts.length);
+		strictEqual(result.attempts[0].terminal, expected.attempts[0].terminal);
+		strictEqual(result.attempts[0].reason, expected.attempts[0].reason);
+		strictEqual(result.attempts[0].targetId, expected.attempts[0].targetId);
+		deepStrictEqual(result.failedTargetIds, expected.failedTargetIds);
+		deepStrictEqual(warnings, ["dispatch: failure log unavailable (EACCES)"]);
+	});
+
+// A warning sink is diagnostic: one that throws must not change the route.
+test("a throwing warning sink leaves a generated-ID route unchanged", async () => {
+	const decision = (result) => ({
+		direction: result.direction,
+		stopReason: result.stopReason,
+		routingRunIdSource: result.routingRunIdSource,
+		calls: result.attempts.map((a) => [a.targetId, a.terminal, a.reason]),
+	});
+	const previous = process.env.SWITCHYARD_ROUTING_RUN_ID;
+	try {
+		delete process.env.SWITCHYARD_ROUTING_RUN_ID;
+		const baseline = fixture();
+		baseline.options.routingRunId = null;
+		baseline.deps.onRoutingWarning = () => {};
+		const expected = decision(
+			await runSimpleRoutingTask(baseline.options, baseline.deps),
+		);
+		strictEqual(expected.routingRunIdSource, "generated");
+		const f = fixture();
+		f.options.routingRunId = null;
+		const warnings = [];
+		f.deps.onRoutingWarning = (message) => {
+			warnings.push(message);
+			throw new Error("warning sink unavailable");
+		};
+		const result = await runSimpleRoutingTask(f.options, f.deps);
+		deepStrictEqual(decision(result), expected);
+		strictEqual(warnings.length, 1);
+		strictEqual(warnings[0].includes("standalone routing ID"), true);
+	} finally {
+		if (previous === undefined) delete process.env.SWITCHYARD_ROUTING_RUN_ID;
+		else process.env.SWITCHYARD_ROUTING_RUN_ID = previous;
+	}
 });
 
 test("a guard answer on a later dispatch logs nothing new", async () => {

@@ -228,6 +228,46 @@ test("an exhaustion record write failure never changes the routing outcome", asy
 	strictEqual(warnings[0].includes("route exhaustion"), true);
 });
 
+// A warning sink is diagnostic: one that throws must not change the route.
+test("an exhaustion record write failure with a throwing warning sink leaves the outcome unchanged", async () => {
+	const quotaFixture = () => {
+		const f = fixture({
+			"antigravity-claude": {
+				status: "failed",
+				result: { providerReliability: quotaDiagnostic() },
+			},
+		});
+		writeFileSync(
+			join(f.deps.stateRoot, "route-exhaustion"),
+			"not a directory",
+			"utf8",
+		);
+		return f;
+	};
+	const decision = (result) => ({
+		direction: result.direction,
+		stopReason: result.stopReason,
+		attempts: result.attempts.map((a) => [a.targetId, a.terminal, a.reason]),
+		failedTargetIds: result.failedTargetIds,
+	});
+	const baseline = quotaFixture();
+	baseline.deps.onRoutingWarning = () => {};
+	const expected = decision(
+		await runSimpleRoutingTask(baseline.options, baseline.deps),
+	);
+	const f = quotaFixture();
+	const warnings = [];
+	f.deps.onRoutingWarning = (message) => {
+		warnings.push(message);
+		throw new Error("warning sink unavailable");
+	};
+	const result = await runSimpleRoutingTask(f.options, f.deps);
+	deepStrictEqual(decision(result), expected);
+	strictEqual(expected.direction, "complete");
+	strictEqual(warnings.length, 1);
+	strictEqual(warnings[0].includes("route exhaustion"), true);
+});
+
 test("selection rejects a live-exhausted target with quota_exhausted evidence", async () => {
 	const restore = withPinnedRoster();
 	try {
